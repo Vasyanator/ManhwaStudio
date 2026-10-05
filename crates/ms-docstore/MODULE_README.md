@@ -20,6 +20,11 @@ repo-root `docstore.py` (it touches only `user_config`).
   durability is applied to the existing file (`Contents` fsyncs it, `ContentsAndDirectory`
   also the directory), so an unchanged flush costs a stat + a cached read.
   `Durability::None` performs no fsync anywhere (neither temp nor directory).
+- `write_bytes_atomic(path, bytes, durability)` (native) exposes that same recipe for files
+  that are NOT owned documents (single-image Save overwriting the user's image). Parent must
+  exist (never created); the old file is never deleted first; on failure it is intact and
+  the temp is removed; the rename replaces the directory entry (a symlink is replaced, not
+  followed — callers canonicalize); identical bytes are not rewritten; the caller logs.
 - `.db` writes to an existing file: ONE `BEGIN IMMEDIATE` transaction reads every row,
   joins, applies the caller's change (mutator / baseline check), splits and writes only the
   row diff: changed rows `UPDATE ... WHERE path` in place (rowid kept — `INSERT OR REPLACE`
@@ -108,6 +113,15 @@ repo-root `docstore.py` (it touches only `user_config`).
 - wasm32: `DocFormat::Db` → `Unsupported`; `.db` files are never probed.
 - Errors: technical `Display`; callers produce localized text. I/O-class write failures
   are logged here (not `DirSync`, which the caller logs).
+
+## Known debt
+Three private copies of the atomic-write recipe exist outside this crate and do not use
+`write_bytes_atomic`: `ms-page-ops/src/fs_exec.rs::atomic_write` (also creates the parent and
+deletes a stale destination before retrying the rename), `ms-tab-cleaning/src/tools/
+watermark_library.rs::write_atomic_bytes` (creates the parent, no Windows retry), `ms-config/src/locale_store.rs::write_atomic`
+(no fsync, no Windows retry; ms-config is above ms-docstore, so it could call it). Fold them
+into `write_bytes_atomic` when their owners are next touched, after checking each one's
+differing semantics.
 
 ## Editing map
 - Schema / split rule: `split.rs` + `sqlite.rs` + `docstore.py` + `fixtures/` TOGETHER.

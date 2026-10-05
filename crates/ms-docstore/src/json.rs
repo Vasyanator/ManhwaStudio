@@ -12,7 +12,8 @@ Main responsibilities:
   `sync_all`, CLOSE the handle, `rename`, and — when the caller asks for it — fsync the
   containing DIRECTORY so the rename itself is on stable storage before the call returns;
   a file that already holds the exact bytes is kept (no temp/rename), with the requested
-  durability applied to it;
+  durability applied to it; `write_bytes_atomic` is its public wrapper for files that
+  are not owned documents;
 - `Fingerprint` / `SaveBaseline`: the "is the file still what I last read?" check two
   running instances of the app need in order not to overwrite each other silently;
 - `is_temp_artifact`: the one owner of the temp-name pattern, for callers that copy or
@@ -259,6 +260,35 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8], durability: Durability)
             Ok(())
         }
     }
+}
+
+/// Public byte-level entry to the store's atomic write recipe, for files that are NOT owned
+/// documents (e.g. a user's image file overwritten in place). It is exactly [`write_atomic`]
+/// — same temp name ([`temp_path_for`]), fsync rules, Windows rename retry and
+/// identical-bytes shortcut — so there is one recipe, not another private copy.
+///
+/// Contract:
+/// - `path` names a file whose parent directory already EXISTS; nothing is created. A
+///   missing parent fails at the temp step and leaves no temp file behind.
+/// - The old file is never deleted before the rename; on every error it is intact (except
+///   [`AtomicWriteError::DirSync`], where the new bytes are already in place) and the temp
+///   file has been removed.
+/// - The rename replaces the DIRECTORY ENTRY at `path`: a symlink there is replaced by a
+///   regular file, not written through. A caller that must update a symlink's target
+///   canonicalizes `path` first.
+/// - When the file already holds exactly `bytes`, nothing is rewritten (its mtime is not
+///   bumped); only `durability` is applied to the existing file.
+/// - The new file gets default permissions for a newly created file, not the old file's.
+/// - Blocking I/O (fsync): never call it on the GUI thread. Nothing is logged here; the
+///   caller logs the error with its own context.
+///
+/// # Errors
+/// [`AtomicWriteError::TempWrite`] (temp could not be created/written/fsynced, including a
+/// missing parent), [`AtomicWriteError::Rename`] (e.g. `path` is a directory),
+/// [`AtomicWriteError::DirSync`] (only with [`Durability::ContentsAndDirectory`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn write_bytes_atomic(path: &Path, bytes: &[u8], durability: Durability) -> Result<(), AtomicWriteError> {
+    write_atomic(path, bytes, durability)
 }
 
 /// The "identical bytes" shortcut of [`write_atomic`]: when `path` already holds exactly
@@ -649,5 +679,59 @@ mod tests {
         assert!(!SaveBaseline::Absent.accepts(one));
         assert!(SaveBaseline::Matching(one).accepts(one));
         assert!(!SaveBaseline::Matching(one).accepts(other));
+    }
+
+    /// Names of every recipe temp artifact left in `dir`.
+    fn temp_leftovers(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir).expect("list dir").map(|entry| entry.expect("dir entry").path()).filter(|path| is_temp_artifact(path)).collect()
+    }
+
+    /// The public byte API replaces an existing file's bytes and leaves no temp behind.
+    #[test]
+    fn write_bytes_atomic_replaces_an_existing_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("page.png");
+        fs::write(&path, b"old image bytes").expect("seed");
+        write_bytes_atomic(&path, b"new", Durability::Contents).expect("replace");
+        assert_eq!(fs::read(&path).expect("read back"), b"new");
+        assert!(temp_leftovers(dir.path()).is_empty());
+    }
+
+    /// The public byte API creates a file that did not exist (its parent does).
+    #[test]
+    fn write_bytes_atomic_creates_a_new_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("fresh.webp");
+        write_bytes_atomic(&path, b"\x00\x01binary", Durability::ContentsAndDirectory).expect("create");
+        assert_eq!(fs::read(&path).expect("read back"), b"\x00\x01binary");
+        assert!(temp_leftovers(dir.path()).is_empty());
+    }
+
+    /// A missing parent directory is an error; nothing is created, no temp is left.
+    #[test]
+    fn write_bytes_atomic_requires_an_existing_parent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("missing");
+        let path = missing.join("image.png");
+        let err = write_bytes_atomic(&path, b"bytes", Durability::Contents).expect_err("a missing parent must fail");
+        assert!(matches!(err, AtomicWriteError::TempWrite { .. }), "{err:?}");
+        assert!(!missing.exists(), "the parent must not be created");
+        assert!(temp_leftovers(dir.path()).is_empty());
+    }
+
+    /// A failed rename (the target is a directory) leaves the old entry intact and removes
+    /// the temp file.
+    #[test]
+    fn write_bytes_atomic_failure_keeps_the_old_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("image.png");
+        fs::create_dir(&path).expect("target directory");
+        let marker = path.join("keep.txt");
+        fs::write(&marker, b"old").expect("seed marker");
+        let err = write_bytes_atomic(&path, b"new", Durability::Contents).expect_err("renaming over a directory must fail");
+        assert!(matches!(err, AtomicWriteError::Rename { .. }), "{err:?}");
+        assert!(path.is_dir(), "the old entry must survive");
+        assert_eq!(fs::read(&marker).expect("read marker"), b"old");
+        assert!(temp_leftovers(dir.path()).is_empty(), "the temp must be removed");
     }
 }

@@ -11,6 +11,10 @@ Main items:
   `Bubble` stores per-bubble placement plus optional `bubble_class`
   (`text`/`image`) and optional `bubble_type` (`default`/`aside`/`on_top`) for text display.
 - `CanvasSettings` stores editable/readonly default bubble display types.
+- `SessionKind` (`Project` / `SingleImage(Arc<SingleImageSession>)`), `SingleImageSession`,
+  `SourceImageFormat`: the session a `ProjectData` belongs to (field `session`; every load sets
+  `Project`, `single_image::open_single_image` sets `SingleImage`). Compiled on every target;
+  the native-only scratch / prepare code lives in `single_image.rs`.
 - `ProjectData::load`: discovers project/title paths, loads pages, bubbles and settings. Before
   any reconcile/normalize pass it calls `page_ops::recover_pending_page_op` so an interrupted
   structural page operation (journaled transaction, see `crates/ms-page-ops/`) is rolled forward or
@@ -86,6 +90,12 @@ use ms_page_ops::clean_binding::{classify_clean_fit, clean_overlay_file_name, Cl
 // projects root), not the `ms_storage` seam — see the note in `MODULE_README.md`.
 pub mod project_scan;
 pub mod save_merge;
+// Single-image mode: the throwaway scratch chapter (reserve / sweep / remove) and the
+// prepare step that turns one picture file into that chapter. Native only (D10 of the
+// single-image plan): it needs the OS temp dir and file locks; the session TYPES below
+// compile everywhere so `ProjectData` keeps one shape on every target.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod single_image;
 pub mod storage_mode;
 
 use anyhow::{Context, Result};
@@ -261,6 +271,89 @@ impl Default for CanvasSettings {
 }
 
 
+/// What kind of editing session a [`ProjectData`] belongs to. Set ONLY by explicit
+/// construction: every `ProjectData::load*` yields `Project`, and the single-image open path
+/// (`single_image::open_single_image`) overwrites it with `SingleImage`. Never inferred from
+/// paths. Every UI branch of the single-image mode keys on this value.
+#[derive(Debug, Clone, Default)]
+pub enum SessionKind {
+    /// A regular chapter of a title on disk.
+    #[default]
+    Project,
+    /// One picture file edited through a hidden scratch chapter; the user's file is written
+    /// only by an explicit Save / Save As.
+    SingleImage(Arc<SingleImageSession>),
+}
+
+/// The image format of a single-image source, detected from the file CONTENT (falling back
+/// to the extension only for formats without a signature, i.e. TGA). Exactly the readable
+/// types of `ms_config::single_image::INPUT_FILE_TYPES`.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum SourceImageFormat {
+    Png,
+    Jpeg,
+    WebP,
+    Gif,
+    Bmp,
+    Tiff,
+    Tga,
+    Qoi,
+}
+
+impl SourceImageFormat {
+    /// Stable lowercase name for logs and technical messages (not user-facing text).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+            Self::WebP => "webp",
+            Self::Gif => "gif",
+            Self::Bmp => "bmp",
+            Self::Tiff => "tiff",
+            Self::Tga => "tga",
+            Self::Qoi => "qoi",
+        }
+    }
+}
+
+/// Facts about the picture a single-image session edits, captured once when it is opened.
+/// Shared read-only (`Arc`) by every consumer of [`SessionKind::SingleImage`].
+#[derive(Clone)]
+pub struct SingleImageSession {
+    /// Absolute path of the file as the user opened it (symlinks NOT resolved).
+    pub source_path: PathBuf,
+    /// Format detected from the file content.
+    pub source_format: SourceImageFormat,
+    /// `false` when the file extension names a different format than the content.
+    pub extension_matches_content: bool,
+    /// The source holds more than one frame (APNG, animated WebP, multi-frame GIF); only the
+    /// first frame was opened, so an in-place save must not replace the animation.
+    pub source_animated: bool,
+    /// An EXIF orientation other than "no transform" was baked into the opened pixels.
+    pub exif_orientation_applied: bool,
+    /// The embedded ICC profile, re-embedded on save (pixels are never colour converted).
+    pub icc_profile: Option<Vec<u8>>,
+    /// Session root of the scratch directory backing this session.
+    pub scratch_root: PathBuf,
+}
+
+// Manual `Debug`: an ICC profile can be hundreds of KiB and is never dumped into logs;
+// only its presence and length are shown.
+impl std::fmt::Debug for SingleImageSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleImageSession")
+            .field("source_path", &self.source_path)
+            .field("source_format", &self.source_format)
+            .field("extension_matches_content", &self.extension_matches_content)
+            .field("source_animated", &self.source_animated)
+            .field("exif_orientation_applied", &self.exif_orientation_applied)
+            .field("icc_profile_len", &self.icc_profile.as_ref().map(Vec::len))
+            .field("scratch_root", &self.scratch_root)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProjectData {
     pub project_dir: PathBuf,
@@ -273,10 +366,38 @@ pub struct ProjectData {
     pub canvas_settings: CanvasSettings,
     #[allow(dead_code)]
     pub settings_data: Value,
+    /// Project chapter or single-image session; see [`SessionKind`] for who sets it.
+    pub session: SessionKind,
 }
 
 #[allow(dead_code)]
 impl ProjectData {
+    /// The kind of session this data belongs to.
+    #[must_use]
+    pub fn session(&self) -> &SessionKind {
+        &self.session
+    }
+
+    /// `true` when this data backs a single-image session (a scratch chapter).
+    #[must_use]
+    pub fn is_single_image(&self) -> bool {
+        matches!(self.session, SessionKind::SingleImage(_))
+    }
+
+    /// The directory the user thinks of as "where this lives": the chapter directory of a
+    /// project, or the folder containing the opened image in single-image mode (never the
+    /// scratch directory). Used as the starting folder of file dialogs.
+    #[must_use]
+    pub fn user_facing_dir(&self) -> PathBuf {
+        match &self.session {
+            SessionKind::Project => self.project_dir.clone(),
+            SessionKind::SingleImage(session) => session
+                .source_path
+                .parent()
+                .map_or_else(|| self.project_dir.clone(), Path::to_path_buf),
+        }
+    }
+
     /// Normal load: bubbles are read from the main chapter folder.
     pub fn load(project_dir: &Path, user_settings: &Value) -> Result<Self> {
         Self::load_internal(project_dir, user_settings, false)
@@ -463,6 +584,9 @@ impl ProjectData {
             comic_type,
             canvas_settings,
             settings_data: settings_cfg.data,
+            // A load always describes a project chapter; the single-image open path
+            // overwrites this after loading its scratch chapter.
+            session: SessionKind::Project,
         })
     }
 

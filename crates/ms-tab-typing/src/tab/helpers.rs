@@ -268,6 +268,10 @@ pub(super) fn text_runtime_from_doc_node(
         center_page_px,
         mask_clip_enabled,
         layer_idx,
+        // Doc-only composite metadata: like `extra`, assigned by `sync_from_doc` right after this
+        // call; the defaults (ungrouped, visible) are what a node without them composites as.
+        group_uid: None,
+        visible: true,
         user_scale,
         angle_deg,
         deform_mesh,
@@ -298,6 +302,10 @@ pub(super) fn runtime_from_decoded(entry: TypingOverlayDecoded) -> TypingOverlay
         center_page_px: entry.center_page_px,
         mask_clip_enabled: entry.mask_clip_enabled,
         layer_idx: entry.layer_idx,
+        // Legacy `text_info.json` carries no PS group or visibility; the doc projection
+        // (`sync_from_doc`) owns both, and `merge_loaded_overlays` keeps an already projected value.
+        group_uid: None,
+        visible: true,
         user_scale: entry.user_scale,
         angle_deg: entry.angle_deg,
         deform_mesh: entry.deform_mesh,
@@ -339,6 +347,11 @@ pub(super) fn merge_loaded_overlays(
             .position(|o| o.uid == runtime.uid && o.page_idx == runtime.page_idx);
         match idx {
             Some(i) => {
+                // The PS group and visibility are doc-owned (`sync_from_doc`), never in the legacy
+                // entry: keep the projected values instead of resetting them to the defaults.
+                let mut runtime = runtime;
+                runtime.group_uid = existing[i].group_uid.take();
+                runtime.visible = existing[i].visible;
                 existing[i] = runtime;
                 touched.push(i);
             }

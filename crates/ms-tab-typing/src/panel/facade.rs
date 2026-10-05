@@ -281,6 +281,7 @@ impl TypingTopPanelState {
             clean_overlays_visible: self.clean_overlays_visible,
             strict_pixel_movement: self.strict_pixel_movement,
             export_default_dir: self.export_default_dir.as_deref(),
+            single_image: self.single_image,
             export_status: &self.export_status,
             export_format: self.export_format,
             comic_type: self.export_comic_type,
@@ -660,6 +661,13 @@ impl TypingTopPanelState {
 
     pub(crate) fn set_export_default_dir(&mut self, path: PathBuf) {
         self.export_default_dir = Some(path);
+    }
+
+    /// Pushes whether the open session is a single-image session. Mirrors
+    /// [`Self::set_export_default_dir`]: called every frame from `TypingTabState::draw`; while set,
+    /// the actions tab hides every project-export control.
+    pub(crate) fn set_single_image_mode(&mut self, single_image: bool) {
+        self.single_image = single_image;
     }
 
     /// Pushes the per-frame export context of the OPEN title into the panel.

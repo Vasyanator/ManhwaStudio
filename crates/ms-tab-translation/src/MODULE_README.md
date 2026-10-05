@@ -359,6 +359,16 @@ is an author note addressed to the translator, not a replica.
   into `RunFailed`. Logging must never include API keys or image binary contents.
 - Shared model locks must be short-lived and released before image decoding, HTTP calls,
   composition/export, storage I/O, or callbacks.
+- Single-image session (`ProjectData::is_single_image`: one picture edited through a scratch
+  chapter that is deleted on exit, no title): the tab reads no title document and offers nothing
+  that only lives in the scratch. Text-detection storage is off (`text_detection_storage_available`:
+  no lazy load, no «Сохранить» button via `TextDetectorPanelView::storage_available`); the
+  character roster is not read (`character_roster_available`: empty roster, no mtime probe); the
+  MT notes / characters / terms toggles are hidden (`draw_machine_translation_panel`'s
+  `project_context_available`) AND ignored by the prompt (`project_context_sources`), so their
+  persisted values stay untouched; the composed-text export dialog starts in
+  `ProjectData::user_facing_dir`, never in the scratch. Every file dialog of this crate that sets a
+  starting directory must use `user_facing_dir`.
 
 ## Editing map
 - To change top-level translation UI routing, canvas overlays/hooks, OCR selection behavior,

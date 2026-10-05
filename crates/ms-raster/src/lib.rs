@@ -14,6 +14,8 @@ Exports:
 - `upscale_replicate` / `downscale_box`: integer-factor pixel replication and box-average
   downscale of interleaved 1..=4-channel `u8` rasters; an exact (bit-for-bit) inverse pair.
 - `box_blur_u8`: clamp-to-edge separable box blur of a single-channel `u8` plane, O(w*h).
+- `rgba_over_white_to_rgb`: straight RGBA8 composited over opaque white into RGB8 (PDF image
+  streams, JPEG saves).
 - `RasterError`: the typed buffer-shape / parameter error.
 
 Notes:
@@ -24,12 +26,14 @@ Level 0 crate: std + `thiserror` only, GUI-free and wasm-safe. Callers own outpu
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
 
+mod alpha;
 mod blur;
 mod morph;
 mod otsu;
 mod polygon;
 mod scale;
 
+pub use alpha::rgba_over_white_to_rgb;
 pub use blur::box_blur_u8;
 pub use morph::dilate_square;
 pub use otsu::otsu_threshold;
@@ -97,6 +101,14 @@ pub enum RasterError {
         channels: usize,
         /// The scale factor.
         factor: usize,
+    },
+    /// An interleaved buffer of unknown size is not a whole number of `channels`-byte pixels.
+    #[error("raster buffer length {len} is not a whole number of {channels}-byte pixels")]
+    NotWholePixels {
+        /// Actual buffer length in bytes.
+        len: usize,
+        /// Bytes per pixel the primitive expects.
+        channels: usize,
     },
     /// The blur radius is so large that the exact window sum does not fit in `u64`.
     #[error("blur radius {radius} is too large")]

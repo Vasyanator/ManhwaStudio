@@ -55,6 +55,16 @@ joined onto a chapter or title directory.
   caller-injected per-page layer merge (`ms-models` sits above this crate, so the binary passes
   `persist::merge_unsaved_layers_into_committed` as a closure), then removes the staging dir.
   Native `std::fs`, blocking, worker thread only; errors are localized `app.merge.*` texts.
+- `single_image.rs` (native only, tests in `single_image_tests.rs`): the storage side of the
+  single-image mode. `SingleImageScratch` reserves a session root under a base dir
+  (`ms_config::single_image::scratch_base()` in production) as create_dir -> lock `.lock` ->
+  write `.ms-single-image` marker; `sweep_stale_sessions` deletes only MARKED roots whose lock
+  it can acquire; `prepare_session` decodes the user's picture (format from content, TGA by
+  extension; EXIF orientation baked in; ICC kept in the session; animated sources open their
+  first frame) into `<root>/title/chapter/src/000.png` and seeds `comic_type = pages`;
+  `open_single_image` = prepare + the regular `ProjectData::load` on that chapter + `session`
+  set. Uses `std::fs` directly like `project_scan.rs`. Errors are `SingleImageError`
+  (`user_message()` localized `project.single_image.*_error`, `Display` technical).
 - `storage_mode.rs`: the Dev/Prod storage-mode conversion driver (`convert_globals`):
   (a) persists `General.storage_mode` in user_config's current format and switches the
   docstore default, (b) converts `fonts_data`/`presets`, (c) the five title-level documents of
@@ -67,6 +77,13 @@ joined onto a chapter or title directory.
   JPEG->PNG magic-byte conversion, and the filesystem helpers the load uses.
 
 ## Contracts and invariants
+- **Session kind is explicit.** `ProjectData::session` is `SessionKind::Project` after every
+  load; only `single_image::open_single_image` sets `SingleImage`. Never infer it from paths.
+- **Single-image mode never writes the user's file or folder** here: everything goes into the
+  scratch root; the source is only read. `SingleImageScratch`'s `Drop` does no I/O (a crash or
+  plain drop leaves the root for the next sweep); `remove()` is a blocking recursive delete,
+  never on the GUI thread. A sweep never touches an entry without the marker, and drops its
+  probe lock handle before deleting (Windows).
 - **Journal first.** `load_internal` calls `ms_page_ops::recover_pending_page_op`
   before ANY reconcile or normalize pass. Until the journal is resolved the page-op
   transaction owns the page keying of every artifact, so a reconcile pass running
@@ -103,6 +120,8 @@ joined onto a chapter or title directory.
   policy owned here, the binding rule is not.
 
 ## Editing map
+- To change the single-image scratch layout, accepted input formats or the prepare step, see
+  `single_image.rs` (the readable-types table itself is `ms_config::single_image`).
 - To change the chapter file layout, edit `ProjectPaths` in
   `crates/ms-page-ops/src/lib.rs` and the constants in `ms-config` — not here.
 - To change what a load reconciles or normalizes, see `reconcile_clean_layers_dir`,

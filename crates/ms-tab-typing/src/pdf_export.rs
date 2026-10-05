@@ -30,7 +30,8 @@ Key structures:
 Key functions:
 - TypingPdfBuilder::push_page(), TypingPdfBuilder::finish()
 - page_box_pt() — pixel dimensions to page box, including the 14400 pt clamp.
-- append_rgb_over_white() / composite_component_over_white() — RGBA to RGB over white.
+- compress_rgb_over_white() — RGBA over white (`ms_raster::rgba_over_white_to_rgb`, the single
+  owner of that rule) streamed row by row into the zlib image stream.
 
 Notes:
 Object numbering is owned entirely by the builder (catalog = 1, page tree = 2, then three
@@ -93,6 +94,11 @@ pub(crate) enum PdfExportError {
     /// The zlib encoder behind the `/FlateDecode` image stream failed.
     #[error("cannot compress the image stream of a {width}x{height} px page: {source}")]
     Compression { width: u32, height: u32, #[source] source: std::io::Error },
+    /// Flattening a row over white rejected its length. Unreachable after `push_page`'s length
+    /// validation (every row is `width * 4` bytes); typed so the shared primitive's error is
+    /// never discarded.
+    #[error("cannot flatten a row of a {width}x{height} px page over white: {source}")]
+    Composite { width: u32, height: u32, #[source] source: ms_raster::RasterError },
     /// [`TypingPdfBuilder::finish`] was called before any page was pushed.
     #[error("cannot write a PDF with no pages")]
     NoPages,
@@ -151,7 +157,8 @@ impl TypingPdfBuilder {
     /// [`PdfExportError::BufferLength`] when `rgba.len()` does not match the dimensions;
     /// [`PdfExportError::PageTooLarge`] when the page cannot be addressed on this target;
     /// [`PdfExportError::TooManyPages`] when the object numbering is exhausted;
-    /// [`PdfExportError::Compression`] when the zlib encoder fails.
+    /// [`PdfExportError::Compression`] when the zlib encoder fails;
+    /// [`PdfExportError::Composite`] never in practice (rows are whole pixels after validation).
     pub(crate) fn push_page(&mut self, rgba: &[u8], width_px: u32, height_px: u32) -> Result<(), PdfExportError> {
         if width_px == 0 || height_px == 0 { return Err(PdfExportError::ZeroSizedPage { width: width_px, height: height_px }); }
 
@@ -172,7 +179,7 @@ impl TypingPdfBuilder {
         let page_count = i32::try_from(self.page_ids.len()).map_err(|_| PdfExportError::TooManyPages { max: MAX_PAGES })?;
         if page_count >= MAX_PAGES { return Err(PdfExportError::TooManyPages { max: MAX_PAGES }); }
 
-        let stream = compress_rgb_over_white(rgba, row_rgba_len).map_err(|source| PdfExportError::Compression { width: width_px, height: height_px, source })?;
+        let stream = compress_rgb_over_white(rgba, row_rgba_len, width_px, height_px)?;
 
         let page_id = Ref::new(self.next_object_id);
         let image_id = Ref::new(self.next_object_id + 1);
@@ -266,45 +273,14 @@ fn page_box_pt(width_px: u32, height_px: u32) -> PageBoxPt {
 #[must_use]
 fn pt_to_f32(pt: f64) -> f32 { pt as f32 }
 
-/// Composites one straight-RGBA8 span over opaque white and appends it to `dst` as RGB8.
-///
-/// `rgba` must be a whole number of 4-byte pixels; a trailing partial pixel is ignored, which
-/// cannot happen for callers inside this module because `push_page` validates the buffer
-/// length first.
-fn append_rgb_over_white(rgba: &[u8], dst: &mut Vec<u8>) {
-    for pixel in rgba.chunks_exact(4) {
-        // Indexing is safe: `chunks_exact(4)` yields slices of exactly four bytes.
-        let alpha = pixel[3];
-        dst.push(composite_component_over_white(pixel[0], alpha));
-        dst.push(composite_component_over_white(pixel[1], alpha));
-        dst.push(composite_component_over_white(pixel[2], alpha));
-    }
-}
-
-/// Composites one 8-bit colour component over an opaque WHITE backdrop.
-///
-/// Returns `round(component * alpha / 255 + 255 * (255 - alpha) / 255)`, evaluated in integer
-/// arithmetic.
-///
-/// White, not black and not "drop the alpha": a PDF page has no transparency backdrop of its
-/// own — anything the content stream does not paint is simply the paper, which every viewer
-/// and every printer shows as white. Compositing over black (or discarding alpha outright)
-/// would ring every antialiased glyph edge and every soft glow with a dark fringe.
-#[must_use]
-fn composite_component_over_white(component: u8, alpha: u8) -> u8 {
-    let alpha = u32::from(alpha);
-    // Largest possible numerator is 255 * 255 = 65025, so u32 cannot overflow; `+ 127` makes
-    // the division by 255 round to nearest instead of truncating.
-    let weighted = u32::from(component) * alpha + 255 * (255 - alpha);
-    let rounded = (weighted + 127) / 255;
-    // `rounded` is provably <= 255; the fallback exists only to keep this path panic-free.
-    u8::try_from(rounded).unwrap_or(u8::MAX)
-}
-
 /// Composites `rgba` over white and returns the zlib-compressed RGB8 samples for a
 /// `/FlateDecode` image stream.
 ///
-/// `row_rgba_len` is the source stride in bytes (`width * 4`) and must divide `rgba.len()`.
+/// `row_rgba_len` is the source stride in bytes (`width * 4`) and must divide `rgba.len()`;
+/// `width_px` / `height_px` only label errors. Each pixel follows
+/// `ms_raster::rgba_over_white_to_rgb`: white, not black and not "drop the alpha", because a PDF
+/// page has no transparency backdrop of its own — unpainted area is the paper, which viewers and
+/// printers show as white, so any other choice rings antialiased glyph edges with a dark fringe.
 ///
 /// LOSSLESS ON PURPOSE — do not "optimize" this into a JPEG (`/DCTDecode`). These pages are the
 /// output of a typesetting program: hard strokes, outlines and glows over flat fills are
@@ -315,17 +291,19 @@ fn composite_component_over_white(component: u8, alpha: u8) -> u8 {
 /// single row rather than a full RGB copy of the page (96 MB for an 800x40000 px page).
 ///
 /// # Errors
-/// Propagates the zlib encoder's `io::Error`. The sink is an in-memory `Vec`, so in practice
-/// this only fires on allocation failure.
-fn compress_rgb_over_white(rgba: &[u8], row_rgba_len: usize) -> std::io::Result<Vec<u8>> {
+/// [`PdfExportError::Compression`] wraps the zlib encoder's `io::Error`; the sink is an
+/// in-memory `Vec`, so in practice this only fires on allocation failure.
+/// [`PdfExportError::Composite`] when a row is not a whole number of RGBA pixels.
+fn compress_rgb_over_white(rgba: &[u8], row_rgba_len: usize, width_px: u32, height_px: u32) -> Result<Vec<u8>, PdfExportError> {
+    let compression = |source| PdfExportError::Compression { width: width_px, height: height_px, source };
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     let mut row_rgb: Vec<u8> = Vec::with_capacity(row_rgba_len / 4 * 3);
     for row in rgba.chunks_exact(row_rgba_len) {
         row_rgb.clear();
-        append_rgb_over_white(row, &mut row_rgb);
-        encoder.write_all(&row_rgb)?;
+        ms_raster::rgba_over_white_to_rgb(row, &mut row_rgb).map_err(|source| PdfExportError::Composite { width: width_px, height: height_px, source })?;
+        encoder.write_all(&row_rgb).map_err(compression)?;
     }
-    encoder.finish()
+    encoder.finish().map_err(compression)
 }
 
 #[cfg(test)]
@@ -438,35 +416,12 @@ mod tests {
     }
 
     #[test]
-    fn alpha_is_composited_over_white() {
-        // Opaque pixels pass through untouched.
-        let mut opaque = Vec::new();
-        append_rgb_over_white(&[10, 20, 30, 255], &mut opaque);
-        assert_eq!(opaque, vec![10, 20, 30]);
-
-        // Fully transparent pixels become paper white.
-        let mut clear = Vec::new();
-        append_rgb_over_white(&[10, 20, 30, 0], &mut clear);
-        assert_eq!(clear, vec![255, 255, 255]);
-
-        // Half-transparent red: red stays saturated, the other channels rise halfway to white.
-        let mut half = Vec::new();
-        append_rgb_over_white(&[255, 0, 0, 128], &mut half);
-        assert_eq!(half, vec![255, 127, 127]);
-
-        // Two pixels in one call keep their order.
-        let mut pair = Vec::new();
-        append_rgb_over_white(&[0, 0, 0, 255, 255, 255, 255, 0], &mut pair);
-        assert_eq!(pair, vec![0, 0, 0, 255, 255, 255]);
-    }
-
-    #[test]
     fn compressed_stream_round_trips_to_rgb_over_white() {
         use std::io::Read;
 
         // Two rows of two pixels, mixing opacities so the row loop is actually exercised.
         let rgba: Vec<u8> = vec![255, 0, 0, 255, 0, 255, 0, 0, 0, 0, 255, 128, 9, 9, 9, 255];
-        let compressed = compress_rgb_over_white(&rgba, 8).unwrap_or_default();
+        let compressed = compress_rgb_over_white(&rgba, 8, 2, 2).unwrap_or_default();
         let mut decoded = Vec::new();
         let read = flate2::read::ZlibDecoder::new(compressed.as_slice()).read_to_end(&mut decoded);
         assert!(read.is_ok(), "the emitted stream must be valid zlib");

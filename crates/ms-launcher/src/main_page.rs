@@ -9,6 +9,8 @@ Main responsibilities:
 - keep the button grid and footer layout isolated from runtime logic;
 - show installer-mode notices from `General.ai_install_type` under the main menu;
 - show the storage-mode conversion status line (progress, then a dismissable failure notice);
+- offer the native-only small "Open image" button (single-image mode), placed over the
+  title -> grid gap without taking layout space, and its picking status;
 - render the central UI card on top of the blur layer with the same button/status composition as launcher.py.
 */
 
@@ -25,6 +27,9 @@ const LEFT_COLUMN_BUTTON_WIDTH: f32 = 210.0;
 const RIGHT_COLUMN_BUTTON_WIDTH: f32 = 190.0;
 const BUTTON_HEIGHT: f32 = 42.0;
 const MENU_BLOCK_LEFT_OFFSET: f32 = 12.0;
+/// Vertical gap between the small "Open image" button and the "Open chapter" button below it.
+#[cfg(not(target_arch = "wasm32"))]
+const OPEN_IMAGE_BUTTON_GAP: f32 = 2.0;
 const IMPORT_POPUP_GAP: f32 = 10.0;
 const IMPORT_POPUP_WIDTH: f32 = 178.0;
 const UPDATE_NOTICE_WIDTH: f32 = 310.0;
@@ -38,6 +43,8 @@ const AI_INSTALL_NOTICE_MAX_HEIGHT: f32 = 96.0;
 pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
     let mut action = None;
     let mut import_button_rect = None;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut open_button_rect = None;
     let viewport = ui.max_rect();
     let menu_top_space = menu_top_space(viewport.height(), app.update_notification.is_some());
     ui.with_layout(Layout::top_down(Align::Center), |ui| {
@@ -47,7 +54,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
             ui.set_width(460.0);
             ui.vertical_centered(|ui| {
                 #[cfg(not(target_arch = "wasm32"))]
-                ui.label(theme::hero_title("ManhwaStudio"));
+                let title_rect = ui.label(theme::hero_title("ManhwaStudio")).rect;
                 #[cfg(target_arch = "wasm32")]
                 ui.label(theme::hero_title(t!("launcher.main.web_demo_title")));
                 ui.add_space(8.0);
@@ -67,7 +74,11 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                                 t!("launcher.main.open_chapter_button"),
                                 LEFT_COLUMN_BUTTON_WIDTH,
                             );
-                                            #[cfg(feature = "tutorial")]
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                open_button_rect = Some(open_response.rect);
+                            }
+                            #[cfg(feature = "tutorial")]
                             app.tutorial.mark(tutorial::TARGET_OPEN, open_response.rect);
                             if open_response.clicked() {
                                 app.state.import_popup_open = false;
@@ -112,13 +123,34 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                             }
                             ui.end_row();
 
-                            if let Some(message) = app.state.main_page_message.as_deref() {
+                            // A pending "Open image" pick owns the status slot, so another
+                            // button clearing `main_page_message` cannot hide it.
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let picking_image = app.open_image_pick_active();
+                            #[cfg(target_arch = "wasm32")]
+                            let picking_image = false;
+                            if picking_image {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.colored_label(theme::TEXT_MUTED, t!("launcher.main.open_image_picking_status"));
+                                });
+                                ui.label("");
+                                ui.end_row();
+                            } else if let Some(message) = app.state.main_page_message.as_deref() {
                                 ui.colored_label(theme::TEXT_MUTED, message);
                                 ui.label("");
                                 ui.end_row();
                             }
                         });
                 });
+                // Single-image mode has no web entry point (plan D10): no button on wasm.
+                #[cfg(not(target_arch = "wasm32"))]
+                if let Some(open_rect) = open_button_rect
+                    && show_open_image_button(ui, title_rect, open_rect, !app.open_image_pick_active()).clicked()
+                {
+                    app.state.import_popup_open = false;
+                    app.start_open_image_pick();
+                }
                 ui.add_space(12.0);
                 let settings_response =
                     menu_button_response(ui, t!("launcher.main.settings_button"), RIGHT_COLUMN_BUTTON_WIDTH);
@@ -326,6 +358,30 @@ fn show_update_notice(
         });
 
     action
+}
+
+/// Draws the small "Open image" button in the gap between the hero title (`title_rect`) and
+/// the "Open chapter" grid button (`open_rect`): horizontally centred on `open_rect`, bottom
+/// `OPEN_IMAGE_BUTTON_GAP` above its top.
+///
+/// The button lives in a `Ui::new_child`, which allocates no space in the parent
+/// (egui-0.36.2/src/ui.rs:209): the card's cursor, its size and the title -> grid distance are
+/// exactly those of the layout without the button. The gap is 24 pt (item spacing 12 + the
+/// 8 + 4 spaces under the title) and the small button is about 18 pt tall, so it fits between
+/// the title's rect and the grid without overlapping either.
+#[cfg(not(target_arch = "wasm32"))]
+fn show_open_image_button(ui: &mut Ui, title_rect: egui::Rect, open_rect: egui::Rect, enabled: bool) -> egui::Response {
+    let band = egui::Rect::from_min_max(
+        egui::pos2(open_rect.left(), title_rect.bottom()),
+        egui::pos2(open_rect.right(), open_rect.top() - OPEN_IMAGE_BUTTON_GAP),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("launcher_open_image_button")
+            .max_rect(band)
+            .layout(Layout::bottom_up(Align::Center)),
+    );
+    theme::launcher_button_small(&mut child, t!("launcher.main.open_image_button"), enabled)
 }
 
 /// A main-menu button of the given width. Returns the full `Response` so the

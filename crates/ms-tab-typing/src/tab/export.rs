@@ -8,6 +8,12 @@ writing the result, plus the async export job polling/request methods on
 UV sampling, textured-triangle rasterization, source-over blending, clean-overlay snapshot
 loading, mask sampling).
 
+Page flatten = `resolve_flatten_input` (worker I/O: page decode, the on-screen snapshot or the
+`layers.json` disk fallback) + the pure `flatten_page_rgba` over a `FlattenPageInput`, whose order,
+visibility and PS group fold come from `ms_models::layer_model::ordering::composite_plan`.
+`flatten_typing_export_page_rgba` chains the two for the PNG / PDF / PSD exports. Jobs are built per
+page by `TypingTextOverlayLayer::build_page_job` (residency, raster + overlay snapshots, bands, groups).
+
 Two pipelines, chosen by `resolve_export_route` from the request's format + destination:
 - ONE-TO-ONE (`Png`/`Psd`, no re-pagination): the historical streaming worker pool. Each
   worker composes, encodes and WRITES one page, so no composed page outlives its worker
@@ -31,15 +37,13 @@ gate the saver holds enqueued writes, and the page flatten can fall back to the 
 */
 
 use super::*;
-// `write_image` is a `PngEncoder` method from this trait; needed for the in-memory
-// PNG encode that replaces `image::save_buffer`/`fs::write` on the storage seam.
-use image::ImageEncoder;
 use std::collections::BTreeMap;
 use std::num::NonZeroU32;
 use std::sync::Condvar;
 
 use crate::export_repaginate::{RibbonSlicer, TypingRepaginateSettings, group_pages_into_ribbons, repaginated_page_file_name};
 use crate::pdf_export::TypingPdfBuilder;
+use super::doc_layers::{raster_composite_item, text_composite_item};
 use ms_models::clean_assign::{LOADER_CLEAN_SCOPE, PageCleanPaths, PageCleanResolution, probe_page_clean};
 
 /// The checked pairing of an export format with its destination: the ONE place that decides
@@ -793,19 +797,29 @@ pub(super) fn repaginated_output_page_count(sizes: &[(u32, u32)], settings: &Typ
     Ok(total)
 }
 
-/// Encodes a straight RGBA8 page as PNG bytes in memory, with the same default `PngEncoder`
-/// parameters `image::save_buffer` uses for a `.png` path.
+/// Encodes a straight RGBA8 page as PNG bytes in memory through `image_encode::encode_rgba`
+/// (`KeepRgba`, no ICC), which uses the same default `PngEncoder` parameters
+/// `image::save_buffer` uses for a `.png` path, so project export bytes are unchanged.
 ///
 /// `output_path` is only used to name the file in the error message.
 ///
 /// # Errors
-/// `typing.errors.save_page_error` when the encoder rejects the buffer or its dimensions.
+/// `typing.errors.save_page_error` when `rgba` is not exactly `width_px * height_px * 4` bytes
+/// or the encoder rejects the buffer or its dimensions.
 fn encode_export_page_png(rgba: &[u8], width_px: u32, height_px: u32, output_path: &Path) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut buf)
-        .write_image(rgba, width_px, height_px, image::ColorType::Rgba8.into())
-        .map_err(|err| tf!("typing.errors.save_page_error", job = output_path.display(), err = err))?;
-    Ok(buf)
+    let save_error = |err: &dyn std::fmt::Display| tf!("typing.errors.save_page_error", job = output_path.display(), err = err);
+    // Borrowing the page in an `ImageBuffer` view avoids copying it; a short buffer is rejected
+    // here, a long one by `encode_rgba`.
+    let page = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(width_px, height_px, rgba)
+        .ok_or_else(|| save_error(&crate::image_encode::EncodeError::BufferLength { width: width_px, height: height_px, len: rgba.len() }))?;
+    let encoding = crate::image_encode::ImageEncoding {
+        format: crate::image_encode::ImageSaveFormat::Png,
+        // Ignored for PNG.
+        jpeg_quality: 100,
+        alpha: crate::image_encode::AlphaPolicy::KeepRgba,
+        icc_profile: None,
+    };
+    crate::image_encode::encode_rgba(&page, &encoding).map_err(|err| save_error(&err))
 }
 
 /// Exports ONE page one-to-one — composes it, encodes it and writes its own file — and returns
@@ -1337,49 +1351,149 @@ impl TypingTextOverlayLayer {
         changed
     }
 
-    /// Builds the per-page text/image overlay export snapshot from the CURRENT `self.overlays`, keyed by
-    /// page and sorted bottom-to-top by unified band-Z (the on-screen draw order). Skips overlays with a
-    /// zero dimension or an RGBA buffer whose length does not match `w*h*4`.
+    /// Builds the text/image overlay export snapshot of ONE page from the CURRENT `self.overlays`,
+    /// sorted bottom-to-top by unified band-Z (stable: equal Z keeps `self.overlays` order, the
+    /// on-screen tie order). Skips overlays with a zero dimension or an RGBA buffer whose length does
+    /// not match `w*h*4`. Hidden / hidden-group overlays are KEPT here (the PSD writer lists them);
+    /// the flatten omits them through the composite plan.
     ///
-    /// Contract: the caller MUST have made every export page resident first (the Phase 2 preload gate or
-    /// the in-function residency pass), because a page's text overlays for migrated/v3 chapters are
-    /// materialized into `self.overlays` only on load. Snapshotting before that silently drops their text.
-    /// Kept as a small pure helper so the ordering fix is unit-testable without driving the async export.
-    pub(super) fn build_export_overlay_snapshots(
+    /// Contract: the caller MUST have made the page resident first (`ensure_raster_layers_for_page`),
+    /// because a page's text overlays for migrated/v3 chapters are materialized into `self.overlays`
+    /// only on load. Snapshotting before that silently drops their text.
+    pub(super) fn export_overlay_snapshots_for_page(
         &self,
-    ) -> HashMap<usize, Vec<TypingExportOverlaySnapshot>> {
-        let mut overlays_by_page = HashMap::<usize, Vec<TypingExportOverlaySnapshot>>::new();
+        page_idx: usize,
+    ) -> Vec<TypingExportOverlaySnapshot> {
+        let mut snapshots: Vec<TypingExportOverlaySnapshot> = Vec::new();
         for overlay in &self.overlays {
+            if overlay.page_idx != page_idx {
+                continue;
+            }
             if overlay.size_px[0] == 0 || overlay.size_px[1] == 0 {
                 continue;
             }
             if overlay.source_rgba.len() != overlay.size_px[0] * overlay.size_px[1] * 4 {
                 continue;
             }
-            let band_z = self.overlay_band_z(overlay.page_idx, &overlay.uid, overlay.layer_idx);
-            overlays_by_page.entry(overlay.page_idx).or_default().push(
-                TypingExportOverlaySnapshot {
-                    page_idx: overlay.page_idx,
-                    center_page_px: overlay.center_page_px,
-                    mask_clip_enabled: overlay.mask_clip_enabled,
-                    layer_idx: overlay.layer_idx,
-                    user_scale: overlay.user_scale,
-                    angle_deg: overlay.angle_deg,
-                    deform_mesh: overlay.deform_mesh.clone(),
-                    size_px: overlay.size_px,
-                    source_rgba: overlay.source_rgba.clone(),
-                    render_data_json: overlay.render_data_json.clone(),
-                    uid: overlay.uid.clone(),
-                    band_z,
-                },
-            );
+            snapshots.push(TypingExportOverlaySnapshot {
+                page_idx: overlay.page_idx,
+                center_page_px: overlay.center_page_px,
+                mask_clip_enabled: overlay.mask_clip_enabled,
+                layer_idx: overlay.layer_idx,
+                user_scale: overlay.user_scale,
+                angle_deg: overlay.angle_deg,
+                deform_mesh: overlay.deform_mesh.clone(),
+                size_px: overlay.size_px,
+                source_rgba: overlay.source_rgba.clone(),
+                render_data_json: overlay.render_data_json.clone(),
+                uid: overlay.uid.clone(),
+                group_uid: overlay.group_uid.clone(),
+                visible: overlay.visible,
+            });
         }
         // Bottom-to-top by the UNIFIED manual band-Z (same as the on-screen draw order), so the export
-        // stacks text exactly as shown. (Was the old layer_idx + page-Y auto-order.)
-        for (page, overlays) in overlays_by_page.iter_mut() {
-            overlays.sort_by_key(|o| self.overlay_band_z(*page, &o.uid, o.layer_idx));
-        }
-        overlays_by_page
+        // stacks text exactly as shown; `sort_by_key` is stable.
+        snapshots.sort_by_key(|o| self.overlay_band_z(page_idx, &o.uid, o.layer_idx));
+        snapshots
+    }
+
+    /// [`Self::export_overlay_snapshots_for_page`] for every page that has overlays, keyed by page.
+    /// Test-only: the export builds its jobs page by page (`build_page_job`).
+    #[cfg(test)]
+    pub(super) fn build_export_overlay_snapshots(
+        &self,
+    ) -> HashMap<usize, Vec<TypingExportOverlaySnapshot>> {
+        let mut pages: Vec<usize> = self.overlays.iter().map(|o| o.page_idx).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        pages
+            .into_iter()
+            .map(|page_idx| (page_idx, self.export_overlay_snapshots_for_page(page_idx)))
+            .filter(|(_, snapshots)| !snapshots.is_empty())
+            .collect()
+    }
+
+    /// Builds the export job of ONE page from the tab's current projection, or `None` (logged) when
+    /// `page_idx` is not a page of `project`.
+    ///
+    /// Makes the page resident first (`ensure_raster_layers_for_page`, which also materializes its doc
+    /// text into `self.overlays`), then snapshots its on-screen rasters (post-effects display RGBA,
+    /// in-session transform / deform, uid, PS group), its overlays
+    /// ([`Self::export_overlay_snapshots_for_page`]) and its `bands_by_page` / `groups_by_page`, so the
+    /// flatten composites exactly what the canvas projection holds. Side-effect-free for the user:
+    /// projecting a page may resolve `pending_select_raster_uid` and move the selection, so the
+    /// selection is restored before returning. GUI thread, but no I/O beyond what the residency pass
+    /// itself does. `output_path` is the page's own output file on a one-to-one route, else `None`.
+    pub(super) fn build_page_job(
+        &mut self,
+        project: &ProjectData,
+        page_idx: usize,
+        output_path: Option<PathBuf>,
+        mask: Option<TypingMaskExportPage>,
+        export_format: TypingExportFormat,
+        font_post_script_names: crate::psd_export::FontPostScriptNames,
+    ) -> Option<TypingExportPageJob> {
+        let Some(page) = project.pages.iter().find(|page| page.idx == page_idx) else {
+            ms_log::runtime_log::log_warn(format!(
+                "[typing] export: page {page_idx} is not a page of the open project; no job built"
+            ));
+            return None;
+        };
+        let saved_selected_raster = self.selected_raster_idx;
+        let saved_selected_raster_page = self.selected_raster_page;
+        let saved_selected_overlay = self.selected_overlay_idx;
+        let saved_pending_select = self.pending_select_raster_uid.clone();
+
+        self.ensure_raster_layers_for_page(page_idx);
+        let rasters: Vec<TypingExportRasterSnapshot> = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .map(|layers| {
+                layers
+                    .iter()
+                    .map(|l| TypingExportRasterSnapshot {
+                        uid: l.uid.clone(),
+                        group_uid: l.group_uid.clone(),
+                        visible: l.visible,
+                        opacity: l.opacity,
+                        transform: l.transform,
+                        deform: l.deform.clone(),
+                        rgba: color_image_to_rgba(&l.image),
+                        size_px: l.image.size,
+                        mask_clip_enabled: l.mask_clip_enabled,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Restore the selection the projection may have changed (export is side-effect-free).
+        self.selected_raster_idx = saved_selected_raster;
+        self.selected_raster_page = saved_selected_raster_page;
+        self.selected_overlay_idx = saved_selected_overlay;
+        self.pending_select_raster_uid = saved_pending_select;
+
+        // The overlay snapshot comes AFTER the residency pass above (ordering fix): the pass
+        // (`ensure_raster_layers_for_page` -> `sync_from_doc`) MATERIALIZES the doc's text nodes of a
+        // never-visited page into `self.overlays`; snapshotting earlier dropped that text.
+        let overlays = self.export_overlay_snapshots_for_page(page_idx);
+        Some(TypingExportPageJob {
+            page_idx,
+            page_path: page.path.clone(),
+            output_path,
+            // The clean model writer's paths (same stem, including its fallback, as the overlay
+            // loader); pure here, resolved on the export worker.
+            clean_paths: Some(PageCleanPaths::for_writer(&project.paths, page)),
+            clean_overlay_rgba: None,
+            overlays,
+            rasters,
+            bands: self.bands_by_page.get(&page_idx).cloned().unwrap_or_default(),
+            groups: self.groups_by_page.get(&page_idx).cloned().unwrap_or_default(),
+            mask,
+            export_format,
+            layers_primary_dir: self.layers_primary_dir.clone(),
+            layers_fallback_dir: self.layers_fallback_dir.clone(),
+            font_post_script_names,
+        })
     }
 
     /// Dispatches the whole-project export described by `request`.
@@ -1460,57 +1574,11 @@ impl TypingTextOverlayLayer {
             );
         }
 
-        // Snapshot the on-screen PS raster layers PER PAGE from the doc projection, so the export
-        // composites EXACTLY what the canvas shows (post-effects display image, in-session transform /
-        // deform, band-Z) rather than re-reading `layers.json` from disk — which silently dropped rasters
-        // for the user (missing `_fx.png`, unflushed staging, etc.). `ensure_raster_layers_for_page` is
-        // lazy (only visited pages are projected), so project every export page first.
-        // Projecting every page (`ensure_raster_layers_for_page`) resolves `pending_select_raster_uid`
-        // and would mutate the user's current selection. Triggering an export must NOT change selection,
-        // so snapshot and restore it around the projection loop.
-        let saved_selected_raster = self.selected_raster_idx;
-        let saved_selected_raster_page = self.selected_raster_page;
-        let saved_selected_overlay = self.selected_overlay_idx;
-        let saved_pending_select = self.pending_select_raster_uid.clone();
-
-        let mut rasters_by_page = HashMap::<usize, Vec<TypingExportRasterSnapshot>>::new();
-        for page in &project.pages {
-            self.ensure_raster_layers_for_page(page.idx);
-            let Some(layers) = self.raster_layers_by_page.get(&page.idx) else {
-                continue;
-            };
-            if layers.is_empty() {
-                continue;
-            }
-            let snaps: Vec<TypingExportRasterSnapshot> = layers
-                .iter()
-                .map(|l| TypingExportRasterSnapshot {
-                    visible: l.visible,
-                    opacity: l.opacity,
-                    transform: l.transform,
-                    deform: l.deform.clone(),
-                    rgba: color_image_to_rgba(&l.image),
-                    size_px: l.image.size,
-                    band_z: self.raster_band_z(page.idx, &l.uid),
-                    mask_clip_enabled: l.mask_clip_enabled,
-                })
-                .collect();
-            rasters_by_page.insert(page.idx, snaps);
-        }
-
-        // Restore the selection the projection loop may have changed (export is side-effect-free).
-        self.selected_raster_idx = saved_selected_raster;
-        self.selected_raster_page = saved_selected_raster_page;
-        self.selected_overlay_idx = saved_selected_overlay;
-        self.pending_select_raster_uid = saved_pending_select;
-
-        // Build the text/image overlay snapshot AFTER the residency pass above (ordering fix): the pass
-        // (`ensure_raster_layers_for_page` -> `sync_from_doc`) MATERIALIZES the doc's text nodes for
-        // never-visited pages into `self.overlays`, so snapshotting here — not before the pass — captures
-        // every page's text. Building it earlier dropped text for migrated/v3 pages the user never opened.
-        let mut overlays_by_page = self.build_export_overlay_snapshots();
-
-        let jobs = project
+        // One job per page, each built from the doc projection (`build_page_job`): rasters, text and
+        // bands/groups are snapshotted AFTER that page was made resident, so the export composites
+        // EXACTLY what the canvas projection holds instead of re-reading `layers.json` from disk
+        // (which silently dropped rasters: missing `_fx.png`, unflushed staging, ...).
+        let pages: Vec<(usize, Option<PathBuf>)> = project
             .pages
             .iter()
             .map(|page| {
@@ -1519,22 +1587,20 @@ impl TypingTextOverlayLayer {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("page");
-                TypingExportPageJob {
-                    page_idx: page.idx,
-                    page_path: page.path.clone(),
-                    output_path: per_page_output.as_ref().map(|(dir, ext)| dir.join(format!("{stem}.{ext}"))),
-                    // The clean model writer's paths (same stem, including its fallback, as the
-                    // overlay loader); pure here, resolved on the export worker.
-                    clean_paths: Some(PageCleanPaths::for_writer(&project.paths, page)),
-                    clean_overlay_rgba: None,
-                    overlays: overlays_by_page.remove(&page.idx).unwrap_or_default(),
-                    rasters: rasters_by_page.remove(&page.idx).unwrap_or_default(),
-                    mask: masks_snapshot.get(&page.idx).cloned(),
+                (page.idx, per_page_output.as_ref().map(|(dir, ext)| dir.join(format!("{stem}.{ext}"))))
+            })
+            .collect();
+        let jobs = pages
+            .into_iter()
+            .filter_map(|(page_idx, output_path)| {
+                self.build_page_job(
+                    project,
+                    page_idx,
+                    output_path,
+                    masks_snapshot.get(&page_idx).cloned(),
                     export_format,
-                    layers_primary_dir: self.layers_primary_dir.clone(),
-                    layers_fallback_dir: self.layers_fallback_dir.clone(),
-                    font_post_script_names: font_post_script_names.clone(),
-                }
+                    font_post_script_names.clone(),
+                )
             })
             .collect::<Vec<_>>();
         let total_pages = jobs.len();
@@ -1577,34 +1643,150 @@ impl TypingTextOverlayLayer {
     }
 }
 
-/// Загружает страницу-источник, накладывает клин и все оверлеи (так же, как делает
-/// PNG-экспорт) и возвращает финальный плоский RGBA8 буфер + размеры страницы.
-/// Используется и PNG-веткой, и PSD-веткой (для composite image_data).
-/// Сравнение оверлеев по порядку наложения (от низа стопки к верху).
-/// Приоритет: меньший `layer_idx` ниже; внутри одного слоя — чем ниже на
-/// картинке (больший `center_y`), тем выше в стопке. Используется и для отрисовки
-/// в редакторе, и для композиции при экспорте, чтобы UI и PNG/PSD совпадали.
-// `overlay_stack_cmp` (the old layer_idx + page-Y auto-order) was retired: text is now ordered by the
-// unified manual band-Z everywhere (draw, interaction, export), like rasters.
+/// Loads the page source, composites its клин, PS rasters and text/image overlays and returns the
+/// flat straight-RGBA8 page with its `(width, height)`. Shared by the PNG, PDF and PSD (composite
+/// image) exports: [`resolve_flatten_input`] (worker I/O) followed by the pure [`flatten_page_rgba`].
+///
+/// # Errors
+/// `typing.errors.open_page_error` when the page source cannot be read or decoded.
 pub(crate) fn flatten_typing_export_page_rgba(
     job: &TypingExportPageJob,
 ) -> Result<(Vec<u8>, usize, usize), String> {
+    let flat = flatten_page_rgba(resolve_flatten_input(job)?);
+    let width = flat.width() as usize;
+    let height = flat.height() as usize;
+    Ok((flat.into_raw(), width, height))
+}
+
+/// Every in-memory input of one page flatten ([`flatten_page_rgba`]): the decoded source plus the
+/// layers to composite over it, borrowed from an export job where possible (no RGBA copies).
+pub(crate) struct FlattenPageInput<'a> {
+    /// Page index: selects the `overlays` of this page and names the page in logs.
+    pub(crate) page_idx: usize,
+    /// The decoded page source, straight RGBA8. It becomes the output buffer.
+    pub(crate) source: image::RgbaImage,
+    /// The page's клин, drawn over the source at the top-left before any layer.
+    pub(crate) clean: Option<&'a image::RgbaImage>,
+    /// PS raster layers in stack order (their input order breaks band-Z ties).
+    pub(crate) rasters: std::borrow::Cow<'a, [TypingExportRasterSnapshot]>,
+    /// Text/image overlays in canonical order (bottom-to-top snapshot order); other pages' entries are
+    /// ignored.
+    pub(crate) overlays: &'a [TypingExportOverlaySnapshot],
+    /// The bands every item's band-Z is looked up in (`ordering::band_z`).
+    pub(crate) bands: std::borrow::Cow<'a, [ms_models::layer_model::ordering::Band]>,
+    /// The PS unified groups folded by the composite plan (visibility + opacity).
+    pub(crate) groups: std::borrow::Cow<'a, [ms_models::layer_model::persist::GroupMeta]>,
+    /// The typing clip mask of the page, for mask-clipped rasters and overlays.
+    pub(crate) mask: Option<&'a TypingMaskExportPage>,
+}
+
+/// Resolves the flatten input of `job` on the export worker: reads and decodes the page source
+/// through the storage seam, and picks the raster / band / group source.
+///
+/// - `job.rasters` non-empty: the on-screen snapshot with the job's in-memory `bands` and `groups`.
+/// - `job.rasters` empty: the disk fallback — rasters and groups from `layers.json`
+///   (`persist::load_page_rasters`; a load failure is reported and yields no rasters) and the bands
+///   from disk (`persist::load_page_bands`), which then also give the OVERLAY band-Z. Without a layers
+///   dir there are no disk bands, so every overlay sits at Z 0 and snapshot order decides. When no
+///   disk groups could be read, the job's in-memory `groups` fold the overlays.
+///
+/// # Errors
+/// `typing.errors.open_page_error` when the page source cannot be read or decoded.
+pub(crate) fn resolve_flatten_input(job: &TypingExportPageJob) -> Result<FlattenPageInput<'_>, String> {
+    use ms_models::layer_model::persist;
+    use std::borrow::Cow;
     let page_path_str = job.page_path.to_string_lossy();
     let page_bytes = ms_storage::global::storage()
         .read(page_path_str.as_ref())
         .map_err(|err| {
             tf!("typing.errors.open_page_error", job = job.page_path.display(), err = err)
         })?;
-    let mut base = image::load_from_memory(&page_bytes)
+    let source = image::load_from_memory(&page_bytes)
         .map_err(|err| {
             tf!("typing.errors.open_page_error", job = job.page_path.display(), err = err)
         })?
         .to_rgba8();
+
+    let (rasters, bands, groups) = if !job.rasters.is_empty() {
+        (Cow::Borrowed(job.rasters.as_slice()), Cow::Borrowed(job.bands.as_slice()), Cow::Borrowed(job.groups.as_slice()))
+    } else if let Some(primary) = job.layers_primary_dir.as_deref() {
+        let fallback = job.layers_fallback_dir.as_deref();
+        let disk_bands = persist::load_page_bands(primary, fallback, job.page_idx);
+        match persist::load_page_rasters(primary, fallback, job.page_idx) {
+            Ok(loaded) => {
+                let rasters: Vec<TypingExportRasterSnapshot> = loaded
+                    .layers
+                    .into_iter()
+                    .map(|l| TypingExportRasterSnapshot {
+                        rgba: l.image.pixels.iter().flat_map(|p| p.to_srgba_unmultiplied()).collect(),
+                        size_px: l.image.size,
+                        uid: l.uid,
+                        group_uid: l.group_uid,
+                        visible: l.visible,
+                        opacity: l.opacity,
+                        transform: l.transform,
+                        deform: l.deform,
+                        mask_clip_enabled: l.mask_clip.unwrap_or(false),
+                    })
+                    .collect();
+                (Cow::Owned(rasters), Cow::Owned(disk_bands), Cow::Owned(loaded.groups))
+            }
+            Err(err) => {
+                eprintln!(
+                    "WARN typing::flatten_export_failed_to_load_rasters page={} err={err}",
+                    job.page_idx
+                );
+                (Cow::Owned(Vec::new()), Cow::Owned(disk_bands), Cow::Borrowed(job.groups.as_slice()))
+            }
+        }
+    } else {
+        (Cow::Owned(Vec::new()), Cow::Owned(Vec::new()), Cow::Borrowed(job.groups.as_slice()))
+    };
+
+    Ok(FlattenPageInput {
+        page_idx: job.page_idx,
+        source,
+        clean: job.clean_overlay_rgba.as_deref(),
+        rasters,
+        overlays: &job.overlays,
+        bands,
+        groups,
+        mask: job.mask.as_ref(),
+    })
+}
+
+/// One composite-plan item of the flatten: an index into `FlattenPageInput::rasters` or `::overlays`.
+#[derive(Clone, Copy)]
+enum FlattenItem {
+    Raster(usize),
+    Overlay(usize),
+}
+
+/// Composites `input` into one flat straight-RGBA8 page (the source buffer, consumed, so no page copy).
+///
+/// Pure: no I/O. Order, visibility and the PS group fold come from `ordering::composite_plan`: rasters
+/// (stack order) and this page's overlays (snapshot order) are planned together, bottom-to-top by
+/// `(band-Z, raster below text)`, an invisible / hidden-group / zero-opacity item is omitted, and each
+/// kept item is drawn with its folded opacity. An effective opacity of 1.0 leaves the item's pixels
+/// untouched (byte-identical to the pre-plan flatten); below 1.0 its alpha is scaled once. A NaN
+/// opacity (item or group) omits the item and is logged once per call.
+pub(crate) fn flatten_page_rgba(input: FlattenPageInput<'_>) -> image::RgbaImage {
+    use ms_models::layer_model::ordering::{CompositeItem, GroupFold, composite_plan};
+    let FlattenPageInput {
+        page_idx,
+        source: mut base,
+        clean,
+        rasters,
+        overlays,
+        bands,
+        groups,
+        mask,
+    } = input;
     let base_w = base.width() as usize;
     let base_h = base.height() as usize;
-    let base_rgba = base.as_mut();
+    let base_rgba: &mut [u8] = &mut base;
 
-    if let Some(clean) = job.clean_overlay_rgba.as_ref() {
+    if let Some(clean) = clean {
         composite_overlay_full_image_over(
             base_rgba,
             [base_w, base_h],
@@ -1613,145 +1795,36 @@ pub(crate) fn flatten_typing_export_page_rgba(
         );
     }
 
-    // PS raster layers to composite, normalized to a common shape (straight RGBA + band-Z). PREFER the
-    // on-screen snapshot taken from the doc projection (`job.rasters`, matching the canvas exactly);
-    // FALL BACK to a disk read of `layers.json` only when no snapshot was provided (back-compat). Then
-    // interleave rasters with text/image overlays in the SAME band-Z order the live canvas uses.
-    use ms_models::layer_model::ordering::Band;
-    use ms_models::layer_model::persist;
-    struct RasterDraw {
-        visible: bool,
-        opacity: f32,
-        transform: ms_models::layer_model::manifest::TransformRec,
-        deform: Option<ms_models::layer_model::manifest::DeformRec>,
-        rgba: Vec<u8>,
-        size_px: [usize; 2],
-        band_z: u32,
-        mask_clip_enabled: bool,
+    // Rasters first, then this page's overlays: the plan's stable sort keeps this input order within
+    // one (band-Z, kind) rank, which is exactly the pre-plan tie rule (raster stack order, snapshot order).
+    let mut slots: Vec<FlattenItem> = Vec::with_capacity(rasters.len() + overlays.len());
+    let mut items: Vec<CompositeItem<'_>> = Vec::with_capacity(rasters.len() + overlays.len());
+    for (i, r) in rasters.iter().enumerate() {
+        slots.push(FlattenItem::Raster(i));
+        items.push(raster_composite_item(&r.uid, r.group_uid.as_deref(), r.visible, r.opacity));
     }
-
-    // On-disk page bands: needed for OVERLAY (text) band-Z in both paths, and for raster band-Z in the
-    // disk-fallback path (the snapshot carries raster band-Z directly).
-    let disk_bands = match job.layers_primary_dir.as_deref() {
-        Some(primary) => {
-            persist::load_page_bands(primary, job.layers_fallback_dir.as_deref(), job.page_idx)
-        }
-        None => Vec::new(),
-    };
-
-    let raster_draws: Vec<RasterDraw> = if !job.rasters.is_empty() {
-        job.rasters
-            .iter()
-            .map(|r| RasterDraw {
-                visible: r.visible,
-                opacity: r.opacity,
-                transform: r.transform,
-                deform: r.deform.clone(),
-                rgba: r.rgba.clone(),
-                size_px: r.size_px,
-                band_z: r.band_z,
-                mask_clip_enabled: r.mask_clip_enabled,
-            })
-            .collect()
-    } else if let Some(primary) = job.layers_primary_dir.as_deref() {
-        let fb = job.layers_fallback_dir.as_deref();
-        let loaded = persist::load_page_rasters(primary, fb, job.page_idx)
-            .unwrap_or_else(|err| {
-                eprintln!(
-                    "WARN typing::flatten_export_failed_to_load_rasters page={} err={err}",
-                    job.page_idx
-                );
-                persist::PageRasters {
-                    groups: Vec::new(),
-                    layers: Vec::new(),
-                }
-            })
-            .layers;
-        let raster_band_z = |uid: &str| -> u32 {
-            for band in &disk_bands {
-                if let Band::Raster { uid: u, z } = band
-                    && u == uid
-                {
-                    return *z;
-                }
-            }
-            disk_bands.len() as u32
-        };
-        loaded
-            .into_iter()
-            .map(|l| {
-                let rgba: Vec<u8> = l
-                    .image
-                    .pixels
-                    .iter()
-                    .flat_map(|p| p.to_srgba_unmultiplied())
-                    .collect();
-                let band_z = raster_band_z(&l.uid);
-                RasterDraw {
-                    visible: l.visible,
-                    opacity: l.opacity,
-                    transform: l.transform,
-                    deform: l.deform,
-                    size_px: l.image.size,
-                    rgba,
-                    band_z,
-                    mask_clip_enabled: l.mask_clip.unwrap_or(false),
-                }
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let overlay_z = |uid: &str, layer_idx: usize| -> u32 {
-        for band in &disk_bands {
-            if let Band::PinnedText { uid: u, z } = band
-                && u == uid
-            {
-                return *z;
-            }
-        }
-        let layer_idx_u32 = u32::try_from(layer_idx).unwrap_or(u32::MAX);
-        for band in &disk_bands {
-            if let Band::TextGroup {
-                layer_idx: li, z, ..
-            } = band
-                && *li == layer_idx_u32
-            {
-                return *z;
-            }
-        }
-        disk_bands.len() as u32
-    };
-
-    enum Item {
-        Raster(usize),
-        Overlay(usize),
-    }
-    // Source BOTH raster and overlay band-Z from the SAME place to avoid divergence: when the in-memory
-    // raster snapshot is present, the overlay snapshot's `band_z` (captured from the same `bands_by_page`)
-    // is authoritative; otherwise fall back to the disk band lookup. Tie-break keeps raster=0 below
-    // overlay=1 at the same Z (text on top of a same-Z raster).
-    let use_snapshot_z = !job.rasters.is_empty();
-    let mut items: Vec<(u32, u32, Item)> = Vec::new();
-    for (i, r) in raster_draws.iter().enumerate() {
-        items.push((r.band_z, 0, Item::Raster(i)));
-    }
-    for (i, ov) in job.overlays.iter().enumerate() {
-        if ov.page_idx != job.page_idx {
+    for (i, ov) in overlays.iter().enumerate() {
+        if ov.page_idx != page_idx {
             continue;
         }
-        let z = if use_snapshot_z { ov.band_z } else { overlay_z(&ov.uid, ov.layer_idx) };
-        items.push((z, 1, Item::Overlay(i)));
+        slots.push(FlattenItem::Overlay(i));
+        items.push(text_composite_item(&ov.uid, ov.layer_idx, ov.group_uid.as_deref(), ov.visible));
     }
-    items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let folds: Vec<GroupFold<'_>> = groups.iter().map(GroupFold::from).collect();
+    if items.iter().any(|item| item.opacity.is_nan()) || folds.iter().any(|group| group.opacity.is_nan()) {
+        ms_log::runtime_log::log_warn(format!(
+            "[typing] export: page {page_idx} has a layer or PS group with a NaN opacity; the affected \
+             layers are left out of the flattened page"
+        ));
+    }
 
-    for (_, _, item) in &items {
-        match item {
-            Item::Overlay(i) => {
-                let overlay = &job.overlays[*i];
+    for step in composite_plan(&bands, &folds, &items) {
+        match slots[step.item] {
+            FlattenItem::Overlay(i) => {
+                let overlay = &overlays[i];
                 let deform_mesh = export_overlay_deform_mesh_for_page(overlay, [base_w, base_h]);
-                let clipped_rgba = export_overlay_clipped_rgba(job, overlay, &deform_mesh);
+                let mut clipped_rgba = export_overlay_clipped_rgba(mask, overlay, &deform_mesh);
+                scale_alpha_in_place(&mut clipped_rgba, step.opacity);
                 if let Some(top_left_px) = direct_overlay_blit_top_left_px(overlay) {
                     composite_overlay_at_page_position_over(
                         base_rgba,
@@ -1770,11 +1843,8 @@ pub(crate) fn flatten_typing_export_page_rgba(
                     );
                 }
             }
-            Item::Raster(i) => {
-                let r = &raster_draws[*i];
-                if !r.visible {
-                    continue;
-                }
+            FlattenItem::Raster(i) => {
+                let r = &rasters[i];
                 let [w, h] = r.size_px;
                 if w == 0 || h == 0 || r.rgba.len() != w * h * 4 {
                     continue;
@@ -1810,38 +1880,44 @@ pub(crate) fn flatten_typing_export_page_rgba(
                 // `clipped_image` and the text-overlay export clip), so it exports WITHOUT pixels outside
                 // the mask. Falls back to unclipped only if there is no mask snapshot.
                 let mut rgba = if r.mask_clip_enabled {
-                    job.mask
-                        .as_ref()
-                        .and_then(|mask| {
-                            export_clip_overlay_rgba_if_needed(mask, [w, h], r.rgba.as_slice(), &mesh)
-                        })
-                        .unwrap_or_else(|| r.rgba.clone())
+                    mask.and_then(|mask| {
+                        export_clip_overlay_rgba_if_needed(mask, [w, h], r.rgba.as_slice(), &mesh)
+                    })
+                    .unwrap_or_else(|| r.rgba.clone())
                 } else {
                     r.rgba.clone()
                 };
-                if r.opacity < 1.0 {
-                    for px in rgba.chunks_exact_mut(4) {
-                        px[3] = (px[3] as f32 * r.opacity).round().clamp(0.0, 255.0) as u8;
-                    }
-                }
+                scale_alpha_in_place(&mut rgba, step.opacity);
                 composite_overlay_mesh_over_page(base_rgba, [base_w, base_h], &rgba, [w, h], &mesh);
             }
         }
     }
 
-    Ok((base.into_raw(), base_w, base_h))
+    base
+}
+
+/// Multiplies every alpha byte of straight `rgba` by `opacity` (a composite-plan step opacity, finite
+/// and in `(0, 1]`). Exactly 1.0 (or more) leaves the buffer untouched, so a full-opacity layer stays
+/// byte-identical; otherwise `round(a * opacity)`, clamped to the byte range.
+fn scale_alpha_in_place(rgba: &mut [u8], opacity: f32) {
+    if opacity >= 1.0 {
+        return;
+    }
+    for px in rgba.chunks_exact_mut(4) {
+        // Clamped to 0..=255 first, so the cast cannot truncate.
+        px[3] = (f32::from(px[3]) * opacity).round().clamp(0.0, 255.0) as u8;
+    }
 }
 
 /// Применяет маску обрезки к оверлею, если она включена и доступна; иначе
 /// возвращает исходный RGBA. Общая логика для PNG- и PSD-экспорта.
 pub(crate) fn export_overlay_clipped_rgba(
-    job: &TypingExportPageJob,
+    mask: Option<&TypingMaskExportPage>,
     overlay: &TypingExportOverlaySnapshot,
     deform_mesh: &TypingOverlayDeformMesh,
 ) -> Vec<u8> {
     if overlay.mask_clip_enabled {
-        job.mask
-            .as_ref()
+        mask
             .and_then(|mask| {
                 export_clip_overlay_rgba_if_needed(
                     mask,
@@ -2011,4 +2087,28 @@ pub(crate) fn export_overlay_deform_mesh_for_page(
             page_size,
         )
     })
+}
+
+#[cfg(test)]
+mod png_encode_tests {
+    use super::*;
+    use image::ImageEncoder;
+
+    /// The project PNG export must stay byte-identical after moving onto `image_encode`:
+    /// compare against the pre-move reference call (a bare `PngEncoder` with RGBA8).
+    #[test]
+    fn export_png_bytes_match_the_bare_png_encoder() {
+        let (width_px, height_px) = (37u32, 23u32);
+        let rgba: Vec<u8> = (0..width_px * height_px * 4).map(|i| u8::try_from((i * 31 + i / 7) % 256).unwrap_or(0)).collect();
+        let mut reference = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut reference).write_image(&rgba, width_px, height_px, image::ColorType::Rgba8.into()).expect("reference encode");
+        let bytes = encode_export_page_png(&rgba, width_px, height_px, Path::new("page.png")).expect("export encode");
+        assert_eq!(bytes, reference);
+    }
+
+    #[test]
+    fn export_png_rejects_a_mismatched_buffer_instead_of_panicking() {
+        assert!(encode_export_page_png(&[0u8; 15], 2, 2, Path::new("page.png")).is_err());
+        assert!(encode_export_page_png(&[0u8; 17], 2, 2, Path::new("page.png")).is_err());
+    }
 }

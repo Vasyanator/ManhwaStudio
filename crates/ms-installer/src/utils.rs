@@ -14,6 +14,8 @@ Main responsibilities:
   elevation work, and no destruction of an existing working environment;
 - sanitize ZIP entry path components that are invalid on Windows before writing files;
 - handle platform integration helpers such as elevation, shortcuts, registry entries, and uninstall cleanup.
+- register the Windows "Open with" entry for single-image input types (all-users AND per-user
+  installs; per-user installs get nothing else) and remove it on uninstall.
 - on Windows Program Files installs, create the root install directory and grant inheritable Users
   modify rights before installer-managed files are created.
 
@@ -2457,18 +2459,22 @@ fn finalize_windows_post_install(
     overall_start: f32,
     overall_end: f32,
 ) -> Result<(), String> {
+    let launcher_path = resolve_windows_launcher_target(root_dir)?;
     if !is_windows_all_users_install_dir(root_dir) {
+        // A per-user install gets exactly one piece of Windows integration: the HKCU "Open with"
+        // entry (user decision Q3 of the single-image plan). No App Paths, no Uninstall entry, no
+        // Start Menu shortcut — those stay all-users only.
+        register_windows_open_with_best_effort(windows_uninstall_registry_root(root_dir), &launcher_path, tx);
         send_progress(
             tx,
             1.0,
-            t!("installer.utils.windows_integration_not_needed_stage"),
+            t!("installer.utils.windows_integration_registry_stage"),
             overall_end,
-            t!("installer.utils.all_users_integration_not_needed_status"),
+            t!("installer.utils.registry_updated_status"),
         );
         return Ok(());
     }
 
-    let launcher_path = resolve_windows_launcher_target(root_dir)?;
     let _ = tx.send(InstallEvent::Step(
         t!("installer.utils.windows_integration_setup_status").to_string(),
     ));
@@ -2485,6 +2491,7 @@ fn finalize_windows_post_install(
         tx,
         t!("installer.utils.registry_entries_added_log").to_string(),
     );
+    register_windows_open_with_best_effort(windows_uninstall_registry_root(root_dir), &launcher_path, tx);
     send_progress(
         tx,
         0.75,
@@ -2652,6 +2659,301 @@ fn register_windows_install_in_registry(
     reg_add_u32_value(&uninstall_key, "NoModify", 1)?;
     reg_add_u32_value(&uninstall_key, "NoRepair", 1)?;
     Ok(())
+}
+
+/// Executable name under `Software\Classes\Applications\` that carries the "Open with" entry.
+/// It is the on-disk name of the launcher (`platform_executable_file_name()` on Windows, the
+/// file `resolve_windows_launcher_target` prefers), so Explorer ties the entry to that binary.
+/// The key is fixed per registry root, so two installs under the same root share it: the last
+/// install wins, and uninstalling one removes the entry only if its command points into that
+/// install's directory ([`remove_windows_open_with_for_install`]). Accepted debt, see the
+/// crate's `MODULE_README.md`.
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_OPEN_WITH_APP_NAME: &str = "manhwastudio_rs.exe";
+
+/// One `REG_SZ` value to write: full key path (with its `HKLM` / `HKCU` root), value name
+/// (`None` = the key's default value) and data.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryStringValue {
+    key: String,
+    value_name: Option<String>,
+    data: String,
+}
+
+/// The `Applications\manhwastudio_rs.exe` key under `registry_root` (`"HKLM"` or `"HKCU"`):
+/// the whole tree the "Open with" registration owns and uninstall deletes.
+#[cfg(any(target_os = "windows", test))]
+fn windows_open_with_app_key(registry_root: &str) -> String {
+    format!(r"{registry_root}\Software\Classes\Applications\{WINDOWS_OPEN_WITH_APP_NAME}")
+}
+
+/// Pure list of values that make ManhwaStudio appear in Explorer's "Open with" list for every
+/// readable single-image input type (`ms_config::single_image::input_extensions`).
+///
+/// Writes ONLY under `Applications\manhwastudio_rs.exe`: the open command `"<launcher>" "%1"`
+/// (the positional image path is the CLI contract), `FriendlyAppName`, and one empty
+/// `SupportedTypes\.<ext>` value per extension. No ProgID, no `OpenWithProgids`, no default
+/// handler: no extension is ever taken over.
+#[cfg(any(target_os = "windows", test))]
+fn windows_open_with_registry_values(
+    registry_root: &str,
+    launcher_path: &str,
+) -> Vec<RegistryStringValue> {
+    let app_key = windows_open_with_app_key(registry_root);
+    let mut values = vec![
+        RegistryStringValue {
+            key: app_key.clone(),
+            value_name: Some("FriendlyAppName".to_owned()),
+            data: "ManhwaStudio".to_owned(),
+        },
+        RegistryStringValue {
+            key: format!(r"{app_key}\shell\open\command"),
+            value_name: None,
+            data: format!("{} \"%1\"", quote_windows_arg(launcher_path)),
+        },
+    ];
+    let supported_types_key = format!(r"{app_key}\SupportedTypes");
+    values.extend(config::single_image::input_extensions().map(|extension| RegistryStringValue {
+        key: supported_types_key.clone(),
+        value_name: Some(format!(".{extension}")),
+        data: String::new(),
+    }));
+    values
+}
+
+/// Writes the "Open with" entry under `registry_root` (`"HKLM"` all-users, `"HKCU"` per-user).
+/// The owned tree is deleted first so a re-install never keeps extensions dropped from the
+/// input table; an entry of another install under the same root is replaced (last install
+/// wins). Errors carry the failing key (`reg` spawn failure or non-zero exit). Install paths
+/// call it through [`register_windows_open_with_best_effort`].
+#[cfg(target_os = "windows")]
+fn register_windows_open_with(registry_root: &str, launcher_path: &Path) -> Result<(), String> {
+    reg_delete_tree_if_exists(&windows_open_with_app_key(registry_root))?;
+    for value in windows_open_with_registry_values(registry_root, &launcher_path.to_string_lossy()) {
+        reg_add_string_value(&value.key, value.value_name.as_deref(), &value.data)?;
+    }
+    Ok(())
+}
+
+/// Registers "Open with" without ever failing the install: the entry is optional and every
+/// mandatory step has already succeeded when this runs. Success and failure both reach the
+/// session log and the installer console; a failure leaves the install complete.
+#[cfg(target_os = "windows")]
+fn register_windows_open_with_best_effort(
+    registry_root: &str,
+    launcher_path: &Path,
+    tx: &mpsc::Sender<InstallEvent>,
+) {
+    match register_windows_open_with(registry_root, launcher_path) {
+        Ok(()) => {
+            ms_log::runtime_log::log_info(format!(
+                "[windows-install] registered \"Open with\" entry under {registry_root} for {}",
+                launcher_path.display()
+            ));
+            send_console_line(tx, tf!("installer.utils.open_with_registered_log", root = registry_root));
+        }
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[windows-install] \"Open with\" registration under {registry_root} for {} failed, install continues: {err}",
+                launcher_path.display()
+            ));
+            send_console_line(tx, tf!("installer.utils.open_with_registration_failed_log", error = err));
+        }
+    }
+}
+
+/// Removes the "Open with" tree under `registry_root` only when its open command launches an
+/// executable inside `install_dir` (the key is shared by every install under one root, see
+/// [`WINDOWS_OPEN_WITH_APP_NAME`]). A tree owned by another install, a missing command, or an
+/// unreadable command is left in place and logged. Errors: only a failed deletion of a tree
+/// this install owns.
+#[cfg(target_os = "windows")]
+fn remove_windows_open_with_for_install(registry_root: &str, install_dir: &Path) -> Result<(), String> {
+    let app_key = windows_open_with_app_key(registry_root);
+    let command_key = format!(r"{app_key}\shell\open\command");
+    match reg_read_default_string(&command_key) {
+        Ok(Some(command)) if open_with_command_targets_install(&command, &install_dir.to_string_lossy()) => {
+            reg_delete_tree_if_exists(&app_key)
+        }
+        Ok(Some(command)) => {
+            ms_log::runtime_log::log_info(format!(
+                "[windows-uninstall] \"Open with\" entry {app_key} belongs to another install ({command}); left in place"
+            ));
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(status) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[windows-uninstall] could not read {command_key} (Windows error {status}); \"Open with\" entry left in place"
+            ));
+            Ok(())
+        }
+    }
+}
+
+/// True when the open `command` (`"<exe>" "%1"` as written by
+/// [`windows_open_with_registry_values`], or an unquoted `<exe> …`) launches an executable
+/// located directly in `install_dir`. Windows paths compare case-insensitively, with `/` and
+/// `\` equivalent and trailing separators ignored. Pure string logic, so it is testable on
+/// every target (a Linux `Path` would not split on `\`).
+#[cfg(any(target_os = "windows", test))]
+fn open_with_command_targets_install(command: &str, install_dir: &str) -> bool {
+    let command = command.trim_start();
+    let exe = match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or_default(),
+        None => command.split_whitespace().next().unwrap_or_default(),
+    };
+    let normalize = |path: &str| path.replace('/', "\\").trim_end_matches('\\').to_lowercase();
+    let exe = normalize(exe);
+    let Some((exe_dir, exe_name)) = exe.rsplit_once('\\') else {
+        return false;
+    };
+    let install_dir = normalize(install_dir);
+    !exe_name.is_empty() && !install_dir.is_empty() && exe_dir == install_dir
+}
+
+/// Registry hive of a `HKLM\…` / `HKCU\…` key string, the only two roots this crate writes.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryHive {
+    LocalMachine,
+    CurrentUser,
+}
+
+/// Splits `HKLM\sub\key` / `HKCU\sub\key` (root case-insensitive) into hive and subkey path.
+/// `None` for any other root or an empty subkey.
+#[cfg(any(target_os = "windows", test))]
+fn split_registry_key(key: &str) -> Option<(RegistryHive, &str)> {
+    let (root, subkey) = key.split_once('\\')?;
+    if subkey.is_empty() {
+        return None;
+    }
+    let hive = if root.eq_ignore_ascii_case("HKLM") {
+        RegistryHive::LocalMachine
+    } else if root.eq_ignore_ascii_case("HKCU") {
+        RegistryHive::CurrentUser
+    } else {
+        return None;
+    };
+    Some((hive, subkey))
+}
+
+/// `ERROR_SUCCESS` / `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND` from `winerror.h`, mirrored
+/// so the status classification below is testable off Windows; a Windows-only test pins them
+/// to the `windows-sys` constants.
+#[cfg(any(target_os = "windows", test))]
+const WIN32_ERROR_SUCCESS: u32 = 0;
+#[cfg(any(target_os = "windows", test))]
+const WIN32_ERROR_FILE_NOT_FOUND: u32 = 2;
+#[cfg(any(target_os = "windows", test))]
+const WIN32_ERROR_PATH_NOT_FOUND: u32 = 3;
+
+/// What a registry key open status says about the key's existence.
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryKeyPresence {
+    Present,
+    Absent,
+    /// Any other status (e.g. access denied): existence unknown, so a deletion must still be
+    /// attempted and allowed to report its own error.
+    Unknown(u32),
+}
+
+/// Maps a `RegOpenKeyExW` status to key existence by numeric code, never by message text
+/// (`reg.exe` messages are localized and written in the OEM code page).
+#[cfg(any(target_os = "windows", test))]
+fn classify_registry_open_status(status: u32) -> RegistryKeyPresence {
+    match status {
+        WIN32_ERROR_SUCCESS => RegistryKeyPresence::Present,
+        WIN32_ERROR_FILE_NOT_FOUND | WIN32_ERROR_PATH_NOT_FOUND => RegistryKeyPresence::Absent,
+        other => RegistryKeyPresence::Unknown(other),
+    }
+}
+
+/// Opens `HKLM\…` / `HKCU\…` for query and closes it again, classifying the status.
+/// A key string with another root yields `Unknown` so the caller falls back to `reg.exe`.
+#[cfg(target_os = "windows")]
+fn registry_key_presence(key: &str) -> RegistryKeyPresence {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW,
+    };
+
+    let Some((hive, subkey)) = split_registry_key(key) else {
+        return RegistryKeyPresence::Unknown(ERROR_INVALID_PARAMETER);
+    };
+    let root = match hive {
+        RegistryHive::LocalMachine => HKEY_LOCAL_MACHINE,
+        RegistryHive::CurrentUser => HKEY_CURRENT_USER,
+    };
+    let subkey_wide = to_wide(subkey);
+    let mut handle: HKEY = std::ptr::null_mut();
+    // SAFETY: `subkey_wide` is a NUL-terminated UTF-16 buffer alive for the call, `handle` is a
+    // valid out-pointer, and the predefined root handles need no closing.
+    let status = unsafe { RegOpenKeyExW(root, subkey_wide.as_ptr(), 0, KEY_QUERY_VALUE, &mut handle) };
+    if status == WIN32_ERROR_SUCCESS {
+        // SAFETY: `handle` was just opened successfully and is closed exactly once.
+        let close_status = unsafe { RegCloseKey(handle) };
+        if close_status != WIN32_ERROR_SUCCESS {
+            ms_log::runtime_log::log_warn(format!(
+                "[windows-registry] RegCloseKey failed for {key} (Windows error {close_status})"
+            ));
+        }
+    }
+    classify_registry_open_status(status)
+}
+
+/// Reads the default (`(Default)`) `REG_SZ` value of `HKLM\…` / `HKCU\…` as UTF-16 through
+/// `RegGetValueW`, so non-ASCII paths survive (unlike parsing `reg query` output).
+/// `Ok(None)` when the key or the value is absent; `Err(status)` with the Win32 error code for
+/// any other failure, including an unsupported root (`ERROR_INVALID_PARAMETER`).
+#[cfg(target_os = "windows")]
+fn reg_read_default_string(key: &str) -> Result<Option<String>, u32> {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_MORE_DATA};
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW,
+    };
+
+    let (hive, subkey) = split_registry_key(key).ok_or(ERROR_INVALID_PARAMETER)?;
+    let root = match hive {
+        RegistryHive::LocalMachine => HKEY_LOCAL_MACHINE,
+        RegistryHive::CurrentUser => HKEY_CURRENT_USER,
+    };
+    let subkey_wide = to_wide(subkey);
+    // The value can grow between the size probe and the read; retry a few times on MORE_DATA.
+    for _ in 0..3 {
+        let mut size_bytes: u32 = 0;
+        // SAFETY: NUL-terminated `subkey_wide`, null value name = default value, null data
+        // pointer with a valid size out-pointer is the documented size query.
+        let status = unsafe {
+            RegGetValueW(root, subkey_wide.as_ptr(), std::ptr::null(), RRF_RT_REG_SZ, std::ptr::null_mut(), std::ptr::null_mut(), &mut size_bytes)
+        };
+        match classify_registry_open_status(status) {
+            RegistryKeyPresence::Present => {}
+            RegistryKeyPresence::Absent => return Ok(None),
+            RegistryKeyPresence::Unknown(code) => return Err(code),
+        }
+        let len_units = usize::try_from(size_bytes).map_err(|_| ERROR_INVALID_PARAMETER)?.div_ceil(2);
+        let mut buffer = vec![0u16; len_units.max(1)];
+        let mut buffer_bytes = u32::try_from(buffer.len() * 2).map_err(|_| ERROR_INVALID_PARAMETER)?;
+        // SAFETY: `buffer` holds `buffer_bytes` writable bytes and outlives the call.
+        let status = unsafe {
+            RegGetValueW(root, subkey_wide.as_ptr(), std::ptr::null(), RRF_RT_REG_SZ, std::ptr::null_mut(), buffer.as_mut_ptr().cast(), &mut buffer_bytes)
+        };
+        if status == ERROR_MORE_DATA {
+            continue;
+        }
+        match classify_registry_open_status(status) {
+            RegistryKeyPresence::Present => {}
+            RegistryKeyPresence::Absent => return Ok(None),
+            RegistryKeyPresence::Unknown(code) => return Err(code),
+        }
+        // RRF_RT_REG_SZ guarantees NUL termination; drop it and anything after it.
+        let text_len = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
+        return Ok(Some(String::from_utf16_lossy(&buffer[..text_len])));
+    }
+    Err(ERROR_MORE_DATA)
 }
 
 #[cfg(target_os = "windows")]
@@ -2835,6 +3137,9 @@ fn remove_windows_shortcuts_for_install(install_dir: &Path) -> Result<(), String
     Ok(())
 }
 
+/// Removes this install's registry entries under its root (HKLM all-users, HKCU per-user).
+/// Every key is attempted independently: one failure never skips the others, and all failures
+/// are returned together (newline-joined). Keys that do not exist are not failures.
 #[cfg(target_os = "windows")]
 fn remove_windows_registry_entries_for_install(install_dir: &Path) -> Result<(), String> {
     let registry_root = windows_uninstall_registry_root(install_dir);
@@ -2845,9 +3150,21 @@ fn remove_windows_registry_entries_for_install(install_dir: &Path) -> Result<(),
         r"{registry_root}\Software\Microsoft\Windows\CurrentVersion\App Paths\manhwastudio_rs.exe"
     );
 
-    reg_delete_tree_if_exists(&uninstall_key)?;
-    reg_delete_tree_if_exists(&app_path_key)?;
-    Ok(())
+    // The "Open with" tree is the only key a per-user install owns; the other two are absent
+    // there and therefore no-ops.
+    let failures: Vec<String> = [
+        remove_windows_open_with_for_install(registry_root, install_dir),
+        reg_delete_tree_if_exists(&uninstall_key),
+        reg_delete_tree_if_exists(&app_path_key),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n"))
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -2922,8 +3239,23 @@ pub(super) fn run_windows_uninstall_worker(
     Ok(())
 }
 
+/// Deletes the registry key `key` (`HKLM\…` / `HKCU\…`) with all its subkeys and values.
+///
+/// Existence is decided by the numeric `RegOpenKeyExW` status ([`registry_key_presence`]), not
+/// by `reg.exe` message text, which is localized and OEM-code-page encoded: an absent key is
+/// `Ok(())` on every Windows locale. A present (or undeterminable) key is deleted with
+/// `reg delete /f`, whose failure is a real error carrying the key and exit code.
 #[cfg(target_os = "windows")]
 fn reg_delete_tree_if_exists(key: &str) -> Result<(), String> {
+    match registry_key_presence(key) {
+        RegistryKeyPresence::Absent => return Ok(()),
+        RegistryKeyPresence::Present => {}
+        RegistryKeyPresence::Unknown(status) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[windows-registry] existence of {key} undetermined (Windows error {status}); attempting deletion"
+            ));
+        }
+    }
     let mut cmd = Command::new("reg");
     apply_windows_no_window(&mut cmd);
     let output = cmd
@@ -2935,17 +3267,6 @@ fn reg_delete_tree_if_exists(key: &str) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    let stdout = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
-    if stderr.contains("unable to find")
-        || stderr.contains("не удается найти")
-        || stdout.contains("unable to find")
-        || stdout.contains("не удается найти")
-    {
-        return Ok(());
-    }
-
     Err(tf!("installer.utils.reg_delete_exit_error", output = output.status.code().unwrap_or(-1), key = key))
 }
 
@@ -3147,7 +3468,7 @@ fn to_wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 fn quote_windows_arg(text: &str) -> String {
     let escaped = text.replace('"', "\\\"");
     format!("\"{escaped}\"")
@@ -5426,5 +5747,124 @@ mod tests {
         std::fs::write(&path, "{ not json").expect("fixture must be writable");
         assert_eq!(super::read_current_ai_install_type(dir.path()), super::config::AiInstallType::None);
         assert_eq!(std::fs::read_to_string(&path).expect("fixture readable"), "{ not json");
+    }
+
+    /// Every readable input extension must be offered in the "Open with" `SupportedTypes`, each
+    /// as an empty `REG_SZ` named `.<ext>`, and nothing outside the owned app key is written.
+    #[test]
+    fn windows_open_with_registers_every_input_extension() {
+        let values = super::windows_open_with_registry_values("HKLM", r"C:\Program Files\ManhwaStudio\manhwastudio_rs.exe");
+        let supported_key = r"HKLM\Software\Classes\Applications\manhwastudio_rs.exe\SupportedTypes";
+        let supported: Vec<&str> = values
+            .iter()
+            .filter(|value| value.key == supported_key)
+            .map(|value| {
+                assert_eq!(value.data, "", "SupportedTypes values carry no data");
+                value.value_name.as_deref().expect("SupportedTypes values are named")
+            })
+            .collect();
+        let expected: Vec<String> = ms_config::single_image::input_extensions().map(|extension| format!(".{extension}")).collect();
+        assert_eq!(supported, expected);
+        for required in [".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".qoi"] {
+            assert!(supported.contains(&required), "missing {required}");
+        }
+        let app_key = super::windows_open_with_app_key("HKLM");
+        assert!(values.iter().all(|value| value.key.starts_with(&app_key)));
+        assert_eq!(values.len(), expected.len() + 2);
+    }
+
+    /// The open command quotes the launcher path (spaces in `Program Files`) and passes the
+    /// file as one quoted positional argument; `FriendlyAppName` names the product.
+    #[test]
+    fn windows_open_with_command_quotes_paths_with_spaces() {
+        let launcher = r"C:\Program Files\Manhwa Studio\manhwastudio_rs.exe";
+        let values = super::windows_open_with_registry_values("HKCU", launcher);
+        let command = values
+            .iter()
+            .find(|value| value.key == r"HKCU\Software\Classes\Applications\manhwastudio_rs.exe\shell\open\command")
+            .expect("open command is registered");
+        assert_eq!(command.value_name, None, "the command is the key's default value");
+        assert_eq!(command.data, r#""C:\Program Files\Manhwa Studio\manhwastudio_rs.exe" "%1""#);
+        let friendly = values
+            .iter()
+            .find(|value| value.value_name.as_deref() == Some("FriendlyAppName"))
+            .expect("friendly name is registered");
+        assert_eq!(friendly.key, r"HKCU\Software\Classes\Applications\manhwastudio_rs.exe");
+        assert_eq!(friendly.data, "ManhwaStudio");
+    }
+
+    /// All-users installs write under HKLM, per-user installs under HKCU, and the removal key
+    /// is exactly the tree every registered value lives in.
+    #[test]
+    fn windows_open_with_uses_the_given_registry_root() {
+        for root in ["HKLM", "HKCU"] {
+            let app_key = super::windows_open_with_app_key(root);
+            assert_eq!(app_key, format!(r"{root}\Software\Classes\Applications\manhwastudio_rs.exe"));
+            let values = super::windows_open_with_registry_values(root, r"D:\Apps\manhwastudio_rs.exe");
+            assert!(values.iter().all(|value| value.key.starts_with(&format!("{root}\\"))));
+            assert!(values.iter().all(|value| value.key == app_key || value.key.starts_with(&format!("{app_key}\\"))));
+            assert!(values.iter().all(|value| !value.key.contains("OpenWithProgids") && !value.key.contains("FileExts")));
+        }
+    }
+
+    /// Key existence is decided by the numeric status: success = present, file/path not found
+    /// = absent (never an error), anything else (access denied, …) = unknown, so the deletion
+    /// is still attempted and reports its own failure.
+    #[test]
+    fn registry_open_status_decides_presence_by_code() {
+        use super::{RegistryKeyPresence, classify_registry_open_status};
+        assert_eq!(classify_registry_open_status(0), RegistryKeyPresence::Present);
+        assert_eq!(classify_registry_open_status(2), RegistryKeyPresence::Absent);
+        assert_eq!(classify_registry_open_status(3), RegistryKeyPresence::Absent);
+        assert_eq!(classify_registry_open_status(5), RegistryKeyPresence::Unknown(5));
+        assert_eq!(classify_registry_open_status(1), RegistryKeyPresence::Unknown(1));
+    }
+
+    /// The mirrored Win32 codes must equal the `windows-sys` constants they stand for.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn mirrored_win32_codes_match_windows_sys() {
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS};
+        assert_eq!(super::WIN32_ERROR_SUCCESS, ERROR_SUCCESS);
+        assert_eq!(super::WIN32_ERROR_FILE_NOT_FOUND, ERROR_FILE_NOT_FOUND);
+        assert_eq!(super::WIN32_ERROR_PATH_NOT_FOUND, ERROR_PATH_NOT_FOUND);
+    }
+
+    /// Only the two roots this crate writes are split; anything else falls back to `reg.exe`.
+    #[test]
+    fn registry_keys_split_into_hive_and_subkey() {
+        use super::{RegistryHive, split_registry_key};
+        assert_eq!(split_registry_key(r"HKLM\Software\X"), Some((RegistryHive::LocalMachine, r"Software\X")));
+        assert_eq!(split_registry_key(r"hkcu\Software\Classes"), Some((RegistryHive::CurrentUser, r"Software\Classes")));
+        assert_eq!(split_registry_key(r"HKCR\.png"), None);
+        assert_eq!(split_registry_key("HKLM"), None);
+        assert_eq!(split_registry_key(r"HKLM\"), None);
+    }
+
+    /// Uninstall removes the shared "Open with" tree only when its command launches an exe
+    /// directly inside THIS install directory (case-insensitive, separator-agnostic), and the
+    /// command written at install time always matches its own install.
+    #[test]
+    fn open_with_command_ownership_matches_only_this_install() {
+        use super::{open_with_command_targets_install, windows_open_with_registry_values};
+        let install = r"C:\Program Files\ManhwaStudio";
+        assert!(open_with_command_targets_install(r#""C:\Program Files\ManhwaStudio\manhwastudio_rs.exe" "%1""#, install));
+        assert!(open_with_command_targets_install(r#""c:/program files/manhwastudio/MANHWASTUDIO_RS.EXE" "%1""#, r"C:\Program Files\ManhwaStudio\"));
+        assert!(open_with_command_targets_install(r"C:\Apps\MS\manhwastudio_rs.exe %1", r"C:\Apps\MS"));
+        assert!(open_with_command_targets_install(r#""C:\Users\Вася\ManhwaStudio\manhwastudio_rs.exe" "%1""#, r"C:\Users\вася\ManhwaStudio"));
+        assert!(!open_with_command_targets_install(r#""D:\Other\ManhwaStudio\manhwastudio_rs.exe" "%1""#, install));
+        assert!(!open_with_command_targets_install(r#""C:\Program Files\ManhwaStudio\sub\manhwastudio_rs.exe" "%1""#, install));
+        assert!(!open_with_command_targets_install(r#""C:\Program Files\ManhwaStudio2\manhwastudio_rs.exe" "%1""#, install));
+        assert!(!open_with_command_targets_install("", install));
+        assert!(!open_with_command_targets_install(r#""manhwastudio_rs.exe" "%1""#, install));
+        assert!(!open_with_command_targets_install(r#""C:\Program Files\ManhwaStudio\manhwastudio_rs.exe" "%1""#, ""));
+
+        let launcher = r"C:\Program Files\Manhwa Studio\manhwastudio_rs.exe";
+        let command = windows_open_with_registry_values("HKLM", launcher)
+            .into_iter()
+            .find(|value| value.key.ends_with(r"\shell\open\command"))
+            .expect("open command is registered")
+            .data;
+        assert!(open_with_command_targets_install(&command, r"C:\Program Files\Manhwa Studio"));
     }
 }

@@ -8,6 +8,10 @@ Main flow:
 - Handles hidden service flags for installer continuation, Windows uninstall, and elevated Start Menu shortcut creation before normal startup.
 - Windows uninstall can relaunch itself elevated with a hidden continuation flag before deleting files from protected install locations.
 - If `--project` points to a valid chapter, opens it immediately.
+- `--image <PATH>` or a positional image path (OS "Open with", `.desktop` `%f`) opens that
+  picture in single-image mode, skipping the launcher; the launcher's "open image" button routes
+  to the same start. The `run_main` loop owns the request's scratch session and deletes it after
+  the studio window closes; stale sessions of crashed runs are swept on a startup worker.
 - If chapter has legacy `scr` and no `src`, auto-renames `scr -> src` during startup validation.
 - Invalid `--project` startup path is reported both in console and in a modal error dialog.
 - If `--project` is missing:
@@ -47,6 +51,9 @@ extern crate ms_i18n;
 mod app;
 mod args;
 mod i18n_resolve;
+// App-shell half of the single-image mode: save controller, its dialogs and the tab / title /
+// hotkey rules `MangaApp` consults (plan `dev-docs/single_image_mode_plan.md`, WP-2.4).
+mod single_image;
 // Studio window startup shell: opens the window immediately and runs the project load on
 // a background thread behind a loading screen, then swaps in `MangaApp`. Native-only: it
 // wraps the native windowed startup flow (`run_main_window`), which does not exist on wasm.
@@ -363,6 +370,9 @@ fn run_main() -> anyhow::Result<()> {
     // uninstall, update continuation) act on an installed copy immediately, so an
     // impossible combination must be rejected before any of them can run.
     reject_conflicting_startup_flags(&cli);
+    // Deletes single-image scratch sessions left behind by crashed runs. Lock-guarded, so a
+    // session of another running instance is never touched; fire-and-forget on a worker.
+    spawn_stale_scratch_sweep();
     // Desktop integration writes into the user's shared `~/.local/share` tree, which is
     // owned by whichever copy registered itself last. A copy launched from a source
     // checkout must not steal it, so this runs only after the CLI is known.
@@ -390,8 +400,9 @@ fn run_main() -> anyhow::Result<()> {
     }
     trace_log!(
         trace::cat::STARTUP,
-        "tracing enabled, args: project={:?} no_ai={} update={} test_launcher={} trace={}",
+        "tracing enabled, args: project={:?} image={:?} no_ai={} update={} test_launcher={} trace={}",
         cli.project,
+        cli.image_arg(),
         cli.no_ai,
         cli.update,
         cli.test_launcher,
@@ -521,28 +532,72 @@ fn run_main() -> anyhow::Result<()> {
 
     // Main loop: re-enters the launcher when the user chooses "Выйти в лаунчер".
     loop {
-        // The launcher shows the reconciliation's progress; a direct `--project` start
-        // defers it to the studio shell, after the project load (`studio_bootstrap`).
-        if cli.project.is_none() {
+        // The launcher shows the reconciliation's progress; a direct `--project` or image
+        // start defers it to the studio shell, after the load (`studio_bootstrap`).
+        let cli_open_target = cli.project.is_some() || cli.image_arg().is_some();
+        if !cli_open_target {
             storage_mode_job::start_pending_reconciliation();
         }
-        let project_dir = resolve_startup_project_dir(&cli, &user_settings, &ai_backend)?;
-        let Some(project_dir) = project_dir else {
+        let Some(target) = resolve_startup_target(&cli, &user_settings, &ai_backend)? else {
             return Ok(());
         };
+        // The loop owns the request (and an image's scratch session) for the window's whole
+        // life and releases it after `run_main_window` returned: no window exists then, so
+        // the recursive delete never runs on a GUI thread (plan D13).
+        let request = match studio_bootstrap::StudioOpenRequest::from_target(target, &config::single_image::scratch_base()) {
+            Ok(request) => request,
+            Err(err) => {
+                runtime_log::log_error(format!("[startup] could not reserve a single-image scratch session: {err}"));
+                show_startup_error_dialog(&err.user_message());
+                if cli_open_target {
+                    anyhow::bail!("single-image scratch reservation failed: {err}");
+                }
+                // Picked in the launcher: go back there instead of ending the program.
+                continue;
+            }
+        };
 
-        // The project load (unsaved detection + `ProjectData::load*`) runs on a background
-        // thread inside `run_main_window`, so the studio window opens immediately with a
-        // loading screen instead of blocking here with no window on screen. A load failure
-        // is shown in-window and resolves through the same `RunResult` mechanism.
-        match run_main_window(project_dir, &user_settings, ai_backend.clone())? {
+        // The load (unsaved detection + `ProjectData::load*`, or the single-image open) runs
+        // on a background thread inside `run_main_window`, so the studio window opens
+        // immediately with a loading screen instead of blocking here with no window on
+        // screen. A load failure is shown in-window and resolves through the same
+        // `RunResult` mechanism.
+        let run_result = run_main_window(&request, &user_settings, ai_backend.clone());
+        request.release();
+        match run_result? {
             RunResult::Exit => return Ok(()),
             RunResult::ReturnToLauncher => {
-                // Clear the --project CLI flag so the launcher is shown next iteration.
-                cli.project = None;
+                // Clear the CLI open target so the launcher is shown next iteration.
+                cli.clear_open_target();
                 runtime_log::log_info("returning to launcher");
             }
         }
+    }
+}
+
+/// Starts the one-shot startup sweep of stale single-image scratch sessions
+/// (`ms_project::single_image::sweep_stale_sessions` over `scratch_base()`) on a named worker
+/// and logs its report. Never blocks startup; a spawn failure is logged and the next start
+/// retries.
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_stale_scratch_sweep() {
+    let spawn_result = thread::Builder::new()
+        .name("single-image-scratch-sweep".to_string())
+        .spawn(|| {
+            let base = config::single_image::scratch_base();
+            let report = project::single_image::sweep_stale_sessions(&base);
+            // Each removal and each error is already logged by the sweep itself; this line
+            // records that the sweep ran and what it saw.
+            runtime_log::log_info(format!(
+                "[startup] single-image scratch sweep of '{}': removed={} live={} errors={}",
+                base.display(),
+                report.removed,
+                report.live,
+                report.errors.len()
+            ));
+        });
+    if let Err(err) = spawn_result {
+        runtime_log::log_warn(format!("[startup] could not start the single-image scratch sweep: {err}"));
     }
 }
 
@@ -731,14 +786,23 @@ fn auto_detect_missing_ai_install_type_for_startup() {
     ));
 }
 
+/// Resolves what the studio opens next: the CLI open target (`--project`, `--image` or the
+/// positional image) when present, else whatever the no-argument startup path (installer
+/// prompts, launcher) yields. `None` means "exit the program".
+///
+/// # Errors
+/// An invalid CLI open target (after its error dialog) and every error of the no-argument path.
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_startup_project_dir(
+fn resolve_startup_target(
     cli: &Cli,
     user_settings: &serde_json::Value,
     ai_backend: &ai_backend_supervisor::AiBackendHandle,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
     if let Some(project_dir) = &cli.project {
         return resolve_cli_project_dir(project_dir);
+    }
+    if let Some(image) = cli.image_arg() {
+        return resolve_cli_image(image).map(Some);
     }
     resolve_project_dir_without_cli_arg(
         user_settings,
@@ -768,16 +832,38 @@ struct StartupRoutingFlags {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
     let path = project_dir.to_path_buf();
     match crate::project_scan::validate_project_dir_for_startup(&path) {
-        crate::project_scan::ProjectValidationState::Valid { .. } => Ok(Some(path)),
+        crate::project_scan::ProjectValidationState::Valid { .. } => Ok(Some(studio_bootstrap::StartupTarget::Project(path))),
         crate::project_scan::ProjectValidationState::Invalid { message } => {
             let full_message = format!("--project path is invalid: {message}");
             show_startup_error_dialog(&full_message);
             anyhow::bail!("{full_message}")
         }
     }
+}
+
+/// Validates a command-line image path (`--image` or positional) before any window exists.
+/// Only existence and kind are checked here; decodability is reported by the studio loading
+/// screen. Mirrors `resolve_cli_project_dir`: an unusable path shows the startup error dialog
+/// and ends startup.
+///
+/// # Errors
+/// The path does not exist, is a directory (the message names `--project`), or is not a
+/// regular file.
+#[cfg(not(target_arch = "wasm32"))]
+fn resolve_cli_image(image: &Path) -> anyhow::Result<studio_bootstrap::StartupTarget> {
+    use crate::project::single_image::SingleImageError;
+    let path = image.to_path_buf();
+    let message = match args::check_image_arg(&path) {
+        Ok(()) => return Ok(studio_bootstrap::StartupTarget::Image(path)),
+        Err(args::ImageArgProblem::NotFound) => SingleImageError::NotFound { path: path.clone() }.user_message(),
+        Err(args::ImageArgProblem::Directory) => tf!("startup.image.directory_error", path = path.display()),
+        Err(args::ImageArgProblem::NotAFile) => SingleImageError::NotAFile { path: path.clone() }.user_message(),
+    };
+    show_startup_error_dialog(&message);
+    anyhow::bail!("image path is invalid: {message}")
 }
 
 /// Relaunches this executable with `--ignore-installed` and returns once the child is spawned.
@@ -821,7 +907,7 @@ fn resolve_project_dir_without_cli_arg(
     flags: StartupRoutingFlags,
     auto_install_target: Option<PathBuf>,
     ai_backend: &ai_backend_supervisor::AiBackendHandle,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
     if should_enter_installer_flow(flags.force_run_installer, auto_install_target.as_ref()) {
         return run_startup_installer(config::program_dir(), auto_install_target);
     }
@@ -889,7 +975,13 @@ fn resolve_project_dir_without_cli_arg(
         Some(spawn_startup_update_check(flags.force_update_available))
     };
     match launcher::run_launcher(user_settings, update_check_rx, ai_backend)? {
-        Some(LauncherOutcome::OpenProject(selection)) => Ok(Some(selection.project_dir)),
+        Some(LauncherOutcome::OpenProject(selection)) => Ok(Some(studio_bootstrap::StartupTarget::Project(selection.project_dir))),
+        // The launcher already checked "exists and is a file"; decode errors are the studio
+        // loading screen's (one owner: `SingleImageError::user_message`).
+        Some(LauncherOutcome::OpenImage(path)) => {
+            runtime_log::log_info(format!("[startup] launcher picked image '{}'", path.display()));
+            Ok(Some(studio_bootstrap::StartupTarget::Image(path)))
+        }
         Some(LauncherOutcome::StartUpdate) => {
             if flags.ignore_installed {
                 refuse_self_update_from_sources();
@@ -935,17 +1027,20 @@ fn startup_update_check_receiver(cli: &Cli) -> Option<mpsc::Receiver<Option<Upda
 #[cfg(not(target_arch = "wasm32"))]
 const CLI_USAGE_ERROR_EXIT: i32 = 2;
 
-/// Aborts startup when the command line combines `--ignore-installed` with a flag that
-/// manages an installed copy (see `args::conflicting_installed_copy_flags`).
+/// Aborts startup when the command line combines flags that contradict each other:
+/// `--ignore-installed` with a flag that manages an installed copy
+/// (`args::conflicting_installed_copy_flags`), or an image to open with a terminal mode or an
+/// installed-copy flag (`args::conflicting_image_flags`).
 ///
 /// Returns normally when the combination is valid. Otherwise it logs, prints a
-/// user-facing diagnostic to stderr and exits with [`CLI_USAGE_ERROR_EXIT`] — it must
-/// terminate rather than ignore the flag, because silently dropping, say, `--uninstall`
-/// would be as surprising as honoring it.
+/// user-facing diagnostic per violated rule to stderr and exits with [`CLI_USAGE_ERROR_EXIT`]
+/// — it must terminate rather than ignore a flag, because silently dropping, say,
+/// `--uninstall` would be as surprising as honoring it.
 #[cfg(not(target_arch = "wasm32"))]
 fn reject_conflicting_startup_flags(cli: &Cli) {
-    let conflicting = args::conflicting_installed_copy_flags(cli);
-    if conflicting.is_empty() {
+    let installed_conflicts = args::conflicting_installed_copy_flags(cli);
+    let image_conflicts = args::conflicting_image_flags(cli);
+    if installed_conflicts.is_empty() && image_conflicts.is_empty() {
         return;
     }
     // The UI catalog is normally installed much later in startup (it needs the user
@@ -957,12 +1052,20 @@ fn reject_conflicting_startup_flags(cli: &Cli) {
     let raw_settings =
         config::load_raw_user_settings_for_startup().unwrap_or(serde_json::Value::Null);
     locale_store::install_embedded_ui_locale(&raw_settings);
-    let message = tf!(
-        "startup.ignore_installed.conflicting_flags",
-        flags = conflicting.join(", ")
-    );
-    runtime_log::log_error(format!("[startup] {message}"));
-    eprintln!("{message}");
+    let mut messages = Vec::with_capacity(2);
+    if !installed_conflicts.is_empty() {
+        messages.push(tf!(
+            "startup.ignore_installed.conflicting_flags",
+            flags = installed_conflicts.join(", ")
+        ));
+    }
+    if !image_conflicts.is_empty() {
+        messages.push(tf!("startup.image.conflicting_flags", flags = image_conflicts.join(", ")));
+    }
+    for message in &messages {
+        runtime_log::log_error(format!("[startup] {message}"));
+        eprintln!("{message}");
+    }
     std::process::exit(CLI_USAGE_ERROR_EXIT);
 }
 
@@ -1268,7 +1371,7 @@ fn should_enter_installer_flow(
 fn run_startup_installer(
     app_dir: PathBuf,
     auto_install_target: Option<PathBuf>,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
     match launcher_install::run_python_installer_window(&app_dir, auto_install_target)
         .map_err(anyhow::Error::msg)?
     {
@@ -1830,19 +1933,21 @@ enum VersionPart {
     Text(String),
 }
 
+/// Opens the studio window for `request` and blocks until it closes. The load runs on a
+/// worker behind the bootstrap loading screen. The caller keeps owning `request` and releases
+/// it (single-image scratch deletion) after this returns.
+///
+/// # Errors
+/// eframe could not create or run the window.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_main_window(
-    project_dir: PathBuf,
+    request: &studio_bootstrap::StudioOpenRequest,
     user_settings: &serde_json::Value,
     ai_backend: ai_backend_supervisor::AiBackendHandle,
 ) -> anyhow::Result<RunResult> {
     // Human-facing surface: the extended, git-derived version (`3.6.0+1cd9638-83-dirty`),
     // never the plain one — a title is read by a person, not parsed by a process.
-    let title = format!(
-        "ManhwaStudio v{} - {}",
-        env!("MS_APP_VERSION"),
-        project_dir.display()
-    );
+    let title = request.window_title(env!("MS_APP_VERSION"));
 
     // Startup geometry from the `Window` config section: which monitor to open on, plus the
     // position/size the studio window was left at. Monitors cannot be enumerated before the
@@ -1879,19 +1984,13 @@ fn run_main_window(
     let flag_for_app = Arc::clone(&return_to_launcher_flag);
 
     // A title (and, historically, the chapter folder) may ship its own `fonts/ui` chain, so
-    // both are probed before the app directories. `ProjectPaths::title_dir` is the chapter's
-    // parent, resolved here because `project_dir` is moved into the loader below.
-    let font_roots: Vec<PathBuf> = project_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .into_iter()
-        .chain(std::iter::once(project_dir.clone()))
-        .collect();
+    // both are probed before the app directories; an image probes none.
+    let font_roots = request.font_roots();
+    let single_image = request.is_single_image();
 
-    // Start the project load before the window opens; the bootstrap shell shows a loading
-    // screen until the receiver yields, then constructs `MangaApp` in place.
-    let load_rx =
-        studio_bootstrap::spawn_project_load_thread(project_dir, user_settings.clone());
+    // Start the load before the window opens; the bootstrap shell shows a loading screen
+    // until the receiver yields, then constructs `MangaApp` in place.
+    let load_rx = studio_bootstrap::spawn_open_thread(request, user_settings.clone());
 
     eframe::run_native(
         &title,
@@ -1911,6 +2010,7 @@ fn run_main_window(
             studio_bootstrap::install_shader_layers(cc);
             Ok(Box::new(studio_bootstrap::StudioBootstrapApp::new(
                 load_rx,
+                single_image,
                 user_settings.clone(),
                 ai_backend.clone(),
                 flag_for_app,
@@ -2229,20 +2329,38 @@ fn load_embedded_icon_data() -> Option<egui::IconData> {
     })
 }
 
+/// Writes the Linux desktop entry and icon on a named background thread, then asks the
+/// desktop database to pick up the entry's `MimeType=` list. Best effort: every failure is
+/// logged and nothing else happens.
 #[cfg(target_os = "linux")]
 fn install_linux_desktop_integration_async() {
-    let _ = thread::Builder::new()
+    let spawn_result = thread::Builder::new()
         .name("desktop-integration-installer".to_string())
-        .spawn(|| {
-            let _ = install_linux_desktop_integration();
+        .spawn(|| match install_linux_desktop_integration() {
+            Ok(Some(apps_dir)) => refresh_linux_desktop_database(&apps_dir),
+            Ok(None) => {}
+            Err(err) => runtime_log::log_warn(format!(
+                "[desktop-integration] could not install the Linux desktop entry: {err}"
+            )),
         });
+    if let Err(err) = spawn_result {
+        runtime_log::log_warn(format!(
+            "[desktop-integration] could not start the desktop-integration thread: {err}"
+        ));
+    }
 }
 
+/// Writes `~/.local/share/applications/manhwastudio_rs.desktop` and the 512 px icon. Returns
+/// the applications directory it wrote into, or `None` when `HOME` or the executable path is
+/// unknown (nothing written then).
+///
+/// # Errors
+/// A directory or file could not be created or written.
 #[cfg(target_os = "linux")]
-fn install_linux_desktop_integration() -> std::io::Result<()> {
-    let home = match env::var_os("HOME") {
-        Some(v) => PathBuf::from(v),
-        None => return Ok(()),
+fn install_linux_desktop_integration() -> std::io::Result<Option<PathBuf>> {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        runtime_log::log_warn("[desktop-integration] HOME is not set; desktop entry not installed");
+        return Ok(None);
     };
 
     let apps_dir = home.join(".local/share/applications");
@@ -2254,42 +2372,132 @@ fn install_linux_desktop_integration() -> std::io::Result<()> {
     fs::write(&icon_path, EMBEDDED_APP_ICON_PNG)?;
 
     let exec_path = match env::current_exe() {
-        Ok(p) => p,
-        Err(_) => return Ok(()),
+        Ok(path) => path,
+        Err(err) => {
+            runtime_log::log_warn(format!(
+                "[desktop-integration] could not resolve the executable path ({err}); desktop entry not installed"
+            ));
+            return Ok(None);
+        }
     };
 
-    let desktop_entry = format!(
+    fs::write(
+        apps_dir.join("manhwastudio_rs.desktop"),
+        linux_desktop_entry_text(&exec_path).as_bytes(),
+    )?;
+
+    Ok(Some(apps_dir))
+}
+
+/// Runs `update-desktop-database <apps_dir>` so the entry's `MimeType=` list shows up in "Open
+/// with" menus without a re-login. Optional tool: absence or failure is logged only. It only
+/// rebuilds the MIME -> applications cache; no default handler is ever set.
+#[cfg(target_os = "linux")]
+fn refresh_linux_desktop_database(apps_dir: &Path) {
+    match std::process::Command::new("update-desktop-database").arg(apps_dir).output() {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => runtime_log::log_warn(format!(
+            "[desktop-integration] update-desktop-database '{}' failed ({}): {}",
+            apps_dir.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => runtime_log::log_info(
+            "[desktop-integration] update-desktop-database is not installed; the desktop picks up the entry on its own rescan",
+        ),
+        Err(err) => runtime_log::log_warn(format!(
+            "[desktop-integration] could not run update-desktop-database: {err}"
+        )),
+    }
+}
+
+/// Text of the Linux desktop entry for the executable at `exec_path`. Pure.
+///
+/// `Exec=` ends in `%f` (one local file, or nothing when launched from a menu), which arrives
+/// as the positional image argument. `MimeType=` lists every readable input type
+/// (`ms_config::single_image::INPUT_FILE_TYPES`), so the program is OFFERED in "Open with";
+/// it never becomes the default handler (that would need a `mimeapps.list` entry).
+#[cfg(any(target_os = "linux", test))]
+fn linux_desktop_entry_text(exec_path: &Path) -> String {
+    format!(
         "[Desktop Entry]\n\
 Type=Application\n\
 Name=ManhwaStudio\n\
 Comment=ManhwaStudio Rust Prototype\n\
-Exec={} %u\n\
+Exec={} %f\n\
 Icon=manhwastudio_rs\n\
 Terminal=false\n\
 Categories=Graphics;\n\
+MimeType={}\n\
 StartupNotify=true\n\
 StartupWMClass=manhwastudio_rs\n\
 X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2\n",
-        escape_desktop_exec_arg(&exec_path)
-    );
-    fs::write(
-        apps_dir.join("manhwastudio_rs.desktop"),
-        desktop_entry.as_bytes(),
-    )?;
-
-    Ok(())
+        escape_desktop_exec_arg(exec_path),
+        desktop_mime_type_list()
+    )
 }
 
-#[cfg(target_os = "linux")]
+/// The `MimeType=` value: every `INPUT_FILE_TYPES` MIME type, `;`-separated with the trailing
+/// `;` the Desktop Entry spec requires for string lists.
+#[cfg(any(target_os = "linux", test))]
+fn desktop_mime_type_list() -> String {
+    config::single_image::INPUT_FILE_TYPES
+        .iter()
+        .map(|file_type| format!("{};", file_type.mime))
+        .collect()
+}
+
+/// Quotes one `Exec=` argument per the Desktop Entry spec. Inside double quotes `"`, `` ` ``,
+/// `$` and `\` need a backslash; the key file's own string escaping is applied first, so that
+/// backslash is itself written doubled (`\\"`, and `\\\\` for a literal backslash). A
+/// literal `%` is written `%%` so it is not read as a field code.
+#[cfg(any(target_os = "linux", test))]
 fn escape_desktop_exec_arg(path: &Path) -> String {
     let mut out = String::with_capacity(path.as_os_str().len() + 2);
     out.push('"');
     for ch in path.to_string_lossy().chars() {
-        if ch == '"' || ch == '\\' {
-            out.push('\\');
+        match ch {
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(ch);
+            }
+            '\\' => out.push_str("\\\\\\\\"),
+            '%' => out.push_str("%%"),
+            _ => out.push(ch),
         }
-        out.push(ch);
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_entry_passes_one_file_and_lists_every_input_mime_type() {
+        let entry = linux_desktop_entry_text(Path::new("/opt/ManhwaStudio/manhwastudio_rs"));
+        assert!(entry.contains("\nExec=\"/opt/ManhwaStudio/manhwastudio_rs\" %f\n"), "{entry}");
+        assert!(!entry.contains("%u"), "a URL field code would hand over non-file URIs");
+        let mime_line = entry
+            .lines()
+            .find_map(|line| line.strip_prefix("MimeType="))
+            .expect("the entry must carry a MimeType line");
+        assert!(mime_line.ends_with(';'), "string lists end with ';': {mime_line}");
+        let listed: Vec<&str> = mime_line.trim_end_matches(';').split(';').collect();
+        let expected: Vec<&str> = config::single_image::INPUT_FILE_TYPES.iter().map(|file_type| file_type.mime).collect();
+        assert_eq!(listed, expected);
+        assert!(listed.contains(&"image/png") && listed.contains(&"image/jpeg"));
+        assert!(entry.starts_with("[Desktop Entry]\n") && entry.contains("\nType=Application\n"));
+    }
+
+    #[test]
+    fn desktop_exec_argument_is_quoted_and_escaped() {
+        assert_eq!(escape_desktop_exec_arg(Path::new("/home/u/My Apps/ms")), "\"/home/u/My Apps/ms\"");
+        assert_eq!(escape_desktop_exec_arg(Path::new("/home/u/Программы/ms")), "\"/home/u/Программы/ms\"");
+        assert_eq!(escape_desktop_exec_arg(Path::new("/a\"b")), "\"/a\\\\\"b\"");
+        assert_eq!(escape_desktop_exec_arg(Path::new("/a$b`c")), "\"/a\\\\$b\\\\`c\"");
+        assert_eq!(escape_desktop_exec_arg(Path::new("/a\\b")), "\"/a\\\\\\\\b\"");
+        assert_eq!(escape_desktop_exec_arg(Path::new("/100%/ms")), "\"/100%%/ms\"");
+    }
 }

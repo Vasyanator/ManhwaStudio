@@ -33,7 +33,10 @@ Structural edits (PS band order / grouping) and raster deletions are saver jobs 
 (`enqueue_page_band_order` / `enqueue_page_grouping` / `enqueue_page_save_dropping_raster`), so every
 `layers.json` write of a doc-wired tab is FIFO-ordered behind the page's earlier content saves. The PS
 text pin meta (`LayerNode.text_pinned` / `text_pinned_by_group`) lives on the node
-(`set_text_pin_meta`), so the PS editor never re-reads it from disk after the page load.
+(`set_text_pin_meta`), so the PS editor never re-reads it from disk after the page load. The PS
+unified group composite meta (visible / opacity) is doc-owned as well (`set_group_meta`): every tab's
+group fold reads `DocPage::groups`, and the page's next doc save writes it. The panel-only
+`collapsed` flag has the doc as its single owner too (`set_group_collapsed`).
 */
 
 use std::collections::HashMap;
@@ -1197,6 +1200,72 @@ impl LayerDoc {
             page.groups.push(group);
             self.bump_version();
         }
+    }
+
+    /// Sets the composite meta (`visible`, `opacity` clamped to `0.0..=1.0`) of the PS unified group
+    /// `group_uid` on a resident page, bumping the version when either value changed. This is the
+    /// group fold every composite consumer reads (typing canvas, typing export, PS composite), so a
+    /// group toggle made in one tab reaches the others through the doc version. Persistence is NOT
+    /// triggered here: the page's groups are written by the next doc page save (`flush_page` /
+    /// `enqueue_page_save` pass `DocPage::groups` to `save_page_rasters`), in the unchanged manifest
+    /// format. The panel-only `collapsed` flag is untouched. Returns `false` when the page or the
+    /// group is absent, or when `opacity` is not finite (nothing changed).
+    pub fn set_group_meta(&mut self, page_idx: usize, group_uid: &str, visible: bool, opacity: f32) -> bool {
+        ms_log::trace_log!(
+            cat::LAYER_MODEL,
+            "set_group_meta page={} uid={} visible={} opacity={}",
+            page_idx,
+            group_uid,
+            visible,
+            opacity
+        );
+        // `f32::clamp` would pass a NaN through into the persisted manifest; refuse it instead.
+        if !opacity.is_finite() {
+            return false;
+        }
+        let opacity = opacity.clamp(0.0, 1.0);
+        let Some(group) = self
+            .pages
+            .get_mut(&page_idx)
+            .and_then(|page| page.groups.iter_mut().find(|g| g.uid == group_uid))
+        else {
+            return false;
+        };
+        let changed = group.visible != visible || group.opacity.to_bits() != opacity.to_bits();
+        group.visible = visible;
+        group.opacity = opacity;
+        if changed {
+            self.bump_version();
+        }
+        true
+    }
+
+    /// Sets the panel-only `collapsed` flag of the PS unified group `group_uid` on a resident page,
+    /// bumping the version when it changed (the PS editor re-projects its stack groups from the doc,
+    /// which is the single in-session owner of the flag). Like [`Self::set_group_meta`] it is persisted
+    /// by the page's next doc save (`save_page_rasters`' `groups`). It does not affect compositing.
+    /// Returns `false` when the page or the group is absent.
+    pub fn set_group_collapsed(&mut self, page_idx: usize, group_uid: &str, collapsed: bool) -> bool {
+        ms_log::trace_log!(
+            cat::LAYER_MODEL,
+            "set_group_collapsed page={} uid={} collapsed={}",
+            page_idx,
+            group_uid,
+            collapsed
+        );
+        let Some(group) = self
+            .pages
+            .get_mut(&page_idx)
+            .and_then(|page| page.groups.iter_mut().find(|g| g.uid == group_uid))
+        else {
+            return false;
+        };
+        let changed = group.collapsed != collapsed;
+        group.collapsed = collapsed;
+        if changed {
+            self.bump_version();
+        }
+        true
     }
 
     /// Removes the `GroupMeta` with `group_uid` from a resident page and clears `group_uid` on every
@@ -4395,6 +4464,116 @@ mod tests {
             (doc.node(0, "a").unwrap().opacity - 0.0).abs() < 1e-6,
             "opacity clamped low"
         );
+    }
+
+    #[test]
+    fn set_group_meta_updates_visible_and_opacity_and_bumps_version_only_on_change() {
+        let mut doc = doc_with_empty_page();
+        doc.add_group(
+            0,
+            GroupMeta {
+                uid: "g0".into(),
+                name: "Group".into(),
+                visible: true,
+                opacity: 1.0,
+                collapsed: true,
+            },
+        );
+        let v0 = doc.version();
+        assert!(doc.set_group_meta(0, "g0", false, 0.5));
+        let g = &doc.page(0).unwrap().groups[0];
+        assert!(!g.visible && (g.opacity - 0.5).abs() < 1e-6);
+        assert!(g.collapsed, "the panel-only collapse flag is untouched");
+        let v1 = doc.version();
+        assert!(v1 > v0, "a change bumps the version");
+
+        assert!(doc.set_group_meta(0, "g0", false, 0.5), "an existing group reports true");
+        assert_eq!(doc.version(), v1, "an unchanged value does not bump the version");
+
+        assert!(doc.set_group_meta(0, "g0", false, 7.0));
+        assert!((doc.page(0).unwrap().groups[0].opacity - 1.0).abs() < 1e-6, "opacity clamped high");
+
+        let v2 = doc.version();
+        assert!(!doc.set_group_meta(0, "missing", true, 1.0), "unknown group uid");
+        assert!(!doc.set_group_meta(9, "g0", true, 1.0), "absent page");
+        assert!(!doc.set_group_meta(0, "g0", true, f32::NAN), "non-finite opacity refused");
+        assert_eq!(doc.version(), v2, "refused calls change nothing");
+        assert!(!doc.page(0).unwrap().groups[0].visible);
+    }
+
+    #[test]
+    fn set_group_collapsed_sets_only_the_flag_and_bumps_only_on_change() {
+        let mut doc = doc_with_empty_page();
+        doc.add_group(
+            0,
+            GroupMeta {
+                uid: "g0".into(),
+                name: "Group".into(),
+                visible: false,
+                opacity: 0.5,
+                collapsed: false,
+            },
+        );
+        let v0 = doc.version();
+        assert!(doc.set_group_collapsed(0, "g0", true));
+        let g = &doc.page(0).unwrap().groups[0];
+        assert!(g.collapsed);
+        assert!(!g.visible && (g.opacity - 0.5).abs() < 1e-6, "composite meta untouched");
+        let v1 = doc.version();
+        assert!(v1 > v0, "a change bumps the version");
+        assert!(doc.set_group_collapsed(0, "g0", true));
+        assert_eq!(doc.version(), v1, "an unchanged flag does not bump");
+        assert!(!doc.set_group_collapsed(0, "missing", false), "unknown group uid");
+        assert!(!doc.set_group_collapsed(4, "g0", false), "absent page");
+        assert_eq!(doc.version(), v1);
+    }
+
+    /// The group meta reaches disk through the ordinary doc page save (sync flush AND the background
+    /// saver), in the unchanged manifest format, and a fresh doc load reads it back.
+    #[test]
+    fn set_group_meta_round_trips_through_flush_and_the_saver() {
+        let dir = temp_dir("group_meta");
+        persist::add_page_raster(&dir, None, 0, "r", "Pic", true, 1.0, tf(1.0, 1.0, 1.0), &img([2, 2], Color32::RED))
+            .unwrap();
+        let mut doc = LayerDoc::new();
+        doc.ensure_page_loaded(0, &dir, None, None, &psz([100, 100])).unwrap();
+        doc.add_group(
+            0,
+            GroupMeta {
+                uid: "g0".into(),
+                name: "Group".into(),
+                visible: true,
+                opacity: 1.0,
+                collapsed: false,
+            },
+        );
+        doc.set_group(0, "r", Some("g0".into()));
+        assert!(doc.set_group_meta(0, "g0", false, 0.25));
+        doc.flush_page(0, &dir, None).unwrap();
+
+        let reload = |dir: &std::path::Path| {
+            let mut fresh = LayerDoc::new();
+            fresh.ensure_page_loaded(0, dir, None, None, &psz([100, 100])).unwrap();
+            fresh.page(0).unwrap().groups.clone()
+        };
+        let groups = reload(&dir);
+        assert_eq!(groups.len(), 1);
+        assert!(!groups[0].visible, "visibility round-trips through the sync flush");
+        assert!((groups[0].opacity - 0.25).abs() < 1e-6, "opacity round-trips through the sync flush");
+
+        doc.enable_background_saver(None);
+        assert!(doc.set_group_meta(0, "g0", true, 0.75));
+        doc.enqueue_page_save(0, &dir, None).unwrap();
+        let handle = doc.saver_handle().expect("saver enabled");
+        assert!(handle.barrier_blocking().is_empty(), "no failed page");
+        let groups = reload(&dir);
+        assert!(groups[0].visible, "visibility round-trips through the saver");
+        assert!((groups[0].opacity - 0.75).abs() < 1e-6, "opacity round-trips through the saver");
+
+        doc.shutdown_saver();
+        if let Err(err) = fs::remove_dir_all(&dir) {
+            eprintln!("test cleanup {}: {err}", dir.display());
+        }
     }
 
     #[test]

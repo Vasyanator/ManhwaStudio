@@ -90,6 +90,11 @@ Contracts:
   `CleanOverlaysModel` storage itself.
 - Chapter removal is licensed only for gain-verified occurrences; a
   correlation-only accept is COUNTED and reported as refused, never subtracted.
+- A single-image session (`set_single_image_session`) has no chapter mode: every
+  mode read goes through `effective_watermark_mode` (persisted «По главе» runs as
+  `MaskOnly` for the session, the stored value is rewritten only by a real pick),
+  the picker offers `offered_watermark_modes`, and `start_chapter_request` refuses —
+  `chapter_source_ref` would otherwise key the GLOBAL library by the scratch root.
 - Honest reporting (plan, "Corrections from the second implementation round"): the
   UI says the IMPRINT is measured exactly, never that «c точен»; the stated ±%
   bounds the alpha SCALE only; the exact/clipped shares are labelled as a
@@ -238,6 +243,31 @@ impl WatermarkMode {
     /// unreachable on a machine without Torch.
     fn requires_torch(self) -> bool {
         self.network().is_some()
+    }
+}
+
+/// The mode the tool runs in this session: the persisted one, except that a single-image
+/// session never runs `Chapter`.
+///
+/// The chapter mode keys the GLOBAL watermark library by the series folder
+/// (`chapter_source_ref`: the chapter directory's parent), which in a single-image session is
+/// the throwaway scratch root — every run would file its measurements under a meaningless,
+/// per-session source key. It falls back to the safe default `MaskOnly` for the session only;
+/// the persisted value is never rewritten by this (`draw_mode_picker` writes only a real pick).
+fn effective_watermark_mode(persisted: &str, single_image: bool) -> WatermarkMode {
+    match WatermarkMode::from_wire(persisted) {
+        WatermarkMode::Chapter if single_image => WatermarkMode::MaskOnly,
+        mode => mode,
+    }
+}
+
+/// The modes the picker offers: all three in a project, the two network modes in a
+/// single-image session (see `effective_watermark_mode`).
+fn offered_watermark_modes(single_image: bool) -> &'static [WatermarkMode] {
+    if single_image {
+        &[WatermarkMode::MaskOnly, WatermarkMode::Clean]
+    } else {
+        &[WatermarkMode::MaskOnly, WatermarkMode::Clean, WatermarkMode::Chapter]
     }
 }
 
@@ -2471,6 +2501,9 @@ pub struct WatermarkRemovalTool {
     /// The reservation the in-flight capture was started for, so a crop that comes back after
     /// the user re-armed still lands where it was promised.
     library_capture_arm: Option<LibraryArm>,
+    /// Whether the open project is a single-image session, pushed by the tab every frame
+    /// before the dock bodies draw. Disables the chapter mode (`effective_watermark_mode`).
+    single_image_session: bool,
 }
 
 impl Default for WatermarkRemovalTool {
@@ -2499,6 +2532,7 @@ impl Default for WatermarkRemovalTool {
             library_panel_request: None,
             library_capture_rx: None,
             library_capture_arm: None,
+            single_image_session: false,
         };
         tool.request_settings_load();
         // Once per process, and off the GUI thread: the scratch crops of a run that was killed
@@ -2513,6 +2547,11 @@ impl Default for WatermarkRemovalTool {
 }
 
 impl WatermarkRemovalTool {
+    /// The mode this session runs in; see `effective_watermark_mode`.
+    fn effective_mode(&self) -> WatermarkMode {
+        effective_watermark_mode(&self.settings.mode, self.single_image_session)
+    }
+
     /// Reads the settings file on a worker thread (never on the GUI thread).
     fn request_settings_load(&mut self) {
         let (tx, rx) = mpsc::channel();
@@ -3059,6 +3098,16 @@ impl WatermarkRemovalTool {
         canvas: &CanvasView,
         project: &ProjectData,
     ) {
+        // The chapter mode is not offered in a single-image session (`effective_watermark_mode`);
+        // this refuses a request that reached here anyway, because the sample path would file
+        // a library entry under the scratch directory's name.
+        if project.is_single_image() {
+            ms_log::runtime_log::log_warn(
+                "[cleaning.watermark] refused a chapter-mode request in a single-image session; \
+                 the chapter mode is not offered there",
+            );
+            return;
+        }
         // The page snapshot is built HERE rather than once per frame: it clones a path per
         // page of the chapter and only a job start ever needs it.
         let pages = self.chapter_page_tasks(canvas, project);
@@ -3254,7 +3303,7 @@ impl CleaningTool for WatermarkRemovalTool {
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.region_base.draw_ui_hint(ui);
-        if WatermarkMode::from_wire(&self.settings.mode) == WatermarkMode::Chapter {
+        if self.effective_mode() == WatermarkMode::Chapter {
             ui.small(t!("cleaning.tools.watermark.chapter.description_hint"));
             // Reachable without an open region editor: an entry can be built from reference
             // crops alone, with no chapter and no selection involved. A TOGGLE drawn pressed
@@ -3306,9 +3355,15 @@ impl CleaningTool for WatermarkRemovalTool {
         self.ai_backend_torch_available = available;
     }
 
-    /// The «Библиотека знаков» panel follows the toggle the two library buttons drive.
+    fn set_single_image_session(&mut self, single_image: bool) {
+        self.single_image_session = single_image;
+    }
+
+    /// The «Библиотека знаков» panel follows the toggle the two library buttons drive. Both
+    /// buttons belong to the chapter mode, which a single-image session does not offer, so the
+    /// panel is never shown there.
     fn wants_library_panel(&self) -> bool {
-        self.library_window.is_open()
+        self.library_window.is_open() && !self.single_image_session
     }
 
     /// Draws the library screen into its dock panel.
@@ -3402,7 +3457,7 @@ impl CleaningTool for WatermarkRemovalTool {
         }
         // The library picker fills itself the first time the chapter mode is drawn and
         // whenever an entry was written, never on a frame that already has a job running.
-        let chapter_mode = WatermarkMode::from_wire(&self.settings.mode) == WatermarkMode::Chapter;
+        let chapter_mode = self.effective_mode() == WatermarkMode::Chapter;
         if chapter_mode
             && !self.chapter.busy()
             && (self.chapter.library_requested || !self.chapter.library_loaded)
@@ -3426,6 +3481,7 @@ impl CleaningTool for WatermarkRemovalTool {
                 ai_backend_torch_available,
                 chapter,
                 library_window,
+                single_image_session,
                 ..
             } = self;
             let mut editor_ctx = WatermarkEditorCtx {
@@ -3437,6 +3493,7 @@ impl CleaningTool for WatermarkRemovalTool {
                 ai_backend_available: *ai_backend_available,
                 ai_backend_torch_available: *ai_backend_torch_available,
                 library_panel_open: library_window.is_open(),
+                single_image_session: *single_image_session,
                 chapter,
                 settings_changed: &mut settings_changed,
                 want_status: &mut want_status,
@@ -3569,6 +3626,8 @@ struct WatermarkEditorCtx<'a> {
     ai_backend_torch_available: bool,
     /// Whether the «Библиотека знаков» dock panel is shown, so its button can draw pressed.
     library_panel_open: bool,
+    /// Whether the open project is a single-image session (no chapter mode).
+    single_image_session: bool,
     /// The chapter mode's whole state. Selection, renaming and deletion happen here
     /// directly; anything that needs a worker leaves through `chapter_request`.
     chapter: &'a mut ChapterState,
@@ -3613,13 +3672,18 @@ fn draw_mode_entry(
 }
 
 impl WatermarkEditorCtx<'_> {
+    /// The mode this session runs in; see `effective_watermark_mode`.
+    fn effective_mode(&self) -> WatermarkMode {
+        effective_watermark_mode(&self.settings.mode, self.single_image_session)
+    }
+
     /// Draws the whole region-editor body: scrollable controls plus preview, then
     /// the run/undo action row. The status line and Отмена/Применить are appended
     /// by `RegionEditToolBase::draw_overlay_ui`.
     fn draw_body(&mut self, ui: &mut egui::Ui, editor: &mut RegionEditorSession) {
         self.session.sync_session(editor.scroll_id);
         let running = self.session.poll_run(editor);
-        let mode = WatermarkMode::from_wire(&self.settings.mode);
+        let mode = self.effective_mode();
 
         let scroll_id = editor.scroll_id;
         // Keep the action row fixed while a long parameter list scrolls, and keep
@@ -3679,23 +3743,23 @@ impl WatermarkEditorCtx<'_> {
     /// never forced to change by this — a settings file naming a network mode still opens,
     /// with the run button explaining why it cannot run.
     fn draw_mode_picker(&mut self, ui: &mut egui::Ui) {
-        let mut mode = WatermarkMode::from_wire(&self.settings.mode);
+        let effective = self.effective_mode();
+        let mut mode = effective;
         let torch_available = self.ai_backend_torch_available;
+        let offered = offered_watermark_modes(self.single_image_session);
         ui.horizontal(|ui| {
             ui.label(t!("cleaning.common.mode_label"));
             WheelComboBox::from_id_salt("cleaning_watermark_mode_picker")
                 .selected_text(mode.label())
                 .show_ui(ui, |ui| {
-                    for candidate in [
-                        WatermarkMode::MaskOnly,
-                        WatermarkMode::Clean,
-                        WatermarkMode::Chapter,
-                    ] {
+                    for &candidate in offered {
                         draw_mode_entry(ui, &mut mode, candidate, torch_available);
                     }
                 });
         });
-        if mode.wire() != self.settings.mode {
+        // Compared with the EFFECTIVE mode, not the persisted string: a single-image session
+        // shows a persisted «По главе» as «Только маска», and only a real pick may overwrite it.
+        if mode != effective {
             self.settings.mode = mode.wire().to_string();
             *self.settings_changed = true;
         }
@@ -4372,7 +4436,7 @@ impl WatermarkEditorCtx<'_> {
     /// shared `mask_generation::generate_button_hover_text`: backend first, Torch second,
     /// what the run does last.
     fn draw_actions(&mut self, ui: &mut egui::Ui, editor: &mut RegionEditorSession, running: bool) {
-        let Some(mode) = WatermarkMode::from_wire(&self.settings.mode).network() else {
+        let Some(mode) = self.effective_mode().network() else {
             return;
         };
         let backend_available = self.ai_backend_available;
@@ -4803,6 +4867,35 @@ mod tests {
         // Including an unknown persisted value, which falls back to `mask_only`.
         tool.settings.mode = "bogus".to_string();
         assert!(!tool.pytorch_required());
+    }
+
+    /// A single-image session never runs the chapter mode — it would key the global library by
+    /// the scratch directory — and never offers it, while a project keeps every mode.
+    #[test]
+    fn a_single_image_session_never_runs_or_offers_the_chapter_mode() {
+        assert_eq!(effective_watermark_mode("chapter", true), WatermarkMode::MaskOnly);
+        assert_eq!(effective_watermark_mode("chapter", false), WatermarkMode::Chapter);
+        assert_eq!(effective_watermark_mode("clean", true), WatermarkMode::Clean);
+        assert_eq!(effective_watermark_mode("mask_only", true), WatermarkMode::MaskOnly);
+        assert!(!offered_watermark_modes(true).contains(&WatermarkMode::Chapter));
+        assert!(offered_watermark_modes(false).contains(&WatermarkMode::Chapter));
+    }
+
+    /// The session fallback leaves the persisted choice alone: the tool reads «По главе» as
+    /// «Только маска» in a single-image session without rewriting `settings.mode`, and the
+    /// chapter library panel stays hidden even when its toggle was on.
+    #[test]
+    fn a_single_image_session_keeps_the_persisted_chapter_mode() {
+        let mut tool = WatermarkRemovalTool::default();
+        tool.settings.mode = WatermarkMode::Chapter.wire().to_string();
+        tool.library_window.toggle();
+        tool.set_single_image_session(true);
+        assert_eq!(tool.effective_mode(), WatermarkMode::MaskOnly);
+        assert_eq!(tool.settings.mode, WatermarkMode::Chapter.wire());
+        assert!(!tool.wants_library_panel());
+        tool.set_single_image_session(false);
+        assert_eq!(tool.effective_mode(), WatermarkMode::Chapter);
+        assert!(tool.wants_library_panel());
     }
 
     /// The «Библиотека знаков» dock tab follows the library state and nothing else, and it

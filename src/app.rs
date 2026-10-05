@@ -40,6 +40,12 @@ App/frame flow:
 Hotkeys:
 - Translation canvas zoom/edit commands + panel toggles (`P/O/K/M/D` by default).
 - Cleaning canvas zoom commands.
+- Single-image save / save-as (registered only in that mode).
+
+Single-image mode:
+- Hooks only (the file is over the 5000-line gate): `single_image` controller field, `tab_visible`,
+  the top-bar and exit-dialog branches, the per-frame `tick`, `quiesce_writers_discarding` /
+  `close_single_image_discarding` and the `on_exit` quiesce. Logic lives in `src/single_image/`.
 
 Profiling (optional, behind the `profiling` cargo feature):
 - `ui` is instrumented with coarse `puffin::profile_scope!` markers around the heavy
@@ -329,6 +335,9 @@ pub struct MangaApp {
     /// set, it would silence the unsaved-changes prompt and the `on_exit` text flush for the rest of
     /// the session.
     discarding_unsaved_changes: bool,
+    /// Save controller of a single-image session (`crate::single_image`); `None` in a project session.
+    /// Owns «Сохранить» / «Сохранить как», the dirty baseline and the JPEG options dialog.
+    single_image: Option<crate::single_image::SingleImageController>,
     /// Windows can misplace a maximized root window when maximize is requested at native creation.
     #[cfg(target_os = "windows")]
     maximize_root_window_on_first_frame: bool,
@@ -352,8 +361,10 @@ enum ExitDialogKind {
     ReturnToLauncher,
 }
 
+/// What happens once the window may close: exit the program, or return to the launcher. Also
+/// carried by the single-image save controller across a save-then-close (`crate::single_image`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingCloseAction {
+pub(crate) enum PendingCloseAction {
     Exit,
     ReturnToLauncher,
 }
@@ -715,8 +726,12 @@ impl MangaApp {
         if let Some(layout) = settings_tab.take_typing_panel_layout_request() {
             typing_tab.set_panel_layout(layout);
         }
+        let single_image = crate::single_image::SingleImageController::from_project(&project, &user_settings);
+        if single_image.is_some() {
+            settings_tab.set_single_image_session();
+        }
         let user_config_path = crate::config::user_config_path();
-        let input_manager_v2 = build_input_manager_v2(user_config_path.as_path());
+        let input_manager_v2 = build_input_manager_v2(user_config_path.as_path(), single_image.is_some());
         let comic_type_prompt_open = project.comic_type.is_none();
         let has_unsaved_changes_cached = project.paths.unsaved_dir.exists();
 
@@ -808,6 +823,7 @@ impl MangaApp {
             has_unsaved_changes_cached,
             next_unsaved_dir_check_s: 0.0,
             discarding_unsaved_changes: false,
+            single_image,
             #[cfg(target_os = "windows")]
             maximize_root_window_on_first_frame: true,
             return_to_launcher: false,
@@ -817,9 +833,19 @@ impl MangaApp {
         }
     }
 
-    /// Returns true if there are in-session changes not yet merged into the project folder.
+    /// Returns true if there are in-session changes not yet merged into the project folder. In a
+    /// single-image session: the image differs from its last write to the file, or a write is still
+    /// in flight; never while the discard latch is set (the window is closing without saving).
     fn has_unsaved_changes(&self) -> bool {
-        self.has_unsaved_changes_cached
+        match &self.single_image {
+            Some(controller) => !self.discarding_unsaved_changes && (controller.is_dirty(&self.autosave_gate, &self.typing_tab, &self.ps_editor_tab) || controller.write_in_flight()),
+            None => self.has_unsaved_changes_cached,
+        }
+    }
+
+    /// Whether `tab` exists in this session (`crate::single_image::tab_visible`).
+    fn tab_visible(&self, tab: AppTab) -> bool {
+        crate::single_image::tab_visible(tab, self.single_image.is_some())
     }
 
     /// Returns the loaded project's root directory for bootstrap-driven reconstruction.
@@ -828,8 +854,12 @@ impl MangaApp {
         self.project.paths.project_dir.clone()
     }
 
-    /// Selects a tab after a full project reload.
+    /// Selects a tab after a full project reload. A tab hidden in this session is refused (logged).
     pub fn set_active_tab(&mut self, tab: AppTab) {
+        if !self.tab_visible(tab) {
+            runtime_log::log_warn(format!("[app] tab {tab:?} does not exist in this session; staying on {:?}", self.active_tab));
+            return;
+        }
         self.active_tab = tab;
     }
 
@@ -1093,6 +1123,11 @@ impl MangaApp {
         // latch stays set — that branch dispatches the window close itself, so the quiet is correct.
         if self.discarding_unsaved_changes {
             self.has_unsaved_changes_cached = false;
+            return;
+        }
+        // A single-image session's staging is a throwaway scratch that is never merged: its dirty
+        // state is the controller's (see `has_unsaved_changes`), not this staging probe's.
+        if self.single_image.is_some() {
             return;
         }
         if self.has_unsaved_changes_cached || now < self.next_unsaved_dir_check_s {
@@ -1526,11 +1561,32 @@ impl MangaApp {
         rx
     }
 
-    /// Starts the DISCARD exit: drops pending edits, quiesces every staging writer (layer saver,
-    /// bubbles saver, клин autosave) and spawns the staging-dir delete job; `action` runs once the
+    /// Starts the DISCARD exit: drops pending edits, quiesces every staging writer
+    /// (`quiesce_writers_discarding`) and spawns the staging-dir delete job; `action` runs once the
     /// delete succeeds (`poll_pending_exit_cleanup`).
     fn start_exit_cleanup(&mut self, action: PendingCloseAction) {
         if self.pending_exit_cleanup.is_some() {
+            return;
+        }
+        self.quiesce_writers_discarding();
+        let rx = Self::spawn_unsaved_delete_job(
+            self.project.paths.unsaved_dir.clone(),
+            self.overlay_autosave_thread.take(),
+        );
+        self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx });
+        self.save_to_project_status = Some((t!("app.cleanup.cleaning").to_string(), 0.0));
+    }
+
+    /// The writer half of a DISCARD: latches `discarding_unsaved_changes`, drops typing's deferred
+    /// edits, shuts the layer saver down without writing (joined), pauses the bubbles saver and tells
+    /// the клин autosave to stop without writing. The клин thread handle is left in place: the
+    /// project discard hands it to its delete job, every other caller lets `on_exit` join it.
+    /// Idempotent (a second call finds the latch set and does nothing).
+    ///
+    /// A single-image session closes through this ALWAYS (plan D13): its staging is a scratch that
+    /// `run_main` deletes after the window is gone, so nothing may be flushed into it.
+    fn quiesce_writers_discarding(&mut self) {
+        if self.discarding_unsaved_changes {
             return;
         }
         // This is the DISCARD path: latch it before anything else. `on_exit` must not flush after this
@@ -1566,15 +1622,21 @@ impl MangaApp {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pause_saver_for_page_op();
-        // Stop the клин autosave without writing (discard) and join it on the delete job before the
-        // delete; left running, a pass could re-create the staging dir after its removal.
+        // Stop the клин autosave without writing (discard). The project discard joins it on the delete
+        // job before the delete (left running, a pass could re-create the staging dir after its
+        // removal); otherwise `on_exit` joins it.
         self.overlay_autosave_control.request_stop_now();
-        let rx = Self::spawn_unsaved_delete_job(
-            self.project.paths.unsaved_dir.clone(),
-            self.overlay_autosave_thread.take(),
-        );
-        self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx });
-        self.save_to_project_status = Some((t!("app.cleanup.cleaning").to_string(), 0.0));
+    }
+
+    /// Closes a single-image session without writing the file: abandons a save that has not started
+    /// writing, quiesces every writer the discard way (D13) and runs `action`.
+    fn close_single_image_discarding(&mut self, ctx: &egui::Context, action: PendingCloseAction) {
+        if let Some(controller) = self.single_image.as_mut() {
+            controller.abandon_pending();
+        }
+        self.quiesce_writers_discarding();
+        self.exit_dialog = None;
+        self.finalize_close(ctx, action);
     }
 
     /// Un-latches the DISCARD path after its staging cleanup FAILED, handing a coherent state back to
@@ -1625,6 +1687,21 @@ impl MangaApp {
             Arc::clone(&self.overlay_autosave_control),
             Some(Arc::clone(&self.autosave_gate)),
         ));
+    }
+
+    /// Acts on the end of a single-image save-then-close: close the discard way (the file is
+    /// written), or show the exit dialog for the same action again.
+    fn apply_single_image_outcome(&mut self, ctx: &egui::Context, outcome: Option<crate::single_image::SaveOutcome>) {
+        match outcome {
+            None => {}
+            Some(crate::single_image::SaveOutcome::CloseNow(action)) => self.close_single_image_discarding(ctx, action),
+            Some(crate::single_image::SaveOutcome::ReturnToExitDialog(action)) => {
+                self.exit_dialog = Some(match action {
+                    PendingCloseAction::Exit => ExitDialogKind::WindowClose,
+                    PendingCloseAction::ReturnToLauncher => ExitDialogKind::ReturnToLauncher,
+                });
+            }
+        }
     }
 
     fn finalize_close(&mut self, ctx: &egui::Context, action: PendingCloseAction) {
@@ -1703,6 +1780,29 @@ impl MangaApp {
             ExitDialogKind::WindowClose => t!("app.exit.exit_button"),
             ExitDialogKind::ReturnToLauncher => t!("app.exit.to_launcher_button"),
         };
+        if let Some(controller) = self.single_image.as_mut() {
+            let action = match kind {
+                ExitDialogKind::WindowClose => PendingCloseAction::Exit,
+                ExitDialogKind::ReturnToLauncher => PendingCloseAction::ReturnToLauncher,
+            };
+            return match crate::single_image::draw_exit_dialog(ctx, title, controller.write_in_flight(), controller.picker_open()) {
+                None => false,
+                Some(crate::single_image::ExitChoice::Cancel) => {
+                    self.exit_dialog = None;
+                    false
+                }
+                Some(crate::single_image::ExitChoice::Save) => {
+                    // The close follows from the controller's `SaveOutcome` (see `ui`).
+                    controller.request_save_then(action);
+                    self.exit_dialog = None;
+                    true
+                }
+                Some(crate::single_image::ExitChoice::DontSave) => {
+                    self.close_single_image_discarding(ctx, action);
+                    true
+                }
+            };
+        }
 
         egui::Window::new(title)
             .collapsible(false)
@@ -2102,6 +2202,10 @@ impl MangaApp {
     /// `active_viewport_owner_tab` to the destination makes the next
     /// `apply_shared_viewport_to_active_canvas` skip its snapshot re-apply.
     fn open_page_in_tab(&mut self, tab: AppTab, page_idx: usize) {
+        if !self.tab_visible(tab) {
+            runtime_log::log_warn(format!("[app] open page {page_idx} in {tab:?} refused: the tab does not exist in this session"));
+            return;
+        }
         self.active_tab = tab;
         self.shared_page_idx = page_idx;
         self.shared_page_center = None;
@@ -2247,6 +2351,16 @@ impl MangaApp {
 
     fn execute_hotkey_command(&mut self, ctx: &egui::Context, command_id: &str) {
         match command_id {
+            crate::single_image::HOTKEY_SAVE_IMAGE => {
+                if let Some(controller) = self.single_image.as_mut() {
+                    controller.request_save();
+                }
+            }
+            crate::single_image::HOTKEY_SAVE_IMAGE_AS => {
+                if let Some(controller) = self.single_image.as_mut() {
+                    controller.request_save_as(ctx);
+                }
+            }
             HOTKEY_TRANSLATION_ZOOM_IN => {
                 if !self.translation_tab.blocks_canvas_zoom() {
                     self.canvas.zoom_by_shortcut(1.1);
@@ -2873,6 +2987,9 @@ impl MangaApp {
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for tab in AppTab::ALL {
+                if !self.tab_visible(tab) {
+                    continue;
+                }
                 let selected = self.active_tab == tab;
                 if ui.selectable_label(selected, tab.title()).clicked() {
                     self.active_tab = tab;
@@ -2886,6 +3003,11 @@ impl MangaApp {
                     } else {
                         self.finalize_close(ui.ctx(), PendingCloseAction::ReturnToLauncher);
                     }
+                }
+                if let Some(controller) = self.single_image.as_mut() {
+                    controller.draw_top_bar(ui);
+                    self.draw_storage_reconcile_notice(ui);
+                    return;
                 }
                 let save_busy = self.save_to_project_rx.is_some()
                     || self.pending_save_after_preload
@@ -2990,6 +3112,18 @@ impl eframe::App for MangaApp {
         let save_completed_this_frame = self.poll_save_to_project(now);
         self.poll_page_op(ctx);
         self.poll_pending_exit_cleanup(ctx, now);
+        // Single-image save driver; every frame, whatever tab is active (it is also the one
+        // `poll_flatten_to_file` caller the typing tab requires).
+        let single_image_outcome = match self.single_image.as_mut() {
+            Some(controller) => controller.tick(ctx, crate::single_image::SaveParts {
+                project: &self.project,
+                typing: &mut self.typing_tab,
+                ps_editor: &mut self.ps_editor_tab,
+                gate: &self.autosave_gate,
+            }),
+            None => None,
+        };
+        self.apply_single_image_outcome(ctx, single_image_outcome);
         self.refresh_unsaved_changes_cache(now);
         if let Some((_, ts)) = &self.save_to_project_status {
             if *ts > 0.0 && now - ts > 5.0 {
@@ -3074,6 +3208,8 @@ impl eframe::App for MangaApp {
 
         // Show exit/leave dialog on top of all other content.
         self.draw_exit_dialog(ctx);
+        let jpeg_options_outcome = self.single_image.as_mut().and_then(|controller| controller.draw_dialogs(ctx));
+        self.apply_single_image_outcome(ctx, jpeg_options_outcome);
 
         self.draw_page_op_overlays(ctx);
 
@@ -3286,7 +3422,7 @@ impl eframe::App for MangaApp {
                         CharactersTabAction::OpenNotesForCharacter(name) => {
                             self.notes_tab.notify_characters_changed();
                             self.notes_tab.set_character_context(name);
-                            self.active_tab = AppTab::Notes;
+                            self.set_active_tab(AppTab::Notes);
                         }
                     }
                 }
@@ -3374,6 +3510,12 @@ impl eframe::App for MangaApp {
     /// `egui-shader-layers` backend's, which `StudioBootstrapApp::on_exit` frees. The parameter is
     /// kept because this is `eframe::App::on_exit`'s signature.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // A single-image session always closes the DISCARD way (plan D13): its staging is a scratch
+        // `run_main` deletes once the window is gone, so nothing below may write into it. No-op when
+        // a dialog already took that path.
+        if self.single_image.is_some() {
+            self.quiesce_writers_discarding();
+        }
         self.stop_overlay_autosave();
         // Release decode workers parked on the look-ahead window: after this frame nothing
         // drains the loader channels, so the promotion frontier would never advance again and
@@ -3972,7 +4114,9 @@ fn persist_typing_centering_assist_state(enabled: bool, show_center: bool) {
     }
 }
 
-fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
+/// Builds the hotkey registry: every code-declared spec, plus the save hotkeys when
+/// `single_image` (`crate::single_image::hotkey_specs`), then the user overrides.
+fn build_input_manager_v2(user_settings_file: &Path, single_image: bool) -> InputManagerV2 {
     let mut manager = InputManagerV2::default();
     manager.register(HotkeySpecV2 {
         id: HOTKEY_TRANSLATION_ZOOM_IN,
@@ -4084,6 +4228,11 @@ fn build_input_manager_v2(user_settings_file: &Path) -> InputManagerV2 {
     });
     for spec in TranslationTabState::hotkey_specs() {
         manager.register(spec);
+    }
+    if single_image {
+        for spec in crate::single_image::hotkey_specs() {
+            manager.register(spec);
+        }
     }
     manager.load_overrides(user_settings_file);
     manager

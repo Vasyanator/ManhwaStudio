@@ -4,6 +4,12 @@ CLI argument parsing for the main Rust app.
 
 Main items:
 - `Cli.project`: optional path to chapter/project directory.
+- `Cli.image` / `Cli.image_positional`: one picture file to open in single-image mode
+  (`--image <PATH>` or a bare positional path, the form OS "Open with" passes). Mutually
+  exclusive with `--project` (clap group `open_target`); `Cli::image_arg` merges the two.
+- `conflicting_image_flags` / `check_image_arg`: the image start's flag-combination rule and its
+  path pre-check (missing, directory, not a regular file), run before any window exists.
+- `Cli::clear_open_target`: forgets the CLI open target when the studio returns to the launcher.
 - `Cli.no_ai`: disables AI-dependent functionality at startup.
 - `Cli.update`: opens the Rust update window directly.
 - `Cli.test_launcher`: starts the new Rust launcher test mode instead of the main app.
@@ -31,10 +37,10 @@ Notes:
 and `build.rs`), not the plain `CARGO_PKG_VERSION`.
 */
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 #[cfg(any(target_os = "windows", test))]
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // `--version` prints the EXTENDED, git-derived version (`MS_APP_VERSION`), not clap's
 // default `CARGO_PKG_VERSION`: a developer typing it is exactly the reader this string
@@ -47,9 +53,22 @@ use std::path::PathBuf;
     version = env!("MS_APP_VERSION"),
     about = "Minimal Rust project viewer for MangaFucker projects"
 )]
+// One open target at most: a chapter (`--project`) OR one image (`--image` / positional).
+// `ArgGroup::multiple` defaults to false, so clap itself rejects any two of them together.
+#[command(group(ArgGroup::new("open_target")))]
 pub struct Cli {
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", group = "open_target")]
     pub project: Option<PathBuf>,
+
+    /// Open one image file in single-image mode, skipping the launcher.
+    #[arg(long, value_name = "PATH", group = "open_target")]
+    pub image: Option<PathBuf>,
+
+    /// Image file to open in single-image mode (same as `--image`). This positional form is
+    /// what file managers pass (`.desktop` `%f`, Windows "Open with" `"%1"`); the path is kept
+    /// as an `OsString`, so spaces and non-UTF-8 names survive.
+    #[arg(value_name = "IMAGE", group = "open_target")]
+    pub image_positional: Option<PathBuf>,
 
     #[arg(long, default_value_t = false)]
     pub no_ai: bool,
@@ -136,8 +155,18 @@ pub fn conflicting_installed_copy_flags(cli: &Cli) -> Vec<&'static str> {
     if !cli.ignore_installed {
         return Vec::new();
     }
-    // Kept in the same order as `INSTALLED_COPY_FLAGS` so the diagnostic is stable.
-    let present = [
+    INSTALLED_COPY_FLAGS
+        .iter()
+        .zip(installed_copy_flags_present(cli))
+        .filter_map(|(flag, is_present)| is_present.then_some(*flag))
+        .collect()
+}
+
+/// Presence of every [`INSTALLED_COPY_FLAGS`] entry in `cli`, index-aligned with that table.
+fn installed_copy_flags_present(cli: &Cli) -> [bool; INSTALLED_COPY_FLAGS.len()] {
+    // Kept in the same order as `INSTALLED_COPY_FLAGS` so the diagnostics are stable; the array
+    // length is the table length, so a flag added to one but not the other fails to compile.
+    [
         cli.update,
         cli.continue_update,
         cli.continue_install,
@@ -147,12 +176,73 @@ pub fn conflicting_installed_copy_flags(cli: &Cli) -> Vec<&'static str> {
         cli.create_start_menu_shortcut_install_dir.is_some(),
         cli.continue_create_start_menu_shortcut,
         cli.uninstall_signal_file.is_some(),
-    ];
-    INSTALLED_COPY_FLAGS
+    ]
+}
+
+/// Startup modes that an image start cannot be combined with: each one is its own terminal flow
+/// (environment check, launcher test window) and would silently drop the image otherwise.
+const IMAGE_EXCLUSIVE_MODE_FLAGS: &[&str] = &["--check-venv", "--test-launcher"];
+
+impl Cli {
+    /// The image to open in single-image mode: `--image`, else the positional path. clap's
+    /// `open_target` group guarantees at most one of them (and no `--project`) is set.
+    #[must_use]
+    pub fn image_arg(&self) -> Option<&Path> {
+        self.image.as_deref().or(self.image_positional.as_deref())
+    }
+
+    /// Forgets the open target given on the command line (`--project`, `--image`, positional
+    /// image), so the next startup-loop iteration shows the launcher instead of re-opening it.
+    pub fn clear_open_target(&mut self) {
+        self.project = None;
+        self.image = None;
+        self.image_positional = None;
+    }
+}
+
+/// Returns the flags present in `cli` that contradict an image start, in a stable order:
+/// first [`IMAGE_EXCLUSIVE_MODE_FLAGS`], then [`INSTALLED_COPY_FLAGS`]. Empty when no image is
+/// given or the combination is valid. A non-empty result must abort startup before any
+/// service action runs, for the same reason as [`conflicting_installed_copy_flags`].
+#[must_use]
+pub fn conflicting_image_flags(cli: &Cli) -> Vec<&'static str> {
+    if cli.image_arg().is_none() {
+        return Vec::new();
+    }
+    let modes = [cli.check_venv, cli.test_launcher];
+    let installed = installed_copy_flags_present(cli);
+    IMAGE_EXCLUSIVE_MODE_FLAGS
         .iter()
-        .zip(present)
+        .zip(modes)
+        .chain(INSTALLED_COPY_FLAGS.iter().zip(installed))
         .filter_map(|(flag, is_present)| is_present.then_some(*flag))
         .collect()
+}
+
+/// Why a command-line image path cannot be opened, found before any window exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageArgProblem {
+    /// Nothing exists at the path (or its metadata cannot be read).
+    NotFound,
+    /// The path is a directory: the user most likely meant `--project`.
+    Directory,
+    /// The path exists but is neither a file nor a directory (socket, device, ...).
+    NotAFile,
+}
+
+/// Cheap pre-check of a command-line image path (one `metadata` call, symlinks followed).
+/// Decodability is NOT checked here: the studio load worker owns that error
+/// (`SingleImageError::user_message` on the loading screen).
+///
+/// # Errors
+/// The [`ImageArgProblem`] that makes the path unusable.
+pub fn check_image_arg(path: &Path) -> Result<(), ImageArgProblem> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(()),
+        Ok(meta) if meta.is_dir() => Err(ImageArgProblem::Directory),
+        Ok(_) => Err(ImageArgProblem::NotAFile),
+        Err(_) => Err(ImageArgProblem::NotFound),
+    }
 }
 
 /// Spelling of the standalone-mode flag, kept next to the `Cli` field it fills so the two
@@ -260,6 +350,87 @@ mod tests {
             conflicting_installed_copy_flags(&cli),
             vec!["--update", "--continue-update"]
         );
+    }
+
+    /// Parses a command line that must be REJECTED by clap and returns clap's error kind.
+    fn parse_error(args: &[&str]) -> clap::error::ErrorKind {
+        let mut argv = vec!["manhwastudio_rs"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv) {
+            Ok(cli) => panic!("command line {args:?} must be rejected, parsed as {cli:?}"),
+            Err(err) => err.kind(),
+        }
+    }
+
+    #[test]
+    fn image_arguments_parse_into_image_arg() {
+        // (command line, expected image) -- the positional form is what file managers pass.
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&[], None),
+            (&["--project", "/tmp/title/ch"], None),
+            (&["--image", "/tmp/a.png"], Some("/tmp/a.png")),
+            (&["/tmp/a.png"], Some("/tmp/a.png")),
+            (&["--no-ai", "/tmp/a.png", "--trace"], Some("/tmp/a.png")),
+            // Windows "Open with" passes `"%1"`: one argument with spaces and non-ASCII text.
+            (&["C:\\Users\\Юзер\\My Pictures\\стр 01.jpg"], Some("C:\\Users\\Юзер\\My Pictures\\стр 01.jpg")),
+            (&["/home/u/Картинки/page one.webp"], Some("/home/u/Картинки/page one.webp")),
+        ];
+        for (args, expected) in cases {
+            let cli = parse(args);
+            assert_eq!(cli.image_arg(), expected.map(Path::new), "command line {args:?}");
+        }
+    }
+
+    #[test]
+    fn open_targets_are_mutually_exclusive() {
+        use clap::error::ErrorKind;
+        assert_eq!(parse_error(&["--project", "/tmp/ch", "--image", "/tmp/a.png"]), ErrorKind::ArgumentConflict);
+        assert_eq!(parse_error(&["--project", "/tmp/ch", "/tmp/a.png"]), ErrorKind::ArgumentConflict);
+        assert_eq!(parse_error(&["--image", "/tmp/a.png", "/tmp/b.png"]), ErrorKind::ArgumentConflict);
+        // Only one positional exists: a second bare path is a usage error, not a second image.
+        assert_eq!(parse_error(&["/tmp/a.png", "/tmp/b.png"]), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn image_conflicts_with_terminal_modes_and_installed_copy_flags() {
+        assert!(conflicting_image_flags(&parse(&["/tmp/a.png", "--no-ai", "--trace", "--ignore-installed"])).is_empty());
+        assert!(
+            conflicting_image_flags(&parse(&["--check-venv", "--test-launcher", "--update"])).is_empty(),
+            "without an image these flags are legitimate"
+        );
+        assert_eq!(conflicting_image_flags(&parse(&["/tmp/a.png", "--check-venv"])), vec!["--check-venv"]);
+        assert_eq!(conflicting_image_flags(&parse(&["--image", "/tmp/a.png", "--test-launcher"])), vec!["--test-launcher"]);
+        assert_eq!(
+            conflicting_image_flags(&parse(&["/tmp/a.png", "--uninstall", "--check-venv", "--continue-update"])),
+            vec!["--check-venv", "--continue-update", "--uninstall"],
+            "modes first, then installed-copy flags in table order"
+        );
+    }
+
+    #[test]
+    fn clear_open_target_forgets_every_open_target() {
+        let mut cli = parse(&["--image", "/tmp/a.png", "--no-ai"]);
+        cli.clear_open_target();
+        assert!(cli.image_arg().is_none());
+        assert!(cli.no_ai, "flags other than the open target are untouched");
+        let mut cli = parse(&["/tmp/a.png"]);
+        cli.clear_open_target();
+        assert!(cli.image_arg().is_none());
+        let mut cli = parse(&["--project", "/tmp/ch"]);
+        cli.clear_open_target();
+        assert!(cli.project.is_none());
+    }
+
+    #[test]
+    fn check_image_arg_classifies_paths() {
+        let dir = std::env::temp_dir().join(format!("ms-args-image-check-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let file = dir.join("page one.png");
+        std::fs::write(&file, b"not decoded here").expect("write test file");
+        assert_eq!(check_image_arg(&file), Ok(()));
+        assert_eq!(check_image_arg(&dir), Err(ImageArgProblem::Directory));
+        assert_eq!(check_image_arg(&dir.join("missing.png")), Err(ImageArgProblem::NotFound));
+        std::fs::remove_dir_all(&dir).expect("remove test dir");
     }
 
     /// Turns a borrowed command line into the owned form `standalone_relaunch_args` takes.

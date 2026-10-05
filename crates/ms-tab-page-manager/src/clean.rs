@@ -1168,6 +1168,7 @@ mod tests {
             comic_type: None,
             canvas_settings: ms_project::CanvasSettings::default(),
             settings_data: Default::default(),
+            session: Default::default(),
         };
         let mut state = PageManagerTabState::default();
         state.set_overlays_model(Arc::new(model_for(&project.pages)));
@@ -1194,6 +1195,7 @@ mod tests {
             comic_type: None,
             canvas_settings: ms_project::CanvasSettings::default(),
             settings_data: Default::default(),
+            session: Default::default(),
         };
         let mut state = PageManagerTabState::default();
         // Nothing requested yet: nothing to wait for.

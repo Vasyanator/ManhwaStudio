@@ -4098,6 +4098,7 @@ dependencies = [
  "ms-memory",
  "ms-models",
  "ms-project",
+ "ms-raster",
  "ms-storage",
  "ms-sysprobe",
  "ms-text-render",

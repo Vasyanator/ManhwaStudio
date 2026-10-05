@@ -73,31 +73,35 @@ impl SettingsTabState {
                     self.canvas_settings.separate_pages,
                 );
                 let mut selected_preset = active_preset;
-                ui.horizontal(|ui| {
-                    ui.label(t!("settings.canvas_ribbon.preset_label"));
-                    ComboBox::from_id_salt("settings_canvas_ribbon_preset")
-                        .selected_text(selected_preset.display_name())
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut selected_preset,
-                                ComicType::Pages,
-                                ComicType::Pages.display_name(),
-                            );
-                            ui.selectable_value(
-                                &mut selected_preset,
-                                ComicType::Ribbon,
-                                ComicType::Ribbon.display_name(),
-                            );
-                            ui.selectable_value(
-                                &mut selected_preset,
-                                ComicType::Custom,
-                                ComicType::Custom.display_name(),
-                            );
-                        });
-                });
-                ui.small(
-                    t!("settings.canvas_ribbon.preset_custom_hint"),
-                );
+                // A single-image session's comic type is fixed to `Pages` by the open step (plan D4):
+                // the preset selector would only rewrite the throwaway scratch project.
+                if !self.single_image_session {
+                    ui.horizontal(|ui| {
+                        ui.label(t!("settings.canvas_ribbon.preset_label"));
+                        ComboBox::from_id_salt("settings_canvas_ribbon_preset")
+                            .selected_text(selected_preset.display_name())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut selected_preset,
+                                    ComicType::Pages,
+                                    ComicType::Pages.display_name(),
+                                );
+                                ui.selectable_value(
+                                    &mut selected_preset,
+                                    ComicType::Ribbon,
+                                    ComicType::Ribbon.display_name(),
+                                );
+                                ui.selectable_value(
+                                    &mut selected_preset,
+                                    ComicType::Custom,
+                                    ComicType::Custom.display_name(),
+                                );
+                            });
+                    });
+                    ui.small(
+                        t!("settings.canvas_ribbon.preset_custom_hint"),
+                    );
+                }
                 if selected_preset != active_preset
                     && let Some((aside_compact_mode, separate_pages)) =
                         selected_preset.canvas_preset()
@@ -189,16 +193,20 @@ impl SettingsTabState {
                                 .hint_text(t!("settings.canvas_ribbon.shared_exclusions_placeholder")),
                         )
                         .changed();
-                    ui.add_space(8.0);
-                    ui.label(t!("settings.canvas_ribbon.project_exclusions_label"));
-                    changed |= ui
-                        .add(
-                            egui::TextEdit::multiline(&mut self.project_spellcheck_custom_words)
-                                .desired_rows(6)
-                                .desired_width(f32::INFINITY)
-                                .hint_text(t!("settings.canvas_ribbon.project_exclusions_placeholder")),
-                        )
-                        .changed();
+                    // The project word list of a single-image session would live in its throwaway
+                    // scratch chapter, so it is not offered there.
+                    if !self.single_image_session {
+                        ui.add_space(8.0);
+                        ui.label(t!("settings.canvas_ribbon.project_exclusions_label"));
+                        changed |= ui
+                            .add(
+                                egui::TextEdit::multiline(&mut self.project_spellcheck_custom_words)
+                                    .desired_rows(6)
+                                    .desired_width(f32::INFINITY)
+                                    .hint_text(t!("settings.canvas_ribbon.project_exclusions_placeholder")),
+                            )
+                            .changed();
+                    }
                 });
 
                 changed |= ui

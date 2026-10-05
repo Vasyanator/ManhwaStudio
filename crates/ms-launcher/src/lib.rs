@@ -17,6 +17,7 @@ Key modules:
 - `first_run_language`: first-run interface/typesetting language-selection modal
 - `main_page`: rendering of the current main page
 - `new_project`: detached "New Project" window runtime and UI
+- `open_image`: main-menu "Open image" picker worker, path validation, outcome mapping (native only)
 - `pages`: animated fullscreen launcher subpages
 - `psd_import_window`: detached PSD/PSB import window, parsed in-process by `ag-psd`
 - `state`: shared launcher UI state and page enum
@@ -24,8 +25,8 @@ Key modules:
 - `tutorial`: launcher main-menu tutorial step script
 
 Notes:
-Launcher returns the selected or newly saved `project_dir` back into startup flow instead of
-spawning a second app process.
+Launcher returns the selected or newly saved `project_dir` (or a picked image path for
+single-image mode) back into startup flow instead of spawning a second app process.
 */
 
 #![warn(clippy::all)]
@@ -49,6 +50,8 @@ pub mod background;
 pub mod first_run_language;
 pub mod main_page;
 pub mod new_project;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod open_image;
 pub mod pages;
 pub mod psd_import_window;
 pub mod state;

@@ -84,7 +84,9 @@ enqueues it through `doc.saver_handle()`, falling back to a synchronous `save_pa
 saver is enabled. The just-enqueued bytes are guaranteed on disk by the save-to-project merge-worker
 barrier and the app-close drain. `layers_dirty` tracks whether the current page has an edit not yet
 enqueued (set on a deferred `edit_doc_node`, cleared on any enqueue/flush); the tab-switch
-`flush_layers` (in `app.rs`) only runs when it is set (conservative — flush when in doubt). Base layers
+`flush_layers` (in `app.rs`) only runs when it is set (conservative — flush when in doubt). It is also
+public as `has_deferred_layer_edits()`: until that flush the edit has not reached the autosave gate, so
+the single-image session counts it as unsaved work. Base layers
 are never part of the LAYER persistence (`persist_current_page` filters to `LayerKind::Raster`);
 they project `src/` and `clean_layers/`, and a `Клин` edit is persisted by the shared clean-overlay
 model's own autosave / save-to-project path instead. See `crates/ms-models/src/layer_model/` for the on-disk schema.
@@ -93,7 +95,7 @@ DISK READS AND STRUCTURAL WRITES: PS reads a page's layers from disk exactly ONC
 off-thread decode, inserted into the doc; every later state (rasters, text, and the PS-owned text pin
 meta `LayerNode.text_pinned` / `text_pinned_by_group`) comes from the doc (`materialize_text_runtime_from_doc`
 + `sync_view_from_doc`). Band / grouping / pin writes are saver jobs: `apply_structural_edit` is the single
-funnel (used by `move_band_one`, `move_group_block`, `persist_grouping` and the pin toggle) and, inside ONE
+funnel (used by `move_band_one`, `move_group_block` and `persist_grouping`) and, inside ONE
 `edit_doc_node` doc edit, enqueues `enqueue_page_band_order` / `enqueue_page_grouping`, mirrors the model
 change and pushes the resulting pin meta via `set_text_pin_meta`. The saver applies a structural job
 after the page's earlier raster + text + effects parts (FIFO), so `persist_current_page` before it is
@@ -119,15 +121,25 @@ doc falls back inside the enqueue.
     the same tree (no separate bottom section). Multi-select: plain = replace, Ctrl/Cmd = toggle,
     Shift = range (`select_row`). A right-click menu groups the selection (`GroupOp` → `apply_group_op`
     → `persist_grouping` → structural grouping job): create / move-to-existing / ungroup / delete. Per-row detail
-    (opacity, fx, merge, delete, pin, rasterize) lives in the **active-layer controls strip** at the
+    (opacity, fx, merge, delete, rasterize, ▲▼) lives in the **active-layer controls strip** at the
     bottom (`draw_active_controls`, keyed on `panel_primary`). The body has NO scroll area and no
     hand-computed height reserve of its own: the dock already draws every tab body inside a bounded
     `ScrollArea::both` and sizes the panel from the CONTENT's measured height, so a nested
     fixed-height scroll area would fight that measurement. Reordering routes through the unified
-    band order: `build_unified_order` produces a contiguous order (groups pulled to their lowest
-    member Z), `move_band_one` / `move_group_block` swap a band / a whole group block. Group
-    collapse/visibility/opacity are stack-only (folded live in `draw_composite`, persisted on
-    page-leave). The two grouping axes: `Layer.group`/`group_uid` (unified PS tree) vs typing's
+    band order: `build_unified_order` (over `tree::unified_band_order`) produces the panel's own row
+    order as a contiguous band order (a grouping edit's members pulled to their group's lowest
+    row; every text its own `PinnedText` band), and `move_band_one` (pure core
+    `band_order_after_move`) / `move_group_block` swap a band / a whole group block. Group
+    visibility/opacity are DOC-level (`write_group_meta` -> `LayerDoc::set_group_meta`), because the
+    typing canvas and the export fold the same groups: the eye persists at once (`route_to_doc`), an
+    opacity drag writes the doc per value change (persisted on tab-switch / page-leave) and records ONE
+    undo step per gesture (`group_opacity_gesture`). The text eye is doc-level too
+    (`write_text_visibility` -> `set_visibility` + `flush_text_page`), so a text hidden here is hidden in
+    typing and in its export ("what you see is what you save"). Collapse is panel-only VIEW state (no
+    undo step) with the doc as its one owner too (`LayerDoc::set_group_collapsed` via `route_to_doc`,
+    persisted at once; the stack copy is a projection). An undo / redo entry whose group or text was
+    deleted fails with `PsEditOpError::TargetGone` and is skipped, so the keypress reaches the next
+    applicable entry. The two grouping axes: `Layer.group`/`group_uid` (unified PS tree) vs typing's
     `layer_idx` text groups — kept independent so the typing tab is untouched.
 - `viewport.rs`: `PsViewport` camera (pan/zoom/fit/100%) and the per-frame `ViewTransform`
   (image↔screen mapping). Independent of the shared canvas engine.
@@ -183,8 +195,12 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   is never reordered, because `active_tool_idx` indexes it.
 - `tree.rs`: pure builder for the unified layers panel. `build_unified_tree(stack, text_layers,
   bands)` joins raster layers + text overlays + groups into one `Vec<TreeItem>` (group headers +
-  indented leaves) ordered top-to-bottom by the unified Z, with the same tiebreak as `draw_composite`
-  so panel order == composite order. The two base leaves close the list (they are the composite's
+  indented leaves) ordered top-to-bottom by the unified Z. The leaf order is asked from the same
+  owner the canvas draws with (`ordering::composite_plan`, every item passed as an order-only item:
+  visible, opaque, ungrouped — hidden rows stay listed), so panel order == composite order,
+  including unpinned doc texts and equal-Z ties. `ordered_user_rows` is the one builder of that
+  order; `unified_band_order` derives the structural band order from it (tests in
+  `composite_plan_tests.rs`). The two base leaves close the list (they are the composite's
   bottom) but are emitted in REVERSE stack order, so `Клин` sits above `Исходник` — the `LayerStack`
   vector itself is never reordered, because its raw order is load-bearing for `draw_composite`.
   A base leaf IS keyed (`RowSel::Base`) so it can be the panel's primary row; the structural lock
@@ -207,13 +223,16 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   and the panel body plus its reusable parameter card (`ui.rs`). Own `MODULE_README.md`; it never writes
   pixels, the doc or the saved project.
 - `edit_op.rs`: undo/redo operations on the generic `ms-actions` engine. `PsEditOp` is a
-  `ReversibleAction<Ctx = PsEditorTabState>` with four variants (real `match`, no `_ =>`, so every
+  `ReversibleAction<Ctx = PsEditorTabState>` with six variants (real `match`, no `_ =>`, so every
   variant is handled everywhere): `RasterPixels` (brush stroke as a tiled+zstd `RasterDiff`, Part A),
   `CleanPixels` (the same delta against the `Клин` base layer, carrying NO uid — base-layer uids are
   regenerated on every page load, so the target is resolved by `LayerKind::Clean`),
   `LayerLifecycle` (add/delete a whole raster layer, retaining `Box<Layer>` + its `z` for re-add), and
   `FieldPatch` (one metadata/geometry field — `LayerFieldPatch::{Visibility,Opacity,Transform,Deform}`
-  — carrying `before` + `after`). Pure, GUI-free cores unit-tested here: `apply_raster_diff_to_layer`
+  — carrying `before` + `after`), `GroupMeta` (a PS group's `GroupMetaValue` visible + opacity, one eye
+  toggle or one whole opacity drag) and `TextVisibility` (the text eye). All metadata ops apply through
+  the shared doc; a text-visibility apply also makes `finish_history_step` enqueue the page's text save.
+  Structural group ops (membership, create / delete, block moves) have no undo yet. Pure, GUI-free cores unit-tested here: `apply_raster_diff_to_layer`
   (diff → `Layer.image` + `base_image` mirror), `copy_region_premul` (region-local buffer), and
   `apply_field_patch_to_layer` (drives a `Layer` field to a patch's `after`; also the no-doc fallback).
 
@@ -400,6 +419,25 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   existing focus early-return). `handle_hotkeys` takes `&ProjectData` so undo/redo can persist.
 
 ## Contracts and invariants
+- **The user-layer composite order, visibility and group fold have ONE owner:
+  `ms_models::layer_model::ordering`.** `sync_view_from_doc` builds `self.bands` with
+  `ordering::doc_page_bands`; `draw_composite` turns the stack's user rasters (stack order, their OWN
+  visible/opacity + unified `group_uid`) and `text_layers` (creation order, opacity 1.0) into
+  `CompositeItem`s and draws `ordering::composite_plan` through the pure adapter `composite_steps`
+  (tests: `composite_plan_tests.rs`). So: band Z first, a raster below a text at equal Z, equal-rank
+  ties by input order (newest text on top, never page-Y), text band lookup uid-first, group opacity
+  clamped to `[0, 1]`, an unknown group uid folds as visible / 1.0. Every node-keyed band-Z lookup
+  (`merge_candidates_by_band_z`) goes through `ordering::band_z`; the layers tree and the
+  structural band order (`tree::ordered_user_rows` -> `build_unified_tree` / `unified_band_order`)
+  and the eyedropper (`sample_visible_composite`, via `composite_steps` with no texts) take their
+  order from the owner too, so ▲▼ and grouping ops act on the neighbour the user sees. The only
+  local lookup left is `raster_band_z` (an undo re-insert position with a 0 fallback, never a draw
+  key). A structural order names every text as its own `PinnedText` band, so ▲▼ works for an
+  unpinned text too and any move / grouping op persists every text of the page pinned at its
+  visible Z (`persist::apply_band_order`); ungroup / group delete only clear `pinned_by_group`.
+  There is NO pin toggle: text order is set only by ▲▼. The on-disk `pinned` / doc `text_pinned`
+  flags stay readable for compatibility and are rewritten only by those structural edits. The two BASE layers stay outside the plan (drawn first, view-only visibility/opacity via
+  `LayerStack::layer_visible` / `layer_opacity`). Do not re-implement ordering or the fold here.
 - **The panel's active row: `panel_primary` is always `Some` while a page is loaded, and always
   names a row that exists in the current tree.** The editor's model already guarantees an active
   layer (`LayerStack::active` is a plain `LayerId`, `Клин` on a fresh page); this is the PANEL half

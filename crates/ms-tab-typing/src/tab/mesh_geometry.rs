@@ -10,7 +10,10 @@ Main responsibilities:
 - draw selection paths, transform/bend/frame/grid handles, and textured deform
   mesh wireframes;
 - hit-test transform handles and classify pointer targets across text/raster
-  overlays;
+  overlays (`unified_topmost_pointer_target` compares by the composite owner's
+  `ordering::composite_rank`; callers pass only items the composite plan keeps)
+  and order the «Слои» panel rows (`order_unified_layer_rows`, the owner's
+  `ordering::composite_plan` order reversed, so panel order == canvas order);
 - sample and deform quad/mesh control points, and convert between page, scene,
   and UV coordinate spaces with clamping;
 - layer-MOVE pure math shared by the pointer drag and the arrow nudge
@@ -1068,19 +1071,21 @@ pub(super) enum TypingPointerTarget {
     None,
 }
 
-/// Picks the TOPMOST item (text overlay vs raster) under the pointer by UNIFIED band-Z, so the click
-/// goes to whatever is drawn on top — matching the canvas draw order exactly. `overlay_z` / `raster_z`
-/// are the topmost overlay's / raster's band-Z *if one is under the pointer* (else `None`). Ties go to
-/// the OVERLAY (text draws above a raster at the same band-Z, mirroring `merged_fills`' `(z, kind)`
-/// tiebreak where raster=0 < overlay=1). Pure, so it is unit-testable.
+/// Picks the TOPMOST item (text overlay vs raster) under the pointer by the composite plan's sort key,
+/// so the click goes to whatever is drawn on top — matching the canvas fill pass exactly. `overlay_z` /
+/// `raster_z` are the band-Z of the topmost overlay / raster under the pointer AMONG THE ITEMS THE
+/// COMPOSITE PLAN KEEPS (else `None`): the callers skip omitted items (`topmost_overlay_at` per overlay,
+/// `composited_raster_flags` for rasters), so a hidden or hidden-group item never wins here. The two are
+/// compared by `ordering::composite_rank`, under which a text ranks above a raster at an equal band-Z,
+/// so ties go to the OVERLAY. Pure, so it is unit-testable.
 pub(super) fn unified_topmost_pointer_target(
     overlay_z: Option<u32>,
     raster_z: Option<u32>,
 ) -> TypingPointerTarget {
+    use ms_models::layer_model::ordering::{CompositeKind, composite_rank};
     match (overlay_z, raster_z) {
         (Some(oz), Some(rz)) => {
-            // Equal band-Z → overlay wins (overlay draws above raster at the same band).
-            if oz >= rz {
+            if composite_rank(oz, CompositeKind::Text) > composite_rank(rz, CompositeKind::Raster) {
                 TypingPointerTarget::Overlay
             } else {
                 TypingPointerTarget::Raster
@@ -1146,17 +1151,32 @@ pub(super) enum TypingLayerRow {
     Raster(usize),
 }
 
-/// Orders the page's layer rows for the panel: by unified band-Z DESCENDING (top of the stack first),
-/// interleaving overlays and rasters. Tie-break at equal Z: OVERLAY above RASTER (matches the canvas
-/// draw/hit-test tie-break where raster=0 < overlay=1). The input is `(row, band_z, raster_below_overlay)`
-/// where the bool is `true` for a raster (sorts below an overlay at the same Z). Pure → unit-testable.
-pub(super) fn order_unified_layer_rows(mut rows: Vec<(TypingLayerRow, u32, bool)>) -> Vec<TypingLayerRow> {
-    // Sort TOP-first: higher Z first; at equal Z, overlay (raster_below=false) before raster (true).
-    rows.sort_by(|a, b| {
-        b.1.cmp(&a.1) // band-Z descending
-            .then_with(|| a.2.cmp(&b.2)) // false (overlay) before true (raster) at equal Z
-    });
-    rows.into_iter().map(|(row, _, _)| row).collect()
+/// Orders the page's layer rows for the «Слои» panel TOP-first, as exactly the canvas composite order
+/// reversed. `rows` must come in the canvas fill pass's input order — rasters in cache order, then
+/// overlays in overlay-index order — each with its composite key (`raster` uid / `text_composite_key`).
+/// They enter the one owner, `ordering::composite_plan`, as order-only items (visible, opaque,
+/// ungrouped), so band Z (uid-first), raster below overlay at an equal Z and later-input-on-top among
+/// equal ranks decide exactly as on the canvas, while hidden / dimmed rows stay listed. Pure.
+pub(super) fn order_unified_layer_rows(
+    bands: &[ms_models::layer_model::ordering::Band],
+    rows: &[(TypingLayerRow, ms_models::layer_model::ordering::CompositeKey<'_>)],
+) -> Vec<TypingLayerRow> {
+    use ms_models::layer_model::ordering::{CompositeItem, composite_plan};
+    let items: Vec<CompositeItem<'_>> = rows
+        .iter()
+        .map(|(_, key)| CompositeItem {
+            key: *key,
+            group_uid: None,
+            visible: true,
+            opacity: 1.0,
+        })
+        .collect();
+    // Every item is visible, opaque and ungrouped, so the plan omits none; it is bottom-to-top.
+    composite_plan(bands, &[], &items)
+        .iter()
+        .rev()
+        .filter_map(|step| rows.get(step.item).map(|(row, _)| *row))
+        .collect()
 }
 
 pub(super) fn select_rotation_handle_corner(quad: &[Pos2; 4], image_rect: Rect) -> usize {

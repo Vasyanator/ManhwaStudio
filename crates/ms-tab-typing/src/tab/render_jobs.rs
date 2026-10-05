@@ -100,6 +100,7 @@ impl TypingTextOverlayLayer {
         self.layers_fallback_dir = Some(main_layers_dir.clone());
         self.raster_layers_by_page.clear();
         self.bands_by_page.clear();
+        self.groups_by_page.clear();
 
         // Committed (non-staging) read source: migrated chapters have `text_info.json` under
         // `layers/`; older ones only under the legacy `text_images/` dir. Used as the save-time
@@ -184,6 +185,19 @@ impl TypingTextOverlayLayer {
                 page_paths,
             ));
         }
+    }
+
+    /// True iff the chapter load of `project` has fully settled: the initial overlay loader finished
+    /// for THIS chapter directory and no eager migration is pending or running (a migration finishing
+    /// later evicts pages from the doc, so a snapshot taken before it could miss its text). Cheap field
+    /// reads. The single-image flatten-to-file gates on it because it may run before the typing tab was
+    /// ever drawn.
+    #[must_use]
+    pub(super) fn chapter_load_settled(&self, project: &ProjectData) -> bool {
+        self.loading_rx.is_none()
+            && self.loaded_project_dir.as_deref() == Some(project.project_dir.as_path())
+            && self.pending_migration.is_none()
+            && self.migration_rx.is_none()
     }
 
     /// Spawns the eager chapter-migration worker for the `pending_migration` request captured at open.
@@ -276,6 +290,7 @@ impl TypingTextOverlayLayer {
                             // migrated bands/text; pages left resident in the doc keep their caches.
                             for &page in &refreshed_pages {
                                 self.bands_by_page.remove(&page);
+                                self.groups_by_page.remove(&page);
                                 self.raster_layers_by_page.remove(&page);
                             }
                         }
@@ -448,6 +463,7 @@ impl TypingTextOverlayLayer {
     pub(super) fn invalidate_raster_cache_for_page(&mut self, page_idx: usize) {
         self.raster_layers_by_page.remove(&page_idx);
         self.bands_by_page.remove(&page_idx);
+        self.groups_by_page.remove(&page_idx);
         if let Some(doc) = &self.layer_doc
             && let Ok(mut guard) = doc.lock()
         {
@@ -578,6 +594,7 @@ impl TypingTextOverlayLayer {
         if !resident {
             self.raster_layers_by_page.remove(&page_idx);
             self.bands_by_page.remove(&page_idx);
+            self.groups_by_page.remove(&page_idx);
         }
         self.ensure_raster_layers_for_page(page_idx);
         let node = LayerNode {

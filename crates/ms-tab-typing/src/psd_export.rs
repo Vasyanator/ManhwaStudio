@@ -340,7 +340,7 @@ pub(super) fn build_typing_page_psd(
         }
         text_index += 1;
         let deform_mesh = export_overlay_deform_mesh_for_page(overlay, [page_w, page_h]);
-        let clipped_rgba = export_overlay_clipped_rgba(job, overlay, &deform_mesh);
+        let clipped_rgba = export_overlay_clipped_rgba(job.mask.as_ref(), overlay, &deform_mesh);
         let mut ambiguous: Option<AmbiguousExportFont> = None;
         let text_data =
             build_layer_text_data(overlay, &job.font_post_script_names, &mut ambiguous);
@@ -810,7 +810,8 @@ mod tests {
                 }
             })),
             uid: "ov-a".into(),
-            band_z: 0,
+            group_uid: None,
+            visible: true,
         };
 
         // Оверлей B: с деформирующим мешем.
@@ -842,7 +843,8 @@ mod tests {
                 }
             })),
             uid: "ov-b".into(),
-            band_z: 0,
+            group_uid: None,
+            visible: true,
         };
 
         let job = TypingExportPageJob {
@@ -853,6 +855,8 @@ mod tests {
             clean_overlay_rgba: None,
             overlays: vec![ov_a, ov_b],
             rasters: Vec::new(),
+            bands: Vec::new(),
+            groups: Vec::new(),
             mask: None,
             export_format: TypingExportFormat::Psd,
             layers_primary_dir: None,
@@ -973,7 +977,8 @@ mod tests {
             source_rgba: solid_overlay_rgba(4, 4, [0, 0, 0, 255]),
             render_data_json: Some(json!({ "text_params": text_params })),
             uid: "ov".into(),
-            band_z: 0,
+            group_uid: None,
+            visible: true,
         };
         let mut ambiguous = None;
         let data = build_layer_text_data(&overlay, index, &mut ambiguous);
@@ -1080,7 +1085,8 @@ mod tests {
                 }
             })),
             uid: uid.into(),
-            band_z: 0,
+            group_uid: None,
+            visible: true,
         };
         let job = TypingExportPageJob {
             page_idx: 0,
@@ -1093,6 +1099,8 @@ mod tests {
                 overlay("b", "Shared-Regular%9999999999999999"),
             ],
             rasters: Vec::new(),
+            bands: Vec::new(),
+            groups: Vec::new(),
             mask: None,
             export_format: TypingExportFormat::Psd,
             layers_primary_dir: None,

@@ -129,7 +129,9 @@ The main data flow is:
    `text_images/`) is READ-ONLY input: it is loaded as a fallback and converted once by the eager
    chapter migration (`tab/render_jobs.rs` -> `ms_models::layer_model::migrate`), which renames the
    PNGs and retires the file to `.bak` last. Page masks (`mask.rs`) are a separate store and remain
-   under `text_images/`.
+   under `text_images/`; they are outside the autosave gate's writers, so mask edits are counted by
+   `TypingMaskLayer::edit_count` (one per brush gesture / applied fill / page clear, exposed as
+   `TypingTabState::mask_edit_count`) for callers that track "changed since" (the single-image save).
 2. INITIAL load of a legacy chapter reads `text_info.json` + referenced PNG files on worker threads,
    trying the unsaved `layers/`, committed `layers/`, then legacy `text_images/` dirs in order. Each
    overlay carries a stable `uid` (minted on creation or on first load). Legacy placement schemas are
@@ -154,6 +156,24 @@ The main data flow is:
    routes through the doc + a band-order save job (`enqueue_page_band_order`), exactly like the PS editor's band move, so
    a later flush never clobbers it (`merge_preserved_text_fields` keeps the pinned Z). Draw order,
    interaction, and export all sort by this unified band-Z (the old `overlay_stack_cmp` is gone).
+   The ORDER RULE itself is not this crate's: `ms_models::layer_model::ordering` owns band-Z lookup
+   (`band_z`, uid first), the (band-Z, raster below text) rank and the composite plan (own visibility +
+   PS unified group visibility/opacity fold, stable input-order ties). The tab projects its inputs —
+   `bands_by_page` (`ordering::doc_page_bands`), `groups_by_page` (the doc page's PS groups; disk:
+   `PageRasters::groups`), and per runtime `group_uid` (+ the text node's `visible`) — in `sync_from_doc`,
+   which `maybe_reproject_from_doc_version` reruns on every doc version bump, so a PS group eye / opacity
+   (`LayerDoc::set_group_meta`) or PS text eye (`set_visibility`) reaches the canvas and the export live;
+   `raster_band_z` / `overlay_band_z` delegate to `band_z`, and BOTH the canvas and the export flatten
+   draw in plan order. Canvas (`tab/draw_page.rs`): `page_fill_plan` (over `page_composite_inputs`)
+   orders `draw_entries` (overlay draw + egui interaction order) and the unified fill pass
+   (`merged_fill_plan`); an item the plan omits (hidden node, hidden or zero-opacity PS group) is
+   neither drawn, nor interactive, nor a bubble occluder, and a kept one is tinted by its step opacity
+   (premultiplied white tint on all four channels, `composite_step_tint`; it applies to deformed rasters
+   too). Hit-tests skip omitted items: `topmost_overlay_at` per overlay, `composited_raster_flags` for
+   the raster entries of `interact_page_rasters`, and `unified_topmost_pointer_target` compares the two
+   winners by `ordering::composite_rank`. A text carries no opacity of its own (item opacity 1.0); only
+   its PS group dims it. `text_composite_key` / `text_composite_item` / `raster_composite_item`
+   (`tab/doc_layers.rs`) are the one item -> owner mapping, shared by canvas and flatten.
    `sync_from_doc` is doc-authoritative for
    text: it reconciles-OR-CREATES — a doc Text node with no local `overlays` runtime is MATERIALIZED
    from the node (`text_runtime_from_doc_node`, mirroring PS's `sync_view_from_doc`). This is what makes
@@ -215,7 +235,8 @@ The main data flow is:
    skipped. **Unified click hit-test (text vs raster):** the raster interaction runs after the overlay
    pass, and egui awards the click to the later-registered widget, so a raster could steal a click that
    lands on a higher-Z text overlay. Before the raster interaction, the topmost overlay and topmost
-   raster UNDER THE POINTER are resolved by unified band-Z (`topmost_overlay_at` / `topmost_raster_target`
+   raster UNDER THE POINTER (only items the composite plan keeps) are resolved by unified band-Z
+   (`topmost_overlay_at` / `topmost_raster_target`
    + `raster_band_z`), and `unified_topmost_pointer_target` (pure, overlay wins ties — text draws above a
    raster at the same band) decides the winner: if the overlay wins, the raster pass is gated out and the
    winning overlay is selected directly on a primary click (egui already routed the click to the raster);
@@ -237,9 +258,15 @@ The main data flow is:
    tab (`typing.layers`), sharing a panel with «Действия»; its body is
    `TypingTextOverlayLayer::draw_layers_tab_body(ui, page_idx)`, because the layer state lives on
    `text_overlays`. The «Слои» body is ONE unified,
-   interleaved list of ALL the page's layers — text overlays, image overlays, AND rasters — ordered by
-   unified band-Z DESCENDING (top first), with overlay-above-raster on a Z tie (`order_unified_layer_rows`,
-   the canvas/hit-test tie-break). Every row has ⬆/⬇ moving it one step in the unified Z (overlay →
+   interleaved list of ALL the page's layers — text overlays, image overlays, AND rasters — top first, in
+   EXACTLY the canvas composite order reversed (`unified_layer_rows` -> `order_unified_layer_rows`: the
+   rows enter `ordering::composite_plan` as order-only items in the fill pass's input order, so band Z,
+   overlay above raster at an equal Z and newest-on-top among equal ranks match the canvas; hidden rows
+   stay listed). A text/image row carries the doc visibility eye (`toggle_overlay_visibility`:
+   `LayerDoc::set_visibility` through `route_to_doc_reporting`, persisted by the deferred text save
+   `mark_placement_save_dirty`; shared with the PS text eye; the typing tab has no undo history, so it
+   records none), and a hidden row is drawn dimmed — the row is the only way back to a text the canvas
+   no longer draws. Every row has ⬆/⬇ moving it one step in the unified Z (overlay →
    `move_overlay_in_unified_z`, raster → `move_raster_in_unified_z`; both route through the shared doc band
    reorder so kinds interleave), at most one move per frame; clicking a row selects it (opening the
    right-side edit panel). The list WIDTH is whatever the dock panel gives it — the panel's own resize
@@ -313,16 +340,32 @@ The main data flow is:
    payload reach `layers/` through the doc's text flush (`tab/persist.rs`, deferred-save policy).
 6. Export workers compose page source, shared clean overlay snapshots, text/image
    overlays, deform meshes, and optional typing masks into final page images
-   (`flatten_typing_export_page_rgba`, shared by PNG and PSD). Export is GATED on full residency
+   (`flatten_typing_export_page_rgba`, shared by PNG, PDF and PSD). The flatten is two steps:
+   `resolve_flatten_input(job) -> FlattenPageInput` (worker I/O: page decode through the storage seam,
+   then the raster/band/group source — the job's on-screen snapshot with its in-memory `bands`/`groups`,
+   or, when the job carries NO raster snapshot, the `layers.json` disk fallback: disk rasters, disk
+   groups and disk bands, the latter then giving the TEXT band-Z too) and the pure
+   `flatten_page_rgba(FlattenPageInput) -> RgbaImage` (no I/O; order, visibility and PS group fold
+   from `ordering::composite_plan`; a full-opacity item is drawn byte-identically, a dimmed one has its
+   alpha scaled once; a NaN opacity omits the item and is logged once). So the export honours PS group
+   visibility/opacity for rasters and text, and the text node's own visibility. KNOWN GAP (accepted,
+   single-image-mode Phase 0): the PSD writer (`psd_export.rs`) still lists EVERY text overlay snapshot
+   as a plain visible layer — a hidden text node or a text in a hidden / dimmed PS group is not written
+   as a hidden / dimmed PSD layer, so the PSD's layer list disagrees with its flattened composite image.
+   Fix: set the PSD layer's hidden flag (and opacity) from a one-item `ordering::composite_plan`, as
+   `topmost_overlay_at` does. Jobs are built page by page by
+   `build_page_job` (residency, raster + overlay snapshots carrying `uid`/`group_uid`/`visible`, the
+   page's bands and groups), which `request_export` calls for every page. Export is GATED on full residency
    (Phase 2): the trigger defers dispatch behind the whole-project preload (see the preload contract
-   below) so EVERY page's text is materialized before snapshotting. ORDERING: `request_export`
-   builds the text/image overlay snapshot (`build_export_overlay_snapshots`) AFTER the raster residency
-   pass (`ensure_raster_layers_for_page` -> `sync_from_doc`), not before — building it earlier silently
+   below) so EVERY page's text is materialized before snapshotting. ORDERING: `build_page_job`
+   builds the page's text/image overlay snapshot (`export_overlay_snapshots_for_page`) AFTER that page's
+   residency pass (`ensure_raster_layers_for_page` -> `sync_from_doc`), not before — building it earlier silently
    dropped the text of migrated/v3 pages the user never visited (their overlays materialize into
-   `self.overlays` only on load). The `rasters_by_page` snapshot is built from the same fully-materialized
+   `self.overlays` only on load). The raster snapshot is built from the same fully-materialized
    projection. PS **raster layers are composited from an
    on-screen SNAPSHOT** (`TypingExportRasterSnapshot` taken from `raster_layers_by_page` at export time,
-   carrying the post-effects display RGBA + transform/deform + band-Z), so the bake matches the canvas
+   carrying the post-effects display RGBA + transform/deform + uid/group; its band-Z comes from the
+   job's `bands`), so the bake matches the canvas
    exactly; it falls back to a disk read of `layers.json` only when the job carries no snapshot. (A pure
    disk re-read silently DROPPED rasters whose `_fx.png` render or staging manifest was missing/stale.)
    Before composing, the export worker (never the GUI thread) barriers the layer saver, because the
@@ -397,8 +440,9 @@ saving, and export.
   - `draw_page.rs`: `draw_page_overlays` (master per-page draw) — takes the per-page `PageView`
     transform plus a `TypingPageInteractionPolicy` snapshot (mask/focus/eyedropper/auto-type/strict-pixel
     flags + `TypingCenteringAssistConfig`) built in the canvas hook before `text_overlays` is borrowed; its
-    `ctx` comes from `ui.ctx()`. Plus repaint/visibility/pixel-snap and centering-assist helpers
-    (`draw_centering_assist` takes a `CenteringMarker` + `PageView` + centering config).
+    `ctx` comes from `ui.ctx()`. Plus the composite-plan fill order (`merged_fill_plan`,
+    `page_fill_plan`, `composited_raster_flags`), repaint/visibility/pixel-snap and centering-assist
+    helpers (`draw_centering_assist` takes a `CenteringMarker` + `PageView` + centering config).
   - `move_layer.rs`: the ONE whole-layer MOVE primitive — the move session's lifecycle
     (`begin_layer_move` / `drive_pointer_layer_move` / `add_keyboard_layer_move_step` /
     `settle_layer_move` / `drive_layer_move_settle`), the single arrow-nudge entry point for both
@@ -442,7 +486,8 @@ saving, and export.
     `use_dark_shape_variant_checkerboard`. The VALUE is `pub(crate)` because
     the sibling `panel` module picks one of three flat greys behind a local-preset row and
     must not grow a second luminance rule to do it.
-  - `export.rs`: export jobs, page composition/flatten free fns, and the TWO export
+  - `export.rs`: export jobs (`build_page_job`), page composition/flatten free fns (the I/O
+    `resolve_flatten_input` and the pure `flatten_page_rgba`), and the TWO export
     pipelines. `resolve_export_route` is the single decision point mapping
     (format × destination × re-pagination) onto `StreamedFiles` (today's per-page
     compose→encode→write, unchanged for PNG/PSD without re-pagination),
@@ -451,6 +496,12 @@ saving, and export.
     `TypingComposeWindow` (Mutex+Condvar sliding window) to keep peak memory bounded.
     Incompatible combinations (PSD + re-pagination, format/destination mismatch) are hard
     errors, never silently reinterpreted.
+  - `flatten_to_file.rs` (native only): the single-image «Сохранить» API of `TypingTabState` —
+    `prepare_flatten_to_file` / `request_flatten_to_file` / `poll_flatten_to_file` and the typed
+    `FlattenToFileRequest` / `FlattenReadiness` / `FlattenToFileReport` / `FlattenToFileError`
+    (re-exported from `lib.rs`). One page, the project export's composite (`build_page_job` +
+    `resolve_flatten_input` + `flatten_page_rgba`), `image_encode::encode_rgba`, then
+    `ms_docstore::write_bytes_atomic` on the worker. See "FLATTEN TO FILE" under contracts.
   - `codec.rs`: `render_data`/`TextRenderParams` parsers and overlay storage-entry normalize/parse.
   - `helpers.rs`: selection→page resolution, bubble/area seed text (incl. the `BubbleClass::Hint`
     exclusion predicates `is_hint_bubble` / `bubble_offers_create_text_header`), doc-node runtime,
@@ -696,6 +747,15 @@ saving, and export.
   box is 1 px = 1 pt, scaled down by one shared factor when a side would exceed PDF's
   hard 14400 pt limit — the pixels are kept, the sheet is simply physically smaller.
   Returns bytes; the caller owns the `ms_storage` write.
+- `image_encode.rs` (pub): pure in-memory encode of a straight-RGBA8 image to PNG, JPEG (always
+  flattened over white by `ms_raster::rgba_over_white_to_rgb`) or lossless WebP, with an
+  `AlphaPolicy` (RGB8 when fully opaque) and an optional ICC profile embedded verbatim (an encoder
+  that cannot embed one is logged, not fatal). `EncodeError` is technical; callers localize.
+  `in_place_format` is the SINGLE owner of the single-image «Сохранить» writability rule (content
+  PNG / JPEG / WebP, not animated, extension agrees with content); `ImageSaveFormat::in_place_for`
+  is only its adapter over an `ms_project::SingleImageSession`. The project PNG export
+  (`tab/export.rs` `encode_export_page_png`) encodes through it with `KeepRgba` and no ICC, which
+  must stay byte-identical to a bare `PngEncoder` (guarded by a test there).
 - `rotation_ctrl_wheel`: app-wide runtime-global (`RotationCtrlWheelMode` Vector/Raster,
   default Vector) selecting how the Ctrl+wheel gesture rotates a selected overlay. Config-free;
   seeded at startup from `TextTab.rotation_ctrl_wheel_mode`, written by the settings "Тайп" pane,
@@ -1146,6 +1206,29 @@ saving, and export.
   no-resurrect on apply, snapshot-after-materialization, and the mask-loader gate — are covered directly
   against `insert_decoded_page`, `build_export_overlay_snapshots`, and `masks_loaded_for_dir`, the exact
   steps the driver and export perform.
+- FLATTEN TO FILE (single-image mode, `tab/flatten_to_file.rs`): the app's session controller calls
+  `prepare_flatten_to_file(ctx, project)` EVERY frame, from whatever tab is active, until it returns
+  `Ready`; it starts and drives the overlay loader, the eager migration, ONE whole-chapter layer-preload
+  pass and the clip-mask loader itself, because `TypingTabState::draw` drives them only while the typing
+  tab is drawn. `request_flatten_to_file` refuses with `NoSuchPage`, or with `Busy` unless the gate holds:
+  the export gate `export_dispatch_ready` (pass drained, masks loaded, no save) AND chapter load settled
+  AND the page resident (or the preparation's pass drained — the export's give-up semantics) AND no
+  flatten / no running or deferred project export AND the projection current with the shared
+  `LayerDoc` (`doc_synced`): a page already resident is never re-read by `build_page_job`, so
+  `prepare_flatten_to_file` re-projects a PS-tab doc edit itself (`drive_doc_sync_without_draw`: polls
+  the save / create / effects / edit jobs that make `maybe_reproject_from_doc_version` back off, then
+  re-projects the canvas's current page — the single-image chapter's only one). The worker barriers the
+  layer saver, snapshots the клин like the export, flattens, encodes and writes atomically; an EXISTING
+  target is canonicalized first so a symlink survives and its permissions are re-applied (owner, ACLs
+  and hard links are not kept); a failed write leaves the old file and no temp. EXPORT⇄FLATTEN mutual
+  exclusion: `draw` folds `flatten_to_file_in_progress()` into the `save_busy` term the export trigger and
+  `run_pending_export_if_ready` read, so an export is deferred while a flatten runs; the flatten's result
+  must be collected with `poll_flatten_to_file` (the app polls it every frame), or exports stay deferred.
+  In a single-image session (`ProjectData::is_single_image`) the actions tab hides the export format row,
+  the re-pagination block and the export button (`set_single_image_mode`), and every panel file dialog
+  defaults into `ProjectData::user_facing_dir()` (the picture's folder), never into the scratch chapter,
+  which is deleted on exit. The clip masks are still saved into the chapter's `text_images/` on
+  mask-panel close; in single-image mode that directory is inside the scratch.
 - Any new executable runtime logic in this module needs focused tests or an explicit
   documented reason if testing is not currently practical.
 - UI strings are localized through `ms-i18n` (`t!`/`tf!`, keys under `typing.*`), NOT
@@ -1398,6 +1481,9 @@ saving, and export.
   its pure page-px<->normalized conversions and the layout-gating predicate live in `tab/mesh_geometry.rs`.
 - To change persisted overlay schema parsing/normalization, edit `tab/codec.rs`.
 - To change export composition or either export pipeline, edit `tab/export.rs`.
+- To change the single-image flatten-to-file (gates, preparation, target write), edit
+  `tab/flatten_to_file.rs`; the composite itself stays in `tab/export.rs` and the encoders in
+  `image_encode.rs`.
 - To change how re-paginated pages are stitched or sliced, edit `export_repaginate.rs`; to
   change the PDF the `Pdf` format emits, edit `pdf_export.rs`. Both are pure — keep I/O and
   the `ms_storage` writes in `tab/export.rs`.

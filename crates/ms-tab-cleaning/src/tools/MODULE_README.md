@@ -510,6 +510,13 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   next `draw_overlay_ui`, the `CleaningDockOut` rule at tool scope. Each `wants_*` answer is the
   tool's OWN single source of truth and is re-asked every frame; the tab never caches it and
   never keeps a second copy.
+- `CleaningTool::set_single_image_session` (defaulted no-op) is pushed by the tab every frame
+  BEFORE `canvas.draw`, because the dock bodies that must hide a feature run inside it. Two tools
+  react: the watermark tool never runs or offers «По главе» there (`effective_watermark_mode`
+  falls back to `MaskOnly` for the session, the persisted mode is rewritten only by a real pick,
+  `start_chapter_request` refuses anyway, the library panel stays hidden) — the chapter mode keys
+  the GLOBAL library by the chapter's parent folder, which would be the scratch root; the stamp
+  tool forces `CurrentImage` and hides its mode row (`stamp_mode_for_session`, no `alt_vers`).
 - `capture_overlay_chunk`, `extract_overlay_chunk`, `overlay_rect_to_scene_rect`,
   `scene_pointer_to_image_px`, `scene_pos_to_source_xy`, `scene_pos_to_overlay_pos`,
   `overlay_pos_to_scene_pos` and `overlay_pixel_for_final_color` are reachable as `pub(super)` items

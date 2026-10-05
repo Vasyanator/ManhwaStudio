@@ -17,7 +17,8 @@ Main types:
 Flow:
 - `draw_text_detector_panel(ui, options, plan_notices, view)`: renders status, options, the
   current page's plan notice (`plan_notice_text`, planned through the cache after the option
-  widgets ran) and action buttons.
+  widgets ran) and action buttons. The Save button is drawn only while
+  `view.storage_available` (false in a single-image session).
 - `TextDetectorPanelOptions::run_mode()` -> `TextDetectorRunMode::plan_inputs()` ->
   `ms_text_detect::plan_detection` is the one chain both the notice and the worker use, so
   the notice announces exactly the resize / tiling the run will do.
@@ -397,6 +398,10 @@ pub struct TextDetectorPanelView<'a> {
     pub can_ocr_current: bool,
     pub can_ocr_all: bool,
     pub can_save: bool,
+    /// Whether the chapter's detection storage exists for this session. `false` in a
+    /// single-image session, whose scratch chapter is deleted on exit: the Save button is not
+    /// drawn at all there.
+    pub storage_available: bool,
     pub edit_lines_mode: bool,
     pub edit_mask_mode: bool,
     /// Size of the current page (`detector_page_size`), or `None` while unknown. The panel
@@ -427,6 +432,7 @@ pub fn draw_text_detector_panel(
         can_ocr_current,
         can_ocr_all,
         can_save,
+        storage_available,
         edit_lines_mode,
         edit_mask_mode,
         page_size,
@@ -569,12 +575,13 @@ pub fn draw_text_detector_panel(
     {
         actions.detect_all = true;
     }
-    if ui
-        .add_enabled(
-            can_save && !detect_busy && !ocr_busy,
-            egui::Button::new(t!("translation.text_detector_panel.save_selection_button")),
-        )
-        .clicked()
+    if storage_available
+        && ui
+            .add_enabled(
+                can_save && !detect_busy && !ocr_busy,
+                egui::Button::new(t!("translation.text_detector_panel.save_selection_button")),
+            )
+            .clicked()
     {
         actions.save_results = true;
     }

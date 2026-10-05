@@ -1030,6 +1030,9 @@ impl CleaningTabState {
         let space_pan_active = space_down;
         if let Some(active_tool) = self.tools.get_mut(self.active_tool_idx) {
             active_tool.set_space_pan_active(space_pan_active);
+            // Before `canvas.draw`: the tool's dock bodies run inside it and hide what a
+            // single-image session does not offer.
+            active_tool.set_single_image_session(project.is_single_image());
         }
         let block_drag_scroll = self.tools.get(self.active_tool_idx).is_some_and(|tool| {
             (primary_down && tool.block_canvas_drag_scroll_on_primary())

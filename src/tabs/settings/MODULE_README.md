@@ -101,6 +101,9 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `cache_pages` it is a cross-project USER preference: written to both the user and project canvas
   files by `crates/ms-canvas/src/settings.rs`, but loaded user-file-primary with a project fallback in
   `crates/ms-project/src/lib.rs::canvas_settings_from_config`.
+  In a single-image session (`SettingsTabState::set_single_image_session`, set by `MangaApp`) it
+  hides the comic-type preset and the project word list: their "project" is the throwaway scratch
+  chapter, and the spellcheck menu loses its project-dictionary target.
 - `typesetting/`: "Тайп" pane SUBMODULE (see its own `MODULE_README.md`). `mod.rs` is the
   orchestrator; `font_settings.rs` + `font_properties_window.rs` are the settings-local
   font-administration UI. The pane hosts the app-wide

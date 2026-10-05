@@ -544,6 +544,7 @@ impl TypingCreatePanelState {
             clean_overlays_visible,
             strict_pixel_movement,
             export_default_dir,
+            single_image,
             export_status,
             export_format,
             comic_type,
@@ -572,7 +573,10 @@ impl TypingCreatePanelState {
             if ui.button(mask_button_label).clicked() {
                 out.toggle_mask = true;
             }
-            if self.preview_enabled {
+            // Project-export controls exist only in the project mode: a single-image session writes
+            // its picture through the app's «Сохранить», never through a project export.
+            let export_controls_visible = self.preview_enabled && !single_image;
+            if export_controls_visible {
                 let mut format = export_format;
                 ui.horizontal(|ui| {
                     ui.label(t!("typing.export.format_label"));
@@ -594,11 +598,11 @@ impl TypingCreatePanelState {
             // reported to the facade, which expires the page-title confirmation whenever the
             // block that hosts it was not drawn. Re-deciding it there would be a second copy
             // of this condition, free to drift from this one.
-            out.repaginate_block_drawn = self.preview_enabled && repaginate_block_visible(export_format);
+            out.repaginate_block_drawn = export_controls_visible && repaginate_block_visible(export_format);
             if out.repaginate_block_drawn {
                 draw_repaginate_block(ui, comic_type, repaginate, repaginate_pages_warning, &mut out);
             }
-            if self.preview_enabled {
+            if export_controls_visible {
                 // Primary export action: painted green to stand out among the
                 // neutral secondary buttons in this panel. The surrounding group
                 // keeps the theme's default stroke.

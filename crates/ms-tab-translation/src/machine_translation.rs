@@ -38,6 +38,8 @@ Context replicas:
   `batch_size`-th translatable replica, so context past a reached per-batch limit is deferred to a
   later window. Context replicas are flagged `"context": true` in the prompt and are never returned,
   counted, or reported as failures.
+- Which title documents (notes template, characters, terms) a system prompt reads is decided only by
+  `project_context_sources`; a single-image session reads none of them.
 */
 
 // AI API machine translation runs over `genai` (reached through `ms_ai_api`, which also
@@ -1842,24 +1844,60 @@ fn build_ai_mt_system_prompt(
     parts.join("\n\n")
 }
 
+/// Which title documents the MT system prompt reads for project context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProjectContextSources {
+    /// The notes template (which itself pulls in characters and terms).
+    notes: bool,
+    /// The character roster, outside the notes template.
+    characters: bool,
+    /// The term list, outside the notes template.
+    terms: bool,
+}
+
+/// Decides which project-context documents a run reads from the panel toggles. The notes
+/// template replaces the two separate blocks. A single-image session has no title, so it reads
+/// none of them whatever the persisted toggles say (the panel hides them there): the documents
+/// would be looked up inside the throwaway scratch directory.
+fn project_context_sources(
+    use_notes_prompt: bool,
+    include_characters: bool,
+    include_terms: bool,
+    single_image: bool,
+) -> ProjectContextSources {
+    if single_image {
+        return ProjectContextSources { notes: false, characters: false, terms: false };
+    }
+    ProjectContextSources {
+        notes: use_notes_prompt,
+        characters: !use_notes_prompt && include_characters,
+        terms: !use_notes_prompt && include_terms,
+    }
+}
+
 /// Appends the optional project-context prompt blocks (notes template, or characters + terms) shared
-/// by the normal and per-ImageBubble system prompts.
+/// by the normal and per-ImageBubble system prompts; which ones is `project_context_sources`.
 fn push_project_context_parts(parts: &mut Vec<String>, options: &AiMtOptions) {
-    if options.use_notes_prompt {
-        if let Some(notes) = build_notes_prompt(&options.project, true, true) {
-            parts.push(format!("Secondary project notes:\n{notes}"));
-        }
-    } else {
-        if options.include_characters
-            && let Some(chars) = build_characters_prompt(&options.project)
-        {
-            parts.push(chars);
-        }
-        if options.include_terms
-            && let Some(terms) = build_terms_prompt(&options.project)
-        {
-            parts.push(terms);
-        }
+    let sources = project_context_sources(
+        options.use_notes_prompt,
+        options.include_characters,
+        options.include_terms,
+        options.project.is_single_image(),
+    );
+    if sources.notes
+        && let Some(notes) = build_notes_prompt(&options.project, true, true)
+    {
+        parts.push(format!("Secondary project notes:\n{notes}"));
+    }
+    if sources.characters
+        && let Some(chars) = build_characters_prompt(&options.project)
+    {
+        parts.push(chars);
+    }
+    if sources.terms
+        && let Some(terms) = build_terms_prompt(&options.project)
+    {
+        parts.push(terms);
     }
 }
 
@@ -2644,11 +2682,33 @@ mod tests {
         build_ai_mt_imagebubble_request_preview, build_ai_mt_request_preview,
         imagebubble_context_line_for_item, imagebubble_context_line_for_target,
         parse_ai_mt_response, prepare_mt_image_for_detail,
-        sort_ai_mt_items, split_ai_mt_batches,
+        sort_ai_mt_items, split_ai_mt_batches, ProjectContextSources, project_context_sources,
     };
     use ms_project::{CanvasSettings, ProjectData, ProjectPaths};
     use std::path::PathBuf;
     use std::sync::Arc;
+
+    /// The notes template replaces the two separate blocks in a project, and a single-image
+    /// session reads no project-context document whatever the persisted toggles say.
+    #[test]
+    fn project_context_sources_follow_the_toggles_and_skip_single_image_sessions() {
+        let none = ProjectContextSources { notes: false, characters: false, terms: false };
+        assert_eq!(
+            project_context_sources(true, true, true, false),
+            ProjectContextSources { notes: true, characters: false, terms: false }
+        );
+        assert_eq!(
+            project_context_sources(false, true, false, false),
+            ProjectContextSources { notes: false, characters: true, terms: false }
+        );
+        assert_eq!(
+            project_context_sources(false, false, true, false),
+            ProjectContextSources { notes: false, characters: false, terms: true }
+        );
+        for (notes, characters, terms) in [(true, true, true), (false, true, true), (false, false, false)] {
+            assert_eq!(project_context_sources(notes, characters, terms, true), none);
+        }
+    }
 
     /// Minimal in-memory `ProjectData` for tests that do not touch image binaries or notes files.
     fn empty_project() -> ProjectData {
@@ -2687,6 +2747,7 @@ mod tests {
             comic_type: None,
             canvas_settings: CanvasSettings::default(),
             settings_data: serde_json::Value::Null,
+            session: Default::default(),
         }
     }
 

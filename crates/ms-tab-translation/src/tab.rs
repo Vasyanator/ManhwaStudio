@@ -84,6 +84,8 @@ Panel dock:
 Characters/footer sync:
 - `ensure_character_names_loaded`, `reload_character_names`: load character names cache.
 - `maybe_refresh_character_names_by_watch`: throttled mtime-watch `characters.json` with auto-refresh.
+- `character_roster_available`: false in a single-image session (no title) — the roster is then
+  empty without any I/O and the watch never probes.
 - `sync_chapter_character_names`, `rebuild_character_names`: chapter-typed half of the footer
   autocomplete base and the reassembly of the combined list.
 - `sync_footer_tracking`: tracks bubble lifecycle and prunes footer caches.
@@ -109,6 +111,8 @@ Text detector flow:
 - `poll_text_detector_events`: consumes detector events and updates status/progress/results.
 - `ensure_text_detection_storage_loaded`: lazy auto-load persisted detector results.
 - `start_text_detection_storage_load`, `start_text_detection_storage_save`: async IO jobs.
+- `text_detection_storage_available`: false in a single-image session (scratch deleted on exit):
+  no lazy load, no Save button, a stray save request is refused.
 - `poll_text_detection_storage_events`: applies load/save completion results.
 - `set_text_detector_status`: updates detector status text and color.
 - `materialize_text_mask_page_from_blocks_if_missing`: legacy fallback that converts
@@ -1557,6 +1561,7 @@ impl TranslationTabState {
                             self.mt_progress,
                             &mut self.mt_stop_notice,
                             &mut self.mt_panel_options,
+                            !project.is_single_image(),
                         )
                     })
                     .inner;
@@ -1638,6 +1643,7 @@ impl TranslationTabState {
                     can_ocr_current,
                     can_ocr_all,
                     can_save,
+                    storage_available: text_detection_storage_available(project),
                     edit_lines_mode: self.text_detector_edit_lines_mode,
                     edit_mask_mode: self.text_detector_edit_mask_mode,
                     page_size,
@@ -1741,6 +1747,16 @@ impl TranslationTabState {
     /// autocomplete base around it. The chapter-collected names are kept as they are: they are
     /// derived from bubbles, not from the roster file.
     fn reload_character_names(&mut self, project: &ProjectData) {
+        // A single-image session has no title, hence no roster: reading it would probe (and the
+        // characters loader may create) a `characters/` folder inside the scratch directory.
+        // The footer still offers the built-in and chapter-collected names.
+        if !character_roster_available(project) {
+            self.character_names_project = Vec::new();
+            self.rebuild_character_names();
+            self.characters_loaded_for = Some(project.paths.characters_dir.clone());
+            self.characters_file_signature = None;
+            return;
+        }
         // A read failure must be visible: the assembled list still looks populated (built-ins plus
         // the names typed in this chapter), so a silently empty roster is easy to miss in the UI.
         // Not per-frame spam — this runs only on a project/chapter switch, on an observed
@@ -1799,7 +1815,9 @@ impl TranslationTabState {
     }
 
     fn maybe_refresh_character_names_by_watch(&mut self, project: &ProjectData, now_s: f64) {
-        if now_s - self.character_names_watch_last_check_s < CHARACTER_NAMES_WATCH_CHECK_SECS {
+        if !character_roster_available(project)
+            || now_s - self.character_names_watch_last_check_s < CHARACTER_NAMES_WATCH_CHECK_SECS
+        {
             return;
         }
         self.character_names_watch_last_check_s = now_s;
@@ -2402,6 +2420,9 @@ impl TranslationTabState {
     }
 
     fn ensure_text_detection_storage_loaded(&mut self, project: &ProjectData) {
+        if !text_detection_storage_available(project) {
+            return;
+        }
         let project_dir = project.paths.project_dir.clone();
         if self
             .text_detection_storage_loaded_for
@@ -2447,7 +2468,9 @@ impl TranslationTabState {
     }
 
     fn start_text_detection_storage_save(&mut self, project: &ProjectData) {
-        if self.text_detection_storage_busy {
+        // The Save button is not drawn without storage; this refuses an action that got here
+        // anyway rather than writing results into a scratch chapter deleted on exit.
+        if !text_detection_storage_available(project) || self.text_detection_storage_busy {
             return;
         }
         if self.text_detector_results.is_empty() {
@@ -6535,6 +6558,18 @@ fn recent_character_rank_from_text(text: &str, shift_down: bool) -> Option<usize
         "^" | ":" if shift_down => Some(6),
         _ => None,
     }
+}
+
+/// Whether the chapter's text-detection storage (`text_detection/`, Save and the lazy auto-load)
+/// is offered: not in a single-image session, whose scratch chapter is deleted on exit.
+fn text_detection_storage_available(project: &ProjectData) -> bool {
+    !project.is_single_image()
+}
+
+/// Whether the title character roster (`characters/characters.json`) is read for the footer
+/// autocomplete: not in a single-image session, which has no title.
+fn character_roster_available(project: &ProjectData) -> bool {
+    !project.is_single_image()
 }
 
 /// Cheap change probe of the title `characters.json` through the document store; `None`

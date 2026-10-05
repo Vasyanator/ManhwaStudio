@@ -24,6 +24,10 @@ Key structures:
 - `LifecycleDir`: `Added` / `Removed` — the direction a `LayerLifecycle` realizes.
 - `LayerFieldPatch`: one metadata/geometry field (visibility / opacity / transform /
   deform), each carrying `before` + `after`.
+- `GroupMetaValue`: a PS unified group's composite meta (visible + opacity), the before/after
+  payload of `PsEditOp::GroupMeta`; `PsEditOp::TextVisibility` is a text node's eye.
+  Both are doc-level (`LayerDoc::set_group_meta` / `set_visibility`), so typing and export
+  follow them.
 - `PsEditOpError`: typed, panic-free failure surface (target not resident + a
   wrapped `RasterDiffError`).
 
@@ -117,6 +121,38 @@ pub(crate) enum PsEditOp {
         /// The field's before + after values; `apply` drives the layer to `after`.
         field: LayerFieldPatch,
     },
+    /// A PS unified group's composite meta change (eye toggle or one whole opacity drag) on the
+    /// group identified by `group_uid`. `apply` drives the doc group to `after`.
+    GroupMeta {
+        /// Page the group belongs to; only valid while that page is resident.
+        page_idx: usize,
+        /// Stable uid of the group (`GroupMeta::uid`).
+        group_uid: String,
+        /// The meta before the edit (the undo target).
+        before: GroupMetaValue,
+        /// The meta after the edit (what `apply` realizes).
+        after: GroupMetaValue,
+    },
+    /// A text node's visibility (the PS panel eye) on the text identified by `text_uid`. `apply`
+    /// drives the doc node's `visible` to `after`.
+    TextVisibility {
+        /// Page the text belongs to; only valid while that page is resident.
+        page_idx: usize,
+        /// Stable doc uid of the text node.
+        text_uid: String,
+        /// Visibility before the edit (the undo target).
+        before: bool,
+        /// Visibility after the edit (what `apply` realizes).
+        after: bool,
+    },
+}
+
+/// A PS unified group's composite meta, as recorded by [`PsEditOp::GroupMeta`]. The panel-only
+/// collapse flag is deliberately absent: collapsing is view state, never an undo step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GroupMetaValue {
+    pub(crate) visible: bool,
+    pub(crate) opacity: f32,
 }
 
 /// The direction a [`PsEditOp::LayerLifecycle`] realizes. A recorded ADD carries `Added` (undo →
@@ -216,6 +252,18 @@ impl ReversibleAction for PsEditOp {
                 layer_uid,
                 field,
             } => ctx.apply_ps_field_patch(*page_idx, layer_uid, field),
+            PsEditOp::GroupMeta {
+                page_idx,
+                group_uid,
+                after,
+                ..
+            } => ctx.apply_ps_group_meta(*page_idx, group_uid, *after),
+            PsEditOp::TextVisibility {
+                page_idx,
+                text_uid,
+                after,
+                ..
+            } => ctx.apply_ps_text_visibility(*page_idx, text_uid, *after),
         }
     }
 
@@ -271,6 +319,28 @@ impl ReversibleAction for PsEditOp {
                 layer_uid: layer_uid.clone(),
                 field: field.inverted(),
             },
+            PsEditOp::GroupMeta {
+                page_idx,
+                group_uid,
+                before,
+                after,
+            } => PsEditOp::GroupMeta {
+                page_idx: *page_idx,
+                group_uid: group_uid.clone(),
+                before: *after,
+                after: *before,
+            },
+            PsEditOp::TextVisibility {
+                page_idx,
+                text_uid,
+                before,
+                after,
+            } => PsEditOp::TextVisibility {
+                page_idx: *page_idx,
+                text_uid: text_uid.clone(),
+                before: *after,
+                after: *before,
+            },
         }
     }
 
@@ -288,6 +358,16 @@ impl ReversibleAction for PsEditOp {
                 LayerFieldPatch::Transform { .. } => t!("ps_editor.edit_op.layer_transform"),
                 LayerFieldPatch::Deform { .. } => t!("ps_editor.edit_op.layer_deform"),
             },
+            // One record is either an eye toggle or one opacity drag (never both), so a visibility
+            // difference names the eye.
+            PsEditOp::GroupMeta { before, after, .. } => {
+                if before.visible == after.visible {
+                    t!("ps_editor.edit_op.group_opacity")
+                } else {
+                    t!("ps_editor.edit_op.group_visibility")
+                }
+            }
+            PsEditOp::TextVisibility { .. } => t!("ps_editor.edit_op.layer_visibility"),
         }
     }
 
@@ -302,7 +382,7 @@ impl ReversibleAction for PsEditOp {
             // must count against the budget). `Color32` is 4 bytes/pixel.
             PsEditOp::LayerLifecycle { layer, .. } => layer.image.pixels.len().saturating_mul(4),
             // Negligible: a few scalars / a small mesh.
-            PsEditOp::FieldPatch { .. } => 0,
+            PsEditOp::FieldPatch { .. } | PsEditOp::GroupMeta { .. } | PsEditOp::TextVisibility { .. } => 0,
         }
     }
 }
@@ -321,6 +401,13 @@ pub(crate) enum PsEditOpError {
         /// The page index the op targeted.
         page_idx: usize,
     },
+    /// The page is resident but the METADATA op's target (a group or a text node) has left it — it
+    /// was deleted after the op was recorded. The entry can never apply again, so the tab's
+    /// undo/redo skips it and moves on to the next entry instead of consuming the keypress.
+    TargetGone {
+        /// The page index the op targeted.
+        page_idx: usize,
+    },
     /// The underlying `RasterDiff` operation failed (size mismatch, corrupt payload,
     /// dimension overflow, ...).
     Raster(RasterDiffError),
@@ -331,6 +418,9 @@ impl fmt::Display for PsEditOpError {
         match self {
             PsEditOpError::NotResident { page_idx } => {
                 write!(f, "ps_editor page {page_idx} is not resident for undo/redo")
+            }
+            PsEditOpError::TargetGone { page_idx } => {
+                write!(f, "ps_editor undo/redo target on page {page_idx} was deleted")
             }
             PsEditOpError::Raster(err) => write!(f, "raster diff failed: {err}"),
         }
@@ -716,7 +806,9 @@ mod tests {
             }
             PsEditOp::RasterPixels { .. }
             | PsEditOp::CleanPixels { .. }
-            | PsEditOp::FieldPatch { .. } => {
+            | PsEditOp::FieldPatch { .. }
+            | PsEditOp::GroupMeta { .. }
+            | PsEditOp::TextVisibility { .. } => {
                 panic!("inverse of a lifecycle op must stay a lifecycle op")
             }
         }
@@ -764,7 +856,60 @@ mod tests {
             }
             PsEditOp::RasterPixels { .. }
             | PsEditOp::LayerLifecycle { .. }
-            | PsEditOp::FieldPatch { .. } => panic!("inverse of a clean op must stay a clean op"),
+            | PsEditOp::FieldPatch { .. }
+            | PsEditOp::GroupMeta { .. }
+            | PsEditOp::TextVisibility { .. } => panic!("inverse of a clean op must stay a clean op"),
+        }
+    }
+
+    #[test]
+    fn group_meta_and_text_visibility_inverses_swap_before_and_after() {
+        let before = GroupMetaValue { visible: true, opacity: 0.25 };
+        let after = GroupMetaValue { visible: true, opacity: 0.75 };
+        let op = PsEditOp::GroupMeta {
+            page_idx: 2,
+            group_uid: "g".to_string(),
+            before,
+            after,
+        };
+        assert_eq!(op.weight(), 0);
+        match op.inverse() {
+            PsEditOp::GroupMeta {
+                page_idx,
+                group_uid,
+                before: inv_before,
+                after: inv_after,
+            } => {
+                assert_eq!((page_idx, group_uid.as_str()), (2, "g"));
+                assert_eq!((inv_before, inv_after), (after, before));
+            }
+            PsEditOp::RasterPixels { .. }
+            | PsEditOp::CleanPixels { .. }
+            | PsEditOp::LayerLifecycle { .. }
+            | PsEditOp::FieldPatch { .. }
+            | PsEditOp::TextVisibility { .. } => panic!("inverse of a group meta op must stay one"),
+        }
+        let text = PsEditOp::TextVisibility {
+            page_idx: 1,
+            text_uid: "t".to_string(),
+            before: true,
+            after: false,
+        };
+        match text.inverse() {
+            PsEditOp::TextVisibility {
+                page_idx,
+                text_uid,
+                before,
+                after,
+            } => {
+                assert_eq!((page_idx, text_uid.as_str()), (1, "t"));
+                assert!(!before && after, "before/after swapped");
+            }
+            PsEditOp::RasterPixels { .. }
+            | PsEditOp::CleanPixels { .. }
+            | PsEditOp::LayerLifecycle { .. }
+            | PsEditOp::FieldPatch { .. }
+            | PsEditOp::GroupMeta { .. } => panic!("inverse of a text visibility op must stay one"),
         }
     }
 }

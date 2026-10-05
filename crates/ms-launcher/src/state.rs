@@ -41,10 +41,16 @@ pub struct UpdateNotification {
     pub remote_version: String,
 }
 
+/// Why the launcher closed; `main.rs` / `web_entry.rs` route on it. The launcher never starts
+/// the studio itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LauncherOutcome {
     OpenProject(OpenProjectSelection),
     StartUpdate,
+    /// Open one picture file in single-image mode. The path was checked to exist and be a
+    /// file when picked; decodability is left to the studio loading screen. Never produced by
+    /// the wasm build (no picker there).
+    OpenImage(PathBuf),
 }
 
 #[derive(Debug)]

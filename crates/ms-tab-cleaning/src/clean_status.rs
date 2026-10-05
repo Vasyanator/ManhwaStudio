@@ -33,6 +33,9 @@ Notes:
   twin is therefore not reported, a mismatched staged file is, and a same-stem file with another
   extension is never the page's clean at all.
 - Dismiss state lives only as long as this struct (one opened chapter); nothing is persisted.
+- No scan runs in a single-image session (`clean_scan_should_start`): its scratch chapter has one
+  page whose clean the session writes itself, and both messages point at the page manager, which
+  that mode hides.
 */
 
 use ms_log::runtime_log;
@@ -161,10 +164,10 @@ impl CleanFolderStatus {
     }
 
     /// Starts a scan of `project`'s clean folders on a worker when one is pending and none is in
-    /// flight. `ctx` is repainted by the worker once the reply is sent, so the GUI does not have
-    /// to poll with continuous repaints.
+    /// flight (`clean_scan_should_start`). `ctx` is repainted by the worker once the reply is
+    /// sent, so the GUI does not have to poll with continuous repaints.
     pub(crate) fn start_scan_if_needed(&mut self, ctx: &egui::Context, project: &ProjectData) {
-        if !self.rescan_pending || self.scan_rx.is_some() {
+        if !clean_scan_should_start(self.rescan_pending, self.scan_rx.is_some(), project.is_single_image()) {
             return;
         }
         self.rescan_pending = false;
@@ -205,6 +208,14 @@ impl CleanFolderStatus {
     pub(crate) fn view(&self) -> CleanStatusView<'_> {
         CleanStatusView { status: self }
     }
+}
+
+/// Whether a clean-folder scan starts this frame: one is pending, none is in flight, and the
+/// project is not a single-image session. A single-image scratch chapter has exactly one page
+/// whose clean the session itself writes, so there is no orphan or foreign-size clean to find,
+/// and both messages point at the page manager, which that mode does not show.
+fn clean_scan_should_start(rescan_pending: bool, scan_in_flight: bool, single_image: bool) -> bool {
+    rescan_pending && !scan_in_flight && !single_image
 }
 
 /// What a dock body needs to derive the status messages: the tab's status state.
@@ -374,6 +385,15 @@ mod tests {
     use super::*;
     use ms_models::clean_assign::{CleanFileLocation, CleanFileProbe, UnassignedClean};
     use std::path::PathBuf;
+
+    /// A scan starts only when pending and idle, and never in a single-image session.
+    #[test]
+    fn a_clean_scan_never_starts_in_a_single_image_session() {
+        assert!(clean_scan_should_start(true, false, false));
+        assert!(!clean_scan_should_start(true, false, true));
+        assert!(!clean_scan_should_start(false, false, false));
+        assert!(!clean_scan_should_start(true, true, false));
+    }
 
     const CURRENT: usize = 3;
     const PAGE_SIZE: [u32; 2] = [720, 1080];

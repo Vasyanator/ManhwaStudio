@@ -3,7 +3,8 @@
 ## Purpose
 Generic, GUI-free raster primitives that the project implements exactly ONCE: the even-odd polygon
 scanline rasterizer, the square (Chebyshev) binary dilation, the Otsu threshold, integer-factor
-replicate upscale / box downscale of interleaved `u8` rasters and the `u8` box blur. Every crate
+replicate upscale / box downscale of interleaved `u8` rasters, the `u8` box blur and the flattening
+of straight RGBA8 over opaque white to RGB8. Every crate
 that needs one of these rules calls this owner; a second implementation anywhere is a defect.
 
 ## Architecture
@@ -27,6 +28,8 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
   in `ms-ai-api` sends `k*W x k*H` and maps the answer back with them).
 - `blur.rs`: `box_blur_u8`, the clamp-to-edge separable box blur of a single-channel plane (the
   image-edit mask feather).
+- `alpha.rs`: `rgba_over_white_to_rgb`, straight RGBA8 over opaque white appended as RGB8 (the
+  typing tab's PDF image streams; JPEG saves of alpha-less outputs).
 
 ## Contracts and invariants
 - `fill_polygon_spans` emits `span(y, x0, x1)` with an INCLUSIVE `x0..=x1`, clamped to the
@@ -51,6 +54,10 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
   pixel farther than `r` from every nonzero pixel stays 0, radius 0 is the identity, the output
   has the input's length. O(w*h) for any radius; `RadiusTooLarge` only when the exact sum cannot
   fit in `u64`. Tests pin it against a brute-force 2-D reference.
+- `rgba_over_white_to_rgb` APPENDS to `dst` (row-by-row streaming through one buffer) and rounds
+  each component as `(c*a + 255*(255-a) + 127) / 255`; that rounding is a byte-level output
+  contract (PDF/JPEG bytes), pinned by an exhaustive 256x256 test against the reference formula.
+  A length that is not a multiple of 4 is `NotWholePixels` and leaves `dst` unchanged.
 - Shape and parameter errors are typed `RasterError` variants; sizes use checked arithmetic and
   no public function panics.
 - No I/O, no logging, no threads, no global state: callers log.
@@ -63,5 +70,6 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
 - To change integer scaling or the blur, edit `scale.rs` / `blur.rs`; the image-edit pipeline's
   bit-exact "untouched outside the mask" guarantee depends on the round trip and on the blur's
   zero-stays-zero reach, so keep those tests green.
+- To change alpha flattening, edit `alpha.rs`; any rounding change alters exported PDF bytes.
 - A new primitive belongs here only if it is generic (no detector, tab or UI semantics) and has,
   or replaces, more than one implementation.

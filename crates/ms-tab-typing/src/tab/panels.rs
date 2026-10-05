@@ -98,7 +98,8 @@ impl TypingTextOverlayLayer {
 
     /// Renders the «Слои» dock tab BODY: one unified, interleaved list of the page's
     /// text layers, image layers and read-only PS raster layers, ordered by unified
-    /// band-Z descending, with per-row ⬆/⬇ move and an 8-row inner scroll.
+    /// band-Z descending, with per-row ⬆/⬇ move and an 8-row inner scroll. Text/image rows also
+    /// carry the doc visibility eye (`toggle_overlay_visibility`); a hidden one is drawn dimmed.
     ///
     /// The surrounding panel — position, size, collapse and the tab header — belongs
     /// to the panel dock (`crates/ms-widgets/src/panel_dock`); this method only fills the `ui`
@@ -111,47 +112,16 @@ impl TypingTextOverlayLayer {
         }
         self.ensure_raster_layers_for_page(page_idx);
 
-        // Indices into `self.overlays` for this page, in array order (== persisted z order).
-        let page_overlay_indices: Vec<usize> = self
-            .overlays
-            .iter()
-            .enumerate()
-            .filter(|(_, o)| o.page_idx == page_idx)
-            .map(|(i, _)| i)
-            .collect();
-
-        let raster_count = self
-            .raster_layers_by_page
-            .get(&page_idx)
-            .map_or(0, Vec::len);
-
-        // Build ONE unified, interleaved row list (text + image overlays + rasters) ordered by unified
-        // band-Z DESCENDING (top of the stack first). Overlay above raster at equal Z (the canvas/hit-test
-        // tie-break). This uses the SAME Z the canvas/hit-test use, so the panel matches what's drawn.
-        let mut row_inputs: Vec<(TypingLayerRow, u32, bool)> = Vec::new();
-        for &ov_idx in &page_overlay_indices {
-            if let Some(o) = self.overlays.get(ov_idx) {
-                let z = self.overlay_band_z(page_idx, &o.uid, o.layer_idx);
-                row_inputs.push((TypingLayerRow::Overlay(ov_idx), z, false));
-            }
-        }
-        for raster_idx in 0..raster_count {
-            if let Some(uid) = self
-                .raster_layers_by_page
-                .get(&page_idx)
-                .and_then(|v| v.get(raster_idx))
-                .map(|l| l.uid.clone())
-            {
-                let z = self.raster_band_z(page_idx, &uid);
-                row_inputs.push((TypingLayerRow::Raster(raster_idx), z, true));
-            }
-        }
-        let ordered_rows = order_unified_layer_rows(row_inputs);
+        // ONE unified, interleaved row list (text + image overlays + rasters), top of the stack first,
+        // in exactly the canvas composite order (`unified_layer_rows` -> the ordering owner).
+        let ordered_rows = self.unified_layer_rows(page_idx);
 
         // A single move per frame across BOTH kinds; the row identity carries the kind.
         let mut move_row: Option<(TypingLayerRow, bool)> = None;
         let mut select_overlay: Option<usize> = None;
         let mut select_raster: Option<usize> = None;
+        // An overlay whose eye was clicked this frame (applied after the list, like the moves).
+        let mut toggle_overlay_visible: Option<usize> = None;
 
         // Representative glyph width + row height from the current font/spacing (not magic numbers).
         // egui's `Fonts*::glyph_width`/`row_height` need a &mut view (only `Painter`/`Ui` text
@@ -223,7 +193,25 @@ impl TypingTextOverlayLayer {
                             // text field does. One call per assembled row label;
                             // cheap and idempotent (`ui_fonts::ensure_covers`).
                             ms_widgets::ui_fonts::ensure_covers(ui.ctx(), &label);
+                            // A text hidden in the doc (PS eye, or the eye below) is not drawn on
+                            // the canvas, so its row is the only place the user can find it again:
+                            // dim it, and offer the eye that un-hides it.
+                            let visible = overlay.visible;
+                            let label = if visible {
+                                egui::RichText::new(label)
+                            } else {
+                                egui::RichText::new(label).weak()
+                            };
                             ui.horizontal(|ui| {
+                                let mut eye = visible;
+                                // Stable per-layer id (the doc uid), independent of row position.
+                                let eye_response = ui
+                                    .push_id(("typing.layers.visibility", overlay.uid.as_str()), |ui| ui.checkbox(&mut eye, ""))
+                                    .inner
+                                    .on_hover_text(t!("typing.layers.visibility_tooltip"));
+                                if eye_response.changed() {
+                                    toggle_overlay_visible = Some(ov_idx);
+                                }
                                 if ui.button("⬆").clicked() {
                                     move_row = Some((*row, true));
                                 }
@@ -269,6 +257,9 @@ impl TypingTextOverlayLayer {
         }
         if let Some(idx) = select_raster {
             self.select_raster(page_idx, idx);
+        }
+        if let Some(idx) = toggle_overlay_visible {
+            self.toggle_overlay_visibility(page_idx, idx);
         }
         // Apply at most one Z change per frame, routing by row kind. Both move helpers route through the
         // shared doc band reorder, so text and rasters interleave correctly. ⬆ raises one step, ⬇ lowers.

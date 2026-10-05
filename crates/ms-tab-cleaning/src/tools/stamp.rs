@@ -17,6 +17,9 @@ FILE HEADER (cleaning/tools/stamp.rs)
     That solver, the overlay/scene coordinate helpers (`scene_pos_to_overlay_pos`,
     `overlay_pos_to_scene_pos`, `overlay_rect_to_scene_rect`) and `extract_overlay_chunk` are
     `pub(super)` items of `base.rs`; this file must not keep copies of them.
+  - A single-image session (`set_single_image_session`) has no `alt_vers` folders: the mode row is
+    hidden, the mode is forced to `CurrentImage` (`stamp_mode_for_session`) and the scratch
+    `alt_vers` folder is never listed. The mode is session state, never persisted.
   - `Color32` is premultiplied sRGBA; every colour helper here works on `to_srgba_unmultiplied()`
     and premultiplies exactly once.
   - `CurrentImage` mode paints TWO canvas markers: the fixed anchor beacon
@@ -66,6 +69,15 @@ const STAMP_SPACING_FACTOR: f32 = 0.6;
 enum StampMode {
     AltVersion,
     CurrentImage,
+}
+
+/// The stamp mode a session may use: `mode` itself, except that a single-image session has no
+/// `alt_vers` chapter folders, so its alt-version mode falls back to `CurrentImage`.
+fn stamp_mode_for_session(mode: StampMode, single_image: bool) -> StampMode {
+    match mode {
+        StampMode::AltVersion if single_image => StampMode::CurrentImage,
+        mode => mode,
+    }
 }
 
 impl StampMode {
@@ -185,6 +197,9 @@ pub struct StampTool {
     current_page_idx: Option<usize>,
     cursor_texture: Option<TextureHandle>,
     cursor_texture_size: [usize; 2],
+    /// Whether the open project is a single-image session, pushed by the tab every frame
+    /// before the dock bodies draw: the alt-version mode is then hidden and never active.
+    single_image_session: bool,
 }
 
 impl Default for StampTool {
@@ -259,6 +274,7 @@ impl Default for StampTool {
             current_page_idx: None,
             cursor_texture: None,
             cursor_texture_size: [0, 0],
+            single_image_session: false,
         }
     }
 }
@@ -291,6 +307,31 @@ impl StampTool {
         );
         self.cursor_texture = None;
         true
+    }
+
+    /// Draws the «Режим» label and the two mode buttons of the tool panel.
+    fn draw_mode_row(&mut self, ui: &mut egui::Ui) {
+        ui.label(t!("cleaning.common.mode_label"));
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(StampMode::AltVersion.title())
+                        .selected(self.mode == StampMode::AltVersion),
+                )
+                .clicked()
+            {
+                self.set_mode(StampMode::AltVersion);
+            }
+            if ui
+                .add(
+                    egui::Button::new(StampMode::CurrentImage.title())
+                        .selected(self.mode == StampMode::CurrentImage),
+                )
+                .clicked()
+            {
+                self.set_mode(StampMode::CurrentImage);
+            }
+        });
     }
 
     fn set_mode(&mut self, mode: StampMode) {
@@ -355,6 +396,11 @@ impl StampTool {
             }
         }
 
+        // A single-image session has no alt-version mode, so its scratch `alt_vers` folder is
+        // never listed.
+        if self.single_image_session {
+            return;
+        }
         let alt_dir = project.paths.alt_vers_dir.clone();
         if self
             .alt_vers_dir
@@ -1160,27 +1206,11 @@ impl CleaningTool for StampTool {
     }
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(t!("cleaning.common.mode_label"));
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(StampMode::AltVersion.title())
-                        .selected(self.mode == StampMode::AltVersion),
-                )
-                .clicked()
-            {
-                self.set_mode(StampMode::AltVersion);
-            }
-            if ui
-                .add(
-                    egui::Button::new(StampMode::CurrentImage.title())
-                        .selected(self.mode == StampMode::CurrentImage),
-                )
-                .clicked()
-            {
-                self.set_mode(StampMode::CurrentImage);
-            }
-        });
+        // A single-image session offers only `CurrentImage` (`stamp_mode_for_session`), so the
+        // mode row is not drawn at all there.
+        if !self.single_image_session {
+            self.draw_mode_row(ui);
+        }
 
         match self.mode {
             StampMode::AltVersion => {
@@ -1313,6 +1343,13 @@ impl CleaningTool for StampTool {
 
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
         self.brush_base.handle_size_shortcuts(ctx)
+    }
+
+    fn set_single_image_session(&mut self, single_image: bool) {
+        self.single_image_session = single_image;
+        // The mode is session state, never persisted, so forcing it here changes nothing
+        // outside this session.
+        self.set_mode(stamp_mode_for_session(self.mode, single_image));
     }
 
     fn set_space_pan_active(&mut self, active: bool) {
@@ -2463,5 +2500,19 @@ mod tests {
         assert_eq!(stamp_sampled_overlay_xy(StampMode::CurrentImage, None, 0.0, None, [10, 10]), None);
         // Alt-version mode samples a different image; a marker on this page would be a lie.
         assert_eq!(stamp_sampled_overlay_xy(StampMode::AltVersion, Some(marker_anchor()), 0.0, Some([10, 10]), [30, 25]), None);
+    }
+
+    /// A single-image session has no `alt_vers` folders: the alt-version mode falls back to the
+    /// current-image mode there, and a project keeps whatever mode is selected.
+    #[test]
+    fn a_single_image_session_never_uses_the_alt_version_mode() {
+        assert_eq!(stamp_mode_for_session(StampMode::AltVersion, true), StampMode::CurrentImage);
+        assert_eq!(stamp_mode_for_session(StampMode::CurrentImage, true), StampMode::CurrentImage);
+        assert_eq!(stamp_mode_for_session(StampMode::AltVersion, false), StampMode::AltVersion);
+
+        let mut tool = StampTool::default();
+        tool.set_mode(StampMode::AltVersion);
+        tool.set_single_image_session(true);
+        assert_eq!(tool.mode, StampMode::CurrentImage);
     }
 }

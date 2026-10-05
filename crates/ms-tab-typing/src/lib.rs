@@ -16,6 +16,8 @@ FILE HEADER (crates/ms-tab-typing/src/lib.rs)
   - `mask`: бинарная маска обрезки страниц (загрузка/редактирование/сохранение/клип).
   - `segmentation`: сегментатор текста (разбивка на блоки + правила соединения при
     переносе) с языко-нейтральным `base` и реализациями языков (`ru`).
+  - `image_encode`: pure RGBA8 -> PNG / JPEG / lossless WebP encoding (alpha policy, ICC) and
+    the single owner of the single-image in-place writability rule.
   - `rotation_ctrl_wheel`: app-wide runtime-global выбор режима поворота Ctrl+колесо
     (Vector/Raster); пишется из Settings «Тайп», читается в Ctrl+wheel-хендлере.
     Сам модуль живёт в крейте `ms-config` (`crates/ms-config/src/rotation_ctrl_wheel.rs`) и здесь реэкспортируется.
@@ -41,6 +43,9 @@ mod psd_export;
 // Pure page-re-pagination engine: stitches composed export pages into same-width ribbons
 // and re-slices them into pages of a chosen aspect ratio / fixed height. GUI-free, no I/O.
 mod export_repaginate;
+// Pure RGBA8 -> PNG / JPEG / lossless WebP encoding (alpha policy, ICC) and the single owner of
+// the single-image in-place writability rule; also the project PNG export's encoder.
+pub mod image_encode;
 // Multi-page PDF writer used by the `Pdf` export format: one full-page raster per page.
 mod pdf_export;
 // The Ctrl+wheel rotation-mode global now lives in `ms-config` (re-exported by `main.rs` as
@@ -70,6 +75,11 @@ pub use panel::seed_imported_system_fonts_from_config;
 // here, in `advanced_form_params`.
 pub use panel::advanced_form_params;
 pub use tab::TypingTabState;
+// The single-image flatten-to-file API of `TypingTabState` (`prepare_flatten_to_file` /
+// `request_flatten_to_file` / `poll_flatten_to_file`), driven by the app's single-image session
+// controller. Native only.
+#[cfg(not(target_arch = "wasm32"))]
+pub use tab::{FlattenReadiness, FlattenToFileError, FlattenToFileReport, FlattenToFileRequest};
 // Per-frame inputs of `TypingTabState::draw`, built by `app.rs` — it carries the
 // app-owned `PanelDockState` borrow the tab draws its panels from.
 pub use tab::TypingDrawParams;

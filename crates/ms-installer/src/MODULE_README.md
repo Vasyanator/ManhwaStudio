@@ -115,6 +115,27 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   then resume with `--continue-update` to repair/create uv-managed `installer_files/venv`, refresh
   PyTorch only for Full installs when the embedded torch version is newer, install missing embedded
   dependency-list packages, and unpack `ManhwaStudio.zip` over the install root.
+- Windows integration differs by install kind (`is_windows_all_users_install_dir`). All-users
+  (Program Files, HKLM): App Paths, Uninstall entry, Start Menu shortcut and the "Open with"
+  entry. Per-user (HKCU): ONLY the "Open with" entry. The "Open with" entry lives entirely under
+  `{root}\Software\Classes\Applications\manhwastudio_rs.exe` (command `"<launcher>" "%1"`, the
+  same exe the shortcuts target, `FriendlyAppName`, one `SupportedTypes\.<ext>` per
+  `ms_config::single_image::input_extensions()`); it never creates a ProgID, `OpenWithProgids`
+  or default handler, so no extension is taken over. Its values come from the pure, tested
+  `windows_open_with_registry_values`; registration deletes the tree first. Registration is
+  best-effort for both install kinds (`register_windows_open_with_best_effort`: logged and shown
+  in the console, never fails an install). Uninstall deletes the tree only when its open command
+  points into the uninstalled directory, and removes every registry key independently, reporting
+  all failures together.
+- Registry key existence is decided by Win32 status codes (`registry_key_presence`,
+  `classify_registry_open_status`), never by `reg.exe` message text: that text is localized and
+  OEM-code-page encoded, so a text match breaks on most Windows locales. Values read back for a
+  decision go through `RegGetValueW` (UTF-16), not `reg query` output.
+- Known debt: the "Open with" key `Applications\manhwastudio_rs.exe` is fixed per registry root.
+  Two installs under one root share it: the last install wins, and uninstalling the owner removes
+  it even if the other install remains (the other install's own uninstall then leaves it alone).
+  A launcher with a fallback exe name (`resolve_windows_launcher_target`) still registers under
+  the fixed key name.
 - Windows Program Files ACL changes happen at root directory creation time, not as a recursive
   post-install permission rewrite.
 - Release binary assets are per-platform × per-arch and distinct: Windows x86_64
@@ -158,6 +179,8 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 
 ## Editing map
 - To change installer screens or user choices, edit `install.rs`.
+- To change the Windows "Open with" registration, edit `utils.rs::windows_open_with_registry_values`
+  (data) and `finalize_windows_post_install` (which install kinds get it).
 - To change what "replace the installed copy" does on disk, edit
   `utils.rs::replace_executable_with_local_file` and keep the exe-only contract above in sync.
 - To change what environment repair does (or must not do), edit

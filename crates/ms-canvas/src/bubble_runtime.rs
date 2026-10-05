@@ -2759,6 +2759,7 @@ mod tests {
             comic_type: None,
             canvas_settings: CanvasSettings::default(),
             settings_data: Value::Null,
+            session: Default::default(),
         }
     }
 

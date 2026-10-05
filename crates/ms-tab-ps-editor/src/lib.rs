@@ -75,7 +75,11 @@ Architecture:
 - layer persistence: a page is read from disk ONCE (the page loader's decode, inserted into the
   shared `LayerDoc`); afterwards the doc is the only source, text pin meta included
   (`materialize_text_runtime_from_doc`). Every `layers.json` write is a doc saver job (sync only
-  without a saver / without a doc); band / grouping / pin edits go through `apply_structural_edit`.
+  without a saver / without a doc); band / grouping edits (which also rewrite the texts' pin flags,
+  see `persist::apply_band_order`) go through `apply_structural_edit`. There is no pin toggle: text
+  order is set only by ▲▼ (every text is its own band). Group visibility / opacity and the text eye
+  are doc-level (`write_group_meta`, `write_text_visibility`), so the typing tab and its export
+  follow them; group collapse is panel-only view state, owned by the doc as well.
 
 Notes:
 Base layers mirror existing models read-only and are never written back.
@@ -100,12 +104,15 @@ pub mod tools;
 pub mod tree;
 pub mod viewport;
 
+#[cfg(test)]
+mod composite_plan_tests;
+
 use ms_canvas::OverlayRectPx;
 use ms_memory::{MemoryBudget, MemoryProfile};
 use ms_models::clean_overlays_model::CleanOverlaysModel;
 use ms_models::layer_model::effects;
 use ms_models::layer_model::manifest::TransformRec;
-use ms_models::layer_model::ordering::Band;
+use ms_models::layer_model::ordering::{self, Band, CompositeItem, CompositeKey, GroupFold};
 use ms_models::layer_model::persist;
 use ms_models::layer_model::saver;
 use ms_project::ProjectData;
@@ -116,7 +123,7 @@ use ms_widgets::panel_dock::{
     PanelNode, TabExtras, TabId,
 };
 use correction::CorrectionState;
-use edit_op::{LayerFieldPatch, LifecycleDir, PsEditOp};
+use edit_op::{GroupMetaValue, LayerFieldPatch, LifecycleDir, PsEditOp};
 use eframe::egui;
 use egui::{Color32, ColorImage, CornerRadius, Pos2, Rect, Sense, Stroke, Vec2};
 use layer_render::TiledTexture;
@@ -734,6 +741,14 @@ pub struct PsEditorTabState {
     /// slider change of a drag, consumed one undo entry per completed gesture (the first idle frame
     /// with no further opacity change), so a drag records a single reversible step, not one per tick.
     opacity_gesture: Option<(LayerId, f32)>,
+    /// Active GROUP opacity-slider gesture: `(page, group uid, group meta BEFORE the drag)`. Same
+    /// one-undo-step-per-drag contract as `opacity_gesture`, closed by
+    /// `finish_group_opacity_gesture` on the first panel frame without a `GroupOp::GroupOpacity`.
+    group_opacity_gesture: Option<(usize, String, GroupMetaValue)>,
+    /// Page whose TEXT payload an undo/redo step changed in the doc (`apply_ps_text_visibility`);
+    /// `finish_history_step` enqueues that page's text save, which `persist_current_page` (rasters
+    /// and groups only) does not cover. Taken (cleared) by every finished history step.
+    history_text_flush_page: Option<usize>,
     /// Transform-tool gesture start snapshot: `(raster uid, transform BEFORE the gesture)`. Captured on
     /// the press frame and consumed at release to record ONE `FieldPatch::Transform` per gesture.
     transform_gesture_before: Option<(String, LayerTransform)>,
@@ -961,22 +976,9 @@ struct PanelRowCx<'a> {
     group_list: &'a [(String, String)],
 }
 
-/// One band with the keys needed to build a contiguous unified order (`build_unified_order`).
-struct BandItem {
-    band: persist::BandRef,
-    /// Unified Z (band index).
-    primary: u32,
-    /// Tiebreak at equal Z (page-Y for texts, 0 for rasters) — mirrors `draw_composite`.
-    secondary: f32,
-    /// Final PS-group membership of this band (`None` for text-group bands, never grouped as a unit).
-    group: Option<String>,
-}
-
 /// A deferred action on a typing text layer, triggered from the PS layers panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextLayerOp {
-    /// Pin/unpin the overlay as its own Z band (vs. auto page-Y order within its group).
-    TogglePin,
     /// Bake the overlay's pixels into an owned raster layer and remove the overlay.
     Rasterize,
 }
@@ -1061,6 +1063,8 @@ impl Default for PsEditorTabState {
             ),
             brush_stroke_dirty: None,
             opacity_gesture: None,
+            group_opacity_gesture: None,
+            history_text_flush_page: None,
             transform_gesture_before: None,
             deform_gesture_before: None,
             panel_rects: Vec::new(),
@@ -1168,6 +1172,8 @@ impl PsEditorTabState {
     ///   `generation` or image size changed. The stack's raster order is set to the doc z order.
     /// - Groups: rebuilt from the doc page's `GroupMeta`, mapping each uid to a stable session
     ///   `GroupId` (reusing the existing id when the group survived), and each raster's group is set.
+    ///   Name, visibility, opacity and the panel-only `collapsed` flag all come from the doc, their
+    ///   single in-session owner.
     /// - Text layers: each doc Text node is reconciled onto the existing `PsTextLayer` with the same
     ///   uid — MODEL fields (transform/deform/visible/image/group) are updated while pin / text-group
     ///   (`layer_idx`) metadata and the GPU texture are preserved (the texture re-uploads only on a
@@ -1227,6 +1233,8 @@ impl PsEditorTabState {
             };
             if let Some(g) = stack.group_mut(gid) {
                 g.name = gmeta.name.clone();
+                // Every group field is doc-owned (`LayerDoc::set_group_meta` / `set_group_collapsed`),
+                // so the stack copy is always a projection of the doc.
                 g.visible = gmeta.visible;
                 g.opacity = gmeta.opacity;
                 g.collapsed = gmeta.collapsed;
@@ -1399,21 +1407,8 @@ impl PsEditorTabState {
         }
         self.text_layers = new_text;
 
-        // --- Bands: derive unified Z directly from the doc node z. ---
-        let mut bands: Vec<Band> = Vec::with_capacity(page.nodes.len());
-        for node in &page.nodes {
-            match node.kind {
-                NodeKind::Raster => bands.push(Band::Raster {
-                    uid: node.uid.clone(),
-                    z: node.z,
-                }),
-                NodeKind::Text => bands.push(Band::PinnedText {
-                    uid: node.uid.clone(),
-                    z: node.z,
-                }),
-            }
-        }
-        self.bands = bands;
+        // --- Bands: derive unified Z directly from the doc node z (the shared ordering owner). ---
+        self.bands = ordering::doc_page_bands(page);
 
         // Record the doc version we just projected so the per-frame version check does not
         // redundantly re-project until the doc changes again.
@@ -1449,10 +1444,14 @@ impl PsEditorTabState {
             if guard.page(page_idx).is_none() {
                 return false;
             }
+            let version_before = guard.version();
             edit(&mut guard);
             // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
-            // `node_mut` (which does not bump the version). Idempotent if `edit` already bumped.
-            guard.mark_changed();
+            // `node_mut` (which does not bump the version); skipped when a mutator already bumped, so
+            // one edit is one version step.
+            if guard.version() == version_before {
+                guard.mark_changed();
+            }
             // Persist so the change survives a reload / save-to-project. ASYNC: enqueue the page job
             // to the background saver (PNG encode + manifest RMW off the GUI thread); falls back to a
             // synchronous flush when no saver is enabled. The save-to-project merge worker and the
@@ -1480,21 +1479,34 @@ impl PsEditorTabState {
         // of `Self`, so `self.history.undo(self)` would double-borrow. Restore the history
         // UNCONDITIONALLY (no `?` between take and restore) so the stack is never lost on an error path.
         let mut history = self.take_history();
-        let result = history.undo(self);
+        let mut result = history.undo(self);
+        // An orphaned metadata entry (its group / text was deleted) has already left the stack and can
+        // never apply; step past it so the keypress undoes the next applicable edit. Terminates: each
+        // iteration pops one entry, and an empty stack yields `Ok(false)`.
+        while let Err(edit_op::PsEditOpError::TargetGone { page_idx }) = &result {
+            ms_log::trace_log!(cat::PS_EDITOR, "undo: skipped an entry whose target left page {}", page_idx);
+            result = history.undo(self);
+        }
         self.history = history;
         self.finish_history_step(result, project, "undo")
     }
 
-    /// Redoes the most recently undone PS-editor edit on the current page, if any. See [`Self::undo`].
+    /// Redoes the most recently undone PS-editor edit on the current page, if any. See [`Self::undo`]
+    /// (orphaned metadata entries are skipped the same way).
     pub fn redo(&mut self, project: &ProjectData) -> bool {
         let mut history = self.take_history();
-        let result = history.redo(self);
+        let mut result = history.redo(self);
+        while let Err(edit_op::PsEditOpError::TargetGone { page_idx }) = &result {
+            ms_log::trace_log!(cat::PS_EDITOR, "redo: skipped an entry whose target left page {}", page_idx);
+            result = history.redo(self);
+        }
         self.history = history;
         self.finish_history_step(result, project, "redo")
     }
 
     /// Shared tail of `undo`/`redo`: on a real change, persist the active page so the reverted state
-    /// survives a reload / save-to-project; logs and swallows an apply error (nothing changed).
+    /// survives a reload / save-to-project (plus the page's text payload when the step changed a text
+    /// node, see `history_text_flush_page`); logs and swallows an apply error (nothing changed).
     ///
     /// Uses `persist_current_page` (not a bare doc enqueue) because it reads the reconciled
     /// `self.stack` and carries the EXPLICIT `removed_uids` from `deleted_raster_uids` — required so a
@@ -1507,9 +1519,14 @@ impl PsEditorTabState {
         project: &ProjectData,
         op: &str,
     ) -> bool {
+        // Taken on every outcome so a failed step cannot leak a flush request into a later one.
+        let text_flush_page = self.history_text_flush_page.take();
         match result {
             Ok(true) => {
                 self.persist_current_page(project);
+                if let Some(page_idx) = text_flush_page {
+                    self.flush_text_page(page_idx, project);
+                }
                 true
             }
             Ok(false) => false,
@@ -1977,6 +1994,143 @@ impl PsEditorTabState {
         Ok(())
     }
 
+    /// Drives the PS unified group `group_uid` on `page_idx` to `after` for undo/redo (see
+    /// [`PsEditOp::GroupMeta`]) through the shared doc (`LayerDoc::set_group_meta`, so the typing tab
+    /// and the export follow) and re-projects; falls back to the stack group when no doc page is
+    /// resident. `finish_history_step` persists the page afterwards. Never panics.
+    ///
+    /// # Errors
+    /// [`edit_op::PsEditOpError::NotResident`] if the stack is absent or on a different page;
+    /// [`edit_op::PsEditOpError::TargetGone`] if the group was deleted (undo/redo skip that entry).
+    fn apply_ps_group_meta(
+        &mut self,
+        page_idx: usize,
+        group_uid: &str,
+        after: GroupMetaValue,
+    ) -> Result<(), edit_op::PsEditOpError> {
+        let stack = self
+            .stack
+            .as_ref()
+            .filter(|s| s.page_idx() == page_idx)
+            .ok_or(edit_op::PsEditOpError::NotResident { page_idx })?;
+        if stack.group_by_uid(group_uid).is_none() {
+            return Err(edit_op::PsEditOpError::TargetGone { page_idx });
+        }
+        self.write_group_meta(page_idx, group_uid, after, None);
+        Ok(())
+    }
+
+    /// Drives the text node `text_uid` on `page_idx` to visibility `after` for undo/redo (see
+    /// [`PsEditOp::TextVisibility`]) through the shared doc and re-projects, and asks
+    /// `finish_history_step` to enqueue the page's text save. Falls back to the local runtime when no
+    /// doc page is resident. Never panics.
+    ///
+    /// # Errors
+    /// [`edit_op::PsEditOpError::NotResident`] if the stack is absent or on a different page;
+    /// [`edit_op::PsEditOpError::TargetGone`] if no local text runtime carries `text_uid` any more
+    /// (the text was deleted; undo/redo skip that entry).
+    fn apply_ps_text_visibility(
+        &mut self,
+        page_idx: usize,
+        text_uid: &str,
+        after: bool,
+    ) -> Result<(), edit_op::PsEditOpError> {
+        if !self.stack.as_ref().is_some_and(|s| s.page_idx() == page_idx) {
+            return Err(edit_op::PsEditOpError::NotResident { page_idx });
+        }
+        if !self.text_layers.iter().any(|t| t.uid == text_uid) {
+            return Err(edit_op::PsEditOpError::TargetGone { page_idx });
+        }
+        if self.write_text_visibility(page_idx, text_uid, after) {
+            self.history_text_flush_page = Some(page_idx);
+        }
+        Ok(())
+    }
+
+    /// The composite meta of the stack group `group_uid`, or `None` when the stack has no such group.
+    fn group_meta_value(&self, group_uid: &str) -> Option<GroupMetaValue> {
+        self.stack
+            .as_ref()
+            .and_then(|s| s.group_by_uid(group_uid))
+            .map(|g| GroupMetaValue {
+                visible: g.visible,
+                opacity: g.opacity,
+            })
+    }
+
+    /// Writes a PS unified group's composite meta into the shared doc (`LayerDoc::set_group_meta`)
+    /// and re-projects the stack from it. With `persist_now = Some(project)` the page save is enqueued
+    /// at once (`route_to_doc`: a discrete eye toggle); with `None` persistence is deferred to the
+    /// tab-switch / page-leave flush (`edit_doc_node`: live opacity drag steps, undo/redo, whose
+    /// caller persists). Without a resident doc page the stack group is written directly and the page
+    /// marked dirty (the legacy local path; `persist_current_page` writes stack groups).
+    fn write_group_meta(
+        &mut self,
+        page_idx: usize,
+        group_uid: &str,
+        value: GroupMetaValue,
+        persist_now: Option<&ProjectData>,
+    ) {
+        let edit = |doc: &mut ms_models::layer_model::layer_doc::LayerDoc| {
+            if !doc.set_group_meta(page_idx, group_uid, value.visible, value.opacity) {
+                // The stack group has no doc twin (or a NaN opacity reached here): the projection that
+                // follows drops / keeps the stack group exactly as the doc says.
+                ms_log::trace_log!(
+                    cat::SYNC,
+                    "write_group_meta: doc refused page={} uid={} opacity={}",
+                    page_idx,
+                    group_uid,
+                    value.opacity
+                );
+            }
+        };
+        let routed = match persist_now {
+            Some(project) => self.route_to_doc(page_idx, project, edit),
+            None => self.edit_doc_node(page_idx, edit),
+        };
+        if !routed {
+            if let Some(g) = self.stack.as_mut().and_then(|s| group_mut_by_uid(s, group_uid)) {
+                g.visible = value.visible;
+                g.opacity = value.opacity;
+            }
+            self.layers_dirty = true;
+        }
+    }
+
+    /// Writes a text node's visibility into the shared doc (`LayerDoc::set_visibility`) and
+    /// re-projects the text runtimes from it. Returns `true` when the doc took the edit (the caller
+    /// then owes the page a text save); `false` means no doc page was resident and only the local
+    /// runtime changed (nothing to persist: such a page has no doc text payload to write).
+    fn write_text_visibility(&mut self, page_idx: usize, text_uid: &str, visible: bool) -> bool {
+        let routed = self.edit_doc_node(page_idx, |doc| {
+            doc.set_visibility(page_idx, text_uid, visible);
+        });
+        if !routed && let Some(layer) = self.text_layers.iter_mut().find(|t| t.uid == text_uid) {
+            layer.visible = visible;
+        }
+        routed
+    }
+
+    /// Closes an open group-opacity drag (`group_opacity_gesture`): records ONE
+    /// [`PsEditOp::GroupMeta`] for the whole gesture when the value actually moved. Called on the
+    /// first panel frame without a group-opacity change, and before a drag on another group starts.
+    fn finish_group_opacity_gesture(&mut self) {
+        let Some((page_idx, group_uid, before)) = self.group_opacity_gesture.take() else {
+            return;
+        };
+        let Some(after) = self.group_meta_value(&group_uid) else {
+            return;
+        };
+        if (after.opacity - before.opacity).abs() > f32::EPSILON || after.visible != before.visible {
+            self.history.record(PsEditOp::GroupMeta {
+                page_idx,
+                group_uid,
+                before,
+                after,
+            });
+        }
+    }
+
     /// Records a just-performed pixel edit of the ACTIVE layer as one reversible undo entry
     /// (observer style — the forward edit was already applied live).
     ///
@@ -2072,6 +2226,10 @@ impl PsEditorTabState {
 
     /// The unified Z of the raster band with `uid` from the current `bands` projection, or 0 when
     /// absent (a just-added raster whose band has not been projected yet, restored on top on redo).
+    ///
+    /// Not a composite lookup: it captures the doc-node Z an undo/redo `LayerLifecycle` re-inserts
+    /// at, so its "absent" answer is a re-insert position, not the owner's past-the-top draw key
+    /// (`ordering::band_z`). Draw order never reads it.
     fn raster_band_z(&self, uid: &str) -> u32 {
         self.bands
             .iter()
@@ -2109,10 +2267,14 @@ impl PsEditorTabState {
             if guard.page(page_idx).is_none() {
                 return false;
             }
+            let version_before = guard.version();
             edit(&mut guard);
             // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
-            // `node_mut` (which does not bump the version). Idempotent if `edit` already bumped.
-            guard.mark_changed();
+            // `node_mut` (which does not bump the version); skipped when a mutator already bumped, so
+            // one edit (e.g. one opacity drag tick) is one version step.
+            if guard.version() == version_before {
+                guard.mark_changed();
+            }
         }
         // This edit only changed in-memory MODEL state (it deferred disk persistence to page-leave /
         // tab-switch), so the page now needs a flush on the next tab-switch.
@@ -2292,6 +2454,7 @@ impl PsEditorTabState {
         // Drop any in-progress gesture snapshots too, so a gesture straddling a page switch cannot
         // record an undo step against the wrong page.
         self.opacity_gesture = None;
+        self.group_opacity_gesture = None;
         self.transform_gesture_before = None;
         self.deform_gesture_before = None;
         // Same reason for the tool's own gesture: an outline traced on the page being left holds
@@ -2523,6 +2686,16 @@ impl PsEditorTabState {
             return;
         }
         self.flush_layers(project);
+    }
+
+    /// True while an edit of the active page changed the shared document but its persistence (and
+    /// with it the autosave gate's `note_action`) is still deferred to the next flush — e.g. a
+    /// visibility / opacity change or a text drag routed through `edit_doc_node`. The single-image
+    /// session counts this as unsaved work, since the gate's action count has not moved yet.
+    /// Cleared by `flush_layers` (an enqueued or written page persist).
+    #[must_use]
+    pub fn has_deferred_layer_edits(&self) -> bool {
+        self.layers_dirty
     }
 
     /// Records that a raster node was removed from the stack this session so the next page save
@@ -3570,7 +3743,7 @@ impl PsEditorTabState {
     }
 
     /// Controls strip for the active row (`panel_primary`): opacity / merge / delete / fx for a
-    /// raster, pin / rasterize for a text, opacity / delete for a group, and — for a structurally
+    /// raster, rasterize / ▲▼ for a text, opacity / delete for a group, and — for a structurally
     /// locked base layer — only its name plus the view-only opacity.
     ///
     /// The "select a layer" hint is a defensive fallback: while a page is loaded `panel_primary` is
@@ -3680,13 +3853,6 @@ impl PsEditorTabState {
                 ui.label(format!("🅣 {}", text.name));
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::Button::new(if text.pinned { "📌" } else { "📍" }).small())
-                        .on_hover_text(t!("ps_editor.active_controls.pin_z"))
-                        .clicked()
-                    {
-                        actions.text_op = Some((index, TextLayerOp::TogglePin));
-                    }
-                    if ui
                         .add(egui::Button::new("⊞").small())
                         .on_hover_text(t!("ps_editor.active_controls.bake_into_layer"))
                         .clicked()
@@ -3744,8 +3910,6 @@ impl PsEditorTabState {
         let Some(stack) = self.stack.as_ref() else {
             return Vec::new();
         };
-        let (raster_z, _, _) = self.band_z_maps();
-        let top_z = self.bands.len() as u32;
         stack
             .layers()
             .iter()
@@ -3755,11 +3919,10 @@ impl PsEditorTabState {
                 let z = match l.kind {
                     // Reserved bottom slot: Клин is composited under every raster.
                     LayerKind::Clean => 0,
-                    LayerKind::Raster => raster_z
-                        .get(&uid)
-                        .copied()
-                        .unwrap_or(top_z)
-                        .saturating_add(1),
+                    LayerKind::Raster => {
+                        ordering::band_z(&self.bands, CompositeKey::Raster { uid: &uid })
+                            .saturating_add(1)
+                    }
                     // Filtered out above.
                     LayerKind::Source => u32::MAX,
                 };
@@ -3903,15 +4066,35 @@ impl PsEditorTabState {
             }
         }
         if let Some(i) = actions.toggle_visible_text
-            && let Some(layer) = self.text_layers.get_mut(i)
+            && let Some((uid, before)) = self.text_layers.get(i).map(|t| (t.uid.clone(), t.visible))
         {
-            layer.visible = !layer.visible;
             ms_log::trace_log!(
                 cat::PS_EDITOR,
                 "panel toggle_visible_text index={} visible={}",
                 i,
-                layer.visible
+                !before
             );
+            // Doc-level, like a raster eye: the typing canvas, its export and Save omit a hidden text
+            // node too ("what you see is what you save"). The text payload carries `visible`, so the
+            // page's text save persists it.
+            match page_idx {
+                Some(page_idx) => {
+                    if self.write_text_visibility(page_idx, &uid, !before) {
+                        self.flush_text_page(page_idx, project);
+                    }
+                    self.history.record(PsEditOp::TextVisibility {
+                        page_idx,
+                        text_uid: uid,
+                        before,
+                        after: !before,
+                    });
+                }
+                None => {
+                    if let Some(layer) = self.text_layers.get_mut(i) {
+                        layer.visible = !before;
+                    }
+                }
+            }
         }
         if let Some((id, value)) = actions.opacity_raster {
             // Live slider: fires only on actual value change (drag steps), not every idle frame.
@@ -4038,6 +4221,10 @@ impl PsEditorTabState {
             ms_log::trace_log!(cat::PS_EDITOR, "panel move_band sel={:?} up={}", sel, up);
             self.move_band_one(sel, up, project);
         }
+        // A frame without a group-opacity change ends an open group-opacity drag (one undo step).
+        if !matches!(actions.group_op, Some(GroupOp::GroupOpacity(..))) {
+            self.finish_group_opacity_gesture();
+        }
         if let Some(op) = actions.group_op {
             ms_log::trace_log!(cat::PS_EDITOR, "panel group_op op={:?}", op);
             self.apply_group_op(op, project);
@@ -4045,9 +4232,42 @@ impl PsEditorTabState {
     }
 }
 
-/// Lexicographic `<` on a `(Z, tiebreak)` unified-order key.
-fn key_lt(a: (u32, f32), b: (u32, f32)) -> bool {
-    a.0 < b.0 || (a.0 == b.0 && a.1.total_cmp(&b.1) == std::cmp::Ordering::Less)
+/// The band order after moving `target` one step (`up` = towards the top) in `order` (bottom-to-top,
+/// each band with its group), plus whether it was a grouped intra-run swap.
+///
+/// A grouped band swaps with its adjacent row only inside its own group's run (`true`: the doc mirror
+/// is one adjacent-node swap); an ungrouped band hops over the whole neighbouring block — a group
+/// run or a single band (`false`: the doc mirror applies the whole order). `None` when `target` is
+/// not in `order` or there is nothing to move past (already at the edge of its run / the stack).
+fn band_order_after_move(
+    mut order: Vec<(persist::BandRef, Option<String>)>,
+    target: &persist::BandRef,
+    up: bool,
+) -> Option<(Vec<persist::BandRef>, bool)> {
+    let pos = order.iter().position(|(b, _)| b == target)?;
+    let my_group = order.get(pos)?.1.clone();
+    let grouped_swap = my_group.is_some();
+    if grouped_swap {
+        // Reorder within the group's run only.
+        let nb = if up { pos.checked_add(1)? } else { pos.checked_sub(1)? };
+        if order.get(nb).is_some_and(|(_, g)| *g == my_group) {
+            order.swap(pos, nb);
+        } else {
+            return None;
+        }
+    } else {
+        // Ungrouped: hop over the neighbouring block.
+        let blocks = segment_blocks(&order);
+        let bi = blocks.iter().position(|(lo, hi)| pos >= *lo && pos <= *hi)?;
+        let target_block = if up { bi.checked_add(1)? } else { bi.checked_sub(1)? };
+        let &(nlo, nhi) = blocks.get(target_block)?;
+        // Move our singleton block to the far side of the neighbour block. Moving up, removing our
+        // (lower) row shifts the neighbour to [nlo-1, nhi-1], so inserting at `nhi` lands after it.
+        let item = order.remove(pos);
+        let insert_at = if up { nhi } else { nlo };
+        order.insert(insert_at.min(order.len()), item);
+    }
+    Some((order.into_iter().map(|(b, _)| b).collect(), grouped_swap))
 }
 
 /// Segments a contiguous unified order into inclusive blocks `[lo, hi]`. A run of bands sharing the
@@ -4074,33 +4294,6 @@ fn group_mut_by_uid<'a>(stack: &'a mut LayerStack, uid: &str) -> Option<&'a mut 
 }
 
 impl PsEditorTabState {
-    /// Band-Z lookup maps from `self.bands`: raster uid→z, text-group layer_idx→z, pinned uid→z.
-    fn band_z_maps(
-        &self,
-    ) -> (
-        HashMap<String, u32>,
-        HashMap<u32, u32>,
-        HashMap<String, u32>,
-    ) {
-        let mut raster_z = HashMap::new();
-        let mut group_z = HashMap::new();
-        let mut pinned_z = HashMap::new();
-        for band in &self.bands {
-            match band {
-                Band::Raster { uid, z } => {
-                    raster_z.insert(uid.clone(), *z);
-                }
-                Band::TextGroup { layer_idx, z, .. } => {
-                    group_z.insert(*layer_idx, *z);
-                }
-                Band::PinnedText { uid, z } => {
-                    pinned_z.insert(uid.clone(), *z);
-                }
-            }
-        }
-        (raster_z, group_z, pinned_z)
-    }
-
     /// Flattens a unified band `order` (bottom-to-top) into one node uid per band, expanding each
     /// `TextGroup(layer_idx)` band into its member text uids sub-ordered by ascending page-Y (lower on
     /// the page sorts lower in the stack), mirroring the render tiebreak (and the typing tab's
@@ -4132,11 +4325,9 @@ impl PsEditorTabState {
         uids
     }
 
-    /// Current PS-group membership of every node (raster uid / text uid → group uid) plus the set of
-    /// currently-pinned text uids.
-    fn current_membership(&self) -> (HashMap<String, Option<String>>, HashSet<String>) {
+    /// Current PS-group membership of every node (raster uid / text uid → group uid).
+    fn current_membership(&self) -> HashMap<String, Option<String>> {
         let mut group_of: HashMap<String, Option<String>> = HashMap::new();
-        let mut pinned: HashSet<String> = HashSet::new();
         if let Some(stack) = self.stack.as_ref() {
             for layer in stack.layers() {
                 if layer.kind.is_base() {
@@ -4147,98 +4338,23 @@ impl PsEditorTabState {
         }
         for text in &self.text_layers {
             group_of.insert(text.uid.clone(), text.group_uid.clone());
-            if text.pinned {
-                pinned.insert(text.uid.clone());
-            }
         }
-        (group_of, pinned)
+        group_of
     }
 
-    /// Builds a complete, contiguous unified band order (bottom-to-top) for the given final
-    /// membership + pin state: each group's bands are pulled together at the group's lowest member
-    /// Z, preserving relative order. Returns each band paired with its final group, for callers that
-    /// segment into group blocks. Mirrors `draw_composite`'s tiebreak so panel == composite order.
+    /// The complete, contiguous structural band order (bottom-to-top) for the final membership
+    /// `group_of`, each band paired with its final group, for callers that segment into group
+    /// blocks. Thin wrapper over `tree::unified_band_order`: the SAME row order the panel shows
+    /// (`tree::ordered_user_rows`, i.e. the canvas composite order), with a grouping edit's members
+    /// pulled together at their group's lowest row; every text is its own `PinnedText` band.
     fn build_unified_order(
         &self,
         group_of: &HashMap<String, Option<String>>,
-        pinned: &HashSet<String>,
     ) -> Vec<(persist::BandRef, Option<String>)> {
-        let (raster_z, group_z, pinned_z) = self.band_z_maps();
-        let top = self.bands.len() as u32;
-        let mut items: Vec<BandItem> = Vec::new();
-
-        if let Some(stack) = self.stack.as_ref() {
-            for layer in stack.layers() {
-                if layer.kind.is_base() {
-                    continue;
-                }
-                let uid = layer.uid.to_string();
-                items.push(BandItem {
-                    band: persist::BandRef::Raster(uid.clone()),
-                    primary: raster_z.get(&uid).copied().unwrap_or(top),
-                    secondary: 0.0,
-                    group: group_of.get(&uid).cloned().flatten(),
-                });
-            }
-        }
-        let mut unpinned_groups: std::collections::BTreeSet<u32> =
-            std::collections::BTreeSet::new();
-        for text in &self.text_layers {
-            if pinned.contains(&text.uid) {
-                let pz = pinned_z
-                    .get(&text.uid)
-                    .copied()
-                    .or_else(|| group_z.get(&text.layer_idx).copied())
-                    .unwrap_or(top);
-                items.push(BandItem {
-                    band: persist::BandRef::PinnedText(text.uid.clone()),
-                    primary: pz,
-                    secondary: text.center().y,
-                    group: group_of.get(&text.uid).cloned().flatten(),
-                });
-            } else {
-                unpinned_groups.insert(text.layer_idx);
-            }
-        }
-        for layer_idx in unpinned_groups {
-            items.push(BandItem {
-                band: persist::BandRef::TextGroup(layer_idx),
-                primary: group_z.get(&layer_idx).copied().unwrap_or(top),
-                secondary: 0.0,
-                group: None,
-            });
-        }
-
-        // Anchor each group at the lexicographically-lowest (primary, secondary) of its members.
-        let mut anchor: HashMap<String, (u32, f32)> = HashMap::new();
-        for it in &items {
-            if let Some(g) = &it.group {
-                let key = (it.primary, it.secondary);
-                anchor
-                    .entry(g.clone())
-                    .and_modify(|e| {
-                        if key_lt(key, *e) {
-                            *e = key;
-                        }
-                    })
-                    .or_insert(key);
-            }
-        }
-        items.sort_by(|a, b| {
-            let ka = a
-                .group
-                .as_ref()
-                .map_or((a.primary, a.secondary), |g| anchor[g]);
-            let kb = b
-                .group
-                .as_ref()
-                .map_or((b.primary, b.secondary), |g| anchor[g]);
-            ka.0.cmp(&kb.0)
-                .then(ka.1.total_cmp(&kb.1))
-                .then(a.primary.cmp(&b.primary))
-                .then(a.secondary.total_cmp(&b.secondary))
-        });
-        items.into_iter().map(|it| (it.band, it.group)).collect()
+        let Some(stack) = self.stack.as_ref() else {
+            return Vec::new();
+        };
+        tree::unified_band_order(stack, &self.text_layers, &self.bands, group_of)
     }
 
     /// Moves a single raster or pinned-text band one step in Z. A grouped band reorders only within
@@ -4273,50 +4389,16 @@ impl PsEditorTabState {
         // are saver jobs applied FIFO, and a pass applies rasters → text → effects → structural, so a
         // freshly-added raster already has its manifest node when the order lands (no sync flush).
         self.persist_current_page(project);
-        let (group_of, pinned) = self.current_membership();
-        let order = self.build_unified_order(&group_of, &pinned);
-        let Some(pos) = order.iter().position(|(b, _)| *b == target) else {
+        let group_of = self.current_membership();
+        let order = self.build_unified_order(&group_of);
+        let Some((order_refs, grouped_swap)) = band_order_after_move(order, &target, up) else {
             return;
         };
-        let mut bands: Vec<(persist::BandRef, Option<String>)> = order;
-        let my_group = bands[pos].1.clone();
         // The single node uid this band addresses (rasters / pinned text are single-node bands).
         let target_uid = match &target {
             persist::BandRef::Raster(u) | persist::BandRef::PinnedText(u) => Some(u.clone()),
             persist::BandRef::TextGroup(_) => None,
         };
-        // A grouped band moving within its run is a single adjacent-node swap (→ `reorder_node_one`);
-        // an ungrouped band hops a whole block (→ apply the recomputed order via `set_z_order`).
-        let grouped_swap = my_group.is_some();
-        if my_group.is_some() {
-            // Reorder within the group's run only.
-            let nb = if up { pos + 1 } else { pos.wrapping_sub(1) };
-            if nb < bands.len() && bands[nb].1 == my_group {
-                bands.swap(pos, nb);
-            } else {
-                return;
-            }
-        } else {
-            // Ungrouped: hop over the neighbouring block.
-            let blocks = segment_blocks(&bands);
-            let bi = blocks.iter().position(|(lo, hi)| pos >= *lo && pos <= *hi);
-            let Some(bi) = bi else { return };
-            let target_block = if up { bi + 1 } else { bi.wrapping_sub(1) };
-            if target_block >= blocks.len() {
-                return;
-            }
-            // Move our singleton block to the far side of the neighbour block.
-            let (nlo, nhi) = blocks[target_block];
-            let item = bands.remove(pos);
-            let insert_at = if up {
-                // neighbour shifted down by one after removal of our lower element.
-                nhi // after removal, neighbour occupies [nlo-1, nhi-1]; insert after it
-            } else {
-                nlo
-            };
-            bands.insert(insert_at.min(bands.len()), item);
-        }
-        let order_refs: Vec<persist::BandRef> = bands.into_iter().map(|(b, _)| b).collect();
         // Apply the SAME reorder in-memory so the doc (and, via its version bump, the typing tab)
         // re-project without a disk round-trip. A grouped intra-run move is one adjacent node swap; an
         // ungrouped block-hop reassigns the whole order.
@@ -4341,13 +4423,15 @@ impl PsEditorTabState {
     /// Resolves a `GroupOp` into a `persist::GroupingEdit`, mirrors the raster-side changes into the
     /// in-memory stack, and persists it through `persist_grouping` (structural saver job + doc mirror).
     ///
-    // Group ops are OUT of scope for undo Part B1 (they share the same structural band-order job as
-    // `move_band_one`); no `PsEditOp` is recorded here. Deferred to a later part.
+    // Structural group ops (membership, create / delete, block moves) are OUT of scope for undo
+    // Part B1 (they share the structural band-order job of `move_band_one`). The group META ops
+    // (visibility, opacity) are doc-level and record `PsEditOp::GroupMeta`, like a raster's eye and
+    // opacity slider.
     fn apply_group_op(&mut self, op: GroupOp, project: &ProjectData) {
         let Some(page_idx) = self.active_page_idx else {
             return;
         };
-        let (group_of, pinned) = self.current_membership();
+        let group_of = self.current_membership();
 
         // Resolve the current selection into node uids (rasters + texts) and the raster ids.
         let mut sel_raster_ids: Vec<LayerId> = Vec::new();
@@ -4387,31 +4471,76 @@ impl PsEditorTabState {
         let mut edit = persist::GroupingEdit::default();
         let mut new_gid: Option<(String, String)> = None; // (uid, name)
 
-        // Group-meta ops (collapse / visibility / opacity) are stack-only: `draw_composite` folds
-        // them live from the stack and `save_page_rasters` persists them on page/tab-leave, so there
-        // is no per-tick disk write (important for the opacity slider). They MUST mark `layers_dirty`
-        // so the dirty-gated tab-switch flush (`flush_layers_if_dirty`) still persists them — without
-        // it a vis/opacity/collapse change would revert on the next PS reload (it is not in the doc).
+        // Group META ops. Visibility and opacity are the composite group fold every tab reads, so
+        // they are DOC-level (`write_group_meta` -> `LayerDoc::set_group_meta`): the typing canvas,
+        // the export and the next `sync_view_from_doc` all see them. The eye persists at once
+        // (`route_to_doc`); an opacity drag mutates the doc per value change and defers the disk
+        // write to the tab-switch flush, recording one undo step per gesture. Collapse is panel-only
+        // VIEW state (no undo step) but has ONE owner, the doc (`set_group_collapsed`): it is written
+        // there and persisted at once by the doc page save, so a later `route_to_doc` save can never
+        // write a stale flag, and the stack copy is re-projected from the doc. Only without a resident
+        // doc page does it fall back to the stack + `layers_dirty` (the stack-group persist).
         match &op {
             GroupOp::ToggleCollapse(uid) => {
-                if let Some(g) = self.stack.as_mut().and_then(|s| group_mut_by_uid(s, uid)) {
-                    g.collapsed = !g.collapsed;
+                let collapsed = !self
+                    .stack
+                    .as_ref()
+                    .and_then(|s| s.group_by_uid(uid))
+                    .is_some_and(|g| g.collapsed);
+                let routed = self.route_to_doc(page_idx, project, |doc| {
+                    if !doc.set_group_collapsed(page_idx, uid, collapsed) {
+                        ms_log::trace_log!(
+                            cat::SYNC,
+                            "toggle collapse: no doc group page={} uid={}",
+                            page_idx,
+                            uid
+                        );
+                    }
+                });
+                if !routed {
+                    if let Some(g) = self.stack.as_mut().and_then(|s| group_mut_by_uid(s, uid)) {
+                        g.collapsed = collapsed;
+                    }
+                    self.layers_dirty = true;
                 }
-                self.layers_dirty = true;
                 return;
             }
             GroupOp::ToggleGroupVisible(uid) => {
-                if let Some(g) = self.stack.as_mut().and_then(|s| group_mut_by_uid(s, uid)) {
-                    g.visible = !g.visible;
+                if let Some(before) = self.group_meta_value(uid) {
+                    let after = GroupMetaValue {
+                        visible: !before.visible,
+                        ..before
+                    };
+                    self.write_group_meta(page_idx, uid, after, Some(project));
+                    self.history.record(PsEditOp::GroupMeta {
+                        page_idx,
+                        group_uid: uid.clone(),
+                        before,
+                        after,
+                    });
                 }
-                self.layers_dirty = true;
                 return;
             }
             GroupOp::GroupOpacity(uid, v) => {
-                if let Some(g) = self.stack.as_mut().and_then(|s| group_mut_by_uid(s, uid)) {
-                    g.opacity = *v;
+                // Snapshot the pre-drag meta ONCE per gesture (a drag on another group closes the
+                // previous gesture first), so the whole drag is one undo step.
+                if self
+                    .group_opacity_gesture
+                    .as_ref()
+                    .is_none_or(|(gesture_page, gesture_uid, _)| *gesture_page != page_idx || gesture_uid != uid)
+                {
+                    self.finish_group_opacity_gesture();
+                    if let Some(before) = self.group_meta_value(uid) {
+                        self.group_opacity_gesture = Some((page_idx, uid.clone(), before));
+                    }
                 }
-                self.layers_dirty = true;
+                if let Some(current) = self.group_meta_value(uid) {
+                    let after = GroupMetaValue {
+                        opacity: *v,
+                        ..current
+                    };
+                    self.write_group_meta(page_idx, uid, after, None);
+                }
                 return;
             }
             GroupOp::MoveGroup(uid, up) => {
@@ -4423,7 +4552,6 @@ impl PsEditorTabState {
 
         // Membership-changing ops below all rebuild the unified order.
         let mut final_group = group_of.clone();
-        let mut final_pinned = pinned.clone();
 
         let target_group: Option<String> = match &op {
             GroupOp::NewFromSelection => {
@@ -4446,7 +4574,9 @@ impl PsEditorTabState {
             GroupOp::Ungroup => None,
             GroupOp::DeleteGroup(uid) => {
                 edit.remove_groups.push(uid.clone());
-                // Members of the deleted group ungroup and (if group-pinned) unpin.
+                // Members of the deleted group ungroup and lose their `pinned_by_group` mark. They
+                // stay pinned at their visible Z: the order below names every text as its own
+                // `PinnedText` band (`tree::unified_band_order`), so nothing jumps on the canvas.
                 let members: Vec<String> = final_group
                     .iter()
                     .filter(|(_, g)| g.as_deref() == Some(uid.as_str()))
@@ -4456,7 +4586,6 @@ impl PsEditorTabState {
                     edit.set_membership.push((n.clone(), None));
                     final_group.insert(n.clone(), None);
                     if text_pin.get(n).is_some_and(|(_, pg)| *pg) {
-                        final_pinned.remove(n);
                         edit.unpin_for_group.push(n.clone());
                     }
                 }
@@ -4467,7 +4596,7 @@ impl PsEditorTabState {
                     stack.remove_group(gid);
                 }
                 let order = self
-                    .build_unified_order(&final_group, &final_pinned)
+                    .build_unified_order(&final_group)
                     .into_iter()
                     .map(|(b, _)| b)
                     .collect();
@@ -4485,25 +4614,24 @@ impl PsEditorTabState {
             final_group.insert(uid.clone(), target_group.clone());
         }
         if target_group.is_some() {
-            // Entering a group: every selected text must own its Z band (auto-pin).
+            // Entering a group: mark the texts the group pinned (every text is its own band in the
+            // order anyway), so a later ungroup can tell a group pin from a user pin.
             for uid in &sel_text_uids {
-                final_pinned.insert(uid.clone());
                 if !is_user_pinned(uid) {
                     edit.pin_for_group.push(uid.clone());
                 }
             }
         } else {
-            // Ungroup: release group-owned pins (keep real user pins).
+            // Ungroup: clear the group-pin mark (the text keeps its own band at its visible Z).
             for uid in &sel_text_uids {
                 if text_pin.get(uid).is_some_and(|(_, pg)| *pg) {
-                    final_pinned.remove(uid);
                     edit.unpin_for_group.push(uid.clone());
                 }
             }
         }
 
         let order = self
-            .build_unified_order(&final_group, &final_pinned)
+            .build_unified_order(&final_group)
             .into_iter()
             .map(|(b, _)| b)
             .collect();
@@ -4538,8 +4666,8 @@ impl PsEditorTabState {
         // are saver jobs applied FIFO, and a pass applies rasters → text → effects → structural, so a
         // freshly-added raster already has its manifest node when the order lands (no sync flush).
         self.persist_current_page(project);
-        let (group_of, pinned) = self.current_membership();
-        let bands = self.build_unified_order(&group_of, &pinned);
+        let group_of = self.current_membership();
+        let bands = self.build_unified_order(&group_of);
         let blocks = segment_blocks(&bands);
         let Some(bi) = blocks
             .iter()
@@ -4656,7 +4784,7 @@ impl PsEditorTabState {
     }
 
     /// The single funnel for PS STRUCTURAL page edits (band order / grouping; band moves, group-block
-    /// moves, grouping ops and the pin toggle). Inside ONE `edit_doc_node` doc edit it enqueues the
+    /// moves and grouping ops). Inside ONE `edit_doc_node` doc edit it enqueues the
     /// structural saver job (`enqueue_page_band_order` / `enqueue_page_grouping` — applied after the
     /// page's earlier raster / text / effects parts; a saver-less doc writes synchronously there) and,
     /// only when that succeeded, runs `mirror` (the in-memory model change) and pushes the resulting
@@ -5077,46 +5205,12 @@ impl PsEditorTabState {
         self.render_cache.remove(&id);
     }
 
-    /// Applies a pin/rasterize action on the text layer at `index`.
+    /// Applies a deferred panel action (rasterize) on the text layer at `index`.
     fn apply_text_layer_op(&mut self, index: usize, op: TextLayerOp, project: &ProjectData) {
         let Some(page_idx) = self.active_page_idx else {
             return;
         };
         match op {
-            TextLayerOp::TogglePin => {
-                let Some(layer) = self.text_layers.get(index) else {
-                    return;
-                };
-                let (uid, layer_idx, pinned) = (layer.uid.clone(), layer.layer_idx, layer.pinned);
-                let mut order: Vec<persist::BandRef> =
-                    self.bands.iter().map(Band::to_ref).collect();
-                if pinned {
-                    // Drop its pinned band so it rejoins its text group's auto-Y order.
-                    order.retain(|b| !matches!(b, persist::BandRef::PinnedText(u) if *u == uid));
-                } else {
-                    // Give it its own band, just above its text group.
-                    let after = self
-                        .bands
-                        .iter()
-                        .position(|b| matches!(b, Band::TextGroup { layer_idx: li, .. } if *li == layer_idx))
-                        .map_or(order.len(), |p| p + 1);
-                    order.insert(after, persist::BandRef::PinnedText(uid));
-                }
-                // In the unified doc, pinning is a Z-order change plus the node's doc-owned pin meta
-                // (`text_pinned`, pushed by `apply_structural_edit`). The z effect is exactly the new
-                // band order — applied in-memory so the doc (and, via its version bump, the typing
-                // tab) re-project without a disk round-trip.
-                let node_order = self.expand_order_to_node_uids(&order);
-                let result = self.apply_structural_edit(
-                    page_idx,
-                    project,
-                    saver::StructuralEdit::BandOrder(order),
-                    |doc| doc.set_z_order(page_idx, &node_order),
-                );
-                if let Err(err) = result {
-                    ms_log::runtime_log::log_warn(format!("[ps_editor] pin text: {err}"));
-                }
-            }
             TextLayerOp::Rasterize => {
                 let Some(layer) = self.text_layers.get(index) else {
                     return;
@@ -5994,59 +6088,24 @@ impl PsEditorTabState {
 
     /// Composites everything bottom-to-top in unified band order: the locked base layers first,
     /// then raster layers and typing overlays interleaved by their band Z (`self.bands`). Unsaved
-    /// rasters / overlays without a band sit on top. Within a text group, overlays sub-order by
-    /// page-Y (lower on the page = higher in the stack), matching the typing tab.
+    /// rasters / overlays without a band sit on top; equal-rank items keep stack / `text_layers`
+    /// order. The order, visibility and group-folded opacities come from the pure
+    /// [`composite_steps`] (the shared `ordering::composite_plan` owner); this method only draws.
     fn draw_composite(
         &mut self,
         ctx: &egui::Context,
         ui: &egui::Ui,
         view: &viewport::ViewTransform,
     ) {
-        enum Step {
-            Raster { id: LayerId, opacity: f32 },
-            Text { index: usize, opacity: f32 },
-        }
-
         // Resolved before any field of `self` is borrowed for the draw plan: the text-overlay loop
         // below holds `&mut self.text_layers`, which would forbid reading the flag there.
         let text_options = self.layer_texture_options();
 
-        // Unified-group visibility/opacity, folded over both rasters (via the stack) and texts.
-        let group_meta: HashMap<String, (bool, f32)> = self
-            .stack
-            .as_ref()
-            .map(|s| {
-                s.groups()
-                    .iter()
-                    .map(|g| (g.uid.to_string(), (g.visible, g.opacity)))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Band Z lookups (owned, so the `self.bands` borrow ends before the plan/borrow dance).
-        let mut raster_z: HashMap<String, u32> = HashMap::new();
-        let mut group_z: HashMap<u32, u32> = HashMap::new();
-        let mut pinned_z: HashMap<String, u32> = HashMap::new();
-        for band in &self.bands {
-            match band {
-                Band::Raster { uid, z } => {
-                    raster_z.insert(uid.clone(), *z);
-                }
-                Band::TextGroup { layer_idx, z, .. } => {
-                    group_z.insert(*layer_idx, *z);
-                }
-                Band::PinnedText { uid, z } => {
-                    pinned_z.insert(uid.clone(), *z);
-                }
-            }
-        }
-        let top_z = self.bands.len() as u32;
-
         let painter = ui.painter_at(view.viewport_rect);
 
-        // Base layers (source/clean) are always the bottom and are not bands.
-        let mut plan: Vec<(u32, f32, Step)> = Vec::new();
-        {
+        // Base layers (source/clean) are always the bottom and are not bands, so they are drawn
+        // here directly and never enter the plan.
+        let plan: Vec<(u32, PsStep)> = {
             let Some(stack) = self.stack.as_ref() else {
                 return;
             };
@@ -6054,65 +6113,29 @@ impl PsEditorTabState {
             // not as the viewport void. Drawn before every layer so it stays the bottom-most mark.
             layer_render::draw_page_checkerboard(&painter, view, stack.size());
             for layer in stack.layers() {
-                if !stack.layer_visible(layer) {
+                if !layer.kind.is_base() || !stack.layer_visible(layer) {
                     continue;
                 }
                 let opacity = stack.layer_opacity(layer);
                 if opacity <= 0.0 {
                     continue;
                 }
-                if layer.kind.is_base() {
-                    if let Some(cache) = self.render_cache.get(&layer.id) {
-                        cache.draw(&painter, view, opacity, layer);
-                    }
-                    continue;
-                }
-                let z = raster_z
-                    .get(&layer.uid.to_string())
-                    .copied()
-                    .unwrap_or(top_z);
-                plan.push((
-                    z,
-                    0.0,
-                    Step::Raster {
-                        id: layer.id,
-                        opacity,
-                    },
-                ));
-            }
-        }
-        for (index, layer) in self.text_layers.iter().enumerate() {
-            if !layer.visible {
-                continue;
-            }
-            // Fold the unified group: skip a hidden group, dim by its opacity.
-            let mut group_opacity = 1.0;
-            if let Some(uid) = &layer.group_uid {
-                match group_meta.get(uid) {
-                    Some((false, _)) => continue,
-                    Some((_, op)) => group_opacity = *op,
-                    None => {}
+                if let Some(cache) = self.render_cache.get(&layer.id) {
+                    cache.draw(&painter, view, opacity, layer);
                 }
             }
-            if group_opacity <= 0.0 {
-                continue;
-            }
-            let z = if layer.pinned {
-                pinned_z.get(&layer.uid).copied()
-            } else {
-                group_z.get(&layer.layer_idx).copied()
-            }
-            .unwrap_or(top_z);
-            plan.push((
-                z,
-                layer.center().y,
-                Step::Text {
-                    index,
-                    opacity: group_opacity,
-                },
-            ));
-        }
-        plan.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+            // Unified-group visibility/opacity, folded by the owner for rasters and texts alike.
+            let group_uids = stack_group_uids(stack);
+            let groups = stack_group_folds(stack, &group_uids);
+            let rasters = PsRasterView::collect(stack);
+            let texts: Vec<PsTextView<'_>> = self
+                .text_layers
+                .iter()
+                .enumerate()
+                .map(|(index, layer)| PsTextView::of(index, layer))
+                .collect();
+            composite_steps(&rasters, &texts, &self.bands, &groups)
+        };
 
         // The composite is rebuilt every frame (no cache), so only emit when the plan size changes
         // to avoid a 60/s flood. `usize::MAX` sentinel forces the first frame to log.
@@ -6126,9 +6149,9 @@ impl PsEditorTabState {
             self.trace_last_composite_steps = plan.len();
         }
 
-        for (_, _, step) in plan {
+        for (_, step) in plan {
             match step {
-                Step::Raster { id, opacity } => {
+                PsStep::Raster { id, opacity } => {
                     if let (Some(stack), Some(cache)) =
                         (self.stack.as_ref(), self.render_cache.get(&id))
                         && let Some(layer) = stack.layer(id)
@@ -6140,7 +6163,7 @@ impl PsEditorTabState {
                         }
                     }
                 }
-                Step::Text { index, opacity } => {
+                PsStep::Text { index, opacity } => {
                     if let Some(layer) = self.text_layers.get_mut(index) {
                         layer.draw(ctx, &painter, view, opacity, text_options);
                     }
@@ -6701,9 +6724,8 @@ impl PsEditorTabState {
     /// Nearest-neighbour sample of the VISIBLE raster composite at page pixel `(wx, wy)`.
     ///
     /// Layers are composited bottom-to-top in the same order [`PsEditorTabState::draw_composite`]
-    /// uses — the two base layers first (they are not bands), then the user rasters by their
-    /// unified band Z with a stable tiebreak on stack position — honouring per-layer and per-group
-    /// visibility and opacity.
+    /// uses — the two base layers first (they are not bands), then the user rasters in the order,
+    /// visibility and group-folded opacity of [`composite_steps`] (the shared ordering owner).
     ///
     /// TEXT overlays are deliberately NOT sampled: they are drawn by the typing renderer and have
     /// no `Layer` buffer to read. That is an accepted limitation of the brush's Alt+click
@@ -6717,30 +6739,13 @@ impl PsEditorTabState {
         if wx >= pw || wy >= ph {
             return None;
         }
-        let mut raster_z: HashMap<String, u32> = HashMap::new();
-        for band in &self.bands {
-            if let Band::Raster { uid, z } = band {
-                raster_z.insert(uid.clone(), *z);
-            }
-        }
-        // One past the highest band Z, used as the sort key of a raster that is in no band at all.
-        // A band list longer than `u32::MAX` is unreachable, and saturating there still sorts such
-        // a layer on top, which is exactly the intent.
-        let top_z = u32::try_from(self.bands.len()).unwrap_or(u32::MAX);
-        let mut rasters: Vec<(u32, usize)> = Vec::new();
-        for (idx, layer) in stack.layers().iter().enumerate() {
-            if layer.kind.is_base() || !stack.layer_visible(layer) {
-                continue;
-            }
-            if stack.layer_opacity(layer) <= 0.0 {
-                continue;
-            }
-            rasters.push((
-                raster_z.get(&layer.uid.to_string()).copied().unwrap_or(top_z),
-                idx,
-            ));
-        }
-        rasters.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        // The user rasters' order, visibility and group-folded opacity come from the SAME plan the
+        // canvas draws (`composite_steps` over the shared ordering owner), so the eyedropper samples
+        // exactly what `draw_composite` shows. Text overlays are not sampled (see above).
+        let group_uids = stack_group_uids(stack);
+        let groups = stack_group_folds(stack, &group_uids);
+        let raster_views = PsRasterView::collect(stack);
+        let raster_plan = composite_steps(&raster_views, &[], &self.bands, &groups);
 
         // `over(src, dst)` is src-over, so walking bottom-to-top and putting each layer over the
         // accumulator reproduces the composite the user sees.
@@ -6755,12 +6760,17 @@ impl PsEditorTabState {
             }
             px = over(scale_premultiplied(sample_layer_world(layer, wx, wy), opacity), px);
         }
-        for (_, idx) in rasters {
-            let Some(layer) = stack.layers().get(idx) else {
-                continue;
-            };
-            let opacity = stack.layer_opacity(layer);
-            px = over(scale_premultiplied(sample_layer_world(layer, wx, wy), opacity), px);
+        for (_, step) in raster_plan {
+            match step {
+                PsStep::Raster { id, opacity } => {
+                    let Some(layer) = stack.layer(id) else {
+                        continue;
+                    };
+                    px = over(scale_premultiplied(sample_layer_world(layer, wx, wy), opacity), px);
+                }
+                // No text views were passed in, so the plan holds rasters only.
+                PsStep::Text { .. } => {}
+            }
         }
         if px.a() == 0 {
             return None;
@@ -6814,6 +6824,154 @@ impl PsEditorTabState {
             self.redo(project);
         }
     }
+}
+
+/// One drawable item of the PS canvas composite above the base layers, in the order
+/// [`composite_steps`] returns. `opacity` is the effective opacity to draw with.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PsStep {
+    /// A user raster layer of the stack; `opacity` already includes its group's factor.
+    Raster { id: LayerId, opacity: f32 },
+    /// The text overlay at `index` in `PsEditorTabState::text_layers`; `opacity` is its unified
+    /// group's opacity (1.0 outside a group).
+    Text { index: usize, opacity: f32 },
+}
+
+/// The composite-relevant facts of one USER raster layer (base layers are excluded): the layer's
+/// OWN visibility and opacity plus its unified group uid. The group fold is NOT pre-applied: the
+/// shared owner (`ordering::composite_plan`) applies it, exactly as for texts.
+#[derive(Debug, Clone, PartialEq)]
+struct PsRasterView {
+    id: LayerId,
+    /// Stable uid string, matched against `Band::Raster::uid`.
+    uid: String,
+    /// Unified PS group uid (`LayerGroup::uid` as a string); `None` outside a group or when the
+    /// layer names a group id the stack no longer has (folds as visible / 1.0, like an unknown uid).
+    group_uid: Option<String>,
+    visible: bool,
+    opacity: f32,
+}
+
+impl PsRasterView {
+    /// Views of every non-base layer of `stack`, bottom-to-top in stack order.
+    fn collect(stack: &LayerStack) -> Vec<Self> {
+        stack
+            .layers()
+            .iter()
+            .filter(|layer| !layer.kind.is_base())
+            .map(|layer| Self {
+                id: layer.id,
+                uid: layer.uid.to_string(),
+                group_uid: layer
+                    .group
+                    .and_then(|g| stack.group(g))
+                    .map(|g| g.uid.to_string()),
+                visible: layer.visible,
+                opacity: layer.opacity,
+            })
+            .collect()
+    }
+}
+
+/// The composite-relevant facts of one text overlay, borrowed from its `PsTextLayer`. A PS text
+/// overlay has no own opacity (it enters the plan at 1.0); its unified-group fold is applied by the
+/// owner from `groups`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PsTextView<'a> {
+    /// Index into `PsEditorTabState::text_layers`.
+    index: usize,
+    uid: &'a str,
+    /// Legacy text group (`Band::TextGroup::layer_idx`): the band-lookup fallback when no
+    /// `PinnedText` band names `uid`.
+    layer_idx: u32,
+    visible: bool,
+    /// Unified PS group uid (`LayerGroup::uid` as a string), if any.
+    group_uid: Option<&'a str>,
+}
+
+impl<'a> PsTextView<'a> {
+    /// The view of `layer`, which sits at `index` in `PsEditorTabState::text_layers`.
+    fn of(index: usize, layer: &'a PsTextLayer) -> Self {
+        Self {
+            index,
+            uid: &layer.uid,
+            layer_idx: layer.layer_idx,
+            visible: layer.visible,
+            group_uid: layer.group_uid.as_deref(),
+        }
+    }
+}
+
+/// The stack's unified group uids as strings, in `stack.groups()` order. The stack keys groups by
+/// `Uuid`; the composite owner matches `&str` uids, so callers stringify once and borrow the result
+/// through [`stack_group_folds`].
+fn stack_group_uids(stack: &LayerStack) -> Vec<String> {
+    stack.groups().iter().map(|g| g.uid.to_string()).collect()
+}
+
+/// The stack's unified groups as owner fold views; `uids` must be [`stack_group_uids`] of the same
+/// stack (zipped by position).
+fn stack_group_folds<'a>(stack: &LayerStack, uids: &'a [String]) -> Vec<GroupFold<'a>> {
+    stack
+        .groups()
+        .iter()
+        .zip(uids)
+        .map(|(g, uid)| GroupFold {
+            uid,
+            visible: g.visible,
+            opacity: g.opacity,
+        })
+        .collect()
+}
+
+/// The PS canvas draw plan above the base layers: `(band_z, step)` bottom-to-top (draw in
+/// returned order).
+///
+/// Pure adaptation onto the ONE owner `ordering::composite_plan` (visibility, group fold, band-Z
+/// lookup, order): rasters enter in stack order, then texts in `text_layers` order (creation order,
+/// newest last = on top), so equal-rank ties resolve by that input order and a raster sits below a
+/// text at equal band Z. Items the owner omits (invisible, hidden group, opacity `<= 0` or NaN)
+/// produce no step. Characterized by `composite_plan_tests`.
+fn composite_steps(
+    rasters: &[PsRasterView],
+    texts: &[PsTextView<'_>],
+    bands: &[Band],
+    groups: &[GroupFold<'_>],
+) -> Vec<(u32, PsStep)> {
+    let raster_items = rasters.iter().map(|raster| CompositeItem {
+        key: CompositeKey::Raster { uid: &raster.uid },
+        group_uid: raster.group_uid.as_deref(),
+        visible: raster.visible,
+        opacity: raster.opacity,
+    });
+    let text_items = texts.iter().map(|text| CompositeItem {
+        key: CompositeKey::Text {
+            uid: text.uid,
+            layer_idx: text.layer_idx,
+        },
+        group_uid: text.group_uid,
+        visible: text.visible,
+        opacity: 1.0,
+    });
+    let items: Vec<CompositeItem<'_>> = raster_items.chain(text_items).collect();
+
+    // `step.item` indexes `items`: `[0, rasters.len())` are rasters, the rest are texts in order.
+    ordering::composite_plan(bands, groups, &items)
+        .into_iter()
+        .filter_map(|step| {
+            let ps_step = match rasters.get(step.item) {
+                Some(raster) => PsStep::Raster {
+                    id: raster.id,
+                    opacity: step.opacity,
+                },
+                None => PsStep::Text {
+                    index: texts.get(step.item.checked_sub(rasters.len())?)?.index,
+                    opacity: step.opacity,
+                },
+            };
+            Some((step.z, ps_step))
+        })
+        .collect()
 }
 
 /// The TAB-level shortcuts, already localized, for the «Горячие клавиши» panel.
@@ -9532,6 +9690,7 @@ mod tests {
             comic_type: None,
             canvas_settings: CanvasSettings::default(),
             settings_data: serde_json::Value::Null,
+            session: Default::default(),
         }
     }
 
@@ -10114,10 +10273,10 @@ mod tests {
         assert!(ps.text_layers.is_empty(), "a non-resident page leaves no stale runtimes");
     }
 
-    /// Saver-less doc: a band move and a pin toggle take the synchronous fallback — the manifest is
-    /// written immediately, the doc z / pin meta and the local runtime agree with it.
+    /// Saver-less doc: a band move takes the synchronous fallback — the manifest is written
+    /// immediately, the doc z / pin meta and the local runtime agree with it.
     #[test]
-    fn a_band_move_and_pin_toggle_without_a_saver_write_synchronously() {
+    fn a_band_move_without_a_saver_writes_synchronously() {
         let dir = ScratchDir::new("sync_band");
         let project = project_in(&dir);
         let (mut ps, doc) = ps_on_doc_page(&project, false);
@@ -10132,37 +10291,6 @@ mod tests {
             assert!(find_node(&guard, T).is_some_and(|n| n.text_pinned));
         }
         assert!(ps.text_layers[0].pinned);
-
-        // Unpin: the order drops its `PinnedText` band → unpinned on disk, in the doc and locally.
-        ps.apply_text_layer_op(0, TextLayerOp::TogglePin, &project);
-        assert_eq!(disk_text_pinned(&project, T), Some(false));
-        assert!(find_node(&doc.lock().expect("doc lock"), T).is_some_and(|n| !n.text_pinned));
-        assert!(!ps.text_layers[0].pinned);
-    }
-
-    /// With a saver: the pin toggle enqueues ONE structural job and updates the doc + local pin meta
-    /// at once; the manifest changes only when the saver runs (observed after a barrier).
-    #[test]
-    fn a_pin_toggle_with_a_saver_enqueues_a_structural_job() {
-        let dir = ScratchDir::new("saver_pin");
-        let project = project_in(&dir);
-        let (mut ps, doc) = ps_on_doc_page(&project, true);
-        assert!(!doc.lock().expect("doc lock").has_pending_saves());
-
-        ps.apply_text_layer_op(0, TextLayerOp::TogglePin, &project);
-        // In memory: immediately consistent, and the page now has a pending (structural) save.
-        assert!(!ps.text_layers[0].pinned);
-        {
-            let guard = doc.lock().expect("doc lock");
-            assert!(find_node(&guard, T).is_some_and(|n| !n.text_pinned));
-            assert!(guard.page_has_pending_save(0), "the structural job holds a pending epoch");
-        }
-
-        let handle = doc.lock().expect("doc lock").saver_handle().expect("saver enabled");
-        assert!(handle.barrier_blocking().is_empty(), "no failed page");
-        assert_eq!(disk_text_pinned(&project, T), Some(false), "the job landed");
-        doc.lock().expect("doc lock").poll_save_acks();
-        assert!(!doc.lock().expect("doc lock").has_pending_saves(), "the ack retired the epoch");
     }
 
     /// With a saver: a band move persists the rasters and the order as saver jobs applied in FIFO
@@ -10186,5 +10314,237 @@ mod tests {
         assert!(handle.barrier_blocking().is_empty(), "no failed page");
         assert_eq!(disk_band_uids(&project), [R1, T, R2]);
         assert_eq!(disk_text_pinned(&project, T), Some(true));
+    }
+    // ---------------------------------------------------------------------------------------
+    // Doc-level composite meta: group eye / opacity and the text eye reach the shared doc.
+    // ---------------------------------------------------------------------------------------
+
+    const G: &str = "00000000-0000-4000-8000-0000000000b1";
+
+    /// `ps_on_doc_page` plus a visible, opaque group `G` holding raster `R1` and text `T`, added to
+    /// the doc and projected (the PS view of a page whose group came from disk).
+    fn ps_on_doc_page_with_group(project: &ProjectData) -> (PsEditorTabState, Arc<Mutex<LayerDoc>>) {
+        let (mut ps, doc) = ps_on_doc_page(project, false);
+        {
+            let mut guard = doc.lock().expect("doc lock");
+            guard.add_group(
+                0,
+                persist::GroupMeta {
+                    uid: G.to_string(),
+                    name: "G".to_string(),
+                    visible: true,
+                    opacity: 1.0,
+                    collapsed: false,
+                },
+            );
+            guard.set_group(0, R1, Some(G.to_string()));
+            guard.set_group(0, T, Some(G.to_string()));
+        }
+        ps.sync_view_from_doc(0);
+        (ps, doc)
+    }
+
+    /// The doc's `(visible, opacity)` of group `G` on page 0.
+    fn doc_group_meta(doc: &Arc<Mutex<LayerDoc>>) -> Option<(bool, f32)> {
+        let guard = doc.lock().expect("doc lock");
+        guard
+            .page(0)
+            .and_then(|page| page.groups.iter().find(|g| g.uid == G))
+            .map(|g| (g.visible, g.opacity))
+    }
+
+    /// The stack's `(visible, opacity)` of group `G`.
+    fn stack_group_meta(ps: &PsEditorTabState) -> Option<(bool, f32)> {
+        ps.group_meta_value(G).map(|v| (v.visible, v.opacity))
+    }
+
+    /// The group eye writes the DOC (so typing and export see it), bumps its version, survives the
+    /// projection that any later doc edit triggers, persists, and undoes / redoes through the doc.
+    #[test]
+    fn a_group_eye_toggle_reaches_the_doc_and_survives_a_doc_sync() {
+        let dir = ScratchDir::new("group_eye");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page_with_group(&project);
+        let v0 = doc.lock().expect("doc lock").version();
+
+        ps.apply_group_op(GroupOp::ToggleGroupVisible(G.to_string()), &project);
+        assert_eq!(doc_group_meta(&doc), Some((false, 1.0)), "the doc group is hidden");
+        assert!(doc.lock().expect("doc lock").version() > v0, "the doc version bumped");
+        assert_eq!(stack_group_meta(&ps), Some((false, 1.0)));
+
+        // An unrelated doc edit re-projects the stack from the doc: the group stays hidden.
+        ps.edit_doc_node(0, |doc| doc.set_opacity(0, R2, 0.5));
+        assert_eq!(stack_group_meta(&ps), Some((false, 1.0)), "the toggle survives sync_view_from_doc");
+
+        // Persisted through the doc page save, in the manifest's group record.
+        let disk = persist::load_page_rasters(&project.paths.unsaved_layers_dir, None, 0).expect("read staging");
+        assert!(disk.groups.iter().any(|g| g.uid == G && !g.visible), "the hidden group reached disk");
+
+        assert_eq!(ps.history.undo_len(), 1, "one undo step per eye toggle");
+        assert!(ps.undo(&project));
+        assert_eq!(doc_group_meta(&doc), Some((true, 1.0)), "undo shows the group again, in the doc");
+        assert!(ps.redo(&project));
+        assert_eq!(doc_group_meta(&doc), Some((false, 1.0)), "redo hides it again");
+    }
+
+    /// A group opacity drag writes the doc on every value change but records ONE undo step for the
+    /// whole gesture, closed by the first panel frame without a change.
+    #[test]
+    fn a_group_opacity_drag_writes_the_doc_and_records_one_undo_step() {
+        let dir = ScratchDir::new("group_opacity");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page_with_group(&project);
+
+        for value in [0.8_f32, 0.6, 0.4] {
+            ps.apply_panel_actions(
+                PanelActions {
+                    group_op: Some(GroupOp::GroupOpacity(G.to_string(), value)),
+                    ..Default::default()
+                },
+                &project,
+            );
+            assert_eq!(doc_group_meta(&doc), Some((true, value)), "the doc follows each drag step");
+        }
+        assert_eq!(ps.history.undo_len(), 0, "no undo step while the drag is in flight");
+        // The first idle panel frame ends the gesture.
+        ps.apply_panel_actions(PanelActions::default(), &project);
+        assert_eq!(ps.history.undo_len(), 1, "one undo step for the whole drag");
+        ps.apply_panel_actions(PanelActions::default(), &project);
+        assert_eq!(ps.history.undo_len(), 1, "idle frames record nothing more");
+
+        assert!(ps.undo(&project));
+        assert_eq!(doc_group_meta(&doc), Some((true, 1.0)), "undo restores the pre-drag opacity");
+    }
+
+    /// The PS text eye writes the doc text node's `visible` (typing / export omit it), survives a
+    /// later projection, is read back by the PS panel, and undoes through the doc.
+    #[test]
+    fn the_text_eye_writes_the_doc_node_and_survives_a_doc_sync() {
+        let dir = ScratchDir::new("text_eye");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page(&project, false);
+        let text_visible_in_doc = |doc: &Arc<Mutex<LayerDoc>>| {
+            find_node(&doc.lock().expect("doc lock"), T).map(|n| n.visible)
+        };
+
+        ps.apply_panel_actions(
+            PanelActions {
+                toggle_visible_text: Some(0),
+                ..Default::default()
+            },
+            &project,
+        );
+        assert_eq!(text_visible_in_doc(&doc), Some(false), "the doc text node is hidden");
+        assert!(!ps.text_layers[0].visible, "the panel reads it back from the doc");
+
+        ps.edit_doc_node(0, |doc| doc.set_opacity(0, R1, 0.5));
+        assert!(!ps.text_layers[0].visible, "the eye survives sync_view_from_doc");
+        let disk_visible = persist::load_page_text_nodes(&project.paths.unsaved_layers_dir, None, 0)
+            .expect("read staging text nodes")
+            .into_iter()
+            .find(|n| n.uid == T)
+            .map(|n| n.visible);
+        assert_eq!(disk_visible, Some(false), "the text save persisted the hidden node");
+
+        assert_eq!(ps.history.undo_len(), 1);
+        assert!(ps.undo(&project));
+        assert_eq!(text_visible_in_doc(&doc), Some(true), "undo shows the text again, in the doc");
+        assert!(ps.text_layers[0].visible);
+    }
+
+    /// One group-opacity drag tick is ONE doc version step (the mutator's own bump; `edit_doc_node`
+    /// adds none on top of it).
+    #[test]
+    fn one_group_opacity_tick_bumps_the_doc_version_once() {
+        let dir = ScratchDir::new("opacity_bump");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page_with_group(&project);
+        let v0 = doc.lock().expect("doc lock").version();
+        ps.apply_group_op(GroupOp::GroupOpacity(G.to_string(), 0.5), &project);
+        assert_eq!(doc.lock().expect("doc lock").version(), v0 + 1);
+    }
+
+    /// Review High-2: a deferred (`edit_doc_node`) edit has not reached the autosave gate yet, so it
+    /// must be visible as `has_deferred_layer_edits` until the flush that persists it — the
+    /// single-image session reads it as unsaved work. An immediately persisted edit leaves it clear.
+    #[test]
+    fn a_deferred_doc_edit_is_reported_until_flushed() {
+        let dir = ScratchDir::new("deferred_edits");
+        let project = project_in(&dir);
+        let (mut ps, _doc) = ps_on_doc_page_with_group(&project);
+        assert!(!ps.has_deferred_layer_edits(), "a freshly loaded page owes nothing");
+        ps.apply_group_op(GroupOp::ToggleCollapse(G.to_string()), &project);
+        assert!(!ps.has_deferred_layer_edits(), "a route_to_doc edit is persisted at once");
+        ps.apply_group_op(GroupOp::GroupOpacity(G.to_string(), 0.5), &project);
+        assert!(ps.has_deferred_layer_edits(), "an opacity tick defers its persistence");
+        ps.flush_layers(&project);
+        assert!(!ps.has_deferred_layer_edits(), "the flush persisted it");
+    }
+
+    /// Collapse has ONE owner, the doc: the toggle writes it there and persists at once, a later group
+    /// eye (whose doc page save also writes the groups) keeps it, and a fresh PS view of the same doc
+    /// page — leaving the page and coming back — shows it collapsed. No undo step is recorded.
+    #[test]
+    fn a_group_collapse_is_doc_owned_persisted_and_survives_a_page_return() {
+        let dir = ScratchDir::new("group_collapse");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page_with_group(&project);
+        let doc_collapsed = |doc: &Arc<Mutex<LayerDoc>>| {
+            let guard = doc.lock().expect("doc lock");
+            guard.page(0).and_then(|page| page.groups.iter().find(|g| g.uid == G)).map(|g| g.collapsed)
+        };
+        let disk_collapsed = |project: &ProjectData| {
+            persist::load_page_rasters(&project.paths.unsaved_layers_dir, None, 0)
+                .expect("read staging")
+                .groups
+                .iter()
+                .find(|g| g.uid == G)
+                .map(|g| g.collapsed)
+        };
+
+        ps.apply_group_op(GroupOp::ToggleCollapse(G.to_string()), &project);
+        assert_eq!(doc_collapsed(&doc), Some(true), "the doc owns the flag");
+        assert!(ps.stack.as_ref().and_then(|s| s.group_by_uid(G)).is_some_and(|g| g.collapsed));
+        assert_eq!(disk_collapsed(&project), Some(true), "persisted at once");
+        assert!(!ps.layers_dirty, "nothing left for a tab-switch flush to lose");
+        assert_eq!(ps.history.undo_len(), 0, "collapse is view state, never an undo step");
+
+        // The group eye's doc page save writes the doc groups, collapse included.
+        ps.apply_group_op(GroupOp::ToggleGroupVisible(G.to_string()), &project);
+        assert_eq!(disk_collapsed(&project), Some(true), "the eye's save keeps the collapse");
+
+        // Leaving and returning: a fresh stack projected from the resident doc page.
+        let (stack, _clean) = base_stack_with_clean();
+        ps.stack = Some(stack);
+        ps.materialize_text_runtime_from_doc(0);
+        ps.sync_view_from_doc(0);
+        assert!(ps.stack.as_ref().and_then(|s| s.group_by_uid(G)).is_some_and(|g| g.collapsed));
+    }
+
+    /// An undo entry whose target was deleted is skipped: the keypress undoes the next applicable edit
+    /// instead of silently consuming the orphan.
+    #[test]
+    fn undo_skips_a_meta_entry_whose_group_was_deleted() {
+        let dir = ScratchDir::new("orphan_undo");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page_with_group(&project);
+        // Text eye first (older entry), then the group eye (newest entry).
+        ps.apply_panel_actions(
+            PanelActions {
+                toggle_visible_text: Some(0),
+                ..Default::default()
+            },
+            &project,
+        );
+        ps.apply_group_op(GroupOp::ToggleGroupVisible(G.to_string()), &project);
+        assert_eq!(ps.history.undo_len(), 2);
+        // The group is deleted elsewhere (structural, no undo entry).
+        ps.edit_doc_node(0, |doc| doc.remove_group(0, G));
+        assert!(ps.group_meta_value(G).is_none());
+
+        assert!(ps.undo(&project), "one keypress reaches the text eye entry");
+        assert_eq!(ps.history.undo_len(), 0, "the orphan was skipped, the text entry undone");
+        let visible = find_node(&doc.lock().expect("doc lock"), T).map(|n| n.visible);
+        assert_eq!(visible, Some(true), "the text eye was undone");
     }
 }

@@ -16,8 +16,8 @@ The top-level flow is:
 ```text
 main.rs / args.rs
     -> ms_config (config) + ms_sysprobe (python_manager) + ms_log (runtime_log/trace)
-    -> ms_launcher (launcher) or studio_bootstrap.rs (background ProjectData::load behind
-       a loading screen)
+    -> ms_launcher (launcher) or studio_bootstrap.rs (background ProjectData::load, or the
+       single-image open into a scratch chapter, behind a loading screen)
     -> MangaApp
     -> shared models: BubblesModel, CleanOverlaysModel, TextMaskModel, LayerDoc
     -> tabs/* through shared CanvasView + CanvasHooks
@@ -56,9 +56,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - `main.rs`: process entry point, startup routing, installer/update service flags, direct update
   window and update continuation entry, project
   validation, launcher handoff, direct project opening, and Linux/Windows integration hooks.
-- `args.rs`: `clap` CLI contract, including visible startup/update flags, the update-check test
-  override, the environment-check and run-from-sources flags, and hidden installer/update
-  continuation flags.
+- `args.rs`: `clap` CLI contract, including visible startup/update flags, the open target
+  (`--project` XOR `--image` XOR a positional image path, clap group `open_target`), the
+  update-check test override, the environment-check and run-from-sources flags, and hidden
+  installer/update continuation flags; plus the pure flag-combination rules
+  (`conflicting_installed_copy_flags`, `conflicting_image_flags`) and the image path pre-check.
 - `version_format` (crate `ms-config`, re-exported by `main.rs`): the pure composition and
   stripping of the application version string. Compiled twice — as a module of `ms-config` and,
   through `include!("crates/ms-config/src/version_format.rs")`, as part of `build.rs` — so that
@@ -120,6 +122,13 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   the window itself from the first frame, so the `WindowGeometryTracker` (monitor/position/size
   persistence) and the Windows first-frame maximize workaround live here, as does the window-wide
   `egui-shader-layers` glow backend (installed from the app creator, destroyed in `on_exit`).
+  `StudioOpenRequest` (project dir, or image + `Arc<SingleImageScratch>`) is what a window opens;
+  it also derives the window title and the `fonts/ui` probe roots.
+- `single_image/`: app-shell half of the single-image mode — `SingleImageController` (one
+  `MangaApp` field, `Some` only for `SessionKind::SingleImage`) behind «Сохранить» / «Сохранить как»,
+  its pure save state machine, the exit and «Параметры JPEG» dialogs, and the tab filter, window
+  title and save-hotkey rules of the mode. `app.rs` holds hooks only; see
+  `single_image/MODULE_README.md`.
 - `project` (crate `ms-project`, re-exported by `main.rs`): chapter data models, project path
   discovery, project/settings loading, legacy `scr`/`src` and `cleaned`/`clean_layers` folder
   normalization, magic-byte JPEG->PNG conversion in `src`/`cleaned`/`clean_layers`, clean-layer
@@ -369,17 +378,38 @@ backend-socket seed, both decided by `--ignore-installed`) -> Windows service fl
 probe (`init_storage_mode_at_startup`: the FIRST document access; seeds the docstore default format)
 -> config seeding -> on-disk locale reconcile (`locale_store::reconcile_disk_catalog`, BEFORE
 `load_user_settings_for_startup`) -> UI-locale install / UI-scale / autosave-policy seeding -> `--check-venv` (terminal) -> `--continue-update` ->
-`--update` -> `--test-launcher` -> AI backend supervisor -> project resolution -> studio window.
+`--update` -> `--test-launcher` -> AI backend supervisor -> open-target resolution
+(`StartupTarget`) -> `StudioOpenRequest` -> studio window -> `StudioOpenRequest::release`.
 A pending storage reconciliation (user_config still in the other format than its recorded mode) is
-started on a worker right before the launcher, or — on a direct `--project` start — by
+started on a worker right before the launcher, or — on a direct `--project` or image start — by
 `studio_bootstrap` once the project has loaded (`ms-settings-ui`'s `storage_mode_job`); an
 incomplete reconciliation is surfaced in the studio's top bar (`MangaApp::draw_storage_reconcile_notice`).
 
 Before any of that, `reject_conflicting_startup_flags` validates the command line: combining
 `--ignore-installed` with a flag that manages an installed copy (`args::INSTALLED_COPY_FLAGS` —
 visible `--update` and the hidden install/update/uninstall/shortcut service flags) exits with code
-2. This runs FIRST because several of those flags act immediately; the decision itself is the pure,
-unit-tested `args::conflicting_installed_copy_flags`.
+2. An image to open combined with `--check-venv`, `--test-launcher` or any installed-copy flag
+exits the same way. This runs FIRST because several of those flags act immediately; the decisions
+themselves are the pure, unit-tested `args::conflicting_installed_copy_flags` /
+`args::conflicting_image_flags`.
+
+Single-image start (plan `dev-docs/single_image_mode_plan.md`, D13): `--image <PATH>`, the
+positional path (what Linux `.desktop` `%f` and Windows "Open with" `"%1"` pass) or the launcher's
+`LauncherOutcome::OpenImage` all become `StartupTarget::Image`. A CLI image skips the launcher
+like `--project`; a missing path, a directory (the message names `--project`) or a non-file shows
+`show_startup_error_dialog` and ends startup. The `run_main` loop then reserves a scratch session
+(`SingleImageScratch::reserve` under `ms_config::single_image::scratch_base()`), OWNS it for the
+window's whole life and deletes it after `run_main_window` returned (no window then, so never on a
+GUI thread); a reservation failure ends a CLI start, or returns a launcher pick to the launcher.
+The load worker runs `open_single_image` (no unsaved detection) and drops its scratch share
+before reporting; an open/decode failure lands on the bootstrap error screen as
+`SingleImageError::user_message` with the usual "Exit to launcher" / "Exit". A single-image
+session refuses the structural-operation reload (logged). `ReturnToLauncher` clears every CLI open
+target. Stale scratch sessions of crashed runs are swept once per start on a worker
+(`spawn_stale_scratch_sweep`, right after the flag check; lock-guarded, so another live instance
+is safe). The Linux desktop entry (`linux_desktop_entry_text`, pure and tested) uses `Exec=… %f`
+and a `MimeType=` list built from `ms_config::single_image::INPUT_FILE_TYPES`; it only OFFERS the
+program in "Open with" (best-effort `update-desktop-database` afterwards), never sets a default.
 
 Two startup flags change that routing:
 - `--check-venv` is TERMINAL: it checks the environment (`ms-installer`'s `venv_check`), exits 0 with a printed
@@ -437,9 +467,18 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   when nothing was pending). Then `force_flush`, клин autosave `request_stop_now`; the worker joins
   it, takes клин snapshots, pauses the bubbles saver, barriers the layer saver, writes the snapshots
   to staging and dispatches the engine. Page ops are not staged; the app is rebuilt from disk.
-- DISCARD (`start_exit_cleanup`): latches `discarding_unsaved_changes` first, DROPS (never flushes)
-  typing's deferred edits, `shutdown_saver_discarding` on the layer saver, pauses the bubbles saver,
-  `request_stop_now` on the клин autosave, then deletes staging on a job that joins that thread.
+- DISCARD (`start_exit_cleanup` = `quiesce_writers_discarding` + delete job): the quiesce latches
+  `discarding_unsaved_changes` first, DROPS (never flushes) typing's deferred edits,
+  `shutdown_saver_discarding` on the layer saver, pauses the bubbles saver, `request_stop_now` on the
+  клин autosave; then staging is deleted on a job that joins that thread.
+- Single-image session (`single_image/`): staging is a scratch that is never merged and that
+  `run_main` deletes after the window closed (plan D13), so EVERY close quiesces the discard way
+  and nothing is flushed: «Не сохранять» and a successful save-then-close go through
+  `close_single_image_discarding` (quiesce + `finalize_close`, no delete job, клин thread joined in
+  `on_exit`); `on_exit` itself quiesces first when no dialog did. Dirty is the controller's
+  (`AutosaveGate::action_count` vs the last-write baseline, plus deferred typing edits, plus a write
+  in flight), never the staging probe. The save-then-close keeps the window open on a failed write
+  and re-opens the exit dialog when the user backed out of the picker / JPEG options.
 - Failed discard (`abort_discard_after_failed_cleanup`): releases the latch, marks the session
   unsaved, and restarts ALL three writers on the same `AutosaveGate` (`enable_background_saver`,
   `resume_saver_after_failed_discard`, a fresh `OverlayAutosaveControl` + autosave thread).
@@ -529,6 +568,11 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
 ## Editing map
 - Startup, service flags, project-open flow, launcher handoff, or update routing: start in
   `main.rs` and `args.rs`.
+- Single-image saving, its top bar, exit dialog, hidden tabs and save hotkeys: `single_image/`
+  (hooks in `app.rs`: `tab_visible`, `draw_tab_bar`, `draw_exit_dialog`, `ui` tick, `on_exit`).
+- Single-image start (CLI, launcher pick, scratch lifetime, desktop entry): `main.rs`
+  (`resolve_startup_target`, the `run_main` loop, `linux_desktop_entry_text`), `args.rs`
+  (`open_target` group), `studio_bootstrap.rs` (`StudioOpenRequest`, `spawn_open_thread`).
 - What the application reports as its version, or which sites may see the git suffix:
   `crates/ms-config/src/version_format.rs` (the pure rules) + `build.rs` (git probing and rerun
   watches); then the

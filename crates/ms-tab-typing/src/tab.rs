@@ -71,6 +71,9 @@ FILE HEADER (crates/ms-tab-typing/src/tab.rs)
     shared `CleanOverlaysModel` (с CPU RGBA-кэшем несохранённых правок); when the model holds
     no overlay for a page, the export decodes (read-only, never written back into the model) the
     file the overlay loader would load (`clean_assign::LOADER_CLEAN_SCOPE`).
+  - Single-image «Сохранить» (native): `prepare_flatten_to_file` / `request_flatten_to_file` /
+    `poll_flatten_to_file` in `tab/flatten_to_file.rs` flatten one page into an image file with the
+    export's composite; mutually exclusive with a project export.
   - Clean overlay visibility in this tab is canvas-local UI state: toggling it must not
     mutate `CleanOverlaysModel` or affect the Cleaning tab.
 - Ключевые методы:
@@ -180,6 +183,12 @@ mod vector_transform;
 mod layout_editor;
 use layout_editor::*;
 mod helpers;
+// Single-image «Сохранить»: flatten one page into an image file (native only — the atomic write
+// it ends with does not exist on wasm).
+#[cfg(not(target_arch = "wasm32"))]
+mod flatten_to_file;
+#[cfg(not(target_arch = "wasm32"))]
+pub use flatten_to_file::{FlattenReadiness, FlattenToFileError, FlattenToFileReport, FlattenToFileRequest};
 use helpers::*;
 // `text_preview_label` moved into `mesh_geometry` but is re-exported by the
 // crate root (`lib.rs`) as `tab::text_preview_label`; a glob import
@@ -559,6 +568,10 @@ pub struct TypingTabState {
     /// exclusive with save (Finding 2): while set, a new export trigger is deferred and no deferred
     /// export dispatches.
     save_busy: bool,
+    /// The single-image flatten-to-file job (`tab/flatten_to_file.rs`). Mutually exclusive with a
+    /// project export in both directions.
+    #[cfg(not(target_arch = "wasm32"))]
+    flatten_to_file: flatten_to_file::FlattenToFileState,
 }
 
 /// Why a deferred text-layer save was flushed. Diagnostics only — every reason performs the same
@@ -705,6 +718,8 @@ impl Default for TypingTabState {
             mask_layer: TypingMaskLayer::default(),
             layer_doc: None,
             save_busy: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            flatten_to_file: flatten_to_file::FlattenToFileState::default(),
         }
     }
 }
@@ -793,6 +808,15 @@ impl TypingTabState {
     pub fn has_pending_text_edits(&self) -> bool {
         self.text_overlays.has_pending_placement_save()
             || self.text_overlays.has_unsettled_layer_move()
+    }
+
+    /// Monotonic count of user clip-mask edits (one per brush gesture, applied fill or page clear;
+    /// see `TypingMaskLayer::edit_count`). The mask is persisted outside the autosave gate's writers,
+    /// so a caller that tracks "changed since X" (the single-image save) compares this counter with a
+    /// value it captured at X.
+    #[must_use]
+    pub fn mask_edit_count(&self) -> u64 {
+        self.mask_layer.edit_count()
     }
 
     /// DROPS every pending text-layer edit without writing it. For the DISCARD path only
@@ -958,7 +982,7 @@ impl TypingTabState {
     /// - `!preload_active` — the layer preload pass has fully drained. It gates on pass COMPLETION, NOT
     ///   full residency: a page whose decode genuinely fails never becomes resident, so a residency gate
     ///   would hang the export forever (Finding 1). The export tolerates a non-resident page (its
-    ///   in-function residency pass skips it and `build_export_overlay_snapshots` omits it).
+    ///   in-function residency pass skips it and `export_overlay_snapshots_for_page` omits it).
     /// - `masks_ready` — the clip-mask loader has drained. An unfinished mask store yields an EMPTY
     ///   `export_masks_snapshot`, silently dropping every page's clip masks, and there is no per-page
     ///   disk fallback for masks at export time. The loader is fast and always completes, so no hang.
@@ -1012,6 +1036,20 @@ impl TypingTabState {
         self.text_overlays.export_rx.is_some()
     }
 
+    /// True while a single-image flatten-to-file worker runs (never on wasm, which has no such API).
+    /// A project export is deferred / withheld while it holds, mirroring `save_busy`.
+    #[must_use]
+    pub fn flatten_to_file_in_progress(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.flatten_to_file.is_running()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            false
+        }
+    }
+
     /// Draws one frame of the «Текст» tab into `params.ui`.
     ///
     /// The dock state is LENT by the application for the frame (see
@@ -1026,7 +1064,10 @@ impl TypingTabState {
             status,
             panel_dock,
         } = params;
-        let save_busy = self.save_busy;
+        // A running single-image flatten-to-file blocks a project export exactly like a busy save
+        // (both directions are exclusive; the flatten refuses while an export runs or is deferred), so
+        // it is folded into the one "busy" term the export trigger and the deferred dispatch read.
+        let save_busy = self.save_busy || self.flatten_to_file_in_progress();
         let _frame_span = ms_log::trace_scope!(cat::FRAME, "typing.draw page={}", self.canvas.current_page_idx());
         let canvas_rect = ui.max_rect();
         // Cross-tab sync: if the shared LayerDoc changed (version advanced) since we last projected,
@@ -1611,9 +1652,9 @@ struct TypingHooks<'a> {
     mask_layer: &'a mut TypingMaskLayer,
     pending_create_text_from_bubble: Option<BubbleCreateTextRequest>,
     page_overlay_occluders: HashMap<usize, Vec<[Pos2; 4]>>,
-    /// True while a project save is pending/in flight (Finding 2). A new export trigger is deferred
-    /// (never dispatched inline) while this holds, so export and save cannot mutate shared doc/staging
-    /// state concurrently.
+    /// True while a project save is pending/in flight (Finding 2) or a single-image flatten-to-file
+    /// runs. A new export trigger is deferred (never dispatched inline) while this holds, so export and
+    /// save cannot mutate shared doc/staging state concurrently, and export and flatten never overlap.
     save_busy: bool,
 }
 
@@ -1748,8 +1789,12 @@ impl CanvasHooks for TypingHooks<'_> {
         {
             self.top_panel.toggle_centering_assist();
         }
-        self.top_panel
-            .set_export_default_dir(project.project_dir.clone());
+        // The user-facing folder, never the hidden single-image scratch chapter (deleted on exit), so
+        // the export / image-import dialogs never default into a directory that vanishes.
+        self.top_panel.set_export_default_dir(project.user_facing_dir());
+        // Single-image mode has no project export (the file is written by «Сохранить»): the panel hides
+        // the export format row, re-pagination block and export button.
+        self.top_panel.set_single_image_mode(project.is_single_image());
         // The export panel needs two project facts it cannot reach on its own: the comic type
         // (re-pagination defaults OFF and warns for a page-based title — it is a webtoon
         // operation) and the `"<title> <chapter>"` base name that prefills the PDF save dialog
@@ -2508,6 +2553,9 @@ struct TypingRasterLayer {
     /// Whether the raster is clipped to the page mask (typing tab). Rasters DEFAULT OFF (text differs).
     /// Projected from the doc node's `NodeBody::Raster.mask_clip` (`Some(true)` ⇒ on).
     mask_clip_enabled: bool,
+    /// PS unified group this raster belongs to (`LayerNode::group_uid`), folded by
+    /// `ordering::composite_plan` with the page's `groups_by_page` entry. `None` = ungrouped.
+    group_uid: Option<String>,
     /// Cached mask-clipped DISPLAY image, rebuilt when the doc node `generation` (which the mask-clip
     /// toggle bumps) changes. `None` until first computed / when `mask_clip_enabled` is false.
     clipped_image: Option<ColorImage>,
@@ -2524,6 +2572,12 @@ struct TypingOverlayRuntime {
     mask_clip_enabled: bool,
     /// Индекс слоя текста, в который сгруппирован оверлей (по умолчанию 0).
     layer_idx: usize,
+    /// PS unified group of the doc text node (`LayerNode::group_uid`), orthogonal to `layer_idx`.
+    /// Projected by `sync_from_doc`; `None` for a runtime no doc node has reached yet.
+    group_uid: Option<String>,
+    /// The doc text node's own visibility (`LayerNode::visible`), projected by `sync_from_doc`;
+    /// `true` for a runtime no doc node has reached yet. Folded by `ordering::composite_plan`.
+    visible: bool,
     user_scale: f32,
     angle_deg: f32,
     deform_mesh: Option<TypingOverlayDeformMesh>,
@@ -2684,21 +2738,28 @@ pub(super) struct TypingExportOverlaySnapshot {
     pub(super) size_px: [usize; 2],
     pub(super) source_rgba: Vec<u8>,
     pub(super) render_data_json: Option<serde_json::Value>,
+    /// Doc node uid: the text's band key (`ordering::CompositeKey::Text`) in the job's `bands`.
     pub(super) uid: String,
-    /// Unified band-Z captured from the SAME in-memory `bands_by_page`/doc-flattened order the raster
-    /// snapshot uses, so text and rasters interleave consistently in the export (no disk-vs-memory
-    /// divergence). The flatten falls back to a disk band lookup only when no snapshot is provided.
-    pub(super) band_z: u32,
+    /// PS unified group of the text (see `TypingOverlayRuntime::group_uid`), folded with the job's
+    /// `groups` by `ordering::composite_plan`.
+    pub(super) group_uid: Option<String>,
+    /// The doc text node's own visibility; an invisible text is omitted by the composite plan.
+    pub(super) visible: bool,
 }
 
 /// A snapshot of one on-screen PS raster layer for export, taken from the doc-projected
-/// `raster_layers_by_page` (the SAME source the live canvas draws) with its unified band-Z. Carrying
+/// `raster_layers_by_page` (the SAME source the live canvas draws); its band-Z is looked up by `uid`
+/// in the job's `bands`. The disk fallback of the flatten builds the same shape from `layers.json`. Carrying
 /// this in the export job makes the composite use exactly what the user sees — including in-session
 /// transforms, deform, and effects renders — instead of re-reading `layers.json` from disk, which can
 /// diverge (unflushed edits, a missing `_fx.png` rendered file, or a stale staging manifest) and silently
 /// DROP the raster from the bake.
 #[derive(Clone)]
 pub(super) struct TypingExportRasterSnapshot {
+    /// Doc node uid: the raster's band key (`ordering::CompositeKey::Raster`) in the job's `bands`.
+    pub(super) uid: String,
+    /// PS unified group of the raster, folded with the job's `groups` by `ordering::composite_plan`.
+    pub(super) group_uid: Option<String>,
     pub(super) visible: bool,
     pub(super) opacity: f32,
     pub(super) transform: ms_models::layer_model::manifest::TransformRec,
@@ -2706,8 +2767,6 @@ pub(super) struct TypingExportRasterSnapshot {
     /// Straight (un-premultiplied) RGBA of the DISPLAY image (post-effects), row-major.
     pub(super) rgba: Vec<u8>,
     pub(super) size_px: [usize; 2],
-    /// Unified band-Z, bottom-to-top, for interleaving with text overlays exactly as on-screen.
-    pub(super) band_z: u32,
     /// Whether the raster is clipped to the page mask (matches the on-screen `clipped_image` path). When
     /// set, the export composite masks the raster via `export_clip_overlay_rgba_if_needed`, so a
     /// mask-clipped raster exports clipped (not with pixels outside the mask).
@@ -2780,6 +2839,13 @@ pub(super) struct TypingExportPageJob {
     /// THESE (matching the canvas) instead of re-reading rasters from `layers_primary_dir`. An empty vec
     /// falls back to the disk read (back-compat).
     pub(super) rasters: Vec<TypingExportRasterSnapshot>,
+    /// The page's unified bands at dispatch (`bands_by_page`: `ordering::doc_page_bands` of the doc
+    /// page, or the disk bands of a doc-less page) — the band-Z source of `rasters` and `overlays`.
+    /// Ignored by the flatten when `rasters` is empty, which then reads the disk bands instead
+    /// (`resolve_flatten_input`).
+    pub(super) bands: Vec<ms_models::layer_model::ordering::Band>,
+    /// The page's PS unified groups at dispatch (visibility + opacity folded by the composite plan).
+    pub(super) groups: Vec<ms_models::layer_model::persist::GroupMeta>,
     pub(super) mask: Option<TypingMaskExportPage>,
     pub(super) export_format: TypingExportFormat,
     pub(super) layers_primary_dir: Option<PathBuf>,
@@ -3227,6 +3293,10 @@ pub(super) struct TypingTextOverlayLayer {
     /// used to interleave rasters and text/image overlays in one ordered draw pass. Cleared in the
     /// same places as `raster_layers_by_page`.
     bands_by_page: HashMap<usize, Vec<ms_models::layer_model::ordering::Band>>,
+    /// PS unified groups per page (`DocPage::groups`, or `PageRasters::groups` on the disk path),
+    /// rewritten together with `bands_by_page` by every projection; the group-fold input of
+    /// `ordering::composite_plan` for the overlay hit-test and the export job.
+    groups_by_page: HashMap<usize, Vec<ms_models::layer_model::persist::GroupMeta>>,
     /// Last `LayerDoc::version` this tab projected. Each frame, if the live doc version differs, the
     /// tab re-projects its current page from the shared doc — the in-memory cross-tab sync. Initialized
     /// to 0 (a fresh doc) and reconciled by every `sync_from_doc`.
@@ -3381,6 +3451,7 @@ impl Default for TypingTextOverlayLayer {
             doc_legacy_text_dir: None,
             raster_layers_by_page: HashMap::new(),
             bands_by_page: HashMap::new(),
+            groups_by_page: HashMap::new(),
             last_doc_version: 0,
             create_raster_state: None,
             raster_effects_state: None,
@@ -3427,3 +3498,5 @@ struct TypingEditImageEffectsRequest {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod composite_characterization_tests;

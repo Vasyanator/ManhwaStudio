@@ -764,6 +764,9 @@ impl TypingTextOverlayLayer {
             center_page_px: decoded.center_page_px,
             mask_clip_enabled: decoded.mask_clip_enabled,
             layer_idx: decoded.layer_idx,
+            // A new text is ungrouped and visible; `route_to_doc` below re-projects the node's values.
+            group_uid: None,
+            visible: true,
             user_scale: decoded.user_scale,
             angle_deg: decoded.angle_deg,
             deform_mesh: decoded.deform_mesh,

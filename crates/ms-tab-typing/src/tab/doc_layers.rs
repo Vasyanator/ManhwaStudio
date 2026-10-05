@@ -10,6 +10,15 @@ raster-layer loading, doc<->tab sync/route helpers, single-raster drawing, unifi
 hit-testing, per-frame canvas bookkeeping, layout-editor state queries, and the
 GPU-cache snapshot/eviction methods on `TypingTextOverlayLayer`.
 
+Ordering is NOT decided here: `ms_models::layer_model::ordering` owns it. This file projects its
+inputs (`bands_by_page` from `ordering::doc_page_bands`, `groups_by_page` from the doc page's PS
+groups, each runtime's `group_uid` / `visible`), answers band-Z through `ordering::band_z`
+(`raster_band_z` / `overlay_band_z`), hands the canvas its plan inputs (`page_composite_inputs`), and
+lets the overlay hit-test (`topmost_overlay_at`) skip what `ordering::composite_plan` omits; the
+«Слои» panel rows (`unified_layer_rows`) are the same plan's order, reversed. `text_composite_key` / `text_composite_item` / `raster_composite_item` are
+the one mapping of a text overlay / raster layer onto the owner's key / item, shared by the canvas
+(`tab/draw_page.rs`) and the export flatten (`tab/export.rs`), so the two cannot build different plans.
+
 Notes:
 Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
 submodules of `tab` can use them. `use super::*;` pulls in the parent module's
@@ -404,6 +413,35 @@ impl TypingTextOverlayLayer {
         }
     }
 
+    /// True when this tab's projection reflects the shared `LayerDoc`'s current `version` (or no doc
+    /// is wired). False while a doc edit made elsewhere (the PS tab) still awaits
+    /// [`Self::maybe_reproject_from_doc_version`]. A poisoned doc lock reads as current: nothing can
+    /// re-project from it any more, so waiting on it would block a caller forever; the composite then
+    /// uses the last projection, exactly as the project export does.
+    pub(super) fn doc_projection_current(&self) -> bool {
+        let Some(doc) = self.layer_doc.as_ref() else {
+            return true;
+        };
+        doc.lock().map_or(true, |guard| guard.version() == self.last_doc_version)
+    }
+
+    /// Off-draw driver of the cross-tab sync, for callers that compose while this tab is NOT drawn
+    /// (the single-image flatten-to-file). Polls every in-flight job that makes
+    /// [`Self::maybe_reproject_from_doc_version`] back off (placement save, create / effects / edit
+    /// renders — the same non-blocking polls `draw` runs), then re-projects `current_page` when the
+    /// doc moved. Safe to run in the same frame as `draw` (every poll is a `try_recv`; a result is
+    /// applied exactly once by whichever caller sees it first).
+    pub(super) fn drive_doc_sync_without_draw(&mut self, ctx: &egui::Context, current_page: usize) {
+        // The "did anything change" flags only drive `draw`'s repaint; the flatten preparation
+        // requests a repaint itself while it is not ready.
+        self.poll_save_jobs(ctx);
+        self.poll_create_overlay_jobs(ctx);
+        self.poll_create_raster_jobs(ctx);
+        self.poll_raster_effects_jobs(ctx);
+        self.poll_edit_overlay_jobs(ctx);
+        self.maybe_reproject_from_doc_version(current_page);
+    }
+
     /// Page pixel size `[w, h]` for `page_idx`, resolved lazily from the cached page image path
     /// (header-only `image_dimensions`) and memoized. Used for legacy-overlay uv→px decoding when the
     /// page is handed to the shared doc. Falls back to `[1, 1]` when unknown.
@@ -445,6 +483,7 @@ impl TypingTextOverlayLayer {
         let Some(primary) = self.layers_primary_dir.clone() else {
             self.raster_layers_by_page.insert(page_idx, Vec::new());
             self.bands_by_page.insert(page_idx, Vec::new());
+            self.groups_by_page.insert(page_idx, Vec::new());
             return;
         };
         let fallback = self.layers_fallback_dir.clone();
@@ -497,12 +536,12 @@ impl TypingTextOverlayLayer {
                 page_idx,
             );
             self.bands_by_page.insert(page_idx, bands);
-            let layers = match ms_models::layer_model::persist::load_page_rasters(
+            let (groups, layers) = match ms_models::layer_model::persist::load_page_rasters(
                 &primary,
                 fallback.as_deref(),
                 page_idx,
             ) {
-                Ok(page) => page
+                Ok(page) => (page.groups, page
                     .layers
                     .into_iter()
                     .map(|l| TypingRasterLayer {
@@ -516,17 +555,19 @@ impl TypingTextOverlayLayer {
                         effects: l.effects,
                         deform: l.deform,
                         mask_clip_enabled: l.mask_clip.unwrap_or(false),
+                        group_uid: l.group_uid,
                         clipped_image: None,
                         texture: None,
                     })
-                    .collect(),
+                    .collect()),
                 Err(err) => {
                     ms_log::runtime_log::log_warn(format!(
                         "[typing] load PS raster layers for page {page_idx} failed: {err}"
                     ));
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 }
             };
+            self.groups_by_page.insert(page_idx, groups);
             self.raster_layers_by_page.insert(page_idx, layers);
         }
 
@@ -559,14 +600,14 @@ impl TypingTextOverlayLayer {
     ///   state, payload tracking) are preserved; the GPU texture is re-uploaded only on a generation
     ///   change. Runtime REMOVAL stays owned by `remove_overlay` / the disk loader, so the projected
     ///   overlay indices are stable across a sync.
-    /// - Bands: one `Raster`/`PinnedText` band per node, with `z` taken directly from the node.
+    /// - Bands: `ordering::doc_page_bands` (one `Raster`/`PinnedText` band per node at its node `z`);
+    ///   groups: the page's PS unified groups (`groups_by_page`), the composite plan's group fold.
     pub(super) fn sync_from_doc(
         &mut self,
         page_idx: usize,
         doc: &ms_models::layer_model::layer_doc::LayerDoc,
     ) {
         use ms_models::layer_model::layer_doc::NodeBody;
-        use ms_models::layer_model::ordering::Band;
         let _sync_span = ms_log::trace_scope!(
             cat::SYNC,
             "sync_from_doc page={} doc_version={}",
@@ -662,6 +703,7 @@ impl TypingTextOverlayLayer {
                 effects: effects.clone(),
                 deform: node.deform.clone(),
                 mask_clip_enabled: mask_clip.unwrap_or(false),
+                group_uid: node.group_uid.clone(),
                 // A generation change (e.g. a mask-clip toggle) invalidates the cached clipped image.
                 clipped_image: None,
                 texture,
@@ -775,6 +817,8 @@ impl TypingTextOverlayLayer {
                     rt.user_scale = user_scale;
                     rt.deform_mesh = deform_mesh;
                     rt.render_data_json = render_data_json;
+                    rt.group_uid = node.group_uid.clone();
+                    rt.visible = node.visible;
                     rt.kind = if *is_image {
                         TypingOverlayKind::Image
                     } else {
@@ -828,6 +872,9 @@ impl TypingTextOverlayLayer {
                     runtime.extra = extra_centers.clone();
                     // Same rationale as `extra`: seeded here instead of widening the constructor.
                     runtime.centering_frame = centering_frame.map(CenteringFrame::from_rec);
+                    // Composite metadata (PS group + own visibility), same rationale.
+                    runtime.group_uid = node.group_uid.clone();
+                    runtime.visible = node.visible;
                     self.overlays.push(runtime);
                     let idx = self.overlays.len() - 1;
                     // Mark the texture generation as projected so a subsequent sync doesn't needlessly
@@ -845,25 +892,12 @@ impl TypingTextOverlayLayer {
         // queue + selection indices) and by the disk loader on a full reload; `sync_from_doc` does
         // not drop runtimes, so the projected overlay indices stay stable across a sync.
 
-        // --- Bands: derive unified Z directly from the doc node z. ---
-        let mut bands: Vec<Band> = Vec::with_capacity(page.nodes.len());
-        for node in &page.nodes {
-            match node.kind {
-                ms_models::layer_model::layer_doc::NodeKind::Raster => {
-                    bands.push(Band::Raster {
-                        uid: node.uid.clone(),
-                        z: node.z,
-                    });
-                }
-                ms_models::layer_model::layer_doc::NodeKind::Text => {
-                    bands.push(Band::PinnedText {
-                        uid: node.uid.clone(),
-                        z: node.z,
-                    });
-                }
-            }
-        }
-        self.bands_by_page.insert(page_idx, bands);
+        // --- Bands + groups: the owner derives the bands from the doc node z; the PS groups are the
+        // group-fold input of the composite plan. Rewritten together so they never describe two
+        // different projections of the page. ---
+        self.bands_by_page
+            .insert(page_idx, ms_models::layer_model::ordering::doc_page_bands(page));
+        self.groups_by_page.insert(page_idx, page.groups.clone());
 
         // A just-created raster asked to be selected once its page synced — resolve by uid now.
         if let Some((pending_page, uid)) = self.pending_select_raster_uid.clone()
@@ -954,13 +988,16 @@ impl TypingTextOverlayLayer {
 
     /// Draws a single cached read-only PS raster layer (by page + index) into `painter`, lazily
     /// uploading its texture via `ctx`. Uses the same page-px -> scene mapping (`scene_from_page_px`)
-    /// as the text overlays. Visibility/opacity handling matches `draw_page_raster_layers`.
+    /// as the text overlays. `opacity` is the composite-plan step opacity (the layer's own opacity
+    /// folded with its PS group, finite and in `(0, 1]`): the caller only passes rasters the plan keeps,
+    /// so visibility is not re-checked here. The tint applies to the affine quad AND the deform mesh.
     pub(super) fn draw_one_raster_layer(
         &mut self,
         ctx: &egui::Context,
         painter: &egui::Painter,
         view: PageView,
         raster_idx: usize,
+        opacity: f32,
     ) {
         let page_idx = view.page_idx;
         let Some(layer) = self
@@ -970,9 +1007,7 @@ impl TypingTextOverlayLayer {
         else {
             return;
         };
-        if !layer.visible || layer.opacity <= 0.0 {
-            return;
-        }
+        let tint = composite_step_tint(opacity);
         let [w, h] = layer.image.size;
         if w == 0 || h == 0 {
             return;
@@ -1011,7 +1046,7 @@ impl TypingTextOverlayLayer {
                 &mesh_scene,
                 grid.cols,
                 grid.rows,
-                Color32::WHITE,
+                tint,
             );
             return;
         }
@@ -1031,7 +1066,6 @@ impl TypingTextOverlayLayer {
             let ry = dx * sin_a + dy * cos_a;
             quad[i] = view.scene_from_page_px([cx + rx, cy + ry]);
         }
-        let tint = Color32::from_white_alpha((layer.opacity.clamp(0.0, 1.0) * 255.0) as u8);
         let mut mesh = Mesh::with_texture(texture.id());
         let uvs = [
             Pos2::new(0.0, 0.0),
@@ -1051,61 +1085,40 @@ impl TypingTextOverlayLayer {
         painter.add(egui::Shape::mesh(mesh));
     }
 
-    /// Unified band Z for a raster (by uid) on `page_idx`: the Z of the matching `Raster` band, or a
-    /// top-of-stack key (`bands.len()`) for an unsaved raster not yet in the manifest.
+    /// Unified band Z for a raster (by uid) on `page_idx`, by the owner rule `ordering::band_z`: the Z
+    /// of the matching `Raster` band, or a top-of-stack key (`bands.len()`) for an unsaved raster not
+    /// yet in the manifest. A page with no cached bands answers 0.
     pub(super) fn raster_band_z(&self, page_idx: usize, uid: &str) -> u32 {
-        let Some(bands) = self.bands_by_page.get(&page_idx) else {
-            return 0;
-        };
-        for band in bands {
-            if let ms_models::layer_model::ordering::Band::Raster { uid: u, z } = band
-                && u == uid
-            {
-                return *z;
-            }
-        }
-        bands.len() as u32
+        use ms_models::layer_model::ordering::{CompositeKey, band_z};
+        self.bands_by_page
+            .get(&page_idx)
+            .map_or(0, |bands| band_z(bands, CompositeKey::Raster { uid }))
     }
 
-    /// Unified band Z for an overlay on `page_idx`: if a `PinnedText` band with `uid` exists, its Z;
-    /// else the Z of the `TextGroup` band whose `layer_idx == layer_idx`; else a top-of-stack key
-    /// (`bands.len()`) for an item not yet in the manifest.
+    /// Unified band Z for an overlay on `page_idx`, by the owner rule `ordering::band_z`: the Z of the
+    /// `PinnedText` band with `uid`; else of the `TextGroup` band whose `layer_idx` matches (membership
+    /// is not checked); else a top-of-stack key (`bands.len()`). A page with no cached bands answers 0.
     pub(super) fn overlay_band_z(&self, page_idx: usize, uid: &str, layer_idx: usize) -> u32 {
-        use ms_models::layer_model::ordering::Band;
-        let Some(bands) = self.bands_by_page.get(&page_idx) else {
-            return 0;
-        };
-        for band in bands {
-            if let Band::PinnedText { uid: u, z } = band
-                && u == uid
-            {
-                return *z;
-            }
-        }
-        let layer_idx_u32 = u32::try_from(layer_idx).unwrap_or(u32::MAX);
-        for band in bands {
-            if let Band::TextGroup {
-                layer_idx: li, z, ..
-            } = band
-                && *li == layer_idx_u32
-            {
-                return *z;
-            }
-        }
-        bands.len() as u32
+        self.bands_by_page.get(&page_idx).map_or(0, |bands| {
+            ms_models::layer_model::ordering::band_z(bands, text_composite_key(uid, layer_idx))
+        })
     }
 
     /// The TOPMOST text/image overlay whose scene quad contains `pointer` on `page_idx`, as
     /// `(overlay_idx, unified band-Z)`, or `None` if no overlay is under the pointer. Used by the unified
     /// click hit-test so a raster cannot steal a click that lands on a higher-Z overlay (and vice-versa
-    /// once text can sit below a raster). Mirrors `merged_fills`' overlay band-Z lookup.
+    /// once text can sit below a raster). An overlay the composite plan omits (its doc node hidden, or
+    /// inside a hidden PS group) is not hit. Among overlays (one kind) the higher band-Z wins and a
+    /// later overlay wins a tie, matching the stable input-order tie rule of `ordering::composite_plan`.
     pub(super) fn topmost_overlay_at(
         &self,
         view: PageView,
         pointer: Option<Pos2>,
     ) -> Option<(usize, u32)> {
+        use ms_models::layer_model::ordering::composite_plan;
         let page_idx = view.page_idx;
         let p = pointer?;
+        let (bands, groups) = self.page_composite_inputs(page_idx);
         let mut best: Option<(usize, u32)> = None;
         for (idx, overlay) in self.overlays.iter().enumerate() {
             if overlay.page_idx != page_idx || overlay.texture.is_none() {
@@ -1115,12 +1128,106 @@ impl TypingTextOverlayLayer {
             if !point_in_quad(p, &quad) {
                 continue;
             }
-            let z = self.overlay_band_z(page_idx, &overlay.uid, overlay.layer_idx);
-            if best.is_none_or(|(_, bz)| z >= bz) {
-                best = Some((idx, z));
+            let item = text_composite_item(
+                &overlay.uid,
+                overlay.layer_idx,
+                overlay.group_uid.as_deref(),
+                overlay.visible,
+            );
+            // A one-item plan answers "is this overlay composited at all" with the owner's own
+            // visibility / group-fold rule, so the hit-test cannot drift from the draw and export.
+            let Some(step) = composite_plan(bands, &groups, &[item]).first().copied() else {
+                continue;
+            };
+            if best.is_none_or(|(_, bz)| step.z >= bz) {
+                best = Some((idx, step.z));
             }
         }
         best
+    }
+
+    /// The composite-plan inputs of `page_idx`: its cached bands (empty when none are cached) and its
+    /// PS unified groups as group folds (empty when none). Every canvas consumer of
+    /// `ordering::composite_plan` on this page takes its inputs from here.
+    pub(super) fn page_composite_inputs(
+        &self,
+        page_idx: usize,
+    ) -> (
+        &[ms_models::layer_model::ordering::Band],
+        Vec<ms_models::layer_model::ordering::GroupFold<'_>>,
+    ) {
+        let bands = self.bands_by_page.get(&page_idx).map_or(&[][..], Vec::as_slice);
+        let groups = self
+            .groups_by_page
+            .get(&page_idx)
+            .map(|groups| groups.iter().map(ms_models::layer_model::ordering::GroupFold::from).collect())
+            .unwrap_or_default();
+        (bands, groups)
+    }
+
+    /// The «Слои» panel rows of `page_idx`, top of the stack first, in exactly the canvas composite
+    /// order reversed: rasters in cache order then the page's overlays in overlay-index order (the
+    /// fill pass's input order) go through `order_unified_layer_rows` over this page's cached bands.
+    /// Hidden rows are listed (the panel shows them); see `order_unified_layer_rows`.
+    pub(super) fn unified_layer_rows(&self, page_idx: usize) -> Vec<TypingLayerRow> {
+        let bands = self.bands_by_page.get(&page_idx).map_or(&[][..], Vec::as_slice);
+        let mut rows: Vec<(TypingLayerRow, ms_models::layer_model::ordering::CompositeKey<'_>)> = Vec::new();
+        if let Some(rasters) = self.raster_layers_by_page.get(&page_idx) {
+            rows.extend(rasters.iter().enumerate().map(|(raster_idx, raster)| {
+                (
+                    TypingLayerRow::Raster(raster_idx),
+                    ms_models::layer_model::ordering::CompositeKey::Raster { uid: &raster.uid },
+                )
+            }));
+        }
+        rows.extend(
+            self.overlays
+                .iter()
+                .enumerate()
+                .filter(|(_, overlay)| overlay.page_idx == page_idx)
+                .map(|(overlay_idx, overlay)| {
+                    (TypingLayerRow::Overlay(overlay_idx), text_composite_key(&overlay.uid, overlay.layer_idx))
+                }),
+        );
+        order_unified_layer_rows(bands, &rows)
+    }
+
+    /// Flips the doc visibility of overlay `overlay_idx` on `page_idx` (the «Слои» row eye).
+    ///
+    /// The text node's `visible` is doc-owned and shared with the PS editor's text eye, so the edit
+    /// goes through the doc (`set_visibility`) and the runtime is re-projected from it; the text
+    /// payload carries `visible`, so the change is persisted by the ordinary deferred text save
+    /// (`mark_placement_save_dirty`). The typing tab has no undo history, so none is recorded. With
+    /// no doc wired, or the page not resident, nothing changes (a runtime-only flip would show a
+    /// state the save would never write) and a warning is logged. Returns whether the doc changed.
+    pub(super) fn toggle_overlay_visibility(&mut self, page_idx: usize, overlay_idx: usize) -> bool {
+        let Some((uid, visible)) = self
+            .overlays
+            .get(overlay_idx)
+            .filter(|overlay| overlay.page_idx == page_idx)
+            .map(|overlay| (overlay.uid.clone(), overlay.visible))
+        else {
+            return false;
+        };
+        let changed = self.route_to_doc_reporting(page_idx, |doc| {
+            // `LayerDoc::node` is test-only; production reads go through `page().nodes`.
+            let differs = doc
+                .page(page_idx)
+                .and_then(|page| page.nodes.iter().find(|node| node.uid == uid))
+                .is_some_and(|node| node.visible == visible);
+            if differs {
+                doc.set_visibility(page_idx, &uid, !visible);
+            }
+            differs
+        });
+        if changed {
+            self.mark_placement_save_dirty();
+        } else {
+            ms_log::runtime_log::log_warn(format!(
+                "[typing] layer visibility not changed: page {page_idx} uid {uid} has no resident doc text node"
+            ));
+        }
+        changed
     }
 
     pub(super) fn begin_canvas_frame(&mut self) {
@@ -1391,7 +1498,7 @@ impl TypingTextOverlayLayer {
     /// `page_*.json`, or a worker panic that drops the sender) is dropped from the pass and NEVER
     /// becomes resident, so a residency gate would hang the export forever. The export tolerates a
     /// non-resident page — its in-function residency pass skips a page it cannot project and
-    /// `build_export_overlay_snapshots` omits it — so dispatching once the pass drains is safe. The
+    /// `export_overlay_snapshots_for_page` omits it — so dispatching once the pass drains is safe. The
     /// caller separately gates on `TypingMaskLayer::masks_loaded` (masks always complete, so no hang).
     #[must_use]
     pub(super) fn take_pending_export_if_ready(
@@ -1602,4 +1709,60 @@ pub(super) fn reconcile_page_text_geometry_into_doc(
         }
     }
     changed
+}
+
+/// The band key of a text/image overlay for `ordering::band_z`: its doc uid first, then its legacy
+/// «Группа текста N» `layer_idx`. A `layer_idx` beyond `u32` saturates, so it can only miss a group.
+pub(super) fn text_composite_key(uid: &str, layer_idx: usize) -> ms_models::layer_model::ordering::CompositeKey<'_> {
+    ms_models::layer_model::ordering::CompositeKey::Text {
+        uid,
+        layer_idx: u32::try_from(layer_idx).unwrap_or(u32::MAX),
+    }
+}
+
+/// The `ordering::composite_plan` input for a text/image overlay. A text has no opacity of its own
+/// (neither this tab nor the PS editor exposes one), so its item opacity is 1.0 and only its PS group
+/// can dim it; `visible` is the doc node's own visibility.
+pub(super) fn text_composite_item<'a>(
+    uid: &'a str,
+    layer_idx: usize,
+    group_uid: Option<&'a str>,
+    visible: bool,
+) -> ms_models::layer_model::ordering::CompositeItem<'a> {
+    ms_models::layer_model::ordering::CompositeItem {
+        key: text_composite_key(uid, layer_idx),
+        group_uid,
+        visible,
+        opacity: 1.0,
+    }
+}
+
+/// The `ordering::composite_plan` input for a PS raster layer: keyed by its node uid, with its own
+/// visibility and opacity and its PS unified group. Shared by the canvas fill pass, the raster
+/// hit-test and the export flatten, so all three plan rasters identically.
+pub(super) fn raster_composite_item<'a>(
+    uid: &'a str,
+    group_uid: Option<&'a str>,
+    visible: bool,
+    opacity: f32,
+) -> ms_models::layer_model::ordering::CompositeItem<'a> {
+    ms_models::layer_model::ordering::CompositeItem {
+        key: ms_models::layer_model::ordering::CompositeKey::Raster { uid },
+        group_uid,
+        visible,
+        opacity,
+    }
+}
+
+/// The premultiplied white vertex tint that draws a texture at a composite-plan step `opacity`.
+/// egui textures and vertex colours are premultiplied (`egui-docs/02-painting.md`, "Colors"), so all
+/// four channels scale: `Color32::from_white_alpha(a)` is `[a, a, a, a]`. 1.0 gives `Color32::WHITE`
+/// (the texture unchanged); a NaN or non-positive opacity gives fully transparent.
+pub(super) fn composite_step_tint(opacity: f32) -> Color32 {
+    let scaled = (opacity * 255.0).round();
+    if scaled.is_nan() || scaled <= 0.0 {
+        return Color32::TRANSPARENT;
+    }
+    // Clamped to 1..=255 just above, so the float -> u8 conversion cannot truncate or wrap.
+    Color32::from_white_alpha(scaled.min(255.0) as u8)
 }

@@ -32,6 +32,10 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   `crates/`. Use `cargo clippy --workspace --all-targets -- -D warnings`, or
   `cargo clippy -p <crate> --all-targets -- -D warnings` for every touched crate. Tests likewise:
   `cargo test -p <crate>` per touched crate, or `cargo test --workspace`.
+- Never run cargo builds of this workspace in parallel (several sub-agents each running
+  `cargo test` / `clippy` at once OOM-killed a 60 GB machine and the whole session). The manager
+  serializes verification across agents: every cargo invocation of a parallel agent is wrapped
+  in one shared `flock <lockfile> cargo … -j 8`, and agents skip Serena (its server costs GBs).
 - Cargo unifies features across the workspace, so a crate can build inside it and fail alone.
   After changing a crate's manifest or features, also run
   `cargo clippy -p <crate> --all-targets --all-features --target <t> -- -D warnings` per target.

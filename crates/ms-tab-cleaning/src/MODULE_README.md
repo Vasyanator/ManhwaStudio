@@ -297,6 +297,13 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   ✕, and a dock tab has no close affordance by design (a tab is only ever MOVED). The same rule
   governs «Библиотека знаков», whose one source of truth lives in the TOOL: its two «Библиотека
   знаков…» buttons toggle it and are drawn `selected` while it is open.
+- Single-image session (`ProjectData::is_single_image`, a hidden scratch chapter of one page):
+  the tab skips the clean-folder status scan (`clean_status::clean_scan_should_start` — both
+  messages point at the page manager, which that mode hides) and pushes the flag to the active
+  tool through `CleaningTool::set_single_image_session` before `canvas.draw`; the tool-side
+  guards are in `tools/MODULE_README.md`. Hidden features never rewrite a persisted setting. A
+  file dialog that sets a starting directory must use `ProjectData::user_facing_dir` (none of
+  this crate's dialogs sets one today).
 
 ## Editing map
 - To change top-level cleaning UI, history, or quick-clean orchestration,

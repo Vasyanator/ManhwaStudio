@@ -203,6 +203,9 @@ pub struct SettingsTabState {
     /// outline. Set when a reveal fires; `None` when no highlight is active. Uses
     /// `web_time::Instant` so it also works under wasm.
     reveal_highlight_until: Option<Instant>,
+    /// `true` in a single-image session (`set_single_image_session`): the canvas pane hides the
+    /// comic-type preset and the project word list, whose project is a throwaway scratch chapter.
+    single_image_session: bool,
 }
 
 impl Default for SettingsTabState {
@@ -260,6 +263,7 @@ impl SettingsTabState {
             pending_reveal: None,
             pending_reveal_expires: None,
             reveal_highlight_until: None,
+            single_image_session: false,
         }
     }
 
@@ -321,6 +325,16 @@ impl SettingsTabState {
             self.user_settings_file.clone(),
             project_settings_file,
         ));
+    }
+
+    /// Marks this tab as part of a single-image session. Call after
+    /// [`Self::set_canvas_settings_binding`]: the bound "project" is the session's scratch chapter,
+    /// so the spellcheck context menu loses its "add to the project dictionary" target, and the
+    /// canvas pane hides the comic-type preset and the project word list (plan
+    /// `dev-docs/single_image_mode_plan.md`, WP-2.4). User-level settings stay editable.
+    pub fn set_single_image_session(&mut self) {
+        self.single_image_session = true;
+        set_project_spellcheck_settings_file(None);
     }
 
     pub fn take_typing_panel_layout_request(&mut self) -> Option<TypingPanelLayout> {

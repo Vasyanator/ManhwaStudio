@@ -19,7 +19,12 @@ notification.
 - `app.rs`: root app state, worker polling, page routing, detached viewport handling.
 - `main_page.rs`: central menu, update notification overlay, AI install-type notices, and the
   storage-mode conversion status line (progress of the process-wide `storage_mode_job`, then a
-  dismissable failure notice).
+  dismissable failure notice). Also the native-only small "Open image" button (drawn in a
+  `Ui::new_child` over the title -> grid gap, so it takes no layout space) and its picking status.
+- `open_image.rs` (native only): single-image mode entry — `rfd` file picker plus path
+  validation (exists + is a file) on a worker, the filter built from
+  `ms_config::single_image::input_extensions()` (plus uppercase copies for case-sensitive GTK
+  globs), and the pure pick -> `LauncherOutcome::OpenImage` mapping. `app.rs` polls it.
 - `state.rs`: page enum, shared UI state, and typed launcher outcomes.
 - `background.rs`: background image plan and decode workers.
 - `first_run_language.rs`: first-run interface/typesetting language-selection modal
@@ -73,6 +78,9 @@ the child windows. See `crates/ms-settings-ui/src/tutorial/MODULE_README.md` for
 - Launcher outcomes are returned to startup flow; the launcher must not spawn a second main app.
 - Long scans, image decoding, probes, downloads, and shell work run on worker threads.
 - Settings changes to the projects root must be propagated to every page/window that caches it.
+- "Open image" closes the launcher with `LauncherOutcome::OpenImage(path)`; `main.rs` routes it.
+  The launcher validates only existence and file-ness; decode errors belong to the studio
+  loading screen (one owner). wasm has no button and `web_entry.rs` ignores the variant.
 - Update notifications are advisory UI state; starting an update closes the launcher and returns
   `LauncherOutcome::StartUpdate` to `main.rs`.
 - The first-run language modal (`first_run_language.rs`) and the main-menu tutorial are mutually
@@ -94,4 +102,6 @@ the child windows. See `crates/ms-settings-ui/src/tutorial/MODULE_README.md` for
 - To change launcher startup or return values, edit `lib.rs` and `state.rs`.
 - To change root polling, page routing, or window lifecycle, edit `app.rs`.
 - To change the main menu or update notice, edit `main_page.rs`.
+- To change the "Open image" picker, its filter or validation, edit `open_image.rs`; the accepted
+  types themselves live in `ms_config::single_image::INPUT_FILE_TYPES`.
 - To change a specific page workflow, edit `pages/`.

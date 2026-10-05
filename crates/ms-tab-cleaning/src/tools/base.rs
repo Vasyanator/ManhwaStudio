@@ -214,6 +214,14 @@ pub trait CleaningTool {
 
     fn set_ai_backend_torch_available(&mut self, _available: bool) {}
 
+    /// Whether the open project is a single-image session (`ProjectData::is_single_image`).
+    ///
+    /// Pushed by the tab every frame BEFORE `canvas.draw`, because `draw_ui` and the other dock
+    /// bodies run inside that call and must already hide what the mode does not offer (chapter-
+    /// or title-level features whose data lives outside the scratch chapter). A tool with no
+    /// such feature ignores it.
+    fn set_single_image_session(&mut self, _single_image: bool) {}
+
     fn space_pan_active(&self) -> bool {
         false
     }

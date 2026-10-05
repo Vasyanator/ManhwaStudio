@@ -138,6 +138,12 @@ impl eframe::App for WebApp {
                         Some(crate::launcher::state::LauncherOutcome::OpenProject(sel)) => Some(sel),
                         // No update flow on web; ignore.
                         Some(crate::launcher::state::LauncherOutcome::StartUpdate) | None => None,
+                        // Single-image mode has no web entry point (plan D10) and the web
+                        // launcher has no button producing it; log the impossible outcome.
+                        Some(crate::launcher::state::LauncherOutcome::OpenImage(path)) => {
+                            console_error(&format!("open image is unavailable on web; ignored path '{}'", path.display()));
+                            None
+                        }
                     },
                     Err(_) => None,
                 };

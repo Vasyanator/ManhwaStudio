@@ -13,9 +13,15 @@ The tree joins the three otherwise-disjoint stores into one hierarchy ordered by
 A group renders as a collapsible header followed by its members indented one level. The crux
 invariant (enforced at write time in `models::layer_model::persist::save_page_grouping`) is that a
 group's members are contiguous on the Z axis, so the tree is just a flat sorted leaf list with
-group runs bracketed by headers. The bottom-to-top leaf order here mirrors `draw_composite`'s plan
-sort exactly (z, then rasters-below-texts, then text page-Y), so the panel order equals the
-composite order.
+group runs bracketed by headers. The bottom-to-top leaf order comes from the SAME owner the canvas
+draws with (`ms_models::layer_model::ordering::composite_plan`): band Z (uid-first lookup), then
+rasters below texts, then input order (rasters in stack order, texts in `text_layers` order), so
+the panel order equals the composite order. Hidden / dimmed rows are still listed: the tree asks the
+owner for ORDER only (every item passed visible, opacity 1, ungrouped).
+
+That row order has ONE builder here, `ordered_user_rows`; both the panel (`build_unified_tree`) and
+the structural band order the ▲▼ / grouping ops persist (`unified_band_order`, wrapped by the tab's
+`build_unified_order`) derive from it, so a move always acts on the neighbour the user sees.
 
 The WHOLE emitted list is top-to-bottom, the base tail included: the base layers are appended last
 (they are the bottom of the composite) but in REVERSE stack order, so `Клин` — which `draw_composite`
@@ -25,7 +31,8 @@ it is load-bearing for compositing, and only this view is reordered.
 
 use super::layers::{LayerId, LayerStack};
 use super::text_layers::PsTextLayer;
-use ms_models::layer_model::ordering::Band;
+use ms_models::layer_model::ordering::{self, Band, CompositeItem, CompositeKey};
+use ms_models::layer_model::persist::BandRef;
 use std::collections::HashMap;
 
 /// One indentation step (px) per nesting level in the panel.
@@ -77,14 +84,130 @@ pub enum TreeItem {
     Leaf(Leaf),
 }
 
-/// A flattened leaf with the keys needed to order it, before grouping into runs.
-struct Flat {
-    kind: LeafKind,
-    group_uid: Option<String>,
-    z: u32,
-    /// Secondary sort key at equal Z: 0.0 for rasters (below texts), page-Y for texts. Mirrors the
-    /// `draw_composite` tiebreak so panel order == composite order.
-    secondary: f32,
+/// One USER row (raster or text, never a base layer) in bottom-to-top composite order: the single
+/// order both the panel tree (`build_unified_tree`) and the structural band order
+/// (`unified_band_order`) are derived from.
+#[derive(Debug, Clone)]
+pub struct OrderedRow {
+    /// `LeafKind::Raster` or `LeafKind::Text`; never `LeafKind::Base`.
+    pub kind: LeafKind,
+    /// The node uid (raster layer uid / text overlay uid).
+    pub uid: String,
+    /// The row's CURRENT unified PS group uid.
+    pub group_uid: Option<String>,
+}
+
+/// An order-only composite item: visible, fully opaque and ungrouped, so `composite_plan` keeps it
+/// and only its band Z / kind / input position decide where it lands.
+fn order_only(key: CompositeKey<'_>) -> CompositeItem<'_> {
+    CompositeItem {
+        key,
+        group_uid: None,
+        visible: true,
+        opacity: 1.0,
+    }
+}
+
+/// The user rows of the page bottom-to-top in EXACTLY the canvas composite order: rows enter the
+/// shared owner (`ordering::composite_plan`) in `draw_composite`'s input order — user rasters in
+/// stack order, then texts in `text_layers` order — as order-only items, so band Z (uid-first),
+/// Raster < Text at equal Z and input order on ties decide, and hidden / dimmed rows are kept.
+#[must_use]
+pub fn ordered_user_rows(
+    stack: &LayerStack,
+    text_layers: &[PsTextLayer],
+    bands: &[Band],
+) -> Vec<OrderedRow> {
+    let mut candidates: Vec<OrderedRow> = Vec::with_capacity(stack.layers().len() + text_layers.len());
+    for layer in stack.layers().iter().filter(|layer| !layer.kind.is_base()) {
+        candidates.push(OrderedRow {
+            kind: LeafKind::Raster(layer.id),
+            uid: layer.uid.to_string(),
+            group_uid: stack.layer_group_uid(layer.id),
+        });
+    }
+    for (index, text) in text_layers.iter().enumerate() {
+        candidates.push(OrderedRow {
+            kind: LeafKind::Text(index),
+            uid: text.uid.clone(),
+            group_uid: text.group_uid.clone(),
+        });
+    }
+    let order: Vec<usize> = {
+        let items: Vec<CompositeItem<'_>> = candidates
+            .iter()
+            .map(|row| match row.kind {
+                // `index` is the row's own position in `text_layers` (built just above).
+                LeafKind::Text(index) => order_only(CompositeKey::Text {
+                    uid: &row.uid,
+                    layer_idx: text_layers.get(index).map_or(0, |t| t.layer_idx),
+                }),
+                LeafKind::Raster(_) | LeafKind::Base(_) => order_only(CompositeKey::Raster { uid: &row.uid }),
+            })
+            .collect();
+        // Every item is visible, opaque and ungrouped, so the plan omits none of them.
+        ordering::composite_plan(bands, &[], &items)
+            .iter()
+            .map(|step| step.item)
+            .collect()
+    };
+    let mut slots: Vec<Option<OrderedRow>> = candidates.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|item| slots.get_mut(item).and_then(Option::take))
+        .collect()
+}
+
+/// The structural band order (bottom-to-top) for the given FINAL group membership `group_of`
+/// (node uid -> group uid; a uid absent from the map is ungrouped), paired with each band's group.
+///
+/// Derived from [`ordered_user_rows`], so with unchanged membership it IS the panel's row order;
+/// each group's members are then pulled together at the group's lowest member row (stable), which
+/// only moves rows when a grouping edit changed membership. Every text row is a
+/// `BandRef::PinnedText`: a text is its own row at its own Z (the order the user sees), and
+/// persisting the order pins it there (`persist::apply_band_order`).
+#[must_use]
+pub fn unified_band_order(
+    stack: &LayerStack,
+    text_layers: &[PsTextLayer],
+    bands: &[Band],
+    group_of: &HashMap<String, Option<String>>,
+) -> Vec<(BandRef, Option<String>)> {
+    let rows = ordered_user_rows(stack, text_layers, bands);
+    let group_at: Vec<Option<String>> = rows
+        .iter()
+        .map(|row| group_of.get(&row.uid).cloned().flatten())
+        .collect();
+    // A group's anchor is the position of its lowest member row.
+    let mut anchor: HashMap<&str, usize> = HashMap::new();
+    for (position, group) in group_at.iter().enumerate() {
+        if let Some(uid) = group {
+            anchor.entry(uid.as_str()).or_insert(position);
+        }
+    }
+    let mut keyed: Vec<(usize, usize)> = group_at
+        .iter()
+        .enumerate()
+        .map(|(position, group)| {
+            let key = group
+                .as_deref()
+                .and_then(|uid| anchor.get(uid).copied())
+                .unwrap_or(position);
+            (key, position)
+        })
+        .collect();
+    keyed.sort_unstable();
+    keyed
+        .into_iter()
+        .filter_map(|(_, position)| {
+            let row = rows.get(position)?;
+            let band = match row.kind {
+                LeafKind::Raster(_) | LeafKind::Base(_) => BandRef::Raster(row.uid.clone()),
+                LeafKind::Text(_) => BandRef::PinnedText(row.uid.clone()),
+            };
+            Some((band, group_at.get(position).cloned().flatten()))
+        })
+        .collect()
 }
 
 /// Builds the unified tree top-to-bottom (first item renders highest). Group metadata (name /
@@ -100,64 +223,18 @@ pub fn build_unified_tree(
     text_layers: &[PsTextLayer],
     bands: &[Band],
 ) -> Vec<TreeItem> {
-    // Band Z lookups (same maps `draw_composite` builds).
-    let mut raster_z: HashMap<String, u32> = HashMap::new();
-    let mut group_z: HashMap<u32, u32> = HashMap::new();
-    let mut pinned_z: HashMap<String, u32> = HashMap::new();
-    for band in bands {
-        match band {
-            Band::Raster { uid, z } => {
-                raster_z.insert(uid.clone(), *z);
-            }
-            Band::TextGroup { layer_idx, z, .. } => {
-                group_z.insert(*layer_idx, *z);
-            }
-            Band::PinnedText { uid, z } => {
-                pinned_z.insert(uid.clone(), *z);
-            }
-        }
-    }
-    let top_z = bands.len() as u32;
+    // Base layers are the very bottom and are not bands: they close the list below.
+    let base: Vec<Leaf> = stack
+        .layers()
+        .iter()
+        .filter(|layer| layer.kind.is_base())
+        .map(|layer| Leaf {
+            kind: LeafKind::Base(layer.id),
+            depth: 0,
+        })
+        .collect();
 
-    // Base layers first (the very bottom), then the band-ordered leaves above them.
-    let mut base: Vec<Leaf> = Vec::new();
-    let mut flat: Vec<Flat> = Vec::new();
-    for layer in stack.layers() {
-        if layer.kind.is_base() {
-            base.push(Leaf {
-                kind: LeafKind::Base(layer.id),
-                depth: 0,
-            });
-            continue;
-        }
-        let z = raster_z
-            .get(&layer.uid.to_string())
-            .copied()
-            .unwrap_or(top_z);
-        flat.push(Flat {
-            kind: LeafKind::Raster(layer.id),
-            group_uid: stack.layer_group_uid(layer.id),
-            z,
-            secondary: 0.0,
-        });
-    }
-    for (index, text) in text_layers.iter().enumerate() {
-        let z = if text.pinned {
-            pinned_z.get(&text.uid).copied()
-        } else {
-            group_z.get(&text.layer_idx).copied()
-        }
-        .unwrap_or(top_z);
-        flat.push(Flat {
-            kind: LeafKind::Text(index),
-            group_uid: text.group_uid.clone(),
-            z,
-            secondary: text.center().y,
-        });
-    }
-
-    // Bottom-to-top order, matching the composite plan sort.
-    flat.sort_by(|a, b| a.z.cmp(&b.z).then(a.secondary.total_cmp(&b.secondary)));
+    let flat = ordered_user_rows(stack, text_layers, bands);
 
     // Walk top-to-bottom (reverse), bracketing each maximal contiguous same-group run with a header.
     let mut out: Vec<TreeItem> = Vec::new();

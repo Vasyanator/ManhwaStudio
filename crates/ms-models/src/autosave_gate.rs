@@ -22,6 +22,7 @@ Key types:
 Key functions:
 - `AutosaveGate::new` / `AutosaveGate::with_policy_fn`
 - `note_action` / `poll` / `wait_deadline` / `force_flush`
+- `action_count`: the monotonic lifetime action counter (single-image dirty tracking)
 */
 
 use std::fmt;
@@ -43,6 +44,8 @@ struct GateState {
     actions: u32,
     /// Monotonic flush counter; each increment means "flush everything held now".
     flush_epoch: u64,
+    /// Lifetime count of noted actions; never reset by a window close.
+    total_actions: u64,
 }
 
 impl GateState {
@@ -124,10 +127,20 @@ impl AutosaveGate {
         state.flush_epoch
     }
 
+    /// Total number of actions noted over the gate's lifetime. Monotonic: it never decreases
+    /// and is NOT reset when a window closes (unlike the per-window count). Single-image mode
+    /// compares it against the value captured at its last successful file write to decide
+    /// whether the session is dirty (`dev-docs/single_image_mode_plan.md` D6).
+    #[must_use]
+    pub fn action_count(&self) -> u64 {
+        self.lock().total_actions
+    }
+
     /// `note_action` at an explicit instant (deterministic tests).
     fn note_action_at(&self, now: Instant) {
         let policy = (self.policy)();
         let mut state = self.lock();
+        state.total_actions = state.total_actions.saturating_add(1);
         if state.first_pending_at.is_none() {
             state.first_pending_at = Some(now);
         }
@@ -155,7 +168,7 @@ impl AutosaveGate {
         state.first_pending_at.map(|first| policy.interval.saturating_sub(now.saturating_duration_since(first)))
     }
 
-    /// Locks the state. A poisoned lock is recovered: the state is three plain counters
+    /// Locks the state. A poisoned lock is recovered: the state is plain counters
     /// updated atomically under the lock, so no invariant can be half-applied by a panic.
     fn lock(&self) -> MutexGuard<'_, GateState> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
@@ -267,6 +280,24 @@ mod tests {
         threshold.store(3, Ordering::Relaxed);
         gate.note_action_at(t0);
         assert_eq!(gate.poll_at(t0), 1);
+    }
+
+    #[test]
+    fn action_count_is_monotonic_across_window_closes() {
+        let gate = gate(Duration::from_secs(60), 2);
+        let t0 = Instant::now();
+        assert_eq!(gate.action_count(), 0);
+        gate.note_action_at(t0);
+        assert_eq!(gate.action_count(), 1);
+        // The threshold closes the window; the lifetime count keeps going.
+        gate.note_action_at(t0);
+        assert_eq!(gate.poll_at(t0), 1);
+        assert_eq!(gate.action_count(), 2);
+        gate.force_flush();
+        assert_eq!(gate.action_count(), 2);
+        gate.note_action_at(t0 + Duration::from_secs(100));
+        assert_eq!(gate.poll_at(t0 + Duration::from_secs(200)), 3);
+        assert_eq!(gate.action_count(), 3);
     }
 
     #[test]

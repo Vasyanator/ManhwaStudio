@@ -182,12 +182,29 @@ nothing. Durability: `write_manifest` asks `ms_page_ops::chapter_docs::chapter_d
 `{chapter}_unsaved` staging manifest is not fsynced (JSON; `.db` ignores durability), a committed one
 keeps `Contents`.
 
+## Composite order, visibility and group fold (one owner)
+`ordering.rs` is the ONE owner of how a page's layers are composited: bottom-to-top order,
+item visibility and the PS unified-group fold. Consumers: the typing canvas draw and hit-test, the
+typing CPU flatten / export, and the PS editor GPU composite. Each builds `CompositeItem`s from its
+own runtime and draws the returned `CompositeStep`s; none re-implements a band-Z lookup or a sort.
+- Bands: `doc_page_bands(&DocPage)` for resident pages, `page_bands(&PageLayers)` for disk paths.
+- `band_z` — uid-first: raster by uid; text by `PinnedText` uid, else `TextGroup` `layer_idx`;
+  no band ⇒ `bands.len()` (top of stack).
+- `composite_plan` — omits an item that is not visible, sits in a hidden group, or whose
+  effective opacity (item × group, each clamped to [0, 1]) is `<= 0` or NaN; an unknown group
+  folds as visible / 1.0; group nesting (`parent_uid`) is not folded. Order is a stable sort on
+  `composite_rank(z, kind)` (Raster below Text at equal Z), so equal ranks keep INPUT order:
+  rasters in stack order, texts in creation order (newest on top). No page-Y tie-break.
+- Base layers (source page, clean) are not items: every consumer draws them first.
+
 ## Files
 - `manifest.rs` — serde schema (`LayersManifest`, `PageLayers`, `LayerRec`, `LayerKindRec`,
   `TransformRec`, `DeformRec`, `TextCentersRec`, `CenteringFrameRec`, `GroupRec`, `PayloadRef`).
 - `compat.rs` — isolated backwards-compatibility: `read_manifest` (raw JSON → version-migrated
   canonical manifest) and the `migrate_value` forward-migration chain. `persist::read_manifest`
   delegates here.
+- `ordering.rs` — `Band`, `page_bands`, `doc_page_bands` and the composite owner (`band_z`,
+  `composite_rank`, `composite_plan`; see the section above). GUI-free, no I/O.
 - `migrate.rs` — eager one-shot chapter migration (`chapter_needs_migration` / `migrate_chapter_to_v3`)
   that converts a legacy `text_info.json` chapter to v3 inline on disk, renaming overlay PNGs (pixels
   preserved) and `.bak`-ing `text_info.json` last. Triggered in the background on chapter open (see the
@@ -311,6 +328,12 @@ keeps `Contents`.
     band / grouping / pin edit, and `text_pinned_by_group` is written by the text flush. The PS editor
     reads its pin state from the doc, never from disk after the page load. `text_pinned` is not
     written: the text writer always emits `pinned = true`.
+  - PS group composite meta: `DocPage::groups` is the ONE in-session source of a group's visibility /
+    opacity for every composite consumer (typing canvas + export via `groups_by_page`, PS via
+    `sync_view_from_doc`). `LayerDoc::set_group_meta` edits it (version bump on change; non-finite
+    opacity refused; `collapsed` untouched), and the page's next doc save writes it through
+    `save_page_rasters`' `groups` argument — no dedicated job, format unchanged. `collapsed` is panel-only
+    PS view state with the same single owner (`LayerDoc::set_group_collapsed`, same persistence).
 - `effects.rs` — the "render type 2" seam: `apply_effects_to_color_image(&ColorImage, effects_json)`
   bridges egui `ColorImage` to the typing tab's pure `apply_effects_to_image`. Straight alpha both
   ways; effects may enlarge the canvas (shadow/glow), so center-placed callers must recenter.

@@ -7,7 +7,8 @@ Dark theme styling helpers for the Rust launcher test UI.
 Main responsibilities:
 - configure egui visuals for the launcher overlay;
 - define shared colors, button states, and card surfaces;
-- keep typography helpers and explicit launcher button rendering consistent with launcher.py;
+- keep typography helpers and explicit launcher button rendering consistent with launcher.py
+  (full-size `launcher_button` and its half-font `launcher_button_small` share one body);
 - draw the amber notice banner (`notice_banner`) shared by every launcher notice that offers
   one action (the open page's unsaved-session recovery and chapter-format conversion).
 */
@@ -49,6 +50,17 @@ pub const STATUS_ERROR: Color32 = Color32::from_rgb(220, 120, 120);
 pub const NOTICE_FILL: Color32 = Color32::from_rgb(72, 58, 0);
 /// Text colour of a notice banner (amber on `NOTICE_FILL`).
 pub const NOTICE_TEXT: Color32 = Color32::from_rgb(255, 210, 40);
+/// Caption font size of a full-size [`launcher_button`].
+const LAUNCHER_BUTTON_FONT_SIZE: f32 = 16.0;
+/// Corner radius of a full-size [`launcher_button`].
+const LAUNCHER_BUTTON_CORNER_RADIUS: u8 = 10;
+/// Caption scale of [`launcher_button_small`] relative to [`launcher_button`].
+const SMALL_BUTTON_SCALE: f32 = 0.7;
+/// Padding of [`launcher_button_small`]: thin enough to keep the button about one caption
+/// line tall.
+const SMALL_BUTTON_PADDING: Vec2 = Vec2::new(8.0, 2.0);
+/// Corner radius of [`launcher_button_small`], scaled down with the button.
+const SMALL_BUTTON_CORNER_RADIUS: u8 = 6;
 /// Size of the action button of a notice banner.
 const NOTICE_BUTTON_SIZE: Vec2 = Vec2::new(130.0, 26.0);
 
@@ -126,21 +138,54 @@ pub fn card_frame() -> Frame {
         .inner_margin(Margin::same(24))
 }
 
+/// Draws a full-size launcher button: `LAUNCHER_BUTTON_FONT_SIZE` caption, at least `size`,
+/// global button padding. A disabled button is drawn in the inactive style and never clicks.
 pub fn launcher_button(ui: &mut Ui, label: &str, size: Vec2, enabled: bool) -> Response {
-    let button_style = if enabled {
+    let padding = ui.spacing().button_padding;
+    styled_launcher_button(ui, label, LAUNCHER_BUTTON_FONT_SIZE, size, padding, LAUNCHER_BUTTON_CORNER_RADIUS, enabled)
+}
+
+/// Draws the small variant of [`launcher_button`]: same fill, stroke, hover and disabled
+/// styling, caption at `SMALL_BUTTON_SCALE` of the full-size font, sized to fit the caption
+/// with `SMALL_BUTTON_PADDING`. Used for secondary actions tucked next to the main menu.
+pub fn launcher_button_small(ui: &mut Ui, label: &str, enabled: bool) -> Response {
+    styled_launcher_button(
+        ui,
+        label,
+        LAUNCHER_BUTTON_FONT_SIZE * SMALL_BUTTON_SCALE,
+        Vec2::ZERO,
+        SMALL_BUTTON_PADDING,
+        SMALL_BUTTON_CORNER_RADIUS,
+        enabled,
+    )
+}
+
+/// Shared body of the launcher button variants: applies the active or inactive launcher
+/// button style and `padding` in a scope, so the caller's style is left untouched.
+fn styled_launcher_button(
+    ui: &mut Ui,
+    label: &str,
+    font_size: f32,
+    min_size: Vec2,
+    padding: Vec2,
+    corner_radius: u8,
+    enabled: bool,
+) -> Response {
+    let mut button_style = if enabled {
         active_button_style(ui.style().as_ref())
     } else {
         inactive_button_style(ui.style().as_ref())
     };
+    button_style.spacing.button_padding = padding;
     ui.scope(|ui| {
         ui.set_style(button_style);
         ui.add_enabled(
             enabled,
-            Button::new(RichText::new(label).size(16.0).color(TEXT_MAIN))
-                .min_size(size)
+            Button::new(RichText::new(label).size(font_size).color(TEXT_MAIN))
+                .min_size(min_size)
                 .fill(BUTTON_FILL)
                 .stroke(Stroke::new(1.0, BUTTON_STROKE))
-                .corner_radius(CornerRadius::same(10)),
+                .corner_radius(CornerRadius::same(corner_radius)),
         )
     })
     .inner

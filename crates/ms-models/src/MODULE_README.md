@@ -39,7 +39,9 @@ candidate.
   since the FIRST pending action, when the action count reaches the threshold, or on
   `force_flush`; each writer keeps its own `seen_epoch` and is due iff `poll() != seen_epoch`. The
   policy is read from `ms_config::autosave_policy` on every call (live settings); tests inject one
-  with `AutosaveGate::with_policy_fn` instead of touching the process globals.
+  with `AutosaveGate::with_policy_fn` instead of touching the process globals. `action_count` is
+  a separate monotonic lifetime counter of noted actions (never reset by a flush); single-image
+  mode compares it with its last-write baseline to decide "dirty" (`src/single_image/`).
 - `bubbles_model.rs`: shared bubble list, revision tracking, canvas settings, and
   coalesced background saving. The bubbles document is written only through
   `ms_docstore::write` (`write_bubbles_snapshot_to`) and its staging existence is
@@ -76,7 +78,8 @@ candidate.
   residency of a decoded page (`PageTexture` / `TextureTile`). Producing and evicting the
   textures stays in `app.rs`; only the types live here.
 - `layer_model/`: the chapter layer document (`LayerDoc`, per-page `layers.json` manifest, text
-  payload, migration, background layer saver). See `layer_model/MODULE_README.md`.
+  payload, migration, background layer saver, and the one owner of layer composite order /
+  visibility / group fold in `ordering.rs`). See `layer_model/MODULE_README.md`.
 - `lib.rs`: module declarations for the shared model layer.
 
 ## Crate boundary

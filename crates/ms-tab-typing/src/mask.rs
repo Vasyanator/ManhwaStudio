@@ -26,6 +26,9 @@ FILE HEADER (tabs/typing/mask.rs)
     финальных изображений без доступа к внутреннему mutable-состоянию слоя.
   - `masks_loaded`: готовность all-pages маски (загрузчик всей главы завершён) — гейт
     для whole-project экспорта/сохранения, чтобы снимок масок не был неполным.
+  - `edit_count`: monotonic count of user mask edits (one per brush gesture, applied fill or
+    page clear). The mask is outside the autosave gate's writers, so the single-image session
+    compares this counter with its saved baseline to tell whether the mask changed since.
 */
 use ms_log::trace::cat;
 use ms_memory::{
@@ -95,6 +98,8 @@ struct TypingMaskStrokeState {
     page_idx: usize,
     erase: bool,
     last_scene_pos: Pos2,
+    /// This gesture already counted as one mask edit (`TypingMaskLayer::edit_count`).
+    counted: bool,
 }
 
 struct TypingPageMask {
@@ -129,6 +134,10 @@ pub struct TypingMaskLayer {
     active_stroke: Option<TypingMaskStrokeState>,
     mask_brush: MaskBrush,
     status_error: Option<(String, f64)>,
+    /// Monotonic count of user mask edits: one per brush gesture that changed pixels, per applied
+    /// fill and per page clear (never per frame; loading a chapter's masks is not an edit). The mask
+    /// is outside the autosave gate's writers, so this is how a caller tells "edited since X".
+    edit_count: u64,
 }
 
 impl Default for TypingMaskLayer {
@@ -150,6 +159,7 @@ impl Default for TypingMaskLayer {
             active_stroke: None,
             mask_brush: MaskBrush::default(),
             status_error: None,
+            edit_count: 0,
         }
     }
 }
@@ -380,6 +390,7 @@ impl TypingMaskLayer {
                         mark_mask_dirty_full(mask);
                     }
                     self.changed_pages.insert(job.page_idx);
+                    self.note_edit();
                 }
                 true
             }
@@ -567,12 +578,13 @@ impl TypingMaskLayer {
                         self.mask_brush.radius_px()
                     );
                 }
-                let start_pos = match self.active_stroke {
+                let (start_pos, already_counted) = match self.active_stroke {
                     Some(state) if state.page_idx == page_idx && state.erase == erase => {
-                        state.last_scene_pos
+                        (state.last_scene_pos, state.counted)
                     }
-                    _ => pos,
+                    _ => (pos, false),
                 };
+                let mut counted = already_counted;
                 let mask_brush = self.mask_brush.clone();
                 let brush_radius = mask_brush.radius_px();
                 let page_mask = self.ensure_mask_for_paint(view);
@@ -595,13 +607,21 @@ impl TypingMaskLayer {
                             mark_mask_dirty_full(mask);
                         }
                         mask_changed = true;
-                        self.changed_pages.insert(page_idx);
+                        counted = true;
                     }
                     self.active_stroke = Some(TypingMaskStrokeState {
                         page_idx,
                         erase,
                         last_scene_pos: pos,
+                        counted,
                     });
+                }
+                if mask_changed {
+                    self.changed_pages.insert(page_idx);
+                    // One edit per gesture: only the first frame of a stroke that changes pixels.
+                    if !already_counted {
+                        self.note_edit();
+                    }
                 }
             }
         }
@@ -793,6 +813,18 @@ impl TypingMaskLayer {
             .collect()
     }
 
+    /// The clip-mask snapshot of ONE page (`None` when the page has no mask): the per-page form of
+    /// [`Self::export_masks_snapshot`] for the single-page flatten-to-file, which must not clone every
+    /// page's mask. Same completeness contract: meaningful only once [`Self::masks_loaded`] holds.
+    #[must_use]
+    pub fn export_mask_snapshot_for_page(&self, page_idx: usize) -> Option<TypingMaskExportPage> {
+        self.masks.get(&page_idx).map(|mask| TypingMaskExportPage {
+            width: mask.width,
+            height: mask.height,
+            data: mask.data.clone(),
+        })
+    }
+
     fn ensure_mask_for_paint(&mut self, view: PageView) -> Option<&mut TypingPageMask> {
         let page_idx = view.page_idx;
         if self.masks.contains_key(&page_idx) {
@@ -825,6 +857,19 @@ impl TypingMaskLayer {
         mask.tile_textures.clear();
         mask.dirty_tiles.clear();
         self.changed_pages.insert(page_idx);
+        self.note_edit();
+    }
+
+    /// Monotonic count of user mask edits (see the `edit_count` field): a caller compares it with a
+    /// value it captured earlier to learn whether the mask was edited since.
+    #[must_use]
+    pub fn edit_count(&self) -> u64 {
+        self.edit_count
+    }
+
+    /// Counts one user mask edit (one gesture / fill / clear).
+    fn note_edit(&mut self) {
+        self.edit_count = self.edit_count.wrapping_add(1);
     }
 
     fn request_save_all(&mut self) {
@@ -1639,5 +1684,50 @@ mod tests {
 
         // Completed, but the recorded chapter is a DIFFERENT one → not ready for `dir`.
         assert!(!layer.masks_loaded_for_dir(&PathBuf::from("/chapter/b")));
+    }
+
+    /// Runs one headless frame of the mask overlay over a 64x64 page at zoom 1 with `events`.
+    fn mask_frame(ctx: &egui::Context, layer: &mut TypingMaskLayer, events: Vec<egui::Event>) {
+        let view = PageView { page_idx: 0, image_rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(64.0, 64.0)), zoom: 1.0 };
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 200.0))), events, ..egui::RawInput::default() };
+        let output = ctx.run_ui(input, |ui| {
+            layer.draw_page_mask_overlay_and_handle_input(ui, view);
+        });
+        // The mask tiles queue texture uploads no renderer applies here.
+        output.drop_without_applying_deltas();
+    }
+
+    fn press(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// Review Medium-1: a mask edit counts ONCE per gesture (a multi-frame stroke is one edit, a
+    /// second stroke another), and a page clear counts too — the single-image session reads this
+    /// counter as unsaved work, since the mask is outside the autosave gate's writers.
+    #[test]
+    fn mask_edits_are_counted_once_per_gesture() {
+        let ctx = egui::Context::default();
+        let mut layer = TypingMaskLayer { panel_open: true, ..TypingMaskLayer::default() };
+        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(10.0, 10.0))]);
+        assert_eq!(layer.edit_count(), 0, "hovering is not an edit");
+
+        // Stroke 1: press, two drag frames, release.
+        mask_frame(&ctx, &mut layer, vec![press(Pos2::new(10.0, 10.0), true)]);
+        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(20.0, 10.0))]);
+        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(30.0, 10.0))]);
+        mask_frame(&ctx, &mut layer, vec![press(Pos2::new(30.0, 10.0), false)]);
+        assert!(layer.masks.get(&0).is_some_and(TypingPageMask::has_active_pixels), "the stroke painted");
+        assert_eq!(layer.edit_count(), 1, "a multi-frame stroke is one edit");
+
+        // Stroke 2.
+        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(10.0, 40.0)), press(Pos2::new(10.0, 40.0), true)]);
+        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(30.0, 40.0))]);
+        mask_frame(&ctx, &mut layer, vec![press(Pos2::new(30.0, 40.0), false)]);
+        assert_eq!(layer.edit_count(), 2, "a second gesture is a second edit");
+
+        layer.clear_mask_page(0);
+        assert_eq!(layer.edit_count(), 3, "clearing a painted page is an edit");
+        layer.clear_mask_page(0);
+        assert_eq!(layer.edit_count(), 3, "clearing an empty page changes nothing");
     }
 }

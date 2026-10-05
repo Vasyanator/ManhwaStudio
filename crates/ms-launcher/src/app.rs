@@ -7,7 +7,8 @@ Root `eframe::App` for the Rust launcher test mode.
 Main responsibilities:
 - own launcher shell state;
 - drive background image plan generation and lazy batch decoding;
-- render the animated multi-column background with a separate post-image blur layer plus the central menu card.
+- render the animated multi-column background with a separate post-image blur layer plus the central menu card;
+- poll the main-menu "Open image" picker worker and turn its pick into `LauncherOutcome::OpenImage`.
 
 Notes:
 - every launcher viewport must reuse the same native app metadata so taskbar icons stay consistent
@@ -93,6 +94,10 @@ pub struct LauncherApp {
     pub(crate) ai_install_type: config::AiInstallType,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
     pending_plan: Option<Receiver<BackgroundImagePlan>>,
+    /// Pending "Open image" pick (`open_image::spawn_image_picker`); `Some` while the native
+    /// dialog is open. Polled each frame, never waited on.
+    #[cfg(not(target_arch = "wasm32"))]
+    open_image_pick: Option<Receiver<crate::open_image::ImagePickResult>>,
     pending_images: Vec<PendingBackgroundImage>,
     background_plan: Option<BackgroundImagePlan>,
     background_slots: Vec<BackgroundSlot>,
@@ -183,6 +188,8 @@ impl LauncherApp {
             ai_install_type,
             update_check_rx,
             pending_plan: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            open_image_pick: None,
             pending_images: Vec::new(),
             background_plan: None,
             background_slots: Vec::new(),
@@ -206,6 +213,8 @@ impl LauncherApp {
 
     fn poll_workers(&mut self, ctx: &egui::Context, target_width: u32, viewport_height: f32) {
         self.poll_update_check(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_open_image_pick(ctx);
         self.poll_plan(ctx, target_width, viewport_height);
         self.poll_images(ctx);
         self.kick_background_load(target_width, viewport_height);
@@ -226,6 +235,68 @@ impl LauncherApp {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
+    }
+
+    /// Starts the "Open image" picker worker unless one is already pending. While it is pending
+    /// the main page shows the picking status instead of `main_page_message`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn start_open_image_pick(&mut self) {
+        if self.open_image_pick.is_some() {
+            return;
+        }
+        ms_log::runtime_log::log_info("[launcher-open-image] picker started");
+        self.state.main_page_message = None;
+        self.open_image_pick = Some(crate::open_image::spawn_image_picker());
+    }
+
+    /// Whether the "Open image" dialog is currently open (the button is disabled meanwhile).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn open_image_pick_active(&self) -> bool {
+        self.open_image_pick.is_some()
+    }
+
+    /// Applies a finished pick: a valid file closes the launcher with
+    /// `LauncherOutcome::OpenImage`; a cancel clears the status; a rejection or a dead worker
+    /// stays in the launcher with a localized status (details in the log).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_open_image_pick(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.open_image_pick else {
+            return;
+        };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // `spawn_image_picker` already logged why the worker is gone.
+                self.open_image_pick = None;
+                self.state.main_page_message = Some(t!("launcher.main.open_image_picker_error").to_owned());
+                return;
+            }
+        };
+        self.open_image_pick = None;
+        match crate::open_image::launcher_outcome_for_pick(result) {
+            Ok(None) => self.state.main_page_message = None,
+            Ok(Some(outcome)) => {
+                ms_log::runtime_log::log_info(format!("[launcher-open-image] closing launcher to open {outcome:?}"));
+                match self.output_outcome.lock() {
+                    Ok(mut output) => {
+                        *output = Some(outcome);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Err(_) => {
+                        // A poisoned slot cannot be delivered (`run_launcher` refuses it too);
+                        // stay open so the user is not dropped out without a result.
+                        ms_log::runtime_log::log_error("[launcher-open-image] launcher outcome slot is poisoned; cannot hand the image to startup");
+                        self.state.main_page_message = Some(t!("launcher.main.open_image_picker_error").to_owned());
+                    }
+                }
+            }
+            Err(rejection) => {
+                ms_log::runtime_log::log_warn(rejection.log_message());
+                self.state.main_page_message = Some(rejection.user_message());
+            }
+        }
+        ctx.request_repaint();
     }
 
     fn poll_plan(&mut self, ctx: &egui::Context, target_width: u32, viewport_height: f32) {

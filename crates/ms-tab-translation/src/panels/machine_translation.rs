@@ -15,7 +15,9 @@ Main items:
   original vs translation). Image modes are blocked only for a model `ms_ai_api::image_input_support`
   lists as text-only (`NotSupported`); `Supported` and `Unknown` models may use them.
 - `MtPanelActions`: UI actions requested by the user (`start` + `cancel`).
-- `draw_machine_translation_panel`: renders settings and action buttons.
+- `draw_machine_translation_panel`: renders settings and action buttons. Its
+  `project_context_available` flag (false in a single-image session, which has no title) hides the
+  notes / characters / terms toggles; the prompt builder ignores them there too.
 
 Notes:
 - The panel has two tabs: legacy machine translation and AI API translation.
@@ -312,6 +314,10 @@ const MT_TARGET_LANGUAGES: &[MtLanguage] = &[
     },
 ];
 
+/// Draws the MT panel and returns this frame's user actions. `project_context_available` is
+/// `false` in a single-image session: the notes / characters / terms toggles are then hidden
+/// (their persisted values stay untouched; `machine_translation::project_context_sources`
+/// ignores them for such a run).
 pub fn draw_machine_translation_panel(
     ui: &mut egui::Ui,
     busy: bool,
@@ -319,6 +325,7 @@ pub fn draw_machine_translation_panel(
     progress: Option<MtPanelProgress>,
     stop_notice: &mut Option<MtStopNotice>,
     options: &mut MtPanelOptions,
+    project_context_available: bool,
 ) -> MtPanelActions {
     let mut actions = MtPanelActions::default();
 
@@ -341,7 +348,7 @@ pub fn draw_machine_translation_panel(
         MtPanelTab::Machine => {
             draw_machine_tab(ui, busy, can_cancel, progress, options, &mut actions)
         }
-        MtPanelTab::AiApi => draw_ai_api_tab(ui, busy, can_cancel, progress, options, &mut actions),
+        MtPanelTab::AiApi => draw_ai_api_tab(ui, busy, can_cancel, progress, options, project_context_available, &mut actions),
     }
 
     draw_mt_stop_notice(ui, stop_notice);
@@ -460,6 +467,7 @@ fn draw_ai_api_tab(
     can_cancel: bool,
     progress: Option<MtPanelProgress>,
     options: &mut MtPanelOptions,
+    project_context_available: bool,
     actions: &mut MtPanelActions,
 ) {
     actions.options_changed |=
@@ -497,7 +505,7 @@ fn draw_ai_api_tab(
                 .max_height(section_max_height)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    draw_ai_translation_section(ui, options, actions);
+                    draw_ai_translation_section(ui, options, project_context_available, actions);
                 });
         }
 
@@ -605,6 +613,7 @@ fn draw_ai_connection_section(
 fn draw_ai_translation_section(
     ui: &mut egui::Ui,
     options: &mut MtPanelOptions,
+    project_context_available: bool,
     actions: &mut MtPanelActions,
 ) {
     ui.label(t!("translation.mt_panel.bubble_sort_label"));
@@ -622,19 +631,23 @@ fn draw_ai_translation_section(
             t!("translation.common.use_character_names_label"),
         )
         .changed();
-    actions.options_changed |= ui
-        .checkbox(
-            &mut options.ai_use_notes_prompt,
-            t!("translation.mt_panel.use_notes_prompt_label"),
-        )
-        .changed();
-    if !options.ai_use_notes_prompt {
+    // The notes / characters / terms documents belong to a title; a single-image session has
+    // none, so the toggles are hidden there.
+    if project_context_available {
         actions.options_changed |= ui
-            .checkbox(&mut options.ai_include_characters, t!("translation.mt_panel.add_characters_label"))
+            .checkbox(
+                &mut options.ai_use_notes_prompt,
+                t!("translation.mt_panel.use_notes_prompt_label"),
+            )
             .changed();
-        actions.options_changed |= ui
-            .checkbox(&mut options.ai_include_terms, t!("translation.mt_panel.add_terms_label"))
-            .changed();
+        if !options.ai_use_notes_prompt {
+            actions.options_changed |= ui
+                .checkbox(&mut options.ai_include_characters, t!("translation.mt_panel.add_characters_label"))
+                .changed();
+            actions.options_changed |= ui
+                .checkbox(&mut options.ai_include_terms, t!("translation.mt_panel.add_terms_label"))
+                .changed();
+        }
     }
     actions.options_changed |= ui
         .checkbox(

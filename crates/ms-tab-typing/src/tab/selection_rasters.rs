@@ -1460,8 +1460,12 @@ impl TypingTextOverlayLayer {
         }
 
         // === Normal mode: move / rotate drag + selection + context menu. ===
-        // Scene quads + centers for this page's rasters.
+        // Scene quads + centers for this page's rasters, limited to the rasters the composite plan keeps
+        // (`composited_raster_flags`): a hidden raster or one inside a hidden PS group is not drawn, so
+        // it is not hit either.
+        let composited = self.composited_raster_flags(page_idx);
         let entries: Vec<(usize, [Pos2; 4], Pos2)> = (0..count)
+            .filter(|i| composited.get(*i).copied().unwrap_or(false))
             .filter_map(|i| {
                 let l = self.raster_layers_by_page.get(&page_idx)?.get(i)?;
                 let quad = raster_quad_scene(&l.transform, l.image.size, view);

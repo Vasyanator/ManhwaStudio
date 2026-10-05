@@ -1456,13 +1456,17 @@ fn export_docx(project: &ProjectData, text: &str) -> Result<Option<PathBuf>, Str
 /// Opens the native "save as" dialog for a composed-text export and returns the
 /// chosen path (with the extension enforced), or `None` if the user cancelled.
 ///
+/// The dialog starts in `ProjectData::user_facing_dir`: the chapter directory of a project,
+/// the opened image's folder in a single-image session — never that session's scratch
+/// directory, which is deleted on exit.
+///
 /// Web stub: there is no native save dialog in the browser build, so this returns
 /// `None` and the export becomes a no-op (browser download export is added
 /// later). The `_` parameters keep the signature identical on both targets.
 #[cfg(not(target_arch = "wasm32"))]
 fn select_export_path(project: &ProjectData, ext: &str, filter_name: &str) -> Option<PathBuf> {
     let mut path = FileDialog::new()
-        .set_directory(&project.project_dir)
+        .set_directory(project.user_facing_dir())
         .set_file_name(format!("{DEFAULT_EXPORT_NAME}.{ext}"))
         .add_filter(filter_name, &[ext])
         .save_file()?;
@@ -1985,6 +1989,7 @@ mod tests {
             comic_type: None,
             canvas_settings: CanvasSettings::default(),
             settings_data: Value::Null,
+            session: Default::default(),
         }
     }
 

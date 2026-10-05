@@ -1,5 +1,6 @@
 // Unit tests for the typing tab; `super` resolves to the `tab` module.
 use super::*;
+use super::draw_page::MergedFillItem;
 
 #[test]
 fn flatten_composites_raster_from_disk_fallback() {
@@ -45,6 +46,8 @@ fn flatten_composites_raster_from_disk_fallback() {
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: Vec::new(), // force the disk-read path
+        bands: Vec::new(),
+        groups: Vec::new(),
         mask: None,
         export_format: TypingExportFormat::Png,
         layers_primary_dir: Some(layers.clone()),
@@ -116,6 +119,8 @@ fn flatten_composites_raster_from_disk_fallback() {
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: Vec::new(),
+        bands: Vec::new(),
+        groups: Vec::new(),
         mask: None,
         export_format: TypingExportFormat::Png,
         layers_primary_dir: Some(unsaved.clone()),
@@ -163,7 +168,8 @@ fn flatten_composites_raster_from_on_screen_snapshot() {
         deform: None,
         rgba: [255, 0, 0, 255].repeat(10 * 10),
         size_px: [10, 10],
-        band_z: 0,
+        uid: "r0".into(),
+        group_uid: None,
         mask_clip_enabled: false,
     };
     let job = TypingExportPageJob {
@@ -174,6 +180,8 @@ fn flatten_composites_raster_from_on_screen_snapshot() {
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: vec![snap],
+        bands: Vec::new(),
+        groups: Vec::new(),
         mask: None,
         export_format: TypingExportFormat::Png,
         layers_primary_dir: None, // no disk source at all
@@ -218,7 +226,8 @@ fn flatten_clips_mask_clip_enabled_raster_in_export() {
         deform: None,
         rgba: [255, 0, 0, 255].repeat(10 * 10),
         size_px: [10, 10],
-        band_z: 0,
+        uid: "r0".into(),
+        group_uid: None,
         mask_clip_enabled: mask_clip,
     };
     // Page mask ACTIVE only on the LEFT half (x < 10) of the 20x20 page.
@@ -238,6 +247,8 @@ fn flatten_clips_mask_clip_enabled_raster_in_export() {
             clean_overlay_rgba: None,
             overlays: Vec::new(),
             rasters: vec![snap],
+            bands: Vec::new(),
+            groups: Vec::new(),
             mask,
             export_format: TypingExportFormat::Png,
             layers_primary_dir: None,
@@ -396,28 +407,239 @@ fn text_preview_label_appends_dots_to_three_accounting_for_existing() {
 }
 
 #[test]
-fn order_unified_layer_rows_interleaves_by_z_overlay_above_raster_on_ties() {
+fn order_unified_layer_rows_is_the_composite_plan_order_top_first() {
+    use ms_models::layer_model::ordering::{Band, CompositeKey};
     use TypingLayerRow::*;
-    // Rows with band-Z; bool = raster_below_overlay (true for rasters).
-    // overlay@5, raster@5 (tie → overlay above), raster@3, overlay@1.
-    let rows = vec![
-        (Overlay(0), 5, false),
-        (Raster(0), 5, true),
-        (Raster(1), 3, true),
-        (Overlay(1), 1, false),
+    let bands = vec![
+        Band::Raster { uid: "r0".into(), z: 2 },
+        Band::PinnedText { uid: "a".into(), z: 2 },
+        Band::Raster { uid: "r1".into(), z: 1 },
+        Band::PinnedText { uid: "b".into(), z: 0 },
     ];
-    // TOP-first (Z desc): overlay@5, raster@5 (overlay wins the tie → listed first), raster@3, overlay@1.
+    let text = |uid| CompositeKey::Text { uid, layer_idx: 0 };
+    // Canvas input order: rasters (cache order), then overlays (overlay-index order).
+    let rows = vec![
+        (Raster(0), CompositeKey::Raster { uid: "r0" }),
+        (Raster(1), CompositeKey::Raster { uid: "r1" }),
+        (Overlay(0), text("a")),
+        (Overlay(1), text("b")),
+        // No band yet (not saved): both sit at the top-of-stack key `bands.len()`, an equal-Z tie.
+        (Overlay(2), text("c")),
+        (Overlay(3), text("d")),
+    ];
+    // TOP-first: the later of the two band-less overlays draws on top, so it is listed first; at
+    // Z 2 the overlay sits above the raster; then r1 (1) and b (0).
     assert_eq!(
-        order_unified_layer_rows(rows),
-        vec![Overlay(0), Raster(0), Raster(1), Overlay(1)]
+        order_unified_layer_rows(&bands, &rows),
+        vec![Overlay(3), Overlay(2), Overlay(0), Raster(0), Raster(1), Overlay(1)]
     );
+    assert!(order_unified_layer_rows(&bands, &[]).is_empty());
+}
 
-    // A raster strictly ABOVE a text (text can sit below a raster now): raster@7 first.
-    let rows2 = vec![(Overlay(2), 2, false), (Raster(2), 7, true)];
-    assert_eq!(order_unified_layer_rows(rows2), vec![Raster(2), Overlay(2)]);
+/// The «Слои» panel lists the page's rows in exactly the canvas fill order reversed, including the
+/// equal-Z ties of not-yet-saved overlays and rasters (newest on top in both).
+#[test]
+fn layers_panel_rows_equal_the_canvas_fill_order_for_equal_z_ties() {
+    use ms_models::layer_model::ordering::Band;
+    let raster = |uid: &str| TypingRasterLayer {
+        uid: uid.into(),
+        name: uid.into(),
+        visible: true,
+        opacity: 1.0,
+        transform: ms_models::layer_model::manifest::TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+        image: ColorImage::filled([2, 2], Color32::WHITE),
+        base_file: String::new(),
+        effects: Vec::new(),
+        deform: None,
+        mask_clip_enabled: false,
+        group_uid: None,
+        clipped_image: None,
+        texture: None,
+    };
+    let text = |uid: &str, page_idx: usize| {
+        text_runtime_from_doc_node(uid, page_idx, [1.0, 1.0], 1.0, 0.0, None, false, false, 0, None, [2, 2], vec![255; 16])
+    };
+    let mut layer = TypingTextOverlayLayer::default();
+    // One saved raster band; everything else is band-less (top-of-stack Z, equal ties).
+    layer.bands_by_page.insert(0, vec![Band::Raster { uid: "saved".into(), z: 0 }]);
+    layer
+        .raster_layers_by_page
+        .insert(0, vec![raster("saved"), raster("new_a"), raster("new_b")]);
+    layer.overlays = vec![text("t0", 0), text("other_page", 1), text("t1", 0), text("t2", 0)];
 
-    // Empty input → empty output.
-    assert!(order_unified_layer_rows(Vec::new()).is_empty());
+    let panel = layer.unified_layer_rows(0);
+    let page_overlays: Vec<usize> = vec![0, 2, 3];
+    let mut canvas: Vec<TypingLayerRow> = layer
+        .page_fill_plan(0, &page_overlays)
+        .iter()
+        .map(|step| match step.item {
+            MergedFillItem::Raster(idx) => TypingLayerRow::Raster(idx),
+            MergedFillItem::Overlay(pos) => TypingLayerRow::Overlay(page_overlays[pos]),
+        })
+        .collect();
+    canvas.reverse();
+    assert_eq!(panel, canvas, "panel rows == canvas order, top first");
+    assert_eq!(
+        panel.first(),
+        Some(&TypingLayerRow::Overlay(3)),
+        "the newest band-less overlay is on top in both"
+    );
+}
+
+/// A doc-only page for the typing sync tests: raster `r` and text `t` in PS group `g` plus an
+/// ungrouped text `u`, all visible, at unified Z 0, 1, 2 (no disk involved).
+fn doc_with_grouped_raster_and_texts() -> ms_models::layer_model::layer_doc::LayerDoc {
+    use ms_models::layer_model::layer_doc::{DecodedPagePayload, LayerDoc, LayerNode, NodeBody, NodeKind};
+    use ms_models::layer_model::manifest::TransformRec;
+    let node = |uid: &str, kind: NodeKind, z: u32, group: Option<&str>| {
+        let image = ColorImage::filled([2, 2], Color32::WHITE);
+        let body = match kind {
+            NodeKind::Raster => NodeBody::Raster {
+                base_image: image.clone(),
+                display_image: image,
+                effects: Vec::new(),
+                base_file: format!("{uid}.png"),
+                mask_clip: None,
+            },
+            NodeKind::Text => NodeBody::Text {
+                render_data: json!({ "text": uid }),
+                image,
+                is_image: false,
+                payload_uid: uid.to_string(),
+                mask_clip: None,
+                extra_centers: Default::default(),
+                centering_frame: None,
+            },
+        };
+        LayerNode {
+            uid: uid.to_string(),
+            name: uid.to_string(),
+            kind,
+            z,
+            visible: true,
+            opacity: 1.0,
+            group_uid: group.map(str::to_string),
+            text_layer_idx: (kind == NodeKind::Text).then_some(0),
+            text_pinned: kind == NodeKind::Text,
+            text_pinned_by_group: false,
+            transform: TransformRec { cx: 1.0, cy: 1.0, rotation: 0.0, scale: 1.0 },
+            deform: None,
+            generation: 0,
+            pixels_dirty: false,
+            body,
+        }
+    };
+    let mut doc = LayerDoc::new();
+    doc.insert_decoded_page(
+        0,
+        DecodedPagePayload {
+            nodes: vec![
+                node("r", NodeKind::Raster, 0, Some("g")),
+                node("t", NodeKind::Text, 1, Some("g")),
+                node("u", NodeKind::Text, 2, None),
+            ],
+            groups: vec![ms_models::layer_model::persist::GroupMeta {
+                uid: "g".into(),
+                name: "G".into(),
+                visible: true,
+                opacity: 1.0,
+                collapsed: false,
+            }],
+        },
+    );
+    doc
+}
+
+/// The kept items of `layer`'s page-0 fill plan over all its overlays, as `(raster|overlay uid, opacity)`.
+fn kept_fill_items(layer: &TypingTextOverlayLayer) -> Vec<(String, f32)> {
+    let overlay_indices: Vec<usize> = (0..layer.overlays.len()).collect();
+    layer
+        .page_fill_plan(0, &overlay_indices)
+        .iter()
+        .filter_map(|step| {
+            let uid = match step.item {
+                MergedFillItem::Raster(idx) => layer.raster_layers_by_page.get(&0)?.get(idx)?.uid.clone(),
+                MergedFillItem::Overlay(pos) => layer.overlays.get(overlay_indices[pos])?.uid.clone(),
+            };
+            Some((uid, step.opacity))
+        })
+        .collect()
+}
+
+/// A PS group meta change made in the doc (`set_group_meta`, what the PS group eye / opacity write)
+/// reaches the typing canvas and the export inputs on the next `sync_from_doc`.
+#[test]
+fn a_doc_group_meta_change_reaches_the_typing_plan_after_sync() {
+    let mut doc = doc_with_grouped_raster_and_texts();
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.sync_from_doc(0, &doc);
+    let all: Vec<String> = kept_fill_items(&layer).into_iter().map(|(uid, _)| uid).collect();
+    assert_eq!(all, ["r", "t", "u"], "everything drawn before the toggle");
+
+    assert!(doc.set_group_meta(0, "g", false, 1.0));
+    layer.sync_from_doc(0, &doc);
+    assert!(
+        layer.groups_by_page.get(&0).is_some_and(|groups| groups.iter().any(|g| g.uid == "g" && !g.visible)),
+        "the export job's groups (groups_by_page) carry the hidden group"
+    );
+    let kept: Vec<String> = kept_fill_items(&layer).into_iter().map(|(uid, _)| uid).collect();
+    assert_eq!(kept, ["u"], "the hidden group's raster and text are omitted");
+
+    assert!(doc.set_group_meta(0, "g", true, 0.5));
+    layer.sync_from_doc(0, &doc);
+    assert_eq!(
+        kept_fill_items(&layer),
+        vec![("r".to_string(), 0.5), ("t".to_string(), 0.5), ("u".to_string(), 1.0)],
+        "a dimmed group dims its members only"
+    );
+}
+
+/// The PS text eye writes the doc node's `visible`; after `sync_from_doc` the typing canvas omits the
+/// text and the export snapshot carries `visible: false` (so the flatten omits it as well).
+#[test]
+fn a_doc_hidden_text_node_is_omitted_after_sync() {
+    let mut doc = doc_with_grouped_raster_and_texts();
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.sync_from_doc(0, &doc);
+    doc.set_visibility(0, "u", false);
+    layer.sync_from_doc(0, &doc);
+    let kept: Vec<String> = kept_fill_items(&layer).into_iter().map(|(uid, _)| uid).collect();
+    assert_eq!(kept, ["r", "t"], "the hidden text is not drawn");
+    let snapshot = layer
+        .export_overlay_snapshots_for_page(0)
+        .into_iter()
+        .find(|s| s.uid == "u")
+        .map(|s| s.visible);
+    assert_eq!(snapshot, Some(false), "the export snapshot carries the hidden flag");
+}
+
+/// The «Слои» row eye writes the doc text node's `visible` (shared with the PS text eye), the
+/// runtime is re-projected from the doc, and the deferred text save is owed; a second click shows the
+/// text again. Without a doc nothing changes (no runtime-only state the save would never write).
+#[test]
+fn the_layers_panel_eye_toggles_the_doc_text_visibility() {
+    use std::sync::{Arc, Mutex};
+    let doc = Arc::new(Mutex::new(doc_with_grouped_raster_and_texts()));
+    let mut layer = TypingTextOverlayLayer::default();
+    layer.sync_from_doc(0, &doc.lock().expect("doc lock"));
+    let u_idx = layer.overlays.iter().position(|o| o.uid == "u").expect("u runtime");
+
+    assert!(!layer.toggle_overlay_visibility(0, u_idx), "no doc wired: nothing changes");
+    assert!(layer.overlays[u_idx].visible);
+    assert!(!layer.has_pending_placement_save());
+
+    layer.set_layer_doc(Arc::clone(&doc));
+    let doc_visible = |doc: &Arc<Mutex<ms_models::layer_model::layer_doc::LayerDoc>>| {
+        doc.lock().expect("doc lock").node(0, "u").map(|n| n.visible)
+    };
+    assert!(layer.toggle_overlay_visibility(0, u_idx));
+    assert_eq!(doc_visible(&doc), Some(false), "the doc node is hidden");
+    assert!(!layer.overlays[u_idx].visible, "the runtime is re-projected from the doc");
+    assert!(layer.has_pending_placement_save(), "the text save is owed");
+
+    assert!(layer.toggle_overlay_visibility(0, u_idx));
+    assert_eq!(doc_visible(&doc), Some(true), "a second click shows it again");
+    assert!(!layer.toggle_overlay_visibility(1, u_idx), "a row index of another page is refused");
 }
 
 #[test]
@@ -6300,6 +6522,8 @@ fn plain_export_job(dir: &Path, page_idx: usize, width_px: u32, height_px: u32, 
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: Vec::new(),
+        bands: Vec::new(),
+        groups: Vec::new(),
         mask: None,
         export_format,
         layers_primary_dir: None,
@@ -6826,6 +7050,8 @@ fn export_clean_fallback_follows_loader_scope_and_leaves_model_untouched() {
         clean_overlay_rgba: None,
         overlays: Vec::new(),
         rasters: Vec::new(),
+        bands: Vec::new(),
+        groups: Vec::new(),
         mask: None,
         export_format: TypingExportFormat::Png,
         layers_primary_dir: None,

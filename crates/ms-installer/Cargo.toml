@@ -71,9 +71,11 @@ web-time.workspace = true
 libc.workspace = true
 
 # Elevation (`ShellExecuteW` + token inspection) and process handles for the Windows
-# uninstall and self-replace paths. Same feature set the binary selects.
+# uninstall and self-replace paths. Same feature set the binary selects, plus
+# `Win32_System_Registry`: registry key existence and UTF-16 value reads by Win32 status
+# code ("Open with" registration and uninstall), because `reg.exe` messages are localized.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }
+windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi", "Win32_System_Registry"] }
 
 [dev-dependencies]
 # Isolated on-disk fixtures for the layout/venv-inspection tests in `utils.rs`.

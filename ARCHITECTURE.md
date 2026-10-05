@@ -70,7 +70,8 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - `ms-gifs` — embedded animated hints, streaming decoder.
 - `ms-raster` — generic raster primitives with one owner each: polygon scanline fill
   (re-exported as `ms_tools::fill_polygon_spans`), square binary dilation, Otsu threshold,
-  integer replicate upscale / box downscale, single-channel box blur.
+  integer replicate upscale / box downscale, single-channel box blur, RGBA-over-white to RGB
+  (used by PDF export and JPEG encoding).
 - `ms-log` — session log (`runtime_log`) and opt-in trace log (`trace_log!` / `trace_scope!`).
 - `ms-text-detect` — GUI-free text-detection domain (block sort and cap, mask normalization, DB
   postprocess, glyph mask, per-engine scale/tiling plan, tile stitching and the runner pipeline
@@ -144,7 +145,9 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   the program markers, else the executable directory. Bundled resources, the Python
   environment, `user_config`, logs and app-managed models all resolve from it.
 - `StudioBootstrapApp` (`src/studio_bootstrap.rs`) loads the project off the GUI thread, owns
-  window geometry and the GL lifetime, then delegates to `MangaApp`.
+  window geometry and the GL lifetime, then delegates to `MangaApp`. It receives a typed
+  `StudioOpenRequest`: a project directory, or a single image (CLI `--image` / positional path,
+  launcher `OpenImage`, OS "Open with").
 - **Reload rebuilds `MangaApp` inside the same `egui::Context`.** Any egui resource a crate
   registers (font families, textures, ids) must be named by content, never by an instance
   counter.
@@ -156,6 +159,14 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - A project opened in the studio is one **chapter** inside a **title** directory.
   `ms_project::ProjectData::load` returns the chapter directories, `pages: Vec<Page>`, the
   bubble list, `ProjectPaths`, `comic_type`, `canvas_settings` and `settings_data`.
+- **Single image mode:** `ProjectData::session()` is a typed `SessionKind` set by the caller,
+  never inferred from paths. For `SingleImage`, `ms_project::single_image` decodes the image
+  (EXIF orientation applied) into a throwaway scratch chapter under the OS temp dir, and the
+  regular load runs on that scratch — never on the user's folder. Writers stay live against the
+  scratch; the user's file is written only by explicit Save / Save As (flattened composite via
+  the typing flatten, atomic write). `run_main` owns the scratch and deletes it after the window
+  closes; stale scratches (marker + released lock) are swept at startup. UI branches
+  (tabs, top bar, exit dialog) live in `src/single_image/`.
 - `Page` and `ProjectPaths` are declared in `ms-page-ops` and re-exported by `ms-project`, so a
   pending page-op journal is resolved (`recover_pending_page_op`) before any reconcile or load
   pass. Every path is an `ms_config` name joined onto the chapter or title directory.
@@ -381,7 +392,10 @@ logged error); the GUI thread only polls and applies results.
 - `CanvasView` is the one canvas engine; tab behaviour plugs in via `CanvasHooks`.
 - One owner per rule: the page <-> clean binding (`clean_binding` + `clean_assign`), Python
   lookup and spawn (`ms_sysprobe::python_manager`), semantic colours (`ms-theme`), `winit`
-  (`ms-window-geometry`), glyph rendering fonts (`ms-fonts` + `ms-text-render`).
+  (`ms-window-geometry`), glyph rendering fonts (`ms-fonts` + `ms-text-render`), layer composite
+  order / visibility / group fold (`ms_models::layer_model::ordering`, consumed by the typing
+  canvas, the typing flatten/export and the PS composite, layers tree and structural order).
+  Layer and group visibility/opacity are `LayerDoc` facts, never one tab's view state.
 
 **Documents**
 - Owned documents are touched only through `ms-docstore`: one `update` per read-modify-write;
@@ -408,6 +422,9 @@ logged error); the GUI thread only polls and applies results.
   failed cleanup releases the latch and restarts all three writers.
 - Exit: deferred typing edits are enqueued inline BEFORE the exit barrier; failed pages are
   reported.
+- A single-image session never merges staging: every close takes the DISCARD quiesce (no
+  flush, no delete job); `run_main` removes the scratch afterwards. Its dirty state is
+  `AutosaveGate::action_count()` against the baseline of the last successful file write.
 
 Detail: `src/MODULE_README.md`, `crates/ms-models/src/MODULE_README.md`,
 `crates/ms-models/src/layer_model/MODULE_README.md`, `crates/ms-tab-typing/src/MODULE_README.md`.

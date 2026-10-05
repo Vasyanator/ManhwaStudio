@@ -36,6 +36,8 @@ ms-widgets = { path = "../ms-widgets" }
 ms-theme = { path = "../ms-theme" }
 # The reusable mask brush behind the page crop mask.
 ms-tools = { path = "../ms-tools" }
+# Flattening RGBA over white for the PDF export's image streams (the single owner of that rule).
+ms-raster = { path = "../ms-raster" }
 # The production text renderer, re-exported crate-wide as `render_next`.
 ms-text-render = { path = "../ms-text-render" }
 # Text segmentation (re-exported as `segmentation`), the typesetting-language model and

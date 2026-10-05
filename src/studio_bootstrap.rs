@@ -17,8 +17,13 @@ Key structures:
   received and discarded, so the deferred close proceeds).
 - Deferred storage-mode reconciliation: on a direct `--project` start, the pending
   conversion (`storage_mode_job`) is started once the project has loaded.
-- `spawn_project_load_thread`: named worker that mirrors the previous synchronous startup
-  sequence (`detect_unsaved_for_project` choosing `load_resume_unsaved` vs `load`).
+- `StartupTarget` / `StudioOpenRequest`: what a studio window opens — a chapter directory, or
+  one image through a reserved single-image scratch session (`ms_project::single_image`). The
+  `run_main` loop owns the request; `StudioOpenRequest::release` deletes the scratch after the
+  window has closed (plan D13). Also derives the window title and the `fonts/ui` probe roots.
+- `spawn_open_thread`: named load worker. Project: `detect_unsaved_for_project` choosing
+  `load_resume_unsaved` vs `load` (the previous synchronous startup sequence). Image:
+  `open_single_image`; its error reaches the error screen as `SingleImageError::user_message`.
 - `install_shader_layers`: installs the `egui-shader-layers` glow backend (the PS editor's
   «Коррекция» shader) from the app creator; `StudioBootstrapApp::on_exit` destroys it.
 
@@ -33,6 +38,9 @@ Closing the window during `Loading` is intercepted (`CancelClose`): the load wor
 non-atomic filesystem writes (`cleaned/` seeding placeholders, JPEG->PNG re-encode +
 source removal) and killing it mid-write can permanently corrupt the chapter, so the shell
 waits for the worker's result, discards it, and only then really closes.
+A single-image session takes the same error screen on a decode/open failure ("Exit to
+launcher" or "Exit"), and refuses the structural-operation reload with a logged error (the
+Page Manager is hidden there, so the request is unreachable).
 A damaged `{chapter}_unsaved` session (a staging document that does not parse) makes
 `load_resume_unsaved` fail with a localized error naming the files; the error screen's
 "Exit to launcher" is the route to discarding it there. Nothing is deleted automatically.
@@ -44,12 +52,13 @@ windowed startup flow (`run_main_window`), gated off wasm at the module declarat
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::app::MangaApp;
 use crate::project::ProjectData;
+use crate::project::single_image::{SingleImageError, SingleImageScratch};
 use crate::runtime_log;
 use crate::tabs::AppTab;
 use crate::window_geometry::{self, WindowGeometryTracker};
 use anyhow::Context;
 use ms_thread as thread;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
@@ -59,17 +68,126 @@ use std::time::Duration;
 /// on input otherwise).
 const LOAD_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Spawns the named background worker that loads the project for the studio window.
+/// What the user asked the studio to open, before any scratch session exists: the output of
+/// startup routing (CLI or launcher), turned into a [`StudioOpenRequest`] by the `run_main` loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartupTarget {
+    /// A chapter directory (`--project` or a launcher pick).
+    Project(PathBuf),
+    /// One picture file to edit in single-image mode (`--image`, positional, launcher button).
+    Image(PathBuf),
+}
+
+/// What one studio window opens. Owned by the `run_main` loop for the whole window life
+/// (plan D13): the loop creates it before the window, lends it to `run_main_window`, and calls
+/// [`StudioOpenRequest::release`] after the window has closed.
+#[derive(Debug)]
+pub enum StudioOpenRequest {
+    /// A chapter directory, loaded with the regular unsaved-detection + `ProjectData::load*`.
+    Project(PathBuf),
+    /// A single image opened through a reserved scratch chapter. The scratch is shared (`Arc`)
+    /// only with the load worker, which drops its clone before reporting its result, so the
+    /// loop is the sole owner again once the window can close.
+    Image { source: PathBuf, scratch: Arc<SingleImageScratch> },
+}
+
+impl StudioOpenRequest {
+    /// Maps a routing target to a request. A project maps 1:1; an image reserves a fresh
+    /// scratch session under `scratch_base` (production: `ms_config::single_image::scratch_base()`).
+    /// Blocking but cheap (mkdir + lock + marker); runs before any window exists.
+    ///
+    /// # Errors
+    /// The `SingleImageScratch::reserve` error; nothing is left behind on failure.
+    pub fn from_target(target: StartupTarget, scratch_base: &Path) -> Result<Self, SingleImageError> {
+        match target {
+            StartupTarget::Project(project_dir) => Ok(Self::Project(project_dir)),
+            StartupTarget::Image(source) => {
+                let scratch = SingleImageScratch::reserve(scratch_base)?;
+                Ok(Self::Image { source, scratch: Arc::new(scratch) })
+            }
+        }
+    }
+
+    /// `true` for a single-image session (decides the reload refusal and the font roots).
+    #[must_use]
+    pub fn is_single_image(&self) -> bool {
+        match self {
+            Self::Project(_) => false,
+            Self::Image { .. } => true,
+        }
+    }
+
+    /// Studio window title: `ManhwaStudio v{version} - {chapter path}` for a project,
+    /// `ManhwaStudio v{version} - {file name}` for an image (the full path when it has no
+    /// file-name component). `version` is the display version (`MS_APP_VERSION`).
+    #[must_use]
+    pub fn window_title(&self, version: &str) -> String {
+        match self {
+            Self::Project(project_dir) => format!("ManhwaStudio v{version} - {}", project_dir.display()),
+            Self::Image { source, .. } => crate::single_image::image_window_title(version, source),
+        }
+    }
+
+    /// Extra `fonts/ui` roots probed before the app directories: a project's title and chapter
+    /// folders (a title may ship its own UI font chain). Empty for an image: the folder of a
+    /// loose picture is not a title, and the scratch never holds fonts.
+    #[must_use]
+    pub fn font_roots(&self) -> Vec<PathBuf> {
+        match self {
+            Self::Project(project_dir) => project_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .into_iter()
+                .chain(std::iter::once(project_dir.clone()))
+                .collect(),
+            Self::Image { .. } => Vec::new(),
+        }
+    }
+
+    /// Ends the request after its window has closed: deletes a single-image scratch session
+    /// (blocking recursive delete — call it only on the main thread after `run_native`
+    /// returned, never on a GUI thread). A delete failure, or a scratch still shared with a
+    /// load worker that has not finished, is logged; the next startup sweep removes it then.
+    pub fn release(self) {
+        match self {
+            Self::Project(_) => {}
+            Self::Image { source, scratch } => match Arc::try_unwrap(scratch) {
+                Ok(scratch) => {
+                    if let Err(err) = scratch.remove() {
+                        runtime_log::log_warn(format!(
+                            "[studio-bootstrap] could not delete the single-image scratch for '{}': {err}; the next startup sweep retries",
+                            source.display()
+                        ));
+                    }
+                }
+                Err(shared) => runtime_log::log_warn(format!(
+                    "[studio-bootstrap] single-image scratch {} is still held by the load worker; left for the next startup sweep",
+                    shared.root().display()
+                )),
+            },
+        }
+    }
+}
+
+/// Spawns the named background worker that opens `request` for the studio window.
 ///
-/// Mirrors the previous synchronous startup path byte-for-byte: detect a
-/// `{chapter}_unsaved` folder next to the chapter, then pick `load_resume_unsaved` vs
-/// `load` accordingly. The result (or the spawn failure, as a disconnected channel) is
-/// observed by `StudioBootstrapApp` through the returned receiver.
-pub fn spawn_project_load_thread(
-    project_dir: PathBuf,
+/// - `Project`: the previous synchronous startup path byte-for-byte: detect a
+///   `{chapter}_unsaved` folder next to the chapter, then `load_resume_unsaved` vs `load`.
+/// - `Image`: `open_single_image` into the reserved scratch (no unsaved detection: a scratch is
+///   always fresh). Its error is logged in technical form here and reported to the loading
+///   screen as `SingleImageError::user_message`, the one owner of decode/open error text.
+///
+/// The result (or the spawn failure, as a disconnected channel) is observed by
+/// `StudioBootstrapApp` through the returned receiver.
+pub fn spawn_open_thread(
+    request: &StudioOpenRequest,
     fallback_user_settings: serde_json::Value,
 ) -> Receiver<anyhow::Result<ProjectData>> {
     let (tx, rx) = mpsc::channel();
+    let job = match request {
+        StudioOpenRequest::Project(project_dir) => LoadJob::Project(project_dir.clone()),
+        StudioOpenRequest::Image { source, scratch } => LoadJob::Image { source: source.clone(), scratch: Arc::clone(scratch) },
+    };
     let spawn_result = thread::Builder::new()
         .name("studio-project-load".to_string())
         .spawn(move || {
@@ -85,16 +203,22 @@ pub fn spawn_project_load_thread(
                     fallback_user_settings
                 }
             };
-            let resume_unsaved = crate::detect_unsaved_for_project(&project_dir);
-            let result = if resume_unsaved {
-                ProjectData::load_resume_unsaved(&project_dir, &user_settings)
-            } else {
-                ProjectData::load(&project_dir, &user_settings)
+            let result = match job {
+                LoadJob::Project(project_dir) => load_project_dir(&project_dir, &user_settings),
+                LoadJob::Image { source, scratch } => {
+                    let result = crate::project::single_image::open_single_image(&source, &scratch, &user_settings);
+                    // Give the scratch back BEFORE reporting: once the shell has the result the
+                    // window may close, and `StudioOpenRequest::release` needs sole ownership.
+                    drop(scratch);
+                    result.map_err(|err| {
+                        runtime_log::log_error(format!("[studio-bootstrap] failed to open single image: {err}"));
+                        anyhow::Error::msg(err.user_message())
+                    })
+                }
+            };
+            if tx.send(result).is_err() {
+                runtime_log::log_info("[studio-bootstrap] studio window closed before the load finished; result dropped");
             }
-            // Same greppable wording as the old startup-path context, now attached where
-            // the load actually runs.
-            .with_context(|| format!("failed to load project at {}", project_dir.display()));
-            let _ = tx.send(result);
         });
     if let Err(err) = spawn_result {
         // The sender is dropped here, so the UI observes `Disconnected` and shows the
@@ -104,6 +228,26 @@ pub fn spawn_project_load_thread(
         ));
     }
     rx
+}
+
+/// The load worker's owned copy of a [`StudioOpenRequest`].
+enum LoadJob {
+    Project(PathBuf),
+    Image { source: PathBuf, scratch: Arc<SingleImageScratch> },
+}
+
+/// Loads a chapter directory: `load_resume_unsaved` when a `{chapter}_unsaved` folder exists
+/// next to it, else `load`. Blocking; load worker only.
+fn load_project_dir(project_dir: &Path, user_settings: &serde_json::Value) -> anyhow::Result<ProjectData> {
+    let resume_unsaved = crate::detect_unsaved_for_project(project_dir);
+    if resume_unsaved {
+        ProjectData::load_resume_unsaved(project_dir, user_settings)
+    } else {
+        ProjectData::load(project_dir, user_settings)
+    }
+    // Same greppable wording as the old startup-path context, now attached where
+    // the load actually runs.
+    .with_context(|| format!("failed to load project at {}", project_dir.display()))
 }
 
 /// Lifecycle of the studio window shell.
@@ -134,6 +278,10 @@ pub struct StudioBootstrapApp {
     close_after_load: bool,
     /// Tab restored after a structural-operation reload; selection intentionally does not persist.
     reload_tab: Option<AppTab>,
+    /// The window edits one image through a scratch chapter (`StudioOpenRequest::Image`). Such
+    /// a session never reloads from disk: the reload path would re-run a PROJECT load on the
+    /// scratch and lose the session kind.
+    single_image: bool,
     /// Observes this window's monitor/position/size and persists them (`Window` config
     /// section). Lives here rather than in `MangaApp` because the shell owns the window from
     /// the first frame, including the loading and error screens.
@@ -177,8 +325,11 @@ pub fn install_shader_layers(cc: &eframe::CreationContext<'_>) {
 }
 
 impl StudioBootstrapApp {
+    /// `single_image` must be `StudioOpenRequest::is_single_image` of the request whose load
+    /// `rx` delivers.
     pub fn new(
         rx: Receiver<anyhow::Result<ProjectData>>,
+        single_image: bool,
         user_settings: serde_json::Value,
         ai_backend: AiBackendHandle,
         return_to_launcher_flag: Arc<AtomicBool>,
@@ -197,6 +348,7 @@ impl StudioBootstrapApp {
             return_to_launcher_flag,
             close_after_load: false,
             reload_tab: None,
+            single_image,
             geometry: WindowGeometryTracker::new(&window_settings),
             #[cfg(target_os = "windows")]
             maximize_root_window_on_first_frame,
@@ -255,7 +407,7 @@ impl StudioBootstrapApp {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 // Worker panicked before sending, or the spawn itself failed (logged in
-                // `spawn_project_load_thread`). A dead worker holds no file handles, so a
+                // `spawn_open_thread`). A dead worker holds no file handles, so a
                 // deferred close needs no further waiting either.
                 runtime_log::log_error(
                     "[studio-bootstrap] project load thread exited without a result",
@@ -352,12 +504,20 @@ impl eframe::App for StudioBootstrapApp {
         let reload = match &mut self.state {
             BootstrapState::Running(app) => {
                 app.ui(ui, frame);
-                if app.take_project_reload_request() {
+                if !app.take_project_reload_request() {
+                    None
+                } else if self.single_image {
+                    // Unreachable by design: the reload follows a structural page operation and
+                    // the Page Manager is hidden in single-image mode. Refuse instead of
+                    // re-loading the scratch as a project; the session keeps running.
+                    runtime_log::log_error(
+                        "[studio-bootstrap] project reload requested in a single-image session; refused, the session keeps running",
+                    );
+                    None
+                } else {
                     let project_dir = app.project_dir();
                     app.on_exit(None);
                     Some(project_dir)
-                } else {
-                    None
                 }
             }
             BootstrapState::Loading { .. } => {
@@ -388,7 +548,7 @@ impl eframe::App for StudioBootstrapApp {
         if let Some(project_dir) = reload {
             self.reload_tab = Some(AppTab::PageManager);
             self.state = BootstrapState::Loading {
-                rx: spawn_project_load_thread(project_dir, self.user_settings.clone()),
+                rx: spawn_open_thread(&StudioOpenRequest::Project(project_dir), self.user_settings.clone()),
             };
             ctx.request_repaint();
         }
@@ -416,5 +576,69 @@ impl eframe::App for StudioBootstrapApp {
                  released together with the context itself",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Unique scratch base under the OS temp dir; each test removes it.
+    fn temp_base(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ms-studio-open-request-{tag}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn project_target_maps_one_to_one_without_touching_the_scratch_base() {
+        let base = temp_base("project");
+        let dir = PathBuf::from("/home/u/titles/Title/Chapter 1");
+        let request = StudioOpenRequest::from_target(StartupTarget::Project(dir.clone()), &base).expect("project maps");
+        assert!(matches!(&request, StudioOpenRequest::Project(mapped) if *mapped == dir));
+        assert!(!request.is_single_image());
+        assert_eq!(request.window_title("1.2.3"), "ManhwaStudio v1.2.3 - /home/u/titles/Title/Chapter 1");
+        assert_eq!(request.font_roots(), vec![PathBuf::from("/home/u/titles/Title"), dir]);
+        assert!(!base.exists(), "a project start must not create the scratch base");
+        request.release();
+    }
+
+    #[test]
+    fn image_target_reserves_a_scratch_and_release_deletes_it() {
+        let base = temp_base("image");
+        let source = PathBuf::from("/home/u/Картинки/page one.jpg");
+        let request = StudioOpenRequest::from_target(StartupTarget::Image(source.clone()), &base).expect("scratch reserved");
+        let root = match &request {
+            StudioOpenRequest::Image { source: mapped, scratch } => {
+                assert_eq!(*mapped, source);
+                scratch.root().to_path_buf()
+            }
+            StudioOpenRequest::Project(dir) => panic!("image mapped to project {}", dir.display()),
+        };
+        assert!(root.starts_with(&base) && root.is_dir(), "scratch root {} must live under the base", root.display());
+        assert!(request.is_single_image());
+        assert_eq!(request.window_title("1.2.3"), "ManhwaStudio v1.2.3 - page one.jpg");
+        assert!(request.font_roots().is_empty(), "an image never probes title-local fonts");
+        request.release();
+        assert!(!root.exists(), "release must delete the scratch session");
+        std::fs::remove_dir_all(&base).expect("remove test scratch base");
+    }
+
+    #[test]
+    fn release_while_the_worker_still_shares_the_scratch_leaves_it_for_the_sweep() {
+        let base = temp_base("shared");
+        let request = StudioOpenRequest::from_target(StartupTarget::Image(PathBuf::from("/home/u/a.png")), &base).expect("scratch reserved");
+        let worker_share = match &request {
+            StudioOpenRequest::Image { scratch, .. } => Arc::clone(scratch),
+            StudioOpenRequest::Project(dir) => panic!("image mapped to project {}", dir.display()),
+        };
+        let root = worker_share.root().to_path_buf();
+        request.release();
+        assert!(root.is_dir(), "a scratch still held elsewhere must not be deleted under its holder");
+        // The last holder dropping the scratch releases the lock without I/O; the startup sweep
+        // then owns the cleanup.
+        drop(worker_share);
+        let report = crate::project::single_image::sweep_stale_sessions(&base);
+        assert_eq!(report.removed, 1);
+        assert!(!root.exists());
+        std::fs::remove_dir_all(&base).expect("remove test scratch base");
     }
 }

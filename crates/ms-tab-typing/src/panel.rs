@@ -854,6 +854,9 @@ pub struct TypingTopPanelState {
     export_base_name: String,
     pending_round_text_positions: bool,
     export_default_dir: Option<PathBuf>,
+    /// The open session is a single-image session (`ProjectData::is_single_image`), pushed in every
+    /// frame by the tab (`set_single_image_mode`). Hides the project-export controls.
+    single_image: bool,
     export_status: TypingExportUiStatus,
     pending_edit_request: Option<TypingOverlayEditRequest>,
     pending_create_image_request: Option<TypingCreateImageRequest>,
@@ -1049,6 +1052,7 @@ impl Default for TypingTopPanelState {
             export_base_name: String::new(),
             pending_round_text_positions: false,
             export_default_dir: None,
+            single_image: false,
             export_status: TypingExportUiStatus::Hidden,
             pending_edit_request: None,
             pending_settings_link: None,
@@ -2041,8 +2045,11 @@ struct TypingRightSectionInputs<'a> {
     clean_overlays_visible: bool,
     /// Whether strict pixel-snapped movement is enabled (drives the checkbox state).
     strict_pixel_movement: bool,
-    /// Default directory for the export folder picker, when known.
+    /// Default directory for the export folder picker and the image-import picker, when known.
     export_default_dir: Option<&'a Path>,
+    /// Single-image session: the export format row, the re-pagination block and the export button
+    /// are not drawn (the picture is written by the app's «Сохранить», not by a project export).
+    single_image: bool,
     /// Current export progress/result to render.
     export_status: &'a TypingExportUiStatus,
     /// Currently selected export format.

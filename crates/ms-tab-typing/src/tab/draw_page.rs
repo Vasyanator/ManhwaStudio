@@ -22,6 +22,17 @@ comes from `ui.ctx()`.
 
 Key structures:
 - CenteringMarker (per-overlay geometry + render inputs for `draw_centering_assist`)
+- MergedFillItem / MergedFillStep + `merged_fill_plan` (pure bottom-to-top fill plan that interleaves
+  raster quads with overlay meshes, delegated to `ms_models::layer_model::ordering::composite_plan`;
+  pinned by `tab/composite_characterization_tests.rs`), and the layer methods `page_fill_plan` (the
+  plan of one page over its cached rasters + the drawn overlays) and `composited_raster_flags` (which
+  rasters the plan keeps, for the raster hit-test).
+
+Composite rule: order, visibility and the PS group fold come from the owner, never from this file.
+An overlay or raster the plan omits (hidden node, hidden / zero-opacity PS group) is not drawn and
+not interactive; a kept one is tinted by its step opacity (premultiplied white tint, all four
+channels — `doc_layers::composite_step_tint`). The canvas and the export flatten build their plan
+items through the same `doc_layers::{raster_composite_item, text_composite_item}`.
 
 Also owns the centering-assist ("Помочь с центровкой") drawing and interaction:
 `draw_centering_assist` paints the page-anchored guide frame + corner handles + the
@@ -41,6 +52,7 @@ that stay there as descendants of module `tab`.
 */
 
 use super::*;
+use super::doc_layers::{composite_step_tint, raster_composite_item, text_composite_item};
 
 impl TypingTextOverlayLayer {
     /// Master per-page draw for the typing tab: draws every visible text/image
@@ -350,19 +362,24 @@ impl TypingTextOverlayLayer {
             });
         }
 
-        // Bottom-to-top by the UNIFIED manual band-Z (retire the old layer_idx + page-Y auto-order):
-        // the top overlay draws last (on top) AND registers its egui interaction last, so on an overlap
-        // the topmost-by-Z overlay wins the click — the same Z the raster/text unified hit-test and the
-        // `merged_fills` draw order use, so draw order == manual order == click order.
-        draw_entries.sort_by(|a, b| {
-            let z = |idx: usize| {
-                self.overlays
-                    .get(idx)
-                    .map(|o| self.overlay_band_z(page_idx, &o.uid, o.layer_idx))
-                    .unwrap_or(0)
-            };
-            z(a.idx).cmp(&z(b.idx))
-        });
+        // Bottom-to-top by the owner's composite plan (`ordering::composite_plan`): the top overlay draws
+        // last (on top) AND registers its egui interaction last, so on an overlap the topmost overlay
+        // wins the click — the same plan the raster/text unified hit-test and the fill pass below use, so
+        // draw order == manual order == click order. An overlay the plan omits (its doc node hidden, or
+        // inside a hidden / zero-opacity PS group) is dropped here: it is neither drawn, nor interactive,
+        // nor an occluder. `draw_entries` was built in overlay-index order, which the plan's stable sort
+        // keeps among equal ranks (the pre-plan tie rule).
+        let draw_entries: Vec<OverlayDrawEntry> = {
+            let overlay_indices: Vec<usize> = draw_entries.iter().map(|entry| entry.idx).collect();
+            let plan = self.page_fill_plan(page_idx, &overlay_indices);
+            let mut slots: Vec<Option<OverlayDrawEntry>> = draw_entries.into_iter().map(Some).collect();
+            plan.iter()
+                .filter_map(|step| match step.item {
+                    MergedFillItem::Overlay(pos) => slots.get_mut(pos).and_then(Option::take),
+                    MergedFillItem::Raster(_) => None,
+                })
+                .collect()
+        };
 
         // A structural change (delete / duplicate) requested by this frame's interaction. It is
         // RECORDED here and APPLIED as the very last thing this function does — see the comment at the
@@ -1479,49 +1496,21 @@ impl TypingTextOverlayLayer {
         }
 
         // Unified-Z fill pass: interleave the read-only PS raster quads with the text/image overlay
-        // textured meshes in one pass ordered bottom-to-top by band Z. (Selection decorations and
-        // editing handles are drawn afterwards so they always sit on top.)
-        enum MergedFillItem {
-            /// Index into the page's cached `raster_layers_by_page` vector.
-            Raster(usize),
-            /// Index into `draw_entries`.
-            Overlay(usize),
-        }
-        let mut merged_fills: Vec<(u32, u32, MergedFillItem)> = Vec::new();
-        // Rasters: band Z from the matching `Raster` band (else top). Tiebreak `0` keeps the cached
-        // bottom-to-top raster order via the raster index in the third tuple slot's stable sort.
-        if let Some(rasters) = self.raster_layers_by_page.get(&page_idx) {
-            for (raster_idx, raster) in rasters.iter().enumerate() {
-                let band_z = self.raster_band_z(page_idx, &raster.uid);
-                merged_fills.push((band_z, 0, MergedFillItem::Raster(raster_idx)));
-            }
-        }
-        // Overlays: band Z from the overlay's text group / pinned-text band (else top). Tiebreak `1`
-        // so that, within the same band Z, overlays draw above rasters; `draw_entries` is already in
-        // the desired within-group order, preserved by the stable sort.
-        for (entry_pos, entry) in draw_entries.iter().enumerate() {
-            let band_z = self
-                .overlays
-                .get(entry.idx)
-                .map(|overlay| self.overlay_band_z(page_idx, &overlay.uid, overlay.layer_idx))
-                .unwrap_or_else(|| {
-                    self.bands_by_page
-                        .get(&page_idx)
-                        .map(|b| b.len() as u32)
-                        .unwrap_or(0)
-                });
-            merged_fills.push((band_z, 1, MergedFillItem::Overlay(entry_pos)));
-        }
-        // Stable sort: primary band Z, then raster-below-overlay tiebreak; existing raster order and
-        // within-group overlay order are preserved as the stable tiebreak.
-        merged_fills.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for (_, _, item) in &merged_fills {
-            match item {
+        // textured meshes in one pass ordered bottom-to-top by the owner's composite plan, each tinted by
+        // its step opacity (own opacity x PS group opacity). (Selection decorations and editing handles
+        // are drawn afterwards so they always sit on top.) The plan is recomputed here, not reused from
+        // the sort above, because this frame's interaction may have changed band Z or the raster list.
+        let overlay_indices: Vec<usize> = draw_entries.iter().map(|entry| entry.idx).collect();
+        let fill_plan = self.page_fill_plan(page_idx, &overlay_indices);
+        for step in &fill_plan {
+            match step.item {
                 MergedFillItem::Raster(raster_idx) => {
-                    self.draw_one_raster_layer(ui.ctx(), &painter, view, *raster_idx);
+                    self.draw_one_raster_layer(ui.ctx(), &painter, view, raster_idx, step.opacity);
                 }
                 MergedFillItem::Overlay(entry_pos) => {
-                    let entry = &draw_entries[*entry_pos];
+                    let Some(entry) = draw_entries.get(entry_pos) else {
+                        continue;
+                    };
                     // Hide the plain baked PNG while the live VECTOR-transform warped preview is drawn
                     // for this overlay (`draw_vector_transform_overlay` below textures the un-warped base
                     // onto the working mesh). Skipping here avoids double-drawing the static + warped
@@ -1535,7 +1524,7 @@ impl TypingTextOverlayLayer {
                         &entry.mesh_scene,
                         entry.mesh_cols,
                         entry.mesh_rows,
-                        Color32::WHITE,
+                        composite_step_tint(step.opacity),
                     );
                 }
             }
@@ -1792,6 +1781,114 @@ impl TypingTextOverlayLayer {
         }
         snap_overlay_center_to_pixels_if_enabled(overlay, strict_pixel_movement, page_size);
         true
+    }
+}
+
+/// One item of the typing canvas' unified-Z fill pass, as ordered by [`merged_fill_plan`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MergedFillItem {
+    /// Index into the page's cached `raster_layers_by_page` vector.
+    Raster(usize),
+    /// Index into the overlay input of the plan (`draw_entries` position at the call sites).
+    Overlay(usize),
+}
+
+/// One step of the canvas fill pass: draw `item` with the folded composite-plan `opacity` (finite and
+/// in `(0, 1]`; 1.0 = the texture as is).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct MergedFillStep {
+    pub(super) item: MergedFillItem,
+    pub(super) opacity: f32,
+}
+
+/// Bottom-to-top fill plan of a page's cached `rasters` (cache order) and `overlays` (draw order),
+/// delegated to `ordering::composite_plan` with rasters first, then overlays, as its input order.
+///
+/// Contract (the owner's): stable sort by `(band Z, raster below overlay)`; ties within one kind keep
+/// the input order; an item that is not visible, sits in a hidden PS group, or whose folded opacity is
+/// `<= 0` / NaN is omitted; every kept item appears exactly once with its folded opacity. Pure;
+/// `pub(super)` so the tests of module `tab` can pin it.
+pub(super) fn merged_fill_plan(
+    bands: &[ms_models::layer_model::ordering::Band],
+    groups: &[ms_models::layer_model::ordering::GroupFold<'_>],
+    rasters: &[ms_models::layer_model::ordering::CompositeItem<'_>],
+    overlays: &[ms_models::layer_model::ordering::CompositeItem<'_>],
+) -> Vec<MergedFillStep> {
+    let items: Vec<ms_models::layer_model::ordering::CompositeItem<'_>> =
+        rasters.iter().chain(overlays.iter()).copied().collect();
+    ms_models::layer_model::ordering::composite_plan(bands, groups, &items)
+        .into_iter()
+        .map(|step| MergedFillStep {
+            // `items` is `rasters` followed by `overlays`, so the index splits at `rasters.len()`.
+            item: match step.item.checked_sub(rasters.len()) {
+                Some(overlay_pos) => MergedFillItem::Overlay(overlay_pos),
+                None => MergedFillItem::Raster(step.item),
+            },
+            opacity: step.opacity,
+        })
+        .collect()
+}
+
+impl TypingTextOverlayLayer {
+    /// The fill plan of `page_idx` over ALL its cached rasters and the overlays `overlay_indices`
+    /// (indices into `self.overlays`, in draw order); `MergedFillItem::Overlay(pos)` is a position in
+    /// `overlay_indices`. Items are built by the shared `raster_composite_item` / `text_composite_item`
+    /// (the same mapping as the export flatten) over `page_composite_inputs`. An index naming no
+    /// overlay is left out of the plan. A NaN opacity omits the item silently here (this runs every
+    /// frame); the export flatten logs it.
+    pub(super) fn page_fill_plan(&self, page_idx: usize, overlay_indices: &[usize]) -> Vec<MergedFillStep> {
+        let (bands, groups) = self.page_composite_inputs(page_idx);
+        let rasters: Vec<_> = self
+            .raster_layers_by_page
+            .get(&page_idx)
+            .map(|rasters| {
+                rasters
+                    .iter()
+                    .map(|r| raster_composite_item(&r.uid, r.group_uid.as_deref(), r.visible, r.opacity))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut positions: Vec<usize> = Vec::with_capacity(overlay_indices.len());
+        let mut overlays = Vec::with_capacity(overlay_indices.len());
+        for (pos, idx) in overlay_indices.iter().enumerate() {
+            let Some(overlay) = self.overlays.get(*idx) else {
+                continue;
+            };
+            positions.push(pos);
+            overlays.push(text_composite_item(
+                &overlay.uid,
+                overlay.layer_idx,
+                overlay.group_uid.as_deref(),
+                overlay.visible,
+            ));
+        }
+        merged_fill_plan(bands, &groups, &rasters, &overlays)
+            .into_iter()
+            .filter_map(|step| match step.item {
+                // Map the plan's overlay index back to its position in `overlay_indices`.
+                MergedFillItem::Overlay(j) => positions.get(j).map(|pos| MergedFillStep {
+                    item: MergedFillItem::Overlay(*pos),
+                    opacity: step.opacity,
+                }),
+                MergedFillItem::Raster(_) => Some(step),
+            })
+            .collect()
+    }
+
+    /// One flag per cached raster of `page_idx` (cache order): `true` when the composite plan keeps the
+    /// raster, i.e. when the canvas draws it. The raster hit-test considers only flagged rasters, so a
+    /// hidden raster or one inside a hidden / zero-opacity PS group is not hit.
+    pub(super) fn composited_raster_flags(&self, page_idx: usize) -> Vec<bool> {
+        let count = self.raster_layers_by_page.get(&page_idx).map_or(0, Vec::len);
+        let mut flags = vec![false; count];
+        for step in self.page_fill_plan(page_idx, &[]) {
+            if let MergedFillItem::Raster(raster_idx) = step.item
+                && let Some(flag) = flags.get_mut(raster_idx)
+            {
+                *flag = true;
+            }
+        }
+        flags
     }
 }
 

@@ -41,6 +41,7 @@ Main items:
   tri-state marker `General.first_run_languages_confirmed` (never in the defaults tree).
 - `load_raw_user_settings_for_startup`: startup-safe read before default backfilling.
 - `load_user_settings_for_startup`: startup-safe read of user settings without creating files.
+- `single_image` (module): single-image mode input types, scratch root and `SingleImage` section.
 */
 
 #![warn(clippy::all)]
@@ -81,6 +82,12 @@ pub mod settings_deep_link;
 // owns the key, the typed value, and the seed of `ms_docstore::set_default_format`.
 pub mod storage_mode;
 pub use storage_mode::{GENERAL_STORAGE_MODE_KEY, StorageMode, storage_mode_from_user_settings};
+
+// Single-image editing mode: the readable input-type table, the scratch-root resolver and
+// the `SingleImage` section of `user_config`. It lives here because the table is pure data
+// read by crates that do not know each other (launcher, installer, project, binary) and
+// the section's default belongs to the `user_config` default tree below.
+pub mod single_image;
 
 // The debouncing, retrying writer thread every self-owned section of `user_config.json`
 // is written through. It sits here because its write step IS this crate's
@@ -1514,6 +1521,11 @@ pub fn user_config_defaults() -> Value {
             }
         },
         "CleaningTab": {},
+        // Section and key names are `single_image::SINGLE_IMAGE_SECTION` /
+        // `SINGLE_IMAGE_JPEG_QUALITY_KEY`; a test there asserts this default reads back.
+        "SingleImage": {
+            "jpeg_quality": single_image::JPEG_QUALITY_DEFAULT
+        },
         "TextTab": {
             "hanging_punctuation": ms_text_util::text_punctuation::DEFAULT_HANGING_PUNCTUATION,
             "text_language": ms_text_util::language::TextLanguage::Ru.tag(),

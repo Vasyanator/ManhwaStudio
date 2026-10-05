@@ -108,6 +108,15 @@ that defines the type.
   `fonts_presets_doc`); `app_fonts_dir` is the ONLY fonts-directory resolver
   (the typing tab owns those documents' contents but resolves the directory here). The conversion
   driver itself lives in `ms-project` (`storage_mode::convert_globals`).
+- `single_image.rs`: the single-image editing mode's shared names — `INPUT_FILE_TYPES` (the ONE
+  readable-input table: extensions + MIME; consumed by the launcher picker, the Linux desktop
+  entry, the Windows "Open with" registration and the CLI error text), `scratch_base()`
+  (native-only, per-user: `std::env::temp_dir()/manhwastudio-single-image-<user>` on Unix, where
+  `/tmp` is shared; unsuffixed on Windows, whose temp dir is per-user) with the per-session
+  `SCRATCH_MARKER_FILE` / `SCRATCH_LOCK_FILE` names, and the `SingleImage.jpeg_quality` setting
+  (default 95, clamped `1..=100`; pure reader `jpeg_quality_from`, targeted writer
+  `save_jpeg_quality` — one `ms_docstore::update`, blocking). The key is Rust-only, so it is
+  outside the `PROTOCOL_VERSION` contract.
 - `locale_store.rs`: native-only (`#[cfg(not(target_arch = "wasm32"))]`) on-disk layer for the
   UI localization catalog. Unpacks the catalogs `ms-i18n` embeds into an editable
   `data_dir()/locale` folder, reconciles each file on every launch (never overwriting or
@@ -170,6 +179,8 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   `merge_missing` adds but never removes — a renamed key leaves the old one on disk.
 - Autosave interval/threshold bounds or defaults: the `AUTOSAVE_*` consts in `lib.rs`; the
   runtime global in `autosave_policy.rs`; the flush decision itself in `ms_models::autosave_gate`.
+- A new readable input image type for the single-image mode: `INPUT_FILE_TYPES` in
+  `single_image.rs` only — every consumer derives its list from it.
 - A new editor tab: `app_tab.rs` (`ALL`, `key()`, `title()`), then the `enabled_tabs` default
   in `lib.rs` and the tab's own module in `src/tabs/`.
 - A new bubble status condition or border kind: `bubble_status.rs` for the model, and

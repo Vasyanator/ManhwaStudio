@@ -24,6 +24,8 @@ Key functions:
   chapter_new_format (new chapter documents follow their siblings' format)
 - convert_document / convert_many / chapter_format_report (convert.rs, re-exported)
 - is_temp_artifact (skip crash-leftover temp files when copying document trees)
+- write_bytes_atomic (native: the atomic write recipe for non-document files, e.g. a
+  user image saved in place; json.rs, re-exported)
 
 Notes:
 - Two formats: `<stem>.json` (JSON codec, json.rs) and `<stem>.db` (SQLite fragment codec,
@@ -70,6 +72,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 pub use json::{AtomicWriteError, Durability, FaultPoint, Fingerprint, SaveBaseline, WriteStep, fingerprint, is_temp_artifact, temp_path_for};
+#[cfg(not(target_arch = "wasm32"))]
+pub use json::write_bytes_atomic;
 #[cfg(any(test, feature = "test-support"))]
 pub use json::{arm_fault, recorded_steps};
 pub use convert::{BatchOutcome, ChapterFormatReport, ConvertHook, ConvertOutcome, ConvertStep, NoHook, chapter_format_report, convert_document, convert_many};
