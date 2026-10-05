@@ -17,6 +17,7 @@ Key structures:
 - `MarksMode`, `MarksSupport`, `RunMarks`: how the user's marks layer may reach an engine, what
   an engine accepts, and what one run carries
 - `EnginePoll`: what one `poll` says about the run in flight
+- `RunOptionsCtx`: the host facts an engine's pinned run options may depend on
 
 Key functions:
 - `composite_marks_over()`: the straight-alpha "over" of the marks layer onto a region (pure)
@@ -27,8 +28,10 @@ Notes:
 An engine never sees `CanvasView`, `ProjectData`, the frame or an `egui::Context` outside
 `poll`; its whole UI surface is a plain `&mut egui::Ui`. There is deliberately NO shared
 progress vocabulary (`dev-docs/region_edit_v2_plan.md` §13.2 D13): engines disagree about
-what progress even is, so each draws its own bar inside its own parameter panel and the host
-learns only Running / Done / Failed. A run's answer is PIXELS and only pixels (D12).
+what progress even is, so each draws its own bar and the host learns only Running / Done /
+Failed. The host decides only WHERE it is drawn: the panel has three sections —
+`draw_progress` pinned at the top, `draw_parameters` in the scroll, and the host's actions
+followed by the engine's `draw_run_options` pinned at the bottom (§13.3 amendment). A run's answer is PIXELS and only pixels (D12).
 The marks layer is the user's colour annotation over the region (arrows, outlines); the HOST
 decides how it travels — composited into the region, as a separate reference image or as a
 transparent layer — from the engine's `marks_support()`, so an engine only ever reads
@@ -236,6 +239,15 @@ pub enum EnginePoll {
     Failed(String),
 }
 
+/// Host facts the engine's pinned run options ([`AiEngine::draw_run_options`]) may depend on,
+/// handed in per frame because the engine never sees the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOptionsCtx {
+    /// At least one mask layer holds a painted pixel (`MaskStack::is_empty` is `false`). The
+    /// marks layer does not count: it is never a permission mask.
+    pub mask_painted: bool,
+}
+
 /// One AI engine a region-editing host can run.
 ///
 /// Ownership boundary: the engine owns its parameters, its persistence, its wire protocol,
@@ -275,13 +287,33 @@ pub trait AiEngine {
     /// parameters change, because an engine may make it depend on one of them.
     fn allows_empty_mask(&self) -> bool;
 
-    /// Draws the engine's parameters, its own progress bar and its engine-specific status —
-    /// the body of the left «Редактор области» panel.
+    /// Draws the engine's parameters and its engine-specific status — the SCROLLED body of
+    /// the «Редактор области» panel. The progress belongs in [`AiEngine::draw_progress`] and
+    /// must not be drawn here as well.
     ///
     /// A plain `&mut Ui`: an engine never touches `CanvasView`, `ProjectData` or the frame.
     /// The panel may not be visible on a given frame, so nothing this method does may be a
     /// precondition of `poll`.
     fn draw_parameters(&mut self, ui: &mut egui::Ui);
+
+    /// Draws the engine's own progress — pinned at the TOP of the «Редактор области» panel,
+    /// outside its scroll, so it stays visible however far the parameters are scrolled.
+    /// Default: nothing.
+    ///
+    /// Draw NOTHING while there is nothing to report: an empty section takes no height (the
+    /// dock allocates nothing for it, not even an item spacing), and
+    /// every point it takes comes off the parameters' scroll viewport. Same rules as
+    /// [`AiEngine::draw_parameters`]: the panel may be hidden, so nothing here may be a
+    /// precondition of `poll`.
+    fn draw_progress(&mut self, _ui: &mut egui::Ui) {}
+
+    /// Draws the engine's per-run options — pinned at the BOTTOM of the panel, under the
+    /// host's «Обработать» section, outside the scroll. Default: nothing.
+    ///
+    /// Only for the few options a user decides per run, next to the button that starts it;
+    /// everything else belongs in [`AiEngine::draw_parameters`]. `ctx` carries the host facts
+    /// such an option may depend on. Same rules as `draw_parameters`.
+    fn draw_run_options(&mut self, _ui: &mut egui::Ui, _ctx: RunOptionsCtx) {}
 
     /// Why a run is refused right now, localized; `None` when it may start.
     ///

@@ -33,7 +33,8 @@ FILE HEADER (tabs/cleaning/tab.rs)
     `CleaningTool::wants_library_panel`). The default arrangement is this tab's own
     (`cleaning_default_dock_layout`).
   - `draw_clean_tab_body` / `draw_tools_tab_body` / `draw_active_tool_tab_body` /
-    `draw_quick_clean_tab_body` / `draw_area_editor_tab_body` /
+    `draw_quick_clean_tab_body` / `draw_area_editor_tab_body` (+ its pinned
+    `draw_area_editor_tab_top` / `draw_area_editor_tab_bottom`) /
     `draw_watermark_library_tab_body`: the bodies of those six tabs. Всё, что требует `&mut CleaningTabState`
     (правки оверлея, запуск фоновых job-ов, смена инструмента), они не делают сами — идут внутри
     `canvas.draw` — а выставляют флаги `CleaningDockOut`, которые `apply_dock_out` применяет уже
@@ -159,10 +160,13 @@ const CLEANING_ACTIVE_TOOL_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 140.0);
 const CLEANING_ACTIVE_TOOL_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(352.0, 360.0);
 
 /// Smallest outer size, in points, the dock may shrink the «Редактор области» panel
-/// to, and the size it starts at. FIXED numbers rather than caption-derived ones, for
-/// the same reason as «Выбранный инструмент»: the body is opaque per-tool UI, so this
-/// tab cannot measure the captions it is about to draw. The body scrolls, so the floor
-/// only has to keep a usable strip on screen.
+/// to. FIXED numbers rather than caption-derived ones, for the same reason as
+/// «Выбранный инструмент»: the body is opaque per-tool UI, so this tab cannot measure
+/// the captions it is about to draw. The height is deliberately NOT raised to hold the
+/// pinned sections (progress on top, the «Обработать» section at the bottom): a taller
+/// floor would make the panel taller for every user whose panel is solved smaller. A
+/// rect shorter than the pinned parts is handled by the dock, which clamps the scroll
+/// viewport to zero and clips the pinned parts and the frame to the panel's rect.
 const CLEANING_AREA_EDITOR_TAB_MIN_SIZE_PX: Vec2 = Vec2::new(240.0, 160.0);
 /// Outer size, in points, the «Редактор области» panel starts at: the geometry lines,
 /// the constraint lines, one row per mask layer, the run button and two status lines.
@@ -2160,6 +2164,22 @@ fn draw_area_editor_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
     }
 }
 
+/// Draws the section pinned at the TOP of «Редактор области», above the scrolled body
+/// (`CleaningTool::draw_main_panel_top`). Dispatched like `draw_area_editor_tab_body`.
+fn draw_area_editor_tab_top(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
+    if let Some(tool) = cx.tools.get_mut(cx.active_tool_idx) {
+        tool.draw_main_panel_top(ui);
+    }
+}
+
+/// Draws the section pinned at the BOTTOM of «Редактор области», under the scrolled body
+/// (`CleaningTool::draw_main_panel_bottom`). Dispatched like `draw_area_editor_tab_body`.
+fn draw_area_editor_tab_bottom(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
+    if let Some(tool) = cx.tools.get_mut(cx.active_tool_idx) {
+        tool.draw_main_panel_bottom(ui);
+    }
+}
+
 /// Draws the «Библиотека знаков» tab body: the second panel a tool may own.
 ///
 /// Dispatched exactly like `draw_area_editor_tab_body`, and reached only while the
@@ -2456,6 +2476,11 @@ impl CanvasHooks for CleaningHooks<'_> {
             .visible(area_editor_panel_wanted)
             .min_size(CLEANING_AREA_EDITOR_TAB_MIN_SIZE_PX)
             .initial_size(CLEANING_AREA_EDITOR_TAB_INITIAL_SIZE_PX)
+            // The engine's progress and the «Обработать» section stay on screen however far
+            // the parameters are scrolled; the panel keeps its height and only the scroll
+            // viewport between them gets shorter.
+            .pinned_top(draw_area_editor_tab_top)
+            .pinned_bottom(draw_area_editor_tab_bottom)
             .show(draw_area_editor_tab_body);
         // The third conditional tab, declared every frame like the other two. Hiding
         // it hands its own `{«Лента», Bottom, 0.0}` anchor down to «Редактор области»

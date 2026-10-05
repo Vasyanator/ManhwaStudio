@@ -10,8 +10,9 @@ Main responsibilities:
   latent-preview texture, the run channel and the unload channel;
 - implement `AiEngine` — id, caption, section, constraints, mask layer, the run gate, the run
   itself and the per-frame `poll`;
-- draw the «Редактор области» panel body: the mask note, the progress bar with the live
-  latent preview, the collapsible generation parameters and the unload button.
+- draw the «Редактор области» panel: the progress bar in the pinned top section
+  (`draw_progress`), and in the scrolled body the mask note, the live latent preview, the
+  collapsible generation parameters and the unload button.
 
 Key structures:
 - `SdxlEngine`
@@ -419,22 +420,28 @@ impl AiEngine for SdxlEngine {
         false
     }
 
+    /// The step bar, pinned above the parameters; nothing while idle with no preview shown.
+    fn draw_progress(&mut self, ui: &mut egui::Ui) {
+        draw_sdxl_progress_bar(ui, &self.progress, self.preview_texture.is_some());
+    }
+
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
         // The mask MEANING, stated in the engine's own body: it is the inverse of FLUX.2
         // klein's, and the engines share one frame and one brush.
         ui.small(t!("cleaning.tools.sdxl.mask_meaning_hint"));
         ui.separator();
 
+        // The bar itself is pinned above this body (`draw_progress`); the preview stays here.
         {
             let Self { progress, preview_texture, preview_uploaded_seq, .. } = self;
-            draw_sdxl_progress_ui(ui, progress, preview_texture, preview_uploaded_seq);
+            draw_sdxl_latent_preview(ui, progress, preview_texture, preview_uploaded_seq);
         }
 
         let mut changed = false;
         let mut unload_clicked = false;
         let unload_busy = self.unload_rx.is_some();
         // The fold stays CLOSED by default: the parameters are a long column and the
-        // progress bar above them is what a run needs on screen.
+        // latent preview above them is what a run needs on screen.
         let params_open = egui::CollapsingHeader::new(t!("cleaning.tools.sdxl.params_heading"))
             .id_salt("cleaning_sdxl_engine_params")
             .default_open(false);

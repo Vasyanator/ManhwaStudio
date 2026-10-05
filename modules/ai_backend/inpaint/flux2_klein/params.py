@@ -141,9 +141,10 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     `status` still reports the path and its `exists: false` flag, so nothing
     about a mistyped path is hidden.
 
-    `whole_region=True` is a MODE, not a hint, and it settles two other keys on
-    the caller's behalf (`mask_dilate_px` -> 0, `color_match` -> False); see
-    `_whole_region_overrides` for why neither is meaningful there.
+    `whole_region=True` is a MODE, not a hint, and it settles three other keys on
+    the caller's behalf (`mask_dilate_px` -> 0, `color_match` -> False,
+    `text_attention_in_mask` -> False); see `_whole_region_overrides` for why
+    none is meaningful there.
 
     Returns a dict with every key of the wire contract present.
 
@@ -235,6 +236,12 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
         # sends a mask — a solid one — so the request format does not fork; the
         # service checks that it really is solid (`_require_solid_mask`).
         "whole_region": whole_region,
+        # Confine the prompt's attention to the masked image tokens (see
+        # `attention.py`): off by default, because it narrows what the prompt can
+        # see and a request written before the field existed must keep running
+        # exactly as it did. A no-op under `whole_region`, which therefore forces
+        # it off (`_whole_region_overrides`).
+        "text_attention_in_mask": _to_bool(merged.get("text_attention_in_mask"), False),
     }
     if whole_region:
         normalized.update(_whole_region_overrides(normalized))
@@ -244,8 +251,8 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
 def _whole_region_overrides(normalized: dict[str, Any]) -> dict[str, Any]:
     """The keys `whole_region` settles on the caller's behalf, with the reasons.
 
-    Both would otherwise operate on an input they have no meaning for, and both
-    are silent about it — which is exactly the failure mode this module refuses
+    Each would otherwise operate on an input it has no meaning for, and each
+    is silent about it — which is exactly the failure mode this module refuses
     everywhere else:
 
     - **`mask_dilate_px` -> 0.** The dilate exists to give a thin painted mask a
@@ -263,15 +270,26 @@ def _whole_region_overrides(normalized: dict[str, Any]) -> dict[str, Any]:
       correction, so the match is switched off and `mask_feather_px` — which is
       NOT switched off — is what joins the regenerated region to the page.
 
+    - **`text_attention_in_mask` -> False.** It confines the prompt to the
+      tokens inside the mask, and a solid mask has every token inside: the
+      attention mask would block nothing and still cost `S²` bytes of VRAM and
+      the flash kernel. Forcing it off keeps the run, the memory forecast and
+      the reported effective value truthful.
+
     Logged whenever it actually overrides a value the caller asked for, so the
     override is visible in the backend log rather than inferred from the result.
     """
-    overrides: dict[str, Any] = {"mask_dilate_px": 0, "color_match": False}
+    overrides: dict[str, Any] = {
+        "mask_dilate_px": 0,
+        "color_match": False,
+        "text_attention_in_mask": False,
+    }
     contradicted = sorted(key for key, value in overrides.items() if normalized[key] != value)
     if contradicted:
         log.info(
-            "FLUX.2 klein: режим «без маски» переопределяет %s — расширять и по чему сверять цвет "
-            "в нём нечего (см. _whole_region_overrides).",
+            "FLUX.2 klein: режим «без маски» переопределяет %s — расширять маску, сверять цвет "
+            "по кольцу вокруг неё и ограничивать внимание текста в нём нечем "
+            "(см. _whole_region_overrides).",
             ", ".join(contradicted),
         )
     return overrides

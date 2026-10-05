@@ -15,7 +15,9 @@ entry in `tab.rs`; it reaches the user only through the host's panels.
 mod.rs::all_engines()      -> one instance of every engine, in picker order
 AiEngine::constraints()    -> the frame's size rules
 AiEngine::mask_layers()    -> the frame's mask stack (tint + name key per layer)
-AiEngine::draw_parameters  -> the body of the left «Редактор области» panel
+AiEngine::draw_progress    -> the pinned top of «Редактор области» (FLUX.2 / SDXL bar; LaMa none)
+AiEngine::draw_parameters  -> the scrolled body of «Редактор области»
+AiEngine::draw_run_options -> per-run options pinned under «Обработать» (FLUX.2 klein only)
 AiEngine::start(request)   -> region + masks in, worker thread out
 AiEngine::poll(ctx)        -> Idle / Running / Done(ColorImage) / Failed(message)
 ```

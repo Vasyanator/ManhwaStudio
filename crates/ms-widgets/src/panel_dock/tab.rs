@@ -17,7 +17,7 @@ Key structures:
 
 Key functions:
 - `PanelTab::title`, `visible`, `transparent_until_hover`, `min_size`,
-  `initial_size`, `show`, `show_with_extras`.
+  `initial_size`, `pinned_top`, `pinned_bottom`, `show`, `show_with_extras`.
 
 Notes:
 `show` does NOT draw. It stores `Box<dyn FnOnce(&mut Ui, &mut C, &mut TabExtras)
@@ -28,13 +28,15 @@ keeps for it. The body captures
 none of the caller's state: it receives the caller's per-frame context `C`, which
 `end` lends to one body at a time. That is what lets every tab of one frame reach
 the same heavy caller state without cloning it or wrapping it in a `RefCell`.
+`pinned_top` / `pinned_bottom` queue up to two more closures of the same kind,
+drawn inside the panel's frame but outside its scroll area.
 */
 
 use egui::Vec2;
 
 use super::extras::TabExtras;
 use super::model::TabId;
-use super::{PanelDock, TabMeta, TabTitle};
+use super::{PanelDock, PinnedBody, TabMeta, TabTitle, TabBodies};
 
 /// One tab declared for the current frame.
 ///
@@ -51,6 +53,8 @@ pub struct PanelTab<'dock, 'ctx, 'frame, C> {
     id: TabId,
     title: Option<TabTitle<'frame>>,
     meta: TabMeta,
+    pinned_top: Option<PinnedBody<'frame, C>>,
+    pinned_bottom: Option<PinnedBody<'frame, C>>,
 }
 
 impl<'dock, 'ctx, 'frame, C> PanelTab<'dock, 'ctx, 'frame, C> {
@@ -61,7 +65,40 @@ impl<'dock, 'ctx, 'frame, C> PanelTab<'dock, 'ctx, 'frame, C> {
             id,
             title: None,
             meta: TabMeta::default(),
+            pinned_top: None,
+            pinned_bottom: None,
         }
+    }
+
+    /// Queues a section drawn under the panel's header, ABOVE the scroll area
+    /// the body lives in, so it never scrolls out of view (a progress bar).
+    ///
+    /// Like the body it is run from [`PanelDock::end`] with the caller's
+    /// context, only while this tab is the drawn tab of a drawn, expanded panel,
+    /// and before the body. Drawing nothing costs no height, not even an item
+    /// spacing. The panel's solved height does not change: the scroll viewport
+    /// gets shorter by the section's height (plus one item spacing) instead.
+    #[must_use]
+    pub fn pinned_top(mut self, section: impl FnOnce(&mut egui::Ui, &mut C) + 'frame) -> Self {
+        self.pinned_top = Some(Box::new(section));
+        self
+    }
+
+    /// Queues a section drawn at the BOTTOM of the panel, under the scroll area
+    /// the body lives in, so it never scrolls out of view (an action row).
+    ///
+    /// Run after the body, under the same conditions as
+    /// [`PanelTab::pinned_top`]. The room it needs is the height it measured
+    /// LAST frame — the dock's one-frame geometry lag — and a change of that
+    /// height repaints; drawing nothing costs no height. In a panel shorter
+    /// than the pinned parts the scroll viewport is clamped to zero and the
+    /// pinned parts (and the panel frame) are clipped to the panel's rect, so
+    /// a [`PanelTab::min_size`] that fits them keeps them whole but is not
+    /// required for correctness.
+    #[must_use]
+    pub fn pinned_bottom(mut self, section: impl FnOnce(&mut egui::Ui, &mut C) + 'frame) -> Self {
+        self.pinned_bottom = Some(Box::new(section));
+        self
     }
 
     /// Sets the header caption, produced lazily once per frame.
@@ -178,8 +215,19 @@ impl<'dock, 'ctx, 'frame, C> PanelTab<'dock, 'ctx, 'frame, C> {
             id,
             title,
             meta,
+            pinned_top,
+            pinned_bottom,
         } = self;
         let title = title.unwrap_or_else(|| Box::new(move || id.as_str().to_owned()));
-        dock.declare(id, meta, title, Box::new(body));
+        dock.declare(
+            id,
+            meta,
+            title,
+            TabBodies {
+                body: Box::new(body),
+                pinned_top,
+                pinned_bottom,
+            },
+        );
     }
 }

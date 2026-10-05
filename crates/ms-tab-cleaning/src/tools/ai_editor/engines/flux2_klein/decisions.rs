@@ -11,6 +11,8 @@ frame, which is what the tests at the end of this file do.
 Main responsibilities:
 - decide the at-most-one line under the prompt field (`flux2_prompt_cache_line`);
 - decide whether the `guidance_scale` control is live at all (`flux2_guidance_supported`);
+- decide whether the «Внимание только к маске» run option is live
+  (`flux2_text_attention_block_reason`);
 - decide what the always-visible readiness line reports (`flux2_readiness_line`), with the
   memory forecast folded in as `Flux2MemorySummary`;
 - name the first reason a run cannot start (`flux2_run_block_reason`);
@@ -22,6 +24,7 @@ Key structures:
 
 Key functions:
 - `flux2_prompt_cache_line()`, `flux2_guidance_supported()`, `flux2_readiness_line()`
+- `flux2_text_attention_block_reason()`
 - `flux2_run_block_reason()`, `region_block_reason()`
 
 Notes:
@@ -91,6 +94,19 @@ pub(super) fn flux2_prompt_cache_line(
 #[must_use]
 pub(super) fn flux2_guidance_supported(status: Option<&Flux2Status>) -> bool {
     status.and_then(|status| status.guidance_supported) != Some(false)
+}
+
+/// Why the «Внимание только к маске» checkbox is closed right now, localized; `None` when
+/// the user may toggle it.
+///
+/// It is closed exactly while no mask pixel is painted: the run is then a whole-region
+/// edit, there is no mask to confine the prompt to, and the flag would not travel
+/// ([`Flux2KleinSettings::to_params`]). It is NOT closed during a run — like every other
+/// parameter it is read when the next run starts — and closing it never rewrites the
+/// user's stored choice.
+#[must_use]
+pub(super) fn flux2_text_attention_block_reason(mask_painted: bool) -> Option<&'static str> {
+    (!mask_painted).then(|| t!("cleaning.tools.flux2_klein.text_attention_in_mask_disabled_hint"))
 }
 
 /// The tone a one-line verdict is drawn in.
@@ -315,6 +331,14 @@ pub(super) fn region_block_reason(region: [usize; 2]) -> Option<String> {
 mod tests {
     use super::*;
     use crate::tools::region_edit_v2::geometry::check_size;
+
+    /// The run option is open exactly while a mask is painted, and a closed one always
+    /// says why.
+    #[test]
+    fn text_attention_is_closed_only_without_a_painted_mask() {
+        assert_eq!(flux2_text_attention_block_reason(true), None);
+        assert!(flux2_text_attention_block_reason(false).is_some_and(|reason| !reason.is_empty()));
+    }
 
     #[test]
     fn region_block_reason_enforces_every_limit() {

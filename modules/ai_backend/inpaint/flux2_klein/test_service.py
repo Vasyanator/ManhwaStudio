@@ -12,6 +12,11 @@ Main responsibilities:
 - verify the warm-up belongs to the placement and is skipped by a run that
   cache-hits a pipeline whose weights have not moved;
 - verify `whole_region` is verified against the mask instead of trusted;
+- verify `text_attention_in_mask` reaches the pipeline as ONE `attention_kwargs`
+  mask built from the dilated mask (and nothing without it or under
+  `whole_region`), that the pipeline's retained copy is dropped before the
+  decode and after a failed denoise, that an empty mask is refused before
+  anything loads, and that a negative prompt of another length is refused;
 - verify `status` merges residency into the disk facts, and omits it with
   `components_busy: true` rather than waiting for the service lock;
 - verify every refusal of `component_action`: unknown component or action, an
@@ -22,7 +27,7 @@ Main responsibilities:
 
 Notes:
 Module attributes are patched on the module that defines them (`pipeline`,
-`hardware`, `components`), never on the `flux2_klein` package.
+`hardware`, `components`, `attention`), never on the `flux2_klein` package.
 """
 
 from __future__ import annotations
@@ -37,7 +42,13 @@ import numpy as np
 from PIL import Image
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import components, hardware, pipeline, streaming
+from modules.ai_backend.inpaint.flux2_klein import (
+    attention,
+    components,
+    hardware,
+    pipeline,
+    streaming,
+)
 # Imported at module scope ON PURPOSE: pulling the IPC handler in from inside a
 # test would import the backend's own stack while `sys.modules` still holds this
 # suite's fake `torch`/`diffusers`, and the half-initialized modules that leaves
@@ -95,8 +106,17 @@ class InpaintRequestTests(_TempTreeCase):
         latents = self.latents
 
         class _Pipe(types.SimpleNamespace):
+            #: Set by a test to make the denoise raise after diffusers' bookkeeping.
+            raise_in_call: BaseException | None = None
+
             def __call__(self, **kwargs: object) -> object:
                 pipe_calls.append(kwargs)
+                # What the real `Flux2KleinInpaintPipeline.__call__` does first,
+                # and never undoes: the attention mask stays referenced by the
+                # pipeline object after the call returns or raises.
+                self._attention_kwargs = kwargs.get("attention_kwargs")
+                if self.raise_in_call is not None:
+                    raise self.raise_in_call
                 return types.SimpleNamespace(images=latents)
 
         self.pipe = _Pipe(
@@ -283,6 +303,161 @@ class InpaintRequestTests(_TempTreeCase):
     def test_without_a_reference_the_pipeline_gets_no_image_reference(self) -> None:
         self._run(placement="full_gpu")
         self.assertNotIn("image_reference", self.pipe_calls[0])
+
+    def _record_attention_masks(self) -> list[dict[str, object]]:
+        """Replace the torch mask builder with a recorder; returns its call list.
+
+        Patched on `attention`, its defining module: the fake torch here cannot
+        build a real tensor, and the builder's own tests cover the mask itself.
+        """
+        built: list[dict[str, object]] = []
+
+        def _build(layout: object, *, dtype_name: str, device: object) -> object:
+            built.append({"layout": layout, "dtype_name": dtype_name, "device": device})
+            return ("attention-mask", len(built))
+
+        builder_patch = patch.object(attention, "build_text_attention_mask", _build)
+        builder_patch.start()
+        self.addCleanup(builder_patch.stop)
+        return built
+
+    def test_without_text_attention_in_mask_the_call_carries_no_attention_kwargs(self) -> None:
+        built = self._record_attention_masks()
+        result = self._run(placement="full_gpu")
+        self.assertNotIn("attention_kwargs", self.pipe_calls[0])
+        self.assertEqual(built, [])
+        self.assertIs(result["text_attention_in_mask"], False)
+
+    def test_text_attention_in_mask_sends_one_mask_built_from_the_dilated_mask(self) -> None:
+        built = self._record_attention_masks()
+        with self.assertLogs(svc.log, level="INFO") as captured:
+            result = self._run(placement="full_gpu", text_attention_in_mask=True)
+        self.assertEqual(
+            self.pipe_calls[0]["attention_kwargs"], {"attention_mask": ("attention-mask", 1)}
+        )
+        self.assertEqual(len(built), 1)
+        layout = built[0]["layout"]
+        # 128 px region -> 8 x 8 tokens; the 48..80 square dilated by the default
+        # 16 px covers pixels 32..95, i.e. token rows/columns 2..5.
+        self.assertEqual(
+            (layout.text_tokens, layout.image_tokens, layout.reference_tokens), (512, 64, 0)
+        )
+        self.assertEqual(layout.inside_tokens, 16)
+        self.assertTrue(layout.inside.reshape(8, 8)[2:6, 2:6].all())
+        self.assertEqual(built[0]["dtype_name"], "bfloat16")
+        self.assertEqual(built[0]["device"], self.service._device)
+        self.assertIs(result["text_attention_in_mask"], True)
+        # Not in `applied`: that dict is persisted into the user's settings.
+        self.assertNotIn("text_attention_in_mask", result["applied"])
+        line = next(line for line in captured.output if "text_attention_in_mask=True" in line)
+        for fragment in ("L=512", "N=64", "R=0", "S=640", "inside_tokens=16", "mask_bytes="):
+            self.assertIn(fragment, line)
+
+    def test_text_attention_in_mask_counts_the_reference_tokens(self) -> None:
+        built = self._record_attention_masks()
+        self.service.inpaint_image_bytes(
+            _png_bytes(self.region, "RGB"),
+            _png_bytes(self.mask, "L"),
+            reference_bytes=_png_bytes(np.zeros((128, 128, 3), dtype=np.uint8), "RGB"),
+            params=self.params(placement="full_gpu", text_attention_in_mask=True),
+        )
+        layout = built[0]["layout"]
+        self.assertEqual(layout.reference_tokens, 64)
+        self.assertEqual(layout.sequence_length, 512 + 3 * 64)
+        # A region-sized reference is spatially aligned with the region, so its
+        # tokens follow the same inside/outside grid.
+        self.assertIs(layout.reference_inside, layout.inside)
+
+    def test_text_attention_in_mask_is_a_noop_under_whole_region(self) -> None:
+        built = self._record_attention_masks()
+        result = self.service.inpaint_image_bytes(
+            _png_bytes(self.region, "RGB"),
+            _png_bytes(np.full((128, 128), 255, dtype=np.uint8), "L"),
+            params=self.params(
+                placement="full_gpu", whole_region=True, text_attention_in_mask=True
+            ),
+        )
+        self.assertNotIn("attention_kwargs", self.pipe_calls[0])
+        self.assertEqual(built, [])
+        self.assertIs(result["text_attention_in_mask"], False)
+
+    def test_a_negative_prompt_of_another_length_is_refused(self) -> None:
+        # The same mask goes to the conditional and the unconditional pass, so
+        # it can only fit both when their text lengths agree.
+        built = self._record_attention_masks()
+        embeds_patch = patch.object(
+            self.service,
+            "_prompt_embeds_locked",
+            lambda _normalized, _report: {
+                "prompt": _FakeEmbeds("edit", text_tokens=512),
+                "negative": _FakeEmbeds("", text_tokens=256),
+            },
+        )
+        embeds_patch.start()
+        self.addCleanup(embeds_patch.stop)
+        with self.assertRaises(ValueError) as caught:
+            self._run(placement="full_gpu", text_attention_in_mask=True)
+        self.assertIn("256", str(caught.exception))
+        self.assertEqual(self.pipe_calls, [])
+        self.assertEqual(built, [])
+
+    def test_a_negative_prompt_of_the_same_length_gets_the_same_mask(self) -> None:
+        self.declare_distilled(None)
+        built = self._record_attention_masks()
+        self._run(placement="full_gpu", guidance_scale=7.0, text_attention_in_mask=True)
+        self.assertIsNotNone(self.pipe_calls[0]["negative_prompt_embeds"])
+        self.assertEqual(len(built), 1)
+        self.assertIn("attention_kwargs", self.pipe_calls[0])
+
+    def test_the_pipeline_drops_the_attention_mask_before_the_decode(self) -> None:
+        # diffusers keeps `pipe._attention_kwargs` after the call; the service
+        # must clear it, or the S x S mask stays on the device through the VAE
+        # decode and for as long as the pipeline stays resident.
+        self._record_attention_masks()
+        seen_at_decode: list[object] = []
+        decode = self.service._decode_locked
+
+        def _decode(pipe: object, latents_cpu: object, normalized: object) -> object:
+            seen_at_decode.append(pipe._attention_kwargs)
+            return decode(pipe, latents_cpu, normalized)
+
+        decode_patch = patch.object(self.service, "_decode_locked", _decode)
+        decode_patch.start()
+        self.addCleanup(decode_patch.stop)
+        self._run(placement="full_gpu", text_attention_in_mask=True)
+        self.assertIn("attention_kwargs", self.pipe_calls[0])
+        self.assertEqual(seen_at_decode, [None])
+        self.assertIsNone(self.pipe._attention_kwargs)
+
+    def test_a_failed_denoise_still_drops_the_attention_mask(self) -> None:
+        self._record_attention_masks()
+        self.pipe.raise_in_call = RuntimeError("denoise failed")
+        with self.assertRaises(RuntimeError):
+            self._run(placement="full_gpu", text_attention_in_mask=True)
+        self.assertIn("attention_kwargs", self.pipe_calls[0])
+        self.assertIsNone(self.pipe._attention_kwargs)
+
+    def test_an_empty_mask_is_refused_before_anything_loads(self) -> None:
+        # Without this early check the planner would refuse it only after the
+        # transformer load and the prompt encode.
+        built = self._record_attention_masks()
+        self.mask = np.zeros((128, 128), dtype=np.uint8)
+        with (
+            self.assertLogs(attention.log, level="WARNING") as captured,
+            self.assertRaises(ValueError) as caught,
+        ):
+            self._run(placement="full_gpu", text_attention_in_mask=True)
+        self.assertIn("нет ни одного токена", str(caught.exception))
+        self.assertTrue(any("mask_shape=(128, 128)" in line for line in captured.output))
+        self.assertEqual(self.order, [])
+        self.assertEqual(self.encodes, 0)
+        self.assertEqual(self.pipe_calls, [])
+        self.assertEqual(built, [])
+
+    def test_an_empty_mask_without_the_flag_is_not_refused_by_it(self) -> None:
+        self.mask = np.zeros((128, 128), dtype=np.uint8)
+        self._run(placement="full_gpu")
+        self.assertEqual(len(self.pipe_calls), 1)
 
     def test_a_reference_of_another_size_is_refused_before_anything_loads(self) -> None:
         with self.assertRaises(ValueError):

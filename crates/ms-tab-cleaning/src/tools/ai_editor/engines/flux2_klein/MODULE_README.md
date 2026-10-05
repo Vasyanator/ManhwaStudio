@@ -148,6 +148,16 @@ Queries the panel arms are one-shot and independent of the run: `.status`
 - **`mask_for_run` is the only place the working mode is decided** (`session.rs`): a
   painted mask travels verbatim with `whole_region = false`; an empty one becomes a
   SOLID mask, because the backend refuses `whole_region = true` otherwise.
+- **«Внимание только к маске» is a persisted CHOICE with an effective wire value**
+  (`text_attention_in_mask`, default on). `to_params` sends `setting && !whole_region`, and
+  the `.estimate` query sends `setting && mask_painted` (`to_estimate_params`) with the
+  painted state the host last handed `draw_run_options`; a change of that state re-arms the
+  forecast while the option is on, because the backend then adds the `attention_mask`
+  breakdown term. The backend echoes the effective value as a TOP-LEVEL response field,
+  deliberately outside `applied`: `apply_backend_flags` must never write it back, or a
+  whole-region run would switch the user's choice off. The checkbox is drawn only in
+  `draw_run_options` (pinned under «Обработать»), closed while no mask is painted
+  (`flux2_text_attention_block_reason`) and never locked by a run, like every other parameter.
 - **Marks travel as a SEPARATE REFERENCE by preference** (`marks_support` in
   `engine/mod.rs`): the host composites the user's marks over a copy of the region and
   hands it over as `RunMarks::Reference`; `run_input` checks it is the region's size and
@@ -207,7 +217,8 @@ Queries the panel arms are one-shot and independent of the run: `.status`
 - To change which marks modes the engine accepts or how a marks reference is validated,
   see `marks_support` and `run_input` in `engine/mod.rs`.
 - To change the progress bar's arithmetic, see `progress.rs`; to change how it looks, see
-  `ui/progress.rs`.
+  `ui/progress.rs`. The bar and the run status are drawn by `AiEngine::draw_progress`
+  (`draw_flux2_progress_section`), which the host pins above the scrolled parameters.
 - To change the run's undo history or the derived mask, see `session.rs`.
 - To change what the engine DOES when a control is pressed, see `engine/actions.rs`; to
   change what it keeps between frames, see `engine/mod.rs`.

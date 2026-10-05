@@ -9,11 +9,16 @@ panel and every block under it. This is the ONLY part of `flux2_klein` that draw
 exactly one frame, and the `draw` method whose ORDER is the design:
 
 ```
-progress bar -> run status -> the PROMPT block (English field, the one cache line, the
-translator and library toggles) -> «Сила изменения» -> the READINESS line -> three SIBLING
-collapsible sections («Установка модели» / «Память и скорость» / «Для экспертов»)
--> the mask note
+the PROMPT block (English field, the one cache line, the translator and library toggles)
+-> «Сила изменения» -> the READINESS line -> three SIBLING collapsible sections
+(«Установка модели» / «Память и скорость» / «Для экспертов») -> the mask note
 ```
+
+Two more parts are drawn OUTSIDE that scrolled body, in the sections the host pins around it:
+`draw_flux2_progress_section` (progress bar + run status, top, via `AiEngine::draw_progress`)
+and `draw_flux2_run_options` («Внимание только к маске», under «Обработать», via
+`AiEngine::draw_run_options`). They are free functions, not `Flux2PanelCtx` methods: they need
+the progress and one setting, not the whole panel borrow.
 
 Everything a user touches per edit is above the folds; everything set once per machine is
 inside them. No section wraps another and none is nested in another.
@@ -25,8 +30,8 @@ plain flag on `Flux2PanelCtx`, which the engine folds back at the end of the fra
 never work started from inside a widget closure.
 
 ## Files and submodules
-- `mod.rs`: `Flux2PanelCtx` and the panel body. Edit it to move a control between blocks
-  or to change the order of the panel.
+- `mod.rs`: `Flux2PanelCtx` and the panel body, plus the two pinned parts. Edit it to move a
+  control between blocks or to change the order of the panel.
 - `install.rs`: the source-mode switch, the editable model-path rows and their pickers,
   the derived paths of the download mode, and the whole Hugging Face download block — the
   ONLY file where the two checkpoints differ on screen. Also

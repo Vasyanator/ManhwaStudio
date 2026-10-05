@@ -20,8 +20,12 @@ Key structures:
 - `TabDrop`: a tab released over this panel's header strip.
 - `ChromeGate`: the pure rule deciding whether a transparent panel is visible.
 
+- `PanelSection`: which part of the body a `show_sections` callback draws.
+
 Key functions:
 - `CollapsiblePanel::show`: draws the panel and runs the active tab's body.
+- `CollapsiblePanel::show_sections`: the same with optional PINNED top/bottom
+  sections drawn inside the frame but outside the scroll area.
 
 Notes:
 - The panel is deliberately NOT movable by `egui::Area`: dragging is the dock's
@@ -87,6 +91,15 @@ Notes:
   from what the content asked for, every solver decision (a shrink, a manual
   size, another tab) becomes this tab's own request and the panel can never get
   smaller again.
+- Optional PINNED sections (`pinned_sections`) sit inside the frame but outside
+  the scroll area: top under the header, bottom under the scroll. They never
+  change the panel's solved height — they only shrink the scroll viewport — and
+  they land in the measured overhead, so the reported request equals the one
+  the same content would make inside the scroll. The bottom section is sized
+  from last frame's measurement (`pinned_bottom_estimate`), the dock's usual
+  one-frame lag. A pinned section that draws nothing costs no height, and the
+  frame itself never extends past the solved rect: the pinned-mode body is laid
+  out in a child `Ui` whose extent reaches the frame clamped to the rect.
 */
 
 use egui::scroll_area::ScrollBarVisibility;
@@ -169,6 +182,73 @@ pub struct MoveTargetEntry<'a> {
     pub label: &'a str,
 }
 
+/// Which part of an expanded panel's body a [`CollapsiblePanel::show_sections`]
+/// callback is asked to draw.
+///
+/// The body is ONE callback dispatched by section rather than three closures,
+/// because the driver's closures all borrow the same per-frame context `&mut C`
+/// and three of them could not coexist. Order on screen and in time: header ->
+/// [`PanelSection::PinnedTop`] -> [`PanelSection::Scroll`] ->
+/// [`PanelSection::PinnedBottom`]. A pinned section is asked for only when the
+/// panel was told it exists ([`CollapsiblePanel::pinned_sections`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PanelSection {
+    /// Drawn under the header, above the scroll area, never scrolled. A section
+    /// that draws nothing costs no height at all — not even the item spacing
+    /// after it (`pinned_section`).
+    PinnedTop,
+    /// The bounded `ScrollArea` every panel has; it shrinks by whatever the
+    /// pinned sections take.
+    Scroll,
+    /// Drawn under the scroll area, at the bottom of the panel, never scrolled.
+    /// Like the top section, drawing nothing costs no height.
+    PinnedBottom,
+}
+
+/// Height budget, in points, of a panel body's scroll viewport.
+///
+/// `body_top` is where the scroll area starts (under the header and any pinned
+/// top section), `body_bottom` the last point the frame's content may reach and
+/// `bottom_reserve` the room kept under the scroll area for a pinned bottom
+/// section (its last measured height plus the item spacing before it; `0.0`
+/// without one).
+///
+/// Without pinned sections the budget keeps the historical floor
+/// [`PANEL_MIN_BODY_HEIGHT`] — the solver never solves a panel below it, so the
+/// floor only matters on a frame whose chrome changed. With pinned sections the
+/// floor is `0.0`: the pinned parts are already outside the scroll, and a floor
+/// there would push the frame past its solved rect by up to that floor.
+fn scroll_budget(body_top: f32, body_bottom: f32, bottom_reserve: f32, has_pinned: bool) -> f32 {
+    let room = body_bottom - body_top - bottom_reserve;
+    if has_pinned {
+        room.max(0.0)
+    } else {
+        room.max(PANEL_MIN_BODY_HEIGHT)
+    }
+}
+
+/// Draws one pinned section into its own child of `ui` and allocates the
+/// section's extent in `ui` only when that extent is taller than zero. Returns
+/// the extent the section drew (zero-height when it drew nothing).
+///
+/// `Ui::scope` is not used because it ALWAYS advances the cursor, and egui adds
+/// `item_spacing` after every advance, even for an empty rect
+/// (`egui-0.36.2/src/ui.rs:1264`, `layout.rs:758`): a declared section that
+/// draws nothing would then cost one item spacing of scroll viewport and of
+/// reported request. The skipped auto id on that path keeps the ids of every
+/// widget after the section the same whether or not it drew something.
+fn pinned_section(ui: &mut egui::Ui, id_salt: &'static str, draw: impl FnOnce(&mut egui::Ui)) -> Rect {
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt(id_salt));
+    draw(&mut child);
+    let drawn = child.min_rect();
+    if drawn.height() > 0.0 {
+        ui.advance_cursor_after_rect(drawn);
+    } else {
+        ui.skip_ahead_auto_ids(1);
+    }
+    drawn
+}
+
 /// What the user did to a panel during one frame, plus what its content wants.
 ///
 /// The widget never mutates the layout model: the frame driver applies these
@@ -235,6 +315,15 @@ pub struct CollapsiblePanelOutput {
     /// as [`CollapsiblePanelOutput::header_strip`]: they carry the insertion
     /// index of a drop the widget itself could not sense.
     pub header_rects: Vec<Rect>,
+    /// Height, in points, the pinned bottom section drew this frame. `None` when
+    /// the panel has no pinned bottom section or did not draw its body
+    /// (collapsed, no active tab).
+    ///
+    /// The scroll viewport is sized BEFORE that section is drawn, from the
+    /// estimate passed in [`CollapsiblePanel::pinned_bottom_estimate`]; the
+    /// driver stores this value as next frame's estimate and asks for a repaint
+    /// when it moved — the dock's one-frame geometry model.
+    pub pinned_bottom_height: Option<f32>,
 }
 
 /// Draws one panel of a `DockLayout`.
@@ -255,6 +344,13 @@ pub struct CollapsiblePanel<'a> {
     transparent_until_hover: bool,
     force_visible: bool,
     move_targets: &'a [MoveTargetEntry<'a>],
+    /// Whether the body has a [`PanelSection::PinnedTop`] section.
+    pinned_top: bool,
+    /// Whether the body has a [`PanelSection::PinnedBottom`] section.
+    pinned_bottom: bool,
+    /// Height, in points, reserved under the scroll area for the pinned bottom
+    /// section — its height as measured last frame.
+    pinned_bottom_estimate: f32,
 }
 
 impl<'a> CollapsiblePanel<'a> {
@@ -277,7 +373,46 @@ impl<'a> CollapsiblePanel<'a> {
             transparent_until_hover: false,
             force_visible: false,
             move_targets: &[],
+            pinned_top: false,
+            pinned_bottom: false,
+            pinned_bottom_estimate: 0.0,
         }
+    }
+
+    /// Declares which pinned sections the body has (both `false` by default).
+    ///
+    /// A pinned section is drawn inside the panel's frame but OUTSIDE its
+    /// scroll area — [`PanelSection::PinnedTop`] under the header,
+    /// [`PanelSection::PinnedBottom`] at the bottom — so it stays visible
+    /// however far the body is scrolled. The panel does not get taller for
+    /// them: the solved rect is the same and only the scroll viewport shrinks.
+    /// The reported [`CollapsiblePanelOutput::measured_size`] is still
+    /// `overhead + scroll content`, with the pinned parts counted in the
+    /// measured overhead, which is the same total the panel would request with
+    /// all of it inside the scroll. Pinned sections are CONTENT: they never fade
+    /// with a transparent panel's chrome.
+    ///
+    /// With no pinned section the panel behaves exactly as it always has.
+    #[must_use]
+    pub fn pinned_sections(mut self, top: bool, bottom: bool) -> Self {
+        self.pinned_top = top;
+        self.pinned_bottom = bottom;
+        self
+    }
+
+    /// Height, in points, to reserve for the pinned bottom section — the
+    /// [`CollapsiblePanelOutput::pinned_bottom_height`] of the previous frame,
+    /// `0.0` before the first one. Ignored without a pinned bottom section.
+    ///
+    /// The bottom section is drawn AFTER the scroll area, so its height this
+    /// frame is not known when the viewport is sized. A section that grew since
+    /// last frame is clipped to the solved rect for that one frame rather than
+    /// painted over the neighbour below; the driver repaints and the next frame
+    /// reserves the new height.
+    #[must_use]
+    pub fn pinned_bottom_estimate(mut self, height: f32) -> Self {
+        self.pinned_bottom_estimate = if height.is_finite() { height.max(0.0) } else { 0.0 };
+        self
     }
 
     /// Whether this panel hides its own CHROME while the pointer is elsewhere.
@@ -403,11 +538,34 @@ impl<'a> CollapsiblePanel<'a> {
     /// header.
     ///
     /// `body` is called at most once, and never when the panel is collapsed or
-    /// has no active tab.
+    /// has no active tab. A panel with pinned sections is drawn with
+    /// [`CollapsiblePanel::show_sections`] instead; this is that call with the
+    /// [`PanelSection::Scroll`] section only.
     pub fn show(
         self,
         ctx: &egui::Context,
         body: impl FnOnce(&mut egui::Ui),
+    ) -> CollapsiblePanelOutput {
+        let mut body = Some(body);
+        self.show_sections(ctx, move |ui, section| {
+            if section == PanelSection::Scroll
+                && let Some(body) = body.take()
+            {
+                body(ui);
+            }
+        })
+    }
+
+    /// Draws the panel and, unless it is collapsed, runs `body` once per
+    /// section of the active tab, in screen order: [`PanelSection::PinnedTop`]
+    /// (only if declared), [`PanelSection::Scroll`], [`PanelSection::PinnedBottom`]
+    /// (only if declared) — see [`CollapsiblePanel::pinned_sections`].
+    ///
+    /// `body` is never called when the panel is collapsed or has no active tab.
+    pub fn show_sections(
+        self,
+        ctx: &egui::Context,
+        body: impl FnMut(&mut egui::Ui, PanelSection),
     ) -> CollapsiblePanelOutput {
         let area_id = egui::Id::new(("ms_panel_dock_panel", self.id_scope, self.id.get()));
         let outer_width = self.rect.width().max(PANEL_MIN_WIDTH);
@@ -431,7 +589,7 @@ impl<'a> CollapsiblePanel<'a> {
         &self,
         ui: &mut egui::Ui,
         outer_width: f32,
-        body: impl FnOnce(&mut egui::Ui),
+        mut body: impl FnMut(&mut egui::Ui, PanelSection),
     ) -> CollapsiblePanelOutput {
         // Decided BEFORE anything is painted: `egui::Frame` takes its colours as
         // builder arguments, so how faded the chrome is has to be known before
@@ -485,6 +643,12 @@ impl<'a> CollapsiblePanel<'a> {
         // stretched into a taller panel or is scrolling inside a shorter one.
         let mut body_budget_height = 0.0_f32;
         let mut body_content_height = 0.0_f32;
+        // Height the pinned bottom section drew this frame, when it ran.
+        let mut pinned_bottom_height: Option<f32> = None;
+        let has_pinned = self.pinned_top || self.pinned_bottom;
+        // Height of the pinned-mode body that lay below `body_bottom` and was
+        // therefore kept out of the frame (`0.0` when it fitted).
+        let mut clamped_overflow = 0.0_f32;
         // Drawn height of the header strip alone, without the frame margins.
         let mut header_height = 0.0_f32;
         // Laid-out rect of the header row, and of every tab header inside it.
@@ -554,17 +718,65 @@ impl<'a> CollapsiblePanel<'a> {
                 return;
             };
             ui.add_space(HEADER_BODY_SPACING);
-            // Exact budget: whatever is left of the solved rect once the header
-            // that was actually drawn and the frame's bottom margin are paid for.
-            // `Ui::cursor` is already advanced past the header and its spacing,
-            // so this is where the scroll area really starts.
-            let body_top = ui.cursor().top();
             // The frame's bottom stroke is paid for here for the same reason the
             // width is: it sits outside the inner margin, so a budget that
             // ignored it made the drawn panel one stroke taller than its rect.
             let body_bottom =
                 self.rect.bottom() - frame.inner_margin.bottomf() - frame.stroke.width;
-            let body_max_height = (body_bottom - body_top).max(PANEL_MIN_BODY_HEIGHT);
+            // Pinned sections are clipped to what the solved rect leaves inside
+            // the frame: on the one frame a pinned bottom section grew beyond
+            // last frame's estimate (or the rect is smaller than the pinned
+            // parts) its overflow must not be painted over the neighbour docked
+            // one gap below.
+            let pinned_clip = Rect::from_x_y_ranges(
+                self.rect.left()..=self.rect.right(),
+                self.rect.top()..=body_bottom.max(self.rect.top()),
+            );
+            // With pinned sections the whole body is laid out in ONE child `Ui`,
+            // which allocates nothing in the frame on its own
+            // (`egui-0.36.2/src/ui.rs:209`); the frame is advanced afterwards by
+            // the child's extent CLAMPED to `body_bottom`. `egui::Frame` paints
+            // its fill and border around everything its content allocated, so
+            // this clamp is what keeps the frame inside the solved rect on the
+            // frame a pinned bottom section grew past last frame's estimate, and
+            // for good when the rect is smaller than the pinned parts. The child
+            // is clipped to the same bound, so neither the frame nor any section
+            // paints over the neighbour one gap below. Without pinned sections
+            // the body goes straight into the frame's `Ui`, exactly as it always
+            // has.
+            let mut pinned_body: Option<egui::Ui> = None;
+            let body_ui: &mut egui::Ui = if has_pinned {
+                let child = pinned_body.insert(
+                    ui.new_child(egui::UiBuilder::new().id_salt("ms_panel_dock_pinned_body")),
+                );
+                child.shrink_clip_rect(pinned_clip);
+                child
+            } else {
+                &mut *ui
+            };
+            if self.pinned_top {
+                pinned_section(body_ui, "ms_panel_dock_pinned_top", |ui| {
+                    body(ui, PanelSection::PinnedTop);
+                });
+            }
+            // Exact budget: whatever is left of the solved rect once the header
+            // that was actually drawn, the pinned top section, the room reserved
+            // for the pinned bottom section and the frame's bottom margin are
+            // paid for. `Ui::cursor` is already advanced past the header, its
+            // spacing and the pinned top section, so this is where the scroll
+            // area really starts.
+            let body_top = body_ui.cursor().top();
+            // The bottom section starts one item spacing under the scroll area
+            // (egui advances the cursor by it after every allocation), so the
+            // reserve is its last measured height plus that spacing. A section
+            // that drew nothing last frame reserves nothing at all, spacing
+            // included: `pinned_section` does not allocate an empty section.
+            let bottom_reserve = if self.pinned_bottom && self.pinned_bottom_estimate > 0.0 {
+                self.pinned_bottom_estimate + body_ui.spacing().item_spacing.y
+            } else {
+                0.0
+            };
+            let body_max_height = scroll_budget(body_top, body_bottom, bottom_reserve, has_pinned);
             // THE SCROLL BARS ARE CHROME. They float OVER the body — an outline
             // around the content, not part of it — and a bar the user is
             // dragging stays fully lit (`interact_handle_opacity`) however far
@@ -575,10 +787,10 @@ impl<'a> CollapsiblePanel<'a> {
             // (`:1268`, `:1469-1519`), so fading the style here is the whole
             // fix. Restored INSIDE the body: a scroll area of the tab's own
             // content is content, and content never fades.
-            let unfaded_scroll = ui.spacing().scroll;
+            let unfaded_scroll = body_ui.spacing().scroll;
             let fade_bars = chrome_opacity < 1.0;
             if fade_bars {
-                ui.spacing_mut().scroll = faded_scroll_style(unfaded_scroll, chrome_opacity);
+                body_ui.spacing_mut().scroll = faded_scroll_style(unfaded_scroll, chrome_opacity);
             }
             let scroll = egui::ScrollArea::both()
                 .id_salt(("ms_panel_dock_body", self.id_scope, active.as_str()))
@@ -604,14 +816,14 @@ impl<'a> CollapsiblePanel<'a> {
                 // into the panel's size, because the measurement below is taken
                 // from the content, never from what the body was given.
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
+                .show(body_ui, |ui| {
                     if fade_bars {
                         ui.spacing_mut().scroll = unfaded_scroll;
                     }
-                    body(ui);
+                    body(ui, PanelSection::Scroll);
                 });
             if fade_bars {
-                ui.spacing_mut().scroll = unfaded_scroll;
+                body_ui.spacing_mut().scroll = unfaded_scroll;
             }
             // `ScrollAreaOutput::inner_rect` is the rect the body was given
             // BEFORE any auto-shrink adjustment (`scroll_area.rs:1040`), i.e.
@@ -619,6 +831,31 @@ impl<'a> CollapsiblePanel<'a> {
             // below the panel's overhead and nothing else.
             body_budget_height = scroll.inner_rect.height();
             body_content_height = scroll.content_size.y;
+            if self.pinned_bottom {
+                // After the scroll area, so it sits under it; its height is read
+                // back as next frame's reserve. Nothing here is faded: the scroll
+                // style was restored above, and a pinned section is content.
+                let footer = pinned_section(body_ui, "ms_panel_dock_pinned_bottom", |ui| {
+                    body(ui, PanelSection::PinnedBottom);
+                });
+                pinned_bottom_height = Some(footer.height());
+            }
+            if let Some(child) = pinned_body.take() {
+                let drawn = child.min_rect();
+                // The frame sees the body only down to `body_bottom` (see where
+                // `pinned_body` is created). What lies below it — a footer that
+                // outgrew its estimate, or pinned parts taller than the rect —
+                // is clipped, and is added back to the measured overhead below,
+                // so the request is the one the unclamped panel would make: a
+                // request that dipped for the one lag frame would make the
+                // solver shrink an auto-sized panel for a frame.
+                let shown_bottom = drawn.bottom().min(body_bottom).max(drawn.top());
+                clamped_overflow = drawn.bottom() - shown_bottom;
+                ui.advance_cursor_after_rect(Rect::from_x_y_ranges(
+                    drawn.x_range(),
+                    drawn.top()..=shown_bottom,
+                ));
+            }
         });
 
         let frame_rect = frame_response.response.rect;
@@ -670,7 +907,7 @@ impl<'a> CollapsiblePanel<'a> {
             // Width is reported as the width we were GIVEN, never as the drawn
             // one: feeding the drawn width back would add the frame margin to
             // the request on every frame and the panel would creep wider.
-            let overhead = (frame_rect.height() - body_budget_height).max(0.0);
+            let overhead = (frame_rect.height() + clamped_overflow - body_budget_height).max(0.0);
             Some(Vec2::new(outer_width, overhead + body_content_height))
         };
 
@@ -688,6 +925,7 @@ impl<'a> CollapsiblePanel<'a> {
             move_panel,
             header_strip,
             header_rects,
+            pinned_bottom_height,
         }
     }
 
@@ -1889,5 +2127,239 @@ mod tests {
         assert_eq!(header_grab_offset(rect, None), None);
         assert_eq!(header_grab_offset(rect, Some(Pos2::new(99.0, 70.0))), None);
         assert_eq!(header_grab_offset(rect, Some(Pos2::new(112.0, 81.0))), None);
+    }
+
+    #[test]
+    fn the_scroll_budget_keeps_its_floor_only_without_pinned_sections() {
+        // Room left: 300 - 100 - 50 = 150, the same with or without pinned parts.
+        assert_eq!(scroll_budget(100.0, 300.0, 50.0, true), 150.0);
+        assert_eq!(scroll_budget(100.0, 300.0, 0.0, false), 200.0);
+        // Not enough room: the historical floor without pinned sections, zero
+        // with them — the pinned parts already sit outside the scroll.
+        assert_eq!(scroll_budget(100.0, 110.0, 0.0, false), PANEL_MIN_BODY_HEIGHT);
+        assert_eq!(scroll_budget(100.0, 110.0, 50.0, true), 0.0);
+    }
+
+    /// Heights, in points, of the probe content one panel draws per section.
+    #[derive(Copy, Clone)]
+    struct ProbeContent {
+        top: Option<f32>,
+        scroll: f32,
+        bottom: Option<f32>,
+    }
+
+    /// What one probe frame observed.
+    struct Probe {
+        output: CollapsiblePanelOutput,
+        /// Sections the callback was asked for, in call order.
+        sections: Vec<PanelSection>,
+        /// Top of the scroll section's content.
+        scroll_top: f32,
+        /// The scroll section's visible viewport (its clip rect).
+        scroll_viewport: Rect,
+        /// Top of the pinned bottom section, when drawn.
+        bottom_top: Option<f32>,
+        item_spacing: f32,
+    }
+
+    /// Draws one panel at `rect` headlessly, three passes so egui's first-frame
+    /// sizing of a new `Area` is behind it, and reports the last pass.
+    fn probe(rect: Rect, content: ProbeContent, bottom_estimate: f32) -> Probe {
+        let ctx = egui::Context::default();
+        let mut last: Option<Probe> = None;
+        for _ in 0..3 {
+            let mut sections = Vec::new();
+            let mut scroll_top = f32::NAN;
+            let mut scroll_viewport = Rect::NOTHING;
+            let mut bottom_top = None;
+            let mut output = None;
+            let mut item_spacing = 0.0;
+            // `FullOutput` carries this test's paint output only; nothing is
+            // rendered, so dropping it is the whole intent.
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                item_spacing = ui.spacing().item_spacing.y;
+                let panel = CollapsiblePanel::new(PanelId::new(0), "probe")
+                    .geometry(SolvedPanel {
+                        rect,
+                        body_max_height: rect.height(),
+                        shrunk: false,
+                    })
+                    .pinned_sections(content.top.is_some(), content.bottom.is_some())
+                    .pinned_bottom_estimate(bottom_estimate);
+                let headers = [PanelTabHeader {
+                    id: TabId::new("probe_tab"),
+                    title: "probe",
+                }];
+                let panel = panel.tabs(&headers, Some(TabId::new("probe_tab")));
+                output = Some(panel.show_sections(ui.ctx(), |ui, section| {
+                    sections.push(section);
+                    let width = ui.available_width();
+                    match section {
+                        // A declared section of height `0.0` draws nothing at all.
+                        PanelSection::PinnedTop => {
+                            if let Some(height) = content.top.filter(|height| *height > 0.0) {
+                                ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+                            }
+                        }
+                        PanelSection::Scroll => {
+                            scroll_top = ui.cursor().top();
+                            scroll_viewport = ui.clip_rect();
+                            ui.allocate_exact_size(Vec2::new(width, content.scroll), Sense::hover());
+                        }
+                        PanelSection::PinnedBottom => {
+                            bottom_top = Some(ui.cursor().top());
+                            if let Some(height) = content.bottom.filter(|height| *height > 0.0) {
+                                ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+                            }
+                        }
+                    }
+                }));
+            })
+            .drop_without_applying_deltas();
+            if let Some(output) = output {
+                last = Some(Probe {
+                    output,
+                    sections,
+                    scroll_top,
+                    scroll_viewport,
+                    bottom_top,
+                    item_spacing,
+                });
+            }
+        }
+        last.expect("the probe panel is drawn on every pass")
+    }
+
+    fn probe_rect(height: f32) -> Rect {
+        Rect::from_min_size(Pos2::new(50.0, 40.0), Vec2::new(300.0, height))
+    }
+
+    #[test]
+    fn a_panel_without_pinned_sections_only_asks_for_the_scroll_body() {
+        let probe = probe(
+            probe_rect(300.0),
+            ProbeContent { top: None, scroll: 100.0, bottom: None },
+            0.0,
+        );
+        assert_eq!(probe.sections, vec![PanelSection::Scroll]);
+        assert_eq!(probe.output.pinned_bottom_height, None);
+        assert!((probe.output.rect.height() - 300.0).abs() < 0.5, "{:?}", probe.output.rect);
+    }
+
+    #[test]
+    fn pinned_sections_keep_the_panel_height_and_shrink_the_scroll() {
+        let (top, bottom) = (30.0, 40.0);
+        let rect = probe_rect(400.0);
+        let plain = probe(rect, ProbeContent { top: None, scroll: 1000.0, bottom: None }, 0.0);
+        let pinned = probe(
+            rect,
+            ProbeContent { top: Some(top), scroll: 1000.0, bottom: Some(bottom) },
+            bottom,
+        );
+        assert_eq!(
+            pinned.sections,
+            vec![PanelSection::PinnedTop, PanelSection::Scroll, PanelSection::PinnedBottom]
+        );
+        // The panel is exactly as tall as it was solved — no taller for the
+        // pinned parts.
+        assert!((pinned.output.rect.height() - plain.output.rect.height()).abs() < 0.5);
+        assert!((pinned.output.rect.height() - 400.0).abs() < 0.5);
+        assert_eq!(pinned.output.pinned_bottom_height, Some(bottom));
+        // The scroll starts under the pinned top section…
+        let spacing = pinned.item_spacing;
+        assert!((pinned.scroll_top - (plain.scroll_top + top + spacing)).abs() < 0.5);
+        // …and the bottom section sits fully inside the solved rect.
+        let bottom_top = pinned.bottom_top.expect("the pinned bottom section ran");
+        assert!(bottom_top + bottom <= rect.bottom() + 0.5, "{bottom_top} + {bottom} > {rect:?}");
+        // The scroll viewport is whatever is left between the two.
+        let viewport = bottom_top - spacing - pinned.scroll_top;
+        assert!(viewport > 0.0 && viewport < 400.0 - top - bottom, "{viewport}");
+    }
+
+    #[test]
+    fn pinned_sections_do_not_inflate_the_reported_request() {
+        let (top, scroll, bottom) = (30.0, 100.0, 40.0);
+        let rect = probe_rect(400.0);
+        let pinned = probe(
+            rect,
+            ProbeContent { top: Some(top), scroll, bottom: Some(bottom) },
+            bottom,
+        );
+        // The same three blocks stacked INSIDE the scroll body, as a tab without
+        // pinned sections draws them: top, gap, content, gap, bottom.
+        let spacing = pinned.item_spacing;
+        let all_in = probe(
+            rect,
+            ProbeContent { top: None, scroll: top + spacing + scroll + spacing + bottom, bottom: None },
+            0.0,
+        );
+        let pinned_request = pinned.output.measured_size.expect("expanded panel").y;
+        let all_in_request = all_in.output.measured_size.expect("expanded panel").y;
+        assert!(
+            (pinned_request - all_in_request).abs() < 0.5,
+            "pinned {pinned_request} vs all-in-scroll {all_in_request}"
+        );
+    }
+
+    #[test]
+    fn a_rect_smaller_than_the_pinned_parts_clamps_the_scroll_to_zero() {
+        let (top, bottom) = (30.0, 40.0);
+        let probe = probe(
+            probe_rect(80.0),
+            ProbeContent { top: Some(top), scroll: 100.0, bottom: Some(bottom) },
+            bottom,
+        );
+        let bottom_top = probe.bottom_top.expect("the pinned bottom section ran");
+        let viewport = bottom_top - probe.item_spacing - probe.scroll_top;
+        assert!(viewport.abs() < 0.5, "the scroll viewport must clamp at zero, got {viewport}");
+        // The frame itself stays inside the solved rect; the pinned parts that
+        // do not fit are clipped, not painted over the neighbour.
+        let rect = probe_rect(80.0);
+        assert!(probe.output.rect.bottom() <= rect.bottom() + 0.5, "{:?} vs {rect:?}", probe.output.rect);
+    }
+
+    #[test]
+    fn declared_but_empty_pinned_sections_cost_nothing() {
+        let rect = probe_rect(300.0);
+        let plain = probe(rect, ProbeContent { top: None, scroll: 100.0, bottom: None }, 0.0);
+        let plain_request = plain.output.measured_size.expect("expanded panel").y;
+        for (top, bottom) in [(Some(0.0), None), (None, Some(0.0)), (Some(0.0), Some(0.0))] {
+            let empty = probe(rect, ProbeContent { top, scroll: 100.0, bottom }, 0.0);
+            let request = empty.output.measured_size.expect("expanded panel").y;
+            assert!(
+                (request - plain_request).abs() < 0.01,
+                "{top:?}/{bottom:?}: request {request} vs {plain_request}"
+            );
+            assert!(
+                (empty.scroll_top - plain.scroll_top).abs() < 0.01,
+                "{top:?}/{bottom:?}: scroll top {} vs {}",
+                empty.scroll_top,
+                plain.scroll_top
+            );
+            assert_eq!(empty.scroll_viewport, plain.scroll_viewport, "{top:?}/{bottom:?}");
+            assert_eq!(empty.output.rect, plain.output.rect, "{top:?}/{bottom:?}");
+            if bottom.is_some() {
+                assert_eq!(empty.output.pinned_bottom_height, Some(0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn a_footer_that_outgrew_its_estimate_keeps_the_frame_in_the_rect() {
+        let (scroll, bottom) = (1000.0, 40.0);
+        let rect = probe_rect(300.0);
+        // The lag frame: nothing reserved, so the footer lands under a full
+        // viewport and past the rect.
+        let grown = probe(rect, ProbeContent { top: None, scroll, bottom: Some(bottom) }, 0.0);
+        assert!(grown.output.rect.bottom() <= rect.bottom() + 0.5, "{:?} vs {rect:?}", grown.output.rect);
+        assert_eq!(grown.output.pinned_bottom_height, Some(bottom));
+        // The request is already the settled one, so the solver sees no dip.
+        let settled = probe(rect, ProbeContent { top: None, scroll, bottom: Some(bottom) }, bottom);
+        let grown_request = grown.output.measured_size.expect("expanded panel").y;
+        let settled_request = settled.output.measured_size.expect("expanded panel").y;
+        assert!(
+            (grown_request - settled_request).abs() < 0.5,
+            "lag frame {grown_request} vs settled {settled_request}"
+        );
     }
 }

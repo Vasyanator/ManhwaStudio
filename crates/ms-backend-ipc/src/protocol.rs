@@ -45,7 +45,7 @@ use serde_json::{Map, Value, json};
 /// The contract also covers state the two processes SHARE on disk: the `user_config`
 /// document's storage semantics (`ms-docstore` / `docstore.py`, `.json` or SQLite `.db`).
 /// A backend payload that reads/writes it differently must be refused here.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 // ============================================================================
 // FRAME SIZE GUARDS

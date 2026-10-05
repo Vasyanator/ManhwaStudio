@@ -156,7 +156,7 @@ live in `handlers/MODULE_README.md`.
     the Rust supervisor to parse. Each transport option also has an environment fallback
     (`MS_BACKEND_TRANSPORT` / `WS_HOST` / `WS_PORT` / `WS_TOKEN`); the CLI flag wins.
   - An unknown `transport` value is a `ValueError`, never a silent fall back to `unix`.
-- The frame protocol version is 4 (`PROTOCOL_VERSION`; it also covers the shared on-disk `user_config` storage semantics of `docstore.py`). A client with a different `v` is rejected
+- The frame protocol version is 6 (`PROTOCOL_VERSION`; it also covers the shared on-disk `user_config` storage semantics of `docstore.py`). A client with a different `v` is rejected
   at handshake with a `kind:"error"` frame before any request.
 - Image bytes are never base64-encoded on the wire. Request blobs carry raw PNG input; response
   blobs carry raw PNG output (masks, inpaint results, SDXL previews). The text-detector forward

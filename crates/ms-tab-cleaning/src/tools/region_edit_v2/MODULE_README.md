@@ -74,8 +74,8 @@ that owns the context, the canvas and the project at once:
   `FrameOutcome`, `FrameButtons`, `PaintTarget` (mask or marks), the two brushes, the marks
   colour and the Ctrl+drag marks rectangle.
 - `engine.rs`: the `AiEngine` trait (`EngineSection`, `EngineRunRequest`, `EnginePoll`,
-  `MaskLayerSpec` re-exported from `layers`, `MarksMode` / `MarksSupport` / `RunMarks` and the
-  pure `composite_marks_over`), plus `violation_text` — the ONE mapping from a
+  `MaskLayerSpec` re-exported from `layers`, `MarksMode` / `MarksSupport` / `RunMarks`,
+  `RunOptionsCtx` and the pure `composite_marks_over`), plus `violation_text` — the ONE mapping from a
   `SizeViolation` to its sentence — and `region_size_refusal`, the engines' run-path size
   re-check built on it. Mask generation is deliberately ABSENT from the trait: it is the host's.
 - `engine_settings.rs`: pure, engine-agnostic helpers for an engine's own settings file —
@@ -299,11 +299,15 @@ The split of duties is fixed: an ENGINE owns its parameters, its settings file, 
 protocol, its worker threads and its OWN progress bar (no shared progress vocabulary — design
 §13.2 D13); the HOST owns the rectangle, the mask stack, the source region, mask GENERATION into
 that stack, the pending result and the apply path, and learns only Running / Done / Failed.
+The host also decides WHERE the engine's parts are drawn (§13.3 pinned-panel amendment).
 
 ```
 CleaningTool::draw_ui           compact panel: engine picker, mask/marks switch, brush and marks
                                 colour, mask layer, mask generation, mask actions, marks mode
-CleaningTool::draw_main_panel   «Редактор области»: engine.draw_parameters + host actions
+CleaningTool::draw_main_panel_top     «Редактор области», pinned top: engine.draw_progress
+CleaningTool::draw_main_panel         «Редактор области», scrolled: engine.draw_parameters
+CleaningTool::draw_main_panel_bottom  «Редактор области», pinned bottom: host actions
+                                      (draw_host_actions), then engine.draw_run_options(RunOptionsCtx)
 CleaningTool::draw_overlay_ui   the per-frame pass (order below), the run, the generation, the apply
 CleaningTool::on_key_event      `-` / `=` / `+` on the active brush, for the pointer OUTSIDE the frame
 CleaningTool::on_wheel_event    Shift+wheel on the active brush, for the pointer OUTSIDE the frame
@@ -341,6 +345,16 @@ produced by `base.rs::spawn_region_loader_thread`, reused rather than copied (D1
 instance owns one such worker and sends `None` and joins it on drop.
 
 Host contracts:
+- **The main panel has three sections and the panel's height does not depend on them.** The
+  cleaning tab declares «Редактор области» with a pinned top (`draw_main_panel_top` ->
+  `AiEngine::draw_progress`) and a pinned bottom (`draw_main_panel_bottom` -> the separator,
+  `draw_host_actions`, then `AiEngine::draw_run_options`) around the scrolled
+  `draw_main_panel` (-> `draw_parameters`). Both pinned parts stay visible however far the
+  parameters scroll; the dock keeps the solved height and only the scroll viewport shrinks
+  (`ms_widgets::panel_dock`, «Pinned sections»). An engine draws its progress ONLY in
+  `draw_progress` (nothing while idle, so the scroll gets the room back) and only per-run
+  options in `draw_run_options`. `RunOptionsCtx::mask_painted` is `!MaskStack::is_empty()` —
+  the marks never count.
 - **Only the spec differs between hosted tools.** `tool_id`, `title`, `log_tag`, both id salts and
   `catalog` come from the `HostSpec`; a salt must be unique per tool (two tools sharing one share
   stored widget state) and frozen once shipped (changing it resets that state).

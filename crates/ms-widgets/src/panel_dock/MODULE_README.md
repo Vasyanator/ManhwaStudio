@@ -141,6 +141,39 @@ twice per frame.
 `egui::Resize` is deliberately NOT used: its size lives in egui memory, which is exactly what forced
 the `id_salt`-revision hack in the old typing panels. Sizes live in `PanelNode::size_override`.
 
+### Pinned sections
+A tab may queue up to two more closures next to its body: `PanelTab::pinned_top` (under the header)
+and `PanelTab::pinned_bottom` (at the bottom of the panel). Both are drawn inside the panel's frame
+but OUTSIDE the scroll area, so they never scroll out of view (first consumer: the cleaning tab's
+«Редактор области» — engine progress on top, the «Обработать» section at the bottom). The panel
+draws them through `CollapsiblePanel::show_sections`, ONE callback dispatched by `PanelSection`,
+because all three closures borrow the same `&mut C`. Rules:
+
+* **They never change the panel's height.** The solved rect is the same; only the scroll viewport
+  gets shorter. The reported request stays `overhead + scroll content`, and the pinned parts are
+  measured as part of that overhead, so the request equals what the same content would ask for
+  inside the scroll — they are never folded into the global `PanelChrome`.
+* **The bottom section lags one frame.** The viewport is sized before that section is drawn, from
+  the height it drew LAST frame (`PanelDockState::pinned_bottom_heights`, keyed like `measured`);
+  a change of at least `MEASUREMENT_EPSILON` repaints. No lag-free form exists in egui 0.36.2
+  without drawing the section twice: a bottom-up child layout places a vertical group at the TOP of
+  its rect, and `egui::Panel` keeps last frame's size in memory as well.
+* **An empty section costs nothing.** A section that draws nothing allocates nothing, not even
+  the item spacing after it (`pinned_section` in `panel.rs`; `Ui::scope` would always advance by
+  one spacing), so a declared-but-empty section leaves the scroll viewport and the request exactly
+  as without it; the bottom reserve is zero while last frame's footer was empty.
+* **Nothing is drawn outside the solved rect, frame included.** With pinned sections the whole
+  body is laid out in one child `Ui` that reaches the frame only CLAMPED to the rect's inner
+  bottom, and that child is clipped there. So on the lag frame of a growing footer, or in a rect
+  below the pinned parts' height, the frame's fill and border and every section stay inside the
+  rect; the clipped part is added back to the measured overhead, so the request does not dip for
+  that frame. Too small a rect clamps the viewport at zero (no `PANEL_MIN_BODY_HEIGHT` floor once
+  a pinned section exists) and cuts the bottom of the pinned parts; a `min_size` that fits them
+  keeps them whole but is not needed for correctness.
+* **They are content.** Never faded by a transparent panel, never part of the gesture zones.
+* A tab without pinned sections is drawn exactly as before (`CollapsiblePanel::show` is
+  `show_sections` with the scroll section only).
+
 ## Files and submodules
 - `mod.rs`: the public re-export surface, `PanelDockState`, `DockArea`, `PanelDock`,
   `PanelDockOutput`, and the three pure frame-planning helpers (`ensure_declared_tabs`,
@@ -892,6 +925,8 @@ content.
   `draw_host`. Both rules are pure and unit-tested — keep them that way rather than growing a
   condition inside the drawing loop.
 - To change what a caller may declare about a tab, edit `tab.rs` and the `TabMeta` it fills in
+  `mod.rs`. Pinned sections: the budget split is `scroll_budget` / `CollapsiblePanel::contents`
+  in `panel.rs`, the per-tab height cache and the repaint rule (`pinned_height_changed`) are in
   `mod.rs`.
 - To change the frame model (which sizes are fed to the solver, which panels are solved, which tab
   is drawn, when a repaint is requested), edit `plan_frame` / `frame_layout` / `PanelDock::end` in

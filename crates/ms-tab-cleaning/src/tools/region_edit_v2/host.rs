@@ -34,6 +34,10 @@ Key structures:
 
 Key functions:
 - `RegionEditHost::new()`: builds the host for one `HostSpec`
+- `draw_main_panel_top()` / `draw_main_panel()` / `draw_main_panel_bottom()`: the three
+  sections of the «Редактор области» panel — engine progress (pinned), engine parameters
+  (scrolled), host actions + engine run options (pinned)
+- `run_options_ctx()`: the host facts handed to `AiEngine::draw_run_options`
 - `start_run()`, `poll_region_load()`, `poll_engine()`: the three steps of one run
 - `apply_result()`: the only `&mut CanvasView` action
 - `select_engine()`: applies an engine's constraints and mask layers to the frame
@@ -42,9 +46,11 @@ Key functions:
 - `reconcile_marks_mode()`, `prepare_run_marks()`: the marks-mode rules, pure and unit-tested
 
 Notes:
-The panel bodies (`draw_ui` / `draw_main_panel` halves) live in the sibling `host_panels.rs`,
-which is why the fields and helpers they read are `pub(super)`: nothing else in the framework
-touches them. NOTHING here decodes an image on the GUI thread: the source region is produced by
+The `CleaningTool` panel entry points (`draw_ui`, `draw_main_panel` and its pinned
+`draw_main_panel_top` / `draw_main_panel_bottom`) stay here as short dispatchers; the section
+helpers they call (engine picker, brush, layers, mask generation and actions, the
+`draw_host_actions` «Обработать» section) live in the sibling `host_panels.rs`, which is why the
+fields and helpers those read are `pub(super)`: nothing else in the framework touches them. NOTHING here decodes an image on the GUI thread: the source region is produced by
 the shared region loader worker of `base.rs` (`spawn_region_loader_thread`, reused rather than
 copied, D10/D14), and the engine runs its own workers. `block_canvas_zoom()` stays `false` (D5):
 that flag also disables the clean-overlay undo shortcuts for the whole session. Blocking is
@@ -54,7 +60,9 @@ precise instead — `captures_canvas_pointer` over the hitbox,
 Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§13).
 */
 
-use super::engine::{AiEngine, EnginePoll, EngineRunRequest, MarksMode, MarksSupport, RunMarks, composite_marks_over};
+use super::engine::{
+    AiEngine, EnginePoll, EngineRunRequest, MarksMode, MarksSupport, RunMarks, RunOptionsCtx, composite_marks_over,
+};
 use super::frame::{FrameHost, FrameLock, RegionFrame, page_source_size};
 use super::geometry::FrameConstraints;
 use super::layers::ResultLayer;
@@ -500,6 +508,15 @@ impl RegionEditHost {
     /// The selected engine, mutably. `None` when the catalog is empty.
     fn engine_mut(&mut self) -> Option<&mut (dyn AiEngine + 'static)> {
         self.engines.get_mut(self.selected).map(AsMut::as_mut)
+    }
+
+    /// The host facts the engine's pinned run options depend on this frame.
+    ///
+    /// `mask_painted` is the MASK stack's answer, never the marks': it is exactly the question
+    /// «Обработать» and an engine's working mode ask (FLUX.2 klein's whole-region mode is "no
+    /// mask pixel painted"), and the marks never act as a permission mask.
+    pub(super) fn run_options_ctx(&self) -> RunOptionsCtx {
+        RunOptionsCtx { mask_painted: !self.frame.masks().is_empty() }
     }
 
     /// Why the selected engine says a switch is unsafe right now; `None` when it is free.
@@ -1186,8 +1203,9 @@ impl CleaningTool for RegionEditHost {
         true
     }
 
-    /// The main part, in the «Редактор области» dock panel: the selected engine's own
-    /// parameters, and the host actions and status under them (§13.1).
+    /// The scrolled middle of the «Редактор области» dock panel: the selected engine's own
+    /// parameters (§13.1). Its progress is pinned above it (`draw_main_panel_top`) and the
+    /// host actions under it (`draw_main_panel_bottom`), both outside the scroll.
     ///
     /// It runs inside `CanvasView::draw` and therefore mutates only the tool: every action
     /// raises a flag the frame consumes at the top of the next pass, re-checked against the
@@ -1199,8 +1217,25 @@ impl CleaningTool for RegionEditHost {
                 ui.colored_label(ui.visuals().error_fg_color, t!("cleaning.tools.area_editor.error_no_engine"));
             }
         }
+    }
+
+    /// The pinned top of the main panel: the selected engine's own progress (D13 — the engine
+    /// owns it, the host only decides where it sits). Nothing without an engine.
+    fn draw_main_panel_top(&mut self, ui: &mut egui::Ui) {
+        if let Some(engine) = self.engine_mut() {
+            engine.draw_progress(ui);
+        }
+    }
+
+    /// The pinned bottom of the main panel: the host's «Обработать» section and, under it,
+    /// the engine's per-run options with the facts they depend on (`run_options_ctx`).
+    fn draw_main_panel_bottom(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         self.draw_host_actions(ui);
+        let ctx = self.run_options_ctx();
+        if let Some(engine) = self.engine_mut() {
+            engine.draw_run_options(ui, ctx);
+        }
     }
 
     fn set_ai_backend_available(&mut self, available: bool) {
@@ -1753,6 +1788,11 @@ mod tests {
         /// The region and the marks of the last started run.
         run_region: Option<egui::ColorImage>,
         run_marks: Option<RunMarks>,
+        /// How often each panel section of the engine was drawn.
+        parameter_draws: usize,
+        progress_draws: usize,
+        /// The context of every `draw_run_options` call, in order.
+        run_options: Vec<RunOptionsCtx>,
     }
 
     /// A minimal `AiEngine` that records what the host does to it and answers whatever the
@@ -1820,7 +1860,15 @@ mod tests {
         fn allows_empty_mask(&self) -> bool {
             false
         }
-        fn draw_parameters(&mut self, _ui: &mut egui::Ui) {}
+        fn draw_parameters(&mut self, _ui: &mut egui::Ui) {
+            self.calls.borrow_mut().parameter_draws += 1;
+        }
+        fn draw_progress(&mut self, _ui: &mut egui::Ui) {
+            self.calls.borrow_mut().progress_draws += 1;
+        }
+        fn draw_run_options(&mut self, _ui: &mut egui::Ui, ctx: RunOptionsCtx) {
+            self.calls.borrow_mut().run_options.push(ctx);
+        }
         fn run_block_reason(&self) -> Option<String> {
             None
         }
@@ -1914,6 +1962,43 @@ mod tests {
             tool.poll_engine(&ctx);
         }
         assert_eq!(calls.borrow().polls, 3, "one poll per frame, unconditionally");
+    }
+
+    /// The three sections of the main panel reach the engine's three draw methods, each
+    /// exactly once — the progress is drawn ONLY in the pinned top, never again inside the
+    /// scrolled parameters.
+    #[test]
+    fn each_main_panel_section_draws_its_own_engine_part() {
+        let ctx = egui::Context::default();
+        let (mut tool, calls) = tool_with_recording_engine(EnginePoll::Idle);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            tool.draw_main_panel_top(ui);
+            tool.draw_main_panel(ui);
+            tool.draw_main_panel_bottom(ui);
+        })
+        .drop_without_applying_deltas();
+        let calls = calls.borrow();
+        assert_eq!((calls.progress_draws, calls.parameter_draws, calls.run_options.len()), (1, 1, 1));
+    }
+
+    /// `mask_painted` is the MASK stack's answer: marks alone leave it `false` (they never
+    /// permit an edit), and one painted mask pixel turns it `true`.
+    #[test]
+    fn the_run_options_learn_whether_a_mask_is_painted() {
+        let ctx = egui::Context::default();
+        let (mut tool, calls) = tool_with_recording_engine(EnginePoll::Idle);
+        tool.frame.place_for_test(0, rect(0, 0, 4, 4));
+        let draw = |tool: &mut RegionEditHost| {
+            ctx.run_ui(egui::RawInput::default(), |ui| tool.draw_main_panel_bottom(ui))
+                .drop_without_applying_deltas();
+        };
+        draw(&mut tool);
+        tool.frame.masks_mut().paint_marks_segment((1, 1), (1, 1), 1, Color32::RED, false);
+        draw(&mut tool);
+        tool.frame.masks_mut().paint_segment((2, 2), (2, 2), 1, false);
+        draw(&mut tool);
+        let painted: Vec<bool> = calls.borrow().run_options.iter().map(|ctx| ctx.mask_painted).collect();
+        assert_eq!(painted, vec![false, false, true]);
     }
 
     /// A failed run releases the frame and is reported to the user; it must not leave the

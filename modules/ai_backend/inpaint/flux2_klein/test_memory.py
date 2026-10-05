@@ -15,7 +15,9 @@ Main responsibilities:
   placement preset that would fit;
 - verify `estimate` answers without loading anything;
 - verify a marks reference adds exactly the region's token count to the denoise
-  and reaches the guard.
+  and reaches the guard;
+- verify `text_attention_in_mask` adds its attention mask to the denoise device
+  term only, and nothing under `whole_region`.
 
 Notes:
 `_weight_bytes` is patched on `components` and `memory_snapshot` on `hardware`:
@@ -500,6 +502,46 @@ class EstimateTests(_TempTreeCase):
                 self.assertEqual(marked["phases"][phase], plain["phases"][phase])
         self.assertEqual(
             marked["phases"]["denoise"]["ram_bytes"], plain["phases"]["denoise"]["ram_bytes"]
+        )
+
+    def test_text_attention_in_mask_adds_its_mask_to_the_denoise_device_only(self) -> None:
+        # One additive (S, S) mask over the REAL joint sequence: the text padded
+        # to `max_sequence_length`, the noisy tokens, the region's clean copy and
+        # the reference — computed by the same formula the run allocates by.
+        plain = svc.normalize_flux2_klein_params(self.params(placement="full_gpu"))
+        masked = svc.normalize_flux2_klein_params(
+            self.params(placement="full_gpu", text_attention_in_mask=True)
+        )
+        tokens = (256 // svc.REGION_SIZE_MULTIPLE) * (128 // svc.REGION_SIZE_MULTIPLE)
+        for with_reference in (False, True):
+            with self.subTest(with_reference=with_reference):
+                base = svc.forecast_memory(plain, 256, 128, with_reference=with_reference)
+                out = svc.forecast_memory(masked, 256, 128, with_reference=with_reference)
+                reference = tokens if with_reference else 0
+                expected = svc.text_attention_mask_bytes(512, tokens, reference, "bfloat16")
+                sequence = 512 + 2 * tokens + reference
+                self.assertEqual(expected, sequence * (-(-sequence // 8) * 8) * 2)
+                self.assertEqual(
+                    out["phases"]["denoise"]["vram_bytes"],
+                    base["phases"]["denoise"]["vram_bytes"] + expected,
+                )
+                self.assertEqual(out["breakdown"]["attention_mask"], expected)
+                self.assertNotIn("attention_mask", base["breakdown"])
+                self.assertEqual(
+                    out["phases"]["denoise"]["ram_bytes"], base["phases"]["denoise"]["ram_bytes"]
+                )
+                for phase in ("encode", "encode_standalone", "decode"):
+                    self.assertEqual(out["phases"][phase], base["phases"][phase])
+
+    def test_text_attention_in_mask_costs_nothing_under_whole_region(self) -> None:
+        # Normalization forces the flag off there, so the forecast must not
+        # reserve memory for a mask the run will never build.
+        plain = svc.normalize_flux2_klein_params(self.params(whole_region=True))
+        asked = svc.normalize_flux2_klein_params(
+            self.params(whole_region=True, text_attention_in_mask=True)
+        )
+        self.assertEqual(
+            svc.forecast_memory(asked, 256, 128), svc.forecast_memory(plain, 256, 128)
         )
 
     def test_without_an_encoder_the_encode_phases_cost_nothing(self) -> None:

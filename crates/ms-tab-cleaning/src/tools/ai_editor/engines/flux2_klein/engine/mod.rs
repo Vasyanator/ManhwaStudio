@@ -149,6 +149,16 @@ pub struct Flux2KleinEngine {
     /// for the geometry, only by a SETTLED region SIZE change ([`AiEngine::set_region`]), so
     /// the forecast follows the controls without flooding the IPC from scrolling or dragging.
     pub(super) estimate_wanted: bool,
+    /// Whether a mask pixel was painted, as the host reported it the last time it drew the
+    /// panel's run options ([`AiEngine::draw_run_options`]). Only the `.estimate` query reads
+    /// it — whether «Внимание только к маске» is in effect moves the forecast — and a stale
+    /// value costs at most one forecast; the RUN derives its mode from the mask it is handed.
+    /// It goes stale whenever the panel is not drawn: while «Редактор области» is collapsed
+    /// or hidden, painting or clearing the mask does not reach it, so an `.estimate`
+    /// dispatched by something else (a settled resize, a settings load) forecasts with the
+    /// old attention-mask term until the panel is drawn again and the change re-arms the
+    /// query. Bounded, accepted: one wrong forecast, never a wrong run.
+    pub(super) mask_painted: bool,
     pub(super) unload_rx: Option<Receiver<Result<(), String>>>,
     pub(super) unload_status: Option<String>,
     /// The per-component action (load / unload / move / warm up) that may be in flight.
@@ -303,6 +313,7 @@ impl Flux2KleinEngine {
             picker_rx: None,
             picker: None,
             progress: Arc::new(Mutex::new(Flux2Progress::default())),
+            mask_painted: false,
             ai_backend_available: false,
             prompt_library_open: false,
             install_section_seeded: false,
@@ -566,9 +577,10 @@ impl Flux2KleinEngine {
             return;
         }
         self.estimate_wanted = false;
-        // The forecast is about memory, which the working mode does not move: the peak is
-        // set by the weights and the region size, not by which pixels the mask permits.
-        let params = self.settings.normalized().to_params(false);
+        // The forecast is about memory, which the working mode barely moves: the peak is set
+        // by the weights and the region size, not by which pixels the mask permits. The one
+        // exception is the prompt-attention mask, counted while it is in effect.
+        let params = self.settings.normalized().to_estimate_params(self.mask_painted);
         let (tx, rx) = mpsc::channel();
         self.estimate_rx = Some(rx);
         thread::spawn(move || {
@@ -859,9 +871,7 @@ impl AiEngine for Flux2KleinEngine {
                 download_check_error,
                 download_rx,
                 download_status,
-                progress,
                 ai_backend_available,
-                run_status,
                 ..
             } = self;
             let mut panel = Flux2PanelCtx {
@@ -899,8 +909,6 @@ impl AiEngine for Flux2KleinEngine {
                 download_check_busy: download_check_rx.is_some(),
                 download_busy: download_rx.is_some(),
                 download_status: download_status.as_deref(),
-                progress,
-                run_status: run_status.as_deref(),
                 ai_backend_available: *ai_backend_available,
                 settings_changed: &mut settings_changed,
                 want_status: &mut want_status,
@@ -986,6 +994,32 @@ impl AiEngine for Flux2KleinEngine {
     /// cannot start, while a `.prompt_cache.build`, a `.component_action` or a
     /// multi-hour model download genuinely blocks the next one — it holds the backend's
     /// one pipeline and the single progress bar a starting run would steal.
+    /// The progress every long operation of this engine shares and the last run's outcome,
+    /// pinned above the parameters.
+    fn draw_progress(&mut self, ui: &mut egui::Ui) {
+        draw_flux2_progress_section(ui, &self.progress, self.run_status.as_deref());
+    }
+
+    /// «Внимание только к маске», pinned under «Обработать». A change of the painted state
+    /// re-arms the forecast while the option is on, because it moves the attention-mask term.
+    fn draw_run_options(&mut self, ui: &mut egui::Ui, ctx: RunOptionsCtx) {
+        if self.mask_painted != ctx.mask_painted {
+            self.mask_painted = ctx.mask_painted;
+            if self.settings.text_attention_in_mask {
+                self.estimate_wanted = true;
+            }
+        }
+        // Same per-variant id namespace as the parameter body.
+        let changed = ui
+            .push_id(self.variant.wire(), |ui| {
+                draw_flux2_run_options(ui, &mut self.settings.text_attention_in_mask, ctx)
+            })
+            .inner;
+        if changed {
+            self.note_settings_changed();
+        }
+    }
+
     fn run_block_reason(&self) -> Option<String> {
         if self.non_run_pipeline_busy() {
             return Some(t!("cleaning.tools.flux2_klein.pipeline_busy_error").to_string());

@@ -15,7 +15,9 @@ AI_API_EDITOR_SPEC.catalog = [CloudEditEngine]     (one engine: the host hides i
 
 CloudEditEngine (engine.rs)
   draw_parameters  draw_image_edit_picker (provider + Russia badge, endpoint, key block, model,
-                   offer notes) -> prompt -> blend -> size line -> billing/privacy -> run state
+                   offer notes) -> prompt -> blend -> size line -> billing/privacy
+  draw_progress    run state: spinner + stage + cancel-billing note, or the last outcome
+                   (pinned above the scrolled parameters by the host)
   constraints()    selection.offer() -> constraints::frame_constraints(rule)  (host re-reads per frame)
   marks_support()  offer.accepts_references() ? reference (preferred) + layer + overlay : overlay only
   run_block_reason decisions::run_block_reason(RunGate snapshot)

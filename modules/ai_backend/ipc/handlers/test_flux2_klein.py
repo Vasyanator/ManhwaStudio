@@ -17,7 +17,8 @@ whose `_write` records each frame, so the exact on-the-wire progress shape
 Coverage:
 - two-phase progress (`load` / `generate`) with an always-empty blob;
 - terminal response: result PNG as the RESPONSE BLOB, header carrying
-  `image_len`, `oom_recovered` and the `applied` memory settings;
+  `image_len`, `oom_recovered`, the `applied` memory settings and, beside them
+  (never inside), the effective `text_attention_in_mask`;
 - request blob split by `image_len`/`mask_len`/`reference_len` with strict
   equality; an absent or zero `reference_len` reaches the service as NO reference
   (`None`), a present one as exactly its own segment, and a malformed length or a
@@ -342,6 +343,7 @@ def test_streaming_emits_two_phases_then_the_terminal_response() -> None:
             "unload_text_encoder_after_encode": False,
             "text_encoder_fp8": False,
         },
+        "text_attention_in_mask": False,
     }
     assert "image_png" not in resp_header
 
@@ -383,6 +385,21 @@ def test_every_applied_flag_is_forwarded_even_when_the_service_omits_one() -> No
         "unload_text_encoder_after_encode": False,
         "text_encoder_fp8": False,
     }
+
+
+def test_the_effective_text_attention_flag_is_reported_beside_applied() -> None:
+    # Beside `applied`, never inside it: `applied` is persisted into the user's
+    # settings, and a `whole_region` run forcing the flag off must not switch
+    # the user's choice off for every later run.
+    result = _default_result()
+    result["text_attention_in_mask"] = True
+    svc = _FakeFlux2KleinService(result)
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
+    resp_header, _blob = handler(
+        _ctx(svc), _header({"params": {}}), REGION_PNG + MASK_PNG, _no_cancel()
+    )
+    assert resp_header["text_attention_in_mask"] is True
+    assert "text_attention_in_mask" not in resp_header["applied"]
 
 
 def test_no_emitter_still_returns_the_terminal_response() -> None:

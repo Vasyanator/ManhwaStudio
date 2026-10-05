@@ -47,12 +47,22 @@ color alignment and the composite are done HERE, not by the pipeline. The wire
 format is L8 and only L8: an RGB/RGBA mask is refused, never converted, because
 guessing which channel means "edit this" edits the wrong pixels.
 
+`text_attention_in_mask=True` confines the PROMPT to the mask: text tokens and
+the image tokens outside the (dilated) mask stop attending to each other, in the
+noisy latents and in the region's clean condition copy alike, so the model can
+no longer ground the instruction on a matching object outside the mask — an edit
+the latent blend and the composite would throw away. A region-sized marks
+reference follows the same grid (it is the region with marks drawn on it). The
+image keeps its full image-to-image context. It is opt-in, costs one `S x S` mask on the device (in
+the memory forecast) and is forced off under `whole_region`.
+
 `whole_region=True` is the "no mask" mode: the whole validated region may change.
 The request format does not fork — the client still sends a mask, a solid one —
 and the service verifies that it really is solid (`_require_solid_mask`) instead
-of trusting the flag. The mode settles two other parameters by itself
-(`_whole_region_overrides`): the dilate is pointless on a full mask, and the
-color match has no unchanged ring to take its statistics from. The feather is
+of trusting the flag. The mode settles three other parameters by itself
+(`_whole_region_overrides`): the dilate is pointless on a full mask, the
+color match has no unchanged ring to take its statistics from, and confining the
+text to the mask would block nothing. The feather is
 NOT disabled; on a solid mask it ramps inwards from the region border, which is
 what joins the regenerated region to the rest of the page.
 
@@ -123,6 +133,8 @@ Module layout (this file re-exports the package's whole public surface, so
                       time, so the host peak is one tensor and not the checkpoint.
 - `prompt_cache.py` - encoder fingerprint, the `.msprompt` container, the library.
 - `imaging.py`      - mask/region decoding, color match, feathered composite.
+- `attention.py`    - `text_attention_in_mask`: the token grid, the joint
+                      sequence layout, the additive attention mask and its bytes.
 - `hardware.py`     - device resolution, memory snapshot, torch cache clearing.
 - `memory.py`       - the RAM/VRAM forecast and the pre-load guard.
 - `pipeline.py`     - component loaders, placement, residency, warm-up, decode.
@@ -145,9 +157,10 @@ log = logging.getLogger(__name__)
 # modules keep resolving. WARNING: a few of them (`memory_snapshot`,
 # `_clear_torch_cache`, `_resolve_selected_backend_device`, `_weight_bytes`,
 # `text_encoder_resident_bytes`, `_quantize_text_encoder_fp8`,
-# `_restore_transformer_to_device`, `write_prompt_file`) are monkeypatched by the
-# test suite. Patch them on their
-# DEFINING module (`hardware`, `components`, `pipeline`, `prompt_cache`), never on
+# `_restore_transformer_to_device`, `write_prompt_file`,
+# `build_text_attention_mask`) are monkeypatched by the test suite. Patch them on
+# their DEFINING module (`hardware`, `components`, `pipeline`, `prompt_cache`,
+# `attention`), never on
 # this package: the re-export here is a separate binding, so patching it would be
 # a silent no-op for every real caller.
 
@@ -313,6 +326,17 @@ from .imaging import (  # noqa: F401  - re-exported public surface
     _match_color_outside_mask,
     _morph_mask,
     _require_solid_mask,
+)
+from .attention import (  # noqa: F401  - re-exported public surface
+    MASK_ROW_ALIGNMENT,
+    TOKEN_PIXELS,
+    TextAttentionLayout,
+    build_text_attention_mask,
+    condition_tokens,
+    plan_text_attention,
+    require_text_attention_target,
+    text_attention_mask_bytes,
+    token_grid_inside,
 )
 from .hardware import (  # noqa: F401  - re-exported public surface
     memory_snapshot,

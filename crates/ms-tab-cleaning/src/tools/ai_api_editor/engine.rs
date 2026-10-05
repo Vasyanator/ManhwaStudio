@@ -13,7 +13,8 @@ Main responsibilities:
   the run gate, the run and the per-frame poll;
 - draw the «Редактор области» panel body: the mask meaning, the service picker
   (`draw_image_edit_picker`), the prompt, the blend, the size line, the billing and privacy
-  notes, and the run's progress and outcome;
+  notes; and, in the section the host pins above it, the run's progress and outcome
+  (`draw_progress`);
 - drive the key block's single-flight worker (`ImageEditKeyRunner::pump`) and the settings
   load/save workers from `poll`.
 
@@ -356,7 +357,7 @@ impl CloudEditEngine {
         ui.small(line);
     }
 
-    /// The run's spinner and stage, or the last outcome.
+    /// The run's spinner and stage, or the last outcome; nothing before the first run.
     fn draw_run_state(&self, ui: &mut egui::Ui) {
         if let Some(run) = self.run.as_ref() {
             ui.horizontal(|ui| {
@@ -479,11 +480,15 @@ impl AiEngine for CloudEditEngine {
         self.draw_size_line(ui);
         ui.small(t!("cleaning.tools.ai_api_editor.billing_hint"));
         ui.small(t!("cleaning.tools.ai_api_editor.privacy_hint"));
-        self.draw_run_state(ui);
 
         if changed {
             self.dirty = true;
         }
+    }
+
+    /// The run's spinner and stage, or the last outcome — pinned above the parameters.
+    fn draw_progress(&mut self, ui: &mut egui::Ui) {
+        self.draw_run_state(ui);
     }
 
     fn run_block_reason(&self) -> Option<String> {

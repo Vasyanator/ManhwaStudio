@@ -15,7 +15,9 @@ Main responsibilities:
   to `ENCODER_KEEP_LAYERS` layers and always in bfloat16
   (`text_encoder_dtype_name`), because it runs on the host CPU; an optional
   marks reference of the region's exact size goes to the pipeline as its
-  `image_reference`;
+  `image_reference`; with `text_attention_in_mask` the prompt's attention is
+  confined to the masked tokens (`attention.build_text_attention_mask`, passed
+  as the pipeline's `attention_kwargs`);
 - `component_action` - one per-component residency action under the same memory
   guard and lease protocol a generation uses;
 - the `prompt_cache_*` methods - the library surface, keyed identically to the
@@ -30,7 +32,8 @@ Notes:
   section of `modules/ai_backend/inpaint/MODULE_README.md`.
 - Symbols the test suite monkeypatches are reached through their defining module
   (`hardware.memory_snapshot`, `pipeline._restore_transformer_to_device`,
-  `prompt_cache.write_prompt_file`, ...) so that one patch reaches every caller.
+  `prompt_cache.write_prompt_file`, `attention.build_text_attention_mask`, ...)
+  so that one patch reaches every caller.
 - torch / diffusers / transformers / cv2 are imported lazily inside the methods
   that need them.
 """
@@ -49,7 +52,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 from ...runtime.model_manager import LoadedModelManager
-from . import hardware, pipeline, prompt_cache
+from . import attention, hardware, pipeline, prompt_cache
 from .components import (
     _SCHEDULER_MARKER,
     _SCHEDULER_SUBDIR,
@@ -462,7 +465,8 @@ class Flux2KleinInpaintService:
 
         # Raises
         `ValueError` for bad params, a bad region size, a mask or reference size
-        mismatch, a non-solid mask under `whole_region`, or a text encoder whose width does
+        mismatch, a non-solid mask under `whole_region`, an empty mask with
+        `text_attention_in_mask` (refused before anything loads), or a text encoder whose width does
         not match the transformer (`require_encoder_transformer_compatible`);
         `FileNotFoundError` when a component is missing; `RuntimeError` when a
         phase does not fit in the free memory; whatever the pipeline raises
@@ -475,6 +479,12 @@ class Flux2KleinInpaintService:
         mask_u8 = _decode_mask(mask_bytes, expected_hw=(height, width))
         if normalized["whole_region"]:
             _require_solid_mask(mask_u8)
+        if normalized["text_attention_in_mask"]:
+            # Before the lease, the load and the prompt encode: an empty mask
+            # would otherwise be refused by the planner only after ~18 GB of
+            # transformer had been read. `whole_region` already forced the flag
+            # off in normalization, so this never sees a solid-mask run.
+            attention.require_text_attention_target(mask_u8)
         reference_rgb = None
         if reference_bytes is not None:
             reference_rgb = _decode_image_rgb(reference_bytes)
@@ -573,6 +583,11 @@ class Flux2KleinInpaintService:
             # side can persist them and take the cheap path next time.
             "applied": applied,
             "oom_recovered": oom_recovered,
+            # Whether the prompt really was confined to the mask. Deliberately
+            # NOT inside `applied`: that dict is written back into the user's
+            # settings, and `whole_region` forcing this off for one run must not
+            # turn the user's choice off for every later run.
+            "text_attention_in_mask": bool(normalized["text_attention_in_mask"]),
         }
 
     # ---- prompt cache: build / save / load ----
@@ -2163,10 +2178,19 @@ class Flux2KleinInpaintService:
         uses the original mask feathered inwards by `mask_feather_px`, which is
         what keeps every pixel outside the mask byte-identical.
 
+        With `text_attention_in_mask` the call also carries
+        `attention_kwargs={"attention_mask": ...}` confining the prompt to the
+        (dilated) mask's tokens (`_text_attention_mask_locked`); without it the
+        key is absent and the call is exactly what it was before the flag. The
+        mask lives for the denoise only: on every exit from the pipeline call
+        the pipeline's retained `_attention_kwargs` and the local reference are
+        dropped, before the VAE decode.
+
         Under `whole_region` this method needs no special case: normalization has
-        already set `mask_dilate_px` to 0 (a solid mask has nothing to grow into)
-        and `color_match` to `False` (there is no unchanged ring to match
-        against) — see `_whole_region_overrides`. The feather still applies, and
+        already set `mask_dilate_px` to 0 (a solid mask has nothing to grow into),
+        `color_match` to `False` (there is no unchanged ring to match against)
+        and `text_attention_in_mask` to `False` (every token is inside) — see
+        `_whole_region_overrides`. The feather still applies, and
         on a solid mask it ramps inwards from the region's own border, which is
         exactly the soft join to the rest of the page that mode wants.
 
@@ -2230,6 +2254,16 @@ class Flux2KleinInpaintService:
         }
         if reference_rgb is not None:
             call_kwargs["image_reference"] = Image.fromarray(reference_rgb, "RGB")
+        if normalized["text_attention_in_mask"]:
+            # diffusers forwards `attention_kwargs` as `joint_attention_kwargs` to
+            # BOTH the conditional and the unconditional pass, and every double-
+            # and single-stream attention hands `attention_mask` to SDPA — so
+            # one mask, built once, covers the whole denoise.
+            call_kwargs["attention_kwargs"] = {
+                "attention_mask": self._text_attention_mask_locked(
+                    latent_mask, normalized, embeds, reference_rgb
+                )
+            }
 
         # `self._device` is the placement target `_ensure_pipeline_locked` chose,
         # which is what the run must happen on; the probe is checked against it
@@ -2239,12 +2273,22 @@ class Flux2KleinInpaintService:
         if normalized["placement"] in ("full_gpu", "encoder_cpu"):
             _require_execution_device(pipe, self._device)
         negative = embeds["negative"]
-        result = pipe(
-            prompt=None,
-            prompt_embeds=embeds["prompt"].to(device=self._device),
-            negative_prompt_embeds=None if negative is None else negative.to(device=self._device),
-            **call_kwargs,
-        )
+        try:
+            result = pipe(
+                prompt=None,
+                prompt_embeds=embeds["prompt"].to(device=self._device),
+                negative_prompt_embeds=None if negative is None else negative.to(device=self._device),
+                **call_kwargs,
+            )
+        finally:
+            # diffusers stores `self._attention_kwargs = attention_kwargs`
+            # (`Flux2KleinInpaintPipeline.__call__`) and never clears it, so the
+            # resident pipeline would keep the S x S attention mask on the device
+            # through the VAE decode (whose forecast excludes it) and while idle,
+            # where no cache clear can free it. Dropping the dict entry matters on
+            # the raising path too: the traceback keeps this frame's locals alive.
+            pipe._attention_kwargs = None
+            call_kwargs.pop("attention_kwargs", None)
 
         # Keep the latents in host memory before anything else touches the GPU:
         # at 1 MP they are a few hundred KiB, and holding them is what lets an
@@ -2265,6 +2309,70 @@ class Flux2KleinInpaintService:
             region_rgb, generated, mask_u8, int(normalized["mask_feather_px"])
         )
         return composed, applied, oom_recovered
+
+    def _text_attention_mask_locked(
+        self,
+        latent_mask: np.ndarray,
+        normalized: dict[str, Any],
+        embeds: dict[str, Any],
+        reference_rgb: np.ndarray | None,
+    ) -> Any:
+        """Build the `text_attention_in_mask` attention mask for this run.
+
+        `latent_mask` is the DILATED mask the pipeline receives as `mask_image`,
+        so the prompt reaches every token the latent blend may change. The text
+        length is read from the real `prompt_embeds`, never from the request:
+        the mask must match the sequence the transformer will actually see.
+        A marks reference always has the region's size here (`inpaint_image_bytes`
+        refuses any other), so its tokens follow the same inside/outside grid
+        (`attention.plan_text_attention`).
+
+        The mask is built on `self._device` — the device `prompt_embeds` is moved
+        to and therefore the one the transformer computes on in every placement
+        (under the two offload placements accelerate's hooks bring the weights
+        there; `pipe._execution_device` resolves to the same accelerator) — and
+        in the request's `dtype`, which is the transformer's, because SDPA
+        requires an additive mask to match the query dtype.
+
+        Caller must hold `self._lock`.
+
+        # Raises
+        `ValueError` when a negative embedding (classifier-free guidance) has a
+        different text length than the prompt — the same mask goes to both
+        passes, so it could only fit one of them — or when the mask has no token
+        inside it (`attention.plan_text_attention`).
+        """
+        text_tokens = int(embeds["prompt"].shape[1])
+        negative = embeds["negative"]
+        if negative is not None and int(negative.shape[1]) != text_tokens:
+            raise ValueError(
+                "Внимание текста только внутри маски: длина негативного промпта "
+                f"({int(negative.shape[1])} токенов) не совпадает с длиной промпта "
+                f"({text_tokens}); одна маска внимания не подходит к обоим проходам."
+            )
+        layout = attention.plan_text_attention(
+            latent_mask,
+            text_tokens=text_tokens,
+            reference_hw=None if reference_rgb is None else reference_rgb.shape[:2],
+        )
+        mask = attention.build_text_attention_mask(
+            layout, dtype_name=normalized["dtype"], device=self._device
+        )
+        log.info(
+            "FLUX.2 klein: внимание текста только внутри маски: text_attention_in_mask=True "
+            "L=%d N=%d R=%d S=%d inside_tokens=%d reference_follows_mask=%s mask_bytes=%d "
+            "dtype=%s device=%s",
+            layout.text_tokens,
+            layout.image_tokens,
+            layout.reference_tokens,
+            layout.sequence_length,
+            layout.inside_tokens,
+            layout.reference_inside is not None,
+            layout.mask_bytes(normalized["dtype"]),
+            normalized["dtype"],
+            self._device,
+        )
+        return mask
 
     def _decode_locked(
         self, pipe: Any, latents_cpu: Any, normalized: dict[str, Any]

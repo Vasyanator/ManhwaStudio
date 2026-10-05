@@ -161,14 +161,64 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
 - **`whole_region` is the "no mask" mode, and the flag is VERIFIED, not trusted.** The client still
   sends a mask — a solid one — so the request format does not fork, and `_require_solid_mask`
   refuses a mask with any empty pixel, naming the count. A flag that disagrees with the data would
-  otherwise surface as a partial edit while the UI said no mask was needed. The mode settles two
+  otherwise surface as a partial edit while the UI said no mask was needed. The mode settles three
   other params in `normalize_flux2_klein_params` (`_whole_region_overrides`, which logs whenever it
   overrides something the caller asked for): `mask_dilate_px` → 0, because a full mask has nothing
   to grow into, and `color_match` → `False`, because `_match_color_outside_mask` takes its
   statistics from the ring OUTSIDE the mask and here that ring is empty — computing it from the
   changed pixels would force the edit's own mean and standard deviation back onto the original's,
   i.e. undo the edit, and computing it from an empty sample is a division by zero. `mask_feather_px`
-  is deliberately NOT switched off: it is what joins the regenerated region to the page.
+  is deliberately NOT switched off: it is what joins the regenerated region to the page. The
+  third is `text_attention_in_mask` → `False`: every token is inside a solid mask, so the
+  attention mask would block nothing and still cost its `S²` bytes (see the next bullet).
+- **`text_attention_in_mask` confines the PROMPT to the mask** (opt-in, default `False`;
+  `flux2_klein/attention.py`). Why it exists: the pipeline always conditions on a clean copy of
+  the WHOLE region, so an instruction can be grounded on a matching object OUTSIDE the mask; the
+  model edits it there, the per-step latent blend and `_composite_over_region` throw that edit
+  away, and the user sees nothing change under the mask. The contract:
+  - ONE additive `(S, S)` mask per run over diffusers 0.39's joint sequence `[text L | noisy N |
+    region clean copy N | reference R]` (verified in the installed pipeline and transformer),
+    passed as the pipeline's `attention_kwargs={"attention_mask": M}`, which diffusers forwards to
+    every double- and single-stream attention of the conditional AND the unconditional pass.
+  - "Inside" is the 16 px token grid of the DILATED mask the pipeline receives as `mask_image`,
+    with a token inside when ANY of its pixels is set — one token wider than the pipeline's own
+    bilinear latent mask, so the text reaches the partially masked band too.
+  - Blocked: image queries outside the mask -> text keys, and text queries -> outside image
+    keys, for the noisy tokens, the clean copy AND a region-aligned reference. The marks
+    reference is a copy of the region with marks drawn on it; when its token grid equals the
+    region's it follows the same inside/outside grid, because open outside reference tokens
+    would hand the prompt a second, spatially aligned path back to the outside object. A
+    reference of another size (no alignment can be assumed) stays fully open to the text, with
+    one log line per run; the service only accepts region-sized references, so a run always
+    takes the aligned branch. Open: text <-> text, text <-> inside tokens, every image <-> image
+    pair (context and harmonization are untouched). Every row keeps an open key; the blocked value is
+    `finfo(dtype).min`, not `-inf`, so a fully blocked row could never turn into `NaN`.
+  - `L` is read from the real `prompt_embeds`; all `L` positions count, padding included (the
+    pipeline never hands the tokenizer's mask to the transformer, and padding states carry prompt
+    content). `R` is derived from the reference's own size (`condition_tokens`), never assumed.
+    A negative embedding of another length, or a mask with no inside token, is a `ValueError` —
+    never a silently unmasked or everything-blocked run. The empty mask is refused BEFORE the
+    lease, load and prompt encode (`attention.require_text_attention_target` on the wire mask —
+    dilation only grows it); the planner's own refusal stays as a last-resort contract check.
+  - The mask lives for the denoise only. diffusers keeps `pipe._attention_kwargs` after the call,
+    so `_generate_locked` clears it (and its own reference) in a `finally` around the pipeline
+    call: the mask never survives into the VAE decode (whose forecast excludes it), a failed
+    denoise, or an idle resident pipeline.
+  - The mask is in the transformer's dtype (SDPA wants an additive mask to match the queries),
+    on `self._device` (where `prompt_embeds` go in every placement), and is a `(S, S)` VIEW of a
+    buffer whose rows are padded to a multiple of 8: SDPA's memory-efficient kernel otherwise
+    copies an unaligned mask on EVERY attention call (measured: 281 MB vs 136 MB extra peak at
+    S = 8706). A mask also rules out the flash kernel; attention runs ~1.5x slower.
+  - The layout is pinned to diffusers, not to our own assumption, by
+    `flux2_klein/test_attention.py::RealTransformerLayoutTests` (a tiny real
+    `Flux2Transformer2DModel` on the CPU): SDPA's shape check catches only a sequence-LENGTH
+    change, never a reorder at the same `S`.
+  - Not removable: second-order leakage through image <-> image attention in later layers
+    (outside tokens read inside tokens that read the text). Its pixels are discarded by the
+    latent blend and the composite anyway.
+  - The effective value is returned as the top-level `text_attention_in_mask`, deliberately NOT
+    in `applied`: the client persists `applied` into the user's settings, and a `whole_region`
+    run must not switch the user's choice off for good.
 - **A marks reference is a CONDITION image, never an edit target.** The optional third blob segment
   (`reference_len`, PROTOCOL.md §5.4) is the user's marks composited over a copy of the region. The
   service decodes it to RGB, refuses any size other than the region's (only then do diffusers'
@@ -605,6 +655,13 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     card. Everything else it cannot prove yields the EXPENSIVE answer, for the reason stated just
     below: over-reserving refuses a run that might have fitted, under-reserving invites the OOM
     killer, and only the second is unrecoverable.
+  - **`text_attention_in_mask` costs a quadratic term, and only while it is in force.** The
+    denoise phase's device figure adds `attention.text_attention_mask_bytes(L, N, R, dtype)` —
+    `S` rows of `S` padded to 8, `S = max_sequence_length + 2N + R` with the region's clean copy
+    counted — the same formula the run allocates by, so `estimate`, the guard and the allocation
+    are still one arithmetic. Normalization forces the flag off under `whole_region`, so the term
+    is zero exactly when no mask will exist; while it is non-zero `breakdown.attention_mask`
+    reports it on its own.
   - **A saving that cannot happen is not forecast.** The decode's per-pixel constant is the cheap
     (tiled) one only when `vae_tiling` is set AND the region reaches
     `components.vae_tile_threshold_pixels` — the threshold read from the VAE's own `config.json`,

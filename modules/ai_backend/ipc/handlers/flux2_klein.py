@@ -28,7 +28,9 @@ Blob convention (the other inpaint methods' two segments, plus one optional):
 user's marks composited over a copy of the region, handed to the pipeline as its
 `image_reference`; the service requires it to be exactly the region's size.
 The result PNG goes in the response blob (raw bytes) and its length is repeated
-as ``image_len`` in the response header, next to the OOM-recovery report.
+as ``image_len`` in the response header, next to the OOM-recovery report and the
+effective ``text_attention_in_mask`` (reported beside ``applied``, not in it,
+because ``applied`` is persisted into the user's settings).
 """
 
 from __future__ import annotations
@@ -230,6 +232,10 @@ def _handle_inpaint_flux2_klein(
         # not degrade the answer — it discards the whole thing, and with it the
         # OOM-recovery settings the next run was supposed to start from.
         "applied": {name: bool(applied.get(name, False)) for name in _APPLIED_FLAGS},
+        # The EFFECTIVE value (false under `whole_region`), reported beside
+        # `applied` rather than inside it: `applied` is persisted into the user's
+        # settings, and a mode-forced off must not overwrite the user's choice.
+        "text_attention_in_mask": bool(result.get("text_attention_in_mask", False)),
     }
     return fields, image_png_out
 

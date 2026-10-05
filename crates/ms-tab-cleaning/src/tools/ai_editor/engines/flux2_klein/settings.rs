@@ -463,6 +463,15 @@ pub(super) struct Flux2KleinSettings {
     pub(super) mask_dilate_px: u32,
     pub(super) mask_feather_px: u32,
     pub(super) color_match: bool,
+    /// «Внимание только к маске»: the prompt acts only on the masked area, so the model
+    /// cannot apply the instruction to a matching object OUTSIDE the mask.
+    ///
+    /// The user's persisted CHOICE, kept whatever the mask is. It is EFFECTIVE only with a
+    /// painted mask: a whole-region run has no mask to confine the prompt to, so the wire
+    /// value is this AND not `whole_region` ([`Flux2KleinSettings::to_params`]). Default
+    /// `true`, also for a file written before the field existed (the struct-level
+    /// `#[serde(default)]`).
+    pub(super) text_attention_in_mask: bool,
 }
 
 impl Default for Flux2KleinSettings {
@@ -520,6 +529,9 @@ impl Default for Flux2KleinSettings {
             // cleaner again (+0.3%) but gives up too much of it.
             mask_feather_px: 12,
             color_match: true,
+            // On: a prompt that may also act outside the mask can edit a matching object
+            // the user never selected, and painting a mask says "only here".
+            text_attention_in_mask: true,
         }
     }
 }
@@ -587,6 +599,7 @@ impl Flux2KleinSettings {
             mask_dilate_px: self.mask_dilate_px.min(FLUX2_DILATE_MAX),
             mask_feather_px: self.mask_feather_px.min(FLUX2_FEATHER_MAX),
             color_match: self.color_match,
+            text_attention_in_mask: self.text_attention_in_mask,
         }
     }
 
@@ -670,8 +683,29 @@ impl Flux2KleinSettings {
     /// Every path that only ASKS the backend something (`.status`, `.estimate`, the
     /// prompt-cache calls) passes `false`: no mask exists for those, and `true` would make
     /// the backend apply the mode's parameter overrides — and log them — on a polling path.
+    ///
+    /// `text_attention_in_mask` goes out as its EFFECTIVE value — the setting AND a painted
+    /// mask (`!whole_region`) — so the wire never claims a mode the run cannot have. The
+    /// `.estimate` query uses [`Flux2KleinSettings::to_estimate_params`] instead.
     #[must_use]
     pub(super) fn to_params(&self, whole_region: bool) -> Value {
+        self.params_for(whole_region, self.text_attention_in_mask && !whole_region)
+    }
+
+    /// The `params` of an `.estimate` query. Like `to_params(false)` — a forecast is never
+    /// a whole-region request — except that `text_attention_in_mask` is effective only
+    /// while `mask_painted`, the host's answer of the last drawn frame: the backend adds
+    /// the attention-mask term to the forecast exactly when the flag is on, and a run
+    /// over an empty mask will not have it.
+    #[must_use]
+    pub(super) fn to_estimate_params(&self, mask_painted: bool) -> Value {
+        self.params_for(false, self.text_attention_in_mask && mask_painted)
+    }
+
+    /// The one builder behind [`Flux2KleinSettings::to_params`] and
+    /// [`Flux2KleinSettings::to_estimate_params`]; `text_attention_in_mask` is the
+    /// already-effective wire value.
+    fn params_for(&self, whole_region: bool, text_attention_in_mask: bool) -> Value {
         // The EFFECTIVE paths, never the raw fields: in download mode the fields hold the
         // user's own configuration and must not reach the backend.
         let paths = self.effective_paths();
@@ -696,6 +730,7 @@ impl Flux2KleinSettings {
             "mask_dilate_px": self.mask_dilate_px,
             "mask_feather_px": self.mask_feather_px,
             "color_match": self.color_match,
+            "text_attention_in_mask": text_attention_in_mask,
             // Pinned, not a setting: see `FLUX2_MAX_SEQ`. The field stays on the wire
             // because the backend still reads it.
             "max_sequence_length": FLUX2_MAX_SEQ,
@@ -1058,6 +1093,46 @@ mod tests {
         }
     }
 
+    /// `text_attention_in_mask` travels as its EFFECTIVE value: the setting AND a painted
+    /// mask. A whole-region run has no mask to confine the prompt to, so it always sends
+    /// `false`, and the user's persisted choice is untouched by that.
+    #[test]
+    fn text_attention_in_mask_is_sent_only_when_effective() {
+        for (setting, whole_region, expected) in
+            [(true, false, true), (true, true, false), (false, false, false), (false, true, false)]
+        {
+            let mut settings = runnable_settings();
+            settings.text_attention_in_mask = setting;
+            let params = settings.normalized().to_params(whole_region);
+            assert_eq!(params["text_attention_in_mask"], json!(expected), "setting {setting}, whole {whole_region}");
+            assert_eq!(settings.text_attention_in_mask, setting, "building params never rewrites the choice");
+        }
+        for (setting, painted, expected) in
+            [(true, true, true), (true, false, false), (false, true, false), (false, false, false)]
+        {
+            let mut settings = runnable_settings();
+            settings.text_attention_in_mask = setting;
+            let params = settings.normalized().to_estimate_params(painted);
+            assert_eq!(params["text_attention_in_mask"], json!(expected), "setting {setting}, painted {painted}");
+            assert_eq!(params["whole_region"], json!(false), "a forecast is never a whole-region request");
+        }
+    }
+
+    /// The flag defaults ON, for a fresh document AND for one written before the field
+    /// existed, and `normalized()` carries it through unchanged in both states.
+    #[test]
+    fn text_attention_in_mask_defaults_on_and_survives_normalization() {
+        assert!(Flux2KleinSettings::default().text_attention_in_mask);
+        let old: Flux2KleinSettings =
+            serde_json::from_value(json!({ "prompt": "remove the text" })).expect("an old document still loads");
+        assert!(old.text_attention_in_mask, "a document without the field reads as on");
+        let off = Flux2KleinSettings { text_attention_in_mask: false, ..Flux2KleinSettings::default() };
+        assert!(!off.normalized().text_attention_in_mask);
+        let round: Flux2KleinSettings =
+            serde_json::from_str(&serde_json::to_string(&off).expect("serializes")).expect("round-trips");
+        assert!(!round.text_attention_in_mask, "an explicit `false` is kept");
+    }
+
     /// A settings file written by an older build carries keys nothing maps to any more:
     /// `whole_region` (the mode is derived from the mask), `max_sequence_length` (pinned to
     /// [`FLUX2_MAX_SEQ`]) and `brush_radius` (the brush belongs to the host). The struct does
@@ -1367,10 +1442,13 @@ mod tests {
             .map(String::as_str)
             .filter(|key| !HISTORIC_KEYS.contains(key))
             .collect();
+        // Key order (`serde_json` without `preserve_order`). Both are ADDITIVE: the variant
+        // came with the second engine and «Внимание только к маске» with the pinned run
+        // options; a document without either still loads (`#[serde(default)]`).
         assert_eq!(
             added,
-            ["variant"],
-            "the variant is the only field the second engine added to the document"
+            ["text_attention_in_mask", "variant"],
+            "only the variant and the run option were added to the historic document"
         );
 
         // A document written by the previous build carries no `variant` and must load as

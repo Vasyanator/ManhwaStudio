@@ -21,11 +21,12 @@ Strict one-directional layering. A module may import from any module ABOVE it in
 
 ```
 params, progress, imaging          (no intra-package dependencies)
+attention                          (-> params)
 components                         (-> params, runtime.torch_support)
 streaming                          (-> components)
 hardware                           (-> runtime.torch_support, ai_device, config)
 prompt_cache                       (-> components, params, runtime.paths)
-memory                             (-> components, hardware, params, streaming)
+memory                             (-> attention, components, hardware, params, streaming)
 pipeline                           (-> components, hardware, progress, streaming,
                                         runtime.rocm_mmap_transfer)
 service                            (-> all of the above, runtime.model_manager)
@@ -73,6 +74,15 @@ reference resolve against the package object itself.
   `validate_prompt_file_metadata`) and the on-disk library under `<program root>/prompt_cache/`.
 - `imaging.py`: wire decode/encode of the region and the mask, the color match against the ring
   outside the mask, the feathered composite, and the mask morphology they need.
+- `attention.py`: the `text_attention_in_mask` contract — the region mask on the 16 px token grid
+  (`token_grid_inside`), the exact token count of a condition image (`condition_tokens`), one
+  run's joint-sequence layout (`plan_text_attention` -> `TextAttentionLayout`, including whether
+  the reference follows the region's inside/outside grid), the pre-load refusal of an empty mask
+  (`require_text_attention_target`), THE device-byte
+  formula of the mask (`text_attention_mask_bytes`, shared by the run's log and
+  `memory.forecast_memory`) and the additive mask itself (`build_text_attention_mask`, the only
+  torch user here). It sits directly under `params` so that both `memory` and `service` can reach
+  the one formula; the domain contract is in `../MODULE_README.md`.
 - `hardware.py`: `memory_snapshot`, `_resolve_selected_backend_device`, `_clear_torch_cache`,
   `_cuda_device_index` — the accelerator and what is free on it.
 - `memory.py`: `forecast_memory` and the pre-load guard `_require_memory_headroom` built on it,
@@ -94,12 +104,15 @@ reference resolve against the package object itself.
   helper, `_PlacementFixture`, `_ResidencyModule`, and the two safetensors writers —
   `_write_safetensors` for a header-only container and `_write_safetensors_with_data` for a real one
   whose tensor bytes sit at chosen offsets). The leading underscore keeps pytest from collecting it.
-- `test_params.py`, `test_components.py`, `test_prompt_cache.py`, `test_imaging.py`,
+- `test_params.py`, `test_components.py`, `test_prompt_cache.py`, `test_imaging.py`, `test_attention.py`,
   `test_hardware.py`, `test_memory.py`, `test_pipeline.py`, `test_streaming.py`,
   `test_service.py`: unit tests, one per module they cover. No torch, no diffusers, no weights, no
   GPU — except `PromptCacheRoundTripTests` (real torch for `safetensors.torch`) and
   `test_streaming.py`'s `_RealTorchFixture` subclasses (real torch for the converter and the meta
-  fill), which skip themselves without it and still need no GPU. Run them with
+  fill) and `test_attention.py`'s `AttentionMaskBuildTests` (real torch on the CPU for the
+  mask) and `RealTransformerLayoutTests` (real torch AND diffusers: a tiny randomly initialised
+  `Flux2Transformer2DModel` that pins the mask layout to diffusers' real concatenation — no
+  download, no file), which skip themselves without them and still need no GPU. Run them with
   `python -m pytest modules/ai_backend/inpaint/ -q` from the repo root.
 
 ## Contracts and invariants
@@ -110,7 +123,7 @@ snapshot out of the way. Monkeypatching couples the DEFINITION site to the USE s
 modules, one `patch.object` reaches every caller only if every caller looks the name up on the
 module that defines it.
 
-Fourteen names are affected, listed with their owner:
+Fifteen names are affected, listed with their owner:
 
 | Name | Owner |
 |---|---|
@@ -119,6 +132,7 @@ Fourteen names are affected, listed with their owner:
 | `memory_snapshot`, `_clear_torch_cache`, `_resolve_selected_backend_device` | `hardware` |
 | `_weight_bytes`, `text_encoder_resident_bytes` | `components` |
 | `program_root`, `write_prompt_file` | `prompt_cache` |
+| `build_text_attention_mask` | `attention` |
 | `is_torch_available` | `components` AND `hardware` — TWO bindings, see below |
 
 `is_torch_available` is the one name in this table WITHOUT a single owner, and it must not be
@@ -135,10 +149,11 @@ Therefore:
 - a module that consumes one of these from ANOTHER module writes `hardware.memory_snapshot(...)`,
   `pipeline._restore_transformer_to_device(...)`, `streaming.load_transformer_streaming(...)`,
   `components._weight_bytes(...)`,
-  `components.text_encoder_resident_bytes(...)`, `prompt_cache.write_prompt_file(...)` — never
+  `components.text_encoder_resident_bytes(...)`, `prompt_cache.write_prompt_file(...)`,
+  `attention.build_text_attention_mask(...)` — never
   `from .hardware import memory_snapshot`;
 - tests patch the OWNER module, never the `flux2_klein` package. `__init__.py` re-exports all
-  fourteen, but a re-export is a separate binding: patching it would be a silent no-op for every
+  fifteen, but a re-export is a separate binding: patching it would be a silent no-op for every
   real caller. The comment above the re-export block says so.
 - `_weight_bytes` and `text_encoder_resident_bytes` are BOTH patch points and must be patched
   TOGETHER wherever a test pins component sizes: `forecast_memory` asks the second for the text
@@ -194,6 +209,13 @@ submodules.
   else: `_encoder_key`, `_prompt_cache_key` and the `.msprompt` metadata all read it.
 - To change the prompt-cache file format or the library layout, see `prompt_cache.py`.
 - To change the composite, the color match, or the mask morphology, see `imaging.py`.
+- To change which token pairs `text_attention_in_mask` blocks, the token-grid rule, or the
+  mask's dtype/padding/size, see `attention.py` — and keep `text_attention_mask_bytes` the ONE
+  formula both the forecast and the allocation use. Whether the mask is sent at all, and its
+  release from `pipe._attention_kwargs` after the call, is `service._generate_locked` (through
+  `_text_attention_mask_locked`); the early empty-mask refusal is in
+  `service.inpaint_image_bytes`; the whole_region override is `params._whole_region_overrides`.
+  After a diffusers upgrade, `RealTransformerLayoutTests` is what proves the layout still holds.
 - To change the memory forecast or the pre-load guard, see `memory.py` (and never split the
   arithmetic in two). The pipeline's transient HOST term is `_transformer_avoids_the_host`, which
   answers from the request alone and answers EXPENSIVELY (the whole checkpoint) whenever it cannot

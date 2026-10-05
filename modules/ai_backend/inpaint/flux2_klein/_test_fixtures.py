@@ -303,8 +303,11 @@ class _FakeEmbeds:
     accepted.
     """
 
-    def __init__(self, text: str = "") -> None:
+    def __init__(self, text: str = "", text_tokens: int = 512) -> None:
         self.text = text
+        #: `(batch, text tokens, width)`: `_text_attention_mask_locked` reads the
+        #: text length from `shape[1]`, exactly as from a real tensor.
+        self.shape = (1, int(text_tokens), 8)
         self.moves: list[object] = []
 
     def detach(self) -> "_FakeEmbeds":

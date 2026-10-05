@@ -9,9 +9,12 @@ module, whose siblings draw the individual blocks it calls into.
 Main responsibilities:
 - own `Flux2PanelCtx`: everything the panel may read or mutate, borrowed for exactly one
   frame, with the intents the controls raise travelling back as plain flags;
-- draw the body in its designed ORDER: progress bar, run status, the prompt block with
-  its cache line and its two unfolding toggles, «Сила изменения», the readiness line, and
-  the three sibling collapsible sections;
+- draw the body in its designed ORDER: the prompt block with its cache line and its two
+  unfolding toggles, «Сила изменения», the readiness line, and the three sibling
+  collapsible sections;
+- draw the two PINNED parts the host places outside the panel's scroll: the progress with
+  the run status (`draw_flux2_progress_section`, top) and the per-run option
+  «Внимание только к маске» (`draw_flux2_run_options`, bottom);
 - delegate each block to the submodule that owns it.
 
 Key structures:
@@ -19,6 +22,7 @@ Key structures:
 
 Key functions:
 - `Flux2PanelCtx::draw()` and the per-block methods it calls
+- `draw_flux2_progress_section()`, `draw_flux2_run_options()`: the pinned parts
 
 Submodules:
 - `install.rs`: the source-mode switch, the model paths and the whole download block.
@@ -47,6 +51,47 @@ use advanced::*;
 // The progress bars and the mask hint the body opens with.
 mod progress;
 use progress::*;
+
+// ---------------------------------------------------------------------------------------
+// Pinned parts
+// ---------------------------------------------------------------------------------------
+
+/// The section pinned at the TOP of the panel: the progress every long operation of this
+/// engine shares, and the engine's line about the last run under it.
+///
+/// Draws nothing at all while no operation owns the bar and no run has reported, so an
+/// idle panel gives the whole height to its parameters.
+pub(super) fn draw_flux2_progress_section(
+    ui: &mut egui::Ui,
+    progress: &Mutex<Flux2Progress>,
+    run_status: Option<&str>,
+) {
+    draw_flux2_progress_ui(ui, progress);
+    if let Some(status) = run_status {
+        ui.small(status);
+    }
+}
+
+/// The per-run option pinned at the BOTTOM of the panel, under «Обработать»:
+/// «Внимание только к маске». Returns `true` when the user toggled it.
+///
+/// Open only while a mask is painted ([`flux2_text_attention_block_reason`]); closed, it
+/// shows the user's STORED choice greyed out, with the reason on hover, and cannot change
+/// it — the choice comes back into effect as soon as a mask is painted.
+pub(super) fn draw_flux2_run_options(ui: &mut egui::Ui, text_attention_in_mask: &mut bool, ctx: RunOptionsCtx) -> bool {
+    let block_reason = flux2_text_attention_block_reason(ctx.mask_painted);
+    let response = ui
+        .add_enabled(
+            block_reason.is_none(),
+            egui::Checkbox::new(text_attention_in_mask, t!("cleaning.tools.flux2_klein.text_attention_in_mask_label")),
+        )
+        .on_hover_text(t!("cleaning.tools.flux2_klein.text_attention_in_mask_hint"));
+    let response = match block_reason {
+        Some(reason) => response.on_disabled_hover_text(reason),
+        None => response,
+    };
+    response.changed()
+}
 
 // ---------------------------------------------------------------------------------------
 // Parameter panel body
@@ -119,9 +164,6 @@ pub(super) struct Flux2PanelCtx<'a> {
     /// what decides whether the block offers «Скачать» or «Отмена».
     pub(super) download_busy: bool,
     pub(super) download_status: Option<&'a str>,
-    pub(super) progress: &'a Arc<Mutex<Flux2Progress>>,
-    /// The engine's own line about the last run, drawn under the progress bar.
-    pub(super) run_status: Option<&'a str>,
     pub(super) ai_backend_available: bool,
     /// Set when a control changed a persisted value.
     pub(super) settings_changed: &'a mut bool,
@@ -146,11 +188,12 @@ pub(super) struct Flux2PanelCtx<'a> {
 }
 
 impl Flux2PanelCtx<'_> {
-    /// Draws the whole «Редактор области» body for this engine: its progress bar and run
-    /// status, the prompt block, the parameters, and the note on what the mask means.
+    /// Draws the scrolled «Редактор области» body for this engine: the prompt block, the
+    /// parameters, and the note on what the mask means.
     ///
-    /// No scroll area and no run button: the panel that hosts this body owns its scrolling,
-    /// and «Обработать» / «Применить» / «Отменить» belong to the frame and its host
+    /// No scroll area, no progress and no run button: the panel that hosts this body owns
+    /// its scrolling, the progress is pinned above it (`draw_flux2_progress_section`), and
+    /// «Обработать» / «Применить» / «Отменить» belong to the frame and its host
     /// (`dev-docs/region_edit_v2_plan.md` §13.1).
     ///
     /// `region` is the frame rectangle's size, `None` while the tool has no frame; the
@@ -163,10 +206,6 @@ impl Flux2PanelCtx<'_> {
     /// paths used to sit two clicks deep while the expert prompt library was expanded on
     /// every frame; that is the inversion this order exists to undo.
     pub(super) fn draw(&mut self, ui: &mut egui::Ui, region: Option<[usize; 2]>) {
-        draw_flux2_progress_ui(ui, self.progress);
-        if let Some(status) = self.run_status {
-            ui.small(status);
-        }
         self.draw_prompt(ui);
         self.draw_strength(ui);
         // Handed in, not derived: the readiness line reports it and the setup section
@@ -996,6 +1035,32 @@ mod tests {
                 hover.contains("{family}"),
                 "locale `{tag}`: the hover line carries the family, `{hover}` does not"
             );
+        }
+    }
+
+    /// The pinned run option and the forecast line it adds are a checkbox with no other
+    /// explanation, so the two catalogs this project maintains by hand (`en`, the reference,
+    /// and `ru`) must carry every one of their keys; `es` / `fr` / `pt` fall back to `en`.
+    #[test]
+    fn the_reference_catalogs_carry_the_text_attention_keys() {
+        const KEYS: [&str; 4] = [
+            "cleaning.tools.flux2_klein.text_attention_in_mask_label",
+            "cleaning.tools.flux2_klein.text_attention_in_mask_hint",
+            "cleaning.tools.flux2_klein.text_attention_in_mask_disabled_hint",
+            "cleaning.tools.flux2_klein.estimate_attention_mask",
+        ];
+        for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
+            let catalog: Value = serde_json::from_str(source)
+                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            for key in KEYS {
+                let value = catalog
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("locale `{tag}` lacks the key `{key}`"));
+                assert!(!value.trim().is_empty(), "locale `{tag}`: `{key}` is empty");
+            }
+            let estimate = catalog.get(KEYS[3]).and_then(Value::as_str).unwrap_or_default();
+            assert!(estimate.contains("{size}"), "locale `{tag}`: the forecast line must name its size");
         }
     }
 }

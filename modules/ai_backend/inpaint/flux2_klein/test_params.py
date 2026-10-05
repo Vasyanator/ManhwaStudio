@@ -7,7 +7,8 @@ and the region contract of `validate_region_size`.
 
 Main responsibilities:
 - verify every enum/path error and every numeric clamp of the wire contract,
-  including the placement-dependent default of `unload_transformer_before_vae`;
+  including the placement-dependent default of `unload_transformer_before_vae`
+  and the opt-in `text_attention_in_mask` that `whole_region` forces off;
 - verify a region that the pipeline would silently resize or crop is refused
   with concrete numbers instead;
 - verify `effective_steps` matches what the pipeline will actually run.
@@ -90,8 +91,30 @@ class NormalizeParamsTests(_TempTreeCase):
                 "color_match",
                 "whole_region",
                 "max_sequence_length",
+                "text_attention_in_mask",
             },
         )
+
+    def test_text_attention_in_mask_is_off_unless_asked_for(self) -> None:
+        # A request written before the field existed must run exactly as before.
+        self.assertFalse(
+            svc.normalize_flux2_klein_params(self.params())["text_attention_in_mask"]
+        )
+        for raw, expected in ((True, True), ("true", True), (1, True), ("on", True),
+                              (False, False), ("0", False), ("maybe", False), (None, False)):
+            with self.subTest(raw=raw):
+                out = svc.normalize_flux2_klein_params(self.params(text_attention_in_mask=raw))
+                self.assertIs(out["text_attention_in_mask"], expected)
+
+    def test_whole_region_forces_text_attention_in_mask_off_and_says_so(self) -> None:
+        # Every token is inside a solid mask, so the attention mask would block
+        # nothing and still cost S² bytes; the effective value must be false.
+        with self.assertLogs(svc.log, level="INFO") as captured:
+            out = svc.normalize_flux2_klein_params(
+                self.params(whole_region=True, text_attention_in_mask=True)
+            )
+        self.assertFalse(out["text_attention_in_mask"])
+        self.assertTrue(any("text_attention_in_mask" in line for line in captured.output))
 
     def test_numeric_clamping(self) -> None:
         out = svc.normalize_flux2_klein_params(

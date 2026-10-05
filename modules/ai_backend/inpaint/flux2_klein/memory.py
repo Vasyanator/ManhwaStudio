@@ -19,6 +19,9 @@ Main responsibilities:
   reserves, `_MEMORY_PRESETS`).
 
 Notes:
+The attention-mask term of `text_attention_in_mask` is not computed here: it
+is `attention.text_attention_mask_bytes`, the one formula the run allocates by.
+
 `components.text_encoder_resident_bytes` and `hardware.memory_snapshot` are
 reached through their modules on purpose: both are replaced by the test suite,
 and a `from ... import` here would leave this module holding a stale reference.
@@ -43,7 +46,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from . import components, hardware, streaming
+from . import attention, components, hardware, streaming
 from .components import text_encoder_available
 from .params import REGION_SIZE_MULTIPLE
 
@@ -239,6 +242,13 @@ def forecast_memory(
     region's size, so it costs exactly the region's latent token count again in
     the transformer's sequence. Nothing else changes: no weight, no decode.
 
+    **`text_attention_in_mask` adds its attention mask to the denoise device
+    term** — `attention.text_attention_mask_bytes`, the formula the run
+    allocates by, and only when the flag is in force (normalization forces it
+    off under `whole_region`). It is the only quadratic term here; it is
+    reported on its own as `breakdown.attention_mask` too, a key present only
+    while the term is non-zero.
+
     Returns `{"vram_bytes", "ram_bytes", "phases", "resident", "breakdown"}`.
     `phases` maps each phase name to its own `{"vram_bytes", "ram_bytes"}` — that
     is what the guard checks one at a time. `resident` names the two costs a run
@@ -293,6 +303,24 @@ def forecast_memory(
         latent_tokens + reference_tokens
     ) * ACTIVATION_BYTES_PER_LATENT_TOKEN
     decode_activations = int(region_width) * int(region_height) * vae_per_pixel
+    # `text_attention_in_mask` holds one additive (S, S) mask on the execution
+    # device for the whole denoise — 150-330 MB at 1 MP, i.e. quadratic in the
+    # tokens where the activation constant above is linear. Its size comes from
+    # `attention.text_attention_mask_bytes`, the same formula the run allocates
+    # by, with the real joint sequence: the text padded to
+    # `max_sequence_length`, the noisy tokens, the region's always-present clean
+    # copy, and the reference. Under `whole_region` normalization has already
+    # switched the flag off, so this is 0 exactly when no mask will exist.
+    attention_mask_bytes = (
+        attention.text_attention_mask_bytes(
+            int(normalized["max_sequence_length"]),
+            latent_tokens,
+            reference_tokens,
+            normalized["dtype"],
+        )
+        if normalized["text_attention_in_mask"]
+        else 0
+    )
 
     placement = normalized["placement"]
     low_cpu = bool(normalized["low_cpu_mem_usage"])
@@ -386,7 +414,7 @@ def forecast_memory(
             else 0,
         },
         "denoise": {
-            "vram_bytes": int(pipeline_device + denoise_activations),
+            "vram_bytes": int(pipeline_device + denoise_activations + attention_mask_bytes),
             "ram_bytes": int(run_ram),
         },
         "decode": {
@@ -394,6 +422,24 @@ def forecast_memory(
             "ram_bytes": int(pipeline_host_resident + resident_encoder + parked_ram),
         },
     }
+    breakdown = {
+        "transformer": int(transformer_bytes),
+        "text_encoder": int(text_encoder_bytes),
+        "vae": int(vae_bytes),
+        "activations": int(denoise_activations + decode_activations),
+        # The encode phase is now the one phase whose cost is dominated by
+        # HOST memory (the 16 GB encoder) while it also holds the pipeline on
+        # the card, so its peak is the larger of the two sides rather than
+        # "the VRAM figure, or the RAM one when there is no VRAM cost".
+        "peak_encode": max(phases["encode"]["vram_bytes"], phases["encode"]["ram_bytes"]),
+        "peak_denoise": phases["denoise"]["vram_bytes"],
+        "peak_decode": phases["decode"]["vram_bytes"],
+    }
+    if attention_mask_bytes:
+        # Already inside `peak_denoise`; listed on its own because it is the one
+        # cost the user toggles directly, and only while it exists — the client
+        # renders every breakdown key, and a permanent zero line would be noise.
+        breakdown["attention_mask"] = int(attention_mask_bytes)
     return {
         "vram_bytes": max(phase["vram_bytes"] for phase in phases.values()),
         "ram_bytes": max(phase["ram_bytes"] for phase in phases.values()),
@@ -407,21 +453,7 @@ def forecast_memory(
             "pipeline_device": int(pipeline_device),
             "text_encoder_host": int(text_encoder_bytes),
         },
-        "breakdown": {
-            "transformer": int(transformer_bytes),
-            "text_encoder": int(text_encoder_bytes),
-            "vae": int(vae_bytes),
-            "activations": int(denoise_activations + decode_activations),
-            # The encode phase is now the one phase whose cost is dominated by
-            # HOST memory (the 16 GB encoder) while it also holds the pipeline on
-            # the card, so its peak is the larger of the two sides rather than
-            # "the VRAM figure, or the RAM one when there is no VRAM cost".
-            "peak_encode": max(
-                phases["encode"]["vram_bytes"], phases["encode"]["ram_bytes"]
-            ),
-            "peak_denoise": phases["denoise"]["vram_bytes"],
-            "peak_decode": phases["decode"]["vram_bytes"],
-        },
+        "breakdown": breakdown,
     }
 
 

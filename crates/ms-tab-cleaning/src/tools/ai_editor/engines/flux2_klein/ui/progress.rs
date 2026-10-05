@@ -2,8 +2,9 @@
 File: cleaning/tools/ai_editor/engines/flux2_klein/ui/progress.rs
 
 Purpose:
-The two things the panel draws above its controls: the progress shared by every long
-operation of this engine, and the hint that explains what the mask MEANS here.
+The progress shared by every long operation of this engine (drawn in the section the host
+pins above the parameters, through `draw_flux2_progress_section`), and the hint that
+explains what the mask MEANS here (the end of the scrolled body).
 
 Main responsibilities:
 - draw one bar for the load and generate phases, and a SECOND bar under it while a model

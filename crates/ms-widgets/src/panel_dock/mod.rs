@@ -13,8 +13,8 @@ Main responsibilities:
   panel order, and write back what the user changed.
 
 Key structures:
-- `PanelDockState`: per-program-tab layouts, last-frame measurements, per-tab
-  extra state (`extras.rs`), dirty flag.
+- `PanelDockState`: per-program-tab layouts, last-frame measurements (content
+  and pinned-bottom heights), per-tab extra state (`extras.rs`), dirty flag.
 - `DockArea`: where the dock may place panels this frame.
 - `PanelDock`: the frame driver (`begin` → `tab(..).show(..)` → `end`).
 - `PanelDockOutput`: rects of the panels drawn this frame, each recorded with
@@ -75,7 +75,8 @@ pub use model::{
     PanelId, PanelNode, TabId,
 };
 pub use panel::{
-    CollapsiblePanel, CollapsiblePanelOutput, MoveTargetEntry, PanelTabHeader, TabDrop,
+    CollapsiblePanel, CollapsiblePanelOutput, MoveTargetEntry, PanelSection, PanelTabHeader,
+    TabDrop,
 };
 pub use persist::{
     PANEL_LAYOUT_SECTION_KEY, PANEL_LAYOUT_SECTION_VERSION, PanelLayoutError, PanelLayoutSnapshot,
@@ -136,6 +137,13 @@ impl Default for TabMeta {
     }
 }
 
+/// Whether a pinned bottom section's drawn `height` differs from the height
+/// the scroll viewport was sized for (`previous`, `None` on its first frame) by
+/// enough to need another frame. A first measurement is always news.
+fn pinned_height_changed(previous: Option<f32>, height: f32) -> bool {
+    previous.is_none_or(|previous| (previous - height).abs() >= MEASUREMENT_EPSILON)
+}
+
 /// Localised caption producer of one declared tab, evaluated once per frame and
 /// only for a tab that is actually drawn.
 pub(super) type TabTitle<'frame> = Box<dyn Fn() -> String + 'frame>;
@@ -155,13 +163,28 @@ pub(super) type TabTitle<'frame> = Box<dyn Fn() -> String + 'frame>;
 pub(super) type TabBody<'frame, C> =
     Box<dyn FnOnce(&mut egui::Ui, &mut C, &mut TabExtras) + 'frame>;
 
-/// One declared tab: its metadata, its title producer and its queued body.
+/// A pinned section of one declared tab, queued by `PanelTab::pinned_top` /
+/// `PanelTab::pinned_bottom` and run by `PanelDock::end` around the body.
+pub(super) type PinnedBody<'frame, C> = Box<dyn FnOnce(&mut egui::Ui, &mut C) + 'frame>;
+
+/// Every closure one tab declaration queues: the scroll body and the optional
+/// pinned sections drawn outside the scroll area.
+pub(super) struct TabBodies<'frame, C> {
+    /// The body drawn inside the panel's scroll area.
+    pub(super) body: TabBody<'frame, C>,
+    /// Drawn under the header, above the scroll area.
+    pub(super) pinned_top: Option<PinnedBody<'frame, C>>,
+    /// Drawn under the scroll area, at the bottom of the panel.
+    pub(super) pinned_bottom: Option<PinnedBody<'frame, C>>,
+}
+
+/// One declared tab: its metadata, its title producer and its queued closures.
 struct TabEntry<'frame, C> {
     meta: TabMeta,
     title: TabTitle<'frame>,
     /// Taken by `end` when the tab turns out to be the drawn one. `None`
     /// afterwards, so a body can never run twice.
-    body: Option<TabBody<'frame, C>>,
+    bodies: Option<TabBodies<'frame, C>>,
 }
 
 /// Where the dock may place panels this frame.
@@ -202,6 +225,12 @@ pub struct PanelDockState {
     /// cache. A measurement belongs to the arrangement it was taken in, exactly
     /// like the panel that holds the tab.
     measured: BTreeMap<String, HashMap<TabId, Vec2>>,
+    /// Height each tab's PINNED BOTTOM section drew the last time it was drawn,
+    /// keyed exactly like [`PanelDockState::measured`] and for the same reason.
+    /// It is next frame's reserve under the scroll area
+    /// (`CollapsiblePanel::pinned_bottom_estimate`); tabs without such a
+    /// section never get an entry.
+    pinned_bottom_heights: BTreeMap<String, HashMap<TabId, f32>>,
     /// Extra per-tab UI state the dock stores and persists, scoped exactly like
     /// [`PanelDockState::measured`]: by `AppTab::key()` first, by `TabId` second.
     ///
@@ -584,6 +613,26 @@ impl PanelDockState {
             .insert(tab, size);
     }
 
+    /// Height `tab`'s pinned bottom section drew the last time the program tab
+    /// `layout_key` drew it; `None` before the first time.
+    fn pinned_bottom_height(&self, layout_key: &str, tab: TabId) -> Option<f32> {
+        self.pinned_bottom_heights.get(layout_key)?.get(&tab).copied()
+    }
+
+    /// Remembers what `tab`'s pinned bottom section drew while the program tab
+    /// `layout_key` was drawing it.
+    fn remember_pinned_bottom_height(&mut self, layout_key: &str, tab: TabId, height: f32) {
+        // Same lookup-before-entry reasoning as `remember_measurement`.
+        if let Some(heights) = self.pinned_bottom_heights.get_mut(layout_key) {
+            heights.insert(tab, height);
+            return;
+        }
+        self.pinned_bottom_heights
+            .entry(layout_key.to_owned())
+            .or_default()
+            .insert(tab, height);
+    }
+
     /// Extra state stored for `tab` inside the program tab `layout_key`, if the
     /// tab ever stored anything.
     ///
@@ -856,7 +905,7 @@ impl<'ctx, 'frame, C> PanelDock<'ctx, 'frame, C> {
         id: TabId,
         meta: TabMeta,
         title: TabTitle<'frame>,
-        body: TabBody<'frame, C>,
+        bodies: TabBodies<'frame, C>,
     ) {
         if self.entries.contains_key(&id) {
             runtime_log::log_warn(format!(
@@ -873,7 +922,7 @@ impl<'ctx, 'frame, C> PanelDock<'ctx, 'frame, C> {
             TabEntry {
                 meta,
                 title,
-                body: Some(body),
+                bodies: Some(bodies),
             },
         );
     }
@@ -1343,7 +1392,22 @@ fn draw_host<'frame, C>(
         // the cursor is regularly not over the panel it is dragging.
         let force_visible = carries_tab
             || matches!(drag_phase, DragPhase::Moving { panel, .. } if panel == panel_plan.id);
-        let body = entries.get_mut(&active).and_then(|entry| entry.body.take());
+        let bodies = entries.get_mut(&active).and_then(|entry| entry.bodies.take());
+        let (has_pinned_top, has_pinned_bottom) = bodies.as_ref().map_or((false, false), |b| {
+            (b.pinned_top.is_some(), b.pinned_bottom.is_some())
+        });
+        let (mut body, mut pinned_top, mut pinned_bottom) = match bodies {
+            Some(b) => (Some(b.body), b.pinned_top, b.pinned_bottom),
+            None => (None, None, None),
+        };
+        // Last frame's height of the pinned bottom section, or nothing reserved
+        // on its first frame: the section is then clipped for one frame and the
+        // repaint below lays it out properly in the next.
+        let previous_pinned_bottom = if has_pinned_bottom {
+            state.pinned_bottom_height(layout_key, active)
+        } else {
+            None
+        };
         // The tab's persisted extra state is taken OUT of the dock state for the
         // duration of the body: the closure below borrows this local, so nothing
         // of `state` is borrowed across `CollapsiblePanel::show` — which still
@@ -1362,9 +1426,26 @@ fn draw_host<'frame, C>(
             // A window that merely still receives pointer events must not claim a
             // drop the user made over a window floating above it.
             .accepts_drop(owns_pointer)
-            .show(ctx, |ui| {
-                if let Some(body) = body {
-                    body(ui, cx, &mut extras);
+            .pinned_sections(has_pinned_top, has_pinned_bottom)
+            .pinned_bottom_estimate(previous_pinned_bottom.unwrap_or(0.0))
+            // ONE closure for the three sections, so `cx` is borrowed once and
+            // lent to each section in turn; every closure is taken, so none can
+            // run twice.
+            .show_sections(ctx, |ui, section| match section {
+                PanelSection::PinnedTop => {
+                    if let Some(top) = pinned_top.take() {
+                        top(ui, cx);
+                    }
+                }
+                PanelSection::Scroll => {
+                    if let Some(body) = body.take() {
+                        body(ui, cx, &mut extras);
+                    }
+                }
+                PanelSection::PinnedBottom => {
+                    if let Some(bottom) = pinned_bottom.take() {
+                        bottom(ui, cx);
+                    }
                 }
             });
         // Back into the state, raising `dirty` only for a REAL change — see
@@ -1372,6 +1453,14 @@ fn draw_host<'frame, C>(
         // touch of `state` in this loop.
         state.finish_tab_extras(layout_key, active, extras);
         chrome = drawn.chrome;
+        if let Some(height) = drawn.pinned_bottom_height {
+            // The scroll viewport was sized from the PREVIOUS height; a section
+            // that changed needs one more frame to get the room it now takes.
+            if pinned_height_changed(previous_pinned_bottom, height) {
+                outcome.needs_repaint = true;
+            }
+            state.remember_pinned_bottom_height(layout_key, active, height);
+        }
 
         drawn_rects.push(drawn.rect);
         if gesture_in_flight {
@@ -5508,5 +5597,13 @@ mod tests {
             .expect("touching the layout dirties the state");
         assert_eq!(snapshot.sub_windows.len(), 1);
         assert_eq!(snapshot.sub_windows[0].index, 0);
+    }
+
+    #[test]
+    fn a_pinned_bottom_height_repaints_only_when_it_is_news() {
+        // The first measurement is always news: nothing was reserved for it.
+        assert!(pinned_height_changed(None, 40.0));
+        assert!(pinned_height_changed(Some(20.0), 40.0));
+        assert!(!pinned_height_changed(Some(40.0), 40.4));
     }
 }

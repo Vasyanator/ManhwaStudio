@@ -47,7 +47,9 @@ subtree and it is one-directional.
   the file IO (the save gate `settings_save_due` is shared, in
   `../../../region_edit_v2/engine_settings.rs`). Edit it to add, rename or re-default a persisted field.
 - `progress.rs`: `SdxlSharedProgress`, the poison-tolerant lock, the generation claim/retire/publish
-  helpers, the bar fraction and `draw_sdxl_progress_ui`. Edit it to change what a run reports while
+  helpers, the bar fraction, `draw_sdxl_progress_bar` (drawn by `AiEngine::draw_progress`, pinned
+  above the parameters) and `draw_sdxl_latent_preview` (inside the scrolled parameters, because it
+  persists after the run). Edit it to change what a run reports while
   it is in flight.
 - `wire.rs`: `lama_model_for_run` (the prefill gate), `sdxl_run_header`, `run_sdxl`, `unload_sdxl`,
   the streaming call, the `CallError` mapping and the request-blob packing (the PNGs come from `tools/region_png.rs`). Edit it to change what

@@ -240,6 +240,20 @@ pub trait CleaningTool {
     /// consumes at the top of its next `draw_overlay_ui`.
     fn draw_main_panel(&mut self, _ui: &mut egui::Ui) {}
 
+    /// Section pinned at the TOP of the «Редактор области» dock panel, above the scrolled
+    /// `draw_main_panel` body (a progress bar). Default: nothing, which takes no height —
+    /// the dock allocates nothing, not even an item spacing, for an empty pinned section.
+    ///
+    /// Same rules as `draw_main_panel`.
+    fn draw_main_panel_top(&mut self, _ui: &mut egui::Ui) {}
+
+    /// Section pinned at the BOTTOM of the «Редактор области» dock panel, under the scrolled
+    /// `draw_main_panel` body (the run actions). Default: nothing, which takes no height
+    /// (the same rule as `draw_main_panel_top`).
+    ///
+    /// Same rules as `draw_main_panel`.
+    fn draw_main_panel_bottom(&mut self, _ui: &mut egui::Ui) {}
+
     /// Whether this tool wants the «Библиотека знаков» dock panel shown.
     ///
     /// A SECOND tool-owned dock tab, independent of `wants_main_panel`: the tab declares it

@@ -41,6 +41,12 @@ pub(super) const FLUX2_BREAKDOWN_PEAK_DECODE: &str = "peak_decode";
 /// report it simply leaves the line out of the tooltip.
 pub(super) const FLUX2_BREAKDOWN_PEAK_ENCODE: &str = "peak_encode";
 
+/// Breakdown key of the prompt-attention mask in an `.estimate` answer — the extra memory
+/// «Внимание только к маске» costs. Present only while that option is in effect for the
+/// forecast ([`Flux2KleinSettings::to_estimate_params`]); it is a TERM of the denoise
+/// peak, not a peak of its own, and gets its own localized line in the tooltip.
+pub(super) const FLUX2_BREAKDOWN_ATTENTION_MASK: &str = "attention_mask";
+
 /// The `.estimate` answer: the backend's own forecast for the current parameters.
 ///
 /// Every figure here is COMPUTED BY THE BACKEND; this side only formats it.
@@ -96,7 +102,8 @@ pub(super) fn estimate_status_line(estimate: &Flux2Estimate, status: Option<&Flu
 
 /// Builds the hover text of the forecast line: the per-phase peaks first, in pipeline
 /// order (prompt encoding, denoise, VAE decode — the VRAM figure is the LARGEST of them,
-/// not their sum), then every other breakdown entry the backend reported.
+/// not their sum), then the prompt-attention mask's term when it is in effect, then every
+/// other breakdown entry the backend reported.
 ///
 /// Breakdown keys are backend identifiers, so they stay literal; their captions and
 /// the unit around them come from the locale, so every figure on this screen is
@@ -119,6 +126,12 @@ pub(super) fn estimate_tooltip(estimate: &Flux2Estimate) -> String {
     if let Some(bytes) = peaks.decode {
         lines.push(tf!(
             "cleaning.tools.flux2_klein.estimate_peak_decode",
+            size = format_gib(bytes)
+        ));
+    }
+    if let Some(bytes) = peaks.attention_mask {
+        lines.push(tf!(
+            "cleaning.tools.flux2_klein.estimate_attention_mask",
             size = format_gib(bytes)
         ));
     }
@@ -147,7 +160,10 @@ pub(super) struct Flux2EstimatePeaks<'a> {
     pub(super) encode: Option<u64>,
     pub(super) denoise: Option<u64>,
     pub(super) decode: Option<u64>,
-    /// Every breakdown entry that is not one of the peaks above, in the order the
+    /// The prompt-attention mask's term ([`FLUX2_BREAKDOWN_ATTENTION_MASK`]), `None` while
+    /// the option is not in effect or the backend predates it.
+    pub(super) attention_mask: Option<u64>,
+    /// Every breakdown entry that is not one of the named ones above, in the order the
     /// backend's object parsed into (key order — see [`Flux2Estimate::breakdown`]).
     pub(super) others: Vec<(&'a str, u64)>,
 }
@@ -166,21 +182,23 @@ pub(super) fn split_estimate_peaks(estimate: &Flux2Estimate) -> Flux2EstimatePea
             .find(|(key, _)| key == name)
             .map(|(_, bytes)| *bytes)
     };
-    const PEAK_KEYS: [&str; 3] = [
+    const NAMED_KEYS: [&str; 4] = [
         FLUX2_BREAKDOWN_PEAK_ENCODE,
         FLUX2_BREAKDOWN_PEAK_DENOISE,
         FLUX2_BREAKDOWN_PEAK_DECODE,
+        FLUX2_BREAKDOWN_ATTENTION_MASK,
     ];
     let others = estimate
         .breakdown
         .iter()
-        .filter(|(key, _)| !PEAK_KEYS.contains(&key.as_str()))
+        .filter(|(key, _)| !NAMED_KEYS.contains(&key.as_str()))
         .map(|(key, bytes)| (key.as_str(), *bytes))
         .collect();
     Flux2EstimatePeaks {
         encode: peak(FLUX2_BREAKDOWN_PEAK_ENCODE),
         denoise: peak(FLUX2_BREAKDOWN_PEAK_DENOISE),
         decode: peak(FLUX2_BREAKDOWN_PEAK_DECODE),
+        attention_mask: peak(FLUX2_BREAKDOWN_ATTENTION_MASK),
         others,
     }
 }
@@ -262,6 +280,23 @@ mod tests {
             split_estimate_peaks(&Flux2Estimate::default()),
             Flux2EstimatePeaks::default()
         );
+    }
+
+    /// The attention-mask term is a NAMED entry: it gets its own localized line and is
+    /// never repeated among the literal-keyed rest.
+    #[test]
+    fn the_attention_mask_term_is_named_not_literal() {
+        let estimate = Flux2Estimate {
+            breakdown: vec![
+                (FLUX2_BREAKDOWN_ATTENTION_MASK.to_string(), 300_000_000),
+                ("transformer".to_string(), 8_000_000_000),
+            ],
+            ..Flux2Estimate::default()
+        };
+        let peaks = split_estimate_peaks(&estimate);
+        assert_eq!(peaks.attention_mask, Some(300_000_000));
+        assert_eq!(peaks.others, vec![("transformer", 8_000_000_000)]);
+        assert_eq!(estimate_tooltip(&estimate).lines().count(), 2);
     }
 
     #[test]

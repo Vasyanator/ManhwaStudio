@@ -9,14 +9,15 @@ Main responsibilities:
 - own `SdxlSharedProgress` and the poison-tolerant lock around it;
 - claim and retire a run's GENERATION so a detached worker cannot drive a live bar;
 - publish one streamed `progress` frame (`publish_progress_frame`);
-- draw the bar and the latest latent preview (`draw_sdxl_progress_ui`).
+- draw the bar (`draw_sdxl_progress_bar`, pinned above the parameters) and the latest
+  latent preview (`draw_sdxl_latent_preview`, inside the scrolled parameters).
 
 Key structures:
 - `SdxlSharedProgress`
 
 Key functions:
 - `begin_progress_generation()`, `retire_progress_generation()`, `publish_progress_frame()`,
-  `draw_sdxl_progress_ui()`
+  `draw_sdxl_progress_bar()`, `draw_sdxl_latent_preview()`
 
 Notes:
 `inpaint.sdxl` streams one `progress` frame per diffusion step, carrying `step` / `total` and
@@ -156,23 +157,50 @@ pub(super) fn sdxl_progress_fraction(step: u32, total: u32) -> f32 {
     (step as f32 / total as f32).clamp(0.0, 1.0)
 }
 
-/// Draws the step progress bar and the latest live latent preview.
+/// Draws the step progress bar — the section the host pins ABOVE the parameters.
 ///
-/// Draws nothing at all while no run owns the bar and no preview has ever been uploaded, so
-/// an idle panel spends no vertical space on it. A new preview is uploaded as a texture only
-/// when the worker produced a frame newer than `preview_uploaded_seq`; a generation that was
-/// retired clears the texture instead, so a cancelled run leaves no stale image behind.
-pub(super) fn draw_sdxl_progress_ui(
+/// Draws nothing at all while no run owns the bar and no preview is shown
+/// (`preview_shown`, the texture [`draw_sdxl_latent_preview`] holds), so an idle panel
+/// spends no vertical space on it. With a preview still on screen after a run, the bar
+/// stays at the step it finished on, as the caption of that preview's run.
+pub(super) fn draw_sdxl_progress_bar(ui: &mut egui::Ui, progress: &Mutex<SdxlSharedProgress>, preview_shown: bool) {
+    let (active, step, total) = {
+        let guard = lock_progress(progress);
+        (guard.active, guard.step, guard.total)
+    };
+    if !active && !preview_shown {
+        return;
+    }
+    if total > 0 {
+        ui.add(
+            egui::ProgressBar::new(sdxl_progress_fraction(step, total))
+                .text(tf!("cleaning.common.step_progress_status", step = step, total = total)),
+        );
+    } else if active {
+        ui.add(
+            egui::ProgressBar::new(0.0).text(t!("cleaning.tools.sdxl.preparing_model_status")),
+        );
+    }
+}
+
+/// Uploads and draws the latest live latent preview — in the SCROLLED parameter body, not
+/// in the pinned progress section: it persists after the run and a pinned image would take
+/// that much height off the parameters for good.
+///
+/// A new preview is uploaded as a texture only when the worker produced a frame newer than
+/// `preview_uploaded_seq`; a generation that was retired clears the texture instead, so a
+/// cancelled run leaves no stale image behind.
+pub(super) fn draw_sdxl_latent_preview(
     ui: &mut egui::Ui,
     progress: &Mutex<SdxlSharedProgress>,
     preview_texture: &mut Option<egui::TextureHandle>,
     preview_uploaded_seq: &mut u64,
 ) {
-    let (active, step, total, new_preview, seq) = {
+    let (new_preview, seq) = {
         let guard = lock_progress(progress);
         let fresh = guard.preview_seq != *preview_uploaded_seq;
         let new_preview = if fresh { Some(guard.preview.clone()) } else { None };
-        (guard.active, guard.step, guard.total, new_preview, guard.preview_seq)
+        (new_preview, guard.preview_seq)
     };
 
     // `Some(None)` is a real answer and not "nothing to do": the shared preview was cleared
@@ -184,21 +212,6 @@ pub(super) fn draw_sdxl_progress_ui(
                 .load_texture("sdxl_latent_preview", image, egui::TextureOptions::LINEAR)
         });
         *preview_uploaded_seq = seq;
-    }
-
-    if !active && preview_texture.is_none() {
-        return;
-    }
-
-    if total > 0 {
-        ui.add(
-            egui::ProgressBar::new(sdxl_progress_fraction(step, total))
-                .text(tf!("cleaning.common.step_progress_status", step = step, total = total)),
-        );
-    } else if active {
-        ui.add(
-            egui::ProgressBar::new(0.0).text(t!("cleaning.tools.sdxl.preparing_model_status")),
-        );
     }
 
     if let Some(handle) = preview_texture.as_ref() {

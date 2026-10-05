@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `5` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `6` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 5. Optional/ignored on others.   |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 6. Optional/ignored on others.   |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -375,7 +375,7 @@ streams `phase:"download"`.
 
 | method                          | request fields (inline)                                                                 | blob(req)              | response fields (status=ok)                                            | blob(resp) | stream  | cancel |
 |---------------------------------|------------------------------------------------------------------------------------------|------------------------|--------------------------------------------------------------------------|------------|---------|--------|
-| `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `reference_len: int?`, `params: object` (see below)     | region PNG ++ mask PNG [++ reference PNG] | `image_len: int`, `oom_recovered: bool`, `applied: object`                 | result PNG | **yes** | yes    |
+| `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `reference_len: int?`, `params: object` (see below)     | region PNG ++ mask PNG [++ reference PNG] | `image_len: int`, `oom_recovered: bool`, `applied: object`, `text_attention_in_mask: bool` | result PNG | **yes** | yes    |
 | `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `memory: object`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `text_encoder_available: bool`, `guidance_supported: bool` | none | no | no |
 | `inpaint.flux2_klein.estimate`  | `params: object`, `region_width: int`, `region_height: int`                                | none                   | `vram_bytes`, `ram_bytes`, `vram_free`, `ram_free`, `fits: bool`, `breakdown: object` | none | no | no |
 | `inpaint.flux2_klein.unload`    | (none)                                                                                     | none                   | `unloaded: bool`                                                          | none       | no      | no     |
@@ -529,7 +529,8 @@ except `full_gpu`), `unload_text_encoder_after_encode: bool` (default `false`
 in every placement), `text_encoder_fp8: bool` (default `false`),
 `mask_dilate_px` (0..64, default 16), `mask_feather_px` (0..32, default 12),
 `color_match: bool` (default `true`), `whole_region: bool` (default `false`),
-`max_sequence_length` (64..512, default 512).
+`max_sequence_length` (64..512, default 512),
+`text_attention_in_mask: bool` (default `false`; see below).
 
 Region constraints, enforced by the backend and never fixed up silently: both
 sides a multiple of **16** and at least **128 px**, area at most **1048576 px²**,
@@ -559,13 +560,39 @@ fork: the blob still carries a mask, and under `whole_region: true` it must be
 SOLID (every pixel non-zero). The backend verifies that instead of trusting the
 flag and answers `status:"error"` naming how many pixels are empty, because a
 flag that disagrees with the data would otherwise surface as a partial edit the
-user was told not to expect. The mode also settles two other params by itself:
+user was told not to expect. The mode also settles other params by itself:
 `mask_dilate_px` becomes `0` (a full mask has nothing to grow into) and
 `color_match` becomes `false` (the match takes its statistics from the pixels
 OUTSIDE the mask, and here there are none — matching against the changed pixels
 would force the edit's own tone back onto the original's). `mask_feather_px`
 stays in force and ramps inwards from the region's border, which is what joins
-the regenerated region to the rest of the page.
+the regenerated region to the rest of the page. `text_attention_in_mask` is
+forced to `false` as well (see below).
+
+**`text_attention_in_mask` — the prompt acts only inside the mask.** Opt-in;
+absent means `false`, so an older client's request runs unchanged. When `true`
+the backend passes the pipeline ONE additive attention mask over the joint
+sequence `[text | noisy region tokens | the region's clean condition copy |
+reference]` (one token = 16x16 px; a token is "inside" when any of its pixels is
+set in the DILATED mask the pipeline receives). Blocked: image tokens outside the
+mask reading the text, and the text reading them — for the noisy tokens, the
+clean copy and the reference alike, since a reference must have the region's
+size and is therefore spatially aligned with it (its token (i, j) shows the
+region's pixels). Open: text <-> text, text <-> inside tokens, every image <->
+image pair. Why: the region's clean copy shows the model the whole region, so an
+instruction can be grounded on a matching object OUTSIDE the mask and edited
+there — an edit the latent blend and the composite then discard, leaving nothing
+changed under the mask. Costs: one `S x S` mask on the compute device (about
+150-330 MB at 1 MP; counted in the denoise phase of `.estimate` and of the
+pre-load guard, listed as `breakdown.attention_mask` while it is in force) and
+the flash attention kernel. It is a no-op under `whole_region` (every token is
+inside), so that mode forces it to `false`. A mask with no set pixel (refused
+before any model loads), or a negative prompt whose text length differs from
+the prompt's (guidance), is a
+`status:"error"`. The response reports the EFFECTIVE value as the top-level
+`text_attention_in_mask: bool` — beside `applied`, never inside it, because the
+client persists `applied` into the user's settings and a `whole_region` run
+must not switch the user's choice off.
 
 Response detail — `applied` is the set of memory settings ACTUALLY in force when
 the run finished, `{unload_transformer_before_vae: bool, vae_tiling: bool,
