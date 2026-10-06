@@ -10,11 +10,16 @@ Main types:
   optional ImageBubble multimodal payloads for AI API translation.
 - `MtControllerEvent`: UI-facing worker events.
 - `TranslationMtController`: MT run lifecycle with immediate cancel semantics.
-- `ActiveMtRun`: currently active run-thread metadata (`run_id`, cancel flag, handle).
+- `ActiveMtRun`: currently active run-thread metadata (`run_id`, cancel switch, handle).
+- `MtRunCancel`: a run's cancel switch: the flag checked between batches/items plus the run's
+  own `GenerationTracker` (live phase / received chars of the AI API request in flight).
 
 Runtime model:
 - each MT run is executed in its own background thread (GUI thread is never blocked);
-- `request_cancel` marks run cancelled and detaches the thread immediately;
+- `request_cancel` marks run cancelled, closes its generation tracker (which aborts the AI API
+  HTTP request in flight and every later one of that run) and detaches the thread immediately;
+- every AI API request runs through `ms_ai_api::exec_chat_tracked`; a stopped request ends the
+  run through the ordinary cancelled path (`RunCancelled`, no error);
 - detached/stale run events are ignored by `run_id` and never touch canvas state.
 
 Backend helper:
@@ -61,7 +66,9 @@ use super::machine_translators::MachineTranslatorBackend;
 use super::machine_translators::deepl::DeeplMtBackend;
 use super::machine_translators::google::GoogleMtBackend;
 use super::machine_translators::yandex::YandexMtBackend;
-use ms_ai_api::AiApiService;
+use ms_ai_api::{AiApiService, GenerationSnapshot, GenerationTracker};
+#[cfg(not(target_arch = "wasm32"))]
+use ms_ai_api::{AiApiError, exec_chat_tracked};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::AiApiTarget;
 #[cfg(not(target_arch = "wasm32"))]
@@ -439,10 +446,39 @@ pub enum MtControllerEvent {
     },
 }
 
+/// One run's cancel switch, shared by the controller and the run thread. The run's
+/// `GenerationTracker` is fresh per run, so a detached (cancelled) run can never touch the
+/// progress shown for the next one.
+#[derive(Debug, Clone)]
+struct MtRunCancel {
+    /// Checked by the run between batches and items.
+    requested: Arc<AtomicBool>,
+    /// Live state of the run's AI API request in flight; closed on cancel, which aborts it.
+    generation: GenerationTracker,
+}
+
+impl MtRunCancel {
+    fn new() -> Self {
+        Self { requested: Arc::new(AtomicBool::new(false)), generation: GenerationTracker::new() }
+    }
+
+    /// Cancels the run: sets the flag, THEN closes the tracker, so a run whose request returns
+    /// `AiApiError::Cancelled` always sees the flag set (the tracker's mutex orders the two) and
+    /// no request of this run can start after a flag check that ran just before the cancel.
+    fn request(&self) {
+        self.requested.store(true, Ordering::Relaxed);
+        self.generation.close();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug)]
 struct ActiveMtRun {
     run_id: u64,
-    cancel_requested: Arc<AtomicBool>,
+    cancel_requested: MtRunCancel,
     thread: JoinHandle<()>,
 }
 
@@ -490,8 +526,8 @@ impl TranslationMtController {
         self.reap_detached_run_threads();
         let run_id = self.next_run_id;
         self.next_run_id = self.next_run_id.saturating_add(1);
-        let cancel_requested = Arc::new(AtomicBool::new(false));
-        let run_cancel_requested = Arc::clone(&cancel_requested);
+        let cancel_requested = MtRunCancel::new();
+        let run_cancel_requested = cancel_requested.clone();
         let evt_tx = self.evt_tx.clone();
 
         let thread = thread::spawn(move || {
@@ -515,13 +551,21 @@ impl TranslationMtController {
         Ok(())
     }
 
+    /// Live state of the active run's AI API request (inactive when no run is active, for the
+    /// legacy translators, and between two requests).
+    pub fn generation_snapshot(&self) -> GenerationSnapshot {
+        self.active_run.as_ref().map_or(GenerationSnapshot::IDLE, |run| run.cancel_requested.generation.snapshot())
+    }
+
+    /// Cancels the active run (flag + its AI API request in flight, see `MtRunCancel::request`)
+    /// and detaches its thread. Returns `false` when nothing was running.
     pub fn request_cancel(&mut self) -> bool {
         if !self.busy {
             return false;
         }
         self.busy = false;
         if let Some(run) = self.active_run.take() {
-            run.cancel_requested.store(true, Ordering::Relaxed);
+            run.cancel_requested.request();
             self.detached_run_threads.push(run.thread);
             return true;
         }
@@ -668,7 +712,7 @@ impl Drop for TranslationMtController {
     fn drop(&mut self) {
         self.busy = false;
         if let Some(run) = self.active_run.take() {
-            run.cancel_requested.store(true, Ordering::Relaxed);
+            run.cancel_requested.request();
             self.detached_run_threads.push(run.thread);
         }
         self.reap_detached_run_threads();
@@ -726,7 +770,7 @@ fn run_translate_request(
     run_id: u64,
     request: MtTranslateRequest,
     evt_tx: &Sender<WorkerEvent>,
-    cancel_requested: &Arc<AtomicBool>,
+    cancel_requested: &MtRunCancel,
 ) {
     let MtTranslateRequest {
         service,
@@ -764,7 +808,7 @@ fn run_translate_request(
         if !item.needs_translation {
             continue;
         }
-        if cancel_requested.load(Ordering::Relaxed) {
+        if cancel_requested.is_requested() {
             let _ = evt_tx.send(WorkerEvent::RunCancelled {
                 run_id,
                 translated,
@@ -777,7 +821,7 @@ fn run_translate_request(
         let backend_result =
             translate_texts_via_translator(service, &source_lang, &target_lang, vec![item.text]);
 
-        if cancel_requested.load(Ordering::Relaxed) {
+        if cancel_requested.is_requested() {
             let _ = evt_tx.send(WorkerEvent::RunCancelled {
                 run_id,
                 translated,
@@ -922,7 +966,7 @@ fn run_ai_translate_request(
     _items: Vec<MtTranslateItem>,
     _options: AiMtOptions,
     evt_tx: &Sender<WorkerEvent>,
-    _cancel_requested: &Arc<AtomicBool>,
+    _cancel_requested: &MtRunCancel,
     _translated: &mut usize,
     _errors: &mut usize,
 ) {
@@ -941,7 +985,7 @@ fn run_ai_translate_request(
     mut items: Vec<MtTranslateItem>,
     options: AiMtOptions,
     evt_tx: &Sender<WorkerEvent>,
-    cancel_requested: &Arc<AtomicBool>,
+    cancel_requested: &MtRunCancel,
     translated: &mut usize,
     errors: &mut usize,
 ) {
@@ -1019,7 +1063,7 @@ fn run_ai_translate_request(
         return;
     }
 
-    if cancel_requested.load(Ordering::Relaxed) {
+    if cancel_requested.is_requested() {
         let _ = evt_tx.send(WorkerEvent::RunCancelled {
             run_id,
             translated: *translated,
@@ -1044,7 +1088,7 @@ async fn run_ai_translate_async(
     options: AiMtOptions,
     api_key: String,
     evt_tx: &Sender<WorkerEvent>,
-    cancel_requested: &Arc<AtomicBool>,
+    cancel_requested: &MtRunCancel,
     translated: &mut usize,
     errors: &mut usize,
 ) -> Result<(), String> {
@@ -1096,7 +1140,7 @@ async fn run_ai_translate_async(
 
     for (batch_idx, chunk) in batches.into_iter().enumerate() {
         let batch_no = batch_idx + 1;
-        if cancel_requested.load(Ordering::Relaxed) {
+        if cancel_requested.is_requested() {
             runtime_log::log_info(format!(
                 "[MT][run {run_id}] cancelled before batch {batch_no}/{batch_total} (translated={translated}, errors={errors})",
                 translated = *translated,
@@ -1129,21 +1173,29 @@ async fn run_ai_translate_async(
             history_batch_sizes.len(),
         ));
         chat_req = chat_req.append_message(user_message);
-        let response = match client
-            .exec_chat(model.clone(), chat_req.clone(), chat_options.as_ref())
-            .await
-        {
-            Ok(response) => response,
+        // Tag 0: MT's Stop cancels the whole run (`request_cancel`), it never targets one request.
+        let response_text = match exec_chat_tracked(&client, model.clone(), chat_req.clone(), chat_options.as_ref(), &cancel_requested.generation, 0).await {
+            Ok(text) => text.trim().to_string(),
+            // Only `request_cancel` / drop close the tracker, after setting the flag: the caller
+            // reports `RunCancelled`.
+            Err(AiApiError::Cancelled) => {
+                runtime_log::log_info(format!(
+                    "[MT][run {run_id}] cancelled during batch {batch_no}/{batch_total} (translated={translated}, errors={errors})",
+                    translated = *translated,
+                    errors = *errors,
+                ));
+                return Ok(());
+            }
             Err(err) => {
                 // Log the raw provider error before it is wrapped and surfaced as RunFailed, so the
                 // exact cause (rate limit, quota, oversized request, network) is recoverable.
+                let detail = err.chat_failure_detail();
                 runtime_log::log_error(format!(
-                    "[MT][run {run_id}] batch {batch_no}/{batch_total}: provider request failed: {err}"
+                    "[MT][run {run_id}] batch {batch_no}/{batch_total}: provider request failed: {detail}"
                 ));
-                return Err(tf!("translation.mt.ai_translate_failed_error", err = err));
+                return Err(tf!("translation.mt.ai_translate_failed_error", err = detail));
             }
         };
-        let response_text = response.first_text().unwrap_or("").trim().to_string();
         let batch_result = parse_ai_mt_response(&response_text);
         match &batch_result {
             Ok(parsed) => runtime_log::log_info(format!(
@@ -1167,7 +1219,7 @@ async fn run_ai_translate_async(
                     if !item.needs_translation {
                         continue;
                     }
-                    if cancel_requested.load(Ordering::Relaxed) {
+                    if cancel_requested.is_requested() {
                         return Ok(());
                     }
                     let entry = translations
@@ -1295,7 +1347,7 @@ async fn run_ai_imagebubble_translate_async(
     options: AiMtOptions,
     api_key: String,
     evt_tx: &Sender<WorkerEvent>,
-    cancel_requested: &Arc<AtomicBool>,
+    cancel_requested: &MtRunCancel,
     translated: &mut usize,
     errors: &mut usize,
 ) -> Result<(), String> {
@@ -1328,7 +1380,7 @@ async fn run_ai_imagebubble_translate_async(
     let mut target_no = 0usize;
 
     for item in &items {
-        if cancel_requested.load(Ordering::Relaxed) {
+        if cancel_requested.is_requested() {
             runtime_log::log_info(format!(
                 "[MT][run {run_id}] cancelled (translated={translated}, errors={errors})",
                 translated = *translated,
@@ -1393,20 +1445,28 @@ async fn run_ai_imagebubble_translate_async(
             image_bytes / 1024,
         ));
 
-        let response = match client
-            .exec_chat(model.clone(), chat_req, chat_options.as_ref())
-            .await
-        {
-            Ok(response) => response,
+        // Tag 0: MT's Stop cancels the whole run (`request_cancel`), it never targets one request.
+        let response_text = match exec_chat_tracked(&client, model.clone(), chat_req, chat_options.as_ref(), &cancel_requested.generation, 0).await {
+            Ok(text) => text.trim().to_string(),
+            // Only `request_cancel` / drop close the tracker, after setting the flag: the caller
+            // reports `RunCancelled`.
+            Err(AiApiError::Cancelled) => {
+                runtime_log::log_info(format!(
+                    "[MT][run {run_id}] cancelled during target {target_no}/{target_total} (translated={translated}, errors={errors})",
+                    translated = *translated,
+                    errors = *errors,
+                ));
+                return Ok(());
+            }
             Err(err) => {
+                let detail = err.chat_failure_detail();
                 runtime_log::log_error(format!(
-                    "[MT][run {run_id}] target {target_no}/{target_total} (id={}): provider request failed: {err}",
+                    "[MT][run {run_id}] target {target_no}/{target_total} (id={}): provider request failed: {detail}",
                     item.bubble_id,
                 ));
-                return Err(tf!("translation.mt.ai_translate_failed_error", err = err));
+                return Err(tf!("translation.mt.ai_translate_failed_error", err = detail));
             }
         };
-        let response_text = response.first_text().unwrap_or("").trim().to_string();
 
         let resolved = match parse_ai_mt_response(&response_text) {
             Ok(translations) => {

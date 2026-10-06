@@ -16,7 +16,11 @@
 //      пользовательским оверлеем, который worker использует вместо crop страницы.
 // - AI API OCR builds `genai` multimodal chat calls (through `ms_ai_api`: target with the
 //   base URL of a compatible service, client, credential-store API keys (optional for a
-//   compatible service), async bridge) from the worker thread.
+//   compatible service), async bridge) from the worker thread and runs them through the
+//   tracked streaming executor `ms_ai_api::exec_chat_tracked`: the controller's
+//   `GenerationTracker` shows the live phase / received characters in the panel, and
+//   "Stop" (`cancel_generation`) or dropping the controller aborts the HTTP request; a
+//   stopped request is published as `RecognizeCancelled`, never as an error.
 // - Post-OCR processing (`apply_post_ocr_processing`) runs in the worker before
 //   the result is published, so every engine path and the stored last result
 //   share the same text: character substitution (`CharReplacementRule`) first,
@@ -38,7 +42,9 @@ use ms_onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
 // AI API OCR (`genai`, reached through `ms_ai_api`) is native-only: `genai` is not
 // compiled for wasm. The worker command/event enums and the controller stay
 // target-neutral; only the bodies that build `genai` requests are gated below.
-use ms_ai_api::{AiApiService, AiApiTarget};
+use ms_ai_api::{AiApiService, AiApiTarget, GenerationSnapshot, GenerationTracker};
+#[cfg(not(target_arch = "wasm32"))]
+use ms_ai_api::AiApiError;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::genai::chat::{ChatMessage, ChatRequest, ContentPart};
 use image::{DynamicImage, GenericImageView, ImageFormat};
@@ -233,6 +239,10 @@ pub enum OcrControllerEvent {
         request_id: u64,
         error: String,
     },
+    /// The user stopped the request (AI API "Stop"); a neutral outcome, not a failure.
+    RecognizeCancelled {
+        request_id: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -244,6 +254,8 @@ pub struct TranslationOcrController {
     cmd_tx: Sender<WorkerCommand>,
     evt_rx: Receiver<WorkerEvent>,
     worker_thread: Option<JoinHandle<()>>,
+    /// Live state and Stop switch of the AI API request the worker runs (shared with it).
+    generation: GenerationTracker,
 }
 
 impl Default for TranslationOcrController {
@@ -256,7 +268,9 @@ impl TranslationOcrController {
     pub fn new() -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
         let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
-        let worker_thread = thread::spawn(move || worker_loop(cmd_rx, evt_tx));
+        let generation = GenerationTracker::new();
+        let worker_generation = generation.clone();
+        let worker_thread = thread::spawn(move || worker_loop(cmd_rx, evt_tx, &worker_generation));
         Self {
             state: OcrLoadState::NotLoaded,
             last_error: None,
@@ -265,7 +279,21 @@ impl TranslationOcrController {
             cmd_tx,
             evt_rx,
             worker_thread: Some(worker_thread),
+            generation,
         }
+    }
+
+    /// Live state of the AI API OCR request in flight, for the panel's generation widget.
+    pub fn generation_snapshot(&self) -> GenerationSnapshot {
+        self.generation.snapshot()
+    }
+
+    /// Stops AI API generation `run_id` (the `run_id` of the snapshot the "Stop" was clicked on)
+    /// if it is still in flight: the HTTP request is dropped and the request ends with
+    /// `OcrControllerEvent::RecognizeCancelled`. A generation that already finished is left
+    /// alone, so a stale click never stops a later queued request. Queued requests still run.
+    pub fn cancel_generation(&self, run_id: u64) {
+        self.generation.cancel_run(run_id);
     }
 
     pub fn state(&self) -> OcrLoadState {
@@ -369,6 +397,16 @@ impl TranslationOcrController {
                     self.last_result = Some(result.clone());
                     out.push(OcrControllerEvent::Recognized { request_id, result });
                 }
+                Ok(WorkerEvent::RecognizeCancelled { request_id }) => {
+                    // The engine itself is fine: a stop is not an error, so any earlier error
+                    // text is cleared like after a successful recognize.
+                    self.last_error = None;
+                    if self.state != OcrLoadState::Ready {
+                        self.set_state(OcrLoadState::Ready);
+                        out.push(OcrControllerEvent::StateChanged(OcrLoadState::Ready));
+                    }
+                    out.push(OcrControllerEvent::RecognizeCancelled { request_id });
+                }
                 Ok(WorkerEvent::RecognizeErr { request_id, error }) => {
                     self.last_error = Some(error.clone());
                     self.set_state(OcrLoadState::Error);
@@ -394,6 +432,11 @@ impl TranslationOcrController {
 
 impl Drop for TranslationOcrController {
     fn drop(&mut self) {
+        // Abort the AI API request in flight first, and make every queued AI API request return
+        // before its keyring read (`run_ai_api_ocr_request` checks `is_closed`): the join below
+        // would otherwise block the GUI thread until the provider answers. Queued non-AI
+        // (backend / native) requests still run before the worker sees `Stop`.
+        self.generation.close();
         let _ = self.cmd_tx.send(WorkerCommand::Stop);
         if let Some(handle) = self.worker_thread.take() {
             let _ = handle.join();
@@ -425,9 +468,12 @@ enum WorkerEvent {
         request_id: u64,
         error: String,
     },
+    RecognizeCancelled {
+        request_id: u64,
+    },
 }
 
-fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
+fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>, generation: &GenerationTracker) {
     let mut page_cache = PageImageCache::new(OCR_PAGE_CACHE_MAX_ITEMS, OCR_PAGE_CACHE_MAX_BYTES);
 
     while let Ok(command) = cmd_rx.recv() {
@@ -444,7 +490,7 @@ fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
                 }
             }
             WorkerCommand::Recognize(request) => {
-                if run_recognize_command(request, &mut page_cache, &cmd_rx, &evt_tx).is_break() {
+                if run_recognize_command(request, &mut page_cache, &cmd_rx, &evt_tx, generation).is_break() {
                     break;
                 }
             }
@@ -636,6 +682,12 @@ fn publish_recognize(
         Ok(result) => WorkerEvent::RecognizeOk { request_id, result },
         Err(error) => WorkerEvent::RecognizeErr { request_id, error },
     };
+    publish_worker_event(event, evt_tx)
+}
+
+/// Sends `event` to the controller. Returns `ControlFlow::Break` if the event
+/// channel is gone (the worker should stop).
+fn publish_worker_event(event: WorkerEvent, evt_tx: &Sender<WorkerEvent>) -> std::ops::ControlFlow<()> {
     if evt_tx.send(event).is_err() {
         std::ops::ControlFlow::Break(())
     } else {
@@ -960,17 +1012,25 @@ fn run_recognize_command(
     page_cache: &mut PageImageCache,
     cmd_rx: &Receiver<WorkerCommand>,
     evt_tx: &Sender<WorkerEvent>,
+    generation: &GenerationTracker,
 ) -> std::ops::ControlFlow<()> {
     loop {
         let request_id = request.request_id;
 
         // The AI-API engine runs over `genai`, not the framed socket, so it has
-        // no IPC cancel; run it synchronously like before.
+        // no IPC cancel; it runs synchronously and is stopped through the
+        // generation tracker instead (the panel's "Stop", or the controller drop).
         if request.engine == OcrEngine::AiApi {
-            let result = run_ai_api_ocr_request(&request, page_cache).map(|mut result| {
-                apply_post_ocr_processing(&mut result, &request);
-                result
-            });
+            let result = match run_ai_api_ocr_request(&request, page_cache, generation) {
+                Ok(mut result) => {
+                    apply_post_ocr_processing(&mut result, &request);
+                    Ok(result)
+                }
+                Err(AiApiOcrFailure::Cancelled) => {
+                    return publish_worker_event(WorkerEvent::RecognizeCancelled { request_id }, evt_tx);
+                }
+                Err(AiApiOcrFailure::Failed(error)) => Err(error),
+            };
             return publish_recognize(request_id, result, evt_tx);
         }
 
@@ -1309,21 +1369,45 @@ fn validate_ai_api_options(options: &OcrRuntimeOptions) -> Result<AiApiTarget, S
     Ok(target)
 }
 
+/// Why an AI API recognize produced no result.
+#[derive(Debug)]
+enum AiApiOcrFailure {
+    /// The user stopped the request (or the controller was dropped): published as
+    /// `RecognizeCancelled`, never as an error.
+    Cancelled,
+    /// A real failure; the text is the user-facing error.
+    Failed(String),
+}
+
+impl From<String> for AiApiOcrFailure {
+    fn from(error: String) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// Web stub: AI-API OCR runs over `genai` + `tokio`, which are not compiled for
 /// the browser build. Returns a clear error instead of a fake recognition.
 #[cfg(target_arch = "wasm32")]
 fn run_ai_api_ocr_request(
     _request: &OcrRecognizeRequest,
     _page_cache: &mut PageImageCache,
-) -> Result<OcrRecognizeResult, String> {
-    Err(t!("translation.ocr.ai_api_web_unavailable_error").to_string())
+    _generation: &GenerationTracker,
+) -> Result<OcrRecognizeResult, AiApiOcrFailure> {
+    Err(AiApiOcrFailure::Failed(t!("translation.ocr.ai_api_web_unavailable_error").to_string()))
 }
 
+/// Recognizes the request's crop with the selected AI API model, streamed through
+/// `ms_ai_api::exec_chat_tracked` so `generation` shows its progress and can stop it.
 #[cfg(not(target_arch = "wasm32"))]
 fn run_ai_api_ocr_request(
     request: &OcrRecognizeRequest,
     page_cache: &mut PageImageCache,
-) -> Result<OcrRecognizeResult, String> {
+    generation: &GenerationTracker,
+) -> Result<OcrRecognizeResult, AiApiOcrFailure> {
+    // The controller is gone: skip the crop and the (possibly blocking) keyring read.
+    if generation.is_closed() {
+        return Err(AiApiOcrFailure::Cancelled);
+    }
     let target = validate_ai_api_options(&request.options)?;
     let crop_png = crop_image_as_png(request, page_cache)?;
     let service = target.service();
@@ -1351,13 +1435,15 @@ fn run_ai_api_ocr_request(
                     Some("ocr-crop.png".to_string()),
                 ),
             ]));
-        let chat_res = client
-            .exec_chat(model, chat_req, None)
-            .await
-            .map_err(|err| tf!("translation.ocr.ai_api_request_failed_error", err = err))?;
-        Ok::<String, String>(chat_res.first_text().unwrap_or("").trim().to_string())
+        // Tagged with the request id, so a "Stop" can tell which request it was shown for.
+        ms_ai_api::exec_chat_tracked(&client, model, chat_req, None, generation, request.request_id).await
     })
-    .map_err(|err| tf!("translation.ocr.async_runtime_error", err = err))??;
+    .map_err(|err| tf!("translation.ocr.async_runtime_error", err = err))?;
+    let text = match text {
+        Ok(text) => text.trim().to_string(),
+        Err(AiApiError::Cancelled) => return Err(AiApiOcrFailure::Cancelled),
+        Err(err) => return Err(AiApiOcrFailure::Failed(tf!("translation.ocr.ai_api_request_failed_error", err = err.chat_failure_detail()))),
+    };
 
     let lines = text
         .lines()

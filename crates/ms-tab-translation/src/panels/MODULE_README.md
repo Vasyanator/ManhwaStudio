@@ -24,9 +24,15 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
 
 ## Files and submodules
 - `mod.rs`: panel module declarations.
-- `ocr.rs`: OCR engine/language/model controls, the AI API engine options (the shared
-  `ms_ai_api::draw_connection` widget, id salt `translation_ocr_ai_api`, inside this panel's own
-  height-capped `ScrollArea` and 300 px width), behavior
+- `mod.rs`: module declarations and `section_header_button`, the one "▶ / ▼ title" header
+  button of the hand-rolled collapsible sections (MT accordion, OCR AI API connection section).
+- `ocr.rs`: OCR engine/language/model controls, the AI API engine options (a collapsible
+  "service, key and instruction" section — `OcrPanelOptions::ai_api_connection_open`, collapsed by
+  default and not persisted, like MT's — holding the shared `ms_ai_api::draw_connection` widget,
+  id salt `translation_ocr_ai_api`, inside this panel's own height-capped `ScrollArea` and 300 px
+  width), the shared `ms_ai_api::draw_generation_status` widget right before the "Статус:" block
+  while an AI API request is in flight (its Stop -> `OcrPanelActions::stop_generation`, carrying the clicked snapshot so the tab stops
+  exactly that generation), behavior
   toggles, load action, selection-mode hints, and last result/error preview. The "Заменять
   символы" master toggle expands an inline editor of post-OCR substitution rules (per-row enable,
   quoted comma-separated targets, replacement, delete); `runtime_char_replacements` parses the
@@ -72,7 +78,12 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   controls: a "connection" accordion section (source/target languages, then the shared
   `ms_ai_api::draw_connection` widget, id salt `translation_mt_ai_api`) and the
   batching/context section, ImageBubble inclusion and image visual-detail controls (blocked only
-  for a model `ms_ai_api::image_input_support` lists as text-only; `Unknown` models are allowed), plus start/cancel actions. On the AI API tab the start buttons also expose
+  for a model `ms_ai_api::image_input_support` lists as text-only; `Unknown` models are allowed), plus start/cancel actions.
+  The tab lends the run view as one `MtPanelRun` (busy, can-cancel, progress, generation
+  snapshot); on the AI API tab `ms_ai_api::draw_generation_status` sits under the start/cancel row,
+  outside both sections, its Stop setting `MtPanelActions::cancel`, and the generic
+  "Translating…" line is hidden while it shows (the counters stay); it stays shown in the gaps
+  between two requests of a busy run, so it does not flicker between batches. On the AI API tab the start buttons also expose
   a right-click "Отобразить полный запрос" debug action (`MtPanelActions::preview_request_page` /
   `preview_request_all`) that asks `tab.rs` to assemble and display the first request without
   sending it.

@@ -5,6 +5,8 @@ UI panel for machine translation options in Translation tab.
 Main items:
 - `MtPanelOptions`: selected MT service + source/target languages.
 - `MtPanelProgress`: transient run progress shown while a translation is active.
+- `MtPanelRun`: the per-frame run view the tab lends the panel (busy, can-cancel, progress and
+  the live AI API generation snapshot).
 - `MtStopNotice`: sticky yellow notice shown when an AI run stopped due to a probable credit/quota or
   usage-limit error, with a toggle that reveals the full provider error.
 - AI API MT options: the connection section (source/target languages, then the shared
@@ -15,6 +17,9 @@ Main items:
   original vs translation). Image modes are blocked only for a model `ms_ai_api::image_input_support`
   lists as text-only (`NotSupported`); `Supported` and `Unknown` models may use them.
 - `MtPanelActions`: UI actions requested by the user (`start` + `cancel`).
+- On the AI API tab the shared `ms_ai_api::draw_generation_status` widget sits under the
+  start/cancel row, outside both accordion sections; its "Stop" is the same action as the
+  cancel button (`MtPanelActions::cancel`).
 - `draw_machine_translation_panel`: renders settings and action buttons. Its
   `project_context_available` flag (false in a single-image session, which has no title) hides the
   notes / characters / terms toggles; the prompt builder ignores them there too.
@@ -28,7 +33,8 @@ Notes:
 use crate::machine_translation::{
     AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtReasoning, AiMtSortMode, MtService,
 };
-use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, ImageInputSupport, draw_connection, image_input_support};
+use crate::panels::section_header_button;
+use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, GenerationSnapshot, ImageInputSupport, draw_connection, draw_generation_status, image_input_support};
 use ms_widgets::WheelComboBox;
 
 #[derive(Debug, Clone)]
@@ -114,10 +120,25 @@ pub enum AiMtPanelSection {
     Translation,
 }
 
+/// What the panel shows about the current MT run, lent by the tab each frame.
+#[derive(Debug, Clone, Copy)]
+pub struct MtPanelRun {
+    /// A run is in progress: the start buttons are disabled and the progress is shown.
+    pub busy: bool,
+    /// The cancel button is enabled (a run is active or pending).
+    pub can_cancel: bool,
+    /// Counters of the active run, when known.
+    pub progress: Option<MtPanelProgress>,
+    /// Live state of the AI API request in flight (`TranslationMtController::generation_snapshot`);
+    /// inactive for the legacy translators.
+    pub generation: GenerationSnapshot,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MtPanelActions {
     pub start_all: bool,
     pub start_page: bool,
+    /// The cancel button, or the generation widget's "Stop" (same action), was clicked.
     pub cancel: bool,
     pub options_changed: bool,
     /// Key save / delete / metadata refresh requested in the AI API connection widget (its
@@ -314,15 +335,14 @@ const MT_TARGET_LANGUAGES: &[MtLanguage] = &[
     },
 ];
 
-/// Draws the MT panel and returns this frame's user actions. `project_context_available` is
+/// Draws the MT panel and returns this frame's user actions. `run` is the tab's view of the
+/// current run. `project_context_available` is
 /// `false` in a single-image session: the notes / characters / terms toggles are then hidden
 /// (their persisted values stay untouched; `machine_translation::project_context_sources`
 /// ignores them for such a run).
 pub fn draw_machine_translation_panel(
     ui: &mut egui::Ui,
-    busy: bool,
-    can_cancel: bool,
-    progress: Option<MtPanelProgress>,
+    run: MtPanelRun,
     stop_notice: &mut Option<MtStopNotice>,
     options: &mut MtPanelOptions,
     project_context_available: bool,
@@ -346,9 +366,9 @@ pub fn draw_machine_translation_panel(
 
     match options.active_tab {
         MtPanelTab::Machine => {
-            draw_machine_tab(ui, busy, can_cancel, progress, options, &mut actions)
+            draw_machine_tab(ui, run, options, &mut actions)
         }
-        MtPanelTab::AiApi => draw_ai_api_tab(ui, busy, can_cancel, progress, options, project_context_available, &mut actions),
+        MtPanelTab::AiApi => draw_ai_api_tab(ui, run, options, project_context_available, &mut actions),
     }
 
     draw_mt_stop_notice(ui, stop_notice);
@@ -408,12 +428,11 @@ fn draw_mt_stop_notice(ui: &mut egui::Ui, stop_notice: &mut Option<MtStopNotice>
 
 fn draw_machine_tab(
     ui: &mut egui::Ui,
-    busy: bool,
-    can_cancel: bool,
-    progress: Option<MtPanelProgress>,
+    run: MtPanelRun,
     options: &mut MtPanelOptions,
     actions: &mut MtPanelActions,
 ) {
+    let MtPanelRun { busy, can_cancel, progress, generation: _ } = run;
     actions.options_changed |= draw_service_combo(ui, &mut options.service);
 
     actions.options_changed |=
@@ -457,19 +476,18 @@ fn draw_machine_tab(
     });
 
     if busy {
-        draw_translation_progress_status(ui, progress);
+        draw_translation_progress_status(ui, progress, true);
     }
 }
 
 fn draw_ai_api_tab(
     ui: &mut egui::Ui,
-    busy: bool,
-    can_cancel: bool,
-    progress: Option<MtPanelProgress>,
+    run: MtPanelRun,
     options: &mut MtPanelOptions,
     project_context_available: bool,
     actions: &mut MtPanelActions,
 ) {
+    let MtPanelRun { busy, can_cancel, progress, generation } = run;
     actions.options_changed |=
         normalize_selected_lang(&mut options.source_lang, MT_SOURCE_LANGUAGES, "auto");
     actions.options_changed |=
@@ -540,17 +558,28 @@ fn draw_ai_api_tab(
                 actions.cancel = true;
             }
         });
+        // Outside both accordion sections, so the request in flight stays visible and stoppable
+        // whichever section is open. Its "Stop" is the cancel button's action. Kept visible in
+        // the gaps between two requests of a busy run (its first request has begun: `run_id > 0`;
+        // the last request's phase and counts stay until the next one resets them), so the
+        // widget does not flicker between batches.
+        let shown = GenerationSnapshot { active: generation.active || (busy && generation.run_id > 0), ..generation };
+        if draw_generation_status(ui, &shown) && can_cancel {
+            actions.cancel = true;
+        }
         if busy {
-            draw_translation_progress_status(ui, progress);
+            // The generation widget already says what the run is doing; only the counters remain.
+            draw_translation_progress_status(ui, progress, !shown.active);
         }
     });
 }
 
-fn draw_translation_progress_status(ui: &mut egui::Ui, progress: Option<MtPanelProgress>) {
-    ui.colored_label(
-        ms_theme::status::INFO,
-        t!("translation.mt_panel.translating_status"),
-    );
+/// The run's progress lines; `show_translating_label` adds the generic "Translating…" line,
+/// omitted while the generation widget above already shows the request's phase.
+fn draw_translation_progress_status(ui: &mut egui::Ui, progress: Option<MtPanelProgress>, show_translating_label: bool) {
+    if show_translating_label {
+        ui.colored_label(ms_theme::status::INFO, t!("translation.mt_panel.translating_status"));
+    }
     if let Some(progress) = progress {
         ui.small(tf!("translation.mt_panel.progress_status", done = progress.translated, total = progress.total, errors = progress.errors));
         if progress.context_budget_chars > 0 {
@@ -571,15 +600,14 @@ fn ai_section_content_max_height(ui: &egui::Ui) -> f32 {
     (ui.ctx().content_rect().height() * 0.7 - 110.0).max(120.0)
 }
 
+/// Accordion header of `section`: a click opens that section (and so closes the other one).
 fn draw_ai_section_header(
     ui: &mut egui::Ui,
     options: &mut MtPanelOptions,
     section: AiMtPanelSection,
     title: &str,
 ) {
-    let expanded = options.ai_open_section == section;
-    let prefix = if expanded { "▼" } else { "▶" };
-    if ui.button(format!("{prefix} {title}")).clicked() {
+    if section_header_button(ui, options.ai_open_section == section, title) {
         options.ai_open_section = section;
     }
 }

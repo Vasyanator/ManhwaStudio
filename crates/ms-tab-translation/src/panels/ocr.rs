@@ -20,13 +20,20 @@ UI specifics:
 - EasyOCR/PaddleOCR model dropdown options are alphabetically sorted by title.
 - The AI API engine options are the shared `ms_ai_api::draw_connection` widget
   (state in `OcrPanelOptions::ai_api`, requests in `OcrPanelActions::ai_api`),
-  wrapped here in the OCR panel's own height-capped `ScrollArea` and 300 px width.
+  inside a collapsible "service, key and instruction" section (the shared
+  `panels::section_header_button`, open state `ai_api_connection_open`, collapsed
+  by default and not persisted, like the MT panel's connection section), wrapped
+  in the OCR panel's own height-capped `ScrollArea` and 300 px width.
+- The shared `ms_ai_api::draw_generation_status` widget (live phase, received
+  characters, "Stop" -> `OcrPanelActions::stop_generation`) sits right before the
+  "Статус:" block, outside the engine options, whenever an AI API request is in flight.
 - Legacy local PaddleOCR engine keys are normalized back to `PaddleOCR`
   by the Translation tab loader.
 */
 
 use crate::ocr::{CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult};
-use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, draw_connection};
+use crate::panels::section_header_button;
+use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, GenerationSnapshot, draw_connection, draw_generation_status};
 use crate::panels::ocr_langs::{
     EASYOCR_FULL_LANGUAGES, EASYOCR_MAIN_LANGUAGES, PADDLEOCR_FULL_LANGUAGES,
     PADDLEOCR_MAIN_LANGUAGES, lang_label,
@@ -58,6 +65,8 @@ pub struct OcrPanelOptions {
     pub surya_max_tokens: u32,
     /// AI API engine connection (service, model, system instruction are persisted by the tab).
     pub ai_api: AiApiConnectionState,
+    /// The AI API "service, key and instruction" section is expanded (UI-only, not persisted).
+    pub ai_api_connection_open: bool,
     pub join_newlines: bool,
     pub reflect_strings: bool,
     /// Lower an entirely uppercase Latin/Cyrillic OCR result to sentence case.
@@ -120,6 +129,7 @@ impl Default for OcrPanelOptions {
             surya_max_sliding_window: 0,
             surya_max_tokens: 0,
             ai_api: AiApiConnectionState::new("You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /"),
+            ai_api_connection_open: false,
             join_newlines: true,
             reflect_strings: false,
             fix_caps_lock: true,
@@ -199,6 +209,9 @@ pub struct OcrPanelActions {
     /// Key save / delete / metadata refresh requested in the AI API connection widget (its
     /// `options_changed` is also folded into `options_changed` above).
     pub ai_api: AiApiConnectionActions,
+    /// "Stop" was clicked in the generation status widget, on this snapshot (its `run_id` and
+    /// `request_tag` = OCR request id say which generation to stop).
+    pub stop_generation: Option<GenerationSnapshot>,
 }
 
 /// AiRequirement gating the engine-SELECTION button (permissive: MangaOCR is
@@ -292,7 +305,9 @@ fn engine_select_button(
 /// selection buttons gate on a per-engine [`AiRequirement`] (optimistic while the
 /// capability is unknown); the selected engine's options interface and the load
 /// button are disabled together when the selected engine+model requirement is
-/// known-unavailable. AiApi stays ungated (network-only).
+/// known-unavailable. AiApi stays ungated (network-only). `generation` is the OCR
+/// controller's live AI API request state; while it is active the generation status
+/// widget is drawn and its "Stop" sets `OcrPanelActions::stop_generation`.
 // Parameters represent distinct required inputs with no natural grouping.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_ocr_panel(
@@ -305,6 +320,7 @@ pub fn draw_ocr_panel(
     quick_selection_active: bool,
     advanced_selection_shortcut: Option<&str>,
     advanced_selection_active: bool,
+    generation: &GenerationSnapshot,
 ) -> OcrPanelActions {
     let mut actions = OcrPanelActions::default();
     let caps = AiCaps::current();
@@ -504,6 +520,14 @@ pub fn draw_ocr_panel(
             }
         }
     });
+    // Outside the engine options (and their collapsible section), so an AI API request in
+    // flight stays visible and stoppable whatever is selected or collapsed.
+    if generation.active {
+        ui.separator();
+        if draw_generation_status(ui, generation) {
+            actions.stop_generation = Some(*generation);
+        }
+    }
     ui.separator();
 
     let (status_color, status_text) = match state {
@@ -702,13 +726,21 @@ fn draw_char_replacements(
     });
 }
 
-/// The AI API engine options: the shared connection widget inside the OCR panel's own
-/// height-capped scroll area, at most 300 px wide.
+/// The AI API engine options: a collapsible "service, key and instruction" section holding the
+/// shared connection widget inside the OCR panel's own height-capped scroll area, at most 300 px
+/// wide. While collapsed the widget is not drawn (its first-draw metadata refresh waits for the
+/// first expand, as in the MT panel).
 fn draw_ai_api_options(
     ui: &mut egui::Ui,
     options: &mut OcrPanelOptions,
     actions: &mut OcrPanelActions,
 ) {
+    if section_header_button(ui, options.ai_api_connection_open, t!("translation.ocr_panel.service_key_instruction_heading")) {
+        options.ai_api_connection_open = !options.ai_api_connection_open;
+    }
+    if !options.ai_api_connection_open {
+        return;
+    }
     let max_width = ui.available_width().min(300.0);
     let max_height = ai_api_options_max_height(ui);
     egui::ScrollArea::vertical()

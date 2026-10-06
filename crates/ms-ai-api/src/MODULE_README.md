@@ -7,13 +7,14 @@ user-given base URL), where their API keys live, how an authenticated client is 
 from a worker thread, which models a service offers, what a model can do (the model capability
 database), and a few provider-agnostic helpers. It also owns the shared connection widget
 (service, base URL, key, model, account status, system instruction) with its GUI-free state and
-background request runner. Every feature that talks to
+background request runner, and live generation progress: the streaming chat executor with a
+real "Stop" and its two-line status widget. Every feature that talks to
 a hosted model goes through it; today that is the translation tab's AI API OCR engine and AI API
 machine translation (`crates/ms-tab-translation`). The cloud image-edit layer (`image_edit/`:
 hosted image-editing models with a size-exact pipeline) lives here too.
 
 Layer: one level above `ms-widgets`; it uses `ms-i18n` (localized texts), `ms-log`
-(diagnostics), `ms-thread` (workers), `ms-theme` (`Severity`), `ms-widgets` (`WheelComboBox`),
+(diagnostics), `ms-thread` (workers), `ms-theme` (`Severity`, status colours), `ms-widgets` (`WheelComboBox`),
 `ms-raster` and `image` (the image-edit pipeline) and `egui`. It must never depend on a tab crate, `ms-models`, `ms-canvas` or `ms-config`
 directly.
 
@@ -23,7 +24,21 @@ consumer validates the destination (`AiApiTarget::new(service, base_url)`), read
 that target (`keys::read_api_key(&target)`; optional when `!service.requires_key()`), builds a client (`client::build_client`) and
 the request identity (`model_id::model_iden`), assembles its own `genai::chat::ChatRequest` with
 the re-exported `ms_ai_api::genai` types, and runs it on a worker thread through
-`client::block_on`.
+`client::block_on`. A chat whose progress the user should see (and be able to stop) runs as
+`exec_chat_tracked` inside that `block_on`:
+
+```text
+GUI: consumer owns a GenerationTracker (Arc), its panel draws
+     draw_generation_status(ui, &snapshot) -> Stop click -> tracker.cancel_run(snapshot.run_id)
+                                                           (or close() for a whole run)
+worker: block_on(exec_chat_tracked(&client, model, req, options, &tracker, request_tag))
+     -> tracker.begin(request_tag) (Thinking, counters 0) -> genai exec_chat_stream
+     -> per chunk: ReasoningChunk -> Thinking + reasoning_chars, Chunk -> Answering + answer_chars
+     -> every await races run.cancelled(): Stop drops the request/stream (HTTP connection closed)
+     -> End event: Ok(answer) | body closed before End: Err(ChatRequest "stream ended early")
+     -> refused "not verified to stream" before any output: one exec_chat retry (no live counts)
+     -> Err(AiApiError::Cancelled) | Err(AiApiError::ChatRequest { detail })
+```
 
 Connection UI flow (per widget instance; the consumer owns one `AiApiConnectionState` and one
 `AiApiTaskRunner`):
@@ -69,6 +84,13 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   `compact_middle`.
 - `tasks.rs`: `AiApiRequest` (redacted `Debug`), `AiApiEvent`, `AiApiTaskRunner`,
   `AiApiPollSummary`.
+- `generation.rs`: `GenerationTracker` / `GenerationRun` / `GenerationSnapshot` /
+  `GenerationPhase` (target-neutral, unit-tested) and, native only, `exec_chat_tracked` plus the
+  crate-private `normalize_think_answer` / `streaming_not_permitted`; its `stream_tests` drive
+  the executor against a loopback OpenAI-compatible server (answer, reasoning count, `<think>`
+  parity, missing terminal event, non-streaming retry, no retry on other errors, real abort).
+- `generation_view.rs`: `draw_generation_status`, the two-line status widget (spinner + phase;
+  received chars + "Stop").
 - `../tests/live_compatible.rs`: opt-in live check of both compatible services against a real
   server (`MS_AI_API_LIVE_URL`; skips when unset): model list, text chat, image chat, empty key.
 - `../tests/live_image_edit.rs`: opt-in live image edit through `image_edit::run_image_edit`
@@ -120,10 +142,11 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
 - **Errors**: every fallible fn returns `AiApiError`; `to_string()` is the exact localized
   text the UI shows. Failures are logged here (`runtime_log`, service + error text) at the
   point they are created; consumers may add their own run-context logs.
-- **Web build**: `genai`, `tokio`, `keyring`, `ureq` are native-only (`serde_json`, `image` and
+- **Web build**: `genai`, `tokio`, `futures-util`, `keyring`, `ureq` are native-only (`serde_json`, `image` and
   `ms-raster` are target-neutral; the `image_edit` core compiles on wasm). On wasm
   the key functions return `KeyStoreWebUnavailable` and `load_metadata` returns
-  `MetadataWebUnavailable`; `client`, `openrouter` and `model_iden` do not exist.
+  `MetadataWebUnavailable`; `client`, `openrouter`, `model_iden` and `exec_chat_tracked` do not
+  exist (the generation tracker and widget do).
 - **Connection widget ids**: `draw_connection` draws straight into the caller's `Ui` — no
   `push_id`, `vertical`, `ScrollArea` or width clamp — and names its two combos
   `"{id_salt}_service"` / `"{id_salt}_model"` and the base URL field `"{id_salt}_base_url"`
@@ -145,6 +168,53 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   consumers' own run workers. Events for a service that is no longer selected (or key events
   and metadata for a base URL that is no longer current) change no state, but "key saved" / "request failed"
   notices are still produced.
+- **Tracked generation has one owner**: every LLM request whose progress a panel shows goes
+  through `exec_chat_tracked`; consumers never stream `genai` themselves. It returns the
+  concatenated answer chunks (reasoning is counted, never returned), untrimmed. That is ALL text
+  parts of the reply — an intentional change from the former `exec_chat` +
+  `ChatResponse::first_text()`, which kept only the first part of a multi-part (Anthropic
+  multi-block, Gemini multi-part) answer. It sends the
+  caller's options unchanged — never `capture_reasoning_content`, which for Gemini injects
+  `includeThoughts` and breaks models without thinking (their thinking just shows as `Thinking`);
+  it requests neither captured content (the answer is accumulated from the chunks, which is
+  what `StreamEnd.captured_content` would hold) nor usage.
+- **A stream must end with the provider's terminal event** (`ChatStreamEvent::End`), for every
+  adapter: a body that closes before it is `ChatRequest` with the localized
+  `ai_api.generation.stream_incomplete_error`, never a partial answer. This also covers mid-stream
+  provider errors genai 0.6.5 does not surface (its Anthropic streamer skips `event: error`
+  frames as unknown). Residual gap: genai's Gemini streamer synthesizes `End` on a bare close,
+  so a truncated Gemini stream still reads as complete.
+- **Non-streaming fallback, once**: when the stream fails before any output with an error that
+  says streaming is not permitted for the model (`streaming_not_permitted`: mentions "stream"
+  and "verif"/"organization", e.g. OpenAI's "organization must be verified to stream this
+  model"), the request is retried once with `exec_chat` and the caller's options (cancel still
+  raced). That reply shows no live counts (phase stays `Thinking`) and is its `first_text()`,
+  with genai's own `<think>` normalization. Any other error is returned as is, never retried.
+- **`<think>` parity with `exec_chat`**: genai applies `normalize_reasoning_content` only in the
+  NON-streaming parser of the OpenAI chat family (trim, then remove the first
+  `<think>…</think>` block and the whitespace after it, only when no reasoning field came back).
+  `exec_chat_tracked` reproduces exactly that (`normalize_think_answer`) when the options ask for
+  it, the adapter is of that family and no reasoning chunk arrived. Known edge: genai's parser
+  treats an empty or `null` reasoning field as "reasoning present" and skips the extraction,
+  while the stream counts only non-empty reasoning chunks, so such a server's inline `<think>`
+  block is now stripped where it used to be kept.
+- **Generation tracker**: one generation at a time per tracker. `begin` resets counters and
+  phase (`Thinking` until the first non-empty answer chunk; afterwards the kind of the last
+  non-empty chunk); dropping the `GenerationRun` ends it (counters kept). The snapshot carries
+  the shown generation's `run_id` and the caller's `request_tag`. `cancel_run(run_id)` stops that
+  generation only while it is still in flight (a stale click never stops a later one; a later
+  `begin` runs); `close` stops it and every later one, for a consumer stopping a whole
+  multi-request run or shutting down (`is_closed` lets a worker skip preparing such a request). A superseded run reads as
+  cancelled and records nothing. Chars are Unicode scalar values. Cancellation wakes the
+  executor through a waker slot under the tracker mutex (no lost wake-up, no tokio `sync`), and
+  the executor races every await against it with `tokio::select!` (`biased`, cancel first):
+  dropping the `genai` future / stream closes the reqwest connection, so the provider request
+  is really aborted. `AiApiError::Cancelled` is a neutral outcome for consumers;
+  `AiApiError::chat_failure_detail` gives the raw provider text to wrap in their own message.
+- **Generation widget**: `draw_generation_status` draws nothing for an inactive snapshot,
+  relies on its spinner's per-frame repaint to keep the counters live, creates no stored ids and
+  returns the Stop click, which is about `snapshot.run_id` (the consumer maps it to
+  `cancel_run` or to its own run cancel).
 - **Not localized on purpose**: hosted provider labels (brand names; the two compatible labels
   ARE localized), the `"OpenRouter: "` status prefix and the `"{requests} req/{interval}"`
   rate-limit part.
@@ -157,6 +227,8 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
 - Change key storage: `keys.rs` (keep `KEYRING_SERVICE`, both target user-name forms and the
   named `image_edit:` forms).
 - Change the model list or account status: `metadata.rs`, `openrouter.rs`.
+- Change live generation progress, Stop semantics or the streaming executor: `generation.rs`;
+  its look: `generation_view.rs` (`ai_api.generation.*` keys).
 - Change the connection widget layout: `connection_view.rs` (the key block is
   `draw_key_block`, shared with other key owners); its state transitions and status
   texts: `connection.rs`; how requests run: `tasks.rs`.

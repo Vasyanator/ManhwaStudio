@@ -41,6 +41,20 @@ Long work is delegated to focused controllers:
   Dilation and Otsu come from `ms-raster` (see `text_detector/MODULE_README.md`).
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
   cancellation, and stale-event filtering.
+- Live AI API generation progress: every AI API OCR / MT request runs through
+  `ms_ai_api::exec_chat_tracked`. The OCR controller owns one `GenerationTracker` shared with its
+  worker; each MT run owns a fresh one inside its cancel switch (`MtRunCancel`). Both controllers
+  expose `generation_snapshot()`; `tab.rs` only lends it to the panels, which draw
+  `ms_ai_api::draw_generation_status` outside their collapsible sections. OCR "Stop" carries the
+  clicked snapshot -> `TranslationOcrController::cancel_generation(run_id)` (a stale click never
+  stops a later queued request), plus `abort_textdetector_ocr` with a neutral status when the
+  snapshot's `request_tag` (= OCR request id) is the detector batch's active request; the stopped request comes back as
+  `OcrControllerEvent::RecognizeCancelled` (Info toast, no error, no detector retry). MT "Stop" is
+  the cancel button's action: `request_cancel` sets the run flag and closes its tracker, which
+  aborts the HTTP request in flight; the run ends through the normal `RunCancelled` path.
+  Dropping the OCR controller closes its tracker before joining the worker: the AI API request
+  in flight is aborted and queued AI API requests return before their keyring read; queued
+  non-AI requests still run before the worker stops (pre-existing).
 - The AI API connection blocks of the OCR and MT panels (key save/delete, metadata refresh) do
   not go through either controller: `tab.rs` owns one `ms_ai_api::AiApiTaskRunner` per panel
   (`ocr_ai_api_tasks`, `mt_ai_api_tasks`), submits the panel's `AiApiConnectionActions` to it and
@@ -114,8 +128,8 @@ detector-only downloads only detection files, while full PaddleOCR also download
 recognition language. PaddleOCR-VL (IPC method `ocr.paddle_vl`) is a PyTorch/Transformers OCR
 engine that needs no text detection and no language selection; it is shown on a second engine row in
 the OCR panel so the side panel stays narrow.
-AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`) from the OCR
-worker thread; provider API keys are read/written only through `ms_ai_api::keys` (OS credential
+AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`, streamed by
+`exec_chat_tracked`) from the OCR worker thread; provider API keys are read/written only through `ms_ai_api::keys` (OS credential
 store) and never persisted to project or user JSON settings. For an OpenAI-/Anthropic-compatible
 service the request goes to the panel's base URL (`ms_ai_api::AiApiTarget`) and a missing key is
 not an error; OCR and MT raise their "API key missing" errors only when `requires_key()`.
@@ -191,8 +205,8 @@ is an author note addressed to the translator, not a replica.
   The `characters.json` watch uses `ms_docstore::signature`.
 - `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
   `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR request building over
-  `ms_ai_api`, crop encoding, page image LRU cache, and
-  model-download/load-state events.
+  `ms_ai_api` (tracked + stoppable via the controller's `GenerationTracker`), crop encoding, page
+  image LRU cache, and model-download/load-state events.
 - `ocr_case_fix.rs`: pure, GUI-free post-OCR ALL-CAPS normalization (detector +
   character state machine) used by `ocr.rs`'s post-processing helper.
 - `text_detector/`: `TranslationTextDetectorController` and batch worker (`mod.rs`), the
@@ -202,7 +216,8 @@ is an author note addressed to the translator, not a replica.
   `MODULE_README.md`.
 - `machine_translation.rs`: `TranslationMtController`, `MtService`, AI API MT options, batch
   item/request types including optional ImageBubble image payloads, per-run worker thread
-  lifecycle, cancellation, chat context pruning, JSON response parsing, and backend dispatch.
+  lifecycle, cancellation (`MtRunCancel`: flag + per-run generation tracker), chat context
+  pruning, JSON response parsing, and backend dispatch.
 - `machine_translators/`: UI-agnostic Google, Yandex, and DeepL MT provider implementations behind
   `MachineTranslatorBackend`.
 - `panels/`: side-panel UI modules for OCR, bubble cards/footer fields, machine translation,

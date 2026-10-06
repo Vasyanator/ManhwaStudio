@@ -3586,6 +3586,7 @@ name = "ms-ai-api"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "futures-util",
  "genai",
  "image 0.25.10",
  "keyring",

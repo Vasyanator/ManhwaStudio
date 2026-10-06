@@ -57,6 +57,12 @@ pub enum AiApiError {
     BaseUrlInvalid { url: String },
     /// A request was built for an empty model id.
     EmptyModel,
+    /// The user stopped the generation (`generation::GenerationTracker::cancel` / `close`); the
+    /// request was dropped. Consumers treat it as a neutral "stopped" outcome, not a failure.
+    Cancelled,
+    /// A chat request or its response stream failed; `detail` is the provider / transport error
+    /// text (see `chat_failure_detail`).
+    ChatRequest { detail: String },
 }
 
 impl AiApiError {
@@ -83,7 +89,17 @@ impl AiApiError {
             Self::BaseUrlMissing { service } => tf!("ai_api.target.base_url_missing_error", service = service.label()),
             Self::BaseUrlInvalid { url } => tf!("ai_api.target.base_url_invalid_error", url = url),
             Self::EmptyModel => t!("ai_api.target.empty_model_error").to_string(),
+            Self::Cancelled => t!("ai_api.generation.cancelled_status").to_string(),
+            Self::ChatRequest { detail } => tf!("ai_api.generation.request_failed_error", err = detail),
         }
+    }
+
+    /// The text a consumer wraps into its own "request failed: {err}" message: the raw
+    /// provider error for `ChatRequest` (so the consumer's message does not repeat a generic
+    /// prefix), the localized `user_message` for every other variant.
+    #[must_use]
+    pub fn chat_failure_detail(&self) -> String {
+        if let Self::ChatRequest { detail } = self { detail.clone() } else { self.user_message() }
     }
 }
 
@@ -109,5 +125,12 @@ mod tests {
         assert_eq!(AiApiError::EmptyKey.to_string(), AiApiError::EmptyKey.user_message());
         let named = AiApiError::StoreNamedKey { label: "Black Forest Labs", detail: "boom-detail".to_string() };
         assert_eq!(named.to_string(), named.user_message());
+    }
+
+    #[test]
+    fn chat_failure_detail_is_the_raw_provider_text_only_for_chat_requests() {
+        let failed = AiApiError::ChatRequest { detail: "HTTP 429".to_string() };
+        assert_eq!(failed.chat_failure_detail(), "HTTP 429");
+        assert_eq!(AiApiError::Cancelled.chat_failure_detail(), AiApiError::Cancelled.user_message());
     }
 }

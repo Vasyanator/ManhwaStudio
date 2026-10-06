@@ -20,8 +20,10 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   `dev-docs/WEB_PORT.md`).
 - macOS (`x86_64-apple-darwin`) is supported but NOT a mandatory check target: `cargo check-mac`
   / `cargo bmac` (zigbuild), `run-dev.MacOS.command`, `build-macos.sh`.
-- For Windows-target builds set `MS_DISABLE_BUILD_CODESIGN=1`, or `build.rs` re-spawns the
-  codesign worker on every source change.
+- For Windows-target builds (including `cargo check-all`) set `MS_DISABLE_BUILD_CODESIGN=1`, or
+  `build.rs` re-spawns the codesign worker on every source change. Under `flock` that detached
+  worker inherits the lock fd and holds the lock for up to ~25 min (it waits for `.exe` files a
+  `check` never produces), stalling every queued cargo call.
 
 ## Verification commands
 

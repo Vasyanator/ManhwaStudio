@@ -26,6 +26,10 @@ Modules:
 - `connection`: `AiApiConnectionState` (widget state), its actions, `apply_event`.
 - `connection_view`: `draw_connection`, the shared egui connection widget, and its reusable
                 `draw_key_block`.
+- `generation`: `GenerationTracker` / `GenerationSnapshot` (live phase, char counts, Stop) and
+                the native streaming executor `exec_chat_tracked`, the one owner of tracked
+                LLM execution.
+- `generation_view`: `draw_generation_status`, the two-line "generation" status widget.
 - `tasks`     : `AiApiRequest` / `AiApiEvent` / `AiApiTaskRunner` (one serial `ms_thread`
                 worker per runner, FIFO).
 
@@ -49,6 +53,8 @@ pub mod connection;
 pub mod connection_view;
 pub mod encoding;
 pub mod error;
+pub mod generation;
+pub mod generation_view;
 pub mod image_edit;
 pub mod keys;
 pub mod metadata;
@@ -65,6 +71,10 @@ pub use connection::{AiApiConnectionActions, AiApiConnectionState, AiApiEventOut
 pub use connection_view::{KeyBlockActions, KeyBlockView, draw_connection, draw_key_block};
 pub use encoding::{Base64Error, base64_decode, base64_encode};
 pub use error::AiApiError;
+#[cfg(not(target_arch = "wasm32"))]
+pub use generation::exec_chat_tracked;
+pub use generation::{GenerationPhase, GenerationRun, GenerationSnapshot, GenerationTracker};
+pub use generation_view::draw_generation_status;
 pub use metadata::{AiApiMetadata, load_metadata};
 pub use model_caps::{ImageInputSupport, image_input_support};
 pub use quota::is_probable_quota_or_limit_error;

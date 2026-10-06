@@ -20,7 +20,10 @@ edition = "2024"
 # `ms-widgets`, `ms-raster`, `egui`, `image`). It must never depend on a tab, `ms-models`,
 # `ms-canvas` or `ms-config`.
 #
-# Web build: `genai`, `tokio`, `keyring` and `ureq` are native-only; the wasm build compiles
+# It also owns live generation progress (`generation`: tracker, streaming executor with a real
+# Stop) and its two-line status widget (`generation_view`).
+#
+# Web build: `genai`, `tokio`, `futures-util`, `keyring` and `ureq` are native-only; the wasm build compiles
 # the target-neutral types (including the pure image-edit core) plus error stubs for key
 # storage and metadata.
 [dependencies]
@@ -50,8 +53,14 @@ serde_json.workspace = true
 # the LLM client (`genai`) with the runtime its futures need (`tokio`), the OS credential
 # store (`keyring`), and the blocking HTTP used for the OpenRouter account status and the
 # image-edit executor (`image_edit/executor.rs`).
+#
+# `tokio` adds `macros` here for the `select!` that races every await of the streaming executor
+# (`generation.rs`) against the user's Stop; `futures-util` provides `StreamExt::next` over the
+# `genai` chat stream (used by this crate alone, so it stays local per the root table's rules;
+# the version is the one `genai` already puts in the graph).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 genai.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros"] }
+futures-util = "0.3"
 keyring.workspace = true
 ureq.workspace = true

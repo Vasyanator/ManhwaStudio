@@ -127,7 +127,7 @@ Text detector flow:
 - `start_text_detector_ocr_for_indices`: queues OCR tasks for detected blocks.
 - `maybe_dispatch_next_textdetector_ocr_request`: scheduler for sequential detector OCR.
 - `finish_textdetector_ocr_if_done`: finalize detector OCR batch.
-- `abort_textdetector_ocr`: hard-reset detector OCR state after fatal condition.
+- `abort_textdetector_ocr`: hard-reset detector OCR state after a fatal condition (error status) or a user stop (neutral status).
 - `draw_text_detector_line_edit_overlay_on_page`, `handle_text_detector_line_edit_hotkeys`,
   `create_text_detector_line_at_uv`: интерактивный режим правки строк + Del/N + создание из ПКМ.
 - `draw_text_detector_mask_edit_overlay_on_page`: интерактивный режим правки маски
@@ -239,7 +239,7 @@ use crate::ocr::{
     OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest, OcrRuntimeOptions,
     TranslationOcrController,
 };
-use ms_ai_api::{AiApiService, AiApiTaskRunner, ImageInputSupport, image_input_support, is_probable_quota_or_limit_error};
+use ms_ai_api::{AiApiService, AiApiTaskRunner, GenerationSnapshot, ImageInputSupport, image_input_support, is_probable_quota_or_limit_error};
 use crate::panels::bubbles::{
     BubbleFooterState, BubblesPanelContext, BubblesPanelState, bubble_extra_bool,
     bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel, footer_no_character,
@@ -251,7 +251,7 @@ use crate::panels::composition::{
     compose_translation_text, draw_composition_panel, normalize_wrap_with,
 };
 use crate::panels::machine_translation::{
-    MtPanelOptions, MtPanelProgress, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
+    MtPanelOptions, MtPanelProgress, MtPanelRun, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
 };
 use crate::panels::ocr::{
     CharReplacementRuleUi, OcrPanelOptions, draw_ocr_panel,
@@ -1514,6 +1514,7 @@ impl TranslationTabState {
                             quick_selection_active,
                             self.hotkey_hints.ocr_advanced_selection_mode.as_deref(),
                             advanced_selection_active,
+                            &self.ocr_controller.generation_snapshot(),
                         )
                     })
                     .inner;
@@ -1528,6 +1529,9 @@ impl TranslationTabState {
                         }
                     }
                     self.ocr_ai_api_tasks.submit_actions(&mut self.ocr_panel_options.ai_api, actions.ai_api);
+                    if let Some(shown) = actions.stop_generation {
+                        self.stop_ocr_generation(ctx, shown);
+                    }
                     if actions.request_load && !backend_unavailable {
                         if let Some(error) = self.current_ocr_torch_requirement_error() {
                             self.push_toast(ctx, error, Severity::Error, 2.8);
@@ -1556,9 +1560,12 @@ impl TranslationTabState {
                     .add_enabled_ui(self.ai_enabled, |ui| {
                         draw_machine_translation_panel(
                             ui,
-                            mt_busy,
-                            mt_can_cancel,
-                            self.mt_progress,
+                            MtPanelRun {
+                                busy: mt_busy,
+                                can_cancel: mt_can_cancel,
+                                progress: self.mt_progress,
+                                generation: self.mt_controller.generation_snapshot(),
+                            },
                             &mut self.mt_stop_notice,
                             &mut self.mt_panel_options,
                             !project.is_single_image(),
@@ -2337,6 +2344,7 @@ impl TranslationTabState {
                         self.abort_textdetector_ocr(
                             ctx,
                             tf!("translation.tab.recognition_stopped_error", error = error),
+                            Severity::Error,
                         );
                     }
                     if manual_target == Some(ManualOcrResultTarget::ToastAndClipboard) {
@@ -2350,7 +2358,32 @@ impl TranslationTabState {
                         );
                     }
                 }
+                // A user stop: drop the request's pending targets like a failure, but report it
+                // neutrally (no error toast, no detector retry).
+                OcrControllerEvent::RecognizeCancelled { request_id } => {
+                    if self.manual_ocr_active_request_id == Some(request_id) {
+                        self.manual_ocr_active_request_id = None;
+                        self.manual_ocr_result_target = None;
+                    }
+                    self.pending_bubble_inserts.remove(&request_id);
+                    let stopped = t!("translation.tab.recognition_cancelled_status").to_string();
+                    self.advanced_recognition.apply_recognition_error(request_id, stopped.clone());
+                    if self.textdetector_ocr_active_request_id == Some(request_id) {
+                        self.abort_textdetector_ocr(ctx, stopped.clone(), Severity::Info);
+                    }
+                    self.push_toast(ctx, stopped, Severity::Info, 2.2);
+                }
             }
+        }
+    }
+
+    /// The OCR panel's generation "Stop" on the generation `shown`: aborts it if still in
+    /// flight and, when its request (`shown.request_tag` = OCR request id) is the detector
+    /// block batch's active one, stops the whole batch (neutral status).
+    fn stop_ocr_generation(&mut self, ctx: &egui::Context, shown: GenerationSnapshot) {
+        self.ocr_controller.cancel_generation(shown.run_id);
+        if self.textdetector_ocr_active_request_id == Some(shown.request_tag) {
+            self.abort_textdetector_ocr(ctx, t!("translation.tab.recognition_cancelled_status").to_string(), Severity::Info);
         }
     }
 
@@ -3238,6 +3271,7 @@ impl TranslationTabState {
                 self.abort_textdetector_ocr(
                     ctx,
                     t!("translation.tab.recognition_start_stopped_status").to_string(),
+                    Severity::Error,
                 );
                 break;
             }
@@ -3301,7 +3335,9 @@ impl TranslationTabState {
         }
     }
 
-    fn abort_textdetector_ocr(&mut self, ctx: &egui::Context, message: String) {
+    /// Hard-resets the detector block-recognition batch and shows `message` with `severity`
+    /// (`Error` after a fatal condition, `Info` for a user stop).
+    fn abort_textdetector_ocr(&mut self, ctx: &egui::Context, message: String, severity: Severity) {
         self.textdetector_ocr_total = 0;
         self.textdetector_ocr_done = 0;
         self.textdetector_ocr_recognized = 0;
@@ -3310,7 +3346,7 @@ impl TranslationTabState {
         self.textdetector_ocr_retry_state = None;
         self.pending_textdetector_ocr_tasks.clear();
         self.text_detector_progress = None;
-        self.set_text_detector_status(message, Severity::Error);
+        self.set_text_detector_status(message, severity);
         ctx.request_repaint();
     }
 
