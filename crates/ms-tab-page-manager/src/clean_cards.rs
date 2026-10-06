@@ -499,7 +499,7 @@ fn draw_link_label(ui: &mut egui::Ui, gap: LayoutRect, origin: egui::Pos2, page_
     // The frame's outer size = content + inner margin + stroke on both sides.
     let chrome = frame.inner_margin.sum() + egui::Vec2::splat(2.0 * frame.stroke.width);
     let size = status_row_size(ui, text, problem_hover.is_some()) + chrome;
-    let rect = to_screen(label_rect(&gap, [size.x, size.y]), origin);
+    let rect = to_screen(label_rect(&gap, [size.x, size.y], ui.spacing().interact_size.y), origin);
     let mut label = ui.new_child(egui::UiBuilder::new().id_salt(("pm_link_label", page_idx)).max_rect(rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
     let response = frame.show(&mut label, |ui| status_row(ui, text, color, problem_hover.is_some())).response;
     if let Some(hover) = problem_hover {

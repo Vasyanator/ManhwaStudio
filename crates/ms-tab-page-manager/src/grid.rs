@@ -63,10 +63,13 @@ pub(super) const CARD_INNER_MARGIN: f32 = 8.0;
 /// Clean-card height: the page card's footprint with the caption line in place of
 /// the badge line, so both card kinds share one height.
 const CLEAN_CARD_HEIGHT: f32 = CARD_HEIGHT;
-/// Vertical gap between a page card and its clean card. Holds the unlink control
-/// at its top and the link label at its middle without overlap (see
+/// Vertical gap between a page card and its clean card. Just tall enough for the
+/// unlink control at its top and the link label below it without overlap (see
 /// `grid_layout::unlink_button_rect` / `label_rect`).
-const LINK_GAP: f32 = 72.0;
+const LINK_GAP: f32 = 48.0;
+/// Vertical spacing between a row carrying clean cards and the next row: 1.5x the
+/// link gap, so a clean card reads as belonging to the page above it, not below.
+const CLEAN_ROW_SPACING: f32 = LINK_GAP * 1.5;
 /// Height of the «Клин без страницы» section header row.
 const SECTION_HEADER_HEIGHT: f32 = 36.0;
 /// Corner radius of every card (page, linked clean, unassigned clean).
@@ -242,6 +245,7 @@ impl PageManagerTabState {
             clean_card_h: CLEAN_CARD_HEIGHT,
             link_gap: LINK_GAP,
             spacing: [spacing.x, spacing.y],
+            clean_row_spacing: CLEAN_ROW_SPACING,
             section_header_h: SECTION_HEADER_HEIGHT,
         };
         // Columns are fitted to the width OUTSIDE the scroll area (scroll bar and
@@ -660,7 +664,7 @@ mod tests {
         assert!(!page_has_clean_link(&links, 0));
         assert!(page_has_clean_link(&links, 1));
         assert!(!page_has_clean_link(&links, 99));
-        let metrics = GridMetrics { card: [CARD_WIDTH, CARD_HEIGHT], clean_card_h: CLEAN_CARD_HEIGHT, link_gap: LINK_GAP, spacing: [8.0, 3.0], section_header_h: SECTION_HEADER_HEIGHT };
+        let metrics = GridMetrics { card: [CARD_WIDTH, CARD_HEIGHT], clean_card_h: CLEAN_CARD_HEIGHT, link_gap: LINK_GAP, spacing: [8.0, 3.0], clean_row_spacing: CLEAN_ROW_SPACING, section_header_h: SECTION_HEADER_HEIGHT };
         // Two columns: pages 0-1 share a row with a link, pages 2-3 do not.
         let layout = GridLayout::build(&metrics, 2.0 * CARD_WIDTH + 8.0, links.len(), |idx| page_has_clean_link(&links, idx), 0);
         assert_eq!(layout.rows[0].kind, GridRowKind::Pages { first: 0, count: 2, with_clean: true });

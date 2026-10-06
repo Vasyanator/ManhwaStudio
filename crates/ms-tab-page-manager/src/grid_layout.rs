@@ -8,7 +8,8 @@ offsets, answers which rows intersect a viewport, and places every card / gap /
 label rect of a row. `grid.rs` drives `ScrollArea::show_viewport` from it.
 
 Key structures:
-- GridMetrics: card footprint, clean-card height, link gap, item spacing, section header height.
+- GridMetrics: card footprint, clean-card height, link gap, item spacing, spacing below a
+  clean-bearing row, section header height.
 - GridRowKind / GridRow: what a row holds and where it sits (top + height).
 - GridLayout: the built row table, column count and total content height.
 - LayoutRect: an axis-aligned rect in content-origin POINTS (egui-free).
@@ -28,8 +29,10 @@ Notes:
 Rows have VARIABLE height: a page row is the card height, plus `link_gap +
 clean_card_h` when any page of the row has a clean; the optional bottom section is
 a header row followed by rows of unassigned clean cards. Consecutive rows are
-separated by `spacing[1]`, and the total height carries no trailing spacing, which
-makes the uniform case identical to `ScrollArea::show_rows` (row `r` at
+separated by `spacing[1]` (by `clean_row_spacing` below a row that carries clean
+cards, so a clean card is visibly apart from the next page row), and the total
+height carries no trailing spacing, which makes the clean-free case identical to
+`ScrollArea::show_rows` (row `r` at
 `r * (card_h + spacing_y)`, total `rows * (card_h + spacing_y) - spacing_y`).
 Contains no egui code and performs no I/O, so every rule here is unit-testable.
 */
@@ -69,14 +72,16 @@ impl LayoutRect {
 /// card; `clean_card_h` is the height of a clean card (same width as a page
 /// card); `link_gap` is the vertical gap between a page card and its clean card
 /// (where the link connector is drawn); `spacing` is egui's `item_spacing`
-/// `[x, y]` between cards and between rows; `section_header_h` is the height of
-/// the unassigned-clean section's header row.
+/// `[x, y]` between cards and between rows; `clean_row_spacing` replaces
+/// `spacing[1]` below a page row that carries clean cards; `section_header_h` is
+/// the height of the unassigned-clean section's header row.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct GridMetrics {
     pub(super) card: [f32; 2],
     pub(super) clean_card_h: f32,
     pub(super) link_gap: f32,
     pub(super) spacing: [f32; 2],
+    pub(super) clean_row_spacing: f32,
     pub(super) section_header_h: f32,
 }
 
@@ -130,7 +135,8 @@ pub(super) struct ScrollAnchor {
 }
 
 /// The built row table of the grid. Rows are ordered and monotonic: each row's
-/// `top` equals the previous row's bottom plus `metrics.spacing[1]`, the first
+/// `top` equals the previous row's bottom plus `metrics.spacing[1]` (plus
+/// `metrics.clean_row_spacing` when the previous row carries clean cards), the first
 /// row starts at 0, and `total_height` is the last row's bottom (0 when empty).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct GridLayout {
@@ -181,11 +187,13 @@ impl GridLayout {
 
         // Prefix sums: every row after the first is preceded by one vertical
         // spacing, matching the layout `show_rows` produced (no trailing spacing).
+        // A row carrying clean cards is followed by the wider `clean_row_spacing`.
         let mut rows = Vec::with_capacity(kinds.len());
         let mut top = 0.0_f32;
         for (kind, height) in kinds {
             rows.push(GridRow { kind, top, height });
-            top += height + metrics.spacing[1];
+            let below = if matches!(kind, GridRowKind::Pages { with_clean: true, .. }) { metrics.clean_row_spacing } else { metrics.spacing[1] };
+            top += height + below;
         }
         let total_height = rows.last().map_or(0.0, GridRow::bottom);
         Self { metrics: *metrics, columns, rows, total_height }
@@ -354,12 +362,15 @@ pub(super) fn unlink_button_rect(gap: &LayoutRect, button_size: [f32; 2]) -> Lay
     LayoutRect { min: [x, gap.min[1]], size: button_size }
 }
 
-/// Places a link label of size `label_size` centred in `gap` on both axes (the
-/// label sits on the connector line). An oversized label overhangs symmetrically.
+/// Places a link label of size `label_size` on the connector line: centred
+/// horizontally, and vertically centred in the part of `gap` below the top
+/// `top_reserved` points (the unlink button's height, see [`unlink_button_rect`]),
+/// so the hover-revealed button never covers the label. An oversized label
+/// overhangs symmetrically.
 #[must_use]
-pub(super) fn label_rect(gap: &LayoutRect, label_size: [f32; 2]) -> LayoutRect {
+pub(super) fn label_rect(gap: &LayoutRect, label_size: [f32; 2], top_reserved: f32) -> LayoutRect {
     let x = gap.min[0] + (gap.size[0] - label_size[0]) * 0.5;
-    let y = gap.min[1] + (gap.size[1] - label_size[1]) * 0.5;
+    let y = gap.min[1] + top_reserved + (gap.size[1] - top_reserved - label_size[1]) * 0.5;
     LayoutRect { min: [x, y], size: label_size }
 }
 
@@ -369,7 +380,7 @@ mod tests {
 
     /// Today's page-card metrics (grid.rs constants) with egui's default spacing.
     fn metrics() -> GridMetrics {
-        GridMetrics { card: [212.0, 276.0], clean_card_h: 200.0, link_gap: 40.0, spacing: [8.0, 3.0], section_header_h: 30.0 }
+        GridMetrics { card: [212.0, 276.0], clean_card_h: 200.0, link_gap: 40.0, spacing: [8.0, 3.0], clean_row_spacing: 60.0, section_header_h: 30.0 }
     }
 
     fn approx(a: f32, b: f32) -> bool {
@@ -470,9 +481,11 @@ mod tests {
         assert!(approx(layout.rows[3].height, m.section_header_h));
         assert!(approx(layout.rows[4].height, m.clean_card_h));
 
-        // Rows are monotonic with exactly one spacing between them.
-        for pair in layout.rows.windows(2) {
-            assert!(approx(pair[1].top, pair[0].bottom() + m.spacing[1]));
+        // Rows are monotonic with exactly one spacing between them; the wider one only below
+        // the clean-bearing row.
+        for (idx, pair) in layout.rows.windows(2).enumerate() {
+            let below = if idx == 1 { m.clean_row_spacing } else { m.spacing[1] };
+            assert!(approx(pair[1].top, pair[0].bottom() + below));
         }
         assert!(approx(layout.total_height, layout.rows[5].bottom()));
 
@@ -515,8 +528,9 @@ mod tests {
         let button = unlink_button_rect(&gap, [60.0, 20.0]);
         assert!(approx(button.min[1], gap.min[1]));
         assert!(approx(button.min[0] + 30.0, gap.min[0] + gap.size[0] * 0.5));
-        let label = label_rect(&gap, [100.0, 18.0]);
-        assert!(approx(label.min[1] + 9.0, gap.min[1] + gap.size[1] * 0.5));
+        let label = label_rect(&gap, [100.0, 18.0], 20.0);
+        assert!(approx(label.min[1] + 9.0, gap.min[1] + 20.0 + (gap.size[1] - 20.0) * 0.5));
+        assert!(!label.overlaps(&button));
         assert!(label.min[0] >= gap.min[0] && label.max()[0] <= gap.max()[0]);
 
         // Visible range over variable rows.

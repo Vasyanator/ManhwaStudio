@@ -106,7 +106,7 @@ draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerA
   auto ids.
 - `grid_layout.rs`: GUI-free row table of the grid (unit-tested): the column
   formula, rows of VARIABLE height (page rows, optionally with a link gap and a
-  clean-card slot; an optional bottom section of a header plus unassigned-clean
+  clean-card slot, followed by a wider spacing; an optional bottom section of a header plus unassigned-clean
   rows) with prefix-summed tops, the viewport row range (binary search), and every
   card / gap / clean-card / header / link-widget rect relative to the content
   origin, the drawn card count of a row range, and the content scroll anchor
