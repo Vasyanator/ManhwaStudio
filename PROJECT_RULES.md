@@ -39,6 +39,12 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
 - Cargo unifies features across the workspace, so a crate can build inside it and fail alone.
   After changing a crate's manifest or features, also run
   `cargo clippy -p <crate> --all-targets --all-features --target <t> -- -D warnings` per target.
+- **Baseline build of `HEAD`** (global §19 "Unrelated must be proven", when the dependency-graph
+  proof is not enough): from a `git worktree` of `HEAD` under the scratchpad, run
+  `flock <lockfile> env CARGO_TARGET_DIR=<repo>/target/head-baseline cargo test -p <crate> -j 8`.
+  The persistent `target/head-baseline` makes every check after the first incremental. Never
+  build the worktree into the main `target/`: its binaries would overwrite
+  `target/release/manhwastudio_rs` and mislead the stale-build check below.
 - **Two runnable binaries** (global §16 "Stale builds"): `target/release/manhwastudio_rs` and
   the repo-root `./manhwastudio_rs` that the `run-dev.*` launchers publish. Find out which one the
   user ran, then compare its mtime (`stat -c '%y' <binary>`) with
