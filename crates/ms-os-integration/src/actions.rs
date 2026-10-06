@@ -37,7 +37,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 use crate::copy_identity::CopyIdentity;
-use crate::report::{RecordKind, RecordReport, RecordStatus, Scope};
+use crate::report::{Defect, ProbeError, RecordKind, RecordReport, RecordStatus, Scope};
 use crate::IntegrationError;
 
 /// Command-line flag carrying the helper's action tokens ([`encode_actions`]). The binary's
@@ -100,9 +100,12 @@ const LINUX_LAYOUT: bool = cfg!(target_os = "linux");
 /// Missing -> `Create`, only in `copy_scope`. This copy's record -> `Remove` (+ `Repair` when it
 /// has defects). Another copy's record -> `RePoint` (only in `copy_scope` or the user scope, so
 /// an all-users record is never pointed at one user's copy) and `Remove`; both need confirmation
-/// while that copy exists ([`needs_confirmation`]). Unreadable records and Linux system-wide
-/// (`Machine`) rows -> none. On Linux the "Open with" row shares the menu row's file, so it never
-/// offers `Remove` (removing the menu entry removes both).
+/// while that copy exists ([`needs_confirmation`]). An unreadable record at a known location
+/// (it exists at our name, but could not be read or names no program) -> `Repair` only in
+/// `copy_scope`, always confirmed: it overwrites the record with this copy's full value set,
+/// whoever wrote it. An unreadable record without a location (folder unresolved, no data home)
+/// and Linux system-wide (`Machine`) rows -> none. On Linux the "Open with" row shares the menu
+/// row's file, so it never offers `Remove` (removing the menu entry removes both).
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 #[must_use]
 pub fn allowed_actions(record: &RecordReport, copy_scope: Scope, read_only: bool) -> Vec<ActionKind> {
@@ -116,6 +119,7 @@ fn allowed_actions_on(linux: bool, record: &RecordReport, copy_scope: Scope, rea
     }
     let mut actions = match &record.status {
         RecordStatus::Missing if record.scope == copy_scope => vec![ActionKind::Create],
+        RecordStatus::Unreadable(error) if record.scope == copy_scope && unreadable_record_exists(error) => vec![ActionKind::Repair],
         RecordStatus::Missing | RecordStatus::Unreadable(_) => Vec::new(),
         RecordStatus::OursOk => vec![ActionKind::Remove],
         RecordStatus::OursStale(_) | RecordStatus::OursBroken(_) => vec![ActionKind::Repair, ActionKind::Remove],
@@ -130,11 +134,31 @@ fn allowed_actions_on(linux: bool, record: &RecordReport, copy_scope: Scope, rea
     actions
 }
 
-/// True when `action` on `record` replaces or deletes a record of another copy that still
-/// exists: the UI asks for an inline confirmation first.
+/// Whether an unreadable record's error still names an existing file or key that an overwrite
+/// can target: a read failure or a record without a program, not a folder or data home that
+/// could not be resolved.
+fn unreadable_record_exists(error: &ProbeError) -> bool {
+    match error {
+        ProbeError::Registry { .. } | ProbeError::Io { .. } | ProbeError::Shortcut { .. } | ProbeError::NoOwner { .. } => true,
+        ProbeError::FolderUnresolved { .. } | ProbeError::NoDataHome => false,
+    }
+}
+
+/// True when `action` on `record` replaces or deletes a record that may not be this copy's: the
+/// UI asks for an inline confirmation first. That is a record of another copy that still exists
+/// (`RePoint`, `Remove`), an unreadable record (`Repair` overwrites it without knowing whose it
+/// is) and a record at our name that launches a foreign program (`Defect::ForeignProgram`;
+/// `Repair`, `Remove`).
 #[must_use]
 pub fn needs_confirmation(record: &RecordReport, action: ActionKind) -> bool {
-    matches!(record.status, RecordStatus::OtherCopy { alive: true, .. }) && matches!(action, ActionKind::RePoint | ActionKind::Remove)
+    match &record.status {
+        RecordStatus::OtherCopy { alive: true, .. } => matches!(action, ActionKind::RePoint | ActionKind::Remove),
+        RecordStatus::Unreadable(_) => matches!(action, ActionKind::Repair | ActionKind::Remove | ActionKind::RePoint),
+        RecordStatus::OursBroken(defects) => {
+            defects.iter().any(|defect| matches!(defect, Defect::ForeignProgram { .. })) && matches!(action, ActionKind::Repair | ActionKind::Remove | ActionKind::RePoint)
+        }
+        RecordStatus::Missing | RecordStatus::OursOk | RecordStatus::OursStale(_) | RecordStatus::OtherCopy { alive: false, .. } => false,
+    }
 }
 
 /// True when an action on a record in `scope` must run in the elevated helper: on Windows a
@@ -675,9 +699,11 @@ pub fn discard_result_file(path: &Path) {
 /// a worker. Does not elevate: on Windows a `Machine` action of an unelevated process fails with
 /// access denied — route those through `windows::elevation::apply_elevated`.
 ///
-/// Create / Repair / RePoint write the full expected value set through the record writers
-/// ("Open with" deletes its tree first); Remove deletes the record whoever owns it (the caller
-/// confirmed it for another copy's record).
+/// Create / Repair / RePoint write the full expected value set through the record writers; every
+/// registry record (Uninstall, App Paths, "Open with") deletes its key tree first, so the key
+/// ends up holding exactly that set (also over a value of the wrong type that made the record
+/// unreadable), and the `.lnk` / desktop entry is overwritten whole. Remove deletes the record
+/// whoever owns it (the caller confirmed it for another copy's record).
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 #[must_use]
 pub fn apply(identity: &CopyIdentity, requests: &[ActionRequest]) -> ActionOutcomes {
@@ -747,8 +773,10 @@ fn apply_windows_one(identity: &CopyIdentity, request: ActionRequest) -> Result<
             .ok_or(IntegrationError::StartMenuFolderNotFound)
     };
     // The Uninstall and App Paths values come from ONE writer table; an action writes the
-    // rows of its own key only.
-    let write_table_rows = |key: &str, display_version: &str| {
+    // rows of its own key only, into a fresh key (tree deleted first, like "Open with"), so no
+    // stray or wrongly typed value of an earlier writer survives.
+    let write_table_rows = |key: &str, display_version: &str| -> Result<(), IntegrationError> {
+        reg_delete_tree_if_exists(key)?;
         uninstall_and_app_paths_values(root, &install_dir.to_string_lossy(), &identity.exe.to_string_lossy(), display_version)
             .iter()
             .filter(|value| value.key() == key)
@@ -838,7 +866,6 @@ fn apply_linux_one(identity: &CopyIdentity, dirs: Option<&crate::linux::xdg::Des
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::report::{Defect, ProbeError};
 
     fn record(kind: RecordKind, scope: Scope, status: RecordStatus) -> RecordReport {
         RecordReport { kind, scope, location: "loc".to_owned(), status, shadowed: false }
@@ -876,6 +903,15 @@ mod tests {
         assert_eq!(on(other(false), User, Machine), vec![RePoint, Remove], "a user record may start an all-users copy");
         assert_eq!(on(other(false), Machine, User), vec![Remove], "an all-users record is never pointed at one user's copy");
         assert!(on(RecordStatus::Unreadable(ProbeError::NoDataHome), User, User).is_empty());
+        // An unreadable record that exists at our name can be overwritten in the copy's scope.
+        let garbage = RecordStatus::Unreadable(ProbeError::Registry { key: "k".to_owned(), value_name: Some("DisplayName".to_owned()), code: 1630 });
+        assert_eq!(on(garbage.clone(), User, User), vec![Repair]);
+        assert_eq!(on(garbage.clone(), Machine, Machine), vec![Repair]);
+        assert!(on(garbage, Machine, User).is_empty(), "never outside the copy's scope");
+        let bad_link = RecordStatus::Unreadable(ProbeError::Shortcut { path: PathBuf::from("x.lnk"), message: "0x80004005".to_owned() });
+        assert_eq!(on(bad_link, User, User), vec![Repair]);
+        assert_eq!(on(RecordStatus::Unreadable(ProbeError::NoOwner { location: "k".to_owned() }), User, User), vec![Repair]);
+        assert!(on(RecordStatus::Unreadable(ProbeError::FolderUnresolved { folder: "Programs" }), User, User).is_empty(), "nowhere to write");
         // Read-only (--ignore-installed) offers nothing anywhere.
         for status in [RecordStatus::Missing, RecordStatus::OursOk, broken(), other(true)] {
             assert!(allowed_actions_on(false, &record(RecordKind::OpenWith, User, status), User, true).is_empty());
@@ -894,7 +930,11 @@ mod tests {
         assert_eq!(on(RecordKind::OpenWith, Scope::User, broken()), vec![Repair]);
         assert_eq!(on(RecordKind::OpenWith, Scope::User, other(true)), vec![RePoint]);
         assert!(on(RecordKind::OpenWith, Scope::User, RecordStatus::OursOk).is_empty());
-        for status in [RecordStatus::Missing, broken(), other(false), RecordStatus::OursOk] {
+        let unreadable = || RecordStatus::Unreadable(ProbeError::Io { path: PathBuf::from("/x.desktop"), kind: io::ErrorKind::InvalidData, message: "m".to_owned() });
+        assert_eq!(on(RecordKind::StartMenu, Scope::User, unreadable()), vec![Repair]);
+        assert_eq!(on(RecordKind::OpenWith, Scope::User, unreadable()), vec![Repair]);
+        assert!(on(RecordKind::StartMenu, Scope::User, RecordStatus::Unreadable(ProbeError::NoDataHome)).is_empty());
+        for status in [RecordStatus::Missing, broken(), other(false), RecordStatus::OursOk, unreadable()] {
             assert!(on(RecordKind::StartMenu, Scope::Machine, status).is_empty(), "system-wide rows are read-only");
         }
     }
@@ -911,6 +951,14 @@ mod tests {
         assert!(!needs_confirmation(&dead, Remove));
         assert!(!needs_confirmation(&ours, Remove));
         assert!(!needs_confirmation(&ours, Repair));
+        // Whose the record is is unknown: an unreadable one and one launching a foreign program.
+        let unreadable = record(RecordKind::StartMenu, Scope::User, RecordStatus::Unreadable(ProbeError::NoOwner { location: "l".to_owned() }));
+        assert!(needs_confirmation(&unreadable, Repair));
+        let foreign = Defect::ForeignProgram { value: crate::report::RecordValue::ShortcutTarget, expected: "e".to_owned(), found: "notepad.exe".to_owned() };
+        let foreign = record(RecordKind::StartMenu, Scope::User, RecordStatus::OursBroken(vec![foreign]));
+        assert!(needs_confirmation(&foreign, Repair));
+        assert!(needs_confirmation(&foreign, Remove));
+        assert!(!needs_confirmation(&record(RecordKind::StartMenu, Scope::User, RecordStatus::Missing), Create));
     }
 
     #[test]

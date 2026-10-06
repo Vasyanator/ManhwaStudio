@@ -78,6 +78,7 @@ Public surface is `crates/ms-widgets/src/lib.rs:43-72`; the module contract is
 | `EditableComboBox` | `crates/ms-widgets/src/editable_combo_box.rs:38` | Combo box whose value can also be typed freely. Stateful; takes an explicit id source in `new`. |
 | `AiButton` | `crates/ms-widgets/src/ai_button.rs:31-96` | Button for an AI tool that gates itself on runtime capabilities (§3). |
 | `ViewportColorSelector` | `crates/ms-widgets/src/viewport_color_selector.rs:28` | Color swatch + eyedropper that samples a viewport pixel through egui screenshot events. Stateful, owns a screenshot token. |
+| `paint_marquee_galley` | `crates/ms-widgets/src/marquee.rs` | Paint-only label helper: a single-line galley clipped to a rect; when it overflows it scrolls like a web marquee (rest, scroll, rest, jump back) and repaints only while overflowing and visible. Use for a fixed-width custom-painted button whose label may not fit (launcher settings sidebar). |
 | `MarkedScrollArea` | `crates/ms-widgets/src/marked_scroll/` | Vertical scroll area with marks painted on the bar and a gutter of items left of it (§4). |
 | `PanelTab` + `CollapsiblePanel` | `crates/ms-widgets/src/panel_dock/` | The **only** way to make a floating panel (§0.1). Declared per frame through `PanelDock`, never constructed directly. Owns collapse, docking, resize, persistence and tear-off into an OS window. |
 

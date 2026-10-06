@@ -9,7 +9,8 @@ runs the actions `ms_os_integration::actions::allowed_actions` offers for each r
 
 Key structures:
 - `SystemRegistrationState`: probe and action worker lifecycle, the inline confirmation of a
-  destructive action on another copy's record, and the outcome of the last action.
+  destructive action on a record that may not be this copy's (another copy's, an unreadable
+  one, one launching a foreign program), and the outcome of the last action.
 - `ActionReport`: what one action batch did (failures, declined UAC prompt, helper failure).
 
 Key functions:
@@ -97,12 +98,17 @@ enum LastOutcome {
     NotStarted(String),
 }
 
-/// A destructive action on another copy's record waiting for the inline confirmation.
+/// A destructive action on a record that may not be this copy's, waiting for the inline
+/// confirmation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingConfirm {
     request: ActionRequest,
-    /// The other copy's executable, shown in the question.
-    other_exe: String,
+    /// Shown in the question: the other copy's executable, the foreign program a record at our
+    /// name launches, or the location of a record that could not be read.
+    subject: String,
+    /// Whose the record is is unknown (unreadable, or a foreign program): the question says so
+    /// instead of naming another working copy.
+    unknown_owner: bool,
 }
 
 /// How a record's status reads in the list.
@@ -330,15 +336,26 @@ impl SystemRegistrationState {
     fn on_action_clicked(&mut self, record: &RecordReport, button: ActionButton) -> Option<ActionRequest> {
         let request = ActionRequest { kind: record.kind, scope: record.scope, action: button.action };
         if button.confirm {
-            let other_exe = match &record.status {
-                RecordStatus::OtherCopy { exe, .. } => exe.display().to_string(),
-                RecordStatus::Missing
-                | RecordStatus::OursOk
-                | RecordStatus::OursStale(_)
-                | RecordStatus::OursBroken(_)
-                | RecordStatus::Unreadable(_) => record.location.clone(),
+            let (subject, unknown_owner) = match &record.status {
+                RecordStatus::OtherCopy { exe, .. } => (exe.display().to_string(), false),
+                RecordStatus::OursBroken(defects) => {
+                    let foreign = defects.iter().find_map(|defect| match defect {
+                        Defect::ForeignProgram { found, .. } => Some(found.clone()),
+                        Defect::TargetMissing { .. }
+                        | Defect::WorkingDirMissing { .. }
+                        | Defect::WorkingDirOutdated { .. }
+                        | Defect::ValueMissing { .. }
+                        | Defect::WrongValue { .. }
+                        | Defect::MalformedCommand { .. }
+                        | Defect::MissingImageTypes { .. }
+                        | Defect::IconMissing
+                        | Defect::VersionOutdated { .. } => None,
+                    });
+                    (foreign.unwrap_or_else(|| record.location.clone()), true)
+                }
+                RecordStatus::Missing | RecordStatus::OursOk | RecordStatus::OursStale(_) | RecordStatus::Unreadable(_) => (record.location.clone(), true),
             };
-            self.confirm = Some(PendingConfirm { request, other_exe });
+            self.confirm = Some(PendingConfirm { request, subject, unknown_owner });
             return None;
         }
         self.confirm = None;
@@ -351,10 +368,14 @@ impl SystemRegistrationState {
             return;
         };
         let busy = self.busy();
-        let question = match pending.request.action {
-            ActionKind::Remove => tf!("launcher.sysreg.remove_confirm_label", path = pending.other_exe),
-            ActionKind::RePoint | ActionKind::Create | ActionKind::Repair => {
-                tf!("launcher.sysreg.repoint_confirm_label", path = pending.other_exe)
+        let question = match (pending.request.action, pending.unknown_owner) {
+            (ActionKind::Remove, false) => tf!("launcher.sysreg.remove_confirm_label", path = pending.subject),
+            (ActionKind::RePoint | ActionKind::Create | ActionKind::Repair, false) => {
+                tf!("launcher.sysreg.repoint_confirm_label", path = pending.subject)
+            }
+            (ActionKind::Remove, true) => tf!("launcher.sysreg.unknown_remove_confirm_label", path = pending.subject),
+            (ActionKind::RePoint | ActionKind::Create | ActionKind::Repair, true) => {
+                tf!("launcher.sysreg.unknown_replace_confirm_label", path = pending.subject)
             }
         };
         let mut confirmed = false;
@@ -625,6 +646,10 @@ fn defect_label(defect: &Defect) -> String {
             tf!("launcher.sysreg.defect.wrong_value_label", name = value.name(), expected = expected, found = found)
         }
         Defect::MalformedCommand { command } => tf!("launcher.sysreg.defect.bad_command_label", command = command),
+        // The same text as the warning tooltip, which maps it to a wrong value.
+        Defect::ForeignProgram { value, expected, found } => {
+            tf!("launcher.sysreg.defect.wrong_value_label", name = value.name(), expected = expected, found = found)
+        }
         Defect::MissingImageTypes { types } => tf!("launcher.sysreg.defect.missing_types_label", types = types.join(", ")),
         Defect::IconMissing => t!("launcher.sysreg.defect.icon_missing_label").to_owned(),
         Defect::VersionOutdated { found } => tf!("launcher.sysreg.defect.version_outdated_label", found = found),
@@ -791,6 +816,27 @@ mod tests {
 
         let unreadable = record(RecordKind::StartMenu, Scope::User, RecordStatus::Unreadable(ProbeError::NoDataHome));
         assert!(row_buttons(&unreadable, &report, false).is_empty());
+        // An unreadable record that exists can be overwritten, after a confirmation.
+        let garbage = record(RecordKind::StartMenu, Scope::User, RecordStatus::Unreadable(ProbeError::NoOwner { location: "l".to_owned() }));
+        assert_eq!(actions_of(row_buttons(&garbage, &report, false)), vec![(ActionKind::Repair, true)]);
+    }
+
+    /// Overwriting a record whose owner is unknown names it as such: the foreign program, or the
+    /// unreadable record's location.
+    #[test]
+    fn unknown_owner_confirmations_name_the_record() {
+        let mut state = SystemRegistrationState::new("3.0.0", false);
+        let foreign = Defect::ForeignProgram { value: RecordValue::ShortcutTarget, expected: "/opt/ms/manhwastudio_rs".to_owned(), found: "/usr/bin/gimp".to_owned() };
+        let foreign = record(RecordKind::StartMenu, Scope::User, RecordStatus::OursBroken(vec![foreign]));
+        let repair = ActionButton { action: ActionKind::Repair, confirm: true, elevated: false };
+        assert_eq!(state.on_action_clicked(&foreign, repair), None);
+        let pending = state.confirm.clone().expect("pending");
+        assert_eq!((pending.subject.as_str(), pending.unknown_owner), ("/usr/bin/gimp", true));
+
+        let garbage = record(RecordKind::OpenWith, Scope::User, RecordStatus::Unreadable(ProbeError::NoOwner { location: "l".to_owned() }));
+        assert_eq!(state.on_action_clicked(&garbage, repair), None);
+        let pending = state.confirm.clone().expect("pending");
+        assert_eq!((pending.subject.as_str(), pending.unknown_owner), ("/home/u/.local/share/applications/x.desktop", true));
     }
 
     /// A confirmed action waits for the inline confirmation; any other runs at once.
@@ -802,7 +848,8 @@ mod tests {
         assert_eq!(state.on_action_clicked(&alive, button), None);
         let pending = state.confirm.clone().expect("a confirmed action is pending");
         assert_eq!(pending.request, ActionRequest { kind: RecordKind::StartMenu, scope: Scope::User, action: ActionKind::RePoint });
-        assert_eq!(pending.other_exe, PathBuf::from("/home/u/other/manhwastudio_rs").display().to_string());
+        assert_eq!(pending.subject, PathBuf::from("/home/u/other/manhwastudio_rs").display().to_string());
+        assert!(!pending.unknown_owner);
 
         let missing = record(RecordKind::OpenWith, Scope::User, RecordStatus::Missing);
         let create = ActionButton { action: ActionKind::Create, confirm: false, elevated: false };
@@ -856,7 +903,8 @@ mod tests {
         });
         state.confirm = Some(PendingConfirm {
             request: ActionRequest { kind: RecordKind::StartMenu, scope: Scope::User, action: ActionKind::Remove },
-            other_exe: "/home/u/x".to_owned(),
+            subject: "/home/u/x".to_owned(),
+            unknown_owner: false,
         });
         let (tx, rx) = mpsc::channel();
         state.probe_rx = Some(rx);

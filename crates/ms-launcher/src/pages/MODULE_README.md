@@ -39,11 +39,16 @@ state arrives.
   AI package probes, `General.ai_install_type` reconciliation, PyTorch/full-dependency upgrade
   flow, and a background-driven Python environment console. The tab set, ordering, tab labels, and
   the shared General/AiBackend/Tutorials sections come from the shared section registry
-  (`crate::settings_shared`): `active_tab` is a `SettingsSectionId`, the tab bar iterates
-  `sections_for(SettingsSurface::Launcher)`, and the three shared "double-interface" panels are owned
-  as one `SharedSettingsPanels`. The dynamic TorchUpgrade hide/relabel logic is applied inline in the
-  tab bar. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/PythonEnvironment)
-  keep their local renderers here. The `ProjectsRootChanged` invariant is unchanged — a saved
+  (`crate::settings_shared`): `active_tab` is a `SettingsSectionId`, the vertical tab sidebar (`show_sidebar`, left of the
+  section content, below the title; tabs in their own `ScrollArea`, "Save log" pinned under it)
+  iterates `sections_for(SettingsSurface::Launcher)`, and the three shared "double-interface"
+  panels are owned as one `SharedSettingsPanels`. The dynamic TorchUpgrade hide/relabel logic is
+  applied inline in the sidebar. Overlong tab labels scroll as `ms_widgets` marquees. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/PythonEnvironment)
+  keep their local renderers here. Section content scrolls in one content-column `ScrollArea`,
+  except the PythonEnvironment console: it fills the column itself (command row + hint pinned
+  bottom-up, output frame with its own stick-to-bottom scroll taking the rest) and drops back
+  into the column scroll as a fixed-height block only when the column is shorter than
+  `CONSOLE_MIN_HEIGHT + CONSOLE_BOTTOM_BLOCK_RESERVE`. The `ProjectsRootChanged` invariant is unchanged — a saved
   projects root is still emitted as `PageNavAction::ProjectsRootChanged` (mapped from the shared
   General section's outcome). The page also OWNS the launcher's `SettingsWarnings` (started on
   the entry's first frame by `LauncherApp::poll_workers`): it passes the set to the shared
@@ -91,6 +96,9 @@ state arrives.
   under `--ignore-installed` (`LauncherHost::ignore_installed`) it is read-only. EVERY end of an
   action batch (success, failure, declined UAC prompt, lost worker) and every refresh returns
   `true` from `show`, and the settings page rechecks `SettingChange::SystemRegistration`.
+- Settings sidebar: the section content keeps exactly one vertical `ScrollArea` of its own
+  (sections nest theirs inside it as before); the sidebar's scroll clip carries a content margin
+  (`SIDEBAR_CLIP_INSET`) so tab hover expansion and corner warning badges are never cut off.
 - Notice banners (one text + at most one action) use `theme::notice_banner` with a stable
   `id_salt`; do not hand-roll another `Frame`.
 - `PageNavAction::OpenProject` must carry an `OpenProjectSelection` that has passed launcher-side

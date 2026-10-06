@@ -475,6 +475,10 @@ fn registration_problems(status: &RecordStatus) -> Vec<RegistrationProblem> {
                 RegistrationProblem::WrongValue { name: value.name(), expected: expected.clone(), found: found.clone() }
             }
             Defect::MalformedCommand { command } => RegistrationProblem::MalformedCommand { command: command.clone() },
+            // A foreign program at our name reads as the value that names it, against this copy.
+            Defect::ForeignProgram { value, expected, found } => {
+                RegistrationProblem::WrongValue { name: value.name(), expected: expected.clone(), found: found.clone() }
+            }
             // Always `Stale` (`Defect::severity`), so filtered out above; listed so a new
             // defect kind forces a decision here.
             Defect::MissingImageTypes { .. } | Defect::IconMissing | Defect::VersionOutdated { .. } | Defect::WorkingDirOutdated { .. } => continue,
@@ -752,6 +756,24 @@ mod tests {
                 }]
             );
             assert!(of(&result, SettingKey::RegistrationOpenWith).is_empty());
+        }
+
+        #[test]
+        fn foreign_program_at_our_name_reads_as_its_wrong_value() {
+            let defect = Defect::ForeignProgram { value: RecordValue::DesktopExec, expected: "/opt/ms/manhwastudio_rs".to_string(), found: "/usr/bin/gimp".to_string() };
+            let result = registration_reasons(&[record(RecordKind::StartMenu, Scope::User, RecordStatus::OursBroken(vec![defect]))], Scope::User);
+            assert_eq!(
+                of(&result, SettingKey::RegistrationStartMenu),
+                vec![WarningReason::RegistrationBroken {
+                    record: RegistrationRecord::StartMenu,
+                    location: LOCATION.to_string(),
+                    problems: vec![RegistrationProblem::WrongValue {
+                        name: "Exec",
+                        expected: "/opt/ms/manhwastudio_rs".to_string(),
+                        found: "/usr/bin/gimp".to_string(),
+                    }],
+                }]
+            );
         }
 
         #[test]

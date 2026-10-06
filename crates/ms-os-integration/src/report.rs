@@ -152,6 +152,12 @@ pub enum Defect {
     IconMissing,
     /// `DisplayVersion` names another version than this copy's `version_core`.
     VersionOutdated { found: String },
+    /// The record at ManhwaStudio's name launches a program that is not a ManhwaStudio
+    /// executable (its file name is not the product's executable name): `value` names it as
+    /// `found`. Reported inside `OursBroken` (the record sits at this copy's name and does not
+    /// start ManhwaStudio) with `expected` = this copy's executable; Repair and Remove of such a
+    /// record need confirmation (`actions::needs_confirmation`), since whose it is is unknown.
+    ForeignProgram { value: RecordValue, expected: String, found: String },
 }
 
 /// Whether a defect stops the record from working (`Broken`, badged) or only leaves outdated or
@@ -167,7 +173,8 @@ pub enum DefectSeverity {
 impl Defect {
     /// The broken/stale split. The ONLY owner of that decision.
     ///
-    /// Broken: a missing target or working directory, a malformed command, a missing value
+    /// Broken: a missing target or working directory, a malformed command, a record that
+    /// launches a program other than ManhwaStudio (`ForeignProgram`), a missing value
     /// without which the record does nothing (`UninstallString`, `DisplayName` — the entry is
     /// hidden without it — `InstallLocation` — the installer finds installs by it — the App
     /// Paths executable, the open command, `Exec=`), and a wrong value that decides what is
@@ -178,7 +185,9 @@ impl Defect {
     #[must_use]
     pub fn severity(&self) -> DefectSeverity {
         match self {
-            Self::TargetMissing { .. } | Self::WorkingDirMissing { .. } | Self::MalformedCommand { .. } => DefectSeverity::Broken,
+            Self::TargetMissing { .. } | Self::WorkingDirMissing { .. } | Self::MalformedCommand { .. } | Self::ForeignProgram { .. } => {
+                DefectSeverity::Broken
+            }
             Self::MissingImageTypes { .. } | Self::IconMissing | Self::VersionOutdated { .. } | Self::WorkingDirOutdated { .. } => DefectSeverity::Stale,
             Self::ValueMissing { value } => match value {
                 RecordValue::DisplayName
@@ -313,7 +322,8 @@ pub struct RecordReport {
     /// True on a `Machine` row that the system does not use because a higher-precedence record
     /// of the same name exists: on Windows the `HKCU` "Open with" key over the `HKLM` one, on
     /// Linux a `.desktop` file of the same id in `$XDG_DATA_HOME` or an earlier
-    /// `$XDG_DATA_DIRS` entry. Always false on `User` rows.
+    /// `$XDG_DATA_DIRS` entry. Always false on `User` rows and on a row whose own record does
+    /// not exist (`Missing`): only an existing record can be hidden.
     pub shadowed: bool,
 }
 
@@ -445,6 +455,7 @@ mod tests {
         assert_eq!(Defect::WorkingDirMissing { path: "p".to_owned() }.severity(), Broken);
         assert_eq!(Defect::WorkingDirOutdated { expected: "e".to_owned(), found: "f".to_owned() }.severity(), Stale);
         assert_eq!(Defect::MalformedCommand { command: "c".to_owned() }.severity(), Broken);
+        assert_eq!(Defect::ForeignProgram { value: RecordValue::ShortcutTarget, expected: "e".to_owned(), found: "f".to_owned() }.severity(), Broken);
         assert_eq!(Defect::MissingImageTypes { types: vec![".png".to_owned()] }.severity(), Stale);
         assert_eq!(Defect::IconMissing.severity(), Stale);
         assert_eq!(Defect::VersionOutdated { found: "1.0.0".to_owned() }.severity(), Stale);

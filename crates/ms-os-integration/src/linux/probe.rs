@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use super::desktop_entry::{EntryOwner, ICON_FILE_NAME, desktop_mime_types, exec_first_argument, main_group_entries, resolved_entry_owner, unescape_desktop_string_value};
 use crate::copy_identity::{CopyIdentity, repo_build_root};
+use crate::identity::LINUX_EXE_NAME;
 use crate::report::{Defect, ProbeError, RecordKind, RecordReport, RecordStatus, RecordValue, Scope, classify};
 
 /// One desktop-entry path as the reader found it: `Ok(None)` = no file, `Ok(Some(text))` = its
@@ -64,7 +65,9 @@ pub struct EntryOracles<'a> {
 ///
 /// Owner = `resolved_entry_owner` (key, else legacy `Exec`, a bare name resolved through
 /// `oracles.resolve`); none, or a bare name not on `$PATH` -> both rows `Unreadable(NoOwner)`
-/// (never badged). `Exec=` / `TryExec=` programs are resolved the same way before they are
+/// (never badged). An owner that is not this copy and whose file name is not
+/// `identity::LINUX_EXE_NAME` is a foreign program: both rows `OursBroken` with
+/// `ForeignProgram` (badged), nothing else judged. `Exec=` / `TryExec=` programs are resolved the same way before they are
 /// compared with the owner. `icon_candidates` are the places the `manhwastudio_rs` icon may live. Both rows carry
 /// the launch defects (gone executable, `Exec=` / `TryExec=` / `Path=` pointing elsewhere, a
 /// missing ownership key on a legacy entry); the menu row adds the icon, the "Open with" row
@@ -106,6 +109,14 @@ pub fn evaluate_desktop_entry(
         }
     };
     let ours = is_ours(&owner);
+    // A program that is not a ManhwaStudio executable at all is not "another copy": the entry at
+    // our name is broken, and Repair / Remove of it ask for confirmation.
+    if !ours && owner.file_name().is_none_or(|name| name != LINUX_EXE_NAME) {
+        let value = if keyed { RecordValue::DesktopOwnerKey } else { RecordValue::DesktopExec };
+        let defect = Defect::ForeignProgram { value, expected: identity.exe.display().to_string(), found: owner.display().to_string() };
+        let status = classify(identity.exe.clone(), true, true, vec![defect]);
+        return rows(status.clone(), status);
+    }
     let alive = exists(&owner);
     // The owner's own executable, after the same `$PATH` resolution as the owner: for this copy
     // by the writer's rule, for another copy lexically. A bare name found nowhere names nobody.
@@ -162,7 +173,9 @@ pub fn evaluate_desktop_entry(
     let mut menu = launch.clone();
     match value_of("Icon").map(unescape_desktop_string_value) {
         None => menu.push(Defect::ValueMissing { value: RecordValue::DesktopIcon }),
-        Some(icon) if Path::new(&icon).is_absolute() => {
+        // The POSIX rule, not `Path::is_absolute`: the judge is pure and also runs in Windows host
+        // test builds, where `/x` has no drive and would not count as absolute.
+        Some(icon) if icon.starts_with('/') => {
             if !exists(Path::new(&icon)) {
                 menu.push(Defect::IconMissing);
             }
@@ -481,6 +494,28 @@ mod tests {
         let (menu, open_with) = judge_on("/nowhere/manhwastudio_rs");
         assert_eq!([menu.clone(), open_with], both(RecordStatus::Unreadable(ProbeError::NoOwner { location })));
         assert!(!badge_worthy(&menu));
+    }
+
+    /// An entry at our name whose program is not a ManhwaStudio executable (by key or legacy
+    /// `Exec`) is a broken record at our name on both rows, never "another copy".
+    #[test]
+    fn foreign_program_entries_are_broken_at_our_name() {
+        let foreign = |value: RecordValue, found: &str| {
+            both(RecordStatus::OursBroken(vec![Defect::ForeignProgram { value, expected: EXE.to_owned(), found: found.to_owned() }]))
+        };
+        let legacy = "[Desktop Entry]\nType=Application\nName=ManhwaStudio\nExec=/usr/bin/gimp %f\nIcon=gimp\n";
+        let statuses = judge(legacy, &[]);
+        assert_eq!(statuses, foreign(RecordValue::DesktopExec, "/usr/bin/gimp"));
+        assert!(crate::report::badge_worthy(&statuses[0]));
+        let keyed = linux_desktop_entry_text(&identity()).replace(&format!("{OWNER_EXE_KEY}={EXE}"), &format!("{OWNER_EXE_KEY}=/usr/bin/gimp"));
+        assert_eq!(judge(&keyed, &[]), foreign(RecordValue::DesktopOwnerKey, "/usr/bin/gimp"));
+        // This copy under another file name is still this copy.
+        let renamed = CopyIdentity { exe: PathBuf::from("/opt/ms/ms-renamed"), ..identity() };
+        let exists = |_: &Path| true;
+        let is_ours = |path: &Path| path == Path::new("/opt/ms/ms-renamed");
+        let oracles = EntryOracles { exists: &exists, is_ours: &is_ours, resolve: &as_is };
+        let [menu, _] = evaluate_desktop_entry(Scope::User, &observed(&linux_desktop_entry_text(&renamed)), false, &renamed, &icons(), &oracles);
+        assert!(matches!(menu.status, RecordStatus::OursOk | RecordStatus::OursStale(_)), "{:?}", menu.status);
     }
 
     /// `shadowed` survives only on Machine rows.

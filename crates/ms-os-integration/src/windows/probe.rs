@@ -21,7 +21,9 @@ Expected values come from the writers' own tables (`values::uninstall_and_app_pa
 probe can never expect something the installer does not write. Paths compare by the uninstall
 ownership rule (`values::normalize_windows_path_text`: case-insensitive, `/` = `\`, trailing
 separators ignored); display texts compare exactly. The record's owner is the executable it
-launches; a record of another copy is judged against THAT copy. `NoModify` / `NoRepair`
+launches (`resolve_owner`): ours when ANY identifying value names this copy, else the first
+ManhwaStudio-named executable (another copy, judged against THAT copy), else a foreign program
+(`OursBroken` with `Defect::ForeignProgram`). `NoModify` / `NoRepair`
 (`REG_DWORD`) are not judged: the registry reader is `REG_SZ`-only and both are cosmetic. The
 pure part is compiled into host test builds; the readers are `target_os = "windows"` only.
 */
@@ -211,10 +213,57 @@ fn owned_status(owner: &str, identity: &CopyIdentity, exists: &dyn Fn(&Path) -> 
     classify(owner_path, ours, alive, defects)
 }
 
+/// Whose a record is, decided from its identifying executables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Owner {
+    /// Some identifying value names this copy's executable.
+    Ours,
+    /// None names this copy; the first ManhwaStudio-named one is another copy's executable.
+    OtherCopy(String),
+    /// None names a ManhwaStudio executable: the record at our name launches `found`, read
+    /// from `value`.
+    Foreign { value: RecordValue, found: String },
+}
+
+/// Whether the Windows path text `exe` names a file called [`WINDOWS_EXE_NAME`] (ASCII
+/// case-insensitive, as Windows file names compare).
+fn is_manhwastudio_exe(exe: &str) -> bool {
+    exe.trim_end_matches(['\\', '/']).rsplit(['\\', '/']).next().is_some_and(|name| name.eq_ignore_ascii_case(WINDOWS_EXE_NAME))
+}
+
+/// The owner of a record from its identifying executables `candidates` (the value each was
+/// read from, the executable text), in priority order; `None` when there is none.
+///
+/// ANY candidate naming this copy makes the record ours (a hand-edited or half-rewritten entry
+/// whose other values still name this copy is this copy's broken record, which Repair fixes).
+/// Else the first candidate whose file name is the ManhwaStudio executable is another copy's;
+/// else the record launches a foreign program ([`Owner::Foreign`], the first candidate).
+fn resolve_owner(candidates: &[(RecordValue, String)], identity: &CopyIdentity) -> Option<Owner> {
+    let ours = identity.exe.to_string_lossy();
+    if candidates.iter().any(|(_, exe)| same_windows_path(exe, &ours)) {
+        return Some(Owner::Ours);
+    }
+    if let Some((_, exe)) = candidates.iter().find(|(_, exe)| is_manhwastudio_exe(exe)) {
+        return Some(Owner::OtherCopy(exe.clone()));
+    }
+    candidates.first().map(|(value, found)| Owner::Foreign { value: *value, found: found.clone() })
+}
+
+/// The status of a record at ManhwaStudio's name that launches the foreign program `found`
+/// (read from `value`): this copy's name, broken, judged against nothing else (see
+/// [`Defect::ForeignProgram`]).
+fn foreign_status(value: RecordValue, found: String, identity: &CopyIdentity) -> RecordStatus {
+    let expected = identity.exe.to_string_lossy().into_owned();
+    classify(identity.exe.clone(), true, true, vec![Defect::ForeignProgram { value, expected, found }])
+}
+
 /// Judges the Uninstall entry under `scope`'s root.
 ///
-/// Owner = the `UninstallString` executable, else `DisplayIcon`, else
-/// `InstallLocation\manhwastudio_rs.exe`; none -> `Unreadable(NoOwner)`. Against the owner:
+/// Owner ([`resolve_owner`] over, in this order, the quoted `UninstallString` executable,
+/// `DisplayIcon`, `InstallLocation\manhwastudio_rs.exe` and the unquoted command's first token):
+/// ours when ANY of them names this copy, else the first ManhwaStudio executable among them,
+/// else a foreign program (`OursBroken` with `ForeignProgram`); none -> `Unreadable(NoOwner)`.
+/// Against the owner:
 /// `UninstallString` must be `"<exe>" --uninstall` (else `MalformedCommand`), `InstallLocation`
 /// the exe's directory, `DisplayIcon` the exe, `DisplayName` / `Publisher` the product texts,
 /// `QuietUninstallString` the uninstall command. `DisplayVersion` is compared with
@@ -236,8 +285,20 @@ pub fn evaluate_program_entry(scope: Scope, observed: &Observed<ObservedUninstal
     let from_icon = present_path_value(values.display_icon.as_deref().map(strip_icon_index)).map(str::to_owned);
     let from_location = present_path_value(values.install_location.as_deref()).map(|dir| format!(r"{}\{WINDOWS_EXE_NAME}", dir.trim_end_matches(['\\', '/'])));
     let from_unquoted = uninstall_string.and_then(command_owner).map(str::to_owned);
-    let Some(owner) = from_command.or(from_icon).or(from_location).or(from_unquoted) else {
-        return row(RecordKind::ProgramEntry, scope, location.clone(), RecordStatus::Unreadable(ProbeError::NoOwner { location }));
+    let candidates: Vec<(RecordValue, String)> = [
+        (RecordValue::UninstallString, from_command),
+        (RecordValue::DisplayIcon, from_icon),
+        (RecordValue::InstallLocation, from_location),
+        (RecordValue::UninstallString, from_unquoted),
+    ]
+    .into_iter()
+    .filter_map(|(value, exe)| exe.map(|exe| (value, exe)))
+    .collect();
+    let owner = match resolve_owner(&candidates, identity) {
+        None => return row(RecordKind::ProgramEntry, scope, location.clone(), RecordStatus::Unreadable(ProbeError::NoOwner { location })),
+        Some(Owner::Foreign { value, found }) => return row(RecordKind::ProgramEntry, scope, location, foreign_status(value, found, identity)),
+        Some(Owner::Ours) => identity.exe.to_string_lossy().into_owned(),
+        Some(Owner::OtherCopy(exe)) => exe,
     };
     let install_dir = windows_parent(&owner).unwrap_or_default();
     let table = uninstall_and_app_paths_values(root, install_dir, &owner, identity.version_core.as_deref().unwrap_or_default());
@@ -279,8 +340,10 @@ pub fn evaluate_program_entry(scope: Scope, observed: &Observed<ObservedUninstal
     row(RecordKind::ProgramEntry, scope, location, owned_status(&owner, identity, exists, defects))
 }
 
-/// Judges the App Paths entry under `scope`'s root. Owner = the default value, else
-/// `Path\manhwastudio_rs.exe`. The default value must be the exe and `Path` its directory.
+/// Judges the App Paths entry under `scope`'s root. Owner ([`resolve_owner`] over the default
+/// value and `Path\manhwastudio_rs.exe`): ours when either names this copy, else the first
+/// ManhwaStudio executable, else a foreign program. The default value must be the exe and
+/// `Path` its directory.
 #[must_use]
 pub fn evaluate_app_paths(scope: Scope, observed: &Observed<ObservedAppPaths>, identity: &CopyIdentity, exists: &dyn Fn(&Path) -> bool) -> RecordReport {
     let location = app_paths_key(registry_root(scope));
@@ -291,8 +354,13 @@ pub fn evaluate_app_paths(scope: Scope, observed: &Observed<ObservedAppPaths>, i
     };
     let from_exe = present_path_value(values.exe.as_deref()).map(str::to_owned);
     let from_path = present_path_value(values.path.as_deref()).map(|dir| format!(r"{}\{WINDOWS_EXE_NAME}", dir.trim_end_matches(['\\', '/'])));
-    let Some(owner) = from_exe.or(from_path) else {
-        return row(RecordKind::AppPaths, scope, location.clone(), RecordStatus::Unreadable(ProbeError::NoOwner { location }));
+    let candidates: Vec<(RecordValue, String)> =
+        [(RecordValue::AppPathsExe, from_exe), (RecordValue::AppPathsPath, from_path)].into_iter().filter_map(|(value, exe)| exe.map(|exe| (value, exe))).collect();
+    let owner = match resolve_owner(&candidates, identity) {
+        None => return row(RecordKind::AppPaths, scope, location.clone(), RecordStatus::Unreadable(ProbeError::NoOwner { location })),
+        Some(Owner::Foreign { value, found }) => return row(RecordKind::AppPaths, scope, location, foreign_status(value, found, identity)),
+        Some(Owner::Ours) => identity.exe.to_string_lossy().into_owned(),
+        Some(Owner::OtherCopy(exe)) => exe,
     };
     let install_dir = windows_parent(&owner).unwrap_or_default();
     let mut defects = Vec::new();
@@ -316,10 +384,12 @@ pub fn expected_supported_types(root: &str) -> Vec<String> {
         .collect()
 }
 
-/// Judges the "Open with" key under `scope`'s root. Owner = the open command's executable; a
-/// key without a command names no program (`Unreadable(NoOwner)`). The command must be
-/// `"<exe>" "%1"`, `FriendlyAppName` the product name, every readable type listed in
-/// `SupportedTypes`. `shadowed` marks a `Machine` row hidden by an `HKCU` key of the same name.
+/// Judges the "Open with" key under `scope`'s root. Owner = the open command's executable (a
+/// foreign program when its file name is not the ManhwaStudio executable); a key without a
+/// command names no program (`Unreadable(NoOwner)`). The command must be `"<exe>" "%1"`,
+/// `FriendlyAppName` the product name, every readable type listed in `SupportedTypes`.
+/// `shadowed` marks an existing `Machine` key hidden by an `HKCU` key of the same name; a
+/// missing one is never shadowed.
 #[must_use]
 pub fn evaluate_open_with(
     scope: Scope,
@@ -330,13 +400,15 @@ pub fn evaluate_open_with(
 ) -> RecordReport {
     let root = registry_root(scope);
     let location = windows_open_with_app_key(root);
-    let shadowed = shadowed && scope == Scope::Machine;
+    let shadowed = shadowed && scope == Scope::Machine && !matches!(observed, Ok(None));
     let status = match observed {
         Ok(None) => RecordStatus::Missing,
         Err(error) => RecordStatus::Unreadable(error.clone()),
-        Ok(Some(values)) => match values.command.as_deref().and_then(command_owner) {
-            None => RecordStatus::Unreadable(ProbeError::NoOwner { location: location.clone() }),
-            Some(owner) => {
+        Ok(Some(values)) => match values.command.as_deref().and_then(command_owner).map(|exe| (exe, resolve_owner(&[(RecordValue::OpenCommand, exe.to_owned())], identity))) {
+            None | Some((_, None)) => RecordStatus::Unreadable(ProbeError::NoOwner { location: location.clone() }),
+            Some((_, Some(Owner::Foreign { value, found }))) => foreign_status(value, found, identity),
+            // The command names one executable: ours or another copy's, judged as itself.
+            Some((owner, Some(Owner::Ours | Owner::OtherCopy(_)))) => {
                 let table = windows_open_with_registry_values(root, owner);
                 let command_key = format!(r"{location}\shell\open\command");
                 let expected_command = table.iter().find(|value| value.key == command_key).map(|value| value.data.clone()).unwrap_or_default();
@@ -364,10 +436,12 @@ pub fn evaluate_open_with(
 }
 
 /// Judges the Start-menu shortcut at `lnk` (`None` = its folder could not be resolved;
-/// `folder` names it). Owner = the link target. The working directory must be the program root
-/// the writer uses (`ShortcutSpec::for_copy` for this copy, `ShortcutSpec::for_launcher` of the
-/// target for another copy); one still at the target's own directory where the program root
-/// moved off it is `WorkingDirOutdated`. The link carries no arguments.
+/// `folder` names it). Owner = the link target (a foreign program when its file name is not the
+/// ManhwaStudio executable: `OursBroken` with `ForeignProgram`). The working directory must be
+/// the program root the writer uses (`ShortcutSpec::for_copy` for this copy,
+/// `ShortcutSpec::for_launcher` of the target for another copy); one still at the target's own
+/// directory where the program root moved off it is `WorkingDirOutdated`. The link carries no
+/// arguments.
 #[must_use]
 pub fn evaluate_start_menu(
     scope: Scope,
@@ -390,6 +464,10 @@ pub fn evaluate_start_menu(
     let owner = link.target.to_string_lossy().into_owned();
     if owner.trim().is_empty() {
         return row(RecordKind::StartMenu, scope, location.clone(), RecordStatus::Unreadable(ProbeError::NoOwner { location }));
+    }
+    // The target is the one identifying value: ours or another copy's is judged as itself.
+    if let Some(Owner::Foreign { value, found }) = resolve_owner(&[(RecordValue::ShortcutTarget, owner.clone())], identity) {
+        return row(RecordKind::StartMenu, scope, location, foreign_status(value, found, identity));
     }
     let mut defects = Vec::new();
     let working_dir = link.working_dir.to_string_lossy();
@@ -686,14 +764,14 @@ mod tests {
         let report = evaluate_program_entry(Scope::Machine, &Ok(Some(written_uninstall(OTHER, "1.0.0"))), &id, &all_exist_but(&[]));
         assert_eq!(report.status, RecordStatus::OtherCopy { exe: PathBuf::from(OTHER), alive: true, defects: Vec::new() });
         let mut broken = written_uninstall(OTHER, "1.0.0");
-        broken.install_location = Some(INSTALL.to_owned());
+        broken.install_location = Some(r"E:\Elsewhere".to_owned());
         let report = evaluate_program_entry(Scope::Machine, &Ok(Some(broken)), &id, &all_exist_but(&[]));
         assert_eq!(
             report.status,
             RecordStatus::OtherCopy {
                 exe: PathBuf::from(OTHER),
                 alive: true,
-                defects: vec![Defect::WrongValue { value: RecordValue::InstallLocation, expected: r"D:\Portable\ManhwaStudio".to_owned(), found: INSTALL.to_owned() }],
+                defects: vec![Defect::WrongValue { value: RecordValue::InstallLocation, expected: r"D:\Portable\ManhwaStudio".to_owned(), found: r"E:\Elsewhere".to_owned() }],
             }
         );
         let report = evaluate_program_entry(Scope::Machine, &Ok(Some(written_uninstall(OTHER, "1.0.0"))), &id, &all_exist_but(&[OTHER]));
@@ -767,7 +845,9 @@ mod tests {
 
         assert!(evaluate_open_with(Scope::Machine, &Ok(Some(written_open_with(EXE))), true, &id, &exists).shadowed);
         assert!(!evaluate_open_with(Scope::User, &Ok(Some(written_open_with(EXE))), true, &id, &exists).shadowed);
-        assert!(evaluate_open_with(Scope::Machine, &Ok(None), true, &id, &exists).shadowed);
+        assert!(!evaluate_open_with(Scope::Machine, &Ok(None), true, &id, &exists).shadowed, "a missing key is never shadowed");
+        let denied = ProbeError::Registry { key: "k".to_owned(), value_name: None, code: 5 };
+        assert!(evaluate_open_with(Scope::Machine, &Err(denied), true, &id, &exists).shadowed, "an unreadable key exists");
     }
 
     /// The expected SupportedTypes names are the writer's (every readable extension with a dot).
@@ -840,6 +920,88 @@ mod tests {
             }
         );
         assert_eq!(judge(link(other, "D:/dev/ms")), RecordStatus::OtherCopy { exe: PathBuf::from(other), alive: true, defects: Vec::new() });
+    }
+
+    /// Ownership by ANY identifying value: an entry whose `UninstallString` names a gone copy
+    /// but whose `InstallLocation` / `DisplayIcon` still name this copy is this copy's broken
+    /// entry (Repair), not another copy's; the same for App Paths `Path`.
+    #[test]
+    fn any_identifying_value_naming_this_copy_makes_it_ours() {
+        let id = identity();
+        let gone = r"D:\Gone\manhwastudio_rs.exe";
+        let exists = all_exist_but(&[r"D:\Gone\manhwastudio_rs.exe"]);
+        let mut entry = written_uninstall(EXE, "3.2.1");
+        entry.uninstall_string = Some(format!("\"{gone}\" --uninstall"));
+        let status = status_of(evaluate_program_entry(Scope::User, &Ok(Some(entry)), &id, &exists));
+        assert_eq!(
+            status,
+            RecordStatus::OursBroken(vec![Defect::WrongValue {
+                value: RecordValue::UninstallString,
+                expected: format!("\"{EXE}\" --uninstall"),
+                found: format!("\"{gone}\" --uninstall"),
+            }])
+        );
+        // Only InstallLocation names this copy.
+        let mut location_only = written_uninstall(OTHER, "3.2.1");
+        location_only.install_location = Some(INSTALL.to_owned());
+        assert!(matches!(status_of(evaluate_program_entry(Scope::User, &Ok(Some(location_only)), &id, &exists)), RecordStatus::OursBroken(_)));
+
+        let app_paths = ObservedAppPaths { exe: Some(gone.to_owned()), path: Some(INSTALL.to_owned()) };
+        assert_eq!(
+            status_of(evaluate_app_paths(Scope::User, &Ok(Some(app_paths)), &id, &exists)),
+            RecordStatus::OursBroken(vec![Defect::WrongValue { value: RecordValue::AppPathsExe, expected: EXE.to_owned(), found: gone.to_owned() }])
+        );
+    }
+
+    /// A record at our name that launches a program which is not a ManhwaStudio executable is a
+    /// broken record at our name (`ForeignProgram`, badged), never "another copy".
+    #[test]
+    fn foreign_programs_are_broken_records_at_our_name() {
+        let id = identity();
+        let exists = all_exist_but(&[]);
+        let notepad = r"C:\Windows\notepad.exe";
+        let foreign = |value: RecordValue| RecordStatus::OursBroken(vec![Defect::ForeignProgram { value, expected: EXE.to_owned(), found: notepad.to_owned() }]);
+
+        let lnk = PathBuf::from("C:/Users/u/Programs/ManhwaStudio.lnk");
+        let link = ObservedShortcut { target: PathBuf::from(notepad), arguments: String::new(), working_dir: PathBuf::from(r"C:\Windows") };
+        let status = status_of(evaluate_start_menu(Scope::User, Some(&lnk), "Programs", &Ok(Some(link)), &id, &exists));
+        assert_eq!(status, foreign(RecordValue::ShortcutTarget));
+        assert!(crate::report::badge_worthy(&status));
+
+        let open_with = ObservedOpenWith { command: Some(format!("\"{notepad}\" \"%1\"")), ..written_open_with(EXE) };
+        assert_eq!(status_of(evaluate_open_with(Scope::User, &Ok(Some(open_with)), false, &id, &exists)), foreign(RecordValue::OpenCommand));
+
+        let entry = ObservedUninstall {
+            uninstall_string: Some(format!("\"{notepad}\" --uninstall")),
+            display_icon: Some(notepad.to_owned()),
+            ..ObservedUninstall::default()
+        };
+        assert_eq!(status_of(evaluate_program_entry(Scope::User, &Ok(Some(entry)), &id, &exists)), foreign(RecordValue::UninstallString));
+
+        let app_paths = ObservedAppPaths { exe: Some(notepad.to_owned()), path: None };
+        assert_eq!(status_of(evaluate_app_paths(Scope::User, &Ok(Some(app_paths)), &id, &exists)), foreign(RecordValue::AppPathsExe));
+
+        // A ManhwaStudio executable among the values decides "another copy" over a foreign one.
+        let mixed = ObservedUninstall {
+            uninstall_string: Some(format!("\"{notepad}\" --uninstall")),
+            display_icon: Some(OTHER.to_owned()),
+            ..ObservedUninstall::default()
+        };
+        let RecordStatus::OtherCopy { exe, .. } = status_of(evaluate_program_entry(Scope::User, &Ok(Some(mixed)), &id, &exists)) else {
+            panic!("a ManhwaStudio executable names the owner");
+        };
+        assert_eq!(exe, PathBuf::from(OTHER));
+    }
+
+    /// The ManhwaStudio executable name test: file name only, ASCII case-insensitive.
+    #[test]
+    fn manhwastudio_exe_names() {
+        assert!(is_manhwastudio_exe(r"C:\A\manhwastudio_rs.exe"));
+        assert!(is_manhwastudio_exe("D:/b/MANHWASTUDIO_RS.EXE"));
+        assert!(is_manhwastudio_exe("manhwastudio_rs.exe"));
+        assert!(!is_manhwastudio_exe(r"C:\Windows\notepad.exe"));
+        assert!(!is_manhwastudio_exe(r"C:\manhwastudio_rs.exe\other.exe"));
+        assert!(!is_manhwastudio_exe(r"C:\A\manhwastudio_rs"));
     }
 
     /// Command and icon parsing helpers.

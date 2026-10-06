@@ -90,12 +90,18 @@ decided by the caller (`ms-installer` `utils.rs::finalize_windows_post_install`)
   (Uninstall: quoted `UninstallString` exe, else `DisplayIcon`, else `InstallLocation` +
   exe name, else the unquoted command's first token; App Paths: default value, else `Path` +
   exe name; "Open with": the command's exe; `.lnk`: its target); no owner -> `Unreadable(NoOwner)`.
-  Ours = owner equals `CopyIdentity::exe` by the path rule of `values::normalize_windows_path_text`.
+  `probe::resolve_owner` decides over those candidates: ours when ANY of them equals
+  `CopyIdentity::exe` by the path rule of `values::normalize_windows_path_text`; else the first
+  one named `manhwastudio_rs.exe` (ASCII case-insensitive) is another copy; else the record
+  launches a foreign program (`OursBroken` with `ForeignProgram`, nothing else judged). This
+  probe rule is separate from the uninstall deletion rule above, which still needs EVERY value
+  to agree.
   Expected values are the writer tables evaluated for the OWNER; paths compare by the path rule,
   display texts exactly, commands as `"<exe>" <tail>` with the tail exact (an unquoted or
   differently-tailed command is `MalformedCommand`). `DisplayVersion` is judged only for this
   copy's entry when the identity carries a version; `NoModify` / `NoRepair` (`REG_DWORD`) are not
-  read. The `HKLM` "Open with" row is `shadowed` when an `HKCU` key of the same name exists.
+  read. The `HKLM` "Open with" row is `shadowed` when it exists (present or unreadable) and an
+  `HKCU` key of the same name exists.
   A `.lnk` working directory still at the target's own directory where the program root moved
   off it is `WorkingDirOutdated` (stale).
 - **Child processes.** Only `elevation.rs` starts one: the elevated copy of the running exe
@@ -115,7 +121,8 @@ decided by the caller (`ms-installer` `utils.rs::finalize_windows_post_install`)
   (the module name shadows it).
 
 ## Editing map
-- New or changed registry value: `values.rs` (+ its golden), writer in `registry.rs`.
+- New or changed registry value: `values.rs` (+ its golden), writer in `registry.rs`. The
+  registration actions (`../actions.rs`) delete a record's key tree before writing it.
 - What uninstall may delete (ownership evidence): `values.rs` predicates (+ tests), read in
   `registry.rs::remove_record_if_owned`.
 - Shortcut location or content: `shortcut.rs`.

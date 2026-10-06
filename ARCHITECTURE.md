@@ -148,7 +148,10 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   is the process's FIRST document access (seeds the docstore default format); the on-disk
   locale catalog is reconciled before user settings load.
 - **Runtime root:** `ms_config::data_dir()` / `program_dir()` = the launch directory if it holds
-  the program markers, else the executable directory. Bundled resources, the Python
+  the program markers, else the executable directory if it does, else — for a repository build
+  (`<repo>/target/<profile>/<exe>`) — `<repo>` if it does (rules: `ms_config::runtime_root`,
+  also the one owner of the repository-build rule `ms-os-integration` writes records with;
+  macOS `.app` bundles use Application Support). Bundled resources, the Python
   environment, `user_config`, logs and app-managed models all resolve from it.
 - `StudioBootstrapApp` (`src/studio_bootstrap.rs`) loads the project off the GUI thread, owns
   window geometry and the GL lifetime, then delegates to `MangaApp`. It receives a typed

@@ -28,6 +28,11 @@ read-only registration probe.
   resolved the same way before they are compared with the owner. Paths compare canonicalized when
   both exist, lexically otherwise (`xdg::same_executable`). The writer and the probe use the same
   rule.
+- An owner that is not this copy and whose file name is not `identity::LINUX_EXE_NAME` is a
+  foreign program: the probe reports both rows `OursBroken` with `ForeignProgram` (Repair offered,
+  confirmed); the startup policy still leaves such an entry alone (it has another owner).
+- The pure judge never uses host path predicates (`Path::is_absolute`): an absolute `Icon=` is
+  one starting with `/`, so the judge behaves the same in a Windows host test build.
 - The startup policy never takes over another copy's entry; only an explicit registration action
   (`crate::actions::apply` -> `xdg::write_entry`) overwrites it. Removing the entry keeps the icon.
 - Writes only under `$XDG_DATA_HOME`; `$XDG_DATA_DIRS` copies are read-only `Machine` rows of the

@@ -332,6 +332,12 @@ crate's `[dev-dependencies]`, so no production build carries them.
   raw wheel delta, e.g. the page manager's split board) must skip its wheel reaction while a
   list is open, exactly as the wheel widgets here do.
 - `seed_spin_box.rs`: seed value input with random generation support.
+- `marquee.rs`: paint-only web-style marquee for a single-line label that overflows its rect
+  (`paint_marquee_galley`): rest at the start, scroll at constant speed until the end shows, short
+  rest, jump back. The phase is the pure `marquee_frame(overflow, time, timing)`, derived from the
+  absolute `InputState::time`, so the helper has no per-widget state and no id. The caller lays
+  out the galley (font and colour are theirs; no theme here). Used by the launcher settings
+  sidebar tabs and its two-line buttons.
 - `help_hint.rs`: light-gray circled "?" icon whose hover tooltip explains a control. The
   tooltip may carry a localized text line, an animated WebP hint from the `ms-gifs` crate, or
   both — text first, animation below it — selected by the constructors (`animated`, `text`,
@@ -411,6 +417,9 @@ crate's `[dev-dependencies]`, so no production build carries them.
   current frame plus the selected row on the closed button. That is a contract, not an
   optimisation: egui's `add_font` never evicts, so a resolver called for every filtered row
   every frame would grow the font atlas without bound while the user scrolls a catalog.
+- `paint_marquee_galley` never allocates space or senses input, and schedules a repaint
+  (`request_repaint_after`: the remaining pause, or one ~16 ms frame while moving) ONLY while the
+  text overflows and its rect is visible; text that fits costs no repaint.
 - `WheelComboBox::from_label` seeds the widget id from the label text. When the label is localized
   (`t!("…")`), chain `.id_salt("stable_key")` so the id stays language-independent
   (`docs/i18n_exclusions.md` §C); user-visible widget labels are localized through `ms-i18n`, but

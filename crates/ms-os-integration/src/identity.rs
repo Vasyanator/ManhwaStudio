@@ -7,7 +7,7 @@ the Windows executable name, the shortcut file name and the registry subkeys. On
 the writer, the uninstaller and any later probe can never disagree on a spelling.
 
 Key items:
-- `PRODUCT_NAME`, `PUBLISHER`, `WINDOWS_EXE_NAME`, `SHORTCUT_FILE_NAME`
+- `PRODUCT_NAME`, `PUBLISHER`, `WINDOWS_EXE_NAME`, `LINUX_EXE_NAME`, `SHORTCUT_FILE_NAME`
 - `UNINSTALL_SUBKEY`, `APP_PATHS_SUBKEY`
 - `LINUX_OWNER_EXE_KEY` (the desktop entry's ownership key)
 - `APP_ICON_PNG` (the 512 px program icon the Linux desktop entry installs)
@@ -27,6 +27,10 @@ pub const PUBLISHER: &str = "Vasyanator";
 /// On-disk name of the Windows launcher executable: the file shortcuts and registry entries
 /// target first, and the name of the App Paths and `Applications\…` keys.
 pub const WINDOWS_EXE_NAME: &str = "manhwastudio_rs.exe";
+
+/// File name of the Linux executable: a desktop entry whose program has another file name
+/// launches something that is not ManhwaStudio (`Defect::ForeignProgram`).
+pub const LINUX_EXE_NAME: &str = "manhwastudio_rs";
 
 /// File name of every Windows shortcut the installer creates (desktop and Start menu).
 pub const SHORTCUT_FILE_NAME: &str = "ManhwaStudio.lnk";

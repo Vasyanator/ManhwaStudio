@@ -6,7 +6,7 @@ Launcher settings page for global launcher options.
 
 Main responsibilities:
 - render the Rust launcher settings card in the same shell/theme as other pages;
-- split launcher settings into tabs without blocking the fullscreen page shell;
+- split launcher settings into tabs (a vertical sidebar) without blocking the fullscreen page shell;
 - edit and persist the projects root stored in `user_config.json`;
 - show system CPU/RAM/core and accelerator information from a background probe;
 - probe AI Python packages through the shared startup/settings probe path;
@@ -24,10 +24,19 @@ background worker threads so the launcher UI never blocks on shell I/O.
 
 The tab set, ordering, tab labels, and the shared General/AiBackend/Tutorials sections come from the
 shared section registry (`ms_settings_ui::settings_shared`): `active_tab` is a `SettingsSectionId`, the tab
-bar iterates `sections_for(SettingsSurface::Launcher)`, and the shared panels are owned as one
+sidebar iterates `sections_for(SettingsSurface::Launcher)`, and the shared panels are owned as one
 `SharedSettingsPanels`. The launcher-exclusive sections (SystemInfo/AiComputations/TorchUpgrade/
 PythonEnvironment) keep their local renderers here; the dynamic TorchUpgrade hide/relabel logic is
-applied inline in the tab bar.
+applied inline in the sidebar.
+
+Layout: under the title the card is split into two explicit child rects — the vertical tab
+sidebar on the left (`show_sidebar`, width `sidebar_width`: a clamped sixth of the card) and the
+active section in its own vertical `ScrollArea` on the right. The sidebar scrolls its tabs and
+pins the "Save log" button below them, outside the scroll; tab labels that do not fit run as
+marquees (`ms_widgets::paint_marquee_galley`). The PythonEnvironment tab is the one exception
+to the content scroll: it fills the content rect itself (command row and hint pinned bottom-up,
+output frame with its own stick-to-bottom scroll in the rest) and only falls back to the
+content scroll, as a fixed-height block, when the column is shorter than its minimum.
 */
 
 use ms_settings_ui::ai_backend_supervisor::AiBackendHandle;
@@ -78,9 +87,10 @@ use ms_log::runtime_log;
 #[cfg(not(target_arch = "wasm32"))]
 use chrono::Local;
 use egui::{
-    Align, Align2, Area, Color32, CornerRadius, FontId, Frame, Layout, Order, RichText, ScrollArea,
-    Sense, Stroke, Ui, Vec2,
+    Align, Area, Color32, CornerRadius, FontId, Frame, Layout, Margin, Order, RichText, ScrollArea,
+    Sense, Stroke, Ui, UiBuilder, Vec2,
 };
+use ms_widgets::{MarqueeTiming, paint_marquee_galley};
 // `Key`/`TextEdit`/`TextStyle` are used only by the native Python-console tab.
 #[cfg(not(target_arch = "wasm32"))]
 use egui::{Key, TextEdit, TextStyle};
@@ -118,9 +128,35 @@ const TAB_STROKE: Color32 = theme::BUTTON_STROKE;
 const TAB_HIGHLIGHT_FILL: Color32 = Color32::from_rgba_premultiplied(120, 88, 18, 188);
 const TAB_HIGHLIGHT_STROKE: Color32 = Color32::from_rgba_premultiplied(236, 197, 76, 170);
 const SETTINGS_CARD_EDGE_GAP: f32 = 18.0;
-// Layout constants for the native Python-console tab only.
+// Vertical tab sidebar. Its width follows the card (a sixth of it, the column the design asks
+// for) but is clamped: below 220 pt most localized tab names would be marquees, above 280 pt
+// the sidebar steals width the section content needs on a wide window.
+const SIDEBAR_WIDTH_FRACTION: f32 = 1.0 / 6.0;
+const SIDEBAR_MIN_WIDTH: f32 = 220.0;
+const SIDEBAR_MAX_WIDTH: f32 = 280.0;
+const SIDEBAR_CONTENT_GAP: f32 = 18.0;
+const SIDEBAR_TAB_HEIGHT: f32 = 36.0;
+const SIDEBAR_TAB_SPACING: f32 = 6.0;
+const SIDEBAR_SAVE_LOG_GAP: f32 = 10.0;
+const SAVE_LOG_BUTTON_HEIGHT: f32 = 44.0;
+// Inset of the tabs inside the sidebar scroll clip: covers the hover expansion
+// (`theme::BUTTON_HOVER_EXPANSION`, 2 pt) plus the part of the corner warning badge that
+// reaches past the button corner (`paint_corner_badge`: 0.4 x its 7 pt radius), with slack.
+const SIDEBAR_CLIP_INSET: i8 = 8;
+// Horizontal text padding inside a tab / two-line button; the marquee clips to it.
+const TAB_LABEL_PADDING: f32 = 12.0;
+// Layout constants for the native Python-console tab only. The tab fills the content column:
+// the command row and its hint are pinned to the bottom, the output frame takes the rest.
+// Smallest output frame the pinned layout accepts; below it the tab falls back to the scrolled
+// content column with a block of `CONSOLE_MIN_HEIGHT + CONSOLE_BOTTOM_BLOCK_RESERVE`.
 #[cfg(not(target_arch = "wasm32"))]
 const CONSOLE_MIN_HEIGHT: f32 = 320.0;
+// Height budgeted for the pinned bottom block: gap above the row (12) + command row
+// (`CONSOLE_INPUT_ROW_HEIGHT`) + gap (6) + up to two 12 pt hint lines + item spacing, with slack.
+#[cfg(not(target_arch = "wasm32"))]
+const CONSOLE_BOTTOM_BLOCK_RESERVE: f32 = 120.0;
+#[cfg(not(target_arch = "wasm32"))]
+const CONSOLE_INPUT_ROW_HEIGHT: f32 = 56.0;
 #[cfg(not(target_arch = "wasm32"))]
 const CONSOLE_INPUT_ROWS: usize = 2;
 // The Python-environment console spawns a native OS shell; it has no web
@@ -148,6 +184,9 @@ struct PythonConsoleState {
     input: String,
     runtime: Option<PythonConsoleRuntime>,
     attempted_start: bool,
+    /// Layout mode of the last drawn frame (`Some(true)` = pinned to the content column,
+    /// `Some(false)` = scrolled fallback for a short window); only used to log mode changes once.
+    last_layout_pinned: Option<bool>,
 }
 
 pub struct SettingsPageState {
@@ -433,12 +472,50 @@ impl SettingsPageState {
                     ui.label(RichText::new(t!("launcher.settings.heading")).size(24.0).strong());
                     ui.add_space(18.0);
 
-                    save_log_button_rect = Some(self.show_tab_bar(ui));
-                    ui.add_space(18.0);
+                    // Below the title the card splits into explicit rects: the tab sidebar on
+                    // the left (full remaining height) and the active section on the right.
+                    // Explicit child rects rather than `ui.horizontal`, whose child starts one
+                    // interact-row high and would not give the sidebar the page height.
+                    let region = ui.available_rect_before_wrap();
+                    let sidebar_rect = egui::Rect::from_min_size(
+                        region.min,
+                        egui::vec2(sidebar_width(region.width()), region.height()),
+                    );
+                    let content_left = (sidebar_rect.right() + SIDEBAR_CONTENT_GAP).min(region.right());
+                    let content_rect = egui::Rect::from_min_max(egui::pos2(content_left, region.top()), region.max);
+
+                    let mut sidebar_ui = ui.new_child(
+                        UiBuilder::new()
+                            .id_salt("launcher.settings.sidebar")
+                            .max_rect(sidebar_rect)
+                            .layout(Layout::top_down(Align::Min)),
+                    );
+                    save_log_button_rect = Some(self.show_sidebar(&mut sidebar_ui));
+
+                    let mut content_ui = ui.new_child(
+                        UiBuilder::new()
+                            .id_salt("launcher.settings.content")
+                            .max_rect(content_rect)
+                            .layout(Layout::top_down(Align::Min)),
+                    );
+                    // The children do not move the parent's cursor; claim the whole region so
+                    // the card keeps its size.
+                    ui.advance_cursor_after_rect(region);
+
+                    // The Python console fills the content column itself (output frame with
+                    // its own scroll, command row pinned to the bottom), so it bypasses the
+                    // column scroll whenever the column is tall enough for it.
+                    if self.active_tab == SettingsSectionId::PythonEnvironment
+                        && self.python_console_layout_pinned(content_rect.height())
+                    {
+                        self.show_python_environment_tab(&mut content_ui);
+                        return;
+                    }
 
                     ScrollArea::vertical()
+                        .id_salt("launcher.settings.content_scroll")
                         .auto_shrink([false, false])
-                        .show(ui, |ui| match self.active_tab {
+                        .show(&mut content_ui, |ui| match self.active_tab {
                             // Shared sections render through the shared panel container,
                             // with the current warnings as inline item badges. `General`
                             // may report a saved projects root; every shared section
@@ -488,7 +565,7 @@ impl SettingsPageState {
                                 }
                             }
                             SettingsSectionId::PythonEnvironment => {
-                                self.show_python_environment_tab(ui);
+                                self.show_python_environment_tab_scrolled(ui);
                             }
                             // Listed on Windows / Linux only (its `SECTIONS` row is cfg'd), so on
                             // other systems `active_tab` never holds it. Every possible change of
@@ -527,53 +604,83 @@ impl SettingsPageState {
         action
     }
 
-    fn show_tab_bar(&mut self, ui: &mut Ui) -> egui::Rect {
-        let mut save_log_rect = egui::Rect::NOTHING;
-        ui.horizontal_wrapped(|ui| {
-            // Build the tab bar from the shared section registry (single source of
-            // truth for which sections the launcher shows and in what order).
-            for descriptor in sections_for(SettingsSurface::Launcher) {
-                let id = descriptor.id;
-                if id == SettingsSectionId::TorchUpgrade {
-                    // The Torch-upgrade tab is dynamic: hidden when no AI is
-                    // installed, and relabeled + highlighted by install type.
-                    match self.ai_install_type {
-                        config::AiInstallType::Base => self.show_tab_button_highlighted(
-                            ui,
-                            id,
-                            t!("launcher.settings.upgrade_to_full_button"),
-                        ),
-                        config::AiInstallType::Full => self.show_tab_button(
-                            ui,
-                            id,
-                            t!("launcher.settings.install_other_pytorch_button"),
-                        ),
-                        config::AiInstallType::None => {}
-                    }
-                } else {
-                    // All other sections use their static per-surface title key,
-                    // resolved to the active locale at runtime (`t!` needs a literal).
-                    let label = ms_i18n::resolve_key(title_key(
-                        id,
-                        SettingsSurface::Launcher,
-                    ));
-                    self.show_tab_button(ui, id, label);
-                }
-            }
+    /// Draws the vertical tab sidebar into `ui` (whose `max_rect` is the whole sidebar column):
+    /// the section tabs in a vertical scroll area, and the "Save log" button pinned below it,
+    /// outside the scroll. Returns the save-log button rect, the anchor of its popup.
+    fn show_sidebar(&mut self, ui: &mut Ui) -> egui::Rect {
+        let column = ui.max_rect();
+        let save_log_top = (column.bottom() - SAVE_LOG_BUTTON_HEIGHT).max(column.top());
+        let tabs_bottom = (save_log_top - SIDEBAR_SAVE_LOG_GAP).max(column.top());
+        let tabs_rect = egui::Rect::from_min_max(column.min, egui::pos2(column.right(), tabs_bottom));
+        // Same horizontal inset as the scrolled tabs, so the button lines up with them.
+        let save_log_rect = egui::Rect::from_min_max(egui::pos2(column.left(), save_log_top), column.max)
+            .shrink2(egui::vec2(f32::from(SIDEBAR_CLIP_INSET), 0.0));
 
-            let response = show_two_line_button(
-                ui,
-                t!("launcher.settings.save_log_button"),
-                t!("launcher.settings.save_log_hint"),
-                egui::vec2(300.0, 40.0),
-                self.log_popup_open,
-            );
-            save_log_rect = response.rect;
-            if response.clicked() {
-                self.log_popup_open = !self.log_popup_open;
-            }
-        });
-        save_log_rect
+        let mut tabs_ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt("launcher.settings.sidebar_tabs")
+                .max_rect(tabs_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        ScrollArea::vertical()
+            .id_salt("launcher.settings.sidebar_scroll")
+            .auto_shrink([false, false])
+            // The scroll area clips to its inner rect INCLUDING this margin
+            // (`egui-0.36.2/src/containers/scroll_area.rs:319`), which is what keeps the hover
+            // expansion and the corner warning badge (they reach past the button's top-right
+            // corner) from being cut off.
+            .content_margin(Margin::symmetric(SIDEBAR_CLIP_INSET, SIDEBAR_CLIP_INSET))
+            .show(&mut tabs_ui, |ui| {
+                ui.spacing_mut().item_spacing.y = SIDEBAR_TAB_SPACING;
+                // Built from the shared section registry (single source of truth for which
+                // sections the launcher shows and in what order).
+                for descriptor in sections_for(SettingsSurface::Launcher) {
+                    let id = descriptor.id;
+                    if id == SettingsSectionId::TorchUpgrade {
+                        // The Torch-upgrade tab is dynamic: hidden when no AI is
+                        // installed, and relabeled + highlighted by install type.
+                        match self.ai_install_type {
+                            config::AiInstallType::Base => self.show_tab_button_highlighted(
+                                ui,
+                                id,
+                                t!("launcher.settings.upgrade_to_full_button"),
+                            ),
+                            config::AiInstallType::Full => self.show_tab_button(
+                                ui,
+                                id,
+                                t!("launcher.settings.install_other_pytorch_button"),
+                            ),
+                            config::AiInstallType::None => {}
+                        }
+                    } else {
+                        // All other sections use their static per-surface title key,
+                        // resolved to the active locale at runtime (`t!` needs a literal).
+                        let label = ms_i18n::resolve_key(title_key(
+                            id,
+                            SettingsSurface::Launcher,
+                        ));
+                        self.show_tab_button(ui, id, label);
+                    }
+                }
+            });
+
+        let mut save_log_ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt("launcher.settings.save_log")
+                .max_rect(save_log_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        let response = show_two_line_button(
+            &mut save_log_ui,
+            t!("launcher.settings.save_log_button"),
+            t!("launcher.settings.save_log_hint"),
+            save_log_rect.size(),
+            self.log_popup_open,
+        );
+        if response.clicked() {
+            self.log_popup_open = !self.log_popup_open;
+        }
+        response.rect
     }
 
     fn show_tab_button(&mut self, ui: &mut Ui, tab: SettingsSectionId, label: &str) {
@@ -584,8 +691,9 @@ impl SettingsPageState {
         self.show_tab_button_impl(ui, tab, label, true);
     }
 
-    /// Draws one custom-painted tab button. `highlighted` gives it the amber
-    /// call-to-action look (the "upgrade to full" tab). The section's worst settings
+    /// Draws one custom-painted sidebar tab, as wide as the sidebar. `highlighted` gives it
+    /// the amber call-to-action look (the "upgrade to full" tab). A label wider than the tab
+    /// scrolls as a marquee (`ms_widgets::paint_marquee_galley`). The section's worst settings
     /// warning, if any, is painted as a corner "!" badge after the label: paint only, the
     /// click rect is unchanged.
     fn show_tab_button_impl(
@@ -608,12 +716,7 @@ impl SettingsPageState {
         } else {
             theme::TEXT_MUTED
         };
-        let desired_width = if label.chars().count() > 24 {
-            280.0
-        } else {
-            190.0
-        };
-        let desired_size = egui::vec2(desired_width, 36.0);
+        let desired_size = egui::vec2(ui.available_width(), SIDEBAR_TAB_HEIGHT);
         let (rect, response) = ui.allocate_exact_size(desired_size, Sense::click());
         let hovered = response.hovered();
         let draw_rect = if hovered {
@@ -635,12 +738,13 @@ impl SettingsPageState {
             ),
             egui::StrokeKind::Middle,
         );
-        ui.painter().text(
-            rect.center(),
-            Align2::CENTER_CENTER,
-            label,
-            FontId::proportional(14.0),
-            text_color,
+        let galley = ui.painter().layout_no_wrap(label.to_owned(), FontId::proportional(14.0), text_color);
+        paint_marquee_galley(
+            ui,
+            rect.shrink2(egui::vec2(TAB_LABEL_PADDING, 0.0)),
+            galley,
+            Align::Min,
+            &MarqueeTiming::DEFAULT,
         );
         if let Some(level) = self.warnings.set().section_level(tab) {
             paint_corner_badge(ui.painter(), draw_rect, level);
@@ -665,7 +769,9 @@ impl SettingsPageState {
 
         let popup_height = POPUP_BUTTON_HEIGHT * 2.0 + POPUP_GAP + 24.0;
         let screen = ui.ctx().content_rect();
-        let popup_x = (button_rect.center().x - POPUP_WIDTH * 0.5)
+        // Left-aligned with the save-log button at the bottom of the sidebar and opened
+        // above it; the popup is wider than the sidebar and extends to the right.
+        let popup_x = button_rect.left()
             .clamp(screen.left() + 8.0, (screen.right() - POPUP_WIDTH - 8.0).max(screen.left() + 8.0));
         let popup_y = (button_rect.min.y - popup_height - POPUP_GAP).max(screen.top() + 8.0);
         let popup_pos = egui::pos2(popup_x, popup_y);
@@ -1447,7 +1553,55 @@ impl SettingsPageState {
         ui.ctx().request_repaint();
     }
 
-    /// Renders the interactive Python-environment console tab.
+    /// Decides whether the Python console is laid out pinned to the content column of height
+    /// `content_height` (true) or inside the column scroll (false, a window too short for
+    /// `CONSOLE_MIN_HEIGHT` plus the bottom block). Logs each change of the decision once.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn python_console_layout_pinned(&mut self, content_height: f32) -> bool {
+        let pinned = python_console_fits_pinned(content_height);
+        if self.python_console.last_layout_pinned != Some(pinned) {
+            self.python_console.last_layout_pinned = Some(pinned);
+            if pinned {
+                runtime_log::log_info(format!(
+                    "[launcher-settings] python console pinned to the content column (height {content_height:.0} pt)"
+                ));
+            } else {
+                runtime_log::log_info(format!(
+                    "[launcher-settings] python console falls back to the scrolled layout: content height {content_height:.0} pt < {:.0} pt needed",
+                    CONSOLE_MIN_HEIGHT + CONSOLE_BOTTOM_BLOCK_RESERVE
+                ));
+            }
+        }
+        pinned
+    }
+
+    /// Web twin: the web notice is a single label, it always stays in the column scroll.
+    #[cfg(target_arch = "wasm32")]
+    fn python_console_layout_pinned(&mut self, _content_height: f32) -> bool {
+        false
+    }
+
+    /// Short-window fallback inside the content column scroll: the console layout gets a fixed
+    /// block just tall enough for its minimum output frame plus the bottom block.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn show_python_environment_tab_scrolled(&mut self, ui: &mut Ui) {
+        let block_size = egui::vec2(ui.available_width(), CONSOLE_MIN_HEIGHT + CONSOLE_BOTTOM_BLOCK_RESERVE);
+        // The child's max rect is exactly the block; the console layout claims all of it.
+        ui.allocate_ui_with_layout(block_size, Layout::top_down(Align::Min), |ui| {
+            self.show_python_environment_tab(ui);
+        });
+    }
+
+    /// Web twin: the notice needs no fixed block.
+    #[cfg(target_arch = "wasm32")]
+    fn show_python_environment_tab_scrolled(&mut self, ui: &mut Ui) {
+        self.show_python_environment_tab(ui);
+    }
+
+    /// Renders the interactive Python-environment console tab into the whole available rect
+    /// of `ui`: the hint line and the command row are laid out bottom-up (pinned to the bottom),
+    /// the output frame fills the remaining height and scrolls its text inside, sticking to
+    /// the bottom.
     ///
     /// Native only: it spawns and talks to an OS shell. The web twin renders an
     /// "unavailable on web" notice.
@@ -1456,39 +1610,30 @@ impl SettingsPageState {
         self.ensure_python_console_started(ui);
         self.poll_python_console(ui);
 
-        Frame::new()
-            .fill(Color32::from_rgba_premultiplied(12, 12, 16, 168))
-            .stroke(Stroke::new(1.0, theme::BUTTON_STROKE))
-            .corner_radius(CornerRadius::same(12))
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.set_min_height(CONSOLE_MIN_HEIGHT);
-                let console_text_width = ui.available_width();
-                ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_width(console_text_width);
-                        ui.add(egui::Label::new(console_output_layout_job(
-                            ui,
-                            self.python_console.output.as_str(),
-                            console_text_width,
-                        )));
-                    });
-            });
-
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
+        let area = ui.available_rect_before_wrap();
+        let mut bottom_ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt("launcher.settings.console_bottom")
+                .max_rect(area)
+                .layout(Layout::bottom_up(Align::Min)),
+        );
+        bottom_ui.label(theme::footer(
+            t!("launcher.settings.console_enter_hint"),
+        ));
+        bottom_ui.add_space(6.0);
+        let row_size = egui::vec2(bottom_ui.available_width(), CONSOLE_INPUT_ROW_HEIGHT);
+        bottom_ui.allocate_ui_with_layout(row_size, Layout::left_to_right(Align::Center), |ui| {
             let input_width = (ui.available_width() - 112.0).max(260.0);
             let response = ui.add_sized(
-                [input_width, 56.0],
+                [input_width, CONSOLE_INPUT_ROW_HEIGHT],
                 TextEdit::multiline(&mut self.python_console.input)
+                    .id_salt("launcher.settings.console_input")
                     .desired_rows(CONSOLE_INPUT_ROWS)
                     .font(TextStyle::Monospace)
                     .hint_text(t!("launcher.settings.console_command_placeholder")),
             );
             let submit_from_button =
-                theme::launcher_button(ui, "Enter", egui::vec2(100.0, 40.0), true).clicked();
+                theme::launcher_button(ui, t!("launcher.settings.console_send_button"), egui::vec2(100.0, 40.0), true).clicked();
             let submit_from_key = response.has_focus()
                 && ui.input(|input| {
                     input.key_pressed(Key::Enter)
@@ -1504,10 +1649,43 @@ impl SettingsPageState {
                 response.request_focus();
             }
         });
-        ui.add_space(6.0);
-        ui.label(theme::footer(
-            t!("launcher.settings.console_enter_hint"),
-        ));
+        bottom_ui.add_space(12.0);
+
+        // Whatever the bottom block left above it is the output frame. If the area is shorter
+        // than the bottom block (only possible below the fallback threshold, where the caller
+        // gives a fixed block), the frame collapses to the top edge instead of inverting.
+        let output_bottom = bottom_ui.available_rect_before_wrap().bottom().clamp(area.top(), area.bottom());
+        let output_rect = egui::Rect::from_min_max(area.min, egui::pos2(area.right(), output_bottom));
+        let mut output_ui = ui.new_child(
+            UiBuilder::new()
+                .id_salt("launcher.settings.console_output")
+                .max_rect(output_rect)
+                .layout(Layout::top_down(Align::Min)),
+        );
+        Frame::new()
+            .fill(Color32::from_rgba_premultiplied(12, 12, 16, 168))
+            .stroke(Stroke::new(1.0, theme::BUTTON_STROKE))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(14))
+            .show(&mut output_ui, |ui| {
+                let console_text_width = ui.available_width();
+                // `auto_shrink(false)` makes the scroll viewport fill the frame's inner rect,
+                // i.e. the whole remaining height.
+                ScrollArea::vertical()
+                    .id_salt("launcher.settings.console_output_scroll")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(console_text_width);
+                        ui.add(egui::Label::new(console_output_layout_job(
+                            ui,
+                            self.python_console.output.as_str(),
+                            console_text_width,
+                        )));
+                    });
+            });
+        // The children do not move the parent's cursor; claim the whole area.
+        ui.advance_cursor_after_rect(area);
     }
 
     /// Web twin of `show_python_environment_tab`: no OS shell exists on web.
@@ -1662,21 +1840,21 @@ fn show_two_line_button(
         Stroke::new(1.0, TAB_STROKE),
         egui::StrokeKind::Middle,
     );
-    let center = rect.center();
-    ui.painter().text(
-        egui::pos2(center.x, center.y - 9.0),
-        Align2::CENTER_CENTER,
-        title,
-        FontId::proportional(14.0),
-        theme::TEXT_MAIN,
-    );
-    ui.painter().text(
-        egui::pos2(center.x, center.y + 9.0),
-        Align2::CENTER_CENTER,
-        subtitle,
-        FontId::proportional(11.0),
-        theme::TEXT_MUTED,
-    );
+    // Each line is centred when it fits and scrolls as a marquee when it does not (the
+    // save-log hint is longer than the sidebar is wide in some locales).
+    let text_rect = rect.shrink2(egui::vec2(TAB_LABEL_PADDING, 0.0));
+    let center_y = rect.center().y;
+    for (text, size, color, line_center_y) in [
+        (title, 14.0, theme::TEXT_MAIN, center_y - 9.0),
+        (subtitle, 11.0, theme::TEXT_MUTED, center_y + 9.0),
+    ] {
+        let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(size), color);
+        let line_rect = egui::Rect::from_center_size(
+            egui::pos2(text_rect.center().x, line_center_y),
+            egui::vec2(text_rect.width(), galley.size().y),
+        );
+        paint_marquee_galley(ui, line_rect, galley, Align::Center, &MarqueeTiming::DEFAULT);
+    }
     response
 }
 
@@ -2339,6 +2517,22 @@ fn queue_shared_outcome(queue: &mut VecDeque<PageNavAction>, projects_dir_saved:
 /// frame's navigation or tab result) is appended behind the shared-section actions queued
 /// earlier in the frame, so e.g. a saved projects root still reaches `LauncherApp` before a
 /// Back navigation leaves the page. Nothing is dropped — the rest waits for later frames.
+/// Width of the settings tab sidebar for a card body `region_width` points wide: a sixth of
+/// it, clamped to `SIDEBAR_MIN_WIDTH..=SIDEBAR_MAX_WIDTH`, and never wider than the region
+/// itself (0 for a degenerate region).
+fn sidebar_width(region_width: f32) -> f32 {
+    (region_width * SIDEBAR_WIDTH_FRACTION)
+        .clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+        .min(region_width.max(0.0))
+}
+
+/// Whether a content column `content_height` pt tall fits the pinned Python console: the
+/// minimum output frame plus the budgeted bottom block (command row and hint).
+#[cfg(not(target_arch = "wasm32"))]
+fn python_console_fits_pinned(content_height: f32) -> bool {
+    content_height >= CONSOLE_MIN_HEIGHT + CONSOLE_BOTTOM_BLOCK_RESERVE
+}
+
 fn next_action(queue: &mut VecDeque<PageNavAction>, frame_action: Option<PageNavAction>) -> Option<PageNavAction> {
     queue.extend(frame_action);
     queue.pop_front()
@@ -2370,5 +2564,25 @@ mod tests {
         queue_shared_outcome(&mut queue, None, None);
         assert_eq!(next_action(&mut queue, Some(PageNavAction::StartUpdate)), Some(PageNavAction::StartUpdate));
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn the_sidebar_is_a_sixth_of_the_card_clamped_and_never_wider_than_it() {
+        assert_eq!(sidebar_width(1500.0), 250.0);
+        assert_eq!(sidebar_width(700.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(sidebar_width(3000.0), SIDEBAR_MAX_WIDTH);
+        assert_eq!(sidebar_width(150.0), 150.0);
+        assert_eq!(sidebar_width(-5.0), 0.0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn the_python_console_pins_only_when_the_minimum_frame_and_bottom_block_fit() {
+        let threshold = CONSOLE_MIN_HEIGHT + CONSOLE_BOTTOM_BLOCK_RESERVE;
+        assert!(python_console_fits_pinned(threshold));
+        assert!(python_console_fits_pinned(threshold + 300.0));
+        assert!(!python_console_fits_pinned(threshold - 1.0));
+        assert!(!python_console_fits_pinned(0.0));
+        assert!(!python_console_fits_pinned(f32::NAN));
     }
 }

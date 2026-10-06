@@ -46,6 +46,10 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     draws: it never mutates text and never touches `egui::TextEditState`, it
     returns a `HangulKeyboardOutcome` (`insert` + `replace_previous`) and the
     consumer decides where the text goes.
+  - `marquee` (`paint_marquee_galley` + the pure `marquee_frame`, `MarqueeTiming`):
+    paints a single-line galley clipped to a rect; when it is wider than the rect it
+    scrolls like a web marquee (rest at the start, scroll, short rest at the end, jump
+    back) and schedules repaints only while it overflows and is visible.
   - `panel_dock`: the dockable-panel system (`dev-docs/dockable_panels_plan.md`).
     Pure layer: `DockLayout` + `PanelNode` describe how panels and their tabs are
     arranged and anchored, and `solve()` resolves that graph into rects (gap
@@ -113,6 +117,7 @@ mod font_preview;
 mod hangul_keyboard;
 mod help_hint;
 mod marked_scroll;
+mod marquee;
 pub mod panel_dock;
 mod searchable_combo_box;
 mod seed_spin_box;
@@ -151,6 +156,7 @@ pub use marked_scroll::{
     ArrowStyle, BarGeometry, GutterItem, GutterSlot, MarkFill, MarkKind, MarkedScrollArea,
     MarkedScrollOutput, ScrollMark, ScrollSector, ScrollSpan, arrow, paint_marks_on_bar,
 };
+pub use marquee::{MarqueeFrame, MarqueeTiming, marquee_frame, paint_marquee_galley};
 #[allow(unused_imports)]
 pub use panel_dock::{
     CollapsiblePanel, CollapsiblePanelOutput, DetachTrigger, DockArea, DockEdge, DockLayout,

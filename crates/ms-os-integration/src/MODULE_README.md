@@ -49,8 +49,8 @@ the eframe-based installer to name or touch a record. It must never depend on `m
   independent operations that all ran.
 - `windows/`: the Windows records; see `windows/MODULE_README.md`.
 - `copy_identity.rs`: `CopyIdentity` (`exe`, `program_root`, `version_core`), the pure
-  `program_root_for` rule, the repository-build rule `repo_build_root` (also
-  `CopyIdentity::repo_build_root`) and `exe_program_root` (the root of a copy known only by its
+  `program_root_for` rule, the repository-build rule `repo_build_root` (a re-export of its one
+  owner `ms_config::runtime_root::repo_build_root`; also `CopyIdentity::repo_build_root`) and `exe_program_root` (the root of a copy known only by its
   exe); `CopyIdentity::current()` = `current_exe()` + `ms_config::program_dir()`.
 - `report.rs`: the registration report — `Scope`, `RecordKind`, `RecordValue`, `RecordReport`,
   `RecordStatus`, `Defect` + `DefectSeverity`, `ProbeError`, `RegistrationReport`; the rules
@@ -99,29 +99,38 @@ the eframe-based installer to name or touch a record. It must never depend on `m
   (`<repo>/target/<any profile>/<exe>`; ASCII case-insensitive on Windows, exact elsewhere) — ->
   the directory containing `target`; else the executable directory when it holds the program
   markers; else the run's resolved runtime root when that does; else the executable directory.
-  So `ms_config`'s cwd-first runtime-root resolution of a launch from a record lands on this
-  copy. `exe` stays the built binary. Values that describe an INSTALL stay exe-based
+  So `ms_config`'s cwd-first runtime-root resolution (cwd, exe dir, repository root; see
+  `ms_config::runtime_root`) of a launch from a record lands on this copy. `exe` stays the built binary. Values that describe an INSTALL stay exe-based
   (`InstallLocation`, `DisplayIcon`, `UninstallString`, and App Paths `Path`, which Windows
   appends to `PATH` rather than using as a working directory). The Windows "Open with" command
-  sets no working directory, so a repository build opened that way resolves its runtime root
-  from the shell's working directory (known gap).
+  sets no working directory; a repository build opened that way still finds its checkout,
+  because `ms_config` falls back to the repository root of a `target/<profile>/` executable.
 - **Registration probe** (`report::probe`): blocking, read-only, never panics; one record that
   cannot be read becomes `Unreadable` (logged) without affecting the others. Readers gather
   `Observed*` values (I/O); `evaluate_*` judges are pure over them, the `CopyIdentity` and an
   `exists` oracle (Linux adds the `is_ours` oracle = `xdg::same_executable`). Expected values
   come from the WRITERS (value tables, `ShortcutSpec`, `desktop_mime_types`), never a copy.
-  A record's owner is the executable it launches; another copy's record is judged against that
-  copy. A working directory still at the owner's exe directory where the program root moved
+  A record's owner is the executable it launches; when a record has several identifying values
+  (Windows Uninstall / App Paths) it is this copy's as soon as ANY of them names this copy, so a
+  half-rewritten own record is `OursBroken` (Repair), not another copy's. Another copy's record
+  is judged against that copy. A record at our name whose program is not a ManhwaStudio
+  executable at all (file name not `identity::WINDOWS_EXE_NAME` / `LINUX_EXE_NAME`, and not this
+  copy) is not "another copy": it is `OursBroken` with `Defect::ForeignProgram` (badged).
+  `shadowed` is set only on an existing record. A working directory still at the owner's exe directory where the program root moved
   off it (a repository build written before the rule) is `WorkingDirOutdated` (stale, Repair
   offered), any other existing-but-different one `WrongValue` (broken). `Defect::severity` is
   the only owner of the broken/stale split, `badge_worthy` the only owner of the badge rule (ours broken, another copy gone, another copy's record broken), and
   `classify` the only constructor of the owned / other statuses.
 - **Actions** (`actions`): Missing -> `Create` (copy scope only); ours -> `Remove`, + `Repair`
   when defective; another copy's -> `RePoint` (copy scope or user scope only) + `Remove`, both
-  confirmed while that copy exists; unreadable rows, Linux system-wide rows and `read_only`
+  confirmed while that copy exists; an unreadable record at a known location (read failure or no
+  program named; it exists at our name) -> `Repair` in the copy scope only, always confirmed
+  (overwrites whoever wrote it); a `ForeignProgram` record -> `Repair` + `Remove`, both
+  confirmed; an unreadable row without a location, Linux system-wide rows and `read_only`
   (`--ignore-installed`) -> none; the Linux "Open with" row never offers `Remove` (it shares the
   menu row's file). Create / Repair / RePoint write the full value set through the record writers
   (`windows::{registry, shortcut, values}`, `linux::xdg::write_entry`), never a copy of a table;
+  every registry record deletes its key tree first, so it ends up holding exactly that set;
   Remove deletes whoever owns the record. `apply` runs every request independently and refreshes
   ONCE per batch (Windows `SHChangeNotify` after an App Paths / "Open with" action, Linux
   `update-desktop-database` after any entry write or delete). The Uninstall entry needs

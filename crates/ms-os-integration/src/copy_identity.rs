@@ -10,7 +10,8 @@ Key items:
 - `CopyIdentity` (`exe`, `program_root`, `version_core`)
 - `CopyIdentity::current()`: the running copy.
 - `program_root_for()`: the pure program-root rule.
-- `repo_build_root()`: the repository-build rule (`<repo>/target/<profile>/<exe>`).
+- `repo_build_root()`: re-export of `ms_config::repo_build_root`, the repository-build rule
+  (`<repo>/target/<profile>/<exe>`).
 - `exe_program_root()`: the program root of a copy known only by its executable path.
 
 Notes:
@@ -20,6 +21,10 @@ not use it.
 */
 
 use std::path::{Path, PathBuf};
+
+// The repository-build rule has ONE owner, `ms_config::runtime_root` (the runtime-root
+// resolution applies it too); re-exported so this crate names it where it names the copy.
+pub use ms_config::repo_build_root;
 
 use crate::IntegrationError;
 
@@ -56,8 +61,9 @@ impl CopyIdentity {
     }
 
     /// True when no program files sit next to the executable (a build output such as
-    /// `target/release`), so its runtime root comes from the working directory, not from the
-    /// executable's location. Blocking (filesystem probe).
+    /// `target/release`), so its runtime root comes from the working directory or its checkout
+    /// (`ms_config::runtime_root`), not from the executable's location. Blocking (filesystem
+    /// probe).
     #[must_use]
     pub fn is_dev_copy(&self) -> bool {
         self.exe.parent().is_none_or(|dir| !ms_config::dir_has_program_markers(dir))
@@ -75,7 +81,8 @@ pub(crate) fn current_program_root(exe: &Path) -> PathBuf {
 /// resolved (`resolved_root`) and the marker probe `has_markers`. Pure over `has_markers`.
 ///
 /// `ms_config` resolves the runtime root as "working directory if it has program markers, else
-/// the executable directory if it has them, else the working directory". A record's `Path=` /
+/// the executable directory if it has them, else a repository build's checkout if it has them,
+/// else the working directory" (`ms_config::runtime_root`). A record's `Path=` /
 /// working directory becomes the working directory of a launch from it, so the returned
 /// directory must make that resolution land on THIS copy:
 /// - the repository root when `exe` is a repository build (`<repo>/target/<profile>/<exe>`, see
@@ -111,32 +118,6 @@ pub fn exe_program_root(exe: &Path) -> Option<PathBuf> {
     repo_build_root(exe).or_else(|| exe.parent().filter(|dir| !dir.as_os_str().is_empty()).map(Path::to_path_buf))
 }
 
-/// The repository root when `exe` is a repository build: its directory (any name — `release`,
-/// `debug`, a custom profile) lies directly in a directory named `target`, and the root is the
-/// directory that contains `target`. The name compares ASCII case-insensitively on Windows
-/// (case-insensitive file system) and exactly elsewhere. `None` for any other layout, and when
-/// the root would be empty (a relative `target/<profile>/<exe>`). Pure (path components only).
-#[must_use]
-pub fn repo_build_root(exe: &Path) -> Option<PathBuf> {
-    repo_build_root_with(exe, cfg!(target_os = "windows"))
-}
-
-/// [`repo_build_root`] with the case rule explicit, so both platforms' rules are testable on
-/// every host.
-#[must_use]
-fn repo_build_root_with(exe: &Path, case_insensitive: bool) -> Option<PathBuf> {
-    let profile_dir = exe.parent()?;
-    // A profile directory needs a real name: `<x>/target/..` or `target/` alone is no layout.
-    profile_dir.file_name()?;
-    let target_dir = profile_dir.parent()?;
-    let target_name = target_dir.file_name()?.to_str()?;
-    let is_target = if case_insensitive { target_name.eq_ignore_ascii_case("target") } else { target_name == "target" };
-    if !is_target {
-        return None;
-    }
-    target_dir.parent().filter(|root| !root.as_os_str().is_empty()).map(Path::to_path_buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,40 +144,6 @@ mod tests {
         assert_eq!(program_root_for(Path::new("/home/u/build/out/manhwastudio_rs"), Path::new("/home/u/src/ms"), &checkout), PathBuf::from("/home/u/src/ms"));
         // No markers anywhere: the executable directory.
         assert_eq!(program_root_for(Path::new("/tmp/x/manhwastudio_rs"), Path::new("/home/u"), &none), PathBuf::from("/tmp/x"));
-    }
-
-    /// The repository-build rule: any profile directory directly under `target`, Linux and
-    /// Windows path shapes, the case rule per platform, and the layouts that do not match.
-    #[test]
-    fn repo_build_root_matches_target_profile_layouts_only() {
-        let root = |exe: &str, ci: bool| repo_build_root_with(Path::new(exe), ci);
-        for ci in [false, true] {
-            assert_eq!(root("/home/u/src/ms/target/release/manhwastudio_rs", ci), Some(PathBuf::from("/home/u/src/ms")));
-            assert_eq!(root("/home/u/src/ms/target/debug/manhwastudio_rs", ci), Some(PathBuf::from("/home/u/src/ms")));
-            assert_eq!(root("/home/u/src/ms/target/release-lto/manhwastudio_rs", ci), Some(PathBuf::from("/home/u/src/ms")));
-            // Trailing separators of the components do not matter.
-            assert_eq!(root("/home/u/src/ms//target/release//manhwastudio_rs", ci), Some(PathBuf::from("/home/u/src/ms")));
-            // A directory named `release` that is not under `target`.
-            assert_eq!(root("/home/u/release/manhwastudio_rs", ci), None);
-            assert_eq!(root("/home/u/build/release/manhwastudio_rs", ci), None);
-            // `target` as the executable's own directory, or two levels too high.
-            assert_eq!(root("/home/u/src/ms/target/manhwastudio_rs", ci), None);
-            assert_eq!(root("/home/u/src/ms/target/x86_64-pc-windows-gnu/release/manhwastudio_rs", ci), None);
-            // Root edge cases: `target` directly under the file-system root, no room for a
-            // root, a relative layout, a bare file name.
-            assert_eq!(root("/target/release/manhwastudio_rs", ci), Some(PathBuf::from("/")));
-            assert_eq!(root("/release/manhwastudio_rs", ci), None);
-            assert_eq!(root("target/release/manhwastudio_rs", ci), None);
-            assert_eq!(root("manhwastudio_rs", ci), None);
-            assert_eq!(root("", ci), None);
-            // Windows path shape (forward slashes: a Linux `Path` does not split on `\`).
-            assert_eq!(root("C:/src/ms/target/release/manhwastudio_rs.exe", ci), Some(PathBuf::from("C:/src/ms")));
-            assert_eq!(root("C:/Program Files/ManhwaStudio/manhwastudio_rs.exe", ci), None);
-        }
-        // The name rule: case-insensitive on Windows only.
-        assert_eq!(root("C:/src/ms/Target/Release/manhwastudio_rs.exe", true), Some(PathBuf::from("C:/src/ms")));
-        assert_eq!(root("/home/u/src/ms/Target/release/manhwastudio_rs", false), None);
-        assert_eq!(root("/home/u/src/ms/targets/release/manhwastudio_rs", true), None);
     }
 
     /// The exe-only program root: repository root for a repository build, else the exe's

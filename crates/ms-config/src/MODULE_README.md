@@ -63,6 +63,12 @@ that defines the type.
   and not in the studio settings tab because their callers — `ms-settings-ui`'s panes and
   `ms-tab-typing` — may not depend on that tab. All of them do blocking I/O: never on the GUI
   thread.
+- `runtime_root.rs`: the pure runtime-root rules behind `program_dir()` / `data_dir()`:
+  `resolve_runtime_root_with` (precedence over a marker oracle) and `repo_build_root` (the
+  repository-build rule, re-exported at the crate root; `ms-os-integration`'s `copy_identity`
+  uses it for the working directory of every OS record it writes — never copy the rule there).
+  `lib.rs::resolve_runtime_root` does the I/O (cwd, `current_exe`, `dir_has_program_markers`)
+  and handles the macOS `.app` bundle data root before it.
 - `version_format.rs`: pure, std-only composition (`compose_app_version`) and stripping
   (`version_core`) of the application version string. The ROOT `build.rs` pulls this exact file
   in with `include!("crates/ms-config/src/version_format.rs")`, so the code the build script
@@ -175,7 +181,19 @@ binary that installs a UI locale). Those crates enable `test-support` from their
   for `x86_64-pc-windows-gnu` (the rule that caught `ms-sysprobe`'s missing
   `windows-sys/Win32_Security`).
 
+- **Runtime root precedence** (`program_dir()` = `data_dir()`, recomputed on every call):
+  macOS `.app` bundle -> `~/Library/Application Support/ManhwaStudio`; else the working
+  directory if it holds program markers; else the executable directory if it does; else, for a
+  repository build (`<repo>/target/<any profile>/<exe>`, `target` ASCII case-insensitive on
+  Windows only), `<repo>` if it does; else the working directory (then the executable
+  directory, then `.`). The working directory stays first so a launch from any copy's root
+  (OS records, run-dev scripts) uses that root; the repository step rescues a build output
+  started with an unrelated working directory (Windows "Open with", double-click).
+
 ## Editing map
+- The runtime-root precedence or the repository-build rule: `runtime_root.rs` (and its
+  precedence table test); `ms-os-integration`'s `copy_identity::program_root_for` must keep
+  making a launch from a record land on its copy under the new order.
 - A new path root, model directory or config file name: `lib.rs`, next to its neighbours.
 - A new user or project setting's default: the corresponding tree in `lib.rs`. Remember that
   `merge_missing` adds but never removes — a renamed key leaves the old one on disk.

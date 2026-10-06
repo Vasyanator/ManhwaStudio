@@ -6,8 +6,10 @@ keeps working unchanged.
 
 Main items:
 - Path constants for project/user data files, model roots, and folders.
-- `program_dir` / `data_dir`: launch working directory root for bundled helpers/assets and
-  writable runtime data, with executable directory fallback.
+- `program_dir` / `data_dir`: runtime root for bundled helpers/assets and writable runtime
+  data: the launch working directory, else the executable directory, else a repository build's
+  checkout (`<repo>/target/<profile>/<exe>`), whichever first holds the program markers
+  (`dir_has_program_markers`); pure precedence and `repo_build_root` in module `runtime_root`.
 - `default_projects_root` / `projects_root_from_user_settings`: resolve projects directory
   (default `{Documents}/manhwastudio_projects`, override from `user_config.json`).
 - `JsonConfig`: load/merge/set wrapper for JSON configs with default backfilling that
@@ -88,6 +90,12 @@ pub use storage_mode::{GENERAL_STORAGE_MODE_KEY, StorageMode, storage_mode_from_
 // read by crates that do not know each other (launcher, installer, project, binary) and
 // the section's default belongs to the `user_config` default tree below.
 pub mod single_image;
+
+// The pure runtime-root rules (precedence over a marker oracle, and the repository-build
+// rule). A module of its own so every row is unit-tested without a file system;
+// `repo_build_root` is re-exported because `ms-os-integration` writes records with it.
+pub mod runtime_root;
+pub use runtime_root::repo_build_root;
 
 // The debouncing, retrying writer thread every self-owned section of `user_config.json`
 // is written through. It sits here because its write step IS this crate's
@@ -563,7 +571,8 @@ pub fn read_ort_load_guard(cfg: &Value, scope_key: &str) -> OrtLoadGuard {
 
 /// True when `dir` holds a program-files marker (`ai_backend.py`, `installer_files` or
 /// `modules`): the one rule that decides whether a directory is a ManhwaStudio runtime root.
-/// [`program_dir`] / [`data_dir`] pick the launch directory or the executable directory by it;
+/// [`program_dir`] / [`data_dir`] pick the launch directory, the executable directory or a
+/// repository build's checkout by it ([`runtime_root`]);
 /// OS-integration code uses it to tell an installed or unpacked copy from a bare build output.
 /// Blocking filesystem probe (three `exists` checks); a missing or unreadable `dir` is `false`.
 pub fn dir_has_program_markers(dir: &Path) -> bool {
@@ -633,7 +642,9 @@ fn is_inside_macos_app_bundle(exe_path: &Path) -> bool {
         .is_some_and(|name| name.ends_with(".app"))
 }
 
-/// Resolve the app's runtime root.
+/// Resolve the app's runtime root: the macOS `.app` bundle data root when inside a bundle, else
+/// the portable rule of [`runtime_root::resolve_runtime_root_with`] over the real working
+/// directory, executable path and marker probe. Blocking (a few `exists` probes).
 fn resolve_runtime_root() -> PathBuf {
     // macOS: inside a signed/quarantined `.app` the bundle is read-only, so the
     // writable runtime root moves to Application Support. Outside a bundle (a
@@ -646,22 +657,12 @@ fn resolve_runtime_root() -> PathBuf {
         }
     }
 
+    // An unreadable working directory or executable path only removes that candidate; the
+    // precedence itself (cwd, exe dir, repository root, fallback) is the pure
+    // `runtime_root::resolve_runtime_root_with`.
     let cwd = std::env::current_dir().ok();
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
-
-    if let Some(cwd) = cwd.as_ref()
-        && dir_has_program_markers(cwd)
-    {
-        return cwd.clone();
-    }
-    if let Some(exe_dir) = exe_dir.as_ref()
-        && dir_has_program_markers(exe_dir)
-    {
-        return exe_dir.clone();
-    }
-    cwd.or(exe_dir).unwrap_or_else(|| PathBuf::from("."))
+    let exe = std::env::current_exe().ok();
+    runtime_root::resolve_runtime_root_with(cwd.as_deref(), exe.as_deref(), &dir_has_program_markers)
 }
 
 pub fn data_dir() -> PathBuf {
