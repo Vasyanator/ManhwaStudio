@@ -14,7 +14,9 @@ Main responsibilities:
 - run the launcher-side PyTorch/full-dependency upgrade flow through installer backend helpers;
 - host a background-driven shell console for the detected Python environment;
 - keep `pip` console commands usable via the active env or `uv pip` fallback;
-- notify the launcher runtime when the projects root changes so dependent pages refresh.
+- notify the launcher runtime when the projects root changes so dependent pages refresh;
+- host the System registration tab (`system_registration.rs`, Windows / Linux) and recheck
+  its warnings after every possible change of the OS records.
 
 Notes:
 Config edits stay synchronous because they are tiny, but the Python environment console runs in
@@ -55,6 +57,9 @@ use ms_installer::install::{
 #[cfg(not(target_arch = "wasm32"))]
 use ms_installer::utils;
 use crate::pages::base::{self, PageNavAction};
+use crate::state::LauncherHost;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use crate::pages::system_registration::SystemRegistrationState;
 use crate::theme;
 use ms_settings_ui::settings_shared::{
     SettingsSectionId, SettingsSurface, SharedSettingsPanels, sections_for, title_key,
@@ -177,6 +182,12 @@ pub struct SettingsPageState {
     warnings: SettingsWarnings,
     /// Whether `warnings` was started for this entry (the full run happens once per entry).
     warning_checks_started: bool,
+    /// `--ignore-installed`: registration checks are silent (`CheckContext`) and the System
+    /// registration tab is read-only.
+    ignore_installed: bool,
+    /// The System registration tab (Windows / Linux only, where its section is listed).
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    system_registration: SystemRegistrationState,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -289,6 +300,7 @@ impl SettingsPageState {
         projects_root: PathBuf,
         ai_install_type: config::AiInstallType,
         ai_backend: AiBackendHandle,
+        host: LauncherHost,
         #[cfg(feature = "tutorial")] tutorial_progress: TutorialProgressHandle,
     ) -> Self {
         // Build the shared panel container, then seed its General widget from the
@@ -315,6 +327,9 @@ impl SettingsPageState {
             // started on the first frame by `ensure_warning_checks_started`.
             warnings: SettingsWarnings::disabled(),
             warning_checks_started: false,
+            ignore_installed: host.ignore_installed,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            system_registration: SystemRegistrationState::new(host.version_core, host.ignore_installed),
         }
     }
 
@@ -327,7 +342,7 @@ impl SettingsPageState {
             return;
         }
         self.warning_checks_started = true;
-        self.warnings = SettingsWarnings::start(egui_ctx, CheckContext::from_handle(&self.ai_backend));
+        self.warnings = SettingsWarnings::start(egui_ctx, self.warning_context());
     }
 
     /// Per-frame warnings upkeep, whatever page or tab is shown: rechecks the AI pane's
@@ -349,7 +364,15 @@ impl SettingsPageState {
         if changes.is_empty() {
             return;
         }
-        self.warnings.recheck(changes, CheckContext::from_handle(&self.ai_backend));
+        let ctx = self.warning_context();
+        self.warnings.recheck(changes, ctx);
+    }
+
+    /// The warning-check context of this frame. Registration checks are off under
+    /// `--ignore-installed`: the System registration tab is read-only then, and a badge must
+    /// be clearable from its tab.
+    fn warning_context(&self) -> CheckContext {
+        CheckContext::from_handle(&self.ai_backend, !self.ignore_installed)
     }
 
     /// The worst warning level over every setting (the main-menu Settings button badge);
@@ -466,6 +489,15 @@ impl SettingsPageState {
                             }
                             SettingsSectionId::PythonEnvironment => {
                                 self.show_python_environment_tab(ui);
+                            }
+                            // Listed on Windows / Linux only (its `SECTIONS` row is cfg'd), so on
+                            // other systems `active_tab` never holds it. Every possible change of
+                            // the OS records (an action ended, a refresh) rechecks their badges.
+                            SettingsSectionId::SystemRegistration => {
+                                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                                if self.system_registration.show(ui, Some(self.warnings.set())) {
+                                    self.recheck_warnings(&[SettingChange::SystemRegistration]);
+                                }
                             }
                             // Studio-only sections are never listed for the launcher
                             // surface, so `active_tab` can never hold one; render nothing.

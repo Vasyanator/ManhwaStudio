@@ -561,7 +561,12 @@ pub fn read_ort_load_guard(cfg: &Value, scope_key: &str) -> OrtLoadGuard {
     }
 }
 
-fn dir_has_program_markers(dir: &Path) -> bool {
+/// True when `dir` holds a program-files marker (`ai_backend.py`, `installer_files` or
+/// `modules`): the one rule that decides whether a directory is a ManhwaStudio runtime root.
+/// [`program_dir`] / [`data_dir`] pick the launch directory or the executable directory by it;
+/// OS-integration code uses it to tell an installed or unpacked copy from a bare build output.
+/// Blocking filesystem probe (three `exists` checks); a missing or unreadable `dir` is `false`.
+pub fn dir_has_program_markers(dir: &Path) -> bool {
     dir.join("ai_backend.py").exists()
         || dir.join("installer_files").exists()
         || dir.join("modules").exists()

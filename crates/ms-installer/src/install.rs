@@ -36,8 +36,8 @@ use web_time::SystemTime;
 
 use ms_config as config;
 
-// Only the Windows "existing install found" window displays the host version.
-#[cfg(target_os = "windows")]
+// The host version: displayed by the Windows "existing install found" window, and its
+// version core written as the Uninstall entry's `DisplayVersion` by a full install.
 use crate::HostVersion;
 use ms_sysprobe::gpu_utils::RuntimeVersion;
 #[cfg(target_os = "windows")]
@@ -49,6 +49,18 @@ use super::utils::*;
 pub use super::utils::{
     run_windows_create_start_menu_shortcut_for_install, run_windows_uninstall_from_current_exe,
 };
+// Windows records (registry keys, shortcuts, path rules) come from their one owner; errors are
+// shown through `IntegrationError::user_message()`, the installer's localized texts.
+#[cfg(target_os = "windows")]
+use ms_os_integration::windows::registry::reg_read_string;
+#[cfg(target_os = "windows")]
+use ms_os_integration::windows::shortcut::{
+    create_windows_desktop_shortcut, create_windows_start_menu_shortcut, resolve_windows_launcher_target,
+};
+#[cfg(target_os = "windows")]
+use ms_os_integration::windows::values::{app_paths_key, uninstall_key};
+#[cfg(target_os = "windows")]
+use ms_os_integration::windows::{is_windows_all_users_install_dir, normalize_windows_path};
 
 pub(super) const INSTALL_SUBDIR_NAME: &str = "ManhwaStudio";
 const TELEGRAM_INVITE_URL: &str = "https://t.me/SelfTranslators";
@@ -72,8 +84,9 @@ pub enum InstallerOutcome {
 pub(super) enum InstallerPurpose {
     /// Full application install: pick a location (possibly elevated), deploy the app
     /// archive and executable, create shortcuts/registry entries, then offer to launch
-    /// the installed copy.
-    FullInstall,
+    /// the installed copy. `host` is the RUNNING program's version — the copy being
+    /// installed — whose core becomes the Uninstall entry's `DisplayVersion`.
+    FullInstall { host: HostVersion },
     /// Repair the managed Python environment of an existing root directory. The
     /// location screen is skipped (the root is fixed), and the worker only provisions
     /// the environment — see `utils::run_environment_repair_worker` for the list of
@@ -107,7 +120,21 @@ enum ExistingInstallUiState {
     Choice,
     WaitingForReinstall,
     WaitingForReplace,
+    /// A shortcut is being written on a worker; the result arrives as
+    /// [`ExistingInstallEvent::ShortcutFinished`].
+    WaitingForShortcut,
     Error,
+}
+
+/// Which shortcut the existing-install window asked its worker to create.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug)]
+enum ExistingInstallShortcut {
+    /// `ManhwaStudio.lnk` on the current user's Desktop.
+    Desktop,
+    /// `ManhwaStudio.lnk` in the Start menu of the install's kind; may relaunch elevated for an
+    /// all-users install (`run_windows_create_start_menu_shortcut_for_install`).
+    StartMenu,
 }
 
 #[cfg(target_os = "windows")]
@@ -117,6 +144,8 @@ enum ExistingInstallEvent {
     InstalledVersionProbed(Result<String, String>),
     /// Result of replacing the installed executable with the running one.
     ReplaceFinished(Result<(), String>),
+    /// Result of a shortcut creation started from this window; the error is user-facing.
+    ShortcutFinished(Result<(), String>),
 }
 
 /// State of the background `--version` probe of the installed copy.
@@ -167,14 +196,23 @@ struct ExistingInstallApp {
     host_version_display: String,
 }
 
+/// Opens the full-install window for `root_dir` (or continues an elevated install into
+/// `auto_install_target`). `host` is this executable's version, passed in because a library
+/// cannot read it; its core is registered as the installed program's `DisplayVersion`.
+/// Blocks until the window closes.
+///
+/// # Errors
+/// Returns an error when the window itself cannot be created or its result cannot be read
+/// back.
 pub fn run_python_installer_window(
     root_dir: &Path,
     auto_install_target: Option<PathBuf>,
+    host: HostVersion,
 ) -> Result<InstallerOutcome, String> {
     run_installer_window(
         root_dir,
         auto_install_target,
-        InstallerPurpose::FullInstall,
+        InstallerPurpose::FullInstall { host },
         t!("installer.install.window_title"),
     )
 }
@@ -395,16 +433,16 @@ fn find_existing_windows_install(
 ) -> Result<Option<ExistingWindowsInstall>, String> {
     let mut candidates: Vec<(PathBuf, String)> = Vec::new();
 
-    if let Some(all_users) = query_registry_install_dir("HKLM")? {
+    if let Some(all_users) = query_registry_install_dir("HKLM") {
         candidates.push((all_users, t!("installer.install.registry_hklm").to_string()));
     }
-    if let Some(current_user) = query_registry_install_dir("HKCU")? {
+    if let Some(current_user) = query_registry_install_dir("HKCU") {
         candidates.push((current_user, t!("installer.install.registry_hkcu").to_string()));
     }
-    if let Some(app_path_dir) = query_registry_app_path_install_dir("HKLM")? {
+    if let Some(app_path_dir) = query_registry_app_path_install_dir("HKLM") {
         candidates.push((app_path_dir, "App Paths HKLM".to_string()));
     }
-    if let Some(app_path_dir) = query_registry_app_path_install_dir("HKCU")? {
+    if let Some(app_path_dir) = query_registry_app_path_install_dir("HKCU") {
         candidates.push((app_path_dir, "App Paths HKCU".to_string()));
     }
     if let Ok(local_default) = default_local_install_dir() {
@@ -438,26 +476,32 @@ fn find_existing_windows_install(
     Ok(None)
 }
 
+/// `InstallLocation` of the Uninstall entry under `registry_root`, when set and non-blank.
 #[cfg(target_os = "windows")]
-fn query_registry_install_dir(registry_root: &str) -> Result<Option<PathBuf>, String> {
-    let key = format!(
-        r"{registry_root}\Software\Microsoft\Windows\CurrentVersion\Uninstall\ManhwaStudio"
-    );
-    let value = reg_query_string_value(&key, Some("InstallLocation"))?;
-    Ok(value
-        .filter(|item| !item.trim().is_empty())
-        .map(PathBuf::from))
+fn query_registry_install_dir(registry_root: &str) -> Option<PathBuf> {
+    read_registry_dir_value(&uninstall_key(registry_root), "InstallLocation")
 }
 
+/// `Path` of the App Paths entry under `registry_root`, when set and non-blank.
 #[cfg(target_os = "windows")]
-fn query_registry_app_path_install_dir(registry_root: &str) -> Result<Option<PathBuf>, String> {
-    let key = format!(
-        r"{registry_root}\Software\Microsoft\Windows\CurrentVersion\App Paths\manhwastudio_rs.exe"
-    );
-    let value = reg_query_string_value(&key, Some("Path"))?;
-    Ok(value
-        .filter(|item| !item.trim().is_empty())
-        .map(PathBuf::from))
+fn query_registry_app_path_install_dir(registry_root: &str) -> Option<PathBuf> {
+    read_registry_dir_value(&app_paths_key(registry_root), "Path")
+}
+
+/// Best-effort read of a directory-valued `REG_SZ` for install discovery: an absent, blank
+/// or unreadable value (access denied, unexpected type) is `None` — discovery only collects
+/// candidates, each of which is verified on disk afterwards — and a read failure is logged.
+#[cfg(target_os = "windows")]
+fn read_registry_dir_value(key: &str, value_name: &str) -> Option<PathBuf> {
+    match reg_read_string(key, Some(value_name)) {
+        Ok(value) => value.filter(|item| !item.trim().is_empty()).map(PathBuf::from),
+        Err(status) => {
+            ms_log::runtime_log::log_warn(format!(
+                "[windows-install-discovery] could not read {key} value {value_name} (Windows error {status}); candidate skipped"
+            ));
+            None
+        }
+    }
 }
 
 pub fn spawn_installed_program_copy(install_dir: &Path) -> Result<PathBuf, String> {
@@ -481,7 +525,7 @@ pub fn resolve_installed_program_copy_path(install_dir: &Path) -> Result<PathBuf
     }
     #[cfg(target_os = "windows")]
     {
-        candidates.push(install_dir.join("manhwastudio_rs.exe"));
+        candidates.push(install_dir.join(ms_os_integration::identity::WINDOWS_EXE_NAME));
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -613,16 +657,39 @@ impl ExistingInstallApp {
         }
     }
 
-    fn create_desktop_shortcut(&mut self) -> Result<(), String> {
-        create_windows_desktop_shortcut(&self.install.install_dir)?;
-        self.set_result(ExistingInstallAction::ExitCurrentCopy);
-        Ok(())
-    }
-
-    fn create_start_menu_shortcut(&mut self) -> Result<(), String> {
-        run_windows_create_start_menu_shortcut_for_install(&self.install.install_dir, false)?;
-        self.set_result(ExistingInstallAction::ExitCurrentCopy);
-        Ok(())
+    /// Starts creating `shortcut` for the installed copy on a named worker: the COM shortcut
+    /// write (and, for an all-users Start menu, the UAC relaunch) blocks, and the GUI thread
+    /// only polls. Switches the window to [`ExistingInstallUiState::WaitingForShortcut`]; the
+    /// outcome arrives as [`ExistingInstallEvent::ShortcutFinished`].
+    fn start_create_shortcut(&mut self, shortcut: ExistingInstallShortcut) {
+        let install_dir = self.install.install_dir.clone();
+        let tx = self.tx.clone();
+        self.state = ExistingInstallUiState::WaitingForShortcut;
+        self.error_text = None;
+        let spawned = ms_thread::Builder::new()
+            .name("existing-install-shortcut".to_string())
+            .spawn(move || {
+                let result = match shortcut {
+                    ExistingInstallShortcut::Desktop => {
+                        create_windows_desktop_shortcut(&install_dir).map(|_| ()).map_err(|e| e.user_message())
+                    }
+                    ExistingInstallShortcut::StartMenu => {
+                        run_windows_create_start_menu_shortcut_for_install(&install_dir, false)
+                    }
+                };
+                if tx.send(ExistingInstallEvent::ShortcutFinished(result)).is_err() {
+                    // The window closed while the worker ran; nobody is left to show the result.
+                    ms_log::runtime_log::log_warn(format!(
+                        "[existing-install] shortcut result ({shortcut:?}) dropped: the window is closed"
+                    ));
+                }
+            });
+        if let Err(err) = spawned {
+            // Without a worker nothing was written: report it like a failed creation.
+            ms_log::runtime_log::log_error(format!("[existing-install] could not start the shortcut worker: {err}"));
+            self.state = ExistingInstallUiState::Error;
+            self.error_text = Some(tf!("installer.install.shortcut_worker_start_error", e = err));
+        }
     }
 
     fn launch_installed_copy(&mut self) -> Result<(), String> {
@@ -692,6 +759,16 @@ impl eframe::App for ExistingInstallApp {
                     self.error_text = Some(err);
                     self.status_text = t!("installer.install.replace_failed_status").to_string();
                 }
+                // Same outcome the synchronous buttons had: success ends this copy's session,
+                // a failure stays in the window with the error.
+                ExistingInstallEvent::ShortcutFinished(Ok(())) => {
+                    self.set_result(ExistingInstallAction::ExitCurrentCopy);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                ExistingInstallEvent::ShortcutFinished(Err(err)) => {
+                    self.state = ExistingInstallUiState::Error;
+                    self.error_text = Some(err);
+                }
             }
         }
 
@@ -743,13 +820,7 @@ impl eframe::App for ExistingInstallApp {
                         )
                         .clicked()
                     {
-                        match self.create_desktop_shortcut() {
-                            Ok(()) => close_window = true,
-                            Err(err) => {
-                                self.state = ExistingInstallUiState::Error;
-                                self.error_text = Some(err);
-                            }
-                        }
+                        self.start_create_shortcut(ExistingInstallShortcut::Desktop);
                     }
                     ui.add_space(6.0);
                     if ui
@@ -759,13 +830,7 @@ impl eframe::App for ExistingInstallApp {
                         )
                         .clicked()
                     {
-                        match self.create_start_menu_shortcut() {
-                            Ok(()) => close_window = true,
-                            Err(err) => {
-                                self.state = ExistingInstallUiState::Error;
-                                self.error_text = Some(err);
-                            }
-                        }
+                        self.start_create_shortcut(ExistingInstallShortcut::StartMenu);
                     }
                     ui.add_space(6.0);
                     if ui
@@ -817,6 +882,12 @@ impl eframe::App for ExistingInstallApp {
                         ui.label(t!("installer.install.waiting_replace_status"));
                     });
                 }
+                ExistingInstallUiState::WaitingForShortcut => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(t!("installer.install.waiting_shortcut_status"));
+                    });
+                }
             }
         });
 
@@ -839,6 +910,13 @@ struct InstallerApp {
     create_windows_desktop_shortcut: bool,
     #[cfg(target_os = "windows")]
     create_windows_start_menu_shortcut: bool,
+    /// Report channel of the finish-screen shortcut worker while it runs
+    /// ([`InstallerApp::finish_with_shortcuts`]); the window refuses to close while it is set.
+    #[cfg(target_os = "windows")]
+    finish_shortcuts_rx: Option<mpsc::Receiver<FinishShortcutsReport>>,
+    /// The finish-screen outcome, applied once the shortcut worker reported.
+    #[cfg(target_os = "windows")]
+    pending_finish_outcome: Option<InstallerOutcome>,
     state: UiState,
     current_operation: String,
     stage_progress: f32,
@@ -873,6 +951,10 @@ impl InstallerApp {
             create_windows_desktop_shortcut: true,
             #[cfg(target_os = "windows")]
             create_windows_start_menu_shortcut: true,
+            #[cfg(target_os = "windows")]
+            finish_shortcuts_rx: None,
+            #[cfg(target_os = "windows")]
+            pending_finish_outcome: None,
             state: UiState::Idle,
             current_operation: t!("installer.install.waiting_start_status").to_string(),
             stage_progress: 0.0,
@@ -888,7 +970,7 @@ impl InstallerApp {
             invite_discord: false,
         };
         match purpose {
-            InstallerPurpose::FullInstall => {
+            InstallerPurpose::FullInstall { .. } => {
                 if let Some(target_dir) = auto_install_target {
                     app.apply_auto_install_target(target_dir);
                 }
@@ -952,54 +1034,95 @@ impl InstallerApp {
         !has_write_access_for_install(target_dir)
     }
 
-    fn maybe_create_windows_shortcuts(&mut self) {
+    /// Ends the full-install finish screen with `outcome` after writing the shortcuts the user
+    /// ticked. Returns `Some(outcome)` when the window may close now (nothing to write, or not
+    /// Windows). Otherwise the `.lnk` writes (COM file I/O that can stall on a redirected
+    /// Desktop) run on the `install-finish-shortcuts` worker, the screen switches to
+    /// `UiState::CreatingShortcuts` and `None` is returned: the window closes with `outcome` once
+    /// the worker reports ([`Self::poll_finish_shortcuts`]). A worker that cannot start is logged,
+    /// shown in the console, and the window closes without shortcuts.
+    fn finish_with_shortcuts(&mut self, outcome: InstallerOutcome) -> Option<InstallerOutcome> {
         #[cfg(target_os = "windows")]
         {
-            if let Some(target_dir) = self.install_target_dir.clone() {
-                let mut created_paths = Vec::new();
-
-                if self.create_windows_desktop_shortcut {
-                    match create_windows_desktop_shortcut(&target_dir) {
-                        Ok(path) => created_paths.push(format!("Desktop: {}", path.display())),
-                        Err(err) => {
-                            self.console_lines.push(format!("[Shortcut/Desktop] {err}"));
-                        }
+            let Some(target_dir) = self.install_target_dir.clone() else {
+                return Some(outcome);
+            };
+            let desktop = self.create_windows_desktop_shortcut;
+            // An all-users install's Start-menu shortcut was already written by the install worker.
+            let start_menu = self.create_windows_start_menu_shortcut && !is_windows_all_users_install_dir(&target_dir);
+            if !desktop && !start_menu {
+                self.apply_finish_shortcuts_report(&target_dir, FinishShortcutsReport::default());
+                return Some(outcome);
+            }
+            let (tx, rx) = mpsc::channel();
+            let worker_dir = target_dir.clone();
+            let spawned = ms_thread::Builder::new()
+                .name("install-finish-shortcuts".to_string())
+                .spawn(move || {
+                    let report = write_finish_screen_shortcuts(&worker_dir, desktop, start_menu);
+                    if tx.send(report).is_err() {
+                        // The receiver lives until the report arrives; only a torn-down app drops it.
+                        ms_log::runtime_log::log_warn("[install] finish-screen shortcut report dropped: the installer window is gone");
                     }
+                });
+            match spawned {
+                Ok(_detached) => {
+                    self.finish_shortcuts_rx = Some(rx);
+                    self.pending_finish_outcome = Some(outcome);
+                    self.state = UiState::CreatingShortcuts;
+                    self.current_operation = t!("installer.install.waiting_shortcuts_status").to_string();
+                    None
                 }
+                Err(err) => {
+                    ms_log::runtime_log::log_error(format!("[install] could not start the finish-screen shortcut worker: {err}"));
+                    self.console_lines.push(tf!("installer.install.shortcut_worker_start_error", e = err));
+                    self.apply_finish_shortcuts_report(&target_dir, FinishShortcutsReport::default());
+                    Some(outcome)
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        Some(outcome)
+    }
 
-                if self.create_windows_start_menu_shortcut
-                    && !is_windows_all_users_install_dir(&target_dir)
-                {
-                    match create_windows_start_menu_shortcut(&target_dir) {
-                        Ok(path) => created_paths.push(format!("Start Menu: {}", path.display())),
-                        Err(err) => {
-                            self.console_lines
-                                .push(format!("[Shortcut/StartMenu] {err}"));
-                        }
-                    }
-                }
+    /// Drains the finish-screen shortcut worker. Returns the outcome chosen on the finish
+    /// screen once the worker reported (or ended without a report, which is logged and shown
+    /// as "not created"); `None` while it still runs or when none was started.
+    #[cfg(target_os = "windows")]
+    fn poll_finish_shortcuts(&mut self) -> Option<InstallerOutcome> {
+        let rx = self.finish_shortcuts_rx.as_ref()?;
+        let report = match rx.try_recv() {
+            Ok(report) => report,
+            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                ms_log::runtime_log::log_error("[install] finish-screen shortcut worker ended without a report");
+                FinishShortcutsReport::default()
+            }
+        };
+        self.finish_shortcuts_rx = None;
+        if let Some(target_dir) = self.install_target_dir.clone() {
+            self.apply_finish_shortcuts_report(&target_dir, report);
+        }
+        self.pending_finish_outcome.take()
+    }
 
-                if !created_paths.is_empty() {
-                    self.current_operation =
-                        tf!("installer.install.shortcuts_created_status", created_paths = created_paths.join(" | "));
-                } else if self.create_windows_desktop_shortcut
-                    || self.create_windows_start_menu_shortcut
-                {
-                    self.current_operation = t!("installer.install.shortcuts_not_created").to_string();
-                } else {
-                    self.current_operation = t!("installer.install.shortcuts_skipped").to_string();
-                }
-                if self.create_windows_start_menu_shortcut
-                    && is_windows_all_users_install_dir(&target_dir)
-                {
-                    self.console_lines.push(
-                        t!("installer.install.start_menu_already_created_log")
-                            .to_string(),
-                    );
-                    if created_paths.is_empty() && !self.create_windows_desktop_shortcut {
-                        self.current_operation = t!("installer.install.start_menu_already_created").to_string();
-                    }
-                }
+    /// Turns the finish-screen shortcut `report` into console lines and the current-operation
+    /// status, judged against the user's ticks for the install at `target_dir`.
+    #[cfg(target_os = "windows")]
+    fn apply_finish_shortcuts_report(&mut self, target_dir: &Path, report: FinishShortcutsReport) {
+        let FinishShortcutsReport { created_paths, console_lines } = report;
+        self.console_lines.extend(console_lines);
+        if !created_paths.is_empty() {
+            self.current_operation = tf!("installer.install.shortcuts_created_status", created_paths = created_paths.join(" | "));
+        } else if self.create_windows_desktop_shortcut || self.create_windows_start_menu_shortcut {
+            self.current_operation = t!("installer.install.shortcuts_not_created").to_string();
+        } else {
+            self.current_operation = t!("installer.install.shortcuts_skipped").to_string();
+        }
+        if self.create_windows_start_menu_shortcut && is_windows_all_users_install_dir(target_dir) {
+            self.console_lines.push(t!("installer.install.start_menu_already_created_log").to_string());
+            if created_paths.is_empty() && !self.create_windows_desktop_shortcut {
+                self.current_operation = t!("installer.install.start_menu_already_created").to_string();
             }
         }
     }
@@ -1053,7 +1176,7 @@ impl InstallerApp {
         self.stage_label = t!("installer.common.preparation").to_string();
         self.overall_progress = 0.0;
         self.overall_label = match self.purpose {
-            InstallerPurpose::FullInstall => tf!(
+            InstallerPurpose::FullInstall { .. } => tf!(
                 "installer.install.installing_to_status",
                 install_target_dir = install_target_dir.display()
             ),
@@ -1074,9 +1197,10 @@ impl InstallerApp {
             .name("mini-launcher-python-installer".to_string())
             .spawn(move || {
                 let result = match purpose {
-                    InstallerPurpose::FullInstall => run_install_worker(
+                    InstallerPurpose::FullInstall { host } => run_install_worker(
                         root_dir,
                         launcher_exe_path,
+                        config::version_format::version_core(host.core),
                         dependency_profile,
                         torch_selection,
                         &tx,
@@ -1309,7 +1433,7 @@ impl eframe::App for InstallerApp {
                     UiState::DependencyProfileChoice => {
                         ui.add_space((center_height * 0.16).max(8.0));
                         ui.label(match self.purpose {
-                            InstallerPurpose::FullInstall => {
+                            InstallerPurpose::FullInstall { .. } => {
                                 t!("installer.install.choose_deps_set_label")
                             }
                             InstallerPurpose::EnvironmentRepair => {
@@ -1415,7 +1539,6 @@ impl eframe::App for InstallerApp {
                                 .add_sized([210.0, 36.0], egui::Button::new(t!("installer.install.open_button")))
                                 .clicked()
                             {
-                                self.maybe_create_windows_shortcuts();
                                 if self.invite_telegram {
                                     let _ = open_url_in_browser(TELEGRAM_INVITE_URL);
                                 }
@@ -1426,8 +1549,7 @@ impl eframe::App for InstallerApp {
                                     .install_target_dir
                                     .clone()
                                     .unwrap_or_else(|| self.root_dir.join(INSTALL_SUBDIR_NAME));
-                                finish_outcome =
-                                    Some(InstallerOutcome::LaunchLauncher(install_dir));
+                                finish_outcome = self.finish_with_shortcuts(InstallerOutcome::LaunchLauncher(install_dir));
                             }
                             ui.add_space(10.0);
                             ui.vertical(|ui| {
@@ -1451,9 +1573,16 @@ impl eframe::App for InstallerApp {
                         ui.add_space(8.0);
                         ui.horizontal_centered(|ui| {
                             if ui.button(t!("installer.common.close_button")).clicked() {
-                                self.maybe_create_windows_shortcuts();
-                                finish_outcome = Some(InstallerOutcome::Completed);
+                                finish_outcome = self.finish_with_shortcuts(InstallerOutcome::Completed);
                             }
+                        });
+                    }
+                    #[cfg(target_os = "windows")]
+                    UiState::CreatingShortcuts => {
+                        ui.add_space((center_height * 0.25).max(12.0));
+                        ui.horizontal_centered(|ui| {
+                            ui.spinner();
+                            ui.label(t!("installer.install.waiting_shortcuts_status"));
                         });
                     }
                     UiState::Failed => {
@@ -1569,13 +1698,55 @@ impl eframe::App for InstallerApp {
                 }
             }
         }
+        #[cfg(target_os = "windows")]
+        if finish_outcome.is_none() {
+            finish_outcome = self.poll_finish_shortcuts();
+        }
+        #[cfg(target_os = "windows")]
+        if self.finish_shortcuts_rx.is_some() && ctx.input(|input| input.viewport().close_requested()) {
+            // Closing now would end the process under the worker mid-write; the outcome the user
+            // already chose is applied (and the window closed) once the worker reports.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         if let Some(outcome) = finish_outcome {
             self.set_result(outcome);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
 
+        // Also polls the finish-screen shortcut worker without user input.
         ctx.request_repaint_after(Duration::from_millis(33));
     }
+}
+
+/// What the finish-screen shortcut worker did: user-facing lines, applied by the GUI thread.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default)]
+struct FinishShortcutsReport {
+    /// `Desktop: <path>` / `Start Menu: <path>` for every shortcut written.
+    created_paths: Vec<String>,
+    /// `[Shortcut/…] <user message>` console lines of failed writes.
+    console_lines: Vec<String>,
+}
+
+/// Writes the finish screen's ticked shortcuts for the install at `target_dir` (Desktop when
+/// `desktop`, per-user Start menu when `start_menu`). Blocking COM file I/O: worker thread only.
+/// Every failure becomes a console line; none aborts the other shortcut.
+#[cfg(target_os = "windows")]
+fn write_finish_screen_shortcuts(target_dir: &Path, desktop: bool, start_menu: bool) -> FinishShortcutsReport {
+    let mut report = FinishShortcutsReport::default();
+    if desktop {
+        match create_windows_desktop_shortcut(target_dir).map_err(|e| e.user_message()) {
+            Ok(path) => report.created_paths.push(format!("Desktop: {}", path.display())),
+            Err(err) => report.console_lines.push(format!("[Shortcut/Desktop] {err}")),
+        }
+    }
+    if start_menu {
+        match create_windows_start_menu_shortcut(target_dir).map_err(|e| e.user_message()) {
+            Ok(path) => report.created_paths.push(format!("Start Menu: {}", path.display())),
+            Err(err) => report.console_lines.push(format!("[Shortcut/StartMenu] {err}")),
+        }
+    }
+    report
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -1586,6 +1757,9 @@ enum UiState {
     TorchChoice,
     Running,
     Completed,
+    /// Finish screen left: the ticked shortcuts are being written on a worker (Windows).
+    #[cfg(target_os = "windows")]
+    CreatingShortcuts,
     Failed,
 }
 

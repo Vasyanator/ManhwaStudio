@@ -29,7 +29,8 @@ one draw entry the launcher calls with its own frame, one the settings tab calls
 theirs. Adding a pane means adding a `SettingsSectionId` variant and both entries.
 
 Layer position: above `ms-widgets` / `ms-config` / `ms-sysprobe` / `ms-backend-ipc` /
-`ms-memory` / `ms-onnx` / `ms-project` (the storage-mode driver), and above exactly ONE tab crate — `ms-tab-translation`, for
+`ms-memory` / `ms-onnx` / `ms-project` (the storage-mode driver) / `ms-os-integration`
+(native only: the OS-record probe behind the registration warnings), and above exactly ONE tab crate — `ms-tab-translation`, for
 `backend_health` (the health snapshot and probe-command model). The tabs never depend back
 on this crate; if a reference in that direction appears, the layering is wrong, not the
 dependency list.
@@ -41,7 +42,8 @@ dependency list.
   `with_item_badge`, the one layout rule for an item's inline warning badge. The studio
   Settings tab shows six sections: the shared General, AiBackend and Tutorials (the last only
   with the `tutorial` feature) plus its own CanvasRibbon, Typesetting and Hotkeys; the launcher
-  adds its own SystemInfo, AiComputations, TorchUpgrade and PythonEnvironment. `SettingsDeepLink`
+  adds its own SystemInfo, AiComputations, TorchUpgrade, PythonEnvironment and (Windows and
+  Linux only, a `cfg`-gated `SECTIONS` row) SystemRegistration. `SettingsDeepLink`
   is declared in `ms_config::settings_deep_link` (the typing tab requests deep links and may not
   depend on this crate) and only re-exported here.
 - `storage_mode_job.rs`: the ONE process-wide Dev/Prod conversion job (slot Idle / Pending /
@@ -95,7 +97,8 @@ dependency list.
   aggregation), the native-only checks, the `SettingsWarnings` worker runtime
   (generation-based latest-wins rechecks driven by `SettingChange`) and the badge
   painter. It consumes the detectors above (`check_backend_spawnable`, `onnx_caps`,
-  `ms_native_runtime::evaluate_native_selection`) and never owns their rules. See its own
+  `ms_native_runtime::evaluate_native_selection`, `ms_os_integration::report::probe`) and
+  never owns their rules. See its own
   `MODULE_README.md`.
 - `tutorial/`: the onboarding subsystem, behind the `tutorial` feature. See its own
   `MODULE_README.md`.

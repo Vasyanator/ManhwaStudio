@@ -6,6 +6,7 @@ Main flow:
 - Parses CLI args (`--project` optional, `--no-ai` optional).
 - Handles hidden service flags for installer continuation and Windows uninstall before normal startup.
 - Handles hidden service flags for installer continuation, Windows uninstall, and elevated Start Menu shortcut creation before normal startup.
+- Routes the elevated system-registration helper (`--system-registration-apply`, Windows only) right after the flag-conflict check.
 - Windows uninstall can relaunch itself elevated with a hidden continuation flag before deleting files from protected install locations.
 - If `--project` points to a valid chapter, opens it immediately.
 - `--image <PATH>` or a positional image path (OS "Open with", `.desktop` `%f`) opens that
@@ -24,6 +25,9 @@ Main flow:
   complete, otherwise opens the installer in environment-repair mode and exits 0/1;
 - supports `--ignore-installed` (run from a source checkout): no Linux desktop entry, no
   existing-install discovery/prompt, per-root backend socket, self-update refused;
+- otherwise keeps the Linux desktop entry and icon current on a startup worker
+  (`install_linux_desktop_integration_async`: create if missing, refresh only if this copy's;
+  the entry text, ownership rule and writer live in `ms_os_integration::linux`);
 - supports `--update` to open the Rust update window directly before normal startup routing;
 - supports hidden `--continue-update` to resume update work after the executable has been replaced;
 - can update an already installed copy found through Windows install discovery or a user-selected
@@ -191,6 +195,14 @@ const HOST_VERSION: ms_installer::HostVersion = ms_installer::HostVersion {
     display: env!("MS_APP_VERSION"),
 };
 
+/// The process facts the launcher needs from startup: `--ignore-installed` (the System
+/// registration tab is read-only and its warnings silent) and this build's version core (the
+/// installer's reduction, `install.rs`), which a written Uninstall entry carries.
+#[cfg(not(target_arch = "wasm32"))]
+fn launcher_host(ignore_installed: bool) -> launcher::state::LauncherHost {
+    launcher::state::LauncherHost { ignore_installed, version_core: version_format::version_core(HOST_VERSION.core) }
+}
+
 // Pure version-string composition/stripping, shared verbatim with `build.rs` through
 // `include!("crates/ms-config/src/version_format.rs")`. It moved into `ms-config` so the
 // installer and launcher crates can reach it without going through the binary. Defines
@@ -302,12 +314,8 @@ use launcher::state::{LauncherOutcome, UpdateNotification};
 use serde::Deserialize;
 #[cfg(not(target_arch = "wasm32"))]
 use std::cmp::Ordering;
-#[cfg(target_os = "linux")]
-use std::env;
 #[cfg(not(target_arch = "wasm32"))]
 use std::ffi::OsStr;
-#[cfg(target_os = "linux")]
-use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
@@ -364,18 +372,33 @@ fn storage_conversion_autostart_gate() -> ai_backend_supervisor::AutostartGate {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_main() -> anyhow::Result<()> {
-    init_startup_logging_best_effort();
     let mut cli = Cli::parse();
+    // The elevated system-registration helper never opens the session log: initializing it
+    // rotates `last.log` -> `previous.log`, and the helper runs while the launcher that
+    // started it still writes `last.log` (on Windows it also holds the file open). The helper
+    // reports every outcome in its result file and the launcher logs them, so it runs without
+    // a file log (`runtime_log` lines are dropped before init). The CLI is therefore parsed
+    // before the log init; a clap usage error exits there without touching the logs.
+    if cli.system_registration_apply.is_none() {
+        init_startup_logging_best_effort();
+    }
     // FIRST action after parsing: several service flags below (Start Menu shortcut,
     // uninstall, update continuation) act on an installed copy immediately, so an
     // impossible combination must be rejected before any of them can run.
     reject_conflicting_startup_flags(&cli);
+    // The elevated system-registration helper (a short-lived admin process the launcher starts
+    // through UAC) does its batch and exits here, BEFORE every other startup side effect (scratch
+    // sweep, desktop entry, backend socket): an elevated process must do nothing else.
+    if cli.system_registration_apply.is_some() {
+        std::process::exit(run_system_registration_helper(&cli));
+    }
     // Deletes single-image scratch sessions left behind by crashed runs. Lock-guarded, so a
     // session of another running instance is never touched; fire-and-forget on a worker.
     spawn_stale_scratch_sweep();
-    // Desktop integration writes into the user's shared `~/.local/share` tree, which is
-    // owned by whichever copy registered itself last. A copy launched from a source
-    // checkout must not steal it, so this runs only after the CLI is known.
+    // Desktop integration writes into the user's shared XDG data tree. It creates the entry
+    // when missing and refreshes only an entry of THIS copy (another copy's entry is never
+    // taken over); a run from a source checkout (`--ignore-installed`) does not touch it at
+    // all, so this runs only after the CLI is known.
     #[cfg(target_os = "linux")]
     if !cli.ignore_installed {
         install_linux_desktop_integration_async();
@@ -517,6 +540,7 @@ fn run_main() -> anyhow::Result<()> {
             &user_settings,
             startup_update_check_receiver(&cli),
             &supervisor.handle(),
+            launcher_host(cli.ignore_installed),
         );
     }
 
@@ -974,7 +998,7 @@ fn resolve_project_dir_without_cli_arg(
     } else {
         Some(spawn_startup_update_check(flags.force_update_available))
     };
-    match launcher::run_launcher(user_settings, update_check_rx, ai_backend)? {
+    match launcher::run_launcher(user_settings, update_check_rx, ai_backend, launcher_host(flags.ignore_installed))? {
         Some(LauncherOutcome::OpenProject(selection)) => Ok(Some(studio_bootstrap::StartupTarget::Project(selection.project_dir))),
         // The launcher already checked "exists and is a file"; decode errors are the studio
         // loading screen's (one owner: `SingleImageError::user_message`).
@@ -1067,6 +1091,39 @@ fn reject_conflicting_startup_flags(cli: &Cli) {
         eprintln!("{message}");
     }
     std::process::exit(CLI_USAGE_ERROR_EXIT);
+}
+
+/// Runs this process as the elevated system-registration helper
+/// (`--system-registration-apply` + `--system-registration-result`, clap requires both) and
+/// returns its exit code (`ms_os_integration::actions::HELPER_EXIT_*`). Windows only; elsewhere
+/// the flags are rejected with a localized "unsupported" diagnostic and [`CLI_USAGE_ERROR_EXIT`].
+#[cfg(not(target_arch = "wasm32"))]
+fn run_system_registration_helper(cli: &Cli) -> i32 {
+    // Same early locale bring-up as `reject_conflicting_startup_flags`: read-only, embedded
+    // catalog, so the helper's failure texts (written into its result file) are localized.
+    let raw_settings =
+        config::load_raw_user_settings_for_startup().unwrap_or(serde_json::Value::Null);
+    locale_store::install_embedded_ui_locale(&raw_settings);
+    #[cfg(target_os = "windows")]
+    {
+        let (Some(actions), Some(result_file)) =
+            (cli.system_registration_apply.as_deref(), cli.system_registration_result.as_deref())
+        else {
+            runtime_log::log_error("[startup] --system-registration-apply without --system-registration-result");
+            return CLI_USAGE_ERROR_EXIT;
+        };
+        ms_os_integration::windows::elevation::run_elevated_helper(actions, result_file, version_format::version_core(HOST_VERSION.core))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let message = t!("startup.system_registration.unsupported_error");
+        runtime_log::log_error(format!(
+            "[startup] {message} (--system-registration-apply {:?})",
+            cli.system_registration_apply
+        ));
+        eprintln!("{message}");
+        CLI_USAGE_ERROR_EXIT
+    }
 }
 
 /// Process exit code of `--check-venv` when the environment is usable.
@@ -1372,7 +1429,7 @@ fn run_startup_installer(
     app_dir: PathBuf,
     auto_install_target: Option<PathBuf>,
 ) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
-    match launcher_install::run_python_installer_window(&app_dir, auto_install_target)
+    match launcher_install::run_python_installer_window(&app_dir, auto_install_target, HOST_VERSION)
         .map_err(anyhow::Error::msg)?
     {
         launcher_install::InstallerOutcome::Completed => Ok(None),
@@ -2329,175 +2386,62 @@ fn load_embedded_icon_data() -> Option<egui::IconData> {
     })
 }
 
-/// Writes the Linux desktop entry and icon on a named background thread, then asks the
-/// desktop database to pick up the entry's `MimeType=` list. Best effort: every failure is
-/// logged and nothing else happens.
+/// Keeps this copy's Linux desktop entry and icon current on a named background thread
+/// (`ms_os_integration::linux::xdg::ensure_at_startup`: create if missing, refresh only if
+/// ours and different, never take over another copy's entry). Best effort: every outcome and
+/// failure is logged and nothing else happens.
 #[cfg(target_os = "linux")]
 fn install_linux_desktop_integration_async() {
+    use ms_os_integration::linux::desktop_entry::StartupOutcome;
+    use ms_os_integration::linux::xdg::{DesktopDirs, ensure_at_startup};
+
     let spawn_result = thread::Builder::new()
         .name("desktop-integration-installer".to_string())
-        .spawn(|| match install_linux_desktop_integration() {
-            Ok(Some(apps_dir)) => refresh_linux_desktop_database(&apps_dir),
-            Ok(None) => {}
-            Err(err) => runtime_log::log_warn(format!(
-                "[desktop-integration] could not install the Linux desktop entry: {err}"
-            )),
+        .spawn(|| {
+            let identity = match ms_os_integration::CopyIdentity::current(None) {
+                Ok(identity) => identity,
+                Err(err) => {
+                    runtime_log::log_warn(format!("[desktop-integration] {err}; desktop entry not checked"));
+                    return;
+                }
+            };
+            let Some(dirs) = DesktopDirs::from_process_env() else {
+                runtime_log::log_warn(
+                    "[desktop-integration] neither XDG_DATA_HOME nor HOME is an absolute path; desktop entry not checked",
+                );
+                return;
+            };
+            let entry = dirs.entry_path();
+            match ensure_at_startup(&identity, &dirs) {
+                Ok(written @ (StartupOutcome::Created | StartupOutcome::Refreshed)) => runtime_log::log_info(format!(
+                    "[desktop-integration] {} '{}' for '{}' (Path='{}', dev copy: {})",
+                    if written == StartupOutcome::Created { "created" } else { "refreshed" },
+                    entry.display(),
+                    identity.exe.display(),
+                    identity.program_root.display(),
+                    identity.is_dev_copy()
+                )),
+                Ok(StartupOutcome::AlreadyCurrent) => runtime_log::log_info(format!(
+                    "[desktop-integration] '{}' is current for '{}'",
+                    entry.display(),
+                    identity.exe.display()
+                )),
+                Ok(StartupOutcome::LeftForeign { exe }) => runtime_log::log_info(format!(
+                    "[desktop-integration] '{}' belongs to another copy '{}' (exists: {}); left untouched",
+                    entry.display(),
+                    exe.display(),
+                    exe.exists()
+                )),
+                // The cause was already logged by `ensure_at_startup`.
+                Ok(StartupOutcome::Unreadable) => {}
+                Err(err) => runtime_log::log_warn(format!(
+                    "[desktop-integration] could not write the Linux desktop entry: {err}"
+                )),
+            }
         });
     if let Err(err) = spawn_result {
         runtime_log::log_warn(format!(
             "[desktop-integration] could not start the desktop-integration thread: {err}"
         ));
-    }
-}
-
-/// Writes `~/.local/share/applications/manhwastudio_rs.desktop` and the 512 px icon. Returns
-/// the applications directory it wrote into, or `None` when `HOME` or the executable path is
-/// unknown (nothing written then).
-///
-/// # Errors
-/// A directory or file could not be created or written.
-#[cfg(target_os = "linux")]
-fn install_linux_desktop_integration() -> std::io::Result<Option<PathBuf>> {
-    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
-        runtime_log::log_warn("[desktop-integration] HOME is not set; desktop entry not installed");
-        return Ok(None);
-    };
-
-    let apps_dir = home.join(".local/share/applications");
-    let icon_dir = home.join(".local/share/icons/hicolor/512x512/apps");
-    fs::create_dir_all(&apps_dir)?;
-    fs::create_dir_all(&icon_dir)?;
-
-    let icon_path = icon_dir.join("manhwastudio_rs.png");
-    fs::write(&icon_path, EMBEDDED_APP_ICON_PNG)?;
-
-    let exec_path = match env::current_exe() {
-        Ok(path) => path,
-        Err(err) => {
-            runtime_log::log_warn(format!(
-                "[desktop-integration] could not resolve the executable path ({err}); desktop entry not installed"
-            ));
-            return Ok(None);
-        }
-    };
-
-    fs::write(
-        apps_dir.join("manhwastudio_rs.desktop"),
-        linux_desktop_entry_text(&exec_path).as_bytes(),
-    )?;
-
-    Ok(Some(apps_dir))
-}
-
-/// Runs `update-desktop-database <apps_dir>` so the entry's `MimeType=` list shows up in "Open
-/// with" menus without a re-login. Optional tool: absence or failure is logged only. It only
-/// rebuilds the MIME -> applications cache; no default handler is ever set.
-#[cfg(target_os = "linux")]
-fn refresh_linux_desktop_database(apps_dir: &Path) {
-    match std::process::Command::new("update-desktop-database").arg(apps_dir).output() {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => runtime_log::log_warn(format!(
-            "[desktop-integration] update-desktop-database '{}' failed ({}): {}",
-            apps_dir.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => runtime_log::log_info(
-            "[desktop-integration] update-desktop-database is not installed; the desktop picks up the entry on its own rescan",
-        ),
-        Err(err) => runtime_log::log_warn(format!(
-            "[desktop-integration] could not run update-desktop-database: {err}"
-        )),
-    }
-}
-
-/// Text of the Linux desktop entry for the executable at `exec_path`. Pure.
-///
-/// `Exec=` ends in `%f` (one local file, or nothing when launched from a menu), which arrives
-/// as the positional image argument. `MimeType=` lists every readable input type
-/// (`ms_config::single_image::INPUT_FILE_TYPES`), so the program is OFFERED in "Open with";
-/// it never becomes the default handler (that would need a `mimeapps.list` entry).
-#[cfg(any(target_os = "linux", test))]
-fn linux_desktop_entry_text(exec_path: &Path) -> String {
-    format!(
-        "[Desktop Entry]\n\
-Type=Application\n\
-Name=ManhwaStudio\n\
-Comment=ManhwaStudio Rust Prototype\n\
-Exec={} %f\n\
-Icon=manhwastudio_rs\n\
-Terminal=false\n\
-Categories=Graphics;\n\
-MimeType={}\n\
-StartupNotify=true\n\
-StartupWMClass=manhwastudio_rs\n\
-X-KDE-DBUS-Restricted-Interfaces=org.kde.kwin.Screenshot,org.kde.KWin.ScreenShot2\n",
-        escape_desktop_exec_arg(exec_path),
-        desktop_mime_type_list()
-    )
-}
-
-/// The `MimeType=` value: every `INPUT_FILE_TYPES` MIME type, `;`-separated with the trailing
-/// `;` the Desktop Entry spec requires for string lists.
-#[cfg(any(target_os = "linux", test))]
-fn desktop_mime_type_list() -> String {
-    config::single_image::INPUT_FILE_TYPES
-        .iter()
-        .map(|file_type| format!("{};", file_type.mime))
-        .collect()
-}
-
-/// Quotes one `Exec=` argument per the Desktop Entry spec. Inside double quotes `"`, `` ` ``,
-/// `$` and `\` need a backslash; the key file's own string escaping is applied first, so that
-/// backslash is itself written doubled (`\\"`, and `\\\\` for a literal backslash). A
-/// literal `%` is written `%%` so it is not read as a field code.
-#[cfg(any(target_os = "linux", test))]
-fn escape_desktop_exec_arg(path: &Path) -> String {
-    let mut out = String::with_capacity(path.as_os_str().len() + 2);
-    out.push('"');
-    for ch in path.to_string_lossy().chars() {
-        match ch {
-            '"' | '`' | '$' => {
-                out.push_str("\\\\");
-                out.push(ch);
-            }
-            '\\' => out.push_str("\\\\\\\\"),
-            '%' => out.push_str("%%"),
-            _ => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn desktop_entry_passes_one_file_and_lists_every_input_mime_type() {
-        let entry = linux_desktop_entry_text(Path::new("/opt/ManhwaStudio/manhwastudio_rs"));
-        assert!(entry.contains("\nExec=\"/opt/ManhwaStudio/manhwastudio_rs\" %f\n"), "{entry}");
-        assert!(!entry.contains("%u"), "a URL field code would hand over non-file URIs");
-        let mime_line = entry
-            .lines()
-            .find_map(|line| line.strip_prefix("MimeType="))
-            .expect("the entry must carry a MimeType line");
-        assert!(mime_line.ends_with(';'), "string lists end with ';': {mime_line}");
-        let listed: Vec<&str> = mime_line.trim_end_matches(';').split(';').collect();
-        let expected: Vec<&str> = config::single_image::INPUT_FILE_TYPES.iter().map(|file_type| file_type.mime).collect();
-        assert_eq!(listed, expected);
-        assert!(listed.contains(&"image/png") && listed.contains(&"image/jpeg"));
-        assert!(entry.starts_with("[Desktop Entry]\n") && entry.contains("\nType=Application\n"));
-    }
-
-    #[test]
-    fn desktop_exec_argument_is_quoted_and_escaped() {
-        assert_eq!(escape_desktop_exec_arg(Path::new("/home/u/My Apps/ms")), "\"/home/u/My Apps/ms\"");
-        assert_eq!(escape_desktop_exec_arg(Path::new("/home/u/Программы/ms")), "\"/home/u/Программы/ms\"");
-        assert_eq!(escape_desktop_exec_arg(Path::new("/a\"b")), "\"/a\\\\\"b\"");
-        assert_eq!(escape_desktop_exec_arg(Path::new("/a$b`c")), "\"/a\\\\$b\\\\`c\"");
-        assert_eq!(escape_desktop_exec_arg(Path::new("/a\\b")), "\"/a\\\\\\\\b\"");
-        assert_eq!(escape_desktop_exec_arg(Path::new("/100%/ms")), "\"/100%%/ms\"");
     }
 }

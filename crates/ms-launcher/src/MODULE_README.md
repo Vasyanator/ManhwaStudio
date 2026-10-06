@@ -15,7 +15,9 @@ The launcher does not perform blocking I/O on the GUI thread. Startup update che
 notification.
 
 ## Files and submodules
-- `lib.rs`: crate root; launcher window setup, app metadata, and public run functions.
+- `lib.rs`: crate root; launcher window setup, app metadata, and public run functions. The
+  launcher app id is `manhwastudio_rs` on Linux (the desktop-entry id, so the window matches
+  the menu entry's `StartupWMClass`), `manhwastudio_rs.launcher` elsewhere.
 - `app.rs`: root app state, worker polling, page routing, detached viewport handling; starts
   and polls the settings-warnings checks (see "Settings warnings").
 - `main_page.rs`: central menu (the Settings button carries the overall settings-warning
@@ -27,7 +29,8 @@ notification.
   validation (exists + is a file) on a worker, the filter built from
   `ms_config::single_image::input_extensions()` (plus uppercase copies for case-sensitive GTK
   globs), and the pure pick -> `LauncherOutcome::OpenImage` mapping. `app.rs` polls it.
-- `state.rs`: page enum, shared UI state, and typed launcher outcomes.
+- `state.rs`: page enum, shared UI state, typed launcher outcomes, and `LauncherHost` (the
+  process facts `main.rs` / `web_entry.rs` hand in: `--ignore-installed`, version core).
 - `background.rs`: background image plan and decode workers.
 - `first_run_language.rs`: first-run interface/typesetting language-selection modal
   (radio toggles, system-locale preselect). Reuses `general_settings_panel`'s
@@ -95,7 +98,10 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
   `PageNavAction::AiInstallTypeChanged`); the projects folder (`ProjectsRoot`) on the falling
   edge of `LauncherState::project_creator_open` (Import page, new-project and PSD-import
   windows), since a create or import can create the folder without any config write — the
-  one place for every create path, in `LauncherApp::poll_workers`. A new launcher-side writer
+  one place for every create path, in `LauncherApp::poll_workers`; the OS registration records
+  (`SystemRegistration`) after every action of the System registration tab and on its refresh
+  (`pages/system_registration.rs`). Registration checks are off under `--ignore-installed`
+  (`CheckContext::registration_checks = !LauncherHost::ignore_installed`). A new launcher-side writer
   of a checked setting (or a new surface that creates the projects folder) must be added here.
 - **Badges** are paint-only (`paint_corner_badge`): the menu button and the tab buttons keep
   their click and tutorial-target rects.

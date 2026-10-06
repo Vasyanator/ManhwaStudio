@@ -85,6 +85,10 @@ pub enum SettingsSectionId {
     TorchUpgrade,
     /// Interactive Python-environment shell console (launcher only).
     PythonEnvironment,
+    /// The OS records of this program copy (menu entry, installed-programs entry, "Open
+    /// with"), probed and repaired from the launcher. Always declared; its `SECTIONS` row
+    /// exists only on Windows and Linux, the platforms with such records.
+    SystemRegistration,
     // Studio-only sections (rendered by the studio settings tab).
     /// Canvas/ribbon settings, comic type, and bubble-status rules (studio only).
     CanvasRibbon,
@@ -163,6 +167,15 @@ const SECTIONS: &[SettingsSectionDescriptor] = &[
         surfaces: &[SettingsSurface::Studio],
         order: 50,
     },
+    // Listed only where OS records exist; the launcher never hides it dynamically, so its
+    // warning keys (`settings_warnings::REGISTRATION_FAMILY`, filtered by the same platforms)
+    // always badge a visible tab.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    SettingsSectionDescriptor {
+        id: SettingsSectionId::SystemRegistration,
+        surfaces: &[SettingsSurface::Launcher],
+        order: 55,
+    },
     SettingsSectionDescriptor {
         id: SettingsSectionId::PythonEnvironment,
         surfaces: &[SettingsSurface::Launcher],
@@ -217,6 +230,7 @@ pub fn title_key(id: SettingsSectionId, surface: SettingsSurface) -> &'static st
         SettingsSectionId::AiComputations => "launcher.settings.tab_ai_compute",
         SettingsSectionId::TorchUpgrade => "launcher.settings.upgrade_to_full_button",
         SettingsSectionId::PythonEnvironment => "launcher.settings.tab_python_env",
+        SettingsSectionId::SystemRegistration => "launcher.settings.tab_system_registration",
         SettingsSectionId::CanvasRibbon => "settings.nav.canvas_ribbon",
         SettingsSectionId::Typesetting => "settings.nav.typesetting",
         SettingsSectionId::Hotkeys => "settings.nav.hotkeys",
@@ -389,6 +403,7 @@ impl SharedSettingsPanels {
             | SettingsSectionId::AiComputations
             | SettingsSectionId::TorchUpgrade
             | SettingsSectionId::PythonEnvironment
+            | SettingsSectionId::SystemRegistration
             | SettingsSectionId::CanvasRibbon
             | SettingsSectionId::Typesetting
             | SettingsSectionId::Hotkeys => {
@@ -486,6 +501,8 @@ mod tests {
             SettingsSectionId::AiComputations,
             SettingsSectionId::AiBackend,
             SettingsSectionId::TorchUpgrade,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            SettingsSectionId::SystemRegistration,
             SettingsSectionId::PythonEnvironment,
             SettingsSectionId::Tutorials,
         ];
@@ -496,9 +513,24 @@ mod tests {
             SettingsSectionId::AiComputations,
             SettingsSectionId::AiBackend,
             SettingsSectionId::TorchUpgrade,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            SettingsSectionId::SystemRegistration,
             SettingsSectionId::PythonEnvironment,
         ];
         assert_eq!(ids, expected);
+    }
+
+    /// The System registration tab is a launcher tab on Windows and Linux only, and it has no
+    /// dynamic hide: the launcher's only post-filter is the TorchUpgrade one, so a badge on a
+    /// registration key always lands on a visible tab. Never listed for the studio.
+    #[test]
+    fn system_registration_is_a_static_launcher_tab_on_windows_and_linux() {
+        let listed = |surface| sections_for(surface).iter().any(|descriptor| descriptor.id == SettingsSectionId::SystemRegistration);
+        assert_eq!(listed(SettingsSurface::Launcher), cfg!(any(target_os = "windows", target_os = "linux")));
+        assert!(!listed(SettingsSurface::Studio));
+        let rows: Vec<&SettingsSectionDescriptor> =
+            SECTIONS.iter().filter(|descriptor| descriptor.id == SettingsSectionId::SystemRegistration).collect();
+        assert!(rows.iter().all(|descriptor| descriptor.surfaces == [SettingsSurface::Launcher] && descriptor.order == 55));
     }
 
     #[test]
@@ -571,6 +603,7 @@ mod tests {
                 Launcher,
                 "launcher.settings.tab_python_env",
             ),
+            (Id::SystemRegistration, Launcher, "launcher.settings.tab_system_registration"),
             (Id::CanvasRibbon, Studio, "settings.nav.canvas_ribbon"),
             (Id::Typesetting, Studio, "settings.nav.typesetting"),
             (Id::Hotkeys, Studio, "settings.nav.hotkeys"),

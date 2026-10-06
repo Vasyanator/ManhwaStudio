@@ -8,7 +8,8 @@ Re-exports the public surface the panes (item badges, change reporting) and the 
 
 Submodules:
 - `model`: GUI-free, wasm-clean keys, reasons, levels, changes and the `WarningSet`.
-- `checks` (native-only): fact gathering + pure decision functions per key.
+- `checks` (native-only): fact gathering + pure decision functions per key; also the
+  record kind -> key / record-name mappings the launcher's System registration tab reuses.
 - `runtime`: `SettingsWarnings` (worker, generations, polling) and `CheckContext`.
 - `badge`: the egui "!" painter and the inline item badge.
 */
@@ -22,8 +23,12 @@ mod model;
 mod runtime;
 
 pub use badge::{item_warning_badge, paint_corner_badge, paint_warning_badge};
+// The record kind -> warning key / record name mappings, for the launcher's System
+// registration tab (the native record kind exists on Windows and Linux only).
+#[cfg(all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "linux")))]
+pub use checks::{registration_key, registration_record};
 pub use model::{
-    FallbackCause, NATIVE_FAMILY, SettingChange, SettingGroupId, SettingKey, SettingLocation, SettingWarning,
-    WarningLevel, WarningReason, WarningSet,
+    FallbackCause, NATIVE_FAMILY, REGISTRATION_FAMILY, RegistrationProblem, RegistrationRecord, SettingChange,
+    SettingGroupId, SettingKey, SettingLocation, SettingWarning, WarningLevel, WarningReason, WarningSet,
 };
 pub use runtime::{CheckContext, SettingsWarnings};

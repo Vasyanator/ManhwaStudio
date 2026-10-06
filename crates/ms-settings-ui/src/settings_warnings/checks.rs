@@ -6,7 +6,9 @@ every `SettingKey`, run on the settings-warnings worker thread.
 Purpose:
 Turns a fresh read of `user_config` plus the existing detectors into `WarningReason`s.
 Split in two halves:
-- fact gathering (`run_checks` and the `gather_*` / `check_*` helpers): one raw config
+- fact gathering (`run_checks` and the `gather_*` / `check_*` helpers): ONE
+  `ms_os_integration::report::probe` of the running copy's OS records (before and
+  independent of the config read, which they do not need), one raw config
   read, `ms_native_runtime::evaluate_native_selection` (uncached, never touches the
   process selection cache), the guard scope of the next load
   (`ms_native_runtime::next_load_scope_key`), `probe_onnx_caps` only when the
@@ -14,7 +16,7 @@ Split in two halves:
   `locale_store::probe_disk_catalog` and a `stat` of the projects folder. Blocking:
   worker only. Untested glue (it probes real hardware and the filesystem);
 - pure decisions (`projects_root_reasons`, `ui_catalog_reasons`, `backend_reasons`,
-  `native_family_reasons`): plain data in, reasons out, unit-tested.
+  `native_family_reasons`, `registration_reasons`): plain data in, reasons out, unit-tested.
 
 Notes:
 Every rule here is a CONSUMER of its owner: build shipping is
@@ -23,7 +25,8 @@ Every rule here is a CONSUMER of its owner: build shipping is
 effective `device`, whether the persisted id names an offered device is
 `onnx_caps::device_id_offered` (over the runtime's own id parse), the guard scope is
 `next_load_scope_key` (shared with the panel's Retry worker), spawnability is
-`check_backend_spawnable`, the catalog rule is `probe_disk_catalog`. The worker never
+`check_backend_spawnable`, the catalog rule is `probe_disk_catalog`, which registration
+records are broken is `ms_os_integration::report::badge_worthy` (over `Defect::severity`). The worker never
 reconciles the AI install type; it only reads it.
 */
 
@@ -38,26 +41,39 @@ use ms_native_runtime::NativeFallbackReason;
 use ms_onnx::NativeDeviceSelection;
 use serde_json::Value;
 
-use super::model::{FallbackCause, NATIVE_FAMILY, SettingKey, SettingWarning, WarningReason};
+use super::model::{FallbackCause, NATIVE_FAMILY, REGISTRATION_FAMILY, SettingKey, SettingWarning, WarningReason};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use super::model::{RegistrationProblem, RegistrationRecord};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+use ms_os_integration::report::{Defect, DefectSeverity, RecordKind, RecordReport, RecordStatus, Scope, badge_worthy};
 use super::runtime::{CheckContext, KeyOutcome};
 use crate::ai_backend_supervisor::{BackendSpawnBlocker, check_backend_spawnable};
 use crate::onnx_caps::{device_id_offered, ep_device_ids, probe_onnx_caps};
 
-/// Runs the checks of `keys` against a fresh config read and returns one outcome per
-/// requested key. A config read failure yields `Skipped` for every key (the previous
-/// warnings stay) and a warning log. Blocking (disk, hardware probes): worker only.
+/// Runs the checks of `keys` and returns one outcome per requested key. The registration
+/// family is checked first from one OS probe, independently of the config; every other key
+/// reads a fresh config, and a config read failure yields `Skipped` for those keys only
+/// (the previous warnings stay) and a warning log. Blocking (disk, registry, hardware
+/// probes): worker only.
 pub(crate) fn run_checks(keys: &BTreeSet<SettingKey>, ctx: CheckContext) -> Vec<(SettingKey, KeyOutcome)> {
+    let mut outcomes = Vec::with_capacity(keys.len());
+    if REGISTRATION_FAMILY.iter().any(|key| keys.contains(key)) {
+        outcomes.extend(check_registration(ctx).into_iter().filter(|(key, _)| keys.contains(key)));
+    }
+
     let cfg = match ms_config::load_raw_user_settings_for_startup() {
         Ok(cfg) => cfg,
         Err(err) => {
+            let config_keys: Vec<SettingKey> =
+                keys.iter().copied().filter(|key| !REGISTRATION_FAMILY.contains(key)).collect();
             runtime_log::log_warn(format!(
-                "settings-warnings: could not read user config; keeping the previous warnings of {keys:?}; error: {err:#}"
+                "settings-warnings: could not read user config; keeping the previous warnings of {config_keys:?}; error: {err:#}"
             ));
-            return keys.iter().map(|key| (*key, KeyOutcome::Skipped)).collect();
+            outcomes.extend(config_keys.into_iter().map(|key| (key, KeyOutcome::Skipped)));
+            return outcomes;
         }
     };
 
-    let mut outcomes = Vec::with_capacity(keys.len());
     if keys.contains(&SettingKey::ProjectsRoot) {
         outcomes.push((SettingKey::ProjectsRoot, check_projects_root(&cfg)));
     }
@@ -341,6 +357,135 @@ pub(crate) fn native_family_reasons(facts: &NativeFacts) -> [(SettingKey, Vec<Wa
     ]
 }
 
+/// Checks the registration family: silent (clean) when `ctx.registration_checks` is off
+/// (`--ignore-installed`: the tab is read-only, so no badge could be cleared there); else
+/// ONE probe of the running copy, mapped by [`registration_reasons`]. When the running
+/// executable cannot be resolved the family is `Skipped` (logged). The version is not
+/// passed: it only feeds `VersionOutdated`, a stale defect that never badges.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn check_registration(ctx: CheckContext) -> Vec<(SettingKey, KeyOutcome)> {
+    if !ctx.registration_checks {
+        return REGISTRATION_FAMILY.iter().map(|key| (*key, KeyOutcome::Checked(Vec::new()))).collect();
+    }
+    match ms_os_integration::CopyIdentity::current(None) {
+        Ok(identity) => {
+            let report = ms_os_integration::report::probe(&identity);
+            registration_reasons(&report.records, report.copy_scope).into_iter().map(|(key, reasons)| (key, checked(key, reasons))).collect()
+        }
+        Err(err) => {
+            runtime_log::log_warn(format!(
+                "settings-warnings: could not resolve the running executable; keeping the previous registration warnings; error: {err}"
+            ));
+            REGISTRATION_FAMILY.iter().map(|key| (*key, KeyOutcome::Skipped)).collect()
+        }
+    }
+}
+
+/// No OS records are checked on this platform: [`REGISTRATION_FAMILY`] is empty here, so
+/// there is nothing to answer.
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+fn check_registration(_ctx: CheckContext) -> Vec<(SettingKey, KeyOutcome)> {
+    Vec::new()
+}
+
+/// The registration rule: one entry per [`REGISTRATION_FAMILY`] key, in that order. A record
+/// is flagged when `badge_worthy` holds AND the System registration tab offers an action on
+/// it (`ms_os_integration::actions::allowed_actions` for the copy's own scope `copy_scope`,
+/// not read-only), so a badge can always be cleared from the tab: a Linux system-wide entry
+/// or an unreadable record never badges. App Paths is filed under `RegistrationProgramEntry`.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) fn registration_reasons(records: &[RecordReport], copy_scope: Scope) -> Vec<(SettingKey, Vec<WarningReason>)> {
+    let mut result: Vec<(SettingKey, Vec<WarningReason>)> =
+        REGISTRATION_FAMILY.iter().map(|key| (*key, Vec::new())).collect();
+    for record in records {
+        // Read-only (`--ignore-installed`) never reaches here: `check_registration` answers
+        // clean before probing.
+        if !badge_worthy(&record.status) || ms_os_integration::actions::allowed_actions(record, copy_scope, false).is_empty() {
+            continue;
+        }
+        let key = registration_key(record.kind);
+        let reason = WarningReason::RegistrationBroken {
+            record: registration_record(record.kind),
+            location: record.location.clone(),
+            problems: registration_problems(&record.status),
+        };
+        match result.iter_mut().find(|(family_key, _)| *family_key == key) {
+            Some((_, reasons)) => reasons.push(reason),
+            // A record kind this platform does not check (e.g. a Windows-only kind in a
+            // Linux report): there is no tab row to clear it from, so it is not flagged.
+            None => runtime_log::log_warn(format!(
+                "settings-warnings: {:?} record at {} is broken but not checked on this platform",
+                record.kind, record.location
+            )),
+        }
+    }
+    result
+}
+
+/// The warning key a record kind is filed under (App Paths folds into the program entry).
+/// The one owner of that mapping: the launcher's System registration tab badges its rows
+/// through it.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[must_use]
+pub fn registration_key(kind: RecordKind) -> SettingKey {
+    match kind {
+        RecordKind::StartMenu => SettingKey::RegistrationStartMenu,
+        RecordKind::ProgramEntry | RecordKind::AppPaths => SettingKey::RegistrationProgramEntry,
+        RecordKind::OpenWith => SettingKey::RegistrationOpenWith,
+    }
+}
+
+/// Maps the native record kind onto its wasm-clean mirror (whose `label` is the record
+/// name the warning tooltip and the launcher's System registration tab both show).
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[must_use]
+pub fn registration_record(kind: RecordKind) -> RegistrationRecord {
+    match kind {
+        RecordKind::StartMenu => RegistrationRecord::StartMenu,
+        RecordKind::ProgramEntry => RegistrationRecord::ProgramEntry,
+        RecordKind::AppPaths => RegistrationRecord::AppPaths,
+        RecordKind::OpenWith => RegistrationRecord::OpenWith,
+    }
+}
+
+/// The problems a badged record shows: for a foreign record whose copy is gone, that copy's
+/// missing executable first; then every BROKEN defect (stale ones never badge), without
+/// duplicates.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn registration_problems(status: &RecordStatus) -> Vec<RegistrationProblem> {
+    let mut problems: Vec<RegistrationProblem> = Vec::new();
+    let defects = match status {
+        RecordStatus::OursBroken(defects) => defects,
+        RecordStatus::OtherCopy { exe, alive, defects } => {
+            if !alive {
+                problems.push(RegistrationProblem::TargetMissing { path: exe.display().to_string() });
+            }
+            defects
+        }
+        RecordStatus::Missing | RecordStatus::OursOk | RecordStatus::OursStale(_) | RecordStatus::Unreadable(_) => {
+            return problems;
+        }
+    };
+    for defect in defects.iter().filter(|defect| defect.severity() == DefectSeverity::Broken) {
+        let problem = match defect {
+            Defect::TargetMissing { path } => RegistrationProblem::TargetMissing { path: path.clone() },
+            Defect::WorkingDirMissing { path } => RegistrationProblem::WorkingDirMissing { path: path.clone() },
+            Defect::ValueMissing { value } => RegistrationProblem::ValueMissing { name: value.name() },
+            Defect::WrongValue { value, expected, found } => {
+                RegistrationProblem::WrongValue { name: value.name(), expected: expected.clone(), found: found.clone() }
+            }
+            Defect::MalformedCommand { command } => RegistrationProblem::MalformedCommand { command: command.clone() },
+            // Always `Stale` (`Defect::severity`), so filtered out above; listed so a new
+            // defect kind forces a decision here.
+            Defect::MissingImageTypes { .. } | Defect::IconMissing | Defect::VersionOutdated { .. } | Defect::WorkingDirOutdated { .. } => continue,
+        };
+        if !problems.contains(&problem) {
+            problems.push(problem);
+        }
+    }
+    problems
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -358,7 +503,7 @@ mod tests {
     const APP_DIR: &str = "/home/u/ManhwaStudio";
 
     fn ctx(ai_enabled: bool, backend_autostart: bool) -> CheckContext {
-        CheckContext { ai_enabled, backend_autostart }
+        CheckContext { ai_enabled, backend_autostart, registration_checks: true }
     }
 
     fn clean_native() -> NativeFacts {
@@ -531,6 +676,160 @@ mod tests {
         assert!(of(&native_family_reasons(&fell_back), SettingKey::OnnxDevice).is_empty());
         let unprobed = NativeFacts { device_offer: None, ..missing };
         assert!(of(&native_family_reasons(&unprobed), SettingKey::OnnxDevice).is_empty());
+    }
+
+    /// Registration-rule fixtures and tests (Windows and Linux: the probe model exists there).
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    mod registration {
+        use std::path::PathBuf;
+
+        use ms_os_integration::report::{Defect, ProbeError, RecordKind, RecordReport, RecordStatus, RecordValue, Scope};
+
+        use super::super::{check_registration, registration_key, registration_reasons};
+        use super::ctx;
+        use crate::settings_warnings::model::{
+            REGISTRATION_FAMILY, RegistrationProblem, RegistrationRecord, SettingKey, WarningReason,
+        };
+        use crate::settings_warnings::runtime::{CheckContext, KeyOutcome};
+
+        const LOCATION: &str = "/home/u/.local/share/applications/manhwastudio_rs.desktop";
+
+        fn record(kind: RecordKind, scope: Scope, status: RecordStatus) -> RecordReport {
+            RecordReport { kind, scope, location: LOCATION.to_string(), status, shadowed: false }
+        }
+
+        fn target_missing() -> Defect {
+            Defect::TargetMissing { path: "/home/u/old/manhwastudio_rs".to_string() }
+        }
+
+        /// The reasons filed under `key`.
+        fn of(result: &[(SettingKey, Vec<WarningReason>)], key: SettingKey) -> Vec<WarningReason> {
+            result.iter().find(|(entry, _)| *entry == key).map(|(_, reasons)| reasons.clone()).unwrap_or_default()
+        }
+
+        #[test]
+        fn one_entry_per_family_key_in_family_order() {
+            let result = registration_reasons(&[], Scope::User);
+            let keys: Vec<SettingKey> = result.iter().map(|(key, _)| *key).collect();
+            assert_eq!(keys.as_slice(), REGISTRATION_FAMILY);
+            assert!(result.iter().all(|(_, reasons)| reasons.is_empty()));
+        }
+
+        #[test]
+        fn only_broken_records_are_flagged() {
+            let records = [
+                record(RecordKind::StartMenu, Scope::User, RecordStatus::Missing),
+                record(RecordKind::StartMenu, Scope::User, RecordStatus::OursOk),
+                record(RecordKind::StartMenu, Scope::User, RecordStatus::OursStale(vec![Defect::IconMissing])),
+                record(RecordKind::OpenWith, Scope::User, RecordStatus::Unreadable(ProbeError::NoDataHome)),
+                record(
+                    RecordKind::OpenWith,
+                    Scope::User,
+                    RecordStatus::OtherCopy { exe: PathBuf::from("/home/u/other/manhwastudio_rs"), alive: true, defects: vec![Defect::IconMissing] },
+                ),
+            ];
+            assert!(registration_reasons(&records, Scope::User).iter().all(|(_, reasons)| reasons.is_empty()));
+        }
+
+        #[test]
+        fn ours_broken_lists_broken_defects_once_and_skips_stale_ones() {
+            let status = RecordStatus::OursBroken(vec![
+                target_missing(),
+                Defect::IconMissing,
+                Defect::ValueMissing { value: RecordValue::DesktopExec },
+                target_missing(),
+            ]);
+            let result = registration_reasons(&[record(RecordKind::StartMenu, Scope::User, status)], Scope::User);
+            assert_eq!(
+                of(&result, SettingKey::RegistrationStartMenu),
+                vec![WarningReason::RegistrationBroken {
+                    record: RegistrationRecord::StartMenu,
+                    location: LOCATION.to_string(),
+                    problems: vec![
+                        RegistrationProblem::TargetMissing { path: "/home/u/old/manhwastudio_rs".to_string() },
+                        RegistrationProblem::ValueMissing { name: "Exec" },
+                    ],
+                }]
+            );
+            assert!(of(&result, SettingKey::RegistrationOpenWith).is_empty());
+        }
+
+        #[test]
+        fn foreign_record_of_a_gone_copy_names_its_missing_program_first() {
+            let exe = PathBuf::from("/home/u/gone/manhwastudio_rs");
+            let status = RecordStatus::OtherCopy {
+                exe: exe.clone(),
+                alive: false,
+                defects: vec![Defect::TargetMissing { path: exe.display().to_string() }, Defect::MalformedCommand { command: "x".to_string() }],
+            };
+            let result = registration_reasons(&[record(RecordKind::OpenWith, Scope::User, status)], Scope::User);
+            let reasons = of(&result, SettingKey::RegistrationOpenWith);
+            assert_eq!(reasons.len(), 1);
+            let Some(WarningReason::RegistrationBroken { problems, record, .. }) = reasons.first() else {
+                panic!("expected a registration reason, got {reasons:?}");
+            };
+            assert_eq!(*record, RegistrationRecord::OpenWith);
+            assert_eq!(
+                problems,
+                &vec![
+                    RegistrationProblem::TargetMissing { path: exe.display().to_string() },
+                    RegistrationProblem::MalformedCommand { command: "x".to_string() },
+                ]
+            );
+        }
+
+        /// Manager rule: a badge must always be clearable from the tab, so a broken record
+        /// the user cannot act on (a Linux system-wide entry) is never flagged.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn linux_system_wide_records_are_never_flagged() {
+            let status = RecordStatus::OursBroken(vec![target_missing()]);
+            let records = [
+                record(RecordKind::StartMenu, Scope::Machine, status.clone()),
+                record(RecordKind::OpenWith, Scope::Machine, status),
+            ];
+            assert!(registration_reasons(&records, Scope::User).iter().all(|(_, reasons)| reasons.is_empty()));
+        }
+
+        /// Windows: all-users rows are actionable (elevated helper), and App Paths folds
+        /// into the program entry under its own record name.
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn windows_machine_rows_flag_and_app_paths_fold_into_the_program_entry() {
+            let status = RecordStatus::OursBroken(vec![target_missing()]);
+            let result = registration_reasons(&[
+                record(RecordKind::ProgramEntry, Scope::Machine, status.clone()),
+                record(RecordKind::AppPaths, Scope::Machine, status),
+            ], Scope::User);
+            let reasons = of(&result, SettingKey::RegistrationProgramEntry);
+            let records: Vec<RegistrationRecord> = reasons
+                .iter()
+                .filter_map(|reason| match reason {
+                    WarningReason::RegistrationBroken { record, .. } => Some(*record),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(records, vec![RegistrationRecord::ProgramEntry, RegistrationRecord::AppPaths]);
+        }
+
+        #[test]
+        fn record_kinds_map_onto_their_keys() {
+            assert_eq!(registration_key(RecordKind::StartMenu), SettingKey::RegistrationStartMenu);
+            assert_eq!(registration_key(RecordKind::ProgramEntry), SettingKey::RegistrationProgramEntry);
+            assert_eq!(registration_key(RecordKind::AppPaths), SettingKey::RegistrationProgramEntry);
+            assert_eq!(registration_key(RecordKind::OpenWith), SettingKey::RegistrationOpenWith);
+        }
+
+        /// Q2: under `--ignore-installed` every registration key is answered clean without
+        /// probing, so an earlier badge is cleared and none appears.
+        #[test]
+        fn registration_checks_off_answers_clean_without_probing() {
+            let off = CheckContext { registration_checks: false, ..ctx(true, false) };
+            let outcomes = check_registration(off);
+            let keys: Vec<SettingKey> = outcomes.iter().map(|(key, _)| *key).collect();
+            assert_eq!(keys.as_slice(), REGISTRATION_FAMILY);
+            assert!(outcomes.iter().all(|(_, outcome)| *outcome == KeyOutcome::Checked(Vec::new())));
+        }
     }
 
     #[test]

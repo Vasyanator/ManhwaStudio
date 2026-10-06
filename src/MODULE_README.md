@@ -391,7 +391,17 @@ visible `--update` and the hidden install/update/uninstall/shortcut service flag
 2. An image to open combined with `--check-venv`, `--test-launcher` or any installed-copy flag
 exits the same way. This runs FIRST because several of those flags act immediately; the decisions
 themselves are the pure, unit-tested `args::conflicting_installed_copy_flags` /
-`args::conflicting_image_flags`.
+`args::conflicting_image_flags`. Right after it, `--system-registration-apply` +
+`--system-registration-result` (hidden pair, also installed-copy flags) run the elevated
+system-registration helper (`ms_os_integration::windows::elevation::run_elevated_helper`) and
+exit with its code, before the scratch sweep or any other side effect; off Windows they exit 2
+with an "unsupported" diagnostic. The helper never initializes the session log (`run_main`
+parses the CLI first and skips `init_startup_logging_best_effort` for it): the init rotates
+`last.log` while the launcher that started the helper still writes it. The helper's outcomes
+reach the log through the launcher, which logs every result-file entry. `--uninstall` (and its
+elevated continuation) keeps the normal init: it logs its own work, and its parent (the
+unelevated `--uninstall`, or the installer's reinstall worker, which starts the INSTALLED copy in
+its install directory) is not writing the same `last.log` in the common case.
 
 Single-image start (plan `dev-docs/single_image_mode_plan.md`, D13): `--image <PATH>`, the
 positional path (what Linux `.desktop` `%f` and Windows "Open with" `"%1"` pass) or the launcher's
@@ -407,9 +417,15 @@ before reporting; an open/decode failure lands on the bootstrap error screen as
 session refuses the structural-operation reload (logged). `ReturnToLauncher` clears every CLI open
 target. Stale scratch sessions of crashed runs are swept once per start on a worker
 (`spawn_stale_scratch_sweep`, right after the flag check; lock-guarded, so another live instance
-is safe). The Linux desktop entry (`linux_desktop_entry_text`, pure and tested) uses `Exec=… %f`
-and a `MimeType=` list built from `ms_config::single_image::INPUT_FILE_TYPES`; it only OFFERS the
-program in "Open with" (best-effort `update-desktop-database` afterwards), never sets a default.
+is safe). The Linux desktop entry is owned by `ms-os-integration` (`linux::desktop_entry` text and
+ownership rule, `linux::xdg` writer); `main.rs` only runs `ensure_at_startup` for
+`CopyIdentity::current` on the `desktop-integration-installer` worker
+(`install_linux_desktop_integration_async`) and logs its `StartupOutcome`. Policy: create when
+missing, refresh only an entry of THIS copy (`X-ManhwaStudio-Exe=`, or a legacy `Exec=`) whose
+text differs, never take over another copy's entry (alive or not), write under `$XDG_DATA_HOME`.
+The entry uses `Exec=… %f` and a `MimeType=` list built from
+`ms_config::single_image::INPUT_FILE_TYPES`; it only OFFERS the program in "Open with"
+(`update-desktop-database` only after a write), never sets a default.
 
 Two startup flags change that routing:
 - `--check-venv` is TERMINAL: it checks the environment (`ms-installer`'s `venv_check`), exits 0 with a printed
@@ -571,8 +587,9 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
 - Single-image saving, its top bar, exit dialog, hidden tabs and save hotkeys: `single_image/`
   (hooks in `app.rs`: `tab_visible`, `draw_tab_bar`, `draw_exit_dialog`, `ui` tick, `on_exit`).
 - Single-image start (CLI, launcher pick, scratch lifetime, desktop entry): `main.rs`
-  (`resolve_startup_target`, the `run_main` loop, `linux_desktop_entry_text`), `args.rs`
-  (`open_target` group), `studio_bootstrap.rs` (`StudioOpenRequest`, `spawn_open_thread`).
+  (`resolve_startup_target`, the `run_main` loop), `args.rs`
+  (`open_target` group), `studio_bootstrap.rs` (`StudioOpenRequest`, `spawn_open_thread`); the
+  desktop entry's text and writer: `crates/ms-os-integration/src/linux/`.
 - What the application reports as its version, or which sites may see the git suffix:
   `crates/ms-config/src/version_format.rs` (the pure rules) + `build.rs` (git probing and rerun
   watches); then the

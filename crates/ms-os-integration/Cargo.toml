@@ -1,0 +1,52 @@
+[package]
+name = "ms-os-integration"
+version = "0.1.0"
+edition = "2024"
+
+# The OS records of a ManhwaStudio program copy, extracted from
+# `crates/ms-installer/src/utils.rs`: the Windows Uninstall / App Paths / "Open with"
+# registry keys, the `ManhwaStudio.lnk` shortcuts, the elevation helpers and the product
+# names they all share. GUI-free and egui-free: callers own their threads, progress
+# reporting and user-facing presentation; this crate only computes names and values,
+# performs the OS writes and deletes, and returns typed errors.
+#
+# It sits at the `ms-sysprobe` level, BELOW every consumer (the installer, the binary, the
+# settings warnings and the launcher's System registration tab), so none of them has to
+# depend on the eframe-based installer just to name or check a registry key.
+#
+# Native-only: no OS registration exists in the web build, so every dependency sits in a
+# native target table and the I/O modules are gated off `wasm32`.
+[dependencies]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# `single_image::input_extensions()`: the one table of readable input types, which the
+# "Open with" `SupportedTypes` values list.
+ms-config = { path = "../ms-config" }
+# Diagnostics of the registry probes and of the entries left in place on uninstall
+# (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# `IntegrationError::user_message` renders the SAME `installer.utils.*` catalog texts the
+# installer showed before the extraction; the macros are mounted crate-wide via
+# `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# `IntegrationError` is a typed public error.
+thiserror.workspace = true
+# The elevated system-registration helper's result file (`actions`: a small JSON document the
+# elevated process writes and the requesting process reads back).
+serde.workspace = true
+serde_json.workspace = true
+
+# Native registry I/O in the 64-bit view (`RegCreateKeyExW` / `RegSetValueExW` /
+# `RegDeleteTreeW` / `RegGetValueW`; `Win32_Security` for the create call's attributes
+# type), the Explorer association refresh (`SHChangeNotify`), token elevation inspection
+# (`GetTokenInformation`), the UAC relaunch (`ShellExecuteW`) and the elevated helper launch
+# (`ShellExecuteExW`, `WaitForSingleObject`, `GetExitCodeProcess`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+# Native `.lnk` shortcuts (`windows::shortcut`): `IShellLinkW` + `IPersistFile` over COM
+# (`Win32_System_Com`; `Win32_Storage_FileSystem` for `IShellLinkW::GetPath`) and the
+# shell's known folders (`SHGetKnownFolderPath`, `Win32_UI_Shell`; `Win32_Foundation` for
+# `RPC_E_CHANGED_MODE`). The COM interfaces exist only in `windows`, not in `windows-sys`.
+# Single-manifest dependency, so it stays local (root `Cargo.toml` header rule). Pinned to the
+# 0.62 line eframe's accesskit already puts in the Windows graph, so it never adds a second copy.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Shell"] }

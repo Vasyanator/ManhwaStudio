@@ -10,6 +10,7 @@ Main responsibilities:
 - hold non-blocking page transition state for animated page navigation;
 - track detached launcher windows that live outside the page stack.
 - carry launcher exit intent back to the startup flow;
+- carry the process facts the launcher needs from startup (`LauncherHost`);
 - remember which storage-conversion failure notice the main page already dismissed.
 - say whether a surface that can create the projects folder is open
   (`project_creator_open`, the edge the settings-warnings recheck of that folder uses).
@@ -53,6 +54,18 @@ pub enum LauncherOutcome {
     /// file when picked; decodability is left to the studio loading screen. Never produced by
     /// the wasm build (no picker there).
     OpenImage(PathBuf),
+}
+
+/// Facts about the running process the launcher cannot derive itself, handed in by
+/// `main.rs` / `web_entry.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LauncherHost {
+    /// `--ignore-installed`: the launcher never modifies the OS records of an installed copy;
+    /// the System registration tab is read-only and its warnings are silent.
+    pub ignore_installed: bool,
+    /// This build's version core (`version_format::version_core` of `CARGO_PKG_VERSION`):
+    /// the `DisplayVersion` a written Uninstall entry carries.
+    pub version_core: &'static str,
 }
 
 #[derive(Debug)]

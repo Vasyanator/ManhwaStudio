@@ -12,7 +12,7 @@ slow stale run can never overwrite a newer recheck.
 
 Key items:
 - `CheckContext`: GUI-side facts the worker cannot read from config (`--no-ai`, the
-  supervisor's autostart value).
+  supervisor's autostart value, `--ignore-installed`).
 - `SettingsWarnings`: `start`, `disabled`, `recheck`, `poll`, `set`.
 - `KeyOutcome` / `CheckRequest` / `CheckBatch`: the channel messages.
 - `coalesce` / `worker_loop`: the worker side (native only).
@@ -47,14 +47,22 @@ pub struct CheckContext {
     /// The supervisor's current autostart toggle (it persists the toggle asynchronously,
     /// so config may still hold the old value).
     pub backend_autostart: bool,
+    /// `false` under `--ignore-installed`: the System registration tab is read-only then,
+    /// so every registration check is silent (a badge must be clearable from its tab).
+    pub registration_checks: bool,
 }
 
 impl CheckContext {
     /// Captures the context from the app-global backend handle (one short mutex read of
-    /// the process snapshot; GUI thread safe).
+    /// the process snapshot; GUI thread safe) plus `registration_checks` (`false` when the
+    /// process runs with `--ignore-installed`).
     #[must_use]
-    pub fn from_handle(handle: &AiBackendHandle) -> Self {
-        Self { ai_enabled: handle.ai_enabled, backend_autostart: handle.process_snapshot().auto_start() }
+    pub fn from_handle(handle: &AiBackendHandle, registration_checks: bool) -> Self {
+        Self {
+            ai_enabled: handle.ai_enabled,
+            backend_autostart: handle.process_snapshot().auto_start(),
+            registration_checks,
+        }
     }
 }
 
@@ -147,7 +155,7 @@ impl SettingsWarnings {
         }
         let mut warnings =
             Self { request_tx: Some(request_tx), result_rx: Some(result_rx), ..Self::disabled() };
-        warnings.queue(&SettingKey::ALL, ctx);
+        warnings.queue(SettingKey::ALL, ctx);
         warnings
     }
 
@@ -355,7 +363,7 @@ mod tests {
     use super::{CheckBatch, CheckContext, CheckRequest, KeyOutcome, SettingsWarnings, coalesce, worker_loop};
     use crate::settings_warnings::model::{SettingChange, SettingKey, SettingWarning, WarningLevel, WarningReason};
 
-    const CTX: CheckContext = CheckContext { ai_enabled: true, backend_autostart: true };
+    const CTX: CheckContext = CheckContext { ai_enabled: true, backend_autostart: true, registration_checks: true };
 
     /// A live instance whose worker side is the test: requests come out of the
     /// returned receiver, results go in through the returned sender.
@@ -381,7 +389,7 @@ mod tests {
     #[test]
     fn stale_full_run_does_not_overwrite_a_newer_recheck() {
         let (mut warnings, requests, results) = hand_fed();
-        warnings.queue(&SettingKey::ALL, CTX);
+        warnings.queue(SettingKey::ALL, CTX);
         warnings.recheck(&[SettingChange::UiLanguage], CTX);
         let full = requests.try_recv().map(|request| request.generations).unwrap_or_default();
         let recheck = requests.try_recv().map(|request| request.generations).unwrap_or_default();
@@ -432,7 +440,7 @@ mod tests {
         let request = requests.try_recv();
         assert!(request.is_ok());
         let Ok(request) = request else { return };
-        assert_eq!(request.ctx, CheckContext { ai_enabled: true, backend_autostart: false });
+        assert_eq!(request.ctx, CheckContext { backend_autostart: false, ..CTX });
         let keys: Vec<SettingKey> = request.generations.keys().copied().collect();
         assert_eq!(keys, vec![SettingKey::AiRuntime, SettingKey::BackendAutostart]);
     }
@@ -441,8 +449,8 @@ mod tests {
     /// different contexts land in separate groups.
     #[test]
     fn coalesce_keeps_the_context_of_each_key_s_latest_request() {
-        let on = CheckContext { ai_enabled: true, backend_autostart: true };
-        let off = CheckContext { ai_enabled: true, backend_autostart: false };
+        let on = CTX;
+        let off = CheckContext { backend_autostart: false, ..CTX };
         let request = |ctx: CheckContext, generation: u64, keys: &[SettingKey]| CheckRequest {
             generations: keys.iter().map(|key| (*key, generation)).collect(),
             ctx,
@@ -469,8 +477,8 @@ mod tests {
     #[test]
     fn explicit_autostart_wins_over_later_stale_snapshot_contexts() {
         let (mut warnings, requests, results) = hand_fed();
-        let stale = CheckContext { ai_enabled: true, backend_autostart: true };
-        warnings.queue(&SettingKey::ALL, stale);
+        let stale = CTX;
+        warnings.queue(SettingKey::ALL, stale);
         warnings.recheck(&[SettingChange::BackendAutostart(false)], stale);
         warnings.recheck(&[SettingChange::OnnxBuild], stale);
         warnings.recheck(&[SettingChange::AiInstallType], stale);

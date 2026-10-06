@@ -74,7 +74,10 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   kernel (`ms_tools::red_black_sor_sweeps`), pixel-inspection threshold and grid
   (`ms_canvas::pixel_inspection_recommended_for`, `pixel_grid::draw_pixel_grid`), page <-> clean
   binding (`ms_page_ops::clean_binding` + `ms_models::clean_assign`), text-detection scale and
-  tiling decision (`ms_text_detect::plan_detection`, used by the detector worker and panel notice).
+  tiling decision (`ms_text_detect::plan_detection`, used by the detector worker and panel notice),
+  OS integration records — record names (`ms_os_integration::identity`), expected registry
+  values (`ms_os_integration::windows::values`) and the "Open with" ownership rule
+  (`open_with_command_targets_install`); no other crate spells a record name or builds its values.
 - Python backend on ROCm: never advise or enable `expandable_segments:True`; checkpoint weights
   move to the GPU only via `modules/ai_backend/runtime/rocm_mmap_transfer.py`; every
   user-facing backend error text passes through `runtime/error_text.py::sanitize_torch_error`.

@@ -11,7 +11,7 @@ ManhwaStudio is a desktop editor for translating comics (manga / manhwa): a chap
 translated (bubbles, OCR, machine translation), cleaned (clean layers, inpainting), typeset
 (rendered text layers) and exported.
 
-- **Rust application** — a Cargo workspace: the thin binary `manhwastudio_rs` (`src/`) over 37
+- **Rust application** — a Cargo workspace: the thin binary `manhwastudio_rs` (`src/`) over 38
   `ms-*` library crates in `crates/`. Builds for Linux and Windows (mandatory), macOS, and
   `wasm32` (web entry, `src/web_entry.rs`).
 - **Python AI backend** — an optional separate process (`ai_backend.py` + `modules/ai_backend/`)
@@ -44,7 +44,7 @@ bin (src/: main.rs, app.rs, studio_bootstrap.rs, tabs/settings/, web_entry.rs)
   <- ms-canvas
   <- ms-models / ms-tabs-simple / ms-installer / ms-ai-api
   <- ms-project / ms-widgets / ms-native-runtime
-  <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry
+  <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration
   <- ms-config / ms-text-render
   <- ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx
   <- ms-log / ms-text-detect
@@ -94,6 +94,12 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   `python_manager` is the only way to find or spawn Python.
 - `ms-onnx-runtime` — locates, downloads and loads the native onnxruntime library per build.
 - `ms-window-geometry` — startup monitor and window geometry; the only direct `winit` user.
+- `ms-os-integration` — the OS records of a program copy (Windows Uninstall / App Paths /
+  "Open with" keys, `.lnk` shortcuts, elevation probe and UAC relaunch; Linux `.desktop` entry
+  and icon): names, expected values, writes and removal, the read-only probe (`report`) and the
+  action rules + elevated helper (`actions`). GUI-free. Consumers: the installer (per install
+  kind), the binary (Linux startup entry, helper routing), `ms-settings-ui` (registration
+  warnings) and `ms-launcher` (System registration tab).
 - `ms-project` — `ProjectData`, `ComicType`, `CanvasSettings`, project scan, save-merge.
 - `ms-widgets` — project widget set (`panel_dock`, `Wheel*`, `AiButton`, spellchecked edits),
   `ui_fonts`, hotkey registry (`InputManagerV2`).
@@ -378,6 +384,7 @@ logged error); the GUI thread only polls and applies results.
 | Cloud image-edit run (submit, poll, download, exact-size finish) | `ms-tab-cleaning/src/tools/ai_api_editor` + `ms_ai_api::image_edit` |
 | Characters / Notes / Wiki background work | `ms-tabs-simple` |
 | Batch processing of new projects | `ms-launcher/src/new_project/batch_processing/` |
+| System-registration probe / actions / elevated helper (`ShellExecuteExW` round trip + result file) | `ms-os-integration` (`report`, `actions`, `windows/elevation.rs`), driven by `ms-launcher/src/pages/system_registration.rs` and `settings_warnings` |
 | Settings warnings checks (full run per launcher entry, per-unit rechecks) | `ms-settings-ui/src/settings_warnings/`, driven by `ms-launcher/src/pages/settings_page.rs` |
 
 ## 12. Key invariants
@@ -393,9 +400,10 @@ logged error); the GUI thread only polls and applies results.
 - `CanvasView` is the one canvas engine; tab behaviour plugs in via `CanvasHooks`.
 - One owner per rule: the page <-> clean binding (`clean_binding` + `clean_assign`), Python
   lookup and spawn (`ms_sysprobe::python_manager`), semantic colours (`ms-theme`), `winit`
-  (`ms-window-geometry`), glyph rendering fonts (`ms-fonts` + `ms-text-render`), layer composite
-  order / visibility / group fold (`ms_models::layer_model::ordering`, consumed by the typing
-  canvas, the typing flatten/export and the PS composite, layers tree and structural order).
+  (`ms-window-geometry`), OS integration records (`ms-os-integration`), glyph rendering fonts
+  (`ms-fonts` + `ms-text-render`), layer composite order / visibility / group fold
+  (`ms_models::layer_model::ordering`, consumed by the typing canvas, the typing
+  flatten/export and the PS composite, layers tree and structural order).
   Layer and group visibility/opacity are `LayerDoc` facts, never one tab's view state.
 
 **Documents**

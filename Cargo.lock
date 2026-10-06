@@ -3402,6 +3402,7 @@ dependencies = [
  "ms-native-runtime",
  "ms-onnx",
  "ms-onnx-runtime",
+ "ms-os-integration",
  "ms-page-ops",
  "ms-project",
  "ms-settings-ui",
@@ -3711,6 +3712,7 @@ dependencies = [
  "ms-docstore",
  "ms-i18n",
  "ms-log",
+ "ms-os-integration",
  "ms-sysprobe",
  "ms-theme",
  "ms-thread",
@@ -3722,7 +3724,6 @@ dependencies = [
  "tempfile",
  "ureq",
  "web-time",
- "windows-sys 0.59.0",
  "zip",
  "zstd",
 ]
@@ -3746,6 +3747,7 @@ dependencies = [
  "ms-i18n",
  "ms-installer",
  "ms-log",
+ "ms-os-integration",
  "ms-page-ops",
  "ms-project",
  "ms-settings-ui",
@@ -3859,6 +3861,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-os-integration"
+version = "0.1.0"
+dependencies = [
+ "ms-config",
+ "ms-i18n",
+ "ms-log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "windows",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "ms-page-ops"
 version = "0.1.0"
 dependencies = [
@@ -3914,6 +3930,7 @@ dependencies = [
  "ms-native-runtime",
  "ms-onnx",
  "ms-onnx-runtime",
+ "ms-os-integration",
  "ms-project",
  "ms-sysprobe",
  "ms-tab-translation",

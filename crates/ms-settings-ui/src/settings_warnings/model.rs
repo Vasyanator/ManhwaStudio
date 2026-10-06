@@ -10,7 +10,9 @@ launcher only read it.
 
 Key items:
 - `SettingKey` + `SettingLocation` / `SettingGroupId`: the checked items and their place.
-- `WarningLevel`, `WarningReason` (+ `FallbackCause`), `SettingWarning`: one flagged fact.
+  `NATIVE_FAMILY` / `REGISTRATION_FAMILY`: keys evaluated together.
+- `WarningLevel`, `WarningReason` (+ `FallbackCause`, `RegistrationRecord`,
+  `RegistrationProblem`), `SettingWarning`: one flagged fact.
   The level has ONE owner, `WarningReason::level()`; the text is localized at draw time by
   `WarningReason::message()`, so a UI-language switch re-renders it.
 - `SettingChange` + `affected_keys()`: what a pane reports after a write landed, and which
@@ -19,7 +21,11 @@ Key items:
   `overall_level`, all through one `worst_where`).
 
 Notes:
-`FallbackCause` mirrors `ms_native_runtime::NativeFallbackReason`, which is native-only.
+`FallbackCause` mirrors `ms_native_runtime::NativeFallbackReason`, and `RegistrationRecord` /
+`RegistrationProblem` mirror `ms_os_integration::report::{RecordKind, Defect}`; both owners
+are native-only. `SettingKey::ALL` and `REGISTRATION_FAMILY` are platform-filtered: the
+registration keys exist on Windows (three) and Linux (two, no installed-programs entry), and
+never on macOS or the web build, which therefore never request them.
 */
 
 use std::collections::BTreeMap;
@@ -46,6 +52,14 @@ pub enum SettingKey {
     OnnxDevice,
     /// `General.ort_load_state`: the ORT crash guard of the effective selection.
     OrtCrashGuard,
+    /// The OS record that starts this copy from the menu: the Start-menu `.lnk` (Windows)
+    /// or the `.desktop` application entry (Linux).
+    RegistrationStartMenu,
+    /// The installed-programs (Uninstall) entry and the App Paths entry (Windows only).
+    RegistrationProgramEntry,
+    /// The "Open with" registration for images: the `Applications\…` key (Windows) or the
+    /// `.desktop` entry's `MimeType=` / file-accepting `Exec=` (Linux).
+    RegistrationOpenWith,
 }
 
 /// The ONNX keys that come from one native selection evaluation and are therefore
@@ -53,22 +67,63 @@ pub enum SettingKey {
 pub const NATIVE_FAMILY: [SettingKey; 4] =
     [SettingKey::OnnxBuild, SettingKey::OnnxProvider, SettingKey::OnnxDevice, SettingKey::OrtCrashGuard];
 
+/// The system-registration keys of this platform: they come from ONE probe of the OS
+/// records and are therefore re-evaluated together. Windows: all three; Linux: no
+/// installed-programs entry exists; elsewhere (macOS, web) none.
+#[cfg(target_os = "windows")]
+pub const REGISTRATION_FAMILY: &[SettingKey] =
+    &[SettingKey::RegistrationStartMenu, SettingKey::RegistrationProgramEntry, SettingKey::RegistrationOpenWith];
+/// The system-registration keys of this platform (see the Windows declaration).
+#[cfg(target_os = "linux")]
+pub const REGISTRATION_FAMILY: &[SettingKey] = &[SettingKey::RegistrationStartMenu, SettingKey::RegistrationOpenWith];
+/// The system-registration keys of this platform (see the Windows declaration).
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub const REGISTRATION_FAMILY: &[SettingKey] = &[];
+
+/// The keys checked on every platform, in declaration order.
+const PORTABLE_KEYS: [SettingKey; 8] = [
+    SettingKey::ProjectsRoot,
+    SettingKey::UiLanguage,
+    SettingKey::AiRuntime,
+    SettingKey::BackendAutostart,
+    SettingKey::OnnxBuild,
+    SettingKey::OnnxProvider,
+    SettingKey::OnnxDevice,
+    SettingKey::OrtCrashGuard,
+];
+
+/// Length of [`SettingKey::ALL`] on this platform.
+const ALL_LEN: usize = PORTABLE_KEYS.len() + REGISTRATION_FAMILY.len();
+
+/// [`PORTABLE_KEYS`] followed by [`REGISTRATION_FAMILY`], built at compile time so the
+/// platform filter has one owner (the family) instead of one full list per platform. Index
+/// loops because iterators are not available in a const initializer; every index is bounded
+/// by its source length and `ALL_LEN` is their sum.
+const ALL_KEYS: [SettingKey; ALL_LEN] = {
+    let mut keys = [SettingKey::ProjectsRoot; ALL_LEN];
+    let mut index = 0;
+    while index < PORTABLE_KEYS.len() {
+        keys[index] = PORTABLE_KEYS[index];
+        index += 1;
+    }
+    let mut family_index = 0;
+    while family_index < REGISTRATION_FAMILY.len() {
+        keys[PORTABLE_KEYS.len() + family_index] = REGISTRATION_FAMILY[family_index];
+        family_index += 1;
+    }
+    keys
+};
+
 impl SettingKey {
-    /// Every checked key, in declaration order (the full run at launcher entry).
-    pub const ALL: [SettingKey; 8] = [
-        SettingKey::ProjectsRoot,
-        SettingKey::UiLanguage,
-        SettingKey::AiRuntime,
-        SettingKey::BackendAutostart,
-        SettingKey::OnnxBuild,
-        SettingKey::OnnxProvider,
-        SettingKey::OnnxDevice,
-        SettingKey::OrtCrashGuard,
-    ];
+    /// Every key checked on this platform, in declaration order (the full run at launcher
+    /// entry). The registration keys are included only where [`REGISTRATION_FAMILY`] has
+    /// them.
+    pub const ALL: &'static [SettingKey] = &ALL_KEYS;
 
     /// Where the key's item is drawn. Every key lives in a section the launcher always
-    /// lists (General or AiBackend), so a badge never propagates from a hidden tab; no
-    /// key belongs to a group yet.
+    /// lists on the platforms that check it (General, AiBackend, and SystemRegistration on
+    /// Windows / Linux), so a badge never propagates from a hidden tab; no key belongs to a
+    /// group yet.
     #[must_use]
     pub const fn location(self) -> SettingLocation {
         let section = match self {
@@ -79,6 +134,9 @@ impl SettingKey {
             | SettingKey::OnnxProvider
             | SettingKey::OnnxDevice
             | SettingKey::OrtCrashGuard => SettingsSectionId::AiBackend,
+            SettingKey::RegistrationStartMenu
+            | SettingKey::RegistrationProgramEntry
+            | SettingKey::RegistrationOpenWith => SettingsSectionId::SystemRegistration,
         };
         SettingLocation { section, group: None }
     }
@@ -142,6 +200,79 @@ impl FallbackCause {
     }
 }
 
+/// Which OS record a registration warning is about. A wasm-clean mirror of
+/// `ms_os_integration::report::RecordKind` (native-only); App Paths keeps its own name although
+/// it is filed under [`SettingKey::RegistrationProgramEntry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationRecord {
+    /// The Start-menu shortcut (Windows) / application-menu entry (Linux).
+    StartMenu,
+    /// The installed-programs entry (Windows).
+    ProgramEntry,
+    /// The App Paths entry (Windows).
+    AppPaths,
+    /// The "Open with" registration for images.
+    OpenWith,
+}
+
+impl RegistrationRecord {
+    /// The localized record name. The keys are shared with the launcher's System
+    /// registration tab, which titles its rows with them.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            // The record is a `.lnk` in the Start menu on Windows and a `.desktop`
+            // application-menu entry on Linux: the name follows what the user sees.
+            #[cfg(target_os = "windows")]
+            RegistrationRecord::StartMenu => t!("launcher.sysreg.start_menu_title"),
+            #[cfg(not(target_os = "windows"))]
+            RegistrationRecord::StartMenu => t!("launcher.sysreg.app_menu_title"),
+            RegistrationRecord::ProgramEntry => t!("launcher.sysreg.program_entry_title"),
+            RegistrationRecord::AppPaths => t!("launcher.sysreg.app_paths_title"),
+            RegistrationRecord::OpenWith => t!("launcher.sysreg.open_with_title"),
+        }
+    }
+}
+
+/// Why a registration record does not work: a wasm-clean mirror of the BROKEN
+/// `ms_os_integration::report::Defect`s (stale ones never badge, so they have no mirror).
+/// Strings are display-ready paths and values; `name` is the technical value name
+/// (`RecordValue::name`, never translated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationProblem {
+    /// The program the record launches does not exist (also: a foreign record whose
+    /// owning copy is gone).
+    TargetMissing { path: String },
+    /// The working directory the record starts in does not exist.
+    WorkingDirMissing { path: String },
+    /// A value the record cannot work without is absent.
+    ValueMissing { name: &'static str },
+    /// A launch-relevant value differs from what the owning copy writes.
+    WrongValue { name: &'static str, expected: String, found: String },
+    /// A command line that cannot be run.
+    MalformedCommand { command: String },
+}
+
+impl RegistrationProblem {
+    /// The localized fragment substituted into the registration tooltip. The keys are
+    /// shared with the launcher's System registration tab (defect details).
+    fn label(&self) -> String {
+        match self {
+            RegistrationProblem::TargetMissing { path } => tf!("launcher.sysreg.defect.target_missing_label", path = path),
+            RegistrationProblem::WorkingDirMissing { path } => {
+                tf!("launcher.sysreg.defect.workdir_missing_label", path = path)
+            }
+            RegistrationProblem::ValueMissing { name } => tf!("launcher.sysreg.defect.value_missing_label", name = name),
+            RegistrationProblem::WrongValue { name, expected, found } => {
+                tf!("launcher.sysreg.defect.wrong_value_label", name = name, expected = expected, found = found)
+            }
+            RegistrationProblem::MalformedCommand { command } => {
+                tf!("launcher.sysreg.defect.bad_command_label", command = command)
+            }
+        }
+    }
+}
+
 /// One flagged fact about a setting, with the data its message needs. Strings carry
 /// display-ready values (paths, tags, slugs) captured by the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +299,9 @@ pub enum WarningReason {
     NativeCpuFallback { reason: FallbackCause },
     /// The persisted device id is not among the devices the EP offers now.
     DeviceMissing { device: String, available: usize },
+    /// An OS record of this copy (or one left by a copy that is gone) does not work.
+    /// `location` is the registry key or file path; `problems` is never empty.
+    RegistrationBroken { record: RegistrationRecord, location: String, problems: Vec<RegistrationProblem> },
 }
 
 impl WarningReason {
@@ -185,7 +319,8 @@ impl WarningReason {
             | WarningReason::UiCatalogEmbedded { .. }
             | WarningReason::UiCatalogEnglish { .. }
             | WarningReason::NativeCpuFallback { .. }
-            | WarningReason::DeviceMissing { .. } => WarningLevel::Yellow,
+            | WarningReason::DeviceMissing { .. }
+            | WarningReason::RegistrationBroken { .. } => WarningLevel::Yellow,
         }
     }
 
@@ -227,6 +362,16 @@ impl WarningReason {
             WarningReason::DeviceMissing { device, available } => {
                 tf!("settings.warnings.device_missing_tooltip", device = device, available = available)
             }
+            WarningReason::RegistrationBroken { record, location, problems } => {
+                let detail = problems.iter().map(RegistrationProblem::label).collect::<Vec<_>>().join("; ");
+                tf!(
+                    "settings.warnings.system_registration_broken_tooltip",
+                    record = record.label(),
+                    location = location,
+                    detail = detail,
+                    tab = t!("launcher.settings.tab_system_registration")
+                )
+            }
         }
     }
 }
@@ -261,6 +406,9 @@ pub enum SettingChange {
     OrtGuardReset,
     /// The AI install type changed (install / uninstall flow).
     AiInstallType,
+    /// An action of the System registration tab finished (success, failure or a declined
+    /// elevation): the OS records are probed again.
+    SystemRegistration,
 }
 
 impl SettingChange {
@@ -284,6 +432,7 @@ impl SettingChange {
                 &NATIVE_FAMILY
             }
             SettingChange::AiInstallType => &[SettingKey::AiRuntime, SettingKey::BackendAutostart],
+            SettingChange::SystemRegistration => REGISTRATION_FAMILY,
         }
     }
 }
@@ -355,7 +504,8 @@ impl WarningSet {
 #[cfg(test)]
 mod tests {
     use super::{
-        NATIVE_FAMILY, SettingChange, SettingKey, SettingWarning, WarningLevel, WarningReason, WarningSet,
+        NATIVE_FAMILY, REGISTRATION_FAMILY, RegistrationProblem, RegistrationRecord, SettingChange, SettingKey,
+        SettingWarning, WarningLevel, WarningReason, WarningSet,
     };
     use crate::settings_shared::{SettingsSectionId, SettingsSurface, sections_for};
 
@@ -370,7 +520,7 @@ mod tests {
     #[test]
     fn empty_set_is_clean_everywhere() {
         let set = WarningSet::default();
-        for key in SettingKey::ALL {
+        for &key in SettingKey::ALL {
             assert_eq!(set.item_level(key), None);
             assert!(set.for_key(key).is_empty());
             assert_eq!(set.tooltip_text(key), None);
@@ -413,18 +563,24 @@ mod tests {
         assert_eq!(text.lines().count(), 2, "{text}");
     }
 
-    /// Every key must live in a section the launcher always lists (never TorchUpgrade,
-    /// which hides with the AI install type), and no key uses the reserved group level.
+    /// Every key checked on this platform must live in a section the launcher lists here
+    /// and never hides (General, AiBackend, SystemRegistration — never TorchUpgrade, which
+    /// hides with the AI install type), and no key uses the reserved group level.
+    /// SystemRegistration joined the set deliberately (system-registration plan, F3): its
+    /// keys exist only where its row is listed.
     #[test]
     fn every_key_maps_to_an_always_listed_launcher_section() {
         let launcher: Vec<SettingsSectionId> =
             sections_for(SettingsSurface::Launcher).iter().map(|descriptor| descriptor.id).collect();
-        for key in SettingKey::ALL {
+        for &key in SettingKey::ALL {
             let location = key.location();
             assert!(launcher.contains(&location.section), "{key:?}");
             assert!(
-                matches!(location.section, SettingsSectionId::General | SettingsSectionId::AiBackend),
-                "{key:?} must stay in General or AiBackend"
+                matches!(
+                    location.section,
+                    SettingsSectionId::General | SettingsSectionId::AiBackend | SettingsSectionId::SystemRegistration
+                ),
+                "{key:?} must stay in General, AiBackend or SystemRegistration"
             );
             assert_eq!(location.group, None, "{key:?}");
         }
@@ -444,6 +600,47 @@ mod tests {
             assert_eq!(change.affected_keys(), &NATIVE_FAMILY, "{change:?}");
         }
         assert_eq!(SettingChange::AiInstallType.affected_keys(), &[K::AiRuntime, K::BackendAutostart]);
+        assert_eq!(SettingChange::SystemRegistration.affected_keys(), REGISTRATION_FAMILY);
+    }
+
+    /// The registration keys are platform-filtered: Windows checks three records, Linux two
+    /// (no installed-programs entry), every other target none; `ALL` carries exactly the
+    /// family after the portable keys, and every family key draws on SystemRegistration.
+    #[test]
+    fn registration_family_is_platform_filtered_and_part_of_all() {
+        use SettingKey as K;
+        #[cfg(target_os = "windows")]
+        let expected: &[SettingKey] = &[K::RegistrationStartMenu, K::RegistrationProgramEntry, K::RegistrationOpenWith];
+        #[cfg(target_os = "linux")]
+        let expected: &[SettingKey] = &[K::RegistrationStartMenu, K::RegistrationOpenWith];
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let expected: &[SettingKey] = &[];
+        assert_eq!(REGISTRATION_FAMILY, expected);
+        let portable = SettingKey::ALL.len() - REGISTRATION_FAMILY.len();
+        assert_eq!(&SettingKey::ALL[portable..], REGISTRATION_FAMILY);
+        assert!(SettingKey::ALL[..portable].iter().all(|key| !REGISTRATION_FAMILY.contains(key)));
+        for &key in REGISTRATION_FAMILY {
+            assert_eq!(key.location().section, SettingsSectionId::SystemRegistration, "{key:?}");
+        }
+    }
+
+    /// A registration warning is Yellow (Q1 of the plan) and aggregates on the
+    /// SystemRegistration tab only.
+    #[test]
+    fn registration_broken_is_yellow_on_its_tab() {
+        let reason = WarningReason::RegistrationBroken {
+            record: RegistrationRecord::OpenWith,
+            location: "/home/u/.local/share/applications/manhwastudio_rs.desktop".to_string(),
+            problems: vec![
+                RegistrationProblem::TargetMissing { path: "/home/u/gone/manhwastudio_rs".to_string() },
+                RegistrationProblem::ValueMissing { name: "Exec" },
+            ],
+        };
+        assert_eq!(reason.level(), WarningLevel::Yellow);
+        let mut set = WarningSet::default();
+        set.replace_key(SettingKey::RegistrationOpenWith, vec![SettingWarning { key: SettingKey::RegistrationOpenWith, reason }]);
+        assert_eq!(set.section_level(SettingsSectionId::SystemRegistration), Some(WarningLevel::Yellow));
+        assert_eq!(set.section_level(SettingsSectionId::General), None);
     }
 
     #[test]

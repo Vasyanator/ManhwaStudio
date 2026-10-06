@@ -20,8 +20,12 @@ and screens but fixes the target to the given root, starts on the dependency-pro
 
 `utils.rs` owns the non-UI installer/update backend: release lookup, downloads, executable
 replacement handoff, archive extraction, managed Python/venv setup, static dependency
-installation, optional full PyTorch setup, elevation helpers, Windows shortcuts/registry
-integration, and uninstall cleanup.
+installation, optional full PyTorch setup, the install-continuation elevation wrappers, the
+sequencing of the Windows integration inside install and uninstall, and uninstall cleanup. The
+Windows records themselves (registry keys, `.lnk` shortcuts, elevation probe and UAC relaunch,
+their names and values) are owned by `ms-os-integration` (`crates/ms-os-integration/src/`);
+`utils.rs` and `install.rs` only call them and turn `IntegrationError::user_message()` into
+their messages.
 Launcher settings reuse the same `utils.rs` PyTorch preflight/install helpers when upgrading a
 base install to full or replacing the installed PyTorch wheel. Installer workers report progress
 through typed events consumed by the UI; command output is surfaced as console/progress events
@@ -55,8 +59,10 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   and probes must run on background threads.
 - Python discovery and command paths must go through `ms_sysprobe::python_manager`.
 - GPU capability probes must go through `ms_sysprobe::gpu_utils`.
-- Release asset lookup, uv download, app archive extraction, dependency installation, shortcuts,
-  registry writes, and uninstall cleanup belong in `utils.rs`, not in egui window code.
+- Release asset lookup, uv download, app archive extraction, dependency installation, the calls
+  that create shortcuts and registry entries, and uninstall cleanup belong in `utils.rs`, not in
+  egui window code. Registry / shortcut / elevation primitives and record names belong in
+  `ms_os_integration::windows`, never here; this crate must not depend on `windows-sys` for them.
 - Direct HTTP file downloads must go through `utils.rs::download_asset` (retry with exponential
   backoff, HTTP Range resume into a `.part` file, size verification, atomic rename into place —
   the destination path never holds a partial file). GitHub API metadata requests must go through
@@ -115,27 +121,25 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   then resume with `--continue-update` to repair/create uv-managed `installer_files/venv`, refresh
   PyTorch only for Full installs when the embedded torch version is newer, install missing embedded
   dependency-list packages, and unpack `ManhwaStudio.zip` over the install root.
-- Windows integration differs by install kind (`is_windows_all_users_install_dir`). All-users
-  (Program Files, HKLM): App Paths, Uninstall entry, Start Menu shortcut and the "Open with"
-  entry. Per-user (HKCU): ONLY the "Open with" entry. The "Open with" entry lives entirely under
-  `{root}\Software\Classes\Applications\manhwastudio_rs.exe` (command `"<launcher>" "%1"`, the
-  same exe the shortcuts target, `FriendlyAppName`, one `SupportedTypes\.<ext>` per
-  `ms_config::single_image::input_extensions()`); it never creates a ProgID, `OpenWithProgids`
-  or default handler, so no extension is taken over. Its values come from the pure, tested
-  `windows_open_with_registry_values`; registration deletes the tree first. Registration is
-  best-effort for both install kinds (`register_windows_open_with_best_effort`: logged and shown
-  in the console, never fails an install). Uninstall deletes the tree only when its open command
-  points into the uninstalled directory, and removes every registry key independently, reporting
-  all failures together.
-- Registry key existence is decided by Win32 status codes (`registry_key_presence`,
-  `classify_registry_open_status`), never by `reg.exe` message text: that text is localized and
-  OEM-code-page encoded, so a text match breaks on most Windows locales. Values read back for a
-  decision go through `RegGetValueW` (UTF-16), not `reg query` output.
-- Known debt: the "Open with" key `Applications\manhwastudio_rs.exe` is fixed per registry root.
-  Two installs under one root share it: the last install wins, and uninstalling the owner removes
-  it even if the other install remains (the other install's own uninstall then leaves it alone).
-  A launcher with a fallback exe name (`resolve_windows_launcher_target`) still registers under
-  the fixed key name.
+- Which Windows records an install gets is decided HERE, by install kind
+  (`ms_os_integration::windows::is_windows_all_users_install_dir`), in
+  `utils.rs::finalize_windows_post_install`. All-users (Program Files, HKLM): App Paths,
+  Uninstall entry, Start Menu shortcut and the "Open with" entry. Per-user (HKCU): ONLY the
+  "Open with" entry (the finish screen may still add the per-user Start-menu and Desktop
+  shortcuts the user ticked). "Open with" registration is best-effort for both kinds
+  (`utils.rs::register_windows_open_with_best_effort`: logged and shown in the console, never
+  fails an install). The Uninstall entry's `DisplayVersion` is the RUNNING program's
+  `version_core` (`HostVersion` handed to `install::run_python_installer_window`, carried by
+  `InstallerPurpose::FullInstall`). Uninstall (`run_windows_uninstall_worker`) removes
+  shortcuts, then the registry entries that point into the uninstalled directory, then the
+  files; when existing entries were left in place (another install's, or unverifiable) it shows
+  a distinct "entries kept" status instead of "cleanup complete" (reasons in the session log). Install discovery (`install.rs::find_existing_windows_install`) reads `InstallLocation`
+  / App Paths `Path` natively and treats an unreadable value as no candidate. What each record
+  contains, the ownership rules on uninstall, Win32 status-code rules and the known debt live in
+  `crates/ms-os-integration/src/windows/MODULE_README.md`.
+- Every user-visible error of a Windows record operation is `IntegrationError::user_message()`,
+  which renders the same `installer.utils.*` catalog texts; never show its `Display` (English,
+  for logs) in the console or a dialog.
 - Windows Program Files ACL changes happen at root directory creation time, not as a recursive
   post-install permission rewrite.
 - Release binary assets are per-platform × per-arch and distinct: Windows x86_64
@@ -168,19 +172,27 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
     (`args::standalone_relaunch_args`) and exits. The flag cannot be turned on in process: startup
     routing consumes it and seeds the backend-socket `OnceLock` long before this window opens.
 - Every background job of that window (the installed copy's `--version` probe, the reinstall, the
-  replacement) reports through ONE `mpsc` channel owned by `ExistingInstallApp`; the GUI thread only
+  replacement, the Desktop / Start-menu shortcut buttons on the `existing-install-shortcut`
+  worker) reports through ONE `mpsc` channel owned by `ExistingInstallApp`; the GUI thread only
   drains it and draws. The probed version is the EXTENDED `MS_APP_VERSION` string: it is displayed
   as-is next to `env!("MS_APP_VERSION")` of the running copy and never compared. A failed probe is
   logged and shown as "unknown"; it never blocks any of the window's actions, because the user may
   be repairing exactly that broken install.
+- The finish screen of a full install writes the ticked Desktop / per-user Start-menu shortcuts
+  on the `install-finish-shortcuts` worker (`InstallerApp::finish_with_shortcuts`), never on the
+  GUI thread: the screen switches to `UiState::CreatingShortcuts`, and the outcome the user chose
+  ("open" / "close") is applied — window closed — only after the worker's report arrived. While
+  it runs, an OS close request is cancelled, so the process never exits under a half-written
+  `.lnk`. A failed shortcut is a console line, never a failed install.
 - Known limitation: external-target updates (existing-install / custom-folder entry points) pick the
   asset by the RUNNING process's os/arch and assume the target executable matches it; the target is
   only version-queried (`--version`), never arch-probed.
 
 ## Editing map
 - To change installer screens or user choices, edit `install.rs`.
-- To change the Windows "Open with" registration, edit `utils.rs::windows_open_with_registry_values`
-  (data) and `finalize_windows_post_install` (which install kinds get it).
+- To change what a Windows record contains (registry values, shortcut target, key names), edit
+  `ms-os-integration` (`windows/values.rs`, `windows/shortcut.rs`, `identity.rs`); to change
+  which install kinds get which record, edit `utils.rs::finalize_windows_post_install`.
 - To change what "replace the installed copy" does on disk, edit
   `utils.rs::replace_executable_with_local_file` and keep the exe-only contract above in sync.
 - To change what environment repair does (or must not do), edit

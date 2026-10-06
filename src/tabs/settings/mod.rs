@@ -403,7 +403,8 @@ impl SettingsTabState {
             SettingsSectionId::SystemInfo
             | SettingsSectionId::AiComputations
             | SettingsSectionId::TorchUpgrade
-            | SettingsSectionId::PythonEnvironment => {
+            | SettingsSectionId::PythonEnvironment
+            | SettingsSectionId::SystemRegistration => {
                 debug_assert!(
                     false,
                     "studio settings active_pane is a launcher-only section: {:?}",

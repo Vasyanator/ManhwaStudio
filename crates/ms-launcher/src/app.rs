@@ -32,7 +32,7 @@ use crate::pages::open_page::OpenPageState;
 use crate::pages::settings_page::SettingsPageState;
 use ms_settings_ui::settings_warnings::{SettingChange, WarningLevel};
 use crate::psd_import_window::PsdImportWindowState;
-use crate::state::{LauncherOutcome, LauncherPage, LauncherState, UpdateNotification};
+use crate::state::{LauncherHost, LauncherOutcome, LauncherPage, LauncherState, UpdateNotification};
 use crate::theme::VEIL_TINT;
 use ms_tabs_simple::wiki::WikiTabState;
 #[cfg(feature = "tutorial")]
@@ -124,6 +124,10 @@ pub struct LauncherApp {
 }
 
 impl LauncherApp {
+    /// Builds the launcher for one entry (program start or return from the studio). No egui
+    /// context exists yet, so workers that need one start on the first frame. `app_id` is the
+    /// native app id every launcher viewport reuses; `host` carries the process facts
+    /// (`--ignore-installed`, version) the settings page needs.
     pub fn new(
         projects_root: PathBuf,
         app_id: String,
@@ -131,6 +135,7 @@ impl LauncherApp {
         output_outcome: Arc<Mutex<Option<LauncherOutcome>>>,
         update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
         ai_backend: AiBackendHandle,
+        host: LauncherHost,
     ) -> Self {
         let ai_install_type = config::AiInstallType::from_user_settings(user_settings);
         // First-run language modal: shown only when the RAW (unmerged) config lacks
@@ -168,6 +173,7 @@ impl LauncherApp {
                 projects_root.clone(),
                 ai_install_type,
                 ai_backend,
+                host,
                 #[cfg(feature = "tutorial")]
                 tutorial_progress.clone(),
             ),

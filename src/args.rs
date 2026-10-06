@@ -30,6 +30,9 @@ Main items:
 - `Cli.continue_create_start_menu_shortcut`: скрытый служебный флаг продолжения elevated-создания ярлыка меню Пуск.
 - `Cli.uninstall_signal_file`: скрытый служебный файл-сигнал для сценария "удалить и затем переустановить".
 - `Cli.continue_update`: hidden service flag that resumes update work after executable replacement.
+- `Cli.system_registration_apply` / `Cli.system_registration_result`: hidden pair that runs this
+  process as the elevated system-registration helper (Windows only; protocol owned by
+  `ms_os_integration::actions`). Each requires the other.
 - `Cli.trace`: enables detailed execution tracing to `trace-last.log` (see `crates/ms-log/src/trace.rs`).
 
 Notes:
@@ -118,6 +121,16 @@ pub struct Cli {
     #[arg(long, default_value_t = false, hide = true)]
     pub continue_update: bool,
 
+    /// Elevated system-registration helper (Windows): the `Machine`-scope action tokens to run
+    /// (`ms_os_integration::actions::encode_actions`). Started only by the launcher's UAC
+    /// launch, together with `--system-registration-result`.
+    #[arg(long, value_name = "ACTIONS", hide = true, requires = "system_registration_result")]
+    pub system_registration_apply: Option<String>,
+
+    /// Result file the elevated system-registration helper writes its outcomes to.
+    #[arg(long, value_name = "PATH", hide = true, requires = "system_registration_apply")]
+    pub system_registration_result: Option<PathBuf>,
+
     #[arg(long, default_value_t = false)]
     pub trace: bool,
 }
@@ -140,6 +153,8 @@ const INSTALLED_COPY_FLAGS: &[&str] = &[
     "--create-start-menu-shortcut-install-dir",
     "--continue-create-start-menu-shortcut",
     "--uninstall-signal-file",
+    "--system-registration-apply",
+    "--system-registration-result",
 ];
 
 /// Returns the [`INSTALLED_COPY_FLAGS`] present in `cli` that contradict
@@ -176,6 +191,8 @@ fn installed_copy_flags_present(cli: &Cli) -> [bool; INSTALLED_COPY_FLAGS.len()]
         cli.create_start_menu_shortcut_install_dir.is_some(),
         cli.continue_create_start_menu_shortcut,
         cli.uninstall_signal_file.is_some(),
+        cli.system_registration_apply.is_some(),
+        cli.system_registration_result.is_some(),
     ]
 }
 
@@ -305,41 +322,51 @@ mod tests {
 
     #[test]
     fn every_installed_copy_flag_conflicts_with_ignore_installed() {
-        // Each flag is checked on its own so a missed field in the mapping fails here
-        // instead of being masked by another flag in the same command line.
-        let cases: &[(&[&str], &str)] = &[
-            (&["--update"], "--update"),
-            (&["--continue-update"], "--continue-update"),
-            (&["--continue-install"], "--continue-install"),
+        // Each flag is checked on its own (or with the partner clap requires) so a missed field
+        // in the mapping fails here instead of being masked by another flag in the same command
+        // line.
+        let cases: &[(&[&str], &[&str])] = &[
+            (&["--update"], &["--update"]),
+            (&["--continue-update"], &["--continue-update"]),
+            (&["--continue-install"], &["--continue-install"]),
+            (&["--continue-install-target", "/tmp/x"], &["--continue-install-target"]),
+            (&["--uninstall"], &["--uninstall"]),
+            (&["--continue-uninstall"], &["--continue-uninstall"]),
+            (&["--create-start-menu-shortcut-install-dir", "/tmp/x"], &["--create-start-menu-shortcut-install-dir"]),
+            (&["--continue-create-start-menu-shortcut"], &["--continue-create-start-menu-shortcut"]),
+            (&["--uninstall-signal-file", "/tmp/x"], &["--uninstall-signal-file"]),
             (
-                &["--continue-install-target", "/tmp/x"],
-                "--continue-install-target",
+                &["--system-registration-apply", "open-with:machine:create", "--system-registration-result", "/tmp/r.json"],
+                &["--system-registration-apply", "--system-registration-result"],
             ),
-            (&["--uninstall"], "--uninstall"),
-            (&["--continue-uninstall"], "--continue-uninstall"),
-            (
-                &["--create-start-menu-shortcut-install-dir", "/tmp/x"],
-                "--create-start-menu-shortcut-install-dir",
-            ),
-            (
-                &["--continue-create-start-menu-shortcut"],
-                "--continue-create-start-menu-shortcut",
-            ),
-            (&["--uninstall-signal-file", "/tmp/x"], "--uninstall-signal-file"),
         ];
         for (args, expected) in cases {
             let mut argv = vec!["--ignore-installed"];
             argv.extend_from_slice(args);
             assert_eq!(
                 conflicting_installed_copy_flags(&parse(&argv)),
-                vec![*expected],
-                "flag {expected} must be rejected together with --ignore-installed"
+                expected.to_vec(),
+                "flags {expected:?} must be rejected together with --ignore-installed"
             );
         }
+        let covered: Vec<&str> = cases.iter().flat_map(|(_, expected)| expected.iter().copied()).collect();
+        assert_eq!(covered, INSTALLED_COPY_FLAGS, "every flag in INSTALLED_COPY_FLAGS needs a case here");
+    }
+
+    /// The helper pair is spelled exactly as the crate that launches the helper spells it, each
+    /// flag requires the other, and an image start rejects it like every installed-copy flag.
+    #[test]
+    fn system_registration_helper_flags() {
+        use ms_os_integration::actions::{SYSTEM_REGISTRATION_APPLY_FLAG, SYSTEM_REGISTRATION_RESULT_FLAG};
+        let cli = parse(&[SYSTEM_REGISTRATION_APPLY_FLAG, "app-paths:machine:repair", SYSTEM_REGISTRATION_RESULT_FLAG, "C:\\Temp\\r one.json"]);
+        assert_eq!(cli.system_registration_apply.as_deref(), Some("app-paths:machine:repair"));
+        assert_eq!(cli.system_registration_result.as_deref(), Some(Path::new("C:\\Temp\\r one.json")));
+        use clap::error::ErrorKind;
+        assert_eq!(parse_error(&[SYSTEM_REGISTRATION_APPLY_FLAG, "app-paths:machine:repair"]), ErrorKind::MissingRequiredArgument);
+        assert_eq!(parse_error(&[SYSTEM_REGISTRATION_RESULT_FLAG, "/tmp/r.json"]), ErrorKind::MissingRequiredArgument);
         assert_eq!(
-            INSTALLED_COPY_FLAGS.len(),
-            cases.len(),
-            "every flag in INSTALLED_COPY_FLAGS needs a case here"
+            conflicting_image_flags(&parse(&["/tmp/a.png", SYSTEM_REGISTRATION_APPLY_FLAG, "x", SYSTEM_REGISTRATION_RESULT_FLAG, "/tmp/r.json"])),
+            vec![SYSTEM_REGISTRATION_APPLY_FLAG, SYSTEM_REGISTRATION_RESULT_FLAG]
         );
     }
 

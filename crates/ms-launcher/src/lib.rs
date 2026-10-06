@@ -62,13 +62,20 @@ pub mod tutorial;
 use ms_settings_ui::ai_backend_supervisor::AiBackendHandle;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_config as config;
-use crate::state::{LauncherOutcome, UpdateNotification};
+use crate::state::{LauncherHost, LauncherOutcome, UpdateNotification};
 use std::sync::mpsc::Receiver;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
 
 const EMBEDDED_APP_ICON_ICO: &[u8] = include_bytes!("../../../app_icon.ico");
 const EMBEDDED_APP_ICON_PNG: &[u8] = include_bytes!("../../../app_icon_512.png");
+/// Native app id of every launcher window. On Linux it is the desktop-entry id
+/// (`manhwastudio_rs.desktop`, `StartupWMClass=manhwastudio_rs`, written by
+/// `ms_os_integration::linux`), so the launcher started from the application menu is matched to
+/// its menu entry and icon (X11 `WM_CLASS`, Wayland `app_id`). Elsewhere it keeps its own id.
+#[cfg(target_os = "linux")]
+const LAUNCHER_APP_ID: &str = "manhwastudio_rs";
+#[cfg(not(target_os = "linux"))]
 const LAUNCHER_APP_ID: &str = "manhwastudio_rs.launcher";
 const LAUNCHER_TEST_APP_ID: &str = "manhwastudio_rs.launcher_test";
 /// Inner size of the launcher window, in logical pixels. The launcher never restores a stored
@@ -76,20 +83,31 @@ const LAUNCHER_TEST_APP_ID: &str = "manhwastudio_rs.launcher_test";
 #[cfg(not(target_arch = "wasm32"))]
 const LAUNCHER_DEFAULT_INNER_SIZE: [f32; 2] = [1360.0, 860.0];
 
+/// Runs the launcher window until it closes and returns why it closed (`None` = the user
+/// closed it). `host` carries the process facts the launcher cannot read itself.
+///
+/// # Errors
+/// The window could not be created, or the outcome slot was poisoned.
 pub fn run_launcher(
     user_settings: &serde_json::Value,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
     ai_backend: &AiBackendHandle,
+    host: LauncherHost,
 ) -> anyhow::Result<Option<LauncherOutcome>> {
-    run_launcher_internal(user_settings, false, update_check_rx, ai_backend)
+    run_launcher_internal(user_settings, false, update_check_rx, ai_backend, host)
 }
 
+/// [`run_launcher`] in test mode (own window title and app id); the outcome is dropped.
+///
+/// # Errors
+/// Same as [`run_launcher`].
 pub fn run_test_launcher(
     user_settings: &serde_json::Value,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
     ai_backend: &AiBackendHandle,
+    host: LauncherHost,
 ) -> anyhow::Result<()> {
-    let _ = run_launcher_internal(user_settings, true, update_check_rx, ai_backend)?;
+    let _ = run_launcher_internal(user_settings, true, update_check_rx, ai_backend, host)?;
     Ok(())
 }
 
@@ -105,6 +123,7 @@ fn run_launcher_internal(
     test_mode: bool,
     _update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
     _ai_backend: &AiBackendHandle,
+    _host: LauncherHost,
 ) -> anyhow::Result<Option<LauncherOutcome>> {
     ms_log::runtime_log::log_warn(format!(
         "Rust launcher window{} is unavailable on the web build",
@@ -119,6 +138,7 @@ fn run_launcher_internal(
     test_mode: bool,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
     ai_backend: &AiBackendHandle,
+    host: LauncherHost,
 ) -> anyhow::Result<Option<LauncherOutcome>> {
     let projects_root = config::projects_root_from_user_settings(user_settings);
     let user_settings = user_settings.clone();
@@ -178,6 +198,7 @@ fn run_launcher_internal(
                 Arc::clone(&output_outcome_for_app),
                 update_check_rx,
                 ai_backend.clone(),
+                host,
             )))
         }),
     )
@@ -220,4 +241,21 @@ fn load_embedded_icon_data() -> Option<egui::IconData> {
         width,
         height,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// On Linux the launcher window carries the desktop-entry id, so the menu entry's
+    /// `StartupWMClass` matches it; other systems and the test mode keep their own ids.
+    #[test]
+    fn launcher_app_id_per_target() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(launcher_app_id(false), "manhwastudio_rs");
+        } else {
+            assert_eq!(launcher_app_id(false), "manhwastudio_rs.launcher");
+        }
+        assert_eq!(launcher_app_id(true), "manhwastudio_rs.launcher_test");
+    }
 }

@@ -50,6 +50,15 @@ state arrives.
   panes (item badges), paints each tab's worst level as a corner badge in
   `show_tab_button_impl` (`highlighted` there is the unrelated amber upgrade-tab look), and
   rechecks the units named by every `SettingChange` the panes report.
+- `system_registration.rs` (Windows and Linux only): the System registration tab
+  (`SystemRegistrationState`, owned by the settings page). Lists the OS records of this copy as
+  `ms_os_integration::report::probe` judged them (worker `system-registration-probe`, on first
+  show, after every action and on refresh) and runs the actions
+  `ms_os_integration::actions::allowed_actions` offers (worker `system-registration-action`:
+  in-process `actions::apply`, plus on Windows `windows::elevation::apply_elevated` for
+  all-users records of an unelevated process; a mixed batch is split). Row badges reuse the
+  warning set (`settings_warnings::registration_key`), record names
+  `settings_warnings::registration_record`, error texts the crate's `user_message`s.
 
 ## Contracts and invariants
 - Page UI must stay responsive. Do not perform project scans, archive traversal, compression,
@@ -75,6 +84,13 @@ state arrives.
   checks themselves run only on the `settings-warnings` worker, never in `show`.
 - The settings page delivers every action a frame produced (e.g. a saved projects root AND a
   finished storage switch): extras are queued and returned one per frame, in order.
+- System registration: the tab only PRESENTS `ms_os_integration` rules (broken = `badge_worthy`,
+  actions = `allowed_actions`, confirmation = `needs_confirmation`, elevation =
+  `requires_elevation`); it never decides one itself. One worker at a time, every button
+  disabled meanwhile; a failed probe drops the old report so no action runs on stale data;
+  under `--ignore-installed` (`LauncherHost::ignore_installed`) it is read-only. EVERY end of an
+  action batch (success, failure, declined UAC prompt, lost worker) and every refresh returns
+  `true` from `show`, and the settings page rechecks `SettingChange::SystemRegistration`.
 - Notice banners (one text + at most one action) use `theme::notice_banner` with a stable
   `id_salt`; do not hand-roll another `Frame`.
 - `PageNavAction::OpenProject` must carry an `OpenProjectSelection` that has passed launcher-side
@@ -91,3 +107,6 @@ state arrives.
 - To change archive import/export, edit `import_page.rs` or `export_page.rs`.
 - To change global launcher settings, environment probes, AI install-type reconciliation, Torch
   upgrade UI, or the Python console, edit `settings_page.rs`.
+- To change the System registration tab's layout, texts or worker flow, edit
+  `system_registration.rs`; what is broken, which actions exist and how they run belong to
+  `crates/ms-os-integration` (`report.rs`, `actions.rs`).

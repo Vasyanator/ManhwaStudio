@@ -73,7 +73,7 @@ uuid.workspace = true
 
 # Native-only halves. The panes keep their `cfg(not(target_arch = "wasm32"))` gates
 # internally (there is no ONNX Runtime dylib, no OS monitor list and no subprocess AI
-# backend on the web), so these three crates are only linked on native.
+# backend on the web), so these crates are only linked on native.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # The ORT dylib resolver behind the AI pane's runtime/build selectors.
 ms-onnx-runtime = { path = "../ms-onnx-runtime" }
@@ -83,6 +83,9 @@ ms-native-runtime = { path = "../ms-native-runtime" }
 ms-window-geometry = { path = "../ms-window-geometry" }
 # The native folder picker behind the General pane's "projects root" button.
 rfd.workspace = true
+# The OS-record probe behind the System registration warnings (`settings_warnings`
+# checks): `CopyIdentity`, `report::probe`, `badge_worthy`. No OS records exist on the web.
+ms-os-integration = { path = "../ms-os-integration" }
 
 [dev-dependencies]
 # Isolated user-config files for the persistence tests (tutorial progress).
