@@ -15,6 +15,7 @@ Main responsibilities:
 
 Key structures:
 - CanvasSceneState
+- StripLayoutStamp (previous pass' strip geometry for the strip-width compensation)
 
 Key functions:
 - CanvasView::begin_canvas_frame()
@@ -41,6 +42,10 @@ Notes:
 - Automatic horizontal centering keeps re-centering while page geometry is still provisional and
   latches (`HorizontalCenteringState`) on settled geometry, a user scroll, or an explicit
   navigation intent.
+- A pure strip-width change (aside presence or gutter settings, at unchanged zoom and viewport)
+  is compensated by keeping the offset relative to the centered offset; the cross-tab viewport
+  snapshot uses the same strip-independent horizontal coordinate (`PendingScrollOffset::FromCenter`,
+  resolved after the strip widths of the pass are known).
 */
 
 use super::bubble_aside_ui;
@@ -48,7 +53,7 @@ use super::bubble_on_top_ui;
 use super::helpers::page_info_content_size;
 use super::types::{
     CanvasContextMenuTarget, CanvasFrameParams, CanvasScenePageFrame, OverlayUploadBudget,
-    PendingPageFocus, PendingZoomAnchor, SourceTextureUploadBudget,
+    PendingPageFocus, PendingScrollOffset, PendingZoomAnchor, SourceTextureUploadBudget,
 };
 use super::view_transform::DVec2;
 use super::{
@@ -75,6 +80,13 @@ const RIBBON_SIDE_FREE_SPACE_FACTOR: f32 = 0.9;
 /// as the one this canvas itself requested. Anything further away is a user scroll.
 const HORIZONTAL_CENTER_READBACK_EPS_PX: f32 = 0.5;
 
+/// Tolerances for "unchanged" in the strip-width compensation (`strip_width_compensation_offset`):
+/// a zoom difference above `STRIP_COMPENSATION_ZOOM_EPS` or a viewport-width difference above
+/// `STRIP_COMPENSATION_VIEWPORT_EPS_PX` screen points disables it for the frame, and a strip-width
+/// change at or below the latter is not worth an offset request.
+const STRIP_COMPENSATION_ZOOM_EPS: f32 = 1e-6;
+const STRIP_COMPENSATION_VIEWPORT_EPS_PX: f32 = 0.01;
+
 /// Screen-point margin by which the viewport is expanded before testing page
 /// visibility. Matches the pre-existing `ui.clip_rect().expand(256.0)` used to
 /// build `viewport_rect`, so transform-derived visibility stays pixel-equivalent
@@ -97,6 +109,22 @@ pub(super) enum HorizontalCenteringState {
     Live { last_requested_x: Option<f32> },
     /// Centering is over and never resumes for this canvas.
     Latched,
+}
+
+/// Strip geometry one scene pass laid out with, kept for the next pass.
+///
+/// When the strip width changes while zoom and viewport width stay the same (the first aside
+/// bubble of the chapter appears, the last one disappears, a gutter-size setting or bubble
+/// visibility changes), every page moves by half the width change inside the strip while egui
+/// keeps the absolute scroll offset; the scene pass compensates that from this stamp.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct StripLayoutStamp {
+    /// Screen width of the scrollable strip (`canvas_row_screen_width`).
+    strip_screen_width: f32,
+    /// Zoom the strip was laid out at.
+    zoom: f32,
+    /// Viewport width the strip was mapped through (the centering's viewport source).
+    viewport_width: f32,
 }
 
 /// The two world-space widths the strip layout is built from.
@@ -176,7 +204,12 @@ pub(super) struct CanvasSceneState {
     /// [`HorizontalCenteringState`] for the invariant.
     pub(super) horizontal_centering: HorizontalCenteringState,
     pub(super) pending_zoom_anchor: Option<PendingZoomAnchor>,
-    pub(super) pending_scroll_offset: Option<Vec2>,
+    /// Deferred scroll request for the next scene pass (an applied focus or a snapshot restore).
+    pub(super) pending_scroll_offset: Option<PendingScrollOffset>,
+    /// Strip geometry of the previous scene pass, compared against the current one to keep the
+    /// pages in place when only the strip width changes (see [`StripLayoutStamp`]). `None`
+    /// before the first scene pass.
+    pub(super) last_strip_layout: Option<StripLayoutStamp>,
     /// Deferred `CanvasView::focus_page` request waiting for the target page's world rect (and
     /// its center, when not explicit) to become resolvable. Applied and cleared by
     /// `CanvasView::try_apply_pending_focus` from the draw pass; a newer `focus_page` or
@@ -265,6 +298,7 @@ impl Default for CanvasSceneState {
             },
             pending_zoom_anchor: None,
             pending_scroll_offset: None,
+            last_strip_layout: None,
             pending_focus: None,
             on_top_hit_rects: HashMap::new(),
             canvas_bottom_hint_rect: None,
@@ -390,6 +424,66 @@ impl CanvasView {
         (row_width - viewport_width.max(1.0)).max(0.0)
     }
 
+    /// Absolute horizontal scroll offset for a position given as `scroll_x_from_center`, the
+    /// distance (screen points) from the centered offset `max_scroll_x / 2`, clamped to
+    /// `[0, max_scroll_x]`.
+    ///
+    /// This is the strip-independent horizontal coordinate: since a page sits at `(R - w) / 2` in
+    /// a strip of width `R`, its screen x is `(V - w) / 2 - scroll_x_from_center` for every strip
+    /// width, so equal `scroll_x_from_center` means equal page position on screen (up to the clamp).
+    #[must_use]
+    pub(super) fn scroll_x_for_offset_from_center(max_scroll_x: f32, scroll_x_from_center: f32) -> f32 {
+        let max_scroll_x = max_scroll_x.max(0.0);
+        (max_scroll_x * 0.5 + scroll_x_from_center).clamp(0.0, max_scroll_x)
+    }
+
+    /// Horizontal scroll offset that keeps every page at the same screen x when the strip width
+    /// changes from `old_strip_width` to `new_strip_width` at an unchanged `viewport_width` (and
+    /// zoom); `scroll_x` is the offset read back under the old strip.
+    ///
+    /// Preserves the offset relative to the centered offset (`scroll_x - old_max / 2`), i.e.
+    /// shifts by half the change of the scroll range. The result is clamped to the new range, so
+    /// a view looking into a gutter that disappeared lands on the nearest edge instead.
+    #[must_use]
+    pub(super) fn compensated_scroll_x(old_strip_width: f32, new_strip_width: f32, viewport_width: f32, scroll_x: f32) -> f32 {
+        // Same viewport floor as `max_scroll_offset_x_for_viewport`.
+        let viewport_width = viewport_width.max(1.0);
+        let old_max = (old_strip_width - viewport_width).max(0.0);
+        let new_max = (new_strip_width - viewport_width).max(0.0);
+        let from_center = scroll_x.clamp(0.0, old_max) - old_max * 0.5;
+        Self::scroll_x_for_offset_from_center(new_max, from_center)
+    }
+
+    /// Distance (screen points) of the current horizontal scroll offset from the centered offset
+    /// of this canvas' strip, measured through the last scene pass' viewport width. Strip
+    /// independent (see [`Self::scroll_x_for_offset_from_center`]). Meaningless before the first
+    /// scene pass; callers gate on `scroll_inner_rect` (the snapshot's `laid_out`).
+    #[must_use]
+    pub(super) fn scroll_x_from_center(&self) -> f32 {
+        let viewport_width = self.scene.scroll_inner_rect.map_or(0.0, |rect| rect.width());
+        self.scene.scroll_offset.x - self.max_scroll_offset_x_for_viewport(viewport_width) * 0.5
+    }
+
+    /// Resolves a deferred scroll request into an absolute scroll offset against the CURRENT
+    /// strip widths and zoom at `viewport_width`. Must run after the scene pass has stored this
+    /// frame's widths, or a `FromCenter` request resolves against a stale strip.
+    #[must_use]
+    pub(super) fn resolve_pending_scroll_offset(&self, request: PendingScrollOffset, viewport_width: f32) -> Vec2 {
+        match request {
+            PendingScrollOffset::Absolute(offset) => offset,
+            PendingScrollOffset::FromCenter {
+                scroll_x_from_center,
+                scroll_y,
+            } => egui::vec2(
+                Self::scroll_x_for_offset_from_center(
+                    self.max_scroll_offset_x_for_viewport(viewport_width),
+                    scroll_x_from_center,
+                ),
+                scroll_y.max(0.0),
+            ),
+        }
+    }
+
     pub(super) fn aside_available_widths_for_page_viewport(
         &self,
         image_rect: Rect,
@@ -483,6 +577,45 @@ impl CanvasView {
             }
         };
         Some(egui::vec2(centered_x, self.scene.scroll_offset.y.max(0.0)))
+    }
+
+    /// Scroll offset that keeps the pages in place after a pure strip-width change, or `None` when
+    /// no compensation is due this frame.
+    ///
+    /// Called last in the scene pass' request chain, so a zoom anchor, a pending scroll request
+    /// or a centering request of this frame always wins. Compensates only when:
+    /// - the centering is `Latched` — while `Live` it owns the offset, and a compensation request
+    ///   recorded nowhere would make the next read-back look like a user scroll;
+    /// - no page focus is still pending (it installs its own offset once resolvable);
+    /// - zoom and viewport width equal the previous pass' (a zoom carries its own anchor, and a
+    ///   viewport resize keeps egui's absolute offset by design);
+    /// - the strip width actually changed — re-requesting an unchanged offset every frame would
+    ///   fight the user's own scrolling.
+    #[must_use]
+    fn strip_width_compensation_offset(
+        &self,
+        previous: Option<StripLayoutStamp>,
+        current: StripLayoutStamp,
+    ) -> Option<Vec2> {
+        let previous = previous?;
+        if self.scene.horizontal_centering != HorizontalCenteringState::Latched
+            || self.scene.pending_focus.is_some()
+            || current.viewport_width <= 1.0
+            || (previous.zoom - current.zoom).abs() > STRIP_COMPENSATION_ZOOM_EPS
+            || (previous.viewport_width - current.viewport_width).abs()
+                > STRIP_COMPENSATION_VIEWPORT_EPS_PX
+            || (previous.strip_screen_width - current.strip_screen_width).abs()
+                <= STRIP_COMPENSATION_VIEWPORT_EPS_PX
+        {
+            return None;
+        }
+        let compensated_x = Self::compensated_scroll_x(
+            previous.strip_screen_width,
+            current.strip_screen_width,
+            current.viewport_width,
+            self.scene.scroll_offset.x,
+        );
+        Some(egui::vec2(compensated_x, self.scene.scroll_offset.y.max(0.0)))
     }
 
     fn canvas_row_width_for_page(&self, page_idx: usize, image_width: f32) -> f32 {
@@ -709,11 +842,14 @@ impl CanvasView {
             overlay_budget,
             source_upload_budget,
         } = params;
-        let requested_offset = self
+        let zoom_anchor_offset = self
             .scene
             .pending_zoom_anchor
-            .map(|anchor| self.scroll_offset_for_zoom_anchor(anchor))
-            .or_else(|| self.scene.pending_scroll_offset.take());
+            .map(|anchor| self.scroll_offset_for_zoom_anchor(anchor));
+        // Taken now (a pending request is consumed by this pass whether or not it wins) but
+        // resolved only after the strip widths below are stored: a snapshot's `FromCenter` request
+        // is relative to the strip this canvas lays out THIS frame.
+        let pending_scroll_offset = self.scene.pending_scroll_offset.take();
         let strip_widths = self.canvas_strip_world_widths(project, page_infos);
         let content_world_width = strip_widths.content;
         self.scene.content_world_width = content_world_width;
@@ -729,9 +865,26 @@ impl CanvasView {
             .scene
             .scroll_inner_rect
             .map_or(frame.canvas_rect.width(), |rect| rect.width());
-        let requested_offset = requested_offset.or_else(|| {
-            self.initial_horizontal_center_scroll_offset(centering_viewport_width, geometry_settled)
-        });
+        let previous_strip_layout = self.scene.last_strip_layout;
+        let strip_layout = StripLayoutStamp {
+            strip_screen_width: self.canvas_row_screen_width(centering_viewport_width),
+            zoom: self.state.zoom,
+            viewport_width: centering_viewport_width,
+        };
+        self.scene.last_strip_layout = Some(strip_layout);
+        let requested_offset = zoom_anchor_offset
+            .or_else(|| {
+                pending_scroll_offset.map(|request| {
+                    self.resolve_pending_scroll_offset(request, centering_viewport_width)
+                })
+            })
+            .or_else(|| {
+                self.initial_horizontal_center_scroll_offset(
+                    centering_viewport_width,
+                    geometry_settled,
+                )
+            })
+            .or_else(|| self.strip_width_compensation_offset(previous_strip_layout, strip_layout));
         let mut scroll_area = egui::ScrollArea::both()
             .id_salt(self.scroll_area_id_salt)
             .auto_shrink([false, false])
@@ -2377,5 +2530,121 @@ mod tests {
                 .all(|row| row.help.is_none()),
             "shortcut chip rows must not carry help"
         );
+    }
+
+    #[test]
+    fn compensated_scroll_x_keeps_offset_from_center() {
+        let viewport = 1000.0;
+        // Unchanged strip width: the offset is unchanged.
+        assert!((CanvasView::compensated_scroll_x(1800.0, 1800.0, viewport, 250.0) - 250.0).abs() <= 1e-4);
+        // Growing strip (max 800 -> 1400): shift by half the range change, 300.
+        assert!((CanvasView::compensated_scroll_x(1800.0, 2400.0, viewport, 250.0) - 550.0).abs() <= 1e-4);
+        // Shrinking strip (max 1400 -> 800) keeps the offset from center when it stays in range...
+        assert!((CanvasView::compensated_scroll_x(2400.0, 1800.0, viewport, 700.0) - 400.0).abs() <= 1e-4);
+        // ...and clamps at both ends when the view looked into the vanished part of the range.
+        assert!((CanvasView::compensated_scroll_x(2400.0, 1800.0, viewport, 1400.0)
+            - 800.0).abs() <= 1e-4);
+        assert!(CanvasView::compensated_scroll_x(2400.0, 1800.0, viewport, 0.0).abs() <= 1e-4);
+        // A strip that fits the viewport (max 0) has exactly one valid offset.
+        assert!(CanvasView::compensated_scroll_x(1800.0, 900.0, viewport, 400.0).abs() <= 1e-4);
+        // From a fitting strip at offset 0 (centered by inset) to a scrollable one: centered.
+        assert!((CanvasView::compensated_scroll_x(1000.0, 1600.0, viewport, 0.0) - 300.0).abs() <= 1e-4);
+    }
+
+    #[test]
+    fn first_aside_bubble_keeps_page_screen_x_after_compensation() {
+        // Worked example: page 800 world px, zoom 1, viewport 1600, default gutters
+        // (side_space 1160 per side with two aside columns). Without any aside bubble the strip
+        // is max(1600, 800, 2.8 * 800) = 2240 and the centered page sits at screen x 400. The
+        // chapter's first aside bubble widens the content row to 3120; the compensated offset
+        // must keep the page at screen x 400.
+        let viewport = 1600.0;
+        let page_width = 800.0;
+        let mut view = CanvasView::default();
+        view.state.zoom = 1.0;
+        view.state.show_bubbles = true;
+        view.state.side_margin = 20.0;
+        view.state.bubble_min_width = 500.0;
+        view.state.bubble_max_width = 550.0;
+        view.state.scale_bubbles = true;
+        view.state.aside_second_column = true;
+        view.state.aside_scale_pct = 100;
+        let page_screen_x = |view: &CanvasView, scroll_x: f32| {
+            let content = view.canvas_row_width_for_page(0, page_width);
+            let (_, image_offset_x) =
+                CanvasView::canvas_page_x_layout(viewport, content, page_width, page_width);
+            image_offset_x - scroll_x
+        };
+        let strip = |view: &CanvasView| {
+            CanvasView::canvas_row_screen_width_for_content(
+                viewport,
+                view.canvas_row_width_for_page(0, page_width),
+                page_width,
+            )
+        };
+
+        let old_strip = strip(&view);
+        assert!((old_strip - 2240.0).abs() <= 1e-3, "old strip {old_strip}");
+        let centered_x = (old_strip - viewport) * 0.5;
+        assert!((page_screen_x(&view, centered_x) - 400.0).abs() <= 1e-3);
+
+        view.scene.page_aside_presence.insert(0, [false, true]);
+        let new_strip = strip(&view);
+        assert!((new_strip - 3120.0).abs() <= 1e-3, "new strip {new_strip}");
+        // Uncompensated, egui keeps the absolute offset and the page jumps by half the change.
+        assert!((page_screen_x(&view, centered_x) - 840.0).abs() <= 1e-3);
+        let compensated_x =
+            CanvasView::compensated_scroll_x(old_strip, new_strip, viewport, centered_x);
+        assert!((page_screen_x(&view, compensated_x) - 400.0).abs() <= 1e-3);
+
+        // Deleting the last aside bubble again restores the original offset exactly.
+        view.scene.page_aside_presence.clear();
+        let back_x = CanvasView::compensated_scroll_x(new_strip, old_strip, viewport, compensated_x);
+        assert!((back_x - centered_x).abs() <= 1e-3);
+        assert!((page_screen_x(&view, back_x) - 400.0).abs() <= 1e-3);
+    }
+
+    #[test]
+    fn strip_width_compensation_only_fires_on_a_pure_latched_strip_change() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let mut view = view_with_layout(1.0, 800.0, viewport);
+        view.scene.scroll_offset = egui::vec2(320.0, 77.0);
+        let previous = StripLayoutStamp {
+            strip_screen_width: 2240.0,
+            zoom: 1.0,
+            viewport_width: 1600.0,
+        };
+        let current = StripLayoutStamp {
+            strip_screen_width: 3120.0,
+            ..previous
+        };
+
+        // Live centering owns the offset.
+        view.scene.horizontal_centering = HorizontalCenteringState::Live {
+            last_requested_x: Some(320.0),
+        };
+        assert_eq!(view.strip_width_compensation_offset(Some(previous), current), None);
+
+        view.latch_horizontal_centering();
+        assert_eq!(
+            view.strip_width_compensation_offset(Some(previous), current),
+            Some(egui::vec2(760.0, 77.0))
+        );
+        // No previous pass, unchanged strip, changed zoom or viewport: nothing to compensate.
+        assert_eq!(view.strip_width_compensation_offset(None, current), None);
+        assert_eq!(view.strip_width_compensation_offset(Some(current), current), None);
+        let zoomed = StripLayoutStamp { zoom: 1.5, ..current };
+        assert_eq!(view.strip_width_compensation_offset(Some(previous), zoomed), None);
+        let resized = StripLayoutStamp {
+            viewport_width: 1400.0,
+            ..current
+        };
+        assert_eq!(view.strip_width_compensation_offset(Some(previous), resized), None);
+        // A pending page focus installs its own offset.
+        view.scene.pending_focus = Some(PendingPageFocus {
+            page_idx: 0,
+            center_px: None,
+        });
+        assert_eq!(view.strip_width_compensation_offset(Some(previous), current), None);
     }
 }

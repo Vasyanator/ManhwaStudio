@@ -235,11 +235,22 @@ shared `CanvasViewportSnapshot`, publishes it only from the active canvas after 
 canvas is drawn, and applies it only to the canvas being entered. Inactive canvases must
 not be scrolled or re-anchored every frame.
 
-`CanvasViewportSnapshot::laid_out` says whether the snapshot's `scroll_offset` means anything:
+The snapshot's horizontal position is strip-independent: `scroll_x_from_center` is the scroll
+offset minus the centered offset (`max_scroll_offset_x_for_viewport / 2`) of the publishing
+canvas, in screen points at the snapshot zoom; `scroll_y` stays a raw offset (row heights do not
+depend on bubbles). Canvases of different tabs lay out strips of different widths (different aside
+presence, hidden hints) and a page sits at `(strip - page) / 2` inside its strip, so a raw x would
+put the page at a different screen x in each tab, while the offset from center keeps it (up to the
+receiver's scroll-range clamp). The receiver's strip width is only known after `draw` rebuilt its
+aside presence, so `apply_viewport_snapshot` queues a `PendingScrollOffset::FromCenter` request
+that the scene pass resolves AFTER storing that frame's strip widths; every other deferred offset
+(an applied focus) is `PendingScrollOffset::Absolute` in this canvas' own scroll-offset space.
+
+`CanvasViewportSnapshot::laid_out` says whether the snapshot's scroll position means anything:
 it mirrors `scene.scroll_inner_rect.is_some()`, which is `Some` only after a real scene pass. A
 snapshot published by a canvas that was never drawn (the app seeds the shared snapshot from a
 fresh `CanvasView`, and a project reload can hand it to another tab before any canvas has laid
-out) carries the initial `Vec2::ZERO`, not a viewed position. `apply_viewport_snapshot` therefore
+out) carries a position derived from the initial zero offset, not a viewed one. `apply_viewport_snapshot` therefore
 applies the ZOOM ONLY for such a snapshot and touches neither the scroll offset, nor the pending
 zoom anchor / focus, nor the centering state: an unusable snapshot is not a navigation intent and
 must not supersede a pending focus or pin the canvas to the left edge for its whole life.
@@ -308,6 +319,19 @@ comparing the next read-back against a request that was never made would misread
 as a user scroll and pin the ribbon to the left edge, which is precisely the failure being fixed.
 The centering reads its viewport width from `scene.scroll_inner_rect` (falling back to
 `canvas_rect` on the very first frame), the same source as the other two space mappings.
+
+Strip-width compensation. The gutters are reserved only for pages with an aside-displayed bubble,
+so the strip width also changes with the first / last aside bubble of the chapter, focus-mode
+Aside selection, `show_bubbles`, `aside_second_column`, bubble width and `aside_scale_pct`. A page
+sits at `(strip - page) / 2` and egui keeps the absolute offset, so without help every page would
+move by half the change. The scene pass therefore keeps the previous pass' `StripLayoutStamp`
+(strip screen width, zoom, viewport width) and, when ONLY the strip width changed, requests
+`compensated_scroll_x`: the offset relative to the centered offset is preserved, clamped to the
+new range (requesting the clamped value directly also avoids egui's one-frame late clamp). It is
+the LAST candidate of the request chain (zoom anchor, pending scroll request, centering win) and
+runs only while the centering is `Latched` and no page focus is pending: while `Live`, the
+centering owns the offset and an unrecorded request would be misread as a user scroll. Zoom
+changes and viewport resizes are deliberately not compensated here.
 
 ## Crate boundary
 `ms-canvas` sits ABOVE `ms-models` / `ms-project` / `ms-widgets` and BELOW the tabs. The

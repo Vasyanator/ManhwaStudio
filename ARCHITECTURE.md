@@ -239,7 +239,9 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   changes by revision. `SharedCanvasSettings` flows the same way and is persisted by a canvas
   settings saver thread.
 - Layout is in stable world coordinates (unscaled page sizes); zoom is a camera transform.
-  Cross-tab viewport sync passes `CanvasViewportSnapshot { zoom, scroll_offset, laid_out }`.
+  Cross-tab viewport sync passes `CanvasViewportSnapshot { zoom, scroll_x_from_center,
+  scroll_y, laid_out }`; the horizontal position is measured from the centered offset, so it is
+  independent of each canvas' strip width.
 - Overlays upload tiled through a background prepare thread; the GUI thread never decodes or
   composes.
 - Bubble text spellcheck follows the typesetting language, not the UI language. Bubble status

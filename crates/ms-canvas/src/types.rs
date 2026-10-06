@@ -18,6 +18,7 @@ Key structures:
 - FocusedBubbleTextInput / HangulInsertTarget
 - RectCoords
 - RuntimeBubble
+- PendingZoomAnchor / PendingScrollOffset / PendingPageFocus (deferred viewport requests)
 - OverlayPreparedTile / OverlayPreparedPage
 - CanvasState
 
@@ -165,6 +166,20 @@ pub(crate) struct CanvasScenePageFrame {
 pub(crate) struct PendingZoomAnchor {
     pub(crate) viewport_local: Vec2,
     pub(crate) world_focus: Vec2,
+}
+
+/// Deferred scroll-offset request consumed by the next scene pass (`CanvasSceneState::
+/// pending_scroll_offset`). At most one is pending; newer navigation intents replace it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PendingScrollOffset {
+    /// A SCROLL-OFFSET-space offset computed against this canvas' own strip (an applied page
+    /// focus); requested as-is.
+    Absolute(Vec2),
+    /// A strip-independent position from a `CanvasViewportSnapshot`: the horizontal offset from
+    /// the centered offset (screen points) plus the raw vertical offset. Resolved into an absolute
+    /// offset by the scene pass only AFTER it has computed this frame's strip widths, because the
+    /// receiving canvas' aside presence (and with it its strip width) is rebuilt in `draw`.
+    FromCenter { scroll_x_from_center: f32, scroll_y: f32 },
 }
 
 /// Deferred `CanvasView::focus_page` request. Recorded when the target page's world rect (or its

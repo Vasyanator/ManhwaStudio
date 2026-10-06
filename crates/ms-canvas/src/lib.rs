@@ -15,7 +15,9 @@ Main types:
 - `CanvasHintRow` / `CanvasHintHelp` / `CanvasBottomHint`: per-tab content of the collapsible
   bottom-center keyboard-shortcut hint overlay (label + key rows, each row optionally carrying a
   "?" help icon); `bottom_hint == None` hides it.
-- `CanvasViewportSnapshot`: cross-tab viewport transfer (`zoom`, `scroll_offset`, `laid_out`);
+- `CanvasViewportSnapshot`: cross-tab viewport transfer (`zoom`, `scroll_x_from_center`,
+  `scroll_y`, `laid_out`). The horizontal position is strip-independent (offset from the centered
+  offset), because canvases of different tabs lay out strips of different widths;
   `laid_out == false` means the offset came from a canvas that never ran a scene pass and only the
   zoom may be transferred.
 - `CanvasFrameParams`: per-frame viewport/interaction flags shared by scene + viewport passes.
@@ -190,7 +192,8 @@ Key CanvasView state groups (important fields):
   `active_rect_handle`, `aside_drag_state`, `bubble_history`, `pending_history_before`,
   `pending_*`, `focused_bubbles`, `deferred_remote_*`, `canvas_context_menu_target`.
 - Page/view state: `page_rects`, `scroll_center_idx`, `scroll_offset`, `visible_scene_rect`,
-  `scroll_inner_rect`, `pending_zoom_anchor`, `pending_scroll_offset`, `pending_focus`.
+  `scroll_inner_rect`, `pending_zoom_anchor`, `pending_scroll_offset`, `pending_focus`,
+  `last_strip_layout`.
 - Overlay runtime: `overlays_visible`, `overlay_images`, `overlay_textures`,
   `overlay_dirty_tiles`, `overlay_prepare_*`, `overlay_prepared_pages`,
   `overlay_upload_min_interval_s`, `overlay_last_upload_s`.
@@ -220,7 +223,9 @@ use self::helpers::*;
 use self::overlay_runtime::OverlayRuntimeState;
 use self::scene::CanvasSceneState;
 use self::settings::CanvasSettingsRuntime;
-use self::types::{HangulInsertTarget, OverlayUploadBudget, PendingPageFocus, RuntimeBubble};
+use self::types::{
+    HangulInsertTarget, OverlayUploadBudget, PendingPageFocus, PendingScrollOffset, RuntimeBubble,
+};
 use ms_models::page_view::{PageImageInfo, PageTexture};
 use ms_widgets::bubble_status::BubbleBorderStyle;
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
@@ -247,14 +252,27 @@ use web_time::{Duration, Instant};
 // UNIX_EPOCH is only used to diff a `std::fs` mtime (std SystemTime), so it stays std.
 use std::time::UNIX_EPOCH;
 
+/// Viewport of one canvas in a form another canvas can restore (cross-tab viewport sync).
+///
+/// The horizontal position is NOT a raw scroll offset: canvases of different tabs lay out strips
+/// of different widths (different aside presence, hidden hints), and a page sits at
+/// `(strip - page) / 2` inside its strip, so one raw offset puts the page at different screen x in
+/// each tab. `scroll_x_from_center` is instead measured from the centered offset, which keeps the
+/// page's screen x for any strip width (up to the receiver's scroll-range clamp). The vertical
+/// offset stays raw: row heights do not depend on bubbles.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CanvasViewportSnapshot {
     pub zoom: f32,
-    pub scroll_offset: Vec2,
-    /// Whether `scroll_offset` was produced by a canvas that has actually run a scene pass.
+    /// Horizontal scroll offset minus the centered offset (`max_scroll_x / 2`) of the publishing
+    /// canvas' strip, in screen points at `zoom`. `0.0` means "horizontally centered"; positive
+    /// values look further right.
+    pub scroll_x_from_center: f32,
+    /// Raw vertical scroll offset in screen points at `zoom`.
+    pub scroll_y: f32,
+    /// Whether the scroll position was produced by a canvas that has actually run a scene pass.
     ///
-    /// A snapshot of a canvas that never ran a scene pass carries NO usable scroll offset — the
-    /// offset is still the initial `Vec2::ZERO`, not a place the user ever looked at. Appliers
+    /// A snapshot of a canvas that never ran a scene pass carries NO usable scroll position — it
+    /// is derived from the initial zero offset, not a place the user ever looked at. Appliers
     /// must take the zoom only from such a snapshot and leave the destination canvas free to run
     /// its own initial centering.
     pub laid_out: bool,
@@ -1083,21 +1101,24 @@ impl CanvasView {
         self.scroll_area_id_salt = id_salt;
     }
 
-    /// Current zoom plus scroll offset of this canvas, for cross-tab viewport synchronization.
+    /// Current zoom plus strip-independent scroll position of this canvas, for cross-tab
+    /// viewport synchronization (see [`CanvasViewportSnapshot`]).
     ///
-    /// `laid_out` reports whether the offset means anything: `scroll_inner_rect` is `Some` only
+    /// `laid_out` reports whether the position means anything: `scroll_inner_rect` is `Some` only
     /// after a real scene pass, so a canvas that was never drawn publishes a zoom-only snapshot.
     #[must_use]
     pub fn viewport_snapshot(&self) -> CanvasViewportSnapshot {
         CanvasViewportSnapshot {
             zoom: self.state.zoom,
-            scroll_offset: self.scene.scroll_offset,
+            scroll_x_from_center: self.scroll_x_from_center(),
+            scroll_y: self.scene.scroll_offset.y,
             laid_out: self.scene.scroll_inner_rect.is_some(),
         }
     }
 
-    /// Restores `snapshot` onto this canvas: the zoom applies immediately, the scroll offset is
-    /// queued for the next draw.
+    /// Restores `snapshot` onto this canvas: the zoom applies immediately, the scroll position is
+    /// queued for the next draw, which resolves it against the strip it lays out (this canvas'
+    /// aside presence is only rebuilt in `draw`).
     ///
     /// A snapshot with `laid_out == false` carries no usable offset (see
     /// [`CanvasViewportSnapshot::laid_out`]): only its zoom is applied, and every pending
@@ -1108,12 +1129,19 @@ impl CanvasView {
         if !snapshot.laid_out {
             return;
         }
-        let scroll_offset = egui::vec2(
-            snapshot.scroll_offset.x.max(0.0),
-            snapshot.scroll_offset.y.max(0.0),
-        );
-        self.scene.scroll_offset = scroll_offset;
-        self.scene.pending_scroll_offset = Some(scroll_offset);
+        let request = PendingScrollOffset::FromCenter {
+            scroll_x_from_center: snapshot.scroll_x_from_center,
+            scroll_y: snapshot.scroll_y.max(0.0),
+        };
+        // Provisional read-back until the next scene pass replaces it: resolved against this
+        // canvas' last laid-out strip, so a zoom-anchor capture or a snapshot taken before that
+        // pass already reports (approximately) the restored position. A canvas that was never
+        // laid out has no strip to resolve against, so its provisional x is the left edge.
+        self.scene.scroll_offset = match self.scene.scroll_inner_rect {
+            Some(rect) => self.resolve_pending_scroll_offset(request, rect.width()),
+            None => egui::vec2(0.0, snapshot.scroll_y.max(0.0)),
+        };
+        self.scene.pending_scroll_offset = Some(request);
         self.scene.pending_zoom_anchor = None;
         // A snapshot restore is a full explicit viewport and the newest navigation intent: it
         // supersedes any not-yet-applied deferred page focus.
@@ -1203,7 +1231,7 @@ impl CanvasView {
             .clamp(0.0, max_scroll_x);
         let offset = egui::vec2(offset_x, (content_center.y - viewport.y * 0.5).max(0.0));
         self.scene.scroll_offset = offset;
-        self.scene.pending_scroll_offset = Some(offset);
+        self.scene.pending_scroll_offset = Some(PendingScrollOffset::Absolute(offset));
         self.scene.pending_zoom_anchor = None;
         self.latch_horizontal_centering();
         true
@@ -3170,18 +3198,24 @@ mod tests {
         let mut canvas = CanvasView::default();
         let snapshot = CanvasViewportSnapshot {
             zoom: 2.25,
-            scroll_offset: egui::vec2(120.0, 340.0),
+            scroll_x_from_center: 120.0,
+            scroll_y: 340.0,
             laid_out: true,
         };
 
         canvas.apply_viewport_snapshot(snapshot);
 
         assert!((canvas.zoom() - 2.25).abs() <= f32::EPSILON);
-        assert_eq!(canvas.scene.scroll_offset, snapshot.scroll_offset);
         assert_eq!(
             canvas.scene.pending_scroll_offset,
-            Some(snapshot.scroll_offset)
+            Some(PendingScrollOffset::FromCenter {
+                scroll_x_from_center: 120.0,
+                scroll_y: 340.0,
+            })
         );
+        // The never-laid-out receiver has no strip yet, so the provisional read-back puts x at the
+        // left edge and keeps y.
+        assert_eq!(canvas.scene.scroll_offset, egui::vec2(0.0, 340.0));
         assert!(canvas.scene.pending_zoom_anchor.is_none());
     }
 
@@ -3195,7 +3229,8 @@ mod tests {
 
         canvas.apply_viewport_snapshot(CanvasViewportSnapshot {
             zoom: 3.0,
-            scroll_offset: Vec2::ZERO,
+            scroll_x_from_center: 0.0,
+            scroll_y: 0.0,
             laid_out: false,
         });
 
@@ -3222,6 +3257,52 @@ mod tests {
         canvas.scene.scroll_inner_rect =
             Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0)));
         assert!(canvas.viewport_snapshot().laid_out);
+    }
+
+    #[test]
+    fn viewport_snapshot_keeps_page_screen_x_across_strip_widths() {
+        // Contract: a snapshot transfers the horizontal position strip-independently. The source
+        // canvas has no aside gutter (strip 2240), the destination reserves one (strip 3120); the
+        // page must land at the same screen x in both, for a centered and an off-center view.
+        let viewport = Rect::from_min_size(Pos2::ZERO, egui::vec2(1600.0, 900.0));
+        let page_width = 800.0;
+        let laid_out_canvas = |content_world_width: f32| {
+            let mut canvas = CanvasView::default();
+            canvas.state.zoom = 1.0;
+            canvas.scene.content_world_width = content_world_width;
+            canvas.scene.max_page_world_width = page_width;
+            canvas.scene.scroll_inner_rect = Some(viewport);
+            canvas
+        };
+        // Page screen x relative to the viewport: in-strip image offset minus the scroll offset.
+        let page_screen_x = |canvas: &CanvasView, scroll_x: f32| {
+            let inset = canvas.viewport_content_inset_x(viewport.width());
+            let image_offset_x = (canvas.scene.content_world_width - page_width) * 0.5;
+            inset + image_offset_x - scroll_x
+        };
+
+        for source_x in [320.0_f32, 100.0, 560.0] {
+            let mut source = laid_out_canvas(page_width);
+            source.scene.scroll_offset = egui::vec2(source_x, 1234.0);
+            let snapshot = source.viewport_snapshot();
+            assert!(snapshot.laid_out);
+            assert!((snapshot.scroll_y - 1234.0).abs() <= 1e-4);
+
+            let mut destination = laid_out_canvas(page_width + 2.0 * 1160.0);
+            destination.apply_viewport_snapshot(snapshot);
+            let Some(request) = destination.scene.pending_scroll_offset else {
+                panic!("a laid-out snapshot must queue a scroll request");
+            };
+            let resolved = destination.resolve_pending_scroll_offset(request, viewport.width());
+
+            assert!((resolved.y - 1234.0).abs() <= 1e-4);
+            let expected = page_screen_x(&source, source_x);
+            let actual = page_screen_x(&destination, resolved.x);
+            assert!(
+                (expected - actual).abs() <= 1e-3,
+                "source x {source_x}: page at {expected} before, {actual} after"
+            );
+        }
     }
 
     /// Builds a loaded `PageImageInfo` for the deferred-focus tests.
@@ -3266,7 +3347,10 @@ mod tests {
         // viewport, so the horizontal scroll range is empty and x clamps to 0 for lack of ANY
         // valid offset, not because the mapping bottoms out.
         assert_eq!(canvas.max_scroll_offset_x_for_viewport(800.0), 0.0);
-        assert_eq!(canvas.scene.pending_scroll_offset, Some(egui::vec2(0.0, 150.0)));
+        assert_eq!(
+            canvas.scene.pending_scroll_offset,
+            Some(PendingScrollOffset::Absolute(egui::vec2(0.0, 150.0)))
+        );
         assert_eq!(canvas.scene.scroll_offset, egui::vec2(0.0, 150.0));
         assert_eq!(
             canvas.scene.horizontal_centering,
@@ -3289,7 +3373,10 @@ mod tests {
         // An explicit center needs no page info: an empty map still resolves.
         assert!(canvas.try_apply_pending_focus(&HashMap::new()));
         // content center = (50, 150) * 2.0 = (100, 300); offset = (100, 300) - (200, 100).
-        assert_eq!(canvas.scene.pending_scroll_offset, Some(egui::vec2(0.0, 200.0)));
+        assert_eq!(
+            canvas.scene.pending_scroll_offset,
+            Some(PendingScrollOffset::Absolute(egui::vec2(0.0, 200.0)))
+        );
         assert!(canvas.scene.pending_focus.is_none());
     }
 
@@ -3298,7 +3385,8 @@ mod tests {
         let mut canvas = CanvasView::default();
 
         // The newest focus_page replaces the pending request and drops a stale raw offset.
-        canvas.scene.pending_scroll_offset = Some(egui::vec2(11.0, 22.0));
+        canvas.scene.pending_scroll_offset =
+            Some(PendingScrollOffset::Absolute(egui::vec2(11.0, 22.0)));
         canvas.focus_page(1, Some(egui::vec2(10.0, 10.0)), 1.0);
         canvas.focus_page(2, None, 1.0);
         assert!(canvas.scene.pending_scroll_offset.is_none());
@@ -3313,11 +3401,18 @@ mod tests {
         // A snapshot restore is newer still: it drops the pending focus entirely.
         canvas.apply_viewport_snapshot(CanvasViewportSnapshot {
             zoom: 1.0,
-            scroll_offset: egui::vec2(5.0, 6.0),
+            scroll_x_from_center: 5.0,
+            scroll_y: 6.0,
             laid_out: true,
         });
         assert!(canvas.scene.pending_focus.is_none());
-        assert_eq!(canvas.scene.pending_scroll_offset, Some(egui::vec2(5.0, 6.0)));
+        assert_eq!(
+            canvas.scene.pending_scroll_offset,
+            Some(PendingScrollOffset::FromCenter {
+                scroll_x_from_center: 5.0,
+                scroll_y: 6.0,
+            })
+        );
     }
 
     #[test]
