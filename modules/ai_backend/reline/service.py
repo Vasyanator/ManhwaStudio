@@ -34,10 +34,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from config import MODELS_DIR
+from ..runtime.paths import side_models_root
 
 CATALOG_URL = "https://mdb.yor.ovh/v1/files"
-MODEL_DIR = Path(MODELS_DIR) / "side_models" / "Reline"
+# Module attribute (not a function) on purpose: the tests patch it. The root comes from the
+# backend's single owner of the side-model root, `runtime.paths.side_models_root()`.
+MODEL_DIR = side_models_root() / "Reline"
 DOWNLOAD_DIR = MODEL_DIR / ".download"
 MODEL_SUFFIXES = (".pt", ".pth", ".ckpt", ".safetensors")
 ARCHIVE_SUFFIXES = (".tar.xz", ".txz")

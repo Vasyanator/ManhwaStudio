@@ -52,7 +52,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   exports need onnxruntime) gates both the selected engine's options interface and the load button —
   when the requirement is known-unavailable, both are disabled and the requirement's
   `disabled_reason` is shown. The panel reads capabilities from the process-global `AiCaps::current`,
-  not from parameters.
+  not from parameters. `selected_mode_requirement` is `pub(crate)` and the single owner of "which
+  runtime does the selected OCR mode need": the tab's Torch-unavailable status
+  (`tab.rs::selected_ocr_mode_requires_torch`) only checks it for `Some(AiRequirement::Torch)`.
 - `ocr_langs.rs`: static EasyOCR and PaddleOCR language catalogs used by the OCR panel.
   Each entry is `(wire_code, display_key)`: the wire code is the persisted identity
   sent to the backend, the display key is an i18n catalog key resolved to a localized

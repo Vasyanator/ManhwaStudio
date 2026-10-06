@@ -9,10 +9,11 @@ tool: regenerates / removes content under a painted mask.
 Model layout (everything under `ManhwaStudio_AI_Models/side_models/`, NOT the HF
 cache):
 - transformer: a GGUF quant chosen by the user, downloaded on demand from
-  `YarvixPA/FLUX.1-Fill-dev-GGUF` into `FLUX_FILL_DIR`;
+  `YarvixPA/FLUX.1-Fill-dev-GGUF` into `side_models/FLUX.1-Fill-dev-GGUF`;
 - VAE / CLIP-L / T5-XXL / scheduler / tokenizers: diffusers components downloaded
   from the open (non-gated) `ostris/Flex.1-alpha` repo (architecturally identical
-  to FLUX.1) into `FLUX_FILL_COMPONENTS_DIR`.
+  to FLUX.1) into its `components/` subdirectory. Both directories derive from
+  `runtime.paths.side_models_root()`, the backend's single owner of that root.
 
 Main responsibilities:
 - list/quant management + on-demand download with byte-level progress;
@@ -52,14 +53,9 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     import numpy as np
 
-try:
-    import config as _config
-except Exception:  # pragma: no cover - config is always importable in-app
-    _config = None
-
 from ..engines.model_download import download_bearer_to_path
 from ..runtime.model_manager import LoadedModelManager
-from ..runtime.paths import program_root
+from ..runtime.paths import side_models_root
 from ..runtime.rocm_mmap_transfer import (
     mmap_staging_required,
     patched_module_to,
@@ -117,17 +113,16 @@ def gguf_path(quant: str) -> str:
 
 
 def _flux_dir() -> str:
-    if _config is not None and hasattr(_config, "FLUX_FILL_DIR"):
-        return _config.FLUX_FILL_DIR
-    # Fallback when `config` is unavailable: resolve against the program root
-    # (owned by `runtime/paths.py`) instead of counting parent directories here.
-    root = str(program_root())
-    return os.path.join(root, "ManhwaStudio_AI_Models", "side_models", "FLUX.1-Fill-dev-GGUF")
+    """`<side_models>/FLUX.1-Fill-dev-GGUF`: the GGUF transformer quants.
+
+    Returned as `str` because callers do string path arithmetic on it
+    (`os.path.join`, `os.path.dirname`).
+    """
+    return os.fspath(side_models_root() / "FLUX.1-Fill-dev-GGUF")
 
 
 def _components_dir() -> str:
-    if _config is not None and hasattr(_config, "FLUX_FILL_COMPONENTS_DIR"):
-        return _config.FLUX_FILL_COMPONENTS_DIR
+    """`<flux dir>/components`: the diffusers VAE / CLIP / T5 / scheduler components."""
     return os.path.join(_flux_dir(), "components")
 
 

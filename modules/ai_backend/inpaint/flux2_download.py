@@ -96,13 +96,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
-try:
-    import config as _config
-except Exception:  # pragma: no cover - config is always importable in-app
-    _config = None
-
 from ..engines.model_download import discard_staging, download_bearer_to_path, staged_bytes
-from ..runtime.paths import program_root
+from ..runtime.paths import side_models_root
 
 log = logging.getLogger(__name__)
 
@@ -496,16 +491,13 @@ class PlannedFile:
 def model_root(variant: ModelVariant) -> Path:
     """Directory that receives the whole model: `<side_models>/<variant dir>`.
 
-    Resolved through root `config.SIDE_MODELS_DIR` when `config` is importable
-    and against `runtime.paths.program_root()` otherwise — never by counting
-    parent directories here.
+    The side-model root comes from `runtime.paths.side_models_root()`, the
+    backend's single owner of it — never from root `config` or a local join.
 
     `variant` is REQUIRED and has no default on purpose: a caller that forgot it
     would silently write one variant's weights into the other's directory.
     """
-    if _config is not None and hasattr(_config, "SIDE_MODELS_DIR"):
-        return Path(_config.SIDE_MODELS_DIR) / variant.dir_name
-    return Path(program_root()) / "ManhwaStudio_AI_Models" / "side_models" / variant.dir_name
+    return side_models_root() / variant.dir_name
 
 
 def required_repos(variant: ModelVariant, uncensored: bool) -> tuple[str, ...]:

@@ -254,7 +254,7 @@ use crate::panels::machine_translation::{
     MtPanelOptions, MtPanelProgress, MtPanelRun, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
 };
 use crate::panels::ocr::{
-    CharReplacementRuleUi, OcrPanelOptions, draw_ocr_panel,
+    CharReplacementRuleUi, OcrPanelOptions, draw_ocr_panel, selected_mode_requirement,
 };
 use crate::panels::text_detector::{
     TextDetectorAlgorithm, TextDetectorPanelOptions, TextDetectorPanelView, TextDetectorPlanNoticeCache,
@@ -271,7 +271,8 @@ use ms_widgets::panel_dock::{
     PanelNode, TabId,
 };
 use ms_widgets::{
-    AutocompleteLine, MarkFill, ScrollMark, ScrollSpan, WheelComboBox, WheelSlider, WheelSpinBox,
+    AiRequirement, AutocompleteLine, MarkFill, ScrollMark, ScrollSpan, WheelComboBox, WheelSlider,
+    WheelSpinBox,
 };
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
@@ -1430,16 +1431,10 @@ impl TranslationTabState {
             .or_else(ms_sysprobe::ai_backend_capabilities::torch_available)
     }
 
+    /// Whether the selected OCR engine+model needs PyTorch. Delegates to the single owner of the
+    /// selected mode's runtime requirement, `panels::ocr::selected_mode_requirement`.
     fn selected_ocr_mode_requires_torch(&self) -> bool {
-        match self.ocr_panel_options.engine {
-            OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya => true,
-            OcrEngine::MangaOcr => self
-                .ocr_panel_options
-                .manga_model
-                .trim()
-                .eq_ignore_ascii_case("base_torch"),
-            OcrEngine::PaddleOcr | OcrEngine::AiApi => false,
-        }
+        matches!(selected_mode_requirement(&self.ocr_panel_options), Some(AiRequirement::Torch))
     }
 
     fn current_ocr_torch_requirement_error(&self) -> Option<String> {

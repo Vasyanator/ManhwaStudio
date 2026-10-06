@@ -13,7 +13,7 @@ never imports this package directly.
 Reline works entirely on on-disk paths — no image bytes cross the IPC socket. `process_image_file`
 builds a node list (`file_reader` → processing nodes → writer), resolves the checkpoint to a LOCAL
 path, and hands the JSON to `reline.Pipeline`. The Torch-backed pipeline is imported lazily inside
-that call, so nothing here is imported at backend startup beyond `config.MODELS_DIR`.
+that call, so nothing here is imported at backend startup beyond the stdlib-only `runtime.paths`.
 
 Model resolution order: an existing local file under `MODEL_DIR` → the remote catalog
 (`CATALOG_URL`) → the built-in `EXTRA_MODELS` list. Downloads land in `MODEL_DIR/.download`;
@@ -45,7 +45,8 @@ two places:
 
 ## Contracts and invariants
 - Reline checkpoints are Torch files kept under `ManhwaStudio_AI_Models/side_models/Reline`
-  (`MODEL_DIR`, derived from `config.MODELS_DIR`).
+  (`MODEL_DIR`, derived from `runtime.paths.side_models_root()`, the backend's single owner of
+  that root).
 - TORCH CHECKPOINTS ONLY — this is a hard upstream constraint, not a policy of ours. The `upscale`
   node is a thin wrapper over `resselt.load_from_file` (`reline/nodes/upscale/node.py`), and that
   function dispatches on the file extension: `.pt` / `.pth` / `.ckpt` / `.safetensors`, and raises

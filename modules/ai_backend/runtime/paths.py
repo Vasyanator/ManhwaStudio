@@ -7,10 +7,15 @@ for the whole `modules/ai_backend` package.
 
 Main responsibilities:
 - resolve the program root (the directory that contains `config.py`,
-  `modules/` and `ManhwaStudio_AI_Models/`) from this file's location.
+  `modules/` and `ManhwaStudio_AI_Models/`) from this file's location;
+- own the backend's side-model root
+  (`ManhwaStudio_AI_Models/side_models`): every backend consumer of an
+  on-demand side model (FLUX.1-Fill, FLUX.2 klein, watermark removal, Reline)
+  derives its directory from `side_models_root()`.
 
 Key functions:
 - `program_root()`
+- `side_models_root()`
 
 Notes:
 - Deliberately dependency-free: standard library only, no `torch`, no
@@ -19,6 +24,9 @@ Notes:
   effects.
 - The depth constant lives here and nowhere else. Moving this file between
   directory levels is the only edit that may change it.
+- Root `config.py` still spells the same side-model directories for its
+  folder-creation list (it is outside this package). `test_paths.py` asserts
+  the two agree.
 """
 
 from __future__ import annotations
@@ -46,3 +54,15 @@ def program_root() -> Path:
     wrong root.
     """
     return _PROGRAM_ROOT
+
+
+def side_models_root() -> Path:
+    """Return `<program root>/ManhwaStudio_AI_Models/side_models`.
+
+    This is the SINGLE backend owner of the side-model root: the on-demand
+    third-party models (FLUX.1-Fill, FLUX.2 klein, watermark removal, Reline)
+    each live in one subdirectory of it, and every backend module derives that
+    subdirectory from here instead of reading root `config` or re-joining the
+    path itself. Pure path arithmetic: nothing is created or probed on disk.
+    """
+    return program_root() / "ManhwaStudio_AI_Models" / "side_models"

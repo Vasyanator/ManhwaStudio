@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from ..runtime.paths import program_root
+from ..runtime.paths import side_models_root
 
 log = logging.getLogger(__name__)
 
@@ -278,19 +278,11 @@ _loaded_modules: dict[str, types.ModuleType] = {}
 def _watermark_dir() -> Path:
     """Root of the on-disk layout: `side_models/WatermarkRemoval`.
 
-    Prefers root `config.WATERMARK_DIR` and falls back to the program root
-    (owned by `runtime/paths.py`) so this module stays importable in a bare test
-    process where `config` is not on the path.
+    Derived from `runtime.paths.side_models_root()`, the backend's single owner
+    of the side-model root; stdlib-only, so this module stays importable in a
+    bare test process.
     """
-    try:
-        import config as _config
-
-        configured = getattr(_config, "WATERMARK_DIR", None)
-        if isinstance(configured, str) and configured:
-            return Path(configured)
-    except Exception:  # pragma: no cover - config is always importable in-app
-        log.debug("watermark: root `config` unavailable, resolving via program_root()")
-    return program_root() / "ManhwaStudio_AI_Models" / "side_models" / "WatermarkRemoval"
+    return side_models_root() / "WatermarkRemoval"
 
 
 def model_dir(model_id: str) -> Path:

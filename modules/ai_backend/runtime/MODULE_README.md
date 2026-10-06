@@ -22,7 +22,10 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 
 ## Files and submodules
 - `paths.py`: `program_root()` — the installation/repo root that contains `config.py`, `modules/`
-  and `ManhwaStudio_AI_Models/`. Stdlib only; imported freely by any layer.
+  and `ManhwaStudio_AI_Models/` — and `side_models_root()` —
+  `ManhwaStudio_AI_Models/side_models` under it. Stdlib only; imported freely by any layer.
+- `test_paths.py`: pins every side-model consumer directory (FLUX.1-Fill, FLUX.2 klein variants,
+  watermark removal, Reline) to `side_models_root()` and to the root `config.py` constants.
 - `torch_support.py`: `is_torch_available()` cached import probe, a debug override that simulates a
   missing Torch (`configure_torch_support(simulate_disabled=...)`), and the stable user-facing
   message for Torch-gated endpoints.
@@ -54,6 +57,11 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - **`paths.program_root()` is the single owner of the package's directory-depth assumption.** No
   other module in `modules/ai_backend` may compute a root with `Path(__file__).resolve().parents[N]`.
   Moving a file between package directories must not require a matching constant edit anywhere else.
+- **`paths.side_models_root()` is the single backend owner of the side-model root.** Every backend
+  consumer of an on-demand side model derives its directory as `side_models_root() / <name>`; none
+  reads root `config` (`SIDE_MODELS_DIR`, `FLUX_FILL_DIR`, `WATERMARK_DIR`, `MODELS_DIR`) or joins
+  `ManhwaStudio_AI_Models/side_models` itself. Root `config.py` still lists the same directories for
+  its folder-creation pass; `test_paths.py` asserts both spellings agree.
 - `__init__.py` re-exports nothing and imports no submodule. The package must stay import-cheap so
   the torch-free `ipc/` layer and its tests never drag in the AI stack — the same reason the parent
   `modules/ai_backend/__init__.py` resolves `run_server` lazily via PEP 562.
@@ -153,6 +161,8 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 
 ## Editing map
 - To change how the installation root is found, edit `paths.py` — and only `paths.py`.
+- To place a new on-demand side model, use `side_models_root() / "<dir>"` and add its consumer to
+  `test_paths.py`.
 - To change device selection, sentinel handling, or device-name probing, edit `device_service.py`.
 - To change the resident-model cap or eviction policy, edit `model_manager.py`.
 - To change MIOpen tuning, the MIOpen cache location, the allocator override, or an environment

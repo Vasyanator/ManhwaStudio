@@ -66,7 +66,7 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
 - `watermark/`: visible-watermark removal (`watermark.detect` / `.remove` / `.status` / `.unload`).
   A domain of its own, not an inpainter: it PREDICTS a mask instead of consuming one, and its
   weights plus the network code are fetched on demand into `side_models/WatermarkRemoval/`
-  (`config.WATERMARK_DIR`). See `watermark/MODULE_README.md`.
+  (`runtime.paths.side_models_root()`). See `watermark/MODULE_README.md`.
 - `reline/`: Reline pipeline adapter and catalog-backed downloader (`reline.models`,
   `reline.process`). See `reline/MODULE_README.md`.
 - `translate/`: machine translation (`translate.deep`). See `translate/MODULE_README.md`.

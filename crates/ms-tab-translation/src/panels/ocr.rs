@@ -6,8 +6,10 @@ Main types:
 - `OcrPanelOptions`: user OCR options (engine/langs/model/behavior toggles).
 - `OcrPanelActions`: UI actions emitted to tab controller.
 
-Main function:
+Main functions:
 - `draw_ocr_panel`: renders OCR controls and last OCR preview.
+- `selected_mode_requirement`: crate-visible single owner of the runtime the
+  selected engine+model needs (the tab's Torch status delegates to it).
 
 UI specifics:
 - Runtime engine-selection buttons are `AiButton`s gated on a per-engine
@@ -231,7 +233,11 @@ fn engine_button_requirement(engine: OcrEngine) -> Option<AiRequirement> {
 /// AiRequirement of the currently-selected engine+model combo (model-aware),
 /// used to gate the engine's options interface and the load button. `None` for
 /// AiApi (network-only).
-fn selected_mode_requirement(options: &OcrPanelOptions) -> Option<AiRequirement> {
+///
+/// Single owner of "which runtime does the selected OCR mode need": the
+/// Translation tab's Torch-unavailable status (`selected_ocr_mode_requires_torch`)
+/// is `Some(AiRequirement::Torch)` of this function, never a parallel match.
+pub(crate) fn selected_mode_requirement(options: &OcrPanelOptions) -> Option<AiRequirement> {
     match options.engine {
         // MangaOCR runs on the runtime of its selected model: the `base_torch`
         // export needs PyTorch, the ONNX exports need onnxruntime.
@@ -1065,6 +1071,59 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(selected_mode_requirement(&ai_api), None);
+    }
+
+    /// Every engine, spelled through an exhaustive match so a new variant fails to compile here
+    /// until the truth table below covers it.
+    fn all_engines() -> [OcrEngine; 6] {
+        let all = [
+            OcrEngine::MangaOcr,
+            OcrEngine::EasyOcr,
+            OcrEngine::PaddleOcr,
+            OcrEngine::PaddleVl,
+            OcrEngine::Surya,
+            OcrEngine::AiApi,
+        ];
+        for engine in all {
+            match engine {
+                OcrEngine::MangaOcr
+                | OcrEngine::EasyOcr
+                | OcrEngine::PaddleOcr
+                | OcrEngine::PaddleVl
+                | OcrEngine::Surya
+                | OcrEngine::AiApi => {}
+            }
+        }
+        all
+    }
+
+    /// Expected Torch need per engine and MangaOCR model: the Translation tab's
+    /// Torch-unavailable status depends on exactly this table.
+    fn expected_requires_torch(engine: OcrEngine, manga_model: &str) -> bool {
+        match engine {
+            OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya => true,
+            OcrEngine::MangaOcr => matches!(manga_model, "base_torch" | " BASE_TORCH "),
+            OcrEngine::PaddleOcr | OcrEngine::AiApi => false,
+        }
+    }
+
+    #[test]
+    fn torch_need_truth_table_matches_selected_mode_requirement() {
+        let models = ["base_onnx", "2025_onnx", "base_torch", " BASE_TORCH ", ""];
+        for engine in all_engines() {
+            for model in models {
+                let options = OcrPanelOptions {
+                    engine,
+                    manga_model: model.to_string(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    expected_requires_torch(engine, model),
+                    matches!(selected_mode_requirement(&options), Some(AiRequirement::Torch)),
+                    "engine {engine:?}, manga_model {model:?}"
+                );
+            }
+        }
     }
 
     #[test]
