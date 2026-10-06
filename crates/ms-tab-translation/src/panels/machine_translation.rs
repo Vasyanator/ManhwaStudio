@@ -5,13 +5,17 @@ UI panel for machine translation options in Translation tab.
 Main items:
 - `MtPanelOptions`: selected MT service + source/target languages.
 - `MtPanelProgress`: transient run progress shown while a translation is active.
-- `MtPanelRun`: the per-frame run view the tab lends the panel (busy, can-cancel, progress and
-  the live AI API generation snapshot).
+- `MtPanelRun`: the per-frame run view the tab lends the panel (busy, can-cancel, progress, the
+  live AI API generation snapshot and the last run's issues).
+- Run issues: a collapsed "Замечания последнего перевода" list under the actions (both tabs):
+  one row per bubble that failed (red) or whose translation a content check marked (yellow),
+  `#id: reason`; the list belongs to `TranslationMtController::run_issues`.
 - `MtStopNotice`: sticky yellow notice shown when an AI run stopped due to a probable credit/quota or
   usage-limit error, with a toggle that reveals the full provider error.
 - AI API MT options: the connection section (source/target languages, then the shared
   `ms_ai_api::draw_connection` widget for provider/base URL/key/model/system prompt), JSON batch
-  size, reasoning, context budget, and optional ImageBubble inclusion/visual detail.
+  size, reasoning, context budget, optional ImageBubble inclusion/visual detail, and the opt-in
+  "strict JSON format" toggle (`ai_strict_json`, a `HelpHint` explains it).
 - Translation mode toggle (`ai_image_mode`): "Обычный" batched mode vs "Только картинки"
   (per-ImageBubble) mode; the latter adds a chapter-context source switch (`ai_image_context_source`:
   original vs translation). Image modes are blocked only for a model `ms_ai_api::image_input_support`
@@ -31,11 +35,12 @@ Notes:
 */
 
 use crate::machine_translation::{
-    AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtReasoning, AiMtSortMode, MtService,
+    AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtReasoning, AiMtSortMode, MtRunIssue,
+    MtRunIssueKind, MtService,
 };
 use crate::panels::section_header_button;
 use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, GenerationSnapshot, ImageInputSupport, draw_connection, draw_generation_status, image_input_support};
-use ms_widgets::WheelComboBox;
+use ms_widgets::{HelpHint, WheelComboBox};
 
 #[derive(Debug, Clone)]
 pub struct MtPanelOptions {
@@ -58,6 +63,9 @@ pub struct MtPanelOptions {
     pub ai_image_detail: AiMtImageDetail,
     pub ai_image_mode: AiMtImageMode,
     pub ai_image_context_source: AiMtContextSource,
+    /// Ask the provider for structured output (JSON schema); opt-in, persisted as
+    /// `machine_translation.ai_api.strict_json`.
+    pub ai_strict_json: bool,
     pub ai_open_section: AiMtPanelSection,
 }
 
@@ -101,6 +109,7 @@ impl Default for MtPanelOptions {
             ai_image_detail: AiMtImageDetail::Auto,
             ai_image_mode: AiMtImageMode::Normal,
             ai_image_context_source: AiMtContextSource::Translation,
+            ai_strict_json: false,
             ai_open_section: AiMtPanelSection::Translation,
         }
     }
@@ -122,7 +131,7 @@ pub enum AiMtPanelSection {
 
 /// What the panel shows about the current MT run, lent by the tab each frame.
 #[derive(Debug, Clone, Copy)]
-pub struct MtPanelRun {
+pub struct MtPanelRun<'a> {
     /// A run is in progress: the start buttons are disabled and the progress is shown.
     pub busy: bool,
     /// The cancel button is enabled (a run is active or pending).
@@ -132,6 +141,9 @@ pub struct MtPanelRun {
     /// Live state of the AI API request in flight (`TranslationMtController::generation_snapshot`);
     /// inactive for the legacy translators.
     pub generation: GenerationSnapshot,
+    /// Failures and content warnings of the active or last run
+    /// (`TranslationMtController::run_issues`).
+    pub issues: &'a [MtRunIssue],
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -342,7 +354,7 @@ const MT_TARGET_LANGUAGES: &[MtLanguage] = &[
 /// ignores them for such a run).
 pub fn draw_machine_translation_panel(
     ui: &mut egui::Ui,
-    run: MtPanelRun,
+    run: MtPanelRun<'_>,
     stop_notice: &mut Option<MtStopNotice>,
     options: &mut MtPanelOptions,
     project_context_available: bool,
@@ -371,9 +383,41 @@ pub fn draw_machine_translation_panel(
         MtPanelTab::AiApi => draw_ai_api_tab(ui, run, options, project_context_available, &mut actions),
     }
 
+    draw_run_issues(ui, run.issues);
     draw_mt_stop_notice(ui, stop_notice);
 
     actions
+}
+
+/// Renders the last run's failures and content warnings as a collapsed list (nothing when there
+/// are none): one wrapped row `#id: reason` per issue, red for a failure, yellow for a warning.
+fn draw_run_issues(ui: &mut egui::Ui, issues: &[MtRunIssue]) {
+    if issues.is_empty() {
+        return;
+    }
+    let failed = issues.iter().filter(|issue| issue.kind == MtRunIssueKind::Failed).count();
+    let warnings = issues.len() - failed;
+    ui.separator();
+    // The heading carries live counts, so the i18n key pins the collapsed state.
+    egui::CollapsingHeader::new(tf!("translation.mt_panel.run_issues_heading", failed = failed, warnings = warnings))
+        .id_salt("translation.mt_panel.run_issues_heading")
+        .default_open(false)
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("translation.mt_panel.run_issues_list")
+                .max_height(180.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for issue in issues {
+                        let color = match issue.kind {
+                            MtRunIssueKind::Failed => ms_theme::status::ERROR,
+                            MtRunIssueKind::Warning => ms_theme::status::WARNING,
+                        };
+                        let row = tf!("translation.mt_panel.run_issue_row", bubble_id = issue.bubble_id, reason = issue.text);
+                        ui.add(egui::Label::new(egui::RichText::new(row).small().color(color)).wrap());
+                    }
+                });
+        });
 }
 
 /// Renders the sticky credit/quota stop notice (if any) with a toggle that reveals the full
@@ -428,11 +472,11 @@ fn draw_mt_stop_notice(ui: &mut egui::Ui, stop_notice: &mut Option<MtStopNotice>
 
 fn draw_machine_tab(
     ui: &mut egui::Ui,
-    run: MtPanelRun,
+    run: MtPanelRun<'_>,
     options: &mut MtPanelOptions,
     actions: &mut MtPanelActions,
 ) {
-    let MtPanelRun { busy, can_cancel, progress, generation: _ } = run;
+    let MtPanelRun { busy, can_cancel, progress, generation: _, issues: _ } = run;
     actions.options_changed |= draw_service_combo(ui, &mut options.service);
 
     actions.options_changed |=
@@ -482,12 +526,12 @@ fn draw_machine_tab(
 
 fn draw_ai_api_tab(
     ui: &mut egui::Ui,
-    run: MtPanelRun,
+    run: MtPanelRun<'_>,
     options: &mut MtPanelOptions,
     project_context_available: bool,
     actions: &mut MtPanelActions,
 ) {
-    let MtPanelRun { busy, can_cancel, progress, generation } = run;
+    let MtPanelRun { busy, can_cancel, progress, generation, issues: _ } = run;
     actions.options_changed |=
         normalize_selected_lang(&mut options.source_lang, MT_SOURCE_LANGUAGES, "auto");
     actions.options_changed |=
@@ -683,6 +727,12 @@ fn draw_ai_translation_section(
             t!("translation.mt_panel.include_existing_translation_label"),
         )
         .changed();
+    ui.horizontal(|ui| {
+        actions.options_changed |= ui
+            .checkbox(&mut options.ai_strict_json, t!("translation.mt_panel.strict_json_label"))
+            .changed();
+        HelpHint::text(t!("translation.mt_panel.strict_json_hint")).show(ui);
+    });
     // Image modes are offered unless the model is KNOWN to be text-only: an unlisted model
     // (`Unknown`, e.g. a local server's) may well accept images, and the user can tell.
     let images_allowed = image_input_support(&options.ai_api.model) != ImageInputSupport::NotSupported;

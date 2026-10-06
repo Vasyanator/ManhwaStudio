@@ -17,10 +17,12 @@
 // - AI API OCR builds `genai` multimodal chat calls (through `ms_ai_api`: target with the
 //   base URL of a compatible service, client, credential-store API keys (optional for a
 //   compatible service), async bridge) from the worker thread and runs them through the
-//   tracked streaming executor `ms_ai_api::exec_chat_tracked`: the controller's
+//   validated streaming executor `ms_ai_api::exec_chat_validated`: the controller's
 //   `GenerationTracker` shows the live phase / received characters in the panel, and
 //   "Stop" (`cancel_generation`) or dropping the controller aborts the HTTP request; a
-//   stopped request is published as `RecognizeCancelled`, never as an error.
+//   stopped request is published as `RecognizeCancelled`, never as an error. The answer is
+//   cleaned (`<think>` blocks, a code fence wrapping the whole answer) before line
+//   splitting; an answer left empty by that is asked for ONCE more (`ai_api_ocr_validation`).
 // - Post-OCR processing (`apply_post_ocr_processing`) runs in the worker before
 //   the result is published, so every engine path and the stored last result
 //   share the same text: character substitution (`CharReplacementRule`) first,
@@ -44,7 +46,9 @@ use ms_onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
 // target-neutral; only the bodies that build `genai` requests are gated below.
 use ms_ai_api::{AiApiService, AiApiTarget, GenerationSnapshot, GenerationTracker};
 #[cfg(not(target_arch = "wasm32"))]
-use ms_ai_api::AiApiError;
+use ms_ai_api::{AiApiError, RepairRequest, RetryReason, TrackedAnswer, Validation};
+#[cfg(not(target_arch = "wasm32"))]
+use ms_ai_api::structured::{clean_plain_text, strip_think_blocks};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::genai::chat::{ChatMessage, ChatRequest, ContentPart};
 use image::{DynamicImage, GenericImageView, ImageFormat};
@@ -1396,8 +1400,9 @@ fn run_ai_api_ocr_request(
     Err(AiApiOcrFailure::Failed(t!("translation.ocr.ai_api_web_unavailable_error").to_string()))
 }
 
-/// Recognizes the request's crop with the selected AI API model, streamed through
-/// `ms_ai_api::exec_chat_tracked` so `generation` shows its progress and can stop it.
+/// Recognizes the request's crop with the selected AI API model through
+/// `ms_ai_api::exec_chat_validated` (tracked streaming: `generation` shows its progress and can
+/// stop it; one retry when the cleaned answer is empty, see `ai_api_ocr_validation`).
 #[cfg(not(target_arch = "wasm32"))]
 fn run_ai_api_ocr_request(
     request: &OcrRecognizeRequest,
@@ -1436,11 +1441,11 @@ fn run_ai_api_ocr_request(
                 ),
             ]));
         // Tagged with the request id, so a "Stop" can tell which request it was shown for.
-        ms_ai_api::exec_chat_tracked(&client, model, chat_req, None, generation, request.request_id).await
+        ms_ai_api::exec_chat_validated(&client, model, chat_req, None, generation, request.request_id, ai_api_ocr_validation).await
     })
     .map_err(|err| tf!("translation.ocr.async_runtime_error", err = err))?;
     let text = match text {
-        Ok(text) => text.trim().to_string(),
+        Ok(validated) => validated.value,
         Err(AiApiError::Cancelled) => return Err(AiApiOcrFailure::Cancelled),
         Err(err) => return Err(AiApiOcrFailure::Failed(tf!("translation.ocr.ai_api_request_failed_error", err = err.chat_failure_detail()))),
     };
@@ -1453,6 +1458,21 @@ fn run_ai_api_ocr_request(
         .collect::<Vec<_>>();
 
     Ok(OcrRecognizeResult { lines, text })
+}
+
+/// Cleans an AI API OCR answer (`strip_think_blocks`, then `clean_plain_text`) and asks for ONE
+/// retry when nothing is left. Plain text has no structure to validate, so an empty answer is
+/// the only case worth a second paid request: a user-selected crop almost always holds text, and
+/// an empty answer usually means the model spent its output on reasoning or wrapped nothing in a
+/// fence. If the retry is empty too, the empty result is published as before.
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_api_ocr_validation(answer: &TrackedAnswer, _attempt: u8) -> Validation<String> {
+    let text = clean_plain_text(&strip_think_blocks(&answer.text));
+    let repair = text.is_empty().then(|| RepairRequest {
+        reason: RetryReason::Empty,
+        message: "Your previous answer contained no recognized text. Return only the text visible in the image, without reasoning, markdown or commentary.".to_string(),
+    });
+    Validation { value: text, repair }
 }
 
 fn normalized_ai_api_system_instruction(options: &OcrRuntimeOptions) -> String {
@@ -2112,5 +2132,18 @@ mod tests {
             vec!["third".to_string(), "second".to_string(), "first".to_string()]
         );
         assert_eq!(result.text, "third\nsecond\nfirst");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn ai_api_ocr_answers_are_cleaned_and_only_an_empty_one_is_retried() {
+        use ms_ai_api::{RetryReason, TrackedAnswer};
+        let answer = |text: &str| TrackedAnswer { text: text.to_string(), truncated: false };
+        let cleaned = super::ai_api_ocr_validation(&answer("<think>reading</think>\n```text\n안녕\n쾅 / 쿵\n```"), 0);
+        assert_eq!(cleaned.value, "안녕\n쾅 / 쿵");
+        assert_eq!(cleaned.repair, None);
+        let empty = super::ai_api_ocr_validation(&answer("<think>the crop is blurry, maybe"), 0);
+        assert_eq!(empty.value, "");
+        assert_eq!(empty.repair.map(|repair| repair.reason), Some(RetryReason::Empty));
     }
 }

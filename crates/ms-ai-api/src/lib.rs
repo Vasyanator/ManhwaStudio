@@ -29,7 +29,13 @@ Modules:
 - `generation`: `GenerationTracker` / `GenerationSnapshot` (live phase, char counts, Stop) and
                 the native streaming executor `exec_chat_tracked`, the one owner of tracked
                 LLM execution.
-- `generation_view`: `draw_generation_status`, the two-line "generation" status widget.
+- `generation_view`: `draw_generation_status`, the "generation" status widget.
+- `structured`: tolerant reading of answers that ignore the requested format (`<think>` removal,
+                JSON extraction with safe repairs, plain-text clean-up) and the generic parts of
+                provider structured output (strict object schema, `JsonSpec` format, rejection
+                recognizer).
+- `validated` : `exec_chat_validated`, the validated executor with ONE repair retry and the
+                structured-output fallback (native only).
 - `tasks`     : `AiApiRequest` / `AiApiEvent` / `AiApiTaskRunner` (one serial `ms_thread`
                 worker per runner, FIFO).
 
@@ -64,8 +70,14 @@ pub mod model_id;
 pub mod openrouter;
 pub mod quota;
 pub mod service;
+pub mod structured;
 pub mod target;
 pub mod tasks;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod validated;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod loopback_test_server;
 
 pub use connection::{AiApiConnectionActions, AiApiConnectionState, AiApiEventOutcome, AiApiNotice};
 pub use connection_view::{KeyBlockActions, KeyBlockView, draw_connection, draw_key_block};
@@ -73,7 +85,7 @@ pub use encoding::{Base64Error, base64_decode, base64_encode};
 pub use error::AiApiError;
 #[cfg(not(target_arch = "wasm32"))]
 pub use generation::exec_chat_tracked;
-pub use generation::{GenerationPhase, GenerationRun, GenerationSnapshot, GenerationTracker};
+pub use generation::{GenerationPhase, GenerationRun, GenerationSnapshot, GenerationTracker, RetryReason, TrackedAnswer};
 pub use generation_view::draw_generation_status;
 pub use metadata::{AiApiMetadata, load_metadata};
 pub use model_caps::{ImageInputSupport, image_input_support};
@@ -81,6 +93,8 @@ pub use quota::is_probable_quota_or_limit_error;
 pub use service::AiApiService;
 pub use target::AiApiTarget;
 pub use tasks::{AiApiEvent, AiApiPollSummary, AiApiRequest, AiApiTaskRunner};
+#[cfg(not(target_arch = "wasm32"))]
+pub use validated::{MAX_REPAIR_RETRIES, RepairRequest, ValidatedAnswer, Validation, exec_chat_validated};
 
 /// The `genai` crate itself, so consumers build chat requests (`genai::chat::*`) against the
 /// one version this crate's client uses. Native only: `genai` is not compiled for wasm.

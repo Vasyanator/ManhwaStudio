@@ -9,6 +9,8 @@ Main types:
 - `MtTranslateItem` / `MtTranslateRequest`: per-bubble input and batch request payload, including
   optional ImageBubble multimodal payloads for AI API translation.
 - `MtControllerEvent`: UI-facing worker events.
+- `MtRunIssue` / `MtRunIssueKind`: the last run's per-bubble failures and content warnings, kept
+  by the controller (`run_issues`) for the panel's warnings list and logged once there.
 - `TranslationMtController`: MT run lifecycle with immediate cancel semantics.
 - `ActiveMtRun`: currently active run-thread metadata (`run_id`, cancel switch, handle).
 - `MtRunCancel`: a run's cancel switch: the flag checked between batches/items plus the run's
@@ -18,8 +20,9 @@ Runtime model:
 - each MT run is executed in its own background thread (GUI thread is never blocked);
 - `request_cancel` marks run cancelled, closes its generation tracker (which aborts the AI API
   HTTP request in flight and every later one of that run) and detaches the thread immediately;
-- every AI API request runs through `ms_ai_api::exec_chat_tracked`; a stopped request ends the
-  run through the ordinary cancelled path (`RunCancelled`, no error);
+- every AI API request runs through `ms_ai_api::exec_chat_validated` (tracked streaming plus ONE
+  format-repair retry); a stopped request ends the run through the ordinary cancelled path
+  (`RunCancelled`, no error);
 - detached/stale run events are ignored by `run_id` and never touch canvas state.
 
 Backend helper:
@@ -27,6 +30,15 @@ Backend helper:
 - AI API translation sends JSON groups with bubble IDs and characters, sends ImageBubble binaries
   only in the active multimodal request, keeps text-only chat history across batches, and prunes old
   turns by an approximate context budget.
+- Answers are read and validated element by element by `ai_mt_response::BatchCollector`: valid
+  items are applied as soon as an answer arrives (before any retry), the one repair retry re-asks
+  only the missing / invalid ids, and still-missing items become per-item failures. The retained
+  chat history of a batch is exactly its user message plus ONE assistant turn holding the
+  collector's canonical JSON of the accepted items (`history_json`), never the raw answer or the
+  repair turns, so the two-messages-per-batch pruning and the history rewrite stay valid.
+- Strict JSON (`AiMtOptions::strict_json`, opt-in): requests carry a provider JSON schema
+  (`ai_mt_response::strict_answer_schema`; batches answer `{"items": [...]}`); a provider that
+  rejects it is answered without it, and the rest of the run stops sending it.
 
 Per-ImageBubble mode (`AiMtOptions::image_mode == ImagesOnly`):
 - `run_ai_imagebubble_translate_async` translates one ImageBubble per request. Every non-target
@@ -68,7 +80,11 @@ use super::machine_translators::google::GoogleMtBackend;
 use super::machine_translators::yandex::YandexMtBackend;
 use ms_ai_api::{AiApiService, GenerationSnapshot, GenerationTracker};
 #[cfg(not(target_arch = "wasm32"))]
-use ms_ai_api::{AiApiError, exec_chat_tracked};
+use ms_ai_api::{AiApiError, Validation, exec_chat_validated};
+#[cfg(not(target_arch = "wasm32"))]
+use ms_ai_api::structured::json_spec_format;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::ai_mt_response::{AiMtTranslation, AnswerForm, BatchCollector, ExpectedKind, content_warnings, strict_answer_schema};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::AiApiTarget;
 #[cfg(not(target_arch = "wasm32"))]
@@ -402,6 +418,8 @@ pub struct AiMtOptions {
     pub image_detail: AiMtImageDetail,
     pub image_mode: AiMtImageMode,
     pub image_context_source: AiMtContextSource,
+    /// Ask the provider for structured output (a JSON schema of the answer); off by default.
+    pub strict_json: bool,
     pub project: ProjectData,
 }
 
@@ -420,10 +438,6 @@ pub enum MtControllerEvent {
     ItemAreasTranslated {
         bubble_id: i64,
         areas: Vec<(String, String)>,
-    },
-    ItemFailed {
-        bubble_id: i64,
-        error: String,
     },
     RunFinished {
         translated: usize,
@@ -444,6 +458,24 @@ pub enum MtControllerEvent {
         context_budget_chars: usize,
         pruned_replicas: usize,
     },
+}
+
+/// Whether a run issue is a failure (nothing applied) or a warning (applied, but doubtful).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtRunIssueKind {
+    /// The bubble got no translation.
+    Failed,
+    /// The translation was applied but a content check marked it.
+    Warning,
+}
+
+/// One entry of the last run's issue list (`TranslationMtController::run_issues`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtRunIssue {
+    pub bubble_id: i64,
+    pub kind: MtRunIssueKind,
+    /// Localized reason.
+    pub text: String,
 }
 
 /// One run's cancel switch, shared by the controller and the run thread. The run's
@@ -490,6 +522,9 @@ pub struct TranslationMtController {
     detached_run_threads: Vec<JoinHandle<()>>,
     evt_tx: Sender<WorkerEvent>,
     evt_rx: Receiver<WorkerEvent>,
+    /// Failures and warnings of the active or last run, in arrival order; cleared when a new
+    /// run starts.
+    run_issues: Vec<MtRunIssue>,
 }
 
 impl Default for TranslationMtController {
@@ -508,6 +543,7 @@ impl TranslationMtController {
             detached_run_threads: Vec::new(),
             evt_tx,
             evt_rx,
+            run_issues: Vec::new(),
         }
     }
 
@@ -548,7 +584,24 @@ impl TranslationMtController {
             thread,
         });
         self.busy = true;
+        self.run_issues.clear();
         Ok(())
+    }
+
+    /// Per-bubble failures and content warnings of the active or last run (empty before the
+    /// first run), for the panel's warnings list.
+    pub fn run_issues(&self) -> &[MtRunIssue] {
+        &self.run_issues
+    }
+
+    /// Records (and logs) one issue of the active run.
+    fn record_issue(&mut self, bubble_id: i64, kind: MtRunIssueKind, text: String) {
+        let label = match kind {
+            MtRunIssueKind::Failed => "failed",
+            MtRunIssueKind::Warning => "warning",
+        };
+        ms_log::runtime_log::log_warn(format!("[MT] bubble {bubble_id} {label}: {}", text.replace('\n', " ")));
+        self.run_issues.push(MtRunIssue { bubble_id, kind, text });
     }
 
     /// Live state of the active run's AI API request (inactive when no run is active, for the
@@ -612,7 +665,16 @@ impl TranslationMtController {
                     error,
                 }) => {
                     if self.is_active_run(run_id) {
-                        out.push(MtControllerEvent::ItemFailed { bubble_id, error });
+                        self.record_issue(bubble_id, MtRunIssueKind::Failed, error);
+                    }
+                }
+                Ok(WorkerEvent::ItemWarning {
+                    run_id,
+                    bubble_id,
+                    warning,
+                }) => {
+                    if self.is_active_run(run_id) {
+                        self.record_issue(bubble_id, MtRunIssueKind::Warning, warning);
                     }
                 }
                 Ok(WorkerEvent::RunFinished {
@@ -740,6 +802,12 @@ enum WorkerEvent {
         run_id: u64,
         bubble_id: i64,
         error: String,
+    },
+    /// A translation was applied, but a content check marked it (`ai_mt_response::ContentWarning`).
+    ItemWarning {
+        run_id: u64,
+        bubble_id: i64,
+        warning: String,
     },
     RunFinished {
         run_id: u64,
@@ -1126,6 +1194,10 @@ async fn run_ai_translate_async(
     let items_with_images = items.iter().filter(|item| item.image.is_some()).count();
     let mut history_batch_sizes: VecDeque<usize> = VecDeque::new();
     let mut pruned_replicas = 0usize;
+    // The answer form follows the system prompt for the whole run; the schema itself is dropped
+    // once the provider rejected it (`structured_output_rejected`).
+    let answer_form = if options.strict_json { AnswerForm::WrappedArray } else { AnswerForm::Array };
+    let mut send_schema = options.strict_json;
 
     let batches = split_ai_mt_batches(&items, batch_size);
     let batch_total = batches.len();
@@ -1173,9 +1245,35 @@ async fn run_ai_translate_async(
             history_batch_sizes.len(),
         ));
         chat_req = chat_req.append_message(user_message);
-        // Tag 0: MT's Stop cancels the whole run (`request_cancel`), it never targets one request.
-        let response_text = match exec_chat_tracked(&client, model.clone(), chat_req.clone(), chat_options.as_ref(), &cancel_requested.generation, 0).await {
-            Ok(text) => text.trim().to_string(),
+        let mut collector = BatchCollector::new(chunk, answer_form, false);
+        let request_options = if send_schema {
+            let kinds: Vec<ExpectedKind> = chunk.iter().filter(|item| item.needs_translation).map(ExpectedKind::of).collect();
+            Some(chat_options.clone().unwrap_or_default().with_response_format(json_spec_format("manga_translation_batch", strict_answer_schema(&kinds, answer_form))))
+        } else {
+            chat_options.clone()
+        };
+        // Valid items of every answer are applied at once (also when a retry follows); the
+        // validator re-asks only what is still missing. Tag 0: MT's Stop cancels the whole run
+        // (`request_cancel`), it never targets one request.
+        let exchange = exec_chat_validated(&client, model.clone(), chat_req.clone(), request_options.as_ref(), &cancel_requested.generation, 0, |answer, attempt| {
+            let report = collector.absorb(&answer.text, answer.truncated);
+            runtime_log::log_info(format!(
+                "[MT][run {run_id}] batch {batch_no}/{batch_total} <- answer {}: {} chars, {}",
+                attempt + 1,
+                answer.text.chars().count(),
+                report.log_summary(),
+            ));
+            for id in &report.newly_accepted {
+                if let (Some(item), Some(entry)) = (chunk.iter().find(|item| item.bubble_id == *id), collector.accepted(*id)) {
+                    emit_accepted_translation(run_id, evt_tx, item, entry, target_lang);
+                    *translated = translated.saturating_add(1);
+                }
+            }
+            Validation { value: (), repair: collector.repair_request(&report) }
+        })
+        .await;
+        let exchange = match exchange {
+            Ok(exchange) => exchange,
             // Only `request_cancel` / drop close the tracker, after setting the flag: the caller
             // reports `RunCancelled`.
             Err(AiApiError::Cancelled) => {
@@ -1196,106 +1294,25 @@ async fn run_ai_translate_async(
                 return Err(tf!("translation.mt.ai_translate_failed_error", err = detail));
             }
         };
-        let batch_result = parse_ai_mt_response(&response_text);
-        match &batch_result {
-            Ok(parsed) => runtime_log::log_info(format!(
-                "[MT][run {run_id}] batch {batch_no}/{batch_total} <- response: {} chars, parsed {} entries",
-                response_text.chars().count(),
-                parsed.len(),
-            )),
-            Err(err) => runtime_log::log_warn(format!(
-                "[MT][run {run_id}] batch {batch_no}/{batch_total} <- response: {} chars, parse failed: {err}",
-                response_text.chars().count(),
-            )),
+        if exchange.structured_output_rejected && send_schema {
+            send_schema = false;
+            runtime_log::log_warn(format!("[MT][run {run_id}] the provider rejected the strict JSON format; the rest of the run is sent without it"));
         }
+        // History keeps the batch's user message plus ONE canonical assistant turn (see the file
+        // header), never the raw answer or the repair turns.
         replace_last_ai_mt_user_message_with_history(&mut chat_req, chunk, &options)?;
-        chat_req = chat_req.append_message(ChatMessage::assistant(response_text.clone()));
+        chat_req = chat_req.append_message(ChatMessage::assistant(collector.history_json()));
         history_batch_sizes.push_back(chunk.len());
 
-        match batch_result {
-            Ok(translations) => {
-                for item in chunk {
-                    // Context-only replicas are provided for ordering and are not expected back.
-                    if !item.needs_translation {
-                        continue;
-                    }
-                    if cancel_requested.is_requested() {
-                        return Ok(());
-                    }
-                    let entry = translations
-                        .iter()
-                        .find(|entry| entry.bubble_id == item.bubble_id);
-                    let multi_area = item.image.as_ref().is_some_and(MtImageInput::is_multi_area);
-                    let ok = if multi_area {
-                        // Multi-area image bubble: require a per-area result array.
-                        match entry.filter(|entry| !entry.areas.is_empty()) {
-                            Some(entry) => {
-                                let areas = entry
-                                    .areas
-                                    .iter()
-                                    .map(|area| {
-                                        (area.original_text.clone(), area.translation.clone())
-                                    })
-                                    .collect();
-                                let _ = evt_tx.send(WorkerEvent::ItemAreasTranslated {
-                                    run_id,
-                                    bubble_id: item.bubble_id,
-                                    areas,
-                                });
-                                true
-                            }
-                            None => false,
-                        }
-                    } else {
-                        match entry.filter(|entry| {
-                            !entry.translation.trim().is_empty()
-                                && (item.image.is_none() || entry.original_text.is_some())
-                        }) {
-                            Some(entry) => {
-                                let _ = evt_tx.send(WorkerEvent::ItemTranslated {
-                                    run_id,
-                                    bubble_id: item.bubble_id,
-                                    translated_text: entry.translation.clone(),
-                                    original_text: entry.original_text.clone(),
-                                });
-                                true
-                            }
-                            None => false,
-                        }
-                    };
-                    if ok {
-                        *translated = translated.saturating_add(1);
-                    } else {
-                        let error = if multi_area {
-                            t!("translation.mt.ai_no_areas_error")
-                                .to_string()
-                        } else if item.image.is_some() {
-                            t!("translation.mt.ai_no_original_translation_error").to_string()
-                        } else {
-                            t!("translation.mt.ai_no_translation_for_id_error").to_string()
-                        };
-                        let _ = evt_tx.send(WorkerEvent::ItemFailed {
-                            run_id,
-                            bubble_id: item.bubble_id,
-                            error,
-                        });
-                        *errors = errors.saturating_add(1);
-                    }
-                }
-            }
-            Err(error) => {
-                for item in chunk {
-                    // Only replicas that needed translation count as failures; context is ignored.
-                    if !item.needs_translation {
-                        continue;
-                    }
-                    let _ = evt_tx.send(WorkerEvent::ItemFailed {
-                        run_id,
-                        bubble_id: item.bubble_id,
-                        error: error.clone(),
-                    });
-                    *errors = errors.saturating_add(1);
-                }
+        for item in chunk.iter().filter(|item| item.needs_translation) {
+            if collector.accepted(item.bubble_id).is_none() {
+                // A failed send means the controller (and its tab) was dropped; nothing to report to.
+                let _ = evt_tx.send(WorkerEvent::ItemFailed {
+                    run_id,
+                    bubble_id: item.bubble_id,
+                    error: collector.failure_text(item.bubble_id),
+                });
+                *errors = errors.saturating_add(1);
             }
         }
         let context_used_chars = chat_req
@@ -1378,6 +1395,8 @@ async fn run_ai_imagebubble_translate_async(
     let mut context: Vec<String> = Vec::new();
     let mut pruned_replicas = 0usize;
     let mut target_no = 0usize;
+    // Cleared for the rest of the run once the provider rejected the schema.
+    let mut send_schema = options.strict_json;
 
     for item in &items {
         if cancel_requested.is_requested() {
@@ -1445,9 +1464,33 @@ async fn run_ai_imagebubble_translate_async(
             image_bytes / 1024,
         ));
 
+        let mut collector = BatchCollector::new(std::slice::from_ref(item), AnswerForm::Object, true);
+        let request_options = if send_schema {
+            let schema = strict_answer_schema(&[ExpectedKind::of(item)], AnswerForm::Object);
+            Some(chat_options.clone().unwrap_or_default().with_response_format(json_spec_format("manga_image_bubble_translation", schema)))
+        } else {
+            chat_options.clone()
+        };
         // Tag 0: MT's Stop cancels the whole run (`request_cancel`), it never targets one request.
-        let response_text = match exec_chat_tracked(&client, model.clone(), chat_req, chat_options.as_ref(), &cancel_requested.generation, 0).await {
-            Ok(text) => text.trim().to_string(),
+        let exchange = exec_chat_validated(&client, model.clone(), chat_req, request_options.as_ref(), &cancel_requested.generation, 0, |answer, attempt| {
+            let report = collector.absorb(&answer.text, answer.truncated);
+            runtime_log::log_info(format!(
+                "[MT][run {run_id}] target {target_no}/{target_total} (id={}) <- answer {}: {} chars, {}",
+                item.bubble_id,
+                attempt + 1,
+                answer.text.chars().count(),
+                report.log_summary(),
+            ));
+            Validation { value: (), repair: collector.repair_request(&report) }
+        })
+        .await;
+        match exchange {
+            Ok(exchange) => {
+                if exchange.structured_output_rejected && send_schema {
+                    send_schema = false;
+                    runtime_log::log_warn(format!("[MT][run {run_id}] the provider rejected the strict JSON format; the rest of the run is sent without it"));
+                }
+            }
             // Only `request_cancel` / drop close the tracker, after setting the flag: the caller
             // reports `RunCancelled`.
             Err(AiApiError::Cancelled) => {
@@ -1466,37 +1509,8 @@ async fn run_ai_imagebubble_translate_async(
                 ));
                 return Err(tf!("translation.mt.ai_translate_failed_error", err = detail));
             }
-        };
-
-        let resolved = match parse_ai_mt_response(&response_text) {
-            Ok(translations) => {
-                runtime_log::log_info(format!(
-                    "[MT][run {run_id}] target {target_no}/{target_total} (id={}) <- response: {} chars, parsed {} entries",
-                    item.bubble_id,
-                    response_text.chars().count(),
-                    translations.len(),
-                ));
-                let entry = translations
-                    .iter()
-                    .find(|entry| entry.bubble_id == item.bubble_id)
-                    .or_else(|| translations.first());
-                emit_imagebubble_result(run_id, evt_tx, item, entry, translated, errors)
-            }
-            Err(err) => {
-                runtime_log::log_warn(format!(
-                    "[MT][run {run_id}] target {target_no}/{target_total} (id={}) <- response: {} chars, parse failed: {err}",
-                    item.bubble_id,
-                    response_text.chars().count(),
-                ));
-                let _ = evt_tx.send(WorkerEvent::ItemFailed {
-                    run_id,
-                    bubble_id: item.bubble_id,
-                    error: err,
-                });
-                *errors = errors.saturating_add(1);
-                None
-            }
-        };
+        }
+        let resolved = emit_imagebubble_result(run_id, evt_tx, item, &collector, target_lang, translated, errors);
 
         // Fold the just-handled image into the context as text (never its binary) so it carries over
         // to the next image while keeping the cached prefix cheap.
@@ -1701,79 +1715,73 @@ struct ResolvedImageText {
     translation: String,
 }
 
-/// Sends the per-item translation event for a single target ImageBubble and returns its resolved
-/// text for context folding, or `None` when the model returned nothing usable (already reported as a
-/// failure).
+/// Sends the per-item translation event for a single target ImageBubble (the collector's accepted
+/// entry, or a failure with its reason) and returns its resolved text for context folding, or
+/// `None` when the model returned nothing usable (reported as a failure).
 #[cfg(not(target_arch = "wasm32"))]
 fn emit_imagebubble_result(
     run_id: u64,
     evt_tx: &Sender<WorkerEvent>,
     item: &MtTranslateItem,
-    entry: Option<&AiMtTranslation>,
+    collector: &BatchCollector,
+    target_lang: &str,
     translated: &mut usize,
     errors: &mut usize,
 ) -> Option<ResolvedImageText> {
-    let multi_area = item.image.as_ref().is_some_and(MtImageInput::is_multi_area);
-    if multi_area {
-        match entry.filter(|entry| !entry.areas.is_empty()) {
-            Some(entry) => {
-                let areas: Vec<(String, String)> = entry
-                    .areas
-                    .iter()
-                    .map(|area| (area.original_text.clone(), area.translation.clone()))
-                    .collect();
-                let original = join_nonempty(areas.iter().map(|(original, _)| original.as_str()));
-                let translation =
-                    join_nonempty(areas.iter().map(|(_, translation)| translation.as_str()));
-                let _ = evt_tx.send(WorkerEvent::ItemAreasTranslated {
-                    run_id,
-                    bubble_id: item.bubble_id,
-                    areas,
-                });
-                *translated = translated.saturating_add(1);
-                Some(ResolvedImageText {
-                    original,
-                    translation,
-                })
-            }
-            None => {
-                let _ = evt_tx.send(WorkerEvent::ItemFailed {
-                    run_id,
-                    bubble_id: item.bubble_id,
-                    error: t!("translation.mt.ai_no_areas_error")
-                        .to_string(),
-                });
-                *errors = errors.saturating_add(1);
-                None
-            }
-        }
+    let Some(entry) = collector.accepted(item.bubble_id) else {
+        // A failed send means the controller (and its tab) was dropped; nothing to report to.
+        let _ = evt_tx.send(WorkerEvent::ItemFailed {
+            run_id,
+            bubble_id: item.bubble_id,
+            error: collector.failure_text(item.bubble_id),
+        });
+        *errors = errors.saturating_add(1);
+        return None;
+    };
+    emit_accepted_translation(run_id, evt_tx, item, entry, target_lang);
+    *translated = translated.saturating_add(1);
+    if entry.areas.is_empty() {
+        Some(ResolvedImageText {
+            original: entry.original_text.clone().unwrap_or_default(),
+            translation: entry.translation.clone(),
+        })
     } else {
-        match entry
-            .filter(|entry| !entry.translation.trim().is_empty() && entry.original_text.is_some())
-        {
-            Some(entry) => {
-                let _ = evt_tx.send(WorkerEvent::ItemTranslated {
-                    run_id,
-                    bubble_id: item.bubble_id,
-                    translated_text: entry.translation.clone(),
-                    original_text: entry.original_text.clone(),
-                });
-                *translated = translated.saturating_add(1);
-                Some(ResolvedImageText {
-                    original: entry.original_text.clone().unwrap_or_default(),
-                    translation: entry.translation.clone(),
-                })
-            }
-            None => {
-                let _ = evt_tx.send(WorkerEvent::ItemFailed {
-                    run_id,
-                    bubble_id: item.bubble_id,
-                    error: t!("translation.mt.ai_no_original_translation_error").to_string(),
-                });
-                *errors = errors.saturating_add(1);
-                None
-            }
-        }
+        Some(ResolvedImageText {
+            original: join_nonempty(entry.areas.iter().map(|area| area.original_text.as_str())),
+            translation: join_nonempty(entry.areas.iter().map(|area| area.translation.as_str())),
+        })
+    }
+}
+
+/// Sends the result event of an accepted translation (`ItemAreasTranslated` for a multi-area
+/// image item, `ItemTranslated` otherwise) followed by one `ItemWarning` per content check that
+/// marked it (`ai_mt_response::content_warnings`; warnings never hold the translation back).
+#[cfg(not(target_arch = "wasm32"))]
+fn emit_accepted_translation(
+    run_id: u64,
+    evt_tx: &Sender<WorkerEvent>,
+    item: &MtTranslateItem,
+    entry: &AiMtTranslation,
+    target_lang: &str,
+) {
+    let kind = ExpectedKind::of(item);
+    // A failed send means the controller (and its tab) was dropped; nothing to report to.
+    let _ = match kind {
+        ExpectedKind::MultiImage { .. } => evt_tx.send(WorkerEvent::ItemAreasTranslated {
+            run_id,
+            bubble_id: item.bubble_id,
+            areas: entry.areas.iter().map(|area| (area.original_text.clone(), area.translation.clone())).collect(),
+        }),
+        ExpectedKind::Text | ExpectedKind::SingleImage => evt_tx.send(WorkerEvent::ItemTranslated {
+            run_id,
+            bubble_id: item.bubble_id,
+            translated_text: entry.translation.clone(),
+            original_text: entry.original_text.clone(),
+        }),
+    };
+    for warning in content_warnings(kind, &item.text, entry, target_lang) {
+        // As above: only a dropped controller makes the send fail.
+        let _ = evt_tx.send(WorkerEvent::ItemWarning { run_id, bubble_id: item.bubble_id, warning: warning.text() });
     }
 }
 
@@ -1897,6 +1905,10 @@ fn build_ai_mt_system_prompt(
     parts.push("Input batches contain ordered text replicas and may contain image bubbles when a multimodal model is selected. Text replicas have id and text. Image bubbles have id, description, and an attached image; for those, read the image and infer the original visible text. A multi-area image bubble additionally has \"area_count\" and an ordered \"areas\" list (each area has index, optional description, optional current_original_text, optional image_bbox = [x1,y1,x2,y2] relative to the attached image); translate each area separately. Some items may be marked \"context\": true and carry an existing_translation: these are already translated and are included only to preserve reading order and dialogue continuity. Never translate context items and never include them in your output. Translate every other item separately. Return a flat JSON array where every id that needs translation appears exactly once and context ids never appear. For text items return {\"id\": number, \"translation\": string}. For single-area image items return {\"id\": number, \"original_text\": string, \"translation\": string}. For multi-area image items return {\"id\": number, \"areas\": [{\"original_text\": string, \"translation\": string}, ...]} with exactly area_count entries in the same order as the input areas. Do not merge, omit, renumber, explain, or add markdown.".to_string());
     if options.use_character_names {
         parts.push("Use character names as speaker context, but do not add speaker labels unless they are present in the source text.".to_string());
+    }
+    if options.strict_json {
+        // Strict structured output needs an object at the top level (`AnswerForm::WrappedArray`).
+        parts.push("Structured output is enforced: wrap the array in a JSON object as {\"items\": [...]}. Every other rule above still applies.".to_string());
     }
 
     push_project_context_parts(&mut parts, options);
@@ -2527,119 +2539,6 @@ fn prune_ai_mt_chat_context(
     pruned_replicas
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug)]
-struct AiMtTranslation {
-    bubble_id: i64,
-    original_text: Option<String>,
-    translation: String,
-    /// Per-area results for a multi-area image bubble (empty for text / single-area items).
-    areas: Vec<AiMtArea>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug)]
-struct AiMtArea {
-    original_text: String,
-    translation: String,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn parse_ai_mt_response(raw: &str) -> Result<Vec<AiMtTranslation>, String> {
-    let json_text = extract_json_payload(raw);
-    let value: Value = serde_json::from_str(&json_text)
-        .map_err(|err| tf!("translation.mt.invalid_json_error", err = err))?;
-    // Accept a flat array, an object wrapping a `translations` array, or — as the per-ImageBubble
-    // mode returns — a single result object for the one target bubble.
-    let arr: Vec<&Value> = if let Some(arr) = value.as_array() {
-        arr.iter().collect()
-    } else if let Some(arr) = value.get("translations").and_then(Value::as_array) {
-        arr.iter().collect()
-    } else if value.is_object()
-        && (value.get("id").is_some()
-            || value.get("bubble_id").is_some()
-            || value.get("areas").is_some())
-    {
-        vec![&value]
-    } else {
-        return Err(t!("translation.mt.json_not_array_error").to_string());
-    };
-    let mut out = Vec::with_capacity(arr.len());
-    for item in arr {
-        let bubble_id = item
-            .get("id")
-            .or_else(|| item.get("bubble_id"))
-            .and_then(Value::as_i64)
-            .ok_or_else(|| t!("translation.mt.json_no_id_error").to_string())?;
-        // Multi-area image bubble: a per-area array of {original_text, translation}.
-        let areas = item
-            .get("areas")
-            .and_then(Value::as_array)
-            .map(|arr| arr.iter().filter_map(parse_ai_mt_area).collect::<Vec<_>>())
-            .unwrap_or_default();
-        let translation = item
-            .get("translation")
-            .or_else(|| item.get("text"))
-            .and_then(Value::as_str)
-            .map(|value| value.trim().to_string());
-        if translation.is_none() && areas.is_empty() {
-            return Err(t!("translation.mt.json_no_translation_error").to_string());
-        }
-        let original_text = item
-            .get("original_text")
-            .or_else(|| item.get("original"))
-            .and_then(Value::as_str)
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
-        out.push(AiMtTranslation {
-            bubble_id,
-            original_text,
-            translation: translation.unwrap_or_default(),
-            areas,
-        });
-    }
-    Ok(out)
-}
-
-/// Parses one per-area entry `{original_text, translation}` from a multi-area image response.
-#[cfg(not(target_arch = "wasm32"))]
-fn parse_ai_mt_area(value: &Value) -> Option<AiMtArea> {
-    let translation = value
-        .get("translation")
-        .or_else(|| value.get("text"))
-        .and_then(Value::as_str)
-        .map(|raw| raw.trim().to_string())?;
-    let original_text = value
-        .get("original_text")
-        .or_else(|| value.get("original"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    Some(AiMtArea {
-        original_text,
-        translation,
-    })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn extract_json_payload(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if let Some(stripped) = trimmed.strip_prefix("```") {
-        let without_lang = stripped
-            .strip_prefix("json")
-            .or_else(|| stripped.strip_prefix("JSON"))
-            .unwrap_or(stripped)
-            .trim_start();
-        return without_lang
-            .strip_suffix("```")
-            .unwrap_or(without_lang)
-            .trim()
-            .to_string();
-    }
-    trimmed.to_string()
-}
-
 fn build_notes_prompt(
     project: &ProjectData,
     include_characters: bool,
@@ -2736,12 +2635,12 @@ pub fn bubble_order_for_sort(bubble: &Bubble) -> i32 {
 mod tests {
     use super::{
         AiApiService, AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtOptions,
-        AiMtReasoning, AiMtSortMode, AiMtTranslation, IMAGEBUBBLE_CONTEXT_HEADER, MtImageArea,
+        AiMtReasoning, AiMtSortMode, IMAGEBUBBLE_CONTEXT_HEADER, MtImageArea,
         MtImageInput, MtImageSource, MtRequestPreviewPart, MtTranslateItem, ResolvedImageText,
         ai_mt_ordered_item_descriptor, build_ai_mt_batch_prompt, build_ai_mt_history_prompt,
         build_ai_mt_imagebubble_request_preview, build_ai_mt_request_preview,
         imagebubble_context_line_for_item, imagebubble_context_line_for_target,
-        parse_ai_mt_response, prepare_mt_image_for_detail,
+        prepare_mt_image_for_detail,
         sort_ai_mt_items, split_ai_mt_batches, ProjectContextSources, project_context_sources,
     };
     use ms_project::{CanvasSettings, ProjectData, ProjectPaths};
@@ -2830,6 +2729,7 @@ mod tests {
             image_detail: AiMtImageDetail::Auto,
             image_mode: AiMtImageMode::Normal,
             image_context_source: AiMtContextSource::Translation,
+            strict_json: false,
             project: empty_project(),
         }
     }
@@ -2870,18 +2770,6 @@ mod tests {
             }),
             needs_translation: true,
         }
-    }
-
-    #[test]
-    fn ai_response_parser_accepts_single_object() {
-        // Per-ImageBubble mode returns a single result object, not an array.
-        let parsed =
-            parse_ai_mt_response(r#"{"id":10,"original_text":"BOOM","translation":"БУМ"}"#)
-                .expect("single object parses");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].bubble_id, 10);
-        assert_eq!(parsed[0].original_text.as_deref(), Some("BOOM"));
-        assert_eq!(parsed[0].translation, "БУМ");
     }
 
     #[test]
@@ -3146,18 +3034,6 @@ mod tests {
     }
 
     #[test]
-    fn ai_response_parser_accepts_multi_area_image() {
-        let parsed = parse_ai_mt_response(
-            r#"[{"id":7,"areas":[{"original_text":"A","translation":"А"},{"original_text":"B","translation":"Б"}]}]"#,
-        )
-        .expect("parsed");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].areas.len(), 2);
-        assert_eq!(parsed[0].areas[0].translation, "А");
-        assert_eq!(parsed[0].areas[1].original_text, "B");
-    }
-
-    #[test]
     fn ai_image_detail_parses_legacy_and_current_keys() {
         assert_eq!(AiMtImageDetail::from_key("jpeg_60"), AiMtImageDetail::Low);
         assert_eq!(AiMtImageDetail::from_key("png"), AiMtImageDetail::High);
@@ -3170,16 +3046,6 @@ mod tests {
         let prepared = prepare_mt_image_for_detail(image, AiMtImageDetail::Low);
         assert_eq!(prepared.width(), 512);
         assert_eq!(prepared.height(), 256);
-    }
-
-    #[test]
-    fn ai_response_parser_accepts_flat_json_ids() {
-        let parsed =
-            parse_ai_mt_response(r#"[{"id":2,"translation":"два"},{"id":5,"translation":"пять"}]"#)
-                .expect("response");
-        assert_eq!(parsed.len(), 2);
-        assert_matches_translation(&parsed[0], 2, "два");
-        assert_matches_translation(&parsed[1], 5, "пять");
     }
 
     #[test]
@@ -3256,17 +3122,11 @@ mod tests {
     }
 
     #[test]
-    fn ai_response_parser_accepts_image_original_text() {
-        let parsed =
-            parse_ai_mt_response(r#"[{"id":9,"original_text":"SALE","translation":"распродажа"}]"#)
-                .expect("response");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].original_text.as_deref(), Some("SALE"));
-        assert_matches_translation(&parsed[0], 9, "распродажа");
-    }
-
-    fn assert_matches_translation(entry: &AiMtTranslation, id: i64, translation: &str) {
-        assert_eq!(entry.bubble_id, id);
-        assert_eq!(entry.translation, translation);
+    fn strict_json_adds_the_wrapper_rule_to_the_system_prompt() {
+        let mut options = ai_options(4);
+        let plain = super::build_ai_mt_system_prompt("en", "ru", &options);
+        assert!(!plain.contains("{\"items\": [...]}"));
+        options.strict_json = true;
+        assert!(super::build_ai_mt_system_prompt("en", "ru", &options).contains("{\"items\": [...]}"));
     }
 }

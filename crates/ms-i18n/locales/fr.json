@@ -3716,8 +3716,6 @@
   "translation.mt.imagebubble_no_image_error": "ImageBubble sans image jointe.",
   "translation.mt.invalid_json_error": "L'IA a renvoyé un JSON invalide : {err}",
   "translation.mt.invalid_response_error": "Réponse du traducteur incorrecte : 1 résultat attendu, {results} reçu(s).",
-  "translation.mt.json_no_id_error": "L'élément JSON de l'IA n'a pas d'id numérique.",
-  "translation.mt.json_no_translation_error": "L'élément JSON de l'IA n'a ni translation ni areas.",
   "translation.mt.json_not_array_error": "Le JSON de l'IA doit être un tableau ou un objet translations.",
   "translation.mt.mode_images_only": "Images uniquement",
   "translation.mt.mode_normal": "Normal",

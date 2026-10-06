@@ -3716,8 +3716,6 @@
   "translation.mt.imagebubble_no_image_error": "ImageBubble sem imagem anexada.",
   "translation.mt.invalid_json_error": "A IA retornou um JSON inválido: {err}",
   "translation.mt.invalid_response_error": "Resposta do tradutor incorreta: esperado 1 resultado, obtido {results}.",
-  "translation.mt.json_no_id_error": "O elemento do JSON da IA não tem um id numérico.",
-  "translation.mt.json_no_translation_error": "O elemento do JSON da IA não tem translation nem areas.",
   "translation.mt.json_not_array_error": "O JSON da IA deve ser um array ou um objeto translations.",
   "translation.mt.mode_images_only": "Somente imagens",
   "translation.mt.mode_normal": "Normal",

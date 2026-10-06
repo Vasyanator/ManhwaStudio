@@ -42,7 +42,8 @@ Long work is delegated to focused controllers:
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
   cancellation, and stale-event filtering.
 - Live AI API generation progress: every AI API OCR / MT request runs through
-  `ms_ai_api::exec_chat_tracked`. The OCR controller owns one `GenerationTracker` shared with its
+  `ms_ai_api::exec_chat_validated` (the tracked executor plus ONE format-repair retry, whose
+  reason the generation widget shows). The OCR controller owns one `GenerationTracker` shared with its
   worker; each MT run owns a fresh one inside its cancel switch (`MtRunCancel`). Both controllers
   expose `generation_snapshot()`; `tab.rs` only lends it to the panels, which draw
   `ms_ai_api::draw_generation_status` outside their collapsible sections. OCR "Stop" carries the
@@ -129,7 +130,10 @@ recognition language. PaddleOCR-VL (IPC method `ocr.paddle_vl`) is a PyTorch/Tra
 engine that needs no text detection and no language selection; it is shown on a second engine row in
 the OCR panel so the side panel stays narrow.
 AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`, streamed by
-`exec_chat_tracked`) from the OCR worker thread; provider API keys are read/written only through `ms_ai_api::keys` (OS credential
+`exec_chat_validated`) from the OCR worker thread; its answer is cleaned
+(`structured::strip_think_blocks` + `clean_plain_text`: `<think>` blocks and a code fence
+wrapping the whole answer; quotes are kept) before line splitting, and an answer left empty is asked for once
+more (`ocr.rs::ai_api_ocr_validation`; nothing else is retried, plain text has no structure); provider API keys are read/written only through `ms_ai_api::keys` (OS credential
 store) and never persisted to project or user JSON settings. For an OpenAI-/Anthropic-compatible
 service the request goes to the panel's base URL (`ms_ai_api::AiApiTarget`) and a missing key is
 not an error; OCR and MT raise their "API key missing" errors only when `requires_key()`.
@@ -188,6 +192,25 @@ between batches and prunes old user/assistant turns when the configured context-
 exceeded. Progress events expose translated/error counts, approximate context usage, and the number
 of replicas removed during context pruning; batches may include existing bubble translations when
 the user enables that context option.
+AI API MT answers are read by `ai_mt_response::BatchCollector` (only reasoning BEFORE the answer
+is stripped; of the JSON candidates found inside prose or fences with safe repairs the one that
+validly answers the most requested ids wins; a cut-off or broken array still yields its complete
+elements, ids as integers or numeric strings, every element
+validated against the request's expected ids and shapes, multi-area counts checked). Valid items
+are applied as soon as an answer arrives; when ids are missing or invalid (or the answer was cut
+off at the output limit) the ONE repair retry re-asks only those ids and its valid items are
+merged (first valid answer per id wins); what is still missing becomes a per-item failure with
+its localized reason. The retained history of a batch is exactly its user message plus ONE
+assistant turn with the collector's canonical JSON of the accepted items (`history_json`), so
+pruning (`prune_ai_mt_chat_context`, two messages per batch) and the text-only history rewrite
+(`replace_last_ai_mt_user_message_with_history`, `last_mut()`) stay correct and later batches
+never see a malformed turn. Content checks (identical to the source, still in the source writing
+system, more than 4x longer) only MARK an applied item (`ItemWarning`), never retry. Per-item
+failures and warnings are kept by `TranslationMtController::run_issues` (cleared per run, logged
+once there) and listed by the MT panel. The opt-in strict JSON mode (`AiMtOptions::strict_json`,
+persisted as `machine_translation.ai_api.strict_json`, default off) sends a provider JSON schema
+(`ai_mt_response::strict_answer_schema`; batches answer `{"items": [...]}`, which the system
+prompt then asks for) and stops sending it for the rest of the run once a provider rejected it.
 `BubbleClass::Hint` never enters an MT batch — not as a translatable item and not as context — in
 any of the three collection paths (scope run, per-ImageBubble mode, explicit per-id request): a hint
 is an author note addressed to the translator, not a replica.
@@ -217,7 +240,11 @@ is an author note addressed to the translator, not a replica.
 - `machine_translation.rs`: `TranslationMtController`, `MtService`, AI API MT options, batch
   item/request types including optional ImageBubble image payloads, per-run worker thread
   lifecycle, cancellation (`MtRunCancel`: flag + per-run generation tracker), chat context
-  pruning, JSON response parsing, and backend dispatch.
+  pruning, the validated AI exchange per batch / per ImageBubble, the run's issue list
+  (`MtRunIssue`), and backend dispatch.
+- `ai_mt_response.rs` (native): pure reading / validation / merging of AI MT answers
+  (`BatchCollector`), the repair message, per-item failure reasons, canonical history JSON,
+  content checks (`content_warnings`) and the strict-output schema (`strict_answer_schema`).
 - `machine_translators/`: UI-agnostic Google, Yandex, and DeepL MT provider implementations behind
   `MachineTranslatorBackend`.
 - `panels/`: side-panel UI modules for OCR, bubble cards/footer fields, machine translation,
@@ -351,7 +378,9 @@ is an author note addressed to the translator, not a replica.
   must surface clear errors.
 - MT worker events are accepted only for the active run id; cancelled/detached run output must not
   mutate canvas state. AI API MT responses must be matched by bubble ID before applying text; for
-  ImageBubble results, original text and translation are applied together.
+  ImageBubble results, original text and translation are applied together, and a multi-area
+  result is applied only with exactly `area_count` areas. The per-ImageBubble mode alone accepts
+  a wrong-id element for its single target.
 - A failed AI run whose error matches `is_probable_quota_or_limit_error` (keyword/HTTP-code scan)
   stops quietly: instead of an `Error` toast the panel shows the sticky `MtStopNotice` with the
   full provider error available behind a toggle. Other run failures keep the `Error` toast.

@@ -78,9 +78,12 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   controls: a "connection" accordion section (source/target languages, then the shared
   `ms_ai_api::draw_connection` widget, id salt `translation_mt_ai_api`) and the
   batching/context section, ImageBubble inclusion and image visual-detail controls (blocked only
-  for a model `ms_ai_api::image_input_support` lists as text-only; `Unknown` models are allowed), plus start/cancel actions.
+  for a model `ms_ai_api::image_input_support` lists as text-only; `Unknown` models are allowed),
+  the opt-in "strict JSON format" checkbox (`ai_strict_json`, explained by a `HelpHint`), plus
+  start/cancel actions.
   The tab lends the run view as one `MtPanelRun` (busy, can-cancel, progress, generation
-  snapshot); on the AI API tab `ms_ai_api::draw_generation_status` sits under the start/cancel row,
+  snapshot, and the controller's `run_issues` slice, drawn on both tabs as a collapsed list
+  `#id: reason` with a stable `id_salt`); on the AI API tab `ms_ai_api::draw_generation_status` sits under the start/cancel row,
   outside both sections, its Stop setting `MtPanelActions::cancel`, and the generic
   "Translating…" line is hidden while it shows (the counters stay); it stays shown in the gaps
   between two requests of a busy run, so it does not flicker between batches. On the AI API tab the start buttons also expose

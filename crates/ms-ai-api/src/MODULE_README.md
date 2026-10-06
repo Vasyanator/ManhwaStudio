@@ -8,7 +8,8 @@ from a worker thread, which models a service offers, what a model can do (the mo
 database), and a few provider-agnostic helpers. It also owns the shared connection widget
 (service, base URL, key, model, account status, system instruction) with its GUI-free state and
 background request runner, and live generation progress: the streaming chat executor with a
-real "Stop" and its two-line status widget. Every feature that talks to
+real "Stop" and its status widget, plus the validated executor (one format-repair retry) and the
+tolerant answer readers of `structured.rs`. Every feature that talks to
 a hosted model goes through it; today that is the translation tab's AI API OCR engine and AI API
 machine translation (`crates/ms-tab-translation`). The cloud image-edit layer (`image_edit/`:
 hosted image-editing models with a size-exact pipeline) lives here too.
@@ -37,7 +38,22 @@ worker: block_on(exec_chat_tracked(&client, model, req, options, &tracker, reque
      -> every await races run.cancelled(): Stop drops the request/stream (HTTP connection closed)
      -> End event: Ok(answer) | body closed before End: Err(ChatRequest "stream ended early")
      -> refused "not verified to stream" before any output: one exec_chat retry (no live counts)
-     -> Err(AiApiError::Cancelled) | Err(AiApiError::ChatRequest { detail })
+     -> Ok(TrackedAnswer { text, truncated }) | Err(AiApiError::Cancelled)
+        | Err(AiApiError::ChatRequest { detail })
+```
+
+A request whose answer must have a given format runs as `exec_chat_validated` instead (same
+place, same tracker):
+
+```text
+worker: exec_chat_validated(.., validate: FnMut(&TrackedAnswer, attempt) -> Validation<T>)
+     -> attempt 0 (exec_attempt)  [response_format rejected before output -> same attempt again
+                                   without it, RetryReason::StructuredOutputUnsupported]
+     -> validate -> repair: None                          -> Ok(ValidatedAnswer)
+                 -> repair: Some(RepairRequest{reason, message})
+     -> attempt 1 = request + assistant(bad answer) + user(message)   (blank answer: request as is)
+        begun with snapshot.retry = Some(reason)  -> widget: "Retry: ..."
+     -> validate -> Ok(ValidatedAnswer { value, answer, retried, unresolved, structured_output_rejected })
 ```
 
 Connection UI flow (per widget instance; the consumer owns one `AiApiConnectionState` and one
@@ -89,8 +105,17 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   crate-private `normalize_think_answer` / `streaming_not_permitted`; its `stream_tests` drive
   the executor against a loopback OpenAI-compatible server (answer, reasoning count, `<think>`
   parity, missing terminal event, non-streaming retry, no retry on other errors, real abort).
-- `generation_view.rs`: `draw_generation_status`, the two-line status widget (spinner + phase;
-  received chars + "Stop").
+- `generation_view.rs`: `draw_generation_status`, the status widget (spinner + phase; the retry
+  line of a second attempt; received chars + "Stop").
+- `structured.rs`: target-neutral answer readers (`strip_think_blocks`,
+  `strip_leading_think_blocks`, `extract_json` -> `JsonExtraction` of ranked `JsonCandidate`s +
+  `JsonShape` / `JsonExtractError`, `clean_plain_text`) and the generic structured-output parts
+  (`strict_object_schema`, native `json_spec_format`, `response_format_rejected`).
+- `validated.rs` (native): `exec_chat_validated`, `Validation` / `RepairRequest` /
+  `ValidatedAnswer`, `MAX_REPAIR_RETRIES`; loopback tests (repair turn content, retry limit,
+  blank answer, no retry on provider errors, structured-output fallback).
+- `loopback_test_server.rs` (native tests only): the scripted OpenAI-compatible loopback server
+  shared by the `generation.rs` and `validated.rs` executor tests.
 - `../tests/live_compatible.rs`: opt-in live check of both compatible services against a real
   server (`MS_AI_API_LIVE_URL`; skips when unset): model list, text chat, image chat, empty key.
 - `../tests/live_image_edit.rs`: opt-in live image edit through `image_edit::run_image_edit`
@@ -145,8 +170,9 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
 - **Web build**: `genai`, `tokio`, `futures-util`, `keyring`, `ureq` are native-only (`serde_json`, `image` and
   `ms-raster` are target-neutral; the `image_edit` core compiles on wasm). On wasm
   the key functions return `KeyStoreWebUnavailable` and `load_metadata` returns
-  `MetadataWebUnavailable`; `client`, `openrouter`, `model_iden` and `exec_chat_tracked` do not
-  exist (the generation tracker and widget do).
+  `MetadataWebUnavailable`; `client`, `openrouter`, `model_iden`, `exec_chat_tracked`,
+  `validated` and `structured::json_spec_format` do not exist (the generation tracker and widget
+  and the rest of `structured` do).
 - **Connection widget ids**: `draw_connection` draws straight into the caller's `Ui` — no
   `push_id`, `vertical`, `ScrollArea` or width clamp — and names its two combos
   `"{id_salt}_service"` / `"{id_salt}_model"` and the base URL field `"{id_salt}_base_url"`
@@ -169,8 +195,11 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   and metadata for a base URL that is no longer current) change no state, but "key saved" / "request failed"
   notices are still produced.
 - **Tracked generation has one owner**: every LLM request whose progress a panel shows goes
-  through `exec_chat_tracked`; consumers never stream `genai` themselves. It returns the
-  concatenated answer chunks (reasoning is counted, never returned), untrimmed. That is ALL text
+  through `exec_chat_tracked` (or `exec_chat_validated`, which is built on it); consumers never
+  stream `genai` themselves. It returns a `TrackedAnswer`: the concatenated answer chunks
+  (reasoning is counted, never returned), untrimmed, and `truncated` = the provider's stop
+  reason was its output-token limit (`StopReason::MaxTokens`, from `StreamEnd` or the
+  non-streaming reply; no stop reason reads as not truncated). That is ALL text
   parts of the reply — an intentional change from the former `exec_chat` +
   `ChatResponse::first_text()`, which kept only the first part of a multi-part (Anthropic
   multi-block, Gemini multi-part) answer. It sends the
@@ -211,10 +240,49 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   dropping the `genai` future / stream closes the reqwest connection, so the provider request
   is really aborted. `AiApiError::Cancelled` is a neutral outcome for consumers;
   `AiApiError::chat_failure_detail` gives the raw provider text to wrap in their own message.
+- **Validated execution, ONE repair retry** (`exec_chat_validated`): the consumer's validator
+  sees every answer (attempt 0, then 1) and returns its best value plus an optional
+  `RepairRequest`; at most `MAX_REPAIR_RETRIES` (= 1) retry follows, sent as the original
+  request + the model's bad answer (assistant) + the repair message (user), or as the original
+  request alone when the answer was blank (providers refuse empty turns). The value returned is
+  the LAST verdict's; a merging validator keeps the merge in its own state and may hand partial
+  results on from inside the validator (they survive a failing retry). Never retried: a
+  cancellation and every provider / transport error (also on the retry). A truncated answer is
+  only reported; the validator decides (e.g. re-ask only what is missing). Repair messages are
+  English model input written by the consumer.
+- **Repair turns never leave the executor**: they exist only in the request of the retry; the
+  caller's own conversation (e.g. MT's batch chat history) is never touched and keeps what the
+  consumer chooses to append.
+- **Structured output is the consumer's opt-in**: a consumer that wants it sets
+  `ChatOptions::response_format` (built with `structured::json_spec_format`, schema from
+  `strict_object_schema`: every property required, no extra ones); this crate owns no schema.
+  When an attempt fails BEFORE any output with an error `response_format_rejected` recognizes,
+  `exec_chat_validated` sends the same attempt again without the format (shown as
+  `RetryReason::StructuredOutputUnsupported`, not counted as the repair retry), keeps it off
+  for the rest of the call and reports `structured_output_rejected`.
+- **Answer readers are tolerant but conservative** (`structured.rs`), applied whatever the
+  reasoning settings (the `normalize_think_answer` parity inside the executor stays as is):
+  - `strip_think_blocks` (plain text) removes every closed `<think>` block, a reasoning prefix
+    closed by a bare `</think>` and a dangling leading block; `strip_leading_think_blocks`
+    (structured answers) removes only reasoning BEFORE the answer, never text inside it.
+  - `extract_json` cuts the answer into fence bodies (`json`-tagged, other) and outside text,
+    balances spans string- and comment-aware and repairs only trailing commas, comments,
+    typographic string delimiters and raw control characters in strings. It returns EVERY
+    complete top-level value of the expected shape as a ranked candidate;
+    `JsonExtraction::best_by(score)` picks the consumer's best (ties: `json` fence > fence >
+    text, then the later one, so a final answer beats a draft). Without such a value, the
+    complete elements of a cut-off (`Unterminated`) or broken (`Invalid`, incl. mismatched
+    brackets) array are salvaged with `defect` set; the rest of a cut-off value, single-quoted
+    or unquoted JSON are never guessed.
+  - `clean_plain_text` strips only a code fence wrapping the WHOLE answer (never quotes).
+  - `response_format_rejected` needs explicit format wording (`response_format`,
+    `json_schema`, `output_config`, structured output, Gemini's schema fields) and never fires
+    for quota / rate-limit / billing (`is_probable_quota_or_limit_error`) or auth errors.
 - **Generation widget**: `draw_generation_status` draws nothing for an inactive snapshot,
   relies on its spinner's per-frame repaint to keep the counters live, creates no stored ids and
   returns the Stop click, which is about `snapshot.run_id` (the consumer maps it to
-  `cancel_run` or to its own run cancel).
+  `cancel_run` or to its own run cancel). A snapshot with `retry` (set by `begin_attempt` for a
+  second attempt, reset by `begin`) adds a warning line naming the `RetryReason`.
 - **Not localized on purpose**: hosted provider labels (brand names; the two compatible labels
   ARE localized), the `"OpenRouter: "` status prefix and the `"{requests} req/{interval}"`
   rate-limit part.
@@ -229,6 +297,9 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
 - Change the model list or account status: `metadata.rs`, `openrouter.rs`.
 - Change live generation progress, Stop semantics or the streaming executor: `generation.rs`;
   its look: `generation_view.rs` (`ai_api.generation.*` keys).
+- Change the repair retry or the structured-output fallback: `validated.rs`; what answers are
+  tolerated (think blocks, JSON extraction and repairs, plain-text clean-up) or which provider
+  errors count as a format rejection: `structured.rs`.
 - Change the connection widget layout: `connection_view.rs` (the key block is
   `draw_key_block`, shared with other key owners); its state transitions and status
   texts: `connection.rs`; how requests run: `tasks.rs`.

@@ -9,8 +9,12 @@ HTTP request when the user presses "Stop".
 
 Key structures:
 - GenerationPhase    : `Thinking` (request start, reasoning chunks) / `Answering` (answer chunks).
-- GenerationSnapshot : what the status widget draws (active, phase, char counts) plus the run id
-                       and caller tag a "Stop" click targets.
+- RetryReason        : why the generation shown is a second attempt (repair retry or a re-run
+                       without structured output); drawn as a warning line by the widget.
+- GenerationSnapshot : what the status widget draws (active, phase, char counts, retry reason)
+                       plus the run id and caller tag a "Stop" click targets.
+- TrackedAnswer      : what a tracked generation returns: the answer text and whether the
+                       provider cut it off at its output-token limit.
 - GenerationTracker  : cheap `Clone` (`Arc`), `Send + Sync`; `begin` / `cancel_run` / `close` /
                        `is_closed` / `snapshot`.
 - GenerationRun      : the worker-side guard of one generation (records chunks, exposes the
@@ -21,6 +25,9 @@ Key functions:
                              `AiApiError::Cancelled` on Stop, an error for a stream without its
                              terminal event, one non-streaming retry when the provider forbids
                              streaming the model.
+- exec_attempt()           : native-only, crate-private; one tracked attempt that also reports
+                             whether a failure came before any output (used by
+                             `validated::exec_chat_validated` for its structured-output fallback).
 - streaming_not_permitted(): native-only, crate-private; recognizes that provider refusal.
 - normalize_think_answer() : native-only, crate-private; genai's non-streaming `<think>`
                              extraction, reproduced for the streamed answer.
@@ -67,11 +74,49 @@ pub struct GenerationSnapshot {
     /// The caller's tag of that generation (`exec_chat_tracked`'s `request_tag`, e.g. the OCR
     /// request id), so the consumer knows which of its requests the click was about.
     pub request_tag: u64,
+    /// `Some` when this generation is a second attempt of the same request (see `RetryReason`);
+    /// `None` for a first attempt.
+    pub retry: Option<RetryReason>,
+}
+
+/// Why a generation is a second attempt of a request the executor already sent once
+/// (`validated::exec_chat_validated`). Plain data: the status widget localizes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReason {
+    /// The answer could not be read in the required format at all.
+    Malformed,
+    /// The answer was readable, but `missing` of the `expected` required entries were absent or
+    /// invalid.
+    Incomplete {
+        /// Entries still missing or invalid after the first answer.
+        missing: usize,
+        /// Entries the request asked for.
+        expected: usize,
+    },
+    /// The provider stopped the answer at its output-token limit.
+    Truncated,
+    /// The answer was empty.
+    Empty,
+    /// The provider rejected the requested structured-output format; the request is sent again
+    /// without it.
+    StructuredOutputUnsupported,
+}
+
+/// The result of one tracked generation: the answer text (every answer chunk concatenated,
+/// untrimmed; reasoning is never part of it) and whether the provider reported that it stopped
+/// at its output-token limit (`genai` `StopReason::MaxTokens`: `length`, `max_tokens`,
+/// `MAX_TOKENS`, `incomplete`). A provider that reports no stop reason reads as not truncated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedAnswer {
+    /// The answer text.
+    pub text: String,
+    /// The answer was cut off by the output-token limit, so its end is missing.
+    pub truncated: bool,
 }
 
 impl GenerationSnapshot {
     /// The inactive snapshot (nothing received, nothing to draw).
-    pub const IDLE: Self = Self { active: false, phase: GenerationPhase::Thinking, reasoning_chars: 0, answer_chars: 0, run_id: 0, request_tag: 0 };
+    pub const IDLE: Self = Self { active: false, phase: GenerationPhase::Thinking, reasoning_chars: 0, answer_chars: 0, run_id: 0, request_tag: 0, retry: None };
 
     /// Every output character received so far: reasoning plus answer.
     #[must_use]
@@ -104,11 +149,13 @@ struct TrackerState {
     closed: bool,
     /// Waker of the task awaiting the current run's cancellation.
     waker: Option<Waker>,
+    /// Retry reason of the current run (`GenerationSnapshot::retry`).
+    retry: Option<RetryReason>,
 }
 
 impl Default for TrackerState {
     fn default() -> Self {
-        Self { run_id: 0, request_tag: 0, active: false, phase: GenerationPhase::Thinking, reasoning_chars: 0, answer_chars: 0, cancelled: false, closed: false, waker: None }
+        Self { run_id: 0, request_tag: 0, active: false, phase: GenerationPhase::Thinking, reasoning_chars: 0, answer_chars: 0, cancelled: false, closed: false, waker: None, retry: None }
     }
 }
 
@@ -139,19 +186,27 @@ impl GenerationTracker {
     #[must_use]
     pub fn snapshot(&self) -> GenerationSnapshot {
         let state = self.lock();
-        GenerationSnapshot { active: state.active, phase: state.phase, reasoning_chars: state.reasoning_chars, answer_chars: state.answer_chars, run_id: state.run_id, request_tag: state.request_tag }
+        GenerationSnapshot { active: state.active, phase: state.phase, reasoning_chars: state.reasoning_chars, answer_chars: state.answer_chars, run_id: state.run_id, request_tag: state.request_tag, retry: state.retry }
     }
 
     /// Starts a new generation tagged `request_tag` (echoed in the snapshot): counters reset,
-    /// phase `Thinking`, active until the returned run is dropped. A run still in flight is
-    /// superseded (it then reads as cancelled and its chunks are ignored). After `close`, the new
-    /// run starts already cancelled.
+    /// phase `Thinking`, no retry reason, active until the returned run is dropped. A run still
+    /// in flight is superseded (it then reads as cancelled and its chunks are ignored). After
+    /// `close`, the new run starts already cancelled.
     #[must_use]
     pub fn begin(&self, request_tag: u64) -> GenerationRun {
+        self.begin_attempt(request_tag, None)
+    }
+
+    /// `begin` for a second attempt of a request: the snapshot carries `retry` so the widget
+    /// can say why the request is sent again.
+    #[must_use]
+    pub fn begin_attempt(&self, request_tag: u64, retry: Option<RetryReason>) -> GenerationRun {
         let (run_id, superseded_waker) = {
             let mut state = self.lock();
             state.run_id = state.run_id.wrapping_add(1);
             state.request_tag = request_tag;
+            state.retry = retry;
             state.active = true;
             state.phase = GenerationPhase::Thinking;
             state.reasoning_chars = 0;
@@ -295,23 +350,27 @@ impl Future for RunCancelled<'_> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::exec_chat_tracked;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::{AttemptFailure, exec_attempt};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use futures_util::StreamExt;
     use genai::adapter::AdapterKind;
-    use genai::chat::{ChatOptions, ChatRequest, ChatStreamEvent};
+    use genai::chat::{ChatOptions, ChatRequest, ChatStreamEvent, StopReason};
     use genai::{Client, ModelIden};
     use ms_log::runtime_log;
 
-    use super::{GenerationRun, GenerationTracker};
+    use super::{GenerationRun, GenerationTracker, RetryReason, TrackedAnswer};
     use crate::error::AiApiError;
 
     /// Runs `request` against `model` as a stream, feeding `tracker` per chunk (the generation is
-    /// tagged `request_tag`, echoed in the snapshot), and returns the answer text: the
-    /// concatenation of EVERY answer chunk, i.e. of all text parts of the reply (reasoning is
-    /// counted, never returned). This is the one owner of tracked LLM execution; call it inside
-    /// `client::block_on` on a worker thread.
+    /// tagged `request_tag`, echoed in the snapshot), and returns the answer: the concatenation
+    /// of EVERY answer chunk, i.e. of all text parts of the reply (reasoning is counted, never
+    /// returned), plus whether the provider stopped it at its output-token limit
+    /// (`TrackedAnswer::truncated`). This is the one owner of tracked LLM execution; call it
+    /// inside `client::block_on` on a worker thread. A caller that must validate the answer's
+    /// format uses `validated::exec_chat_validated`, which runs on top of it.
     ///
     /// `options` are the caller's chat options, sent unchanged: reasoning capture is deliberately
     /// NOT added, because for Gemini it injects `thinkingConfig.includeThoughts`, which models
@@ -342,41 +401,61 @@ mod native {
     /// or during the request; `AiApiError::ChatRequest` with the provider error text when the
     /// request or the stream failed, or with the localized "stream ended early" text when the
     /// terminal event never came. All are logged here.
-    pub async fn exec_chat_tracked(client: &Client, model: ModelIden, request: ChatRequest, options: Option<&ChatOptions>, tracker: &GenerationTracker, request_tag: u64) -> Result<String, AiApiError> {
-        let run = tracker.begin(request_tag);
+    pub async fn exec_chat_tracked(client: &Client, model: ModelIden, request: ChatRequest, options: Option<&ChatOptions>, tracker: &GenerationTracker, request_tag: u64) -> Result<TrackedAnswer, AiApiError> {
+        exec_attempt(client, model, request, options, tracker, request_tag, None).await.map_err(|failure| failure.error)
+    }
+
+    /// A failed tracked attempt: the error (already logged) and whether it happened before any
+    /// answer or reasoning output arrived — only such a failure can be a provider rejecting the
+    /// request itself (e.g. its structured-output format).
+    #[derive(Debug)]
+    pub(crate) struct AttemptFailure {
+        pub(crate) error: AiApiError,
+        pub(crate) before_output: bool,
+    }
+
+    /// `exec_chat_tracked` for one attempt of a request, begun with `retry` as the snapshot's
+    /// retry reason (`None` for a first attempt). Same contract and errors, plus
+    /// `AttemptFailure::before_output`.
+    pub(crate) async fn exec_attempt(client: &Client, model: ModelIden, request: ChatRequest, options: Option<&ChatOptions>, tracker: &GenerationTracker, request_tag: u64, retry: Option<RetryReason>) -> Result<TrackedAnswer, AttemptFailure> {
+        let run = tracker.begin_attempt(request_tag, retry);
         let model_name = model.model_name.to_string();
         if run.is_cancelled() {
-            return Err(cancelled(&model_name));
+            return Err(AttemptFailure { error: cancelled(&model_name), before_output: true });
         }
         let normalize = options.and_then(|options| options.normalize_reasoning_content) == Some(true) && adapter_normalizes_think_tags(model.adapter_kind);
         // Kept for the one non-streaming retry; the streaming call consumes its own copy.
         let fallback_request = request.clone();
         match stream_answer(client, model.clone(), request, options, &run).await {
-            StreamOutcome::Done { answer, reasoning_received } => {
-                if normalize && !reasoning_received {
-                    return Ok(normalize_think_answer(&answer));
+            StreamOutcome::Done { answer, reasoning_received, truncated } => {
+                if truncated {
+                    runtime_log::log_warn(format!("[AI API] answer of '{model_name}' was cut off at the provider's output-token limit ({} chars received)", answer.chars().count()));
                 }
-                Ok(answer)
+                let text = if normalize && !reasoning_received { normalize_think_answer(&answer) } else { answer };
+                Ok(TrackedAnswer { text, truncated })
             }
-            StreamOutcome::Cancelled => Err(cancelled(&model_name)),
+            StreamOutcome::Cancelled => Err(AttemptFailure { error: cancelled(&model_name), before_output: false }),
             StreamOutcome::Incomplete => {
                 runtime_log::log_error(format!("[AI API] chat stream for '{model_name}' ended before the provider's terminal event; the partial answer is discarded"));
-                Err(AiApiError::ChatRequest { detail: t!("ai_api.generation.stream_incomplete_error").to_string() })
+                Err(AttemptFailure { error: AiApiError::ChatRequest { detail: t!("ai_api.generation.stream_incomplete_error").to_string() }, before_output: false })
             }
             StreamOutcome::Failed { error, output_received } => {
                 let detail = error.to_string();
                 if output_received || !streaming_not_permitted(&detail) {
-                    return Err(request_failed(&model_name, &error));
+                    return Err(AttemptFailure { error: request_failed(&model_name, &error), before_output: !output_received });
                 }
                 runtime_log::log_warn(format!("[AI API] streaming '{model_name}' was refused by the provider ({detail}); retrying once without streaming"));
                 let reply = tokio::select! {
                     biased;
-                    () = run.cancelled() => return Err(cancelled(&model_name)),
+                    () = run.cancelled() => return Err(AttemptFailure { error: cancelled(&model_name), before_output: true }),
                     reply = client.exec_chat(model, fallback_request, options) => reply,
                 };
                 match reply {
-                    Ok(response) => Ok(response.first_text().unwrap_or("").to_string()),
-                    Err(err) => Err(request_failed(&model_name, &err)),
+                    Ok(response) => {
+                        let truncated = response.stop_reason.as_ref().is_some_and(StopReason::is_max_tokens);
+                        Ok(TrackedAnswer { text: response.first_text().unwrap_or("").to_string(), truncated })
+                    }
+                    Err(err) => Err(AttemptFailure { error: request_failed(&model_name, &err), before_output: true }),
                 }
             }
         }
@@ -384,8 +463,9 @@ mod native {
 
     /// How one streaming attempt ended.
     enum StreamOutcome {
-        /// The terminal event arrived; `answer` is every answer chunk concatenated.
-        Done { answer: String, reasoning_received: bool },
+        /// The terminal event arrived; `answer` is every answer chunk concatenated, `truncated`
+        /// tells whether its stop reason was the output-token limit.
+        Done { answer: String, reasoning_received: bool, truncated: bool },
         /// The run was cancelled; the request / stream was dropped.
         Cancelled,
         /// The body ended without the provider's terminal event.
@@ -427,7 +507,10 @@ mod native {
                     run.record_reasoning(&chunk.content);
                 }
                 Some(Ok(ChatStreamEvent::Start | ChatStreamEvent::ThoughtSignatureChunk(_) | ChatStreamEvent::ToolCallChunk(_))) => {}
-                Some(Ok(ChatStreamEvent::End(_))) => return StreamOutcome::Done { answer, reasoning_received },
+                Some(Ok(ChatStreamEvent::End(end))) => {
+                    let truncated = end.captured_stop_reason.as_ref().is_some_and(StopReason::is_max_tokens);
+                    return StreamOutcome::Done { answer, reasoning_received, truncated };
+                }
             }
         }
     }
@@ -541,9 +624,6 @@ mod native {
     /// OpenAI-compatible streaming protocol (no external network, no files).
     #[cfg(test)]
     mod stream_tests {
-        use std::io::{Read, Write};
-        use std::net::{TcpListener, TcpStream};
-        use std::sync::mpsc;
         use std::time::{Duration, Instant};
 
         use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
@@ -551,108 +631,49 @@ mod native {
         use super::exec_chat_tracked;
         use crate::client::{block_on, build_client};
         use crate::error::AiApiError;
-        use crate::generation::{GenerationPhase, GenerationTracker};
+        use crate::generation::{GenerationPhase, GenerationTracker, TrackedAnswer};
+        use crate::loopback_test_server::{WAIT, delta_event, finish_events, finish_events_with, json_response, serve, sse_response};
         use crate::model_id::model_iden;
         use crate::service::AiApiService;
         use crate::target::AiApiTarget;
 
-        const WAIT: Duration = Duration::from_secs(10);
-
-        fn delta_event(field: &str, text: &str) -> String {
-            let delta = serde_json::json!({ "choices": [{ "index": 0, "delta": { field: text }, "finish_reason": null }] });
-            format!("data: {delta}\n\n")
-        }
-
-        fn finish_events() -> Vec<String> {
-            let finish = serde_json::json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] });
-            vec![format!("data: {finish}\n\n"), "data: [DONE]\n\n".to_string()]
-        }
-
-        /// Reads one HTTP request (headers + `Content-Length` body) and returns its body, so the
-        /// client is never answered before it finished sending.
-        fn read_request(stream: &mut TcpStream) -> std::io::Result<String> {
-            let mut buffer = Vec::new();
-            let mut chunk = [0_u8; 4096];
-            loop {
-                let read = stream.read(&mut chunk)?;
-                if read == 0 {
-                    return Ok(String::new());
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-                let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&buffer[..header_end]).to_ascii_lowercase();
-                let content_length = headers.lines().find_map(|line| line.strip_prefix("content-length:")).and_then(|value| value.trim().parse::<usize>().ok()).unwrap_or(0);
-                if buffer.len() >= header_end + 4 + content_length {
-                    return Ok(String::from_utf8_lossy(&buffer[header_end + 4..]).into_owned());
-                }
-            }
-        }
-
-        /// A 200 server-sent-events response whose body is `events`, closed after them.
-        fn sse_response(events: &[String]) -> String {
-            let mut response = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
-            for event in events {
-                response.push_str(event);
-            }
-            response
-        }
-
-        /// A JSON response with `status_line` (e.g. `"400 Bad Request"`).
-        fn json_response(status_line: &str, body: &str) -> String {
-            format!("HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
-        }
-
-        /// A loopback server answering one connection per entry of `responses`, in order.
-        struct TestServer {
-            base_url: String,
-            /// Signalled when the client closed the stalled last connection.
-            closed: mpsc::Receiver<()>,
-            /// The request bodies, in order.
-            requests: mpsc::Receiver<String>,
-        }
-
-        /// Starts a `TestServer`. With `stall`, the last connection is held open after its
-        /// response until the client closes it.
-        fn serve(responses: Vec<String>, stall: bool) -> TestServer {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port for the test server");
-            let port = listener.local_addr().expect("loopback listener has an address").port();
-            let (closed_tx, closed) = mpsc::channel();
-            let (requests_tx, requests) = mpsc::channel();
-            std::thread::spawn(move || {
-                let last = responses.len().saturating_sub(1);
-                for (index, response) in responses.iter().enumerate() {
-                    let Ok((mut stream, _)) = listener.accept() else { return };
-                    let Ok(body) = read_request(&mut stream) else { return };
-                    // An `Err` only means the test does not inspect the requests.
-                    requests_tx.send(body).ok();
-                    if stream.write_all(response.as_bytes()).and_then(|()| stream.flush()).is_err() {
-                        return;
-                    }
-                    if stall && index == last {
-                        // Blocks until the client drops the connection (read returns 0), bounded
-                        // by `WAIT` so a broken test cannot leave the thread hanging.
-                        if stream.set_read_timeout(Some(WAIT)).is_err() {
-                            return;
-                        }
-                        let mut probe = [0_u8; 64];
-                        if matches!(stream.read(&mut probe), Ok(0)) {
-                            // An `Err` only means the test stopped waiting for the close.
-                            closed_tx.send(()).ok();
-                        }
-                    }
-                }
-            });
-            TestServer { base_url: format!("http://127.0.0.1:{port}"), closed, requests }
-        }
-
-        fn run(base_url: &str, options: Option<&ChatOptions>, tracker: &GenerationTracker) -> Result<String, AiApiError> {
+        fn run_answer(base_url: &str, options: Option<&ChatOptions>, tracker: &GenerationTracker) -> Result<TrackedAnswer, AiApiError> {
             let target = AiApiTarget::new(AiApiService::OpenAiCompatible, base_url).expect("loopback base URL is valid");
             let client = build_client(&target, String::new());
             let model = model_iden(AiApiService::OpenAiCompatible, "test-model").expect("non-empty model id");
             let request = ChatRequest::default().append_message(ChatMessage::user("hi"));
             block_on(exec_chat_tracked(&client, model, request, options, tracker, 7)).expect("tokio runtime builds")
+        }
+
+        fn run(base_url: &str, options: Option<&ChatOptions>, tracker: &GenerationTracker) -> Result<String, AiApiError> {
+            run_answer(base_url, options, tracker).map(|answer| answer.text)
+        }
+
+        #[test]
+        fn a_completed_stream_is_not_truncated() {
+            let mut events = vec![delta_event("content", "done")];
+            events.extend(finish_events());
+            let server = serve(vec![sse_response(&events)], false);
+            let answer = run_answer(&server.base_url, None, &GenerationTracker::new()).expect("stream completes");
+            assert_eq!(answer, TrackedAnswer { text: "done".to_string(), truncated: false });
+        }
+
+        #[test]
+        fn a_length_stop_reports_a_truncated_answer() {
+            let mut events = vec![delta_event("content", "[{\"id\":1,")];
+            events.extend(finish_events_with("length"));
+            let server = serve(vec![sse_response(&events)], false);
+            let answer = run_answer(&server.base_url, None, &GenerationTracker::new()).expect("stream completes");
+            assert_eq!(answer, TrackedAnswer { text: "[{\"id\":1,".to_string(), truncated: true });
+        }
+
+        #[test]
+        fn a_non_streaming_reply_reports_its_stop_reason() {
+            let refusal = r#"{"error":{"message":"Your organization must be verified to stream this model.","param":"stream"}}"#;
+            let reply = r#"{"id":"x","object":"chat.completion","created":0,"model":"test-model","choices":[{"index":0,"message":{"role":"assistant","content":"cut"},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let server = serve(vec![json_response("400 Bad Request", refusal), json_response("200 OK", reply)], false);
+            let answer = run_answer(&server.base_url, None, &GenerationTracker::new()).expect("retry succeeds");
+            assert_eq!(answer, TrackedAnswer { text: "cut".to_string(), truncated: true });
         }
 
         #[test]
@@ -829,7 +850,7 @@ mod tests {
         drop(first);
         let second = tracker.begin(5);
         assert!(!second.is_cancelled());
-        assert_eq!(tracker.snapshot(), GenerationSnapshot { active: true, phase: GenerationPhase::Thinking, reasoning_chars: 0, answer_chars: 0, run_id: 2, request_tag: 5 });
+        assert_eq!(tracker.snapshot(), GenerationSnapshot { active: true, phase: GenerationPhase::Thinking, reasoning_chars: 0, answer_chars: 0, run_id: 2, request_tag: 5, retry: None });
     }
 
     #[test]

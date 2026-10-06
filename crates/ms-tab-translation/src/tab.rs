@@ -1565,6 +1565,7 @@ impl TranslationTabState {
                                 can_cancel: mt_can_cancel,
                                 progress: self.mt_progress,
                                 generation: self.mt_controller.generation_snapshot(),
+                                issues: self.mt_controller.run_issues(),
                             },
                             &mut self.mt_stop_notice,
                             &mut self.mt_panel_options,
@@ -3855,12 +3856,6 @@ impl TranslationTabState {
                         );
                     }
                 }
-                MtControllerEvent::ItemFailed { bubble_id, error } => {
-                    eprintln!(
-                        "[MT][ItemFailed] bubble_id={bubble_id} error={}",
-                        error.replace('\n', " ")
-                    );
-                }
                 MtControllerEvent::RunFinished { translated, errors } => {
                     self.mt_progress = None;
                     let severity = if errors == 0 {
@@ -4281,6 +4276,7 @@ impl TranslationTabState {
             image_detail: self.mt_panel_options.ai_image_detail,
             image_mode: self.mt_panel_options.ai_image_mode,
             image_context_source: self.mt_panel_options.ai_image_context_source,
+            strict_json: self.mt_panel_options.ai_strict_json,
             project: project.clone(),
         }
     }
@@ -6166,6 +6162,8 @@ impl TranslationTabState {
                 if let Some(value) = ai_obj.get("include_image_bubbles").and_then(Value::as_bool) {
                     self.mt_panel_options.ai_include_image_bubbles = value;
                 }
+                // Opt-in: a missing key (settings written before the option existed) reads as off.
+                self.mt_panel_options.ai_strict_json = ai_obj.get("strict_json").and_then(Value::as_bool).unwrap_or(false);
                 if let Some(value) = ai_obj.get("image_detail").and_then(Value::as_str) {
                     self.mt_panel_options.ai_image_detail = AiMtImageDetail::from_key(value);
                 } else if let Some(value) =
@@ -7886,6 +7884,10 @@ fn apply_translation_settings_sections(
     mt_ai_obj.insert(
         "include_image_bubbles".to_string(),
         Value::Bool(mt_options.ai_include_image_bubbles),
+    );
+    mt_ai_obj.insert(
+        "strict_json".to_string(),
+        Value::Bool(mt_options.ai_strict_json),
     );
     mt_ai_obj.insert(
         "image_detail".to_string(),

@@ -12,6 +12,8 @@ reach into `backend_health` / `text_detector` / `machine_translation`. It must n
 
 Submodules:
 - `adv_rec`: floating advanced-recognition window for manual OCR region selection.
+- `ai_mt_response`: reading, validating and merging AI API MT answers, content checks, the
+  strict-output schema (native only).
 - `backend_health`: push-driven AI-backend health (`TOPIC_HEALTH` v2 events) + device-control helpers.
 - `machine_translators`: concrete MT backends (Google/Yandex/DeepL) used by worker.
 - `machine_translation`: MT controller/worker and backend dispatch integration.
@@ -32,6 +34,8 @@ Submodules:
 extern crate ms_i18n;
 
 mod adv_rec;
+#[cfg(not(target_arch = "wasm32"))]
+mod ai_mt_response;
 // `pub` rather than crate-private: the binary's AI backend panel and supervisor, the
 // launcher's reline flow and the `cleaning` tab all read the push-driven health snapshot
 // through it.
