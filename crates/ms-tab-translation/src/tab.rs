@@ -183,6 +183,7 @@ Module-level utility functions:
 Key TranslationTabState field groups:
 - Panel/controllers/options: `active_panel`, `ai_enabled`, `ocr_controller`, `ocr_panel_options`,
   `ocr_engine_states` + `ocr_loading_engine` (runtime per-engine OCR statuses),
+  `ocr_model_downloads` (external OCR model status/download controller, polled per frame),
   `ocr_last_panel_engine`/`ocr_last_health_check_request_s`,
   `ai_backend_health*`,
   `mt_controller`, `mt_panel_options`, `text_detector_controller`,
@@ -228,7 +229,7 @@ use ms_tabs_simple::characters::load_character_names;
 use crate::adv_rec::{
     AdvancedRecognitionAction, AdvancedRecognitionSelection, AdvancedRecognitionWindow,
 };
-use crate::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
+use crate::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand, paddle_vl_ready_for};
 use crate::machine_translation::{
     AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtOptions, AiMtReasoning, AiMtSortMode,
     MtControllerEvent, MtImageArea, MtImageInput, MtImageSource, MtRequestPreview,
@@ -237,8 +238,11 @@ use crate::machine_translation::{
 };
 use crate::ocr::{
     OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest, OcrRuntimeOptions,
-    TranslationOcrController,
+    TranslationOcrController, external_model_spec,
 };
+use crate::ocr_model_download::OcrModelDownloadController;
+use crate::panels::ocr_model_download::ModelDownloadAction;
+use ms_sysprobe::ai_models::external_catalog::PaddleVlVariant;
 use ms_ai_api::{AiApiService, AiApiTaskRunner, GenerationSnapshot, ImageInputSupport, image_input_support, is_probable_quota_or_limit_error};
 use crate::panels::bubbles::{
     BubbleFooterState, BubblesPanelContext, BubblesPanelState, bubble_extra_bool,
@@ -254,7 +258,7 @@ use crate::panels::machine_translation::{
     MtPanelOptions, MtPanelProgress, MtPanelRun, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
 };
 use crate::panels::ocr::{
-    CharReplacementRuleUi, OcrPanelOptions, draw_ocr_panel, selected_mode_requirement,
+    CharReplacementRuleUi, OcrPanelModelView, OcrPanelOptions, draw_ocr_panel, selected_mode_requirement,
 };
 use crate::panels::text_detector::{
     TextDetectorAlgorithm, TextDetectorPanelOptions, TextDetectorPanelView, TextDetectorPlanNoticeCache,
@@ -685,7 +689,10 @@ pub struct TranslationTabState {
     /// Key / metadata requests of the OCR panel's AI API connection widget
     /// (`ocr_panel_options.ai_api`), polled by `poll_ai_api_events`.
     ocr_ai_api_tasks: AiApiTaskRunner,
-    ocr_engine_states: [OcrLoadState; 6],
+    ocr_engine_states: [OcrLoadState; 7],
+    /// Install status and explicit downloads of the external OCR models (Baberu OCR,
+    /// PaddleOCR-VL variants); polled every frame by `poll_ocr_model_downloads`.
+    ocr_model_downloads: OcrModelDownloadController,
     ocr_loading_engine: Option<OcrEngine>,
     ocr_last_panel_engine: Option<OcrEngine>,
     ocr_last_health_check_request_s: f64,
@@ -963,7 +970,8 @@ impl TranslationTabState {
             ocr_controller: TranslationOcrController::default(),
             ocr_panel_options: OcrPanelOptions::default(),
             ocr_ai_api_tasks: AiApiTaskRunner::default(),
-            ocr_engine_states: [OcrLoadState::NotLoaded; 6],
+            ocr_engine_states: [OcrLoadState::NotLoaded; 7],
+            ocr_model_downloads: OcrModelDownloadController::new(),
             ocr_loading_engine: None,
             ocr_last_panel_engine: None,
             ocr_last_health_check_request_s: -10_000.0,
@@ -1131,6 +1139,7 @@ impl TranslationTabState {
             OcrEngine::Surya => 3,
             OcrEngine::AiApi => 4,
             OcrEngine::PaddleVl => 5,
+            OcrEngine::Baberu => 6,
         }
     }
 
@@ -1160,8 +1169,10 @@ impl TranslationTabState {
         let manga_ready = snapshot.ocr_manga_ready;
         let easy_ready = snapshot.ocr_easy_ready;
         let paddle_ready = snapshot.ocr_paddle_ready;
-        let paddle_vl_ready = snapshot.ocr_paddle_vl_ready;
+        // Per variant: a resident engine of another PaddleOCR-VL variant is not "ready".
+        let paddle_vl_ready = paddle_vl_ready_for(snapshot, self.ocr_panel_options.paddle_vl_model.key());
         let surya_ready = snapshot.ocr_surya_ready;
+        let baberu_ready = snapshot.ocr_baberu_ready;
         let sync_engine = |this: &mut Self, engine: OcrEngine, ready: Option<bool>| {
             let Some(ready) = ready else {
                 return;
@@ -1177,6 +1188,39 @@ impl TranslationTabState {
         sync_engine(self, OcrEngine::PaddleOcr, paddle_ready);
         sync_engine(self, OcrEngine::PaddleVl, paddle_vl_ready);
         sync_engine(self, OcrEngine::Surya, surya_ready);
+        sync_engine(self, OcrEngine::Baberu, baberu_ready);
+    }
+
+    /// Applies the OCR panel's external-model outcome of one frame: a requested download /
+    /// cancel, a fresh status probe when the engine or the PaddleOCR-VL variant changed (an
+    /// earlier "installed" may be stale), and `NotLoaded` for PaddleOCR-VL after a variant
+    /// switch (the loaded weights are the old variant's).
+    fn apply_ocr_model_panel_changes(&mut self, engine_before: OcrEngine, variant_before: PaddleVlVariant, action: ModelDownloadAction) {
+        let engine = self.ocr_panel_options.engine;
+        let variant = self.ocr_panel_options.paddle_vl_model;
+        let spec = external_model_spec(engine, variant);
+        if variant != variant_before {
+            self.set_ocr_state_for_engine(OcrEngine::PaddleVl, OcrLoadState::NotLoaded);
+        }
+        if (engine != engine_before || variant != variant_before)
+            && let Some(spec) = spec
+        {
+            self.ocr_model_downloads.request_status(spec);
+        }
+        match (action, spec) {
+            (ModelDownloadAction::Download, Some(spec)) => self.ocr_model_downloads.start_download(spec),
+            (ModelDownloadAction::Cancel, Some(_)) => self.ocr_model_downloads.cancel(),
+            (ModelDownloadAction::None, _) | (ModelDownloadAction::Download | ModelDownloadAction::Cancel, None) => {}
+        }
+    }
+
+    /// Per-frame poll of the external OCR model controller; keeps repainting while a
+    /// download or status probe is in flight so progress stays live.
+    fn poll_ocr_model_downloads(&mut self, ctx: &egui::Context) {
+        self.ocr_model_downloads.poll();
+        if self.ocr_model_downloads.is_active() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
     }
 
     fn request_ai_backend_health_check(&mut self, ctx: &egui::Context, force: bool) {
@@ -1486,6 +1530,18 @@ impl TranslationTabState {
             }
             TranslationPanel::Ocr => {
                 let selected_engine_before = self.ocr_panel_options.engine;
+                let selected_variant_before = self.ocr_panel_options.paddle_vl_model;
+                let model_spec = external_model_spec(selected_engine_before, selected_variant_before);
+                // Opening the panel on (or switching to) a model never probed this session.
+                if let Some(spec) = model_spec
+                    && self.ocr_model_downloads.state_for(spec.id) == crate::ocr_model_download::OcrModelDownloadState::Unknown
+                {
+                    self.ocr_model_downloads.request_status(spec);
+                }
+                let model_snapshot = model_spec.map(|spec| self.ocr_model_downloads.panel_snapshot(spec));
+                // The MT source language is the input language of OCR; `TextTab.text_language` is the
+                // typesetting (output) language and the wrong signal here.
+                let korean_source = self.mt_panel_options.source_lang.trim().eq_ignore_ascii_case("ko");
                 let force_health_check = self.ocr_last_panel_engine != Some(selected_engine_before);
                 // Route-aware: a native ONNX selection needs no backend, so we do
                 // NOT probe backend health or mark it unavailable for it.
@@ -1510,6 +1566,7 @@ impl TranslationTabState {
                             self.hotkey_hints.ocr_advanced_selection_mode.as_deref(),
                             advanced_selection_active,
                             &self.ocr_controller.generation_snapshot(),
+                            OcrPanelModelView { korean_source, download: model_snapshot.as_ref() },
                         )
                     })
                     .inner;
@@ -1524,6 +1581,7 @@ impl TranslationTabState {
                         }
                     }
                     self.ocr_ai_api_tasks.submit_actions(&mut self.ocr_panel_options.ai_api, actions.ai_api);
+                    self.apply_ocr_model_panel_changes(selected_engine_before, selected_variant_before, actions.model_download);
                     if let Some(shown) = actions.stop_generation {
                         self.stop_ocr_generation(ctx, shown);
                     }
@@ -2163,6 +2221,12 @@ impl TranslationTabState {
     ) {
         for event in self.ocr_controller.poll_events() {
             match event {
+                OcrControllerEvent::ExternalModelMissing(spec) => {
+                    // The gate's error names the button of the disk state it just probed;
+                    // re-probe so the panel draws that same button (it may still show a
+                    // stale `Installed` or an older state).
+                    self.ocr_model_downloads.request_status(spec);
+                }
                 OcrControllerEvent::StateChanged(state) => match state {
                     OcrLoadState::DownloadingModel => {
                         let engine = self
@@ -2194,6 +2258,11 @@ impl TranslationTabState {
                             .take()
                             .unwrap_or(self.ocr_panel_options.engine);
                         self.set_ocr_state_for_engine(engine, OcrLoadState::Error);
+                        // A load error of an external-model engine may come from its files
+                        // (deleted, damaged): refresh the panel's install state too.
+                        if let Some(spec) = external_model_spec(engine, self.ocr_panel_options.paddle_vl_model) {
+                            self.ocr_model_downloads.request_status(spec);
+                        }
                         self.push_toast(
                             ctx,
                             t!("translation.tab.engine_load_error").to_string(),
@@ -5598,6 +5667,7 @@ impl CanvasHooks for TranslationTabState {
         self.poll_text_detector_events(ctx);
         self.poll_text_detection_storage_events(project);
         self.poll_ocr_events(ctx, canvas, project);
+        self.poll_ocr_model_downloads(ctx);
         self.poll_mt_events(ctx, canvas);
         self.poll_ai_api_events(ctx);
         self.handle_image_bubble_hotkeys(ctx, canvas, project);
@@ -5925,6 +5995,8 @@ impl TranslationTabState {
         }
 
         let ocr = project.settings_data.get("OCR").and_then(Value::as_object);
+        // A missing or unknown variant key loads as the default variant (saved back as its key).
+        self.ocr_panel_options.paddle_vl_model = paddle_vl_model_from_settings(ocr);
         if let Some(ocr_obj) = ocr {
             if let Some(engine_raw) = ocr_obj.get("engine").and_then(Value::as_str) {
                 self.ocr_panel_options.engine = parse_ocr_engine_key(engine_raw);
@@ -7744,6 +7816,10 @@ fn apply_translation_settings_sections(
         "script".to_string(),
         Value::String(ocr_options.paddle_vl_script.clone()),
     );
+    paddle_vl_obj.insert(
+        "model".to_string(),
+        Value::String(ocr_options.paddle_vl_model.key().to_string()),
+    );
     params_obj.insert("paddle_vl".to_string(), Value::Object(paddle_vl_obj));
     let mut surya_obj = params_obj
         .get("surya")
@@ -8112,6 +8188,7 @@ fn parse_ocr_engine_key(engine: &str) -> OcrEngine {
             OcrEngine::PaddleVl
         }
         "surya" | "suryaocr" | "surya_ocr" => OcrEngine::Surya,
+        "baberu" | "baberu_ocr" | "baberuocr" => OcrEngine::Baberu,
         "aiapi" | "ai_api" | "ai-api" | "genai" => OcrEngine::AiApi,
         "paddle_onnx" | "paddleonnx" | "paddle-onnx" | "onnx" => OcrEngine::PaddleOcr,
         "mangaocr" | "manga_ocr" | "manga" | "mocr" => OcrEngine::MangaOcr,
@@ -8127,7 +8204,22 @@ fn ocr_engine_to_project_key(engine: OcrEngine) -> &'static str {
         OcrEngine::PaddleVl => "paddle_vl",
         OcrEngine::Surya => "surya",
         OcrEngine::AiApi => "ai_api",
+        OcrEngine::Baberu => "baberu",
     }
+}
+
+/// The PaddleOCR-VL variant persisted in an `OCR` settings section
+/// (`params.paddle_vl.model`, legacy section alias `params.paddleocrvl`). Missing, non-string
+/// or unknown values give `PaddleVlVariant::default()`.
+fn paddle_vl_model_from_settings(ocr: Option<&Map<String, Value>>) -> PaddleVlVariant {
+    ocr.and_then(|ocr| ocr.get("params"))
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("paddle_vl").or_else(|| params.get("paddleocrvl")))
+        .and_then(Value::as_object)
+        .and_then(|paddle_vl| paddle_vl.get("model"))
+        .and_then(Value::as_str)
+        .and_then(PaddleVlVariant::from_key)
+        .unwrap_or_default()
 }
 
 fn parse_ocr_lang_text_setting(value: Option<&Value>) -> Option<String> {
@@ -8174,6 +8266,7 @@ fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions) -> OcrRuntimeOptions
         manga_model: ocr_options.manga_model.clone(),
         paddle_lang: ocr_options.paddle_lang.clone(),
         paddle_vl_script: ocr_options.paddle_vl_script.clone(),
+        paddle_vl_model: ocr_options.paddle_vl_model,
         easy_langs: ocr_options.easy_langs.clone(),
         surya_task_name: if surya_is_active {
             "ocr_without_boxes".to_string()
@@ -8889,5 +8982,143 @@ mod settings_persistence_tests {
         assert!(save_defaults(&path).is_err());
         assert_eq!(std::fs::read_to_string(&path).map_err(|err| err.to_string())?, seed);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ocr_model_settings_tests {
+    use super::{
+        CompositionPanelOptions, Map, MtPanelOptions, OcrEngine, OcrPanelOptions, PaddleVlVariant, TextDetectorPanelOptions,
+        Value, apply_translation_settings_sections, ocr_engine_to_project_key, paddle_vl_model_from_settings,
+        parse_ocr_engine_key,
+    };
+    use serde_json::json;
+
+    /// Writes `ocr` through the real settings writer and returns the `OCR` section.
+    fn written_ocr_section(ocr: &OcrPanelOptions, seed: Value) -> Map<String, Value> {
+        let mut root = seed.as_object().cloned().unwrap_or_default();
+        apply_translation_settings_sections(
+            &mut root,
+            ocr,
+            &MtPanelOptions::default(),
+            &CompositionPanelOptions::default(),
+            &TextDetectorPanelOptions::default(),
+        );
+        root.get("OCR").and_then(Value::as_object).cloned().unwrap_or_default()
+    }
+
+    /// Every variant survives a write + read, keeps the sibling `script` key, and is stored
+    /// as its stable key.
+    #[test]
+    fn paddle_vl_model_round_trips_for_every_variant() {
+        for variant in PaddleVlVariant::ALL {
+            let options = OcrPanelOptions { paddle_vl_model: variant, ..Default::default() };
+            let section = written_ocr_section(&options, json!({}));
+            assert_eq!(section["params"]["paddle_vl"]["model"], json!(variant.key()));
+            assert_eq!(section["params"]["paddle_vl"]["script"], json!("auto"));
+            assert_eq!(paddle_vl_model_from_settings(Some(&section)), variant);
+        }
+    }
+
+    /// A project saved before the option existed, an unknown key or a non-string value all
+    /// load as the default variant (normalized to its key on the next save).
+    #[test]
+    fn missing_or_unknown_paddle_vl_model_loads_as_default() {
+        assert_eq!(paddle_vl_model_from_settings(None), PaddleVlVariant::Official16);
+        for section in [
+            json!({}),
+            json!({ "params": {} }),
+            json!({ "params": { "paddle_vl": { "script": "korean" } } }),
+            json!({ "params": { "paddle_vl": { "model": "official_9_9" } } }),
+            json!({ "params": { "paddle_vl": { "model": 3 } } }),
+        ] {
+            let map = section.as_object().cloned().unwrap_or_default();
+            assert_eq!(paddle_vl_model_from_settings(Some(&map)), PaddleVlVariant::Official16, "{section}");
+        }
+        // The legacy section alias and key normalization of `from_key` are honoured.
+        let legacy = json!({ "params": { "paddleocrvl": { "model": " MANGA_JA " } } });
+        assert_eq!(paddle_vl_model_from_settings(legacy.as_object()), PaddleVlVariant::MangaJa);
+    }
+
+    #[test]
+    fn baberu_engine_key_round_trips_and_accepts_aliases() {
+        for alias in ["baberu", "baberu_ocr", "BaberuOCR", " baberuocr "] {
+            assert_eq!(parse_ocr_engine_key(alias), OcrEngine::Baberu, "{alias}");
+        }
+        assert_eq!(parse_ocr_engine_key(ocr_engine_to_project_key(OcrEngine::Baberu)), OcrEngine::Baberu);
+        let options = OcrPanelOptions { engine: OcrEngine::Baberu, ..Default::default() };
+        assert_eq!(written_ocr_section(&options, json!({}))["engine"], json!("baberu"));
+    }
+}
+
+#[cfg(test)]
+mod ocr_model_download_wiring_tests {
+    use super::{ModelDownloadAction, OcrEngine, OcrLoadState, OcrModelDownloadController, PaddleVlVariant, TranslationTabState};
+    use crate::ocr_model_download::fakes::{missing_probe, waits_for_cancel};
+    use crate::ocr_model_download::{DownloadNotice, Jobs, OcrModelDownloadState};
+    use ms_sysprobe::ai_models::external_catalog::BABERU_OCR;
+    use std::time::{Duration, Instant};
+
+    /// A tab whose download controller runs fakes (no filesystem, no network).
+    fn tab_with_fake_downloads() -> TranslationTabState {
+        let mut tab = TranslationTabState::default();
+        tab.ocr_model_downloads = OcrModelDownloadController::with_jobs(Jobs { status: missing_probe, download: waits_for_cancel });
+        tab
+    }
+
+    fn settle(tab: &mut TranslationTabState) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            tab.ocr_model_downloads.poll();
+            if !tab.ocr_model_downloads.is_active() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "download controller did not settle");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A PaddleOCR-VL variant switch unloads the engine (the loaded weights are the old
+    /// variant's) and probes the new variant; an unchanged selection probes nothing.
+    #[test]
+    fn a_variant_switch_unloads_paddle_vl_and_probes_the_new_variant() {
+        let mut tab = tab_with_fake_downloads();
+        tab.ocr_panel_options.engine = OcrEngine::PaddleVl;
+        tab.ocr_panel_options.paddle_vl_model = PaddleVlVariant::MangaJa;
+        tab.set_ocr_state_for_engine(OcrEngine::PaddleVl, OcrLoadState::Ready);
+        tab.apply_ocr_model_panel_changes(OcrEngine::PaddleVl, PaddleVlVariant::MangaJa, ModelDownloadAction::None);
+        assert_eq!(tab.ocr_state_for_engine(OcrEngine::PaddleVl), OcrLoadState::Ready);
+        assert_eq!(tab.ocr_model_downloads.state_for(PaddleVlVariant::MangaJa.spec().id), OcrModelDownloadState::Unknown);
+
+        tab.apply_ocr_model_panel_changes(OcrEngine::PaddleVl, PaddleVlVariant::Official16, ModelDownloadAction::None);
+        assert_eq!(tab.ocr_state_for_engine(OcrEngine::PaddleVl), OcrLoadState::NotLoaded);
+        assert_eq!(tab.ocr_model_downloads.state_for(PaddleVlVariant::MangaJa.spec().id), OcrModelDownloadState::Checking);
+        settle(&mut tab);
+        assert_eq!(tab.ocr_model_downloads.state_for(PaddleVlVariant::MangaJa.spec().id), OcrModelDownloadState::Missing);
+
+        // An engine switch to Baberu probes Baberu and leaves PaddleOCR-VL's load state.
+        tab.ocr_panel_options.engine = OcrEngine::Baberu;
+        tab.apply_ocr_model_panel_changes(OcrEngine::PaddleVl, PaddleVlVariant::MangaJa, ModelDownloadAction::None);
+        assert_eq!(tab.ocr_model_downloads.state_for(BABERU_OCR.id), OcrModelDownloadState::Checking);
+        settle(&mut tab);
+    }
+
+    /// Download and Cancel go to the selected engine's spec; an engine without an external
+    /// model ignores them.
+    #[test]
+    fn download_and_cancel_route_to_the_selected_spec() {
+        let mut tab = tab_with_fake_downloads();
+        tab.ocr_panel_options.engine = OcrEngine::MangaOcr;
+        tab.apply_ocr_model_panel_changes(OcrEngine::MangaOcr, PaddleVlVariant::Official16, ModelDownloadAction::Download);
+        assert!(!tab.ocr_model_downloads.is_active());
+
+        tab.ocr_panel_options.engine = OcrEngine::Baberu;
+        tab.apply_ocr_model_panel_changes(OcrEngine::Baberu, PaddleVlVariant::Official16, ModelDownloadAction::Download);
+        assert!(matches!(tab.ocr_model_downloads.state_for(BABERU_OCR.id), OcrModelDownloadState::Downloading(_)));
+        tab.apply_ocr_model_panel_changes(OcrEngine::Baberu, PaddleVlVariant::Official16, ModelDownloadAction::Cancel);
+        settle(&mut tab);
+        let snapshot = tab.ocr_model_downloads.panel_snapshot(&BABERU_OCR);
+        assert_eq!(snapshot.notice, Some(DownloadNotice::Cancelled));
+        assert_eq!(snapshot.state, OcrModelDownloadState::Missing);
     }
 }

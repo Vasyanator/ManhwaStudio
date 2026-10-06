@@ -8,6 +8,7 @@ Methods hosted here:
     ocr.paddle_vl    — PaddleOCR-VL recognition (METHOD_OCR_PADDLE_VL)
     ocr.surya        — Surya OCR recognition (METHOD_OCR_SURYA)
     ocr.paddle_onnx  — PaddleOCR-ONNX recognition (METHOD_OCR_PADDLE_ONNX)
+    ocr.baberu       — Baberu OCR recognition, ONNX: vision on the selected EP, decoders on CPU (METHOD_OCR_BABERU)
 
 Registration pattern — add a new OCR method handler here like this:
 
@@ -32,6 +33,7 @@ import threading
 from typing import Any
 
 from ..protocol import (
+    METHOD_OCR_BABERU,
     METHOD_OCR_EASY,
     METHOD_OCR_MANGA,
     METHOD_OCR_PADDLE,
@@ -56,6 +58,14 @@ def _decode_optional_positive_int(header: dict[str, Any], field: str) -> int | N
         raise ValueError(f"Field '{field}' must be a positive integer.")
     if raw <= 0:
         raise ValueError(f"Field '{field}' must be a positive integer.")
+    return raw
+
+
+def _require_non_empty_str(header: dict[str, Any], field: str) -> str:
+    """Return ``header[field]`` when it is a non-empty string; ``ValueError`` naming the field otherwise."""
+    raw = header.get(field)
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"Field '{field}' is required and must be a non-empty string.")
     return raw
 
 
@@ -203,13 +213,19 @@ def _handle_ocr_paddle_vl(
 ) -> tuple[dict[str, Any], bytes]:
     """`ocr.paddle_vl`: recognize the request-blob image via PaddleOCR-VL.
 
-    Request fields: ``join_newlines`` (default true), ``reflect_strings``
-    (default false), ``paddle_vl_script`` (optional string, lowercased; empty
-    -> ``None``).  Returns ``engine``/``lines``/``text`` inline; no response
-    blob.
+    Request fields: the REQUIRED ``paddle_vl_model`` (variant label) and
+    ``paddle_vl_model_dir`` (absolute directory of the downloaded checkpoint;
+    Rust owns the download), ``join_newlines`` (default true),
+    ``reflect_strings`` (default false), ``paddle_vl_script`` (optional string,
+    lowercased; empty -> ``None``).  This layer checks only that the two model
+    fields are non-empty strings and forwards them verbatim; the label syntax
+    and the directory are the service's single answer.  Returns
+    ``engine``/``lines``/``text`` inline; no response blob.
     """
     if not blob:
         raise ValueError("ocr.paddle_vl requires the input image in the frame blob.")
+    model = _require_non_empty_str(header, "paddle_vl_model")
+    model_dir = _require_non_empty_str(header, "paddle_vl_model_dir")
     if cancel_event.is_set():
         raise Interrupted("ocr.paddle_vl canceled before start.")
 
@@ -220,6 +236,8 @@ def _handle_ocr_paddle_vl(
 
     result = ctx.state.paddle_vl_ocr.recognize_image_bytes(
         blob,
+        model=model,
+        model_dir=model_dir,
         join_newlines=bool(header.get("join_newlines", True)),
         reflect_strings=bool(header.get("reflect_strings", False)),
         script=script,
@@ -356,3 +374,53 @@ def _handle_ocr_paddle_onnx(
 
 
 register(METHOD_OCR_PADDLE_ONNX, _handle_ocr_paddle_onnx)
+
+
+def _handle_ocr_baberu(
+    ctx: HandlerContext,
+    header: dict[str, Any],
+    blob: bytes,
+    cancel_event: threading.Event,
+) -> tuple[dict[str, Any], bytes]:
+    """`ocr.baberu`: recognize the request-blob image via Baberu OCR (ONNX; vision on the selected EP, decoders on CPU).
+
+    Request fields: ``join_newlines`` (default true), ``reflect_strings``
+    (default false) and the REQUIRED ``baberu_model_files`` object
+    ``{vision, prefill, step, vocab}`` of absolute paths sent by Rust, which
+    owns the model download. This layer checks only that the object is
+    present; validating each path is the service's single answer
+    (``BaberuFiles.from_request``). Not Torch-gated. Returns
+    ``engine``/``lines``/``text`` inline; no response blob.
+    """
+    if not blob:
+        raise ValueError("ocr.baberu requires the input image in the frame blob.")
+    model_files = header.get("baberu_model_files")
+    if not isinstance(model_files, dict):
+        raise ValueError(
+            "Field 'baberu_model_files' must be an object with the absolute "
+            "'vision', 'prefill', 'step' and 'vocab' paths."
+        )
+    if cancel_event.is_set():
+        raise Interrupted("ocr.baberu canceled before start.")
+
+    result = ctx.state.baberu_ocr.recognize_image_bytes(
+        blob,
+        model_files=model_files,
+        join_newlines=bool(header.get("join_newlines", True)),
+        reflect_strings=bool(header.get("reflect_strings", False)),
+    )
+
+    if cancel_event.is_set():
+        raise Interrupted("ocr.baberu canceled.")
+
+    return (
+        {
+            "engine": "baberuocr",
+            "lines": result["lines"],
+            "text": result["text"],
+        },
+        b"",
+    )
+
+
+register(METHOD_OCR_BABERU, _handle_ocr_baberu)

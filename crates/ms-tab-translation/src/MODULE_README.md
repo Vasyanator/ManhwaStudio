@@ -26,8 +26,13 @@ Long work is delegated to focused controllers:
   transport, page crop/cache handling, and per-engine load state. The AI API layer itself
   (services, credential-store keys, client, async bridge, model metadata, the connection widget
   and its request runner) lives in `ms-ai-api`.
-  `OcrEngine` has six engines: MangaOCR, EasyOCR, PaddleOCR, PaddleOCR-VL and Surya (backend IPC
-  methods `ocr.*`, MangaOCR/PaddleOCR also native ONNX) and AI API (`genai`, no backend).
+  `OcrEngine` has seven engines: MangaOCR, EasyOCR, PaddleOCR, PaddleOCR-VL, Surya and Baberu OCR
+  (backend IPC methods `ocr.*`; MangaOCR/PaddleOCR/Baberu also native ONNX) and AI API (`genai`,
+  no backend).
+- `ocr_model_download.rs` owns the install status and the explicit, user-started downloads of the
+  EXTERNAL OCR models (Baberu OCR, the three PaddleOCR-VL variants; pinned specs in
+  `ms_sysprobe::ai_models::external_catalog`). The tab polls it per frame; the OCR panel draws its
+  state through `panels/ocr_model_download.rs`.
 - `text_detector/` owns the text detector worker and returns page boxes plus editable binary
   masks. Detector modes (`TextDetectorRunMode`): `Classic` (local Otsu threshold + dilation +
   connected components), `PaddleOcr` (native ONNX or backend `textdetector.paddle.forward`),
@@ -123,12 +128,31 @@ socket on unix, token-authenticated loopback WebSocket on Windows; the transport
 `ms-backend-ipc`). All backend transport goes through `ms_backend_ipc::shared_client()`;
 `backend_health.rs` owns no TCP/port state. OCR requests use `begin_call`/`CallHandle` for explicit
 cancellation. App-managed
-model files must be resolved through `ms_sysprobe::ai_models` before backend initialization; EasyOCR,
-Surya, and PaddleOCR-VL library/Hugging Face caches remain backend/library-managed. PaddleOCR
+model files must be resolved through `ms_sysprobe::ai_models` before backend initialization; EasyOCR
+and Surya library/Hugging Face caches remain backend/library-managed. PaddleOCR
 detector-only downloads only detection files, while full PaddleOCR also downloads the selected
 recognition language. PaddleOCR-VL (IPC method `ocr.paddle_vl`) is a PyTorch/Transformers OCR
 engine that needs no text detection and no language selection; it is shown on a second engine row in
-the OCR panel so the side panel stays narrow.
+the OCR panel so the side panel stays narrow, next to Baberu OCR (`ocr.baberu` / native).
+EXTERNAL models (Baberu OCR, the selected PaddleOCR-VL variant `OcrRuntimeOptions::paddle_vl_model`,
+persisted per title as `OCR.params.paddle_vl.model`, missing/unknown -> `official_1_6`) are NEVER
+downloaded implicitly: `ocr.rs::gate_external_models` is the one pre-dispatch gate (load
+warmup before the route decision, every non-AI-API recognize) and turns "not installed" into a
+localized error naming the panel's download/resume button (caption owner:
+`ocr_model_download::offered_download_label`); a miss also emits
+`OcrControllerEvent::ExternalModelMissing(spec)`, on which the tab re-probes the panel state, so the
+button the error names is the one drawn. The resolved paths travel in the
+request header (`paddle_vl_model` key + absolute `paddle_vl_model_dir`; `baberu_model_files`
+`{vision, prefill, step, vocab}`), so the backend owns no layout. The only downloader is the
+panel's Download button -> `OcrModelDownloadController` (one download at a time, worker threads,
+byte progress, Cancel; `ms_sysprobe::ai_models::external::download_external_model`, which retries
+transient network failures itself and reports the wait as the `Retrying` phase). A download
+that ends without installing (cancel, failure) leaves a `DownloadNotice` and re-probes the spec; a
+second spec's Download is disabled in the panel while one runs (busy line names the running one).
+A download interrupted by a tab rebuild (controller drop) or a crash is recognized by its staged
+bytes: the next probe reports `Partial`, shown as "download was interrupted" + Resume; no
+process-global state keeps it.
+`ocr::external_model_spec` is the single owner of the engine -> external spec mapping.
 AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`, streamed by
 `exec_chat_validated`) from the OCR worker thread; its answer is cleaned
 (`structured::strip_think_blocks` + `clean_plain_text`: `<think>` blocks and a code fence
@@ -137,13 +161,16 @@ more (`ocr.rs::ai_api_ocr_validation`; nothing else is retried, plain text has n
 store) and never persisted to project or user JSON settings. For an OpenAI-/Anthropic-compatible
 service the request goes to the panel's base URL (`ms_ai_api::AiApiTarget`) and a missing key is
 not an error; OCR and MT raise their "API key missing" errors only when `requires_key()`.
-The native ONNX Runtime OCR path (MangaOCR + PaddleOCR) is selected in `ocr.rs` by the pure
-`ocr_route` helper: with `General.ai_runtime == "native"` and a non-`Suspect` provider-scope SIGILL
-guard, MangaOCR with an ONNX export (`base_onnx`/`2025_onnx`; `base_torch` has no native path)
-routes to `NativeManga`, and PaddleOCR routes to `NativePaddle` (any language); every other case
+The native ONNX Runtime OCR path (MangaOCR + PaddleOCR + Baberu OCR) is selected in `ocr.rs` by the
+pure `ocr_route` helper: with `General.ai_runtime == "native"` and a non-`Suspect` provider-scope
+SIGILL guard, MangaOCR with an ONNX export (`base_onnx`/`2025_onnx`; `base_torch` has no native path)
+routes to `NativeManga`, PaddleOCR routes to `NativePaddle` (any language) and Baberu OCR to
+`NativeBaberu` (`ms_native_runtime::recognize_baberu`, vision on the selected EP, decoders on CPU, on the gate's resolved files);
+every other case
 (other engines, torch-only model, Suspect guard, backend runtime) routes to the Python backend. On
 the native route the OCR worker decodes the crop to RGBA and calls
-`ms_native_runtime::recognize_manga` / `recognize_paddle` (desktop-only), assembling lines/text
+`ms_native_runtime::recognize_manga` / `recognize_paddle` / `recognize_baberu` (desktop-only),
+assembling lines/text
 with the same `join_newlines`/`reflect_strings` rules as the backend (Paddle's lines are joined with
 `\n` first). The guard scope uses `native_runtime::native_load_scope_key()`
 (`{build}:{provider}[:{device}]@{version}`) so the pre-check matches the build/provider/adapter that
@@ -232,6 +259,14 @@ is an author note addressed to the translator, not a replica.
   image LRU cache, and model-download/load-state events.
 - `ocr_case_fix.rs`: pure, GUI-free post-OCR ALL-CAPS normalization (detector +
   character state machine) used by `ocr.rs`'s post-processing helper.
+- `ocr_model_download.rs`: `OcrModelDownloadController` (stat-only status worker + at most one
+  download thread, progress coalesced in a mutex snapshot, injected worker bodies for tests; a
+  running download is cancelled and DETACHED on drop, never joined on the GUI thread),
+  `OcrModelDownloadState` + `DownloadNotice` + `OcrModelPanelSnapshot` (what the panel block
+  draws), `offered_download_label` (the one owner of the visible download caption, also named by
+  the OCR gate error), the `ExternalModelError` -> localized message mapping (no English detail
+  reaches the user; the full `Display` is logged) and the localized byte formatter. Test fakes
+  (`fakes`) are shared with the tab's wiring tests.
 - `text_detector/`: `TranslationTextDetectorController` and batch worker (`mod.rs`), the
   model-based entry point and fallback policy (`pipeline.rs`), the backend forward runner
   (`backend.rs`), native Paddle routing and runner (`native.rs`, desktop only), local classic
@@ -256,6 +291,9 @@ is an author note addressed to the translator, not a replica.
   max-loaded-models, and CUDA diagnostics helpers. The snapshot's `backend_version` is DIAGNOSTIC
   only — it is never compared with the program version and never gates a feature; compatibility is
   decided by `PROTOCOL_VERSION` in the `hello` handshake (`crates/ms-backend-ipc/src/`).
+  It also carries the per-engine OCR readiness flags (`ocr.<engine>.ready`, incl. `baberuocr`)
+  and the resident PaddleOCR-VL variant (`ocr.paddleocrvl.model`); readiness of the SELECTED
+  variant is `paddle_vl_ready_for`, so a variant switch never shows a stale "ready".
 
 ## Contracts and invariants
 - OCR, detector, MT, storage load/save, crop preparation, and backend health work must not block
@@ -434,6 +472,10 @@ is an author note addressed to the translator, not a replica.
   `footer_autocomplete_candidates`.
 - To change OCR engine options, loading, recognition requests, IPC method names, crop handling, or
   page image caching, edit `ocr.rs` and the OCR panel in `panels/ocr.rs`.
+- To change which external model an OCR engine needs or how a missing one is reported, edit
+  `external_model_spec` / `resolve_external_model_dirs_in` / `gate_external_models_in` in `ocr.rs`; to change how such a model
+  is probed or downloaded, `ocr_model_download.rs` (pins and files live in `ms-sysprobe`); to change
+  the download block's look, `panels/ocr_model_download.rs`.
 - To change text detector algorithms, masks, backend IPC methods, or cleaning-tool detector
   helpers, edit `text_detector/` (map in its `MODULE_README.md`) and `panels/text_detector.rs`.
   Block order/cap and mask normalization rules live in `ms-text-detect`, not here.

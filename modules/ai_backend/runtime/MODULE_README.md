@@ -92,8 +92,9 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   therefore scope its load in its own `try` and call `mark_loaded()` as soon as that load returns —
   before running inference — while `release()` runs in `finally` on every path. The inpaint and
   watermark services are the reference shape (`inpaint/MODULE_README.md`, covered by
-  `inpaint/test_lease_protocol.py`); `ocr/` and `detection/` still wrap load and inference in one
-  `try` and are due the same treatment.
+  `inpaint/test_lease_protocol.py`); `ocr/paddle_vl.py` and `ocr/baberu.py` follow it too. The other
+  `ocr/` services and `detection/` still wrap load and inference in one `try` and are due the same
+  treatment.
 - On a ROCm Torch build, `configure_rocm_runtime()` runs once at process startup before any
   inference: it defaults `MIOPEN_FIND_MODE=FAST` (immediate mode, no per-input-shape kernel
   auto-tuning), forces `expandable_segments:False` into the allocator-config variable Torch will

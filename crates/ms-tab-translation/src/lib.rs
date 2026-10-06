@@ -18,6 +18,8 @@ Submodules:
 - `machine_translators`: concrete MT backends (Google/Yandex/DeepL) used by worker.
 - `machine_translation`: MT controller/worker and backend dispatch integration.
 - `ocr`: OCR controller/worker and backend transport.
+- `ocr_model_download`: status/download controller of the external OCR models (Baberu OCR,
+  PaddleOCR-VL variants) the OCR panel downloads explicitly.
 - `ocr_case_fix`: pure post-OCR "ALL CAPS" -> sentence-case normalization.
 - `text_detector`: text detector controller/worker (classic + Paddle/CTD/Surya backend modes).
 - `panels`: UI subpanels for Translation tab.
@@ -46,6 +48,7 @@ pub mod machine_translation;
 mod machine_translators;
 mod ocr;
 mod ocr_case_fix;
+mod ocr_model_download;
 pub mod panels;
 mod tab;
 // `pub` rather than crate-private: the `cleaning` tab's mask-generation and

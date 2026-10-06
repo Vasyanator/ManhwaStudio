@@ -45,7 +45,7 @@ use serde_json::{Map, Value, json};
 /// The contract also covers state the two processes SHARE on disk: the `user_config`
 /// document's storage semantics (`ms-docstore` / `docstore.py`, `.json` or SQLite `.db`).
 /// A backend payload that reads/writes it differently must be refused here.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -96,9 +96,18 @@ pub const TOPIC_LOG: &str = "log";
 pub const METHOD_OCR_MANGA: &str = "ocr.manga";
 pub const METHOD_OCR_EASY: &str = "ocr.easy";
 pub const METHOD_OCR_PADDLE: &str = "ocr.paddle";
+/// PaddleOCR-VL through the backend's vendored model code. Since protocol v7 the request
+/// header MUST carry `paddle_vl_model` (the variant label, `^[a-z0-9_]{1,64}$`, used for the
+/// lease key, logs and the health `ocr.paddleocrvl.model` echo) and `paddle_vl_model_dir`
+/// (absolute directory of the downloaded variant); the backend never downloads it.
 pub const METHOD_OCR_PADDLE_VL: &str = "ocr.paddle_vl";
 pub const METHOD_OCR_SURYA: &str = "ocr.surya";
 pub const METHOD_OCR_PADDLE_ONNX: &str = "ocr.paddle_onnx";
+/// Baberu OCR on the backend's ONNX Runtime (protocol v7; vision on the selected ONNX
+/// provider, decoders on the CPU provider): the fallback of the native engine. Request
+/// header: `baberu_model_files` = `{vision, prefill, step, vocab}`, each an absolute path
+/// of the downloaded model; plus `join_newlines` and `reflect_strings`. Answers `engine: "baberuocr"`, `lines`, `text`.
+pub const METHOD_OCR_BABERU: &str = "ocr.baberu";
 
 // --- Machine translation ---
 pub const METHOD_TRANSLATE_DEEP: &str = "translate.deep";

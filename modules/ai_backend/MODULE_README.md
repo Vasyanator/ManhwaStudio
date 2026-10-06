@@ -55,8 +55,9 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
   `LoadedModelManager`, and the two ROCm workarounds. See `runtime/MODULE_README.md`.
 - `engines/`: cross-domain model-family runtime and model acquisition (`paddle_onnx`,
   `surya_checkpoints`, `model_download`). See `engines/MODULE_README.md`.
-- `ocr/`: OCR services (`ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya`) and the
-  PaddleOCR-VL script constraint. See `ocr/MODULE_README.md`.
+- `ocr/`: OCR services (`ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya` / `.baberu`),
+  the PaddleOCR-VL script constraint and the vendored PaddleOCR-VL model code
+  (`ocr/paddle_vl_vendor/`). See `ocr/MODULE_README.md`.
 - `detection/`: forward-only text detectors (`textdetector.{ctd,paddle,surya}.forward`: tiles in,
   probability maps out; Rust plans and post-processes) plus the vendored ComicTextDetector network
   in `detection/textdetector/`. See `detection/MODULE_README.md`.
@@ -97,14 +98,18 @@ the convention `browser/` already used.
   diffusers, transformers, onnxruntime) into the process, and the `ipc/` layer must stay torch-free.
   `browser/__init__.py` is the single exception — it re-exports `BrowserService`, which is safe only
   because `browser/service.py` imports Selenium/Playwright lazily (see `browser/MODULE_README.md`).
-  The vendored subtrees (`detection/textdetector/`, `inpaint/lama_runtime_bundle/`) keep their
-  upstream `__init__.py` contents and are import-gated by their callers instead.
+  The vendored subtrees (`detection/textdetector/`, `inpaint/lama_runtime_bundle/`,
+  `ocr/paddle_vl_vendor/`) keep their upstream contents and are import-gated by their callers
+  instead.
 - Service initialization is lazy and must surface missing packages or weights as explicit errors —
   never a silent fallback to a different model, device, or channel mode.
 - Torch and ONNX model roots are separate: `ManhwaStudio_AI_Models/Torch` vs `.../ONNX`. Do not write
   ONNX weights under `Torch/` or Torch checkpoints under `ONNX/`. Library-managed caches (EasyOCR,
-  Surya, PaddleOCR-VL via the Hugging Face hub) stay under those libraries' own default paths unless
-  a service explicitly owns the download contract.
+  Surya) stay under those libraries' own default paths unless a service explicitly owns the download
+  contract. PaddleOCR-VL and Baberu OCR are downloaded by RUST into
+  `ManhwaStudio_AI_Models/side_models/` (pinned commit, sha256 per file); the backend receives their
+  absolute paths per request, never downloads them, never reads the Hugging Face cache for them, and
+  never runs `trust_remote_code`.
 - `General.ai_device`, `General.ai_onnx_provider` and `General.ai_onnx_device_id` use `not-selected`
   as the config sentinel; a service must resolve it to a real runtime default before constructing a
   Torch device or ONNX provider settings, and must never persist that automatic resolution as an

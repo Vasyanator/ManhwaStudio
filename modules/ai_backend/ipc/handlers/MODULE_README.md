@@ -24,8 +24,12 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - `__init__.py`: the single shared touch-point — one import line per group, and the instructions for
   adding a new one. Never add handler imports to `registry.py` instead.
 - `health.py`: `health` (`ctx.get_health_snapshot`, not a service call).
-- `ocr.py`: `ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya` / `.paddle_onnx`
-  (`paddle_onnx` routes through the same `state.paddle_ocr` service as `ocr.paddle`).
+- `ocr.py`: `ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya` / `.paddle_onnx` /
+  `.baberu` (`paddle_onnx` routes through the same `state.paddle_ocr` service as `ocr.paddle`).
+  The model-location fields Rust sends (`paddle_vl_model` + `paddle_vl_model_dir`, and the
+  `baberu_model_files` object) are REQUIRED; this layer checks only their presence and type and
+  forwards them verbatim — the label syntax and every path check are the service's single answer.
+  `ocr.baberu` is not Torch-gated (ONNX Runtime: vision on the selected EP, decoders on CPU).
 - `textdetector.py`: `textdetector.ctd.forward` / `.paddle.forward` / `.surya.forward` — forward-only
   detection. Owns the wire contract (`FORWARD_SPECS`: align, map stride, channel names per engine;
   `parse_forward_request` / `encode_forward_response`) and validates BOTH directions: `n`, tile

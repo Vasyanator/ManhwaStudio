@@ -3840,7 +3840,10 @@ dependencies = [
  "ms-log",
  "ms-text-detect",
  "ort",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.18",
+ "unicode-general-category",
 ]
 
 [[package]]
@@ -3969,6 +3972,9 @@ dependencies = [
  "ms-thread",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
  "ureq",
  "windows-sys 0.59.0",
 ]

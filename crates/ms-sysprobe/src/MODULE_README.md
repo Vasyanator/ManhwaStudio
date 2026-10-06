@@ -43,6 +43,12 @@ Callers own the threading: nothing here spawns a worker for you.
   cleaning inpaint engines) resolves it here BEFORE loading it natively or asking the
   backend to use it. Library-managed caches (EasyOCR, Surya) are deliberately not in the
   catalog.
+- `ai_models/`: EXTERNAL third-party models pinned to a commit (`external_catalog.rs`:
+  Baberu OCR, PaddleOCR-VL variants; `external.rs`: stat-only status probe and the
+  verified, resumable, cancellable downloader that retries transient network failures with
+  backoff, with a completion marker). Catalog is the
+  single owner of repo/revision/files/dir; nothing downloads implicitly. Detail:
+  `ai_models/MODULE_README.md`.
 - `hf_token.rs`: the process-wide Hugging Face access token. Cached value plus free
   get/set/clear, backed by the OS secret store (`keyring`) under its OWN service name
   `"ManhwaStudio Hugging Face"` — never the OCR key entry, which is a different credential
@@ -93,8 +99,8 @@ Callers own the threading: nothing here spawns a worker for you.
   belong to `src/installer/`, which calls into this crate for the discovery contract.
 - Crate boundary: dependencies are `ms-log` (diagnostics), `ms-i18n` (user-facing strings),
   `ms-config` (the `AiInstallType` level only), `ms-thread` (the AI probe's worker),
-  `image` (the capture contract), `serde`/`serde_json` (probe output), `hf-hub` + `ureq`
-  (`ai_models`, native-only), `keyring` (`hf_token`, native-only), and `windows-sys` on
+  `image` (the capture contract), `serde`/`serde_json` (probe output, model markers),
+  `sha2` + `thiserror` (`ai_models::external`), `hf-hub` + `ureq` (`ai_models`, native-only), `keyring` (`hf_token`, native-only), and `windows-sys` on
   Windows. No probe may READ OR WRITE a config document, and the crate must NOT gain a
   dependency on the application's upper layers (`project`, `app`, the tabs) or on egui —
   being a GUI-free leaf is what lets it type-check in parallel with the binary.
@@ -112,6 +118,8 @@ Callers own the threading: nothing here spawns a worker for you.
   see `ai_install_probe.rs` (the snippet and `detect_ai_install_type_from_report`).
 - To add a model or change which files one needs, see `ai_models.rs`; a new caller must go
   through it rather than downloading into the model tree itself.
+- To add or re-pin an external third-party model, see `ai_models/external_catalog.rs`;
+  download mechanics live in `ai_models/external.rs`.
 - To change how the Hugging Face token is stored or seeded, see `hf_token.rs` — and keep
   the rule that no message may interpolate the value.
 - To let a new consumer reach these modules, no change is needed here: it already sees them

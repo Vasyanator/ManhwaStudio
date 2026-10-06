@@ -34,6 +34,8 @@ Main functions:
 - `apply_health_payload`: folds a health `Value` (pulled response OR pushed event header)
   into the shared snapshot — identical field mapping for both transports.
 - `spawn_ai_backend_probe`: starts the background `TOPIC_HEALTH` subscription + device-control thread.
+- `paddle_vl_ready_for`: readiness of the SELECTED PaddleOCR-VL variant (the backend reports
+  one resident variant in `ocr.paddleocrvl.model`).
 */
 
 use ms_backend_ipc::{self as backend_ipc, CallError};
@@ -80,7 +82,12 @@ pub struct AiBackendHealthSnapshot {
     pub ocr_easy_ready: Option<bool>,
     pub ocr_paddle_ready: Option<bool>,
     pub ocr_paddle_vl_ready: Option<bool>,
+    /// PaddleOCR-VL variant key the backend has resident (`ocr.paddleocrvl.model`); its
+    /// `ready` describes THIS variant only, see [`paddle_vl_ready_for`].
+    pub ocr_paddle_vl_model: Option<String>,
     pub ocr_surya_ready: Option<bool>,
+    /// Baberu OCR backend fallback engine readiness (`ocr.baberuocr.ready`).
+    pub ocr_baberu_ready: Option<bool>,
     pub selected_device: Option<String>,
     pub available_devices: Vec<String>,
     pub device_options: Vec<AiBackendDeviceOption>,
@@ -111,7 +118,9 @@ impl Default for AiBackendHealthSnapshot {
             ocr_easy_ready: None,
             ocr_paddle_ready: None,
             ocr_paddle_vl_ready: None,
+            ocr_paddle_vl_model: None,
             ocr_surya_ready: None,
+            ocr_baberu_ready: None,
             selected_device: None,
             available_devices: Vec::new(),
             device_options: Vec::new(),
@@ -144,7 +153,9 @@ impl AiBackendHealthSnapshot {
             ocr_easy_ready: None,
             ocr_paddle_ready: None,
             ocr_paddle_vl_ready: None,
+            ocr_paddle_vl_model: None,
             ocr_surya_ready: None,
+            ocr_baberu_ready: None,
             selected_device: None,
             available_devices: Vec::new(),
             device_options: Vec::new(),
@@ -234,7 +245,9 @@ struct HealthFields {
     ocr_easy_ready: Option<bool>,
     ocr_paddle_ready: Option<bool>,
     ocr_paddle_vl_ready: Option<bool>,
+    ocr_paddle_vl_model: Option<String>,
     ocr_surya_ready: Option<bool>,
+    ocr_baberu_ready: Option<bool>,
     backend_version: Option<String>,
 }
 
@@ -252,7 +265,9 @@ fn parse_health_payload(payload: &Value) -> HealthFields {
         ocr_easy_ready: health_ocr_ready_flag(payload, "easyocr"),
         ocr_paddle_ready: health_ocr_ready_flag(payload, "paddleocr"),
         ocr_paddle_vl_ready: health_ocr_ready_flag(payload, "paddleocrvl"),
+        ocr_paddle_vl_model: health_ocr_model(payload, "paddleocrvl"),
         ocr_surya_ready: health_ocr_ready_flag(payload, "suryaocr"),
+        ocr_baberu_ready: health_ocr_ready_flag(payload, "baberuocr"),
         backend_version: health_backend_version(payload),
     }
 }
@@ -285,7 +300,9 @@ fn apply_health_fields(
     guard.ocr_easy_ready = fields.ocr_easy_ready;
     guard.ocr_paddle_ready = fields.ocr_paddle_ready;
     guard.ocr_paddle_vl_ready = fields.ocr_paddle_vl_ready;
+    guard.ocr_paddle_vl_model = fields.ocr_paddle_vl_model;
     guard.ocr_surya_ready = fields.ocr_surya_ready;
+    guard.ocr_baberu_ready = fields.ocr_baberu_ready;
     // Backend onnxruntime reachability: available only while connected AND a
     // provider list has been enumerated. The retained list is not cleared on
     // disconnect, so on reconnect this restores immediately from the last-known
@@ -325,7 +342,9 @@ fn apply_health_offline(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>, details:
             ocr_easy_ready: None,
             ocr_paddle_ready: None,
             ocr_paddle_vl_ready: None,
+            ocr_paddle_vl_model: None,
             ocr_surya_ready: None,
+            ocr_baberu_ready: None,
             backend_version: None,
         },
     );
@@ -577,6 +596,31 @@ fn health_ocr_ready_flag(payload: &Value, engine_key: &str) -> Option<bool> {
         .and_then(Value::as_object)
         .and_then(|service| service.get("ready"))
         .and_then(Value::as_bool)
+}
+
+/// The trimmed non-empty `ocr.<engine_key>.model` string of a health payload (the
+/// PaddleOCR-VL variant the backend has resident), `None` when absent.
+fn health_ocr_model(payload: &Value, engine_key: &str) -> Option<String> {
+    payload
+        .get("ocr")
+        .and_then(Value::as_object)
+        .and_then(|ocr| ocr.get(engine_key))
+        .and_then(Value::as_object)
+        .and_then(|service| service.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+/// PaddleOCR-VL readiness of the SELECTED variant `selected_key`: the backend reports one
+/// resident variant, so its `ready` holds only when `model` names `selected_key`; a ready
+/// engine of another variant means the selected one is not loaded (`Some(false)`). `None`
+/// stays `None` (no health block yet), so a variant switch never shows a stale "ready".
+#[must_use]
+pub fn paddle_vl_ready_for(snapshot: &AiBackendHealthSnapshot, selected_key: &str) -> Option<bool> {
+    let ready = snapshot.ocr_paddle_vl_ready?;
+    Some(ready && snapshot.ocr_paddle_vl_model.as_deref() == Some(selected_key))
 }
 
 fn health_backend_version(payload: &Value) -> Option<String> {
@@ -1235,8 +1279,9 @@ mod tests {
                 "mangaocr": { "ready": true },
                 "easyocr": { "ready": false },
                 "paddleocr": { "ready": true },
-                "paddleocrvl": { "ready": false },
-                "suryaocr": { "ready": true }
+                "paddleocrvl": { "ready": false, "device": "cpu", "model": " manga_ja ", "last_error": null },
+                "suryaocr": { "ready": true },
+                "baberuocr": { "ready": true, "device": "cpu", "last_error": null }
             }
         });
         let refresh = apply_health_fields(&snapshot, parse_health_payload(&event));
@@ -1250,7 +1295,9 @@ mod tests {
         assert_eq!(guard.ocr_easy_ready, Some(false));
         assert_eq!(guard.ocr_paddle_ready, Some(true));
         assert_eq!(guard.ocr_paddle_vl_ready, Some(false));
+        assert_eq!(guard.ocr_paddle_vl_model.as_deref(), Some("manga_ja"));
         assert_eq!(guard.ocr_surya_ready, Some(true));
+        assert_eq!(guard.ocr_baberu_ready, Some(true));
         assert!(guard.checked_at.is_some());
         assert_eq!(
             guard.details,
@@ -1355,7 +1402,9 @@ mod tests {
                 ocr_easy_ready: None,
                 ocr_paddle_ready: None,
                 ocr_paddle_vl_ready: None,
+                ocr_paddle_vl_model: None,
                 ocr_surya_ready: None,
+                ocr_baberu_ready: None,
                 backend_version: None,
             },
         );
@@ -1511,5 +1560,23 @@ mod tests {
         assert!(render_cuda_diagnostics(&json!("   ")).is_none());
         assert!(render_cuda_diagnostics(&json!({})).is_none());
         assert!(render_cuda_diagnostics(&json!([])).is_none());
+    }
+
+    /// The resident PaddleOCR-VL variant decides readiness of the selected one: a ready
+    /// engine of another variant reads as "not loaded", never as a stale "ready".
+    #[test]
+    fn paddle_vl_readiness_is_per_variant() {
+        let mut snapshot = AiBackendHealthSnapshot::default();
+        assert_eq!(super::paddle_vl_ready_for(&snapshot, "official_1_6"), None);
+        snapshot.ocr_paddle_vl_ready = Some(true);
+        snapshot.ocr_paddle_vl_model = Some("manga_ja".to_string());
+        assert_eq!(super::paddle_vl_ready_for(&snapshot, "manga_ja"), Some(true));
+        assert_eq!(super::paddle_vl_ready_for(&snapshot, "official_1_6"), Some(false));
+        snapshot.ocr_paddle_vl_ready = Some(false);
+        assert_eq!(super::paddle_vl_ready_for(&snapshot, "manga_ja"), Some(false));
+        // A ready flag without a model name cannot vouch for any variant.
+        snapshot.ocr_paddle_vl_ready = Some(true);
+        snapshot.ocr_paddle_vl_model = None;
+        assert_eq!(super::paddle_vl_ready_for(&snapshot, "manga_ja"), Some(false));
     }
 }

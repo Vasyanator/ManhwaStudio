@@ -54,6 +54,7 @@ from .engines.paddle_onnx import RuntimeFactory
 from .detection.ctd import CtdTextDetectorService
 from .detection.paddle import PaddleTextDetectorService
 from .detection.surya import SuryaTextDetectorService
+from .ocr.baberu import BaberuOcrService
 from .ocr.easy import EasyOcrService
 from .ocr.manga import MangaOcrService
 from .ocr.paddle import PaddleOcrService
@@ -104,6 +105,7 @@ class AppState:
     paddle_ocr: PaddleOcrService
     paddle_vl_ocr: PaddleVlOcrService
     surya_ocr: SuryaOcrService
+    baberu_ocr: BaberuOcrService
     text_detector_ctd: CtdTextDetectorService
     text_detector_paddle: PaddleTextDetectorService
     text_detector_surya: SuryaTextDetectorService
@@ -152,6 +154,7 @@ def _build_health_snapshot(state: AppState) -> dict[str, Any]:
             "paddleocr": _safe_service_health(state.paddle_ocr),
             "paddleocrvl": _safe_service_health(state.paddle_vl_ocr),
             "suryaocr": _safe_service_health(state.surya_ocr),
+            "baberuocr": _safe_service_health(state.baberu_ocr),
         },
         "text_detector": {
             "ctd": _safe_service_health(state.text_detector_ctd),
@@ -238,6 +241,7 @@ def run_server(
         paddle_ocr=PaddleOcrService(onnx_runtime_factory),
         paddle_vl_ocr=PaddleVlOcrService(model_manager),
         surya_ocr=SuryaOcrService(model_manager),
+        baberu_ocr=BaberuOcrService(model_manager, ai_device_service),
         text_detector_ctd=CtdTextDetectorService(model_manager),
         text_detector_paddle=PaddleTextDetectorService(onnx_runtime_factory),
         text_detector_surya=SuryaTextDetectorService(model_manager),

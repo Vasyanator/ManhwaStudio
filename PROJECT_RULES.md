@@ -90,6 +90,23 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   move to the GPU only via `modules/ai_backend/runtime/rocm_mmap_transfer.py`; every
   user-facing backend error text passes through `runtime/error_text.py::sanitize_torch_error`.
 
+## Network downloads
+
+Any code that downloads anything (models, runtimes, code, user content; Rust or Python) must
+survive an unstable network:
+- transient failures (connect/DNS/reset, read timeout, a body shorter than announced, HTTP
+  408/429/5xx) are retried automatically with capped exponential backoff, each retry resuming
+  from the bytes already staged (HTTP `Range`) when the server supports it; the attempt budget
+  resets after a retry that made progress; permanent failures (other 4xx, hash/size mismatch,
+  local disk errors) are not retried;
+- staged bytes are discarded only when they are proven wrong (hash mismatch, overflow), never
+  because a transfer stopped early; an interrupted run resumes on the next start;
+- every request has connect and read timeouts; cancel interrupts both the transfer and the
+  backoff wait;
+- retries are logged with context and visible in the UI as progress, not as a failure.
+Reference implementation: `ms_sysprobe::ai_models::external`. Tests use an injected fetcher and
+an injectable sleep, never the network.
+
 ## House style: no formatter (global §4)
 
 The tree is NOT rustfmt-clean: long signatures, calls and literals deliberately stay on one line.

@@ -2,8 +2,10 @@
 Package: modules/ai_backend/ocr
 
 OCR service adapters of the Python AI backend: MangaOCR (`manga.py`), EasyOCR
-(`easy.py`), PaddleOCR ONNX (`paddle.py`), PaddleOCR-VL (`paddle_vl.py`), Surya
-(`surya.py`), plus the PaddleOCR-VL script constraint (`script_constraint.py`).
+(`easy.py`), PaddleOCR ONNX (`paddle.py`), PaddleOCR-VL (`paddle_vl.py`, over the
+vendored model code in `paddle_vl_vendor/`), Surya (`surya.py`), Baberu OCR
+(`baberu.py`), plus the PaddleOCR-VL script constraint (`script_constraint.py`)
+and the shared line formatter (`result_format.py`).
 
 This module intentionally re-exports NOTHING and imports no submodule. Each
 engine drags in a different heavy stack (torch + transformers for MangaOCR

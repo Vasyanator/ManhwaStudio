@@ -42,8 +42,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   worker to lower an entirely uppercase Latin/Cyrillic result to sentence case
   (`translation::ocr_case_fix`); it carries no UI logic of its own. Wider engines
   (PaddleOCR-VL) live on a second engine row to keep the side panel from widening; PaddleOCR-VL
-  shows no language/model controls (only an optional writing-system restriction: auto / korean /
-  chinese / japanese). The five runtime engine-selection buttons are `AiButton`s gated on a
+  shows no language controls, only its weight-variant combo (below) and an optional
+  writing-system restriction: auto / korean / chinese / japanese. The six runtime engine-selection buttons are `AiButton`s gated on a
   per-engine `AiRequirement` (`engine_button_requirement`, permissive on an unknown capability so a
   not-yet-probed native ONNX runtime does not lock selection out); each shows a runtime marker badge
   (`engine_marker`: Torch / ONNX / Torch/ONNX). AiApi is network-only and stays a plain ungated
@@ -55,6 +55,23 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   not from parameters. `selected_mode_requirement` is `pub(crate)` and the single owner of "which
   runtime does the selected OCR mode need": the tab's Torch-unavailable status
   (`tab.rs::selected_ocr_mode_requires_torch`) only checks it for `Some(AiRequirement::Torch)`.
+  External-model engines: Baberu OCR (second row, `AiRequirement::Onnx` / marker "ONNX", a
+  "ja/zh/en only" hint and a warning when the MT source language is `ko`, lent as
+  `OcrPanelModelView::korean_source`) and PaddleOCR-VL (weight-variant `WheelComboBox`
+  `paddle_vl_model`, id salt `translation.ocr_panel.paddle_vl_model_label`, above the script
+  restriction; the manga_ja choice shows its hint). For both, the download block is drawn outside
+  the engine-options gate (`OcrPanelModelView::download`, the `OcrModelPanelSnapshot` of
+  `ocr::external_model_spec(engine, variant)` taken at frame start; drawn only while its
+  `spec_id` matches the selection after this frame's widgets), its clicks return in
+  `OcrPanelActions::model_download`, and the load button is enabled only when that state is
+  `Installed` (`load_blocked_reason` gives the disabled hover: checking / downloading / not
+  downloaded).
+- `ocr_model_download.rs`: the shared external-model download block (status line, the last
+  cancel / failure notice, Download / Resume button, `ProgressBar` with file N of M and byte
+  counters or the automatic-retry countdown, Cancel; while ANOTHER model downloads, a line naming it with its progress over a
+  disabled Download button). The pure `download_block_view` maps `OcrModelPanelSnapshot` -> what
+  is shown; button captions come from `crate::ocr_model_download::offered_download_label` (shared
+  with the OCR "not downloaded" error).
 - `ocr_langs.rs`: static EasyOCR and PaddleOCR language catalogs used by the OCR panel.
   Each entry is `(wire_code, display_key)`: the wire code is the persisted identity
   sent to the backend, the display key is an i18n catalog key resolved to a localized

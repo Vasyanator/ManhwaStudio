@@ -15,12 +15,16 @@ Key types:
 - OrtError              : typed error surface for load/warmup and inference failures
 - OrtRuntime        : a loaded, dylib-backed ort environment handle
 - MangaOcrEngine    : native MangaOCR encoder+decoder inference (see `manga_ocr`)
+- BaberuOcrEngine   : native Baberu OCR vision + KV-cached decoder inference: vision on
+  the selected EP, decoders on CPU (see `baberu_ocr`)
 - PaddleOcrEngine   : native PaddleOCR detection+recognition (see `paddle_ocr`)
 
 Key functions:
 - OrtRuntime::load          : dlopen the onnxruntime library and commit the ort environment options
 - OrtRuntime::warmup        : create the ort environment (executes real onnxruntime code)
 - OrtRuntime::build_session : build an inference session applying the committed execution provider
+- OrtRuntime::build_session_on : the same, on another EP of the loaded build (Baberu vision under TensorRT -> CUDA)
+- OrtRuntime::build_session_cpu_only : the same session options with no execution provider (CPU)
 
 Notes:
 Pure inference infrastructure: no egui/eframe, no application config, no paths,
@@ -39,9 +43,11 @@ The ort environment is a process-global singleton owned by the `ort` crate; an
 // without adding meaning. Suppressed crate-wide as a not-applicable style lint.
 #![allow(clippy::doc_markdown)]
 
+pub mod baberu_ocr;
 pub mod manga_ocr;
 pub mod paddle_ocr;
 
+pub use baberu_ocr::{BaberuOcrEngine, BaberuVisionPlacement};
 pub use manga_ocr::MangaOcrEngine;
 pub use paddle_ocr::{
     PaddleDetection, PaddleDetector, PaddleLine, PaddleOcrEngine, PaddleRecognizer,
@@ -267,6 +273,32 @@ pub enum OrtError {
         /// Reason the dictionary could not be loaded/parsed.
         detail: String,
     },
+
+    /// Loading or parsing the Baberu OCR character vocabulary (`tokenizer/vocab.json`)
+    /// failed: unreadable file, malformed JSON, or an entry that is not one character.
+    #[error("Не удалось загрузить словарь Baberu OCR «{path}»: {detail}")]
+    BaberuVocabLoad {
+        /// Path of the `vocab.json` file that could not be loaded.
+        path: PathBuf,
+        /// Reason the vocabulary could not be loaded/parsed.
+        detail: String,
+    },
+
+    /// The input image could not be prepared for Baberu OCR (empty image or a size
+    /// whose buffer length overflows).
+    #[error("Не удалось подготовить изображение для Baberu OCR: {detail}")]
+    BaberuPreprocess {
+        /// Reason preprocessing failed.
+        detail: String,
+    },
+
+    /// The Baberu OCR greedy decoder met unusable logits (empty, NaN, a width that
+    /// changes between steps, or a token id outside the logits row).
+    #[error("Ошибка декодирования Baberu OCR: {detail}")]
+    BaberuDecode {
+        /// Description of the invalid decoder state.
+        detail: String,
+    },
 }
 
 /// A loaded, dylib-backed ONNX Runtime environment handle.
@@ -442,38 +474,47 @@ impl OrtRuntime {
     /// [`OrtError::SessionBuild`] if the builder cannot be created, the execution
     /// provider registration fails, or the model file is missing/unreadable.
     pub fn build_session(&self, model_path: &Path) -> Result<Session, OrtError> {
-        // The ort builder methods return DISTINCT error generics (`ort::Error<T>`),
-        // so each fallible step maps its own error inline (Display -> String) rather
-        // than sharing one closure — a single closure would fix `T` and not typecheck.
-        let builder = Session::builder().map_err(|e| OrtError::SessionBuild {
-            path: model_path.to_path_buf(),
-            reason: e.to_string(),
-        })?;
-        let builder = builder
-            .with_optimization_level(GraphOptimizationLevel::All)
-            .map_err(|e| OrtError::SessionBuild {
-                path: model_path.to_path_buf(),
-                reason: e.to_string(),
-            })?;
-
-        // Register the committed provider (if any) and commit the session. CPU
-        // registers nothing, keeping the historical CPU-only builder byte-identical.
-        let mut builder = builder;
-        if let Some(ep) = self.execution_provider_dispatch() {
-            builder =
-                builder.with_execution_providers([ep]).map_err(|e| OrtError::SessionBuild {
-                    path: model_path.to_path_buf(),
-                    reason: e.to_string(),
-                })?;
-        }
-
-        builder.commit_from_file(model_path).map_err(|e| OrtError::SessionBuild {
-            path: model_path.to_path_buf(),
-            reason: e.to_string(),
-        })
+        build_session_with(model_path, self.execution_provider_dispatch(self.provider))
     }
 
-    /// Builds the ort execution-provider dispatch for this runtime's provider.
+    /// Builds a session on `provider` instead of the committed one, with the same options,
+    /// `error_on_failure()` registration and this runtime's [`OrtRuntime::device`] as
+    /// [`OrtRuntime::build_session`]. For a graph that must not use the committed EP but
+    /// can use another EP of the same build: Baberu runs its vision graph on CUDA when
+    /// the committed EP is TensorRT (no TensorRT engine cache is configured). The caller
+    /// must pick an EP the loaded onnxruntime build carries; registration fails otherwise.
+    ///
+    /// # Errors
+    /// - [`OrtError::UnsupportedProvider`] if `provider` cannot run on this platform.
+    /// - [`OrtError::SessionBuild`] as for [`OrtRuntime::build_session`].
+    pub fn build_session_on(&self, provider: ExecutionProvider, model_path: &Path) -> Result<Session, OrtError> {
+        if !provider.is_available_on_current_platform() {
+            return Err(OrtError::UnsupportedProvider(provider.id()));
+        }
+        build_session_with(model_path, self.execution_provider_dispatch(provider))
+    }
+
+    /// Builds an inference session from `model_path` on ONNX Runtime's built-in CPU
+    /// backend, whatever execution provider this runtime was loaded for.
+    ///
+    /// Same session options as [`OrtRuntime::build_session`]
+    /// (`GraphOptimizationLevel::All`), but no execution provider is registered and the
+    /// runtime's [`OrtRuntime::device`] is ignored. For graphs that are CPU-oriented on
+    /// every accelerator build: Baberu's int8 decoders (`DynamicQuantizeLinear` +
+    /// `MatMulInteger`, plus the KV-cache ops) fall back node by node to the CPU on GPU
+    /// EPs and run 2-4x slower per token there than on a plain CPU session (benchmark
+    /// 2026-10-06), and the CPU fallback of a Baberu vision session whose provider build
+    /// failed.
+    ///
+    /// # Errors
+    /// [`OrtError::SessionBuild`] if the builder cannot be created or the model file is
+    /// missing/unreadable.
+    pub fn build_session_cpu_only(&self, model_path: &Path) -> Result<Session, OrtError> {
+        build_session_with(model_path, None)
+    }
+
+    /// Builds the ort execution-provider dispatch for `provider` (the committed one, or
+    /// the one [`OrtRuntime::build_session_on`] asks for) with this runtime's device.
     ///
     /// Returns `None` for [`ExecutionProvider::Cpu`] (no EP is registered, so ONNX
     /// Runtime uses its built-in CPU backend). For every other provider it returns
@@ -482,8 +523,8 @@ impl OrtRuntime {
     /// (numeric `Index` for DirectML/CUDA/TensorRT/WebGPU, device-TYPE string for
     /// OpenVINO). See [`OrtRuntime::build_session`] for the full contract. The match
     /// is exhaustive: a new provider variant must force a decision here.
-    fn execution_provider_dispatch(&self) -> Option<ort::ep::ExecutionProviderDispatch> {
-        match self.provider {
+    fn execution_provider_dispatch(&self, provider: ExecutionProvider) -> Option<ort::ep::ExecutionProviderDispatch> {
+        match provider {
             ExecutionProvider::Cpu => None,
             ExecutionProvider::DirectMl => {
                 // `with_device_id` selects a specific adapter via the `_DML` append
@@ -585,6 +626,47 @@ impl OrtRuntime {
         ms_log::trace_log!(cat::STARTUP, "ms-onnx warmup done provider={}", self.provider.id());
         Ok(())
     }
+}
+
+/// The one session builder behind [`OrtRuntime::build_session`] and
+/// [`OrtRuntime::build_session_cpu_only`]: all graph optimizations, then `ep` when
+/// given (`None` = ONNX Runtime's built-in CPU backend), then the model file.
+///
+/// # Errors
+/// [`OrtError::SessionBuild`] if the builder cannot be created, the execution provider
+/// registration fails, or the model file is missing/unreadable.
+fn build_session_with(
+    model_path: &Path,
+    ep: Option<ort::ep::ExecutionProviderDispatch>,
+) -> Result<Session, OrtError> {
+    // The ort builder methods return DISTINCT error generics (`ort::Error<T>`), so each
+    // fallible step maps its own error inline (Display -> String) rather than sharing one
+    // closure — a single closure would fix `T` and not typecheck.
+    let builder = Session::builder().map_err(|e| OrtError::SessionBuild {
+        path: model_path.to_path_buf(),
+        reason: e.to_string(),
+    })?;
+    let mut builder =
+        builder.with_optimization_level(GraphOptimizationLevel::All).map_err(|e| {
+            OrtError::SessionBuild {
+                path: model_path.to_path_buf(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    // Register the provider (if any) and commit the session. `None` registers nothing,
+    // keeping the historical CPU-only builder byte-identical.
+    if let Some(ep) = ep {
+        builder = builder.with_execution_providers([ep]).map_err(|e| OrtError::SessionBuild {
+            path: model_path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+    }
+
+    builder.commit_from_file(model_path).map_err(|e| OrtError::SessionBuild {
+        path: model_path.to_path_buf(),
+        reason: e.to_string(),
+    })
 }
 
 #[cfg(test)]

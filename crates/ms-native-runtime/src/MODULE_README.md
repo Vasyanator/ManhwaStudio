@@ -4,7 +4,7 @@
 The process-global lazy manager for the IN-PROCESS native ONNX Runtime OCR path
 (`General.ai_runtime = "native"`): it owns the single `ms_onnx::OrtRuntime`, the one
 always-resident `PaddleDetector`, and the LRU-bounded cache of `MangaOcrEngine` /
-`PaddleRecognizer` engines, and turns a crop or page image into recognized text or
+`PaddleRecognizer` / `BaberuOcrEngine` engines, and turns a crop or page image into recognized text or
 detected regions without going through the Python backend.
 
 The binary re-exports it as `crate::native_runtime`, so every existing
@@ -71,6 +71,22 @@ translation text-detector pipeline wraps it as its native Paddle runner).
 accelerator provider (a 4 x 960^2 batch can exhaust a small GPU, and an OOM would silently
 send every page to the backend).
 
+`recognize_baberu(&BaberuModelPaths, image, progress)` is the Baberu OCR entry. Unlike the
+other engines it resolves NO model itself: the caller (the external-model catalog in
+`ms-sysprobe`, through the OCR router) passes the four absolute file paths, and a missing
+file is `ModelNotDownloaded` — checked before the dylib is resolved, never answered with a
+download. The engine runs inside the same `run_guarded` sequence (guard markers, dylib
+load). Vision on the selected EP, decoders on CPU (why: int8 decoder ops fall back to CPU
+on GPU EPs; benchmark 2026-10-06): the vision session follows the committed EP and device
+(the CUDA EP of the same build under TensorRT, which has no engine cache here; the CPU when
+its build on the EP fails), the two decoders always use `OrtRuntime::build_session_cpu_only`.
+The placement rule lives in `ms_onnx::baberu_ocr`; this crate logs the effective vision
+provider once per engine build (INFO, or WARN naming requested vs effective when vision
+fell back to the CPU). It is
+ONE LRU entry (three sessions), keyed by its paths only: the provider selection is fixed
+for the process and `reset_load_latch` drops every engine, so a cached engine never
+outlives the provider it was built for.
+
 ## Contracts and invariants
 - Every op on the ONE shared `PaddleDetector` (`recognize_paddle`, `detect_paddle`,
   `paddle_det_forward`) runs inside `run_guarded`, holds `lock_paddle_op` for its whole
@@ -103,6 +119,10 @@ send every page to the backend).
   `NativeHardwareFacts` (both `probe_all` and the lazy `probe_for`). The settings panel picks
   the change up without edits.
 - To change the engine cache policy, see the LRU section of `lib.rs`
-  (`General.ai_max_loaded_models`).
+  (`General.ai_max_loaded_models`). The LRU is this process's own count: the Python
+  backend's model manager reads the same setting for ITS models, so the worst case is N
+  native plus N backend models resident.
+- To change the Baberu entry (missing-model check, engine cache), see `recognize_baberu`,
+  `ensure_baberu_engine`, `run_baberu_inference`; inference itself is `ms_onnx::baberu_ocr`.
 - To change WHERE the crash-guard markers are written, see
   `crates/ms-config/src/ort_load_guard.rs`, not this crate.

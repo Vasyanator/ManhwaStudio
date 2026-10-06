@@ -9,7 +9,9 @@ Main responsibilities:
 - verify the stateful UTF-8 allowlist keeps target-script bytes (incl. byte
   fallback), digits, and whitespace while banning other scripts;
 - verify EOS is only allowed on a complete-character boundary;
-- verify incremental pending advancement matches a full walk.
+- verify incremental pending advancement matches a full walk;
+- verify a NON-special `<|LOC_n|>` spotting token (PaddleOCR-VL 1.5/1.6 made
+  them ordinary vocabulary entries) is never allowed under any script.
 
 Notes:
 A lightweight fake byte index stands in for `TokenByteIndex` so these tests need
@@ -20,7 +22,11 @@ from __future__ import annotations
 
 import unittest
 
-from modules.ai_backend.ocr.script_constraint import ScriptConstraint, normalize_script
+from modules.ai_backend.ocr.script_constraint import (
+    ScriptConstraint,
+    TokenByteIndex,
+    normalize_script,
+)
 
 
 class _FakeIndex:
@@ -105,6 +111,38 @@ class KoreanConstraintTests(unittest.TestCase):
         allowed = set(fn(0, fake_input([99, 99])))
         self.assertIn(0, allowed)
         self.assertNotIn(1, allowed)
+
+
+class _FakeTokenizer:
+    """Tokenizer surface `TokenByteIndex` reads, shaped like the 1.6 vocab."""
+
+    # 0 '요', 1 '▁1', 2 '<|LOC_0|>' (non-special in 1.5/1.6), 3 '<0xEC>', 4 '</s>' (EOS).
+    _TOKENS = ["요", "▁1", "<|LOC_0|>", "<0xEC>", "</s>"]
+    all_special_ids = [4]
+    eos_token_id = 4
+
+    def __len__(self) -> int:
+        return len(self._TOKENS)
+
+    def convert_ids_to_tokens(self, ids: list[int]) -> list[str]:
+        return [self._TOKENS[i] for i in ids]
+
+
+class NonSpecialLocTokenTests(unittest.TestCase):
+    def test_loc_token_contributes_its_text_bytes(self) -> None:
+        index = TokenByteIndex(_FakeTokenizer())
+        self.assertEqual(index.token_bytes[2], b"<|LOC_0|>")
+        self.assertEqual(index.token_bytes[4], b"")
+
+    def test_loc_token_is_banned_under_every_script(self) -> None:
+        index = TokenByteIndex(_FakeTokenizer())
+        for script in ("korean", "chinese", "japanese"):
+            with self.subTest(script=script):
+                allowed = set(ScriptConstraint(index, script)._allowed_ids(b""))
+                # 'L', 'O', 'C' fall outside every script range.
+                self.assertNotIn(2, allowed)
+                self.assertIn(1, allowed)  # digit with a space prefix stays legal
+                self.assertIn(4, allowed)  # EOS on a complete boundary
 
 
 if __name__ == "__main__":

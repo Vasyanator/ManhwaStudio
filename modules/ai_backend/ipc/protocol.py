@@ -35,7 +35,7 @@ from __future__ import annotations
 # The contract also covers the on-disk user_config storage semantics shared with
 # Rust (docstore.py / ms-docstore: `.json` or SQLite `.db`).
 # ============================================================================
-PROTOCOL_VERSION = 6
+PROTOCOL_VERSION = 7
 
 # ============================================================================
 # FRAME SIZE GUARDS
@@ -117,6 +117,10 @@ METHOD_OCR_PADDLE = "ocr.paddle"            # POST /ocr/paddle
 METHOD_OCR_PADDLE_VL = "ocr.paddle_vl"      # POST /ocr/paddle_vl
 METHOD_OCR_SURYA = "ocr.surya"              # POST /ocr/surya
 METHOD_OCR_PADDLE_ONNX = "ocr.paddle_onnx"  # POST /ocr/paddle_onnx
+# Baberu OCR on ONNX Runtime (v7; vision on the selected ONNX provider, decoders on
+# CPU): the backend fallback of the native Rust engine; model files arrive as
+# absolute paths in `baberu_model_files`.
+METHOD_OCR_BABERU = "ocr.baberu"
 
 # --- Machine translation ---
 METHOD_TRANSLATE_DEEP = "translate.deep"    # POST /translate/deep
@@ -213,6 +217,7 @@ ALL_METHODS = frozenset(
         METHOD_OCR_PADDLE_VL,
         METHOD_OCR_SURYA,
         METHOD_OCR_PADDLE_ONNX,
+        METHOD_OCR_BABERU,
         METHOD_TRANSLATE_DEEP,
         METHOD_INPAINT_LAMA_V2,
         METHOD_INPAINT_LAMA_V2_UNLOAD,

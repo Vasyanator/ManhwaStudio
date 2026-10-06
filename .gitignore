@@ -138,6 +138,14 @@ tools/egui_docs/*.py[cod]
 # so the fixtures stay reproducible.
 !tools/make_text_detect_fixtures.py
 
+# Baberu OCR parity fixtures of ms-onnx (Pillow resize goldens, reference non-content ids, small
+# sample crops + reference decodes) and their generator; the parity tests read them.
+!crates/ms-onnx/fixtures/
+!crates/ms-onnx/fixtures/baberu/
+!crates/ms-onnx/fixtures/baberu/*.json
+!crates/ms-onnx/fixtures/baberu/*.png
+!tools/make_baberu_fixtures.py
+
 # The run-dev source-run scripts. Unlike the rest of tools/, these are user-facing
 # and are useless unless published: run-dev.* in the root only hands off to them.
 !tools/run-dev/

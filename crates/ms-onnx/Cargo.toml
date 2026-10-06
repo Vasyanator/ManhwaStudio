@@ -35,3 +35,14 @@ thiserror.workspace = true
 # The engine-neutral text-detection domain: the DB postprocess, the glyph mask and `Quad`
 # (re-exported as `paddle_ocr::Quad`) that the native Paddle detector runs after its forward pass.
 ms-text-detect = { path = "../ms-text-detect" }
+# Parses the Baberu OCR character vocabulary (`tokenizer/vocab.json`, a JSON list of chars).
+serde_json.workspace = true
+# Unicode general category of each Baberu vocab char: the decoder's run cap treats L*/N*
+# ("content") chars differently from symbols, exactly as the reference's
+# `unicodedata.category(ch)[0] in "LN"`. `char::is_alphanumeric` is NOT the same set.
+# Local, not in `[workspace.dependencies]`: this is its only manifest. `no_std`, pure Rust.
+unicode-general-category = "1.1"
+
+[dev-dependencies]
+# Hashes resized outputs for the Pillow-parity golden cases in `fixtures/baberu/`.
+sha2.workspace = true

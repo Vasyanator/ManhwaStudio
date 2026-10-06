@@ -8,6 +8,9 @@ Main responsibilities:
   files directly into ManhwaStudio_AI_Models without using HF cache blobs or symlinks.
 - Return concrete local paths for Rust model initialization code.
 
+- Mount the `external` (pinned third-party model downloader) and `external_catalog`
+  submodules; see `ai_models/MODULE_README.md`.
+
 Notes:
 - Library-managed caches such as EasyOCR and Surya are intentionally absent here.
 - Callers must invoke this from worker/background code, not the GUI thread.
@@ -25,6 +28,11 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Mutex, OnceLock};
+
+/// Pinned external (third-party) model downloader and status probe; see `ai_models/MODULE_README.md`.
+pub mod external;
+/// The pinned external-model catalog (Baberu OCR, PaddleOCR-VL variants).
+pub mod external_catalog;
 
 pub const HF_OWNER: &str = "Vasyanator2";
 pub const HF_REPO_NAME: &str = "ManhwaStudio_AI_Models";

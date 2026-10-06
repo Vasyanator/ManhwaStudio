@@ -324,7 +324,8 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
 - **Crash guard.** Every onnxruntime library load is bracketed by persisted markers
   (`ms_config::ort_load_guard`); a scope that crashed is `Suspect` at next launch and routes to
   the backend.
-- **Routing.** Native covers MangaOCR, PaddleOCR recognition and PaddleOCR detection; pure
+- **Routing.** Native covers MangaOCR, PaddleOCR recognition, PaddleOCR detection and Baberu OCR
+  (vision on the selected EP, int8 decoders always on CPU; backend `ocr.baberu` is its fallback); pure
   routers in `ms-tab-translation` decide. Native routes need no backend; a native failure is
   logged and falls back to the backend when it is up. Native code runs only on worker threads
   and is compiled out on wasm.
@@ -333,8 +334,14 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   `textdetector.{ctd,paddle,surya}.forward` only runs the network and returns u8 probability
   maps (wire codec: `ms_backend_ipc::textdetector`).
 - **App-managed models** live under `ManhwaStudio_AI_Models/` and are fetched by Rust through
-  `ms_sysprobe::ai_models` before a backend feature initializes them.
-- **Downloaded code.** `modules/ai_backend/watermark/` is the only place that executes
+  `ms_sysprobe::ai_models` before a backend feature initializes them. Third-party OCR models
+  (Baberu OCR, the PaddleOCR-VL variants) come from the pinned external catalog
+  (`ai_models::external_catalog`: repo, commit, per-file size + sha256, `side_models/` dir) — the
+  one owner of those facts; Rust downloads them explicitly (never implicitly on use) and sends the
+  backend absolute paths, so the backend only loads them offline. Other `side_models/` models
+  (FLUX, watermark, Reline) are still downloaded by the backend.
+- **Downloaded code.** PaddleOCR-VL model code is vendored (`ocr/paddle_vl_vendor/`, no
+  `trust_remote_code`). `modules/ai_backend/watermark/` is the only place that executes
   network-downloaded code (pinned commit, SHA-256 verified, hashed bytes are executed bytes).
 
 ## 10. Cross-cutting services

@@ -47,6 +47,7 @@ def _make_state(*, surya_raises: bool = False) -> SimpleNamespace:
         paddle_ocr=_OkService("paddleocr"),
         paddle_vl_ocr=_OkService("paddleocrvl"),
         surya_ocr=surya,
+        baberu_ocr=_OkService("baberuocr"),
         text_detector_ctd=_OkService("ctd"),
         text_detector_paddle=_OkService("paddle"),
         text_detector_surya=_OkService("surya_td"),
@@ -67,9 +68,11 @@ def test_snapshot_all_ok_has_full_shape() -> None:
     assert snap["ok"] is True
     assert snap["service"] == "mf_ai_backend"
     assert set(snap["ocr"]) == {
-        "easyocr", "mangaocr", "paddleocr", "paddleocrvl", "suryaocr",
+        "easyocr", "mangaocr", "paddleocr", "paddleocrvl", "suryaocr", "baberuocr",
     }
     assert snap["ocr"]["suryaocr"] == {"status": "ok", "name": "suryaocr"}
+    # `baberuocr` is the key the Rust health parser reads for `ocr.baberu`.
+    assert snap["ocr"]["baberuocr"] == {"status": "ok", "name": "baberuocr"}
 
 
 def test_one_raising_service_does_not_kill_snapshot() -> None:

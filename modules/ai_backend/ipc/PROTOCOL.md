@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `6` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `7` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 6. Optional/ignored on others.   |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 7. Optional/ignored on others.   |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -229,7 +229,7 @@ Legend:
   method replaced; it is not an address the backend serves. Methods added after
   the HTTP backend was retired have no such column entry.
 
-Total methods mapped: **36** — the full contents of `ALL_METHODS` in
+Total methods mapped: **46** — the full contents of `ALL_METHODS` in
 `protocol.py`, which is the machine-readable source of the same list. A method
 present in `protocol.py` but absent here is a documentation defect.
 
@@ -244,14 +244,26 @@ becomes explicit cancel).
 | POST /ocr/manga  | `ocr.manga`       | `join_newlines: bool=true`, `reflect_strings: bool=false`, `manga_model: string\|null`                                                                                                                   | input image PNG | `engine:"mangaocr"`, `lines: string[]`, `text: string`      | none       | no     | yes    |
 | POST /ocr/easy   | `ocr.easy`        | `join_newlines: bool=true`, `reflect_strings: bool=false`, `easy_langs: string="ko"`                                                                                                                     | input image PNG | `engine:"easyocr"`, `lines: string[]`, `text: string`       | none       | no     | yes    |
 | POST /ocr/paddle | `ocr.paddle`      | `join_newlines: bool=true`, `reflect_strings: bool=false`, `paddle_lang: string="korean_v5"`                                                                                                             | input image PNG | `engine:"paddleocr"`, `lines: string[]`, `text: string`     | none       | no     | yes    |
-| POST /ocr/paddle_vl | `ocr.paddle_vl`| `join_newlines: bool=true`, `reflect_strings: bool=false`, `paddle_vl_script: string\|null` (lowercased)                                                                                                  | input image PNG | `engine:"paddleocrvl"`, `lines: string[]`, `text: string`   | none       | no     | yes    |
+| POST /ocr/paddle_vl | `ocr.paddle_vl`| `paddle_vl_model: string` (required, `^[a-z0-9_]{1,64}$`), `paddle_vl_model_dir: string` (required, absolute directory), `join_newlines: bool=true`, `reflect_strings: bool=false`, `paddle_vl_script: string\|null` (lowercased) | input image PNG | `engine:"paddleocrvl"`, `lines: string[]`, `text: string`   | none       | no     | yes    |
 | POST /ocr/surya  | `ocr.surya`       | `join_newlines: bool=true`, `reflect_strings: bool=false`, `surya_task_name: string="ocr_without_boxes"`, `surya_recognize_math: bool=false`, `surya_sort_lines: bool=false`, `surya_drop_repeated_text: bool=false`, `surya_max_sliding_window: int>0\|null`, `surya_max_tokens: int>0\|null` | input image PNG | `engine:"suryaocr"`, `task_name: string`, `lines: string[]`, `text: string` | none | no | yes |
 | POST /ocr/paddle_onnx | `ocr.paddle_onnx` | `join_newlines: bool=true`, `reflect_strings: bool=false`, `paddle_onnx_model: string="korean_v5"` (lowercased), `paddle_onnx_device: string="cpu"` (lowercased)                                    | input image PNG | `engine:"paddleocr_onnx"`, `model: string`, `device: string`, `lines: string[]`, `text: string` | none | no | yes |
+|                  | `ocr.baberu`      | `baberu_model_files: {vision, prefill, step, vocab}` (required; each an absolute file path), `join_newlines: bool=true`, `reflect_strings: bool=false`                                                    | input image PNG | `engine:"baberuocr"`, `lines: string[]`, `text: string`     | none       | no     | yes    |
 
 Notes:
 - `manga_model` value `base_torch` requires Torch (see §6 Torch gate).
-- `easy`, `paddle_vl`, `surya` require Torch. `paddle` and `paddle_onnx` run on
-  the ONNX runtime and do not require Torch.
+- `easy`, `paddle_vl`, `surya` require Torch. `paddle`, `paddle_onnx` and `baberu`
+  run on the ONNX runtime and do not require Torch; `baberu` runs its vision graph on
+  the selected ONNX provider (TensorRT -> CUDA; CPU when the provider is unusable) and
+  its two int8 decoders on the CPU execution provider.
+- **Model locations are Rust's (v7).** The backend never downloads PaddleOCR-VL or
+  Baberu and never reads the Hugging Face cache for them: Rust downloads the pinned,
+  sha256-verified files and sends their absolute locations with every request.
+  `paddle_vl_model` is an opaque variant label (Rust sends `official_1_6`,
+  `official_1_5` or `manga_ja`) used for the lease key, logs and the health echo;
+  `paddle_vl_model_dir` is that variant's directory. `baberu_model_files` names the
+  vision encoder, decoder prefill, decoder step and `vocab.json`. A missing field is
+  a `ValueError` naming it; a non-absolute or missing path is an error naming the
+  path. PaddleOCR-VL runs vendored model code (no `trust_remote_code`).
 - `paddle_onnx_model` is one of the keys in `PADDLE_ONNX_MODEL_TO_LANG`
   (`korean_v5`, `chinese_v5`, ..., `tamil_v3`).
 
@@ -929,7 +941,7 @@ Events are `kind:"event"`, `id:0`, with a `topic`. Payload fields are inline in
 
 | topic        | trigger                                    | payload (inline header fields)                                                                                                                                                                                                  | blob              |
 |--------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|
-| `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr}`, `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill}`, `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object`. (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
+| `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr, baberuocr}` (each that service's own `health()` object with at least `ready: bool`; `paddleocrvl` is `{ready, device, model, last_error}` where `model` is the resident variant label or `null`, and `baberuocr` is `{ready, device, last_error}` where `device` is the effective vision device, e.g. `"CUDAExecutionProvider:0"` or `"CPUExecutionProvider"`, or `null` when nothing is resident; its decoders always run on the CPU), `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill}`, `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object`. (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
 | `device`     | device/provider selection changed          | the full `device.get` result shape (selected/available torch + onnx fields)                                                                                                                                                    | none              |
 | `model_load` | model load/unload progress (new in v2)     | `model: string`, `phase: string` (e.g. `"start"\|"progress"\|"done"\|"unload"`), `loaded: int` (optional), `total: int` (optional), `message: string` (optional)                                                               | none              |
 | `log`        | optional backend log line stream (opt-in)  | `level: string` (e.g. `"info"\|"warn"\|"error"`), `message: string`, `ts_unix_s: float` (optional)                                                                                                                             | none              |

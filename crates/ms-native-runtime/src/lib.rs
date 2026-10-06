@@ -8,8 +8,9 @@ of native OCR engines. Exactly ONE `PaddleDetector` is kept resident and shared 
 the native Paddle detection forward (`paddle_det_forward` / `detect_paddle`) AND every
 PaddleOCR-language recognition (through
 `ms_onnx::paddle_recognize`), so no per-language detector session is duplicated.
-`MangaOcrEngine`s (Base / 2025) and per-language `PaddleRecognizer`s live in a
-capacity-bounded LRU keyed by `NativeModelId`. Turns a crop/page image into
+`MangaOcrEngine`s (Base / 2025), per-language `PaddleRecognizer`s and `BaberuOcrEngine`s
+(one per model-path set; vision on the selected EP, decoders on CPU) live in a capacity-bounded LRU keyed
+by `NativeModelId`. Turns a crop/page image into
 recognized text or detected regions without going through the Python backend.
 Selected via `General.ai_runtime = "native"`.
 
@@ -57,13 +58,16 @@ Key items:
 - MangaVariant          : which MangaOCR ONNX export to run (alias of the
   `ai_models` enum so the router and this module share one type).
 - NativeModelId         : identity key for an LRU-cached engine (MangaBase / Manga2025
-  / PaddleRec(lang)).
+  / PaddleRec(lang) / Baberu(paths)).
 - LruCache              : the pure, capacity-bounded LRU behind the engine cache.
 - NativeRuntimeError    : typed failure surface (guard-disabled, dylib resolve,
-  ORT load, model ensure, engine load, inference, guard write).
+  ORT load, model ensure / not downloaded, engine load, inference, guard write).
 - recognize_manga       : native MangaOCR entry point (guard -> load -> recognize).
 - recognize_paddle      : native PaddleOCR OCR entry point (shared detector + per-lang
   recognizer).
+- BaberuModelPaths / recognize_baberu : native Baberu OCR entry point over CALLER-resolved
+  model files (missing file -> ModelNotDownloaded before any dylib work; vision on the
+  selected EP, decoders on CPU; the effective vision EP is logged once per engine build).
 - detect_paddle         : native PaddleOCR text-detector entry point (shared detector,
   single 960-px pass + postprocess; kept for callers of the whole-page result).
 - paddle_det_forward    : forward-only PaddleOCR detector pass on prepared tiles -> u8
@@ -131,8 +135,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use ms_onnx::{
-    ExecutionProvider, MangaOcrEngine, NativeDeviceSelection, OrtError, OrtRuntime,
-    PaddleDetection, PaddleDetector, PaddleRecognizer,
+    BaberuOcrEngine, BaberuVisionPlacement, ExecutionProvider, MangaOcrEngine,
+    NativeDeviceSelection, OrtError, OrtRuntime, PaddleDetection, PaddleDetector,
+    PaddleRecognizer,
 };
 
 use ms_text_detect::ProbMap;
@@ -206,6 +211,17 @@ pub enum NativeRuntimeError {
     /// Native PaddleOCR text detection failed.
     PaddleDetect(OrtError),
 
+    /// A model file the caller resolved does not exist: the model was never downloaded
+    /// (or was removed). Never answered with an implicit download; the payload is the
+    /// first missing file.
+    ModelNotDownloaded(PathBuf),
+
+    /// Building the native Baberu OCR engine (vision + two decoder sessions + vocab) failed.
+    BaberuEngineLoad(OrtError),
+
+    /// Native Baberu OCR recognition failed.
+    BaberuInference(OrtError),
+
     /// Persisting the SIGILL load-guard marker failed.
     GuardWrite(String),
 
@@ -265,6 +281,16 @@ impl std::fmt::Display for NativeRuntimeError {
             Self::PaddleDetect(source) => {
                 f.write_str(&tf!("native_runtime.error.paddle_detect", detail = source))
             }
+            Self::ModelNotDownloaded(path) => f.write_str(&tf!(
+                "native_runtime.error.model_not_downloaded",
+                path = path.display()
+            )),
+            Self::BaberuEngineLoad(source) => {
+                f.write_str(&tf!("native_runtime.error.baberu_engine_load", detail = source))
+            }
+            Self::BaberuInference(source) => {
+                f.write_str(&tf!("native_runtime.error.baberu_inference", detail = source))
+            }
             Self::GuardWrite(detail) => {
                 f.write_str(&tf!("native_runtime.error.guard_write", detail = detail))
             }
@@ -288,8 +314,11 @@ impl std::error::Error for NativeRuntimeError {
             | Self::PaddleEngineLoad(source)
             | Self::PaddleInference(source)
             | Self::PaddleDetectorLoad(source)
-            | Self::PaddleDetect(source) => Some(source),
+            | Self::PaddleDetect(source)
+            | Self::BaberuEngineLoad(source)
+            | Self::BaberuInference(source) => Some(source),
             Self::GuardDisabled { .. }
+            | Self::ModelNotDownloaded(_)
             | Self::ModelEnsure(_)
             | Self::GuardWrite(_)
             | Self::EngineUnavailable => None,
@@ -951,6 +980,9 @@ enum NativeModelId {
     Manga2025,
     /// PaddleOCR recognizer for the given (trimmed) language key.
     PaddleRec(String),
+    /// Baberu OCR engine built from exactly these files: other paths are another entry,
+    /// so a cached engine is never reused for a different model copy.
+    Baberu(BaberuModelPaths),
 }
 
 /// A loadable native engine held in the LRU (a MangaOCR engine or a PaddleOCR
@@ -961,6 +993,8 @@ enum CachedEngine {
     Manga(MangaOcrEngine),
     /// A PaddleOCR recognizer (used with the shared detector via `paddle_recognize`).
     PaddleRec(PaddleRecognizer),
+    /// A Baberu OCR engine (vision on the selected EP, two CPU decoder sessions, vocabulary).
+    Baberu(BaberuOcrEngine),
 }
 
 /// A small, capacity-bounded LRU map: least-recently-used entries are evicted first.
@@ -1218,6 +1252,69 @@ pub fn recognize_paddle(
         ensure_paddle_detector(ort, progress)?;
         ensure_paddle_recognizer(&lang, ort, progress)?;
         run_paddle_inference(&lang, image)
+    })
+}
+
+/// The files of one downloaded Baberu OCR model copy, resolved by the CALLER.
+///
+/// This crate owns no Baberu layout or catalog: the external-model catalog that
+/// downloads the files decides where they live, and the OCR router passes the absolute
+/// paths here. `vision` is `vision_fp16.onnx`, `prefill` / `step` the int8 decoder
+/// graphs, `vocab` the `tokenizer/vocab.json` character list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaberuModelPaths {
+    /// Vision encoder graph (`onnx/vision_fp16.onnx`).
+    pub vision: PathBuf,
+    /// Decoder prefill graph (`onnx/decoder_prefill_int8.onnx`).
+    pub prefill: PathBuf,
+    /// Decoder step graph with the KV cache (`onnx/decoder_step_int8.onnx`).
+    pub step: PathBuf,
+    /// Character vocabulary (`tokenizer/vocab.json`).
+    pub vocab: PathBuf,
+}
+
+impl BaberuModelPaths {
+    /// Fails with [`NativeRuntimeError::ModelNotDownloaded`] naming the first file that
+    /// is not a regular file. Pure filesystem stat, no download.
+    ///
+    /// # Errors
+    /// [`NativeRuntimeError::ModelNotDownloaded`] with the first missing path.
+    pub fn ensure_present(&self) -> Result<(), NativeRuntimeError> {
+        [&self.vision, &self.prefill, &self.step, &self.vocab]
+            .into_iter()
+            .find(|path| !path.is_file())
+            .map_or(Ok(()), |missing| Err(NativeRuntimeError::ModelNotDownloaded(missing.clone())))
+    }
+}
+
+/// Recognizes the text of one speech-bubble crop with the native Baberu OCR engine.
+///
+/// The model files must already be downloaded: a missing file is
+/// [`NativeRuntimeError::ModelNotDownloaded`], checked BEFORE the ONNX Runtime library is
+/// resolved, so a missing model never triggers a dylib download or a guard marker. The
+/// engine is then built (once, cached in the LRU as one entry for its three sessions)
+/// and run inside the shared SIGILL-guarded sequence, exactly like [`recognize_manga`].
+/// Vision on the selected EP, decoders on CPU (why: int8 decoder ops fall back to CPU on
+/// GPU EPs; benchmark 2026-10-06); the placement rule is `ms_onnx::baberu_ocr`'s, and a
+/// vision build that fails on the EP runs on the CPU with a WARN instead of failing.
+/// `progress` reports onnxruntime dylib download activity on the calling (worker) thread.
+///
+/// # Threading
+/// Worker-thread only: performs blocking download, dlopen, and inference.
+///
+/// # Errors
+/// [`NativeRuntimeError::ModelNotDownloaded`], the guard/dylib/ORT-load surface of
+/// [`recognize_manga`], plus [`NativeRuntimeError::BaberuEngineLoad`] /
+/// [`NativeRuntimeError::BaberuInference`].
+pub fn recognize_baberu(
+    paths: &BaberuModelPaths,
+    image: &image::RgbaImage,
+    progress: &mut dyn FnMut(OrtDownloadProgress),
+) -> Result<String, NativeRuntimeError> {
+    paths.ensure_present()?;
+    run_guarded(progress, |ort, _progress| {
+        ensure_baberu_engine(paths, ort)?;
+        run_baberu_inference(paths, image)
     })
 }
 
@@ -1822,6 +1919,100 @@ fn with_shared_detector<T>(
     }
 
     result.map_err(NativeRuntimeError::PaddleDetect)
+}
+
+/// Ensures the Baberu engine for `paths` is built and cached (LRU). The three session
+/// builds run with the global lock released.
+fn ensure_baberu_engine(paths: &BaberuModelPaths, ort: &OrtRuntime) -> Result<(), NativeRuntimeError> {
+    let id = NativeModelId::Baberu(paths.clone());
+    {
+        let mut state = lock_state();
+        if state.engines.contains(&id) {
+            state.engines.touch(&id);
+            return Ok(());
+        }
+    }
+
+    runtime_log::log_info(format!(
+        "[native-runtime] building Baberu OCR engine (vision on '{}', decoders on cpu) vision={} \
+         prefill={} step={} vocab={}",
+        ort.provider().id(),
+        paths.vision.display(),
+        paths.prefill.display(),
+        paths.step.display(),
+        paths.vocab.display()
+    ));
+    let engine = BaberuOcrEngine::load(ort, &paths.vision, &paths.prefill, &paths.step, &paths.vocab)
+        .map_err(NativeRuntimeError::BaberuEngineLoad)?;
+    log_baberu_vision_placement(engine.vision_placement());
+
+    let mut state = lock_state();
+    // Keep an engine another worker committed in the meantime (see `ensure_engine`).
+    if !state.engines.contains(&id) {
+        insert_engine(&mut state, id, CachedEngine::Baberu(engine));
+    }
+    Ok(())
+}
+
+/// Logs where a freshly built Baberu engine runs its vision graph, once per engine build:
+/// INFO on the selected provider or its rule-based substitute (TensorRT -> CUDA), WARN
+/// naming requested vs effective provider when the build fell back to the CPU (correct
+/// output, slower vision).
+fn log_baberu_vision_placement(placement: &BaberuVisionPlacement) {
+    match placement {
+        BaberuVisionPlacement::Selected(provider) => runtime_log::log_info(format!(
+            "[native-runtime] Baberu OCR engine ready: vision provider='{}' (effective), decoders on cpu.",
+            provider.id()
+        )),
+        BaberuVisionPlacement::Substituted { requested, used } => runtime_log::log_info(format!(
+            "[native-runtime] Baberu OCR engine ready: vision provider='{}' instead of '{}' \
+             (TensorRT is not used for Baberu vision: no engine cache, each session build would \
+             compile for minutes), decoders on cpu.",
+            used.id(),
+            requested.id()
+        )),
+        BaberuVisionPlacement::CpuFallback { requested, attempted, error } => {
+            runtime_log::log_warn(format!(
+                "[native-runtime] Baberu OCR vision requested provider='{}' but effective provider='cpu': \
+                 the vision session could not be built on '{}' ({error}); decoders on cpu. \
+                 Recognition stays correct, vision is slower.",
+                requested.id(),
+                attempted.id()
+            ));
+        }
+    }
+}
+
+/// Runs Baberu inference with the global lock RELEASED during the call: the engine is
+/// taken out of the LRU, used, and reinserted as most-recently-used whatever the
+/// outcome. A concurrent caller that finds it taken gets `EngineUnavailable` (and the
+/// router falls back), like MangaOCR.
+fn run_baberu_inference(
+    paths: &BaberuModelPaths,
+    image: &image::RgbaImage,
+) -> Result<String, NativeRuntimeError> {
+    let id = NativeModelId::Baberu(paths.clone());
+    let mut engine = take_baberu_engine(&id)?;
+    let result = engine.recognize(image);
+    {
+        let mut state = lock_state();
+        insert_engine(&mut state, id, CachedEngine::Baberu(engine));
+    }
+    result.map_err(NativeRuntimeError::BaberuInference)
+}
+
+/// Takes the Baberu engine for `id` out of the LRU, or fails.
+fn take_baberu_engine(id: &NativeModelId) -> Result<BaberuOcrEngine, NativeRuntimeError> {
+    let mut state = lock_state();
+    match state.engines.take(id) {
+        Some(CachedEngine::Baberu(engine)) => Ok(engine),
+        Some(other) => {
+            // Wrong payload type for this id: put it back, surface an internal error.
+            insert_engine(&mut state, id.clone(), other);
+            Err(NativeRuntimeError::EngineUnavailable)
+        }
+        None => Err(NativeRuntimeError::EngineUnavailable),
+    }
 }
 
 /// Persists the succeeded marker exactly once per process, after the first successful
@@ -2467,6 +2658,83 @@ mod tests {
         // Replacing an existing key updates its value and refreshes recency.
         assert!(lru.insert(1, 100).is_empty());
         assert_eq!(lru.take(&1), Some(100));
+    }
+
+    /// Unique, never-created scratch path under the system temp dir.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("ms-native-runtime-{tag}-{}-{nanos}", std::process::id()))
+    }
+
+    fn baberu_paths(root: &std::path::Path) -> BaberuModelPaths {
+        BaberuModelPaths {
+            vision: root.join("onnx").join("vision_fp16.onnx"),
+            prefill: root.join("onnx").join("decoder_prefill_int8.onnx"),
+            step: root.join("onnx").join("decoder_step_int8.onnx"),
+            vocab: root.join("tokenizer").join("vocab.json"),
+        }
+    }
+
+    #[test]
+    fn baberu_model_not_downloaded_names_the_first_missing_file() {
+        // An empty root: nothing is created, and the check never downloads or loads ORT.
+        let root = scratch_dir("baberu-missing");
+        let paths = baberu_paths(&root);
+        match paths.ensure_present() {
+            Err(NativeRuntimeError::ModelNotDownloaded(missing)) => assert_eq!(missing, paths.vision),
+            other => panic!("expected ModelNotDownloaded, got {other:?}"),
+        }
+        // The public entry point refuses before touching the ORT guard or dylib.
+        let mut progress = |_: OrtDownloadProgress| {};
+        let image = image::RgbaImage::new(4, 4);
+        assert!(matches!(
+            recognize_baberu(&paths, &image, &mut progress),
+            Err(NativeRuntimeError::ModelNotDownloaded(_))
+        ));
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn baberu_model_present_when_every_file_exists() {
+        let root = scratch_dir("baberu-present");
+        let paths = baberu_paths(&root);
+        let created = [&paths.vision, &paths.prefill, &paths.step, &paths.vocab].into_iter().try_for_each(|file| {
+            file.parent().map_or(Ok(()), std::fs::create_dir_all)?;
+            std::fs::write(file, b"x")
+        });
+        let all_present = paths.ensure_present();
+        // Removing only the vocab must report exactly that file.
+        let vocab_removed = std::fs::remove_file(&paths.vocab);
+        let vocab_missing = paths.ensure_present();
+        // Clean up before asserting so a failed assertion leaves nothing behind.
+        let cleaned = std::fs::remove_dir_all(&root);
+
+        assert!(created.is_ok(), "scratch setup failed: {created:?}");
+        assert!(all_present.is_ok(), "{all_present:?}");
+        assert!(vocab_removed.is_ok(), "{vocab_removed:?}");
+        assert!(matches!(
+            vocab_missing,
+            Err(NativeRuntimeError::ModelNotDownloaded(ref p)) if *p == paths.vocab
+        ));
+        assert!(cleaned.is_ok(), "scratch cleanup failed: {cleaned:?}");
+    }
+
+    #[test]
+    fn baberu_cache_ids_are_keyed_by_model_paths() {
+        let a = NativeModelId::Baberu(baberu_paths(std::path::Path::new("/models/a")));
+        let b = NativeModelId::Baberu(baberu_paths(std::path::Path::new("/models/b")));
+        assert_ne!(a, b);
+        assert_eq!(a, NativeModelId::Baberu(baberu_paths(std::path::Path::new("/models/a"))));
+        assert_ne!(a, NativeModelId::MangaBase);
+
+        // One LRU entry per model copy, sharing the capacity with the other engines.
+        let mut lru: LruCache<NativeModelId, u8> = LruCache::new(2);
+        assert!(lru.insert(NativeModelId::MangaBase, 1).is_empty());
+        assert!(lru.insert(a.clone(), 2).is_empty());
+        assert_eq!(lru.insert(b.clone(), 3), vec![(NativeModelId::MangaBase, 1)]);
+        assert!(lru.contains(&a) && lru.contains(&b));
     }
 
     #[test]

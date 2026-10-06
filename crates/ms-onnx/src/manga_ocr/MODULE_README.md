@@ -51,8 +51,9 @@ image → preprocess (NCHW f32) → encoder session → encoder_hidden_states
   `OrtError::VocabLoad`; empty images to `OrtError::ImagePreprocess`.
 - **`recognize` takes `&mut self`** because `ort::session::Session::run` requires
   `&mut self`; the engine owns its sessions.
-- **CPU-only (Phase 1):** sessions register no execution provider (default CPU) and
-  use `GraphOptimizationLevel::All` to match the reference's `ORT_ENABLE_ALL`.
+- **Committed execution provider:** sessions are built with `OrtRuntime::build_session`,
+  so they use the provider and device the runtime was loaded with (CPU registers none),
+  with `GraphOptimizationLevel::All` to match the reference's `ORT_ENABLE_ALL`.
 - **Post-process order is load-bearing** and must match Python exactly.
 
 ## Parity caveats

@@ -34,6 +34,8 @@ import pytest
 from modules.ai_backend.ipc import registry
 from modules.ai_backend.ipc.handlers import ocr as ocr_handlers
 from modules.ai_backend.ipc.protocol import (
+    ALL_METHODS,
+    METHOD_OCR_BABERU,
     METHOD_OCR_EASY,
     METHOD_OCR_PADDLE,
     METHOD_OCR_PADDLE_ONNX,
@@ -92,6 +94,7 @@ def _canceled() -> threading.Event:
         METHOD_OCR_PADDLE_VL,
         METHOD_OCR_SURYA,
         METHOD_OCR_PADDLE_ONNX,
+        METHOD_OCR_BABERU,
     ],
 )
 def test_methods_registered(method: str) -> None:
@@ -224,11 +227,21 @@ def test_paddle_canceled() -> None:
 # ocr.paddle_vl
 # ---------------------------------------------------------------------------
 
+_PADDLE_VL_MODEL = {
+    "paddle_vl_model": "official_1_6",
+    "paddle_vl_model_dir": "/models/side_models/PaddleOCR-VL/official_1_6",
+}
+
+
 def test_paddle_vl_defaults_script_none() -> None:
     fake = _FakeOcr({"lines": ["v"], "text": "v"})
     ctx = _make_ctx(paddle_vl_ocr=fake)
-    header, blob = ocr_handlers._handle_ocr_paddle_vl(ctx, {}, IMG, _no_cancel())
+    header, blob = ocr_handlers._handle_ocr_paddle_vl(ctx, dict(_PADDLE_VL_MODEL), IMG, _no_cancel())
+    # The model fields are forwarded verbatim: label syntax and the directory
+    # check belong to the service.
     assert fake.last_kwargs == {
+        "model": "official_1_6",
+        "model_dir": "/models/side_models/PaddleOCR-VL/official_1_6",
         "join_newlines": True,
         "reflect_strings": False,
         "script": None,
@@ -240,34 +253,49 @@ def test_paddle_vl_defaults_script_none() -> None:
 def test_paddle_vl_script_lowercased() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(paddle_vl_ocr=fake)
-    ocr_handlers._handle_ocr_paddle_vl(ctx, {"paddle_vl_script": " Latin "}, IMG, _no_cancel())
+    ocr_handlers._handle_ocr_paddle_vl(ctx, {**_PADDLE_VL_MODEL, "paddle_vl_script": " Latin "}, IMG, _no_cancel())
     assert fake.last_kwargs["script"] == "latin"
 
 
 def test_paddle_vl_blank_script_is_none() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(paddle_vl_ocr=fake)
-    ocr_handlers._handle_ocr_paddle_vl(ctx, {"paddle_vl_script": "   "}, IMG, _no_cancel())
+    ocr_handlers._handle_ocr_paddle_vl(ctx, {**_PADDLE_VL_MODEL, "paddle_vl_script": "   "}, IMG, _no_cancel())
     assert fake.last_kwargs["script"] is None
 
 
 def test_paddle_vl_non_string_script_errors() -> None:
     ctx = _make_ctx(paddle_vl_ocr=_FakeOcr({"lines": [], "text": ""}))
     with pytest.raises(ValueError, match="paddle_vl_script"):
-        ocr_handlers._handle_ocr_paddle_vl(ctx, {"paddle_vl_script": 7}, IMG, _no_cancel())
+        ocr_handlers._handle_ocr_paddle_vl(ctx, {**_PADDLE_VL_MODEL, "paddle_vl_script": 7}, IMG, _no_cancel())
+
+
+@pytest.mark.parametrize("field", ["paddle_vl_model", "paddle_vl_model_dir"])
+@pytest.mark.parametrize("value", [None, "", "   ", 5])
+def test_paddle_vl_requires_model_fields(field: str, value: Any) -> None:
+    fake = _FakeOcr({"lines": [], "text": ""})
+    ctx = _make_ctx(paddle_vl_ocr=fake)
+    header = dict(_PADDLE_VL_MODEL)
+    if value is None:
+        del header[field]
+    else:
+        header[field] = value
+    with pytest.raises(ValueError, match=field):
+        ocr_handlers._handle_ocr_paddle_vl(ctx, header, IMG, _no_cancel())
+    assert fake.calls == []
 
 
 def test_paddle_vl_empty_blob_errors() -> None:
     ctx = _make_ctx(paddle_vl_ocr=_FakeOcr({"lines": [], "text": ""}))
     with pytest.raises(ValueError, match="frame blob"):
-        ocr_handlers._handle_ocr_paddle_vl(ctx, {}, b"", _no_cancel())
+        ocr_handlers._handle_ocr_paddle_vl(ctx, dict(_PADDLE_VL_MODEL), b"", _no_cancel())
 
 
 def test_paddle_vl_canceled() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(paddle_vl_ocr=fake)
     with pytest.raises(Interrupted):
-        ocr_handlers._handle_ocr_paddle_vl(ctx, {}, IMG, _canceled())
+        ocr_handlers._handle_ocr_paddle_vl(ctx, dict(_PADDLE_VL_MODEL), IMG, _canceled())
     assert fake.calls == []
 
 
@@ -424,4 +452,71 @@ def test_paddle_onnx_canceled() -> None:
     ctx = _make_ctx(paddle_ocr=fake)
     with pytest.raises(Interrupted):
         ocr_handlers._handle_ocr_paddle_onnx(ctx, {}, IMG, _canceled())
+    assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
+# ocr.baberu
+# ---------------------------------------------------------------------------
+
+_BABERU_FILES = {
+    "vision": "/models/BaberuOCR/onnx/vision_fp16.onnx",
+    "prefill": "/models/BaberuOCR/onnx/decoder_prefill_int8.onnx",
+    "step": "/models/BaberuOCR/onnx/decoder_step_int8.onnx",
+    "vocab": "/models/BaberuOCR/tokenizer/vocab.json",
+}
+
+
+def test_baberu_is_in_the_method_list() -> None:
+    assert METHOD_OCR_BABERU == "ocr.baberu"
+    assert METHOD_OCR_BABERU in ALL_METHODS
+
+
+def test_baberu_forwards_files_and_defaults() -> None:
+    fake = _FakeOcr({"lines": ["b"], "text": "b"})
+    ctx = _make_ctx(baberu_ocr=fake)
+    header, blob = ocr_handlers._handle_ocr_baberu(
+        ctx, {"baberu_model_files": _BABERU_FILES}, IMG, _no_cancel()
+    )
+    assert fake.last_image == IMG
+    # The object is forwarded verbatim: per-path validation is the service's.
+    assert fake.last_kwargs == {
+        "model_files": _BABERU_FILES,
+        "join_newlines": True,
+        "reflect_strings": False,
+    }
+    assert header == {"engine": "baberuocr", "lines": ["b"], "text": "b"}
+    assert blob == b""
+
+
+def test_baberu_parses_flags() -> None:
+    fake = _FakeOcr({"lines": [], "text": ""})
+    ctx = _make_ctx(baberu_ocr=fake)
+    req = {"baberu_model_files": _BABERU_FILES, "join_newlines": False, "reflect_strings": True}
+    ocr_handlers._handle_ocr_baberu(ctx, req, IMG, _no_cancel())
+    assert fake.last_kwargs["join_newlines"] is False
+    assert fake.last_kwargs["reflect_strings"] is True
+
+
+@pytest.mark.parametrize("files", [None, "/models/BaberuOCR", ["a", "b"]])
+def test_baberu_requires_the_files_object(files: Any) -> None:
+    fake = _FakeOcr({"lines": [], "text": ""})
+    ctx = _make_ctx(baberu_ocr=fake)
+    header = {} if files is None else {"baberu_model_files": files}
+    with pytest.raises(ValueError, match="baberu_model_files"):
+        ocr_handlers._handle_ocr_baberu(ctx, header, IMG, _no_cancel())
+    assert fake.calls == []
+
+
+def test_baberu_empty_blob_errors() -> None:
+    ctx = _make_ctx(baberu_ocr=_FakeOcr({"lines": [], "text": ""}))
+    with pytest.raises(ValueError, match="frame blob"):
+        ocr_handlers._handle_ocr_baberu(ctx, {"baberu_model_files": _BABERU_FILES}, b"", _no_cancel())
+
+
+def test_baberu_canceled() -> None:
+    fake = _FakeOcr({"lines": [], "text": ""})
+    ctx = _make_ctx(baberu_ocr=fake)
+    with pytest.raises(Interrupted):
+        ocr_handlers._handle_ocr_baberu(ctx, {"baberu_model_files": _BABERU_FILES}, IMG, _canceled())
     assert fake.calls == []

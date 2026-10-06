@@ -1,3 +1,19 @@
 This product includes software developed by the LaMa project
 (https://github.com/advimman/lama)
 licensed under the Apache License, Version 2.0.
+
+This product includes the PaddleOCR-VL model code
+(modules/ai_backend/ocr/paddle_vl_vendor/, unmodified) from
+https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6
+(commit c5630abae1d940eafe0697512a0325494b02ab42),
+Copyright (c) 2025 PaddlePaddle Authors,
+licensed under the Apache License, Version 2.0
+(see modules/ai_backend/ocr/paddle_vl_vendor/LICENSE).
+
+This product includes a port of the Baberu OCR inference procedure
+(preprocessing and greedy decoding of onnx_infer.py) from
+https://huggingface.co/genshiai-daichi/baberu-ocr
+(commit cc74c99765dc5f089d12a8f2e11692bb029a4391),
+Copyright 2026 Baberu OCR authors,
+licensed under the Apache License, Version 2.0
+(modules/ai_backend/ocr/baberu.py and crates/ms-onnx/src/baberu_ocr/).

@@ -1,0 +1,133 @@
+{
+ "pillow_version": "12.2.0",
+ "filter": "BICUBIC",
+ "prng": "xorshift32",
+ "cases": [
+  {
+   "name": "identity_37x23",
+   "seed": 1,
+   "in_w": 37,
+   "in_h": 23,
+   "out_w": 37,
+   "out_h": 23,
+   "sha256": "018e4f8d39f8ed98a44add7077444623df7d830d296ddc63fef3d67ba02be47a"
+  },
+  {
+   "name": "up_13x9_to_224",
+   "seed": 2,
+   "in_w": 13,
+   "in_h": 9,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "1d393ca8797059c6054ae5818674c191eda831f7756ee7d66a817927a48cfe14"
+  },
+  {
+   "name": "down_300x120_to_224",
+   "seed": 3,
+   "in_w": 300,
+   "in_h": 120,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "eace54115623419975029b47cd0adf92e6c78f69353b8b46656355c3b7f99ec1"
+  },
+  {
+   "name": "column_1x40_to_224",
+   "seed": 4,
+   "in_w": 1,
+   "in_h": 40,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "20d0dbf80b1ffc31104e9dd66adde5a2adcd3f43134a5ed0118f49c514969397"
+  },
+  {
+   "name": "row_50x1_to_224",
+   "seed": 5,
+   "in_w": 50,
+   "in_h": 1,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "9313f807ccca3ae7832cf2d554efbe279481a5ce431b685bb4431a0a24e44dd1"
+  },
+  {
+   "name": "wide_640x48_to_224",
+   "seed": 6,
+   "in_w": 640,
+   "in_h": 48,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "8b394a51763663af7aae900925bc290357f2bc5723762b9ae7f5f55dcb9a75e4"
+  },
+  {
+   "name": "tall_5x700_to_224",
+   "seed": 7,
+   "in_w": 5,
+   "in_h": 700,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "70555c73ec965e54611d4c931a549ade41870b442c96b06bacd582f632300c0c"
+  },
+  {
+   "name": "vertical_only_224x500",
+   "seed": 8,
+   "in_w": 224,
+   "in_h": 500,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "d369ec61976fc86c15f1de67b5e5d3f52cfd2b0d09bda796ad5a504c6377a3c4"
+  },
+  {
+   "name": "horizontal_only_500x224",
+   "seed": 9,
+   "in_w": 500,
+   "in_h": 224,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "35c1d490a3a23f94b67807ad7846b235e22ccb28cef7007c4dca50365d1005e7"
+  },
+  {
+   "name": "odd_31x17_to_11x29",
+   "seed": 10,
+   "in_w": 31,
+   "in_h": 17,
+   "out_w": 11,
+   "out_h": 29,
+   "sha256": "677d2fa5b1fe22077a62e483adb751f440103eaf3a8e5aa6bf4dd6ad21e783cf"
+  },
+  {
+   "name": "to_1x1_from_9x7",
+   "seed": 11,
+   "in_w": 9,
+   "in_h": 7,
+   "out_w": 1,
+   "out_h": 1,
+   "sha256": "dac662c1edf1af5777d5071ca2759b23d81cc1d335c29803fc88c02afed65f03"
+  },
+  {
+   "name": "aspect_100_exact_3x300_horizontal_first",
+   "seed": 12,
+   "in_w": 3,
+   "in_h": 300,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "0a4609969f071b7b34c14a55d9604fc054783f8c15faf15f357150beb59c3286"
+  },
+  {
+   "name": "aspect_over_100_3x301_vertical_first",
+   "seed": 13,
+   "in_w": 3,
+   "in_h": 301,
+   "out_w": 224,
+   "out_h": 224,
+   "sha256": "ee27a5b904476bd10dd7269af5cc5b2d45fa5d704f646742c164752bde3b9ba3"
+  },
+  {
+   "name": "aspect_over_100_growing_2x300_horizontal_first",
+   "seed": 14,
+   "in_w": 2,
+   "in_h": 300,
+   "out_w": 224,
+   "out_h": 400,
+   "sha256": "16aada25bd72924cb1b6b9aa04aa0381ceae6d05e44cd35737d2f76940628106"
+  }
+ ]
+}

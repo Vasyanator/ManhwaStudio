@@ -2,8 +2,9 @@
 File: crates/ms-tab-translation/src/panels/mod.rs
 
 Purpose:
-Module declarations of the Translation tab's side panels, plus the one helper shared by more
-than one panel.
+Module declarations of the Translation tab's side panels (including `ocr_model_download`,
+the OCR panel's external-model download block), plus the one helper shared by more than one
+panel.
 
 Key functions:
 - section_header_button(): the "▶ / ▼ title" header button of the panels' hand-rolled
@@ -15,6 +16,7 @@ pub mod composition;
 pub mod machine_translation;
 pub mod ocr;
 pub mod ocr_langs;
+pub mod ocr_model_download;
 pub mod text_detector;
 
 /// Draws a collapsible-section header as a button labelled `"▼ {title}"` when `expanded`, else

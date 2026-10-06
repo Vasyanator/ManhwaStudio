@@ -12,7 +12,9 @@ Submodules:
 - `ai_install_probe`: which AI Python packages are installed, classified into the persisted
   `ms_config::AiInstallType` level.
 - `ai_models`: lazy, resumable download of the app-managed model tree from the
-  `Vasyanator2/ManhwaStudio_AI_Models` Hugging Face repository into a caller-supplied root.
+  `Vasyanator2/ManhwaStudio_AI_Models` Hugging Face repository into a caller-supplied root;
+  its `external` / `external_catalog` submodules own pinned third-party models (Baberu OCR,
+  PaddleOCR-VL) and their verified downloader.
 - `hf_token`: the process-wide Hugging Face access token, cached in memory and backed by the
   OS secret store (`keyring`).
 - `gpu_utils`: NVIDIA/AMD/DirectML/WebGPU adapter detection, CUDA/ROCm runtime versions,

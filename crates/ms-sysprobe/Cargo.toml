@@ -26,6 +26,10 @@ image.workspace = true
 # Python snippet returns a typed JSON report, hence the derive.
 serde.workspace = true
 serde_json.workspace = true
+# `ai_models::external` verifies every pinned external-model file against its sha256.
+sha2.workspace = true
+# Typed public error of `ai_models::external` (`ExternalModelError`).
+thiserror.workspace = true
 
 # Native-only halves of the two Hugging Face modules. `hf-hub` resolves repository file
 # URLs for `ai_models` (which then streams them itself, without the HF cache), and
@@ -48,3 +52,7 @@ keyring.workspace = true
 # these two modules use.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_Graphics_Gdi"] }
+
+[dev-dependencies]
+# Unique, self-removing scratch directories for the `ai_models::external` download tests.
+tempfile.workspace = true

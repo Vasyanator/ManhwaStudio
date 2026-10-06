@@ -31,10 +31,19 @@ UI specifics:
   "Статус:" block, outside the engine options, whenever an AI API request is in flight.
 - Legacy local PaddleOCR engine keys are normalized back to `PaddleOCR`
   by the Translation tab loader.
+- External-model engines (Baberu OCR, PaddleOCR-VL) show the shared download
+  block (`panels::ocr_model_download`) under their options; their load button is
+  enabled only once the model is `Installed`. Baberu OCR sits on the second engine
+  row with a "ja/zh/en only" hint and a warning when the MT source language is
+  Korean (`OcrPanelModelView::korean_source`). PaddleOCR-VL has a weight-variant
+  `WheelComboBox` (`OcrPanelOptions::paddle_vl_model`) above the script restriction.
 */
 
-use crate::ocr::{CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult};
+use crate::ocr::{CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult, external_model_spec};
+use crate::ocr_model_download::OcrModelPanelSnapshot;
+use crate::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download, load_blocked_reason};
 use crate::panels::section_header_button;
+use ms_sysprobe::ai_models::external_catalog::PaddleVlVariant;
 use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, GenerationSnapshot, draw_connection, draw_generation_status};
 use crate::panels::ocr_langs::{
     EASYOCR_FULL_LANGUAGES, EASYOCR_MAIN_LANGUAGES, PADDLEOCR_FULL_LANGUAGES,
@@ -56,6 +65,8 @@ pub struct OcrPanelOptions {
     pub paddle_lang: String,
     pub paddle_show_full_langs: bool,
     pub paddle_vl_script: String,
+    /// Selected PaddleOCR-VL weights; persisted per title as `OCR.params.paddle_vl.model`.
+    pub paddle_vl_model: PaddleVlVariant,
     pub easy_langs: String,
     pub easy_lang_to_add: String,
     pub easy_show_full_langs: bool,
@@ -121,6 +132,7 @@ impl Default for OcrPanelOptions {
             paddle_lang: "korean_v5".to_string(),
             paddle_show_full_langs: false,
             paddle_vl_script: "auto".to_string(),
+            paddle_vl_model: PaddleVlVariant::default(),
             easy_langs: "ko".to_string(),
             easy_lang_to_add: "ko".to_string(),
             easy_show_full_langs: false,
@@ -214,6 +226,19 @@ pub struct OcrPanelActions {
     /// "Stop" was clicked in the generation status widget, on this snapshot (its `run_id` and
     /// `request_tag` = OCR request id say which generation to stop).
     pub stop_generation: Option<GenerationSnapshot>,
+    /// Download / cancel requested in the external-model download block.
+    pub model_download: ModelDownloadAction,
+}
+
+/// Per-frame inputs of the OCR panel's external-model parts, lent by the tab.
+#[derive(Debug, Clone, Copy)]
+pub struct OcrPanelModelView<'a> {
+    /// The MT panel's source language is Korean: Baberu OCR cannot read it.
+    pub korean_source: bool,
+    /// Download snapshot of the external model of the engine selected at the START of the
+    /// frame (`ocr::external_model_spec`); `None` for engines without one. It is drawn only
+    /// while it still matches the selection after this frame's widgets (`spec_id`).
+    pub download: Option<&'a OcrModelPanelSnapshot>,
 }
 
 /// AiRequirement gating the engine-SELECTION button (permissive: MangaOCR is
@@ -226,6 +251,8 @@ fn engine_button_requirement(engine: OcrEngine) -> Option<AiRequirement> {
         OcrEngine::PaddleOcr => Some(AiRequirement::Onnx),
         OcrEngine::PaddleVl => Some(AiRequirement::Torch),
         OcrEngine::Surya => Some(AiRequirement::Torch),
+        // Native ONNX Runtime or the backend's onnxruntime: no PyTorch involved.
+        OcrEngine::Baberu => Some(AiRequirement::Onnx),
         OcrEngine::AiApi => None,
     }
 }
@@ -256,6 +283,7 @@ pub(crate) fn selected_mode_requirement(options: &OcrPanelOptions) -> Option<AiR
         OcrEngine::PaddleOcr => Some(AiRequirement::Onnx),
         OcrEngine::PaddleVl => Some(AiRequirement::Torch),
         OcrEngine::Surya => Some(AiRequirement::Torch),
+        OcrEngine::Baberu => Some(AiRequirement::Onnx),
         OcrEngine::AiApi => None,
     }
 }
@@ -269,6 +297,7 @@ fn engine_marker(engine: OcrEngine) -> Option<&'static str> {
         OcrEngine::PaddleOcr => Some("ONNX"),
         OcrEngine::PaddleVl => Some("Torch"),
         OcrEngine::Surya => Some("Torch"),
+        OcrEngine::Baberu => Some("ONNX"),
         OcrEngine::AiApi => None,
     }
 }
@@ -313,7 +342,9 @@ fn engine_select_button(
 /// button are disabled together when the selected engine+model requirement is
 /// known-unavailable. AiApi stays ungated (network-only). `generation` is the OCR
 /// controller's live AI API request state; while it is active the generation status
-/// widget is drawn and its "Stop" sets `OcrPanelActions::stop_generation`.
+/// widget is drawn and its "Stop" sets `OcrPanelActions::stop_generation`. `model` lends
+/// the external-model state of the selected engine (download block, load gating) and
+/// whether the MT source language is Korean (Baberu warning).
 // Parameters represent distinct required inputs with no natural grouping.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_ocr_panel(
@@ -327,6 +358,7 @@ pub fn draw_ocr_panel(
     advanced_selection_shortcut: Option<&str>,
     advanced_selection_active: bool,
     generation: &GenerationSnapshot,
+    model: OcrPanelModelView<'_>,
 ) -> OcrPanelActions {
     let mut actions = OcrPanelActions::default();
     let caps = AiCaps::current();
@@ -399,6 +431,16 @@ pub fn draw_ocr_panel(
                 req,
                 "PaddleOCR-VL",
                 t!("translation.ocr_panel.vision_language_hint"),
+            );
+        }
+        if let Some(req) = engine_button_requirement(OcrEngine::Baberu) {
+            actions.options_changed |= engine_select_button(
+                ui,
+                &mut options.engine,
+                OcrEngine::Baberu,
+                req,
+                "Baberu OCR",
+                t!("translation.ocr_panel.baberu_hint"),
             );
         }
     });
@@ -496,6 +538,7 @@ pub fn draw_ocr_panel(
                 actions.options_changed |= draw_easy_selected_langs(ui, options);
             }
             OcrEngine::PaddleVl => {
+                actions.options_changed |= draw_paddle_vl_variant_combo(ui, &mut options.paddle_vl_model);
                 // PaddleOCR-VL auto-detects script; an optional hard-restriction mode
                 // constrains decoding to one writing system to curb hallucination on
                 // messy/handwritten text (no separate language model is selected).
@@ -521,11 +564,29 @@ pub fn draw_ocr_panel(
             }
             // Surya auto-detects language and needs no selection UI here.
             OcrEngine::Surya => {}
+            OcrEngine::Baberu => {
+                ui.small(t!("translation.ocr_panel.baberu_languages_hint"));
+                if model.korean_source {
+                    ui.colored_label(ms_theme::status::WARNING, t!("translation.ocr_panel.baberu_korean_warning"));
+                }
+            }
             OcrEngine::AiApi => {
                 draw_ai_api_options(ui, options, &mut actions);
             }
         }
     });
+    // Outside the engine-options gate: downloading needs only the network, so a model can
+    // be fetched even while its runtime requirement is not (yet) met.
+    // The snapshot was taken before this frame's engine / variant widgets: right after a
+    // switch it describes the previous model, so it is drawn only for the spec it belongs
+    // to (the next frame brings the new spec's snapshot).
+    let selected_spec = external_model_spec(options.engine, options.paddle_vl_model);
+    if let (Some(spec), Some(snapshot)) = (selected_spec, model.download)
+        && snapshot.spec_id == spec.id
+    {
+        actions.model_download = draw_ocr_model_download(ui, spec, snapshot);
+    }
+    let model_blocked_reason = selected_spec.and_then(|spec| load_blocked_reason(spec, model.download));
     // Outside the engine options (and their collapsible section), so an AI API request in
     // flight stays visible and stoppable whatever is selected or collapsed.
     if generation.active {
@@ -614,15 +675,21 @@ pub fn draw_ocr_panel(
     };
     ui.horizontal_wrapped(|ui| {
         let button = ui.add_enabled(
-            !state.is_busy() && selected_engine_enabled,
+            !state.is_busy() && selected_engine_enabled && model_blocked_reason.is_none(),
             egui::Button::new(button_label),
         );
         // Surface the requirement's disabled reason on hover and as a colored hint,
-        // both derived from the same `selected_mode_requirement` used to gate it.
+        // both derived from the same `selected_mode_requirement` used to gate it. A model
+        // that is not installed yet (missing, checking, downloading) is explained by the
+        // download block above, so the button only repeats it on hover.
         let disabled_reason = if selected_engine_enabled {
             None
         } else {
             selected_mode_requirement(options).map(|req| req.disabled_reason(&caps))
+        };
+        let button = match model_blocked_reason.filter(|_| selected_engine_enabled) {
+            Some(reason) => button.on_disabled_hover_text(reason),
+            None => button,
         };
         let button = match disabled_reason {
             Some(reason) => button.on_disabled_hover_text(reason),
@@ -791,6 +858,34 @@ fn disabled_manga_model_choice(
         return true;
     }
     false
+}
+
+/// Localized label of a PaddleOCR-VL weight variant (the persisted identity is
+/// `PaddleVlVariant::key`, never this text).
+pub(crate) fn paddle_vl_variant_label(variant: PaddleVlVariant) -> &'static str {
+    match variant {
+        PaddleVlVariant::Official16 => t!("translation.ocr_panel.paddle_vl_model_official_1_6"),
+        PaddleVlVariant::Official15 => t!("translation.ocr_panel.paddle_vl_model_official_1_5"),
+        PaddleVlVariant::MangaJa => t!("translation.ocr_panel.paddle_vl_model_manga_ja"),
+    }
+}
+
+/// The PaddleOCR-VL weight-variant dropdown (modeled on the MangaOCR model dropdown) plus
+/// the manga_ja hint. Returns `true` when the selection changed.
+fn draw_paddle_vl_variant_combo(ui: &mut egui::Ui, selected: &mut PaddleVlVariant) -> bool {
+    let mut changed = false;
+    WheelComboBox::from_label(t!("translation.ocr_panel.paddle_vl_model_label"))
+        .id_salt("translation.ocr_panel.paddle_vl_model_label")
+        .selected_text(paddle_vl_variant_label(*selected))
+        .show_ui(ui, |ui| {
+            for variant in PaddleVlVariant::ALL {
+                changed |= ui.selectable_value(selected, variant, paddle_vl_variant_label(variant)).changed();
+            }
+        });
+    if *selected == PaddleVlVariant::MangaJa {
+        ui.small(t!("translation.ocr_panel.paddle_vl_model_manga_ja_hint"));
+    }
+    changed
 }
 
 // PaddleOCR-VL writing-system restriction modes: `(wire key, display i18n key)`.
@@ -1034,8 +1129,8 @@ fn parse_lang_codes(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiRequirement, OcrEngine, OcrPanelOptions, engine_button_requirement,
-        parse_replacement_targets, selected_mode_requirement,
+        AiRequirement, OcrEngine, OcrPanelOptions, PaddleVlVariant, engine_button_requirement, engine_marker,
+        paddle_vl_variant_label, parse_replacement_targets, selected_mode_requirement,
     };
 
     #[test]
@@ -1075,7 +1170,7 @@ mod tests {
 
     /// Every engine, spelled through an exhaustive match so a new variant fails to compile here
     /// until the truth table below covers it.
-    fn all_engines() -> [OcrEngine; 6] {
+    fn all_engines() -> [OcrEngine; 7] {
         let all = [
             OcrEngine::MangaOcr,
             OcrEngine::EasyOcr,
@@ -1083,6 +1178,7 @@ mod tests {
             OcrEngine::PaddleVl,
             OcrEngine::Surya,
             OcrEngine::AiApi,
+            OcrEngine::Baberu,
         ];
         for engine in all {
             match engine {
@@ -1091,7 +1187,8 @@ mod tests {
                 | OcrEngine::PaddleOcr
                 | OcrEngine::PaddleVl
                 | OcrEngine::Surya
-                | OcrEngine::AiApi => {}
+                | OcrEngine::AiApi
+                | OcrEngine::Baberu => {}
             }
         }
         all
@@ -1103,7 +1200,7 @@ mod tests {
         match engine {
             OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya => true,
             OcrEngine::MangaOcr => matches!(manga_model, "base_torch" | " BASE_TORCH "),
-            OcrEngine::PaddleOcr | OcrEngine::AiApi => false,
+            OcrEngine::PaddleOcr | OcrEngine::AiApi | OcrEngine::Baberu => false,
         }
     }
 
@@ -1176,5 +1273,31 @@ mod tests {
         let runtime = options.runtime_char_replacements();
         assert_eq!(runtime.len(), 1);
         assert_eq!(runtime[0].targets, vec!["…"]);
+    }
+
+    /// Baberu runs on onnxruntime (native or the backend's), never PyTorch.
+    #[test]
+    fn baberu_needs_onnx_and_is_marked_onnx() {
+        let baberu = OcrPanelOptions { engine: OcrEngine::Baberu, ..Default::default() };
+        assert_eq!(selected_mode_requirement(&baberu), Some(AiRequirement::Onnx));
+        assert_eq!(engine_button_requirement(OcrEngine::Baberu), Some(AiRequirement::Onnx));
+        assert_eq!(engine_marker(OcrEngine::Baberu), Some("ONNX"));
+    }
+
+    /// The variant dropdown shows one distinct localized label per variant, none of which
+    /// is the persisted key, and a fresh panel starts on the default variant.
+    #[test]
+    fn paddle_vl_variant_labels_are_distinct_and_default_is_official_1_6() {
+        assert_eq!(OcrPanelOptions::default().paddle_vl_model, PaddleVlVariant::Official16);
+        let labels: Vec<&str> = PaddleVlVariant::ALL.into_iter().map(paddle_vl_variant_label).collect();
+        // No catalog is installed in unit tests, so a label resolves to its key; catalog
+        // presence is checked by `ms-i18n`'s key-validation test.
+        for (variant, label) in PaddleVlVariant::ALL.into_iter().zip(&labels) {
+            assert_ne!(*label, variant.key());
+        }
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len());
     }
 }

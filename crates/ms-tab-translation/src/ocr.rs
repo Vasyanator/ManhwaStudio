@@ -29,12 +29,23 @@
 //   then the optional ALL-CAPS -> sentence-case fix (`ocr_case_fix`).
 // - Вспомогательные функции: crop по UV, PNG-кодирование, сборка/разбор
 //   framed-заголовков `BackendClient`/`CallHandle` и JSON.
+// - External models (Baberu OCR, PaddleOCR-VL variants): `external_model_spec` names the
+//   pinned spec an engine needs; `gate_external_models` is the ONE pre-dispatch gate
+//   (load warmup and every non-AI-API recognize) that turns "not downloaded" into a
+//   localized error naming the panel's download button, and reports the missing spec
+//   (`OcrControllerEvent::ExternalModelMissing`) so the tab re-probes the panel's state and
+//   the button the error names is the one drawn. Nothing here downloads them; the
+//   download controller is `ocr_model_download.rs`. Baberu routes like MangaOCR/PaddleOCR:
+//   native ONNX (vision on the selected EP, decoders on CPU) under the native runtime + Safe
+//   guard, else backend `ocr.baberu`.
 // ============================================================================
 use ms_backend_ipc::{self as backend_ipc, CallError, CallHandle};
 use crate::backend_health::ai_backend_offline_error;
 use crate::ocr_case_fix;
 use ms_config as config;
 use ms_sysprobe::ai_models;
+use ms_sysprobe::ai_models::external::{ExternalModelSpec, ExternalModelStatus, external_model_status};
+use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, BaberuFiles, PaddleVlVariant, baberu_files};
 // Native ONNX Runtime OCR path (Phase 1: MangaOCR only). Desktop-only: the native
 // runtime + ORT loader depend on `ms-onnx`/`ort`, which are not part of the web build.
 #[cfg(not(target_arch = "wasm32"))]
@@ -98,6 +109,9 @@ pub enum OcrEngine {
     PaddleVl,
     Surya,
     AiApi,
+    /// Baberu OCR: native ONNX (vision on the selected EP, decoders on CPU) with a backend
+    /// `ocr.baberu` fallback; ja/zh/en only.
+    Baberu,
 }
 
 impl OcrEngine {
@@ -111,6 +125,7 @@ impl OcrEngine {
             OcrEngine::PaddleOcr => Some(protocol::METHOD_OCR_PADDLE),
             OcrEngine::PaddleVl => Some(protocol::METHOD_OCR_PADDLE_VL),
             OcrEngine::Surya => Some(protocol::METHOD_OCR_SURYA),
+            OcrEngine::Baberu => Some(protocol::METHOD_OCR_BABERU),
             OcrEngine::AiApi => None,
         }
     }
@@ -125,6 +140,8 @@ pub struct OcrRuntimeOptions {
     pub manga_model: String,
     pub paddle_lang: String,
     pub paddle_vl_script: String,
+    /// Selected PaddleOCR-VL weights (`paddle_vl_model` on the wire, `key()` form).
+    pub paddle_vl_model: PaddleVlVariant,
     pub easy_langs: String,
     pub surya_task_name: String,
     pub surya_recognize_math: bool,
@@ -247,6 +264,10 @@ pub enum OcrControllerEvent {
     RecognizeCancelled {
         request_id: u64,
     },
+    /// The pre-dispatch gate found this external model not installed (the load or
+    /// recognize also fails with the "not downloaded" error): the tab re-probes its
+    /// download state so the panel shows the button that error names.
+    ExternalModelMissing(&'static ExternalModelSpec),
 }
 
 #[derive(Debug)]
@@ -352,6 +373,9 @@ impl TranslationOcrController {
         let mut out = Vec::new();
         for _ in 0..OCR_EVENT_POLL_BUDGET {
             match self.evt_rx.try_recv() {
+                Ok(WorkerEvent::ExternalModelMissing(spec)) => {
+                    out.push(OcrControllerEvent::ExternalModelMissing(spec));
+                }
                 Ok(WorkerEvent::ModelDownloadStarted) => {
                     if self.state != OcrLoadState::DownloadingModel {
                         self.set_state(OcrLoadState::DownloadingModel);
@@ -460,6 +484,8 @@ enum WorkerCommand {
 
 #[derive(Debug)]
 enum WorkerEvent {
+    /// Sent by the external-model gate right before the error it causes.
+    ExternalModelMissing(&'static ExternalModelSpec),
     ModelDownloadStarted,
     BackendLoadStarted,
     LoadOk,
@@ -510,6 +536,9 @@ fn warmup_ocr_engine(
     if engine == OcrEngine::AiApi {
         return validate_ai_api_options(options).map(|_target| ());
     }
+    // External models are never downloaded implicitly: a missing Baberu / PaddleOCR-VL
+    // model fails the load here, on both routes, with the error naming the panel button.
+    let model_dirs = gate_external_models(engine, options, evt_tx)?;
 
     // Route-aware readiness gate. When the active route is the native ONNX Runtime,
     // the Python backend is NOT required: native inference lazy-loads the runtime +
@@ -528,7 +557,7 @@ fn warmup_ocr_engine(
         return Ok(());
     }
 
-    warmup_backend_ocr_engine(engine, options, evt_tx)
+    warmup_backend_ocr_engine(engine, options, &model_dirs, evt_tx)
 }
 
 /// Whether an OCR route requires warming the Python backend at load time.
@@ -539,7 +568,7 @@ fn warmup_ocr_engine(
 #[cfg(not(target_arch = "wasm32"))]
 fn ocr_route_needs_backend_warmup(route: OcrRoute) -> bool {
     match route {
-        OcrRoute::NativeManga(_) | OcrRoute::NativePaddle => false,
+        OcrRoute::NativeManga(_) | OcrRoute::NativePaddle | OcrRoute::NativeBaberu => false,
         OcrRoute::Backend => true,
     }
 }
@@ -547,6 +576,7 @@ fn ocr_route_needs_backend_warmup(route: OcrRoute) -> bool {
 fn warmup_backend_ocr_engine(
     engine: OcrEngine,
     options: &OcrRuntimeOptions,
+    model_dirs: &ExternalModelDirs,
     evt_tx: &Sender<WorkerEvent>,
 ) -> Result<(), String> {
     ensure_backend_ocr_models(engine, options, evt_tx)?;
@@ -557,7 +587,7 @@ fn warmup_backend_ocr_engine(
         .ok_or_else(|| t!("translation.ocr.method_not_set_error").to_string())?;
     // Warm the per-engine worker/model by recognizing a tiny throwaway image.
     // The header carries the engine params; the blob carries the raw PNG bytes.
-    let header_fields = ocr_header_fields(options, true, false);
+    let header_fields = ocr_header_fields(options, model_dirs, true, false)?;
     let dummy_png = dummy_warmup_png()?;
     // A warmup that races against a cancel just returns; treat that as success
     // (the model still got touched). Errors/transport are surfaced normally.
@@ -572,17 +602,43 @@ fn warmup_backend_ocr_engine(
 /// method. The backend reads only the fields its method needs and ignores the
 /// rest, so sending the full superset keeps a single builder for all engines.
 /// The image itself is NOT in the header — it travels as the request blob.
+///
+/// `model_dirs` carries the resolved external models: `paddle_vl_model_dir` (absolute
+/// checkpoint directory, `ocr.paddle_vl` requires it) and `baberu_model_files`
+/// (`{vision, prefill, step, vocab}` absolute paths, `ocr.baberu` requires it); each is
+/// `null` when not resolved for this request.
+///
+/// # Errors
+/// A model path that is not valid UTF-8 (it could not be sent without being mangled, so
+/// it is rejected instead of lossily converted).
 fn ocr_header_fields(
     options: &OcrRuntimeOptions,
+    model_dirs: &ExternalModelDirs,
     join_newlines: bool,
     reflect_strings: bool,
-) -> Value {
-    json!({
+) -> Result<Value, String> {
+    let paddle_vl_model_dir = model_dirs.paddle_vl.as_deref().map(wire_path).transpose()?;
+    let baberu_model_files = model_dirs
+        .baberu
+        .as_ref()
+        .map(|files| -> Result<Value, String> {
+            Ok(json!({
+                "vision": wire_path(&files.vision)?,
+                "prefill": wire_path(&files.prefill)?,
+                "step": wire_path(&files.step)?,
+                "vocab": wire_path(&files.vocab)?,
+            }))
+        })
+        .transpose()?;
+    Ok(json!({
         "join_newlines": join_newlines,
         "reflect_strings": reflect_strings,
         "manga_model": options.manga_model,
         "paddle_lang": options.paddle_lang,
         "paddle_vl_script": options.paddle_vl_script,
+        "paddle_vl_model": options.paddle_vl_model.key(),
+        "paddle_vl_model_dir": paddle_vl_model_dir,
+        "baberu_model_files": baberu_model_files,
         "easy_langs": options.easy_langs,
         "surya_task_name": options.surya_task_name,
         "surya_recognize_math": options.surya_recognize_math,
@@ -590,7 +646,113 @@ fn ocr_header_fields(
         "surya_drop_repeated_text": options.surya_drop_repeated_text,
         "surya_max_sliding_window": non_zero_u32_to_option(options.surya_max_sliding_window),
         "surya_max_tokens": non_zero_u32_to_option(options.surya_max_tokens)
+    }))
+}
+
+/// A model path as a wire string; never lossy.
+fn wire_path(path: &Path) -> Result<&str, String> {
+    path.to_str().ok_or_else(|| tf!("translation.ocr.model_path_not_utf8_error", path = path.display()))
+}
+
+/// The resolved on-disk locations of the external models one OCR request needs. Empty
+/// (`Default`) for engines without an external model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExternalModelDirs {
+    /// Installed directory of the selected PaddleOCR-VL variant.
+    pub paddle_vl: Option<PathBuf>,
+    /// Installed Baberu OCR files.
+    pub baberu: Option<BaberuFiles>,
+}
+
+/// The pinned external model `engine` needs (`paddle_vl` picks the PaddleOCR-VL variant),
+/// or `None` for engines whose models are app-managed elsewhere or library-managed.
+/// Single owner of the engine -> external spec mapping (gate, panel download block, tab
+/// status probes).
+pub(crate) fn external_model_spec(engine: OcrEngine, paddle_vl: PaddleVlVariant) -> Option<&'static ExternalModelSpec> {
+    match engine {
+        OcrEngine::Baberu => Some(&BABERU_OCR),
+        OcrEngine::PaddleVl => Some(paddle_vl.spec()),
+        OcrEngine::MangaOcr | OcrEngine::EasyOcr | OcrEngine::PaddleOcr | OcrEngine::Surya | OcrEngine::AiApi => None,
+    }
+}
+
+/// The pre-dispatch gate under the real `side_models` root. Worker thread only (stats files).
+///
+/// # Errors
+/// See [`gate_external_models_in`].
+fn gate_external_models(
+    engine: OcrEngine,
+    options: &OcrRuntimeOptions,
+    evt_tx: &Sender<WorkerEvent>,
+) -> Result<ExternalModelDirs, String> {
+    gate_external_models_in(&config::side_models_dir(), engine, options, evt_tx)
+}
+
+/// [`resolve_external_model_dirs_in`] plus the miss report: when the model is not
+/// installed, `WorkerEvent::ExternalModelMissing(spec)` is sent BEFORE the caller publishes
+/// the error, so the tab re-probes the panel state in the same poll.
+///
+/// # Errors
+/// See [`resolve_external_model_dirs_in`].
+fn gate_external_models_in(
+    side_models_root: &Path,
+    engine: OcrEngine,
+    options: &OcrRuntimeOptions,
+    evt_tx: &Sender<WorkerEvent>,
+) -> Result<ExternalModelDirs, String> {
+    resolve_external_model_dirs_in(side_models_root, engine, options).inspect_err(|_| {
+        // Only an external-model engine can fail the gate, so the spec is always `Some`.
+        if let Some(spec) = external_model_spec(engine, options.paddle_vl_model)
+            && evt_tx.send(WorkerEvent::ExternalModelMissing(spec)).is_err()
+        {
+            ms_log::runtime_log::log_info(format!("[ocr] controller gone; cannot report missing model '{}'", spec.id));
+        }
     })
+}
+
+/// Resolves the installed external model of `engine` under `side_models_root` (stat-only,
+/// never downloads). Engines without an external model get `ExternalModelDirs::default()`.
+///
+/// # Errors
+/// The localized "model is not downloaded" message naming the exact download / resume
+/// button the OCR panel shows for the model's current state.
+fn resolve_external_model_dirs_in(
+    side_models_root: &Path,
+    engine: OcrEngine,
+    options: &OcrRuntimeOptions,
+) -> Result<ExternalModelDirs, String> {
+    let Some(spec) = external_model_spec(engine, options.paddle_vl_model) else {
+        return Ok(ExternalModelDirs::default());
+    };
+    match external_model_status(side_models_root, spec) {
+        ExternalModelStatus::Installed => {}
+        status @ (ExternalModelStatus::Partial { .. } | ExternalModelStatus::Missing) => {
+            ms_log::runtime_log::log_info(format!(
+                "[ocr] external model '{}' is not installed ({status:?}); asking the user to download it",
+                spec.id
+            ));
+            return Err(model_not_downloaded_error(spec, status));
+        }
+    }
+    let dir = spec.local_dir(side_models_root);
+    Ok(match engine {
+        OcrEngine::Baberu => ExternalModelDirs { baberu: Some(baberu_files(&dir)), ..ExternalModelDirs::default() },
+        OcrEngine::PaddleVl => ExternalModelDirs { paddle_vl: Some(dir), ..ExternalModelDirs::default() },
+        // `external_model_spec` returned `None` for these, so they returned above.
+        OcrEngine::MangaOcr | OcrEngine::EasyOcr | OcrEngine::PaddleOcr | OcrEngine::Surya | OcrEngine::AiApi => {
+            ExternalModelDirs::default()
+        }
+    })
+}
+
+/// The localized "not downloaded" error for `spec` in `status`, naming the button the
+/// panel shows for that state ("Download (size)" or "Resume download (done of total)").
+/// The caption comes from `ocr_model_download::download_label_for_status`, the panel's own
+/// owner of the visible caption; the tab re-probes the panel on the accompanying
+/// `ExternalModelMissing`, so both read the same disk state.
+fn model_not_downloaded_error(spec: &ExternalModelSpec, status: ExternalModelStatus) -> String {
+    let button = crate::ocr_model_download::download_label_for_status(spec, status);
+    tf!("translation.ocr.model_not_downloaded_error", button = button)
 }
 
 /// v2 readiness gate replacing the legacy HTTP `/health` precondition. A
@@ -729,6 +891,9 @@ enum OcrRoute {
     /// Run PaddleOCR natively via the in-process ONNX Runtime (language from the
     /// request options).
     NativePaddle,
+    /// Run Baberu OCR natively (vision on the selected EP, decoders on CPU) on the files
+    /// resolved by the gate.
+    NativeBaberu,
     /// Run through the Python backend (the historical path).
     Backend,
 }
@@ -740,7 +905,7 @@ enum OcrRoute {
 /// MangaOCR routes to [`OcrRoute::NativeManga`] iff `manga_model_key` maps to an
 /// ONNX export (`base_onnx`/`2025_onnx`; `base_torch` has no native path);
 /// PaddleOCR always routes to [`OcrRoute::NativePaddle`] (every paddle language has
-/// a native path). Every other engine, and every non-native/Suspect case, routes
+/// a native path) and Baberu OCR to [`OcrRoute::NativeBaberu`]. Every other engine, and every non-native/Suspect case, routes
 /// to [`OcrRoute::Backend`], so an unrecognized or torch-only selection never
 /// silently takes the native path.
 fn ocr_route(
@@ -760,6 +925,7 @@ fn ocr_route(
             None => OcrRoute::Backend,
         },
         OcrEngine::PaddleOcr => OcrRoute::NativePaddle,
+        OcrEngine::Baberu => OcrRoute::NativeBaberu,
         // These engines have no native path yet; they use the Python backend.
         OcrEngine::EasyOcr
         | OcrEngine::PaddleVl
@@ -773,8 +939,8 @@ fn ocr_route(
 ///
 /// This is the single source of truth the UI readiness gates consult. It reuses
 /// [`ocr_route`] so it can never disagree with the actual dispatch: a native
-/// route (MangaOCR ONNX or PaddleOCR under the native runtime with a non-`Suspect`
-/// guard) needs NO backend and returns `false`; every backend-routed engine/model
+/// route (MangaOCR ONNX, PaddleOCR or Baberu OCR under the native runtime with a
+/// non-`Suspect` guard) needs NO backend and returns `false`; every backend-routed engine/model
 /// returns `true`. `AiApi` is special-cased to `false` because it runs over `genai`
 /// and never touches the backend socket (its `ocr_route` value is `Backend` only
 /// because `OcrRoute` has no AI-API variant). A `Suspect` guard falls back to the
@@ -791,7 +957,7 @@ pub(crate) fn ocr_requires_backend(
         return false;
     }
     match ocr_route(runtime, engine, manga_model_key, guard) {
-        OcrRoute::NativeManga(_) | OcrRoute::NativePaddle => false,
+        OcrRoute::NativeManga(_) | OcrRoute::NativePaddle | OcrRoute::NativeBaberu => false,
         OcrRoute::Backend => true,
     }
 }
@@ -845,7 +1011,7 @@ fn log_native_fallback_once() {
     if !LOGGED.swap(true, Ordering::Relaxed) {
         ms_log::runtime_log::log_info(
             "[ocr] native AI runtime selected but the current OCR engine/model has no native path \
-             (native covers MangaOCR ONNX + PaddleOCR); using the Python backend.",
+             (native covers MangaOCR ONNX + PaddleOCR + Baberu OCR); using the Python backend.",
         );
     }
 }
@@ -891,7 +1057,8 @@ enum NativeOcrOutcome {
     Failed(String),
 }
 
-/// Attempts the native ONNX Runtime OCR path (MangaOCR or PaddleOCR) for `request`.
+/// Attempts the native ONNX Runtime OCR path (MangaOCR, PaddleOCR or Baberu OCR) for
+/// `request`; `model_dirs` is the gate's resolution (Baberu reads its files from it).
 ///
 /// Returns [`NativeOcrOutcome::Ok`] on success, [`NativeOcrOutcome::NotNative`]
 /// when the request has no native path (so the backend handles it), and
@@ -903,6 +1070,7 @@ enum NativeOcrOutcome {
 #[cfg(not(target_arch = "wasm32"))]
 fn try_native_ocr(
     request: &OcrRecognizeRequest,
+    model_dirs: &ExternalModelDirs,
     page_cache: &mut PageImageCache,
     evt_tx: &Sender<WorkerEvent>,
 ) -> NativeOcrOutcome {
@@ -955,6 +1123,12 @@ fn try_native_ocr(
             native_runtime::recognize_paddle(&request.options.paddle_lang, &rgba, &mut progress)
                 .map(|lines| lines.join("\n"))
         }
+        OcrRoute::NativeBaberu => match model_dirs.baberu.as_ref() {
+            Some(files) => native_runtime::recognize_baberu(&baberu_model_paths(files), &rgba, &mut progress),
+            // The gate resolves Baberu files before any Baberu dispatch; without them the
+            // model is simply not installed.
+            None => return NativeOcrOutcome::Failed(model_not_downloaded_error(&BABERU_OCR, ExternalModelStatus::Missing)),
+        },
         // `Backend` is handled above; unreachable here but matched exhaustively.
         OcrRoute::Backend => return NativeOcrOutcome::NotNative,
     };
@@ -986,7 +1160,20 @@ fn native_ocr_engine_label(route: OcrRoute) -> &'static str {
     match route {
         OcrRoute::NativeManga(_) => "MangaOCR",
         OcrRoute::NativePaddle => "PaddleOCR",
+        OcrRoute::NativeBaberu => "Baberu OCR",
         OcrRoute::Backend => "OCR",
+    }
+}
+
+/// The catalog's resolved Baberu files as the native runtime's path set (the runtime owns
+/// no layout; the catalog does).
+#[cfg(not(target_arch = "wasm32"))]
+fn baberu_model_paths(files: &BaberuFiles) -> native_runtime::BaberuModelPaths {
+    native_runtime::BaberuModelPaths {
+        vision: files.vision.clone(),
+        prefill: files.prefill.clone(),
+        step: files.step.clone(),
+        vocab: files.vocab.clone(),
     }
 }
 
@@ -1038,14 +1225,21 @@ fn run_recognize_command(
             return publish_recognize(request_id, result, evt_tx);
         }
 
-        // Native ONNX Runtime route (MangaOCR + PaddleOCR). On success we publish
+        // The external-model gate runs before the route decision, so a missing Baberu /
+        // PaddleOCR-VL model fails the same way on the native and the backend route.
+        let model_dirs = match gate_external_models(request.engine, &request.options, evt_tx) {
+            Ok(dirs) => dirs,
+            Err(error) => return publish_recognize(request_id, Err(error), evt_tx),
+        };
+
+        // Native ONNX Runtime route (MangaOCR + PaddleOCR + Baberu OCR). On success we publish
         // the native result. On a native failure we preserve the fallback contract
         // ONLY when the backend is up; when the backend is offline we surface the
         // real native error instead of falling through to the misleading
         // "backend offline" message. A non-native op falls through to the backend.
         // Desktop-only: the native runtime is compiled out on the web build.
         #[cfg(not(target_arch = "wasm32"))]
-        match try_native_ocr(&request, page_cache, evt_tx) {
+        match try_native_ocr(&request, &model_dirs, page_cache, evt_tx) {
             NativeOcrOutcome::Ok(mut result) => {
                 apply_post_ocr_processing(&mut result, &request);
                 return publish_recognize(request_id, Ok(result), evt_tx);
@@ -1062,7 +1256,7 @@ fn run_recognize_command(
             }
         }
 
-        match run_backend_recognize(&request, page_cache, cmd_rx) {
+        match run_backend_recognize(&request, &model_dirs, page_cache, cmd_rx) {
             BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(result)) => {
                 let result = result.map(|mut result| {
                     apply_post_ocr_processing(&mut result, &request);
@@ -1102,6 +1296,7 @@ enum BackendRecognizeFlow {
 /// request if one arrives.
 fn run_backend_recognize(
     request: &OcrRecognizeRequest,
+    model_dirs: &ExternalModelDirs,
     page_cache: &mut PageImageCache,
     cmd_rx: &Receiver<WorkerCommand>,
 ) -> BackendRecognizeFlow {
@@ -1123,11 +1318,10 @@ fn run_backend_recognize(
         Ok(png) => png,
         Err(err) => return BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(Err(err))),
     };
-    let header_fields = ocr_header_fields(
-        &request.options,
-        request.join_newlines,
-        request.reflect_strings,
-    );
+    let header_fields = match ocr_header_fields(&request.options, model_dirs, request.join_newlines, request.reflect_strings) {
+        Ok(fields) => fields,
+        Err(err) => return BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(Err(err))),
+    };
 
     // Begin the call (with a bounded transport retry), obtaining a cancellable
     // handle. Keep the client + id so a superseding selection can cancel by id.
@@ -1257,9 +1451,10 @@ fn ensure_backend_ocr_models_inner(
                 ai_models::ensure_manga_ocr_onnx_with_reporter(&models_root, model, reporter)?;
             }
         }
-        // PaddleVl (Transformers) downloads its weights through the Hugging Face
-        // hub cache on first use, like EasyOCR/Surya; no app-managed model tree.
-        OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya | OcrEngine::AiApi => {}
+        // PaddleOCR-VL and Baberu use pinned external models that only the panel's explicit
+        // download installs (`gate_external_models` gates them; nothing is fetched
+        // here). EasyOCR/Surya keep their library-managed caches; AI API has no local model.
+        OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya | OcrEngine::Baberu | OcrEngine::AiApi => {}
     }
     Ok(())
 }
@@ -1576,7 +1771,7 @@ mod tests {
         AiApiService, CallError, CharReplacementRule, OcrEngine, OcrRecognizeResult,
         OcrRecognizeRequest, OcrRoute, OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements,
         apply_post_ocr_processing, assemble_native_ocr_result, interpret_call_result,
-        native_failure_should_surface, ocr_header_fields,
+        ExternalModelDirs, native_failure_should_surface, ocr_header_fields,
         ocr_requires_backend, ocr_route, ocr_route_needs_backend_warmup, parse_ocr_response,
     };
     use ms_sysprobe::ai_models::MangaOcrOnnxModel;
@@ -1589,6 +1784,7 @@ mod tests {
             manga_model: "base".to_string(),
             paddle_lang: "korean_v5".to_string(),
             paddle_vl_script: "korean".to_string(),
+            paddle_vl_model: super::PaddleVlVariant::MangaJa,
             easy_langs: "ko".to_string(),
             surya_task_name: "ocr_without_boxes".to_string(),
             surya_recognize_math: false,
@@ -1696,14 +1892,20 @@ mod tests {
             OcrEngine::Surya.backend_method(),
             Some(protocol::METHOD_OCR_SURYA)
         );
+        assert_eq!(
+            OcrEngine::Baberu.backend_method(),
+            Some(protocol::METHOD_OCR_BABERU)
+        );
         assert_eq!(OcrEngine::AiApi.backend_method(), None);
         assert!(OcrEngine::Surya.requires_backend());
+        assert!(OcrEngine::Baberu.requires_backend());
         assert!(!OcrEngine::AiApi.requires_backend());
     }
 
     #[test]
     fn ocr_header_fields_carry_params_not_image() {
-        let header = ocr_header_fields(&sample_options(), false, true);
+        let header = ocr_header_fields(&sample_options(), &ExternalModelDirs::default(), false, true)
+            .expect("no model paths to convert");
         // Engine params live inline in the header (the image is NOT here — it
         // travels as the request blob).
         assert_eq!(header["join_newlines"], json!(false));
@@ -1726,7 +1928,8 @@ mod tests {
     fn request_header_uses_engine_method_and_keeps_params() {
         // Mirror what begin_call/request_header produce on the wire: method +
         // reserved fields plus the inline engine params.
-        let header_fields = ocr_header_fields(&sample_options(), true, false);
+        let header_fields = ocr_header_fields(&sample_options(), &ExternalModelDirs::default(), true, false)
+            .expect("no model paths to convert");
         let wire = protocol::request_header(
             7,
             OcrEngine::EasyOcr.backend_method().unwrap(),
@@ -1988,6 +2191,7 @@ mod tests {
             MangaOcrOnnxModel::Model2025
         )));
         assert!(!ocr_route_needs_backend_warmup(OcrRoute::NativePaddle));
+        assert!(!ocr_route_needs_backend_warmup(OcrRoute::NativeBaberu));
         assert!(ocr_route_needs_backend_warmup(OcrRoute::Backend));
     }
 
@@ -2004,6 +2208,7 @@ mod tests {
                 OcrEngine::PaddleVl,
                 OcrEngine::Surya,
                 OcrEngine::AiApi,
+                OcrEngine::Baberu,
             ] {
                 assert_eq!(
                     ocr_requires_backend(engine, "base_onnx", AiRuntime::Backend, guard),
@@ -2145,5 +2350,174 @@ mod tests {
         let empty = super::ai_api_ocr_validation(&answer("<think>the crop is blurry, maybe"), 0);
         assert_eq!(empty.value, "");
         assert_eq!(empty.repair.map(|repair| repair.reason), Some(RetryReason::Empty));
+    }
+
+    /// Every engine, spelled through an exhaustive match so a new variant fails to compile
+    /// here until the routing matrix below covers it.
+    fn all_engines() -> [OcrEngine; 7] {
+        let all = [
+            OcrEngine::MangaOcr,
+            OcrEngine::EasyOcr,
+            OcrEngine::PaddleOcr,
+            OcrEngine::PaddleVl,
+            OcrEngine::Surya,
+            OcrEngine::AiApi,
+            OcrEngine::Baberu,
+        ];
+        for engine in all {
+            match engine {
+                OcrEngine::MangaOcr
+                | OcrEngine::EasyOcr
+                | OcrEngine::PaddleOcr
+                | OcrEngine::PaddleVl
+                | OcrEngine::Surya
+                | OcrEngine::AiApi
+                | OcrEngine::Baberu => {}
+            }
+        }
+        all
+    }
+
+    /// The full runtime x guard x engine matrix (MangaOCR with an ONNX export): native only
+    /// for the native runtime with a Safe guard, and only for the three native engines.
+    #[test]
+    fn routing_matrix_covers_every_runtime_guard_and_engine() {
+        for runtime in [AiRuntime::Native, AiRuntime::Backend] {
+            for guard in [OrtLoadDecision::Safe, OrtLoadDecision::Suspect] {
+                for engine in all_engines() {
+                    let native = runtime == AiRuntime::Native && guard == OrtLoadDecision::Safe;
+                    let expected = match engine {
+                        OcrEngine::MangaOcr if native => OcrRoute::NativeManga(MangaOcrOnnxModel::Base),
+                        OcrEngine::PaddleOcr if native => OcrRoute::NativePaddle,
+                        OcrEngine::Baberu if native => OcrRoute::NativeBaberu,
+                        OcrEngine::MangaOcr
+                        | OcrEngine::PaddleOcr
+                        | OcrEngine::Baberu
+                        | OcrEngine::EasyOcr
+                        | OcrEngine::PaddleVl
+                        | OcrEngine::Surya
+                        | OcrEngine::AiApi => OcrRoute::Backend,
+                    };
+                    assert_eq!(
+                        ocr_route(runtime, engine, "base_onnx", guard),
+                        expected,
+                        "runtime {runtime:?} guard {guard:?} engine {engine:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Baberu on the native route needs no backend (its AiButton gating must not wait on
+    /// backend health); on any backend route it does.
+    #[test]
+    fn baberu_requires_backend_only_off_the_native_route() {
+        assert!(!ocr_requires_backend(OcrEngine::Baberu, "", AiRuntime::Native, OrtLoadDecision::Safe));
+        assert!(ocr_requires_backend(OcrEngine::Baberu, "", AiRuntime::Native, OrtLoadDecision::Suspect));
+        assert!(ocr_requires_backend(OcrEngine::Baberu, "", AiRuntime::Backend, OrtLoadDecision::Safe));
+    }
+
+    #[test]
+    fn external_model_spec_maps_only_baberu_and_paddle_vl() {
+        use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant};
+        for engine in all_engines() {
+            for variant in PaddleVlVariant::ALL {
+                let spec = super::external_model_spec(engine, variant);
+                match engine {
+                    OcrEngine::Baberu => assert_eq!(spec.map(|s| s.id), Some(BABERU_OCR.id)),
+                    OcrEngine::PaddleVl => assert_eq!(spec.map(|s| s.id), Some(variant.spec().id)),
+                    OcrEngine::MangaOcr
+                    | OcrEngine::EasyOcr
+                    | OcrEngine::PaddleOcr
+                    | OcrEngine::Surya
+                    | OcrEngine::AiApi => assert!(spec.is_none(), "{engine:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_carries_resolved_model_paths_and_variant_key() {
+        use ms_sysprobe::ai_models::external_catalog::baberu_files;
+        let dirs = ExternalModelDirs {
+            paddle_vl: Some(std::path::PathBuf::from("/models/side_models/PaddleOCR-VL/manga_ja")),
+            baberu: Some(baberu_files(std::path::Path::new("/models/side_models/BaberuOCR"))),
+        };
+        let header = ocr_header_fields(&sample_options(), &dirs, true, false).expect("utf-8 paths");
+        assert_eq!(header["paddle_vl_model"], json!("manga_ja"));
+        assert_eq!(header["paddle_vl_model_dir"], json!("/models/side_models/PaddleOCR-VL/manga_ja"));
+        let files = &header["baberu_model_files"];
+        let expected = baberu_files(std::path::Path::new("/models/side_models/BaberuOCR"));
+        assert_eq!(files["vision"], json!(expected.vision.to_str().expect("utf-8")));
+        assert_eq!(files["prefill"], json!(expected.prefill.to_str().expect("utf-8")));
+        assert_eq!(files["step"], json!(expected.step.to_str().expect("utf-8")));
+        assert_eq!(files["vocab"], json!(expected.vocab.to_str().expect("utf-8")));
+
+        // Without resolved models both fields are explicit nulls (the backend ignores them
+        // for other methods; `ocr.paddle_vl` / `ocr.baberu` never get here unresolved).
+        let bare = ocr_header_fields(&sample_options(), &ExternalModelDirs::default(), true, false).expect("no paths");
+        assert_eq!(bare["paddle_vl_model_dir"], Value::Null);
+        assert_eq!(bare["baberu_model_files"], Value::Null);
+        assert_eq!(bare["paddle_vl_model"], json!("manga_ja"));
+    }
+
+    /// A model path that is not UTF-8 must be rejected, never sent lossily.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_model_path_is_a_header_error() {
+        use std::os::unix::ffi::OsStrExt;
+        let bad = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/models/\xff\xfe"));
+        let dirs = ExternalModelDirs { paddle_vl: Some(bad), baberu: None };
+        assert!(ocr_header_fields(&sample_options(), &dirs, true, false).is_err());
+    }
+
+    /// The gate on a fresh (empty) `side_models` root: Baberu and every PaddleOCR-VL variant
+    /// fail with the localized "not downloaded" error naming the download button; engines
+    /// without an external model pass with empty dirs. Stat-only, nothing is written.
+    #[test]
+    fn gate_reports_not_downloaded_on_an_empty_root() {
+        use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant};
+        let root = std::env::temp_dir().join(format!("ms_tab_translation_gate_{}_absent", std::process::id()));
+        assert!(!root.exists(), "the probe root must not exist: {}", root.display());
+        let baberu = super::resolve_external_model_dirs_in(&root, OcrEngine::Baberu, &sample_options());
+        let missing = super::ExternalModelStatus::Missing;
+        let expected_button = crate::ocr_model_download::download_label_for_status(&BABERU_OCR, missing);
+        assert_eq!(baberu, Err(tf!("translation.ocr.model_not_downloaded_error", button = expected_button)));
+        for variant in PaddleVlVariant::ALL {
+            let options = super::OcrRuntimeOptions { paddle_vl_model: variant, ..sample_options() };
+            let result = super::resolve_external_model_dirs_in(&root, OcrEngine::PaddleVl, &options);
+            let button = crate::ocr_model_download::download_label_for_status(variant.spec(), missing);
+            assert_eq!(result, Err(tf!("translation.ocr.model_not_downloaded_error", button = button)), "{variant:?}");
+        }
+        for engine in [OcrEngine::MangaOcr, OcrEngine::EasyOcr, OcrEngine::PaddleOcr, OcrEngine::Surya, OcrEngine::AiApi] {
+            assert_eq!(
+                super::resolve_external_model_dirs_in(&root, engine, &sample_options()),
+                Ok(ExternalModelDirs::default()),
+                "{engine:?}"
+            );
+        }
+        assert!(!root.exists(), "the gate must not create anything");
+    }
+
+    /// M1: a gate miss reports WHICH spec is missing (so the tab re-probes the panel) before
+    /// the caller publishes the error; a pass, or an engine without an external model,
+    /// reports nothing.
+    #[test]
+    fn gate_miss_reports_the_missing_spec() {
+        use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant};
+        let root = std::env::temp_dir().join(format!("ms_tab_translation_gate_report_{}_absent", std::process::id()));
+        assert!(!root.exists(), "the probe root must not exist: {}", root.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(super::gate_external_models_in(&root, OcrEngine::Baberu, &sample_options(), &tx).is_err());
+        assert!(matches!(rx.try_recv(), Ok(super::WorkerEvent::ExternalModelMissing(spec)) if spec.id == BABERU_OCR.id));
+        let options = super::OcrRuntimeOptions { paddle_vl_model: PaddleVlVariant::MangaJa, ..sample_options() };
+        assert!(super::gate_external_models_in(&root, OcrEngine::PaddleVl, &options, &tx).is_err());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(super::WorkerEvent::ExternalModelMissing(spec)) if spec.id == PaddleVlVariant::MangaJa.spec().id
+        ));
+        assert!(super::gate_external_models_in(&root, OcrEngine::MangaOcr, &sample_options(), &tx).is_ok());
+        assert!(rx.try_recv().is_err(), "a pass reports nothing");
+        assert!(!root.exists(), "the gate must not create anything");
     }
 }

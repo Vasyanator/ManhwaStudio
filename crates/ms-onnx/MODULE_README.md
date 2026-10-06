@@ -5,9 +5,10 @@ Native ONNX Runtime inference infrastructure for ManhwaStudio. It is a pure,
 GUI-free layer over the `ort` bindings (v2.0.0-rc.12) in **load-dynamic** mode. It
 loads the onnxruntime shared library from a caller-supplied path, initializes the
 ort environment, and hosts the native inference engines: **MangaOCR**
-(`src/manga_ocr/`, exported as `MangaOcrEngine`) and **PaddleOCR** detection +
+(`src/manga_ocr/`, exported as `MangaOcrEngine`), **PaddleOCR** detection +
 recognition (`src/paddle_ocr/`, exported as `PaddleOcrEngine` / `PaddleDetector` /
-`PaddleRecognizer`). The crate never downloads anything and never reads app config:
+`PaddleRecognizer`) and **Baberu OCR** (`src/baberu_ocr/`, exported as
+`BaberuOcrEngine`; vision on the selected EP, decoders on CPU). The crate never downloads anything and never reads app config:
 callers pass the dylib path, the execution provider, and model/vocabulary/dict paths.
 
 ## Architecture
@@ -23,6 +24,9 @@ these `ort` entry points:
 - `ort::environment::current()` — creates the actual `OrtEnv` (onnxruntime
   `CreateEnv` + default allocator). Called from `warmup`, it executes real
   onnxruntime code.
+- `OrtRuntime::build_session_on(provider, model_path)` — the same build on another EP of
+  the loaded onnxruntime build with the runtime's device (Baberu vision: CUDA under a
+  TensorRT selection).
 - `OrtRuntime::build_session(model_path)` — builds a session with all graph
   optimizations and applies the committed execution provider: CPU registers
   nothing (byte-identical to the historical CPU-only builder);
@@ -49,8 +53,10 @@ unsupported-CPU SIGILL would surface.
 - `src/lib.rs`: the crate root public surface — `ExecutionProvider` (`id` /
   `is_available_on_current_platform`), `NativeDeviceSelection`
   (`Default`/`Index`/`OpenVinoDeviceType` + `index()`), `OrtError`, `OrtRuntime`
-  (`load` / `warmup` / `provider` / `device` / `device_id` / `build_session`) — plus
-  re-exports of `MangaOcrEngine`, the PaddleOCR types, and the free
+  (`load` / `warmup` / `provider` / `device` / `device_id` / `build_session` /
+  `build_session_on` / `build_session_cpu_only`) — plus re-exports of `MangaOcrEngine`,
+  `BaberuOcrEngine`, `BaberuVisionPlacement`,
+  the PaddleOCR types, and the free
   `paddle_recognize` pipeline function. Edit here for runtime/error-surface changes
   and execution-provider registration.
 - `src/manga_ocr/`: the native MangaOCR engine (`MangaOcrEngine`) — preprocess,
@@ -65,6 +71,12 @@ unsupported-CPU SIGILL would surface.
 - `tests/paddle_ocr_e2e.rs`: `#[ignore]` PaddleOCR end-to-end tests (detect + recognize, and
   the forward-only `forward_prob_maps` checked against `detect` and batch-vs-single); env
   vars in its header.
+- `src/baberu_ocr/`: the native Baberu OCR engine; see its `MODULE_README.md`.
+- `tests/baberu_ocr_e2e.rs`: opt-in (env-gated, skips with one line) Baberu parity test
+  against the Python reference strings in `fixtures/baberu/e2e_cases.json`.
+- `fixtures/baberu/`: committed Baberu fixtures (Pillow resize goldens, reference
+  non-content ids, four small sample crops + reference decodes), regenerated only by
+  `tools/make_baberu_fixtures.py`.
 
 ## Contracts and invariants
 - **Pure inference crate.** No egui/eframe, no application config, no path
@@ -84,8 +96,16 @@ unsupported-CPU SIGILL would surface.
   `<ep>` feature pulls `ort-sys/<ep>`, which conflicts with load-dynamic's
   `disable-linking`. The `ExecutionProvider` types compile on all targets; platform
   gating happens in `OrtRuntime::load`, not `build_session`.
-- **Extra dep:** `imageproc` 0.25-compatible (0.27) — pure Rust, used only by the
+- **Extra deps:** `imageproc` 0.25-compatible (0.27) — pure Rust, used only by the
   PaddleOCR path (contours, min-area-rect, perspective warp). No OpenCV/Clipper.
+  `serde_json` + `unicode-general-category` (`no_std`, pure Rust) — the Baberu vocabulary
+  and its L*/N* content classification.
+- **`build_session_cpu_only`** builds with the same options as `build_session` but
+  registers no EP and ignores the device, for graphs that are CPU-oriented on every build:
+  Baberu's two int8 decoders (vision on the selected EP, decoders on CPU — why: int8
+  decoder ops fall back to CPU on GPU EPs; benchmark 2026-10-06) and the CPU retry of a
+  Baberu vision session whose provider build failed. Every other graph uses
+  `build_session`.
 - **No panics on bad input.** `load` maps a missing file to
   `OrtError::LibraryNotFound`, a load/ABI failure to `OrtError::LoadFailed`, and a
   provider unavailable on the current `cfg(target_os)` to
@@ -115,7 +135,10 @@ unsupported-CPU SIGILL would surface.
 - To add a new execution provider, extend `ExecutionProvider` (add an `id` arm, a
   platform-gating arm, and a `build_session` registration arm — all three matches
   are exhaustive, no `_`).
-- To change how sessions apply the provider, edit `OrtRuntime::build_session`.
+- To change how sessions apply the provider, edit `OrtRuntime::build_session` /
+  `execution_provider_dispatch`; the shared session options live in the private
+  `build_session_with`.
+- To change Baberu OCR inference, edit `src/baberu_ocr/` (see its `MODULE_README.md`).
 - The accelerator selection is threaded through `OrtRuntime` as `device`
   (`NativeDeviceSelection`, set at `load`, read back via `device()`; `device_id()`
   is a convenience projecting only `Index(id)` to `Some(id)`). To change which

@@ -13,10 +13,11 @@ Several unrelated concerns live here:
   font-IDENTITY rules before the identity code ever sees the files. Run by hand when
   the bundle changes.
 - **fixture generation** (`make_ellipsis_ligature_fixture.py`,
-  `make_text_detect_fixtures.py`) — building committed test fixtures: the one test
-  font of `ms-text-render`, and the golden text-detector postprocess fixtures of
-  `ms-text-detect` recorded from the Python backend. Run by hand only when a
-  fixture's contract changes.
+  `make_text_detect_fixtures.py`, `make_baberu_fixtures.py`) — building committed test
+  fixtures: the one test font of `ms-text-render`, the golden text-detector postprocess
+  fixtures of `ms-text-detect` recorded from the Python backend, and the Baberu OCR
+  parity fixtures of `ms-onnx` recorded from Pillow and the upstream reference loop. Run
+  by hand only when a fixture's contract changes.
 - **`run-dev/`** — the source-run entry point (update from git, provision Rust,
   `cargo run`). Unlike everything else here it is aimed at **users**, not agents,
   and is invoked through the launchers in the project root. It has its own
@@ -184,7 +185,18 @@ detection cannot be fooled by punctuation inside strings or comments.
 - **`--apply` output is best-effort text surgery** and must be compiled + reviewed
   (notably the §C `id_salt` insertions and any `REVIEW`-flagged sites).
 
+- `make_baberu_fixtures.py`: records `crates/ms-onnx/fixtures/baberu/`. Always: the
+  Pillow BICUBIC resize goldens (`resize_cases.json`, xorshift32 PRNG inputs, sha256 of
+  the output); with `--vocab`: the reference non-content ids; with `--model-dir` +
+  `--font`: four sample crops rendered with that font and the upstream `onnx_infer.py`
+  loop's decode on the CPU EP (`e2e_cases.json`). The committed samples were rendered with
+  the bundled `fonts/ui/core/01-SourceHanSansK-Regular.otf`. Needs Pillow (and numpy +
+  onnxruntime for `--model-dir`), all in `venv/`. The docstring documents formats and the
+  PRNG contract that the Rust test reimplements.
+
 ## Editing map
+- To add a Baberu resize golden case or sample, edit `RESIZE_CASES` / `E2E_SAMPLES` in
+  `make_baberu_fixtures.py` and rerun it (Pillow and onnxruntime versions are recorded).
 - To add or change a text-detector fixture case, edit the `*_cases()` builders in
   `make_text_detect_fixtures.py`, rerun it, and update
   `crates/ms-text-detect/fixtures/README.md` if the case list or format changed.
