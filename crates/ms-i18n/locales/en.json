@@ -422,6 +422,8 @@
   "canvas.bottom_hint.translation.create_bubble_label": "Create bubble",
   "canvas.bottom_hint.translation.create_bubble_recent_char_keys": "2-6+T",
   "canvas.bottom_hint.translation.create_bubble_recent_char_label": "Create bubble with a recent character",
+  "canvas.bottom_hint.translation.create_hint_bubble_keys": "H",
+  "canvas.bottom_hint.translation.create_hint_bubble_label": "Create hint bubble",
   "canvas.bottom_hint.translation.create_image_bubble_crop_keys": "Shift+Q+drag LMB",
   "canvas.bottom_hint.translation.create_image_bubble_crop_label": "Create image bubble (page region)",
   "canvas.bottom_hint.translation.create_image_bubble_keys": "Q",

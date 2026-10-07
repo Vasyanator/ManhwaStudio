@@ -3959,6 +3959,10 @@ fn build_translation_hint_rows() -> Vec<CanvasHintRow> {
             t!("canvas.bottom_hint.translation.create_image_bubble_crop_keys"),
         ),
         CanvasHintRow::new(
+            t!("canvas.bottom_hint.translation.create_hint_bubble_label"),
+            t!("canvas.bottom_hint.translation.create_hint_bubble_keys"),
+        ),
+        CanvasHintRow::new(
             t!("canvas.bottom_hint.translation.delete_bubble_label"),
             t!("canvas.bottom_hint.translation.delete_bubble_keys"),
         ),
