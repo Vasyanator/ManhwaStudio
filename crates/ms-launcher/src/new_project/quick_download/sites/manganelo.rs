@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/manganelo.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/manganelo.rs
 
 Purpose:
 Chapter resolver for the manganelo mirror family, which serves four interchangeable domains
@@ -23,7 +23,7 @@ the marker names and the CDN join below are site-specific.
 
 use super::super::html::{collect_anchor_hrefs_containing, find_js_array_literal};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{normalize_network_url, path_contains};
 use serde_json::Value;
 
@@ -52,7 +52,7 @@ pub(crate) fn manganelo_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloa
     // origin, so it is derived from the chapter URL rather than hard-coded.
     let referer = normalize_network_url("/", &chapter_url);
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(referer),
     })
 }

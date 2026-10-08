@@ -3763,6 +3763,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sha2",
  "sys-locale",
  "tar",
  "tempfile",

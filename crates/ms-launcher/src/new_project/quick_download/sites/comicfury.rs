@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/comicfury.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/comicfury.rs
 
 Purpose:
 Chapter resolver for comicfury.com and its `*.thecomicseries.com` mirrors.
@@ -16,7 +16,7 @@ host, or from the subdomain on a mirror. Page images are recognized by a `/comic
 
 use super::super::html::{collect_anchor_hrefs_containing, extract_html_tags, get_html_attr};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{
     dedupe_preserve, extract_host, normalize_network_url, path_segments, query_param,
 };
@@ -72,7 +72,7 @@ pub(crate) fn comicfury_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloa
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: None,
     })
 }

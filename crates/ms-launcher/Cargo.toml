@@ -79,6 +79,8 @@ image.workspace = true
 rayon.workspace = true
 # Wall-clock and monotonic time in the download/progress reporting; wasm-safe.
 web-time.workspace = true
+# Quick download: verifies a page against the SHA-256 its site publishes (MangaDex file names).
+sha2.workspace = true
 
 # Native-only halves. The launcher owns a real OS window and reaches the network and the
 # filesystem; its wasm build keeps the module signatures and returns "unavailable on web"

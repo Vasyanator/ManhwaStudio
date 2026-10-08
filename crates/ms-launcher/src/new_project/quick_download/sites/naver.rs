@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/naver.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/naver.rs
 
 Purpose:
 Chapter resolver for comic.naver.com.
@@ -22,7 +22,7 @@ order. The CDN ignores a `?type=` parameter here, so the linked URL already is t
 
 use super::super::html::{extract_html_tags, get_html_attr};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, normalize_network_url, query_param};
 
 /// `id` prefix the viewer puts on every episode page image (`content_image_0`, ...); site
@@ -55,7 +55,7 @@ pub(crate) fn comic_naver_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownl
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: None,
     })
 }

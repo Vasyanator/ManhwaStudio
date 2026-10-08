@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/kaliscan.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/kaliscan.rs
 
 Purpose:
 Chapter resolver for kaliscan.me.
@@ -20,7 +20,7 @@ marker name and the comma splitting below are site-specific.
 
 use super::super::html::find_js_string_literal;
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::normalize_network_url;
 
 /// Site root a (normally absolute) page URL is resolved against, and the `Referer` the image
@@ -45,7 +45,7 @@ pub(crate) fn kaliscan_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownload
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(format!("{KALISCAN_ROOT}/")),
     })
 }

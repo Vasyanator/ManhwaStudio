@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/mangafreak.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/mangafreak.rs
 
 Purpose:
 Chapter resolver for mangafreak.
@@ -19,7 +19,7 @@ page image.
 
 use super::super::html::{extract_html_tags, get_html_attr};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, normalize_network_url};
 
 /// Host and path prefix every mangafreak page image starts with, scheme excluded so that both
@@ -41,7 +41,7 @@ pub(crate) fn mangafreak_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownlo
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         // Pages live on a different host than the chapter page, so they are requested with the
         // chapter page as `Referer`, the way a browser rendering that page would.
         referer: Some(url.to_string()),

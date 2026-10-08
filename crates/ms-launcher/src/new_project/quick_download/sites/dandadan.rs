@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/dandadan.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/dandadan.rs
 
 Purpose:
 Chapter resolver for dandadan.net.
@@ -20,7 +20,7 @@ figure at all, the pages are `<img>` elements with the `aligncenter` class inste
 
 use super::super::html::{extract_html_tags, get_html_attr};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, normalize_network_url};
 
 /// CSS class marking a page image on chapter pages that ship no `<figure>` container.
@@ -44,7 +44,7 @@ pub(crate) fn dandadan_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownload
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         // Requested with the chapter page as `Referer`, the way a browser rendering that page
         // would; the pages may be served from a separate media host.
         referer: Some(url.to_string()),

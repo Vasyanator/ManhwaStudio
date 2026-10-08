@@ -15,7 +15,9 @@ pub(crate) fn <site>_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadEr
 It receives the normalized chapter/series URL, performs whatever fetches that site needs
 (`super::super::http`), extracts the ordered page URLs, and returns a `SiteDownloadPlan` with the
 optional `Referer` the site's CDN requires. It must not download images itself — the controller does
-that.
+that. Pages are `PlannedImage`s: a site with a single origin wraps its list with
+`PlannedImage::from_urls`; a site that knows a mirror origin or a published digest fills
+`fallbacks` / `sha256` per page, and the controller's retry/fallback loop uses them.
 
 Every module is split into a thin `*_plan` that does the I/O and a PURE parser
 (`parse_<site>_images(...) -> Vec<String>`, plus any id/slug extraction) that takes already-fetched
@@ -25,7 +27,10 @@ text. The pure half is what the unit tests exercise, so no test touches the netw
 
 ## Files and submodules
 Sites whose page list comes from a JSON or GraphQL API:
-- `mangadex.rs`: mangadex.org `at-home` API, latest-chapter feed pick.
+- `mangadex.rs`: mangadex.org `at-home` API, latest-chapter feed pick. Primary URL on the
+  MangaDex@Home node from `baseUrl`, fallback on `uploads.mangadex.org`, SHA-256 from the page file
+  name (the official reader's scheme); the JSON -> plan step is the pure
+  `mangadex_plan_from_at_home`.
 - `weebdex.rs`: weebdex.org via `api.weebdex.org/chapter/{id}`; needs `Referer` + `Origin`.
 - `mangataro.rs`: mangataro.org `/auth/chapter-content?chapter_id=`.
 - `dankefuerslesen.rs`: danke.moe `/api/series/{slug}/`; URL `-` maps to JSON key `.`.

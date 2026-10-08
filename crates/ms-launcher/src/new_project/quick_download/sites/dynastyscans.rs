@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/dynastyscans.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/dynastyscans.rs
 
 Purpose:
 Chapter resolver for dynasty-scans.com.
@@ -20,7 +20,7 @@ marker name and the site root below are site-specific.
 
 use super::super::html::find_js_array_literal;
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::normalize_network_url;
 use serde_json::Value;
 
@@ -46,7 +46,7 @@ pub(crate) fn dynastyscans_plan(url: &str) -> Result<SiteDownloadPlan, QuickDown
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(format!("{DYNASTYSCANS_ROOT}/")),
     })
 }

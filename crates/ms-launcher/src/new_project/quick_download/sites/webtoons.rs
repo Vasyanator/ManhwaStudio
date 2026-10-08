@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/webtoons.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/webtoons.rs
 
 Purpose:
 Chapter resolver for webtoons.com (including the mobile host and Canvas/Challenge series).
@@ -31,7 +31,7 @@ un-recompressed original is downloaded rather than the site's display copy.
 
 use super::super::html::{extract_html_tags, get_html_attr, html_unescape};
 use super::super::http::{fetch_json_value, fetch_text};
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{
     dedupe_preserve, normalize_network_url, path_segments, query_param,
 };
@@ -77,7 +77,7 @@ pub(crate) fn webtoons_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownload
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(WEBTOONS_REFERER.to_string()),
     })
 }

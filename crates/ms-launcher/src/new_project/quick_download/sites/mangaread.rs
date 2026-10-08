@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/mangaread.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/mangaread.rs
 
 Purpose:
 Chapter resolver for mangaread.org.
@@ -24,7 +24,7 @@ is the following `entry-header` block, not the first closing `div`.
 
 use super::super::html::{extract_html_tags, get_html_attr, html_unescape};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, normalize_network_url, path_segments};
 
 /// Class of the container holding the page images.
@@ -57,7 +57,7 @@ pub(crate) fn mangaread_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloa
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(url.to_string()),
     })
 }

@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/kuaikan.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/kuaikan.rs
 
 Purpose:
 Chapter resolver for kuaikanmanhua.com.
@@ -15,7 +15,7 @@ http(s) strings.
 
 use super::super::html::collect_https_json_strings;
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, looks_like_image_url};
 
 /// Builds the download plan for a kuaikanmanhua.com topic or chapter URL.
@@ -46,7 +46,7 @@ pub(crate) fn kuaikan_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadE
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: None,
     })
 }

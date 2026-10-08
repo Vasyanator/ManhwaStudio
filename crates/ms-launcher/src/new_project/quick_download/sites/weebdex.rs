@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/weebdex.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/weebdex.rs
 
 Purpose:
 Chapter resolver for weebdex.org.
@@ -18,7 +18,7 @@ URLs are rejected: resolving a chapter list is out of scope for the quick downlo
 */
 
 use super::super::http::fetch_json_with_headers;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::path_segment_after;
 use serde_json::Value;
 
@@ -56,7 +56,7 @@ pub(crate) fn weebdex_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadE
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(referer),
     })
 }

@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/mangataro.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/mangataro.rs
 
 Purpose:
 Chapter resolver for mangataro.org.
@@ -18,7 +18,7 @@ endpoint is deliberately not used: the quick downloader resolves one chapter, no
 */
 
 use super::super::http::fetch_json_value;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::path_segments;
 use serde_json::Value;
 
@@ -46,7 +46,7 @@ pub(crate) fn mangataro_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloa
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(format!("{MANGATARO_ORIGIN}/")),
     })
 }

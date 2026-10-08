@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/hiperdex.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/hiperdex.rs
 
 Purpose:
 Chapter resolver for the hiperdex/hipertoon mirror family.
@@ -23,7 +23,7 @@ series page lives behind a POST form endpoint this module does not speak.
 
 use super::super::html::{extract_html_tags, get_html_attr, html_unescape};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, normalize_network_url, path_segments};
 
 /// Builds the download plan for a hiperdex/hipertoon chapter URL.
@@ -52,7 +52,7 @@ pub(crate) fn hiperdex_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownload
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(url.to_string()),
     })
 }

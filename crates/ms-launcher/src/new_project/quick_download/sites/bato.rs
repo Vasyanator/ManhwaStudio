@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/bato.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/bato.rs
 
 Purpose:
 Chapter resolver for bato.to.
@@ -22,7 +22,7 @@ scanner requires an assignment gap. Only the bracket matching is shared
 
 use super::super::html::{extract_html_tags, find_array_literal_end, get_html_attr, html_unescape};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use serde_json::Value;
 
 /// Builds the download plan for a bato.to chapter URL, trying the Astro payload first and
@@ -43,7 +43,7 @@ pub(crate) fn bato_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadErro
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some("https://bato.to/".to_string()),
     })
 }

@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/url_util.rs
+File: crates/ms-launcher/src/new_project/quick_download/url_util.rs
 
 Purpose:
 Site-agnostic URL primitives shared by the quick downloader: scheme normalization, host and

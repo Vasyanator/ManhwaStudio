@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/rawkuma.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/rawkuma.rs
 
 Purpose:
 Chapter resolver for rawkuma.
@@ -20,7 +20,7 @@ content, plus the generic "does this look like an image" filter.
 
 use super::super::html::{extract_html_tags, get_html_attr};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, looks_like_image_url, normalize_network_url};
 
 /// WordPress asset prefixes that only ever carry theme/plugin chrome (logos, sprites, icons),
@@ -46,7 +46,7 @@ pub(crate) fn rawkuma_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloadE
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         // Requested with the chapter page as `Referer`, the way a browser rendering that page
         // would; the pages may be served from a separate media host.
         referer: Some(url.to_string()),

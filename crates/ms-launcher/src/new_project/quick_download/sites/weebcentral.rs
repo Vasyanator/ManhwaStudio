@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/weebcentral.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/weebcentral.rs
 
 Purpose:
 Chapter resolver for weebcentral.com.
@@ -27,7 +27,7 @@ being fetched.
 
 use super::super::html::{extract_html_tags, get_html_attr, html_unescape};
 use super::super::http::fetch_text_with_headers;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, normalize_network_url, path_segments};
 
 /// Path appended to the chapter URL to reach the page-list fragment.
@@ -64,7 +64,7 @@ pub(crate) fn weebcentral_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownl
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(chapter_url),
     })
 }

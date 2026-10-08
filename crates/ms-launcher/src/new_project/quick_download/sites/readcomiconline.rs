@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/readcomiconline.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/readcomiconline.rs
 
 Purpose:
 Chapter resolver for readcomiconline.li, including its obfuscated image-URL decoder.
@@ -19,7 +19,7 @@ to test against.
 use super::super::base64::base64_decode;
 use super::super::html::collect_anchor_hrefs_containing;
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{path_segment_count, path_segments};
 
 /// Builds the download plan for a readcomiconline.li issue or comic URL.
@@ -75,7 +75,7 @@ pub(crate) fn readcomiconline_plan(url: &str) -> Result<SiteDownloadPlan, QuickD
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: None,
     })
 }

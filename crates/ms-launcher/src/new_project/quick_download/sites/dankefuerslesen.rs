@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/dankefuerslesen.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/dankefuerslesen.rs
 
 Purpose:
 Chapter resolver for danke.moe (Danke fürs Lesen).
@@ -20,7 +20,7 @@ lowest group id is picked to keep the result deterministic.
 */
 
 use super::super::http::fetch_json_value;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::path_segments;
 use serde_json::{Map, Value};
 
@@ -49,7 +49,7 @@ pub(crate) fn dankefuerslesen_plan(url: &str) -> Result<SiteDownloadPlan, QuickD
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: None,
     })
 }

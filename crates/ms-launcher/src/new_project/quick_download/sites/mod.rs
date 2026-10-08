@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/mod.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/mod.rs
 
 Purpose:
 Module map of the per-site chapter resolvers. One file per supported site; this file only

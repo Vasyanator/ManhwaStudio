@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/tcbscans.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/tcbscans.rs
 
 Purpose:
 Chapter resolver for the tcbscans mirror family.
@@ -19,7 +19,7 @@ what lets one module serve every mirror.
 
 use super::super::html::{extract_html_tags, get_html_attr};
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, normalize_network_url};
 
 /// CSS class that marks a page image on a tcbscans chapter page.
@@ -42,7 +42,7 @@ pub(crate) fn tcbscans_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownload
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         // Pages are served from a CDN host, so the images are requested with the chapter page
         // as `Referer`, the way a browser rendering that page would.
         referer: Some(url.to_string()),

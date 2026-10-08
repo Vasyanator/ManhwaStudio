@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/base64.rs
+File: crates/ms-launcher/src/new_project/quick_download/base64.rs
 
 Purpose:
 Minimal standard-alphabet base64 decoder used by the quick downloader.

@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/hentai2read.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/hentai2read.rs
 
 Purpose:
 Chapter resolver for hentai2read.com (adult site).
@@ -23,7 +23,7 @@ marker name and the CDN join below are site-specific.
 
 use super::super::html::find_js_array_literal;
 use super::super::http::fetch_text;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use serde_json::Value;
 
 /// Image host of hentai2read, deliberately different from the site root: the `'images'`
@@ -50,7 +50,7 @@ pub(crate) fn hentai2read_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownl
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(format!("{HENTAI2READ_ROOT}/")),
     })
 }

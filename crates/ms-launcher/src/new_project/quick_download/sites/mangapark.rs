@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/mangapark.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/mangapark.rs
 
 Purpose:
 Chapter resolver for mangapark and its mirror domains.
@@ -20,7 +20,7 @@ and `/comic/<comic id>/<slug>/<part>-i<id>`.
 */
 
 use super::super::http::post_json_value;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{normalize_network_url, path_segments};
 use serde_json::{Value, json};
 
@@ -70,7 +70,7 @@ pub(crate) fn mangapark_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownloa
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(referer),
     })
 }

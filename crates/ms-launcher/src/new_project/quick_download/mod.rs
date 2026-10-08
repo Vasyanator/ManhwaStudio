@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/mod.rs
+File: crates/ms-launcher/src/new_project/quick_download/mod.rs
 
 Purpose:
 Module root of the direct ("quick") chapter downloader used by the New Project launcher.

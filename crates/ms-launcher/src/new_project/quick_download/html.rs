@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/html.rs
+File: crates/ms-launcher/src/new_project/quick_download/html.rs
 
 Purpose:
 Site-agnostic HTML/JSON scraping primitives of the quick downloader: a forgiving tag

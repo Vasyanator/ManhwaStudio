@@ -1,5 +1,5 @@
 /*
-File: src/launcher/new_project/quick_download/sites/senmanga.rs
+File: crates/ms-launcher/src/new_project/quick_download/sites/senmanga.rs
 
 Purpose:
 Chapter resolver for raw.senmanga.com.
@@ -23,7 +23,7 @@ Chapter URLs have the shape `/<series>/<chapter>`; anything shorter is rejected.
 
 use super::super::html::{extract_html_tags, get_html_attr, html_unescape};
 use super::super::http::fetch_text_with_headers;
-use super::super::plan::{QuickDownloadError, SiteDownloadPlan};
+use super::super::plan::{PlannedImage, QuickDownloadError, SiteDownloadPlan};
 use super::super::url_util::{dedupe_preserve, normalize_network_url, path_segment_count};
 
 /// Fixed cookie selecting the all-pages viewer. Not user-specific and not a session.
@@ -58,7 +58,7 @@ pub(crate) fn senmanga_plan(url: &str) -> Result<SiteDownloadPlan, QuickDownload
         });
     }
     Ok(SiteDownloadPlan {
-        image_urls,
+        images: PlannedImage::from_urls(image_urls),
         referer: Some(url.to_string()),
     })
 }

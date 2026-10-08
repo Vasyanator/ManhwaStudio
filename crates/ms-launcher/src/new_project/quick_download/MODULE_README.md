@@ -20,22 +20,29 @@ http.rs  url_util.rs  html.rs  base64.rs      site-agnostic primitives
 
 `window.rs` only sees `mod.rs`. It calls `QuickDownloadController::begin_download(url)` and drains
 `QuickDownloadEvent`s in `poll(ctx)`; everything below the controller runs on the worker thread.
-A site module never downloads images itself — it returns a `SiteDownloadPlan` (ordered image URLs
-plus the optional `Referer` that site's CDN requires) and the controller does the fetching.
+A site module never downloads images itself — it returns a `SiteDownloadPlan` (pages in reading
+order plus the optional `Referer` that site's CDN requires) and the controller does the fetching.
+Each page is a site-agnostic `PlannedImage`: a primary `url`, ordered `fallbacks` (the same image
+on another origin) and an optional expected `sha256`. Sites without a mirror origin wrap their URL
+list with `PlannedImage::from_urls`.
 
 ## Files and submodules
 - `mod.rs`: module map and the launcher-facing re-exports (`QuickDownloadController`,
   `QuickDownloadEvent`) plus `supported_sites_tooltip()`.
 - `controller.rs`: `QuickDownloadController`, the UI/worker event types, `spawn_quick_download`,
-  `load_quick_download`, and `download_images_ordered`. Edit it for progress, threading, or the
-  ribbon handoff.
-- `plan.rs`: `SiteDownloadPlan`, `QuickDownloadError`, and `build_site_download_plan` — the single
-  host switch of the module.
-- `http.rs`: `execute_request` and the fetch entry points on top of it — `fetch_text`/`fetch_bytes`/
-  `fetch_json_value` (default headers) and `fetch_text_with_headers`/`fetch_json_with_headers`/
-  `post_json_value` for sites needing custom headers, a fixed cookie, or a JSON POST. Owns the
-  shared timeout and User-Agent, the process-wide `ureq` agent, `DOWNLOAD_PARALLELISM` and the
-  pool `install_on_download_pool` runs the image download on, and the wasm stubs.
+  `load_quick_download`, `download_images_ordered`, and the per-page retry/fallback state machine
+  `fetch_page_with_fallbacks` over a per-download `PageFetcher` (attempt budgets, backoff,
+  hedging, `DeadHosts`, digest check, decode). Edit it for progress, threading, the retry
+  policy, or the ribbon handoff.
+- `plan.rs`: `SiteDownloadPlan`, `PlannedImage`, `QuickDownloadError`, the digest hex helpers, and
+  `build_site_download_plan` — the single host switch of the module.
+- `http.rs`: `execute_request` and the fetch entry points on top of it — `fetch_text`/
+  `fetch_json_value` (default headers), `fetch_text_with_headers`/`fetch_json_with_headers`/
+  `post_json_value` for sites needing custom headers, a fixed cookie, or a JSON POST, and
+  `fetch_image_bytes`, whose `ImageFetchFailure` carries a `FetchFailureKind` (transient vs
+  permanent, rule in `classify_status`/`classify_transport`). Owns the shared timeout and
+  User-Agent, the process-wide `ureq` agent, `DOWNLOAD_PARALLELISM` and the pool
+  `install_on_download_pool` runs the image download on, and the wasm stubs.
 - `url_util.rs`: URL normalization, host/query/path extraction, relative link resolution,
   `dedupe_preserve`, `looks_like_image_url`. Unit-tested.
 - `html.rs`: tolerant tag scanner (`HtmlTag`, `extract_html_tags`), `get_html_attr`,
@@ -77,8 +84,31 @@ plus the optional `Referer` that site's CDN requires) and the controller does th
   (`QuickDownloadError`); no silent fallbacks and no placeholder pages.
 - Images are decoded from the downloaded bytes, never from the URL extension
   (`looks_like_image_url` is only a link filter).
-- `download_images_ordered` is all-or-nothing: the first failure aborts the whole chapter, and the
-  returned vector is re-sorted into plan order regardless of completion order.
+- **Per-page retry and fallback** (project "Network downloads" rule, applied to whole small
+  images): `fetch_page_with_fallbacks` walks a page's URLs in order. A `Transient` failure
+  (transport error incl. TLS, body cut short, HTTP 408/429/5xx) is retried on the same URL with
+  exponential backoff — 2 attempts while another URL remains, 3 on the last one (so the longest
+  wait is 1 s); a `Permanent` failure (404, other 4xx, bad URL), a SHA-256 mismatch, or
+  undecodable bytes moves to the next URL immediately. Every retry/fallback is logged (page
+  number, URL, error; error bodies cut to 512 bytes); the final error keeps the last failure's
+  user message and its log message lists every attempt and skip. No HTTP `Range` resume: pages
+  are fetched whole and a cut transfer is simply retried. There is no cancel path (a new download
+  only replaces the receiver; tracked as `STATE.md` S-022), so the waits are kept short and
+  bounded. Fetch, sleep and the hedge delay are injected, so the tests never touch the network or
+  wait on the clock.
+- **Hedging** (the official MangaDex reader's scheme): an attempt on a URL that still has a later
+  candidate runs on its own thread; if it has not finished within `HEDGE_DELAY` (5 s), the rest
+  of the page's candidates start on a second thread and the first validated image wins. The
+  loser is not cancelled — it ends within the socket timeouts and its result is dropped. These
+  lanes are dedicated short-lived threads, NEVER tasks on the download pool: the pool's workers
+  block waiting for them, so lanes queued on the same fixed-size pool could deadlock.
+- **Dead hosts** (`DeadHosts`, one per `download_images_ordered` run): once a host has failed 3
+  whole pages (every attempt on its URL spent, any failure kind — including a hedged loser
+  failing after the page returned), later pages skip that host's URLs without a request while
+  they still have another candidate. A page's LAST candidate is always tried.
+- `download_images_ordered` is still all-or-nothing at chapter level: the first page that failed on
+  every URL aborts the chapter, and the returned vector is re-sorted into plan order regardless of
+  completion order.
 - The native HTTP client (`ureq`) is not built for wasm. `http.rs` keeps a `#[cfg]` pair for every
   fetch entry point, and the wasm stub returns a clear "unsupported on web" error instead of a fake
   response. Keep both branches in sync.
@@ -90,8 +120,10 @@ plus the optional `Referer` that site's CDN requires) and the controller does th
 ## Editing map
 - To add or fix a supported site, edit (or add) the file in `sites/` and, for a new site, add one
   arm to `build_site_download_plan` in `plan.rs`.
-- To change progress reporting, threading, parallelism use, or the ribbon handoff, edit
-  `controller.rs`.
+- To change progress reporting, threading, parallelism use, the retry/fallback policy, or the
+  ribbon handoff, edit `controller.rs` (what counts as transient: `http.rs`).
+- To give a site mirror origins or expected digests, fill `PlannedImage::fallbacks` / `sha256` in
+  its `sites/` file (example: `sites/mangadex.rs`); the controller needs no change.
 - To change timeouts, headers, or the web-build behavior, edit `http.rs`.
 - To change URL/HTML/base64 primitives, edit `url_util.rs` / `html.rs` / `base64.rs` and their tests.
 - To change what the launcher can call, edit the re-exports in `mod.rs` (and check
