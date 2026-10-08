@@ -25,13 +25,24 @@ Main responsibilities:
   virtual-scroll reader case), while keys still present keep their stop-time order;
 - `_append_first_seen_keys` keeps non-overlapping scroll windows in reading order;
 - the site-published page index travels raw JS payload -> DOM keys ->
-  `DeepCaptureDomOrder` -> `_deep_capture_sort_key`;
+  `DeepCaptureDomOrder` -> `_deep_capture_cluster_sort_key`;
 - that index is accepted (`_site_page_index_authority`) only when it looks like a real
   reading index — counted per DOM element, present in every key space, discriminative,
   and agreeing with document order — and once accepted its gaps are filled so untagged
   records keep their document position;
 - `stop_deep_intercept` accumulates the DOM order on both sides of the canvas screenshot
   pass, which scrolls (and therefore recycles) elements;
+- a byte-identical repeat payload merges its ordering evidence into the kept entry
+  (bounded, de-duplicated, counted) instead of being discarded, so a MangaDex-shaped
+  capture (scrambled CDN network copies stored first, DOM-mapped `blob:` twins later)
+  finalizes in DOM order, while the same capture without that evidence reproduces
+  arrival order; a pixel-identical payload with different bytes merges its evidence at
+  decode; a content cluster is ordered by its best member, not its representative;
+  the key is one evidence item's whole key (never a field mix) and a single entry keys
+  exactly as documented; `_deep_capture_url_sequence` takes the last file-name number
+  and ignores `blob:`/`data:`/synthetic URLs, so merged blob twins cannot scramble a
+  MangaDex capture whose DOM maps are empty; the `cloak deep order:` block names tier,
+  key, source, the deciding evidence, alternates and cluster size;
 - the pure deep-capture diagnostics helpers: `DeepCaptureStallTracker` reports a stall
   and a recovery exactly once per episode and never while captures keep arriving,
   `DeepCapturePageShape` parsing tolerates junk counters and its signature changes only
@@ -42,25 +53,31 @@ Main responsibilities:
 Notes:
 Fake pages record `evaluate`/`bring_to_front` and never touch a real browser. `_valid_pages`
 is patched to return them, bypassing `_ensure_browser`. Ordering tests patch
-`_read_dom_order_keys` instead, so no browser or network is involved anywhere. The tests
+`_read_dom_order_keys` instead, so no browser or network is involved anywhere. Tests that
+store real payloads use `_temporary_deep_capture`, a capture rooted in a unique system temp
+directory that is removed afterwards. The tests
 avoid pytest fixtures and expose a `__main__` runner so they pass under both `pytest` and a
 plain `python3` invocation.
 """
 
 from __future__ import annotations
 
+import random
 import shutil
 import sys
 import tempfile
 import threading
 import types
+import uuid
 from contextlib import contextmanager
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from PIL import Image
 
 from modules.new_project.adv_fetch_cloak_cli import (
+    DEEP_CAPTURE_MAX_ENTRY_ALTERNATES,
     CloakFetchDaemon,
     DeepCallStat,
     DeepCaptureDomOrder,
@@ -72,13 +89,17 @@ from modules.new_project.adv_fetch_cloak_cli import (
     DeepStallEvent,
     _append_first_seen_keys,
     _combine_dom_order,
+    _deep_capture_cluster_sort_key,
     _deep_capture_dom_keys_from_raw,
     _deep_capture_page_shape_from_raw,
-    _deep_capture_sort_key,
+    _deep_capture_source_rank,
     _deep_capture_source_breakdown,
+    _deep_capture_url_sequence,
     _format_deep_call_stats,
+    _format_deep_capture_order,
     _format_deep_capture_summary,
     _format_deep_drain_stages,
+    _select_cluster_representative,
     _site_page_index_authority,
 )
 
@@ -615,6 +636,17 @@ def _capture_entry(page: int) -> dict[str, Any]:
     return {"source": "network", "url": _img_url(page), "metadata": {}}
 
 
+def _entry_sort_key(
+    entry: dict[str, Any],
+    image: Image.Image,
+    fallback_index: int,
+    dom_order: Optional[DeepCaptureDomOrder] = None,
+) -> tuple[int, int, int, int, int, int]:
+    """Sort key of one capture, through the production entry point as a cluster of one."""
+    record = {"entry": entry, "image": image, "source_index": fallback_index}
+    return _deep_capture_cluster_sort_key([record], record, dom_order)[0]
+
+
 def _finalize_from_raw(
     full_raw: list[dict[str, Any]], stop_raw: list[dict[str, Any]]
 ) -> DeepCaptureDomOrder:
@@ -655,7 +687,7 @@ def _sorted_pages(dom_order: Optional[DeepCaptureDomOrder], pages: list[int]) ->
     """Sort `pages` the way the deep-capture pipeline would, and report the order."""
     image = Image.new("RGB", (4, 4))
     decorated = [
-        (page, _deep_capture_sort_key(_capture_entry(page), image, index, dom_order))
+        (page, _entry_sort_key(_capture_entry(page), image, index, dom_order))
         for index, page in enumerate(pages)
     ]
     decorated.sort(key=lambda pair: pair[1])
@@ -668,7 +700,7 @@ def _sorted_urls(dom_order: Optional[DeepCaptureDomOrder], urls: list[str]) -> l
     decorated = [
         (
             url,
-            _deep_capture_sort_key(
+            _entry_sort_key(
                 {"source": "network", "url": url, "metadata": {}}, image, index, dom_order
             ),
         )
@@ -862,8 +894,8 @@ def test_sort_key_tier_selection_with_authoritative_index() -> None:
     )
     image = Image.new("RGB", (4, 4))
 
-    img_key = _deep_capture_sort_key(_capture_entry(1), image, 0, dom_order)
-    canvas_key = _deep_capture_sort_key(_capture_entry(10), image, 1, dom_order)
+    img_key = _entry_sort_key(_capture_entry(1), image, 0, dom_order)
+    canvas_key = _entry_sort_key(_capture_entry(10), image, 1, dom_order)
 
     assert img_key[:2] == (0, 42)
     assert canvas_key[:2] == (0, 41)
@@ -881,8 +913,8 @@ def test_sort_key_tier_selection_without_authoritative_index() -> None:
     )
     image = Image.new("RGB", (4, 4))
 
-    img_key = _deep_capture_sort_key(_capture_entry(1), image, 0, dom_order)
-    canvas_key = _deep_capture_sort_key(_capture_entry(10), image, 1, dom_order)
+    img_key = _entry_sort_key(_capture_entry(1), image, 0, dom_order)
+    canvas_key = _entry_sort_key(_capture_entry(10), image, 1, dom_order)
 
     assert img_key[:2] == (1, 7)
     assert canvas_key[:2] == (1, 3)
@@ -892,7 +924,7 @@ def test_sort_key_without_dom_order_uses_weaker_tiers() -> None:
     image = Image.new("RGB", (4, 4))
     entry = {"source": "network", "url": "https://cdn.example/x.webp", "metadata": {"dom_order": 5}}
 
-    key = _deep_capture_sort_key(entry, image, 0, None)
+    key = _entry_sort_key(entry, image, 0, None)
 
     assert key[:2] == (2, 5)
 
@@ -942,6 +974,454 @@ def test_stop_accumulates_dom_order_around_the_screenshot_pass() -> None:
     assert dom_order.url_to_index[_img_url(9)] == 0
     assert dom_order.element_to_index[10] == 1
     assert dom_order.url_to_index[_img_url(11)] == 2
+
+
+# --- evidence-preserving dedup and best-evidence ordering --------------------------
+
+
+@contextmanager
+def _temporary_deep_capture() -> Iterator[tuple[CloakFetchDaemon, DeepCaptureState]]:
+    """An active deep capture whose raw/output dirs live under the system temp dir.
+
+    Unlike `_deep_capture_daemon`, payloads can really be remembered (raw bytes are
+    written) and finalized (PNGs are saved); everything is removed on exit, so the test
+    leaves no file behind. Progress events and stdout emits are silenced.
+    """
+    root = Path(tempfile.mkdtemp(prefix="ms_test_cloak_deep_"))
+    try:
+        raw_dir = root / "_raw"
+        raw_dir.mkdir()
+        daemon = CloakFetchDaemon()
+        capture = DeepCaptureState(
+            stop_event=threading.Event(),
+            lock=threading.Lock(),
+            entries=[],
+            hashes=set(),
+            page_url="https://reader.example/chapter/abc",
+            output_dir=root,
+            raw_dir=raw_dir,
+        )
+        daemon._deep_capture = capture
+        daemon._deep_capture_active = True
+        daemon._emit_progress = lambda *_args, **_kwargs: None  # type: ignore[assignment]
+        yield daemon, capture
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _noise_page_png(page: int, size: int = 96) -> tuple[bytes, bytes]:
+    """Distinct per-page noise image: (PNG bytes, raw RGB pixels).
+
+    Seeded noise gives every page an unrelated dHash, so content clustering keeps the
+    pages apart exactly as it does for real, different manga pages.
+    """
+    generator = random.Random(page)
+    pixels = bytes(generator.randrange(256) for _ in range(size * size * 3))
+    image = Image.frombytes("RGB", (size, size), pixels)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue(), image.tobytes()
+
+
+def test_duplicate_payload_merges_its_evidence_into_the_kept_entry() -> None:
+    with _temporary_deep_capture() as (daemon, capture):
+        body = b"same-bytes"
+        daemon._remember_deep_capture_bytes(
+            source="network", url="https://cdn.example/a.png", body=body, content_type="image/png"
+        )
+        twin = {"source": "img-element", "url": "blob:https://reader.example/1", "metadata": {"element": "img"}}
+        for _ in range(2):
+            daemon._remember_deep_capture_bytes(
+                source=twin["source"],
+                url=twin["url"],
+                body=body,
+                content_type="image/png",
+                metadata=twin["metadata"],
+            )
+        # A repeat of the kept copy's own evidence counts, but adds nothing new.
+        daemon._remember_deep_capture_bytes(
+            source="network", url="https://cdn.example/a.png", body=body, content_type="image/png"
+        )
+        daemon._remember_deep_capture_bytes(
+            source="network", url="https://cdn.example/b.png", body=b"other", content_type="image/png"
+        )
+
+        assert len(capture.entries) == 2
+        kept = capture.entries[0]
+        assert kept["source"] == "network" and kept["url"] == "https://cdn.example/a.png"
+        assert kept["alternates"] == [twin]
+        assert kept["duplicates"] == 3
+        assert capture.entries[1]["alternates"] == [] and capture.entries[1]["duplicates"] == 0
+        # Raw bytes are still written once per distinct payload.
+        assert len(list(capture.raw_dir.iterdir())) == 2
+
+
+def test_duplicate_alternates_are_bounded() -> None:
+    with _temporary_deep_capture() as (daemon, capture):
+        for index in range(DEEP_CAPTURE_MAX_ENTRY_ALTERNATES + 5):
+            daemon._remember_deep_capture_bytes(
+                source="createObjectURL", url=f"blob:https://r.example/{index}", body=b"x", content_type=""
+            )
+
+        kept = capture.entries[0]
+        assert len(kept["alternates"]) == DEEP_CAPTURE_MAX_ENTRY_ALTERNATES
+        assert kept["duplicates"] == DEEP_CAPTURE_MAX_ENTRY_ALTERNATES + 4
+
+
+MANGADEX_PAGE_COUNT = 8
+# Network arrival order of the CDN copies: pages 2/3/4 load in parallel and page 2
+# finishes after 3 and 4, exactly as in the live MangaDex run.
+MANGADEX_ARRIVAL = (1, 3, 4, 2, 6, 5, 8, 7)
+MANGADEX_CHAPTER_HASH = "db6694b8111a957714d4627d88824685"
+
+
+def _mangadex_cdn_url(page: int, *, numbered: bool) -> str:
+    content_hash = f"fdffab{page:x}ce"  # letters around every digit: never a standalone number
+    name = f"{page}-{content_hash}.png" if numbered else f"{content_hash}.png"
+    return f"https://uploads.example.network/data/{MANGADEX_CHAPTER_HASH}/{name}"
+
+
+def _mangadex_blob_url(page: int) -> str:
+    return f"blob:https://mangadex.example/7c1e{page:02}a0-0000-4000-8000-00000000000{page % 10}"
+
+
+def _capture_mangadex_chapter(
+    daemon: CloakFetchDaemon, *, numbered: bool
+) -> tuple[DeepCaptureDomOrder, dict[bytes, int]]:
+    """Feed a MangaDex-shaped capture: CDN network copies first, blob twins later.
+
+    Every page is shown through `URL.createObjectURL` -> `<img src="blob:...">`, so the
+    DOM order map knows only the blob URLs, while the network copy (CDN URL, scrambled
+    arrival order) is the one stored first. Returns the stop-time DOM order and a map
+    from each page's pixels to its true page number.
+    """
+    bodies = {page: _noise_page_png(page) for page in range(1, MANGADEX_PAGE_COUNT + 1)}
+    for page in MANGADEX_ARRIVAL:
+        for source in ("network", "network"):
+            daemon._remember_deep_capture_bytes(
+                source=source,
+                url=_mangadex_cdn_url(page, numbered=numbered),
+                body=bodies[page][0],
+                content_type="image/png",
+            )
+    for page in MANGADEX_ARRIVAL:
+        for source in ("createObjectURL", "img-element"):
+            daemon._remember_deep_capture_bytes(
+                source=source,
+                url=_mangadex_blob_url(page),
+                body=bodies[page][0],
+                content_type="image/png",
+            )
+    dom_order = DeepCaptureDomOrder(
+        url_to_index={_mangadex_blob_url(page): 9 + page for page in range(1, MANGADEX_PAGE_COUNT + 1)},
+        element_to_index={},
+    )
+    return dom_order, {pixels: page for page, (_png, pixels) in bodies.items()}
+
+
+def _final_page_numbers(result: dict[str, Any], pixels_to_page: dict[bytes, int]) -> list[int]:
+    """True page numbers of the saved auto-review files, in output order."""
+    output_dir = Path(result["output_dir"])
+    pages: list[int] = []
+    for item in sorted(result["items"], key=lambda item: item["order"]):
+        with Image.open(output_dir / item["file_name"]) as saved:
+            pages.append(pixels_to_page[saved.convert("RGB").tobytes()])
+    return pages
+
+
+def test_mangadex_blob_twins_put_scrambled_network_copies_in_dom_order() -> None:
+    with _temporary_deep_capture() as (daemon, capture):
+        dom_order, pixels_to_page = _capture_mangadex_chapter(daemon, numbered=True)
+        entries = list(capture.entries)
+
+        result = daemon._build_auto_result_from_deep_entries(
+            entries, capture.page_url, capture.output_dir, None, dom_order
+        )
+
+        assert _final_page_numbers(result, pixels_to_page) == list(range(1, MANGADEX_PAGE_COUNT + 1))
+        # Every page was stored as its network copy, and is placed by the DOM tier (1)
+        # through its merged blob twin, not by the URL-number fallback.
+        assert len(entries) == MANGADEX_PAGE_COUNT
+        assert all(entry["source"] == "network" for entry in entries)
+        image = Image.new("RGB", (4, 4))
+        assert all(
+            _entry_sort_key(entry, image, index, dom_order)[0] == 1
+            for index, entry in enumerate(entries)
+        )
+        assert sum(entry["duplicates"] for entry in entries) == 3 * MANGADEX_PAGE_COUNT
+
+
+def test_mangadex_order_without_merged_evidence_is_arrival_order() -> None:
+    # Control: with no page number in the file name and the twins' evidence stripped,
+    # the same capture falls back to network arrival order - the reported bug.
+    with _temporary_deep_capture() as (daemon, capture):
+        dom_order, _pixels = _capture_mangadex_chapter(daemon, numbered=False)
+        image = Image.new("RGB", (4, 4))
+
+        def ordered_pages(entries: list[dict[str, Any]]) -> list[int]:
+            arrival_page = {index: page for index, page in enumerate(MANGADEX_ARRIVAL)}
+            decorated = sorted(
+                (_entry_sort_key(entry, image, index, dom_order), arrival_page[index])
+                for index, entry in enumerate(entries)
+            )
+            return [page for _key, page in decorated]
+
+        stripped = [{**entry, "alternates": []} for entry in capture.entries]
+
+        assert ordered_pages(stripped) == list(MANGADEX_ARRIVAL)
+        assert ordered_pages(list(capture.entries)) == list(range(1, MANGADEX_PAGE_COUNT + 1))
+
+
+def test_pixel_duplicate_with_different_bytes_merges_its_evidence_at_decode() -> None:
+    # Page 2 is stored first as a PNG under a CDN URL in no DOM map, and later as a BMP
+    # (different bytes, identical pixels) under a DOM-mapped blob URL. The decode pass
+    # drops the BMP as a pixel duplicate; its evidence must still place page 2.
+    with _temporary_deep_capture() as (daemon, capture):
+        pngs = {page: _noise_page_png(page) for page in (1, 2, 3)}
+        bmp_buffer = BytesIO()
+        Image.frombytes("RGB", (96, 96), pngs[2][1]).save(bmp_buffer, format="BMP")
+        assert bmp_buffer.getvalue() != pngs[2][0]
+
+        def remember(source: str, url: str, body: bytes) -> None:
+            daemon._remember_deep_capture_bytes(source=source, url=url, body=body, content_type="image/png")
+
+        remember("network", "https://cdn.example/data/fdffabce.png", pngs[2][0])
+        remember("network", "https://cdn.example/data/abcdef.png", pngs[3][0])
+        remember("network", "https://cdn.example/data/fedcba.png", pngs[1][0])
+        remember("img-element", "blob:https://reader.example/page-two", bmp_buffer.getvalue())
+        dom_order = DeepCaptureDomOrder(
+            url_to_index={
+                "https://cdn.example/data/fedcba.png": 0,
+                "blob:https://reader.example/page-two": 1,
+                "https://cdn.example/data/abcdef.png": 2,
+            },
+            element_to_index={},
+        )
+        entries = list(capture.entries)
+        assert len(entries) == 4
+
+        result = daemon._build_auto_result_from_deep_entries(
+            entries, capture.page_url, capture.output_dir, None, dom_order
+        )
+
+        pixels_to_page = {pixels: page for page, (_png, pixels) in pngs.items()}
+        assert _final_page_numbers(result, pixels_to_page) == [1, 2, 3]
+        kept = entries[0]
+        assert kept["alternates"] == [
+            {"source": "img-element", "url": "blob:https://reader.example/page-two", "metadata": {}}
+        ]
+        # Decode-time merges are exact-dupes, not capture-time merged-dupes.
+        assert sum(entry["duplicates"] for entry in entries) == 0
+
+
+def test_mangadex_blob_twins_without_dom_keys_keep_file_name_order() -> None:
+    # The DOM read missed every blob URL (revoked/recycled before a drain), so only the
+    # URL tier is left. The merged blob twins must not outrank the CDN file-name numbers
+    # with junk digits from their UUIDs.
+    generator = random.Random(7)
+    blob_urls = {
+        page: f"blob:https://mangadex.example/{uuid.UUID(int=generator.getrandbits(128), version=4)}"
+        for page in range(1, MANGADEX_PAGE_COUNT + 1)
+    }
+    with _temporary_deep_capture() as (daemon, capture):
+        bodies = {page: _noise_page_png(page) for page in range(1, MANGADEX_PAGE_COUNT + 1)}
+        for page in MANGADEX_ARRIVAL:
+            daemon._remember_deep_capture_bytes(
+                source="network",
+                url=_mangadex_cdn_url(page, numbered=True),
+                body=bodies[page][0],
+                content_type="image/png",
+            )
+        for page in MANGADEX_ARRIVAL:
+            daemon._remember_deep_capture_bytes(
+                source="createObjectURL", url=blob_urls[page], body=bodies[page][0], content_type="image/png"
+            )
+        entries = list(capture.entries)
+        assert all(len(entry["alternates"]) == 1 for entry in entries)
+
+        result = daemon._build_auto_result_from_deep_entries(
+            entries,
+            capture.page_url,
+            capture.output_dir,
+            None,
+            DeepCaptureDomOrder(url_to_index={}, element_to_index={}),
+        )
+
+        pixels_to_page = {pixels: page for page, (_png, pixels) in bodies.items()}
+        assert _final_page_numbers(result, pixels_to_page) == list(range(1, MANGADEX_PAGE_COUNT + 1))
+
+
+def test_single_entry_key_is_the_documented_tuple() -> None:
+    # Without alternates the key is exactly the entry's own key, field by field.
+    image = Image.new("RGB", (5, 7))
+    entry = {"source": "network", "url": _img_url(1), "metadata": {"dom_order": 4}, "order": 3}
+    dom_order = DeepCaptureDomOrder(url_to_index={_img_url(1): 7}, element_to_index={})
+
+    assert _entry_sort_key(entry, image, 2, dom_order) == (
+        1, 7, 7, _deep_capture_source_rank("network"), 2, -35
+    )
+    assert _entry_sort_key(entry, image, 2, None) == (
+        2, 4, sys.maxsize, _deep_capture_source_rank("network"), 2, -35
+    )
+    bare = {"source": "network", "url": "https://cdn.example/x/cover.webp", "metadata": {}}
+    assert _entry_sort_key(bare, image, 9, None) == (5, 9, sys.maxsize, _deep_capture_source_rank("network"), 9, -35)
+
+
+def test_cluster_key_is_one_items_whole_key_not_a_mix() -> None:
+    # Item A has the authoritative page index but no document position of its own;
+    # item B has a document position. The page index tier wins, and the key must be A's
+    # whole key - B's document position must not be spliced into it.
+    image = Image.new("RGB", (4, 4))
+    url_a = "https://cdn.example/a.png"
+    url_b = "blob:https://r.example/b"
+    dom_order = DeepCaptureDomOrder(
+        url_to_index={url_b: 5},
+        element_to_index={},
+        url_to_page={url_a: 2},
+        authoritative=True,
+    )
+    entry = {
+        "source": "network",
+        "url": url_a,
+        "metadata": {},
+        "alternates": [{"source": "img-element", "url": url_b, "metadata": {}}],
+    }
+    record = {"entry": entry, "image": image, "source_index": 0}
+
+    key, deciding = _deep_capture_cluster_sort_key([record], record, dom_order)
+
+    assert key[:3] == (0, 2, sys.maxsize)
+    assert deciding is entry
+
+
+def test_cluster_is_ordered_by_its_best_member_not_its_representative() -> None:
+    # Page 3 is seen as a DOM-mapped network copy AND as an offscreen descramble export
+    # of the same content; the export wins the pixels but has no DOM key.
+    image = Image.new("RGB", (800, 1200))
+
+    def url(page: int) -> str:
+        return f"https://cdn.example/ch/{page:03}.jpg"
+
+    dom_order = DeepCaptureDomOrder({url(page): page for page in range(1, 6)}, {})
+    network_3 = {
+        "entry": {"source": "network", "url": url(3), "metadata": {}, "order": 1},
+        "image": image,
+        "source_index": 1,
+    }
+    offscreen_3 = {
+        "entry": {"source": "offscreen-convertToBlob", "url": "", "metadata": {}, "order": 9},
+        "image": image,
+        "source_index": 9,
+    }
+    clusters = {3: [network_3, offscreen_3]}
+    for page in (1, 2, 4, 5):
+        clusters[page] = [
+            {
+                "entry": {"source": "network", "url": url(page), "metadata": {}, "order": page + 10},
+                "image": image,
+                "source_index": page + 10,
+            }
+        ]
+
+    representative_3 = _select_cluster_representative(clusters[3])
+    assert representative_3 is offscreen_3
+    assert _entry_sort_key(offscreen_3["entry"], image, 9, dom_order)[0] == 5
+
+    keys = {
+        page: _deep_capture_cluster_sort_key(
+            cluster, _select_cluster_representative(cluster), dom_order
+        )[0]
+        for page, cluster in clusters.items()
+    }
+
+    assert keys[3][:2] == (1, 3)
+    assert sorted(keys, key=keys.__getitem__) == [1, 2, 3, 4, 5]
+
+
+def test_url_sequence_prefers_the_file_name_number() -> None:
+    hashed_dir = f"https://uploads.example.network/data/{MANGADEX_CHAPTER_HASH}"
+    page_numbers = [
+        _deep_capture_url_sequence(f"{hashed_dir}/{page}-fdffab{page:x}ce.png") for page in (1, 2, 3, 4, 12)
+    ]
+    assert page_numbers == [1, 2, 3, 4, 12]
+    assert _deep_capture_url_sequence("https://cdn.example/x/012.jpg") == 12
+    assert _deep_capture_url_sequence("https://cdn.example/x/page_7.webp") == 7
+    assert _deep_capture_url_sequence("https://cdn.example/manga/5/ch/34/015.webp") == 15
+    # A long digit run in the file name is a hash, not a page: the whole-URL rule decides.
+    assert _deep_capture_url_sequence("https://cdn.example/manga/5/ch/123456789.webp") == 5
+
+
+def test_url_sequence_takes_the_last_file_name_number() -> None:
+    assert _deep_capture_url_sequence("https://cdn.example/manga/t/chapter-12-page-3.jpg") == 3
+    assert _deep_capture_url_sequence("https://cdn.example/x/012_003.jpg") == 3
+    assert _deep_capture_url_sequence("https://cdn.example/x/IMG_20230101_0003.jpg") == 3
+    assert _deep_capture_url_sequence("https://cdn.example/x/003@2x.png") == 3
+    # An out-of-range trailing number does not hide the in-range page number.
+    assert _deep_capture_url_sequence("https://cdn.example/x/007_1600.jpg") == 7
+
+
+def test_url_sequence_ignores_non_resource_schemes() -> None:
+    # A blob URL is a random UUID: its digits are junk, never a page number.
+    assert _deep_capture_url_sequence("blob:https://mangadex.org/3f2a1b7c-0e45-4a2b-9c1d-123456789abc") is None
+    assert _deep_capture_url_sequence("data:image/png;base64,iVBORw0KGgo12") is None
+    assert _deep_capture_url_sequence("deep-capture://capture/page/0003.png") is None
+    assert _deep_capture_url_sequence("file:///home/u/scans/ch1/004.png") == 4
+
+
+def test_url_sequence_falls_back_to_the_whole_url_rule() -> None:
+    assert _deep_capture_url_sequence("https://cdn.example/img/w800/p12.jpg?v=2") == 2
+    assert _deep_capture_url_sequence("https://cdn.example/manga/5/cover.jpg") == 5
+    assert _deep_capture_url_sequence("https://cdn.example/manga/cover.jpg") is None
+    assert _deep_capture_url_sequence("https://cdn.example/manga/900/0.jpg") is None
+
+
+def test_order_block_names_tier_key_source_and_cluster() -> None:
+    image = Image.new("RGB", (4, 4))
+    long_url = "https://cdn.example/" + "d" * 300 + "/7-page.png"
+    member = {"entry": {"source": "network", "url": long_url, "metadata": {}}, "image": image, "source_index": 0}
+    record = {
+        "entry": {
+            "source": "createObjectURL",
+            "url": "blob:https://r.example/1",
+            "metadata": {},
+            "alternates": [{"source": "img-element", "url": "blob:https://r.example/1", "metadata": {"element": "img"}}],
+        },
+        "image": image,
+        "source_index": 1,
+        "sort_key": (1, 10, 10, 2, 0, -16),
+        "sort_evidence": {"source": "img-element", "url": "blob:https://r.example/1", "metadata": {"element": "img"}},
+    }
+    record["cluster"] = [record, member]
+    member_page = {**member, "sort_key": (4, 7, 99, 3, 0, -16), "sort_evidence": member["entry"]}
+
+    lines = _format_deep_capture_order([record, member_page])
+
+    assert all(line.startswith("cloak deep order:") for line in lines)
+    assert len(lines) == 3
+    assert lines[1].startswith(
+        "cloak deep order: #1 tier=1 key=(1, 10, 10, 2, 0, -16) source=createObjectURL via=img-element"
+    )
+    assert "alts=1 cluster=2" in lines[1]
+    # Deciding URL equals the primary URL -> no separate `primary=` field.
+    assert lines[1].endswith("url=blob:https://r.example/1")
+    assert "tier=4" in lines[2] and "cluster=1" in lines[2] and "via=network" in lines[2]
+    assert lines[2].endswith("/7-page.png") and "..." in lines[2] and "primary=" not in lines[2]
+
+
+def test_order_block_shows_the_deciding_evidence_and_the_primary_url() -> None:
+    image = Image.new("RGB", (4, 4))
+    record = {
+        "entry": {"source": "network", "url": "https://cdn.example/data/a.png", "metadata": {}},
+        "image": image,
+        "source_index": 0,
+        "sort_key": (1, 3, 3, 2, 0, -16),
+        "sort_evidence": {"source": "createObjectURL", "url": "blob:https://r.example/3", "metadata": {}},
+    }
+
+    line = _format_deep_capture_order([record])[1]
+
+    assert "source=network via=createObjectURL" in line
+    assert "url=blob:https://r.example/3 primary=https://cdn.example/data/a.png" in line
 
 
 # --- deep-capture diagnostics -------------------------------------------------------
@@ -1080,6 +1560,7 @@ def test_summary_block_is_greppable_and_complete() -> None:
         cluster_merged=4,
         pages=6,
         probable_junk=1,
+        merged_duplicates=5,
     )
 
     lines = _format_deep_capture_summary(
@@ -1089,6 +1570,7 @@ def test_summary_block_is_greppable_and_complete() -> None:
     assert all(line.startswith("cloak deep summary:") for line in lines)
     assert "payloads=17" in lines[0] and "pages=6" in lines[0] and "probable_junk=1" in lines[0]
     assert "cluster-merged=4" in lines[0] and "dom-collapsed=3" in lines[0]
+    assert "merged-dupes=5" in lines[0]
     assert lines[1] == "cloak deep summary: source canvas-native raw=9 pages=5 probable_junk=0"
     assert lines[2] == "cloak deep summary: source network raw=6 pages=1 probable_junk=1"
 
@@ -1176,6 +1658,21 @@ if __name__ == "__main__":
     test_sort_key_without_dom_order_uses_weaker_tiers()
     test_page_index_minority_is_not_authoritative()
     test_stop_accumulates_dom_order_around_the_screenshot_pass()
+    test_duplicate_payload_merges_its_evidence_into_the_kept_entry()
+    test_duplicate_alternates_are_bounded()
+    test_mangadex_blob_twins_put_scrambled_network_copies_in_dom_order()
+    test_mangadex_order_without_merged_evidence_is_arrival_order()
+    test_pixel_duplicate_with_different_bytes_merges_its_evidence_at_decode()
+    test_mangadex_blob_twins_without_dom_keys_keep_file_name_order()
+    test_single_entry_key_is_the_documented_tuple()
+    test_cluster_key_is_one_items_whole_key_not_a_mix()
+    test_cluster_is_ordered_by_its_best_member_not_its_representative()
+    test_url_sequence_prefers_the_file_name_number()
+    test_url_sequence_takes_the_last_file_name_number()
+    test_url_sequence_ignores_non_resource_schemes()
+    test_url_sequence_falls_back_to_the_whole_url_rule()
+    test_order_block_names_tier_key_source_and_cluster()
+    test_order_block_shows_the_deciding_evidence_and_the_primary_url()
     test_stall_tracker_reports_one_warning_per_episode()
     test_stall_tracker_reports_recovery_once()
     test_stall_tracker_never_stalls_while_captures_keep_arriving()

@@ -17,12 +17,14 @@ Main items:
   transparent payloads.
 - Deep intercept captures bytes from every layer (network/CDP, canvas readback, screenshots, plus
   observe-only page hooks for `URL.createObjectURL` and `OffscreenCanvas.convertToBlob` so DRM and
-  descramble sites are covered) and finalizes them through a content pipeline: blank (single-colour)
+  descramble sites are covered; a byte-identical repeat is merged into the first copy as ordering
+  evidence, never discarded) and finalizes them through a content pipeline: blank (single-colour)
   frames are dropped globally, per-element repeats collapsed by stable WeakMap id, records clustered
   by perceptual hash so one page seen through several layers is one page, the highest-fidelity
-  representative is kept per cluster, pages are ordered by the site's own published page index when
-  that index passes the authority gate (`_site_page_index_authority`) and otherwise by
-  DOM/geometry/URL signals, and size-outlier pages are flagged as probable junk.
+  representative is kept per cluster for the pixels, pages are ordered by the best evidence of the
+  whole cluster (`_deep_capture_cluster_sort_key`: every member and merged alternate) - the site's own
+  published page index when that index passes the authority gate (`_site_page_index_authority`) and
+  otherwise DOM/geometry/URL signals - and size-outlier pages are flagged as probable junk.
 
 Deep-capture diagnostics (all lines go to the runtime log through `_debug_log` /
 `_warn_log`, and every one of them is greppable by its `cloak deep <kind>:` prefix):
@@ -35,7 +37,9 @@ Deep-capture diagnostics (all lines go to the runtime log through `_debug_log` /
   pass with no new capture, plus one line when captures resume;
 - `cloak deep call:`    a single browser call slower than `DEEP_CAPTURE_SLOW_CALL_SECONDS`;
 - `cloak deep start/stop/settle/screenshots:` phase timings of the capture lifecycle;
-- `cloak deep summary:` the stop block - pipeline counters and a per-source breakdown.
+- `cloak deep summary:` the stop block - pipeline counters and a per-source breakdown;
+- `cloak deep order:`   one block after the final sort - per page its tier, sort key, source,
+  the deciding evidence item's source and URL, alternate count and cluster size.
 
 Protocol:
 - `_handle_command({"command": ...})` runs one command and reports a single
@@ -96,6 +100,14 @@ DEEP_CAPTURE_PHASH_MERGE_DISTANCE = 5
 # Captures whose smaller side is below this many pixels are flagged as probable
 # junk (icons, sprites, UI chrome) in the deep-intercept review.
 DEEP_CAPTURE_MIN_PAGE_DIM = 64
+# Upper bound on the distinct ordering-evidence alternates one deep-capture entry keeps
+# from byte-identical duplicates (see `_merge_deep_capture_duplicate`). A page is
+# typically seen through 3-5 layers; the bound only stops a pathological page that
+# re-exports the same bytes under ever-new blob URLs from growing an entry without limit.
+DEEP_CAPTURE_MAX_ENTRY_ALTERNATES = 16
+# Length above which a URL in the `cloak deep order:` block is elided in the middle,
+# keeping both the host/path head and the file-name tail that ordering depends on.
+DEEP_CAPTURE_ORDER_LOG_URL_LIMIT = 160
 # A single Playwright call inside the deep-capture path slower than this is named and
 # timed in its own log line, so a call that is merely slow (rather than hung) is
 # attributable from the log without re-running the capture.
@@ -169,6 +181,10 @@ class DeepCaptureState:
     # up-to-four URL variants one `<img>` emits collapse into a single element when
     # coverage ratios are computed. First reading wins. Guarded by ``lock``.
     dom_key_elements: dict[tuple[str, str], tuple[str, str]] = field(default_factory=dict)
+    # Position in ``entries`` of the entry holding each stored sha256 (the keys equal
+    # ``hashes``), so a byte-identical repeat can merge its ordering evidence into that
+    # entry without scanning the list. Guarded by ``lock``.
+    entry_by_digest: dict[str, int] = field(default_factory=dict)
 
 
 # Attributes a site may use to publish an explicit, 1-based (or 0-based - only the
@@ -334,7 +350,8 @@ class DeepDecodeStats:
     """Outcome counters of the deep-capture decode pass.
 
     `attempted` payloads were read; `decoded` became records; `exact_duplicates` decoded
-    to bytes already seen; `undecodable` failed to read or parse as an image. When the
+    to pixels already seen (their ordering evidence was merged into the kept record's
+    entry, not lost); `undecodable` failed to read or parse as an image. When the
     user cancelled mid-pass, `attempted` is lower than the payload count and `cancelled`
     is True.
     """
@@ -350,10 +367,14 @@ class DeepCaptureSummary:
     """Counts of one finished deep capture, from raw payloads to review pages.
 
     `payloads` is what the interception layers stored; `decoded` how many of those
-    turned into images; `exact_duplicates` / `undecodable` explain the difference.
+    turned into images; `exact_duplicates` (pixel-identical payloads, evidence merged
+    into the kept record) / `undecodable` explain the difference.
     `blank_dropped`, `dom_collapsed` and `cluster_merged` are the three reductions the
     finalization pipeline applies, in that order, and `pages` is what the review window
-    receives (`probable_junk` of them pre-unchecked).
+    receives (`probable_junk` of them pre-unchecked). `merged_duplicates` counts the
+    byte-identical payloads that were never stored as payloads of their own because
+    `_merge_deep_capture_duplicate` folded their ordering evidence into the first copy;
+    they are not part of `payloads`, and decode-time merges never add to this count.
     """
     payloads: int
     decoded: int
@@ -364,6 +385,7 @@ class DeepCaptureSummary:
     cluster_merged: int
     pages: int
     probable_junk: int
+    merged_duplicates: int = 0
 
 
 @dataclass
@@ -381,7 +403,7 @@ class DeepCaptureDomOrder:
     then gap-filled: a key whose element publishes no index inherits the index of its
     nearest indexed predecessor in document order, so a partially tagged document stays
     one sequence instead of splitting into an indexed and an unindexed sort tier; such
-    ties are resolved by document order inside `_deep_capture_sort_key`.
+    ties are resolved by document order inside `_deep_capture_evidence_item_key`.
 
     On a site that publishes no such attributes both maps are empty and `authoritative`
     is False, so ordering behaves exactly as if this tier did not exist.
@@ -1480,17 +1502,36 @@ class CloakFetchDaemon:
         content_type: str,
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
+        """Store one captured payload, or fold a byte-identical repeat into its first copy.
+
+        The raw bytes are written once per sha256. A later payload with the same bytes is
+        not stored again; its `source`, `url` and `metadata` are appended to the kept
+        entry as ordering evidence (`_merge_deep_capture_duplicate`), because the copy
+        that arrived first (usually the network body under a CDN URL) is often the one
+        WITHOUT a DOM key, while a later twin (an `img-element` / `createObjectURL`
+        `blob:` URL) is in the DOM order map. No-op when deep capture is not active or
+        `body` is empty. Called on the browser-owner thread; mutates under `capture.lock`.
+        """
         capture = self._deep_capture
         if capture is None or not self._deep_capture_active or not body:
             return
         digest = hashlib.sha256(body).hexdigest()
         with capture.lock:
             if digest in capture.hashes:
+                # The bytes are already stored, but this copy may carry the ordering
+                # evidence the stored one lacks (a DOM-mapped `blob:` URL arriving after
+                # the CDN network copy), so fold it in instead of discarding it.
+                kept_index = capture.entry_by_digest.get(digest)
+                if kept_index is not None:
+                    _merge_deep_capture_duplicate(
+                        capture.entries[kept_index], source, url, metadata or {}
+                    )
                 return
             capture.hashes.add(digest)
             raw_name = f"{len(capture.entries) + 1:06}_{digest[:16]}.bin"
             raw_path = capture.raw_dir / raw_name
             raw_path.write_bytes(body)
+            capture.entry_by_digest[digest] = len(capture.entries)
             capture.entries.append(
                 {
                     "order": len(capture.entries),
@@ -1501,6 +1542,8 @@ class CloakFetchDaemon:
                     "raw_path": str(raw_path),
                     "size": len(body),
                     "metadata": metadata or {},
+                    "alternates": [],
+                    "duplicates": 0,
                 }
             )
 
@@ -1843,17 +1886,25 @@ class CloakFetchDaemon:
         entries: list[dict[str, Any]],
         cancel_file: Optional[Path],
     ) -> tuple[list[dict[str, Any]], DeepDecodeStats]:
-        """Decode captured payloads into scored records, dropping exact duplicates.
+        """Decode captured payloads into scored records, folding pixel-exact duplicates.
 
         Each record keeps the original entry, decoded RGB image, capture order, a
         blank-frame flag, and a perceptual hash used later for content clustering.
+        A payload whose decoded pixels equal an earlier record's (different bytes, e.g. a
+        canvas readback PNG of a page also fetched as a JPEG) produces no record, but its
+        ordering evidence - its own source/URL/metadata and every alternate it carries - is
+        merged into the kept record's entry via `_merge_deep_capture_duplicate` (bounded by
+        the same cap, without touching the capture-time `duplicates` counter; it is counted
+        in `DeepDecodeStats.exact_duplicates` instead), so that page can still be placed by
+        whichever copy had a DOM key. The kept entries are mutated in place.
         Cancellation via `cancel_file` stops decoding early but keeps what was decoded.
 
         Returns the records together with the pass's `DeepDecodeStats`, which the stop
         summary uses to explain the gap between payloads captured and images decoded.
         """
         records: list[dict[str, Any]] = []
-        image_hashes: set[str] = set()
+        # Decoded-pixel digest -> the record that keeps those pixels.
+        kept_by_pixels: dict[str, dict[str, Any]] = {}
         stats_counters = DeepDecodeStats()
         total = len(entries)
         for index, entry in enumerate(entries):
@@ -1874,8 +1925,18 @@ class CloakFetchDaemon:
                 stats_counters.undecodable += 1
                 continue
             image_digest = _image_exact_digest(image)
-            if image_digest in image_hashes:
+            kept = kept_by_pixels.get(image_digest)
+            if kept is not None:
                 stats_counters.exact_duplicates += 1
+                for evidence in _deep_capture_ordering_evidence(entry):
+                    evidence_metadata = evidence.get("metadata")
+                    _merge_deep_capture_duplicate(
+                        kept["entry"],
+                        str(evidence.get("source") or ""),
+                        str(evidence.get("url") or ""),
+                        evidence_metadata if isinstance(evidence_metadata, dict) else {},
+                        count_duplicate=False,
+                    )
                 _debug_log(
                     "cloak deep decode: [%d/%d] exact-duplicate dropped source=%s %dx%d url=%s",
                     index + 1,
@@ -1886,7 +1947,6 @@ class CloakFetchDaemon:
                     _short_link(str(entry.get("url") or "")),
                 )
                 continue
-            image_hashes.add(image_digest)
             stats = _blank_stats(image)
             blank = _image_looks_blank(image)
             _debug_log(
@@ -1907,15 +1967,15 @@ class CloakFetchDaemon:
                 _image_dhash(image),
                 _short_link(str(entry.get("url") or "")),
             )
-            records.append(
-                {
-                    "entry": entry,
-                    "image": image,
-                    "source_index": index,
-                    "blank": blank,
-                    "phash": _image_dhash(image),
-                }
-            )
+            record = {
+                "entry": entry,
+                "image": image,
+                "source_index": index,
+                "blank": blank,
+                "phash": _image_dhash(image),
+            }
+            kept_by_pixels[image_digest] = record
+            records.append(record)
         stats_counters.decoded = len(records)
         return records, stats_counters
 
@@ -1934,11 +1994,14 @@ class CloakFetchDaemon:
         repeated frames of the same DOM element, cluster the rest by visual content
         so one page captured through several layers (network bytes, canvas readback,
         screenshot) becomes a single page, pick the highest-fidelity representative
-        per cluster, order pages by DOM/geometry/URL signals, and flag size-outlier
-        pages as probable junk for the review UI.
+        per cluster for the pixels, order pages by DOM/geometry/URL signals pooled from
+        every cluster member and every merged duplicate (`_deep_capture_cluster_sort_key`),
+        and flag size-outlier pages as probable junk for the review UI.
 
-        Emits the greppable ``cloak deep summary:`` block (pipeline counters plus a
-        per-source breakdown) once the pipeline has run.
+        Emits the greppable ``cloak deep order:`` block (per final page: tier, sort key,
+        source, URL, alternates, cluster size) right after the sort, and the
+        ``cloak deep summary:`` block (pipeline counters, including the duplicates merged
+        at capture time, plus a per-source breakdown) once the pipeline has run.
 
         Raises RuntimeError if nothing decodable or only blank frames were captured.
         """
@@ -1977,12 +2040,20 @@ class CloakFetchDaemon:
         dom_collapsed = len(records) - len(collapsed)
         clusters = _cluster_deep_records_by_content(collapsed)
         cluster_merged = len(collapsed) - len(clusters)
-        representatives = [_select_cluster_representative(cluster) for cluster in clusters]
-        representatives.sort(
-            key=lambda record: _deep_capture_sort_key(
-                record["entry"], record["image"], record["source_index"], dom_order
+        # The representative decides the pixels; the page's place in the chapter is the
+        # best ordering evidence of ANY cluster member (see `_deep_capture_cluster_sort_key`).
+        representatives: list[dict[str, Any]] = []
+        for cluster in clusters:
+            representative = _select_cluster_representative(cluster)
+            representative["cluster"] = cluster
+            representative["sort_key"], representative["sort_evidence"] = (
+                _deep_capture_cluster_sort_key(cluster, representative, dom_order)
             )
-        )
+            representatives.append(representative)
+        representatives.sort(key=lambda record: record["sort_key"])
+        merged_duplicates = sum(int(entry.get("duplicates") or 0) for entry in entries)
+        for line in _format_deep_capture_order(representatives):
+            _debug_log("%s", line)
         _assign_deep_capture_confidence(representatives)
         probable_junk = sum(1 for record in representatives if record.get("probable_junk"))
         _debug_log(
@@ -2008,6 +2079,7 @@ class CloakFetchDaemon:
             cluster_merged=cluster_merged,
             pages=len(representatives),
             probable_junk=probable_junk,
+            merged_duplicates=merged_duplicates,
         )
         for line in _format_deep_capture_summary(
             summary, _deep_capture_source_breakdown(entries, representatives)
@@ -4006,11 +4078,13 @@ def _format_deep_capture_summary(
     """
     lines = [
         (
-            "cloak deep summary: payloads=%d decoded=%d exact-dupes=%d undecodable=%d "
-            "blank-dropped=%d dom-collapsed=%d cluster-merged=%d pages=%d probable_junk=%d"
+            "cloak deep summary: payloads=%d merged-dupes=%d decoded=%d exact-dupes=%d "
+            "undecodable=%d blank-dropped=%d dom-collapsed=%d cluster-merged=%d pages=%d "
+            "probable_junk=%d"
         )
         % (
             summary.payloads,
+            summary.merged_duplicates,
             summary.decoded,
             summary.exact_duplicates,
             summary.undecodable,
@@ -4064,6 +4138,72 @@ def _canvas_reject_reason(item: dict[str, Any]) -> str:
     if not data.startswith("data:image/png;base64,"):
         return f"unexpected data URL prefix: {data[:80]}"
     return "unknown reject reason"
+
+
+def _merge_deep_capture_duplicate(
+    entry: dict[str, Any],
+    source: str,
+    url: str,
+    metadata: dict[str, Any],
+    *,
+    count_duplicate: bool = True,
+) -> None:
+    """Fold a duplicate's ordering evidence into the kept deep-capture `entry`.
+
+    Used for byte-identical repeats at capture time and, with `count_duplicate=False`,
+    for pixel-identical payloads at decode time (one call per evidence item of the
+    dropped entry, so counting there would inflate the number). When `count_duplicate`
+    is True the entry's `duplicates` counter (summed into the stop summary's
+    `merged-dupes`: byte-identical payloads never stored on their own) is incremented.
+    Appends `{"source", "url", "metadata"}` to the entry's `alternates` list
+    unless that exact evidence is already the entry's own or already listed, or the list
+    already holds `DEEP_CAPTURE_MAX_ENTRY_ALTERNATES` items. The evidence is shaped like
+    an entry so `_deep_capture_ordering_evidence` can hand it to the same lookups.
+    At capture time the caller holds the capture lock; at decode time the entries are
+    no longer shared with the drain. The raw bytes are never touched here.
+    """
+    if count_duplicate:
+        entry["duplicates"] = int(entry.get("duplicates") or 0) + 1
+    candidate = {"source": source, "url": url, "metadata": dict(metadata)}
+    identity = _deep_capture_evidence_identity(candidate)
+    if identity == _deep_capture_evidence_identity(entry):
+        return
+    alternates = entry.get("alternates")
+    if not isinstance(alternates, list):
+        alternates = []
+        entry["alternates"] = alternates
+    if len(alternates) >= DEEP_CAPTURE_MAX_ENTRY_ALTERNATES:
+        return
+    if any(_deep_capture_evidence_identity(known) == identity for known in alternates):
+        return
+    alternates.append(candidate)
+
+
+def _deep_capture_evidence_identity(evidence: dict[str, Any]) -> tuple[str, str, str]:
+    """Hashable identity of one piece of ordering evidence: source, URL, metadata."""
+    metadata = evidence.get("metadata")
+    metadata_items = sorted(metadata.items()) if isinstance(metadata, dict) else []
+    return (
+        str(evidence.get("source") or ""),
+        str(evidence.get("url") or ""),
+        repr(metadata_items),
+    )
+
+
+def _deep_capture_ordering_evidence(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """All ordering evidence of one captured payload: the entry itself, then its alternates.
+
+    Each item is entry-shaped (`source`, `url`, `metadata`), so every per-capture lookup
+    (`_deep_capture_resolved_*`, `_deep_capture_dom_order`, URL geometry / page number)
+    applies to it unchanged. This is the one place that defines what "the evidence of an
+    entry" is; `_deep_capture_cluster_sort_key` keys every item of every cluster member
+    and keeps the smallest whole key.
+    """
+    evidence = [entry]
+    alternates = entry.get("alternates")
+    if isinstance(alternates, list):
+        evidence.extend(item for item in alternates if isinstance(item, dict))
+    return evidence
 
 
 def _deep_capture_lookup_dom_value(
@@ -4125,36 +4265,41 @@ def _deep_capture_resolved_page_index(
     )
 
 
-def _deep_capture_sort_key(
-    entry: dict[str, Any],
-    image: Image.Image,
+def _deep_capture_evidence_item_key(
+    item: dict[str, Any],
+    *,
+    area: int,
     fallback_index: int,
-    dom_order: Optional[DeepCaptureDomOrder] = None,
+    capture_order: int,
+    dom_order: Optional[DeepCaptureDomOrder],
 ) -> tuple[int, int, int, int, int, int]:
-    """Sort key placing a captured page in reading order.
+    """Sort key placing a page in reading order from ONE item of its ordering evidence.
 
-    Returns `(primary_rank, primary_value, dom_position, source_rank, fallback_index,
-    area_rank)`. `primary_rank` names the strongest ordering signal available for this
-    capture, in descending trust: 0 the site's own published page index (only when the
-    DOM read marked it authoritative), 1 combined document order, 2 per-snapshot DOM walk
-    order, 3 on-page geometry, 4 a URL-embedded page number, 5 capture order. Records that
-    resolve through different tiers are grouped tier by tier, so the tiers must stay
-    ordered from most to least trustworthy.
+    `item` is entry-shaped (`source`, `url`, `metadata`; see
+    `_deep_capture_ordering_evidence`). Returns `(primary_rank, primary_value,
+    dom_position, source_rank, fallback_index, area_rank)`. `primary_rank` names the
+    strongest signal this item carries, in descending trust: 0 the site's own published
+    page index (only when the DOM read marked it authoritative), 1 combined document
+    order, 2 per-snapshot DOM walk order, 3 on-page geometry, 4 a URL-embedded page
+    number, 5 capture order (`capture_order`). Records that resolve through different
+    tiers are grouped tier by tier, so the tiers must stay ordered from most to least
+    trustworthy.
 
-    `dom_position` is the record's place in combined document order, or
+    `dom_position` is the item's place in combined document order, or
     `_UNKNOWN_DOM_POSITION` when it has none. It sits immediately after `primary_value`
     so that any tie inside a tier - most importantly several pages sharing one published
-    index, which is what a single shared `data-index` wrapper produces - degrades to
-    document order instead of to network arrival order.
+    index - degrades to document order instead of to network arrival order. `area` is the
+    pixel area of the image the page will show (larger sorts first on a full tie);
+    `area`, `fallback_index` and `capture_order` describe the page, not the item, so
+    every item of one page is keyed with the same values.
     """
-    url = str(entry.get("url") or "")
-    page_index = _deep_capture_resolved_page_index(entry, url, dom_order)
-    dom_index = _deep_capture_resolved_dom_index(entry, url, dom_order)
-    dom_walk_order = _deep_capture_dom_order(entry)
+    url = str(item.get("url") or "")
+    page_index = _deep_capture_resolved_page_index(item, url, dom_order)
+    dom_index = _deep_capture_resolved_dom_index(item, url, dom_order)
+    dom_walk_order = _deep_capture_dom_order(item)
     absolute_top = _deep_capture_canvas_top(url)
     sequence = _deep_capture_url_sequence(url)
-    source = str(entry.get("source") or "")
-    source_rank = _deep_capture_source_rank(source)
+    source_rank = _deep_capture_source_rank(str(item.get("source") or ""))
     # The site's own published page index is the ground truth when it exists (it orders
     # canvas and <img> pages in one sequence even when only one kind survives in the
     # DOM); then document order, per-snapshot DOM walk order, on-page geometry,
@@ -4176,10 +4321,108 @@ def _deep_capture_sort_key(
         primary_value = sequence
     else:
         primary_rank = 5
-        primary_value = int(entry.get("order") or fallback_index)
+        primary_value = capture_order
     dom_position = _UNKNOWN_DOM_POSITION if dom_index is None else dom_index
-    area_rank = -int(image.width * image.height)
-    return (primary_rank, primary_value, dom_position, source_rank, fallback_index, area_rank)
+    return (primary_rank, primary_value, dom_position, source_rank, fallback_index, -area)
+
+
+def _deep_capture_capture_order(entry: dict[str, Any], fallback_index: int) -> int:
+    """Tier-5 value of one entry: its capture `order`, else `fallback_index`."""
+    return int(entry.get("order") or fallback_index)
+
+
+def _deep_capture_cluster_sort_key(
+    cluster: list[dict[str, Any]],
+    representative: dict[str, Any],
+    dom_order: Optional[DeepCaptureDomOrder] = None,
+) -> tuple[tuple[int, int, int, int, int, int], dict[str, Any]]:
+    """Sort key of one page (a content cluster) and the evidence item that decided it.
+
+    The only production ordering entry point; a single capture is a cluster of one.
+    Every item of `_deep_capture_ordering_evidence` of every member (each entry plus its
+    merged alternates) is keyed by `_deep_capture_evidence_item_key` with the same
+    page-level values - the `representative`'s area, the smallest member
+    `source_index`, the smallest member capture order - and the lexicographically
+    smallest whole key wins, so the key is always one real item's key (no field is mixed
+    in from another item). The `representative` decides the pixels only: it is chosen by
+    fidelity, so it is often a blob/offscreen export with no DOM key while another member
+    (a network copy under a DOM-mapped URL) knows exactly where the page sits.
+
+    For a single entry with no alternates this is exactly that entry's own key. Returns
+    `(key, deciding_item)`; ties between items keep the first in member/evidence order.
+    `cluster` must be non-empty and every member must carry `entry`, `image`,
+    `source_index`.
+    """
+    fallback_index = min(int(record["source_index"]) for record in cluster)
+    capture_order = min(
+        _deep_capture_capture_order(record["entry"], int(record["source_index"]))
+        for record in cluster
+    )
+    image = representative["image"]
+    area = int(image.width * image.height)
+    best: Optional[tuple[tuple[int, int, int, int, int, int], dict[str, Any]]] = None
+    for record in cluster:
+        for item in _deep_capture_ordering_evidence(record["entry"]):
+            key = _deep_capture_evidence_item_key(
+                item,
+                area=area,
+                fallback_index=fallback_index,
+                capture_order=capture_order,
+                dom_order=dom_order,
+            )
+            if best is None or key < best[0]:
+                best = (key, item)
+    if best is None:
+        raise ValueError("cannot order an empty deep-capture cluster")
+    return best
+
+
+def _middle_elide(text: str, limit: int) -> str:
+    """Shorten `text` to `limit` characters by eliding its middle (keeps head and tail)."""
+    if len(text) <= limit:
+        return text
+    head = (limit - 3) // 2
+    tail = limit - 3 - head
+    return f"{text[:head]}...{text[-tail:]}"
+
+
+def _format_deep_capture_order(pages: list[dict[str, Any]]) -> list[str]:
+    """Render the greppable ``cloak deep order:`` block for the final sorted pages.
+
+    `pages` are the finalized records in output order; each carries its `entry` (the
+    representative's), the `sort_key` it was ordered by, the `sort_evidence` item that
+    decided that key, and its `cluster` (member records). One header line, then one line
+    per page: final position, tier (`sort_key[0]`), the whole sort key, the source kind
+    of the pixels (`source=`), the source and URL of the deciding evidence (`via=`,
+    `url=`), the representative's own URL only when it differs (`primary=`), the number
+    of alternate evidence items pooled from every cluster member, and the cluster size.
+    URLs are middle-elided to `DEEP_CAPTURE_ORDER_LOG_URL_LIMIT`. Logging only; one
+    block per stop.
+    """
+    lines = [f"cloak deep order: {len(pages)} page(s), key=(tier, value, dom, source, index, -area)"]
+    for position, record in enumerate(pages, start=1):
+        entry = record["entry"]
+        cluster = record.get("cluster") or [record]
+        alternates = sum(
+            len(_deep_capture_ordering_evidence(member["entry"])) - 1 for member in cluster
+        )
+        sort_key = record.get("sort_key") or ()
+        tier = sort_key[0] if sort_key else "?"
+        evidence = record.get("sort_evidence")
+        if not isinstance(evidence, dict):
+            evidence = entry
+        primary_url = str(entry.get("url") or "")
+        deciding_url = str(evidence.get("url") or "")
+        line = (
+            f"cloak deep order: #{position} tier={tier} key={tuple(sort_key)} "
+            f"source={entry.get('source') or '?'} via={evidence.get('source') or '?'} "
+            f"alts={alternates} cluster={len(cluster)} "
+            f"url={_middle_elide(deciding_url, DEEP_CAPTURE_ORDER_LOG_URL_LIMIT)}"
+        )
+        if primary_url != deciding_url:
+            line += f" primary={_middle_elide(primary_url, DEEP_CAPTURE_ORDER_LOG_URL_LIMIT)}"
+        lines.append(line)
+    return lines
 
 
 def _deep_capture_item_metadata(item: dict[str, Any]) -> dict[str, Any]:
@@ -4309,6 +4552,12 @@ def _collapse_deep_capture_dom_updates(records: list[dict[str, Any]]) -> list[di
     `dom_order`); within a key the most-preferred frame wins. Captures without an
     element key (network bytes, blob/offscreen exports) pass through untouched and
     are later merged by visual content in `_cluster_deep_records_by_content`.
+
+    The dropped frames' ordering evidence is deliberately NOT carried into the survivor:
+    the element-level evidence (`element_id` / `dom_order`) is identical by construction,
+    and the rest (their URLs and merged alternates) describes the dropped frames' own
+    pixels - on a recycled canvas pool those are other pages, whose positions must not
+    be attached to this one.
     """
     by_element: dict[tuple[str, int], dict[str, Any]] = {}
     passthrough: list[dict[str, Any]] = []
@@ -4345,8 +4594,37 @@ def _deep_capture_record_preference(record: dict[str, Any]) -> tuple[int, int, i
     return (nonblank, source_quality, area, source_index)
 
 
+# URL schemes whose path is a real resource path that may carry a page number. `blob:`
+# (a random UUID), `data:` (base64) and synthetic schemes (`deep-capture://`, `about:`)
+# only ever yield junk digits, which as merged alternates would outrank real page numbers.
+_DEEP_CAPTURE_PAGE_NUMBER_SCHEMES = frozenset({"http", "https", "file"})
+
+
 def _deep_capture_url_sequence(url: str) -> Optional[int]:
+    """Page number embedded in a capture URL (tier 4 of the sort key), if any.
+
+    Returns `None` for any scheme outside `_DEEP_CAPTURE_PAGE_NUMBER_SCHEMES`. The file
+    name is tried first: the LAST standalone run of 1-4 digits in the last path segment
+    whose value is in range (not touching a letter or another digit, so `2-fdff….png` ->
+    2, `012.jpg` -> 12, `page_7.webp` -> 7, `chapter-12-page-3.jpg` -> 3, `012_003.jpg`
+    -> 3, while hash characters and long digit runs never count; the page number trails
+    a chapter number far more often than it leads it). Only when the file name has none
+    does the whole path plus query fall back to the smallest 1-3 digit run; that
+    whole-URL rule alone made a chapter-hash directory such as `/data/db66…/` yield the
+    same number for every page. Values outside 0 < n <= 500 are ignored in both rules.
+    Returns `None` when neither finds a number.
+    """
     parsed = urlparse(url)
+    if parsed.scheme.lower() not in _DEEP_CAPTURE_PAGE_NUMBER_SCHEMES:
+        return None
+    file_name = unquote(parsed.path).rstrip("/").rsplit("/", 1)[-1]
+    file_name_numbers = [
+        int(match.group(0))
+        for match in re.finditer(r"(?<![A-Za-z0-9])\d{1,4}(?![A-Za-z0-9])", file_name)
+    ]
+    in_range = [number for number in file_name_numbers if 0 < number <= 500]
+    if in_range:
+        return in_range[-1]
     value = unquote(f"{parsed.path}?{parsed.query}")
     numbers = [
         int(match.group(0))
@@ -4569,7 +4847,7 @@ def _fill_page_index_gaps(
     not tag, an `<img>` whose wrapper lost the attribute - would resolve no index, fall
     into the next sort tier, and be concatenated after *every* indexed page instead of
     staying where the document puts it. Inherited slots tie with their predecessor and
-    are separated by document order in `_deep_capture_sort_key`.
+    are separated by document order in `_deep_capture_evidence_item_key`.
 
     Returns an empty mapping when no element publishes an index.
     """
