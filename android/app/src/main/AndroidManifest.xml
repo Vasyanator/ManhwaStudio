@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Manifest of the ManhwaStudio Android app.
+
+  LaunchActivity is the launcher entry: it installs the bundled runtime files into
+  filesDir/ms_root (AssetInstaller) off the UI thread, then starts MainActivity, the
+  GameActivity that hosts the Rust library (android.app.lib_name = the cdylib name).
+
+  configChanges: the Rust app lives as long as its Activity, so every configuration change a
+  desktop-class session produces (DeX / freeform resize, rotation, density, keyboard or mouse
+  attach, dark mode, locale) is delivered to the running Activity instead of recreating it.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- eframe renders through GLES 3 (egui-shader-layers needs 3.0). -->
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+    <!-- Downloads (chapters, fonts, spellcheck dictionaries) and AI API calls. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- allowBackup off: the runtime root holds hundreds of MB of bundled fonts and the user's
+         projects; cloud auto-backup of them is neither wanted nor bounded. -->
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:resizeableActivity="true"
+        android:theme="@style/Theme.ManhwaStudio">
+
+        <activity
+            android:name=".LaunchActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode|locale|layoutDirection|fontScale|touchscreen|colorMode"
+            android:exported="true"
+            android:resizeableActivity="true"
+            android:theme="@style/Theme.ManhwaStudio.Launch">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode|locale|layoutDirection|fontScale|touchscreen|colorMode"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:theme="@style/Theme.ManhwaStudio"
+            android:windowSoftInputMode="adjustResize">
+            <!-- The library GameActivity loads; must equal the Rust cdylib name. -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="manhwastudio_rs" />
+        </activity>
+    </application>
+</manifest>

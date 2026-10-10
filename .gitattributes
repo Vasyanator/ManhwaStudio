@@ -20,6 +20,12 @@ run-dev.Linux.sh         text eol=lf
 run-dev.MacOS.command    text eol=lf
 tools/run-dev/*.sh       text eol=lf
 
+# Android build: POSIX scripts (a CRLF shebang line is not executable) and the Gradle
+# wrapper's batch file (cmd.exe needs CRLF).
+build-android.sh         text eol=lf
+android/gradlew          text eol=lf
+android/gradlew.bat      text eol=crlf
+
 # tools/run-dev/run-dev.ps1 is deliberately absent: PowerShell accepts either
 # line ending, and what actually matters there — the UTF-8 BOM — is not affected
 # by any line-ending attribute.

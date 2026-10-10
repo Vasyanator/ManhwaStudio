@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- MainActivity: GameActivity extends AppCompatActivity, so an AppCompat theme is required.
+         Dark background: the Rust UI uses egui's dark theme, so no white flash before the first
+         frame. -->
+    <style name="Theme.ManhwaStudio" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+
+    <!-- LaunchActivity: a plain Activity showing the asset-install progress. -->
+    <style name="Theme.ManhwaStudio.Launch" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
+</resources>

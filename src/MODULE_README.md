@@ -70,6 +70,9 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - `android_entry.rs` (`cfg(target_os = "android")`): the unmangled `android_main(AndroidApp)`
   android-activity calls. Order is a contract: register the handle in
   `ms_window_geometry::android_app` (every `NativeOptions` reads `android_app` from there),
+  refuse to start unless the Kotlin `AssetInstaller` installed THIS APK's bundled files into the
+  runtime root (bundled stamp asset `ms_root.stamp` == `ms_root/.ms_assets_stamp`; the names are
+  shared with `android/app/src/main/kotlin/.../AssetInstaller.kt`, see `android/README.md`),
   init `rustls-platform-verifier` with the application context (fatal on failure: the verifier
   panics on first use otherwise), create `<internal data dir>/ms_root` and make it the working
   directory BEFORE any `ms_config` / `ms_fonts` call (the runtime root falls back to the working

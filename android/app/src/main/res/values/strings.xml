@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- English (reference) strings of the Android shell. The Rust UI is localized by ms-i18n;
+     only the few texts shown before the Rust library starts live here. -->
+<resources>
+    <string name="app_name" translatable="false">ManhwaStudio</string>
+    <string name="launch_installing_status">Preparing resources… %1$d of %2$d files</string>
+    <string name="launch_install_error">Could not prepare the program resources.\n\n%1$s\n\nFree some storage space and start the app again.</string>
+</resources>

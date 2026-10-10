@@ -14,6 +14,8 @@ Rust application code lives under `src/` and is the current implementation; it o
 - `build_zip.py`: builds `ManhwaStudio.zip`; synchronizes `config.py VERSION` from `Cargo.toml` before archiving.
 - `build-all.py`: release orchestrator; builds the desktop target matrix, signs Windows exes, invokes `build_zip.py`, and assembles `target/final/` under updater-expected asset names.
 - `modules/`: Python helper modules used by launcher/backend flows.
+- `build-android.sh` + `android/`: one-command Android APK build (cargo-ndk cdylib, bundled fonts,
+  Gradle wrapper project with the Kotlin shell); see `android/README.md`.
 - `src/`: Rust application source.
 
 ## Contracts and invariants
@@ -34,4 +36,5 @@ Rust application code lives under `src/` and is the current implementation; it o
 - To change the embedded icon, the version composition, or the codesign worker, edit `build.rs`.
 - To change ZIP contents or version synchronization, edit `build_zip.py`.
 - To change Python runtime constants, edit `config.py`.
+- To change the Android APK build or bundled files, edit `build-android.sh`; the Android shell lives in `android/`.
 - To change current application behavior, prefer `src/` unless the task explicitly targets legacy Python/runtime packaging.

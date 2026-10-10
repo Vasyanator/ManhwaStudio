@@ -46,6 +46,28 @@
 !run-dev.MacOS.command
 !run-dev.Windows.bat
 
+# Android app: the one-command build script and the Gradle project in android/ (sources,
+# Gradle scripts, Gradle wrapper). Everything build-android.sh stages into app/src/main
+# (jniLibs/, assets/, the launcher icon PNG), Gradle build outputs and caches,
+# android/local.properties and every keystore stay out: only the patterns below are re-included.
+!build-android.sh
+!android/
+!android/**/
+!android/README.md
+!android/**/*.kts
+!android/**/*.kt
+!android/**/*.xml
+!android/gradle.properties
+!android/gradlew
+!android/gradlew.bat
+!android/gradle/wrapper/gradle-wrapper.jar
+!android/gradle/wrapper/gradle-wrapper.properties
+android/.gradle/
+android/.kotlin/
+android/**/build/
+android/app/src/main/jniLibs/
+android/app/src/main/assets/
+
 # Application icons embedded by Rust code and the Windows resource build.
 !app_icon.ico
 !app_icon_512.png

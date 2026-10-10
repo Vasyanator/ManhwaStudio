@@ -44,6 +44,11 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   `cargo check-all`, `cargo clippy --workspace --all-targets -- -D warnings` (linux and
   `--target x86_64-pc-windows-gnu`), `cargo test -p <every touched crate>` and the Android check,
   each with `--message-format short` where cargo supports it.
+- Android (`aarch64-linux-android`, not a mandatory target yet): check / lint the root library
+  with `cargo ndk -t arm64-v8a --platform 31 clippy -p manhwastudio_rs --lib -- -D warnings`
+  (`ANDROID_NDK_HOME` set); the APK is built only by `./build-android.sh` (`--install` deploys;
+  see `android/README.md`). Its cdylib comes from `cargo rustc --crate-type cdylib`: never add
+  `cdylib` to the root `[lib]`, every desktop build would then link one.
 - Cargo unifies features across the workspace, so a crate can build inside it and fail alone.
   After changing a crate's manifest or features, also run
   `cargo clippy -p <crate> --all-targets --all-features --target <t> -- -D warnings` per target.

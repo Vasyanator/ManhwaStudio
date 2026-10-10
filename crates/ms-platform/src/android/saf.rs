@@ -21,7 +21,7 @@ use std::sync::{Mutex, PoisonError};
 /// Binary name of the Kotlin SAF bridge class, loaded through the application class loader.
 /// The single owner of this name; the Gradle project must declare the class under it.
 #[cfg(target_os = "android")]
-pub(crate) const SAF_BRIDGE_CLASS: &jni::strings::JNIStr = jni::jni_str!("com.manhwastudio.platform.SafBridge");
+pub(crate) const SAF_BRIDGE_CLASS: &jni::strings::JNIStr = jni::jni_str!("io.github.vasyanator.manhwastudio.platform.SafBridge");
 
 /// Requests waiting for an asynchronous result, keyed by a process-unique id.
 pub(crate) struct PendingRegistry<T> {
