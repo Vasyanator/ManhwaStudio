@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: crates/ms-sysprobe/src/ai_models.rs (re-exported as `crate::ai_models`)
+FILE OVERVIEW: crates/ms-sysprobe/src/ai_models.rs
 Application-managed AI model resolver and lazy Hugging Face downloader.
 
 Main responsibilities:

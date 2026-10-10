@@ -63,6 +63,17 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   items; the shims stay `pub(crate)`, so a shim no call site uses is an unused-import error and
   is removed rather than kept. The library exists so a platform build that needs one (Android
   `cdylib`) reaches the same startup code; its crate type stays the default `rlib`.
+- `android_entry.rs` (`cfg(target_os = "android")`): the unmangled `android_main(AndroidApp)`
+  android-activity calls. Order is a contract: register the handle in
+  `ms_window_geometry::android_app` (every `NativeOptions` reads `android_app` from there),
+  init `rustls-platform-verifier` with the application context (fatal on failure: the verifier
+  panics on first use otherwise), create `<internal data dir>/ms_root` and make it the working
+  directory BEFORE any `ms_config` / `ms_fonts` call (the runtime root falls back to the working
+  dir), then `native_main()`. Errors are logged to logcat and `android_main` returns.
+  Logging there: `android_logger` for the `log` facade; android-activity already forwards
+  stdout/stderr and panics to logcat; `runtime_log` writes `ms_root/last.log` as on desktop.
+  A new `eframe::run_native` anywhere in the process must set
+  `android_app: ms_window_geometry::android_app::current()` under the same cfg.
 - `args.rs`: `clap` CLI contract, including visible startup/update flags, the open target
   (`--project` XOR `--image` XOR a positional image path, clap group `open_target`), the
   update-check test override, the environment-check and run-from-sources flags, and hidden

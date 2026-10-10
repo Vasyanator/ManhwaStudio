@@ -11,16 +11,18 @@ ManhwaStudio is a desktop editor for translating comics (manga / manhwa): a chap
 translated (bubbles, OCR, machine translation), cleaned (clean layers, inpainting), typeset
 (rendered text layers) and exported.
 
-- **Rust application** — a Cargo workspace: the thin binary `manhwastudio_rs` (`src/`) over 38
-  `ms-*` library crates in `crates/`. Builds for Linux and Windows (mandatory), macOS, and
-  `wasm32` (web entry, `src/web_entry.rs`).
+- **Rust application** — a Cargo workspace: the root package `manhwastudio_rs` (`src/`: a
+  library holding the application, plus a thin binary entry) over 38 `ms-*` library crates in
+  `crates/`. Builds for Linux and Windows (mandatory), macOS, `wasm32` (web entry,
+  `src/web_entry.rs`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
+  exists so that build can export `android_main`).
 - **Python AI backend** — an optional separate process (`ai_backend.py` + `modules/ai_backend/`)
   for torch-based models. The app also has an in-process native ONNX runtime, so most basic AI
   features work without Python.
 - `old_or_test/` holds the archived 2.x Python UI: never an architecture reference.
 
 ```text
-main.rs / args.rs  (CLI, startup routing, process-global services)
+lib.rs / args.rs  (CLI, startup routing, process-global services; main.rs is a thin entry)
   -> ms-launcher (project catalogue, New Project, import)   -- separate eframe window
   -> studio_bootstrap.rs (loads ProjectData off the GUI thread behind a loading screen)
   -> MangaApp (src/app.rs: editor root, owns tabs, shared models, loader pool, panel dock)
@@ -36,7 +38,7 @@ layering. Dependencies point DOWN only (`<-` = "depends on"); a level may use an
 crates on one line do not know each other.
 
 ```text
-bin (src/: main.rs, app.rs, studio_bootstrap.rs, tabs/settings/, web_entry.rs)
+root package (src/: lib.rs + thin main.rs, app.rs, studio_bootstrap.rs, tabs/settings/, web_entry.rs)
   <- ms-launcher / ms-tab-page-manager
   <- ms-settings-ui / ms-tab-cleaning / ms-tab-ps-editor
   <- ms-tab-translation / ms-tab-typing
@@ -55,7 +57,7 @@ Non-obvious edges: `ms-tools` sits ABOVE `ms-canvas`; `ms-widgets` does NOT depe
 `ms-models`; `ms-models` depends on `ms-text-render` (layer effects). Tab-to-tab edges exist and
 point down only: page-manager -> ps-editor -> typing; cleaning -> translation -> tabs-simple;
 `ms-settings-ui` and `ms-launcher` also use `ms-tab-translation`. The studio never references
-`ms-launcher`; only `main.rs` / `web_entry.rs` start it.
+`ms-launcher`; only `lib.rs` (native startup) / `web_entry.rs` start it.
 
 **Foundation (levels 0-2)**
 - `ms-thread` — `std::thread` surface; Web Workers on wasm.
@@ -137,10 +139,13 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   dependencies in `[workspace.dependencies]`); their local checkouts under `crates/` are
   gitignored. `egui-large-image` does the tiled display of very large images (launcher ribbon
   and crop editor, page-manager viewer).
+- `crates/winit`, `crates/egui` — Android-port forks of winit 0.30 and the egui family
+  (separate git repositories, gitignored), wired in by root `[patch.crates-io]`; fork changes are
+  Android-only, so desktop builds compile the released code.
 
 ## 3. Startup and process lifetime
 
-- `src/main.rs::run_main` runs the launcher and the studio as **sequential `eframe::run_native`
+- `src/lib.rs::run_main` runs the launcher and the studio as **sequential `eframe::run_native`
   windows in one process**. Process-global services created there outlive both windows: the
   `AiBackendSupervisor` (backend process and health/device probe), the UI-scale slot, the
   `ms-fonts` byte cache, the Hugging Face token cache.

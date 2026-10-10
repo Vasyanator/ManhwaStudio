@@ -74,7 +74,7 @@ Verified in both directions:
 
 - `crates/ms-storage/src/global.rs:72` declares `pub fn install` under
   `#[cfg(target_arch = "wasm32")]`. It has one real caller, `src/web_entry.rs:38`.
-  `find_referencing_symbols` returns `{}` — because `src/main.rs:56-57` gates `mod web_entry` at
+  `find_referencing_symbols` returns `{}` — because `src/lib.rs:68-69` gates `mod web_entry` at
   the module declaration, so that file does not exist for the linux target.
 - That same `install` function *was* returned as a referencing symbol when searching for
   references to `Storage`, proving a cfg-gated item inside a loaded file is indexed normally.

@@ -149,7 +149,7 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
 
 The AI backend and tutorials sections have no studio-local file: they are rendered inline in
 `mod.rs::draw` through `SharedSettingsPanels::draw`, which forwards to the shared
-`crate::ai_backend_panel::draw_ai_backend_panel` and `crate::tutorial::draw_tutorials_pane`. The
+`ms_settings_ui::ai_backend_panel::draw_ai_backend_panel` and `crate::tutorial::draw_tutorials_pane`. The
 `SharedSettingsPanels` container (in `crate::settings_shared`) owns the panel scratch state and the
 tutorial progress handle; the studio passes its `AiBackendHandle` in by reference. The AI backend
 panel hosts the "ONNX-инференс" runtime selector, the OFFLINE-capable RUNTIME-BRANCHED ONNX
@@ -197,7 +197,7 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
 - Persisted settings errors should be surfaced or logged with context; do not silently replace real
   failures with fake success.
 - UI-visible strings are localized through the `ms-i18n` `t!` / `tf!` macros (crate-wide via
-  `#[macro_use] extern crate ms_i18n;` in `main.rs`); the Russian source lives in
+  `#[macro_use] extern crate ms_i18n;` in `lib.rs`); the Russian source lives in
   `crates/ms-i18n/locales/{ru,en}.json`. Enum wire tokens (`AsideBubbleCompactMode::as_str`, …),
   serde field names, and `user_config.json` keys stay byte-identical English/serde and must NOT be
   routed through `t!` (see `docs/i18n_exclusions.md`). Any `WheelComboBox::from_label` /
@@ -220,7 +220,7 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   `crates/ms-canvas/src/types.rs`, and finally the widget here. The struct literals carry no
   `..Default::default()`, so the compiler flags every construction site.
 - To change AI backend process controls, process logs, autostart, or device/probe commands, edit the
-  shared `crate::ai_backend_panel` widget and the `save_*` worker functions in `mod.rs`; the studio
+  shared `ms_settings_ui::ai_backend_panel` widget and the `save_*` worker functions in `mod.rs`; the studio
   renders it inline in `mod.rs::draw` (scroll area + `shared.draw(AiBackend, ..)`).
 - To change the projects directory, the memory profile, or the UI-interface language, edit the shared
   `crate::general_settings_panel` widget (used by both the studio pane and the launcher); the studio

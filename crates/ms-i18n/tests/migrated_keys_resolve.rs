@@ -64,7 +64,7 @@ const SAMPLE: &[(&str, &str)] = &[
     ("installer.install.install_button", "Установить"),
     ("installer.common.close_button", "Закрыть"),
     // Keys migrated in the final root-`src/` batch (app.rs, ai_backend*, backend_ipc,
-    // onnx_runtime, main.rs, and the shared root modules).
+    // onnx_runtime, lib.rs, and the shared root modules).
     ("app.tab.translation", "Перевод"),
     ("ai_backend.check_now_button", "Проверить сейчас"),
     (

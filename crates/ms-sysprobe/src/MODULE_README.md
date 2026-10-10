@@ -9,11 +9,12 @@ process-global Torch-availability slot. Independent modules with nothing in comm
 that each asks the operating system or a remote service a blocking question and returns a
 plain answer, with no knowledge of the caller's state.
 
-This is a standalone workspace crate. `src/main.rs` mounts it under the historical module
+This is a standalone workspace crate. `src/lib.rs` mounts it under the historical module
 names with
-`pub use ms_sysprobe::{ai_install_probe, gpu_utils, paste_image, python_manager, screen_capture};` and
-`pub use ms_sysprobe::{ai_backend_capabilities, ai_models, hf_token};`, so every
-application call site keeps writing `crate::gpu_utils::…` and friends.
+`pub(crate) use ms_sysprobe::{ai_install_probe, python_manager};` and
+`pub(crate) use ms_sysprobe::hf_token;`, so those call sites keep writing
+`crate::python_manager::…` and friends; `gpu_utils`, `paste_image`, `screen_capture`,
+`ai_backend_capabilities` and `ai_models` have no root shim (callers name `ms_sysprobe::` directly).
 
 ## Architecture
 No shared state and one cross-module call (`ai_install_probe` runs its snippet through
@@ -61,7 +62,7 @@ Callers own the threading: nothing here spawns a worker for you.
   package and import status, and classifies the machine into `ms_config::AiInstallType`
   (`None` / `Base` / `Full`). Report parsing and classification are target-neutral; only the
   spawn half is `#[cfg(not(wasm32))]`. Edit here for a new probed package or a changed level
-  rule; PERSISTING the level is the caller's job (`main.rs`).
+  rule; PERSISTING the level is the caller's job (`lib.rs`).
 - `gpu_utils.rs`: vendor/architecture detection (NVIDIA, AMD, Apple), CUDA/ROCm runtime
   versions, Linux driver + ROCm installation state, ROCm 7.2 LLVM-target support, Windows
   DirectML accelerators, and the WebGPU adapter enumeration whose returned index IS Dawn's
@@ -123,6 +124,5 @@ Callers own the threading: nothing here spawns a worker for you.
 - To change how the Hugging Face token is stored or seeded, see `hf_token.rs` — and keep
   the rule that no message may interpolate the value.
 - To let a new consumer reach these modules, no change is needed here: it already sees them
-  as `crate::ai_install_probe` / `crate::gpu_utils` / `crate::python_manager` /
-  `crate::screen_capture` / `crate::ai_models` / `crate::hf_token` /
-  `crate::ai_backend_capabilities` through the `src/main.rs` re-export.
+  as `ms_sysprobe::<module>` (the `src/lib.rs` shims `crate::ai_install_probe` /
+  `crate::python_manager` / `crate::hf_token` still exist).

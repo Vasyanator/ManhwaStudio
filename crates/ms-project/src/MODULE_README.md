@@ -4,7 +4,7 @@
 Crate root of `ms-project`: the project/chapter domain model of ManhwaStudio and the
 load-time passes that bring a chapter folder into a consistent, current shape before
 any tab or worker reads it. Re-exported by the binary as `crate::project`
-(`src/main.rs`).
+(`src/lib.rs`).
 
 GUI-free: it produces data for the editor, never widgets. All of its work is blocking
 disk I/O, so it runs on the background load thread (`src/studio_bootstrap.rs`), never

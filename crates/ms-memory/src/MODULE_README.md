@@ -7,7 +7,7 @@ which cached resources should be dropped first. It never owns a pixel, a
 `egui::TextureHandle`, or any tab state — cache owners keep their storage and ask this
 crate what to evict.
 
-Single-file crate (`lib.rs`). `src/main.rs` mounts it with
+Single-file crate (`lib.rs`). `src/lib.rs` mounts it with
 `pub use ms_memory as memory_manager;`, so application call sites keep writing
 `crate::memory_manager::…`.
 

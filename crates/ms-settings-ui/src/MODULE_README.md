@@ -5,7 +5,7 @@ The settings surface ManhwaStudio's TWO shells share. The launcher's settings pa
 studio's Settings tab render the same General / AI-backend / Tutorials panes and drive the
 same AI-backend supervisor, so neither shell may own them. Re-exported by the binary under
 the module names its call sites already use (`crate::settings_shared`,
-`crate::general_settings_panel`, `crate::ai_backend_panel`, `crate::ai_backend_supervisor`,
+`crate::general_settings_panel`, `crate::ai_backend_supervisor`,
 `crate::tutorial`).
 
 ## Architecture
@@ -47,7 +47,7 @@ dependency list.
   is declared in `ms_config::settings_deep_link` (the typing tab requests deep links and may not
   depend on this crate) and only re-exported here.
 - `storage_mode_job.rs`: the ONE process-wide Dev/Prod conversion job (slot Idle / Pending /
-  Running {done,total} / Finished {outcome}). The startup reconciliation (`main.rs` records it
+  Running {done,total} / Finished {outcome}). The startup reconciliation (`lib.rs` records it
   pending; the launcher loop or `studio_bootstrap` starts it) and the General pane's switch
   both run `ms_project::storage_mode::convert_globals` through it on a named worker
   (`docstore-reconcile` / `docstore-convert`), so two drivers never run at once. The

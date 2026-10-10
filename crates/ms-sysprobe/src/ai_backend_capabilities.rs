@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: crates/ms-sysprobe/src/ai_backend_capabilities.rs (re-exported as `crate::ai_backend_capabilities`)
+FILE OVERVIEW: crates/ms-sysprobe/src/ai_backend_capabilities.rs
 Process-wide AI runtime capability slots, mirrored from honest sources so the UI
 can gate tool buttons without touching the shared health snapshot lock.
 

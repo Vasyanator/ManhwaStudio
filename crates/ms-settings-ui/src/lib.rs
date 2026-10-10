@@ -3,7 +3,7 @@ FILE OVERVIEW: crates/ms-settings-ui/src/lib.rs
 Crate root of `ms-settings-ui`: the settings surface shared by BOTH application shells —
 the launcher's settings page and the studio's Settings tab. The binary re-exports every
 module under the name its call sites already use (`crate::settings_shared`,
-`crate::general_settings_panel`, `crate::ai_backend_panel`, `crate::ai_backend_supervisor`,
+`crate::general_settings_panel`, `crate::ai_backend_supervisor`,
 `crate::tutorial`), so no path in `src/` had to change.
 
 Main modules:

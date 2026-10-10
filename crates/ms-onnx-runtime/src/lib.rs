@@ -27,8 +27,8 @@ and every additional source share one download+verify+extract path. Downloads an
 disk I/O are blocking; `resolve_or_download_ort_dylib` MUST run on a worker thread,
 never on the GUI thread. This module owns dylib RESOLUTION only; it never links,
 initializes, or runs onnxruntime — that is `ms-onnx`'s job, and it consumes the
-path returned here. Storage lives under `ms_config::data_dir()`. The binary re-exports this crate as
-`crate::onnx_runtime`, so every existing call site keeps its path.
+path returned here. Storage lives under `ms_config::data_dir()`. The binary names this crate directly as
+`ms_onnx_runtime::`.
 */
 
 #![warn(clippy::all)]

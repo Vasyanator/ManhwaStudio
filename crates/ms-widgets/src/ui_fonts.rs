@@ -985,7 +985,7 @@ mod desktop {
         ///
         /// Returns whether the gate is now armed. An empty plan RESETS it to idle instead:
         /// `run_main` runs the launcher and the studio as sequential `run_native` windows
-        /// in ONE process (`src/main.rs`), so a second studio session gets a fresh context
+        /// in ONE process (`src/lib.rs`), so a second studio session gets a fresh context
         /// with no fonts in it and must be able to load the extended tier again — while a
         /// session whose stack (e.g. a title override) ships none must not inherit the plan
         /// of the previous one.

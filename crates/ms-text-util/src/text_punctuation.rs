@@ -14,7 +14,7 @@ is meaningless without the character set defined here. It does NOT touch the set
 Contract (после выноса в крейт `ms-text-util`):
 Крейт config-free — сам он НЕ читает `user_config.json`. При первом обращении набор
 инициализируется из `DEFAULT_HANGING_PUNCTUATION`. Приложение на старте засевает
-пользовательское значение через `set_hanging_punctuation` (см. main.rs
+пользовательское значение через `set_hanging_punctuation` (см. lib.rs
 `seed_hanging_punctuation_from_config`), а настройки редактируют его тем же вызовом.
 
 Used by:

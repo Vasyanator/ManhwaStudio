@@ -19,7 +19,7 @@ Flow:
   badges and ignores the outcome's `changed_settings`); studio-only sections use this
   module's local renderers.
 - The shared panels forward to the shared `crate::general_settings_panel` /
-  `crate::ai_backend_panel` / `crate::tutorial` widgets over the app-global supervisor
+  `ms_settings_ui::ai_backend_panel` / `crate::tutorial` widgets over the app-global supervisor
   handle; the backend process/probe lifecycle itself lives in
   `crate::ai_backend_supervisor` (owned by `run_main`, not by this tab).
 */

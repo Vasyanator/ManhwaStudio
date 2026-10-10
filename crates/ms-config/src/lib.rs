@@ -100,7 +100,7 @@ pub use runtime_root::repo_build_root;
 // The debouncing, retrying writer thread every self-owned section of `user_config.json`
 // is written through. It sits here because its write step IS this crate's
 // `update_user_config_file` border; its feeders (window geometry, panel-dock layout)
-// stay above. The binary re-exports it as `crate::config_saver`.
+// stay above. The binary names it directly as `ms_config::config_saver`.
 pub mod config_saver;
 // On-disk editable UI locale catalog (`data_dir()/locale`): unpack + reconcile the
 // catalogs `ms-i18n` embeds, then install the active one. It reads the active locale

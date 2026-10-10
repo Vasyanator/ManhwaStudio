@@ -14,7 +14,7 @@ workspace crate.
 - `apply(ctx)` selects `Theme::Dark` and overrides, on the dark style only,
   `Visuals::error_fg_color = status::ERROR` and `Visuals::warn_fg_color = status::WARNING`.
   Nothing else of stock dark is touched (no widget restyling). It is called from the
-  app-creation closure of every studio window (`src/main.rs`: studio, update check,
+  app-creation closure of every studio window (`src/lib.rs`: studio, update check,
   missing-Python prompt, basic project chooser; `src/web_entry.rs` on the launcher→editor swap)
   and of the installer's update window (`crates/ms-installer/src/update.rs`).
 - Everything else is `const` data plus the checkerboard painter.

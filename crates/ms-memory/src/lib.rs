@@ -12,14 +12,14 @@ Notes:
 This crate does not own pixels, `TextureHandle`s, or tab state. Cache owners keep storage local and
 may use the pure policy functions here to choose reconstructable least-recently-used resources.
 The binary mounts it under its historical module path with `pub use ms_memory as memory_manager;`
-(`src/main.rs`), so every call site keeps writing `crate::memory_manager::…`.
+(`src/lib.rs`), so every call site keeps writing `crate::memory_manager::…`.
 */
 
 #![warn(clippy::all)]
 
 // `MemoryProfile::label()` returns a localized profile name, so the crate needs the
 // `ms-i18n` macros. `#[macro_export]` + `$crate::` expansion means one crate-root
-// `#[macro_use]` is enough, mirroring `src/main.rs`.
+// `#[macro_use]` is enough, mirroring `src/lib.rs`.
 #[macro_use]
 extern crate ms_i18n;
 

@@ -1,7 +1,7 @@
 /*
 FILE OVERVIEW: crates/ms-installer/src/lib.rs
 Crate root of `ms-installer`, re-exported by the binary as `crate::installer`
-(`src/main.rs`), so every `crate::installer::…` call site keeps working unchanged.
+(`src/lib.rs`), so every `crate::installer::…` call site keeps working unchanged.
 
 Main responsibilities:
 - expose the installer UI and service flows used by application startup;

@@ -117,14 +117,14 @@ reads/writes — never across a download, ORT load, or inference (an engine is t
 out, run, and put back). All PaddleOCR detector ops (detect + recognize, which share
 the single resident `PaddleDetector`) are serialized by `PADDLE_OP_LOCK` so a second
 caller blocks on the first instead of finding the detector taken and needlessly
-falling back to the backend or rebuilding a duplicate session. Native-only: the binary gates its `crate::native_runtime` re-export off wasm because this
+falling back to the backend or rebuilding a duplicate session. Native-only: the binary's dependency on it is native-only because this
 crate depends on `ms-onnx`/`ort`.
 */
 
 #![warn(clippy::all)]
 
 // The `ms-i18n` UI-string macros (`t!` / `tf!` / `tp!`), mounted crate-wide exactly as
-// `src/main.rs` mounts them for the binary: this manager's localized failure messages use
+// `src/lib.rs` mounts them for the binary: this manager's localized failure messages use
 // the bare macro names the extraction tool emits and the key-validation test scans for.
 #[macro_use]
 extern crate ms_i18n;

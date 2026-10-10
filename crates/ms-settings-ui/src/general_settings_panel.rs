@@ -180,7 +180,7 @@ impl GeneralSettingsPanelState {
     /// and default memory profile so the UI still opens. The legacy
     /// `Canvas.cache_pages`→memory-profile migration is applied and written back to
     /// disk by `config::load_user_config()`, which runs during startup seeding in
-    /// `main.rs` (before any settings panel is constructed), so the `memory_profile`
+    /// `lib.rs` (before any settings panel is constructed), so the `memory_profile`
     /// read here is already migrated.
     #[must_use]
     pub fn new() -> Self {

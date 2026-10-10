@@ -71,7 +71,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 // The version composition is shared verbatim with the crate: it is a module of
-// `ms-config` (re-exported by the binary as `crate::version_format`, see `src/main.rs`).
+// `ms-config` (re-exported by the binary as `crate::version_format`, see `src/lib.rs`).
 // `include!` rather than a copy, so that the code this script runs is the code
 // `cargo test` covers; the file's `#[cfg(test)] mod tests` is inert here.
 include!("crates/ms-config/src/version_format.rs");

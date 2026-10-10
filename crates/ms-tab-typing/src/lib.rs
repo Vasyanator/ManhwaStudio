@@ -26,7 +26,7 @@ FILE HEADER (crates/ms-tab-typing/src/lib.rs)
 #![warn(clippy::all)]
 
 // The `ms-i18n` UI-string macros (`t!` / `tf!` / `tp!`), mounted crate-wide exactly as
-// `src/main.rs` mounts them for the binary: this tab's localized labels use the bare
+// `src/lib.rs` mounts them for the binary: this tab's localized labels use the bare
 // macro names the extraction tool emits and the key-validation test scans for.
 #[macro_use]
 extern crate ms_i18n;
@@ -48,8 +48,7 @@ mod export_repaginate;
 pub mod image_encode;
 // Multi-page PDF writer used by the `Pdf` export format: one full-page raster per page.
 mod pdf_export;
-// The Ctrl+wheel rotation-mode global now lives in `ms-config` (re-exported by `main.rs` as
-// `ms_config::rotation_ctrl_wheel`) so that the config default tree can read its default without
+// The Ctrl+wheel rotation-mode global now lives in `ms-config` (`ms_config::rotation_ctrl_wheel`) so that the config default tree can read its default without
 // depending on `tabs`. This re-export keeps existing
 // `ms_config::rotation_ctrl_wheel::…` paths valid.
 pub use ms_config::rotation_ctrl_wheel;
@@ -70,7 +69,7 @@ pub use panel::seed_effect_defaults_from_config;
 pub use panel::seed_imported_system_fonts_from_config;
 // The advanced text-form search knobs (`TextTab.advanced_form_search`). Re-exported
 // because a config-owning site lives outside typing: the startup seed
-// (`main.rs::seed_advanced_form_search_from_config`). The knob object's PLACEMENT in
+// (`lib.rs::seed_advanced_form_search_from_config`). The knob object's PLACEMENT in
 // `user_config.json` is `ms_config::save_advanced_form_search_params`; its SHAPE stays
 // here, in `advanced_form_params`.
 pub use panel::advanced_form_params;

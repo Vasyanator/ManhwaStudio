@@ -23,15 +23,16 @@ ms-i18n ─┤
 ms-thread ─┘
 ```
 
-The binary re-exports this crate and several of its modules under binary-local names in
-`src/main.rs` (other crates name `ms_config::` directly):
+The binary re-exports this crate and several of its modules under root-package-local (`pub(crate)`) names in
+`src/lib.rs` (other crates name `ms_config::` directly):
 
 | shim | reaches |
 |---|---|
 | `pub use ms_config as config;` | `crate::config::…` |
 | `pub use ms_config::app_tab;` | `crate::app_tab::…`, and `crate::tabs::AppTab` on top of it |
-| `pub use ms_config::rotation_ctrl_wheel;` | `crate::rotation_ctrl_wheel::…`, and `crate::tabs::typing::rotation_ctrl_wheel::…` |
-| `pub use ms_config::{config_saver, locale_store, version_format};` | `crate::config_saver::…` etc. (`locale_store` native-only) |
+| `pub(crate) use ms_config::{locale_store, version_format};` | `crate::locale_store::…` etc. (`locale_store` native-only) |
+
+`rotation_ctrl_wheel` and `config_saver` have no root shim: callers name `ms_config::` directly (`ms-tab-typing` re-exports `rotation_ctrl_wheel` for `crate::tabs::typing::rotation_ctrl_wheel::…`).
 
 Every access to a config DOCUMENT goes through `ms-docstore`: `JsonConfig` (user config
 and a title's `settings.json`), `load_user_config`, `load_raw_user_settings_for_startup`,
@@ -109,7 +110,7 @@ that defines the type.
 - `storage_mode.rs`: the Dev/Prod document storage mode — `StorageMode` (frozen
   `"prod"`/`"dev"` under `General.storage_mode`, default Prod), `probe_storage_mode` (pure
   probe of a user-config document) and `init_storage_mode_at_startup`, which seeds
-  `ms_docstore::set_default_format` as the process's FIRST document access (`main.rs`). Also
+  `ms_docstore::set_default_format` as the process's FIRST document access (`lib.rs`). Also
   the fonts-directory document locations (`app_fonts_dir`, `fonts_data_doc`,
   `fonts_presets_doc`); `app_fonts_dir` is the ONLY fonts-directory resolver
   (the typing tab owns those documents' contents but resolves the directory here). The conversion

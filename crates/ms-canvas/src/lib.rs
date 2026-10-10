@@ -212,7 +212,7 @@ Key CanvasView state groups (important fields):
 #![warn(clippy::all)]
 
 // The `ms-i18n` UI-string macros (`t!` / `tf!` / `tp!`), mounted crate-wide exactly as
-// `src/main.rs` mounts them for the binary: the canvas' localized labels use the bare
+// `src/lib.rs` mounts them for the binary: the canvas' localized labels use the bare
 // macro names the extraction tool emits and the key-validation test scans for.
 #[macro_use]
 extern crate ms_i18n;

@@ -1406,7 +1406,7 @@ session long before this call.
   and logs once — the form window may not abort the GUI thread.
 - **PERSISTENCE** is `user_config.json` → `TextTab.advanced_form_search`, ONE JSON object
   (`config::TEXT_TAB_ADVANCED_FORM_SEARCH_KEY`), following the `rotation_ctrl_wheel_mode`
-  recipe: seeded at startup by `main.rs::seed_advanced_form_search_from_config`, written by
+  recipe: seeded at startup by `lib.rs::seed_advanced_form_search_from_config`, written by
   `ms_config::save_advanced_form_search_params` on a named thread. The
   GUI thread never reads the config file. The write goes through
   `config::update_user_config_file`: that helper takes the `user_config.json` document lock
@@ -1663,7 +1663,7 @@ of the comic type.
   `create_advanced::draw_advanced_form_search_params_section`; to change the CARD ORDER, see
   `text_forms::order_advanced_forms`; to change where the values are written, see
   `ms_config::save_advanced_form_search_params` and
-  `main.rs::seed_advanced_form_search_from_config`.
+  `lib.rs::seed_advanced_form_search_from_config`.
 - To change WHEN the form search re-runs, see `panel::AdvancedFormSearchBase` (the struct) /
   `create_advanced::advanced_form_search_base` (what fills it) /
   `schedule_advanced_form_search`; to change what it measures with, see

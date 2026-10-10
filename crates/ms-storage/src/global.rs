@@ -20,7 +20,7 @@ Read-only global dispatch via `OnceLock` is the sanctioned pattern for immutable
 configuration. The handle is set once and never mutated; the backends themselves
 are internally synchronized (`PassthroughStorage` is stateless; `MemStorage`
 uses an `RwLock`). The binary re-exports this module as `crate::storage`
-(`src/main.rs`), so every existing `crate::storage::…` call site keeps working.
+(`src/lib.rs`), so every existing `crate::storage::…` call site keeps working.
 See docs/WEB_PORT.md.
 */
 

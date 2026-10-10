@@ -185,7 +185,7 @@ Consequences worth knowing before you write the body:
 * **The body scrolls on both axes by itself.** Do not add your own `ScrollArea` around the whole
   body; you would nest two scroll areas and the outer one would win.
 * **Panels live on `Order::Foreground`.** Canvas input gating is z-order based
-  (`crate::input_util::pointer_over_floating_area`), so a panel lowered below that order stops
+  (`ms_widgets::input_util::pointer_over_floating_area`), so a panel lowered below that order stops
   shielding the canvas underneath it and clicks fall through onto the artwork.
 
 What is still legitimately an `Area`: toasts, tooltips, scene-anchored overlays, the tutorial
@@ -215,7 +215,7 @@ fonts/theme **before the first frame**. `NativeOptions` is at epi.rs:296; its `v
 ViewportBuilder` field carries window metadata. The project's studio startup:
 
 ```rust
-// src/main.rs:1363-1393
+// src/lib.rs:1995-2054 (excerpt, abridged)
 let mut viewport = egui::ViewportBuilder::default()
     .with_inner_size([1400.0, 900.0])
     .with_min_inner_size([900.0, 600.0])
@@ -236,8 +236,8 @@ eframe::run_native(
 )
 ```
 
-Other `run_native` entry points in the same file: missing-python prompt (src/main.rs:672),
-update check (src/main.rs:1178), launcher (src/main.rs:1676).
+Other `run_native` entry points in the same file: missing-python prompt (src/lib.rs:1287),
+update check (src/lib.rs:1794), launcher (src/lib.rs:2329).
 
 ## 5. Multi-viewport (extra native windows)
 
@@ -381,7 +381,7 @@ the result actually happens. The font loader above is the canonical example.
 
 * To change the root app shell, tab bar, top panel, or per-tab central panel: `src/app.rs`
   (`impl eframe::App for MangaApp`, src/app.rs:2337).
-* To change process startup, window size/icon/app-id, or which `run_native` runs: `src/main.rs`.
+* To change process startup, window size/icon/app-id, or which `run_native` runs: `src/lib.rs`.
 * To change the launcher shell and its secondary native windows: `src/launcher/app.rs`.
 * To change the launcher look (Style/Visuals/palette): `crates/ms-launcher/src/theme.rs`.
 * To change a studio semantic colour (status text, canvas chrome, checkerboard): `crates/ms-theme/`.

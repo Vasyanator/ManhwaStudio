@@ -141,41 +141,41 @@ path = "src/bin/tutorial_test/main.rs"
 # cfg(not(wasm32)) block below and their call sites are cfg-gated per WEB_PORT.md.
 [dependencies]
 # Framed IPC with the Python AI backend (`crate::backend_ipc` re-export shim in
-# `src/main.rs`). Cross-target: the crate itself compiles a wasm stub, matching the
+# `src/lib.rs`). Cross-target: the crate itself compiles a wasm stub, matching the
 # unconditional module declaration it replaced.
 ms-backend-ipc = { path = "crates/ms-backend-ipc" }
 ms-log = { path = "crates/ms-log" }
 # Global config / runtime-path hub (`program_dir`/`data_dir`, `user_config.json`,
-# default trees), re-exported as `crate::config` from `src/main.rs` together with its
+# default trees), re-exported as `crate::config` from `src/lib.rs` together with its
 # two companion modules `crate::app_tab` and `crate::rotation_ctrl_wheel`. It is the
 # crate every upper layer reads, so it sits ABOVE ms-log/ms-memory/ms-storage/
 # ms-text-util/ms-i18n and below everything in `src/`.
 ms-config = { path = "crates/ms-config" }
 # Image-cache memory policy (profile, pressure, budgets, eviction ordering),
-# re-exported as `crate::memory_manager` from `src/main.rs`. `config.rs` reads
+# re-exported as `crate::memory_manager` from `src/lib.rs`. `config.rs` reads
 # `MemoryProfile` from it, so it must stay BELOW config in the dependency order.
 ms-memory = { path = "crates/ms-memory" }
 # The journalled structural page transaction (insert/delete/reorder/rotate/stitch/
-# split of a chapter tree), re-exported as `crate::page_ops` from `src/main.rs`. It
+# split of a chapter tree), re-exported as `crate::page_ops` from `src/lib.rs`. It
 # also owns the `Page` / `ProjectPaths` data types that `ms-project` re-exports, so it
 # sits BELOW `ms-project` — the only direction that breaks the old module cycle.
 ms-page-ops = { path = "crates/ms-page-ops" }
 # The project/chapter domain model (`ProjectData`, `Bubble`, `CanvasSettings`,
 # `ComicType`) and its load-time reconcile passes, re-exported as `crate::project`
-# from `src/main.rs`. Everything above it in `src/` reads the loaded project.
+# from `src/lib.rs`. Everything above it in `src/` reads the loaded project.
 ms-project = { path = "crates/ms-project" }
 # The owned-document store (every JSON document the app owns goes through it). The
 # binary names it directly only to pin the web build's document format at startup
 # (`src/web_entry.rs`); all reads/writes go through the crates that own each document.
 ms-docstore = { path = "crates/ms-docstore" }
 # Host-environment probes (GPU/accelerator detection, app-local Python runtime,
-# desktop region capture), re-exported as `crate::{gpu_utils, python_manager,
-# screen_capture}` from `src/main.rs`. Cross-target like the module declarations it
+# desktop region capture), mounted as `crate::{python_manager, ai_install_probe, hf_token}`
+# by `src/lib.rs`; other modules are named `ms_sysprobe::` directly. Cross-target like the module declarations it
 # replaced: `python_manager` carries its own `#![cfg(not(wasm32))]`.
 ms-sysprobe = { path = "crates/ms-sysprobe" }
 # The reusable UI-primitive layer (`src/widgets/` + `input_util` + `ui_fonts`),
-# re-exported as `crate::widgets` / `crate::input_util` / `crate::ui_fonts` from
-# `src/main.rs`. It knows nothing about the project domain, so it sits below
+# re-exported as `crate::widgets` / `crate::ui_fonts` from
+# `src/lib.rs`. It knows nothing about the project domain, so it sits below
 # `canvas`/`tabs`/`launcher` and may never depend on them.
 ms-widgets = { path = "crates/ms-widgets" }
 # The studio's semantic colours on top of egui's stock dark theme (status text, canvas
@@ -185,28 +185,29 @@ ms-widgets = { path = "crates/ms-widgets" }
 ms-theme = { path = "crates/ms-theme" }
 # The shared runtime models (bubbles, layer document, clean overlays, text masks) plus
 # the source-page view model, re-exported as `crate::models` / `crate::page_view` from
-# `src/main.rs`. Sits ABOVE `ms-project` and BELOW the canvas and the tabs; egui is a
+# `src/lib.rs`. Sits ABOVE `ms-project` and BELOW the canvas and the tabs; egui is a
 # pixel format there, never a drawing surface.
 ms-models = { path = "crates/ms-models" }
 # The canvas facade (page rendering, bubble editing, clean-overlay painting), re-exported
-# as `crate::canvas` from `src/main.rs`. It declares `CanvasHooks`, which the tabs
+# as `crate::canvas` from `src/lib.rs`. It declares `CanvasHooks`, which the tabs
 # IMPLEMENT, so it sits below them and never names a tab.
 ms-canvas = { path = "crates/ms-canvas" }
 # The reusable tooling primitives (`src/tools/`): mask brush, polygon rasterizer, the shared
 # red-black SOR kernel, the dense overlay-pixel solve and the host-neutral patch core,
-# re-exported as `crate::tools` from `src/main.rs`. Sits ABOVE `ms-canvas`/`ms-widgets` and
+# named `ms_tools::` directly by the root package. Sits ABOVE `ms-canvas`/`ms-widgets` and
 # BELOW the tabs, which implement its `PatchHost` trait.
 ms-tools = { path = "crates/ms-tools" }
 # The settings surface both shells share (`src/settings_shared.rs`,
 # `src/general_settings_panel.rs`, `src/ai_backend_panel.rs`, `src/ai_backend_supervisor.rs`
-# and `src/tutorial/`), re-exported under those same names from `src/main.rs`. The
+# and `src/tutorial/`), re-exported under those same names from `src/lib.rs` (except
+# `ai_backend_panel`, named `ms_settings_ui::` directly). The
 # launcher's settings page and the studio's Settings tab render the SAME panes and drive the
 # SAME AI-backend supervisor, so neither shell could own them. Its `tutorial` feature is
 # forwarded from this crate's own — see the `[features]` note.
 ms-settings-ui = { path = "crates/ms-settings-ui" }
 # The launcher shell (`src/launcher/`), re-exported as `crate::launcher` from
-# `src/main.rs`. Effectively a SECOND application next to the studio: the editor never
-# references it — only `main.rs` (native startup) and `web_entry.rs` (the wasm entry) do.
+# `src/lib.rs`. Effectively a SECOND application next to the studio: the editor never
+# references it — only `lib.rs` (native startup) and `web_entry.rs` (the wasm entry) do.
 # It sits at the very top of the stack; nothing may depend on it.
 ms-launcher = { path = "crates/ms-launcher" }
 # The «Текст» (typing) tab (`src/tabs/typing/`), re-exported as `crate::tabs::typing`
@@ -329,16 +330,16 @@ tokio.workspace = true
 # Native ONNX Runtime inference infrastructure (load-dynamic; runtime-resolved
 # dylib). Native-only: onnxruntime is a native shared library.
 ms-onnx = { path = "crates/ms-onnx" }
-# The loader that resolves/downloads that dylib, re-exported as `crate::onnx_runtime`
-# from `src/main.rs`. Native-only for the same reason as `ms-onnx`, and because every
+# The loader that resolves/downloads that dylib, named `ms_onnx_runtime::` directly by
+# the root package. Native-only for the same reason as `ms-onnx`, and because every
 # path in it is blocking download/extract I/O.
 ms-onnx-runtime = { path = "crates/ms-onnx-runtime" }
-# The native ONNX Runtime OCR manager (`src/native_runtime.rs`), re-exported as
-# `crate::native_runtime` from `src/main.rs`. Native-only for the same reason as
+# The native ONNX Runtime OCR manager (`src/native_runtime.rs`), named
+# `ms_native_runtime::` directly by the root package. Native-only for the same reason as
 # `ms-onnx`: it owns the process-global `OrtRuntime` and the engine LRU.
 ms-native-runtime = { path = "crates/ms-native-runtime" }
 # Startup monitor + main-window geometry (`src/window_geometry.rs`), re-exported as
-# `crate::window_geometry` from `src/main.rs`. It owns the self-versioned `Window`
+# `crate::window_geometry` from `src/lib.rs`. It owns the self-versioned `Window`
 # section of `user_config.json` and is the only place that talks to winit: egui/eframe
 # expose no monitor list at all, only the raw window (`CreationContext::winit_window` /
 # `Frame::winit_window`), whose type comes from that exact crate — which is why `winit`
@@ -346,12 +347,12 @@ ms-native-runtime = { path = "crates/ms-native-runtime" }
 # monitors do not exist on wasm.
 ms-window-geometry = { path = "crates/ms-window-geometry" }
 # OS records of a program copy (`ms_os_integration`): the Linux desktop entry and icon that
-# `src/main.rs` writes at startup on its own worker, and the Windows elevated system-registration
+# `src/lib.rs` writes at startup on its own worker, and the Windows elevated system-registration
 # helper it routes (`--system-registration-apply`). Native-only: no OS registration exists in
 # the web build.
 ms-os-integration = { path = "crates/ms-os-integration" }
 # The desktop installer/updater subsystem (`src/installer/`), re-exported as
-# `crate::installer` from `src/main.rs`. Desktop-only: it installs the managed Python
+# `crate::installer` from `src/lib.rs`. Desktop-only: it installs the managed Python
 # environment and replaces the shipped executable, neither of which exists on the web
 # build. It is an application surface of its own (two standalone `eframe` windows), so
 # nothing above it depends on it — startup and the launcher's settings page only start
@@ -369,6 +370,21 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "console"] }
+
+# Android-only dependencies, used by `src/android_entry.rs` (plan: dev-docs/ANDROID_PORT.md).
+# eframe takes the GameActivity backend of android-activity: the NativeActivity backend is
+# incompatible with the `accesskit` feature of the shared eframe pin. Adding the feature here
+# leaves the desktop and wasm feature sets untouched. `android_logger` routes the `log` facade
+# (eframe, winit, glow, ...) to logcat; stdout/stderr are already forwarded by
+# android-activity. `jni` (same 0.22 line as android-activity and rustls-platform-verifier)
+# hands the application context to `rustls-platform-verifier`, which reqwest (via `genai`)
+# uses for HTTPS and which panics on first use unless initialized.
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { workspace = true, features = ["android-game-activity"] }
+android_logger = { version = "0.15", default-features = false }
+log = "0.4"
+jni = { version = "0.22", default-features = false }
+rustls-platform-verifier = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }

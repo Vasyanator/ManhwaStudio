@@ -11,12 +11,11 @@ Two modes:
 
 This module reads no config of its own (like `ms_text_util::text_punctuation`): it only
 owns the thread-safe runtime global. The app seeds it at startup from
-`TextTab.rotation_ctrl_wheel_mode` (`main.rs::seed_rotation_ctrl_wheel_from_config`),
+`TextTab.rotation_ctrl_wheel_mode` (`lib.rs::seed_rotation_ctrl_wheel_from_config`),
 the settings "Тайп" pane edits it live, and the typing tab reads it in the Ctrl+wheel
 handler. It lives in `ms-config` — not under `tabs::typing`, whose concern it otherwise is —
 because the crate root reads `DEFAULT_ROTATION_CTRL_WHEEL_MODE` for the `TextTab` defaults and
-must not depend on `tabs`. The binary re-exports it as `crate::rotation_ctrl_wheel` and
-`tabs::typing` re-exports it again, so the existing
+must not depend on `tabs`. `tabs::typing` re-exports it, so the existing
 `crate::tabs::typing::rotation_ctrl_wheel::…` paths keep working.
 
 Key types:

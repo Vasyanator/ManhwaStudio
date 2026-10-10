@@ -7,8 +7,7 @@ always-resident `PaddleDetector`, and the LRU-bounded cache of `MangaOcrEngine` 
 `PaddleRecognizer` / `BaberuOcrEngine` engines, and turns a crop or page image into recognized text or
 detected regions without going through the Python backend.
 
-The binary re-exports it as `crate::native_runtime`, so every existing
-`crate::native_runtime::…` path keeps working.
+The binary names the crate directly as `ms_native_runtime::`.
 
 ## Architecture
 One file, `lib.rs`, whose own header carries the full contract (execution-provider

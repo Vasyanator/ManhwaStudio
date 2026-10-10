@@ -18,7 +18,7 @@ service, while this one is a single global value.
 Shape:
 A runtime global with free get/set/clear functions, in the shape of
 `crates/ms-config/src/rotation_ctrl_wheel.rs`: a cached value behind an `RwLock`,
-seeded once at startup (`seed_hf_token_from_secret_store`, called by `main.rs`, reads
+seeded once at startup (`seed_hf_token_from_secret_store`, called by `lib.rs`, reads
 on its own worker) so that every later READ is a lock acquisition rather than an OS
 round trip. Only the seed, a save and a delete
 touch the secret store, and all three are BLOCKING — the GUI thread must never call

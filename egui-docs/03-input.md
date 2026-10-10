@@ -62,7 +62,7 @@ Callers: `src/canvas/mod.rs:1507`, `src/tabs/typing/tab.rs:725` and `:788`,
 Caveat (pre-existing duplication, not a pattern to copy): the wheel widgets each carry a private clone
 of the same helper, `raw_wheel_events_delta` — `crates/ms-widgets/src/wheel_slider.rs:438`,
 `crates/ms-widgets/src/wheel_spin_box.rs:284`, `crates/ms-widgets/src/wheel_combo_box.rs:326`. They do **not** call
-`input_util`. New code should call `crate::input_util::raw_wheel_delta`.
+`input_util`. New code should call `ms_widgets::input_util::raw_wheel_delta`.
 
 ## REMOVED: `Context::is_pointer_over_area` — and `is_pointer_over_egui` is a trap here
 
@@ -225,8 +225,8 @@ a frame with `ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::User
 
 ## Editing map
 
-- Wheel/zoom on any canvas → `crate::input_util::raw_wheel_delta` (`src/input_util.rs:31`).
-- "Did the click hit bare canvas?" → `crate::input_util::pointer_over_floating_area` (`src/input_util.rs:55`).
+- Wheel/zoom on any canvas → `ms_widgets::input_util::raw_wheel_delta` (`crates/ms-widgets/src/input_util.rs:31`).
+- "Did the click hit bare canvas?" → `ms_widgets::input_util::pointer_over_floating_area` (`crates/ms-widgets/src/input_util.rs:55`).
 - New hotkey → register a `HotkeySpecV2` (`src/input_manager_v2.rs`) + handle it in
   `MangaApp::execute_hotkey_command` (`src/app.rs:1571`).
 - Widget-local interaction → allocate with the right `Sense` and read the `Response`; do not read

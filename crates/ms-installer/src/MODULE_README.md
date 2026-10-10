@@ -2,7 +2,7 @@
 
 ## Purpose
 Crate root of `ms-installer`, re-exported by the binary as `crate::installer`
-(`src/main.rs`), so every `crate::installer::…` call site keeps working unchanged.
+(`src/lib.rs`), so every `crate::installer::…` call site keeps working unchanged.
 Installer runtime used by the main startup path when the managed Python environment is missing or
 when Windows service flags request installer maintenance actions.
 
@@ -167,7 +167,7 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
     administrator rights are offered as one possible remedy, never as the headline. Elevation is
     out of scope — this action never requests UAC — and a rename refused because the destination is
     in use gets its own "the installed copy is running" message.
-  - "run this copy standalone" only records `ExistingInstallAction::RunStandalone`; `main.rs`
+  - "run this copy standalone" only records `ExistingInstallAction::RunStandalone`; `lib.rs`
     relaunches this executable with `--ignore-installed` prepended
     (`args::standalone_relaunch_args`) and exits. The flag cannot be turned on in process: startup
     routing consumes it and seeds the backend-socket `OnceLock` long before this window opens.

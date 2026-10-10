@@ -5,13 +5,13 @@ Rust launcher runtime shown before a chapter is opened.
 
 ## Architecture
 `lib.rs` (crate root) owns the native launcher entry points (`run_launcher`, `run_test_launcher`)
-and returns a typed outcome to `main.rs`.
+and returns a typed outcome to `lib.rs`.
 `app.rs` owns the root `eframe::App`, background image workers, detached child windows, and
 page navigation. Page modules render focused launcher workflows and report actions through
 `PageNavAction`.
 
 The launcher does not perform blocking I/O on the GUI thread. Startup update checks are started by
-`main.rs` and delivered to the launcher through a channel; the launcher only polls and renders the
+`lib.rs` and delivered to the launcher through a channel; the launcher only polls and renders the
 notification.
 
 ## Files and submodules
@@ -30,7 +30,7 @@ notification.
   `ms_config::single_image::input_extensions()` (plus uppercase copies for case-sensitive GTK
   globs), and the pure pick -> `LauncherOutcome::OpenImage` mapping. `app.rs` polls it.
 - `state.rs`: page enum, shared UI state, typed launcher outcomes, and `LauncherHost` (the
-  process facts `main.rs` / `web_entry.rs` hand in: `--ignore-installed`, version core).
+  process facts `lib.rs` / `web_entry.rs` hand in: `--ignore-installed`, version core).
 - `background.rs`: background image plan and decode workers.
 - `first_run_language.rs`: first-run interface/typesetting language-selection modal
   (radio toggles, system-locale preselect). Reuses `general_settings_panel`'s
@@ -110,11 +110,11 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
 - Launcher outcomes are returned to startup flow; the launcher must not spawn a second main app.
 - Long scans, image decoding, probes, downloads, and shell work run on worker threads.
 - Settings changes to the projects root must be propagated to every page/window that caches it.
-- "Open image" closes the launcher with `LauncherOutcome::OpenImage(path)`; `main.rs` routes it.
+- "Open image" closes the launcher with `LauncherOutcome::OpenImage(path)`; `lib.rs` routes it.
   The launcher validates only existence and file-ness; decode errors belong to the studio
   loading screen (one owner). wasm has no button and `web_entry.rs` ignores the variant.
 - Update notifications are advisory UI state; starting an update closes the launcher and returns
-  `LauncherOutcome::StartUpdate` to `main.rs`.
+  `LauncherOutcome::StartUpdate` to `lib.rs`.
 - The first-run language modal (`first_run_language.rs`) and the main-menu tutorial are mutually
   exclusive: while the modal is `Some`, `app.rs` suppresses `maybe_autoplay(LauncherMain)` and hands
   the tour off exactly once on confirm. The modal is gated on the persisted tri-state marker

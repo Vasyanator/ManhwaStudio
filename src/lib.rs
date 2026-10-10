@@ -3,9 +3,12 @@ FILE OVERVIEW: src/lib.rs
 Library root of the `manhwastudio_rs` package: the module tree (`app`, `args`, `tabs`, …), the
 `crate::x` re-export shims onto the `ms-*` crates, and the whole native startup flow. The
 `manhwastudio_rs` binary (`src/main.rs`) is a thin shell that calls `native_main()` (desktop) or
-`web_main()` (wasm32); these two functions are the library's only entry points. The split exists
-so a platform build that needs a library (the Android `cdylib`, built later with
-`cargo rustc --lib --crate-type cdylib`) can reach the same startup code.
+`web_main()` (wasm32); these two functions are the library's only public entry points. The split
+exists so a platform build that needs a library (the Android `cdylib`, built with
+`cargo rustc --lib --crate-type cdylib`) can reach the same startup code: on Android the
+unmangled `android_main` of `android_entry.rs` prepares the process and calls `native_main()`.
+Every `eframe::NativeOptions` built here sets `android_app` from
+`window_geometry::android_app::current()` on Android (compiled out elsewhere).
 
 Main flow (`native_main` -> `run_main`):
 - Parses CLI args (`--project` optional, `--no-ai` optional).
@@ -53,6 +56,10 @@ Main flow (`native_main` -> `run_main`):
 #[macro_use]
 extern crate ms_i18n;
 
+// Android process entry (`android_main`, exported from the `cdylib` the APK loads): logcat,
+// TLS verifier, runtime root, then the same `native_main` startup as the desktop binary.
+#[cfg(target_os = "android")]
+mod android_entry;
 mod app;
 mod args;
 mod i18n_resolve;
@@ -1281,6 +1288,9 @@ fn prompt_missing_python_env_action() -> MissingPythonEnvAction {
 
     let options = eframe::NativeOptions {
         viewport,
+        // winit cannot build an event loop on Android without the Activity handle.
+        #[cfg(target_os = "android")]
+        android_app: window_geometry::android_app::current(),
         ..Default::default()
     };
 
@@ -1788,6 +1798,9 @@ fn run_update_check_window(local_version: String) -> anyhow::Result<UpdateCheckD
 
     let options = eframe::NativeOptions {
         viewport,
+        // winit cannot build an event loop on Android without the Activity handle.
+        #[cfg(target_os = "android")]
+        android_app: window_geometry::android_app::current(),
         ..Default::default()
     };
 
@@ -2010,6 +2023,9 @@ fn run_main_window(
 
     let native_options = eframe::NativeOptions {
         viewport,
+        // winit cannot build an event loop on Android without the Activity handle.
+        #[cfg(target_os = "android")]
+        android_app: window_geometry::android_app::current(),
         ..Default::default()
     };
 
@@ -2323,6 +2339,9 @@ fn pick_project_dir_from_basic_launcher_gui(
 
     let chooser_options = eframe::NativeOptions {
         viewport,
+        // winit cannot build an event loop on Android without the Activity handle.
+        #[cfg(target_os = "android")]
+        android_app: window_geometry::android_app::current(),
         ..Default::default()
     };
 

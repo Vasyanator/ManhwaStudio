@@ -23,7 +23,7 @@ Dependencies:
 Notes:
 It lives in this crate because it is a host-environment probe like `screen_capture`, and
 because its callers now span crates (the typing tab, the translation tab, the launcher);
-the binary re-exports it as `crate::paste_image` so every existing path keeps working.
+the binary names it directly as `ms_sysprobe::paste_image`.
 This module returns RGBA pixels only. Callers remain responsible for spawning a worker thread
 and converting the result into egui or image crate types.
 */

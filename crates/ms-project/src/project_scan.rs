@@ -26,7 +26,7 @@ Notes:
 The chapter's owned documents are named by `ms_page_ops::chapter_docs` (never re-derived
 here). A chapter keeps its format across a global Dev/Prod switch; converting it is an
 explicit user action (the launcher's open page), never a side effect of a scan.
-These live outside `main.rs` so that `launcher` does not have to reference the binary root
+These live outside `lib.rs` so that `launcher` does not have to reference the root package
 upwards. Everything here is plain filesystem I/O and must stay free of UI and of app state.
 */
 

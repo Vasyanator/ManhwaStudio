@@ -20,8 +20,8 @@ project domain: it may depend on `ms-config`, `ms-log`, `ms-i18n`, `ms-text-util
 `ms-gifs`, `ms-thread` and `ms-fonts` (the last one native-only), and it may NOT depend on
 `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the canvas, the tabs and the
 launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its
-crate-root leaves as `crate::input_util`, `crate::ui_fonts`, `crate::bubble_status` and
-`crate::input_manager_v2`.
+crate-root leaves as `crate::ui_fonts`, `crate::bubble_status` and
+`crate::input_manager_v2` (`input_util` has no root shim: `ms_widgets::input_util`).
 
 Two helpers this crate owns are TEST-ONLY and reach dependent crates through the `test-support`
 feature of `ms-config`, not through `#[cfg(test)]`: `ms_config::config_saver::test_harness`

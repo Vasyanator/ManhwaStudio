@@ -8,7 +8,7 @@ Non-interactive readiness check of the managed Python environment behind the
 Main responsibilities:
 - decide whether the environment of a runtime root is complete, without opening a window;
 - describe WHY it is not complete in a user-facing message and in the runtime log;
-- keep the decision free of GUI code: the caller (`main.rs`) owns the installer window and
+- keep the decision free of GUI code: the caller (`lib.rs`) owns the installer window and
   the process exit code.
 
 Key structures:

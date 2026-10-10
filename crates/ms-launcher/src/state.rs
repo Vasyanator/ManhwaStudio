@@ -44,7 +44,7 @@ pub struct UpdateNotification {
     pub remote_version: String,
 }
 
-/// Why the launcher closed; `main.rs` / `web_entry.rs` route on it. The launcher never starts
+/// Why the launcher closed; `lib.rs` / `web_entry.rs` route on it. The launcher never starts
 /// the studio itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LauncherOutcome {
@@ -57,7 +57,7 @@ pub enum LauncherOutcome {
 }
 
 /// Facts about the running process the launcher cannot derive itself, handed in by
-/// `main.rs` / `web_entry.rs`.
+/// `lib.rs` / `web_entry.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LauncherHost {
     /// `--ignore-installed`: the launcher never modifies the OS records of an installed copy;

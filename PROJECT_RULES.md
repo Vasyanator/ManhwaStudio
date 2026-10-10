@@ -64,7 +64,7 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   are `#[cfg(any(test, feature = "test-support"))]`, enabled only from `[dev-dependencies]`
   (examples: `ms-models`, `ms-config`).
 - Crates extracted from the binary do not enable `clippy::pedantic`; crates written fresh do.
-- The `crate::x` re-export shims in `src/main.rs` and `src/tabs/mod.rs` are binary-local
+- The `crate::x` re-export shims in `src/lib.rs` and `src/tabs/mod.rs` are root-package-local (`pub(crate)`)
   compatibility aliases for code still in `src/`. Not every crate has one (e.g. `ms-docstore`,
   `ms-fonts`, `ms-i18n`, `ms-text-render` are named `ms_x::` directly); a new crate needs none.
 - Thread creation on any code path that also runs on wasm goes through `ms_thread`; bare
@@ -169,7 +169,7 @@ Reformatting is acceptable only once proven inert this way.
 ## Code navigation and live-app automation
 
 - Read `SERENA.md` before any `mcp__serena__*` call (it replaces Serena's own manual). Wasm- and
-  windows-gated modules (e.g. `src/main.rs` `mod web_entry`) are invisible to it — confirm
+  windows-gated modules (e.g. `src/lib.rs` `mod web_entry`) are invisible to it — confirm
   reference searches with grep. Use grep for i18n keys, locale JSON, `MODULE_README.md`,
   `dev-docs/` and every `egui-docs/` lookup.
 - Live-app automation (global §16 "Manual UI Verification") is the `/egui-mcp` skill (egui

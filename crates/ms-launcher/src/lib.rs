@@ -1,7 +1,7 @@
 /*
 FILE OVERVIEW: crates/ms-launcher/src/lib.rs
 Crate root of `ms-launcher`, re-exported by the binary as `crate::launcher`
-(`src/main.rs`), so every `crate::launcher::…` call site keeps working unchanged.
+(`src/lib.rs`), so every `crate::launcher::…` call site keeps working unchanged.
 
 Purpose:
 Runtime for the Rust launcher UI.
@@ -170,6 +170,9 @@ fn run_launcher_internal(
 
     let native_options = eframe::NativeOptions {
         viewport,
+        // winit cannot build an event loop on Android without the Activity handle.
+        #[cfg(target_os = "android")]
+        android_app: ms_window_geometry::android_app::current(),
         ..Default::default()
     };
 

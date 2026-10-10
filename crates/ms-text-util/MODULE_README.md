@@ -52,8 +52,8 @@ Four independent modules. None reads config or touches the filesystem.
 - No dependency on the app crate or `config`. Process-global state defaults to
   values that reproduce the historical behavior; the **app** seeds user values at
   startup: hanging punctuation via `set_hanging_punctuation`
-  (`main.rs::seed_hanging_punctuation_from_config`) and the typesetting language
-  via `set_text_language` (`main.rs::seed_text_language_from_config`, config key
+  (`lib.rs::seed_hanging_punctuation_from_config`) and the typesetting language
+  via `set_text_language` (`lib.rs::seed_text_language_from_config`, config key
   `TextTab.text_language`).
 - Russian segmentation output is bit-identical to the pre-refactor renderer.
 - `segmentation` depends on `text_punctuation` and `language` within this crate.

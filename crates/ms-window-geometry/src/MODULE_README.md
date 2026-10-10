@@ -4,7 +4,7 @@
 Owns WHERE the program's OS window opens and where it is left: the user's primary-monitor
 choice, the last known geometry of the studio window, and the plumbing that keeps both in
 the self-versioned `Window` section of `user_config.json`. Re-exported by the binary as
-`crate::window_geometry` (`src/main.rs`).
+`crate::window_geometry` (`src/lib.rs`).
 
 Native-only: winit windows and OS monitors do not exist in the web build, so the binary
 depends on this crate from its `cfg(not(target_arch = "wasm32"))` block.
@@ -23,7 +23,7 @@ startup (no window yet)          runtime (window exists)
 ```
 
 Layer position: `ms-config` (+ its `config_saver`) <- **`ms-window-geometry`** <- the
-binary (`main.rs`, `studio_bootstrap.rs`, the launcher) and the settings UI.
+binary (`lib.rs`, `studio_bootstrap.rs`, the launcher) and the settings UI.
 
 This crate is the project's ONLY direct user of `winit`: egui/eframe expose no monitor
 list, only the raw window handle (`CreationContext::winit_window` / `Frame::winit_window`),
@@ -36,6 +36,12 @@ in, or the two `Window` types stop unifying.
   (`plan_startup_placement` / `apply_placement`), the monitor resolution
   (`resolve_monitor` / `largest_monitor_index` / `should_relocate`) and the persistence
   path (`update_window_section` / `persist_geometry` / `spawn_geometry_saver`).
+- `android_app.rs` (`cfg(target_os = "android")` only): the one process-global owner of the
+  Android `AndroidApp` handle (`install` / `current`, re-exported type `AndroidApp`). It lives
+  here because this crate is the only direct `winit` user and already sits under both the
+  binary and `ms-launcher`. `android_main` (`src/android_entry.rs`) installs the handle, and
+  REPLACES it when android-activity calls `android_main` again for a re-created Activity;
+  every `eframe::NativeOptions` in the process sets `android_app: android_app::current()`.
 
 ## Contracts and invariants
 - **Units.** Everything persisted is in *logical pixels* (physical / DPI scale), independent

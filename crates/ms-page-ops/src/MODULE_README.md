@@ -2,7 +2,7 @@
 
 ## Purpose
 Crate root of `ms-page-ops`, re-exported by the binary as `crate::page_ops`
-(`src/main.rs`).
+(`src/lib.rs`).
 
 GUI-free engine for STRUCTURAL page operations on a loaded chapter: move a
 page, insert pages (from image files or a generated blank), delete pages,

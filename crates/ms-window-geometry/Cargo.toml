@@ -53,6 +53,13 @@ thiserror.workspace = true
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }
 
+# Android: winit likewise refuses to compile without an android-activity backend. This names
+# the one the binary selects through eframe's `android-game-activity` feature, so a standalone
+# Android check of this crate builds and the workspace feature union is unchanged. The
+# `AndroidApp` handle of `android_app.rs` comes from this backend.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", default-features = false, features = ["android-game-activity"] }
+
 [dev-dependencies]
 # Same crate as above, re-declared only to switch on `test-support` for test builds:
 # it exposes `config_saver::test_harness` (`LoopHarness`, the timing constants), which

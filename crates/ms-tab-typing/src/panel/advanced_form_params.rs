@@ -12,7 +12,7 @@ Main responsibilities:
   section binds these constants, so a control can never offer a value the search
   refuses;
 - hold the process-wide runtime value, seeded at startup from
-  `TextTab.advanced_form_search` (`main.rs::seed_advanced_form_search_from_config`)
+  `TextTab.advanced_form_search` (`lib.rs::seed_advanced_form_search_from_config`)
   and placed into `user_config.json` by `ms_config::save_advanced_form_search_params`;
 - translate the knobs into `ms_text_render::wrap::forms::FormSearchParams` (layers A/B)
   and into the layer-C ordering constants used by `text_forms::order_advanced_forms`.

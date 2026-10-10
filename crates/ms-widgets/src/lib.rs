@@ -2,7 +2,7 @@
 FILE HEADER (crates/ms-widgets/src/lib.rs)
 - Назначение: публичный реэкспорт переиспользуемых UI-виджетов приложения.
   Крейт `ms-widgets` реэкспортируется бинарником как `crate::widgets`
-  (`src/main.rs`), поэтому все существующие пути `crate::widgets::…` валидны.
+  (`src/lib.rs`), поэтому все существующие пути `crate::widgets::…` валидны.
   Вместе с виджетами сюда переехали два соседних листа того же слоя:
   `input_util` (общие egui-хелперы ввода) и `ui_fonts` (единственный владелец
   UI-шрифтового стека); оба тоже реэкспортированы бинарником под своими именами.
@@ -83,7 +83,7 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
 #![warn(clippy::all)]
 
 // Brings the `ms-i18n` UI-string macros (`t!` / `tf!` / `tp!`) into crate-wide scope,
-// exactly as `src/main.rs` does for the binary: the widgets' localized labels use the
+// exactly as `src/lib.rs` does for the binary: the widgets' localized labels use the
 // bare macro names the extraction tool emits and the key-validation test scans for.
 #[macro_use]
 extern crate ms_i18n;

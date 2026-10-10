@@ -12,7 +12,7 @@ Key functions:
 - `apply_elevated()`: `ShellExecuteExW("runas")` of this executable with
   `--system-registration-apply <tokens> --system-registration-result <file>`, wait on its
   process handle, read and delete its result file.
-- `run_elevated_helper()`: the helper's entry point (called by `src/main.rs`); runs the decoded
+- `run_elevated_helper()`: the helper's entry point (called by `src/lib.rs`); runs the decoded
   `Machine`-scope actions in-process and writes the result file. NEVER elevates.
 
 Notes:

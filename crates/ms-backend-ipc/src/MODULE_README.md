@@ -7,7 +7,7 @@ Every Rust subsystem reaches the backend through this crate (usually via the
 process-wide `shared_client()`); no other code opens its own backend connection.
 
 This is a standalone workspace crate. The binary mounts it under its historical module
-path with `pub use ms_backend_ipc as backend_ipc;` (`src/main.rs`), so every application
+path with `pub use ms_backend_ipc as backend_ipc;` (`src/lib.rs`), so every application
 call site keeps writing `crate::backend_ipc::…`.
 
 ## Architecture
@@ -57,7 +57,7 @@ Three ways out of "CPython on Windows cannot bind AF_UNIX" were weighed; the loo
   client reuses this module's codec unchanged instead of needing a fourth transport.
 
 Socket isolation: `backend_socket_path()` normally yields the shared
-`manhwastudio_backend_socket` path. Under `--ignore-installed`, `main.rs` calls
+`manhwastudio_backend_socket` path. Under `--ignore-installed`, `lib.rs` calls
 `seed_isolated_backend_socket_name(program_dir)` right after CLI parsing, which appends
 a stable FNV-1a-64 digest of the canonicalized runtime root to the file name. That makes
 a copy launched from a source checkout use its own socket instead of adopting (or being
@@ -112,7 +112,7 @@ is ephemeral and published per process.
   it is logged once per handshake so a mixed installation is visible in `last.log`, and
   it must never gate a feature or raise UI.
 - The STUDIO half of that same log line comes from `client::set_studio_version`, a
-  write-once process-global the BINARY seeds at startup (`src/main.rs`, from
+  write-once process-global the BINARY seeds at startup (`src/lib.rs`, from
   `HOST_VERSION.core`). This crate cannot read it for itself: `env!("CARGO_PKG_VERSION")`
   compiled here expands to the library's own `0.1.0`. Unseeded it logs `<unknown>` rather
   than a plausible-looking wrong number. It is diagnostic only — `hello_header()` does not

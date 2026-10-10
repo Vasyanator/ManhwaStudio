@@ -239,7 +239,7 @@ pub(crate) mod text_params_schema;
 // The eight user knobs of the advanced text-form search: their supported ranges and
 // defaults, the process-global runtime value, the persisted JSON shape and the mapping
 // onto the engine's `FormSearchParams`. `pub(crate)` (re-exported by `tabs::typing`)
-// because the startup seed (`main.rs`) and the config writer (`tabs::settings`) live
+// because the startup seed (`lib.rs`) and the config writer (`tabs::settings`) live
 // outside the typing subtree.
 pub mod advanced_form_params;
 use advanced_form_params::AdvancedFormParams;

@@ -30,14 +30,14 @@ Contract:
   user-facing strings go through the `ms-i18n` macros mounted below.
 - No probe reads or writes a config DOCUMENT. `ai_install_probe` names
   `ms_config::AiInstallType` only because classifying a machine into that persisted level is
-  its whole output; persisting it stays with the caller (`main.rs`).
+  its whole output; persisting it stays with the caller (`lib.rs`).
 */
 
 #![warn(clippy::all)]
 
 // User-facing failure strings (`t!` / `tf!`) from the shared catalog. The macros are
 // `#[macro_export]`ed and expand through `$crate::`, so one crate-root `#[macro_use]`
-// covers the whole crate — the same line `src/main.rs` uses for the binary.
+// covers the whole crate — the same line `src/lib.rs` uses for the binary.
 #[macro_use]
 extern crate ms_i18n;
 

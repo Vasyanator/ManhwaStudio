@@ -8,8 +8,8 @@ exposing a specific execution-provider set (see `builds.rs`). It probes a portab
 cache, and on first use downloads the pinned official release archive, verifies its
 SHA256, and extracts the loadable library (plus any extra sibling libs). It delivers
 dylib RESOLUTION only: it does not link, initialize, or run onnxruntime.
-`native_runtime` consumes the returned path. The binary re-exports the crate as
-`crate::onnx_runtime` (`src/main.rs`, native-only), so every call site keeps its path.
+`native_runtime` consumes the returned path. The binary names the crate directly as
+`ms_onnx_runtime::` (native-only).
 
 ## Architecture
 `ms_config::data_dir()/onnxruntime/<build_slug>/<version>/` is the per-build,

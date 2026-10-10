@@ -1,8 +1,8 @@
 /*
 FILE HEADER (crates/ms-tools/src/lib.rs)
 - Назначение: crate root of `ms-tools` — reusable UI/drawing tooling primitives that are
-  not bound to a particular tab. Re-exported by the binary as `crate::tools`, so every
-  existing `crate::tools::…` call site keeps its path.
+  not bound to a particular tab. Named directly by the binary as
+  `ms_tools::`.
 - Layer: ABOVE `ms-canvas` / `ms-widgets`, BELOW the tabs. This crate must never name
   `tabs`, `app` or `launcher`; hosts drive the patch core through `PatchHost`.
 - Экспорт:
@@ -28,7 +28,7 @@ FILE HEADER (crates/ms-tools/src/lib.rs)
 #![warn(clippy::all)]
 
 // The `ms-i18n` UI-string macros (`t!` / `tf!` / `tp!`), mounted crate-wide exactly as
-// `src/main.rs` mounts them for the binary: the patch tool's localized labels use the bare
+// `src/lib.rs` mounts them for the binary: the patch tool's localized labels use the bare
 // macro names the extraction tool emits and the key-validation test scans for.
 #[macro_use]
 extern crate ms_i18n;

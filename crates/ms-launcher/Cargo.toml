@@ -9,7 +9,7 @@ edition = "2024"
 # import/export pages, the first-run language modal and the launcher settings page.
 #
 # It is effectively a SECOND application, not a layer of the editor: the studio
-# (`src/app.rs` and the tab crates) does not reference it at all — only `src/main.rs` and
+# (`src/app.rs` and the tab crates) does not reference it at all — only `src/lib.rs` and
 # `src/web_entry.rs` do, through the `crate::launcher` re-export. It sits at the very top
 # of the stack, next to the studio, and nothing may depend on it.
 [features]

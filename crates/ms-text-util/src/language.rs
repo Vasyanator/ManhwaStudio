@@ -21,7 +21,7 @@ Key functions:
 Contract:
 The crate is config-free: it never reads `user_config.json`. The application
 seeds the user value at startup via `set_text_language`
-(`main.rs::seed_text_language_from_config`). The u8 encoding used by the atomic
+(`lib.rs::seed_text_language_from_config`). The u8 encoding used by the atomic
 is defined by explicit `to_u8`/`from_u8` (no `as` casts), so the wire encoding
 is stable and does not depend on enum layout.
 */

@@ -66,6 +66,10 @@ re-exports this crate as `crate::window_geometry` from its `cfg(not(wasm32))` bl
 
 #![warn(clippy::all)]
 
+// Process-global owner of the Android `AndroidApp` handle every `NativeOptions` needs there.
+#[cfg(target_os = "android")]
+pub mod android_app;
+
 use ms_config as config;
 use ms_config::config_saver::{self, ConfigSaver, SaverLabels};
 use ms_log::runtime_log;

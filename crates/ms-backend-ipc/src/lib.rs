@@ -5,7 +5,7 @@ Purpose:
 Crate root of `ms-backend-ipc` — the Rust <-> Python AI-backend IPC layer. Hosts the
 single framed transport and re-exports everything the application imports as
 `backend_ipc::*` (the binary mounts this crate under that name through a re-export
-shim in `src/main.rs`).
+shim in `src/lib.rs`).
 
 Submodules:
 - `transport`: dual-transport connection primitives (`backend_socket_path`,
@@ -36,7 +36,7 @@ identical on both transports.
 // The user-visible strings this crate emits (backend connection/handshake failures) go
 // through the `ms-i18n` macros. They are `#[macro_export]`ed and expand via `$crate::`,
 // so one crate-root `#[macro_use]` is all a consumer crate needs — the same single line
-// `src/main.rs` uses for the binary.
+// `src/lib.rs` uses for the binary.
 #[macro_use]
 extern crate ms_i18n;
 

@@ -15,7 +15,7 @@ Main responsibilities:
 - start background installer workers and consume their progress events;
 - persist the selected AI dependency level into the installed `user_config.json`
   (one `ms_docstore::update` of the install target's document);
-- expose startup service entry points used by `main.rs`.
+- expose startup service entry points used by `lib.rs`.
 
 Notes:
 Non-UI installer work lives in `utils.rs` so the same worker helpers can be reused by future
@@ -103,7 +103,7 @@ pub enum ExistingInstallAction {
     /// Run THIS copy without touching the installed one. The flag that expresses this
     /// (`--ignore-installed`) is consumed during startup routing long before this window
     /// opens and is seeded into a `OnceLock`, so it cannot be turned on in process:
-    /// `main.rs` must relaunch this executable with the flag prepended and then exit.
+    /// `lib.rs` must relaunch this executable with the flag prepended and then exit.
     RunStandalone,
 }
 
@@ -646,7 +646,7 @@ impl ExistingInstallApp {
             });
     }
 
-    /// Records the "run this copy standalone" choice; `main.rs` performs the relaunch.
+    /// Records the "run this copy standalone" choice; `lib.rs` performs the relaunch.
     fn choose_run_standalone(&mut self) {
         self.set_result(ExistingInstallAction::RunStandalone);
     }
