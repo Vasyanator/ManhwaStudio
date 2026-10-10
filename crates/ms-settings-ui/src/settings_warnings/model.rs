@@ -608,6 +608,8 @@ mod tests {
     /// family after the portable keys, and every family key draws on SystemRegistration.
     #[test]
     fn registration_family_is_platform_filtered_and_part_of_all() {
+        // Only the Windows and Linux arms name keys; elsewhere the alias would be unused.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         use SettingKey as K;
         #[cfg(target_os = "windows")]
         let expected: &[SettingKey] = &[K::RegistrationStartMenu, K::RegistrationProgramEntry, K::RegistrationOpenWith];

@@ -44,6 +44,7 @@ const FORMAT_DB: u8 = 1;
 thread_local! {
     /// Unit tests of this crate run in parallel threads of one process; a per-thread
     /// default keeps a test that switches to `Db` from changing its neighbours' behavior.
+    #[cfg_attr(target_os = "android", expect(clippy::missing_const_for_thread_local, reason = "clippy false positive on targets without native TLS: std's os-TLS thread_local wraps the const initializer in a plain init fn"))]
     static TEST_DEFAULT: std::cell::Cell<Option<DocFormat>> = const { std::cell::Cell::new(None) };
 }
 

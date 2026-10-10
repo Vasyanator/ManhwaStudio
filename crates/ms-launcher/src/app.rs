@@ -882,13 +882,39 @@ impl LauncherApp {
                     .with_maximize_button(true)
                     .with_active(true),
             ),
-            |ui, _class| {
+            |ui, class| {
                 let ctx = ui.ctx().clone();
                 keep_open = !ctx.input(|input| input.viewport().close_requested());
                 ctx.request_repaint_after(Duration::from_millis(100));
-                egui::CentralPanel::default().show(ui, |ui| {
-                    self.wiki_guide_tab.draw(ui);
-                });
+                match class {
+                    // Without multi-window support (wasm, Android) egui wraps this callback in
+                    // a non-collapsible `Window` that has no close button and never reports
+                    // `close_requested` (egui-0.36.2/src/context.rs:4174-4185), so the guide
+                    // supplies its own close path. The guide is drawn straight into that
+                    // wrapper: a `CentralPanel` there would fill the whole root viewport.
+                    egui::ViewportClass::EmbeddedWindow => {
+                        // Escape closes only while no widget holds focus, so it never steals
+                        // the key from a focused search field inside the guide.
+                        let nothing_focused = ctx.memory(|memory| memory.focused().is_none());
+                        if nothing_focused && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+                            keep_open = false;
+                        }
+                        ui.push_id("launcher.common.close_button", |ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button(t!("launcher.common.close_button")).clicked() {
+                                    keep_open = false;
+                                }
+                            });
+                        });
+                        ui.separator();
+                        self.wiki_guide_tab.draw(ui);
+                    }
+                    egui::ViewportClass::Root | egui::ViewportClass::Deferred | egui::ViewportClass::Immediate => {
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            self.wiki_guide_tab.draw(ui);
+                        });
+                    }
+                }
             },
         );
         self.wiki_guide_window_open = keep_open;

@@ -58,6 +58,7 @@ static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {
+    #[cfg_attr(target_os = "android", expect(clippy::missing_const_for_thread_local, reason = "clippy false positive on targets without native TLS: std's os-TLS thread_local wraps the const initializer in a plain init fn"))]
     static SPAN_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 

@@ -3291,6 +3291,7 @@ mod tests {
         /// Подменяемый источник свободной памяти для тестов защиты по памяти.
         /// `None` (по умолчанию) → реальный `available_memory_bytes()`.
         /// `Some(value)` → защита видит ровно `value` (где `value` сам `Option`).
+        #[cfg_attr(target_os = "android", expect(clippy::missing_const_for_thread_local, reason = "clippy false positive on targets without native TLS: std's os-TLS thread_local wraps the const initializer in a plain init fn"))]
         static MEMORY_OVERRIDE: Cell<Option<Option<u64>>> = const { Cell::new(None) };
     }
 

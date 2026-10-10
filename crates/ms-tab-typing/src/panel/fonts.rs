@@ -598,6 +598,7 @@ thread_local! {
     /// `font_file_data_from_bytes` ON THIS THREAD. Thread-local rather than global so
     /// that fonts parsed by other tests running in parallel cannot be attributed to the
     /// file this thread is reading.
+    #[cfg_attr(target_os = "android", expect(clippy::missing_const_for_thread_local, reason = "clippy false positive on targets without native TLS: std's os-TLS thread_local wraps the const initializer in a plain init fn"))]
     static FONT_DB_PARSES_ON_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

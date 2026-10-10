@@ -2024,6 +2024,7 @@ impl FontProfileMemory {
 thread_local! {
     /// Identities whose PERSISTED DEFAULT profile was written on this thread, in order.
     /// Per-thread so parallel tests cannot see each other's writes.
+    #[cfg_attr(target_os = "android", expect(clippy::missing_const_for_thread_local, reason = "clippy false positive on targets without native TLS: std's os-TLS thread_local wraps the const initializer in a plain init fn"))]
     static PERSISTED_DEFAULT_WRITES: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }

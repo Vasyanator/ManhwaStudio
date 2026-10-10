@@ -60,6 +60,7 @@ fn panel_fonts_dir() -> PathBuf {
 #[cfg(test)]
 thread_local! {
     /// Per-THREAD so parallel tests cannot see each other's injection.
+    #[cfg_attr(target_os = "android", expect(clippy::missing_const_for_thread_local, reason = "clippy false positive on targets without native TLS: std's os-TLS thread_local wraps the const initializer in a plain init fn"))]
     static TEST_FONTS_DIR: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
 }

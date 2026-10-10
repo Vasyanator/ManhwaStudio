@@ -355,6 +355,9 @@ mod tests {
 
     /// The helper pair is spelled exactly as the crate that launches the helper spells it, each
     /// flag requires the other, and an image start rejects it like every installed-copy flag.
+    // Gated like `ms_os_integration::actions`: that module exists outside the crate's own test
+    // build only on Windows and Linux (its `all(test, ...)` arm never applies to a dependency).
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     #[test]
     fn system_registration_helper_flags() {
         use ms_os_integration::actions::{SYSTEM_REGISTRATION_APPLY_FLAG, SYSTEM_REGISTRATION_RESULT_FLAG};

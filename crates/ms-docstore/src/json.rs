@@ -485,6 +485,7 @@ pub enum FaultPoint {
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Fault armed for THIS thread only, so an injecting test cannot break a parallel one.
+    #[cfg_attr(target_os = "android", expect(clippy::missing_const_for_thread_local, reason = "clippy false positive on targets without native TLS: std's os-TLS thread_local wraps the const initializer in a plain init fn"))]
     static ARMED_FAULT: std::cell::Cell<Option<FaultPoint>> = const { std::cell::Cell::new(None) };
 }
 
