@@ -14,6 +14,9 @@ rust-version = "1.95"
 
 [workspace]
 members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
+# The Android port forks under `crates/` are separate workspaces patched in below; without
+# this exclusion Cargo would adopt them as implicit members of this workspace.
+exclude = ["crates/winit", "crates/egui"]
 
 # Single pin for every third-party crate used by MORE THAN ONE manifest in this workspace.
 # Members write `<dep>.workspace = true` instead of repeating a version, so a version can no
@@ -391,3 +394,23 @@ ms-tab-typing = { path = "crates/ms-tab-typing", features = ["test-support"] }
 # accessors (`ensure_page_loaded`, `node`, `is_text`, `display_image`) that the typing
 # tab's tests drive. Test builds only, for the same reason.
 ms-models = { path = "crates/ms-models", features = ["test-support"] }
+
+# Android port forks (plan: dev-docs/ANDROID_PORT.md). `winit` and the egui family are
+# separate git repositories checked out under `crates/` (branch `manhwastudio-android`,
+# gitignored here). Fork changes stay inside `cfg(target_os = "android")` code, so desktop
+# builds compile the same code as the crates.io releases. Every egui-family crate in the
+# graph is patched together: patching only `eframe` would pull a second, path-sourced `egui`
+# next to the crates.io one. These local paths become GitHub URLs once the forks are
+# published.
+[patch.crates-io]
+winit = { path = "crates/winit" }
+ecolor = { path = "crates/egui/crates/ecolor" }
+eframe = { path = "crates/egui/crates/eframe" }
+egui = { path = "crates/egui/crates/egui" }
+egui_extras = { path = "crates/egui/crates/egui_extras" }
+egui_glow = { path = "crates/egui/crates/egui_glow" }
+egui-wgpu = { path = "crates/egui/crates/egui-wgpu" }
+egui-winit = { path = "crates/egui/crates/egui-winit" }
+emath = { path = "crates/egui/crates/emath" }
+epaint = { path = "crates/egui/crates/epaint" }
+epaint_default_fonts = { path = "crates/egui/crates/epaint_default_fonts" }
