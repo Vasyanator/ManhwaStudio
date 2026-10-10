@@ -780,7 +780,8 @@ pub fn native_fallback_reason(
         cuda_build_available,
         facts.openvino_available,
         facts.webgpu_available,
-        provider_supported_on_platform(ep),
+        // `ms_onnx` owns "can this EP run on the build target"; never re-derive it here.
+        ep.is_available_on_current_platform(),
     );
     // The embedded manifest is the owner of "which builds ship for this OS/arch"; the
     // allocation-free lookup keeps the panel's per-frame call cheap.
@@ -913,28 +914,6 @@ pub fn active_build() -> Option<String> {
         Some(native_selection().build.to_string())
     } else {
         None
-    }
-}
-
-/// Whether `provider` can run on the OS this binary was built for.
-///
-/// Mirrors `ms_onnx::ExecutionProvider`'s platform gating: DirectML is Windows-only,
-/// Core ML is macOS-only, CUDA is unavailable on macOS, WebGPU runs on all three
-/// desktop targets (Dawn D3D12/Vulkan/Metal), OpenVINO is x86_64 Windows/Linux,
-/// TensorRT is Windows/Linux (mirrors CUDA), and CPU is always available.
-fn provider_supported_on_platform(provider: ExecutionProvider) -> bool {
-    match provider {
-        ExecutionProvider::Cpu => true,
-        ExecutionProvider::DirectMl => cfg!(target_os = "windows"),
-        ExecutionProvider::CoreMl => cfg!(target_os = "macos"),
-        ExecutionProvider::Cuda => !cfg!(target_os = "macos"),
-        ExecutionProvider::WebGpu => {
-            cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos"))
-        }
-        ExecutionProvider::OpenVino => {
-            cfg!(all(target_arch = "x86_64", any(target_os = "windows", target_os = "linux")))
-        }
-        ExecutionProvider::TensorRt => cfg!(any(target_os = "windows", target_os = "linux")),
     }
 }
 
@@ -2177,7 +2156,7 @@ mod tests {
     fn webgpu_is_supported_on_desktop_targets() {
         // WebGPU runs on all three desktop targets via Dawn; both GNU check targets
         // (linux, windows) must report it supported.
-        assert!(provider_supported_on_platform(ExecutionProvider::WebGpu));
+        assert!(ExecutionProvider::WebGpu.is_available_on_current_platform());
     }
 
     #[test]

@@ -42,6 +42,13 @@ in, or the two `Window` types stop unifying.
   binary and `ms-launcher`. `android_main` (`src/android_entry.rs`) installs the handle, and
   REPLACES it when android-activity calls `android_main` again for a re-created Activity;
   every `eframe::NativeOptions` in the process sets `android_app: android_app::current()`.
+  It also maps `General.android_native_windows` (`ms_config::AndroidNativeWindows`) onto the
+  forked winit's `multiwindow::set_native_window_policy` (`apply_native_window_policy`). The
+  crate-root `apply_android_native_window_policy()` (no-op off Android) reads `user_config`
+  and calls it; the two product roots (launcher `ms-launcher/src/lib.rs`, studio
+  `src/lib.rs::run_main_window`) call it right before `eframe::run_native`, because eframe
+  decides native vs embedded viewports once per `run_native`. The startup prompts keep
+  whatever policy is set (they open no secondary viewports).
 
 ## Contracts and invariants
 - **Units.** Everything persisted is in *logical pixels* (physical / DPI scale), independent

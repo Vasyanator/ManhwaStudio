@@ -2153,6 +2153,9 @@ fn run_main_window(
     // until the receiver yields, then constructs `MangaApp` in place.
     let load_rx = studio_bootstrap::spawn_open_thread(request, user_settings.clone());
 
+    // eframe decides native vs embedded secondary viewports once per `run_native` (Android:
+    // `General.android_native_windows`, read fresh so a launcher-side change applies here).
+    window_geometry::apply_android_native_window_policy();
     eframe::run_native(
         &title,
         native_options,

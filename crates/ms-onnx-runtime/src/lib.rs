@@ -10,7 +10,8 @@ the loadable library, and returns its on-disk path. The app starts fine without
 the library present — resolution happens only when a caller asks for it.
 
 Key types:
-- OrtRuntimeError    : typed failure surface for probe/download/verify/extract
+- OrtRuntimeError    : typed failure surface for probe/download/verify/extract, plus
+  `Unavailable` where the platform has no native runtime (Android, wasm)
 - OrtDownloadStage   : coarse progress stage (Probing/Downloading/.../Done)
 - OrtDownloadProgress: byte counters + stage reported through the callback
 
@@ -120,6 +121,10 @@ pub enum OrtRuntimeError {
 
     /// A filesystem operation (create dir, write, rename, remove) failed.
     Io(String),
+
+    /// The platform has no native ONNX Runtime (`PlatformFeature::NativeOnnxRuntime`);
+    /// returned before any manifest lookup, disk or network access.
+    Unavailable(ms_platform::Unavailable),
 }
 
 impl std::fmt::Display for OrtRuntimeError {
@@ -150,12 +155,15 @@ impl std::fmt::Display for OrtRuntimeError {
                 f.write_str(&tf!("onnx_runtime.error.dylib_not_found", member = member))
             }
             Self::Io(detail) => f.write_str(&tf!("onnx_runtime.error.io", detail = detail)),
+            // Already localized by `ms-platform`.
+            Self::Unavailable(err) => std::fmt::Display::fmt(err, f),
         }
     }
 }
 
-// No variant wraps another error (all carry Strings or plain fields), so the
-// default `source()` (None) is correct; the impl is required so this type can be an
+// No variant wraps an underlying cause (Strings, plain fields, or the self-contained
+// `Unavailable` whose `Display` this type forwards), so the default `source()` (None)
+// is correct and no message is printed twice in a chain; the impl is required so this type can be an
 // `Error` source for `NativeRuntimeError`.
 impl std::error::Error for OrtRuntimeError {}
 
@@ -221,6 +229,8 @@ pub fn ort_dylib_dir(build_slug: &str, ort_version: &str) -> PathBuf {
 /// never from the GUI thread.
 ///
 /// # Errors
+/// - [`OrtRuntimeError::Unavailable`] if the platform has no native ONNX Runtime
+///   (checked first, before the manifest, the disk or the network).
 /// - [`OrtRuntimeError::NoManifestEntry`] if no archive is pinned for this platform/build.
 /// - [`OrtRuntimeError::Download`] on network/HTTP failure.
 /// - [`OrtRuntimeError::ChecksumMismatch`] if the archive fails SHA256 verification.
@@ -230,6 +240,9 @@ pub fn resolve_or_download_ort_dylib(
     build: &str,
     progress: &mut dyn FnMut(OrtDownloadProgress),
 ) -> Result<PathBuf, OrtRuntimeError> {
+    // The capability table is the one owner of "is there a native runtime here"; refuse
+    // before touching the manifest, the cache or the network.
+    ms_platform::PlatformFeature::NativeOnnxRuntime.require().map_err(OrtRuntimeError::Unavailable)?;
     // The version is per-entry, so the manifest lookup must run BEFORE computing the
     // cache dir and probing: each build resolves under its own version. The lookup is
     // an in-memory scan (no network), and a cached library can only exist after a
@@ -888,5 +901,14 @@ mod tests {
             &result,
             Err(OrtRuntimeError::NoManifestEntry { build, .. }) if build == "directml"
         ));
+    }
+
+    #[test]
+    fn unavailable_displays_the_platform_message() {
+        let err = ms_platform::Unavailable::new(
+            ms_platform::PlatformFeature::NativeOnnxRuntime,
+            ms_platform::UnavailableReason::NotOnThisPlatform,
+        );
+        assert_eq!(OrtRuntimeError::Unavailable(err).to_string(), err.user_message());
     }
 }

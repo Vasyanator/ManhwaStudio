@@ -39,7 +39,8 @@ Availability rule owner: `native_fallback_reason(build, ep, &NativeHardwareFacts
 `NativeFallbackReason` says why) answers "can this build/EP run here" for the runtime's
 selection and for the AI backend panel's native build picker. It also rejects a build with no
 archive for this OS/arch, asking the manifest owner (`ms_onnx_runtime::build_shipped_here`),
-never a platform table of its own. The cached selection calls it over the facts of only the
+never a platform table of its own; whether the EP can run on the build target is likewise
+asked of `ms_onnx::ExecutionProvider::is_available_on_current_platform`. The cached selection calls it over the facts of only the
 probes that (build, EP) needs; the panel's build picker calls `native_build_fallback_reason`
 (headline EP) over `NativeHardwareFacts::probe_all()` taken on its own probe worker. A new
 build-availability decision for the native runtime belongs here, not in a caller.

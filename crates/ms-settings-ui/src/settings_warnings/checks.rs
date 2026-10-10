@@ -182,7 +182,8 @@ fn gather_backend(
 
 /// The backend rules, as `(AiRuntime reasons, BackendAutostart reasons)`.
 ///
-/// - Nothing under `--no-ai` (`!ctx.ai_enabled`) or without a blocker.
+/// - Nothing under `--no-ai` (`!ctx.ai_enabled`), without a blocker, or when the platform
+///   has no Python backend (`PlatformUnavailable`: the AI backend pane shows that notice).
 /// - `AiRuntime`: the blocker, when the runtime is `Backend`.
 /// - `BackendAutostart`: the blocker, when autostart is on — except a missing Python
 ///   while no AI is installed (user decision Q2: that state is the main page's "AI not
@@ -199,6 +200,9 @@ pub(crate) fn backend_reasons(
     };
     let app_dir = app_dir.display().to_string();
     let reason = match blocker {
+        // No Python backend on this platform: the AI backend pane already shows the notice,
+        // so a script/Python warning here would only be noise.
+        BackendSpawnBlocker::PlatformUnavailable(_) => return (Vec::new(), Vec::new()),
         BackendSpawnBlocker::ScriptMissing => WarningReason::BackendScriptMissing { app_dir },
         BackendSpawnBlocker::PayloadOutdated => WarningReason::BackendPayloadOutdated { app_dir },
         BackendSpawnBlocker::PythonMissing(detail) => WarningReason::BackendPythonMissing { detail: detail.clone() },
@@ -577,6 +581,18 @@ mod tests {
         assert_eq!(
             backend_reasons(AiRuntime::Backend, ctx(true, true), AiInstallType::Full, None, Path::new(APP_DIR)),
             none
+        );
+    }
+
+    #[test]
+    fn backend_silent_when_the_platform_has_no_backend() {
+        let blocker = BackendSpawnBlocker::PlatformUnavailable(ms_platform::Unavailable::new(
+            ms_platform::PlatformFeature::PythonBackend,
+            ms_platform::UnavailableReason::NotOnThisPlatform,
+        ));
+        assert_eq!(
+            backend_reasons(AiRuntime::Backend, ctx(true, true), AiInstallType::Full, Some(&blocker), Path::new(APP_DIR)),
+            (Vec::new(), Vec::new())
         );
     }
 

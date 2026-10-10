@@ -7,8 +7,8 @@ Android JNI plumbing shared by the platform backends.
 Submodules:
 - jni_ctx: attaching to the JVM through the android-activity `ndk-context` and loading app
   classes with the application class loader (Android only).
-- saf: the pending-request registry of the SAF bridge and its class name. The registry is pure
-  Rust and is compiled for host tests too.
+- saf: the pure half of the SAF bridge (class name, wire codes and decoders, pending-request
+  registry, staging name rules). Pure Rust, compiled for host tests too.
 */
 
 #[cfg(target_os = "android")]

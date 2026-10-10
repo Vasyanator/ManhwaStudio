@@ -19,7 +19,8 @@ Key functions:
 - build_version     : the manifest version for a build on the current platform
 - build_shipped_here : whether a build has an archive for the current platform (no allocation)
 - provider_version  : back-compat shim — the version of a provider's DEFAULT build
-- current_platform  : the (os, arch) pair this binary was built for, via cfg
+- current_platform  : the (os, arch) pair this binary was built for
+- platform_keys     : pure target_os/target_arch -> manifest (os, arch) key mapping
 - sha256_hex        : lowercase hex SHA256 of a byte slice (pure)
 - sha256_hex_of_file: streaming lowercase hex SHA256 of a file
 - verify_sha256_file: compare a file's SHA256 against an expected hex string
@@ -244,24 +245,29 @@ pub fn provider_version(provider: ms_onnx::ExecutionProvider) -> Option<String> 
 
 /// The `(os, arch)` platform keys for the target this binary was built for.
 ///
-/// `os` is one of `"windows"`, `"macos"`, `"linux"`; `arch` is `"aarch64"` or
-/// `"x86_64"`. These match the manifest key scheme. Pure and const-foldable.
+/// [`platform_keys`] applied to the build target (`std::env::consts::{OS, ARCH}` are the
+/// compile-time `target_os` / `target_arch` names), so it is const-foldable.
 #[must_use]
 pub fn current_platform() -> (&'static str, &'static str) {
-    let os = if cfg!(target_os = "windows") {
-        "windows"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        // The only supported non-macOS unix target is Linux; other unixes fall
-        // through here intentionally (no manifest entry -> typed no-entry error).
-        "linux"
+    platform_keys(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Maps a `target_os` / `target_arch` pair to the manifest's `(os, arch)` key scheme.
+///
+/// `os` is `"windows"`, `"macos"`, `"android"` or `"linux"`; `arch` is `"aarch64"` or
+/// `"x86_64"`. Android gets its own key, never `"linux"`: the official Linux archives are
+/// glibc builds that cannot load on Android's bionic, and the manifest has no `android`
+/// row, so every lookup there misses with the typed no-entry error. Any other unix falls
+/// through to `"linux"` intentionally (no matching archive -> the same typed miss). Pure.
+#[must_use]
+pub fn platform_keys(target_os: &str, target_arch: &str) -> (&'static str, &'static str) {
+    let os = match target_os {
+        "windows" => "windows",
+        "macos" => "macos",
+        "android" => "android",
+        _ => "linux",
     };
-    let arch = if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x86_64"
-    };
+    let arch = if target_arch == "aarch64" { "aarch64" } else { "x86_64" };
     (os, arch)
 }
 
@@ -646,6 +652,27 @@ mod tests {
         assert_eq!(coreml.url, cpu.url, "coreml must reuse the cpu osx archive");
         assert_eq!(coreml.sha256, cpu.sha256);
         assert_eq!(coreml.dylib_member, cpu.dylib_member);
+    }
+
+    #[test]
+    fn platform_keys_maps_desktop_targets_unchanged() {
+        assert_eq!(platform_keys("windows", "x86_64"), ("windows", "x86_64"));
+        assert_eq!(platform_keys("windows", "aarch64"), ("windows", "aarch64"));
+        assert_eq!(platform_keys("macos", "x86_64"), ("macos", "x86_64"));
+        assert_eq!(platform_keys("macos", "aarch64"), ("macos", "aarch64"));
+        assert_eq!(platform_keys("linux", "x86_64"), ("linux", "x86_64"));
+        assert_eq!(platform_keys("linux", "aarch64"), ("linux", "aarch64"));
+        // Other unixes keep falling through to the linux key.
+        assert_eq!(platform_keys("freebsd", "x86_64"), ("linux", "x86_64"));
+    }
+
+    #[test]
+    fn android_has_its_own_key_and_no_manifest_entry() {
+        let (os, arch) = platform_keys("android", "aarch64");
+        assert_eq!((os, arch), ("android", "aarch64"));
+        for build in crate::builds::all_builds() {
+            assert!(lookup_build(os, arch, build.slug).is_none(), "{}", build.slug);
+        }
     }
 
     #[test]

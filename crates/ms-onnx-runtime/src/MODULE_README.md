@@ -16,6 +16,7 @@ dylib RESOLUTION only: it does not link, initialize, or run onnxruntime.
 per-version cache root. Resolution flow (`resolve_or_download_ort_dylib(build)`):
 
 ```
+PlatformFeature::NativeOnnxRuntime unavailable (Android, wasm) -> Unavailable, nothing touched
 manifest lookup_build (os, arch, build) -> (miss) NoManifestEntry, no network
     -> version = entry.version (per-entry, NOT global)
     -> probe cache: ALL expected members present? -> (hit) return path, no network
@@ -75,7 +76,8 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
   `ManifestEntry` with its `build` field), embedded JSON parsing, `lookup`
   (four-key), `lookup_build` (the resolution primary), `build_version`,
   `build_shipped_here` (allocation-free "has an archive here", used by the native availability rule),
-  `provider_version` (compat shim), `current_platform`, and SHA256 helpers. Edit here
+  `provider_version` (compat shim), `current_platform` over the pure `platform_keys`
+  (`android` is its own os key with no manifest row, never `linux`), and SHA256 helpers. Edit here
   to change the manifest schema or integrity checks.
 - `ort_manifest.json`: the pinned per-`(os, arch, provider, build)` download recipes,
   each carrying its `build` slug, `version`, and (optionally) `additional_sources`.

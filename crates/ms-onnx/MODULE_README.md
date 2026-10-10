@@ -115,7 +115,7 @@ unsupported-CPU SIGILL would surface.
   (`cpu`/`directml`/`coreml`/`cuda`/`webgpu`/`openvino`/`tensorrt`) used by higher
   layers for per-provider config scoping. Keep these values stable.
 - **Provider platform gating:** DirectML = Windows only, Core ML = macOS only,
-  CUDA = not macOS, WebGPU = Windows/Linux/macOS (Dawn), OpenVINO = x86_64
+  CUDA = Windows/Linux, WebGPU = Windows/Linux/macOS (Dawn), OpenVINO = x86_64
   Windows/Linux (Intel device + OpenVINO runtime: self-contained on the Linux
   wheel, system SDK on Windows), TensorRT = Windows/Linux (mirrors CUDA; bundled in
   the CUDA "gpu" build, needs the NVIDIA/CUDA stack), CPU = everywhere.

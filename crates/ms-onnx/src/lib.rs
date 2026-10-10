@@ -114,13 +114,13 @@ impl ExecutionProvider {
 
     /// Whether this provider can run on the platform this binary was built for.
     ///
-    /// `DirectML` is Windows-only, Core ML is macOS-only, and CUDA is unavailable
-    /// on macOS; the CPU provider is always available. WebGPU runs on all three
-    /// desktop targets via Dawn (D3D12/Vulkan/Metal), so it is available on
-    /// Windows, Linux, and macOS. Higher layers use this to query provider
-    /// availability without duplicating the `cfg(target_os)` logic (e.g. to decide
-    /// which providers to offer). The result reflects the target this binary was
-    /// compiled for, evaluated at compile time.
+    /// `DirectML` is Windows-only, Core ML is macOS-only, and CUDA is Windows/Linux
+    /// only (no NVIDIA stack on macOS or Android); the CPU provider is always
+    /// available. WebGPU runs on all three desktop targets via Dawn
+    /// (D3D12/Vulkan/Metal), so it is available on Windows, Linux, and macOS. Higher
+    /// layers use this to query provider availability without duplicating the
+    /// `cfg(target_os)` logic (e.g. to decide which providers to offer). The result
+    /// reflects the target this binary was compiled for, evaluated at compile time.
     ///
     /// Note: rc.12's own `ort::ep::WebGPU::supported_by_platform` returns `false`
     /// on macOS (it only counts Windows/Linux/wasm), but that predicate merely
@@ -143,7 +143,7 @@ impl ExecutionProvider {
             ExecutionProvider::Cpu => true,
             ExecutionProvider::DirectMl => cfg!(target_os = "windows"),
             ExecutionProvider::CoreMl => cfg!(target_os = "macos"),
-            ExecutionProvider::Cuda => !cfg!(target_os = "macos"),
+            ExecutionProvider::Cuda => cfg!(any(target_os = "windows", target_os = "linux")),
             ExecutionProvider::WebGpu => {
                 cfg!(any(target_os = "windows", target_os = "linux", target_os = "macos"))
             }
@@ -768,9 +768,10 @@ mod tests {
             ExecutionProvider::CoreMl.is_available_on_current_platform(),
             cfg!(target_os = "macos")
         );
+        // CUDA: Windows/Linux only; Android (`target_os = "android"`) is not Linux here.
         assert_eq!(
             ExecutionProvider::Cuda.is_available_on_current_platform(),
-            !cfg!(target_os = "macos")
+            cfg!(any(target_os = "windows", target_os = "linux"))
         );
         // WebGPU runs on all three desktop targets via Dawn.
         assert_eq!(

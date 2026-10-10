@@ -21,7 +21,8 @@ Main types:
   (`start_with_autostart_gate` there, so autostart waits for storage-mode conversions).
 - `AutostartGate` / `AutostartDeferral`: the one-shot, gate-deferred autostart polled on the
   worker tick; a user Start/Restart/Stop or autostart-off cancels it.
-- `check_backend_spawnable` / `BackendSpawnBlocker` (native-only): the spawn preconditions,
+- `check_backend_spawnable` / `BackendSpawnBlocker` (native-only): the spawn preconditions
+  (platform has a Python backend first, then the disk checks),
   silent, shared by the spawn and by inspection callers (settings checks).
 
 Notes:
@@ -618,6 +619,9 @@ fn backend_payload_is_current(app_dir: &Path) -> bool {
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendSpawnBlocker {
+    /// The platform has no Python backend at all (`PlatformFeature::PythonBackend`,
+    /// Android); checked before anything on disk. Its `Display` is the localized message.
+    PlatformUnavailable(ms_platform::Unavailable),
     /// `ai_backend.py` is not a file in the program directory.
     ScriptMissing,
     /// The Python payload predates the document store (no `docstore.py`, KG-017).
@@ -627,8 +631,8 @@ pub enum BackendSpawnBlocker {
     PythonMissing(String),
 }
 
-/// The spawn preconditions of the backend, in the order the spawn checks them:
-/// `ai_backend.py` exists, the payload carries [`BACKEND_PAYLOAD_MARKER`]
+/// The spawn preconditions of the backend, in the order the spawn checks them: the
+/// platform has a Python backend (`ms_platform` capability table), `ai_backend.py` exists, the payload carries [`BACKEND_PAYLOAD_MARKER`]
 /// ([`backend_payload_is_current`], KG-017), and `python_manager` resolves an interpreter
 /// under `app_dir`. Silent (the caller decides what to log). Stats the disk: worker
 /// threads only.
@@ -638,6 +642,17 @@ pub enum BackendSpawnBlocker {
 /// interpreter the spawn would use.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn check_backend_spawnable(app_dir: &Path) -> Result<PathBuf, BackendSpawnBlocker> {
+    check_backend_spawnable_on(ms_platform::PlatformFeature::PythonBackend.require(), app_dir)
+}
+
+/// [`check_backend_spawnable`] with the platform answer passed in, so tests can exercise
+/// the unavailable-platform order on a desktop host.
+#[cfg(not(target_arch = "wasm32"))]
+fn check_backend_spawnable_on(
+    platform: Result<(), ms_platform::Unavailable>,
+    app_dir: &Path,
+) -> Result<PathBuf, BackendSpawnBlocker> {
+    platform.map_err(BackendSpawnBlocker::PlatformUnavailable)?;
     if !app_dir.join("ai_backend.py").is_file() {
         return Err(BackendSpawnBlocker::ScriptMissing);
     }
@@ -682,6 +697,10 @@ fn start_ai_backend_process(
     let app_dir = config::program_dir();
     let python = match check_backend_spawnable(&app_dir) {
         Ok(python) => python,
+        Err(BackendSpawnBlocker::PlatformUnavailable(unavailable)) => {
+            runtime_log::log_warn(format!("[ai-backend] refusing to start the backend: {unavailable:?}"));
+            return Err(unavailable.user_message());
+        }
         Err(BackendSpawnBlocker::ScriptMissing) => {
             return Err(tf!("ai_backend.supervisor.script_not_found", app_dir = app_dir.display()));
         }
@@ -1103,7 +1122,7 @@ pub fn save_ai_backend_autostart(user_settings_file: &Path, enabled: bool) -> Re
 mod tests {
     use super::{
         AiBackendProcessCommand, AutostartDeferral, AutostartPoll, BackendSpawnBlocker, WsPortLine, backend_payload_is_current,
-        check_backend_spawnable, command_cancels_autostart, load_ai_backend_autostart, parse_ws_port_line, save_ai_backend_autostart,
+        check_backend_spawnable, check_backend_spawnable_on, command_cancels_autostart, load_ai_backend_autostart, parse_ws_port_line, save_ai_backend_autostart,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1173,6 +1192,28 @@ mod tests {
         // The interpreter lookup is confined to `app_dir` (venv / installer_files), so an
         // empty temp dir has none whatever Python the machine has.
         assert!(matches!(check_backend_spawnable(dir.path()), Err(BackendSpawnBlocker::PythonMissing(_))));
+        Ok(())
+    }
+
+    /// An unavailable platform is reported first, before any file is looked at, and the
+    /// blocker carries the localized platform message.
+    #[test]
+    fn unavailable_platform_blocks_before_the_disk_checks() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("ai_backend.py"), b"")?;
+        std::fs::write(dir.path().join("docstore.py"), b"")?;
+        let unavailable = ms_platform::Unavailable::new(
+            ms_platform::PlatformFeature::PythonBackend,
+            ms_platform::UnavailableReason::NotOnThisPlatform,
+        );
+        assert_eq!(
+            check_backend_spawnable_on(Err(unavailable), dir.path()),
+            Err(BackendSpawnBlocker::PlatformUnavailable(unavailable))
+        );
+        assert_eq!(unavailable.to_string(), unavailable.user_message());
+        // On a desktop host the real gate passes and the disk checks decide.
+        let empty = tempfile::tempdir()?;
+        assert_eq!(check_backend_spawnable(empty.path()), Err(BackendSpawnBlocker::ScriptMissing));
         Ok(())
     }
 

@@ -75,6 +75,8 @@ Callers own the threading: nothing here spawns a worker for you.
   `venv`, `installer_files/env`, `installer_files/python`), of the configured `Command`
   values that run it, and of the Windows Job Object that kills a spawned Python child with
   the Rust parent. Native-only: the file carries `#![cfg(not(target_arch = "wasm32"))]`.
+  Where `ms_platform::PlatformFeature::PythonBackend` is unavailable (Android) every lookup
+  fails first with the localized `Unavailable` message, so no caller can spawn Python there.
   Edit here for anything about locating or launching Python.
 - `paste_image.rs`: `read_image_from_clipboard()` — one normalized RGBA image out of the
   system clipboard through `ms_platform::clipboard` (image, then a copied file list or an

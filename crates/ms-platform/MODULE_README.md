@@ -17,9 +17,9 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   `Completion` and calls `finish(result)` exactly once; dropping it unfinished reads as
   `WorkerLost`. Backend per target:
   - desktop (`desktop.rs`): rfd on a detached `file-dialog` thread;
-  - Android (`android.rs`): the SAF bridge via the pending registry (`android/saf.rs`); until
-    the Kotlin `SafBridge` and its Rust launch path exist, a `platform-bridge` worker probes
-    for the class and every request resolves to `Unavailable { FilePicker, BridgeMissing }`;
+  - Android (`android.rs`): the Storage Access Framework bridge to the Kotlin `SafBridge`
+    (see "SAF bridge" below); an APK without the class answers
+    `Unavailable { FilePicker, BridgeMissing }`;
   - wasm (`unavailable.rs`): `Unavailable { FilePicker, NotOnThisPlatform }`.
 - **Clipboard** (`clipboard/`): blocking, short reads. Desktop = arboard; Android text = JNI
   `ClipboardManager` on the calling thread (`android.rs`); Android image / file list / HTML
@@ -27,6 +27,32 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - **JNI** (`android/jni_ctx.rs`): `with_env` attaches the thread and passes the application
   context; `load_app_class` uses `Context.getClassLoader()` because `FindClass` on a native
   thread cannot see app classes.
+
+## SAF bridge (Android)
+- Flow: `request` registers the `Completion` and spawns a `platform-bridge` worker. The worker
+  loads `SafBridge` (application class loader, cached; `nativeOnResult` bound with
+  `RegisterNatives`, so the binding never depends on the cdylib's symbol export), calls `SafBridge.launch` (returns at
+  once; Kotlin starts the translucent `SafRequestActivity` on the UI thread over the last
+  resumed Activity), then blocks on a channel until the native
+  `Java_io_github_vasyanator_manhwastudio_platform_SafBridge_nativeOnResult` delivers the one
+  result for its request id. Open kinds are then copied in by the worker (`SafBridge.copyToFile`
+  / `listTree`); save kinds become staged targets.
+- Wire contract (both sides change together): kind codes = `DialogKind` order 0..4; status
+  0 picked / 1 cancelled / 2 failed; `nativeOnResult -> false` = Rust did not take over the URI
+  grants, Kotlin releases them; blocking helpers answer `String?` (null = ok), `listTree` the
+  encoding of `saf::decode_tree_listing`, `treeHasEntries` 1 / 0 / -1. Kotlin never throws into
+  native and calls `nativeOnResult` exactly once per accepted launch (a start that never
+  happens fails after 10 s).
+- Local layout: inputs `<cacheDir>/saf_in/<request id>/`, outputs
+  `<noBackupFilesDir>/saf_out/<request id>/`; names are sanitized and de-duplicated
+  (`android/saf.rs`), a created document's staging name keeps the requested extension. Both
+  roots are purged on the first request of a process; a committed target removes its staging
+  dir; copied-in inputs stay until the next process (callers read them after the pick).
+- Grants: the picker's transient grants belong to `SafRequestActivity`, which finishes right
+  after reporting, so Kotlin persists them first; Rust releases them after copy-in / `commit`
+  (or when a result is discarded); `SafBridge` releases leftovers of an earlier process.
+- Cancel: dropping the `PendingDialog` withdraws it; a running copy-in stops before the next
+  file and deletes its copies. The picker itself stays until the user closes it.
 
 ## Files and submodules
 - `lib.rs`: crate root, re-exports `PlatformFeature`, `Unavailable`, `UnavailableReason`.
@@ -38,8 +64,11 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - `file_dialog/mime.rs`: pure filter -> MIME mapping for SAF.
 - `clipboard/{mod,desktop,android,unavailable}.rs`: clipboard API and backends.
 - `message.rs`: `show_error_blocking` (startup only).
-- `android/`: `jni_ctx.rs` (Android only), `saf.rs` (pending-request registry, also
-  host-tested; the bridge class name `SAF_BRIDGE_CLASS`).
+- `android/`: `jni_ctx.rs` (Android only), `saf.rs` (pure SAF half, host-tested in
+  `saf/tests.rs`: the bridge class name `SAF_BRIDGE_CLASS`, wire codes and decoders, the
+  pending-request registry, staging name rules).
+- Kotlin half: `android/app/src/main/kotlin/io/github/vasyanator/manhwastudio/platform/`
+  (`SafBridge.kt`, `SafRequestActivity.kt`; manifest entry for the latter).
 
 ## Contracts and invariants
 - One file dialog in flight process-wide: a second request resolves to
@@ -56,7 +85,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   uppercase spelling because GTK / xdg-portal globs are case-sensitive.
 - `PickDirectoryPath` needs `PersistentDirectoryPicker` (unavailable on Android: SAF yields
   tree URIs, never usable paths).
-- No JNI on the GUI thread: Android backends run every JVM call on a worker. The one
+- No JNI on the GUI thread: Android backends run every JVM call on a worker
+  (`FolderTarget::has_entries` answers from a probe taken at pick time). The one
   exception is the synchronous clipboard text read (`clipboard/android.rs`): a single short
   binder round trip, the same cost class as the desktop arboard read it replaces.
 - Logs: outcome per dialog at info level with the kind and file names only (never full paths);
@@ -72,6 +102,7 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - New dialog kind: `DialogKind` (append only: its index is the Kotlin bridge contract),
   `picked_from_paths`, each backend, and the `Picked` table.
 - New extension family for SAF: `file_dialog/mime.rs`.
-- Android SAF launch / result path: `file_dialog/android.rs` + `android/saf.rs`.
+- Android SAF launch / result / commit path: `file_dialog/android.rs` (JNI) +
+  `android/saf.rs` (wire codes, names) + the Kotlin `SafBridge.kt` / `SafRequestActivity.kt`.
 - Android clipboard reads: `clipboard/android.rs` + the `read_text_backend` dispatch in
   `clipboard/mod.rs`.

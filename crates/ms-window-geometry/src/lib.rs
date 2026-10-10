@@ -27,6 +27,7 @@ Key functions:
 - `resolve_monitor`, `largest_monitor_index`, `should_relocate`
 - `refresh_monitors`, `monitor_snapshot`, `persist_preferred_monitor`, `request_relocation`
 - `update_window_section`, `persist_geometry`, `spawn_geometry_saver`
+- `apply_android_native_window_policy` (Android secondary-window policy before `run_native`)
 
 Notes:
 DURABILITY. Geometry reaches the disk through `config_saver::ConfigSaver`, the shared debouncing
@@ -392,6 +393,25 @@ pub fn load_window_settings() -> WindowSettings {
                  placement; the window manager decides this time; error={err:#}"
             ));
             WindowSettings::default()
+        }
+    }
+}
+
+/// Applies the user's Android secondary-window policy (`General.android_native_windows`)
+/// before a product `eframe::run_native`; a no-op on every other target.
+///
+/// On Android it reads `user_config` (blocking, but it runs before the window exists) and
+/// hands the value to `android_app::apply_native_window_policy`. A read error is logged and
+/// leaves the policy unchanged (winit's `Auto` until something set it), so a window still opens.
+pub fn apply_android_native_window_policy() {
+    #[cfg(target_os = "android")]
+    match config::load_raw_user_settings_for_startup() {
+        Ok(settings) => android_app::apply_native_window_policy(&settings),
+        Err(err) => {
+            runtime_log::log_error(format!(
+                "[android-windows] failed to read user_config.json for the secondary-window \
+                 policy; keeping the current policy; error={err:#}"
+            ));
         }
     }
 }

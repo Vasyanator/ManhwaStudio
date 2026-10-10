@@ -115,6 +115,12 @@ that defines the type.
   `fonts_presets_doc`); `app_fonts_dir` is the ONLY fonts-directory resolver
   (the typing tab owns those documents' contents but resolves the directory here). The conversion
   driver itself lives in `ms-project` (`storage_mode::convert_globals`).
+- `android_windows.rs`: the Android secondary-window policy — `AndroidNativeWindows` (frozen
+  `"auto"`/`"native"`/`"embedded"` under `General.android_native_windows`, default Auto) and
+  the pure reader `android_native_windows_from_user_settings` (unknown value -> Auto + warning).
+  Compiled on every target (the shared General pane names it, showing the row only on
+  Android); applied to the forked winit by
+  `ms_window_geometry::apply_android_native_window_policy` before each product `run_native`.
 - `single_image.rs`: the single-image editing mode's shared names — `INPUT_FILE_TYPES` (the ONE
   readable-input table: extensions + MIME; consumed by the launcher picker, the Linux desktop
   entry, the Windows "Open with" registration and the CLI error text), `scratch_base()`

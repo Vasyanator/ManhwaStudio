@@ -27,6 +27,11 @@ supervisor worker, so its change carries the new value and is reported on the cl
 a `WarningSet` (launcher) the runtime combo, autostart checkbox, build / EP / device rows
 and the build-action row carry inline badges; `None` (studio) draws the pre-badge layout.
 
+Platform gate:
+Where `ms_platform::PlatformFeature::PythonBackend` is unavailable (Android) the pane leads
+with the localized `Unavailable` message and keeps Start/Restart disabled; the supervisor
+refuses the spawn on its own as well (`BackendSpawnBlocker::PlatformUnavailable`).
+
 Key items:
 - `AiBackendPanelState`: per-UI selection scratch (device/provider/onnx/max-models) and
   the completion channel of the off-thread writes (`PendingChanges`).
@@ -279,6 +284,13 @@ pub fn draw_ai_backend_panel(
     let snapshot = handle.health_snapshot();
     let process = handle.process_snapshot();
     let ai_enabled = handle.ai_enabled;
+    // The capability table decides whether this platform can run the Python backend at
+    // all (not on Android); Start/Restart stay disabled and the reason leads the pane.
+    let backend_platform = ms_platform::PlatformFeature::PythonBackend.require();
+    if let Err(unavailable) = &backend_platform {
+        ui.colored_label(ms_theme::status::WARNING, unavailable.user_message());
+    }
+    let can_spawn = ai_enabled && backend_platform.is_ok();
 
     // Native ONNX runtime selector (desktop-only; the native path depends on
     // `ms-onnx`/`ort`, compiled out on the web build).
@@ -320,7 +332,7 @@ pub fn draw_ai_backend_panel(
     ui.horizontal_wrapped(|ui| {
         if ui
             .add_enabled(
-                ai_enabled && !process.running(),
+                can_spawn && !process.running(),
                 egui::Button::new(t!("ai_backend.start_button")),
             )
             .clicked()
@@ -339,7 +351,7 @@ pub fn draw_ai_backend_panel(
             handle.send_probe(AiBackendProbeCommand::CheckNow);
         }
         if ui
-            .add_enabled(ai_enabled, egui::Button::new(t!("ai_backend.restart_button")))
+            .add_enabled(can_spawn, egui::Button::new(t!("ai_backend.restart_button")))
             .clicked()
         {
             handle.send_process(AiBackendProcessCommand::Restart);

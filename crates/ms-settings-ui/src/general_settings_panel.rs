@@ -42,7 +42,8 @@ Key items:
 - `LocaleOption`: one selectable interface language (tag + display name).
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
 - `draw_general_settings_panel`: renders the projects-dir editor + Dev/Prod storage row
-  (`storage_mode_setting`) + memory-profile combo + interface-scale slider + autosave policy + UI-language
+  (`storage_mode_setting`) + memory-profile combo + interface-scale slider + autosave policy +
+  primary-monitor selector + Android-only secondary-window policy + UI-language
   selector + typesetting-language selector. With a `WarningSet` (launcher) the
   projects-dir and UI-language labels carry their inline warning badges; `None` (studio)
   draws no badge and keeps the layout unchanged.
@@ -128,6 +129,9 @@ pub struct GeneralSettingsPanelState {
     /// web build.
     #[cfg(not(target_arch = "wasm32"))]
     pub preferred_monitor: Option<ms_window_geometry::MonitorKey>,
+    /// Android secondary-window policy (`General.android_native_windows`). Held on every
+    /// target (the row is only drawn on Android); applied at the next `run_native`.
+    pub android_native_windows: ms_config::AndroidNativeWindows,
     /// Status line under the projects-dir editor.
     pub status: GeneralSettingsStatus,
     /// The Dev/Prod storage row (conversion job bookkeeping of this surface).
@@ -190,7 +194,7 @@ impl GeneralSettingsPanelState {
     /// read here is already migrated.
     #[must_use]
     pub fn new() -> Self {
-        let (projects_dir, memory_profile, ui_language_tag) =
+        let (projects_dir, memory_profile, ui_language_tag, android_native_windows) =
             match ms_config::load_raw_user_settings_for_startup() {
                 Ok(settings) => (
                     ms_config::projects_root_from_user_settings(&settings)
@@ -198,6 +202,7 @@ impl GeneralSettingsPanelState {
                         .into_owned(),
                     ms_config::memory_profile_from_user_settings(&settings),
                     ui_language_tag_from_settings(&settings),
+                    ms_config::android_native_windows_from_user_settings(&settings),
                 ),
                 Err(err) => {
                     runtime_log::log_error(format!(
@@ -210,6 +215,7 @@ impl GeneralSettingsPanelState {
                             .into_owned(),
                         MemoryProfile::default(),
                         DEFAULT_UI_LANGUAGE_TAG.to_string(),
+                        ms_config::AndroidNativeWindows::default(),
                     )
                 }
             };
@@ -233,6 +239,7 @@ impl GeneralSettingsPanelState {
             autosave_action_threshold: autosave_policy.action_threshold,
             #[cfg(not(target_arch = "wasm32"))]
             preferred_monitor: seed_preferred_monitor(),
+            android_native_windows,
             // Filesystem scan happens once here, at construction — never per frame.
             locale_options: scan_locale_options(),
             status: GeneralSettingsStatus::Idle,
@@ -385,6 +392,13 @@ pub fn draw_general_settings_panel(
     draw_primary_monitor_setting(ui, state);
 
     ui.separator();
+
+    // Only Android has a secondary-window policy; no `PlatformFeature` describes it, so the
+    // row is gated on the target (a compile-time constant, the row still builds everywhere).
+    if cfg!(target_os = "android") {
+        draw_android_native_windows_setting(ui, state);
+        ui.separator();
+    }
 
     // Interface-language selector. Populated once from the on-disk `locale/` folder
     // (see `scan_locale_options`); changing it persists and live-installs the locale.
@@ -595,6 +609,52 @@ fn draw_primary_monitor_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPa
 fn draw_primary_monitor_setting(ui: &mut egui::Ui, _state: &mut GeneralSettingsPanelState) {
     ui.label(t!("settings.general.monitor_label"));
     ui.small(t!("settings.general.monitor_unavailable_hint"));
+}
+
+/// Renders the Android secondary-window policy selector (`General.android_native_windows`).
+///
+/// A change is persisted synchronously; it is APPLIED by
+/// `ms_window_geometry::apply_android_native_window_policy` before the next launcher or studio
+/// `run_native`, because eframe picks native vs embedded viewports once per window start.
+fn draw_android_native_windows_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+    use ms_config::AndroidNativeWindows;
+
+    ui.label(t!("settings.general.android_windows_label"));
+    ui.small(t!("settings.general.android_windows_hint"));
+    let mut selected = state.android_native_windows;
+    ui.horizontal_wrapped(|ui| {
+        WheelComboBox::from_label(t!("settings.general.android_windows_combo_label"))
+            .id_salt("settings.general.android_windows_combo_label")
+            .selected_text(android_native_windows_option_label(selected))
+            .show_ui(ui, |ui| {
+                for policy in AndroidNativeWindows::ALL {
+                    ui.selectable_value(&mut selected, policy, android_native_windows_option_label(policy));
+                }
+            });
+    });
+    if selected == state.android_native_windows {
+        return;
+    }
+    state.android_native_windows = selected;
+    if let Err(err) = persist_general_key(
+        ms_config::GENERAL_ANDROID_NATIVE_WINDOWS_KEY,
+        serde_json::Value::String(selected.as_config_str().to_string()),
+    ) {
+        runtime_log::log_error(format!(
+            "[general-settings] failed to persist the Android window policy '{}'; error={err}",
+            selected.as_config_str()
+        ));
+        state.status = GeneralSettingsStatus::Error(t!("settings.general.android_windows_save_error").to_string());
+    }
+}
+
+/// Localized combo entry for one Android secondary-window policy.
+fn android_native_windows_option_label(policy: ms_config::AndroidNativeWindows) -> String {
+    match policy {
+        ms_config::AndroidNativeWindows::Auto => t!("settings.general.android_windows_auto_option").to_string(),
+        ms_config::AndroidNativeWindows::Native => t!("settings.general.android_windows_native_option").to_string(),
+        ms_config::AndroidNativeWindows::Embedded => t!("settings.general.android_windows_embedded_option").to_string(),
+    }
 }
 
 /// Combo entry for one monitor: its name (or an index-based placeholder) plus its resolution.

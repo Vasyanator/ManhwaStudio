@@ -9,7 +9,7 @@ Main responsibilities:
 - the capability table: `PlatformFeature::is_available()` (the one owner) and the typed
   `Unavailable` error every gated entry point returns;
 - the async-shaped file-dialog seam (`file_dialog`): rfd on desktop, Storage Access Framework
-  on Android (bridge pending), typed `Unavailable` on wasm;
+  on Android (Kotlin `SafBridge`), typed `Unavailable` on wasm;
 - system clipboard reads (`clipboard`): arboard on desktop, JNI text on Android, typed
   `Unavailable` for the rest;
 - the pre-window error box (`message::show_error_blocking`).
@@ -34,7 +34,7 @@ pub mod clipboard;
 pub mod file_dialog;
 pub mod message;
 
-// Android JNI plumbing. `saf.rs` (the pending-request registry) is pure Rust, so it is also
+// Android JNI plumbing. `saf.rs` (the pure half of the SAF bridge) is pure Rust, so it is also
 // compiled for host tests; everything that touches the JVM is Android-only inside.
 #[cfg(any(target_os = "android", test))]
 mod android;

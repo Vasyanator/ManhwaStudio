@@ -19,8 +19,9 @@ Key functions:
 
 Notes:
 One dialog in flight process-wide (`FileDialogError::Busy`). Backends: `desktop.rs` (rfd on a
-`file-dialog` thread), `android.rs` (SAF bridge; until the Kotlin bridge lands every request
-resolves to `Unavailable { FilePicker, BridgeMissing }`), `unavailable.rs` (wasm). Every
+`file-dialog` thread), `android.rs` (the Storage Access Framework bridge: picked inputs are
+copied into app storage, save targets are staged locally and streamed to the document on
+`commit`), `unavailable.rs` (wasm). Every
 outcome is logged here at info level with the kind and file names only, never full paths.
 */
 
@@ -185,27 +186,35 @@ pub struct PickedFile {
 }
 
 /// A save destination for one file. Write the COMPLETE file to [`Self::write_path`] first, then
-/// call [`Self::commit`]. Opaque so the Android variant (staging path + document URI) can be
-/// added without touching callers. On desktop the path already carries an extension whenever the
-/// request had filters: a name typed without one gets the first filter's first extension.
+/// call [`Self::commit`]. Opaque: on Android the write path is a local staging file and the
+/// destination a SAF document. The path always carries an extension whenever the request had
+/// filters: a name chosen without one gets the first filter's first extension.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SaveTarget {
     path: PathBuf,
     display_name: String,
+    /// The SAF document `commit` streams [`Self::path`] to; `None` = the path is the destination.
+    #[cfg(target_os = "android")]
+    document: Option<android::FileDocument>,
 }
 
 impl SaveTarget {
     /// A target whose write path is the destination itself (desktop backend).
-    #[cfg(any(not(any(target_arch = "wasm32", target_os = "android")), test))]
+    #[cfg(any(not(any(target_arch = "wasm32", target_os = "android")), test, feature = "test-support"))]
     fn local(path: PathBuf) -> Self {
-        Self { display_name: display_name_of(&path), path }
+        Self {
+            display_name: display_name_of(&path),
+            path,
+            #[cfg(target_os = "android")]
+            document: None,
+        }
     }
 
     /// A desktop-shaped target at `path`, for dependents' tests.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn for_test(path: PathBuf) -> Self {
-        Self { display_name: display_name_of(&path), path }
+        Self::local(path)
     }
 
     /// Where the caller writes the file (desktop: the final path).
@@ -221,36 +230,48 @@ impl SaveTarget {
     }
 
     /// Publishes the written file to the chosen destination. Desktop: no-op (the file already
-    /// is the destination). Android (bridge pending): streams the file to the document URI,
-    /// which BLOCKS, so call it on the worker that finished the write.
+    /// is the destination). Android: streams the staged file to the document and removes the
+    /// staging copy, which BLOCKS, so call it on the worker that finished the write.
     ///
     /// # Errors
     /// [`FileDialogError::Commit`] when the destination could not be written.
     pub fn commit(self) -> Result<(), FileDialogError> {
+        #[cfg(target_os = "android")]
+        if let Some(document) = self.document {
+            return android::commit_file(&self.path, &document);
+        }
         Ok(())
     }
 }
 
 /// A destination folder. Write into [`Self::write_dir`], then call [`Self::commit`]. Opaque for
-/// the same reason as [`SaveTarget`].
+/// the same reason as [`SaveTarget`] (Android: a local staging folder and a SAF document tree).
 #[derive(Debug, PartialEq, Eq)]
 pub struct FolderTarget {
     dir: PathBuf,
     display_name: String,
+    /// The SAF tree `commit` copies [`Self::dir`] into; `None` = the dir is the destination.
+    #[cfg(target_os = "android")]
+    document: Option<android::TreeDocument>,
 }
 
 impl FolderTarget {
     /// A target whose write dir is the destination itself (desktop backend).
-    #[cfg(any(not(any(target_arch = "wasm32", target_os = "android")), test))]
+    #[cfg(any(not(any(target_arch = "wasm32", target_os = "android")), test, feature = "test-support"))]
     fn local(dir: PathBuf) -> Self {
-        Self { display_name: display_name_of(&dir), dir }
+        Self {
+            display_name: display_name_of(&dir),
+            dir,
+            #[cfg(target_os = "android")]
+            document: None,
+        }
     }
 
     /// A desktop-shaped target at `dir`, for dependents' tests.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn for_test(dir: PathBuf) -> Self {
-        Self { display_name: display_name_of(&dir), dir }
+        Self::local(dir)
     }
 
     /// Where the caller writes (desktop: the chosen folder itself).
@@ -266,22 +287,32 @@ impl FolderTarget {
     }
 
     /// Whether the chosen destination already holds entries (an overwrite-confirmation input).
-    /// Blocking directory read: a short one on desktop, a JVM round trip on Android.
+    /// Desktop: a short blocking directory read. Android: answered from the probe the bridge
+    /// worker made at pick time, so it never touches the JVM (GUI-thread safe).
     ///
     /// # Errors
     /// [`FileDialogError::TargetIo`] when the folder cannot be listed.
     pub fn has_entries(&self) -> Result<bool, FileDialogError> {
+        #[cfg(target_os = "android")]
+        if let Some(document) = &self.document {
+            return document.has_entries();
+        }
         std::fs::read_dir(&self.dir)
             .map(|mut entries| entries.next().is_some())
             .map_err(|err| FileDialogError::TargetIo { detail: err.to_string() })
     }
 
-    /// Publishes the written folder. Desktop: no-op. Android (bridge pending): copies the
-    /// staging folder into the document tree, which BLOCKS (worker only).
+    /// Publishes the written folder. Desktop: no-op. Android: copies the staging folder into
+    /// the document tree (same-named entries are overwritten, as a desktop write into the
+    /// folder would) and removes the staging copy, which BLOCKS (worker only).
     ///
     /// # Errors
     /// [`FileDialogError::Commit`] when the destination could not be written.
     pub fn commit(self) -> Result<(), FileDialogError> {
+        #[cfg(target_os = "android")]
+        if let Some(document) = self.document {
+            return android::commit_folder(&self.dir, &document);
+        }
         Ok(())
     }
 }

@@ -35,7 +35,7 @@ arboard.workspace = true
 wayland-sys = { version = "0.31", features = ["dlopen"] }
 
 # Android: the application context and JavaVM that android-activity publishes through
-# `ndk-context`, used for class probes and (later) the SAF bridge.
+# `ndk-context`, used by the clipboard reads and the SAF file-dialog bridge.
 [target.'cfg(target_os = "android")'.dependencies]
 jni.workspace = true
 ndk-context.workspace = true

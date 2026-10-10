@@ -14,6 +14,11 @@ Main responsibilities:
 - apply shared process settings such as UTF-8 environment variables and hidden Windows windows.
 
 Notes:
+Platform gate: on a target without the Python backend (`ms_platform::PlatformFeature::
+PythonBackend`, e.g. Android) every lookup (`detect_python_environment`,
+`resolve_python_executable*`, and through them `build_python_*command` and
+`has_supported_python_env`) fails first with the localized `Unavailable` message, so no
+Python spawn (backend, Reline, browser, installer) can start there.
 This module does not install Python or packages. The installer owns downloads and dependency
 installation, but it uses this module for the same executable-discovery contract as runtime code.
 
@@ -96,12 +101,30 @@ impl DerefMut for ManagedPythonChild {
     }
 }
 
+/// Whether `root_dir` holds a usable app-local Python environment; always `false` where
+/// the platform has no Python backend.
 #[must_use]
 pub fn has_supported_python_env(root_dir: &Path) -> bool {
     detect_python_environment(root_dir).is_ok()
 }
 
+/// The capability-table gate shared by every lookup entry point.
+///
+/// # Errors
+/// The localized `Unavailable { PythonBackend }` message when the platform has no Python
+/// backend.
+fn require_python_backend() -> Result<(), String> {
+    ms_platform::PlatformFeature::PythonBackend.require().map_err(|err| err.user_message())
+}
+
+/// Finds the app-local Python environment under `root_dir` (managed venv, venv, conda
+/// env, standalone Python, in that order).
+///
+/// # Errors
+/// The localized platform message when the platform has no Python backend; otherwise the
+/// localized "environment not found" message.
 pub fn detect_python_environment(root_dir: &Path) -> Result<PythonEnvironment, String> {
+    require_python_backend()?;
     let managed_venv = root_dir.join("installer_files").join("venv");
     if activation_root_exists(&managed_venv) {
         return Ok(PythonEnvironment::VirtualEnv { root: managed_venv });
@@ -133,7 +156,13 @@ pub fn resolve_python_executable(root_dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Finds the Python executable inside `python_dir` or one level below it.
+///
+/// # Errors
+/// The localized platform message when the platform has no Python backend; otherwise a
+/// localized directory-read or "executable not found" message.
 pub fn resolve_python_executable_in_dir(python_dir: &Path) -> Result<PathBuf, String> {
+    require_python_backend()?;
     for rel in python_executable_candidates() {
         let candidate = python_dir.join(rel);
         if candidate.is_file() {

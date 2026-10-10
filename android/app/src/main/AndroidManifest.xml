@@ -18,6 +18,10 @@
     <!-- Downloads (chapters, fonts, spellcheck dictionaries) and AI API calls. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Secondary windows (winit's SecondaryWindowActivity tasks): programmatic focus and
+         bring-to-front via ActivityManager.moveTaskToFront. -->
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
+
     <!-- allowBackup off: the runtime root holds hundreds of MB of bundled fonts and the user's
          projects; cloud auto-backup of them is neither wanted nor bounded. -->
     <application
@@ -26,6 +30,12 @@
         android:label="@string/app_name"
         android:resizeableActivity="true"
         android:theme="@style/Theme.ManhwaStudio">
+
+        <!-- The native library winit's SecondaryWindowActivity loads (a process may start from a
+             restored secondary-window task, before MainActivity loaded it); = the cdylib name. -->
+        <meta-data
+            android:name="rs.winit.android.NATIVE_LIB"
+            android:value="manhwastudio_rs" />
 
         <activity
             android:name=".LaunchActivity"
@@ -51,5 +61,15 @@
                 android:name="android.app.lib_name"
                 android:value="manhwastudio_rs" />
         </activity>
+
+        <!-- Invisible host of one Storage Access Framework picker (platform/SafBridge.kt, the
+             Kotlin half of the Rust file-dialog seam). Translucent so the requesting window
+             stays visible behind the picker; started without NEW_TASK over that window. -->
+        <activity
+            android:name=".platform.SafRequestActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode|locale|layoutDirection|fontScale|touchscreen|colorMode"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>
 </manifest>

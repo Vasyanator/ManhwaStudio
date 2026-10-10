@@ -170,6 +170,10 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - **Reload rebuilds `MangaApp` inside the same `egui::Context`.** Any egui resource a crate
   registers (font families, textures, ids) must be named by content, never by an instance
   counter.
+- **Android:** `src/android_entry.rs::android_main` (cdylib built by `build-android.sh`) chdirs
+  into `<internal data>/ms_root` and runs the same `run_main`. Before each product `run_native`,
+  `ms_window_geometry::apply_android_native_window_policy` applies `General.android_native_windows`
+  to the winit fork, which decides real per-Activity windows vs embedded egui windows.
 - **GL lifetime:** the binary calls `egui_shader_layers::install_glow` in the app creator and
   `destroy_glow` on exit; no `ms-*` crate owns GL objects.
 

@@ -73,6 +73,13 @@ impl ScreenRect {
     }
 }
 
+/// The localized `Unavailable { ScreenCapture }` message for a native target without a
+/// capture backend (Android): the capability table owns that answer, not a literal here.
+#[cfg(all(not(target_arch = "wasm32"), not(any(target_os = "windows", target_os = "linux", target_os = "macos"))))]
+fn screen_capture_unavailable() -> String {
+    ms_platform::Unavailable::new(ms_platform::PlatformFeature::ScreenCapture, ms_platform::UnavailableReason::NotOnThisPlatform).user_message()
+}
+
 #[cfg(target_os = "linux")]
 type LinuxCaptureCommand = fn(ScreenRect) -> Result<RgbaImage, String>;
 
@@ -103,7 +110,7 @@ pub fn query_virtual_desktop_bounds() -> Result<ScreenRect, String> {
         ))
     ))]
     {
-        Err("desktop capture is not supported on this platform".to_string())
+        Err(screen_capture_unavailable())
     }
 }
 
@@ -140,7 +147,7 @@ pub fn capture_screen_rect(rect: ScreenRect) -> Result<RgbaImage, String> {
     ))]
     {
         let _ = rect;
-        Err("desktop capture is not supported on this platform".to_string())
+        Err(screen_capture_unavailable())
     }
 }
 

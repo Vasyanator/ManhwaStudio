@@ -178,6 +178,9 @@ fn run_launcher_internal(
         ..Default::default()
     };
 
+    // eframe decides native vs embedded secondary viewports once per `run_native` (Android:
+    // `General.android_native_windows`; a no-op elsewhere).
+    ms_window_geometry::apply_android_native_window_policy();
     eframe::run_native(
         if test_mode {
             "ManhwaStudio - Rust Launcher Test"

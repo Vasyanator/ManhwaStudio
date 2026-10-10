@@ -88,4 +88,6 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.7.1")
     // Kotlin component of rustls-platform-verifier (local Maven repo, see settings.gradle.kts).
     implementation("rustls:rustls-platform-verifier:latest.release")
+    // Kotlin half of winit's secondary windows (module in the winit fork, see settings.gradle.kts).
+    implementation(project(":winit-secondary-window"))
 }
