@@ -1,20 +1,21 @@
 # Module: src
 
 ## Purpose
-The binary crate `manhwastudio_rs`: the desktop entry point and startup routing, the studio
-window shell, the editor root (`MangaApp`), the `settings/` tab and the crate-shim map in
-`main.rs`. Everything else — the launcher, the installer, the settings UI, the tabs, the canvas,
-the models, the widgets, the config hub — lives in `crates/*`; `main.rs` re-exports those crates
-under binary-local `crate::…` module names (see `ARCHITECTURE.md` for the crate layers).
+The root package `manhwastudio_rs`: a library (`lib.rs`) holding the startup routing, the studio
+window shell, the editor root (`MangaApp`), the `settings/` tab and the crate-shim map, plus the
+thin `manhwastudio_rs` binary (`main.rs`) that only calls into it. Everything else — the
+launcher, the installer, the settings UI, the tabs, the canvas, the models, the widgets, the
+config hub — lives in `crates/*`; `lib.rs` re-exports those crates under crate-internal
+`crate::…` module names (see `ARCHITECTURE.md` for the crate layers).
 
-`src/` is the entry point for application behaviour; follow the shim comments in `main.rs` to the
+`src/` is the entry point for application behaviour; follow the shim comments in `lib.rs` to the
 owning crate. Legacy Python UI code outside this tree is not an architecture reference for new work.
 
 ## Architecture
 The top-level flow is:
 
 ```text
-main.rs / args.rs
+main.rs -> lib.rs (native_main / web_main) / args.rs
     -> ms_config (config) + ms_sysprobe (python_manager) + ms_log (runtime_log/trace)
     -> ms_launcher (launcher) or studio_bootstrap.rs (background ProjectData::load, or the
        single-image open into a scratch chapter, behind a loading screen)
@@ -24,7 +25,7 @@ main.rs / args.rs
     -> background workers and optional Python AI backend
 ```
 
-`main.rs` owns process startup and hidden service flags. It prepares runtime logging, validates or
+`lib.rs` owns process startup and hidden service flags. It prepares runtime logging, validates or
 discovers a project, starts installer/update/launcher flows when needed, handles direct `--update`
 entry, custom/existing install update entry, and hidden `--continue-update` continuation into the
 update window, and opens the studio window for an opened chapter. The studio window starts as
@@ -53,15 +54,21 @@ and draw state, but it must not perform blocking I/O, model downloads, Python pr
 extraction, image decoding, text rendering, export composition, or AI inference on the GUI thread.
 
 ## Files and submodules
-- `main.rs`: process entry point, startup routing, installer/update service flags, direct update
-  window and update continuation entry, project
-  validation, launcher handoff, direct project opening, and Linux/Windows integration hooks.
+- `main.rs`: the binary's process entry only — the Windows `windows_subsystem` attribute and the
+  native / wasm32 `fn main`, which call `native_main()` / `web_main()`. Nothing else goes here.
+- `lib.rs`: library root — module tree, crate shims, and the native startup flow behind
+  `native_main()` (startup routing, installer/update service flags, direct update window and
+  update continuation entry, project validation, launcher handoff, direct project opening, and
+  Linux/Windows integration hooks). `native_main` / `web_main` are the library's only public
+  items; the shims stay `pub(crate)`, so a shim no call site uses is an unused-import error and
+  is removed rather than kept. The library exists so a platform build that needs one (Android
+  `cdylib`) reaches the same startup code; its crate type stays the default `rlib`.
 - `args.rs`: `clap` CLI contract, including visible startup/update flags, the open target
   (`--project` XOR `--image` XOR a positional image path, clap group `open_target`), the
   update-check test override, the environment-check and run-from-sources flags, and hidden
   installer/update continuation flags; plus the pure flag-combination rules
   (`conflicting_installed_copy_flags`, `conflicting_image_flags`) and the image path pre-check.
-- `version_format` (crate `ms-config`, re-exported by `main.rs`): the pure composition and
+- `version_format` (crate `ms-config`, re-exported by `lib.rs`): the pure composition and
   stripping of the application version string. Compiled twice — as a module of `ms-config` and,
   through `include!("crates/ms-config/src/version_format.rs")`, as part of `build.rs` — so that
   the code the build script runs is the code `cargo test` covers. It must stay std-only: no `t!`,
@@ -69,8 +76,8 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   build metadata" rule changes; edit `build.rs` when the git probing or the rerun watches change.
   NOTE: a library cannot read the binary's version. `MS_APP_VERSION` is a `rustc-env` emitted for
   the ROOT crate only, and `CARGO_PKG_VERSION` inside a crate is that crate's own — which is why
-  `main.rs` hands the pair to `ms-installer` as `HostVersion` instead of the installer reading it.
-- `venv_check` (crate `ms-installer`, re-exported by `main.rs`): native-only, GUI-free readiness
+  `lib.rs` hands the pair to `ms-installer` as `HostVersion` instead of the installer reading it.
+- `venv_check` (crate `ms-installer`, re-exported by `lib.rs`): native-only, GUI-free readiness
   check of the managed Python environment behind `--check-venv`. Reads `General.ai_install_type`
   from the root's `user_config.json` (never writing it), resolves the interpreter through
   `ms_sysprobe::python_manager`, and compares the dependency set required for that install type
@@ -80,7 +87,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   are SHARED with the repair worker, so "ready" always implies the worker would have nothing to
   do. Any failure to VERIFY readiness (unreadable config, unresolvable interpreter, failed probe)
   is reported as NOT ready — the check never claims readiness it could not confirm. It performs no
-  installation and opens no window; the window and the exit code belong to `main.rs`. It lives in
+  installation and opens no window; the window and the exit code belong to `lib.rs`. It lives in
   `ms-installer` and NOT in `ms-sysprobe` with its siblings: it reads the installer's own package
   requirements, and `ms-sysprobe` sits BELOW `ms-installer`, so hosting it there would make the
   two circular.
@@ -103,19 +110,18 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   egui's keyboard zoom (`zoom_with_keyboard = false`) every frame, so the only UI zoom is the
   interface-scale setting.
 - `app_tab` (crate `ms-config`): declaration of the `AppTab` tab selector with BOTH its persistence
-  half (`ALL`, `key()`) and the localized display `title()`. Re-exported by `main.rs` as
+  half (`ALL`, `key()`) and the localized display `title()`. Re-exported by `lib.rs` as
   `crate::app_tab` and again by `tabs/mod.rs`, so `crate::tabs::AppTab` stays the path everything
   uses while the config crate builds the `enabled_tabs` default without touching `tabs`. It sits in
   `ms-config` because that default is built from `key()`; `title()` had to follow, since an inherent
   `impl` may only be written in the crate that defines the type.
-- `page_view` (crate `ms-models`, re-exported by `main.rs`): source-page view model shared by app
+- `page_view` (crate `ms-models`, re-exported by `lib.rs`): source-page view model shared by app
   shell, canvas and tabs — `PageImageInfo` / `SourcePageLoadState` (geometry + load state) and
   `PageTexture` / `TextureTile` (tiled GPU residency keeping the decoded bytes). `app.rs` produces
   and evicts them; nothing there draws.
 - `rotation_ctrl_wheel` (crate `ms-config`): app-wide runtime global for the typing tab's Ctrl+wheel
   rotation mode (Vector/Raster). Lives there only so the config crate can read its default;
-  `main.rs` re-exports it as `crate::rotation_ctrl_wheel` and `tabs::typing` re-exports it again and
-  remains its conceptual owner.
+  `tabs::typing` re-exports it and remains its conceptual owner (no crate-root shim).
 - `studio_bootstrap.rs`: startup shell for the studio window — opens the window immediately, runs
   the background project load behind a loading screen (or an error screen with exit/return-to-
   launcher actions), then swaps in `MangaApp` and delegates `ui`/`on_exit` to it. It also owns
@@ -129,7 +135,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   its pure save state machine, the exit and «Параметры JPEG» dialogs, and the tab filter, window
   title and save-hotkey rules of the mode. `app.rs` holds hooks only; see
   `single_image/MODULE_README.md`.
-- `project` (crate `ms-project`, re-exported by `main.rs`): chapter data models, project path
+- `project` (crate `ms-project`, re-exported by `lib.rs`): chapter data models, project path
   discovery, project/settings loading, legacy `scr`/`src` and `cleaned`/`clean_layers` folder
   normalization, magic-byte JPEG->PNG conversion in `src`/`cleaned`/`clean_layers`, clean-layer
   filename normalization (including the legacy `<group>_<page>` cleaned numbering, e.g.
@@ -139,11 +145,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   and injects the per-page layer-manifest merge from `models::layer_model::persist`). `Page` and
   `ProjectPaths` are re-exported from `ms-page-ops`, which declares them. See
   `crates/ms-project/src/MODULE_README.md`.
-- `project_scan` (crate `ms-project`, re-exported by `main.rs`): filesystem scan of the projects
+- `project_scan` (crate `ms-project`, re-exported by `lib.rs`): filesystem scan of the projects
   ROOT shared by the launcher and startup — title/chapter enumeration, openability validation
   (`ProjectValidationState`) and unsaved-chapter detection. Plain I/O: no UI, no app state. It is
   the same domain one level up from the chapter load, which is why it sits in `ms-project`.
-- `config` (crate `ms-config`, re-exported by `main.rs`): runtime path roots, project/user config defaults, `JsonConfig`, application data
+- `config` (crate `ms-config`, re-exported by `lib.rs`): runtime path roots, project/user config defaults, `JsonConfig`, application data
   directories, model root helpers, `AiInstallType`, and `Flux2Variant` (the FLUX.2 klein
   checkpoint that keys its model directory, component paths and settings file). The runtime root is normally the portable
   launch/exe directory, except on macOS when the executable runs inside a `*.app` bundle: there the
@@ -158,7 +164,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   config may still carry legacy Russian tab labels as keys next to the English ids; they are inert
   and left on disk. A feature that starts reading `enabled_tabs` owns the one-time cleanup migration
   (keyed by `AppTab::key()`).
-- `config_saver` (crate `ms-config`, re-exported by `main.rs`): the ONE debouncing writer thread behind every `user_config.json` section that
+- `config_saver` (crate `ms-config`, named as `ms_config::config_saver`): the ONE debouncing writer thread behind every `user_config.json` section that
   is written from the GUI thread by a user gesture — today the `PanelLayout` section
   (`ms-widgets`' `panel_dock/persist.rs`) and the `Window` section (crate `ms-window-geometry`). It owns the
   durability policy of those sections: 700 ms coalescing into one write, a failed write HELD and
@@ -180,7 +186,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `PanelDockState::show_idle_sub_windows` on every frame whose active tab is not a dock host
   (`tab_hosts_panel_dock`), because those windows are immediate viewports and exist only while they
   are shown.
-- `window_geometry` (crate `ms-window-geometry`, re-exported by `main.rs`, native-only
+- `window_geometry` (crate `ms-window-geometry`, re-exported by `lib.rs`, native-only
   `#[cfg(not(wasm32))]`): owner of the self-versioned `Window` section of `user_config.json` —
   the user's primary-monitor choice, the largest monitor seen last run, and the studio window's
   restored position/size/maximized state. Provides the pure startup planner
@@ -202,7 +208,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `rotation_ctrl_wheel.rs` (cached value + free get/set/clear), backed by the OS secret
   store under its OWN service name `"ManhwaStudio Hugging Face"` — never the OCR key entry, which
   belongs to the translation tab and is keyed by service. Seeded once at startup
-  (`main.rs::seed_hf_token_from_secret_store`, on a worker thread) so reads are lock acquisitions,
+  (`lib.rs::seed_hf_token_from_secret_store`, on a worker thread) so reads are lock acquisitions,
   not OS round trips; `store`/`clear`/`read` are BLOCKING and callers spawn for them. Tri-state:
   `HfTokenState::Unknown` (not read yet) is distinct from `Missing` and must never be rendered as
   it. The token is never written to `user_config.json`, to any settings JSON, or to a log line, and
@@ -218,13 +224,13 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   ASYMMETRIC — Linux needs only an Intel GPU because the wheel bundles the OpenVINO runtime, Windows
   ALSO needs a system `openvino*.dll` on the library path because its wheel does not bundle it).
 - logging/tracing live in the `ms-log` crate (`crates/ms-log`), re-exported as
-  `crate::runtime_log` / `crate::trace` (+ `trace_log!` / `trace_scope!` macros) from `main.rs`.
+  `crate::runtime_log` / `crate::trace` (+ the `trace_log!` macro) from `lib.rs`.
   Text utilities (`text_punctuation`, `segmentation`) live in `ms-text-util`, and the typing text
   renderer (`render_next`) in `ms-text-render`; all three are re-exported at their old paths.
-  The same shim pattern carries four more extracted leaves, all mounted from `main.rs` under their
+  The same shim pattern carries more extracted leaves, all mounted from `lib.rs` under their
   historical module names: `ms-backend-ipc` (`crate::backend_ipc`), `ms-sysprobe`
-  (`crate::gpu_utils`, `crate::python_manager`, `crate::screen_capture`) and `ms-memory`
-  (`crate::memory_manager`). Their sources are under `crates/<name>/src/`, each with its own
+  (`crate::python_manager`, `crate::ai_install_probe`, `crate::hf_token`) and `ms-memory`
+  (`crate::memory_manager`); other `ms-sysprobe` modules are named `ms_sysprobe::…` directly. Their sources are under `crates/<name>/src/`, each with its own
   `MODULE_README.md`; the entries below describe the same items at their unchanged call paths.
 - `backend_ipc` (crate `ms-backend-ipc`): the Rust<->Python AI-backend framed IPC. Submodules:
   `transport` (socket path `backend_socket_path()`, `connect_path`, `BackendStream`), `protocol`
@@ -236,16 +242,16 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   The framed protocol is the only IPC transport to the backend.
 - `ai_backend_capabilities` (crate `ms-sysprobe`): process-wide mirrored capability slot for cheap Torch availability
   checks after backend health probing.
-- `ai_install_probe` (crate `ms-sysprobe`, re-exported by `main.rs`): shared Python package
-  probe that classifies the machine into `config::AiInstallType`; `main.rs` persists the
+- `ai_install_probe` (crate `ms-sysprobe`, re-exported by `lib.rs`): shared Python package
+  probe that classifies the machine into `config::AiInstallType`; `lib.rs` persists the
   result into `General.ai_install_type`.
 - `ai_models` (crate `ms-sysprobe`): app-managed AI model catalog, lazy Hugging Face file resolution, direct model
   downloads into `ManhwaStudio_AI_Models`, and typed local path helpers for Rust callers.
-- `onnx_runtime` (crate `ms-onnx-runtime`, re-exported by `main.rs`, native-only
+- `onnx_runtime` (crate `ms-onnx-runtime`, no crate-root shim, native-only
   `#[cfg(not(wasm32))]`): loader that resolves/downloads the official onnxruntime dynamic library
   for `ms-onnx` (probe/download/verify/extract, `ORT_VERSION`). Worker-thread only.
   See `crates/ms-onnx-runtime/src/MODULE_README.md`.
-- `native_runtime` (crate `ms-native-runtime`, re-exported by `main.rs`, native-only
+- `native_runtime` (crate `ms-native-runtime`, no crate-root shim, native-only
   `#[cfg(not(wasm32))]`): process-global lazy manager for the
   in-process ONNX Runtime path (`General.ai_runtime = "native"`). Owns one `OrtRuntime`, ONE
   always-resident shared `PaddleDetector` (used by the detector op and every PaddleOCR language via
@@ -275,11 +281,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `recognize_manga`, `recognize_paddle`, `detect_paddle`, `execution_provider_from_ort_token`,
   `native_load_scope_key`, `ort_dylib_committed`, `active_build`, and `reset_load_latch` are the public
   surface (the guard/scope helpers are worker-thread only — they do disk I/O + hardware probes).
-- `input_manager_v2` (crate `ms-widgets`, re-exported by `main.rs`): keyboard shortcut and
+- `input_manager_v2` (crate `ms-widgets`, re-exported by `lib.rs`): keyboard shortcut and
   modifier-only hotkey registry, user overrides, and command lookup. It moved down into the
   widget layer because it is a pure egui-input primitive over `AppTab` and the `translation` tab
   crate registers specs with it; the settings hotkeys pane reaches it through the re-export.
-- `locale_store` (crate `ms-config`, re-exported by `main.rs`): native-only (`#[cfg(not(wasm32))]`) on-disk layer for the UI localization
+- `locale_store` (crate `ms-config`, re-exported by `lib.rs`): native-only (`#[cfg(not(wasm32))]`) on-disk layer for the UI localization
   catalog. Unpacks the `ms-i18n` embedded catalogs into an editable `config::data_dir()/locale`
   folder and reconciles each file on every launch (verbatim on absence; add only missing keys on
   presence, from the embedded catalog for embedded locales and from `en.json` for custom-language
@@ -293,7 +299,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   unwritable `locale/` folder or a corrupt file is a logged, bounded degradation to the embedded/English
   catalog, never fatal (a corrupt file is left byte-for-byte intact). On wasm the module is compiled out
   and `web_entry.rs` installs the embedded catalog directly.
-- `ui_fonts` (crate `ms-widgets`, re-exported by `main.rs`): the single owner of the UI font stack. Installs the bundled `fonts/ui` chain
+- `ui_fonts` (crate `ms-widgets`, re-exported by `lib.rs`): the single owner of the UI font stack. Installs the bundled `fonts/ui` chain
   into an `egui::Context` from a worker thread, taking the manifest and the process-wide
   `'static` bytes from `ms-fonts` (so epaint borrows one copy instead of keeping a second),
   and owns the `BUBBLE_TEXT_FAMILY_NAME` / `UI_BOLD_FAMILY_NAME` family names plus the
@@ -309,20 +315,20 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   (`validate_font_bytes`), because epaint parses every registered file eagerly and PANICS
   on a failure it cannot recover from. A candidate whose core files all fail that check is
   treated as an absent override and the bundled stack wins.
-- `bubble_status` (crate `ms-widgets`, re-exported by `main.rs`): the egui half of the bubble status feature — border painting helpers and the
+- `bubble_status` (crate `ms-widgets`, re-exported by `lib.rs`): the egui half of the bubble status feature — border painting helpers and the
   `BubbleBorderPaintColor` colour view — plus a wholesale re-export of the GUI-free rule model in
   `ms_config::bubble_status` (rules, conditions, default preset, JSON, evaluation), which had to
   move down because `user_config_defaults()` embeds the default preset. `crate::bubble_status::…`
   still names both halves.
 - `paste_image` (crate `ms-sysprobe`): clipboard image reader shared by the launcher and the
   typing/translation tabs. A host-environment probe like `screen_capture`, which is why it sits
-  in that crate; `main.rs` re-exports it as `crate::paste_image`.
+  in that crate; callers name it `ms_sysprobe::paste_image`.
 - `screen_capture` (crate `ms-sysprobe`): viewport/screen capture helpers for color picking and related tools.
-- `tools` (crate `ms-tools`, re-exported by `main.rs`): shared tool primitives not tied to a
+- `tools` (crate `ms-tools`, named as `ms_tools`): shared tool primitives not tied to a
   specific tab — the mask brush, the polygon scanline rasterizer, the shared red-black SOR
   kernel, the dense overlay-pixel solve — plus `tools::patch`, the host-neutral patch-tool core
-  the tabs drive through its `PatchHost` trait. `crate::tools::…` still names all of it.
-- `page_ops` (crate `ms-page-ops`, re-exported by `main.rs`): GUI-free engine for structural
+  the tabs drive through its `PatchHost` trait. Nothing in `src/` uses it directly; the tab crates depend on it.
+- `page_ops` (crate `ms-page-ops`, re-exported by `lib.rs`): GUI-free engine for structural
   page operations (`PageOpKind`: move / insert files / create blank / delete / split / crop-rotate /
   stitch) executed as a journaled crash-safe transaction over both the committed chapter tree and the `_unsaved` mirror;
   `recover_pending_page_op` is called at the start of `ProjectData::load_internal`. It also
@@ -330,9 +336,9 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   the two crates acyclic. `MangaApp` quiesces all page-indexed writers before dispatching the
   engine on a worker; `StudioBootstrapApp` then rebuilds a fresh app from disk, never remapping
   runtime state in place. See `crates/ms-page-ops/src/MODULE_README.md`.
-- `models` (crate `ms-models`, re-exported by `main.rs`): shared mutable chapter models used across
+- `models` (crate `ms-models`, re-exported by `lib.rs`): shared mutable chapter models used across
   tabs and workers, plus `page_view`. See `crates/ms-models/src/MODULE_README.md`.
-- `canvas` (crate `ms-canvas`, re-exported by `main.rs`): shared canvas engine for page layout,
+- `canvas` (crate `ms-canvas`, re-exported by `lib.rs`): shared canvas engine for page layout,
   viewport navigation, bubble editing, overlays, settings sync, and canvas workers. It DECLARES
   `CanvasHooks`, which the tabs implement, so it never names a tab. See
   `crates/ms-canvas/src/MODULE_README.md`.
@@ -341,18 +347,18 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   call site changed: `ms-tab-typing` (`typing`), `ms-tabs-simple` (`characters`, `terms`, `notes`,
   `wiki`), `ms-tab-translation`, `ms-tab-ps-editor`, `ms-tab-page-manager`, `ms-tab-cleaning`.
   See `tabs/MODULE_README.md` for the shim map and the layering rules.
-- `launcher` (crate `ms-launcher`, re-exported by `main.rs`): pre-project launcher, project
+- `launcher` (crate `ms-launcher`, re-exported by `lib.rs`): pre-project launcher, project
   open/import/export/settings pages, detached new-project window, PSD import, and
   batch/download/stitching flows. Effectively a SECOND application next to the studio: the editor
-  never names it — only `main.rs` and `web_entry.rs` do. See
+  never names it — only `lib.rs` and `web_entry.rs` do. See
   `crates/ms-launcher/src/MODULE_README.md`.
-- `installer` (crate `ms-installer`, re-exported by `main.rs`, native-only): installer, update
+- `installer` (crate `ms-installer`, re-exported by `lib.rs`, native-only): installer, update
   window shell, dependency setup, elevation helpers, shortcuts, registry/uninstall helpers, the
   installer workers and `venv_check`. It takes the host application's version pair as an explicit
   `HostVersion` parameter. See `crates/ms-installer/src/MODULE_README.md`.
 - The settings surface shared by BOTH shells — `settings_shared`, `general_settings_panel`,
   `ai_backend_panel`, `ai_backend_supervisor` and the `tutorial` subsystem — is the crate
-  `ms-settings-ui`, re-exported by `main.rs` under those same names. The launcher's settings page
+  `ms-settings-ui`; `lib.rs` re-exports the ones the root package uses under those same names. The launcher's settings page
   and the studio `settings/` tab render the same panes, so neither could own them. Its `tutorial`
   feature is FORWARDED from the root `tutorial` feature (features are not inherited); the demo bin
   `src/bin/tutorial_test` still mounts `tutorial/engine.rs` through `#[path]`. See
@@ -361,9 +367,9 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   The module exists only to HOST the cross-crate tests guarding it: they assert against
   `ms-text-util`'s key sets and hold `ms_config::locale_store::GLOBAL_LOCALE_LOCK`, and `ms-i18n`
   sits below both, so the binary is the lowest place that can see all three at once.
-- `widgets` (crate `ms-widgets`, re-exported by `main.rs`): reusable egui widgets with narrow typed
-  APIs, plus the three crate-root leaves of the same layer re-exported alongside it —
-  `input_util`, `ui_fonts` and `bubble_status`. Knows nothing of the project domain: canvas, tabs
+- `widgets` (crate `ms-widgets`, re-exported by `lib.rs`): reusable egui widgets with narrow typed
+  APIs, plus crate-root leaves of the same layer — `input_util`, `ui_fonts` and `bubble_status`
+  (the last two re-exported alongside it). Knows nothing of the project domain: canvas, tabs
   and launcher depend on it, never the reverse. See `crates/ms-widgets/src/MODULE_README.md`.
 - `bin/`: diagnostic and development binaries for renderer/widget/layout testing. These are not
   production entry points.
@@ -418,7 +424,7 @@ session refuses the structural-operation reload (logged). `ReturnToLauncher` cle
 target. Stale scratch sessions of crashed runs are swept once per start on a worker
 (`spawn_stale_scratch_sweep`, right after the flag check; lock-guarded, so another live instance
 is safe). The Linux desktop entry is owned by `ms-os-integration` (`linux::desktop_entry` text and
-ownership rule, `linux::xdg` writer); `main.rs` only runs `ensure_at_startup` for
+ownership rule, `linux::xdg` writer); `lib.rs` only runs `ensure_at_startup` for
 `CopyIdentity::current` on the `desktop-integration-installer` worker
 (`install_linux_desktop_integration_async`) and logs its `StartupOutcome`. Policy: create when
 missing, refresh only an entry of THIS copy (`X-ManhwaStudio-Exe=`, or a legacy `Exec=`) whose
@@ -432,7 +438,7 @@ Two startup flags change that routing:
   message when it is complete, otherwise opens the installer in environment-repair mode and exits
   0 (repaired AND re-verified) or 1 (cancelled / failed / still not ready). A repair that reports
   success is re-checked before exiting 0, so the caller never receives a broken environment. It
-  never opens the launcher or studio and never starts the AI backend. `main.rs` calls
+  never opens the launcher or studio and never starts the AI backend. `lib.rs` calls
   `std::process::exit` there so the code is exact instead of the generic error exit of an `anyhow`
   return.
 - `--ignore-installed` marks a run from a source checkout: no Linux desktop-entry write, no Windows
@@ -512,7 +518,7 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   `MS_APP_VERSION` (composed at build time by `build.rs`, e.g. `3.6.0+1cd9638-83-dirty`) is the
   HUMAN form: window title, version labels, `--version`, diagnostic logs. `CARGO_PKG_VERSION` is
   the MACHINE form: every comparison and every value parsed by another process — all three
-  release comparators (`main.rs`, `ms-installer`'s `update.rs` / `utils.rs`). A suffix on a
+  release comparators (`lib.rs`, `ms-installer`'s `update.rs` / `utils.rs`). A suffix on a
   compared value makes a build outrank its own release tag. Neither form is compared with the
   Python backend: compatibility there is `PROTOCOL_VERSION` in the `hello` handshake
   (`backend_ipc/`), and the backend's own version is diagnostic only.
@@ -583,10 +589,10 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
 
 ## Editing map
 - Startup, service flags, project-open flow, launcher handoff, or update routing: start in
-  `main.rs` and `args.rs`.
+  `lib.rs` and `args.rs`.
 - Single-image saving, its top bar, exit dialog, hidden tabs and save hotkeys: `single_image/`
   (hooks in `app.rs`: `tab_visible`, `draw_tab_bar`, `draw_exit_dialog`, `ui` tick, `on_exit`).
-- Single-image start (CLI, launcher pick, scratch lifetime, desktop entry): `main.rs`
+- Single-image start (CLI, launcher pick, scratch lifetime, desktop entry): `lib.rs`
   (`resolve_startup_target`, the `run_main` loop), `args.rs`
   (`open_target` group), `studio_bootstrap.rs` (`StudioOpenRequest`, `spawn_open_thread`); the
   desktop entry's text and writer: `crates/ms-os-integration/src/linux/`.
@@ -595,13 +601,13 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   watches); then the
   human/machine split in "Contracts and invariants" above before touching any call site.
 - What counts as a complete Python environment, or the `--check-venv` exit contract:
-  `crates/ms-installer/src/venv_check.rs` (decision) + `main.rs::run_check_venv_flow` (window +
+  `crates/ms-installer/src/venv_check.rs` (decision) + `lib.rs::run_check_venv_flow` (window +
   exit code) + `crates/ms-installer/src/utils.rs::required_dependency_specs` (the required set).
 - User/project config defaults, runtime roots, model root paths, or global path helpers:
   `crates/ms-config/src/lib.rs` (re-exported as `crate::config`).
 - Which monitor a window opens on, restoring/persisting the main window's position, size or
   maximized state, or the primary-monitor selector: crate `ms-window-geometry`. The startup call
-  sites are `main.rs::run_main_window` and `ms-launcher`'s `lib.rs::run_launcher_internal` (viewport
+  sites are `lib.rs::run_main_window` and `ms-launcher`'s `lib.rs::run_launcher_internal` (viewport
   builder), the runtime owner is `studio_bootstrap.rs` (`WindowGeometryTracker`), and the UI is
   the monitor row in `ms-settings-ui`'s `general_settings_panel.rs`.
 - Memory profile, pressure thresholds, budgets, or cache eviction ordering policy:
