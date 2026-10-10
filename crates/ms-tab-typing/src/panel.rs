@@ -165,9 +165,6 @@ use eframe::egui;
 use egui::text::{CCursor, CCursorRange};
 use egui::text_selection::visuals::paint_text_selection;
 use egui::{Align, Color32, ColorImage, Id, Rect, TextureHandle, TextureOptions, Vec2};
-// Native-only file dialog; the `rfd` crate is absent on the wasm target.
-#[cfg(not(target_arch = "wasm32"))]
-use rfd::FileDialog;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -2427,6 +2424,10 @@ struct TypingCreatePanelState {
     render_in_flight: bool,
     needs_initial_preview: bool,
     status_line: String,
+    /// The file dialog the right-hand column opened (export destination or image file), polled
+    /// each frame by `create_sections::poll_right_section_dialog`; its triggers are disabled
+    /// while it is open.
+    right_section_dialog: Option<create_sections::TypingPanelDialog>,
     /// Font diagnostic of the LAST COMPLETED preview render: which characters of
     /// the current text the renderer's fallback chain drew instead of the selected
     /// font, and which nothing could draw. Its lifetime mirrors `preview_texture` —

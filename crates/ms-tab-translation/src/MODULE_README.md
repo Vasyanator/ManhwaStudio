@@ -326,7 +326,10 @@ is an author note addressed to the translator, not a replica.
   description, original text, and translation. Translation owns ImageBubble shortcuts: `Q` creates
   an empty external-image bubble under the pointer, and `Shift+Q` captures a drag rectangle as the
   page crop for the selected ImageBubble or creates one at the crop center. External ImageBubble
-  files are written to the chapter unsaved staging `image_bubbles/` directory and stored as
+  files are picked through ONE tab-level file-dialog slot (`TranslationTabState::image_bubble_pick`,
+  an `ImageBubbleFilePick` started by the canvas footer or a bubbles-panel card and resolved per
+  frame by `poll_image_bubble_pick`, which keeps both «choose file» buttons disabled while it is
+  open). They are written to the chapter unsaved staging `image_bubbles/` directory and stored as
   chapter-relative paths so the saved chapter can resolve them after commit. `Q`/`Shift+Q` are
   NOT registered hotkeys: plain `Q` is edge-gated by `image_create_q_armed`, cleared while `Q`
   takes part in a `Shift+Q` crop session or after a creation and re-armed only once `Q` is fully

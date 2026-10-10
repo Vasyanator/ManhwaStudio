@@ -2793,12 +2793,38 @@ pub(super) enum TypingExportFormat {
 /// Typed on purpose — the export used to thread a bare `PathBuf` that every site had to
 /// KNOW meant a directory, which a single-file format cannot express. The pairing with
 /// [`TypingExportFormat`] is validated once, in `resolve_export_route`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Each variant is the `ms_platform` file-dialog target the user picked: the run writes into
+/// its write location, and `export_typing_pages` commits it once the whole output is written
+/// (desktop: no-op; Android: a blocking copy to the chosen document).
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum TypingExportDestination {
     /// A directory that receives one file per exported page. Created if missing.
-    Folder(PathBuf),
+    Folder(ms_platform::file_dialog::FolderTarget),
     /// The `.pdf` file the whole chapter is written to. Its parent is created if missing.
-    PdfFile(PathBuf),
+    PdfFile(ms_platform::file_dialog::SaveTarget),
+}
+
+impl TypingExportDestination {
+    /// The chosen folder or file name, for logs and status lines.
+    pub(super) fn display_name(&self) -> &str {
+        match self {
+            TypingExportDestination::Folder(target) => target.display_name(),
+            TypingExportDestination::PdfFile(target) => target.display_name(),
+        }
+    }
+
+    /// Publishes the written output to the chosen destination. Blocking on Android, so it is
+    /// called only on the export worker, after the whole output was written.
+    ///
+    /// # Errors
+    /// The platform's commit failure (`FileDialogError::Commit`).
+    pub(super) fn commit(self) -> Result<(), ms_platform::file_dialog::FileDialogError> {
+        match self {
+            TypingExportDestination::Folder(target) => target.commit(),
+            TypingExportDestination::PdfFile(target) => target.commit(),
+        }
+    }
 }
 
 /// One dispatched export: destination, format, re-pagination settings and the base name
@@ -2807,7 +2833,7 @@ pub(super) enum TypingExportDestination {
 /// Built by the top panel when the user picks a destination and consumed by
 /// `TypingTextOverlayLayer::request_export`. It is also what a deferred export
 /// ([`PendingTypingExport`]) holds while it waits for the whole-project preload.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct TypingExportRequest {
     /// Folder or file the run writes to; must match `format` (see `resolve_export_route`).
     pub(super) destination: TypingExportDestination,
@@ -2865,8 +2891,8 @@ struct TypingExportResult {
     exported: usize,
     /// Source pages the run was asked to export.
     total: usize,
-    /// Where the run wrote — the picked folder, or the picked `.pdf` file.
-    destination: TypingExportDestination,
+    /// Display name of where the run wrote — the picked folder, or the picked `.pdf` file.
+    destination_name: String,
     /// Localized, deduplicated notes about what the OUTPUT FORMAT could not express, in a
     /// run that otherwise succeeded (every page was written). Today: PSD text layers whose
     /// font name is claimed by several installed fonts — see

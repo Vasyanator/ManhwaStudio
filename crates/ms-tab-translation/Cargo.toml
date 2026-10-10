@@ -36,6 +36,9 @@ ms-log = { path = "../ms-log" }
 ms-memory = { path = "../ms-memory" }
 # The bubble and clean-overlay runtime models this tab reads and writes.
 ms-models = { path = "../ms-models" }
+# Non-blocking file dialogs: the image-bubble «choose file» and the composition TXT/DOCX
+# export. Compiled on every target; a platform without a dialog answers with a typed error.
+ms-platform = { path = "../ms-platform" }
 # The chapter domain model the tab reads pages and bubbles from.
 ms-project = { path = "../ms-project" }
 # Host-environment probes: AI-backend capability/device reporting, the model registry and
@@ -84,7 +87,7 @@ web-time.workspace = true
 
 # Native-only dependencies, matching the root manifest exactly so the graph keeps one copy
 # of each: blocking HTTP (`ureq`, the DeepL/Yandex backends), the concrete Google translator
-# (`translators`), native file dialogs (`rfd`), the ONNX Runtime loader and the native
+# (`translators`), the ONNX Runtime loader and the native
 # OCR/detector manager (the ONNX sessions themselves stay behind `ms-native-runtime`). The LLM
 # client stack (`genai`, `tokio`) and the OS credential store (`keyring`) live in `ms-ai-api`.
 # Their call sites are `#[cfg(not(target_arch = "wasm32"))]`-gated; the wasm build compiles
@@ -92,7 +95,6 @@ web-time.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ureq.workspace = true
 translators.workspace = true
-rfd.workspace = true
 # The loader that resolves/downloads the onnxruntime dylib; the detector panel renders its
 # `OrtDownloadProgress`.
 ms-onnx-runtime = { path = "../ms-onnx-runtime" }
@@ -107,3 +109,5 @@ ms-native-runtime = { path = "../ms-native-runtime" }
 ms-config = { path = "../ms-config", features = ["test-support"] }
 # Temp directories for the `settings.json` persistence tests.
 tempfile.workspace = true
+# `SaveTarget::for_test` for the composition export writer tests.
+ms-platform = { path = "../ms-platform", features = ["test-support"] }

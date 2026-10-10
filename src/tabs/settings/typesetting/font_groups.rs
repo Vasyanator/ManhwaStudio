@@ -69,7 +69,9 @@ mark as "Отсутствует" a member the panel resolves fine. The synthetic
 the one available font that is in NEITHER category — `font_admin::is_bundled_ui_font_identity`
 is what keeps it from being reported missing (see `member_is_available`).
 
-FONT-CARD IMPORT THREADING: the click only SPAWNS a worker. The native file picker, the PSD
+FONT-CARD IMPORT THREADING: the click only SPAWNS a worker. The file picker
+(`ms_platform::file_dialog::pick_blocking`; a picker failure becomes `CardImportOutcome::Failed`
+with its localized message), the PSD
 read and every by-name system-font lookup (a cold one scans the whole OS font database) run
 there; the GUI polls one `mpsc` result with `try_recv` and schedules the next poll with
 `request_repaint_after` (the picker is modal and unbounded in time, so a full-rate repaint loop
@@ -87,6 +89,7 @@ use super::font_settings::{
     draw_name_mode_switch, font_row_matches, font_row_name_for_mode, unavailable_row_name,
 };
 use crate::runtime_log;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, Picked};
 use crate::tabs::typing::font_admin::{self, FontEntry, VirtualFontGroupInfo, VirtualFontGroupMemberInfo};
 use crate::widgets::{
     PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
@@ -140,16 +143,11 @@ const IDENTITY_HASH_SEPARATOR: char = '%';
 /// ([`bottom_row_is_stacked`]), which is what makes it survive a longer locale or a larger
 /// interface font — widths a hand-picked constant cannot anticipate.
 const EDITOR_WINDOW_MIN_WIDTH: f32 = 660.0;
-/// Whether the font-card import can actually run in this build.
-///
-/// `rfd` is a desktop-only dependency: the web build links no native file dialog, the worker's
-/// pick resolves as "cancelled", and the button would silently do nothing. It is disabled there
-/// with an explaining hover instead — see `GroupEditorState::draw_import_buttons`.
-#[cfg(not(target_arch = "wasm32"))]
-const CARD_IMPORT_AVAILABLE: bool = true;
-/// Web build: see the non-wasm definition.
-#[cfg(target_arch = "wasm32")]
-const CARD_IMPORT_AVAILABLE: bool = false;
+/// Whether the font-card import can actually run in this build: it needs a file picker
+/// (`ms_platform::PlatformFeature::FilePicker`, absent only on the web build). Without one the
+/// button is disabled with an explaining hover instead of failing on click — see
+/// `GroupEditorState::draw_import_buttons`.
+const CARD_IMPORT_AVAILABLE: bool = ms_platform::PlatformFeature::FilePicker.is_available();
 
 /// Member-name resolver: NORMALIZED font IDENTITY → the data a member row needs to draw itself.
 ///
@@ -907,8 +905,8 @@ impl GroupEditorState {
     /// Both are drawn in every build and every state, disabled with an explaining hover when
     /// they cannot act, so the capability stays discoverable instead of silently vanishing:
     /// - the font-card import is disabled while one is already in flight, and permanently on
-    ///   the web build, which links no native file dialog ([`CARD_IMPORT_AVAILABLE`]) — there
-    ///   the click would resolve as "cancelled" and the button would do nothing at all;
+    ///   the web build, which has no file picker ([`CARD_IMPORT_AVAILABLE`]) — there the click
+    ///   could only fail;
     /// - the archive import is permanently disabled: the feature does not exist yet.
     fn draw_import_buttons(&mut self, ui: &mut egui::Ui, fonts: &GroupEditorFonts<'_>) {
         let importing = self.card_import_rx.is_some();
@@ -2037,8 +2035,10 @@ fn spawn_card_import(loaded: Vec<String>) -> std::io::Result<mpsc::Receiver<Card
 /// The whole worker-side import: pick a file, read the card, deduplicate it and resolve every
 /// name to a font identity. Blocking throughout; returns the one value the GUI polls.
 fn run_card_import(loaded: &[String]) -> CardImportOutcome {
-    let Some(path) = pick_font_card_path() else {
-        return CardImportOutcome::Cancelled;
+    let path = match pick_font_card_path() {
+        Ok(Some(path)) => path,
+        Ok(None) => return CardImportOutcome::Cancelled,
+        Err(error) => return CardImportOutcome::Failed(error),
     };
     let entries = match read_font_card(&path) {
         Ok(entries) => entries,
@@ -2109,26 +2109,22 @@ fn resolve_card_entry(entry: FontCardEntry, loaded: &[String]) -> ResolvedCardEn
     }
 }
 
-/// Opens the native single-file picker filtered to PSD documents and returns the chosen path,
-/// or `None` when the user cancelled. BLOCKING: worker-thread only.
-#[cfg(not(target_arch = "wasm32"))]
-fn pick_font_card_path() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter(t!("typing.font_settings.font_card_filter"), &["psd"])
-        .pick_file()
-}
-
-/// Web stub: the browser build links no native file dialog (`rfd` is a desktop-only
-/// dependency), so the pick resolves as cancelled and the dropped capability is logged.
+/// Opens the single-file picker filtered to PSD documents and returns the chosen (locally
+/// readable) path, or `None` when the user cancelled. BLOCKING: worker-thread only.
 ///
-/// Unreachable in practice — the import button is disabled on this target
-/// ([`CARD_IMPORT_AVAILABLE`]), which is where the user actually learns the feature is
-/// unavailable. The stub exists so the pipeline still compiles for the web build, and logs in
-/// case a future call site forgets the gate.
-#[cfg(target_arch = "wasm32")]
-fn pick_font_card_path() -> Option<PathBuf> {
-    runtime_log::log_warn("[settings] native file picker unavailable on web build; font-card import skipped");
-    None
+/// # Errors
+/// [`FontCardError`] carrying the picker's localized message when no dialog could be shown
+/// (another one is open, the platform has none, the dialog backend failed).
+fn pick_font_card_path() -> Result<Option<PathBuf>, FontCardError> {
+    let request = FileDialogRequest::new(DialogKind::OpenFile).filter(t!("typing.font_settings.font_card_filter"), &["psd"]);
+    match file_dialog::pick_blocking(request) {
+        // `OpenFile` always answers `Files` with exactly one entry (the ms-platform kind contract).
+        Ok(picked) => Ok(picked.and_then(Picked::into_file).map(|file| file.path)),
+        Err(err) => Err(FontCardError {
+            user_message: err.user_message(),
+            log_message: format!("the font-card file picker failed: {err:?}"),
+        }),
+    }
 }
 
 #[cfg(test)]

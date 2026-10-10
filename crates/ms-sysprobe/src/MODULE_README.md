@@ -55,7 +55,9 @@ Callers own the threading: nothing here spawns a worker for you.
   `"ManhwaStudio Hugging Face"` — never the OCR key entry, which is a different credential
   with a different lifetime. Seeded once at startup by the binary on a worker thread, so
   reads are lock acquisitions rather than OS round trips. Tri-state: `Unknown` (not read
-  yet) is distinct from `Missing`. The token value is never logged, never interpolated into
+  yet) is distinct from `Missing`. No store on wasm and Android (`keyring` compiled out):
+  the store operations return the `PlatformFeature::CredentialStore` unavailable message
+  and the seed only logs it. The token value is never logged, never interpolated into
   a message, and never written to any config or settings document.
 - `ai_install_probe.rs`: runs one isolated Python snippet through the ACTIVATED app-local
   environment (the same shell path launcher settings use), reports PyTorch / ONNX Runtime
@@ -75,9 +77,10 @@ Callers own the threading: nothing here spawns a worker for you.
   the Rust parent. Native-only: the file carries `#![cfg(not(target_arch = "wasm32"))]`.
   Edit here for anything about locating or launching Python.
 - `paste_image.rs`: `read_image_from_clipboard()` — one normalized RGBA image out of the
-  system clipboard, `arboard` first and then the Wayland/X11 command-line helpers
-  (`wl-paste`, `xclip`, `xsel`) where `arboard` cannot serve the offered representation.
-  Native-only; the readers are compiled out on wasm. A host probe like `screen_capture`,
+  system clipboard through `ms_platform::clipboard` (image, then a copied file list or an
+  image path in the text/HTML), then the Wayland/X11 command-line helpers (`wl-paste`,
+  `xclip`, `xsel`) on Linux. Compiled on every target; what is readable per platform is
+  `ms-platform`'s answer, and each failed representation is logged. A host probe like `screen_capture`,
   and shared across crates (the typing and translation tabs, the launcher), which is why it
   is not in any one of them. Returns pixels only: spawning the worker and converting into
   egui/`image` types stays with the caller.
@@ -101,7 +104,7 @@ Callers own the threading: nothing here spawns a worker for you.
 - Crate boundary: dependencies are `ms-log` (diagnostics), `ms-i18n` (user-facing strings),
   `ms-config` (the `AiInstallType` level only), `ms-thread` (the AI probe's worker),
   `image` (the capture contract), `serde`/`serde_json` (probe output, model markers),
-  `sha2` + `thiserror` (`ai_models::external`), `hf-hub` + `ureq` (`ai_models`, native-only), `keyring` (`hf_token`, native-only), and `windows-sys` on
+  `sha2` + `thiserror` (`ai_models::external`), `hf-hub` + `ureq` (`ai_models`, native-only), `keyring` (`hf_token`, not wasm/Android), `ms-platform` (clipboard reads, capability table), and `windows-sys` on
   Windows. No probe may READ OR WRITE a config document, and the crate must NOT gain a
   dependency on the application's upper layers (`project`, `app`, the tabs) or on egui —
   being a GUI-free leaf is what lets it type-check in parallel with the binary.

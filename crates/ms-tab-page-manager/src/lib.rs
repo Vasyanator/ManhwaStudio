@@ -164,7 +164,8 @@ pub struct PageManagerTabState {
     /// was re-activated, which triggers a clean rescan (other tabs may have changed the trees).
     last_drawn_frame: Option<u64>,
     clean_dialog: Option<clean::CleanDialog>,
-    clean_picker_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    /// The open replacement-clean file dialog, polled by `clean::poll_clean_picker`.
+    clean_picker: Option<ms_platform::file_dialog::PendingDialog>,
 
     // --- badge caches, recomputed only when the source revision changes ---
     /// `BubblesModel::revision` the counts were computed at.
@@ -230,7 +231,7 @@ impl Default for PageManagerTabState {
             op_in_progress: false,
             last_drawn_frame: None,
             clean_dialog: None,
-            clean_picker_rx: None,
+            clean_picker: None,
             bubbles_revision_seen: None,
             bubble_counts: HashMap::new(),
             bubble_total: 0,
@@ -317,7 +318,7 @@ impl PageManagerTabState {
         self.clean_scan_requested_epoch = None;
         self.clean_scan_done_epoch = None;
         self.clean_dialog = None;
-        self.clean_picker_rx = None;
+        self.clean_picker = None;
     }
 
     /// True while a clean attach/detach/delete/probe worker job is running. The
@@ -430,7 +431,7 @@ impl PageManagerTabState {
                 .is_some_and(PageManagerDialog::picker_active)
             || self.clean_scan_in_flight()
             || self.clean_op_in_flight
-            || self.clean_picker_rx.is_some()
+            || self.clean_picker.is_some()
         {
             ctx.request_repaint();
         }

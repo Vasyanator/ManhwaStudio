@@ -4,7 +4,7 @@ File: cleaning/tools/ai_editor/engines/flux2_klein/session.rs
 Purpose:
 The per-session run state of the FLUX.2 klein engine: the channel a worker answers on,
 the per-RUN undo stack, the derivation of the mask that actually goes on the wire, and
-the file pickers the panel opens.
+the file-dialog requests the panel opens.
 
 Main responsibilities:
 - own `Flux2SessionState` — the run receiver, the undo history and their bounds;
@@ -12,23 +12,25 @@ Main responsibilities:
 - decide the working mode from the painted mask (`mask_for_run`): a painted buffer
   travels verbatim with `whole_region = false`, an empty one becomes a SOLID mask;
 - write the flags the backend reports back into the settings (`apply_backend_flags`);
-- open a native file/directory picker off the GUI thread (`spawn_flux2_picker`).
+- build the file-dialog request of each picker purpose (`flux2_picker_request`); the engine
+  opens it through the non-blocking `ms_platform::file_dialog::request`.
 
 Key structures:
 - `Flux2SessionState`, `Flux2RunPoll`, `Flux2PickerPurpose`
 
 Key functions:
-- `mask_for_run()`, `apply_backend_flags()`, `spawn_flux2_picker()`
+- `mask_for_run()`, `apply_backend_flags()`, `flux2_picker_request()`
 
 Notes:
 The painted mask is NOT stored here — it belongs to the host's `MaskStack` and arrives
 in `EngineRunRequest::masks`. `mask_for_run` is the ONLY place the working mode is
 decided; the backend refuses `whole_region = true` unless the mask really is uniformly
-255. `spawn_flux2_picker` has two cfg variants: a real picker off-thread on desktop, and
-an immediately-closed channel on wasm32.
+255. The model-path pickers ask for a directory PATH used in place (`PickDirectoryPath`) or
+an existing file; a platform without them answers the request with a typed error.
 */
 
 use super::*;
+use ms_platform::file_dialog::{DialogKind, FileDialogRequest};
 
 // ---------------------------------------------------------------------------------------
 // Per-session state
@@ -265,61 +267,28 @@ pub(super) enum Flux2PickerPurpose {
     PromptCacheImport,
 }
 
-/// Spawns the blocking native file dialog for `purpose` on a worker thread.
+/// The file-dialog request of `purpose`.
 ///
-/// `None` means the user cancelled. Never called on the GUI thread's own stack: `rfd`
-/// blocks until the dialog closes.
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn spawn_flux2_picker(purpose: Flux2PickerPurpose) -> Receiver<Option<PathBuf>> {
-    let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
-    thread::spawn(move || {
-        let picked = match purpose {
-            Flux2PickerPurpose::TextEncoderDir
-            | Flux2PickerPurpose::TransformerDir
-            | Flux2PickerPurpose::VaeDir => rfd::FileDialog::new().pick_folder(),
-            Flux2PickerPurpose::TransformerFile | Flux2PickerPurpose::VaeFile => {
-                rfd::FileDialog::new()
-                    .add_filter(
-                        t!("cleaning.tools.flux2_klein.weights_files_filter"),
-                        &["safetensors", "sft", "gguf"],
-                    )
-                    .pick_file()
-            }
-            Flux2PickerPurpose::PromptCacheExport => rfd::FileDialog::new()
-                .set_title(t!(
-                    "cleaning.tools.flux2_klein.prompt_cache_export_dialog_title"
-                ))
-                .add_filter(
-                    t!("cleaning.tools.flux2_klein.prompt_cache_files_filter"),
-                    &[FLUX2_PROMPT_CACHE_EXTENSION],
-                )
-                // The extension is part of the file's identity, so the suggested name
-                // already carries it; the stem is a plain identifier and stays literal.
-                .set_file_name(format!("prompt.{FLUX2_PROMPT_CACHE_EXTENSION}"))
-                .save_file(),
-            Flux2PickerPurpose::PromptCacheImport => rfd::FileDialog::new()
-                .set_title(t!(
-                    "cleaning.tools.flux2_klein.prompt_cache_import_dialog_title"
-                ))
-                .add_filter(
-                    t!("cleaning.tools.flux2_klein.prompt_cache_files_filter"),
-                    &[FLUX2_PROMPT_CACHE_EXTENSION],
-                )
-                .pick_file(),
-        };
-        let _ = tx.send(picked);
-    });
-    rx
-}
-
-/// Web fallback: the browser build has no native file dialog (`rfd` is native-only),
-/// so the pick resolves immediately as cancelled and the dropped capability is logged.
-#[cfg(target_arch = "wasm32")]
-pub(super) fn spawn_flux2_picker(_purpose: Flux2PickerPurpose) -> Receiver<Option<PathBuf>> {
-    let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
-    ms_log::runtime_log::log_warn("[cleaning] FLUX.2 klein file picker unavailable on web build");
-    let _ = tx.send(None);
-    rx
+/// The model directories are used IN PLACE by the backend, so they are `PickDirectoryPath`
+/// requests, never copied-in folders; the prompt-cache export is a `SaveFile` whose target the
+/// engine commits once the backend has written it.
+pub(super) fn flux2_picker_request(purpose: Flux2PickerPurpose) -> FileDialogRequest {
+    match purpose {
+        Flux2PickerPurpose::TextEncoderDir | Flux2PickerPurpose::TransformerDir | Flux2PickerPurpose::VaeDir => {
+            FileDialogRequest::new(DialogKind::PickDirectoryPath)
+        }
+        Flux2PickerPurpose::TransformerFile | Flux2PickerPurpose::VaeFile => FileDialogRequest::new(DialogKind::OpenFile)
+            .filter(t!("cleaning.tools.flux2_klein.weights_files_filter"), &["safetensors", "sft", "gguf"]),
+        Flux2PickerPurpose::PromptCacheExport => FileDialogRequest::new(DialogKind::SaveFile)
+            .title(t!("cleaning.tools.flux2_klein.prompt_cache_export_dialog_title"))
+            .filter(t!("cleaning.tools.flux2_klein.prompt_cache_files_filter"), &[FLUX2_PROMPT_CACHE_EXTENSION])
+            // The extension is part of the file's identity, so the suggested name already
+            // carries it; the stem is a plain identifier and stays literal.
+            .suggested_name(format!("prompt.{FLUX2_PROMPT_CACHE_EXTENSION}")),
+        Flux2PickerPurpose::PromptCacheImport => FileDialogRequest::new(DialogKind::OpenFile)
+            .title(t!("cleaning.tools.flux2_klein.prompt_cache_import_dialog_title"))
+            .filter(t!("cleaning.tools.flux2_klein.prompt_cache_files_filter"), &[FLUX2_PROMPT_CACHE_EXTENSION]),
+    }
 }
 
 #[cfg(test)]
@@ -389,5 +358,22 @@ mod tests {
         let painted_px = painted.iter().filter(|value| **value > 0).count();
         assert!(painted_px > 0 && painted_px < painted.len(), "a real stroke");
         assert_eq!(mask_for_run(&painted), (painted.clone(), false));
+    }
+
+    /// Directories are kept as paths, weights and caches are files, the export is a save.
+    #[test]
+    fn picker_requests_match_their_purpose() {
+        let cases = [
+            (Flux2PickerPurpose::TextEncoderDir, DialogKind::PickDirectoryPath),
+            (Flux2PickerPurpose::TransformerDir, DialogKind::PickDirectoryPath),
+            (Flux2PickerPurpose::VaeDir, DialogKind::PickDirectoryPath),
+            (Flux2PickerPurpose::TransformerFile, DialogKind::OpenFile),
+            (Flux2PickerPurpose::VaeFile, DialogKind::OpenFile),
+            (Flux2PickerPurpose::PromptCacheExport, DialogKind::SaveFile),
+            (Flux2PickerPurpose::PromptCacheImport, DialogKind::OpenFile),
+        ];
+        for (purpose, kind) in cases {
+            assert_eq!(flux2_picker_request(purpose).kind(), kind, "{purpose:?}");
+        }
     }
 }

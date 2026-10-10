@@ -19,14 +19,23 @@ MangaApp.single_image: Option<SingleImageController>   (Some only for SessionKin
   dialogs.rs     exit dialog, «Параметры JPEG» dialog (stateless draw fns)
   mod.rs         tab_visible, image_window_title, hotkey_specs, SaveParts, SaveOutcome, wasm stub
 ```
-One save: `Idle -> [ChoosingFormat -> PickingPath] -> [JpegOptions] -> Preparing -> Writing -> Idle`.
+One save: `Idle -> [ChoosingFormat -> PickingPath] -> [JpegOptions] -> Preparing -> Writing -> [Committing] -> Idle`.
 - `ChoosingFormat`: «Сохранить как…» (button or Ctrl+Shift+S) toggles a small format panel under the
   button — one button per `ImageSaveFormat::save_formats()` (the one extension table; labels from
   `ImageSaveFormat::label`), plus «✕». «Сохранить» without an in-place target, including from the exit
   dialog, opens the same panel. «✕» / Escape / the toggle close it with no status; during a
   save-then-close that returns to the exit dialog (the controller defers that step to the next `tick`).
-- `PickingPath { format }`: native `rfd` save dialog on a worker, filtered to the chosen format's
-  extensions (plus uppercase copies for GTK), `<stem>.<ext>` preselected. The CHOSEN format is
+- `PickingPath { format }`: `ms_platform::file_dialog` save dialog (`SaveFile`, `pick_blocking`) on
+  a worker, filtered to the chosen format's extensions, `<stem>.<ext>` preselected; a dialog that
+  cannot be shown ends the save as `PickerUnavailable` with the dialog layer's message. The answer
+  is an `ms_platform` dialog target: the machine writes its write path and keeps the target
+  (`pending_commit`) for `Committing`.
+- `Committing`: after the flatten wrote a dialog target's file, the controller commits it on a
+  worker (`take_commit` -> `spawn_commit` -> `commit_finished`); a commit error is a failed save.
+  Only where platform paths are the user's own files (`writes_in_place`, from
+  `PlatformFeature::PersistentDirectoryPicker`: desktop) are the opened file and the last
+  «Сохранить как» target rewritten in place by «Сохранить»; elsewhere (Android SAF) there is no
+  in-place target and every save goes through the dialog and its commit. The CHOSEN format is
   authoritative (`extension_enforced_path`): a name without one of its extensions gets the canonical
   one appended (no extension) or REPLACING the other one. When that changed file EXISTS the worker
   shows the dialog again with the full name (`changed_name_needs_confirmation`), so the native
@@ -37,7 +46,7 @@ One save: `Idle -> [ChoosingFormat -> PickingPath] -> [JpegOptions] -> Preparing
   the top bar (it may never become ready if a loader worker died).
 - Dispatch (GUI thread, cheap): PS `flush_layers`, typing `flush_text_layers` (failure logged, the
   flatten composes from the live document), `baseline = edit_stamp`, `request_flatten_to_file`.
-- `Writing`: `poll_flatten_to_file` every frame; success adopts the baseline and the target.
+- `Writing`: `poll_flatten_to_file` every frame; success (after `Committing`, for a dialog target) adopts the baseline and, where paths are written in place, the target.
 
 ## Files and submodules
 - `mod.rs`: shared types and pure rules; the wasm stand-in for the controller.

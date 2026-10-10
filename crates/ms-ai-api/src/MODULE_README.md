@@ -169,7 +169,8 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   point they are created; consumers may add their own run-context logs.
 - **Web build**: `genai`, `tokio`, `futures-util`, `keyring`, `ureq` are native-only (`serde_json`, `image` and
   `ms-raster` are target-neutral; the `image_edit` core compiles on wasm). On wasm
-  the key functions return `KeyStoreWebUnavailable` and `load_metadata` returns
+  the key functions return `KeyStoreWebUnavailable` (on Android, where `keyring` is also compiled
+  out, `KeyStoreUnavailable(ms_platform::Unavailable)`) and `load_metadata` returns
   `MetadataWebUnavailable`; `client`, `openrouter`, `model_iden`, `exec_chat_tracked`,
   `validated` and `structured::json_spec_format` do not exist (the generation tracker and widget
   and the rest of `structured` do).

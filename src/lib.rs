@@ -22,8 +22,12 @@ Main flow (`native_main` -> `run_main`):
   to the same start. The `run_main` loop owns the request's scratch session and deletes it after
   the studio window closes; stale sessions of crashed runs are swept on a startup worker.
 - If chapter has legacy `scr` and no `src`, auto-renames `scr -> src` during startup validation.
-- Invalid `--project` startup path is reported both in console and in a modal error dialog.
-- If `--project` is missing:
+- Invalid `--project` startup path is reported both in console and in a modal error dialog
+  (`ms_platform::message::show_error_blocking`; log-only where no native box exists).
+- The Python AI backend supervisor starts only where `PlatformFeature::PythonBackend` exists.
+- If `--project` is missing (the route itself is the pure `startup_routing`):
+  - on a platform without installed-copy management (`ms_platform::PlatformFeature`, e.g.
+    Android) goes straight to the launcher: no installer, install prompts or update check;
   - checks whether Python env required by installer-dependent features is available;
   - when env is missing, asks whether to start the installer, update a custom install folder, or
     continue into the Rust launcher;
@@ -262,7 +266,7 @@ pub(crate) use ms_text_util::text_punctuation;
 pub(crate) use ms_text_util::language;
 
 // Native-only startup imports. All of these feed the native launcher/installer/
-// update-check flow (`eframe::run_native`, `rfd`, `ureq`, `clap` CLI, native
+// update-check flow (`eframe::run_native`, `ureq`, `clap` CLI, native
 // windows) which does not exist on `wasm32`. They are gated so the wasm build
 // does not fail on missing deps or unused imports. `std::path::{Path, PathBuf}`
 // stays unconditional because path types appear in items that both targets compile;
@@ -291,6 +295,10 @@ use std::cmp::Ordering;
 #[cfg(not(target_arch = "wasm32"))]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use ms_platform::PlatformFeature;
+#[cfg(not(target_arch = "wasm32"))]
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(not(target_arch = "wasm32"))]
@@ -518,7 +526,7 @@ fn run_main() -> anyhow::Result<()> {
     if cli.test_launcher {
         init_runtime_logging();
         storage_mode_job::start_pending_reconciliation();
-        let supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(!cli.no_ai, Some(storage_conversion_autostart_gate()));
+        let supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(ai_backend_enabled(&cli), Some(storage_conversion_autostart_gate()));
         return launcher::run_test_launcher(
             &user_settings,
             startup_update_check_receiver(&cli),
@@ -527,7 +535,7 @@ fn run_main() -> anyhow::Result<()> {
         );
     }
 
-    let ai_enabled = !cli.no_ai;
+    let ai_enabled = ai_backend_enabled(&cli);
     // The single Python AI backend is owned here, above the launcher/studio loop, so it
     // starts in the launcher (per the autostart toggle) and survives transitions between
     // the launcher and the studio. Dropped (which stops the process + probe) on any return.
@@ -838,6 +846,47 @@ struct StartupRoutingFlags {
     ignore_installed: bool,
 }
 
+/// Where the no-open-target startup path goes; decided by [`startup_routing`].
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupRoute {
+    /// Straight into the installer window (installer continuation after elevation).
+    Installer,
+    /// No usable Python environment: the existing-install discovery (Windows) and the
+    /// "install the Python environment?" prompt run first; choosing the launcher there
+    /// continues to it, with the update check as given.
+    MissingEnvironmentPrompt { update_check: bool },
+    /// The launcher, with or without the startup update check.
+    Launcher { update_check: bool },
+}
+
+/// The pure routing decision of `resolve_project_dir_without_cli_arg`.
+///
+/// - Without installed-copy management on this platform (`installed_copy_management` =
+///   `PlatformFeature::InstalledCopyManagement`) nothing installer-related runs: no installer
+///   continuation, no install prompts, no update check — the launcher opens directly.
+/// - Installer continuation (`flags.force_run_installer`, or an `has_auto_install_target`
+///   from the elevated relaunch) enters the installer.
+/// - Under `--ignore-installed` the environment is the developer's business: no prompt.
+///   Otherwise a missing environment (`has_python_env == false`) asks first.
+///
+/// `has_python_env` is read only where it can matter (installed-copy management available, no
+/// `--ignore-installed`, no installer continuation).
+#[cfg(not(target_arch = "wasm32"))]
+const fn startup_routing(flags: StartupRoutingFlags, has_auto_install_target: bool, installed_copy_management: bool, has_python_env: bool) -> StartupRoute {
+    let update_check = update_check_enabled(flags.ignore_installed, installed_copy_management);
+    if !installed_copy_management {
+        return StartupRoute::Launcher { update_check };
+    }
+    if flags.force_run_installer || has_auto_install_target {
+        return StartupRoute::Installer;
+    }
+    if !flags.ignore_installed && !has_python_env {
+        return StartupRoute::MissingEnvironmentPrompt { update_check };
+    }
+    StartupRoute::Launcher { update_check }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
     let path = project_dir.to_path_buf();
@@ -915,72 +964,41 @@ fn resolve_project_dir_without_cli_arg(
     auto_install_target: Option<PathBuf>,
     ai_backend: &ai_backend_supervisor::AiBackendHandle,
 ) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
-    if should_enter_installer_flow(flags.force_run_installer, auto_install_target.as_ref()) {
-        return run_startup_installer(config::program_dir(), auto_install_target);
-    }
-
+    let installed_copy_management = installed_copy_management_available();
     let program_dir = config::program_dir();
-    // Under `--ignore-installed` the environment is the developer's business: neither the
-    // installed-copy discovery nor the "install the Python environment?" prompt may run,
-    // so startup goes straight to the launcher.
-    let has_python_env =
-        flags.ignore_installed || python_manager::has_supported_python_env(&program_dir);
-
-    #[cfg(target_os = "windows")]
-    if !has_python_env {
-        let existing_install_action =
-            match launcher_install::handle_existing_windows_install(&program_dir, HOST_VERSION) {
-                Ok(action) => action,
-                Err(err) => {
-                    runtime_log::log_warn(format!(
-                        "existing Windows install detection failed for '{}': {err}",
-                        program_dir.display()
-                    ));
-                    launcher_install::ExistingInstallAction::NoInstallFound
+    // The probe is skipped where `startup_routing` ignores its answer (no installed-copy
+    // management on this platform, or `--ignore-installed`); it is a few cheap `stat`s.
+    let has_python_env = installed_copy_management
+        && !flags.ignore_installed
+        && python_manager::has_supported_python_env(&program_dir);
+    let route = startup_routing(flags, auto_install_target.is_some(), installed_copy_management, has_python_env);
+    let update_check = match route {
+        StartupRoute::Installer => return run_startup_installer(program_dir, auto_install_target),
+        StartupRoute::MissingEnvironmentPrompt { update_check } => {
+            #[cfg(target_os = "windows")]
+            if let Some(handled) = route_existing_windows_install(&program_dir)? {
+                return Ok(handled);
+            }
+            match prompt_missing_python_env_action() {
+                MissingPythonEnvAction::Install => {
+                    return run_startup_installer(program_dir, None);
                 }
-            };
-        match existing_install_action {
-            launcher_install::ExistingInstallAction::NoInstallFound => {}
-            launcher_install::ExistingInstallAction::ExitCurrentCopy => return Ok(None),
-            launcher_install::ExistingInstallAction::StartInstaller(target_dir) => {
-                return run_startup_installer(program_dir, Some(target_dir));
+                MissingPythonEnvAction::UpdateCustom(target) => {
+                    let _ = installer::update::run_external_install_update_window(target, HOST_VERSION)
+                        .map_err(anyhow::Error::msg)?;
+                    return Ok(None);
+                }
+                MissingPythonEnvAction::LaunchLauncher => {}
             }
-            launcher_install::ExistingInstallAction::UpdateInstalled(target) => {
-                let _ = installer::update::run_external_install_update_window(target, HOST_VERSION)
-                    .map_err(anyhow::Error::msg)?;
-                return Ok(None);
-            }
-            // Its own arm on purpose: it must NOT fall through to the missing-Python prompt
-            // below the way `NoInstallFound` does — the user asked to run THIS copy as it is.
-            launcher_install::ExistingInstallAction::RunStandalone => {
-                spawn_self_in_standalone_mode(&program_dir)?;
-                return Ok(None);
-            }
+            update_check
         }
-    }
-
-    if !has_python_env {
-        match prompt_missing_python_env_action() {
-            MissingPythonEnvAction::Install => {
-                return run_startup_installer(config::program_dir(), None);
-            }
-            MissingPythonEnvAction::UpdateCustom(target) => {
-                let _ = installer::update::run_external_install_update_window(target, HOST_VERSION)
-                    .map_err(anyhow::Error::msg)?;
-                return Ok(None);
-            }
-            MissingPythonEnvAction::LaunchLauncher => {}
-        }
-    }
+        StartupRoute::Launcher { update_check } => update_check,
+    };
 
     ensure_standard_launcher_startup_artifacts()?;
-    // No update check under `--ignore-installed`: without a notification the launcher never
-    // shows its update button, which is why the outcome below is a guard, not the UI path.
-    let update_check_rx = if flags.ignore_installed {
-        None
-    } else {
-        Some(spawn_startup_update_check(flags.force_update_available))
-    };
+    // Without a notification the launcher never shows its update button, which is why the
+    // `StartUpdate` arm below is a guard, not the UI path.
+    let update_check_rx = update_check.then(|| spawn_startup_update_check(flags.force_update_available));
     match launcher::run_launcher(user_settings, update_check_rx, ai_backend, launcher_host(flags.ignore_installed))? {
         Some(LauncherOutcome::OpenProject(selection)) => Ok(Some(studio_bootstrap::StartupTarget::Project(selection.project_dir))),
         // The launcher already checked "exists and is a file"; decode errors are the studio
@@ -994,11 +1012,54 @@ fn resolve_project_dir_without_cli_arg(
                 refuse_self_update_from_sources();
                 return Ok(None);
             }
+            if let Err(unavailable) = PlatformFeature::InstalledCopyManagement.require() {
+                runtime_log::log_error(format!("[startup] self-update requested on a platform without installed-copy management; refused: {unavailable:?}"));
+                return Ok(None);
+            }
             let _ = installer::update::run_update_window(flags.force_update_available, HOST_VERSION)
                 .map_err(anyhow::Error::msg)?;
             Ok(None)
         }
         None => Ok(None),
+    }
+}
+
+/// Windows only, missing Python environment: looks for an installed copy of the program and
+/// acts on the user's choice in the existing-install window. `Some(result)` ends the
+/// no-argument startup path with `result`; `None` continues to the missing-environment prompt
+/// (no install found, or the detection failed, which is logged).
+///
+/// # Errors
+/// The update window or the standalone relaunch failed.
+#[cfg(target_os = "windows")]
+fn route_existing_windows_install(program_dir: &Path) -> anyhow::Result<Option<Option<studio_bootstrap::StartupTarget>>> {
+    let existing_install_action = match launcher_install::handle_existing_windows_install(program_dir, HOST_VERSION) {
+        Ok(action) => action,
+        Err(err) => {
+            runtime_log::log_warn(format!(
+                "existing Windows install detection failed for '{}': {err}",
+                program_dir.display()
+            ));
+            launcher_install::ExistingInstallAction::NoInstallFound
+        }
+    };
+    match existing_install_action {
+        launcher_install::ExistingInstallAction::NoInstallFound => Ok(None),
+        launcher_install::ExistingInstallAction::ExitCurrentCopy => Ok(Some(None)),
+        launcher_install::ExistingInstallAction::StartInstaller(target_dir) => {
+            run_startup_installer(program_dir.to_path_buf(), Some(target_dir)).map(Some)
+        }
+        launcher_install::ExistingInstallAction::UpdateInstalled(target) => {
+            let _ = installer::update::run_external_install_update_window(target, HOST_VERSION)
+                .map_err(anyhow::Error::msg)?;
+            Ok(Some(None))
+        }
+        // Its own arm on purpose: it must NOT fall through to the missing-Python prompt
+        // the way `NoInstallFound` does — the user asked to run THIS copy as it is.
+        launcher_install::ExistingInstallAction::RunStandalone => {
+            spawn_self_in_standalone_mode(program_dir)?;
+            Ok(Some(None))
+        }
     }
 }
 
@@ -1018,14 +1079,42 @@ fn refuse_self_update_from_sources() {
 
 /// Returns the startup update-check receiver, or `None` when self-update is disabled.
 ///
-/// `--ignore-installed` suppresses the check entirely: the launcher then has no update
-/// notification to draw, so its update button never appears.
+/// `--ignore-installed`, or a platform without installed-copy management, suppresses the
+/// check entirely ([`update_check_enabled`]): the launcher then has no update notification to
+/// draw, so its update button never appears.
 #[cfg(not(target_arch = "wasm32"))]
 fn startup_update_check_receiver(cli: &Cli) -> Option<mpsc::Receiver<Option<UpdateNotification>>> {
-    if cli.ignore_installed {
-        return None;
+    update_check_enabled(cli.ignore_installed, installed_copy_management_available())
+        .then(|| spawn_startup_update_check(cli.test_ver_check))
+}
+
+/// Whether the Python AI backend may start: not under `--no-ai`, and only where the platform
+/// can run it (`PlatformFeature::PythonBackend`). Both supervisor starts use it.
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_backend_enabled(cli: &Cli) -> bool {
+    !cli.no_ai && PlatformFeature::PythonBackend.is_available()
+}
+
+/// `PlatformFeature::InstalledCopyManagement` for the startup routing. When the platform lacks
+/// it (no installer, update check, install prompts or update windows), the first call logs that
+/// once per process; the routing loop asks again on every return to the launcher.
+#[cfg(not(target_arch = "wasm32"))]
+fn installed_copy_management_available() -> bool {
+    static LOGGED_UNAVAILABLE: std::sync::Once = std::sync::Once::new();
+    let available = PlatformFeature::InstalledCopyManagement.is_available();
+    if !available {
+        LOGGED_UNAVAILABLE.call_once(|| {
+            runtime_log::log_info("[startup] installed-copy management unavailable on this platform: no installer, install prompts or update check");
+        });
     }
-    Some(spawn_startup_update_check(cli.test_ver_check))
+    available
+}
+
+/// Whether the startup update check runs: never from a source checkout (`--ignore-installed`)
+/// and never on a platform without installed-copy management.
+#[cfg(not(target_arch = "wasm32"))]
+const fn update_check_enabled(ignore_installed: bool, installed_copy_management: bool) -> bool {
+    installed_copy_management && !ignore_installed
 }
 
 /// Process exit code for an impossible command line (a usage error, mirroring clap's
@@ -1303,6 +1392,7 @@ fn prompt_missing_python_env_action() -> MissingPythonEnvAction {
             Ok(Box::new(MissingPythonEnvPromptApp {
                 output: output_for_app,
                 error_text: None,
+                folder_pick: None,
             }))
         }),
     ) {
@@ -1320,6 +1410,8 @@ fn prompt_missing_python_env_action() -> MissingPythonEnvAction {
 struct MissingPythonEnvPromptApp {
     output: Arc<Mutex<MissingPythonEnvAction>>,
     error_text: Option<String>,
+    /// The custom-update folder picker while it is open; every button is disabled meanwhile.
+    folder_pick: Option<PendingDialog>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1331,12 +1423,32 @@ impl MissingPythonEnvPromptApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
-    fn choose_custom_update_target(&mut self, ctx: &egui::Context) {
-        let Some(folder) = rfd::FileDialog::new()
-            .set_title(t!("startup.custom_update.folder_picker_title"))
-            .pick_folder()
-        else {
+    /// Opens the folder picker for «update a custom install folder» without blocking the window.
+    fn start_custom_update_pick(&mut self, ctx: &egui::Context) {
+        let request = FileDialogRequest::new(DialogKind::PickDirectoryPath).title(t!("startup.custom_update.folder_picker_title"));
+        let repaint_ctx = ctx.clone();
+        self.error_text = None;
+        self.folder_pick = Some(file_dialog::request(request, Some(Arc::new(move || repaint_ctx.request_repaint()))));
+    }
+
+    /// Takes the folder picker's answer once it arrived: a cancel does nothing, an error is
+    /// shown in the prompt (and logged), a folder is checked for an installed program copy.
+    fn poll_custom_update_pick(&mut self, ctx: &egui::Context) {
+        let Some(result) = self.folder_pick.as_mut().and_then(PendingDialog::poll) else {
             return;
+        };
+        self.folder_pick = None;
+        let folder = match result {
+            // `PickDirectoryPath` always answers `DirectoryPath` (the ms-platform kind contract).
+            Ok(picked) => match picked.and_then(file_dialog::Picked::into_directory_path) {
+                Some(folder) => folder,
+                None => return,
+            },
+            Err(err) => {
+                runtime_log::log_warn(format!("[startup] custom update folder picker failed: {err:?}"));
+                self.error_text = Some(err.user_message());
+                return;
+            }
         };
         match launcher_install::resolve_installed_program_copy_path(&folder) {
             Ok(executable_path) => {
@@ -1362,6 +1474,8 @@ impl eframe::App for MissingPythonEnvPromptApp {
         // the calls (viewport commands, helper methods) that still operate on the context.
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        self.poll_custom_update_pick(ctx);
+        let picking = self.folder_pick.is_some();
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.heading(t!("startup.install_prompt.title"));
@@ -1374,40 +1488,36 @@ impl eframe::App for MissingPythonEnvPromptApp {
                     ui.colored_label(ms_theme::status::ERROR, error_text);
                 }
                 ui.add_space(14.0);
-                if ui
-                    .add_sized([360.0, 34.0], egui::Button::new(t!("startup.install_prompt.install_button")))
-                    .clicked()
-                {
-                    self.set_output_and_close(MissingPythonEnvAction::Install, ctx);
-                }
-                ui.add_space(6.0);
-                if ui
-                    .add_sized(
-                        [360.0, 34.0],
-                        egui::Button::new(t!("startup.install_prompt.update_custom_button")),
-                    )
-                    .clicked()
-                {
-                    self.choose_custom_update_target(ctx);
-                }
-                ui.add_space(6.0);
-                if ui
-                    .add_sized([360.0, 34.0], egui::Button::new(t!("startup.install_prompt.open_basic_launcher_button")))
-                    .clicked()
-                {
-                    self.set_output_and_close(MissingPythonEnvAction::LaunchLauncher, ctx);
-                }
+                // While the folder picker is open the window keeps repainting but takes no
+                // other choice: its answer may still close the window.
+                ui.add_enabled_ui(!picking, |ui| {
+                    if ui
+                        .add_sized([360.0, 34.0], egui::Button::new(t!("startup.install_prompt.install_button")))
+                        .clicked()
+                    {
+                        self.set_output_and_close(MissingPythonEnvAction::Install, ctx);
+                    }
+                    ui.add_space(6.0);
+                    if ui
+                        .add_sized(
+                            [360.0, 34.0],
+                            egui::Button::new(t!("startup.install_prompt.update_custom_button")),
+                        )
+                        .clicked()
+                    {
+                        self.start_custom_update_pick(ctx);
+                    }
+                    ui.add_space(6.0);
+                    if ui
+                        .add_sized([360.0, 34.0], egui::Button::new(t!("startup.install_prompt.open_basic_launcher_button")))
+                        .clicked()
+                    {
+                        self.set_output_and_close(MissingPythonEnvAction::LaunchLauncher, ctx);
+                    }
+                });
             });
         });
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn should_enter_installer_flow(
-    force_run_installer: bool,
-    auto_install_target: Option<&PathBuf>,
-) -> bool {
-    force_run_installer || auto_install_target.is_some()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1430,15 +1540,17 @@ fn run_startup_installer(
     }
 }
 
+/// Shows a startup failure (before any window exists) in the native error box and logs it.
+/// Where the platform has no native message box (Android), the error-level log line IS the
+/// outcome (it reaches logcat) until an in-app dialog exists there.
 #[cfg(not(target_arch = "wasm32"))]
 fn show_startup_error_dialog(message: &str) {
     runtime_log::log_error(format!("startup error dialog shown: {message}"));
-    let _ = rfd::MessageDialog::new()
-        .set_title(t!("startup.error_dialog.title"))
-        .set_description(message)
-        .set_buttons(rfd::MessageButtons::Ok)
-        .set_level(rfd::MessageLevel::Error)
-        .show();
+    if let Err(unavailable) = ms_platform::message::show_error_blocking(t!("startup.error_dialog.title"), message) {
+        runtime_log::log_error(format!(
+            "[startup] the startup error could not be shown in a dialog; it is reported only in this log.\nReason: {unavailable:?}\nMessage: {message}"
+        ));
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2438,5 +2550,50 @@ fn install_linux_desktop_integration_async() {
         runtime_log::log_warn(format!(
             "[desktop-integration] could not start the desktop-integration thread: {err}"
         ));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod startup_routing_tests {
+    use super::{StartupRoute, StartupRoutingFlags, startup_routing};
+
+    fn flags(force_run_installer: bool, ignore_installed: bool) -> StartupRoutingFlags {
+        StartupRoutingFlags { force_update_available: false, force_run_installer, ignore_installed }
+    }
+
+    #[test]
+    fn installer_continuation_enters_the_installer() {
+        assert_eq!(startup_routing(flags(true, false), false, true, true), StartupRoute::Installer);
+        assert_eq!(startup_routing(flags(false, false), true, true, false), StartupRoute::Installer);
+    }
+
+    #[test]
+    fn missing_environment_prompts_before_the_launcher() {
+        assert_eq!(startup_routing(flags(false, false), false, true, false), StartupRoute::MissingEnvironmentPrompt { update_check: true });
+    }
+
+    #[test]
+    fn ready_environment_opens_the_launcher_with_the_update_check() {
+        assert_eq!(startup_routing(flags(false, false), false, true, true), StartupRoute::Launcher { update_check: true });
+    }
+
+    #[test]
+    fn ignore_installed_skips_prompt_and_update_check() {
+        assert_eq!(startup_routing(flags(false, true), false, true, false), StartupRoute::Launcher { update_check: false });
+    }
+
+    #[test]
+    fn no_installed_copy_management_opens_the_launcher_without_any_installer_step() {
+        for force_run_installer in [false, true] {
+            for has_auto_install_target in [false, true] {
+                for has_python_env in [false, true] {
+                    assert_eq!(
+                        startup_routing(flags(force_run_installer, false), has_auto_install_target, false, has_python_env),
+                        StartupRoute::Launcher { update_check: false },
+                        "force={force_run_installer} target={has_auto_install_target} env={has_python_env}"
+                    );
+                }
+            }
+        }
     }
 }

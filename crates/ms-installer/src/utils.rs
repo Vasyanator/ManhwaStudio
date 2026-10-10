@@ -76,8 +76,11 @@ use serde::Deserialize;
 use tar::Archive;
 use zip::ZipArchive;
 
+// Install-dir defaults exist only on desktop OSes; Android has no installed copy.
+#[cfg(not(target_os = "android"))]
+use super::install::INSTALL_SUBDIR_NAME;
 use super::install::{
-    EMBEDDED_APP_ICON_ICO, EMBEDDED_APP_ICON_PNG, INSTALL_SUBDIR_NAME, InstallDependencyProfile,
+    EMBEDDED_APP_ICON_ICO, EMBEDDED_APP_ICON_PNG, InstallDependencyProfile,
     InstallEvent, TorchBackend, TorchChoicePrompt, TorchInstallSelection, TorchPreflightResult,
     TorchWheelOption,
 };
@@ -1993,7 +1996,8 @@ pub(super) fn default_local_install_dir() -> Result<PathBuf, String> {
             .join(INSTALL_SUBDIR_NAME));
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    // Android has no XDG data dir or system-wide /opt: it falls through to the typed unsupported-OS error.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     {
         let base = env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -2019,7 +2023,8 @@ pub(super) fn default_all_users_install_dir() -> Result<PathBuf, String> {
         return Ok(PathBuf::from("/Applications").join(INSTALL_SUBDIR_NAME));
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    // Same: no system-wide install location on Android.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     {
         return Ok(PathBuf::from("/opt").join(INSTALL_SUBDIR_NAME));
     }
@@ -2028,7 +2033,8 @@ pub(super) fn default_all_users_install_dir() -> Result<PathBuf, String> {
     Err(t!("installer.utils.unsupported_os_error").to_string())
 }
 
-#[cfg(not(target_os = "windows"))]
+// Used only by the macOS/Linux install-dir defaults (none on Android or Windows).
+#[cfg(not(any(target_os = "windows", target_os = "android")))]
 fn home_dir_path() -> Result<PathBuf, String> {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -2256,7 +2262,8 @@ pub(super) fn relaunch_self_elevated(root_dir: &Path, target_dir: &Path) -> Resu
     Ok(())
 }
 
-#[cfg(all(unix, not(target_os = "macos"), not(target_os = "windows")))]
+// pkexec/sudo do not exist on Android; it takes the unsupported-OS arm below.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "android")), not(target_os = "windows")))]
 pub(super) fn relaunch_self_elevated(root_dir: &Path, target_dir: &Path) -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| tf!("installer.utils.determine_exe_error", e = e))?;
 
@@ -2282,7 +2289,7 @@ pub(super) fn relaunch_self_elevated(root_dir: &Path, target_dir: &Path) -> Resu
     Ok(())
 }
 
-#[cfg(not(any(unix, target_os = "windows")))]
+#[cfg(any(target_os = "android", not(any(unix, target_os = "windows"))))]
 pub(super) fn relaunch_self_elevated(_root_dir: &Path, _target_dir: &Path) -> Result<(), String> {
     Err(t!("installer.utils.elevation_unsupported_os_error").to_string())
 }
@@ -3712,7 +3719,8 @@ pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    // No xdg-open on Android; it falls through to the typed unsupported-OS error.
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))]
     {
         Command::new("xdg-open")
             .arg(url)

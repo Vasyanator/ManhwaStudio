@@ -50,7 +50,9 @@ use ms_project::{Page, ProjectPaths};
 use ms_models::page_view::PageImageInfo;
 
 use super::clean_link;
-use super::dialogs::spawn_clean_picker;
+use ms_platform::file_dialog::{self, PendingDialog};
+
+use super::dialogs::clean_file_request;
 use super::PageManagerTabState;
 
 /// A pending user confirmation for a content operation.
@@ -617,29 +619,37 @@ impl PageManagerTabState {
         }
     }
 
-    /// Polls the native replacement picker without blocking the UI. A picked file
+    /// Polls the replacement-clean file dialog without blocking the UI. A picked file
     /// is first probed on the clean worker (header dimensions -> real `AttachFit`),
     /// so the confirmation dialog can warn about scaling or reject an incompatible
-    /// image instead of always claiming an exact fit.
+    /// image instead of always claiming an exact fit. A dialog failure (e.g. no file dialog on
+    /// this platform) lands in the tab's error line; a cancel is a silent no-op.
     pub(super) fn poll_clean_picker(&mut self, project: &ms_project::ProjectData, page_infos: &std::collections::HashMap<usize, PageImageInfo>) {
-        let Some(rx) = self.clean_picker_rx.as_ref() else { return; };
-        match rx.try_recv() {
-            Ok(Some(path)) => {
-                self.clean_picker_rx = None;
-                // The picker only produces a path; header decode remains in the clean worker.
-                let Some(page_idx) = self.selection.iter().next().copied() else { return; };
-                let sizes = page_sizes(project, page_infos, &self.thumbs);
-                let Some((_, page_size)) = sizes.into_iter().find(|(idx, _)| *idx == page_idx) else { self.error_message = Some(t!("page_manager.clean_size_unknown").to_string()); return; };
-                match self.clean_runtime.send(CleanJob::ProbeAttach { path, page_idx, page_size }) {
-                    // The probe occupies the serial worker; treat it as in-flight so
-                    // mutating buttons stay disabled and frames keep coming.
-                    Ok(()) => self.clean_op_in_flight = true,
-                    Err(error) => self.error_message = Some(tf!("page_manager.clean_operation_failed", error = error)),
-                }
+        let Some(result) = self.clean_picker.as_mut().and_then(PendingDialog::poll) else { return; };
+        self.clean_picker = None;
+        let path = match result {
+            Ok(Some(picked)) => match picked.into_file() {
+                Some(file) => file.path,
+                // `OpenFile` always answers with one file (`Picked` contract); anything else is a
+                // platform-layer bug, logged and treated as a cancel.
+                None => { runtime_log::log_error("[page_manager] clean picker returned no file for an OpenFile request"); return; }
+            },
+            Ok(None) => return,
+            Err(error) => {
+                runtime_log::log_warn(format!("[page_manager] replacement-clean file dialog failed: {error:?}"));
+                self.error_message = Some(error.user_message());
+                return;
             }
-            Ok(None) => self.clean_picker_rx = None,
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => { self.clean_picker_rx = None; self.error_message = Some(t!("page_manager.clean_picker_failed").to_string()); }
+        };
+        // The picker only produces a path; header decode remains in the clean worker.
+        let Some(page_idx) = self.selection.iter().next().copied() else { return; };
+        let sizes = page_sizes(project, page_infos, &self.thumbs);
+        let Some((_, page_size)) = sizes.into_iter().find(|(idx, _)| *idx == page_idx) else { self.error_message = Some(t!("page_manager.clean_size_unknown").to_string()); return; };
+        match self.clean_runtime.send(CleanJob::ProbeAttach { path, page_idx, page_size }) {
+            // The probe occupies the serial worker; treat it as in-flight so
+            // mutating buttons stay disabled and frames keep coming.
+            Ok(()) => self.clean_op_in_flight = true,
+            Err(error) => self.error_message = Some(tf!("page_manager.clean_operation_failed", error = error)),
         }
     }
 
@@ -816,12 +826,13 @@ impl PageManagerTabState {
         self.submit_clean_mutation(project, |ctx| Some(CleanJob::DeleteUnassigned { file_name, ctx }));
     }
 
-    /// Opens the asynchronous native picker for a selected page's replacement clean.
+    /// Opens the non-blocking file dialog for a selected page's replacement clean.
     /// Blocked while any clean op / probe / structural op is in flight, and while a
-    /// previous picker is still open (its receiver must not be overwritten).
+    /// previous dialog is still open (its pending handle must not be overwritten).
     pub(super) fn start_replace_clean_picker(&mut self) {
-        if !self.clean_mutation_blocked() && self.clean_picker_rx.is_none() {
-            self.clean_picker_rx = Some(spawn_clean_picker());
+        if !self.clean_mutation_blocked() && self.clean_picker.is_none() {
+            // No waker: the tab requests a repaint every frame while the dialog is pending.
+            self.clean_picker = Some(file_dialog::request(clean_file_request(), None));
         }
     }
 

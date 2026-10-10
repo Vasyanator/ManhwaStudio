@@ -79,20 +79,21 @@ pub(super) enum TypingExportRoute {
 ///   the panel plumbing; it is reported instead of reinterpreted.
 pub(super) fn resolve_export_route(request: &TypingExportRequest) -> Result<TypingExportRoute, String> {
     match (request.format, &request.destination) {
-        (TypingExportFormat::Png, TypingExportDestination::Folder(dir)) => {
+        (TypingExportFormat::Png, TypingExportDestination::Folder(target)) => {
+            let dir = target.write_dir().to_path_buf();
             if request.repaginate.enabled {
-                Ok(TypingExportRoute::RepaginatedPng { dir: dir.clone() })
+                Ok(TypingExportRoute::RepaginatedPng { dir })
             } else {
-                Ok(TypingExportRoute::StreamedFiles { dir: dir.clone() })
+                Ok(TypingExportRoute::StreamedFiles { dir })
             }
         }
-        (TypingExportFormat::Psd, TypingExportDestination::Folder(dir)) => {
+        (TypingExportFormat::Psd, TypingExportDestination::Folder(target)) => {
             if request.repaginate.enabled {
                 return Err(t!("typing.errors.export_psd_repaginate_unsupported").to_string());
             }
-            Ok(TypingExportRoute::StreamedFiles { dir: dir.clone() })
+            Ok(TypingExportRoute::StreamedFiles { dir: target.write_dir().to_path_buf() })
         }
-        (TypingExportFormat::Pdf, TypingExportDestination::PdfFile(file)) => Ok(TypingExportRoute::Pdf { file: file.clone() }),
+        (TypingExportFormat::Pdf, TypingExportDestination::PdfFile(target)) => Ok(TypingExportRoute::Pdf { file: target.write_path().to_path_buf() }),
         (TypingExportFormat::Png | TypingExportFormat::Psd, TypingExportDestination::PdfFile(_)) | (TypingExportFormat::Pdf, TypingExportDestination::Folder(_)) => {
             Err(t!("typing.errors.export_destination_mismatch").to_string())
         }
@@ -142,14 +143,17 @@ pub(super) fn compose_window_pages(worker_count: usize) -> usize {
 ///
 /// Validates the format/destination pairing, creates the output location, loads the клин
 /// snapshots, then drives the one-to-one or the collecting pipeline. `progress_tx` receives
-/// one `Progress` event per SOURCE page processed, in both pipelines.
+/// one `Progress` event per SOURCE page processed, in both pipelines. Once the whole output is
+/// written the destination is committed (`TypingExportDestination::commit`; blocking on
+/// Android, which is why it happens here, on the export worker).
 ///
 /// # Errors
 /// The first failure of the run, already localized: an invalid request
 /// (`resolve_export_route`), an output location that cannot be created, a клин snapshot that
-/// cannot be loaded, or the first page/document failure the pipeline hit. The one-to-one
-/// pipeline still writes every page it can before reporting; the collecting pipeline writes
-/// NOTHING once a page has failed, because a half-stitched document would be silent data loss.
+/// cannot be loaded, the first page/document failure the pipeline hit, or a destination that
+/// could not be committed. The one-to-one pipeline still writes every page it can before
+/// reporting; the collecting pipeline writes NOTHING once a page has failed, because a
+/// half-stitched document would be silent data loss. A failed run is never committed.
 pub(super) fn export_typing_pages(
     mut jobs: Vec<TypingExportPageJob>,
     request: TypingExportRequest,
@@ -158,16 +162,19 @@ pub(super) fn export_typing_pages(
 ) -> Result<TypingExportResult, String> {
     let route = resolve_export_route(&request)?;
     prepare_export_output_location(&route)?;
+    let TypingExportRequest { destination, format: _, repaginate: repaginate_settings, output_base_name } = request;
+    let destination_name = destination.display_name().to_owned();
     let total = jobs.len();
     if jobs.is_empty() {
-        return Ok(TypingExportResult { exported: 0, total, destination: request.destination, warnings: Vec::new() });
+        // Nothing was written, so there is nothing to publish.
+        return Ok(TypingExportResult { exported: 0, total, destination_name, warnings: Vec::new() });
     }
     prepare_export_clean_overlay_snapshots(&mut jobs, clean_overlays_model)?;
     // Only the collecting pipeline re-paginates; `resolve_export_route` has already rejected
     // the one format that cannot (PSD).
-    let repaginate = request.repaginate.enabled.then_some(request.repaginate);
-    match route {
-        TypingExportRoute::StreamedFiles { .. } => export_typing_pages_streamed(jobs, request.destination, progress_tx),
+    let repaginate = repaginate_settings.enabled.then_some(repaginate_settings);
+    let result = match route {
+        TypingExportRoute::StreamedFiles { .. } => export_typing_pages_streamed(jobs, destination_name, progress_tx),
         TypingExportRoute::RepaginatedPng { dir } => {
             // The file NAMES of a re-paginated run need the run's final page count up front —
             // it selects the zero padding, and a padding that widened halfway through would
@@ -179,17 +186,22 @@ pub(super) fn export_typing_pages(
             // after minutes of composition — and the consumer re-checks each composed page
             // against the scanned size, so the assumption is verified rather than trusted.
             let sizes = scan_export_page_sizes(&jobs)?;
-            let total_output = repaginated_output_page_count(&sizes, &request.repaginate)?;
-            let sink = TypingCollectedSink::RepaginatedPng { dir, base: request.output_base_name, total_output, written: 0 };
-            export_typing_pages_collected(jobs, sink, repaginate, Some(sizes), request.destination, progress_tx, compose_typing_export_page)
+            let total_output = repaginated_output_page_count(&sizes, &repaginate_settings)?;
+            let sink = TypingCollectedSink::RepaginatedPng { dir, base: output_base_name, total_output, written: 0 };
+            export_typing_pages_collected(jobs, sink, repaginate, Some(sizes), destination_name, progress_tx, compose_typing_export_page)
         }
         TypingExportRoute::Pdf { file } => {
             // A PDF names no page, so it needs no size pre-scan: the document simply takes the
             // pages in order, at whatever size each composes to.
             let sink = TypingCollectedSink::Pdf { file, builder: TypingPdfBuilder::new() };
-            export_typing_pages_collected(jobs, sink, repaginate, None, request.destination, progress_tx, compose_typing_export_page)
+            export_typing_pages_collected(jobs, sink, repaginate, None, destination_name, progress_tx, compose_typing_export_page)
         }
-    }
+    }?;
+    destination.commit().map_err(|err| {
+        ms_log::runtime_log::log_warn(format!("[typing] export: committing the destination '{}' failed: {err:?}", result.destination_name));
+        err.user_message()
+    })?;
+    Ok(result)
 }
 
 /// The historical ONE-TO-ONE pipeline: a pool of workers pops pages and each composes,
@@ -199,7 +211,7 @@ pub(super) fn export_typing_pages(
 /// worker count. A page that fails does NOT abort the run — every other page is still written
 /// and the first error is reported at the end — because the output files are independent of
 /// one another.
-fn export_typing_pages_streamed(jobs: Vec<TypingExportPageJob>, destination: TypingExportDestination, progress_tx: mpsc::Sender<TypingExportEvent>) -> Result<TypingExportResult, String> {
+fn export_typing_pages_streamed(jobs: Vec<TypingExportPageJob>, destination_name: String, progress_tx: mpsc::Sender<TypingExportEvent>) -> Result<TypingExportResult, String> {
     let total = jobs.len();
     let worker_count = export_worker_count(jobs.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
@@ -260,7 +272,7 @@ fn export_typing_pages_streamed(jobs: Vec<TypingExportPageJob>, destination: Typ
     }
     // Worker completion order is not deterministic, so sort for a stable status line.
     warnings.sort();
-    Ok(TypingExportResult { exported, total, destination, warnings })
+    Ok(TypingExportResult { exported, total, destination_name, warnings })
 }
 
 /// One composed page on its way from an export worker to the ordered consumer: straight
@@ -591,7 +603,7 @@ pub(super) fn export_typing_pages_collected(
     mut sink: TypingCollectedSink,
     repaginate: Option<TypingRepaginateSettings>,
     expected_sizes: Option<Vec<(u32, u32)>>,
-    destination: TypingExportDestination,
+    destination_name: String,
     progress_tx: mpsc::Sender<TypingExportEvent>,
     compose: TypingComposeFn,
 ) -> Result<TypingExportResult, String> {
@@ -690,7 +702,7 @@ pub(super) fn export_typing_pages_collected(
     }
     let written = sink.finish()?;
     ms_log::trace_log!(cat::PERSIST, "export collected pages={} output_pages={}", composed_ok, written);
-    Ok(TypingExportResult { exported: composed_ok, total, destination, warnings: Vec::new() })
+    Ok(TypingExportResult { exported: composed_ok, total, destination_name, warnings: Vec::new() })
 }
 
 /// Renders a `thread::join` panic payload as text for the log: the `&str` / `String` message a
@@ -1309,10 +1321,10 @@ impl TypingTextOverlayLayer {
                         Ok(result) => {
                             ms_log::trace_log!(
                                 cat::PERSIST,
-                                "export result=ok exported={} total={} destination={:?}",
+                                "export result=ok exported={} total={} destination={}",
                                 result.exported,
                                 result.total,
-                                result.destination
+                                result.destination_name
                             );
                             for warning in &result.warnings {
                                 ms_log::trace_log!(cat::PERSIST, "export warning={}", warning);

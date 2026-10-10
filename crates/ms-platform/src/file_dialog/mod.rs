@@ -72,6 +72,8 @@ pub enum DialogKind {
     /// An existing folder, readable at a local path (copied in recursively on Android).
     OpenFolder,
     /// A new file: write the complete file to `SaveTarget::write_path`, then `commit()`.
+    /// When the request has filters and the user typed a name WITHOUT any extension, the
+    /// desktop backend appends the first extension of the first filter (`with_default_extension`).
     SaveFile,
     /// A destination folder: write into `FolderTarget::write_dir`, then `commit()`.
     SaveIntoFolder,
@@ -184,7 +186,8 @@ pub struct PickedFile {
 
 /// A save destination for one file. Write the COMPLETE file to [`Self::write_path`] first, then
 /// call [`Self::commit`]. Opaque so the Android variant (staging path + document URI) can be
-/// added without touching callers.
+/// added without touching callers. On desktop the path already carries an extension whenever the
+/// request had filters: a name typed without one gets the first filter's first extension.
 #[derive(Debug, PartialEq, Eq)]
 pub struct SaveTarget {
     path: PathBuf,
@@ -630,6 +633,29 @@ fn picked_from_paths(kind: DialogKind, paths: Vec<PathBuf>) -> Option<Picked> {
         DialogKind::PickDirectoryPath => Picked::DirectoryPath(paths.next()?),
     };
     Some(picked)
+}
+
+/// The path a `SaveFile` dialog returned, with the first extension of the first filter appended
+/// when the chosen name has NO extension at all. A path that already has any extension (the
+/// user's own, or one the native dialog appended) is returned unchanged, so nothing is doubled
+/// or replaced; a request without filters leaves the path as typed.
+#[cfg(any(not(any(target_arch = "wasm32", target_os = "android")), test))]
+fn with_default_extension(path: PathBuf, filters: &[FileFilter]) -> PathBuf {
+    if path.extension().is_some() {
+        return path;
+    }
+    let Some(extension) = filters.first().and_then(|filter| filter.extensions.first()) else {
+        return path;
+    };
+    // Appended to the whole file name (not `set_extension`), so a name like `notes.` or a
+    // dotless stem keeps every character the user typed.
+    let mut name = path.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    if name.is_empty() {
+        return path;
+    }
+    name.push(".");
+    name.push(extension);
+    path.with_file_name(name)
 }
 
 #[cfg(any(not(any(target_arch = "wasm32", target_os = "android")), test))]

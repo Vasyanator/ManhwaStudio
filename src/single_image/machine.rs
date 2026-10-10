@@ -17,7 +17,8 @@ Key functions:
 - `SaveMachine::request_save` / `request_save_as` / `request_save_then`
 - `choose_format`, `cancel_format_choice`
 - `picker_closed`, `confirm_jpeg_options`, `cancel_jpeg_options`, `cancel_preparing`
-- `dispatched`, `dispatch_refused`, `write_finished`
+- `picker_unavailable`, `dispatched`, `dispatch_refused`, `write_finished`, `take_commit`,
+  `commit_finished`
 - `resolve_save_as_path()` / `extension_enforced_path()`: picked path -> target; the CHOSEN format
   is authoritative, the extension is appended or replaced to match it.
 
@@ -28,10 +29,21 @@ defines both inputs (`controller::edit_stamp` / `deferred_edits`); this machine 
 baseline is captured when the write is DISPATCHED (after the save's own flushes) and applied only
 when the write succeeds, so an edit made while the file is being written keeps the session dirty,
 and a failed write changes nothing.
+
+Dialog targets (plan WP1d): a «Сохранить как» answer is an `ms_platform` `SaveTarget`. The machine
+writes its write path, keeps the dialog target as `pending_commit` and, after the flatten wrote
+the file, enters `Committing` until the controller's commit worker reports (`take_commit` ->
+`commit_finished`); a commit failure is a failed save. Whether a written path may later be
+rewritten IN PLACE without the dialog (`writes_in_place`) is the caller's platform answer: on
+desktop the dialog's write path IS the chosen file, so the opened file and the last «Сохранить
+как» target are «Сохранить» targets; where it is not (Android SAF: a staging file published to a
+document URI), there is no in-place target at all and every «Сохранить» goes through the dialog,
+so a copied path is never written without its commit.
 */
 
 use crate::app::PendingCloseAction;
 use crate::tabs::typing::FlattenToFileError;
+use ms_platform::file_dialog::SaveTarget as DialogTarget;
 use crate::tabs::typing::image_encode::ImageSaveFormat;
 use std::path::{Path, PathBuf};
 
@@ -85,6 +97,14 @@ pub(super) enum Phase {
         /// Edit stamp at dispatch.
         baseline: u64,
     },
+    /// The file was written; the commit worker publishes it to the dialog target. Like `Writing`,
+    /// it cannot be cancelled and the save succeeds only when it does.
+    Committing {
+        /// The written file.
+        target: SaveTarget,
+        /// Edit stamp at dispatch.
+        baseline: u64,
+    },
 }
 
 /// Why a save did not happen. Typed so the localized text is chosen in one place
@@ -93,6 +113,12 @@ pub(super) enum Phase {
 pub(super) enum SaveError {
     /// The native file dialog could not be shown (its worker ended without an answer).
     PickerFailed,
+    /// No dialog could be shown (another one is open, none on this platform, backend failure);
+    /// the dialog layer's localized message.
+    PickerUnavailable(String),
+    /// The file was written but could not be published to the chosen destination; the dialog
+    /// layer's localized message.
+    Commit(String),
     /// The typing tab refused the flatten (another flatten or an export is running).
     Busy,
     /// The scratch chapter has no page.
@@ -199,16 +225,21 @@ pub(super) struct SaveMachine {
     status_revision: u64,
     /// The close action to run once the current save succeeds (save-then-close from the exit dialog).
     after_save: Option<PendingCloseAction>,
+    /// The dialog target of the save in progress, committed after its write (see the file header).
+    pending_commit: Option<DialogTarget>,
+    /// Whether a written path may be rewritten in place by a later «Сохранить» (see the header).
+    writes_in_place: bool,
     /// Set when a successful save moved the target to a new path (the window title must follow).
     retitle_to: Option<PathBuf>,
 }
 
 impl SaveMachine {
     /// A fresh session. `in_place` is `ImageSaveFormat::in_place_for(session)` with the opened
-    /// path; `animated` shows the first-frame notice.
-    pub fn new(in_place: Option<SaveTarget>, jpeg_quality: u8, animated: bool) -> Self {
+    /// path; `animated` shows the first-frame notice; `writes_in_place` = paths the platform hands
+    /// out are the user's own files (see the file header). Without it `in_place` is dropped.
+    pub fn new(in_place: Option<SaveTarget>, jpeg_quality: u8, animated: bool, writes_in_place: bool) -> Self {
         let mut machine = Self {
-            target: in_place,
+            target: in_place.filter(|_| writes_in_place),
             saved_baseline: 0,
             phase: Phase::Idle,
             jpeg_quality,
@@ -217,6 +248,8 @@ impl SaveMachine {
             status_revision: 0,
             after_save: None,
             retitle_to: None,
+            pending_commit: None,
+            writes_in_place,
         };
         if animated {
             machine.set_status(Status::AnimatedNotice);
@@ -251,9 +284,9 @@ impl SaveMachine {
         matches!(self.phase, Phase::PickingPath { .. })
     }
 
-    /// The file is being written right now (cannot be cancelled).
+    /// The file is being written or committed right now (cannot be cancelled).
     pub fn writing(&self) -> bool {
-        matches!(self.phase, Phase::Writing { .. })
+        matches!(self.phase, Phase::Writing { .. } | Phase::Committing { .. })
     }
 
     /// The current «Сохранить» target, if any.
@@ -307,7 +340,7 @@ impl SaveMachine {
                 Step::Nothing
             }
             Phase::ChoosingFormat => self.cancel_format_choice(),
-            Phase::PickingPath { .. } | Phase::JpegOptions { .. } | Phase::Preparing { .. } | Phase::Writing { .. } => Step::Nothing,
+            Phase::PickingPath { .. } | Phase::JpegOptions { .. } | Phase::Preparing { .. } | Phase::Writing { .. } | Phase::Committing { .. } => Step::Nothing,
         }
     }
 
@@ -343,10 +376,12 @@ impl SaveMachine {
     }
 
     /// The file dialog closed. `None` = the user cancelled it (a save-then-close returns to the exit
-    /// dialog). A path is written in the CHOSEN format, its extension made to match
-    /// ([`resolve_save_as_path`]); a JPEG target always shows the options (they are the format's
-    /// options step for «Сохранить как»).
-    pub fn picker_closed(&mut self, picked: Option<PathBuf>) -> Step {
+    /// dialog). The target is written in the CHOSEN format; where paths are written in place its
+    /// extension is made to match ([`resolve_save_as_path`]), elsewhere the dialog's write path is
+    /// kept as is (its name belongs to the document it is committed to). The dialog target is kept
+    /// for the commit after the write. A JPEG target always shows the options (they are the
+    /// format's options step for «Сохранить как»).
+    pub fn picker_closed(&mut self, picked: Option<DialogTarget>) -> Step {
         let Phase::PickingPath { format } = self.phase else {
             return Step::Nothing;
         };
@@ -355,7 +390,9 @@ impl SaveMachine {
             self.set_status(Status::Cancelled);
             return self.after_save.take().map_or(Step::Nothing, Step::ReturnToExitDialog);
         };
-        let target = resolve_save_as_path(picked, format);
+        let written = picked.write_path().to_path_buf();
+        let target = if self.writes_in_place { resolve_save_as_path(written, format) } else { SaveTarget { path: written, format } };
+        self.pending_commit = Some(picked);
         if target.format == ImageSaveFormat::Jpeg {
             self.phase = Phase::JpegOptions { target, quality: self.jpeg_quality };
         } else {
@@ -371,11 +408,18 @@ impl SaveMachine {
         }
     }
 
+    /// No dialog could be shown; `message` is the dialog layer's localized explanation.
+    pub fn picker_unavailable(&mut self, message: String) {
+        if self.picking_path() {
+            self.fail(SaveError::PickerUnavailable(message));
+        }
+    }
+
     /// The quality the JPEG options slider edits, while that dialog is shown.
     pub fn jpeg_options_quality_mut(&mut self) -> Option<&mut u8> {
         match &mut self.phase {
             Phase::JpegOptions { quality, .. } => Some(quality),
-            Phase::Idle | Phase::ChoosingFormat | Phase::PickingPath { .. } | Phase::Preparing { .. } | Phase::Writing { .. } => None,
+            Phase::Idle | Phase::ChoosingFormat | Phase::PickingPath { .. } | Phase::Preparing { .. } | Phase::Writing { .. } | Phase::Committing { .. } => None,
         }
     }
 
@@ -397,6 +441,7 @@ impl SaveMachine {
             return Step::Nothing;
         }
         self.phase = Phase::Idle;
+        self.pending_commit = None;
         self.set_status(Status::Cancelled);
         self.after_save.take().map_or(Step::Nothing, Step::ReturnToExitDialog)
     }
@@ -407,6 +452,7 @@ impl SaveMachine {
         if matches!(self.phase, Phase::Preparing { .. }) {
             self.phase = Phase::Idle;
             self.after_save = None;
+            self.pending_commit = None;
             self.set_status(Status::Cancelled);
         }
     }
@@ -416,8 +462,11 @@ impl SaveMachine {
     pub fn abandon_pending(&mut self) {
         self.after_save = None;
         match self.phase {
-            Phase::ChoosingFormat | Phase::PickingPath { .. } | Phase::JpegOptions { .. } | Phase::Preparing { .. } => self.phase = Phase::Idle,
-            Phase::Idle | Phase::Writing { .. } => {}
+            Phase::ChoosingFormat | Phase::PickingPath { .. } | Phase::JpegOptions { .. } | Phase::Preparing { .. } => {
+                self.phase = Phase::Idle;
+                self.pending_commit = None;
+            }
+            Phase::Idle | Phase::Writing { .. } | Phase::Committing { .. } => {}
         }
     }
 
@@ -438,11 +487,10 @@ impl SaveMachine {
         }
     }
 
-    /// The flatten worker reported. On success the dispatch baseline becomes the saved baseline,
-    /// the target becomes the written path (a «Сохранить как» moves it) and a pending close action
-    /// runs — unless the session became dirty again during the write (`edit_stamp_now` /
-    /// `deferred_edits_now`), which asks again instead. On failure nothing changes but the status,
-    /// and a pending close action is dropped (the window stays open with the error).
+    /// The flatten worker reported. A save to a dialog target then enters `Committing` (the
+    /// controller takes the target with [`Self::take_commit`]); any other success finishes the save
+    /// (see [`Self::commit_finished`] for what success does). On failure nothing changes but the
+    /// status, and a pending close action is dropped (the window stays open with the error).
     pub fn write_finished(&mut self, result: Result<(), SaveError>, edit_stamp_now: u64, deferred_edits_now: bool) -> Step {
         let Phase::Writing { target, baseline } = self.phase.clone() else {
             return Step::Nothing;
@@ -452,12 +500,44 @@ impl SaveMachine {
             self.fail(err);
             return Step::Nothing;
         }
+        if self.pending_commit.is_some() {
+            self.phase = Phase::Committing { target, baseline };
+            return Step::Nothing;
+        }
+        self.finish_success(target, baseline, edit_stamp_now, deferred_edits_now)
+    }
+
+    /// The dialog target to commit, once (`Some` only in `Committing`). The controller commits it
+    /// on a worker and reports through [`Self::commit_finished`].
+    pub fn take_commit(&mut self) -> Option<DialogTarget> {
+        if matches!(self.phase, Phase::Committing { .. }) { self.pending_commit.take() } else { None }
+    }
+
+    /// The commit worker reported. On success the dispatch baseline becomes the saved baseline,
+    /// the target becomes the written path where paths are rewritten in place (a «Сохранить как»
+    /// moves it; elsewhere the next «Сохранить» asks for a destination again) and a pending close
+    /// action runs — unless the session became dirty again meanwhile (`edit_stamp_now` /
+    /// `deferred_edits_now`), which asks again instead. A failure is a failed save.
+    pub fn commit_finished(&mut self, result: Result<(), SaveError>, edit_stamp_now: u64, deferred_edits_now: bool) -> Step {
+        let Phase::Committing { target, baseline } = self.phase.clone() else {
+            return Step::Nothing;
+        };
+        self.phase = Phase::Idle;
+        if let Err(err) = result {
+            self.fail(err);
+            return Step::Nothing;
+        }
+        self.finish_success(target, baseline, edit_stamp_now, deferred_edits_now)
+    }
+
+    /// The common end of a successful save (`write_finished` without a commit, `commit_finished`).
+    fn finish_success(&mut self, target: SaveTarget, baseline: u64, edit_stamp_now: u64, deferred_edits_now: bool) -> Step {
         self.saved_baseline = baseline;
         if self.target.as_ref().map(|current| &current.path) != Some(&target.path) {
             self.retitle_to = Some(target.path.clone());
         }
         self.set_status(Status::Saved { name: target.display_name() });
-        self.target = Some(target);
+        self.target = self.writes_in_place.then_some(target);
         match self.after_save.take() {
             None => Step::Nothing,
             Some(action) if self.is_dirty(edit_stamp_now, deferred_edits_now) => Step::ReturnToExitDialog(action),
@@ -480,10 +560,12 @@ impl SaveMachine {
         self.set_status(Status::Preparing);
     }
 
-    /// Ends the save with `err`; a pending close action is dropped (the window stays open).
+    /// Ends the save with `err`; a pending close action and an uncommitted dialog target are
+    /// dropped (the window stays open).
     fn fail(&mut self, err: SaveError) {
         self.phase = Phase::Idle;
         self.after_save = None;
+        self.pending_commit = None;
         self.set_status(Status::Error(err));
     }
 
@@ -558,15 +640,25 @@ mod tests {
         assert_eq!(machine.choose_format(format), Next::OpenPicker(format));
     }
 
-    /// Drives a machine from `Preparing` through a successful write with dispatch baseline `baseline`.
+    /// A desktop-shaped dialog answer (`SaveTarget::for_test`) writing `path`.
+    fn dialog(path: &str) -> DialogTarget {
+        DialogTarget::for_test(PathBuf::from(path))
+    }
+
+    /// Drives a machine from `Preparing` through a successful write with dispatch baseline
+    /// `baseline`, and through the commit when the save has a dialog target.
     fn save_ok(machine: &mut SaveMachine, baseline: u64) -> Step {
         machine.dispatched(baseline);
-        machine.write_finished(Ok(()), baseline, false)
+        let step = machine.write_finished(Ok(()), baseline, false);
+        if machine.take_commit().is_some() {
+            return machine.commit_finished(Ok(()), baseline, false);
+        }
+        step
     }
 
     #[test]
     fn fresh_session_is_clean_and_any_action_makes_it_dirty() {
-        let machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         assert!(!machine.is_dirty(0, false));
         assert!(machine.is_dirty(1, false));
         assert!(machine.is_dirty(0, true), "a deferred edit (typing text, PS layer) is unsaved work");
@@ -574,7 +666,7 @@ mod tests {
 
     #[test]
     fn successful_save_adopts_the_dispatch_baseline() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         machine.request_save();
         assert!(matches!(machine.phase(), Phase::Preparing { .. }));
         assert_eq!(save_ok(&mut machine, 7), Step::Nothing);
@@ -586,7 +678,7 @@ mod tests {
 
     #[test]
     fn edit_during_write_stays_dirty() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         machine.request_save();
         machine.dispatched(7);
         // Two more actions land while the worker writes.
@@ -597,7 +689,7 @@ mod tests {
 
     #[test]
     fn failed_write_keeps_dirty_and_drops_the_close_action() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         machine.request_save_then(PendingCloseAction::Exit);
         machine.dispatched(4);
         let err = SaveError::Write { path: PathBuf::from("/home/u/a.png"), reason: "denied".to_owned() };
@@ -611,7 +703,7 @@ mod tests {
 
     #[test]
     fn save_then_close_closes_only_when_clean_after_the_write() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         machine.request_save_then(PendingCloseAction::ReturnToLauncher);
         assert_eq!(save_ok(&mut machine, 3), Step::CloseNow(PendingCloseAction::ReturnToLauncher));
 
@@ -622,9 +714,9 @@ mod tests {
 
     #[test]
     fn save_as_updates_the_target_and_the_title() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         save_as(&mut machine, ImageSaveFormat::WebpLossless);
-        assert_eq!(machine.picker_closed(Some(PathBuf::from("/home/u/b.webp"))), Step::Nothing);
+        assert_eq!(machine.picker_closed(Some(dialog("/home/u/b.webp"))), Step::Nothing);
         assert_eq!(save_ok(&mut machine, 2), Step::Nothing);
         assert_eq!(machine.target(), Some(&SaveTarget { path: PathBuf::from("/home/u/b.webp"), format: ImageSaveFormat::WebpLossless }));
         assert_eq!(machine.take_retitle(), Some(PathBuf::from("/home/u/b.webp")));
@@ -636,9 +728,9 @@ mod tests {
 
     #[test]
     fn failed_save_as_keeps_the_old_target() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         save_as(&mut machine, ImageSaveFormat::Png);
-        let _ = machine.picker_closed(Some(PathBuf::from("/home/u/b.png")));
+        let _ = machine.picker_closed(Some(dialog("/home/u/b.png")));
         machine.dispatched(1);
         let _ = machine.write_finished(Err(SaveError::WorkerLost), 1, false);
         assert_eq!(machine.target(), Some(&png("/home/u/a.png")));
@@ -647,7 +739,7 @@ mod tests {
 
     #[test]
     fn jpeg_options_are_shown_once_per_target() {
-        let mut machine = SaveMachine::new(Some(jpeg("/home/u/a.jpg")), 95, false);
+        let mut machine = SaveMachine::new(Some(jpeg("/home/u/a.jpg")), 95, false, true);
         machine.request_save();
         assert!(matches!(machine.phase(), Phase::JpegOptions { quality: 95, .. }));
         if let Some(quality) = machine.jpeg_options_quality_mut() {
@@ -661,19 +753,19 @@ mod tests {
         assert_eq!(save_ok(&mut machine, 2), Step::Nothing);
         // «Сохранить как» to a .jpg always shows the options, even for the confirmed path.
         save_as(&mut machine, ImageSaveFormat::Jpeg);
-        let _ = machine.picker_closed(Some(PathBuf::from("/home/u/a.jpg")));
+        let _ = machine.picker_closed(Some(dialog("/home/u/a.jpg")));
         assert!(matches!(machine.phase(), Phase::JpegOptions { quality: 80, .. }), "the confirmed quality is the new default");
         assert_eq!(machine.confirm_jpeg_options(), Some(80));
         assert_eq!(save_ok(&mut machine, 3), Step::Nothing);
         // A different JPEG target asks again on «Сохранить» after it became the target.
         save_as(&mut machine, ImageSaveFormat::Jpeg);
-        let _ = machine.picker_closed(Some(PathBuf::from("/home/u/c.jpeg")));
+        let _ = machine.picker_closed(Some(dialog("/home/u/c.jpeg")));
         assert!(matches!(machine.phase(), Phase::JpegOptions { .. }));
     }
 
     #[test]
     fn cancelled_jpeg_options_write_nothing() {
-        let mut machine = SaveMachine::new(Some(jpeg("/home/u/a.jpg")), 95, false);
+        let mut machine = SaveMachine::new(Some(jpeg("/home/u/a.jpg")), 95, false, true);
         machine.request_save_then(PendingCloseAction::Exit);
         assert_eq!(machine.cancel_jpeg_options(), Step::ReturnToExitDialog(PendingCloseAction::Exit));
         assert_eq!(machine.phase(), &Phase::Idle);
@@ -685,7 +777,7 @@ mod tests {
     #[test]
     fn no_in_place_target_makes_save_act_as_save_as() {
         // Animated or non-writable source (gif, bmp, mismatched extension): no in-place target.
-        let mut machine = SaveMachine::new(None, 95, true);
+        let mut machine = SaveMachine::new(None, 95, true, true);
         assert_eq!(machine.status().0, Some(&Status::AnimatedNotice));
         machine.request_save();
         assert_eq!(machine.phase(), &Phase::ChoosingFormat, "«Сохранить» without a target opens the format panel");
@@ -694,7 +786,7 @@ mod tests {
         // A path without an extension gets the chosen format's. (The picker worker only delivers such
         // a path once `changed_name_needs_confirmation` found that `out.png` does not exist, or the
         // user confirmed that full name in the dialog; see below.)
-        let _ = machine.picker_closed(Some(PathBuf::from("/home/u/out")));
+        let _ = machine.picker_closed(Some(dialog("/home/u/out")));
         assert!(matches!(machine.phase(), Phase::Preparing { target } if target == &png("/home/u/out.png")));
     }
 
@@ -702,7 +794,7 @@ mod tests {
     /// «✕» / Escape / the toggle close it with no action and no status.
     #[test]
     fn format_panel_opens_chooses_and_cancels() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         assert_eq!(machine.request_save_as(), Step::Nothing);
         assert!(machine.choosing_format());
         assert!(machine.busy(), "the open panel blocks «Сохранить»");
@@ -714,7 +806,7 @@ mod tests {
         assert_eq!(machine.request_save_as(), Step::Nothing, "the toggle is inert while the picker is open");
         assert!(machine.picking_path());
         // The picked name follows the CHOSEN format, and JPEG always shows its options.
-        let _ = machine.picker_closed(Some(PathBuf::from("/home/u/b.png")));
+        let _ = machine.picker_closed(Some(dialog("/home/u/b.png")));
         assert!(matches!(machine.phase(), Phase::JpegOptions { target, .. } if target == &jpeg("/home/u/b.jpg")));
         let _ = machine.cancel_jpeg_options();
 
@@ -739,7 +831,7 @@ mod tests {
     /// «✕» or by the toggle) returns to the exit dialog, as a cancelled picker does.
     #[test]
     fn exit_dialog_fallback_shows_the_panel_and_cancel_returns_to_it() {
-        let mut machine = SaveMachine::new(None, 95, false);
+        let mut machine = SaveMachine::new(None, 95, false, true);
         machine.request_save_then(PendingCloseAction::Exit);
         assert!(machine.choosing_format());
         assert_eq!(machine.cancel_format_choice(), Step::ReturnToExitDialog(PendingCloseAction::Exit));
@@ -754,7 +846,7 @@ mod tests {
         assert_eq!(machine.picker_closed(None), Step::ReturnToExitDialog(PendingCloseAction::Exit));
 
         // The exit dialog opened over an already open panel: its «Сохранить» adopts the panel.
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         let _ = machine.request_save_as();
         machine.request_save_then(PendingCloseAction::Exit);
         assert!(machine.choosing_format());
@@ -763,7 +855,7 @@ mod tests {
 
     #[test]
     fn picker_cancel_returns_to_the_exit_dialog() {
-        let mut machine = SaveMachine::new(None, 95, false);
+        let mut machine = SaveMachine::new(None, 95, false, true);
         machine.request_save_then(PendingCloseAction::ReturnToLauncher);
         assert_eq!(machine.choose_format(ImageSaveFormat::Png), Next::OpenPicker(ImageSaveFormat::Png));
         assert_eq!(machine.picker_closed(None), Step::ReturnToExitDialog(PendingCloseAction::ReturnToLauncher));
@@ -776,7 +868,7 @@ mod tests {
 
     #[test]
     fn cancel_while_preparing_drops_the_save_and_the_close_action() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         machine.request_save_then(PendingCloseAction::Exit);
         machine.cancel_preparing();
         assert_eq!(machine.phase(), &Phase::Idle);
@@ -793,7 +885,7 @@ mod tests {
 
     #[test]
     fn requests_are_ignored_while_busy_but_save_then_adopts_the_running_save() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         machine.request_save();
         machine.dispatched(1);
         machine.request_save();
@@ -805,7 +897,7 @@ mod tests {
 
     #[test]
     fn abandon_keeps_a_running_write() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         machine.request_save();
         machine.abandon_pending();
         assert_eq!(machine.phase(), &Phase::Idle);
@@ -817,7 +909,7 @@ mod tests {
 
     #[test]
     fn transient_status_expires_only_for_its_revision() {
-        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false);
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
         machine.request_save();
         let _ = save_ok(&mut machine, 1);
         let (_, revision) = machine.status();
@@ -830,6 +922,95 @@ mod tests {
         let (_, revision) = machine.status();
         machine.expire_status(revision);
         assert!(machine.status().0.is_some());
+    }
+
+    #[test]
+    fn save_as_commits_the_dialog_target_after_the_write() {
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
+        save_as(&mut machine, ImageSaveFormat::Png);
+        let _ = machine.picker_closed(Some(dialog("/home/u/b.png")));
+        assert_eq!(machine.take_commit(), None, "nothing to commit before the write");
+        machine.dispatched(2);
+        assert_eq!(machine.write_finished(Ok(()), 2, false), Step::Nothing);
+        assert!(matches!(machine.phase(), Phase::Committing { target, baseline: 2 } if target == &png("/home/u/b.png")));
+        assert!(machine.writing(), "a close waits for the commit");
+        assert!(machine.is_dirty(2, false), "not saved before the commit succeeded");
+        let committed = machine.take_commit();
+        assert_eq!(committed.as_ref().map(DialogTarget::write_path), Some(Path::new("/home/u/b.png")));
+        assert_eq!(machine.take_commit(), None, "the target is handed out once");
+        assert_eq!(machine.commit_finished(Ok(()), 2, false), Step::Nothing);
+        assert!(!machine.is_dirty(2, false));
+        assert_eq!(machine.target(), Some(&png("/home/u/b.png")));
+        // The remembered desktop target is rewritten in place: no dialog, no commit.
+        machine.request_save();
+        machine.dispatched(3);
+        assert_eq!(machine.write_finished(Ok(()), 3, false), Step::Nothing);
+        assert_eq!(machine.phase(), &Phase::Idle);
+    }
+
+    #[test]
+    fn failed_commit_is_a_failed_save() {
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
+        save_as(&mut machine, ImageSaveFormat::Png);
+        machine.request_save_then(PendingCloseAction::Exit);
+        let _ = machine.picker_closed(Some(dialog("/home/u/b.png")));
+        machine.dispatched(4);
+        let _ = machine.write_finished(Ok(()), 4, false);
+        assert!(machine.take_commit().is_some());
+        let err = SaveError::Commit("denied".to_owned());
+        assert_eq!(machine.commit_finished(Err(err.clone()), 4, false), Step::Nothing, "the close action is dropped");
+        assert_eq!(machine.phase(), &Phase::Idle);
+        assert!(machine.is_dirty(4, false));
+        assert_eq!(machine.status().0, Some(&Status::Error(err)));
+        assert_eq!(machine.target(), Some(&png("/home/u/a.png")), "the old target stays");
+        assert_eq!(machine.take_retitle(), None);
+    }
+
+    /// Android SAF shape: paths are not the user's files. No in-place target, the dialog's write
+    /// path is written as named, and EVERY «Сохранить» goes through the dialog and its commit.
+    #[test]
+    fn without_in_place_writes_every_save_goes_through_a_committed_dialog_target() {
+        let mut machine = SaveMachine::new(Some(png("/copy/a.png")), 95, false, false);
+        assert_eq!(machine.target(), None, "the opened copy is never rewritten in place");
+        for round in 1..=2 {
+            machine.request_save();
+            assert_eq!(machine.phase(), &Phase::ChoosingFormat, "round {round}");
+            assert_eq!(machine.choose_format(ImageSaveFormat::Png), Next::OpenPicker(ImageSaveFormat::Png));
+            let _ = machine.picker_closed(Some(dialog("/staging/out")));
+            assert!(matches!(machine.phase(), Phase::Preparing { target } if target.path == Path::new("/staging/out")), "the staging name is kept");
+            machine.dispatched(round);
+            assert_eq!(machine.write_finished(Ok(()), round, false), Step::Nothing);
+            assert!(machine.take_commit().is_some(), "round {round} commits");
+            assert_eq!(machine.commit_finished(Ok(()), round, false), Step::Nothing);
+            assert!(!machine.is_dirty(round, false));
+            assert_eq!(machine.target(), None, "round {round}: nothing to rewrite in place");
+        }
+    }
+
+    #[test]
+    fn unavailable_picker_reports_its_message() {
+        let mut machine = SaveMachine::new(None, 95, false, true);
+        machine.request_save_then(PendingCloseAction::Exit);
+        let _ = machine.choose_format(ImageSaveFormat::Png);
+        machine.picker_unavailable("No dialogs here.".to_owned());
+        assert_eq!(machine.phase(), &Phase::Idle);
+        assert_eq!(machine.status().0, Some(&Status::Error(SaveError::PickerUnavailable("No dialogs here.".to_owned()))));
+        machine.picker_unavailable("late".to_owned());
+        assert_eq!(machine.status().0, Some(&Status::Error(SaveError::PickerUnavailable("No dialogs here.".to_owned()))), "ignored outside PickingPath");
+    }
+
+    #[test]
+    fn a_cancelled_save_as_drops_its_dialog_target() {
+        let mut machine = SaveMachine::new(Some(png("/home/u/a.png")), 95, false, true);
+        save_as(&mut machine, ImageSaveFormat::Jpeg);
+        let _ = machine.picker_closed(Some(dialog("/home/u/b.jpg")));
+        let _ = machine.cancel_jpeg_options();
+        // The next in-place save has nothing to commit.
+        machine.request_save();
+        machine.dispatched(1);
+        assert_eq!(machine.write_finished(Ok(()), 1, false), Step::Nothing);
+        assert_eq!(machine.phase(), &Phase::Idle);
+        assert_eq!(machine.take_commit(), None);
     }
 
     /// The chosen format is authoritative: no / empty extension -> appended; one of its own

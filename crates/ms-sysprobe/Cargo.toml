@@ -30,21 +30,24 @@ serde_json.workspace = true
 sha2.workspace = true
 # Typed public error of `ai_models::external` (`ExternalModelError`).
 thiserror.workspace = true
+# Platform seams: the system clipboard behind `paste_image` and the capability table
+# (`PlatformFeature`) that decides which host probes and stores exist on this target.
+ms-platform = { path = "../ms-platform" }
 
-# Native-only halves of the two Hugging Face modules. `hf-hub` resolves repository file
-# URLs for `ai_models` (which then streams them itself, without the HF cache), and
-# `keyring` is the OS secret store `hf_token` keeps the access token in. Both are
-# compiled out on wasm, where the modules keep their signatures and return a typed
-# "unavailable on web" error — the same feature sets the binary already selects, so no
-# second copy is built.
+# Native-only half of `ai_models`: `hf-hub` resolves repository file URLs (which the
+# module then streams itself, without the HF cache). Compiled out on wasm, where the module
+# keeps its signatures and returns a typed "unavailable on web" error — the same feature
+# sets the binary already selects, so no second copy is built.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# The system clipboard behind `paste_image`. Native-only: there is no synchronous
-# clipboard on wasm, where the module's readers are compiled out.
-arboard.workspace = true
 hf-hub.workspace = true
 # `ai_models` streams each resolved file itself (into the app model tree, no HF cache
 # blobs or symlinks), so it needs the HTTP client directly and not only through hf-hub.
 ureq.workspace = true
+
+# The OS secret store `hf_token` keeps the access token in. Not on wasm (no store) and not
+# on Android: keyring has no Android backend there and would silently link its in-memory
+# mock, so `hf_token` answers `PlatformFeature::CredentialStore` unavailable instead.
+[target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 keyring.workspace = true
 
 # Windows GDI screen capture and the Job Object that kills spawned Python children with

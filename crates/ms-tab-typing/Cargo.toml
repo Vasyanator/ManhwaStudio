@@ -99,11 +99,10 @@ thiserror.workspace = true
 anyhow.workspace = true
 # Monotonic time that also works in a web build (debounce and animation timers).
 web-time.workspace = true
-
-# Native file dialogs behind the font/preset import and export controls. Native-only:
-# there is no `rfd` on wasm, where the call sites are compiled out.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rfd.workspace = true
+# Non-blocking file dialogs behind the export destination and «pick image from file», and the
+# export targets the run commits. Compiled on every target: a platform without a dialog
+# answers with a typed error.
+ms-platform = { path = "../ms-platform" }
 
 [dev-dependencies]
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
@@ -117,6 +116,9 @@ ms-config = { path = "../ms-config", features = ["test-support"] }
 # STANDALONE `cargo clippy -p ms-tab-typing` compile, which the workspace-wide feature
 # union would otherwise mask.
 ms-models = { path = "../ms-models", features = ["test-support"] }
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support`: the
+# export tests build desktop-shaped `FolderTarget` / `SaveTarget` destinations.
+ms-platform = { path = "../ms-platform", features = ["test-support"] }
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
 # builds: it exposes the atomic-write step journal (`recorded_steps` / `WriteStep`) the
 # presets durability tests assert on.

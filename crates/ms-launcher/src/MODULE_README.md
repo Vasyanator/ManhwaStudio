@@ -25,10 +25,11 @@ notification.
   storage-mode conversion status line (progress of the process-wide `storage_mode_job`, then a
   dismissable failure notice). Also the native-only small "Open image" button (drawn in a
   `Ui::new_child` over the title -> grid gap, so it takes no layout space) and its picking status.
-- `open_image.rs` (native only): single-image mode entry — `rfd` file picker plus path
-  validation (exists + is a file) on a worker, the filter built from
-  `ms_config::single_image::input_extensions()` (plus uppercase copies for case-sensitive GTK
-  globs), and the pure pick -> `LauncherOutcome::OpenImage` mapping. `app.rs` polls it.
+- `open_image.rs` (native only): single-image mode entry — `ms_platform::file_dialog::pick_blocking`
+  plus path validation (exists + is a file) on a worker, the filter built from
+  `ms_config::single_image::input_extensions()` (the dialog seam adds the uppercase spellings
+  case-sensitive GTK globs need), and the pure pick -> `LauncherOutcome::OpenImage` mapping.
+  `app.rs` polls it.
 - `state.rs`: page enum, shared UI state, typed launcher outcomes, and `LauncherHost` (the
   process facts `lib.rs` / `web_entry.rs` hand in: `--ignore-installed`, version core).
 - `background.rs`: background image plan and decode workers.

@@ -61,7 +61,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   update continuation entry, project validation, launcher handoff, direct project opening, and
   Linux/Windows integration hooks). `native_main` / `web_main` are the library's only public
   items; the shims stay `pub(crate)`, so a shim no call site uses is an unused-import error and
-  is removed rather than kept. The library exists so a platform build that needs one (Android
+  is removed rather than kept. Platform gates of the startup flow ask `ms_platform::PlatformFeature`:
+  `InstalledCopyManagement` (no installer, install prompts, update check or update window
+  where absent; the no-argument route is the pure, unit-tested `startup_routing`) and
+  `PythonBackend` (both supervisor starts). The startup error box is
+  `ms_platform::message::show_error_blocking`, log-only where no native box exists. The library exists so a platform build that needs one (Android
   `cdylib`) reaches the same startup code; its crate type stays the default `rlib`.
 - `android_entry.rs` (`cfg(target_os = "android")`): the unmangled `android_main(AndroidApp)`
   android-activity calls. Order is a contract: register the handle in

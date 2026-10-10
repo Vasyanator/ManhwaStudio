@@ -116,7 +116,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   controls, «Перевести» action), so a new class must state what its card shows instead of
   inheriting the text-bubble layout.
 - `composition.rs`: composed text generation from project bubbles, plain/MiniJinja formatting
-  options, and TXT/DOCX export helpers. ImageBubbles are gated by the `include_image_bubbles`
+  options, and the TXT/DOCX export: a non-blocking `ms_platform` save dialog, then a worker that
+  writes the whole file and commits the target (`write_export`); the export buttons stay disabled
+  while one export is in flight. ImageBubbles are gated by the `include_image_bubbles`
   option: when enabled, each text area contributes one line `{translation}` (plus ` - {description}`
   when `use_character_names` is on and the description is non-empty); area 0 reads the legacy
   fields, later areas read `extra["text_areas"]`. The MiniJinja path simply includes/excludes image

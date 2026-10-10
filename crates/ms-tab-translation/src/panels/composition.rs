@@ -9,6 +9,8 @@ Main responsibilities:
 - own `CompositionPanelOptions` (the settings boundary mirrored by the parser/writer in `tab.rs`)
 - filter, sort and format bubbles into the composed text (`compose_translation_text`)
 - draw the «Текст» / «Параметры» sub-tabs and the export actions
+- run a TXT/DOCX export: a non-blocking save dialog (`ms_platform::file_dialog`), then the write
+  and the target's `commit()` on a worker (`write_export`)
 
 Key structures:
 - CompositionPanelOptions: every composition setting, persisted in `settings.json`
@@ -16,12 +18,14 @@ Key structures:
   `DroppedReplica` barrier that stops hint lookahead
 - HintBinding: forward / dropped / trailing, the resolved attachment of one hint
 - EmitParams: emission-time settings (limit, merging, separators)
+- ExportFormat / ExportStage: the export in flight (dialog open, or the worker writing)
 
 Key functions:
 - compose_translation_text(): entry point, dispatches to `compose_plain` / `compose_minijinja`
 - compose_plain(): filter + sort + format, then `emit_composition_items`
 - classify_hint_bindings(): one backward scan resolving every hint's attachment
 - emit_composition_items(): pure emission pass — limit, character merging, hint attachment
+- write_export(): worker half of an export (write the whole file, then commit the target)
 
 Notes:
 Formatting is separated from emission so the ordering, limit and hint-attachment rules can be
@@ -36,12 +40,13 @@ use crate::panels::bubbles::{
 use ms_widgets::WheelSpinBox;
 use eframe::egui;
 use minijinja::{AutoEscape, Environment, context};
-#[cfg(not(target_arch = "wasm32"))]
-use rfd::FileDialog;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog, SaveTarget};
 use serde_json::Value;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 const LIMIT_MIN: usize = 100;
 const LIMIT_MAX: usize = 100_000;
@@ -66,9 +71,7 @@ fn unknown_character_text() -> &'static str {
 fn narrator_character_text() -> &'static str {
     t!("translation.composition.narrator")
 }
-// Only used by the native file-save picker (`select_export_path`), which is
-// compiled out on wasm.
-#[cfg(not(target_arch = "wasm32"))]
+/// File stem the export dialog suggests (an on-disk name, not UI text).
 const DEFAULT_EXPORT_NAME: &str = "composition_export";
 const COMPOSED_TEXT_ROWS: usize = 12;
 const TEMPLATE_ROWS: usize = 6;
@@ -218,11 +221,63 @@ struct CompositionNotice {
     is_error: bool,
 }
 
-#[derive(Debug, Clone)]
+/// A composed-text export format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Txt,
+    Docx,
+}
+
+impl ExportFormat {
+    /// File extension (lowercase, no dot).
+    fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Txt => "txt",
+            ExportFormat::Docx => "docx",
+        }
+    }
+
+    /// Label of the save dialog's filter.
+    fn filter_label(self) -> &'static str {
+        match self {
+            ExportFormat::Txt => t!("translation.composition.txt_files_filter"),
+            ExportFormat::Docx => t!("translation.composition.docx_files_filter"),
+        }
+    }
+
+    /// Success notice naming the written file.
+    fn saved_status(self, name: &str) -> String {
+        match self {
+            ExportFormat::Txt => tf!("translation.composition.txt_saved_status", path = name),
+            ExportFormat::Docx => tf!("translation.composition.docx_saved_status", path = name),
+        }
+    }
+
+    /// Failure notice wrapping an already-localized or OS error text.
+    fn save_error(self, err: &str) -> String {
+        match self {
+            ExportFormat::Txt => tf!("translation.composition.txt_save_error", err = err),
+            ExportFormat::Docx => tf!("translation.composition.docx_save_error", err = err),
+        }
+    }
+}
+
+/// The export in flight; at most one, and both export buttons are disabled meanwhile.
+#[derive(Debug)]
+enum ExportStage {
+    /// The save dialog is open. `text` is the composition as it was when the button was
+    /// clicked, so what is written is what the user saw.
+    Picking { format: ExportFormat, text: String, dialog: PendingDialog },
+    /// A worker writes the file and commits the target; `Ok` carries the file's display name.
+    Writing { format: ExportFormat, rx: Receiver<Result<String, String>> },
+}
+
+#[derive(Debug)]
 pub struct CompositionPanelState {
     tab: CompositionTab,
     pub composed_text: String,
     notice: Option<CompositionNotice>,
+    export: Option<ExportStage>,
 }
 
 impl Default for CompositionPanelState {
@@ -231,6 +286,7 @@ impl Default for CompositionPanelState {
             tab: CompositionTab::Text,
             composed_text: no_items_text().to_string(),
             notice: None,
+            export: None,
         }
     }
 }
@@ -342,6 +398,7 @@ fn draw_text_tab(
         t!("translation.composition.output_placeholder"),
     );
 
+    poll_export(ui.ctx(), state);
     ui.horizontal_wrapped(|ui| {
         if ui.button(t!("translation.composition.copy_output_button")).clicked() {
             ui.ctx().copy_text(state.composed_text.clone());
@@ -350,19 +407,15 @@ fn draw_text_tab(
         if ui.button(t!("translation.common.refresh_button")).clicked() {
             actions.request_rebuild = true;
         }
-        if ui.button(t!("translation.composition.export_txt_button")).clicked() {
-            match export_txt(project, &state.composed_text) {
-                Ok(Some(path)) => state.set_info(tf!("translation.composition.txt_saved_status", path = path.display())),
-                Ok(None) => {}
-                Err(err) => state.set_error(tf!("translation.composition.txt_save_error", err = err)),
-            }
+        let export_idle = state.export.is_none();
+        if ui.add_enabled(export_idle, egui::Button::new(t!("translation.composition.export_txt_button"))).clicked() {
+            start_export(ui.ctx(), project, state, ExportFormat::Txt);
         }
-        if ui.button(t!("translation.composition.export_docx_button")).clicked() {
-            match export_docx(project, &state.composed_text) {
-                Ok(Some(path)) => state.set_info(tf!("translation.composition.docx_saved_status", path = path.display())),
-                Ok(None) => {}
-                Err(err) => state.set_error(tf!("translation.composition.docx_save_error", err = err)),
-            }
+        if ui.add_enabled(export_idle, egui::Button::new(t!("translation.composition.export_docx_button"))).clicked() {
+            start_export(ui.ctx(), project, state, ExportFormat::Docx);
+        }
+        if !export_idle {
+            ui.spinner();
         }
     });
 
@@ -1431,63 +1484,90 @@ fn textedit_height(ui: &egui::Ui, rows: usize) -> f32 {
     line_h * rows as f32 + 12.0
 }
 
-fn export_txt(project: &ProjectData, text: &str) -> Result<Option<PathBuf>, String> {
-    let Some(path) = select_export_path(project, "txt", "Text files") else {
-        return Ok(None);
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    fs::write(&path, text).map_err(|err| err.to_string())?;
-    Ok(Some(path))
-}
-
-fn export_docx(project: &ProjectData, text: &str) -> Result<Option<PathBuf>, String> {
-    let Some(path) = select_export_path(project, "docx", "Word document") else {
-        return Ok(None);
-    };
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    save_simple_docx(&path, text)?;
-    Ok(Some(path))
-}
-
-/// Opens the native "save as" dialog for a composed-text export and returns the
-/// chosen path (with the extension enforced), or `None` if the user cancelled.
+/// Opens the save dialog of a `format` export without blocking.
 ///
 /// The dialog starts in `ProjectData::user_facing_dir`: the chapter directory of a project,
 /// the opened image's folder in a single-image session — never that session's scratch
 /// directory, which is deleted on exit.
-///
-/// Web stub: there is no native save dialog in the browser build, so this returns
-/// `None` and the export becomes a no-op (browser download export is added
-/// later). The `_` parameters keep the signature identical on both targets.
-#[cfg(not(target_arch = "wasm32"))]
-fn select_export_path(project: &ProjectData, ext: &str, filter_name: &str) -> Option<PathBuf> {
-    let mut path = FileDialog::new()
-        .set_directory(project.user_facing_dir())
-        .set_file_name(format!("{DEFAULT_EXPORT_NAME}.{ext}"))
-        .add_filter(filter_name, &[ext])
-        .save_file()?;
-    ensure_path_extension(&mut path, ext);
-    Some(path)
+fn start_export(ctx: &egui::Context, project: &ProjectData, state: &mut CompositionPanelState, format: ExportFormat) {
+    let extension = format.extension();
+    let request = FileDialogRequest::new(DialogKind::SaveFile)
+        .start_dir(&project.user_facing_dir())
+        .suggested_name(format!("{DEFAULT_EXPORT_NAME}.{extension}"))
+        .filter(format.filter_label(), &[extension]);
+    let repaint_ctx = ctx.clone();
+    let dialog = file_dialog::request(request, Some(Arc::new(move || repaint_ctx.request_repaint())));
+    state.export = Some(ExportStage::Picking { format, text: state.composed_text.clone(), dialog });
 }
 
-#[cfg(target_arch = "wasm32")]
-fn select_export_path(_project: &ProjectData, _ext: &str, _filter_name: &str) -> Option<PathBuf> {
-    None
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn ensure_path_extension(path: &mut PathBuf, ext: &str) {
-    let has_ext = path
-        .extension()
-        .and_then(|v| v.to_str())
-        .is_some_and(|v| v.eq_ignore_ascii_case(ext));
-    if !has_ext {
-        path.set_extension(ext);
+/// Advances the export in flight: a closed dialog hands its target to the write worker, a
+/// finished worker becomes the notice. A cancelled dialog ends the export silently.
+fn poll_export(ctx: &egui::Context, state: &mut CompositionPanelState) {
+    match state.export.take() {
+        None => {}
+        Some(ExportStage::Picking { format, text, mut dialog }) => match dialog.poll() {
+            None => state.export = Some(ExportStage::Picking { format, text, dialog }),
+            Some(Ok(None)) => {}
+            Some(Ok(Some(picked))) => match picked.into_save_target() {
+                Some(target) => state.export = Some(spawn_export_writer(ctx, format, target, text)),
+                // `SaveFile` always answers with a target (`Picked` contract); anything else is a
+                // platform-layer bug, logged and treated as a cancel.
+                None => ms_log::runtime_log::log_error("[translation] composition export: save dialog returned no target for a SaveFile request"),
+            },
+            Some(Err(err)) => {
+                ms_log::runtime_log::log_warn(format!("[translation] composition {format:?} export: save dialog failed: {err:?}"));
+                state.set_error(format.save_error(&err.user_message()));
+            }
+        },
+        Some(ExportStage::Writing { format, rx }) => match rx.try_recv() {
+            Ok(Ok(name)) => state.set_info(format.saved_status(&name)),
+            Ok(Err(err)) => state.set_error(format.save_error(&err)),
+            Err(TryRecvError::Empty) => state.export = Some(ExportStage::Writing { format, rx }),
+            Err(TryRecvError::Disconnected) => {
+                ms_log::runtime_log::log_error(format!("[translation] composition {format:?} export: writer thread ended without a result"));
+                state.set_error(format.save_error(t!("translation.composition.export_worker_lost_error")));
+            }
+        },
     }
+}
+
+/// Starts the worker that writes `text` to `target` and commits it; the GUI is repainted when
+/// it finishes.
+fn spawn_export_writer(ctx: &egui::Context, format: ExportFormat, target: SaveTarget, text: String) -> ExportStage {
+    let (tx, rx) = mpsc::channel();
+    let repaint_ctx = ctx.clone();
+    ms_thread::spawn(move || {
+        let result = write_export(format, target, &text);
+        if let Err(err) = &result {
+            ms_log::runtime_log::log_warn(format!("[translation] composition {format:?} export failed: {err}"));
+        }
+        // The receiver is gone only when the panel state was dropped (project closed); there is
+        // nobody left to report to.
+        if tx.send(result).is_err() {
+            ms_log::runtime_log::log_info("[translation] composition export finished after its panel was dropped");
+        }
+        repaint_ctx.request_repaint();
+    });
+    ExportStage::Writing { format, rx }
+}
+
+/// Writes the COMPLETE export to the target's write path, then commits the target (a blocking
+/// stream on Android, so this runs on a worker). Returns the file's display name.
+///
+/// # Errors
+/// The OS error of the directory creation or the write, or the localized commit failure.
+fn write_export(format: ExportFormat, target: SaveTarget, text: &str) -> Result<String, String> {
+    let path = target.write_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    match format {
+        ExportFormat::Txt => fs::write(path, text).map_err(|err| err.to_string())?,
+        ExportFormat::Docx => save_simple_docx(path, text)?,
+    }
+    let name = target.display_name().to_owned();
+    target.commit().map_err(|err| err.user_message())?;
+    Ok(name)
 }
 
 fn save_simple_docx(path: &Path, text: &str) -> Result<(), String> {
@@ -1658,8 +1738,10 @@ fn crc32(data: &[u8]) -> u32 {
 mod tests {
     use super::{
         ComposedItem, CompositionPanelOptions, CompositionSourceMode, EmitParams, compose_plain,
-        emit_composition_items, image_bubble_area_translations, is_hint_bubble, is_image_bubble,
+        ExportFormat, emit_composition_items, image_bubble_area_translations, is_hint_bubble,
+        is_image_bubble, write_export,
     };
+    use ms_platform::file_dialog::SaveTarget;
     use ms_project::{Bubble, CanvasSettings, ProjectData, ProjectPaths};
     use serde_json::{Map, Value, json};
     use std::path::PathBuf;
@@ -2166,5 +2248,33 @@ mod tests {
         // No translation at all -> no lines.
         let empty = image_bubble_area_translations(&image_bubble("  ", Map::new()));
         assert!(empty.is_empty());
+    }
+
+    /// The export writer writes the whole file to the target, creating missing parents, and
+    /// reports the target's display name; DOCX output is a zip container.
+    #[test]
+    fn write_export_writes_txt_and_docx_into_the_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let txt_path = dir.path().join("nested").join("out.txt");
+        let name = write_export(ExportFormat::Txt, SaveTarget::for_test(txt_path.clone()), "line 1\nline 2").expect("txt export");
+        assert_eq!(name, "out.txt");
+        assert_eq!(std::fs::read_to_string(&txt_path).expect("read txt"), "line 1\nline 2");
+
+        let docx_path = dir.path().join("out.docx");
+        let name = write_export(ExportFormat::Docx, SaveTarget::for_test(docx_path.clone()), "текст").expect("docx export");
+        assert_eq!(name, "out.docx");
+        let bytes = std::fs::read(&docx_path).expect("read docx");
+        assert!(bytes.starts_with(b"PK\x03\x04"), "a docx is a zip archive");
+    }
+
+    /// A write that cannot happen is an error, never a silent success.
+    #[test]
+    fn write_export_reports_an_unwritable_target() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // The target's parent is a FILE, so neither the directory nor the file can be created.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"x").expect("blocker file");
+        let result = write_export(ExportFormat::Txt, SaveTarget::for_test(blocker.join("out.txt")), "x");
+        assert!(result.is_err());
     }
 }

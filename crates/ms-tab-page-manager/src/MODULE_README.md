@@ -70,8 +70,10 @@ draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerA
   shared cap. Being index-keyed, they are dropped by `clear_model_clean_thumbs`,
   which `notify_pages_changed` must call. Clean FILES (detached/problem) use the
   path pipeline, which keeps alpha; draw both over `ms_theme::checkerboard`.
-- The native `rfd` file picker for "insert pages" is blocking and therefore
-  runs on its own worker thread; the wasm build resolves it as a cancelled pick.
+- File dialogs ("insert pages", "replace clean from file") go through
+  `ms_platform::file_dialog::request`: the GUI keeps the `PendingDialog` and polls it per
+  frame, the trigger stays disabled while it is open, and a platform without a dialog answers
+  with a typed error shown in the tab's error line (never a silent cancel).
 - `clean.rs` owns a second, serial worker for `clean_assign` inventory scans, image
   decoding, and every clean-file mutation. It receives immutable project snapshots
   (`CleanJobContext`: epoch, paths, pages), locks `CleanOverlaysModel` only briefly (never across
@@ -114,7 +116,7 @@ draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerA
   converts its `LayoutRect`s.
 - `dialogs.rs`: insert / create-blank / delete-confirm dialogs, the
   `InsertPosition -> at` resolution and the blank-page default-size rule
-  (`default_blank_size`, unit-tested), the background file picker, and the
+  (`default_blank_size`, unit-tested), the two file-dialog requests, and the
   `PageManagerDialog` enum every dialog (stitch, split and crop included) is
   dispatched through.
 - `thumbs.rs`: worker thread + generic LRU `ThumbCache` (unit-tested) + the

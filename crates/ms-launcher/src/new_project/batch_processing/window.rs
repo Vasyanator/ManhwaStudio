@@ -18,8 +18,9 @@ Key structures:
 - FileTaskEvent — result of one off-thread file dialog / filesystem task
 
 File dialogs and the GUI thread:
-A native file dialog blocks until the user answers it, and reading or writing a graph is
-filesystem work; neither may run on the GUI thread (`CLAUDE.md` §5). Both therefore live in
+A dialog opened with `ms_platform::file_dialog::pick_blocking` blocks until the user answers
+it, and reading or writing a graph is filesystem work; neither may run on the GUI thread
+(`CLAUDE.md` §5). Both therefore live in
 `spawn_graph_save` / `spawn_graph_load` / `spawn_node_path_pick`, which return a
 `Receiver<FileTaskEvent>` that `poll_file_task` drains once per frame — the same
 dialog-off-thread shape used by the cleaning tab's watermark library window. At most one such
@@ -31,10 +32,11 @@ window and is NOT recreated between openings, so `on_window_closed` drops the in
 receiver on both close paths: the worker's `send` then fails (which it already reports as a log
 line) instead of parking an answer that the next opening would apply to a different graph.
 
-Only the dialog itself differs between targets (`pick_path`): the web build has no `rfd`, so it
-answers with a ready-made failure event, which the task bodies report rather than silently
-treating as a cancellation. Everything else — the worker, the channel, the events and the poll —
-is one code path on every target.
+A target without a dialog (web; Android directory paths) answers through `ms_platform` with a
+typed `FileDialogError`, which `pick` turns into a failure event that the task bodies report
+rather than silently treating as a cancellation. The worker, the channel, the events and the
+poll are one code path on every target. A graph is saved through the picked `SaveTarget`:
+written completely, then committed on the same worker.
 
 Notes:
 The window is opened as a native `ctx.show_viewport_immediate()` from
@@ -48,6 +50,8 @@ use super::graph::{GraphModel, GraphVariable};
 use super::node_defs::NodeDefs;
 use super::types::{DataType, NodeParams};
 use egui::{Color32, RichText, ScrollArea, Ui, ViewportClass};
+use ms_platform::PlatformFeature;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, Picked};
 use ms_thread as thread;
 use ms_widgets::WheelComboBox;
 use std::path::PathBuf;
@@ -703,9 +707,9 @@ impl BatchProcessingWindowState {
 
 // ─── File task workers ────────────────────────────────────────────────────────
 
-/// Which native dialog a file task needs.
+/// Which dialog a file task needs.
 ///
-/// Only [`pick_path`] interprets it; every other part of a task body is target-independent.
+/// Only [`pick`] interprets it; every other part of a task body is target-independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickKind {
     /// Where the graph JSON should be written.
@@ -759,63 +763,57 @@ where
     rx
 }
 
-/// Ask the user for a path with the native dialog for `kind`, blocking until they answer.
+/// Ask the user with the dialog for `kind`, blocking until they answer.
 ///
 /// Called only from inside a file-task worker — it blocks, so it must never reach the GUI
-/// thread (`CLAUDE.md` §5). Returns `Ok(Some(path))` for a choice and `Ok(None)` for a
-/// dismissed dialog; `Err` carries a ready-made failure event for a build that has no dialog at
-/// all. Those two are deliberately distinct outcomes: reporting "no dialog exists here" as a
-/// cancellation would be the silent fallback `CLAUDE.md` §6 forbids. `what` and
-/// `unsupported_message` describe the capability for that case and are unused on native.
-#[cfg(not(target_arch = "wasm32"))]
-fn pick_path(
-    kind: PickKind,
-    _what: &str,
-    _unsupported_message: &str,
-) -> Result<Option<PathBuf>, FileTaskEvent> {
-    Ok(match kind {
-        PickKind::GraphSaveTarget => rfd::FileDialog::new()
-            .add_filter(t!("launcher.batch.graph_file_filter"), &["json"])
-            .save_file(),
-        PickKind::GraphSource => rfd::FileDialog::new()
-            .add_filter(t!("launcher.batch.graph_file_filter"), &["json"])
-            .pick_file(),
-        PickKind::TextFile => rfd::FileDialog::new()
-            .add_filter(t!("launcher.batch.text_file_label"), &["txt"])
-            .pick_file(),
-        PickKind::Directory => rfd::FileDialog::new().pick_folder(),
+/// thread (`CLAUDE.md` §5). Returns `Ok(Some(picked))` for a choice (its variant matches the
+/// `DialogKind` of `kind`) and `Ok(None)` for a dismissed dialog; `Err` carries a ready-made
+/// failure event when the dialog itself failed or does not exist on this target. Those are
+/// deliberately distinct outcomes: reporting "no dialog exists here" as a cancellation would be
+/// the silent fallback `CLAUDE.md` §6 forbids. `what` names the task in the log line.
+fn pick(kind: PickKind, what: &str) -> Result<Option<Picked>, FileTaskEvent> {
+    let request = match kind {
+        PickKind::GraphSaveTarget => FileDialogRequest::new(DialogKind::SaveFile).filter(t!("launcher.batch.graph_file_filter"), &["json"]),
+        PickKind::GraphSource => FileDialogRequest::new(DialogKind::OpenFile).filter(t!("launcher.batch.graph_file_filter"), &["json"]),
+        PickKind::TextFile => FileDialogRequest::new(DialogKind::OpenFile).filter(t!("launcher.batch.text_file_label"), &["txt"]),
+        PickKind::Directory => FileDialogRequest::new(DialogKind::PickDirectoryPath),
+    };
+    file_dialog::pick_blocking(request).map_err(|err| FileTaskEvent::Failed {
+        user_message: err.user_message(),
+        log_message: format!("{what} dialog failed: {err:?}"),
     })
 }
 
-/// Web build: `rfd` is native-only, so there is no dialog to open and the missing capability is
-/// reported instead of being passed off as a cancellation the user never made.
-#[cfg(target_arch = "wasm32")]
-fn pick_path(
-    _kind: PickKind,
-    what: &str,
-    unsupported_message: &str,
-) -> Result<Option<PathBuf>, FileTaskEvent> {
-    Err(FileTaskEvent::Failed {
-        user_message: unsupported_message.to_string(),
-        log_message: format!("{what} needs a native file dialog, which this build does not have"),
-    })
+/// The failure event for a dialog answer whose variant does not match its kind. Unreachable
+/// under the ms-platform contract; reported instead of being treated as a cancellation.
+fn mismatched_pick(what: &str) -> FileTaskEvent {
+    FileTaskEvent::Failed {
+        user_message: t!("launcher.batch.file_task_failed_error").to_string(),
+        log_message: format!("{what} dialog returned a result of another kind"),
+    }
 }
 
 /// Worker body for "save graph": dialog (only when no path is remembered), serialize, write.
 ///
 /// `json` is the already-taken snapshot of the model, so the worker never touches live UI
-/// state. `known_path` is the path a previous save settled on; when it is `Some` the save is
-/// silent and no dialog is shown, which is the behaviour the toolbar has always had.
+/// state. `known_path` is the path a previous save or load settled on; when it is `Some` and
+/// the platform keeps picked paths usable in place, the save is silent and no dialog is shown,
+/// which is the behaviour the toolbar has always had on desktop.
 fn spawn_graph_save(json: serde_json::Value, known_path: Option<PathBuf>) -> Receiver<FileTaskEvent> {
+    // Without `PersistentDirectoryPicker` (Android) a remembered path is a staging file or an
+    // app-storage copy, not the user's document: writing it in place would publish nothing, so
+    // every save goes through the SaveFile dialog and its commit instead.
+    let known_path = known_path.filter(|_| PlatformFeature::PersistentDirectoryPicker.is_available());
     spawn_file_task("graph save", move || {
-        let path = match known_path {
-            Some(path) => path,
-            None => match pick_path(
-                PickKind::GraphSaveTarget,
-                "graph save",
-                t!("launcher.batch.save_web_unsupported"),
-            ) {
-                Ok(Some(path)) => path,
+        // `target` is the picked destination, published by `commit` after the write; a
+        // remembered `known_path` is written in place and needs no commit.
+        let (path, target) = match known_path {
+            Some(path) => (path, None),
+            None => match pick(PickKind::GraphSaveTarget, "graph save") {
+                Ok(Some(picked)) => match picked.into_save_target() {
+                    Some(target) => (target.write_path().to_path_buf(), Some(target)),
+                    None => return mismatched_pick("graph save"),
+                },
                 Ok(None) => return FileTaskEvent::Cancelled,
                 Err(event) => return event,
             },
@@ -829,25 +827,32 @@ fn spawn_graph_save(json: serde_json::Value, known_path: Option<PathBuf>) -> Rec
                 };
             }
         };
-        match std::fs::write(&path, text) {
-            Ok(()) => FileTaskEvent::GraphSaved { path },
-            Err(err) => FileTaskEvent::Failed {
+        if let Err(err) = std::fs::write(&path, text) {
+            return FileTaskEvent::Failed {
                 user_message: tf!("launcher.batch.save_file_error", err = err),
                 log_message: format!("save graph to '{}': {err}", path.display()),
-            },
+            };
         }
+        if let Some(target) = target
+            && let Err(err) = target.commit()
+        {
+            return FileTaskEvent::Failed {
+                user_message: err.user_message(),
+                log_message: format!("commit saved graph '{}': {err:?}", path.display()),
+            };
+        }
+        FileTaskEvent::GraphSaved { path }
     })
 }
 
 /// Worker body for "load graph": dialog, read, JSON parse.
 fn spawn_graph_load() -> Receiver<FileTaskEvent> {
     spawn_file_task("graph load", || {
-        let path = match pick_path(
-            PickKind::GraphSource,
-            "graph load",
-            t!("launcher.batch.load_web_unsupported"),
-        ) {
-            Ok(Some(path)) => path,
+        let path = match pick(PickKind::GraphSource, "graph load") {
+            Ok(Some(picked)) => match picked.into_file() {
+                Some(file) => file.path,
+                None => return mismatched_pick("graph load"),
+            },
             Ok(None) => return FileTaskEvent::Cancelled,
             Err(event) => return event,
         };
@@ -877,18 +882,23 @@ fn spawn_node_path_pick(node_id: u32, purpose: NodePathPurpose) -> Receiver<File
             NodePathPurpose::StartStringFile => PickKind::TextFile,
             NodePathPurpose::SaveFolderDirectory => PickKind::Directory,
         };
-        match pick_path(
-            kind,
-            "node path pick",
-            t!("launcher.batch.pick_path_web_unsupported"),
-        ) {
-            Ok(Some(path)) => FileTaskEvent::NodePathPicked {
+        let picked = match pick(kind, "node path pick") {
+            Ok(Some(picked)) => picked,
+            Ok(None) => return FileTaskEvent::Cancelled,
+            Err(event) => return event,
+        };
+        let path = match kind {
+            PickKind::TextFile => picked.into_file().map(|file| file.path),
+            PickKind::Directory => picked.into_directory_path(),
+            PickKind::GraphSaveTarget | PickKind::GraphSource => None,
+        };
+        match path {
+            Some(path) => FileTaskEvent::NodePathPicked {
                 node_id,
                 purpose,
                 path,
             },
-            Ok(None) => FileTaskEvent::Cancelled,
-            Err(event) => event,
+            None => mismatched_pick("node path pick"),
         }
     })
 }

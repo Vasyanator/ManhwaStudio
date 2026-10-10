@@ -16,6 +16,12 @@ not carry its inline tags back (`advanced_form_tags_lost_status`). Both are
 drawn here, and not in the status row above it, because that row belongs to
 the preview render and is overwritten by it.
 
+The right-hand column's file dialogs (export destination, image file) are non-blocking
+`ms_platform::file_dialog` requests (`export_dialog_request`, `image_file_request`): the
+pending handle lives in `TypingCreatePanelState::right_section_dialog`, is polled each frame
+by `poll_right_section_dialog`, and both triggers stay disabled while it is open. A dialog
+failure is shown in the panel's status line.
+
 Notes:
 Extracted verbatim from panel.rs. Methods are pub(super) because
 TypingCreatePanelState is used only inside panel.rs. use super::* pulls in
@@ -26,8 +32,98 @@ use super::*;
 // The per-render font diagnostic is mapped to colors/wording in one place only
 // (`create_presets.rs`, together with the static coverage tooltip).
 use super::create_presets::font_fallback_status_lines;
+use ms_platform::file_dialog::{self, DialogKind, DialogResult, FileDialogRequest, PendingDialog};
+
+/// A file dialog opened by the create panel's right-hand column.
+pub(super) enum TypingPanelDialog {
+    /// The export destination dialog; `kind` is the destination SHAPE it was opened for.
+    Export { kind: TypingExportDialogKind, dialog: PendingDialog },
+    /// The «pick image from file» dialog.
+    ImageFile(PendingDialog),
+}
+
+impl TypingPanelDialog {
+    /// `None` while the dialog is open; its result exactly once.
+    fn poll(&mut self) -> Option<DialogResult> {
+        match self {
+            TypingPanelDialog::Export { dialog, .. } | TypingPanelDialog::ImageFile(dialog) => dialog.poll(),
+        }
+    }
+}
+
+/// The export destination dialog for `format`: a folder for the per-page formats, a `.pdf`
+/// file (prefilled from `base_name`) for PDF. Returns the destination kind with the request so
+/// the result is mapped by the same decision that chose the dialog.
+pub(super) fn export_dialog_request(format: TypingExportFormat, default_dir: Option<&Path>, base_name: &str) -> (TypingExportDialogKind, FileDialogRequest) {
+    let kind = export_dialog_kind(format);
+    let request = match kind {
+        TypingExportDialogKind::Folder => FileDialogRequest::new(DialogKind::SaveIntoFolder),
+        TypingExportDialogKind::PdfFile => FileDialogRequest::new(DialogKind::SaveFile)
+            .suggested_name(pdf_export_file_name(base_name))
+            .filter(t!("typing.export.pdf_files_label"), &["pdf"]),
+    };
+    let request = match default_dir {
+        Some(dir) => request.start_dir(dir),
+        None => request,
+    };
+    (kind, request)
+}
+
+/// The «pick image from file» dialog, starting in `default_dir` when known.
+pub(super) fn image_file_request(default_dir: Option<&Path>) -> FileDialogRequest {
+    let request = FileDialogRequest::new(DialogKind::OpenFile)
+        .filter(t!("typing.export.images_label"), &["png", "jpg", "jpeg", "webp", "bmp"]);
+    match default_dir {
+        Some(dir) => request.start_dir(dir),
+        None => request,
+    }
+}
 
 impl TypingCreatePanelState {
+
+    /// Opens `request` without blocking and keeps its handle; `wrap` names what it is for.
+    fn open_right_section_dialog(&mut self, ui: &egui::Ui, request: FileDialogRequest, wrap: impl FnOnce(PendingDialog) -> TypingPanelDialog) {
+        let repaint_ctx = ui.ctx().clone();
+        let dialog = file_dialog::request(request, Some(Arc::new(move || repaint_ctx.request_repaint())));
+        self.right_section_dialog = Some(wrap(dialog));
+    }
+
+    /// Turns a closed right-column dialog into this frame's action: an export destination or an
+    /// image-file request. A cancel is a no-op; a failure lands in the status line.
+    fn poll_right_section_dialog(&mut self, out: &mut TypingRightSectionActions) {
+        let Some(result) = self.right_section_dialog.as_mut().and_then(TypingPanelDialog::poll) else {
+            return;
+        };
+        let Some(dialog) = self.right_section_dialog.take() else {
+            return;
+        };
+        let picked = match result {
+            Ok(Some(picked)) => picked,
+            Ok(None) => return,
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!("[typing] create panel file dialog failed: {err:?}"));
+                self.status_line = err.user_message();
+                return;
+            }
+        };
+        // The `Picked` variant always matches the request kind; a mismatch is a platform-layer
+        // bug, logged and treated as a cancel.
+        let mismatch = || ms_log::runtime_log::log_error("[typing] create panel file dialog answered with the wrong result kind");
+        match dialog {
+            TypingPanelDialog::Export { kind: TypingExportDialogKind::Folder, .. } => match picked.into_folder_target() {
+                Some(target) => out.export_destination = Some(TypingExportDestination::Folder(target)),
+                None => mismatch(),
+            },
+            TypingPanelDialog::Export { kind: TypingExportDialogKind::PdfFile, .. } => match picked.into_save_target() {
+                Some(target) => out.export_destination = Some(TypingExportDestination::PdfFile(target)),
+                None => mismatch(),
+            },
+            TypingPanelDialog::ImageFile(_) => match picked.into_file() {
+                Some(file) => out.create_image_request = Some(TypingCreateImageRequest::FromFile(file.path)),
+                None => mismatch(),
+            },
+        }
+    }
 
     pub(super) fn draw_preview_section(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
@@ -564,6 +660,9 @@ impl TypingCreatePanelState {
             create_image_request: None,
             changed_strict_pixel_movement: None,
         };
+        self.poll_right_section_dialog(&mut out);
+        // One dialog at a time: both file-dialog triggers wait while one is open.
+        let dialog_open = self.right_section_dialog.is_some();
         ui.vertical(|ui| {
             let mask_button_label = if mask_panel_open {
                 t!("typing.export.close_clip_mask_button")
@@ -615,30 +714,13 @@ impl TypingCreatePanelState {
                         let caption = ms_i18n::resolve_key(export_button_label_key(export_format));
                         let label = egui::RichText::new(caption)
                             .color(Color32::from_rgb(230, 230, 230));
-                        ui.add(egui::Button::new(label).fill(Color32::from_rgb(46, 140, 56)))
+                        ui.add_enabled(!dialog_open, egui::Button::new(label).fill(Color32::from_rgb(46, 140, 56)))
                             .clicked()
                     })
                     .inner;
                 if clicked {
-                    // Native picker; on web there is no OS dialog (folder export is handled
-                    // by a zip download in the web-glue phase).
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let mut dialog = FileDialog::new();
-                        if let Some(path) = export_default_dir {
-                            dialog = dialog.set_directory(path);
-                        }
-                        out.export_destination = match export_dialog_kind(export_format) {
-                            TypingExportDialogKind::Folder => {
-                                dialog.pick_folder().map(TypingExportDestination::Folder)
-                            }
-                            TypingExportDialogKind::PdfFile => dialog
-                                .set_file_name(pdf_export_file_name(export_base_name))
-                                .add_filter(t!("typing.export.pdf_files_label"), &["pdf"])
-                                .save_file()
-                                .map(TypingExportDestination::PdfFile),
-                        };
-                    }
+                    let (kind, request) = export_dialog_request(export_format, export_default_dir, export_base_name);
+                    self.open_right_section_dialog(ui, request, |dialog| TypingPanelDialog::Export { kind, dialog });
                 }
             }
             if self.preview_enabled {
@@ -646,23 +728,11 @@ impl TypingCreatePanelState {
                 {
                     out.create_image_request = Some(TypingCreateImageRequest::FromClipboard);
                 }
-                if ui.button(t!("typing.export.pick_image_from_file_button")).clicked() {
-                    // Native file picker; web file selection arrives via an
-                    // <input type=file> in the web-glue phase.
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let mut dialog = FileDialog::new();
-                        if let Some(path) = export_default_dir {
-                            dialog = dialog.set_directory(path);
-                        }
-                        if let Some(path) = dialog
-                            .add_filter(t!("typing.export.images_label"), &["png", "jpg", "jpeg", "webp", "bmp"])
-                            .pick_file()
-                        {
-                            out.create_image_request =
-                                Some(TypingCreateImageRequest::FromFile(path));
-                        }
-                    }
+                if ui
+                    .add_enabled(!dialog_open, egui::Button::new(t!("typing.export.pick_image_from_file_button")))
+                    .clicked()
+                {
+                    self.open_right_section_dialog(ui, image_file_request(export_default_dir), TypingPanelDialog::ImageFile);
                 }
             }
             if self.preview_enabled {
@@ -884,5 +954,33 @@ fn draw_repaginate_block(
 
     if changed {
         out.changed_repaginate = Some(settings);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The export dialog follows the destination SHAPE of the format: a folder to write into
+    /// for the per-page formats, a `.pdf` save for PDF (filtered to pdf only).
+    #[test]
+    fn export_dialog_request_matches_the_destination_kind() {
+        for format in [TypingExportFormat::Png, TypingExportFormat::Psd] {
+            let (kind, request) = export_dialog_request(format, None, "Тайтл 1");
+            assert_eq!(kind, TypingExportDialogKind::Folder);
+            assert_eq!(request.kind(), DialogKind::SaveIntoFolder);
+        }
+        let (kind, request) = export_dialog_request(TypingExportFormat::Pdf, Some(Path::new("/projects/t")), "Тайтл 1");
+        assert_eq!(kind, TypingExportDialogKind::PdfFile);
+        assert_eq!(request.kind(), DialogKind::SaveFile);
+        assert_eq!(request.filters()[0].extensions(), ["pdf".to_string()]);
+    }
+
+    /// «Pick image from file» opens one existing image.
+    #[test]
+    fn image_file_request_opens_one_image() {
+        let request = image_file_request(None);
+        assert_eq!(request.kind(), DialogKind::OpenFile);
+        assert!(request.filters()[0].extensions().contains(&"webp".to_string()));
     }
 }

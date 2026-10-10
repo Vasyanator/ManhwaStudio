@@ -45,6 +45,9 @@ texture cached in the state) instead of the flat dark container fill: a fully tr
 a layer is otherwise indistinguishable from painted black ink and gets reported as a decoding bug.
 The read path deliberately disables `ReadOptions::total_memory_limit` — see the comment in
 `load_document_from_bytes`.
+The file and folder pickers go through the non-blocking `ms_platform::file_dialog` seam: the
+open `PendingDialog` lives in `pending_pick`, is polled every frame (`poll_pick`) and keeps the
+window busy, so the pick buttons stay disabled until it resolves.
 */
 
 use crate::new_project::project_io::{
@@ -62,8 +65,10 @@ use egui::{
 use ag_psd::psd::{Layer, PixelData, ReadOptions};
 use ag_psd::read_psd;
 use image::{RgbaImage, imageops};
+use ms_platform::file_dialog::{DialogResult, PendingDialog, Picked};
+// Opening a picker is native-only here (the web build keeps its own "unavailable" statuses).
 #[cfg(not(target_arch = "wasm32"))]
-use rfd::FileDialog;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, Waker};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::Read;
@@ -167,6 +172,8 @@ pub struct PsdImportWindowState {
     pending_scan: Option<Receiver<ScanWorkerResult>>,
     pending_preview: Option<Receiver<PreviewWorkerResult>>,
     pending_import: Option<Receiver<ImportWorkerResult>>,
+    /// The open file/folder picker; `Some` until its result is taken by `poll_pick`.
+    pending_pick: Option<PendingDialog>,
     open_after_save_requested: bool,
     queued_open: Option<OpenProjectSelection>,
 }
@@ -338,6 +345,7 @@ struct WorkerError {
     log_message: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum ScanRequest {
     Files { paths: Vec<PathBuf> },
     Folder { path: PathBuf },
@@ -406,6 +414,7 @@ impl PsdImportWindowState {
             pending_scan: None,
             pending_preview: None,
             pending_import: None,
+            pending_pick: None,
             open_after_save_requested: false,
             queued_open: None,
         };
@@ -419,6 +428,7 @@ impl PsdImportWindowState {
         let ctx_owned = ui.ctx().clone();
         let ctx = &ctx_owned;
         self.poll_catalog(ctx);
+        self.poll_pick();
         self.poll_scan(ctx);
         self.poll_preview(ctx);
         self.poll_import(ctx);
@@ -542,14 +552,15 @@ impl PsdImportWindowState {
     }
 
     fn show_top_bar(&mut self, ui: &mut Ui) {
+        let ctx = ui.ctx().clone();
         ui.horizontal_wrapped(|ui| {
             if button_sized(ui, t!("launcher.psd_import.open_psd_zip_button"), TOP_BUTTON_SIZE, !self.is_busy()).clicked()
             {
-                self.pick_files();
+                self.pick_files(&ctx);
             }
             if button_sized(ui, t!("launcher.psd_import.open_psd_folder_button"), TOP_BUTTON_SIZE, !self.is_busy()).clicked()
             {
-                self.pick_folder();
+                self.pick_folder(&ctx);
             }
             if button_sized(ui, t!("launcher.psd_import.swap_source_clean_button"), TOP_BUTTON_SIZE, !self.is_busy()).clicked()
             {
@@ -1071,40 +1082,51 @@ impl PsdImportWindowState {
         )
     }
 
+    /// Opens the multi-file picker (documents, images, archives) without blocking; the result
+    /// is applied by `poll_pick`. The pick buttons are disabled while it is open.
     #[cfg(not(target_arch = "wasm32"))]
-    fn pick_files(&mut self) {
-        let Some(paths) = FileDialog::new()
-            .set_directory(self.projects_root.clone())
-            .add_filter("Photoshop / Images / ZIP / RAR", PICKER_EXTENSIONS)
-            .pick_files()
-        else {
-            return;
-        };
-        self.start_scan(ScanRequest::Files { paths });
+    fn pick_files(&mut self, ctx: &Context) {
+        let request = FileDialogRequest::new(DialogKind::OpenFiles)
+            .start_dir(&self.projects_root)
+            .filter(t!("launcher.psd_import.picker_filter_label"), PICKER_EXTENSIONS);
+        self.pending_pick = Some(file_dialog::request(request, Some(repaint_waker(ctx))));
     }
 
-    /// Web stub: native file/folder pickers (`rfd`) have no browser equivalent.
+    /// Web stub: the browser build has no file picker.
     /// Reports the missing capability instead of opening a dialog.
     #[cfg(target_arch = "wasm32")]
-    fn pick_files(&mut self) {
+    fn pick_files(&mut self, _ctx: &Context) {
         self.status = ImportStatus::Error(t!("launcher.psd_import.select_files_web_unsupported").to_string());
     }
 
+    /// Opens the folder picker without blocking; see `pick_files`.
     #[cfg(not(target_arch = "wasm32"))]
-    fn pick_folder(&mut self) {
-        let Some(path) = FileDialog::new()
-            .set_directory(self.projects_root.clone())
-            .pick_folder()
-        else {
-            return;
-        };
-        self.start_scan(ScanRequest::Folder { path });
+    fn pick_folder(&mut self, ctx: &Context) {
+        let request = FileDialogRequest::new(DialogKind::OpenFolder).start_dir(&self.projects_root);
+        self.pending_pick = Some(file_dialog::request(request, Some(repaint_waker(ctx))));
     }
 
     /// Web stub twin of `pick_files` for the folder picker.
     #[cfg(target_arch = "wasm32")]
-    fn pick_folder(&mut self) {
+    fn pick_folder(&mut self, _ctx: &Context) {
         self.status = ImportStatus::Error(t!("launcher.psd_import.select_folder_web_unsupported").to_string());
+    }
+
+    /// Takes the result of the open picker, if it resolved: a pick starts the scan, a cancel
+    /// changes nothing, a dialog failure becomes the error status (details in the log).
+    fn poll_pick(&mut self) {
+        let Some(result) = self.pending_pick.as_mut().and_then(PendingDialog::poll) else {
+            return;
+        };
+        self.pending_pick = None;
+        match scan_request_from_pick(result) {
+            PickOutcome::Cancelled => {}
+            PickOutcome::Scan(request) => self.start_scan(request),
+            PickOutcome::Failed { user_message, log_message } => {
+                runtime_log::log_warn(format!("[launcher-psd] source picker failed: {log_message}"));
+                self.status = ImportStatus::Error(user_message);
+            }
+        }
     }
 
     fn start_scan(&mut self, request: ScanRequest) {
@@ -1661,7 +1683,8 @@ impl PsdImportWindowState {
     }
 
     fn is_busy(&self) -> bool {
-        self.pending_scan.is_some()
+        self.pending_pick.is_some()
+            || self.pending_scan.is_some()
             || self.pending_preview.is_some()
             || self.pending_import.is_some()
     }
@@ -3033,6 +3056,42 @@ fn clear_success_status(status: &mut ImportStatus) {
     }
 }
 
+/// What a resolved source picker asks the window to do.
+#[derive(Debug, PartialEq, Eq)]
+enum PickOutcome {
+    /// The user closed the dialog: nothing changes.
+    Cancelled,
+    /// Scan the picked files or folder.
+    Scan(ScanRequest),
+    /// The dialog failed: a localized status plus the typed error for the log.
+    Failed { user_message: String, log_message: String },
+}
+
+/// Maps a picker result onto the scan it starts. `OpenFiles` yields `Picked::Files` and
+/// `OpenFolder` `Picked::Folder` (the seam's contract); any other variant is a backend bug and
+/// is reported as a failure, never guessed at.
+fn scan_request_from_pick(result: DialogResult) -> PickOutcome {
+    match result {
+        Ok(None) => PickOutcome::Cancelled,
+        Ok(Some(Picked::Files(files))) => PickOutcome::Scan(ScanRequest::Files { paths: files.into_iter().map(|file| file.path).collect() }),
+        Ok(Some(Picked::Folder(path))) => PickOutcome::Scan(ScanRequest::Folder { path }),
+        Ok(Some(other @ (Picked::SaveTarget(_) | Picked::FolderTarget(_) | Picked::DirectoryPath(_)))) => PickOutcome::Failed {
+            user_message: t!("launcher.psd_import.picker_error").to_string(),
+            log_message: format!("source picker returned an unexpected result: {other:?}"),
+        },
+        Err(error) => PickOutcome::Failed { user_message: error.user_message(), log_message: format!("{error:?}") },
+    }
+}
+
+/// Repaint callback for a dialog opened from this window: wakes the viewport it was opened
+/// from (the detached PSD window, or the launcher root when embedded).
+#[cfg(not(target_arch = "wasm32"))]
+fn repaint_waker(ctx: &Context) -> Waker {
+    let ctx = ctx.clone();
+    let viewport = ctx.viewport_id();
+    Arc::new(move || ctx.request_repaint_of(viewport))
+}
+
 fn button_sized(ui: &mut Ui, label: &str, size: egui::Vec2, enabled: bool) -> egui::Response {
     ui.add_enabled(enabled, Button::new(label).min_size(size))
 }
@@ -3046,7 +3105,25 @@ fn standard_dark_style() -> egui::Style {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayerImportType, LayerSource, PsdLayerRow, import_clean_filename_for_page, import_filename_for_page};
+    use super::{LayerImportType, LayerSource, PickOutcome, PsdLayerRow, ScanRequest, import_clean_filename_for_page, import_filename_for_page, scan_request_from_pick};
+    use ms_platform::file_dialog::{FileDialogError, Picked, PickedFile};
+    use std::path::PathBuf;
+
+    #[test]
+    fn picker_results_map_onto_scans() {
+        assert_eq!(scan_request_from_pick(Ok(None)), PickOutcome::Cancelled);
+        let file = PathBuf::from("/home/u/chapter/001.psd");
+        let files = Picked::Files(vec![PickedFile { path: file.clone(), display_name: "001.psd".to_owned() }]);
+        assert_eq!(scan_request_from_pick(Ok(Some(files))), PickOutcome::Scan(ScanRequest::Files { paths: vec![file] }));
+        let folder = PathBuf::from("/home/u/chapter");
+        assert_eq!(scan_request_from_pick(Ok(Some(Picked::Folder(folder.clone())))), PickOutcome::Scan(ScanRequest::Folder { path: folder.clone() }));
+        assert!(matches!(scan_request_from_pick(Ok(Some(Picked::DirectoryPath(folder)))), PickOutcome::Failed { .. }));
+        let PickOutcome::Failed { user_message, log_message } = scan_request_from_pick(Err(FileDialogError::Busy)) else {
+            panic!("a dialog error must fail the pick");
+        };
+        assert!(!user_message.is_empty());
+        assert!(log_message.contains("Busy"));
+    }
 
     #[test]
     fn import_filename_preserves_page_gaps() {

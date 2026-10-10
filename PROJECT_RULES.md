@@ -38,6 +38,12 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   `cargo test` / `clippy` at once OOM-killed a 60 GB machine and the whole session). The manager
   serializes verification across agents: every cargo invocation of a parallel agent is wrapped
   in one shared `flock <lockfile> cargo … -j 8`, and agents skip Serena (its server costs GBs).
+  With two or more such workers, use the deferred verification mode (global §2.1): a worker
+  runs only `flock <lockfile> cargo check -p <its crate> -j 8` (plus the same with
+  `cargo ndk -t arm64-v8a --platform 31` for Android-port work); the manager then runs
+  `cargo check-all`, `cargo clippy --workspace --all-targets -- -D warnings` (linux and
+  `--target x86_64-pc-windows-gnu`), `cargo test -p <every touched crate>` and the Android check,
+  each with `--message-format short` where cargo supports it.
 - Cargo unifies features across the workspace, so a crate can build inside it and fail alone.
   After changing a crate's manifest or features, also run
   `cargo clippy -p <crate> --all-targets --all-features --target <t> -- -D warnings` per target.

@@ -50,8 +50,6 @@ image.workspace = true
 egui-large-image.workspace = true
 # Typed public errors of the dialog and worker paths.
 thiserror.workspace = true
-
-# Native file dialogs behind "insert page from disk". Native-only: there is no `rfd` on
-# wasm, where the call sites are compiled out.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rfd.workspace = true
+# Non-blocking file dialogs behind "insert pages" and "replace clean from file". Compiled on
+# every target: a platform without a dialog answers with a typed error.
+ms-platform = { path = "../ms-platform" }

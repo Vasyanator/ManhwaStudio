@@ -18,11 +18,14 @@ Key structures:
 
 Notes:
 This module is shared infrastructure for the new-project flow and is intended to be reused by
-other launcher features that need project discovery or image export.
+other launcher features that need project discovery or image export. A save into a picked folder
+writes into its `FolderTarget::write_dir` and then calls `commit()` on the save worker (a no-op on
+desktop, the publish step where the picked folder is not directly writable).
 */
 
 use ms_config as config;
 use crate::state::OpenProjectSelection;
+use ms_platform::file_dialog::FolderTarget;
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -79,8 +82,9 @@ pub enum ProjectSaveTarget {
         chapter: String,
         alt_name: String,
     },
+    /// A folder picked with a `SaveIntoFolder` dialog: written into, then committed.
     Folder {
-        folder: PathBuf,
+        target: FolderTarget,
     },
 }
 
@@ -413,6 +417,15 @@ fn run_save_request(
             ),
         });
     }
+    // A picked folder is published only after every page was written; a failed publish is a
+    // failed save.
+    match request.target {
+        ProjectSaveTarget::Folder { target } => target.commit().map_err(|err| ProjectSaveError {
+            user_message: err.user_message(),
+            log_message: format!("failed to commit save folder '{}': {err:?}", resolved.output_dir.display()),
+        })?,
+        ProjectSaveTarget::ProjectSource { .. } | ProjectSaveTarget::AltVersion { .. } => {}
+    }
 
     Ok(ProjectSaveSuccess {
         target_dir: resolved.output_dir,
@@ -494,8 +507,8 @@ fn resolve_target(
                 open_selection: None,
             })
         }
-        ProjectSaveTarget::Folder { folder } => Ok(SaveResolvedTarget {
-            output_dir: folder.clone(),
+        ProjectSaveTarget::Folder { target } => Ok(SaveResolvedTarget {
+            output_dir: target.write_dir().to_path_buf(),
             open_selection: None,
         }),
     }
@@ -546,5 +559,28 @@ fn send_progress(
         .is_err()
     {
         ms_log::runtime_log::log_warn("[new-project] failed to send save progress to UI");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_save_writes_every_page_into_the_picked_folder() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let folder = root.path().join("picked");
+        let request = ProjectSaveRequest {
+            target: ProjectSaveTarget::Folder { target: FolderTarget::for_test(folder.clone()) },
+            images: vec![ProjectSaveImage { image: RgbaImage::new(2, 2) }; 2],
+        };
+        let (tx, _rx) = mpsc::channel();
+        let success = run_save_request(root.path(), request, tx)
+            .map_err(|err| std::io::Error::other(err.log_message))?;
+        assert_eq!(success.saved_images, 2);
+        assert_eq!(success.target_dir, folder);
+        assert!(folder.join("001.png").is_file() && folder.join("002.png").is_file());
+        assert!(success.open_selection.is_none());
+        Ok(())
     }
 }

@@ -126,7 +126,9 @@ Queries the panel arms are one-shot and independent of the run: `.status`
 - `progress.rs`: `Flux2Progress` and its `Mutex` discipline, the generation counter,
   `Flux2RateEstimator`, the streamed frame parsers and the byte/rate/duration formatters.
 - `session.rs`: `Flux2SessionState` (run channel + per-RUN undo stack), `Flux2RunPoll`,
-  `mask_for_run`, `apply_backend_flags` and `spawn_flux2_picker`.
+  `mask_for_run`, `apply_backend_flags` and `flux2_picker_request` (the dialog request per
+  picker purpose; the engine opens it through `ms_platform::file_dialog::request` and commits
+  the prompt-cache export's save target after the backend wrote it).
 - `wire.rs`: `Flux2RunInput` (the pixels of one run), `run_flux2_klein` with its OOM
   retry pass, `flux2_stream_call`, the `.status` and `.component_action` calls and their
   parsers, the prompt translation and the run request packing `flux2_run_request`

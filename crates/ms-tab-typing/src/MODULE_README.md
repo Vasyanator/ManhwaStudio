@@ -495,7 +495,11 @@ saving, and export.
     so workers only COMPOSE and a reorder buffer consumes by `page_idx`, throttled by
     `TypingComposeWindow` (Mutex+Condvar sliding window) to keep peak memory bounded.
     Incompatible combinations (PSD + re-pagination, format/destination mismatch) are hard
-    errors, never silently reinterpreted.
+    errors, never silently reinterpreted. The destination is the `ms_platform` dialog target
+    (`TypingExportDestination::{Folder(FolderTarget), PdfFile(SaveTarget)}`): the run writes
+    into its write location and `export_typing_pages` commits it on the export worker only
+    after the whole output was written; a failed run is never committed, and a commit failure
+    is reported like any other export failure.
   - `flatten_to_file.rs` (native only): the single-image «Сохранить» API of `TypingTabState` —
     `prepare_flatten_to_file` / `request_flatten_to_file` / `poll_flatten_to_file` and the typed
     `FlattenToFileRequest` / `FlattenReadiness` / `FlattenToFileReport` / `FlattenToFileError`

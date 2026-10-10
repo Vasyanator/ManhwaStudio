@@ -65,7 +65,9 @@ dependency list.
   autosave policy (interval + action threshold, live in `ms_config::autosave_policy`), typesetting
   language, startup monitor. Also owns the process-wide UI-scale slot
   (`ui_scale_percent` / `apply_ui_scale`) every `eframe::run_native` creator applies, and
-  the locale-catalog helpers the launcher's first-run language modal reuses.
+  the locale-catalog helpers the launcher's first-run language modal reuses. Its projects-root
+  "Browse" button uses the non-blocking `ms_platform::file_dialog` (`PickDirectoryPath`, polled
+  each frame) and is drawn only where `PlatformFeature::PersistentDirectoryPicker` is available.
 - `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,
   backend health readout, ORT crash-guard reset. The provider list is the UNION of the offline
   native set and the providers the backend reports; backend-only providers (e.g. MIGraphX,

@@ -24,6 +24,9 @@ pub enum AiApiError {
     KeyringUnavailable { detail: String },
     /// Key storage was requested on the web build, which has no credential store.
     KeyStoreWebUnavailable,
+    /// Key storage was requested on a platform without an OS credential store in this build
+    /// (Android); the typed capability answer for `PlatformFeature::CredentialStore`.
+    KeyStoreUnavailable(ms_platform::Unavailable),
     /// An empty (or whitespace-only) key was offered for storage.
     EmptyKey,
     /// Reading the stored key failed for a reason other than "no key stored".
@@ -73,6 +76,7 @@ impl AiApiError {
         match self {
             Self::KeyringUnavailable { detail } => tf!("ai_api.keys.keyring_unavailable_error", err = detail),
             Self::KeyStoreWebUnavailable => t!("ai_api.keys.web_unavailable_error").to_string(),
+            Self::KeyStoreUnavailable(unavailable) => unavailable.user_message(),
             Self::EmptyKey => t!("ai_api.keys.empty_key_error").to_string(),
             Self::ReadKey { service, detail } => tf!("ai_api.keys.read_error", service = service.label(), err = detail),
             Self::StoreKey { service, detail } => tf!("ai_api.keys.store_error", service = service.label(), err = detail),
@@ -125,6 +129,15 @@ mod tests {
         assert_eq!(AiApiError::EmptyKey.to_string(), AiApiError::EmptyKey.user_message());
         let named = AiApiError::StoreNamedKey { label: "Black Forest Labs", detail: "boom-detail".to_string() };
         assert_eq!(named.to_string(), named.user_message());
+    }
+
+    #[test]
+    fn key_store_unavailable_displays_the_platform_message() {
+        let unavailable = ms_platform::Unavailable::new(ms_platform::PlatformFeature::CredentialStore, ms_platform::UnavailableReason::NotOnThisPlatform);
+        let error = AiApiError::KeyStoreUnavailable(unavailable);
+        assert_eq!(error.to_string(), error.user_message());
+        assert_eq!(error.user_message(), unavailable.user_message());
+        assert_eq!(error.chat_failure_detail(), unavailable.user_message());
     }
 
     #[test]

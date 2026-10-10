@@ -5,9 +5,11 @@ Purpose:
 Cross-platform clipboard image reader shared by launcher and editor tabs.
 
 Main responsibilities:
-- read RGBA images from the system clipboard without blocking the GUI thread;
-- provide a single normalized image contract for callers;
-- add Linux fallbacks for common Wayland/X11 clipboard tools when `arboard` is insufficient.
+- read one RGBA image from the system clipboard through `ms_platform::clipboard`, trying the
+  image itself, then a copied file list, then an image path/URI in the text or HTML;
+- provide a single normalized (length-validated) image contract for callers;
+- add Linux fallbacks for common Wayland/X11 clipboard tools when the platform reader is
+  insufficient.
 
 Key structures:
 - ClipboardImage
@@ -16,25 +18,26 @@ Key functions:
 - read_image_from_clipboard()
 
 Dependencies:
-- `arboard` for primary clipboard access;
-- `image` for decoding fallback clipboard payloads on Linux;
+- `ms_platform::clipboard` for every system clipboard read (it decides per platform what is
+  readable: everything on desktop, text only on Android, nothing on wasm);
+- `image` for decoding referenced image files and Linux helper output;
 - `wl-paste`, `xclip`, `xsel` as optional runtime helpers on Linux.
 
 Notes:
 It lives in this crate because it is a host-environment probe like `screen_capture`, and
 because its callers now span crates (the typing tab, the translation tab, the launcher);
 the binary names it directly as `ms_sysprobe::paste_image`.
-This module returns RGBA pixels only. Callers remain responsible for spawning a worker thread
-and converting the result into egui or image crate types.
+This module returns RGBA pixels only and blocks (clipboard transfer, file decode, helper
+processes): callers remain responsible for running it on a worker thread and converting the
+result into egui or image crate types.
+A failed alternative representation is logged (never silently dropped) and the chain moves
+on; only the primary image-read error (plus the Linux fallback error) reaches the caller.
 */
 
-// Native-only clipboard backend; absent on the wasm target.
-#[cfg(not(target_arch = "wasm32"))]
-use arboard::Clipboard;
+use ms_log::runtime_log;
+use ms_platform::clipboard::{self, ClipboardError};
 #[cfg(target_os = "linux")]
 use std::env;
-// Path helpers are only used by the native clipboard readers below.
-#[cfg(not(target_arch = "wasm32"))]
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
@@ -51,6 +54,7 @@ enum LinuxClipboardSession {
 #[cfg(target_os = "linux")]
 type LinuxClipboardReader = fn() -> Result<Option<ClipboardImage>, String>;
 
+/// A clipboard image whose `rgba` is exactly `width * height * 4` bytes (rows top to bottom).
 #[derive(Debug, Clone)]
 pub struct ClipboardImage {
     pub width: usize,
@@ -58,23 +62,26 @@ pub struct ClipboardImage {
     pub rgba: Vec<u8>,
 }
 
-/// Reads an RGBA image from the system clipboard.
+/// Reads an RGBA image from the system clipboard. Blocking: call it from a worker.
 ///
-/// Native builds try `arboard`, then alternative clipboard representations, then
-/// Linux command-line helpers. On wasm there is no system clipboard image API, so
-/// this returns a clear error instead of a fake success.
-#[cfg(target_arch = "wasm32")]
+/// Tries the clipboard image, then the alternative representations (file list, an image
+/// path or `file://` URI in the text, then in the HTML), then — on Linux — the command-line
+/// helpers. A platform without a reader for some representation (Android: no image, file
+/// list or HTML; wasm: nothing) answers that step with a typed `Unavailable`, which is logged
+/// and skipped like any other failed alternative.
+///
+/// # Errors
+/// The localized message of the primary image-read failure; on Linux combined with the
+/// helper fallback's error.
 pub fn read_image_from_clipboard() -> Result<ClipboardImage, String> {
-    Err(t!("paste_image.web_unavailable").to_string())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn read_image_from_clipboard() -> Result<ClipboardImage, String> {
-    match read_image_from_clipboard_arboard() {
+    match read_image_from_platform_clipboard() {
         Ok(image) => Ok(image),
         Err(primary_error) => {
-            if let Ok(image) = read_image_from_clipboard_arboard_alternatives() {
-                return Ok(image);
+            match read_image_from_clipboard_alternatives() {
+                Ok(image) => return Ok(image),
+                Err(alternatives_error) => {
+                    runtime_log::log_info(format!("[paste-image] no image in the alternative clipboard representations: {alternatives_error}"));
+                }
             }
             #[cfg(target_os = "linux")]
             {
@@ -89,41 +96,62 @@ pub fn read_image_from_clipboard() -> Result<ClipboardImage, String> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn read_image_from_clipboard_arboard() -> Result<ClipboardImage, String> {
-    let mut clipboard = Clipboard::new().map_err(|err| err.to_string())?;
-    let image = clipboard.get_image().map_err(|err| err.to_string())?;
-    validate_rgba_image(image.width, image.height, image.bytes.into_owned())
+fn read_image_from_platform_clipboard() -> Result<ClipboardImage, String> {
+    let image = clipboard::read_image().map_err(|err| err.user_message())?;
+    validate_rgba_image(image.width, image.height, image.rgba)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn read_image_from_clipboard_arboard_alternatives() -> Result<ClipboardImage, String> {
-    let mut clipboard = Clipboard::new().map_err(|err| err.to_string())?;
-
-    if let Ok(paths) = clipboard.get().file_list()
-        && let Some(image) = paths
-            .into_iter()
-            .find_map(|path| read_image_from_path(path.as_path()).ok())
-    {
-        return Ok(image);
+/// Looks for an image file referenced by the non-image clipboard representations. Read
+/// failures of a representation are logged and the next one is tried; a referenced file that
+/// exists but cannot be decoded ends the search with that error (the user clearly copied it).
+fn read_image_from_clipboard_alternatives() -> Result<ClipboardImage, String> {
+    match clipboard::read_file_list() {
+        Ok(paths) => {
+            if let Some(image) = paths.into_iter().find_map(|path| read_image_from_path(path.as_path()).ok()) {
+                return Ok(image);
+            }
+        }
+        Err(err) => log_alternative_read_failure("file list", &err),
     }
 
-    if let Ok(text) = clipboard.get_text()
-        && let Some(image) = try_decode_image_reference(text.as_str())?
-    {
-        return Ok(image);
+    match clipboard::read_text() {
+        Ok(Some(text)) => {
+            if let Some(image) = try_decode_image_reference(text.as_str())? {
+                return Ok(image);
+            }
+        }
+        Ok(None) => {}
+        Err(err) => log_alternative_read_failure("text", &err),
     }
 
-    if let Ok(html) = clipboard.get().html()
-        && let Some(image) = try_decode_image_reference(html.as_str())?
-    {
-        return Ok(image);
+    match clipboard::read_html() {
+        Ok(Some(html)) => {
+            if let Some(image) = try_decode_image_reference(html.as_str())? {
+                return Ok(image);
+            }
+        }
+        Ok(None) => {}
+        Err(err) => log_alternative_read_failure("html", &err),
     }
 
     Err(t!("paste_image.no_image_path").to_string())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+/// Logs a failed alternative read. `NoContent` is the normal "not this kind" answer and is
+/// not logged; an unavailable reader is expected on mobile/web (info), a backend failure is a
+/// real problem (warn).
+fn log_alternative_read_failure(representation: &str, err: &ClipboardError) {
+    match err {
+        ClipboardError::NoContent => {}
+        ClipboardError::Unavailable(unavailable) => {
+            runtime_log::log_info(format!("[paste-image] clipboard {representation} reader unavailable: {unavailable:?}"));
+        }
+        ClipboardError::Backend { detail } => {
+            runtime_log::log_warn(format!("[paste-image] clipboard {representation} read failed: {detail}"));
+        }
+    }
+}
+
 fn validate_rgba_image(
     width: usize,
     height: usize,
@@ -146,7 +174,6 @@ fn validate_rgba_image(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn read_image_from_path(path: &Path) -> Result<ClipboardImage, String> {
     let decoded = image::open(path)
         .map_err(|err| tf!("paste_image.open_error", path = path.display(), err = err))?
@@ -158,7 +185,6 @@ fn read_image_from_path(path: &Path) -> Result<ClipboardImage, String> {
     )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn try_decode_image_reference(raw: &str) -> Result<Option<ClipboardImage>, String> {
     let Some(path) = extract_image_path_reference(raw) else {
         return Ok(None);
@@ -166,7 +192,6 @@ fn try_decode_image_reference(raw: &str) -> Result<Option<ClipboardImage>, Strin
     read_image_from_path(path.as_path()).map(Some)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn extract_image_path_reference(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -190,7 +215,6 @@ fn extract_image_path_reference(raw: &str) -> Option<PathBuf> {
     None
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_file_uri(raw: &str) -> Option<PathBuf> {
     let uri = raw.strip_prefix("file://")?;
     let decoded = decode_percent_escaped(uri)?;
@@ -198,7 +222,6 @@ fn parse_file_uri(raw: &str) -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn decode_percent_escaped(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -218,12 +241,10 @@ fn decode_percent_escaped(raw: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn hex_to_u8(high: u8, low: u8) -> Option<u8> {
     Some((hex_nibble(high)? << 4) | hex_nibble(low)?)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),
@@ -463,4 +484,50 @@ fn parse_preferred_image_mime_types(raw: &[u8]) -> Vec<String> {
         }
     }
     preferred
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_percent_escaped, extract_image_path_reference, try_decode_image_reference, validate_rgba_image};
+
+    #[test]
+    fn validate_rgba_image_checks_size_and_length() {
+        assert!(validate_rgba_image(0, 1, Vec::new()).is_err());
+        assert!(validate_rgba_image(2, 1, vec![0; 7]).is_err());
+        assert!(validate_rgba_image(usize::MAX, 2, Vec::new()).is_err());
+        let image = validate_rgba_image(2, 1, vec![7; 8]).unwrap_or_else(|err| panic!("valid 2x1 image rejected: {err}"));
+        assert_eq!((image.width, image.height, image.rgba.len()), (2, 1, 8));
+    }
+
+    #[test]
+    fn percent_decoding_handles_escapes_and_rejects_truncation() {
+        assert_eq!(decode_percent_escaped("/tmp/a%20b%2Fc").as_deref(), Some("/tmp/a b/c"));
+        assert_eq!(decode_percent_escaped("%4"), None);
+        assert_eq!(decode_percent_escaped("%zz"), None);
+    }
+
+    #[test]
+    fn image_reference_is_found_in_text_lines_and_file_uris() {
+        let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("temp dir: {err}"));
+        let path = dir.path().join("pasted image.png");
+        image::RgbaImage::from_pixel(3, 2, image::Rgba([1, 2, 3, 255])).save(&path).unwrap_or_else(|err| panic!("write png: {err}"));
+
+        let plain = format!("\n  {}\n", path.display());
+        assert_eq!(extract_image_path_reference(&plain), Some(path.clone()));
+        let uri = format!("file://{}", path.display().to_string().replace(' ', "%20"));
+        assert_eq!(extract_image_path_reference(&uri), Some(path.clone()));
+        assert_eq!(extract_image_path_reference("not a path"), None);
+        assert_eq!(extract_image_path_reference("   "), None);
+
+        let decoded = try_decode_image_reference(&plain).unwrap_or_else(|err| panic!("decode: {err}")).unwrap_or_else(|| panic!("no image decoded"));
+        assert_eq!((decoded.width, decoded.height, decoded.rgba.len()), (3, 2, 24));
+    }
+
+    #[test]
+    fn referenced_file_that_is_not_an_image_is_an_error() {
+        let dir = tempfile::tempdir().unwrap_or_else(|err| panic!("temp dir: {err}"));
+        let path = dir.path().join("note.txt");
+        std::fs::write(&path, b"plain text").unwrap_or_else(|err| panic!("write: {err}"));
+        assert!(try_decode_image_reference(&path.display().to_string()).is_err());
+    }
 }

@@ -11,8 +11,10 @@ Key functions:
 
 Notes:
 `FindClass` on a native thread only sees system classes, so app classes (the Kotlin bridges)
-must come from the application class loader. Never call these on the GUI thread: every call
-is a JVM round trip; the backends run them on a `platform-bridge` worker.
+must come from the application class loader. Do not call these on the GUI thread: every call
+is a JVM round trip; the backends run them on a `platform-bridge` worker. Sole sanctioned
+exception: `clipboard::android::read_text` (one short `ClipboardManager` binder call, the same
+cost as the desktop clipboard read it replaces; see `clipboard/android.rs`).
 */
 
 use jni::errors::Error as JniError;

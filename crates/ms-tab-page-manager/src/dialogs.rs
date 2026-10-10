@@ -2,10 +2,10 @@
 File: tabs/page_manager/dialogs.rs
 
 Purpose:
-Modal dialogs of the page-manager tab: "Insert pages" (native file picker on a
-worker thread), "Create blank page" (size/color/position), and the delete
-confirmation with attachment counts. It also supplies the background native
-picker used by the clean replacement flow.
+Modal dialogs of the page-manager tab: "Insert pages" (non-blocking platform
+file dialog), "Create blank page" (size/color/position), and the delete
+confirmation with attachment counts. It also supplies the file-dialog request
+used by the clean replacement flow.
 
 Key structures:
 - PageManagerDialog: which dialog is open, with its state.
@@ -16,23 +16,23 @@ Key functions:
 - PageManagerTabState::draw_dialogs(): renders the open dialog, emits actions.
 - resolve_insert_at(): InsertPosition -> concrete new-order index.
 - default_blank_size(): blank-page size defaults from the neighbouring page.
+- insert_files_request() / clean_file_request(): the two `ms_platform` dialog requests.
 
 Notes:
-The blocking `rfd` picker runs on a worker thread (GUI thread must never block);
-the wasm build has no native dialog and resolves as a cancelled pick.
+File dialogs go through `ms_platform::file_dialog::request`, which never blocks: the
+dialog state keeps the `PendingDialog` and polls it each frame. A platform without a
+dialog (wasm, Android until its bridge lands) answers with a typed error that is shown
+in the tab's error line.
 */
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 
 use eframe::egui;
-// Worker-thread spawn is only needed for the native `rfd` picker; the wasm
-// build resolves the pick synchronously as cancelled.
-#[cfg(not(target_arch = "wasm32"))]
-use ms_thread as thread;
 
+use ms_log::runtime_log;
 use ms_page_ops::PageOpKind;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog};
 use ms_project::ProjectData;
 use ms_widgets::WheelComboBox;
 use ms_widgets::WheelSpinBox;
@@ -121,8 +121,8 @@ pub(super) fn default_blank_size(
 /// State of the "Insert pages" dialog.
 pub(super) struct InsertDialogState {
     position: InsertPosition,
-    /// Receiver of the file-picker worker while a pick is in progress.
-    picker_rx: Option<Receiver<Option<Vec<PathBuf>>>>,
+    /// The open "pick files" dialog while a pick is in progress.
+    picker: Option<PendingDialog>,
 }
 
 /// State of the "Create blank page" dialog.
@@ -163,7 +163,7 @@ impl PageManagerDialog {
             } else {
                 InsertPosition::AtEnd
             },
-            picker_rx: None,
+            picker: None,
         })
     }
 
@@ -208,7 +208,7 @@ impl PageManagerDialog {
     /// Whether a background file pick is currently pending.
     pub(super) fn picker_active(&self) -> bool {
         match self {
-            PageManagerDialog::Insert(state) => state.picker_rx.is_some(),
+            PageManagerDialog::Insert(state) => state.picker.is_some(),
             PageManagerDialog::Create(_)
             | PageManagerDialog::Delete(_)
             | PageManagerDialog::Stitch(_)
@@ -218,54 +218,17 @@ impl PageManagerDialog {
     }
 }
 
-/// Spawns the blocking native multi-file picker on a worker thread and returns
-/// the receiver of its result (`None` = cancelled). The extension filter matches
+/// The "insert pages" multi-file dialog. The extension filter matches
 /// `project::collect_images` (png/jpg/jpeg).
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_files_picker() -> Receiver<Option<Vec<PathBuf>>> {
-    let (tx, rx) = mpsc::channel::<Option<Vec<PathBuf>>>();
-    thread::spawn(move || {
-        let files = rfd::FileDialog::new()
-            .add_filter(
-                t!("page_manager.insert_dialog.images_filter"),
-                &["png", "jpg", "jpeg"],
-            )
-            .pick_files();
-        let _ = tx.send(files);
-    });
-    rx
+fn insert_files_request() -> FileDialogRequest {
+    FileDialogRequest::new(DialogKind::OpenFiles)
+        .filter(t!("page_manager.insert_dialog.images_filter"), &["png", "jpg", "jpeg"])
 }
 
-/// Starts the single-image picker used for replacement clean layers.
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn spawn_clean_picker() -> Receiver<Option<PathBuf>> {
-    let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
-    thread::spawn(move || {
-        let file = rfd::FileDialog::new()
-            .add_filter(t!("page_manager.clean_picker_filter"), &["png", "jpg", "jpeg"])
-            .pick_file();
-        let _ = tx.send(file);
-    });
-    rx
-}
-
-/// Web fallback for the replacement-clean picker.
-#[cfg(target_arch = "wasm32")]
-pub(super) fn spawn_clean_picker() -> Receiver<Option<PathBuf>> {
-    let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
-    ms_log::runtime_log::log_warn("[page_manager] native clean picker unavailable on web build");
-    let _ = tx.send(None);
-    rx
-}
-
-/// Web stub: the browser build has no native file dialog (`rfd`), so the pick
-/// resolves immediately as cancelled and the dropped capability is logged.
-#[cfg(target_arch = "wasm32")]
-fn spawn_files_picker() -> Receiver<Option<Vec<PathBuf>>> {
-    let (tx, rx) = mpsc::channel::<Option<Vec<PathBuf>>>();
-    ms_log::runtime_log::log_warn("[page_manager] native file picker unavailable on web build");
-    let _ = tx.send(None);
-    rx
+/// The single-image dialog of the replacement-clean flow (same extensions as the insert).
+pub(super) fn clean_file_request() -> FileDialogRequest {
+    FileDialogRequest::new(DialogKind::OpenFile)
+        .filter(t!("page_manager.clean_picker_filter"), &["png", "jpg", "jpeg"])
 }
 
 /// Draws the position combo shared by the insert and create dialogs. The
@@ -364,30 +327,33 @@ impl PageManagerTabState {
         actions: &mut Vec<PageManagerAction>,
     ) -> Option<InsertDialogState> {
         // Poll a pending pick first: a completed pick emits the op and closes.
-        if let Some(rx) = state.picker_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(Some(files)) if !files.is_empty() => {
-                    let at = resolve_insert_at(state.position, &self.selection, page_count);
-                    actions.push(PageManagerAction::RequestOp(PageOpKind::InsertFiles {
-                        at,
-                        files,
-                    }));
-                    return None;
-                }
-                Ok(_) => {
-                    // Cancelled or empty pick: stay open, allow another attempt.
-                    state.picker_rx = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    state.picker_rx = None;
-                    self.error_message =
-                        Some(t!("page_manager.insert_dialog.picker_failed_error").to_string());
+        if let Some(result) = state.picker.as_mut().and_then(PendingDialog::poll) {
+            state.picker = None;
+            match result {
+                Ok(Some(picked)) => match picked.into_files() {
+                    Some(picked_files) if !picked_files.is_empty() => {
+                        let at = resolve_insert_at(state.position, &self.selection, page_count);
+                        let files = picked_files.into_iter().map(|file| file.path).collect();
+                        actions.push(PageManagerAction::RequestOp(PageOpKind::InsertFiles {
+                            at,
+                            files,
+                        }));
+                        return None;
+                    }
+                    // `OpenFiles` always answers with at least one file (`Picked` contract);
+                    // anything else is a platform-layer bug, logged and treated as a cancel.
+                    _ => runtime_log::log_error("[page_manager] insert-pages dialog returned no files for an OpenFiles request"),
+                },
+                // Cancelled: stay open, allow another attempt.
+                Ok(None) => {}
+                Err(err) => {
+                    runtime_log::log_warn(format!("[page_manager] insert-pages file dialog failed: {err:?}"));
+                    self.error_message = Some(err.user_message());
                 }
             }
         }
 
-        let picking = state.picker_rx.is_some();
+        let picking = state.picker.is_some();
         let has_selection = !self.selection.is_empty();
         let mut keep_open = true;
         let mut close_clicked = false;
@@ -412,7 +378,11 @@ impl PageManagerTabState {
                         )
                         .clicked()
                     {
-                        state.picker_rx = Some(spawn_files_picker());
+                        let repaint_ctx = ctx.clone();
+                        state.picker = Some(file_dialog::request(
+                            insert_files_request(),
+                            Some(Arc::new(move || repaint_ctx.request_repaint())),
+                        ));
                     }
                     if picking {
                         ui.spinner();
@@ -698,5 +668,18 @@ mod tests {
         let map = sizes(&[]);
         let lookup = |idx: usize| map.get(&idx).copied();
         assert_eq!(default_blank_size(&lookup, 1, 3), (1000, 1500));
+    }
+
+    /// The two dialogs pick what the page-ops engine imports: several / one png-jpg file.
+    #[test]
+    fn file_dialog_requests_pick_page_images() {
+        let insert = insert_files_request();
+        assert_eq!(insert.kind(), DialogKind::OpenFiles);
+        let clean = clean_file_request();
+        assert_eq!(clean.kind(), DialogKind::OpenFile);
+        for request in [&insert, &clean] {
+            let extensions: Vec<&str> = request.filters().iter().flat_map(|filter| filter.extensions()).map(String::as_str).collect();
+            assert_eq!(extensions, ["png", "jpg", "jpeg"]);
+        }
     }
 }

@@ -10,7 +10,10 @@ Main types:
 - `BubbleCardBody`: the exhaustive `BubbleClass` -> card-shape decision (single-line hint text vs
   translation+original, image controls, character controls, «Перевести» action).
 - `BubblesPanelState`: panel runtime state (filters, editor cache, pending flushes, visible list cache).
-- `BubblesPanelContext`: shared tab state links (footer overrides, pending patches, character refresh flags).
+- `BubblesPanelContext`: shared tab state links (footer overrides, pending patches, character refresh flags,
+  the tab's image-bubble file-dialog slot).
+- `ImageBubbleFilePick`: a pending «choose file» dialog for one external image bubble; started here
+  or from the canvas footer, resolved by the tab (`tab.rs::poll_image_bubble_pick`).
 
 Main flow:
 - `draw_bubbles_panel` -> `BubblesPanelState::draw`: renders controls, applies filters, draws card list.
@@ -21,7 +24,8 @@ Main flow:
 Utilities:
 - footer parsing helpers: `footer_state_for_bubble`, `bubble_footer_state_from_record`,
   `bubble_extra_string` (без trim, сохраняет пользовательские пробелы),
-  `bubble_extra_bool`, `bubble_extra_i32`, image-bubble file save helpers.
+  `bubble_extra_bool`, `bubble_extra_i32`, the clipboard image-bubble save helper and
+  `image_bubble_file_request` (the one «choose file» dialog request).
 - patch helper: `queue_footer_patch`.
 */
 
@@ -33,25 +37,48 @@ use eframe::egui;
 use egui::{Color32, Stroke};
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
+use ms_platform::file_dialog::{self, DialogKind, DialogResult, FileDialogRequest, PendingDialog};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-/// Opens the native image-file picker for an external image bubble and returns
-/// the chosen path, or `None` if the user cancelled.
-///
-/// Web stub: the browser build has no native file dialog (`rfd`), so this returns
-/// `None` and the "choose file" button is a no-op there (browser file import via
-/// `<input type=file>` is added later).
-#[cfg(not(target_arch = "wasm32"))]
-fn pick_image_bubble_file() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
-        .pick_file()
+/// The file dialog of an external image bubble's «choose file» action.
+#[must_use]
+pub(crate) fn image_bubble_file_request() -> FileDialogRequest {
+    FileDialogRequest::new(DialogKind::OpenFile)
+        .filter(t!("translation.image_io.images_filter"), &["png", "jpg", "jpeg", "webp", "bmp"])
 }
 
-#[cfg(target_arch = "wasm32")]
-fn pick_image_bubble_file() -> Option<PathBuf> {
-    None
+/// A pending «choose file» dialog for one external image bubble.
+///
+/// The Translation tab keeps ONE slot for it (`TranslationTabState::image_bubble_pick`), shared
+/// by the canvas footer and this panel's cards: only one file dialog may be open at a time,
+/// and the tab resolves the result once per frame whichever surface started it, so a result is
+/// never lost because its card scrolled out of view.
+pub struct ImageBubbleFilePick {
+    bubble_id: i64,
+    dialog: PendingDialog,
+}
+
+impl ImageBubbleFilePick {
+    /// Opens the dialog for `bubble_id` without blocking; `ctx` is repainted when it closes.
+    #[must_use]
+    pub fn request(ctx: &egui::Context, bubble_id: i64) -> Self {
+        let repaint_ctx = ctx.clone();
+        let dialog = file_dialog::request(image_bubble_file_request(), Some(Arc::new(move || repaint_ctx.request_repaint())));
+        Self { bubble_id, dialog }
+    }
+
+    /// The bubble the picked file is for.
+    #[must_use]
+    pub fn bubble_id(&self) -> i64 {
+        self.bubble_id
+    }
+
+    /// `None` while the dialog is open; the result exactly once (`Ok(None)` = cancelled).
+    pub fn poll(&mut self) -> Option<DialogResult> {
+        self.dialog.poll()
+    }
 }
 
 /// Display placeholder + sentinel for "no character selected" in the footer
@@ -235,6 +262,8 @@ pub struct BubblesPanelContext<'a> {
     pub last_clarification: &'a mut String,
     pub last_page_idx: &'a mut i64,
     pub last_bubble_order: &'a mut i32,
+    /// The tab's one «choose file» slot for external image bubbles (see [`ImageBubbleFilePick`]).
+    pub image_bubble_pick: &'a mut Option<ImageBubbleFilePick>,
 }
 
 /// Which class-dependent rows one bubble card draws.
@@ -1035,20 +1064,14 @@ impl BubblesPanelState {
                         Err(err) => *image_error = Some(err),
                     }
                 }
-                if ui.small_button(t!("translation.common.choose_file_button")).clicked()
-                    && let Some(path) = pick_image_bubble_file()
+                // Disabled while any image-bubble dialog is open: one dialog at a time, and
+                // the open one may belong to another bubble.
+                let picking = panel_ctx.image_bubble_pick.is_some();
+                if ui
+                    .add_enabled(!picking, egui::Button::new(t!("translation.common.choose_file_button")).small())
+                    .clicked()
                 {
-                    match copy_external_image_for_bubble(project, bubble_id, &path) {
-                        Ok(saved) => queue_footer_patch(
-                            panel_ctx.pending_footer_patches,
-                            panel_ctx.pending_footer_patch_changed_at,
-                            bubble_id,
-                            "image_path",
-                            Value::String(project_relative_path(project, &saved)),
-                            now_s,
-                        ),
-                        Err(err) => *image_error = Some(err),
-                    }
+                    *panel_ctx.image_bubble_pick = Some(ImageBubbleFilePick::request(ui.ctx(), bubble_id));
                 }
             } else {
                 ui.label(t!("translation.bubbles.page_field_label"));
@@ -1344,29 +1367,6 @@ fn save_clipboard_image_for_bubble(
     image
         .save(&path)
         .map_err(|err| tf!("translation.image_io.save_error", path = path.display(), err = err))?;
-    Ok(path)
-}
-
-fn copy_external_image_for_bubble(
-    project: &ProjectData,
-    bubble_id: i64,
-    source: &Path,
-) -> Result<PathBuf, String> {
-    if !source.is_file() {
-        return Err(tf!("translation.image_io.file_not_found_error", source = source.display()));
-    }
-    let dir = image_bubbles_dir(project);
-    fs::create_dir_all(&dir)
-        .map_err(|err| tf!("translation.image_io.create_dir_error", dir = dir.display(), err = err))?;
-    let ext = source
-        .extension()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("png");
-    let path = dir.join(format!("image_bubble_{bubble_id}.{ext}"));
-    fs::copy(source, &path).map_err(|err| {
-        tf!("translation.image_io.copy_error", source = source.display(), path = path.display(), err = err)
-    })?;
     Ok(path)
 }
 

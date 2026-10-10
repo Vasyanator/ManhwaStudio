@@ -35,9 +35,12 @@ Notes:
 The token VALUE must never appear in a log line, an error message or a panic payload.
 Every message in this file says "the token" and interpolates only the keyring's own
 error, which never carries the secret.
-The keyring does not exist in the browser, so the wasm build gets the same stubs
-`ocr.rs` uses: the store operations fail with a clear "unavailable on web" error while
-the cache still works, so a wasm build compiles and behaves honestly.
+There is no OS secret store in the browser, and none on Android until a Keystore-backed
+store exists (`keyring` would silently link its in-memory mock there), so on wasm and
+Android the store operations fail with the localized
+`ms_platform::Unavailable { CredentialStore }` message while the cache still works, and the
+startup seed only logs that the store is unavailable. `PlatformFeature::CredentialStore`
+owns that decision; the `cfg` gates here only keep `keyring` out of those builds.
 */
 
 use std::sync::RwLock;
@@ -47,12 +50,12 @@ use std::sync::RwLock;
 /// Its own name, never shared with `"ManhwaStudio AI API OCR"`: the two are different
 /// credentials with different lifetimes, and a shared entry would let deleting one
 /// silently delete the other.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 const HF_TOKEN_SERVICE: &str = "ManhwaStudio Hugging Face";
 
 /// Account name inside that service. There is exactly one Hugging Face token per
 /// installation, so the account is a constant rather than a user identity.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 const HF_TOKEN_ACCOUNT: &str = "default";
 
 /// What the UI knows about the stored token right now.
@@ -124,14 +127,14 @@ fn read_cache() -> Option<String> {
     }
 }
 
-/// Web stub: there is no OS credential store in the browser, so storing the token is
+/// Stub for builds without an OS credential store (wasm, Android): storing the token is
 /// rejected with a clear error rather than silently dropped.
 ///
 /// # Errors
-/// Always returns the "unavailable on web" message.
-#[cfg(target_arch = "wasm32")]
+/// Always returns the localized "credential store unavailable" message.
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn store_hf_token(_token: &str) -> Result<(), String> {
-    Err(t!("hf_token.keystore_web_unavailable_error").to_string())
+    Err(credential_store_unavailable())
 }
 
 /// Writes `token` into the OS secret store and refreshes the cache.
@@ -145,7 +148,7 @@ pub fn store_hf_token(_token: &str) -> Result<(), String> {
 /// # Errors
 /// Returns a localized message when the token is empty or when the secret store
 /// refuses the write. Neither message ever carries the token itself.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn store_hf_token(token: &str) -> Result<(), String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
@@ -158,13 +161,13 @@ pub fn store_hf_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Web stub: no OS credential store on the browser build.
+/// Stub for builds without an OS credential store (wasm, Android).
 ///
 /// # Errors
-/// Always returns the "unavailable on web" message.
-#[cfg(target_arch = "wasm32")]
+/// Always returns the localized "credential store unavailable" message.
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn clear_hf_token() -> Result<(), String> {
-    Err(t!("hf_token.keystore_web_unavailable_error").to_string())
+    Err(credential_store_unavailable())
 }
 
 /// Deletes the token from the OS secret store and empties the cache.
@@ -174,7 +177,7 @@ pub fn clear_hf_token() -> Result<(), String> {
 ///
 /// # Errors
 /// Returns a localized message when the secret store refuses the deletion.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn clear_hf_token() -> Result<(), String> {
     match hf_keyring_entry()?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => {
@@ -185,14 +188,14 @@ pub fn clear_hf_token() -> Result<(), String> {
     }
 }
 
-/// Web stub: no OS credential store on the browser build. An error rather than an empty
-/// string, so a caller cannot mistake "unavailable" for "the user has no token".
+/// Stub for builds without an OS credential store (wasm, Android). An error rather than an
+/// empty string, so a caller cannot mistake "unavailable" for "the user has no token".
 ///
 /// # Errors
-/// Always returns the "unavailable on web" message.
-#[cfg(target_arch = "wasm32")]
+/// Always returns the localized "credential store unavailable" message.
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn read_hf_token() -> Result<String, String> {
-    Err(t!("hf_token.keystore_web_unavailable_error").to_string())
+    Err(credential_store_unavailable())
 }
 
 /// Reads the token from the OS secret store and refreshes the cache.
@@ -204,7 +207,7 @@ pub fn read_hf_token() -> Result<String, String> {
 /// Returns a localized message when the secret store is unreachable or refuses the
 /// read. The cache is left untouched then, so a transient failure does not turn a
 /// stored token into a missing one.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn read_hf_token() -> Result<String, String> {
     let token = match hf_keyring_entry()?.get_password() {
         Ok(token) => token,
@@ -219,7 +222,7 @@ pub fn read_hf_token() -> Result<String, String> {
 ///
 /// # Errors
 /// Returns a localized message when the platform has no usable credential store.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 fn hf_keyring_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(HF_TOKEN_SERVICE, HF_TOKEN_ACCOUNT)
         .map_err(|err| tf!("hf_token.keyring_unavailable_error", err = err))
@@ -231,7 +234,7 @@ fn hf_keyring_entry() -> Result<keyring::Entry, String> {
 /// the cache reports [`HfTokenState::Unknown`], which every surface renders as "not
 /// known" rather than as "no token". A failure is logged WITHOUT the token and leaves
 /// the cache unseeded, so the next explicit read can still succeed.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn seed_hf_token_from_secret_store() {
     ms_thread::spawn(|| {
         if let Err(err) = read_hf_token() {
@@ -241,6 +244,26 @@ pub fn seed_hf_token_from_secret_store() {
             ));
         }
     });
+}
+
+/// The localized message of a credential-store operation on a build without one. Asks the
+/// capability table, so the reason stays its decision.
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
+fn credential_store_unavailable() -> String {
+    match ms_platform::PlatformFeature::CredentialStore.require() {
+        Err(unavailable) => unavailable.user_message(),
+        // The table reports a store on this target, but this build compiled `keyring` out:
+        // the bridge to it is what is missing.
+        Ok(()) => ms_platform::Unavailable::new(ms_platform::PlatformFeature::CredentialStore, ms_platform::UnavailableReason::BridgeMissing).user_message(),
+    }
+}
+
+/// Startup seed of builds without an OS credential store (wasm, Android): logs once that the
+/// store is unavailable and leaves the cache unseeded, so the badge reports "not known"
+/// instead of claiming that no token exists.
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
+pub fn seed_hf_token_from_secret_store() {
+    ms_log::runtime_log::log_info(format!("[startup] Hugging Face token not seeded: {}", credential_store_unavailable()));
 }
 
 #[cfg(test)]

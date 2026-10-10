@@ -14,10 +14,13 @@ Key functions:
 Notes:
 Blocking and short; callers may use them on the GUI thread exactly as they used arboard.
 Writing to the clipboard goes through egui's `OutputCommand`, never through this module.
-Backends: `desktop.rs` (arboard, a fresh handle per read), `unavailable.rs` (Android until the
-JNI `ClipboardManager` backend lands, and wasm).
+Backends: `desktop.rs` (arboard, a fresh handle per read), `android.rs` (text over the JNI
+`ClipboardManager`, on the calling thread), `unavailable.rs` (Android image / file list /
+HTML, and every read on wasm).
 */
 
+#[cfg(target_os = "android")]
+mod android;
 #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 mod desktop;
 #[cfg(any(target_arch = "wasm32", target_os = "android"))]
@@ -27,6 +30,11 @@ mod unavailable;
 use desktop as backend;
 #[cfg(any(target_arch = "wasm32", target_os = "android"))]
 use unavailable as backend;
+// Android reads text through its JNI backend; image, file list and HTML stay unavailable.
+#[cfg(target_os = "android")]
+use android::read_text as read_text_backend;
+#[cfg(not(target_os = "android"))]
+use backend::read_text as read_text_backend;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -105,7 +113,7 @@ impl From<Unavailable> for ClipboardError {
 /// # Errors
 /// [`ClipboardError::Unavailable`] (`ClipboardText`) or [`ClipboardError::Backend`].
 pub fn read_text() -> Result<Option<String>, ClipboardError> {
-    backend::read_text()
+    read_text_backend()
 }
 
 /// Reads an image.

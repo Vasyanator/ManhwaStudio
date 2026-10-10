@@ -16,6 +16,10 @@ Key structures:
 
 Notes:
 Filesystem scanning and archive creation stay off the GUI thread to keep launcher interactions responsive.
+The destination comes from the non-blocking `ms_platform::file_dialog` seam (`SaveFile`): the
+open dialog is polled each frame and keeps the page busy; the archive worker writes the
+complete file to `SaveTarget::write_path` and only then calls `SaveTarget::commit`
+(`run_export_job` owns that order), so a commit failure is reported like an export failure.
 */
 
 use crate::pages::base::{self, PageNavAction};
@@ -23,10 +27,10 @@ use crate::theme;
 use ms_log::runtime_log;
 use ms_widgets::WheelComboBox;
 use egui::{Align, Layout, RichText, Ui};
-// Native file save dialog. On web there is no OS dialog; the save-path picking
-// step is replaced with a "unavailable on web" status (Phase 5 adds download).
+// Save dialog seam. On web the export step is replaced with an "unavailable on web" status
+// (Phase 5 adds download), so the dialog types are native-only here.
 #[cfg(not(target_arch = "wasm32"))]
-use rfd::FileDialog;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogError, FileDialogRequest, PendingDialog, SaveTarget};
 // Used only by the native archive writer, which is compiled out on web.
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::File;
@@ -65,6 +69,21 @@ pub struct ExportPageState {
     status: ExportPageStatus,
     pending_refresh: Option<Receiver<ExportRefreshResult>>,
     pending_export: Option<Receiver<ExportWorkerResult>>,
+    /// The open save dialog plus the export it was opened for; `Some` until `poll_save_dialog`
+    /// takes its result.
+    #[cfg(not(target_arch = "wasm32"))]
+    pending_save_dialog: Option<PendingSaveDialog>,
+}
+
+/// An export waiting for its destination: what to archive, snapshotted when Export was
+/// clicked, and the dialog choosing where.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct PendingSaveDialog {
+    project_dir: PathBuf,
+    chapter_name: String,
+    compression_level: i32,
+    dialog: PendingDialog,
 }
 
 #[derive(Debug)]
@@ -104,6 +123,8 @@ impl ExportPageState {
             status: ExportPageStatus::Loading,
             pending_refresh: None,
             pending_export: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending_save_dialog: None,
         };
         state.start_refresh(None, None);
         state
@@ -111,7 +132,10 @@ impl ExportPageState {
 
     pub fn show(&mut self, ui: &mut Ui) -> Option<PageNavAction> {
         self.poll_refresh();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_save_dialog();
         self.poll_export();
+        let ctx = ui.ctx().clone();
 
         let mut action = None;
         if let Some(back_action) = base::show_page_shell(ui, |ui| {
@@ -226,7 +250,7 @@ impl ExportPageState {
                             )
                             .clicked()
                             {
-                                self.start_export();
+                                self.start_export(&ctx);
                             }
                             if theme::launcher_button(
                                 ui,
@@ -264,6 +288,11 @@ impl ExportPageState {
         self.selected_chapter = None;
         self.pending_export = None;
         self.pending_refresh = None;
+        // A dialog opened for a chapter of the old root must not export into the new one.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.pending_save_dialog = None;
+        }
         self.start_refresh(None, None);
     }
 
@@ -302,69 +331,77 @@ impl ExportPageState {
         }
     }
 
-    /// Starts a `.mschapter` export: picks a destination via the OS save dialog
-    /// and runs `tar + zstd` archiving on a worker.
+    /// Starts a `.mschapter` export: opens the save dialog without blocking; once it resolves,
+    /// `poll_save_dialog` runs `tar + zstd` archiving on a worker. The selection and compression
+    /// level are snapshotted now, so changing them while the dialog is open does not matter.
     ///
     /// Native only. On web there is no save dialog and archive download is a
     /// Phase 5 web-glue feature, so the web twin reports the operation as
     /// unavailable instead of exporting.
     #[cfg(not(target_arch = "wasm32"))]
-    fn start_export(&mut self) {
+    fn start_export(&mut self, ctx: &egui::Context) {
         let Some(selection) = self.current_selection() else {
             self.status = ExportPageStatus::Error(t!("launcher.common.select_title_chapter_error").to_string());
             return;
         };
 
-        let default_name = format!("{} {}.mschapter", selection.title, selection.chapter);
-        let default_path = self.projects_root.join(default_name);
-        let Some(save_path) = FileDialog::new()
-            .set_directory(self.projects_root.clone())
-            .set_file_name(
-                default_path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("chapter.mschapter"),
-            )
-            .add_filter(t!("launcher.common.chapter_files_filter"), &["mschapter"])
-            .save_file()
-        else {
-            return;
-        };
-        let save_path = ensure_mschapter_extension(save_path);
-
-        self.status = ExportPageStatus::Exporting;
-        let project_dir = selection.project_dir.clone();
-        let chapter_name = selection.chapter.clone();
-        let level = COMPRESSION_PRESETS
+        let request = FileDialogRequest::new(DialogKind::SaveFile)
+            .start_dir(&self.projects_root)
+            .suggested_name(format!("{} {}.mschapter", selection.title, selection.chapter))
+            .filter(t!("launcher.common.chapter_files_filter"), &["mschapter"]);
+        let waker_ctx = ctx.clone();
+        let dialog = file_dialog::request(request, Some(std::sync::Arc::new(move || waker_ctx.request_repaint())));
+        let compression_level = COMPRESSION_PRESETS
             .get(self.selected_compression)
             .map(|(_, level)| *level)
             .unwrap_or(10);
+        self.pending_save_dialog = Some(PendingSaveDialog {
+            project_dir: selection.project_dir,
+            chapter_name: selection.chapter,
+            compression_level,
+            dialog,
+        });
+    }
+
+    /// Takes the save dialog's result, if it resolved: a destination starts the archive worker,
+    /// a cancel changes nothing, a dialog failure becomes the error status (details in the log).
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_save_dialog(&mut self) {
+        let Some(result) = self.pending_save_dialog.as_mut().and_then(|pending| pending.dialog.poll()) else {
+            return;
+        };
+        let Some(pending) = self.pending_save_dialog.take() else {
+            return;
+        };
+        match result {
+            Ok(None) => {}
+            Ok(Some(picked)) => match picked.into_save_target() {
+                Some(target) => self.spawn_export_worker(pending, target),
+                // `SaveFile` always yields `Picked::SaveTarget` (the seam's contract).
+                None => {
+                    runtime_log::log_error("[launcher-export] save dialog returned a result without a save target");
+                    self.status = ExportPageStatus::Error(t!("launcher.export_page.export_failed").to_string());
+                }
+            },
+            Err(err) => {
+                runtime_log::log_warn(format!("[launcher-export] save dialog failed: {err:?}"));
+                self.status = ExportPageStatus::Error(err.user_message());
+            }
+        }
+    }
+
+    /// Runs the archive write and the target commit (`run_export_job`) on a worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_export_worker(&mut self, pending: PendingSaveDialog, target: SaveTarget) {
+        let PendingSaveDialog { project_dir, chapter_name, compression_level, dialog: _ } = pending;
+        self.status = ExportPageStatus::Exporting;
         let (tx, rx) = mpsc::channel();
         self.pending_export = Some(rx);
         let spawn_result = thread::Builder::new()
             .name("launcher-export-worker".to_string())
             .spawn(move || {
-                let result =
-                    match export_chapter_archive(&project_dir, &chapter_name, &save_path, level) {
-                        Ok(()) => ExportWorkerResult {
-                            user_message: tf!("launcher.export_page.export_success_status", save_path = save_path.display()),
-                            log_message: Some(format!(
-                                "[launcher-export] exported '{}' to '{}'",
-                                project_dir.display(),
-                                save_path.display()
-                            )),
-                            success: true,
-                        },
-                        Err(err) => ExportWorkerResult {
-                            user_message: tf!("launcher.export_page.export_error", err = err),
-                            log_message: Some(format!(
-                                "[launcher-export] failed to export '{}' to '{}': {err}",
-                                project_dir.display(),
-                                save_path.display()
-                            )),
-                            success: false,
-                        },
-                    };
+                let save_path = ensure_mschapter_extension(target.write_path().to_path_buf());
+                let result = run_export_job(&project_dir, &save_path, |save_path| export_chapter_archive(&project_dir, &chapter_name, save_path, compression_level), || target.commit());
                 if tx.send(result).is_err() {
                     runtime_log::log_warn(
                         "[launcher-export] export receiver dropped before result delivery",
@@ -384,7 +421,7 @@ impl ExportPageState {
     /// Web twin of `start_export`: chapter export is not wired on the web build
     /// yet, so it surfaces a clear "unavailable on web" status.
     #[cfg(target_arch = "wasm32")]
-    fn start_export(&mut self) {
+    fn start_export(&mut self, _ctx: &egui::Context) {
         self.status =
             ExportPageStatus::Error(t!("launcher.export_page.export_web_unsupported").to_string());
     }
@@ -472,7 +509,11 @@ impl ExportPageState {
     }
 
     fn is_busy(&self) -> bool {
-        self.pending_refresh.is_some() || self.pending_export.is_some()
+        #[cfg(not(target_arch = "wasm32"))]
+        let save_dialog_open = self.pending_save_dialog.is_some();
+        #[cfg(target_arch = "wasm32")]
+        let save_dialog_open = false;
+        self.pending_refresh.is_some() || self.pending_export.is_some() || save_dialog_open
     }
 }
 
@@ -524,7 +565,46 @@ fn build_refresh_result(
     }
 }
 
-// Only reached through the native `start_export`; compiled out on web where
+/// One export job, in its fixed order: `write_archive` writes the COMPLETE archive to
+/// `save_path`, and only after it succeeded `commit` publishes the save target (exactly once; a
+/// failed write never commits a partial file). Either failure becomes an error result with the
+/// shared export error status. Blocking: runs on the export worker.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_export_job(
+    project_dir: &Path,
+    save_path: &Path,
+    write_archive: impl FnOnce(&Path) -> Result<(), String>,
+    commit: impl FnOnce() -> Result<(), FileDialogError>,
+) -> ExportWorkerResult {
+    let outcome = write_archive(save_path).and_then(|()| {
+        commit().map_err(|err| {
+            runtime_log::log_warn(format!("[launcher-export] committing '{}' failed: {err:?}", save_path.display()));
+            err.user_message()
+        })
+    });
+    match outcome {
+        Ok(()) => ExportWorkerResult {
+            user_message: tf!("launcher.export_page.export_success_status", save_path = save_path.display()),
+            log_message: Some(format!(
+                "[launcher-export] exported '{}' to '{}'",
+                project_dir.display(),
+                save_path.display()
+            )),
+            success: true,
+        },
+        Err(err) => ExportWorkerResult {
+            user_message: tf!("launcher.export_page.export_error", err = err),
+            log_message: Some(format!(
+                "[launcher-export] failed to export '{}' to '{}': {err}",
+                project_dir.display(),
+                save_path.display()
+            )),
+            success: false,
+        },
+    }
+}
+
+// Only reached through the native export worker; compiled out on web where
 // no export path is wired yet.
 #[cfg(not(target_arch = "wasm32"))]
 fn export_chapter_archive(
@@ -555,7 +635,8 @@ fn export_chapter_archive(
     Ok(())
 }
 
-// Only used by the native `start_export`; compiled out on web.
+/// Appends `.mschapter` when the user typed a name without it (GTK does not add the filter's
+/// extension). Desktop-shaped: the path is the destination itself. Native only.
 #[cfg(not(target_arch = "wasm32"))]
 fn ensure_mschapter_extension(path: PathBuf) -> PathBuf {
     if path
@@ -605,5 +686,88 @@ fn show_status(ui: &mut Ui, status: &ExportPageStatus) {
 fn clear_status_if_success(status: &mut ExportPageStatus) {
     if matches!(status, ExportPageStatus::Success(_)) {
         *status = ExportPageStatus::Ready;
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::{export_chapter_archive, run_export_job};
+    use ms_platform::file_dialog::{FileDialogError, SaveTarget};
+    use std::cell::RefCell;
+    use std::path::Path;
+    use std::sync::MutexGuard;
+
+    /// Installs a catalog with the two messages the error tests read, holding the process-wide
+    /// locale lock for the test's duration (the catalog slot is global to the test binary).
+    fn install_error_catalog() -> MutexGuard<'static, ()> {
+        let guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let catalog = ms_i18n::Catalog::from_json_str(
+            &ms_i18n::LocaleTag::parse("en").expect("en tag"),
+            r#"{ "launcher.export_page.export_error": "Export failed: {err}", "platform.file_dialog.commit_error": "Could not write the destination: {detail}" }"#,
+        )
+        .expect("test catalog parses");
+        ms_i18n::install(catalog);
+        guard
+    }
+
+    #[test]
+    fn commit_runs_once_after_a_successful_write() {
+        let calls = RefCell::new(Vec::new());
+        let result = run_export_job(
+            Path::new("/home/u/title/chapter"),
+            Path::new("/home/u/out.mschapter"),
+            |_| {
+                calls.borrow_mut().push("write");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("commit");
+                Ok(())
+            },
+        );
+        assert!(result.success);
+        assert_eq!(calls.into_inner(), vec!["write", "commit"]);
+    }
+
+    #[test]
+    fn a_failed_write_never_commits() {
+        let _locale = install_error_catalog();
+        let committed = RefCell::new(false);
+        let result = run_export_job(
+            Path::new("/home/u/title/chapter"),
+            Path::new("/home/u/out.mschapter"),
+            |_| Err("disk full".to_owned()),
+            || {
+                *committed.borrow_mut() = true;
+                Ok(())
+            },
+        );
+        assert!(!result.success);
+        assert!(!committed.into_inner());
+        assert!(result.user_message.contains("disk full"));
+    }
+
+    #[test]
+    fn a_commit_failure_surfaces_as_the_export_error_status() {
+        let _locale = install_error_catalog();
+        let commit_error = FileDialogError::Commit { detail: "uri revoked".to_owned() };
+        let expected = commit_error.user_message();
+        let result = run_export_job(Path::new("/home/u/title/chapter"), Path::new("/home/u/out.mschapter"), |_| Ok(()), || Err(commit_error));
+        assert!(!result.success);
+        assert_eq!(expected, "Could not write the destination: uri revoked");
+        assert!(result.user_message.contains(&expected), "{} does not carry {expected}", result.user_message);
+    }
+
+    #[test]
+    fn archive_lands_at_the_save_target_write_path() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let chapter_dir = dir.path().join("title").join("chapter");
+        std::fs::create_dir_all(&chapter_dir).expect("create chapter dir");
+        std::fs::write(chapter_dir.join("page.png"), b"page").expect("write page");
+        let target = SaveTarget::for_test(dir.path().join("out.mschapter"));
+        let save_path = target.write_path().to_path_buf();
+        let result = run_export_job(&chapter_dir, &save_path, |path| export_chapter_archive(&chapter_dir, "chapter", path, 1), || target.commit());
+        assert!(result.success, "{}", result.user_message);
+        assert!(std::fs::metadata(&save_path).is_ok_and(|meta| meta.len() > 0));
     }
 }

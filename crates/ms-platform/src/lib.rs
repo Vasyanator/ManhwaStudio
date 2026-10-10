@@ -10,7 +10,8 @@ Main responsibilities:
   `Unavailable` error every gated entry point returns;
 - the async-shaped file-dialog seam (`file_dialog`): rfd on desktop, Storage Access Framework
   on Android (bridge pending), typed `Unavailable` on wasm;
-- system clipboard reads (`clipboard`): arboard on desktop, typed `Unavailable` elsewhere;
+- system clipboard reads (`clipboard`): arboard on desktop, JNI text on Android, typed
+  `Unavailable` for the rest;
 - the pre-window error box (`message::show_error_blocking`).
 
 Key structures:

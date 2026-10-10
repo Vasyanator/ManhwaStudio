@@ -15,6 +15,9 @@ Long-running image processing is delegated to background controllers to keep the
 responsive while the ribbon updates. Ribbon and crop-editor page images are painted only through
 `ribbon::paint_ribbon_tiles` (tiled, culled, budgeted uploads); this file owns their layout, not
 their tiling.
+File dialogs are non-blocking `ms_platform::file_dialog` requests polled every frame (their
+trigger buttons are disabled while one is open), and overwriting a non-empty save folder is
+confirmed through the in-app `ConfirmModal` (`overwrite_confirm`).
 */
 
 use egui::{
@@ -23,16 +26,16 @@ use egui::{
     WindowLevel,
 };
 use image::{DynamicImage, RgbaImage};
-#[cfg(not(target_arch = "wasm32"))]
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use ms_platform::file_dialog::{self, DialogKind, FileDialogError, FileDialogRequest, PendingDialog};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use ms_thread as thread;
 use web_time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ms_config as config;
+use crate::confirm_modal::{ConfirmAnswer, ConfirmModal};
 use crate::new_project::advanced_download::{
     AdvancedAutoCandidateSet, AdvancedBrowserBackend, AdvancedDownloadController,
     AdvancedDownloadEvent, InterceptCounts, build_pages_from_auto_candidates,
@@ -118,6 +121,22 @@ const AUTO_REVIEW_CARD_GAP: f32 = 10.0;
 const AUTO_REVIEW_CARD_MARGIN: f32 = 8.0;
 const AUTO_REVIEW_CARD_HEADER_HEIGHT: f32 = 24.0;
 const AUTO_REVIEW_CARD_FOOTER_HEIGHT: f32 = 34.0;
+
+/// A save waiting for the user to confirm overwriting a non-empty destination folder.
+struct PendingOverwrite {
+    modal: ConfirmModal,
+    launch: SaveLaunch,
+}
+
+/// One save to start once its destination is settled: where it goes, what happens after it
+/// finishes, and the status line shown while it runs.
+struct SaveLaunch {
+    target: ProjectSaveTarget,
+    open_after_save: bool,
+    /// Switch back to the import panel after a successful save ("save and download more").
+    return_to_import: bool,
+    status_message: String,
+}
 
 #[derive(Clone)]
 struct OperationProgress {
@@ -624,6 +643,12 @@ pub struct NewProjectWindowState {
     open_after_save_requested: bool,
     return_to_import_after_save_requested: bool,
     pending_open_selection: Option<OpenProjectSelection>,
+    /// Open "cut like a reference folder" picker, polled every frame.
+    cut_like_folder_dialog: Option<PendingDialog>,
+    /// Open "save into a folder" picker, polled every frame.
+    save_folder_dialog: Option<PendingDialog>,
+    /// Save waiting for the overwrite confirmation modal.
+    overwrite_confirm: Option<PendingOverwrite>,
     pending_open_wiki_guide: bool,
     batch_processing_window_open: bool,
     batch_processing: crate::new_project::batch_processing::BatchProcessingWindowState,
@@ -792,6 +817,9 @@ impl NewProjectWindowState {
             open_after_save_requested: false,
             return_to_import_after_save_requested: false,
             pending_open_selection: None,
+            cut_like_folder_dialog: None,
+            save_folder_dialog: None,
+            overwrite_confirm: None,
             pending_open_wiki_guide: false,
             batch_processing_window_open: false,
             batch_processing:
@@ -854,6 +882,8 @@ impl NewProjectWindowState {
         self.poll_quick_download(ctx);
         self.poll_stitch(ctx);
         self.poll_save(ctx);
+        self.poll_cut_like_folder_dialog();
+        self.poll_save_folder_dialog();
         self.poll_waifu2x(ctx);
         self.poll_reline(ctx);
         self.poll_reline_model_catalog(ctx);
@@ -899,6 +929,7 @@ impl NewProjectWindowState {
         self.show_advanced_auto_review_window(ctx);
         self.show_screen_capture_overlay(ctx);
         self.show_batch_processing_window(ctx);
+        self.show_overwrite_confirm(ctx);
         if self.source_import.is_loading()
             || self.project_catalog.is_loading()
             || self.advanced_download.is_loading()
@@ -1193,7 +1224,7 @@ impl NewProjectWindowState {
                         )
                         .clicked()
                         {
-                            self.open_file_dialog();
+                            self.open_file_dialog(ui.ctx());
                         }
                         if button_sized(
                             ui,
@@ -1203,7 +1234,7 @@ impl NewProjectWindowState {
                         )
                         .clicked()
                         {
-                            self.open_folder_dialog();
+                            self.open_folder_dialog(ui.ctx());
                         }
                     });
                     if button_sized(
@@ -1233,7 +1264,7 @@ impl NewProjectWindowState {
                             )
                             .clicked()
                             {
-                                self.open_folder_dialog();
+                                self.open_folder_dialog(ui.ctx());
                             }
                             if button_sized(
                                 ui,
@@ -1243,7 +1274,7 @@ impl NewProjectWindowState {
                             )
                             .clicked()
                             {
-                                self.open_file_dialog();
+                                self.open_file_dialog(ui.ctx());
                             }
                         });
                     },
@@ -1571,7 +1602,7 @@ impl NewProjectWindowState {
                     )
                     .clicked()
                     {
-                        self.start_save_to_folder();
+                        self.start_save_to_folder(ui.ctx());
                     }
                     self.show_operation_progress(ui, "save");
                     return;
@@ -1602,7 +1633,7 @@ impl NewProjectWindowState {
                 )
                 .clicked()
                 {
-                    self.start_save_to_project(true);
+                    self.start_save_to_project(true, false);
                 }
                 if button_sized(
                     ui,
@@ -1611,9 +1642,8 @@ impl NewProjectWindowState {
                     can_save,
                 )
                 .clicked()
-                    && self.start_save_to_project(false)
                 {
-                    self.return_to_import_after_save_requested = true;
+                    self.start_save_to_project(false, true);
                 }
 
                 ui.add_space(SECTION_SPACING);
@@ -1681,7 +1711,7 @@ impl NewProjectWindowState {
             #[cfg(feature = "tutorial")]
             self.tutorial.mark(tutorial::TARGET_IMPORT, open_folder.rect);
             if open_folder.clicked() {
-                self.open_folder_dialog();
+                self.open_folder_dialog(ui.ctx());
             }
             if button_sized(
                 ui,
@@ -1691,7 +1721,7 @@ impl NewProjectWindowState {
             )
             .clicked()
             {
-                self.open_file_dialog();
+                self.open_file_dialog(ui.ctx());
             }
         });
         if button_sized(
@@ -2835,6 +2865,7 @@ impl NewProjectWindowState {
             && !self.ribbon.pages().is_empty();
         let can_pick_folder = self.cut_as_chapter_enabled
             && !self.stitch.is_loading()
+            && self.cut_like_folder_dialog.is_none()
             && !self.ribbon.pages().is_empty();
 
         field_label(ui, t!("launcher.new_project.stitch_k_label"));
@@ -2938,7 +2969,7 @@ impl NewProjectWindowState {
                 )
                 .clicked()
                 {
-                    self.start_cut_like_folder();
+                    self.start_cut_like_folder(ui.ctx());
                 }
             });
         });
@@ -3677,7 +3708,7 @@ impl NewProjectWindowState {
                     )
                     .clicked()
                     {
-                        self.start_save_to_project(true);
+                        self.start_save_to_project(true, false);
                     }
                     if button_sized(
                         ui,
@@ -3687,7 +3718,7 @@ impl NewProjectWindowState {
                     )
                     .clicked()
                     {
-                        self.start_save_to_project(false);
+                        self.start_save_to_project(false, false);
                     }
                 },
             );
@@ -3756,7 +3787,7 @@ impl NewProjectWindowState {
                 )
                 .clicked()
                 {
-                    self.start_save_to_folder();
+                    self.start_save_to_folder(ui.ctx());
                 }
             });
         }
@@ -4565,9 +4596,37 @@ impl NewProjectWindowState {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn start_cut_like_folder(&mut self) {
-        let Some(folder) = FileDialog::new().pick_folder() else {
+    /// Opens the reference-folder picker without blocking; `poll_cut_like_folder_dialog`
+    /// starts the cut once a folder is chosen.
+    fn start_cut_like_folder(&mut self, ctx: &egui::Context) {
+        if self.cut_like_folder_dialog.is_some() {
+            return;
+        }
+        let request = FileDialogRequest::new(DialogKind::OpenFolder);
+        self.cut_like_folder_dialog = Some(file_dialog::request(request, Some(repaint_waker(ctx))));
+    }
+
+    /// Applies the reference-folder picker's answer: a folder starts the cut, a cancel changes
+    /// nothing, a dialog failure is reported in the error line.
+    fn poll_cut_like_folder_dialog(&mut self) {
+        let Some(pending) = self.cut_like_folder_dialog.as_mut() else {
+            return;
+        };
+        let Some(result) = pending.poll() else {
+            return;
+        };
+        self.cut_like_folder_dialog = None;
+        let folder = match result {
+            Ok(Some(picked)) => picked.into_folder(),
+            Ok(None) => return,
+            Err(err) => {
+                self.report_dialog_error("cut-like-reference folder", &err);
+                return;
+            }
+        };
+        let Some(folder) = folder else {
+            // `OpenFolder` always answers with `Picked::Folder` (ms-platform contract).
+            self.report_dialog_error("cut-like-reference folder", &FileDialogError::WorkerLost);
             return;
         };
         self.start_cut_like_reference(
@@ -4576,12 +4635,10 @@ impl NewProjectWindowState {
         );
     }
 
-    /// Web stub: folder picking needs a native dialog (`rfd`) with no browser
-    /// equivalent, so this reports the missing capability instead of opening one.
-    #[cfg(target_arch = "wasm32")]
-    fn start_cut_like_folder(&mut self) {
-        self.last_error = Some(t!("launcher.new_project.choose_folder_web_unsupported").to_string());
-        self.import_status = t!("launcher.new_project.cut_by_folder_web_unsupported").to_string();
+    /// Logs a failed file dialog with its typed error and shows its localized message.
+    fn report_dialog_error(&mut self, what: &str, err: &FileDialogError) {
+        ms_log::runtime_log::log_warn(format!("[new-project] {what} dialog failed: {err:?}"));
+        self.last_error = Some(err.user_message());
     }
 
     fn start_cut_like_reference(&mut self, reference_dir: PathBuf, status_message: &str) {
@@ -4803,16 +4860,21 @@ impl NewProjectWindowState {
             && !self.save.is_loading()
             && !self.waifu2x.is_loading()
             && !self.reline.is_loading()
+            && self.save_folder_dialog.is_none()
+            && self.overwrite_confirm.is_none()
             && !self.ribbon.pages().is_empty()
     }
 
-    fn start_save_to_project(&mut self, open_after_save: bool) -> bool {
+    /// Saves the ribbon into the `src` folder of the chosen title/chapter, asking first when
+    /// that folder already has files. `return_to_import` switches back to the import panel
+    /// after a successful save ("save and download more").
+    fn start_save_to_project(&mut self, open_after_save: bool, return_to_import: bool) {
         let title = self.save_title_input.trim().to_string();
         let chapter = self.save_chapter.trim().to_string();
         if title.is_empty() || chapter.is_empty() {
             self.last_error = Some(t!("launcher.new_project.specify_title_chapter_error").to_string());
             self.import_status = t!("launcher.new_project.save_to_project_unavailable").to_string();
-            return false;
+            return;
         }
         let target_dir = self
             .project_catalog
@@ -4820,7 +4882,7 @@ impl NewProjectWindowState {
             .join(&title)
             .join(&chapter)
             .join(config::SRC_DIR);
-        let should_continue = match confirm_overwrite_nonempty(&target_dir) {
+        let needs_confirm = match needs_overwrite_confirm(&target_dir) {
             Ok(value) => value,
             Err(err) => {
                 self.last_error =
@@ -4830,21 +4892,18 @@ impl NewProjectWindowState {
                     "[new-project] failed to inspect project save dir '{}': {err}",
                     target_dir.display()
                 ));
-                return false;
+                return;
             }
         };
-        if !should_continue {
-            return false;
-        }
-        self.begin_save(
-            ProjectSaveRequest {
+        self.confirm_then_save(
+            needs_confirm,
+            SaveLaunch {
                 target: ProjectSaveTarget::ProjectSource { title, chapter },
-                images: self.current_save_images(),
+                open_after_save,
+                return_to_import,
+                status_message: t!("launcher.new_project.saving_to_project_progress").to_string(),
             },
-            open_after_save,
-            t!("launcher.new_project.saving_to_project_progress"),
         );
-        true
     }
 
     fn start_save_alt_version(&mut self) {
@@ -4871,7 +4930,7 @@ impl NewProjectWindowState {
             .join(&chapter)
             .join(config::ALT_VERS_DIR)
             .join(&alt_name);
-        let should_continue = match confirm_overwrite_nonempty(&target_dir) {
+        let needs_confirm = match needs_overwrite_confirm(&target_dir) {
             Ok(value) => value,
             Err(err) => {
                 self.last_error =
@@ -4884,74 +4943,133 @@ impl NewProjectWindowState {
                 return;
             }
         };
-        if !should_continue {
-            return;
-        }
-        self.begin_save(
-            ProjectSaveRequest {
+        self.confirm_then_save(
+            needs_confirm,
+            SaveLaunch {
                 target: ProjectSaveTarget::AltVersion {
                     title,
                     chapter,
                     alt_name,
                 },
-                images: self.current_save_images(),
+                open_after_save: false,
+                return_to_import: false,
+                status_message: t!("launcher.new_project.saving_alt_progress").to_string(),
             },
-            false,
-            t!("launcher.new_project.saving_alt_progress"),
         );
     }
 
-    /// Web stub: saving to an arbitrary folder requires a native folder dialog
-    /// (`rfd`), unavailable in the browser. Reports the missing capability.
-    #[cfg(target_arch = "wasm32")]
-    fn start_save_to_folder(&mut self) {
-        self.last_error = Some(t!("launcher.new_project.save_to_folder_web_unsupported").to_string());
-        self.import_status = t!("launcher.new_project.save_to_folder_web_unsupported").to_string();
+    /// Opens the destination-folder picker without blocking; `poll_save_folder_dialog`
+    /// continues the save once a folder is chosen. The picker reopens one level above the
+    /// previous pick: after saving a chapter into `.../16`, it starts at the title folder so
+    /// sibling chapters are one click away (desktop only; other platforms ignore it).
+    fn start_save_to_folder(&mut self, ctx: &egui::Context) {
+        if self.save_folder_dialog.is_some() {
+            return;
+        }
+        let mut request = FileDialogRequest::new(DialogKind::SaveIntoFolder);
+        if let Some(parent) = self.last_independent_save_dir.as_deref().and_then(Path::parent) {
+            request = request.start_dir(parent);
+        }
+        self.save_folder_dialog = Some(file_dialog::request(request, Some(repaint_waker(ctx))));
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn start_save_to_folder(&mut self) {
-        let mut dialog = FileDialog::new();
-        // Reopen one level above the previous session pick: after saving a
-        // chapter into `.../16`, the next dialog starts at the title folder
-        // `.../` so sibling chapters are one click away.
-        if let Some(parent) = self
-            .last_independent_save_dir
-            .as_deref()
-            .and_then(std::path::Path::parent)
-        {
-            dialog = dialog.set_directory(parent);
-        }
-        let Some(folder) = dialog.pick_folder() else {
+    /// Applies the destination-folder picker's answer: asks before overwriting a non-empty
+    /// folder, then starts the save. A cancel changes nothing; a dialog failure is reported.
+    fn poll_save_folder_dialog(&mut self) {
+        let Some(pending) = self.save_folder_dialog.as_mut() else {
             return;
         };
+        let Some(result) = pending.poll() else {
+            return;
+        };
+        self.save_folder_dialog = None;
+        let target = match result {
+            Ok(Some(picked)) => picked.into_folder_target(),
+            Ok(None) => return,
+            Err(err) => {
+                self.report_dialog_error("save folder", &err);
+                self.import_status = t!("launcher.new_project.save_to_folder_failed").to_string();
+                return;
+            }
+        };
+        let Some(target) = target else {
+            // `SaveIntoFolder` always answers with `Picked::FolderTarget` (ms-platform contract).
+            self.report_dialog_error("save folder", &FileDialogError::WorkerLost);
+            self.import_status = t!("launcher.new_project.save_to_folder_failed").to_string();
+            return;
+        };
+        let folder = target.write_dir().to_path_buf();
         self.last_independent_save_dir = Some(folder.clone());
-        let should_continue = match confirm_overwrite_nonempty(&folder) {
+        let needs_confirm = match target.has_entries() {
             Ok(value) => value,
             Err(err) => {
                 self.last_error =
                     Some(t!("launcher.new_project.check_selected_folder_error").to_string());
                 self.import_status = t!("launcher.new_project.save_to_folder_failed").to_string();
                 ms_log::runtime_log::log_error(format!(
-                    "[new-project] failed to inspect folder save dir '{}': {err}",
+                    "[new-project] failed to inspect folder save dir '{}': {err:?}",
                     folder.display()
                 ));
                 return;
             }
         };
-        if !should_continue {
+        self.confirm_then_save(
+            needs_confirm,
+            SaveLaunch {
+                status_message: tf!("launcher.new_project.saving_to_folder_progress", folder = folder.display()),
+                target: ProjectSaveTarget::Folder { target },
+                open_after_save: false,
+                return_to_import: false,
+            },
+        );
+    }
+
+    /// Starts `launch` now, or parks it behind the overwrite confirmation when
+    /// `needs_confirm` (the destination folder already has files).
+    fn confirm_then_save(&mut self, needs_confirm: bool, launch: SaveLaunch) {
+        if !needs_confirm {
+            self.launch_save(launch);
             return;
         }
+        self.overwrite_confirm = Some(PendingOverwrite {
+            modal: ConfirmModal::new(
+                "launcher.new_project.overwrite_folder_title",
+                t!("launcher.new_project.overwrite_folder_title"),
+                t!("launcher.new_project.folder_not_empty_prompt"),
+            ),
+            launch,
+        });
+    }
+
+    /// Draws the pending overwrite question; "Yes" starts the parked save, "No" drops it.
+    fn show_overwrite_confirm(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.overwrite_confirm else {
+            return;
+        };
+        match pending.modal.show(ctx) {
+            ConfirmAnswer::Pending => {}
+            ConfirmAnswer::No => self.overwrite_confirm = None,
+            ConfirmAnswer::Yes => {
+                if let Some(pending) = self.overwrite_confirm.take() {
+                    self.launch_save(pending.launch);
+                }
+            }
+        }
+    }
+
+    /// Starts the save worker for a settled destination. The ribbon images are taken now, so a
+    /// save confirmed later writes the ribbon as it is at confirmation time.
+    fn launch_save(&mut self, launch: SaveLaunch) {
+        let SaveLaunch { target, open_after_save, return_to_import, status_message } = launch;
         self.begin_save(
-            ProjectSaveRequest {
-                target: ProjectSaveTarget::Folder {
-                    folder: folder.clone(),
-                },
-                images: self.current_save_images(),
-            },
-            false,
-            &tf!("launcher.new_project.saving_to_folder_progress", folder = folder.display()),
+            ProjectSaveRequest { target, images: self.current_save_images() },
+            open_after_save,
+            &status_message,
         );
+        // Only a save that actually started may route back to the import panel when it ends.
+        if return_to_import && self.save.is_loading() {
+            self.return_to_import_after_save_requested = true;
+        }
     }
 
     fn begin_save(
@@ -5180,38 +5298,17 @@ impl NewProjectWindowState {
         output.paint_gutter(painter, items);
     }
 
-    fn open_folder_dialog(&mut self) {
-        if self
-            .source_import
-            .begin_pick(OpenSourceKind::Folder, self.source_import_options())
-        {
-            self.manual_cut_guides.clear();
-            self.last_error = None;
-            self.active_progress = Some(OperationProgress {
-                operation: "source",
-                stage: "scan".to_string(),
-                current: 0,
-                total: 1,
-            });
-            self.import_status = t!("launcher.new_project.scanning_folder_status").to_string();
-        }
+    /// Opens the source folder picker; `poll_folder_load` shows the import progress once a
+    /// folder is chosen.
+    fn open_folder_dialog(&mut self, ctx: &egui::Context) {
+        self.source_import
+            .begin_pick(OpenSourceKind::Folder, self.source_import_options(), Some(repaint_waker(ctx)));
     }
 
-    fn open_file_dialog(&mut self) {
-        if self
-            .source_import
-            .begin_pick(OpenSourceKind::File, self.source_import_options())
-        {
-            self.manual_cut_guides.clear();
-            self.last_error = None;
-            self.active_progress = Some(OperationProgress {
-                operation: "source",
-                stage: "scan".to_string(),
-                current: 0,
-                total: 1,
-            });
-            self.import_status = t!("launcher.new_project.opening_file_status").to_string();
-        }
+    /// Opens the source file picker (archive, HTML or image); see `open_folder_dialog`.
+    fn open_file_dialog(&mut self, ctx: &egui::Context) {
+        self.source_import
+            .begin_pick(OpenSourceKind::File, self.source_import_options(), Some(repaint_waker(ctx)));
     }
 
     fn start_quick_download(&mut self) {
@@ -5315,6 +5412,29 @@ impl NewProjectWindowState {
     fn poll_folder_load(&mut self, ctx: &egui::Context) {
         if let Some(event) = self.source_import.poll(ctx) {
             match event {
+                SourceLoadEvent::LoadStarted { kind } => {
+                    self.manual_cut_guides.clear();
+                    self.last_error = None;
+                    self.active_progress = Some(OperationProgress {
+                        operation: "source",
+                        stage: "scan".to_string(),
+                        current: 0,
+                        total: 1,
+                    });
+                    self.import_status = match kind {
+                        OpenSourceKind::Folder => t!("launcher.new_project.scanning_folder_status"),
+                        OpenSourceKind::File => t!("launcher.new_project.opening_file_status"),
+                    }
+                    .to_string();
+                }
+                SourceLoadEvent::PickFailed {
+                    user_message,
+                    log_message,
+                } => {
+                    // The ribbon is untouched: only the picker failed, nothing was loaded.
+                    ms_log::runtime_log::log_warn(format!("[new-project] {log_message}"));
+                    self.last_error = Some(user_message);
+                }
                 SourceLoadEvent::Progress {
                     stage,
                     current,
@@ -6462,6 +6582,11 @@ impl NewProjectWindowState {
     }
 
     fn handle_window_closed(&mut self) {
+        // A question or a picker answer belongs to the session that asked; never carry it into
+        // the next opening of the window.
+        self.overwrite_confirm = None;
+        self.cut_like_folder_dialog = None;
+        self.save_folder_dialog = None;
         self.waifu2x.shutdown();
         self.waifu2x = Waifu2xController::new();
         self.reline = RelineController::new();
@@ -7988,32 +8113,22 @@ fn progress_stage_title(stage: &str) -> &'static str {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn confirm_overwrite_nonempty(path: &std::path::Path) -> Result<bool, std::io::Error> {
-    if !path.exists() || !dir_has_entries(path)? {
-        return Ok(true);
+/// Whether saving into `dir` must first ask before overwriting: only an existing directory
+/// that already has entries does. A missing directory is created by the save.
+///
+/// # Errors
+/// The I/O error of listing an existing `dir`.
+fn needs_overwrite_confirm(dir: &Path) -> std::io::Result<bool> {
+    if !dir.exists() {
+        return Ok(false);
     }
-    Ok(MessageDialog::new()
-        .set_title("ManhwaStudio")
-        .set_description(t!("launcher.new_project.folder_not_empty_prompt"))
-        .set_buttons(MessageButtons::YesNo)
-        .set_level(MessageLevel::Warning)
-        .show()
-        == MessageDialogResult::Yes)
+    dir_has_entries(dir)
 }
 
-/// Web stub: the native confirmation modal (`rfd::MessageDialog`) has no browser
-/// equivalent. Empty/absent targets proceed as on native; for a non-empty target we
-/// cannot prompt, so we log the skipped confirmation and proceed instead of blocking.
-#[cfg(target_arch = "wasm32")]
-fn confirm_overwrite_nonempty(path: &std::path::Path) -> Result<bool, std::io::Error> {
-    if !path.exists() || !dir_has_entries(path)? {
-        return Ok(true);
-    }
-    ms_log::runtime_log::log_warn(
-        "overwrite confirmation dialog unavailable on web build; proceeding without prompt",
-    );
-    Ok(true)
+/// The repaint callback a file dialog calls when it resolves, so the frame that polls it runs.
+fn repaint_waker(ctx: &egui::Context) -> file_dialog::Waker {
+    let ctx = ctx.clone();
+    Arc::new(move || ctx.request_repaint())
 }
 
 fn load_image_url_presets() -> Vec<(String, String)> {
@@ -8262,8 +8377,8 @@ mod macos_capture_bounds_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RIBBON_MIN_WIDTH_FRACTION, clamp_ribbon_width_fraction, ribbon_page_display_size,
-        ribbon_page_left_inset, ribbon_scale_base_px,
+        RIBBON_MIN_WIDTH_FRACTION, clamp_ribbon_width_fraction, needs_overwrite_confirm,
+        ribbon_page_display_size, ribbon_page_left_inset, ribbon_scale_base_px,
     };
 
     /// Points of slack allowed when comparing derived layout sizes.
@@ -8394,5 +8509,21 @@ mod tests {
         assert!((clamp_ribbon_width_fraction(f32::NAN) - 1.0).abs() < EPS);
         assert!((clamp_ribbon_width_fraction(f32::INFINITY) - 1.0).abs() < EPS);
         assert!((clamp_ribbon_width_fraction(f32::NEG_INFINITY) - 1.0).abs() < EPS);
+    }
+
+    #[test]
+    fn missing_or_empty_folder_needs_no_overwrite_confirm() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert!(!needs_overwrite_confirm(&dir.path().join("absent"))?);
+        assert!(!needs_overwrite_confirm(dir.path())?);
+        Ok(())
+    }
+
+    #[test]
+    fn folder_with_entries_needs_overwrite_confirm() -> std::io::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("001.png"), b"x")?;
+        assert!(needs_overwrite_confirm(dir.path())?);
+        Ok(())
     }
 }

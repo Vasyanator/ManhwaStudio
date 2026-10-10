@@ -4,8 +4,9 @@ File: src/single_image/controller.rs
 Purpose:
 `SingleImageController`, the single-image session's save controller (one `MangaApp` field, `Some`
 only in that mode). It owns the pure `SaveMachine` and performs its side effects: the native
-«Сохранить как» file dialog and the `user_config` quality write (both on workers), the per-frame
-drive of `TypingTabState::prepare_flatten_to_file`, the GUI-thread dispatch sequence (PS flush,
+«Сохранить как» file dialog (`ms_platform::file_dialog::pick_blocking`) and the `user_config`
+quality write (both on workers), the per-frame drive of
+`TypingTabState::prepare_flatten_to_file`, the GUI-thread dispatch sequence (PS flush,
 typing flush, baseline capture, `request_flatten_to_file`), the per-frame `poll_flatten_to_file`,
 the window-title update after «Сохранить как», and the top bar (with the «Сохранить как…» format
 panel) / JPEG options UI.
@@ -21,8 +22,9 @@ Key functions:
   `request_save*()`, `abandon_pending()`.
 
 Notes:
-The GUI thread does no file I/O here: the picker, the flatten (compose, encode, atomic write) and
-the quality persistence run on workers; the GUI thread only snapshots, flushes into the in-memory
+The GUI thread does no file I/O here: the picker, the flatten (compose, encode, atomic write), the
+commit of a dialog target (`spawn_commit`, after the flatten wrote its write path; a failure is a
+failed save) and the quality persistence run on workers; the GUI thread only snapshots, flushes into the in-memory
 savers and polls channels. Encoding policy of a save (plan D7): PNG / WebP drop alpha only when
 fully opaque, JPEG is flattened over white at the session quality, the source's ICC profile is
 re-embedded. Dirty inputs are defined here (`edit_stamp`, `deferred_edits`); the machine only
@@ -48,9 +50,11 @@ use crate::tabs::typing::image_encode::{AlphaPolicy, ImageEncoding, ImageSaveFor
 use crate::tabs::ps_editor::PsEditorTabState;
 use crate::tabs::typing::{FlattenReadiness, FlattenToFileRequest, TypingTabState};
 use eframe::egui;
+use ms_platform::PlatformFeature;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogError, FileDialogRequest, Picked, SaveTarget as DialogTarget};
 use ms_thread as thread;
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -78,8 +82,11 @@ enum FormatPanelChoice {
 pub(crate) struct SingleImageController {
     session: Arc<SingleImageSession>,
     machine: SaveMachine,
-    /// Result of the native file dialog while `Phase::PickingPath` (`None` inside = cancelled).
-    picker_rx: Option<Receiver<Option<PathBuf>>>,
+    /// Result of the file dialog while `Phase::PickingPath` (`Ok(None)` = cancelled, `Err` = no
+    /// dialog could be shown).
+    picker_rx: Option<Receiver<Result<Option<DialogTarget>, FileDialogError>>>,
+    /// Result of the commit worker while `Phase::Committing`.
+    commit_rx: Option<Receiver<Result<(), FileDialogError>>>,
     /// Result of the last JPEG quality persistence.
     persist_rx: Option<Receiver<Result<(), String>>>,
     /// The status revision being timed and when it was first drawn (app time, seconds).
@@ -104,8 +111,8 @@ impl SingleImageController {
             in_place.as_ref().map(|target| target.format),
             session.source_animated
         ));
-        let machine = SaveMachine::new(in_place, ms_config::single_image::jpeg_quality_from(user_settings), session.source_animated);
-        Some(Self { session: Arc::clone(session), machine, picker_rx: None, persist_rx: None, status_shown: None, deferred_step: Step::Nothing })
+        let machine = SaveMachine::new(in_place, ms_config::single_image::jpeg_quality_from(user_settings), session.source_animated, picked_paths_are_user_files());
+        Some(Self { session: Arc::clone(session), machine, picker_rx: None, commit_rx: None, persist_rx: None, status_shown: None, deferred_step: Step::Nothing })
     }
 
     /// The image differs from the last successful write to the file (plan D6): the edit stamp
@@ -181,6 +188,13 @@ impl SingleImageController {
                 runtime_log::log_warn(format!("[single_image] a flatten result arrived with no save in progress; ignored.\nResult: {result:?}"));
             }
             let finished = self.machine.write_finished(result, edit_stamp(gate, typing), deferred_edits(typing, ps_editor));
+            step = merge_steps(step, finished);
+            if let Some(target) = self.machine.take_commit() {
+                self.spawn_commit(target);
+            }
+        }
+        if let Some(result) = self.poll_commit() {
+            let finished = self.machine.commit_finished(result, edit_stamp(gate, typing), deferred_edits(typing, ps_editor));
             step = merge_steps(step, finished);
         }
         if let Some(path) = self.machine.take_retitle() {
@@ -277,13 +291,22 @@ impl SingleImageController {
     /// changes (extension appended or replaced) while that file already exists is asked again with
     /// the full name (review M1: the dialog's own overwrite confirmation never saw it), until the user
     /// names a file that is written as named, or a free one, or cancels.
+    /// Where paths are not written in place (see `SaveMachine`), the answer's name is never changed,
+    /// so there is nothing to re-ask.
     fn spawn_picker(&mut self, format: ImageSaveFormat) {
         let (dir, file_name) = save_as_suggestion(&self.session.source_path, self.machine.target(), format);
+        let writes_in_place = picked_paths_are_user_files();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let extensions = save_as_filter_extensions(format);
             let mut picked = show_save_dialog(&extensions, dir.as_deref(), file_name, None);
-            while let Some(changed) = picked.as_deref().and_then(|path| changed_name_needs_confirmation(path, format, path_may_exist)) {
+            while let Some(changed) = picked
+                .as_ref()
+                .ok()
+                .and_then(Option::as_ref)
+                .filter(|_| writes_in_place)
+                .and_then(|target| changed_name_needs_confirmation(target.write_path(), format, path_may_exist))
+            {
                 let name = changed.file_name().map_or_else(|| changed.display().to_string(), |name| name.to_string_lossy().into_owned());
                 runtime_log::log_info(format!("[single_image] the chosen format changed the save dialog answer's name and that file exists; asking again.\nPath: {}", changed.display()));
                 let title = tf!("single_image.save_as.confirm_name_title", name = name);
@@ -297,21 +320,64 @@ impl SingleImageController {
         self.picker_rx = Some(rx);
     }
 
+    /// Publishes the written file to its dialog target on a worker (`SaveTarget::commit` blocks on
+    /// Android; a no-op on desktop). The answer is taken by [`Self::poll_commit`].
+    fn spawn_commit(&mut self, target: DialogTarget) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let name = target.display_name().to_owned();
+            let result = target.commit();
+            if let Err(err) = &result {
+                runtime_log::log_error(format!("[single_image] the written image could not be published to the chosen destination.\nName: {name}\nError: {err:?}"));
+            }
+            // The receiver outlives a commit (a close waits for `write_in_flight`); a gone one is logged.
+            if tx.send(result).is_err() {
+                runtime_log::log_warn("[single_image] save commit finished after its controller was dropped; result discarded");
+            }
+        });
+        self.commit_rx = Some(rx);
+    }
+
+    /// The commit worker's answer, once, as the machine's save result.
+    fn poll_commit(&mut self) -> Option<Result<(), SaveError>> {
+        let rx = self.commit_rx.as_ref()?;
+        match rx.try_recv() {
+            Ok(result) => {
+                self.commit_rx = None;
+                Some(result.map_err(|err| SaveError::Commit(err.user_message())))
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.commit_rx = None;
+                runtime_log::log_error("[single_image] the save commit worker ended without an answer.\nPossible cause: a panic while publishing the file");
+                Some(Err(SaveError::WorkerLost))
+            }
+        }
+    }
+
     /// The native «Сохранить как» dialog is open (it cannot be closed from here).
     pub(crate) fn picker_open(&self) -> bool {
         self.machine.picking_path()
     }
 
-    /// Feeds the file dialog's answer to the machine.
+    /// Feeds the file dialog's answer to the machine. A dialog that could not be shown (another
+    /// one open, no picker on this platform, backend failure) is logged with its typed error and
+    /// reported as `SaveError::PickerUnavailable` with the dialog layer's localized message.
     fn poll_picker(&mut self) -> Step {
         let Some(rx) = self.picker_rx.as_ref() else {
             return Step::Nothing;
         };
         match rx.try_recv() {
-            Ok(picked) => {
+            Ok(Ok(picked)) => {
                 self.picker_rx = None;
-                runtime_log::log_info(format!("[single_image] save dialog closed.\nPicked: {:?}", picked.as_ref().map(|path| path.display().to_string())));
+                runtime_log::log_info(format!("[single_image] save dialog closed.\nPicked: {:?}", picked.as_ref().map(|target| target.write_path().display().to_string())));
                 self.machine.picker_closed(picked)
+            }
+            Ok(Err(err)) => {
+                self.picker_rx = None;
+                runtime_log::log_error(format!("[single_image] the save dialog could not be shown.\nError: {err:?}"));
+                self.machine.picker_unavailable(err.user_message());
+                Step::Nothing
             }
             Err(TryRecvError::Empty) => Step::Nothing,
             Err(TryRecvError::Disconnected) => {
@@ -446,17 +512,31 @@ fn draw_format_panel(ui: &egui::Ui, anchor: &egui::Response) -> Option<FormatPan
     shown.inner.or_else(|| shown.response.should_close().then_some(FormatPanelChoice::Cancel))
 }
 
-/// Shows the blocking native save dialog (picker worker only) filtered to `extensions`, in `dir`
-/// with `file_name` preselected and an optional window `title`. `None` = cancelled.
-fn show_save_dialog(extensions: &[String], dir: Option<&Path>, file_name: String, title: Option<String>) -> Option<PathBuf> {
-    let mut dialog = rfd::FileDialog::new().add_filter(t!("single_image.save_as.images_filter"), extensions).set_file_name(file_name);
+/// Shows the blocking save dialog (picker worker only) filtered to `extensions`, in `dir` with
+/// `file_name` preselected and an optional window `title`. `Ok(None)` = cancelled. The answer is
+/// the dialog target: write its write path, then commit it (the machine and `spawn_commit`).
+///
+/// # Errors
+/// [`FileDialogError`] when no dialog could be shown.
+fn show_save_dialog(extensions: &[String], dir: Option<&Path>, file_name: String, title: Option<String>) -> Result<Option<DialogTarget>, FileDialogError> {
+    let mut request = FileDialogRequest::new(DialogKind::SaveFile).filter(t!("single_image.save_as.images_filter"), extensions).suggested_name(file_name);
     if let Some(dir) = dir {
-        dialog = dialog.set_directory(dir);
+        request = request.start_dir(dir);
     }
     if let Some(title) = title {
-        dialog = dialog.set_title(title);
+        request = request.title(title);
     }
-    dialog.save_file()
+    // `SaveFile` always answers `SaveTarget` (the ms-platform kind contract).
+    Ok(file_dialog::pick_blocking(request)?.and_then(Picked::into_save_target))
+}
+
+/// Whether paths the platform hands out (the opened image, a save dialog's write path) are the
+/// user's own files, so a later «Сохранить» may rewrite them in place. That is exactly when a
+/// picked directory path is usable in place (`PlatformFeature::PersistentDirectoryPicker`):
+/// desktop yes; Android SAF no — it yields app-storage copies and staging files published to
+/// document URIs, which must go through their dialog target every time.
+fn picked_paths_are_user_files() -> bool {
+    PlatformFeature::PersistentDirectoryPicker.is_available()
 }
 
 /// Whether something exists at `path` (a dangling symlink counts: writing there would replace it).
@@ -521,6 +601,8 @@ fn status_text(status: &Status) -> String {
 fn error_text(err: &SaveError) -> String {
     match err {
         SaveError::PickerFailed => t!("single_image.save.picker_error").to_owned(),
+        SaveError::PickerUnavailable(message) => tf!("single_image.save.picker_unavailable_error", err = message),
+        SaveError::Commit(message) => tf!("single_image.save.commit_error", err = message),
         SaveError::Busy => t!("single_image.save.busy_error").to_owned(),
         SaveError::NoPage => t!("single_image.save.no_page_error").to_owned(),
         SaveError::Compose(message) => tf!("single_image.save.compose_error", err = message),

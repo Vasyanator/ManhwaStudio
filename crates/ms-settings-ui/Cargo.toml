@@ -50,6 +50,10 @@ ms-tab-translation = { path = "../ms-tab-translation" }
 ms-text-util = { path = "../ms-text-util" }
 # Named worker threads: no pane may probe, spawn or write on the GUI thread.
 ms-thread = { path = "../ms-thread" }
+# Platform seams: the capability table (`PlatformFeature`) and the non-blocking folder picker
+# behind the General pane's "projects root" button. Cross-target (typed `Unavailable` where a
+# platform has no dialog).
+ms-platform = { path = "../ms-platform" }
 # The storage-mode conversion driver (`storage_mode::convert_globals`) the General pane's
 # Dev/Prod switch and the startup reconciliation run on a worker. A domain crate, not a
 # tab: it never depends back on this one.
@@ -81,8 +85,6 @@ ms-onnx-runtime = { path = "../ms-onnx-runtime" }
 ms-native-runtime = { path = "../ms-native-runtime" }
 # The startup-monitor selector of the General pane.
 ms-window-geometry = { path = "../ms-window-geometry" }
-# The native folder picker behind the General pane's "projects root" button.
-rfd.workspace = true
 # The OS-record probe behind the System registration warnings (`settings_warnings`
 # checks): `CopyIdentity`, `report::probe`, `badge_worthy`. No OS records exist on the web.
 ms-os-integration = { path = "../ms-os-integration" }

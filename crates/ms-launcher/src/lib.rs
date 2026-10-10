@@ -14,6 +14,7 @@ Main responsibilities:
 Key modules:
 - `app`: root `eframe::App` implementation
 - `background`: background catalog/validation workers
+- `confirm_modal`: in-app Yes/No confirmation (`egui::Modal`) for overwrite questions
 - `first_run_language`: first-run interface/typesetting language-selection modal
 - `main_page`: rendering of the current main page
 - `new_project`: detached "New Project" window runtime and UI
@@ -47,6 +48,7 @@ extern crate ms_i18n;
 
 pub mod app;
 pub mod background;
+mod confirm_modal;
 pub mod first_run_language;
 pub mod main_page;
 pub mod new_project;

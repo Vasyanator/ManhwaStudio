@@ -277,15 +277,15 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   "Импортировать архив со шрифтами", which is permanently `add_enabled(false)` and says on hover
   that the feature is not there yet — drawn rather than omitted so the planned capability is
   discoverable. The card-import button follows the same discipline where it cannot act: disabled
-  while a run is in flight, and disabled on the WEB build (`CARD_IMPORT_AVAILABLE`), which links
-  no native file dialog and would otherwise answer a click with silence. Neither is a buffered
+  while a run is in flight, and disabled where the platform has no file picker
+  (`CARD_IMPORT_AVAILABLE` = `ms_platform::PlatformFeature::FilePicker`, i.e. the web build). Neither is a buffered
   edit: both write to the store directly, like member removal.
 
 ## Font-card import (`font_groups.rs` + `font_card_psd.rs`)
 - The pipeline, all of it OFF the GUI thread: the click spawns one worker
   (`spawn_card_import`) carrying a SNAPSHOT of the loaded font identities; the worker opens the
-  native picker (`rfd`, `#[cfg(not(target_arch = "wasm32"))]` — the wasm build has no dialog and
-  logs a skipped pick, and the button is disabled there anyway), reads the card
+  picker (`ms_platform::file_dialog::pick_blocking`, `OpenFile`; a picker error is reported as
+  `CardImportOutcome::Failed` with its localized message), reads the card
   (`font_card_psd::read_font_card`), deduplicates it and
   resolves every name; the GUI polls ONE `mpsc` result with `try_recv` and schedules the next
   poll with `request_repaint_after(CARD_IMPORT_POLL_INTERVAL)` — NOT a bare `request_repaint`:
@@ -403,8 +403,8 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   `crates/ms-tab-typing/src/panel/MODULE_README.md`, "Font model exposure").
 - Do not block the GUI thread: font enumeration, font-file analysis, native file pickers,
   by-name system-font lookups and font-card PSD reading run on worker threads, results polled
-  over `mpsc`. `rfd` is a NON-wasm dependency, so every picker call site needs a
-  `#[cfg(target_arch = "wasm32")]` stub (this module compiles for the web build too).
+  over `mpsc`. Pickers go through `ms_platform::file_dialog`, which compiles on every target
+  and answers a typed `Unavailable` where there is none, so call sites need no cfg stub.
 - i18n: the font-settings strings keep the HISTORICAL `typing.font_settings.*` key namespace
   (the widget used to live under the typing panel). The namespace was intentionally NOT renamed
   on the move — renaming ~21 keys would churn every locale for no user benefit. UI-visible

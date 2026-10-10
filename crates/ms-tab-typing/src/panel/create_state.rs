@@ -246,6 +246,7 @@ impl TypingCreatePanelState {
             render_in_flight: false,
             needs_initial_preview: true,
             status_line,
+            right_section_dialog: None,
             preview_font_fallbacks: FontFallbackReport::default(),
             preview_texture: None,
             preview_size: [1, 1],

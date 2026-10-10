@@ -52,17 +52,14 @@ anyhow.workspace = true
 ms-text-util = { path = "../ms-text-util" }
 # Animated WebP hints carried by the canvas' bottom hint rows (`CanvasHintHelp`).
 ms-gifs = { path = "../ms-gifs" }
+# System clipboard text for the bubble paste flow (`ms_platform::clipboard`, every target).
+ms-platform = { path = "../ms-platform" }
 # Monotonic time that also works in a web build (debounce and animation timers).
 web-time.workspace = true
 # Parallel overlay tile preparation.
 rayon.workspace = true
 # Overlay raster decode/scale on the CPU side of the upload pipeline.
 image.workspace = true
-
-# Clipboard-backed bubble copy/paste. Native-only: there is no synchronous clipboard
-# on wasm, where the call sites are compiled out.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-arboard.workspace = true
 
 [dev-dependencies]
 # Temp directories for the `settings.json` persistence tests.

@@ -21,6 +21,7 @@ use cosmic_text::fontdb;
 use eframe::egui;
 use egui::{Color32, ColorImage, Stroke, TextureHandle, TextureOptions, Vec2};
 use image::RgbaImage;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, Picked};
 use serde_json::json;
 use std::env;
 use std::fs;
@@ -362,12 +363,20 @@ impl TextRenderTestApp {
             return;
         };
 
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name("render.png")
-            .add_filter("PNG image", &["png"])
-            .save_file()
-        else {
-            return;
+        // Dev tool: the dialog blocks this window on purpose (`pick_blocking` on the GUI thread
+        // is acceptable only in a throwaway tester, never in product UI).
+        let request = FileDialogRequest::new(DialogKind::SaveFile).suggested_name("render.png").filter("PNG image", &["png"]);
+        let target = match file_dialog::pick_blocking(request) {
+            // `SaveFile` always answers `SaveTarget` (the ms-platform kind contract).
+            Ok(picked) => match picked.and_then(Picked::into_save_target) {
+                Some(target) => target,
+                None => return,
+            },
+            Err(err) => {
+                eprintln!("text_render_test: save dialog failed: {err:?}");
+                self.status_line = err.user_message();
+                return;
+            }
         };
 
         let Some(rgba) = RgbaImage::from_raw(image.width, image.height, image.rgba.clone()) else {
@@ -375,12 +384,18 @@ impl TextRenderTestApp {
             return;
         };
 
-        match rgba.save(&path) {
+        if let Err(err) = rgba.save(target.write_path()) {
+            self.status_line = format!("Ошибка сохранения PNG: {err}");
+            return;
+        }
+        let name = target.write_path().display().to_string();
+        match target.commit() {
             Ok(()) => {
-                self.status_line = format!("Сохранено: {}", path.display());
+                self.status_line = format!("Сохранено: {name}");
             }
             Err(err) => {
-                self.status_line = format!("Ошибка сохранения PNG: {err}");
+                eprintln!("text_render_test: publishing the saved PNG failed: {err:?}");
+                self.status_line = err.user_message();
             }
         }
     }

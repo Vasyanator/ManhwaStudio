@@ -1624,6 +1624,12 @@ has exactly ONE owner and is unit-testable without a GUI (`panel/tests.rs`):
 - `export_dialog_kind(format)` / `export_button_label_key(format)` — one decision drives BOTH the
   button's caption and which dialog opens (save-file for `Pdf`, folder picker otherwise), so the
   two can never disagree. `pdf_export_file_name(base)` builds the prefilled «‹тайтл› ‹глава›.pdf».
+- The dialogs themselves are non-blocking `ms_platform::file_dialog` requests built by
+  `create_sections::{export_dialog_request, image_file_request}` (folder = `SaveIntoFolder`,
+  PDF = `SaveFile`). The pending handle is `TypingCreatePanelState::right_section_dialog`, polled
+  once per frame by `poll_right_section_dialog`; the export button and «pick image from file»
+  stay disabled while it is open, and a dialog failure goes to the panel's `status_line`. The
+  picked `FolderTarget` / `SaveTarget` IS the `TypingExportDestination`.
 
 **Invariant — the confirmation may not outlive the block's visibility.** `repaginate_pages_warning`
 lives on the shared `TypingTopPanelState`, but the block is drawn only while the panel is in

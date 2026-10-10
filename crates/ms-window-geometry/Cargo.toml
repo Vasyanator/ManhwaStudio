@@ -38,7 +38,7 @@ serde_json.workspace = true
 # `#[derive(thiserror::Error)]` enum — same major as the rest of the workspace.
 thiserror.workspace = true
 
-# On the free-unix platforms winit refuses to compile without at least one windowing
+# On the free-unix platforms (unix minus macOS and Android) winit refuses to compile without at least one windowing
 # backend (`compile_error!("The platform you're compiling for is not supported by winit")`,
 # `winit-0.30.13/src/platform_impl/mod.rs`). In the workspace build eframe's `x11`/`wayland`
 # features already select both through `egui-winit`, but cargo does NOT unify features for a
@@ -50,7 +50,9 @@ thiserror.workspace = true
 # feature -> `smithay-clipboard/dlopen` -> `wayland-backend/dlopen`), so naming it here is
 # likewise a no-op for the union. `wayland-csd-adwaita` stays OFF deliberately: this crate
 # must not turn client-side decorations on behind eframe's back.
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+# Android is `unix` but has neither X11 nor Wayland: it gets its own android-activity backend
+# in the block below, so it is excluded here to keep those backends out of Android builds.
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
 winit = { version = "0.30", default-features = false, features = ["x11", "wayland", "wayland-dlopen"] }
 
 # Android: winit likewise refuses to compile without an android-activity backend. This names

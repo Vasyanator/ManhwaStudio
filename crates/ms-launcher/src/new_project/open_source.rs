@@ -17,14 +17,15 @@ Key structures:
 
 Notes:
 The GUI polls this module for completed import events. Long-running file I/O stays off the
-main thread to keep the launcher responsive.
+main thread to keep the launcher responsive. The source picker is a non-blocking
+`ms_platform::file_dialog` request that `poll` drains before the import worker starts;
+`is_loading` covers the open picker too, so every import trigger stays disabled meanwhile.
 */
 
 use crate::new_project::ribbon::{ImportedImage, RibbonPage, build_ribbon_pages};
 use image::{DynamicImage, ImageFormat, ImageReader};
+use ms_platform::file_dialog::{self, DialogKind, FileDialogError, FileDialogRequest, PendingDialog, Waker};
 use ms_thread as thread;
-#[cfg(not(target_arch = "wasm32"))]
-use rfd::FileDialog;
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -36,15 +37,10 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use web_time::{SystemTime, UNIX_EPOCH};
 
 const IMAGE_SIGNATURE_BYTES: usize = 32;
-// Picker filter lists are only consumed by the native file dialog (`rfd`); gated out
-// of the web build, which has no dialog to filter.
-#[cfg(not(target_arch = "wasm32"))]
+// Picker filter lists of the source file dialog.
 const IMAGE_DIALOG_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff"];
-#[cfg(not(target_arch = "wasm32"))]
 const HTML_DIALOG_EXTENSIONS: &[&str] = &["html", "htm"];
-#[cfg(not(target_arch = "wasm32"))]
 const ARCHIVE_DIALOG_EXTENSIONS: &[&str] = &["zip", "rar", "7z", "tar", "tgz", "gz"];
-#[cfg(not(target_arch = "wasm32"))]
 const SUPPORTED_DIALOG_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "bmp", "webp", "tif", "tiff", "html", "htm", "zip", "rar", "7z", "tar",
     "tgz", "gz",
@@ -56,6 +52,7 @@ pub enum OpenSourceKind {
     File,
 }
 
+#[derive(Debug)]
 pub struct SourceImportOptions {
     pub filter_same_width: bool,
     pub extra_name_patterns: String,
@@ -66,8 +63,17 @@ struct PendingSourceLoad {
     rx: Receiver<SourceLoadWorkerEvent>,
 }
 
+/// An open source picker and the import it starts once a path is chosen.
+#[derive(Debug)]
+struct PendingSourcePick {
+    kind: OpenSourceKind,
+    options: SourceImportOptions,
+    dialog: PendingDialog,
+}
+
 pub struct SourceImportController {
     pending: Option<PendingSourceLoad>,
+    picking: Option<PendingSourcePick>,
 }
 
 pub struct SourceLoadSuccess {
@@ -80,6 +86,14 @@ pub struct SourceLoadSuccess {
 }
 
 pub enum SourceLoadEvent {
+    /// The picker returned a source and its import worker started.
+    LoadStarted { kind: OpenSourceKind },
+    /// The picker itself failed (another dialog open, unavailable on this platform, backend
+    /// error). Nothing was imported and the current ribbon is untouched.
+    PickFailed {
+        user_message: String,
+        log_message: String,
+    },
     Progress {
         stage: String,
         current: usize,
@@ -125,19 +139,58 @@ struct ImportedImageBatch {
 
 impl SourceImportController {
     pub fn new() -> Self {
-        Self { pending: None }
+        Self { pending: None, picking: None }
     }
 
+    /// True while a source picker is open or an import worker runs.
     pub fn is_loading(&self) -> bool {
-        self.pending.is_some()
+        self.pending.is_some() || self.picking.is_some()
     }
 
-    pub fn begin_pick(&mut self, kind: OpenSourceKind, options: SourceImportOptions) -> bool {
-        let Some(path) = pick_source(kind) else {
-            return false;
+    /// Opens the source picker for `kind` without blocking. `poll` reports
+    /// `SourceLoadEvent::LoadStarted` once a path is chosen (the import then runs with
+    /// `options`), `PickFailed` when the dialog fails, and nothing on a cancel. Ignored while
+    /// another pick or import is in progress. `waker` is called when the picker answers.
+    pub fn begin_pick(&mut self, kind: OpenSourceKind, options: SourceImportOptions, waker: Option<Waker>) {
+        if self.is_loading() {
+            return;
+        }
+        let dialog = file_dialog::request(source_pick_request(kind), waker);
+        self.track_pick(kind, options, dialog);
+    }
+
+    /// Stores an open picker; split from `begin_pick` so tests can inject a resolved dialog.
+    fn track_pick(&mut self, kind: OpenSourceKind, options: SourceImportOptions, dialog: PendingDialog) {
+        self.picking = Some(PendingSourcePick { kind, options, dialog });
+    }
+
+    /// Takes the picker's answer once it arrives and starts the import for a chosen path.
+    fn poll_pick(&mut self) -> Option<SourceLoadEvent> {
+        let result = self.picking.as_mut()?.dialog.poll()?;
+        let PendingSourcePick { kind, options, .. } = self.picking.take()?;
+        let picked = match result {
+            Ok(Some(picked)) => picked,
+            Ok(None) => return None,
+            Err(err) => {
+                return Some(SourceLoadEvent::PickFailed {
+                    user_message: err.user_message(),
+                    log_message: format!("{kind:?} source picker failed: {err:?}"),
+                });
+            }
+        };
+        let path = match kind {
+            OpenSourceKind::Folder => picked.into_folder(),
+            OpenSourceKind::File => picked.into_file().map(|file| file.path),
+        };
+        let Some(path) = path else {
+            // The kind and the `Picked` variant always match (ms-platform contract).
+            return Some(SourceLoadEvent::PickFailed {
+                user_message: FileDialogError::WorkerLost.user_message(),
+                log_message: format!("{kind:?} source picker returned a result of another kind"),
+            });
         };
         self.begin_load(kind, path, options);
-        true
+        Some(SourceLoadEvent::LoadStarted { kind })
     }
 
     pub fn begin_load(
@@ -152,6 +205,9 @@ impl SourceImportController {
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) -> Option<SourceLoadEvent> {
+        if let Some(event) = self.poll_pick() {
+            return Some(event);
+        }
         let pending = self.pending.take()?;
         let mut last_progress = None;
         loop {
@@ -199,25 +255,16 @@ impl SourceImportController {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn pick_source(kind: OpenSourceKind) -> Option<PathBuf> {
+/// The picker request for a source of `kind`: a folder, or one file of the importable types.
+fn source_pick_request(kind: OpenSourceKind) -> FileDialogRequest {
     match kind {
-        OpenSourceKind::Folder => FileDialog::new().pick_folder(),
-        OpenSourceKind::File => FileDialog::new()
-            .add_filter(t!("launcher.new_project.source.supported_files_filter"), SUPPORTED_DIALOG_EXTENSIONS)
-            .add_filter(t!("launcher.new_project.source.images_filter"), IMAGE_DIALOG_EXTENSIONS)
-            .add_filter("HTML", HTML_DIALOG_EXTENSIONS)
-            .add_filter(t!("launcher.new_project.source.archives_filter"), ARCHIVE_DIALOG_EXTENSIONS)
-            .pick_file(),
+        OpenSourceKind::Folder => FileDialogRequest::new(DialogKind::OpenFolder),
+        OpenSourceKind::File => FileDialogRequest::new(DialogKind::OpenFile)
+            .filter(t!("launcher.new_project.source.supported_files_filter"), SUPPORTED_DIALOG_EXTENSIONS)
+            .filter(t!("launcher.new_project.source.images_filter"), IMAGE_DIALOG_EXTENSIONS)
+            .filter("HTML", HTML_DIALOG_EXTENSIONS)
+            .filter(t!("launcher.new_project.source.archives_filter"), ARCHIVE_DIALOG_EXTENSIONS),
     }
-}
-
-/// Web stub: native file/folder pickers (`rfd`) have no browser equivalent. Returns
-/// `None` (as a cancelled pick) and logs the dropped capability.
-#[cfg(target_arch = "wasm32")]
-fn pick_source(_kind: OpenSourceKind) -> Option<PathBuf> {
-    ms_log::runtime_log::log_warn("source file picker unavailable on web build");
-    None
 }
 
 fn spawn_source_loader(
@@ -1589,6 +1636,7 @@ fn get_html_attr<'a>(attrs: &'a str, attr_name: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use image::Rgba;
+    use ms_platform::file_dialog::{Picked, PickedFile};
     use std::error::Error;
 
     #[test]
@@ -1632,5 +1680,74 @@ mod tests {
     #[test]
     fn non_image_prefix_has_no_image_format() {
         assert_eq!(guess_image_format_from_prefix(b"not an image"), None);
+    }
+
+    fn test_options() -> SourceImportOptions {
+        SourceImportOptions { filter_same_width: false, extra_name_patterns: String::new() }
+    }
+
+    /// A path under the temp dir that no test creates: the loader started for it fails on its
+    /// own, without the test writing anything.
+    fn missing_source_path() -> PathBuf {
+        std::env::temp_dir().join(format!("manhwastudio_missing_source_{}_{}", std::process::id(), line!()))
+    }
+
+    #[test]
+    fn open_picker_counts_as_loading_until_it_answers() {
+        let mut controller = SourceImportController::new();
+        controller.track_pick(OpenSourceKind::Folder, test_options(), PendingDialog::ready(Ok(None)));
+        assert!(controller.is_loading(), "triggers must stay disabled while the picker is open");
+    }
+
+    #[test]
+    fn cancelled_pick_reports_nothing_and_ends_loading() {
+        let ctx = egui::Context::default();
+        let mut controller = SourceImportController::new();
+        controller.track_pick(OpenSourceKind::File, test_options(), PendingDialog::ready(Ok(None)));
+        assert!(controller.poll(&ctx).is_none());
+        assert!(!controller.is_loading());
+    }
+
+    #[test]
+    fn failed_pick_is_a_pick_failure_not_a_load_failure() {
+        let ctx = egui::Context::default();
+        let mut controller = SourceImportController::new();
+        controller.track_pick(OpenSourceKind::Folder, test_options(), PendingDialog::ready(Err(FileDialogError::Busy)));
+        match controller.poll(&ctx) {
+            Some(SourceLoadEvent::PickFailed { user_message, .. }) => assert!(!user_message.is_empty()),
+            _ => panic!("a dialog error must surface as PickFailed (the ribbon stays untouched)"),
+        }
+        assert!(!controller.is_loading());
+    }
+
+    #[test]
+    fn picked_folder_starts_the_import() {
+        let ctx = egui::Context::default();
+        let mut controller = SourceImportController::new();
+        let picked = Picked::Folder(missing_source_path());
+        controller.track_pick(OpenSourceKind::Folder, test_options(), PendingDialog::ready(Ok(Some(picked))));
+        assert!(matches!(controller.poll(&ctx), Some(SourceLoadEvent::LoadStarted { kind: OpenSourceKind::Folder })));
+        assert!(controller.is_loading(), "the import worker runs after the pick");
+    }
+
+    #[test]
+    fn picked_file_starts_the_import() {
+        let ctx = egui::Context::default();
+        let mut controller = SourceImportController::new();
+        let path = missing_source_path();
+        let picked = Picked::Files(vec![PickedFile { display_name: "source.zip".to_string(), path }]);
+        controller.track_pick(OpenSourceKind::File, test_options(), PendingDialog::ready(Ok(Some(picked))));
+        assert!(matches!(controller.poll(&ctx), Some(SourceLoadEvent::LoadStarted { kind: OpenSourceKind::File })));
+        assert!(controller.is_loading());
+    }
+
+    #[test]
+    fn mismatched_pick_is_reported_and_starts_nothing() {
+        let ctx = egui::Context::default();
+        let mut controller = SourceImportController::new();
+        let picked = Picked::Folder(missing_source_path());
+        controller.track_pick(OpenSourceKind::File, test_options(), PendingDialog::ready(Ok(Some(picked))));
+        assert!(matches!(controller.poll(&ctx), Some(SourceLoadEvent::PickFailed { .. })));
+        assert!(!controller.is_loading());
     }
 }

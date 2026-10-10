@@ -10,14 +10,15 @@ Key functions:
 - run(): builds and shows the rfd dialog for one request.
 
 Notes:
-`OpenFolder`, `SaveIntoFolder` and `PickDirectoryPath` all map to `pick_folder`; the targets'
+`OpenFolder`, `SaveIntoFolder` and `PickDirectoryPath` all map to `pick_folder`. A `SaveFile`
+name typed without an extension gets the first filter's first extension. The targets'
 `commit()` is a no-op here because the chosen path IS the destination. On macOS rfd forwards a
 dialog opened off the main thread to the main thread itself.
 */
 
 use std::path::PathBuf;
 
-use super::{Completion, DialogKind, DropGuard, FileDialogError, FileDialogRequest, Picked, picked_from_paths};
+use super::{Completion, DialogKind, DropGuard, FileDialogError, FileDialogRequest, Picked, picked_from_paths, with_default_extension};
 
 /// Starts `request` on a detached `file-dialog` thread. A panic inside rfd drops the completion,
 /// which the requester sees as `WorkerLost`.
@@ -57,7 +58,8 @@ fn run(request: &FileDialogRequest) -> Option<Picked> {
         DialogKind::OpenFile => dialog.pick_file().into_iter().collect(),
         DialogKind::OpenFiles => dialog.pick_files().unwrap_or_default(),
         DialogKind::OpenFolder | DialogKind::SaveIntoFolder | DialogKind::PickDirectoryPath => dialog.pick_folder().into_iter().collect(),
-        DialogKind::SaveFile => dialog.save_file().into_iter().collect(),
+        // Native save dialogs do not reliably add the filter's extension to a typed name.
+        DialogKind::SaveFile => dialog.save_file().map(|path| with_default_extension(path, &request.filters)).into_iter().collect(),
     };
     picked_from_paths(request.kind, paths)
 }

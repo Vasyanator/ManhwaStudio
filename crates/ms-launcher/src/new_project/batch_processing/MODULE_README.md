@@ -59,11 +59,15 @@ startup `ready` event, and talk JSON-RPC over stdio for the duration of the run.
   in-flight receiver. The worker's `send` then fails (already handled as a log line) instead of
   parking a result that the next opening would apply to a different graph, and the reopened
   window is not stuck showing the "dialog open" spinner with Save/Load disabled.
-- On the web build there is no `rfd`, so `pick_path` answers with a ready-made
-  `FileTaskEvent::Failed` carrying a `*_web_unsupported` message: the caller has one code path
-  and the missing capability is reported rather than silently dropped. The filesystem half is
-  not gated — a save with a remembered `save_path` skips the dialog entirely and still reaches
-  `std::fs::write`, reporting `save_file_error` if that fails.
+- Dialogs go through `ms_platform::file_dialog::pick_blocking` (inside the worker). A target
+  without the dialog (web; `PickDirectoryPath` on Android) answers with a typed
+  `FileDialogError`, which `pick` turns into a `FileTaskEvent::Failed` carrying its
+  `user_message`: the caller has one code path and the missing capability is reported rather
+  than silently dropped. A graph saved to a picked `SaveTarget` is written completely and then
+  `commit()`ed on the same worker. A save with a remembered `save_path` skips the dialog and
+  writes that path in place (reporting `save_file_error` if that fails) only where
+  `PlatformFeature::PersistentDirectoryPicker` is available; elsewhere (Android) the path is a
+  staging file or an app-storage copy, so every save goes through the SaveFile dialog.
 
 ## Widgets
 - Node parameter editors and the variables panel use the project's `Wheel*` widgets

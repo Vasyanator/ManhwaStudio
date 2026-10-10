@@ -95,11 +95,10 @@ thiserror.workspace = true
 web-time.workspace = true
 # The watermark library's on-disk bundle format.
 zip.workspace = true
-
-# Native file dialogs behind the model / watermark import and export controls. Native-only:
-# there is no `rfd` on wasm, where the call sites are compiled out.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-rfd.workspace = true
+# Non-blocking file dialogs behind the FLUX.2 model paths, the prompt-cache import/export and
+# the watermark library's import/export controls. Compiled on every target: a platform
+# without a dialog answers with a typed error.
+ms-platform = { path = "../ms-platform" }
 
 [dev-dependencies]
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test

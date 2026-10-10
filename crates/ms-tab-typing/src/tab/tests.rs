@@ -6374,6 +6374,16 @@ fn composed_ribbon_page(width_px: u32, height_px: u32, first_ribbon_row: u32) ->
     TypingComposedPage { rgba, width_px, height_px }
 }
 
+/// A desktop-shaped folder destination at `dir` (the `ms_platform` test door).
+fn folder_destination(dir: PathBuf) -> TypingExportDestination {
+    TypingExportDestination::Folder(ms_platform::file_dialog::FolderTarget::for_test(dir))
+}
+
+/// A desktop-shaped PDF destination at `file` (the `ms_platform` test door).
+fn pdf_destination(file: PathBuf) -> TypingExportDestination {
+    TypingExportDestination::PdfFile(ms_platform::file_dialog::SaveTarget::for_test(file))
+}
+
 /// Builds an export request; every test below varies only the three fields it cares about.
 fn export_request(destination: TypingExportDestination, format: TypingExportFormat, repaginate_enabled: bool) -> TypingExportRequest {
     let repaginate = crate::export_repaginate::TypingRepaginateSettings { enabled: repaginate_enabled, ..Default::default() };
@@ -6424,38 +6434,38 @@ fn export_base_name_joins_title_and_chapter_and_degrades_to_empty() {
 
 #[test]
 fn export_route_matches_format_to_destination() {
-    let folder = TypingExportDestination::Folder(PathBuf::from("/out/chapter"));
-    let file = TypingExportDestination::PdfFile(PathBuf::from("/out/chapter.pdf"));
+    let folder = || folder_destination(PathBuf::from("/out/chapter"));
+    let file = || pdf_destination(PathBuf::from("/out/chapter.pdf"));
 
     assert_eq!(
-        resolve_export_route(&export_request(folder.clone(), TypingExportFormat::Png, false)).unwrap(),
+        resolve_export_route(&export_request(folder(), TypingExportFormat::Png, false)).unwrap(),
         TypingExportRoute::StreamedFiles { dir: PathBuf::from("/out/chapter") }
     );
     assert_eq!(
-        resolve_export_route(&export_request(folder.clone(), TypingExportFormat::Psd, false)).unwrap(),
+        resolve_export_route(&export_request(folder(), TypingExportFormat::Psd, false)).unwrap(),
         TypingExportRoute::StreamedFiles { dir: PathBuf::from("/out/chapter") }
     );
     assert_eq!(
-        resolve_export_route(&export_request(folder.clone(), TypingExportFormat::Png, true)).unwrap(),
+        resolve_export_route(&export_request(folder(), TypingExportFormat::Png, true)).unwrap(),
         TypingExportRoute::RepaginatedPng { dir: PathBuf::from("/out/chapter") }
     );
     assert_eq!(
-        resolve_export_route(&export_request(file.clone(), TypingExportFormat::Pdf, true)).unwrap(),
+        resolve_export_route(&export_request(file(), TypingExportFormat::Pdf, true)).unwrap(),
         TypingExportRoute::Pdf { file: PathBuf::from("/out/chapter.pdf") }
     );
 
     // Both mismatch directions are rejected instead of being reinterpreted: a PDF cannot be
     // written into a folder of per-page files, and a per-page format cannot target one file.
-    assert!(resolve_export_route(&export_request(folder.clone(), TypingExportFormat::Pdf, false)).is_err());
-    assert!(resolve_export_route(&export_request(file.clone(), TypingExportFormat::Png, false)).is_err());
-    assert!(resolve_export_route(&export_request(file, TypingExportFormat::Psd, false)).is_err());
+    assert!(resolve_export_route(&export_request(folder(), TypingExportFormat::Pdf, false)).is_err());
+    assert!(resolve_export_route(&export_request(file(), TypingExportFormat::Png, false)).is_err());
+    assert!(resolve_export_route(&export_request(file(), TypingExportFormat::Psd, false)).is_err());
 }
 
 #[test]
 fn export_route_rejects_psd_combined_with_repagination() {
     // A re-sliced page is no longer the page whose layer stack a PSD carries, so the flag is
     // reported as an error rather than silently ignored (the panel also hides the section).
-    let request = export_request(TypingExportDestination::Folder(PathBuf::from("/out/chapter")), TypingExportFormat::Psd, true);
+    let request = export_request(folder_destination(PathBuf::from("/out/chapter")), TypingExportFormat::Psd, true);
     assert!(resolve_export_route(&request).is_err());
 }
 
@@ -6553,7 +6563,7 @@ fn a_collecting_export_run_drains_its_window_and_writes_every_output_page() {
         })
         .collect();
     let request = TypingExportRequest {
-        destination: TypingExportDestination::Folder(out_dir.clone()),
+        destination: folder_destination(out_dir.clone()),
         format: TypingExportFormat::Png,
         repaginate: TypingRepaginateSettings { enabled: true, mode: TypingRepaginateMode::FixedHeight, fixed_height_px: 10, ..Default::default() },
         output_base_name: "Тайтл 1".to_string(),
@@ -6600,7 +6610,7 @@ fn a_pdf_export_run_writes_one_document_and_rejects_a_folder_destination() {
 
     let jobs: Vec<TypingExportPageJob> = (0..3).map(|page_idx| plain_export_job(&dir, page_idx, 7, 4, None, TypingExportFormat::Pdf)).collect();
     let request = TypingExportRequest {
-        destination: TypingExportDestination::PdfFile(pdf_path.clone()),
+        destination: pdf_destination(pdf_path.clone()),
         format: TypingExportFormat::Pdf,
         repaginate: crate::export_repaginate::TypingRepaginateSettings::default(),
         output_base_name: "Тайтл 1 Глава 1".to_string(),
@@ -6608,6 +6618,8 @@ fn a_pdf_export_run_writes_one_document_and_rejects_a_folder_destination() {
     let (tx, _rx) = mpsc::channel::<TypingExportEvent>();
     let result = export_typing_pages(jobs, request, None, tx).unwrap();
     assert_eq!((result.exported, result.total), (3, 3));
+    // The result names the picked file, never the write path (a staging path on Android).
+    assert_eq!(result.destination_name, "Тайтл 1 Глава 1.pdf");
     // The parent directory is created by the run, and the document is written once, whole.
     let bytes = std::fs::read(&pdf_path).unwrap();
     assert!(bytes.starts_with(b"%PDF-"), "a PDF document was written");
@@ -6615,7 +6627,7 @@ fn a_pdf_export_run_writes_one_document_and_rejects_a_folder_destination() {
     // The same jobs with a FOLDER destination are a routing error, not a guess.
     let jobs: Vec<TypingExportPageJob> = (0..3).map(|page_idx| plain_export_job(&dir, page_idx, 7, 4, None, TypingExportFormat::Pdf)).collect();
     let bad_request = TypingExportRequest {
-        destination: TypingExportDestination::Folder(dir.join("out")),
+        destination: folder_destination(dir.join("out")),
         format: TypingExportFormat::Pdf,
         repaginate: crate::export_repaginate::TypingRepaginateSettings::default(),
         output_base_name: String::new(),
@@ -6679,13 +6691,13 @@ fn exploding_export_jobs(dir: &Path, pages: usize, exploding_page_idx: usize) ->
 /// of failing it.
 fn collecting_pdf_run_with_deadline(jobs: Vec<TypingExportPageJob>, pdf_path: &Path, compose: fn(&TypingExportPageJob) -> Result<TypingComposedPage, String>, deadline: std::time::Duration) -> Result<TypingExportResult, String> {
     let sink = TypingCollectedSink::Pdf { file: pdf_path.to_path_buf(), builder: crate::pdf_export::TypingPdfBuilder::new() };
-    let destination = TypingExportDestination::PdfFile(pdf_path.to_path_buf());
+    let destination_name = pdf_path.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
     // `progress_rx` is kept alive for the whole run: the pipeline tolerates a closed progress
     // channel, but these tests are about the worker pool, not about that tolerance.
     let (progress_tx, progress_rx) = mpsc::channel::<TypingExportEvent>();
     let (done_tx, done_rx) = mpsc::channel::<Result<TypingExportResult, String>>();
     let worker = thread::spawn(move || {
-        let outcome = export_typing_pages_collected(jobs, sink, None, None, destination, progress_tx, compose);
+        let outcome = export_typing_pages_collected(jobs, sink, None, None, destination_name, progress_tx, compose);
         // The only receiver is `done_rx` below; a send failure would mean the test already gave
         // up on the deadline, and there is nobody left to hand the outcome to.
         let _ = done_tx.send(outcome);

@@ -19,7 +19,9 @@ Main responsibilities:
   (add a level, export, delete);
 - ask the tool to reserve the next canvas selection for the library, and fold the crop it
   captures back in;
-- run every one of those off the GUI thread and poll the channel per frame.
+- run every one of those off the GUI thread and poll the channel per frame;
+- open the library's file dialogs without blocking (`picker_request`, polled by `poll_picker`);
+  an export writes the whole archive / folder, then commits the dialog's target on the worker.
 
 Key structures:
 - `WatermarkLibraryWindow` — the whole state, owned by `WatermarkRemovalTool`.
@@ -112,6 +114,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use eframe::egui;
 use egui::{Color32, TextureHandle, TextureOptions};
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog};
 use ms_thread as thread;
 use ms_widgets::ViewportColorSelector;
 
@@ -512,8 +515,9 @@ pub(super) struct WatermarkLibraryWindow {
     intake: IntakeForm,
     rx: Option<Receiver<LibraryEvent>>,
     status: Option<String>,
-    picker_rx: Option<Receiver<Option<Vec<PathBuf>>>>,
-    picker: Option<PickerPurpose>,
+    /// The open file dialog and what it was opened for. One at a time; every library button
+    /// is disabled meanwhile (`busy`).
+    picker: Option<(PickerPurpose, PendingDialog)>,
     /// Set whenever the on-disk library changed, so the chapter mode's own picker reloads.
     changed: bool,
     /// Set whenever something the panel SHOWS changed outside the draw — a status, a refusal
@@ -668,7 +672,7 @@ impl WatermarkLibraryWindow {
 
     /// True while a worker or a file dialog owns the library state.
     fn busy(&self) -> bool {
-        self.rx.is_some() || self.picker_rx.is_some()
+        self.rx.is_some() || self.picker.is_some()
     }
 
     /// Starts a worker, refusing a second job while one is in flight: two jobs would leave
@@ -932,36 +936,58 @@ impl WatermarkLibraryWindow {
         self.pending.retain(|crop| !committed.contains(&crop.path));
     }
 
-    /// Folds a finished file pick into the form or starts the job it was picked for.
+    /// Folds a finished file pick into the form or starts the job it was picked for. A cancel
+    /// is a no-op; a dialog failure lands on the status line.
     fn poll_picker(&mut self) {
-        let Some(rx) = self.picker_rx.as_ref() else {
+        let Some(result) = self.picker.as_mut().and_then(|(_, dialog)| dialog.poll()) else {
             return;
         };
-        let picked = match rx.try_recv() {
-            Ok(picked) => picked,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => None,
-        };
-        self.picker_rx = None;
-        let Some(purpose) = self.picker.take() else {
+        let Some((purpose, _)) = self.picker.take() else {
             return;
         };
-        let Some(paths) = picked.filter(|paths| !paths.is_empty()) else {
-            return;
+        let picked = match result {
+            Ok(Some(picked)) => picked,
+            Ok(None) => return,
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!("[cleaning] watermark library {purpose:?} file dialog failed: {err:?}"));
+                self.set_status(err.user_message());
+                return;
+            }
+        };
+        // The `Picked` variant always matches the request kind (`picker_request`); a mismatch is
+        // a platform-layer bug, logged and treated as a cancel.
+        let mismatch = |purpose: &PickerPurpose| {
+            ms_log::runtime_log::log_error(format!("[cleaning] watermark library {purpose:?}: file dialog answered with the wrong result kind"));
         };
         match purpose {
             PickerPurpose::ReferenceCrops => {
+                let Some(files) = picked.into_files() else {
+                    mismatch(&purpose);
+                    return;
+                };
                 self.intake.open = true;
                 self.intake.target = None;
-                self.intake.files = paths;
+                self.intake.files = files.into_iter().map(|file| file.path).collect();
             }
             PickerPurpose::ImproveEntry(entry_id) => {
+                let Some(files) = picked.into_files() else {
+                    mismatch(&PickerPurpose::ImproveEntry(entry_id));
+                    return;
+                };
                 self.intake.open = true;
                 self.intake.target = Some(entry_id);
-                self.intake.files = paths;
+                self.intake.files = files.into_iter().map(|file| file.path).collect();
             }
             PickerPurpose::ImportArchive | PickerPurpose::ImportFolder => {
-                let source = paths[0].clone();
+                let source = if purpose == PickerPurpose::ImportArchive {
+                    picked.into_file().map(|file| file.path)
+                } else {
+                    picked.into_folder()
+                };
+                let Some(source) = source else {
+                    mismatch(&purpose);
+                    return;
+                };
                 self.start_job(move |tx| {
                     let _ = tx.send(match import_entry(&source) {
                         Ok(entry_id) => LibraryEvent::Changed(tf!(
@@ -973,24 +999,42 @@ impl WatermarkLibraryWindow {
                 });
             }
             PickerPurpose::ExportArchive(entry_id) => {
-                let dest = paths[0].clone();
+                let Some(target) = picked.into_save_target() else {
+                    mismatch(&PickerPurpose::ExportArchive(entry_id));
+                    return;
+                };
                 self.start_job(move |tx| {
-                    let _ = tx.send(match export_entry_zip(&entry_id, &dest) {
-                        Ok(()) => LibraryEvent::Changed(tf!(
+                    // Write the whole archive, THEN publish it (a blocking stream on Android).
+                    let result = export_entry_zip(&entry_id, target.write_path()).and_then(|()| {
+                        let name = target.display_name().to_owned();
+                        target.commit().map(|()| name).map_err(|err| err.user_message())
+                    });
+                    let _ = tx.send(match result {
+                        Ok(name) => LibraryEvent::Changed(tf!(
                             "cleaning.tools.watermark.chapter.library_exported_status",
-                            path = dest.display()
+                            path = name
                         )),
                         Err(err) => LibraryEvent::failed(err),
                     });
                 });
             }
             PickerPurpose::ExportFolder(entry_id) => {
-                let parent = paths[0].clone();
+                let Some(target) = picked.into_folder_target() else {
+                    mismatch(&PickerPurpose::ExportFolder(entry_id));
+                    return;
+                };
                 self.start_job(move |tx| {
-                    let _ = tx.send(match export_entry_dir(&entry_id, &parent) {
-                        Ok(path) => LibraryEvent::Changed(tf!(
+                    // Copy the entry folder into the destination, THEN publish it (Android: a
+                    // blocking copy into the document tree). The status names the copy relative
+                    // to the folder the user chose, which is all the user ever saw of it.
+                    let result = export_entry_dir(&entry_id, target.write_dir()).and_then(|written| {
+                        let shown = Path::new(target.display_name()).join(written.file_name().unwrap_or(written.as_os_str()));
+                        target.commit().map(|()| shown).map_err(|err| err.user_message())
+                    });
+                    let _ = tx.send(match result {
+                        Ok(shown) => LibraryEvent::Changed(tf!(
                             "cleaning.tools.watermark.chapter.library_exported_status",
-                            path = path.display()
+                            path = shown.display()
                         )),
                         Err(err) => LibraryEvent::failed(err),
                     });
@@ -999,13 +1043,14 @@ impl WatermarkLibraryWindow {
         }
     }
 
-    /// Opens a native file dialog on a worker thread for `purpose`.
+    /// Opens a non-blocking file dialog for `purpose`; at most one at a time.
     fn start_picker(&mut self, purpose: PickerPurpose) {
-        if self.picker_rx.is_some() {
+        if self.picker.is_some() {
             return;
         }
-        self.picker_rx = Some(spawn_picker(&purpose));
-        self.picker = Some(purpose);
+        // No waker: `poll` requests a repaint every frame while the panel is `busy`.
+        let dialog = file_dialog::request(picker_request(&purpose), None);
+        self.picker = Some((purpose, dialog));
     }
 
     /// Runs the reference-crop intake and writes the resulting entry.
@@ -2911,58 +2956,23 @@ fn color_to_level(color: Color32) -> [f32; 3] {
     ]
 }
 
-/// Spawns the blocking native file dialog for `purpose` on a worker thread.
-///
-/// Every variant answers with a path list so the caller has one shape to poll; single-pick
-/// dialogs answer with one element. `None` means the user cancelled.
-#[cfg(not(target_arch = "wasm32"))]
-fn spawn_picker(purpose: &PickerPurpose) -> Receiver<Option<Vec<PathBuf>>> {
-    let (tx, rx) = mpsc::channel::<Option<Vec<PathBuf>>>();
-    let purpose = purpose.clone();
-    thread::spawn(move || {
-        let picked = match purpose {
-            PickerPurpose::ReferenceCrops | PickerPurpose::ImproveEntry(_) => {
-                rfd::FileDialog::new()
-                    .add_filter(
-                        t!("cleaning.tools.watermark.chapter.reference_files_filter"),
-                        &["png", "jpg", "jpeg", "webp", "bmp"],
-                    )
-                    .pick_files()
-            }
-            PickerPurpose::ImportArchive => rfd::FileDialog::new()
-                .add_filter(
-                    t!("cleaning.tools.watermark.chapter.library_archive_filter"),
-                    &[ENTRY_ARCHIVE_EXTENSION],
-                )
-                .pick_file()
-                .map(|path| vec![path]),
-            PickerPurpose::ImportFolder | PickerPurpose::ExportFolder(_) => {
-                rfd::FileDialog::new().pick_folder().map(|path| vec![path])
-            }
-            PickerPurpose::ExportArchive(entry_id) => rfd::FileDialog::new()
-                .set_file_name(format!("{entry_id}.{ENTRY_ARCHIVE_EXTENSION}"))
-                .add_filter(
-                    t!("cleaning.tools.watermark.chapter.library_archive_filter"),
-                    &[ENTRY_ARCHIVE_EXTENSION],
-                )
-                .save_file()
-                .map(|path| vec![path]),
-        };
-        let _ = tx.send(picked);
-    });
-    rx
-}
-
-/// Web fallback: the browser build has no native file dialog (`rfd` is native-only), so the
-/// pick resolves immediately as cancelled and the dropped capability is logged.
-#[cfg(target_arch = "wasm32")]
-fn spawn_picker(_purpose: &PickerPurpose) -> Receiver<Option<Vec<PathBuf>>> {
-    let (tx, rx) = mpsc::channel::<Option<Vec<PathBuf>>>();
-    ms_log::runtime_log::log_warn(
-        "[cleaning] watermark library file picker unavailable on web build",
-    );
-    let _ = tx.send(None);
-    rx
+/// The file-dialog request of `purpose`. Picking a folder to IMPORT and a folder to EXPORT
+/// into are different requests: the first reads an existing folder, the second is a write
+/// destination (`SaveIntoFolder`).
+fn picker_request(purpose: &PickerPurpose) -> FileDialogRequest {
+    match purpose {
+        PickerPurpose::ReferenceCrops | PickerPurpose::ImproveEntry(_) => FileDialogRequest::new(DialogKind::OpenFiles).filter(
+            t!("cleaning.tools.watermark.chapter.reference_files_filter"),
+            &["png", "jpg", "jpeg", "webp", "bmp"],
+        ),
+        PickerPurpose::ImportArchive => FileDialogRequest::new(DialogKind::OpenFile)
+            .filter(t!("cleaning.tools.watermark.chapter.library_archive_filter"), &[ENTRY_ARCHIVE_EXTENSION]),
+        PickerPurpose::ImportFolder => FileDialogRequest::new(DialogKind::OpenFolder),
+        PickerPurpose::ExportFolder(_) => FileDialogRequest::new(DialogKind::SaveIntoFolder),
+        PickerPurpose::ExportArchive(entry_id) => FileDialogRequest::new(DialogKind::SaveFile)
+            .suggested_name(format!("{entry_id}.{ENTRY_ARCHIVE_EXTENSION}"))
+            .filter(t!("cleaning.tools.watermark.chapter.library_archive_filter"), &[ENTRY_ARCHIVE_EXTENSION]),
+    }
 }
 
 #[cfg(test)]
@@ -3785,5 +3795,25 @@ mod tests {
         window.request_icons();
         assert!(window.rx.is_some(), "a changed entry must be rendered again");
         window.finish_job();
+    }
+
+    /// Each purpose asks for the dialog kind its result is used as: importing a folder READS
+    /// one, exporting into a folder WRITES one, and only the archive save suggests a name.
+    #[test]
+    fn picker_requests_match_their_purpose() {
+        let id = "entry-1".to_string();
+        let cases = [
+            (PickerPurpose::ReferenceCrops, DialogKind::OpenFiles),
+            (PickerPurpose::ImproveEntry(id.clone()), DialogKind::OpenFiles),
+            (PickerPurpose::ImportArchive, DialogKind::OpenFile),
+            (PickerPurpose::ImportFolder, DialogKind::OpenFolder),
+            (PickerPurpose::ExportArchive(id.clone()), DialogKind::SaveFile),
+            (PickerPurpose::ExportFolder(id), DialogKind::SaveIntoFolder),
+        ];
+        for (purpose, kind) in cases {
+            assert_eq!(picker_request(&purpose).kind(), kind, "{purpose:?}");
+        }
+        let archive = picker_request(&PickerPurpose::ImportArchive);
+        assert_eq!(archive.filters()[0].extensions(), [ENTRY_ARCHIVE_EXTENSION.to_string()]);
     }
 }

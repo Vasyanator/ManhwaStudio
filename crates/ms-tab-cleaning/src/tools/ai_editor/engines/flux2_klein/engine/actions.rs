@@ -12,8 +12,8 @@ Main responsibilities:
   (`start_store_hf_token`, `start_clear_hf_token`, `poll_hf_token`);
 - the model download: the pre-flight check, the transfer, its cancellation, and the
   derivation it applies when it finishes (`start_download_check` .. `apply_download_outcome`);
-- the prompt translation (`start_translate`, `poll_translate`) and the native file pickers
-  (`start_picker`, `poll_picker`);
+- the prompt translation (`start_translate`, `poll_translate`) and the non-blocking file
+  dialogs (`start_picker`, `poll_picker`);
 - the six `.prompt_cache.*` jobs, the header they share and the outcome they apply
   (`start_prompt_cache_*`, `poll_prompt_cache`, `apply_prompt_cache_outcome`).
 
@@ -29,6 +29,7 @@ reads all four channels at once.
 */
 
 use super::*;
+use ms_platform::file_dialog::{self, SaveTarget};
 
 impl Flux2KleinEngine {
     /// Starts one per-component action on a worker thread.
@@ -442,34 +443,66 @@ impl Flux2KleinEngine {
         });
     }
 
-    /// Starts a native file dialog for `purpose`; at most one dialog at a time.
+    /// Starts a non-blocking file dialog for `purpose`; at most one dialog at a time.
     pub(super) fn start_picker(&mut self, purpose: Flux2PickerPurpose) {
-        if self.picker_rx.is_some() {
+        if self.picker.is_some() {
             return;
         }
-        self.picker_rx = Some(spawn_flux2_picker(purpose));
-        self.picker = Some(purpose);
+        // No waker, as before: the result is picked up by the next frame's `poll_picker`.
+        let dialog = file_dialog::request(flux2_picker_request(purpose), None);
+        self.picker = Some((purpose, dialog));
     }
 
     /// Folds a finished file pick into the matching model-path field, or — for the two
     /// prompt-cache purposes — starts the IPC call the dialog was opened for.
     ///
     /// A cancelled dialog is a no-op in both cases: nothing is written and no call goes
-    /// out.
+    /// out. A dialog failure is shown in the prompt-cache status line for the two cache
+    /// purposes and in the run status line for the model paths.
     pub(super) fn poll_picker(&mut self) {
-        let Some(rx) = self.picker_rx.as_ref() else {
+        let Some(result) = self.picker.as_mut().and_then(|(_, dialog)| dialog.poll()) else {
             return;
         };
-        let picked = match rx.try_recv() {
-            Ok(picked) => picked,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => None,
-        };
-        self.picker_rx = None;
-        let Some(purpose) = self.picker.take() else {
+        let Some((purpose, _)) = self.picker.take() else {
             return;
         };
-        let Some(path) = picked else {
+        let picked = match result {
+            Ok(Some(picked)) => picked,
+            Ok(None) => return,
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!("[cleaning] FLUX.2 klein {purpose:?} file dialog failed: {err:?}"));
+                let message = Some(err.user_message());
+                match purpose {
+                    Flux2PickerPurpose::PromptCacheExport | Flux2PickerPurpose::PromptCacheImport => self.prompt_cache_status = message,
+                    Flux2PickerPurpose::TextEncoderDir
+                    | Flux2PickerPurpose::TransformerFile
+                    | Flux2PickerPurpose::TransformerDir
+                    | Flux2PickerPurpose::VaeFile
+                    | Flux2PickerPurpose::VaeDir => self.run_status = message,
+                }
+                return;
+            }
+        };
+        // The `Picked` variant always matches the request kind (`flux2_picker_request`); a
+        // mismatch is a platform-layer bug, logged and treated as a cancel.
+        let mismatch = || ms_log::runtime_log::log_error(format!("[cleaning] FLUX.2 klein {purpose:?}: file dialog answered with the wrong result kind"));
+        // The export keeps its save TARGET: the backend writes the file, then the target is
+        // committed (`start_prompt_cache_export`).
+        if purpose == Flux2PickerPurpose::PromptCacheExport {
+            match picked.into_save_target() {
+                Some(target) => self.start_prompt_cache_export(target),
+                None => mismatch(),
+            }
+            return;
+        }
+        let path = match purpose {
+            Flux2PickerPurpose::TextEncoderDir | Flux2PickerPurpose::TransformerDir | Flux2PickerPurpose::VaeDir => picked.into_directory_path(),
+            Flux2PickerPurpose::TransformerFile | Flux2PickerPurpose::VaeFile | Flux2PickerPurpose::PromptCacheImport | Flux2PickerPurpose::PromptCacheExport => {
+                picked.into_file().map(|file| file.path)
+            }
+        };
+        let Some(path) = path else {
+            mismatch();
             return;
         };
         let value = path.to_string_lossy().to_string();
@@ -482,11 +515,9 @@ impl Flux2KleinEngine {
                 self.settings.vae_path = value;
             }
             // These two carry a library entry in or out through a FILE: nothing is
-            // persisted and the settings are left exactly as they were.
-            Flux2PickerPurpose::PromptCacheExport => {
-                self.start_prompt_cache_export(path);
-                return;
-            }
+            // persisted and the settings are left exactly as they were. The export was
+            // dispatched above, with its save target.
+            Flux2PickerPurpose::PromptCacheExport => return,
             Flux2PickerPurpose::PromptCacheImport => {
                 self.start_prompt_cache_import(path);
                 return;
@@ -550,11 +581,12 @@ impl Flux2KleinEngine {
         );
     }
 
-    /// Writes the entry the export dialog was opened for to `path`.
-    pub(super) fn start_prompt_cache_export(&mut self, path: PathBuf) {
+    /// Writes the entry the export dialog was opened for to the dialog's `target`.
+    pub(super) fn start_prompt_cache_export(&mut self, target: SaveTarget) {
         let Some(name) = self.prompt_cache_export_name.take() else {
             return;
         };
+        let path = target.write_path().to_path_buf();
         let header = self.prompt_cache_header(&[
             ("name", json!(name)),
             ("path", json!(path.to_string_lossy())),
@@ -562,7 +594,11 @@ impl Flux2KleinEngine {
         self.start_prompt_cache_job(
             t!("cleaning.tools.flux2_klein.prompt_cache_exporting_status"),
             move || {
-                export_flux2_prompt_cache(header).map(|()| Flux2PromptCacheOutcome::Exported(path))
+                // The backend writes the whole file to the target's write path; only then is the
+                // target published (a no-op on desktop, a blocking stream on Android).
+                export_flux2_prompt_cache(header)?;
+                target.commit().map_err(|err| err.user_message())?;
+                Ok(Flux2PromptCacheOutcome::Exported(path))
             },
         );
     }

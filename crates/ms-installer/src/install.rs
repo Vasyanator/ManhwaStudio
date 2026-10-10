@@ -35,6 +35,7 @@ use web_time::Instant;
 use web_time::SystemTime;
 
 use ms_config as config;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog, Picked};
 
 // The host version: displayed by the Windows "existing install found" window, and its
 // version core written as the Uninstall entry's `DisplayVersion` by a full install.
@@ -904,6 +905,11 @@ struct InstallerApp {
     root_dir: PathBuf,
     install_location_choice: InstallLocationChoice,
     custom_install_base_dir_input: String,
+    /// The custom-location folder picker while it is open (polled every frame; its "Choose"
+    /// button is disabled meanwhile).
+    custom_dir_pick: Option<PendingDialog>,
+    /// Why the last custom-location picker could not be shown, under the location row.
+    custom_dir_pick_error: Option<String>,
     install_target_dir: Option<PathBuf>,
     launcher_exe_path: Option<PathBuf>,
     #[cfg(target_os = "windows")]
@@ -933,6 +939,38 @@ struct InstallerApp {
 }
 
 impl InstallerApp {
+    /// Opens the custom install location's folder picker without blocking the window, starting
+    /// in the typed folder when it exists, else in the program root.
+    fn start_custom_dir_pick(&mut self, ctx: &egui::Context) {
+        let dialog_dir = PathBuf::from(self.custom_install_base_dir_input.trim());
+        let base_dir = if dialog_dir.is_dir() { dialog_dir } else { self.root_dir.clone() };
+        let request = FileDialogRequest::new(DialogKind::PickDirectoryPath).start_dir(&base_dir);
+        let repaint_ctx = ctx.clone();
+        self.custom_dir_pick_error = None;
+        self.custom_dir_pick = Some(file_dialog::request(request, Some(Arc::new(move || repaint_ctx.request_repaint()))));
+    }
+
+    /// Takes the folder picker's answer once it arrived: a folder replaces the custom location
+    /// field, a cancel changes nothing, a failure is shown under the field and logged.
+    fn poll_custom_dir_pick(&mut self) {
+        let Some(result) = self.custom_dir_pick.as_mut().and_then(PendingDialog::poll) else {
+            return;
+        };
+        self.custom_dir_pick = None;
+        match result {
+            // `PickDirectoryPath` always answers `DirectoryPath` (the ms-platform kind contract).
+            Ok(picked) => {
+                if let Some(chosen_dir) = picked.and_then(Picked::into_directory_path) {
+                    self.custom_install_base_dir_input = chosen_dir.to_string_lossy().to_string();
+                }
+            }
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!("[installer] custom install folder picker failed: {err:?}"));
+                self.custom_dir_pick_error = Some(err.user_message());
+            }
+        }
+    }
+
     fn new(
         root_dir: PathBuf,
         result_sink: Arc<Mutex<Option<InstallerOutcome>>>,
@@ -945,6 +983,8 @@ impl InstallerApp {
             root_dir,
             install_location_choice: InstallLocationChoice::AllUsers,
             custom_install_base_dir_input,
+            custom_dir_pick: None,
+            custom_dir_pick_error: None,
             install_target_dir: None,
             launcher_exe_path: env::current_exe().ok(),
             #[cfg(target_os = "windows")]
@@ -1229,6 +1269,7 @@ impl eframe::App for InstallerApp {
         // viewport commands / repaint scheduling, and build the root `CentralPanel` on `ui` below.
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        self.poll_custom_dir_pick();
         let mut queued_events = Vec::new();
         if let Some(rx) = &self.rx {
             while let Ok(event) = rx.try_recv() {
@@ -1379,22 +1420,19 @@ impl eframe::App for InstallerApp {
                                     )
                                     .desired_width((ui.available_width() - 140.0).max(180.0)),
                                 );
-                                if ui.button(t!("installer.install.choose_button")).clicked() {
-                                    let dialog_dir =
-                                        PathBuf::from(self.custom_install_base_dir_input.trim());
-                                    let base_dir = if dialog_dir.is_dir() {
-                                        dialog_dir
-                                    } else {
-                                        self.root_dir.clone()
-                                    };
-                                    if let Some(chosen_dir) =
-                                        rfd::FileDialog::new().set_directory(base_dir).pick_folder()
-                                    {
-                                        self.custom_install_base_dir_input =
-                                            chosen_dir.to_string_lossy().to_string();
-                                    }
+                                if ui
+                                    .add_enabled(
+                                        self.custom_dir_pick.is_none(),
+                                        egui::Button::new(t!("installer.install.choose_button")),
+                                    )
+                                    .clicked()
+                                {
+                                    self.start_custom_dir_pick(ctx);
                                 }
                             });
+                            if let Some(error) = &self.custom_dir_pick_error {
+                                ui.colored_label(ms_theme::status::ERROR, error);
+                            }
                         }
 
                         ui.add_space(6.0);

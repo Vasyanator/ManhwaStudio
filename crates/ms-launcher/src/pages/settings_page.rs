@@ -37,6 +37,10 @@ marquees (`ms_widgets::paint_marquee_galley`). The PythonEnvironment tab is the 
 to the content scroll: it fills the content rect itself (command row and hint pinned bottom-up,
 output frame with its own stick-to-bottom scroll in the rest) and only falls back to the
 content scroll, as a fixed-height block, when the column is shorter than its minimum.
+
+"Save log" (native) goes through the non-blocking `ms_platform::file_dialog` seam: the open
+save dialog and then the copy + commit worker live in `LogSaveState`, are polled each frame,
+and keep the button disabled; the outcome replaces the button's second line.
 */
 
 use ms_settings_ui::ai_backend_supervisor::AiBackendHandle;
@@ -94,9 +98,10 @@ use ms_widgets::{MarqueeTiming, paint_marquee_galley};
 // `Key`/`TextEdit`/`TextStyle` are used only by the native Python-console tab.
 #[cfg(not(target_arch = "wasm32"))]
 use egui::{Key, TextEdit, TextStyle};
-// Native folder picker for the projects-root field; no OS dialog on web.
+use ms_platform::file_dialog::PendingDialog;
+// The save-log dialog flow runs only on native (no log file or save dialog on web).
 #[cfg(not(target_arch = "wasm32"))]
-use rfd::FileDialog;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, SaveTarget};
 use serde_json::Value;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
@@ -208,6 +213,8 @@ pub struct SettingsPageState {
     #[cfg(not(target_arch = "wasm32"))]
     torch_upgrade: TorchUpgradeState,
     log_popup_open: bool,
+    /// The "Save log" flow: open dialog, copy worker, last outcome.
+    log_save: LogSaveState,
     /// Actions reported in one frame beyond the one `show` can return (e.g. a saved
     /// projects root AND a finished storage switch); delivered one per frame, in order.
     queued_actions: VecDeque<PageNavAction>,
@@ -233,6 +240,25 @@ pub struct SettingsPageState {
 enum LogKind {
     Current,
     Previous,
+}
+
+/// The "Save log" flow: the save dialog, then the copy + commit worker, then the localized
+/// outcome shown as the save-log button's second line. While `busy`, the button is disabled.
+/// On web nothing ever starts it (no log file, no save dialog).
+#[derive(Debug, Default)]
+struct LogSaveState {
+    /// The open save dialog and the log it saves.
+    dialog: Option<(LogKind, PendingDialog)>,
+    /// The copy worker: `Ok(saved file name)` or `Err(localized error)`.
+    copy: Option<Receiver<Result<String, String>>>,
+    /// Outcome of the last save; cleared when the next save starts.
+    status: Option<String>,
+}
+
+impl LogSaveState {
+    fn busy(&self) -> bool {
+        self.dialog.is_some() || self.copy.is_some()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -360,6 +386,7 @@ impl SettingsPageState {
             #[cfg(not(target_arch = "wasm32"))]
             torch_upgrade: TorchUpgradeState::default(),
             log_popup_open: false,
+            log_save: LogSaveState::default(),
             queued_actions: VecDeque::new(),
             ai_backend,
             // `new` has no egui context (and also runs for the web entry): the worker is
@@ -459,6 +486,8 @@ impl SettingsPageState {
     }
 
     pub fn show(&mut self, ui: &mut Ui) -> Option<PageNavAction> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_log_save();
         let mut action = None;
         let mut save_log_button_rect = None;
         if let Some(back_action) = base::show_page_shell(ui, |ui| {
@@ -670,10 +699,14 @@ impl SettingsPageState {
                 .max_rect(save_log_rect)
                 .layout(Layout::top_down(Align::Min)),
         );
+        // One save at a time: the button stays disabled while the dialog or the copy runs.
+        if self.log_save.busy() {
+            save_log_ui.disable();
+        }
         let response = show_two_line_button(
             &mut save_log_ui,
             t!("launcher.settings.save_log_button"),
-            t!("launcher.settings.save_log_hint"),
+            self.log_save.status.as_deref().unwrap_or(t!("launcher.settings.save_log_hint")),
             save_log_rect.size(),
             self.log_popup_open,
         );
@@ -818,7 +851,7 @@ impl SettingsPageState {
 
         if let Some(kind) = save_kind {
             self.log_popup_open = false;
-            self.save_log_file(kind);
+            self.save_log_file(kind, ui.ctx());
             return;
         }
 
@@ -835,51 +868,96 @@ impl SettingsPageState {
         }
     }
 
-    /// Copies the selected runtime log to a user-chosen file via the OS save
-    /// dialog.
+    /// Opens the save dialog for the selected runtime log without blocking; `poll_log_save`
+    /// copies the log once a destination is chosen.
     ///
     /// Native only. The web twin reports that log export is unavailable (no OS
     /// save dialog / filesystem on web).
     #[cfg(not(target_arch = "wasm32"))]
-    fn save_log_file(&mut self, kind: LogKind) {
-        let log_dir = config::data_dir();
-        let (source_name, label) = match kind {
-            LogKind::Current => ("last.log", "current"),
-            LogKind::Previous => ("previous.log", "previous"),
-        };
-        let source_path = log_dir.join(source_name);
-        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
-        let default_name = format!("manhwastudio_{label}_log_{timestamp}.log");
-
-        let Some(save_path) = FileDialog::new()
-            .set_file_name(&default_name)
-            .add_filter(t!("launcher.settings.log_files_filter"), &["log"])
-            .save_file()
-        else {
+    fn save_log_file(&mut self, kind: LogKind, ctx: &egui::Context) {
+        if self.log_save.busy() {
             return;
+        }
+        let label = match kind {
+            LogKind::Current => "current",
+            LogKind::Previous => "previous",
         };
+        let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+        let request = FileDialogRequest::new(DialogKind::SaveFile)
+            .suggested_name(format!("manhwastudio_{label}_log_{timestamp}.log"))
+            .filter(t!("launcher.settings.log_files_filter"), &["log"]);
+        let waker_ctx = ctx.clone();
+        let dialog = file_dialog::request(request, Some(std::sync::Arc::new(move || waker_ctx.request_repaint())));
+        self.log_save.status = None;
+        self.log_save.dialog = Some((kind, dialog));
+    }
 
-        match std::fs::copy(&source_path, &save_path) {
-            Ok(_) => {
-                runtime_log::log_info(format!(
-                    "[launcher-settings] saved '{}' log to '{}'",
-                    source_name,
-                    save_path.display()
-                ));
+    /// Advances the "Save log" flow: a chosen destination starts the copy worker, a cancel
+    /// ends the flow silently, a dialog failure or a finished copy sets the status line.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn poll_log_save(&mut self) {
+        if let Some((kind, dialog)) = self.log_save.dialog.as_mut()
+            && let Some(result) = dialog.poll()
+        {
+            let kind = *kind;
+            self.log_save.dialog = None;
+            match result {
+                Ok(None) => {}
+                Ok(Some(picked)) => match picked.into_save_target() {
+                    Some(target) => self.spawn_log_copy(kind, target),
+                    // `SaveFile` always yields `Picked::SaveTarget` (the seam's contract).
+                    None => {
+                        runtime_log::log_error("[launcher-settings] save-log dialog returned a result without a save target");
+                        self.log_save.status = Some(t!("launcher.settings.log_save_failed_status").to_owned());
+                    }
+                },
+                Err(err) => {
+                    runtime_log::log_warn(format!("[launcher-settings] save-log dialog failed: {err:?}"));
+                    self.log_save.status = Some(err.user_message());
+                }
             }
+        }
+        if let Some(rx) = &self.log_save.copy {
+            let outcome = match rx.try_recv() {
+                Ok(Ok(file_name)) => tf!("launcher.settings.log_saved_status", name = file_name),
+                Ok(Err(message)) => message,
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    runtime_log::log_error("[launcher-settings] save-log worker ended without a result");
+                    t!("launcher.settings.log_save_failed_status").to_owned()
+                }
+            };
+            self.log_save.copy = None;
+            self.log_save.status = Some(outcome);
+        }
+    }
+
+    /// Copies the `kind` log into `target` on the `launcher-save-log` worker.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_log_copy(&mut self, kind: LogKind, target: SaveTarget) {
+        let source_name = match kind {
+            LogKind::Current => "last.log",
+            LogKind::Previous => "previous.log",
+        };
+        let source_path = config::data_dir().join(source_name);
+        let (tx, rx) = mpsc::channel();
+        let spawned = thread::Builder::new().name("launcher-save-log".to_string()).spawn(move || {
+            if tx.send(copy_log_to_target(&source_path, target)).is_err() {
+                runtime_log::log_warn("[launcher-settings] save-log result dropped: the settings page stopped polling");
+            }
+        });
+        match spawned {
+            Ok(_) => self.log_save.copy = Some(rx),
             Err(err) => {
-                runtime_log::log_error(format!(
-                    "[launcher-settings] failed to save '{}' log to '{}': {err}",
-                    source_name,
-                    save_path.display()
-                ));
+                runtime_log::log_error(format!("[launcher-settings] failed to spawn the save-log worker: {err}"));
+                self.log_save.status = Some(tf!("launcher.settings.log_save_error", err = err));
             }
         }
     }
 
     /// Web twin of `save_log_file`: no OS save dialog or filesystem on web.
     #[cfg(target_arch = "wasm32")]
-    fn save_log_file(&mut self, _kind: LogKind) {
+    fn save_log_file(&mut self, _kind: LogKind, _ctx: &egui::Context) {
         runtime_log::log_error("Сохранение лога недоступно в веб-версии.".to_string());
     }
 
@@ -1818,6 +1896,36 @@ impl Drop for SettingsPageState {
     }
 }
 
+/// Copies the log at `source` to `target`'s write path, then commits the target (only after
+/// the complete copy). Returns the saved file name, or the localized error status; both
+/// outcomes are logged with the paths. Blocking: worker only.
+#[cfg(not(target_arch = "wasm32"))]
+fn copy_log_to_target(source: &Path, target: SaveTarget) -> Result<String, String> {
+    let write_path = target.write_path().to_path_buf();
+    let display_name = target.display_name().to_owned();
+    if let Err(err) = std::fs::copy(source, &write_path) {
+        runtime_log::log_error(format!(
+            "[launcher-settings] failed to save '{}' log to '{}': {err}",
+            source.display(),
+            write_path.display()
+        ));
+        return Err(tf!("launcher.settings.log_save_error", err = err));
+    }
+    if let Err(err) = target.commit() {
+        runtime_log::log_error(format!(
+            "[launcher-settings] failed to commit saved log '{}': {err:?}",
+            write_path.display()
+        ));
+        return Err(tf!("launcher.settings.log_save_error", err = err.user_message()));
+    }
+    runtime_log::log_info(format!(
+        "[launcher-settings] saved '{}' log to '{}'",
+        source.display(),
+        write_path.display()
+    ));
+    Ok(display_name)
+}
+
 fn show_two_line_button(
     ui: &mut Ui,
     title: &str,
@@ -2546,6 +2654,19 @@ fn sh_escape_str(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn saved_log_lands_at_the_target_and_reports_its_name() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source = dir.path().join("last.log");
+        std::fs::write(&source, b"log line").expect("write source log");
+        let destination = dir.path().join("saved.log");
+        assert_eq!(copy_log_to_target(&source, SaveTarget::for_test(destination.clone())), Ok("saved.log".to_owned()));
+        assert_eq!(std::fs::read(&destination).expect("read saved log"), b"log line");
+        let missing = dir.path().join("previous.log");
+        assert!(copy_log_to_target(&missing, SaveTarget::for_test(dir.path().join("other.log"))).is_err());
+    }
 
     #[test]
     fn a_projects_root_and_a_storage_switch_in_one_frame_are_both_delivered_in_order() {

@@ -142,8 +142,8 @@ path = "src/bin/tutorial_test/main.rs"
 # Cross-target dependencies. These compile on both native and wasm32 (pure Rust
 # or with first-class wasm support: egui/eframe, image, cosmic-text, serde, zip,
 # rayon under the atomics build, etc.). Native-only crates (sockets, native HTTP,
-# subprocess/dylib, OS keyring, clipboard, file dialogs) live in the
-# cfg(not(wasm32)) block below and their call sites are cfg-gated per WEB_PORT.md.
+# subprocess/dylib) live in the cfg(not(wasm32)) block below and their call sites are
+# cfg-gated per WEB_PORT.md.
 [dependencies]
 # Framed IPC with the Python AI backend (`crate::backend_ipc` re-export shim in
 # `src/lib.rs`). Cross-target: the crate itself compiles a wasm stub, matching the
@@ -173,6 +173,10 @@ ms-project = { path = "crates/ms-project" }
 # binary names it directly only to pin the web build's document format at startup
 # (`src/web_entry.rs`); all reads/writes go through the crates that own each document.
 ms-docstore = { path = "crates/ms-docstore" }
+# Platform seams (`PlatformFeature` capability table, file dialogs, the pre-window error
+# box), named `ms_platform::` directly. Cross-target: it answers a typed `Unavailable` where a
+# platform lacks a backend, so its call sites carry no cfg of their own.
+ms-platform = { path = "crates/ms-platform" }
 # Host-environment probes (GPU/accelerator detection, app-local Python runtime,
 # desktop region capture), mounted as `crate::{python_manager, ai_install_probe, hf_token}`
 # by `src/lib.rs`; other modules are named `ms_sysprobe::` directly. Cross-target like the module declarations it
@@ -313,24 +317,21 @@ puffin = { version = "0.20.0", optional = true }
 puffin_egui = { path = "crates/puffin_egui", optional = true }
 
 # Native-only dependencies: native sockets / blocking HTTP (ureq, hf-hub,
-# translators, genai+tokio), dynamic library loading (libloading), OS credential
-# store (keyring), clipboard (arboard), and native file dialogs (rfd). None have
+# translators, genai+tokio) and dynamic library loading (libloading). None have
 # a usable wasm32-unknown-unknown path with the current API usage; the web build
-# replaces them (fetch, IndexedDB, download) in the web-glue phase.
+# replaces them (fetch, IndexedDB, download) in the web-glue phase. File dialogs and
+# the startup error box come from `ms-platform` (shared section), which owns `rfd`.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Owner of the bundled `fonts/ui` stack (manifest + process-wide `'static` bytes).
 # Native-only: it resolves the directory next to the executable and reads files from
 # disk, neither of which exists in a web build — `src/ui_fonts.rs` compiles to a no-op
 # there and the web entry point installs its own fonts.
 ms-fonts = { path = "crates/ms-fonts" }
-arboard.workspace = true
 libloading.workspace = true
-rfd.workspace = true
 hf-hub.workspace = true
 ureq.workspace = true
 translators.workspace = true
 genai.workspace = true
-keyring.workspace = true
 tokio.workspace = true
 # Native ONNX Runtime inference infrastructure (load-dynamic; runtime-resolved
 # dylib). Native-only: onnxruntime is a native shared library.
@@ -401,6 +402,10 @@ serde_json.workspace = true
 [dev-dependencies]
 # Isolated on-disk chapter fixtures for the `page_ops` transaction tests.
 tempfile.workspace = true
+# Same crate as in `[dependencies]`, re-declared only to switch on `test-support` for test
+# builds: `SaveTarget::for_test` builds the dialog answers the single-image save-machine tests
+# feed in.
+ms-platform = { path = "crates/ms-platform", features = ["test-support"] }
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support`
 # for test builds: it exposes `config_saver::test_harness` (used by the window
 # geometry saver tests) and `locale_store::GLOBAL_LOCALE_LOCK` (held by every test

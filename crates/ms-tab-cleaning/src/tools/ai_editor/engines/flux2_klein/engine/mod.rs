@@ -190,8 +190,8 @@ pub struct Flux2KleinEngine {
     pub(super) download_status: Option<String>,
     pub(super) translate_rx: Option<Receiver<Result<String, String>>>,
     pub(super) translate_status: Option<String>,
-    pub(super) picker_rx: Option<Receiver<Option<PathBuf>>>,
-    pub(super) picker: Option<Flux2PickerPurpose>,
+    /// The open file dialog and what it was opened for; at most one at a time.
+    pub(super) picker: Option<(Flux2PickerPurpose, ms_platform::file_dialog::PendingDialog)>,
     pub(super) progress: Arc<Mutex<Flux2Progress>>,
     pub(super) ai_backend_available: bool,
     /// Whether the prompt-cache LIBRARY is unfolded under the prompt block.
@@ -310,7 +310,6 @@ impl Flux2KleinEngine {
             download_status: None,
             translate_rx: None,
             translate_status: None,
-            picker_rx: None,
             picker: None,
             progress: Arc::new(Mutex::new(Flux2Progress::default())),
             mask_painted: false,

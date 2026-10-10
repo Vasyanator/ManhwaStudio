@@ -21,8 +21,9 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
     the Kotlin `SafBridge` and its Rust launch path exist, a `platform-bridge` worker probes
     for the class and every request resolves to `Unavailable { FilePicker, BridgeMissing }`;
   - wasm (`unavailable.rs`): `Unavailable { FilePicker, NotOnThisPlatform }`.
-- **Clipboard** (`clipboard/`): blocking, short reads. Desktop = arboard; Android and wasm =
-  typed `Unavailable` (Android text answers `BridgeMissing` until its JNI backend lands).
+- **Clipboard** (`clipboard/`): blocking, short reads. Desktop = arboard; Android text = JNI
+  `ClipboardManager` on the calling thread (`android.rs`); Android image / file list / HTML
+  and every wasm read = typed `Unavailable`.
 - **JNI** (`android/jni_ctx.rs`): `with_env` attaches the thread and passes the application
   context; `load_app_class` uses `Context.getClassLoader()` because `FindClass` on a native
   thread cannot see app classes.
@@ -35,7 +36,7 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - `file_dialog/{desktop,android,unavailable}.rs`: one backend per target (dispatch via
   `use … as backend`).
 - `file_dialog/mime.rs`: pure filter -> MIME mapping for SAF.
-- `clipboard/{mod,desktop,unavailable}.rs`: clipboard API and backends.
+- `clipboard/{mod,desktop,android,unavailable}.rs`: clipboard API and backends.
 - `message.rs`: `show_error_blocking` (startup only).
 - `android/`: `jni_ctx.rs` (Android only), `saf.rs` (pending-request registry, also
   host-tested; the bridge class name `SAF_BRIDGE_CLASS`).
@@ -48,11 +49,16 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   variant always matches the `DialogKind` (table on `Picked`).
 - Write the COMPLETE output to `SaveTarget::write_path` / `FolderTarget::write_dir`, then call
   `commit()` on the worker that wrote it (desktop: no-op; Android: blocking stream to the URI).
+- Desktop `SaveFile`: a name typed WITHOUT any extension gets the first extension of the first
+  filter (`with_default_extension`); a path that already has an extension is never changed.
+  Callers therefore never re-derive the extension themselves.
 - Filter extensions are normalized to lowercase without the dot; the desktop backend adds the
   uppercase spelling because GTK / xdg-portal globs are case-sensitive.
 - `PickDirectoryPath` needs `PersistentDirectoryPicker` (unavailable on Android: SAF yields
   tree URIs, never usable paths).
-- No JNI on the GUI thread: Android backends run every JVM call on a worker.
+- No JNI on the GUI thread: Android backends run every JVM call on a worker. The one
+  exception is the synchronous clipboard text read (`clipboard/android.rs`): a single short
+  binder round trip, the same cost class as the desktop arboard read it replaces.
 - Logs: outcome per dialog at info level with the kind and file names only (never full paths);
   failures at warn level with the typed error.
 - No egui types: callers own the UI and pass a repaint `Waker`.
@@ -67,4 +73,5 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   `picked_from_paths`, each backend, and the `Picked` table.
 - New extension family for SAF: `file_dialog/mime.rs`.
 - Android SAF launch / result path: `file_dialog/android.rs` + `android/saf.rs`.
-- Android clipboard text: replace the `read_text` dispatch of `clipboard/mod.rs` on Android.
+- Android clipboard reads: `clipboard/android.rs` + the `read_text_backend` dispatch in
+  `clipboard/mod.rs`.

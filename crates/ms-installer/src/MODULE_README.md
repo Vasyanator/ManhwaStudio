@@ -44,7 +44,9 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - `lib.rs`: crate boundary, public installer entry point export, and `HostVersion` — the
   application's own version pair, which the binary hands in at the entry points because a
   library cannot read the executable's `CARGO_PKG_VERSION` / `MS_APP_VERSION`.
-- `install.rs`: installer UI, event types, public startup/service functions.
+- `install.rs`: installer UI, event types, public startup/service functions. Its folder picker
+  (custom install location) is the non-blocking `ms_platform::file_dialog` (`PickDirectoryPath`,
+  polled each frame).
 - `update.rs`: update window shell, background release re-check, test-version override,
   executable-update progress, PyTorch choice continuation, completion state, and no-update exit.
 - `utils.rs`: worker pipeline and platform helpers used by installer and updater UI.

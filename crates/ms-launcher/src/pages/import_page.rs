@@ -16,22 +16,23 @@ Key structures:
 
 Notes:
 All archive reads, zstd decode, tar traversal, and filesystem writes run off the GUI thread.
+The archive picker is a non-blocking `ms_platform::file_dialog` request polled every frame
+(Browse is disabled while it is open), and replacing an existing chapter is confirmed through
+the in-app `ConfirmModal`; neither blocks the GUI thread.
 */
 
+use crate::confirm_modal::{ConfirmAnswer, ConfirmModal};
 use crate::pages::base::{self, PageNavAction};
 use crate::state::OpenProjectSelection;
 use crate::theme;
 use ms_log::runtime_log;
 use ms_widgets::EditableComboBox;
 use egui::{Align, Layout, RichText, Ui};
-// Native file picker + overwrite-confirmation dialogs. On web there is no OS
-// dialog: archive picking and overwrite confirmation are replaced with
-// "unavailable on web" statuses (Phase 5 wires an <input type=file> import).
-#[cfg(not(target_arch = "wasm32"))]
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use ms_thread as thread;
 use web_time::{SystemTime, UNIX_EPOCH};
@@ -49,7 +50,27 @@ pub struct ImportPageState {
     pending_titles: Option<Receiver<TitleRefreshResult>>,
     pending_metadata: Option<Receiver<ArchiveMetadataResult>>,
     pending_import: Option<Receiver<ImportWorkerResult>>,
+    /// The open `.mschapter` picker, polled every frame.
+    pending_pick: Option<PendingDialog>,
+    /// "Replace the existing chapter?" question and the import it would start.
+    pending_replace: Option<PendingReplace>,
     queued_open: Option<OpenProjectSelection>,
+}
+
+/// An import waiting for the user to confirm replacing an existing chapter.
+#[derive(Debug)]
+struct PendingReplace {
+    modal: ConfirmModal,
+    request: ImportRequest,
+}
+
+/// Everything one import worker needs, captured when the import was requested.
+#[derive(Debug)]
+struct ImportRequest {
+    archive_path: PathBuf,
+    title: String,
+    chapter: String,
+    open_after: bool,
 }
 
 #[derive(Debug)]
@@ -100,6 +121,8 @@ impl ImportPageState {
             pending_titles: None,
             pending_metadata: None,
             pending_import: None,
+            pending_pick: None,
+            pending_replace: None,
             queued_open: None,
         };
         state.start_titles_refresh();
@@ -110,6 +133,8 @@ impl ImportPageState {
         self.poll_titles();
         self.poll_metadata();
         self.poll_import();
+        self.poll_pick();
+        self.show_replace_confirm(ui.ctx());
 
         if let Some(selection) = self.queued_open.take() {
             return Some(PageNavAction::OpenProject(selection));
@@ -144,7 +169,7 @@ impl ImportPageState {
                             )
                             .clicked()
                             {
-                                self.pick_archive_file();
+                                self.pick_archive_file(ui.ctx());
                             }
                         });
 
@@ -240,42 +265,76 @@ impl ImportPageState {
         self.pending_metadata = None;
         self.pending_import = None;
         self.pending_titles = None;
+        // The question names a chapter under the OLD root; it no longer describes the import.
+        self.pending_replace = None;
         self.queued_open = None;
         self.start_titles_refresh();
     }
 
-    /// Opens the OS file picker to choose a `.mschapter` archive and begins
-    /// loading its metadata.
-    ///
-    /// Native only. The web twin reports that picking a file this way is
-    /// unavailable (Phase 5 replaces it with an `<input type=file>` flow).
-    #[cfg(not(target_arch = "wasm32"))]
-    fn pick_archive_file(&mut self) {
+    /// Opens the file picker for a `.mschapter` archive without blocking; `poll_pick` takes
+    /// the answer and starts the metadata load. The picker starts next to the previously chosen
+    /// archive, else in the projects root (desktop only; other platforms ignore it).
+    fn pick_archive_file(&mut self, ctx: &egui::Context) {
+        if self.pending_pick.is_some() {
+            return;
+        }
         let start_dir = self
             .archive_path
             .as_ref()
             .and_then(|path| path.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| self.projects_root.clone());
-        let Some(path) = FileDialog::new()
-            .set_directory(start_dir)
-            .add_filter(t!("launcher.common.chapter_files_filter"), &["mschapter"])
-            .pick_file()
-        else {
-            return;
-        };
-
-        self.archive_path = Some(path.clone());
-        clear_status_if_success(&mut self.status);
-        self.start_metadata_load(path);
+        let request = FileDialogRequest::new(DialogKind::OpenFile)
+            .start_dir(&start_dir)
+            .filter(t!("launcher.common.chapter_files_filter"), &["mschapter"]);
+        let repaint_ctx = ctx.clone();
+        self.pending_pick = Some(file_dialog::request(request, Some(Arc::new(move || repaint_ctx.request_repaint()))));
     }
 
-    /// Web twin of `pick_archive_file`: no OS file dialog exists on the web
-    /// build yet, so it surfaces a clear "unavailable on web" status.
-    #[cfg(target_arch = "wasm32")]
-    fn pick_archive_file(&mut self) {
-        self.status = ImportPageStatus::Error(
-            t!("launcher.import_page.select_file_web_unsupported").to_string(),
-        );
+    /// Applies the picker's answer once it arrives. A cancel changes nothing; a dialog failure
+    /// (busy, unavailable on this platform, backend error) becomes the page's error status.
+    fn poll_pick(&mut self) {
+        let Some(pending) = self.pending_pick.as_mut() else {
+            return;
+        };
+        let Some(result) = pending.poll() else {
+            return;
+        };
+        self.pending_pick = None;
+        match result {
+            Ok(Some(picked)) => {
+                let Some(file) = picked.into_file() else {
+                    // `OpenFile` always answers with `Picked::Files` (ms-platform contract).
+                    runtime_log::log_error("[launcher-import] archive picker returned a non-file result");
+                    self.status = ImportPageStatus::Error(file_dialog::FileDialogError::WorkerLost.user_message());
+                    return;
+                };
+                self.archive_path = Some(file.path.clone());
+                clear_status_if_success(&mut self.status);
+                self.start_metadata_load(file.path);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                runtime_log::log_warn(format!("[launcher-import] archive picker failed: {err:?}"));
+                self.status = ImportPageStatus::Error(err.user_message());
+            }
+        }
+    }
+
+    /// Draws the pending "replace the existing chapter?" question; "Yes" starts the import it
+    /// was asked for, "No" drops it.
+    fn show_replace_confirm(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_replace else {
+            return;
+        };
+        match pending.modal.show(ctx) {
+            ConfirmAnswer::Pending => {}
+            ConfirmAnswer::No => self.pending_replace = None,
+            ConfirmAnswer::Yes => {
+                if let Some(pending) = self.pending_replace.take() {
+                    self.spawn_import(pending.request);
+                }
+            }
+        }
     }
 
     fn start_titles_refresh(&mut self) {
@@ -371,35 +430,27 @@ impl ImportPageState {
             return;
         }
 
-        let title_dir = self.projects_root.join(&title);
-        let chapter_dir = title_dir.join(&chapter);
+        let request = ImportRequest { archive_path, title, chapter, open_after };
+        let chapter_dir = self.projects_root.join(&request.title).join(&request.chapter);
         if chapter_dir.is_dir() {
-            // Native shows a blocking overwrite-confirmation dialog. On web no OS
-            // dialog exists, so rather than silently replacing an existing
-            // chapter, refuse the overwrite with a clear status.
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                let description = tf!("launcher.import_page.chapter_exists_prompt", chapter = chapter, title = title);
-                let should_continue = MessageDialog::new()
-                    .set_title("ManhwaStudio")
-                    .set_description(&description)
-                    .set_buttons(MessageButtons::YesNo)
-                    .set_level(MessageLevel::Warning)
-                    .show()
-                    == MessageDialogResult::Yes;
-                if !should_continue {
-                    return;
-                }
-            }
-            #[cfg(target_arch = "wasm32")]
-            {
-                self.status = ImportPageStatus::Error(
-                    t!("launcher.import_page.replace_web_unsupported").to_string(),
-                );
-                return;
-            }
+            // Replacing a chapter is destructive: ask first, start the import on "Yes".
+            let text = tf!("launcher.import_page.chapter_exists_prompt", chapter = request.chapter, title = request.title);
+            self.pending_replace = Some(PendingReplace {
+                modal: ConfirmModal::new(
+                    "launcher.import_page.replace_chapter_title",
+                    t!("launcher.import_page.replace_chapter_title"),
+                    text,
+                ),
+                request,
+            });
+            return;
         }
+        self.spawn_import(request);
+    }
 
+    /// Starts the import worker for an already validated (and, if needed, confirmed) request.
+    fn spawn_import(&mut self, request: ImportRequest) {
+        let ImportRequest { archive_path, title, chapter, open_after } = request;
         self.status = ImportPageStatus::Importing;
         let projects_root = self.projects_root.clone();
         let (tx, rx) = mpsc::channel();
@@ -562,6 +613,8 @@ impl ImportPageState {
         self.pending_titles.is_some()
             || self.pending_metadata.is_some()
             || self.pending_import.is_some()
+            || self.pending_pick.is_some()
+            || self.pending_replace.is_some()
     }
 }
 

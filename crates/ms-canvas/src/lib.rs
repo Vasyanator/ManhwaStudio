@@ -238,9 +238,6 @@ use ms_widgets::{
     BarGeometry, HangulKeyboardMode, HangulKeyboardOutcome, ScrollMark, paint_marks_on_bar,
     queue_word_to_global_exceptions, queue_word_to_project_exceptions, show_hangul_keyboard,
 };
-// Native-only clipboard backend; absent on the wasm target.
-#[cfg(not(target_arch = "wasm32"))]
-use arboard::Clipboard;
 use eframe::egui;
 use egui::{Pos2, Rect, TextureHandle, Vec2};
 use serde_json::{Map, Value};
@@ -2881,22 +2878,21 @@ fn bubble_spellcheck_disabled_key(field: BubbleTextField) -> &'static str {
     }
 }
 
-/// Reads plain text from the system clipboard, sanitized for canvas use.
+/// Reads plain text from the system clipboard (`ms_platform::clipboard`), sanitized for
+/// canvas use.
 ///
-/// Native builds query `arboard`. On wasm there is no synchronous clipboard-text
-/// API here, so this returns `None` (no fake success) and callers treat it as an
-/// empty clipboard.
-#[cfg(not(target_arch = "wasm32"))]
+/// `None` when the clipboard holds no text OR the read failed; a failure (including a
+/// platform without a clipboard reader, e.g. wasm) is logged with its typed error, so the
+/// paste becomes a no-op instead of a fake success.
 fn read_system_clipboard_text() -> Option<String> {
-    let mut clipboard = Clipboard::new().ok()?;
-    let raw = clipboard.get_text().ok()?;
-    Some(sanitize_clipboard_text(&raw))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn read_system_clipboard_text() -> Option<String> {
-    runtime_log::log_info("[canvas] чтение буфера обмена недоступно в веб-версии".to_string());
-    None
+    match ms_platform::clipboard::read_text() {
+        Ok(Some(raw)) => Some(sanitize_clipboard_text(&raw)),
+        Ok(None) => None,
+        Err(err) => {
+            runtime_log::log_warn(format!("[canvas] clipboard text read failed: {err:?}"));
+            None
+        }
+    }
 }
 
 /// Builds the cache key identifying a rendered image-bubble preview.

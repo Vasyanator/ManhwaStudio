@@ -245,7 +245,7 @@ use crate::panels::ocr_model_download::ModelDownloadAction;
 use ms_sysprobe::ai_models::external_catalog::PaddleVlVariant;
 use ms_ai_api::{AiApiService, AiApiTaskRunner, GenerationSnapshot, ImageInputSupport, image_input_support, is_probable_quota_or_limit_error};
 use crate::panels::bubbles::{
-    BubbleFooterState, BubblesPanelContext, BubblesPanelState, bubble_extra_bool,
+    BubbleFooterState, BubblesPanelContext, BubblesPanelState, ImageBubbleFilePick, bubble_extra_bool,
     bubble_extra_string, bubble_footer_state_from_record, draw_bubbles_panel, footer_no_character,
     footer_no_characters,
     footer_state_for_bubble,
@@ -805,6 +805,9 @@ pub struct TranslationTabState {
     footer_tracking_synced_revision: Option<u64>,
     footer_known_ids: HashSet<i64>,
     footer_overrides: HashMap<i64, BubbleFooterState>,
+    /// The one open «choose file» dialog of an external image bubble, started by the canvas
+    /// footer or a bubbles-panel card and resolved by [`Self::poll_image_bubble_pick`].
+    image_bubble_pick: Option<ImageBubbleFilePick>,
     pending_footer_patches: HashMap<i64, Map<String, Value>>,
     pending_footer_patch_changed_at: HashMap<i64, f64>,
     footer_character_autocomplete: HashMap<i64, AutocompleteLine>,
@@ -1053,6 +1056,7 @@ impl TranslationTabState {
             footer_tracking_synced_revision: None,
             footer_known_ids: HashSet::new(),
             footer_overrides: HashMap::new(),
+            image_bubble_pick: None,
             pending_footer_patches: HashMap::new(),
             pending_footer_patch_changed_at: HashMap::new(),
             footer_character_autocomplete: HashMap::new(),
@@ -1518,6 +1522,7 @@ impl TranslationTabState {
                     last_clarification: &mut self.last_clarification,
                     last_page_idx: &mut self.last_page_idx,
                     last_bubble_order: &mut self.last_bubble_order,
+                    image_bubble_pick: &mut self.image_bubble_pick,
                 };
                 draw_bubbles_panel(
                     &mut self.bubbles_panel,
@@ -2165,6 +2170,41 @@ impl TranslationTabState {
             {
                 canvas.flush_pending_bubble_upserts_now(project);
             }
+        }
+    }
+
+    /// Resolves the image-bubble «choose file» dialog once it closed: copies the picked file into
+    /// the staging image-bubble folder and queues the `image_path` footer patch. A cancel is a
+    /// no-op; a dialog or copy failure becomes an error toast.
+    fn poll_image_bubble_pick(&mut self, ctx: &egui::Context, project: &ProjectData, now_s: f64) {
+        let Some(pick) = self.image_bubble_pick.as_mut() else {
+            return;
+        };
+        let Some(result) = pick.poll() else {
+            return;
+        };
+        let bubble_id = pick.bubble_id();
+        self.image_bubble_pick = None;
+        let source = match result {
+            Ok(Some(picked)) => match picked.into_file() {
+                Some(file) => file.path,
+                // `OpenFile` always answers with one file (`Picked` contract); anything else is
+                // a platform-layer bug, logged and treated as a cancel.
+                None => {
+                    ms_log::runtime_log::log_error(format!("[translation] image bubble {bubble_id}: file dialog returned no file for an OpenFile request"));
+                    return;
+                }
+            },
+            Ok(None) => return,
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!("[translation] image bubble {bubble_id}: file dialog failed: {err:?}"));
+                self.push_toast(ctx, err.user_message(), Severity::Error, 3.0);
+                return;
+            }
+        };
+        match copy_external_image_bubble(project, bubble_id, &source) {
+            Ok(saved) => self.queue_footer_patch(bubble_id, "image_path", Value::String(project_relative_path(project, &saved)), now_s),
+            Err(err) => self.push_toast(ctx, err, Severity::Error, 3.0),
         }
     }
 
@@ -5238,18 +5278,14 @@ impl TranslationTabState {
                     Err(err) => self.push_toast(ui.ctx(), err, Severity::Error, 3.0),
                 }
             }
-            if ui.small_button(t!("translation.common.choose_file_button")).clicked()
-                && let Some(path) = pick_image_bubble_file()
+            // Disabled while any image-bubble dialog is open: one dialog at a time, and the
+            // open one may belong to another bubble. Resolved by `poll_image_bubble_pick`.
+            let picking = self.image_bubble_pick.is_some();
+            if ui
+                .add_enabled(!picking, egui::Button::new(t!("translation.common.choose_file_button")).small())
+                .clicked()
             {
-                match copy_external_image_bubble(project, bubble_id, &path) {
-                    Ok(saved) => self.queue_footer_patch(
-                        bubble_id,
-                        "image_path",
-                        Value::String(project_relative_path(project, &saved)),
-                        now_s,
-                    ),
-                    Err(err) => self.push_toast(ui.ctx(), err, Severity::Error, 3.0),
-                }
+                self.image_bubble_pick = Some(ImageBubbleFilePick::request(ui.ctx(), bubble_id));
             }
         }
     }
@@ -5676,6 +5712,7 @@ impl CanvasHooks for TranslationTabState {
         self.handle_advanced_recognition_window(ctx, canvas, project);
         self.maybe_dispatch_next_textdetector_ocr_request(ctx, project);
         self.handle_pending_mt_actions(ctx, canvas, project);
+        self.poll_image_bubble_pick(ctx, project, now_s);
         self.flush_footer_patches(canvas, project, now_s);
         self.bubbles_panel.flush_text_updates(canvas, now_s);
         self.handle_text_detector_line_edit_hotkeys(ctx, canvas, project);
@@ -7501,24 +7538,6 @@ fn save_clipboard_image_bubble(project: &ProjectData, bubble_id: i64) -> Result<
         .save(&path)
         .map_err(|err| tf!("translation.image_io.save_error", path = path.display(), err = err))?;
     Ok(path)
-}
-
-/// Opens the native image-file picker for an external image bubble and returns
-/// the chosen path, or `None` if the user cancelled.
-///
-/// Web stub: the browser build has no native file dialog (`rfd`), so this returns
-/// `None` and the "choose file" button is a no-op there (browser file import via
-/// `<input type=file>` is added later).
-#[cfg(not(target_arch = "wasm32"))]
-fn pick_image_bubble_file() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp"])
-        .pick_file()
-}
-
-#[cfg(target_arch = "wasm32")]
-fn pick_image_bubble_file() -> Option<PathBuf> {
-    None
 }
 
 fn copy_external_image_bubble(

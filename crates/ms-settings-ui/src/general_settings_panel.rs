@@ -66,6 +66,8 @@ but persists through the same paths.
 use ms_i18n::resolve_key;
 use ms_memory::MemoryProfile;
 use ms_log::runtime_log;
+use ms_platform::PlatformFeature;
+use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog, Picked};
 use ms_widgets::{WheelComboBox, WheelSlider};
 use ms_text_util::language::{ScriptGroup, TextLanguage, set_text_language, text_language};
 use ms_thread as thread;
@@ -73,6 +75,7 @@ use crate::settings_shared::with_item_badge;
 use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
 use crate::storage_mode_setting::{StorageModeSettingState, draw_storage_mode_setting};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Status line shown under the projects-directory editor.
@@ -129,6 +132,9 @@ pub struct GeneralSettingsPanelState {
     pub status: GeneralSettingsStatus,
     /// The Dev/Prod storage row (conversion job bookkeeping of this surface).
     pub storage_mode: StorageModeSettingState,
+    /// The projects-root folder picker while it is open (polled every frame; the "Browse"
+    /// button is disabled meanwhile).
+    projects_dir_pick: Option<PendingDialog>,
 }
 
 /// One selectable interface language for the UI-language selector.
@@ -231,6 +237,7 @@ impl GeneralSettingsPanelState {
             locale_options: scan_locale_options(),
             status: GeneralSettingsStatus::Idle,
             storage_mode: StorageModeSettingState::default(),
+            projects_dir_pick: None,
         }
     }
 
@@ -248,7 +255,8 @@ impl GeneralSettingsPanelState {
 ///
 /// Persists a changed projects dir / memory profile synchronously (one serialized
 /// `ms_docstore` update of `user_config.json`, under its document lock); persistence failures set an error status and
-/// are logged. The native folder picker button is desktop-only.
+/// are logged. The folder picker button ("Browse") is drawn only where a picked folder can be
+/// used in place (`PlatformFeature::PersistentDirectoryPicker`); its dialog never blocks.
 ///
 /// `warnings` is the launcher's warning set: the projects-dir and UI-language labels get
 /// their inline badges (`with_item_badge`). The studio passes `None`: no badge, the
@@ -260,6 +268,7 @@ pub fn draw_general_settings_panel(
     warnings: Option<&WarningSet>,
 ) -> GeneralSettingsOutcome {
     let mut outcome = GeneralSettingsOutcome::default();
+    poll_projects_dir_pick(state);
 
     // Projects-directory editor (rich variant: text field + folder picker + save).
     with_item_badge(ui, warnings, SettingKey::ProjectsRoot, |ui| ui.label(t!("settings.general.projects_dir_label")));
@@ -277,11 +286,14 @@ pub fn draw_general_settings_panel(
         if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             should_save = true;
         }
-        // The native OS folder picker exists only on desktop; on web there is no OS
-        // directory to browse, so the button is omitted.
-        #[cfg(not(target_arch = "wasm32"))]
-        if ui.button(t!("settings.general.browse_button")).clicked() {
-            pick_projects_dir(state);
+        // The projects root is a path used in place, so the button exists only where the
+        // picker yields one (desktop); elsewhere it is omitted, the text field stays.
+        if PlatformFeature::PersistentDirectoryPicker.is_available()
+            && ui
+                .add_enabled(state.projects_dir_pick.is_none(), egui::Button::new(t!("settings.general.browse_button")))
+                .clicked()
+        {
+            start_projects_dir_pick(ui.ctx(), state);
         }
     });
 
@@ -1017,25 +1029,42 @@ fn clear_success_status(state: &mut GeneralSettingsPanelState) {
     }
 }
 
-/// Opens the native OS folder picker and stores the chosen (normalized) projects root
-/// in the input field. Desktop-only (no OS directory dialog on web).
-#[cfg(not(target_arch = "wasm32"))]
-fn pick_projects_dir(state: &mut GeneralSettingsPanelState) {
+/// Opens the projects-root folder picker (`PickDirectoryPath`) without blocking, starting in
+/// the field's folder when it exists, else in the default projects root. The answer is taken
+/// by [`poll_projects_dir_pick`].
+fn start_projects_dir_pick(ctx: &egui::Context, state: &mut GeneralSettingsPanelState) {
     let current = normalize_projects_dir_value(&state.projects_dir_input);
     let start_dir = if std::path::Path::new(&current).is_dir() {
         PathBuf::from(current)
     } else {
         ms_config::default_projects_root()
     };
-    let Some(selected_dir) = rfd::FileDialog::new()
-        .set_directory(start_dir)
-        .pick_folder()
-    else {
+    let request = FileDialogRequest::new(DialogKind::PickDirectoryPath).start_dir(&start_dir);
+    let repaint_ctx = ctx.clone();
+    state.projects_dir_pick = Some(file_dialog::request(request, Some(Arc::new(move || repaint_ctx.request_repaint()))));
+}
+
+/// Takes the folder picker's answer once it arrived: a chosen folder goes (normalized) into the
+/// input field with a "now save" hint, a cancel changes nothing, a failure is shown in the
+/// status line and logged.
+fn poll_projects_dir_pick(state: &mut GeneralSettingsPanelState) {
+    let Some(result) = state.projects_dir_pick.as_mut().and_then(PendingDialog::poll) else {
         return;
     };
-    state.projects_dir_input = normalize_projects_dir_value(&selected_dir.to_string_lossy());
-    state.status =
-        GeneralSettingsStatus::Info(t!("settings.general.projects_dir_picked_hint").to_string());
+    state.projects_dir_pick = None;
+    match result {
+        // `PickDirectoryPath` always answers `DirectoryPath` (the ms-platform kind contract).
+        Ok(picked) => {
+            if let Some(selected_dir) = picked.and_then(Picked::into_directory_path) {
+                state.projects_dir_input = normalize_projects_dir_value(&selected_dir.to_string_lossy());
+                state.status = GeneralSettingsStatus::Info(t!("settings.general.projects_dir_picked_hint").to_string());
+            }
+        }
+        Err(err) => {
+            runtime_log::log_warn(format!("[settings] projects-root folder picker failed: {err:?}"));
+            state.status = GeneralSettingsStatus::Error(err.user_message());
+        }
+    }
 }
 
 /// Whether the normalized input differs from the last saved projects root (drives the

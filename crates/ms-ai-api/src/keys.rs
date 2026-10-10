@@ -25,12 +25,15 @@ Key functions:
 Notes:
 Every call is blocking credential-store I/O: never call it on the GUI thread. The web build
 has no credential store; each function there returns `AiApiError::KeyStoreWebUnavailable`.
+Android has none either until a Keystore-backed store exists (`keyring` would silently link
+its in-memory mock there, so it is compiled out); each function there returns
+`AiApiError::KeyStoreUnavailable` carrying `ms_platform::Unavailable { CredentialStore }`.
 A key is never logged; failures are logged with the service and the store's error text.
 */
 
 use crate::error::AiApiError;
 use crate::target::AiApiTarget;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 use ms_log::runtime_log;
 
 /// Credential-store service name of every AI API key. A persistence contract: users' saved
@@ -68,14 +71,32 @@ impl NamedKeyUser {
     }
 }
 
-/// Web stub: the OS credential store (`keyring`) does not exist in the browser,
-/// so storing an API key is rejected with a clear error.
+/// The error of every key-store call on the web build, which has no credential store.
+#[cfg(target_arch = "wasm32")]
+fn key_store_unavailable() -> AiApiError {
+    AiApiError::KeyStoreWebUnavailable
+}
+
+/// The error of every key-store call on Android: the capability table's typed answer for
+/// `PlatformFeature::CredentialStore`. Should the table ever report a store there, this build
+/// still compiled `keyring` out, so the bridge to that store is what is missing.
+#[cfg(target_os = "android")]
+fn key_store_unavailable() -> AiApiError {
+    use ms_platform::{PlatformFeature, Unavailable, UnavailableReason};
+    match PlatformFeature::CredentialStore.require() {
+        Err(unavailable) => AiApiError::KeyStoreUnavailable(unavailable),
+        Ok(()) => AiApiError::KeyStoreUnavailable(Unavailable::new(PlatformFeature::CredentialStore, UnavailableReason::BridgeMissing)),
+    }
+}
+
+/// Stub for builds without an OS credential store (wasm, Android): storing an API key is
+/// rejected with a clear error.
 ///
 /// # Errors
-/// Always `AiApiError::KeyStoreWebUnavailable`.
-#[cfg(target_arch = "wasm32")]
+/// Always the no-credential-store error (see `key_store_unavailable`).
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn store_api_key(_target: &AiApiTarget, _api_key: &str) -> Result<(), AiApiError> {
-    Err(AiApiError::KeyStoreWebUnavailable)
+    Err(key_store_unavailable())
 }
 
 /// Stores the trimmed `api_key` for `target` (its service, plus its base URL for a compatible
@@ -84,7 +105,7 @@ pub fn store_api_key(_target: &AiApiTarget, _api_key: &str) -> Result<(), AiApiE
 /// # Errors
 /// `EmptyKey` for an empty/whitespace key, `KeyringUnavailable` when the store cannot be
 /// opened, `StoreKey` when the write fails.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn store_api_key(target: &AiApiTarget, api_key: &str) -> Result<(), AiApiError> {
     let service = target.service();
     let trimmed = api_key.trim();
@@ -97,14 +118,14 @@ pub fn store_api_key(target: &AiApiTarget, api_key: &str) -> Result<(), AiApiErr
     })
 }
 
-/// Web stub: no OS credential store on the browser build, so clearing a key is
+/// Stub for builds without an OS credential store (wasm, Android): clearing a key is
 /// rejected with a clear error.
 ///
 /// # Errors
-/// Always `AiApiError::KeyStoreWebUnavailable`.
-#[cfg(target_arch = "wasm32")]
+/// Always the no-credential-store error (see `key_store_unavailable`).
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn clear_api_key(_target: &AiApiTarget) -> Result<(), AiApiError> {
-    Err(AiApiError::KeyStoreWebUnavailable)
+    Err(key_store_unavailable())
 }
 
 /// Deletes the stored key of `target`; a target without a stored key is success. For a
@@ -112,7 +133,7 @@ pub fn clear_api_key(_target: &AiApiTarget) -> Result<(), AiApiError> {
 ///
 /// # Errors
 /// `KeyringUnavailable` when the store cannot be opened, `DeleteKey` when the delete fails.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn clear_api_key(target: &AiApiTarget) -> Result<(), AiApiError> {
     let service = target.service();
     match keyring_entry(target)?.delete_credential() {
@@ -124,15 +145,15 @@ pub fn clear_api_key(target: &AiApiTarget) -> Result<(), AiApiError> {
     }
 }
 
-/// Web stub: no OS credential store on the browser build. Returns a clear error
-/// so callers (OCR warmup, MT run, metadata) surface "unavailable on web" rather
+/// Stub for builds without an OS credential store (wasm, Android). Returns a clear error
+/// so callers (OCR warmup, MT run, metadata) surface "credential store unavailable" rather
 /// than treating a missing key as an empty one.
 ///
 /// # Errors
-/// Always `AiApiError::KeyStoreWebUnavailable`.
-#[cfg(target_arch = "wasm32")]
+/// Always the no-credential-store error (see `key_store_unavailable`).
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn read_api_key(_target: &AiApiTarget) -> Result<String, AiApiError> {
-    Err(AiApiError::KeyStoreWebUnavailable)
+    Err(key_store_unavailable())
 }
 
 /// Reads the stored key of `target`, untrimmed; `Ok("")` when no key is stored. For a
@@ -142,7 +163,7 @@ pub fn read_api_key(_target: &AiApiTarget) -> Result<String, AiApiError> {
 /// # Errors
 /// `KeyringUnavailable` when the store cannot be opened, `ReadKey` when the read fails for a
 /// reason other than a missing entry.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn read_api_key(target: &AiApiTarget) -> Result<String, AiApiError> {
     let service = target.service();
     match keyring_entry(target)?.get_password() {
@@ -156,7 +177,7 @@ pub fn read_api_key(target: &AiApiTarget) -> Result<String, AiApiError> {
 }
 
 /// Opens the credential-store entry `(KEYRING_SERVICE, credential_user(target))`.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 fn keyring_entry(target: &AiApiTarget) -> Result<keyring::Entry, AiApiError> {
     open_entry(&credential_user(target), target.service().label())
 }
@@ -166,7 +187,7 @@ fn keyring_entry(target: &AiApiTarget) -> Result<keyring::Entry, AiApiError> {
 ///
 /// # Errors
 /// `KeyringUnavailable` when the store cannot be opened.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 fn open_entry(user: &str, label: &str) -> Result<keyring::Entry, AiApiError> {
     keyring::Entry::new(KEYRING_SERVICE, user).map_err(|err| {
         runtime_log::log_error(format!("[AI API] OS credential store unavailable for {label}: {err}"));
@@ -174,13 +195,13 @@ fn open_entry(user: &str, label: &str) -> Result<keyring::Entry, AiApiError> {
     })
 }
 
-/// Web stub: no OS credential store on the browser build.
+/// Stub for builds without an OS credential store (wasm, Android).
 ///
 /// # Errors
-/// Always `AiApiError::KeyStoreWebUnavailable`.
-#[cfg(target_arch = "wasm32")]
+/// Always the no-credential-store error (see `key_store_unavailable`).
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn store_named_key(_user: &NamedKeyUser, _label: &'static str, _api_key: &str) -> Result<(), AiApiError> {
-    Err(AiApiError::KeyStoreWebUnavailable)
+    Err(key_store_unavailable())
 }
 
 /// Stores the trimmed `api_key` in the named slot `user`, replacing any previous key there.
@@ -189,7 +210,7 @@ pub fn store_named_key(_user: &NamedKeyUser, _label: &'static str, _api_key: &st
 /// # Errors
 /// `EmptyKey` for an empty/whitespace key, `KeyringUnavailable` when the store cannot be
 /// opened, `StoreNamedKey` when the write fails.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn store_named_key(user: &NamedKeyUser, label: &'static str, api_key: &str) -> Result<(), AiApiError> {
     let trimmed = api_key.trim();
     if trimmed.is_empty() {
@@ -201,20 +222,20 @@ pub fn store_named_key(user: &NamedKeyUser, label: &'static str, api_key: &str) 
     })
 }
 
-/// Web stub: no OS credential store on the browser build.
+/// Stub for builds without an OS credential store (wasm, Android).
 ///
 /// # Errors
-/// Always `AiApiError::KeyStoreWebUnavailable`.
-#[cfg(target_arch = "wasm32")]
+/// Always the no-credential-store error (see `key_store_unavailable`).
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn clear_named_key(_user: &NamedKeyUser, _label: &'static str) -> Result<(), AiApiError> {
-    Err(AiApiError::KeyStoreWebUnavailable)
+    Err(key_store_unavailable())
 }
 
 /// Deletes the key of the named slot `user`; a slot without a stored key is success.
 ///
 /// # Errors
 /// `KeyringUnavailable` when the store cannot be opened, `DeleteNamedKey` when the delete fails.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn clear_named_key(user: &NamedKeyUser, label: &'static str) -> Result<(), AiApiError> {
     match open_entry(user.as_str(), label)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -225,14 +246,14 @@ pub fn clear_named_key(user: &NamedKeyUser, label: &'static str) -> Result<(), A
     }
 }
 
-/// Web stub: no OS credential store on the browser build, so a missing store is never mistaken
-/// for a missing key.
+/// Stub for builds without an OS credential store (wasm, Android), so a missing store is never
+/// mistaken for a missing key.
 ///
 /// # Errors
-/// Always `AiApiError::KeyStoreWebUnavailable`.
-#[cfg(target_arch = "wasm32")]
+/// Always the no-credential-store error (see `key_store_unavailable`).
+#[cfg(any(target_arch = "wasm32", target_os = "android"))]
 pub fn read_named_key(_user: &NamedKeyUser, _label: &'static str) -> Result<String, AiApiError> {
-    Err(AiApiError::KeyStoreWebUnavailable)
+    Err(key_store_unavailable())
 }
 
 /// Reads the key of the named slot `user`, untrimmed; `Ok("")` when no key is stored. The
@@ -241,7 +262,7 @@ pub fn read_named_key(_user: &NamedKeyUser, _label: &'static str) -> Result<Stri
 /// # Errors
 /// `KeyringUnavailable` when the store cannot be opened, `ReadNamedKey` when the read fails for
 /// a reason other than a missing entry.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn read_named_key(user: &NamedKeyUser, label: &'static str) -> Result<String, AiApiError> {
     match open_entry(user.as_str(), label)?.get_password() {
         Ok(key) => Ok(key),
@@ -257,7 +278,7 @@ pub fn read_named_key(user: &NamedKeyUser, label: &'static str) -> Result<String
 /// persistence contract), `"{service.key()}@{endpoint}"` for a compatible service. The endpoint
 /// is `AiApiTarget`'s normalized base URL, which a compatible target always carries, so two
 /// spellings of one server share a key and two servers never do.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 fn credential_user(target: &AiApiTarget) -> String {
     let service = target.service();
     match target.endpoint() {
@@ -269,14 +290,14 @@ fn credential_user(target: &AiApiTarget) -> String {
 #[cfg(test)]
 mod tests {
     use super::{KEYRING_SERVICE, NamedKeyUser};
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     use super::credential_user;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     use crate::service::AiApiService;
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     use crate::target::AiApiTarget;
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     fn target(service: AiApiService, base_url: &str) -> AiApiTarget {
         AiApiTarget::new(service, base_url).unwrap_or_else(|error| panic!("test target {service:?} {base_url:?}: {error:?}"))
     }
@@ -289,7 +310,7 @@ mod tests {
 
     // Persistence contract: hosted services keep the user names users' saved keys live under,
     // whatever base URL is left over in the settings.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     #[test]
     fn hosted_user_name_is_the_frozen_service_key() {
         for service in AiApiService::ALL.into_iter().filter(|service| !service.uses_base_url()) {
@@ -297,7 +318,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     #[test]
     fn compatible_user_name_is_bound_to_the_normalized_endpoint() {
         let local = target(AiApiService::OpenAiCompatible, " HTTP://127.0.0.1:8080 ");
@@ -318,7 +339,7 @@ mod tests {
 
     // A named slot never aliases a target slot: target user names are `service.key()` or
     // `"{service.key()}@{url}"`, and no service key contains the `:` of the named prefix.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
     #[test]
     fn named_user_names_never_collide_with_target_user_names() {
         for service in AiApiService::ALL {

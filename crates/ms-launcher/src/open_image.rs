@@ -8,10 +8,13 @@ onto the launcher outcome. Native only — the wasm build has no picker and no b
 `dev-docs/single_image_mode_plan.md`).
 
 Key items:
-- `spawn_image_picker()`: runs `rfd::FileDialog::pick_file` and the validation on a worker;
-  the GUI thread only polls the returned channel.
-- `picker_filter_extensions()`: the picker filter, built from the ONE input-type table
-  `ms_config::single_image::input_extensions()`.
+- `spawn_image_picker()`: runs the blocking `ms_platform::file_dialog::pick_blocking` and the
+  validation on a worker; the GUI thread only polls the returned channel.
+- `image_picker_request()`: the `OpenFile` request, its filter built from the ONE input-type
+  table `ms_config::single_image::input_extensions()` (the dialog seam adds the uppercase
+  spellings case-sensitive GTK globs need).
+- `pick_result_from_dialog()`: maps a dialog result onto `ImagePickResult` (cancel, dialog
+  failure, validated pick).
 - `validate_picked_path()`: the launcher's only check — the path exists and is a file.
 - `launcher_outcome_for_pick()`: pure mapping of an `ImagePickResult` onto
   `LauncherOutcome::OpenImage`.
@@ -24,6 +27,8 @@ error (`SingleImageError::user_message`), so the launcher never duplicates that 
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
+
+use ms_platform::file_dialog::{self, DialogKind, DialogResult, FileDialogRequest};
 
 use crate::state::LauncherOutcome;
 
@@ -47,6 +52,9 @@ pub enum OpenImageRejection {
     NotAFile(PathBuf),
     /// The file metadata could not be read; `error` is the OS error text for the log.
     Inaccessible { path: PathBuf, error: String },
+    /// The file dialog itself failed (another dialog open, no picker on this platform, a
+    /// backend failure). `message` is the localized status, `detail` the typed error for the log.
+    Dialog { message: String, detail: String },
 }
 
 impl OpenImageRejection {
@@ -56,6 +64,7 @@ impl OpenImageRejection {
             OpenImageRejection::NotFound(path) => tf!("launcher.main.open_image_not_found_error", path = path.display()),
             OpenImageRejection::NotAFile(path) => tf!("launcher.main.open_image_not_a_file_error", path = path.display()),
             OpenImageRejection::Inaccessible { path, .. } => tf!("launcher.main.open_image_access_error", path = path.display()),
+            OpenImageRejection::Dialog { message, .. } => message.clone(),
         }
     }
 
@@ -68,24 +77,39 @@ impl OpenImageRejection {
                 "[launcher-open-image] cannot read metadata of the picked path; path='{}'; error={error}; possible cause: permissions or a broken link",
                 path.display()
             ),
+            OpenImageRejection::Dialog { detail, .. } => format!("[launcher-open-image] file dialog failed; error={detail}"),
         }
     }
 }
 
-/// Extensions for the picker filter: every input extension in table order, followed by its
-/// uppercase spelling. The uppercase copies are needed because the GTK and xdg-portal backends
-/// of `rfd` turn each extension into a case-sensitive `*.ext` glob, which would hide
-/// `PHOTO.JPG`; Windows and macOS match case-insensitively, so the copies are harmless there.
-pub fn picker_filter_extensions() -> Vec<String> {
-    let lowercase: Vec<&'static str> = ms_config::single_image::input_extensions().collect();
-    let mut extensions: Vec<String> = lowercase.iter().map(|extension| (*extension).to_owned()).collect();
-    for extension in &lowercase {
-        let upper = extension.to_ascii_uppercase();
-        if !extensions.contains(&upper) {
-            extensions.push(upper);
-        }
+/// The single-file request of the "Open image" picker: one filter listing every input
+/// extension in table order. Uppercase spellings are not listed here: the desktop dialog
+/// backend adds them for the case-sensitive GTK / xdg-portal globs.
+pub fn image_picker_request() -> FileDialogRequest {
+    let extensions: Vec<&'static str> = ms_config::single_image::input_extensions().collect();
+    FileDialogRequest::new(DialogKind::OpenFile).filter(t!("launcher.main.open_image_filter"), &extensions)
+}
+
+/// Maps a finished dialog onto the pick result: a cancel stays `Cancelled`, a dialog failure
+/// becomes `Rejected(Dialog)`, a picked file goes through `validate_picked_path` (blocking
+/// metadata read: call only off the GUI thread).
+pub fn pick_result_from_dialog(result: DialogResult) -> ImagePickResult {
+    match result {
+        Ok(None) => ImagePickResult::Cancelled,
+        Ok(Some(picked)) => match picked.into_file() {
+            Some(file) => match validate_picked_path(file.path) {
+                Ok(path) => ImagePickResult::Selected(path),
+                Err(rejection) => ImagePickResult::Rejected(rejection),
+            },
+            // `OpenFile` always yields `Picked::Files` with one file (the seam's contract);
+            // anything else is a backend bug, reported like a picker failure.
+            None => ImagePickResult::Rejected(OpenImageRejection::Dialog {
+                message: t!("launcher.main.open_image_picker_error").to_owned(),
+                detail: "OpenFile dialog returned a result without a file".to_owned(),
+            }),
+        },
+        Err(error) => ImagePickResult::Rejected(OpenImageRejection::Dialog { message: error.user_message(), detail: format!("{error:?}") }),
     }
-    extensions
 }
 
 /// Checks that `path` names an existing regular file (symlinks are followed). Blocking file
@@ -111,7 +135,7 @@ pub fn launcher_outcome_for_pick(result: ImagePickResult) -> Result<Option<Launc
     }
 }
 
-/// Starts the native single-file picker plus validation on a named worker thread and returns
+/// Starts the single-file picker plus validation on a named worker thread and returns
 /// the receiver of its one result. The dialog opens at the OS default location (Windows and
 /// GTK remember the last folder used): the projects root holds chapters, not loose pictures,
 /// so it would be a worse start. A disconnected receiver without a value means the worker
@@ -119,14 +143,7 @@ pub fn launcher_outcome_for_pick(result: ImagePickResult) -> Result<Option<Launc
 pub fn spawn_image_picker() -> Receiver<ImagePickResult> {
     let (tx, rx) = mpsc::channel::<ImagePickResult>();
     let spawned = std::thread::Builder::new().name("launcher-open-image-picker".to_owned()).spawn(move || {
-        let extensions = picker_filter_extensions();
-        let result = match rfd::FileDialog::new().add_filter(t!("launcher.main.open_image_filter"), &extensions).pick_file() {
-            None => ImagePickResult::Cancelled,
-            Some(path) => match validate_picked_path(path) {
-                Ok(path) => ImagePickResult::Selected(path),
-                Err(rejection) => ImagePickResult::Rejected(rejection),
-            },
-        };
+        let result = pick_result_from_dialog(file_dialog::pick_blocking(image_picker_request()));
         if tx.send(result).is_err() {
             // The launcher window closed while the dialog was open; nobody waits for the pick.
             ms_log::runtime_log::log_warn("[launcher-open-image] pick finished after the launcher stopped polling; result dropped");
@@ -144,15 +161,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filter_lists_every_input_extension_then_uppercase_copies() {
-        let lowercase: Vec<&str> = ms_config::single_image::input_extensions().collect();
-        let extensions = picker_filter_extensions();
-        assert_eq!(extensions.len(), lowercase.len() * 2);
-        assert_eq!(&extensions[..lowercase.len()], lowercase.as_slice());
-        for extension in &lowercase {
-            assert!(extensions.contains(&extension.to_ascii_uppercase()), "missing uppercase copy of {extension}");
-        }
-        assert!(extensions.iter().all(|extension| !extension.starts_with('.')));
+    fn request_is_one_open_file_filter_over_the_input_table() {
+        let request = image_picker_request();
+        assert_eq!(request.kind(), DialogKind::OpenFile);
+        let [filter] = request.filters() else {
+            panic!("expected exactly one filter, got {:?}", request.filters());
+        };
+        let expected: Vec<&str> = ms_config::single_image::input_extensions().collect();
+        assert_eq!(filter.extensions(), expected.as_slice());
+    }
+
+    #[test]
+    fn dialog_results_map_onto_pick_results() {
+        use ms_platform::file_dialog::{FileDialogError, Picked, PickedFile};
+
+        assert_eq!(pick_result_from_dialog(Ok(None)), ImagePickResult::Cancelled);
+        let ImagePickResult::Rejected(OpenImageRejection::Dialog { message, detail }) = pick_result_from_dialog(Err(FileDialogError::Busy)) else {
+            panic!("a dialog error must become a Dialog rejection");
+        };
+        assert!(!message.is_empty());
+        assert!(detail.contains("Busy"));
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let file = dir.path().join("page.png");
+        std::fs::write(&file, b"not decoded here").expect("write fixture file");
+        let picked = Picked::Files(vec![PickedFile { path: file.clone(), display_name: "page.png".to_owned() }]);
+        assert_eq!(pick_result_from_dialog(Ok(Some(picked))), ImagePickResult::Selected(file));
+        let folder = Picked::Folder(dir.path().to_path_buf());
+        assert!(matches!(pick_result_from_dialog(Ok(Some(folder))), ImagePickResult::Rejected(OpenImageRejection::Dialog { .. })));
     }
 
     #[test]

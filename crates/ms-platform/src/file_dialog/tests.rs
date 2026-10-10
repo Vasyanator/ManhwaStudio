@@ -201,3 +201,14 @@ fn every_message_key_is_shipped_and_interpolated() {
     let unavailable = Unavailable::new(PlatformFeature::FilePicker, crate::UnavailableReason::BridgeMissing);
     assert_eq!(FileDialogError::from(unavailable).user_message(), unavailable.user_message());
 }
+
+#[test]
+fn save_path_without_extension_gets_the_first_filter_extension() {
+    let filters = FileDialogRequest::new(DialogKind::SaveFile).filter("Text", &["TXT", "log"]).filter("Docs", &["docx"]).filters().to_vec();
+    assert_eq!(with_default_extension(PathBuf::from("/out/notes"), &filters), PathBuf::from("/out/notes.txt"));
+    // Any existing extension is kept as typed: the user's own, or one the native dialog added.
+    assert_eq!(with_default_extension(PathBuf::from("/out/notes.txt"), &filters), PathBuf::from("/out/notes.txt"));
+    assert_eq!(with_default_extension(PathBuf::from("/out/notes.md"), &filters), PathBuf::from("/out/notes.md"));
+    // No filters: nothing to infer from.
+    assert_eq!(with_default_extension(PathBuf::from("/out/notes"), &[]), PathBuf::from("/out/notes"));
+}

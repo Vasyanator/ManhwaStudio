@@ -43,6 +43,9 @@ ms-i18n = { path = "../ms-i18n" }
 # Named worker threads for the download/unpack/pip stages, which must never block the
 # installer window's GUI thread.
 ms-thread = { path = "../ms-thread" }
+# The non-blocking folder picker of the installer's "custom install location" row
+# (`ms_platform::file_dialog`, `PickDirectoryPath`).
+ms-platform = { path = "../ms-platform" }
 # The Windows OS records of an install (Uninstall / App Paths / "Open with" registry keys,
 # `ManhwaStudio.lnk` shortcuts, elevation probe and UAC relaunch) and their names. The
 # installer sequences them and maps `IntegrationError::user_message()` into its messages;
@@ -63,8 +66,6 @@ tar.workspace = true
 zip.workspace = true
 # The Python runtime for some platforms ships as `.tar.zst`.
 zstd.workspace = true
-# The "choose a custom install folder" prompts of the update flow.
-rfd.workspace = true
 # The installer window paints the bundled application icon.
 image.workspace = true
 # Wall-clock and monotonic time in the progress/ETA reporting.

@@ -61,6 +61,9 @@ ms-i18n = { path = "../ms-i18n" }
 # Named worker threads: catalogue scans, downloads, stitching and image conversion never
 # run on the GUI thread.
 ms-thread = { path = "../ms-thread" }
+# File open/save dialogs (`file_dialog::request` polled per frame, `pick_blocking` on workers)
+# and the platform capability table.
+ms-platform = { path = "../ms-platform" }
 # The launcher windows are `eframe` applications; same feature set as the binary so no
 # second copy of the backend is built.
 eframe.workspace = true
@@ -92,8 +95,6 @@ ms-window-geometry = { path = "../ms-window-geometry" }
 # offers and runs their actions (`actions`), and on Windows the elevated helper
 # (`windows::elevation::apply_elevated`). Native only: the web build has no OS records.
 ms-os-integration = { path = "../ms-os-integration" }
-# Native file/folder dialogs of import, export and the new-project sources.
-rfd.workspace = true
 # HTTP for the quick/advanced downloaders and the site adapters.
 ureq.workspace = true
 # Chapter archives arrive as `.zip`, `.tar.gz` and `.tar.zst`.
@@ -120,3 +121,6 @@ tempfile.workspace = true
 # does NOT unify features for a standalone `cargo check -p ms-launcher`, so it has to be
 # named here and not only in the binary's dev-dependencies.
 ms-config = { path = "../ms-config", features = ["test-support"] }
+# `test-support` exposes `PendingDialog::ready` / `SaveTarget::for_test` for the tests of the
+# launcher's pending-dialog state machines and export commit ordering.
+ms-platform = { path = "../ms-platform", features = ["test-support"] }
