@@ -13,7 +13,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [workspace]
-members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
+members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-platform", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
 # The Android port forks under `crates/` are separate workspaces patched in below; without
 # this exclusion Cargo would adopt them as implicit members of this workspace.
 exclude = ["crates/winit", "crates/egui"]
@@ -65,10 +65,15 @@ image = { version = "0.25", default-features = true }
 # `ms-text-detect` needs none of them and must stay wasm-buildable, while `ms-onnx` opts back into
 # `rayon` (it only parallelizes `warp_into`; the output is identical either way).
 imageproc = { version = "0.27", default-features = false }
+# Android JNI: the root package (`src/android_entry.rs`) and `ms-platform`. Same 0.22 line as
+# android-activity and rustls-platform-verifier, so all of them share one `JavaVM` singleton.
+jni = { version = "0.22", default-features = false }
 keyring = { version = "3.6.3", default-features = false, features = ["linux-native-sync-persistent", "windows-native", "apple-native", "crypto-rust", "vendored"] }
 libc = "0.2"
 libloading = "0.8"
 minijinja = "2"
+# Android application context + JavaVM published by android-activity (`ms-platform`).
+ndk-context = "0.1.1"
 rayon = "1"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
@@ -383,7 +388,7 @@ web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlC
 eframe = { workspace = true, features = ["android-game-activity"] }
 android_logger = { version = "0.15", default-features = false }
 log = "0.4"
-jni = { version = "0.22", default-features = false }
+jni.workspace = true
 rustls-platform-verifier = "0.7"
 
 [target.'cfg(windows)'.dependencies]

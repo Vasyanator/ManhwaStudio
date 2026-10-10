@@ -3903,6 +3903,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-platform"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "jni",
+ "ms-i18n",
+ "ms-log",
+ "ndk-context",
+ "rfd",
+ "serde_json",
+ "thiserror 2.0.18",
+ "wayland-sys",
+]
+
+[[package]]
 name = "ms-project"
 version = "0.1.0"
 dependencies = [

@@ -48,7 +48,7 @@ root package (src/: lib.rs + thin main.rs, app.rs, studio_bootstrap.rs, tabs/set
   <- ms-project / ms-widgets / ms-native-runtime
   <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration
   <- ms-config / ms-text-render
-  <- ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx
+  <- ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx / ms-platform
   <- ms-log / ms-text-detect
   <- ms-actions / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
 ```
@@ -85,6 +85,11 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - `ms-memory` — image-memory profiles and eviction policy; owns no pixels.
 - `ms-onnx` — onnxruntime (`ort`, load-dynamic) inference: MangaOCR, PaddleOCR.
 - `ms-backend-ipc` — framed IPC client for the Python backend.
+- `ms-platform` — GUI-free platform seams: the capability table
+  (`PlatformFeature::is_available()`, typed `Unavailable`), the async-shaped file-dialog seam
+  (rfd on desktop, Storage Access Framework on Android), clipboard reads and the pre-window
+  error box. The only crate naming `rfd` / `arboard`, and the one place JNI is used for
+  platform services.
 
 **Core (levels 3-6)**
 - `ms-config` — runtime root (`data_dir` / `program_dir`), `user_config` sections and defaults,
@@ -420,7 +425,9 @@ logged error); the GUI thread only polls and applies results.
   (`ms-window-geometry`), OS integration records (`ms-os-integration`), glyph rendering fonts
   (`ms-fonts` + `ms-text-render`), layer composite order / visibility / group fold
   (`ms_models::layer_model::ordering`, consumed by the typing canvas, the typing
-  flatten/export and the PS composite, layers tree and structural order).
+  flatten/export and the PS composite, layers tree and structural order), platform
+  capability decisions (`ms_platform::PlatformFeature`), file dialogs
+  (`ms_platform::file_dialog`) and system clipboard reads (`ms_platform::clipboard`).
   Layer and group visibility/opacity are `LayerDoc` facts, never one tab's view state.
 
 **Documents**
