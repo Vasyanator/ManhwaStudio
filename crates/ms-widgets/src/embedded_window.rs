@@ -328,7 +328,7 @@ impl<'a> EmbeddedWindow<'a> {
 
     /// The content draws under this style: its `Ui`, and through
     /// `ms_theme::with_scoped_global_style` the popups and `Area`s it opens. The title strip
-    /// keeps the host's style.
+    /// always uses `ms_theme::base_style`, independent of this and of the host's style.
     pub fn content_style(mut self, style: Arc<egui::Style>) -> Self {
         self.content_style = Some(style);
         self
@@ -509,10 +509,15 @@ struct ChromeClicks {
     collapse_clicked: bool,
 }
 
-/// Draws the embedded title strip (a top panel in the host's style): close X and the optional
-/// collapse button on the right, the title truncated into the rest.
+/// Draws the embedded title strip: close X and the optional collapse button on the right, the
+/// title truncated into the rest. The strip always uses the plain base style
+/// (`ms_theme::base_style`), never the host screen's style (e.g. the launcher's large outlined
+/// buttons), so every embedded window has the same neutral chrome. The host `Ui`'s style is
+/// restored afterwards, because the panel frame and its separator line are resolved from it.
 fn draw_title_strip(ui: &mut egui::Ui, window_id: Id, title: &str, collapsible: bool) -> ChromeClicks {
     let mut clicks = ChromeClicks::default();
+    let host_style = Arc::clone(ui.style());
+    ui.set_style(ms_theme::base_style());
     egui::Panel::top(window_id.with("ms_embedded_window_title")).show(ui, |ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             clicks.close_clicked = ui.button(CLOSE_GLYPH).on_hover_text(t!("widgets.embedded_window.close_tooltip")).clicked();
@@ -524,6 +529,7 @@ fn draw_title_strip(ui: &mut egui::Ui, window_id: Id, title: &str, collapsible: 
             });
         });
     });
+    ui.set_style(host_style);
     clicks
 }
 
