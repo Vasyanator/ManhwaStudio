@@ -29,6 +29,7 @@ Key functions:
 - `update_window_section`, `persist_geometry`, `spawn_geometry_saver`
 - `apply_android_native_window_policy` (secondary-window setting before `run_native`, Android)
 - `sync_secondary_window_policy` (secondary-window setting onto a live context, Android)
+- `identity::{app_id, app_icon, with_identity}` (window app id + icon, `identity.rs`)
 
 Notes:
 DURABILITY. Geometry reaches the disk through `config_saver::ConfigSaver`, the shared debouncing
@@ -71,6 +72,8 @@ re-exports this crate as `crate::window_geometry` from its `cfg(not(wasm32))` bl
 // Process-global owner of the Android `AndroidApp` handle every `NativeOptions` needs there.
 #[cfg(target_os = "android")]
 pub mod android_app;
+// The program's window identity (app id + icon): one owner for every window of the main group.
+pub mod identity;
 
 use ms_config as config;
 use ms_config::config_saver::{self, ConfigSaver, SaverLabels};

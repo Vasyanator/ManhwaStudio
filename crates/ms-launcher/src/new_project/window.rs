@@ -2062,10 +2062,9 @@ impl NewProjectWindowState {
         let viewport_id = egui::ViewportId::from_hash_of(SCREEN_CAPTURE_VIEWPORT_ID_SALT);
         let mut keep_open = true;
         let mut capture_requested = false;
-        let builder = crate::apply_launcher_window_metadata(
+        let builder = crate::app::with_window_identity(
             egui::ViewportBuilder::default()
                 .with_title(t!("launcher.new_project.capture_mode_button"))
-                .with_app_id(crate::launcher_app_id(false))
                 .with_position(egui::pos2(
                     overlay.desktop_bounds.x as f32,
                     overlay.desktop_bounds.y as f32,
@@ -2084,6 +2083,9 @@ impl NewProjectWindowState {
                 .with_minimize_button(false)
                 .with_maximize_button(false)
                 .with_active(true),
+            // The new-project window does not know the run mode; the capture overlay has
+            // always carried the normal app id.
+            false,
         );
 
         ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
@@ -6955,10 +6957,11 @@ impl NewProjectWindowState {
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
             .with_resizable(true);
-        ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
+        ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
             let ctx = ui.ctx().clone();
-            let keep_open = self.batch_processing.show(ui, class);
-            if !keep_open {
+            let out = self.batch_processing.show_content(ui);
+            if out.close_clicked || ctx.input(|input| input.viewport().close_requested()) {
+                self.batch_processing.on_window_closed();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 self.batch_processing_window_open = false;
             }

@@ -308,18 +308,12 @@ use ms_thread as thread;
 #[cfg(not(target_arch = "wasm32"))]
 use web_time::Duration;
 
-const EMBEDDED_APP_ICON_ICO: &[u8] = include_bytes!("../app_icon.ico");
-const EMBEDDED_APP_ICON_PNG: &[u8] = include_bytes!("../app_icon_512.png");
 #[allow(dead_code)]
 const LAUNCHER_OUTPUT_PREFIX: &str = "MS_OPEN_PROJECT_JSON=";
 #[allow(dead_code)]
 const UPDATE_API_RELEASES: &str = "https://api.github.com/repos/Vasyanator/ManhwaStudio/releases";
 #[allow(dead_code)]
 const UPDATE_ASSET_NAME: &str = "ManhwaStudio.zip";
-#[cfg(target_os = "linux")]
-const MAIN_WINDOW_APP_ID: &str = "manhwastudio_rs";
-#[cfg(not(target_os = "linux"))]
-const MAIN_WINDOW_APP_ID: &str = "manhwastudio_rs.main";
 /// Inner size of the studio window on a first run, in logical pixels. Also the size the
 /// startup placement centers on a monitor when no geometry has been stored yet.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1374,7 +1368,7 @@ fn prompt_missing_python_env_action() -> MissingPythonEnvAction {
         .with_inner_size([520.0, 250.0])
         .with_min_inner_size([480.0, 230.0])
         .with_resizable(false);
-    if let Some(icon) = load_embedded_icon_data() {
+    if let Some(icon) = window_geometry::identity::app_icon() {
         viewport = viewport.with_icon(icon);
     }
 
@@ -1907,7 +1901,7 @@ fn run_update_check_window(local_version: String) -> anyhow::Result<UpdateCheckD
         .with_min_inner_size([460.0, 180.0])
         .with_resizable(true)
         .with_app_id(UPDATE_CHECK_WINDOW_APP_ID);
-    if let Some(icon) = load_embedded_icon_data() {
+    if let Some(icon) = window_geometry::identity::app_icon() {
         viewport = viewport.with_icon(icon);
     }
 
@@ -2123,7 +2117,7 @@ fn run_main_window(
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(STUDIO_DEFAULT_INNER_SIZE)
         .with_min_inner_size([900.0, 600.0])
-        .with_app_id(MAIN_WINDOW_APP_ID);
+        .with_app_id(window_geometry::identity::MAIN_WINDOW_APP_ID);
     viewport = window_geometry::apply_placement(viewport, &placement);
     // Windows keeps the historical workaround: `with_maximized` in the builder leaves the
     // window unmaximized there, so `StudioBootstrapApp` sends the command on its first frame
@@ -2132,7 +2126,7 @@ fn run_main_window(
     {
         viewport = viewport.with_maximized(placement.maximized);
     }
-    if let Some(icon) = load_embedded_icon_data() {
+    if let Some(icon) = window_geometry::identity::app_icon() {
         viewport = viewport.with_icon(icon);
     }
 
@@ -2448,7 +2442,7 @@ fn pick_project_dir_from_basic_launcher_gui(
         .with_min_inner_size([520.0, 220.0])
         .with_resizable(true)
         .with_app_id(BASIC_LAUNCHER_WINDOW_APP_ID);
-    if let Some(icon) = load_embedded_icon_data() {
+    if let Some(icon) = window_geometry::identity::app_icon() {
         viewport = viewport.with_icon(icon);
     }
 
@@ -2479,21 +2473,6 @@ fn pick_project_dir_from_basic_launcher_gui(
         .map_err(|_| anyhow::anyhow!("failed to read selected project directory"))?
         .clone();
     Ok(selected)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn load_embedded_icon_data() -> Option<egui::IconData> {
-    let image = image::load_from_memory(EMBEDDED_APP_ICON_ICO)
-        .or_else(|_| image::load_from_memory(EMBEDDED_APP_ICON_PNG))
-        .ok()?;
-    let rgba = image.into_rgba8();
-    let width = rgba.width();
-    let height = rgba.height();
-    Some(egui::IconData {
-        rgba: rgba.into_raw(),
-        width,
-        height,
-    })
 }
 
 /// Keeps this copy's Linux desktop entry and icon current on a named background thread

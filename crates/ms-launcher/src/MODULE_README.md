@@ -4,22 +4,35 @@
 Rust launcher runtime shown before a chapter is opened.
 
 ## Architecture
-`lib.rs` (crate root) owns the native launcher entry points (`run_launcher`, `run_test_launcher`)
-and returns a typed outcome to `lib.rs`.
-`app.rs` owns the root `eframe::App`, background image workers, detached child windows, and
-page navigation. Page modules render focused launcher workflows and report actions through
-`PageNavAction`.
+The launcher is a SCREEN, not a window. One entry (program start, or return from the studio)
+runs in two steps:
 
-The launcher does not perform blocking I/O on the GUI thread. Startup update checks are started by
-`lib.rs` and delivered to the launcher through a channel; the launcher only polls and renders the
-notification.
+```text
+worker:      prepare_entry(fallback settings, ai_backend, host, test_mode) -> LauncherEntry
+GUI thread:  LauncherApp::new(entry)          (no I/O; only spawns page workers)
+each frame:  screen.show(ui); host acts on screen.take_outcome()
+```
+
+`prepare_entry` is BLOCKING: it re-reads the user settings fresh (so a projects folder changed
+during the previous entry is seen), reads the raw config for the first-run modal and builds the
+sub-states whose constructors do I/O (settings page, new-project window, tutorial progress).
+`prepare_entry_with_settings` is the same with caller-supplied settings (the web build).
+`app.rs` owns the screen: background image workers, child windows and page navigation. Page
+modules render focused launcher workflows and report actions through `PageNavAction`. The host
+owns the window (title, size, close, style) and the startup update check, whose result it hands
+in with `set_update_notification`.
+
+`lib.rs` still runs the screen in its own window (`run_launcher`, `run_test_launcher`) through
+the private `LauncherWindow` wrapper. That wrapper is TEMPORARY: it goes when the persistent main
+window (`src/shell/`) hosts the screen.
 
 ## Files and submodules
-- `lib.rs`: crate root; launcher window setup, app metadata, and public run functions. The
-  launcher app id is `manhwastudio_rs` on Linux (the desktop-entry id, so the window matches
-  the menu entry's `StartupWMClass`), `manhwastudio_rs.launcher` elsewhere.
-- `app.rs`: root app state, worker polling, page routing, detached viewport handling; starts
-  and polls the settings-warnings checks (see "Settings warnings").
+- `lib.rs`: crate root; re-exports the screen API and keeps the temporary own-window entry
+  points (`run_launcher`, `run_test_launcher`, private `LauncherWindow`).
+- `app.rs`: `LauncherEntry` / `prepare_entry*`, the `LauncherApp` screen (state, worker polling,
+  page routing, child viewports, the pending exit); starts and polls the settings-warnings checks
+  (see "Settings warnings"). `with_window_identity` stamps every child viewport with the main
+  window's app id and icon (`ms_window_geometry::identity`, the one owner of both).
 - `main_page.rs`: central menu (the Settings button carries the overall settings-warning
   corner badge), update notification overlay, AI install-type notices, and the
   storage-mode conversion status line (progress of the process-wide `storage_mode_job`, then a
@@ -110,10 +123,16 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
   their click and tutorial-target rects.
 
 ## Contracts and invariants
+- The screen never touches the root viewport: no `ViewportCommand::Close`, no maximize, no
+  title, no global style. Its exit is one pending `LauncherOutcome` (the first exit of an entry
+  wins), taken once by the host through `take_outcome`.
+- `LauncherApp::new` performs no blocking I/O. A sub-state whose constructor reads config,
+  scans disk or probes the system is built in `prepare_entry` and carried by `LauncherEntry`
+  (which must stay `Send`; a compile-time assertion guards it).
 - Launcher outcomes are returned to startup flow; the launcher must not spawn a second main app.
 - Long scans, image decoding, probes, downloads, and shell work run on worker threads.
 - Settings changes to the projects root must be propagated to every page/window that caches it.
-- "Open image" closes the launcher with `LauncherOutcome::OpenImage(path)`; `lib.rs` routes it.
+- "Open image" exits the launcher with `LauncherOutcome::OpenImage(path)`; `lib.rs` routes it.
   The launcher validates only existence and file-ness; decode errors belong to the studio
   loading screen (one owner). wasm has no button and `web_entry.rs` ignores the variant.
 - The launcher never writes the egui global style itself: `ms_theme::install` is the only writer.
@@ -121,8 +140,8 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
   under `ms_theme::with_scoped_global_style(base_style)`, which restores the launcher style
   exactly; their embedded paths and content panels use `ui.set_style(ms_theme::base_style())`.
   Status colours (`error_fg` / `warn_fg`) therefore come from `ms_theme::status` here too.
-- Update notifications are advisory UI state; starting an update closes the launcher and returns
-  `LauncherOutcome::StartUpdate` to `lib.rs`.
+- Update notifications are advisory UI state set by the host (`set_update_notification`);
+  starting an update exits the launcher with `LauncherOutcome::StartUpdate`.
 - The first-run language modal (`first_run_language.rs`) and the main-menu tutorial are mutually
   exclusive: while the modal is `Some`, `app.rs` suppresses `maybe_autoplay(LauncherMain)` and hands
   the tour off exactly once on confirm. The modal is gated on the persisted tri-state marker
@@ -139,8 +158,9 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
   the cwd or the exe dir and falls back to the cwd, so the whole config tree — including
   `General.first_run_languages_confirmed` — is created inside that scratch dir and the real
   installation is untouched.
-- To change launcher startup or return values, edit `lib.rs` and `state.rs`.
-- To change root polling, page routing, or window lifecycle, edit `app.rs`.
+- To change what an entry reads or builds before the screen exists, edit `prepare_entry*` in
+  `app.rs`; return values live in `state.rs`.
+- To change root polling, page routing, or child-window lifecycle, edit `app.rs`.
 - To change the main menu or update notice, edit `main_page.rs`.
 - To change the "Open image" picker, its filter or validation, edit `open_image.rs`; the accepted
   types themselves live in `ms_config::single_image::INPUT_FILE_TYPES`.

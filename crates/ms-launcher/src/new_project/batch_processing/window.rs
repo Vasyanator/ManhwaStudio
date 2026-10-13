@@ -15,6 +15,7 @@ Main responsibilities:
 
 Key structures:
 - BatchProcessingWindowState — root state for the entire window
+- BatchContentOutcome — what one frame of the content reports to the owner (close request)
 - FileTaskEvent — result of one off-thread file dialog / filesystem task
 
 File dialogs and the GUI thread:
@@ -39,9 +40,11 @@ poll are one code path on every target. A graph is saved through the picked `Sav
 written completely, then committed on the same worker.
 
 Notes:
-The window is opened as a native `ctx.show_viewport_immediate()` from
-`new_project/window.rs`.  It does not own a project; it operates on standalone
-image pipelines and saves results to user-specified folders.
+This file draws only the window CONTENT (`show_content` lays its panels out inside whatever
+`Ui` the owner hands it); the owner in `new_project/window.rs` decides how the window is
+hosted and when it closes, and calls `on_window_closed` on every close path. It does not own
+a project; it operates on standalone image pipelines and saves results to user-specified
+folders.
 */
 
 use super::canvas::{CanvasAction, CanvasState, NodePathPurpose};
@@ -49,7 +52,7 @@ use super::executor::{ExecutorEvent, GraphSnapshot, spawn_executor};
 use super::graph::{GraphModel, GraphVariable};
 use super::node_defs::NodeDefs;
 use super::types::{DataType, NodeParams};
-use egui::{Color32, RichText, ScrollArea, Ui, ViewportClass};
+use egui::{Color32, RichText, ScrollArea, Ui};
 use ms_platform::PlatformFeature;
 use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, Picked};
 use ms_thread as thread;
@@ -116,6 +119,15 @@ enum FileTaskEvent {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
+/// What one frame of [`BatchProcessingWindowState::show_content`] reports to its owner.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[must_use = "the owner must act on a close request"]
+pub struct BatchContentOutcome {
+    /// The toolbar's Close button was clicked this frame; the owner closes the window and
+    /// calls `on_window_closed`.
+    pub close_clicked: bool,
+}
+
 pub struct BatchProcessingWindowState {
     graph: GraphModel,
     canvas: CanvasState,
@@ -175,22 +187,22 @@ impl BatchProcessingWindowState {
         }
     }
 
-    /// Main entry point called every frame from the launcher.
-    /// Returns false when the window should close.
-    pub fn show(&mut self, ui: &mut egui::Ui, _class: ViewportClass) -> bool {
-        // The viewport callback hands us a `Ui`; derive the child viewport `Context`
-        // (cheap Arc clone) for input polling and executor progress repaints.
+    /// Draws one frame of the window content into `ui` and polls the executor and file task.
+    ///
+    /// The panels are laid out inside `ui`, so the owner may host the content in any container
+    /// (a native viewport, an embedded window). Closing is the OWNER's decision: this method
+    /// never closes anything itself, it only reports the toolbar's Close button through
+    /// [`BatchContentOutcome::close_clicked`]. On every close path the owner must call
+    /// [`Self::on_window_closed`].
+    pub fn show_content(&mut self, ui: &mut egui::Ui) -> BatchContentOutcome {
+        // Cheap Arc clone of the hosting `Context`, used for executor / dialog repaints.
         let ctx_owned = ui.ctx().clone();
         let ctx = &ctx_owned;
-        if ctx.input(|input| input.viewport().close_requested()) {
-            self.on_window_closed();
-            return false;
-        }
 
         self.poll_executor(ctx);
         self.poll_file_task(ctx);
 
-        let mut keep_open = true;
+        let mut outcome = BatchContentOutcome::default();
 
         // ── Top toolbar ────────────────────────────────────────────────────
         egui::Panel::top("bp_toolbar").show(ui, |ui| {
@@ -227,7 +239,7 @@ impl BatchProcessingWindowState {
                 }
                 ui.separator();
                 if ui.button(t!("launcher.batch.close_button")).clicked() {
-                    keep_open = false;
+                    outcome.close_clicked = true;
                 }
             });
         });
@@ -290,16 +302,13 @@ impl BatchProcessingWindowState {
             self.handle_canvas_actions(actions);
         });
 
-        if !keep_open {
-            self.on_window_closed();
-        }
-        keep_open
+        outcome
     }
 
     /// Release everything that must not outlive this session of the window.
     ///
-    /// Called on BOTH close paths (the viewport's own close request and the toolbar's Close
-    /// button), because the parent keeps this state struct alive between openings: without
+    /// The owner calls it on EVERY close path (the host's own close request and the toolbar's
+    /// Close button reported by `show_content`), because the parent keeps this state struct alive between openings: without
     /// this, an in-flight dialog's worker would still hold a live sender, its `send` would
     /// succeed into a receiver nobody reads, and the next opening would apply that answer —
     /// silently replacing a freshly built graph with a `GraphLoaded`, or writing a
@@ -310,7 +319,7 @@ impl BatchProcessingWindowState {
     ///
     /// Not an error path from the user's point of view — they closed the window — so it logs
     /// and shows nothing (`CLAUDE.md` §7).
-    fn on_window_closed(&mut self) {
+    pub(crate) fn on_window_closed(&mut self) {
         if self.file_task_rx.take().is_some() {
             ms_log::runtime_log::log_info(
                 "[batch-processing] window closed with a file dialog in flight: its result is abandoned",

@@ -1,5 +1,5 @@
 /*
-File: src/launcher/state.rs
+File: crates/ms-launcher/src/state.rs
 
 Purpose:
 Shared UI state for the Rust launcher shell.
@@ -44,8 +44,8 @@ pub struct UpdateNotification {
     pub remote_version: String,
 }
 
-/// Why the launcher closed; `lib.rs` / `web_entry.rs` route on it. The launcher never starts
-/// the studio itself.
+/// Why the launcher screen exits, handed to its host through `LauncherApp::take_outcome`
+/// (`lib.rs` / `web_entry.rs` route on it). The launcher never starts the studio itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LauncherOutcome {
     OpenProject(OpenProjectSelection),

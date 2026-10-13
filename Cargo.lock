@@ -4292,6 +4292,7 @@ name = "ms-window-geometry"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "image 0.25.10",
  "ms-config",
  "ms-log",
  "ms-thread",

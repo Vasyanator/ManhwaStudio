@@ -204,7 +204,8 @@ because all three closures borrow the same `&mut C`. Rules:
 - `window.rs`: the detached OS windows. `SubWindowNode` (one window's identity and last known
   geometry), the pure tear-out model (`drag_tension`, `DragTension`,
   `DETACH_TENSION_DISTANCE`) and the detach verdict built on it (`detach_trigger`,
-  `DragEndContext`, `DetachTrigger`), the lifecycle questions (`next_sub_window_index`,
+  `DragEndContext`, `DetachTrigger`; `detach_verdict` gates it by `detach_allowed`), the
+  Embedded-mode re-dock (`sub_windows_to_redock`), the lifecycle questions (`next_sub_window_index`,
   `obsolete_sub_windows`, `geometry_changed`), the menu destinations (`MoveTarget`,
   `move_targets`) and the window NAMES the menu and the OS title bar share (`sub_window_name`,
   `sub_window_title`, `move_target_label`), plus the two egui plumbing helpers
@@ -378,6 +379,18 @@ the deferred form needs `Fn + Send + Sync + 'static`, which the caller's tab bod
 the typing tab's hundred-field states) cannot satisfy. Parent and child therefore repaint
 together; that is the accepted price and must not be "optimised" away.
 
+**Only in Separate mode.** Whether the dock may open sub-windows at all is decided by
+`ms_widgets::embedded_window::effective_mode(ctx)` — the one owner of the secondary-window
+decision (`General.secondary_windows`, Android `auto`, wasm, eframe's `embed_viewports` runtime
+fallback); the dock never reads that setting or a `cfg` itself. `PanelDockState::apply_window_mode`
+runs at the top of every dock pass (`begin_frame`, `show_idle_sub_windows`) and sets
+`detach_allowed = window::detach_allowed(mode)`. In Embedded mode egui would draw an extra
+viewport as an `egui::Window` inside the main one — not a window of its own, and a `CentralPanel`
+inside egui's wrapper — so there the dock detaches nothing: no dashed tear-out outline (tab or
+panel), no «Переместить в окно →» submenu (`move_targets` returns nothing), and every release
+verdict (`window::detach_verdict`) is an ordinary drop: a panel stays clamped at the border as if
+released at the edge, a tab with no landing is cancelled.
+
 Inside a sub-window there is a `CentralPanel` for the neutral background and the same
 `draw_host` loop the main window runs — the same panels, the same gestures, no canvas.
 `draw_host` reads `ctx` while that window's viewport is current, which
@@ -528,6 +541,15 @@ A window that is merely empty in the program tab currently drawn stays OPEN and 
 `PanelDockState::show_idle_sub_windows` keeps the viewports alive. That call must happen exactly
 once per frame and only when `PanelDock::end` did not run, because showing one viewport twice in
 a pass renders it twice.
+
+In Embedded mode every sub-window is closed through that same path at the top of the pass
+(`apply_window_mode`): its panels return to the main window and the dirty flag makes
+`PanelLayoutWriter` store the re-docked arrangement, so persisted detached layouts (installed
+before any `Context` exists, by `install_persisted_sub_windows`) re-dock on the first pass and the
+stored `sub_windows` list becomes empty. A panel drag running inside a re-docked window is
+dropped. Turning Separate again restores nothing: the layout follows what the user saw. The mode
+is evaluated once per pass, before any window draws, so a mid-run flip shows no flicker
+(Separate -> Embedded closes the open viewports on the next pass).
 
 **Platform honesty.** A new window is placed at the release point, lifted into the shared frame
 and lowered back into viewport points with the source window's scale — available on

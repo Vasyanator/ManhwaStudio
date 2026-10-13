@@ -23,7 +23,7 @@ Only compiled on `wasm32`. Native startup lives in `lib.rs`.
 */
 
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use wasm_bindgen::JsCast as _;
 
@@ -114,10 +114,7 @@ fn console_error(message: &str) {
 /// enum and swap in place.
 #[allow(clippy::large_enum_variant)]
 enum WebApp {
-    Launcher {
-        app: Box<crate::launcher::app::LauncherApp>,
-        outcome: Arc<Mutex<Option<crate::launcher::state::LauncherOutcome>>>,
-    },
+    Launcher(Box<crate::launcher::app::LauncherApp>),
     Editor(Box<crate::app::MangaApp>),
 }
 
@@ -130,22 +127,19 @@ impl eframe::App for WebApp {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         match self {
-            WebApp::Launcher { app, outcome } => {
-                app.ui(ui, frame);
-                // Poll the launcher's outcome; on "open project" swap to the editor.
-                let selection = match outcome.lock() {
-                    Ok(mut guard) => match guard.take() {
-                        Some(crate::launcher::state::LauncherOutcome::OpenProject(sel)) => Some(sel),
-                        // No update flow on web; ignore.
-                        Some(crate::launcher::state::LauncherOutcome::StartUpdate) | None => None,
-                        // Single-image mode has no web entry point (plan D10) and the web
-                        // launcher has no button producing it; log the impossible outcome.
-                        Some(crate::launcher::state::LauncherOutcome::OpenImage(path)) => {
-                            console_error(&format!("open image is unavailable on web; ignored path '{}'", path.display()));
-                            None
-                        }
-                    },
-                    Err(_) => None,
+            WebApp::Launcher(app) => {
+                app.show(ui);
+                // Take the launcher's exit; on "open project" swap to the editor.
+                let selection = match app.take_outcome() {
+                    Some(crate::launcher::state::LauncherOutcome::OpenProject(sel)) => Some(sel),
+                    // No update flow on web; ignore.
+                    Some(crate::launcher::state::LauncherOutcome::StartUpdate) | None => None,
+                    // Single-image mode has no web entry point (plan D10) and the web
+                    // launcher has no button producing it; log the impossible outcome.
+                    Some(crate::launcher::state::LauncherOutcome::OpenImage(path)) => {
+                        console_error(&format!("open image is unavailable on web; ignored path '{}'", path.display()));
+                        None
+                    }
                 };
                 if let Some(sel) = selection {
                     match build_editor_from_selection(&sel) {
@@ -168,22 +162,17 @@ impl eframe::App for WebApp {
 fn build_web_launcher() -> WebApp {
     let _ = crate::storage::storage().create_dir_all(PROJECTS_ROOT);
     let settings = serde_json::json!({ "General": { "projects_dir": PROJECTS_ROOT } });
-    let outcome = Arc::new(Mutex::new(None));
-    let app = crate::launcher::app::LauncherApp::new(
-        std::path::PathBuf::from(PROJECTS_ROOT),
-        "manhwastudio_web".to_string(),
-        &settings,
-        Arc::clone(&outcome),
-        None,
+    // The web storage is in memory, so preparing the entry on the page thread does not block
+    // on real I/O.
+    let entry = crate::launcher::prepare_entry_with_settings(
+        settings,
         crate::ai_backend_supervisor::AiBackendHandle::disabled(),
         // The web build has no installed copy and no OS records (no System registration tab);
         // the version core is still reduced exactly as `lib.rs::launcher_host` does.
         crate::launcher::state::LauncherHost { ignore_installed: false, version_core: crate::version_format::version_core(env!("CARGO_PKG_VERSION")) },
+        false,
     );
-    WebApp::Launcher {
-        app: Box::new(app),
-        outcome,
-    }
+    WebApp::Launcher(Box::new(crate::launcher::app::LauncherApp::new(entry)))
 }
 
 /// Loads the selected project and constructs the editor (AI disabled).

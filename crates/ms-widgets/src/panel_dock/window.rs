@@ -12,6 +12,9 @@ Main responsibilities:
 - measure how hard a drag is being pulled past the dock area's border
   (`drag_tension`) and decide, WITHOUT any global cursor coordinate, whether a
   finished drag tore out of the window (`detach_trigger`);
+- decide whether the dock may open sub-windows at all in the current secondary
+  window mode (`detach_allowed`, `detach_verdict`) and which existing ones must
+  then be re-docked (`sub_windows_to_redock`);
 - decide which sub-windows are still needed (`obsolete_sub_windows`) and which
   index a new one takes (`next_sub_window_index`);
 - name the windows (`sub_window_name`, `sub_window_title`, `move_target_label`)
@@ -27,7 +30,8 @@ Key structures:
 - `MoveTarget`: one destination of the «Переместить в окно →» submenu.
 
 Key functions:
-- `drag_tension`, `detach_trigger`
+- `drag_tension`, `detach_trigger`, `detach_verdict`
+- `detach_allowed`, `sub_windows_to_redock`
 - `next_sub_window_index`, `obsolete_sub_windows`
 - `move_targets`, `move_target_label`, `sub_window_name`, `sub_window_title`
 - `sub_window_viewport_id`, `sub_window_builder`
@@ -54,6 +58,8 @@ accepted and must not be "optimised" into the deferred form.
 use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{Pos2, Rect, Vec2};
+
+use ms_config::secondary_windows::WindowMode;
 
 use super::model::{DockLayout, HostId};
 
@@ -302,6 +308,60 @@ pub fn detach_trigger(context: DragEndContext) -> Option<DetachTrigger> {
     }
 }
 
+/// Whether the dock may open sub-windows in the secondary-window `mode` this pass.
+///
+/// `mode` comes ONLY from `crate::embedded_window::effective_mode` — the one owner
+/// of the Separate / Embedded decision (user setting, platform, eframe's runtime
+/// gate). In `Embedded` mode every extra viewport would be drawn as an
+/// `egui::Window` inside the main one (`egui-0.36.2/src/context.rs:4124-4127`),
+/// which is not a window of its own, so the dock does not detach at all there.
+#[must_use]
+pub fn detach_allowed(mode: WindowMode) -> bool {
+    match mode {
+        WindowMode::Separate => true,
+        WindowMode::Embedded => false,
+    }
+}
+
+/// The verdict of a finished drag in one window: [`detach_trigger`] gated by
+/// whether detaching is allowed at all ([`detach_allowed`]).
+///
+/// `owns_pointer` is the frame's "the cursor is over THIS window": a window that
+/// does not own it never resolves the release itself and hands it to the frame's
+/// address resolution as [`DetachTrigger::PointerLeftWindow`]. With `allowed ==
+/// false` the answer is always `None`, so a release past the border is an ordinary
+/// drop: the panel stays clamped at the edge, a tab with no landing is cancelled.
+#[must_use]
+pub fn detach_verdict(
+    allowed: bool,
+    context: DragEndContext,
+    owns_pointer: bool,
+) -> Option<DetachTrigger> {
+    if !allowed {
+        return None;
+    }
+    if owns_pointer {
+        detach_trigger(context)
+    } else {
+        Some(DetachTrigger::PointerLeftWindow)
+    }
+}
+
+/// Sub-windows that must be re-docked into the main window, in list order: every
+/// one of them while detaching is not allowed, none otherwise.
+///
+/// Persisted detached layouts are installed before any `Context` exists, so the
+/// first dock pass in `Embedded` mode is what re-docks them; nothing is restored
+/// when the mode later turns `Separate` again.
+#[must_use]
+pub fn sub_windows_to_redock(allowed: bool, sub_windows: &[SubWindowNode]) -> Vec<u32> {
+    if allowed {
+        Vec::new()
+    } else {
+        sub_windows.iter().map(|node| node.index).collect()
+    }
+}
+
 /// One destination offered by the «Переместить в окно →» submenu of a tab
 /// caption or a panel header.
 ///
@@ -327,8 +387,18 @@ pub enum MoveTarget {
 /// would do nothing — while a new window is always offered, because opening one
 /// is always possible. `sub_windows` may be in any order; the result is sorted
 /// so the menu does not reshuffle when the dock's own list does.
+///
+/// `allow_windows == false` (detaching not allowed, [`detach_allowed`]) yields an
+/// EMPTY list, which hides the submenu: there is then no window to move into.
 #[must_use]
-pub fn move_targets(sub_windows: &[SubWindowNode], current: HostId) -> Vec<MoveTarget> {
+pub fn move_targets(
+    sub_windows: &[SubWindowNode],
+    current: HostId,
+    allow_windows: bool,
+) -> Vec<MoveTarget> {
+    if !allow_windows {
+        return Vec::new();
+    }
     let mut targets: Vec<MoveTarget> = Vec::with_capacity(sub_windows.len() + 2);
     if current != HostId::MainWindow {
         targets.push(MoveTarget::Existing(HostId::MainWindow));
@@ -643,7 +713,7 @@ mod tests {
         // From the main window: no «main window» entry, both sub-windows, and a
         // new one.
         assert_eq!(
-            move_targets(&nodes, HostId::MainWindow),
+            move_targets(&nodes, HostId::MainWindow, true),
             vec![
                 MoveTarget::Existing(HostId::SubWindow(0)),
                 MoveTarget::Existing(HostId::SubWindow(2)),
@@ -652,7 +722,7 @@ mod tests {
         );
         // From sub-window 0: the main window comes first and 0 itself is gone.
         assert_eq!(
-            move_targets(&nodes, HostId::SubWindow(0)),
+            move_targets(&nodes, HostId::SubWindow(0), true),
             vec![
                 MoveTarget::Existing(HostId::MainWindow),
                 MoveTarget::Existing(HostId::SubWindow(2)),
@@ -664,7 +734,7 @@ mod tests {
     #[test]
     fn the_menu_offers_a_new_window_even_when_none_exists() {
         assert_eq!(
-            move_targets(&[], HostId::MainWindow),
+            move_targets(&[], HostId::MainWindow, true),
             vec![MoveTarget::NewWindow]
         );
     }
@@ -678,13 +748,67 @@ mod tests {
             SubWindowNode::new(1, None, DEFAULT_SUB_WINDOW_SIZE),
         ];
         assert_eq!(
-            move_targets(&nodes, HostId::MainWindow),
+            move_targets(&nodes, HostId::MainWindow, true),
             vec![
                 MoveTarget::Existing(HostId::SubWindow(1)),
                 MoveTarget::Existing(HostId::SubWindow(3)),
                 MoveTarget::NewWindow,
             ]
         );
+    }
+
+    #[test]
+    fn only_separate_mode_allows_detaching() {
+        assert!(detach_allowed(WindowMode::Separate));
+        assert!(!detach_allowed(WindowMode::Embedded));
+    }
+
+    #[test]
+    fn a_disallowed_detach_never_returns_a_verdict() {
+        // Every case that WOULD detach when allowed: pointer gone, release
+        // unreportable, pulled past the threshold, and a release over another
+        // window (`owns_pointer == false`).
+        let torn = Pos2::new(AREA.left() - DETACH_TENSION_DISTANCE - 1.0, 400.0);
+        let inside = Pos2::new(500.0, 400.0);
+        let cases = [
+            (context(true, Some(inside)), true),
+            (context(false, None), true),
+            (context(false, Some(torn)), true),
+            (context(false, Some(inside)), false),
+            (context(false, Some(inside)), true),
+        ];
+        for (case, owns_pointer) in cases {
+            assert_eq!(detach_verdict(false, case, owns_pointer), None, "{case:?}");
+        }
+        // Allowed, the verdict is exactly the trigger rule, and a window that
+        // does not own the pointer hands the drop on.
+        assert_eq!(
+            detach_verdict(true, context(false, Some(torn)), true),
+            Some(DetachTrigger::PulledPastArea)
+        );
+        assert_eq!(detach_verdict(true, context(false, Some(inside)), true), None);
+        assert_eq!(
+            detach_verdict(true, context(false, Some(inside)), false),
+            Some(DetachTrigger::PointerLeftWindow)
+        );
+    }
+
+    #[test]
+    fn the_menu_is_empty_when_windows_are_not_allowed() {
+        let nodes = [SubWindowNode::new(0, None, DEFAULT_SUB_WINDOW_SIZE)];
+        assert!(move_targets(&nodes, HostId::MainWindow, false).is_empty());
+        assert!(move_targets(&[], HostId::SubWindow(0), false).is_empty());
+    }
+
+    #[test]
+    fn every_sub_window_is_redocked_only_when_detaching_is_not_allowed() {
+        let nodes = [
+            SubWindowNode::new(3, None, DEFAULT_SUB_WINDOW_SIZE),
+            SubWindowNode::new(1, None, DEFAULT_SUB_WINDOW_SIZE),
+        ];
+        assert_eq!(sub_windows_to_redock(false, &nodes), vec![3, 1]);
+        assert!(sub_windows_to_redock(true, &nodes).is_empty());
+        assert!(sub_windows_to_redock(false, &[]).is_empty());
     }
 
     #[test]

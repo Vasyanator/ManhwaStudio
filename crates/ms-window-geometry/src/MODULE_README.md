@@ -55,8 +55,16 @@ in, or the two `Window` types stop unifying.
   full-screen fallback still wins) and is meant for screen switches inside one persistent
   window; it does no I/O. The startup prompts keep whatever policy is set (they open no
   secondary viewports).
+- `identity.rs`: the program's window identity — `MAIN_WINDOW_APP_ID` / `TEST_WINDOW_APP_ID`,
+  `app_id(test_mode)`, `app_icon()` (embedded ICO, PNG fallback, decoded once per process) and
+  `with_identity(builder, test_mode)`. Builds on every target that compiles this crate.
 
 ## Contracts and invariants
+- **Window identity has one owner.** Every window grouped with the main window (the main
+  window itself, launcher child windows) takes its app id and icon from `identity`; no other
+  crate spells the main app id or decodes the icon. The prompt windows of `src/lib.rs` and the
+  installer keep their own app ids and take only the icon (the installer still has its own
+  decoder: known duplicate, to be switched to `identity::app_icon`).
 - **Units.** Everything persisted is in *logical pixels* (physical / DPI scale), independent
   of the egui zoom factor. `MonitorKey` is the one exception: it stores what winit reports,
   i.e. physical pixels, plus the scale needed to convert. See the UNITS note in `lib.rs`.

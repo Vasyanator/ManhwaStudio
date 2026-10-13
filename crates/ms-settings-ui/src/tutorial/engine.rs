@@ -124,11 +124,14 @@ impl TutorialRegistry {
 }
 
 /// Side effect run when a step is entered, with the app's mutable context `C`.
-type EnterAction<C> = Box<dyn FnMut(&mut C)>;
+/// `Send`, like [`Gate`], so a screen holding a controller can be built on a worker or moved
+/// to one (the launcher entry, the studio teardown).
+type EnterAction<C> = Box<dyn FnMut(&mut C) + Send>;
 
 /// Predicate that decides when a gated step may advance. Receives read access to
 /// the app context `C` and the per-frame target registry (via [`GateCtx`]).
-type Gate<C> = Box<dyn Fn(&GateCtx<'_, C>) -> bool>;
+/// `Send` for the same reason as [`EnterAction`].
+type Gate<C> = Box<dyn Fn(&GateCtx<'_, C>) -> bool + Send>;
 
 /// Where a step goes when it advances. The default is [`StepNext::Linear`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,7 +257,7 @@ impl<C> TutorialStep<C> {
     /// (via a command sink in `C`) trigger an action. Runs on forward entry AND
     /// on "Назад" re-entry, so keep it idempotent.
     #[must_use]
-    pub fn on_enter(mut self, action: impl FnMut(&mut C) + 'static) -> Self {
+    pub fn on_enter(mut self, action: impl FnMut(&mut C) + Send + 'static) -> Self {
         self.on_enter = Some(Box::new(action));
         self
     }
@@ -273,7 +276,7 @@ impl<C> TutorialStep<C> {
     /// Auto-advance as soon as `gate` holds (a spinner shows while waiting). Use
     /// for steps that trigger an async action and wait for it to finish.
     #[must_use]
-    pub fn await_gate(mut self, gate: impl Fn(&GateCtx<'_, C>) -> bool + 'static) -> Self {
+    pub fn await_gate(mut self, gate: impl Fn(&GateCtx<'_, C>) -> bool + Send + 'static) -> Self {
         self.advance = Advance::Await {
             gate: Box::new(gate),
             auto: true,
@@ -283,7 +286,7 @@ impl<C> TutorialStep<C> {
 
     /// Show "Далее" but keep it disabled until `gate` holds (user controls pace).
     #[must_use]
-    pub fn gated(mut self, gate: impl Fn(&GateCtx<'_, C>) -> bool + 'static) -> Self {
+    pub fn gated(mut self, gate: impl Fn(&GateCtx<'_, C>) -> bool + Send + 'static) -> Self {
         self.advance = Advance::Await {
             gate: Box::new(gate),
             auto: false,

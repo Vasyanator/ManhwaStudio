@@ -7,12 +7,13 @@ Purpose:
 Runtime for the Rust launcher UI.
 
 Main responsibilities:
-- expose launcher entrypoints for default startup and explicit test mode;
-- assemble native window options and icon;
+- expose the launcher screen API (`app::{LauncherEntry, prepare_entry, LauncherApp}`);
+- keep the temporary own-window entry points (`run_launcher`, `run_test_launcher`) working
+  until the persistent main window hosts the launcher screen;
 - keep launcher-specific code isolated in this crate.
 
 Key modules:
-- `app`: root `eframe::App` implementation
+- `app`: the launcher screen (`LauncherApp`) and its entry preparation
 - `background`: background catalog/validation workers
 - `confirm_modal`: in-app Yes/No confirmation (`egui::Modal`) for overwrite questions
 - `first_run_language`: first-run interface/typesetting language-selection modal
@@ -62,34 +63,21 @@ pub mod theme;
 pub mod tutorial;
 
 use ms_settings_ui::ai_backend_supervisor::AiBackendHandle;
-#[cfg(not(target_arch = "wasm32"))]
-use ms_config as config;
 use crate::state::{LauncherHost, LauncherOutcome, UpdateNotification};
 use std::sync::mpsc::Receiver;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, Mutex};
 
-const EMBEDDED_APP_ICON_ICO: &[u8] = include_bytes!("../../../app_icon.ico");
-const EMBEDDED_APP_ICON_PNG: &[u8] = include_bytes!("../../../app_icon_512.png");
-/// Native app id of every launcher window. On Linux it is the desktop-entry id
-/// (`manhwastudio_rs.desktop`, `StartupWMClass=manhwastudio_rs`, written by
-/// `ms_os_integration::linux`), so the launcher started from the application menu is matched to
-/// its menu entry and icon (X11 `WM_CLASS`, Wayland `app_id`). Elsewhere it keeps its own id.
-#[cfg(target_os = "linux")]
-const LAUNCHER_APP_ID: &str = "manhwastudio_rs";
-#[cfg(not(target_os = "linux"))]
-const LAUNCHER_APP_ID: &str = "manhwastudio_rs.launcher";
-const LAUNCHER_TEST_APP_ID: &str = "manhwastudio_rs.launcher_test";
+pub use app::{LauncherApp, LauncherEntry, prepare_entry, prepare_entry_with_settings};
+
 /// Inner size of the launcher window, in logical pixels. The launcher never restores a stored
 /// size; this is also the size the startup placement centers on the chosen monitor.
 #[cfg(not(target_arch = "wasm32"))]
 const LAUNCHER_DEFAULT_INNER_SIZE: [f32; 2] = [1360.0, 860.0];
 
-/// Runs the launcher window until it closes and returns why it closed (`None` = the user
-/// closed it). `host` carries the process facts the launcher cannot read itself.
+/// Runs the launcher in its own window until it closes and returns why it closed (`None` =
+/// the user closed it). `host` carries the process facts the launcher cannot read itself.
 ///
 /// # Errors
-/// The window could not be created, or the outcome slot was poisoned.
+/// The window could not be created.
 pub fn run_launcher(
     user_settings: &serde_json::Value,
     update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
@@ -109,8 +97,8 @@ pub fn run_test_launcher(
     ai_backend: &AiBackendHandle,
     host: LauncherHost,
 ) -> anyhow::Result<()> {
-    let _ = run_launcher_internal(user_settings, true, update_check_rx, ai_backend, host)?;
-    Ok(())
+    // Test mode routes nowhere: whatever the launcher returned is intentionally dropped.
+    run_launcher_internal(user_settings, true, update_check_rx, ai_backend, host).map(drop)
 }
 
 /// Web stub for the launcher entry point.
@@ -142,16 +130,16 @@ fn run_launcher_internal(
     ai_backend: &AiBackendHandle,
     host: LauncherHost,
 ) -> anyhow::Result<Option<LauncherOutcome>> {
-    let projects_root = config::projects_root_from_user_settings(user_settings);
-    let user_settings = user_settings.clone();
-    let ai_backend = ai_backend.clone();
-    let output_outcome = Arc::new(Mutex::new(None::<LauncherOutcome>));
-    let output_outcome_for_app = Arc::clone(&output_outcome);
+    // Blocking entry preparation runs here, before the window exists, so the GUI thread of
+    // the window never waits on it.
+    let entry = prepare_entry(user_settings, ai_backend.clone(), host, test_mode);
     ms_log::runtime_log::log_info(format!(
         "starting Rust launcher{} with projects root '{}'",
         if test_mode { " test mode" } else { "" },
-        projects_root.display()
+        entry.projects_root.display()
     ));
+    let outcome = std::rc::Rc::new(std::cell::Cell::new(None::<LauncherOutcome>));
+    let outcome_for_window = std::rc::Rc::clone(&outcome);
 
     // The launcher follows the primary-monitor choice but NOT the studio's stored size: the
     // `Window` geometry section describes the studio window, and the launcher keeps its own
@@ -161,14 +149,13 @@ fn run_launcher_internal(
         LAUNCHER_DEFAULT_INNER_SIZE,
         ms_window_geometry::SizePolicy::KeepDefault,
     );
-    let viewport = egui::ViewportBuilder::default()
-        .with_inner_size(LAUNCHER_DEFAULT_INNER_SIZE)
-        .with_min_inner_size([980.0, 680.0])
-        .with_app_id(launcher_app_id(test_mode));
+    let viewport = ms_window_geometry::identity::with_identity(
+        egui::ViewportBuilder::default()
+            .with_inner_size(LAUNCHER_DEFAULT_INNER_SIZE)
+            .with_min_inner_size([980.0, 680.0]),
+        test_mode,
+    );
     let viewport = ms_window_geometry::apply_placement(viewport, &placement);
-    #[cfg(not(target_os = "windows"))]
-    let viewport = viewport.with_maximized(true);
-    let viewport = apply_launcher_window_metadata(viewport);
 
     let native_options = eframe::NativeOptions {
         viewport,
@@ -192,77 +179,56 @@ fn run_launcher_internal(
             // Publish the monitor list for the settings page and refresh the "largest monitor"
             // fallback: the launcher is often the only window a user opens before choosing a
             // monitor, so it must not depend on the studio having run first.
-            ms_window_geometry::refresh_monitors(cc.winit_window().map(Arc::as_ref));
+            ms_window_geometry::refresh_monitors(cc.winit_window().map(std::sync::Arc::as_ref));
             ms_widgets::ui_fonts::install(&cc.egui_ctx, ms_widgets::ui_fonts::Tier::Core);
             theme::configure_context(&cc.egui_ctx);
             // Global interface scale (`General.ui_scale_percent`): applied per-`Context`,
             // so the launcher window honors it independently of the studio window.
             ms_settings_ui::general_settings_panel::apply_ui_scale_to_context(&cc.egui_ctx);
-            Ok(Box::new(app::LauncherApp::new(
-                projects_root.clone(),
-                launcher_app_id(test_mode).to_owned(),
-                &user_settings,
-                Arc::clone(&output_outcome_for_app),
+            Ok(Box::new(LauncherWindow {
+                screen: LauncherApp::new(entry),
                 update_check_rx,
-                ai_backend.clone(),
-                host,
-            )))
+                outcome: outcome_for_window,
+            }))
         }),
     )
     .map_err(|err| anyhow::anyhow!(err.to_string()))?;
 
-    let outcome = output_outcome
-        .lock()
-        .map_err(|_| anyhow::anyhow!("failed to read launcher outcome"))?
-        .clone();
-    Ok(outcome)
+    Ok(outcome.take())
 }
 
-pub(crate) fn apply_launcher_window_metadata(
-    viewport: egui::ViewportBuilder,
-) -> egui::ViewportBuilder {
-    if let Some(icon) = load_embedded_icon_data() {
-        viewport.with_icon(icon)
-    } else {
-        viewport
-    }
+/// TEMPORARY own window around the launcher screen, so `run_launcher` keeps working until the
+/// persistent main window (`src/shell/`, plan WP-6) hosts the screen; delete it then. It polls
+/// the startup update check into the screen, and closes the window on the screen's first exit.
+#[cfg(not(target_arch = "wasm32"))]
+struct LauncherWindow {
+    screen: LauncherApp,
+    update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
+    /// The first exit the screen produced, read by `run_launcher_internal` after the window
+    /// closed. A `Cell` is enough: the window and the reader live on the same thread.
+    outcome: std::rc::Rc<std::cell::Cell<Option<LauncherOutcome>>>,
 }
 
-pub(crate) fn launcher_app_id(test_mode: bool) -> &'static str {
-    if test_mode {
-        LAUNCHER_TEST_APP_ID
-    } else {
-        LAUNCHER_APP_ID
-    }
-}
-
-fn load_embedded_icon_data() -> Option<egui::IconData> {
-    let image = image::load_from_memory(EMBEDDED_APP_ICON_ICO)
-        .or_else(|_| image::load_from_memory(EMBEDDED_APP_ICON_PNG))
-        .ok()?;
-    let rgba = image.into_rgba8();
-    let width = rgba.width();
-    let height = rgba.height();
-    Some(egui::IconData {
-        rgba: rgba.into_raw(),
-        width,
-        height,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// On Linux the launcher window carries the desktop-entry id, so the menu entry's
-    /// `StartupWMClass` matches it; other systems and the test mode keep their own ids.
-    #[test]
-    fn launcher_app_id_per_target() {
-        if cfg!(target_os = "linux") {
-            assert_eq!(launcher_app_id(false), "manhwastudio_rs");
-        } else {
-            assert_eq!(launcher_app_id(false), "manhwastudio_rs.launcher");
+#[cfg(not(target_arch = "wasm32"))]
+impl eframe::App for LauncherWindow {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(rx) = &self.update_check_rx {
+            match rx.try_recv() {
+                Ok(notification) => {
+                    self.screen.set_update_notification(notification);
+                    self.update_check_rx = None;
+                    ui.ctx().request_repaint();
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.update_check_rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
         }
-        assert_eq!(launcher_app_id(true), "manhwastudio_rs.launcher_test");
+        self.screen.show(ui);
+        if let Some(outcome) = self.screen.take_outcome() {
+            // Keep the first exit if the close takes more than one frame to land.
+            let pending = self.outcome.take();
+            self.outcome.set(Some(pending.unwrap_or(outcome)));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 }

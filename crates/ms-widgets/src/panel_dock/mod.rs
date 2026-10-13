@@ -65,6 +65,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use egui::{Pos2, Rect, Vec2};
 
+use ms_config::secondary_windows::WindowMode;
 use ms_log::runtime_log;
 
 pub use cross_window::{DropAddress, PanelDropTarget, TabLanding, WindowGeometry};
@@ -288,9 +289,12 @@ pub struct PanelDockState {
     /// Set once the "this platform does not place windows" warning has been
     /// logged, so a Wayland session does not log it per detach.
     warned_placement_unsupported: bool,
-    /// Set once the "this backend has no OS windows" warning has been logged
-    /// (web builds, where every viewport is embedded).
-    warned_embedded_viewports: bool,
+    /// Whether this pass may open sub-windows: `window::detach_allowed` of
+    /// `embedded_window::effective_mode`, set by
+    /// [`PanelDockState::apply_window_mode`] before any window draws. `false`
+    /// hides the tear-out outline and the «Переместить в окно →» submenu and turns
+    /// every detach verdict into an ordinary drop.
+    detach_allowed: bool,
     /// Set whenever a layout changed in a way persistence would have to store.
     dirty: bool,
 }
@@ -445,6 +449,7 @@ impl PanelDockState {
     /// window can never address a drop against where the cursor was during some
     /// earlier drag.
     fn begin_frame(&mut self, ctx: &egui::Context, gesture_in_flight: bool) {
+        self.apply_window_mode(crate::embedded_window::effective_mode(ctx));
         self.main_viewport = Some(ctx.viewport_id());
         self.frame_hosts.clear();
         // Areas are per-frame facts too: a window that stopped drawing must not
@@ -453,6 +458,50 @@ impl PanelDockState {
         if !gesture_in_flight {
             self.drag_pointer_global = None;
         }
+    }
+
+    /// Applies this pass's secondary-window `mode` (from
+    /// `crate::embedded_window::effective_mode`, the one owner of that decision;
+    /// the dock never reads the setting or a `cfg` itself).
+    ///
+    /// Sets [`PanelDockState::detach_allowed`]. When detaching is not allowed,
+    /// every sub-window is closed through `close_sub_window` — its panels return to
+    /// the main window (requirement 10) and the dirty flag persists the re-docked
+    /// arrangement, so a stored detached layout is re-docked once and for good —
+    /// and a panel drag that was running inside one of them is dropped. Nothing is
+    /// restored when the mode turns `Separate` again. Runs before any window of
+    /// the pass draws, so a mode flip takes effect without flicker.
+    fn apply_window_mode(&mut self, mode: WindowMode) {
+        let allowed = window::detach_allowed(mode);
+        if allowed != self.detach_allowed {
+            runtime_log::log_info(format!(
+                "[panel_dock] secondary windows mode {mode:?}: detaching panels into windows \
+                 is {}",
+                if allowed { "allowed" } else { "disabled" }
+            ));
+            self.detach_allowed = allowed;
+        }
+        let redock = window::sub_windows_to_redock(allowed, &self.sub_windows);
+        if redock.is_empty() {
+            return;
+        }
+        if self
+            .drag
+            .as_ref()
+            .is_some_and(|session| redock.iter().any(|index| session.host == HostId::SubWindow(*index)))
+        {
+            // Its window stops being shown, so no pass would ever advance or end
+            // the gesture, and `gesture_in_flight` would stay set for good.
+            self.drag = None;
+        }
+        for index in &redock {
+            self.close_sub_window(*index);
+        }
+        runtime_log::log_info(format!(
+            "[panel_dock] secondary windows are embedded: {} sub-window(s) re-docked into the \
+             main window",
+            redock.len()
+        ));
     }
 
     /// Opens a new sub-window and returns its index, or `None` when no index is
@@ -508,6 +557,9 @@ impl PanelDockState {
     /// pass renders it twice. Closing and pruning still happen, so a window whose
     /// close button is pressed while the tab is away is handled at once.
     pub fn show_idle_sub_windows(&mut self, ctx: &egui::Context) {
+        // Before the emptiness check: in Embedded mode this re-docks every
+        // sub-window, and the pass then shows none.
+        self.apply_window_mode(crate::embedded_window::effective_mode(ctx));
         if self.sub_windows.is_empty() {
             return;
         }
@@ -1334,7 +1386,7 @@ fn draw_host<'frame, C>(
     // Destinations of the «Переместить в окно →» submenu. Built ONCE per window:
     // every panel drawn here lives in the same host and therefore offers the same
     // destinations, and the labels must outlive the borrowed slice below.
-    let move_labels: Vec<(MoveTarget, String)> = window::move_targets(&state.sub_windows, host)
+    let move_labels: Vec<(MoveTarget, String)> = window::move_targets(&state.sub_windows, host, state.detach_allowed)
         .into_iter()
         .map(|target| (target, window::move_target_label(target)))
         .collect();
@@ -1565,6 +1617,7 @@ fn draw_host<'frame, C>(
     // tear-out, and the receiving window paints the insertion feedback instead.
     if carries_tab
         && owns_pointer
+        && state.detach_allowed
         && window::drag_tension(area, pointer_pos, state.tab_drag_left_window).is_torn_off()
         && let Some(pointer) = pointer_pos
         && let Some(payload) = egui::DragAndDrop::payload::<DraggedTab>(ctx)
@@ -1622,15 +1675,18 @@ fn draw_host<'frame, C>(
             // A window that does not own the pointer answers nothing at all: the
             // drop belongs to another of our windows (or to the bare desktop),
             // and only the frame's address resolution can say which.
-            let verdict = if owns_pointer {
-                window::detach_trigger(DragEndContext {
+            // Not allowed to detach (Embedded mode), a release past the border
+            // is an ordinary drop: no bare area under it, so the move is
+            // cancelled.
+            let verdict = window::detach_verdict(
+                state.detach_allowed,
+                DragEndContext {
                     pointer_left_window: state.tab_drag_left_window,
                     release_pos: pointer_pos,
                     area,
-                })
-            } else {
-                Some(DetachTrigger::PointerLeftWindow)
-            };
+                },
+                owns_pointer,
+            );
             match verdict {
                 Some(trigger) => {
                     // The payload is deliberately NOT taken: another of our
@@ -1680,7 +1736,7 @@ fn draw_host<'frame, C>(
                     // The cursor is over another of our windows; that window
                     // paints the feedback, and painting a tear-out outline here
                     // as well would promise a window that will not open.
-                } else if tension.is_torn_off() {
+                } else if tension.is_torn_off() && state.detach_allowed {
                     // The panel itself is pinned to the area's border, so the
                     // only thing that can say "let go now and this becomes a
                     // window" is an outline where the cursor actually is. No
@@ -1930,6 +1986,10 @@ fn paint_cross_window_feedback(
 /// rather than closed, which is requirement 11 — a sub-window follows the
 /// program's tabs and stays open and grey when the active one has nothing for it.
 ///
+/// In Embedded mode the list is always empty here: `apply_window_mode` re-docked
+/// every sub-window at the top of the pass, so no viewport is shown (egui would
+/// draw one as a window INSIDE the main one, which is no window of its own).
+///
 /// Immediate, never deferred: the deferred form needs `Fn + Send + Sync +
 /// 'static` (`egui-0.35.0/src/context.rs:3960`), which the caller's tab bodies —
 /// borrowing the typing tab's hundred-field states — cannot satisfy. The price is
@@ -1947,18 +2007,6 @@ fn show_sub_windows<'frame, C>(
     let mut outcome = HostOutcome::default();
     if state.sub_windows.is_empty() {
         return outcome;
-    }
-    // Backends without multi-window support (the web build) embed every extra
-    // viewport in the main one and report `ViewportClass::EmbeddedWindow`
-    // (`egui-0.35.0/src/context.rs:4008-4011`). The panels are still reachable
-    // there, but they are not OS windows, and saying so once beats letting a
-    // user wonder why nothing detached.
-    if ctx.embed_viewports() && !state.warned_embedded_viewports {
-        state.warned_embedded_viewports = true;
-        runtime_log::log_warn(
-            "[panel_dock] this backend cannot open separate OS windows; the dock's sub-windows \
-             are drawn as windows embedded in the main one",
-        );
     }
     let nodes: Vec<SubWindowNode> = state.sub_windows.clone();
     for node in nodes {
@@ -2820,11 +2868,15 @@ fn advance_panel_drag(
         return DragPhase::Released {
             panel: session.panel,
             grab_offset: session.grab_offset,
-            detach: window::detach_trigger(DragEndContext {
-                pointer_left_window: true,
-                release_pos: None,
-                area,
-            }),
+            detach: window::detach_verdict(
+                state.detach_allowed,
+                DragEndContext {
+                    pointer_left_window: true,
+                    release_pos: None,
+                    area,
+                },
+                owns_pointer,
+            ),
         };
     };
     // The pointer is back (or never left): the latch must not outlive it, or an
@@ -2859,15 +2911,15 @@ fn advance_panel_drag(
         state.drag = None;
         // A release whose cursor is over another of our windows leaves this
         // window entirely, whatever the tension against ITS dock area says.
-        let detach = if owns_pointer {
-            window::detach_trigger(DragEndContext {
+        let detach = window::detach_verdict(
+            state.detach_allowed,
+            DragEndContext {
                 pointer_left_window: false,
                 release_pos: Some(pointer),
                 area,
-            })
-        } else {
-            Some(DetachTrigger::PointerLeftWindow)
-        };
+            },
+            owns_pointer,
+        );
         DragPhase::Released {
             panel: session.panel,
             grab_offset: session.grab_offset,
@@ -5586,6 +5638,71 @@ mod tests {
         assert_eq!(state.sub_windows()[0].index, 2);
         assert_eq!(state.sub_windows()[0].pos, Some(Pos2::new(120.0, 80.0)));
         assert!(!state.is_dirty());
+    }
+
+    /// A state restored from a config that stored panels in sub-window 2.
+    fn state_with_a_persisted_sub_window() -> PanelDockState {
+        let mut restored = DockLayout::new();
+        restored
+            .insert_panel(
+                PanelNode::new(PanelId::new(0), HostId::SubWindow(2), vec![TAB_A])
+                    .expect("panel in sub-window 2"),
+            )
+            .expect("insert");
+        let mut state = PanelDockState::new();
+        state.install_persisted_layouts([("typing".to_owned(), restored)].into_iter().collect());
+        state.install_persisted_sub_windows(vec![SubWindowNode::new(
+            2,
+            None,
+            Vec2::new(400.0, 500.0),
+        )]);
+        state
+    }
+
+    #[test]
+    fn embedded_mode_redocks_persisted_sub_windows_and_persists_that() {
+        let mut state = state_with_a_persisted_sub_window();
+        assert!(!state.is_dirty());
+        state.apply_window_mode(WindowMode::Embedded);
+        assert!(!state.detach_allowed);
+        assert!(state.sub_windows().is_empty());
+        let layout = state.layout("typing").expect("layout");
+        let panel = layout.panel_of_tab(TAB_A).expect("the tab survives the re-dock");
+        assert_eq!(
+            layout.panel(panel).map(|node| node.host),
+            Some(HostId::MainWindow)
+        );
+        // The re-docked arrangement is what persistence stores: no windows left.
+        let snapshot = state
+            .take_dirty_layouts()
+            .expect("re-docking dirties the state");
+        assert!(snapshot.sub_windows.is_empty());
+        // A further Embedded pass has nothing left to do.
+        state.apply_window_mode(WindowMode::Embedded);
+        assert!(!state.is_dirty());
+    }
+
+    #[test]
+    fn separate_mode_keeps_the_sub_windows() {
+        let mut state = state_with_a_persisted_sub_window();
+        state.apply_window_mode(WindowMode::Separate);
+        assert!(state.detach_allowed);
+        assert_eq!(state.sub_windows().len(), 1);
+        assert_eq!(state.sub_windows()[0].index, 2);
+        assert!(!state.is_dirty());
+    }
+
+    #[test]
+    fn a_mode_flip_redocks_and_is_not_undone_by_flipping_back() {
+        let mut state = state_with_a_sub_window();
+        state.apply_window_mode(WindowMode::Separate);
+        assert_eq!(state.sub_windows().len(), 1);
+        state.apply_window_mode(WindowMode::Embedded);
+        assert!(state.sub_windows().is_empty());
+        assert!(!state.opened_sub_windows.contains(&0));
+        state.apply_window_mode(WindowMode::Separate);
+        assert!(state.detach_allowed);
+        assert!(state.sub_windows().is_empty());
     }
 
     #[test]

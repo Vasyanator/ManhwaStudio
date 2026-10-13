@@ -37,6 +37,8 @@ serde_json.workspace = true
 # `WindowGeometryError`, the typed failure of the section writers, is a
 # `#[derive(thiserror::Error)]` enum — same major as the rest of the workspace.
 thiserror.workspace = true
+# Decodes the embedded window icon (`identity::app_icon`; ICO, PNG fallback).
+image.workspace = true
 
 # On the free-unix platforms (unix minus macOS and Android) winit refuses to compile without at least one windowing
 # backend (`compile_error!("The platform you're compiling for is not supported by winit")`,

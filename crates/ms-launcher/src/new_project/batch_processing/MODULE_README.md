@@ -55,7 +55,8 @@ startup `ready` event, and talk JSON-RPC over stdio for the duration of the run.
 - egui repaints on demand, so `poll_file_task` re-arms a `request_repaint_after` while a task is
   pending; without it a finished dialog would sit unread until the user moved the mouse.
 - **A task never outlives the window session that started it.** The parent keeps this state
-  struct alive between openings, so `on_window_closed` — called on BOTH close paths — drops the
+  struct alive between openings, so `on_window_closed` — called by the owner on EVERY close path
+  (`show_content` never closes anything itself, it only reports the Close button) — drops the
   in-flight receiver. The worker's `send` then fails (already handled as a log line) instead of
   parking a result that the next opening would apply to a different graph, and the reopened
   window is not stuck showing the "dialog open" spinner with Save/Load disabled.

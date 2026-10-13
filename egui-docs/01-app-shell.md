@@ -297,7 +297,9 @@ Gotchas, all verified in the source docs:
 dock tab; the dock owns that window (`crates/ms-widgets/src/panel_dock/window.rs`), draws one
 `show_viewport_immediate` per sub-window every frame, persists it, and closes it when its last panel
 leaves. Rolling your own viewport for a panel would take it out of the layout, out of persistence,
-and out of the user's «Переместить в окно →» menu. See §3.1.
+and out of the user's «Переместить в окно →» menu. See §3.1. In Embedded mode
+(`effective_mode`, §5.1) the dock opens no sub-windows: detaching is disabled and stored detached
+panels re-dock into the main window (`PanelDockState::apply_window_mode`).
 
 ### 5.1 Embedded windows and the stack
 

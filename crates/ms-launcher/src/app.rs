@@ -1,20 +1,30 @@
 /*
-File: src/launcher/app.rs
+File: crates/ms-launcher/src/app.rs
 
 Purpose:
-Root `eframe::App` for the Rust launcher test mode.
+The launcher SCREEN: a plain state machine the host window draws each frame and asks for its
+exit (`take_outcome`). It owns no window: it never closes, maximizes or styles the root
+viewport.
 
 Main responsibilities:
+- gather everything an entry needs that costs blocking I/O, off the GUI thread
+  (`prepare_entry` -> `LauncherEntry`), and assemble the screen from it without I/O
+  (`LauncherApp::new`);
 - own launcher shell state;
 - drive background image plan generation and lazy batch decoding;
 - render the animated multi-column background with a separate post-image blur layer plus the central menu card;
 - poll the main-menu "Open image" picker worker and turn its pick into `LauncherOutcome::OpenImage`;
 - start the settings-warnings checks on the first frame of each launcher entry, poll them every
-  frame, and route launcher-side setting changes (first-run language confirm) to their recheck.
+  frame, and route launcher-side setting changes (first-run language confirm) to their recheck;
+- hold the one pending exit (`LauncherOutcome`) until the host takes it.
+
+Key items:
+- `LauncherEntry`, `prepare_entry`, `prepare_entry_with_settings`
+- `LauncherApp::{new, show, take_outcome, set_update_notification}`
 
 Notes:
-- every launcher viewport must reuse the same native app metadata so taskbar icons stay consistent
-  on Linux and Windows, including detached child windows.
+- every launcher child viewport carries the main window's identity (`with_window_identity`:
+  app id + icon from `ms_window_geometry::identity`) so taskbars group it with the main window.
 */
 
 use ms_settings_ui::ai_backend_supervisor::AiBackendHandle;
@@ -36,10 +46,11 @@ use crate::state::{LauncherHost, LauncherOutcome, LauncherPage, LauncherState, U
 use crate::theme::VEIL_TINT;
 use ms_tabs_simple::wiki::WikiTabState;
 #[cfg(feature = "tutorial")]
-use ms_settings_ui::tutorial::{TutorialController, TutorialId, TutorialStep};
+use ms_settings_ui::tutorial::{TutorialController, TutorialId, TutorialProgressHandle, TutorialStep};
 use eframe::egui::{self, epaint};
+use serde_json::Value;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, mpsc::Receiver};
+use std::sync::mpsc::Receiver;
 use web_time::{Duration, Instant};
 
 const BACKGROUND_COLUMNS: usize = 5;
@@ -67,9 +78,166 @@ struct PendingBackgroundImage {
     rx: Receiver<Option<LoadedBackgroundImage>>,
 }
 
+/// Everything one launcher entry (program start or return from the studio) needs that costs
+/// blocking I/O, gathered OFF the GUI thread by [`prepare_entry`]; [`LauncherApp::new`] turns it
+/// into the screen without further I/O. `Send`, so a worker can build it and hand it over.
+///
+/// The constructors of the settings page (config reads, locale scan), the new-project window
+/// (config reads that may persist migrated defaults, browser and waifu2x probes) and the
+/// first-run modal (raw config read, locale scan) perform that I/O, so the entry carries those
+/// sub-states already built rather than the raw reads.
+pub struct LauncherEntry {
+    /// Projects root of this entry, derived from [`Self::user_settings`].
+    pub projects_root: PathBuf,
+    /// User settings of this entry (stored values over defaults), read when it was prepared.
+    pub user_settings: Value,
+    /// `--test-launcher`: child windows carry the test app id.
+    pub test_mode: bool,
+    first_run_language: Option<FirstRunLanguageState>,
+    settings_page: SettingsPageState,
+    new_project_window: NewProjectWindowState,
+    #[cfg(feature = "tutorial")]
+    tutorial_progress: TutorialProgressHandle,
+    background_decode_parallelism: usize,
+}
+
+impl std::fmt::Debug for LauncherEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LauncherEntry")
+            .field("projects_root", &self.projects_root)
+            .field("test_mode", &self.test_mode)
+            .field("first_run_language", &self.first_run_language.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+// The host prepares the entry on a worker and moves it to the GUI thread.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<LauncherEntry>();
+};
+
+/// Prepares one launcher entry. BLOCKING (config reads, disk scans, probes): call it on a
+/// worker, never on the GUI thread.
+///
+/// The user settings are read FRESH, so a change made during the previous entry (for example
+/// the projects folder chosen on the settings page) is seen by this one; when that read fails,
+/// the failure is logged and `fallback_user_settings` (the host's startup snapshot) is used.
+/// `ai_backend` and `host` go to the settings page; `test_mode` is `--test-launcher`.
+#[must_use]
+pub fn prepare_entry(fallback_user_settings: &Value, ai_backend: AiBackendHandle, host: LauncherHost, test_mode: bool) -> LauncherEntry {
+    let user_settings = fresh_user_settings(config::load_user_settings_for_startup(), fallback_user_settings);
+    prepare_entry_with_settings(user_settings, ai_backend, host, test_mode)
+}
+
+/// [`prepare_entry`] with caller-supplied user settings instead of the fresh config read (the
+/// web build roots the launcher at its virtual projects folder). Equally BLOCKING: it still
+/// reads the raw config for the first-run language modal and builds the sub-states whose
+/// constructors do I/O.
+#[must_use]
+pub fn prepare_entry_with_settings(user_settings: Value, ai_backend: AiBackendHandle, host: LauncherHost, test_mode: bool) -> LauncherEntry {
+    let projects_root = config::projects_root_from_user_settings(&user_settings);
+    // First-run language modal: shown only when the RAW (unmerged) config lacks the interface
+    // and/or typesetting language. A config read error is bounded degradation — log it and
+    // never block the user behind the modal.
+    let first_run_language = match config::load_raw_user_settings_for_startup() {
+        Ok(raw) => FirstRunLanguageState::from_startup(&raw),
+        Err(err) => {
+            ms_log::runtime_log::log_error(format!(
+                "[launcher] could not read raw settings for the first-run language modal; \
+                 skipping it; error={err:#}"
+            ));
+            None
+        }
+    };
+    // One shared progress handle: the controllers autoplay against it and the settings
+    // "Обучение" pane resets it, so all of them stay in sync within the entry.
+    #[cfg(feature = "tutorial")]
+    let tutorial_progress = ms_settings_ui::tutorial::shared_progress();
+    let ai_install_type = config::AiInstallType::from_user_settings(&user_settings);
+    let settings_page = SettingsPageState::new(
+        projects_root.clone(),
+        ai_install_type,
+        ai_backend,
+        host,
+        #[cfg(feature = "tutorial")]
+        tutorial_progress.clone(),
+    );
+    let new_project_window = NewProjectWindowState::new(
+        projects_root.clone(),
+        #[cfg(feature = "tutorial")]
+        tutorial_progress.clone(),
+    );
+    // `available_parallelism` reads cgroup limits on Linux, so it is taken here too.
+    let background_decode_parallelism = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    ms_log::runtime_log::log_info(format!(
+        "[launcher] entry prepared{}: projects root '{}', first-run modal {}",
+        if test_mode { " (test mode)" } else { "" },
+        projects_root.display(),
+        if first_run_language.is_some() { "pending" } else { "not needed" }
+    ));
+    LauncherEntry {
+        projects_root,
+        user_settings,
+        test_mode,
+        first_run_language,
+        settings_page,
+        new_project_window,
+        #[cfg(feature = "tutorial")]
+        tutorial_progress,
+        background_decode_parallelism,
+    }
+}
+
+/// The user settings an entry runs with: the fresh `read` when it succeeded, else (logged)
+/// the host's `fallback` snapshot.
+fn fresh_user_settings(read: anyhow::Result<Value>, fallback: &Value) -> Value {
+    match read {
+        Ok(settings) => settings,
+        Err(err) => {
+            ms_log::runtime_log::log_error(format!(
+                "[launcher] could not re-read user settings for this launcher entry; using the \
+                 startup snapshot (a projects folder changed since startup may be stale); error={err:#}"
+            ));
+            fallback.clone()
+        }
+    }
+}
+
+/// Records `outcome` in `slot` unless an exit is already pending: the FIRST exit of an entry
+/// wins, because the host acts on it and a later one in the same frame would contradict what
+/// the user saw happen first. A dropped later outcome is logged. Returns whether it was kept.
+fn keep_first_outcome(slot: &mut Option<LauncherOutcome>, outcome: LauncherOutcome) -> bool {
+    if let Some(pending) = slot {
+        ms_log::runtime_log::log_warn(format!("[launcher] exit {pending:?} is already pending; dropping the later exit {outcome:?}"));
+        return false;
+    }
+    *slot = Some(outcome);
+    true
+}
+
+/// Stamps the main window's identity (app id + icon, `ms_window_geometry::identity`) on a
+/// launcher child viewport so the desktop groups it with the main window.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn with_window_identity(builder: egui::ViewportBuilder, test_mode: bool) -> egui::ViewportBuilder {
+    ms_window_geometry::identity::with_identity(builder, test_mode)
+}
+
+/// Web twin of the native `with_window_identity`: the browser has no OS windows (and the
+/// web build no `ms-window-geometry`), so the builder passes through unchanged.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn with_window_identity(builder: egui::ViewportBuilder, _test_mode: bool) -> egui::ViewportBuilder {
+    builder
+}
+
+/// The launcher screen. Built per entry from a [`LauncherEntry`]; drawn by the host with
+/// [`LauncherApp::show`]; its exit is collected with [`LauncherApp::take_outcome`].
 pub struct LauncherApp {
     pub state: LauncherState,
-    app_id: String,
+    /// `--test-launcher`: child windows carry the test app id.
+    test_mode: bool,
     new_project_window: NewProjectWindowState,
     psd_import_window: PsdImportWindowState,
     wiki_guide_tab: WikiTabState,
@@ -87,7 +255,8 @@ pub struct LauncherApp {
     /// Last-seen page, to edge-trigger autoplay only on entering the main page.
     #[cfg(feature = "tutorial")]
     tutorial_prev_page: Option<LauncherPage>,
-    output_outcome: Arc<Mutex<Option<LauncherOutcome>>>,
+    /// The pending exit of this entry, until the host takes it (`take_outcome`).
+    outcome: Option<LauncherOutcome>,
     pub(crate) update_notification: Option<UpdateNotification>,
     /// First-run language-selection modal. `Some` until the user confirms it (or
     /// `None` when both languages were already chosen). While it is `Some` the
@@ -98,7 +267,6 @@ pub struct LauncherApp {
     /// projects-folder warning (a create or import may have created the folder).
     project_creator_was_open: bool,
     pub(crate) ai_install_type: config::AiInstallType,
-    update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
     pending_plan: Option<Receiver<BackgroundImagePlan>>,
     /// Pending "Open image" pick (`open_image::spawn_image_picker`); `Some` while the native
     /// dialog is open. Polled each frame, never waited on.
@@ -112,8 +280,6 @@ pub struct LauncherApp {
     background_column_width: u32,
     background_decode_parallelism: usize,
     background_started_at: Instant,
-    #[cfg(target_os = "windows")]
-    maximize_root_window_on_first_frame: bool,
     /// On Windows, the new-project child viewport must be maximised on the first rendered
     /// frame rather than at window creation, to avoid the winit placement bug.
     #[cfg(target_os = "windows")]
@@ -124,59 +290,35 @@ pub struct LauncherApp {
 }
 
 impl LauncherApp {
-    /// Builds the launcher for one entry (program start or return from the studio). No egui
-    /// context exists yet, so workers that need one start on the first frame. `app_id` is the
-    /// native app id every launcher viewport reuses; `host` carries the process facts
-    /// (`--ignore-installed`, version) the settings page needs.
-    pub fn new(
-        projects_root: PathBuf,
-        app_id: String,
-        user_settings: &serde_json::Value,
-        output_outcome: Arc<Mutex<Option<LauncherOutcome>>>,
-        update_check_rx: Option<Receiver<Option<UpdateNotification>>>,
-        ai_backend: AiBackendHandle,
-        host: LauncherHost,
-    ) -> Self {
-        let ai_install_type = config::AiInstallType::from_user_settings(user_settings);
-        // First-run language modal: shown only when the RAW (unmerged) config lacks
-        // the interface and/or typesetting language. A config read error is bounded
-        // degradation — log it and never block the user behind the modal.
-        let first_run_language = match config::load_raw_user_settings_for_startup() {
-            Ok(raw) => FirstRunLanguageState::from_startup(&raw),
-            Err(err) => {
-                ms_log::runtime_log::log_error(format!(
-                    "[launcher] could not read raw settings for the first-run language modal; \
-                     skipping it; error={err:#}"
-                ));
-                None
-            }
-        };
-        // One shared progress handle: the controller autoplays against it and the
-        // settings "Обучение" pane resets it, so both stay in sync within the run.
-        #[cfg(feature = "tutorial")]
-        let tutorial_progress = ms_settings_ui::tutorial::shared_progress();
+    /// Builds the launcher screen for one entry. Performs NO blocking I/O (everything that
+    /// needs it was gathered by [`prepare_entry`]); it only spawns the page workers (catalogue
+    /// scans, wiki scan, background plan). No egui context exists yet, so workers that need
+    /// one start on the first frame.
+    #[must_use]
+    pub fn new(entry: LauncherEntry) -> Self {
+        let LauncherEntry {
+            projects_root,
+            user_settings,
+            test_mode,
+            first_run_language,
+            settings_page,
+            new_project_window,
+            #[cfg(feature = "tutorial")]
+            tutorial_progress,
+            background_decode_parallelism,
+        } = entry;
+        let ai_install_type = config::AiInstallType::from_user_settings(&user_settings);
         let mut app = Self {
             state: LauncherState::new(),
-            app_id,
-            new_project_window: NewProjectWindowState::new(
-                projects_root.clone(),
-                #[cfg(feature = "tutorial")]
-                tutorial_progress.clone(),
-            ),
+            test_mode,
+            new_project_window,
             psd_import_window: PsdImportWindowState::new(projects_root.clone()),
             wiki_guide_tab: WikiTabState::new(),
             wiki_guide_window_open: false,
-            open_page: OpenPageState::new(projects_root.clone(), user_settings),
+            open_page: OpenPageState::new(projects_root.clone(), &user_settings),
             import_page: ImportPageState::new(projects_root.clone()),
             export_page: ExportPageState::new(projects_root.clone()),
-            settings_page: SettingsPageState::new(
-                projects_root.clone(),
-                ai_install_type,
-                ai_backend,
-                host,
-                #[cfg(feature = "tutorial")]
-                tutorial_progress.clone(),
-            ),
+            settings_page,
             #[cfg(feature = "tutorial")]
             tutorial: TutorialController::new(
                 tutorial_progress,
@@ -194,12 +336,11 @@ impl LauncherApp {
             .with_callout_tint(egui::Color32::from_rgba_unmultiplied(18, 20, 26, 179)),
             #[cfg(feature = "tutorial")]
             tutorial_prev_page: None,
-            output_outcome,
+            outcome: None,
             update_notification: None,
             first_run_language,
             project_creator_was_open: false,
             ai_install_type,
-            update_check_rx,
             pending_plan: None,
             #[cfg(not(target_arch = "wasm32"))]
             open_image_pick: None,
@@ -209,12 +350,8 @@ impl LauncherApp {
             background_pending_slots: Vec::new(),
             background_column_heights: [0.0; BACKGROUND_COLUMNS],
             background_column_width: 0,
-            background_decode_parallelism: std::thread::available_parallelism()
-                .map(|parallelism| parallelism.get())
-                .unwrap_or(1),
+            background_decode_parallelism,
             background_started_at: Instant::now(),
-            #[cfg(target_os = "windows")]
-            maximize_root_window_on_first_frame: true,
             #[cfg(target_os = "windows")]
             new_project_maximize_on_first_frame: true,
             #[cfg(target_os = "windows")]
@@ -224,8 +361,21 @@ impl LauncherApp {
         app
     }
 
+    /// Takes the pending exit of this entry, if any (one-shot: a second call returns `None`).
+    /// The host calls it after [`Self::show`] each frame and acts on `Some` (open the studio,
+    /// start the update); the launcher itself never closes the window.
+    pub fn take_outcome(&mut self) -> Option<LauncherOutcome> {
+        self.outcome.take()
+    }
+
+    /// Sets (`Some`) or clears (`None`) the update notice of the main page. The host owns the
+    /// startup update check and hands its result in, so a return from the studio shows the
+    /// notice again without a new check.
+    pub fn set_update_notification(&mut self, notification: Option<UpdateNotification>) {
+        self.update_notification = notification;
+    }
+
     fn poll_workers(&mut self, ctx: &egui::Context, target_width: u32, viewport_height: f32) {
-        self.poll_update_check(ctx);
         // Settings warnings: the first frame of this entry starts the full check run
         // (`new` has no egui context); every frame then forwards landed AI-pane writes
         // and applies results, whichever page is shown.
@@ -252,23 +402,6 @@ impl LauncherApp {
         self.settings_page.overall_warning_level()
     }
 
-    fn poll_update_check(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.update_check_rx else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(notification) => {
-                self.update_notification = notification;
-                self.update_check_rx = None;
-                ctx.request_repaint();
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.update_check_rx = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-    }
-
     /// Starts the "Open image" picker worker unless one is already pending. While it is pending
     /// the main page shows the picking status instead of `main_page_message`.
     #[cfg(not(target_arch = "wasm32"))]
@@ -287,7 +420,7 @@ impl LauncherApp {
         self.open_image_pick.is_some()
     }
 
-    /// Applies a finished pick: a valid file closes the launcher with
+    /// Applies a finished pick: a valid file becomes the pending exit
     /// `LauncherOutcome::OpenImage`; a cancel clears the status; a rejection or a dead worker
     /// stays in the launcher with a localized status (details in the log).
     #[cfg(not(target_arch = "wasm32"))]
@@ -309,19 +442,8 @@ impl LauncherApp {
         match crate::open_image::launcher_outcome_for_pick(result) {
             Ok(None) => self.state.main_page_message = None,
             Ok(Some(outcome)) => {
-                ms_log::runtime_log::log_info(format!("[launcher-open-image] closing launcher to open {outcome:?}"));
-                match self.output_outcome.lock() {
-                    Ok(mut output) => {
-                        *output = Some(outcome);
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    Err(_) => {
-                        // A poisoned slot cannot be delivered (`run_launcher` refuses it too);
-                        // stay open so the user is not dropped out without a result.
-                        ms_log::runtime_log::log_error("[launcher-open-image] launcher outcome slot is poisoned; cannot hand the image to startup");
-                        self.state.main_page_message = Some(t!("launcher.main.open_image_picker_error").to_owned());
-                    }
-                }
+                ms_log::runtime_log::log_info(format!("[launcher-open-image] leaving the launcher to open {outcome:?}"));
+                keep_first_outcome(&mut self.outcome, outcome);
             }
             Err(rejection) => {
                 ms_log::runtime_log::log_warn(rejection.log_message());
@@ -668,9 +790,6 @@ impl LauncherApp {
             }
             PageNavAction::OpenProject(selection) => {
                 self.close_settings_resources_if_leaving(LauncherPage::Main);
-                if let Ok(mut output) = self.output_outcome.lock() {
-                    *output = Some(LauncherOutcome::OpenProject(selection.clone()));
-                }
                 if let Err(err) = crate::pages::open_page::persist_last_selection_values(
                     &selection.title,
                     &selection.chapter,
@@ -679,14 +798,11 @@ impl LauncherApp {
                         "[launcher-open] failed to persist last selection: {err:#}"
                     ));
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
             }
             PageNavAction::StartUpdate => {
                 self.close_settings_resources_if_leaving(LauncherPage::Main);
-                if let Ok(mut output) = self.output_outcome.lock() {
-                    *output = Some(LauncherOutcome::StartUpdate);
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                keep_first_outcome(&mut self.outcome, LauncherOutcome::StartUpdate);
             }
         }
     }
@@ -735,8 +851,8 @@ impl LauncherApp {
             return;
         }
 
-        // Parent (launcher) context: drives the native child viewport and the
-        // launcher-close command. The embedded web path renders straight into `ui`.
+        // Parent (launcher) context: drives the native child viewport. The embedded web path
+        // renders straight into `ui`.
         #[cfg(not(target_arch = "wasm32"))]
         let ctx = ui.ctx().clone();
 
@@ -754,17 +870,17 @@ impl LauncherApp {
         {
             keep_open = true;
             let viewport_id = egui::ViewportId::from_hash_of(NEW_PROJECT_VIEWPORT_ID_SALT);
-            let builder = crate::apply_launcher_window_metadata(
+            let builder = with_window_identity(
                 egui::ViewportBuilder::default()
                     .with_title(t!("launcher.new_project.window_title"))
                     .with_inner_size([1180.0, 760.0])
                     .with_min_inner_size([1000.0, 680.0])
-                    .with_app_id(&self.app_id)
                     .with_resizable(true)
                     .with_close_button(true)
                     .with_minimize_button(true)
                     .with_maximize_button(true)
                     .with_active(true),
+                self.test_mode,
             );
             // On Linux/macOS the native hint is reliable; on Windows it misplaces the window,
             // so maximisation is deferred to the first rendered frame via ViewportCommand.
@@ -783,9 +899,6 @@ impl LauncherApp {
         }
 
         if let Some(selection) = self.new_project_window.take_open_project_selection() {
-            if let Ok(mut output) = self.output_outcome.lock() {
-                *output = Some(LauncherOutcome::OpenProject(selection.clone()));
-            }
             if let Err(err) = crate::pages::open_page::persist_last_selection_values(
                 &selection.title,
                 &selection.chapter,
@@ -794,8 +907,7 @@ impl LauncherApp {
                     "[launcher-open] failed to persist last selection after save: {err:#}"
                 ));
             }
-            #[cfg(not(target_arch = "wasm32"))]
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
             keep_open = false;
         }
         if self.new_project_window.take_open_wiki_guide_requested() {
@@ -814,21 +926,21 @@ impl LauncherApp {
             return;
         }
 
-        // Parent (launcher) context: drives the child viewport and launcher-close command.
+        // Parent (launcher) context: drives the child viewport.
         let ctx = ui.ctx().clone();
         let viewport_id = egui::ViewportId::from_hash_of(PSD_IMPORT_VIEWPORT_ID_SALT);
         let mut keep_open = true;
-        let builder = crate::apply_launcher_window_metadata(
+        let builder = with_window_identity(
             egui::ViewportBuilder::default()
                 .with_title(t!("launcher.psd_import.window_title"))
                 .with_inner_size([1360.0, 820.0])
                 .with_min_inner_size([1120.0, 720.0])
-                .with_app_id(&self.app_id)
                 .with_resizable(true)
                 .with_close_button(true)
                 .with_minimize_button(true)
                 .with_maximize_button(true)
                 .with_active(true),
+            self.test_mode,
         );
         #[cfg(not(target_os = "windows"))]
         let builder = builder.with_maximized(true);
@@ -843,9 +955,6 @@ impl LauncherApp {
             keep_open = self.psd_import_window.show(ui, class);
         });
         if let Some(selection) = self.psd_import_window.take_open_project_selection() {
-            if let Ok(mut output) = self.output_outcome.lock() {
-                *output = Some(LauncherOutcome::OpenProject(selection.clone()));
-            }
             if let Err(err) = crate::pages::open_page::persist_last_selection_values(
                 &selection.title,
                 &selection.chapter,
@@ -854,7 +963,7 @@ impl LauncherApp {
                     "[launcher-open] failed to persist last selection after psd import: {err:#}"
                 ));
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
             keep_open = false;
         }
         self.state.psd_import_window_open = keep_open;
@@ -870,17 +979,17 @@ impl LauncherApp {
         let mut keep_open = true;
         ctx.show_viewport_immediate(
             viewport_id,
-            crate::apply_launcher_window_metadata(
+            with_window_identity(
                 egui::ViewportBuilder::default()
                     .with_title(t!("launcher.wiki_guide.window_title"))
                     .with_inner_size([980.0, 760.0])
                     .with_min_inner_size([720.0, 540.0])
-                    .with_app_id(&self.app_id)
                     .with_resizable(true)
                     .with_close_button(true)
                     .with_minimize_button(true)
                     .with_maximize_button(true)
                     .with_active(true),
+                self.test_mode,
             ),
             |ui, class| {
                 let ctx = ui.ctx().clone();
@@ -979,18 +1088,14 @@ fn slot_fade_alpha(loaded_at: Option<Instant>) -> f32 {
         .unwrap_or(1.0)
 }
 
-impl eframe::App for LauncherApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // eframe 0.35 drives the app from a root `Ui`; derive the `Context`
-        // (cheap Arc clone) for viewport commands, worker polling and child windows.
+impl LauncherApp {
+    /// Draws one frame of the launcher screen into the host's root `ui` (the whole window
+    /// content) and drives its workers. Non-blocking. Never touches the root viewport (close,
+    /// size, style); an exit is left for [`Self::take_outcome`].
+    pub fn show(&mut self, ui: &mut egui::Ui) {
+        // Derive the `Context` (cheap Arc clone) for worker polling and child windows.
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        #[cfg(target_os = "windows")]
-        if self.maximize_root_window_on_first_frame {
-            self.maximize_root_window_on_first_frame = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-            ctx.request_repaint();
-        }
 
         // Tutorial is gated behind the `tutorial` feature (off by default); the
         // controller and its `mark` sites stay compiled but inert without it.
@@ -1166,4 +1271,70 @@ fn rotate_pos(pos: egui::Pos2, center: egui::Pos2, angle_radians: f32) -> egui::
         center.x + delta.x * cos - delta.y * sin,
         center.y + delta.x * sin + delta.y * cos,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fresh_user_settings, keep_first_outcome};
+    use crate::state::{LauncherOutcome, OpenProjectSelection};
+    use ms_docstore::{DocKind, DocRef};
+    use serde_json::{Value, json};
+    use std::path::PathBuf;
+
+    /// Reads a user config document the way the startup path does (`ms_docstore`), but from
+    /// the given temp path instead of the real runtime root.
+    fn read_temp_config(path: &std::path::Path) -> anyhow::Result<Value> {
+        let doc = DocRef::new(path.to_path_buf(), DocKind::UserConfig);
+        Ok(ms_docstore::read_value(&doc)?.unwrap_or_else(|| json!({})))
+    }
+
+    /// A launcher entry sees the projects folder as stored NOW, not the host's startup
+    /// snapshot: the stale-projects-root bug of a return from the studio.
+    #[test]
+    fn prepare_entry_reads_projects_root_fresh_from_config() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("user_config.json");
+        let fresh_root = temp.path().join("fresh_projects");
+        std::fs::write(&path, serde_json::to_vec(&json!({"General": {"projects_dir": fresh_root.to_string_lossy()}}))?)?;
+        let startup_snapshot = json!({"General": {"projects_dir": "/home/u/stale_projects"}});
+
+        let settings = fresh_user_settings(read_temp_config(&path), &startup_snapshot);
+
+        assert_eq!(ms_config::projects_root_from_user_settings(&settings), fresh_root);
+        Ok(())
+    }
+
+    /// A failed re-read degrades to the host's snapshot instead of an empty config.
+    #[test]
+    fn prepare_entry_falls_back_to_startup_snapshot_when_config_is_unreadable() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("user_config.json");
+        std::fs::write(&path, b"{ not json")?;
+        let startup_snapshot = json!({"General": {"projects_dir": "/home/u/snapshot_projects"}});
+
+        let read = read_temp_config(&path);
+        assert!(read.is_err(), "a malformed config must fail to read");
+        let settings = fresh_user_settings(read, &startup_snapshot);
+
+        assert_eq!(settings, startup_snapshot);
+        assert_eq!(ms_config::projects_root_from_user_settings(&settings), PathBuf::from("/home/u/snapshot_projects"));
+        Ok(())
+    }
+
+    /// The first exit of an entry is kept; a later one is dropped; taking it is one-shot.
+    #[test]
+    fn take_outcome_is_one_shot_and_first_exit_wins() {
+        let open = LauncherOutcome::OpenProject(OpenProjectSelection {
+            project_dir: PathBuf::from("/home/u/projects/title/chapter"),
+            title: "title".to_owned(),
+            chapter: "chapter".to_owned(),
+            resume_unsaved: false,
+        });
+        let mut slot = None;
+        assert!(keep_first_outcome(&mut slot, open.clone()));
+        assert!(!keep_first_outcome(&mut slot, LauncherOutcome::StartUpdate));
+        assert_eq!(slot.take(), Some(open));
+        assert_eq!(slot.take(), None);
+        assert!(keep_first_outcome(&mut slot, LauncherOutcome::StartUpdate));
+    }
 }
