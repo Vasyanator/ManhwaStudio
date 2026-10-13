@@ -46,7 +46,7 @@ pub use ms_tab_translation as translation;
 // «Коррекция» GL pass. The re-export keeps every `crate::tabs::ps_editor::…` path valid in
 // `app.rs` and the `page_manager` tab without touching a call site. It owns no GL objects:
 // the «Коррекция» shader belongs to the `egui-shader-layers` backend, which
-// `studio_bootstrap` installs at window creation and destroys in its `on_exit`.
+// the main window (`src/shell/`) installs at window creation and destroys in its `on_exit`.
 pub use ms_tab_ps_editor as ps_editor;
 // The «Менеджер страниц» tab now lives in the standalone `ms-tab-page-manager` crate —
 // the page card grid and every structural dialog (crop / split / stitch / clean). The

@@ -16,9 +16,10 @@ Key functions:
 
 Notes:
 A child module of `app` so it reaches `MangaApp`'s private fields and helpers without widening
-their visibility. Callers today: `MangaApp`'s `eframe::App::on_exit` and the structural-operation
-reload in `studio_bootstrap.rs`, both still on the GUI thread until the shell's Closing screen
-runs this on a worker.
+their visibility. Its caller is the main window (`src/shell/closing.rs::teardown_blocking`): the
+Closing screen's worker for every leave of the studio (exit, return to the launcher, reload), or
+the window's `on_exit` when eframe ended the process with the studio open. The web entry never
+runs it (it drops the app in place); the web port of the shell is deferred.
 */
 
 use super::{MangaApp, persist_canvas_hint_collapsed_state, persist_typing_centering_assist_state};
@@ -59,10 +60,15 @@ impl MangaApp {
     /// Blocking: meant for a worker thread (or the process-shutdown hook). Idempotent, because every
     /// step it calls is (a saver already shut down is skipped). Returns what could not be made
     /// durable; each item is logged here too.
+    #[cfg_attr(
+        target_arch = "wasm32",
+        expect(dead_code, reason = "the web entry drops MangaApp in place and never tears it down; remove when the deferred web port of the main-window shell (unified-window WP-6) runs the teardown")
+    )]
     pub(crate) fn shutdown_blocking(&mut self) -> ShutdownReport {
         let mut report = ShutdownReport::default();
         // A single-image session always closes the DISCARD way (plan D13): its staging is a scratch
-        // `run_main` deletes once the window is gone, so nothing below may write into it. No-op when
+        // the shell's teardown deletes right after this app is dropped, so nothing below may write
+        // into it. No-op when
         // a dialog already took that path.
         if self.single_image.is_some() {
             self.quiesce_writers_discarding();

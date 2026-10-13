@@ -19,7 +19,10 @@ Key items:
 - seed_test_chapter(): writes the generated demo chapter into storage.
 
 Notes:
-Only compiled on `wasm32`. Native startup lives in `lib.rs`.
+Only compiled on `wasm32`. Native startup lives in `lib.rs` and the main window in `shell/`; the
+web entry shares only the per-screen style (`shell::style`). Porting the full shell here (screen
+state machine, teardown worker) is deferred: the web load is synchronous against virtual storage
+and `MangaApp` is dropped in place without its teardown.
 */
 
 use std::io::Cursor;
@@ -72,8 +75,8 @@ pub fn start() {
                 canvas,
                 web_options,
                 Box::new(|cc| {
-                    // Installs the launcher style AND pins the dark preference (`ms_theme::install`).
-                    crate::launcher::theme::configure_context(&cc.egui_ctx);
+                    // The launcher screen's complete style, built from scratch (`shell::style`).
+                    crate::shell::style::apply(&cc.egui_ctx, crate::shell::style::StyleScreen::Launcher);
                     // GPU shader layers (the PS editor's «Коррекция») on WebGL2. WebGL1 is
                     // refused by the library; the panel then reports the correction as
                     // unavailable. No teardown: the browser frees the WebGL context with the page.
@@ -144,7 +147,8 @@ impl eframe::App for WebApp {
                 if let Some(sel) = selection {
                     match build_editor_from_selection(&sel) {
                         Ok(editor) => {
-                            ms_theme::apply(ctx);
+                            // The studio's complete style replaces the launcher's wholesale.
+                            crate::shell::style::apply(ctx, crate::shell::style::StyleScreen::Studio);
                             // The editor's only UI zoom is the interface-scale setting.
                             ctx.options_mut(|options| options.zoom_with_keyboard = false);
                             *self = WebApp::Editor(Box::new(editor));

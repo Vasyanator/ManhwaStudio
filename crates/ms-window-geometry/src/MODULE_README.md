@@ -2,7 +2,8 @@
 
 ## Purpose
 Owns WHERE the program's OS window opens and where it is left: the user's primary-monitor
-choice, the last known geometry of the studio window, and the plumbing that keeps both in
+choice, the last known geometry of the main window (the one window hosting the launcher and the
+studio), and the plumbing that keeps both in
 the self-versioned `Window` section of `user_config.json`. Re-exported by the binary as
 `crate::window_geometry` (`src/lib.rs`).
 
@@ -23,7 +24,7 @@ startup (no window yet)          runtime (window exists)
 ```
 
 Layer position: `ms-config` (+ its `config_saver`) <- **`ms-window-geometry`** <- the
-binary (`lib.rs`, `studio_bootstrap.rs`, the launcher) and the settings UI.
+binary (the main window, `src/shell/`), `ms-launcher` (window identity) and the settings UI.
 
 This crate is the project's ONLY direct user of `winit`: egui/eframe expose no monitor
 list, only the raw window handle (`CreationContext::winit_window` / `Frame::winit_window`),
@@ -45,16 +46,13 @@ in, or the two `Window` types stop unifying.
   It also applies `General.secondary_windows` (`ms_config::SecondaryWindows`) to the forked
   winit (`set_secondary_window_policy`: resolved for Android, `Separate` -> `Native`,
   otherwise `Embedded`; the fork's device auto-detection is never used) and exposes the fork's
-  runtime gate (`native_windows_available`). Two crate-root entry points, both no-ops off
-  Android: `apply_android_native_window_policy()` reads `user_config`, seeds the live
-  `ms_config::secondary_windows` value and sets the policy; the two product roots (launcher
-  `ms-launcher/src/lib.rs`, studio `src/lib.rs::run_main_window`) call it right before
-  `eframe::run_native`, because eframe decides native vs embedded viewports once per
-  `run_native`. `sync_secondary_window_policy(ctx, setting)` re-syncs a LIVE context (sets the
-  policy, then `ctx.set_embed_viewports(!native_windows_available())`, so the fork's
-  full-screen fallback still wins) and is meant for screen switches inside one persistent
-  window; it does no I/O. The startup prompts keep whatever policy is set (they open no
-  secondary viewports).
+  runtime gate (`native_windows_available`). The main window (`src/shell/mod.rs`) sets the
+  policy from the live `ms_config::secondary_windows` value right before its one
+  `eframe::run_native` (eframe reads it when it creates the event loop), and calls the crate-root
+  `sync_secondary_window_policy(ctx, setting)` (a no-op off Android) at creation and on every
+  screen switch: it sets the policy, then `ctx.set_embed_viewports(!native_windows_available())`,
+  so the fork's full-screen fallback still wins; no I/O. The startup prompts keep whatever policy
+  is set (they open no secondary viewports).
 - `identity.rs`: the program's window identity — `MAIN_WINDOW_APP_ID` / `TEST_WINDOW_APP_ID`,
   `app_id(test_mode)`, `app_icon()` (embedded ICO, PNG fallback, decoded once per process) and
   `with_identity(builder, test_mode)`. Builds on every target that compiles this crate.
@@ -79,14 +77,13 @@ in, or the two `Window` types stop unifying.
 - **Section version.** `WINDOW_SECTION_VERSION` is mirrored as a literal in `ms-config`'s
   default tree (this crate is native-only and cannot be referenced from there); a drift test
   in `lib.rs` keeps the two in step.
-- **Owners.** The studio owns the geometry: `StudioBootstrapApp` (`src/studio_bootstrap.rs`)
-  holds the `WindowGeometryTracker` from the first frame and flushes it in `on_exit`. The
-  launcher only follows the monitor choice (`SizePolicy::KeepDefault`) and never persists
-  geometry. A geometry sample is taken only while the window is neither maximized, minimized
+- **Owners.** The main window owns the geometry: `AppShell` (`src/shell/mod.rs`) restores it
+  (`plan_startup_placement`), holds the `WindowGeometryTracker` from the first frame, whichever
+  screen (launcher or studio) is shown, and flushes it in `on_exit`. A geometry sample is taken only while the window is neither maximized, minimized
   nor fullscreen; a write touches only its own fields of the section.
 - **Windows first-frame maximize.** On Windows the restored maximized state is applied as a
   first-frame `ViewportCommand::Maximized`, gated on the persisted `Window.maximized` flag
-  (default `true`), by `StudioBootstrapApp`.
+  (default `true`), by `AppShell`.
 - **No `ViewportBuilder::with_monitor`.** In egui-winit 0.36.2 it requests BORDERLESS
   FULLSCREEN on that monitor (`egui-winit-0.36.2/src/lib.rs:2003-2006`), so placement uses a
   stored position inside the monitor instead.

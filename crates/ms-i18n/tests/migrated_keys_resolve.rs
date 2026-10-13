@@ -71,7 +71,7 @@ const SAMPLE: &[(&str, &str)] = &[
         "backend_ipc.frame.header_not_object",
         "JSON-заголовок кадра backend должен быть объектом.",
     ),
-    ("startup.basic_launcher.heading", "Базовый лаунчер"),
+    ("startup.install_prompt.title", "Программа не установлена"),
     ("bubble_status.border_solid", "Сплошная"),
     ("memory.profile.minimal", "Минимум"),
     ("settings.general.ui_language_label", "Язык интерфейса:"),

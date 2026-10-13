@@ -33,7 +33,8 @@ Native only (`cfg(not(target_arch = "wasm32"))` on the `mod` line): it needs the
 and file locks. Like `project_scan.rs` it uses `std::fs` directly rather than the
 `ms_storage` seam: the scratch and the user's file are real native paths, and the desktop
 seam is a passthrough anyway. Every function here blocks on disk I/O and decoding: call it on
-the load worker or after the window closed, never on the GUI thread. Pixels and ICC bytes are
+a worker (the studio's open worker, or the teardown worker that releases the scratch), never on
+the GUI thread. Pixels and ICC bytes are
 never logged.
 */
 

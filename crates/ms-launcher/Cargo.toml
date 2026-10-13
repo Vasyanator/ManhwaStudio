@@ -89,11 +89,11 @@ web-time.workspace = true
 # Quick download: verifies a page against the SHA-256 its site publishes (MangaDex file names).
 sha2.workspace = true
 
-# Native-only halves. The launcher owns a real OS window and reaches the network and the
-# filesystem; its wasm build keeps the module signatures and returns "unavailable on web"
-# (see the `cfg(target_arch = "wasm32")` stub of `run_launcher_internal` in `lib.rs`).
+# Native-only halves. The launcher's child windows are real OS windows and it reaches the network
+# and the filesystem; the web build has no OS windows (`app.rs::with_window_identity` passes the
+# builder through there).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# Startup placement of the launcher window on the user's chosen monitor.
+# Window identity (app id + icon) of the launcher's child windows (`identity`).
 ms-window-geometry = { path = "../ms-window-geometry" }
 # The System registration settings tab: probes this copy's OS records (`report::probe`),
 # offers and runs their actions (`actions`), and on Windows the elevated helper

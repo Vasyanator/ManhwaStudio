@@ -212,32 +212,47 @@ pub type AppCreator<'app> =
 
 `CreationContext` (eframe-0.36.2/src/epi.rs:53) exposes `egui_ctx: egui::Context` — the place to set
 fonts/theme **before the first frame**. `NativeOptions` is at epi.rs:296; its `viewport:
-ViewportBuilder` field carries window metadata. The project's studio startup:
+ViewportBuilder` field carries window metadata.
+
+**The program has ONE product `run_native`: the main window** (`src/shell/mod.rs::run`). The
+launcher and the studio are screens of it, switched in place; nothing closes the window between
+them. Abridged:
 
 ```rust
-// src/lib.rs:1995-2054 (excerpt, abridged)
-let mut viewport = egui::ViewportBuilder::default()
-    .with_inner_size([1400.0, 900.0])
-    .with_min_inner_size([900.0, 600.0])
-    .with_app_id(MAIN_WINDOW_APP_ID);
+// src/shell/mod.rs, `run` (abridged)
+let mut viewport = window_geometry::identity::with_identity(
+    egui::ViewportBuilder::default()
+        .with_title(title.as_str())
+        .with_inner_size(MAIN_WINDOW_DEFAULT_INNER_SIZE)
+        .with_min_inner_size(min_size),
+    config.test_mode,
+);
+viewport = window_geometry::apply_placement(viewport, &placement);
 #[cfg(not(target_os = "windows"))]
-{ viewport = viewport.with_maximized(true); }
-if let Some(icon) = load_embedded_icon_data() { viewport = viewport.with_icon(icon); }
-
-let native_options = eframe::NativeOptions { viewport, ..Default::default() };
-
-eframe::run_native(
-    &title,
-    native_options,
-    Box::new(move |cc| {
-        ms_theme::apply(&cc.egui_ctx); // stock dark + studio status colours
-        Ok(Box::new(app::MangaApp::new(project, ai_backend.clone(), flag_for_app)))
-    }),
-)
+{ viewport = viewport.with_maximized(placement.maximized); } // Windows: first-frame command
+let native_options = eframe::NativeOptions { viewport, /* android_app on Android */ ..Default::default() };
+eframe::run_native(APP_NAME, native_options, Box::new(move |cc| {
+    Ok(Box::new(AppShell::new(cc, config, &window_settings, exit_for_window)))
+}))
 ```
 
-Other `run_native` entry points in the same file: missing-python prompt (src/lib.rs:1287),
-update check (src/lib.rs:1794), launcher (src/lib.rs:2329).
+The creator (`AppShell::new`) does everything that belongs to the window for its whole life:
+monitors, `ui_fonts::install(Tier::Full)`, UI scale, the shader-layer GL backend,
+`options_mut(zoom_with_keyboard = false)`, then the first screen (`style::apply`, title, minimum
+size). A screen switch later sends `ViewportCommand::Title` (egui-0.36.2/src/viewport.rs:1090) and
+`MinInnerSize` (:1111) and reinstalls the complete style (§7).
+
+* **Root close lives in `App::logic`** (eframe-0.36.2/src/epi.rs:167). eframe checks the root
+  viewport's output for `ViewportCommand::CancelClose` (viewport.rs:1087) after `logic` + `ui`
+  AND after a logic-only tick of a hidden window (eframe-0.36.2/src/native/epi_integration.rs:305-310,
+  :340-346), so deciding there also answers the close button of a minimized window. A `Close` the
+  app sends itself (viewport.rs:1084) comes back as `close_requested` on the next frame
+  (egui-winit-0.36.2/src/lib.rs:1744): never cancel that one, or the window can never close.
+* **The other `run_native` sites are separate prompt windows**, run before (or, for the launcher's
+  "Update", after) the main window, never at the same time: the missing-environment prompt
+  (`src/lib.rs::prompt_missing_python_env_action`) and the installer / update / existing-install
+  windows of `ms-installer` (`install.rs`, `update.rs`). Each installs the core font tier
+  (`ui_fonts::install(.., Tier::Core)`) in its own creator.
 
 ## 5. Multi-viewport (extra native windows)
 
@@ -366,7 +381,9 @@ viewport command (`crates/ms-widgets/src/embedded_window.rs`, `show_separate`, a
   is a pure function of the active screen: `ms_theme::base_style()` (stock `Visuals::dark()` plus
   the `error_fg_color` / `warn_fg_color` status colours) plus that screen's pure layer, e.g.
   `ms_launcher::theme::launcher_style(base)`. Windows without a layer call `ms_theme::apply`
-  (= `install(base_style())`). Child viewports share the `Context`, so they inherit it.
+  (= `install(base_style())`). Child viewports share the `Context`, so they inherit it. The main
+  window rebuilds and installs the screen's complete style on EVERY screen switch
+  (`src/shell/style.rs`); it never compares two `Style`s to skip that (see the `PartialEq` note).
 * Do not call `ctx.set_theme` (context.rs:2170), `global_style_mut()` (:2189), `all_styles_mut()`
   (:2213), `style_mut_of` / `set_style_of` (:2237, :2250), `set_global_style` (:2200), or
   `set_visuals` / `set_visuals_of` (:2280, :2267) in product code. **There is no
@@ -439,7 +456,8 @@ the result actually happens. The font loader above is the canonical example.
 
 * To change the root app shell, tab bar, top panel, or per-tab central panel: `src/app.rs`
   (`impl eframe::App for MangaApp`, src/app.rs:2337).
-* To change process startup, window size/icon/app-id, or which `run_native` runs: `src/lib.rs`.
+* To change process startup or the startup prompts: `src/lib.rs`. To change the main window
+  (size, icon/app-id, title, close policy, screen switching): `src/shell/` (its `MODULE_README.md`).
 * To change the launcher shell: `crates/ms-launcher/src/app.rs`. To change how ANY secondary window
   opens (separate vs embedded, title strip, stacking): `crates/ms-widgets/src/embedded_window.rs`.
 * To change the launcher look (Style/Visuals/palette): `crates/ms-launcher/src/theme.rs`.

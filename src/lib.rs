@@ -11,45 +11,31 @@ Every `eframe::NativeOptions` built here sets `android_app` from
 `window_geometry::android_app::current()` on Android (compiled out elsewhere).
 
 Main flow (`native_main` -> `run_main`):
-- Parses CLI args (`--project` optional, `--no-ai` optional).
-- Handles hidden service flags for installer continuation and Windows uninstall before normal startup.
-- Handles hidden service flags for installer continuation, Windows uninstall, and elevated Start Menu shortcut creation before normal startup.
-- Routes the elevated system-registration helper (`--system-registration-apply`, Windows only) right after the flag-conflict check.
-- Windows uninstall can relaunch itself elevated with a hidden continuation flag before deleting files from protected install locations.
-- If `--project` points to a valid chapter, opens it immediately.
-- `--image <PATH>` or a positional image path (OS "Open with", `.desktop` `%f`) opens that
-  picture in single-image mode, skipping the launcher; the launcher's "open image" button routes
-  to the same start. The `run_main` loop owns the request's scratch session and deletes it after
-  the studio window closes; stale sessions of crashed runs are swept on a startup worker.
-- If chapter has legacy `scr` and no `src`, auto-renames `scr -> src` during startup validation.
-- Invalid `--project` startup path is reported both in console and in a modal error dialog
-  (`ms_platform::message::show_error_blocking`; log-only where no native box exists).
-- The Python AI backend supervisor starts only where `PlatformFeature::PythonBackend` exists.
-- If `--project` is missing (the route itself is the pure `startup_routing`):
-  - on a platform without installed-copy management (`ms_platform::PlatformFeature`, e.g.
-    Android) goes straight to the launcher: no installer, install prompts or update check;
-  - checks whether Python env required by installer-dependent features is available;
-  - when env is missing, asks whether to start the installer, update a custom install folder, or
-    continue into the Rust launcher;
-- starts a non-blocking GitHub release version check before the Rust launcher and lets the launcher
-  return an update intent when the user clicks "Обновить";
-- supports `--check-venv`: checks the managed Python environment, exits 0 silently when it is
-  complete, otherwise opens the installer in environment-repair mode and exits 0/1;
-- supports `--ignore-installed` (run from a source checkout): no Linux desktop entry, no
-  existing-install discovery/prompt, per-root backend socket, self-update refused;
-- otherwise keeps the Linux desktop entry and icon current on a startup worker
-  (`install_linux_desktop_integration_async`: create if missing, refresh only if this copy's;
-  the entry text, ownership rule and writer live in `ms_os_integration::linux`);
-- supports `--update` to open the Rust update window directly before normal startup routing;
-- supports hidden `--continue-update` to resume update work after the executable has been replaced;
-- can update an already installed copy found through Windows install discovery or a user-selected
-  custom install folder;
-- prepares startup artifacts (`user_config.json`, `ManhwaStudio_AI_Models`, `last.log/previous.log`) before Rust launcher startup.
-- auto-detects and persists `General.ai_install_type` when that key is absent.
-- Validates chapter folders in a worker thread (`src` + image files in `src`).
-- Rust launcher берёт корень проектов из `user_config.json` (`General.projects_dir`)
-  с fallback на `{Documents}/manhwastudio_projects`.
-- Loads project data and starts the main eframe app.
+- Parses CLI args and rejects contradictory flag combinations first.
+- Handles hidden service flags (installer continuation, Windows uninstall, elevated Start Menu
+  shortcut creation, the elevated system-registration helper) before normal startup.
+- Seeds the process-global settings (storage mode first, locale, UI scale, autosave policy,
+  secondary windows) and starts the Python AI backend supervisor where
+  `PlatformFeature::PythonBackend` exists.
+- `--check-venv` (terminal), `--continue-update` and `--update` run their own windows.
+- `resolve_start`: a valid `--project` chapter, or `--image <PATH>` / a positional image path
+  (OS "Open with", `.desktop` `%f`), opens the studio directly; an invalid one is reported in
+  the console and a modal error box (`ms_platform::message::show_error_blocking`; log-only where
+  no native box exists). Without an open target the pure `startup_routing` decides: on a platform
+  without installed-copy management straight to the launcher; otherwise installer continuation,
+  or — with no usable Python environment — the Windows existing-install check and the
+  "install / update a custom folder / continue" prompt, each as its own window, ONCE per process.
+- `shell::run` opens the ONE main window (`src/shell/`) on the launcher or the studio; the
+  launcher and the studio are screens of it, switched in place. The startup GitHub release check
+  runs once, on the first launcher entry (`update_check.rs`); a launcher "Update" request runs the
+  update window after the main window has closed.
+- `--test-launcher` is the main window in test mode (own title / app id; any exit quits).
+- `--ignore-installed` (run from a source checkout): no Linux desktop entry, no existing-install
+  discovery or prompt, no update check, per-root backend socket, self-update refused.
+- Otherwise keeps the Linux desktop entry and icon current on a startup worker
+  (`install_linux_desktop_integration_async`; text, ownership rule and writer live in
+  `ms_os_integration::linux`); sweeps stale single-image scratch sessions on a worker.
+- Auto-detects and persists `General.ai_install_type` when that key is absent.
 */
 
 // Bring the `ms-i18n` UI-string macros (`t!` / `tf!` / `tp!`) into crate-wide
@@ -70,12 +56,14 @@ mod i18n_resolve;
 // App-shell half of the single-image mode: save controller, its dialogs and the tab / title /
 // hotkey rules `MangaApp` consults (plan `dev-docs/single_image_mode_plan.md`, WP-2.4).
 mod single_image;
-// Studio window startup shell: opens the window immediately and runs the project load on
-// a background thread behind a loading screen, then swaps in `MangaApp`. Native-only: it
-// wraps the native windowed startup flow (`run_main_window`), which does not exist on wasm.
-#[cfg(not(target_arch = "wasm32"))]
-mod studio_bootstrap;
+// The main window: ONE `run_native` hosting the launcher and the studio as screens (launcher
+// entry, studio load and studio teardown on workers). Its `style` part is shared with the web
+// entry; everything else is native-only (gated inside).
+mod shell;
 mod tabs;
+// The startup check for a newer release (GitHub), started once by the main window.
+#[cfg(not(target_arch = "wasm32"))]
+mod update_check;
 #[cfg(target_arch = "wasm32")]
 mod web_entry;
 
@@ -98,8 +86,8 @@ pub(crate) use ms_settings_ui::{ai_backend_supervisor, general_settings_panel, s
 // The launcher shell — project catalogue, the detached "New Project" window with every
 // download/stitch/reline/batch flow, PSD import, the import/export pages, the first-run
 // language modal and the launcher settings page — now lives in the standalone
-// `ms-launcher` crate. It is effectively a second application: the studio never names it,
-// only the native startup in this file and `web_entry.rs` do. The re-export keeps every `crate::launcher::…`
+// `ms-launcher` crate. It is a screen of the main window: the studio never names it, only the
+// main window (`shell/`) and `web_entry.rs` host it. The re-export keeps every `crate::launcher::…`
 // path valid without touching a call site.
 pub(crate) use ms_launcher as launcher;
 // Gated exactly as the module was. The root `tutorial` feature FORWARDS to
@@ -273,10 +261,6 @@ pub(crate) use ms_text_util::language;
 // the shared filesystem helpers that used to keep `std::ffi::OsStr` unconditional
 // here now live in `project_scan.rs`.
 #[cfg(not(target_arch = "wasm32"))]
-use crate::widgets::WheelComboBox;
-#[cfg(not(target_arch = "wasm32"))]
-use anyhow::Context;
-#[cfg(not(target_arch = "wasm32"))]
 use args::Cli;
 #[cfg(not(target_arch = "wasm32"))]
 use clap::Parser;
@@ -286,40 +270,15 @@ use installer::install as launcher_install;
 use installer::update::UpdateWindowOutcome;
 #[cfg(not(target_arch = "wasm32"))]
 use installer::utils::ExternalUpdateTarget;
-#[cfg(not(target_arch = "wasm32"))]
-use launcher::state::{LauncherOutcome, UpdateNotification};
-#[cfg(not(target_arch = "wasm32"))]
-use serde::Deserialize;
-#[cfg(not(target_arch = "wasm32"))]
-use std::cmp::Ordering;
-#[cfg(not(target_arch = "wasm32"))]
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_platform::PlatformFeature;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog};
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_thread as thread;
-#[cfg(not(target_arch = "wasm32"))]
-use web_time::Duration;
-
-#[allow(dead_code)]
-const LAUNCHER_OUTPUT_PREFIX: &str = "MS_OPEN_PROJECT_JSON=";
-#[allow(dead_code)]
-const UPDATE_API_RELEASES: &str = "https://api.github.com/repos/Vasyanator/ManhwaStudio/releases";
-#[allow(dead_code)]
-const UPDATE_ASSET_NAME: &str = "ManhwaStudio.zip";
-/// Inner size of the studio window on a first run, in logical pixels. Also the size the
-/// startup placement centers on a monitor when no geometry has been stored yet.
-#[cfg(not(target_arch = "wasm32"))]
-const STUDIO_DEFAULT_INNER_SIZE: [f32; 2] = [1400.0, 900.0];
-const UPDATE_CHECK_WINDOW_APP_ID: &str = "manhwastudio_rs.update_check";
-const BASIC_LAUNCHER_WINDOW_APP_ID: &str = "manhwastudio_rs.basic_launcher";
 
 /// Web entry, called by the wasm32 `fn main` of the `manhwastudio_rs` binary: boots the eframe
 /// `WebRunner` on the page canvas. Real startup lives in `web_entry.rs`; the native
@@ -357,7 +316,7 @@ fn storage_conversion_autostart_gate() -> ai_backend_supervisor::AutostartGate {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn run_main() -> anyhow::Result<()> {
-    let mut cli = Cli::parse();
+    let cli = Cli::parse();
     // The elevated system-registration helper never opens the session log: initializing it
     // rotates `last.log` -> `previous.log`, and the helper runs while the launcher that
     // started it still writes `last.log` (on Windows it also holds the file open). The helper
@@ -522,69 +481,72 @@ fn run_main() -> anyhow::Result<()> {
 
     if cli.test_launcher {
         init_runtime_logging();
-        storage_mode_job::start_pending_reconciliation();
         let supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(ai_backend_enabled(&cli), Some(storage_conversion_autostart_gate()));
-        return launcher::run_test_launcher(
-            &user_settings,
-            startup_update_check_receiver(&cli),
-            &supervisor.handle(),
-            launcher_host(cli.ignore_installed),
-        );
+        // Test mode routes nowhere: the shell quits on any launcher exit.
+        let exit = shell::run(shell::ShellConfig {
+            initial: shell::InitialScreen::Launcher,
+            user_settings,
+            ai_backend: supervisor.handle(),
+            host: launcher_host(cli.ignore_installed),
+            test_mode: true,
+            update_check: update_check_enabled(cli.ignore_installed, installed_copy_management_available()).then_some(cli.test_ver_check),
+        })?;
+        runtime_log::log_info(format!("[startup] --test-launcher window closed ({exit:?})"));
+        return Ok(());
     }
 
     let ai_enabled = ai_backend_enabled(&cli);
-    // The single Python AI backend is owned here, above the launcher/studio loop, so it
-    // starts in the launcher (per the autostart toggle) and survives transitions between
-    // the launcher and the studio. Dropped (which stops the process + probe) on any return.
+    // The single Python AI backend is owned here, above the main window, so it starts with the
+    // launcher (per the autostart toggle) and survives every switch between the launcher and the
+    // studio. Dropped (which stops the process + probe) on any return.
     // The autostart waits (on the supervisor worker) until no storage-mode conversion is
     // pending or running: the backend writes `user_config` itself (KG-016). With `--project`
     // the reconciliation stays pending until the project is loaded, so the autostart does too.
     let ai_backend_supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(ai_enabled, Some(storage_conversion_autostart_gate()));
     let ai_backend = ai_backend_supervisor.handle();
 
-    // Main loop: re-enters the launcher when the user chooses "Выйти в лаунчер".
-    loop {
-        // The launcher shows the reconciliation's progress; a direct `--project` or image
-        // start defers it to the studio shell, after the load (`studio_bootstrap`).
-        let cli_open_target = cli.project.is_some() || cli.image_arg().is_some();
-        if !cli_open_target {
-            storage_mode_job::start_pending_reconciliation();
-        }
-        let Some(target) = resolve_startup_target(&cli, &user_settings, &ai_backend)? else {
-            return Ok(());
-        };
-        // The loop owns the request (and an image's scratch session) for the window's whole
-        // life and releases it after `run_main_window` returned: no window exists then, so
-        // the recursive delete never runs on a GUI thread (plan D13).
-        let request = match studio_bootstrap::StudioOpenRequest::from_target(target, &config::single_image::scratch_base()) {
-            Ok(request) => request,
-            Err(err) => {
-                runtime_log::log_error(format!("[startup] could not reserve a single-image scratch session: {err}"));
-                show_startup_error_dialog(&err.user_message());
-                if cli_open_target {
-                    anyhow::bail!("single-image scratch reservation failed: {err}");
-                }
-                // Picked in the launcher: go back there instead of ending the program.
-                continue;
-            }
-        };
-
-        // The load (unsaved detection + `ProjectData::load*`, or the single-image open) runs
-        // on a background thread inside `run_main_window`, so the studio window opens
-        // immediately with a loading screen instead of blocking here with no window on
-        // screen. A load failure is shown in-window and resolves through the same
-        // `RunResult` mechanism.
-        let run_result = run_main_window(&request, &user_settings, ai_backend.clone());
-        request.release();
-        match run_result? {
-            RunResult::Exit => return Ok(()),
-            RunResult::ReturnToLauncher => {
-                // Clear the CLI open target so the launcher is shown next iteration.
-                cli.clear_open_target();
-                runtime_log::log_info("returning to launcher");
-            }
-        }
+    // The startup prompts (installer continuation, missing environment, Windows existing
+    // install) run ONCE here, as their own windows, before the main window exists.
+    let Some(start) = resolve_start(&cli)? else {
+        return Ok(());
+    };
+    // The ONE main window: launcher and studio are its screens, switched in place. The launcher
+    // shows the storage reconciliation's progress; a direct `--project` or image start defers it
+    // to the studio screen, after the load.
+    let exit = shell::run(shell::ShellConfig {
+        initial: start.initial,
+        user_settings,
+        ai_backend,
+        host: launcher_host(cli.ignore_installed),
+        test_mode: false,
+        update_check: start.update_check.then_some(cli.test_ver_check),
+    })?;
+    match exit {
+        shell::ShellExit::Quit => Ok(()),
+        shell::ShellExit::StartUpdate => run_launcher_requested_update(&cli),
     }
+}
+
+/// Runs the update window the launcher's "Update" button asked for, after the main window has
+/// closed. The button only exists with an update notification, which the startup check never
+/// produces under `--ignore-installed` or without installed-copy management, so both checks below
+/// are guards, not the UI path.
+///
+/// # Errors
+/// The update window could not run.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_launcher_requested_update(cli: &Cli) -> anyhow::Result<()> {
+    if cli.ignore_installed {
+        refuse_self_update_from_sources();
+        return Ok(());
+    }
+    if let Err(unavailable) = PlatformFeature::InstalledCopyManagement.require() {
+        runtime_log::log_error(format!("[startup] self-update requested on a platform without installed-copy management; refused: {unavailable:?}"));
+        return Ok(());
+    }
+    let outcome = installer::update::run_update_window(cli.test_ver_check, HOST_VERSION).map_err(anyhow::Error::msg)?;
+    runtime_log::log_info(format!("[startup] update window closed: {outcome:?}"));
+    Ok(())
 }
 
 /// Starts the one-shot startup sweep of stale single-image scratch sessions
@@ -621,27 +583,6 @@ fn init_startup_logging_best_effort() {
     }
 }
 
-/// Outcome reported by `run_main_window` after the eframe window closes.
-///
-/// Native-only: this only describes the native windowed run loop.
-#[cfg(not(target_arch = "wasm32"))]
-enum RunResult {
-    Exit,
-    ReturnToLauncher,
-}
-
-/// Returns true when there is a `{chapter}_unsaved` folder adjacent to the chapter dir.
-#[cfg(not(target_arch = "wasm32"))]
-fn detect_unsaved_for_project(project_dir: &Path) -> bool {
-    let Some(chapter_name) = project_dir.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
-    let Some(title_dir) = project_dir.parent() else {
-        return false;
-    };
-    title_dir.join(format!("{chapter_name}_unsaved")).is_dir()
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 fn init_runtime_logging() {
     let log_dir = config::data_dir();
@@ -654,14 +595,6 @@ fn init_runtime_logging() {
         log_dir.join("last.log").display(),
         log_dir.join("previous.log").display()
     ));
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn ensure_standard_launcher_startup_artifacts() -> anyhow::Result<()> {
-    init_runtime_logging();
-    config::ensure_model_dirs()?;
-    let _ = config::load_user_config()?;
-    Ok(())
 }
 
 /// Seeds the config-free `ms_text_util::text_punctuation` set from user config at
@@ -798,33 +731,37 @@ fn auto_detect_missing_ai_install_type_for_startup() {
     ));
 }
 
-/// Resolves what the studio opens next: the CLI open target (`--project`, `--image` or the
+/// Where the main window starts and whether it runs the startup update check.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct StartPlan {
+    initial: shell::InitialScreen,
+    /// Run the startup update check (once, on the first launcher entry).
+    update_check: bool,
+}
+
+/// Resolves where the main window starts: the CLI open target (`--project`, `--image` or the
 /// positional image) when present, else whatever the no-argument startup path (installer
-/// prompts, launcher) yields. `None` means "exit the program".
+/// prompts) yields — normally the launcher. `None` means "exit the program". The prompts run
+/// once per process: a later return to the launcher does not repeat them.
 ///
 /// # Errors
 /// An invalid CLI open target (after its error dialog) and every error of the no-argument path.
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_startup_target(
-    cli: &Cli,
-    user_settings: &serde_json::Value,
-    ai_backend: &ai_backend_supervisor::AiBackendHandle,
-) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
+fn resolve_start(cli: &Cli) -> anyhow::Result<Option<StartPlan>> {
+    // A CLI start can still reach the launcher later ("Exit to launcher"); its update notice
+    // follows the same rule as a launcher start.
+    let cli_update_check = || update_check_enabled(cli.ignore_installed, installed_copy_management_available());
     if let Some(project_dir) = &cli.project {
-        return resolve_cli_project_dir(project_dir);
+        return Ok(resolve_cli_project_dir(project_dir)?.map(|target| StartPlan { initial: shell::InitialScreen::Studio(target), update_check: cli_update_check() }));
     }
     if let Some(image) = cli.image_arg() {
-        return resolve_cli_image(image).map(Some);
+        let target = resolve_cli_image(image)?;
+        return Ok(Some(StartPlan { initial: shell::InitialScreen::Studio(target), update_check: cli_update_check() }));
     }
-    resolve_project_dir_without_cli_arg(
-        user_settings,
-        StartupRoutingFlags {
-            force_update_available: cli.test_ver_check,
-            force_run_installer: cli.continue_install || cli.continue_install_target.is_some(),
-            ignore_installed: cli.ignore_installed,
-        },
+    resolve_start_without_cli_arg(
+        StartupRoutingFlags { force_run_installer: cli.continue_install || cli.continue_install_target.is_some(), ignore_installed: cli.ignore_installed },
         cli.continue_install_target.clone(),
-        ai_backend,
     )
 }
 
@@ -835,8 +772,6 @@ fn resolve_startup_target(
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy)]
 struct StartupRoutingFlags {
-    /// `--test-ver-check`: pretend an update is available.
-    force_update_available: bool,
     /// Installer continuation after elevation: go straight into the installer window.
     force_run_installer: bool,
     /// `--ignore-installed`: never discover, modify, or replace an installed copy.
@@ -885,10 +820,10 @@ const fn startup_routing(flags: StartupRoutingFlags, has_auto_install_target: bo
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
+fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<shell::studio::StartupTarget>> {
     let path = project_dir.to_path_buf();
     match crate::project_scan::validate_project_dir_for_startup(&path) {
-        crate::project_scan::ProjectValidationState::Valid { .. } => Ok(Some(studio_bootstrap::StartupTarget::Project(path))),
+        crate::project_scan::ProjectValidationState::Valid { .. } => Ok(Some(shell::studio::StartupTarget::Project(path))),
         crate::project_scan::ProjectValidationState::Invalid { message } => {
             let full_message = format!("--project path is invalid: {message}");
             show_startup_error_dialog(&full_message);
@@ -906,11 +841,11 @@ fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<studio_b
 /// The path does not exist, is a directory (the message names `--project`), or is not a
 /// regular file.
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_cli_image(image: &Path) -> anyhow::Result<studio_bootstrap::StartupTarget> {
+fn resolve_cli_image(image: &Path) -> anyhow::Result<shell::studio::StartupTarget> {
     use crate::project::single_image::SingleImageError;
     let path = image.to_path_buf();
     let message = match args::check_image_arg(&path) {
-        Ok(()) => return Ok(studio_bootstrap::StartupTarget::Image(path)),
+        Ok(()) => return Ok(shell::studio::StartupTarget::Image(path)),
         Err(args::ImageArgProblem::NotFound) => SingleImageError::NotFound { path: path.clone() }.user_message(),
         Err(args::ImageArgProblem::Directory) => tf!("startup.image.directory_error", path = path.display()),
         Err(args::ImageArgProblem::NotAFile) => SingleImageError::NotAFile { path: path.clone() }.user_message(),
@@ -954,13 +889,14 @@ fn spawn_self_in_standalone_mode(working_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The no-open-target startup path: installer continuation, or — with no usable Python
+/// environment — the Windows existing-install check and the missing-environment prompt, each as
+/// its own window; otherwise (or when the user picks it there) the launcher. `None` = exit.
+///
+/// # Errors
+/// An installer or update window failed, or the standalone relaunch failed.
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_project_dir_without_cli_arg(
-    user_settings: &serde_json::Value,
-    flags: StartupRoutingFlags,
-    auto_install_target: Option<PathBuf>,
-    ai_backend: &ai_backend_supervisor::AiBackendHandle,
-) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
+fn resolve_start_without_cli_arg(flags: StartupRoutingFlags, auto_install_target: Option<PathBuf>) -> anyhow::Result<Option<StartPlan>> {
     let installed_copy_management = installed_copy_management_available();
     let program_dir = config::program_dir();
     // The probe is skipped where `startup_routing` ignores its answer (no installed-copy
@@ -970,19 +906,23 @@ fn resolve_project_dir_without_cli_arg(
         && python_manager::has_supported_python_env(&program_dir);
     let route = startup_routing(flags, auto_install_target.is_some(), installed_copy_management, has_python_env);
     let update_check = match route {
-        StartupRoute::Installer => return run_startup_installer(program_dir, auto_install_target),
+        StartupRoute::Installer => {
+            run_startup_installer(program_dir, auto_install_target)?;
+            return Ok(None);
+        }
         StartupRoute::MissingEnvironmentPrompt { update_check } => {
             #[cfg(target_os = "windows")]
-            if let Some(handled) = route_existing_windows_install(&program_dir)? {
-                return Ok(handled);
+            if route_existing_windows_install(&program_dir)? {
+                return Ok(None);
             }
             match prompt_missing_python_env_action() {
                 MissingPythonEnvAction::Install => {
-                    return run_startup_installer(program_dir, None);
+                    run_startup_installer(program_dir, None)?;
+                    return Ok(None);
                 }
                 MissingPythonEnvAction::UpdateCustom(target) => {
-                    let _ = installer::update::run_external_install_update_window(target, HOST_VERSION)
-                        .map_err(anyhow::Error::msg)?;
+                    let outcome = installer::update::run_external_install_update_window(target, HOST_VERSION).map_err(anyhow::Error::msg)?;
+                    runtime_log::log_info(format!("[startup] custom-folder update window closed: {outcome:?}"));
                     return Ok(None);
                 }
                 MissingPythonEnvAction::LaunchLauncher => {}
@@ -991,45 +931,18 @@ fn resolve_project_dir_without_cli_arg(
         }
         StartupRoute::Launcher { update_check } => update_check,
     };
-
-    ensure_standard_launcher_startup_artifacts()?;
-    // Without a notification the launcher never shows its update button, which is why the
-    // `StartUpdate` arm below is a guard, not the UI path.
-    let update_check_rx = update_check.then(|| spawn_startup_update_check(flags.force_update_available));
-    match launcher::run_launcher(user_settings, update_check_rx, ai_backend, launcher_host(flags.ignore_installed))? {
-        Some(LauncherOutcome::OpenProject(selection)) => Ok(Some(studio_bootstrap::StartupTarget::Project(selection.project_dir))),
-        // The launcher already checked "exists and is a file"; decode errors are the studio
-        // loading screen's (one owner: `SingleImageError::user_message`).
-        Some(LauncherOutcome::OpenImage(path)) => {
-            runtime_log::log_info(format!("[startup] launcher picked image '{}'", path.display()));
-            Ok(Some(studio_bootstrap::StartupTarget::Image(path)))
-        }
-        Some(LauncherOutcome::StartUpdate) => {
-            if flags.ignore_installed {
-                refuse_self_update_from_sources();
-                return Ok(None);
-            }
-            if let Err(unavailable) = PlatformFeature::InstalledCopyManagement.require() {
-                runtime_log::log_error(format!("[startup] self-update requested on a platform without installed-copy management; refused: {unavailable:?}"));
-                return Ok(None);
-            }
-            let _ = installer::update::run_update_window(flags.force_update_available, HOST_VERSION)
-                .map_err(anyhow::Error::msg)?;
-            Ok(None)
-        }
-        None => Ok(None),
-    }
+    Ok(Some(StartPlan { initial: shell::InitialScreen::Launcher, update_check }))
 }
 
 /// Windows only, missing Python environment: looks for an installed copy of the program and
-/// acts on the user's choice in the existing-install window. `Some(result)` ends the
-/// no-argument startup path with `result`; `None` continues to the missing-environment prompt
-/// (no install found, or the detection failed, which is logged).
+/// acts on the user's choice in the existing-install window. `true` ends the startup (the
+/// program exits); `false` continues to the missing-environment prompt (no install found, or the
+/// detection failed, which is logged).
 ///
 /// # Errors
 /// The update window or the standalone relaunch failed.
 #[cfg(target_os = "windows")]
-fn route_existing_windows_install(program_dir: &Path) -> anyhow::Result<Option<Option<studio_bootstrap::StartupTarget>>> {
+fn route_existing_windows_install(program_dir: &Path) -> anyhow::Result<bool> {
     let existing_install_action = match launcher_install::handle_existing_windows_install(program_dir, HOST_VERSION) {
         Ok(action) => action,
         Err(err) => {
@@ -1041,21 +954,22 @@ fn route_existing_windows_install(program_dir: &Path) -> anyhow::Result<Option<O
         }
     };
     match existing_install_action {
-        launcher_install::ExistingInstallAction::NoInstallFound => Ok(None),
-        launcher_install::ExistingInstallAction::ExitCurrentCopy => Ok(Some(None)),
+        launcher_install::ExistingInstallAction::NoInstallFound => Ok(false),
+        launcher_install::ExistingInstallAction::ExitCurrentCopy => Ok(true),
         launcher_install::ExistingInstallAction::StartInstaller(target_dir) => {
-            run_startup_installer(program_dir.to_path_buf(), Some(target_dir)).map(Some)
+            run_startup_installer(program_dir.to_path_buf(), Some(target_dir))?;
+            Ok(true)
         }
         launcher_install::ExistingInstallAction::UpdateInstalled(target) => {
-            let _ = installer::update::run_external_install_update_window(target, HOST_VERSION)
-                .map_err(anyhow::Error::msg)?;
-            Ok(Some(None))
+            let outcome = installer::update::run_external_install_update_window(target, HOST_VERSION).map_err(anyhow::Error::msg)?;
+            runtime_log::log_info(format!("[startup] installed-copy update window closed: {outcome:?}"));
+            Ok(true)
         }
         // Its own arm on purpose: it must NOT fall through to the missing-Python prompt
         // the way `NoInstallFound` does — the user asked to run THIS copy as it is.
         launcher_install::ExistingInstallAction::RunStandalone => {
             spawn_self_in_standalone_mode(program_dir)?;
-            Ok(Some(None))
+            Ok(true)
         }
     }
 }
@@ -1072,17 +986,6 @@ fn refuse_self_update_from_sources() {
         "[startup] self-update refused: running from sources (--ignore-installed)",
     );
     show_startup_error_dialog(t!("startup.ignore_installed.update_refused"));
-}
-
-/// Returns the startup update-check receiver, or `None` when self-update is disabled.
-///
-/// `--ignore-installed`, or a platform without installed-copy management, suppresses the
-/// check entirely ([`update_check_enabled`]): the launcher then has no update notification to
-/// draw, so its update button never appears.
-#[cfg(not(target_arch = "wasm32"))]
-fn startup_update_check_receiver(cli: &Cli) -> Option<mpsc::Receiver<Option<UpdateNotification>>> {
-    update_check_enabled(cli.ignore_installed, installed_copy_management_available())
-        .then(|| spawn_startup_update_check(cli.test_ver_check))
 }
 
 /// Whether the Python AI backend may start: not under `--no-ai`, and only where the platform
@@ -1301,59 +1204,6 @@ fn run_environment_repair_and_report(root_dir: &Path) -> i32 {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn spawn_startup_update_check(
-    force_update_available: bool,
-) -> mpsc::Receiver<Option<UpdateNotification>> {
-    let (tx, rx) = mpsc::channel();
-    // Two values, on purpose. The comparison against a GitHub release tag runs on the
-    // plain `CARGO_PKG_VERSION`, so a development build is never mistaken for a newer
-    // release than the tag it was built from; the notification is shown to a person and
-    // therefore carries the extended, git-derived string.
-    let local_version = env!("CARGO_PKG_VERSION").to_string();
-    let display_version = env!("MS_APP_VERSION").to_string();
-
-    let spawn_result = thread::Builder::new()
-        .name("startup-version-check".to_string())
-        .spawn(move || {
-            let notification = if force_update_available {
-                Some(UpdateNotification {
-                    local_version: display_version,
-                    remote_version: "test-update".to_string(),
-                })
-            } else {
-                match fetch_latest_release_tag() {
-                    Ok(remote_version) if is_remote_newer(&local_version, &remote_version) => {
-                        Some(UpdateNotification {
-                            local_version: display_version,
-                            remote_version,
-                        })
-                    }
-                    Ok(remote_version) => {
-                        runtime_log::log_info(format!(
-                            "[startup-version-check] no update: local={}, remote={}",
-                            display_version, remote_version
-                        ));
-                        None
-                    }
-                    Err(err) => {
-                        runtime_log::log_warn(format!("[startup-version-check] {err}"));
-                        None
-                    }
-                }
-            };
-            let _ = tx.send(notification);
-        });
-
-    if let Err(err) = spawn_result {
-        runtime_log::log_warn(format!(
-            "[startup-version-check] failed to spawn version check worker: {err}"
-        ));
-    }
-
-    rx
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 enum MissingPythonEnvAction {
     Install,
     UpdateCustom(ExternalUpdateTarget),
@@ -1517,22 +1367,24 @@ impl eframe::App for MissingPythonEnvPromptApp {
     }
 }
 
+/// Runs the installer window for `app_dir` (installer continuation, or the user's "install"
+/// choice); the program exits afterwards in every case. A finished install that offers to launch
+/// the installed copy starts it as a separate process.
+///
+/// # Errors
+/// The installer window failed, the installer reported a failure, or the installed copy could not
+/// be started.
 #[cfg(not(target_arch = "wasm32"))]
-fn run_startup_installer(
-    app_dir: PathBuf,
-    auto_install_target: Option<PathBuf>,
-) -> anyhow::Result<Option<studio_bootstrap::StartupTarget>> {
-    match launcher_install::run_python_installer_window(&app_dir, auto_install_target, HOST_VERSION)
-        .map_err(anyhow::Error::msg)?
-    {
-        launcher_install::InstallerOutcome::Completed => Ok(None),
+fn run_startup_installer(app_dir: PathBuf, auto_install_target: Option<PathBuf>) -> anyhow::Result<()> {
+    match launcher_install::run_python_installer_window(&app_dir, auto_install_target, HOST_VERSION).map_err(anyhow::Error::msg)? {
+        launcher_install::InstallerOutcome::Completed
+        | launcher_install::InstallerOutcome::ElevatedRelaunchStarted
+        | launcher_install::InstallerOutcome::Cancelled => Ok(()),
         launcher_install::InstallerOutcome::LaunchLauncher(install_dir) => {
-            launcher_install::spawn_installed_program_copy(&install_dir)
-                .map_err(anyhow::Error::msg)?;
-            Ok(None)
+            let exe = launcher_install::spawn_installed_program_copy(&install_dir).map_err(anyhow::Error::msg)?;
+            runtime_log::log_info(format!("[startup] started the installed copy '{}'", exe.display()));
+            Ok(())
         }
-        launcher_install::InstallerOutcome::ElevatedRelaunchStarted => Ok(None),
-        launcher_install::InstallerOutcome::Cancelled => Ok(None),
         launcher_install::InstallerOutcome::Failed(err) => Err(anyhow::Error::msg(err)),
     }
 }
@@ -1548,931 +1400,6 @@ fn show_startup_error_dialog(message: &str) {
             "[startup] the startup error could not be shown in a dialog; it is reported only in this log.\nReason: {unavailable:?}\nMessage: {message}"
         ));
     }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreLaunchAction {
-    LaunchLauncher,
-    RunUpdaterAndExit,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn open_launcher_with_optional_update_check(
-    app_dir: &Path,
-    create_startup_artifacts: bool,
-) -> anyhow::Result<Option<PathBuf>> {
-    let action = decide_pre_launch_action(app_dir)?;
-    if action == PreLaunchAction::RunUpdaterAndExit {
-        if let Err(err) = spawn_python_update_and_exit(app_dir) {
-            let message = tf!("startup.update_py_launch_error", err = err);
-            show_startup_error_dialog(&message);
-        } else {
-            return Ok(None);
-        }
-    }
-    run_python_launcher_and_wait_for_project(app_dir, create_startup_artifacts)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn decide_pre_launch_action(app_dir: &Path) -> anyhow::Result<PreLaunchAction> {
-    let config_path = app_dir.join("config.py");
-    if !config_path.is_file() {
-        return Ok(PreLaunchAction::LaunchLauncher);
-    }
-
-    let local_version =
-        read_local_version_from_config(&config_path).unwrap_or_else(|| "2.0".to_string());
-    let decision = match run_update_check_window(local_version) {
-        Ok(decision) => decision,
-        Err(err) => {
-            runtime_log::log_error(format!("[startup-update-check] UI error: {err}"));
-            eprintln!("[startup-update-check] UI error: {err}");
-            return Ok(PreLaunchAction::LaunchLauncher);
-        }
-    };
-    Ok(match decision {
-        UpdateCheckDecision::LaunchLauncher => PreLaunchAction::LaunchLauncher,
-        UpdateCheckDecision::RunUpdaterAndExit => PreLaunchAction::RunUpdaterAndExit,
-    })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn spawn_python_update_and_exit(app_dir: &Path) -> anyhow::Result<()> {
-    runtime_log::log_info(format!("launching update.py from '{}'", app_dir.display()));
-    let mut cmd = build_python_update_command(app_dir).map_err(anyhow::Error::msg)?;
-    cmd.spawn()
-        .map_err(|e| anyhow::anyhow!("failed to launch update.py: {e}"))?;
-    Ok(())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn run_python_launcher_and_wait_for_project(
-    app_dir: &Path,
-    create_startup_artifacts: bool,
-) -> anyhow::Result<Option<PathBuf>> {
-    if create_startup_artifacts {
-        ensure_standard_launcher_startup_artifacts()?;
-    }
-    runtime_log::log_info(format!(
-        "launching launcher.py from '{}'",
-        app_dir.display()
-    ));
-    let mut cmd = build_python_launcher_command(app_dir).map_err(anyhow::Error::msg)?;
-    let output = cmd
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to launch launcher.py: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    if !stdout.trim().is_empty() {
-        runtime_log::log_info(format!("[launcher.py][stdout] {}", stdout.trim()));
-    }
-    if !stderr.trim().is_empty() {
-        runtime_log::log_warn(format!("[launcher.py][stderr] {}", stderr.trim()));
-    }
-
-    let selected = parse_selected_project_from_stdout(&stdout)?;
-    if !output.status.success() && selected.is_none() {
-        let code = output.status.code().unwrap_or(-1);
-        runtime_log::log_error(format!(
-            "launcher.py exited with code {code}; stderr='{}'",
-            stderr.trim()
-        ));
-        anyhow::bail!(
-            "launcher.py exited with code {code}. stderr: {}",
-            stderr.trim()
-        );
-    }
-
-    let Some(project_dir) = selected else {
-        runtime_log::log_info("launcher.py exited without selected project");
-        return Ok(None);
-    };
-    runtime_log::log_info(format!(
-        "launcher selected project '{}'",
-        project_dir.display()
-    ));
-
-    match crate::project_scan::validate_project_dir_for_startup(&project_dir) {
-        crate::project_scan::ProjectValidationState::Valid { .. } => Ok(Some(project_dir)),
-        crate::project_scan::ProjectValidationState::Invalid { message } => {
-            anyhow::bail!("launcher returned invalid project path: {message}")
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-struct LauncherSelectionPayload {
-    project: String,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn parse_selected_project_from_stdout(stdout: &str) -> anyhow::Result<Option<PathBuf>> {
-    for line in stdout.lines().rev() {
-        let trimmed = line.trim();
-        let Some(payload_raw) = trimmed.strip_prefix(LAUNCHER_OUTPUT_PREFIX) else {
-            continue;
-        };
-        let payload: LauncherSelectionPayload = serde_json::from_str(payload_raw)
-            .with_context(|| "invalid launcher selection payload")?;
-        let project = payload.project.trim();
-        if project.is_empty() {
-            anyhow::bail!("launcher returned empty project path");
-        }
-        return Ok(Some(PathBuf::from(project)));
-    }
-    Ok(None)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn has_launcher_script(app_dir: &Path) -> bool {
-    app_dir.join("launcher.py").is_file()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-#[cfg(target_os = "windows")]
-fn build_python_launcher_command(app_dir: &Path) -> Result<std::process::Command, String> {
-    python_manager::build_python_script_command(app_dir, "launcher.py")
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-#[cfg(target_os = "windows")]
-fn build_python_update_command(app_dir: &Path) -> Result<std::process::Command, String> {
-    python_manager::build_python_script_command(app_dir, "update.py")
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-#[cfg(not(target_os = "windows"))]
-fn build_python_launcher_command(app_dir: &Path) -> Result<std::process::Command, String> {
-    python_manager::build_python_script_command(app_dir, "launcher.py")
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-#[cfg(not(target_os = "windows"))]
-fn build_python_update_command(app_dir: &Path) -> Result<std::process::Command, String> {
-    python_manager::build_python_script_command(app_dir, "update.py")
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UpdateCheckDecision {
-    LaunchLauncher,
-    RunUpdaterAndExit,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug)]
-struct UpdateCheckResult {
-    remote_version: String,
-    update_available: bool,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug)]
-enum UpdateCheckUiState {
-    Checking,
-    UpdateAvailable { remote_version: String },
-    Error { message: String },
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-struct UpdateCheckApp {
-    local_version: String,
-    state: UpdateCheckUiState,
-    pending_check: Option<mpsc::Receiver<Result<UpdateCheckResult, String>>>,
-    output_decision: Arc<Mutex<Option<UpdateCheckDecision>>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl UpdateCheckApp {
-    fn new(
-        local_version: String,
-        output_decision: Arc<Mutex<Option<UpdateCheckDecision>>>,
-    ) -> Self {
-        let mut app = Self {
-            local_version,
-            state: UpdateCheckUiState::Checking,
-            pending_check: None,
-            output_decision,
-        };
-        app.start_check();
-        app
-    }
-
-    fn start_check(&mut self) {
-        let local_version = self.local_version.clone();
-        let (tx, rx) = mpsc::channel();
-        self.pending_check = Some(rx);
-        self.state = UpdateCheckUiState::Checking;
-
-        let _ = thread::Builder::new()
-            .name("startup-update-check".to_string())
-            .spawn(move || {
-                let result = fetch_latest_release_tag().map(|remote_version| UpdateCheckResult {
-                    update_available: is_remote_newer(&local_version, &remote_version),
-                    remote_version,
-                });
-                let _ = tx.send(result);
-            });
-    }
-
-    fn set_decision_and_close(&self, decision: UpdateCheckDecision, ctx: &egui::Context) {
-        if let Ok(mut out) = self.output_decision.lock() {
-            *out = Some(decision);
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-    }
-
-    fn poll_check_result(&mut self, ctx: &egui::Context) {
-        let mut should_clear_receiver = false;
-        if let Some(rx) = &self.pending_check {
-            match rx.try_recv() {
-                Ok(Ok(result)) => {
-                    should_clear_receiver = true;
-                    if result.update_available {
-                        self.state = UpdateCheckUiState::UpdateAvailable {
-                            remote_version: result.remote_version,
-                        };
-                    } else {
-                        self.set_decision_and_close(UpdateCheckDecision::LaunchLauncher, ctx);
-                    }
-                }
-                Ok(Err(err)) => {
-                    should_clear_receiver = true;
-                    self.state = UpdateCheckUiState::Error { message: err };
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    should_clear_receiver = true;
-                    self.state = UpdateCheckUiState::Error {
-                        message: t!("startup.update_check.failed").to_string(),
-                    };
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-
-        if should_clear_receiver {
-            self.pending_check = None;
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl eframe::App for UpdateCheckApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // egui 0.35: `App::ui` receives the window-root `Ui`. Keep a borrowed `Context` handle
-        // for the context-level calls (poll, viewport commands, repaint scheduling) below.
-        let ctx = ui.ctx().clone();
-        let ctx = &ctx;
-        self.poll_check_result(ctx);
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading(t!("startup.update_check.heading"));
-                ui.add_space(8.0);
-                ui.label(tf!("startup.update_check.local_version", arg = self.local_version));
-                ui.add_space(10.0);
-
-                match &self.state {
-                    UpdateCheckUiState::Checking => {
-                        ui.spinner();
-                        ui.label(t!("startup.update_check.checking"));
-                    }
-                    UpdateCheckUiState::UpdateAvailable { remote_version } => {
-                        ui.colored_label(
-                            ms_theme::status::SUCCESS,
-                            tf!("startup.update_check.new_version_available", remote_version = remote_version),
-                        );
-                    }
-                    UpdateCheckUiState::Error { message } => {
-                        ui.colored_label(ms_theme::status::ERROR, message);
-                    }
-                }
-
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if matches!(self.state, UpdateCheckUiState::Error { .. })
-                        && ui.button(t!("startup.update_check.retry_button")).clicked()
-                    {
-                        self.start_check();
-                    }
-
-                    if matches!(self.state, UpdateCheckUiState::UpdateAvailable { .. })
-                        && ui.button(t!("startup.update_check.update_button")).clicked()
-                    {
-                        self.set_decision_and_close(UpdateCheckDecision::RunUpdaterAndExit, ctx);
-                    }
-
-                    if ui.button(t!("startup.update_check.skip_button")).clicked() {
-                        self.set_decision_and_close(UpdateCheckDecision::LaunchLauncher, ctx);
-                    }
-                });
-            });
-        });
-
-        if matches!(self.state, UpdateCheckUiState::Checking) {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn run_update_check_window(local_version: String) -> anyhow::Result<UpdateCheckDecision> {
-    let output = Arc::new(Mutex::new(None::<UpdateCheckDecision>));
-    let out = Arc::clone(&output);
-    let local_version_for_ui = local_version;
-
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([540.0, 210.0])
-        .with_min_inner_size([460.0, 180.0])
-        .with_resizable(true)
-        .with_app_id(UPDATE_CHECK_WINDOW_APP_ID);
-    if let Some(icon) = window_geometry::identity::app_icon() {
-        viewport = viewport.with_icon(icon);
-    }
-
-    let options = eframe::NativeOptions {
-        viewport,
-        // winit cannot build an event loop on Android without the Activity handle.
-        #[cfg(target_os = "android")]
-        android_app: window_geometry::android_app::current(),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        t!("startup.update_check.window_title"),
-        options,
-        Box::new(move |cc| {
-            ms_theme::apply(&cc.egui_ctx);
-            ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Core);
-            Ok(Box::new(UpdateCheckApp::new(
-                local_version_for_ui.clone(),
-                Arc::clone(&out),
-            )))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    let decision = output
-        .lock()
-        .map_err(|_| anyhow::anyhow!("failed to read update-check decision"))?
-        .unwrap_or(UpdateCheckDecision::LaunchLauncher);
-    Ok(decision)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn read_local_version_from_config(config_path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(config_path).ok()?;
-    parse_version_from_config(&content)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn parse_version_from_config(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with("VERSION") {
-            continue;
-        }
-
-        let after_name = trimmed.strip_prefix("VERSION")?.trim_start();
-        let after_eq = after_name.strip_prefix('=')?.trim_start();
-        let quote = after_eq.chars().next()?;
-        if quote != '"' && quote != '\'' {
-            continue;
-        }
-
-        let tail = &after_eq[quote.len_utf8()..];
-        if let Some(end_idx) = tail.find(quote) {
-            return Some(tail[..end_idx].trim().to_string());
-        }
-    }
-    None
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn fetch_latest_release_tag() -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(30))
-        .build();
-
-    let mut req = agent
-        .get(UPDATE_API_RELEASES)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "UpdateScript/1.0");
-
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
-        }
-    }
-
-    let resp = req
-        .call()
-        .map_err(|e| tf!("startup.update_check.request_error", e = e))?;
-    let body = resp
-        .into_string()
-        .map_err(|e| tf!("startup.update_check.response_read_error", e = e))?;
-
-    let releases: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| tf!("startup.update_check.json_error", e = e))?;
-    let releases = releases
-        .as_array()
-        .ok_or_else(|| t!("startup.update_check.unexpected_format").to_string())?;
-
-    for rel in releases {
-        let tag = rel
-            .get("tag_name")
-            .and_then(|v| v.as_str())
-            .or_else(|| rel.get("name").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .trim();
-        if tag.is_empty() {
-            continue;
-        }
-
-        let has_zip = rel
-            .get("assets")
-            .and_then(|v| v.as_array())
-            .map(|assets| {
-                assets.iter().any(|asset| {
-                    asset.get("name").and_then(|v| v.as_str()) == Some(UPDATE_ASSET_NAME)
-                })
-            })
-            .unwrap_or(false);
-
-        if has_zip {
-            return Ok(tag.to_string());
-        }
-    }
-
-    Err(tf!("startup.update_check.asset_not_found", UPDATE_ASSET_NAME = UPDATE_ASSET_NAME))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn is_remote_newer(local: &str, remote: &str) -> bool {
-    compare_versions(remote, local).is_gt()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn compare_versions(a: &str, b: &str) -> Ordering {
-    let pa = parse_version_to_parts(a);
-    let pb = parse_version_to_parts(b);
-
-    for (left, right) in pa.iter().zip(pb.iter()) {
-        let ord = compare_version_part(left, right);
-        if !ord.is_eq() {
-            return ord;
-        }
-    }
-
-    pa.len().cmp(&pb.len())
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn parse_version_to_parts(version: &str) -> Vec<VersionPart> {
-    let normalized = normalize_version(version);
-    normalized
-        .split(['.', '-', '+', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            if let Ok(num) = part.parse::<u64>() {
-                VersionPart::Num(num)
-            } else {
-                VersionPart::Text(part.to_ascii_lowercase())
-            }
-        })
-        .collect()
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn normalize_version(version: &str) -> &str {
-    let trimmed = version.trim();
-    if let Some(rest) = trimmed.strip_prefix('v') {
-        rest
-    } else if let Some(rest) = trimmed.strip_prefix('V') {
-        rest
-    } else {
-        trimmed
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn compare_version_part(left: &VersionPart, right: &VersionPart) -> Ordering {
-    match (left, right) {
-        (VersionPart::Num(a), VersionPart::Num(b)) => a.cmp(b),
-        (VersionPart::Text(a), VersionPart::Text(b)) => a.cmp(b),
-        (VersionPart::Num(_), VersionPart::Text(_)) => Ordering::Greater,
-        (VersionPart::Text(_), VersionPart::Num(_)) => Ordering::Less,
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-enum VersionPart {
-    Num(u64),
-    Text(String),
-}
-
-/// Opens the studio window for `request` and blocks until it closes. The load runs on a
-/// worker behind the bootstrap loading screen. The caller keeps owning `request` and releases
-/// it (single-image scratch deletion) after this returns.
-///
-/// # Errors
-/// eframe could not create or run the window.
-#[cfg(not(target_arch = "wasm32"))]
-fn run_main_window(
-    request: &studio_bootstrap::StudioOpenRequest,
-    user_settings: &serde_json::Value,
-    ai_backend: ai_backend_supervisor::AiBackendHandle,
-) -> anyhow::Result<RunResult> {
-    // Human-facing surface: the extended, git-derived version (`3.6.0+1cd9638-83-dirty`),
-    // never the plain one — a title is read by a person, not parsed by a process.
-    let title = request.window_title(env!("MS_APP_VERSION"));
-
-    // Startup geometry from the `Window` config section: which monitor to open on, plus the
-    // position/size the studio window was left at. Monitors cannot be enumerated before the
-    // window exists (see `window_geometry`'s header), so the placement is derived from the
-    // stored monitor rect alone; the live list is reconciled once the window is up.
-    let window_settings = window_geometry::load_window_settings();
-    let placement = window_geometry::plan_startup_placement(
-        &window_settings,
-        STUDIO_DEFAULT_INNER_SIZE,
-        window_geometry::SizePolicy::RestoreStored,
-    );
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size(STUDIO_DEFAULT_INNER_SIZE)
-        .with_min_inner_size([900.0, 600.0])
-        .with_app_id(window_geometry::identity::MAIN_WINDOW_APP_ID);
-    viewport = window_geometry::apply_placement(viewport, &placement);
-    // Windows keeps the historical workaround: `with_maximized` in the builder leaves the
-    // window unmaximized there, so `StudioBootstrapApp` sends the command on its first frame
-    // instead (it reads the same stored flag).
-    #[cfg(not(target_os = "windows"))]
-    {
-        viewport = viewport.with_maximized(placement.maximized);
-    }
-    if let Some(icon) = window_geometry::identity::app_icon() {
-        viewport = viewport.with_icon(icon);
-    }
-
-    let native_options = eframe::NativeOptions {
-        viewport,
-        // winit cannot build an event loop on Android without the Activity handle.
-        #[cfg(target_os = "android")]
-        android_app: window_geometry::android_app::current(),
-        ..Default::default()
-    };
-
-    let return_to_launcher_flag = Arc::new(AtomicBool::new(false));
-    let flag_for_app = Arc::clone(&return_to_launcher_flag);
-
-    let single_image = request.is_single_image();
-
-    // Start the load before the window opens; the bootstrap shell shows a loading screen
-    // until the receiver yields, then constructs `MangaApp` in place.
-    let load_rx = studio_bootstrap::spawn_open_thread(request, user_settings.clone());
-
-    // eframe decides native vs embedded secondary viewports once per `run_native` (Android:
-    // `General.secondary_windows`, read fresh so a launcher-side change applies here).
-    window_geometry::apply_android_native_window_policy();
-    eframe::run_native(
-        &title,
-        native_options,
-        Box::new(move |cc| {
-            ms_theme::apply(&cc.egui_ctx);
-            // First point in the process where monitors can be listed at all (a second winit
-            // `EventLoop` cannot exist). Publishes them for the settings UI and refreshes the
-            // "largest monitor" fallback the NEXT start places on.
-            window_geometry::refresh_monitors(cc.winit_window().map(std::sync::Arc::as_ref));
-            ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Full);
-            // Global interface scale (`General.ui_scale_percent`): per-`Context`, so the
-            // studio applies it for itself exactly like the launcher does for its window.
-            general_settings_panel::apply_ui_scale_to_context(&cc.egui_ctx);
-            // GPU shader layers (the PS editor's «Коррекция»): needs `cc.gl`, so it can only
-            // happen here; the shell destroys the backend in its `on_exit`.
-            studio_bootstrap::install_shader_layers(cc);
-            Ok(Box::new(studio_bootstrap::StudioBootstrapApp::new(
-                load_rx,
-                single_image,
-                user_settings.clone(),
-                ai_backend.clone(),
-                flag_for_app,
-                cc.egui_ctx.clone(),
-            )))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    if return_to_launcher_flag.load(AtomicOrdering::SeqCst) {
-        Ok(RunResult::ReturnToLauncher)
-    } else {
-        Ok(RunResult::Exit)
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug)]
-#[allow(dead_code)]
-struct ProjectValidationResult {
-    project_dir: PathBuf,
-    state: crate::project_scan::ProjectValidationState,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug)]
-#[allow(dead_code)]
-enum ChooserUiState {
-    Empty,
-    Validating,
-    Ready { image_count: usize },
-    Invalid { message: String },
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-struct BasicLauncherApp {
-    projects_root: PathBuf,
-    titles: Vec<String>,
-    chapters: Vec<String>,
-    selected_title: Option<String>,
-    selected_chapter: Option<String>,
-    state: ChooserUiState,
-    pending_validation: Option<mpsc::Receiver<ProjectValidationResult>>,
-    output_project_dir: Arc<Mutex<Option<PathBuf>>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-impl BasicLauncherApp {
-    fn new(projects_root: PathBuf, output_project_dir: Arc<Mutex<Option<PathBuf>>>) -> Self {
-        let mut app = Self {
-            projects_root,
-            titles: Vec::new(),
-            chapters: Vec::new(),
-            selected_title: None,
-            selected_chapter: None,
-            state: ChooserUiState::Empty,
-            pending_validation: None,
-            output_project_dir,
-        };
-        app.reload_lists();
-        app
-    }
-
-    fn selected_project_dir(&self) -> Option<PathBuf> {
-        let title = self.selected_title.as_ref()?;
-        let chapter = self.selected_chapter.as_ref()?;
-        Some(self.projects_root.join(title).join(chapter))
-    }
-
-    fn reload_lists(&mut self) {
-        self.titles = crate::project_scan::list_titles(&self.projects_root).unwrap_or_default();
-        self.selected_title = self.titles.first().cloned();
-        self.reload_chapters_for_selected_title();
-    }
-
-    fn reload_chapters_for_selected_title(&mut self) {
-        let Some(title) = self.selected_title.clone() else {
-            self.chapters.clear();
-            self.selected_chapter = None;
-            self.state = ChooserUiState::Invalid {
-                message: tf!("startup.basic_launcher.no_titles", arg = self.projects_root.display()),
-            };
-            return;
-        };
-
-        self.chapters = crate::project_scan::list_chapters(&self.projects_root, &title).unwrap_or_default();
-        self.selected_chapter = self.chapters.first().cloned();
-        if let Some(project_dir) = self.selected_project_dir() {
-            self.start_validation(project_dir);
-        } else {
-            self.state = ChooserUiState::Invalid {
-                message: t!("startup.basic_launcher.no_chapters").to_string(),
-            };
-        }
-    }
-
-    fn start_validation(&mut self, project_dir: PathBuf) {
-        let (tx, rx) = mpsc::channel();
-        self.state = ChooserUiState::Validating;
-        self.pending_validation = Some(rx);
-
-        thread::spawn(move || {
-            let state = crate::project_scan::validate_project_dir_for_startup(&project_dir);
-            let _ = tx.send(ProjectValidationResult { project_dir, state });
-        });
-    }
-
-    fn poll_validation(&mut self) {
-        let mut should_clear_receiver = false;
-        if let Some(rx) = &self.pending_validation {
-            match rx.try_recv() {
-                Ok(result) => {
-                    should_clear_receiver = true;
-                    if self.selected_project_dir().as_ref() == Some(&result.project_dir) {
-                        self.state = match result.state {
-                            crate::project_scan::ProjectValidationState::Valid { image_count } => {
-                                ChooserUiState::Ready { image_count }
-                            }
-                            crate::project_scan::ProjectValidationState::Invalid { message } => {
-                                ChooserUiState::Invalid { message }
-                            }
-                        };
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    should_clear_receiver = true;
-                    self.state = ChooserUiState::Invalid {
-                        message: t!("startup.basic_launcher.validation_failed").to_string(),
-                    };
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-
-        if should_clear_receiver {
-            self.pending_validation = None;
-        }
-    }
-
-    fn can_start(&self) -> bool {
-        matches!(self.state, ChooserUiState::Ready { .. }) && self.selected_project_dir().is_some()
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl eframe::App for BasicLauncherApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // egui 0.35: `App::ui` receives the window-root `Ui`. Keep a borrowed `Context` handle
-        // for the context-level `send_viewport_cmd` call inside the panel body below.
-        let ctx = ui.ctx().clone();
-        let ctx = &ctx;
-        self.poll_validation();
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.heading(t!("startup.basic_launcher.heading"));
-                ui.add_space(8.0);
-                ui.label(t!("startup.basic_launcher.hint"));
-                ui.add_space(12.0);
-
-                ui.horizontal(|ui| {
-                    ui.label(t!("startup.basic_launcher.title_label"));
-                    let mut changed_title = false;
-                    WheelComboBox::from_id_salt("basic_launcher_title")
-                        .width(320.0)
-                        .selected_text(self.selected_title.as_deref().unwrap_or("—"))
-                        .show_ui(ui, |ui| {
-                            for title in &self.titles {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.selected_title,
-                                        Some(title.clone()),
-                                        title,
-                                    )
-                                    .changed()
-                                {
-                                    changed_title = true;
-                                }
-                            }
-                        });
-                    if ui.button(t!("startup.basic_launcher.refresh_button")).clicked() {
-                        self.reload_lists();
-                    }
-                    if changed_title {
-                        self.reload_chapters_for_selected_title();
-                    }
-                });
-
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(t!("startup.basic_launcher.chapter_label"));
-                    let mut changed_chapter = false;
-                    WheelComboBox::from_id_salt("basic_launcher_chapter")
-                        .width(320.0)
-                        .selected_text(self.selected_chapter.as_deref().unwrap_or("—"))
-                        .show_ui(ui, |ui| {
-                            for chapter in &self.chapters {
-                                if ui
-                                    .selectable_value(
-                                        &mut self.selected_chapter,
-                                        Some(chapter.clone()),
-                                        chapter,
-                                    )
-                                    .changed()
-                                {
-                                    changed_chapter = true;
-                                }
-                            }
-                        });
-                    if changed_chapter && let Some(project_dir) = self.selected_project_dir() {
-                        self.start_validation(project_dir);
-                    }
-                });
-
-                ui.add_space(10.0);
-                if let Some(path) = self.selected_project_dir() {
-                    ui.monospace(path.display().to_string());
-                } else {
-                    ui.label(t!("startup.basic_launcher.no_chapter_selected"));
-                }
-
-                ui.add_space(8.0);
-                match &self.state {
-                    ChooserUiState::Empty => {
-                        ui.label(t!("startup.basic_launcher.select_title_chapter"));
-                    }
-                    ChooserUiState::Validating => {
-                        ui.label(t!("startup.basic_launcher.validating"));
-                    }
-                    ChooserUiState::Ready { image_count } => {
-                        ui.colored_label(
-                            ms_theme::status::SUCCESS,
-                            tf!("startup.basic_launcher.validation_ok", image_count = image_count),
-                        );
-                    }
-                    ChooserUiState::Invalid { message } => {
-                        ui.colored_label(ms_theme::status::ERROR, message);
-                    }
-                }
-
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let launch_btn =
-                        ui.add_enabled(self.can_start(), egui::Button::new(t!("startup.basic_launcher.open_button")));
-                    if launch_btn.clicked() {
-                        if let Some(path) = self.selected_project_dir()
-                            && let Ok(mut out) = self.output_project_dir.lock()
-                        {
-                            *out = Some(path);
-                        }
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-            });
-        });
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)]
-fn pick_project_dir_from_basic_launcher_gui(
-    projects_root: PathBuf,
-) -> anyhow::Result<Option<PathBuf>> {
-    let selected = Arc::new(Mutex::new(None::<PathBuf>));
-    let out = Arc::clone(&selected);
-
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([620.0, 260.0])
-        .with_min_inner_size([520.0, 220.0])
-        .with_resizable(true)
-        .with_app_id(BASIC_LAUNCHER_WINDOW_APP_ID);
-    if let Some(icon) = window_geometry::identity::app_icon() {
-        viewport = viewport.with_icon(icon);
-    }
-
-    let chooser_options = eframe::NativeOptions {
-        viewport,
-        // winit cannot build an event loop on Android without the Activity handle.
-        #[cfg(target_os = "android")]
-        android_app: window_geometry::android_app::current(),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        t!("startup.basic_launcher.window_title"),
-        chooser_options,
-        Box::new(move |cc| {
-            ms_theme::apply(&cc.egui_ctx);
-            ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Core);
-            Ok(Box::new(BasicLauncherApp::new(
-                projects_root.clone(),
-                Arc::clone(&out),
-            )))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    let selected = selected
-        .lock()
-        .map_err(|_| anyhow::anyhow!("failed to read selected project directory"))?
-        .clone();
-    Ok(selected)
 }
 
 /// Keeps this copy's Linux desktop entry and icon current on a named background thread
@@ -2540,7 +1467,7 @@ mod startup_routing_tests {
     use super::{StartupRoute, StartupRoutingFlags, startup_routing};
 
     fn flags(force_run_installer: bool, ignore_installed: bool) -> StartupRoutingFlags {
-        StartupRoutingFlags { force_update_available: false, force_run_installer, ignore_installed }
+        StartupRoutingFlags { force_run_installer, ignore_installed }
     }
 
     #[test]

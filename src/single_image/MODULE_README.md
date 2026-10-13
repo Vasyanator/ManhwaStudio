@@ -4,7 +4,7 @@
 App-shell half of the single-image mode (plan `dev-docs/single_image_mode_plan.md`, WP-2.4): the
 session controller behind «Сохранить» / «Сохранить как», its two dialogs, and the small rules
 `MangaApp` consults in that mode (visible tabs, window title, save hotkeys). The session itself (the
-scratch chapter, `SessionKind::SingleImage`) is opened by `ms-project` + `studio_bootstrap.rs`; the
+scratch chapter, `SessionKind::SingleImage`) is opened by `ms-project` + `src/shell/studio.rs`; the
 flatten into a file is `ms-tab-typing`'s `*_flatten_to_file` API. This module only sequences them.
 
 It exists as a directory module because `src/app.rs` is over the 5000-line gate (plan D12):
@@ -74,8 +74,8 @@ One save: `Idle -> [ChoosingFormat -> PickingPath] -> [JpegOptions] -> Preparing
 - `tick` MUST run every frame whatever tab is active: it is the app's one `poll_flatten_to_file`
   caller (the typing tab defers project exports until a finished flatten is polled).
 - Every close of a single-image session is a DISCARD quiesce in `app.rs`
-  (`quiesce_writers_discarding`: no flush into the scratch, which `run_main` deletes after the window
-  closed, plan D13). Save-then-close closes only when the write succeeded and the session is still
+  (`quiesce_writers_discarding`: no flush into the scratch, which the shell's teardown worker deletes
+  after the app was dropped, plan D13). Save-then-close closes only when the write succeeded and the session is still
   clean; a cancelled picker / JPEG dialog returns to the exit dialog; a failure keeps the window open
   with the error status. While a write runs the exit dialog only offers «Cancel»; while the native
   «Сохранить как» dialog is open «Не сохранять» is disabled (that dialog cannot be closed from code and
@@ -97,7 +97,7 @@ One save: `Idle -> [ChoosingFormat -> PickingPath] -> [JpegOptions] -> Preparing
   flag) are re-applied, but owner, ACLs and extended attributes are not, and a HARD-LINKED picture is
   detached from its other links (they keep the old bytes).
 - Detached typing workers (mask save, placement save, create renders) are not joined before
-  `run_main` deletes the scratch session; one finishing late can re-create a marker-less directory
+  the shell's teardown worker deletes the scratch session; one finishing late can re-create a marker-less directory
   under the scratch base that the startup sweep never removes (`dev-docs/known_gaps.md` KG-031).
 
 ## Editing map

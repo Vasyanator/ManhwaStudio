@@ -7,7 +7,7 @@ any tab or worker reads it. Re-exported by the binary as `crate::project`
 (`src/lib.rs`).
 
 GUI-free: it produces data for the editor, never widgets. All of its work is blocking
-disk I/O, so it runs on the background load thread (`src/studio_bootstrap.rs`), never
+disk I/O, so it runs on the background load thread (`src/shell/studio.rs`), never
 on the GUI thread.
 
 ## Architecture

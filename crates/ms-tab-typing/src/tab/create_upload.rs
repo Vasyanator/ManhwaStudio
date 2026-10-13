@@ -60,7 +60,7 @@ pub(super) fn shift_drag_capture_layer_id() -> egui::LayerId {
 /// `Context::add_font` resolves a name collision in favour of the FIRST registrant and never
 /// compares bytes (egui-0.35.0/src/context.rs:2066-2074), while a project reload (a structural
 /// page-manager operation, «Перезагрузить проект») rebuilds the whole `MangaApp` — and with it
-/// this layer — INSIDE THE SAME context (`src/studio_bootstrap.rs`). A per-instance sequence
+/// this layer — INSIDE THE SAME context (the main window, `src/shell/`). A per-instance sequence
 /// number therefore re-issues a name the context already holds foreign bytes for, and the editor
 /// silently draws the previous session's typeface.
 ///

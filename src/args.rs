@@ -9,7 +9,6 @@ Main items:
   exclusive with `--project` (clap group `open_target`); `Cli::image_arg` merges the two.
 - `conflicting_image_flags` / `check_image_arg`: the image start's flag-combination rule and its
   path pre-check (missing, directory, not a regular file), run before any window exists.
-- `Cli::clear_open_target`: forgets the CLI open target when the studio returns to the launcher.
 - `Cli.no_ai`: disables AI-dependent functionality at startup.
 - `Cli.update`: opens the Rust update window directly.
 - `Cli.test_launcher`: starts the new Rust launcher test mode instead of the main app.
@@ -206,14 +205,6 @@ impl Cli {
     #[must_use]
     pub fn image_arg(&self) -> Option<&Path> {
         self.image.as_deref().or(self.image_positional.as_deref())
-    }
-
-    /// Forgets the open target given on the command line (`--project`, `--image`, positional
-    /// image), so the next startup-loop iteration shows the launcher instead of re-opening it.
-    pub fn clear_open_target(&mut self) {
-        self.project = None;
-        self.image = None;
-        self.image_positional = None;
     }
 }
 
@@ -435,20 +426,6 @@ mod tests {
             vec!["--check-venv", "--continue-update", "--uninstall"],
             "modes first, then installed-copy flags in table order"
         );
-    }
-
-    #[test]
-    fn clear_open_target_forgets_every_open_target() {
-        let mut cli = parse(&["--image", "/tmp/a.png", "--no-ai"]);
-        cli.clear_open_target();
-        assert!(cli.image_arg().is_none());
-        assert!(cli.no_ai, "flags other than the open target are untouched");
-        let mut cli = parse(&["/tmp/a.png"]);
-        cli.clear_open_target();
-        assert!(cli.image_arg().is_none());
-        let mut cli = parse(&["--project", "/tmp/ch"]);
-        cli.clear_open_target();
-        assert!(cli.project.is_none());
     }
 
     #[test]

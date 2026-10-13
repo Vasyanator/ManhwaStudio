@@ -18,7 +18,7 @@ panel body (ui.rs)  -> CorrectionState ; CorrectionAvailability::check(ctx) -> �
 draw_canvas         -> CorrectionState::active_params()  -> Option<BrightnessContrastParams>
                     -> shader::paint_correction_layer: egui_shader_layers::ShaderLayer over
                        page_rect ∩ canvas rect, chain = presets::brightness_contrast(offset, gain)
-binary (studio_bootstrap) -> install_glow at window creation, destroy_glow in on_exit
+binary (main window, src/shell/) -> install_glow at window creation, destroy_glow in on_exit
 ```
 
 The GPU work is done by the `egui-shader-layers` crate (crates.io, glow backend only): its layer
@@ -65,7 +65,7 @@ states it in testable Rust.
   itself is private to the library and is not re-tested here.
 - **GL lifetime belongs to the library contract.** The binary calls
   `egui_shader_layers::install_glow` once from the eframe app creator (`cc.gl`) and
-  `destroy_glow` from `StudioBootstrapApp::on_exit`; the backend creates its GL objects lazily on
+  `destroy_glow` from the main window's `AppShell::on_exit` (`src/shell/mod.rs`); the backend creates its GL objects lazily on
   the first painted layer. Nothing in this crate may hold GL objects of its own.
 - **Failure is loud.** A missing backend, a failed backend (e.g. WebGL1 / GL < 3.3) or a driver
   rejecting the preset's translated shader makes `CorrectionAvailability::check` true, and the panel then
@@ -91,5 +91,5 @@ states it in testable Rust.
   layer is painted between `draw_composite` and the pixel-grid pass, on a painter clipped to
   `page_rect ∩ canvas rect`.
 - To change backend installation or teardown, see `install_shader_layers` and
-  `StudioBootstrapApp::on_exit` (`src/studio_bootstrap.rs`) and the web app creator in
+  `AppShell::on_exit` (`src/shell/studio.rs`, `src/shell/mod.rs`) and the web app creator in
   `src/web_entry.rs`.

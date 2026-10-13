@@ -651,8 +651,8 @@ mod tests {
     }
 
     /// Nothing in the PROCESS-GLOBAL loader remembers that a family was registered: that
-    /// fact belongs to one `egui::Context`, and this process creates several sequentially
-    /// (the launcher and the studio are separate `eframe::run_native` calls). A global
+    /// fact belongs to one `egui::Context`, and a process may create more than one (the startup
+    /// prompt windows run before the main window; tests build many). A global
     /// memo would make every font of the previous context look permanently unbindable in
     /// the next one — the whole settings font list would fall back to the interface font.
     #[test]

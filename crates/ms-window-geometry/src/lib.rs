@@ -3,7 +3,8 @@ File: crates/ms-window-geometry/src/lib.rs
 
 Purpose:
 Owns WHERE the program's OS window opens and where it is left: the user's primary-monitor
-choice, the last known geometry of the studio window, and the runtime plumbing that keeps
+choice, the last known geometry of the main window (the one window that hosts the launcher and
+the studio), and the runtime plumbing that keeps
 both in `user_config.json`.
 
 Main responsibilities:
@@ -27,8 +28,7 @@ Key functions:
 - `resolve_monitor`, `largest_monitor_index`, `should_relocate`
 - `refresh_monitors`, `monitor_snapshot`, `persist_preferred_monitor`, `request_relocation`
 - `update_window_section`, `persist_geometry`, `spawn_geometry_saver`
-- `apply_android_native_window_policy` (secondary-window setting before `run_native`, Android)
-- `sync_secondary_window_policy` (secondary-window setting onto a live context, Android)
+- `sync_secondary_window_policy` (secondary-window setting onto the live main window, Android)
 - `identity::{app_id, app_icon, with_identity}` (window app id + icon, `identity.rs`)
 
 Notes:
@@ -281,12 +281,12 @@ pub struct WindowSettings {
     /// it is what makes "start on the largest monitor" work before any window exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_monitor: Option<MonitorKey>,
-    /// Last known geometry of the studio window while it was neither maximized, minimized nor
+    /// Last known geometry of the main window while it was neither maximized, minimized nor
     /// fullscreen. Position is the OUTER top-left, size is the INNER size — the pair
     /// `with_position` / `with_inner_size` expect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub main: Option<WindowRect>,
-    /// Whether the studio window was left maximized.
+    /// Whether the main window was left maximized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximized: Option<bool>,
 }
@@ -401,30 +401,6 @@ pub fn load_window_settings() -> WindowSettings {
     }
 }
 
-/// Applies the user's secondary-window setting (`General.secondary_windows`) before a product
-/// `eframe::run_native`; a no-op on every other target than Android.
-///
-/// On Android it reads `user_config` (blocking, but it runs before the window exists), seeds
-/// the live `ms_config::secondary_windows` value and hands it to the forked winit through
-/// `android_app::set_secondary_window_policy`, which eframe consults once per `run_native`. A
-/// read error is logged and leaves both unchanged, so a window still opens. Transitional: once
-/// one persistent window hosts every screen, [`sync_secondary_window_policy`] replaces it.
-pub fn apply_android_native_window_policy() {
-    #[cfg(target_os = "android")]
-    match config::load_raw_user_settings_for_startup() {
-        Ok(settings) => {
-            config::secondary_windows::seed_from_user_settings(&settings);
-            android_app::set_secondary_window_policy(config::secondary_windows::current());
-        }
-        Err(err) => {
-            runtime_log::log_error(format!(
-                "[secondary-windows] failed to read user_config.json for the secondary-window \
-                 setting; keeping the current policy; error={err:#}"
-            ));
-        }
-    }
-}
-
 /// Re-syncs a live window's viewport embedding with the secondary-window `setting`.
 ///
 /// On Android it sets the forked winit's policy (`Separate` -> native windows, `Auto` /
@@ -530,16 +506,6 @@ pub fn resolve_monitor(preferred: Option<&MonitorKey>, monitors: &[MonitorKey]) 
 // Startup placement (pure)
 // ---------------------------------------------------------------------------------------
 
-/// Whether a window restores the stored size or keeps the one its own builder declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SizePolicy {
-    /// The studio window: it owns the persisted geometry and restores it verbatim.
-    RestoreStored,
-    /// Every other window (today: the launcher): it only follows the monitor choice and
-    /// keeps its own size.
-    KeepDefault,
-}
-
 /// Geometry to feed into a `ViewportBuilder` before the window exists.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct StartupPlacement {
@@ -551,12 +517,13 @@ pub struct StartupPlacement {
     pub maximized: bool,
 }
 
-/// Computes the startup geometry from the stored section alone — no monitor enumeration,
-/// because none is possible before the window exists (see the file header).
+/// Computes the main window's startup geometry from the stored section alone — no monitor
+/// enumeration, because none is possible before the window exists (see the file header). The
+/// main window owns the persisted geometry and restores it.
 ///
 /// `default_size` is the window's own inner size in logical pixels, used when centering on a
-/// monitor. Rules, in order:
-/// 1. `RestoreStored` + a stored rect that lies on the target monitor → restore it verbatim.
+/// monitor and nothing is stored. Rules, in order:
+/// 1. A stored rect that lies on the target monitor → restore it verbatim.
 /// 2. A known target monitor → center the window on it (this is what "start on monitor X",
 ///    and "start on the largest monitor" when nothing was chosen, actually does).
 /// 3. Nothing known (first run) → leave placement to the window system.
@@ -564,14 +531,12 @@ pub struct StartupPlacement {
 pub fn plan_startup_placement(
     settings: &WindowSettings,
     default_size: [f32; 2],
-    size_policy: SizePolicy,
 ) -> StartupPlacement {
     let maximized = settings.maximized.unwrap_or(true);
     let target = settings.target_monitor().map(MonitorKey::logical_rect);
     let stored = settings.main.filter(WindowRect::is_sane);
 
-    if size_policy == SizePolicy::RestoreStored
-        && let Some(rect) = stored
+    if let Some(rect) = stored
         && target.is_none_or(|monitor| monitor.contains(rect.center()))
     {
         return StartupPlacement {
@@ -583,10 +548,7 @@ pub fn plan_startup_placement(
 
     // The stored size is still the user's size even when the stored POSITION is stale
     // (the window's monitor went away, or the user picked a different one).
-    let size = match size_policy {
-        SizePolicy::RestoreStored => stored.map_or(default_size, |rect| [rect.w, rect.h]),
-        SizePolicy::KeepDefault => default_size,
-    };
+    let size = stored.map_or(default_size, |rect| [rect.w, rect.h]);
     let position = target.map(|monitor| {
         [
             monitor.x + ((monitor.w - size[0]) * 0.5).max(0.0),
@@ -595,10 +557,7 @@ pub fn plan_startup_placement(
     });
     StartupPlacement {
         position,
-        size: match size_policy {
-            SizePolicy::RestoreStored => stored.map(|rect| [rect.w, rect.h]),
-            SizePolicy::KeepDefault => None,
-        },
+        size: stored.map(|rect| [rect.w, rect.h]),
         maximized,
     }
 }
@@ -607,7 +566,7 @@ pub fn plan_startup_placement(
 ///
 /// [`StartupPlacement::maximized`] is deliberately NOT applied here: Windows needs the
 /// first-frame `ViewportCommand::Maximized` workaround instead of the builder flag
-/// (see `studio_bootstrap.rs`), so each call site decides how to honor it.
+/// (see `src/shell/mod.rs`), so each call site decides how to honor it.
 #[must_use]
 pub fn apply_placement(
     mut builder: egui::ViewportBuilder,
@@ -696,8 +655,8 @@ fn monitor_slot() -> &'static RwLock<Option<MonitorSnapshot>> {
 ///
 /// The UI has no winit window handle, and the move needs a multi-frame un-maximize / move /
 /// re-maximize sequence, so the request is parked here and executed by
-/// [`WindowGeometryTracker`] on its next frame. A window without a tracker (the launcher)
-/// simply never consumes it; the choice still applies at the next start.
+/// [`WindowGeometryTracker`] on its next frame. A window without a tracker simply never consumes
+/// it; the choice still applies at the next start.
 fn relocation_request_slot() -> &'static Mutex<Option<MonitorKey>> {
     static SLOT: OnceLock<Mutex<Option<MonitorKey>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
@@ -712,7 +671,7 @@ pub fn monitor_snapshot() -> Option<MonitorSnapshot> {
         .clone()
 }
 
-/// Asks the studio window to move onto `monitor` as soon as it draws its next frame.
+/// Asks the main window to move onto `monitor` as soon as it draws its next frame.
 pub fn request_relocation(monitor: MonitorKey) {
     *relocation_request_slot()
         .lock()
@@ -1016,9 +975,9 @@ enum RelocationStage {
     Moved { restore_maximized: bool },
 }
 
-/// Observes the live studio window and keeps `user_config.json` in sync with it.
+/// Observes the live main window and keeps `user_config.json` in sync with it.
 ///
-/// Owned by the window's `eframe::App` (today `StudioBootstrapApp`), one per window. All disk
+/// Owned by the window's `eframe::App` (the main window's `AppShell`, `src/shell/mod.rs`), one per window. All disk
 /// work happens on the writer thread; the per-frame path only reads already-computed
 /// `ViewportInfo` values and compares them with the last sample.
 #[derive(Debug)]
@@ -1364,7 +1323,7 @@ mod tests {
             maximized: Some(false),
             ..WindowSettings::default()
         };
-        let placement = plan_startup_placement(&settings, [1400.0, 900.0], SizePolicy::RestoreStored);
+        let placement = plan_startup_placement(&settings, [1400.0, 900.0]);
         assert_eq!(placement.position, Some([2000.0, 100.0]));
         assert_eq!(placement.size, Some([1400.0, 900.0]));
         assert!(!placement.maximized);
@@ -1377,7 +1336,7 @@ mod tests {
             main: Some(rect(4000.0, 100.0, 1400.0, 900.0)),
             ..WindowSettings::default()
         };
-        let placement = plan_startup_placement(&settings, [1400.0, 900.0], SizePolicy::RestoreStored);
+        let placement = plan_startup_placement(&settings, [1400.0, 900.0]);
         assert_eq!(placement.position, Some([(3840.0 - 1400.0) / 2.0, (2160.0 - 900.0) / 2.0]));
         assert_eq!(placement.size, Some([1400.0, 900.0]));
         // Nothing stored about the maximized state -> the historical default (maximized).
@@ -1390,7 +1349,7 @@ mod tests {
             auto_monitor: Some(monitor("DP-1", 1920, 0, 3840, 2160)),
             ..WindowSettings::default()
         };
-        let placement = plan_startup_placement(&settings, [1400.0, 900.0], SizePolicy::RestoreStored);
+        let placement = plan_startup_placement(&settings, [1400.0, 900.0]);
         assert_eq!(
             placement.position,
             Some([1920.0 + (3840.0 - 1400.0) / 2.0, (2160.0 - 900.0) / 2.0])
@@ -1400,29 +1359,10 @@ mod tests {
 
     #[test]
     fn startup_placement_without_any_knowledge_leaves_placement_to_the_window_system() {
-        let placement = plan_startup_placement(
-            &WindowSettings::default(),
-            [1400.0, 900.0],
-            SizePolicy::RestoreStored,
-        );
+        let placement = plan_startup_placement(&WindowSettings::default(), [1400.0, 900.0]);
         assert_eq!(placement.position, None);
         assert_eq!(placement.size, None);
         assert!(placement.maximized);
-    }
-
-    #[test]
-    fn startup_placement_keep_default_only_follows_the_monitor() {
-        let settings = WindowSettings {
-            monitor: Some(monitor("DP-1", 1920, 0, 3840, 2160)),
-            main: Some(rect(2000.0, 100.0, 1400.0, 900.0)),
-            ..WindowSettings::default()
-        };
-        let placement = plan_startup_placement(&settings, [1360.0, 860.0], SizePolicy::KeepDefault);
-        assert_eq!(
-            placement.position,
-            Some([1920.0 + (3840.0 - 1360.0) / 2.0, (2160.0 - 860.0) / 2.0])
-        );
-        assert_eq!(placement.size, None);
     }
 
     #[test]
@@ -1432,7 +1372,7 @@ mod tests {
             main: Some(rect(4000.0, 4000.0, 2000.0, 1500.0)),
             ..WindowSettings::default()
         };
-        let placement = plan_startup_placement(&settings, [1400.0, 900.0], SizePolicy::RestoreStored);
+        let placement = plan_startup_placement(&settings, [1400.0, 900.0]);
         assert_eq!(placement.position, Some([100.0, 50.0]));
     }
 

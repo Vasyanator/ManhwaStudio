@@ -6,8 +6,8 @@ The launcher's style layer and dark styling helpers.
 
 Main responsibilities:
 - build the launcher screen style as a pure layer over `ms_theme::base_style()`
-  (`launcher_style`); `configure_context` installs it through `ms_theme::install`, the only
-  global-style writer;
+  (`launcher_style`); the host window (`src/shell/style.rs`, `web_entry.rs`) installs it through
+  `ms_theme::install`, the only global-style writer;
 - define shared colors, button states, and card surfaces;
 - keep typography helpers and explicit launcher button rendering consistent with launcher.py
   (full-size `launcher_button` and its half-font `launcher_button_small` share one body);
@@ -17,7 +17,7 @@ Main responsibilities:
 
 use egui::style::StyleModifier;
 use egui::{
-    Align, Button, Color32, Context, CornerRadius, Frame, Label, Layout, Margin, Response,
+    Align, Button, Color32, CornerRadius, Frame, Label, Layout, Margin, Response,
     RichText, Stroke, Style, Ui, Vec2,
 };
 
@@ -65,15 +65,6 @@ const SMALL_BUTTON_PADDING: Vec2 = Vec2::new(8.0, 2.0);
 const SMALL_BUTTON_CORNER_RADIUS: u8 = 6;
 /// Size of the action button of a notice banner.
 const NOTICE_BUTTON_SIZE: Vec2 = Vec2::new(130.0, 26.0);
-
-/// Installs the launcher screen style on `ctx`: `ms_theme::install` of
-/// [`launcher_style`] over `ms_theme::base_style()`. The global style is written only by
-/// `ms_theme::install`; this wrapper exists for the launcher window creator and the web entry
-/// and goes away when the shell installs the screen style itself (removal boundary: WP-6 of the
-/// unified-window refactor, which deletes both callers).
-pub fn configure_context(ctx: &Context) {
-    ms_theme::install(ctx, launcher_style(ms_theme::base_style()));
-}
 
 /// The launcher's style layer, a pure function of `base`: launcher spacing, widget fills,
 /// strokes and corner radii, transparent panels and opaque popups. Every `Visuals` field it does
@@ -317,11 +308,11 @@ fn active_button_style(style: &Style) -> Style {
 mod tests {
     use super::{
         BUTTON_FILL, BUTTON_HOVER_EXPANSION, BUTTON_HOVERED, BUTTON_PRESSED, BUTTON_STROKE,
-        CARD_STROKE, COMBO_FILL, COMBO_POPUP_FILL, TEXT_MAIN, configure_context, launcher_style,
+        CARD_STROKE, COMBO_FILL, COMBO_POPUP_FILL, TEXT_MAIN, launcher_style,
     };
     use egui::{Color32, CornerRadius, Stroke, Style};
 
-    /// Frozen reference of the launcher style as `configure_context` produced it before the
+    /// Frozen reference of the launcher style as the former `configure_context` produced it before the
     /// style ownership moved to `ms_theme` (characterization fixture: do NOT "simplify" it into
     /// a call of the production code, it exists to catch drift of that code). Applies the
     /// launcher layer to `style`.
@@ -360,8 +351,8 @@ mod tests {
         style
     }
 
-    /// The style a fresh context reported after `set_theme(Dark)`, which the legacy
-    /// `configure_context` started from: egui's default dark style.
+    /// The style a fresh context reported after `set_theme(Dark)`, which the
+    /// former `configure_context` started from: egui's default dark style.
     fn stock_dark_style() -> Style {
         Style { visuals: egui::Visuals::dark(), ..Default::default() }
     }
@@ -385,22 +376,5 @@ mod tests {
         legacy.visuals.error_fg_color = ms_theme::status::ERROR;
         legacy.visuals.warn_fg_color = ms_theme::status::WARNING;
         assert_eq!(layered, with_formatter_of(legacy, &layered));
-    }
-
-    /// `configure_context` installs exactly the pure layer, regardless of what was installed
-    /// before (the style is replaced wholesale, never inherited), and repeated installs agree.
-    #[test]
-    fn configure_context_installs_the_pure_layer_idempotently() {
-        let ctx = egui::Context::default();
-        let mut foreign = ms_theme::base_style();
-        foreign.spacing.indent = 99.0;
-        ms_theme::install(&ctx, foreign);
-        configure_context(&ctx);
-        let once = ctx.global_style();
-        assert_eq!(*once, with_formatter_of(launcher_style(ms_theme::base_style()), &once));
-        configure_context(&ctx);
-        let twice = ctx.global_style();
-        assert_eq!(*twice, with_formatter_of((*once).clone(), &twice));
-        assert_eq!(ctx.theme(), egui::Theme::Dark);
     }
 }

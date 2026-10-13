@@ -22,13 +22,12 @@ modules render focused launcher workflows and report actions through `PageNavAct
 owns the window (title, size, close, style) and the startup update check, whose result it hands
 in with `set_update_notification`.
 
-`lib.rs` still runs the screen in its own window (`run_launcher`, `run_test_launcher`) through
-the private `LauncherWindow` wrapper. That wrapper is TEMPORARY: it goes when the persistent main
-window (`src/shell/`) hosts the screen.
+The host is the program's main window (`src/shell/` of the root package; the web build's
+`web_entry.rs`): it prepares the entry on a worker, draws the screen, takes its exit and switches
+the same window to the studio. This crate runs no window of its own.
 
 ## Files and submodules
-- `lib.rs`: crate root; re-exports the screen API and keeps the temporary own-window entry
-  points (`run_launcher`, `run_test_launcher`, private `LauncherWindow`).
+- `lib.rs`: crate root; re-exports the screen API.
 - `app.rs`: `LauncherEntry` / `prepare_entry*`, the `LauncherApp` screen (state, worker polling,
   page routing, child viewports, the pending exit); starts and polls the settings-warnings checks
   (see "Settings warnings"). `with_window_identity` stamps every child viewport with the main
@@ -82,7 +81,8 @@ window (`src/shell/`) hosts the screen.
   (`src/tabs/settings/typesetting/font_groups.rs`, the rfd `add_filter` for the font card), even
   though `ag-psd` would read a `.psb` there. Both are scope decisions; widen them only on request.
 - `theme.rs`: the launcher style layer (`launcher_style`, a pure function over
-  `ms_theme::base_style()`; `configure_context` installs it through `ms_theme::install`) and
+  `ms_theme::base_style()`; the host installs it through `ms_theme::install` on every switch to
+  the launcher, `src/shell/style.rs`) and
   visual style helpers, including `notice_banner` (the amber one-action notice used by the open
   page's recovery and chapter-format banners).
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
@@ -132,7 +132,7 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
 - Launcher outcomes are returned to startup flow; the launcher must not spawn a second main app.
 - Long scans, image decoding, probes, downloads, and shell work run on worker threads.
 - Settings changes to the projects root must be propagated to every page/window that caches it.
-- "Open image" exits the launcher with `LauncherOutcome::OpenImage(path)`; `lib.rs` routes it.
+- "Open image" exits the launcher with `LauncherOutcome::OpenImage(path)`; the host routes it.
   The launcher validates only existence and file-ness; decode errors belong to the studio
   loading screen (one owner). wasm has no button and `web_entry.rs` ignores the variant.
 - The launcher never writes the egui global style itself: `ms_theme::install` is the only writer.

@@ -123,6 +123,9 @@ use web_time::{Duration, Instant};
 
 // Blocking teardown (`MangaApp::shutdown_blocking`) and the permanent `MangaApp: Send` guard.
 mod shutdown;
+// Named by the main window's Closing screen (`src/shell/closing.rs`), which runs the teardown.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use shutdown::ShutdownReport;
 
 const DECODE_TILE_SIDE: u32 = 2048;
 const LOADER_QUEUE_CAPACITY: usize = 2;
@@ -325,7 +328,7 @@ pub struct MangaApp {
     page_op_rx: Option<Receiver<Result<PageOpOutcome, String>>>,
     /// Error dialog shown after a failed operation; disk state must be reloaded before editing.
     page_op_error: Option<String>,
-    /// Consumed by `StudioBootstrapApp` to reconstruct this app from disk.
+    /// Consumed by the main window's studio screen (`src/shell/studio.rs`) to reload the chapter from disk.
     pending_project_reload: bool,
     has_unsaved_changes_cached: bool,
     next_unsaved_dir_check_s: f64,
@@ -1602,7 +1605,7 @@ impl MangaApp {
     /// Idempotent (a second call finds the latch set and does nothing).
     ///
     /// A single-image session closes through this ALWAYS (plan D13): its staging is a scratch that
-    /// `run_main` deletes after the window is gone, so nothing may be flushed into it.
+    /// the shell's teardown deletes after this app is dropped, so nothing may be flushed into it.
     fn quiesce_writers_discarding(&mut self) {
         if self.discarding_unsaved_changes {
             return;
@@ -3507,19 +3510,6 @@ impl eframe::App for MangaApp {
                 ctx.request_repaint();
             }
         }
-    }
-
-    /// eframe's shutdown hook: runs the blocking teardown ([`MangaApp::shutdown_blocking`],
-    /// `app/shutdown.rs`) inline and keeps only its logs. Reached only while `MangaApp` is still
-    /// driven as an `eframe::App` (the web build; natively `StudioBootstrapApp` calls
-    /// `shutdown_blocking` itself); delete it once the shell owns teardown (unified-window WP-6).
-    ///
-    /// The GL context is not needed here: the only GL objects the studio owns are the
-    /// `egui-shader-layers` backend's, which `StudioBootstrapApp::on_exit` frees.
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // The report is dropped on purpose: its items are already logged by the teardown and this
-        // hook has no UI left to show them.
-        drop(self.shutdown_blocking());
     }
 }
 

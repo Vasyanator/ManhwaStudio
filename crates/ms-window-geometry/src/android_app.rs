@@ -10,8 +10,8 @@ Key functions:
 - install(): stores the handle of the current Activity (called by `android_main`).
 - current(): a clone of the stored handle for a `NativeOptions` builder.
 - set_secondary_window_policy(): resolves `General.secondary_windows` for Android and hands it
-  to the forked winit's process-global secondary-window policy (called through the crate-root
-  `sync_secondary_window_policy` / `apply_android_native_window_policy`).
+  to the forked winit's process-global secondary-window policy (called by the main window before
+  its `run_native` and through the crate-root `sync_secondary_window_policy` on every switch).
 - native_windows_available(): the fork's runtime gate (policy, bridge, full-screen fallback).
 
 Notes:

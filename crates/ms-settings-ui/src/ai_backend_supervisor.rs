@@ -1,16 +1,15 @@
 /*
-FILE OVERVIEW: src/ai_backend_supervisor.rs
+FILE OVERVIEW: crates/ms-settings-ui/src/ai_backend_supervisor.rs
 App-global supervisor that owns the lifecycle of the single Python AI backend
 process (`ai_backend.py`) and the shared health/device probe.
 
 Why this lives above launcher and studio:
-`run_main()` runs launcher and studio as separate, sequential `eframe::run_native`
-windows. Previously the backend process was owned by the studio's settings tab and
-killed when the studio window closed, so it died on every studio->launcher
-transition and could never be used from the launcher. The supervisor is created
-once in `run_main()` before the launcher/studio loop and shut down only when the
-whole app exits, so the backend persists across transitions and both UIs can drive
-it through a cloneable [`AiBackendHandle`].
+the launcher and the studio are screens of one main window (`src/shell/`) whose screens are
+built and dropped on every switch, and the startup prompt windows run before it. Owned by a
+screen, the backend would die on every studio->launcher switch and could never be used from
+the launcher. The supervisor is created once in `run_main()` before the main window and shut
+down only when the whole app exits, so the backend persists across switches and both UIs
+can drive it through a cloneable [`AiBackendHandle`].
 
 Main types:
 - `AiBackendProcessSnapshot`: thread-safe process state (running/status/logs/autostart).

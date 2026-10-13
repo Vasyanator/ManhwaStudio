@@ -48,7 +48,8 @@ dependency list.
   depend on this crate) and only re-exported here.
 - `storage_mode_job.rs`: the ONE process-wide Dev/Prod conversion job (slot Idle / Pending /
   Running {done,total} / Finished {outcome}). The startup reconciliation (`lib.rs` records it
-  pending; the launcher loop or `studio_bootstrap` starts it) and the General pane's switch
+  pending; the main window starts it when it shows the launcher, or when a direct `--project`
+  start finished loading — `src/shell/`) and the General pane's switch
   both run `ms_project::storage_mode::convert_globals` through it on a named worker
   (`docstore-reconcile` / `docstore-convert`), so two drivers never run at once. The
   Pending -> Running transition of the reconciliation is claimed in one critical section, so a
@@ -64,7 +65,8 @@ dependency list.
 - `general_settings_panel.rs`: projects root, storage mode, memory profile, UI language, UI scale,
   autosave policy (interval + action threshold, live in `ms_config::autosave_policy`), typesetting
   language, startup monitor. Also owns the process-wide UI-scale slot
-  (`ui_scale_percent` / `apply_ui_scale`) every `eframe::run_native` creator applies, and
+  (`ui_scale_percent` / `apply_ui_scale`) the main window's creator applies once (launcher and
+  studio share its `Context`, so a change rescales both), and
   the locale-catalog helpers the launcher's first-run language modal reuses. Its projects-root
   "Browse" button uses the non-blocking `ms_platform::file_dialog` (`PickDirectoryPath`, polled
   each frame) and is drawn only where `PlatformFeature::PersistentDirectoryPicker` is available.

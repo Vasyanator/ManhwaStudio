@@ -29,10 +29,10 @@ surfaces read and write the process-global `ms_text_util::language`, which is th
 single source of truth, so they cannot drift out of sync.
 
 The interface-scale slider is a THIRD kind of setting here: like the UI language it is
-applied live rather than returned in the outcome, but it applies only to the surface
-that renders it, because `Context::set_zoom_factor` is per-`Context` and launcher and
-studio are separate `run_native` windows. The other surface picks the value up at
-startup through `apply_ui_scale_from_user_settings`.
+applied live rather than returned in the outcome: `Context::set_zoom_factor` is
+per-`Context`, and the launcher and the studio are screens of ONE main window sharing one
+`Context`, so a change on either surface rescales both at once. A new window picks the value
+up from the process-global `ui_scale_percent()` through `apply_ui_scale_to_context`.
 
 Key items:
 - `GeneralSettingsPanelState`: per-UI scratch + mirrored persisted values.
@@ -49,8 +49,8 @@ Key items:
   draws no badge and keeps the layout unchanged.
 - `draw_autosave_settings`: the global autosave policy (interval minutes + action
   threshold); applied live to `ms_config::autosave_policy` first, then persisted.
-- `apply_ui_scale` / `apply_ui_scale_from_user_settings`: apply `General.ui_scale_percent`
-  to an egui context (called by each `run_native` constructor closure).
+- `apply_ui_scale` / `apply_ui_scale_to_context`: apply `General.ui_scale_percent`
+  to an egui context (the main window's creator calls the latter once).
 - `draw_text_language_setting`: the shared typesetting-language selector (script group +
   language combos), also called by the studio "Тайп" pane; takes a per-call-site
   `id_salt` prefix so the two rendered instances keep distinct egui ids.

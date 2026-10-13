@@ -502,7 +502,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
     `M >= 0, B >= 0`; contrast pivoted on mid-grey needs a NEGATIVE offset.
   - **Rendered by `egui-shader-layers`** (crates.io, glow backend): a `ShaderLayer` running
     `presets::brightness_contrast`. This crate owns no GL objects; the binary installs the backend
-    at window creation and destroys it in `StudioBootstrapApp::on_exit`. A missing or failed
+    at window creation and destroys it in the main window's `AppShell::on_exit` (`src/shell/mod.rs`). A missing or failed
     backend makes the panel say the correction is unavailable; it never silently draws nothing.
 - **The pixel grid is a PAGE grid, and that is an accepted limitation.** Page px == source px for
   the two base layers, which are permanently identity-transformed (`layers.rs::is_transformable`),

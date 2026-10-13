@@ -1,8 +1,8 @@
 # Module: src
 
 ## Purpose
-The root package `manhwastudio_rs`: a library (`lib.rs`) holding the startup routing, the studio
-window shell, the editor root (`MangaApp`), the `settings/` tab and the crate-shim map, plus the
+The root package `manhwastudio_rs`: a library (`lib.rs`) holding the startup routing, the main
+window (`shell/`: one window hosting the launcher and the studio), the editor root (`MangaApp`), the `settings/` tab and the crate-shim map, plus the
 thin `manhwastudio_rs` binary (`main.rs`) that only calls into it. Everything else — the
 launcher, the installer, the settings UI, the tabs, the canvas, the models, the widgets, the
 config hub — lives in `crates/*`; `lib.rs` re-exports those crates under crate-internal
@@ -17,20 +17,24 @@ The top-level flow is:
 ```text
 main.rs -> lib.rs (native_main / web_main) / args.rs
     -> ms_config (config) + ms_sysprobe (python_manager) + ms_log (runtime_log/trace)
-    -> ms_launcher (launcher) or studio_bootstrap.rs (background ProjectData::load, or the
-       single-image open into a scratch chapter, behind a loading screen)
+    -> startup prompts (installer / missing environment / update: own windows, once)
+    -> shell/ (ONE main window): launcher screen (ms_launcher) <-> studio screen
+       (background ProjectData::load or single-image open behind a loading screen; teardown on
+       a worker behind a Closing screen)
     -> MangaApp
     -> shared models: BubblesModel, CleanOverlaysModel, TextMaskModel, LayerDoc
     -> tabs/* through shared CanvasView + CanvasHooks
     -> background workers and optional Python AI backend
 ```
 
-`lib.rs` owns process startup and hidden service flags. It prepares runtime logging, validates or
-discovers a project, starts installer/update/launcher flows when needed, handles direct `--update`
-entry, custom/existing install update entry, and hidden `--continue-update` continuation into the
-update window, and opens the studio window for an opened chapter. The studio window starts as
-`StudioBootstrapApp` (`studio_bootstrap.rs`), which runs `ProjectData::load*` on a background
-thread behind a loading screen and swaps in `MangaApp` once the project snapshot is ready.
+`lib.rs` owns process startup and hidden service flags. It prepares runtime logging, validates
+the command-line open target, runs the installer / update / missing-environment prompt windows
+once when needed (direct `--update`, custom/existing install update, hidden `--continue-update`
+continuation), then runs the main window (`shell::run`) on the launcher or directly on the CLI
+target, and runs the update window afterwards when the launcher asked for it. The main window
+(`shell/`, see its `MODULE_README.md`) switches between the launcher and the studio in place: its
+studio screen runs `ProjectData::load*` on a background thread behind a loading screen and swaps
+in `MangaApp` once the project snapshot is ready.
 
 `MangaApp` in `app.rs` is the editor root. It creates shared models, wires them into tabs and
 canvas instances, starts one unified background loader pool that decodes source pages and clean
@@ -57,9 +61,9 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - `main.rs`: the binary's process entry only — the Windows `windows_subsystem` attribute and the
   native / wasm32 `fn main`, which call `native_main()` / `web_main()`. Nothing else goes here.
 - `lib.rs`: library root — module tree, crate shims, and the native startup flow behind
-  `native_main()` (startup routing, installer/update service flags, direct update window and
-  update continuation entry, project validation, launcher handoff, direct project opening, and
-  Linux/Windows integration hooks). `native_main` / `web_main` are the library's only public
+  `native_main()` (startup routing `resolve_start`, installer/update service flags, direct update
+  window and update continuation entry, CLI target validation, the one `shell::run`, the
+  launcher-requested update afterwards, and Linux/Windows integration hooks). `native_main` / `web_main` are the library's only public
   items; the shims stay `pub(crate)`, so a shim no call site uses is an unused-import error and
   is removed rather than kept. Platform gates of the startup flow ask `ms_platform::PlatformFeature`:
   `InstalledCopyManagement` (no installer, install prompts, update check or update window
@@ -127,9 +131,12 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   the app-side ordering: "Save / page-op / discard / exit choreography" below). It never closes,
   maximizes or configures the window: a close it decides (exit dialog, save-then-close, launcher
   button, OS close via `request_os_close`) is a `PendingCloseAction` the window host takes with
-  `take_close_request` and performs; `egui::Options` (keyboard zoom off) belong to the host.
+  `take_close_request` and performs; `egui::Options` (keyboard zoom off) belong to the host
+  (`shell/`). `MangaApp` is driven through its `eframe::App::ui` by the shell's studio screen (and
+  by the web entry); it has no `on_exit` of its own.
 - `app/shutdown.rs`: child module of `app` holding `MangaApp::shutdown_blocking() ->
-  ShutdownReport`, the blocking teardown (order: "exit choreography" below; failed layer pages
+  ShutdownReport` (re-exported as `crate::app::ShutdownReport` for the shell's Closing screen),
+  the blocking teardown (order: "exit choreography" below; failed layer pages
   and the bubbles-saver error are logged AND returned), and the permanent compile-time
   `MangaApp: Send` guard (native only), which is why `CleaningTool`, `AiEngine` and `PsTool`
   have a `Send` supertrait: the teardown is meant to run with the app moved onto a worker.
@@ -146,18 +153,16 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - `rotation_ctrl_wheel` (crate `ms-config`): app-wide runtime global for the typing tab's Ctrl+wheel
   rotation mode (Vector/Raster). Lives there only so the config crate can read its default;
   `tabs::typing` re-exports it and remains its conceptual owner (no crate-root shim).
-- `studio_bootstrap.rs`: startup shell for the studio window — opens the window immediately, runs
-  the background project load behind a loading screen (or an error screen with exit/return-to-
-  launcher actions), then swaps in `MangaApp`, delegates `ui` to it, performs the close it
-  requests (`take_close_request`; the OS close goes through `request_os_close` and is cancelled
-  only when the exit dialog opened), and runs `shutdown_blocking` in `on_exit` and before a
-  reload. It turns egui's keyboard zoom off when the editor starts (`zoom_with_keyboard = false`),
-  so the only UI zoom is the interface-scale setting. It also owns
-  the window itself from the first frame, so the `WindowGeometryTracker` (monitor/position/size
-  persistence) and the Windows first-frame maximize workaround live here, as does the window-wide
-  `egui-shader-layers` glow backend (installed from the app creator, destroyed in `on_exit`).
-  `StudioOpenRequest` (project dir, or image + `Arc<SingleImageScratch>`) is what a window opens;
-  it also derives the window title.
+- `shell/`: the main window — ONE `eframe::run_native` (`shell::run`) hosting the launcher and
+  the studio as screens behind a pure transition table (`screen.rs`); launcher entry, studio load
+  and studio teardown on workers (PreparingLauncher / loading / Closing screens); owns geometry
+  (`WindowGeometryTracker`), the Windows first-frame maximize, title, minimum size, fonts, UI
+  scale, the `egui-shader-layers` glow backend, `egui::Options`, the per-screen global style and
+  the root close. `shell/studio.rs` holds `StartupTarget` / `StudioOpenRequest` (project dir, or
+  image + `Arc<SingleImageScratch>`, reserved by the open worker) and the studio screen. See
+  `shell/MODULE_README.md`.
+- `update_check.rs`: the startup check for a newer GitHub release (worker; comparison on
+  `CARGO_PKG_VERSION`), started once by the shell on the first launcher entry.
 - `single_image/`: app-shell half of the single-image mode — `SingleImageController` (one
   `MangaApp` field, `Some` only for `SessionKind::SingleImage`) behind «Сохранить» / «Сохранить как»,
   its pure save state machine, the exit and «Параметры JPEG» dialogs, and the tab filter, window
@@ -360,7 +365,8 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `recover_pending_page_op` is called at the start of `ProjectData::load_internal`. It also
   DECLARES `Page` and `ProjectPaths`, which `ms-project` re-exports — the direction that keeps
   the two crates acyclic. `MangaApp` quiesces all page-indexed writers before dispatching the
-  engine on a worker; `StudioBootstrapApp` then rebuilds a fresh app from disk, never remapping
+  engine on a worker; the shell (`shell/`) then tears the app down on a worker and rebuilds a
+  fresh one from disk, never remapping
   runtime state in place. See `crates/ms-page-ops/src/MODULE_README.md`.
 - `models` (crate `ms-models`, re-exported by `lib.rs`): shared mutable chapter models used across
   tabs and workers, plus `page_view`. See `crates/ms-models/src/MODULE_README.md`.
@@ -402,20 +408,23 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 
 ## Runtime data flow
 Startup first resolves config and runtime paths, initializes logging, handles hidden service flags,
-and either opens a validated project or starts the Rust launcher. The launcher returns a typed
-outcome to startup; it does not start the editor on its own.
+and opens the main window either on a validated project or on the Rust launcher. The launcher
+returns a typed outcome to the main window, which switches to the studio in place; the launcher
+never starts the editor on its own.
 
 Startup routing order in `run_main`: CLI parse -> (Linux desktop integration and the isolated
 backend-socket seed, both decided by `--ignore-installed`) -> Windows service flags -> storage-mode
 probe (`init_storage_mode_at_startup`: the FIRST document access; seeds the docstore default format)
 -> config seeding -> on-disk locale reconcile (`locale_store::reconcile_disk_catalog`, BEFORE
 `load_user_settings_for_startup`) -> UI-locale install / UI-scale / autosave-policy seeding -> `--check-venv` (terminal) -> `--continue-update` ->
-`--update` -> `--test-launcher` -> AI backend supervisor -> open-target resolution
-(`StartupTarget`) -> `StudioOpenRequest` -> studio window -> `StudioOpenRequest::release`.
+`--update` -> `--test-launcher` (the main window in test mode) -> AI backend supervisor ->
+`resolve_start` (CLI `StartupTarget`, or the one-time startup prompts, else the launcher) ->
+`shell::run` (the main window until it closes) -> the launcher-requested update window, if any.
 A pending storage reconciliation (user_config still in the other format than its recorded mode) is
-started on a worker right before the launcher, or — on a direct `--project` or image start — by
-`studio_bootstrap` once the project has loaded (`ms-settings-ui`'s `storage_mode_job`); an
-incomplete reconciliation is surfaced in the studio's top bar (`MangaApp::draw_storage_reconcile_notice`).
+started on a worker whenever the main window enters the launcher, or — on a direct `--project` or
+image start — by the studio screen once the project has loaded (`ms-settings-ui`'s
+`storage_mode_job`); an incomplete reconciliation is surfaced in the studio's top bar
+(`MangaApp::draw_storage_reconcile_notice`).
 
 Before any of that, `reject_conflicting_startup_flags` validates the command line: combining
 `--ignore-installed` with a flag that manages an installed copy (`args::INSTALLED_COPY_FLAGS` —
@@ -439,15 +448,14 @@ Single-image start (plan `dev-docs/single_image_mode_plan.md`, D13): `--image <P
 positional path (what Linux `.desktop` `%f` and Windows "Open with" `"%1"` pass) or the launcher's
 `LauncherOutcome::OpenImage` all become `StartupTarget::Image`. A CLI image skips the launcher
 like `--project`; a missing path, a directory (the message names `--project`) or a non-file shows
-`show_startup_error_dialog` and ends startup. The `run_main` loop then reserves a scratch session
-(`SingleImageScratch::reserve` under `ms_config::single_image::scratch_base()`), OWNS it for the
-window's whole life and deletes it after `run_main_window` returned (no window then, so never on a
-GUI thread); a reservation failure ends a CLI start, or returns a launcher pick to the launcher.
-The load worker runs `open_single_image` (no unsaved detection) and drops its scratch share
-before reporting; an open/decode failure lands on the bootstrap error screen as
-`SingleImageError::user_message` with the usual "Exit to launcher" / "Exit". A single-image
-session refuses the structural-operation reload (logged). `ReturnToLauncher` clears every CLI open
-target. Stale scratch sessions of crashed runs are swept once per start on a worker
+`show_startup_error_dialog` and ends startup. The studio screen's open worker then reserves a
+scratch session (`SingleImageScratch::reserve` under `ms_config::single_image::scratch_base()`)
+and runs `open_single_image` in it (no unsaved detection); the studio screen OWNS the request for
+the session's whole life and the Closing screen's teardown worker deletes the scratch after the app
+was dropped (never on the GUI thread). A reservation failure, like an open/decode failure, lands on
+the studio error screen as `SingleImageError::user_message` with the usual "Exit to launcher" /
+"Exit" (a CLI start therefore exits with code 0). A single-image session refuses the
+structural-operation reload (logged). Stale scratch sessions of crashed runs are swept once per start on a worker
 (`spawn_stale_scratch_sweep`, right after the flag check; lock-guarded, so another live instance
 is safe). The Linux desktop entry is owned by `ms-os-integration` (`linux::desktop_entry` text and
 ownership rule, `linux::xdg` writer); `lib.rs` only runs `ensure_at_startup` for
@@ -476,7 +484,7 @@ Two startup flags change that routing:
   because the supervisor and the IPC client must agree on it without a shared call path.
 
 When a chapter opens, `ProjectData::load` builds the typed project snapshot on a background thread
-while `StudioBootstrapApp` shows a loading screen. `MangaApp::new` then constructs `BubblesModel`,
+while the shell's studio screen (`shell/studio.rs`) shows a loading screen. `MangaApp::new` then constructs `BubblesModel`,
 `CleanOverlaysModel`, `TextMaskModel` and the chapter `LayerDoc` (all `Arc<Mutex<_>>`), shares them with tabs, and starts one unified decode
 pool that interleaves source pages and clean overlays in page order; overlays are applied to
 `CleanOverlaysModel` as they arrive (no in-order promotion), while source pages keep strict
@@ -520,7 +528,7 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   `shutdown_saver_discarding` on the layer saver, pauses the bubbles saver, `request_stop_now` on the
   клин autosave; then staging is deleted on a job that joins that thread.
 - Single-image session (`single_image/`): staging is a scratch that is never merged and that
-  `run_main` deletes after the window closed (plan D13), so EVERY close quiesces the discard way
+  the shell's teardown worker deletes after the app was dropped (plan D13), so EVERY close quiesces the discard way
   and nothing is flushed: «Не сохранять» and a successful save-then-close go through
   `close_single_image_discarding` (quiesce + `finalize_close`, no delete job, клин thread joined in
   `shutdown_blocking`); `shutdown_blocking` itself quiesces first when no dialog did. Dirty is the controller's
@@ -530,7 +538,9 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
 - Failed discard (`abort_discard_after_failed_cleanup`): releases the latch, marks the session
   unsaved, and restarts ALL three writers on the same `AutosaveGate` (`enable_background_saver`,
   `resume_saver_after_failed_discard`, a fresh `OverlayAutosaveControl` + autosave thread).
-- `shutdown_blocking` (`app/shutdown.rs`, called from the host's `on_exit` and before a reload): flush-and-stop the клин autosave (stop-now when discarding) and join it, then (unless discarding) enqueue typing's deferred edits INLINE,
+- `shutdown_blocking` (`app/shutdown.rs`, run by the shell's Closing-screen worker for every leave of
+  the studio — exit, return to the launcher, reload — or inline from the shell's `on_exit` when
+  eframe ended the window with the studio open): flush-and-stop the клин autosave (stop-now when discarding) and join it, then (unless discarding) enqueue typing's deferred edits INLINE,
   then barrier the layer saver and report its failed pages, then shut down layer and bubbles savers.
 
 ## Contracts and invariants
@@ -573,9 +583,12 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   not duplicated canvas state machines.
 - Errors should have user-facing status and diagnostic logging context without secrets or large data
   dumps.
-- Every studio window (and the web launcher→editor swap) installs its theme ONLY through
-  `ms_theme::apply`, never a bare `set_theme`; semantic colours come from `ms-theme` (see
-  `crates/ms-theme/MODULE_README.md`). The launcher keeps its own `crates/ms-launcher/src/theme.rs`.
+- The global style is a pure function of the active screen: the shell (and the web
+  launcher→editor swap) installs it ONLY through `shell::style::apply` (`ms_theme::install` of the
+  launcher layer or the studio base), rebuilt from scratch on every switch; never a bare
+  `set_theme`. The separate prompt windows use `ms_theme::apply`. Semantic colours come from
+  `ms-theme` (see `crates/ms-theme/MODULE_README.md`); the launcher layer is
+  `crates/ms-launcher/src/theme.rs`.
 - Fonts are installed ONLY through `ms_widgets::ui_fonts`, and only with `egui::Context::add_font`.
   `Context::set_fonts` replaces the whole definition set and would drop the families other
   subsystems add at runtime (typing font previews/editors), which then panics in epaint;
@@ -603,7 +616,7 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
     kernels in `crates/ms-tab-cleaning/src/tools/gradient.rs`, the circle rasterizers in `ms-tools`' `mask_brush.rs`,
     the pure leaves of `crates/ms-tab-typing/src/tab/mesh_geometry.rs`, `pack_aside_slots` and
     `reserve_canvas_page_frame` in `canvas/`, `evaluate_bubble_shape`'s scoring internals
-    (`crates/ms-tab-typing/src/auto_typing.rs`), and the `studio_bootstrap.rs` spawns.
+    (`crates/ms-tab-typing/src/auto_typing.rs`), and the `shell/studio.rs` spawns.
   - `TypingExportPageJob` and the render-request structs in `crates/ms-tab-typing/src/tab/render_store.rs`: both
     review pools independently found these already ARE the target pattern. Use them as the model;
     do not "consolidate" them further.
@@ -614,13 +627,14 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
     is legitimate — they are composition roots and a persistence boundary.
 
 ## Editing map
-- Startup, service flags, project-open flow, launcher handoff, or update routing: start in
-  `lib.rs` and `args.rs`.
+- Startup, service flags, the one-time prompts, or update routing: start in `lib.rs` and
+  `args.rs`. Switching between launcher and studio, the window's close policy, loading / Closing
+  screens: `shell/` (its `MODULE_README.md`).
 - Single-image saving, its top bar, exit dialog, hidden tabs and save hotkeys: `single_image/`
   (hooks in `app.rs`: `tab_visible`, `draw_tab_bar`, `draw_exit_dialog`, `ui` tick; `app/shutdown.rs`: the teardown quiesce).
 - Single-image start (CLI, launcher pick, scratch lifetime, desktop entry): `lib.rs`
-  (`resolve_startup_target`, the `run_main` loop), `args.rs`
-  (`open_target` group), `studio_bootstrap.rs` (`StudioOpenRequest`, `spawn_open_thread`); the
+  (`resolve_start`), `args.rs` (`open_target` group), `shell/studio.rs` (`StartupTarget`,
+  `StudioOpenRequest`, `spawn_open_thread`), `shell/closing.rs` (scratch release); the
   desktop entry's text and writer: `crates/ms-os-integration/src/linux/`.
 - What the application reports as its version, or which sites may see the git suffix:
   `crates/ms-config/src/version_format.rs` (the pure rules) + `build.rs` (git probing and rerun
@@ -633,8 +647,8 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   `crates/ms-config/src/lib.rs` (re-exported as `crate::config`).
 - Which monitor a window opens on, restoring/persisting the main window's position, size or
   maximized state, or the primary-monitor selector: crate `ms-window-geometry`. The startup call
-  sites are `lib.rs::run_main_window` and `ms-launcher`'s `lib.rs::run_launcher_internal` (viewport
-  builder), the runtime owner is `studio_bootstrap.rs` (`WindowGeometryTracker`), and the UI is
+  site is `shell/mod.rs::run` (viewport builder), the runtime owner is the shell's `AppShell`
+  (`WindowGeometryTracker`), and the UI is
   the monitor row in `ms-settings-ui`'s `general_settings_panel.rs`.
 - Memory profile, pressure thresholds, budgets, or cache eviction ordering policy:
   crate `ms-memory` (re-exported as `crate::memory_manager`).
@@ -660,9 +674,9 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   sizes) without touching the OS window size. The live value is the process-global
   `ui_scale_percent()`, seeded once in `run_main` (`seed_ui_scale_from_user_settings`) and updated by
   the slider — NOT re-read from the startup `user_settings` snapshot, which `run_main` reuses for
-  every window of the session. Each `run_native` constructor closure that should honor it calls
-  `apply_ui_scale_to_context` next to `ui_fonts::install*` (today: studio `run_main_window` +
-  `launcher::run`); a window that does not call it renders at native size. The shared
+  the main window. The main window's creator (`shell/mod.rs`) calls `apply_ui_scale_to_context`
+  next to `ui_fonts::install` once; launcher and studio share that `Context`, so a change on either
+  settings surface rescales both. A window that does not call it renders at native size. The shared
   typesetting-language selector itself is the public `general_settings_panel::draw_text_language_setting(ui, id_salt)`,
   called by both this widget and the studio "Тайп" pane (`tabs/settings/typesetting/`).
 - Menu-level shared layer for the two settings surfaces (launcher settings page + studio settings
@@ -718,7 +732,8 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
 - Root editor wiring, shared model setup, texture upload budgets, page/overlay loader behavior,
   active tab routing, viewport sync, or global hotkeys: `app.rs`. Studio teardown order or what
   it reports: `app/shutdown.rs`.
-- Studio window startup shell, background project load, loading/error screens: `studio_bootstrap.rs`.
+- The studio screen: background project load, loading/error screens: `shell/studio.rs`; its
+  teardown screen: `shell/closing.rs`.
 - Canvas layout, zoom, scrolling, bubble interaction, overlay runtime, or canvas settings:
   `canvas/`.
 - Shared bubble, clean overlay, or text detector mask state: `models/`.
