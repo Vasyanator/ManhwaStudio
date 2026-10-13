@@ -20,6 +20,10 @@ window entering the stack never covers in its first pass. When the decision diff
 previous pass, the parent file drops keyboard focus (`Memory::stop_text_input`), because egui
 keeps a no-longer-drawn widget focused for one more pass (egui-0.36.2/src/memory/mod.rs:630-637).
 
+Consumers: the launcher (`crates/ms-launcher/src/app.rs`: New Project, PSD import, Wiki guide)
+and New Project's batch-processing child (`crates/ms-launcher/src/new_project/window.rs`,
+`show_children`). See `crates/ms-launcher/src/MODULE_README.md` "Secondary windows".
+
 ## Files and submodules
 - `stack.rs`: `WindowStacks` (per-viewport stacks, parent scope of a running `children` closure,
   per-pass `Decision`), `StackEntry`, and the pure `escape_closes` rule. No `Context`, no drawing;

@@ -79,7 +79,8 @@ pub fn apply(ctx: &egui::Context) {
 ///
 /// The one in-frame exception to "the global style is a function of the active screen": a
 /// separate native window that shares the screen's `Context` but must render its own look while
-/// it draws (New Project, PSD import). Contract: the global style after the call equals the
+/// it draws (reached through `ms_widgets::EmbeddedWindow::content_style`, e.g. New Project and
+/// PSD import in Separate mode). Contract: the global style after the call equals the
 /// style before it. Nesting is allowed and unwinds in LIFO order.
 pub fn with_scoped_global_style<R>(ctx: &egui::Context, style: Arc<egui::Style>, f: impl FnOnce() -> R) -> R {
     // RAII guard held for its drop: restores the captured slots after `f`, even on unwind.

@@ -29,9 +29,10 @@ the same window to the studio. This crate runs no window of its own.
 ## Files and submodules
 - `lib.rs`: crate root; re-exports the screen API.
 - `app.rs`: `LauncherEntry` / `prepare_entry*`, the `LauncherApp` screen (state, worker polling,
-  page routing, child viewports, the pending exit); starts and polls the settings-warnings checks
-  (see "Settings warnings"). `with_window_identity` stamps every child viewport with the main
-  window's app id and icon (`ms_window_geometry::identity`, the one owner of both).
+  page routing, secondary windows, the pending exit); starts and polls the settings-warnings checks
+  (see "Settings warnings"). `with_window_identity` stamps every separate-window viewport
+  (batch processing included) with the main window's app id and icon
+  (`ms_window_geometry::identity`, the one owner of both).
 - `main_page.rs`: central menu (the Settings button carries the overall settings-warning
   corner badge), update notification overlay, AI install-type notices, and the
   storage-mode conversion status line (progress of the process-wide `storage_mode_job`, then a
@@ -50,10 +51,10 @@ the same window to the studio. This crate runs no window of its own.
   `pub(crate)` scan/install/persist helpers; blocks input with the tutorial-engine
   overlay pattern. Edit here to change the modal's detection, preselection, or layout.
 - `pages/`: fullscreen launcher pages for open/import/export/settings flows.
-- `new_project/`: detached new-project workflow. Its ribbon and crop-editor previews are drawn
+- `new_project/`: the New Project window's content (and its batch-processing child window). Its ribbon and crop-editor previews are drawn
   only through `new_project/ribbon.rs` over the `egui-large-image` crate (tiled, budgeted uploads;
   see `new_project/MODULE_README.md`).
-- `psd_import_window.rs`: detached PSD/PSB import workflow. Both formats take the same path:
+- `psd_import_window.rs`: the PSD import window's content (`poll` + `show_content`): PSD/PSB import. Both formats take the same path:
   `ag-psd` tells them apart by the version field in the file header, and the accepted
   extensions live in one place (`is_supported_document_ext`). Plain raster files
   (`is_supported_image_ext`: png/jpg/jpeg/bmp/webp/tif/tiff) found in the same selection,
@@ -87,6 +88,27 @@ the same window to the studio. This crate runs no window of its own.
   page's recovery and chapter-format banners).
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
   match the `mark` calls in `main_page.rs`.
+
+## Secondary windows
+New Project, PSD import and the Wiki guide (and batch processing, a child of New Project) are
+`ms_widgets::EmbeddedWindow`s: the widget alone decides separate OS window vs embedded
+(`embedded_window::effective_mode`) and owns the title strip, stacking and close X. Their open /
+collapsed state is an `EmbeddedWindowState` (`LauncherState::{new_project_window_state,
+psd_import_window_state}`, `LauncherApp::wiki_guide_window`, the New Project state's batch window).
+- **Per pass** (`LauncherApp::show`): `HostPassPlan` from `covers_host` + the first-run modal.
+  Workers (`poll_workers`, and each open window's `poll`) run on EVERY pass. While an embedded
+  window covers the launcher viewport, the launcher draws nothing of its own (main panel, first-run
+  modal, tutorial). The windows are shown every pass in the order New Project (children: batch),
+  PSD import, Wiki guide; they are siblings on one stack, so open order decides the top.
+- **Closing** is the owner's job: on `close_requested` it calls the content's close hook
+  (`NewProjectWindowState::on_window_closed`, which also closes batch) and `state.close()`.
+  A finished save / import that opens a project closes its window too.
+- **Collapse** (embedded only): New Project, PSD import and batch are collapsible; their creator
+  draws the restore button (`main_page.rs` `show_resume_buttons`; for batch, New Project's batch
+  button). The Wiki guide is not collapsible and closes on Escape.
+- **Style:** New Project, PSD import and batch keep the plain dark look through
+  `.content_style(ms_theme::base_style())`, which also covers the `ctx`-level dialogs their
+  content opens (crop editor, auto-review, node menus). The Wiki guide uses the launcher style.
 
 ## Tutorial wiring
 `app.rs` owns a `TutorialController<LauncherState>` (lighter dim so the wallpaper stays visible) and
@@ -136,10 +158,12 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
   The launcher validates only existence and file-ness; decode errors belong to the studio
   loading screen (one owner). wasm has no button and `web_entry.rs` ignores the variant.
 - The launcher never writes the egui global style itself: `ms_theme::install` is the only writer.
-  The New Project and PSD import native windows share the launcher's `Context`, so they render
-  under `ms_theme::with_scoped_global_style(base_style)`, which restores the launcher style
-  exactly; their embedded paths and content panels use `ui.set_style(ms_theme::base_style())`.
-  Status colours (`error_fg` / `warn_fg`) therefore come from `ms_theme::status` here too.
+  New Project, PSD import and batch processing get their plain dark look only through the
+  widget's `content_style` (see "Secondary windows"). Status colours (`error_fg` / `warn_fg`)
+  therefore come from `ms_theme::status` here too.
+- A secondary window is never a hand-written viewport or `egui::Window`: it is an
+  `EmbeddedWindow`, and the launcher never decides separate vs embedded itself (no `cfg`, no
+  `ViewportClass` match).
 - Update notifications are advisory UI state set by the host (`set_update_notification`);
   starting an update exits the launcher with `LauncherOutcome::StartUpdate`.
 - The first-run language modal (`first_run_language.rs`) and the main-menu tutorial are mutually
@@ -160,7 +184,9 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
   installation is untouched.
 - To change what an entry reads or builds before the screen exists, edit `prepare_entry*` in
   `app.rs`; return values live in `state.rs`.
-- To change root polling, page routing, or child-window lifecycle, edit `app.rs`.
+- To change root polling, page routing, or a secondary window's lifecycle (open, close, restore),
+  edit `app.rs` (`draw_*_window`, `HostPassPlan`) and `main_page.rs` (restore buttons); how a
+  window opens or stacks lives in `ms_widgets::embedded_window`.
 - To change the main menu or update notice, edit `main_page.rs`.
 - To change the "Open image" picker, its filter or validation, edit `open_image.rs`; the accepted
   types themselves live in `ms_config::single_image::INPUT_FILE_TYPES`.

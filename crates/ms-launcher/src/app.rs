@@ -23,7 +23,11 @@ Key items:
 - `LauncherApp::{new, show, take_outcome, set_update_notification}`
 
 Notes:
-- every launcher child viewport carries the main window's identity (`with_window_identity`:
+- the secondary windows (New Project with its batch-processing child, PSD import, Wiki guide)
+  are `ms_widgets::EmbeddedWindow`s: one widget decides separate OS window vs embedded, and while
+  an embedded window covers the launcher viewport (`covers_host`) the launcher draws nothing of
+  its own (`HostPassPlan`) but still polls its workers and still shows its windows;
+- every separate-window viewport carries the main window's identity (`with_window_identity`:
   app id + icon from `ms_window_geometry::identity`) so taskbars group it with the main window.
 */
 
@@ -48,8 +52,10 @@ use ms_tabs_simple::wiki::WikiTabState;
 #[cfg(feature = "tutorial")]
 use ms_settings_ui::tutorial::{TutorialController, TutorialId, TutorialProgressHandle, TutorialStep};
 use eframe::egui::{self, epaint};
+use ms_widgets::embedded_window::{self, EmbeddedWindow, EmbeddedWindowState};
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::Receiver;
 use web_time::{Duration, Instant};
 
@@ -60,9 +66,10 @@ const BACKGROUND_TILT_DEGREES: f32 = 4.0;
 const BACKGROUND_FADE_IN_SECS: f32 = 1.0;
 const BACKGROUND_PLACEHOLDER_FILL: egui::Color32 = egui::Color32::TRANSPARENT;
 const BACKGROUND_PLACEHOLDER_STROKE: egui::Color32 = egui::Color32::TRANSPARENT;
-const NEW_PROJECT_VIEWPORT_ID_SALT: &str = "launcher_new_project_window";
-const PSD_IMPORT_VIEWPORT_ID_SALT: &str = "launcher_psd_import_window";
-const WIKI_GUIDE_VIEWPORT_ID_SALT: &str = "launcher_wiki_guide_window";
+/// `EmbeddedWindow` identities (stack entry, content `Ui` and separate viewport): never shown.
+const NEW_PROJECT_WINDOW_ID: &str = "launcher_new_project_window";
+const PSD_IMPORT_WINDOW_ID: &str = "launcher_psd_import_window";
+const WIKI_GUIDE_WINDOW_ID: &str = "launcher_wiki_guide_window";
 
 struct BackgroundSlot {
     path: PathBuf,
@@ -218,8 +225,9 @@ fn keep_first_outcome(slot: &mut Option<LauncherOutcome>, outcome: LauncherOutco
     true
 }
 
-/// Stamps the main window's identity (app id + icon, `ms_window_geometry::identity`) on a
-/// launcher child viewport so the desktop groups it with the main window.
+/// Stamps the main window's identity (app id + icon, `ms_window_geometry::identity`) on the
+/// separate-window viewport of a launcher secondary window (batch processing included) so the
+/// desktop groups it with the main window.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn with_window_identity(builder: egui::ViewportBuilder, test_mode: bool) -> egui::ViewportBuilder {
     ms_window_geometry::identity::with_identity(builder, test_mode)
@@ -241,7 +249,8 @@ pub struct LauncherApp {
     new_project_window: NewProjectWindowState,
     psd_import_window: PsdImportWindowState,
     wiki_guide_tab: WikiTabState,
-    wiki_guide_window_open: bool,
+    /// The Wiki guide window (opened from the New Project window).
+    wiki_guide_window: EmbeddedWindowState,
     open_page: OpenPageState,
     import_page: ImportPageState,
     export_page: ExportPageState,
@@ -280,13 +289,6 @@ pub struct LauncherApp {
     background_column_width: u32,
     background_decode_parallelism: usize,
     background_started_at: Instant,
-    /// On Windows, the new-project child viewport must be maximised on the first rendered
-    /// frame rather than at window creation, to avoid the winit placement bug.
-    #[cfg(target_os = "windows")]
-    new_project_maximize_on_first_frame: bool,
-    /// Same deferred-maximize guard for the PSD-import child viewport.
-    #[cfg(target_os = "windows")]
-    psd_import_maximize_on_first_frame: bool,
 }
 
 impl LauncherApp {
@@ -314,7 +316,7 @@ impl LauncherApp {
             new_project_window,
             psd_import_window: PsdImportWindowState::new(projects_root.clone()),
             wiki_guide_tab: WikiTabState::new(),
-            wiki_guide_window_open: false,
+            wiki_guide_window: EmbeddedWindowState::new(),
             open_page: OpenPageState::new(projects_root.clone(), &user_settings),
             import_page: ImportPageState::new(projects_root.clone()),
             export_page: ExportPageState::new(projects_root.clone()),
@@ -352,10 +354,6 @@ impl LauncherApp {
             background_column_width: 0,
             background_decode_parallelism,
             background_started_at: Instant::now(),
-            #[cfg(target_os = "windows")]
-            new_project_maximize_on_first_frame: true,
-            #[cfg(target_os = "windows")]
-            psd_import_maximize_on_first_frame: true,
         };
         app.pending_plan = Some(background::spawn_background_plan(projects_root));
         app
@@ -773,7 +771,7 @@ impl LauncherApp {
                 self.close_settings_resources_if_leaving(target);
                 self.state.begin_transition(target);
             }
-            PageNavAction::OpenNewProjectWindow => self.state.new_project_window_open = true,
+            PageNavAction::OpenNewProjectWindow => self.state.new_project_window_state.open(ctx),
             PageNavAction::BackToMain => {
                 self.close_settings_resources_if_leaving(LauncherPage::Main);
                 self.state.begin_transition(LauncherPage::Main);
@@ -841,98 +839,59 @@ impl LauncherApp {
         ctx.request_repaint();
     }
 
+    /// Shows the New Project window (with batch processing as its child window) for this pass.
+    /// Its workers are polled on every pass it is open, also while it is covered or collapsed.
     fn draw_new_project_window(&mut self, ui: &mut egui::Ui) {
-        if !self.state.new_project_window_open {
-            // Reset the flag so the window is maximised again the next time it opens.
-            #[cfg(target_os = "windows")]
-            {
-                self.new_project_maximize_on_first_frame = true;
-            }
-            return;
-        }
-
-        // Parent (launcher) context: drives the native child viewport. The embedded web path
-        // renders straight into `ui`.
-        #[cfg(not(target_arch = "wasm32"))]
         let ctx = ui.ctx().clone();
-
-        let mut keep_open;
-
-        // Web: the browser has no separate OS windows, so render the new-project
-        // UI EMBEDDED in the launcher's main viewport (its `show_embedded` path).
-        #[cfg(target_arch = "wasm32")]
-        {
-            keep_open = self.new_project_window.show(ui, egui::ViewportClass::EmbeddedWindow);
+        let test_mode = self.test_mode;
+        if self.state.new_project_window_state.is_open() {
+            self.new_project_window.poll(&ctx);
         }
-
-        // Native: the new-project window is its own OS window (immediate viewport).
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            keep_open = true;
-            let viewport_id = egui::ViewportId::from_hash_of(NEW_PROJECT_VIEWPORT_ID_SALT);
-            let builder = with_window_identity(
-                egui::ViewportBuilder::default()
-                    .with_title(t!("launcher.new_project.window_title"))
-                    .with_inner_size([1180.0, 760.0])
-                    .with_min_inner_size([1000.0, 680.0])
-                    .with_resizable(true)
-                    .with_close_button(true)
-                    .with_minimize_button(true)
-                    .with_maximize_button(true)
-                    .with_active(true),
-                self.test_mode,
-            );
-            // On Linux/macOS the native hint is reliable; on Windows it misplaces the window,
-            // so maximisation is deferred to the first rendered frame via ViewportCommand.
-            #[cfg(not(target_os = "windows"))]
-            let builder = builder.with_maximized(true);
-            ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
-                #[cfg(target_os = "windows")]
-                if self.new_project_maximize_on_first_frame {
-                    self.new_project_maximize_on_first_frame = false;
-                    let ctx = ui.ctx();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-                    ctx.request_repaint();
-                }
-                keep_open = self.new_project_window.show(ui, class);
-            });
-        }
-
-        if let Some(selection) = self.new_project_window.take_open_project_selection() {
-            if let Err(err) = crate::pages::open_page::persist_last_selection_values(
-                &selection.title,
-                &selection.chapter,
-            ) {
-                ms_log::runtime_log::log_warn(format!(
-                    "[launcher-open] failed to persist last selection after save: {err:#}"
-                ));
-            }
-            keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
-            keep_open = false;
-        }
-        if self.new_project_window.take_open_wiki_guide_requested() {
-            self.wiki_guide_window_open = true;
-        }
-        self.state.new_project_window_open = keep_open;
-    }
-
-    fn draw_psd_import_window(&mut self, ui: &mut egui::Ui) {
-        if !self.state.psd_import_window_open {
-            // Reset the flag so the window is maximised again the next time it opens.
-            #[cfg(target_os = "windows")]
-            {
-                self.psd_import_maximize_on_first_frame = true;
-            }
-            return;
-        }
-
-        // Parent (launcher) context: drives the child viewport.
-        let ctx = ui.ctx().clone();
-        let viewport_id = egui::ViewportId::from_hash_of(PSD_IMPORT_VIEWPORT_ID_SALT);
-        let mut keep_open = true;
         let builder = with_window_identity(
             egui::ViewportBuilder::default()
-                .with_title(t!("launcher.psd_import.window_title"))
+                .with_inner_size([1180.0, 760.0])
+                .with_min_inner_size([1000.0, 680.0])
+                .with_resizable(true)
+                .with_close_button(true)
+                .with_minimize_button(true)
+                .with_maximize_button(true)
+                .with_active(true),
+            test_mode,
+        );
+        // `content` and `children` both drive the one window state; the widget runs them one
+        // after the other (never nested), so the two `borrow_mut`s never overlap.
+        let response = {
+            let window = std::cell::RefCell::new(&mut self.new_project_window);
+            EmbeddedWindow::new(NEW_PROJECT_WINDOW_ID, t!("launcher.new_project.window_title"), &mut self.state.new_project_window_state)
+                .viewport(builder)
+                .collapsible(true)
+                .maximize_on_open(true)
+                .content_style(Arc::new(ms_theme::base_style()))
+                .show(ui, |ui| window.borrow_mut().show_content(ui), |ui| window.borrow_mut().show_children(ui, test_mode))
+        };
+
+        if let Some(selection) = self.new_project_window.take_open_project_selection() {
+            if let Err(err) = crate::pages::open_page::persist_last_selection_values(&selection.title, &selection.chapter) {
+                ms_log::runtime_log::log_warn(format!("[launcher-open] failed to persist last selection after save: {err:#}"));
+            }
+            keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
+            self.state.new_project_window_state.close();
+        } else if response.close_requested {
+            self.new_project_window.on_window_closed();
+            self.state.new_project_window_state.close();
+        }
+        if self.new_project_window.take_open_wiki_guide_requested() {
+            self.wiki_guide_window.open(&ctx);
+        }
+    }
+
+    /// Shows the PSD import window for this pass; its workers are polled on every pass it is open.
+    fn draw_psd_import_window(&mut self, ui: &mut egui::Ui) {
+        if self.state.psd_import_window_state.is_open() {
+            self.psd_import_window.poll(ui.ctx());
+        }
+        let builder = with_window_identity(
+            egui::ViewportBuilder::default()
                 .with_inner_size([1360.0, 820.0])
                 .with_min_inner_size([1120.0, 720.0])
                 .with_resizable(true)
@@ -942,91 +901,54 @@ impl LauncherApp {
                 .with_active(true),
             self.test_mode,
         );
-        #[cfg(not(target_os = "windows"))]
-        let builder = builder.with_maximized(true);
-        ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
-            #[cfg(target_os = "windows")]
-            if self.psd_import_maximize_on_first_frame {
-                self.psd_import_maximize_on_first_frame = false;
-                let ctx = ui.ctx();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-                ctx.request_repaint();
-            }
-            keep_open = self.psd_import_window.show(ui, class);
-        });
+        let window = &mut self.psd_import_window;
+        let response = EmbeddedWindow::new(PSD_IMPORT_WINDOW_ID, t!("launcher.psd_import.window_title"), &mut self.state.psd_import_window_state)
+            .viewport(builder)
+            .collapsible(true)
+            .maximize_on_open(true)
+            .content_style(Arc::new(ms_theme::base_style()))
+            .show(ui, |ui| window.show_content(ui), |_| {});
+
         if let Some(selection) = self.psd_import_window.take_open_project_selection() {
-            if let Err(err) = crate::pages::open_page::persist_last_selection_values(
-                &selection.title,
-                &selection.chapter,
-            ) {
-                ms_log::runtime_log::log_warn(format!(
-                    "[launcher-open] failed to persist last selection after psd import: {err:#}"
-                ));
+            if let Err(err) = crate::pages::open_page::persist_last_selection_values(&selection.title, &selection.chapter) {
+                ms_log::runtime_log::log_warn(format!("[launcher-open] failed to persist last selection after psd import: {err:#}"));
             }
             keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
-            keep_open = false;
+            self.state.psd_import_window_state.close();
+        } else if response.close_requested {
+            self.state.psd_import_window_state.close();
         }
-        self.state.psd_import_window_open = keep_open;
     }
 
+    /// Shows the Wiki guide window for this pass (Escape closes it while nothing has focus).
     fn draw_wiki_guide_window(&mut self, ui: &mut egui::Ui) {
-        if !self.wiki_guide_window_open {
-            return;
-        }
-
-        let ctx = ui.ctx().clone();
-        let viewport_id = egui::ViewportId::from_hash_of(WIKI_GUIDE_VIEWPORT_ID_SALT);
-        let mut keep_open = true;
-        ctx.show_viewport_immediate(
-            viewport_id,
-            with_window_identity(
-                egui::ViewportBuilder::default()
-                    .with_title(t!("launcher.wiki_guide.window_title"))
-                    .with_inner_size([980.0, 760.0])
-                    .with_min_inner_size([720.0, 540.0])
-                    .with_resizable(true)
-                    .with_close_button(true)
-                    .with_minimize_button(true)
-                    .with_maximize_button(true)
-                    .with_active(true),
-                self.test_mode,
-            ),
-            |ui, class| {
-                let ctx = ui.ctx().clone();
-                keep_open = !ctx.input(|input| input.viewport().close_requested());
-                ctx.request_repaint_after(Duration::from_millis(100));
-                match class {
-                    // Without multi-window support (wasm, Android) egui wraps this callback in
-                    // a non-collapsible `Window` that has no close button and never reports
-                    // `close_requested` (egui-0.36.2/src/context.rs:4174-4185), so the guide
-                    // supplies its own close path. The guide is drawn straight into that
-                    // wrapper: a `CentralPanel` there would fill the whole root viewport.
-                    egui::ViewportClass::EmbeddedWindow => {
-                        // Escape closes only while no widget holds focus, so it never steals
-                        // the key from a focused search field inside the guide.
-                        let nothing_focused = ctx.memory(|memory| memory.focused().is_none());
-                        if nothing_focused && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
-                            keep_open = false;
-                        }
-                        ui.push_id("launcher.common.close_button", |ui| {
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button(t!("launcher.common.close_button")).clicked() {
-                                    keep_open = false;
-                                }
-                            });
-                        });
-                        ui.separator();
-                        self.wiki_guide_tab.draw(ui);
-                    }
-                    egui::ViewportClass::Root | egui::ViewportClass::Deferred | egui::ViewportClass::Immediate => {
-                        egui::CentralPanel::default().show(ui, |ui| {
-                            self.wiki_guide_tab.draw(ui);
-                        });
-                    }
-                }
-            },
+        let builder = with_window_identity(
+            egui::ViewportBuilder::default()
+                .with_inner_size([980.0, 760.0])
+                .with_min_inner_size([720.0, 540.0])
+                .with_resizable(true)
+                .with_close_button(true)
+                .with_minimize_button(true)
+                .with_maximize_button(true)
+                .with_active(true),
+            self.test_mode,
         );
-        self.wiki_guide_window_open = keep_open;
+        let guide = &mut self.wiki_guide_tab;
+        let response = EmbeddedWindow::new(WIKI_GUIDE_WINDOW_ID, t!("launcher.wiki_guide.window_title"), &mut self.wiki_guide_window)
+            .viewport(builder)
+            .close_on_escape(true)
+            .show(
+                ui,
+                |ui| {
+                    // The guide's scan worker reports through a channel the tab drains while drawing.
+                    ui.ctx().request_repaint_after(Duration::from_millis(100));
+                    guide.draw(ui);
+                },
+                |_| {},
+            );
+        if response.close_requested {
+            self.wiki_guide_window.close();
+        }
     }
 
     fn column_total_height(&self, column: usize) -> Option<f32> {
@@ -1096,7 +1018,49 @@ impl LauncherApp {
         // Derive the `Context` (cheap Arc clone) for worker polling and child windows.
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        let plan = HostPassPlan::new(embedded_window::covers_host(ctx), self.first_run_language.is_some());
 
+        // Workers run on every pass, also while an embedded window covers the launcher.
+        let viewport_rect = ctx.content_rect();
+        let target_width = calc_column_width(viewport_rect.width());
+        if self.background_column_width != target_width {
+            self.background_column_width = target_width;
+            if self.background_plan.is_some() {
+                self.rebuild_background_layout(ctx, target_width, viewport_rect.height());
+            }
+        }
+        self.poll_workers(ctx, target_width, viewport_rect.height());
+
+        if plan.draw_host {
+            self.draw_host(ctx, ui, viewport_rect);
+        }
+
+        // The windows are shown on every pass (a window not shown for a pass drops off its
+        // stack); the widget decides which of them, if any, draws.
+        if plan.show_windows {
+            self.draw_new_project_window(ui);
+            self.draw_psd_import_window(ui);
+            self.draw_wiki_guide_window(ui);
+        }
+
+        // Overlay last so its full-viewport hitbox occludes the page content and
+        // its spotlight/callout sit above everything on the root viewport.
+        #[cfg(feature = "tutorial")]
+        if plan.draw_host {
+            self.tutorial.render(ctx);
+        }
+
+        // Native: smooth 60 FPS. Web: throttle the forced repaint to reduce
+        // sustained GPU load (a WebGL/driver-stability safeguard for the demo).
+        #[cfg(not(target_arch = "wasm32"))]
+        ctx.request_repaint_after(Duration::from_millis(16));
+        #[cfg(target_arch = "wasm32")]
+        ctx.request_repaint_after(Duration::from_millis(50));
+    }
+
+    /// The launcher's own UI for one pass: tutorial tick, background + pages, first-run modal.
+    /// Skipped entirely while an embedded window covers the launcher viewport.
+    fn draw_host(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, viewport_rect: egui::Rect) {
         // Tutorial is gated behind the `tutorial` feature (off by default); the
         // controller and its `mark` sites stay compiled but inert without it.
         #[cfg(feature = "tutorial")]
@@ -1120,32 +1084,12 @@ impl LauncherApp {
             self.tutorial.begin_frame();
         }
 
-        let viewport_rect = ctx.content_rect();
-        // On the web the new-project window renders EMBEDDED in this same viewport
-        // (its own CentralPanel), because the browser has no separate OS windows.
-        // Skip the launcher's own CentralPanel that frame so there is exactly one.
-        #[cfg(target_arch = "wasm32")]
-        let draw_main_panel = !self.state.new_project_window_open;
-        #[cfg(not(target_arch = "wasm32"))]
-        let draw_main_panel = true;
-        if draw_main_panel {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ui, |ui| {
-                    let rect = viewport_rect;
-                    let target_width = calc_column_width(rect.width());
-                    if self.background_column_width != target_width {
-                        self.background_column_width = target_width;
-                        if self.background_plan.is_some() {
-                            self.rebuild_background_layout(ctx, target_width, rect.height());
-                        }
-                    }
-
-                    self.poll_workers(ctx, target_width, rect.height());
-                    self.draw_background(ui, rect);
-                    self.draw_pages(ctx, ui, rect);
-                });
-        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                self.draw_background(ui, viewport_rect);
+                self.draw_pages(ctx, ui, viewport_rect);
+            });
 
         // First-run language modal: rendered above the page content (its blocker
         // occludes all input beneath) and before the child windows. On confirm it
@@ -1167,27 +1111,24 @@ impl LauncherApp {
                 self.tutorial_prev_page = None;
             }
         }
+    }
+}
 
-        // Child viewports are independent native windows the root-viewport blocker
-        // cannot occlude; none can legitimately be open on a true first run, so skip
-        // drawing them entirely while the modal is up — this is a hard guarantee.
-        if self.first_run_language.is_none() {
-            self.draw_new_project_window(ui);
-            self.draw_psd_import_window(ui);
-            self.draw_wiki_guide_window(ui);
-        }
+/// What the launcher host draws in one pass, decided from two facts only (pure, unit-tested).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostPassPlan {
+    /// The launcher's own UI: main panel (background + pages), first-run modal, tutorial.
+    draw_host: bool,
+    /// The launcher's secondary windows (New Project, PSD import, Wiki guide).
+    show_windows: bool,
+}
 
-        // Overlay last so its full-viewport hitbox occludes the page content and
-        // its spotlight/callout sit above everything on the root viewport.
-        #[cfg(feature = "tutorial")]
-        self.tutorial.render(ctx);
-
-        // Native: smooth 60 FPS. Web: throttle the forced repaint to reduce
-        // sustained GPU load (a WebGL/driver-stability safeguard for the demo).
-        #[cfg(not(target_arch = "wasm32"))]
-        ctx.request_repaint_after(Duration::from_millis(16));
-        #[cfg(target_arch = "wasm32")]
-        ctx.request_repaint_after(Duration::from_millis(50));
+impl HostPassPlan {
+    /// `covered`: an embedded window covers the launcher viewport this pass
+    /// (`embedded_window::covers_host`). `first_run_modal_open`: the first-run language modal is
+    /// up; no secondary window can legitimately be open on a true first run, so none is shown.
+    fn new(covered: bool, first_run_modal_open: bool) -> Self {
+        Self { draw_host: !covered, show_windows: !first_run_modal_open }
     }
 }
 
@@ -1275,7 +1216,7 @@ fn rotate_pos(pos: egui::Pos2, center: egui::Pos2, angle_radians: f32) -> egui::
 
 #[cfg(test)]
 mod tests {
-    use super::{fresh_user_settings, keep_first_outcome};
+    use super::{HostPassPlan, fresh_user_settings, keep_first_outcome};
     use crate::state::{LauncherOutcome, OpenProjectSelection};
     use ms_docstore::{DocKind, DocRef};
     use serde_json::{Value, json};
@@ -1336,5 +1277,15 @@ mod tests {
         assert_eq!(slot.take(), Some(open));
         assert_eq!(slot.take(), None);
         assert!(keep_first_outcome(&mut slot, LauncherOutcome::StartUpdate));
+    }
+
+    #[test]
+    fn host_pass_plan_hides_the_host_only_while_covered() {
+        assert_eq!(HostPassPlan::new(false, false), HostPassPlan { draw_host: true, show_windows: true });
+        // Covered: nothing of the launcher draws, but its windows are still shown (the covering
+        // one draws, the others keep their stack places).
+        assert_eq!(HostPassPlan::new(true, false), HostPassPlan { draw_host: false, show_windows: true });
+        // First run: the language modal is part of the host; no window may open over it.
+        assert_eq!(HostPassPlan::new(false, true), HostPassPlan { draw_host: true, show_windows: false });
     }
 }

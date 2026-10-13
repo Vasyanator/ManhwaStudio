@@ -1,13 +1,17 @@
 # Module: crates/ms-launcher/src/new_project
 
 ## Purpose
-Detached "New Project" launcher window. This module gathers source pages, prepares ribbon images,
+Content of the launcher's "New Project" window. This module gathers source pages, prepares ribbon images,
 downloads or imports external chapter content, and saves the resulting project without blocking the
 main launcher UI.
 
 ## Architecture
-UI-facing state lives in `window.rs`. It owns the native/embedded viewport, form state, ribbon
-preview, crop/manual-cut UI, and event polling. Long-running behavior is split into controller
+UI-facing state lives in `window.rs`. The launcher hosts it in an `ms_widgets::EmbeddedWindow`
+(which alone decides separate OS window vs embedded) and calls three entry points per pass:
+`poll` (every worker; on every pass the window is open, also while covered or collapsed),
+`show_content` (form, ribbon preview, crop/manual-cut UI and the window's own dialogs; only while
+the window is visible) and `show_children` (the batch-processing child `EmbeddedWindow`). On a
+user close the launcher calls `on_window_closed`, which also closes batch processing. Long-running behavior is split into controller
 modules that expose `begin`/`poll` style APIs over channels: source import, project catalog/save,
 quick download, advanced Selenium download, stitching, waifu2x, clipboard/screen capture, and
 batch processing.
@@ -27,8 +31,9 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
 (`ai_backend_supervisor::global_handle`) to start it before issuing commands.
 
 ## Files and submodules
-- `mod.rs`: public module map for the detached new-project window.
-- `window.rs`: `NewProjectWindowState`, viewport rendering, left-panel modes, ribbon preview,
+- `mod.rs`: public module map for the new-project window.
+- `window.rs`: `NewProjectWindowState` (`poll` / `show_content` / `show_children` /
+  `on_window_closed`), the batch child window and its one close path `close_batch_window`, left-panel modes, ribbon preview,
   crop/manual cut UI, save forms, controller polling, and open-project handoff after save. The
   ribbon preview's on-screen geometry is decided by two persisted preferences
   (`NewProjectWindow/RibbonUniformWidth`, `NewProjectWindow/RibbonWidthFraction`) resolved through
@@ -66,9 +71,9 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
 - `batch_processing/`: standalone visual graph editor and executor for repeated import/download,
   browser, stitch, waifu2x, and save pipelines. See `batch_processing/MODULE_README.md`.
 - `tutorial.rs`: branching onboarding tour (`TutorialId::NewProject`). `window.rs` owns a
-  `TutorialController<NpTutorialCtx>` rendered in THIS viewport. Because the pipeline triggers are
+  `TutorialController<NpTutorialCtx>` rendered over THIS window's content. Because the pipeline triggers are
   private `&mut self` methods, the tutorial drives them via a command/snapshot context: `on_enter`
-  pushes `NpTutorialCommand`s that `show()` drains into `apply_tutorial_command` after `sync`, and
+  pushes `NpTutorialCommand`s that `show_content()` drains into `apply_tutorial_command` after `sync`, and
   gates read `tutorial_snapshot()` (busy / ribbon-has-pages / waifu-available). The visual branch
   triggers a real test-download → stitch → waifu2x, each step waiting on `!busy`; the explain branch
   only switches the panel mode and highlights sections.
@@ -130,7 +135,8 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   shown in the simplified gallery, edit `reline_models.rs`; to change the simplified controls or
   preset-to-pipeline mapping, edit `show_reline_simple`/`build_reline_simple_options` in
   `window.rs`.
-- To change detached window UI flow or controller wiring, edit `window.rs`.
+- To change the window's UI flow, controller wiring or the batch child window, edit `window.rs`;
+  how it is hosted (title, size, collapse, close) is in `crates/ms-launcher/src/app.rs`.
 - To change how ribbon pages are scaled or how wide the ribbon container is, edit
   `show_ribbon`/`apply_ribbon_resize` in `window.rs`. Every page rect derives from one
   `(width_scale, image_size)` pair, so downstream tile painting, manual-cut guides, page-boundary

@@ -10,6 +10,7 @@ Main responsibilities:
 - show installer-mode notices from `General.ai_install_type` under the main menu;
 - show the storage-mode conversion status line (progress, then a dismissable failure notice);
 - paint the overall settings-warnings level as a corner "!" on the Settings menu button;
+- offer the restore buttons of collapsed secondary windows (New Project, PSD import);
 - offer the native-only small "Open image" button (single-image mode), placed over the
   title -> grid gap without taking layout space, and its picking status;
 - render the central UI card on top of the blur layer with the same button/status composition as launcher.py.
@@ -153,6 +154,7 @@ pub fn show(app: &mut LauncherApp, ui: &mut Ui) -> Option<PageNavAction> {
                     app.state.import_popup_open = false;
                     app.start_open_image_pick();
                 }
+                show_resume_buttons(app, ui);
                 ui.add_space(12.0);
                 let settings_response =
                     menu_button_response(ui, t!("launcher.main.settings_button"), RIGHT_COLUMN_BUTTON_WIDTH);
@@ -391,6 +393,24 @@ fn show_open_image_button(ui: &mut Ui, title_rect: egui::Rect, open_rect: egui::
     theme::launcher_button_small(&mut child, t!("launcher.main.open_image_button"), enabled)
 }
 
+/// Restore buttons of the launcher's collapsed secondary windows (an embedded window that was
+/// collapsed draws nothing until its creator restores it; `ms_widgets::embedded_window`).
+/// Draws nothing while no window is collapsed.
+fn show_resume_buttons(app: &mut LauncherApp, ui: &mut Ui) {
+    if app.state.new_project_window_state.is_collapsed() {
+        ui.add_space(12.0);
+        if menu_button_response(ui, t!("launcher.main.resume_new_project_button"), RIGHT_COLUMN_BUTTON_WIDTH).clicked() {
+            app.state.new_project_window_state.restore(ui.ctx());
+        }
+    }
+    if app.state.psd_import_window_state.is_collapsed() {
+        ui.add_space(12.0);
+        if menu_button_response(ui, t!("launcher.main.resume_psd_import_button"), RIGHT_COLUMN_BUTTON_WIDTH).clicked() {
+            app.state.psd_import_window_state.restore(ui.ctx());
+        }
+    }
+}
+
 /// A main-menu button of the given width. Returns the full `Response` so the
 /// caller can record its rect for the tutorial overlay before consuming clicks.
 fn menu_button_response(ui: &mut Ui, label: &str, width: f32) -> egui::Response {
@@ -451,7 +471,7 @@ fn show_import_popup(
                         {
                             app.state.import_popup_open = false;
                             app.state.main_page_message = None;
-                            app.state.psd_import_window_open = true;
+                            app.state.psd_import_window_state.open(ui.ctx());
                         }
                     });
                 });

@@ -22,8 +22,9 @@ included); it depends on no workspace crate.
   basic project chooser; `src/web_entry.rs` on the launcher→editor swap; the installer's update
   window `crates/ms-installer/src/update.rs`).
 - `with_scoped_global_style(ctx, style, f)` installs `style` for the duration of `f` and then
-  restores the previous slots and preference exactly (same `Arc`s, also on unwind). Used by the
-  launcher's New Project and PSD import native windows, which share the launcher's `Context`.
+  restores the previous slots and preference exactly (same `Arc`s, also on unwind). Reached through
+  `ms_widgets::EmbeddedWindow::content_style` (New Project, PSD import and batch processing),
+  whose separate windows share the launcher's `Context`.
 - Everything else is `const` data plus the checkerboard painter.
 
 ## Files and submodules

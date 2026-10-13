@@ -1,12 +1,16 @@
 /*
-File: src/launcher/new_project/window.rs
+File: crates/ms-launcher/src/new_project/window.rs
 
 Purpose:
-Standalone "New Project" launcher window that mirrors the legacy Python layout.
+Content of the launcher's "New Project" window (mirrors the legacy Python layout). The launcher
+hosts it in a `ms_widgets::EmbeddedWindow`, which decides separate OS window vs embedded.
 
 Main responsibilities:
+- poll every worker on each pass the window is open (`poll`), draw the content and its own
+  dialogs only while the window is visible (`show_content`);
 - render the import/download/stitch/save control column from the Python window;
-- render a separate native egui viewport when supported, with embedded fallback;
+- own batch processing as a child `EmbeddedWindow` (`show_children`; closed with this window,
+  `on_window_closed`);
 - react to ribbon/source events produced by sibling logic modules.
 
 Notes:
@@ -22,7 +26,7 @@ confirmed through the in-app `ConfirmModal` (`overwrite_confirm`).
 
 use egui::{
     Align, Button, CentralPanel, ComboBox, Frame, Layout, ProgressBar, RichText, ScrollArea,
-    Slider, Stroke, TextEdit, TextureHandle, TextureOptions, Ui, ViewportClass, Window,
+    Slider, Stroke, TextEdit, TextureHandle, TextureOptions, Ui, Window,
     WindowLevel,
 };
 use image::{DynamicImage, RgbaImage};
@@ -76,10 +80,15 @@ use ms_sysprobe::paste_image;
 use ms_settings_ui::tutorial::{TutorialController, TutorialId, TutorialProgressHandle, TutorialStep};
 use ms_sysprobe::screen_capture::{self, ScreenRect};
 use ms_widgets::{
-    ArrowStyle, EditableComboBox, GutterItem, MarkedScrollArea, MarkedScrollOutput, ScrollSpan,
-    arrow,
+    ArrowStyle, EditableComboBox, EmbeddedWindow, EmbeddedWindowState, GutterItem, MarkedScrollArea,
+    MarkedScrollOutput, ScrollSpan, arrow,
 };
+use crate::new_project::batch_processing::BatchProcessingWindowState;
 
+/// `EmbeddedWindow` identity of the batch-processing child window: never shown.
+const BATCH_PROCESSING_WINDOW_ID: &str = "launcher_batch_processing_window";
+/// Background of the whole window content (the window's own plain dark look).
+const WINDOW_FILL: egui::Color32 = egui::Color32::from_rgb(24, 24, 27);
 const LEFT_PANEL_WIDTH: f32 = 444.0;
 const SECTION_SPACING: f32 = 14.0;
 const ACTION_BUTTON_SIZE: egui::Vec2 = egui::vec2(170.0, 34.0);
@@ -650,10 +659,11 @@ pub struct NewProjectWindowState {
     /// Save waiting for the overwrite confirmation modal.
     overwrite_confirm: Option<PendingOverwrite>,
     pending_open_wiki_guide: bool,
-    batch_processing_window_open: bool,
-    batch_processing: crate::new_project::batch_processing::BatchProcessingWindowState,
-    /// Onboarding overlay for THIS viewport (its own controller so the overlay
-    /// renders in the new-project window, not the launcher root). Drives the
+    /// The batch-processing window, a child of this one (`show_children`).
+    batch_window: EmbeddedWindowState,
+    batch_processing: BatchProcessingWindowState,
+    /// Onboarding overlay for THIS window (its own controller, rendered by `show_content`, so
+    /// the overlay shows only while the new-project window is visible). Drives the
     /// pipeline via commands drained after `sync` (see `tutorial.rs`). Gated
     /// behind the `tutorial` feature (off by default).
     #[cfg(feature = "tutorial")]
@@ -821,9 +831,8 @@ impl NewProjectWindowState {
             save_folder_dialog: None,
             overwrite_confirm: None,
             pending_open_wiki_guide: false,
-            batch_processing_window_open: false,
-            batch_processing:
-                crate::new_project::batch_processing::BatchProcessingWindowState::new(),
+            batch_window: EmbeddedWindowState::new(),
+            batch_processing: BatchProcessingWindowState::new(),
             #[cfg(feature = "tutorial")]
             tutorial: TutorialController::new(
                 tutorial_progress,
@@ -840,7 +849,7 @@ impl NewProjectWindowState {
     }
 
     /// Execute a tutorial-requested action on the whole window state. Called from
-    /// `show` after `sync` drains the command queue, so `self.tutorial` is no
+    /// `show_content` after `sync` drains the command queue, so `self.tutorial` is no
     /// longer borrowed. Every action is idempotent enough to survive a "Назад"
     /// re-entry (the pipeline triggers self-guard on in-flight ops).
     #[cfg(feature = "tutorial")]
@@ -867,11 +876,10 @@ impl NewProjectWindowState {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, viewport_class: ViewportClass) -> bool {
-        // The viewport callback hands us a `Ui`; derive its `Context` (cheap Arc clone)
-        // so the worker polling, sub-windows and global-style swap below stay unchanged.
-        let ctx_owned = ui.ctx().clone();
-        let ctx = &ctx_owned;
+    /// Polls every worker of the window. The owner calls it on every pass the window is open,
+    /// also while it is covered (by batch processing or the guide) or collapsed, so imports,
+    /// downloads and saves keep progressing.
+    pub fn poll(&mut self, ctx: &egui::Context) {
         self.poll_clipboard_paste();
         self.poll_screen_capture();
         self.maybe_start_pending_screen_capture();
@@ -887,6 +895,32 @@ impl NewProjectWindowState {
         self.poll_waifu2x(ctx);
         self.poll_reline(ctx);
         self.poll_reline_model_catalog(ctx);
+        if self.source_import.is_loading()
+            || self.project_catalog.is_loading()
+            || self.advanced_download.is_loading()
+            || self.quick_download.is_loading()
+            || self.test_chapter_check_rx.is_some()
+            || self.stitch.is_loading()
+            || self.save.is_loading()
+            || self.waifu2x.is_loading()
+            || self.reline.is_loading()
+            || self.clipboard_paste_in_flight
+            || self.screen_capture_overlay.is_some()
+            || self.screen_capture_pending.is_some()
+            || self.screen_capture_in_flight
+            || self.crop_editor.is_some()
+        {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
+    }
+
+    /// Draws the window content into the `Ui` the owner's `EmbeddedWindow` hands out, plus
+    /// the window's own dialogs (crop editor, auto-review, screen-capture overlay, overwrite
+    /// confirmation) and its tutorial overlay. The owner runs it under the plain base style
+    /// (`content_style`), which also covers those `ctx`-level dialogs.
+    pub fn show_content(&mut self, ui: &mut egui::Ui) {
+        let ctx_owned = ui.ctx().clone();
+        let ctx = &ctx_owned;
 
         // --- Tutorial: autoplay on the open edge, then drive one tick. ---
         // The whole tutorial is gated behind the `tutorial` feature (off by
@@ -911,56 +945,47 @@ impl NewProjectWindowState {
             }
         }
 
-        // A native window is its own viewport but shares the launcher's single egui Context,
-        // so its style is global. Render it (and its `ctx`-based sub-windows) under the plain
-        // base style through `ms_theme`'s scoped helper, which restores the previous
-        // (launcher) style exactly afterwards, so it never leaks back and leaves the
-        // launcher's combo boxes / text fields unstyled. The embedded path scopes its style via
-        // `ui.set_style` instead and needs no global change.
-        let mut render = || {
-            let keep_open = match viewport_class {
-                ViewportClass::EmbeddedWindow => self.show_embedded(ctx),
-                _ => self.show_native(ui),
-            };
-            self.show_crop_editor_window(ctx);
-            self.show_advanced_auto_review_window(ctx);
-            self.show_screen_capture_overlay(ctx);
-            self.show_batch_processing_window(ctx);
-            self.show_overwrite_confirm(ctx);
-            if self.source_import.is_loading()
-                || self.project_catalog.is_loading()
-                || self.advanced_download.is_loading()
-                || self.quick_download.is_loading()
-                || self.test_chapter_check_rx.is_some()
-                || self.stitch.is_loading()
-                || self.save.is_loading()
-                || self.waifu2x.is_loading()
-                || self.reline.is_loading()
-                || self.clipboard_paste_in_flight
-                || self.screen_capture_overlay.is_some()
-                || self.screen_capture_pending.is_some()
-                || self.screen_capture_in_flight
-                || self.crop_editor.is_some()
-            {
-                ctx.request_repaint_after(Duration::from_millis(50));
-            }
-            // Overlay last so it draws on top within THIS viewport (its own ctx).
-            #[cfg(feature = "tutorial")]
-            self.tutorial.render(ctx);
+        ui.painter().rect_filled(ui.max_rect(), 0.0, WINDOW_FILL);
+        Frame::new().inner_margin(egui::Margin::same(18)).show(ui, |ui| self.show_contents(ui));
+        self.show_crop_editor_window(ctx);
+        self.show_advanced_auto_review_window(ctx);
+        self.show_screen_capture_overlay(ctx);
+        self.show_overwrite_confirm(ctx);
+        // Overlay last so it draws on top within THIS window.
+        #[cfg(feature = "tutorial")]
+        self.tutorial.render(ctx);
+    }
 
-            if !keep_open {
-                self.handle_window_closed();
-                // Re-arm the open edge so re-opening the window can autoplay again.
-                #[cfg(feature = "tutorial")]
-                {
-                    self.tutorial_first_frame = true;
-                }
-            }
-            keep_open
-        };
-        match viewport_class {
-            ViewportClass::EmbeddedWindow => render(),
-            _ => ms_theme::with_scoped_global_style(ctx, Arc::new(ms_theme::base_style()), render),
+    /// Shows the windows opened FROM this one (batch processing) for this pass; the owner runs
+    /// it as the `children` of the New Project `EmbeddedWindow`, so it runs also while New
+    /// Project is covered or collapsed. `test_mode` (`--test-launcher`) picks the app id the
+    /// separate batch window carries.
+    pub fn show_children(&mut self, ui: &mut egui::Ui, test_mode: bool) {
+        let builder = crate::app::with_window_identity(
+            egui::ViewportBuilder::default().with_inner_size([1200.0, 800.0]).with_min_inner_size([900.0, 600.0]).with_resizable(true),
+            test_mode,
+        );
+        let batch = &mut self.batch_processing;
+        let response = EmbeddedWindow::new(BATCH_PROCESSING_WINDOW_ID, t!("launcher.batch.window_title"), &mut self.batch_window)
+            .viewport(builder)
+            .collapsible(true)
+            .content_style(Arc::new(ms_theme::base_style()))
+            .show(ui, |ui| batch.show_content(ui), |_| {});
+        let close_clicked = response.inner.is_some_and(|outcome| outcome.close_clicked);
+        if close_clicked || response.close_requested {
+            close_batch_window(&mut self.batch_window, &mut self.batch_processing);
+        }
+    }
+
+    /// Releases what belongs to one opening of the window. The owner calls it when the user
+    /// closed the window; it also closes batch processing, a child of this window.
+    pub fn on_window_closed(&mut self) {
+        self.handle_window_closed();
+        close_batch_window(&mut self.batch_window, &mut self.batch_processing);
+        // Re-arm the open edge so re-opening the window can autoplay again.
+        #[cfg(feature = "tutorial")]
+        {
+            self.tutorial_first_frame = true;
         }
     }
 
@@ -983,52 +1008,7 @@ impl NewProjectWindowState {
         self.project_catalog.refresh();
     }
 
-    fn show_native(&mut self, ui: &mut egui::Ui) -> bool {
-        if ui.ctx().input(|input| input.viewport().close_requested()) {
-            return false;
-        }
-
-        CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(24, 24, 27))
-                    .inner_margin(egui::Margin::same(18)),
-            )
-            .show(ui, |ui| {
-                // An immediate viewport's root ui snapshots `ctx.style()` at
-                // creation (the launcher style), so the global-style swap in
-                // `show()` reaches `ctx`-based sub-windows but NOT these panel
-                // widgets. Set this window's dark style directly on the content
-                // ui, mirroring the embedded path, so the launcher theme cannot
-                // leak into the new-project window.
-                ui.set_style(ms_theme::base_style());
-                self.show_contents(ui, false);
-            });
-        true
-    }
-
-    fn show_embedded(&mut self, ctx: &egui::Context) -> bool {
-        let mut keep_open = true;
-        Window::new(t!("launcher.new_project.window_title")).id(egui::Id::new("launcher.new_project.window_title"))
-            .open(&mut keep_open)
-            .default_size(egui::vec2(1180.0, 760.0))
-            .min_width(1000.0)
-            .min_height(680.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                ui.scope(|ui| {
-                    ui.set_style(ms_theme::base_style());
-                    self.show_contents(ui, true);
-                });
-            });
-        keep_open
-    }
-
-    fn show_contents(&mut self, ui: &mut Ui, embedded: bool) {
-        if embedded {
-            ui.add_space(4.0);
-        }
-
+    fn show_contents(&mut self, ui: &mut Ui) {
         ui.columns(2, |columns| {
             columns[0].set_width(LEFT_PANEL_WIDTH);
             self.show_left_panel(&mut columns[0]);
@@ -1063,15 +1043,15 @@ impl NewProjectWindowState {
                     self.pending_open_wiki_guide = true;
                 }
             });
-            if button_sized(
-                ui,
-                t!("launcher.new_project.batch_processing_button"),
-                egui::vec2(LEFT_PANEL_WIDTH - 4.0, 34.0),
-                true,
-            )
-            .clicked()
-            {
-                self.batch_processing_window_open = true;
+            // A collapsed batch window draws nothing until restored: this button is its
+            // restore button then (`open` also restores).
+            let batch_label = if self.batch_window.is_collapsed() {
+                t!("launcher.new_project.resume_batch_button")
+            } else {
+                t!("launcher.new_project.batch_processing_button")
+            };
+            if button_sized(ui, batch_label, egui::vec2(LEFT_PANEL_WIDTH - 4.0, 34.0), true).clicked() {
+                self.batch_window.open(ui.ctx());
             }
             ui.add_space(10.0);
             self.show_left_panel_mode_tabs(ui);
@@ -6946,26 +6926,15 @@ impl NewProjectWindowState {
                 )),
         );
     }
+}
 
-    fn show_batch_processing_window(&mut self, ctx: &egui::Context) {
-        if !self.batch_processing_window_open {
-            return;
-        }
-        let viewport_id = egui::ViewportId::from_hash_of("launcher_batch_processing_window");
-        let builder = egui::ViewportBuilder::default()
-            .with_title(t!("launcher.batch.window_title"))
-            .with_inner_size([1200.0, 800.0])
-            .with_min_inner_size([900.0, 600.0])
-            .with_resizable(true);
-        ctx.show_viewport_immediate(viewport_id, builder, |ui, _class| {
-            let ctx = ui.ctx().clone();
-            let out = self.batch_processing.show_content(ui);
-            if out.close_clicked || ctx.input(|input| input.viewport().close_requested()) {
-                self.batch_processing.on_window_closed();
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                self.batch_processing_window_open = false;
-            }
-        });
+/// Closes the batch-processing window (if open) and drops what its opening started
+/// (`on_window_closed`). Every close path goes through here: its X / toolbar Close, and the
+/// close of its parent New Project window.
+fn close_batch_window(window: &mut EmbeddedWindowState, batch: &mut BatchProcessingWindowState) {
+    if window.is_open() {
+        window.close();
+        batch.on_window_closed();
     }
 }
 
@@ -8372,9 +8341,57 @@ mod macos_capture_bounds_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        RIBBON_MIN_WIDTH_FRACTION, clamp_ribbon_width_fraction, needs_overwrite_confirm,
-        ribbon_page_display_size, ribbon_page_left_inset, ribbon_scale_base_px,
+        BatchProcessingWindowState, RIBBON_MIN_WIDTH_FRACTION, clamp_ribbon_width_fraction, close_batch_window,
+        needs_overwrite_confirm, ribbon_page_display_size, ribbon_page_left_inset, ribbon_scale_base_px,
     };
+    use ms_widgets::embedded_window::covers_host;
+    use ms_widgets::{EmbeddedWindow, EmbeddedWindowState};
+
+    /// One headless pass of a host showing a parent window whose child is the batch window.
+    /// Returns whether the host was covered. The first pass's font-atlas delta is never applied
+    /// without a renderer, so it is cleared (epaint panics when an unapplied delta is dropped).
+    fn parent_with_batch_pass(ctx: &egui::Context, parent: &mut EmbeddedWindowState, batch: &mut EmbeddedWindowState) -> bool {
+        let mut covered = false;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            covered = covers_host(ui.ctx());
+            EmbeddedWindow::new("test.new_project", "New project", &mut *parent).show(
+                ui,
+                |_| {},
+                |ui| {
+                    EmbeddedWindow::new("test.new_project.batch", "Batch", &mut *batch).show(ui, |_| {}, |_| {});
+                },
+            );
+        })
+        .textures_delta
+        .clear();
+        covered
+    }
+
+    #[test]
+    fn closing_new_project_closes_its_batch_window() {
+        // `Context::default()` embeds every window, so both stack on the root viewport.
+        let ctx = egui::Context::default();
+        let mut parent = EmbeddedWindowState::new();
+        let mut batch_window = EmbeddedWindowState::new();
+        let mut batch = BatchProcessingWindowState::new();
+        parent.open(&ctx);
+        batch_window.open(&ctx);
+        for _ in 0..3 {
+            parent_with_batch_pass(&ctx, &mut parent, &mut batch_window);
+        }
+        assert!(parent_with_batch_pass(&ctx, &mut parent, &mut batch_window));
+
+        // The parent's close path (`on_window_closed`) closes the batch window too.
+        close_batch_window(&mut batch_window, &mut batch);
+        parent.close();
+        assert!(!batch_window.is_open());
+        parent_with_batch_pass(&ctx, &mut parent, &mut batch_window);
+        assert!(!parent_with_batch_pass(&ctx, &mut parent, &mut batch_window), "nothing covers the host once both are closed");
+
+        // Closing an already closed batch window is a no-op.
+        close_batch_window(&mut batch_window, &mut batch);
+        assert!(!batch_window.is_open());
+    }
 
     /// Points of slack allowed when comparing derived layout sizes.
     const EPS: f32 = 0.001;

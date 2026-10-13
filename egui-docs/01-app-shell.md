@@ -260,10 +260,9 @@ size). A screen switch later sends `ViewportCommand::Title` (egui-0.36.2/src/vie
 `ms_widgets::EmbeddedWindow`** (`crates/ms-widgets/src/embedded_window.rs`), never a hand-written
 `show_viewport_immediate`: the widget opens the same content either as a separate OS window or
 embedded in the window it came from (§5.1). The raw viewport API below is what the widget and the
-panel dock's sub-windows are built on. Launcher call sites not yet migrated to the widget
-(`crates/ms-launcher/src/app.rs` `draw_new_project_window` / `draw_psd_import_window` /
-`draw_wiki_guide_window`, `crates/ms-launcher/src/new_project/window.rs` batch processing) are not
-a precedent.
+panel dock's sub-windows are built on. Consumers: `crates/ms-launcher/src/app.rs`
+(`draw_new_project_window` / `draw_psd_import_window` / `draw_wiki_guide_window`) and
+`crates/ms-launcher/src/new_project/window.rs` (`show_children`: batch processing).
 
 Pattern underneath: a stable `ViewportId`, a `ViewportBuilder`, and
 `Context::show_viewport_immediate` (egui-0.36.2/src/context.rs:4116). The child ui callback receives
@@ -391,10 +390,11 @@ viewport command (`crates/ms-widgets/src/embedded_window.rs`, `show_separate`, a
   like `ui.style_mut()`, applies to that subtree only — that stays allowed.
 * **Scoped exception:** `ms_theme::with_scoped_global_style(ctx, Arc<Style>, f)` installs a style
   for the duration of `f` and restores the previous `Arc`s and preference exactly (also on
-  unwind). It exists for a separate native window that shares the screen's `Context` but must
-  render its own look (the launcher's New Project and PSD import windows). An immediate
-  viewport's root `Ui` snapshots the style at creation, so those windows also `ui.set_style` their
-  content `Ui`.
+  unwind). It exists for a secondary window that shares the screen's `Context` but must render
+  its own look, and is reached only through `EmbeddedWindow::content_style` (the launcher's New
+  Project, PSD import and batch-processing windows): the widget runs the content under the scoped
+  style AND `ui.set_style`s the content `Ui`, because an immediate viewport's root `Ui` snapshots
+  the style at creation.
 * `Style: PartialEq` (egui-0.36.2/src/style.rs:241) compares `number_formatter` by `Arc` pointer
   (style.rs:57-61): two independently built styles are never equal.
 * `combo_popup_style()` (`crates/ms-launcher/src/theme.rs`) returns a `StyleModifier` for

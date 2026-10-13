@@ -8,7 +8,8 @@ Main responsibilities:
 - define launcher pages up front;
 - keep small page-independent labels used by the main menu UI;
 - hold non-blocking page transition state for animated page navigation;
-- track detached launcher windows that live outside the page stack.
+- own the open / collapsed state of the launcher's secondary windows (New Project, PSD import;
+  `ms_widgets::EmbeddedWindowState`).
 - carry launcher exit intent back to the startup flow;
 - carry the process facts the launcher needs from startup (`LauncherHost`);
 - remember which storage-conversion failure notice the main page already dismissed.
@@ -17,6 +18,7 @@ Main responsibilities:
 */
 
 use crate::pages::base::PageTransition;
+use ms_widgets::EmbeddedWindowState;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,8 +74,10 @@ pub struct LauncherHost {
 pub struct LauncherState {
     pub current_page: LauncherPage,
     pub page_transition: Option<PageTransition>,
-    pub new_project_window_open: bool,
-    pub psd_import_window_open: bool,
+    /// The New Project window (open while collapsed too).
+    pub new_project_window_state: EmbeddedWindowState,
+    /// The PSD import window (open while collapsed too).
+    pub psd_import_window_state: EmbeddedWindowState,
     pub import_popup_open: bool,
     pub main_page_message: Option<String>,
     pub footer_label: String,
@@ -87,8 +91,8 @@ impl LauncherState {
         Self {
             current_page: LauncherPage::Main,
             page_transition: None,
-            new_project_window_open: false,
-            psd_import_window_open: false,
+            new_project_window_state: EmbeddedWindowState::new(),
+            psd_import_window_state: EmbeddedWindowState::new(),
             import_popup_open: false,
             main_page_message: None,
             footer_label: t!("launcher.about.credits").to_string(),
@@ -98,11 +102,11 @@ impl LauncherState {
 
     /// Whether a surface that can create the projects folder is open: the Import page (an
     /// archive import creates `{root}/{title}`), the new-project window or the PSD-import
-    /// window (both save a title under the root). `LauncherApp` rechecks the projects-folder
+    /// window (both save a title under the root; a collapsed window is still open). `LauncherApp` rechecks the projects-folder
     /// warning when this turns false.
     #[must_use]
     pub fn project_creator_open(&self) -> bool {
-        self.current_page == LauncherPage::ImportChapter || self.new_project_window_open || self.psd_import_window_open
+        self.current_page == LauncherPage::ImportChapter || self.new_project_window_state.is_open() || self.psd_import_window_state.is_open()
     }
 
     pub fn begin_transition(&mut self, target: LauncherPage) {
@@ -130,16 +134,21 @@ mod tests {
 
     #[test]
     fn project_creator_open_covers_import_page_and_creating_windows() {
+        let ctx = egui::Context::default();
         let mut state = LauncherState::new();
         assert!(!state.project_creator_open());
         state.current_page = LauncherPage::ImportChapter;
         assert!(state.project_creator_open());
         state.current_page = LauncherPage::Settings;
         assert!(!state.project_creator_open());
-        state.new_project_window_open = true;
+        state.new_project_window_state.open(&ctx);
         assert!(state.project_creator_open());
-        state.new_project_window_open = false;
-        state.psd_import_window_open = true;
+        state.new_project_window_state.collapse();
+        assert!(state.project_creator_open(), "a collapsed window is still open");
+        state.new_project_window_state.close();
+        state.psd_import_window_state.open(&ctx);
         assert!(state.project_creator_open());
+        state.psd_import_window_state.close();
+        assert!(!state.project_creator_open());
     }
 }

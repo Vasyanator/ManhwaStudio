@@ -2,7 +2,10 @@
 File: src/launcher/psd_import_window.rs
 
 Purpose:
-Detached egui window for importing simple Photoshop layers into launcher projects.
+Content of the launcher's PSD import window (hosted by `ms_widgets::EmbeddedWindow` in
+`app.rs`, which decides separate OS window vs embedded) for importing simple Photoshop layers
+into launcher projects: `poll` runs every pass the window is open, `show_content` only while
+it is visible.
 
 Main responsibilities:
 - render a dark-themed import UI with layer mapping and preview;
@@ -60,7 +63,7 @@ use ms_widgets::EditableComboBox;
 use egui::{
     self, Align, Button, CentralPanel, Color32, ColorImage, ComboBox, Context, Frame, Grid, Id,
     Layout, Panel, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions,
-    Ui, ViewportClass,
+    Ui,
 };
 use ag_psd::psd::{Layer, PixelData, ReadOptions};
 use ag_psd::read_psd;
@@ -88,6 +91,8 @@ const ACTION_BUTTON_SIZE: egui::Vec2 = egui::vec2(176.0, 36.0);
 const SIDE_PANEL_MIN_WIDTH: f32 = 340.0;
 const SIDE_PANEL_MAX_WIDTH: f32 = 470.0;
 const PREVIEW_MIN_WIDTH: f32 = 420.0;
+/// Background of the whole window content (the window's own plain dark look).
+const WINDOW_FILL: Color32 = Color32::from_rgb(24, 24, 27);
 const PREVIEW_BACKGROUND: Color32 = Color32::from_rgb(18, 18, 20);
 const ERROR_COLOR: Color32 = Color32::from_rgb(214, 104, 104);
 const SUCCESS_COLOR: Color32 = Color32::from_rgb(72, 170, 102);
@@ -422,11 +427,9 @@ impl PsdImportWindowState {
         state
     }
 
-    pub fn show(&mut self, ui: &mut Ui, viewport_class: ViewportClass) -> bool {
-        // The viewport callback hands us a `Ui`; derive its `Context` (cheap Arc clone)
-        // for worker polling, repaint scheduling and the global-style swap below.
-        let ctx_owned = ui.ctx().clone();
-        let ctx = &ctx_owned;
+    /// Polls the window's workers (catalog, picker, scan, preview, import). The owner calls it
+    /// on every pass the window is open, also while it is covered or collapsed.
+    pub fn poll(&mut self, ctx: &Context) {
         self.poll_catalog(ctx);
         self.poll_pick();
         self.poll_scan(ctx);
@@ -436,15 +439,14 @@ impl PsdImportWindowState {
         if self.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
+    }
 
-        match viewport_class {
-            ViewportClass::EmbeddedWindow => self.show_embedded(ctx),
-            // A native window is its own viewport but shares the launcher's single egui Context,
-            // so its style is global. Render it under the plain base style through `ms_theme`'s
-            // scoped helper, which restores the previous (launcher) style exactly afterwards, so
-            // it never leaks back and leaves the launcher's combo boxes / text fields unstyled.
-            _ => ms_theme::with_scoped_global_style(ctx, Arc::new(ms_theme::base_style()), || self.show_native(ui)),
-        }
+    /// Draws the window content into the `Ui` the owner's `EmbeddedWindow` hands out (already
+    /// under the plain base style). Closing is the owner's decision; this window keeps its
+    /// state across openings.
+    pub fn show_content(&mut self, ui: &mut Ui) {
+        ui.painter().rect_filled(ui.max_rect(), 0.0, WINDOW_FILL);
+        self.show_contents(ui);
     }
 
     pub fn take_open_project_selection(&mut self) -> Option<OpenProjectSelection> {
@@ -460,39 +462,6 @@ impl PsdImportWindowState {
         };
         self.catalog_error = None;
         self.catalog.refresh();
-    }
-
-    fn show_native(&mut self, ui: &mut Ui) -> bool {
-        if ui.ctx().input(|input| input.viewport().close_requested()) {
-            return false;
-        }
-        CentralPanel::default()
-            .frame(Frame::new().fill(Color32::from_rgb(24, 24, 27)))
-            .show(ui, |ui| {
-                // An immediate viewport's root ui snapshots `ctx.style()` at
-                // creation (the launcher style), so the global-style swap in
-                // `show()` does not reach these panel widgets. Set this window's
-                // dark style directly on the content ui (mirroring the embedded
-                // path) so the launcher theme cannot leak in.
-                ui.set_style(ms_theme::base_style());
-                self.show_contents(ui);
-            });
-        true
-    }
-
-    fn show_embedded(&mut self, ctx: &Context) -> bool {
-        let mut keep_open = true;
-        egui::Window::new(t!("launcher.psd_import.window_title"))
-            .id(egui::Id::new("launcher.psd_import.window_title"))
-            .open(&mut keep_open)
-            .default_size(egui::vec2(1360.0, 820.0))
-            .min_width(1120.0)
-            .min_height(720.0)
-            .show(ctx, |ui| {
-                ui.set_style(ms_theme::base_style());
-                self.show_contents(ui);
-            });
-        keep_open
     }
 
     fn show_contents(&mut self, ui: &mut Ui) {
