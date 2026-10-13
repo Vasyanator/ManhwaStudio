@@ -81,6 +81,7 @@ Public surface is `crates/ms-widgets/src/lib.rs:43-72`; the module contract is
 | `paint_marquee_galley` | `crates/ms-widgets/src/marquee.rs` | Paint-only label helper: a single-line galley clipped to a rect; when it overflows it scrolls like a web marquee (rest, scroll, rest, jump back) and repaints only while overflowing and visible. Use for a fixed-width custom-painted button whose label may not fit (launcher settings sidebar). |
 | `MarkedScrollArea` | `crates/ms-widgets/src/marked_scroll/` | Vertical scroll area with marks painted on the bar and a gutter of items left of it (§4). |
 | `PanelTab` + `CollapsiblePanel` | `crates/ms-widgets/src/panel_dock/` | The **only** way to make a floating panel (§0.1). Declared per frame through `PanelDock`, never constructed directly. Owns collapse, docking, resize, persistence and tear-off into an OS window. |
+| `EmbeddedWindow` (+ `EmbeddedWindowState`, `effective_mode`, `covers_host`) | `crates/ms-widgets/src/embedded_window.rs` | The **only** way to open a secondary window (New Project, PSD import, Wiki guide, batch processing): a separate OS window or, embedded, a frameless full-viewport window with a title strip (close X, optional collapse) that stacks per viewport — only the top one draws, the host checks `covers_host` and draws nothing while covered. Not for panels (dock) and not for transient dialogs (`egui::Window`). Contract: `01-app-shell.md` §5.1. |
 
 ## 2. `wheel_input_guard.rs` — the process-global popup guard
 

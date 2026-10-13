@@ -17,7 +17,7 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 ## Crate boundary
 `ms-widgets` is the reusable UI-primitive layer of the workspace. It knows NOTHING about the
 project domain: it may depend on `ms-config`, `ms-log`, `ms-i18n`, `ms-text-util`, `ms-sysprobe`,
-`ms-gifs`, `ms-thread` and `ms-fonts` (the last one native-only), and it may NOT depend on
+`ms-gifs`, `ms-thread`, `ms-theme` and `ms-fonts` (the last one native-only), and it may NOT depend on
 `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the canvas, the tabs and the
 launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its
 crate-root leaves as `crate::ui_fonts`, `crate::bubble_status` and
@@ -146,7 +146,20 @@ crate's `[dev-dependencies]`, so no production build carries them.
   self-versioned `PanelLayout` section of `user_config.json` and `PanelLayoutWriter`, its handle on
   the shared `config_saver::ConfigSaver` writer thread, which the application feeds from
   `PanelDockState::take_dirty_layouts`; it is the only file of the subsystem that reaches the disk,
-  and the debounce/retry policy behind it lives in `crates/ms-config/src/config_saver.rs`. Sub-windows are a later phase.
+  and the debounce/retry policy behind it lives in `crates/ms-config/src/config_saver.rs`. `window.rs`
+  owns the panels detached into OS sub-windows (immediate child viewports).
+- `embedded_window.rs` + `embedded_window/`: `EmbeddedWindow`, a secondary window (New Project,
+  PSD import, the Wiki guide, batch processing) shown EITHER as a separate OS window (immediate
+  viewport) OR embedded over the whole viewport it was opened in: no frame, a title strip (title,
+  optional collapse button, close X), the content below. `effective_mode(ctx)` is the one
+  Separate/Embedded decision (`ms_config::secondary_windows::requested_mode()` plus
+  `ctx.embed_viewports()`, which forces Embedded). Embedded windows STACK per viewport
+  (`embedded_window/stack.rs`, pure, one `WindowStacks` per `Context` in egui temp data): only the
+  topmost non-collapsed window draws; the windows below it and the host draw nothing, and the
+  host learns that from `covers_host(ctx)` before drawing. `show(ui, content, children)` runs
+  `children` (the windows opened FROM this one) on every open pass, also while covered or
+  collapsed. Collapsed windows are restored by a button their CREATOR draws. Detail:
+  `embedded_window/MODULE_README.md`.
 - `autocomplete_line.rs`: single-line text input with inline completion and a popup suggestion
   list. Matching is SEGMENT-based, not whole-line: a query segment is any suffix of the text
   before the caret that starts at a word/punctuation boundary (`-` and `'` are not boundaries —
@@ -423,6 +436,14 @@ crate's `[dev-dependencies]`, so no production build carries them.
 - `paint_marquee_galley` never allocates space or senses input, and schedules a repaint
   (`request_repaint_after`: the remaining pause, or one ~16 ms frame while moving) ONLY while the
   text overflows and its rect is visible; text that fits costs no repaint.
+- `EmbeddedWindow` in Embedded mode never calls the viewport API (egui would wrap the content in a
+  floating `egui::Window`). Per viewport and pass, at most one embedded window draws: the covering
+  window is decided once per pass, so a window opened in pass P first draws in P+1 and a close /
+  collapse / restore shows in the next pass. Its content `Ui` id is `Id::new((window id,
+  "content"))` in both modes, so content state survives covering and mode switches; per-viewport
+  egui memory (areas, focus, popups) does not. `close_requested` is a report: the caller closes
+  the state or vetoes. A host that is covered must skip all of its own drawing and hotkeys but
+  keep polling workers and keep calling `show` on its windows.
 - `WheelComboBox::from_label` seeds the widget id from the label text. When the label is localized
   (`t!("…")`), chain `.id_salt("stable_key")` so the id stays language-independent
   (`docs/i18n_exclusions.md` §C); user-visible widget labels are localized through `ms-i18n`, but
@@ -432,6 +453,8 @@ crate's `[dev-dependencies]`, so no production build carries them.
 - To add a reusable widget, create a focused source file and re-export its public type in
   `lib.rs`.
 - To change spellcheck behavior, edit `spellchecked_line.rs`.
+- To change secondary-window chrome, stacking or the Separate/Embedded decision, edit
+  `embedded_window.rs` (drawing, modes) or `embedded_window/stack.rs` (pure stack rules).
 - To change wheel consumption behavior, edit `wheel_input_guard.rs` and the specific `wheel_*`
   wrapper.
 - To change text styling/highlight layout, edit `text_edit_plus.rs` and verify wrapped lines and

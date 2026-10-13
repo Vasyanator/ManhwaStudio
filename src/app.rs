@@ -36,6 +36,9 @@ App/frame flow:
 - `new`: also starts shared AI-backend health probe and wires it into Settings/Translation tabs.
 - `ui` (eframe::App, egui 0.35): frame tick (poll workers, draw active tab, dispatch hotkeys).
 - `dispatch_hotkeys` + `execute_hotkey_command`: execute `InputManagerV2` commands.
+- Close: `finalize_close` / `request_os_close` record a `PendingCloseAction` that the window
+  host takes with `take_close_request`; `MangaApp` never sends a root `Close`, never maximizes
+  and never touches `egui::Options`. Teardown: `shutdown_blocking` in `app/shutdown.rs`.
 
 Hotkeys:
 - Translation canvas zoom/edit commands + panel toggles (`P/O/K/M/D` by default).
@@ -45,7 +48,7 @@ Hotkeys:
 Single-image mode:
 - Hooks only (the file is over the 5000-line gate): `single_image` controller field, `tab_visible`,
   the top-bar and exit-dialog branches, the per-frame `tick`, `quiesce_writers_discarding` /
-  `close_single_image_discarding` and the `on_exit` quiesce. Logic lives in `src/single_image/`.
+  `close_single_image_discarding` and the `shutdown_blocking` quiesce. Logic lives in `src/single_image/`.
 
 Profiling (optional, behind the `profiling` cargo feature):
 - `ui` is instrumented with coarse `puffin::profile_scope!` markers around the heavy
@@ -117,6 +120,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use web_time::{Duration, Instant};
+
+// Blocking teardown (`MangaApp::shutdown_blocking`) and the permanent `MangaApp: Send` guard.
+mod shutdown;
 
 const DECODE_TILE_SIDE: u32 = 2048;
 const LOADER_QUEUE_CAPACITY: usize = 2;
@@ -196,7 +202,7 @@ pub struct MangaApp {
     /// pool so it can throttle how far ahead it decodes (see `DECODE_AHEAD_WINDOW`). Mirrors
     /// `next_decode_idx_to_enqueue`; updated whenever promotion advances it.
     decode_promotion_progress: Arc<AtomicUsize>,
-    /// Raised in `on_exit` to release decode workers parked on the look-ahead window. Without
+    /// Raised in `shutdown_blocking` to release decode workers parked on the look-ahead window. Without
     /// it, returning to the launcher mid-load freezes the promotion frontier and any parked
     /// worker (plus the pool-joining spawner thread) would spin/block forever, leaking threads
     /// on every launcher<->studio round-trip during a load.
@@ -324,7 +330,7 @@ pub struct MangaApp {
     has_unsaved_changes_cached: bool,
     next_unsaved_dir_check_s: f64,
     /// Latched by `start_exit_cleanup`: the user chose to DISCARD the unsaved chapter and the staging
-    /// dir is being deleted. While it is set every remaining persistence path goes quiet — `on_exit`
+    /// dir is being deleted. While it is set every remaining persistence path goes quiet — `shutdown_blocking`
     /// must not flush (it would re-create the deleted staging dir with the discarded edits) and
     /// `refresh_unsaved_changes_cache` must not re-latch (it would re-open the exit dialog).
     ///
@@ -332,19 +338,15 @@ pub struct MangaApp {
     /// cleanup (that branch dispatches the window close in the same call, so the few remaining frames
     /// must stay quiet), but a FAILED cleanup hands control back to a still-running app, and
     /// `poll_pending_exit_cleanup` must then clear it via `abort_discard_after_failed_cleanup` — left
-    /// set, it would silence the unsaved-changes prompt and the `on_exit` text flush for the rest of
+    /// set, it would silence the unsaved-changes prompt and the `shutdown_blocking` text flush for the rest of
     /// the session.
     discarding_unsaved_changes: bool,
     /// Save controller of a single-image session (`crate::single_image`); `None` in a project session.
     /// Owns «Сохранить» / «Сохранить как», the dirty baseline and the JPEG options dialog.
     single_image: Option<crate::single_image::SingleImageController>,
-    /// Windows can misplace a maximized root window when maximize is requested at native creation.
-    #[cfg(target_os = "windows")]
-    maximize_root_window_on_first_frame: bool,
-    /// When true the app closes and signals main to reopen the launcher.
-    return_to_launcher: bool,
-    /// Shared flag written before the window closes so that `run_main_window` can detect it.
-    return_to_launcher_flag: Arc<AtomicBool>,
+    /// The close this session decided on (exit, or back to the launcher), waiting for the window
+    /// host to take it (`take_close_request`). `MangaApp` never closes the window itself.
+    close_request: Option<PendingCloseAction>,
     /// Whether the puffin_egui frame-profiler window is shown. Compiled in only under the
     /// `profiling` feature; defaults to on so the profiler is visible immediately, and can be
     /// toggled at runtime with F11.
@@ -367,6 +369,29 @@ enum ExitDialogKind {
 pub(crate) enum PendingCloseAction {
     Exit,
     ReturnToLauncher,
+}
+
+/// What an OS close-button press does to a running session ([`MangaApp::request_os_close`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsCloseDecision {
+    /// A close is already decided this frame; keep it.
+    KeepPending,
+    /// Unsaved work and no exit dialog yet: ask save / discard / cancel first.
+    OpenExitDialog,
+    /// Nothing to ask (no unsaved work, or the exit dialog is already open): exit.
+    Exit,
+}
+
+/// Pure core of [`MangaApp::request_os_close`]. A second OS close while the exit dialog is open
+/// exits without asking again, as the dialog-less close always did.
+fn os_close_decision(close_pending: bool, has_unsaved_changes: bool, exit_dialog_open: bool) -> OsCloseDecision {
+    if close_pending {
+        OsCloseDecision::KeepPending
+    } else if has_unsaved_changes && !exit_dialog_open {
+        OsCloseDecision::OpenExitDialog
+    } else {
+        OsCloseDecision::Exit
+    }
 }
 
 struct PendingExitCleanup {
@@ -463,11 +488,7 @@ struct UploadTask {
 }
 
 impl MangaApp {
-    pub fn new(
-        project: ProjectData,
-        ai_backend: AiBackendHandle,
-        return_to_launcher_flag: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(project: ProjectData, ai_backend: AiBackendHandle) -> Self {
         let ai_enabled = ai_backend.ai_enabled;
         // Enable puffin scope recording once at editor startup. Without this the
         // `profile_scope!` markers are no-ops and the profiler window stays empty.
@@ -483,13 +504,13 @@ impl MangaApp {
             crate::config::memory_profile_from_user_settings(&user_settings),
         ));
         // Per-tab canvas bottom-hint collapsed state, seeded once from `user_config` (absent =>
-        // expanded). Read back on exit and persisted via `on_exit`; not saved on every toggle.
+        // expanded). Read back on exit and persisted via `shutdown_blocking`; not saved on every toggle.
         let translation_hint_collapsed =
             hint_collapsed_from_user_settings(&user_settings, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY);
         let typing_hint_collapsed =
             hint_collapsed_from_user_settings(&user_settings, CANVAS_TYPING_HINT_COLLAPSED_KEY);
         // Persisted centering-assist checkboxes, seeded once from `user_config` (absent => assist off,
-        // marker shown). Read back on exit and persisted via `on_exit`; not saved on every toggle. The
+        // marker shown). Read back on exit and persisted via `shutdown_blocking`; not saved on every toggle. The
         // bound-center KIND stays session-only.
         let typing_centering_assist_enabled = text_tab_bool_from_user_settings(
             &user_settings,
@@ -824,10 +845,7 @@ impl MangaApp {
             next_unsaved_dir_check_s: 0.0,
             discarding_unsaved_changes: false,
             single_image,
-            #[cfg(target_os = "windows")]
-            maximize_root_window_on_first_frame: true,
-            return_to_launcher: false,
-            return_to_launcher_flag,
+            close_request: None,
             #[cfg(feature = "profiling")]
             profiler_window_open: true,
         }
@@ -876,7 +894,7 @@ impl MangaApp {
     /// the handle already and joins it in the delete job.
     ///
     /// Blocks for the final pass (one PNG encode per dirty page), or for a save-to-project merge
-    /// that still holds a pause. That is acceptable only from `on_exit`, the same class as the
+    /// that still holds a pause. That is acceptable only from `shutdown_blocking`, the same class as the
     /// layer-saver barrier there; structural operations transfer the handle to their worker.
     fn stop_overlay_autosave(&mut self) {
         if self.discarding_unsaved_changes {
@@ -1580,7 +1598,7 @@ impl MangaApp {
     /// The writer half of a DISCARD: latches `discarding_unsaved_changes`, drops typing's deferred
     /// edits, shuts the layer saver down without writing (joined), pauses the bubbles saver and tells
     /// the клин autosave to stop without writing. The клин thread handle is left in place: the
-    /// project discard hands it to its delete job, every other caller lets `on_exit` join it.
+    /// project discard hands it to its delete job, every other caller lets `shutdown_blocking` join it.
     /// Idempotent (a second call finds the latch set and does nothing).
     ///
     /// A single-image session closes through this ALWAYS (plan D13): its staging is a scratch that
@@ -1589,7 +1607,7 @@ impl MangaApp {
         if self.discarding_unsaved_changes {
             return;
         }
-        // This is the DISCARD path: latch it before anything else. `on_exit` must not flush after this
+        // This is the DISCARD path: latch it before anything else. `shutdown_blocking` must not flush after this
         // (its typing flush would re-create the staging dir being deleted, with the very edits the user
         // discarded), and `refresh_unsaved_changes_cache` must stop recomputing (a re-latch would
         // re-open the exit dialog and make discard-and-exit impossible).
@@ -1624,19 +1642,19 @@ impl MangaApp {
             .pause_saver_for_page_op();
         // Stop the клин autosave without writing (discard). The project discard joins it on the delete
         // job before the delete (left running, a pass could re-create the staging dir after its
-        // removal); otherwise `on_exit` joins it.
+        // removal); otherwise `shutdown_blocking` joins it.
         self.overlay_autosave_control.request_stop_now();
     }
 
     /// Closes a single-image session without writing the file: abandons a save that has not started
     /// writing, quiesces every writer the discard way (D13) and runs `action`.
-    fn close_single_image_discarding(&mut self, ctx: &egui::Context, action: PendingCloseAction) {
+    fn close_single_image_discarding(&mut self, action: PendingCloseAction) {
         if let Some(controller) = self.single_image.as_mut() {
             controller.abandon_pending();
         }
         self.quiesce_writers_discarding();
         self.exit_dialog = None;
-        self.finalize_close(ctx, action);
+        self.finalize_close(action);
     }
 
     /// Un-latches the DISCARD path after its staging cleanup FAILED, handing a coherent state back to
@@ -1646,7 +1664,7 @@ impl MangaApp {
     /// the assumption that the process ends moments later. When the cleanup fails instead, that
     /// assumption is void and the latch becomes a permanent lie: `refresh_unsaved_changes_cache` would
     /// pin `has_unsaved_changes_cached` to false forever (no unsaved-changes prompt on any later close)
-    /// and `on_exit` would skip the typing text flush for the rest of the session, so every later
+    /// and `shutdown_blocking` would skip the typing text flush for the rest of the session, so every later
     /// deferred edit would be dropped without a word.
     ///
     /// The session is re-reported as UNSAVED rather than recomputed. The discard did not complete, so
@@ -1691,10 +1709,10 @@ impl MangaApp {
 
     /// Acts on the end of a single-image save-then-close: close the discard way (the file is
     /// written), or show the exit dialog for the same action again.
-    fn apply_single_image_outcome(&mut self, ctx: &egui::Context, outcome: Option<crate::single_image::SaveOutcome>) {
+    fn apply_single_image_outcome(&mut self, outcome: Option<crate::single_image::SaveOutcome>) {
         match outcome {
             None => {}
-            Some(crate::single_image::SaveOutcome::CloseNow(action)) => self.close_single_image_discarding(ctx, action),
+            Some(crate::single_image::SaveOutcome::CloseNow(action)) => self.close_single_image_discarding(action),
             Some(crate::single_image::SaveOutcome::ReturnToExitDialog(action)) => {
                 self.exit_dialog = Some(match action {
                     PendingCloseAction::Exit => ExitDialogKind::WindowClose,
@@ -1704,21 +1722,34 @@ impl MangaApp {
         }
     }
 
-    fn finalize_close(&mut self, ctx: &egui::Context, action: PendingCloseAction) {
-        match action {
-            PendingCloseAction::Exit => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    /// Records that the session may now close with `action`; the window host acts on it through
+    /// [`MangaApp::take_close_request`]. A later decision in the same frame replaces an earlier one.
+    fn finalize_close(&mut self, action: PendingCloseAction) {
+        self.close_request = Some(action);
+    }
+
+    /// Takes the close this session decided on, if any. The window host polls it after every
+    /// frame and performs the close (or the return to the launcher); `None` means keep running.
+    pub(crate) fn take_close_request(&mut self) -> Option<PendingCloseAction> {
+        self.close_request.take()
+    }
+
+    /// Handles the OS close button (the root window's `close_requested`). The caller has already
+    /// cancelled the OS close: with unsaved work and no exit dialog open this opens the dialog
+    /// (the save-then-close flow then ends in a close request); otherwise it requests
+    /// [`PendingCloseAction::Exit`]. A close request already pending this frame is kept as is.
+    pub(crate) fn request_os_close(&mut self) {
+        match os_close_decision(self.close_request.is_some(), self.has_unsaved_changes(), self.exit_dialog.is_some()) {
+            OsCloseDecision::KeepPending => {}
+            OsCloseDecision::OpenExitDialog => {
+                self.pending_save_completion_action = Some(PendingCloseAction::Exit);
+                self.exit_dialog = Some(ExitDialogKind::WindowClose);
             }
-            PendingCloseAction::ReturnToLauncher => {
-                self.return_to_launcher = true;
-                self.return_to_launcher_flag
-                    .store(true, AtomicOrdering::SeqCst);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+            OsCloseDecision::Exit => self.finalize_close(PendingCloseAction::Exit),
         }
     }
 
-    fn poll_pending_exit_cleanup(&mut self, ctx: &egui::Context, now: f64) {
+    fn poll_pending_exit_cleanup(&mut self, now: f64) {
         let Some(cleanup) = self.pending_exit_cleanup.as_ref() else {
             return;
         };
@@ -1736,7 +1767,7 @@ impl MangaApp {
                 self.has_unsaved_changes_cached = false;
                 self.save_to_project_status = Some((t!("app.cleanup.cleaned").to_string(), now));
                 runtime_log::log_info("[exit] unsaved cleanup complete");
-                self.finalize_close(ctx, action);
+                self.finalize_close(action);
             }
             Ok(Err(err)) => {
                 self.pending_exit_cleanup = None;
@@ -1798,7 +1829,7 @@ impl MangaApp {
                     true
                 }
                 Some(crate::single_image::ExitChoice::DontSave) => {
-                    self.close_single_image_discarding(ctx, action);
+                    self.close_single_image_discarding(action);
                     true
                 }
             };
@@ -3001,7 +3032,7 @@ impl MangaApp {
                     if self.has_unsaved_changes() {
                         self.exit_dialog = Some(ExitDialogKind::ReturnToLauncher);
                     } else {
-                        self.finalize_close(ui.ctx(), PendingCloseAction::ReturnToLauncher);
+                        self.finalize_close(PendingCloseAction::ReturnToLauncher);
                     }
                 }
                 if let Some(controller) = self.single_image.as_mut() {
@@ -3090,17 +3121,8 @@ impl eframe::App for MangaApp {
         puffin::GlobalProfiler::lock().new_frame();
         #[cfg(feature = "profiling")]
         puffin::profile_scope!("MangaApp::update");
-        ctx.options_mut(|opt| {
-            opt.zoom_with_keyboard = false;
-        });
         if let Ok(mut doc) = self.layer_doc.lock() {
             doc.poll_save_acks();
-        }
-        #[cfg(target_os = "windows")]
-        if self.maximize_root_window_on_first_frame {
-            self.maximize_root_window_on_first_frame = false;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
-            ctx.request_repaint();
         }
 
         // Poll active "save to project" job and expire old status messages (show for 5 s).
@@ -3111,7 +3133,7 @@ impl eframe::App for MangaApp {
         self.drive_pending_save_preload(ctx);
         let save_completed_this_frame = self.poll_save_to_project(now);
         self.poll_page_op(ctx);
-        self.poll_pending_exit_cleanup(ctx, now);
+        self.poll_pending_exit_cleanup(now);
         // Single-image save driver; every frame, whatever tab is active (it is also the one
         // `poll_flatten_to_file` caller the typing tab requires).
         let single_image_outcome = match self.single_image.as_mut() {
@@ -3123,7 +3145,7 @@ impl eframe::App for MangaApp {
             }),
             None => None,
         };
-        self.apply_single_image_outcome(ctx, single_image_outcome);
+        self.apply_single_image_outcome(single_image_outcome);
         self.refresh_unsaved_changes_cache(now);
         if let Some((_, ts)) = &self.save_to_project_status {
             if *ts > 0.0 && now - ts > 5.0 {
@@ -3148,19 +3170,8 @@ impl eframe::App for MangaApp {
                     .take()
                     .unwrap_or(PendingCloseAction::Exit);
                 self.exit_dialog = None;
-                self.finalize_close(ctx, action);
+                self.finalize_close(action);
             }
-        }
-
-        // Intercept the OS window-close button when there are unsaved changes.
-        if ctx.input(|i| i.viewport().close_requested())
-            && self.has_unsaved_changes()
-            && self.exit_dialog.is_none()
-        {
-            self.pending_save_completion_action = Some(PendingCloseAction::Exit);
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.exit_dialog = Some(ExitDialogKind::WindowClose);
-            // If no unsaved changes: let eframe handle the close normally.
         }
 
         {
@@ -3209,7 +3220,7 @@ impl eframe::App for MangaApp {
         // Show exit/leave dialog on top of all other content.
         self.draw_exit_dialog(ctx);
         let jpeg_options_outcome = self.single_image.as_mut().and_then(|controller| controller.draw_dialogs(ctx));
-        self.apply_single_image_outcome(ctx, jpeg_options_outcome);
+        self.apply_single_image_outcome(jpeg_options_outcome);
 
         self.draw_page_op_overlays(ctx);
 
@@ -3498,149 +3509,17 @@ impl eframe::App for MangaApp {
         }
     }
 
-    /// Final shutdown drain for the background layer saver: called by eframe on real process exit
-    /// (window close, return-to-launcher, or any other teardown). Flushes the typing tab's deferred
-    /// text edits, then blocks until every queued layer write is flushed and the worker thread is
-    /// joined, so no pending raster/text/effects write is lost on exit. Must NOT hold the doc lock
-    /// across the barrier: it clones the handle, drops the lock, then barriers; finally
-    /// `shutdown_saver` drains the queue + joins the worker. Relying on Arc-drop ordering alone is
-    /// unsafe (a lingering Arc clone in a worker could skip the join).
+    /// eframe's shutdown hook: runs the blocking teardown ([`MangaApp::shutdown_blocking`],
+    /// `app/shutdown.rs`) inline and keeps only its logs. Reached only while `MangaApp` is still
+    /// driven as an `eframe::App` (the web build; natively `StudioBootstrapApp` calls
+    /// `shutdown_blocking` itself); delete it once the shell owns teardown (unified-window WP-6).
     ///
     /// The GL context is not needed here: the only GL objects the studio owns are the
-    /// `egui-shader-layers` backend's, which `StudioBootstrapApp::on_exit` frees. The parameter is
-    /// kept because this is `eframe::App::on_exit`'s signature.
+    /// `egui-shader-layers` backend's, which `StudioBootstrapApp::on_exit` frees.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // A single-image session always closes the DISCARD way (plan D13): its staging is a scratch
-        // `run_main` deletes once the window is gone, so nothing below may write into it. No-op when
-        // a dialog already took that path.
-        if self.single_image.is_some() {
-            self.quiesce_writers_discarding();
-        }
-        self.stop_overlay_autosave();
-        // Release decode workers parked on the look-ahead window: after this frame nothing
-        // drains the loader channels, so the promotion frontier would never advance again and
-        // parked workers (and the pool joiner) would leak. Workers blocked on `send` exit on
-        // their own once the receivers drop with `self`.
-        self.loader_shutdown.store(true, AtomicOrdering::Release);
-        // 0) Write the typing tab's DEFERRED text edits — necessarily BEFORE the barrier below.
-        // Typing does not write an edit as it happens (that would write every drag frame); it writes at
-        // a focus-loss point, and closing the app is a focus loss no in-tab flush point observes. The
-        // barrier is what guarantees bytes on disk, but it can only cover writes already ENQUEUED, so a
-        // still-deferred edit must be enqueued first or it is lost on close. This flush enqueues INLINE
-        // on this thread (not via the detached placement-save worker, which has no quiescence handle and
-        // would race the barrier), so step 1 covers it. No-op when nothing is dirty.
-        //
-        // SKIPPED on the discard path: `start_exit_cleanup` deletes the staging dir on purpose and has
-        // already dropped the pending edits, so a flush here would write back exactly what the user
-        // asked to throw away — and, with the saver already shut down, `enqueue_page_text_save`'s
-        // synchronous fallback would re-create the deleted `_unsaved/layers/` dir to do it.
-        if self.discarding_unsaved_changes {
-            runtime_log::log_info(
-                "[app] on_exit: discard path — pending typing text edits dropped, not flushed",
-            );
-        } else {
-            self.typing_tab
-                .flush_text_layers_if_dirty(TypingSaveFlushReason::Exit);
-        }
-        // 1) Barrier without holding the lock (clone the handle, drop the guard, then block).
-        let handle = self
-            .layer_doc
-            .lock()
-            .ok()
-            .and_then(|guard| guard.saver_handle());
-        // Pages the barrier reported as FAILED writes. Teardown has no project merge left to reconcile
-        // them with, but the result must still be inspected and reported: since typing text edits are
-        // deferred, this barrier is the ONLY durability signal a deferred edit ever gets, and exiting
-        // with a cheerful "drained" line while pages silently failed to write hides real data loss.
-        let mut barrier_failed_pages: Vec<usize> = Vec::new();
-        if let Some(handle) = handle {
-            barrier_failed_pages = handle.barrier_blocking().into_iter().collect();
-            barrier_failed_pages.sort_unstable();
-        }
-        // 2) Drain remaining queue + join the worker thread (idempotent; safe if already shut down).
-        if let Ok(mut guard) = self.layer_doc.lock() {
-            guard.shutdown_saver();
-        } else {
-            runtime_log::log_error("[app] on_exit: shared doc lock poisoned, saver not joined");
-        }
-        if barrier_failed_pages.is_empty() {
-            runtime_log::log_info("[app] on_exit: layer saver drained and shut down");
-        } else {
-            // Exit still proceeds — nothing can retry a write at teardown — but it must not claim success.
-            runtime_log::log_error(format!(
-                "[app] on_exit: layer saver shut down, but the teardown barrier reported {} page(s) \
-                 whose layer write FAILED: {:?}. Their layer data (including any deferred typing text \
-                 edit flushed above) is NOT in the staging dir. Cause is logged per page by the saver; \
-                 exit continues because no retry is possible at teardown.",
-                barrier_failed_pages.len(),
-                barrier_failed_pages
-            ));
-        }
-
-        // 3) Drain and join the bubbles saver. Normally its barrier flushes queued snapshots. The
-        // discard path paused its gate before deleting staging, so this only drains and joins there:
-        // queued snapshots are intentionally dropped and cannot recreate `_unsaved/`.
-        // Poison is RECOVERED here too: a poisoned lock must not cost the user their last edits by
-        // skipping the flush entirely. A shutdown FAILURE is still reported — exit proceeds (no retry
-        // is possible at teardown), but it must not claim success it did not observe.
-        if let Err(err) = self
-            .bubbles_model
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .shutdown_saver()
-        {
-            runtime_log::log_error(format!(
-                "[app] on_exit: bubbles saver could not be flushed and joined: {err}"
-            ));
-        } else {
-            runtime_log::log_info("[app] on_exit: bubbles saver drained and shut down");
-        }
-
-        // 4) Persist per-tab canvas bottom-hint collapsed state (exit-only, single read-modify-write).
-        // `on_exit` fires on both program close and return-to-launcher, so this is the one save point.
-        persist_canvas_hint_collapsed_state(
-            self.canvas.bottom_hint_collapsed(),
-            self.typing_tab.hint_collapsed(),
-        );
-
-        // 5) Persist the two typing centering-assist checkboxes (exit-only, single locked RMW). The
-        // bound-center KIND is deliberately session-only, so it is not written here.
-        persist_typing_centering_assist_state(
-            self.typing_tab.centering_assist_enabled(),
-            self.typing_tab.centering_show_center(),
-        );
-
-        // 6) Flush a still-pending per-font-settings write. A parameter edit stores the font's
-        // default profile through a multi-second DEBOUNCE (one document write per burst instead of
-        // one per keystroke), and the debounced writer is a detached thread that dies with the
-        // process — so changing a parameter and closing the app a second later used to lose the
-        // edit outright. Synchronous by necessity: no GUI frame follows this call and no thread
-        // outlives it. No-op when nothing is pending, which is the normal case.
-        if crate::tabs::typing::font_admin::flush_pending_saves() {
-            runtime_log::log_info("[app] on_exit: flushed a pending fonts_data.json write");
-        }
-
-        // 6a) Flush a still-pending DEFAULT local-preset set. Same shape and same reason as
-        // the step above, for the other debounced typing store: a local preset renamed or
-        // re-parameterised inside its debounce window would otherwise die with the detached
-        // writer thread. No-op when nothing is owed. Why this write is synchronous here — and
-        // why a deadline would trade a visible hang for a silent loss — is argued at
-        // `local_presets::flush_pending_local_presets_save` and in
-        // `crates/ms-tab-typing/src/panel/MODULE_README.md`.
-        if self.typing_tab.flush_pending_local_presets_save() {
-            runtime_log::log_info(
-                "[app] on_exit: flushed a pending fonts/presets.json local-preset write",
-            );
-        }
-
-        // 7) Flush the dockable-panel layouts. A last poll first, because the frame that raised
-        // the dirty flag may be the one the close arrived in and no further frame will poll it;
-        // then the writer's own debounce window is drained synchronously and its thread joined.
-        // Both steps are no-ops when nothing changed.
-        if let Some(layouts) = self.panel_dock.take_dirty_layouts() {
-            self.panel_layout_writer.store(layouts);
-        }
-        self.panel_layout_writer.flush_and_join();
+        // The report is dropped on purpose: its items are already logged by the teardown and this
+        // hook has no UI left to show them.
+        drop(self.shutdown_blocking());
     }
 }
 
@@ -4047,7 +3926,7 @@ fn apply_hint_collapsed_to_config_root(root: &mut Value, translation: bool, typi
 /// Persists the per-tab canvas bottom-hint collapsed flags (Translation, Typing) to
 /// `user_config.json`.
 ///
-/// Called once from [`MangaApp::on_exit`]. Routes through [`crate::config::update_user_config_file`],
+/// Called once from [`MangaApp::shutdown_blocking`]. Routes through [`crate::config::update_user_config_file`],
 /// the canonical serialized read-modify-write (atomic replace), so unrelated keys survive. A malformed
 /// existing document is NOT overwritten: the error is logged and the file is left as is.
 /// Teardown-only: on any read/parse/write failure it logs and returns without panicking, so a failed
@@ -4101,7 +3980,7 @@ fn apply_centering_assist_to_config_root(root: &mut Value, enabled: bool, show_c
 
 /// Persists the two typing centering-assist flags to `user_config.json`.
 ///
-/// Called once from [`MangaApp::on_exit`]. Routes through [`crate::config::update_user_config_file`],
+/// Called once from [`MangaApp::shutdown_blocking`]. Routes through [`crate::config::update_user_config_file`],
 /// the canonical locked read-modify-write primitive, so unrelated keys survive and the write is
 /// serialized with every other config writer. Teardown-only: on any read/parse/write failure it logs a
 /// warning and returns without panicking, so a failed write never blocks shutdown.
@@ -4781,12 +4660,12 @@ fn copy_rgba_tile_rows(
 mod tests {
     use super::{
         CANVAS_CONFIG_SECTION, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY,
-        CANVAS_TYPING_HINT_COLLAPSED_KEY, DECODE_AHEAD_WINDOW, PageOpTextQuiesce, SaveGateDecision,
+        CANVAS_TYPING_HINT_COLLAPSED_KEY, DECODE_AHEAD_WINDOW, OsCloseDecision, PageOpTextQuiesce, SaveGateDecision,
         TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY, TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
         TEXT_TAB_CONFIG_SECTION, TypingTextFlushError,
         apply_centering_assist_to_config_root, apply_hint_collapsed_to_config_root,
         decode_idx_within_window, deferred_save_ready, hint_collapsed_from_user_settings,
-        page_op_text_quiesce, panel_dock_default_layout_builders, save_trigger_decision,
+        os_close_decision, page_op_text_quiesce, panel_dock_default_layout_builders, save_trigger_decision,
         should_seed_page_cache_on_initial_load, DockLayout, PanelDockPass,
         cleaning_default_dock_layout, tab_hosts_panel_dock, text_tab_bool_from_user_settings,
         ps_editor_default_dock_layout, translation_default_dock_layout, typing_default_dock_layout,
@@ -4796,6 +4675,21 @@ mod tests {
     use crate::tabs::AppTab;
     use crate::widgets::panel_dock::TabId;
     use serde_json::{Value, json};
+
+    /// OS close button: a close decided earlier in the frame wins; unsaved work asks once (the
+    /// exit dialog); a clean session, or a second press while the dialog is open, exits.
+    #[test]
+    fn os_close_decision_covers_every_state() {
+        for unsaved in [false, true] {
+            for dialog in [false, true] {
+                assert_eq!(os_close_decision(true, unsaved, dialog), OsCloseDecision::KeepPending);
+            }
+        }
+        assert_eq!(os_close_decision(false, true, false), OsCloseDecision::OpenExitDialog);
+        assert_eq!(os_close_decision(false, true, true), OsCloseDecision::Exit);
+        assert_eq!(os_close_decision(false, false, false), OsCloseDecision::Exit);
+        assert_eq!(os_close_decision(false, false, true), OsCloseDecision::Exit);
+    }
 
     /// The dock hosts are the tabs `PanelDock::end` runs for, and the idle sub-window keep-alive
     /// must run on exactly the complementary frames. The hosts are the three CANVAS tabs — each

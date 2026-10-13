@@ -4275,6 +4275,7 @@ dependencies = [
  "ms-log",
  "ms-sysprobe",
  "ms-text-util",
+ "ms-theme",
  "ms-thread",
  "serde",
  "serde_json",

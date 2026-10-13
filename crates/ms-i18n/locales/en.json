@@ -5532,6 +5532,8 @@
   "widgets.color_preset_picker.hex_tooltip": "Hex code of the color: #rrggbb or #rrggbbaa. Can be typed in by hand.",
   "widgets.color_preset_picker.update_button": "Update",
   "widgets.color_preset_picker.update_tooltip": "Write the current color into the selected preset cell.",
+  "widgets.embedded_window.close_tooltip": "Close this window",
+  "widgets.embedded_window.collapse_tooltip": "Collapse this window; it can be restored from the screen beneath it",
   "widgets.hangul_keyboard.clear_button": "Clear",
   "widgets.hangul_keyboard.frequent_row_label": "Frequent",
   "widgets.hangul_keyboard.insert_button": "Insert",

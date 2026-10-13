@@ -241,29 +241,35 @@ update check (src/lib.rs:1794), launcher (src/lib.rs:2329).
 
 ## 5. Multi-viewport (extra native windows)
 
-Pattern used for all secondary windows: a stable `ViewportId`, a `ViewportBuilder`, and
+**A secondary window of the app (New Project, PSD import, the Wiki guide, batch processing) is an
+`ms_widgets::EmbeddedWindow`** (`crates/ms-widgets/src/embedded_window.rs`), never a hand-written
+`show_viewport_immediate`: the widget opens the same content either as a separate OS window or
+embedded in the window it came from (§5.1). The raw viewport API below is what the widget and the
+panel dock's sub-windows are built on. Launcher call sites not yet migrated to the widget
+(`crates/ms-launcher/src/app.rs` `draw_new_project_window` / `draw_psd_import_window` /
+`draw_wiki_guide_window`, `crates/ms-launcher/src/new_project/window.rs` batch processing) are not
+a precedent.
+
+Pattern underneath: a stable `ViewportId`, a `ViewportBuilder`, and
 `Context::show_viewport_immediate` (egui-0.36.2/src/context.rs:4116). The child ui callback receives
 **`(&mut Ui, ViewportClass)`** — again a `Ui`, not a `Context`.
 
 ```rust
-// src/launcher/app.rs:620-646 (new-project window)
-let viewport_id = egui::ViewportId::from_hash_of(NEW_PROJECT_VIEWPORT_ID_SALT); // egui-0.36.2/src/viewport.rs:152
-let builder = crate::launcher::apply_launcher_window_metadata(
-    egui::ViewportBuilder::default()
-        .with_title(t!("launcher.new_project.window_title"))
-        .with_inner_size([1180.0, 760.0])
-        .with_min_inner_size([1000.0, 680.0])
-        .with_app_id(&self.app_id)
-        .with_resizable(true) /* … */,
-);
-ctx.show_viewport_immediate(viewport_id, builder, |ui, class| {
-    keep_open = self.new_project_window.show(ui, class);
+// crates/ms-widgets/src/embedded_window.rs, `show_separate` (abridged)
+let own_viewport = ViewportId::from_hash_of((SEPARATE_VIEWPORT_SALT, id)); // egui-0.36.2/src/viewport.rs:152
+let builder = builder.with_title(title);
+ctx.show_viewport_immediate(own_viewport, builder, |ui, class| {
+    let child_ctx = ui.ctx().clone();
+    response.close_requested = child_ctx.input(|input| input.viewport().close_requested());
+    /* CentralPanel + content, unless an embedded window covers this viewport */
 });
 ```
 
-Close it with `ctx.send_viewport_cmd(egui::ViewportCommand::Close)`
-(egui-0.36.2/src/context.rs:4016, `ViewportCommand::Close` at egui-0.36.2/src/viewport.rs:1084) —
-see src/launcher/app.rs:662, :721.
+A child viewport's close only REPORTS: `ViewportInfo::close_requested`
+(egui-0.36.2/src/data/input/viewport_info.rs:111); the OS window lives for as long as the parent
+keeps calling `show_viewport_immediate` for it. `ctx.send_viewport_cmd(egui::ViewportCommand::Close)`
+(egui-0.36.2/src/context.rs:4016, `ViewportCommand::Close` at egui-0.36.2/src/viewport.rs:1084)
+closes the viewport it is sent from.
 
 Gotchas, all verified in the source docs:
 
@@ -271,26 +277,65 @@ Gotchas, all verified in the source docs:
   repaint together, so it is roughly double work per extra viewport; `show_viewport_deferred`
   (context.rs:4062) avoids that but needs `Send + Sync` state. Immediate must be called **every pass**
   the window should exist, and **only from the main thread** (context.rs:4090-4107).
-* **Embedding fallback.** If `Context::embed_viewports` is true (backend without multi-window
-  support, e.g. wasm), the callback is run inside an embedded `Window` and `class ==
-  ViewportClass::EmbeddedWindow` (context.rs:4110-4113, egui-0.36.2/src/viewport.rs:82). Child code
-  must therefore not assume it owns an OS window — that is why the repo passes `class` down.
+* **Embedding fallback.** If `Context::embed_viewports` is true (wasm, Android's runtime fallback),
+  OR the backend registered no immediate-viewport renderer, the callback runs inside a floating
+  non-collapsible `egui::Window` and `class == ViewportClass::EmbeddedWindow`
+  (context.rs:4124-4127, :4130-4136, `show_embedded_viewport` at :4174-4185;
+  egui-0.36.2/src/viewport.rs:82). That wrapper has no close button and never reports
+  `close_requested`, and a `CentralPanel` inside it fills the whole root viewport — the
+  double-window look `EmbeddedWindow` exists to avoid: in its Embedded mode it never calls the
+  viewport API at all.
 * **Per-viewport style/visuals.** Each viewport has its own `Ui` tree but shares the `Context` style;
   restyle the child from inside its callback (`ui.set_style`, egui-0.36.2/src/ui.rs:387) rather than
   mutating the global style, or the parent window changes too.
 * **Platform quirk in this repo:** Windows misplaces a window created with `with_maximized(true)`, so
-  maximisation is deferred to the first child frame via
-  `ViewportCommand::Maximized(true)` + `request_repaint()` (src/launcher/app.rs:633-644).
-
-Other users of the pattern: src/launcher/psd_import_window.rs via src/launcher/app.rs:699,
-src/launcher/new_project/window.rs:2047 (screen capture) and :6757
-(src/launcher/new_project/batch_processing/window.rs).
+  maximisation is deferred to the first child frame via `ViewportCommand::Maximized(true)`
+  (egui-0.36.2/src/viewport.rs:1137) + `request_repaint()` — `EmbeddedWindow::maximize_on_open`
+  does exactly that on Windows and uses `with_maximized(true)` (viewport.rs:389) elsewhere.
 
 **Do not open a viewport for a floating panel.** A panel torn off into its own OS window is still a
 dock tab; the dock owns that window (`crates/ms-widgets/src/panel_dock/window.rs`), draws one
 `show_viewport_immediate` per sub-window every frame, persists it, and closes it when its last panel
 leaves. Rolling your own viewport for a panel would take it out of the layout, out of persistence,
 and out of the user's «Переместить в окно →» menu. See §3.1.
+
+### 5.1 Embedded windows and the stack
+
+`EmbeddedWindow::new(id, title, &mut state)` + `.show(ui, content, children)`; the contract lives in
+the file header and `crates/ms-widgets/src/embedded_window/MODULE_README.md`. The egui facts it
+rests on:
+
+* **One decision.** `ms_widgets::embedded_window::effective_mode(ctx)` = the user setting
+  (`ms_config::secondary_windows::requested_mode()`) unless `ctx.embed_viewports()`
+  (egui-0.36.2/src/context.rs:4001) forces Embedded. Evaluated every pass; nothing else decides.
+* **Stack storage.** One `WindowStacks` per `Context` in temp data via `Context::data_mut`
+  (context.rs:1033) and `IdTypeMap::get_temp_mut_or_default` (egui-0.36.2/src/util/id_type_map.rs:503;
+  the value must be `Clone + Send + Sync + Default`), partitioned by `Context::viewport_id`
+  (context.rs:3949) and aged by `Context::cumulative_pass_nr` (context.rs:1781), which is PER
+  VIEWPORT and restarts when egui drops and recreates a viewport (the `viewports.retain` at
+  context.rs:2757).
+* **Only the top draws.** Embedded, a window is a `Panel::top` title strip plus a `CentralPanel`
+  on the viewport's root `Ui`; the covered windows and the host draw nothing (a host asks
+  `covers_host(ctx)` first). Nothing is occluded by z-order — what is not drawn has no widgets,
+  so it takes no input.
+* **Content state survives** covering and mode switches: the content runs in
+  `ui.scope_builder(UiBuilder::new().id(..))` (ui_builder.rs:71) and an explicit id is used
+  verbatim (ui.rs:251-252). Per-viewport memory (areas, focus, popups) still resets when a window
+  switches between Separate and Embedded.
+* **Focus of a widget that stops being drawn.** egui keeps it focused for exactly one more pass and
+  then drops it in `Focus::end_pass` (egui-0.36.2/src/memory/mod.rs:630-637: the focused id was
+  not used this pass and had focus last pass). `EmbeddedWindow` drops focus itself
+  (`Memory::stop_text_input`, memory/mod.rs:1001) whenever the covering window changes, so the new
+  top never inherits a hidden widget's focus.
+* **Escape and focus.** An unfiltered Escape clears focus in `Focus::begin_pass`, BEFORE the pass
+  runs (memory/mod.rs:599-602; `TextEdit`'s default `EventFilter` does not claim Escape,
+  egui-0.36.2/src/data/input/event_filter.rs:34, :44, :56). So `memory.focused().is_none()` is always
+  true on the pass of an Escape press and cannot tell "Escape left a text field" apart. The widget
+  remembers whether focus was held at the end of the window's previous pass and closes only when
+  it was not (`close_on_escape(true)`; `InputState::consume_key`,
+  egui-0.36.2/src/input_state/mod.rs:722).
+* **Separate-mode restore** sends `ViewportCommand::Minimized(false)` and `Focus`
+  (viewport.rs:1134, :1169); collapse of a separate window is `Minimized(true)`.
 
 ## 6. Repaint model
 
@@ -307,7 +352,8 @@ egui repaints on demand. Nothing in `ui()` re-runs by itself.
 thread finishing, a channel receiving, an animation you drive yourself. Cheap and idempotent per
 frame. Repo examples: while background loaders run (src/app.rs:2443-2447), from the font loader
 thread once each stage of the stack is registered (`src/ui_fonts.rs`, `install_blocking`), after a
-viewport command (src/launcher/app.rs:643).
+viewport command (`crates/ms-widgets/src/embedded_window.rs`, `show_separate`, after
+`ViewportCommand::Maximized(true)`).
 
 ## 7. Theme and style
 
@@ -392,7 +438,8 @@ the result actually happens. The font loader above is the canonical example.
 * To change the root app shell, tab bar, top panel, or per-tab central panel: `src/app.rs`
   (`impl eframe::App for MangaApp`, src/app.rs:2337).
 * To change process startup, window size/icon/app-id, or which `run_native` runs: `src/lib.rs`.
-* To change the launcher shell and its secondary native windows: `src/launcher/app.rs`.
+* To change the launcher shell: `crates/ms-launcher/src/app.rs`. To change how ANY secondary window
+  opens (separate vs embedded, title strip, stacking): `crates/ms-widgets/src/embedded_window.rs`.
 * To change the launcher look (Style/Visuals/palette): `crates/ms-launcher/src/theme.rs`.
 * To change a studio semantic colour (status text, canvas chrome, checkerboard): `crates/ms-theme/`.
 * To change fonts (which files load, family names, fallback order): `src/ui_fonts.rs` and

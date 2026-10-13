@@ -119,14 +119,20 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `CanvasDrawParams::panel_dock`, which the canvas only carries. It also owns the clean-overlay
   autosave thread and its `OverlayAutosaveControl`: save-to-project pauses it and takes the dirty
   клин snapshots on its worker, page ops and discard stop it without writing (joined off the GUI
-  thread), `on_exit` flushes and stops it; `refresh_unsaved_changes_cache` also reports enqueued but
+  thread), the teardown (`shutdown_blocking`) flushes and stops it; `refresh_unsaved_changes_cache` also reports enqueued but
   unacknowledged layer-saver writes (`LayerDoc::has_pending_saves`) and клин pages still held dirty.
   It creates and owns the project's single `AutosaveGate` and hands it to all three staging writers
   (layer saver, bubbles model, клин model + autosave thread); it forces the gate on save-to-project
   success and before a page operation (gate semantics: `crates/ms-models/src/MODULE_README.md`;
-  the app-side ordering: "Save / page-op / discard / exit choreography" below). It turns off
-  egui's keyboard zoom (`zoom_with_keyboard = false`) every frame, so the only UI zoom is the
-  interface-scale setting.
+  the app-side ordering: "Save / page-op / discard / exit choreography" below). It never closes,
+  maximizes or configures the window: a close it decides (exit dialog, save-then-close, launcher
+  button, OS close via `request_os_close`) is a `PendingCloseAction` the window host takes with
+  `take_close_request` and performs; `egui::Options` (keyboard zoom off) belong to the host.
+- `app/shutdown.rs`: child module of `app` holding `MangaApp::shutdown_blocking() ->
+  ShutdownReport`, the blocking teardown (order: "exit choreography" below; failed layer pages
+  and the bubbles-saver error are logged AND returned), and the permanent compile-time
+  `MangaApp: Send` guard (native only), which is why `CleaningTool`, `AiEngine` and `PsTool`
+  have a `Send` supertrait: the teardown is meant to run with the app moved onto a worker.
 - `app_tab` (crate `ms-config`): declaration of the `AppTab` tab selector with BOTH its persistence
   half (`ALL`, `key()`) and the localized display `title()`. Re-exported by `lib.rs` as
   `crate::app_tab` and again by `tabs/mod.rs`, so `crate::tabs::AppTab` stays the path everything
@@ -142,7 +148,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   `tabs::typing` re-exports it and remains its conceptual owner (no crate-root shim).
 - `studio_bootstrap.rs`: startup shell for the studio window — opens the window immediately, runs
   the background project load behind a loading screen (or an error screen with exit/return-to-
-  launcher actions), then swaps in `MangaApp` and delegates `ui`/`on_exit` to it. It also owns
+  launcher actions), then swaps in `MangaApp`, delegates `ui` to it, performs the close it
+  requests (`take_close_request`; the OS close goes through `request_os_close` and is cancelled
+  only when the exit dialog opened), and runs `shutdown_blocking` in `on_exit` and before a
+  reload. It turns egui's keyboard zoom off when the editor starts (`zoom_with_keyboard = false`),
+  so the only UI zoom is the interface-scale setting. It also owns
   the window itself from the first frame, so the `WindowGeometryTracker` (monitor/position/size
   persistence) and the Windows first-frame maximize workaround live here, as does the window-wide
   `egui-shader-layers` glow backend (installed from the app creator, destroyed in `on_exit`).
@@ -194,7 +204,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
 - Dockable-panel arrangement: `ms-widgets`'s `panel_dock/persist.rs` owns the self-versioned `PanelLayout`
   section of `user_config.json` (one entry per program tab, keyed by `AppTab::key()`). It is the
   only writer of that section and does all of its I/O on a `config_saver` thread
-  (`PanelLayoutWriter`, owned by `MangaApp`, flushed in `on_exit`). The dock STATE is app-owned too
+  (`PanelLayoutWriter`, owned by `MangaApp`, flushed by `shutdown_blocking`). The dock STATE is app-owned too
   — `MangaApp::panel_dock`, exactly one per studio window, lent to the drawing tab for the frame —
   because sub-window indices, the persisted window list and the layouts of every program tab are one
   shared thing; `app.rs` polls it for a dirty layout once per frame. Loading happens once before the
@@ -513,14 +523,14 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   `run_main` deletes after the window closed (plan D13), so EVERY close quiesces the discard way
   and nothing is flushed: «Не сохранять» and a successful save-then-close go through
   `close_single_image_discarding` (quiesce + `finalize_close`, no delete job, клин thread joined in
-  `on_exit`); `on_exit` itself quiesces first when no dialog did. Dirty is the controller's
+  `shutdown_blocking`); `shutdown_blocking` itself quiesces first when no dialog did. Dirty is the controller's
   (`AutosaveGate::action_count` vs the last-write baseline, plus deferred typing edits, plus a write
   in flight), never the staging probe. The save-then-close keeps the window open on a failed write
   and re-opens the exit dialog when the user backed out of the picker / JPEG options.
 - Failed discard (`abort_discard_after_failed_cleanup`): releases the latch, marks the session
   unsaved, and restarts ALL three writers on the same `AutosaveGate` (`enable_background_saver`,
   `resume_saver_after_failed_discard`, a fresh `OverlayAutosaveControl` + autosave thread).
-- `on_exit`: flush-and-stop the клин autosave (stop-now when discarding) and join it, then (unless discarding) enqueue typing's deferred edits INLINE,
+- `shutdown_blocking` (`app/shutdown.rs`, called from the host's `on_exit` and before a reload): flush-and-stop the клин autosave (stop-now when discarding) and join it, then (unless discarding) enqueue typing's deferred edits INLINE,
   then barrier the layer saver and report its failed pages, then shut down layer and bubbles savers.
 
 ## Contracts and invariants
@@ -607,7 +617,7 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
 - Startup, service flags, project-open flow, launcher handoff, or update routing: start in
   `lib.rs` and `args.rs`.
 - Single-image saving, its top bar, exit dialog, hidden tabs and save hotkeys: `single_image/`
-  (hooks in `app.rs`: `tab_visible`, `draw_tab_bar`, `draw_exit_dialog`, `ui` tick, `on_exit`).
+  (hooks in `app.rs`: `tab_visible`, `draw_tab_bar`, `draw_exit_dialog`, `ui` tick; `app/shutdown.rs`: the teardown quiesce).
 - Single-image start (CLI, launcher pick, scratch lifetime, desktop entry): `lib.rs`
   (`resolve_startup_target`, the `run_main` loop), `args.rs`
   (`open_target` group), `studio_bootstrap.rs` (`StudioOpenRequest`, `spawn_open_thread`); the
@@ -706,7 +716,8 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
 - Chapter filesystem shape, project load/save contracts, page discovery, staged unsaved paths, or
   legacy bubble format migration: `crates/ms-project/src/lib.rs`.
 - Root editor wiring, shared model setup, texture upload budgets, page/overlay loader behavior,
-  active tab routing, viewport sync, or global hotkeys: `app.rs`.
+  active tab routing, viewport sync, or global hotkeys: `app.rs`. Studio teardown order or what
+  it reports: `app/shutdown.rs`.
 - Studio window startup shell, background project load, loading/error screens: `studio_bootstrap.rs`.
 - Canvas layout, zoom, scrolling, bubble interaction, overlay runtime, or canvas settings:
   `canvas/`.

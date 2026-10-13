@@ -26,6 +26,9 @@ ms-log = { path = "../ms-log" }
 # writes it through `ms_config::config_saver`; `spellchecked_line.rs` resolves its
 # dictionary folder under `ms_config::data_dir()`.
 ms-config = { path = "../ms-config" }
+# `embedded_window.rs` draws a window's content under its own style through
+# `ms_theme::with_scoped_global_style` (the one global-style owner). A leaf crate: downward edge.
+ms-theme = { path = "../ms-theme" }
 # Owned-document access: `spellchecked_line.rs` reads/updates/probes the title
 # `settings.json` and `input_manager_v2.rs` reads `user_config.json` through it.
 ms-docstore = { path = "../ms-docstore" }

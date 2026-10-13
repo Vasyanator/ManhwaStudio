@@ -1369,9 +1369,8 @@ mod tests {
     use super::super::geometry::SizeViolation;
     use crate::tools::mask_generation::{MaskGenerationParams, WatermarkProgress};
     use egui::Color32;
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
     fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
         OverlayRectPx { x, y, w, h }
@@ -1515,21 +1514,21 @@ mod tests {
     /// the user placed stays, turns red, and the mask stack is left alone.
     #[test]
     fn the_size_rules_follow_the_selected_engine_every_frame() {
-        let grid = Rc::new(Cell::new(1));
+        let grid = Arc::new(AtomicUsize::new(1));
         let mut tool = test_host();
         tool.engines = vec![Box::new(RecordingEngine {
-            calls: Rc::new(RefCell::new(EngineCalls::default())),
+            calls: Arc::new(Mutex::new(EngineCalls::default())),
             answer: EnginePoll::Idle,
             switch_block: None,
-            grid: Rc::clone(&grid),
-            marks: Rc::new(Cell::new(MarksSupport::OVERLAY_ONLY)),
+            grid: Arc::clone(&grid),
+            marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
         })];
         tool.selected = 0;
         tool.frame.place_for_test(0, rect(0, 0, 12, 20));
         tool.push_engine_rules();
         assert_eq!(tool.frame.size_violation(), None);
 
-        grid.set(8);
+        grid.store(8, Ordering::Relaxed);
         tool.push_engine_rules();
         assert_eq!(tool.frame.size_violation(), Some(SizeViolation::NotMultiple));
         let r = tool.frame.rect_px().expect("the frame stays placed");
@@ -1795,44 +1794,51 @@ mod tests {
         run_options: Vec<RunOptionsCtx>,
     }
 
+    /// Locks a value the test shares with a [`RecordingEngine`]. The engine sits behind `Arc` +
+    /// `Mutex` only because `AiEngine: Send`; everything runs on the test thread, and a lock
+    /// poisoned by an earlier failed assertion still holds the record the next assertion reads.
+    fn recorded<T>(shared: &Mutex<T>) -> MutexGuard<'_, T> {
+        shared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// A minimal `AiEngine` that records what the host does to it and answers whatever the
     /// test queued. It exists because the host's contract with an engine is entirely about
     /// CALL ORDER and per-frame pushes, which no real engine can observe for us.
     struct RecordingEngine {
-        calls: Rc<RefCell<EngineCalls>>,
+        calls: Arc<Mutex<EngineCalls>>,
         answer: EnginePoll,
         /// What this engine answers to [`AiEngine::switch_block_reason`]. `None` is the
         /// trait default and the state every other test wants.
         switch_block: Option<String>,
         /// The grid its `constraints()` declare, shared so a test can change the declaration
         /// the way a real engine's own parameter would. `1` everywhere else.
-        grid: Rc<Cell<usize>>,
+        grid: Arc<AtomicUsize>,
         /// What its `marks_support()` answers, shared for the same reason as `grid`. The
         /// trait default (overlay only) everywhere else.
-        marks: Rc<Cell<MarksSupport>>,
+        marks: Arc<Mutex<MarksSupport>>,
     }
 
     impl RecordingEngine {
         /// An engine whose call record nobody reads, answering `Idle` and refusing no switch.
         fn idle() -> Self {
             Self {
-                calls: Rc::new(RefCell::new(EngineCalls::default())),
+                calls: Arc::new(Mutex::new(EngineCalls::default())),
                 answer: EnginePoll::Idle,
                 switch_block: None,
-                grid: Rc::new(Cell::new(1)),
-                marks: Rc::new(Cell::new(MarksSupport::OVERLAY_ONLY)),
+                grid: Arc::new(AtomicUsize::new(1)),
+                marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
             }
         }
 
         /// An idle engine whose marks support the test controls through the returned cell.
-        fn with_marks(support: MarksSupport, calls: &Rc<RefCell<EngineCalls>>) -> (Self, Rc<Cell<MarksSupport>>) {
-            let marks = Rc::new(Cell::new(support));
+        fn with_marks(support: MarksSupport, calls: &Arc<Mutex<EngineCalls>>) -> (Self, Arc<Mutex<MarksSupport>>) {
+            let marks = Arc::new(Mutex::new(support));
             let engine = Self {
-                calls: Rc::clone(calls),
+                calls: Arc::clone(calls),
                 answer: EnginePoll::Idle,
                 switch_block: None,
-                grid: Rc::new(Cell::new(1)),
-                marks: Rc::clone(&marks),
+                grid: Arc::new(AtomicUsize::new(1)),
+                marks: Arc::clone(&marks),
             };
             (engine, marks)
         }
@@ -1852,7 +1858,7 @@ mod tests {
             false
         }
         fn constraints(&self) -> FrameConstraints {
-            FrameConstraints { multiple: self.grid.get(), min_side: 1, ..FrameConstraints::UNCONSTRAINED }
+            FrameConstraints { multiple: self.grid.load(Ordering::Relaxed), min_side: 1, ..FrameConstraints::UNCONSTRAINED }
         }
         fn mask_layers(&self) -> Vec<MaskLayerSpec> {
             vec![MaskLayerSpec { tint: Color32::RED, label_key: "cleaning.region_frame.status.free" }]
@@ -1861,13 +1867,13 @@ mod tests {
             false
         }
         fn draw_parameters(&mut self, _ui: &mut egui::Ui) {
-            self.calls.borrow_mut().parameter_draws += 1;
+            recorded(&self.calls).parameter_draws += 1;
         }
         fn draw_progress(&mut self, _ui: &mut egui::Ui) {
-            self.calls.borrow_mut().progress_draws += 1;
+            recorded(&self.calls).progress_draws += 1;
         }
         fn draw_run_options(&mut self, _ui: &mut egui::Ui, ctx: RunOptionsCtx) {
-            self.calls.borrow_mut().run_options.push(ctx);
+            recorded(&self.calls).run_options.push(ctx);
         }
         fn run_block_reason(&self) -> Option<String> {
             None
@@ -1876,30 +1882,30 @@ mod tests {
             self.switch_block.clone()
         }
         fn marks_support(&self) -> MarksSupport {
-            self.marks.get()
+            *recorded(&self.marks)
         }
         fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
-            let mut calls = self.calls.borrow_mut();
+            let mut calls = recorded(&self.calls);
             calls.started = Some((request.page_idx, request.region.size[0], request.masks.len()));
             calls.run_region = Some(request.region);
             calls.run_marks = Some(request.marks);
             Ok(())
         }
         fn poll(&mut self, _ctx: &egui::Context) -> EnginePoll {
-            self.calls.borrow_mut().polls += 1;
+            recorded(&self.calls).polls += 1;
             std::mem::replace(&mut self.answer, EnginePoll::Idle)
         }
         fn cancel(&mut self) {
-            self.calls.borrow_mut().cancels += 1;
+            recorded(&self.calls).cancels += 1;
         }
         fn set_backend_available(&mut self, available: bool) {
-            self.calls.borrow_mut().backend = Some(available);
+            recorded(&self.calls).backend = Some(available);
         }
         fn set_torch_available(&mut self, available: bool) {
-            self.calls.borrow_mut().torch = Some(available);
+            recorded(&self.calls).torch = Some(available);
         }
         fn set_region(&mut self, region: Option<OverlayRectPx>, geometry_settled: bool) {
-            let mut calls = self.calls.borrow_mut();
+            let mut calls = recorded(&self.calls);
             calls.region = Some(region);
             calls.geometry_settled = Some(geometry_settled);
         }
@@ -1907,15 +1913,15 @@ mod tests {
 
     /// Installs a single `RecordingEngine` answering `answer`, and returns the tool plus the
     /// shared call record.
-    fn tool_with_recording_engine(answer: EnginePoll) -> (RegionEditHost, Rc<RefCell<EngineCalls>>) {
-        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+    fn tool_with_recording_engine(answer: EnginePoll) -> (RegionEditHost, Arc<Mutex<EngineCalls>>) {
+        let calls = Arc::new(Mutex::new(EngineCalls::default()));
         let mut tool = test_host();
         tool.engines = vec![Box::new(RecordingEngine {
-            calls: Rc::clone(&calls),
+            calls: Arc::clone(&calls),
             answer,
             switch_block: None,
-            grid: Rc::new(Cell::new(1)),
-            marks: Rc::new(Cell::new(MarksSupport::OVERLAY_ONLY)),
+            grid: Arc::new(AtomicUsize::new(1)),
+            marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
         })];
         tool.selected = 0;
         (tool, calls)
@@ -1926,13 +1932,13 @@ mod tests {
     /// the drawing code, because a switch must not depend on a control having been drawn.
     #[test]
     fn an_engine_that_calls_a_switch_unsafe_refuses_it() {
-        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let calls = Arc::new(Mutex::new(EngineCalls::default()));
         let busy = |reason: Option<&str>| RecordingEngine {
-            calls: Rc::clone(&calls),
+            calls: Arc::clone(&calls),
             answer: EnginePoll::Idle,
             switch_block: reason.map(str::to_string),
-            grid: Rc::new(Cell::new(1)),
-            marks: Rc::new(Cell::new(MarksSupport::OVERLAY_ONLY)),
+            grid: Arc::new(AtomicUsize::new(1)),
+            marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
         };
         let mut tool = test_host();
         tool.engines = vec![Box::new(busy(Some("downloading"))), Box::new(busy(None))];
@@ -1961,7 +1967,7 @@ mod tests {
         for _ in 0..3 {
             tool.poll_engine(&ctx);
         }
-        assert_eq!(calls.borrow().polls, 3, "one poll per frame, unconditionally");
+        assert_eq!(recorded(&calls).polls, 3, "one poll per frame, unconditionally");
     }
 
     /// The three sections of the main panel reach the engine's three draw methods, each
@@ -1977,7 +1983,7 @@ mod tests {
             tool.draw_main_panel_bottom(ui);
         })
         .drop_without_applying_deltas();
-        let calls = calls.borrow();
+        let calls = recorded(&calls);
         assert_eq!((calls.progress_draws, calls.parameter_draws, calls.run_options.len()), (1, 1, 1));
     }
 
@@ -1997,7 +2003,7 @@ mod tests {
         draw(&mut tool);
         tool.frame.masks_mut().paint_segment((2, 2), (2, 2), 1, false);
         draw(&mut tool);
-        let painted: Vec<bool> = calls.borrow().run_options.iter().map(|ctx| ctx.mask_painted).collect();
+        let painted: Vec<bool> = recorded(&calls).run_options.iter().map(|ctx| ctx.mask_painted).collect();
         assert_eq!(painted, vec![false, false, true]);
     }
 
@@ -2021,7 +2027,7 @@ mod tests {
         let (mut tool, calls) = tool_with_recording_engine(EnginePoll::Running);
         tool.frame.set_processing(true);
         tool.cancel_run();
-        assert_eq!(calls.borrow().cancels, 1);
+        assert_eq!(recorded(&calls).cancels, 1);
         assert_eq!(tool.frame.lock(), FrameLock::Free);
     }
 
@@ -2103,7 +2109,7 @@ mod tests {
     /// until the engine stops supporting it, and is then moved to the preferred mode.
     #[test]
     fn the_marks_mode_follows_engine_switches_and_support_changes() {
-        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let calls = Arc::new(Mutex::new(EngineCalls::default()));
         let (overlay_engine, _) = RecordingEngine::with_marks(MarksSupport::OVERLAY_ONLY, &calls);
         let (flexible, support) = RecordingEngine::with_marks(all_modes(MarksMode::TransparentLayer), &calls);
         let mut tool = test_host();
@@ -2117,7 +2123,7 @@ mod tests {
         tool.push_engine_rules();
         assert_eq!(tool.marks_mode, MarksMode::SeparateReference, "a supported choice stands");
 
-        support.set(MarksSupport::new(MarksMode::TransparentLayer).with(MarksMode::OverlayOnRegion));
+        *recorded(&support) = MarksSupport::new(MarksMode::TransparentLayer).with(MarksMode::OverlayOnRegion);
         tool.push_engine_rules();
         assert_eq!(tool.marks_mode, MarksMode::TransparentLayer, "an unsupported choice falls back to the preference");
 
@@ -2129,7 +2135,7 @@ mod tests {
     /// not consumed by it.
     #[test]
     fn a_run_carries_the_marks_in_the_selected_mode() {
-        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let calls = Arc::new(Mutex::new(EngineCalls::default()));
         let (engine, _) = RecordingEngine::with_marks(all_modes(MarksMode::TransparentLayer), &calls);
         let mut tool = test_host();
         tool.engines = vec![Box::new(engine)];
@@ -2142,7 +2148,7 @@ mod tests {
         let region = egui::ColorImage::filled([4, 4], Color32::WHITE);
         tool.hand_region_to_engine(PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4), purpose: LoadPurpose::Run }, region.clone());
 
-        let calls = calls.borrow();
+        let calls = recorded(&calls);
         assert_eq!(calls.run_region.as_ref(), Some(&region), "a layer-mode run keeps the region clean");
         let Some(RunMarks::Layer(layer)) = calls.run_marks.as_ref() else { panic!("the marks travel as a layer: {:?}", calls.run_marks) };
         assert_eq!(layer.get_pixel(1, 1).0, [255, 0, 0, 255], "the mark the frame holds");
@@ -2152,7 +2158,7 @@ mod tests {
     /// The default (overlay-only) engine gets the marks composited into its region.
     #[test]
     fn a_default_engine_gets_the_marks_inside_the_region() {
-        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let calls = Arc::new(Mutex::new(EngineCalls::default()));
         let (engine, _) = RecordingEngine::with_marks(MarksSupport::OVERLAY_ONLY, &calls);
         let mut tool = test_host();
         tool.engines = vec![Box::new(engine)];
@@ -2166,7 +2172,7 @@ mod tests {
             PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4), purpose: LoadPurpose::Run },
             egui::ColorImage::filled([4, 4], Color32::WHITE),
         );
-        let calls = calls.borrow();
+        let calls = recorded(&calls);
         let sent = calls.run_region.as_ref().expect("the run started");
         assert_eq!(sent.pixels[0], Color32::RED, "the mark is part of the picture");
         assert_eq!(sent.pixels[3 * 4 + 3], Color32::WHITE, "an unmarked pixel is untouched");
@@ -2198,7 +2204,7 @@ mod tests {
     /// the accepted result carries none of the marks the engine did not paint over.
     #[test]
     fn an_overlay_run_never_merges_untouched_marks_into_the_result() {
-        let calls = Rc::new(RefCell::new(EngineCalls::default()));
+        let calls = Arc::new(Mutex::new(EngineCalls::default()));
         let (engine, _) = RecordingEngine::with_marks(MarksSupport::OVERLAY_ONLY, &calls);
         let mut tool = test_host();
         tool.engines = vec![Box::new(engine)];
@@ -2211,7 +2217,7 @@ mod tests {
             PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 4, 4), purpose: LoadPurpose::Run },
             egui::ColorImage::filled([4, 4], Color32::WHITE),
         );
-        let mut answer = calls.borrow().run_region.clone().expect("the run started");
+        let mut answer = recorded(&calls).run_region.clone().expect("the run started");
         assert_eq!(answer.pixels[0], Color32::RED, "the engine saw the marks");
         // The engine repaints pixel 1 and leaves pixel 0 as it got it.
         answer.pixels[1] = Color32::BLUE;

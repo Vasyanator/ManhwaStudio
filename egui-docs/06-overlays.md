@@ -237,6 +237,19 @@ the same point.
   `for_enabled` (:53), `for_disabled` (:62), `.at_pointer()` (:72), `.show(|ui| …)` (:101);
   `Response::on_hover_text` (response.rs:727) is the shorthand.
 
+## 7.1 Embedded windows are not overlays
+
+An embedded `EmbeddedWindow` (`crates/ms-widgets/src/embedded_window.rs`, contract in
+`01-app-shell.md` §5.1) covers the whole viewport, but NOT by z-order: it is a `Panel::top` +
+`CentralPanel` on the viewport's root `Ui` (egui-0.36.2/src/containers/panel.rs:265, :1212), drawn INSTEAD of the host and of
+the windows beneath it, which skip drawing entirely while `covers_host(ctx)` is true. Nothing is
+occluded, so none of §3-§5 applies to it: a host widget that is not drawn has no `Response`, takes
+no click, no hover and no key. The consequence for a host is the opposite of an overlay's: a
+covered host must also skip everything ctx-level it would otherwise do (its own `Area`s, popups,
+hotkeys, the tutorial), because those are not drawn "under" the window — they would be drawn on
+top of it. Popups and `Area`s the window's OWN content opens are ordinary egui layers above its
+panels (§1).
+
 ## 8. Canvas overlays (pointer only)
 
 Tabs paint on top of the page image through the `CanvasHooks` trait

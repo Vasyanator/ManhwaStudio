@@ -12,7 +12,9 @@ re-encode of all pages) or a legacy migration left the user staring at nothing f
 Key structures:
 - `StudioBootstrapApp`: `eframe::App` wrapper with four states — `Loading` (polls the
   worker's receiver, draws a centered spinner), `Failed` (error screen with
-  return-to-launcher / exit buttons), `Running` (delegates `ui` and `on_exit` to `MangaApp`),
+  return-to-launcher / exit buttons), `Running` (delegates `ui` to `MangaApp`, performs the
+  close it requests via `take_close_request`, routes the OS close through `request_os_close`,
+  and runs `MangaApp::shutdown_blocking` in `on_exit` and before a reload),
   and `ClosingDiscarded` (a close arrived during `Loading`; the worker's result has been
   received and discarded, so the deferred close proceeds).
 - Deferred storage-mode reconciliation: on a direct `--project` start, the pending
@@ -50,7 +52,7 @@ windowed startup flow (`run_main_window`), gated off wasm at the module declarat
 */
 
 use crate::ai_backend_supervisor::AiBackendHandle;
-use crate::app::MangaApp;
+use crate::app::{MangaApp, PendingCloseAction};
 use crate::project::ProjectData;
 use crate::project::single_image::{SingleImageError, SingleImageScratch};
 use crate::runtime_log;
@@ -270,8 +272,8 @@ pub struct StudioBootstrapApp {
     /// section). Lives here rather than in `MangaApp` because the shell owns the window from
     /// the first frame, including the loading and error screens.
     geometry: WindowGeometryTracker,
-    /// Windows-only workaround mirrored from `MangaApp`: `with_maximized` is skipped in the
-    /// viewport builder there, so the shell maximizes the root window on its first frame
+    /// Windows-only workaround: `with_maximized` is skipped in the viewport builder, so the
+    /// shell maximizes the root window on its first frame
     /// (otherwise the loading screen shows in the unmaximized 1400x900 window). Now gated on
     /// the persisted state: a window left un-maximized must not be maximized again on Windows.
     #[cfg(target_os = "windows")]
@@ -357,11 +359,11 @@ impl StudioBootstrapApp {
                     );
                     BootstrapState::ClosingDiscarded
                 } else {
-                    let mut app = MangaApp::new(
-                        project,
-                        self.ai_backend.clone(),
-                        Arc::clone(&self.return_to_launcher_flag),
-                    );
+                    let mut app = MangaApp::new(project, self.ai_backend.clone());
+                    // The only UI zoom is the interface-scale setting: egui's keyboard zoom is off
+                    // from the editor's first frame on (the window shell takes this over in
+                    // unified-window WP-6; `Options` survive a reload's `Loading` phase).
+                    self.egui_ctx.options_mut(|options| options.zoom_with_keyboard = false);
                     if let Some(tab) = self.reload_tab.take() {
                         app.set_active_tab(tab);
                     }
@@ -406,6 +408,38 @@ impl StudioBootstrapApp {
             }
         };
         self.state = next;
+    }
+
+    /// Performs the close the running studio decided on this frame, and routes the OS close
+    /// button through it. An OS close is handed to `MangaApp::request_os_close`; when that
+    /// resolves to a close request the OS close simply proceeds, otherwise (the exit dialog
+    /// opened) it is cancelled. Cancelling it and re-sending `Close` instead would not work: a
+    /// `Close` command is re-delivered as `close_requested` on the next frame and would be
+    /// cancelled again. A close decided in-app (dialog, save-then-close, launcher button) sends
+    /// `Close`; `ReturnToLauncher` first raises `return_to_launcher_flag` for `run_main_window`.
+    fn apply_studio_close(app: &mut MangaApp, ctx: &egui::Context, return_to_launcher_flag: &AtomicBool) {
+        let os_close = ctx.input(|i| i.viewport().close_requested());
+        if os_close {
+            app.request_os_close();
+        }
+        match app.take_close_request() {
+            Some(action) => {
+                match action {
+                    PendingCloseAction::Exit => {}
+                    PendingCloseAction::ReturnToLauncher => return_to_launcher_flag.store(true, AtomicOrdering::SeqCst),
+                }
+                if !os_close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            None if os_close => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                // The exit dialog was opened after this frame's draw; show it without waiting
+                // for input.
+                ctx.request_repaint();
+            }
+            None => {}
+        }
     }
 
     /// Centered spinner + status label while the load worker runs. With `closing` the label
@@ -488,6 +522,7 @@ impl eframe::App for StudioBootstrapApp {
         let reload = match &mut self.state {
             BootstrapState::Running(app) => {
                 app.ui(ui, frame);
+                Self::apply_studio_close(app, &ctx, &self.return_to_launcher_flag);
                 if !app.take_project_reload_request() {
                     None
                 } else if self.single_image {
@@ -500,7 +535,8 @@ impl eframe::App for StudioBootstrapApp {
                     None
                 } else {
                     let project_dir = app.project_dir();
-                    app.on_exit(None);
+                    // The report is dropped on purpose: its items are already logged by the teardown.
+                    drop(app.shutdown_blocking());
                     Some(project_dir)
                 }
             }
@@ -538,7 +574,7 @@ impl eframe::App for StudioBootstrapApp {
         }
     }
 
-    /// Forwards eframe's shutdown hook to the real app once it exists: `MangaApp::on_exit`
+    /// Runs the real app's blocking teardown once it exists: `MangaApp::shutdown_blocking`
     /// drains the background layer saver, and skipping it would lose queued layer writes.
     /// Before the project arrives there is nothing to drain.
     ///
@@ -550,7 +586,9 @@ impl eframe::App for StudioBootstrapApp {
     /// for the whole window, not for one `MangaApp`, so the shell owns its teardown.
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let BootstrapState::Running(app) = &mut self.state {
-            app.on_exit(gl);
+            // The report is dropped on purpose: its items are already logged by the teardown and no
+            // frame is left to show them.
+            drop(app.shutdown_blocking());
         }
         self.geometry.flush_and_join();
         match gl {

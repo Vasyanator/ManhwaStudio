@@ -74,6 +74,10 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     one (`Tall`, the default) or AFTER it on the same line (`Wide`, one line per
     row). Row height is uniform across the list within a layout, and the caller's
     font resolver is called only for the rows actually drawn this frame.
+  - `embedded_window` (`EmbeddedWindow`, `EmbeddedWindowState`, `EmbeddedWindowResponse`,
+    `effective_mode`, `covers_host`): a secondary window shown either as a separate OS window
+    or embedded over the whole viewport (title strip with close X and optional collapse);
+    embedded windows stack per viewport and only the topmost one draws.
   - `HelpHint`: a light-gray circled "?" icon whose hover tooltip carries a
     localized text line, an animated WebP hint (`ms-gifs` asset) streamed on a
     short-lived background worker, or both — text above the animation. An optional
@@ -113,6 +117,10 @@ mod ai_button;
 mod autocomplete_line;
 mod color_preset_picker;
 mod editable_combo_box;
+// `EmbeddedWindow`: a secondary window shown either as a separate OS window or embedded over
+// the whole viewport, with a per-viewport stack (only the topmost window draws). Public module:
+// consumers also call its free functions (`covers_host`, `effective_mode`).
+pub mod embedded_window;
 mod font_preview;
 mod hangul_keyboard;
 mod help_hint;
@@ -138,6 +146,7 @@ pub use color_preset_picker::{
     ColorPresetPicker, ColorPresetPickerOutput, ColorPresets, PRESET_COLUMNS, PRESET_COUNT,
     PRESET_ROWS, PresetDefaults,
 };
+pub use embedded_window::{EmbeddedWindow, EmbeddedWindowResponse, EmbeddedWindowState};
 #[allow(unused_imports)]
 pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
 #[allow(unused_imports)]

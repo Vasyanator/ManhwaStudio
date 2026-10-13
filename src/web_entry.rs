@@ -151,6 +151,8 @@ impl eframe::App for WebApp {
                     match build_editor_from_selection(&sel) {
                         Ok(editor) => {
                             ms_theme::apply(ctx);
+                            // The editor's only UI zoom is the interface-scale setting.
+                            ctx.options_mut(|options| options.zoom_with_keyboard = false);
                             *self = WebApp::Editor(Box::new(editor));
                         }
                         Err(err) => console_error(&format!("open project failed: {err}")),
@@ -198,12 +200,7 @@ fn build_editor_from_selection(
         crate::project::ProjectData::load(&sel.project_dir, &settings)
     }
     .map_err(|e| format!("ProjectData::load: {e:#}"))?;
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    Ok(crate::app::MangaApp::new(
-        project,
-        crate::ai_backend_supervisor::AiBackendHandle::disabled(),
-        flag,
-    ))
+    Ok(crate::app::MangaApp::new(project, crate::ai_backend_supervisor::AiBackendHandle::disabled()))
 }
 
 /// Writes the generated demo chapter into storage if it is not already present,

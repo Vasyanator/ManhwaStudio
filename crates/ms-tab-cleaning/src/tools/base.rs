@@ -133,7 +133,12 @@ pub struct CleaningCursorOccluder {
     pub radius_scene: f32,
 }
 
-pub trait CleaningTool {
+/// One cleaning-tab tool, held as `Box<dyn CleaningTool>` by `CleaningTabState`.
+///
+/// `Send` is a supertrait because the whole studio root (`MangaApp`, which owns the cleaning tab)
+/// is moved to a worker thread for its blocking teardown (`src/app/shutdown.rs` asserts it); a tool
+/// must therefore keep only `Send` state (channels, `Arc<Mutex<_>>`, join handles), never `Rc`.
+pub trait CleaningTool: Send {
     #[allow(dead_code)]
     fn tool_id(&self) -> &'static str;
     fn title(&self) -> &'static str;

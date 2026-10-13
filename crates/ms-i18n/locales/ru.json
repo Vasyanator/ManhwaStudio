@@ -5536,6 +5536,8 @@
   "widgets.color_preset_picker.hex_tooltip": "HEX-код цвета: #rrggbb или #rrggbbaa. Можно ввести вручную.",
   "widgets.color_preset_picker.update_button": "Обновить",
   "widgets.color_preset_picker.update_tooltip": "Записать текущий цвет в выбранную ячейку пресетов.",
+  "widgets.embedded_window.close_tooltip": "Закрыть это окно",
+  "widgets.embedded_window.collapse_tooltip": "Свернуть это окно; его можно вернуть с экрана под ним",
   "widgets.hangul_keyboard.clear_button": "Очистить",
   "widgets.hangul_keyboard.frequent_row_label": "Частые",
   "widgets.hangul_keyboard.insert_button": "Вставить",

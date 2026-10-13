@@ -255,7 +255,10 @@ pub struct RunOptionsCtx {
 /// stack, the pending result and the apply path. An engine never touches `CanvasView`,
 /// `ProjectData` or the frame, and never blocks the GUI thread — every call below must
 /// return within a frame.
-pub trait AiEngine {
+///
+/// `Send` is a supertrait because the host that owns the engine lives inside `MangaApp`, which is
+/// moved to a worker thread for its blocking teardown (`src/app/shutdown.rs` asserts it).
+pub trait AiEngine: Send {
     /// Stable identifier, used for widget ids and logs. Never shown to the user.
     fn id(&self) -> &'static str;
 
