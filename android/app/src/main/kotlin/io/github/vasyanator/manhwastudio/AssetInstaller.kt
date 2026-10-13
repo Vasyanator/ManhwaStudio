@@ -3,8 +3,9 @@
  *
  * Purpose:
  * Installs the runtime files bundled in the APK (the assets/ms_root tree: UI and typing fonts,
- * optionally the extended fonts and the wiki) into filesDir/ms_root, the directory the Rust
- * library makes its working directory and runtime root (src/android_entry.rs).
+ * the launcher background images, optionally the extended fonts and the wiki) into
+ * filesDir/ms_root, the directory the Rust library makes its working directory and runtime root
+ * (src/android_entry.rs).
  *
  * Key functions:
  * - isInstalled(): cheap check that ms_root holds exactly this APK's bundle.
