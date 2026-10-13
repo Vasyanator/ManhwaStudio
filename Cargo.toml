@@ -385,10 +385,14 @@ web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlC
 # android-activity. `jni` (same 0.22 line as android-activity and rustls-platform-verifier)
 # hands the application context to `rustls-platform-verifier`, which reqwest (via `genai`)
 # uses for HTTPS and which panics on first use unless initialized.
+# `tracing` is not used by this package: it is listed only to turn on its `log` feature, so the
+# `tracing` events of the winit fork (and of any other dependency) become `log` records, and
+# therefore logcat lines, while no `tracing` subscriber is installed (none is on Android).
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { workspace = true, features = ["android-game-activity"] }
 android_logger = { version = "0.15", default-features = false }
 log = "0.4"
+tracing = { version = "0.1.40", default-features = false, features = ["log"] }
 jni.workspace = true
 rustls-platform-verifier = "0.7"
 

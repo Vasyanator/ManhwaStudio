@@ -22,8 +22,11 @@ Key structures:
 Notes:
 Logging: android-activity already forwards stdout/stderr (so `eprintln!` and the default panic
 message) to logcat, and catches a panic of `android_main` itself; `android_logger` adds the
-`log` facade (eframe, winit, glow). `ms_log::runtime_log` keeps writing `last.log` under the
-runtime root once `run_main` initializes it.
+`log` facade (eframe, glow) at Info level; the winit fork logs through `tracing`, whose `log`
+feature (enabled in the root manifest's Android dependencies) turns its events into `log`
+records while no `tracing` subscriber exists, so they reach logcat under the same tag.
+`ms_log::runtime_log` keeps writing `last.log` under the runtime root once `run_main`
+initializes it.
 The runtime root (`ms_config::program_dir` / `data_dir`) falls back to the working directory,
 so the working directory must be `ms_root` BEFORE the first `ms_config` / `ms_fonts` call.
 Bundled assets (fonts, optionally the wiki) are copied from the APK into `ms_root` by the Kotlin

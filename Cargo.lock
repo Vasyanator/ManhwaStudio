@@ -3442,6 +3442,7 @@ dependencies = [
  "texture-synthesis",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "translators",
  "ttf-parser 0.25.1",
  "unicode-script",
