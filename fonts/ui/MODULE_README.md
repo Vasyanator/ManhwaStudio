@@ -25,16 +25,16 @@ There are exactly four readers, and they consume the same manifest for different
 - `crates/ms-fonts` — the OWNER. Resolves the directory, sorts the files by their `NN-`
   prefix, reads the family names out of each `name` table and hands out `'static` bytes.
 - `crates/ms-widgets/src/ui_fonts.rs` — the egui UI. Runs on a worker thread and registers each file with
-  `egui::Context::add_font` (as `FontData::from_static` over the shared bytes). It is also
-  the only reader that honours a title-local `fonts/ui` override.
+  `egui::Context::add_font` (as `FontData::from_static` over the shared bytes). This
+  directory is the ONLY UI font source: a title's own `fonts/` folder holds typesetting
+  fonts and is never read for the UI.
 - `crates/ms-text-render/src/font_base.rs` — the text RENDERER (design:
   `dev-docs/unicode_base_font_plan.md`). Turns the same manifest into the renderer's own
   `fontdb::Database` plus the deterministic `MsFallback` chain, and never uses the
-  operating system's fonts. It ignores the title override on purpose (decision 2).
+  operating system's fonts, nor any project folder (decision 2).
 - `crates/ms-tab-typing/src/panel/{fonts,font_provider}.rs` — the typing panel. Reads only
   `core[0]` (its path for the list entry, its `ms_fonts::bytes` for the renderer) to offer
-  the stack as the selectable "built-in interface font". It uses the process manifest, not
-  the title override, for the same reason the renderer does.
+  the stack as the selectable "built-in interface font".
 
 ```text
 fonts/ui/
@@ -90,16 +90,12 @@ and `Name("canvas-bubble-unicode")`; the last two names are the constants
 - **A `fonts/ui` candidate must actually contain USABLE core fonts to win.** A candidate that
   yields no core font (`core/`, or the legacy flat layout) is skipped and logged, so an
   existing but empty — or `ext/`-only — folder cannot shadow the healthy bundled directory.
-  "Usable" means the file really parses as a font and its family name reads: epaint PANICS on
-  a font it cannot parse (`epaint-0.36.2/src/text/fonts.rs:981-994`), so a title-local
-  override — which arrives with untrusted project data — is validated before installation,
-  and a file that fails is dropped with a logged reason instead of taking the studio down.
-  The probe order is split by owner: the process manifest (`ms-fonts`) probes the working
-  directory and then the executable directory, while a title-local `fonts/ui` is probed
-  first and ONLY by `crates/ms-widgets/src/ui_fonts.rs`. That override therefore restyles the UI but never
-  the render — a project must not be able to change how a finished render looks
-  (`dev-docs/unicode_base_font_plan.md`, decision 2). An override supplies its own tiers
-  only; a tier it does not ship stays empty rather than being mixed with the bundled one.
+  "Usable" means the family name reads from the file's `name` table; `ms-fonts` drops a file
+  that fails, because epaint PANICS on a font it cannot parse
+  (`epaint-0.36.2/src/text/fonts.rs:981-994`). The candidates are the working directory and
+  then the executable directory, both probed by `ms-fonts` only; no project or title folder
+  is ever a candidate — a project must not be able to change the UI fonts or how a finished
+  render looks (`dev-docs/unicode_base_font_plan.md`, decision 2).
 - **The separator is a HYPHEN.** It used to be a colon (`0:Roboto-…`), which is not a legal
   file-name character on Windows. A name with a colon has no prefix and therefore sorts last.
 - Supported extensions: `.otf`, `.ttf`, `.ttc`, `.otc`. Anything else in these folders

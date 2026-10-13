@@ -339,7 +339,7 @@ fn main() {
         APP_TITLE,
         native_options,
         Box::new(|cc| {
-            cc.egui_ctx.set_theme(egui::Theme::Dark);
+            ms_theme::apply(&cc.egui_ctx);
             Ok(Box::new(TutorialTestApp::new(cc)))
         }),
     );

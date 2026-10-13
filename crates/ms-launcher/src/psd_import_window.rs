@@ -439,17 +439,11 @@ impl PsdImportWindowState {
 
         match viewport_class {
             ViewportClass::EmbeddedWindow => self.show_embedded(ctx),
-            _ => {
-                // A native window is its own viewport but shares the launcher's single egui
-                // Context, so its style is global. Switch to this window's dark style while it
-                // renders and restore the previous (launcher) style afterwards, so it never
-                // leaks back and leaves the launcher's combo boxes / text fields unstyled.
-                let previous_style = ctx.global_style();
-                ctx.set_global_style(standard_dark_style());
-                let keep_open = self.show_native(ui);
-                ctx.set_global_style(previous_style);
-                keep_open
-            }
+            // A native window is its own viewport but shares the launcher's single egui Context,
+            // so its style is global. Render it under the plain base style through `ms_theme`'s
+            // scoped helper, which restores the previous (launcher) style exactly afterwards, so
+            // it never leaks back and leaves the launcher's combo boxes / text fields unstyled.
+            _ => ms_theme::with_scoped_global_style(ctx, Arc::new(ms_theme::base_style()), || self.show_native(ui)),
         }
     }
 
@@ -480,7 +474,7 @@ impl PsdImportWindowState {
                 // `show()` does not reach these panel widgets. Set this window's
                 // dark style directly on the content ui (mirroring the embedded
                 // path) so the launcher theme cannot leak in.
-                ui.set_style(standard_dark_style());
+                ui.set_style(ms_theme::base_style());
                 self.show_contents(ui);
             });
         true
@@ -495,7 +489,7 @@ impl PsdImportWindowState {
             .min_width(1120.0)
             .min_height(720.0)
             .show(ctx, |ui| {
-                ui.set_style(standard_dark_style());
+                ui.set_style(ms_theme::base_style());
                 self.show_contents(ui);
             });
         keep_open
@@ -3094,13 +3088,6 @@ fn repaint_waker(ctx: &Context) -> Waker {
 
 fn button_sized(ui: &mut Ui, label: &str, size: egui::Vec2, enabled: bool) -> egui::Response {
     ui.add_enabled(enabled, Button::new(label).min_size(size))
-}
-
-fn standard_dark_style() -> egui::Style {
-    egui::Style {
-        visuals: egui::Visuals::dark(),
-        ..Default::default()
-    }
 }
 
 #[cfg(test)]

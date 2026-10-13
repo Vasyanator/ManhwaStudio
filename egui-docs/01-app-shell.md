@@ -311,19 +311,29 @@ viewport command (src/launcher/app.rs:643).
 
 ## 7. Theme and style
 
-* `ctx.set_theme(egui::Theme::Dark)` — takes `impl Into<ThemePreference>` (egui-0.36.2/src/context.rs:2170);
-  studio windows do not call it directly: they call `ms_theme::apply(&cc.egui_ctx)`
-  (`crates/ms-theme/src/lib.rs`), which sets `Theme::Dark` and then overrides
-  `error_fg_color`/`warn_fg_color` on the dark style through `style_mut_of`.
-* **There is no `Context::set_style` in 0.36.** The context-level API is
-  `global_style()` / `global_style_mut()` (context.rs:2175, :2189), `all_styles_mut()` (:2213),
-  `style_mut_of(theme, …)` / `set_style_of(theme, …)` (:2237, :2250), `set_visuals` / `set_visuals_of`
-  (:2280, :2267). `set_style` exists only on `Ui` (egui-0.36.2/src/ui.rs:387) and applies to that
-  subtree.
-* The launcher's palette lives in `crates/ms-launcher/src/theme.rs`: `configure_context(ctx)` clones
-  `ctx.global_style()`, edits `Style`/`Visuals` (spacing, `Visuals::dark()`, widget fills, corner
-  radii) and installs it (crates/ms-launcher/src/theme.rs:55-…); `combo_popup_style()` returns a
-  `StyleModifier` (crates/ms-launcher/src/theme.rs:212) for popup-local overrides.
+* **The global style is written ONLY by `ms_theme::install(ctx, style)`** (`crates/ms-theme/src/lib.rs`).
+  It is one `ctx.options_mut` call (egui-0.36.2/src/context.rs:1135) that sets the public `Options`
+  fields `dark_style`, `light_style` (both the same `Arc<Style>`) and `theme_preference = Dark`
+  (egui-0.36.2/src/memory/mod.rs:196-206; `ThemePreference::Dark` at memory/theme.rs:69). The style
+  is a pure function of the active screen: `ms_theme::base_style()` (stock `Visuals::dark()` plus
+  the `error_fg_color` / `warn_fg_color` status colours) plus that screen's pure layer, e.g.
+  `ms_launcher::theme::launcher_style(base)`. Windows without a layer call `ms_theme::apply`
+  (= `install(base_style())`). Child viewports share the `Context`, so they inherit it.
+* Do not call `ctx.set_theme` (context.rs:2170), `global_style_mut()` (:2189), `all_styles_mut()`
+  (:2213), `style_mut_of` / `set_style_of` (:2237, :2250), `set_global_style` (:2200), or
+  `set_visuals` / `set_visuals_of` (:2280, :2267) in product code. **There is no
+  `Context::set_style` in 0.36**; `set_style` exists only on `Ui` (egui-0.36.2/src/ui.rs:387) and,
+  like `ui.style_mut()`, applies to that subtree only — that stays allowed.
+* **Scoped exception:** `ms_theme::with_scoped_global_style(ctx, Arc<Style>, f)` installs a style
+  for the duration of `f` and restores the previous `Arc`s and preference exactly (also on
+  unwind). It exists for a separate native window that shares the screen's `Context` but must
+  render its own look (the launcher's New Project and PSD import windows). An immediate
+  viewport's root `Ui` snapshots the style at creation, so those windows also `ui.set_style` their
+  content `Ui`.
+* `Style: PartialEq` (egui-0.36.2/src/style.rs:241) compares `number_formatter` by `Arc` pointer
+  (style.rs:57-61): two independently built styles are never equal.
+* `combo_popup_style()` (`crates/ms-launcher/src/theme.rs`) returns a `StyleModifier` for
+  popup-local launcher overrides.
 
 ## 8. Fonts
 

@@ -912,57 +912,56 @@ impl NewProjectWindowState {
         }
 
         // A native window is its own viewport but shares the launcher's single egui Context,
-        // so its style is global. Switch to this window's dark style for the duration of its
-        // rendering and restore the previous (launcher) style afterwards, so it never leaks
-        // back and leaves the launcher's combo boxes / text fields unstyled. The embedded path
-        // scopes its style via `ui.set_style` instead and needs no global change.
-        let restore_style = (!matches!(viewport_class, ViewportClass::EmbeddedWindow)).then(|| {
-            let previous = ctx.global_style();
-            ctx.set_global_style(standard_dark_style());
-            previous
-        });
-        let keep_open = match viewport_class {
-            ViewportClass::EmbeddedWindow => self.show_embedded(ctx),
-            _ => self.show_native(ui),
-        };
-        self.show_crop_editor_window(ctx);
-        self.show_advanced_auto_review_window(ctx);
-        self.show_screen_capture_overlay(ctx);
-        self.show_batch_processing_window(ctx);
-        self.show_overwrite_confirm(ctx);
-        if self.source_import.is_loading()
-            || self.project_catalog.is_loading()
-            || self.advanced_download.is_loading()
-            || self.quick_download.is_loading()
-            || self.test_chapter_check_rx.is_some()
-            || self.stitch.is_loading()
-            || self.save.is_loading()
-            || self.waifu2x.is_loading()
-            || self.reline.is_loading()
-            || self.clipboard_paste_in_flight
-            || self.screen_capture_overlay.is_some()
-            || self.screen_capture_pending.is_some()
-            || self.screen_capture_in_flight
-            || self.crop_editor.is_some()
-        {
-            ctx.request_repaint_after(Duration::from_millis(50));
-        }
-        // Overlay last so it draws on top within THIS viewport (its own ctx).
-        #[cfg(feature = "tutorial")]
-        self.tutorial.render(ctx);
-
-        if !keep_open {
-            self.handle_window_closed();
-            // Re-arm the open edge so re-opening the window can autoplay again.
-            #[cfg(feature = "tutorial")]
+        // so its style is global. Render it (and its `ctx`-based sub-windows) under the plain
+        // base style through `ms_theme`'s scoped helper, which restores the previous
+        // (launcher) style exactly afterwards, so it never leaks back and leaves the
+        // launcher's combo boxes / text fields unstyled. The embedded path scopes its style via
+        // `ui.set_style` instead and needs no global change.
+        let mut render = || {
+            let keep_open = match viewport_class {
+                ViewportClass::EmbeddedWindow => self.show_embedded(ctx),
+                _ => self.show_native(ui),
+            };
+            self.show_crop_editor_window(ctx);
+            self.show_advanced_auto_review_window(ctx);
+            self.show_screen_capture_overlay(ctx);
+            self.show_batch_processing_window(ctx);
+            self.show_overwrite_confirm(ctx);
+            if self.source_import.is_loading()
+                || self.project_catalog.is_loading()
+                || self.advanced_download.is_loading()
+                || self.quick_download.is_loading()
+                || self.test_chapter_check_rx.is_some()
+                || self.stitch.is_loading()
+                || self.save.is_loading()
+                || self.waifu2x.is_loading()
+                || self.reline.is_loading()
+                || self.clipboard_paste_in_flight
+                || self.screen_capture_overlay.is_some()
+                || self.screen_capture_pending.is_some()
+                || self.screen_capture_in_flight
+                || self.crop_editor.is_some()
             {
-                self.tutorial_first_frame = true;
+                ctx.request_repaint_after(Duration::from_millis(50));
             }
+            // Overlay last so it draws on top within THIS viewport (its own ctx).
+            #[cfg(feature = "tutorial")]
+            self.tutorial.render(ctx);
+
+            if !keep_open {
+                self.handle_window_closed();
+                // Re-arm the open edge so re-opening the window can autoplay again.
+                #[cfg(feature = "tutorial")]
+                {
+                    self.tutorial_first_frame = true;
+                }
+            }
+            keep_open
+        };
+        match viewport_class {
+            ViewportClass::EmbeddedWindow => render(),
+            _ => ms_theme::with_scoped_global_style(ctx, Arc::new(ms_theme::base_style()), render),
         }
-        if let Some(previous_style) = restore_style {
-            ctx.set_global_style(previous_style);
-        }
-        keep_open
     }
 
     pub fn take_open_project_selection(&mut self) -> Option<OpenProjectSelection> {
@@ -1002,7 +1001,7 @@ impl NewProjectWindowState {
                 // widgets. Set this window's dark style directly on the content
                 // ui, mirroring the embedded path, so the launcher theme cannot
                 // leak into the new-project window.
-                ui.set_style(standard_dark_style());
+                ui.set_style(ms_theme::base_style());
                 self.show_contents(ui, false);
             });
         true
@@ -1018,7 +1017,7 @@ impl NewProjectWindowState {
             .resizable(true)
             .show(ctx, |ui| {
                 ui.scope(|ui| {
-                    ui.set_style(standard_dark_style());
+                    ui.set_style(ms_theme::base_style());
                     self.show_contents(ui, true);
                 });
             });
@@ -7160,13 +7159,6 @@ fn draw_ribbon_resize_handles(ui: &Ui, outer_rect: egui::Rect, container_width: 
 fn manual_cut_y_is_valid(y: usize, page_height: usize) -> bool {
     y >= MANUAL_CUT_MIN_EDGE_DISTANCE_PX
         && y.saturating_add(MANUAL_CUT_MIN_EDGE_DISTANCE_PX) <= page_height
-}
-
-fn standard_dark_style() -> egui::Style {
-    egui::Style {
-        visuals: egui::Visuals::dark(),
-        ..Default::default()
-    }
 }
 
 fn advanced_group_color(group_id: usize) -> egui::Color32 {

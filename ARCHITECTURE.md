@@ -172,8 +172,9 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   counter.
 - **Android:** `src/android_entry.rs::android_main` (cdylib built by `build-android.sh`) chdirs
   into `<internal data>/ms_root` and runs the same `run_main`. Before each product `run_native`,
-  `ms_window_geometry::apply_android_native_window_policy` applies `General.android_native_windows`
-  to the winit fork, which decides real per-Activity windows vs embedded egui windows.
+  `ms_window_geometry::apply_android_native_window_policy` applies `General.secondary_windows`
+  (`ms_config::secondary_windows`, the one owner of the separate-vs-embedded decision on every
+  platform) to the winit fork, which decides real per-Activity windows vs embedded egui windows.
 - **GL lifetime:** the binary calls `egui_shader_layers::install_glow` in the app creator and
   `destroy_glow` on exit; no `ms-*` crate owns GL objects.
 
@@ -304,8 +305,9 @@ the actions tabs return. Canvas tabs implement `CanvasHooks`; the others draw th
 - Rendering never consults OS fonts: one process font database over the bundled `fonts/ui`
   stack plus caller-registered fonts, with a fixed `en-US` locale, so output is
   machine-independent.
-- The `ms-fonts` manifest is process-global and project-independent; only `ui_fonts` honours a
-  title-local `fonts/ui` override, so a project can never change final render output.
+- The `ms-fonts` manifest is process-global and project-independent, and it is the only UI
+  font source (`ui_fonts`): a title's `fonts/` folder carries typesetting fonts only, so a
+  project can change neither the UI fonts nor final render output.
 - UI language (`General.ui_language`, `ms_i18n::LocaleTag`) and typesetting language
   (`TextTab.text_language`, `ms_text_util::language::TextLanguage`) are independent;
   hyphenation, segmentation and font coverage follow the TEXT language.

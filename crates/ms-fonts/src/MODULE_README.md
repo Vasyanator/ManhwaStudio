@@ -64,10 +64,10 @@ installs (`Core` = core + bold, `Full` = everything).
   component, a symlink), so consumers must not cache it themselves, and
   `FontData::from_static` / `fontdb::Source::Binary` share one copy instead of each
   holding their own. Keying by spelling would leak one process-lifetime copy per spelling.
-- **No project/title override here.** The manifest is process-global, so it must not
-  depend on the open project: a title-local `fonts/ui` applies to the UI only, because a
-  project must never be able to change how a finished render looks
-  (`dev-docs/unicode_base_font_plan.md`, decision 2).
+- **No project/title override.** The manifest is process-global and must not depend on
+  the open project: a project must never be able to change how a finished render looks
+  (`dev-docs/unicode_base_font_plan.md`, decision 2). It is also the only UI font source
+  (`ms_widgets::ui_fonts`); a title's `fonts/` folder holds typesetting fonts only.
 - **Nothing here may run on the GUI thread on first use.** `stack()` lists directories and
   reads a `name` table per file; `bytes()` reads whole font files. Later calls are cheap
   (an atomic load, resp. a hash lookup).

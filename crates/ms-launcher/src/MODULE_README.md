@@ -68,8 +68,10 @@ notification.
   and `psb` exists nowhere outside this module; (2) the font-card import filter stays `psd`-only
   (`src/tabs/settings/typesetting/font_groups.rs`, the rfd `add_filter` for the font card), even
   though `ag-psd` would read a `.psb` there. Both are scope decisions; widen them only on request.
-- `theme.rs`: launcher visual style helpers, including `notice_banner` (the amber one-action
-  notice used by the open page's recovery and chapter-format banners).
+- `theme.rs`: the launcher style layer (`launcher_style`, a pure function over
+  `ms_theme::base_style()`; `configure_context` installs it through `ms_theme::install`) and
+  visual style helpers, including `notice_banner` (the amber one-action notice used by the open
+  page's recovery and chapter-format banners).
 - `tutorial.rs`: step script for the main-menu tour (`TutorialId::LauncherMain`); its target keys
   match the `mark` calls in `main_page.rs`.
 
@@ -114,6 +116,11 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
 - "Open image" closes the launcher with `LauncherOutcome::OpenImage(path)`; `lib.rs` routes it.
   The launcher validates only existence and file-ness; decode errors belong to the studio
   loading screen (one owner). wasm has no button and `web_entry.rs` ignores the variant.
+- The launcher never writes the egui global style itself: `ms_theme::install` is the only writer.
+  The New Project and PSD import native windows share the launcher's `Context`, so they render
+  under `ms_theme::with_scoped_global_style(base_style)`, which restores the launcher style
+  exactly; their embedded paths and content panels use `ui.set_style(ms_theme::base_style())`.
+  Status colours (`error_fg` / `warn_fg`) therefore come from `ms_theme::status` here too.
 - Update notifications are advisory UI state; starting an update closes the launcher and returns
   `LauncherOutcome::StartUpdate` to `lib.rs`.
 - The first-run language modal (`first_run_language.rs`) and the main-menu tutorial are mutually

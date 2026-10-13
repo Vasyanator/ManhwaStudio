@@ -245,9 +245,9 @@ fn describe_font(path: &Path, tier: Tier) -> Option<StackFont> {
 /// `current_dir`/`current_exe` only drops that one candidate, so the stack is still found
 /// through the other one.
 ///
-/// Project/title-local overrides are deliberately NOT candidates here: they apply to the
-/// UI only, because a project must not be able to change how a finished render looks
-/// (`dev-docs/unicode_base_font_plan.md`, decision 2).
+/// Project/title-local directories are deliberately NOT candidates: a project must not be
+/// able to change how a finished render looks (`dev-docs/unicode_base_font_plan.md`,
+/// decision 2), and this manifest is also the only UI font source (`ms_widgets::ui_fonts`).
 fn candidate_dirs() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 

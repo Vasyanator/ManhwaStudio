@@ -492,6 +492,9 @@ fn run_main() -> anyhow::Result<()> {
     // Seed the process-global autosave policy (interval + action threshold) the save workers
     // re-read on every wait; the General settings pane changes it live afterwards.
     ms_config::autosave_policy::seed_autosave_policy_from_user_settings(&user_settings);
+    // Seed the process-global secondary-window setting (separate OS windows vs embedded);
+    // the General settings pane changes it live afterwards.
+    ms_config::secondary_windows::seed_from_user_settings(&user_settings);
 
     // Environment check mode terminates the process: it must never fall through into the
     // launcher, the studio, or the AI backend supervisor. `process::exit` is used instead
@@ -2144,9 +2147,6 @@ fn run_main_window(
     let return_to_launcher_flag = Arc::new(AtomicBool::new(false));
     let flag_for_app = Arc::clone(&return_to_launcher_flag);
 
-    // A title (and, historically, the chapter folder) may ship its own `fonts/ui` chain, so
-    // both are probed before the app directories; an image probes none.
-    let font_roots = request.font_roots();
     let single_image = request.is_single_image();
 
     // Start the load before the window opens; the bootstrap shell shows a loading screen
@@ -2154,7 +2154,7 @@ fn run_main_window(
     let load_rx = studio_bootstrap::spawn_open_thread(request, user_settings.clone());
 
     // eframe decides native vs embedded secondary viewports once per `run_native` (Android:
-    // `General.android_native_windows`, read fresh so a launcher-side change applies here).
+    // `General.secondary_windows`, read fresh so a launcher-side change applies here).
     window_geometry::apply_android_native_window_policy();
     eframe::run_native(
         &title,
@@ -2165,7 +2165,7 @@ fn run_main_window(
             // `EventLoop` cannot exist). Publishes them for the settings UI and refreshes the
             // "largest monitor" fallback the NEXT start places on.
             window_geometry::refresh_monitors(cc.winit_window().map(std::sync::Arc::as_ref));
-            ui_fonts::install_with_roots(&cc.egui_ctx, ui_fonts::Tier::Full, &font_roots);
+            ui_fonts::install(&cc.egui_ctx, ui_fonts::Tier::Full);
             // Global interface scale (`General.ui_scale_percent`): per-`Context`, so the
             // studio applies it for itself exactly like the launcher does for its window.
             general_settings_panel::apply_ui_scale_to_context(&cc.egui_ctx);

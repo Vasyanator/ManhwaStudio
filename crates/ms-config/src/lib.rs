@@ -32,8 +32,9 @@ Main items:
 - `MemoryProfile`: persisted global image-cache memory policy recorded under `General`.
 - `StorageMode` (module `storage_mode`): Dev (`.json`) / Prod (`.db`) document storage mode
   under `General.storage_mode`, plus the startup probe seeding the docstore default format.
-- `AndroidNativeWindows` (module `android_windows`): Android secondary-window policy
-  (`auto` / `native` / `embedded`) under `General.android_native_windows`.
+- `SecondaryWindows` / `WindowMode` / `WindowHost` (module `secondary_windows`): where
+  secondary windows open (`auto` / `separate` / `embedded`) under `General.secondary_windows`,
+  its per-platform resolution and the process-global live value.
 - `ui_scale_percent_from_user_settings` / `clamp_ui_scale_percent` / `ui_scale_factor_from_percent`:
   global interface scale (`General.ui_scale_percent`) and its conversion to the egui zoom factor.
 - `autosave_policy_from_user_settings`: the clamped autosave interval / action threshold
@@ -87,11 +88,12 @@ pub mod settings_deep_link;
 pub mod storage_mode;
 pub use storage_mode::{GENERAL_STORAGE_MODE_KEY, StorageMode, storage_mode_from_user_settings};
 
-// The Android secondary-window policy (`General.android_native_windows`). Compiled on every
-// target because the shared settings pane names it everywhere and only shows it on Android;
-// `ms-window-geometry` applies it to the forked winit before each product `run_native`.
-pub mod android_windows;
-pub use android_windows::{AndroidNativeWindows, GENERAL_ANDROID_NATIVE_WINDOWS_KEY, android_native_windows_from_user_settings};
+// The secondary-window setting (`General.secondary_windows`), one for every platform. It
+// lives here because its key and default are part of the `General` tree, its migration runs
+// in `load_user_config`, and both the shared settings pane and `ms-window-geometry` (which
+// applies it to the forked winit on Android) already depend on this crate.
+pub mod secondary_windows;
+pub use secondary_windows::{GENERAL_SECONDARY_WINDOWS_KEY, SecondaryWindows, WindowHost, WindowMode, secondary_windows_from_user_settings};
 
 // Single-image editing mode: the readable input-type table, the scratch-root resolver and
 // the `SingleImage` section of `user_config`. It lives here because the table is pure data
@@ -1452,7 +1454,7 @@ pub fn user_config_defaults() -> Value {
             "ort_load_state": {},
             "memory_profile": MemoryProfile::default().as_config_str(),
             "storage_mode": StorageMode::default().as_config_str(),
-            "android_native_windows": AndroidNativeWindows::default().as_config_str(),
+            "secondary_windows": SecondaryWindows::default().as_config_str(),
             "typing_panel_layout": "vertical",
             // Built above from `AppTab::key()`. Older configs may still carry the
             // legacy Russian keys next to these; see the `enabled_tabs` note in
@@ -2209,7 +2211,11 @@ pub fn load_user_config() -> Result<JsonConfig> {
     };
     ms_docstore::with_lock(&cfg.doc.clone(), |locked| -> Result<()> {
         cfg.data = config_root_or_empty(locked.read_value(), &cfg.path)?;
-        let migrated = migrate_missing_memory_profile_from_legacy_cache_pages(&mut cfg.data);
+        let memory_profile_migrated = migrate_missing_memory_profile_from_legacy_cache_pages(&mut cfg.data);
+        // Before `apply_defaults`: the backfill would otherwise insert the default
+        // `secondary_windows` and the legacy Android value would be lost.
+        let secondary_windows_migrated = secondary_windows::migrate_android_native_windows(&mut cfg.data);
+        let migrated = memory_profile_migrated || secondary_windows_migrated;
         let defaults_applied = cfg.apply_defaults();
         if migrated || defaults_applied {
             locked

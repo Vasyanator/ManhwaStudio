@@ -1,26 +1,34 @@
 # Module: crates/ms-theme
 
 ## Purpose
-Single owner of the STUDIO's semantic colour defaults, layered on top of egui's stock dark
-theme: status (severity) text colours, the editing chrome drawn over page images, the modal
-scrim, and the transparency checkerboards. Values live here once so they can be retuned in one
-place.
+Single owner of the egui GLOBAL style and of the STUDIO's semantic colour defaults, layered on
+top of egui's stock dark theme: the base style, status (severity) text colours, the editing
+chrome drawn over page images, the modal scrim, and the transparency checkerboards. Values live
+here once so they can be retuned in one place.
 
 ## Architecture
 A leaf crate: depends on `egui` only, no I/O, no state beyond the checkerboard tile textures
-cached in each `egui::Context`'s temp data. Every studio crate may depend on it; it depends on no
-workspace crate.
+cached in each `egui::Context`'s temp data. Every UI crate may depend on it (the launcher
+included); it depends on no workspace crate.
 
-- `apply(ctx)` selects `Theme::Dark` and overrides, on the dark style only,
-  `Visuals::error_fg_color = status::ERROR` and `Visuals::warn_fg_color = status::WARNING`.
-  Nothing else of stock dark is touched (no widget restyling). It is called from the
-  app-creation closure of every studio window (`src/lib.rs`: studio, update check,
-  missing-Python prompt, basic project chooser; `src/web_entry.rs` on the launcher→editor swap)
-  and of the installer's update window (`crates/ms-installer/src/update.rs`).
+- `base_style()` is pure: egui's default `Style` with `Visuals::dark()`, where only
+  `error_fg_color = status::ERROR` and `warn_fg_color = status::WARNING` differ. Screen styles
+  are pure layers over it (the launcher's `launcher_style` in `crates/ms-launcher/src/theme.rs`).
+- `install(ctx, style)` writes a complete style in ONE `options_mut` call: preference pinned to
+  `Dark`, the same `Arc<Style>` in the dark and the light slot. Nothing of the previous style is
+  inherited.
+- `apply(ctx)` = `install(ctx, base_style())`, for windows without a screen layer: the studio
+  and the separate prompt windows (`src/lib.rs`: studio, update check, missing-Python prompt,
+  basic project chooser; `src/web_entry.rs` on the launcher→editor swap; the installer's update
+  window `crates/ms-installer/src/update.rs`).
+- `with_scoped_global_style(ctx, style, f)` installs `style` for the duration of `f` and then
+  restores the previous slots and preference exactly (same `Arc`s, also on unwind). Used by the
+  launcher's New Project and PSD import native windows, which share the launcher's `Context`.
 - Everything else is `const` data plus the checkerboard painter.
 
 ## Files and submodules
-- `src/lib.rs`: crate root, `apply`, re-export of `Severity`.
+- `src/lib.rs`: crate root, `base_style`, `install`, `apply`, `with_scoped_global_style`,
+  re-export of `Severity`.
 - `src/status.rs`: `Severity` (`Info`/`Success`/`Warning`/`Error`) and its `color()`; the
   panel-text constants `ERROR`, `WARNING`, `SUCCESS`, `INFO`, plus `DESTRUCTIVE_ARMED_FILL` and
   `ON_STATUS_FILL` (a glyph painted on an `ERROR`/`WARNING` fill, e.g. a "!" badge).
@@ -37,10 +45,19 @@ workspace crate.
   transparency board uses a `checkerboard` preset.
 - Pixel/raster colours of images and masks (tints baked into buffers, `put_pixel` values,
   `[u8; 3]` mask colours) are data, not theme, and stay local to their owners.
-- The launcher has its own theme (`crates/ms-launcher/src/theme.rs`): its own chrome does not use
-  this crate and `apply` is never called on a launcher window. The shared `ms-settings-ui` panes
-  the launcher embeds (double-interface pattern) do use `status` colours, so a status reads the
-  same in the studio and the launcher.
+- **`install` is the only writer of the egui global style in the workspace.** No other code calls
+  `Context::set_theme`, `set_global_style`, `global_style_mut`, `all_styles_mut`,
+  `style_mut_of`, `set_style_of` or `set_visuals*`, or writes `Options::{dark_style,
+  light_style, theme_preference}` (test-only headless contexts excepted). `Ui::set_style` and
+  `ui.style_mut()` stay allowed: they are local to one `Ui` subtree. The only in-frame
+  temporary change is `with_scoped_global_style`, whose contract is "global style after == global
+  style before".
+- The global style is a pure function of the active screen: `base_style()` plus that screen's
+  pure layer. The launcher layers its palette over the base, so status colours read the same in
+  the studio, the launcher and the shared `ms-settings-ui` panes.
+- `Style: PartialEq` compares `number_formatter` by `Arc` pointer: two independently built
+  styles are never `==`. Tests copy the formatter before comparing; production code must not use
+  style equality to detect "unchanged".
 - No speculative tokens: every constant names a role with existing studio users. Add a token
   only for a repeated role; a one-off colour stays local.
 - Checkerboard `cell_px` is never zero (only the presets construct a board). `paint` never
@@ -48,7 +65,9 @@ workspace crate.
   top-left corner and keeps cells screen-constant (one texel per point).
 
 ## Editing map
-- Retune a status colour: `src/status.rs` (`ERROR`/`WARNING` also flow into `Visuals` via `apply`).
+- Retune a status colour: `src/status.rs` (`ERROR`/`WARNING` also flow into `Visuals` via
+  `base_style`).
 - Retune canvas chrome: `src/canvas.rs`.
 - Change a checkerboard palette or cell size: the presets in `src/checkerboard.rs`.
-- Change what `apply` overrides on the dark style: `src/lib.rs`, and keep its tests in sync.
+- Change what the base style overrides: `base_style` in `src/lib.rs`, and keep its tests in sync.
+- Change how a style reaches the context: `install` (the single writer) in `src/lib.rs`.

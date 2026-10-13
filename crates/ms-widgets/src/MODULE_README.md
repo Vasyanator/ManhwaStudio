@@ -44,14 +44,17 @@ crate's `[dev-dependencies]`, so no production build carries them.
   command only on the RISING edge (per-command `last_shortcut_held`): holding a key triggers it
   once. Modifier-only bindings are not dispatched there.
 - `ui_fonts.rs`: the single owner of the bundled `fonts/ui` stack. Every egui context the
-  application creates installs the same chain through it, off the GUI thread. Native-only
-  internals (`mod desktop`); the wasm build compiles the two entry points to no-ops.
+  application creates installs the same chain through it, off the GUI thread. The source is
+  always the global `ms-fonts` manifest (no title-local override; a title's `fonts/` is for
+  typesetting only), and `Tier::Full` arms the deferred `ext/` tier at most once per
+  process. Native-only internals (`mod desktop`); the wasm build compiles the two entry
+  points to no-ops.
   Fonts are registered only with `Context::add_font`, as `FontData::from_static` over the
   `ms-fonts` bytes (`from_owned` would keep a second copy of ~99 MB). Never call
   `Context::set_fonts` (it replaces the whole definition set and drops runtime-registered
   families, which then panic in epaint), and never call `Context::fonts`/`fonts_mut` from the
   loader: they panic before the first frame. Every product `run_native` creator closure calls
-  `install*` exactly once (the dev binaries in `src/bin/` do not).
+  `install` exactly once (the dev binaries in `src/bin/` do not).
 - `bubble_status.rs`: the egui half of the bubble-status feature — it paints a rule's border
   with a bare `Painter` and re-exports the GUI-free rule model from `ms_config::bubble_status`.
 - `ai_button.rs`: AI-tool button gating itself on the process-global AI capabilities

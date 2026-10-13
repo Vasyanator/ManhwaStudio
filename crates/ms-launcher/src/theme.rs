@@ -1,11 +1,13 @@
 /*
-File: src/launcher/theme.rs
+File: crates/ms-launcher/src/theme.rs
 
 Purpose:
-Dark theme styling helpers for the Rust launcher test UI.
+The launcher's style layer and dark styling helpers.
 
 Main responsibilities:
-- configure egui visuals for the launcher overlay;
+- build the launcher screen style as a pure layer over `ms_theme::base_style()`
+  (`launcher_style`); `configure_context` installs it through `ms_theme::install`, the only
+  global-style writer;
 - define shared colors, button states, and card surfaces;
 - keep typography helpers and explicit launcher button rendering consistent with launcher.py
   (full-size `launcher_button` and its half-font `launcher_button_small` share one body);
@@ -64,11 +66,23 @@ const SMALL_BUTTON_CORNER_RADIUS: u8 = 6;
 /// Size of the action button of a notice banner.
 const NOTICE_BUTTON_SIZE: Vec2 = Vec2::new(130.0, 26.0);
 
+/// Installs the launcher screen style on `ctx`: `ms_theme::install` of
+/// [`launcher_style`] over `ms_theme::base_style()`. The global style is written only by
+/// `ms_theme::install`; this wrapper exists for the launcher window creator and the web entry
+/// and goes away when the shell installs the screen style itself (removal boundary: WP-6 of the
+/// unified-window refactor, which deletes both callers).
 pub fn configure_context(ctx: &Context) {
-    let mut style = (*ctx.global_style()).clone();
+    ms_theme::install(ctx, launcher_style(ms_theme::base_style()));
+}
+
+/// The launcher's style layer, a pure function of `base`: launcher spacing, widget fills,
+/// strokes and corner radii, transparent panels and opaque popups. Every `Visuals` field it does
+/// not name (notably `error_fg_color` / `warn_fg_color`) is kept from `base`.
+#[must_use]
+pub fn launcher_style(base: Style) -> Style {
+    let mut style = base;
     style.spacing.item_spacing = egui::vec2(12.0, 12.0);
     style.spacing.button_padding = egui::vec2(18.0, 12.0);
-    style.visuals = egui::Visuals::dark();
     style.visuals.extreme_bg_color = COMBO_FILL;
     style.visuals.faint_bg_color = Color32::from_rgba_premultiplied(255, 255, 255, 10);
     style.visuals.code_bg_color = Color32::from_rgba_premultiplied(20, 20, 24, 230);
@@ -115,7 +129,7 @@ pub fn configure_context(ctx: &Context) {
     style.visuals.panel_fill = Color32::TRANSPARENT;
     style.visuals.window_corner_radius = CornerRadius::same(18);
     style.visuals.menu_corner_radius = CornerRadius::same(12);
-    ctx.set_global_style(style);
+    style
 }
 
 pub fn hero_title(text: &str) -> RichText {
@@ -297,4 +311,96 @@ fn active_button_style(style: &Style) -> Style {
     style.visuals.widgets.active.expansion = BUTTON_HOVER_EXPANSION;
     style.visuals.widgets.open = style.visuals.widgets.hovered;
     style
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BUTTON_FILL, BUTTON_HOVER_EXPANSION, BUTTON_HOVERED, BUTTON_PRESSED, BUTTON_STROKE,
+        CARD_STROKE, COMBO_FILL, COMBO_POPUP_FILL, TEXT_MAIN, configure_context, launcher_style,
+    };
+    use egui::{Color32, CornerRadius, Stroke, Style};
+
+    /// Frozen reference of the launcher style as `configure_context` produced it before the
+    /// style ownership moved to `ms_theme` (characterization fixture: do NOT "simplify" it into
+    /// a call of the production code, it exists to catch drift of that code). Applies the
+    /// launcher layer to `style`.
+    fn legacy_launcher_style(mut style: Style) -> Style {
+        style.spacing.item_spacing = egui::vec2(12.0, 12.0);
+        style.spacing.button_padding = egui::vec2(18.0, 12.0);
+        style.visuals = egui::Visuals::dark();
+        style.visuals.extreme_bg_color = COMBO_FILL;
+        style.visuals.faint_bg_color = Color32::from_rgba_premultiplied(255, 255, 255, 10);
+        style.visuals.code_bg_color = Color32::from_rgba_premultiplied(20, 20, 24, 230);
+        style.visuals.selection.bg_fill = Color32::from_rgba_premultiplied(120, 120, 140, 96);
+        style.visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 255, 255, 72));
+        style.visuals.override_text_color = Some(TEXT_MAIN);
+        for (widget, fill) in [
+            (&mut style.visuals.widgets.inactive, BUTTON_FILL),
+            (&mut style.visuals.widgets.hovered, BUTTON_HOVERED),
+            (&mut style.visuals.widgets.active, BUTTON_PRESSED),
+            (&mut style.visuals.widgets.open, BUTTON_HOVERED),
+            (&mut style.visuals.widgets.noninteractive, BUTTON_FILL),
+        ] {
+            widget.bg_fill = fill;
+            widget.weak_bg_fill = fill;
+            widget.bg_stroke = Stroke::new(1.0, BUTTON_STROKE);
+            widget.corner_radius = CornerRadius::same(10);
+            widget.fg_stroke.color = TEXT_MAIN;
+        }
+        style.visuals.widgets.inactive.expansion = 0.0;
+        style.visuals.widgets.hovered.expansion = BUTTON_HOVER_EXPANSION;
+        style.visuals.widgets.active.expansion = BUTTON_HOVER_EXPANSION;
+        style.visuals.widgets.open.expansion = BUTTON_HOVER_EXPANSION;
+        style.visuals.window_fill = COMBO_POPUP_FILL;
+        style.visuals.window_stroke = Stroke::new(1.0, CARD_STROKE);
+        style.visuals.panel_fill = Color32::TRANSPARENT;
+        style.visuals.window_corner_radius = CornerRadius::same(18);
+        style.visuals.menu_corner_radius = CornerRadius::same(12);
+        style
+    }
+
+    /// The style a fresh context reported after `set_theme(Dark)`, which the legacy
+    /// `configure_context` started from: egui's default dark style.
+    fn stock_dark_style() -> Style {
+        Style { visuals: egui::Visuals::dark(), ..Default::default() }
+    }
+
+    /// `Style: PartialEq` compares `number_formatter` by `Arc` POINTER, so two independently
+    /// built styles are never equal; copy `reference`'s formatter into `style` so a comparison
+    /// checks every other field.
+    fn with_formatter_of(mut style: Style, reference: &Style) -> Style {
+        style.number_formatter = reference.number_formatter.clone();
+        style
+    }
+
+    /// The pure layer over the shared base equals the pre-refactor launcher style everywhere
+    /// except the two status colours, which now come from the base (`ms_theme::status`).
+    #[test]
+    fn launcher_style_matches_legacy_except_status_colours() {
+        let layered = launcher_style(ms_theme::base_style());
+        assert_eq!(layered.visuals.error_fg_color, ms_theme::status::ERROR);
+        assert_eq!(layered.visuals.warn_fg_color, ms_theme::status::WARNING);
+        let mut legacy = legacy_launcher_style(stock_dark_style());
+        legacy.visuals.error_fg_color = ms_theme::status::ERROR;
+        legacy.visuals.warn_fg_color = ms_theme::status::WARNING;
+        assert_eq!(layered, with_formatter_of(legacy, &layered));
+    }
+
+    /// `configure_context` installs exactly the pure layer, regardless of what was installed
+    /// before (the style is replaced wholesale, never inherited), and repeated installs agree.
+    #[test]
+    fn configure_context_installs_the_pure_layer_idempotently() {
+        let ctx = egui::Context::default();
+        let mut foreign = ms_theme::base_style();
+        foreign.spacing.indent = 99.0;
+        ms_theme::install(&ctx, foreign);
+        configure_context(&ctx);
+        let once = ctx.global_style();
+        assert_eq!(*once, with_formatter_of(launcher_style(ms_theme::base_style()), &once));
+        configure_context(&ctx);
+        let twice = ctx.global_style();
+        assert_eq!(*twice, with_formatter_of((*once).clone(), &twice));
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+    }
 }

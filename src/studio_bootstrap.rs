@@ -20,7 +20,7 @@ Key structures:
 - `StartupTarget` / `StudioOpenRequest`: what a studio window opens — a chapter directory, or
   one image through a reserved single-image scratch session (`ms_project::single_image`). The
   `run_main` loop owns the request; `StudioOpenRequest::release` deletes the scratch after the
-  window has closed (plan D13). Also derives the window title and the `fonts/ui` probe roots.
+  window has closed (plan D13). Also derives the window title.
 - `spawn_open_thread`: named load worker. Project: `detect_unsaved_for_project` choosing
   `load_resume_unsaved` vs `load` (the previous synchronous startup sequence). Image:
   `open_single_image`; its error reaches the error screen as `SingleImageError::user_message`.
@@ -125,22 +125,6 @@ impl StudioOpenRequest {
         match self {
             Self::Project(project_dir) => format!("ManhwaStudio v{version} - {}", project_dir.display()),
             Self::Image { source, .. } => crate::single_image::image_window_title(version, source),
-        }
-    }
-
-    /// Extra `fonts/ui` roots probed before the app directories: a project's title and chapter
-    /// folders (a title may ship its own UI font chain). Empty for an image: the folder of a
-    /// loose picture is not a title, and the scratch never holds fonts.
-    #[must_use]
-    pub fn font_roots(&self) -> Vec<PathBuf> {
-        match self {
-            Self::Project(project_dir) => project_dir
-                .parent()
-                .map(Path::to_path_buf)
-                .into_iter()
-                .chain(std::iter::once(project_dir.clone()))
-                .collect(),
-            Self::Image { .. } => Vec::new(),
         }
     }
 
@@ -596,7 +580,6 @@ mod tests {
         assert!(matches!(&request, StudioOpenRequest::Project(mapped) if *mapped == dir));
         assert!(!request.is_single_image());
         assert_eq!(request.window_title("1.2.3"), "ManhwaStudio v1.2.3 - /home/u/titles/Title/Chapter 1");
-        assert_eq!(request.font_roots(), vec![PathBuf::from("/home/u/titles/Title"), dir]);
         assert!(!base.exists(), "a project start must not create the scratch base");
         request.release();
     }
@@ -616,7 +599,6 @@ mod tests {
         assert!(root.starts_with(&base) && root.is_dir(), "scratch root {} must live under the base", root.display());
         assert!(request.is_single_image());
         assert_eq!(request.window_title("1.2.3"), "ManhwaStudio v1.2.3 - page one.jpg");
-        assert!(request.font_roots().is_empty(), "an image never probes title-local fonts");
         request.release();
         assert!(!root.exists(), "release must delete the scratch session");
         std::fs::remove_dir_all(&base).expect("remove test scratch base");

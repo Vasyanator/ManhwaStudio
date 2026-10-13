@@ -34,8 +34,10 @@ from __future__ import annotations
 # mismatch is a clean error (see PROTOCOL.md "Error model").
 # The contract also covers the on-disk user_config storage semantics shared with
 # Rust (docstore.py / ms-docstore: `.json` or SQLite `.db`).
+# 9: General.android_native_windows replaced by General.secondary_windows
+# (user_config migration on load).
 # ============================================================================
-PROTOCOL_VERSION = 8
+PROTOCOL_VERSION = 9
 
 # ============================================================================
 # FRAME SIZE GUARDS

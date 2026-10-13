@@ -27,7 +27,8 @@ Key functions:
 - `resolve_monitor`, `largest_monitor_index`, `should_relocate`
 - `refresh_monitors`, `monitor_snapshot`, `persist_preferred_monitor`, `request_relocation`
 - `update_window_section`, `persist_geometry`, `spawn_geometry_saver`
-- `apply_android_native_window_policy` (Android secondary-window policy before `run_native`)
+- `apply_android_native_window_policy` (secondary-window setting before `run_native`, Android)
+- `sync_secondary_window_policy` (secondary-window setting onto a live context, Android)
 
 Notes:
 DURABILITY. Geometry reaches the disk through `config_saver::ConfigSaver`, the shared debouncing
@@ -397,22 +398,44 @@ pub fn load_window_settings() -> WindowSettings {
     }
 }
 
-/// Applies the user's Android secondary-window policy (`General.android_native_windows`)
-/// before a product `eframe::run_native`; a no-op on every other target.
+/// Applies the user's secondary-window setting (`General.secondary_windows`) before a product
+/// `eframe::run_native`; a no-op on every other target than Android.
 ///
-/// On Android it reads `user_config` (blocking, but it runs before the window exists) and
-/// hands the value to `android_app::apply_native_window_policy`. A read error is logged and
-/// leaves the policy unchanged (winit's `Auto` until something set it), so a window still opens.
+/// On Android it reads `user_config` (blocking, but it runs before the window exists), seeds
+/// the live `ms_config::secondary_windows` value and hands it to the forked winit through
+/// `android_app::set_secondary_window_policy`, which eframe consults once per `run_native`. A
+/// read error is logged and leaves both unchanged, so a window still opens. Transitional: once
+/// one persistent window hosts every screen, [`sync_secondary_window_policy`] replaces it.
 pub fn apply_android_native_window_policy() {
     #[cfg(target_os = "android")]
     match config::load_raw_user_settings_for_startup() {
-        Ok(settings) => android_app::apply_native_window_policy(&settings),
+        Ok(settings) => {
+            config::secondary_windows::seed_from_user_settings(&settings);
+            android_app::set_secondary_window_policy(config::secondary_windows::current());
+        }
         Err(err) => {
             runtime_log::log_error(format!(
-                "[android-windows] failed to read user_config.json for the secondary-window \
-                 policy; keeping the current policy; error={err:#}"
+                "[secondary-windows] failed to read user_config.json for the secondary-window \
+                 setting; keeping the current policy; error={err:#}"
             ));
         }
+    }
+}
+
+/// Re-syncs a live window's viewport embedding with the secondary-window `setting`.
+///
+/// On Android it sets the forked winit's policy (`Separate` -> native windows, `Auto` /
+/// `Embedded` -> embedded) and then `ctx.set_embed_viewports(!native_windows_available())`, so
+/// the fork's runtime gate (missing bridge, full-screen fallback latch) still wins over a
+/// `Separate` request. Safe to call between frames, e.g. at a screen switch; viewports already
+/// open keep their mode. Elsewhere it is a no-op: eframe's own `embed_viewports` value stays.
+/// No I/O; runs on the GUI thread.
+#[cfg_attr(not(target_os = "android"), expect(unused_variables, reason = "only Android has a runtime viewport policy to sync; the parameters are read in its branch"))]
+pub fn sync_secondary_window_policy(ctx: &egui::Context, setting: config::SecondaryWindows) {
+    #[cfg(target_os = "android")]
+    {
+        android_app::set_secondary_window_policy(setting);
+        ctx.set_embed_viewports(!android_app::native_windows_available());
     }
 }
 

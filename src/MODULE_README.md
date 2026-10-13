@@ -147,7 +147,7 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   persistence) and the Windows first-frame maximize workaround live here, as does the window-wide
   `egui-shader-layers` glow backend (installed from the app creator, destroyed in `on_exit`).
   `StudioOpenRequest` (project dir, or image + `Arc<SingleImageScratch>`) is what a window opens;
-  it also derives the window title and the `fonts/ui` probe roots.
+  it also derives the window title.
 - `single_image/`: app-shell half of the single-image mode — `SingleImageController` (one
   `MangaApp` field, `Some` only for `SessionKind::SingleImage`) behind «Сохранить» / «Сохранить как»,
   its pure save state machine, the exit and «Параметры JPEG» dialogs, and the tab filter, window
@@ -326,13 +326,11 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   the first character the chain cannot draw and is called from the canvas while a frame
   runs (it reads `Context::fonts_mut`, so never from a loader or a worker thread); the
   canvas bubble cards and the typing tab's user-text surfaces all offer it their strings.
-  The title-local `fonts/ui` override is resolved here and nowhere else — the `ms-fonts`
-  manifest stays project-independent so a project cannot change a finished render.
-  Override files come from an arbitrary opened project and are therefore UNTRUSTED: each
-  one is parsed and must yield a family name before it can be installed
-  (`validate_font_bytes`), because epaint parses every registered file eagerly and PANICS
-  on a failure it cannot recover from. A candidate whose core files all fail that check is
-  treated as an absent override and the bundled stack wins.
+  The global program `fonts/ui` stack (the `ms-fonts` manifest) is the ONLY UI font source:
+  a title's `fonts/` folder holds typesetting fonts and is never read for the UI. The
+  extended tier is armed at most once per process. System-fallback files are parsed and
+  must yield a family name before they are installed (`validate_font_bytes`), because
+  epaint parses every registered file eagerly and PANICS on a failure.
 - `bubble_status` (crate `ms-widgets`, re-exported by `lib.rs`): the egui half of the bubble status feature — border painting helpers and the
   `BubbleBorderPaintColor` colour view — plus a wholesale re-export of the GUI-free rule model in
   `ms_config::bubble_status` (rules, conditions, default preset, JSON, evaluation), which had to

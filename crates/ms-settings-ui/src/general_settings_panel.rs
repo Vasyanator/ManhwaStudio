@@ -43,7 +43,7 @@ Key items:
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
 - `draw_general_settings_panel`: renders the projects-dir editor + Dev/Prod storage row
   (`storage_mode_setting`) + memory-profile combo + interface-scale slider + autosave policy +
-  primary-monitor selector + Android-only secondary-window policy + UI-language
+  primary-monitor selector + secondary-window setting (not on the web) + UI-language
   selector + typesetting-language selector. With a `WarningSet` (launcher) the
   projects-dir and UI-language labels carry their inline warning badges; `None` (studio)
   draws no badge and keeps the layout unchanged.
@@ -129,9 +129,10 @@ pub struct GeneralSettingsPanelState {
     /// web build.
     #[cfg(not(target_arch = "wasm32"))]
     pub preferred_monitor: Option<ms_window_geometry::MonitorKey>,
-    /// Android secondary-window policy (`General.android_native_windows`). Held on every
-    /// target (the row is only drawn on Android); applied at the next `run_native`.
-    pub android_native_windows: ms_config::AndroidNativeWindows,
+    /// Where secondary windows open (`General.secondary_windows`). Held on every target (the
+    /// row is not drawn on the web); a change is applied live to
+    /// `ms_config::secondary_windows` and takes effect the next time a window opens.
+    pub secondary_windows: ms_config::SecondaryWindows,
     /// Status line under the projects-dir editor.
     pub status: GeneralSettingsStatus,
     /// The Dev/Prod storage row (conversion job bookkeeping of this surface).
@@ -194,7 +195,7 @@ impl GeneralSettingsPanelState {
     /// read here is already migrated.
     #[must_use]
     pub fn new() -> Self {
-        let (projects_dir, memory_profile, ui_language_tag, android_native_windows) =
+        let (projects_dir, memory_profile, ui_language_tag, secondary_windows) =
             match ms_config::load_raw_user_settings_for_startup() {
                 Ok(settings) => (
                     ms_config::projects_root_from_user_settings(&settings)
@@ -202,7 +203,7 @@ impl GeneralSettingsPanelState {
                         .into_owned(),
                     ms_config::memory_profile_from_user_settings(&settings),
                     ui_language_tag_from_settings(&settings),
-                    ms_config::android_native_windows_from_user_settings(&settings),
+                    ms_config::secondary_windows_from_user_settings(&settings),
                 ),
                 Err(err) => {
                     runtime_log::log_error(format!(
@@ -215,7 +216,7 @@ impl GeneralSettingsPanelState {
                             .into_owned(),
                         MemoryProfile::default(),
                         DEFAULT_UI_LANGUAGE_TAG.to_string(),
-                        ms_config::AndroidNativeWindows::default(),
+                        ms_config::SecondaryWindows::default(),
                     )
                 }
             };
@@ -239,7 +240,7 @@ impl GeneralSettingsPanelState {
             autosave_action_threshold: autosave_policy.action_threshold,
             #[cfg(not(target_arch = "wasm32"))]
             preferred_monitor: seed_preferred_monitor(),
-            android_native_windows,
+            secondary_windows,
             // Filesystem scan happens once here, at construction — never per frame.
             locale_options: scan_locale_options(),
             status: GeneralSettingsStatus::Idle,
@@ -393,10 +394,10 @@ pub fn draw_general_settings_panel(
 
     ui.separator();
 
-    // Only Android has a secondary-window policy; no `PlatformFeature` describes it, so the
-    // row is gated on the target (a compile-time constant, the row still builds everywhere).
-    if cfg!(target_os = "android") {
-        draw_android_native_windows_setting(ui, state);
+    // The web has one canvas and no separate windows, so the choice would be meaningless
+    // there; the host decision has one owner (`WindowHost::current`), not a `PlatformFeature`.
+    if ms_config::WindowHost::current() != ms_config::WindowHost::Web {
+        draw_secondary_windows_setting(ui, state);
         ui.separator();
     }
 
@@ -611,49 +612,50 @@ fn draw_primary_monitor_setting(ui: &mut egui::Ui, _state: &mut GeneralSettingsP
     ui.small(t!("settings.general.monitor_unavailable_hint"));
 }
 
-/// Renders the Android secondary-window policy selector (`General.android_native_windows`).
+/// Renders the secondary-window selector (`General.secondary_windows`).
 ///
-/// A change is persisted synchronously; it is APPLIED by
-/// `ms_window_geometry::apply_android_native_window_policy` before the next launcher or studio
-/// `run_native`, because eframe picks native vs embedded viewports once per window start.
-fn draw_android_native_windows_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
-    use ms_config::AndroidNativeWindows;
+/// A change is applied live to `ms_config::secondary_windows` first (read when the next
+/// secondary window opens), then persisted synchronously; a failed write keeps the live value
+/// for this session and reports the error on the status line.
+fn draw_secondary_windows_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+    use ms_config::SecondaryWindows;
 
-    ui.label(t!("settings.general.android_windows_label"));
-    ui.small(t!("settings.general.android_windows_hint"));
-    let mut selected = state.android_native_windows;
+    ui.label(t!("settings.general.secondary_windows_label"));
+    ui.small(t!("settings.general.secondary_windows_hint"));
+    let mut selected = state.secondary_windows;
     ui.horizontal_wrapped(|ui| {
-        WheelComboBox::from_label(t!("settings.general.android_windows_combo_label"))
-            .id_salt("settings.general.android_windows_combo_label")
-            .selected_text(android_native_windows_option_label(selected))
+        WheelComboBox::from_label(t!("settings.general.secondary_windows_combo_label"))
+            .id_salt("settings.general.secondary_windows_combo_label")
+            .selected_text(secondary_windows_option_label(selected))
             .show_ui(ui, |ui| {
-                for policy in AndroidNativeWindows::ALL {
-                    ui.selectable_value(&mut selected, policy, android_native_windows_option_label(policy));
+                for setting in SecondaryWindows::ALL {
+                    ui.selectable_value(&mut selected, setting, secondary_windows_option_label(setting));
                 }
             });
     });
-    if selected == state.android_native_windows {
+    if selected == state.secondary_windows {
         return;
     }
-    state.android_native_windows = selected;
+    state.secondary_windows = selected;
+    ms_config::secondary_windows::set(selected);
     if let Err(err) = persist_general_key(
-        ms_config::GENERAL_ANDROID_NATIVE_WINDOWS_KEY,
+        ms_config::GENERAL_SECONDARY_WINDOWS_KEY,
         serde_json::Value::String(selected.as_config_str().to_string()),
     ) {
         runtime_log::log_error(format!(
-            "[general-settings] failed to persist the Android window policy '{}'; error={err}",
+            "[general-settings] failed to persist the secondary-window setting '{}'; error={err}",
             selected.as_config_str()
         ));
-        state.status = GeneralSettingsStatus::Error(t!("settings.general.android_windows_save_error").to_string());
+        state.status = GeneralSettingsStatus::Error(t!("settings.general.secondary_windows_save_error").to_string());
     }
 }
 
-/// Localized combo entry for one Android secondary-window policy.
-fn android_native_windows_option_label(policy: ms_config::AndroidNativeWindows) -> String {
-    match policy {
-        ms_config::AndroidNativeWindows::Auto => t!("settings.general.android_windows_auto_option").to_string(),
-        ms_config::AndroidNativeWindows::Native => t!("settings.general.android_windows_native_option").to_string(),
-        ms_config::AndroidNativeWindows::Embedded => t!("settings.general.android_windows_embedded_option").to_string(),
+/// Localized combo entry for one secondary-window setting.
+fn secondary_windows_option_label(setting: ms_config::SecondaryWindows) -> String {
+    match setting {
+        ms_config::SecondaryWindows::Auto => t!("settings.general.secondary_windows_auto_option").to_string(),
+        ms_config::SecondaryWindows::Separate => t!("settings.general.secondary_windows_separate_option").to_string(),
+        ms_config::SecondaryWindows::Embedded => t!("settings.general.secondary_windows_embedded_option").to_string(),
     }
 }
 

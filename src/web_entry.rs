@@ -72,7 +72,7 @@ pub fn start() {
                 canvas,
                 web_options,
                 Box::new(|cc| {
-                    cc.egui_ctx.set_theme(egui::Theme::Dark);
+                    // Installs the launcher style AND pins the dark preference (`ms_theme::install`).
                     crate::launcher::theme::configure_context(&cc.egui_ctx);
                     // GPU shader layers (the PS editor's «Коррекция») on WebGL2. WebGL1 is
                     // refused by the library; the panel then reports the correction as

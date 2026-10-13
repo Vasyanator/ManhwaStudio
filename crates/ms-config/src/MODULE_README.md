@@ -115,12 +115,18 @@ that defines the type.
   `fonts_presets_doc`); `app_fonts_dir` is the ONLY fonts-directory resolver
   (the typing tab owns those documents' contents but resolves the directory here). The conversion
   driver itself lives in `ms-project` (`storage_mode::convert_globals`).
-- `android_windows.rs`: the Android secondary-window policy — `AndroidNativeWindows` (frozen
-  `"auto"`/`"native"`/`"embedded"` under `General.android_native_windows`, default Auto) and
-  the pure reader `android_native_windows_from_user_settings` (unknown value -> Auto + warning).
-  Compiled on every target (the shared General pane names it, showing the row only on
-  Android); applied to the forked winit by
-  `ms_window_geometry::apply_android_native_window_policy` before each product `run_native`.
+- `secondary_windows.rs`: where secondary windows open, one setting for every platform —
+  `SecondaryWindows` (frozen `"auto"`/`"separate"`/`"embedded"` under
+  `General.secondary_windows`, default Auto), the resolved `WindowMode`, the host class
+  `WindowHost` (its `current()` is the ONLY `cfg` site of the decision; there is deliberately
+  no `PlatformFeature`) and the pure table `resolve_for` (web: always embedded; Android:
+  embedded unless `Separate`; desktop: separate unless `Embedded`). The live value is a
+  process-global atomic (`current` / `set` / `seed_from_user_settings`, `requested_mode`), edited
+  by the shared General pane. `migrate_android_native_windows` rewrites the Android-only
+  predecessor `General.android_native_windows` (`native` -> `separate`, `embedded`, else
+  `auto`; the old key is always removed, an existing new key wins) and runs in
+  `load_user_config` BEFORE the defaults backfill; the reader maps an unmigrated legacy key the
+  same way. Applied to the forked winit by `ms_window_geometry` (Android only).
 - `single_image.rs`: the single-image editing mode's shared names — `INPUT_FILE_TYPES` (the ONE
   readable-input table: extensions + MIME; consumed by the launcher picker, the Linux desktop
   entry, the Windows "Open with" registration and the CLI error text), `scratch_base()`

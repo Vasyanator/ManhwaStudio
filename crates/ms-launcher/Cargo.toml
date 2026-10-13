@@ -36,6 +36,10 @@ ms-page-ops = { path = "../ms-page-ops" }
 ms-docstore = { path = "../ms-docstore" }
 # Every widget the launcher is built from, plus `ui_fonts` for the window's font stack.
 ms-widgets = { path = "../ms-widgets" }
+# The base style and the only global-style writer (`ms_theme::install`): the launcher style
+# is a pure layer over `base_style()`, and New Project / PSD import render their plain dark
+# look through `with_scoped_global_style`.
+ms-theme = { path = "../ms-theme" }
 # The settings surface shared with the studio: the settings page embeds
 # `SharedSettingsPanels`, the first-run modal reuses the locale helpers of the General
 # pane, and the launcher drives the same `AiBackendHandle` supervisor.

@@ -42,13 +42,19 @@ in, or the two `Window` types stop unifying.
   binary and `ms-launcher`. `android_main` (`src/android_entry.rs`) installs the handle, and
   REPLACES it when android-activity calls `android_main` again for a re-created Activity;
   every `eframe::NativeOptions` in the process sets `android_app: android_app::current()`.
-  It also maps `General.android_native_windows` (`ms_config::AndroidNativeWindows`) onto the
-  forked winit's `multiwindow::set_native_window_policy` (`apply_native_window_policy`). The
-  crate-root `apply_android_native_window_policy()` (no-op off Android) reads `user_config`
-  and calls it; the two product roots (launcher `ms-launcher/src/lib.rs`, studio
-  `src/lib.rs::run_main_window`) call it right before `eframe::run_native`, because eframe
-  decides native vs embedded viewports once per `run_native`. The startup prompts keep
-  whatever policy is set (they open no secondary viewports).
+  It also applies `General.secondary_windows` (`ms_config::SecondaryWindows`) to the forked
+  winit (`set_secondary_window_policy`: resolved for Android, `Separate` -> `Native`,
+  otherwise `Embedded`; the fork's device auto-detection is never used) and exposes the fork's
+  runtime gate (`native_windows_available`). Two crate-root entry points, both no-ops off
+  Android: `apply_android_native_window_policy()` reads `user_config`, seeds the live
+  `ms_config::secondary_windows` value and sets the policy; the two product roots (launcher
+  `ms-launcher/src/lib.rs`, studio `src/lib.rs::run_main_window`) call it right before
+  `eframe::run_native`, because eframe decides native vs embedded viewports once per
+  `run_native`. `sync_secondary_window_policy(ctx, setting)` re-syncs a LIVE context (sets the
+  policy, then `ctx.set_embed_viewports(!native_windows_available())`, so the fork's
+  full-screen fallback still wins) and is meant for screen switches inside one persistent
+  window; it does no I/O. The startup prompts keep whatever policy is set (they open no
+  secondary viewports).
 
 ## Contracts and invariants
 - **Units.** Everything persisted is in *logical pixels* (physical / DPI scale), independent

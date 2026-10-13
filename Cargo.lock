@@ -3765,6 +3765,7 @@ dependencies = [
  "ms-tab-translation",
  "ms-tabs-simple",
  "ms-text-util",
+ "ms-theme",
  "ms-thread",
  "ms-widgets",
  "ms-window-geometry",
