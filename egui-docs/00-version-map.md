@@ -62,6 +62,19 @@ Both round to UI pixels and both exist on `Context`:
 
 On desktop the two are usually identical; do not assume it.
 
+**ManhwaStudio fork (Android safe area).** The build patches egui / egui-winit / eframe with the
+fork in `crates/egui` (root `[patch.crates-io]`); two facts differ from upstream 0.36.2:
+
+* The root `Ui` every `App::ui` / viewport callback receives is `max_rect(ctx.content_rect())`
+  (`crates/egui/crates/egui/src/context.rs:814`; upstream: `viewport_rect()`), so `Panel` /
+  `CentralPanel` stay inside the safe area. Identical on desktop, where the insets are zero.
+* On Android, egui-winit sets `safe_area_insets` every frame from the window's system bars,
+  display cutout and on-screen keyboard (`crates/egui/crates/egui-winit/src/lib.rs:308`).
+  So on Android `content_rect` is smaller than `viewport_rect` (and shrinks while the keyboard is
+  open). Lay out and place callouts in `content_rect`; only full-viewport scrims/dims use
+  `viewport_rect`. The zoom-change rescale also uses `viewport_rect` there
+  (`crates/egui/crates/egui/src/context.rs:447`).
+
 ---
 
 ## 4. Painter, corners, strokes

@@ -79,6 +79,10 @@ Builders that matter for overlays:
   positioned by hand.
 * Full-viewport geometry comes from `ctx.viewport_rect()` (egui-0.36.2/src/context.rs:2921). There is
   no `screen_rect()` in 0.36.
+* Split the two on purpose: a dim / scrim / input blocker covers `ctx.viewport_rect()`, but a callout
+  or card you position by hand belongs in `ctx.content_rect()` (egui-0.36.2/src/context.rs:2907) —
+  on Android (fork, see `00-version-map.md` §3) that excludes the status bar, gesture bar, cutout
+  and on-screen keyboard. Reference: `ms-settings-ui/src/tutorial/engine.rs` (`show`).
 
 ## 3. Painting vs. registering a hitbox — the core distinction
 

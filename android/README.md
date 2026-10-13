@@ -66,6 +66,16 @@ application meta-data `rs.winit.android.NATIVE_LIB = manhwastudio_rs` and `REORD
 and lifecycle: `crates/winit/src/platform_impl/android/secondary/MODULE_README.md`; inclusion
 details: `crates/winit/android/README.md`.
 
+## Window insets
+
+Android draws the app edge-to-edge (enforced from targetSdk 35): the status bar, the gesture /
+navigation bar, a display cutout and the on-screen keyboard overlap the window. The winit fork
+reads each window's insets through the `winit-secondary-window` module (also for the main
+`GameActivity`) and egui keeps its panels inside the resulting safe area, the keyboard included
+(contract: `crates/winit/src/platform_impl/android/MODULE_README.md`). Therefore the manifest
+must not opt out of edge-to-edge, and `MainActivity` keeps `windowSoftInputMode="adjustResize"`,
+which makes Android report the keyboard as an inset instead of panning the window.
+
 ## File dialogs (Storage Access Framework)
 
 The Rust file-dialog seam (`crates/ms-platform`, `file_dialog/android.rs`) loads

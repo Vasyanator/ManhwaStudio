@@ -49,6 +49,11 @@
             </intent-filter>
         </activity>
 
+        <!-- Edge-to-edge is enforced (targetSdk 35): the window is never resized for the system
+             bars or the keyboard. adjustResize stays because it makes Android report the
+             keyboard as an ime() window inset instead of panning the window; the winit fork
+             folds that inset into the safe area egui lays out in (android/README.md, "Window
+             insets"). Do NOT add windowOptOutEdgeToEdgeEnforcement. -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode|locale|layoutDirection|fontScale|touchscreen|colorMode"

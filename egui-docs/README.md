@@ -2,8 +2,9 @@
 
 **Read this before writing or changing any UI code.**
 
-This project builds against **egui / eframe 0.36.2** (upstream crates.io, no fork,
-no `[patch]`). Recent egui releases (through 0.36) renamed, removed, or restructured a large part of the API
+This project builds against **egui / eframe 0.36.2**: the API is upstream crates.io 0.36.2,
+patched in through root `[patch.crates-io]` by the ManhwaStudio fork in `crates/egui`
+(Android multi-window and safe-area changes; the behavioural facts are in `00-version-map.md` §3). Recent egui releases (through 0.36) renamed, removed, or restructured a large part of the API
 that a language model has memorised from earlier versions. Writing egui from memory
 here does not produce slightly-old code — it produces code that **does not compile**,
 or worse, code that compiles and behaves subtly wrong (input leaking under overlays,

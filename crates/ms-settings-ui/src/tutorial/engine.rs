@@ -624,7 +624,12 @@ impl<C> Tutorial<C> {
             tf!("tutorial.step_counter", step = self.history.len())
         };
 
+        // The dim covers the whole viewport (also the system-bar bands); the callout is placed
+        // and clipped inside the safe content rect, so it never sits under the status /
+        // navigation bar, a display cutout or the on-screen keyboard (Android). Without
+        // safe-area insets both rects are equal.
         let screen = ctx.viewport_rect();
+        let content = ctx.content_rect();
         let hole = registry
             .union(&targets)
             .map(|rect| rect.expand(self.padding));
@@ -635,20 +640,20 @@ impl<C> Tutorial<C> {
         // 2. Resolve where the callout goes and where the fixed-length arrow runs,
         // using the callout size measured last frame so the arrow keeps its length.
         let placement =
-            hole.map(|hole| Self::compute_placement(hole, screen, self.last_callout_size));
+            hole.map(|hole| Self::compute_placement(hole, content, self.last_callout_size));
         let callout_pos = match placement {
             Some(placement) => placement.pos,
             // No visible target: centre the callout, no arrow.
             None => Pos2::new(
-                screen.center().x - self.last_callout_size.x * 0.5,
-                screen.center().y - self.last_callout_size.y * 0.5,
+                content.center().x - self.last_callout_size.x * 0.5,
+                content.center().y - self.last_callout_size.y * 0.5,
             ),
         };
 
         // 3. Callout box (interactive, above the dim). Returns any button action.
         let (callout_rect, action) = Self::show_callout(
             ctx,
-            screen,
+            content,
             callout_pos,
             &title,
             &body,
@@ -737,7 +742,7 @@ impl<C> Tutorial<C> {
     // add indirection without clarifying this single call site.
     fn show_callout(
         ctx: &Context,
-        screen: Rect,
+        content: Rect,
         pos: Pos2,
         title: &str,
         body: &str,
@@ -758,7 +763,7 @@ impl<C> Tutorial<C> {
             .movable(false)
             .interactable(true)
             .show(ctx, |ui| {
-                ui.set_clip_rect(screen);
+                ui.set_clip_rect(content);
                 // Keep the themed popup stroke/shadow/rounding; only override the
                 // fill when a surface asks for an opaque tint (readability under a
                 // light dim).
@@ -873,6 +878,7 @@ impl<C> Tutorial<C> {
     /// direction (straight for a side zone, 45° for a corner zone), and the
     /// callout is anchored by its element-facing edge/corner to that tail — so the
     /// arrow leaves the callout at the mirror of where it enters the highlight.
+    /// `screen` is the rect the callout belongs in: the safe content rect, not the viewport.
     fn compute_placement(hole: Rect, screen: Rect, callout_size: Vec2) -> CalloutPlacement {
         let zone = classify_zone(hole, screen);
         let s = FRAC_1_SQRT_2;
