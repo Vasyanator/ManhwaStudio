@@ -18,14 +18,16 @@ Main responsibilities:
   (`touch_selection`) and drives its own selection state with it (`drive_touch_drag` for
   rectangle-drag capture modes);
 - hand this frame's finger tap point to the tab (`touch_tap`), for dismiss/commit decisions
-  only (the canvas itself does nothing on a tap);
+  and layer selection (the canvas itself does nothing on a tap), and the armed long-press point
+  (`touch_long_press_armed_at`), so a tab can make the drag a selection only on its objects;
 - draw the armed long-press feedback marker.
 
 Key functions:
 - `CanvasView::touch_owner_id`
 - `CanvasView::take_touch_output_for_frame` / `apply_touch_navigation`
 - `CanvasView::publish_touch_surface` / `draw_touch_long_press_feedback`
-- `CanvasView::set_long_press_selection` / `touch_selection` / `touch_tap`
+- `CanvasView::set_long_press_selection` / `touch_selection` / `touch_tap` /
+  `touch_long_press_armed_at`
 - `drive_touch_drag` + `TouchDrivenDrag`: the one mapping of a `TouchSelection` onto a
   rectangle-drag capture mode (begin at the press point, follow, commit on release, drop on
   cancel).
@@ -131,8 +133,9 @@ impl CanvasView {
     /// A one-frame flag, unlike `set_zoom_blocked`: the surface publication at the end of
     /// `draw` resets it, so a tab that stops setting it can never leave a stale `true`. Call it
     /// before `draw`, or from a hook that runs inside `draw` with `&mut CanvasView`. The router
-    /// copies the flag when a finger is claimed, so it decides the gesture of a touch that
-    /// starts on the NEXT frame.
+    /// copies the flag when a finger is claimed and re-reads it from every later publication
+    /// until that finger's drag starts, so the flag of frame N decides a drag that starts in
+    /// frame N + 1 (see [`Self::touch_long_press_armed_at`]).
     pub fn set_long_press_selection(&mut self, enabled: bool) {
         self.scene.long_press_selection = enabled;
     }
@@ -152,12 +155,27 @@ impl CanvasView {
     ///
     /// A tap is a lone finger lifted within the click distance before its long-press armed
     /// (`TouchOutput::tap_at`). Valid from `draw`'s input step on, like [`Self::touch_selection`],
-    /// and reported on the lift frame only. The canvas acts on no tap: a tab may use it ONLY
-    /// where a mouse click OUTSIDE something dismisses or commits it (the typing create editor),
-    /// never to place, select or paint — every other bare-canvas click action stays mouse-only.
+    /// and reported on the lift frame only. The canvas acts on no tap. A tab may use it only for
+    /// what a mouse click OUTSIDE something does (dismiss / commit, e.g. the typing create editor)
+    /// and for selecting / deselecting its own layers (the typing text layers); never to place or
+    /// paint — every other bare-canvas click action stays mouse-only.
     #[must_use]
     pub fn touch_tap(&self) -> Option<Pos2> {
         self.scene.touch_tap_at
+    }
+
+    /// This frame's armed finger long-press on this canvas (the press point, screen points): the
+    /// finger is still down and has not moved beyond the click distance (`TouchOutput::
+    /// long_press_armed_at`). Reported on every frame while armed, from `draw`'s input step on.
+    ///
+    /// A tab that wants the drag of this press to be a selection only when it started on one of
+    /// its objects decides here and calls [`Self::set_long_press_selection`] in the SAME frame
+    /// (from a hook inside `draw` with `&mut CanvasView`): the router re-reads the flag from
+    /// every publication until the drag starts, and no drag can start before the frame after the
+    /// one that reported the arm.
+    #[must_use]
+    pub fn touch_long_press_armed_at(&self) -> Option<Pos2> {
+        self.scene.touch_long_press_armed_at
     }
 
     /// Stable id under which this canvas publishes its touch surface and takes its touch

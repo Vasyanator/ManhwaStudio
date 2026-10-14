@@ -437,7 +437,24 @@ saving, and export.
     same gates the overlay hook applies (`touch_create_selection_available`, mask panel closed,
     layout editor not editing) — the hook itself only gets `&CanvasView`. A finger tap outside
     the open create editor (`CanvasView::touch_tap`) commits it like a mouse click outside
-    (`create_editor_commit_requested`); no other typing action reacts to a tap.
+    (`create_editor_commit_requested`). The create rectangle takes the finger drag as a parameter
+    (`draw_create_overlay_ui`), so a drag `touch_layers.rs` claimed as a layer move never reaches it.
+  - `touch_layers.rs`: finger input on text layers (text/image overlays), driven once per frame by
+    `drive_touch_layer_input` from the canvas' top-left hook — the one hook that runs after the
+    canvas took the frame's touch output and before it publishes its surface. A TAP selects the
+    layer under it (the selected layer keeps a tap inside its grab area, the mouse's sticky focus;
+    otherwise the topmost by composite order) or deselects (`clear_selection`) when there is none —
+    a raster under the finger counts as none, rasters stay mouse-only; ignored while the create
+    editor is open (the tap commits it), the mask panel is open, the eyedropper is active or the
+    layout editor owns the canvas. A HOLD on the SELECTED layer (`touch_long_press_armed_at` in its
+    grab area, not in a transform mode) sets `set_long_press_selection(true)` that same frame, so the
+    drag arrives as a `TouchSelection`; a drag that BEGAN there opens a move session with source
+    `Touch` on the one move primitive (`move_layer.rs`): every frame recomputes the total delta from
+    the press point, `Released` settles it (one deferred write per gesture), `Cancelled` drops it
+    unsettled and restores the pre-gesture center and mesh (nothing written). A hold anywhere else
+    stays the create rectangle (when one can start) or a pan. Hit-tests use the mouse's grab rule
+    (`mesh_geometry::overlay_grab_mesh_scene`) over the page as the canvas drew it
+    (`canvas_page_view*`).
   - `selection_rasters.rs`: overlay/raster selection, remove, text-layer duplication
     (`duplicate_overlay`), raster interact/menu/transform/deform and
     the NON-move raster drags (rotate, perspective corner handle) — a whole-layer move belongs to
@@ -828,6 +845,10 @@ saving, and export.
   - **The whole-pixel snap of the base runs on the FIRST real displacement, not on the press.** A click
     that never moves the pointer must change no geometry and must not mark the project edited; the
     session's `has_changes` gates the settle, so such a click leaves no trace at all.
+  - **A finger gesture (`Touch`) ends by its drag's end, not by input state** (a claimed finger
+    never presses the primary button): `layer_move_settles` never settles it; `touch_layers.rs`
+    settles on `Released`, drops it and restores the geometry on `Cancelled`, and settles it as a
+    lift when a frame reports no drag (the end was lost).
   - **A keyboard gesture ends by HELD keys, not by key events.** `drive_layer_move_settle` settles a
     `Keyboard` session on the first frame where `key_down` reports no arrow held (level-triggered, so
     OS key-repeat gaps do not split one hold into many gestures, and egui's focus-loss clearing of

@@ -329,15 +329,12 @@ impl TypingTextOverlayLayer {
             } else {
                 None
             };
-            let selection_mesh_scene = if is_selected_text {
-                expand_selection_mesh_to_min_screen_side(
-                    &geometry.mesh_scene,
-                    geometry.mesh_cols,
-                    geometry.mesh_rows,
-                )
-            } else {
-                geometry.mesh_scene.clone()
-            };
+            let selection_mesh_scene = overlay_grab_mesh_scene(
+                &geometry.mesh_scene,
+                geometry.mesh_cols,
+                geometry.mesh_rows,
+                is_selected_text,
+            );
             let selection_bounds_rect = if is_selected_text {
                 deform_mesh_bounds(&selection_mesh_scene)
             } else {

@@ -1257,6 +1257,18 @@ pub(super) fn overlay_scene_geometry(
     }
 }
 
+/// The scene mesh a press must land in to GRAB an overlay (mouse press or click, finger tap or
+/// hold): the overlay's own scene mesh, grown to the minimum on-screen selection side when it is
+/// the SELECTED TEXT overlay, so a tiny selected text stays grabbable. The one rule shared by
+/// `draw_page_overlays` (the mouse) and the finger path (`touch_layers.rs`).
+pub(super) fn overlay_grab_mesh_scene(mesh_scene: &[Pos2], cols: usize, rows: usize, is_selected_text: bool) -> Vec<Pos2> {
+    if is_selected_text {
+        expand_selection_mesh_to_min_screen_side(mesh_scene, cols, rows)
+    } else {
+        mesh_scene.to_vec()
+    }
+}
+
 // ===================== Centering assist geometry (pure) =====================
 // The "Помочь с центровкой" (centering assist) feature anchors a guide FRAME to the page and keeps a
 // chosen text center bound to the frame center. These are the pure math primitives; the interaction,

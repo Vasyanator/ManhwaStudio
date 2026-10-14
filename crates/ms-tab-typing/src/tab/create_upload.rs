@@ -39,6 +39,7 @@ the render keeps taking the panel's unscaled size.
 */
 
 use super::*;
+use ms_widgets::touch_nav::TouchSelection;
 
 /// Layer id of the full-canvas Shift+drag selection-capture overlay.
 ///
@@ -141,6 +142,10 @@ impl TypingTextOverlayLayer {
             || ctx.input(|i| i.modifiers.shift)
     }
 
+    /// Draws the create UI of this frame: the Shift+drag / finger create rectangle, the inline
+    /// editor, the in-flight hint and the status toasts. `touch_selection` is this frame's finger
+    /// long-press drag for the create rectangle — `CanvasView::touch_selection`, or `None` when the
+    /// finger path already took it as a layer move (`touch_layers.rs`).
     pub(super) fn draw_create_overlay_ui(
         &mut self,
         ctx: &egui::Context,
@@ -148,6 +153,7 @@ impl TypingTextOverlayLayer {
         canvas: &CanvasView,
         project: &ProjectData,
         top_panel: &TypingTopPanelState,
+        touch_selection: Option<TouchSelection>,
     ) {
         let now_s = ctx.input(|i| i.time);
         if self
@@ -165,7 +171,7 @@ impl TypingTextOverlayLayer {
             self.create_status_warning = None;
         }
 
-        self.capture_shift_drag_selection(ctx, canvas_rect, canvas, project, top_panel);
+        self.capture_shift_drag_selection(ctx, canvas_rect, canvas, project, top_panel, touch_selection);
         self.draw_active_shift_selection(ctx);
         self.draw_text_editor(ctx, project, top_panel, canvas.touch_tap());
         self.draw_render_inflight_hint(ctx);
@@ -184,6 +190,8 @@ impl TypingTextOverlayLayer {
             && self.raster_effects_state.is_none()
     }
 
+    /// Runs the create rectangle: a Shift+drag of the mouse, or the finger long-press drag
+    /// `touch_selection` (see `draw_create_overlay_ui`). Commits through `finish_create_selection`.
     pub(super) fn capture_shift_drag_selection(
         &mut self,
         ctx: &egui::Context,
@@ -191,6 +199,7 @@ impl TypingTextOverlayLayer {
         canvas: &CanvasView,
         project: &ProjectData,
         top_panel: &TypingTopPanelState,
+        touch_selection: Option<TouchSelection>,
     ) {
         if !self.touch_create_selection_available() {
             return;
@@ -199,7 +208,7 @@ impl TypingTextOverlayLayer {
 
         // The finger first (see `drive_touch_drag`): it needs no Shift, starts at the
         // long-press point and commits on lift exactly like a mouse release below.
-        if let Some(touch) = canvas.touch_selection()
+        if let Some(touch) = touch_selection
             && let Some(finished) = drive_touch_drag(&mut self.create_selection, touch, |origin| {
                 begin_touch_create_selection(contains_any_page(canvas, project, origin), origin)
             })

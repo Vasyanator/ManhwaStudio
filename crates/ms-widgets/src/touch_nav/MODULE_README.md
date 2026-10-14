@@ -35,7 +35,8 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
   After `LONG_PRESS_ARM_S` it **arms** (`long_press_armed_at` = start, every frame while held).
 - **Tap**: a Pending touch lifted (not cancelled) within the click distance, before the arm
   time, with no button held and without having stopped a fling → `tap_at` = start, lift frame
-  only. Consumers use it only for dismiss/commit decisions a mouse click outside would make.
+  only. Consumers use it for dismiss/commit decisions a mouse click outside would make and for
+  selecting their own layers (Typing text layers); never to place or paint.
 - **Axis lock** (lone finger): the pan does not move the page until the finger is
   `AXIS_LOCK_DECIDE_PT` (10 pt) from its anchor (the press point; under a held pen/mouse button
   the anchor follows the finger, so the gesture restarts where the palm lifted). Then
@@ -56,7 +57,10 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
   frame, `end` Released on lift); when the surface has `long_press_selection == false` the drag
   pans instead. The flag is re-read from every publication of the owner until the drag starts
   (not only at claim), so a mode that ended while the finger rested makes the drag pan; once
-  selecting, the drag stays a selection until lift or cancel.
+  selecting, the drag stays a selection until lift or cancel. A consumer whose selection exists
+  only at some points (Typing: a hold on the selected text layer) publishes the flag in the frame
+  `long_press_armed_at` first appears: the drag cannot start before the next frame, which reads
+  that publication (pinned by `selection_mode_published_in_the_arming_frame_selects_the_next_drag`).
 - **Second claimed finger of the same owner**: every claim of the owner becomes a free pan for the
   rest of the gesture (an undecided one catches up from its anchor); before arming → both
   pan/pinch; after arming →

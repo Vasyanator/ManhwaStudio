@@ -618,6 +618,31 @@ fn selection_mode_gained_before_the_drag_selects_and_a_running_selection_keeps_g
     assert_eq!(output.selection.map(|selection| selection.began), Some(true));
 }
 
+/// The hand-off a consumer that selects only at certain points relies on (Typing: hold on the
+/// selected text layer): the mode is off at the claim, the owner sees `long_press_armed_at` in the
+/// arming frame's output and publishes the mode in that same frame, and the very next frame's drag
+/// is a selection from the press point. Without the publication the same drag pans.
+#[test]
+fn selection_mode_published_in_the_arming_frame_selects_the_next_drag() {
+    let start = pos2(100.0, 100.0);
+    for publish_on_arm in [true, false] {
+        let mut bench = Bench::new();
+        bench.surfaces = vec![surface(false)];
+        let (_, _) = bench.step(owning_start(1, start), 0.0);
+        let armed = bench.output(Vec::new(), LONG_PRESS_ARM_S);
+        assert_eq!(armed.long_press_armed_at, Some(start), "the arm is reported in its own frame");
+        bench.surfaces = vec![surface(publish_on_arm)];
+        let output = bench.output(owning_move(1, pos2(130.0, 100.0)), LONG_PRESS_ARM_S + 0.05);
+        if publish_on_arm {
+            assert_eq!(output.selection.map(|selection| (selection.origin, selection.began)), Some((start, true)));
+            assert_eq!(output.navigation, None);
+        } else {
+            assert_eq!(output.selection, None);
+            assert_eq!(output.navigation.map(|navigation| navigation.pan_delta()), Some(vec2(30.0, 0.0)));
+        }
+    }
+}
+
 #[test]
 fn focus_loss_drops_claims_and_cancels_the_selection() {
     let mut bench = Bench::new();

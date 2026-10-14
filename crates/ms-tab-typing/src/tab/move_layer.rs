@@ -699,7 +699,8 @@ pub(super) fn snap_move_base_on_first_displacement(
 ///
 /// A `Pointer` gesture ends when the primary button is up; a `Keyboard` gesture ends on the first
 /// frame with no arrow key HELD (level-triggered, so OS key-repeat gaps do not split one hold into
-/// many gestures). Each source ignores the other's signal.
+/// many gestures). Each source ignores the other's signal. A `Touch` gesture never settles here: the
+/// finger drag's own end settles or cancels it (`touch_layers.rs`).
 #[must_use]
 pub(super) fn layer_move_settles(
     source: TypingLayerMoveSource,
@@ -709,5 +710,6 @@ pub(super) fn layer_move_settles(
     match source {
         TypingLayerMoveSource::Pointer => !primary_down,
         TypingLayerMoveSource::Keyboard => !any_arrow_down,
+        TypingLayerMoveSource::Touch => false,
     }
 }

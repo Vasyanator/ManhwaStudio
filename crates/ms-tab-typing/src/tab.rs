@@ -180,6 +180,8 @@ mod selection_rasters;
 mod autotype;
 mod draw_page;
 mod move_layer;
+mod touch_layers;
+use touch_layers::{TypingTouchFrame, TypingTouchGates, TypingTouchLayerMove, canvas_page_view, canvas_page_view_at};
 mod vector_transform;
 mod layout_editor;
 use layout_editor::*;
@@ -1760,6 +1762,30 @@ impl CanvasHooks for TypingHooks<'_> {
             self.top_panel.centering_assist_kind(),
             self.top_panel.centering_show_center(),
         );
+        // Finger input on text layers (tap selects / deselects, hold on the selected layer + drag
+        // moves it; `tab/touch_layers.rs`). Here because this hook runs after the canvas took this
+        // frame's touch output and before it publishes its touch surface: the long-press flag set
+        // below reaches the router before the drag can start. Before the selection sync below, so a
+        // finger selection change reaches the edit panel in the same frame, and before the create
+        // UI, which must not see a drag this consumed.
+        let touch_outcome = {
+            let canvas_view: &CanvasView = canvas;
+            self.text_overlays.drive_touch_layer_input(
+                TypingTouchFrame::from_canvas(canvas_view),
+                TypingTouchGates {
+                    panel_blocks: self.top_panel.is_mask_panel_open() || self.top_panel.eyedropper_active(),
+                    strict_pixel_movement: self.top_panel.strict_pixel_movement(),
+                },
+                &|pos| canvas_page_view_at(canvas_view, pos),
+                &|page_idx| canvas_page_view(canvas_view, page_idx),
+            )
+        };
+        if touch_outcome.long_press_selection {
+            canvas.set_long_press_selection(true);
+        }
+        if touch_outcome.changed {
+            ctx.request_repaint();
+        }
         self.text_overlays.flush_edit_save_on_selection_change();
         if self.top_panel.is_mask_panel_open() {
             self.text_overlays.clear_selection();
@@ -1857,6 +1883,7 @@ impl CanvasHooks for TypingHooks<'_> {
                 canvas,
                 project,
                 self.top_panel,
+                if touch_outcome.selection_consumed { None } else { canvas.touch_selection() },
             );
         }
         // Every floating «Текст» panel is a dock tab. The visibility flags are read
@@ -2962,6 +2989,10 @@ enum TypingLayerMoveSource {
     Pointer,
     /// Arrow-key nudge: ends on the first frame with no arrow key held.
     Keyboard,
+    /// Finger long-press drag (`tab/touch_layers.rs`): ends with the drag's `TouchSelection::end`
+    /// (lift settles, cancel restores the geometry), never by the pointer or key state — a claimed
+    /// finger never presses the primary button.
+    Touch,
 }
 
 /// Geometry snapshot a move session applies its delta to.
@@ -3315,6 +3346,9 @@ pub(super) struct TypingTextOverlayLayer {
     /// frame by `drive_layer_move_settle`, and by `clear_selection` / `remove_overlay` so a gesture
     /// interrupted by a selection change or a delete still lands its write.
     move_session: Option<TypingLayerMoveSession>,
+    /// The finger drag driving `move_session` (source `Touch`), with the geometry to restore when
+    /// the drag is cancelled (`tab/touch_layers.rs`). `None` while no finger moves a layer.
+    touch_layer_move: Option<TypingTouchLayerMove>,
     width_resize_drag: Option<WidthResizeDragState>,
     primary_pointer_targets_overlay_this_frame: bool,
     /// Page image path per page index (captured at project load), so the page's pixel size can be
@@ -3490,6 +3524,7 @@ impl Default for TypingTextOverlayLayer {
             drag_state: None,
             drag_has_changes: false,
             move_session: None,
+            touch_layer_move: None,
             width_resize_drag: None,
             primary_pointer_targets_overlay_this_frame: false,
             page_image_paths: HashMap::new(),

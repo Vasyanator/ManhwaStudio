@@ -432,8 +432,9 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   asks for the next frame itself), so the canvas has no kinetic state of its own.
 - **Tap**: `touch_tap()` returns this frame's `TouchOutput::tap_at` (stored by `handle_shortcuts`,
   valid like `touch_selection`). The canvas acts on no tap. A tab may use it only where a mouse
-  click OUTSIDE something dismisses or commits it (today: the Typing create editor); bubble
-  placement, aside selection, Translation line presses and Cleaning/PS tools stay mouse-only.
+  click OUTSIDE something dismisses or commits it (the Typing create editor) and to select /
+  deselect its own layers (the Typing text layers); bubble placement, aside selection,
+  Translation line presses and Cleaning/PS tools stay mouse-only.
 - **Long-press menu**: `scene.touch_long_press_at` reaches `handle_canvas_page_interactions`;
   `touch::context_menu_open_pos` picks the secondary-click position or, failing that, the
   long-press point inside the row, and both go through `canvas_context_menu_target_at` and the same
@@ -452,6 +453,10 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `drive_touch_drag` + `TouchDrivenDrag` (begin at the press point, follow, `Released` commits like
   a mouse release, `Cancelled` drops like Esc; a mouse drag in the slot is never touched); the
   Cleaning tab replays it onto its tools' stroke hooks (`ms-tab-cleaning/src/touch_selection.rs`).
+  A tab whose selection exists only at certain points (Typing: a drag that starts on the selected
+  text layer moves it) reads `touch_long_press_armed_at()` in a hook inside `draw` and sets the
+  flag in that same frame: the router re-reads it until the drag starts, and the first drag frame
+  is always a later frame than the one that reported the arm.
 
 ## Contracts and invariants
 - Do not block the GUI thread with image decoding, disk I/O, long computation, or worker waits.
