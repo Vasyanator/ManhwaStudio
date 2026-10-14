@@ -286,7 +286,7 @@ Consumers:
   `sections_for(Launcher)`), `:428`/`:443` (`self.shared.draw(...)` with its warning set).
 
 **To add a new shared pane:** (1) write `draw_<name>_pane(ui, &mut State, ...)` in its own
-`src/<name>_panel.rs` — no `MangaApp`/launcher types in the signature; (2) add a
+`src/<name>_panel.rs` — no `StudioApp`/launcher types in the signature; (2) add a
 `SettingsSectionId` variant and a `SECTIONS` descriptor listing the surfaces and order;
 (3) add the state field to `SharedSettingsPanels` and an arm in its `draw`; (4) add the
 localized title keys via `title_key`. Do not route a surface-local section through

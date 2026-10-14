@@ -48,7 +48,7 @@ Verified against egui 0.35 APIs: `Context::viewport_rect` (not the removed
 
 // This is a reusable overlay engine with a deliberately broad public surface
 // (start/stop/is_active/sync/render, group targeting, padding). Any single
-// consumer — the standalone demo bin or a surface controller — exercises only a
+// consumer — the standalone demo example or a surface controller — exercises only a
 // subset, so unused-item lints here are false positives for a shared engine
 // rather than genuinely dead code.
 #![allow(dead_code)]
@@ -539,7 +539,7 @@ impl<C> Tutorial<C> {
                 }
                 None => {
                     // A dangling id is a script bug; surface it loudly (the engine
-                    // stays dependency-light for the demo bin, so no structured
+                    // stays dependency-light by contract, so no structured
                     // logger here) and end rather than hang.
                     eprintln!("[tutorial] step id '{id}' not found; ending tutorial");
                     self.active = false;

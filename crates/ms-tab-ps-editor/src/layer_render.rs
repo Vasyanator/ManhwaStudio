@@ -82,7 +82,7 @@ impl TiledTexture {
     /// In egui 0.35 filtering is a property of the `TextureId`, not of the mesh
     /// (`TextureOptions` travels only with an `ImageDelta`), so one handle cannot be drawn both
     /// smoothed and un-smoothed — a switch costs either a second handle per tile or a re-upload.
-    /// The canvas affords dual handles (`app.rs::TextureTile`) because its source-page cache
+    /// The canvas affords dual handles (`studio.rs::TextureTile`) because its source-page cache
     /// retains the tile bytes AND is registered with `memory_manager` as an evictable
     /// `CacheResourceKind`. The PS editor's `render_cache` is neither: a dual-handle grid would be
     /// untracked, unevictable GPU memory — roughly +122 MB for the two base layers of a tall

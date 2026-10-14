@@ -11,15 +11,15 @@ This directory is the crate root of `ms-tab-cleaning`, re-exported by the binary
 `crate::tabs::cleaning::…` path stays valid. Layer: the TOP of the library stack — above
 `ms-canvas` / `ms-models` / `ms-tools` / `ms-widgets`, the level-0 `ms-raster` (square
 dilation), `ms-ai-api` (the cloud image-edit layer of «ИИ редактирование (API)») and
-`ms-tab-translation` (backend health, the text detector and the MT service), and below only `app.rs`, which calls
-`CleaningTabState::draw`. It must never name `app` or `launcher`. There is NO dependency on
+`ms-tab-translation` (backend health, the text detector and the MT service), and below only `studio.rs`, which calls
+`CleaningTabState::draw`. It must never name `studio` or `launcher`. There is NO dependency on
 `ms-tab-typing`: the only thing shared with it is the atomic document-write RECIPE that
 `tools/watermark_library.rs` reimplements, because that crate's `panel/doc_store.rs` is
 crate-private and unreachable from here.
 
 ## Architecture
 `CleaningTabState` owns a dedicated `CanvasView`, the active `CleaningTool`, cleaning UI state,
-and optional shared models injected by `MangaApp`. The tab routes pointer, keyboard, wheel,
+and optional shared models injected by `StudioApp`. The tab routes pointer, keyboard, wheel,
 and overlay-window events into the active tool. Tools edit canvas overlay scratch state and
 commit through `CanvasView`, which synchronizes committed pages into `CleanOverlaysModel`
 and its diff-based undo/redo history.
@@ -34,7 +34,7 @@ Quick text cleanup builds per-page jobs from source pages plus text masks, runs 
 workers, and applies prepared `ColorImage` patches into `CleanOverlaysModel` as results arrive.
 The tab has NO save action of its own. Clean edits mark pages dirty in `CleanOverlaysModel`; the
 app-level overlay autosave (`ms-canvas` workers) writes them to the chapter's unsaved staging
-`clean_layers/`, and «Сохранить проект» (`app.rs`) flushes the remaining dirty pages there and
+`clean_layers/`, and «Сохранить проект» (`studio.rs`) flushes the remaining dirty pages there and
 merges the staging tree into the committed chapter. Nothing in this crate writes the committed
 `clean_layers/` directly, so staging/discard semantics hold.
 
@@ -52,11 +52,11 @@ plus the run/apply/cancel row and the frame's status line) and «Библиот�
 (`cleaning.watermark_library`: `CleaningTool::draw_library_panel`, a SECOND tool-owned panel — for
 the watermark tool that is the management screen of its on-disk library). Its default arrangement
 is `cleaning_default_dock_layout` — seven panels,
-handed to the dock both by `app.rs::restore_panel_dock` and by `ensure_default_layout`. A tab body cannot mutate the tab: the
+handed to the dock both by `studio.rs::restore_panel_dock` and by `ensure_default_layout`. A tab body cannot mutate the tab: the
 dock runs inside `CanvasView::draw`, so a body only raises a flag on `CleaningDockOut` and
 `CleaningTabState::apply_dock_out` performs every mutation after that call returns, in the order the
 three floating surfaces these tabs replaced performed theirs. The dock state is NOT owned here: it is
-app-owned (`MangaApp::panel_dock`, one per studio window) and lent in for the frame through
+app-owned (`StudioApp::panel_dock`, one per studio window) and lent in for the frame through
 `CleaningDrawParams::panel_dock`, which `tab.rs` passes on to `CanvasDrawParams`. The dock runs in
 `CleaningHooks::draw_canvas_overlay_top_left` — inside `CanvasView::draw`, so a «Лента» edit still
 lands before `publish_canvas_settings` — and it must run on EVERY frame this tab is active,
@@ -104,7 +104,7 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   same owner the page manager uses), one scan at a time with an epoch that drops superseded
   replies. Rescans: the first draw, every entry into the tab (a gap in
   `Context::cumulative_frame_nr` between draws — so a return from the page manager counts), and
-  `CleaningTabState::request_orphan_clean_rescan`, which `app.rs` calls after a successful
+  `CleaningTabState::request_orphan_clean_rescan`, which `studio.rs` calls after a successful
   «Сохранить проект». Message selection is the pure, unit-tested
   `select_clean_status_messages`. Dismissals are session-only and never persisted.
 - `watermark_chapter.rs`: GUI-free chapter-level watermark decomposition engine — the exact,
@@ -236,7 +236,7 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 - The «Клин» status area's message 1 mirrors the overlay LOADER: the current page's
   `PageCleanEntry` resolved in the loader's scope (`clean_status::LOADER_SCOPE`,
   `StagedOverCommitted`) is a `SizeMismatch`; it never restates the binding rule itself, and the
-  scope must change together with the loader's in `src/app.rs`; message 2 is
+  scope must change together with the loader's in `src/studio/residency/loader.rs` (`loadable_clean_overlay`); message 2 is
   `NoMatchingPage` only (minus deliberately detached `*_detached` files, `clean_assign::is_detached_clean_file`), never `Unreadable`. Its body only draws; cross clicks leave through
   `CleaningDockOut::clean_status_dismiss`. With nothing to say it lays out nothing at all.
 - Text-mask GPU cache eviction must not mutate `TextMaskModel`, loaded mask data, quick-clean jobs,
@@ -272,7 +272,7 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `cleaning_default_dock_layout` is dropped from the user's stored arrangement on every load, so
   adding a dock tab here means adding it to that builder too. It is this tab's OWN builder — every
   canvas program tab has one, there is no shared ribbon-only builder to fall back on — and
-  it is registered under `AppTab::Cleaning.key()` in `app.rs::restore_panel_dock` as well; a builder
+  it is registered under `AppTab::Cleaning.key()` in `studio.rs::restore_panel_dock` as well; a builder
   wired in only one of the two places silently resets the stored arrangement.
 - A dock tab body runs INSIDE `CanvasView::draw`. It edits the state its own widgets own — the
   active tool's UI mutates that tool, exactly as it did inside the tool window — but it may not
@@ -306,10 +306,12 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   ✕, and a dock tab has no close affordance by design (a tab is only ever MOVED). The same rule
   governs «Библиотека знаков», whose one source of truth lives in the TOOL: its two «Библиотека
   знаков…» buttons toggle it and are drawn `selected` while it is open.
-- Single-image session (`ProjectData::is_single_image`, a hidden scratch chapter of one page):
-  the tab skips the clean-folder status scan (`clean_status::clean_scan_should_start` — both
-  messages point at the page manager, which that mode hides) and pushes the flag to the active
-  tool through `CleaningTool::set_single_image_session` before `canvas.draw`; the tool-side
+- Single-image session (a hidden scratch chapter): the crate never asks the project for its
+  session kind; the root pushes `ms_models::SessionCapabilities` once
+  (`CleaningTabState::set_session_capabilities`). Without `clean_scan` the tab skips the
+  clean-folder status scan (`clean_status::clean_scan_should_start` — both messages point at the
+  page manager, which that mode hides), and it pushes the whole value to the active tool every
+  frame through `CleaningTool::set_session_capabilities` before `canvas.draw`; the tool-side
   guards are in `tools/MODULE_README.md`. Hidden features never rewrite a persisted setting. A
   file dialog that sets a starting directory must use `ProjectData::user_facing_dir` (none of
   this crate's dialogs sets one today).

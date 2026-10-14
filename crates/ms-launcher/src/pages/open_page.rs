@@ -11,7 +11,8 @@ Main responsibilities:
 - offer converting a chapter whose documents are not in the current storage mode's format
   (banner + `launcher-chapter-convert` worker); opening without converting stays allowed;
 - recovery banner for a `{chapter}_unsaved` session: "Restore" resumes it, plain "Open"
-  discards it; when the validation worker finds a staging document that does not parse
+  discards it (the choice is carried by the folder itself: Open deletes it first, and the host's
+  load resumes whenever it exists — `src/shell/chapter_load.rs`); when the validation worker finds a staging document that does not parse
   (`project_scan::damaged_unsaved_documents`), Restore is disabled and the banner names the
   damaged files and offers "Discard session and open" (the same discard path);
 - remember the last opened title and per-title last opened chapters in `user_config.json`.
@@ -472,11 +473,12 @@ impl OpenPageState {
                                         Some(restore),
                                     ) {
                                         let title = self.selected_title.clone().unwrap_or_default();
+                                        // No resume flag: the staging folder is kept, so the
+                                        // host's load resumes it.
                                         let selection = OpenProjectSelection {
                                             project_dir: self.projects_root.join(&title).join(&unsaved_name),
                                             title,
                                             chapter: unsaved_name,
-                                            resume_unsaved: true,
                                         };
                                         ui_action = Some(PageNavAction::OpenProject(selection));
                                     }
@@ -566,7 +568,6 @@ impl OpenPageState {
             project_dir: self.projects_root.join(&title).join(&chapter),
             title,
             chapter,
-            resume_unsaved: false,
         })
     }
 

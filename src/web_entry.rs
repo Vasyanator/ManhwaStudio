@@ -5,7 +5,7 @@ Purpose:
 Browser (wasm32) entry point. Boots the eframe `WebRunner` with the ManhwaStudio
 launcher, installs the in-memory storage backend (the web session store), seeds
 an always-available generated demo chapter into it, and swaps to the editor
-(`MangaApp`) when the launcher requests opening a project.
+(`StudioApp`) when the launcher requests opening a project.
 
 The web build is intentionally backend-independent (targets static hosting such
 as GitHub Pages): no AI backend, no downloaders — only local file/archive import
@@ -22,7 +22,9 @@ Notes:
 Only compiled on `wasm32`. Native startup lives in `lib.rs` and the main window in `shell/`; the
 web entry shares only the per-screen style (`shell::style`). Porting the full shell here (screen
 state machine, teardown worker) is deferred: the web load is synchronous against virtual storage
-and `MangaApp` is dropped in place without its teardown.
+and `StudioApp` is dropped in place without its teardown. The studio's outbound queue
+(`StudioApp::take_outputs`) is drained every frame and ignored (logged): a close or reload does
+nothing here.
 */
 
 use std::io::Cursor;
@@ -113,12 +115,12 @@ fn console_error(message: &str) {
 }
 
 /// Top-level web app: the launcher until the user opens a project, then the full
-/// `MangaApp`. eframe drives a single `App`, so the two phases live behind this
+/// `StudioApp`. eframe drives a single `App`, so the two phases live behind this
 /// enum and swap in place.
 #[allow(clippy::large_enum_variant)]
 enum WebApp {
     Launcher(Box<crate::launcher::app::LauncherApp>),
-    Editor(Box<crate::app::MangaApp>),
+    Editor(Box<crate::studio::StudioApp>),
 }
 
 impl eframe::App for WebApp {
@@ -157,7 +159,18 @@ impl eframe::App for WebApp {
                     }
                 }
             }
-            WebApp::Editor(app) => app.ui(ui, frame),
+            WebApp::Editor(app) => {
+                app.ui(ui, frame);
+                // The web entry has no screen switching (see the file notes): a title is applied
+                // like the native shell does; close, reload and decline are drained and ignored,
+                // logged (S-037).
+                for output in app.take_outputs() {
+                    match output {
+                        crate::studio::StudioOutput::Title(title) => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(title)),
+                        other => crate::runtime_log::log_info(format!("[web] studio output {other:?} ignored: the web entry has no window host")),
+                    }
+                }
+            }
         }
     }
 }
@@ -172,28 +185,28 @@ fn build_web_launcher() -> WebApp {
         settings,
         crate::ai_backend_supervisor::AiBackendHandle::disabled(),
         // The web build has no installed copy and no OS records (no System registration tab);
-        // the version core is still reduced exactly as `lib.rs::launcher_host` does.
+        // the version core is still reduced exactly as `startup::launcher_host` does.
         crate::launcher::state::LauncherHost { ignore_installed: false, version_core: crate::version_format::version_core(env!("CARGO_PKG_VERSION")) },
         false,
     );
     WebApp::Launcher(Box::new(crate::launcher::app::LauncherApp::new(entry)))
 }
 
-/// Loads the selected project and constructs the editor (AI disabled).
+/// Loads the selected project and constructs the editor (AI disabled). Resume vs fresh is
+/// decided by `shell::chapter_load`, the one owner shared with the native studio.
 ///
 /// # Errors
-/// Returns a message if `ProjectData::load` fails.
+/// Returns a message if the `ProjectData` load fails.
 fn build_editor_from_selection(
     sel: &crate::launcher::state::OpenProjectSelection,
-) -> std::result::Result<crate::app::MangaApp, String> {
+) -> std::result::Result<crate::studio::StudioApp, String> {
     let settings = serde_json::Value::Object(serde_json::Map::new());
-    let project = if sel.resume_unsaved {
-        crate::project::ProjectData::load_resume_unsaved(&sel.project_dir, &settings)
-    } else {
-        crate::project::ProjectData::load(&sel.project_dir, &settings)
-    }
-    .map_err(|e| format!("ProjectData::load: {e:#}"))?;
-    Ok(crate::app::MangaApp::new(project, crate::ai_backend_supervisor::AiBackendHandle::disabled()))
+    let project = crate::shell::chapter_load::load_chapter(&sel.project_dir, &settings)
+        .map_err(|e| format!("ProjectData::load: {e:#}"))?;
+    // Single-threaded page with an in-memory store: the studio's pre-reads run inline here,
+    // where the native shell runs them on its open worker.
+    let bootstrap = crate::studio::StudioBootstrap::build_blocking(&project);
+    Ok(crate::studio::StudioApp::new(project, bootstrap, crate::ai_backend_supervisor::AiBackendHandle::disabled()))
 }
 
 /// Writes the generated demo chapter into storage if it is not already present,

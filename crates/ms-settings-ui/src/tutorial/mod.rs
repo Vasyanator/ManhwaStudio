@@ -7,8 +7,8 @@ surface; a surface owns a `TutorialController<C>` that maps a stable `TutorialId
 to a step script and persists per-tutorial completion.
 
 Main responsibilities:
-- promote the overlay engine from the demo bin into the main binary so launcher
-  and studio surfaces can `use crate::tutorial`;
+- host the overlay engine so launcher and studio surfaces can `use crate::tutorial`
+  (its standalone demo is the `tutorial_test` example of this crate);
 - define the stable persistence keys (`TutorialId`), the persisted progress model
   (`TutorialProgress`), and the per-surface runner (`TutorialController`);
 - expose the shared "Обучение" settings pane (`draw_tutorials_pane`) reused by

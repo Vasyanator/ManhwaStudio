@@ -1745,8 +1745,8 @@ $Json is cargo's stdout, one JSON object per line. The LAST `compiler-artifact`
 message whose `target.name` equals $TargetName and whose `executable` is non-null
 wins: a stream can carry several artifacts for one target, and the final one
 describes what is on disk now. Filtering by target name is not optional — the
-package declares several bin targets besides this one, and `src/bin/` adds more
-automatically — and the non-null test is what skips library artifacts, which
+stream also carries the package's library target and every dependency, and the
+package may gain bin targets — and the non-null test is what skips library artifacts, which
 report `"executable":null`.
 
 Pure: reads nothing, writes nothing, and is safe to call on arbitrary text. Lines

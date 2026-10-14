@@ -4,7 +4,8 @@ Crate root of `ms-installer`, re-exported by the binary as `crate::installer`
 (`src/lib.rs`), so every `crate::installer::…` call site keeps working unchanged.
 
 Main responsibilities:
-- expose the installer UI and service flows used by application startup;
+- expose the installer UI and service flows used by application startup, including the
+  missing-environment prompt window (`prompt_window`);
 - keep installer backend helpers scoped to this crate.
 
 Notes:
@@ -48,6 +49,12 @@ pub struct HostVersion {
 pub mod install;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod update;
+// The missing-environment startup prompt window (install / update a custom folder / launcher).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod prompt_window;
+// The one window-context preparation (theme choice + bundled UI fonts) of every window above.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod window;
 // `utils` is the installer's backend half (layout probing, archive handling, pip and
 // release queries). It is `pub` rather than crate-private because the startup
 // `--check-venv` path (`src/venv_check.rs`) and the launcher's settings page read the

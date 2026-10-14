@@ -66,7 +66,7 @@ pub(super) fn shift_drag_capture_layer_id() -> egui::LayerId {
 /// The name may NOT depend on any counter or handle that lives shorter than the `egui::Context`.
 /// `Context::add_font` resolves a name collision in favour of the FIRST registrant and never
 /// compares bytes (egui-0.35.0/src/context.rs:2066-2074), while a project reload (a structural
-/// page-manager operation, «Перезагрузить проект») rebuilds the whole `MangaApp` — and with it
+/// page-manager operation, «Перезагрузить проект») rebuilds the whole `StudioApp` — and with it
 /// this layer — INSIDE THE SAME context (the main window, `src/shell/`). A per-instance sequence
 /// number therefore re-issues a name the context already holds foreign bytes for, and the editor
 /// silently draws the previous session's typeface.
@@ -1337,7 +1337,7 @@ mod tests {
     }
 
     /// REGRESSION: a project reload (a structural page-manager operation, «Перезагрузить
-    /// проект») rebuilds the whole `MangaApp` — and with it this layer — inside the SAME
+    /// проект») rebuilds the whole `StudioApp` — and with it this layer — inside the SAME
     /// `egui::Context`. While the family name was a per-instance sequence number, the rebuilt
     /// layer re-issued `typing-editor-font-1`, `Context::add_font` kept the bytes registered
     /// under that name in the previous life of the app (it never compares bytes), and the editor

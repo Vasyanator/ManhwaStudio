@@ -267,7 +267,7 @@ impl TypingCreatePanelState {
     /// Writes a still-owed DEFAULT local-set save immediately, on the CALLING thread.
     /// Returns whether there was anything to flush.
     ///
-    /// This is the app-exit flush (`MangaApp::on_exit`), modelled on
+    /// This is the app-exit flush (`StudioApp::on_exit`), modelled on
     /// `font_settings_store::flush_pending_saves`: the debounced writer is a detached thread
     /// that dies with the process, so renaming a local preset and closing the app a second
     /// later used to lose the rename outright.
@@ -275,7 +275,7 @@ impl TypingCreatePanelState {
     /// SYNCHRONOUS ON THE GUI THREAD, AND DELIBERATELY SO. This is the one accepted exception
     /// to the "never block the GUI thread" rule (CLAUDE.md §5), and it is not new: the
     /// PRE-EXISTING `font_admin::flush_pending_saves` has the identical shape at
-    /// `src/app.rs:3421`, one step above this one's call site. No GUI frame follows `on_exit`
+    /// `src/studio.rs:3421`, one step above this one's call site. No GUI frame follows `on_exit`
     /// and no thread outlives it, so there is no responsiveness left to protect, and the work
     /// is ONE atomic write of the same small document the debounced writer would have
     /// written. A deadline would not make it safer: it trades a hang the user can see for a
@@ -1650,7 +1650,7 @@ mod tests {
         assert!(state.local_presets_dirty_since.is_none());
     }
 
-    /// THE EXIT FLUSH (`MangaApp::on_exit`): an edit made inside the debounce window is
+    /// THE EXIT FLUSH (`StudioApp::on_exit`): an edit made inside the debounce window is
     /// written on the way out instead of dying with the detached writer thread. Reports
     /// nothing to flush when the set is clean.
     #[test]

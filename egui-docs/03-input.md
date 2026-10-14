@@ -184,8 +184,8 @@ key_pressed(Key) / key_down(Key) / key_released(Key)     // :746 / :769 / :774
   `active_when_input`, then `ctx.input_mut(|i| i.consume_shortcut(&shortcut))` and fires **only on the
   rising edge** (`last_shortcut_held`, :293-304) so a held key does not repeat.
 
-Dispatch: `MangaApp::dispatch_hotkeys` (`src/app.rs:1562`) calls `collect_triggered` and routes each id
-through `MangaApp::execute_hotkey_command` (`src/app.rs:1571`).
+Dispatch: `StudioApp::dispatch_hotkeys` (`src/studio.rs:773`) calls `collect_triggered` and routes each id
+through `StudioApp::execute_hotkey_command` (`src/studio.rs:782`).
 
 **Rule: a new hotkey = a new `HotkeySpecV2` + an arm in `execute_hotkey_command`.** Do not sprinkle
 `input.key_pressed(..)` — that bypasses rebinding, scoping, text-field suppression and edge-triggering.
@@ -282,7 +282,7 @@ Facts the canvas finger gestures rely on (owner: `ms_widgets::touch_nav`,
 - Wheel/zoom on any canvas → `ms_widgets::input_util::raw_wheel_delta` (`crates/ms-widgets/src/input_util.rs:31`).
 - "Did the click hit bare canvas?" → `ms_widgets::input_util::pointer_over_floating_area` (`crates/ms-widgets/src/input_util.rs:55`).
 - New hotkey → register a `HotkeySpecV2` (`src/input_manager_v2.rs`) + handle it in
-  `MangaApp::execute_hotkey_command` (`src/app.rs:1571`).
+  `StudioApp::execute_hotkey_command` (`src/studio.rs:782`).
 - Widget-local interaction → allocate with the right `Sense` and read the `Response`; do not read
   `ctx.input().pointer` for widget hit-testing.
 - Screenshot/eyedropper flow → `crates/ms-widgets/src/viewport_color_selector.rs`.

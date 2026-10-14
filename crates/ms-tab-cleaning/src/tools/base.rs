@@ -79,6 +79,7 @@ FILE HEADER (cleaning/tools/base.rs)
     that the host-neutral patch core's store step can reach it too.
 */
 use ms_canvas::{CanvasView, OverlayRectPx};
+use ms_models::SessionCapabilities;
 use ms_models::clean_overlays_model::CleanOverlaysModel;
 use ms_project::ProjectData;
 use super::mask_generation::{
@@ -141,8 +142,8 @@ pub struct CleaningCursorOccluder {
 
 /// One cleaning-tab tool, held as `Box<dyn CleaningTool>` by `CleaningTabState`.
 ///
-/// `Send` is a supertrait because the whole studio root (`MangaApp`, which owns the cleaning tab)
-/// is moved to a worker thread for its blocking teardown (`src/app/shutdown.rs` asserts it); a tool
+/// `Send` is a supertrait because the whole studio root (`StudioApp`, which owns the cleaning tab)
+/// is moved to a worker thread for its blocking teardown (`src/studio/shutdown.rs` asserts it); a tool
 /// must therefore keep only `Send` state (channels, `Arc<Mutex<_>>`, join handles), never `Rc`.
 pub trait CleaningTool: Send {
     #[allow(dead_code)]
@@ -241,13 +242,13 @@ pub trait CleaningTool: Send {
 
     fn set_ai_backend_torch_available(&mut self, _available: bool) {}
 
-    /// Whether the open project is a single-image session (`ProjectData::is_single_image`).
+    /// What the open session offers (`SessionCapabilities`; a single-image session offers no
+    /// chapter- or title-level feature, whose data would live in the throwaway scratch chapter).
     ///
-    /// Pushed by the tab every frame BEFORE `canvas.draw`, because `draw_ui` and the other dock
-    /// bodies run inside that call and must already hide what the mode does not offer (chapter-
-    /// or title-level features whose data lives outside the scratch chapter). A tool with no
-    /// such feature ignores it.
-    fn set_single_image_session(&mut self, _single_image: bool) {}
+    /// Pushed by the tab to the active tool every frame BEFORE `canvas.draw`, because `draw_ui`
+    /// and the other dock bodies run inside that call and must already hide what the session does
+    /// not offer. A tool with no such feature ignores it.
+    fn set_session_capabilities(&mut self, _caps: SessionCapabilities) {}
 
     fn space_pan_active(&self) -> bool {
         false

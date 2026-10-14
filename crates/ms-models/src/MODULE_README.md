@@ -6,7 +6,7 @@ The models own user-editable chapter state that must be synchronized between GUI
 background workers, autosave, and export code.
 
 ## Architecture
-Models in this directory are usually wrapped in `Arc<Mutex<_>>` by `MangaApp` and passed
+Models in this directory are usually wrapped in `Arc<Mutex<_>>` by `StudioApp` and passed
 to tabs through typed setter methods. GUI code should take short snapshots from these
 models and release locks before doing rendering, image processing, file I/O, or callbacks.
 
@@ -41,11 +41,13 @@ candidate.
   policy is read from `ms_config::autosave_policy` on every call (live settings); tests inject one
   with `AutosaveGate::with_policy_fn` instead of touching the process globals. `action_count` is
   a separate monotonic lifetime counter of noted actions (never reset by a flush); single-image
-  mode compares it with its last-write baseline to decide "dirty" (`src/single_image/`).
+  mode compares it with its last-write baseline to decide "dirty" (`src/studio/session/image_set/`).
 - `bubbles_model.rs`: shared bubble list, revision tracking, canvas settings, and
   coalesced background saving. The bubbles document is written only through
   `ms_docstore::write` (`write_bubbles_snapshot_to`) and its staging existence is
-  probed with `ms_docstore::exists` — never a raw file write. The `DocRef` comes from
+  probed with `ms_docstore::exists` (`staged_bubbles_exist`; `BubblesModel::new` probes it,
+  `new_with_staging_probe` takes an answer pre-read off the GUI thread) — never a raw file write.
+  The `DocRef` comes from
   `ms_page_ops::chapter_docs::chapter_doc_for_write`, so a NEW staging document is
   created in the chapter's format (`.json` / `.db`, docstore rule B.3), never the
   process default when the chapter already has a document.
@@ -73,10 +75,17 @@ candidate.
 - `clean_overlays_model.rs`: shared clean overlay images, undo/redo history, per-consumer change
   revisions (`delta_since`), save-dirty tracking, autosave snapshots, and cached decoded page images.
 - `text_mask_model.rs`: shared text detector masks keyed by page index.
+- `session_caps.rs`: `SessionCapabilities`, the `Copy` set of features the open studio session
+  offers (title documents, lasting chapter storage, clean scan, series watermark library, alt
+  versions, project export, project settings), each field with a named tab consumer.
+  Two values, `PROJECT` and `IMAGE_SET`; the root maps its session kind onto them in one place
+  (`SessionMode::capabilities`) and pushes the value once per `StudioApp` through one
+  `set_session_capabilities` per tab. Tab crates read these
+  fields and never call `ProjectData::is_single_image` themselves. `Default` = `PROJECT`.
 - `page_view.rs`: source-page view model shared by the app shell, the canvas and the tabs —
   page geometry with its load state (`PageImageInfo` / `SourcePageLoadState`) plus the tiled GPU
   residency of a decoded page (`PageTexture` / `TextureTile`). Producing and evicting the
-  textures stays in `app.rs`; only the types live here.
+  textures stays in `studio.rs`; only the types live here.
 - `layer_model/`: the chapter layer document (`LayerDoc`, per-page `layers.json` manifest, text
   payload, migration, background layer saver, and the one owner of layer composite order /
   visibility / group fold in `ordering.rs`). See `layer_model/MODULE_README.md`.
@@ -233,3 +242,5 @@ it from its `[dev-dependencies]`, so no production build carries them.
 - To change decoded source-page cache behavior for tools, edit `clean_overlays_model.rs`.
 - To change detector mask storage, dimensions, allocation, or revisioning, edit
   `text_mask_model.rs`.
+- To gate a tab feature on the session kind, add a field to `SessionCapabilities`
+  (`session_caps.rs`) with its consumer named, set it in both constants, and read it in the tab.

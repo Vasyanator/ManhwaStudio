@@ -13,7 +13,7 @@ edition = "2024"
 #
 # Layer: near the TOP of the library stack — above the canvas, the models, the tooling
 # primitives, the widgets and `ms-tab-typing` (the layers panel renders typing's text
-# preview label), and below `app.rs` and the `page_manager` tab. It must never name `app`
+# preview label), and below `studio.rs` and the `page_manager` tab. It must never name `studio`
 # or `launcher`.
 #
 # GL lifetime: this crate owns NO GL objects. The correction's shader resources belong to the

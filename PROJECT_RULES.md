@@ -225,13 +225,15 @@ Reformatting is acceptable only once proven inert this way.
 
 **Overrides global §2.5 "File size" calibration** (thresholds unchanged, counts are this
 repository's). Measured over `src/` and `crates/` (excluding `target/` and the external
-`egui-large-image`, `egui-shader-layers`, `ag-psd` checkouts): 34 Rust files exceed 3000 lines and
-15 exceed 5000; without the exempt test modules, 32 and 13. Among them
-`crates/ms-tab-ps-editor/src/lib.rs` (10190), `crates/ms-text-render/src/pipeline.rs` (8211) and
-`src/app.rs` (5215) — why the hard gate needs >5000 lines AND a new responsibility. Scale example:
-custom kerning took `src/tabs/settings/typesetting/font_properties_window.rs` from 1230 to 2467
-lines in one change — nothing should have stopped that one, but the NEXT feature to land there
-must pause. `src/app.rs` is a hotspot: sequence parallel tasks that touch it.
+`egui-large-image`, `egui-shader-layers`, `ag-psd` checkouts and the gitignored `egui` / `winit`
+forks): 35 Rust files exceed 3000 lines and 14 exceed 5000; without the exempt test modules, 33
+and 12 — all of them in `crates/`. Among them `crates/ms-tab-ps-editor/src/lib.rs` (10584),
+`crates/ms-tab-translation/src/tab.rs` (9486) and `crates/ms-text-render/src/pipeline.rs` (8211) —
+why the hard gate needs >5000 lines AND a new responsibility. Scale example: custom kerning took
+`src/tabs/settings/typesetting/font_properties_window.rs` from 1230 to 2467 lines in one change —
+nothing should have stopped that one, but the NEXT feature to land there must pause.
+`src/studio.rs` (the editor root, ~2080 lines, under both thresholds) is a hotspot: sequence
+parallel tasks that touch it.
 
 ## Canonical "one decision, many owners" case (global §2.5)
 

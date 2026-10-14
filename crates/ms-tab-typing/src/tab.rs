@@ -13,7 +13,7 @@ FILE HEADER (crates/ms-tab-typing/src/tab.rs)
   Ниже описан общий контракт вкладки; конкретные реализации ищите в подмодулях каталога `tab/`.
 - Ключевые поля `TypingTabState`:
   - `canvas`: отдельный инстанс холста для вкладки типинга (`editable = false`). Bottom-hint
-    forwarders (`set_hint_collapsed` / `hint_collapsed` / `set_bottom_hint`) let `app.rs` seed the
+    forwarders (`set_hint_collapsed` / `hint_collapsed` / `set_bottom_hint`) let `studio.rs` seed the
     collapsed flag from `user_config` at construction, read it back on exit, and push per-frame hint
     content.
   - `text_overlays`: слой PNG-оверлеев (`text` + `image`). Text overlays persist as inline v3 text
@@ -80,10 +80,11 @@ FILE HEADER (crates/ms-tab-typing/src/tab.rs)
 - Ключевые методы:
   - `set_bubbles_model`: подключение shared-модели пузырей.
   - `set_overlays_model`: подключение shared-модели clean-overlay.
-  - `viewport_snapshot/apply_viewport_snapshot`: bridge для общего viewport sync в `MangaApp`.
+  - `canvas` / `canvas_mut`: the tab's `CanvasView`, through which `StudioApp` syncs the shared
+    viewport and page (`src/studio/view_sync.rs`) and reads the page window / pixel inspection.
   - `draw`: кадр вкладки (poll загрузчика, upload текстур по бюджету, рендер `CanvasView`).
     Все входы кадра приходят одним `TypingDrawParams`; среди них — `panel_dock`, состояние
-    панельного дока, которым владеет приложение (`MangaApp.panel_dock`, одно на окно студии)
+    панельного дока, которым владеет приложение (`StudioApp.panel_dock`, одно на окно студии)
     и которое одалживается вкладке на кадр. Вкладка его НЕ хранит.
   - `draw_canvas_mask_overlay_on_page` / `draw_canvas_overlay_on_page` (в `TypingHooks`):
     yellow mask-preview/input живёт в canvas mask-layer, а текстовые/image оверлеи и
@@ -119,7 +120,7 @@ use ms_log::trace::cat;
 use ms_canvas as canvas;
 use ms_canvas::{
     BubbleClass, CANVAS_RIBBON_TAB, CanvasBottomHint, CanvasDrawParams, CanvasHooks,
-    CanvasUiStatus, CanvasView, CanvasViewportSnapshot, RectCoords, SourceTextureUploadBudget,
+    CanvasUiStatus, CanvasView, RectCoords, SourceTextureUploadBudget,
     TouchDrivenDrag, drive_touch_drag, parse_image_text_areas,
 };
 use ms_memory::{
@@ -127,11 +128,12 @@ use ms_memory::{
     CacheResourceKind, select_eviction_candidates,
 };
 use ms_models::bubbles_model::BubblesModel;
+use ms_models::SessionCapabilities;
 use ms_models::clean_overlays_model::CleanOverlaysModel;
 use ms_sysprobe::paste_image;
 use ms_project::{Bubble, ProjectData};
 use ms_config::app_tab::AppTab;
-use crate::TypingTopPanelState;
+use crate::{TypingPanelSeed, TypingTopPanelState};
 // Re-exported to `tab`'s child modules (e.g. `panels`, `layout_editor`) via `use super::*`.
 use ms_widgets::WheelSlider;
 use ms_widgets::touch_nav::context_menu_popup;
@@ -551,7 +553,7 @@ pub struct TypingDrawParams<'a> {
     pub page_infos: &'a HashMap<usize, PageImageInfo>,
     pub texture_cache: &'a mut HashMap<usize, PageTexture>,
     pub status: CanvasUiStatus,
-    /// The studio window's dock state, owned by `MangaApp` and LENT for this frame.
+    /// The studio window's dock state, owned by `StudioApp` and LENT for this frame.
     ///
     /// It is not a field of this tab because one studio window has exactly one dock
     /// state: sub-window indices and the persisted `sub_windows` list are global, and
@@ -565,10 +567,10 @@ pub struct TypingTabState {
     top_panel: TypingTopPanelState,
     mask_layer: TypingMaskLayer,
     /// Shared unified layer document (app-owned): the source of truth for per-page layer MODEL state,
-    /// shared with the PS tab. `None` until `set_layer_doc` is called by app.rs.
+    /// shared with the PS tab. `None` until `set_layer_doc` is called by studio.rs.
     layer_doc: Option<std::sync::Arc<std::sync::Mutex<ms_models::layer_model::layer_doc::LayerDoc>>>,
     /// True while a project save is pending on the whole-project preload or already in flight (state
-    /// owned by `MangaApp`, pushed in via `set_save_busy` before each `draw`). Makes export mutually
+    /// owned by `StudioApp`, pushed in via `set_save_busy` before each `draw`). Makes export mutually
     /// exclusive with save (Finding 2): while set, a new export trigger is deferred and no deferred
     /// export dispatches.
     save_busy: bool,
@@ -711,14 +713,25 @@ fn placement_save_debounce_tick(
 type PendingTypingExport = TypingExportRequest;
 
 impl Default for TypingTabState {
+    /// Reads the panels' `user_config.json` seed on the calling thread; the studio pre-reads it
+    /// on its open worker and calls [`TypingTabState::from_seed`].
     fn default() -> Self {
+        Self::from_seed(TypingPanelSeed::read_blocking())
+    }
+}
+
+impl TypingTabState {
+    /// The tab built from an already read panel `seed` (`TypingPanelSeed::read_blocking`): reads
+    /// no config document, spawns the panels' workers and the shared background font load.
+    #[must_use]
+    pub fn from_seed(seed: TypingPanelSeed) -> Self {
         super::render_next::touch_runtime_smoke_contract();
         let mut canvas = CanvasView::default();
         canvas.editable = false;
         Self {
             canvas,
             text_overlays: TypingTextOverlayLayer::default(),
-            top_panel: TypingTopPanelState::default(),
+            top_panel: TypingTopPanelState::from_seed(seed),
             mask_layer: TypingMaskLayer::default(),
             layer_doc: None,
             save_busy: false,
@@ -754,6 +767,14 @@ impl TypingTabState {
         self.top_panel.set_panel_layout(layout);
     }
 
+    /// Sets what the open session offers (`SessionMode::capabilities` in the root). The root pushes it
+    /// once, right after construction; the session kind never changes during the tab's lifetime.
+    /// Without `project_export` (a single-image session, whose file is written by «Сохранить») the
+    /// panel hides the export format row, the re-pagination block and the export button.
+    pub fn set_session_capabilities(&mut self, caps: SessionCapabilities) {
+        self.top_panel.set_session_capabilities(caps);
+    }
+
     /// Flushes the typing tab's text overlays (inline v3 payload) into the staging `layers.json` so a
     /// legacy chapter that was only viewed still migrates its text on save-to-project.
     ///
@@ -777,8 +798,8 @@ impl TypingTabState {
     ///
     /// Text-layer edits are not written as they happen (that would write on every drag frame); they are
     /// written at a focus-loss point. This is the flush for the two focus losses the tab cannot observe
-    /// itself, and `MangaApp` owns both:
-    /// - leaving the Text tab (`apply_shared_viewport_to_active_canvas`) — the tab stops being drawn,
+    /// itself, and `StudioApp` owns both:
+    /// - leaving the Text tab (`ViewSync::before_draw` in the studio) — the tab stops being drawn,
     ///   so its own per-frame flush points stop running;
     /// - application exit (`on_exit`) — REQUIRED, and required BEFORE the layer-saver barrier: the
     ///   barrier is the only thing that guarantees bytes on disk, and it cannot cover a write that has
@@ -793,7 +814,7 @@ impl TypingTabState {
 
     /// Whether a text-layer edit has been made but not yet written to the staging dir.
     ///
-    /// Exists because deferral broke an inference `MangaApp::refresh_unsaved_changes_cache` used to be
+    /// Exists because deferral broke an inference `StudioApp::refresh_unsaved_changes_cache` used to be
     /// able to make: it detects typing changes by the `_unsaved` staging dir EXISTING, which held while
     /// every edit wrote immediately. A deferred edit is real unsaved work that has not touched the disk
     /// yet, so the staging probe alone would miss it and the close dialog could be skipped for an edit
@@ -802,7 +823,7 @@ impl TypingTabState {
     /// Conservative by design (it reports `save_requested_while_busy`, which a successful inline
     /// `flush_text_layers` does not retire), so it may say "pending" for work that is in fact already
     /// enqueued. That over-reporting is harmless for an unsaved-changes prompt, but it makes this
-    /// unusable as a post-flush "did everything land?" check. `MangaApp::start_page_op`, the other
+    /// unusable as a post-flush "did everything land?" check. `StudioApp::start_page_op`, the other
     /// caller, therefore reads it BEFORE its flush and only to answer "was there anything to lose?".
     /// An OPEN move gesture counts too: `settle_layer_move` is the only place a move marks the layer
     /// dirty (text) or reaches the document (raster), and it is driven from `draw`, which stops at
@@ -824,7 +845,7 @@ impl TypingTabState {
     }
 
     /// DROPS every pending text-layer edit without writing it. For the DISCARD path only
-    /// (`MangaApp::start_exit_cleanup`), which deletes the `_unsaved` staging dir on purpose.
+    /// (`StudioApp::start_exit_cleanup`), which deletes the `_unsaved` staging dir on purpose.
     ///
     /// Required, not cosmetic: discard shuts the layer saver down and deletes the staging dir, so any
     /// surviving pending write would be re-dispatched afterwards — through the saver's SYNC fallback,
@@ -868,7 +889,7 @@ impl TypingTabState {
     /// Writes a still-owed DEFAULT local-preset set immediately, on the calling thread.
     /// Returns whether there was anything to flush.
     ///
-    /// Called from `MangaApp::on_exit` next to `font_admin::flush_pending_saves`, and for the
+    /// Called from `StudioApp::on_exit` next to `font_admin::flush_pending_saves`, and for the
     /// same reason: the create panel persists its local presets through a multi-second
     /// debounce, and the debounced writer is a detached thread that dies with the process.
     /// A no-op when nothing is owed, which is the normal case.
@@ -883,7 +904,7 @@ impl TypingTabState {
     }
 
     /// Drains a pending in-app settings deep-link request raised by the typing panel's
-    /// font-group "?" help icon. `Some(link)` once per click; the caller (`app.rs`) applies
+    /// font-group "?" help icon. `Some(link)` once per click; the caller (`studio.rs`) applies
     /// it by calling `SettingsTabState::navigate_to` and switching to the settings tab.
     #[must_use]
     pub fn take_settings_navigation_request(
@@ -897,20 +918,18 @@ impl TypingTabState {
         self.canvas.set_bottom_hint(hint);
     }
 
-    pub fn viewport_snapshot(&self) -> CanvasViewportSnapshot {
-        self.canvas.viewport_snapshot()
+    /// This tab's page + bubble canvas. The studio reads its viewport, page window and
+    /// pixel-inspection state through it (view sync, page residency).
+    #[must_use]
+    pub fn canvas(&self) -> &CanvasView {
+        &self.canvas
     }
 
-    pub fn apply_viewport_snapshot(&mut self, snapshot: CanvasViewportSnapshot) {
-        self.canvas.apply_viewport_snapshot(snapshot);
-    }
-
-    pub fn current_page_local_view_center(&self) -> Option<(usize, Vec2)> {
-        self.canvas.current_page_local_view_center()
-    }
-
-    pub fn focus_page(&mut self, page_idx: usize, center_px: Option<Vec2>, zoom: f32) {
-        self.canvas.focus_page(page_idx, center_px, zoom);
+    /// This tab's page + bubble canvas, mutably: the studio applies the shared viewport snapshot
+    /// and explicit page focus through it. Tab-specific canvas configuration stays behind this
+    /// tab's own setters.
+    pub fn canvas_mut(&mut self) -> &mut CanvasView {
+        &mut self.canvas
     }
 
     pub fn evict_gpu_caches(&mut self, request: &CacheEvictionRequest) -> CacheEvictionReport {
@@ -928,14 +947,6 @@ impl TypingTabState {
         request: &CacheEvictionRequest,
     ) -> CacheEvictionReport {
         self.canvas.evict_clean_overlay_gpu_cache(request)
-    }
-
-    pub fn active_source_page_window(&self, neighbor_radius: usize) -> HashSet<usize> {
-        self.canvas.active_source_page_window(neighbor_radius)
-    }
-
-    pub fn source_pixel_inspection_active(&self) -> bool {
-        self.canvas.source_pixel_inspection_active()
     }
 
     /// True iff every page's LAYER data is resident (the whole-project preload has fully drained).
@@ -1026,7 +1037,7 @@ impl TypingTabState {
     }
 
     /// Records whether a project save is pending on the whole-project preload or already in flight
-    /// (state owned by `MangaApp`). Must be called by the App before `draw` each frame. It makes
+    /// (state owned by `StudioApp`). Must be called by the App before `draw` each frame. It makes
     /// export mutually exclusive with save (Finding 2): while set, a new export trigger is deferred and
     /// no deferred export dispatches. Kept as a setter (not a `draw` argument) to keep `draw`'s public
     /// signature within the argument-count budget.
@@ -1832,9 +1843,6 @@ impl CanvasHooks for TypingHooks<'_> {
         // The user-facing folder, never the hidden single-image scratch chapter (deleted on exit), so
         // the export / image-import dialogs never default into a directory that vanishes.
         self.top_panel.set_export_default_dir(project.user_facing_dir());
-        // Single-image mode has no project export (the file is written by «Сохранить»): the panel hides
-        // the export format row, re-pagination block and export button.
-        self.top_panel.set_single_image_mode(project.is_single_image());
         // The export panel needs two project facts it cannot reach on its own: the comic type
         // (re-pagination defaults OFF and warns for a page-based title — it is a webtoon
         // operation) and the `"<title> <chapter>"` base name that prefills the PDF save dialog
@@ -3286,7 +3294,7 @@ pub(super) struct TypingTextOverlayLayer {
     ///
     /// An OPTIMIZATION, not the carrier of the font's identity: the egui family NAME is derived
     /// from the same key by `create_upload::editor_font_family_name`, so an instance that starts
-    /// with an empty memo (a project reload rebuilds `MangaApp` inside the SAME `egui::Context`)
+    /// with an empty memo (a project reload rebuilds `StudioApp` inside the SAME `egui::Context`)
     /// still names each font exactly as the previous one did. All the memo saves is copying the
     /// bytes into an `egui::FontData` again; a repeat `add_font` under an existing name is a
     /// no-op, and one key always stands for one set of bytes, so the repeat is harmless.

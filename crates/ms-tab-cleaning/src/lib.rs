@@ -9,8 +9,8 @@ Crate root of the «Клининг» (cleaning) tab. Re-exported by the binary f
 Layer:
 The TOP of the library stack — above the canvas, the models, the tooling primitives, the
 widgets and `ms-tab-translation` (it drives the AI backend health, the text detector and
-the MT service through that crate), and below only `app.rs`, which calls
-`CleaningTabState::draw`. It must never name `app` or `launcher`.
+the MT service through that crate), and below only `studio.rs`, which calls
+`CleaningTabState::draw`. It must never name `studio` or `launcher`.
 It does NOT depend on `ms-tab-typing` and must not start to: the one thing the two share is
 the atomic document-write RECIPE that `tools/watermark_library.rs` documents and reimplements,
 because `ms-tab-typing`'s `panel/doc_store.rs` is crate-private and unreachable from here.
@@ -55,7 +55,7 @@ mod watermark_chapter;
 
 pub use tab::{CleaningDrawParams, CleaningTabState};
 /// The «Клининг» dock arrangement builder, handed to the app-owned dock state by
-/// `app.rs::restore_panel_dock` before the first frame. `pub`, not crate-private: the
+/// `studio.rs::restore_panel_dock` before the first frame. `pub`, not crate-private: the
 /// caller lives in the binary.
 pub use tab::cleaning_default_dock_layout;
 /// Test-only door: marks the process as a test process so the cloud-edit tool never writes the

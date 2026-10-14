@@ -94,7 +94,7 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   uses — and replans only when the engine, params or page size change. The tab owns the cache
   and lends it to `draw_text_detector_panel`, which queries it after the option widgets ran, so
   the frame of an option change already shows the new plan. The page size reaches the
-  panel from `MangaApp::page_infos` through `draw_side_panel` (`detector_page_size`: no notice
+  panel from `StudioApp::page_infos` through `draw_side_panel` (`detector_page_size`: no notice
   while the page is loading, failed or 0x0). `plan_notice_text` / `plan_ctd_size_text` only
   format the notice.
 - `machine_translation.rs`: tabbed MT UI with legacy provider/source/target controls and AI API

@@ -477,7 +477,6 @@ fn resolve_target(
                     project_dir,
                     title: title.to_string(),
                     chapter: chapter.to_string(),
-                    resume_unsaved: false,
                 }),
             })
         }

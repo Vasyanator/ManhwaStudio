@@ -30,14 +30,13 @@ pub enum LauncherPage {
     Settings,
 }
 
+/// The chapter the user chose to open. It carries no resume/fresh choice: the host resumes
+/// whenever a `{chapter}_unsaved` folder exists (the Open page deletes it for a fresh open).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenProjectSelection {
     pub project_dir: PathBuf,
     pub title: String,
     pub chapter: String,
-    /// When true the project was opened in crash-recovery mode: the `_unsaved` staging
-    /// folder was detected and the user chose to resume from it.
-    pub resume_unsaved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

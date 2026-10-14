@@ -90,6 +90,6 @@ states it in testable Rust.
 - To change what the pass covers, see `PsEditorTabState::draw_correction_pass` in `../lib.rs`: the
   layer is painted between `draw_composite` and the pixel-grid pass, on a painter clipped to
   `page_rect ∩ canvas rect`.
-- To change backend installation or teardown, see `install_shader_layers` and
-  `AppShell::on_exit` (`src/shell/studio.rs`, `src/shell/mod.rs`) and the web app creator in
+- To change backend installation or teardown, see `install` (`src/shell/gl.rs`, called from the
+  main window's creator), `AppShell::on_exit` (`src/shell/mod.rs`) and the web app creator in
   `src/web_entry.rs`.

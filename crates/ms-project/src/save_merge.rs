@@ -23,7 +23,7 @@ Key functions:
 
 Notes:
 Native-only in practice: uses `std::fs` directly (recursive copy + `remove_dir_all`), exactly
-like the code it was moved from (`src/app.rs`). Blocking; callers run it on a worker thread.
+like the code it was moved from (`src/studio.rs`). Blocking; callers run it on a worker thread.
 User-facing error texts reuse the `app.merge.*` localization keys.
 Durability: only the bubbles document is directory-fsynced before the staging directory is
 removed; the byte-copied page files and the per-page layer merge are not (a known gap, see

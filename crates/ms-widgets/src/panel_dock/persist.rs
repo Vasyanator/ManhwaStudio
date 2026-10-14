@@ -843,7 +843,7 @@ fn decode_sub_windows(stored: &[StoredSubWindow]) -> Vec<SubWindowNode> {
 /// together with the sub-windows it refers to.
 ///
 /// `user_settings` is an already loaded `user_config.json` snapshot (the one
-/// `MangaApp` reads at startup) — this function performs no I/O. Each entry of
+/// `StudioApp` reads at startup) — this function performs no I/O. Each entry of
 /// `defaults` is a program tab's `AppTab::key()` and its default-layout builder;
 /// the builder is used only to learn which `TabId`s that program tab knows (see
 /// [`known_tabs`]), never to replace a stored layout.
@@ -1111,7 +1111,7 @@ impl config_saver::SaverPayload for PanelLayoutSnapshot {
     /// The sub-window list, by contrast, is REPLACED: it is one global list, so
     /// the newest snapshot is the whole truth about it. That is sound because the
     /// writer has exactly ONE feeder — the studio window's single
-    /// `PanelDockState`, owned by `MangaApp` — so every snapshot describes all
+    /// `PanelDockState`, owned by `StudioApp` — so every snapshot describes all
     /// windows. A second feeder would have to teach this fold how they share the
     /// list; the project deliberately does not have one.
     ///

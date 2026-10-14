@@ -176,7 +176,7 @@ Where premultiplication bites:
   then re-importing it with `from_rgba_unmultiplied` double-darkens it — the repo has a regression test
   for exactly this (`src/tabs/typing/tab/tests.rs:480`).
 - Any RGBA coming from the `image` crate is **un-premultiplied**, so it must go through
-  `ColorImage::from_rgba_unmultiplied` (repo: `src/app.rs:1747`, `src/app.rs:3159`).
+  `ColorImage::from_rgba_unmultiplied` (repo: `src/studio/residency/decode.rs:110`, `src/studio/residency/mod.rs:346`).
 
 `Rgba` (`ecolor-0.36.2/src/rgba.rs:10`) is linear-space `[f32; 4]`, also premultiplied;
 `From<Color32> for Rgba` / `From<Rgba> for Color32` at `ecolor-0.36.2/src/lib.rs:51` and `:74`.
@@ -275,7 +275,7 @@ pub fn load_texture(&self, name: impl Into<String>, image: impl Into<ImageData>,
 — `impl Drop { self.tex_mngr.write().free(self.id) }`). Store the handle in your app/tab state for as
 long as you paint with it; a handle created inside `fn ui(..)` and dropped at the end of the frame
 produces a blank/garbage texture. Cloning the handle is cheap and refcounts the texture
-(`texture_handle.rs:31`). Repo keeps handles in tile structs: `src/app.rs:1751-1758`.
+(`texture_handle.rs:31`). Repo keeps handles in tile structs: `src/studio/residency/mod.rs` (`PageTexture` tiles).
 
 Other handle methods: `id() -> TextureId` (:64), `set` (:70), `set_partial` (:78), `size()` (:90),
 `byte_size` (:104).
@@ -285,7 +285,7 @@ is the font atlas) or `User(u64)` (custom renderer texture).
 
 `TextureOptions` (`epaint-0.36.2/src/textures.rs:160`): fields `magnification`, `minification`,
 `wrap_mode`, `mipmap_mode`. Constants: `LINEAR` (:183), `NEAREST` (:191), `LINEAR_REPEAT` (:199),
-`NEAREST_REPEAT` (:215). Repo: `TextureOptions::LINEAR` for page tiles (`src/app.rs:1755`),
+`NEAREST_REPEAT` (:215). Repo: `TextureOptions::LINEAR` for page tiles (`src/studio/residency/mod.rs:353`),
 `NEAREST` for masks (`src/tabs/translation/tab.rs:254`, `src/tabs/cleaning/tab.rs:1591`).
 
 Displaying a texture:
@@ -335,7 +335,7 @@ points × `pixels_per_point`.
 - Custom textured geometry / deform meshes: `src/tabs/typing/tab/mesh_geometry.rs`
   (`build_textured_deform_mesh`, `draw_textured_deform_mesh`).
 - Layer/raster quads on the typing canvas: `src/tabs/typing/tab/doc_layers.rs`.
-- Page tile texture upload (frame-budgeted, `ColorImage` → `TextureHandle`): `src/app.rs`
+- Page tile texture upload (frame-budgeted, `ColorImage` → `TextureHandle`): `src/studio.rs`
   (`upload_textures_incremental`, :1718).
 - Mask textures (`NEAREST`): `src/tabs/cleaning/tools/base.rs`, `src/tabs/translation/tab.rs`.
 - Anything that must also be exported: keep the `Arc<image::RgbaImage>` side alive (`CleanOverlaysModel`, `ARCHITECTURE.md`).

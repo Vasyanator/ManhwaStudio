@@ -49,7 +49,7 @@ use eframe::egui;
 use std::collections::HashSet;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
-/// The clean-tree scope the overlay loader (`src/app.rs`, `loadable_clean_overlay`) resolves a
+/// The clean-tree scope the overlay loader (`src/studio.rs`, `loadable_clean_overlay`) resolves a
 /// page's clean in; message 1 must use the same one, since it reports what the loader skipped.
 const LOADER_SCOPE: CleanTreeScope = LOADER_CLEAN_SCOPE;
 
@@ -112,7 +112,7 @@ impl CleanFolderStatus {
     /// Records that the tab is drawn in frame `frame_nr` and requests a rescan when the tab was
     /// NOT drawn in the frame before, i.e. the user has just switched into the Cleaning tab.
     ///
-    /// Detecting the entry here rather than in `app.rs` covers every way into the tab (tab bar,
+    /// Detecting the entry here rather than in `studio.rs` covers every way into the tab (tab bar,
     /// "open page in tab", a return from the page manager, which is where clean files are
     /// attached or trashed) without the app having to track the previous tab for this.
     pub(crate) fn note_frame(&mut self, frame_nr: u64) {
@@ -163,11 +163,12 @@ impl CleanFolderStatus {
         }
     }
 
-    /// Starts a scan of `project`'s clean folders on a worker when one is pending and none is in
-    /// flight (`clean_scan_should_start`). `ctx` is repainted by the worker once the reply is
-    /// sent, so the GUI does not have to poll with continuous repaints.
-    pub(crate) fn start_scan_if_needed(&mut self, ctx: &egui::Context, project: &ProjectData) {
-        if !clean_scan_should_start(self.rescan_pending, self.scan_rx.is_some(), project.is_single_image()) {
+    /// Starts a scan of `project`'s clean folders on a worker when one is pending, none is in
+    /// flight and the session offers it (`clean_scan_offered`: `SessionCapabilities::clean_scan`;
+    /// see `clean_scan_should_start`). `ctx` is repainted by the worker once the reply is sent,
+    /// so the GUI does not have to poll with continuous repaints.
+    pub(crate) fn start_scan_if_needed(&mut self, ctx: &egui::Context, project: &ProjectData, clean_scan_offered: bool) {
+        if !clean_scan_should_start(self.rescan_pending, self.scan_rx.is_some(), clean_scan_offered) {
             return;
         }
         self.rescan_pending = false;
@@ -211,11 +212,12 @@ impl CleanFolderStatus {
 }
 
 /// Whether a clean-folder scan starts this frame: one is pending, none is in flight, and the
-/// project is not a single-image session. A single-image scratch chapter has exactly one page
-/// whose clean the session itself writes, so there is no orphan or foreign-size clean to find,
-/// and both messages point at the page manager, which that mode does not show.
-fn clean_scan_should_start(rescan_pending: bool, scan_in_flight: bool, single_image: bool) -> bool {
-    rescan_pending && !scan_in_flight && !single_image
+/// session offers it (`clean_scan_offered`, false in a single-image session). A single-image
+/// scratch chapter holds only cleans the session itself writes, so there is no orphan or
+/// foreign-size clean to find, and both messages point at the page manager, which that mode does
+/// not show.
+fn clean_scan_should_start(rescan_pending: bool, scan_in_flight: bool, clean_scan_offered: bool) -> bool {
+    rescan_pending && !scan_in_flight && clean_scan_offered
 }
 
 /// What a dock body needs to derive the status messages: the tab's status state.
@@ -389,10 +391,10 @@ mod tests {
     /// A scan starts only when pending and idle, and never in a single-image session.
     #[test]
     fn a_clean_scan_never_starts_in_a_single_image_session() {
-        assert!(clean_scan_should_start(true, false, false));
-        assert!(!clean_scan_should_start(true, false, true));
-        assert!(!clean_scan_should_start(false, false, false));
-        assert!(!clean_scan_should_start(true, true, false));
+        assert!(clean_scan_should_start(true, false, true));
+        assert!(!clean_scan_should_start(true, false, false));
+        assert!(!clean_scan_should_start(false, false, true));
+        assert!(!clean_scan_should_start(true, true, true));
     }
 
     const CURRENT: usize = 3;

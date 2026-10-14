@@ -9,7 +9,7 @@ edition = "2024"
 #
 # Layer: ABOVE `ms-models` / `ms-project` / `ms-widgets`, BELOW the tabs. The
 # `CanvasHooks` trait is DECLARED here and IMPLEMENTED by the tabs, so the dependency
-# points down only — this crate must never name `tabs`, `app` or `launcher`.
+# points down only — this crate must never name `tabs`, `studio` or `launcher`.
 [dependencies]
 # The whole crate draws: scene passes, bubble widgets, overlay uploads.
 egui.workspace = true

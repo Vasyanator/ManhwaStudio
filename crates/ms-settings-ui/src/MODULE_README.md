@@ -37,6 +37,8 @@ dependency list.
 
 ## Files and submodules
 - `lib.rs`: crate root and module list; the `tutorial` feature gate.
+- `../examples/`: the `tutorial_test` overlay demo (`required-features = ["tutorial"]`); see
+  `../examples/MODULE_README.md`.
 - `settings_shared.rs`: the menu-level layer — `SettingsSectionId`, `sections_for`,
   `title_key`, `SharedSettingsPanels`, which owns the three shared panes, and
   `with_item_badge`, the one layout rule for an item's inline warning badge. The studio
@@ -66,9 +68,10 @@ dependency list.
   autosave policy (interval + action threshold, live in `ms_config::autosave_policy`), typesetting
   language, startup monitor, secondary windows, the touchscreen-gestures switch
   (`General.touch_gestures`, applied live to `ms_config::touch_gestures`; the row is drawn only
-  where `PlatformFeature::CanvasTouchGestures` is available). Also owns the process-wide UI-scale slot
-  (`ui_scale_percent` / `apply_ui_scale`) the main window's creator applies once (launcher and
-  studio share its `Context`, so a change rescales both), and
+  where `PlatformFeature::CanvasTouchGestures` is available). Its UI-scale slider writes the
+  process-wide slot owned by `ms_widgets::ui_scale` (re-exported here as `ui_scale_percent` /
+  `apply_ui_scale` / `apply_ui_scale_to_context` / `seed_ui_scale_from_user_settings`; launcher
+  and studio share the main window's `Context`, so a change rescales both). It also owns
   the locale-catalog helpers the launcher's first-run language modal reuses. Its projects-root
   "Browse" button uses the non-blocking `ms_platform::file_dialog` (`PickDirectoryPath`, polled
   each frame) and is drawn only where `PlatformFeature::PersistentDirectoryPicker` is available.
@@ -100,12 +103,13 @@ dependency list.
   device reconcile and the settings device check both ask it. No UI here.
 - `ai_backend_supervisor.rs`: `AiBackendHandle` — the app-global handle both shells drive
   the Python backend process through, plus its health probe and (on Windows) the loopback
-  WebSocket handshake. `AiBackendSupervisor` is built once in `run_main` and outlives the
+  WebSocket handshake. `AiBackendSupervisor` is built once at startup
+  (`ProcessServices::start_ai_backend_supervisor`, `src/startup/services.rs`) and outlives the
   launcher -> studio switch; the process itself (spawn, stdout/stderr reader threads, runtime
   log) is owned by the `AiBackendProcessRuntime` worker (`spawn_ai_backend_process_worker`). `start_with_autostart_gate` defers the persisted autostart until a
   gate opens (the binary passes `!storage_mode_job::backend_autostart_blocked()`); a user
   Start/Restart/Stop cancels a deferred autostart. The handle carries the process's
-  `LocalAiAvailability` (`local_ai`, built in `run_main`: `--no-ai` switches off the backend AND
+  `LocalAiAvailability` (`local_ai`, built by `src/startup/services.rs`: `--no-ai` switches off the backend AND
   native ONNX, the platform decides on its own). With the backend off no process worker and no
   probe start; the health snapshot is the fixed `AiBackendHealthSnapshot::unavailable` (checked,
   not connected, naming the reason) so backend routes are refused, and the capability hints are
@@ -136,8 +140,9 @@ dependency list.
 - **The `tutorial` feature is NOT inherited.** The root crate forwards it
   (`tutorial = ["ms-settings-ui/tutorial"]`). Enabling one without the other silently drops
   the tours from half the app.
-- `tutorial/engine.rs` is ALSO mounted by the `tutorial_test` demo bin through `#[path]`,
-  so it must stay dependency-light: egui + std only, no config, no logging, no `t!`.
+- `tutorial/engine.rs` stays dependency-light: egui + std only, no config, no logging, no
+  `t!`. The `tutorial_test` demo (`../examples/tutorial_test/`) imports it as
+  `ms_settings_ui::tutorial::engine` under the `tutorial` feature, like every other consumer.
 - **Backend spawn guard.** `start_ai_backend_process` is the single spawn point (autostart,
   Start, Restart). Its preconditions have one owner, `check_backend_spawnable(app_dir)`
   (`BackendSpawnBlocker`: `ai_backend.py` missing; a Python payload without `docstore.py`,

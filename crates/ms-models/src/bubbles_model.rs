@@ -23,7 +23,9 @@ Threading/persistence:
 - The saver always writes to the unsaved staging folder (`unsaved_bubbles_path`).
   The main chapter file is only updated by an explicit "save to project" merge.
 - `has_unsaved_changes()` returns true when the unsaved staging bubbles document exists
-  (probed through `ms_docstore::exists`, format-independent).
+  (probed through `ms_docstore::exists`, format-independent: `staged_bubbles_exist`). The
+  initial probe runs in `BubblesModel::new`, or is pre-read by the caller off the GUI thread and
+  passed to `BubblesModel::new_with_staging_probe` (the studio does this on its open worker).
 - Every write of the bubbles document (`write_bubbles_snapshot_to`) goes through
   `ms_docstore` (atomic whole-document replace), never a raw file write.
 */
@@ -213,14 +215,41 @@ struct BubblesSaverGate {
     paused: bool,
 }
 
+/// Whether the staging bubbles document at `unsaved_bubbles_path` exists, in any format. Asks the
+/// document store (`ms_docstore::exists`), which probes through the storage seam, so the web build
+/// checks its in-memory/IndexedDB store. Blocking I/O: the initial "unsaved changes" flag of
+/// [`BubblesModel::new_with_staging_probe`], pre-read off the GUI thread by the studio's open worker.
+#[must_use]
+pub fn staged_bubbles_exist(unsaved_bubbles_path: &Path) -> bool {
+    ms_docstore::exists(&DocRef::new(unsaved_bubbles_path, DocKind::Bubbles))
+}
+
 #[allow(dead_code)]
 impl BubblesModel {
+    /// Builds the model and spawns its saver, probing the staging bubbles document itself
+    /// ([`staged_bubbles_exist`], blocking I/O). Callers on the GUI thread pre-read the probe and
+    /// use [`Self::new_with_staging_probe`] instead.
     pub fn new(
         bubbles: Vec<Bubble>,
         bubbles_path: PathBuf,
         unsaved_bubbles_path: PathBuf,
         canvas_settings: SharedCanvasSettings,
         autosave_gate: Option<Arc<AutosaveGate>>,
+    ) -> Self {
+        let has_staged_bubbles = staged_bubbles_exist(&unsaved_bubbles_path);
+        Self::new_with_staging_probe(bubbles, bubbles_path, unsaved_bubbles_path, canvas_settings, autosave_gate, has_staged_bubbles)
+    }
+
+    /// Same as [`Self::new`], but takes the staging probe's answer (`has_staged_bubbles`: what
+    /// [`staged_bubbles_exist`] returned for `unsaved_bubbles_path`, read shortly before) instead of
+    /// performing it, so it does no document I/O. Spawns the saver thread.
+    pub fn new_with_staging_probe(
+        bubbles: Vec<Bubble>,
+        bubbles_path: PathBuf,
+        unsaved_bubbles_path: PathBuf,
+        canvas_settings: SharedCanvasSettings,
+        autosave_gate: Option<Arc<AutosaveGate>>,
+        has_staged_bubbles: bool,
     ) -> Self {
         let saver_gate = Arc::new(Mutex::new(BubblesSaverGate::default()));
         let (saver_sender, saver_thread) = spawn_bubbles_saver_thread(
@@ -230,15 +259,11 @@ impl BubblesModel {
         );
         let saver_tx = Arc::new(Mutex::new(saver_sender));
         let bubble_index_by_id = build_bubble_index(&bubbles);
-        // Ask the document store whether the staging bubbles document exists (in any
-        // format; it probes through the storage seam, so the web build checks its
-        // in-memory/IndexedDB store).
-        let has_unsaved_changes = ms_docstore::exists(&DocRef::new(&unsaved_bubbles_path, DocKind::Bubbles));
         Self {
             bubbles: Arc::new(bubbles),
             bubble_index_by_id,
             bubbles_path,
-            has_unsaved_changes,
+            has_unsaved_changes: has_staged_bubbles,
             unsaved_bubbles_path,
             revision: 1,
             canvas_settings,
@@ -528,7 +553,7 @@ impl BubblesModel {
     pub fn mark_saved_to_project(&mut self) {
         // A mutation accepted while the save barrier was held is written to a newly recreated
         // staging file after the merge. Preserve that post-save dirty state instead of clearing it.
-        self.has_unsaved_changes = ms_docstore::exists(&DocRef::new(&self.unsaved_bubbles_path, DocKind::Bubbles));
+        self.has_unsaved_changes = staged_bubbles_exist(&self.unsaved_bubbles_path);
     }
 
     fn touch_and_save(&mut self) -> Result<()> {
@@ -1044,6 +1069,24 @@ mod tests {
         assert!(staging_path.exists(), "final resume did not persist the held snapshot");
         assert!(model.shutdown_saver().is_ok());
         assert!(std::fs::remove_file(staging_path).is_ok());
+    }
+
+    /// The initial "unsaved changes" flag: `new` probes the staging document itself, and
+    /// `new_with_staging_probe` takes the pre-read answer verbatim without probing.
+    #[test]
+    fn the_initial_unsaved_flag_follows_the_staging_probe() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let unsaved = dir.path().join("translation_bubbles.json");
+        let committed = dir.path().join("committed.json");
+        assert!(!staged_bubbles_exist(&unsaved));
+        let fresh = BubblesModel::new(Vec::new(), committed.clone(), unsaved.clone(), SharedCanvasSettings::default(), None);
+        assert!(!fresh.has_unsaved_changes());
+        let told = BubblesModel::new_with_staging_probe(Vec::new(), committed.clone(), unsaved.clone(), SharedCanvasSettings::default(), None, true);
+        assert!(told.has_unsaved_changes(), "the pre-read answer is taken verbatim");
+        assert!(write_bubbles_snapshot_to(&unsaved, &[]).is_ok());
+        assert!(staged_bubbles_exist(&unsaved));
+        let staged = BubblesModel::new(Vec::new(), committed, unsaved, SharedCanvasSettings::default(), None);
+        assert!(staged.has_unsaved_changes());
     }
 
     // ---- Autosave gate ------------------------------------------------------------------------

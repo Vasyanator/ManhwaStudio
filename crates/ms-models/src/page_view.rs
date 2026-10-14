@@ -12,8 +12,8 @@ Key structures:
   RGBA bytes so a dropped texture can be re-uploaded without decoding again.
 
 Notes:
-These types live in `ms-models` (not in `app.rs`) so that `canvas` and `tabs` do not have to
-reference the app shell upwards. Producing and evicting the textures stays in `app.rs`.
+These types live in `ms-models` (not in `studio.rs`) so that `canvas` and `tabs` do not have to
+reference the app shell upwards. Producing and evicting the textures stays in `studio.rs`.
 */
 
 use eframe::egui;

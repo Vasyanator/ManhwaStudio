@@ -578,7 +578,7 @@ The arrangement lives in the self-versioned `PanelLayout` section of `user_confi
   `PanelDockState`) debounces a burst and performs ONE write through
   `config::update_user_config_file`, the locked read-modify-write border of the file. It is fed by
   `PanelDockState::take_dirty_layouts`, polled once per frame right after the tab draws, because
-  `dirty` is raised on every frame a panel drag advances. `MangaApp::on_exit` polls once more and
+  `dirty` is raised on every frame a panel drag advances. `StudioApp::on_exit` polls once more and
   flushes. **The writer is the last owner of a snapshot** — polling clears `dirty`, so a snapshot
   the writer drops exists nowhere else. A failed write therefore keeps its snapshot and retries it
   on a doubling, capped backoff; a newer snapshot is folded OVER the held one by the same per-tab
@@ -660,7 +660,7 @@ The arrangement lives in the self-versioned `PanelLayout` section of `user_confi
 `pos` — absent where the platform does not report one — and inner `size`), and a panel addresses
 one through its `host`. The list is GLOBAL, not per program tab, so the writer REPLACES it while
 merging the layouts per key. **That question is settled: there is exactly ONE dock state per studio
-window** (`MangaApp::panel_dock`), lent to whichever program tab draws, so the writer has a single
+window** (`StudioApp::panel_dock`), lent to whichever program tab draws, so the writer has a single
 feeder and the list has a single owner. A panel naming a window the list does not describe comes
 back to the main window, and a window no restored layout puts a panel in is not opened.
 
@@ -685,7 +685,7 @@ content.
 - **Both widgets are mandatory.** Every floating panel of the studio is built from
   `CollapsiblePanel` + `PanelTab`. No new `Area + Frame::popup` with a hand-rolled collapse arrow,
   and no bare `egui::Window` used as a panel.
-- **One dock state per studio window, and it is the APPLICATION's.** `MangaApp` owns it and lends a
+- **One dock state per studio window, and it is the APPLICATION's.** `StudioApp` owns it and lends a
   `&mut` to the program tab that draws; a tab may not keep one of its own. Three global concerns
   forbid splitting it per tab: a sub-window's `ViewportId` is derived from an index minted by a
   PER-STATE counter (two states would show two immediate viewports under one id in a single pass),

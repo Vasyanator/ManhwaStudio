@@ -13,9 +13,9 @@ edition = "2024"
 # notes, wiki}`, so every existing `crate::tabs::characters::…` call site keeps its path.
 #
 # Layer: near the TOP of the library stack — above the project model, the widgets and the
-# storage seam, and below `app.rs` / `launcher/app.rs` (which own the tab states) and the
+# storage seam, and below `studio.rs` / `launcher/app.rs` (which own the tab states) and the
 # `translation` tab (which reads character and term note entries). It must never name
-# `app`, `launcher` or another tab.
+# `studio`, `launcher` or another tab.
 
 [dependencies]
 # The chapter/project domain model every one of the four tabs reads its paths from.

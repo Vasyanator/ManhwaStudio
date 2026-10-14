@@ -25,7 +25,7 @@ message) to logcat, and catches a panic of `android_main` itself; `android_logge
 `log` facade (eframe, glow) at Info level; the winit fork logs through `tracing`, whose `log`
 feature (enabled in the root manifest's Android dependencies) turns its events into `log`
 records while no `tracing` subscriber exists, so they reach logcat under the same tag.
-`ms_log::runtime_log` keeps writing `last.log` under the runtime root once `run_main`
+`ms_log::runtime_log` keeps writing `last.log` under the runtime root once `startup::run_native`
 initializes it.
 The runtime root (`ms_config::program_dir` / `data_dir`) falls back to the working directory,
 so the working directory must be `ms_root` BEFORE the first `ms_config` / `ms_fonts` call.

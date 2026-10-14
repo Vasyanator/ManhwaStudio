@@ -7,6 +7,9 @@ Main types:
   the shared panels against, the `SharedSettingsPanels` container that owns the three
   cross-surface panel states (General / AiBackend / Tutorials), and the user-facing
   memory profile binding to `MemoryManager`.
+- `SettingsTabSeed` / `SpellcheckWordsSeed`: the tab's construction-time and binding-time
+  disk reads, done by `read_blocking` on a worker (the studio's open worker) so
+  `SettingsTabState::from_seed` and `set_canvas_settings_binding` perform no I/O.
 
 Section identity is the cross-surface `crate::settings_shared::SettingsSectionId`; the
 tab bar and studio section order come from `settings_shared::sections_for(Studio)` and
@@ -21,7 +24,7 @@ Flow:
 - The shared panels forward to the shared `crate::general_settings_panel` /
   `ms_settings_ui::ai_backend_panel` / `crate::tutorial` widgets over the app-global supervisor
   handle; the backend process/probe lifecycle itself lives in
-  `crate::ai_backend_supervisor` (owned by `run_main`, not by this tab).
+  `crate::ai_backend_supervisor` (owned by `startup::run_native`, not by this tab).
 */
 
 mod canvas_ribbon;
@@ -36,6 +39,7 @@ use crate::config;
 use crate::input_manager_v2::InputManagerV2;
 use crate::memory_manager::{MemoryManager, MemoryProfile};
 use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
+use crate::models::SessionCapabilities;
 use crate::models::clean_overlays_model::CleanOverlaysModel;
 use crate::project::{ComicType, save_comic_type_to_project_file};
 use crate::runtime_log;
@@ -205,9 +209,10 @@ pub struct SettingsTabState {
     /// outline. Set when a reveal fires; `None` when no highlight is active. Uses
     /// `web_time::Instant` so it also works under wasm.
     reveal_highlight_until: Option<Instant>,
-    /// `true` in a single-image session (`set_single_image_session`): the canvas pane hides the
-    /// comic-type preset and the project word list, whose project is a throwaway scratch chapter.
-    single_image_session: bool,
+    /// `SessionCapabilities::project_settings` (`set_session_capabilities`): `false` in a
+    /// single-image session, whose project is a throwaway scratch chapter — the canvas pane then
+    /// hides the comic-type preset and the project word list.
+    project_settings: bool,
 }
 
 impl Default for SettingsTabState {
@@ -216,19 +221,91 @@ impl Default for SettingsTabState {
     }
 }
 
-impl SettingsTabState {
-    pub fn new(ai_backend_handle: AiBackendHandle, memory_manager: Arc<MemoryManager>) -> Self {
+/// Everything [`SettingsTabState`] reads from disk at construction, read once by
+/// [`SettingsTabSeed::read_blocking`] (on the studio's open worker) so the tab itself is built
+/// on the GUI thread without I/O ([`SettingsTabState::from_seed`]).
+#[derive(Debug)]
+pub struct SettingsTabSeed {
+    /// `user_config.json` path the tab writes its settings back to.
+    user_settings_file: PathBuf,
+    /// `General.typing_panel_layout`.
+    typing_panel_layout: TypingPanelLayout,
+    /// The font-settings lists' name-display switches (`TextTab.font_list_name_mode_*`).
+    font_name_display_modes: FontNameDisplayModes,
+    /// The cross-surface panels, seeded from `user_config.json` (and the locale folder scan)
+    /// by `SharedSettingsPanels::new`; plain data, so building them off the GUI thread is safe.
+    shared: SharedSettingsPanels,
+}
+
+impl SettingsTabSeed {
+    /// Reads the seed: the typing panel layout, the font-list name modes and the shared panels'
+    /// startup state. Blocking document reads; never on the GUI thread of a running window.
+    #[must_use]
+    pub fn read_blocking() -> Self {
         let user_settings_file = config::user_config_path();
         let typing_panel_layout = load_typing_panel_layout(&user_settings_file);
-        // Interface preference of the font-settings lists; read here (once, at construction,
-        // like the panel layout above) so the widget itself performs no I/O and still knows
-        // where to write a change back to.
+        // Interface preference of the font-settings lists; read here (once, like the panel
+        // layout above) so the widget itself performs no I/O and still knows where to write a
+        // change back to.
         let font_name_display_modes = load_font_name_display_modes(&user_settings_file);
-        let font_settings_file = user_settings_file.clone();
         let shared = SharedSettingsPanels::new(
             #[cfg(feature = "tutorial")]
             crate::tutorial::shared_progress(),
         );
+        Self { user_settings_file, typing_panel_layout, font_name_display_modes, shared }
+    }
+}
+
+/// The two spellcheck word lists the canvas pane edits, read once by
+/// [`SpellcheckWordsSeed::read_blocking`] (off the GUI thread) and installed by
+/// [`SettingsTabState::set_canvas_settings_binding`].
+#[derive(Debug, Clone)]
+pub struct SpellcheckWordsSeed {
+    /// The shared (user-level) custom dictionary, newline-joined ("" when unreadable, logged).
+    custom: String,
+    /// The project word list of the bound settings file ("" when unreadable, logged).
+    project: String,
+    /// `current_spellcheck_words_revision()` taken BEFORE both reads: a list written after it
+    /// bumps the revision, so the tab reloads instead of keeping a stale copy.
+    revision: u64,
+}
+
+impl SpellcheckWordsSeed {
+    /// Reads both word lists for the project whose settings document is
+    /// `project_settings_file`. Blocking file / document reads; a failure is logged and reads
+    /// as an empty list (the tab's long-standing fallback).
+    #[must_use]
+    pub fn read_blocking(project_settings_file: &Path) -> Self {
+        let revision = current_spellcheck_words_revision();
+        let custom = load_custom_spellcheck_words().unwrap_or_else(|err| {
+            runtime_log::log_warn(format!(
+                "[settings] failed to load custom spellcheck dictionary: {err}"
+            ));
+            String::new()
+        });
+        let project = load_project_spellcheck_words(project_settings_file).unwrap_or_else(|err| {
+            runtime_log::log_warn(format!(
+                "[settings] failed to load project spellcheck words '{}': {err}",
+                project_settings_file.display()
+            ));
+            String::new()
+        });
+        Self { custom, project, revision }
+    }
+}
+
+impl SettingsTabState {
+    /// Reads its seed on the calling thread ([`SettingsTabSeed::read_blocking`]) and builds the
+    /// tab ([`Self::from_seed`]).
+    pub fn new(ai_backend_handle: AiBackendHandle, memory_manager: Arc<MemoryManager>) -> Self {
+        Self::from_seed(SettingsTabSeed::read_blocking(), ai_backend_handle, memory_manager)
+    }
+
+    /// Builds the tab from an already read `seed`: no file or document I/O. Applies the seeded
+    /// memory profile to `memory_manager`.
+    pub fn from_seed(seed: SettingsTabSeed, ai_backend_handle: AiBackendHandle, memory_manager: Arc<MemoryManager>) -> Self {
+        let SettingsTabSeed { user_settings_file, typing_panel_layout, font_name_display_modes, shared } = seed;
+        let font_settings_file = user_settings_file.clone();
         // Seed the runtime memory profile from the shared general panel (loaded from
         // config), the same value the shared widget starts with.
         memory_manager.set_profile(shared.memory_profile());
@@ -265,7 +342,7 @@ impl SettingsTabState {
             pending_reveal: None,
             pending_reveal_expires: None,
             reveal_highlight_until: None,
-            single_image_session: false,
+            project_settings: true,
         }
     }
 
@@ -274,7 +351,7 @@ impl SettingsTabState {
     /// rendered (force-opens the relevant collapsed blocks, scrolls to them, and
     /// highlights them for ~2 seconds).
     ///
-    /// This does NOT switch the active app tab; the caller (`app.rs`) is responsible for
+    /// This does NOT switch the active app tab; the caller (`studio.rs`) is responsible for
     /// flipping to the settings tab after calling this.
     pub fn navigate_to(&mut self, link: SettingsDeepLink) {
         match link {
@@ -288,12 +365,18 @@ impl SettingsTabState {
 }
 
 impl SettingsTabState {
+    /// Binds the canvas pane to a project: its settings document `project_settings_file`, the
+    /// starting canvas settings, the two shared models, and the spellcheck word lists `words`
+    /// pre-read for that same document ([`SpellcheckWordsSeed::read_blocking`]). Sets the
+    /// process-global project spellcheck target and (re)starts the canvas-settings saver thread;
+    /// no file or document read here.
     pub fn set_canvas_settings_binding(
         &mut self,
         project_settings_file: PathBuf,
         initial_canvas_settings: SharedCanvasSettings,
         bubbles_model: Arc<Mutex<BubblesModel>>,
         clean_overlays_model: Arc<Mutex<CleanOverlaysModel>>,
+        words: SpellcheckWordsSeed,
     ) {
         if let Some(runtime) = self.canvas_settings_runtime.take() {
             let _ = runtime.tx.send(None);
@@ -303,23 +386,12 @@ impl SettingsTabState {
         self.project_settings_file = project_settings_file.clone();
         self.canvas_settings = initial_canvas_settings;
         set_project_spellcheck_settings_file(Some(project_settings_file.clone()));
-        self.spellcheck_custom_words = load_custom_spellcheck_words().unwrap_or_else(|err| {
-            runtime_log::log_warn(format!(
-                "[settings] failed to load custom spellcheck dictionary: {err}"
-            ));
-            String::new()
-        });
-        self.project_spellcheck_custom_words =
-            load_project_spellcheck_words(&project_settings_file).unwrap_or_else(|err| {
-                runtime_log::log_warn(format!(
-                    "[settings] failed to load project spellcheck words '{}': {err}",
-                    project_settings_file.display()
-                ));
-                String::new()
-            });
+        let SpellcheckWordsSeed { custom, project, revision } = words;
+        self.spellcheck_custom_words = custom;
+        self.project_spellcheck_custom_words = project;
         self.spellcheck_custom_words_synced = Some(self.spellcheck_custom_words.clone());
         self.project_spellcheck_words_synced = Some(self.project_spellcheck_custom_words.clone());
-        self.spellcheck_words_revision_seen = current_spellcheck_words_revision();
+        self.spellcheck_words_revision_seen = revision;
         self.bubbles_model = Some(bubbles_model);
         self.clean_overlays_model = Some(clean_overlays_model);
         self.apply_memory_profile_to_runtime(self.shared.memory_profile());
@@ -329,14 +401,17 @@ impl SettingsTabState {
         ));
     }
 
-    /// Marks this tab as part of a single-image session. Call after
-    /// [`Self::set_canvas_settings_binding`]: the bound "project" is the session's scratch chapter,
-    /// so the spellcheck context menu loses its "add to the project dictionary" target, and the
-    /// canvas pane hides the comic-type preset and the project word list (plan
-    /// `dev-docs/single_image_mode_plan.md`, WP-2.4). User-level settings stay editable.
-    pub fn set_single_image_session(&mut self) {
-        self.single_image_session = true;
-        set_project_spellcheck_settings_file(None);
+    /// Sets what the open session offers (`SessionMode::capabilities` in the root). Call once, after
+    /// [`Self::set_canvas_settings_binding`]: without `project_settings` (a single-image session,
+    /// whose bound "project" is the scratch chapter) the spellcheck context menu loses its "add to
+    /// the project dictionary" target, and the canvas pane hides the comic-type preset and the
+    /// project word list (plan `dev-docs/single_image_mode_plan.md`, WP-2.4). User-level settings
+    /// stay editable.
+    pub fn set_session_capabilities(&mut self, caps: SessionCapabilities) {
+        self.project_settings = caps.project_settings;
+        if !caps.project_settings {
+            set_project_spellcheck_settings_file(None);
+        }
     }
 
     pub fn take_typing_panel_layout_request(&mut self) -> Option<TypingPanelLayout> {

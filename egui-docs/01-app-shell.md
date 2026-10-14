@@ -54,7 +54,7 @@ the `Ui`** (egui-0.36.2/src/ui.rs:452), so holding it forbids the mutable borrow
 `Context` is an `Arc` handle, so cloning it is cheap and detaches the borrow. The project's idiom:
 
 ```rust
-// src/app.rs:2338-2346
+// src/studio.rs:1126
 fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     // egui 0.35 replaced `App::update(&Context, …)` with `App::ui(&mut Ui, …)`: the framework
     // now hands us the window-root `Ui` that fills the whole window. The top-level panels below
@@ -99,7 +99,7 @@ egui 0.36 has **one** `Panel` type with side constructors, not `TopBottomPanel`/
 Real skeleton from this repo:
 
 ```rust
-// src/app.rs:2449 and src/app.rs:2487 (root app: top bar + central content)
+// src/studio.rs (`StudioApp::ui`: top bar + central content)
 egui::Panel::top("top_bar").show(ui, |ui| {
     self.draw_tab_bar(ui);
 });
@@ -250,7 +250,7 @@ size). A screen switch later sends `ViewportCommand::Title` (egui-0.36.2/src/vie
   (egui-winit-0.36.2/src/lib.rs:1744): never cancel that one, or the window can never close.
 * **The other `run_native` sites are separate prompt windows**, run before (or, for the launcher's
   "Update", after) the main window, never at the same time: the missing-environment prompt
-  (`src/lib.rs::prompt_missing_python_env_action`) and the installer / update / existing-install
+  (`ms_installer::prompt_window`, called from `src/startup/prompts.rs`) and the installer / update / existing-install
   windows of `ms-installer` (`install.rs`, `update.rs`). Each installs the core font tier
   (`ui_fonts::install(.., Tier::Core)`) in its own creator.
 
@@ -366,7 +366,7 @@ egui repaints on demand. Nothing in `ui()` re-runs by itself.
 
 **You MUST call one of these** whenever state changes outside the frame that produced it: a worker
 thread finishing, a channel receiving, an animation you drive yourself. Cheap and idempotent per
-frame. Repo examples: while background loaders run (src/app.rs:2443-2447), from the font loader
+frame. Repo examples: while background loaders run (`StudioApp::ui`, src/studio.rs), from the font loader
 thread once each stage of the stack is registered (`src/ui_fonts.rs`, `install_blocking`), after a
 viewport command (`crates/ms-widgets/src/embedded_window.rs`, `show_separate`, after
 `ViewportCommand::Maximized(true)`).
@@ -454,9 +454,9 @@ the result actually happens. The font loader above is the canonical example.
 
 ## Editing map
 
-* To change the root app shell, tab bar, top panel, or per-tab central panel: `src/app.rs`
-  (`impl eframe::App for MangaApp`, src/app.rs:2337).
-* To change process startup or the startup prompts: `src/lib.rs`. To change the main window
+* To change the root app shell, tab bar, top panel, or per-tab central panel: `src/studio.rs`
+  (`impl eframe::App for StudioApp`, src/studio.rs:1126).
+* To change process startup or the startup prompts: `src/startup/` (prompt window: `ms_installer::prompt_window`). To change the main window
   (size, icon/app-id, title, close policy, screen switching): `src/shell/` (its `MODULE_README.md`).
 * To change the launcher shell: `crates/ms-launcher/src/app.rs`. To change how ANY secondary window
   opens (separate vs embedded, title strip, stacking): `crates/ms-widgets/src/embedded_window.rs`.

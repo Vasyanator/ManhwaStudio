@@ -9,9 +9,9 @@ This directory is the crate root of `ms-tab-ps-editor`, re-exported by the binar
 `src/tabs/mod.rs` as `crate::tabs::ps_editor`, so every existing
 `crate::tabs::ps_editor::…` path stays valid. Layer: near the top of the library stack —
 above `ms-canvas` / `ms-models` / `ms-tools` / `ms-widgets` and `ms-tab-typing` (the layers
-panel renders typing's text preview label), below `app.rs` and the `page_manager` tab. It
-must never name `app` or `launcher`. `ps_editor_default_dock_layout` is `pub` because
-`app.rs::restore_panel_dock` calls it from the binary.
+panel renders typing's text preview label), below `studio.rs` and the `page_manager` tab. It
+must never name `studio` or `launcher`. `ps_editor_default_dock_layout` is `pub` because
+`studio.rs::restore_panel_dock` calls it from the binary.
 
 ## Architecture
 Data flow for one page:
@@ -84,7 +84,7 @@ enqueues it through `doc.saver_handle()`, falling back to a synchronous `save_pa
 saver is enabled. The just-enqueued bytes are guaranteed on disk by the save-to-project merge-worker
 barrier and the app-close drain. `layers_dirty` tracks whether the current page has an edit not yet
 enqueued (set on a deferred `edit_doc_node`, cleared on any enqueue/flush); the tab-switch
-`flush_layers` (in `app.rs`) only runs when it is set (conservative — flush when in doubt). It is also
+`flush_layers` (in `studio.rs`) only runs when it is set (conservative — flush when in doubt). It is also
 public as `has_deferred_layer_edits()`: until that flush the edit has not reached the autosave gate, so
 the single-image session counts it as unsaved work. Base layers
 are never part of the LAYER persistence (`persist_current_page` filters to `LayerKind::Raster`);
@@ -160,7 +160,7 @@ doc falls back inside the enqueue.
   doc's inline text flush to `layers.json` (`flush_text_page`). Kept out of `LayerStack` so raster
   tools/invariants are untouched.
 
-Cross-tab sync: both tabs hold the shared in-memory `LayerDoc` (`set_layer_doc`, created in `app.rs`),
+Cross-tab sync: both tabs hold the shared in-memory `LayerDoc` (`set_layer_doc`, created in `studio.rs`),
 the source of truth for per-page layer MODEL state. Raster/text MODEL edits route through it
 (`route_to_doc` / `edit_doc_node`). The band-order / grouping / pin ops enqueue their structural edit
 (`apply_structural_edit`, see «DISK READS AND STRUCTURAL WRITES») and mirror the same change onto the
@@ -217,7 +217,7 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   tracking, budgeted upload, and transform-aware mesh draw. Each grid also owns the
   `TextureOptions` its tiles are uploaded with; `set_options` switches it and marks every tile
   dirty ONLY on a real change, so the existing budgeted uploader re-uploads over a few frames. A
-  second `TextureHandle` per tile (the canvas' `app.rs::TextureTile` pattern) is deliberately NOT
+  second `TextureHandle` per tile (the canvas' `studio.rs::TextureTile` pattern) is deliberately NOT
   used here: `render_cache` is not registered with `memory_manager`, so dual handles would be
   untracked, unevictable GPU memory (~+122 MB for the two base layers of a tall page).
   Also `draw_page_checkerboard`: the page's transparency board is the studio's
@@ -261,7 +261,7 @@ The tab ids are PERSISTENCE identities (they key the panel inside `user_config.j
 (`dev-docs/i18n_exclusions.md`).
 
 **Default arrangement** (`ps_editor_default_dock_layout`, registered in
-`app.rs::panel_dock_default_layout_builders`): two columns. Left — «PS редактор» on the viewport's left
+`studio.rs::panel_dock_default_layout_builders`): two columns. Left — «PS редактор» on the viewport's left
 edge, «Инструменты» below it, «Выбранный инструмент» below that. Right — «Слои» on the viewport's
 right edge, then «Горячие клавиши» under it and «Коррекция» under THAT — a chain, not two panels on
 one target: `solver::place_outside` is a pure function of the target rect and does no occupancy
@@ -700,9 +700,9 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
   movement.
 - `TiledTexture` is sized to each layer's own image; `sync_render_cache` rebuilds a layer's cache
   when its image is resized (e.g. a freshly cropped clip). Base layers stay page-sized.
-- This tab is excluded from the canvas source-page residency window in `app.rs`; it manages its own
+- This tab is excluded from the canvas source-page residency window in `studio.rs`; it manages its own
   page residency via `page_loader`.
-- View sync with `CanvasView` (driven from `app.rs` on tab transitions, "в доступных пределах"):
+- View sync with `CanvasView` (driven from `studio.rs` on tab transitions, "в доступных пределах"):
   `sync_view_from_canvas` mirrors the canvas's current page, zoom, and page-local camera center on
   entry, and `current_page`/`camera` feed them back so the canvas follows on exit. Zoom is clamped
   to each side's own limits, so the freer PS editor honors a canvas zoom as far as it can.
@@ -738,7 +738,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 - To change "select layer fully", edit `select_active_layer_fully` in `mod.rs`.
 - To change which panels exist, where they start, or what the «Панели…» menu offers, edit
   `ps_editor_default_dock_layout` / `PsEditorPanelVisibility` / `ps_editor_panels_menu` in `mod.rs`
-  (and register the builder in `app.rs::panel_dock_default_layout_builders`).
+  (and register the builder in `studio.rs::panel_dock_default_layout_builders`).
 - To change what a panel SHOWS, edit its `*_tab_contents` method in `mod.rs`
   (`main_tab_contents` / `tools_tab_contents` / `active_tool_tab_contents` / `hotkeys_tab_contents`
   / `layers_panel_body`); the «Коррекция» body lives in `correction/ui.rs`.

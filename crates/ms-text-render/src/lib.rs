@@ -70,7 +70,7 @@ pub use font_provider::{
 pub use font_system_pool::prewarm_font_system_pool;
 
 // Конструктор `FontSystem` над бандловой базой (`font_base.rs`). Публичен только
-// ради внешних render-харнессов (`src/bin/text_render_test`), чтобы они шейпили
+// ради внешних render-харнессов (пример `examples/text_render_test.rs`), чтобы они шейпили
 // на той же детерминированной базе, что и продакшен, а не на шрифтах ОС.
 // Продакшен-рендер обязан брать систему из пула (`with_leased_font_system`).
 pub use font_base::new_render_font_system;

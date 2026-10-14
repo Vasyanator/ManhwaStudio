@@ -14,7 +14,7 @@ and presentation.
 ## Architecture
 ```text
 ms-installer (utils.rs / install.rs)      sequencing per install kind, progress, messages
-bin src/lib.rs                           Linux entry check/write on a startup worker;
+bin src/startup/                         Linux entry check/write on a startup worker;
                                           routes the elevated helper (run_elevated_helper)
 ms-settings-ui settings_warnings          probe() -> badges (badge_worthy + allowed_actions)
 ms-launcher pages/system_registration.rs  probe() rows, allowed_actions buttons, apply() /
@@ -164,7 +164,7 @@ the eframe-based installer to name or touch a record. It must never depend on `m
 - To change the Linux entry's keys or MIME list, edit `linux/desktop_entry.rs` and its golden;
   to change the ownership rule or the startup decision, edit `entry_owner` / `decide_startup`
   there; to change where it is written or the XDG resolution, edit `linux/xdg.rs` (the startup
-  call site is `src/lib.rs::install_linux_desktop_integration_async`).
+  call site is `src/startup/os_integration.rs::install_linux_desktop_integration_async`).
 - To change what identifies a program copy or its program root, edit `copy_identity.rs`.
 - To change which actions a record offers, how an action writes, or the helper protocol, edit
   `actions.rs` (+ its tables); the UAC launch and the helper entry point are in

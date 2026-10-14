@@ -255,6 +255,9 @@ mod font_provider;
 use font_provider::TabFontProvider;
 mod presets_io;
 use presets_io::*;
+// The `user_config.json` values the typing panels are built from, read once (off the GUI thread
+// for the studio) and handed to `TypingTabState::from_seed`.
+pub use presets_io::TypingPanelSeed;
 // The SINGLE owner of `fonts/presets.json` (the create-preset document), its atomic write
 // and the one-shot migration out of `user_config.TextTab.create_presets`.
 mod presets_store;
@@ -851,9 +854,10 @@ pub struct TypingTopPanelState {
     export_base_name: String,
     pending_round_text_positions: bool,
     export_default_dir: Option<PathBuf>,
-    /// The open session is a single-image session (`ProjectData::is_single_image`), pushed in every
-    /// frame by the tab (`set_single_image_mode`). Hides the project-export controls.
-    single_image: bool,
+    /// Whether the session offers a project export (`SessionCapabilities::project_export`, false in
+    /// a single-image session), pushed once by the tab (`set_session_capabilities`). `false` hides
+    /// the project-export controls.
+    project_export: bool,
     export_status: TypingExportUiStatus,
     pending_edit_request: Option<TypingOverlayEditRequest>,
     pending_create_image_request: Option<TypingCreateImageRequest>,
@@ -1018,9 +1022,22 @@ pub(super) enum TypingCreateImageRequest {
 }
 
 impl Default for TypingTopPanelState {
+    /// Reads its `user_config.json` seed on the calling thread (`TypingPanelSeed::read_blocking`);
+    /// a GUI-thread owner pre-reads the seed on a worker and uses [`Self::from_seed`].
     fn default() -> Self {
-        let mut create_panel = TypingCreatePanelState::new(true);
-        let mut edit_panel = TypingCreatePanelState::new(false);
+        Self::from_seed(TypingPanelSeed::read_blocking())
+    }
+}
+
+impl TypingTopPanelState {
+    /// Builds both panels from an already read `seed` (no `user_config.json` read here): the
+    /// create panel gets the formula presets and the stored parameter identity mode, the edit
+    /// panel the same formula presets and the default `Font` mode (it never offers the switch).
+    /// Spawns the shared background font load and the panels' workers.
+    #[must_use]
+    pub fn from_seed(seed: TypingPanelSeed) -> Self {
+        let mut create_panel = TypingCreatePanelState::with_config(true, seed.formula_presets.clone(), seed.identity_mode);
+        let mut edit_panel = TypingCreatePanelState::with_config(false, seed.formula_presets, ParamIdentityMode::Font);
         // Both panels start with an EMPTY font list and share ONE background load of it:
         // reading, hashing and parsing every font file must not happen on the GUI thread
         // (CLAUDE.md §5), and it must not happen twice for one startup either.
@@ -1049,7 +1066,7 @@ impl Default for TypingTopPanelState {
             export_base_name: String::new(),
             pending_round_text_positions: false,
             export_default_dir: None,
-            single_image: false,
+            project_export: true,
             export_status: TypingExportUiStatus::Hidden,
             pending_edit_request: None,
             pending_settings_link: None,
@@ -2045,9 +2062,10 @@ struct TypingRightSectionInputs<'a> {
     strict_pixel_movement: bool,
     /// Default directory for the export folder picker and the image-import picker, when known.
     export_default_dir: Option<&'a Path>,
-    /// Single-image session: the export format row, the re-pagination block and the export button
-    /// are not drawn (the picture is written by the app's «Сохранить», not by a project export).
-    single_image: bool,
+    /// `false` without a project export (a single-image session): the export format row, the
+    /// re-pagination block and the export button are not drawn (the picture is written by the
+    /// app's «Сохранить», not by a project export).
+    project_export: bool,
     /// Current export progress/result to render.
     export_status: &'a TypingExportUiStatus,
     /// Currently selected export format.

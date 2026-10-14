@@ -10,7 +10,7 @@ edition = "2024"
 # as `crate::tools`, so every existing `crate::tools::...` call site keeps its path.
 #
 # Layer: ABOVE `ms-canvas` / `ms-widgets` (it borrows `OverlayRectPx` and a slider),
-# BELOW the tabs. It must never name `tabs`, `app` or `launcher`; hosts drive it
+# BELOW the tabs. It must never name `tabs`, `studio` or `launcher`; hosts drive it
 # through the `PatchHost` trait declared here.
 [dependencies]
 # Every primitive here paints into or reads from egui surfaces.

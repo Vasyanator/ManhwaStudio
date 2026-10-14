@@ -5,10 +5,10 @@ Crate root of the «Перевод» (translation) tab. Re-exported by the binar
 `crate::tabs::translation::…` call site keeps its path.
 
 Layer: near the top of the library stack — above the canvas, the models, the widgets and
-`ms-tabs-simple` (it reads character and term note entries), and below `app.rs`, the AI
+`ms-tabs-simple` (it reads character and term note entries), and below `studio.rs`, the AI
 backend panel/supervisor, the launcher's reline flow and the `cleaning` tab, all of which
 reach into `backend_health` / `text_detector` / `machine_translation`. It must never name
-`app` or `launcher`.
+`studio` or `launcher`.
 
 Submodules:
 - `adv_rec`: floating advanced-recognition window for manual OCR region selection.
@@ -63,7 +63,7 @@ mod tab;
 pub mod text_detector;
 
 /// The «Перевод» dock arrangement builder, handed to the app-owned dock state by
-/// `app.rs::restore_panel_dock` before the first frame.
+/// `studio.rs::restore_panel_dock` before the first frame.
 pub use tab::translation_default_dock_layout;
 pub use tab::{
     HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL, HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION,

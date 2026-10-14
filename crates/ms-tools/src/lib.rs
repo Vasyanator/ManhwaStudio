@@ -4,7 +4,7 @@ FILE HEADER (crates/ms-tools/src/lib.rs)
   not bound to a particular tab. Named directly by the binary as
   `ms_tools::`.
 - Layer: ABOVE `ms-canvas` / `ms-widgets`, BELOW the tabs. This crate must never name
-  `tabs`, `app` or `launcher`; hosts drive the patch core through `PatchHost`.
+  `tabs`, `studio` or `launcher`; hosts drive the patch core through `PatchHost`.
 - Экспорт:
   - `MaskBrush`: переиспользуемая кисть для рисования бинарной маски в `egui::ColorImage`
     (радиус, hotkeys размера, Shift+wheel, отрисовка курсора, штрихи по сегменту).

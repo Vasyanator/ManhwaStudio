@@ -80,7 +80,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   the registered `Waker`, nothing else. The GUI polls `has_pending()` (no JNI) and runs
   `take_pending_blocking()` on a worker, which clears the flag BEFORE asking Kotlin, so a batch
   published meanwhile is never missed. `takePending` renames `ready` to `claimed`.
-- Cold start: `init()` once per native session on the `run_main` thread before the first
+- Cold start: `init()` once per native session on the startup thread
+  (`shell::incoming::cold_start_target`, called by `startup::run_native`) before the first
   frame (documented exception to "no JNI on the GUI thread"): load class, bind native,
   `markNativeReady`, `sweepClaimed` (deletes batches an earlier session claimed and unfinished
   leftovers), `takePending`.

@@ -53,7 +53,7 @@ const STACKS_KEY: &str = "ms_embedded_window_stacks";
 const SEPARATE_VIEWPORT_SALT: &str = "ms_embedded_window";
 
 /// Close button glyph of the title strip. A shape, not a word: the localized tooltip carries the
-/// meaning (same convention as `CLOSE_GLYPH` in `src/single_image/controller.rs`).
+/// meaning (same convention as `CLOSE_GLYPH` in `src/studio/session/image_set/controller.rs`).
 const CLOSE_GLYPH: &str = "✕";
 
 /// Collapse button glyph of the title strip (a "minimize" bar; meaning in the tooltip).

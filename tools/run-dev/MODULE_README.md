@@ -211,7 +211,8 @@ committed and never shows up as a local change during Stage 1:
   profile directory, a `--target` triple and `CARGO_TARGET_DIR` all move the output, so a hand-built
   `target/release/…` path would be wrong on somebody's machine — and `--message-format=json` alone
   would swallow the compiler errors, hence the `-render-diagnostics` variant. Filtering on the
-  target name is required: the package has several bin targets, `src/bin/` autodiscovery included.
+  target name is required: the stream also carries the library target and every dependency, and
+  the package may gain bin targets.
   Normally the call is cache-warm and free, because phase 1 already built; under
   `--offline`/`-Offline`, where phase 1 is skipped, it is the call that really builds.
 - **Publishing the root binary is a convenience and never fatal.** Every failure of it — cargo not

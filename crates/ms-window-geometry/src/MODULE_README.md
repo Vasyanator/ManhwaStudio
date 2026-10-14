@@ -60,8 +60,7 @@ in, or the two `Window` types stop unifying.
 ## Contracts and invariants
 - **Window identity has one owner.** Every window grouped with the main window (the main
   window itself, launcher child windows) takes its app id and icon from `identity`; no other
-  crate spells the main app id or decodes the icon. The prompt windows of `src/lib.rs` and the
-  installer keep their own app ids and take only the icon (the installer still has its own
+  crate spells the main app id or decodes the icon. The prompt windows (`src/startup/prompts.rs`, `ms_installer::window`) keep their own app ids and take only the icon (the installer still has its own
   decoder: known duplicate, to be switched to `identity::app_icon`).
 - **Units.** Everything persisted is in *logical pixels* (physical / DPI scale), independent
   of the egui zoom factor. `MonitorKey` is the one exception: it stores what winit reports,

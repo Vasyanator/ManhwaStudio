@@ -8,7 +8,7 @@ Crate root of the "PS-подобный редактор" tab. Re-exported by the
 
 Layer: near the top of the library stack — above the canvas, the models, the tooling
 primitives, the widgets and `ms-tab-typing` (the layers panel renders typing's text
-preview label), and below `app.rs` and the `page_manager` tab. It must never name `app`
+preview label), and below `studio.rs` and the `page_manager` tab. It must never name `studio`
 or `launcher`.
 
 Orchestrates the "PS-подобный редактор" tab: a standalone, single-page, layered editor that is
@@ -16,7 +16,7 @@ deliberately NOT a `CanvasView`. It owns its own pan/zoom viewport, layer stack,
 set, and tiled GPU cache.
 
 Key structures:
-- `PsEditorTabState`: the tab state held by `MangaApp`.
+- `PsEditorTabState`: the tab state held by `StudioApp`.
 - `PsEditorDockCx`: the per-frame context the panel dock lends to one tab body at a time.
 - `PsEditorPanelVisibility`: the five "is this panel shown" flags, stored in the MAIN tab's
   `TabExtras` bag and toggled from its «Панели…» menu.
@@ -73,7 +73,7 @@ Architecture:
 - «Коррекция»: a VIEW-ONLY colour correction of the composited canvas (`correction/`). It is the
   project's first GPU shader pass — an `egui_glow` paint callback inserted between `draw_composite`
   and the pixel-grid pass — and it never touches layer pixels, the doc or the saved project. Its GL
-  objects are built lazily inside the callback and freed from `MangaApp::on_exit`.
+  objects are built lazily inside the callback and freed from `StudioApp::on_exit`.
 
 - layer persistence: a page is read from disk ONCE (the page loader's decode, inserted into the
   shared `LayerDoc`); afterwards the doc is the only source, text pin meta included
@@ -279,7 +279,7 @@ const PS_EDITOR_TOOL_PANEL_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(300.0, 200.0);
 /// and skipped, never panicked on: the dock then creates a panel for the orphaned tab on its own,
 /// which is a degraded arrangement rather than a lost tab.
 #[must_use]
-// `pub`, not crate-private: `app.rs::restore_panel_dock` hands it to the app-owned dock
+// `pub`, not crate-private: `studio.rs::restore_panel_dock` hands it to the app-owned dock
 // state as a `fn` pointer, and it lives in another crate.
 pub fn ps_editor_default_dock_layout() -> DockLayout {
     let mut layout = DockLayout::new();
@@ -677,7 +677,7 @@ pub struct PsEditorTabState {
     /// composite is rebuilt every frame, so unconditional logging would flood the trace at 60/s).
     trace_last_composite_steps: usize,
     /// Shared unified layer document (app-owned): the source of truth for per-page layer MODEL state,
-    /// shared with the typing tab. `None` until `set_layer_doc` is called by app.rs.
+    /// shared with the typing tab. `None` until `set_layer_doc` is called by studio.rs.
     layer_doc:
         Option<std::sync::Arc<std::sync::Mutex<ms_models::layer_model::layer_doc::LayerDoc>>>,
     /// Set by the "100%" button; consumed in `draw_canvas` where the real canvas rect is known.

@@ -31,6 +31,8 @@ crate's `[dev-dependencies]`, so no production build carries them.
 
 ## Files and submodules
 - `lib.rs`: public export surface for reusable widgets.
+- `../examples/`: focused widget demos as Cargo examples of this package; see
+  `../examples/MODULE_README.md`.
 - `input_util.rs`: shared egui input helpers — raw (unsmoothed) wheel delta and the
   "is the pointer over a floating egui layer" test. Both restore semantics egui removed after 0.31 (still absent in 0.36).
 - `touch_nav/`: the one owner of finger input on canvases (own `MODULE_README.md`). The shell's
@@ -44,12 +46,21 @@ crate's `[dev-dependencies]`, so no production build carries them.
   specs, the persisted `Hotkeys` overrides in `user_config.json`, and the per-frame dispatch of
   triggered commands out of `egui::InputState` by id and `HotkeyScopeV2`. It lives at this layer
   (not in the binary) because it is a pure egui-input primitive over `ms_config::app_tab::AppTab`:
-  the binary's `app.rs` and settings hotkeys pane AND the `ms-tab-translation` crate both register
+  the binary's `studio.rs` and settings hotkeys pane AND the `ms-tab-translation` crate both register
   specs with it. Defaults stay in Rust code; only user overrides are stored on disk (read via
-  `ms_docstore::read_value`, written via `ms_config::update_user_config_file`).
+  `ms_docstore::read_value`, written via `ms_config::update_user_config_file`). The read can be
+  split from the apply: `HotkeyOverrides::read_blocking` on a worker, then
+  `InputManagerV2::apply_overrides` on the GUI thread (the studio does this).
   `collect_triggered` consumes a `KeyboardShortcut` press (auto-repeats included) but fires the
   command only on the RISING edge (per-command `last_shortcut_held`): holding a key triggers it
   once. Modifier-only bindings are not dispatched there.
+- `ui_scale.rs`: the single owner of the process-global interface scale
+  (`General.ui_scale_percent`, in percent): the startup seed, the live read, the live change
+  (`apply_ui_scale`, used by the settings slider) and `apply_ui_scale_to_context`, which every
+  product `eframe::run_native` creator calls once next to `ui_fonts::install*`. The GUI-free
+  read / clamp / zoom-factor rules stay in `ms-config`; persisting a changed value is the
+  settings pane's job (`ms-settings-ui`, which re-exports these names from
+  `general_settings_panel`). Unseeded, the value is the default (native size).
 - `ui_fonts.rs`: the single owner of the bundled `fonts/ui` stack. Every egui context the
   application creates installs the same chain through it, off the GUI thread. The source is
   always the global `ms-fonts` manifest (no title-local override; a title's `fonts/` is for
@@ -61,7 +72,7 @@ crate's `[dev-dependencies]`, so no production build carries them.
   `Context::set_fonts` (it replaces the whole definition set and drops runtime-registered
   families, which then panic in epaint), and never call `Context::fonts`/`fonts_mut` from the
   loader: they panic before the first frame. Every product `run_native` creator closure calls
-  `install` exactly once (the dev binaries in `src/bin/` do not).
+  `install` exactly once (the demos in `../examples/` do not).
 - `bubble_status.rs`: the egui half of the bubble-status feature — it paints a rule's border
   with a bare `Painter` and re-exports the GUI-free rule model from `ms_config::bubble_status`.
 - `ai_button.rs`: AI-tool button gating itself on the process-global AI capabilities

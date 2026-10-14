@@ -4,8 +4,8 @@ FILE HEADER (crates/ms-tab-typing/src/lib.rs)
   `src/tabs/mod.rs` как `crate::tabs::typing`, поэтому все существующие пути
   `crate::tabs::typing::…` продолжают работать.
 - Слой: вершина библиотечного стека — выше canvas/models/widgets и ниже только
-  `app.rs`, который зовёт `TypingTabState::draw`. Крейт не имеет права называть
-  `app`, `launcher` или другую вкладку.
+  `studio.rs`, который зовёт `TypingTabState::draw`. Крейт не имеет права называть
+  `studio`, `launcher` или другую вкладку.
 - Содержимое:
   - `auto_typing`: алгоритм авто-тайпа (оптический центр оверлея + поиск пузыря по
     composited-странице `src + clean overlay` из shared cache).
@@ -61,6 +61,8 @@ pub use ms_text_util::segmentation;
 mod tab;
 
 pub use panel::{TypingPanelLayout, TypingTopPanelState};
+// The panels' `user_config.json` seed, read off the GUI thread for `TypingTabState::from_seed`.
+pub use panel::TypingPanelSeed;
 // Editor widget for per-effect-kind default parameters, rendered by the settings pane.
 pub use panel::EffectDefaultsEditorState;
 // Startup seeding of the runtime-global effect-defaults store from user config.
@@ -79,17 +81,17 @@ pub use tab::TypingTabState;
 // controller. Native only.
 #[cfg(not(target_arch = "wasm32"))]
 pub use tab::{FlattenDestination, FlattenOutcome, FlattenReadiness, FlattenToFileError, FlattenToFileReport, FlattenToFileRequest};
-// Per-frame inputs of `TypingTabState::draw`, built by `app.rs` — it carries the
+// Per-frame inputs of `TypingTabState::draw`, built by `studio.rs` — it carries the
 // app-owned `PanelDockState` borrow the tab draws its panels from.
 pub use tab::TypingDrawParams;
 // This tab's default panel arrangement, handed to the app-owned dock state as a
 // `fn` pointer (restore before the first frame + `ensure_default_layout` per frame).
 pub use tab::typing_default_dock_layout;
-// Reason tag for `TypingTabState::flush_text_layers_if_dirty`; `app.rs` names it at the tab-leave and
+// Reason tag for `TypingTabState::flush_text_layers_if_dirty`; `studio.rs` names it at the tab-leave and
 // exit flush points.
 pub use tab::TypingSaveFlushReason;
 // Failure of `TypingTabState::flush_text_layers` — a flush that could not run at all, as opposed to
-// one that ran and owned no pages. `app.rs` names it: its page-op quiesce gate treats an unwired text
+// one that ran and owned no pages. `studio.rs` names it: its page-op quiesce gate treats an unwired text
 // store (the Text tab was never opened) differently from a poisoned document lock.
 // `tab::TypingTextFlushOutcome` stays unexported: callers match the `Ok` value without naming it, and
 // an unused re-export is a warning.

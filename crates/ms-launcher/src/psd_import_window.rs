@@ -1393,7 +1393,6 @@ impl PsdImportWindowState {
                                 project_dir: response.project_dir.clone(),
                                 title: response.title.clone(),
                                 chapter: response.chapter.clone(),
-                                resume_unsaved: false,
                             });
                         }
                         self.catalog.refresh();

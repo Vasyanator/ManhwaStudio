@@ -8,7 +8,7 @@ clean-overlay painting. Re-exported by the binary as `crate::canvas`, so every e
 
 Layer: ABOVE `ms-models` / `ms-project` / `ms-widgets` and BELOW the tabs. The `CanvasHooks`
 trait declared here is implemented BY the tabs — the dependency points down only, and this
-crate must never name `crate::tabs`, `crate::app` or `crate::launcher`.
+crate must never name `crate::tabs`, `crate::studio` or `crate::launcher`.
 
 Main types:
 - `CanvasUiStatus`: per-frame loading status for canvas overlays/hooks.
@@ -121,7 +121,7 @@ CanvasView method map:
   `request_delete_bubble`, `request_translate_bubble`,
   `set_bubble_texts_from_panel`, `copy_bubble_text_to_clipboard`,
   `paste_bubble_text_from_clipboard`,
-  `flush_pending_bubble_upserts_now`, `apply_machine_translation_result`,
+  `flush_pending_bubble_upserts_now`, `flush_all_bubble_edits_now`, `apply_machine_translation_result`,
   `patch_bubble_extra_fields`, `capture_bubble_history_before_mutation`,
   `try_undo_bubbles_history`, `try_redo_bubbles_history`, `handle_shortcuts`.
 - Scene and overlay geometry API:
@@ -605,7 +605,7 @@ pub trait CanvasHooks {
     /// its PANEL DOCK.
     ///
     /// `panel_dock` is the studio window's single dock state
-    /// (`MangaApp::panel_dock`), lent through [`CanvasDrawParams::panel_dock`]
+    /// (`StudioApp::panel_dock`), lent through [`CanvasDrawParams::panel_dock`]
     /// for this frame only — the canvas itself never reads or writes it. This is
     /// where all three canvas tabs run `PanelDock::begin` … `end`, and the reason
     /// it is HERE rather than after `CanvasView::draw` returns is one: the
@@ -712,12 +712,12 @@ pub struct CanvasDrawParams<'a> {
     pub status: CanvasUiStatus,
     pub source_upload_budget: &'a mut SourceTextureUploadBudget,
     pub hooks: &'a mut dyn CanvasHooks,
-    /// The studio window's panel-dock state, owned by `MangaApp` and lent for
+    /// The studio window's panel-dock state, owned by `StudioApp` and lent for
     /// this frame. The canvas only CARRIES it: it hands it to
     /// [`CanvasHooks::draw_canvas_overlay_top_left`], the one place all three
     /// canvas tabs run their dock, and touches nothing in it itself. The borrow
     /// must be disjoint from `hooks` and from the `CanvasView` being drawn,
-    /// which it is by construction — all three are separate fields of `MangaApp`
+    /// which it is by construction — all three are separate fields of `StudioApp`
     /// or of the drawing tab.
     pub panel_dock: &'a mut PanelDockState,
 }
@@ -2830,7 +2830,7 @@ impl CanvasView {
 
     // The three bottom-hint API methods below are the public surface used by the per-tab wiring:
     // the tab feeds content each frame, seeds the collapsed state from `user_config` at
-    // construction, and reads it back on exit for persistence (see `app.rs` on_exit).
+    // construction, and reads it back on exit for persistence (see `studio.rs` on_exit).
 
     /// Sets the bottom-hint content for the current frame. `None` hides the hint. Content only --
     /// does not change collapsed state.

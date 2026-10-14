@@ -15,6 +15,7 @@ Key structures:
 
 Key functions:
 - CanvasView::apply_canvas_snapshot()
+- CanvasView::canvas_snapshot() (pub: also used by the studio root for its preset snapshots)
 - CanvasView::publish_canvas_settings()
 - save_canvas_settings_to_project_file()
 - save_canvas_settings_to_user_file()
@@ -131,7 +132,13 @@ impl CanvasView {
         self.queue_canvas_settings_save(&project.paths.settings_file, snapshot);
     }
 
-    fn canvas_snapshot(&self) -> SharedCanvasSettings {
+    /// The canvas' current shared settings as a `SharedCanvasSettings` value.
+    ///
+    /// The one owner of the `CanvasState` -> `SharedCanvasSettings` mapping: `bubble_type` is
+    /// always `Hybrid`, enums are stored by `as_str`, every other field is copied as is (no
+    /// clamping; `apply_canvas_snapshot` clamps on the way back in). Pure: it publishes nothing.
+    #[must_use]
+    pub fn canvas_snapshot(&self) -> SharedCanvasSettings {
         SharedCanvasSettings {
             bubble_type: BubbleMode::Hybrid.as_str().to_string(),
             editable_bubble_type: self.state.hybrid_editable_bubble_type.as_str().to_string(),

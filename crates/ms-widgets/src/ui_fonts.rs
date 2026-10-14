@@ -164,7 +164,7 @@ mod desktop {
     /// Last-resort system font candidates, probed in order as `(regular, bold)` pairs.
     ///
     /// Used only when no bundled `fonts/ui` chain could be loaded. The list is the
-    /// historical one from `MangaApp::ensure_fonts`: CJK-capable faces on the common
+    /// historical one from `StudioApp::ensure_fonts`: CJK-capable faces on the common
     /// Linux distributions, macOS and Windows.
     const SYSTEM_FONT_CANDIDATES: [(&str, Option<&str>); 6] = [
         (

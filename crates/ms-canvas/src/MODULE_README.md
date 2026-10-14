@@ -76,7 +76,7 @@ The canvas owns a collapsible bottom-center keyboard-shortcut hint overlay, draw
 `scene.rs::draw_canvas_bottom_hint` right after the floating controls. Content is opt-in per tab:
 the owning tab pushes `Option<CanvasBottomHint>` (label + key rows) every frame via
 `set_bottom_hint`, and `None` hides it. Rows are FIXED, hand-authored, localized pairs (built in
-`app.rs::build_translation_hint_rows` / `build_typing_hint_rows` from `canvas.bottom_hint.*` `t!`
+`studio/tabs.rs::build_translation_hint_rows` / `build_typing_hint_rows` from `canvas.bottom_hint.*` `t!`
 keys), NOT derived from the hotkey registry; rebuilding them per frame re-localizes on a runtime
 language switch. A row may also carry an optional `CanvasHintHelp` (`CanvasHintRow::with_help`):
 a circled "?" (`widgets::HelpHint`) whose hover tooltip shows text, an animation, or both, drawn
@@ -230,7 +230,7 @@ local-only stamp-preview pixels), or copy nothing for an uncached page (it loads
 `synced_overlays_revision` past the write only when the canvas was fully synced before it; the
 lazy load never advances it.
 
-Viewport sync across translation, cleaning, and typing is explicit. `MangaApp` owns the
+Viewport sync across translation, cleaning, and typing is explicit. `StudioApp` owns the
 shared `CanvasViewportSnapshot`, publishes it only from the active canvas after that
 canvas is drawn, and applies it only to the canvas being entered. Inactive canvases must
 not be scrolled or re-anchored every frame.
@@ -263,7 +263,7 @@ manager) scrolls on its first frames instead of being silently dropped. Exactly 
 pending at a time; a newer `focus_page` or `apply_viewport_snapshot` call replaces or drops it.
 
 Source page geometry is separate from source page GPU residency. Scene layout and hit testing use
-`PageImageInfo` dimensions supplied by `MangaApp`; `PageTexture` only represents optional tiled GPU
+`PageImageInfo` dimensions supplied by `StudioApp`; `PageTexture` only represents optional tiled GPU
 handles for source imagery. NEAREST source textures are materialized lazily while pixel inspection
 is active and are dropped outside the active page window.
 
@@ -336,7 +336,7 @@ changes and viewport resizes are deliberately not compensated here.
 ## Crate boundary
 `ms-canvas` sits ABOVE `ms-models` / `ms-project` / `ms-widgets` and BELOW the tabs. The
 `CanvasHooks` trait is DECLARED here and IMPLEMENTED by the tabs, so the dependency points down
-only: this crate must never name `tabs`, `app` or `launcher` (that would be a dependency cycle).
+only: this crate must never name `tabs`, `studio` or `launcher` (that would be a dependency cycle).
 The binary re-exports the crate as `crate::canvas`.
 
 What the tabs consume is therefore the crate's PUBLIC surface, not a `pub(crate)` one:
@@ -390,6 +390,9 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   the ORT SIGILL guard marker written concurrently under the same lock. Its title `settings.json`
   half goes through `ms_docstore::update` for the same reason: the mutator edits only the canvas
   keys, so it cannot revert keys other writers (translation tab, spellcheck words) own.
+  `CanvasView::canvas_snapshot` (pub) is the one owner of the canvas state -> `SharedCanvasSettings`
+  mapping; callers outside the crate (the studio root's comic-type preset and initial model seed)
+  use it instead of spelling the struct literal.
 - `helpers.rs`: stateless geometry, image, and text helper functions.
 - `pixel_grid.rs`: the ONE per-source-pixel inspection grid, shared with `tabs::ps_editor`
   (`pub(crate)` for that reason). `pixel_grid_spans` is pure geometry (clip-bounded, unit-tested);
@@ -569,6 +572,17 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   handle `drag_stopped` paths (`pending_upsert.insert` + clear `active_*_handle`). It is the single
   source of truth for that commit and is skipped for a normally-finishing gesture, which already
   cleared its state before the fallback runs, so each gesture commits exactly once.
+- Bubble text writes wait `TEXT_UPSERT_DEBOUNCE_SECS` in `pending_text_upsert` (promoted by the
+  canvas draw), and the per-frame flush skips locally locked (focused / debounced / pasting)
+  bubbles. A persistence point therefore calls `flush_all_bubble_edits_now` instead: it promotes
+  every debounced text upsert and writes focused bubbles too (only a pending paste and an active
+  drag still wait), with the same one-snapshot undo behaviour and no file I/O. It adopts the
+  post-write model revision only when the canvas had pulled every earlier change, so a canvas
+  flushed while hidden still pulls the other canvases' edits on its next draw. Canvases write whole
+  bubble records without a conflict check (last writer wins), so the studio calls it on every
+  canvas whose tab is not active, each frame (a no-op once clean), and on all three — the active
+  one LAST — before save-to-project, a page op and the non-discard teardown; DISCARD never flushes.
+  `flush_pending_bubble_upserts_now` stays the regular flush for tab-internal calls.
 - `hook_bubbles_revision()` is a cheap `u64` fingerprint of the bubble set `hook_bubbles_snapshot`
   would build: it folds `BubblesModel::revision()` with the runtime-only set
   (`runtime_bubbles` count + `next_bubble_id`), so a runtime-only, not-yet-flushed bubble bumps it.
@@ -621,7 +635,7 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   declares. To change how the tab is DECLARED (title, size bounds, body), edit
   `lib.rs::declare_ribbon_tab`, which all three tabs call.
 - To change source page GPU residency or NEAREST inspection behavior, edit `scene.rs`,
-  `lib.rs`, and the source-page texture owner in `app.rs`.
+  `lib.rs`, and the source-page texture owner in `studio.rs`.
 - To change how the pixel grid LOOKS or which lines it emits, edit `pixel_grid.rs` — it is shared
   with the PS editor, so a change there is visible in both. To change WHEN the canvas shows it,
   edit `scene.rs::draw_pixel_grid_on_page`; to change the threshold itself, edit

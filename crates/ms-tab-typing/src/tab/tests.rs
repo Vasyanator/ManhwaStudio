@@ -3938,8 +3938,8 @@ fn deferred_raster_geometry_enqueues_and_barrier_persists_transform_and_deform()
 // the dispatch/dirty contract they share is covered by the tests above; `flush_text_layers`'s own
 // per-page persistence contract is covered by the `layer_model::persist` tests.
 //
-// Also NOT unit-tested (needs a running GUI): that `MangaApp::start_exit_cleanup` → `on_exit` performs
-// no write, and that the exit dialog does not reopen after "Не сохранять". Both live in `MangaApp`,
+// Also NOT unit-tested (needs a running GUI): that `StudioApp::start_exit_cleanup` → `on_exit` performs
+// no write, and that the exit dialog does not reopen after "Не сохранять". Both live in `StudioApp`,
 // which cannot be constructed without a project, an eframe context, and the loader threads.
 
 // ===================== Centering assist geometry =====================
@@ -5743,7 +5743,7 @@ fn strict_pixel_move_snaps_after_the_page_clamp() {
 
 #[test]
 fn whole_document_flush_settles_an_open_move() {
-    // `MangaApp`'s page operations and save-to-project call `flush_text_layers` DIRECTLY, not
+    // `StudioApp`'s page operations and save-to-project call `flush_text_layers` DIRECTLY, not
     // `flush_text_layers_if_dirty`. Both are points of no return (a page op reloads the project; a
     // save merges staging and deletes it), so the settle has to live in `flush_text_layers` itself —
     // settling only in the `_if_dirty` wrapper left both able to reload or merge over an unsettled
@@ -5779,7 +5779,7 @@ fn whole_document_flush_settles_an_open_move() {
     });
 
     // The flush itself cannot run on this bare layer (no layers dir), which is precisely the case
-    // `app.rs` treats as ABORT — but the settle must have happened before that decision.
+    // `studio.rs` treats as ABORT — but the settle must have happened before that decision.
     let outcome = layer.flush_text_layers();
     assert!(
         matches!(outcome, Err(TypingTextFlushError::NoLayersDir)),

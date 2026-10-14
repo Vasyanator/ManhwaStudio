@@ -8,9 +8,9 @@ This directory is the crate root of `ms-tab-translation`, re-exported by the bin
 `src/tabs/mod.rs` as `crate::tabs::translation`, so every existing
 `crate::tabs::translation::…` path stays valid. Layer: near the top of the library stack —
 above `ms-canvas` / `ms-models` / `ms-widgets` / `ms-tools` and `ms-tabs-simple` (character
-and term note entries feed the MT glossary), below `app.rs`, `ai_backend_panel.rs`,
+and term note entries feed the MT glossary), below `studio.rs`, `ai_backend_panel.rs`,
 `ai_backend_supervisor.rs`, the launcher reline flow and the `cleaning` tab. It must never
-name `app`, `launcher` or a tab above it. Items reachable from outside the crate
+name `studio`, `launcher` or a tab above it. Items reachable from outside the crate
 (`backend_health`, `machine_translation::translate_texts_via_translator`, `text_detector`'s
 mask helpers, `panels::machine_translation::{MtLanguage, MT_SOURCE_LANGUAGES}`) are `pub`
 for that reason and carry a note saying so.
@@ -41,7 +41,7 @@ Long work is delegated to focused controllers:
   runners here only run the forward pass (in-process or over IPC). The inline
   `detect_*_mask_for_image` helpers are the same pipeline reused by Cleaning's mask generation.
   The detector panel announces the current page's plan (resize, tile count) by planning with the
-  same `TextDetectorRunMode::plan_inputs` the worker uses; `app.rs` lends the page sizes
+  same `TextDetectorRunMode::plan_inputs` the worker uses; `studio.rs` lends the page sizes
   (`page_infos`) through `draw_side_panel`.
   Dilation and Otsu come from `ms-raster` (see `text_detector/MODULE_README.md`).
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
@@ -80,7 +80,7 @@ through `canvas::declare_ribbon_tab`, the canvas' one declaration of it) and its
 the per-frame context `TranslationDockCx`. Its default arrangement is its OWN
 `translation_default_dock_layout`: the ribbon panel at the dock area's left edge and the cards
 docked to its right, top-aligned, which is where the row of cards floated before the migration. The
-same `fn` item is handed to the dock both by `app.rs::restore_panel_dock` and by
+same `fn` item is handed to the dock both by `studio.rs::restore_panel_dock` and by
 `ensure_default_layout`, since the dock state keeps it to rebuild the arrangement for the header's
 reset item.
 
@@ -104,7 +104,7 @@ paints the background, the border and the text into the rect the layout returns
 (`recent_character_card_caption_pos`). The two size helpers are each other's inverse and are tested
 as such: they are what keeps the hand-painted card pixel-identical to the framed one it replaced.
 
-The dock state is app-owned (`MangaApp::panel_dock`, one per studio
+The dock state is app-owned (`StudioApp::panel_dock`, one per studio
 window) and reaches this tab through `CanvasDrawParams::panel_dock`, which the canvas passes into
 `draw_canvas_overlay_top_left`; the tab owns none of it. `draw_panel_dock` runs at the very END of
 that hook, and what that placement buys is ONE thing: running inside `CanvasView::draw` keeps a
@@ -334,7 +334,7 @@ is an author note addressed to the translator, not a replica.
 - The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
   `translation_default_dock_layout` is dropped from the user's stored arrangement on every load, so
   adding a dock tab here means adding it to that builder too. It is registered under
-  `AppTab::Translation.key()` in `app.rs::restore_panel_dock` as well; a builder wired in only one
+  `AppTab::Translation.key()` in `studio.rs::restore_panel_dock` as well; a builder wired in only one
   of the two places silently resets the stored arrangement.
 - Text detector page results carry source size, block rectangles in source pixels, mask size, and
   mask alpha bytes. Mask buffers must match `width * height` and invalid geometry must be rejected.
@@ -364,7 +364,7 @@ is an author note addressed to the translator, not a replica.
   released, so a lingering `Q` (e.g. `Shift` released a frame earlier) cannot spawn an extra bubble.
 - Translation also owns the hint-bubble shortcut: `H` creates a `BubbleClass::Hint` under the
   pointer. Unlike `Q`/`Shift+Q` it is a REGISTERED hotkey
-  (`HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE`, `app.rs`, default `Key::H` with no modifiers, scope
+  (`HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE`, `studio.rs`, default `Key::H` with no modifiers, scope
   `Tab(Translation)`), so it appears in Settings → Hotkeys, is rebindable, and inherits the
   rising-edge semantics of the hotkey manager instead of a hand-rolled armed gate.
 - HINT ATTACHMENT is the reason a hint exists, and it is a contract of this tab, not a formatting
@@ -472,13 +472,15 @@ is an author note addressed to the translator, not a replica.
   into `RunFailed`. Logging must never include API keys or image binary contents.
 - Shared model locks must be short-lived and released before image decoding, HTTP calls,
   composition/export, storage I/O, or callbacks.
-- Single-image session (`ProjectData::is_single_image`: one picture edited through a scratch
-  chapter that is deleted on exit, no title): the tab reads no title document and offers nothing
-  that only lives in the scratch. Text-detection storage is off (`text_detection_storage_available`:
-  no lazy load, no «Сохранить» button via `TextDetectorPanelView::storage_available`); the
-  character roster is not read (`character_roster_available`: empty roster, no mtime probe); the
-  MT notes / characters / terms toggles are hidden (`draw_machine_translation_panel`'s
-  `project_context_available`) AND ignored by the prompt (`project_context_sources`), so their
+- Single-image session (one picture edited through a scratch chapter that is deleted on exit, no
+  title): the tab never asks the project for its session kind; it reads the
+  `ms_models::SessionCapabilities` the root pushes once (`set_session_capabilities`, also copied
+  into `AiMtOptions::session_caps` for the worker). It reads no title document and offers nothing
+  that only lives in the scratch. Text-detection storage is off (`chapter_storage`: no lazy load,
+  no «Сохранить» button via `TextDetectorPanelView::storage_available`); the character roster is
+  not read (`title_documents`: empty roster, no mtime probe); the MT notes / characters / terms
+  toggles are hidden (`draw_machine_translation_panel`'s `project_context_available`, fed from
+  `title_documents`) AND ignored by the prompt (`project_context_sources`), so their
   persisted values stay untouched; the composed-text export dialog starts in
   `ProjectData::user_facing_dir`, never in the scratch. Every file dialog of this crate that sets a
   starting directory must use `user_facing_dir`.

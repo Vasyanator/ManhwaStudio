@@ -407,7 +407,7 @@ static FALLBACK_TABLES: OnceLock<FallbackTables> = OnceLock::new();
 /// `prewarm_font_system_pool` exists for exactly that.
 ///
 /// Public (re-exported from the crate root) so out-of-crate render harnesses —
-/// today `src/bin/text_render_test` — build their `FontSystem` the way production
+/// today the `examples/text_render_test.rs` example — build their `FontSystem` the way production
 /// does instead of calling `FontSystem::new()` and silently testing against the
 /// operator's installed fonts. Production render code must go through the pool
 /// (`with_leased_font_system`), never through this constructor directly.

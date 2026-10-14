@@ -17,7 +17,8 @@ Key structures:
 
 Key functions:
 - apply_machine_translation_result()
-- flush_bubble_upserts_to_model()
+- flush_bubble_upserts_to_model(): the per-frame flush of pending upserts into `BubblesModel`
+- flush_all_bubble_edits_now(): the persistence-point flush (debounced text and focused bubbles too)
 - sync_runtime_from_model_or_project()
 - apply_pending_actions()
 - is_runtime_bubble_hidden(): the SINGLE hidden-hint visibility gate; every runtime-bubble scan
@@ -533,6 +534,29 @@ impl CanvasView {
 
     pub fn flush_pending_bubble_upserts_now(&mut self, project: &ProjectData) {
         self.flush_bubble_upserts_to_model(project);
+    }
+
+    /// Pushes EVERY pending bubble edit of this canvas into the shared `BubblesModel` now, for a
+    /// persistence point (save-to-project, a structural page op, the non-discard teardown). Unlike
+    /// [`Self::flush_pending_bubble_upserts_now`] it first promotes each debounced text upsert
+    /// regardless of its `TEXT_UPSERT_DEBOUNCE_SECS` timer, and it also writes a bubble whose text
+    /// field is focused (its runtime text is the newest the user typed; the focus lock exists only
+    /// to avoid per-keystroke writes). Still skipped: a bubble with a pending paste, and every
+    /// positional write while a drag gesture runs (the gesture end re-queues it).
+    ///
+    /// Undo: the same as the regular flush — one history snapshot for the whole batch, none when
+    /// nothing is written. Model sync: the canvas adopts the post-write model revision only when it
+    /// had pulled every earlier change, so a canvas flushed while hidden still pulls the other
+    /// canvases' edits on its next draw. No file I/O: the model hands its snapshot to the
+    /// background bubbles saver (durability still comes only from that saver's barrier). Cheap and
+    /// a no-op when nothing is pending, so it may run every frame (the studio flushes every
+    /// non-active canvas each frame and all of them at a persistence point).
+    pub fn flush_all_bubble_edits_now(&mut self, project: &ProjectData) {
+        let debounced: Vec<i64> = self.bubble_runtime.pending_text_upsert.keys().copied().collect();
+        for bid in debounced {
+            self.commit_text_upsert_now(bid);
+        }
+        self.flush_bubble_upserts(project, UpsertFlushScope::Everything);
     }
 
     pub fn apply_machine_translation_result(
@@ -1946,6 +1970,22 @@ impl CanvasView {
     }
 
     pub(super) fn flush_bubble_upserts_to_model(&mut self, project: &ProjectData) {
+        self.flush_bubble_upserts(project, UpsertFlushScope::Regular);
+    }
+
+    /// Whether `scope` holds `bid` back from this flush: the regular per-frame flush skips every
+    /// locally locked bubble (focused, debounced text, pending paste); a full flush only a bubble
+    /// with a pending paste.
+    fn upsert_held_back(&self, bid: i64, scope: UpsertFlushScope) -> bool {
+        match scope {
+            UpsertFlushScope::Regular => self.is_bubble_locally_locked(bid),
+            UpsertFlushScope::Everything => self.bubble_runtime.pending_bubble_paste.is_some_and(|pending| pending.bid == bid),
+        }
+    }
+
+    /// The pending-upsert flush shared by [`Self::flush_bubble_upserts_to_model`] and
+    /// [`Self::flush_all_bubble_edits_now`]; `scope` only decides which locked bubbles wait.
+    fn flush_bubble_upserts(&mut self, project: &ProjectData, scope: UpsertFlushScope) {
         let Some(model) = self.bubble_runtime.bubbles_model.as_ref().map(Arc::clone) else {
             return;
         };
@@ -1964,7 +2004,7 @@ impl CanvasView {
         let mut pending: Vec<i64> = self.bubble_runtime.pending_upsert.iter().copied().collect();
         pending.sort_unstable();
         let will_flush = pending.iter().any(|bid| {
-            !self.is_bubble_locally_locked(*bid)
+            !self.upsert_held_back(*bid, scope)
                 && self.bubble_runtime.runtime_bubbles.contains_key(bid)
         });
         if !will_flush {
@@ -1977,9 +2017,13 @@ impl CanvasView {
             );
             return;
         };
+        // Whether this canvas has pulled every model change so far. A full flush can run on a canvas
+        // that is not drawn (another tab is active) while other canvases moved the model on; adopting
+        // the post-write revision then would make its next draw skip the pull and keep stale copies.
+        let in_sync_before = locked.revision() == self.bubble_runtime.synced_bubbles_revision;
         let mut had_success = false;
         for bid in pending {
-            if self.is_bubble_locally_locked(bid) {
+            if self.upsert_held_back(bid, scope) {
                 continue;
             }
             let Some(rt) = self.bubble_runtime.runtime_bubbles.get(&bid) else {
@@ -2072,7 +2116,13 @@ impl CanvasView {
                 )),
             }
         }
-        if had_success {
+        // The regular flush runs right after its draw's pull and adopts the revision as before; a
+        // full flush adopts it only when every change up to its own writes was already pulled.
+        let adopt_revision = match scope {
+            UpsertFlushScope::Regular => true,
+            UpsertFlushScope::Everything => in_sync_before,
+        };
+        if had_success && adopt_revision {
             self.bubble_runtime.synced_bubbles_revision = locked.revision();
         }
     }
@@ -2400,6 +2450,15 @@ impl CanvasView {
         self.image_bubble_meta_cache.remove(&bid);
         self.image_bubble_preview_cache.remove(&bid);
     }
+}
+
+/// Which locally locked bubbles a pending-upsert flush holds back (`upsert_held_back`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpsertFlushScope {
+    /// The per-frame flush: focused, debounced-text and pending-paste bubbles wait.
+    Regular,
+    /// A persistence point (`flush_all_bubble_edits_now`): only a pending paste waits.
+    Everything,
 }
 
 #[cfg(test)]
@@ -2915,6 +2974,114 @@ mod tests {
             (redone_u - 0.55).abs() < 1e-4,
             "redo must restore the committed anchor: {redone_u}"
         );
+    }
+
+    /// A text edit still inside its debounce window, on a bubble whose field is focused: the
+    /// regular flush holds it back; the persistence-point flush writes it at once, records exactly
+    /// one undo entry, and leaves nothing pending.
+    #[test]
+    fn flush_all_bubble_edits_writes_debounced_text_of_a_focused_bubble_with_one_undo_entry() {
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.30, 0.30, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+        let revision_before = model.lock().expect("lock model").revision();
+        let model_text = |model: &Arc<Mutex<BubblesModel>>| model.lock().expect("lock model").with_bubble(1, |b| b.text.clone()).expect("bubble 1 exists");
+
+        // The user types into bubble 1; the write waits on its debounce timer and the field is focused.
+        canvas.bubble_runtime.runtime_bubbles.get_mut(&1).expect("runtime bubble 1").text = "typed".to_string();
+        canvas.schedule_text_upsert(1, 0.0);
+        canvas.bubble_runtime.focused_bubbles.insert(1);
+
+        canvas.flush_pending_bubble_upserts_now(&project);
+        assert_eq!(model.lock().expect("lock model").revision(), revision_before, "the regular flush keeps the debounce");
+        assert_eq!(model_text(&model), "");
+
+        canvas.flush_all_bubble_edits_now(&project);
+        assert_eq!(model_text(&model), "typed", "the debounced text reaches the model");
+        assert!(canvas.bubble_runtime.pending_text_upsert.is_empty());
+        assert!(canvas.bubble_runtime.pending_upsert.is_empty());
+        // Nothing left: a second full flush writes nothing.
+        let revision_after = model.lock().expect("lock model").revision();
+        canvas.flush_all_bubble_edits_now(&project);
+        assert_eq!(model.lock().expect("lock model").revision(), revision_after);
+
+        // One undo entry for the flush: undo restores the empty text, a second undo finds nothing.
+        assert!(canvas.try_undo_bubbles_history());
+        assert_eq!(model_text(&model), "");
+        assert!(!canvas.try_undo_bubbles_history());
+    }
+
+    /// Two canvases on one model edit the same bubble: the left (inactive) canvas holds an OLDER
+    /// debounced edit, the active canvas a NEWER one. Flushed in the studio's order — the left
+    /// canvas when its tab is left (or first in a persistence fan-out), the active canvas last —
+    /// the newest text is what the model ends with, and it was written exactly once (one revision
+    /// step per canvas write). Each canvas records at most one undo entry for its flush. The left
+    /// canvas did not adopt a revision past changes it never pulled, so its next sync shows the
+    /// newest text.
+    #[test]
+    fn two_canvases_editing_one_bubble_commit_the_newest_edit() {
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.30, 0.30, Side::Left)]);
+        let model_text = || model.lock().expect("lock model").with_bubble(1, |b| b.text.clone()).expect("bubble 1 exists");
+        let revision = || model.lock().expect("lock model").revision();
+        let mut left = CanvasView::default();
+        let mut active = CanvasView::default();
+        for canvas in [&mut left, &mut active] {
+            canvas.set_bubbles_model(Arc::clone(&model));
+            canvas.sync_runtime_from_model_or_project(&project);
+        }
+        // Older edit in the left canvas, still debounced and focused; then the newer one in the active canvas.
+        left.bubble_runtime.runtime_bubbles.get_mut(&1).expect("left bubble 1").text = "older".to_string();
+        left.schedule_text_upsert(1, 0.0);
+        left.bubble_runtime.focused_bubbles.insert(1);
+        active.bubble_runtime.runtime_bubbles.get_mut(&1).expect("active bubble 1").text = "newer".to_string();
+        active.schedule_text_upsert(1, 0.5);
+        active.bubble_runtime.focused_bubbles.insert(1);
+        let start = revision();
+
+        left.flush_all_bubble_edits_now(&project);
+        assert_eq!(model_text(), "older");
+        assert_eq!(revision(), start + 1, "the left canvas writes once");
+        active.flush_all_bubble_edits_now(&project);
+        assert_eq!(model_text(), "newer", "the active canvas, flushed last, wins");
+        assert_eq!(revision(), start + 2, "the newest edit is written exactly once");
+        // A repeated fan-out writes nothing more.
+        left.flush_all_bubble_edits_now(&project);
+        active.flush_all_bubble_edits_now(&project);
+        assert_eq!(revision(), start + 2);
+
+        // The left canvas adopted only its own write; the active one was not in sync either (the
+        // left canvas wrote after its pull), so both pull the model on their next sync.
+        assert_eq!(left.bubble_runtime.synced_bubbles_revision, start + 1);
+        assert_eq!(active.bubble_runtime.synced_bubbles_revision, start);
+        left.bubble_runtime.focused_bubbles.clear();
+        left.sync_runtime_from_model_or_project(&project);
+        assert_eq!(left.bubble_runtime.runtime_bubbles[&1].text, "newer", "the left canvas shows the newest text on return");
+
+        // At most one undo entry per canvas flush: the active canvas undoes its one write.
+        assert!(active.try_undo_bubbles_history());
+        assert_eq!(model_text(), "older");
+        assert!(!active.try_undo_bubbles_history());
+    }
+
+    /// A bubble with a pending paste is held back even by the persistence-point flush.
+    #[test]
+    fn flush_all_bubble_edits_holds_back_a_pending_paste() {
+        let project = empty_project();
+        let model = test_model(vec![text_bubble_record(1, 0, 0.30, 0.30, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+        let revision_before = model.lock().expect("lock model").revision();
+        canvas.bubble_runtime.runtime_bubbles.get_mut(&1).expect("runtime bubble 1").text = "pasting".to_string();
+        canvas.bubble_runtime.pending_upsert.insert(1);
+        canvas.bubble_runtime.pending_bubble_paste = Some(PendingBubblePaste { bid: 1, field: BubbleTextField::Translation });
+
+        canvas.flush_all_bubble_edits_now(&project);
+        assert_eq!(model.lock().expect("lock model").revision(), revision_before);
+        assert!(canvas.bubble_runtime.pending_upsert.contains(&1), "the paste's upsert stays queued");
     }
 
     #[test]

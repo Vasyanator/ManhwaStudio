@@ -9,9 +9,9 @@ path.
 
 Layer:
 Near the top of the library stack: above `ms-project`, `ms-widgets`, `ms-storage`,
-`ms-sysprobe` and `ms-thread`, and below `app.rs` / `launcher/app.rs`, which own the tab
+`ms-sysprobe` and `ms-thread`, and below `studio.rs` / `launcher/app.rs`, which own the tab
 states, and below the `translation` tab, which reads this crate's note entries. The
-crate must never name `app`, `launcher` or another tab.
+crate must never name `studio`, `launcher` or another tab.
 
 Modules:
 - `characters`: character cards (portrait, aliases, description) plus the

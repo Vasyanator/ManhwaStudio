@@ -11,7 +11,7 @@ This directory is the crate root of `ms-tab-page-manager`, re-exported by the bi
 `src/tabs/mod.rs` as `crate::tabs::page_manager`, so every existing
 `crate::tabs::page_manager::…` path stays valid. Layer: near the top of the library stack —
 above `ms-page-ops` / `ms-models` / `ms-widgets` and `ms-tab-ps-editor` (its viewport camera
-drives the crop/split/stitch previews), below only `app.rs`. It must never name `app` or
+drives the crop/split/stitch previews), below only `studio.rs`. It must never name `studio` or
 `launcher`.
 
 ## Architecture
@@ -35,7 +35,7 @@ draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerA
   its resident source-page textures to `draw` for it and asks `viewer_source_page` /
   `viewer_wants_nearest_source` which page (and filter) to keep resident for this tab.
 - Shared models arrive through setters, mirroring the other tabs' wiring in
-  `MangaApp::new`: `set_bubbles_model`, `set_overlays_model`, `set_layer_doc`.
+  `StudioApp::new`: `set_bubbles_model`, `set_overlays_model`, `set_layer_doc`.
 - Badge data is cached and refreshed only when the source revision changes:
   bubble counts by `BubblesModel::revision`, clean-overlay presence by
   `CleanOverlaysModel::revision` (`is_overlay_virtual_absent`), layer counts by

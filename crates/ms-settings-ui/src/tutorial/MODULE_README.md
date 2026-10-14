@@ -7,8 +7,9 @@ the only root feature forwarded to workspace crates): the integration
 points (`mod tutorial`, controller fields, `mark`/autoplay/`sync`/`render` calls,
 and the "Обучение" settings panes) are `#[cfg(feature = "tutorial")]` in their
 host surfaces, so a default build compiles the whole subsystem out. This module's
-own files still compile — the demo bin `src/bin/tutorial_test` mounts `engine.rs`
-via `#[path]` independently of the feature.
+files compile only with the feature; the demo example
+`crates/ms-settings-ui/examples/tutorial_test` imports `engine.rs` as
+`ms_settings_ui::tutorial::engine` and therefore requires it (`required-features`).
 
 Shared in-app tutorial / onboarding layer. One overlay engine dims the viewport
 except a spotlighted target, draws a dashed outline + arrow + text callout, and
@@ -43,8 +44,8 @@ dim; fix it to use `Response::contains_pointer`/`hovered`).
 ## Files and submodules
 - `engine.rs`: the reusable overlay (`TutorialRegistry`, `TutorialStep<C>`,
   `Tutorial<C>`). Dependency-light (egui + std, so it uses `eprintln!` not the
-  structured logger) because the demo bin `src/bin/tutorial_test/main.rs` mounts
-  it via `#[path]`; do not add crate deps here. Step builders: `.id()` (label for
+  structured logger); do not add crate deps here. The demo example
+  `crates/ms-settings-ui/examples/tutorial_test/main.rs` imports it as a normal module. Step builders: `.id()` (label for
   jumps), `.on_enter()`, `.choice(label, goto)` (branch button), `.await_gate()`
   (auto-advance when the gate holds — a spinner shows meanwhile), `.gated()`
   (disable "Далее" until the gate holds), `.link()/.finish()` (override where the

@@ -112,7 +112,7 @@ Callers own the threading: nothing here spawns a worker for you.
   `image` (the capture contract), `serde`/`serde_json` (probe output, model markers),
   `sha2` + `thiserror` (`ai_models::external`), `ureq` (`ai_models`, native-only), `keyring` (`hf_token`, not wasm/Android), `ms-platform` (clipboard reads, capability table), and `windows-sys` on
   Windows. No probe may READ OR WRITE a config document, and the crate must NOT gain a
-  dependency on the application's upper layers (`project`, `app`, the tabs) or on egui —
+  dependency on the application's upper layers (`project`, `studio`, the tabs) or on egui —
   being a GUI-free leaf is what lets it type-check in parallel with the binary.
 - The Windows feature list of `windows-sys` is this crate's own business. Building only
   inside the workspace hides a missing feature (cargo unifies features with the binary's

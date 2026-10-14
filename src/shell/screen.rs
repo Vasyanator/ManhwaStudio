@@ -12,7 +12,7 @@ Key structures:
   a Closing screen continues once the studio teardown finished.
 - `ShellEvent` / `LauncherExit`: everything that can move the window.
 - `Transition` / `Effect`: the next screen, the shell's action, the OS-close verdict.
-- `ShellExit`: what `run_main` does after the window closed.
+- `ShellExit`: what `startup::run_native` does after the window closed.
 
 Key functions:
 - `on_event(kind, event)`: the transition table (`None` = the event does not apply there).
@@ -24,7 +24,7 @@ Notes:
 OS close policy (the `ShellEvent::OsClose` rows): PreparingLauncher, Launcher and a failed
 studio load allow it (the window quits); a loading studio cancels it and closes once the load
 worker delivered (it may be mid-write); a running studio cancels it and asks the studio
-(`MangaApp::request_os_close`: exit dialog or a close request); a Closing screen cancels it and
+(`StudioApp::request_os_close`: exit dialog or a close request); a Closing screen cancels it and
 turns into "exit after the teardown"; Exiting allows it, because the shell itself sent that
 `Close` (eframe re-delivers a sent `Close` as `close_requested` on the next frame, so cancelling
 it would loop forever).
@@ -38,13 +38,13 @@ continues into the new open instead of its previous destination (the newest user
 page-operation reload is safe to skip, the operation is already on disk); Exiting drops it.
 */
 
-use crate::app::PendingCloseAction;
-use crate::shell::studio::{ImageSources, StartupTarget};
+use crate::studio::PendingCloseAction;
+use crate::shell::target::{ImageSources, StartupTarget};
 use crate::shell::style::StyleScreen;
 use crate::tabs::AppTab;
 use std::path::PathBuf;
 
-/// What `run_main` does once the main window has closed.
+/// What `startup::run_native` does once the main window has closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShellExit {
     /// End the process.
@@ -61,7 +61,7 @@ pub(crate) enum StudioPhase {
     Loading { close_after_load: bool },
     /// The load failed; the error screen offers "back to the launcher" and "exit".
     Failed,
-    /// `MangaApp` runs.
+    /// `StudioApp` runs.
     Running,
 }
 
@@ -88,7 +88,7 @@ pub(crate) enum ScreenKind {
     Launcher,
     /// The studio screen in `StudioPhase`.
     Studio(StudioPhase),
-    /// A worker tears the studio down (`MangaApp::shutdown_blocking`, scratch release).
+    /// A worker tears the studio down (`StudioApp::shutdown_blocking`, scratch release).
     Closing { then: AfterClose },
     /// The shell sent the root `Close`; the window is going away with `exit`.
     Exiting { exit: ShellExit },
@@ -116,7 +116,7 @@ pub(crate) enum ShellEvent {
     StudioLoaded,
     /// The studio open worker reported a failure (or died).
     StudioLoadFailed,
-    /// The running studio decided to close (`MangaApp::take_close_request`).
+    /// The running studio decided to close (`StudioOutput::Close`, from `StudioApp::take_outputs`).
     StudioClose(PendingCloseAction),
     /// The running studio asked to reload its chapter after a structural page operation.
     StudioReload { project_dir: PathBuf },
@@ -147,13 +147,13 @@ pub(crate) enum Effect {
     ShowLauncher,
     /// Start the studio open worker for `target`; a reload restores `tab`.
     LoadStudio { target: StartupTarget, tab: Option<AppTab> },
-    /// Construct `MangaApp` from the delivered project.
+    /// Construct `StudioApp` from the delivered project.
     StartStudio,
     /// Show the load-error screen.
     ShowLoadError,
-    /// Move the studio (app and open request) onto the teardown worker.
+    /// Move the studio (app and its `StudioSession`) onto the teardown worker.
     Shutdown,
-    /// Hand the OS close to the running studio (`MangaApp::request_os_close`).
+    /// Hand the OS close to the running studio (`StudioApp::request_os_close`).
     RequestOsClose,
     /// Send the root `ViewportCommand::Close`.
     CloseWindow,
@@ -161,7 +161,7 @@ pub(crate) enum Effect {
     /// after `ShowLauncher` / `StartStudio`).
     QueueOpen(StartupTarget),
     /// Keep the target and ask the running studio whether it may close for it
-    /// (`MangaApp::request_close_for_incoming`).
+    /// (`StudioApp::request_close_for_incoming`).
     AskStudioToOpen(StartupTarget),
 }
 
@@ -589,7 +589,7 @@ mod tests {
 
     #[test]
     fn launcher_outcomes_map_to_exits() {
-        let selection = OpenProjectSelection { project_dir: reload_dir(), title: "Title".to_string(), chapter: "Chapter 1".to_string(), resume_unsaved: false };
+        let selection = OpenProjectSelection { project_dir: reload_dir(), title: "Title".to_string(), chapter: "Chapter 1".to_string() };
         assert_eq!(launcher_exit_for(LauncherOutcome::OpenProject(selection.clone()), false), LauncherExit::Open(StartupTarget::Project(reload_dir())));
         let picked = vec![PathBuf::from("/home/u/p2.png"), PathBuf::from("/home/u/p10.png")];
         assert_eq!(

@@ -14,8 +14,8 @@ edition = "2024"
 #
 # Layer: the TOP of the library stack — above the canvas, the models, the tooling
 # primitives, the widgets and `ms-tab-translation` (it drives the AI backend health, the
-# text detector and the MT service through it) — and below only `app.rs`, which calls
-# `CleaningTabState::draw`. It must never name `app` or `launcher`.
+# text detector and the MT service through it) — and below only `studio.rs`, which calls
+# `CleaningTabState::draw`. It must never name `studio` or `launcher`.
 #
 # It does NOT depend on `ms-tab-typing`: those two are the workspace's largest crates, and
 # an edge between them would serialize the build's critical path for nothing. Keep it that

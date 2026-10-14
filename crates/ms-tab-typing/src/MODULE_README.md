@@ -2,12 +2,12 @@
 
 ## Purpose
 This crate implements the `Text` tab. The binary re-exports it from `src/tabs/mod.rs` as
-`crate::tabs::typing`, so every `crate::tabs::typing::…` path in `app.rs`, the settings tab
+`crate::tabs::typing`, so every `crate::tabs::typing::…` path in `studio.rs`, the settings tab
 and the PS editor keeps working.
 
 It is the TOP of the library stack: above the canvas, the models, the widgets and every leaf
-crate, and below only `app.rs`, which calls `TypingTabState::draw`. Nothing below it may name
-it back, and it must never name `app`, `launcher` or another tab — the settings tab reaches
+crate, and below only `studio.rs`, which calls `TypingTabState::draw`. Nothing below it may name
+it back, and it must never name `studio`, `launcher` or another tab — the settings tab reaches
 its font model through the `font_admin` facade, and its settings deep links go through
 `ms_config::settings_deep_link`. It combines a read-only `CanvasView`,
 text/image overlay placement, text rendering, overlay deformation, clipping masks,
@@ -43,7 +43,7 @@ floating UI.
 
 Every floating PANEL of this tab is a tab of the shared panel dock (`crates/ms-widgets/src/panel_dock`,
 `dev-docs/dockable_panels_plan.md`). This tab does NOT own the dock state: the `PanelDockState` is
-app-owned (`MangaApp::panel_dock`, one per studio window) and lent in for the frame through
+app-owned (`StudioApp::panel_dock`, one per studio window) and lent in for the frame through
 `TypingDrawParams::panel_dock`, which the borrow checker sees as disjoint from `top_panel` /
 `text_overlays` / `mask_layer` — the split `PanelDock::begin` needs. `tab.rs` passes that borrow
 straight on to `CanvasDrawParams::panel_dock`, and the canvas hands it back as a parameter of
@@ -92,7 +92,7 @@ state owns them. Because several bodies need `&mut TypingTopPanelState`, three n
 through captured borrows.
 
 That layout is PERSISTED (`widgets::panel_dock::persist`), and the whole persistence cycle is
-app-level now: `app.rs::restore_panel_dock` installs the stored arrangement before the first frame,
+app-level now: `studio.rs::restore_panel_dock` installs the stored arrangement before the first frame,
 polls `PanelDockState::take_dirty_layouts` right after this tab draws and again in `on_exit`. What
 this tab still owns is `typing_default_dock_layout`, handed to the app as a `fn` pointer: it is the
 DICTIONARY of this tab's tab keys, so a new `TabId` must be added to it or the stored arrangement
@@ -100,7 +100,7 @@ will drop that tab on every load.
 
 Any of these tabs can be pulled out into a real OS window (`widgets::panel_dock::window`). Such a
 window is an immediate child viewport and therefore exists only while it is SHOWN every frame —
-which `PanelDock::end` does only while a dock-hosting program tab draws. `MangaApp::ui` shows them
+which `PanelDock::end` does only while a dock-hosting program tab draws. `StudioApp::ui` shows them
 on every other frame (`show_idle_sub_windows`, gated on `tab_hosts_panel_dock`), so the user's
 detached windows survive a tab switch (empty and grey, by the user's decision). Exactly one of the
 two per frame, or the viewport would be shown twice in one pass.
@@ -393,6 +393,8 @@ The module exposes memory snapshots and eviction methods for those textures only
 saving, and export.
 
 ## Files and submodules
+- `../examples/`: `test_center_find`, the standalone prototype of the auto-typing bubble-centre
+  search (`auto_typing.rs`); see `../examples/MODULE_README.md`.
 - `lib.rs`: crate root — module wiring and public re-exports for `TypingTabState`, `TypingDrawParams`,
   `TypingTopPanelState`, and `TypingPanelLayout`, plus the
   `typing_default_dock_layout` the app hands to the shared dock state.
@@ -417,7 +419,9 @@ saving, and export.
 - `tab.rs`: module root of the tab. Holds the data model (all `struct`/`enum`
   definitions incl. `TypingTabState`, `TypingTextOverlayLayer`, `TypingOverlayRuntime`,
   `TypingRasterLayer`, deform/export/create/edit/layout structs), the public
-  `TypingTabState` facade + `Default`, the `impl CanvasHooks for TypingHooks`, and the
+  `TypingTabState` facade + `Default` (reads the panels' `TypingPanelSeed` on the calling
+  thread) / `from_seed` (pre-read seed, no config I/O: the studio reads it on its open worker),
+  the `impl CanvasHooks for TypingHooks`, and the
   `mod`/`use` wiring. The behavior (methods + free fns) lives in child submodules under
   `tab/`. All child modules are DESCENDANTS of `tab`, so they read the model's private
   fields directly; moved methods/free-fns are `pub(super)` (or `pub(crate)`
@@ -688,7 +692,9 @@ saving, and export.
     `create_presets::draw_font_combo` (per-row `primary_color` + `tooltip`). See `panel/MODULE_README.md` for the coverage/cache contract.
   - `presets_io.rs`: what still belongs to `user_config.json` — formula presets, per-effect-kind
     defaults, the legacy inline-tags flag — plus the formula/drawn/vector layout <-> `Value`
-    conversions (free fns). Retains only the READ helper `load_text_tab_imported_system_fonts`
+    conversions (free fns), and `TypingPanelSeed` (formula presets + parameter identity mode read
+    once; `TypingTopPanelState::from_seed` / `TypingCreatePanelState::with_config` build the
+    panels from it without config I/O). Retains only the READ helper `load_text_tab_imported_system_fonts`
     for the one-time legacy migration (see `font_settings_store`); the imported-fonts WRITE path
     moved to `fonts_data.rs`, and the CREATE PRESETS moved to `presets_store.rs`.
   - `presets_store.rs`: the SINGLE owner of `fonts/presets.json` (version 2 — the version that
@@ -835,7 +841,7 @@ saving, and export.
   work on a worker thread — see `crates/ms-widgets/src/ui_fonts.rs`.
 - **An egui resource this tab registers is NAMED BY ITS CONTENT, never by an instance counter.**
   A project reload (structural page-manager op, «Перезагрузить проект») rebuilds the whole
-  `MangaApp` — every tab state with it — inside the SAME `egui::Context`, and `Context::add_font`
+  `StudioApp` — every tab state with it — inside the SAME `egui::Context`, and `Context::add_font`
   keeps the FIRST registration of a name without comparing bytes. A sequence number therefore
   re-issues a name the context already holds foreign bytes for. The create editor's own-typeface
   family is `tab/create_upload.rs::editor_font_family_name(identity, content id, face)`, a pure
@@ -874,7 +880,7 @@ saving, and export.
     `flush_text_layers`, which settles FIRST (before `sync_overlay_state_into_doc`, so a moved text
     layer's geometry is in what gets pushed, and before the doc flush, so a moved raster's geometry
     has reached the document). It must sit there and not only in the `flush_text_layers_if_dirty`
-    wrapper, because `MangaApp`'s page operations and save-to-project call `flush_text_layers`
+    wrapper, because `StudioApp`'s page operations and save-to-project call `flush_text_layers`
     DIRECTLY — and a raster move lives nowhere but this tab's runtime projection until it settles, so
     a page op would reload over it and a save would merge without it, both reporting success. The
     wrapper keeps its own settle too, since it decides whether to flush at all
@@ -950,13 +956,13 @@ saving, and export.
   with no resident pages). Clearing before the dispatch made a failed one look saved forever — the
   debounce stops arming its repaint, `has_pending_placement_save` goes false, and tab-leave/exit stop
   retrying, which at exit is silent data loss.
-  The `Err` vs `Ok`-with-empty-`owned_pages` distinction binds `app.rs` too, and in BOTH of its eager
+  The `Err` vs `Ok`-with-empty-`owned_pages` distinction binds `studio.rs` too, and in BOTH of its eager
   callers an unverified set means ABORT, never proceed: save-to-project would otherwise let the merge
   preserve stale committed text, delete the staging dir, and report success, and a page operation would
   remap the page-keyed trees without the pending edits (`ARCHITECTURE.md`, "Key invariants"). One asymmetry belongs
   here: `NoLayersDir`/`NoLayerDoc` mean the store was never wired, because `ensure_loader_started`
   wires it on the tab's FIRST DRAW. A session that never opened the Text tab therefore gets `Err` from
-  a tab that owes nothing — which is why `app.rs`'s page-op gate treats those variants as "quiesced
+  a tab that owes nothing — which is why `studio.rs`'s page-op gate treats those variants as "quiesced
   unless an edit is actually pending" instead of aborting on any `Err`.
   `has_pending_placement_save` covers THREE axes — `placement_save_dirty`, `edit_render_data_dirty`,
   and `save_requested_while_busy` (a flush that could only PARK behind an in-flight render has not
@@ -978,19 +984,19 @@ saving, and export.
     every `mark_placement_save_dirty` lives inside `canvas.draw`'s callees, so an earlier tick observes
     a mark only on the NEXT frame — which strands the write entirely when the marking frame is the last
     one drawn (no repaint armed), and otherwise doubles the delay to ~2 windows across two wakeups.
-  - **Tab leave / app exit** — `TypingTabState::flush_text_layers_if_dirty`, called by `app.rs` (the
+  - **Tab leave / app exit** — `TypingTabState::flush_text_layers_if_dirty`, called by `studio.rs` (the
     tab cannot see either event: both stop its `draw`). The EXIT flush is REQUIRED and must run BEFORE
     `on_exit`'s layer-saver barrier — see the quiescence note below.
   - Eager, deliberately NOT deferred: `remove_overlay` / `remove_raster` (anti-resurrection durability
     must not depend on reaching a flush point; both go through `dispatch_structural_placement_save`),
     the internal `save_requested_while_busy` re-fire, the band-order save job, and `exit_layout_editor` (leaving the editor IS a focus loss, so it flushes
     rather than defers).
-  - NOT a flush point at all — the DISCARD path (`app.rs::start_exit_cleanup`) calls
+  - NOT a flush point at all — the DISCARD path (`ProjectSession::start_exit_cleanup`, `src/studio/session/project/discard.rs`) calls
     `TypingTabState::discard_pending_text_edits`, which DROPS everything unwritten, including the
     parked re-fire. Discard deletes the staging dir and shuts the saver down, so any surviving pending
     write would be re-dispatched into `enqueue_page_text_save`'s sync fallback and re-create that dir
     with the edits the user threw away; a surviving `has_pending_text_edits` would also re-latch
-    `app.rs`'s unsaved cache and re-open the exit dialog.
+    `studio.rs`'s unsaved cache and re-open the exit dialog.
   The decision core `placement_save_debounce_tick` (`tab.rs`) is a pure fn and is unit-tested;
   `mark_placement_save_dirty` clears the window seed and the next frame re-seeds it, which is how a
   re-mark restarts the window without any edit site needing a clock.
@@ -1211,11 +1217,11 @@ saving, and export.
   the autosave overwrite the staged клин).
   EXPORT⇄SAVE MUTUAL EXCLUSION (Finding 2): export and project-save share the SAME preloader and both
   mutate shared doc/staging state (save's text flush → staging merge; export reads doc/overlays), so they
-  must never dispatch in the same window. `MangaApp` passes `save_busy` (= `save_to_project_rx.is_some() ||
+  must never dispatch in the same window. `StudioApp` passes `save_busy` (= `save_to_project_rx.is_some() ||
   pending_save_after_preload`) into `TypingTabState::draw`; while it holds, a new export trigger is DEFERRED
   (never dispatched inline) and `run_pending_export_if_ready` withholds dispatch (the `!save_busy` term).
   Save always completes, so the export is not starved; a save trigger does not consult export state, so
-  save is prioritized (the more stateful op) without deadlock. PROJECT-SAVE (Phase 4, `app.rs`) gates on
+  save is prioritized (the more stateful op) without deadlock. PROJECT-SAVE (Phase 4, `studio.rs`) gates on
   LAYERS ONLY — NOT masks, NOT
   клин: the save merge copies the committed `text_images/` verbatim (`copy_dir_overwrite_except`), so no
   in-memory mask data is consumed (unvisited pages' masks stay on disk), and клин edits are captured
@@ -1227,10 +1233,10 @@ saving, and export.
   making the unsaved→committed merge authoritative for it (v3-complete inline text incl. deletions);
   an unvisited or decode-failed page's committed text is preserved as-is (v3-incomplete but never lost).
   The save
-  TRIGGER (`MangaApp::request_save_to_project`, all three call sites: toolbar + both exit-dialog "save
+  TRIGGER (`StudioApp::request_save_to_project`, all three call sites: toolbar + both exit-dialog "save
   chapter" buttons) runs the save immediately when `all_pages_loaded`, else DEFERS: it starts
-  `TypingTabState::begin_preload_all_pages` and sets `MangaApp::pending_save_after_preload`.
-  `MangaApp::drive_pending_save_preload` (called every frame from `update`, BEFORE the tab-draw and
+  `TypingTabState::begin_preload_all_pages` and sets `StudioApp::pending_save_after_preload`.
+  `StudioApp::drive_pending_save_preload` (called every frame from `update`, BEFORE the tab-draw and
   independent of the active tab — the typing tab drives its own preload only while it is drawn) advances
   the preload, shows a "Подготовка страниц N/M" status (`app.save.preparing_pages`), and dispatches the
   real `start_save_to_project` once the preload PASS drains (`deferred_save_ready(preload_active) =
@@ -1241,7 +1247,7 @@ saving, and export.
   the SAME deferral: the exit-dialog "save chapter" path keeps the app alive (frames keep pumping) until
   the deferred save completes and then closes — `on_exit` only drains the layer saver and never triggers
   a save, so there is no synchronous full-load and no hang. The pure gate cores are unit-tested: in
-  `app.rs` `save_trigger_decision`, `deferred_save_ready` (incl. `deferred_save_does_not_hang_on_decode_error_giving_up`
+  `studio.rs` `save_trigger_decision`, `deferred_save_ready` (incl. `deferred_save_does_not_hang_on_decode_error_giving_up`
   — the Finding 1 give-up path dispatches instead of hanging); in `tab.rs`
   `export_dispatch_ready` (`export_dispatch_gate_pass_completion_masks_and_mutual_exclusion` — proves the
   export gate carries NO residency term so the give-up path cannot hang, waits on masks, and is blocked
@@ -1281,8 +1287,9 @@ saving, and export.
   exclusion: `draw` folds `flatten_to_file_in_progress()` into the `save_busy` term the export trigger and
   `run_pending_export_if_ready` read, so an export is deferred while a flatten runs; the flatten's result
   must be collected with `poll_flatten_to_file` (the app polls it every frame), or exports stay deferred.
-  In a single-image session (`ProjectData::is_single_image`) the actions tab hides the export format row,
-  the re-pagination block and the export button (`set_single_image_mode`), and every panel file dialog
+  Without a project export (`ms_models::SessionCapabilities::project_export` false: a single-image session;
+  pushed once by the root through `TypingTabState::set_session_capabilities`) the actions tab hides the
+  export format row, the re-pagination block and the export button; in that session every panel file dialog
   defaults into `ProjectData::user_facing_dir()` (the picture's folder), never into the scratch chapter,
   which is deleted on exit. The clip masks are still saved into the chapter's `text_images/` on
   mask-panel close; in single-image mode that directory is inside the scratch.
@@ -1306,8 +1313,8 @@ saving, and export.
   the guide frame, corner handles, binding/reconciliation, and renderer center computation stay governed
   by `centering_assist_enabled` alone. PERSISTENCE: `centering_assist_enabled` and `centering_show_center`
   persist in `user_config.json` under `TextTab` (keys `centering_assist_enabled`, `centering_show_center`),
-  seeded ONCE in `MangaApp::new` (via `TypingTabState::set_centering_assist_persisted_state`) and written
-  ONCE in `MangaApp::on_exit` (`persist_typing_centering_assist_state` → `config::update_user_config_file`,
+  seeded ONCE in `StudioApp::new` (via `TypingTabState::set_centering_assist_persisted_state`) and written
+  ONCE in `StudioApp::on_exit` (`persist_typing_centering_assist_state` → `config::update_user_config_file`,
   the canonical locked RMW; enabled defaults absent→false, show-center absent→true). `centering_assist_kind`
   stays SESSION-ONLY (not persisted). When enabled, the
   production text renders request BOTH renderer centers (`RenderExtraInfoRequest`) at the five dispatch

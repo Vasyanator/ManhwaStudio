@@ -1269,7 +1269,6 @@ mod tests {
             project_dir: PathBuf::from("/home/u/projects/title/chapter"),
             title: "title".to_owned(),
             chapter: "chapter".to_owned(),
-            resume_unsaved: false,
         });
         let mut slot = None;
         assert!(keep_first_outcome(&mut slot, open.clone()));

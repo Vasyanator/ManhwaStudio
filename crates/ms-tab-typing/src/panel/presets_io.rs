@@ -9,6 +9,8 @@ Main responsibilities:
 - load the TextTab legacy inline-tags flag;
 - load the LEGACY TextTab imported-system-fonts path list (read-only migration input);
 - load, default, and save the formula presets;
+- `TypingPanelSeed`: the formula presets + the identity mode read once, so the panels can be
+  built without config I/O (`TypingTopPanelState::from_seed`);
 - load and save the per-effect-kind defaults;
 - load and save the create panel's parameter identity mode;
 - convert formula, drawn-lines, and vector-lines layouts to and from serde_json Value.
@@ -562,6 +564,36 @@ pub(super) fn load_text_tab_formula_presets() -> HashMap<String, TypingFormulaPr
         out.insert(name.clone(), TypingFormulaPreset { layout });
     }
     out
+}
+
+/// The `user_config.json` (`TextTab`) values the two typing panels are built from: the formula
+/// presets (both panels) and the create panel's parameter identity mode.
+///
+/// Read once by [`TypingPanelSeed::read_blocking`], which can run on a worker so the tab itself
+/// is then built without config I/O (`TypingTabState::from_seed`). Plain data, `Send`.
+pub struct TypingPanelSeed {
+    pub(super) formula_presets: HashMap<String, TypingFormulaPreset>,
+    pub(super) identity_mode: ParamIdentityMode,
+}
+
+impl TypingPanelSeed {
+    /// Reads the seed from the runtime root's `user_config.json` (two blocking document reads;
+    /// an absent or unreadable document yields the built-in defaults, as the panel constructors
+    /// always did). Never call it on the GUI thread.
+    #[must_use]
+    pub fn read_blocking() -> Self {
+        Self { formula_presets: load_text_tab_formula_presets(), identity_mode: load_text_tab_param_identity_mode() }
+    }
+}
+
+impl std::fmt::Debug for TypingPanelSeed {
+    // `TypingFormulaPreset` has no `Debug`; the preset names are what identifies the seed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TypingPanelSeed")
+            .field("formula_presets", &self.formula_presets.keys().collect::<Vec<_>>())
+            .field("identity_mode", &self.identity_mode)
+            .finish()
+    }
 }
 
 /// Loads the per-effect-kind default overrides from `TextTab.effect_defaults`.

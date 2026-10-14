@@ -75,7 +75,7 @@ impl SettingsTabState {
                 let mut selected_preset = active_preset;
                 // A single-image session's comic type is fixed to `Pages` by the open step (plan D4):
                 // the preset selector would only rewrite the throwaway scratch project.
-                if !self.single_image_session {
+                if self.project_settings {
                     ui.horizontal(|ui| {
                         ui.label(t!("settings.canvas_ribbon.preset_label"));
                         ComboBox::from_id_salt("settings_canvas_ribbon_preset")
@@ -195,7 +195,7 @@ impl SettingsTabState {
                         .changed();
                     // The project word list of a single-image session would live in its throwaway
                     // scratch chapter, so it is not offered there.
-                    if !self.single_image_session {
+                    if self.project_settings {
                         ui.add_space(8.0);
                         ui.label(t!("settings.canvas_ribbon.project_exclusions_label"));
                         changed |= ui

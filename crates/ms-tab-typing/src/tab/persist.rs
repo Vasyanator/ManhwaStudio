@@ -140,7 +140,7 @@ impl TypingTextOverlayLayer {
     }
 
     /// DROPS all pending text-save state without writing: both dirty axes, the idle window, AND the
-    /// parked re-fire. DISCARD path only (`app.rs::start_exit_cleanup`).
+    /// parked re-fire. DISCARD path only (`studio.rs::start_exit_cleanup`).
     ///
     /// Unlike `clear_placement_save_dirty` this also cancels `save_requested_while_busy`, because on
     /// the discard path a re-fire is not a lost write to protect but an unwanted one: it would run
@@ -497,10 +497,10 @@ impl TypingTextOverlayLayer {
         // moved RASTER's geometry has reached the document.
         //
         // This is the whole-document flush, and it has THREE callers, all of which are points of no
-        // return where the gesture is genuinely over: the tab-leave/exit flush, `MangaApp`'s page
+        // return where the gesture is genuinely over: the tab-leave/exit flush, `StudioApp`'s page
         // operations (which remap the page-keyed trees and reload the project behind them), and
         // save-to-project (which merges staging into the committed tree and then deletes staging).
-        // The two `app.rs` callers reach `flush_text_layers` DIRECTLY, so settling only in
+        // The two `studio.rs` callers reach `flush_text_layers` DIRECTLY, so settling only in
         // `flush_text_layers_if_dirty` left both of them able to reload or merge over an unsettled
         // gesture — the raster half of which lives nowhere but the runtime projection.
         //

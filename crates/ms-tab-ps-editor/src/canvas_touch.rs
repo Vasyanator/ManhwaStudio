@@ -28,7 +28,7 @@ use ms_widgets::touch_nav::{self, TouchOutput, TouchSelection, TouchSelectionEnd
 /// Radius of the long-press feedback ring, in screen points.
 const LONG_PRESS_MARKER_RADIUS: f32 = 18.0;
 
-/// Content-named touch owner id of the PS editor canvas (stable across `MangaApp` rebuilds).
+/// Content-named touch owner id of the PS editor canvas (stable across `StudioApp` rebuilds).
 fn owner_id() -> Id {
     Id::new("ps_editor.canvas")
 }

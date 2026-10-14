@@ -10,7 +10,10 @@ Main responsibilities:
 - re-check release availability on entry without blocking the GUI thread;
 - support the startup test-version override without performing network I/O;
 - run the updater in two stages: executable replacement, then `--continue-update` environment and
-  archive refresh.
+  archive refresh;
+- own the release-feed constants (`APP_RELEASES_API`, `APP_ZIP_ASSET_NAME`) that `utils.rs` and
+  the binary's startup update check also use. Versions are ordered only by
+  `ms_config::version_format::compare_release_versions` / `is_remote_newer`.
 
 Notes:
 Updater work runs on background workers. The GUI thread only polls channels and draws progress or
@@ -18,14 +21,15 @@ choice state.
 */
 
 use eframe::egui;
-use std::cmp::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use ms_thread as thread;
 use web_time::Duration;
 
 use ms_config as config;
+use ms_config::version_format::is_remote_newer;
 
 use crate::HostVersion;
+use crate::window::{WindowLook, prepare_window_context};
 
 use super::install::TorchInstallSelection;
 use super::utils::{
@@ -34,8 +38,11 @@ use super::utils::{
     run_update_continuation_stage,
 };
 
-const APP_RELEASES_API: &str = "https://api.github.com/repos/Vasyanator/ManhwaStudio/releases";
-const APP_ZIP_ASSET_NAME: &str = "ManhwaStudio.zip";
+/// GitHub API endpoint listing this program's releases. The one copy: the startup update
+/// check (`src/update_check.rs`) and the installer's download paths (`utils.rs`) use it too.
+pub const APP_RELEASES_API: &str = "https://api.github.com/repos/Vasyanator/ManhwaStudio/releases";
+/// The application archive asset; a release without it is not installable or updatable.
+pub const APP_ZIP_ASSET_NAME: &str = "ManhwaStudio.zip";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateWindowOutcome {
@@ -87,8 +94,7 @@ fn run_update_window_internal(mode: UpdateMode, host: HostVersion) -> Result<Upd
         t!("installer.update.window_title"),
         native_options,
         Box::new(move |cc| {
-            ms_theme::apply(&cc.egui_ctx);
-            ms_widgets::ui_fonts::install(&cc.egui_ctx, ms_widgets::ui_fonts::Tier::Core);
+            prepare_window_context(&cc.egui_ctx, WindowLook::StudioTheme);
             Ok(Box::new(UpdateApp::new(mode, output_for_app, host)))
         }),
     )
@@ -591,76 +597,4 @@ fn fetch_latest_app_release_tag() -> Result<String, String> {
     }
 
     Err(tf!("installer.update.no_release_with_assets_error", app_zip_asset_name = APP_ZIP_ASSET_NAME, platform_binary_asset_name = platform_binary_asset_name()))
-}
-
-fn is_remote_newer(local: &str, remote: &str) -> bool {
-    compare_versions(remote, local).is_gt()
-}
-
-fn compare_versions(left: &str, right: &str) -> Ordering {
-    let left_parts = parse_version_to_parts(left);
-    let right_parts = parse_version_to_parts(right);
-
-    for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
-        let ordering = compare_version_part(left_part, right_part);
-        if !ordering.is_eq() {
-            return ordering;
-        }
-    }
-
-    left_parts.len().cmp(&right_parts.len())
-}
-
-fn parse_version_to_parts(version: &str) -> Vec<VersionPart> {
-    normalize_version(version)
-        .split(['.', '-', '+', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| match part.parse::<u64>() {
-            Ok(number) => VersionPart::Number(number),
-            Err(_) => VersionPart::Text(part.to_ascii_lowercase()),
-        })
-        .collect()
-}
-
-fn normalize_version(version: &str) -> &str {
-    let trimmed = version.trim();
-    trimmed
-        .strip_prefix('v')
-        .or_else(|| trimmed.strip_prefix('V'))
-        .unwrap_or(trimmed)
-}
-
-fn compare_version_part(left: &VersionPart, right: &VersionPart) -> Ordering {
-    match (left, right) {
-        (VersionPart::Number(left), VersionPart::Number(right)) => left.cmp(right),
-        (VersionPart::Text(left), VersionPart::Text(right)) => left.cmp(right),
-        (VersionPart::Number(_), VersionPart::Text(_)) => Ordering::Greater,
-        (VersionPart::Text(_), VersionPart::Number(_)) => Ordering::Less,
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum VersionPart {
-    Number(u64),
-    Text(String),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{compare_versions, is_remote_newer};
-    use std::cmp::Ordering;
-
-    #[test]
-    fn compares_numeric_release_versions() {
-        assert_eq!(compare_versions("v3.5.0", "3.4.9"), Ordering::Greater);
-        assert_eq!(compare_versions("3.4.0", "v3.4.0"), Ordering::Equal);
-        assert_eq!(compare_versions("3.3.9", "3.4.0"), Ordering::Less);
-    }
-
-    #[test]
-    fn detects_remote_update_against_local_version() {
-        assert!(is_remote_newer("3.4.0", "v3.4.1"));
-        assert!(!is_remote_newer("3.4.0", "v3.4.0"));
-        assert!(!is_remote_newer("3.4.1", "v3.4.0"));
-    }
 }

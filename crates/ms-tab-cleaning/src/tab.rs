@@ -52,7 +52,8 @@ FILE HEADER (tabs/cleaning/tab.rs)
   - `handle_active_tool_input/hotkeys/wheel`: маршрутизация ввода в активный инструмент.
   - `canvas_pointer_occluded`: общий гейт ввода, когда pointer занят floating UI/popup/dialog поверх canvas.
   - `zoom_by_shortcut/reset_zoom_shortcut`: прокси zoom-hotkeys CanvasView с учётом блокировок от инструмента.
-  - `viewport_snapshot/apply_viewport_snapshot`: bridge для общего viewport sync в `MangaApp`.
+  - `canvas` / `canvas_mut`: the tab's `CanvasView`, through which `StudioApp` syncs the shared
+    viewport and page (`src/studio/view_sync.rs`) and reads the page window / pixel inspection.
 - Важно: если активный инструмент возвращает `block_canvas_zoom() = true` (например, открыт region editor),
   zoom CanvasView блокируется, чтобы Ctrl/Z-комбинации обрабатывались только инструментом.
   Для инструментов, которым нужен `Ctrl+ЛКМ` (например, `Замазка` для прямоугольника),
@@ -69,7 +70,7 @@ use super::tools::{
 };
 use ms_models::page_view::{PageImageInfo, PageTexture};
 use ms_canvas::{
-    self, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView, CanvasViewportSnapshot,
+    self, CanvasDrawParams, CanvasHooks, CanvasUiStatus, CanvasView,
     SourceTextureUploadBudget,
 };
 use ms_memory::{
@@ -78,6 +79,7 @@ use ms_memory::{
 };
 use ms_models::bubbles_model::BubblesModel;
 use ms_models::clean_overlays_model::CleanOverlaysModel;
+use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::TextMaskModel;
 use ms_project::ProjectData;
 use ms_config::app_tab::AppTab;
@@ -89,7 +91,7 @@ use ms_widgets::panel_dock::{
 use ms_widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Vec2};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -760,7 +762,7 @@ pub struct CleaningDrawParams<'a> {
     pub page_infos: &'a HashMap<usize, PageImageInfo>,
     pub texture_cache: &'a mut HashMap<usize, PageTexture>,
     pub status: CanvasUiStatus,
-    /// The studio window's dock state, owned by `MangaApp` and LENT for this
+    /// The studio window's dock state, owned by `StudioApp` and LENT for this
     /// frame. It is not a field of this tab because one studio window has exactly
     /// one dock state, shared by every program tab that hosts panels
     /// (`src/widgets/panel_dock/MODULE_README.md`); the lent-in borrow is also
@@ -796,6 +798,10 @@ pub struct CleaningTabState {
     ai_backend_health: Option<Arc<Mutex<AiBackendHealthSnapshot>>>,
     /// Clean-folder scan and dismiss state behind the «Клин» tab's status area.
     clean_folder_status: CleanFolderStatus,
+    /// What the open session offers (`set_session_capabilities`, pushed once by the root):
+    /// `clean_scan` gates the clean-folder scan; the whole value is re-pushed to the active tool
+    /// every frame (`CleaningTool::set_session_capabilities`).
+    session_caps: SessionCapabilities,
 }
 
 impl Default for CleaningTabState {
@@ -843,6 +849,7 @@ impl Default for CleaningTabState {
             quick_clean_status_text: None,
             ai_backend_health: None,
             clean_folder_status: CleanFolderStatus::default(),
+            session_caps: SessionCapabilities::default(),
         };
         state.activate_tool(0);
         state
@@ -870,6 +877,12 @@ impl CleaningTabState {
         self.ai_backend_health = Some(snapshot);
     }
 
+    /// Sets what the open session offers (`SessionMode::capabilities` in the root). The root pushes it
+    /// once, right after construction; the session kind never changes during the tab's lifetime.
+    pub fn set_session_capabilities(&mut self, caps: SessionCapabilities) {
+        self.session_caps = caps;
+    }
+
     /// Asks the «Клин» status area to rescan the chapter's clean folders on a worker at the next
     /// draw. For disk changes the tab cannot see itself — the app calls it once «Сохранить проект»
     /// has merged the staging tree. Entering the tab rescans on its own. Cheap; never blocks.
@@ -881,20 +894,18 @@ impl CleaningTabState {
         self.canvas.set_scroll_area_id_salt(id_salt);
     }
 
-    pub fn viewport_snapshot(&self) -> CanvasViewportSnapshot {
-        self.canvas.viewport_snapshot()
+    /// This tab's page + bubble canvas. The studio reads its viewport, page window and
+    /// pixel-inspection state through it (view sync, page residency).
+    #[must_use]
+    pub fn canvas(&self) -> &CanvasView {
+        &self.canvas
     }
 
-    pub fn apply_viewport_snapshot(&mut self, snapshot: CanvasViewportSnapshot) {
-        self.canvas.apply_viewport_snapshot(snapshot);
-    }
-
-    pub fn current_page_local_view_center(&self) -> Option<(usize, egui::Vec2)> {
-        self.canvas.current_page_local_view_center()
-    }
-
-    pub fn focus_page(&mut self, page_idx: usize, center_px: Option<egui::Vec2>, zoom: f32) {
-        self.canvas.focus_page(page_idx, center_px, zoom);
+    /// This tab's page + bubble canvas, mutably: the studio applies the shared viewport snapshot
+    /// and explicit page focus through it. Tab-specific canvas configuration stays behind this
+    /// tab's own setters.
+    pub fn canvas_mut(&mut self) -> &mut CanvasView {
+        &mut self.canvas
     }
 
     pub fn cleaning_mask_gpu_memory_snapshot(
@@ -945,14 +956,6 @@ impl CleaningTabState {
         request: &CacheEvictionRequest,
     ) -> CacheEvictionReport {
         self.canvas.evict_clean_overlay_gpu_cache(request)
-    }
-
-    pub fn active_source_page_window(&self, neighbor_radius: usize) -> HashSet<usize> {
-        self.canvas.active_source_page_window(neighbor_radius)
-    }
-
-    pub fn source_pixel_inspection_active(&self) -> bool {
-        self.canvas.source_pixel_inspection_active()
     }
 
     pub fn zoom_by_shortcut(&mut self, factor: f32) -> bool {
@@ -1039,9 +1042,9 @@ impl CleaningTabState {
         let space_pan_active = space_down;
         if let Some(active_tool) = self.tools.get_mut(self.active_tool_idx) {
             active_tool.set_space_pan_active(space_pan_active);
-            // Before `canvas.draw`: the tool's dock bodies run inside it and hide what a
-            // single-image session does not offer.
-            active_tool.set_single_image_session(project.is_single_image());
+            // Before `canvas.draw`: the tool's dock bodies run inside it and hide what the
+            // session does not offer.
+            active_tool.set_session_capabilities(self.session_caps);
         }
         let block_drag_scroll = self.tools.get(self.active_tool_idx).is_some_and(|tool| {
             (primary_down && tool.block_canvas_drag_scroll_on_primary())
@@ -1073,7 +1076,7 @@ impl CleaningTabState {
         // Read by the «Клин» body, so polled before `canvas.draw` like every other body input.
         self.clean_folder_status.note_frame(ctx.cumulative_frame_nr());
         self.clean_folder_status.poll();
-        self.clean_folder_status.start_scan_if_needed(ctx, project);
+        self.clean_folder_status.start_scan_if_needed(ctx, project, self.session_caps.clean_scan);
         let cursor_occluder = self.active_cursor_occluder(ctx, canvas_rect);
         let mut hooks = CleaningHooks {
             quick_text_mask_panel_open: self.quick_text_mask_panel_open,
@@ -2434,7 +2437,7 @@ impl CanvasHooks for CleaningHooks<'_> {
     /// all three canvas tabs then run their dock at the same point of the frame with
     /// the same dock-area rule. It must also run on EVERY frame this tab is active:
     /// the dock's detached sub-windows are immediate viewports kept alive by
-    /// `PanelDock::end` (`app.rs::tab_hosts_panel_dock`).
+    /// `PanelDock::end` (`studio.rs::tab_hosts_panel_dock`).
     fn draw_canvas_overlay_top_left(
         &mut self,
         ctx: &egui::Context,

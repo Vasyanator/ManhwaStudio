@@ -108,7 +108,8 @@ active-logs = []
 # settings pane). Off by default: the tutorial controller and its `mark` sites
 # stay compiled but inert, and all autoplay/overlay rendering plus the settings
 # pane are gated out. Enable with `--features tutorial` to restore the tours.
-# The engine itself always compiles (the demo bin mounts it through `#[path]`).
+# The engine compiles only with the feature too; its demo is the `tutorial_test`
+# example of `ms-settings-ui` (`required-features = ["tutorial"]`).
 # Features are NOT inherited: this MUST forward to `ms-settings-ui/tutorial`, where the
 # subsystem now lives, or the tours would compile out while the binary still gated its
 # own `mark` sites in.
@@ -129,14 +130,6 @@ profiling = ["dep:puffin", "dep:puffin_egui"]
 # inject input, and capture screenshots. Active only when the `EGUI_INSPECTION`
 # env var is set at runtime; off by default so production builds are unaffected.
 inspection = ["eframe/inspection"]
-
-[[bin]]
-name = "render_gallery"
-path = "src/bin/render_gallery/main.rs"
-
-[[bin]]
-name = "tutorial_test"
-path = "src/bin/tutorial_test/main.rs"
 
 # Cross-target dependencies. These compile on both native and wasm32 (pure Rust
 # or with first-class wasm support: egui/eframe, image, cosmic-text, serde, zip,
@@ -219,38 +212,37 @@ ms-settings-ui = { path = "crates/ms-settings-ui" }
 # It sits at the very top of the stack; nothing may depend on it.
 ms-launcher = { path = "crates/ms-launcher" }
 # The «Текст» (typing) tab (`src/tabs/typing/`), re-exported as `crate::tabs::typing`
-# from `src/tabs/mod.rs`. The top of the library stack: only `app.rs` calls into it
+# from `src/tabs/mod.rs`. The top of the library stack: only `studio.rs` calls into it
 # (`TypingTabState::draw`), and nothing below it may name it back.
 ms-tab-typing = { path = "crates/ms-tab-typing" }
 # The four small project-editor tabs («Персонажи», «Термины», «Заметки», «Вики»),
 # re-exported as `crate::tabs::{characters, terms, notes, wiki}` from `src/tabs/mod.rs`.
-# Same layer as `ms-tab-typing`: only `app.rs`, `launcher/app.rs` and the translation tab
+# Same layer as `ms-tab-typing`: only `studio.rs`, `launcher/app.rs` and the translation tab
 # call into it, and nothing below it may name it back.
 ms-tabs-simple = { path = "crates/ms-tabs-simple" }
 # The «Перевод» (translation) tab (`src/tabs/translation/`), re-exported as
 # `crate::tabs::translation` from `src/tabs/mod.rs`. Sits above `ms-tabs-simple` (it reads
-# character/term note entries) and below `app.rs`, the AI backend panel/supervisor, the
+# character/term note entries) and below `studio.rs`, the AI backend panel/supervisor, the
 # launcher's reline flow and the `cleaning` tab.
 ms-tab-translation = { path = "crates/ms-tab-translation" }
 # The «PS-подобный редактор» tab (`src/tabs/ps_editor/`), re-exported as
 # `crate::tabs::ps_editor` from `src/tabs/mod.rs`. Sits above `ms-tab-typing` (its layers
-# panel renders typing's text preview label) and below `app.rs` and the `page_manager`
+# panel renders typing's text preview label) and below `studio.rs` and the `page_manager`
 # tab. It owns no GL objects: its «Коррекция» shader layer runs on the `egui-shader-layers`
 # backend this binary installs and destroys (`studio_bootstrap`).
 ms-tab-ps-editor = { path = "crates/ms-tab-ps-editor" }
 # The «Менеджер страниц» tab (`src/tabs/page_manager/`), re-exported as
 # `crate::tabs::page_manager` from `src/tabs/mod.rs`. Sits above `ms-tab-ps-editor` (the
-# crop/split/stitch previews reuse its viewport camera) and below only `app.rs`, which
+# crop/split/stitch previews reuse its viewport camera) and below only `studio.rs`, which
 # executes the structural page ops the tab requests.
 ms-tab-page-manager = { path = "crates/ms-tab-page-manager" }
 # The «Клининг» tab (`src/tabs/cleaning/`), re-exported as `crate::tabs::cleaning` from
 # `src/tabs/mod.rs`. The TOP of the library stack: it sits above `ms-tab-translation`
-# (backend health, the text detector, the MT service) and only `app.rs` calls into it
+# (backend health, the text detector, the MT service) and only `studio.rs` calls into it
 # (`CleaningTabState::draw`). It deliberately does NOT depend on `ms-tab-typing` — an edge
 # between the two largest crates would serialize the build for nothing.
 ms-tab-cleaning = { path = "crates/ms-tab-cleaning" }
 ms-text-util = { path = "crates/ms-text-util" }
-ms-text-render = { path = "crates/ms-text-render" }
 ms-actions = { path = "crates/ms-actions", features = ["raster"] }
 ms-storage = { path = "crates/ms-storage" }
 ms-thread = { path = "crates/ms-thread" }
@@ -265,10 +257,6 @@ egui.workspace = true
 # Installs the shader-layer glow backend on the studio window's egui context and frees it on
 # exit; the layers themselves are painted by `ms-tab-ps-editor`.
 egui-shader-layers.workspace = true
-cosmic-text.workspace = true
-swash.workspace = true
-zeno.workspace = true
-hyphenation.workspace = true
 image.workspace = true
 minijinja.workspace = true
 serde.workspace = true

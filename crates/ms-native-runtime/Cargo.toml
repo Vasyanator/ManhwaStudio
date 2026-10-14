@@ -10,7 +10,7 @@ edition = "2024"
 #
 # Layer: ABOVE `ms-onnx` / `ms-onnx-runtime` / `ms-sysprobe` / `ms-config`, BELOW the tabs
 # and the AI backend panel, which route OCR/detection requests into it. It must never name
-# `tabs`, `app` or `launcher`; the SIGILL crash guard it writes lives in
+# `tabs`, `studio` or `launcher`; the SIGILL crash guard it writes lives in
 # `ms_config::ort_load_guard`.
 #
 # Native-only by construction: `ms-onnx`/`ort` load a native shared library, so the binary

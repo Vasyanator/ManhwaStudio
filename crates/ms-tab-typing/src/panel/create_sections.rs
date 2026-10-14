@@ -640,7 +640,7 @@ impl TypingCreatePanelState {
             clean_overlays_visible,
             strict_pixel_movement,
             export_default_dir,
-            single_image,
+            project_export,
             export_status,
             export_format,
             comic_type,
@@ -672,9 +672,9 @@ impl TypingCreatePanelState {
             if ui.button(mask_button_label).clicked() {
                 out.toggle_mask = true;
             }
-            // Project-export controls exist only in the project mode: a single-image session writes
-            // its picture through the app's «Сохранить», never through a project export.
-            let export_controls_visible = self.preview_enabled && !single_image;
+            // Project-export controls exist only when the session offers a project export: a
+            // single-image session writes its picture through the app's «Сохранить» instead.
+            let export_controls_visible = self.preview_enabled && project_export;
             if export_controls_visible {
                 let mut format = export_format;
                 ui.horizontal(|ui| {

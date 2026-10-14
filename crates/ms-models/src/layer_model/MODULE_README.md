@@ -383,7 +383,7 @@ own runtime and draws the returned `CompositeStep`s; none re-implements a band-Z
     wait is `recv_timeout(min(gate.wait_deadline(), 1 s))`. Every async funnel of the doc (and the PS
     raw-handle page save via `LayerDoc::note_autosave_action`) reports ONE action AFTER its send;
     `bump_dirty_epoch` never does. `None` = write after every drain.
-  WIRING: the doc enables the saver via `enable_background_saver(gate)` (called ONCE in `app.rs` on the
+  WIRING: the doc enables the saver via `enable_background_saver(gate)` (called ONCE in `studio.rs` on the
   shared doc at startup) and feeds it through `enqueue_page_save` / `enqueue_page_text_save` /
   `enqueue_raster_effects` (sync-flush fallback when no saver is enabled). A caller saving MANY pages
   at once uses `enqueue_pages_text_save`, which sends them as ONE `SaverMsg::Jobs` message: separate

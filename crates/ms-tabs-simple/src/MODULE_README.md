@@ -11,8 +11,8 @@ Re-exported by the binary from `src/tabs/mod.rs` as
 
 ## Architecture
 Layer: near the top of the library stack. It may depend on `ms-project`, `ms-widgets`,
-`ms-storage`, `ms-docstore`, `ms-log`, `ms-sysprobe`, `ms-thread` and `ms-i18n`, and it may NOT depend on `app`,
-`launcher` or another tab crate. Above it sit `app.rs` and `launcher/app.rs` (which own the
+`ms-storage`, `ms-docstore`, `ms-log`, `ms-sysprobe`, `ms-thread` and `ms-i18n`, and it may NOT depend on `studio`,
+`launcher` or another tab crate. Above it sit `studio.rs` and `launcher/app.rs` (which own the
 tab states) and `ms-tab-translation`, which reads this crate's note entries to build the MT
 glossary.
 

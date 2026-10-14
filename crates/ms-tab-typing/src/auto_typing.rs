@@ -16,7 +16,7 @@ FILE HEADER (tabs/typing/auto_typing.rs)
 - Поведение:
   - Поиск пузыря выполняется region-growing с ограничениями по цветовым дельтам.
   - Область валидируется по геометрии (`fill/solidity/shape/radial`) как в тестовом
-    `src/bin/test_center_find.rs`.
+    `examples/test_center_find.rs` этого крейта.
   - Для UI отладки результат возвращает UV-контур/границы/центр (по сглаженному контуру).
 */
 

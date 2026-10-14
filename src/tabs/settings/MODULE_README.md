@@ -16,7 +16,7 @@ The three cross-surface "double-interface" sections (General / AiBackend / Tutor
 a single `crate::settings_shared::SharedSettingsPanels` embedded on `SettingsTabState` and rendered
 via `shared.draw(id, ui, Studio, &ai_backend_handle)`; the studio-only sections
 (CanvasRibbon / Typesetting / Hotkeys) render through this module's own methods. The AI backend
-section no longer owns the backend process: `SettingsTabState` holds a cloned `AiBackendHandle`,
+section does not own the backend process: `SettingsTabState` holds a cloned `AiBackendHandle`,
 passed by reference into `shared.draw`. Pane files render focused UI sections through methods on
 `SettingsTabState`.
 
@@ -25,7 +25,7 @@ the in-memory `SharedCanvasSettings`, sends save requests, polls shared snapshot
 backend process/probe commands through the `AiBackendHandle`.
 
 The `ai_backend.py` process and the health/device probe are owned **app-globally** by
-`crate::ai_backend_supervisor` (created in `run_main` before the launcher/studio loop), so the
+`crate::ai_backend_supervisor` (created in `startup::run_native` before the launcher/studio loop), so the
 backend starts in the launcher (per the autostart toggle) and survives launcher↔studio transitions.
 Both the studio settings tab and the launcher settings page render the same
 `ai_backend_panel::draw_ai_backend_panel` against that shared handle. The backend speaks the framed
@@ -33,29 +33,31 @@ IPC protocol over the AF_UNIX socket at `backend_ipc::backend_socket_path()`; th
 that path to Python with `--socket`. There is no free-port reservation and no HTTP server.
 
 ## Files and submodules
-- `mod.rs`: `SettingsTabState`, section routing (over `settings_shared::sections_for(Studio)`),
+- `mod.rs`: `SettingsTabState` (`from_seed` over a `SettingsTabSeed` — the typing panel layout,
+  font-list name modes and `SharedSettingsPanels` read once by `read_blocking`, on the studio's
+  open worker; `new` reads it inline), the canvas binding's pre-read `SpellcheckWordsSeed`,
+  section routing (over `settings_shared::sections_for(Studio)`),
   canvas settings binding, the shared `AiBackendHandle`, the `SharedSettingsPanels` container for
   the General / AiBackend / Tutorials sections, typing-layout persistence helper, and the coalesced
   canvas settings save worker. The AiBackend and Tutorials sections are rendered inline in `draw` via
   `shared.draw(...)` (AiBackend inside the scroll area); the General section goes through `general.rs`.
-  (The projects-dir + memory-profile editing/persistence moved to the shared
-  `crate::general_settings_panel` widget; the `user_config.json` write lock moved to `config`.)
-  (The backend process worker + autostart persistence now live in `crate::ai_backend_supervisor`.)
+  The projects-dir + memory-profile editing and persistence belong to the shared
+  `crate::general_settings_panel` widget, the backend process worker + autostart persistence to
+  `crate::ai_backend_supervisor`.
   The `user_config.json` writers for the AI runtime selector, the unified ONNX selection and the
   typesetting-language / hanging-punctuation keys are DECLARED in `ms-config` (next to
-  `save_advanced_form_search_params`), together with their round-trip tests. They had to move down:
+  `save_advanced_form_search_params`), together with their round-trip tests. They sit in `ms-config` because
   four of them are driven from `ms-settings-ui`'s AI-backend and General panes, which are shared
   with the launcher's settings page and may not depend on this tab. This module re-exports only
-  `save_hanging_punctuation`, the one its own typesetting pane still calls. What they write:
+  `save_hanging_punctuation`, the one its own typesetting pane calls. What they write:
   `save_ai_runtime` (writes `General.ai_runtime` and sets
   `General.ai_runtime_configured=true`, marking the runtime as an explicit user choice so the native
-  default no longer applies),
+  default does not apply),
   `save_onnx_provider_device` (writes `General.ai_onnx_provider`/`ai_onnx_device_id` + the
   `*_configured` flags, the SAME keys the backend uses, so one selection drives both runtimes),
   `save_onnx_build` (writes `General.ai_onnx_build`, the native-only build slug picking the onnxruntime
   binary; wired to the "Билд" selector),
-  `save_max_loaded_models` (writes `General.ai_max_loaded_models` as an integer), and
-  and, in `ms-config`'s `ort_load_guard`,
+  `save_max_loaded_models` (writes `General.ai_max_loaded_models` as an integer), and, in `ms-config`'s `ort_load_guard`,
   `mark_ort_load_attempted` / `mark_ort_load_succeeded` / `reset_ort_load_guard` (mutate
   `General.ort_load_state[scope]`, where `scope` is `provider[:device]@version`). The three guard writers fsync the file after writing so the
   aborted-attempt marker survives an uncatchable SIGILL during onnxruntime load (and the marker write
@@ -101,8 +103,8 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `cache_pages` it is a cross-project USER preference: written to both the user and project canvas
   files by `crates/ms-canvas/src/settings.rs`, but loaded user-file-primary with a project fallback in
   `crates/ms-project/src/lib.rs::canvas_settings_from_config`.
-  In a single-image session (`SettingsTabState::set_single_image_session`, set by `MangaApp`) it
-  hides the comic-type preset and the project word list: their "project" is the throwaway scratch
+  Without `SessionCapabilities::project_settings` (a single-image session;
+  `SettingsTabState::set_session_capabilities`, pushed once by `StudioApp::new`) it hides the comic-type preset and the project word list: their "project" is the throwaway scratch
   chapter, and the spellcheck menu loses its project-dictionary target.
 - `typesetting/`: "Тайп" pane SUBMODULE (see its own `MODULE_README.md`). `mod.rs` is the
   orchestrator; `font_settings.rs` + `font_properties_window.rs` are the settings-local
@@ -156,13 +158,13 @@ panel hosts the "ONNX-инференс" runtime selector, the OFFLINE-capable RU
 selection (Native build/EP/device combos vs Backend unified provider/device combos), and the shared
 model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_build` /
 `save_onnx_provider_device` / `save_max_loaded_models`) and the ORT load-guard writers live in
-`mod.rs`.
+`ms-config` (see above).
 
 ## In-app deep links (`navigate_to`)
 - `SettingsTabState::navigate_to(SettingsDeepLink)` is the crate-public entry point for in-app
   deep links (e.g. the typing panel's font-group "?" help icon). It selects the target section
-  (`active_pane`) and stashes a `pending_reveal`; it does NOT switch the app tab (the caller in
-  `app.rs` flips `active_tab` to `Settings`). The target section's draw force-opens its collapsed
+  (`active_pane`) and stashes a `pending_reveal`; it does NOT switch the app tab (the caller,
+  `StudioApp::apply_app_request` in `src/studio.rs`, flips `active_tab` to `Settings`). The target section's draw force-opens its collapsed
   blocks and issues the scroll while the reveal is pending, consuming the flag on the first frame
   the target block actually renders (async content may need a few frames; a bounded
   `pending_reveal_expires` wait prevents a stuck force-open) and arming a ~2 s highlight
@@ -200,10 +202,10 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   `#[macro_use] extern crate ms_i18n;` in `lib.rs`); the Russian source lives in
   `crates/ms-i18n/locales/{ru,en}.json`. Enum wire tokens (`AsideBubbleCompactMode::as_str`, …),
   serde field names, and `user_config.json` keys stay byte-identical English/serde and must NOT be
-  routed through `t!` (see `docs/i18n_exclusions.md`). Any `WheelComboBox::from_label` /
+  routed through `t!` (see `dev-docs/i18n_exclusions.md`). Any `WheelComboBox::from_label` /
   `egui::CollapsingHeader::new` / `ui.collapsing` whose label is localized MUST carry a stable
   `.id_salt(...)` (or be built as `CollapsingHeader::new(...).id_salt(...).show(...)`) so the widget
-  id does not follow the translated text (`docs/i18n_exclusions.md` §C).
+  id does not follow the translated text (`dev-docs/i18n_exclusions.md` §C).
 
 ## Editing map
 - To add or rename a settings section, edit the registry `crate::settings_shared`
@@ -213,14 +215,14 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
 - To change shared canvas/ribbon settings, edit `canvas_ribbon.rs` and the save/apply helpers in
   `mod.rs`. `SharedCanvasSettings` has NO serde derives, so ADDING a field means threading it by
   hand through: `crates/ms-models/src/bubbles_model.rs` (struct + `Default`), `crates/ms-project/src/lib.rs::CanvasSettings`
-  (struct + `Default`) and its loader `canvas_settings_from_config`, the two bridges in `app.rs`,
+  (struct + `Default`) and its loader `canvas_settings_from_config`, the `canvas_snapshot` bridges in `src/studio.rs`,
   the two writers in `crates/ms-canvas/src/settings.rs`
   (`save_canvas_settings_to_project_file` / `save_canvas_settings_to_user_file`),
   `CanvasView::apply_canvas_snapshot` / `canvas_snapshot` plus the `CanvasState` field in
   `crates/ms-canvas/src/types.rs`, and finally the widget here. The struct literals carry no
   `..Default::default()`, so the compiler flags every construction site.
 - To change AI backend process controls, process logs, autostart, or device/probe commands, edit the
-  shared `ms_settings_ui::ai_backend_panel` widget and the `save_*` worker functions in `mod.rs`; the studio
+  shared `ms_settings_ui::ai_backend_panel` widget and the `save_*` writers in `ms-config`; the studio
   renders it inline in `mod.rs::draw` (scroll area + `shared.draw(AiBackend, ..)`).
 - To change the projects directory, the memory profile, or the UI-interface language, edit the shared
   `crate::general_settings_panel` widget (used by both the studio pane and the launcher); the studio

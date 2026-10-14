@@ -50,8 +50,10 @@ Key items:
   draws no badge and keeps the layout unchanged.
 - `draw_autosave_settings`: the global autosave policy (interval minutes + action
   threshold); applied live to `ms_config::autosave_policy` first, then persisted.
-- `apply_ui_scale` / `apply_ui_scale_to_context`: apply `General.ui_scale_percent`
-  to an egui context (the main window's creator calls the latter once).
+- `apply_ui_scale` / `apply_ui_scale_to_context` / `ui_scale_percent` /
+  `seed_ui_scale_from_user_settings`: re-exports of the process-global interface-scale slot
+  owned by `ms_widgets::ui_scale` (every product window's creator calls
+  `apply_ui_scale_to_context` once).
 - `draw_text_language_setting`: the shared typesetting-language selector (script group +
   language combos), also called by the studio "Тайп" pane; takes a per-call-site
   `id_salt` prefix so the two rendered instances keep distinct egui ids.
@@ -78,7 +80,6 @@ use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
 use crate::storage_mode_setting::{StorageModeSettingState, draw_storage_mode_setting};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Status line shown under the projects-directory editor.
 ///
@@ -839,55 +840,11 @@ fn persist_autosave_key(state: &mut GeneralSettingsPanelState, key: &str, value:
 /// Slider/wheel step of the interface-scale control, in percent.
 const UI_SCALE_STEP_PERCENT: u16 = 5;
 
-/// Process-global interface scale, in percent. The single source of truth while the
-/// process runs, mirroring how the UI language lives in the `ms-i18n` runtime rather
-/// than in a settings snapshot.
-///
-/// It must NOT be re-derived from the startup `user_settings` snapshot per window:
-/// `run_main` reads that snapshot ONCE and reuses it for every launcher/studio window
-/// of the session, so a scale changed in one surface would be invisible to the next
-/// window opened after it.
-static UI_SCALE_PERCENT: AtomicU32 = AtomicU32::new(ms_config::UI_SCALE_PERCENT_DEFAULT);
-
-/// Seeds the process-global interface scale from the startup user settings.
-///
-/// Called ONCE during startup, before any window is created (next to the other
-/// `seed_*_from_config` calls in `run_main`). Out-of-range stored values are clamped
-/// by [`ms_config::ui_scale_percent_from_user_settings`].
-pub fn seed_ui_scale_from_user_settings(user_settings: &serde_json::Value) {
-    UI_SCALE_PERCENT.store(
-        ms_config::ui_scale_percent_from_user_settings(user_settings),
-        Ordering::Relaxed,
-    );
-}
-
-/// The current process-global interface scale, in percent.
-#[must_use]
-pub fn ui_scale_percent() -> u32 {
-    UI_SCALE_PERCENT.load(Ordering::Relaxed)
-}
-
-/// Applies an interface scale (in percent) to `ctx` via `Context::set_zoom_factor` and
-/// records it as the new process-global value.
-///
-/// Out-of-range input is clamped by [`ms_config::ui_scale_factor_from_percent`].
-/// The zoom change becomes active at the start of the next pass (egui defers it to
-/// avoid jitter) and egui requests the repaint itself. Only the passed context is
-/// rescaled — other open windows own separate `Context`s and pick the value up when
-/// they are (re)created.
-pub fn apply_ui_scale(ctx: &egui::Context, percent: u32) {
-    UI_SCALE_PERCENT.store(percent, Ordering::Relaxed);
-    ctx.set_zoom_factor(ms_config::ui_scale_factor_from_percent(percent));
-}
-
-/// Applies the process-global interface scale to a freshly created egui context.
-///
-/// Every `eframe::run_native` constructor closure that should honor the global
-/// interface scale calls this ONCE, next to `ui_fonts::install*`. A surface that does
-/// not call it simply renders at native size.
-pub fn apply_ui_scale_to_context(ctx: &egui::Context) {
-    ctx.set_zoom_factor(ms_config::ui_scale_factor_from_percent(ui_scale_percent()));
-}
+// The process-global interface scale lives in `ms_widgets::ui_scale` (below this crate, so the
+// installer and prompt windows can apply it too). Re-exported here so the binary's callers
+// (`crate::general_settings_panel::…` in the shell and the startup seed) keep their paths; this
+// pane's slider writes the live value through `apply_ui_scale`.
+pub use ms_widgets::ui_scale::{apply_ui_scale, apply_ui_scale_to_context, seed_ui_scale_from_user_settings, ui_scale_percent};
 
 /// Persists the chosen typesetting language to `TextTab.text_language` on a
 /// background thread (the GUI thread must never do disk I/O; see CLAUDE.md §5).
@@ -1338,20 +1295,6 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(normalize_projects_dir_value("  /tmp/my_projects  "), expected);
-    }
-
-    #[test]
-    fn ui_scale_seed_sets_process_global_and_clamps() {
-        seed_ui_scale_from_user_settings(&serde_json::json!({"General": {"ui_scale_percent": 90}}));
-        assert_eq!(ui_scale_percent(), 90);
-        // A hand-edited absurd value is clamped, never stored as-is.
-        seed_ui_scale_from_user_settings(
-            &serde_json::json!({"General": {"ui_scale_percent": 10_000}}),
-        );
-        assert_eq!(ui_scale_percent(), ms_config::UI_SCALE_PERCENT_MAX);
-        // Restore the default so the shared global does not leak into other tests.
-        seed_ui_scale_from_user_settings(&serde_json::json!({}));
-        assert_eq!(ui_scale_percent(), ms_config::UI_SCALE_PERCENT_DEFAULT);
     }
 
     #[test]

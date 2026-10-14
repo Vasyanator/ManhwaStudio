@@ -57,7 +57,7 @@ works because both backends offer the same shape:
   Verify anything about the `wasm32` re-exports with `grep`, not with a reference query.
 
 ## Relationships
-- **Consumers:** the binary crate (76 files under `src/`, including `app.rs`,
+- **Consumers:** the binary crate (76 files under `src/`, including `studio.rs`,
   `config_saver.rs`, `ai_backend_supervisor.rs`, the launcher workers and the typing panel)
   and one workspace crate, `ms-log`, whose `runtime_log` and `trace` writer threads are
   started with `ms_thread::Builder`.

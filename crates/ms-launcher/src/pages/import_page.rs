@@ -772,7 +772,6 @@ fn import_archive_into_projects(
         project_dir: chapter_dir,
         title: title.to_string(),
         chapter: chapter.to_string(),
-        resume_unsaved: false,
     }))
 }
 

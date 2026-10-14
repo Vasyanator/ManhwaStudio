@@ -54,7 +54,7 @@ Main responsibilities:
   windres forwards it to the preprocessor unquoted, which otherwise fails the build
   with `cc1.exe: fatal error: Files\ManhwaStudio`.
 - On Windows, starts a detached post-build `osslsigncode` worker that waits for
-  known bin `.exe` files and signs them with a PKCS#12 certificate, unless
+  the package binary's `.exe` (`signed_bin_names`) and signs it with a PKCS#12 certificate, unless
   `MS_DISABLE_BUILD_CODESIGN=1` disables the background signer.
 - Codesign credentials (key path + password) are NEVER hardcoded. They are read
   from `.secret/build_config.json` (git/hg-ignored). When that file is missing or
@@ -64,7 +64,6 @@ Main responsibilities:
 - On non-Windows targets, performs no-op to keep builds fast and portable.
 */
 
-use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -511,7 +510,7 @@ fn spawn_windows_signer() {
     let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_owned());
     let base_out_dir = target_dir.join(target_triple).join(profile);
 
-    let exe_paths: Vec<PathBuf> = discover_bin_names()
+    let exe_paths: Vec<PathBuf> = signed_bin_names()
         .into_iter()
         .map(|name| base_out_dir.join(format!("{name}.exe")))
         .collect();
@@ -567,30 +566,15 @@ fn resolve_target_dir() -> PathBuf {
     }
 }
 
-fn discover_bin_names() -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    let package_name = env::var("CARGO_PKG_NAME").unwrap_or_default();
-    if !package_name.is_empty() {
-        names.insert(package_name);
+/// Names of the executables the codesign worker waits for: the package's single binary
+/// target (`src/main.rs`, named after the package). The diagnostic programs are examples
+/// of the library crates they exercise, so they are never built here and never signed.
+/// Empty only when cargo did not set `CARGO_PKG_NAME` (the caller then skips signing).
+fn signed_bin_names() -> Vec<String> {
+    match env::var("CARGO_PKG_NAME") {
+        Ok(package_name) if !package_name.is_empty() => vec![package_name],
+        _ => Vec::new(),
     }
-
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let bin_dir = manifest_dir.join("src").join("bin");
-    if let Ok(entries) = fs::read_dir(bin_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
-                names.insert(stem.to_owned());
-            }
-        }
-    }
-
-    names
 }
 
 fn shell_quote(path: &Path) -> String {

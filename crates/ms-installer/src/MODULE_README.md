@@ -50,6 +50,12 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - `update.rs`: update window shell, background release re-check, test-version override,
   executable-update progress, PyTorch choice continuation, completion state, and no-update exit.
 - `utils.rs`: worker pipeline and platform helpers used by installer and updater UI.
+- `prompt_window.rs`: the missing-environment startup prompt (install / update a custom install
+  folder / open the launcher), returning `MissingPythonEnvAction`; the binary's
+  `src/startup/prompts.rs` runs it and maps a failed window to `LaunchLauncher`. It uses
+  `ms_window_geometry` for the shared window icon and the Android Activity handle.
+- `window.rs`: `prepare_window_context(ctx, WindowLook)`, the one window-context preparation
+  every window of this crate calls first in its creator closure.
 - `venv_check.rs`: the non-interactive, GUI-free readiness check behind `--check-venv`. It
   lives here rather than in `ms-sysprobe` because it reads `utils.rs`' own package
   requirements and shares `installed_torch_is_current` / `missing_specs_for_readiness` with
@@ -57,6 +63,15 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   the two circular.
 
 ## Contracts and invariants
+- Every `eframe::run_native` creator of this crate prepares its context ONLY through
+  `window::prepare_window_context`: bundled UI fonts at `ui_fonts::Tier::Core` always, the studio
+  theme for `WindowLook::StudioTheme` (update window, missing-environment prompt) and egui's stock
+  visuals for `WindowLook::EguiDefault` (the three `install.rs` windows), then the process-global UI
+  scale (`ms_widgets::ui_scale::apply_ui_scale_to_context`). The scale is whatever the slot holds
+  when the window is created: the startup seed (`init_full`) runs before the update windows,
+  the startup prompts and the `--check-venv` repair window; a launcher-requested update window
+  sees the live value. The Windows `--uninstall` service window runs before that seed and
+  therefore renders at the default 100 %.
 - GUI windows must only poll channels and draw UI; downloads, filesystem work, command execution,
   and probes must run on background threads.
 - Python discovery and command paths must go through `ms_sysprobe::python_manager`.
@@ -116,8 +131,11 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   target executable with `--version`, compare against GitHub releases, replace that executable, and
   launch the target copy with `--continue-update`. `--version` prints the EXTENDED version
   (`MS_APP_VERSION`, possibly `3.6.0+1cd9638-83-dirty`), so `run_update_binary_stage_inner` reduces
-  both sides with `version_format::version_core` before `compare_version_strings`; the release
-  comparators themselves are always fed the plain `CARGO_PKG_VERSION`. The extended string may be
+  both sides with `version_format::version_core` before `version_format::compare_release_versions`
+  (the ONE release comparator, also used by the update window and the binary's startup check;
+  never add a local copy); the release checks themselves are always fed the plain
+  `CARGO_PKG_VERSION`. The releases API URL and archive asset name are the `pub const`s in
+  `update.rs` (`APP_RELEASES_API`, `APP_ZIP_ASSET_NAME`). The extended string may be
   displayed (`UpdateApp::local_version_display`) but never compared.
 - Update flow is two-stage: first replace the platform executable from the latest GitHub release,
   then resume with `--continue-update` to repair/create uv-managed `installer_files/venv`, refresh

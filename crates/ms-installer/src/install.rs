@@ -17,6 +17,9 @@ Main responsibilities:
   (one `ms_docstore::update` of the install target's document);
 - expose startup service entry points used by `lib.rs`.
 
+Every window's creator closure prepares its context through `window::prepare_window_context`
+(`WindowLook::EguiDefault`: these windows never applied the studio theme).
+
 Notes:
 Non-UI installer work lives in `utils.rs` so the same worker helpers can be reused by future
 update flows.
@@ -44,6 +47,8 @@ use ms_sysprobe::gpu_utils::RuntimeVersion;
 #[cfg(target_os = "windows")]
 use ms_sysprobe::python_manager;
 use eframe::egui;
+// Theme + UI fonts of every window this file opens (all three keep egui's stock visuals).
+use crate::window::{WindowLook, prepare_window_context};
 
 use super::utils::*;
 #[cfg(target_os = "windows")]
@@ -270,7 +275,7 @@ fn run_installer_window(
         window_title,
         native_options,
         Box::new(move |cc| {
-            ms_widgets::ui_fonts::install(&cc.egui_ctx, ms_widgets::ui_fonts::Tier::Core);
+            prepare_window_context(&cc.egui_ctx, WindowLook::EguiDefault);
             Ok(Box::new(InstallerApp::new(
                 root_dir.clone(),
                 Arc::clone(&shared_result_for_app),
@@ -326,7 +331,7 @@ fn run_existing_windows_install_window(
         "ManhwaStudio",
         native_options,
         Box::new(move |cc| {
-            ms_widgets::ui_fonts::install(&cc.egui_ctx, ms_widgets::ui_fonts::Tier::Core);
+            prepare_window_context(&cc.egui_ctx, WindowLook::EguiDefault);
             Ok(Box::new(ExistingInstallApp::new(
                 existing_install.clone(),
                 result_sink_for_app,
@@ -2037,7 +2042,7 @@ pub(super) fn run_windows_uninstall_window(
         t!("installer.install.uninstall_window_title"),
         native_options,
         Box::new(move |cc| {
-            ms_widgets::ui_fonts::install(&cc.egui_ctx, ms_widgets::ui_fonts::Tier::Core);
+            prepare_window_context(&cc.egui_ctx, WindowLook::EguiDefault);
             Ok(Box::new(UninstallApp::new(rx, result_sink_for_app)))
         }),
     )

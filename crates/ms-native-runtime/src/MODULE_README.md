@@ -122,7 +122,7 @@ outlives the provider it was built for.
   `reset_load_latch` enables a SAME-build retry only. A different build needs a restart.
 - Blocking work only. Nothing here may be called from the GUI thread; the callers own the
   worker.
-- This crate must never name `tabs`, `app` or `launcher`.
+- This crate must never name `tabs`, `studio` or `launcher`.
 
 ## Editing map
 - To change provider/device resolution or the fallback ladder, see `native_fallback_reason`

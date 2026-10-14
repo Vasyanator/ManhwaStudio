@@ -26,3 +26,21 @@ hyphenation.workspace = true
 image.workspace = true
 rayon.workspace = true
 serde_json.workspace = true
+
+# Dependencies of the diagnostic programs in `examples/` only (see
+# `examples/MODULE_README.md`); the library itself stays GUI-free.
+[dev-dependencies]
+# The egui preview windows of `text_render_test` and `test_text_shape`.
+eframe.workspace = true
+# `text_render_test`: dark theme of its window and the non-blocking PNG save dialog.
+ms-theme = { path = "../ms-theme" }
+ms-platform = { path = "../ms-platform" }
+# `text_render_test`: aggregated error of its `main`.
+anyhow.workspace = true
+
+# The golden-image harness carries self-check `#[test]`s (`rgba_diff`); examples are not
+# test targets by default, so `cargo test -p ms-text-render` runs them only with this.
+[[example]]
+name = "render_gallery"
+path = "examples/render_gallery/main.rs"
+test = true

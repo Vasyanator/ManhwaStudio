@@ -104,7 +104,7 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
 - Hook-time reads (`layer_id_at`, popup memory) use egui memory of `Memory::viewport_id`, which
   is ROOT between root passes only while the app has no deferred viewports (it shows immediate
   ones only).
-- `owner` ids are content-named (stable across `MangaApp` rebuilds in one `egui::Context`).
+- `owner` ids are content-named (stable across `StudioApp` rebuilds in one `egui::Context`).
 - On/off is live, never by recreating the router: `TouchRouter::set_enabled` records a request
   that `route` applies at a frame start. On applies at once from a fresh state; off waits until
   no claim and no stripped promoted press is left, so every release whose press was stripped is

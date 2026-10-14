@@ -10,8 +10,8 @@ edition = "2024"
 # `crate::tabs::typing::...` call site keeps its path.
 #
 # Layer: the TOP of the library stack — above the canvas, the models, the widgets and
-# every leaf crate, and below only the binary's `app.rs`, which calls
-# `TypingTabState::draw`. It must never name `app`, `launcher` or another tab; the
+# every leaf crate, and below only the binary's `studio.rs`, which calls
+# `TypingTabState::draw`. It must never name `studio`, `launcher` or another tab; the
 # settings tab reaches its font model through the `font_admin` facade only, and its
 # settings deep links go through `ms_config::settings_deep_link`.
 [features]

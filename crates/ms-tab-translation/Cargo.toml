@@ -13,10 +13,10 @@ edition = "2024"
 #
 # Layer: near the TOP of the library stack — above the canvas, the models, the widgets,
 # the tooling primitives and `ms-tabs-simple` (it reads character and term note entries
-# for the MT glossary), and below `app.rs`, `ai_backend_panel.rs`,
+# for the MT glossary), and below `studio.rs`, `ai_backend_panel.rs`,
 # `ai_backend_supervisor.rs`, the launcher's reline flow and the `cleaning` tab, which all
 # reach into `backend_health` / `text_detector` / `machine_translation`. It must never
-# name `app`, `launcher` or a tab above it.
+# name `studio`, `launcher` or a tab above it.
 
 [dependencies]
 # Framed IPC with the Python AI backend: every OCR, detector and health request goes

@@ -124,7 +124,7 @@ pub enum CleanTreeScope {
 }
 
 /// The scope the overlay loader resolves a page's clean in. Every consumer that must agree with
-/// what the canvas shows (the loader in `src/app.rs`, the Cleaning tab's status messages, the
+/// what the canvas shows (the loader in `src/studio.rs`, the Cleaning tab's status messages, the
 /// typing export's disk fallback) names this constant instead of restating the variant.
 pub const LOADER_CLEAN_SCOPE: CleanTreeScope = CleanTreeScope::StagedOverCommitted;
 

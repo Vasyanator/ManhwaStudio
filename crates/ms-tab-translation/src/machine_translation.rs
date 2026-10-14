@@ -93,6 +93,7 @@ use ms_ai_api::client::{block_on, build_client};
 use ms_ai_api::keys::read_api_key;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_ai_api::model_id::model_iden;
+use ms_models::SessionCapabilities;
 use ms_project::{Bubble, ProjectData};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_log::runtime_log;
@@ -420,6 +421,9 @@ pub struct AiMtOptions {
     pub image_context_source: AiMtContextSource,
     /// Ask the provider for structured output (a JSON schema of the answer); off by default.
     pub strict_json: bool,
+    /// What the open session offers; `title_documents` decides whether the project-context
+    /// documents (notes, characters, terms) are read at all (`project_context_sources`).
+    pub session_caps: SessionCapabilities,
     pub project: ProjectData,
 }
 
@@ -1928,16 +1932,17 @@ struct ProjectContextSources {
 }
 
 /// Decides which project-context documents a run reads from the panel toggles. The notes
-/// template replaces the two separate blocks. A single-image session has no title, so it reads
+/// template replaces the two separate blocks. Without title documents
+/// (`SessionCapabilities::title_documents` false: a single-image session has no title) it reads
 /// none of them whatever the persisted toggles say (the panel hides them there): the documents
 /// would be looked up inside the throwaway scratch directory.
 fn project_context_sources(
     use_notes_prompt: bool,
     include_characters: bool,
     include_terms: bool,
-    single_image: bool,
+    title_documents: bool,
 ) -> ProjectContextSources {
-    if single_image {
+    if !title_documents {
         return ProjectContextSources { notes: false, characters: false, terms: false };
     }
     ProjectContextSources {
@@ -1954,7 +1959,7 @@ fn push_project_context_parts(parts: &mut Vec<String>, options: &AiMtOptions) {
         options.use_notes_prompt,
         options.include_characters,
         options.include_terms,
-        options.project.is_single_image(),
+        options.session_caps.title_documents,
     );
     if sources.notes
         && let Some(notes) = build_notes_prompt(&options.project, true, true)
@@ -2643,6 +2648,7 @@ mod tests {
         prepare_mt_image_for_detail,
         sort_ai_mt_items, split_ai_mt_batches, ProjectContextSources, project_context_sources,
     };
+    use ms_models::SessionCapabilities;
     use ms_project::{CanvasSettings, ProjectData, ProjectPaths};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -2653,19 +2659,19 @@ mod tests {
     fn project_context_sources_follow_the_toggles_and_skip_single_image_sessions() {
         let none = ProjectContextSources { notes: false, characters: false, terms: false };
         assert_eq!(
-            project_context_sources(true, true, true, false),
+            project_context_sources(true, true, true, true),
             ProjectContextSources { notes: true, characters: false, terms: false }
         );
         assert_eq!(
-            project_context_sources(false, true, false, false),
+            project_context_sources(false, true, false, true),
             ProjectContextSources { notes: false, characters: true, terms: false }
         );
         assert_eq!(
-            project_context_sources(false, false, true, false),
+            project_context_sources(false, false, true, true),
             ProjectContextSources { notes: false, characters: false, terms: true }
         );
         for (notes, characters, terms) in [(true, true, true), (false, true, true), (false, false, false)] {
-            assert_eq!(project_context_sources(notes, characters, terms, true), none);
+            assert_eq!(project_context_sources(notes, characters, terms, false), none);
         }
     }
 
@@ -2730,6 +2736,7 @@ mod tests {
             image_mode: AiMtImageMode::Normal,
             image_context_source: AiMtContextSource::Translation,
             strict_json: false,
+            session_caps: SessionCapabilities::PROJECT,
             project: empty_project(),
         }
     }

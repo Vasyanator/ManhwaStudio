@@ -90,7 +90,24 @@ impl TypingCreatePanelState {
     /// already-supported state: the combo shows nothing, the status line says the list is
     /// loading, and `poll_font_reload_results` performs the initial selection when the
     /// list lands.
+    ///
+    /// Reads the formula presets and — for the create panel (`preview_enabled`) — the
+    /// parameter identity mode from `user_config.TextTab` on the calling thread; the edit panel
+    /// never offers the switch and stays on the default `Font` mode. [`Self::with_config`]
+    /// takes those values pre-read.
     pub(super) fn new(preview_enabled: bool) -> Self {
+        let identity_mode = if preview_enabled {
+            load_text_tab_param_identity_mode()
+        } else {
+            ParamIdentityMode::Font
+        };
+        Self::with_config(preview_enabled, load_text_tab_formula_presets(), identity_mode)
+    }
+
+    /// [`Self::new`] over pre-read `user_config.TextTab` values: `formula_presets_by_name` (the
+    /// stored formula presets merged over the built-ins, `load_text_tab_formula_presets`) and
+    /// `identity_mode`. Reads no config document; spawns the panel's workers.
+    pub(super) fn with_config(preview_enabled: bool, formula_presets_by_name: HashMap<String, TypingFormulaPreset>, identity_mode: ParamIdentityMode) -> Self {
         let fonts_dir = panel_fonts_dir();
         // Snapshot the runtime-global imported system-font paths (seeded at startup from
         // config), so the background load merges exactly what the store knows now.
@@ -114,16 +131,6 @@ impl TypingCreatePanelState {
         if preview_enabled {
             super::create_presets::spawn_presets_seed(&fonts_dir, &preset_store_tx);
         }
-        let formula_presets_by_name = load_text_tab_formula_presets();
-        // The parameter-identity mode is a per-panel preference of the CREATE panel and is
-        // read from `user_config.TextTab` (a small document the constructor already reads
-        // for the formula presets and the effect defaults). The edit panel never offers the
-        // switch, so it stays on the default `Font` mode without touching the config at all.
-        let identity_mode = if preview_enabled {
-            load_text_tab_param_identity_mode()
-        } else {
-            ParamIdentityMode::Font
-        };
         let (request_tx, result_rx) = spawn_preview_render_worker();
         // The list is not loaded yet, so the honest status is "loading", not "no fonts".
         let status_line = t!("typing.fonts.reloading_status").to_string();

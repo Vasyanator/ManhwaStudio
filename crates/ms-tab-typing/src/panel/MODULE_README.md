@@ -690,13 +690,13 @@ newer on-disk schema, an unserializable snapshot), and not past
 `LOCAL_PRESETS_SAVE_MAX_RETRIES` consecutive attempts; both guards would otherwise spin a
 write-and-log loop every debounce window for the rest of the session. Neither guard loses
 data: the set stays dirty, so the next edit still writes it — and so does
-`flush_pending_local_presets_save`, the app-exit flush `MangaApp::on_exit` calls next to
+`flush_pending_local_presets_save`, the app-exit flush `StudioApp::on_exit` calls next to
 `font_admin::flush_pending_saves` (facade → `TypingTabState` → panel), which is what keeps an
 edit made inside the debounce window from dying with the detached writer thread.
 
 THE EXIT FLUSH WRITES SYNCHRONOUSLY ON THE GUI THREAD, AND THAT IS A DELIBERATE TRADE-OFF, not
 an oversight of the "never block the GUI thread" rule (CLAUDE.md §5). It is the same shape the
-PRE-EXISTING `font_admin::flush_pending_saves` has used at `src/app.rs:3421` for `fonts_data.json`,
+PRE-EXISTING `font_admin::flush_pending_saves` uses in `src/studio/shutdown.rs` for `fonts_data.json`,
 and it is bounded in the only sense that matters: no GUI frame follows `on_exit` and no thread
 outlives it, so there is nothing left to keep responsive, and the work is ONE atomic write of
 the same small document the debounced writer would have written. A deadline (write on a thread,
@@ -1245,7 +1245,7 @@ session long before this call.
 - Drain chain (mirrors the font-group request): `create_state::take_settings_link_request` →
   `facade::draw` drains BOTH sub-panels into `TypingTopPanelState::pending_settings_link` →
   `facade::take_settings_link` → crate-public `TypingTabState::take_settings_navigation_request`.
-  `app.rs` polls it right after `typing.draw`, calls `SettingsTabState::navigate_to(link)`, and
+  `studio.rs` polls it right after `typing.draw`, calls `SettingsTabState::navigate_to(link)`, and
   switches `active_tab` to `Settings`. The link is a pure payload; the typing side never touches
   settings state directly.
 

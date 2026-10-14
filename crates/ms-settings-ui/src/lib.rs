@@ -60,8 +60,8 @@ pub mod storage_mode_setting;
 // crate's own `tutorial` feature forwards to this one — they must never be enabled
 // separately, or the tours silently disappear from one half of the app.
 //
-// The engine file itself is ALSO mounted by the `tutorial_test` demo bin through
-// `#[path]`, which is why it must stay dependency-light (egui + std only) and why it
-// keeps compiling for that bin regardless of this feature.
+// The engine stays dependency-light (egui + std only); its demo is the `tutorial_test`
+// example (`examples/tutorial_test/`), which imports `tutorial::engine` and therefore
+// declares `required-features = ["tutorial"]`.
 #[cfg(feature = "tutorial")]
 pub mod tutorial;

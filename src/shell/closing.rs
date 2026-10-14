@@ -3,10 +3,10 @@ File: src/shell/closing.rs
 
 Purpose:
 The Closing screen of the main window: the studio's blocking teardown runs on a worker while
-the window stays responsive. The whole `Box<MangaApp>` moves onto the worker (dropping it joins
+the window stays responsive. The whole `Box<StudioApp>` moves onto the worker (dropping it joins
 threads in many places, so draining it in a frame would block), which runs
-`MangaApp::shutdown_blocking`, drops the app, then releases the session's `StudioOpenRequest`
-(single-image scratch deletion) and reports last.
+`StudioApp::shutdown_blocking`, drops the app, then releases the `StudioSession`
+(image-set scratch deletion) and reports last.
 
 Key structures:
 - `StudioShutdownJob`: the worker (`spawn`, non-blocking `poll`, `finish_blocking` for the
@@ -21,9 +21,9 @@ behaviour before the Closing screen existed). The payload is handed over through
 `Mutex<Option<_>>` so it can be taken back when the thread never started.
 */
 
-use crate::app::{MangaApp, ShutdownReport};
+use crate::studio::{StudioApp, ShutdownReport};
 use crate::runtime_log;
-use crate::shell::studio::StudioOpenRequest;
+use crate::shell::studio::StudioSession;
 use ms_thread as thread;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -33,8 +33,8 @@ use std::time::Duration;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What the teardown worker handles: the running app (absent when the studio never ran) and the
-/// session's open request (absent when the open worker produced none).
-type Payload = (Option<Box<MangaApp>>, Option<StudioOpenRequest>);
+/// session (absent when the open worker produced none).
+type Payload = (Option<Box<StudioApp>>, Option<StudioSession>);
 
 /// How the studio teardown ended.
 #[derive(Debug)]
@@ -58,9 +58,9 @@ impl ShutdownOutcome {
 }
 
 /// The blocking studio teardown: `shutdown_blocking`, drop the app (joins its threads), then
-/// release the request (deletes a single-image scratch; after the app, so no writer still holds its
+/// release the session (deletes an image-set scratch; after the app, so no writer still holds its
 /// files). BLOCKING: the teardown worker, or the process-shutdown hook (`AppShell::on_exit`).
-pub(crate) fn teardown_blocking(app: Option<Box<MangaApp>>, request: Option<StudioOpenRequest>) -> ShutdownReport {
+pub(crate) fn teardown_blocking(app: Option<Box<StudioApp>>, session: Option<StudioSession>) -> ShutdownReport {
     let report = match app {
         Some(mut app) => {
             let report = app.shutdown_blocking();
@@ -69,8 +69,8 @@ pub(crate) fn teardown_blocking(app: Option<Box<MangaApp>>, request: Option<Stud
         }
         None => ShutdownReport::default(),
     };
-    if let Some(request) = request {
-        request.release();
+    if let Some(session) = session {
+        session.release();
     }
     report
 }
@@ -89,19 +89,19 @@ pub(crate) struct StudioShutdownJob {
 }
 
 impl StudioShutdownJob {
-    /// Moves `app` and `request` onto the teardown worker and returns immediately. When the
+    /// Moves `app` and `session` onto the teardown worker and returns immediately. When the
     /// thread cannot be spawned the failure is logged and the teardown runs inline (blocking the
     /// caller) instead of being skipped.
-    pub(crate) fn spawn(app: Option<Box<MangaApp>>, request: Option<StudioOpenRequest>) -> Self {
-        let payload: Arc<Mutex<Option<Payload>>> = Arc::new(Mutex::new(Some((app, request))));
+    pub(crate) fn spawn(app: Option<Box<StudioApp>>, session: Option<StudioSession>) -> Self {
+        let payload: Arc<Mutex<Option<Payload>>> = Arc::new(Mutex::new(Some((app, session))));
         let worker_payload = Arc::clone(&payload);
         let (tx, rx) = mpsc::channel();
         let spawn_result = thread::Builder::new().name("studio-shutdown".to_string()).spawn(move || {
             // The lock only guards the hand-over; a poisoned one still holds a whole `Option`.
             let taken = worker_payload.lock().unwrap_or_else(PoisonError::into_inner).take();
             if let Some(payload) = taken {
-                let (app, request) = payload;
-                let report = teardown_blocking(app, request);
+                let (app, session) = payload;
+                let report = teardown_blocking(app, session);
                 if tx.send(report).is_err() {
                     runtime_log::log_warn("[shell] the studio teardown finished after the main window was gone; report dropped");
                 }
@@ -112,7 +112,7 @@ impl StudioShutdownJob {
             Err(err) => {
                 runtime_log::log_error(format!("[shell] could not start the studio-shutdown thread: {err}; tearing the studio down on the GUI thread"));
                 let taken = payload.lock().unwrap_or_else(PoisonError::into_inner).take();
-                let report = taken.map(|(app, request)| teardown_blocking(app, request)).unwrap_or_default();
+                let report = taken.map(|(app, session)| teardown_blocking(app, session)).unwrap_or_default();
                 Self { state: JobState::Done(Some(ShutdownOutcome::Finished(report))) }
             }
         }
@@ -165,9 +165,9 @@ pub(crate) struct ClosingScreen {
 }
 
 impl ClosingScreen {
-    /// Starts the teardown of `app` / `request` (see [`StudioShutdownJob::spawn`]).
-    pub(crate) fn start(app: Option<Box<MangaApp>>, request: Option<StudioOpenRequest>) -> Self {
-        Self { job: StudioShutdownJob::spawn(app, request), failure: None }
+    /// Starts the teardown of `app` / `session` (see [`StudioShutdownJob::spawn`]).
+    pub(crate) fn start(app: Option<Box<StudioApp>>, session: Option<StudioSession>) -> Self {
+        Self { job: StudioShutdownJob::spawn(app, session), failure: None }
     }
 
     /// Polls the teardown. Returns `true` once it finished cleanly (the shell continues); a
@@ -245,7 +245,7 @@ fn page_numbers(pages: &[usize]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ShutdownOutcome, StudioShutdownJob, page_numbers};
-    use crate::app::ShutdownReport;
+    use crate::studio::ShutdownReport;
 
     #[test]
     fn only_a_report_without_failures_is_clean() {

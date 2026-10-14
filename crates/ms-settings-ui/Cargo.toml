@@ -92,3 +92,11 @@ ms-os-integration = { path = "../ms-os-integration" }
 [dev-dependencies]
 # Isolated user-config files for the persistence tests (tutorial progress).
 tempfile.workspace = true
+
+# The tutorial overlay demo (`examples/tutorial_test/`) imports the crate's own
+# `tutorial::engine`, which exists only with the `tutorial` feature:
+# `cargo run -p ms-settings-ui --example tutorial_test --features tutorial`.
+[[example]]
+name = "tutorial_test"
+path = "examples/tutorial_test/main.rs"
+required-features = ["tutorial"]

@@ -52,7 +52,7 @@ use ms_sysprobe::gpu_utils::{
     detect_nvidia_compute_capability, detect_nvidia_gpu, detect_rocm_runtime_version,
 };
 use ms_sysprobe::python_manager;
-use ms_config::version_format::version_core;
+use ms_config::version_format::{compare_release_versions, version_core};
 // The Windows records (registry entries, shortcuts, elevation) are owned by
 // `ms_os_integration`; this module only sequences them inside install / uninstall and turns
 // their typed errors into the installer's localized messages (`user_message()`).
@@ -86,10 +86,9 @@ use super::install::{
 };
 #[cfg(target_os = "windows")]
 use super::install::{UninstallEvent, run_windows_uninstall_window, send_uninstall_progress};
+use super::update::{APP_RELEASES_API, APP_ZIP_ASSET_NAME};
 
 const UV_RELEASE_API: &str = "https://api.github.com/repos/astral-sh/uv/releases/latest";
-const APP_RELEASES_API: &str = "https://api.github.com/repos/Vasyanator/ManhwaStudio/releases";
-const APP_ZIP_ASSET_NAME: &str = "ManhwaStudio.zip";
 // Per-platform × per-arch GitHub *release asset* names of the main executable,
 // as produced by `build-all.py`. These name the file uploaded to the release,
 // NOT the on-disk executable (see `platform_executable_file_name`).
@@ -412,7 +411,7 @@ pub(super) fn run_install_worker(
         tx,
         app_range.0,
         lerp(app_range.0, app_range.1, 0.50),
-        "ManhwaStudio.zip",
+        APP_ZIP_ASSET_NAME,
     )?;
 
     let app_extract_dir = downloads_dir.join("manhwastudio_extract");
@@ -953,7 +952,7 @@ fn run_update_binary_stage_inner(
     // both sides are reduced to their semver core before comparing: build metadata such as
     // `+1cd9638-83-dirty` carries no ordering meaning, and leaving it in would make a
     // development build compare as strictly newer than its own release tag forever.
-    if compare_version_strings(version_core(&remote_version), version_core(&local_version)).is_le() {
+    if compare_release_versions(version_core(&remote_version), version_core(&local_version)).is_le() {
         return Ok(UpdateBinaryStageOutcome::NoUpdate {
             local_version,
             remote_version,
@@ -1533,7 +1532,7 @@ fn download_and_extract_app_archive_for_update(
         &install_tx,
         overall_range.0,
         lerp(overall_range.0, overall_range.1, 0.45),
-        "ManhwaStudio.zip",
+        APP_ZIP_ASSET_NAME,
     )?;
 
     let staging_dir = root_dir.join("installer_files").join("update_extract");
@@ -1672,14 +1671,14 @@ pub fn installed_torch_version(installed: &HashMap<String, String>) -> Option<&s
 /// have nothing left to do.
 ///
 /// An absent torch is not current. A version string that does not parse as a version
-/// compares BELOW the requirement (see `compare_version_strings`), so an unreadable
+/// compares BELOW the requirement (see `compare_release_versions`), so an unreadable
 /// version is treated as "not current" — the safe direction, because it can only
 /// cause an extra repair offer, never a false "ready". Local wheel suffixes
 /// (`2.9.1+cu126`, `2.12.0+rocm7.2`) compare above the bare requirement, as intended.
 #[must_use]
 pub fn installed_torch_is_current(installed: &HashMap<String, String>) -> bool {
     installed_torch_version(installed)
-        .is_some_and(|version| compare_version_strings(version, REQUIRED_TORCH_VERSION).is_ge())
+        .is_some_and(|version| compare_release_versions(version, REQUIRED_TORCH_VERSION).is_ge())
 }
 
 /// Returns the full dependency spec list a working environment must provide for
@@ -1833,45 +1832,6 @@ fn dependency_package_name(dep: &str) -> Option<&str> {
 
 fn normalize_package_name(name: &str) -> String {
     name.trim().replace(['_', '.'], "-").to_ascii_lowercase()
-}
-
-fn compare_version_strings(left: &str, right: &str) -> std::cmp::Ordering {
-    let left_parts = parse_version_parts(left);
-    let right_parts = parse_version_parts(right);
-    for (left, right) in left_parts.iter().zip(right_parts.iter()) {
-        let ordering = match (left, right) {
-            (VersionPart::Number(left), VersionPart::Number(right)) => left.cmp(right),
-            (VersionPart::Text(left), VersionPart::Text(right)) => left.cmp(right),
-            (VersionPart::Number(_), VersionPart::Text(_)) => std::cmp::Ordering::Greater,
-            (VersionPart::Text(_), VersionPart::Number(_)) => std::cmp::Ordering::Less,
-        };
-        if !ordering.is_eq() {
-            return ordering;
-        }
-    }
-    left_parts.len().cmp(&right_parts.len())
-}
-
-fn parse_version_parts(version: &str) -> Vec<VersionPart> {
-    let normalized = version
-        .trim()
-        .strip_prefix('v')
-        .or_else(|| version.trim().strip_prefix('V'))
-        .unwrap_or_else(|| version.trim());
-    normalized
-        .split(['.', '-', '+', '_'])
-        .filter(|part| !part.is_empty())
-        .map(|part| match part.parse::<u64>() {
-            Ok(value) => VersionPart::Number(value),
-            Err(_) => VersionPart::Text(part.to_ascii_lowercase()),
-        })
-        .collect()
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum VersionPart {
-    Number(u64),
-    Text(String),
 }
 
 fn prepare_install_root_dir(root_dir: &Path) -> Result<(), String> {
@@ -2294,6 +2254,9 @@ pub(super) fn relaunch_self_elevated(_root_dir: &Path, _target_dir: &Path) -> Re
     Err(t!("installer.utils.elevation_unsupported_os_error").to_string())
 }
 
+/// Creates the all-users Start Menu shortcut of the copy in `install_dir`, relaunching this
+/// executable elevated (with `continue_create_start_menu_shortcut` set) when needed. Windows only:
+/// startup rejects the flags elsewhere. Errors are localized user texts.
 #[cfg(target_os = "windows")]
 pub fn run_windows_create_start_menu_shortcut_for_install(
     install_dir: &Path,
@@ -2312,15 +2275,6 @@ pub fn run_windows_create_start_menu_shortcut_for_install(
     }
 
     create_windows_start_menu_shortcut(install_dir).map(|_| ()).map_err(|e| e.user_message())
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-pub fn run_windows_create_start_menu_shortcut_for_install(
-    _install_dir: &Path,
-    _continue_create_start_menu_shortcut: bool,
-) -> Result<(), String> {
-    Err(t!("installer.utils.start_menu_unsupported_os_error").to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -2493,8 +2447,10 @@ fn register_windows_open_with_best_effort(
     }
 }
 
+/// Uninstalls the copy the running executable belongs to, relaunching elevated (with
+/// `continue_uninstall` set) when needed; the outcome is also written to `uninstall_signal_file`
+/// when given. Windows only: startup rejects the flags elsewhere. Errors are localized user texts.
 #[cfg(target_os = "windows")]
-#[allow(dead_code)]
 pub fn run_windows_uninstall_from_current_exe(
     continue_uninstall: bool,
     uninstall_signal_file: Option<&Path>,
@@ -2520,18 +2476,16 @@ pub fn run_windows_uninstall_from_current_exe(
 
     let result = run_windows_uninstall_window(current_exe, install_dir);
     if let Some(signal_file) = uninstall_signal_file {
-        let _ = write_uninstall_signal_file(signal_file, &result);
+        // The waiting reinstall flow learns the outcome only from this file; a failed write must
+        // at least be logged, the uninstall result itself is still returned below.
+        if let Err(err) = write_uninstall_signal_file(signal_file, &result) {
+            ms_log::runtime_log::log_error(format!(
+                "[installer] uninstall: could not write the signal file {}: {err}",
+                signal_file.display()
+            ));
+        }
     }
     result
-}
-
-#[cfg(not(target_os = "windows"))]
-#[allow(dead_code)]
-pub fn run_windows_uninstall_from_current_exe(
-    _continue_uninstall: bool,
-    _uninstall_signal_file: Option<&Path>,
-) -> Result<(), String> {
-    Err(t!("installer.utils.uninstall_unsupported_os_error").to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -4521,7 +4475,7 @@ mod tests {
         MACOS_BINARY_ASSET_NAME_AARCH64, MACOS_BINARY_ASSET_NAME_X86_64,
         WINDOWS_BINARY_ASSET_NAME_AARCH64, WINDOWS_BINARY_ASSET_NAME_X86_64,
         BASE_DEPENDENCIES, ONNXRUNTIME_DISTRIBUTIONS, REQUIRED_TORCH_VERSION, TORCH_DEPENDENCIES,
-        compare_version_strings, dependency_package_name, installed_torch_is_current,
+        dependency_package_name, installed_torch_is_current,
         installed_torch_version, is_retryable_http_status, missing_dependency_specs,
         missing_specs_for_readiness, normalize_package_name, parse_content_range_total,
         parse_executable_version_output, parse_pip_freeze_packages, platform_binary_asset_name,
@@ -4533,7 +4487,6 @@ mod tests {
         staged_replacement_file_name,
     };
     use ms_config::AiInstallType;
-    use std::cmp::Ordering;
     use std::collections::HashMap;
 
     /// Builds a `pip freeze` style snapshot from `name==version` pairs, normalizing
@@ -4847,13 +4800,6 @@ mod tests {
         );
         assert_eq!(dependency_package_name("torch==2.9.1"), Some("torch"));
         assert_eq!(normalize_package_name("deep_translator"), "deep-translator");
-    }
-
-    #[test]
-    fn compare_version_strings_handles_prefixed_numeric_versions() {
-        assert_eq!(compare_version_strings("2.9.1", "2.9.0"), Ordering::Greater);
-        assert_eq!(compare_version_strings("v2.9.1", "2.9.1"), Ordering::Equal);
-        assert_eq!(compare_version_strings("2.8.0", "2.9.1"), Ordering::Less);
     }
 
     #[test]

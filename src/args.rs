@@ -10,6 +10,9 @@ Main items:
   `Cli::image_args` returns whichever was given, in command-line order.
 - `conflicting_image_flags` / `check_image_arg`: the image start's flag-combination rule and its
   path pre-check (missing, directory, not a regular file), run before any window exists.
+- `conflicting_project_flags`: the same rule for `--project` (terminal modes only).
+- `windows_only_flags`: the Windows-only service flags given; `startup::mode::decide` makes them
+  a usage error off Windows.
 - `Cli.no_ai`: switches off the LOCAL AI runtimes (Python backend and native ONNX) for the
   process; cloud AI API and machine translation stay available
   (`ms_tab_translation::local_ai::LocalAiAvailability`).
@@ -79,7 +82,7 @@ pub struct Cli {
 
     /// `--no-ai`: no LOCAL AI runtimes in this process — the Python backend is never started
     /// and native ONNX is never loaded. Cloud AI API (OCR and MT) and the plain machine
-    /// translators are network code and keep working. Read once in `run_main` into
+    /// translators are network code and keep working. Read once in `startup::run_native` into
     /// `LocalAiAvailability::for_process`.
     #[arg(long, default_value_t = false)]
     pub no_ai: bool,
@@ -204,9 +207,26 @@ fn installed_copy_flags_present(cli: &Cli) -> [bool; INSTALLED_COPY_FLAGS.len()]
     ]
 }
 
-/// Startup modes that an image start cannot be combined with: each one is its own terminal flow
-/// (environment check, launcher test window) and would silently drop the image otherwise.
-const IMAGE_EXCLUSIVE_MODE_FLAGS: &[&str] = &["--check-venv", "--test-launcher"];
+/// Startup modes that an open target (an image set or `--project`) cannot be combined with: each
+/// one is its own terminal flow (environment check, launcher test window) and would silently drop
+/// the target otherwise.
+const OPEN_TARGET_EXCLUSIVE_MODE_FLAGS: &[&str] = &["--check-venv", "--test-launcher"];
+
+/// Presence of every [`OPEN_TARGET_EXCLUSIVE_MODE_FLAGS`] entry in `cli`, index-aligned with that
+/// table (the array length is the table length, so the two cannot drift apart).
+fn open_target_exclusive_modes_present(cli: &Cli) -> [bool; OPEN_TARGET_EXCLUSIVE_MODE_FLAGS.len()] {
+    [cli.check_venv, cli.test_launcher]
+}
+
+/// Service flags that act only on Windows (the Start Menu shortcut and the uninstall of an
+/// installed copy, with their elevated-continuation and signal-file companions).
+const WINDOWS_ONLY_FLAGS: &[&str] = &[
+    "--uninstall",
+    "--continue-uninstall",
+    "--uninstall-signal-file",
+    "--create-start-menu-shortcut-install-dir",
+    "--continue-create-start-menu-shortcut",
+];
 
 impl Cli {
     /// The image files to open as one set, in command-line order: the `--image` values, else
@@ -219,7 +239,7 @@ impl Cli {
 }
 
 /// Returns the flags present in `cli` that contradict an image start, in a stable order:
-/// first [`IMAGE_EXCLUSIVE_MODE_FLAGS`], then [`INSTALLED_COPY_FLAGS`]. Empty when no image is
+/// first [`OPEN_TARGET_EXCLUSIVE_MODE_FLAGS`], then [`INSTALLED_COPY_FLAGS`]. Empty when no image is
 /// given or the combination is valid. A non-empty result must abort startup before any
 /// service action runs, for the same reason as [`conflicting_installed_copy_flags`].
 #[must_use]
@@ -227,12 +247,49 @@ pub fn conflicting_image_flags(cli: &Cli) -> Vec<&'static str> {
     if cli.image_args().is_empty() {
         return Vec::new();
     }
-    let modes = [cli.check_venv, cli.test_launcher];
+    let modes = open_target_exclusive_modes_present(cli);
     let installed = installed_copy_flags_present(cli);
-    IMAGE_EXCLUSIVE_MODE_FLAGS
+    OPEN_TARGET_EXCLUSIVE_MODE_FLAGS
         .iter()
         .zip(modes)
         .chain(INSTALLED_COPY_FLAGS.iter().zip(installed))
+        .filter_map(|(flag, is_present)| is_present.then_some(*flag))
+        .collect()
+}
+
+/// Returns the terminal-mode flags present in `cli` that contradict `--project`
+/// ([`OPEN_TARGET_EXCLUSIVE_MODE_FLAGS`], in table order). Empty without `--project`. The sibling
+/// of [`conflicting_image_flags`] for a chapter start: `--check-venv` / `--test-launcher` never
+/// open the chapter, so accepting the combination would silently drop it. Installed-copy flags
+/// stay legitimate with `--project` (an update window runs first, then the chapter opens).
+#[must_use]
+pub fn conflicting_project_flags(cli: &Cli) -> Vec<&'static str> {
+    if cli.project.is_none() {
+        return Vec::new();
+    }
+    OPEN_TARGET_EXCLUSIVE_MODE_FLAGS
+        .iter()
+        .zip(open_target_exclusive_modes_present(cli))
+        .filter_map(|(flag, is_present)| is_present.then_some(*flag))
+        .collect()
+}
+
+/// Returns the [`WINDOWS_ONLY_FLAGS`] present in `cli`, in table order. Platform-free on purpose:
+/// whether they are a usage error is decided by `startup::mode::decide` from its platform facts.
+#[must_use]
+pub fn windows_only_flags(cli: &Cli) -> Vec<&'static str> {
+    // Index-aligned with `WINDOWS_ONLY_FLAGS`; the array type pins the length to the table's, so
+    // a flag added to one but not the other fails to compile instead of `zip` truncating.
+    let present: [bool; WINDOWS_ONLY_FLAGS.len()] = [
+        cli.uninstall,
+        cli.continue_uninstall,
+        cli.uninstall_signal_file.is_some(),
+        cli.create_start_menu_shortcut_install_dir.is_some(),
+        cli.continue_create_start_menu_shortcut,
+    ];
+    WINDOWS_ONLY_FLAGS
+        .iter()
+        .zip(present)
         .filter_map(|(flag, is_present)| is_present.then_some(*flag))
         .collect()
 }
@@ -450,6 +507,35 @@ mod tests {
             conflicting_image_flags(&parse(&["/tmp/a.png", "--uninstall", "--check-venv", "--continue-update"])),
             vec!["--check-venv", "--continue-update", "--uninstall"],
             "modes first, then installed-copy flags in table order"
+        );
+    }
+
+    #[test]
+    fn project_conflicts_with_terminal_modes_only() {
+        assert!(conflicting_project_flags(&parse(&["--check-venv", "--test-launcher"])).is_empty(), "without --project these modes are legitimate");
+        assert!(conflicting_project_flags(&parse(&["--project", "/tmp/ch", "--update", "--continue-update", "--no-ai"])).is_empty(), "installed-copy flags stay legitimate with --project");
+        assert_eq!(conflicting_project_flags(&parse(&["--project", "/tmp/ch", "--check-venv"])), vec!["--check-venv"]);
+        assert_eq!(conflicting_project_flags(&parse(&["--test-launcher", "--project", "/tmp/ch", "--check-venv"])), vec!["--check-venv", "--test-launcher"], "table order, not command-line order");
+    }
+
+    #[test]
+    fn windows_only_flags_are_listed_in_table_order() {
+        assert!(windows_only_flags(&parse(&["--update", "--check-venv", "--trace"])).is_empty());
+        let cases: &[(&[&str], &str)] = &[
+            (&["--uninstall"], "--uninstall"),
+            (&["--continue-uninstall"], "--continue-uninstall"),
+            (&["--uninstall-signal-file", "/tmp/s"], "--uninstall-signal-file"),
+            (&["--create-start-menu-shortcut-install-dir", "/tmp/x"], "--create-start-menu-shortcut-install-dir"),
+            (&["--continue-create-start-menu-shortcut"], "--continue-create-start-menu-shortcut"),
+        ];
+        for (args, expected) in cases {
+            assert_eq!(windows_only_flags(&parse(args)), vec![*expected], "command line {args:?}");
+        }
+        let covered: Vec<&str> = cases.iter().map(|(_, expected)| *expected).collect();
+        assert_eq!(covered, WINDOWS_ONLY_FLAGS, "every flag in WINDOWS_ONLY_FLAGS needs a case here");
+        assert_eq!(
+            windows_only_flags(&parse(&["--continue-create-start-menu-shortcut", "--uninstall", "--create-start-menu-shortcut-install-dir", "/tmp/x"])),
+            vec!["--uninstall", "--create-start-menu-shortcut-install-dir", "--continue-create-start-menu-shortcut"]
         );
     }
 

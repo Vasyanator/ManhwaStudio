@@ -22,13 +22,14 @@ translated (bubbles, OCR, machine translation), cleaned (clean layers, inpaintin
 - `old_or_test/` holds the archived 2.x Python UI: never an architecture reference.
 
 ```text
-lib.rs / args.rs  (CLI, startup routing, process-global services; main.rs is a thin entry)
+startup/ + args.rs  (CLI, RunMode, ProcessServices, startup routing; lib.rs + main.rs are thin entries)
   -> startup prompts (installer, missing environment, update)  -- own windows, once
   -> shell/ (THE main window: one eframe::run_native, screens switched in place)
        -> launcher screen: ms-launcher (project catalogue, New Project, import)
        -> studio screen: loads ProjectData off the GUI thread behind a loading screen,
-          tears MangaApp down on a worker behind a Closing screen
-  -> MangaApp (src/app.rs: editor root, owns tabs, shared models, loader pool, panel dock)
+          tears StudioApp down on a worker behind a Closing screen
+  -> StudioApp (src/studio.rs + src/studio/: editor root; owns PageResidency, StagingWriters,
+               SessionMode, Tabs, CloseFlow, panel dock; outbound StudioOutput queue)
        -> shared models: BubblesModel, CleanOverlaysModel, TextMaskModel, LayerDoc
        -> tabs: CanvasView + CanvasHooks (Translation, Cleaning, Typing) and own-UI tabs
        -> background workers; native ONNX runtime; Python backend over framed IPC
@@ -41,7 +42,7 @@ layering. Dependencies point DOWN only (`<-` = "depends on"); a level may use an
 crates on one line do not know each other.
 
 ```text
-root package (src/: lib.rs + thin main.rs, shell/, app.rs, tabs/settings/, web_entry.rs)
+root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/settings/, web_entry.rs)
   <- ms-launcher / ms-tab-page-manager
   <- ms-settings-ui / ms-tab-cleaning / ms-tab-ps-editor
   <- ms-tab-translation / ms-tab-typing
@@ -154,15 +155,17 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 
 ## 3. Startup and process lifetime
 
-- **One main window.** `src/lib.rs::run_main` runs the startup prompt windows (installer,
-  missing environment, `--update`) once, then ONE `eframe::run_native` — the main window
+- **One main window.** `src/startup/` (`run_native`, called by `lib.rs::native_main`) decides one
+  `RunMode` right after parsing (`mode.rs`: service flags, test launcher, main run), builds the
+  `ProcessServices` in the fixed startup order (`services.rs`), runs the startup prompt windows
+  (installer, missing environment, `--update`) once, then ONE `eframe::run_native` — the main window
   (`src/shell/`, `AppShell`) — that hosts the launcher and the studio as SCREENS and stays open
   while switching between them; a launcher "Update" runs the update window after it closed. The
   shell owns the window (geometry, identity, title, minimum size, fonts, UI scale, GL lifetime,
   `egui::Options`, the per-screen global style, the root close); screens are state machines that
   return typed exits, and where the window goes next is one pure table (`shell/screen.rs`). No
   switch blocks the GUI thread: the launcher entry is prepared, the studio loaded and torn down
-  on workers. Process-global services created in `run_main` outlive the window: the
+  on workers. Process-global services created at startup outlive the window: the
   `AiBackendSupervisor` (backend process and health/device probe), the UI-scale slot, the
   `ms-fonts` byte cache, the Hugging Face token cache.
 - Startup order that later code relies on: `ms_config::storage_mode::init_storage_mode_at_startup`
@@ -174,19 +177,20 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   also the one owner of the repository-build rule `ms-os-integration` writes records with;
   macOS `.app` bundles use Application Support). Bundled resources, the Python
   environment, `user_config`, logs and app-managed models all resolve from it.
-- The studio screen (`src/shell/studio.rs`) loads the project off the GUI thread, then delegates
-  to `MangaApp`. It opens a typed `StartupTarget`: a project directory, or an ordered image set
+- The studio screen (`src/shell/studio/`) loads the project off the GUI thread, then delegates
+  to `StudioApp`. It opens a typed `StartupTarget`: a project directory, or an ordered image set
   (`Images(ImageSources)`: CLI `--image` / positional paths, launcher multi-pick, OS "Open with",
-  Android Share); the open worker turns it into a `StudioOpenRequest` (reserving the scratch).
+  Android Share); the open worker turns it into a `StudioSession` (reserving the scratch), loads the
+  `ProjectData` and pre-reads the `StudioBootstrap` (every disk input of `StudioApp::new`).
 - **External opens while running** (Android Share / "Open with" via the `ms_platform::incoming`
-  inbox; cold start reads it in `run_main`): the main window's screen table decides — the
+  inbox; cold start reads it in `startup::run_native`): the main window's screen table decides — the
   launcher opens them at once, the studio asks (its unsaved-changes flow or a confirmation),
   Loading/Closing screens queue and merge them in arrival order.
-- **Every `MangaApp` and every launcher screen lives inside the same `egui::Context`** (reload,
+- **Every `StudioApp` and every launcher screen lives inside the same `egui::Context`** (reload,
   launcher <-> studio). Any egui resource a crate registers (font families, textures, ids) must be
   named by content, never by an instance counter; fonts are installed once per process.
 - **Android:** `src/android_entry.rs::android_main` (cdylib built by `build-android.sh`) chdirs
-  into `<internal data>/ms_root` and runs the same `run_main` — one `run_native` there too. The
+  into `<internal data>/ms_root` and runs the same `startup::run_native` — one `eframe::run_native` there too. The
   main window sets `General.secondary_windows` (`ms_config::secondary_windows`, the one owner of
   the separate-vs-embedded decision on every platform) on the winit fork before it, and re-syncs
   it at creation and on every screen switch (`ms_window_geometry::sync_secondary_window_policy`);
@@ -209,7 +213,7 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   (unchanged pixels — `PixelDigest` of the opened image — are skipped), pages without a writable
   source and Save As of a set go to one chosen folder. The studio screen owns the scratch; the teardown worker
   deletes it after the app was dropped; stale scratches (marker + released lock) are swept at startup. UI branches
-  (tabs, top bar, exit dialog) live in `src/single_image/`.
+  (tabs, top bar, exit dialog) live in `src/studio/session/image_set/`.
 - `Page` and `ProjectPaths` are declared in `ms-page-ops` and re-exported by `ms-project`, so a
   pending page-op journal is resolved (`recover_pending_page_op`) before any reconcile or load
   pass. Every path is an `ms_config` name joined onto the chapter or title directory.
@@ -232,19 +236,25 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 
 ## 5. Root runtime and shared models
 
-- `MangaApp` (`src/app.rs`) creates the chapter models, each `Arc<Mutex<_>>`, and injects them
+- `StudioApp` (`src/studio.rs` + `src/studio/`) owns one opened session: `PageResidency`
+  (page decode and GPU residency), `StagingWriters` (the three `_unsaved` writers, their
+  `AutosaveGate`, the DISCARD latch), `SessionMode` (`Project(ProjectSession)` /
+  `ImageSet(ImageSetSession)`, chosen once), `Tabs` (the tab states), `CloseFlow` (close intent)
+  and the panel dock. Everything it asks of the window leaves through one `StudioOutput` queue
+  (title, close, received-images decline, reload after a page op).
+- `StudioApp` creates the chapter models, each `Arc<Mutex<_>>`, and injects them
   into tabs and canvases through typed setters: `BubblesModel`, `CleanOverlaysModel`,
   `TextMaskModel`, `LayerDoc`. Models carry revision (or per-node generation) counters; tabs pull
   changes by revision and never copy shared state by hand. Lock briefly, snapshot, release.
-- `MangaApp` is a screen of the main window, not a window: it never closes, maximizes or styles
+- `StudioApp` is a screen of the main window, not a window: it never closes, maximizes or styles
   it. A close it decides (exit dialog, launcher button, OS close via `request_os_close`) is a
-  `PendingCloseAction` the shell takes; its teardown (`shutdown_blocking`, `src/app/shutdown.rs`)
-  runs on the shell's worker with the whole `Box<MangaApp>` moved there (`MangaApp: Send` is a
+  `PendingCloseAction` the shell takes; its teardown (`shutdown_blocking`, `src/studio/shutdown.rs`)
+  runs on the shell's worker with the whole `Box<StudioApp>` moved there (`StudioApp: Send` is a
   compile-time guard).
-- **Page loader pipeline:** one background decode pool for source pages AND clean overlays (page
+- **Page loader pipeline** (`PageResidency`, `src/studio/residency/`): one background decode pool for source pages AND clean overlays (page
   order) -> strictly ordered promotion on the GUI thread -> tiled GPU upload under a per-frame
   budget. Page dimensions come from `PageImageInfo`; GPU textures are a droppable cache.
-- **Texture lending:** `MangaApp` owns the resident `PageTexture` map and lends it (`&mut`) to
+- **Texture lending:** `PageResidency` owns the resident `PageTexture` map; `StudioApp` lends it (`&mut`) to
   the active tab each frame — canvas tabs through the canvas draw params, the page-manager
   viewer through its `draw`. Each tab reports the source-page window it needs
   (`active_source_page_window`), which drives residency and eviction.
@@ -262,7 +272,7 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   it.
 - **Undo** everywhere uses `ms-actions`: bubbles as snapshot ops, clean overlays and PS-editor
   rasters as tiled `RasterDiff`s bounded by count and a memory-profile byte budget.
-- **Panel dock:** one `PanelDockState` per studio window, owned by `MangaApp` and lent to the
+- **Panel dock:** one `PanelDockState` per studio window, owned by `StudioApp` and lent to the
   active tab per frame; layouts are keyed by `AppTab::key()` and persisted through the
   `PanelLayout` config section.
 - **Touch on canvases:** one router (`ms_widgets::touch_nav`), run from the main window's
@@ -274,7 +284,7 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   `CanvasView::set_long_press_selection` / `touch_selection`). Mouse and pen (Android stylus is
   routed as a mouse by the winit fork) keep tool behaviour.
 - **Hotkeys:** `ms_widgets::InputManagerV2` (code-declared specs, user overrides in
-  `user_config` -> `Hotkeys`), dispatched by `MangaApp` per active tab.
+  `user_config` -> `Hotkeys`), dispatched by `StudioApp` per active tab.
 
 ## 6. Canvas
 
@@ -298,7 +308,7 @@ Detail: `crates/ms-canvas/src/MODULE_README.md`.
 
 ## 7. Tabs
 
-`AppTab` (`crates/ms-config/src/app_tab.rs`) fixes order and persistence ids. `MangaApp` owns
+`AppTab` (`crates/ms-config/src/app_tab.rs`) fixes order and persistence ids. `StudioApp` owns
 every tab state, lends it shared models, textures and the panel dock each frame, and executes
 the actions tabs return. Canvas tabs implement `CanvasHooks`; the others draw their own UI.
 
@@ -436,10 +446,12 @@ logged error); the GUI thread only polls and applies results.
 
 | Pipeline | Owner |
 |---|---|
-| Page + clean-overlay decode pool, ordered promotion, GPU upload | `src/app.rs` |
+| Page + clean-overlay decode pool, ordered promotion, GPU upload | `src/studio/residency/` (`PageResidency`) |
 | Launcher entry preparation (config reads, scans, probes) | `src/shell/mod.rs` (`ms_launcher::prepare_entry` on a worker) |
-| Studio project load behind the loading screen | `src/shell/studio.rs` |
-| Studio teardown behind the Closing screen (`MangaApp::shutdown_blocking`, scratch release) | `src/shell/closing.rs` |
+| Studio project load + `StudioBootstrap` pre-read behind the loading screen | `src/shell/studio/open.rs` |
+| Save-to-project merge, page-op quiesce + dispatch, DISCARD delete job | `src/studio/session/project/` (writer steps: `src/studio/staging_writers.rs`) |
+| Image-set save (flatten, file dialog, commit, JPEG quality persistence) | `src/studio/session/image_set/` |
+| Studio teardown behind the Closing screen (`StudioApp::shutdown_blocking`, scratch release) | `src/shell/closing.rs` |
 | Startup update check (once per process) | `src/update_check.rs`, started by `src/shell/` |
 | Bubble and layer persistence (coalescing savers) | `ms-models` (`bubbles_model.rs`, `layer_model/saver.rs`) |
 | Clean overlay autosave, canvas settings saver, overlay tile prepare | `ms-canvas/src/workers.rs` |
@@ -469,7 +481,7 @@ logged error); the GUI thread only polls and applies results.
 - No model lock is held across I/O, rendering, callbacks or a worker wait.
 
 **Shared state**
-- Cross-tab state lives only in the `Arc<Mutex<_>>` models owned by `MangaApp`.
+- Cross-tab state lives only in the `Arc<Mutex<_>>` models `StudioApp` creates and shares with the tabs.
 - `CanvasView` is the one canvas engine; tab behaviour plugs in via `CanvasHooks`.
 - One owner per rule: the page <-> clean binding (`clean_binding` + `clean_assign`), Python
   lookup and spawn (`ms_sysprobe::python_manager`), semantic colours (`ms-theme`), `winit`
@@ -500,9 +512,9 @@ logged error); the GUI thread only polls and applies results.
 - A flush that could not run is never "nothing to save": save-to-project ABORTS on any
   unverified flush or barrier (nothing merged, staging kept, user told); a page op aborts on a
   failed lock or overlay flush, but only logs a warning when the layer-saver barrier reports
-  failed pages (see `src/MODULE_README.md`, save/page-op choreography).
+  failed pages (see `src/studio/MODULE_README.md`, save/page-op choreography).
 - DISCARD never flushes: it drops pending state in all three writers before deleting staging
-  (a docstore write would re-create the directory) and latches `discarding_unsaved_changes`; a
+  (a docstore write would re-create the directory) and latches the discard first (`StagingWriters`); a
   failed cleanup releases the latch and restarts all three writers.
 - Exit: deferred typing edits are enqueued inline BEFORE the exit barrier; failed pages are
   reported.
@@ -510,7 +522,7 @@ logged error); the GUI thread only polls and applies results.
   flush, no delete job); the main window's teardown worker removes the scratch afterwards. Its dirty state is
   `AutosaveGate::action_count()` against the baseline of the last successful file write.
 
-Detail: `src/MODULE_README.md`, `crates/ms-models/src/MODULE_README.md`,
+Detail: `src/studio/MODULE_README.md`, `crates/ms-models/src/MODULE_README.md`,
 `crates/ms-models/src/layer_model/MODULE_README.md`, `crates/ms-tab-typing/src/MODULE_README.md`.
 
 **Versions and protocol**

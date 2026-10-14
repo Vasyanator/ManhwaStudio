@@ -560,7 +560,7 @@ fn resolve_registered_face(
 /// `matches`-passing faces, not a filter, so it can never empty the set.
 ///
 /// Public (re-exported from the crate root) so out-of-crate render harnesses that
-/// build their own `FontSystem` — today `src/bin/text_render_test` — can apply the
+/// build their own `FontSystem` — today the `examples/text_render_test.rs` example — can apply the
 /// SAME guard instead of re-deriving these matching subtleties.
 #[must_use]
 pub fn family_has_matching_face(font_system: &FontSystem, attrs: &Attrs<'_>) -> bool {

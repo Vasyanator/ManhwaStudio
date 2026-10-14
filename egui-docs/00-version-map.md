@@ -240,10 +240,10 @@ Practical rule: a bare `&str`, `RichText` or `Image` still works as before becau
 | `App::save`, `App::on_exit`, `App::clear_color`, `App::raw_input_hook` | Still present. | `epi.rs:212,222,248,279` |
 | `eframe::Frame` | Still the app-frame handle passed to `ui`/`logic`. | `epi.rs:661` |
 
-Canonical 0.36 app shape (as used here, `src/app.rs:2337-2338`):
+Canonical 0.36 app shape (as used here, `src/studio.rs:1126`):
 
 ```rust
-impl eframe::App for MangaApp {
+impl eframe::App for StudioApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();           // clone: `ui` stays mutably usable
         egui::Panel::top(egui::Id::new("top")).show(ui, |ui| { /* … */ });

@@ -83,6 +83,9 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     short-lived background worker, or both — text above the animation. An optional
     `with_action` button sits below that content; `show_with_action` returns a
     `HelpHintResponse` reporting its click.
+  - `ui_scale` (`seed_ui_scale_from_user_settings`, `ui_scale_percent`, `apply_ui_scale`,
+    `apply_ui_scale_to_context`): the process-global interface scale, applied once per egui
+    context by every product window and changed live by the settings slider.
   - `touch_nav` (`TouchRouter`, `TouchSurface`, `TouchOutput`, `TouchNavigation`,
     `TouchSelection`, `context_menu_popup`, `publish_surface`, `take_touch_output`): the one
     owner of finger input on canvases. A finger that starts on a published canvas surface
@@ -107,7 +110,7 @@ pub mod input_util;
 // persisted `Hotkeys` overrides in `user_config.json`, and the per-frame dispatch of
 // triggered commands from `egui::InputState`. It lives here rather than in the binary
 // because it is a pure egui-input primitive over `ms_config::app_tab::AppTab`, and both
-// the binary (`app.rs`, the settings hotkeys pane) and the `translation` tab crate
+// the binary (`studio.rs`, the settings hotkeys pane) and the `translation` tab crate
 // register specs with it.
 pub mod input_manager_v2;
 // The egui half of the bubble-status feature: it paints a rule's border with a bare
@@ -119,6 +122,10 @@ pub mod bubble_status;
 // installs the same chain through it. It sits here because it is a pure egui-context
 // concern shared by every window, launcher and installer included.
 pub mod ui_fonts;
+// The process-global interface scale (`General.ui_scale_percent`) and its application to an
+// egui context. Next to `ui_fonts` for the same reason: every product window (main window,
+// startup prompts, installer / update windows) applies it once per context.
+pub mod ui_scale;
 // Canvas touch gestures: the one owner of the finger decision. The shell's `raw_input_hook`
 // drives `TouchRouter`; canvases publish surfaces and take typed navigation / long-press /
 // selection output; both canvas context menus open through `context_menu_popup`. Public

@@ -53,6 +53,8 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 `render_text_to_image` keep their behavior.
 
 ## Files and submodules
+- `../examples/`: renderer diagnostics as Cargo examples of this package (`render_gallery`
+  golden harness, `text_render_test`, `test_text_shape`); see `../examples/MODULE_README.md`.
 - `mod.rs`: module wiring, public re-export of `render_text_to_image`, and runtime smoke
   anchors that keep staged contracts compiled.
 - `types.rs`: public render parameter/result types and enums shared with `typing/tab.rs`
@@ -97,7 +99,7 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   per process from the bundled `fonts/ui` stack (`ms-fonts`). Owns
   `new_render_font_system` (the single `FontSystem` constructor, re-exported from
   the crate root for out-of-crate render harnesses such as
-  `src/bin/text_render_test`), the base `fontdb::Database` and `MsFallback`
+  `examples/text_render_test.rs`), the base `fontdb::Database` and `MsFallback`
   (`cosmic_text::Fallback`). Edit it to change which fonts back a render, the
   script -> font mapping, the forbidden list, or the weight fallback faces are
   registered under (`FALLBACK_FACE_WEIGHT`). Its test-only `test_bundle` submodule is

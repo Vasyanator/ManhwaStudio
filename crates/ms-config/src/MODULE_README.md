@@ -11,7 +11,7 @@ The project's global configuration and runtime-path layer. It answers two questi
   a missing key without rewriting an already-complete document.
 
 It is the hub every upper layer reads, so it depends on nothing above it: no egui, no
-`tabs`, no `app`. GUI-free and cross-target.
+`tabs`, no `studio`. GUI-free and cross-target.
 
 ## Architecture
 ```text
@@ -70,8 +70,9 @@ that defines the type.
   uses it for the working directory of every OS record it writes — never copy the rule there).
   `lib.rs::resolve_runtime_root` does the I/O (cwd, `current_exe`, `dir_has_program_markers`)
   and handles the macOS `.app` bundle data root before it.
-- `version_format.rs`: pure, std-only composition (`compose_app_version`) and stripping
-  (`version_core`) of the application version string. The ROOT `build.rs` pulls this exact file
+- `version_format.rs`: pure, std-only composition (`compose_app_version`), stripping
+  (`version_core`) and ordering (`compare_release_versions` / `is_remote_newer`, the ONE
+  release-version comparator of the workspace) of the application version string. The ROOT `build.rs` pulls this exact file
   in with `include!("crates/ms-config/src/version_format.rs")`, so the code the build script
   runs is the code `cargo test` covers — which is why it must stay std-only: no `t!`, no
   logging, no reference to any other item of this crate.
@@ -132,7 +133,7 @@ that defines the type.
   (`default_for(WindowHost)`: on for Android, off for desktop and web; `DEFAULT` goes into the
   `General` tree), pure reader `touch_gestures_from_user_settings` (absent or non-boolean ->
   `DEFAULT`), process-global live value (`current` / `set` / `seed_from_user_settings`, seeded
-  in `run_main`, edited by the shared General pane) and `effective(available, setting)` /
+  at startup by `src/startup/services.rs`, edited by the shared General pane) and `effective(available, setting)` /
   `enabled_with(available)`. The platform capability stays `ms_platform::PlatformFeature::
   CanvasTouchGestures` (this crate does not depend on `ms-platform`): the caller passes it in.
 - `single_image.rs`: the image-set (single-image) editing mode's shared names — `INPUT_FILE_TYPES`
@@ -163,7 +164,7 @@ binary that installs a UI locale). Those crates enable `test-support` from their
 `[dev-dependencies]`, so no production build carries either item.
 
 ## Contracts and invariants
-- **No dependency may point upwards.** Nothing here may name `egui`, `tabs`, `app`, or any
+- **No dependency may point upwards.** Nothing here may name `egui`, `tabs`, `studio`, or any
   other item of the binary. A new need for one of those means the caller passes a value in,
   or the type moves down — not that this crate grows a dependency.
 - **`user_config.json` transactions are serialized** by the `ms-docstore` document lock.

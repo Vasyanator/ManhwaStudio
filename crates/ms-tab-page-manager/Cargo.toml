@@ -12,9 +12,9 @@ edition = "2024"
 #
 # Layer: near the TOP of the library stack — above `ms-page-ops`, `ms-models`, `ms-widgets`
 # and `ms-tab-ps-editor` (the crop/split/stitch previews reuse its viewport camera) — and
-# below only `app.rs`. The tab NEVER executes a structural operation itself: it emits
+# below only `studio.rs`. The tab NEVER executes a structural operation itself: it emits
 # `PageManagerAction::RequestOp` and the app quiesces writers, runs the op and calls
-# `notify_pages_changed`. It must never name `app` or `launcher`.
+# `notify_pages_changed`. It must never name `studio` or `launcher`.
 
 [dependencies]
 # `user_config.json` sections owned by this tab plus the `AppTab` enum the grid switches to.

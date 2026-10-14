@@ -14,9 +14,8 @@ Key functions:
 - `sources_from_batches(batches)`: pure mapping (files in arrival order, Kotlin skips as
   localized `SkippedSource`s, batch folders as inbox batches) plus the folders nothing refers to.
 - `spawn_take()`: `take_pending_blocking` + mapping on the `incoming-take` worker.
-- `cold_start_target()`: `ms_platform::incoming::init` + mapping, for `run_main` (pre-window).
+- `cold_start_target()`: `ms_platform::incoming::init` + mapping, for `startup::run_native` (pre-window).
 - `discard_target(target, why)`: logs and releases a target that will not be opened.
-- `received_count(target)`: how many images a delivered target holds (for the question text).
 
 Notes:
 Where a delivered target goes (open, queue, ask, drop) is decided by the pure table in
@@ -24,7 +23,7 @@ Where a delivered target goes (open, queue, ask, drop) is decided by the pure ta
 before the first window frame (`cold_start_target`, the documented pre-window exception).
 */
 
-use super::studio::{ImageSources, StartupTarget};
+use super::target::{ImageSources, StartupTarget, received_count, release_inbox_batches_blocking};
 use crate::project::SkippedSource;
 use crate::runtime_log;
 use ms_platform::incoming::{self, IncomingBatch, IncomingError};
@@ -101,8 +100,8 @@ pub(super) fn spawn_take() -> std::io::Result<IncomingTake> {
         let result = incoming::take_pending_blocking().map(target_from_batches_blocking);
         if let Err(mpsc::SendError(result)) = tx.send(result) {
             // The shell is gone (the window closed): nobody will open the images.
-            if let Ok(Some(target)) = result {
-                release_inbox_batches_blocking(&target);
+            if let Ok(Some(StartupTarget::Images(sources))) = result {
+                release_inbox_batches_blocking(sources.inbox_batches());
             }
             runtime_log::log_info("[incoming] a take finished after the main window closed; its images were released");
         }
@@ -112,7 +111,7 @@ pub(super) fn spawn_take() -> std::io::Result<IncomingTake> {
     Ok(IncomingTake { rx })
 }
 
-/// Cold start, for `run_main` BEFORE the main window exists: binds the platform wake-up and takes
+/// Cold start, for `startup::run_native` BEFORE the main window exists: binds the platform wake-up and takes
 /// the batches that started (or reached) the process, as one image set. A platform failure is
 /// logged and returned as the localized message for the user; the program continues without the
 /// images. Outside Android: `(None, None)`.
@@ -133,41 +132,22 @@ pub(crate) fn cold_start_target() -> (Option<StartupTarget>, Option<String>) {
     }
 }
 
-/// How many images a delivered target holds (files plus documents already rejected), for the
-/// "close and open N images?" texts. A project counts as one.
-#[must_use]
-pub(super) fn received_count(target: &StartupTarget) -> usize {
-    match target {
-        StartupTarget::Project(_) => 1,
-        StartupTarget::Images(sources) => sources.files().len() + sources.skipped().len(),
-    }
-}
-
 /// Drops a delivered target that will not be opened (`why` names the reason in the log) and
 /// releases its inbox batches on a worker. A spawn failure is logged; the next start sweeps them.
 pub(crate) fn discard_target(target: StartupTarget, why: &str) {
     runtime_log::log_info(format!("[incoming] {} received image(s) dropped: {why}", received_count(&target)));
-    let has_batches = match &target {
-        StartupTarget::Project(_) => false,
-        StartupTarget::Images(sources) => !sources.inbox_batches().is_empty(),
+    let sources = match target {
+        StartupTarget::Project(_) => return,
+        StartupTarget::Images(sources) => sources,
     };
-    if !has_batches {
+    if sources.inbox_batches().is_empty() {
         return;
     }
-    let spawn_result = thread::Builder::new().name("incoming-release".to_string()).spawn(move || release_inbox_batches_blocking(&target));
+    let spawn_result = thread::Builder::new().name("incoming-release".to_string()).spawn(move || release_inbox_batches_blocking(sources.inbox_batches()));
     match spawn_result {
         // Detached: release failures are logged by the platform layer.
         Ok(handle) => drop(handle),
         Err(err) => runtime_log::log_warn(format!("[incoming] could not start the inbox release worker: {err}; the next start sweeps the batches")),
-    }
-}
-
-/// Releases a target's inbox batches (blocking: workers only).
-fn release_inbox_batches_blocking(target: &StartupTarget) {
-    if let StartupTarget::Images(sources) = target {
-        for batch in sources.inbox_batches() {
-            incoming::release_batch_blocking(batch);
-        }
     }
 }
 

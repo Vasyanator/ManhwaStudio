@@ -73,7 +73,7 @@ pub const PROMOTION_GRACE_S: f64 = 0.5;
 
 /// One canvas surface a finger may be claimed on, published every frame by its owner.
 ///
-/// `owner` is a content-named, stable id (it outlives a `MangaApp` rebuild in the same
+/// `owner` is a content-named, stable id (it outlives a `StudioApp` rebuild in the same
 /// `egui::Context`); it keys the output in [`take_touch_output`]. `rect` and `holes` are in
 /// screen points of the ROOT viewport.
 #[derive(Clone, Debug, PartialEq)]

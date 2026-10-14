@@ -14,6 +14,8 @@ Key types:
 - `HotkeyBindingV2`: effective runtime binding.
 - `HotkeyCommandV2`: registered command with metadata and current binding.
 - `InputManagerV2`: runtime registry and dispatcher for configurable hotkeys.
+- `HotkeyOverrides`: the persisted overrides read once (`read_blocking`, off the GUI thread)
+  and applied later (`InputManagerV2::apply_overrides`).
 
 Notes:
 - Defaults stay in Rust code; only user overrides are stored on disk.
@@ -113,6 +115,43 @@ pub struct HotkeyCommandV2 {
     last_shortcut_held: bool,
 }
 
+/// The user's persisted hotkey overrides (`user_config.json` -> `Hotkeys`), read once so the
+/// read can happen off the GUI thread and be applied later with
+/// [`InputManagerV2::apply_overrides`]. Keyed by command id; an entry that does not parse is
+/// dropped at read time (that command keeps its code default).
+#[derive(Debug, Clone, Default)]
+pub struct HotkeyOverrides {
+    bindings: HashMap<String, HotkeyBindingV2>,
+}
+
+impl HotkeyOverrides {
+    /// Reads the overrides from the `user_config.json` at `user_settings_file` through the
+    /// document store. Blocking; an absent, unreadable or malformed document yields no
+    /// overrides (the latter two logged).
+    #[must_use]
+    pub fn read_blocking(user_settings_file: &Path) -> Self {
+        Self::from_config_root(&load_root_json(user_settings_file))
+    }
+
+    /// The overrides stored in an already loaded `user_config.json` root. No I/O.
+    #[must_use]
+    pub fn from_config_root(root: &Value) -> Self {
+        let bindings = root
+            .get(HOTKEYS_CONFIG_SECTION)
+            .and_then(Value::as_object)
+            .map(|hotkeys| {
+                hotkeys
+                    .iter()
+                    .filter_map(|(command_id, raw_binding)| {
+                        binding_from_json(raw_binding).map(|binding| (command_id.clone(), binding))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { bindings }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct InputManagerV2 {
     commands: Vec<HotkeyCommandV2>,
@@ -148,10 +187,18 @@ impl InputManagerV2 {
         self.bindings_revision = self.bindings_revision.saturating_add(1);
     }
 
+    /// Reads the user overrides from `user_settings_file` and applies them
+    /// ([`HotkeyOverrides::read_blocking`] + [`Self::apply_overrides`]). Blocking document read:
+    /// a GUI-thread caller pre-reads the overrides on a worker and calls `apply_overrides`.
     pub fn load_overrides(&mut self, user_settings_file: &Path) {
-        let overrides = load_hotkey_overrides(user_settings_file);
+        self.apply_overrides(&HotkeyOverrides::read_blocking(user_settings_file));
+    }
+
+    /// Replaces the binding of every registered command that `overrides` names (commands
+    /// registered later are not affected) and bumps the bindings revision once. No I/O.
+    pub fn apply_overrides(&mut self, overrides: &HotkeyOverrides) {
         for command in &mut self.commands {
-            if let Some(binding) = overrides.get(&command.id) {
+            if let Some(binding) = overrides.bindings.get(&command.id) {
                 command.binding = binding.clone();
             }
         }
@@ -357,21 +404,6 @@ pub fn clear_hotkey_override(user_settings_file: &Path, command_id: &str) -> Res
     .map_err(|err| err.to_string())
 }
 
-fn load_hotkey_overrides(user_settings_file: &Path) -> HashMap<String, HotkeyBindingV2> {
-    let root = load_root_json(user_settings_file);
-    root.get(HOTKEYS_CONFIG_SECTION)
-        .and_then(Value::as_object)
-        .map(|hotkeys| {
-            hotkeys
-                .iter()
-                .filter_map(|(command_id, raw_binding)| {
-                    binding_from_json(raw_binding).map(|binding| (command_id.clone(), binding))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// Reads the whole `user_config.json` at `user_settings_file` through the document store.
 /// An absent, unreadable or malformed document yields an empty object (default hotkeys);
 /// the latter two are logged.
@@ -494,5 +526,57 @@ fn matches_scope(scope: HotkeyScopeV2, active_tab: AppTab) -> bool {
     match scope {
         HotkeyScopeV2::Global => true,
         HotkeyScopeV2::Tab(tab) => tab == active_tab,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn spec(id: &'static str, key: egui::Key) -> HotkeySpecV2 {
+        HotkeySpecV2 {
+            id,
+            title: "title",
+            section: "section",
+            default_shortcut: Some(egui::KeyboardShortcut::new(egui::Modifiers::NONE, key)),
+            default_modifier_only: None,
+            scope: HotkeyScopeV2::Global,
+            active_when_input: false,
+        }
+    }
+
+    /// Pre-read overrides replace exactly the bindings they name, drop an entry that does not
+    /// parse, and bump the revision once (what `load_overrides` did in one step).
+    #[test]
+    fn applying_pre_read_overrides_replaces_only_the_named_bindings() {
+        let root = json!({
+            HOTKEYS_CONFIG_SECTION: {
+                "a": { "enabled": true, "shortcut": { "key": "B", "modifiers": { "ctrl": true } } },
+                "b": "not a binding"
+            }
+        });
+        let overrides = HotkeyOverrides::from_config_root(&root);
+        let mut manager = InputManagerV2::default();
+        manager.register(spec("a", egui::Key::A));
+        manager.register(spec("b", egui::Key::C));
+        let revision = manager.bindings_revision();
+        manager.apply_overrides(&overrides);
+        assert_eq!(manager.bindings_revision(), revision + 1);
+        let a = manager.binding("a").and_then(|binding| binding.shortcut).map(|shortcut| (shortcut.logical_key, shortcut.modifiers.ctrl));
+        assert_eq!(a, Some((egui::Key::B, true)));
+        let b = manager.binding("b").and_then(|binding| binding.shortcut).map(|shortcut| shortcut.logical_key);
+        assert_eq!(b, Some(egui::Key::C), "an unparsable override keeps the code default");
+    }
+
+    /// A root without the section (or not an object) carries no overrides.
+    #[test]
+    fn a_root_without_hotkeys_has_no_overrides() {
+        let mut manager = InputManagerV2::default();
+        manager.register(spec("a", egui::Key::A));
+        manager.apply_overrides(&HotkeyOverrides::from_config_root(&json!({"General": {}})));
+        manager.apply_overrides(&HotkeyOverrides::from_config_root(&Value::Null));
+        let a = manager.binding("a").and_then(|binding| binding.shortcut).map(|shortcut| shortcut.logical_key);
+        assert_eq!(a, Some(egui::Key::A));
     }
 }

@@ -495,7 +495,6 @@ impl ExportPageState {
             project_dir: self.projects_root.join(&title).join(&chapter),
             title,
             chapter,
-            resume_unsaved: false,
         })
     }
 

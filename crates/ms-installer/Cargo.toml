@@ -31,11 +31,12 @@ ms-log = { path = "../ms-log" }
 # `python_manager` (discovery of the app-local Python runtime).
 ms-sysprobe = { path = "../ms-sysprobe" }
 # `ui_fonts::install` — the installer windows mount the same bundled UI font stack as
-# the rest of the application. Together with `ms-theme` below, the crate's only UI-layer
-# dependencies.
+# the rest of the application. Together with `ms-theme` and `ms-window-geometry` below, the
+# crate's only UI-layer dependencies (all applied through `window.rs` / `prompt_window.rs`).
 ms-widgets = { path = "../ms-widgets" }
-# `ms_theme::apply` — the installer windows run the studio theme (stock dark plus the
-# studio status colours), not the launcher's.
+# `ms_theme::apply` — the update window and the missing-environment prompt run the studio
+# theme (stock dark plus the studio status colours), not the launcher's; `ms_theme::status`
+# colours are used by every window.
 ms-theme = { path = "../ms-theme" }
 # Every user-visible string of the installer goes through `t!` / `tf!`; the macros are
 # mounted crate-wide via `#[macro_use] extern crate ms_i18n;` in `lib.rs`.
@@ -51,6 +52,10 @@ ms-platform = { path = "../ms-platform" }
 # installer sequences them and maps `IntegrationError::user_message()` into its messages;
 # all Win32 calls live there, so this crate has no direct `windows-sys` dependency.
 ms-os-integration = { path = "../ms-os-integration" }
+# The missing-environment prompt (`prompt_window.rs`) uses the program's shared window icon
+# (`identity::app_icon`) and, on Android, the Activity handle (`android_app::current`) that
+# winit needs to build its event loop.
+ms-window-geometry = { path = "../ms-window-geometry" }
 # The installer and update windows are standalone `eframe` applications
 # (`eframe::run_native`), with the same feature set the binary selects so no second
 # copy of the backend is built.

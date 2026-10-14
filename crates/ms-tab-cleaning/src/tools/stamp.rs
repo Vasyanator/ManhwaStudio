@@ -17,7 +17,8 @@ FILE HEADER (cleaning/tools/stamp.rs)
     That solver, the overlay/scene coordinate helpers (`scene_pos_to_overlay_pos`,
     `overlay_pos_to_scene_pos`, `overlay_rect_to_scene_rect`) and `extract_overlay_chunk` are
     `pub(super)` items of `base.rs`; this file must not keep copies of them.
-  - A single-image session (`set_single_image_session`) has no `alt_vers` folders: the mode row is
+  - A session without alt versions (`set_session_capabilities`, `SessionCapabilities::alt_versions`
+    false: a single-image session has no `alt_vers` folders): the mode row is
     hidden, the mode is forced to `CurrentImage` (`stamp_mode_for_session`) and the scratch
     `alt_vers` folder is never listed. The mode is session state, never persisted.
   - `Color32` is premultiplied sRGBA; every colour helper here works on `to_srgba_unmultiplied()`
@@ -47,6 +48,7 @@ use super::base::{
     scene_pos_to_overlay_pos,
 };
 use ms_canvas::{CanvasView, OverlayRectPx};
+use ms_models::SessionCapabilities;
 use ms_project::ProjectData;
 use ms_widgets::{WheelComboBox, WheelSlider, WheelSpinBox};
 use eframe::egui;
@@ -71,11 +73,12 @@ enum StampMode {
     CurrentImage,
 }
 
-/// The stamp mode a session may use: `mode` itself, except that a single-image session has no
-/// `alt_vers` chapter folders, so its alt-version mode falls back to `CurrentImage`.
-fn stamp_mode_for_session(mode: StampMode, single_image: bool) -> StampMode {
+/// The stamp mode a session may use: `mode` itself, except that a session without alt versions
+/// (`alt_versions` false: a single-image session has no `alt_vers` chapter folders) falls back
+/// from the alt-version mode to `CurrentImage`.
+fn stamp_mode_for_session(mode: StampMode, alt_versions: bool) -> StampMode {
     match mode {
-        StampMode::AltVersion if single_image => StampMode::CurrentImage,
+        StampMode::AltVersion if !alt_versions => StampMode::CurrentImage,
         mode => mode,
     }
 }
@@ -197,9 +200,10 @@ pub struct StampTool {
     current_page_idx: Option<usize>,
     cursor_texture: Option<TextureHandle>,
     cursor_texture_size: [usize; 2],
-    /// Whether the open project is a single-image session, pushed by the tab every frame
-    /// before the dock bodies draw: the alt-version mode is then hidden and never active.
-    single_image_session: bool,
+    /// Whether the session offers alt versions (`SessionCapabilities::alt_versions`), pushed by
+    /// the tab every frame before the dock bodies draw: without them the alt-version mode is
+    /// hidden and never active.
+    alt_versions: bool,
 }
 
 impl Default for StampTool {
@@ -274,7 +278,7 @@ impl Default for StampTool {
             current_page_idx: None,
             cursor_texture: None,
             cursor_texture_size: [0, 0],
-            single_image_session: false,
+            alt_versions: true,
         }
     }
 }
@@ -396,9 +400,9 @@ impl StampTool {
             }
         }
 
-        // A single-image session has no alt-version mode, so its scratch `alt_vers` folder is
-        // never listed.
-        if self.single_image_session {
+        // Without alt versions (a single-image session) there is no alt-version mode, so the
+        // scratch `alt_vers` folder is never listed.
+        if !self.alt_versions {
             return;
         }
         let alt_dir = project.paths.alt_vers_dir.clone();
@@ -1206,9 +1210,9 @@ impl CleaningTool for StampTool {
     }
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
-        // A single-image session offers only `CurrentImage` (`stamp_mode_for_session`), so the
-        // mode row is not drawn at all there.
-        if !self.single_image_session {
+        // Without alt versions (a single-image session) only `CurrentImage` is offered
+        // (`stamp_mode_for_session`), so the mode row is not drawn at all.
+        if self.alt_versions {
             self.draw_mode_row(ui);
         }
 
@@ -1345,11 +1349,11 @@ impl CleaningTool for StampTool {
         self.brush_base.handle_size_shortcuts(ctx)
     }
 
-    fn set_single_image_session(&mut self, single_image: bool) {
-        self.single_image_session = single_image;
+    fn set_session_capabilities(&mut self, caps: SessionCapabilities) {
+        self.alt_versions = caps.alt_versions;
         // The mode is session state, never persisted, so forcing it here changes nothing
         // outside this session.
-        self.set_mode(stamp_mode_for_session(self.mode, single_image));
+        self.set_mode(stamp_mode_for_session(self.mode, caps.alt_versions));
     }
 
     fn set_space_pan_active(&mut self, active: bool) {
@@ -2506,13 +2510,13 @@ mod tests {
     /// current-image mode there, and a project keeps whatever mode is selected.
     #[test]
     fn a_single_image_session_never_uses_the_alt_version_mode() {
-        assert_eq!(stamp_mode_for_session(StampMode::AltVersion, true), StampMode::CurrentImage);
-        assert_eq!(stamp_mode_for_session(StampMode::CurrentImage, true), StampMode::CurrentImage);
-        assert_eq!(stamp_mode_for_session(StampMode::AltVersion, false), StampMode::AltVersion);
+        assert_eq!(stamp_mode_for_session(StampMode::AltVersion, false), StampMode::CurrentImage);
+        assert_eq!(stamp_mode_for_session(StampMode::CurrentImage, false), StampMode::CurrentImage);
+        assert_eq!(stamp_mode_for_session(StampMode::AltVersion, true), StampMode::AltVersion);
 
         let mut tool = StampTool::default();
         tool.set_mode(StampMode::AltVersion);
-        tool.set_single_image_session(true);
+        tool.set_session_capabilities(SessionCapabilities::IMAGE_SET);
         assert_eq!(tool.mode, StampMode::CurrentImage);
     }
 }

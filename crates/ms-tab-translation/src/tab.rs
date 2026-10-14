@@ -79,13 +79,13 @@ Panel dock:
   under it and falls back to a fixed canvas offset.
 - `translation_default_dock_layout`: this tab's OWN default arrangement, since a default layout is
   the dictionary stored tab keys are resolved against. Registered under `AppTab::Translation.key()`
-  both in `app.rs::restore_panel_dock` and in `draw_panel_dock`'s `ensure_default_layout`.
+  both in `studio.rs::restore_panel_dock` and in `draw_panel_dock`'s `ensure_default_layout`.
 
 Characters/footer sync:
 - `ensure_character_names_loaded`, `reload_character_names`: load character names cache.
 - `maybe_refresh_character_names_by_watch`: throttled mtime-watch `characters.json` with auto-refresh.
-- `character_roster_available`: false in a single-image session (no title) — the roster is then
-  empty without any I/O and the watch never probes.
+- `SessionCapabilities::title_documents` (`set_session_capabilities`): false in a single-image
+  session (no title) — the roster is then empty without any I/O and the watch never probes.
 - `sync_chapter_character_names`, `rebuild_character_names`: chapter-typed half of the footer
   autocomplete base and the reassembly of the combined list.
 - `sync_footer_tracking`: tracks bubble lifecycle and prunes footer caches.
@@ -117,8 +117,8 @@ Text detector flow:
 - `poll_text_detector_events`: consumes detector events and updates status/progress/results.
 - `ensure_text_detection_storage_loaded`: lazy auto-load persisted detector results.
 - `start_text_detection_storage_load`, `start_text_detection_storage_save`: async IO jobs.
-- `text_detection_storage_available`: false in a single-image session (scratch deleted on exit):
-  no lazy load, no Save button, a stray save request is refused.
+- `SessionCapabilities::chapter_storage`: false in a single-image session (scratch deleted on
+  exit): no lazy load, no Save button, a stray save request is refused.
 - `poll_text_detection_storage_events`: applies load/save completion results.
 - `set_text_detector_status`: updates detector status text and color.
 - `materialize_text_mask_page_from_blocks_if_missing`: legacy fallback that converts
@@ -229,6 +229,7 @@ use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
     CacheResourceKind, select_eviction_candidates,
 };
+use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::{TextMaskModel, TextMaskPage};
 use ms_sysprobe::paste_image;
 use ms_project::{Bubble, Page, ProjectData};
@@ -408,7 +409,7 @@ const TRANSLATION_RECENT_CHARACTERS_TAB_INITIAL_SIZE_PX: Vec2 = Vec2::new(560.0,
 ///
 /// Used only when no layout exists yet for this program tab; a restored one always
 /// wins. Handed to the app-owned dock state as a plain `fn` pointer, both when the
-/// persisted layouts are restored before the first frame (`app.rs`) and by
+/// persisted layouts are restored before the first frame (`studio.rs`) and by
 /// `ensure_default_layout` on every frame this tab draws — the two must name the
 /// same item, since the header's «сбросить раскладку» rebuilds from the one the
 /// state kept. A model refusal is logged and skipped, never panicked on: the dock
@@ -930,6 +931,10 @@ pub struct TranslationTabState {
     recent_characters: VecDeque<RecentCharacterEntry>,
     last_page_idx: i64,
     last_bubble_order: i32,
+    /// What the open session offers (`set_session_capabilities`, pushed once by the root):
+    /// `title_documents` gates the MT project context and the character roster,
+    /// `chapter_storage` the text-detection storage.
+    session_caps: SessionCapabilities,
 }
 
 impl Default for TranslationTabState {
@@ -1183,6 +1188,7 @@ impl TranslationTabState {
             recent_characters: VecDeque::new(),
             last_page_idx: -1,
             last_bubble_order: -1,
+            session_caps: SessionCapabilities::default(),
         }
     }
 
@@ -1386,6 +1392,13 @@ impl TranslationTabState {
         self.ensure_mt_settings_loaded(project);
         self.ensure_composition_settings_loaded(project);
         self.ensure_text_detector_settings_loaded(project);
+    }
+
+    /// Sets what the open session offers (`SessionMode::capabilities` in the root). The root pushes it
+    /// once, right after construction and before the first frame; the session kind never changes
+    /// during the tab's lifetime.
+    pub fn set_session_capabilities(&mut self, caps: SessionCapabilities) {
+        self.session_caps = caps;
     }
 
     pub fn set_hotkey_hints(&mut self, hints: TranslationHotkeyHints) {
@@ -1811,7 +1824,7 @@ impl TranslationTabState {
                     },
                     &mut self.mt_stop_notice,
                     &mut self.mt_panel_options,
-                    !project.is_single_image(),
+                    self.session_caps.title_documents,
                 );
                 if actions.options_changed {
                     self.mt_settings_dirty = true;
@@ -1879,7 +1892,7 @@ impl TranslationTabState {
                     can_ocr_current,
                     can_ocr_all,
                     can_save,
-                    storage_available: text_detection_storage_available(project),
+                    storage_available: self.session_caps.chapter_storage,
                     edit_lines_mode: self.text_detector_edit_lines_mode,
                     edit_mask_mode: self.text_detector_edit_mask_mode,
                     page_size,
@@ -1986,7 +1999,7 @@ impl TranslationTabState {
         // A single-image session has no title, hence no roster: reading it would probe (and the
         // characters loader may create) a `characters/` folder inside the scratch directory.
         // The footer still offers the built-in and chapter-collected names.
-        if !character_roster_available(project) {
+        if !self.session_caps.title_documents {
             self.character_names_project = Vec::new();
             self.rebuild_character_names();
             self.characters_loaded_for = Some(project.paths.characters_dir.clone());
@@ -2051,7 +2064,7 @@ impl TranslationTabState {
     }
 
     fn maybe_refresh_character_names_by_watch(&mut self, project: &ProjectData, now_s: f64) {
-        if !character_roster_available(project)
+        if !self.session_caps.title_documents
             || now_s - self.character_names_watch_last_check_s < CHARACTER_NAMES_WATCH_CHECK_SECS
         {
             return;
@@ -2728,7 +2741,7 @@ impl TranslationTabState {
     }
 
     fn ensure_text_detection_storage_loaded(&mut self, project: &ProjectData) {
-        if !text_detection_storage_available(project) {
+        if !self.session_caps.chapter_storage {
             return;
         }
         let project_dir = project.paths.project_dir.clone();
@@ -2778,7 +2791,7 @@ impl TranslationTabState {
     fn start_text_detection_storage_save(&mut self, project: &ProjectData) {
         // The Save button is not drawn without storage; this refuses an action that got here
         // anyway rather than writing results into a scratch chapter deleted on exit.
-        if !text_detection_storage_available(project) || self.text_detection_storage_busy {
+        if !self.session_caps.chapter_storage || self.text_detection_storage_busy {
             return;
         }
         if self.text_detector_results.is_empty() {
@@ -4535,6 +4548,7 @@ impl TranslationTabState {
             image_mode: self.mt_panel_options.ai_image_mode,
             image_context_source: self.mt_panel_options.ai_image_context_source,
             strict_json: self.mt_panel_options.ai_strict_json,
+            session_caps: self.session_caps,
             project: project.clone(),
         }
     }
@@ -5686,7 +5700,7 @@ impl TranslationTabState {
         total_pages: usize,
         panel_dock: &mut PanelDockState,
     ) {
-        // The SAME `fn` item `app.rs::restore_panel_dock` registers: the dock state
+        // The SAME `fn` item `studio.rs::restore_panel_dock` registers: the dock state
         // keeps it to rebuild the arrangement for the header's reset item, so two
         // different builders here would reset to something the user never saw.
         panel_dock.ensure_default_layout(
@@ -6043,7 +6057,7 @@ impl CanvasHooks for TranslationTabState {
         //
         // It must run on EVERY frame this tab is active — the dock's detached sub-windows are
         // immediate viewports that only exist while `PanelDock::end` shows them
-        // (`app.rs::PanelDockPass`), so this hook has no early return before this point.
+        // (`studio.rs::PanelDockPass`), so this hook has no early return before this point.
         self.draw_panel_dock(ctx, canvas_rect, canvas, status.total_pages, panel_dock);
     }
 
@@ -6887,18 +6901,6 @@ fn recent_character_rank_from_text(text: &str, shift_down: bool) -> Option<usize
         "^" | ":" if shift_down => Some(6),
         _ => None,
     }
-}
-
-/// Whether the chapter's text-detection storage (`text_detection/`, Save and the lazy auto-load)
-/// is offered: not in a single-image session, whose scratch chapter is deleted on exit.
-fn text_detection_storage_available(project: &ProjectData) -> bool {
-    !project.is_single_image()
-}
-
-/// Whether the title character roster (`characters/characters.json`) is read for the footer
-/// autocomplete: not in a single-image session, which has no title.
-fn character_roster_available(project: &ProjectData) -> bool {
-    !project.is_single_image()
 }
 
 /// Cheap change probe of the title `characters.json` through the document store; `None`

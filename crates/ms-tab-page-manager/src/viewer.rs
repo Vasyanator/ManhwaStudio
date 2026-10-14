@@ -22,7 +22,7 @@ Key functions:
 - PageManagerTabState::release_hidden_viewer_clean(): the app's every-frame hook that frees the
   clean's tiles and textures while the tab is not drawn.
 - PageManagerTabState::viewer_source_page() / viewer_wants_nearest_source(): what the app's
-  source-page residency window must keep for this tab (see `src/app.rs`).
+  source-page residency window must keep for this tab (see `src/studio.rs`).
 - resolve_target(): the target re-resolved against this frame's links / inventory (unit-tested).
 - over_page_available(), clean_request_due(), reply_is_current(), same_model_pixels(),
   nearest_sampling_for(), px_from_f32(), newest_job(), run_viewer_worker(): rules with unit

@@ -396,8 +396,8 @@ pub fn normalize_selection_slot(selection: &mut Option<Selection>) {
 /// `draw_overlay_ui` (its surface and its panel) and `captures_canvas_pointer` (standing the tab's
 /// canvas input aside). All of them are inert by default, so the four shipped tools implement none.
 ///
-/// `Send` is a supertrait because the PS editor tab lives inside `MangaApp`, which is moved to a
-/// worker thread for its blocking teardown (`src/app/shutdown.rs` asserts it).
+/// `Send` is a supertrait because the PS editor tab lives inside `StudioApp`, which is moved to a
+/// worker thread for its blocking teardown (`src/studio/shutdown.rs` asserts it).
 pub trait PsTool: Send {
     fn id(&self) -> PsToolId;
     fn title(&self) -> &'static str;

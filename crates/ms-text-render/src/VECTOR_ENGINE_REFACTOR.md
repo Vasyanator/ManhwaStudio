@@ -344,5 +344,5 @@ not affected. AA does not affect layout, so it is excluded from
 `pipeline.rs`, `raster.rs`, `glyph_contour.rs`, `font_registry.rs`,
 `inline_styles.rs`, `wrap/{shape,horizontal,vertical,forms,hyphenation}.rs`,
 `layout/vertical.rs`, `formula/render.rs`, `effects/*`,
-`src/tabs/typing/segmentation/{base,ru}.rs`, and the reference bin
-`src/bin/text_render_test/render.rs`.
+`src/tabs/typing/segmentation/{base,ru}.rs`, and the reference example
+`crates/ms-text-render/examples/text_render_test/render.rs`.

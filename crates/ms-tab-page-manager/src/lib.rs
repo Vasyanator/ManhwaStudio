@@ -8,7 +8,7 @@ keeps its path.
 
 Layer: near the top of the library stack — above the page-op transaction, the models, the
 widgets and `ms-tab-ps-editor` (the crop/split/stitch previews reuse its viewport camera),
-and below only `app.rs`. It must never name `app` or `launcher`.
+and below only `studio.rs`. It must never name `studio` or `launcher`.
 
 "Page manager" studio tab: a card grid of the chapter's pages with selection,
 badges (bubble count / layer count), each page's clean card linked under it, a
@@ -108,7 +108,7 @@ pub enum PageManagerAction {
 
 /// State of the "Page manager" tab. Construct with `Default`, wire the shared
 /// models through the `set_*` methods (mirroring the other tabs' wiring in
-/// `MangaApp::new`), then call [`Self::draw`] every frame the tab is active.
+/// `StudioApp::new`), then call [`Self::draw`] every frame the tab is active.
 pub struct PageManagerTabState {
     bubbles_model: Option<Arc<Mutex<BubblesModel>>>,
     overlays_model: Option<Arc<Mutex<CleanOverlaysModel>>>,

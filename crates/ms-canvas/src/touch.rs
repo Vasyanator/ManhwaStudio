@@ -58,7 +58,7 @@ const LONG_PRESS_FEEDBACK_RADIUS_PT: f32 = 28.0;
 
 /// Builds the touch owner id of a canvas whose scroll area uses `scroll_area_id_salt`.
 ///
-/// Content-named (never an instance counter): every `MangaApp` rebuild in the same
+/// Content-named (never an instance counter): every `StudioApp` rebuild in the same
 /// `egui::Context` gets the same id for the same tab canvas, and canvases of different tabs
 /// differ because their scroll salts differ.
 #[must_use]
