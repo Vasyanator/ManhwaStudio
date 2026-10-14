@@ -16,7 +16,9 @@ global session manager), `ms-onnx-runtime` (library resolver), `ms-tab-translati
 - `OrtRuntime` (`lib.rs`) is the app-side handle of the committed, dylib-backed ort environment;
   every session is built through it: `build_session` applies the committed execution provider
   and device uniformly, `build_session_cpu_only` (same options, no EP) serves graphs that are
-  CPU-oriented on every build (Baberu's int8 decoders). Both share one private builder.
+  CPU-oriented on every build (Baberu's int8 decoders). Both share one private builder, which
+  also applies the per-platform session thread policy (`SessionThreads::for_provider`: desktop
+  keeps onnxruntime's defaults, Android pins the intra-op / XNNPACK pools).
 - Engines own their sessions and take `&mut self` on run paths (`Session::run` requires it).
 - The detection DOMAIN (DB postprocess, glyph mask, `Quad`, `ProbMap`) is NOT here: `paddle_ocr`
   runs the forward pass and calls `ms_text_detect::{db, glyph_mask}` on the probability map
@@ -49,7 +51,7 @@ global session manager), `ms-onnx-runtime` (library resolver), `ms-tab-translati
 
 ## Editing map
 - To change provider / device selection or session options, edit `lib.rs`
-  (`OrtRuntime::build_session`).
+  (`OrtRuntime::build_session`); thread counts only in `SessionThreads::for_provider`.
 - To change MangaOCR inference, see `manga_ocr/`; PaddleOCR inference, see `paddle_ocr/`;
   Baberu OCR, see `baberu_ocr/`.
 - To change DB box extraction or the Paddle glyph mask, edit `ms-text-detect` (`db.rs`,

@@ -15,6 +15,8 @@ Main responsibilities:
 - images handed over by other apps (`incoming`): the Android Share / "Open with" inbox (Kotlin
   `IncomingImages`), "nothing incoming" on every other target;
 - the pre-window error box (`message::show_error_blocking`);
+- the installed package's native library directory (`native_libs`, Android only): where the
+  onnxruntime library bundled in the APK is loaded from;
 - the Android credential store (`credentials`, Kotlin `CredentialBridge`): API keys and tokens
   encrypted under an AndroidKeyStore key. Android only; desktop consumers keep `keyring`.
 
@@ -24,6 +26,7 @@ Key structures:
 - clipboard::{ClipboardRgba, ClipboardError}
 - incoming::{IncomingBatch, IncomingSkip, IncomingError}
 - credentials::CredentialError (Android)
+- native_libs::NativeLibraryDirError (Android)
 
 Notes:
 Holds no egui types: callers turn a dialog result into UI themselves and pass a repaint
@@ -44,6 +47,10 @@ pub mod credentials;
 pub mod file_dialog;
 pub mod incoming;
 pub mod message;
+// The installed package's native library directory (where the APK's bundled onnxruntime
+// lives). Android only: no other target has a package library folder to report.
+#[cfg(target_os = "android")]
+pub mod native_libs;
 
 // Android JNI plumbing. `saf.rs` (the pure half of the SAF bridge) is pure Rust, so it is also
 // compiled for host tests; everything that touches the JVM is Android-only inside.

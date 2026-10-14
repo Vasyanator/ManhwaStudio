@@ -6,7 +6,9 @@ for the current platform and a selected BUILD, so the `ms-onnx` crate can
 `dlopen` it. A **build** is a concrete onnxruntime binary of a specific version
 exposing a specific execution-provider set (see `builds.rs`). It probes a portable
 cache, and on first use downloads the pinned official release archive, verifies its
-SHA256, and extracts the loadable library (plus any extra sibling libs). It delivers
+SHA256, and extracts the loadable library (plus any extra sibling libs). On Android the
+library is BUNDLED in the APK instead (official `onnxruntime-android` AAR) and is only
+located, never downloaded. It delivers
 dylib RESOLUTION only: it does not link, initialize, or run onnxruntime.
 `native_runtime` consumes the returned path. The binary names the crate directly as
 `ms_onnx_runtime::` (native-only).
@@ -16,9 +18,11 @@ dylib RESOLUTION only: it does not link, initialize, or run onnxruntime.
 per-version cache root. Resolution flow (`resolve_or_download_ort_dylib(build)`):
 
 ```
-PlatformFeature::NativeOnnxRuntime unavailable (Android, wasm) -> Unavailable, nothing touched
+PlatformFeature::NativeOnnxRuntime unavailable (wasm) -> Unavailable, nothing touched
 manifest lookup_build (os, arch, build) -> (miss) NoManifestEntry, no network
-    -> version = entry.version (per-entry, NOT global)
+    -> (bundled row) <package nativeLibraryDir>/<library>, is_file -> return path
+                     (else BundledLibraryMissing / NativeLibraryDir), no network, no cache
+    -> (download row) version = entry.version (per-entry, NOT global)
     -> probe cache: ALL expected members present? -> (hit) return path, no network
     -> (miss) for the primary source AND each additional_source:
             download archive to <name>.part -> atomic rename
@@ -37,8 +41,18 @@ builds never collide.
 declares `slug`, Russian display name, `onnx_version`, `category` (Basic / Specific /
 Informational), the ordered EP set, and the platforms that have a manifest entry. It
 also owns `default_build_for_current_os` (windows → `directml`, linux → `webgpu`,
-macos → `coreml`, else `cpu`) and `default_build_for_provider` (the provider→build map
+macos → `coreml`, android → `xnnpack`, else `cpu`) and `default_build_for_provider` (the provider→build map
 the compat shims use).
+
+Bundled builds (Android aarch64): `cpu` (`[Cpu]`) and `xnnpack` (`[Xnnpack, Cpu]`, the
+default) are two EP sets over ONE bundled `libonnxruntime.so`. They are rows of the separate
+`bundled` table of `ort_manifest.json` (`{os, arch, provider, build, version, library}`), so
+the download schema keeps `url` / `archive` / `dylib_member` required; `lookup_build` returns
+`BuildSource::{Download, Bundled}`, so `build_version`, `build_shipped_here` and the crash-guard
+scope key work unchanged for both. The bundled version is pinned twice — the AAR coordinate in
+`android/app/build.gradle.kts` and the `bundled` rows — and a host test
+(`bundled_version_matches_the_gradle_aar_pin`) keeps them equal. `build_source_kind_here` and
+`ort_downloads_offered_here` tell the AI panel which builds have nothing to download.
 
 Per-build versions: cpu / coreml / webgpu = **1.27.0**, directml = **1.24.4**,
 cuda13 = **1.27.0**, cuda12 = **1.24.1**, openvino = **1.24.1**. `ORT_VERSION = 1.20.1`
@@ -75,17 +89,24 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
 - `manifest.rs`: typed manifest model (`ArchiveKind`, `ManifestSource`,
   `ManifestEntry` with its `build` field), embedded JSON parsing, `lookup`
   (four-key), `lookup_build` (the resolution primary), `build_version`,
-  `build_shipped_here` (allocation-free "has an archive here", used by the native availability rule),
+  `build_shipped_here` (allocation-free "has a row here", used by the native availability rule),
+  `build_source_kind_here` / `ort_downloads_offered_here` (download vs bundled, for the panel),
+  `BundledEntry` / `BuildSource`,
   `provider_version` (compat shim), `current_platform` over the pure `platform_keys`
-  (`android` is its own os key with no manifest row, never `linux`), and SHA256 helpers. Edit here
+  (`android` is its own os key with only bundled rows, never `linux`), and SHA256 helpers. Edit here
   to change the manifest schema or integrity checks.
 - `ort_manifest.json`: the pinned per-`(os, arch, provider, build)` download recipes,
-  each carrying its `build` slug, `version`, and (optionally) `additional_sources`.
+  each carrying its `build` slug, `version`, and (optionally) `additional_sources`; plus the
+  `bundled` table (libraries shipped inside the app package, Android only).
   Edit here to bump a build's version, add a platform, or add a build.
 
 ## Contracts and invariants
 - Worker-thread only: `resolve_or_download_ort_dylib` performs blocking network and
-  disk I/O and MUST NOT run on the GUI thread.
+  disk I/O (and, for a bundled build on Android, a JNI round trip through
+  `ms_platform::native_libs`) and MUST NOT run on the GUI thread.
+- Bundled rows: Android only (test `bundled_rows_are_android_only_and_match_the_catalog`), a
+  `(os, arch, build)` key is in at most one table, and a missing bundled library is the typed
+  `BundledLibraryMissing` (logged with the path), never a download.
 - App-starts-without-library: resolution is lazy and first-use only; a missing
   library is never an error until a caller asks for it.
 - Integrity: a pinned SHA256 that mismatches is a HARD error — the archive is
@@ -143,6 +164,9 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
   Any parity / end-to-end tests that pinned 1.20.1 CPU numeric output must be re-validated
   against 1.27.0 (numerics may differ within tolerance). onnxruntime 1.27.0 ships NO
   osx-x86_64 archive, so the CPU build drops Intel macOS (Apple Silicon only there).
+- Android library name: the AAR's `libonnxruntime.so` has an unversioned SONAME, so
+  `expected_primary_dylib_filename` returns `libonnxruntime.so` there (only a future Android
+  DOWNLOAD row would use it; bundled rows name their `library`).
 - No silent build substitution: a build with no manifest entry returns
   `OrtRuntimeError::NoManifestEntry`, never a CPU fallback or a panic.
 - Path safety: extracted members are flattened to a controlled filename inside the
@@ -150,6 +174,9 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
 - Storage location belongs to `config::data_dir()`; do not hard-code writable paths.
 
 ## Editing map
+- Bump the Android ORT: the AAR version in `android/app/build.gradle.kts`, the `bundled`
+  rows' `version` and the `cpu` / `xnnpack` catalog `onnx_version` together (tests pin all
+  three; a different `cpu` version per OS is not expressible today).
 - Bump a build's version, add a platform, or add a build: `ort_manifest.json` (per-entry
   `provider`, `build`, `version`, `url`, `sha256`, `archive`, `dylib_member`,
   `extra_members`, and optional `additional_sources`) AND the `builds.rs` catalog row.

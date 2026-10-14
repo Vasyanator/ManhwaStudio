@@ -215,5 +215,23 @@
         "onnxruntime/capi/libtbbmalloc.so"
       ]
     }
+  ],
+  "bundled": [
+    {
+      "os": "android",
+      "arch": "aarch64",
+      "provider": "cpu",
+      "build": "cpu",
+      "version": "1.27.0",
+      "library": "libonnxruntime.so"
+    },
+    {
+      "os": "android",
+      "arch": "aarch64",
+      "provider": "xnnpack",
+      "build": "xnnpack",
+      "version": "1.27.0",
+      "library": "libonnxruntime.so"
+    }
   ]
 }

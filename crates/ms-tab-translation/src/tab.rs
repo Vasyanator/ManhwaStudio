@@ -104,9 +104,12 @@ Characters/footer sync:
 OCR flow:
 - `poll_ocr_events`: consumes OCR controller events, toasts, optional bubble insert, retry logic.
 - `handle_ocr_selection`: OCR selection capture layer and finalize behavior.
-- `touch_selection_mode` / `begin_touch_ocr_selection`: the finger long-press selection drag of
-  the held OCR / crop mode (driven through `ms_canvas::drive_touch_drag`); the capture areas are
-  registered as touch capture layers of the canvas, so a plain finger pans under them.
+- `touch_selection_mode` / `touch_selection_mode_for` / `begin_touch_ocr_selection`: the finger
+  long-press selection drag of the held OCR / crop mode, or with no key held of the panel's
+  finger OCR kind (`OcrPanelOptions::finger_selection`), driven through
+  `ms_canvas::drive_touch_drag`; it ends on lift only (never on a modifier release), and on an
+  unavailable OCR route it is refused with a toast (`finger_ocr_selection_refused`). The capture
+  areas are registered as touch capture layers of the canvas, so a plain finger pans under them.
 - `open_advanced_recognition_for_scene_rect`: opens advanced-recognition window for selected scene rect.
 - `wants_canvas_shift_drag_selection` (CanvasHooks): reserves canvas drag for OCR capture.
 
@@ -264,7 +267,7 @@ use crate::panels::machine_translation::{
     MtPanelOptions, MtPanelProgress, MtPanelRun, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
 };
 use crate::panels::ocr::{
-    CharReplacementRuleUi, OcrPanelModelView, OcrPanelOptions, draw_ocr_panel, selected_mode_requirement,
+    CharReplacementRuleUi, FingerOcrSelection, OcrPanelModelView, OcrPanelOptions, draw_ocr_panel, selected_mode_requirement,
 };
 use crate::panels::text_detector::{
     DetectorUnavailable, TextDetectorAlgorithm, TextDetectorPanelOptions, TextDetectorPanelView, TextDetectorPlanNoticeCache,
@@ -530,13 +533,64 @@ enum OcrSelectionKind {
     Advanced,
 }
 
+impl From<FingerOcrSelection> for OcrSelectionKind {
+    fn from(finger: FingerOcrSelection) -> Self {
+        match finger {
+            FingerOcrSelection::Quick => Self::Simple,
+            FingerOcrSelection::Advanced => Self::Advanced,
+        }
+    }
+}
+
 /// The capture mode a finger long-press drag drives this frame (see `touch_selection_mode`).
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TouchSelectionMode {
     /// Shift+Q held: page-crop selection for an image bubble.
     ImageCrop,
-    /// An OCR selection modifier held: quick or advanced OCR of the selected rect.
+    /// Quick or advanced OCR of the selected rect: the held OCR modifier's kind, or with no
+    /// key held the panel's finger OCR kind.
     Ocr(OcrSelectionKind),
+}
+
+/// The per-frame facts [`touch_selection_mode_for`] decides on.
+#[derive(Debug, Clone, Copy)]
+struct TouchSelectionInputs {
+    /// The crop chord (Shift+Q) is held.
+    crop_keys_down: bool,
+    /// The advanced recognition window is open (it owns OCR until closed).
+    advanced_window_open: bool,
+    /// A text-detector edit mode (lines or mask) is on: its own long-press meaning stays.
+    detector_edit_mode: bool,
+    /// The advanced OCR modifier is held.
+    advanced_held: bool,
+    /// The quick OCR modifier is held.
+    quick_held: bool,
+    /// The panel's finger OCR kind, used when no key is held.
+    finger_kind: OcrSelectionKind,
+}
+
+/// The capture mode a finger long-press drag drives (pure; see
+/// `TranslationTabState::touch_selection_mode`): the crop chord, then a held advanced or quick
+/// modifier — the pointer path's precedence — and with no key held the finger OCR kind, unless
+/// the advanced window is open or a text-detector edit mode is on (`None`: the drag pans). The
+/// OCR route is NOT consulted: an unavailable route still claims the drag so it can be refused
+/// visibly (`finger_ocr_selection_refused`).
+fn touch_selection_mode_for(inputs: TouchSelectionInputs) -> Option<TouchSelectionMode> {
+    if inputs.crop_keys_down {
+        return Some(TouchSelectionMode::ImageCrop);
+    }
+    if inputs.advanced_window_open {
+        return None;
+    }
+    if inputs.advanced_held {
+        Some(TouchSelectionMode::Ocr(OcrSelectionKind::Advanced))
+    } else if inputs.quick_held {
+        Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple))
+    } else if inputs.detector_edit_mode {
+        None
+    } else {
+        Some(TouchSelectionMode::Ocr(inputs.finger_kind))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -587,6 +641,16 @@ impl ImageCropDragSelection {
 impl OcrDragSelection {
     fn rect(&self) -> Rect {
         Rect::from_two_pos(self.start, self.current)
+    }
+
+    /// Whether the pointer path ends this selection this frame: a mouse selection ends on a
+    /// drag stop or on releasing its own modifier. A finger one never ends here — only on lift
+    /// or cancel (`drive_touch_drag`), since it may run with no key held at all.
+    fn pointer_should_finish(&self, drag_stopped: bool, advanced_held: bool, quick_held: bool) -> bool {
+        !self.touch
+            && (drag_stopped
+                || (self.kind == OcrSelectionKind::Advanced && !advanced_held)
+                || (self.kind == OcrSelectionKind::Simple && !quick_held))
     }
 }
 
@@ -1368,24 +1432,25 @@ impl TranslationTabState {
 
     /// The capture mode a finger long-press drag drives this frame, or `None` (the drag pans).
     ///
-    /// The same precedence the pointer path applies: the crop chord wins over the OCR
-    /// modifiers, OCR needs a runnable route for the selected engine and no open advanced-recognition window, and the
-    /// advanced modifier wins over the quick one. A mode is a held key here, so a finger
-    /// selects only while its mode is held, exactly like the mouse.
+    /// The pointer path's precedence (crop chord, then the advanced, then the quick modifier);
+    /// with no key held a finger still selects, with the panel's finger OCR kind, because a
+    /// tablet has no keyboard. Rules: [`touch_selection_mode_for`].
     fn touch_selection_mode(&self, ctx: &egui::Context) -> Option<TouchSelectionMode> {
-        if Self::image_crop_selection_keys_down(ctx) {
-            return Some(TouchSelectionMode::ImageCrop);
-        }
-        if self.selected_ocr_route_availability().is_err() || self.advanced_recognition.is_open() {
-            return None;
-        }
-        if self.ocr_advanced_selection_mode_active() {
-            Some(TouchSelectionMode::Ocr(OcrSelectionKind::Advanced))
-        } else if self.ocr_quick_selection_mode_active() {
-            Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple))
-        } else {
-            None
-        }
+        touch_selection_mode_for(TouchSelectionInputs {
+            crop_keys_down: Self::image_crop_selection_keys_down(ctx),
+            advanced_window_open: self.advanced_recognition.is_open(),
+            detector_edit_mode: self.text_detector_edit_lines_mode || self.text_detector_edit_mask_mode,
+            advanced_held: self.ocr_advanced_selection_mode_active(),
+            quick_held: self.ocr_quick_selection_mode_active(),
+            finger_kind: self.ocr_panel_options.finger_selection.into(),
+        })
+    }
+
+    /// Whether canvas finger gestures are effective in this process: the platform supports
+    /// them AND the user's `General.touch_gestures` setting is on (`ms_config::touch_gestures`,
+    /// the owner the main window's router reads too). Gates the finger-only OCR panel controls.
+    fn finger_gestures_active() -> bool {
+        ms_config::touch_gestures::enabled_with(ms_platform::PlatformFeature::CanvasTouchGestures.is_available())
     }
 
     fn panel_title(&self, panel: TranslationPanel) -> String {
@@ -1679,6 +1744,7 @@ impl TranslationTabState {
                 let backend_unavailable = requires_backend && self.ai_backend_unavailable();
                 let quick_selection_active = self.ocr_quick_selection_mode_active();
                 let advanced_selection_active = self.ocr_advanced_selection_mode_active();
+                let finger_gestures_active = Self::finger_gestures_active();
                 let actions = draw_ocr_panel(
                     ui,
                     self.ocr_state_for_engine(self.ocr_panel_options.engine),
@@ -1689,6 +1755,7 @@ impl TranslationTabState {
                     quick_selection_active,
                     self.hotkey_hints.ocr_advanced_selection_mode.as_deref(),
                     advanced_selection_active,
+                    finger_gestures_active,
                     &self.ocr_controller.generation_snapshot(),
                     OcrPanelModelView { korean_source, download: model_snapshot.as_ref() },
                 );
@@ -4923,8 +4990,17 @@ impl TranslationTabState {
         canvas: &CanvasView,
         project: &ProjectData,
     ) {
-        if self.current_ocr_route_availability().is_err() {
+        let touch = canvas.touch_selection();
+        if let Err(off) = self.current_ocr_route_availability() {
             self.ocr_selection = None;
+            // A finger OCR selection on an unavailable route is refused visibly at its start
+            // instead of drawing a rect that cannot run (the drag stays claimed, so it does
+            // not pan either).
+            if let Some(touch) = touch
+                && finger_ocr_selection_refused(touch, self.touch_selection_mode(ctx), contains_any_page(canvas, project, touch.origin))
+            {
+                self.push_toast(ctx, off.user_message(), Severity::Error, 2.6);
+            }
             return;
         }
         if self.advanced_recognition.is_open() {
@@ -4938,14 +5014,16 @@ impl TranslationTabState {
         let advanced_mode_active = self.ocr_advanced_selection_mode_active();
         let quick_mode_active = self.ocr_quick_selection_mode_active();
         let selection_active = self.ocr_selection.is_some();
-        if !advanced_mode_active && !quick_mode_active && !selection_active {
+        // A finger selection runs with no key held (the finger OCR kind), so its drag alone
+        // keeps this path alive.
+        if !advanced_mode_active && !quick_mode_active && !selection_active && touch.is_none() {
             return;
         }
 
         // The finger first (see `drive_touch_drag`): its selection starts at the long-press
-        // point, takes the kind of the modifier held then, and ends on lift exactly like a
-        // mouse release below.
-        if let Some(touch) = canvas.touch_selection() {
+        // point, takes the kind of the modifier held then (or the finger OCR kind with none),
+        // and ends on lift exactly like a mouse release below.
+        if let Some(touch) = touch {
             let mode = self.touch_selection_mode(ctx);
             if let Some(finished) = drive_touch_drag(&mut self.ocr_selection, touch, |origin| {
                 begin_touch_ocr_selection(mode, contains_any_page(canvas, project, origin), origin, recent_character_rank_from_input(ctx))
@@ -5006,12 +5084,8 @@ impl TranslationTabState {
                     }
                 }
 
-                // Releasing the selection's modifier ends it for both sources; a drag stop only
-                // ends a mouse selection (a finger one ended on lift above).
                 let should_finish = self.ocr_selection.as_ref().is_some_and(|selection| {
-                    (!selection.touch && response.drag_stopped())
-                        || (selection.kind == OcrSelectionKind::Advanced && !advanced_mode_active)
-                        || (selection.kind == OcrSelectionKind::Simple && !quick_mode_active)
+                    selection.pointer_should_finish(response.drag_stopped(), advanced_mode_active, quick_mode_active)
                 });
                 if should_finish && let Some(selection) = self.ocr_selection.take() {
                     self.finish_ocr_selection(ctx, canvas, project, selection);
@@ -6163,6 +6237,14 @@ impl TranslationTabState {
             }
             if let Some(bubbles) = ocr_obj.get("bubbles").and_then(Value::as_bool) {
                 self.ocr_panel_options.create_bubble = bubbles;
+            }
+            // Absent (older titles) or unknown keeps the quick default.
+            if let Some(finger) = ocr_obj
+                .get("finger_selection")
+                .and_then(Value::as_str)
+                .and_then(FingerOcrSelection::from_settings_key)
+            {
+                self.ocr_panel_options.finger_selection = finger;
             }
             if let Some(replace_chars) = ocr_obj.get("replace_chars").and_then(Value::as_bool) {
                 self.ocr_panel_options.replace_chars_enabled = replace_chars;
@@ -7476,9 +7558,19 @@ fn begin_touch_ocr_selection(
     on_page.then_some(OcrDragSelection { start: origin, current: origin, kind, recent_character_rank, touch: true })
 }
 
+/// Whether this frame's finger `touch` STARTS an OCR selection that must be refused because the
+/// OCR route is unavailable: exactly the press `begin_touch_ocr_selection` would turn into a
+/// rect (an OCR `mode`, on a page), on its first frame only, so one gesture toasts once.
+fn finger_ocr_selection_refused(touch: ms_widgets::touch_nav::TouchSelection, mode: Option<TouchSelectionMode>, on_page: bool) -> bool {
+    touch.began && begin_touch_ocr_selection(mode, on_page, touch.origin, None).is_some()
+}
+
 #[cfg(test)]
 mod touch_selection_tests {
-    use super::{OcrDragSelection, OcrSelectionKind, TouchSelectionMode, begin_touch_ocr_selection};
+    use super::{
+        OcrDragSelection, OcrSelectionKind, TouchSelectionInputs, TouchSelectionMode, begin_touch_ocr_selection,
+        finger_ocr_selection_refused, touch_selection_mode_for,
+    };
     use eframe::egui::{Rect, pos2};
     use ms_canvas::drive_touch_drag;
     use ms_widgets::touch_nav::{TouchSelection, TouchSelectionEnd};
@@ -7508,6 +7600,92 @@ mod touch_selection_tests {
         assert_eq!(finished.rect(), Rect::from_two_pos(origin, pos2(80.0, 90.0)));
         assert_eq!(finished.kind, OcrSelectionKind::Advanced);
         assert!(slot.is_none());
+    }
+
+    /// No key held, nothing else active: the finger OCR kind of the panel.
+    fn idle(finger_kind: OcrSelectionKind) -> TouchSelectionInputs {
+        TouchSelectionInputs {
+            crop_keys_down: false,
+            advanced_window_open: false,
+            detector_edit_mode: false,
+            advanced_held: false,
+            quick_held: false,
+            finger_kind,
+        }
+    }
+
+    #[test]
+    fn with_no_key_held_a_finger_selects_the_configured_ocr_kind() {
+        for kind in [OcrSelectionKind::Simple, OcrSelectionKind::Advanced] {
+            assert_eq!(touch_selection_mode_for(idle(kind)), Some(TouchSelectionMode::Ocr(kind)));
+        }
+        assert_eq!(OcrSelectionKind::from(crate::panels::ocr::FingerOcrSelection::default()), OcrSelectionKind::Simple, "quick by default");
+    }
+
+    #[test]
+    fn a_held_key_wins_over_the_finger_kind() {
+        let finger_advanced = idle(OcrSelectionKind::Advanced);
+        let quick = TouchSelectionInputs { quick_held: true, ..finger_advanced };
+        assert_eq!(touch_selection_mode_for(quick), Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple)));
+        let finger_quick = idle(OcrSelectionKind::Simple);
+        let advanced = TouchSelectionInputs { advanced_held: true, quick_held: true, ..finger_quick };
+        assert_eq!(touch_selection_mode_for(advanced), Some(TouchSelectionMode::Ocr(OcrSelectionKind::Advanced)));
+        let crop = TouchSelectionInputs { crop_keys_down: true, advanced_held: true, ..finger_quick };
+        assert_eq!(touch_selection_mode_for(crop), Some(TouchSelectionMode::ImageCrop));
+    }
+
+    #[test]
+    fn the_finger_kind_yields_to_the_advanced_window_and_detector_edit_modes() {
+        let finger = idle(OcrSelectionKind::Simple);
+        assert_eq!(touch_selection_mode_for(TouchSelectionInputs { advanced_window_open: true, ..finger }), None);
+        assert_eq!(touch_selection_mode_for(TouchSelectionInputs { advanced_window_open: true, quick_held: true, ..finger }), None);
+        assert_eq!(touch_selection_mode_for(TouchSelectionInputs { detector_edit_mode: true, ..finger }), None, "edit modes keep their long-press");
+        assert_eq!(
+            touch_selection_mode_for(TouchSelectionInputs { detector_edit_mode: true, quick_held: true, ..finger }),
+            Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple)),
+            "a held key still selects in an edit mode, as the mouse does"
+        );
+    }
+
+    #[test]
+    fn a_finger_selection_is_not_finished_by_the_modifier_state() {
+        let origin = pos2(5.0, 5.0);
+        for kind in [OcrSelectionKind::Simple, OcrSelectionKind::Advanced] {
+            let finger = begin_touch_ocr_selection(Some(TouchSelectionMode::Ocr(kind)), true, origin, None).expect("starts");
+            for (drag_stopped, advanced_held, quick_held) in [(false, false, false), (true, false, false), (false, true, true)] {
+                assert!(!finger.pointer_should_finish(drag_stopped, advanced_held, quick_held), "a finger selection ends only on lift");
+            }
+            let mouse = OcrDragSelection { touch: false, ..finger.clone() };
+            assert!(mouse.pointer_should_finish(false, false, false), "a mouse selection ends when its modifier is released");
+            assert!(mouse.pointer_should_finish(true, true, true), "and on a drag stop");
+            assert!(!mouse.pointer_should_finish(false, true, true));
+        }
+    }
+
+    #[test]
+    fn a_cancelled_finger_selection_commits_nothing() {
+        let origin = pos2(10.0, 10.0);
+        let mut slot: Option<OcrDragSelection> = None;
+        let begin = |at| begin_touch_ocr_selection(touch_selection_mode_for(idle(OcrSelectionKind::Simple)), true, at, None);
+        let step = TouchSelection { origin, pos: pos2(60.0, 60.0), began: true, end: None };
+        assert!(drive_touch_drag(&mut slot, step, begin).is_none());
+        assert!(slot.is_some(), "the key-less finger drag started a selection");
+        let cancel = TouchSelection { origin, pos: pos2(70.0, 70.0), began: false, end: Some(TouchSelectionEnd::Cancelled) };
+        assert!(drive_touch_drag(&mut slot, cancel, begin).is_none(), "a cancel runs no OCR");
+        assert!(slot.is_none(), "and drops the rect");
+    }
+
+    #[test]
+    fn an_unavailable_route_refuses_a_finger_selection_once_at_its_start() {
+        let origin = pos2(10.0, 10.0);
+        let mode = touch_selection_mode_for(idle(OcrSelectionKind::Simple));
+        let began = TouchSelection { origin, pos: origin, began: true, end: None };
+        assert!(finger_ocr_selection_refused(began, mode, true));
+        let later = TouchSelection { began: false, ..began };
+        assert!(!finger_ocr_selection_refused(later, mode, true), "one toast per gesture");
+        assert!(!finger_ocr_selection_refused(began, mode, false), "off a page nothing would start");
+        assert!(!finger_ocr_selection_refused(began, Some(TouchSelectionMode::ImageCrop), true), "the crop chord is not OCR");
+        assert!(!finger_ocr_selection_refused(began, None, true));
     }
 }
 
@@ -7907,6 +8085,10 @@ fn apply_translation_settings_sections(
     ocr_obj.insert(
         "bubbles".to_string(),
         Value::Bool(ocr_options.create_bubble),
+    );
+    ocr_obj.insert(
+        "finger_selection".to_string(),
+        Value::String(ocr_options.finger_selection.settings_key().to_string()),
     );
     ocr_obj.insert(
         "replace_chars".to_string(),

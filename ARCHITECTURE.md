@@ -90,8 +90,9 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - `ms-backend-ipc` — framed IPC client for the Python backend.
 - `ms-platform` — GUI-free platform seams: the capability table
   (`PlatformFeature::is_available()`, typed `Unavailable`), the async-shaped file-dialog seam
-  (rfd on desktop, Storage Access Framework on Android), clipboard reads and the pre-window
-  error box. The only crate naming `rfd` / `arboard`, and the one place JNI is used for
+  (rfd on desktop, Storage Access Framework on Android), clipboard reads, the pre-window
+  error box, the Android credential store (`credentials`) and the Android package's native
+  library directory (`native_libs`). The only crate naming `rfd` / `arboard`, and the one place JNI is used for
   platform services.
 
 **Core (levels 3-6)**
@@ -350,6 +351,9 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
 
 - **Two runtimes.** In-process native ONNX (`ms-onnx` sessions, `ms-onnx-runtime` library
   resolver/downloader, `ms-native-runtime` manager) and the out-of-process Python backend.
+  On Android the native runtime loads the onnxruntime library bundled in the APK (official
+  `onnxruntime-android` AAR; `bundled` rows of `ort_manifest.json`, located through
+  `ms_platform::native_libs`); builds `cpu` and `xnnpack` (default), nothing is downloaded.
   `ms_tab_translation::local_ai::effective_ai_runtime` picks the effective one: native unless the
   user explicitly chose the backend (`General.ai_runtime_configured`) on a platform that has it.
   `--no-ai` turns off the LOCAL runtimes only (backend and native ONNX); cloud AI API OCR / MT and

@@ -10,14 +10,16 @@ the loadable library, and returns its on-disk path. The app starts fine without
 the library present — resolution happens only when a caller asks for it.
 
 Key types:
-- OrtRuntimeError    : typed failure surface for probe/download/verify/extract, plus
-  `Unavailable` where the platform has no native runtime (Android, wasm)
+- OrtRuntimeError    : typed failure surface for probe/download/verify/extract and the
+  bundled-library lookup, plus `Unavailable` where the platform has no native runtime (wasm)
 - OrtDownloadStage   : coarse progress stage (Probing/Downloading/.../Done)
 - OrtDownloadProgress: byte counters + stage reported through the callback
 
 Key functions:
 - ort_dylib_dir                : pure per-provider/version cache directory
-- resolve_or_download_ort_dylib: probe or download+verify+extract, worker-thread only
+- resolve_or_download_ort_dylib: probe or download+verify+extract (download rows), or
+  locate the library the app package ships (bundled rows); worker-thread only
+- build_source_kind_here / ort_downloads_offered_here: download vs bundled, for the UI
 
 Notes:
 The onnxruntime version is per manifest ENTRY, not global: the resolved cache dir
@@ -28,7 +30,9 @@ and every additional source share one download+verify+extract path. Downloads an
 disk I/O are blocking; `resolve_or_download_ort_dylib` MUST run on a worker thread,
 never on the GUI thread. This module owns dylib RESOLUTION only; it never links,
 initializes, or runs onnxruntime — that is `ms-onnx`'s job, and it consumes the
-path returned here. Storage lives under `ms_config::data_dir()`. The binary names this crate directly as
+path returned here. A BUNDLED build (Android: the `onnxruntime-android` AAR merged into the
+APK) has no recipe: resolution returns `<package native library dir>/<library>` after an
+existence check, with no network and no cache directory. Storage lives under `ms_config::data_dir()`. The binary names this crate directly as
 `ms_onnx_runtime::`.
 */
 
@@ -66,7 +70,7 @@ mod manifest;
 // unused-import warning only until the build-selection UI consumes `build_version`
 // directly.
 #[allow(unused_imports)]
-pub use manifest::{ORT_VERSION, build_shipped_here, build_version, provider_version};
+pub use manifest::{ORT_VERSION, OrtBuildSourceKind, build_shipped_here, build_source_kind_here, build_version, ort_downloads_offered_here, provider_version};
 
 /// Read buffer size for streaming the archive download to disk.
 const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
@@ -125,6 +129,14 @@ pub enum OrtRuntimeError {
     /// The platform has no native ONNX Runtime (`PlatformFeature::NativeOnnxRuntime`);
     /// returned before any manifest lookup, disk or network access.
     Unavailable(ms_platform::Unavailable),
+
+    /// A bundled build's library folder (the app package's native library directory)
+    /// could not be determined. Carries the technical detail (JNI failure text).
+    NativeLibraryDir(String),
+
+    /// A bundled build's library is not in the app package's native library directory
+    /// (a broken or foreign APK). Never answered with a download.
+    BundledLibraryMissing(PathBuf),
 }
 
 impl std::fmt::Display for OrtRuntimeError {
@@ -157,6 +169,13 @@ impl std::fmt::Display for OrtRuntimeError {
             Self::Io(detail) => f.write_str(&tf!("onnx_runtime.error.io", detail = detail)),
             // Already localized by `ms-platform`.
             Self::Unavailable(err) => std::fmt::Display::fmt(err, f),
+            Self::NativeLibraryDir(detail) => {
+                f.write_str(&tf!("onnx_runtime.error.native_library_dir", detail = detail))
+            }
+            Self::BundledLibraryMissing(path) => f.write_str(&tf!(
+                "onnx_runtime.error.bundled_library_missing",
+                path = path.display()
+            )),
         }
     }
 }
@@ -214,7 +233,9 @@ pub fn ort_dylib_dir(build_slug: &str, ort_version: &str) -> PathBuf {
 /// Resolves the onnxruntime library path for BUILD `build`, downloading it on first use.
 ///
 /// `build` is a stable build slug from the [`builds`] catalog (e.g. `"cpu"`,
-/// `"cuda13"`, `"openvino"`). Probes [`ort_dylib_dir`] for an already-extracted
+/// `"cuda13"`, `"openvino"`). A BUNDLED row (Android) resolves to the library inside the
+/// app package's native library directory after an existence check — no network, no
+/// cache, progress `Probing` then `Done`. For a download row it probes [`ort_dylib_dir`] for an already-extracted
 /// library and returns its path immediately (no network) if present. Otherwise it
 /// looks up the manifest entry for the current platform and this build, downloads the
 /// official archive, verifies its SHA256 (mismatch is a hard error — the bad file is
@@ -236,6 +257,8 @@ pub fn ort_dylib_dir(build_slug: &str, ort_version: &str) -> PathBuf {
 /// - [`OrtRuntimeError::ChecksumMismatch`] if the archive fails SHA256 verification.
 /// - [`OrtRuntimeError::Extraction`] / [`OrtRuntimeError::DylibNotFoundInArchive`] on unpack failure.
 /// - [`OrtRuntimeError::Io`] on filesystem failure.
+/// - [`OrtRuntimeError::NativeLibraryDir`] / [`OrtRuntimeError::BundledLibraryMissing`] for a
+///   bundled build whose package folder is unknown or lacks the library.
 pub fn resolve_or_download_ort_dylib(
     build: &str,
     progress: &mut dyn FnMut(OrtDownloadProgress),
@@ -249,13 +272,27 @@ pub fn resolve_or_download_ort_dylib(
     // successful download (which requires an entry), so probing after the lookup never
     // regresses the offline fast path.
     let (os, arch) = manifest::current_platform();
-    let entry = manifest::lookup_build(os, arch, build).ok_or_else(|| {
+    let source = manifest::lookup_build(os, arch, build).ok_or_else(|| {
         OrtRuntimeError::NoManifestEntry {
             os,
             arch,
             build: build.to_string(),
         }
     })?;
+    let entry = match source {
+        manifest::BuildSource::Download(entry) => entry,
+        manifest::BuildSource::Bundled(entry) => {
+            emit(progress, OrtDownloadStage::Probing, 0, None);
+            let path = bundled_library_path(package_native_library_dir()?, entry)?;
+            runtime_log::log_info(format!(
+                "[onnx-runtime] using bundled ONNX Runtime {} for build '{build}' at {}",
+                entry.version,
+                path.display()
+            ));
+            emit(progress, OrtDownloadStage::Done, 0, None);
+            return Ok(path);
+        }
+    };
 
     let provider_id = entry.provider.as_str();
     let version = entry.version.as_str();
@@ -338,6 +375,49 @@ pub fn resolve_or_download_ort_dylib(
     ));
     emit(progress, OrtDownloadStage::Done, 0, None);
     Ok(primary_path)
+}
+
+/// The app package's native library directory, where bundled libraries live.
+///
+/// Android: `ApplicationInfo.nativeLibraryDir` (JNI; worker thread only, which every
+/// caller of the resolver already is).
+///
+/// # Errors
+/// [`OrtRuntimeError::NativeLibraryDir`] when the JVM cannot answer.
+#[cfg(target_os = "android")]
+fn package_native_library_dir() -> Result<&'static Path, OrtRuntimeError> {
+    ms_platform::native_libs::native_library_dir().map_err(|err| OrtRuntimeError::NativeLibraryDir(err.to_string()))
+}
+
+/// Other targets have no app package with a library folder. Unreachable through the
+/// shipped manifest (bundled rows are Android-only, enforced by a manifest test); an
+/// edited manifest gets a typed error, never a guessed path.
+///
+/// # Errors
+/// Always [`OrtRuntimeError::NativeLibraryDir`].
+#[cfg(not(target_os = "android"))]
+fn package_native_library_dir() -> Result<&'static Path, OrtRuntimeError> {
+    Err(OrtRuntimeError::NativeLibraryDir("this platform has no app package library folder".to_string()))
+}
+
+/// The bundled library of `entry` inside `dir`, after an existence check.
+///
+/// # Errors
+/// [`OrtRuntimeError::BundledLibraryMissing`] when `dir/<library>` is not a regular file
+/// (logged with the path: a packaging defect, not a user condition).
+fn bundled_library_path(dir: &Path, entry: &manifest::BundledEntry) -> Result<PathBuf, OrtRuntimeError> {
+    let path = dir.join(&entry.library);
+    if path.is_file() {
+        Ok(path)
+    } else {
+        runtime_log::log_error(format!(
+            "[onnx-runtime] bundled ONNX Runtime library for build '{}' is missing at {}; \
+             the APK was built without the onnxruntime-android AAR or with its library excluded.",
+            entry.build,
+            path.display()
+        ));
+        Err(OrtRuntimeError::BundledLibraryMissing(path))
+    }
 }
 
 /// The on-disk paths of every library an entry is expected to place in `dir`.
@@ -708,20 +788,23 @@ fn write_stream<R: Read>(reader: &mut R, out_path: &Path) -> Result<(), OrtRunti
 ///
 /// The returned name is what [`resolve_or_download_ort_dylib`] both probes for and
 /// writes the primary member to, so probe and extraction always agree. Linux and
-/// macOS embed the version in the soname; Windows does not.
+/// macOS embed the version in the soname; Windows and Android do not (Android's
+/// `onnxruntime-android` library has the unversioned SONAME `libonnxruntime.so`; its
+/// builds are bundled, so only an Android download row would ever reach this arm).
 #[must_use]
 fn expected_primary_dylib_filename(ort_version: &str) -> String {
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "android"))]
     {
-        // The Windows DLL name is unversioned; the version param is unused here.
+        // The Windows DLL / Android library name is unversioned; the version param is
+        // unused here.
         let _ = ort_version;
-        "onnxruntime.dll".to_string()
+        if cfg!(target_os = "windows") { "onnxruntime.dll".to_string() } else { "libonnxruntime.so".to_string() }
     }
     #[cfg(target_os = "macos")]
     {
         format!("libonnxruntime.{ort_version}.dylib")
     }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "android")))]
     {
         format!("libonnxruntime.so.{ort_version}")
     }
@@ -901,6 +984,31 @@ mod tests {
             &result,
             Err(OrtRuntimeError::NoManifestEntry { build, .. }) if build == "directml"
         ));
+    }
+
+    #[test]
+    fn bundled_library_path_requires_the_file() {
+        let base = std::env::temp_dir().join(format!("ort_bundled_test_{}", std::process::id()));
+        std::fs::create_dir_all(&base).expect("create test dir");
+        let entry = manifest::BundledEntry {
+            os: "android".to_string(),
+            arch: "aarch64".to_string(),
+            provider: "cpu".to_string(),
+            build: "cpu".to_string(),
+            version: "1.27.0".to_string(),
+            library: "libonnxruntime.so".to_string(),
+        };
+        let missing = bundled_library_path(&base, &entry);
+        assert!(matches!(&missing, Err(OrtRuntimeError::BundledLibraryMissing(path)) if path == &base.join("libonnxruntime.so")));
+        std::fs::write(base.join("libonnxruntime.so"), b"elf").expect("write fixture");
+        assert_eq!(bundled_library_path(&base, &entry).expect("present"), base.join("libonnxruntime.so"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    #[cfg(not(target_os = "android"))]
+    fn host_has_no_package_library_folder() {
+        assert!(matches!(package_native_library_dir(), Err(OrtRuntimeError::NativeLibraryDir(_))));
     }
 
     #[test]

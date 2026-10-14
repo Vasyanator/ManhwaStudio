@@ -38,7 +38,7 @@ these `ort` entry points:
   OpenVINO reads `OpenVinoDeviceType(s)` (a device-TYPE string like
   `"CPU"`/`"GPU"`/`"GPU.0"`/`"NPU"`/`"HETERO:..."`) and passes it via
   `with_device_type(s)`, otherwise letting OpenVINO pick its own default device.
-  CoreML/CPU ignore the selection. TensorRT is registered alone: onnxruntime still
+  CoreML/XNNPACK/CPU ignore the selection. TensorRT is registered alone: onnxruntime still
   falls back per-node to CPU for ops TensorRT cannot run (not an EP failure).
   WebGPU/OpenVINO/TensorRT are distinct backends (different GPU/accelerator
   kernels); their numeric output is NOT asserted byte-equal to the CPU reference —
@@ -112,19 +112,27 @@ unsupported-CPU SIGILL would surface.
   `OrtError::UnsupportedProvider`. `warmup` maps env-creation failure to
   `OrtError::WarmupFailed`. No `.unwrap()`/`.expect()` in these paths.
 - **`ExecutionProvider::id`** returns a stable lowercase id
-  (`cpu`/`directml`/`coreml`/`cuda`/`webgpu`/`openvino`/`tensorrt`) used by higher
+  (`cpu`/`directml`/`coreml`/`cuda`/`webgpu`/`openvino`/`tensorrt`/`xnnpack`) used by higher
   layers for per-provider config scoping. Keep these values stable.
 - **Provider platform gating:** DirectML = Windows only, Core ML = macOS only,
   CUDA = Windows/Linux, WebGPU = Windows/Linux/macOS (Dawn), OpenVINO = x86_64
   Windows/Linux (Intel device + OpenVINO runtime: self-contained on the Linux
   wheel, system SDK on Windows), TensorRT = Windows/Linux (mirrors CUDA; bundled in
-  the CUDA "gpu" build, needs the NVIDIA/CUDA stack), CPU = everywhere.
+  the CUDA "gpu" build, needs the NVIDIA/CUDA stack), XNNPACK = aarch64 Android only (the
+  bundled `onnxruntime-android` library carries it; the desktop archives do not), CPU =
+  everywhere.
   `ExecutionProvider::is_available_on_current_platform` exposes this predicate
   publicly so higher layers query availability without duplicating the
   `cfg(target_os)` logic; `OrtRuntime::load` uses it to gate. Note: rc.12's own
   `ort::ep::WebGPU::supported_by_platform` excludes macOS, but that only controls
   ort's log verbosity — registration still works on macOS with a WebGPU-capable
   dylib, so this crate reports macOS as available.
+- **Session threading has one owner**, the private `SessionThreads::for_provider` used by
+  `build_session_with` (every session builder goes through it). Desktop: nothing is set, so
+  sessions keep onnxruntime's defaults. Android: CPU sessions (including
+  `build_session_cpu_only`) get 4 intra-op threads; XNNPACK sessions get 1 intra-op thread
+  without spinning plus an XNNPACK pool of 4 (onnxruntime's documented XNNPACK layout). The
+  numbers are initial values that still need the device benchmark (`dev-docs/ANDROID_ONNX.md`).
 - **Global-singleton caveat:** ort's environment options are process-global.
   Only the first `load` commits its options; later loads reuse them (logged). A
   second `load` with a *different* dylib does not replace the first environment.

@@ -34,7 +34,8 @@ The APK is always Gradle's debug variant, signed with AGP's debug keystore
   never end up in the APK.
 - The winit / egui fork checkouts under `crates/` that the root `Cargo.toml` patches in.
 - Gradle itself is fetched by the wrapper (`gradlew`, pinned version + SHA-256); network access
-  is needed on the first build for Gradle, AGP and the AndroidX libraries.
+  is needed on the first build for Gradle, AGP, the AndroidX libraries and the ONNX Runtime AAR
+  (Maven Central; cached by Gradle afterwards).
 
 ## Layout
 
@@ -46,6 +47,8 @@ The APK is always Gradle's debug variant, signed with AGP's debug keystore
   versionCode = major * 1000000 + minor * 1000 + patch), dependencies, packaging.
 - `app/src/main/AndroidManifest.xml`: `LaunchActivity` (launcher entry) and `MainActivity`
   (the `GameActivity`, `android.app.lib_name = manhwastudio_rs`).
+- `app/src/main/res/xml/data_extraction_rules.xml`: Android 12+ backup / device-transfer
+  exclusions (see "Credential store").
 - `app/src/main/kotlin/io/github/vasyanator/manhwastudio/`:
   - `LaunchActivity.kt`: installs the bundled files on a worker thread, receives shared /
     opened images into the inbox, then starts `MainActivity` (see "Incoming images");
@@ -151,9 +154,10 @@ encrypted with it under a fresh IV and stored in the app-private SharedPreferenc
 `ms_credentials`. The key alias, the file name and the stored value format are persistence
 contracts; the JNI contract is in the Kotlin file header and the ms-platform `MODULE_README.md`.
 
-Cloud backup is disabled in the manifest, but Android 12+ may still copy app data in a
-device-to-device transfer; the Keystore key never travels, so transferred entries cannot be
-decrypted there. Whenever the key is missing (transfer, restore, Keystore reset), the entries
+Cloud backup is disabled in the manifest, and `res/xml/data_extraction_rules.xml` excludes
+`ms_credentials.xml` from cloud backup and from the device-to-device transfer that Android 12+
+performs even with `allowBackup="false"`; the Keystore key never travels anyway, so a copied
+entry could not be decrypted. Whenever the key is missing (restore, Keystore reset), the entries
 stay in place and every read reports "cannot be decrypted" instead of "no key"; saving the key
 again replaces the entry. No minification is configured, so the class needs no keep rule; one
 is needed if R8 is ever enabled (the class and its `@JvmStatic` methods are reached only by
@@ -163,6 +167,24 @@ Device check: save an API key in the AI API connection widget, force-stop the ap
 again and confirm the key still reads (the widget shows it stored); `adb shell run-as
 io.github.vasyanator.manhwastudio cat shared_prefs/ms_credentials.xml` shows only `v1.<hex>`
 names and `1:...` ciphertexts, never a plaintext key.
+
+## Native ONNX Runtime
+
+The native AI path (MangaOCR, PaddleOCR detection + recognition, Baberu OCR) loads the official
+`com.microsoft.onnxruntime:onnxruntime-android` AAR's `libonnxruntime.so` (CPU and XNNPACK
+execution providers), declared in `app/build.gradle.kts`. Gradle merges it into the APK
+(about +10 MB compressed, ~28 MB installed); `useLegacyPackaging = true` extracts it into the
+package's `nativeLibraryDir`, from which the Rust side loads it by path
+(`ms_platform::native_libs`, `ms_onnx_runtime` bundled rows) — nothing is downloaded on the
+device. The AAR's Java-API JNI library `libonnxruntime4j_jni.so` is excluded (unused). The AAR
+version is pinned twice on purpose and checked by a host test in `ms-onnx-runtime`
+(`bundled_version_matches_the_gradle_aar_pin`): bump `build.gradle.kts` and the `bundled` rows of
+`crates/ms-onnx-runtime/src/ort_manifest.json` (and the catalog in `builds.rs`) together.
+
+Device check: after the first native OCR the session log has the line
+`[onnx-runtime] using bundled ONNX Runtime ... at <nativeLibraryDir>/libonnxruntime.so`. If the system kills the app for memory during the
+first inference, the native crash guard stays "Suspect" like after a crash, and native AI stays
+off until "Retry ORT" in the AI settings.
 
 ## Bundled files and the runtime root
 

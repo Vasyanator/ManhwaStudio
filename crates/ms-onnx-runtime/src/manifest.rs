@@ -11,13 +11,19 @@ Key types:
 - ArchiveKind    : how a release archive is packed (Zip / TarGz / TarZst)
 - ManifestSource : one download+extract recipe (url, sha256, archive, members)
 - ManifestEntry  : one (os, arch, provider, build) -> version + primary source + extras
-- Manifest       : the whole parsed document (default version + entries)
+- BundledEntry   : one (os, arch, provider, build) -> version + the library the app
+  package ships (Android APK); no download recipe
+- BuildSource    : what `lookup_build` found — a download row or a bundled row
+- OrtBuildSourceKind : the public, data-free kind of a `BuildSource`
+- Manifest       : the whole parsed document (default version + entries + bundled)
 
 Key functions:
-- lookup            : find the entry for (os, arch, provider_id, build)
-- lookup_build      : find the entry for (os, arch, build) — the build-keyed primary
+- lookup            : find the DOWNLOAD entry for (os, arch, provider_id, build)
+- lookup_build      : find the row for (os, arch, build) in either table — the build-keyed primary
 - build_version     : the manifest version for a build on the current platform
-- build_shipped_here : whether a build has an archive for the current platform (no allocation)
+- build_shipped_here : whether a build has a row for the current platform (no allocation)
+- build_source_kind_here : download or bundled, for the current platform
+- ort_downloads_offered_here : whether any build is downloadable on the current platform
 - provider_version  : back-compat shim — the version of a provider's DEFAULT build
 - current_platform  : the (os, arch) pair this binary was built for
 - platform_keys     : pure target_os/target_arch -> manifest (os, arch) key mapping
@@ -38,6 +44,9 @@ can ship before a maintainer pins their hash; see the unverified-hash handling i
 `onnx_runtime::mod` and the module README. An entry may pull additional libraries from
 extra archives via `additional_sources` (multi-source entries), each extracted into the
 same cache directory as the primary source.
+Bundled rows live in their own `bundled` table, so the download schema stays strict
+(`url` / `archive` / `dylib_member` required): a bundled build has no recipe, its library
+is part of the app package. A `(os, arch, build)` key is in at most one table (test).
 */
 
 use std::fs::File;
@@ -147,6 +156,76 @@ pub struct ManifestEntry {
     pub additional_sources: Vec<ManifestSource>,
 }
 
+/// One bundled-build row: an onnxruntime library that ships INSIDE the app package (the
+/// Android APK merges it from the official `onnxruntime-android` AAR) instead of being
+/// downloaded. Resolution never touches the network for it: the library is looked up in
+/// the package's native library directory.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundledEntry {
+    /// Normalized OS key (`"android"` for every shipped row).
+    pub os: String,
+    /// Normalized architecture key (`"aarch64"`).
+    pub arch: String,
+    /// Provider id of the build's headline EP, matching `ms_onnx::ExecutionProvider::id`.
+    pub provider: String,
+    /// Build slug, matching a [`super::builds::OrtBuild::slug`]. Several bundled builds may
+    /// name the same library (one binary, different EP sets).
+    pub build: String,
+    /// ONNX Runtime version of the bundled library. Must equal the catalog build's
+    /// version AND the AAR version pinned in `android/app/build.gradle.kts` (both tested).
+    pub version: String,
+    /// File name of the library in the package's native library directory.
+    pub library: String,
+}
+
+/// What [`lookup_build`] found for a build on a platform.
+#[derive(Debug, Clone, Copy)]
+pub enum BuildSource {
+    /// A download recipe (official release archive or wheel).
+    Download(&'static ManifestEntry),
+    /// A library shipped inside the app package.
+    Bundled(&'static BundledEntry),
+}
+
+impl BuildSource {
+    /// The ONNX Runtime version of the row.
+    #[must_use]
+    pub fn version(self) -> &'static str {
+        match self {
+            BuildSource::Download(entry) => &entry.version,
+            BuildSource::Bundled(entry) => &entry.version,
+        }
+    }
+
+    /// The provider id of the row.
+    #[must_use]
+    pub fn provider(self) -> &'static str {
+        match self {
+            BuildSource::Download(entry) => &entry.provider,
+            BuildSource::Bundled(entry) => &entry.provider,
+        }
+    }
+
+    /// The data-free kind of this source.
+    #[must_use]
+    pub fn kind(self) -> OrtBuildSourceKind {
+        match self {
+            BuildSource::Download(_) => OrtBuildSourceKind::Download,
+            BuildSource::Bundled(_) => OrtBuildSourceKind::Bundled,
+        }
+    }
+}
+
+/// How a build's onnxruntime library is obtained on the current platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrtBuildSourceKind {
+    /// Downloaded on first use, verified and extracted into the per-build cache.
+    Download,
+    /// Shipped inside the app package; never downloaded.
+    Bundled,
+}
+
 /// The parsed manifest document.
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Manifest {
@@ -155,6 +234,8 @@ struct Manifest {
     ort_version: String,
     /// All known (os, arch, provider) download recipes.
     entries: Vec<ManifestEntry>,
+    /// Builds shipped inside the app package (no download recipe).
+    bundled: Vec<BundledEntry>,
 }
 
 /// Parses (once) and returns the embedded manifest.
@@ -193,18 +274,30 @@ pub fn lookup(
     })
 }
 
-/// Finds the manifest entry for `(os, arch, build)`, if one exists.
+/// Finds the row for `(os, arch, build)` in the download table or the bundled table.
 ///
-/// The primary lookup for resolution: a build slug is globally unique, so the
-/// `(os, arch, build)` triple identifies exactly one row. Returns `None` when the
-/// build is not shipped on this platform; the caller maps that to a typed
+/// The primary lookup for resolution: a build slug is globally unique and a key is in at
+/// most one table, so the `(os, arch, build)` triple identifies exactly one row. Returns
+/// `None` when the build is not shipped on this platform; the caller maps that to a typed
 /// `OrtRuntimeError::NoManifestEntry`.
 #[must_use]
-pub fn lookup_build(os: &str, arch: &str, build: &str) -> Option<&'static ManifestEntry> {
+pub fn lookup_build(os: &str, arch: &str, build: &str) -> Option<BuildSource> {
+    lookup_download(os, arch, build).map(BuildSource::Download).or_else(|| lookup_bundled(os, arch, build).map(BuildSource::Bundled))
+}
+
+/// The download row for `(os, arch, build)`, if any.
+#[must_use]
+fn lookup_download(os: &str, arch: &str, build: &str) -> Option<&'static ManifestEntry> {
     manifest()
         .entries
         .iter()
         .find(|entry| entry.os == os && entry.arch == arch && entry.build == build)
+}
+
+/// The bundled row for `(os, arch, build)`, if any.
+#[must_use]
+fn lookup_bundled(os: &str, arch: &str, build: &str) -> Option<&'static BundledEntry> {
+    manifest().bundled.iter().find(|entry| entry.os == os && entry.arch == arch && entry.build == build)
 }
 
 /// The ONNX Runtime version pinned for build `build` on the CURRENT platform.
@@ -215,10 +308,11 @@ pub fn lookup_build(os: &str, arch: &str, build: &str) -> Option<&'static Manife
 #[must_use]
 pub fn build_version(build: &str) -> Option<String> {
     let (os, arch) = current_platform();
-    lookup_build(os, arch, build).map(|entry| entry.version.clone())
+    lookup_build(os, arch, build).map(|source| source.version().to_string())
 }
 
-/// Whether build `build` has a pinned archive for the CURRENT platform's `(os, arch)`.
+/// Whether build `build` has a row (download or bundled) for the CURRENT platform's
+/// `(os, arch)`.
 ///
 /// Answers the same question as `build_version(build).is_some()` without cloning the
 /// version, so per-frame callers (the AI panel's build picker, through the native
@@ -228,6 +322,24 @@ pub fn build_version(build: &str) -> Option<String> {
 pub fn build_shipped_here(build: &str) -> bool {
     let (os, arch) = current_platform();
     lookup_build(os, arch, build).is_some()
+}
+
+/// How build `build`'s library is obtained on the CURRENT platform, or `None` when the
+/// build is not shipped here. Allocation-free (per-frame callers: the AI panel hides the
+/// download affordances of a bundled build).
+#[must_use]
+pub fn build_source_kind_here(build: &str) -> Option<OrtBuildSourceKind> {
+    let (os, arch) = current_platform();
+    lookup_build(os, arch, build).map(BuildSource::kind)
+}
+
+/// Whether any build can be DOWNLOADED on the current platform. `false` where every
+/// shipped build is bundled in the app package (Android): there, a build that is not
+/// shipped can never be obtained, so the AI panel lists only the shipped builds.
+#[must_use]
+pub fn ort_downloads_offered_here() -> bool {
+    let (os, arch) = current_platform();
+    manifest().entries.iter().any(|entry| entry.os == os && entry.arch == arch)
 }
 
 /// Back-compat shim: the version of `provider`'s DEFAULT build on the CURRENT platform.
@@ -256,9 +368,9 @@ pub fn current_platform() -> (&'static str, &'static str) {
 ///
 /// `os` is `"windows"`, `"macos"`, `"android"` or `"linux"`; `arch` is `"aarch64"` or
 /// `"x86_64"`. Android gets its own key, never `"linux"`: the official Linux archives are
-/// glibc builds that cannot load on Android's bionic, and the manifest has no `android`
-/// row, so every lookup there misses with the typed no-entry error. Any other unix falls
-/// through to `"linux"` intentionally (no matching archive -> the same typed miss). Pure.
+/// glibc builds that cannot load on Android's bionic; Android's rows are the `bundled`
+/// ones (the library inside the APK). Any other unix falls through to `"linux"`
+/// intentionally (no matching archive -> the typed no-entry miss). Pure.
 #[must_use]
 pub fn platform_keys(target_os: &str, target_arch: &str) -> (&'static str, &'static str) {
     let os = match target_os {
@@ -381,7 +493,7 @@ mod tests {
         // WebGPU ships the onnxruntime-webgpu 1.27.0 wheel per platform (Dawn is
         // statically linked into the main library — there is NO separate
         // `webgpu_dawn` sidecar in the 1.27.0 wheels).
-        let win = lookup_build("windows", "x86_64", "webgpu").expect("windows webgpu entry");
+        let win = lookup_download("windows", "x86_64", "webgpu").expect("windows webgpu entry");
         assert_eq!(win.version, "1.27.0");
         assert_eq!(win.archive, ArchiveKind::Zip);
         assert_eq!(win.dylib_member, "onnxruntime/capi/onnxruntime.dll");
@@ -397,7 +509,7 @@ mod tests {
                 .any(|m| m.ends_with("onnxruntime_providers_shared.dll"))
         );
 
-        let linux = lookup_build("linux", "x86_64", "webgpu").expect("linux webgpu entry");
+        let linux = lookup_download("linux", "x86_64", "webgpu").expect("linux webgpu entry");
         assert_eq!(linux.version, "1.27.0");
         assert_eq!(linux.archive, ArchiveKind::Zip);
         assert_eq!(
@@ -406,7 +518,7 @@ mod tests {
         );
         assert_eq!(linux.sha256.as_deref().map(str::len), Some(64));
 
-        let mac = lookup_build("macos", "aarch64", "webgpu").expect("macos webgpu entry");
+        let mac = lookup_download("macos", "aarch64", "webgpu").expect("macos webgpu entry");
         assert_eq!(mac.version, "1.27.0");
         assert_eq!(mac.archive, ArchiveKind::Zip);
         assert_eq!(mac.dylib_member, "onnxruntime/capi/libonnxruntime.1.27.0.dylib");
@@ -457,7 +569,7 @@ mod tests {
     fn additional_sources_default_to_empty_and_parse_when_present() {
         // Existing rows omit `additional_sources` -> it defaults to empty (serde
         // back-compat with the pre-multi-source JSON).
-        let cpu = lookup_build("linux", "x86_64", "cpu").expect("linux cpu entry");
+        let cpu = lookup_download("linux", "x86_64", "cpu").expect("linux cpu entry");
         assert!(cpu.additional_sources.is_empty());
 
         // A multi-source entry deserializes its extra archives with members.
@@ -491,10 +603,10 @@ mod tests {
     fn cpu_build_is_present_on_supported_platforms() {
         // The CPU build ships for linux/windows x86_64 and macOS on Apple Silicon.
         // onnxruntime 1.27.0 has NO osx-x86_64 archive, so Intel macOS is dropped.
-        assert!(lookup_build("linux", "x86_64", "cpu").is_some());
-        assert!(lookup_build("windows", "x86_64", "cpu").is_some());
-        assert!(lookup_build("macos", "aarch64", "cpu").is_some());
-        assert!(lookup_build("macos", "x86_64", "cpu").is_none());
+        assert!(lookup_download("linux", "x86_64", "cpu").is_some());
+        assert!(lookup_download("windows", "x86_64", "cpu").is_some());
+        assert!(lookup_download("macos", "aarch64", "cpu").is_some());
+        assert!(lookup_download("macos", "x86_64", "cpu").is_none());
     }
 
     #[test]
@@ -513,12 +625,12 @@ mod tests {
     #[test]
     fn lookup_misses_return_none() {
         // Unknown OS misses.
-        assert!(lookup_build("plan9", "x86_64", "cpu").is_none());
+        assert!(lookup_download("plan9", "x86_64", "cpu").is_none());
         // DirectML is Windows-only: there is no linux/directml archive.
-        assert!(lookup_build("linux", "x86_64", "directml").is_none());
+        assert!(lookup_download("linux", "x86_64", "directml").is_none());
         // CUDA builds are Windows/Linux only: there is no macOS/cuda archive.
-        assert!(lookup_build("macos", "x86_64", "cuda13").is_none());
-        assert!(lookup_build("macos", "aarch64", "cuda12").is_none());
+        assert!(lookup_download("macos", "x86_64", "cuda13").is_none());
+        assert!(lookup_download("macos", "aarch64", "cuda12").is_none());
         // The four-key `lookup` also rejects a valid provider with the wrong build.
         assert!(lookup("linux", "x86_64", "cpu", "cuda13").is_none());
         assert!(lookup("linux", "x86_64", "cuda", "cuda13").is_some());
@@ -546,7 +658,7 @@ mod tests {
             ),
         ];
         for (build, version, win_member, linux_member) in cases {
-            let win = lookup_build("windows", "x86_64", build)
+            let win = lookup_download("windows", "x86_64", build)
                 .unwrap_or_else(|| panic!("windows {build} entry"));
             assert_eq!(win.provider, "cuda");
             assert_eq!(win.version, version);
@@ -564,7 +676,7 @@ mod tests {
                 );
             }
 
-            let linux = lookup_build("linux", "x86_64", build)
+            let linux = lookup_download("linux", "x86_64", build)
                 .unwrap_or_else(|| panic!("linux {build} entry"));
             assert_eq!(linux.version, version);
             assert_eq!(linux.archive, ArchiveKind::TarGz);
@@ -587,7 +699,7 @@ mod tests {
     fn directml_build_is_present_with_extra_dlls() {
         // The DirectML EP ships in the PyPI `onnxruntime-directml` 1.24.4 wheel and
         // needs `DirectML.dll` extracted next to `onnxruntime.dll`.
-        let entry = lookup_build("windows", "x86_64", "directml").expect("directml windows entry");
+        let entry = lookup_download("windows", "x86_64", "directml").expect("directml windows entry");
         assert_eq!(entry.version, "1.24.4");
         assert_eq!(entry.archive, ArchiveKind::Zip);
         assert_eq!(entry.dylib_member, "onnxruntime/capi/onnxruntime.dll");
@@ -614,7 +726,7 @@ mod tests {
         // OpenVINO ships the PyPI `onnxruntime-openvino` 1.24.1 wheels with pinned
         // digests. The Windows wheel does NOT bundle the OpenVINO runtime (needs a
         // system install); the Linux wheel bundles the full runtime (libopenvino*).
-        let win = lookup_build("windows", "x86_64", "openvino").expect("openvino windows entry");
+        let win = lookup_download("windows", "x86_64", "openvino").expect("openvino windows entry");
         assert_eq!(win.version, "1.24.1");
         assert_eq!(win.dylib_member, "onnxruntime/capi/onnxruntime.dll");
         assert_eq!(win.sha256.as_deref().map(str::len), Some(64));
@@ -626,7 +738,7 @@ mod tests {
         // No bundled OpenVINO runtime DLL on Windows.
         assert!(!win.extra_members.iter().any(|m| m.contains("libopenvino")));
 
-        let linux = lookup_build("linux", "x86_64", "openvino").expect("openvino linux entry");
+        let linux = lookup_download("linux", "x86_64", "openvino").expect("openvino linux entry");
         assert_eq!(linux.version, "1.24.1");
         assert_eq!(linux.dylib_member, "onnxruntime/capi/libonnxruntime.so.1.24.1");
         assert_eq!(linux.sha256.as_deref().map(str::len), Some(64));
@@ -647,8 +759,8 @@ mod tests {
     fn coreml_reuses_the_cpu_osx_archive() {
         // CoreML is built into the standard macOS onnxruntime archive, so the
         // coreml build reuses the same URL/sha256/dylib as the cpu osx entry.
-        let coreml = lookup_build("macos", "aarch64", "coreml").expect("macos coreml entry");
-        let cpu = lookup_build("macos", "aarch64", "cpu").expect("macos cpu entry");
+        let coreml = lookup_download("macos", "aarch64", "coreml").expect("macos coreml entry");
+        let cpu = lookup_download("macos", "aarch64", "cpu").expect("macos cpu entry");
         assert_eq!(coreml.url, cpu.url, "coreml must reuse the cpu osx archive");
         assert_eq!(coreml.sha256, cpu.sha256);
         assert_eq!(coreml.dylib_member, cpu.dylib_member);
@@ -667,12 +779,79 @@ mod tests {
     }
 
     #[test]
-    fn android_has_its_own_key_and_no_manifest_entry() {
+    fn android_has_its_own_key_and_only_bundled_rows() {
         let (os, arch) = platform_keys("android", "aarch64");
         assert_eq!((os, arch), ("android", "aarch64"));
-        for build in crate::builds::all_builds() {
-            assert!(lookup_build(os, arch, build.slug).is_none(), "{}", build.slug);
+        // Nothing is downloadable on Android: the official archives are glibc builds.
+        assert!(!manifest().entries.iter().any(|entry| entry.os == "android"));
+        // The APK bundles one library that serves the `cpu` and `xnnpack` builds.
+        for build in ["cpu", "xnnpack"] {
+            match lookup_build(os, arch, build) {
+                Some(BuildSource::Bundled(entry)) => {
+                    assert_eq!(entry.library, "libonnxruntime.so", "{build}");
+                    assert_eq!(entry.version, "1.27.0", "{build}");
+                }
+                other => panic!("android/{build} must be a bundled row, got {other:?}"),
+            }
         }
+        // Every other catalog build is absent on Android.
+        for build in crate::builds::all_builds() {
+            if build.slug != "cpu" && build.slug != "xnnpack" {
+                assert!(lookup_build(os, arch, build.slug).is_none(), "{}", build.slug);
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_rows_are_android_only_and_match_the_catalog() {
+        // `resolve_or_download_ort_dylib` reads bundled libraries from the Android package
+        // directory only; a bundled row for another OS would be unresolvable.
+        for entry in &manifest().bundled {
+            assert_eq!(entry.os, "android", "bundled row {}", entry.build);
+            let build = crate::builds::build_by_slug(&entry.build).unwrap_or_else(|| panic!("no catalog build for bundled slug '{}'", entry.build));
+            assert_eq!(entry.version, build.onnx_version, "version mismatch for bundled build '{}'", entry.build);
+            assert!(build.platforms.iter().any(|&(os, arch)| os == entry.os && arch == entry.arch), "catalog platforms of '{}' lack {}/{}", entry.build, entry.os, entry.arch);
+            assert_eq!(build.execution_providers.first().map(|ep| ep.id()), Some(entry.provider.as_str()), "provider of bundled '{}' is not its headline EP", entry.build);
+        }
+    }
+
+    #[test]
+    fn a_key_is_in_at_most_one_table() {
+        for bundled in &manifest().bundled {
+            assert!(
+                lookup_download(&bundled.os, &bundled.arch, &bundled.build).is_none(),
+                "{}/{}/{} is both downloadable and bundled",
+                bundled.os,
+                bundled.arch,
+                bundled.build
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_version_matches_the_gradle_aar_pin() {
+        // Two owners of one fact: the AAR the APK bundles (Gradle) and the version the
+        // manifest reports for it (guard scope key, panel). They must never drift.
+        const GRADLE: &str = include_str!("../../../android/app/build.gradle.kts");
+        const COORDINATE: &str = "com.microsoft.onnxruntime:onnxruntime-android:";
+        let start = GRADLE.find(COORDINATE).map(|index| index + COORDINATE.len()).unwrap_or_else(|| panic!("build.gradle.kts has no {COORDINATE} dependency"));
+        let rest = &GRADLE[start..];
+        let pinned = &rest[..rest.find('"').unwrap_or_else(|| panic!("unterminated AAR coordinate in build.gradle.kts"))];
+        assert!(!manifest().bundled.is_empty());
+        for entry in &manifest().bundled {
+            assert_eq!(entry.version, pinned, "bundled build '{}' vs the Gradle AAR pin", entry.build);
+        }
+    }
+
+    #[test]
+    fn host_offers_downloads_and_no_bundled_build() {
+        // The test host is linux x86_64: every shipped build there is a download.
+        assert!(ort_downloads_offered_here());
+        for build in crate::builds::all_builds() {
+            assert_ne!(build_source_kind_here(build.slug), Some(OrtBuildSourceKind::Bundled), "{}", build.slug);
+        }
+        assert_eq!(build_source_kind_here("cpu"), Some(OrtBuildSourceKind::Download));
+        assert_eq!(build_source_kind_here("xnnpack"), None);
     }
 
     #[test]

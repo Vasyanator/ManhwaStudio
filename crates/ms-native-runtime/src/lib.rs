@@ -74,7 +74,8 @@ Key items:
   probability maps (shared detector), for the tiled `ms_text_detect` pipeline.
 - paddle_det_max_batch  : tiles per paddle_det_forward call for the effective provider
   (4 on CPU, 1 on any accelerator, to bound GPU memory).
-- execution_provider_from_ort_token : maps a shared ORT provider token -> ExecutionProvider.
+- parse_ort_provider_token / OrtProviderToken : parses a shared ORT provider token (known EP,
+  not selected, or a typed unknown token); ort_provider_token is its exhaustive inverse.
 - NativeHardwareFacts   : the probe answers the availability rule consults (`probe_all`).
 - native_fallback_reason / native_build_fallback_reason : the pure availability rule
   (`NativeFallbackReason` = why a (build, EP) falls back to CPU); shared with the panel.
@@ -100,7 +101,9 @@ marker (`General.ort_load_state[<scope key>]`, see `native_load_scope_key`) via
 mark it succeeded. A crash during load OR first inference leaves `succeeded = false`,
 which the next launch reads as `Suspect` and refuses to re-trigger. A GRACEFUL error
 (the process survived, so it was not a SIGILL) clears the marker again so it is not
-falsely treated as Suspect. `run_guarded` factors this load/guard sequence once and
+falsely treated as Suspect. On Android the low-memory killer ending the process during the
+first inference leaves the same Suspect marker (indistinguishable from a crash); where no
+Python backend exists the refusal says so instead of naming the backend. `run_guarded` factors this load/guard sequence once and
 shares it across the manga/paddle/detector ops.
 
 Because multiple worker threads share this module concurrently, a graceful-error
@@ -175,9 +178,10 @@ const MIN_MAX_LOADED_MODELS: usize = 1;
 /// values add diagnostic context, rendered through `Display` on the frame.
 #[derive(Debug)]
 pub enum NativeRuntimeError {
-    /// A prior ORT load began but never confirmed success (likely a SIGILL), so
-    /// loading is refused for this scope until the guard is reset. Callers fall
-    /// back to the Python backend.
+    /// A prior ORT load began but never confirmed success (likely a SIGILL; on Android
+    /// also the low-memory killer ending the process during the first inference), so
+    /// loading is refused for this scope until the guard is reset. Callers fall back to
+    /// the Python backend where the platform has one; the message says which.
     GuardDisabled {
         /// Execution-provider id the guard is scoped to (e.g. `"cpu"`).
         provider: &'static str,
@@ -245,11 +249,14 @@ impl std::fmt::Display for NativeRuntimeError {
                 // are translated independently, and a duplicated literal drifts (pt-BR
                 // shipped "Repetir ORT" in the message and "Tentar ORT novamente" on the
                 // button before this was interpolated).
-                f.write_str(&tf!(
-                    "native_runtime.error.guard_disabled",
-                    provider = provider,
-                    button = t!("ai_backend.ort_retry_button")
-                ))
+                // Where the platform has no Python backend (Android, web) the message must
+                // not claim the backend took over.
+                let button = t!("ai_backend.ort_retry_button");
+                if ms_platform::PlatformFeature::PythonBackend.is_available() {
+                    f.write_str(&tf!("native_runtime.error.guard_disabled", provider = provider, button = button))
+                } else {
+                    f.write_str(&tf!("native_runtime.error.guard_disabled_no_backend", provider = provider, button = button))
+                }
             }
             Self::DylibResolve(source) => {
                 f.write_str(&tf!("native_runtime.error.dylib_resolve", detail = source))
@@ -369,27 +376,67 @@ fn native_selection() -> ProviderSelection {
 /// and a "restart required" hint (different build).
 static ORT_DYLIB_COMMITTED: AtomicBool = AtomicBool::new(false);
 
-/// Maps a shared ORT execution-provider TOKEN (as stored by BOTH the Python backend
-/// and the native path under `General.ai_onnx_provider`) to an [`ExecutionProvider`].
-///
-/// Recognizes the exact tokens the backend writes: `CPUExecutionProvider`,
-/// `DmlExecutionProvider`, `CUDAExecutionProvider`, `CoreMLExecutionProvider`,
-/// `WebGpuExecutionProvider` (matching `ort::ep::WebGPU::name()`),
-/// `OpenVINOExecutionProvider`, and `TensorrtExecutionProvider`. Any unknown,
-/// absent, or `"not-selected"` token maps to [`ExecutionProvider::Cpu`] — the only
-/// universally available provider — so a stray config never picks a GPU the machine
-/// cannot run.
+/// The shared ORT execution-provider TOKEN of `ep`, as stored under
+/// `General.ai_onnx_provider` by BOTH the Python backend and the native path (each is the
+/// `name()` of the matching `ort::ep::*` type). Exhaustive: a new provider must get its
+/// token here, and [`parse_ort_provider_token`] reads every token back (round-trip test).
 #[must_use]
-pub fn execution_provider_from_ort_token(token: &str) -> ExecutionProvider {
-    match token.trim() {
-        "DmlExecutionProvider" => ExecutionProvider::DirectMl,
-        "CUDAExecutionProvider" => ExecutionProvider::Cuda,
-        "CoreMLExecutionProvider" => ExecutionProvider::CoreMl,
-        "WebGpuExecutionProvider" => ExecutionProvider::WebGpu,
-        "OpenVINOExecutionProvider" => ExecutionProvider::OpenVino,
-        "TensorrtExecutionProvider" => ExecutionProvider::TensorRt,
-        // "CPUExecutionProvider", "not-selected", and any unknown token -> CPU.
-        _ => ExecutionProvider::Cpu,
+pub const fn ort_provider_token(ep: ExecutionProvider) -> &'static str {
+    match ep {
+        ExecutionProvider::Cpu => "CPUExecutionProvider",
+        ExecutionProvider::DirectMl => "DmlExecutionProvider",
+        ExecutionProvider::CoreMl => "CoreMLExecutionProvider",
+        ExecutionProvider::Cuda => "CUDAExecutionProvider",
+        ExecutionProvider::WebGpu => "WebGpuExecutionProvider",
+        ExecutionProvider::OpenVino => "OpenVINOExecutionProvider",
+        ExecutionProvider::TensorRt => "TensorrtExecutionProvider",
+        ExecutionProvider::Xnnpack => "XnnpackExecutionProvider",
+    }
+}
+
+/// A persisted ORT provider token, parsed by [`parse_ort_provider_token`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrtProviderToken {
+    /// A provider the native runtime can register.
+    Provider(ExecutionProvider),
+    /// No provider chosen: empty, or the `"not-selected"` sentinel.
+    NotSelected,
+    /// A token the native runtime does not know: a backend-only EP the Python backend
+    /// wrote (e.g. `MIGraphXExecutionProvider`, `ROCMExecutionProvider`) or a hand edit.
+    /// Carries the trimmed token so callers can name it in their log.
+    Unknown(String),
+}
+
+impl OrtProviderToken {
+    /// The provider of a [`OrtProviderToken::Provider`], `None` otherwise.
+    #[must_use]
+    pub fn provider(&self) -> Option<ExecutionProvider> {
+        match self {
+            OrtProviderToken::Provider(ep) => Some(*ep),
+            OrtProviderToken::NotSelected | OrtProviderToken::Unknown(_) => None,
+        }
+    }
+}
+
+/// Parses a shared ORT execution-provider TOKEN (see [`ort_provider_token`]); whitespace
+/// is trimmed. Every token [`ort_provider_token`] produces reads back as its provider; an
+/// empty or `"not-selected"` token is [`OrtProviderToken::NotSelected`]; anything else is
+/// [`OrtProviderToken::Unknown`] — never a silent CPU, the caller decides and logs. Pure.
+#[must_use]
+pub fn parse_ort_provider_token(token: &str) -> OrtProviderToken {
+    let token = token.trim();
+    match token {
+        "CPUExecutionProvider" => OrtProviderToken::Provider(ExecutionProvider::Cpu),
+        "DmlExecutionProvider" => OrtProviderToken::Provider(ExecutionProvider::DirectMl),
+        "CUDAExecutionProvider" => OrtProviderToken::Provider(ExecutionProvider::Cuda),
+        "CoreMLExecutionProvider" => OrtProviderToken::Provider(ExecutionProvider::CoreMl),
+        "WebGpuExecutionProvider" => OrtProviderToken::Provider(ExecutionProvider::WebGpu),
+        "OpenVINOExecutionProvider" => OrtProviderToken::Provider(ExecutionProvider::OpenVino),
+        "TensorrtExecutionProvider" => OrtProviderToken::Provider(ExecutionProvider::TensorRt),
+        "XnnpackExecutionProvider" => OrtProviderToken::Provider(ExecutionProvider::Xnnpack),
+        "" => OrtProviderToken::NotSelected,
+        sentinel if sentinel.eq_ignore_ascii_case("not-selected") => OrtProviderToken::NotSelected,
+        unknown => OrtProviderToken::Unknown(unknown.to_string()),
     }
 }
 
@@ -414,6 +461,12 @@ fn compute_native_selection() -> ProviderSelection {
         runtime_log::log_warn(format!(
             "[native-runtime] configured ONNX build '{slug}' is not in the catalog; \
              using the per-OS default."
+        ));
+    }
+    if let Some(token) = &report.unknown_configured_provider {
+        runtime_log::log_warn(format!(
+            "[native-runtime] configured ONNX provider token '{token}' is not a native \
+             execution provider (a backend-only EP or a hand edit); requesting the CPU EP."
         ));
     }
     match report.fallback {
@@ -479,6 +532,10 @@ pub struct NativeSelectionReport {
     /// The configured `General.ai_onnx_build` slug when it is not in the catalog (the
     /// per-OS default was used instead); `None` when unset or known.
     pub unknown_configured_build: Option<String>,
+    /// The configured `General.ai_onnx_provider` token when the native runtime does not
+    /// know it ([`OrtProviderToken::Unknown`]); the CPU EP was requested instead. `None`
+    /// when unset or known.
+    pub unknown_configured_provider: Option<String>,
     /// The SIGILL guard scope key (`{build}:{provider}[:{device}]@{version}`) of the
     /// EFFECTIVE selection.
     pub scope_key: String,
@@ -493,6 +550,9 @@ pub struct NativeSelectionReport {
 ///    per-OS default (`default_build_for_current_os`).
 /// 2. `requested_provider` = the `General.ai_onnx_provider` token, validated to belong to
 ///    that build's EP set; otherwise the build's headline EP ([`resolve_ep_for_build`]).
+///    An unknown token requests the CPU EP and is reported in
+///    `unknown_configured_provider` (a backend-only GPU token must not pick the build's
+///    accelerator behind the user's back).
 /// 3. Availability fallback ([`native_fallback_reason`] over the facts of only the probes
 ///    that (build, EP) needs): a non-runnable selection becomes the `cpu` build + CPU EP,
 ///    except a non-runnable `cpu` build, which is kept (its load then fails and callers
@@ -505,9 +565,12 @@ pub struct NativeSelectionReport {
 #[must_use]
 pub fn evaluate_native_selection(cfg: &serde_json::Value) -> NativeSelectionReport {
     let (requested_build, unknown_configured_build) = resolve_build_slug(cfg);
-    let requested_token = config::ai_onnx_provider_token_from_user_settings(cfg)
-        .as_deref()
-        .map(execution_provider_from_ort_token);
+    let (requested_token, unknown_configured_provider) =
+        match config::ai_onnx_provider_token_from_user_settings(cfg).as_deref().map(parse_ort_provider_token) {
+            Some(OrtProviderToken::Provider(ep)) => (Some(ep), None),
+            Some(OrtProviderToken::NotSelected) | None => (None, None),
+            Some(OrtProviderToken::Unknown(token)) => (Some(ExecutionProvider::Cpu), Some(token)),
+        };
     let requested_provider = resolve_ep_for_build(requested_build, requested_token);
 
     // Probe only what the requested (build, EP) actually needs, so a CPU/DirectML config
@@ -531,6 +594,7 @@ pub fn evaluate_native_selection(cfg: &serde_json::Value) -> NativeSelectionRepo
         device,
         fallback,
         unknown_configured_build,
+        unknown_configured_provider,
         scope_key,
     }
 }
@@ -574,7 +638,7 @@ fn resolve_ep_for_build(build: &str, requested: Option<ExecutionProvider>) -> Ex
 ///   [`NativeDeviceSelection::OpenVinoDeviceType`]; absent/empty → `Default`.
 /// - Index-based EPs (`Cuda`/`TensorRt`/`DirectMl`/`WebGpu`): the id parses to an `i32`
 ///   adapter index → [`NativeDeviceSelection::Index`]; absent/unparseable → `Default`.
-/// - `Cpu`/`CoreMl`: the id is ignored → `Default`.
+/// - `Cpu`/`CoreMl`/`Xnnpack`: the id is ignored → `Default`.
 ///
 /// The one parse owner of `ai_onnx_device_id`: callers that judge a persisted id (the
 /// settings checks, the AI panel's device reconcile) parse it here, so they accept exactly
@@ -599,7 +663,7 @@ pub fn device_selection_for(ep: ExecutionProvider, device_id: Option<&str>) -> N
                 None => NativeDeviceSelection::Default,
             }
         }
-        ExecutionProvider::Cpu | ExecutionProvider::CoreMl => NativeDeviceSelection::Default,
+        ExecutionProvider::Cpu | ExecutionProvider::CoreMl | ExecutionProvider::Xnnpack => NativeDeviceSelection::Default,
     }
 }
 
@@ -1370,10 +1434,11 @@ pub fn paddle_det_max_batch() -> NonZeroUsize {
 
 /// The [`paddle_det_max_batch`] policy for one provider. OpenVINO counts as an
 /// accelerator even with a `CPU` device type: its device string may name a GPU/NPU, and
-/// the conservative batch only costs throughput.
+/// the conservative batch only costs throughput. XNNPACK runs in host memory like the CPU
+/// EP, so it takes the CPU batch.
 fn paddle_det_batch_for(provider: ExecutionProvider) -> NonZeroUsize {
     match provider {
-        ExecutionProvider::Cpu => PADDLE_DET_CPU_BATCH,
+        ExecutionProvider::Cpu | ExecutionProvider::Xnnpack => PADDLE_DET_CPU_BATCH,
         ExecutionProvider::DirectMl
         | ExecutionProvider::CoreMl
         | ExecutionProvider::Cuda
@@ -1527,8 +1592,15 @@ fn ensure_ort_runtime(
     });
     let guard = config::read_ort_load_guard(&cfg, scope);
     if config::ort_load_decision(guard) == config::OrtLoadDecision::Suspect {
+        // A previous load or first inference never confirmed success: a SIGILL, a crash,
+        // or (Android) the low-memory killer ending the process mid-inference.
+        let fallback = if ms_platform::PlatformFeature::PythonBackend.is_available() {
+            "callers fall back to the Python backend"
+        } else {
+            "no Python backend on this platform, native AI stays off until the guard is reset"
+        };
         runtime_log::log_warn(format!(
-            "[native-runtime] ORT load guard is Suspect for scope '{scope}'; refusing native load, using backend."
+            "[native-runtime] ORT load guard is Suspect for scope '{scope}'; refusing native load ({fallback})."
         ));
         return Err(NativeRuntimeError::GuardDisabled {
             provider: provider.id(),
@@ -2058,6 +2130,7 @@ mod tests {
     #[test]
     fn paddle_det_batch_is_four_on_cpu_and_one_on_accelerators() {
         assert_eq!(paddle_det_batch_for(ExecutionProvider::Cpu).get(), 4);
+        assert_eq!(paddle_det_batch_for(ExecutionProvider::Xnnpack).get(), 4);
         for provider in [
             ExecutionProvider::DirectMl,
             ExecutionProvider::CoreMl,
@@ -2099,57 +2172,46 @@ mod tests {
         );
     }
 
+    /// Every provider (a new variant is forced into `ort_provider_token` by its exhaustive
+    /// match; list it here so its token is round-tripped too).
+    const ALL_PROVIDERS: [ExecutionProvider; 8] = [
+        ExecutionProvider::Cpu,
+        ExecutionProvider::DirectMl,
+        ExecutionProvider::CoreMl,
+        ExecutionProvider::Cuda,
+        ExecutionProvider::WebGpu,
+        ExecutionProvider::OpenVino,
+        ExecutionProvider::TensorRt,
+        ExecutionProvider::Xnnpack,
+    ];
+
     #[test]
-    fn ort_token_maps_to_execution_provider() {
-        // The exact tokens the Python backend + native path share.
-        assert_eq!(
-            execution_provider_from_ort_token("CPUExecutionProvider"),
-            ExecutionProvider::Cpu
-        );
-        assert_eq!(
-            execution_provider_from_ort_token("DmlExecutionProvider"),
-            ExecutionProvider::DirectMl
-        );
-        assert_eq!(
-            execution_provider_from_ort_token("CUDAExecutionProvider"),
-            ExecutionProvider::Cuda
-        );
-        assert_eq!(
-            execution_provider_from_ort_token("CoreMLExecutionProvider"),
-            ExecutionProvider::CoreMl
-        );
-        // The exact token `ort::ep::WebGPU::name()` emits.
-        assert_eq!(
-            execution_provider_from_ort_token("WebGpuExecutionProvider"),
-            ExecutionProvider::WebGpu
-        );
-        assert_eq!(
-            execution_provider_from_ort_token("OpenVINOExecutionProvider"),
-            ExecutionProvider::OpenVino
-        );
-        assert_eq!(
-            execution_provider_from_ort_token("TensorrtExecutionProvider"),
-            ExecutionProvider::TensorRt
-        );
-        // Whitespace is trimmed.
-        assert_eq!(
-            execution_provider_from_ort_token(" DmlExecutionProvider "),
-            ExecutionProvider::DirectMl
-        );
-        // Unknown / sentinel / empty -> the always-available CPU provider, never a
-        // GPU the machine may be unable to run.
-        assert_eq!(
-            execution_provider_from_ort_token("not-selected"),
-            ExecutionProvider::Cpu
-        );
-        assert_eq!(
-            execution_provider_from_ort_token("MIGraphXExecutionProvider"),
-            ExecutionProvider::Cpu
-        );
-        assert_eq!(
-            execution_provider_from_ort_token(""),
-            ExecutionProvider::Cpu
-        );
+    fn ort_token_round_trips_every_provider() {
+        for ep in ALL_PROVIDERS {
+            assert_eq!(parse_ort_provider_token(ort_provider_token(ep)), OrtProviderToken::Provider(ep), "{ep:?}");
+        }
+        // The exact tokens the Python backend writes / `ort::ep::*::name()` emits.
+        assert_eq!(ort_provider_token(ExecutionProvider::WebGpu), "WebGpuExecutionProvider");
+        assert_eq!(ort_provider_token(ExecutionProvider::Xnnpack), "XnnpackExecutionProvider");
+    }
+
+    #[test]
+    fn ort_token_parse_trims_and_types_the_rest() {
+        assert_eq!(parse_ort_provider_token(" DmlExecutionProvider "), OrtProviderToken::Provider(ExecutionProvider::DirectMl));
+        assert_eq!(parse_ort_provider_token("not-selected"), OrtProviderToken::NotSelected);
+        assert_eq!(parse_ort_provider_token("  "), OrtProviderToken::NotSelected);
+        // A backend-only EP is a typed unknown, never a silent CPU.
+        assert_eq!(parse_ort_provider_token("MIGraphXExecutionProvider"), OrtProviderToken::Unknown("MIGraphXExecutionProvider".to_string()));
+        assert_eq!(parse_ort_provider_token("MIGraphXExecutionProvider").provider(), None);
+    }
+
+    #[test]
+    fn evaluate_native_selection_reports_an_unknown_provider_token() {
+        let report = evaluate_native_selection(&json!({"General": {"ai_onnx_build": "cpu", "ai_onnx_provider": "ROCMExecutionProvider"}}));
+        assert_eq!(report.unknown_configured_provider.as_deref(), Some("ROCMExecutionProvider"));
+        assert_eq!(report.requested_provider, ExecutionProvider::Cpu);
+        let known = evaluate_native_selection(&json!({"General": {"ai_onnx_build": "cpu", "ai_onnx_provider": "CPUExecutionProvider"}}));
+        assert_eq!(known.unknown_configured_provider, None);
     }
 
     #[test]
@@ -2242,6 +2304,10 @@ mod tests {
         );
         assert_eq!(
             device_selection_for(ExecutionProvider::CoreMl, Some("3")),
+            NativeDeviceSelection::Default
+        );
+        assert_eq!(
+            device_selection_for(ExecutionProvider::Xnnpack, Some("3")),
             NativeDeviceSelection::Default
         );
     }

@@ -35,6 +35,9 @@ PyTorch device, diagnostics) are hidden. The supervisor never starts a backend t
 (`AiBackendHandle::local_ai`) and refuses the spawn on its own as well
 (`BackendSpawnBlocker::PlatformUnavailable`). Under `--no-ai` on desktop the blocks stay
 visible but disabled, with the flag named.
+Where every onnxruntime build is bundled in the app package (Android:
+`ms_onnx_runtime::ort_downloads_offered_here` is false) the build picker lists only the
+builds shipped here, and a bundled build never offers or starts a download.
 
 Key items:
 - `AiBackendPanelState`: per-UI selection scratch (device/provider/onnx/max-models) and
@@ -56,6 +59,8 @@ use ms_widgets::WheelComboBox;
 use crate::onnx_caps::{OnnxCaps, device_id_offered, ep_device_ids, probe_onnx_caps};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
+#[cfg(not(target_arch = "wasm32"))]
+use ms_native_runtime::ort_provider_token;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_tab_translation::backend_health::AiBackendDeviceOption;
 #[cfg(not(target_arch = "wasm32"))]
@@ -782,7 +787,7 @@ fn draw_backend_provider_selection(
 /// availability (Базовые / Специфичные / Недоступные); the EP list comes from the chosen
 /// build; the device combo adapts per EP (including OpenVINO's device-type strings). The
 /// selection is persisted to the unified config keys off-thread. An AVAILABLE build's
-/// dylib is auto-downloaded; the build-action button drives a force-download / retry /
+/// dylib is auto-downloaded (never a bundled one); the build-action button drives a force-download / retry /
 /// restart per the committed-dylib state (see [`ort_build_action`]).
 ///
 /// `warnings` (launcher only) badges the build, EP, device and build-action rows. An
@@ -823,14 +828,12 @@ fn draw_native_build_selection(
             .provider_token
             .as_ref()
             .map(|token| token.trim())
-            .filter(|token| eps.iter().any(|ep| ep_ort_token(*ep) == *token))
+            .filter(|token| eps.iter().any(|ep| ort_provider_token(*ep) == *token))
             .map(str::to_string)
-            .or_else(|| eps.first().map(|ep| ep_ort_token(*ep).to_string()))
+            .or_else(|| eps.first().map(|ep| ort_provider_token(*ep).to_string()))
             .unwrap_or_default();
         // Device: the persisted id if valid for that EP, else the EP's first device.
-        let ep = ms_native_runtime::execution_provider_from_ort_token(
-            &state.selected_onnx_provider,
-        );
+        let ep = native_device_ep(&state.selected_onnx_provider);
         let devices = ep_device_options(ep, caps);
         state.selected_onnx_device_id = config_read
             .device_id
@@ -842,7 +845,7 @@ fn draw_native_build_selection(
         state.selected_onnx_build = build;
     }
 
-    let groups = partition_builds(&availability);
+    let groups = partition_builds(&availability, ms_onnx_runtime::ort_downloads_offered_here());
     let prev_build = state.selected_onnx_build.clone();
 
     ui.horizontal_wrapped(|ui| {
@@ -868,7 +871,7 @@ fn draw_native_build_selection(
     if state.selected_onnx_build != prev_build
         && let Some(first) = builds::build_execution_providers(&state.selected_onnx_build).first()
     {
-        state.selected_onnx_provider = ep_ort_token(*first).to_string();
+        state.selected_onnx_provider = ort_provider_token(*first).to_string();
         state.selected_onnx_device_id = ep_device_options(*first, caps)
             .first()
             .map(|device| device.id.clone())
@@ -888,7 +891,7 @@ fn draw_native_build_selection(
     ui.horizontal_wrapped(|ui| {
         let selected_label = eps
             .iter()
-            .find(|ep| ep_ort_token(**ep) == state.selected_onnx_provider)
+            .find(|ep| ort_provider_token(**ep) == state.selected_onnx_provider)
             .map(|ep| ep_display_label(*ep).to_string())
             .unwrap_or_else(|| state.selected_onnx_provider.clone());
         ui.add_enabled_ui(eps.len() > 1, |ui| {
@@ -898,7 +901,7 @@ fn draw_native_build_selection(
                     for ep in eps {
                         ui.selectable_value(
                             &mut state.selected_onnx_provider,
-                            ep_ort_token(*ep).to_string(),
+                            ort_provider_token(*ep).to_string(),
                             ep_display_label(*ep),
                         );
                     }
@@ -909,9 +912,7 @@ fn draw_native_build_selection(
 
     // An EP change resets the device to that EP's first option.
     if state.selected_onnx_provider != prev_provider {
-        let ep = ms_native_runtime::execution_provider_from_ort_token(
-            &state.selected_onnx_provider,
-        );
+        let ep = native_device_ep(&state.selected_onnx_provider);
         state.selected_onnx_device_id = ep_device_options(ep, caps)
             .first()
             .map(|device| device.id.clone())
@@ -920,7 +921,7 @@ fn draw_native_build_selection(
 
     // Device combo — per selected EP.
     let selected_ep =
-        ms_native_runtime::execution_provider_from_ort_token(&state.selected_onnx_provider);
+        native_device_ep(&state.selected_onnx_provider);
     let devices = ep_device_options(selected_ep, caps);
     let device_flagged = warnings.and_then(|set| set.item_level(SettingKey::OnnxDevice)).is_some();
     let mut device_picked = false;
@@ -995,9 +996,11 @@ fn draw_native_build_selection(
 
     // Auto-download the selected build's dylib when it is AVAILABLE and not present yet.
     // Unavailable builds are only fetched via the explicit "Загрузить другую сборку"
-    // button (forced download).
+    // button (forced download). A bundled build (Android) is never downloaded: its
+    // library ships in the app package.
     let selected_available = build_slug_available(&build_slug, &availability);
-    if selected_available && dylib_present == Some(false) {
+    let bundled = ms_onnx_runtime::build_source_kind_here(&build_slug) == Some(ms_onnx_runtime::OrtBuildSourceKind::Bundled);
+    if selected_available && !bundled && dylib_present == Some(false) {
         maybe_start_ort_download(state, &build_slug);
     }
 
@@ -1007,7 +1010,7 @@ fn draw_native_build_selection(
 
     // onnxruntime auto-download progress for the selected build (worker-reported).
     draw_ort_download_progress(ui, state);
-    with_item_badge(ui, warnings, SettingKey::OrtCrashGuard, |ui| draw_build_action_button(ui, state, dylib_present));
+    with_item_badge(ui, warnings, SettingKey::OrtCrashGuard, |ui| draw_build_action_button(ui, state, dylib_present, bundled));
 }
 
 /// Whether an explicit device pick must be saved although the selection did not change:
@@ -1369,14 +1372,11 @@ fn build_onnx_provider_options(
 }
 
 /// Whether an ORT provider token maps to a real native execution provider the
-/// in-process ONNX path can load. CPU counts; any token that maps to the CPU FALLBACK
-/// (unknown/backend-only, e.g. MIGraphX/ROCm) is NOT native-capable.
+/// in-process ONNX path can load. CPU counts; an unknown / backend-only token (e.g.
+/// MIGraphX/ROCm) or the "not selected" sentinel is NOT native-capable.
 #[cfg(not(target_arch = "wasm32"))]
 fn token_is_native_capable(token: &str) -> bool {
-    let token = token.trim();
-    token == "CPUExecutionProvider"
-        || ms_native_runtime::execution_provider_from_ort_token(token)
-            != ms_onnx::ExecutionProvider::Cpu
+    ms_native_runtime::parse_ort_provider_token(token).provider().is_some()
 }
 
 /// The backend-reported device list for `token` (its `onnx_devices_by_provider` entry,
@@ -1596,6 +1596,8 @@ struct BuildAvailability {
     cuda12: bool,
     /// OpenVINO build: Intel device + OpenVINO runtime present.
     openvino: bool,
+    /// XNNPACK build (Android: shipped in the APK).
+    xnnpack: bool,
 }
 
 /// Computes per-build availability by asking the native runtime's availability rule
@@ -1613,6 +1615,7 @@ fn build_availability(caps: &OnnxCaps) -> BuildAvailability {
         cuda13: runnable("cuda13"),
         cuda12: runnable("cuda12"),
         openvino: runnable("openvino"),
+        xnnpack: runnable("xnnpack"),
     }
 }
 
@@ -1628,6 +1631,7 @@ fn build_slug_available(slug: &str, availability: &BuildAvailability) -> bool {
         "cuda13" => availability.cuda13,
         "cuda12" => availability.cuda12,
         "openvino" => availability.openvino,
+        "xnnpack" => availability.xnnpack,
         // qnn (informational) and any unknown slug: not runnable here.
         _ => false,
     }
@@ -1649,14 +1653,20 @@ struct BuildGroups {
 ///
 /// An AVAILABLE `Basic` build lands in `basic`, an available `Specific` build in
 /// `specific`; every build unavailable on this machine — plus the informational QNN
-/// entry — lands in `unavailable`. Pure over the availability flags, so the grouping is
+/// entry — lands in `unavailable`. With `downloads_offered == false`
+/// (`ms_onnx_runtime::ort_downloads_offered_here`: every build here is bundled, Android)
+/// an unavailable build can never be obtained, so it and QNN are not listed at all: the
+/// picker offers exactly the builds shipped here. Pure over its inputs, so the grouping is
 /// unit-testable.
 #[cfg(not(target_arch = "wasm32"))]
-fn partition_builds(availability: &BuildAvailability) -> BuildGroups {
+fn partition_builds(availability: &BuildAvailability, downloads_offered: bool) -> BuildGroups {
     use ms_onnx_runtime::builds::{self, BuildCategory};
     let mut groups = BuildGroups::default();
     for build in builds::all_builds() {
         let available = build_slug_available(build.slug, availability);
+        if !available && !downloads_offered {
+            continue;
+        }
         match build.category {
             BuildCategory::Basic => {
                 if available {
@@ -1726,21 +1736,14 @@ fn render_build_group(
     }
 }
 
-/// The ORT provider TOKEN for an execution provider, matching the tokens
-/// [`ms_native_runtime::execution_provider_from_ort_token`] recognizes (so the
-/// token↔EP round-trip is stable). These are the same tokens the Python backend writes.
+/// The EP whose device list the native device combo shows for the selected ORT `token`:
+/// the parsed provider, else the CPU EP's single "default" entry. The native branch keeps
+/// the token inside the selected build's EP set (`reconcile_native_ep`), so the fallback
+/// is reached only for a build with no EP (the informational QNN row), which has no device
+/// to choose either way.
 #[cfg(not(target_arch = "wasm32"))]
-fn ep_ort_token(ep: ms_onnx::ExecutionProvider) -> &'static str {
-    use ms_onnx::ExecutionProvider;
-    match ep {
-        ExecutionProvider::Cpu => "CPUExecutionProvider",
-        ExecutionProvider::DirectMl => "DmlExecutionProvider",
-        ExecutionProvider::CoreMl => "CoreMLExecutionProvider",
-        ExecutionProvider::Cuda => "CUDAExecutionProvider",
-        ExecutionProvider::WebGpu => "WebGpuExecutionProvider",
-        ExecutionProvider::OpenVino => "OpenVINOExecutionProvider",
-        ExecutionProvider::TensorRt => "TensorrtExecutionProvider",
-    }
+fn native_device_ep(token: &str) -> ms_onnx::ExecutionProvider {
+    ms_native_runtime::parse_ort_provider_token(token).provider().unwrap_or(ms_onnx::ExecutionProvider::Cpu)
 }
 
 /// A friendly EP name for the "EP" combo.
@@ -1755,6 +1758,7 @@ fn ep_display_label(ep: ms_onnx::ExecutionProvider) -> &'static str {
         ExecutionProvider::WebGpu => "WebGPU",
         ExecutionProvider::OpenVino => "OpenVINO",
         ExecutionProvider::TensorRt => "TensorRT",
+        ExecutionProvider::Xnnpack => "XNNPACK",
     }
 }
 
@@ -1765,7 +1769,7 @@ fn ep_display_label(ep: ms_onnx::ExecutionProvider) -> &'static str {
 /// - DirectML → `"{index}: {name}"` per detected DX12 adapter, else `GPU 0`.
 /// - WebGPU → `"{index}: {name}"` per enumerated adapter, else «По умолчанию».
 /// - CUDA / TensorRT → `GPU 0`.
-/// - CPU / CoreML → «По умолчанию».
+/// - CPU / CoreML / XNNPACK → «По умолчанию».
 /// - OpenVINO → the device-TYPE string itself (`CPU` / `GPU` / `NPU`).
 #[cfg(not(target_arch = "wasm32"))]
 fn ep_device_options(ep: ms_onnx::ExecutionProvider, caps: &OnnxCaps) -> Vec<OnnxDeviceOptionUi> {
@@ -1784,7 +1788,7 @@ fn ep_device_options(ep: ms_onnx::ExecutionProvider, caps: &OnnxCaps) -> Vec<Onn
         ExecutionProvider::DirectMl => indexed(&caps.directml_accelerators, "GPU 0"),
         ExecutionProvider::WebGpu => indexed(&caps.webgpu_adapters, t!("ai_backend.device_default")),
         ExecutionProvider::Cuda | ExecutionProvider::TensorRt => vec!["GPU 0".to_string()],
-        ExecutionProvider::Cpu | ExecutionProvider::CoreMl => vec![t!("ai_backend.device_default").to_string()],
+        ExecutionProvider::Cpu | ExecutionProvider::CoreMl | ExecutionProvider::Xnnpack => vec![t!("ai_backend.device_default").to_string()],
         // OpenVINO selects a device by TYPE string, persisted verbatim to
         // `ai_onnx_device_id` (the native path routes it via `with_device_type`); the
         // type string is also its label.
@@ -1810,20 +1814,20 @@ fn reconcile_native_ep(
 
     let current_in_set = eps
         .iter()
-        .any(|ep| ep_ort_token(*ep) == state.selected_onnx_provider);
+        .any(|ep| ort_provider_token(*ep) == state.selected_onnx_provider);
     if !current_in_set {
         let from_config = config_read
             .provider_token
             .as_ref()
             .map(|token| token.trim())
-            .filter(|token| eps.iter().any(|ep| ep_ort_token(*ep) == *token))
+            .filter(|token| eps.iter().any(|ep| ort_provider_token(*ep) == *token))
             .map(str::to_string);
         state.selected_onnx_provider =
-            from_config.unwrap_or_else(|| ep_ort_token(*headline).to_string());
+            from_config.unwrap_or_else(|| ort_provider_token(*headline).to_string());
     }
 
     let ep =
-        ms_native_runtime::execution_provider_from_ort_token(&state.selected_onnx_provider);
+        native_device_ep(&state.selected_onnx_provider);
     let devices = ep_device_options(ep, caps);
     // Validity is the runtime-consistent rule (`device_id_offered`), not combo membership:
     // a hand-written id the native load accepts for an offered device (OpenVINO "GPU.0")
@@ -1940,6 +1944,8 @@ enum OrtBuildAction {
 ///   `Retry`.
 /// - `ort_committed` == true: if the selected build IS the committed `active_build`, a
 ///   same-build `Retry`; otherwise `RestartNote` (the committed dylib is pinned).
+/// - `bundled` (the library ships in the app package, Android): never `LoadOtherBuild`,
+///   there is nothing to download; an uncommitted bundled build offers `Retry`.
 ///
 /// `active_build` is the committed build slug; `None` (nothing committed) is treated as
 /// `Retry` in the committed branch, which cannot occur in practice.
@@ -1949,6 +1955,7 @@ fn ort_build_action(
     active_build: Option<&str>,
     selected_build: &str,
     dylib_present: bool,
+    bundled: bool,
 ) -> OrtBuildAction {
     if ort_committed {
         match active_build {
@@ -1956,7 +1963,7 @@ fn ort_build_action(
             Some(_) => OrtBuildAction::RestartNote,
             None => OrtBuildAction::Retry,
         }
-    } else if dylib_present {
+    } else if dylib_present || bundled {
         OrtBuildAction::Retry
     } else {
         OrtBuildAction::LoadOtherBuild
@@ -1969,11 +1976,13 @@ fn ort_build_action(
 ///
 /// `dylib_present` is `None` while the presence probe is in flight; it is treated as "not
 /// present" so the uncommitted branch offers a download until the build is proven cached.
+/// `bundled` (Android) suppresses the download offer (see [`ort_build_action`]).
 #[cfg(not(target_arch = "wasm32"))]
 fn draw_build_action_button(
     ui: &mut egui::Ui,
     state: &AiBackendPanelState,
     dylib_present: Option<bool>,
+    bundled: bool,
 ) {
     let committed = ms_native_runtime::ort_dylib_committed();
     let active = ms_native_runtime::active_build();
@@ -1982,6 +1991,7 @@ fn draw_build_action_button(
         active.as_deref(),
         &state.selected_onnx_build,
         dylib_present.unwrap_or(false),
+        bundled,
     );
     match action {
         OrtBuildAction::Retry => {
@@ -2483,8 +2493,8 @@ mod tests {
     use super::{
         AiBackendPanelState, BackendOnnxProviders, BuildAvailability, OnnxCaps, OnnxProviderOption, OrtBuildAction,
         PendingChanges, SettingChange, build_availability, build_onnx_provider_options, build_slug_available,
-        default_onnx_provider, device_pick_needs_save, ep_device_options, ep_display_label, ep_ort_token,
-        ort_build_action, partition_builds, provider_runtime_state, report_landed,
+        default_onnx_provider, device_pick_needs_save, ep_device_options, ep_display_label, ort_provider_token,
+        native_device_ep, ort_build_action, partition_builds, provider_runtime_state, report_landed,
     };
     use ms_config::AiRuntime;
     use ms_tab_translation::backend_health::AiBackendDeviceOption;
@@ -2982,6 +2992,7 @@ mod tests {
         assert_eq!(full.cuda13, ships("cuda13"));
         assert_eq!(full.cuda12, ships("cuda12"));
         assert_eq!(full.openvino, ships("openvino"));
+        assert_eq!(full.xnnpack, ships("xnnpack"));
 
         // The informational QNN entry and an unknown slug are never available.
         assert!(!build_slug_available("qnn", &full));
@@ -3001,8 +3012,9 @@ mod tests {
             cuda13: true,
             cuda12: false,
             openvino: false,
+            xnnpack: false,
         };
-        let groups = partition_builds(&availability);
+        let groups = partition_builds(&availability, true);
         for slug in ["cpu", "directml", "webgpu", "coreml"] {
             assert!(groups.basic.contains(&slug), "{slug} should be Базовые");
         }
@@ -3030,8 +3042,9 @@ mod tests {
             cuda13: false,
             cuda12: false,
             openvino: false,
+            xnnpack: false,
         };
-        let groups = partition_builds(&availability);
+        let groups = partition_builds(&availability, true);
         assert_eq!(groups.basic, vec!["cpu"]);
         assert!(groups.specific.is_empty());
         for slug in ["directml", "webgpu", "coreml", "cuda13", "cuda12", "openvino", "qnn"] {
@@ -3039,8 +3052,8 @@ mod tests {
         }
     }
 
-    /// Each EP's ORT token round-trips back to the same EP through
-    /// `execution_provider_from_ort_token`, so a persisted token resolves correctly.
+    /// Each EP's ORT token round-trips back to the same EP through the native runtime's
+    /// parser, so a persisted token resolves correctly (the device combo's EP included).
     #[test]
     fn ep_tokens_round_trip() {
         use ms_onnx::ExecutionProvider;
@@ -3052,14 +3065,33 @@ mod tests {
             ExecutionProvider::WebGpu,
             ExecutionProvider::OpenVino,
             ExecutionProvider::TensorRt,
+            ExecutionProvider::Xnnpack,
         ] {
-            let token = ep_ort_token(ep);
-            assert_eq!(
-                ms_native_runtime::execution_provider_from_ort_token(token),
-                ep,
-                "token {token} must map back to its EP"
-            );
+            let token = ort_provider_token(ep);
+            assert_eq!(native_device_ep(token), ep, "token {token} must map back to its EP");
         }
+        // No EP named (informational build): the device combo shows CPU's default entry.
+        assert_eq!(native_device_ep(""), ExecutionProvider::Cpu);
+    }
+
+    /// Where nothing can be downloaded (every build bundled, Android) the picker lists only
+    /// the builds that run here; QNN and unavailable builds are not offered at all.
+    #[test]
+    fn partition_without_downloads_lists_only_runnable_builds() {
+        let availability = BuildAvailability {
+            cpu: true,
+            directml: false,
+            webgpu: false,
+            coreml: false,
+            cuda13: false,
+            cuda12: false,
+            openvino: false,
+            xnnpack: true,
+        };
+        let groups = partition_builds(&availability, false);
+        assert_eq!(groups.basic, vec!["cpu", "xnnpack"]);
+        assert!(groups.specific.is_empty());
+        assert!(groups.unavailable.is_empty(), "{:?}", groups.unavailable);
     }
 
     /// The EP labels for a build follow the build's ordered EP set.
@@ -3151,15 +3183,18 @@ mod tests {
     fn build_action_decision_matrix() {
         use OrtBuildAction::{LoadOtherBuild, RestartNote, Retry};
         // Not committed: present → same-build retry; absent → download it.
-        assert_eq!(ort_build_action(false, None, "cuda13", true), Retry);
-        assert_eq!(ort_build_action(false, None, "cuda13", false), LoadOtherBuild);
+        assert_eq!(ort_build_action(false, None, "cuda13", true, false), Retry);
+        assert_eq!(ort_build_action(false, None, "cuda13", false, false), LoadOtherBuild);
         // Committed same build → retry regardless of presence.
-        assert_eq!(ort_build_action(true, Some("cuda13"), "cuda13", true), Retry);
-        assert_eq!(ort_build_action(true, Some("cuda13"), "cuda13", false), Retry);
+        assert_eq!(ort_build_action(true, Some("cuda13"), "cuda13", true, false), Retry);
+        assert_eq!(ort_build_action(true, Some("cuda13"), "cuda13", false, false), Retry);
         // Committed different build → restart required (dylib is pinned).
-        assert_eq!(ort_build_action(true, Some("directml"), "cuda13", true), RestartNote);
-        assert_eq!(ort_build_action(true, Some("directml"), "cuda13", false), RestartNote);
+        assert_eq!(ort_build_action(true, Some("directml"), "cuda13", true, false), RestartNote);
+        assert_eq!(ort_build_action(true, Some("directml"), "cuda13", false, false), RestartNote);
         // Defensive: committed but no active recorded → retry.
-        assert_eq!(ort_build_action(true, None, "cuda13", true), Retry);
+        assert_eq!(ort_build_action(true, None, "cuda13", true, false), Retry);
+        // Bundled (Android): nothing to download, so never LoadOtherBuild.
+        assert_eq!(ort_build_action(false, None, "xnnpack", false, true), Retry);
+        assert_eq!(ort_build_action(true, Some("cpu"), "xnnpack", false, true), RestartNote);
     }
 }

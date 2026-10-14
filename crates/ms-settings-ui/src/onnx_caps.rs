@@ -110,7 +110,7 @@ pub(crate) fn probe_onnx_caps() -> OnnxCaps {
 ///
 /// - DirectML → one id per detected DX12 adapter (the adapter index), else `"0"`.
 /// - WebGPU → one id per enumerated adapter (the Dawn `device_id` index), else `"0"`.
-/// - CUDA / TensorRT / CPU / CoreML → the single id `"0"`.
+/// - CUDA / TensorRT / CPU / CoreML / XNNPACK → the single id `"0"`.
 /// - OpenVINO → the device-TYPE strings `"CPU"` / `"GPU"` / `"NPU"`.
 pub(crate) fn ep_device_ids(ep: ExecutionProvider, caps: &OnnxCaps) -> Vec<String> {
     // One id per enumerated adapter (the index), or the single placeholder id "0".
@@ -127,7 +127,8 @@ pub(crate) fn ep_device_ids(ep: ExecutionProvider, caps: &OnnxCaps) -> Vec<Strin
         ExecutionProvider::Cuda
         | ExecutionProvider::TensorRt
         | ExecutionProvider::Cpu
-        | ExecutionProvider::CoreMl => vec!["0".to_string()],
+        | ExecutionProvider::CoreMl
+        | ExecutionProvider::Xnnpack => vec!["0".to_string()],
         ExecutionProvider::OpenVino => OPENVINO_DEVICE_TYPES.iter().map(|kind| (*kind).to_string()).collect(),
     }
 }

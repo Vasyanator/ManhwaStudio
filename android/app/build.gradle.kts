@@ -70,6 +70,9 @@ android {
             useLegacyPackaging = true
             // build-android.sh strips the library itself; AGP would otherwise need the NDK.
             keepDebugSymbols += "**/*.so"
+            // The onnxruntime AAR's Java API binding: the Rust side loads libonnxruntime.so by
+            // path and never uses the Java API, so its JNI library is dead weight.
+            excludes += "**/libonnxruntime4j_jni.so"
         }
     }
 
@@ -90,4 +93,10 @@ dependencies {
     implementation("rustls:rustls-platform-verifier:latest.release")
     // Kotlin half of winit's secondary windows (module in the winit fork, see settings.gradle.kts).
     implementation(project(":winit-secondary-window"))
+    // The official ONNX Runtime for Android (CPU + XNNPACK EPs): its jni/arm64-v8a/
+    // libonnxruntime.so lands in the package's nativeLibraryDir, where the native ONNX runtime
+    // loads it by path (the `bundled` rows of crates/ms-onnx-runtime/src/ort_manifest.json).
+    // The version must equal those rows' `version` (a host test in ms-onnx-runtime checks it)
+    // and stay >= 1.18, the floor of the pinned `ort` crate.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.27.0")
 }

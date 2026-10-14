@@ -81,7 +81,11 @@ dependency list.
   EFFECTIVE one (`ms_tab_translation::local_ai::effective_ai_runtime`). Native build availability (picker groups,
   "(unavailable)" label, auto-download gate) is NOT decided here: it is
   `ms_native_runtime::native_build_fallback_reason` over the caps probe's
-  `NativeHardwareFacts`, so the panel shows what the runtime will do. The Backend-branch
+  `NativeHardwareFacts`, so the panel shows what the runtime will do. Where nothing is
+  downloadable (`ms_onnx_runtime::ort_downloads_offered_here() == false`, Android: every build
+  is bundled in the APK) the picker lists only the runnable builds, and a bundled build never
+  starts or offers a download (`build_source_kind_here`). EP tokens are written and read
+  through `ms_native_runtime::{ort_provider_token, parse_ort_provider_token}`. The Backend-branch
   provider list's `native_available` flag is a separate local-capability heuristic (DirectML
   adapter detected, CUDA 12 probe) that only seeds the Backend default provider. Selections persist off-thread through
   `ms_config::save_onnx_provider_device` / `save_onnx_build` / `save_max_loaded_models` and work

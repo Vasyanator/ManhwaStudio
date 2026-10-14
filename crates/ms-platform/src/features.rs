@@ -39,7 +39,8 @@ pub enum PlatformFeature {
     PythonBackend,
     /// Installer, self-update, update check and the installed-copy prompts.
     InstalledCopyManagement,
-    /// The in-process native ONNX Runtime (download and load of the dylib).
+    /// The in-process native ONNX Runtime: a downloaded dylib on desktop, the onnxruntime
+    /// library bundled in the APK on Android (`native_libs::native_library_dir`).
     NativeOnnxRuntime,
     /// The desktop region screen-capture overlay.
     ScreenCapture,
@@ -101,8 +102,14 @@ impl PlatformFeature {
     #[must_use]
     pub const fn is_available(self) -> bool {
         match self {
-            // Desktop has rfd / arboard; Android gets SAF and JNI ClipboardManager backends.
-            PlatformFeature::FilePicker | PlatformFeature::ClipboardText | PlatformFeature::CredentialStore => DESKTOP || ANDROID,
+            // Desktop has rfd / arboard / keyring; Android gets SAF, JNI ClipboardManager and the
+            // Keystore-backed credential store. Native ONNX: desktop downloads the official
+            // release dylib, Android loads the onnxruntime library the APK bundles (official
+            // `onnxruntime-android` AAR). None of them exist on wasm.
+            PlatformFeature::FilePicker
+            | PlatformFeature::ClipboardText
+            | PlatformFeature::CredentialStore
+            | PlatformFeature::NativeOnnxRuntime => DESKTOP || ANDROID,
             // Android-only storage model (app-specific external dirs, MANAGE_EXTERNAL_STORAGE).
             PlatformFeature::AppStorageVolumes | PlatformFeature::AllFilesAccess => ANDROID,
             // Linux, macOS and Android. Windows delivers a pen as touch events (winit has no
@@ -110,7 +117,6 @@ impl PlatformFeature {
             PlatformFeature::CanvasTouchGestures => (DESKTOP && !WINDOWS) || ANDROID,
             PlatformFeature::PythonBackend
             | PlatformFeature::InstalledCopyManagement
-            | PlatformFeature::NativeOnnxRuntime
             | PlatformFeature::ScreenCapture
             | PlatformFeature::ExternalArchiveTools
             | PlatformFeature::Waifu2xUpscaler
@@ -256,6 +262,14 @@ mod tests {
             assert_eq!(feature.is_available(), expected, "{feature:?}");
             assert_eq!(feature.require().is_ok(), expected, "{feature:?}");
         }
+    }
+
+    #[test]
+    fn native_onnx_runtime_table() {
+        // Desktop downloads the dylib, Android bundles it in the APK; wasm has none.
+        let expected = cfg!(not(target_arch = "wasm32"));
+        assert_eq!(PlatformFeature::NativeOnnxRuntime.is_available(), expected);
+        assert_eq!(PlatformFeature::NativeOnnxRuntime.require().is_ok(), expected);
     }
 
     #[test]

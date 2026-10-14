@@ -24,7 +24,8 @@ Key functions:
 
 Notes:
 Slugs are STABLE identifiers shared with `ort_manifest.json` (the `build` field) and the
-per-build cache directory; they must not change. The catalog is const data with no
+per-build cache directory; they must not change. Android's builds (`cpu`, `xnnpack`) are
+BUNDLED rows of the manifest: one `libonnxruntime.so` from the APK, two EP sets. The catalog is const data with no
 runtime state. QNN is an INFORMATIONAL-only entry: it has no manifest entry and no EP,
 and is not runnable on x86_64 — it exists so the panel can show it under "Недоступные".
 */
@@ -77,6 +78,8 @@ pub struct OrtBuild {
 const P_WIN: (&str, &str) = ("windows", "x86_64");
 const P_LINUX: (&str, &str) = ("linux", "x86_64");
 const P_MAC_ARM: (&str, &str) = ("macos", "aarch64");
+/// 64-bit ARM Android (the APK's only ABI); its builds are bundled, never downloaded.
+const P_ANDROID_ARM: (&str, &str) = ("android", "aarch64");
 
 /// The full, ordered ONNX Runtime build catalog.
 ///
@@ -91,8 +94,19 @@ static BUILDS: &[OrtBuild] = &[
         category: BuildCategory::Basic,
         execution_providers: &[ExecutionProvider::Cpu],
         // onnxruntime 1.27.0 ships no osx-x86_64 archive, so the CPU build targets
-        // Apple Silicon only on macOS (Intel Macs are unsupported at 1.27).
-        platforms: &[P_WIN, P_LINUX, P_MAC_ARM],
+        // Apple Silicon only on macOS (Intel Macs are unsupported at 1.27). Android: the
+        // library bundled in the APK.
+        platforms: &[P_WIN, P_LINUX, P_MAC_ARM, P_ANDROID_ARM],
+    },
+    OrtBuild {
+        slug: "xnnpack",
+        display_name: "XNNPACK",
+        // The same bundled `onnxruntime-android` library as Android's `cpu` build, with the
+        // XNNPACK EP registered in front of the CPU EP.
+        onnx_version: "1.27.0",
+        category: BuildCategory::Basic,
+        execution_providers: &[ExecutionProvider::Xnnpack, ExecutionProvider::Cpu],
+        platforms: &[P_ANDROID_ARM],
     },
     OrtBuild {
         slug: "directml",
@@ -209,6 +223,7 @@ pub fn build_execution_providers(slug: &str) -> &'static [ExecutionProvider] {
 /// - Windows → `"directml"` (D3D12 GPU acceleration available on all vendors);
 /// - Linux   → `"webgpu"` (cross-vendor GPU acceleration without a CUDA toolchain);
 /// - macOS   → `"coreml"` (Apple Neural Engine / GPU);
+/// - Android → `"xnnpack"` (ARM-optimized CPU kernels of the bundled library);
 /// - any other target → `"cpu"`.
 ///
 /// The returned slug is always present in [`all_builds`]; the caller is responsible
@@ -222,6 +237,8 @@ pub fn default_build_for_current_os() -> &'static str {
         "coreml"
     } else if cfg!(target_os = "linux") {
         "webgpu"
+    } else if cfg!(target_os = "android") {
+        "xnnpack"
     } else {
         "cpu"
     }
@@ -243,6 +260,7 @@ pub fn default_build_for_provider(provider: ExecutionProvider) -> &'static str {
         ExecutionProvider::WebGpu => "webgpu",
         ExecutionProvider::OpenVino => "openvino",
         ExecutionProvider::TensorRt => "cuda13",
+        ExecutionProvider::Xnnpack => "xnnpack",
     }
 }
 
@@ -298,6 +316,16 @@ mod tests {
             build_execution_providers("openvino"),
             &[ExecutionProvider::OpenVino, ExecutionProvider::Cpu]
         );
+        assert_eq!(
+            build_execution_providers("xnnpack"),
+            &[ExecutionProvider::Xnnpack, ExecutionProvider::Cpu]
+        );
+    }
+
+    #[test]
+    fn android_ships_cpu_and_xnnpack_only() {
+        let android: Vec<&str> = all_builds().iter().filter(|build| build.platforms.contains(&P_ANDROID_ARM)).map(|build| build.slug).collect();
+        assert_eq!(android, vec!["cpu", "xnnpack"]);
     }
 
     #[test]
@@ -323,6 +351,7 @@ mod tests {
         assert_eq!(default_build_for_provider(ExecutionProvider::Cuda), "cuda13");
         assert_eq!(default_build_for_provider(ExecutionProvider::TensorRt), "cuda13");
         assert_eq!(default_build_for_provider(ExecutionProvider::OpenVino), "openvino");
+        assert_eq!(default_build_for_provider(ExecutionProvider::Xnnpack), "xnnpack");
         // Every mapped slug must resolve to a real catalog build.
         for provider in [
             ExecutionProvider::Cpu,
@@ -332,6 +361,7 @@ mod tests {
             ExecutionProvider::WebGpu,
             ExecutionProvider::OpenVino,
             ExecutionProvider::TensorRt,
+            ExecutionProvider::Xnnpack,
         ] {
             assert!(build_by_slug(default_build_for_provider(provider)).is_some());
         }

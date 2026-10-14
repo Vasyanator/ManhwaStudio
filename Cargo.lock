@@ -3764,6 +3764,7 @@ dependencies = [
  "ms-log",
  "ms-onnx",
  "ms-onnx-runtime",
+ "ms-platform",
  "ms-sysprobe",
  "ms-text-detect",
  "serde_json",

@@ -121,12 +121,21 @@ main window alone.
 
 Finger input on the selection modes (`ms_widgets::touch_nav`): both capture areas are registered
 as touch capture layers of the canvas (`publish_capture_layer` under `canvas.touch_owner_id()`), so
-a plain finger PANS under them. A finger long-press drag selects while a mode key is held — the
-hook sets `CanvasView::set_long_press_selection(touch_selection_mode().is_some())` every frame,
-with the pointer path's precedence (crop chord, then advanced, then quick OCR) — and is mapped
-through `ms_canvas::drive_touch_drag` onto the same `image_crop_selection` / `ocr_selection` slot,
-marked `touch` so the pointer path never moves or ends it; a lift commits through the same
-`finish_*` helpers as a mouse release, a cancel drops it. The crop chord predicate the finger uses
+a plain finger PANS under them. A finger long-press drag selects — the hook sets
+`CanvasView::set_long_press_selection(touch_selection_mode().is_some())` every frame, with the
+pointer path's precedence (crop chord, then advanced, then quick OCR) and, with NO key held, the
+OCR kind chosen in the OCR panel (`OcrPanelOptions::finger_selection`, quick by default, persisted
+per title as `OCR.finger_selection`; the choice and a finger hint are shown only while finger
+gestures are effective, `ms_config::touch_gestures::enabled_with(CanvasTouchGestures)`). The
+key-less finger default is off while the advanced window is open or a text-detector edit mode is
+on (rules: pure `touch_selection_mode_for`). The drag is mapped through
+`ms_canvas::drive_touch_drag` onto the same `image_crop_selection` / `ocr_selection` slot, marked
+`touch` so the pointer path never moves or ends it — including the modifier-release finish rule
+(`OcrDragSelection::pointer_should_finish`); a lift commits through the same `finish_*` helpers as
+a mouse release, a cancel drops it. The OCR route is not part of the mode decision: on an
+unavailable route the drag stays claimed and its start toasts the route's refusal
+(`finger_ocr_selection_refused`) instead of drawing a rect that cannot run. Mouse and pen read
+only the modifier flags. The crop chord predicate the finger uses
 (`image_crop_selection_keys_down`) omits the pointer path's `!any_touches()` gate, which would
 otherwise end the crop under the very finger driving it.
 

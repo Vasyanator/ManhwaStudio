@@ -33,6 +33,9 @@ ms-text-detect = { path = "../ms-text-detect" }
 ms-log = { path = "../ms-log" }
 # Localized failure messages (`t!` / `tf!`), mounted crate-wide in `lib.rs`.
 ms-i18n = { path = "../ms-i18n" }
+# The capability table: whether a Python backend exists to take over when the crash guard
+# refuses a native load (the guard's log and user message say so only where it does).
+ms-platform = { path = "../ms-platform" }
 # The RGBA crop/page buffers handed to the OCR and detection entry points.
 image.workspace = true
 # The unified ONNX selection is read straight off the merged `user_config.json` tree.

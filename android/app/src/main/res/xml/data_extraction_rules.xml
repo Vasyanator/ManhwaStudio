@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12+ backup and device-to-device transfer rules (`android:dataExtractionRules` of the
+     application). `allowBackup="false"` no longer stops a device-to-device transfer on Android 12+,
+     so the encrypted credential store (`platform/CredentialBridge.kt`, SharedPreferences file
+     `ms_credentials`) is excluded explicitly: its AndroidKeyStore key never travels, so a copied
+     file could only ever read as "cannot be decrypted". -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="ms_credentials.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="ms_credentials.xml" />
+    </device-transfer>
+</data-extraction-rules>

@@ -17,7 +17,8 @@ resolved once per process, because the ort environment and the loaded dylib are 
 process-global and not swappable without an app restart.
 
 Layer: ABOVE `ms-onnx` (sessions), `ms-text-detect` (`ProbMap`), `ms-onnx-runtime` (the dylib resolver/downloader),
-`ms-sysprobe` (`ai_models`, `gpu_utils`) and `ms-config`; BELOW the translation tab's OCR /
+`ms-sysprobe` (`ai_models`, `gpu_utils`), `ms-config` and `ms-platform` (whether a Python
+backend exists to take over, for the guard's log and message); BELOW the translation tab's OCR /
 detector routers and the AI backend panel, which call into it. Native-only: `ms-onnx`/`ort`
 load a native shared library, so the binary gates the re-export off wasm.
 
@@ -27,6 +28,11 @@ with the Python backend and resolved once per process. An unavailable accelerato
 to the `cpu` build with a logged notice, never a wrong result (where a `cpu` archive ships, see
 below); a load-time EP failure is an
 error the callers answer by falling back to the backend.
+The persisted EP token is parsed by `parse_ort_provider_token` (typed: a known provider,
+not selected, or `Unknown(token)`); `ort_provider_token` is its exhaustive inverse and the one
+owner of the token table (the AI panel writes through it). An unknown token (a backend-only EP
+such as ROCm / MIGraphX, or a hand edit) keeps requesting the CPU EP, but explicitly: it is
+reported in `NativeSelectionReport::unknown_configured_provider` and logged once.
 `evaluate_native_selection(cfg)` is the one owner of that resolution: uncached, silent, and
 returning a `NativeSelectionReport` (requested and effective triple, fallback reason, guard
 scope key of the effective triple). The process cache (`compute_native_selection`, behind
@@ -107,6 +113,11 @@ outlives the provider it was built for.
   (`mark_ort_load_attempted` before, `mark_ort_load_succeeded` after the first successful
   inference, `reset_ort_load_guard` on a graceful failure). That guard is what makes an
   uncatchable SIGILL survivable across launches; it may not be skipped or reordered.
+  On Android the low-memory killer can end the process during the first inference (large
+  fp32 models); the guard cannot tell that from a crash, so the scope reads `Suspect` on the
+  next launch exactly like after a SIGILL and native AI stays off until the user presses the
+  guard reset ("Retry ORT"). Where no Python backend exists (`PlatformFeature::PythonBackend`),
+  the refusal log and the `GuardDisabled` message say so instead of "using the backend".
 - `ORT_DYLIB_COMMITTED` is set after the first successful load and NEVER cleared:
   `reset_load_latch` enables a SAME-build retry only. A different build needs a restart.
 - Blocking work only. Nothing here may be called from the GUI thread; the callers own the

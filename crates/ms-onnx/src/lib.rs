@@ -9,7 +9,7 @@ is never linked or downloaded at build time.
 
 Key types:
 - ExecutionProvider     : the inference backend to request
-  (CPU/DirectML/CoreML/CUDA/WebGPU/OpenVINO/TensorRT)
+  (CPU/DirectML/CoreML/CUDA/WebGPU/OpenVINO/TensorRT/XNNPACK)
 - NativeDeviceSelection : accelerator selection (default / numeric index /
   OpenVINO device-type string) applied to the EP when a session is built
 - OrtError              : typed error surface for load/warmup and inference failures
@@ -29,6 +29,8 @@ Key functions:
 Notes:
 Pure inference infrastructure: no egui/eframe, no application config, no paths,
 and no download logic. The caller owns dylib resolution and provider selection.
+Session threading has one owner, `SessionThreads::for_provider` (Android pins the
+intra-op pools; desktop keeps onnxruntime's defaults).
 The ort environment is a process-global singleton owned by the `ort` crate; an
 `OrtRuntime` is the app-side handle for the committed, dylib-backed environment.
 */
@@ -54,6 +56,7 @@ pub use paddle_ocr::{
     paddle_recognize,
 };
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use ms_log::trace::cat;
@@ -91,6 +94,11 @@ pub enum ExecutionProvider {
     /// adapter is selected by a numeric device id
     /// ([`NativeDeviceSelection::Index`]).
     TensorRt,
+    /// XNNPACK, the ARM/x86 CPU kernel library, as an onnxruntime EP (Android aarch64,
+    /// where the bundled `onnxruntime-android` build carries it). It runs on the CPU with
+    /// its own thread pool; nodes it does not support fall back to the CPU EP per node.
+    /// No device selection.
+    Xnnpack,
 }
 
 impl ExecutionProvider {
@@ -98,7 +106,7 @@ impl ExecutionProvider {
     ///
     /// Used as a scoping key for per-provider configuration; the returned values
     /// (`"cpu"`, `"directml"`, `"coreml"`, `"cuda"`, `"webgpu"`, `"openvino"`,
-    /// `"tensorrt"`) are part of the crate's contract and must not change.
+    /// `"tensorrt"`, `"xnnpack"`) are part of the crate's contract and must not change.
     #[must_use]
     pub fn id(self) -> &'static str {
         match self {
@@ -109,6 +117,7 @@ impl ExecutionProvider {
             ExecutionProvider::WebGpu => "webgpu",
             ExecutionProvider::OpenVino => "openvino",
             ExecutionProvider::TensorRt => "tensorrt",
+            ExecutionProvider::Xnnpack => "xnnpack",
         }
     }
 
@@ -137,6 +146,10 @@ impl ExecutionProvider {
     /// TensorRT mirrors CUDA (Windows/Linux, not macOS): it is bundled in the CUDA
     /// ("gpu") build and needs the NVIDIA/CUDA stack; this predicate does not probe
     /// for a working NVIDIA driver.
+    ///
+    /// XNNPACK is offered only on aarch64 Android: the only onnxruntime build here that
+    /// carries it is the `onnxruntime-android` library the APK bundles (the desktop
+    /// release archives are built without it).
     #[must_use]
     pub fn is_available_on_current_platform(self) -> bool {
         match self {
@@ -153,6 +166,57 @@ impl ExecutionProvider {
             ExecutionProvider::TensorRt => {
                 cfg!(any(target_os = "windows", target_os = "linux"))
             }
+            ExecutionProvider::Xnnpack => cfg!(all(target_os = "android", target_arch = "aarch64")),
+        }
+    }
+}
+
+/// The thread policy of one session: the session's intra-op pool and, for XNNPACK, the
+/// EP's own pool. Produced only by [`SessionThreads::for_provider`], the one owner of
+/// session threading; `None` fields keep onnxruntime's defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionThreads {
+    /// Session intra-op thread count (`SetIntraOpNumThreads`); `None` = onnxruntime's
+    /// default (one thread per core).
+    intra_op_threads: Option<usize>,
+    /// Whether intra-op threads may spin before blocking; `None` = onnxruntime's default
+    /// (spinning on).
+    intra_op_spinning: Option<bool>,
+    /// XNNPACK's own pool size (`intra_op_num_threads` EP option); only read by the
+    /// XNNPACK dispatch.
+    xnnpack_threads: Option<NonZeroUsize>,
+}
+
+/// Android: worker threads for the CPU-class sessions. The tablet SoCs pair a few fast
+/// cores with slow efficiency cores; onnxruntime's default pool (one thread per core)
+/// puts work on the slow cores and the whole op waits for them. 4 is an initial value that
+/// still needs the device benchmark (dev-docs/ANDROID_ONNX.md, device checklist).
+const ANDROID_CPU_THREADS: NonZeroUsize = NonZeroUsize::MIN.saturating_add(3);
+
+impl SessionThreads {
+    /// The thread policy for a session on `provider` (`Cpu` for the CPU-only builder).
+    ///
+    /// Desktop: onnxruntime's defaults for every provider. Android: a CPU session gets
+    /// [`ANDROID_CPU_THREADS`] intra-op threads; an XNNPACK session gets ONE intra-op
+    /// thread without spinning plus an XNNPACK pool of [`ANDROID_CPU_THREADS`] — the
+    /// layout onnxruntime documents for XNNPACK, so the two pools do not contend for the
+    /// same cores. Pure.
+    const fn for_provider(provider: ExecutionProvider) -> Self {
+        const DEFAULTS: SessionThreads = SessionThreads { intra_op_threads: None, intra_op_spinning: None, xnnpack_threads: None };
+        if !cfg!(target_os = "android") {
+            return DEFAULTS;
+        }
+        match provider {
+            ExecutionProvider::Xnnpack => SessionThreads { intra_op_threads: Some(1), intra_op_spinning: Some(false), xnnpack_threads: Some(ANDROID_CPU_THREADS) },
+            ExecutionProvider::Cpu => SessionThreads { intra_op_threads: Some(ANDROID_CPU_THREADS.get()), intra_op_spinning: None, xnnpack_threads: None },
+            // No accelerator EP runs on Android today (`is_available_on_current_platform`);
+            // should one arrive, its threading is decided here, not defaulted silently.
+            ExecutionProvider::DirectMl
+            | ExecutionProvider::CoreMl
+            | ExecutionProvider::Cuda
+            | ExecutionProvider::WebGpu
+            | ExecutionProvider::OpenVino
+            | ExecutionProvider::TensorRt => DEFAULTS,
         }
     }
 }
@@ -443,7 +507,8 @@ impl OrtRuntime {
     ///   MangaOCR session builder).
     /// - [`ExecutionProvider::DirectMl`] / [`ExecutionProvider::CoreMl`] /
     ///   [`ExecutionProvider::Cuda`] / [`ExecutionProvider::WebGpu`] /
-    ///   [`ExecutionProvider::OpenVino`] / [`ExecutionProvider::TensorRt`] register
+    ///   [`ExecutionProvider::OpenVino`] / [`ExecutionProvider::TensorRt`] /
+    ///   [`ExecutionProvider::Xnnpack`] register
     ///   the matching EP with `error_on_failure()`, so a broken GPU/accelerator
     ///   setup surfaces as an [`OrtError::SessionBuild`] instead of silently falling
     ///   back to CPU. (TensorRT is registered alone; onnxruntime still falls back
@@ -457,7 +522,10 @@ impl OrtRuntime {
     /// - OpenVINO reads [`NativeDeviceSelection::OpenVinoDeviceType`]: when present,
     ///   the device-TYPE string is passed via `with_device_type(s)`; otherwise
     ///   OpenVINO chooses its own default device.
-    /// - CoreML and CPU ignore the device selection entirely.
+    /// - CoreML, XNNPACK and CPU ignore the device selection entirely.
+    ///
+    /// Session threading follows `SessionThreads::for_provider` (Android only; desktop
+    /// keeps onnxruntime's defaults).
     ///
     /// WebGPU additionally pins the Dawn backend to the platform's native GPU API
     /// (D3D12 on Windows, Vulkan on Linux); on macOS no backend is set and Dawn
@@ -474,7 +542,7 @@ impl OrtRuntime {
     /// [`OrtError::SessionBuild`] if the builder cannot be created, the execution
     /// provider registration fails, or the model file is missing/unreadable.
     pub fn build_session(&self, model_path: &Path) -> Result<Session, OrtError> {
-        build_session_with(model_path, self.execution_provider_dispatch(self.provider))
+        build_session_with(model_path, self.provider, self.execution_provider_dispatch(self.provider))
     }
 
     /// Builds a session on `provider` instead of the committed one, with the same options,
@@ -491,7 +559,7 @@ impl OrtRuntime {
         if !provider.is_available_on_current_platform() {
             return Err(OrtError::UnsupportedProvider(provider.id()));
         }
-        build_session_with(model_path, self.execution_provider_dispatch(provider))
+        build_session_with(model_path, provider, self.execution_provider_dispatch(provider))
     }
 
     /// Builds an inference session from `model_path` on ONNX Runtime's built-in CPU
@@ -510,7 +578,7 @@ impl OrtRuntime {
     /// [`OrtError::SessionBuild`] if the builder cannot be created or the model file is
     /// missing/unreadable.
     pub fn build_session_cpu_only(&self, model_path: &Path) -> Result<Session, OrtError> {
-        build_session_with(model_path, None)
+        build_session_with(model_path, ExecutionProvider::Cpu, None)
     }
 
     /// Builds the ort execution-provider dispatch for `provider` (the committed one, or
@@ -601,6 +669,15 @@ impl OrtRuntime {
                 }
                 Some(ep.build().error_on_failure())
             }
+            ExecutionProvider::Xnnpack => {
+                // XNNPACK has no device; its pool size comes from the one thread-policy
+                // owner, which also shrinks the session's own intra-op pool to match.
+                let mut ep = ort::ep::XNNPACK::default();
+                if let Some(threads) = SessionThreads::for_provider(provider).xnnpack_threads {
+                    ep = ep.with_intra_op_num_threads(threads);
+                }
+                Some(ep.build().error_on_failure())
+            }
         }
     }
 
@@ -628,15 +705,18 @@ impl OrtRuntime {
     }
 }
 
-/// The one session builder behind [`OrtRuntime::build_session`] and
-/// [`OrtRuntime::build_session_cpu_only`]: all graph optimizations, then `ep` when
-/// given (`None` = ONNX Runtime's built-in CPU backend), then the model file.
+/// The one session builder behind [`OrtRuntime::build_session`],
+/// [`OrtRuntime::build_session_on`] and [`OrtRuntime::build_session_cpu_only`]: all graph
+/// optimizations, the thread policy of `provider` ([`SessionThreads::for_provider`]), then
+/// `ep` when given (`None` = ONNX Runtime's built-in CPU backend), then the model file.
+/// `provider` is the EP `ep` was built for (`Cpu` when `ep` is `None`).
 ///
 /// # Errors
-/// [`OrtError::SessionBuild`] if the builder cannot be created, the execution provider
-/// registration fails, or the model file is missing/unreadable.
+/// [`OrtError::SessionBuild`] if the builder cannot be created, a thread option or the
+/// execution provider registration fails, or the model file is missing/unreadable.
 fn build_session_with(
     model_path: &Path,
+    provider: ExecutionProvider,
     ep: Option<ort::ep::ExecutionProviderDispatch>,
 ) -> Result<Session, OrtError> {
     // The ort builder methods return DISTINCT error generics (`ort::Error<T>`), so each
@@ -653,6 +733,22 @@ fn build_session_with(
                 reason: e.to_string(),
             }
         })?;
+
+    // Thread policy (desktop: nothing set, so its sessions keep onnxruntime's defaults
+    // byte-for-byte; see `SessionThreads::for_provider`).
+    let threads = SessionThreads::for_provider(provider);
+    if let Some(count) = threads.intra_op_threads {
+        builder = builder.with_intra_threads(count).map_err(|e| OrtError::SessionBuild {
+            path: model_path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+    }
+    if let Some(spinning) = threads.intra_op_spinning {
+        builder = builder.with_intra_op_spinning(spinning).map_err(|e| OrtError::SessionBuild {
+            path: model_path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+    }
 
     // Register the provider (if any) and commit the session. `None` registers nothing,
     // keeping the historical CPU-only builder byte-identical.
@@ -746,6 +842,29 @@ mod tests {
         assert_eq!(ExecutionProvider::WebGpu.id(), "webgpu");
         assert_eq!(ExecutionProvider::OpenVino.id(), "openvino");
         assert_eq!(ExecutionProvider::TensorRt.id(), "tensorrt");
+        assert_eq!(ExecutionProvider::Xnnpack.id(), "xnnpack");
+    }
+
+    #[test]
+    fn session_threads_follow_the_platform_policy() {
+        let cpu = SessionThreads::for_provider(ExecutionProvider::Cpu);
+        let xnnpack = SessionThreads::for_provider(ExecutionProvider::Xnnpack);
+        if cfg!(target_os = "android") {
+            assert_eq!(cpu.intra_op_threads, Some(4));
+            assert_eq!(cpu.xnnpack_threads, None);
+            assert_eq!(xnnpack.intra_op_threads, Some(1));
+            assert_eq!(xnnpack.intra_op_spinning, Some(false));
+            assert_eq!(xnnpack.xnnpack_threads.map(NonZeroUsize::get), Some(4));
+        } else {
+            // Desktop sessions keep onnxruntime's defaults for every provider.
+            for provider in [ExecutionProvider::Cpu, ExecutionProvider::Cuda, ExecutionProvider::WebGpu, ExecutionProvider::Xnnpack] {
+                assert_eq!(
+                    SessionThreads::for_provider(provider),
+                    SessionThreads { intra_op_threads: None, intra_op_spinning: None, xnnpack_threads: None },
+                    "{provider:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -787,6 +906,11 @@ mod tests {
         assert_eq!(
             ExecutionProvider::TensorRt.is_available_on_current_platform(),
             cfg!(any(target_os = "windows", target_os = "linux"))
+        );
+        // XNNPACK: only the bundled aarch64 Android build carries it.
+        assert_eq!(
+            ExecutionProvider::Xnnpack.is_available_on_current_platform(),
+            cfg!(all(target_os = "android", target_arch = "aarch64"))
         );
     }
 

@@ -4,7 +4,8 @@
 GUI-free platform seams. The one owner of "does this platform offer X" (`PlatformFeature`),
 of file open/save dialogs (`file_dialog`), of system clipboard reads (`clipboard`), of images
 other apps hand over (`incoming`: Android Share / "Open with"), of the Android credential store
-(`credentials`) and of the pre-window native error box (`message`). The only crate that names `rfd` and `arboard`; its
+(`credentials`), of the installed package's native library directory (`native_libs`, Android)
+and of the pre-window native error box (`message`). The only crate that names `rfd` and `arboard`; its
 Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the crate stack
 (deps: `ms-i18n`, `ms-log`); compiles for desktop, wasm32 and Android.
 
@@ -33,6 +34,12 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 
 - **Incoming images** (`incoming/`): every function exists on every target; outside Android it
   answers "nothing incoming". Android: see "Incoming inbox" below.
+
+- **Native library directory** (`native_libs.rs`, Android only): `native_library_dir()` asks
+  `Context.getApplicationInfo().nativeLibraryDir` once over JNI (worker thread only) and caches
+  it for the process (a failure is not cached); typed `NativeLibraryDirError`. The onnxruntime
+  resolver (`ms-onnx-runtime`) loads the APK's bundled `libonnxruntime.so` from there. Not
+  compiled elsewhere (no package folder exists there, so there is no answer to fake).
 
 - **Credentials** (`credentials/`, Android + host tests only): blocking `read_blocking` /
   `store_blocking` / `delete_blocking` of one secret by (service, account), typed
@@ -127,6 +134,7 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - `incoming/listing.rs`: pure decoding of the Kotlin listing and the release policy (host-tested).
 - `incoming/android.rs`: the JNI half (class load, native binding, static calls).
 - `message.rs`: `show_error_blocking` (startup only).
+- `native_libs.rs`: the Android package's native library directory (JNI, cached).
 - `credentials/mod.rs`: `CredentialError`, the Android operations, the pure `entry_name` and
   `decode_read_answer`; `credentials/android.rs`: the JNI calls; `credentials/tests.rs`: host
   tests (frozen names, answer decoding, messages).
@@ -180,6 +188,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   `android/app/src/main/AndroidManifest.xml` (`LaunchActivity`).
 - Android clipboard reads: `clipboard/android.rs` + the `read_text_backend` dispatch in
   `clipboard/mod.rs`.
+- Android native library directory (bundled onnxruntime): `native_libs.rs`; the directory is
+  only populated because `android/app/build.gradle.kts` keeps `useLegacyPackaging = true`.
 - Android credential store: Kotlin `CredentialBridge.kt` (storage, crypto) +
   `credentials/android.rs` (JNI) + `credentials/mod.rs` (names, answer decoding, errors); new
   message keys `platform.credentials.*_error` in `en.json` and `ru.json`.

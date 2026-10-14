@@ -124,7 +124,10 @@ fn graph_placement(graph: BaberuGraph, provider: ExecutionProvider) -> SessionPl
             | ExecutionProvider::CoreMl
             | ExecutionProvider::Cuda
             | ExecutionProvider::WebGpu
-            | ExecutionProvider::OpenVino => SessionPlacement::On(provider),
+            | ExecutionProvider::OpenVino
+            // XNNPACK takes the fp16 vision graph's supported nodes and leaves the rest
+            // (the `com.microsoft` contrib ops) to the CPU EP per node.
+            | ExecutionProvider::Xnnpack => SessionPlacement::On(provider),
         },
     }
 }
@@ -473,7 +476,7 @@ mod tests {
         assert_eq!(names[11], ("present_v5".to_owned(), "past_v5".to_owned()));
     }
 
-    const ALL_PROVIDERS: [ExecutionProvider; 7] = [
+    const ALL_PROVIDERS: [ExecutionProvider; 8] = [
         ExecutionProvider::Cpu,
         ExecutionProvider::DirectMl,
         ExecutionProvider::CoreMl,
@@ -481,6 +484,7 @@ mod tests {
         ExecutionProvider::WebGpu,
         ExecutionProvider::OpenVino,
         ExecutionProvider::TensorRt,
+        ExecutionProvider::Xnnpack,
     ];
 
     #[test]

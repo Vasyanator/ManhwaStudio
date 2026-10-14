@@ -36,7 +36,7 @@ wayland-sys = { version = "0.31", features = ["dlopen"] }
 
 # Android: the application context and JavaVM that android-activity publishes through
 # `ndk-context`, used by the clipboard reads, the SAF file-dialog bridge, the incoming-images
-# inbox and the credential store bridge.
+# inbox, the credential store bridge and the native library directory query.
 [target.'cfg(target_os = "android")'.dependencies]
 jni.workspace = true
 ndk-context.workspace = true

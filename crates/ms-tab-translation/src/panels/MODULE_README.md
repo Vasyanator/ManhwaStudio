@@ -33,7 +33,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   width), the shared `ms_ai_api::draw_generation_status` widget right before the "Статус:" block
   while an AI API request is in flight (its Stop -> `OcrPanelActions::stop_generation`, carrying the clicked snapshot so the tab stops
   exactly that generation), behavior
-  toggles, load action, selection-mode hints, and last result/error preview. The "Заменять
+  toggles, load action, selection-mode hints (plus, only while canvas finger gestures are
+  effective, a finger hint and the quick/advanced `FingerOcrSelection` for a key-less finger
+  long-press drag, persisted per title as `OCR.finger_selection`), and last result/error preview. The "Заменять
   символы" master toggle expands an inline editor of post-OCR substitution rules (per-row enable,
   quoted comma-separated targets, replacement, delete); `runtime_char_replacements` parses the
   enabled rows into `CharReplacementRule`s carried by `OcrRecognizeRequest`, and the OCR worker
