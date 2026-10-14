@@ -1,5 +1,5 @@
 /*
-File: crates/ms-widgets/src/touch_nav/router.rs
+File: crates/ms-input/src/touch/router.rs
 
 Purpose:
 The input-boundary router of canvas touch gestures. Runs on the ROOT viewport's
@@ -236,6 +236,7 @@ impl Phase {
 
 /// One claimed touch.
 #[derive(Clone, Debug)]
+#[expect(clippy::struct_excessive_bools, reason = "independent per-touch flags of the gesture state machine, each read on its own; moved verbatim from ms-widgets, which does not enable clippy::pedantic")]
 struct Claim {
     owner: Id,
     /// The owner's `TouchSurface::long_press_selection`, refreshed from every publication of the
@@ -304,12 +305,11 @@ struct FrameAcc {
 
 impl FrameAcc {
     fn owner(&mut self, owner: Id) -> &mut OwnerFrame {
-        let index = match self.owners.iter().position(|(id, _)| *id == owner) {
-            Some(index) => index,
-            None => {
-                self.owners.push((owner, OwnerFrame::default()));
-                self.owners.len() - 1
-            }
+        let index = if let Some(index) = self.owners.iter().position(|(id, _)| *id == owner) {
+            index
+        } else {
+            self.owners.push((owner, OwnerFrame::default()));
+            self.owners.len() - 1
         };
         &mut self.owners[index].1
     }
@@ -543,7 +543,7 @@ impl TouchRouter {
                 other => events.push(other),
             }
         }
-        self.finish_frame(now, cfg, acc)
+        self.finish_frame(now, cfg, &acc)
     }
 
     /// Claims the touch when it starts on a published surface; returns whether it did.
@@ -739,6 +739,7 @@ impl TouchRouter {
             }
             // Clamped to `0..=FLING_MAX_DT_S` first, so narrowing to f32 keeps far more precision
             // than one frame needs (there is no lossless f64 -> f32 conversion; this one is bounded).
+            #[expect(clippy::cast_possible_truncation, reason = "bounded to 0..=FLING_MAX_DT_S just above (see the comment)")]
             let dt = elapsed.min(f64::from(FLING_MAX_DT_S)) as f32;
             fling.time = now;
             let friction = FLING_FRICTION_PT_S2 * dt;
@@ -817,7 +818,7 @@ impl TouchRouter {
     }
 
     /// Arms due long-presses, builds per-owner outputs and rolls navigation positions over.
-    fn finish_frame(&mut self, now: f64, cfg: RouterConfig, acc: FrameAcc) -> RouteResult {
+    fn finish_frame(&mut self, now: f64, cfg: RouterConfig, acc: &FrameAcc) -> RouteResult {
         self.recent_ends.retain(|(_, time)| now - time <= PROMOTION_GRACE_S);
         let palm = !self.passthrough_down.is_empty();
         for claim in self.claims.values_mut().filter(|claim| claim.phase == Phase::Pending) {

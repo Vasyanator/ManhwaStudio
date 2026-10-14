@@ -1,5 +1,5 @@
 /*
-File: crates/ms-widgets/src/touch_nav/menu.rs
+File: crates/ms-input/src/touch/menu.rs
 
 Purpose:
 The single open path of canvas context menus: a mouse/pen secondary click and a finger
@@ -28,7 +28,7 @@ use egui::{Popup, SetOpenCommand};
 /// the router's `TouchOutput::long_press_at` of THIS frame (only when it belongs to this
 /// response's area). The popup id is egui's default for `response`
 /// (`Popup::default_response_id`), so `Popup::is_id_open` works as for `Popup::context_menu`.
-pub fn context_menu_popup<'a>(response: &'a Response, long_press_at: Option<Pos2>) -> Popup<'a> {
+pub fn context_menu_popup(response: &Response, long_press_at: Option<Pos2>) -> Popup<'_> {
     let anchor_id = Popup::default_response_id(response).with("ms_touch_anchor");
     let set_open = if response.secondary_clicked() || long_press_at.is_some() {
         Some(SetOpenCommand::Bool(true))

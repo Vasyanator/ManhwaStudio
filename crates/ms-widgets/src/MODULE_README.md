@@ -17,7 +17,8 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 ## Crate boundary
 `ms-widgets` is the reusable UI-primitive layer of the workspace. It knows NOTHING about the
 project domain: it may depend on `ms-config`, `ms-log`, `ms-i18n`, `ms-text-util`, `ms-sysprobe`,
-`ms-gifs`, `ms-thread`, `ms-theme` and `ms-fonts` (the last one native-only), and it may NOT depend on
+`ms-gifs`, `ms-thread`, `ms-theme`, `ms-input` (the unified input model and the touch router it
+re-exports as `touch_nav`) and `ms-fonts` (the last one native-only), and it may NOT depend on
 `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the canvas, the tabs and the
 launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its
 crate-root leaves as `crate::ui_fonts`, `crate::bubble_status` and
@@ -35,13 +36,13 @@ crate's `[dev-dependencies]`, so no production build carries them.
   `../examples/MODULE_README.md`.
 - `input_util.rs`: shared egui input helpers — raw (unsmoothed) wheel delta and the
   "is the pointer over a floating egui layer" test. Both restore semantics egui removed after 0.31 (still absent in 0.36).
-- `touch_nav/`: the one owner of finger input on canvases (own `MODULE_README.md`). The shell's
-  `raw_input_hook` drives `TouchRouter`, which claims a touch that starts on a canvas surface
-  published last frame and strips egui-winit's emulated mouse events for it, so a finger never
-  reaches a tool; canvases publish `TouchSurface`s and take a typed `TouchOutput` (pan / pinch,
-  long-press feedback, long-press menu point, long-press selection drag, drag-region drag) every
-  frame. Both canvas context menus open through `context_menu_popup` (secondary click and
-  long-press share one path). Ordinary UI, the mouse and the pen are untouched.
+- `touch_nav` (no directory here): a TEMPORARY re-export shim, `pub use ms_input::touch as
+  touch_nav;` in `lib.rs`. The canvas touch-gesture owner (`TouchRouter`, `TouchSurface`,
+  `TouchOutput`, `context_menu_popup`, ...) lives in `crates/ms-input/src/touch/` (own
+  `MODULE_README.md`), part of the unified input crate. The shim keeps every
+  `ms_widgets::touch_nav::…` / `ms_widgets::TouchRouter` path compiling; it is removed (and the
+  importers re-pointed to `ms_input::touch`) by the input-unification cleanup package (WP9). Add
+  no new user of the shim.
 - `input_manager_v2.rs`: the user-configurable hotkey registry — code-declared `HotkeySpecV2`
   specs, the persisted `Hotkeys` overrides in `user_config.json`, and the per-frame dispatch of
   triggered commands out of `egui::InputState` by id and `HotkeyScopeV2`. It lives at this layer
@@ -484,6 +485,7 @@ crate's `[dev-dependencies]`, so no production build carries them.
 - To change jamo keyboard layout or latch semantics, edit `hangul_keyboard.rs`; the syllable
   arithmetic and the compatibility-jamo tables belong to `crates/ms-text-util/src/hangul.rs`.
 - To change finger gestures on canvases (claim rule, stripping, long-press, pan / pinch) or the
-  canvas context-menu open path, edit `touch_nav/` and read its `MODULE_README.md` first.
+  canvas context-menu open path, edit `crates/ms-input/src/touch/` (not this crate) and read its
+  `MODULE_README.md` first.
 - To change panel docking (arrangement rules, gaps, shrinking, or later the panel widgets), edit
   `panel_dock/` and read its own `MODULE_README.md` first.

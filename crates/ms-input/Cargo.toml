@@ -1,0 +1,41 @@
+[package]
+name = "ms-input"
+version = "0.1.0"
+edition = "2024"
+
+# The unified input model of the studio: buttons (keyboard, modifiers, mouse, touch sources,
+# unknown devices), code-declared actions (Command / Mode / Axis / Gesture) with any number of
+# user-rebindable alternatives, the registry, the pure matcher, conflict and shadow detection,
+# localized binding labels and the persisted `Hotkeys` codec (format 2 + v1 migration).
+# The egui runtime (router, per-frame `InputFrame`, capture) and the canvas touch router
+# (`touch/`, moved from `ms-widgets`) are layered on top of this model inside the same crate;
+# the model itself never reads an egui `Context`.
+#
+# Layer: the `ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry /
+# ms-os-integration` line, BELOW `ms-widgets`. It must never depend on `ms-widgets`, a tab crate,
+# `ms-studio-tab` or the root package; those depend on it.
+
+[dependencies]
+# `egui::Key` is the keyboard button type (physical key names, `Key::name` / `from_name` for the
+# persisted tokens, `symbol_or_name` for glyph labels); the runtime and `touch/` read the
+# `egui::Context` (events, pointer, layers, popups, temp data).
+egui.workspace = true
+# `AppTab` (tab-scoped actions) and `update_user_config_file` (the serialized read-modify-write
+# the override writers go through).
+ms-config = { path = "../ms-config" }
+# Localized button / gesture / conflict texts (`t!` / `tf!`, mounted crate-wide in `lib.rs`) and
+# `resolve_key` for the declared title keys.
+ms-i18n = { path = "../ms-i18n" }
+# Diagnostics of dropped overrides and of the v1 -> v2 migration (`runtime_log`); the runtime's
+# and the touch router's input traces (`trace_log!`, category INPUT).
+ms-log = { path = "../ms-log" }
+# The `Hotkeys` section codec.
+serde_json.workspace = true
+# Typed public errors (declaration, binding, decode, persistence).
+thiserror.workspace = true
+# The error type of the `update_user_config_file` mutator boundary.
+anyhow.workspace = true
+
+[dev-dependencies]
+# Reads back the temp-dir user config the writer tests produce (format auto-detected).
+ms-docstore = { path = "../ms-docstore" }

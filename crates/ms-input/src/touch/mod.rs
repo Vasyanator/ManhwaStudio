@@ -1,5 +1,5 @@
 /*
-File: crates/ms-widgets/src/touch_nav/mod.rs
+File: crates/ms-input/src/touch/mod.rs
 
 Purpose:
 Public surface of the canvas touch-gesture owner. A finger that starts on a canvas
@@ -13,6 +13,7 @@ Main responsibilities:
 - the per-frame publication channel from canvases to the router (`publish_surface`,
   `publish_capture_layer`, `publish_hole`), stored in `egui::Context` temp data;
 - the take-once delivery channel from the router to canvases (`take_touch_output`);
+- the non-consuming selection read of the unified input router (`peek_selection`);
 - the public output types (`TouchNavigation`, `TouchSelection`, `TouchOutput`);
 - the long-press timing constant and the promotion-rule constants.
 
@@ -22,7 +23,8 @@ Key structures:
 - `TouchOutput`: everything one canvas gets from the router for one frame.
 
 Key functions:
-- `publish_surface`, `publish_capture_layer`, `publish_hole`, `take_touch_output`;
+- `publish_surface`, `publish_capture_layer`, `publish_hole`, `take_touch_output`,
+  `peek_selection`;
 - `TouchRouter::route` (in `router.rs`), driven by the shell's `raw_input_hook`;
 - `context_menu_popup` (in `menu.rs`), the single open path of canvas context menus.
 
@@ -330,6 +332,27 @@ pub fn take_touch_output(ctx: &Context, owner: Id) -> TouchOutput {
         }
     }
     delivery.output
+}
+
+/// Reads `owner`'s long-press selection drag of this frame WITHOUT taking the output: the input
+/// router (`crate::router`) matches touch binding alternatives from it at the start of the pass,
+/// and the owner still takes the whole output once with [`take_touch_output`] afterwards.
+///
+/// `None` when the router delivered nothing for `owner` this frame, when the output was already
+/// taken, or when it carries no selection.
+#[must_use]
+pub fn peek_selection(ctx: &Context, owner: Id) -> Option<TouchSelection> {
+    ctx.data(|data| {
+        data.get_temp::<Vec<Delivery>>(deliveries_id())
+            .and_then(|deliveries| deliveries.iter().find(|delivery| delivery.owner == owner).and_then(|delivery| delivery.output.selection))
+    })
+}
+
+/// Test door of the input router's tests (`crate::tests`): stores `output` as this frame's
+/// delivery for `owner`, as a routing call would.
+#[cfg(test)]
+pub(crate) fn deliver_for_test(ctx: &Context, owner: Id, output: TouchOutput) {
+    store_deliveries(ctx, vec![Delivery { owner, output, repaint_after_s: None }]);
 }
 
 /// Takes the surfaces, extra holes and capture layers published during the previous frame

@@ -13,7 +13,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [workspace]
-members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-local-ai", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-studio-tab", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-platform", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
+members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-local-ai", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-studio-tab", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-input", "crates/ms-platform", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
 # The Android port forks under `crates/` are separate workspaces patched in below; without
 # this exclusion Cargo would adopt them as implicit members of this workspace.
 exclude = ["crates/winit", "crates/egui"]
@@ -228,6 +228,10 @@ ms-tab-translation = { path = "crates/ms-tab-translation" }
 # `backend_health`: the push-driven backend health snapshot), named `ms_local_ai::` directly:
 # the root builds `LocalAiAvailability` at startup and the studio reads the health snapshot.
 ms-local-ai = { path = "crates/ms-local-ai" }
+# The unified input model (buttons, declared actions with rebindable alternatives, matcher,
+# conflicts, localized binding labels, the `Hotkeys` codec), named `ms_input::` directly (no
+# shim). Sits BELOW `ms-widgets` and every tab crate, which declare their actions through it.
+ms-input = { path = "crates/ms-input" }
 # The `StudioTab` trait: the order-free per-tab hooks `studio/tabs.rs` (`Tabs`) iterates instead
 # of matching on `AppTab` at every call site. Named `ms_studio_tab::` directly (no shim).
 ms-studio-tab = { path = "crates/ms-studio-tab" }

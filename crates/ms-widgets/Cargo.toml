@@ -40,6 +40,10 @@ ms-text-util = { path = "../ms-text-util" }
 ms-sysprobe = { path = "../ms-sysprobe" }
 # `HelpHint` streams its animated WebP hints from the bundled asset crate.
 ms-gifs = { path = "../ms-gifs" }
+# The canvas touch router (`ms_input::touch`), re-exported as `touch_nav` by a temporary shim
+# in `lib.rs` until its importers name `ms_input::touch` directly. `ms-input` sits below this
+# crate and never depends on it.
+ms-input = { path = "../ms-input" }
 # Panel-dock layout snapshots and the spellcheck word lists are JSON documents.
 serde_json.workspace = true
 # The panel-dock layout model is serialized into `user_config.json`.

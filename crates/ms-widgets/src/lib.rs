@@ -87,12 +87,10 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     `apply_ui_scale_to_context`): the process-global interface scale, applied once per egui
     context by every product window and changed live by the settings slider.
   - `touch_nav` (`TouchRouter`, `TouchSurface`, `TouchOutput`, `TouchNavigation`,
-    `TouchSelection`, `context_menu_popup`, `publish_surface`, `take_touch_output`): the one
-    owner of finger input on canvases. A finger that starts on a published canvas surface
-    never reaches a tool: it pans / pinches, a long-press opens the canvas context menu on
-    release or turns a following drag into a typed selection, and a press on an
-    owner-published drag region drags it at once (typed region drag). Mouse and pen are
-    unchanged.
+    `TouchSelection`, `context_menu_popup`, `publish_surface`, `take_touch_output`): a
+    temporary re-export of `ms_input::touch`, the one owner of finger input on canvases (see
+    `crates/ms-input/src/touch/MODULE_README.md`). Removed once every importer names
+    `ms_input::touch` directly.
 */
 #![warn(clippy::all)]
 
@@ -126,11 +124,11 @@ pub mod ui_fonts;
 // egui context. Next to `ui_fonts` for the same reason: every product window (main window,
 // startup prompts, installer / update windows) applies it once per context.
 pub mod ui_scale;
-// Canvas touch gestures: the one owner of the finger decision. The shell's `raw_input_hook`
-// drives `TouchRouter`; canvases publish surfaces and take typed navigation / long-press /
-// selection output; both canvas context menus open through `context_menu_popup`. Public
-// module so consumers name `ms_widgets::touch_nav::…`; the main types are re-exported below.
-pub mod touch_nav;
+// Canvas touch gestures moved to the unified input crate (`ms_input::touch`). TEMPORARY shim:
+// keeps every `ms_widgets::touch_nav::…` path (shell hook, ms-canvas, tab crates, PS editor)
+// compiling until the input-unification cleanup re-points them to `ms_input::touch` and deletes
+// this line together with the re-exports below. Add no new user.
+pub use ms_input::touch as touch_nav;
 
 mod ai_button;
 mod autocomplete_line;

@@ -1,5 +1,5 @@
 /*
-File: crates/ms-widgets/src/touch_nav/tests.rs
+File: crates/ms-input/src/touch/tests.rs
 
 Purpose:
 Contract tests of the canvas touch router and the context-menu helper.
@@ -11,7 +11,8 @@ Main responsibilities:
 - pure and adapter tests of the live on/off request (`TouchRouter::set_enabled`);
 - headless `Context::run_ui` tests of the egui adapter (`TouchRouter::route`), of the
   background-layer fact `Context::layer_id_at` reports over bare canvas, and of
-  `context_menu_popup` against egui's own `Popup::context_menu`.
+  `context_menu_popup` against egui's own `Popup::context_menu`;
+- the non-consuming `peek_selection` read.
 
 Notes:
 Event sequences follow `crates/egui/crates/egui-winit/src/lib.rs` `on_touch`: the `Touch`
@@ -29,8 +30,8 @@ use super::router::{
 };
 use super::{
     LONG_PRESS_ARM_S, PROMOTION_GRACE_S, TouchOutput, TouchRouter, TouchSelection,
-    TouchSelectionEnd, TouchSurface, context_menu_popup, polygon_contains, publish_capture_layer,
-    publish_hole, publish_surface, take_touch_output,
+    TouchSelectionEnd, TouchSurface, context_menu_popup, peek_selection, polygon_contains,
+    publish_capture_layer, publish_hole, publish_surface, take_touch_output,
 };
 
 const CFG: RouterConfig = RouterConfig { slop_pt: 6.0, long_press_s: LONG_PRESS_ARM_S };
@@ -803,7 +804,7 @@ fn locked_lift_flings_with_egui_kinetic_law() {
         assert_eq!(navigation.touches, 0, "a kinetic frame has no touches");
         assert_eq!(navigation.prev_centroid, pos2(176.0, 110.5), "anchored at the lift point");
         assert_close(navigation.zoom_factor, 1.0);
-        assert_eq!(navigation.pan_delta().y, 0.0, "the glide follows the lock");
+        assert!(navigation.pan_delta().y.abs() < f32::EPSILON, "the glide follows the lock");
         assert_eq!(result.next_deadline(), Some(now));
         // egui's step (`scroll_area.rs:866-877`): v -= friction * dt, then move by v * dt.
         speed -= FLING_FRICTION_PT_S2 * 0.01;
@@ -828,7 +829,7 @@ fn fling_steps_are_clamped_to_the_max_dt() {
     let dt = FLING_MAX_DT_S;
     let expected = (600.0 - FLING_FRICTION_PT_S2 * dt) * dt;
     assert!((navigation.pan_delta().y - expected).abs() < 0.1, "{navigation:?}");
-    assert_eq!(navigation.pan_delta().x, 0.0);
+    assert!(navigation.pan_delta().x.abs() < f32::EPSILON);
 }
 
 #[test]
@@ -1531,4 +1532,19 @@ fn long_press_opens_the_menu_at_the_press_point_without_a_pointer() {
     publish_surface(&ctx, surface(true));
     router.route(&ctx, &mut raw);
     assert!(!Popup::is_any_open(&ctx), "a claim start dismisses the open menu");
+}
+
+#[test]
+fn peek_selection_does_not_take_the_output() {
+    // The unified input router peeks at the selection before the owner takes its output; the
+    // peek must leave the take-once delivery intact.
+    let ctx = Context::default();
+    let selection = TouchSelection { origin: pos2(10.0, 20.0), pos: pos2(30.0, 40.0), began: true, end: None };
+    let output = TouchOutput { selection: Some(selection), ..TouchOutput::default() };
+    super::store_deliveries(&ctx, vec![super::Delivery { owner: owner(), output, repaint_after_s: None }]);
+    assert_eq!(peek_selection(&ctx, owner()), Some(selection));
+    assert_eq!(peek_selection(&ctx, owner()), Some(selection), "a peek never consumes");
+    assert_eq!(peek_selection(&ctx, Id::new("touch_nav.test.other")), None);
+    assert_eq!(take_touch_output(&ctx, owner()), output, "the owner still takes the whole output");
+    assert_eq!(peek_selection(&ctx, owner()), None, "nothing is left after the take");
 }

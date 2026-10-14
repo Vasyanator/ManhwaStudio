@@ -1,4 +1,4 @@
-# Module: crates/ms-widgets/src/touch_nav
+# Module: crates/ms-input/src/touch
 
 ## Purpose
 The one owner of finger input on canvases. A finger that starts on a canvas never reaches a
@@ -19,7 +19,11 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
              ──► take_touch_output (navigation, tap_at, long_press_armed_at, long_press_at,
                                      selection, region_drag)
              ──► context_menu_popup(response, long_press_at).show(..)
+input router (crate::router, start of the pass) ──► peek_selection (non-consuming)
 ```
+Place in the crate: the touch router is the RAW stage of `ms-input` (it runs before egui builds
+its pointer state); the input router (`../router.rs`) runs inside the pass and only reads its
+deliveries through `peek_selection`, to match touch binding alternatives (`Button::Touch`).
 - `mod.rs`: public types, constants, the publication and take-once delivery channel.
 - `router.rs`: `TouchRouter` — the egui adapter `route` and the pure core `route_events`.
 - `menu.rs`: `context_menu_popup`, the single open path of canvas context menus.
@@ -97,6 +101,8 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
 - Navigation counts only touches present at both frame start and frame end, so adding or lifting
   a finger never jumps. Apply it as zoom about `prev_centroid`, then move `prev_centroid` onto
   `centroid`.
+- `peek_selection` never takes: the owner's `take_touch_output` later in the pass still gets the
+  whole output (pinned by `peek_selection_does_not_take_the_output`).
 - Outputs live one frame: the router replaces them each frame; a consumer must take them every
   frame it publishes a surface (`take_touch_output` also requests the repaint that arms a pending
   long-press on time — a repaint requested in the hook would be reset by
