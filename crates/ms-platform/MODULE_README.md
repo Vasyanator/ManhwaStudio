@@ -3,8 +3,8 @@
 ## Purpose
 GUI-free platform seams. The one owner of "does this platform offer X" (`PlatformFeature`),
 of file open/save dialogs (`file_dialog`), of system clipboard reads (`clipboard`), of images
-other apps hand over (`incoming`: Android Share / "Open with") and of the pre-window native
-error box (`message`). The only crate that names `rfd` and `arboard`; its
+other apps hand over (`incoming`: Android Share / "Open with"), of the Android credential store
+(`credentials`) and of the pre-window native error box (`message`). The only crate that names `rfd` and `arboard`; its
 Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the crate stack
 (deps: `ms-i18n`, `ms-log`); compiles for desktop, wasm32 and Android.
 
@@ -33,6 +33,34 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 
 - **Incoming images** (`incoming/`): every function exists on every target; outside Android it
   answers "nothing incoming". Android: see "Incoming inbox" below.
+
+- **Credentials** (`credentials/`, Android + host tests only): blocking `read_blocking` /
+  `store_blocking` / `delete_blocking` of one secret by (service, account), typed
+  `CredentialError` (`Unavailable` = bridge missing from the APK, `Unreadable`, `Backend`).
+  Desktop consumers keep `keyring` themselves and the web has no store, so the module does not
+  exist there (no fake answer). See "Credential store" below.
+
+## Credential store (Android)
+- Owner of the storage: the Kotlin `CredentialBridge` (file header there). One AES-256-GCM key
+  in the AndroidKeyStore (alias `io.github.vasyanator.manhwastudio.credentials.v1`,
+  non-exportable, no user-auth requirement, created by the first write), entries in the
+  app-private SharedPreferences file `ms_credentials` as `1:<b64 IV>:<b64 ciphertext+tag>`,
+  fresh Keystore IV per write, the entry name as GCM AAD. Alias, file name and value format are
+  persistence contracts.
+- Entry name (`entry_name`, pure, host-tested, frozen): `"v1." + hex(service) + "." +
+  hex(account)`; Kotlin treats it as opaque.
+- Unreadable is never "missing": an entry that exists but does not decrypt (Keystore key lost
+  or invalidated, malformed or tampered value) is `CredentialError::Unreadable`; nothing deletes
+  or rewrites it except an explicit store (replaces it) or delete. Consumers surface it as a
+  read error.
+- Wire contract (both sides change together): class name `CREDENTIAL_CLASS`
+  (`credentials/android.rs`); `read(Context, String) -> String[]` = `{"ok", secret}` /
+  `{"missing"}` / `{"unreadable", detail}` / `{"failed", detail}` (decoded by
+  `decode_read_answer`, a malformed answer never echoes a field); `write` / `delete` answer
+  `String?` (null = done). Kotlin never throws into native and serializes all operations.
+- Secrets never reach a log, an error or a `Debug` output; logs carry the operation and the
+  typed error only. Verified on a device only: the Keystore key, encryption, persistence across
+  restarts and the unreadable path.
 
 ## Incoming inbox (Android)
 - Owner of the layout: the Kotlin `IncomingImages` (file header there). `LaunchActivity`
@@ -99,11 +127,14 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - `incoming/listing.rs`: pure decoding of the Kotlin listing and the release policy (host-tested).
 - `incoming/android.rs`: the JNI half (class load, native binding, static calls).
 - `message.rs`: `show_error_blocking` (startup only).
+- `credentials/mod.rs`: `CredentialError`, the Android operations, the pure `entry_name` and
+  `decode_read_answer`; `credentials/android.rs`: the JNI calls; `credentials/tests.rs`: host
+  tests (frozen names, answer decoding, messages).
 - `android/`: `jni_ctx.rs` (Android only; also the shared `read_string_array`), `saf.rs` (pure SAF half, host-tested in
   `saf/tests.rs`: the bridge class name `SAF_BRIDGE_CLASS`, wire codes and decoders, the
   pending-request registry, staging name rules).
 - Kotlin half: `android/app/src/main/kotlin/io/github/vasyanator/manhwastudio/platform/`
-  (`SafBridge.kt`, `SafRequestActivity.kt`, `IncomingImages.kt`; manifest entry for
+  (`SafBridge.kt`, `SafRequestActivity.kt`, `IncomingImages.kt`, `CredentialBridge.kt`; manifest entry for
   `SafRequestActivity`). The "Open with" MIME list of the manifest is guarded against
   `ms_config::single_image::INPUT_FILE_TYPES` by `crates/ms-config/tests/android_manifest_mime.rs`.
 
@@ -122,6 +153,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   uppercase spelling because GTK / xdg-portal globs are case-sensitive.
 - `PickDirectoryPath` needs `PersistentDirectoryPicker` (unavailable on Android: SAF yields
   tree URIs, never usable paths).
+- Credential operations are blocking (Keystore binder calls, synchronous storage commit):
+  callers run them on workers only.
 - No JNI on the GUI thread: Android backends run every JVM call on a worker
   (`FolderTarget::has_entries` answers from a probe taken at pick time). The one
   exception is the synchronous clipboard text read (`clipboard/android.rs`): a single short
@@ -147,3 +180,6 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   `android/app/src/main/AndroidManifest.xml` (`LaunchActivity`).
 - Android clipboard reads: `clipboard/android.rs` + the `read_text_backend` dispatch in
   `clipboard/mod.rs`.
+- Android credential store: Kotlin `CredentialBridge.kt` (storage, crypto) +
+  `credentials/android.rs` (JNI) + `credentials/mod.rs` (names, answer decoding, errors); new
+  message keys `platform.credentials.*_error` in `en.json` and `ru.json`.

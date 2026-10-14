@@ -13,8 +13,10 @@ Key items:
 - `download_external_model()`: blocking download with byte progress, cancel, resume,
   automatic retry of transient network failures, size + sha256 verification, atomic
   per-file publish and a completion marker.
-- `RangeFetcher` + `FetchError` + `RetryPolicy` + `download_with()`: the testable core with
-  an injected HTTP fetcher and an injected backoff sleep.
+- `download_with()`: the testable core with an injected `RangeFetcher` and `RetryPolicy`
+  (injected backoff sleep). The HTTP seam, the retry schedule and the per-file resumable
+  stream live in `resumable.rs` (shared with the main-repository downloader); this file
+  adds the pin (size + sha256), the staging layout and the markers.
 - `ExternalModelError`: typed errors; `Display` is English diagnostic text for logs, the UI
   maps variants to localized messages.
 
@@ -32,8 +34,9 @@ Notes:
 - Nothing here runs on the GUI thread: every function touches the filesystem, the
   download also the network. Callers own the worker.
 - No implicit download anywhere: `installed_dir` only reports.
-- The HF token is sent as a bearer header only to the resolve URL; ureq drops it on a
-  cross-host redirect. It is never logged.
+- Resolve URLs come from `resumable::hf_resolve_url` (`HF_ENDPOINT` honoured, no home
+  directory needed). The HF token is sent as a bearer header only to the resolve URL; ureq
+  drops it on a cross-host redirect. It is never logged.
 - Retry: a TRANSIENT failure (connect / DNS / reset / read timeout, a body that ends before
   the pinned size, HTTP 408 / 429 / 5xx) is retried with exponential backoff, resuming the
   `.part` with `Range`; the counter resets whenever an attempt staged new bytes. Permanent
@@ -50,13 +53,21 @@ Notes:
 */
 
 use std::path::{Path, PathBuf};
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::atomic::Ordering;
 use std::sync::atomic::AtomicBool;
-#[cfg(not(target_arch = "wasm32"))]
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(not(target_arch = "wasm32"))]
+use super::resumable::{
+    CHUNK, PartRequest, RangeFetcher, ResumableFetch, RetryPolicy, StreamError, StreamEvent, UreqFetcher, chunk_len, hf_resolve_url,
+};
+// Test-only names of the shared HTTP seam, so `external/tests.rs` reaches them via `super::*`.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+use super::resumable::{FetchError, FetchResponse, FetchStatus, classify_status};
+
+/// Log prefix of every line this module writes.
+#[cfg(not(target_arch = "wasm32"))]
+const LOG_TAG: &str = "[external-models]";
 
 /// File name of the completion marker inside a model directory.
 pub const COMPLETE_MARKER: &str = ".ms_model_complete.json";
@@ -268,19 +279,10 @@ pub fn download_external_model(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&ExternalDownloadProgress),
 ) -> Result<PathBuf, ExternalModelError> {
-    use hf_hub::api::sync::ApiBuilder;
-    use hf_hub::{Repo, RepoType};
-
     validate_spec(spec)?;
-    let api = ApiBuilder::from_env().with_progress(false).build().map_err(|err| {
-        let error = ExternalModelError::Http { file: spec.id, detail: format!("could not build the Hugging Face client: {err}") };
-        log_failure(spec, &error);
-        error
-    })?;
-    let repo = api.repo(Repo::with_revision(spec.repo_id.to_owned(), RepoType::Model, spec.revision.to_owned()));
-    let base_url = |file: &ExternalFile| repo.url(file.path);
+    let base_url = |file: &ExternalFile| hf_resolve_url(spec.repo_id, spec.revision, file.path);
     let token = crate::hf_token::hf_token();
-    let fetcher = ureq_fetcher::UreqFetcher::new((!token.is_empty()).then_some(token));
+    let fetcher = UreqFetcher::new((!token.is_empty()).then_some(token));
     download_with(&fetcher, &base_url, side_models_root, spec, cancel, &RetryPolicy::standard(), progress)
 }
 
@@ -340,115 +342,6 @@ pub(crate) fn validate_spec(spec: &ExternalModelSpec) -> Result<(), ExternalMode
         }
     }
     Ok(())
-}
-
-/// Response status the downloader distinguishes: a whole body or the requested suffix.
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FetchStatus {
-    /// HTTP 200: the body is the whole file, whatever offset was asked for.
-    Full,
-    /// HTTP 206: the body starts at the requested offset.
-    Partial,
-}
-
-/// An opened HTTP response body.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) struct FetchResponse {
-    /// How `body` relates to the requested offset.
-    pub status: FetchStatus,
-    /// The streamed body.
-    pub body: Box<dyn std::io::Read + Send>,
-}
-
-/// Why a request could not be opened; decides whether the downloader retries it. `detail`
-/// is English diagnostic text without secrets (it reaches the log only).
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FetchError {
-    /// Worth retrying: connect / DNS / I/O transport failures, HTTP 408, 429 and 5xx.
-    /// `retry_after` is the server's `Retry-After` when it sent one in delta-seconds form.
-    Transient { detail: String, retry_after: Option<Duration> },
-    /// Retrying cannot help: any other HTTP status, a malformed URL or proxy setting, a
-    /// redirect loop, a 206 for another range.
-    Permanent { detail: String },
-}
-
-/// Classifies an HTTP error status: 408 (request timeout), 429 (rate limit) and every 5xx
-/// are transient, everything else permanent. `retry_after` is the raw `Retry-After` header;
-/// only the delta-seconds form is honoured (an HTTP-date falls back to the backoff).
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn classify_status(code: u16, retry_after: Option<&str>) -> FetchError {
-    let detail = format!("HTTP status {code}");
-    if code == 408 || code == 429 || (500..=599).contains(&code) {
-        let retry_after = retry_after.and_then(|value| value.trim().parse::<u64>().ok()).map(Duration::from_secs);
-        FetchError::Transient { detail, retry_after }
-    } else {
-        FetchError::Permanent { detail }
-    }
-}
-
-/// The HTTP seam of the downloader; tests inject an in-memory implementation.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) trait RangeFetcher {
-    /// Opens `url`, asking for the bytes from `offset` on when `offset > 0`. A `Partial`
-    /// answer must start exactly at `offset` (the implementation checks it). Errors while
-    /// READING the returned body are always treated as transient by the downloader.
-    ///
-    /// # Errors
-    /// A classified [`FetchError`] for any transport or status failure.
-    fn fetch(&self, url: &str, offset: u64) -> Result<FetchResponse, FetchError>;
-}
-
-/// Retry schedule for transient failures, with the backoff sleep injected so tests never
-/// wait real time.
-///
-/// Retry `n` (1-based count of consecutive failed attempts that staged no new bytes) waits
-/// `first_delay * 2^(n-1)`, capped at `max_delay`, or the server's `Retry-After` when that is
-/// longer (itself capped at `retry_after_cap`). After `max_retries` such retries the last
-/// failure is returned as `ExternalModelError::Http`.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) struct RetryPolicy<'a> {
-    /// Retries allowed in a row without progress.
-    pub max_retries: u32,
-    /// Wait before the first retry.
-    pub first_delay: Duration,
-    /// Upper bound of the exponential backoff.
-    pub max_delay: Duration,
-    /// Upper bound of a server-requested `Retry-After` wait.
-    pub retry_after_cap: Duration,
-    /// Longest single sleep; the cancel flag is polled between slices.
-    pub wait_slice: Duration,
-    /// Sleeps for one slice (production: `std::thread::sleep`).
-    pub sleep: &'a dyn Fn(Duration),
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl RetryPolicy<'static> {
-    /// Production schedule: 5 retries without progress, waiting 2, 4, 8, 16 and 30 s
-    /// (`Retry-After` honoured up to 60 s), cancel polled every 100 ms. With the ureq read
-    /// timeout of 60 s, a link that is completely down fails after about 6 minutes.
-    pub(crate) fn standard() -> Self {
-        Self {
-            max_retries: 5,
-            first_delay: Duration::from_secs(2),
-            max_delay: Duration::from_secs(30),
-            retry_after_cap: Duration::from_secs(60),
-            wait_slice: Duration::from_millis(100),
-            sleep: &std::thread::sleep,
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl RetryPolicy<'_> {
-    /// Wait before retry `attempt` (1-based); see the type comment for the formula.
-    pub(crate) fn delay_for(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
-        // 2^(attempt-1) saturates at u32::MAX for absurd attempt counts; the cap applies anyway.
-        let factor = 1_u32.checked_shl(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
-        let backoff = self.first_delay.saturating_mul(factor).min(self.max_delay);
-        retry_after.map_or(backoff, |requested| requested.min(self.retry_after_cap).max(backoff))
-    }
 }
 
 /// Testable download core; see [`download_external_model`] for the contract. `base_url`
@@ -548,29 +441,8 @@ struct FileJob<'a> {
     done_before: u64,
 }
 
-/// Outcome of one failed request attempt for a file.
-#[cfg(not(target_arch = "wasm32"))]
-enum AttemptError {
-    /// Returned to the caller as is (cancel, local I/O, permanent HTTP failure, overflow).
-    Fatal(ExternalModelError),
-    /// The staged prefix is valid and the failure may pass: retry after a backoff.
-    /// `retry_after` is the server's requested wait, if any.
-    Transient { detail: String, retry_after: Option<Duration> },
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl From<ExternalModelError> for AttemptError {
-    fn from(error: ExternalModelError) -> Self {
-        Self::Fatal(error)
-    }
-}
-
 #[cfg(not(target_arch = "wasm32"))]
 impl FileJob<'_> {
-    /// Read buffer size: the upper bound of one read, hence the coarsest cancel and progress
-    /// granularity (a network read usually returns far less).
-    const CHUNK: usize = 128 * 1024;
-
     /// Makes `file` present and verified at its final path: keeps an already-correct file,
     /// otherwise resumes or restarts its `.part` (retrying transient failures), verifies
     /// size then sha256, fsyncs and renames it into place.
@@ -604,15 +476,9 @@ impl FileJob<'_> {
         if written > 0 {
             self.hash_existing(index, file, &part, &mut hasher)?;
         }
-        if written < file.size {
-            // Returns only once exactly `file.size` bytes are staged and fsynced.
-            self.stream_with_retries(index, file, url, &part, written, &mut hasher)?;
-        } else {
-            // A complete `.part` left by an interrupted earlier run: make it durable before
-            // it is published.
-            let handle = std::fs::OpenOptions::new().write(true).open(&part).map_err(|source| io_error(&part, source))?;
-            handle.sync_all().map_err(|source| io_error(&part, source))?;
-        }
+        // Returns only once exactly `file.size` bytes are staged and fsynced (a complete
+        // `.part` left by an interrupted earlier run is only fsynced).
+        self.stream_part(index, file, url, &part, written, &mut hasher)?;
 
         let actual = hex_lower(&hasher.finalize());
         if actual != file.sha256 {
@@ -627,18 +493,14 @@ impl FileJob<'_> {
     }
 
     /// Streams the rest of `file` into `part` from `offset` (bytes already staged and already
-    /// fed to `hasher`) until exactly `file.size` bytes are staged, then fsyncs the `.part`.
-    ///
-    /// A transient failure (see [`AttemptError::Transient`]) keeps the staged bytes and is
-    /// retried per `self.retry`, resuming from the staged length; the retry counter resets
-    /// whenever an attempt staged new bytes, so isolated drops over a long download never
-    /// exhaust it.
+    /// fed to `hasher`) through the shared resumable fetch, with the pinned size as the
+    /// authoritative length, mapping its events onto [`ExternalDownloadProgress`].
     ///
     /// # Errors
     /// `Cancelled` (also during a retry wait), `Io`, `SizeMismatch` (overflow, `.part`
     /// deleted), `Http` for a permanent failure or once the retries are exhausted (`.part`
     /// kept).
-    fn stream_with_retries(
+    fn stream_part(
         &mut self,
         index: usize,
         file: &'static ExternalFile,
@@ -647,136 +509,21 @@ impl FileJob<'_> {
         offset: u64,
         hasher: &mut sha2::Sha256,
     ) -> Result<(), ExternalModelError> {
-        let mut written = offset;
-        let mut failures = 0_u32;
-        loop {
-            let before = written;
-            let (detail, retry_after) = match self.stream_attempt(index, file, url, part, &mut written, hasher) {
-                Ok(()) if written == file.size => return Ok(()),
-                // The body ended cleanly but early (chunked or close-delimited response
-                // cut off): the staged prefix is valid, so resume it.
-                Ok(()) => (format!("the response body ended at byte {written} of {}", file.size), None),
-                Err(AttemptError::Fatal(error)) => return Err(error),
-                Err(AttemptError::Transient { detail, retry_after }) => (detail, retry_after),
-            };
-            if written > before {
-                failures = 0;
+        let log_context = format!("id={} file={}", self.spec.id, file.path);
+        let engine = ResumableFetch { fetcher: self.fetcher, retry: self.retry, cancel: self.cancel, log_tag: LOG_TAG, log_context: &log_context };
+        let request = PartRequest { url, part, offset, expected_size: Some(file.size) };
+        let result = engine.fetch_part(&request, Some(hasher), &mut |event| match event {
+            StreamEvent::Downloading { staged } => self.report(index, file, ExternalDownloadPhase::Downloading, staged),
+            StreamEvent::Retrying { attempt, max_attempts, delay_secs, staged } => {
+                self.report(index, file, ExternalDownloadPhase::Retrying { attempt, max_attempts, delay_secs }, staged);
             }
-            failures = failures.saturating_add(1);
-            if failures > self.retry.max_retries {
-                return Err(ExternalModelError::Http {
-                    file: file.path,
-                    detail: format!("{detail} (gave up after {} retries without progress)", self.retry.max_retries),
-                });
-            }
-            let delay = self.retry.delay_for(failures, retry_after);
-            ms_log::runtime_log::log_warn(format!(
-                "[external-models] transient download failure, retrying: id={} file={} offset={written} attempt={failures}/{} delay_ms={} error={detail}",
-                self.spec.id,
-                file.path,
-                self.retry.max_retries,
-                delay.as_millis()
-            ));
-            self.wait_before_retry(index, file, written, failures, delay)?;
-        }
-    }
-
-    /// One request for the rest of `file`, appending to `part` and advancing `*written`
-    /// (and `hasher`) per chunk, so the staged length stays correct when the attempt fails.
-    /// A 200 answer to a range request restarts the file from zero. `Ok` means the body
-    /// ended cleanly; the caller compares `*written` with the pinned size.
-    fn stream_attempt(
-        &mut self,
-        index: usize,
-        file: &'static ExternalFile,
-        url: &str,
-        part: &Path,
-        written: &mut u64,
-        hasher: &mut sha2::Sha256,
-    ) -> Result<(), AttemptError> {
-        use sha2::Digest;
-        use std::io::{Read, Write};
-
-        self.check_cancel()?;
-        let offset = *written;
-        let response = self.fetcher.fetch(url, offset).map_err(|error| match error {
-            FetchError::Transient { detail, retry_after } => AttemptError::Transient { detail, retry_after },
-            FetchError::Permanent { detail } => AttemptError::Fatal(ExternalModelError::Http { file: file.path, detail }),
-        })?;
-        let mut handle = match response.status {
-            FetchStatus::Partial => {
-                // Offset 0 means no `.part` exists yet; otherwise the staged prefix is extended.
-                let handle = if offset == 0 { std::fs::File::create(part) } else { std::fs::OpenOptions::new().append(true).open(part) };
-                handle.map_err(|source| io_error(part, source))?
-            }
-            FetchStatus::Full => {
-                if offset > 0 {
-                    ms_log::runtime_log::log_info(format!(
-                        "[external-models] server ignored the range request, restarting: id={} file={} offset={offset}",
-                        self.spec.id, file.path
-                    ));
-                }
-                let handle = std::fs::File::create(part).map_err(|source| io_error(part, source))?;
-                *hasher = sha2::Sha256::new();
-                *written = 0;
-                handle
-            }
-        };
-        let mut body = response.body;
-        let mut buffer = vec![0_u8; Self::CHUNK];
-        loop {
-            self.check_cancel()?;
-            // Any failure of the body stream (reset, read timeout, ureq's `UnexpectedEof` for
-            // a body shorter than its Content-Length) leaves a valid staged prefix: retry it.
-            let read = body
-                .read(&mut buffer)
-                .map_err(|err| AttemptError::Transient { detail: format!("reading the response failed: {err}"), retry_after: None })?;
-            if read == 0 {
-                break;
-            }
-            let chunk = &buffer[..read];
-            let next = written.saturating_add(chunk_len(read));
-            if next > file.size {
-                drop(handle);
-                remove_file_if_exists(part)?;
-                return Err(AttemptError::Fatal(ExternalModelError::SizeMismatch { file: file.path, expected: file.size, actual: next }));
-            }
-            handle.write_all(chunk).map_err(|source| io_error(part, source))?;
-            hasher.update(chunk);
-            *written = next;
-            self.report(index, file, ExternalDownloadPhase::Downloading, next);
-        }
-        if *written == file.size {
-            handle.sync_all().map_err(|source| io_error(part, source))?;
-        }
-        Ok(())
-    }
-
-    /// Waits `delay` before retry `attempt`, sleeping in `wait_slice` steps and polling the
-    /// cancel flag between them. Reports `Retrying` whenever the remaining whole seconds
-    /// change, last with `delay_secs: 0` right before returning.
-    ///
-    /// # Errors
-    /// `Cancelled` as soon as the flag is seen.
-    fn wait_before_retry(&mut self, index: usize, file: &'static ExternalFile, staged: u64, attempt: u32, delay: Duration) -> Result<(), ExternalModelError> {
-        let mut remaining = delay;
-        let mut shown = None;
-        loop {
-            self.check_cancel()?;
-            // Whole seconds, rounded up, so "in 1 s" is shown until the wait is really over.
-            let delay_secs = remaining.as_secs().saturating_add(u64::from(remaining.subsec_nanos() > 0));
-            if shown != Some(delay_secs) {
-                shown = Some(delay_secs);
-                let phase = ExternalDownloadPhase::Retrying { attempt, max_attempts: self.retry.max_retries, delay_secs };
-                self.report(index, file, phase, staged);
-            }
-            if remaining.is_zero() {
-                return Ok(());
-            }
-            // A zero slice would never advance the wait; one millisecond is the floor.
-            let slice = remaining.min(self.retry.wait_slice.max(Duration::from_millis(1)));
-            (self.retry.sleep)(slice);
-            remaining = remaining.saturating_sub(slice);
+        });
+        match result {
+            Ok(_) => Ok(()),
+            Err(StreamError::Cancelled) => Err(ExternalModelError::Cancelled),
+            Err(StreamError::Io { path, source }) => Err(ExternalModelError::Io { path, source }),
+            Err(StreamError::Http { detail }) => Err(ExternalModelError::Http { file: file.path, detail }),
+            Err(StreamError::SizeMismatch { expected, actual }) => Err(ExternalModelError::SizeMismatch { file: file.path, expected, actual }),
         }
     }
 
@@ -793,7 +540,7 @@ impl FileJob<'_> {
         use std::io::Read;
 
         let mut handle = std::fs::File::open(path).map_err(|source| io_error(path, source))?;
-        let mut buffer = vec![0_u8; Self::CHUNK];
+        let mut buffer = vec![0_u8; CHUNK];
         let mut hashed = 0_u64;
         self.report(index, file, ExternalDownloadPhase::Verifying, 0);
         loop {
@@ -809,7 +556,7 @@ impl FileJob<'_> {
     }
 
     fn check_cancel(&self) -> Result<(), ExternalModelError> {
-        if self.cancel.load(Ordering::Relaxed) { Err(ExternalModelError::Cancelled) } else { Ok(()) }
+        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) { Err(ExternalModelError::Cancelled) } else { Ok(()) }
     }
 
     fn report(&mut self, index: usize, file: &'static ExternalFile, phase: ExternalDownloadPhase, file_done: u64) {
@@ -944,13 +691,6 @@ fn io_error(path: &Path, source: std::io::Error) -> ExternalModelError {
     ExternalModelError::Io { path: path.to_path_buf(), source }
 }
 
-/// A read length as `u64`. `usize` is at most 64 bits on every supported target, so the
-/// saturating fallback is unreachable; it only avoids a lossy `as`.
-#[cfg(not(target_arch = "wasm32"))]
-fn chunk_len(read: usize) -> u64 {
-    u64::try_from(read).unwrap_or(u64::MAX)
-}
-
 /// Lowercase hex of a digest.
 #[cfg(not(target_arch = "wasm32"))]
 fn hex_lower(bytes: &[u8]) -> String {
@@ -1082,93 +822,6 @@ mod active_guard {
     impl Drop for ActiveDownload {
         fn drop(&mut self) {
             ACTIVE.lock().unwrap_or_else(PoisonError::into_inner).remove(self.0);
-        }
-    }
-}
-
-/// The production `RangeFetcher` over a ureq agent.
-#[cfg(not(target_arch = "wasm32"))]
-mod ureq_fetcher {
-    use std::time::Duration;
-
-    use super::{FetchError, FetchResponse, FetchStatus, RangeFetcher, classify_status};
-
-    pub(super) struct UreqFetcher {
-        agent: ureq::Agent,
-        /// Hugging Face token; sent as a bearer header, never logged. ureq's default
-        /// redirect policy drops `Authorization` on every redirect (the LFS CDN is another
-        /// host), while keeping `Range`.
-        bearer: Option<String>,
-    }
-
-    impl UreqFetcher {
-        pub(super) fn new(bearer: Option<String>) -> Self {
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(15))
-                .timeout_read(Duration::from_secs(60))
-                .try_proxy_from_env(true)
-                .build();
-            Self { agent, bearer }
-        }
-    }
-
-    impl RangeFetcher for UreqFetcher {
-        fn fetch(&self, url: &str, offset: u64) -> Result<FetchResponse, FetchError> {
-            let mut request = self.agent.get(url);
-            if offset > 0 {
-                request = request.set("Range", &format!("bytes={offset}-"));
-            }
-            if let Some(token) = &self.bearer {
-                request = request.set("Authorization", &format!("Bearer {token}"));
-            }
-            let response = match request.call() {
-                Ok(response) => response,
-                Err(ureq::Error::Status(code, response)) => return Err(classify_status(code, response.header("Retry-After"))),
-                Err(ureq::Error::Transport(transport)) => {
-                    let detail = transport.to_string();
-                    return Err(if transport_is_transient(transport.kind()) {
-                        FetchError::Transient { detail, retry_after: None }
-                    } else {
-                        FetchError::Permanent { detail }
-                    });
-                }
-            };
-            let status = match response.status() {
-                200 => FetchStatus::Full,
-                206 => {
-                    // A 206 for another range would silently corrupt the resumed file.
-                    let range = response.header("Content-Range").unwrap_or_default();
-                    if !range.starts_with(&format!("bytes {offset}-")) {
-                        return Err(FetchError::Permanent { detail: format!("unexpected Content-Range '{range}' for offset {offset}") });
-                    }
-                    FetchStatus::Partial
-                }
-                other => return Err(FetchError::Permanent { detail: format!("unexpected HTTP status {other}") }),
-            };
-            Ok(FetchResponse { status, body: Box::new(response.into_reader()) })
-        }
-    }
-
-    /// Whether a ureq transport failure may pass on its own: network-level failures (DNS,
-    /// connect, I/O including timeouts and resets, a garbled status line or header from a
-    /// flaky proxy) are retried; configuration problems and redirect loops are not.
-    fn transport_is_transient(kind: ureq::ErrorKind) -> bool {
-        use ureq::ErrorKind;
-
-        match kind {
-            ErrorKind::Dns
-            | ErrorKind::ConnectionFailed
-            | ErrorKind::Io
-            | ErrorKind::BadStatus
-            | ErrorKind::BadHeader
-            | ErrorKind::ProxyConnect => true,
-            ErrorKind::InvalidUrl
-            | ErrorKind::UnknownScheme
-            | ErrorKind::InsecureRequestHttpsOnly
-            | ErrorKind::TooManyRedirects
-            | ErrorKind::InvalidProxyUrl
-            | ErrorKind::ProxyUnauthorized
-            | ErrorKind::HTTP => false,
         }
     }
 }

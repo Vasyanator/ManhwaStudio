@@ -27,12 +27,12 @@ use serde_json::Value;
 use std::num::NonZeroUsize;
 use web_time::Instant;
 
-/// Reads the native runtime selection + SIGILL guard (scoped to the effective native provider)
+/// Reads the effective native runtime selection (`local_ai::effective_ai_runtime`) + SIGILL guard (scoped to the effective native provider)
 /// fresh off disk and returns the detection route. Worker-thread only (disk I/O). Returns
 /// [`DetectorRoute::Backend`] when the config cannot be read.
 pub(super) fn current_detector_route() -> DetectorRoute {
     let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
-    let runtime = config::AiRuntime::from_user_settings(&cfg);
+    let runtime = crate::local_ai::effective_ai_runtime(&cfg);
     let scope = native_runtime::native_load_scope_key();
     let decision = config::ort_load_decision(config::read_ort_load_guard(&cfg, &scope));
     detector_native_route(runtime, decision)

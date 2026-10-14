@@ -23,7 +23,8 @@ Main constants:
 
 Main types:
 - `AiBackendHealthSnapshot`: last health result for UI status
-  (`connected`, `details`, `checked_at`, backend version).
+  (`connected`, `details`, `checked_at`, backend version); `unavailable(LocalAiOff)` is the
+  fixed snapshot of a process whose backend is off (`--no-ai` or platform).
 - `AiBackendProbeCommand`: control messages for probe thread
   (`CheckNow`, `RefreshDeviceInfo`, `SetDevice`, `SetOnnxDevice`, `RefreshCudaDiagnostics`, `Stop`).
 
@@ -38,6 +39,7 @@ Main functions:
   one resident variant in `ocr.paddleocrvl.model`).
 */
 
+use crate::local_ai::LocalAiOff;
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -142,11 +144,16 @@ impl Default for AiBackendHealthSnapshot {
 }
 
 impl AiBackendHealthSnapshot {
-    pub fn disabled() -> Self {
+    /// The final snapshot of a process whose Python backend is off (`--no-ai`, or a platform
+    /// without it): `checked_at` is set and `connected` is false, so every "is the backend
+    /// unavailable?" gate (`checked_at.is_some() && !connected`) refuses backend routes, and
+    /// `details` names the real reason. No probe ever overwrites it (none is started).
+    #[must_use]
+    pub fn unavailable(off: LocalAiOff) -> Self {
         Self {
             connected: false,
-            details: t!("translation.backend_health.disabled_no_ai_status").to_string(),
-            checked_at: None,
+            details: off.user_message(),
+            checked_at: Some(Instant::now()),
             backend_version: None,
             is_torch_available: Some(false),
             ocr_manga_ready: None,
@@ -160,7 +167,7 @@ impl AiBackendHealthSnapshot {
             available_devices: Vec::new(),
             device_options: Vec::new(),
             torch_device_needs_selection: false,
-            device_details: t!("translation.backend_health.device_mgmt_disabled_status").to_string(),
+            device_details: t!("translation.backend_health.device_mgmt_unavailable_status").to_string(),
             selected_onnx_provider: None,
             available_onnx_providers: Vec::new(),
             selected_onnx_device_id: None,
@@ -168,9 +175,9 @@ impl AiBackendHealthSnapshot {
             onnx_devices_by_provider: HashMap::new(),
             onnx_device_needs_selection: false,
             max_loaded_models: 3,
-            onnx_details: t!("translation.backend_health.onnx_mgmt_disabled_status").to_string(),
+            onnx_details: t!("translation.backend_health.onnx_mgmt_unavailable_status").to_string(),
             device_checked_at: None,
-            cuda_diagnostics: t!("translation.backend_health.cuda_diagnostics_disabled_status").to_string(),
+            cuda_diagnostics: t!("translation.backend_health.cuda_diagnostics_unavailable_status").to_string(),
             cuda_checked_at: None,
         }
     }

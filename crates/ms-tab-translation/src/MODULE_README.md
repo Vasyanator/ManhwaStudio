@@ -200,12 +200,14 @@ Native OCR/detection run WITHOUT the Python backend: BOTH the controller readine
 trigger gate are route-aware. `ocr.rs::warmup_ocr_engine` and `text_detector/mod.rs::run_detect_batch`
 skip `ensure_v2_backend_ready` (and the backend warmup) when the active route is native — the
 in-process runtime/model load lazily on first use and the controller reaches `Ready` with the
-backend offline. The UI trigger gate `ocr::ocr_requires_backend(engine, model, runtime, guard)` is
-the single source of truth for "does this OCR selection need the backend?": native ONNX routes
-return `false`, backend routes return `true`, and `AiApi` (over `genai`) never requires the backend;
-`tab.rs::ocr_requires_backend_runtime` calls it, reading the runtime+guard from a per-tab cache
-refreshed at most every `OCR_ROUTE_INPUTS_CACHE_TTL` so the per-frame gate never blocks on disk I/O.
-Every OCR trigger (drag-box, advanced/quick recognize, the load button, the proactive health check)
+backend offline. The UI trigger gate `ocr::ocr_route_availability(engine, model, runtime, guard,
+local_ai)` is the single source of truth for "can this OCR selection run here, and on what?":
+`ocr_route_kind` maps the selection to `AiRouteKind::{Cloud, Native, Backend}` (native ONNX routes,
+backend routes, and `AiApi` over `genai` = `Cloud`), and `AiRouteKind::availability` checks it
+against the process's `LocalAiAvailability`; `tab.rs` (`current_ocr_route_availability`,
+`ocr_request_refusal`) calls it, reading the runtime+guard from a per-tab cache refreshed at most
+every `OCR_ROUTE_INPUTS_CACHE_TTL` so the per-frame gate never blocks on disk I/O. Every OCR trigger
+(drag-box, advanced/quick recognize, the load button, block OCR, the proactive health check)
 consults it, so a native selection dispatches with the backend offline. Only backend routes warm
 the backend and probe backend health. The native→backend fallback still applies when native
 inference fails AND the backend is up (the fallback path re-checks readiness itself).
@@ -264,6 +266,12 @@ is an author note addressed to the translator, not a replica.
   and is left untouched. Retired `text_detector.params` keys (`STALE_TEXT_DETECTOR_PARAM_KEYS`:
   the old CTD font-size and rearrange-batch params) are ignored on read and stripped on write.
   The `characters.json` watch uses `ms_docstore::signature`.
+- `local_ai.rs`: `LocalAiAvailability` (may this process use the Python backend / native ONNX:
+  `--no-ai` switches both off, the platform capability table decides independently, a platform
+  reason wins), `LocalAiOff` (typed reason + `user_message`), `AiRouteKind` and its
+  `availability` (the ONE route-availability rule: cloud always, native needs native ONNX allowed,
+  backend needs the backend allowed), and `effective_ai_runtime` (the router's runtime: a stored
+  `Backend` reads as `Native` without `PlatformFeature::PythonBackend`).
 - `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
   `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR request building over
   `ms_ai_api` (tracked + stoppable via the controller's `GenerationTracker`), crop encoding, page
@@ -466,7 +474,19 @@ is an author note addressed to the translator, not a replica.
   `ProjectData::user_facing_dir`, never in the scratch. Every file dialog of this crate that sets a
   starting directory must use `user_facing_dir`.
 
+- Local-AI gating (`local_ai.rs`): `--no-ai` means "no LOCAL AI runtimes" (Python backend and
+  native ONNX). Cloud AI API OCR/MT and the plain machine translators are NEVER gated by it or by
+  the platform: the OCR and MT panels are never disabled as a whole, MT has no availability gate,
+  and only a route needing an off runtime is refused, with `LocalAiOff::user_message` as the
+  text. Every route decision goes through `AiRouteKind::availability` (OCR via
+  `ocr::ocr_route_availability`, detection via `TextDetectorAlgorithm::availability` +
+  `DetectorRoute::route_kind`); never test the flag or the platform anywhere else. Every router
+  reads the runtime through `local_ai::effective_ai_runtime`, never `AiRuntime::from_user_settings`
+  directly. The tab publishes native ORT as armed only when `local_ai.native_onnx` is `Ok`.
 ## Editing map
+- To change what `--no-ai` or a platform switches off, or which route kind needs which
+  runtime, edit `local_ai.rs` (`LocalAiAvailability::resolve`, `AiRouteKind::availability`);
+  to change which OCR selection runs on what, edit `ocr::ocr_route_kind` / `ocr_route`.
 - To change top-level translation UI routing, canvas overlays/hooks, OCR selection behavior,
   detector storage, footer sync, or settings persistence, edit `tab.rs`.
 - To change which dock tabs this program tab declares, where its panels start, or what the

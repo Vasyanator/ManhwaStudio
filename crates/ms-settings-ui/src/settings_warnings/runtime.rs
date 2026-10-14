@@ -42,8 +42,12 @@ use crate::ai_backend_supervisor::AiBackendHandle;
 /// GUI-side facts the checks need but cannot read from config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckContext {
-    /// `false` under `--no-ai`: every AI check is then silent.
-    pub ai_enabled: bool,
+    /// Whether this process may use the Python backend (`AiBackendHandle::local_ai`): `false`
+    /// under `--no-ai` or without the backend on the platform; the backend checks are then silent.
+    pub backend_enabled: bool,
+    /// Whether this process may use native ONNX (`AiBackendHandle::local_ai`): `false` under
+    /// `--no-ai` or without native ONNX on the platform; the native checks are then silent.
+    pub native_onnx_enabled: bool,
     /// The supervisor's current autostart toggle (it persists the toggle asynchronously,
     /// so config may still hold the old value).
     pub backend_autostart: bool,
@@ -59,7 +63,8 @@ impl CheckContext {
     #[must_use]
     pub fn from_handle(handle: &AiBackendHandle, registration_checks: bool) -> Self {
         Self {
-            ai_enabled: handle.ai_enabled,
+            backend_enabled: handle.local_ai.backend.is_ok(),
+            native_onnx_enabled: handle.local_ai.native_onnx.is_ok(),
             backend_autostart: handle.process_snapshot().auto_start(),
             registration_checks,
         }
@@ -363,7 +368,8 @@ mod tests {
     use super::{CheckBatch, CheckContext, CheckRequest, KeyOutcome, SettingsWarnings, coalesce, worker_loop};
     use crate::settings_warnings::model::{SettingChange, SettingKey, SettingWarning, WarningLevel, WarningReason};
 
-    const CTX: CheckContext = CheckContext { ai_enabled: true, backend_autostart: true, registration_checks: true };
+    const CTX: CheckContext =
+        CheckContext { backend_enabled: true, native_onnx_enabled: true, backend_autostart: true, registration_checks: true };
 
     /// A live instance whose worker side is the test: requests come out of the
     /// returned receiver, results go in through the returned sender.

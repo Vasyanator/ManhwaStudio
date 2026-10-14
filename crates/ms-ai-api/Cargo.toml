@@ -25,8 +25,8 @@ edition = "2024"
 #
 # Web build: `genai`, `tokio`, `futures-util`, `keyring` and `ureq` are native-only; the wasm build compiles
 # the target-neutral types (including the pure image-edit core) plus error stubs for key
-# storage and metadata. Android also compiles `keyring` out (key-store stubs answer
-# `PlatformFeature::CredentialStore` unavailable).
+# storage and metadata. Android also compiles `keyring` out: its keys live in the
+# Keystore-backed `ms_platform::credentials` store instead.
 [dependencies]
 # Localized error and status texts (`t!` / `tf!`), mounted crate-wide in `lib.rs`.
 ms-i18n = { path = "../ms-i18n" }
@@ -34,8 +34,8 @@ ms-i18n = { path = "../ms-i18n" }
 ms-log = { path = "../ms-log" }
 # Worker threads for key and metadata requests (Web Workers on wasm).
 ms-thread = { path = "../ms-thread" }
-# Capability table: the typed `Unavailable` of the key store on builds without one
-# (`AiApiError::KeyStoreUnavailable`).
+# The Android credential store of the API keys (`ms_platform::credentials`) and the typed
+# `Unavailable` of a missing store (`AiApiError::KeyStoreUnavailable`).
 ms-platform = { path = "../ms-platform" }
 # `Severity` of the notices the connection state hands to its consumer's toasts.
 ms-theme = { path = "../ms-theme" }
@@ -69,6 +69,7 @@ futures-util = "0.3"
 ureq.workspace = true
 
 # The OS credential store of the API keys. Not on wasm (no store) and not on Android: keyring
-# has no Android backend there and would silently link its in-memory mock.
+# has no Android backend there and would silently link its in-memory mock; Android keys go
+# through `ms_platform::credentials` instead.
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 keyring.workspace = true

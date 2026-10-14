@@ -6,7 +6,8 @@ tools (regions): plan with `ms_text_detect::plan_detection`, run the plan throug
 
 Key items:
 - `DetectorRoute` / `detector_native_route()`: where a PaddleOCR forward runs (target-neutral,
-  pure; the disk read lives in `native::current_detector_route`).
+  pure; the disk read lives in `native::current_detector_route`); `DetectorRoute::route_kind`
+  maps it onto the one local-AI availability rule (`crate::local_ai`).
 - `paddle_route()`: the current PaddleOCR route (always `Backend` on wasm).
 - `detect_image()`: plan + run one in-memory RGB page; native Paddle first when routed there,
   re-running the whole page on the backend after a native failure that the backend may not
@@ -23,6 +24,7 @@ Worker-thread only: decode, IPC and inference are blocking.
 */
 
 use super::TextDetectorPageResult;
+use crate::local_ai::AiRouteKind;
 use super::backend::{IpcRunner, SharedClientTransport, ensure_backend_models, forward_engine};
 use image::RgbImage;
 use ms_text_detect::mask::MaskError;
@@ -34,23 +36,30 @@ use web_time::Instant;
 
 /// Where a PaddleOCR text-detection forward pass runs. CTD and Surya always run on the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DetectorRoute {
+pub(crate) enum DetectorRoute {
     /// In-process ONNX Runtime (`ms_native_runtime`).
-    #[cfg_attr(
-        target_arch = "wasm32",
-        expect(dead_code, reason = "the web build has no native runtime, so only desktop constructs this route")
-    )]
     Native,
     /// The Python backend over framed IPC.
     Backend,
 }
 
+impl DetectorRoute {
+    /// The runtime this route runs on, for the one availability rule
+    /// (`local_ai::AiRouteKind::availability`).
+    pub(crate) fn route_kind(self) -> AiRouteKind {
+        match self {
+            DetectorRoute::Native => AiRouteKind::Native,
+            DetectorRoute::Backend => AiRouteKind::Backend,
+        }
+    }
+}
+
 /// Pure routing decision for a native PaddleOCR detection attempt: [`DetectorRoute::Native`]
 /// only when the user selected the native AI runtime AND the per-scope SIGILL load guard is not
-/// `Suspect`. Mirrors `ocr::ocr_route` for detection. Desktop only (its sole caller,
-/// `native::current_detector_route`, is).
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn detector_native_route(runtime: ms_config::AiRuntime, guard: ms_config::OrtLoadDecision) -> DetectorRoute {
+/// `Suspect`. Mirrors `ocr::ocr_route` for detection. Called by `native::current_detector_route`
+/// (worker, fresh disk read) and by the tab's availability gate (cached inputs; on wasm with the
+/// fixed `Backend` runtime).
+pub(crate) fn detector_native_route(runtime: ms_config::AiRuntime, guard: ms_config::OrtLoadDecision) -> DetectorRoute {
     if runtime == ms_config::AiRuntime::Native && guard == ms_config::OrtLoadDecision::Safe {
         DetectorRoute::Native
     } else {

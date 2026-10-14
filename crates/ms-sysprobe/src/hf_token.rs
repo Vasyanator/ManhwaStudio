@@ -8,12 +8,12 @@ block's property — any feature that has to fetch from a gated Hugging Face rep
 reads the same value, so it lives here rather than inside an engine.
 
 Storage:
-The token is a CREDENTIAL and is kept in the OS secret store (`keyring`) under the
-service name `"ManhwaStudio Hugging Face"`, exactly as the AI API keys are kept under
-`"ManhwaStudio AI API OCR"` (`crates/ms-tab-translation/src/ocr.rs`). It is NEVER written to
-`user_config.json`, to any settings JSON, or to a log. The OCR entry is deliberately
-NOT reused or generalized: that one belongs to the translation tab and is keyed by
-service, while this one is a single global value.
+The token is a CREDENTIAL and is kept in the platform secret store under the service name
+`"ManhwaStudio Hugging Face"` (the OS store through `keyring` on desktop, the Keystore-backed
+`ms_platform::credentials` store on Android), exactly as the AI API keys are kept under
+`"ManhwaStudio AI API OCR"` (`ms_ai_api::keys`). It is NEVER written to `user_config.json`, to
+any settings JSON, or to a log. The AI API entry is deliberately NOT reused or generalized:
+that one is keyed by service, while this one is a single global value.
 
 Shape:
 A runtime global with free get/set/clear functions, in the shape of
@@ -33,14 +33,15 @@ Key items:
 
 Notes:
 The token VALUE must never appear in a log line, an error message or a panic payload.
-Every message in this file says "the token" and interpolates only the keyring's own
+Every message in this file says "the token" and interpolates only the store's own
 error, which never carries the secret.
-There is no OS secret store in the browser, and none on Android until a Keystore-backed
-store exists (`keyring` would silently link its in-memory mock there), so on wasm and
-Android the store operations fail with the localized
+The per-target store is chosen in ONE place, the private `backend` module: desktop `keyring`,
+Android `ms_platform::credentials` (`keyring` would silently link its in-memory mock there, so
+it is compiled out), web: none — the store operations fail with the localized
 `ms_platform::Unavailable { CredentialStore }` message while the cache still works, and the
-startup seed only logs that the store is unavailable. `PlatformFeature::CredentialStore`
-owns that decision; the `cfg` gates here only keep `keyring` out of those builds.
+startup seed only logs that. On Android an APK without the Kotlin bridge answers the same
+message with the `BridgeMissing` reason, and a token that can no longer be decrypted is a read
+error, never "no token".
 */
 
 use std::sync::RwLock;
@@ -50,12 +51,10 @@ use std::sync::RwLock;
 /// Its own name, never shared with `"ManhwaStudio AI API OCR"`: the two are different
 /// credentials with different lifetimes, and a shared entry would let deleting one
 /// silently delete the other.
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 const HF_TOKEN_SERVICE: &str = "ManhwaStudio Hugging Face";
 
 /// Account name inside that service. There is exactly one Hugging Face token per
 /// installation, so the account is a constant rather than a user identity.
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 const HF_TOKEN_ACCOUNT: &str = "default";
 
 /// What the UI knows about the stored token right now.
@@ -127,143 +126,192 @@ fn read_cache() -> Option<String> {
     }
 }
 
-/// Stub for builds without an OS credential store (wasm, Android): storing the token is
-/// rejected with a clear error rather than silently dropped.
+/// Writes `token` into the secret store and refreshes the cache.
 ///
-/// # Errors
-/// Always returns the localized "credential store unavailable" message.
-#[cfg(any(target_arch = "wasm32", target_os = "android"))]
-pub fn store_hf_token(_token: &str) -> Result<(), String> {
-    Err(credential_store_unavailable())
-}
-
-/// Writes `token` into the OS secret store and refreshes the cache.
-///
-/// BLOCKING: the keyring is an OS round trip. Never call this on the GUI thread —
+/// BLOCKING: the store is an OS round trip. Never call this on the GUI thread —
 /// spawn it (`ms_thread::spawn`), the way the token row of the FLUX.2 panel does.
 /// The value is trimmed; an empty or whitespace-only token is refused rather than
 /// stored, because an empty entry and a missing entry would then mean the same thing
 /// to every reader.
 ///
 /// # Errors
-/// Returns a localized message when the token is empty or when the secret store
-/// refuses the write. Neither message ever carries the token itself.
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+/// Returns a localized message when the token is empty, when the build has no usable store,
+/// or when the secret store refuses the write. No message ever carries the token itself.
 pub fn store_hf_token(token: &str) -> Result<(), String> {
     let trimmed = token.trim();
     if trimmed.is_empty() {
         return Err(t!("hf_token.empty_error").to_string());
     }
-    hf_keyring_entry()?
-        .set_password(trimmed)
-        .map_err(|err| tf!("hf_token.store_error", err = err))?;
+    backend::set(HF_TOKEN_SERVICE, HF_TOKEN_ACCOUNT, trimmed).map_err(|failure| failure.into_message(|err| tf!("hf_token.store_error", err = err)))?;
     set_cached_hf_token(Some(trimmed.to_string()));
     Ok(())
 }
 
-/// Stub for builds without an OS credential store (wasm, Android).
-///
-/// # Errors
-/// Always returns the localized "credential store unavailable" message.
-#[cfg(any(target_arch = "wasm32", target_os = "android"))]
-pub fn clear_hf_token() -> Result<(), String> {
-    Err(credential_store_unavailable())
-}
-
-/// Deletes the token from the OS secret store and empties the cache.
+/// Deletes the token from the secret store and empties the cache.
 ///
 /// BLOCKING, like [`store_hf_token`]. Deleting a token that is not there succeeds: the
 /// user asked for "no token stored", and that is the state either way.
 ///
 /// # Errors
-/// Returns a localized message when the secret store refuses the deletion.
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+/// Returns a localized message when the build has no usable store or the secret store
+/// refuses the deletion.
 pub fn clear_hf_token() -> Result<(), String> {
-    match hf_keyring_entry()?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {
-            set_cached_hf_token(Some(String::new()));
-            Ok(())
-        }
-        Err(err) => Err(tf!("hf_token.delete_error", err = err)),
-    }
+    backend::delete(HF_TOKEN_SERVICE, HF_TOKEN_ACCOUNT).map_err(|failure| failure.into_message(|err| tf!("hf_token.delete_error", err = err)))?;
+    set_cached_hf_token(Some(String::new()));
+    Ok(())
 }
 
-/// Stub for builds without an OS credential store (wasm, Android). An error rather than an
-/// empty string, so a caller cannot mistake "unavailable" for "the user has no token".
-///
-/// # Errors
-/// Always returns the localized "credential store unavailable" message.
-#[cfg(any(target_arch = "wasm32", target_os = "android"))]
-pub fn read_hf_token() -> Result<String, String> {
-    Err(credential_store_unavailable())
-}
-
-/// Reads the token from the OS secret store and refreshes the cache.
+/// Reads the token from the secret store and refreshes the cache.
 ///
 /// BLOCKING, like [`store_hf_token`]. A missing entry is not an error: it answers with
-/// an empty string, which is the honest "no token is stored".
+/// an empty string, which is the honest "no token is stored". A store that cannot be used
+/// is an error, so a caller cannot mistake "unavailable" for "the user has no token".
 ///
 /// # Errors
-/// Returns a localized message when the secret store is unreachable or refuses the
-/// read. The cache is left untouched then, so a transient failure does not turn a
+/// Returns a localized message when the build has no usable store, or when the secret store
+/// is unreachable or refuses the read (on Android also when the stored token can no longer
+/// be decrypted). The cache is left untouched then, so a transient failure does not turn a
 /// stored token into a missing one.
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
 pub fn read_hf_token() -> Result<String, String> {
-    let token = match hf_keyring_entry()?.get_password() {
-        Ok(token) => token,
-        Err(keyring::Error::NoEntry) => String::new(),
-        Err(err) => return Err(tf!("hf_token.read_error", err = err)),
-    };
-    set_cached_hf_token(Some(token.trim().to_string()));
-    Ok(token.trim().to_string())
+    let token = backend::get(HF_TOKEN_SERVICE, HF_TOKEN_ACCOUNT).map_err(|failure| failure.into_message(|err| tf!("hf_token.read_error", err = err)))?.unwrap_or_default();
+    let token = token.trim().to_string();
+    set_cached_hf_token(Some(token.clone()));
+    Ok(token)
 }
 
-/// Builds this token's secret-store entry.
-///
-/// # Errors
-/// Returns a localized message when the platform has no usable credential store.
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
-fn hf_keyring_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(HF_TOKEN_SERVICE, HF_TOKEN_ACCOUNT)
-        .map_err(|err| tf!("hf_token.keyring_unavailable_error", err = err))
-}
-
-/// Seeds the process-wide cache from the OS secret store, on a worker thread.
+/// Seeds the process-wide cache from the secret store, on a worker thread.
 ///
 /// Called once at startup. It is deliberately fire-and-forget: until the answer lands
 /// the cache reports [`HfTokenState::Unknown`], which every surface renders as "not
 /// known" rather than as "no token". A failure is logged WITHOUT the token and leaves
-/// the cache unseeded, so the next explicit read can still succeed.
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+/// the cache unseeded, so the next explicit read can still succeed. A build without a store
+/// (web) logs that once and spawns nothing.
 pub fn seed_hf_token_from_secret_store() {
+    if let Some(unavailable) = backend::UNAVAILABLE {
+        ms_log::runtime_log::log_info(format!("[startup] Hugging Face token not seeded: {}", unavailable()));
+        return;
+    }
     ms_thread::spawn(|| {
         if let Err(err) = read_hf_token() {
-            // The message carries the keyring's own error, never the token.
-            ms_log::runtime_log::log_warn(format!(
-                "[startup] Hugging Face token could not be read from the secret store: {err}"
-            ));
+            // The message carries the store's own error, never the token.
+            ms_log::runtime_log::log_warn(format!("[startup] Hugging Face token could not be read from the secret store: {err}"));
         }
     });
 }
 
-/// The localized message of a credential-store operation on a build without one. Asks the
-/// capability table, so the reason stays its decision.
-#[cfg(any(target_arch = "wasm32", target_os = "android"))]
-fn credential_store_unavailable() -> String {
-    match ms_platform::PlatformFeature::CredentialStore.require() {
-        Err(unavailable) => unavailable.user_message(),
-        // The table reports a store on this target, but this build compiled `keyring` out:
-        // the bridge to it is what is missing.
-        Ok(()) => ms_platform::Unavailable::new(ms_platform::PlatformFeature::CredentialStore, ms_platform::UnavailableReason::BridgeMissing).user_message(),
+/// Why one backend operation failed, before it becomes the caller's localized message.
+#[derive(Debug)]
+enum StoreFailure {
+    /// The final localized message (no usable store, or the store could not be opened).
+    Message(String),
+    /// The operation itself failed; the store's own error text, never the token.
+    Operation(String),
+}
+
+impl StoreFailure {
+    /// The localized message: `Message` as is, `Operation` through `operation_message` (the
+    /// operation's own `hf_token.*_error` sentence around the store's error text).
+    fn into_message(self, operation_message: impl FnOnce(&str) -> String) -> String {
+        match self {
+            StoreFailure::Message(message) => message,
+            StoreFailure::Operation(detail) => operation_message(&detail),
+        }
     }
 }
 
-/// Startup seed of builds without an OS credential store (wasm, Android): logs once that the
-/// store is unavailable and leaves the cache unseeded, so the badge reports "not known"
-/// instead of claiming that no token exists.
-#[cfg(any(target_arch = "wasm32", target_os = "android"))]
-pub fn seed_hf_token_from_secret_store() {
-    ms_log::runtime_log::log_info(format!("[startup] Hugging Face token not seeded: {}", credential_store_unavailable()));
+// The one per-target choice of this file: which store holds the token. Each backend answers
+// `get` (`Ok(None)` = no entry), `set` and `delete` (a missing entry is success), and
+// `UNAVAILABLE` (`Some(message)` on a build without any store).
+
+/// Desktop: the OS secret store through `keyring`.
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+mod backend {
+    use super::StoreFailure;
+
+    /// Desktop always has a store; failures surface per operation.
+    pub(super) const UNAVAILABLE: Option<fn() -> String> = None;
+
+    fn entry(service: &str, account: &str) -> Result<keyring::Entry, StoreFailure> {
+        keyring::Entry::new(service, account).map_err(|err| StoreFailure::Message(tf!("hf_token.keyring_unavailable_error", err = err)))
+    }
+
+    pub(super) fn get(service: &str, account: &str) -> Result<Option<String>, StoreFailure> {
+        match entry(service, account)?.get_password() {
+            Ok(token) => Ok(Some(token)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(StoreFailure::Operation(err.to_string())),
+        }
+    }
+
+    pub(super) fn set(service: &str, account: &str, secret: &str) -> Result<(), StoreFailure> {
+        entry(service, account)?.set_password(secret).map_err(|err| StoreFailure::Operation(err.to_string()))
+    }
+
+    pub(super) fn delete(service: &str, account: &str) -> Result<(), StoreFailure> {
+        match entry(service, account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(StoreFailure::Operation(err.to_string())),
+        }
+    }
+}
+
+/// Android: the Keystore-backed `ms_platform::credentials` store (`keyring` has no Android
+/// backend and would silently link its in-memory mock, so it is compiled out). An APK without
+/// the bridge answers the localized `Unavailable { CredentialStore, BridgeMissing }` message;
+/// an undecryptable entry is a read error, never "no token".
+#[cfg(target_os = "android")]
+mod backend {
+    use super::StoreFailure;
+    use ms_platform::credentials::{self, CredentialError};
+
+    /// The store exists (the bridge is probed per operation).
+    pub(super) const UNAVAILABLE: Option<fn() -> String> = None;
+
+    fn failure(err: CredentialError) -> StoreFailure {
+        match err {
+            CredentialError::Unavailable(unavailable) => StoreFailure::Message(unavailable.user_message()),
+            CredentialError::Unreadable { .. } | CredentialError::Backend { .. } => StoreFailure::Operation(err.to_string()),
+        }
+    }
+
+    pub(super) fn get(service: &str, account: &str) -> Result<Option<String>, StoreFailure> {
+        credentials::read_blocking(service, account).map_err(failure)
+    }
+
+    pub(super) fn set(service: &str, account: &str, secret: &str) -> Result<(), StoreFailure> {
+        credentials::store_blocking(service, account, secret).map_err(failure)
+    }
+
+    pub(super) fn delete(service: &str, account: &str) -> Result<(), StoreFailure> {
+        credentials::delete_blocking(service, account).map_err(failure)
+    }
+}
+
+/// Web: no secret store in the browser; every operation answers the capability table's
+/// localized `Unavailable { CredentialStore }` message while the cache still works.
+#[cfg(target_arch = "wasm32")]
+mod backend {
+    use super::StoreFailure;
+
+    /// The localized message of the capability table for the missing store.
+    fn message() -> String {
+        let store = ms_platform::PlatformFeature::CredentialStore;
+        ms_platform::Unavailable::new(store, store.unavailable_reason()).user_message()
+    }
+
+    pub(super) const UNAVAILABLE: Option<fn() -> String> = Some(message);
+
+    pub(super) fn get(_service: &str, _account: &str) -> Result<Option<String>, StoreFailure> {
+        Err(StoreFailure::Message(message()))
+    }
+
+    pub(super) fn set(_service: &str, _account: &str, _secret: &str) -> Result<(), StoreFailure> {
+        Err(StoreFailure::Message(message()))
+    }
+
+    pub(super) fn delete(_service: &str, _account: &str) -> Result<(), StoreFailure> {
+        Err(StoreFailure::Message(message()))
+    }
 }
 
 #[cfg(test)]

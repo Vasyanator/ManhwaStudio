@@ -15,7 +15,10 @@ Main types:
 - `AiBackendProcessSnapshot`: thread-safe process state (running/status/logs/autostart).
 - `AiBackendProcessCommand`: control messages for the process worker thread.
 - `AiBackendHandle`: cloneable handle the launcher and studio settings UIs talk to
-  (process control + health snapshot + device-probe commands).
+  (process control + health snapshot + device-probe commands), carrying the process's
+  `LocalAiAvailability` (`local_ai`: `--no-ai` switches off the backend and native ONNX; the
+  platform decides independently). An off backend gets no worker and no probe, only the fixed
+  `AiBackendHealthSnapshot::unavailable` snapshot.
 - `AiBackendSupervisor`: owns the worker thread + probe thread; built once in `run_main`
   (`start_with_autostart_gate` there, so autostart waits for storage-mode conversions).
 - `AutostartGate` / `AutostartDeferral`: the one-shot, gate-deferred autostart polled on the
@@ -57,6 +60,7 @@ use ms_log::runtime_log;
 use ms_tab_translation::backend_health::{
     AiBackendHealthSnapshot, AiBackendProbeCommand, spawn_ai_backend_probe,
 };
+use ms_tab_translation::local_ai::{LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
 use serde_json::Value;
 use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]
@@ -104,10 +108,12 @@ impl AiBackendProcessSnapshot {
         }
     }
 
-    pub fn disabled(auto_start: bool) -> Self {
+    /// The fixed snapshot of a process whose backend is off: `status` names the real reason
+    /// (`--no-ai`, or a platform without the backend). No process worker ever updates it.
+    pub fn unavailable(auto_start: bool, off: LocalAiOff) -> Self {
         Self {
             running: false,
-            status: t!("ai_backend.supervisor.launch_disabled_no_ai").to_string(),
+            status: off.user_message(),
             auto_start,
             updated_at: None,
             logs: VecDeque::new(),
@@ -216,7 +222,10 @@ fn parse_ws_port_line(line: &str) -> WsPortLine {
 /// the app-global backend. Cloning shares the same underlying snapshots/channels.
 #[derive(Debug, Clone)]
 pub struct AiBackendHandle {
-    pub ai_enabled: bool,
+    /// Which local AI runtimes this process may use (`--no-ai` + platform). The backend half
+    /// decides whether this supervisor runs a process worker and probe at all; the studio
+    /// tabs gate their local-runtime routes on it. Cloud AI API is never gated by it.
+    pub local_ai: LocalAiAvailability,
     pub health: Arc<Mutex<AiBackendHealthSnapshot>>,
     pub probe_tx: Option<Sender<AiBackendProbeCommand>>,
     pub process_snapshot: Arc<Mutex<AiBackendProcessSnapshot>>,
@@ -224,13 +233,17 @@ pub struct AiBackendHandle {
 }
 
 impl AiBackendHandle {
-    /// An inert handle for `--no-ai` / default contexts: no worker, no probe.
+    /// An inert handle (web entry, tests, default contexts): no worker, no probe, every local
+    /// runtime off as under `--no-ai` — the platform reason wins where the platform lacks the
+    /// runtime (`LocalAiAvailability::for_process`).
     pub fn disabled() -> Self {
+        let local_ai = LocalAiAvailability::for_process(true);
+        let off = backend_off_or_flag(local_ai);
         Self {
-            ai_enabled: false,
-            health: Arc::new(Mutex::new(AiBackendHealthSnapshot::disabled())),
+            local_ai,
+            health: Arc::new(Mutex::new(AiBackendHealthSnapshot::unavailable(off))),
             probe_tx: None,
-            process_snapshot: Arc::new(Mutex::new(AiBackendProcessSnapshot::disabled(false))),
+            process_snapshot: Arc::new(Mutex::new(AiBackendProcessSnapshot::unavailable(false, off))),
             process_tx: None,
         }
     }
@@ -262,6 +275,15 @@ impl AiBackendHandle {
     }
 }
 
+/// The backend's off reason of an inert handle; `DisabledByFlag` when `local_ai` (built with
+/// the flag set) somehow allows the backend, so the inert handle never claims it can run.
+fn backend_off_or_flag(local_ai: LocalAiAvailability) -> LocalAiOff {
+    local_ai
+        .backend
+        .err()
+        .unwrap_or(LocalAiOff { runtime: LocalRuntime::PythonBackend, reason: LocalAiOffReason::DisabledByFlag })
+}
+
 /// Owns the worker + probe threads. Built once in `run_main()` and torn down via
 /// [`AiBackendSupervisor::shutdown`] when the whole app exits.
 pub struct AiBackendSupervisor {
@@ -271,16 +293,20 @@ pub struct AiBackendSupervisor {
 }
 
 impl AiBackendSupervisor {
-    /// Starts the supervisor. When `ai_enabled`, spawns the process worker
-    /// (auto-starting the backend if the persisted autostart toggle is on) and the
-    /// health/device probe. When disabled (`--no-ai`), everything stays inert.
+    /// Starts the supervisor for `local_ai`. When the backend is allowed
+    /// (`local_ai.backend` is `Ok`), spawns the process worker (auto-starting the backend if
+    /// the persisted autostart toggle is on) and the health/device probe. When it is off
+    /// (`--no-ai`, or a platform without the Python backend) no worker and no probe start:
+    /// the health snapshot is the fixed [`AiBackendHealthSnapshot::unavailable`] (checked,
+    /// not connected, naming the reason), so backend routes are refused, not tried.
     ///
-    /// Also primes the process-global AI capability hints (backend / torch /
-    /// onnxruntime) with the same policy: `None` (unknown until the first honest
-    /// signal — health snapshot for backend/torch/backend-ORT, route-inputs refresh
-    /// for native-ORT) when `ai_enabled`, or forced `Some(false)` under `--no-ai`.
-    pub fn start(ai_enabled: bool) -> Self {
-        Self::start_with_autostart_gate(ai_enabled, None)
+    /// Also primes the process-global AI capability hints: backend / torch / backend-ORT are
+    /// `None` (unknown until the first health snapshot) when the backend is allowed, else
+    /// `Some(false)`; native-ORT is `None` (the tab's route-inputs refresh publishes it) when
+    /// native ONNX is allowed, else `Some(false)`. `--no-ai` switches off the LOCAL runtimes
+    /// only (backend and native ONNX); cloud AI API features are not capability-gated here.
+    pub fn start(local_ai: LocalAiAvailability) -> Self {
+        Self::start_with_autostart_gate(local_ai, None)
     }
 
     /// [`Self::start`] with a deferred-autostart gate. When the persisted autostart toggle
@@ -289,31 +315,35 @@ impl AiBackendSupervisor {
     /// is `None` or already true). The gate runs on the worker thread, never on the GUI
     /// thread, and must be cheap and non-blocking. A user Start/Restart/Stop (or turning
     /// autostart off) while the autostart is still deferred cancels it: user intent wins.
-    pub fn start_with_autostart_gate(ai_enabled: bool, gate: Option<AutostartGate>) -> Self {
-        // Prime the global capability hints exactly as the studio used to do at
-        // construction: unknown until the first honest signal, or forced
-        // unavailable under --no-ai (which gates every AI capability off).
-        let primed = if ai_enabled { None } else { Some(false) };
-        ms_sysprobe::ai_backend_capabilities::set_torch_available(primed);
-        ms_sysprobe::ai_backend_capabilities::set_backend_available(primed);
-        ms_sysprobe::ai_backend_capabilities::set_backend_ort_available(primed);
-        ms_sysprobe::ai_backend_capabilities::set_native_ort_available(primed);
+    pub fn start_with_autostart_gate(local_ai: LocalAiAvailability, gate: Option<AutostartGate>) -> Self {
+        // Prime the global capability hints: unknown until the first honest signal, or
+        // known-unavailable for a runtime this process may not use.
+        let backend_primed = if local_ai.backend.is_ok() { None } else { Some(false) };
+        let native_primed = if local_ai.native_onnx.is_ok() { None } else { Some(false) };
+        ms_sysprobe::ai_backend_capabilities::set_torch_available(backend_primed);
+        ms_sysprobe::ai_backend_capabilities::set_backend_available(backend_primed);
+        ms_sysprobe::ai_backend_capabilities::set_backend_ort_available(backend_primed);
+        ms_sysprobe::ai_backend_capabilities::set_native_ort_available(native_primed);
+        if let Err(off) = local_ai.backend {
+            runtime_log::log_info(format!(
+                "[ai-backend] supervisor inert: Python backend off ({:?}); native ONNX: {:?}",
+                off.reason, local_ai.native_onnx
+            ));
+        }
 
         let user_settings_file = config::user_config_path();
         let auto_start = load_ai_backend_autostart(&user_settings_file);
 
-        let health = Arc::new(Mutex::new(if ai_enabled {
-            AiBackendHealthSnapshot::default()
-        } else {
-            AiBackendHealthSnapshot::disabled()
+        let health = Arc::new(Mutex::new(match local_ai.backend {
+            Ok(()) => AiBackendHealthSnapshot::default(),
+            Err(off) => AiBackendHealthSnapshot::unavailable(off),
         }));
-        let process_snapshot = Arc::new(Mutex::new(if ai_enabled {
-            AiBackendProcessSnapshot::new(auto_start)
-        } else {
-            AiBackendProcessSnapshot::disabled(auto_start)
+        let process_snapshot = Arc::new(Mutex::new(match local_ai.backend {
+            Ok(()) => AiBackendProcessSnapshot::new(auto_start),
+            Err(off) => AiBackendProcessSnapshot::unavailable(auto_start, off),
         }));
 
-        let (probe_tx, probe_thread, process_runtime) = if ai_enabled {
+        let (probe_tx, probe_thread, process_runtime) = if local_ai.backend.is_ok() {
             let (probe_tx, probe_thread) = spawn_ai_backend_probe(Arc::clone(&health));
             // The OS backend process is native-only. On web there is no process to
             // spawn (the whole AI backend is compiled out), so the supervisor keeps a
@@ -336,7 +366,7 @@ impl AiBackendSupervisor {
         };
 
         let handle = AiBackendHandle {
-            ai_enabled,
+            local_ai,
             health,
             probe_tx,
             process_snapshot,

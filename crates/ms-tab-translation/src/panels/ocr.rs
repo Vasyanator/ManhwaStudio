@@ -372,8 +372,8 @@ pub fn draw_ocr_panel(
     ui.label(t!("translation.ocr_panel.engine_label"));
     // Runtime engines gate their selection button on a per-engine AiRequirement
     // (optimistic while unknown); AiApi is network-only and stays a plain
-    // selectable_value so it works with the backend offline (the outer
-    // `add_enabled_ui(ai_enabled, ...)` in tab.rs still disables it under --no-ai).
+    // selectable_value so it works with every local AI runtime off (backend offline,
+    // `--no-ai`, a platform without the backend or native ONNX).
     ui.horizontal_wrapped(|ui| {
         if let Some(req) = engine_button_requirement(OcrEngine::MangaOcr) {
             actions.options_changed |= engine_select_button(

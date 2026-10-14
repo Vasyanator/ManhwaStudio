@@ -15,6 +15,10 @@ Submodules:
 - `ai_mt_response`: reading, validating and merging AI API MT answers, content checks, the
   strict-output schema (native only).
 - `backend_health`: push-driven AI-backend health (`TOPIC_HEALTH` v2 events) + device-control helpers.
+- `local_ai`: which local AI runtimes (Python backend, native ONNX) the process may use
+  (`--no-ai` + platform), the one route-availability rule (`AiRouteKind::availability`) and
+  the effective-runtime helper (`effective_ai_runtime`); public for the supervisor, the AI
+  backend pane and the root.
 - `machine_translators`: concrete MT backends (Google/Yandex/DeepL) used by worker.
 - `machine_translation`: MT controller/worker and backend dispatch integration.
 - `ocr`: OCR controller/worker and backend transport.
@@ -45,6 +49,9 @@ pub mod backend_health;
 // `pub` rather than crate-private: the `cleaning` tab's Flux.2 engine translates prompts
 // through `translate_texts_via_translator`.
 pub mod machine_translation;
+// `pub` rather than crate-private: the root builds `LocalAiAvailability`, the supervisor
+// carries it and the AI backend pane reads `effective_ai_runtime`.
+pub mod local_ai;
 mod machine_translators;
 mod ocr;
 mod ocr_case_fix;

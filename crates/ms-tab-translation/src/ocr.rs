@@ -38,9 +38,17 @@
 //   download controller is `ocr_model_download.rs`. Baberu routes like MangaOCR/PaddleOCR:
 //   native ONNX (vision on the selected EP, decoders on CPU) under the native runtime + Safe
 //   guard, else backend `ocr.baberu`.
+// - Route availability (UI gate): `ocr_route_kind` maps a selection onto
+//   `local_ai::AiRouteKind` (AI API = cloud, native ONNX routes, backend routes) and
+//   `ocr_route_availability` checks it against the process's `LocalAiAvailability`
+//   (`--no-ai` / platform) through the one rule `AiRouteKind::availability`. The worker reads
+//   the runtime through `local_ai::effective_ai_runtime` (`read_ocr_route_inputs`).
 // ============================================================================
 use ms_backend_ipc::{self as backend_ipc, CallError, CallHandle};
 use crate::backend_health::ai_backend_offline_error;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::local_ai::effective_ai_runtime;
+use crate::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use crate::ocr_case_fix;
 use ms_config as config;
 use ms_sysprobe::ai_models;
@@ -934,32 +942,47 @@ fn ocr_route(
     }
 }
 
-/// Route-aware decision for whether the Python backend is required to run the
-/// selected OCR engine/model under `runtime` and the SIGILL load `guard`.
+/// What the selected OCR engine/model runs on under `runtime` and the SIGILL load `guard`.
 ///
-/// This is the single source of truth the UI readiness gates consult. It reuses
-/// [`ocr_route`] so it can never disagree with the actual dispatch: a native
-/// route (MangaOCR ONNX, PaddleOCR or Baberu OCR under the native runtime with a
-/// non-`Suspect` guard) needs NO backend and returns `false`; every backend-routed engine/model
-/// returns `true`. `AiApi` is special-cased to `false` because it runs over `genai`
-/// and never touches the backend socket (its `ocr_route` value is `Backend` only
-/// because `OcrRoute` has no AI-API variant). A `Suspect` guard falls back to the
-/// backend, so it correctly reports the backend as required. Pure and testable.
-pub(crate) fn ocr_requires_backend(
+/// Reuses [`ocr_route`] so it can never disagree with the actual dispatch: a native route
+/// (MangaOCR ONNX, PaddleOCR or Baberu OCR under the native runtime with a non-`Suspect`
+/// guard) is [`AiRouteKind::Native`], every other local engine/model is
+/// [`AiRouteKind::Backend`]. `AiApi` is [`AiRouteKind::Cloud`]: it runs over `genai` and never
+/// touches the backend socket (its `ocr_route` value is `Backend` only because `OcrRoute` has
+/// no AI-API variant). A `Suspect` guard falls back to the backend. Pure and testable.
+pub(crate) fn ocr_route_kind(
     engine: OcrEngine,
     manga_model_key: &str,
     runtime: config::AiRuntime,
     guard: config::OrtLoadDecision,
-) -> bool {
-    // Engines that never use the backend socket (AiApi over `genai`) never require
-    // it, regardless of runtime/guard.
+) -> AiRouteKind {
+    // Engines that never use the backend socket (AiApi over `genai`) are cloud routes,
+    // regardless of runtime/guard.
     if !engine.requires_backend() {
-        return false;
+        return AiRouteKind::Cloud;
     }
     match ocr_route(runtime, engine, manga_model_key, guard) {
-        OcrRoute::NativeManga(_) | OcrRoute::NativePaddle | OcrRoute::NativeBaberu => false,
-        OcrRoute::Backend => true,
+        OcrRoute::NativeManga(_) | OcrRoute::NativePaddle | OcrRoute::NativeBaberu => AiRouteKind::Native,
+        OcrRoute::Backend => AiRouteKind::Backend,
     }
+}
+
+/// The single source of truth every OCR trigger, the load button and the panel notice
+/// consult: the route kind of the selected engine/model ([`ocr_route_kind`]) checked against
+/// the process's local-AI availability by the one rule, [`AiRouteKind::availability`]. An
+/// `Ok(AiRouteKind::Backend)` still needs a connected backend (the caller's health check).
+///
+/// # Errors
+/// The [`LocalAiOff`] of the runtime the route needs (`--no-ai`, or a platform without it).
+pub(crate) fn ocr_route_availability(
+    engine: OcrEngine,
+    manga_model_key: &str,
+    runtime: config::AiRuntime,
+    guard: config::OrtLoadDecision,
+    local_ai: &LocalAiAvailability,
+) -> Result<AiRouteKind, LocalAiOff> {
+    let kind = ocr_route_kind(engine, manga_model_key, runtime, guard);
+    kind.availability(local_ai).map(|()| kind)
 }
 
 /// Reads the native-routing inputs (selected AI runtime + provider-scoped SIGILL
@@ -972,7 +995,7 @@ pub(crate) fn ocr_requires_backend(
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn read_ocr_route_inputs() -> (config::AiRuntime, config::OrtLoadDecision) {
     let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
-    let runtime = config::AiRuntime::from_user_settings(&cfg);
+    let runtime = effective_ai_runtime(&cfg);
     let scope = native_runtime::native_load_scope_key();
     let decision = config::ort_load_decision(config::read_ort_load_guard(&cfg, &scope));
     (runtime, decision)
@@ -1037,7 +1060,7 @@ fn current_ocr_route(engine: OcrEngine, manga_model_key: &str) -> OcrRoute {
 #[cfg(not(target_arch = "wasm32"))]
 fn native_ai_runtime_selected() -> bool {
     let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
-    config::AiRuntime::from_user_settings(&cfg) == config::AiRuntime::Native
+    effective_ai_runtime(&cfg) == config::AiRuntime::Native
 }
 
 /// Outcome of an attempted native ONNX Runtime OCR recognize.
@@ -1772,8 +1795,11 @@ mod tests {
         OcrRecognizeRequest, OcrRoute, OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements,
         apply_post_ocr_processing, assemble_native_ocr_result, interpret_call_result,
         ExternalModelDirs, native_failure_should_surface, ocr_header_fields,
-        ocr_requires_backend, ocr_route, ocr_route_needs_backend_warmup, parse_ocr_response,
+        ocr_route, ocr_route_availability, ocr_route_kind, ocr_route_needs_backend_warmup,
+        parse_ocr_response,
     };
+    use crate::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOffReason, LocalRuntime};
+    use ms_platform::{PlatformFeature, Unavailable, UnavailableReason};
     use ms_sysprobe::ai_models::MangaOcrOnnxModel;
     use ms_backend_ipc::protocol;
     use ms_config::{AiRuntime, OrtLoadDecision};
@@ -2280,6 +2306,111 @@ mod tests {
             assert!(
                 ocr_requires_backend(engine, "base_onnx", AiRuntime::Native, OrtLoadDecision::Safe),
                 "engine {engine:?}"
+            );
+        }
+    }
+
+    /// Whether the route kind is the backend (the contract the older `ocr_requires_backend`
+    /// tests below pin, now read through [`ocr_route_kind`]).
+    fn ocr_requires_backend(
+        engine: OcrEngine,
+        manga_model_key: &str,
+        runtime: AiRuntime,
+        guard: OrtLoadDecision,
+    ) -> bool {
+        ocr_route_kind(engine, manga_model_key, runtime, guard) == AiRouteKind::Backend
+    }
+
+    const ALL_ENGINES: [OcrEngine; 7] = [
+        OcrEngine::MangaOcr,
+        OcrEngine::EasyOcr,
+        OcrEngine::PaddleOcr,
+        OcrEngine::PaddleVl,
+        OcrEngine::Surya,
+        OcrEngine::AiApi,
+        OcrEngine::Baberu,
+    ];
+
+    fn platform(on: bool, feature: PlatformFeature) -> Result<(), Unavailable> {
+        if on { Ok(()) } else { Err(Unavailable::new(feature, UnavailableReason::NotOnThisPlatform)) }
+    }
+
+    /// Every combination of `--no-ai` x backend platform x native platform x engine x
+    /// runtime x guard: AI API always runs; a native route needs native allowed, a backend
+    /// route needs the backend allowed, and the refusal names the runtime the route needs.
+    #[test]
+    fn ocr_route_availability_all_combinations() {
+        for no_ai in [false, true] {
+            for backend_platform in [false, true] {
+                for native_platform in [false, true] {
+                    let local = LocalAiAvailability::resolve(
+                        no_ai,
+                        platform(backend_platform, PlatformFeature::PythonBackend),
+                        platform(native_platform, PlatformFeature::NativeOnnxRuntime),
+                    );
+                    for engine in ALL_ENGINES {
+                        for model in ["base_onnx", "base_torch"] {
+                            for runtime in [AiRuntime::Backend, AiRuntime::Native] {
+                                for guard in [OrtLoadDecision::Safe, OrtLoadDecision::Suspect] {
+                                    let case = format!(
+                                        "no_ai={no_ai} backend={backend_platform} native={native_platform} \
+                                         {engine:?} {model} {runtime:?} {guard:?}"
+                                    );
+                                    let kind = ocr_route_kind(engine, model, runtime, guard);
+                                    let result = ocr_route_availability(engine, model, runtime, guard, &local);
+                                    match kind {
+                                        AiRouteKind::Cloud => {
+                                            assert_eq!(engine, OcrEngine::AiApi, "{case}");
+                                            assert_eq!(result, Ok(AiRouteKind::Cloud), "{case}");
+                                        }
+                                        AiRouteKind::Native => {
+                                            let allowed = native_platform && !no_ai;
+                                            assert_eq!(result.is_ok(), allowed, "{case}");
+                                            if let Err(off) = result {
+                                                assert_eq!(off.runtime, LocalRuntime::NativeOnnx, "{case}");
+                                            }
+                                        }
+                                        AiRouteKind::Backend => {
+                                            let allowed = backend_platform && !no_ai;
+                                            assert_eq!(result.is_ok(), allowed, "{case}");
+                                            if let Err(off) = result {
+                                                assert_eq!(off.runtime, LocalRuntime::PythonBackend, "{case}");
+                                                // The platform reason wins over the flag.
+                                                let expected = if backend_platform {
+                                                    LocalAiOffReason::DisabledByFlag
+                                                } else {
+                                                    LocalAiOffReason::UnavailableOnPlatform(
+                                                        UnavailableReason::NotOnThisPlatform,
+                                                    )
+                                                };
+                                                assert_eq!(off.reason, expected, "{case}");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The user's report: under `--no-ai` (and on a platform with neither local runtime)
+    /// the AI API OCR still runs.
+    #[test]
+    fn ai_api_ocr_runs_with_every_local_runtime_off() {
+        for local in [
+            LocalAiAvailability::resolve(true, Ok(()), Ok(())),
+            LocalAiAvailability::resolve(
+                false,
+                platform(false, PlatformFeature::PythonBackend),
+                platform(false, PlatformFeature::NativeOnnxRuntime),
+            ),
+        ] {
+            assert_eq!(
+                ocr_route_availability(OcrEngine::AiApi, "", AiRuntime::Native, OrtLoadDecision::Safe, &local),
+                Ok(AiRouteKind::Cloud)
             );
         }
     }

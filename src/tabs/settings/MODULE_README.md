@@ -190,8 +190,8 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   and persist through the settings save worker.
 - Memory profile changes must update the shared `MemoryManager` immediately and persist
   `General.memory_profile` in `user_config.json` without editing project canvas settings.
-- AI backend controls must respect `--no-ai`: disabled state should not start or command the
-  process, and health/probe UI should show the disabled snapshot.
+- AI backend controls must respect `AiBackendHandle::local_ai` (`--no-ai`, platform): an off
+  backend is never started or commanded, and health/probe UI shows the fixed unavailable snapshot.
 - Hotkey capture treats `Esc` as cancel; modifier-only bindings are explicit `Ctrl`/`Alt`/`Shift`
   choices, not accidental raw key captures.
 - Persisted settings errors should be surfaced or logged with context; do not silently replace real

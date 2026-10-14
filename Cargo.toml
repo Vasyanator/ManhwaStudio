@@ -58,7 +58,6 @@ egui-shader-layers = { version = "0.2", default-features = false, features = ["g
 egui-large-image = "0.1"
 flate2 = "1"
 genai = "0.6"
-hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 hyphenation = { version = "0.8", features = ["embed_all"] }
 image = { version = "0.25", default-features = true }
 # Defaults (`rayon`, `text`, `fft`) are OFF here because they can only be turned off in this table:
@@ -316,7 +315,7 @@ puffin = { version = "0.20.0", optional = true }
 # release when it was vendored. See crates/puffin_egui/Cargo.toml.
 puffin_egui = { path = "crates/puffin_egui", optional = true }
 
-# Native-only dependencies: native sockets / blocking HTTP (ureq, hf-hub,
+# Native-only dependencies: native sockets / blocking HTTP (ureq,
 # translators, genai+tokio) and dynamic library loading (libloading). None have
 # a usable wasm32-unknown-unknown path with the current API usage; the web build
 # replaces them (fetch, IndexedDB, download) in the web-glue phase. File dialogs and
@@ -328,7 +327,6 @@ puffin_egui = { path = "crates/puffin_egui", optional = true }
 # there and the web entry point installs its own fonts.
 ms-fonts = { path = "crates/ms-fonts" }
 libloading.workspace = true
-hf-hub.workspace = true
 ureq.workspace = true
 translators.workspace = true
 genai.workspace = true

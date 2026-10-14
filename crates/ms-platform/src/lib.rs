@@ -14,13 +14,16 @@ Main responsibilities:
   `Unavailable` for the rest;
 - images handed over by other apps (`incoming`): the Android Share / "Open with" inbox (Kotlin
   `IncomingImages`), "nothing incoming" on every other target;
-- the pre-window error box (`message::show_error_blocking`).
+- the pre-window error box (`message::show_error_blocking`);
+- the Android credential store (`credentials`, Kotlin `CredentialBridge`): API keys and tokens
+  encrypted under an AndroidKeyStore key. Android only; desktop consumers keep `keyring`.
 
 Key structures:
 - PlatformFeature, Unavailable, UnavailableReason (`features.rs`)
 - file_dialog::{FileDialogRequest, PendingDialog, Picked, SaveTarget, FolderTarget}
 - clipboard::{ClipboardRgba, ClipboardError}
 - incoming::{IncomingBatch, IncomingSkip, IncomingError}
+- credentials::CredentialError (Android)
 
 Notes:
 Holds no egui types: callers turn a dialog result into UI themselves and pass a repaint
@@ -34,6 +37,10 @@ callback (`file_dialog::Waker`). The only crate that names `rfd` / `arboard`; se
 mod features;
 
 pub mod clipboard;
+// The credential store seam has only an Android backend (desktop consumers use `keyring`
+// directly, the web has no store); its pure half is also compiled for host tests.
+#[cfg(any(target_os = "android", test))]
+pub mod credentials;
 pub mod file_dialog;
 pub mod incoming;
 pub mod message;

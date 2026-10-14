@@ -28,9 +28,13 @@ a `WarningSet` (launcher) the runtime combo, autostart checkbox, build / EP / de
 and the build-action row carry inline badges; `None` (studio) draws the pre-badge layout.
 
 Platform gate:
-Where `ms_platform::PlatformFeature::PythonBackend` is unavailable (Android) the pane leads
-with the localized `Unavailable` message and keeps Start/Restart disabled; the supervisor
-refuses the spawn on its own as well (`BackendSpawnBlocker::PlatformUnavailable`).
+Where `ms_platform::PlatformFeature::PythonBackend` is unavailable (Android, web) the pane
+leads with the localized `Unavailable` message, offers no "Backend" runtime choice and draws
+only the native ONNX selection: the backend-only blocks (status, process control, log,
+PyTorch device, diagnostics) are hidden. The supervisor never starts a backend there
+(`AiBackendHandle::local_ai`) and refuses the spawn on its own as well
+(`BackendSpawnBlocker::PlatformUnavailable`). Under `--no-ai` on desktop the blocks stay
+visible but disabled, with the flag named.
 
 Key items:
 - `AiBackendPanelState`: per-UI selection scratch (device/provider/onnx/max-models) and
@@ -283,9 +287,13 @@ pub fn draw_ai_backend_panel(
     let mut outcome = AiBackendPanelOutcome::default();
     let snapshot = handle.health_snapshot();
     let process = handle.process_snapshot();
-    let ai_enabled = handle.ai_enabled;
+    // Whether this process may use the Python backend at all: `false` under `--no-ai` and on
+    // a platform without it (`LocalAiAvailability`, built once in `run_main`).
+    let ai_enabled = handle.local_ai.backend.is_ok();
     // The capability table decides whether this platform can run the Python backend at
-    // all (not on Android); Start/Restart stay disabled and the reason leads the pane.
+    // all (not on Android). There the reason leads the pane, and every backend-only block
+    // (status, process control, log, PyTorch device, diagnostics) and the "Backend" runtime
+    // option are hidden: nothing in them could ever work.
     let backend_platform = ms_platform::PlatformFeature::PythonBackend.require();
     if let Err(unavailable) = &backend_platform {
         ui.colored_label(ms_theme::status::WARNING, unavailable.user_message());
@@ -295,7 +303,14 @@ pub fn draw_ai_backend_panel(
     // Native ONNX runtime selector (desktop-only; the native path depends on
     // `ms-onnx`/`ort`, compiled out on the web build).
     #[cfg(not(target_arch = "wasm32"))]
-    draw_ai_runtime_section(ui, state, warnings);
+    draw_ai_runtime_section(ui, state, warnings, backend_platform.is_ok());
+
+    if backend_platform.is_err() {
+        // Only the native ONNX selection (and the model limit it shares) applies here.
+        draw_onnx_and_models_section(ui, handle, state, &snapshot, ai_enabled, warnings);
+        outcome.changed_settings = state.append_landed_changes(outcome.changed_settings);
+        return outcome;
+    }
 
     ui.label(tf!("ai_backend.service_address_label", backend_ipc = backend_ipc::backend_socket_path().display()));
 
@@ -2295,10 +2310,17 @@ fn spawn_save_max_loaded_models(value: u32) {
 /// selector. The onnxruntime download progress and the build-action button live in the
 /// native "Билд" section (they depend on the selected build).
 ///
-/// The current runtime is read once off the GUI thread into `state`; changes are
-/// persisted off-thread. Desktop-only (the native runtime is compiled out on wasm).
+/// The current runtime is read once off the GUI thread into `state` (the EFFECTIVE runtime,
+/// `local_ai::effective_ai_runtime`); changes are persisted off-thread. With
+/// `backend_on_platform == false` the "Backend" choice is not offered. Desktop-only (the
+/// native runtime is compiled out on wasm).
 #[cfg(not(target_arch = "wasm32"))]
-fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState, warnings: Option<&WarningSet>) {
+fn draw_ai_runtime_section(
+    ui: &mut egui::Ui,
+    state: &mut AiBackendPanelState,
+    warnings: Option<&WarningSet>,
+    backend_on_platform: bool,
+) {
     use ms_config::AiRuntime;
 
     ui.heading(t!("ai_backend.onnx_inference_heading"));
@@ -2322,7 +2344,9 @@ fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState, w
             .spawn(move || {
                 let cfg = ms_config::load_raw_user_settings_for_startup()
                     .unwrap_or(serde_json::Value::Null);
-                let runtime = AiRuntime::from_user_settings(&cfg);
+                // The effective runtime: a stored `Backend` reads as `Native` where the
+                // platform has no Python backend (the same helper every router uses).
+                let runtime = ms_tab_translation::local_ai::effective_ai_runtime(&cfg);
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some(runtime);
                 }
@@ -2349,11 +2373,14 @@ fn draw_ai_runtime_section(ui: &mut egui::Ui, state: &mut AiBackendPanelState, w
                 WheelComboBox::from_label(t!("ai_backend.onnx_inference_combo_label")).id_salt("ai_backend.onnx_inference_combo_label")
                     .selected_text(ai_runtime_label(selected))
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut selected,
-                            AiRuntime::Backend,
-                            ai_runtime_label(AiRuntime::Backend),
-                        );
+                        // No "Backend" choice where the platform cannot run it.
+                        if backend_on_platform {
+                            ui.selectable_value(
+                                &mut selected,
+                                AiRuntime::Backend,
+                                ai_runtime_label(AiRuntime::Backend),
+                            );
+                        }
                         ui.selectable_value(
                             &mut selected,
                             AiRuntime::Native,

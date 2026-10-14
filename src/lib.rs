@@ -15,8 +15,9 @@ Main flow (`native_main` -> `run_main`):
 - Handles hidden service flags (installer continuation, Windows uninstall, elevated Start Menu
   shortcut creation, the elevated system-registration helper) before normal startup.
 - Seeds the process-global settings (storage mode first, locale, UI scale, autosave policy,
-  secondary windows) and starts the Python AI backend supervisor where
-  `PlatformFeature::PythonBackend` exists.
+  secondary windows) and starts the AI backend supervisor with the process's
+  `LocalAiAvailability` (`--no-ai` switches off the Python backend and native ONNX; the
+  backend process runs only where `PlatformFeature::PythonBackend` exists).
 - `--check-venv` (terminal), `--continue-update` and `--update` run their own windows.
 - Takes the images another app delivered at startup (Android Share / "Open with",
   `shell::incoming::cold_start_target`, pre-window) before `resolve_start`.
@@ -278,6 +279,8 @@ use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_platform::PlatformFeature;
 #[cfg(not(target_arch = "wasm32"))]
+use ms_tab_translation::local_ai::LocalAiAvailability;
+#[cfg(not(target_arch = "wasm32"))]
 use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Arc, Mutex};
@@ -488,7 +491,7 @@ fn run_main() -> anyhow::Result<()> {
 
     if cli.test_launcher {
         init_runtime_logging();
-        let supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(ai_backend_enabled(&cli), Some(storage_conversion_autostart_gate()));
+        let supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(LocalAiAvailability::for_process(cli.no_ai), Some(storage_conversion_autostart_gate()));
         // Test mode routes nowhere: the shell quits on any launcher exit.
         let exit = shell::run(shell::ShellConfig {
             initial: shell::InitialScreen::Launcher,
@@ -503,14 +506,17 @@ fn run_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let ai_enabled = ai_backend_enabled(&cli);
+    // Which local AI runtimes this process may use: `--no-ai` switches off the Python backend
+    // AND native ONNX; the platform decides on its own (`LocalAiAvailability::for_process`).
+    // Cloud AI API and machine translation are never gated by it.
+    let local_ai = LocalAiAvailability::for_process(cli.no_ai);
     // The single Python AI backend is owned here, above the main window, so it starts with the
     // launcher (per the autostart toggle) and survives every switch between the launcher and the
     // studio. Dropped (which stops the process + probe) on any return.
     // The autostart waits (on the supervisor worker) until no storage-mode conversion is
     // pending or running: the backend writes `user_config` itself (KG-016). With `--project`
     // the reconciliation stays pending until the project is loaded, so the autostart does too.
-    let ai_backend_supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(ai_enabled, Some(storage_conversion_autostart_gate()));
+    let ai_backend_supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(local_ai, Some(storage_conversion_autostart_gate()));
     let ai_backend = ai_backend_supervisor.handle();
 
     // Images another app handed over before (or by) starting the process (Android Share / "Open
@@ -1033,13 +1039,6 @@ fn refuse_self_update_from_sources() {
         "[startup] self-update refused: running from sources (--ignore-installed)",
     );
     show_startup_error_dialog(t!("startup.ignore_installed.update_refused"));
-}
-
-/// Whether the Python AI backend may start: not under `--no-ai`, and only where the platform
-/// can run it (`PlatformFeature::PythonBackend`). Both supervisor starts use it.
-#[cfg(not(target_arch = "wasm32"))]
-fn ai_backend_enabled(cli: &Cli) -> bool {
-    !cli.no_ai && PlatformFeature::PythonBackend.is_available()
 }
 
 /// `PlatformFeature::InstalledCopyManagement` for the startup routing. When the platform lacks

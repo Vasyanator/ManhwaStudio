@@ -77,7 +77,9 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
 - `error.rs`: `AiApiError` — typed error, `Display` is the localized message.
 - `keys.rs`: credential-store CRUD per `AiApiTarget` (`read_api_key`, `store_api_key`,
   `clear_api_key`) and per named slot (`NamedKeyUser`, `read_named_key`, `store_named_key`,
-  `clear_named_key`), `KEYRING_SERVICE`, the private user-name rule, wasm stubs.
+  `clear_named_key`), `KEYRING_SERVICE`, the private user-name rule, and the one per-target
+  store choice (private `backend`: desktop `keyring`, Android `ms_platform::credentials`, web
+  none).
 - `client.rs` (native): `build_client` (auth + base-URL routing for one target), `block_on`.
 - `model_id.rs` (native items): UI model-id prefix rules (`model_iden`, crate-private
   `ui_model_name`).
@@ -124,8 +126,12 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   guarantee end to end. A real run is paid.
 
 ## Contracts and invariants
-- **Keys live only in the OS credential store**, never in a project or user settings file.
-  Entry = (`KEYRING_SERVICE` = `"ManhwaStudio AI API OCR"`, user name). The user name of a hosted
+- **Keys live only in the platform credential store**, never in a project or user settings
+  file: the OS store through `keyring` on desktop; on Android the Keystore-backed
+  `ms_platform::credentials` store (AES-256-GCM key in the AndroidKeyStore, encrypted entries in
+  app-private storage; same service and user names). An Android entry that can no longer be
+  decrypted (Keystore key lost) is a `ReadKey` / `ReadNamedKey` error, never "no key"; storing
+  a new key replaces it. Entry = (`KEYRING_SERVICE` = `"ManhwaStudio AI API OCR"`, user name). The user name of a hosted
   service is `AiApiService::key()`; of a compatible service `"{key()}@{normalized base URL}"`
   (e.g. `openai_compatible@http://127.0.0.1:8080/v1/`), so a stored key is only ever sent to
   the exact server it was saved for and a URL without its own key reads as "no key". Both forms
@@ -169,8 +175,9 @@ draw_connection(ui, id_salt, max_width, &mut state) -> AiApiConnectionActions
   point they are created; consumers may add their own run-context logs.
 - **Web build**: `genai`, `tokio`, `futures-util`, `keyring`, `ureq` are native-only (`serde_json`, `image` and
   `ms-raster` are target-neutral; the `image_edit` core compiles on wasm). On wasm
-  the key functions return `KeyStoreWebUnavailable` (on Android, where `keyring` is also compiled
-  out, `KeyStoreUnavailable(ms_platform::Unavailable)`) and `load_metadata` returns
+  the key functions return `KeyStoreWebUnavailable` (on Android `keyring` is compiled out too;
+  only an APK without the Kotlin credential bridge answers
+  `KeyStoreUnavailable(ms_platform::Unavailable)`) and `load_metadata` returns
   `MetadataWebUnavailable`; `client`, `openrouter`, `model_iden`, `exec_chat_tracked`,
   `validated` and `structured::json_spec_format` do not exist (the generation tracker and widget
   and the rest of `structured` do).

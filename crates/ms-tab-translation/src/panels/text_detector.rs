@@ -12,7 +12,8 @@ Main types:
   engine, its params or the page size change (`plan_detection` allocates its tile list).
 - `DetectorUnavailable`: why the selected algorithm cannot run; produced only by
   `TextDetectorAlgorithm::availability`, the one owner of the "can detect" decision
-  (panel button gate, panel hint and the tab's run-mode check all route through it).
+  (panel button gate, panel hint and the tab's run-mode check all route through it). Its
+  local-AI half is the shared rule of `crate::local_ai` (`--no-ai` / platform per runtime).
 
 Flow:
 - `draw_text_detector_panel(ui, options, plan_notices, view)`: renders status, options, the
@@ -32,8 +33,9 @@ Flow:
   детектора и режима редактирования маски.
 */
 
+use crate::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use crate::text_detector::{
-    TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, TextDetectorRunMode, TextDetectorSuryaOptions,
+    DetectorRoute, TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, TextDetectorRunMode, TextDetectorSuryaOptions,
 };
 use ms_models::page_view::{PageImageInfo, SourcePageLoadState};
 use ms_text_detect::{DetectParams, EngineKind, PlanMode, PlanNotice, plan_detection};
@@ -75,42 +77,30 @@ impl TextDetectorAlgorithm {
         }
     }
 
-    /// The one "can this algorithm run now" decision. `Classic` is a local heuristic
-    /// and is always available; every other algorithm needs AI enabled (no `--no-ai`);
-    /// the PyTorch detectors (`Ai` = ComicTextDetector, `Surya`) additionally fail only
-    /// when the backend has REPORTED PyTorch missing (`Some(false)`) — an unknown
-    /// capability (`None`) is permissive so a not-yet-probed backend does not lock them
-    /// out. `ai_enabled` is checked first, so `--no-ai` always wins over `TorchMissing`.
-    pub fn availability(
+    /// The one "can this algorithm run now" decision. `Classic` is a local heuristic and is
+    /// always available. Every other algorithm maps to the runtime it runs on —
+    /// `PaddleOcr` to `paddle_route` (native ONNX or the backend, `detector_native_route`),
+    /// `Ai` (ComicTextDetector) and `Surya` to the backend — and is checked by the one
+    /// local-AI rule (`AiRouteKind::availability`: `--no-ai` / platform). The PyTorch detectors
+    /// additionally fail only when the backend has REPORTED PyTorch missing (`Some(false)`) —
+    /// an unknown capability (`None`) is permissive so a not-yet-probed backend does not lock
+    /// them out. The local-AI reason is checked first, so it always wins over `TorchMissing`.
+    pub(crate) fn availability(
         self,
-        ai_enabled: bool,
+        paddle_route: DetectorRoute,
+        local_ai: &LocalAiAvailability,
         torch_available: Option<bool>,
     ) -> Result<(), DetectorUnavailable> {
-        let needs_torch = match self {
+        let (kind, needs_torch) = match self {
             TextDetectorAlgorithm::Classic => return Ok(()),
-            TextDetectorAlgorithm::PaddleOcr => false,
-            TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya => true,
+            TextDetectorAlgorithm::PaddleOcr => (paddle_route.route_kind(), false),
+            TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya => (AiRouteKind::Backend, true),
         };
-        if !ai_enabled {
-            return Err(DetectorUnavailable::AiDisabled);
-        }
+        kind.availability(local_ai).map_err(DetectorUnavailable::LocalAi)?;
         if needs_torch && torch_available == Some(false) {
             return Err(DetectorUnavailable::TorchMissing);
         }
         Ok(())
-    }
-
-    /// Localized "disabled by `--no-ai`" status for this algorithm. `Classic` is never
-    /// unavailable (see [`Self::availability`]); its arm only keeps the match total and
-    /// reuses the generic AI-detector text.
-    fn ai_disabled_status(self) -> &'static str {
-        match self {
-            TextDetectorAlgorithm::PaddleOcr => t!("translation.text_detector.paddle_disabled_status"),
-            TextDetectorAlgorithm::Classic | TextDetectorAlgorithm::Ai => {
-                t!("translation.text_detector.ai_disabled_status")
-            }
-            TextDetectorAlgorithm::Surya => t!("translation.text_detector.surya_disabled_status"),
-        }
     }
 }
 
@@ -118,30 +108,34 @@ impl TextDetectorAlgorithm {
 /// [`TextDetectorAlgorithm::availability`].
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DetectorUnavailable {
-    /// AI features are disabled for this session (`--no-ai`).
-    AiDisabled,
+    /// The local runtime the algorithm's route needs is off (`--no-ai`, or not on this platform).
+    LocalAi(LocalAiOff),
     /// The algorithm runs on PyTorch and the backend reported PyTorch missing.
     TorchMissing,
 }
 
 impl DetectorUnavailable {
-    /// Localized error text for a refused detection run (the tab's run-mode check):
-    /// the algorithm's `--no-ai` text, or the shared "PyTorch is not installed" text.
-    pub fn status_text(self, algorithm: TextDetectorAlgorithm) -> &'static str {
+    /// Localized error text for a refused detection run (the tab's run-mode check): the
+    /// algorithm name with the local-AI reason, or the shared "PyTorch is not installed" text.
+    pub fn status_text(self, algorithm: TextDetectorAlgorithm) -> String {
         match self {
-            DetectorUnavailable::AiDisabled => algorithm.ai_disabled_status(),
-            DetectorUnavailable::TorchMissing => t!("translation.common.pytorch_not_installed_status"),
+            DetectorUnavailable::LocalAi(off) => tf!(
+                "translation.text_detector.unavailable_status",
+                detector = algorithm.title(),
+                reason = off.user_message()
+            ),
+            DetectorUnavailable::TorchMissing => t!("translation.common.pytorch_not_installed_status").to_string(),
         }
     }
 
     /// Localized hint shown under the panel's disabled detect buttons, or `None` for
     /// `Classic`. It names the real reason, the same text a refused run reports
-    /// ([`Self::status_text`]): the algorithm's `--no-ai` text, or "PyTorch is not installed".
+    /// ([`Self::status_text`]).
     ///
     /// `Classic` never yields a hint even when given a reason: the tab computes the
     /// availability BEFORE the panel's algorithm selector runs, so on the frame the user
     /// switches to `Classic` the stale reason meets the new algorithm, and no hint must show.
-    fn panel_hint_text(self, algorithm: TextDetectorAlgorithm) -> Option<&'static str> {
+    fn panel_hint_text(self, algorithm: TextDetectorAlgorithm) -> Option<String> {
         match algorithm {
             TextDetectorAlgorithm::Classic => None,
             TextDetectorAlgorithm::PaddleOcr | TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya => {
@@ -629,52 +623,70 @@ mod tests {
         TextDetectorPlanNoticeCache, algorithm_marker, algorithm_requirement, detector_page_size, plan_ctd_size_text,
         plan_notice_text,
     };
-    use crate::text_detector::TextDetectorRunMode;
+    use crate::local_ai::{LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
+    use crate::text_detector::{DetectorRoute, TextDetectorRunMode};
     use ms_models::page_view::{PageImageInfo, SourcePageLoadState};
+    use ms_platform::{PlatformFeature, Unavailable, UnavailableReason};
     use ms_text_detect::{EngineKind, PlanMode, PlanNotice};
 
     const TORCH_STATES: [Option<bool>; 3] = [None, Some(true), Some(false)];
 
-    /// Reference copy of the panel-arm `can_detect` match `availability` replaced.
-    fn reference_can_detect(
-        algorithm: TextDetectorAlgorithm,
-        ai_enabled: bool,
-        torch_available: Option<bool>,
-    ) -> bool {
-        match algorithm {
-            TextDetectorAlgorithm::Classic => true,
-            TextDetectorAlgorithm::PaddleOcr => ai_enabled,
-            TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya => {
-                ai_enabled && !matches!(torch_available, Some(false))
-            }
-        }
+    fn platform(on: bool, feature: PlatformFeature) -> Result<(), Unavailable> {
+        if on { Ok(()) } else { Err(Unavailable::new(feature, UnavailableReason::NotOnThisPlatform)) }
     }
 
-    /// Reference copy of the run-mode error match `availability` replaced:
-    /// `None` = the run is allowed, `Some(text)` = the refusal text.
-    fn reference_run_error(
-        algorithm: TextDetectorAlgorithm,
-        ai_enabled: bool,
-        torch_available: Option<bool>,
-    ) -> Option<&'static str> {
-        match algorithm {
-            TextDetectorAlgorithm::Classic => None,
-            TextDetectorAlgorithm::PaddleOcr => {
-                (!ai_enabled).then(|| t!("translation.text_detector.paddle_disabled_status"))
-            }
-            TextDetectorAlgorithm::Ai => {
-                if !ai_enabled {
-                    return Some(t!("translation.text_detector.ai_disabled_status"));
+    /// Every `--no-ai` x backend platform x native platform x Paddle route x torch state:
+    /// `Classic` always runs; Paddle needs the runtime of its route; CTD/Surya need the backend
+    /// and, after it, a PyTorch not reported missing; the local-AI reason wins over PyTorch.
+    #[test]
+    fn availability_all_combinations() {
+        for no_ai in [false, true] {
+            for backend_platform in [false, true] {
+                for native_platform in [false, true] {
+                    let local = LocalAiAvailability::resolve(
+                        no_ai,
+                        platform(backend_platform, PlatformFeature::PythonBackend),
+                        platform(native_platform, PlatformFeature::NativeOnnxRuntime),
+                    );
+                    let backend_ok = backend_platform && !no_ai;
+                    let native_ok = native_platform && !no_ai;
+                    for route in [DetectorRoute::Native, DetectorRoute::Backend] {
+                        for torch in TORCH_STATES {
+                            for algorithm in DETECTOR_ALGORITHMS {
+                                let case = format!(
+                                    "{algorithm:?} no_ai={no_ai} backend={backend_platform} \
+                                     native={native_platform} {route:?} torch={torch:?}"
+                                );
+                                let got = algorithm.availability(route, &local, torch);
+                                let expected: Result<(), &str> = match algorithm {
+                                    TextDetectorAlgorithm::Classic => Ok(()),
+                                    TextDetectorAlgorithm::PaddleOcr => match route {
+                                        DetectorRoute::Native if !native_ok => Err("native"),
+                                        DetectorRoute::Backend if !backend_ok => Err("backend"),
+                                        DetectorRoute::Native | DetectorRoute::Backend => Ok(()),
+                                    },
+                                    TextDetectorAlgorithm::Ai | TextDetectorAlgorithm::Surya => {
+                                        if !backend_ok {
+                                            Err("backend")
+                                        } else if torch == Some(false) {
+                                            Err("torch")
+                                        } else {
+                                            Ok(())
+                                        }
+                                    }
+                                };
+                                let got_kind = got.map_err(|reason| match reason {
+                                    DetectorUnavailable::LocalAi(off) => match off.runtime {
+                                        LocalRuntime::NativeOnnx => "native",
+                                        LocalRuntime::PythonBackend => "backend",
+                                    },
+                                    DetectorUnavailable::TorchMissing => "torch",
+                                });
+                                assert_eq!(got_kind, expected, "{case}");
+                            }
+                        }
+                    }
                 }
-                matches!(torch_available, Some(false))
-                    .then(|| t!("translation.common.pytorch_not_installed_status"))
-            }
-            TextDetectorAlgorithm::Surya => {
-                if !ai_enabled {
-                    return Some(t!("translation.text_detector.surya_disabled_status"));
-                }
-                matches!(torch_available, Some(false))
-                    .then(|| t!("translation.common.pytorch_not_installed_status"))
             }
         }
     }
@@ -683,58 +695,21 @@ mod tests {
     /// fresh switch to `Classic`; the panel must show no hint (the `Classic` arm was `None`).
     #[test]
     fn classic_never_shows_a_panel_hint() {
-        for reason in [DetectorUnavailable::AiDisabled, DetectorUnavailable::TorchMissing] {
+        let off = LocalAiOff { runtime: LocalRuntime::PythonBackend, reason: LocalAiOffReason::DisabledByFlag };
+        for reason in [DetectorUnavailable::LocalAi(off), DetectorUnavailable::TorchMissing] {
             assert_eq!(reason.panel_hint_text(TextDetectorAlgorithm::Classic), None, "{reason:?}");
         }
     }
 
+    /// The panel hint names the same reason a refused run reports.
     #[test]
-    fn availability_matches_the_three_replaced_decisions() {
-        for algorithm in DETECTOR_ALGORITHMS {
-            for ai_enabled in [false, true] {
-                for torch_available in TORCH_STATES {
-                    let case = format!("{algorithm:?} ai={ai_enabled} torch={torch_available:?}");
-                    let availability = algorithm.availability(ai_enabled, torch_available);
-                    assert_eq!(
-                        availability.is_ok(),
-                        reference_can_detect(algorithm, ai_enabled, torch_available),
-                        "can_detect: {case}"
-                    );
-                    assert_eq!(
-                        availability.err().map(|reason| reason.status_text(algorithm)),
-                        reference_run_error(algorithm, ai_enabled, torch_available),
-                        "run error: {case}"
-                    );
-                    // The panel hint names the same reason a refused run reports
-                    // (PyTorch missing included); `Classic` never reaches `Err`.
-                    if let Err(reason) = availability {
-                        assert_eq!(
-                            reason.panel_hint_text(algorithm),
-                            reference_run_error(algorithm, ai_enabled, torch_available),
-                            "panel hint: {case}"
-                        );
-                    }
-                }
+    fn panel_hint_matches_the_run_refusal() {
+        let off = LocalAiOff { runtime: LocalRuntime::NativeOnnx, reason: LocalAiOffReason::DisabledByFlag };
+        for algorithm in [TextDetectorAlgorithm::PaddleOcr, TextDetectorAlgorithm::Ai, TextDetectorAlgorithm::Surya] {
+            for reason in [DetectorUnavailable::LocalAi(off), DetectorUnavailable::TorchMissing] {
+                assert_eq!(reason.panel_hint_text(algorithm), Some(reason.status_text(algorithm)), "{algorithm:?}");
             }
         }
-    }
-
-    #[test]
-    fn availability_reasons() {
-        assert_eq!(TextDetectorAlgorithm::Classic.availability(false, Some(false)), Ok(()));
-        assert_eq!(
-            TextDetectorAlgorithm::PaddleOcr.availability(true, Some(false)),
-            Ok(())
-        );
-        assert_eq!(
-            TextDetectorAlgorithm::Ai.availability(false, Some(false)),
-            Err(DetectorUnavailable::AiDisabled)
-        );
-        assert_eq!(
-            TextDetectorAlgorithm::Surya.availability(true, Some(false)),
-            Err(DetectorUnavailable::TorchMissing)
-        );
-        assert_eq!(TextDetectorAlgorithm::Surya.availability(true, None), Ok(()));
     }
 
     /// Q7c: a PyTorch detector with PyTorch missing names that reason, not "AI disabled".
@@ -743,7 +718,7 @@ mod tests {
         for algorithm in [TextDetectorAlgorithm::Ai, TextDetectorAlgorithm::Surya] {
             assert_eq!(
                 DetectorUnavailable::TorchMissing.panel_hint_text(algorithm),
-                Some(t!("translation.common.pytorch_not_installed_status")),
+                Some(t!("translation.common.pytorch_not_installed_status").to_string()),
                 "{algorithm:?}"
             );
         }

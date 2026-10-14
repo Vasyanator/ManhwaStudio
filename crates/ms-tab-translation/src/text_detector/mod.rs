@@ -52,7 +52,8 @@ pub use region::{detect_ai_ctd_mask_for_image, detect_paddle_mask_for_image, det
 use ms_config as config;
 use ms_sysprobe::ai_models;
 use ms_text_detect::{DetectParams, EngineKind};
-use pipeline::DetectorRoute;
+// The tab's detector availability gate maps the Paddle route onto the local-AI rule.
+pub(crate) use pipeline::{DetectorRoute, detector_native_route};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread::{self as thread, JoinHandle};

@@ -25,7 +25,7 @@ Every rule here is a CONSUMER of its owner: build shipping is
 effective `device`, whether the persisted id names an offered device is
 `onnx_caps::device_id_offered` (over the runtime's own id parse), the guard scope is
 `next_load_scope_key` (shared with the panel's Retry worker), spawnability is
-`check_backend_spawnable`, the catalog rule is `probe_disk_catalog`, which registration
+`check_backend_spawnable`, the effective runtime is `local_ai::effective_ai_runtime`, the catalog rule is `probe_disk_catalog`, which registration
 records are broken is `ms_os_integration::report::badge_worthy` (over `Defect::severity`). The worker never
 reconciles the AI install type; it only reads it.
 */
@@ -39,6 +39,7 @@ use ms_config::{AiInstallType, AiRuntime, OrtLoadDecision};
 use ms_log::runtime_log;
 use ms_native_runtime::NativeFallbackReason;
 use ms_onnx::NativeDeviceSelection;
+use ms_tab_translation::local_ai::effective_ai_runtime;
 use serde_json::Value;
 
 use super::model::{FallbackCause, NATIVE_FAMILY, REGISTRATION_FAMILY, SettingKey, SettingWarning, WarningReason};
@@ -170,11 +171,11 @@ fn gather_backend(
     wants_runtime: bool,
     wants_autostart: bool,
 ) -> (Vec<WarningReason>, Vec<WarningReason>) {
-    let runtime = AiRuntime::from_user_settings(cfg);
+    let runtime = effective_ai_runtime(cfg);
     // Read only: the install-type owner (the launcher's reconciliation) is not run here.
     let install = AiInstallType::from_user_settings(cfg);
     let app_dir = ms_config::program_dir();
-    let needs_spawn_check = ctx.ai_enabled
+    let needs_spawn_check = ctx.backend_enabled
         && ((wants_runtime && runtime == AiRuntime::Backend) || (wants_autostart && ctx.backend_autostart));
     let blocker = if needs_spawn_check { check_backend_spawnable(&app_dir).err() } else { None };
     backend_reasons(runtime, ctx, install, blocker.as_ref(), &app_dir)
@@ -182,7 +183,8 @@ fn gather_backend(
 
 /// The backend rules, as `(AiRuntime reasons, BackendAutostart reasons)`.
 ///
-/// - Nothing under `--no-ai` (`!ctx.ai_enabled`), without a blocker, or when the platform
+/// - Nothing when the backend is off (`!ctx.backend_enabled`: `--no-ai` or the platform),
+///   without a blocker, or when the platform
 ///   has no Python backend (`PlatformUnavailable`: the AI backend pane shows that notice).
 /// - `AiRuntime`: the blocker, when the runtime is `Backend`.
 /// - `BackendAutostart`: the blocker, when autostart is on — except a missing Python
@@ -195,7 +197,7 @@ pub(crate) fn backend_reasons(
     blocker: Option<&BackendSpawnBlocker>,
     app_dir: &Path,
 ) -> (Vec<WarningReason>, Vec<WarningReason>) {
-    let Some(blocker) = blocker.filter(|_| ctx.ai_enabled) else {
+    let Some(blocker) = blocker.filter(|_| ctx.backend_enabled) else {
         return (Vec::new(), Vec::new());
     };
     let app_dir = app_dir.display().to_string();
@@ -251,7 +253,7 @@ pub(crate) struct DeviceOffer {
 /// Evaluates the native selection and gathers [`NativeFacts`]; every native key is clean
 /// under `--no-ai` or when the runtime is `Backend` (those items are not drawn then).
 fn gather_native(cfg: &Value, ctx: CheckContext) -> [(SettingKey, Vec<WarningReason>); 4] {
-    if !native_checks_apply(ctx, AiRuntime::from_user_settings(cfg)) {
+    if !native_checks_apply(ctx, effective_ai_runtime(cfg)) {
         return NATIVE_FAMILY.map(|key| (key, Vec::new()));
     }
     let report = ms_native_runtime::evaluate_native_selection(cfg);
@@ -285,11 +287,12 @@ fn gather_native(cfg: &Value, ctx: CheckContext) -> [(SettingKey, Vec<WarningRea
     })
 }
 
-/// Whether the native family is checked at all: not under `--no-ai`, and only for the
+/// Whether the native family is checked at all: only when native ONNX is allowed in this
+/// process (`ctx.native_onnx_enabled`: not `--no-ai`, and on the platform), and only for the
 /// `Native` runtime (the native items are drawn only then).
 pub(crate) fn native_checks_apply(ctx: CheckContext, runtime: AiRuntime) -> bool {
     match runtime {
-        AiRuntime::Native => ctx.ai_enabled,
+        AiRuntime::Native => ctx.native_onnx_enabled,
         AiRuntime::Backend => false,
     }
 }
@@ -510,8 +513,14 @@ mod tests {
 
     const APP_DIR: &str = "/home/u/ManhwaStudio";
 
-    fn ctx(ai_enabled: bool, backend_autostart: bool) -> CheckContext {
-        CheckContext { ai_enabled, backend_autostart, registration_checks: true }
+    /// A context with both local runtimes allowed (`local_ai`) or both off (`--no-ai`).
+    fn ctx(local_ai: bool, backend_autostart: bool) -> CheckContext {
+        CheckContext {
+            backend_enabled: local_ai,
+            native_onnx_enabled: local_ai,
+            backend_autostart,
+            registration_checks: true,
+        }
     }
 
     fn clean_native() -> NativeFacts {
@@ -634,6 +643,10 @@ mod tests {
         assert!(native_checks_apply(ctx(true, false), AiRuntime::Native));
         assert!(!native_checks_apply(ctx(true, true), AiRuntime::Backend));
         assert!(!native_checks_apply(ctx(false, false), AiRuntime::Native));
+        // A platform with native ONNX but no Python backend (Android): native checks apply,
+        // backend reasons stay silent.
+        let native_only = CheckContext { backend_enabled: false, ..ctx(true, true) };
+        assert!(native_checks_apply(native_only, AiRuntime::Native));
     }
 
     #[test]

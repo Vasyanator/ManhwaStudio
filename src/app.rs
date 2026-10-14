@@ -508,7 +508,7 @@ struct UploadTask {
 
 impl MangaApp {
     pub fn new(project: ProjectData, ai_backend: AiBackendHandle) -> Self {
-        let ai_enabled = ai_backend.ai_enabled;
+        let local_ai = ai_backend.local_ai;
         // Enable puffin scope recording once at editor startup. Without this the
         // `profile_scope!` markers are no-ops and the profiler window stays empty.
         #[cfg(feature = "profiling")]
@@ -691,7 +691,7 @@ impl MangaApp {
         let ai_backend_probe_tx = ai_backend.probe_tx.clone();
         let text_mask_model = Arc::new(Mutex::new(TextMaskModel::new()));
         let mut translation_tab = TranslationTabState::new(
-            ai_enabled,
+            local_ai,
             Arc::clone(&ai_backend_health),
             ai_backend_probe_tx.clone(),
         );

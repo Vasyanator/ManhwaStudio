@@ -10,7 +10,9 @@ Main items:
   `Cli::image_args` returns whichever was given, in command-line order.
 - `conflicting_image_flags` / `check_image_arg`: the image start's flag-combination rule and its
   path pre-check (missing, directory, not a regular file), run before any window exists.
-- `Cli.no_ai`: disables AI-dependent functionality at startup.
+- `Cli.no_ai`: switches off the LOCAL AI runtimes (Python backend and native ONNX) for the
+  process; cloud AI API and machine translation stay available
+  (`ms_tab_translation::local_ai::LocalAiAvailability`).
 - `Cli.update`: opens the Rust update window directly.
 - `Cli.test_launcher`: starts the new Rust launcher test mode instead of the main app.
 - `Cli.test_ver_check`: forces update checks to report an available update in launcher/update UI.
@@ -75,6 +77,10 @@ pub struct Cli {
     #[arg(value_name = "IMAGE", group = "open_target", num_args = 1..)]
     pub image_positional: Vec<PathBuf>,
 
+    /// `--no-ai`: no LOCAL AI runtimes in this process — the Python backend is never started
+    /// and native ONNX is never loaded. Cloud AI API (OCR and MT) and the plain machine
+    /// translators are network code and keep working. Read once in `run_main` into
+    /// `LocalAiAvailability::for_process`.
     #[arg(long, default_value_t = false)]
     pub no_ai: bool,
 

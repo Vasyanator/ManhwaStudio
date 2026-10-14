@@ -47,7 +47,8 @@ pub enum PlatformFeature {
     ExternalArchiveTools,
     /// The external waifu2x upscaler executable.
     Waifu2xUpscaler,
-    /// The OS credential store for AI API keys and the Hugging Face token.
+    /// The OS credential store for AI API keys and the Hugging Face token (desktop keyring;
+    /// on Android the Keystore-backed `credentials` store).
     CredentialStore,
     /// File open/save dialogs (`file_dialog`). On Android a request may still resolve to
     /// [`UnavailableReason::BridgeMissing`] at runtime.
@@ -101,7 +102,7 @@ impl PlatformFeature {
     pub const fn is_available(self) -> bool {
         match self {
             // Desktop has rfd / arboard; Android gets SAF and JNI ClipboardManager backends.
-            PlatformFeature::FilePicker | PlatformFeature::ClipboardText => DESKTOP || ANDROID,
+            PlatformFeature::FilePicker | PlatformFeature::ClipboardText | PlatformFeature::CredentialStore => DESKTOP || ANDROID,
             // Android-only storage model (app-specific external dirs, MANAGE_EXTERNAL_STORAGE).
             PlatformFeature::AppStorageVolumes | PlatformFeature::AllFilesAccess => ANDROID,
             // Linux, macOS and Android. Windows delivers a pen as touch events (winit has no
@@ -113,7 +114,6 @@ impl PlatformFeature {
             | PlatformFeature::ScreenCapture
             | PlatformFeature::ExternalArchiveTools
             | PlatformFeature::Waifu2xUpscaler
-            | PlatformFeature::CredentialStore
             | PlatformFeature::PersistentDirectoryPicker
             | PlatformFeature::NativeMessageBox
             | PlatformFeature::ClipboardImage

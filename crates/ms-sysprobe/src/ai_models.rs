@@ -4,38 +4,54 @@ Application-managed AI model resolver and lazy Hugging Face downloader.
 
 Main responsibilities:
 - Define the canonical ManhwaStudio_AI_Models file layout for Rust callers.
-- Resolve Hugging Face repository URLs through the official hf-hub crate and stream the selected
-  files directly into ManhwaStudio_AI_Models without using HF cache blobs or symlinks.
+- Download missing files of the `main` revision directly into ManhwaStudio_AI_Models (no HF
+  cache blobs or symlinks) through the shared resumable fetch (`ai_models/resumable.rs`):
+  `<file>.part` staging next to the target, HTTP `Range` resume, retry with capped backoff,
+  connect/read timeouts, size verified against the server's announcement, rename on success.
 - Return concrete local paths for Rust model initialization code.
 
-- Mount the `external` (pinned third-party model downloader) and `external_catalog`
-  submodules; see `ai_models/MODULE_README.md`.
+- Mount the `external` (pinned third-party model downloader), `external_catalog` and
+  `resumable` (shared HTTP mechanics) submodules; see `ai_models/MODULE_README.md`.
 
 Notes:
 - Library-managed caches such as EasyOCR and Surya are intentionally absent here.
 - Callers must invoke this from worker/background code, not the GUI thread.
+- The main repository is not pinned: there is no hash to check, so a file is published once
+  exactly the announced number of bytes is staged. Requests carry no Hugging Face token (the
+  repository is public). The `ensure_*` API has no cancel parameter, so a download runs until
+  it completes or its retries are exhausted.
 */
 
-// Hugging Face download stack is native-only (`hf-hub`/`ureq` are compiled out on
-// wasm); the resolver keeps its public signatures on both targets and stubs the
-// actual download on the web build.
-#[cfg(not(target_arch = "wasm32"))]
-use hf_hub::api::sync::ApiBuilder;
+// The HTTP download stack is native-only (`ureq` is compiled out on wasm); the resolver
+// keeps its public signatures on both targets and stubs the actual download on the web
+// build.
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs;
-#[cfg(not(target_arch = "wasm32"))]
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::AtomicBool;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::{Mutex, OnceLock};
+
+#[cfg(not(target_arch = "wasm32"))]
+use resumable::{PartRequest, RangeFetcher, ResumableFetch, RetryPolicy, StreamError, UreqFetcher, hf_resolve_url};
 
 /// Pinned external (third-party) model downloader and status probe; see `ai_models/MODULE_README.md`.
 pub mod external;
 /// The pinned external-model catalog (Baberu OCR, PaddleOCR-VL variants).
 pub mod external_catalog;
+/// Shared HTTP mechanics of both downloaders: resolve URLs and the resumable per-file fetch.
+#[cfg(not(target_arch = "wasm32"))]
+mod resumable;
 
 pub const HF_OWNER: &str = "Vasyanator2";
 pub const HF_REPO_NAME: &str = "ManhwaStudio_AI_Models";
+/// Revision of the app-managed repository the downloader resolves (unpinned branch).
+#[cfg(not(target_arch = "wasm32"))]
+const HF_REVISION: &str = "main";
+/// Log prefix of the main-repository downloader.
+#[cfg(not(target_arch = "wasm32"))]
+const LOG_TAG: &str = "[ai-models]";
 
 const PADDLE_DET_ONNX: &str = "ONNX/PaddleOCR/detection/v5/det.onnx";
 const PADDLE_DET_CONFIG: &str = "ONNX/PaddleOCR/detection/v5/config.json";
@@ -318,15 +334,15 @@ fn ensure_remote_files(
         report();
     }
 
-    let api = ApiBuilder::from_env()
-        .with_progress(false)
-        .build()
-        .map_err(|err| tf!("ai_models.hf_client_error", err = err))?;
-    let repo = api.model(format!("{HF_OWNER}/{HF_REPO_NAME}"));
+    let repo_id = format!("{HF_OWNER}/{HF_REPO_NAME}");
+    // The main repository is public: no token, as before (only pinned external models use
+    // the user's Hugging Face token).
+    let fetcher = UreqFetcher::new(None);
+    let retry = RetryPolicy::standard();
     for remote in still_missing {
-        let url = repo.url(remote);
-        download_hf_file_direct(&url, &models_root.join(remote), remote)?;
+        let url = hf_resolve_url(&repo_id, HF_REVISION, remote);
         let local = models_root.join(remote);
+        download_hf_file_with(&fetcher, &retry, &url, &local, remote)?;
         if !is_nonempty_file(&local) {
             return Err(tf!("ai_models.file_missing_after_download", local = local.display()));
         }
@@ -334,39 +350,66 @@ fn ensure_remote_files(
     Ok(())
 }
 
+/// Downloads `url` into `local_path` through `<file name>.part` next to it: resumes a part
+/// left by an earlier run with `Range`, retries transient failures per `retry`, verifies the
+/// staged length against the size the server announced (`Content-Length` /
+/// `Content-Range`), fsyncs and renames it into place. `remote` is the repository path, for
+/// messages and logs only. A failed download keeps the `.part` for the next call unless its
+/// bytes were proven wrong.
+///
+/// # Errors
+/// A localized message (`ai_models.*` keys) for a folder, download, write or rename failure.
 #[cfg(not(target_arch = "wasm32"))]
-fn download_hf_file_direct(url: &str, local_path: &Path, remote: &str) -> Result<(), String> {
+fn download_hf_file_with(
+    fetcher: &dyn RangeFetcher,
+    retry: &RetryPolicy<'_>,
+    url: &str,
+    local_path: &Path,
+    remote: &str,
+) -> Result<(), String> {
     let parent = local_path
         .parent()
         .ok_or_else(|| tf!("ai_models.invalid_model_path", local_path = local_path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|err| tf!("ai_models.create_folder_error", parent = parent.display(), err = err))?;
+    let part = part_path_for(local_path)
+        .ok_or_else(|| tf!("ai_models.invalid_model_path", local_path = local_path.display()))?;
+    let offset = part.metadata().map(|metadata| if metadata.is_file() { metadata.len() } else { 0 }).unwrap_or(0);
+    ms_log::runtime_log::log_info(format!("{LOG_TAG} download start: file={remote} resume_from={offset} url={url}"));
 
-    let tmp_path = local_path.with_extension("part");
-    let response = ureq::get(url)
-        .call()
-        .map_err(|err| tf!("ai_models.download_error", remote = remote, err = err))?;
-    let mut reader = response.into_reader();
-    let mut file = fs::File::create(&tmp_path).map_err(|err| {
-        tf!("ai_models.temp_file_error", tmp_path = tmp_path.display(), err = err)
-    })?;
-    let mut buffer = [0_u8; 128 * 1024];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .map_err(|err| tf!("ai_models.stream_read_error", remote = remote, err = err))?;
-        if read == 0 {
-            break;
+    // The `ensure_*` API has no cancel parameter (see the file header): this flag is never set.
+    let never_cancelled = AtomicBool::new(false);
+    let log_context = format!("file={remote}");
+    let engine = ResumableFetch { fetcher, retry, cancel: &never_cancelled, log_tag: LOG_TAG, log_context: &log_context };
+    let request = PartRequest { url, part: &part, offset, expected_size: None };
+    let size = engine.fetch_part(&request, None, &mut |_| {}).map_err(|error| {
+        ms_log::runtime_log::log_error(format!("{LOG_TAG} download failed: file={remote} part={} error={error:?}", part.display()));
+        match error {
+            StreamError::Io { path, source } => tf!("ai_models.write_error", tmp_path = path.display(), err = source),
+            StreamError::Http { detail } => tf!("ai_models.download_error", remote = remote, err = detail),
+            StreamError::SizeMismatch { expected, actual } => tf!(
+                "ai_models.download_error",
+                remote = remote,
+                err = format!("size mismatch: expected {expected} bytes, got {actual}")
+            ),
+            // Unreachable while the flag above is never set; mapped rather than assumed.
+            StreamError::Cancelled => tf!("ai_models.download_error", remote = remote, err = "cancelled"),
         }
-        file.write_all(&buffer[..read])
-            .map_err(|err| tf!("ai_models.write_error", tmp_path = tmp_path.display(), err = err))?;
-    }
-    file.flush()
-        .map_err(|err| tf!("ai_models.flush_error", tmp_path = tmp_path.display(), err = err))?;
-    fs::rename(&tmp_path, local_path).map_err(|err| {
+    })?;
+    fs::rename(&part, local_path).map_err(|err| {
+        ms_log::runtime_log::log_error(format!("{LOG_TAG} could not publish the download: file={remote} error={err}"));
         tf!("ai_models.save_error", local_path = local_path.display(), err = err)
     })?;
+    ms_log::runtime_log::log_info(format!("{LOG_TAG} download complete: file={remote} bytes={size}"));
     Ok(())
+}
+
+/// `<file name>.part` next to `local_path`; `None` when the path has no file name.
+#[cfg(not(target_arch = "wasm32"))]
+fn part_path_for(local_path: &Path) -> Option<PathBuf> {
+    let mut name = local_path.file_name()?.to_os_string();
+    name.push(".part");
+    Some(local_path.with_file_name(name))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

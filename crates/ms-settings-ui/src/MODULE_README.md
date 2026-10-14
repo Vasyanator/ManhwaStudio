@@ -75,7 +75,10 @@ dependency list.
 - `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,
   backend health readout, ORT crash-guard reset. The provider list is the UNION of the offline
   native set and the providers the backend reports; backend-only providers (e.g. MIGraphX,
-  ROCm) stay selectable for backend ONNX. Native build availability (picker groups,
+  ROCm) stay selectable for backend ONNX. Without `PlatformFeature::PythonBackend` (Android,
+  web) it offers no "Backend" runtime and draws only the native ONNX selection (backend status,
+  process control, log, PyTorch device and diagnostics hidden); the runtime it shows is the
+  EFFECTIVE one (`ms_tab_translation::local_ai::effective_ai_runtime`). Native build availability (picker groups,
   "(unavailable)" label, auto-download gate) is NOT decided here: it is
   `ms_native_runtime::native_build_fallback_reason` over the caps probe's
   `NativeHardwareFacts`, so the panel shows what the runtime will do. The Backend-branch
@@ -97,7 +100,12 @@ dependency list.
   launcher -> studio switch; the process itself (spawn, stdout/stderr reader threads, runtime
   log) is owned by the `AiBackendProcessRuntime` worker (`spawn_ai_backend_process_worker`). `start_with_autostart_gate` defers the persisted autostart until a
   gate opens (the binary passes `!storage_mode_job::backend_autostart_blocked()`); a user
-  Start/Restart/Stop cancels a deferred autostart.
+  Start/Restart/Stop cancels a deferred autostart. The handle carries the process's
+  `LocalAiAvailability` (`local_ai`, built in `run_main`: `--no-ai` switches off the backend AND
+  native ONNX, the platform decides on its own). With the backend off no process worker and no
+  probe start; the health snapshot is the fixed `AiBackendHealthSnapshot::unavailable` (checked,
+  not connected, naming the reason) so backend routes are refused, and the capability hints are
+  primed `Some(false)` for every runtime that is off (`None` = unknown otherwise).
 - `settings_warnings/`: per-setting warnings ("!" badges) of the shared panes — the
   GUI-free model (`SettingKey`, `WarningReason` owning the level, `WarningSet`
   aggregation), the native-only checks, the `SettingsWarnings` worker runtime

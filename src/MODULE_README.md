@@ -68,7 +68,10 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   is removed rather than kept. Platform gates of the startup flow ask `ms_platform::PlatformFeature`:
   `InstalledCopyManagement` (no installer, install prompts, update check or update window
   where absent; the no-argument route is the pure, unit-tested `startup_routing`) and
-  `PythonBackend` (both supervisor starts). The startup error box is
+  `PythonBackend` / `NativeOnnxRuntime` (both supervisor starts take
+  `ms_tab_translation::local_ai::LocalAiAvailability::for_process(cli.no_ai)`: `--no-ai` switches
+  off the local AI runtimes — backend and native ONNX — never cloud AI API or machine
+  translation; `MangaApp::new` hands it to the Translation tab). The startup error box is
   `ms_platform::message::show_error_blocking`, log-only where no native box exists. The library exists so a platform build that needs one (Android
   `cdylib`) reaches the same startup code; its crate type stays the default `rlib`.
 - `android_entry.rs` (`cfg(target_os = "android")`): the unmangled `android_main(AndroidApp)`

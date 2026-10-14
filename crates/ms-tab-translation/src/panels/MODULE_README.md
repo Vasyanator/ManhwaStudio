@@ -47,7 +47,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   per-engine `AiRequirement` (`engine_button_requirement`, permissive on an unknown capability so a
   not-yet-probed native ONNX runtime does not lock selection out); each shows a runtime marker badge
   (`engine_marker`: Torch / ONNX / Torch/ONNX). AiApi is network-only and stays a plain ungated
-  `selectable_value` (still disabled under `--no-ai` by the outer `add_enabled_ui` in `tab.rs`).
+  `selectable_value`: it works with every local AI runtime off (`--no-ai`, Android); `tab.rs` never
+  disables the panel as a whole and names an unavailable local route's reason under it.
   Cascade: `selected_mode_requirement` (model-aware; MangaOCR `base_torch` needs Torch, its ONNX
   exports need onnxruntime) gates both the selected engine's options interface and the load button —
   when the requirement is known-unavailable, both are disabled and the requirement's
@@ -79,7 +80,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
 - `text_detector.rs`: detector algorithm/options UI, status/progress display, run/OCR/save/clear
   actions, and line/mask edit mode toggles. `tab.rs` lends it a per-frame
   `TextDetectorPanelView` snapshot. It also owns `TextDetectorAlgorithm::availability`, the ONE
-  "can this detector run" decision (`--no-ai`, reported-missing PyTorch) shared by the panel's
+  "can this detector run" decision (the local-AI rule of `crate::local_ai` for the algorithm's
+  route — Paddle native or backend, CTD/Surya backend — then reported-missing PyTorch) shared by the panel's
   detect-button gate and hint and by `tab.rs`'s run-mode refusal; never re-derive it elsewhere.
   The hint under disabled detect buttons names the same reason a refused run reports.
   `TextDetectorPanelOptions::run_mode` builds the run mode `tab.rs` starts (availability is

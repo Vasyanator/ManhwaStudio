@@ -1,20 +1,28 @@
 # Module: crates/ms-sysprobe/src/ai_models
 
 ## Purpose
-Submodules of `ai_models.rs` for EXTERNAL models: third-party Hugging Face repositories the
-application downloads itself at a pinned commit, as opposed to the app-managed
+Submodules of `ai_models.rs`. Mostly EXTERNAL models: third-party Hugging Face repositories
+the application downloads itself at a pinned commit, as opposed to the app-managed
 `Vasyanator2/ManhwaStudio_AI_Models` tree that `ai_models.rs` resolves. Today: Baberu OCR and
 the PaddleOCR-VL variants (official 1.6 default, official 1.5, manga_ja). The Python backend
-never downloads these; it receives the resolved directory or file paths from Rust.
+never downloads these; it receives the resolved directory or file paths from Rust. Plus
+`resumable.rs`, the HTTP mechanics BOTH downloaders (external and main repository) share.
 
 ## Architecture
 - `external_catalog.rs` is DATA: one `ExternalModelSpec` per model (repo id, 40-hex commit,
   file allowlist with exact size + sha256, target directory relative to `side_models`), the
   typed `PaddleVlVariant` selector and the Baberu layout helper `baberu_files`.
-- `external.rs` is MECHANICS: the stat-only probe (`external_model_status`,
+- `external.rs` is the PINNED downloader: the stat-only probe (`external_model_status`,
   `installed_dir`) and the blocking downloader (`download_external_model`), whose core
   (`download_with`) takes an injected `RangeFetcher` and `RetryPolicy` (with an injected
-  backoff sleep), so tests run without network and without real waiting.
+  backoff sleep), so tests run without network and without real waiting. It owns the
+  staging layout, markers and sha256; streaming one file is delegated to `resumable.rs`.
+- `resumable.rs` is the shared HTTP layer (native-only): `hf_resolve_url` (endpoint from
+  `HF_ENDPOINT`, default `https://huggingface.co`, every path segment percent-encoded; no
+  `hf_hub` and no home directory, which Android app processes lack), the `RangeFetcher`
+  seam with `UreqFetcher`, `RetryPolicy`, and `ResumableFetch::fetch_part` — stream one file
+  into its `.part` from the staged length until the whole file is staged and fsynced, with
+  the size either pinned (external) or announced by the server (main repository).
 - Neither reads config: callers pass the side-models root (`ms_config::side_models_dir()`).
 - Threading: none of it may run on the GUI thread; the OCR download controller in
   `ms-tab-translation` owns the worker and polls the progress it is given.
@@ -35,7 +43,8 @@ Download flow for one spec (`<side_models>/<spec.dir>`):
    write the completion marker `.ms_model_complete.json` (temp + fsync + rename); remove
    `.download/` (a failure here is only a logged warning: the model is installed).
 
-Transient-failure retry (`RetryPolicy::standard`): connect / DNS / I/O transport errors
+Transient-failure retry (`RetryPolicy::standard`, implemented once in `resumable.rs` and
+used by both downloaders): connect / DNS / I/O transport errors
 (timeouts, resets), any error while reading a body, a body that ends before the pinned size
 (ureq reports a short Content-Length body as `UnexpectedEof`, a cut chunked body as a clean
 EOF — both land here), and HTTP 408 / 429 / 5xx are retried up to 5 times in a row, waiting
@@ -46,8 +55,13 @@ staged new bytes. The wait sleeps in 100 ms slices, polls cancel between them an
 offset, attempt, delay and error. Everything else is permanent and ends the download at once.
 
 ## Files and submodules
-- `external.rs`: spec/status/progress/error types, probe, downloader, ureq fetcher, busy
-  guard. Edit for download mechanics, marker format or HTTP handling.
+- `external.rs`: spec/status/progress/error types, probe, pinned downloader, busy guard.
+  Edit for staging layout, marker format or verification.
+- `resumable.rs`: resolve URLs, HTTP seam + ureq fetcher, retry schedule, per-file
+  resumable stream. Edit for HTTP handling, retry/resume rules or timeouts.
+- `resumable/tests.rs`: URL encoding and endpoint override, the unpinned (server-announced
+  size) stream, and the main-repository downloader `ai_models::download_hf_file_with`, over a
+  scripted in-memory fetcher.
 - `external/tests.rs`: downloader tests over an in-memory fetcher in a self-removing temp
   dir, plus one opt-in `#[ignore]` real download (`MS_TEST_EXTERNAL_DOWNLOAD=1`).
 - `external_catalog.rs`: the pinned specs and `PaddleVlVariant`. Edit to add a model or
@@ -72,7 +86,17 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   filesystems, which the final sha256 check catches (that one file is downloaded again).
   A periodic fsync would not help without a durable "verified up to" checkpoint.
 - The HF token goes only into the bearer header, is never logged, and ureq drops it on any
-  redirect. Requests resolve through `hf_hub` URLs, so `HF_ENDPOINT` is honoured.
+  redirect. Requests resolve through `resumable::hf_resolve_url`, so `HF_ENDPOINT` is
+  honoured; nothing here may call `hf_hub::ApiBuilder::from_env` (it panics without a home
+  directory). The main-repository downloader sends no token (public repository).
+- Size rule of the shared stream: a pinned size is authoritative; without one the size is
+  the 200's `Content-Length` or the 206's `Content-Range` total, requested with
+  `Accept-Encoding: identity` (ureq would otherwise negotiate gzip and drop the length). A
+  file whose size the server never announced is refused (`.part` kept), never published
+  unverified. Staged bytes are deleted only when proven wrong: overflow, a 206 total that
+  differs from the one already learned (remote changed), or a 416 showing the `.part` is
+  longer than the remote file (that one restarts from zero at once); a matching 416 total
+  means the `.part` is already complete.
 - `ExternalModelError`'s `Display` is English diagnostic text for logs; user-facing text is
   chosen by the UI layer from the variant (i18n keys live with the UI).
 - wasm: specs, status and `installed_dir` compile; `download_external_model` returns
@@ -85,4 +109,6 @@ offset, attempt, delay and error. Everything else is permanent and ends the down
   catalog tests check hex lengths, unique dirs and totals — add its total there.
 - Moving a pin: change revision and the changed file rows together; installs of the old pin
   then read `Missing` and a re-download keeps unchanged files.
-- Download behaviour (resume, verification, marker): `external.rs` + `external/tests.rs`.
+- Pinned-download behaviour (verification, marker, staging): `external.rs` +
+  `external/tests.rs`. Resume / retry / HTTP behaviour of both downloaders: `resumable.rs` +
+  `resumable/tests.rs` (and the pinned retry tests in `external/tests.rs`).

@@ -71,15 +71,20 @@ impl RangeFetcher for FakeFetcher {
         if self.mode == RangeMode::Honour && offset > 0 {
             let start = usize::try_from(offset).map_err(permanent)?;
             let suffix = body.get(start..).ok_or_else(|| classify_status(416, None))?.to_vec();
-            return Ok(FetchResponse { status: FetchStatus::Partial, body: Box::new(Cursor::new(suffix)) });
+            return Ok(FetchResponse { status: FetchStatus::Partial, total_len: Some(total_len(body)), body: Box::new(Cursor::new(suffix)) });
         }
-        Ok(FetchResponse { status: FetchStatus::Full, body: Box::new(Cursor::new(body.clone())) })
+        Ok(FetchResponse { status: FetchStatus::Full, total_len: Some(total_len(body)), body: Box::new(Cursor::new(body.clone())) })
     }
 }
 
 /// A fake-server internal failure as a permanent fetch error.
 fn permanent(err: impl std::fmt::Display) -> FetchError {
     FetchError::Permanent { detail: err.to_string() }
+}
+
+/// The whole-file size a fake server announces.
+fn total_len(body: &[u8]) -> u64 {
+    u64::try_from(body.len()).unwrap_or(u64::MAX)
 }
 
 fn url_of(file: &ExternalFile) -> String {
@@ -537,7 +542,7 @@ impl RangeFetcher for ScriptedFetcher {
             Some(Step::Short(len)) => Box::new(Cursor::new(rest[..len.min(rest.len())].to_vec())),
             Some(Step::Status(code, retry_after)) => return Err(classify_status(code, retry_after)),
         };
-        Ok(FetchResponse { status, body })
+        Ok(FetchResponse { status, total_len: Some(total_len(&self.body)), body })
     }
 }
 

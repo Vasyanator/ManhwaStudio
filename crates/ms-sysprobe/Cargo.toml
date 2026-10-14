@@ -30,23 +30,23 @@ serde_json.workspace = true
 sha2.workspace = true
 # Typed public error of `ai_models::external` (`ExternalModelError`).
 thiserror.workspace = true
-# Platform seams: the system clipboard behind `paste_image` and the capability table
-# (`PlatformFeature`) that decides which host probes and stores exist on this target.
+# Platform seams: the system clipboard behind `paste_image`, the capability table
+# (`PlatformFeature`) that decides which host probes and stores exist on this target, and
+# the Android credential store of the Hugging Face token (`credentials`).
 ms-platform = { path = "../ms-platform" }
 
-# Native-only half of `ai_models`: `hf-hub` resolves repository file URLs (which the
-# module then streams itself, without the HF cache). Compiled out on wasm, where the module
+# Native-only half of `ai_models`: it builds Hugging Face resolve URLs itself and streams
+# each file with resumable ranged requests (no HF cache). Compiled out on wasm, where the module
 # keeps its signatures and returns a typed "unavailable on web" error — the same feature
 # sets the binary already selects, so no second copy is built.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-hf-hub.workspace = true
 # `ai_models` streams each resolved file itself (into the app model tree, no HF cache
-# blobs or symlinks), so it needs the HTTP client directly and not only through hf-hub.
+# blobs or symlinks) over this HTTP client.
 ureq.workspace = true
 
 # The OS secret store `hf_token` keeps the access token in. Not on wasm (no store) and not
 # on Android: keyring has no Android backend there and would silently link its in-memory
-# mock, so `hf_token` answers `PlatformFeature::CredentialStore` unavailable instead.
+# mock, so `hf_token` uses the Keystore-backed `ms_platform::credentials` store instead.
 [target.'cfg(not(any(target_arch = "wasm32", target_os = "android")))'.dependencies]
 keyring.workspace = true
 

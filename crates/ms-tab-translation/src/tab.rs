@@ -184,7 +184,9 @@ Module-level utility functions:
   `build_ocr_request`, `build_bubble_original_text`.
 
 Key TranslationTabState field groups:
-- Panel/controllers/options: `active_panel`, `ai_enabled`, `ocr_controller`, `ocr_panel_options`,
+- Panel/controllers/options: `active_panel`, `local_ai` (which local AI runtimes the process
+  may use; OCR/detector routes are gated per route through it, MT and AI API never are),
+  `ocr_controller`, `ocr_panel_options`,
   `ocr_engine_states` + `ocr_loading_engine` (runtime per-engine OCR statuses),
   `ocr_model_downloads` (external OCR model status/download controller, polled per frame),
   `ocr_last_panel_engine`/`ocr_last_health_check_request_s`,
@@ -233,6 +235,7 @@ use crate::adv_rec::{
     AdvancedRecognitionAction, AdvancedRecognitionSelection, AdvancedRecognitionWindow,
 };
 use crate::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand, paddle_vl_ready_for};
+use crate::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use crate::machine_translation::{
     AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtOptions, AiMtReasoning, AiMtSortMode,
     MtControllerEvent, MtImageArea, MtImageInput, MtImageSource, MtRequestPreview,
@@ -264,7 +267,7 @@ use crate::panels::ocr::{
     CharReplacementRuleUi, OcrPanelModelView, OcrPanelOptions, draw_ocr_panel, selected_mode_requirement,
 };
 use crate::panels::text_detector::{
-    TextDetectorAlgorithm, TextDetectorPanelOptions, TextDetectorPanelView, TextDetectorPlanNoticeCache,
+    DetectorUnavailable, TextDetectorAlgorithm, TextDetectorPanelOptions, TextDetectorPanelView, TextDetectorPlanNoticeCache,
     detector_page_size, draw_text_detector_panel,
 };
 use crate::text_detector::{
@@ -717,7 +720,10 @@ struct RecentCharacterEntry {
 
 pub struct TranslationTabState {
     active_panel: TranslationPanel,
-    ai_enabled: bool,
+    /// Which local AI runtimes (Python backend, native ONNX) this process may use (`--no-ai`
+    /// and platform). Only routes needing an off runtime are refused (`ocr_route_availability`,
+    /// `TextDetectorAlgorithm::availability`); cloud AI API and machine translation never are.
+    local_ai: LocalAiAvailability,
     ai_backend_health: Arc<Mutex<AiBackendHealthSnapshot>>,
     ai_backend_health_cached: AiBackendHealthSnapshot,
     ai_backend_probe_tx: Option<Sender<AiBackendProbeCommand>>,
@@ -865,7 +871,8 @@ pub struct TranslationTabState {
 impl Default for TranslationTabState {
     fn default() -> Self {
         Self::new(
-            true,
+            // No `--no-ai`: the platform alone decides.
+            LocalAiAvailability::for_process(false),
             Arc::new(Mutex::new(AiBackendHealthSnapshot::default())),
             None,
         )
@@ -992,15 +999,18 @@ impl TranslationTabState {
         ]
     }
 
+    /// Builds the tab. `local_ai` is the process's local-AI availability (carried by the
+    /// backend supervisor handle); `ai_backend_health` / `ai_backend_probe_tx` are the shared
+    /// health snapshot and the probe channel (`None` when no probe runs).
     pub fn new(
-        ai_enabled: bool,
+        local_ai: LocalAiAvailability,
         ai_backend_health: Arc<Mutex<AiBackendHealthSnapshot>>,
         ai_backend_probe_tx: Option<Sender<AiBackendProbeCommand>>,
     ) -> Self {
         let (settings_save_tx, settings_save_thread) = spawn_translation_settings_saver_thread();
         Self {
             active_panel: TranslationPanel::None,
-            ai_enabled,
+            local_ai,
             ai_backend_health: Arc::clone(&ai_backend_health),
             ai_backend_health_cached: match ai_backend_health.lock() {
                 Ok(guard) => guard.clone(),
@@ -1265,7 +1275,7 @@ impl TranslationTabState {
     }
 
     fn request_ai_backend_health_check(&mut self, ctx: &egui::Context, force: bool) {
-        if !self.ai_enabled {
+        if self.local_ai.backend.is_err() {
             return;
         }
         let snapshot = self.ai_backend_health_snapshot();
@@ -1359,14 +1369,14 @@ impl TranslationTabState {
     /// The capture mode a finger long-press drag drives this frame, or `None` (the drag pans).
     ///
     /// The same precedence the pointer path applies: the crop chord wins over the OCR
-    /// modifiers, OCR needs the AI features and no open advanced-recognition window, and the
+    /// modifiers, OCR needs a runnable route for the selected engine and no open advanced-recognition window, and the
     /// advanced modifier wins over the quick one. A mode is a held key here, so a finger
     /// selects only while its mode is held, exactly like the mouse.
     fn touch_selection_mode(&self, ctx: &egui::Context) -> Option<TouchSelectionMode> {
         if Self::image_crop_selection_keys_down(ctx) {
             return Some(TouchSelectionMode::ImageCrop);
         }
-        if !self.ai_enabled || self.advanced_recognition.is_open() {
+        if self.selected_ocr_route_availability().is_err() || self.advanced_recognition.is_open() {
             return None;
         }
         if self.ocr_advanced_selection_mode_active() {
@@ -1476,42 +1486,83 @@ impl TranslationTabState {
         &self.ai_backend_health_cached
     }
 
+    /// Whether the backend is known unusable: off for the process (`local_ai.backend`), or
+    /// checked and not connected. A not-yet-probed backend counts as usable (optimistic).
     fn ai_backend_unavailable(&self) -> bool {
-        if !self.ai_enabled {
-            return false;
+        if self.local_ai.backend.is_err() {
+            return true;
         }
         let snapshot = self.ai_backend_health_snapshot();
         snapshot.checked_at.is_some() && !snapshot.connected
     }
 
-    /// Route-aware gate: does the currently selected OCR engine/model need the
-    /// Python backend to run?
-    ///
-    /// This is the single decision every OCR trigger and the load button consult so
-    /// a native ONNX route (MangaOCR ONNX / PaddleOCR under the native runtime with a
-    /// non-`Suspect` guard) is NOT blocked behind backend health, while every
-    /// backend-routed engine/model stays gated exactly as before. Backend-routed
-    /// selections behave byte-identically to the previous
-    /// `options.engine.requires_backend()` check. Reads the runtime + guard from a
-    /// short-lived cache (see `refresh_ocr_route_inputs_cache`) so this frequently
-    /// called gate never blocks the GUI thread on disk I/O.
+    /// The routing inputs (effective `AiRuntime` + provider-scoped SIGILL load guard) the
+    /// route gates use, from the short-lived cache (see `refresh_ocr_route_inputs_cache`);
+    /// callers that may run before any refresh this frame refresh first. Never reads disk.
     #[cfg(not(target_arch = "wasm32"))]
-    fn ocr_requires_backend_runtime(&mut self) -> bool {
-        self.refresh_ocr_route_inputs_cache();
-        let (runtime, guard) = self.ocr_route_inputs_cached;
-        crate::ocr::ocr_requires_backend(
+    fn ocr_route_inputs(&self) -> (ms_config::AiRuntime, ms_config::OrtLoadDecision) {
+        self.ocr_route_inputs_cached
+    }
+
+    /// Web build: no native runtime, so every local route is a backend route.
+    #[cfg(target_arch = "wasm32")]
+    fn ocr_route_inputs(&self) -> (ms_config::AiRuntime, ms_config::OrtLoadDecision) {
+        (ms_config::AiRuntime::Backend, ms_config::OrtLoadDecision::Safe)
+    }
+
+    /// Route-aware gate for the selected OCR engine/model: what it runs on, or why it cannot
+    /// run in this process (`crate::ocr::ocr_route_availability`, the single owner). An
+    /// `Ok(AiRouteKind::Backend)` additionally needs a connected backend
+    /// ([`Self::ai_backend_unavailable`]); AI API is always `Ok(Cloud)`, even under `--no-ai`.
+    /// Uses the cached route inputs (no disk I/O); `&mut self` callers refresh them first
+    /// through [`Self::current_ocr_route_availability`].
+    fn selected_ocr_route_availability(&self) -> Result<AiRouteKind, LocalAiOff> {
+        let (runtime, guard) = self.ocr_route_inputs();
+        crate::ocr::ocr_route_availability(
             self.ocr_panel_options.engine,
             &self.ocr_panel_options.manga_model,
             runtime,
             guard,
+            &self.local_ai,
         )
     }
 
-    /// Web build has no native runtime, so OCR always routes to the backend; this
-    /// preserves the historical `engine.requires_backend()` behavior verbatim.
-    #[cfg(target_arch = "wasm32")]
+    /// [`Self::selected_ocr_route_availability`] after refreshing the throttled route-input
+    /// cache, for the OCR triggers and the panel.
+    fn current_ocr_route_availability(&mut self) -> Result<AiRouteKind, LocalAiOff> {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.refresh_ocr_route_inputs_cache();
+        self.selected_ocr_route_availability()
+    }
+
+    /// Whether the selected OCR engine/model runs on the Python backend in this process.
     fn ocr_requires_backend_runtime(&mut self) -> bool {
-        self.ocr_panel_options.engine.requires_backend()
+        matches!(self.current_ocr_route_availability(), Ok(AiRouteKind::Backend))
+    }
+
+    /// Why an OCR request for the selected engine/model must be refused now, or `None`: the
+    /// route's local runtime is off (its reason), or the route needs the backend and the
+    /// backend is unavailable. The OCR triggers toast it as an error.
+    fn ocr_request_refusal(&mut self) -> Option<String> {
+        match self.current_ocr_route_availability() {
+            Err(off) => Some(off.user_message()),
+            Ok(AiRouteKind::Backend) if self.ai_backend_unavailable() => {
+                Some(t!("translation.tab.backend_unavailable_status").to_string())
+            }
+            Ok(AiRouteKind::Backend | AiRouteKind::Native | AiRouteKind::Cloud) => None,
+        }
+    }
+
+    /// The text detector's availability for the selected algorithm: the PaddleOCR route from
+    /// the cached route inputs (`detector_native_route`, the rule the detector worker applies),
+    /// checked against `local_ai` and the backend's PyTorch report.
+    fn text_detector_availability(&self) -> Result<(), DetectorUnavailable> {
+        let (runtime, guard) = self.ocr_route_inputs();
+        self.text_detector_options.algorithm.availability(
+            crate::text_detector::detector_native_route(runtime, guard),
+            &self.local_ai,
+            self.ai_backend_torch_available(),
+        )
     }
 
     /// Refreshes the cached native-runtime routing inputs from disk at most once per
@@ -1527,13 +1578,14 @@ impl TranslationTabState {
             self.ocr_route_inputs_cached = crate::ocr::read_ocr_route_inputs();
             self.ocr_route_inputs_checked_at = Some(now);
             // Publish native onnxruntime availability for UI gating. Native ORT is
-            // "armed" — considered available even before its dylib loads — when the
-            // effective runtime is Native and the SIGILL load guard is Safe. When
-            // ORT routes through the backend (runtime Backend, or native guard
-            // Suspect), native is not the ORT path, so this slot is false and ORT
+            // "armed" — considered available even before its dylib loads — when native ONNX
+            // is allowed in this process (`local_ai.native_onnx`: not `--no-ai`, and the
+            // platform has it), the effective runtime is Native and the SIGILL load guard is
+            // Safe. Otherwise native is not the ORT path, so this slot is false and ORT
             // availability falls to the backend slot (backend connected + providers).
             let (runtime, guard) = self.ocr_route_inputs_cached;
-            let native_armed = runtime == ms_config::AiRuntime::Native
+            let native_armed = self.local_ai.native_onnx.is_ok()
+                && runtime == ms_config::AiRuntime::Native
                 && guard == ms_config::OrtLoadDecision::Safe;
             ms_sysprobe::ai_backend_capabilities::set_native_ort_available(Some(native_armed));
         }
@@ -1614,9 +1666,12 @@ impl TranslationTabState {
                 // typesetting (output) language and the wrong signal here.
                 let korean_source = self.mt_panel_options.source_lang.trim().eq_ignore_ascii_case("ko");
                 let force_health_check = self.ocr_last_panel_engine != Some(selected_engine_before);
-                // Route-aware: a native ONNX selection needs no backend, so we do
-                // NOT probe backend health or mark it unavailable for it.
-                let requires_backend = self.ocr_requires_backend_runtime();
+                // Route-aware: a native ONNX or cloud selection needs no backend, so we do
+                // NOT probe backend health or mark it unavailable for it. The panel itself is
+                // never disabled as a whole: AI API OCR runs with every local runtime off
+                // (`--no-ai`, Android), and local engines self-gate on their capabilities.
+                let route = self.current_ocr_route_availability();
+                let requires_backend = matches!(route, Ok(AiRouteKind::Backend));
                 if requires_backend {
                     self.request_ai_backend_health_check(ctx, force_health_check);
                     self.sync_ocr_states_from_backend_health_snapshot();
@@ -1624,111 +1679,94 @@ impl TranslationTabState {
                 let backend_unavailable = requires_backend && self.ai_backend_unavailable();
                 let quick_selection_active = self.ocr_quick_selection_mode_active();
                 let advanced_selection_active = self.ocr_advanced_selection_mode_active();
-                let actions = ui
-                    .add_enabled_ui(self.ai_enabled, |ui| {
-                        draw_ocr_panel(
-                            ui,
-                            self.ocr_state_for_engine(self.ocr_panel_options.engine),
-                            &mut self.ocr_panel_options,
-                            self.ocr_controller.last_error(),
-                            self.ocr_controller.last_result(),
-                            self.hotkey_hints.ocr_quick_selection_mode.as_deref(),
-                            quick_selection_active,
-                            self.hotkey_hints.ocr_advanced_selection_mode.as_deref(),
-                            advanced_selection_active,
-                            &self.ocr_controller.generation_snapshot(),
-                            OcrPanelModelView { korean_source, download: model_snapshot.as_ref() },
-                        )
-                    })
-                    .inner;
-                if self.ai_enabled {
-                    if actions.options_changed {
-                        self.ocr_settings_dirty = true;
-                        if selected_engine_before != self.ocr_panel_options.engine
-                            && self.ocr_requires_backend_runtime()
-                        {
-                            self.request_ai_backend_health_check(ctx, true);
-                            self.sync_ocr_states_from_backend_health_snapshot();
-                        }
+                let actions = draw_ocr_panel(
+                    ui,
+                    self.ocr_state_for_engine(self.ocr_panel_options.engine),
+                    &mut self.ocr_panel_options,
+                    self.ocr_controller.last_error(),
+                    self.ocr_controller.last_result(),
+                    self.hotkey_hints.ocr_quick_selection_mode.as_deref(),
+                    quick_selection_active,
+                    self.hotkey_hints.ocr_advanced_selection_mode.as_deref(),
+                    advanced_selection_active,
+                    &self.ocr_controller.generation_snapshot(),
+                    OcrPanelModelView { korean_source, download: model_snapshot.as_ref() },
+                );
+                if actions.options_changed {
+                    self.ocr_settings_dirty = true;
+                    if selected_engine_before != self.ocr_panel_options.engine
+                        && self.ocr_requires_backend_runtime()
+                    {
+                        self.request_ai_backend_health_check(ctx, true);
+                        self.sync_ocr_states_from_backend_health_snapshot();
                     }
-                    self.ocr_ai_api_tasks.submit_actions(&mut self.ocr_panel_options.ai_api, actions.ai_api);
-                    self.apply_ocr_model_panel_changes(selected_engine_before, selected_variant_before, actions.model_download);
-                    if let Some(shown) = actions.stop_generation {
-                        self.stop_ocr_generation(ctx, shown);
+                }
+                self.ocr_ai_api_tasks.submit_actions(&mut self.ocr_panel_options.ai_api, actions.ai_api);
+                self.apply_ocr_model_panel_changes(selected_engine_before, selected_variant_before, actions.model_download);
+                if let Some(shown) = actions.stop_generation {
+                    self.stop_ocr_generation(ctx, shown);
+                }
+                if actions.request_load && !backend_unavailable {
+                    if let Err(off) = route {
+                        self.push_toast(ctx, off.user_message(), Severity::Error, 2.8);
+                    } else if let Some(error) = self.current_ocr_torch_requirement_error() {
+                        self.push_toast(ctx, error, Severity::Error, 2.8);
+                    } else {
+                        self.mark_ocr_load_requested_for_engine(self.ocr_panel_options.engine);
+                        self.ocr_controller.request_load(
+                            self.ocr_panel_options.engine,
+                            build_ocr_runtime_options(&self.ocr_panel_options),
+                        );
                     }
-                    if actions.request_load && !backend_unavailable {
-                        if let Some(error) = self.current_ocr_torch_requirement_error() {
-                            self.push_toast(ctx, error, Severity::Error, 2.8);
-                        } else {
-                            self.mark_ocr_load_requested_for_engine(self.ocr_panel_options.engine);
-                            self.ocr_controller.request_load(
-                                self.ocr_panel_options.engine,
-                                build_ocr_runtime_options(&self.ocr_panel_options),
-                            );
-                        }
-                    }
-                } else {
+                }
+                // The selected local engine cannot run in this process: name the runtime and
+                // the real reason (`--no-ai`, or not on this platform). Read after the panel
+                // ran, so an engine switch this frame shows its own reason.
+                if let Err(off) = self.selected_ocr_route_availability() {
                     ui.separator();
-                    ui.colored_label(
-                        ms_theme::status::WARNING,
-                        t!("translation.tab.ocr_disabled_status"),
-                    );
-                    ui.small(t!("translation.tab.ocr_restart_hint"));
+                    ui.colored_label(ms_theme::status::WARNING, off.user_message());
                 }
                 self.ocr_last_panel_engine = Some(self.ocr_panel_options.engine);
             }
             TranslationPanel::MachineTranslation => {
                 let mt_busy = self.mt_controller.is_busy();
                 let mt_can_cancel = self.mt_has_active_or_pending();
-                let actions = ui
-                    .add_enabled_ui(self.ai_enabled, |ui| {
-                        draw_machine_translation_panel(
-                            ui,
-                            MtPanelRun {
-                                busy: mt_busy,
-                                can_cancel: mt_can_cancel,
-                                progress: self.mt_progress,
-                                generation: self.mt_controller.generation_snapshot(),
-                                issues: self.mt_controller.run_issues(),
-                            },
-                            &mut self.mt_stop_notice,
-                            &mut self.mt_panel_options,
-                            !project.is_single_image(),
-                        )
-                    })
-                    .inner;
-                if self.ai_enabled {
-                    if actions.options_changed {
-                        self.mt_settings_dirty = true;
-                    }
-                    self.mt_ai_api_tasks.submit_actions(&mut self.mt_panel_options.ai_api, actions.ai_api);
-                    if actions.start_all {
-                        self.pending_mt_start_all = true;
-                    }
-                    if actions.start_page {
-                        self.pending_mt_start_page = true;
-                    }
-                    if actions.preview_request_page {
-                        self.start_ai_mt_request_preview(ctx, canvas, project, true);
-                    }
-                    if actions.preview_request_all {
-                        self.start_ai_mt_request_preview(ctx, canvas, project, false);
-                    }
-                    if actions.cancel {
-                        self.cancel_active_mt(ctx);
-                    }
-                    self.poll_ai_mt_request_preview(ctx);
-                    self.draw_ai_mt_request_preview_window(ctx);
-                } else {
-                    ui.separator();
-                    ui.colored_label(
-                        ms_theme::status::WARNING,
-                        t!("translation.tab.mt_disabled_status"),
-                    );
-                    ui.small(
-                        t!("translation.tab.mt_restart_hint"),
-                    );
+                // Machine translation (plain translators and AI API) is network code: no local
+                // AI runtime is involved, so neither `--no-ai` nor the platform gates it.
+                let actions = draw_machine_translation_panel(
+                    ui,
+                    MtPanelRun {
+                        busy: mt_busy,
+                        can_cancel: mt_can_cancel,
+                        progress: self.mt_progress,
+                        generation: self.mt_controller.generation_snapshot(),
+                        issues: self.mt_controller.run_issues(),
+                    },
+                    &mut self.mt_stop_notice,
+                    &mut self.mt_panel_options,
+                    !project.is_single_image(),
+                );
+                if actions.options_changed {
+                    self.mt_settings_dirty = true;
                 }
+                self.mt_ai_api_tasks.submit_actions(&mut self.mt_panel_options.ai_api, actions.ai_api);
+                if actions.start_all {
+                    self.pending_mt_start_all = true;
+                }
+                if actions.start_page {
+                    self.pending_mt_start_page = true;
+                }
+                if actions.preview_request_page {
+                    self.start_ai_mt_request_preview(ctx, canvas, project, true);
+                }
+                if actions.preview_request_all {
+                    self.start_ai_mt_request_preview(ctx, canvas, project, false);
+                }
+                if actions.cancel {
+                    self.cancel_active_mt(ctx);
+                }
+                self.poll_ai_mt_request_preview(ctx);
+                self.draw_ai_mt_request_preview_window(ctx);
             }
             TranslationPanel::Composition => {
                 if self.composition_rebuild_requested {
@@ -1750,14 +1788,13 @@ impl TranslationTabState {
             TranslationPanel::TextDetector => {
                 self.ensure_text_detection_storage_loaded(project);
                 let has_pages = !project.pages.is_empty();
-                let availability = self
-                    .text_detector_options
-                    .algorithm
-                    .availability(self.ai_enabled, self.ai_backend_torch_available());
-                let can_ocr_current = self.ai_enabled
+                let availability = self.text_detector_availability();
+                // OCR over detected blocks runs the selected OCR engine: its route decides.
+                let block_ocr_route = self.current_ocr_route_availability();
+                let can_ocr_current = block_ocr_route.is_ok()
                     && self.ocr_controller.state() == OcrLoadState::Ready
                     && self.has_detected_blocks_on_page(canvas.current_page_idx());
-                let can_ocr_all = self.ai_enabled
+                let can_ocr_all = block_ocr_route.is_ok()
                     && self.ocr_controller.state() == OcrLoadState::Ready
                     && self.has_detected_blocks_any();
                 let can_save =
@@ -1827,11 +1864,11 @@ impl TranslationTabState {
                     );
                 }
 
-                if !self.ai_enabled {
+                if let Err(off) = block_ocr_route {
                     ui.separator();
                     ui.colored_label(
                         ms_theme::status::WARNING,
-                        t!("translation.tab.block_ocr_disabled_status"),
+                        tf!("translation.tab.block_ocr_unavailable_status", reason = off.user_message()),
                     );
                 } else if self.ocr_controller.state() != OcrLoadState::Ready {
                     ui.separator();
@@ -3169,9 +3206,7 @@ impl TranslationTabState {
     /// [`TextDetectorAlgorithm::availability`] says it cannot run now.
     fn text_detector_run_mode(&self) -> Result<TextDetectorRunMode, String> {
         let algorithm = self.text_detector_options.algorithm;
-        algorithm
-            .availability(self.ai_enabled, self.ai_backend_torch_available())
-            .map_err(|reason| reason.status_text(algorithm).to_string())?;
+        self.text_detector_availability().map_err(|reason| reason.status_text(algorithm))?;
         Ok(self.text_detector_options.run_mode())
     }
 
@@ -3271,13 +3306,8 @@ impl TranslationTabState {
         project: &ProjectData,
         mut indices: Vec<usize>,
     ) {
-        if !self.ai_enabled {
-            self.push_toast(
-                ctx,
-                t!("translation.tab.ocr_disabled_status").to_string(),
-                Severity::Warning,
-                2.6,
-            );
+        if let Err(off) = self.current_ocr_route_availability() {
+            self.push_toast(ctx, off.user_message(), Severity::Warning, 2.6);
             return;
         }
         if let Some(error) = self.current_ocr_torch_requirement_error() {
@@ -4373,15 +4403,6 @@ impl TranslationTabState {
         project: &ProjectData,
         items: Vec<MtTranslateItem>,
     ) {
-        if !self.ai_enabled {
-            self.push_toast(
-                ctx,
-                t!("translation.tab.mt_disabled_status").to_string(),
-                Severity::Warning,
-                2.6,
-            );
-            return;
-        }
         if self.mt_controller.is_busy() {
             self.push_toast(
                 ctx,
@@ -4463,15 +4484,6 @@ impl TranslationTabState {
     ) {
         // Preview is meaningful only for the AI API path; plain translators have no request context.
         if self.mt_panel_options.active_tab != MtPanelTab::AiApi {
-            return;
-        }
-        if !self.ai_enabled {
-            self.push_toast(
-                ctx,
-                t!("translation.tab.mt_disabled_status").to_string(),
-                Severity::Warning,
-                2.6,
-            );
             return;
         }
         let items = self.collect_ai_mt_scope_items(canvas, project, current_page_only);
@@ -4911,7 +4923,7 @@ impl TranslationTabState {
         canvas: &CanvasView,
         project: &ProjectData,
     ) {
-        if !self.ai_enabled {
+        if self.current_ocr_route_availability().is_err() {
             self.ocr_selection = None;
             return;
         }
@@ -5134,22 +5146,8 @@ impl TranslationTabState {
         };
         match action {
             AdvancedRecognitionAction::Recognize { image_override_png } => {
-                if !self.ai_enabled {
-                    self.push_toast(
-                        ctx,
-                        t!("translation.tab.ocr_disabled_status").to_string(),
-                        Severity::Warning,
-                        2.6,
-                    );
-                    return;
-                }
-                if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
-                    self.push_toast(
-                        ctx,
-                        t!("translation.tab.backend_unavailable_status").to_string(),
-                        Severity::Error,
-                        2.6,
-                    );
+                if let Some(refusal) = self.ocr_request_refusal() {
+                    self.push_toast(ctx, refusal, Severity::Error, 2.6);
                     return;
                 }
                 if let Some(error) = self.current_ocr_torch_requirement_error() {
@@ -5191,22 +5189,8 @@ impl TranslationTabState {
                 }
             }
             AdvancedRecognitionAction::QuickRecognizeSelection { image_override_png } => {
-                if !self.ai_enabled {
-                    self.push_toast(
-                        ctx,
-                        t!("translation.tab.ocr_disabled_status").to_string(),
-                        Severity::Warning,
-                        2.6,
-                    );
-                    return;
-                }
-                if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
-                    self.push_toast(
-                        ctx,
-                        t!("translation.tab.backend_unavailable_status").to_string(),
-                        Severity::Error,
-                        2.6,
-                    );
+                if let Some(refusal) = self.ocr_request_refusal() {
+                    self.push_toast(ctx, refusal, Severity::Error, 2.6);
                     return;
                 }
                 if let Some(error) = self.current_ocr_torch_requirement_error() {
@@ -5275,22 +5259,8 @@ impl TranslationTabState {
         scene_rect: Rect,
         recent_character_rank: Option<usize>,
     ) {
-        if !self.ai_enabled {
-            self.push_toast(
-                ctx,
-                t!("translation.tab.ocr_disabled_status").to_string(),
-                Severity::Warning,
-                2.6,
-            );
-            return;
-        }
-        if self.ocr_requires_backend_runtime() && self.ai_backend_unavailable() {
-            self.push_toast(
-                ctx,
-                t!("translation.tab.backend_unavailable_status").to_string(),
-                Severity::Error,
-                2.6,
-            );
+        if let Some(refusal) = self.ocr_request_refusal() {
+            self.push_toast(ctx, refusal, Severity::Error, 2.6);
             return;
         }
         if let Some(error) = self.current_ocr_torch_requirement_error() {
@@ -5693,7 +5663,7 @@ impl CanvasHooks for TranslationTabState {
         if Self::image_crop_selection_mode_active(ctx) || self.image_crop_selection.is_some() {
             return true;
         }
-        if !self.ai_enabled {
+        if self.selected_ocr_route_availability().is_err() {
             return false;
         }
         if self.advanced_recognition.is_open() {
@@ -5955,7 +5925,7 @@ impl CanvasHooks for TranslationTabState {
                         });
                 });
         }
-        if self.ai_enabled && self.active_panel == TranslationPanel::Ocr {
+        if self.active_panel == TranslationPanel::Ocr {
             ctx.request_repaint_after(Duration::from_millis(350));
         }
         if self.ocr_quick_selection_mode_active()

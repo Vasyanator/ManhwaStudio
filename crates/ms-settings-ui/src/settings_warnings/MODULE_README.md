@@ -48,8 +48,10 @@ GUI frame: poll() -> WarningSet -> item_warning_badge / section_level / overall_
   here; else Yellow: CPU fallback for a build-level cause). OnnxProvider (Yellow: CPU fallback
   for an EP-level cause). OnnxDevice (Yellow: no fallback, the EP consumes the id, and the
   persisted id does not name an offered device). OrtCrashGuard (Red: the guard of the scope
-  the next native load reads is `Suspect`). Every AI check is silent under `--no-ai`; the native family is silent unless the
-  runtime is `Native`. Registration (Windows: StartMenu, ProgramEntry — App Paths folds into
+  the next native load reads is `Suspect`). The backend checks are silent when the process may not
+  use the backend (`CheckContext::backend_enabled`: `--no-ai` or platform), the native family when it
+  may not use native ONNX (`native_onnx_enabled`) or the EFFECTIVE runtime
+  (`local_ai::effective_ai_runtime`) is not `Native`. Registration (Windows: StartMenu, ProgramEntry — App Paths folds into
   it —, OpenWith; Linux: StartMenu, OpenWith; Yellow `RegistrationBroken`): a record that is
   `badge_worthy` AND has an action in `allowed_actions`, so every badge is clearable from the
   System registration tab (Linux system-wide entries and unreadable records never badge).

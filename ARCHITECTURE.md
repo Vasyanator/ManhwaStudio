@@ -350,8 +350,11 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
 
 - **Two runtimes.** In-process native ONNX (`ms-onnx` sessions, `ms-onnx-runtime` library
   resolver/downloader, `ms-native-runtime` manager) and the out-of-process Python backend.
-  `ms_config::AiRuntime::from_user_settings` picks the effective one: native unless the user
-  explicitly chose the backend (`General.ai_runtime_configured`).
+  `ms_tab_translation::local_ai::effective_ai_runtime` picks the effective one: native unless the
+  user explicitly chose the backend (`General.ai_runtime_configured`) on a platform that has it.
+  `--no-ai` turns off the LOCAL runtimes only (backend and native ONNX); cloud AI API OCR / MT and
+  non-AI machine translation are never gated by it. Per-route availability has one owner,
+  `local_ai::AiRouteKind::availability` (cloud / native / backend).
 - **Backend boundary.** Framed, multiplexed IPC (`ms-backend-ipc`): AF_UNIX socket on unix,
   token-authenticated loopback WebSocket on Windows. Every Rust caller uses
   `ms_backend_ipc::shared_client()`. Method and topic names live in
@@ -409,7 +412,9 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   deletes).
 - **Log** (`ms-log`) — session log `last.log` / `previous.log` and opt-in trace log, each with
   its own writer thread; callers pass the directory in.
-- **Credentials** — secrets live only in the OS keyring, never in a config file: AI API keys
+- **Credentials** — secrets live only in the platform credential store, never in a config file
+  (desktop: the OS keyring; Android: the Keystore-backed `ms_platform::credentials` store over the
+  Kotlin `CredentialBridge`, where an undecryptable value is an error, never "no key"): AI API keys
   (`ms_ai_api::keys`; per service, per service + base URL for compatible endpoints, and frozen
   `image_edit:{provider}[@{region}]` names for image-edit providers) and the Hugging Face token (`ms_sysprobe::hf_token`, a cached
   process-wide value seeded off-thread). Keyring I/O never runs on the GUI thread; a token is

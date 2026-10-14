@@ -24,8 +24,9 @@ pub enum AiApiError {
     KeyringUnavailable { detail: String },
     /// Key storage was requested on the web build, which has no credential store.
     KeyStoreWebUnavailable,
-    /// Key storage was requested on a platform without an OS credential store in this build
-    /// (Android); the typed capability answer for `PlatformFeature::CredentialStore`.
+    /// Key storage was requested where no credential store is reachable (an Android APK
+    /// without the Kotlin `CredentialBridge`); the typed capability answer for
+    /// `PlatformFeature::CredentialStore`.
     KeyStoreUnavailable(ms_platform::Unavailable),
     /// An empty (or whitespace-only) key was offered for storage.
     EmptyKey,
