@@ -23,7 +23,8 @@ Key structures:
 - `StudioScreen`: phases `Loading` (polls the worker, shows progress and the large-set
   confirmation), `Failed` (error screen with back-to-launcher / exit buttons), `Cancelled` (the
   user cancelled the open: leaves for the launcher at once), `Running` (delegates `ui` to
-  `MangaApp`).
+  `MangaApp`, and forwards the shell's question about delivered images:
+  `request_close_for_incoming`, `take_incoming_declined`).
 - `StudioExit`: the screen's exits (studio close, reload, the two error-screen buttons).
 
 Key functions:
@@ -116,7 +117,6 @@ impl ImageSources {
     /// This set followed by `later`: files, skipped documents and inbox batches are each
     /// concatenated in order, so pages delivered later come after the earlier ones.
     #[must_use]
-    #[cfg_attr(not(test), expect(dead_code, reason = "consumed by the shell's external-delivery merge (`screen::merge_open`, plan WP7); remove this attribute when WP7 lands"))]
     pub fn merged(mut self, later: Self) -> Self {
         self.files.extend(later.files);
         self.skipped.extend(later.skipped);
@@ -637,8 +637,9 @@ impl StudioScreen {
     /// The shell deferred an OS close until the worker delivers: an image-set open is stopped
     /// (its pending question answered "no") so the close never waits on the user. Not a user
     /// cancel: the cancelled load then ends the program through the table's close-after-load row.
-    /// Idempotent; a project load is left to finish (it may be mid-write).
-    fn cancel_for_close(&mut self) {
+    /// Idempotent; a project load is left to finish (it may be mid-write). Called from the shell's
+    /// `logic` (so a minimized window stops the open too) and from `ui`.
+    pub(crate) fn cancel_for_close(&mut self) {
         if self.image_set
             && let Phase::Loading(loading) = &mut self.phase
         {
@@ -674,6 +675,25 @@ impl StudioScreen {
     pub(crate) fn request_os_close(&mut self) {
         if let Phase::Running(app) = &mut self.phase {
             app.request_os_close();
+        }
+    }
+
+    /// Asks the running studio whether it may close for `count` externally delivered images
+    /// (`MangaApp::request_close_for_incoming`). `false` outside `Running`, or when the studio is
+    /// already closing for another reason: the caller then drops the images.
+    pub(crate) fn request_close_for_incoming(&mut self, count: usize) -> bool {
+        match &mut self.phase {
+            Phase::Running(app) => app.request_close_for_incoming(count),
+            Phase::Loading(_) | Phase::Failed { .. } | Phase::Cancelled => false,
+        }
+    }
+
+    /// Whether the user declined the externally delivered images since the last call
+    /// (`MangaApp::take_incoming_declined`); always `false` outside `Running`.
+    pub(crate) fn take_incoming_declined(&mut self) -> bool {
+        match &mut self.phase {
+            Phase::Running(app) => app.take_incoming_declined(),
+            Phase::Loading(_) | Phase::Failed { .. } | Phase::Cancelled => false,
         }
     }
 

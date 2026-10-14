@@ -2,35 +2,37 @@
 File: src/single_image/controller.rs
 
 Purpose:
-`SingleImageController`, the single-image session's save controller (one `MangaApp` field, `Some`
-only in that mode). It owns the pure `SaveMachine` and performs its side effects: the native
-«Сохранить как» file dialog (`ms_platform::file_dialog::pick_blocking`) and the `user_config`
-quality write (both on workers), the per-frame drive of
-`TypingTabState::prepare_flatten_to_file`, the GUI-thread dispatch sequence (PS flush,
-typing flush, baseline capture, `request_flatten_to_file`), the per-frame `poll_flatten_to_file`,
-the window-title update after «Сохранить как», and the top bar (with the «Сохранить как…» format
-panel) / JPEG options UI.
+`SingleImageController`, the image-set (single-image) session's save controller (one `MangaApp`
+field, `Some` only in that mode). It owns the pure `SaveMachine` and performs its side effects: the
+native «Сохранить как» file dialog and the folder dialog (`ms_platform::file_dialog::pick_blocking`,
+on workers), the commit of a dialog target and the `user_config` quality write (workers), the
+per-frame drive of `TypingTabState::prepare_flatten_to_file` for the page the machine names, the
+GUI-thread dispatch sequence (PS flush, typing flush, baseline capture, `request_flatten_to_file`),
+the per-frame `poll_flatten_to_file`, the window title (synced once after the open, then after a
+save moved page 0's file), and the UI: the top bar (with the «Сохранить как…» format panel), the
+JPEG options, the folder overwrite confirmation and the skipped-files notice.
 
 Key structures:
 - `SingleImageController`
 
 Key functions:
-- `SingleImageController::from_project()`: `Some` for a single-image `ProjectData`.
+- `SingleImageController::from_project()`: `Some` for an image-set `ProjectData`.
 - `tick()`: call EVERY frame, whatever tab is active (it is also the app's one
   `poll_flatten_to_file` caller, which the typing tab requires).
 - `draw_top_bar()` (also the format panel, `draw_format_panel`) / `draw_dialogs()`;
   `request_save*()`, `abandon_pending()`.
 
 Notes:
-The GUI thread does no file I/O here: the picker, the flatten (compose, encode, atomic write), the
-commit of a dialog target (`spawn_commit`, after the flatten wrote its write path; a failure is a
-failed save) and the quality persistence run on workers; the GUI thread only snapshots, flushes into the in-memory
-savers and polls channels. Encoding policy of a save (plan D7): PNG / WebP drop alpha only when
-fully opaque, JPEG is flattened over white at the session quality, the source's ICC profile is
-re-embedded. Dirty inputs are defined here (`edit_stamp`, `deferred_edits`); the machine only
-compares them. The picker worker re-asks with the full name when the chosen format changed the
-answer's name (extension appended or replaced) and that file exists, so the native overwrite
-confirmation always saw the written name.
+The GUI thread does no file I/O here: the pickers (and the folder's "has entries" probe), the
+flatten (compose, digest, encode, atomic write), the commit of a dialog target (after the stage's
+files were written; a failure fails those pages) and the quality persistence run on workers; the
+GUI thread only snapshots, flushes into the in-memory savers and polls channels. Encoding policy of
+a save (plan D7): PNG / WebP drop alpha only when fully opaque, JPEG is flattened over white at the
+session quality, the page's source ICC profile is re-embedded. Dirty inputs are defined here
+(`edit_stamp`, `deferred_edits`); the machine only compares them. The file picker worker re-asks
+with the full name when the chosen format changed the answer's name (extension appended or
+replaced) and that file exists, so the native overwrite confirmation always saw the written name;
+a folder that already holds entries is confirmed by the machine's `ConfirmFolder` dialog.
 
 The format panel is an `egui::Popup` (`PopupKind::Menu` -> `Order::Foreground`) whose open state is
 the machine's `Phase::ChoosingFormat`, not egui memory. It blocks the canvas the same way the exit
@@ -39,19 +41,19 @@ takes the hover / click / drag) — and, being a popup, also sets `Context::any_
 cleaning and PS-editor canvas gates check on top of `layer_id_at`.
 */
 
-use super::dialogs::{JpegOptionsChoice, draw_jpeg_options_dialog};
-use super::machine::{Next, Phase, SaveError, SaveMachine, SaveTarget, Status, Step, changed_name_needs_confirmation, save_as_filter_extensions, save_as_suggestion};
+use super::dialogs::{JpegOptionsChoice, draw_folder_overwrite_dialog, draw_jpeg_options_dialog, draw_skipped_notice};
+use super::machine::{Commit, FormatNote, Next, PageJob, PageResult, PageSource, SaveError, SaveMachine, SaveTarget, Status, Step, changed_name_needs_confirmation, save_as_filter_extensions, save_as_suggestion};
 use super::{SaveOutcome, SaveParts, image_window_title};
 use crate::app::PendingCloseAction;
 use crate::models::autosave_gate::AutosaveGate;
 use crate::project::{ProjectData, SessionKind, SingleImageSession};
 use crate::runtime_log;
-use crate::tabs::typing::image_encode::{AlphaPolicy, ImageEncoding, ImageSaveFormat};
 use crate::tabs::ps_editor::PsEditorTabState;
-use crate::tabs::typing::{FlattenDestination, FlattenOutcome, FlattenReadiness, FlattenToFileRequest, TypingTabState};
+use crate::tabs::typing::image_encode::{AlphaPolicy, ImageEncoding, ImageSaveFormat};
+use crate::tabs::typing::{FlattenOutcome, FlattenReadiness, FlattenToFileRequest, TypingTabState};
 use eframe::egui;
 use ms_platform::PlatformFeature;
-use ms_platform::file_dialog::{self, DialogKind, FileDialogError, FileDialogRequest, Picked, SaveTarget as DialogTarget};
+use ms_platform::file_dialog::{self, DialogKind, FileDialogError, FileDialogRequest, FolderTarget, Picked, SaveTarget as DialogTarget};
 use ms_thread as thread;
 use serde_json::Value;
 use std::path::Path;
@@ -72,19 +74,25 @@ const FORMAT_PANEL_ID: &str = "single_image.save_as.format_panel";
 /// What the format panel answered this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormatPanelChoice {
-    /// Save in this format (the file dialog opens next).
+    /// Save in this format (the file or folder dialog opens next).
     Format(ImageSaveFormat),
     /// «✕» or Escape: close the panel without saving.
     Cancel,
 }
 
-/// Save controller of one single-image session (see the file header).
+/// Answer of the folder dialog worker: the folder and whether it already holds entries, `None` =
+/// cancelled, `Err` = no dialog could be shown.
+type FolderAnswer = Result<Option<(FolderTarget, bool)>, FileDialogError>;
+
+/// Save controller of one image-set session (see the file header).
 pub(crate) struct SingleImageController {
     session: Arc<SingleImageSession>,
     machine: SaveMachine,
     /// Result of the file dialog while `Phase::PickingPath` (`Ok(None)` = cancelled, `Err` = no
     /// dialog could be shown).
     picker_rx: Option<Receiver<Result<Option<DialogTarget>, FileDialogError>>>,
+    /// Result of the folder dialog while `Phase::PickingFolder`.
+    folder_rx: Option<Receiver<FolderAnswer>>,
     /// Result of the commit worker while `Phase::Committing`.
     commit_rx: Option<Receiver<Result<(), FileDialogError>>>,
     /// Result of the last JPEG quality persistence.
@@ -94,44 +102,70 @@ pub(crate) struct SingleImageController {
     /// A save step produced outside `tick` / `draw_dialogs` (the format panel closed during a
     /// save-then-close, from the top bar or the hotkey), reported by the next `tick`.
     deferred_step: Step,
+    /// «Стоп» / «Отмена» was clicked in the top bar; applied by the next `tick`, which has the
+    /// dirty inputs the machine needs.
+    stop_requested: bool,
+    /// The skipped-files notice is still shown (opened once when the open left files out).
+    skipped_notice_open: bool,
+    /// The window title was set from the opened pages (the startup title named the request).
+    title_synced: bool,
 }
 
 impl SingleImageController {
-    /// The controller of `project`'s single-image session, or `None` for a project session.
+    /// The controller of `project`'s image-set session, or `None` for a project session.
     /// `user_settings` is the startup `user_config` root (JPEG quality default).
     pub(crate) fn from_project(project: &ProjectData, user_settings: &Value) -> Option<Self> {
         let SessionKind::SingleImage(session) = project.session() else {
             return None;
         };
-        // Only page 0 (the session's first file) is saved here. The studio still opens one-file
-        // sets only; removal condition: the per-page save sequencing of the image-set plan (WP6)
-        // replaces this single target.
-        let source = session.first_source();
-        let in_place = ImageSaveFormat::in_place_for(source).map(|format| SaveTarget { path: source.source_path.clone(), format });
+        let pages: Vec<PageSource> = session
+            .sources()
+            .iter()
+            .map(|facts| PageSource {
+                source_path: facts.source_path.clone(),
+                in_place: ImageSaveFormat::in_place_for(facts).map(|format| SaveTarget { path: facts.source_path.clone(), format }),
+                opened_digest: facts.opened_digest,
+                animated: facts.source_animated,
+            })
+            .collect();
+        let first = session.first_source();
         runtime_log::log_info(format!(
-            "[single_image] session opened.\nSource: {}\nPages: {}\nFormat: {}\nIn-place save: {:?}\nAnimated: {}",
-            source.source_path.display(),
+            "[single_image] session opened.\nFirst source: {}\nPages: {}\nFirst format: {}\nPages with an in-place target: {}\nAnimated pages: {}\nSkipped files: {}",
+            first.source_path.display(),
             session.page_count(),
-            source.source_format.as_str(),
-            in_place.as_ref().map(|target| target.format),
-            source.source_animated
+            first.source_format.as_str(),
+            pages.iter().filter(|page| page.in_place.is_some()).count(),
+            pages.iter().filter(|page| page.animated).count(),
+            session.skipped().len()
         ));
-        let machine = SaveMachine::new(in_place, ms_config::single_image::jpeg_quality_from(user_settings), source.source_animated, picked_paths_are_user_files());
-        Some(Self { session: Arc::clone(session), machine, picker_rx: None, commit_rx: None, persist_rx: None, status_shown: None, deferred_step: Step::Nothing })
+        let machine = SaveMachine::new(pages, ms_config::single_image::jpeg_quality_from(user_settings), picked_paths_are_user_files());
+        Some(Self {
+            skipped_notice_open: !session.skipped().is_empty(),
+            session: Arc::clone(session),
+            machine,
+            picker_rx: None,
+            folder_rx: None,
+            commit_rx: None,
+            persist_rx: None,
+            status_shown: None,
+            deferred_step: Step::Nothing,
+            stop_requested: false,
+            title_synced: false,
+        })
     }
 
-    /// The image differs from the last successful write to the file (plan D6): the edit stamp
-    /// moved, or an edit is still deferred in typing or the PS editor.
+    /// The image differs from the last fully successful save (plan D6): the edit stamp moved, or
+    /// an edit is still deferred in typing or the PS editor.
     pub(crate) fn is_dirty(&self, gate: &AutosaveGate, typing: &TypingTabState, ps_editor: &PsEditorTabState) -> bool {
         self.machine.is_dirty(edit_stamp(gate, typing), deferred_edits(typing, ps_editor))
     }
 
-    /// The file is being written right now (a close must wait for it).
+    /// A file is being written or committed right now (a close must wait for it).
     pub(crate) fn write_in_flight(&self) -> bool {
         self.machine.writing()
     }
 
-    /// «Сохранить» (opens the format panel when the image has no in-place target).
+    /// «Сохранить» (one page without an in-place target: opens the format panel).
     pub(crate) fn request_save(&mut self) {
         self.machine.request_save();
     }
@@ -149,80 +183,90 @@ impl SingleImageController {
     }
 
     /// The window closes without saving: drop every save step that has not started writing. An
-    /// open native file dialog's answer is ignored (its channel is dropped).
+    /// open native dialog's answer is ignored (its channel is dropped).
     pub(crate) fn abandon_pending(&mut self) {
         self.machine.abandon_pending();
         self.picker_rx = None;
+        self.folder_rx = None;
     }
 
-    /// Per-frame drive. Polls the file dialog and the quality write, advances a preparing save and
-    /// dispatches it once the composite inputs are ready, polls the flatten worker (every frame, as
-    /// the typing tab requires), retitles the window after «Сохранить как» and times transient
-    /// statuses. Returns what the app must do when a save-then-close ended.
+    /// Per-frame drive. Polls the dialogs and the quality write, applies a requested stop, advances
+    /// the page being prepared and dispatches it once its composite inputs are ready, polls the
+    /// flatten worker (every frame, as the typing tab requires), starts and polls a commit, keeps
+    /// the window title in step and times transient statuses. Returns what the app must do when a
+    /// save-then-close ended.
     pub(crate) fn tick(&mut self, ctx: &egui::Context, parts: SaveParts<'_>) -> Option<SaveOutcome> {
         let SaveParts { project, typing, ps_editor, gate } = parts;
         self.poll_persist();
         let deferred = std::mem::replace(&mut self.deferred_step, Step::Nothing);
         let mut step = merge_steps(deferred, self.poll_picker());
-        if let Phase::Preparing { target } = self.machine.phase() {
-            let target = target.clone();
-            // The session saves its first page; a chapter without pages has nothing to prepare, and
-            // `dispatch` refuses it with `NoPage`.
-            let readiness = project.pages.first().map_or(FlattenReadiness::Ready, |page| typing.prepare_flatten_to_file(ctx, project, page.idx));
-            match readiness {
+        step = merge_steps(step, self.poll_folder_picker());
+        if std::mem::take(&mut self.stop_requested) {
+            runtime_log::log_info("[single_image] save stopped by the user");
+            let stopped = self.machine.stop(edit_stamp(gate, typing), deferred_edits(typing, ps_editor));
+            step = merge_steps(step, stopped);
+        }
+        if let Some(job) = self.machine.job_to_prepare().cloned() {
+            match typing.prepare_flatten_to_file(ctx, project, job.page_idx) {
                 FlattenReadiness::Preparing { .. } => {}
                 FlattenReadiness::Ready => {
-                    // Dispatch sequence (plan WP-2.4), all cheap GUI-thread calls: push the PS editor's
-                    // active-page rasters and typing's deferred text into the savers (the flatten worker
-                    // barriers them), THEN capture the baseline — the flushes note actions themselves
-                    // and clear the deferred flags, so a successful write leaves the session clean.
-                    ps_editor.flush_layers(project);
-                    if let Err(err) = typing.flush_text_layers() {
-                        // The flatten composes from the live document, not from staging, so the file is
-                        // still correct; only the scratch staging copy is behind.
-                        runtime_log::log_warn(format!("[single_image] text flush before save failed; the save composes from the live document.\nTarget: {}\nError: {err:?}", target.path.display()));
+                    if self.machine.flush_due() {
+                        // Dispatch sequence (plan WP-2.4), all cheap GUI-thread calls, once per save
+                        // stage: push the PS editor's active-page rasters and typing's deferred text into
+                        // the savers (the flatten worker barriers them), THEN capture the baseline — the
+                        // flushes note actions themselves and clear the deferred flags, so a fully
+                        // successful save leaves the session clean.
+                        ps_editor.flush_layers(project);
+                        if let Err(err) = typing.flush_text_layers() {
+                            // The flatten composes from the live document, not from staging, so the files
+                            // are still correct; only the scratch staging copy is behind.
+                            runtime_log::log_warn(format!("[single_image] text flush before save failed; the save composes from the live document.\nPage: {}\nError: {err:?}", job.page_idx));
+                        }
                     }
                     let baseline = edit_stamp(gate, typing);
-                    self.dispatch(ctx, project, typing, &target, baseline);
+                    let dispatched = self.dispatch(ctx, project, typing, &job, baseline, deferred_edits(typing, ps_editor));
+                    step = merge_steps(step, dispatched);
                 }
             }
         }
         if let Some(result) = typing.poll_flatten_to_file() {
-            let result = result.map(|report| match report.outcome {
-                FlattenOutcome::Written { target, bytes_written } => runtime_log::log_info(format!("[single_image] saved.\nPage: {}\nTarget: {}\nBytes: {bytes_written}", report.page_idx, target.display())),
-                // Not requested by this controller (it always writes, `unchanged_if: None`); logged
-                // should a future request shape reach this path.
-                outcome @ (FlattenOutcome::Unchanged | FlattenOutcome::Composed) => runtime_log::log_warn(format!("[single_image] the flatten wrote nothing.\nPage: {}\nOutcome: {outcome:?}", report.page_idx)),
-            });
-            let result = result.map_err(|err| SaveError::from_flatten(&err));
+            let result = result
+                .map(|report| match report.outcome {
+                    FlattenOutcome::Written { target, bytes_written } => {
+                        runtime_log::log_info(format!("[single_image] page saved.\nPage: {}\nTarget: {}\nBytes: {bytes_written}", report.page_idx, target.display()));
+                        PageResult::Written(report.digest)
+                    }
+                    FlattenOutcome::Unchanged => PageResult::Unchanged,
+                    FlattenOutcome::Composed => PageResult::Composed,
+                })
+                .map_err(|err| SaveError::from_flatten(&err));
             if !self.machine.writing() {
                 runtime_log::log_warn(format!("[single_image] a flatten result arrived with no save in progress; ignored.\nResult: {result:?}"));
             }
             let finished = self.machine.write_finished(result, edit_stamp(gate, typing), deferred_edits(typing, ps_editor));
             step = merge_steps(step, finished);
-            if let Some(target) = self.machine.take_commit() {
-                self.spawn_commit(target);
-            }
+        }
+        if let Some(commit) = self.machine.take_commit() {
+            self.spawn_commit(commit);
         }
         if let Some(result) = self.poll_commit() {
             let finished = self.machine.commit_finished(result, edit_stamp(gate, typing), deferred_edits(typing, ps_editor));
             step = merge_steps(step, finished);
         }
-        if let Some(path) = self.machine.take_retitle() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(image_window_title(env!("MS_APP_VERSION"), &path, 1)));
-        }
+        self.sync_title(ctx);
         self.time_status(ctx);
         if self.machine.busy() && !self.machine.choosing_format() {
-            // Picker, preparation and write all finish without an input event (the format panel
-            // only changes on input).
+            // Pickers, preparation, writes and commits all finish without an input event (the
+            // format panel and the confirmation dialogs only change on input).
             ctx.request_repaint_after(web_time::Duration::from_millis(100));
         }
         step_outcome(step)
     }
 
-    /// Draws «Сохранить» / «Сохранить как» and the status line into the top bar, and the format
-    /// panel under «Сохранить как» while it is open. The caller's layout is right-to-left, so items
-    /// are added from the right edge inward.
+    /// Draws «Сохранить» / «Сохранить как» and the status line into the top bar, the format panel
+    /// under «Сохранить как» while it is open, and «Отмена» (one page, while preparing) or «Стоп»
+    /// (an image-set pass). The caller's layout is right-to-left, so items are added from the right
+    /// edge inward.
     pub(crate) fn draw_top_bar(&mut self, ui: &mut egui::Ui) {
         let busy = self.machine.busy();
         let choosing = self.machine.choosing_format();
@@ -231,8 +275,8 @@ impl SingleImageController {
         if save_as.clicked() {
             self.request_save_as(ui.ctx());
         }
-        if self.machine.choosing_format() {
-            match draw_format_panel(ui, &save_as) {
+        if let Some(note) = self.machine.format_panel_note() {
+            match draw_format_panel(ui, &save_as, note) {
                 None => {}
                 Some(FormatPanelChoice::Format(format)) => {
                     runtime_log::log_info(format!("[single_image] save format chosen: {}", format.label()));
@@ -248,37 +292,60 @@ impl SingleImageController {
         if ui.add_enabled(!busy, egui::Button::new(t!("app.menu.save_image_button"))).clicked() {
             self.request_save();
         }
-        if matches!(self.machine.phase(), Phase::Preparing { .. })
-            && ui.button(t!("single_image.save.cancel_button")).on_hover_text(t!("single_image.save.cancel_tooltip")).clicked()
-        {
-            runtime_log::log_info("[single_image] save cancelled while preparing");
-            self.machine.cancel_preparing();
+        if self.machine.pass_running() {
+            if ui.add_enabled(!self.stop_requested, egui::Button::new(t!("single_image.save.stop_button"))).on_hover_text(t!("single_image.save.stop_tooltip")).clicked() {
+                self.request_stop(ui.ctx());
+            }
+        } else if self.machine.job_to_prepare().is_some() && ui.button(t!("single_image.save.cancel_button")).on_hover_text(t!("single_image.save.cancel_tooltip")).clicked() {
+            self.request_stop(ui.ctx());
         }
+        let single = self.machine.page_count() == 1;
         let (status, _) = self.machine.status();
         if let Some(status) = status {
-            let text = status_text(status);
-            if matches!(status, Status::Error(_)) {
+            let text = status_text(status, single);
+            let label = if matches!(status, Status::Error(_) | Status::Partial { .. }) {
                 let color = ui.visuals().error_fg_color;
-                ui.label(egui::RichText::new(text).color(color));
+                ui.label(egui::RichText::new(text).color(color))
             } else {
-                ui.label(text);
+                ui.label(text)
+            };
+            if let Status::Partial { failed, .. } = status {
+                label.on_hover_text(failed_pages_text(failed));
             }
         }
     }
 
-    /// Draws the JPEG options dialog while a save waits on it. Returns `ReturnToExitDialog` when it
-    /// was cancelled during a save-then-close.
+    /// Draws the dialogs of the session: the skipped-files notice (once after the open), the
+    /// folder overwrite confirmation and the JPEG options while a save waits on them. Returns
+    /// `ReturnToExitDialog` when a save-then-close was cancelled in one of them.
     pub(crate) fn draw_dialogs(&mut self, ctx: &egui::Context) -> Option<SaveOutcome> {
-        let quality = self.machine.jpeg_options_quality_mut()?;
-        match draw_jpeg_options_dialog(ctx, quality)? {
-            JpegOptionsChoice::Save => {
-                if let Some(quality) = self.machine.confirm_jpeg_options() {
-                    self.persist_quality(quality);
-                }
-                None
-            }
-            JpegOptionsChoice::Cancel => step_outcome(self.machine.cancel_jpeg_options()),
+        if self.skipped_notice_open && draw_skipped_notice(ctx, self.session.skipped()) {
+            self.skipped_notice_open = false;
         }
+        let mut step = Step::Nothing;
+        if let Some(folder) = self.machine.confirm_folder_name().map(str::to_owned)
+            && let Some(replace) = draw_folder_overwrite_dialog(ctx, &folder)
+        {
+            runtime_log::log_info(format!("[single_image] non-empty save folder {}.\nFolder: {folder}", if replace { "accepted" } else { "declined" }));
+            step = merge_steps(step, self.machine.confirm_folder(replace));
+        }
+        if let Some(quality) = self.machine.jpeg_options_quality_mut() {
+            match draw_jpeg_options_dialog(ctx, quality) {
+                None => {}
+                Some(JpegOptionsChoice::Save) => {
+                    if let Some(quality) = self.machine.confirm_jpeg_options() {
+                        self.persist_quality(quality);
+                    }
+                }
+                Some(JpegOptionsChoice::Cancel) => step = merge_steps(step, self.machine.cancel_jpeg_options()),
+            }
+        }
+        step_outcome(step)
+    }
+
+    /// The native file or folder dialog is open (it cannot be closed from here).
+    pub(crate) fn picker_open(&self) -> bool {
+        self.machine.picking_path()
     }
 
     /// Starts the side effect a format choice asked for.
@@ -286,6 +353,7 @@ impl SingleImageController {
         match next {
             Next::Nothing => {}
             Next::OpenPicker(format) => self.spawn_picker(format),
+            Next::OpenFolderPicker(format) => self.spawn_folder_picker(format),
         }
     }
 
@@ -295,6 +363,24 @@ impl SingleImageController {
             self.deferred_step = merge_steps(self.deferred_step, step);
             ctx.request_repaint();
         }
+    }
+
+    /// Remembers a stop click for the next `tick` and schedules that frame.
+    fn request_stop(&mut self, ctx: &egui::Context) {
+        self.stop_requested = true;
+        ctx.request_repaint();
+    }
+
+    /// Sets the window title from the opened pages once (the startup title named the REQUESTED
+    /// files, some of which may have been skipped), and again whenever a save moved page 0's file.
+    fn sync_title(&mut self, ctx: &egui::Context) {
+        let moved = self.machine.take_retitle();
+        if self.title_synced && moved.is_none() {
+            return;
+        }
+        self.title_synced = true;
+        let first = moved.unwrap_or_else(|| self.session.first_source().source_path.clone());
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(image_window_title(env!("MS_APP_VERSION"), &first, self.machine.page_count())));
     }
 
     /// Opens the native save dialog on a worker, filtered to `format`, in the current target's (else
@@ -331,15 +417,43 @@ impl SingleImageController {
         self.picker_rx = Some(rx);
     }
 
-    /// Publishes the written file to its dialog target on a worker (`SaveTarget::commit` blocks on
-    /// Android; a no-op on desktop). The answer is taken by [`Self::poll_commit`].
-    fn spawn_commit(&mut self, target: DialogTarget) {
+    /// Opens the native folder dialog on a worker for pages written in `format`, starting in page
+    /// 0's current target's (else its opened file's) folder. The worker also answers whether the
+    /// chosen folder already holds entries (a blocking listing on desktop; an unreadable folder is
+    /// logged and counts as holding some, so the user is asked rather than files replaced unasked).
+    fn spawn_folder_picker(&mut self, format: ImageSaveFormat) {
+        let start_dir = self.machine.target().map_or(self.session.first_source().source_path.as_path(), |target| target.path.as_path()).parent().map(Path::to_path_buf);
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let name = target.display_name().to_owned();
-            let result = target.commit();
+            let answer = show_folder_dialog(start_dir.as_deref()).map(|picked| {
+                picked.map(|folder| {
+                    let has_entries = folder.has_entries().unwrap_or_else(|err| {
+                        runtime_log::log_warn(format!("[single_image] could not list the chosen save folder; asking before replacing files.\nFolder: {}\nError: {err:?}", folder.display_name()));
+                        true
+                    });
+                    (folder, has_entries)
+                })
+            });
+            runtime_log::log_info(format!("[single_image] folder dialog closed.\nFormat: {}\nPicked: {:?}", format.label(), answer.as_ref().map(|picked| picked.as_ref().map(|(folder, has_entries)| (folder.write_dir().display().to_string(), *has_entries)))));
+            // The receiver is gone only when the controller abandoned the save (window closing).
+            if tx.send(answer).is_err() {
+                runtime_log::log_info("[single_image] folder dialog answered after the save was abandoned; ignored");
+            }
+        });
+        self.folder_rx = Some(rx);
+    }
+
+    /// Publishes the written file(s) to their dialog target on a worker (`commit` blocks on
+    /// Android; a no-op on desktop). The answer is taken by [`Self::poll_commit`].
+    fn spawn_commit(&mut self, commit: Commit) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (name, result) = match commit {
+                Commit::File(target) => (target.display_name().to_owned(), target.commit()),
+                Commit::Folder(folder) => (folder.display_name().to_owned(), folder.commit()),
+            };
             if let Err(err) = &result {
-                runtime_log::log_error(format!("[single_image] the written image could not be published to the chosen destination.\nName: {name}\nError: {err:?}"));
+                runtime_log::log_error(format!("[single_image] the written image(s) could not be published to the chosen destination.\nName: {name}\nError: {err:?}"));
             }
             // The receiver outlives a commit (a close waits for `write_in_flight`); a gone one is logged.
             if tx.send(result).is_err() {
@@ -364,11 +478,6 @@ impl SingleImageController {
                 Some(Err(SaveError::WorkerLost))
             }
         }
-    }
-
-    /// The native «Сохранить как» dialog is open (it cannot be closed from here).
-    pub(crate) fn picker_open(&self) -> bool {
-        self.machine.picking_path()
     }
 
     /// Feeds the file dialog's answer to the machine. A dialog that could not be shown (another
@@ -400,20 +509,53 @@ impl SingleImageController {
         }
     }
 
-    /// Dispatches the flatten of the session's page into `target`.
-    fn dispatch(&mut self, ctx: &egui::Context, project: &ProjectData, typing: &mut TypingTabState, target: &SaveTarget, baseline: u64) {
-        let Some(page_idx) = project.pages.first().map(|page| page.idx) else {
-            runtime_log::log_error(format!("[single_image] save refused: the scratch chapter has no page.\nTarget: {}", target.path.display()));
-            self.machine.dispatch_refused(SaveError::NoPage);
-            return;
+    /// Feeds the folder dialog's answer to the machine (errors as in [`Self::poll_picker`]).
+    fn poll_folder_picker(&mut self) -> Step {
+        let Some(rx) = self.folder_rx.as_ref() else {
+            return Step::Nothing;
         };
-        let encoding = ImageEncoding { format: target.format, jpeg_quality: self.machine.jpeg_quality(), alpha: AlphaPolicy::DropIfOpaque, icc_profile: self.session.first_source().icc_profile.clone() };
-        // Every save writes (no digest skip yet): the single-page behaviour is unchanged.
-        let request = FlattenToFileRequest { page_idx, destination: FlattenDestination::File(target.path.clone()), encoding, unchanged_if: None };
+        match rx.try_recv() {
+            Ok(Ok(picked)) => {
+                self.folder_rx = None;
+                self.machine.folder_picked(picked)
+            }
+            Ok(Err(err)) => {
+                self.folder_rx = None;
+                runtime_log::log_error(format!("[single_image] the folder dialog could not be shown.\nError: {err:?}"));
+                self.machine.picker_unavailable(err.user_message());
+                Step::Nothing
+            }
+            Err(TryRecvError::Empty) => Step::Nothing,
+            Err(TryRecvError::Disconnected) => {
+                self.folder_rx = None;
+                runtime_log::log_error("[single_image] the folder dialog worker ended without an answer.\nPossible cause: the native folder dialog failed or panicked");
+                self.machine.picker_failed();
+                Step::Nothing
+            }
+        }
+    }
+
+    /// Dispatches the flatten of `job` (encoded with the page's own ICC profile). A refusal (busy,
+    /// no such page; logged by the typing tab) is reported to the machine with the dirty inputs
+    /// `edit_stamp_now` (= `baseline`) / `deferred_edits_now`.
+    fn dispatch(&mut self, ctx: &egui::Context, project: &ProjectData, typing: &mut TypingTabState, job: &PageJob, baseline: u64, deferred_edits_now: bool) -> Step {
+        let icc_profile = match self.session.source(job.page_idx) {
+            Some(facts) => facts.icc_profile.clone(),
+            None => {
+                // Not reachable for a page of the session (`sources()[i]` backs page `i`); the
+                // request below refuses a page that is not in the chapter.
+                runtime_log::log_warn(format!("[single_image] no source facts for page {}; it is written without an ICC profile", job.page_idx));
+                None
+            }
+        };
+        let encoding = ImageEncoding { format: job.format, jpeg_quality: self.machine.jpeg_quality(), alpha: AlphaPolicy::DropIfOpaque, icc_profile };
+        let request = FlattenToFileRequest { page_idx: job.page_idx, destination: job.destination.clone(), encoding, unchanged_if: job.unchanged_if };
         match typing.request_flatten_to_file(ctx, project, request) {
-            Ok(()) => self.machine.dispatched(baseline),
-            // Logged by the typing tab.
-            Err(err) => self.machine.dispatch_refused(SaveError::from_flatten(&err)),
+            Ok(()) => {
+                self.machine.dispatched(baseline);
+                Step::Nothing
+            }
+            Err(err) => self.machine.dispatch_refused(SaveError::from_flatten(&err), baseline, deferred_edits_now),
         }
     }
 
@@ -484,8 +626,9 @@ impl SingleImageController {
 }
 
 /// Draws the «Сохранить как» format panel: a small menu-style popup right-aligned under the
-/// `anchor` button, with a title, «✕» and one button per writable format
-/// (`ImageSaveFormat::save_formats`, the one table). Returns the answer of this frame.
+/// `anchor` button, with a title, «✕», a line saying what is saved for an image set (`note`) and
+/// one button per writable format (`ImageSaveFormat::save_formats`, the one table). Returns the
+/// answer of this frame.
 ///
 /// Input capture: the popup is an interactable `Order::Foreground` area sensing click AND drag over
 /// its whole rect, so egui's hit-test gives every press, drag and hover over it to the panel and
@@ -494,7 +637,7 @@ impl SingleImageController {
 /// `Context::any_popup_open()` / `layer_id_at` refuse as well. Clicks elsewhere are ignored (it
 /// closes only by a choice, «✕», Escape or the toggle), so a click that leaves the panel never
 /// both closes it and lands on the canvas.
-fn draw_format_panel(ui: &egui::Ui, anchor: &egui::Response) -> Option<FormatPanelChoice> {
+fn draw_format_panel(ui: &egui::Ui, anchor: &egui::Response, note: FormatNote) -> Option<FormatPanelChoice> {
     let popup = egui::Popup::new(egui::Id::new(FORMAT_PANEL_ID), ui.ctx().clone(), anchor, ui.layer_id())
         .kind(egui::PopupKind::Menu)
         .open(true)
@@ -512,6 +655,15 @@ fn draw_format_panel(ui: &egui::Ui, anchor: &egui::Response) -> Option<FormatPan
                 choice = Some(FormatPanelChoice::Cancel);
             }
         });
+        match note {
+            FormatNote::File => {}
+            FormatNote::AllPages(pages) => {
+                ui.small(tp!("single_image.save.all_pages_folder_label", pages));
+            }
+            FormatNote::Homeless(pages) => {
+                ui.small(tp!("single_image.save.needs_folder_label", pages));
+            }
+        }
         ui.separator();
         for format in ImageSaveFormat::save_formats() {
             if ui.button(format.label()).clicked() {
@@ -542,7 +694,21 @@ fn show_save_dialog(extensions: &[String], dir: Option<&Path>, file_name: String
     Ok(file_dialog::pick_blocking(request)?.and_then(Picked::into_save_target))
 }
 
-/// Whether paths the platform hands out (the opened image, a save dialog's write path) are the
+/// Shows the blocking "save into folder" dialog (folder picker worker only), starting in `dir`.
+/// `Ok(None)` = cancelled. The answer is the folder target: write into its write dir, then commit.
+///
+/// # Errors
+/// [`FileDialogError`] when no dialog could be shown.
+fn show_folder_dialog(dir: Option<&Path>) -> Result<Option<FolderTarget>, FileDialogError> {
+    let mut request = FileDialogRequest::new(DialogKind::SaveIntoFolder).title(t!("single_image.save.folder_picker_title"));
+    if let Some(dir) = dir {
+        request = request.start_dir(dir);
+    }
+    // `SaveIntoFolder` always answers `FolderTarget` (the ms-platform kind contract).
+    Ok(file_dialog::pick_blocking(request)?.and_then(Picked::into_folder_target))
+}
+
+/// Whether paths the platform hands out (the opened images, a save dialog's write path) are the
 /// user's own files, so a later «Сохранить» may rewrite them in place. That is exactly when a
 /// picked directory path is usable in place (`PlatformFeature::PersistentDirectoryPicker`):
 /// desktop yes; Android SAF no — it yields app-storage copies and staging files published to
@@ -574,13 +740,13 @@ fn edit_stamp(gate: &AutosaveGate, typing: &TypingTabState) -> u64 {
 
 /// An edit already changed the image but is not yet counted by [`edit_stamp`]: typing's deferred
 /// text-layer writes, or a PS-editor document edit whose persistence (and `note_action`) waits for
-/// the next flush. The save's dispatch flushes both before capturing its baseline.
+/// the next flush. A save stage's first dispatch flushes both before the baseline is captured.
 fn deferred_edits(typing: &TypingTabState, ps_editor: &PsEditorTabState) -> bool {
     typing.has_pending_text_edits() || ps_editor.has_deferred_layer_edits()
 }
 
-/// Two save steps of one frame (a deferred format-panel close, the picker and the write cannot end
-/// the same save-then-close twice; the later one wins defensively).
+/// Two save steps of one frame (a deferred format-panel close, the pickers, a stop and the write
+/// cannot end the same save-then-close twice; the later one wins defensively).
 fn merge_steps(first: Step, second: Step) -> Step {
     match second {
         Step::Nothing => first,
@@ -597,16 +763,28 @@ fn step_outcome(step: Step) -> Option<SaveOutcome> {
     }
 }
 
-/// The localized status line.
-fn status_text(status: &Status) -> String {
+/// The localized status line; `single` = a one-page session (its own animated-notice wording).
+fn status_text(status: &Status, single: bool) -> String {
     match status {
-        Status::AnimatedNotice => tf!("single_image.open.animated_notice", button = t!("app.menu.save_image_button")),
+        Status::AnimatedNotice { .. } if single => tf!("single_image.open.animated_notice", button = t!("app.menu.save_image_button")),
+        Status::AnimatedNotice { pages } => tp!("single_image.open.animated_pages_notice", *pages),
         Status::Preparing => t!("app.save.image_preparing_status").to_owned(),
         Status::Writing { name } => tf!("single_image.save.writing_status", name = name),
+        Status::Progress { done, total } => tf!("single_image.save.progress_status", done = done, total = total),
+        Status::NeedsFolder { pages } => tp!("single_image.save.needs_folder_label", *pages),
         Status::Saved { name } => tf!("app.save.image_saved_status", name = name),
+        Status::Unchanged { name } => tf!("single_image.save.unchanged_status", name = name),
+        Status::SetSaved { written, unchanged } => tf!("single_image.save.set_saved_status", written = written, unchanged = unchanged),
+        Status::Partial { written, failed } => tf!("single_image.save.partial_status", written = written, failed = failed.len()),
+        Status::Stopped { written, unsaved } => tf!("single_image.save.stopped_status", written = written, unsaved = unsaved),
         Status::Cancelled => t!("single_image.save.cancelled_status").to_owned(),
         Status::Error(err) => error_text(err),
     }
+}
+
+/// The hover text of a partial save: one line per failed page with its error.
+fn failed_pages_text(failed: &[(String, SaveError)]) -> String {
+    failed.iter().map(|(name, err)| tf!("single_image.save.failed_page_line", name = name, err = error_text(err))).collect::<Vec<_>>().join("\n")
 }
 
 /// The localized text of a save error.
@@ -619,7 +797,7 @@ fn error_text(err: &SaveError) -> String {
         SaveError::NoPage => t!("single_image.save.no_page_error").to_owned(),
         SaveError::Compose(message) => tf!("single_image.save.compose_error", err = message),
         SaveError::Encode(message) => tf!("single_image.save.encode_error", err = message),
-        SaveError::Write { path, reason } => tf!("single_image.save.write_error", path = path.display(), err = reason),
+        SaveError::Write { path, reason, .. } => tf!("single_image.save.write_error", path = path.display(), err = reason),
         SaveError::WorkerLost => t!("single_image.save.worker_lost_error").to_owned(),
         SaveError::QualityNotPersisted(message) => tf!("single_image.save.quality_persist_error", err = message),
     }

@@ -130,7 +130,8 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   success and before a page operation (gate semantics: `crates/ms-models/src/MODULE_README.md`;
   the app-side ordering: "Save / page-op / discard / exit choreography" below). It never closes,
   maximizes or configures the window: a close it decides (exit dialog, save-then-close, launcher
-  button, OS close via `request_os_close`) is a `PendingCloseAction` the window host takes with
+  button, OS close via `request_os_close`, images another app delivered via
+  `request_close_for_incoming`) is a `PendingCloseAction` the window host takes with
   `take_close_request` and performs; `egui::Options` (keyboard zoom off) belong to the host
   (`shell/`). `MangaApp` is driven through its `eframe::App::ui` by the shell's studio screen (and
   by the web entry); it has no `on_exit` of its own.
@@ -140,6 +141,13 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   and the bubbles-saver error are logged AND returned), and the permanent compile-time
   `MangaApp: Send` guard (native only), which is why `CleaningTool`, `AiEngine` and `PsTool`
   have a `Send` supertrait: the teardown is meant to run with the app moved onto a worker.
+- `app/incoming_open.rs`: child module of `app` answering the window host's "close for N received
+  images?" (`request_close_for_incoming`): a dirty session gets the existing unsaved-changes
+  dialog in its `ExitDialogKind::OpenIncoming` variant (project «Сохранить главу» closes after the
+  merge via `pending_save_completion_action`, «Не сохранять» runs the DISCARD cleanup; a
+  single-image session uses its own exit dialog), a clean one a one-line confirmation; the end is
+  `PendingCloseAction::OpenIncoming` or a decline (`take_incoming_declined`). A close already
+  decided for another reason wins (the request is refused). The images stay with the shell.
 - `app_tab` (crate `ms-config`): declaration of the `AppTab` tab selector with BOTH its persistence
   half (`ALL`, `key()`) and the localized display `title()`. Re-exported by `lib.rs` as
   `crate::app_tab` and again by `tabs/mod.rs`, so `crate::tabs::AppTab` stays the path everything
@@ -159,7 +167,9 @@ extraction, image decoding, text rendering, export composition, or AI inference 
   (`WindowGeometryTracker`), the Windows first-frame maximize, title, minimum size, fonts, UI
   scale, the `egui-shader-layers` glow backend, `egui::Options`, the per-screen global style and
   the root close. `shell/studio.rs` holds `StartupTarget` / `StudioOpenRequest` (project dir, or
-  image + `Arc<SingleImageScratch>`, reserved by the open worker) and the studio screen. See
+  an ordered image set + `Arc<SingleImageScratch>`, reserved by the open worker) and the studio
+  screen; `shell/incoming.rs` takes images other apps hand over (Android Share / "Open with",
+  `ms_platform::incoming`) on a worker, or before the window at a cold start. See
   `shell/MODULE_README.md`.
 - `update_check.rs`: the startup check for a newer GitHub release (worker; comparison on
   `CARGO_PKG_VERSION`), started once by the shell on the first launcher entry.
@@ -444,11 +454,15 @@ elevated continuation) keeps the normal init: it logs its own work, and its pare
 unelevated `--uninstall`, or the installer's reinstall worker, which starts the INSTALLED copy in
 its install directory) is not writing the same `last.log` in the common case.
 
-Single-image start (plan `dev-docs/single_image_mode_plan.md`, D13): `--image <PATH>`, the
-positional path (what Linux `.desktop` `%f` and Windows "Open with" `"%1"` pass) or the launcher's
-`LauncherOutcome::OpenImage` all become `StartupTarget::Image`. A CLI image skips the launcher
-like `--project`; a missing path, a directory (the message names `--project`) or a non-file shows
-`show_startup_error_dialog` and ends startup. The studio screen's open worker then reserves a
+Image-set (single-image) start (plan `dev-docs/single_image_mode_plan.md`, D13): `--image <PATH>`
+(repeatable), the positional paths (what Linux `.desktop` `%F` and Windows "Open with" `"%1"`
+pass), the launcher's multi-pick (`LauncherOutcome::OpenImages`) and the images another app
+delivered on Android (Share / "Open with": taken pre-window by `shell::incoming::cold_start_target`
+when there is no CLI target; later deliveries are the shell's `ExternalOpen`) all become
+`StartupTarget::Images`, in the order received. A CLI image set skips the launcher like
+`--project`; when NO path is a file (missing, a directory — the message names `--project` — or a
+non-file) `show_startup_error_dialog` shows each problem and startup ends; otherwise every path
+goes to the open worker, which lists the unusable ones as skipped. The studio screen's open worker then reserves a
 scratch session (`SingleImageScratch::reserve` under `ms_config::single_image::scratch_base()`)
 and runs `open_image_set` in it (no unsaved detection); the studio screen OWNS the request for
 the session's whole life and the Closing screen's teardown worker deletes the scratch after the app
@@ -463,7 +477,8 @@ ownership rule, `linux::xdg` writer); `lib.rs` only runs `ensure_at_startup` for
 (`install_linux_desktop_integration_async`) and logs its `StartupOutcome`. Policy: create when
 missing, refresh only an entry of THIS copy (`X-ManhwaStudio-Exe=`, or a legacy `Exec=`) whose
 text differs, never take over another copy's entry (alive or not), write under `$XDG_DATA_HOME`.
-The entry uses `Exec=… %f` and a `MimeType=` list built from
+The entry uses `Exec=… %F` (several selected files arrive as positional images of ONE process)
+and a `MimeType=` list built from
 `ms_config::single_image::INPUT_FILE_TYPES`; it only OFFERS the program in "Open with"
 (`update-desktop-database` only after a write), never sets a default.
 
@@ -632,10 +647,15 @@ deferred text edits in `crates/ms-tab-typing/src/MODULE_README.md`.
   screens: `shell/` (its `MODULE_README.md`).
 - Single-image saving, its top bar, exit dialog, hidden tabs and save hotkeys: `single_image/`
   (hooks in `app.rs`: `tab_visible`, `draw_tab_bar`, `draw_exit_dialog`, `ui` tick; `app/shutdown.rs`: the teardown quiesce).
-- Single-image start (CLI, launcher pick, scratch lifetime, desktop entry): `lib.rs`
+- Image-set start (CLI, launcher pick, scratch lifetime, desktop entry): `lib.rs`
   (`resolve_start`), `args.rs` (`open_target` group), `shell/studio.rs` (`StartupTarget`,
   `StudioOpenRequest`, `spawn_open_thread`), `shell/closing.rs` (scratch release); the
   desktop entry's text and writer: `crates/ms-os-integration/src/linux/`.
+- Images delivered by other apps (Android Share / "Open with"): routing per screen in
+  `shell/screen.rs` (`ExternalOpen` rows, `merge_open`), taking / mapping / dropping in
+  `shell/incoming.rs`, the cold start in `lib.rs::run_main`, the running studio's question in
+  `app/incoming_open.rs` (hooks in `app.rs`: `ExitDialogKind::OpenIncoming`, `draw_exit_dialog`,
+  `ui`); the inbox itself: `crates/ms-platform/src/incoming/` + the Kotlin `IncomingImages`.
 - What the application reports as its version, or which sites may see the git suffix:
   `crates/ms-config/src/version_format.rs` (the pure rules) + `build.rs` (git probing and rerun
   watches); then the

@@ -16,6 +16,7 @@ Key structures:
 
 Key functions:
 - `on_event(kind, event)`: the transition table (`None` = the event does not apply there).
+- `merge_open(queued, new)`: folds a newly delivered open target into one still waiting.
 - `launcher_exit_for(outcome, test_mode)`: maps a launcher outcome to its exit.
 - `style_screen(kind)`, `min_inner_size(kind)`: per-screen window attributes.
 
@@ -27,6 +28,14 @@ worker delivered (it may be mid-write); a running studio cancels it and asks the
 turns into "exit after the teardown"; Exiting allows it, because the shell itself sent that
 `Close` (eframe re-delivers a sent `Close` as `close_requested` on the next frame, so cancelling
 it would loop forever).
+
+External delivery (`ShellEvent::ExternalOpen`: images another app handed over, Android Share /
+"Open with"): the launcher opens them at once; PreparingLauncher and a loading studio queue them
+(`Effect::QueueOpen`, re-fed by the shell after `ShowLauncher` / `StartStudio`); a running studio
+is asked first (`Effect::AskStudioToOpen`: its unsaved-changes flow, or a one-line confirmation),
+and its answer comes back as `StudioCloseForOpen`; a failed load is replaced; a Closing screen
+continues into the new open instead of its previous destination (the newest user intent wins; a
+page-operation reload is safe to skip, the operation is already on disk); Exiting drops it.
 */
 
 use crate::app::PendingCloseAction;
@@ -65,6 +74,9 @@ pub(crate) enum AfterClose {
     Reload { project_dir: PathBuf, tab: AppTab },
     /// Close the window and end the process.
     Exit,
+    /// Open the target in a fresh studio (images another app delivered while the studio was open
+    /// or closing).
+    Open(StartupTarget),
 }
 
 /// The active screen of the main window.
@@ -116,6 +128,12 @@ pub(crate) enum ShellEvent {
     ShutdownFinished,
     /// The OS asked to close the root window.
     OsClose,
+    /// Another app handed over something to open (Android Share / "Open with"), already merged
+    /// with any target the shell still held queued.
+    ExternalOpen(StartupTarget),
+    /// The running studio agreed to close for the externally delivered target (the shell's
+    /// mapping of `StudioClose(PendingCloseAction::OpenIncoming)` onto the target it holds).
+    StudioCloseForOpen(StartupTarget),
 }
 
 /// What the shell does while entering [`Transition::next`].
@@ -139,6 +157,12 @@ pub(crate) enum Effect {
     RequestOsClose,
     /// Send the root `ViewportCommand::Close`.
     CloseWindow,
+    /// Keep the target until the screen can take it (the shell re-feeds it as `ExternalOpen`
+    /// after `ShowLauncher` / `StartStudio`).
+    QueueOpen(StartupTarget),
+    /// Keep the target and ask the running studio whether it may close for it
+    /// (`MangaApp::request_close_for_incoming`).
+    AskStudioToOpen(StartupTarget),
 }
 
 /// The result of one event: the next screen, the shell's action, and — for
@@ -175,14 +199,16 @@ pub(crate) fn on_event(kind: &ScreenKind, event: ShellEvent) -> Option<Transitio
     let transition = match kind {
         ScreenKind::PreparingLauncher => match event {
             E::LauncherPrepared => Transition::to(ScreenKind::Launcher, Effect::ShowLauncher),
-            E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::ShutdownFinished => return None,
+            E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::ShutdownFinished | E::StudioCloseForOpen(_) => return None,
+            E::ExternalOpen(target) => Transition::to(ScreenKind::PreparingLauncher, Effect::QueueOpen(target)),
             E::OsClose => on_os_close(kind),
         },
         ScreenKind::Launcher => match event {
             E::LauncherExit(LauncherExit::Open(target)) => Transition::to(loading(false), Effect::LoadStudio { target, tab: None }),
             E::LauncherExit(LauncherExit::StartUpdate) => Transition::to(exiting(ShellExit::StartUpdate), Effect::CloseWindow),
             E::LauncherExit(LauncherExit::Quit) => Transition::to(exiting(ShellExit::Quit), Effect::CloseWindow),
-            E::LauncherPrepared | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::ShutdownFinished => return None,
+            E::ExternalOpen(target) => Transition::to(loading(false), Effect::LoadStudio { target, tab: None }),
+            E::LauncherPrepared | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::ShutdownFinished | E::StudioCloseForOpen(_) => return None,
             E::OsClose => on_os_close(kind),
         },
         ScreenKind::Studio(StudioPhase::Loading { close_after_load }) => match event {
@@ -191,20 +217,28 @@ pub(crate) fn on_event(kind: &ScreenKind, event: ShellEvent) -> Option<Transitio
             E::StudioLoaded => Transition::to(ScreenKind::Studio(StudioPhase::Running), Effect::StartStudio),
             E::StudioLoadFailed if *close_after_load => Transition::to(closing(AfterClose::Exit), Effect::Shutdown),
             E::StudioLoadFailed => Transition::to(ScreenKind::Studio(StudioPhase::Failed), Effect::ShowLoadError),
-            E::LauncherPrepared | E::LauncherExit(_) | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::ShutdownFinished => return None,
+            E::ExternalOpen(target) => Transition::to(loading(*close_after_load), Effect::QueueOpen(target)),
+            E::LauncherPrepared | E::LauncherExit(_) | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::ShutdownFinished | E::StudioCloseForOpen(_) => return None,
             E::OsClose => on_os_close(kind),
         },
         ScreenKind::Studio(StudioPhase::Running) => match event {
             E::StudioClose(PendingCloseAction::Exit) => Transition::to(closing(AfterClose::Exit), Effect::Shutdown),
             E::StudioClose(PendingCloseAction::ReturnToLauncher) => Transition::to(closing(AfterClose::Launcher), Effect::Shutdown),
+            // The shell maps this one onto `StudioCloseForOpen` with the target it holds; it never
+            // reaches the table on its own.
+            E::StudioClose(PendingCloseAction::OpenIncoming) => return None,
+            E::StudioCloseForOpen(target) => Transition::to(closing(AfterClose::Open(target)), Effect::Shutdown),
             E::StudioReload { project_dir } => Transition::to(closing(AfterClose::Reload { project_dir, tab: AppTab::PageManager }), Effect::Shutdown),
+            E::ExternalOpen(target) => Transition::to(ScreenKind::Studio(StudioPhase::Running), Effect::AskStudioToOpen(target)),
             E::LauncherPrepared | E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::FailedBack | E::FailedExit | E::ShutdownFinished => return None,
             E::OsClose => on_os_close(kind),
         },
         ScreenKind::Studio(StudioPhase::Failed) => match event {
             E::FailedBack => Transition::to(closing(AfterClose::Launcher), Effect::Shutdown),
             E::FailedExit => Transition::to(closing(AfterClose::Exit), Effect::Shutdown),
-            E::LauncherPrepared | E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::ShutdownFinished => return None,
+            // The error screen is replaced by the newly delivered target.
+            E::ExternalOpen(target) => Transition::to(closing(AfterClose::Open(target)), Effect::Shutdown),
+            E::LauncherPrepared | E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::ShutdownFinished | E::StudioCloseForOpen(_) => return None,
             E::OsClose => on_os_close(kind),
         },
         ScreenKind::Closing { then } => match event {
@@ -214,16 +248,40 @@ pub(crate) fn on_event(kind: &ScreenKind, event: ShellEvent) -> Option<Transitio
                     Transition::to(loading(false), Effect::LoadStudio { target: StartupTarget::Project(project_dir.clone()), tab: Some(*tab) })
                 }
                 AfterClose::Exit => Transition::to(exiting(ShellExit::Quit), Effect::CloseWindow),
+                AfterClose::Open(target) => Transition::to(loading(false), Effect::LoadStudio { target: target.clone(), tab: None }),
             },
-            E::LauncherPrepared | E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit => return None,
+            // The newest user intent wins over the previous destination (exit, launcher, or a
+            // page-operation reload, whose operation is already on disk); a queued open absorbs it.
+            E::ExternalOpen(target) => {
+                let queued = match then {
+                    AfterClose::Open(queued) => Some(queued.clone()),
+                    AfterClose::Launcher | AfterClose::Reload { .. } | AfterClose::Exit => None,
+                };
+                Transition::to(closing(AfterClose::Open(merge_open(queued, target))), Effect::None)
+            }
+            E::LauncherPrepared | E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::StudioCloseForOpen(_) => return None,
             E::OsClose => on_os_close(kind),
         },
         ScreenKind::Exiting { .. } => match event {
-            E::LauncherPrepared | E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::ShutdownFinished => return None,
+            // The window is going away: a delivered target is dropped (the shell logs it and
+            // releases its inbox batches).
+            E::LauncherPrepared | E::LauncherExit(_) | E::StudioLoaded | E::StudioLoadFailed | E::StudioClose(_) | E::StudioReload { .. } | E::FailedBack | E::FailedExit | E::ShutdownFinished | E::ExternalOpen(_) | E::StudioCloseForOpen(_) => return None,
             E::OsClose => on_os_close(kind),
         },
     };
     Some(transition)
+}
+
+/// Folds a newly delivered open target `new` into the one still waiting (`queued`): two image sets
+/// concatenate in arrival order (`ImageSources::merged`); otherwise the newer target wins (the
+/// dropped one is a project, which owns no inbox batch, or an image set whose batches the next
+/// start sweeps).
+#[must_use]
+pub(crate) fn merge_open(queued: Option<StartupTarget>, new: StartupTarget) -> StartupTarget {
+    match (queued, new) {
+        (Some(StartupTarget::Images(earlier)), StartupTarget::Images(later)) => StartupTarget::Images(earlier.merged(later)),
+        (None | Some(StartupTarget::Project(_) | StartupTarget::Images(_)), new) => new,
+    }
 }
 
 /// The OS-close policy (file header), one row per screen. Exhaustive on purpose: a new screen must
@@ -326,6 +384,13 @@ mod tests {
         PathBuf::from("/home/u/titles/Title/Chapter 1")
     }
 
+    /// An image set over `names` (fictional paths), with one inbox batch named after the first.
+    fn images(names: &[&str]) -> StartupTarget {
+        let files = names.iter().map(|name| PathBuf::from(format!("/home/u/inbox/{name}"))).collect();
+        let batch = PathBuf::from(format!("/home/u/inbox/batch-{}", names.first().copied().unwrap_or("empty")));
+        StartupTarget::Images(ImageSources::new(files, Vec::new(), vec![batch]).expect("test sets are non-empty"))
+    }
+
     fn every_kind() -> Vec<ScreenKind> {
         vec![
             ScreenKind::PreparingLauncher,
@@ -337,6 +402,7 @@ mod tests {
             closing(AfterClose::Launcher),
             closing(AfterClose::Reload { project_dir: reload_dir(), tab: AppTab::PageManager }),
             closing(AfterClose::Exit),
+            closing(AfterClose::Open(images(&["a.png"]))),
             exiting(ShellExit::Quit),
             exiting(ShellExit::StartUpdate),
         ]
@@ -405,6 +471,64 @@ mod tests {
             false,
         );
         assert_row(&closing(AfterClose::Exit), ShellEvent::ShutdownFinished, exiting(ShellExit::Quit), Effect::CloseWindow, false);
+        assert_row(
+            &closing(AfterClose::Open(images(&["a.png"]))),
+            ShellEvent::ShutdownFinished,
+            loading(false),
+            Effect::LoadStudio { target: images(&["a.png"]), tab: None },
+            false,
+        );
+    }
+
+    #[test]
+    fn external_open_rows() {
+        let target = images(&["a.png", "b.png"]);
+        let open = || ShellEvent::ExternalOpen(target.clone());
+        // Queued until the screen can take it.
+        assert_row(&ScreenKind::PreparingLauncher, open(), ScreenKind::PreparingLauncher, Effect::QueueOpen(target.clone()), false);
+        assert_row(&loading(false), open(), loading(false), Effect::QueueOpen(target.clone()), false);
+        // A deferred OS close survives the queueing.
+        assert_row(&loading(true), open(), loading(true), Effect::QueueOpen(target.clone()), false);
+        // The launcher opens at once.
+        assert_row(&ScreenKind::Launcher, open(), loading(false), Effect::LoadStudio { target: target.clone(), tab: None }, false);
+        // A running studio is asked; its agreement comes back as `StudioCloseForOpen`.
+        assert_row(&running(), open(), running(), Effect::AskStudioToOpen(target.clone()), false);
+        assert_row(&running(), ShellEvent::StudioCloseForOpen(target.clone()), closing(AfterClose::Open(target.clone())), Effect::Shutdown, false);
+        // A failed load is replaced.
+        assert_row(&failed(), open(), closing(AfterClose::Open(target.clone())), Effect::Shutdown, false);
+        // A Closing screen continues into the open; an open already queued there absorbs it.
+        for then in [AfterClose::Launcher, AfterClose::Reload { project_dir: reload_dir(), tab: AppTab::PageManager }, AfterClose::Exit] {
+            assert_row(&closing(then), open(), closing(AfterClose::Open(target.clone())), Effect::None, false);
+        }
+        assert_row(
+            &closing(AfterClose::Open(images(&["first.png"]))),
+            open(),
+            closing(AfterClose::Open(merge_open(Some(images(&["first.png"])), target.clone()))),
+            Effect::None,
+            false,
+        );
+        // The window is going away: dropped.
+        for exit in [ShellExit::Quit, ShellExit::StartUpdate] {
+            assert!(on_event(&exiting(exit), open()).is_none());
+        }
+        // The raw studio close for an open never reaches the table: the shell maps it.
+        assert!(on_event(&running(), ShellEvent::StudioClose(PendingCloseAction::OpenIncoming)).is_none());
+    }
+
+    #[test]
+    fn merge_open_concatenates_image_sets_in_arrival_order() {
+        let merged = merge_open(Some(images(&["a.png", "b.png"])), images(&["c.png"]));
+        let StartupTarget::Images(sources) = merged else {
+            panic!("two image sets merge into an image set");
+        };
+        let names: Vec<_> = sources.files().iter().map(|path| path.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or_default().to_string()).collect();
+        assert_eq!(names, ["a.png", "b.png", "c.png"]);
+        assert_eq!(sources.inbox_batches(), [PathBuf::from("/home/u/inbox/batch-a.png"), PathBuf::from("/home/u/inbox/batch-c.png")]);
+        // Nothing queued: the new target as is.
+        assert_eq!(merge_open(None, images(&["c.png"])), images(&["c.png"]));
+        // Anything else: the newer target wins.
+        assert_eq!(merge_open(Some(StartupTarget::Project(reload_dir())), images(&["c.png"])), images(&["c.png"]));
+        assert_eq!(merge_open(Some(images(&["a.png"])), StartupTarget::Project(reload_dir())), StartupTarget::Project(reload_dir()));
     }
 
     #[test]
@@ -434,11 +558,14 @@ mod tests {
             ShellEvent::StudioLoaded,
             ShellEvent::StudioLoadFailed,
             ShellEvent::StudioClose(PendingCloseAction::Exit),
+            ShellEvent::StudioClose(PendingCloseAction::OpenIncoming),
             ShellEvent::StudioReload { project_dir: reload_dir() },
             ShellEvent::FailedBack,
             ShellEvent::FailedExit,
             ShellEvent::ShutdownFinished,
             ShellEvent::OsClose,
+            ShellEvent::ExternalOpen(images(&["a.png"])),
+            ShellEvent::StudioCloseForOpen(images(&["a.png"])),
         ];
         let applies = |kind: &ScreenKind, event: &ShellEvent| -> bool {
             matches!(
@@ -446,9 +573,10 @@ mod tests {
                 (ScreenKind::PreparingLauncher, ShellEvent::LauncherPrepared)
                     | (ScreenKind::Launcher, ShellEvent::LauncherExit(_))
                     | (ScreenKind::Studio(StudioPhase::Loading { .. }), ShellEvent::StudioLoaded | ShellEvent::StudioLoadFailed)
-                    | (ScreenKind::Studio(StudioPhase::Running), ShellEvent::StudioClose(_) | ShellEvent::StudioReload { .. })
+                    | (ScreenKind::Studio(StudioPhase::Running), ShellEvent::StudioClose(PendingCloseAction::Exit | PendingCloseAction::ReturnToLauncher) | ShellEvent::StudioReload { .. } | ShellEvent::StudioCloseForOpen(_))
                     | (ScreenKind::Studio(StudioPhase::Failed), ShellEvent::FailedBack | ShellEvent::FailedExit)
                     | (ScreenKind::Closing { .. }, ShellEvent::ShutdownFinished)
+                    | (ScreenKind::PreparingLauncher | ScreenKind::Launcher | ScreenKind::Studio(_) | ScreenKind::Closing { .. }, ShellEvent::ExternalOpen(_))
                     | (_, ShellEvent::OsClose)
             )
         };

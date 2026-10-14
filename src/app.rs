@@ -39,6 +39,10 @@ App/frame flow:
 - Close: `finalize_close` / `request_os_close` record a `PendingCloseAction` that the window
   host takes with `take_close_request`; `MangaApp` never sends a root `Close`, never maximizes
   and never touches `egui::Options`. Teardown: `shutdown_blocking` in `app/shutdown.rs`.
+- Images another app delivered while the session runs: the window host calls
+  `request_close_for_incoming` (logic in `app/incoming_open.rs`): the unsaved-changes dialog
+  (`ExitDialogKind::OpenIncoming`) or a one-line confirmation, ending in
+  `PendingCloseAction::OpenIncoming` or a decline (`take_incoming_declined`).
 
 Hotkeys:
 - Translation canvas zoom/edit commands + panel toggles (`P/O/K/M/D` by default).
@@ -123,6 +127,8 @@ use web_time::{Duration, Instant};
 
 // Blocking teardown (`MangaApp::shutdown_blocking`) and the permanent `MangaApp: Send` guard.
 mod shutdown;
+// Images delivered by another app while the session runs (`request_close_for_incoming`).
+mod incoming_open;
 // Named by the main window's Closing screen (`src/shell/closing.rs`), which runs the teardown.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use shutdown::ShutdownReport;
@@ -350,6 +356,12 @@ pub struct MangaApp {
     /// The close this session decided on (exit, or back to the launcher), waiting for the window
     /// host to take it (`take_close_request`). `MangaApp` never closes the window itself.
     close_request: Option<PendingCloseAction>,
+    /// The window host's question "close for N received images?" while it is open or its close
+    /// flow runs (`app/incoming_open.rs`); `None` otherwise.
+    incoming_open: Option<incoming_open::IncomingOpenRequest>,
+    /// Latched when the user declined the received images; taken by the window host
+    /// (`take_incoming_declined`), which then drops them.
+    incoming_declined: bool,
     /// Whether the puffin_egui frame-profiler window is shown. Compiled in only under the
     /// `profiling` feature; defaults to on so the profiler is visible immediately, and can be
     /// toggled at runtime with F11.
@@ -364,14 +376,18 @@ enum ExitDialogKind {
     WindowClose,
     /// Triggered by the in-app "Выйти в лаунчер" button.
     ReturnToLauncher,
+    /// Triggered by images another app delivered (`request_close_for_incoming`).
+    OpenIncoming,
 }
 
-/// What happens once the window may close: exit the program, or return to the launcher. Also
-/// carried by the single-image save controller across a save-then-close (`crate::single_image`).
+/// What happens once the window may close: exit the program, return to the launcher, or open the
+/// images another app delivered (the window host holds them). Also carried by the single-image
+/// save controller across a save-then-close (`crate::single_image`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingCloseAction {
     Exit,
     ReturnToLauncher,
+    OpenIncoming,
 }
 
 /// What an OS close-button press does to a running session ([`MangaApp::request_os_close`]).
@@ -838,6 +854,8 @@ impl MangaApp {
             save_to_project_status: None,
             storage_notice_dismissed_job: None,
             pending_save_completion_action: None,
+            incoming_open: None,
+            incoming_declined: false,
             pending_save_after_preload: false,
             exit_dialog: None,
             pending_exit_cleanup: None,
@@ -1720,6 +1738,7 @@ impl MangaApp {
                 self.exit_dialog = Some(match action {
                     PendingCloseAction::Exit => ExitDialogKind::WindowClose,
                     PendingCloseAction::ReturnToLauncher => ExitDialogKind::ReturnToLauncher,
+                    PendingCloseAction::OpenIncoming => ExitDialogKind::OpenIncoming,
                 });
             }
         }
@@ -1742,9 +1761,15 @@ impl MangaApp {
     /// (the save-then-close flow then ends in a close request); otherwise it requests
     /// [`PendingCloseAction::Exit`]. A close request already pending this frame is kept as is.
     pub(crate) fn request_os_close(&mut self) {
-        match os_close_decision(self.close_request.is_some(), self.has_unsaved_changes(), self.exit_dialog.is_some()) {
+        // The open-incoming dialog never asked about exiting: an OS close over it asks again
+        // (and drops the received images, `app/incoming_open.rs`).
+        let exit_dialog_open = self.exit_dialog.is_some_and(|kind| kind != ExitDialogKind::OpenIncoming);
+        match os_close_decision(self.close_request.is_some(), self.has_unsaved_changes(), exit_dialog_open) {
             OsCloseDecision::KeepPending => {}
             OsCloseDecision::OpenExitDialog => {
+                if self.exit_dialog == Some(ExitDialogKind::OpenIncoming) {
+                    self.decline_incoming_open();
+                }
                 self.pending_save_completion_action = Some(PendingCloseAction::Exit);
                 self.exit_dialog = Some(ExitDialogKind::WindowClose);
             }
@@ -1813,16 +1838,27 @@ impl MangaApp {
         let title = match kind {
             ExitDialogKind::WindowClose => t!("app.exit.exit_button"),
             ExitDialogKind::ReturnToLauncher => t!("app.exit.to_launcher_button"),
+            ExitDialogKind::OpenIncoming => t!("app.exit.open_incoming_title"),
         };
+        let incoming_count = self.incoming_open_count();
         if let Some(controller) = self.single_image.as_mut() {
             let action = match kind {
                 ExitDialogKind::WindowClose => PendingCloseAction::Exit,
                 ExitDialogKind::ReturnToLauncher => PendingCloseAction::ReturnToLauncher,
+                ExitDialogKind::OpenIncoming => PendingCloseAction::OpenIncoming,
             };
-            return match crate::single_image::draw_exit_dialog(ctx, title, controller.write_in_flight(), controller.picker_open()) {
+            let choice = if kind == ExitDialogKind::OpenIncoming {
+                crate::single_image::draw_open_incoming_exit_dialog(ctx, incoming_count, controller.write_in_flight(), controller.picker_open())
+            } else {
+                crate::single_image::draw_exit_dialog(ctx, title, controller.write_in_flight(), controller.picker_open())
+            };
+            return match choice {
                 None => false,
                 Some(crate::single_image::ExitChoice::Cancel) => {
                     self.exit_dialog = None;
+                    if kind == ExitDialogKind::OpenIncoming {
+                        self.decline_incoming_open();
+                    }
                     false
                 }
                 Some(crate::single_image::ExitChoice::Save) => {
@@ -1890,6 +1926,15 @@ impl MangaApp {
                             }
                         });
                     }
+                    // Same three choices as the launcher exit; the logic is in `app/incoming_open.rs`.
+                    ExitDialogKind::OpenIncoming => match self.draw_incoming_unsaved_dialog_body(ui) {
+                        None => {}
+                        Some(incoming_open::UnsavedChoice::Cancel) => close_dialog = true,
+                        Some(incoming_open::UnsavedChoice::Save | incoming_open::UnsavedChoice::Discard) => {
+                            close_dialog = true;
+                            handled = true;
+                        }
+                    },
                 }
             });
 
@@ -3222,6 +3267,7 @@ impl eframe::App for MangaApp {
 
         // Show exit/leave dialog on top of all other content.
         self.draw_exit_dialog(ctx);
+        self.draw_incoming_confirm(ctx);
         let jpeg_options_outcome = self.single_image.as_mut().and_then(|controller| controller.draw_dialogs(ctx));
         self.apply_single_image_outcome(jpeg_options_outcome);
 

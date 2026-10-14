@@ -18,8 +18,11 @@ Main flow (`native_main` -> `run_main`):
   secondary windows) and starts the Python AI backend supervisor where
   `PlatformFeature::PythonBackend` exists.
 - `--check-venv` (terminal), `--continue-update` and `--update` run their own windows.
+- Takes the images another app delivered at startup (Android Share / "Open with",
+  `shell::incoming::cold_start_target`, pre-window) before `resolve_start`.
 - `resolve_start`: a valid `--project` chapter, or an image set (`--image <PATH>`, repeatable, or
-  positional image paths: OS "Open with", `.desktop` `%F`), opens the studio directly; an
+  positional image paths: OS "Open with", `.desktop` `%F`; or the delivered images when there is
+  no CLI target), opens the studio directly; an
   invalid project, or an image set none of whose paths is a file, is reported in
   the console and a modal error box (`ms_platform::message::show_error_blocking`; log-only where
   no native box exists). Without an open target the pure `startup_routing` decides: on a platform
@@ -491,6 +494,7 @@ fn run_main() -> anyhow::Result<()> {
             host: launcher_host(cli.ignore_installed),
             test_mode: true,
             update_check: update_check_enabled(cli.ignore_installed, installed_copy_management_available()).then_some(cli.test_ver_check),
+            incoming_error: None,
         })?;
         runtime_log::log_info(format!("[startup] --test-launcher window closed ({exit:?})"));
         return Ok(());
@@ -506,9 +510,14 @@ fn run_main() -> anyhow::Result<()> {
     let ai_backend_supervisor = ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(ai_enabled, Some(storage_conversion_autostart_gate()));
     let ai_backend = ai_backend_supervisor.handle();
 
+    // Images another app handed over before (or by) starting the process (Android Share / "Open
+    // with"): taken once, before the main window exists — the documented pre-window exception to
+    // "no JNI on the GUI thread" (`ms_platform::incoming::init`). It also binds the warm-delivery
+    // wake-up the main window polls. Nothing outside Android.
+    let (incoming_target, incoming_error) = shell::incoming::cold_start_target();
     // The startup prompts (installer continuation, missing environment, Windows existing
     // install) run ONCE here, as their own windows, before the main window exists.
-    let Some(start) = resolve_start(&cli)? else {
+    let Some(start) = resolve_start(&cli, incoming_target)? else {
         return Ok(());
     };
     // The ONE main window: launcher and studio are its screens, switched in place. The launcher
@@ -521,6 +530,7 @@ fn run_main() -> anyhow::Result<()> {
         host: launcher_host(cli.ignore_installed),
         test_mode: false,
         update_check: start.update_check.then_some(cli.test_ver_check),
+        incoming_error,
     })?;
     match exit {
         shell::ShellExit::Quit => Ok(()),
@@ -742,23 +752,36 @@ struct StartPlan {
 }
 
 /// Resolves where the main window starts: the CLI open target (`--project`, or an image set from
-/// `--image` / the positional paths) when present, else whatever the no-argument startup path (installer
+/// `--image` / the positional paths) when present, else the images another app delivered at
+/// startup (`incoming`, Android), else whatever the no-argument startup path (installer
 /// prompts) yields — normally the launcher. `None` means "exit the program". The prompts run
-/// once per process: a later return to the launcher does not repeat them.
+/// once per process: a later return to the launcher does not repeat them. A CLI target wins over
+/// `incoming` (the two never meet on one platform); the dropped images are released.
 ///
 /// # Errors
 /// An invalid CLI open target (after its error dialog) and every error of the no-argument path.
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_start(cli: &Cli) -> anyhow::Result<Option<StartPlan>> {
+fn resolve_start(cli: &Cli, incoming: Option<shell::studio::StartupTarget>) -> anyhow::Result<Option<StartPlan>> {
     // A CLI start can still reach the launcher later ("Exit to launcher"); its update notice
-    // follows the same rule as a launcher start.
+    // follows the same rule as a launcher start. A start from delivered images follows it too.
     let cli_update_check = || update_check_enabled(cli.ignore_installed, installed_copy_management_available());
+    let has_cli_target = cli.project.is_some() || !cli.image_args().is_empty();
+    let incoming = match incoming {
+        Some(target) if has_cli_target => {
+            shell::incoming::discard_target(target, "a command-line open target was given");
+            None
+        }
+        other => other,
+    };
     if let Some(project_dir) = &cli.project {
         return Ok(resolve_cli_project_dir(project_dir)?.map(|target| StartPlan { initial: shell::InitialScreen::Studio(target), update_check: cli_update_check() }));
     }
     let images = cli.image_args();
     if !images.is_empty() {
         let target = resolve_cli_images(images)?;
+        return Ok(Some(StartPlan { initial: shell::InitialScreen::Studio(target), update_check: cli_update_check() }));
+    }
+    if let Some(target) = incoming {
         return Ok(Some(StartPlan { initial: shell::InitialScreen::Studio(target), update_check: cli_update_check() }));
     }
     resolve_start_without_cli_arg(

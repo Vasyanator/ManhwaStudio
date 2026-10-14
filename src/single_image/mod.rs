@@ -36,6 +36,7 @@ mod machine;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use controller::SingleImageController;
 pub(crate) use dialogs::draw_exit_dialog;
+pub(crate) use dialogs::draw_open_incoming_exit_dialog;
 
 use crate::app::PendingCloseAction;
 use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2};

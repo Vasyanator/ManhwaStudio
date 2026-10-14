@@ -9,8 +9,8 @@ window; the screens own only their content.
 ```text
 run_main (src/lib.rs): startup prompts (own windows) -> shell::run(ShellConfig) -> ShellExit
 AppShell (mod.rs, eframe::App)
-  logic(): poll workers (launcher entry, studio load, studio teardown, update check)
-           + root close_requested -> screen::on_event(OsClose)
+  logic(): poll workers (launcher entry, studio load, studio teardown, update check,
+           incoming-images take -> ExternalOpen) + root close_requested -> on_event(OsClose)
   ui():    geometry, Windows first-frame maximize, draw the active screen, UI exits
   dispatch(event) -> screen::on_event(kind, event) -> Transition { next, effect, cancel_os_close }
                   -> run_effect (moves data between screens) -> enter_screen on a switch
@@ -37,6 +37,10 @@ transition goes through `screen::on_event`; the shell only executes the returned
   `ProjectData::load*`, or for an image set the size estimate, the large-set question and
   `open_image_set` with `OpenEvent::Progress` and a shared cancel flag), `StudioScreen` (loading
   with progress / confirmation / Cancel, error, cancelled, running), `install_shader_layers`.
+- `incoming.rs`: external image delivery (Android Share / "Open with", `ms_platform::incoming`):
+  `sources_from_batches` (batches -> one ordered `ImageSources`, Kotlin skips as localized
+  `SkippedSource`s), the `incoming-take` worker (`spawn_take`), `cold_start_target` (pre-window,
+  for `run_main`), `discard_target` (log + release the inbox batches on a worker).
 - `closing.rs`: `StudioShutdownJob` (teardown worker, `poll`, `finish_blocking`),
   `ClosingScreen` (spinner, or the failure + Continue), `teardown_blocking`.
 
@@ -83,6 +87,20 @@ transition goes through `screen::on_event`; the shell only executes the returned
 - **Bad image files are reported in one place**: the CLI rejects a start only when no path is a
   file (startup error dialog), the launcher stays only when no picked file is usable; otherwise
   every path goes to the open worker, which lists the unusable ones as skipped.
+- **External delivery** (images another app hands over; `screen.rs` header): `AppShell::new`
+  registers the repaint waker; `logic` polls `incoming::has_pending()` (atomic, no JNI) and takes
+  on the `incoming-take` worker; the target is dispatched as `ExternalOpen`, after folding in any
+  target still pending (`merge_open`: image sets concatenate in arrival order). Launcher: opens at
+  once. PreparingLauncher / Loading: `QueueOpen` into `AppShell::pending_open`, re-fed after
+  `ShowLauncher` / `StartStudio`. Running: `AskStudioToOpen` keeps the target in `pending_open`
+  and calls `MangaApp::request_close_for_incoming` (dirty: the unsaved-changes flow; clean: a
+  one-line confirmation); the studio's `StudioClose(OpenIncoming)` is mapped to
+  `StudioCloseForOpen(pending_open)` -> Closing{Open} -> Loading. Failed load: replaced.
+  Closing: continues into the open (newest intent wins). Exiting: dropped. A target the window
+  will not open (declined, the studio closed for another reason, the window exits, a refused
+  ask) is dropped by `incoming::discard_target`, which releases its inbox batches on a worker.
+  Cold start: `run_main` takes the batches pre-window; they become `InitialScreen::Studio` when
+  there is no CLI target. A failed take is logged and shown once in a small window.
 - Android: one `run_native`; the fork's secondary-window policy is set before it and re-synced at
   creation and every switch. Nothing here relies on the winit fork re-emitting `Resumed` for a
   second event loop (`dev-docs/ANDROID_PORT.md`).
@@ -99,3 +117,6 @@ transition goes through `screen::on_event`; the shell only executes the returned
 - Teardown order: `src/app/shutdown.rs`; how it runs and what the user sees: `closing.rs`.
 - Startup prompts and the post-window update: `src/lib.rs` (`resolve_start`,
   `resolve_cli_images`, `run_launcher_requested_update`).
+- Images other apps hand over: where they go per screen — `screen.rs` (`ExternalOpen` rows,
+  `merge_open`); taking, mapping, dropping — `incoming.rs`; `pending_open` and the polling —
+  `mod.rs`; the running studio's question — `src/app/incoming_open.rs`.

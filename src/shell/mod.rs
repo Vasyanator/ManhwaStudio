@@ -18,14 +18,18 @@ Key structures:
 Key functions:
 - `run(config)`: builds the viewport from the stored main-window geometry and runs the window.
 - `AppShell::logic`: polls every worker (launcher entry, studio load, studio teardown, update
-  check) and owns the root close decision, so a minimized window still progresses.
+  check, incoming-images take) and owns the root close decision, so a minimized window still
+  progresses.
 - `AppShell::ui`: geometry, the Windows first-frame maximize, the active screen, UI exits.
 
 Notes:
 No blocking work on the GUI thread at any switch: the launcher entry is prepared on a worker
 (PreparingLauncher screen), the studio loads on a worker (loading screen) and is torn down on a
 worker (Closing screen). Every switch rebuilds the style from scratch (`style.rs`), sets the
-title and minimum size, and re-syncs the secondary-window policy (Android). `on_exit` is the
+title and minimum size, and re-syncs the secondary-window policy (Android). Images another app
+hands over (Android Share / "Open with") are taken on a worker when `ms_platform::incoming`
+raises its flag and dispatched as `ShellEvent::ExternalOpen`; a target the table queues or asks
+about waits in `AppShell::pending_open` (`incoming.rs` moves the data). `on_exit` is the
 process-shutdown path only (eframe ended without the shell's consent, e.g. the Android Activity
 went away): it tears a running studio down inline. Native only, except `style`, which the web
 entry uses too.
@@ -33,6 +37,8 @@ entry uses too.
 
 #[cfg(not(target_arch = "wasm32"))]
 mod closing;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod incoming;
 #[cfg(not(target_arch = "wasm32"))]
 mod screen;
 #[cfg(not(target_arch = "wasm32"))]
@@ -47,10 +53,12 @@ pub(crate) use screen::ShellExit;
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
     use super::closing::{self, ClosingScreen};
+    use super::incoming::{self, IncomingTake};
     use super::screen::{self, Effect, ScreenKind, ShellEvent, ShellExit, StudioPhase};
     use super::studio::{LoadResult, StartupTarget, StudioExit, StudioScreen};
     use super::style;
     use crate::ai_backend_supervisor::AiBackendHandle;
+    use crate::app::PendingCloseAction;
     use crate::launcher::app::{LauncherApp, LauncherEntry};
     use crate::launcher::state::{LauncherHost, UpdateNotification};
     use crate::project::ProjectData;
@@ -59,6 +67,7 @@ mod native {
     use ms_thread as thread;
     use std::cell::Cell;
     use std::rc::Rc;
+    use std::sync::Arc;
     use std::sync::mpsc::{self, Receiver, TryRecvError};
     use std::time::Duration;
 
@@ -82,7 +91,7 @@ mod native {
     pub(crate) enum InitialScreen {
         /// The launcher (prepared on a worker first).
         Launcher,
-        /// The studio, opening a CLI target directly.
+        /// The studio, opening a CLI target (or the images that started the process) directly.
         Studio(StartupTarget),
     }
 
@@ -100,6 +109,9 @@ mod native {
         /// `force` is `--test-ver-check`. `None`: no check (source checkout, no installed-copy
         /// management).
         pub update_check: Option<bool>,
+        /// A localized error to show once on the first screen (the cold-start take of incoming
+        /// images failed; the details are logged).
+        pub incoming_error: Option<String>,
     }
 
     /// Runs the main window until it closes and returns what `run_main` must do next. The only
@@ -216,6 +228,18 @@ mod native {
         egui_ctx: egui::Context,
         /// Read by `run` after the window closed.
         exit: Rc<Cell<ShellExit>>,
+        /// An externally delivered target waiting for its screen: queued (PreparingLauncher,
+        /// loading studio) or asked about (running studio). Folded into every later
+        /// `ExternalOpen`; dropped (inbox batches released) when the studio closes for another
+        /// reason, the user declines it, or the window exits.
+        pending_open: Option<StartupTarget>,
+        /// The running incoming-images take worker.
+        incoming_take: Option<IncomingTake>,
+        /// The take worker could not be spawned; polling stops (logged once) and the received
+        /// images stay in the inbox for the next start.
+        incoming_take_unavailable: bool,
+        /// A localized incoming-images error shown in a small window until dismissed.
+        incoming_error: Option<String>,
     }
 
     impl AppShell {
@@ -236,7 +260,10 @@ mod native {
             super::studio::install_shader_layers(cc);
             // The only UI zoom is the interface-scale setting.
             ctx.options_mut(|options| options.zoom_with_keyboard = false);
-            let ShellConfig { initial, user_settings, ai_backend, host, test_mode, update_check } = config;
+            let ShellConfig { initial, user_settings, ai_backend, host, test_mode, update_check, incoming_error } = config;
+            // The platform wake-up repaints the window, so `logic` sees `has_pending` at once.
+            let waker_ctx = ctx.clone();
+            ms_platform::incoming::set_waker(Arc::new(move || waker_ctx.request_repaint()));
             let mut shell = Self {
                 kind: initial_kind(&initial),
                 active: Active::Gone,
@@ -253,6 +280,10 @@ mod native {
                 maximize_on_first_frame: window_settings.maximized.unwrap_or(true),
                 egui_ctx: ctx.clone(),
                 exit,
+                pending_open: None,
+                incoming_take: None,
+                incoming_take_unavailable: false,
+                incoming_error,
             };
             let effect = match initial {
                 InitialScreen::Launcher => Effect::PrepareLauncher,
@@ -267,8 +298,14 @@ mod native {
         /// the effect, and — when the screen changes — the per-screen window attributes. An event
         /// the table rejects is logged and ignored.
         fn dispatch(&mut self, ctx: &egui::Context, event: ShellEvent, payload: Payload) {
+            let event = self.resolve_open_event(event);
             let Some(transition) = screen::on_event(&self.kind, event.clone()) else {
-                runtime_log::log_warn(format!("[shell] event {event:?} does not apply to screen {:?}; ignored", self.kind));
+                match event {
+                    ShellEvent::ExternalOpen(target) | ShellEvent::StudioCloseForOpen(target) => {
+                        incoming::discard_target(target, &format!("the screen {:?} cannot take them", self.kind));
+                    }
+                    other => runtime_log::log_warn(format!("[shell] event {other:?} does not apply to screen {:?}; ignored", self.kind)),
+                }
                 return;
             };
             if transition.cancel_os_close {
@@ -281,10 +318,54 @@ mod native {
             self.kind = transition.next;
             if let ScreenKind::Exiting { exit } = &self.kind {
                 self.exit.set(*exit);
+                if let Some(target) = self.pending_open.take() {
+                    incoming::discard_target(target, "the window is closing");
+                }
             }
+            // A queued target is re-fed once the screen that can take it exists.
+            let refeed = matches!(transition.effect, Effect::ShowLauncher | Effect::StartStudio);
             self.run_effect(ctx, transition.effect, payload);
             if switched {
                 self.enter_screen(ctx);
+            }
+            if refeed && let Some(target) = self.pending_open.take() {
+                runtime_log::log_info(format!("[shell] re-feeding {} queued received image(s) on {:?}", incoming::received_count(&target), self.kind));
+                self.dispatch(ctx, ShellEvent::ExternalOpen(target), Payload::None);
+            }
+        }
+
+        /// Shell-side bookkeeping of `pending_open` before an event reaches the table:
+        /// - `ExternalOpen(t)` absorbs the target still pending (`screen::merge_open`), so one
+        ///   delivery queue never splits;
+        /// - the studio's `StudioClose(OpenIncoming)` becomes `StudioCloseForOpen` with the pending
+        ///   target (none pending is a defect: logged, treated as a return to the launcher);
+        /// - any other studio close drops the pending target (logged, inbox batches released).
+        fn resolve_open_event(&mut self, event: ShellEvent) -> ShellEvent {
+            match event {
+                ShellEvent::ExternalOpen(target) => ShellEvent::ExternalOpen(screen::merge_open(self.pending_open.take(), target)),
+                ShellEvent::StudioClose(PendingCloseAction::OpenIncoming) => match self.pending_open.take() {
+                    Some(target) => ShellEvent::StudioCloseForOpen(target),
+                    None => {
+                        runtime_log::log_error("[shell] defect: the studio closed to open received images, but none is pending; returning to the launcher");
+                        ShellEvent::StudioClose(PendingCloseAction::ReturnToLauncher)
+                    }
+                },
+                ShellEvent::StudioClose(action @ (PendingCloseAction::Exit | PendingCloseAction::ReturnToLauncher)) => {
+                    if let Some(target) = self.pending_open.take() {
+                        incoming::discard_target(target, &format!("the studio closed for {action:?}"));
+                    }
+                    ShellEvent::StudioClose(action)
+                }
+                other @ (ShellEvent::LauncherPrepared
+                | ShellEvent::LauncherExit(_)
+                | ShellEvent::StudioLoaded
+                | ShellEvent::StudioLoadFailed
+                | ShellEvent::StudioReload { .. }
+                | ShellEvent::FailedBack
+                | ShellEvent::FailedExit
+                | ShellEvent::ShutdownFinished
+                | ShellEvent::OsClose
+                | ShellEvent::StudioCloseForOpen(_)) => other,
             }
         }
 
@@ -361,6 +442,25 @@ mod native {
                 Effect::CloseWindow => {
                     self.active = Active::Gone;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                Effect::QueueOpen(target) => {
+                    runtime_log::log_info(format!("[shell] {} received image(s) queued until {:?} can take them", incoming::received_count(&target), self.kind));
+                    self.pending_open = Some(target);
+                }
+                Effect::AskStudioToOpen(target) => {
+                    let count = incoming::received_count(&target);
+                    let asked = match &mut self.active {
+                        Active::Studio(studio) => studio.request_close_for_incoming(count),
+                        Active::PreparingLauncher(_) | Active::Launcher(_) | Active::Closing(_) | Active::Gone => false,
+                    };
+                    if asked {
+                        runtime_log::log_info(format!("[shell] asked the studio to close for {count} received image(s)"));
+                        self.pending_open = Some(target);
+                    } else {
+                        incoming::discard_target(target, "the studio is already closing for another reason");
+                    }
+                    // The question opened after this frame's draw; show it without waiting.
+                    ctx.request_repaint();
                 }
             }
         }
@@ -456,6 +556,16 @@ mod native {
                     }
                 }
                 Active::Studio(studio) => {
+                    // A deferred OS close stops an image-set open even while the window is
+                    // minimized (`ui` is not called then).
+                    if matches!(self.kind, ScreenKind::Studio(StudioPhase::Loading { close_after_load: true })) {
+                        studio.cancel_for_close();
+                    }
+                    if studio.take_incoming_declined()
+                        && let Some(target) = self.pending_open.take()
+                    {
+                        incoming::discard_target(target, "the user declined to close the studio for them");
+                    }
                     if let Some(result) = studio.poll_load() {
                         match result {
                             LoadResult::Loaded(project) => self.dispatch(ctx, ShellEvent::StudioLoaded, Payload::Project(project)),
@@ -473,6 +583,64 @@ mod native {
                     }
                 }
                 Active::Launcher(_) | Active::Gone => {}
+            }
+        }
+
+        /// Takes images other apps handed over: starts the take worker when the platform raised
+        /// its flag (an atomic read, no JNI here), and dispatches the worker's target as
+        /// `ExternalOpen`. A failed take is logged and shown once in a small window.
+        fn poll_incoming(&mut self, ctx: &egui::Context) {
+            if let Some(take) = &self.incoming_take {
+                let Some(result) = take.poll() else {
+                    ctx.request_repaint_after(POLL_INTERVAL);
+                    return;
+                };
+                self.incoming_take = None;
+                match result {
+                    Ok(Some(target)) => {
+                        runtime_log::log_info(format!("[shell] received {} image(s) from another app on {:?}", incoming::received_count(&target), self.kind));
+                        self.dispatch(ctx, ShellEvent::ExternalOpen(target), Payload::None);
+                    }
+                    Ok(None) => runtime_log::log_info("[shell] the incoming-images take found nothing to open"),
+                    Err(err) => {
+                        runtime_log::log_error(format!("[shell] {err}"));
+                        self.incoming_error = Some(err.user_message().to_string());
+                    }
+                }
+            }
+            // A batch published while the worker ran raised the flag again: take it next.
+            if self.incoming_take.is_none() && !self.incoming_take_unavailable && ms_platform::incoming::has_pending() {
+                match incoming::spawn_take() {
+                    Ok(take) => {
+                        self.incoming_take = Some(take);
+                        ctx.request_repaint_after(POLL_INTERVAL);
+                    }
+                    Err(err) => {
+                        runtime_log::log_error(format!("[shell] could not start the incoming-images take worker: {err}; received images stay in the inbox until the next start"));
+                        self.incoming_take_unavailable = true;
+                    }
+                }
+            }
+        }
+
+        /// Draws the incoming-images error window while one is set; OK dismisses it.
+        fn draw_incoming_error(&mut self, ctx: &egui::Context) {
+            let Some(message) = &self.incoming_error else {
+                return;
+            };
+            let mut dismissed = false;
+            egui::Window::new(t!("shell.incoming.error_title"))
+                .id(egui::Id::new("shell.incoming.error_title"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(message.as_str());
+                    ui.add_space(8.0);
+                    dismissed = ui.button(t!("shell.incoming.ok_button")).clicked();
+                });
+            if dismissed {
+                self.incoming_error = None;
             }
         }
 
@@ -517,6 +685,7 @@ mod native {
         fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.poll_update_check(ctx);
             self.poll_workers(ctx);
+            self.poll_incoming(ctx);
             if ctx.input(|input| input.viewport().close_requested()) {
                 self.dispatch(ctx, ShellEvent::OsClose, Payload::None);
             }
@@ -554,6 +723,7 @@ mod native {
                     None
                 }
             };
+            self.draw_incoming_error(&ctx);
             if retry_prepare {
                 runtime_log::log_info("[shell] retrying the launcher preparation");
                 self.active = Active::PreparingLauncher(self.spawn_launcher_prepare());
