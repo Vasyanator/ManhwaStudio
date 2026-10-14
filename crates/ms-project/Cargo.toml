@@ -40,6 +40,9 @@ image.workspace = true
 rayon.workspace = true
 # Wall-clock timestamps that also work on wasm32 (`SystemTime` is unusable there).
 web-time.workspace = true
+# `PixelDigest` (`pixel_digest.rs`): SHA-256 over a page's RGBA8, the one "same pixels" test of
+# the image-set mode (computed at open here and by the typing flatten at save).
+sha2.workspace = true
 
 # Android only: `flock` for the single-image scratch lock, because the stable std's
 # `File::try_lock` returns `Unsupported` there (see `single_image::try_lock_exclusive`).

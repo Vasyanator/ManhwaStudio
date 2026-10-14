@@ -56,15 +56,22 @@ joined onto a chapter or title directory.
   `persist::merge_unsaved_layers_into_committed` as a closure), then removes the staging dir.
   Native `std::fs`, blocking, worker thread only; errors are localized `app.merge.*` texts.
 - `single_image.rs` (native only, tests in `single_image_tests.rs`): the storage side of the
-  single-image mode. `SingleImageScratch` reserves a session root under a base dir
-  (`ms_config::single_image::scratch_base()` in production) as create_dir -> lock `.lock` ->
-  write `.ms-single-image` marker; `sweep_stale_sessions` deletes only MARKED roots whose lock
-  it can acquire; `prepare_session` decodes the user's picture (format from content, TGA by
-  extension; EXIF orientation baked in; ICC kept in the session; animated sources open their
-  first frame) into `<root>/title/chapter/src/000.png` and seeds `comic_type = pages`;
-  `open_single_image` = prepare + the regular `ProjectData::load` on that chapter + `session`
-  set. Uses `std::fs` directly like `project_scan.rs`. Errors are `SingleImageError`
-  (`user_message()` localized `project.single_image.*_error`, `Display` technical).
+  image-set (single-image) mode — one or several picture files opened, in the order received, as
+  the pages of one hidden scratch chapter. `SingleImageScratch` reserves a session root under a
+  base dir (`ms_config::single_image::scratch_base()` in production) as create_dir -> lock
+  `.lock` -> write `.ms-single-image` marker; `sweep_stale_sessions` deletes only MARKED roots
+  whose lock it can acquire. `estimate_image_set` (header-only RGBA8 size) +
+  `needs_size_confirmation` (thresholds from `ms_config::single_image`) decide whether a large
+  set asks first. `open_image_set` decodes each file in order (format from content, TGA by
+  extension; EXIF orientation baked in; ICC kept; animated sources open their first frame) into
+  `<root>/title/chapter/src/{i:03}.png`, records its `SourceImageFacts` with the `PixelDigest`
+  of the written RGBA8, skips (and lists as `SkippedSource`) files that cannot be opened, seeds
+  `comic_type = pages`, runs the regular `ProjectData::load` and sets the session. Uses
+  `std::fs` directly like `project_scan.rs`. Errors are `SingleImageError` (`user_message()`
+  localized `project.single_image.*`, `Display` technical).
+- `pixel_digest.rs` (every target): `PixelDigest`, SHA-256 over `width_le ‖ height_le ‖ RGBA8`
+  — the ONE "same pixels" test of the image-set mode (open records it per page, the typing
+  flatten recomputes it so Save skips an unchanged page).
 - `storage_mode.rs`: the Dev/Prod storage-mode conversion driver (`convert_globals`):
   (a) persists `General.storage_mode` in user_config's current format and switches the
   docstore default, (b) converts `fonts_data`/`presets`, (c) the five title-level documents of
@@ -78,7 +85,14 @@ joined onto a chapter or title directory.
 
 ## Contracts and invariants
 - **Session kind is explicit.** `ProjectData::session` is `SessionKind::Project` after every
-  load; only `single_image::open_single_image` sets `SingleImage`. Never infer it from paths.
+  load; only `single_image::open_image_set` sets `SingleImage`. Never infer it from paths.
+- **Image-set page mapping.** A `SingleImageSession` has at least one source (its constructor
+  refuses an empty list); `sources()[i]` backs scratch page `i` (`Page::idx == i`, file
+  `{i:03}.png`), in the order the files were given, and `open_image_set` verifies the loaded
+  page list against it. Structural page operations would break this mapping, which is why the
+  mode hides the Page Manager. A file failing to READ or DECODE is skipped (listed in
+  `skipped()`); a scratch WRITE failure aborts the whole set; nothing opened is
+  `NothingOpened`, whose text for a single requested file is that file's own reason.
 - **Single-image mode never writes the user's file or folder** here: everything goes into the
   scratch root; the source is only read. `SingleImageScratch`'s `Drop` does no I/O (a crash or
   plain drop leaves the root for the next sweep); `remove()` is a blocking recursive delete,
@@ -122,8 +136,10 @@ joined onto a chapter or title directory.
   policy owned here, the binding rule is not.
 
 ## Editing map
-- To change the single-image scratch layout, accepted input formats or the prepare step, see
-  `single_image.rs` (the readable-types table itself is `ms_config::single_image`).
+- To change the scratch layout, accepted input formats, the per-file decode or the skip/fatal
+  split of an image-set open, see `single_image.rs` (the readable-types table and the
+  confirmation thresholds live in `ms_config::single_image`). To change what counts as "the
+  same pixels", see `pixel_digest.rs` (the typing flatten uses the same type).
 - To change the chapter file layout, edit `ProjectPaths` in
   `crates/ms-page-ops/src/lib.rs` and the constants in `ms-config` — not here.
 - To change what a load reconciles or normalizes, see `reconcile_clean_layers_dir`,

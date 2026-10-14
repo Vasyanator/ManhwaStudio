@@ -11,10 +11,12 @@ Main items:
   `Bubble` stores per-bubble placement plus optional `bubble_class`
   (`text`/`image`) and optional `bubble_type` (`default`/`aside`/`on_top`) for text display.
 - `CanvasSettings` stores editable/readonly default bubble display types.
-- `SessionKind` (`Project` / `SingleImage(Arc<SingleImageSession>)`), `SingleImageSession`,
+- `SessionKind` (`Project` / `SingleImage(Arc<SingleImageSession>)`), `SingleImageSession`
+  (ordered per-page `SourceImageFacts`, the `SkippedSource` list, the scratch root),
   `SourceImageFormat`: the session a `ProjectData` belongs to (field `session`; every load sets
-  `Project`, `single_image::open_single_image` sets `SingleImage`). Compiled on every target;
-  the native-only scratch / prepare code lives in `single_image.rs`.
+  `Project`, `single_image::open_image_set` sets `SingleImage`). Compiled on every target;
+  the native-only scratch / open code lives in `single_image.rs`, `PixelDigest` in
+  `pixel_digest.rs`.
 - `ProjectData::load`: discovers project/title paths, loads pages, bubbles and settings. Before
   any reconcile/normalize pass it calls `page_ops::recover_pending_page_op` so an interrupted
   structural page operation (journaled transaction, see `crates/ms-page-ops/`) is rolled forward or
@@ -90,8 +92,12 @@ use ms_page_ops::clean_binding::{classify_clean_fit, clean_overlay_file_name, Cl
 // projects root), not the `ms_storage` seam — see the note in `MODULE_README.md`.
 pub mod project_scan;
 pub mod save_merge;
-// Single-image mode: the throwaway scratch chapter (reserve / sweep / remove) and the
-// prepare step that turns one picture file into that chapter. Native only (D10 of the
+// `PixelDigest`, the one "same pixels" test of the image-set mode. Compiled on every target:
+// the typing flatten (also built for wasm) computes it at save time.
+mod pixel_digest;
+pub use pixel_digest::PixelDigest;
+// Image-set (single-image) mode: the throwaway scratch chapter (reserve / sweep / remove) and
+// the open step that turns an ordered list of picture files into that chapter's pages. Native only (D10 of the
 // single-image plan): it needs the OS temp dir and file locks; the session TYPES below
 // compile everywhere so `ProjectData` keeps one shape on every target.
 #[cfg(not(target_arch = "wasm32"))]
@@ -272,16 +278,17 @@ impl Default for CanvasSettings {
 
 
 /// What kind of editing session a [`ProjectData`] belongs to. Set ONLY by explicit
-/// construction: every `ProjectData::load*` yields `Project`, and the single-image open path
-/// (`single_image::open_single_image`) overwrites it with `SingleImage`. Never inferred from
-/// paths. Every UI branch of the single-image mode keys on this value.
+/// construction: every `ProjectData::load*` yields `Project`, and the image-set open path
+/// (`single_image::open_image_set`) overwrites it with `SingleImage`. Never inferred from
+/// paths. Every UI branch of the image-set (single-image) mode keys on this value.
 #[derive(Debug, Clone, Default)]
 pub enum SessionKind {
     /// A regular chapter of a title on disk.
     #[default]
     Project,
-    /// One picture file edited through a hidden scratch chapter; the user's file is written
-    /// only by an explicit Save / Save As.
+    /// An ordered set of one or more picture files edited through a hidden scratch chapter (one
+    /// page per opened file, in the order received); the user's files are written only by an
+    /// explicit Save / Save As. Named after the one-image case it generalizes.
     SingleImage(Arc<SingleImageSession>),
 }
 
@@ -317,10 +324,10 @@ impl SourceImageFormat {
     }
 }
 
-/// Facts about the picture a single-image session edits, captured once when it is opened.
-/// Shared read-only (`Arc`) by every consumer of [`SessionKind::SingleImage`].
+/// Facts about ONE opened picture file of an image-set session, captured once when it is
+/// opened; page `idx` of the scratch chapter was decoded from `SingleImageSession::source(idx)`.
 #[derive(Clone)]
-pub struct SingleImageSession {
+pub struct SourceImageFacts {
     /// Absolute path of the file as the user opened it (symlinks NOT resolved).
     pub source_path: PathBuf,
     /// Format detected from the file content.
@@ -334,23 +341,97 @@ pub struct SingleImageSession {
     pub exif_orientation_applied: bool,
     /// The embedded ICC profile, re-embedded on save (pixels are never colour converted).
     pub icc_profile: Option<Vec<u8>>,
-    /// Session root of the scratch directory backing this session.
-    pub scratch_root: PathBuf,
+    /// Digest of the page exactly as written into the scratch chapter (upright RGBA8): the
+    /// baseline a save compares the flattened page against to skip an unchanged file.
+    pub opened_digest: PixelDigest,
 }
 
 // Manual `Debug`: an ICC profile can be hundreds of KiB and is never dumped into logs;
 // only its presence and length are shown.
-impl std::fmt::Debug for SingleImageSession {
+impl std::fmt::Debug for SourceImageFacts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SingleImageSession")
+        f.debug_struct("SourceImageFacts")
             .field("source_path", &self.source_path)
             .field("source_format", &self.source_format)
             .field("extension_matches_content", &self.extension_matches_content)
             .field("source_animated", &self.source_animated)
             .field("exif_orientation_applied", &self.exif_orientation_applied)
             .field("icc_profile_len", &self.icc_profile.as_ref().map(Vec::len))
-            .field("scratch_root", &self.scratch_root)
+            .field("opened_digest", &self.opened_digest)
             .finish()
+    }
+}
+
+/// One requested file that an image-set open left out (missing, not a file, unsupported,
+/// undecodable or unreadable), kept so the UI can list it after the open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedSource {
+    /// The path as requested (absolute when it could be resolved).
+    pub path: PathBuf,
+    /// Localized reason for the user, rendered when the file was skipped.
+    pub message: String,
+}
+
+/// Facts of an image-set (single-image) session, captured once when it is opened. Shared
+/// read-only (`Arc`) by every consumer of [`SessionKind::SingleImage`].
+///
+/// Invariant (enforced by [`SingleImageSession::new`]): at least one source; `sources()[i]`
+/// backs scratch page `i` (`Page::idx == i`), in the order the files were received.
+#[derive(Debug, Clone)]
+pub struct SingleImageSession {
+    sources: Vec<SourceImageFacts>,
+    skipped: Vec<SkippedSource>,
+    scratch_root: PathBuf,
+}
+
+impl SingleImageSession {
+    /// A session over `sources` (page order), the files left out at open time (`skipped`, in
+    /// request order) and the scratch session root backing it. `None` when `sources` is empty:
+    /// a session always has at least one page.
+    #[must_use]
+    pub fn new(sources: Vec<SourceImageFacts>, skipped: Vec<SkippedSource>, scratch_root: PathBuf) -> Option<Self> {
+        if sources.is_empty() {
+            return None;
+        }
+        Some(Self { sources, skipped, scratch_root })
+    }
+
+    /// Every opened source in page order (never empty).
+    #[must_use]
+    pub fn sources(&self) -> &[SourceImageFacts] {
+        &self.sources
+    }
+
+    /// The source of page `page_idx`, `None` past the last page.
+    #[must_use]
+    pub fn source(&self, page_idx: usize) -> Option<&SourceImageFacts> {
+        self.sources.get(page_idx)
+    }
+
+    /// The source of page 0: the file a one-image session is about, and the one whose folder
+    /// and name stand for the whole set (dialog start folder, window title).
+    #[must_use]
+    pub fn first_source(&self) -> &SourceImageFacts {
+        // `new` refuses an empty list and the field is private, so index 0 always exists.
+        &self.sources[0]
+    }
+
+    /// Number of opened pages (at least 1).
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Requested files the open left out, in request order (empty when everything opened).
+    #[must_use]
+    pub fn skipped(&self) -> &[SkippedSource] {
+        &self.skipped
+    }
+
+    /// Session root of the scratch directory backing this session.
+    #[must_use]
+    pub fn scratch_root(&self) -> &Path {
+        &self.scratch_root
     }
 }
 
@@ -385,13 +466,14 @@ impl ProjectData {
     }
 
     /// The directory the user thinks of as "where this lives": the chapter directory of a
-    /// project, or the folder containing the opened image in single-image mode (never the
+    /// project, or the folder containing the first opened image in image-set mode (never the
     /// scratch directory). Used as the starting folder of file dialogs.
     #[must_use]
     pub fn user_facing_dir(&self) -> PathBuf {
         match &self.session {
             SessionKind::Project => self.project_dir.clone(),
             SessionKind::SingleImage(session) => session
+                .first_source()
                 .source_path
                 .parent()
                 .map_or_else(|| self.project_dir.clone(), Path::to_path_buf),
@@ -727,7 +809,15 @@ fn reconcile_clean_layers_dir(project_dir: &Path) -> Result<()> {
 /// # Errors
 /// Returns an error if the file cannot be created or the encoder fails to write `target`.
 fn write_png_fast(image: &image::DynamicImage, target: &Path) -> Result<()> {
-    let rgba = image.to_rgba8();
+    write_png_rgba8_fast(&image.to_rgba8(), target)
+}
+
+/// [`write_png_fast`] for a buffer that already is RGBA8 (no conversion copy): the image-set
+/// open writes, and hashes, exactly this buffer.
+///
+/// # Errors
+/// Returns an error if the encoder fails or the storage seam cannot write `target`.
+fn write_png_rgba8_fast(rgba: &image::RgbaImage, target: &Path) -> Result<()> {
     // Encode into an in-memory buffer, then hand the finished PNG bytes to the storage seam.
     // The seam owns the actual byte sink (real file on native, virtual store on web), so no
     // direct file handle is created here.

@@ -2,15 +2,19 @@
 File: crates/ms-config/src/single_image.rs
 
 Purpose:
-Names, data and the one setting of the single-image editing mode (open one picture file,
-edit it in the studio, write it back): which input files it accepts, where its throwaway
-scratch chapters live, and the `SingleImage` section of `user_config`.
+Names, data and the one setting of the image-set (single-image) editing mode (open one or
+several picture files, edit them in the studio, write them back): which input files it accepts,
+when a large set asks for confirmation, where its throwaway scratch chapters live, and the
+`SingleImage` section of `user_config`.
 
 Key items:
 - `ImageFileType` / `INPUT_FILE_TYPES` / `input_extensions()`: the ONE table of readable input
   types. Consumed by the launcher picker filter, the Linux `.desktop` `MimeType=` line, the
   Windows "Open with" `SupportedTypes`, and the CLI error text; a test in `ms-project` asserts
   every entry decodes.
+- `IMAGE_SET_CONFIRM_COUNT` / `IMAGE_SET_CONFIRM_DECODED_BYTES`: the soft size limits above which
+  opening an image set asks the user first (the decision itself is
+  `ms_project::single_image::needs_size_confirmation`).
 - `scratch_base()` (native only) + `SCRATCH_MARKER_FILE` / `SCRATCH_LOCK_FILE`: the per-user
   scratch root under the OS temp directory and the two per-session file names the startup sweep
   keys on.
@@ -59,6 +63,15 @@ pub const INPUT_FILE_TYPES: &[ImageFileType] = &[
 pub fn input_extensions() -> impl Iterator<Item = &'static str> {
     INPUT_FILE_TYPES.iter().flat_map(|file_type| file_type.extensions.iter().copied())
 }
+
+/// An image set of MORE than this many files asks the user to confirm before it opens (there is
+/// no hard cap; user decision). Consumed by `ms_project::single_image::needs_size_confirmation`.
+pub const IMAGE_SET_CONFIRM_COUNT: usize = 200;
+
+/// An image set whose decoded pages (RGBA8, 4 bytes per pixel) would take MORE than this many
+/// bytes (2 GiB) asks the user to confirm before it opens. Consumed with
+/// [`IMAGE_SET_CONFIRM_COUNT`] by `ms_project::single_image::needs_size_confirmation`.
+pub const IMAGE_SET_CONFIRM_DECODED_BYTES: u64 = 2 << 30;
 
 /// Name of the directory under the OS temp directory that holds every scratch session.
 #[cfg(not(target_arch = "wasm32"))]

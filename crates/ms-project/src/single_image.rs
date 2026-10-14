@@ -2,16 +2,18 @@
 File: crates/ms-project/src/single_image.rs
 
 Purpose:
-The storage side of the single-image editing mode (open one picture file, edit it in the
-studio, write it back). The picture is never edited where it lies: it is decoded into a
-hidden, throwaway scratch chapter, and the REGULAR `ProjectData::load` runs on that chapter,
-so every tab, writer and loader keeps working against an ordinary chapter tree while the
-user's file and folder stay untouched until an explicit Save / Save As (owned elsewhere).
+The storage side of the image-set (single-image) editing mode (open one or several picture
+files in a given order, edit them in the studio, write them back). The pictures are never
+edited where they lie: they are decoded into a hidden, throwaway scratch chapter (one page per
+file, in the order received), and the REGULAR `ProjectData::load` runs on that chapter, so
+every tab, writer and loader keeps working against an ordinary chapter tree while the user's
+files and folders stay untouched until an explicit Save / Save As (owned elsewhere).
 
 Scratch layout (fixed ASCII names, never derived from the user's file name):
     <base>/<session-id>/                  session root: `.ms-single-image` marker, `.lock` (held)
     <base>/<session-id>/title/            ProjectPaths::title_dir (`settings.json` seeded here)
-    <base>/<session-id>/title/chapter/src/000.png   the decoded, upright source
+    <base>/<session-id>/title/chapter/src/{i:03}.png   page i: the i-th opened file, decoded
+                                                     and upright (000.png, 001.png, ...)
 
 Key items:
 - `SingleImageScratch`: one reserved session root. `reserve` creates it in the order
@@ -20,13 +22,16 @@ Key items:
   plain drop leaves the directory for the next startup sweep); `remove` deletes it.
 - `sweep_stale_sessions`: deletes every session root under a base that carries the marker and
   whose `.lock` can be acquired (its owner process is gone). Unmarked entries are never touched.
-- `prepare_session`: source file -> format check against the readable-types table -> ICC /
-  EXIF orientation / animation probe -> decode (default `image::Limits`) -> orientation baked
-  in -> PNG `000.png` in the scratch chapter -> `comic_type = pages` seeded.
-- `open_single_image`: `prepare_session` + `ProjectData::load` on the scratch chapter + the
-  `SessionKind::SingleImage` session set on the result.
+- `estimate_image_set` / `ImageSetEstimate` / `needs_size_confirmation`: header-only size
+  estimate of a set and the soft-limit decision (thresholds in `ms_config::single_image`).
+- `open_image_set`: per file, in order, `decode_source` (format check against the
+  readable-types table -> ICC / EXIF orientation / animation probe -> decode with the default
+  `image::Limits` -> orientation baked in -> RGBA8) then `write_scratch_page` (`PixelDigest` of
+  the written buffer, PNG `{i:03}.png`); a file failing `decode_source` is SKIPPED and listed,
+  a `write_scratch_page` failure aborts the set. Then `comic_type = pages` seeded once, the
+  regular `ProjectData::load`, the page list checked, `SessionKind::SingleImage` set.
 - `SingleImageError`: typed failure; `user_message()` is localized
-  (`project.single_image.*_error`), `Display` is the technical text for logs.
+  (`project.single_image.*`), `Display` is the technical text for logs.
 
 Notes:
 Native only (`cfg(not(target_arch = "wasm32"))` on the `mod` line): it needs the OS temp dir
@@ -44,25 +49,26 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 use image::codecs::gif::GifDecoder;
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::metadata::Orientation;
-use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader};
-use ms_config::single_image::{INPUT_FILE_TYPES, SCRATCH_LOCK_FILE, SCRATCH_MARKER_FILE, input_extensions};
+use image::{AnimationDecoder, DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
+use ms_config::single_image::{IMAGE_SET_CONFIRM_COUNT, IMAGE_SET_CONFIRM_DECODED_BYTES, INPUT_FILE_TYPES, SCRATCH_LOCK_FILE, SCRATCH_MARKER_FILE, input_extensions};
 use ms_log::runtime_log;
 use serde_json::Value;
 
-use crate::{ComicType, ProjectData, SessionKind, SingleImageSession, SourceImageFormat};
+use crate::{ComicType, PixelDigest, ProjectData, SessionKind, SingleImageSession, SkippedSource, SourceImageFacts, SourceImageFormat};
 
 /// Title directory name inside a session root.
 const SCRATCH_TITLE_DIR: &str = "title";
 /// Chapter directory name inside the scratch title.
 const SCRATCH_CHAPTER_DIR: &str = "chapter";
-/// File name of the one page inside the scratch chapter's source directory.
-const SCRATCH_PAGE_FILE: &str = "000.png";
+/// At most this many file names are listed in the "nothing opened" message; the rest are
+/// summarized as a count.
+const NOTHING_OPENED_LISTED_NAMES: usize = 10;
 /// Session-root name attempts before `reserve` gives up on name collisions. A collision needs
 /// the same pid, nanosecond timestamp and counter, so more than one retry means a broken clock
 /// or a hostile directory; the bound keeps `reserve` from spinning.
@@ -71,7 +77,8 @@ const RESERVE_MAX_ATTEMPTS: u32 = 16;
 /// Process-wide counter that disambiguates session ids created within one clock tick.
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Failure of a single-image operation.
+/// Failure of an image-set (single-image) operation. The first five variants describe ONE
+/// source file; inside [`open_image_set`] they make that file skipped, not the open fail.
 ///
 /// `Display` is the technical text for logs (paths, operation, OS error);
 /// [`SingleImageError::user_message`] is the localized text for the user.
@@ -91,8 +98,13 @@ pub enum SingleImageError {
     Io { op: &'static str, path: PathBuf, source: io::Error },
     /// The session lock file could not be created or locked.
     Lock { path: PathBuf, reason: String },
-    /// The prepared scratch chapter did not load as a one-page project.
+    /// The prepared scratch chapter did not load as exactly the opened pages, in order.
     ProjectLoad { reason: String },
+    /// No file of the set could be opened; `skipped` lists every requested file with its
+    /// reason (callers' `prior_skipped` first).
+    NothingOpened { skipped: Vec<SkippedSource> },
+    /// The caller's cancel flag stopped the open.
+    Cancelled,
 }
 
 impl SingleImageError {
@@ -111,8 +123,37 @@ impl SingleImageError {
             Self::Io { path, .. } => tf!("project.single_image.io_error", path = path.display()),
             Self::Lock { path, .. } => tf!("project.single_image.lock_error", path = path.display()),
             Self::ProjectLoad { .. } => t!("project.single_image.project_load_error").to_string(),
+            Self::NothingOpened { skipped } => nothing_opened_message(skipped),
+            Self::Cancelled => t!("project.single_image.open_cancelled_status").to_string(),
         }
     }
+}
+
+/// User text of [`SingleImageError::NothingOpened`]. With exactly one requested file it is that
+/// file's own reason, word for word what a one-image open has always shown; otherwise the
+/// listed file names (see [`listed_file_names`]), one per line, plus "and N more".
+fn nothing_opened_message(skipped: &[SkippedSource]) -> String {
+    if let [only] = skipped {
+        return only.message.clone();
+    }
+    let (names, rest) = listed_file_names(skipped);
+    let mut files = names.join("\n");
+    if rest > 0 {
+        files.push('\n');
+        files.push_str(&tp!("project.single_image.more_files_label", rest));
+    }
+    tf!("project.single_image.nothing_opened_error", files = files)
+}
+
+/// The file names (the path's last component, else the whole path) of the first
+/// `NOTHING_OPENED_LISTED_NAMES` skipped entries, and how many entries are left unlisted.
+fn listed_file_names(skipped: &[SkippedSource]) -> (Vec<String>, usize) {
+    let names = skipped
+        .iter()
+        .take(NOTHING_OPENED_LISTED_NAMES)
+        .map(|entry| entry.path.file_name().map_or_else(|| entry.path.display().to_string(), |name| name.to_string_lossy().into_owned()))
+        .collect();
+    (names, skipped.len().saturating_sub(NOTHING_OPENED_LISTED_NAMES))
 }
 
 impl fmt::Display for SingleImageError {
@@ -127,6 +168,8 @@ impl fmt::Display for SingleImageError {
             Self::Io { op, path, source } => write!(f, "single image I/O failed ({op}) at {}: {source}", path.display()),
             Self::Lock { path, reason } => write!(f, "single image scratch lock failed at {}: {reason}", path.display()),
             Self::ProjectLoad { reason } => write!(f, "single image scratch chapter failed to load: {reason}"),
+            Self::NothingOpened { skipped } => write!(f, "no file of the image set could be opened ({} skipped)", skipped.len()),
+            Self::Cancelled => write!(f, "image set open cancelled"),
         }
     }
 }
@@ -140,7 +183,9 @@ impl std::error::Error for SingleImageError {
             | Self::UnsupportedFormat { .. }
             | Self::Decode { .. }
             | Self::Lock { .. }
-            | Self::ProjectLoad { .. } => None,
+            | Self::ProjectLoad { .. }
+            | Self::NothingOpened { .. }
+            | Self::Cancelled => None,
         }
     }
 }
@@ -199,7 +244,7 @@ impl SingleImageScratch {
     }
 
     /// The scratch chapter directory (`<root>/title/chapter`), the directory handed to
-    /// `ProjectData::load`. It exists only after [`prepare_session`].
+    /// `ProjectData::load`. It exists only after [`open_image_set`] created it.
     #[must_use]
     pub fn chapter_dir(&self) -> PathBuf {
         self.root.join(SCRATCH_TITLE_DIR).join(SCRATCH_CHAPTER_DIR)
@@ -407,17 +452,60 @@ fn push_sweep_error(report: &mut SweepReport, message: String) {
     report.errors.push(message);
 }
 
-/// Result of [`prepare_session`].
-#[derive(Debug, Clone)]
-pub struct PreparedSingleImage {
-    /// The scratch chapter directory to hand to `ProjectData::load`.
-    pub chapter_dir: PathBuf,
-    /// Session facts to attach to the loaded `ProjectData`.
-    pub session: Arc<SingleImageSession>,
-    /// Width of the upright (orientation-applied) page, in pixels.
-    pub width_px: u32,
-    /// Height of the upright (orientation-applied) page, in pixels.
-    pub height_px: u32,
+/// Size of an image set as estimated before it is opened (see [`estimate_image_set`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSetEstimate {
+    /// Number of requested files.
+    pub count: usize,
+    /// Bytes the decoded pages would take as RGBA8 (4 bytes per pixel), from the file headers.
+    /// A file whose header cannot be read counts as 0 (the open reports it as skipped).
+    pub decoded_bytes: u64,
+}
+
+/// Estimates the memory an image set would decode into, from the file HEADERS only (no pixel
+/// decode): `width * height * 4` per readable file, saturating. The dimensions are the stored
+/// ones; an EXIF rotation swaps them without changing the product. Blocking (opens every file):
+/// worker thread only.
+#[must_use]
+pub fn estimate_image_set(sources: &[PathBuf]) -> ImageSetEstimate {
+    let decoded_bytes = sources.iter().map(|source| header_decoded_bytes(source)).fold(0_u64, u64::saturating_add);
+    ImageSetEstimate { count: sources.len(), decoded_bytes }
+}
+
+/// RGBA8 byte size of one file from its header, 0 when the header cannot be read (logged; the
+/// open itself reports that file as skipped with the real reason).
+fn header_decoded_bytes(source: &Path) -> u64 {
+    // `ImageReader::open` presets the format from the extension, so a signature-less TGA is
+    // still measured; any recognized content signature overrides it.
+    let dimensions = ImageReader::open(source)
+        .and_then(ImageReader::with_guessed_format)
+        .map_err(image::ImageError::from)
+        .and_then(ImageReader::into_dimensions);
+    match dimensions {
+        Ok((width, height)) => u64::from(width).saturating_mul(u64::from(height)).saturating_mul(4),
+        Err(err) => {
+            runtime_log::log_info(format!(
+                "single image: size estimate cannot read the header of {}: {err}; counted as 0 bytes",
+                source.display()
+            ));
+            0
+        }
+    }
+}
+
+/// `true` when an image set is large enough to ask the user before opening it: more than
+/// `ms_config::single_image::IMAGE_SET_CONFIRM_COUNT` files, or more than
+/// `IMAGE_SET_CONFIRM_DECODED_BYTES` of decoded pages. There is no hard cap.
+#[must_use]
+pub fn needs_size_confirmation(estimate: &ImageSetEstimate) -> bool {
+    estimate.count > IMAGE_SET_CONFIRM_COUNT || estimate.decoded_bytes > IMAGE_SET_CONFIRM_DECODED_BYTES
+}
+
+/// File name of scratch page `page_idx`: the canonical zero-padded `{idx:03}.png` that
+/// `ProjectData::load`'s page normalization also produces, so the load never renames a page and
+/// its numeric sort keeps the received order past 999 (`1000.png` sorts after `999.png`).
+fn scratch_page_file_name(page_idx: usize) -> String {
+    format!("{page_idx:03}.png")
 }
 
 /// Maps a recognized `image` format onto the readable single-image types, `None` for any
@@ -466,20 +554,31 @@ fn probe_animated(bytes: &[u8], format: SourceImageFormat, path: &Path) -> Resul
     }
 }
 
-/// Decodes `source` into the scratch chapter of `scratch` and seeds its comic type.
+/// One source file decoded and probed, not yet written into the scratch chapter.
+struct DecodedSource {
+    source_path: PathBuf,
+    source_format: SourceImageFormat,
+    extension_matches_content: bool,
+    source_animated: bool,
+    exif_orientation_applied: bool,
+    icc_profile: Option<Vec<u8>>,
+    /// The upright (orientation-applied) pixels reduced to RGBA8: exactly what is written.
+    rgba: RgbaImage,
+}
+
+/// Reads, probes and decodes ONE source file. Every error here concerns that file alone (the
+/// image-set open skips it and continues); nothing is written.
 ///
 /// The format is detected from the content (the extension decides only for TGA, which has no
 /// signature) and must be a readable type. The ICC profile and EXIF orientation come from the
-/// decoder; the orientation is baked into the pixels, which are reduced to RGBA8 and written
-/// as `<chapter>/src/000.png`; `comic_type = pages` is written to the scratch title's
-/// `settings.json`. The source file and its folder are only READ. Decoding uses the default
-/// `image::Limits`. Call it once per freshly reserved scratch. Blocking: worker thread only.
+/// decoder; the orientation is baked into the pixels, which are reduced to RGBA8 once. Decoding
+/// uses the default `image::Limits`. The source file and its folder are only READ.
 ///
 /// # Errors
-/// `NotFound` / `NotAFile` for a bad path, `UnsupportedFormat` for content outside the
-/// readable types, `Decode` for a damaged or over-limit image, `Io` for filesystem failures
-/// (including the comic-type seed).
-pub fn prepare_session(source: &Path, scratch: &SingleImageScratch) -> Result<PreparedSingleImage, SingleImageError> {
+/// `NotFound` / `NotAFile` for a bad path, `UnsupportedFormat` for content outside the readable
+/// types, `Decode` for a damaged or over-limit image, `Io` when the file cannot be resolved,
+/// stat-ed, read or probed.
+fn decode_source(source: &Path) -> Result<DecodedSource, SingleImageError> {
     let source_path = std::path::absolute(source).map_err(|err| io_error("resolve source path", source, err))?;
     match std::fs::metadata(&source_path) {
         Ok(meta) if meta.is_file() => {}
@@ -528,60 +627,138 @@ pub fn prepare_session(source: &Path, scratch: &SingleImageScratch) -> Result<Pr
     });
     let mut image = DynamicImage::from_decoder(decoder).map_err(decode_err)?;
     image.apply_orientation(orientation);
-    let exif_orientation_applied = orientation != Orientation::NoTransforms;
-    let (width_px, height_px) = (image.width(), image.height());
+    // 16-bit and float sources are reduced to RGBA8 here, like every page the app works on;
+    // `into_rgba8` reuses the buffer when the image already is RGBA8.
+    let rgba = image.into_rgba8();
+    Ok(DecodedSource {
+        source_path,
+        source_format,
+        extension_matches_content,
+        source_animated,
+        exif_orientation_applied: orientation != Orientation::NoTransforms,
+        icc_profile,
+        rgba,
+    })
+}
 
+/// Writes `decoded` as scratch page `page_idx` into `src_dir` and returns its facts, with the
+/// digest of exactly the written buffer. Every error here is a scratch failure (fatal for the
+/// whole set), never a property of the source file.
+///
+/// # Errors
+/// `Io` when the page cannot be encoded or written.
+fn write_scratch_page(decoded: DecodedSource, page_idx: usize, src_dir: &Path) -> Result<SourceImageFacts, SingleImageError> {
+    let DecodedSource { source_path, source_format, extension_matches_content, source_animated, exif_orientation_applied, icc_profile, rgba } = decoded;
+    let (width_px, height_px) = rgba.dimensions();
+    let opened_digest = PixelDigest::of_rgba8(width_px, height_px, rgba.as_raw());
+    let page_path = src_dir.join(scratch_page_file_name(page_idx));
+    // The shared service-format PNG writer (RGBA8, fast compression).
+    crate::write_png_rgba8_fast(&rgba, &page_path).map_err(|err| io_error("write scratch page", &page_path, io::Error::other(format!("{err:#}"))))?;
+    runtime_log::log_info(format!(
+        "single image: page {page_idx} prepared from {} (format {}, {width_px}x{height_px}, animated {source_animated}, orientation applied {exif_orientation_applied}, icc {}, extension matches content {extension_matches_content})",
+        source_path.display(),
+        source_format.as_str(),
+        if icc_profile.is_some() { "present" } else { "absent" },
+    ));
+    Ok(SourceImageFacts { source_path, source_format, extension_matches_content, source_animated, exif_orientation_applied, icc_profile, opened_digest })
+}
+
+/// Opens an ORDERED set of picture files as one image-set session: page `i` of a fresh scratch
+/// chapter is the `i`-th file that opened, in the order given; files that cannot be opened are
+/// left out and listed. Then the regular `ProjectData::load` runs on the scratch chapter and its
+/// `session` is set to `SessionKind::SingleImage`. A one-file set is the classic single-image
+/// mode.
+///
+/// - Files are decoded SEQUENTIALLY (one decoded image in memory at a time); each is written as
+///   `<chapter>/src/{i:03}.png` and hashed once (`SourceImageFacts::opened_digest`).
+/// - `prior_skipped`: files the caller already rejected (e.g. a failed copy), listed first in the
+///   session's `skipped`, before the ones skipped here.
+/// - `progress(done, total)`: called with `(0, total)` first and after every file, skipped ones
+///   included (`total == sources.len()`).
+/// - `cancel` is checked before every file and before the final load.
+/// - `comic_type = pages` is seeded once into the scratch title's `settings.json`.
+///
+/// Call it once per freshly reserved scratch. The user's files and folders are only READ.
+/// Blocking: the studio open worker only.
+///
+/// # Errors
+/// Per-file problems (`NotFound`, `NotAFile`, `UnsupportedFormat`, `Decode`, a source `Io`) are
+/// NOT errors: the file is skipped (logged in technical form). The open fails with
+/// `NothingOpened` when no file opened, `Cancelled` when `cancel` was set, `Io` when the scratch
+/// chapter cannot be created, a page cannot be written or the comic type cannot be seeded, and
+/// `ProjectLoad` when the scratch chapter does not load as exactly the opened pages in order.
+pub fn open_image_set(
+    sources: &[PathBuf],
+    prior_skipped: Vec<SkippedSource>,
+    scratch: &SingleImageScratch,
+    user_settings: &Value,
+    progress: &mut dyn FnMut(usize, usize),
+    cancel: &AtomicBool,
+) -> Result<ProjectData, SingleImageError> {
+    let total = sources.len();
     let chapter_dir = scratch.chapter_dir();
     let src_dir = chapter_dir.join(ms_config::SRC_DIR);
     std::fs::create_dir_all(&src_dir).map_err(|err| io_error("create scratch chapter", &src_dir, err))?;
-    let page_path = src_dir.join(SCRATCH_PAGE_FILE);
-    // The shared service-format PNG writer (RGBA8, fast compression): 16-bit and float
-    // sources are reduced to RGBA8 here, like every page the app works on.
-    crate::write_png_fast(&image, &page_path).map_err(|err| io_error("write scratch page", &page_path, io::Error::other(format!("{err:#}"))))?;
-    drop(image);
+
+    let mut opened: Vec<SourceImageFacts> = Vec::with_capacity(total);
+    let mut skipped = prior_skipped;
+    progress(0, total);
+    for (index, source) in sources.iter().enumerate() {
+        if cancel.load(AtomicOrdering::Relaxed) {
+            runtime_log::log_info(format!("single image: open cancelled after {index} of {total} file(s)"));
+            return Err(SingleImageError::Cancelled);
+        }
+        match decode_source(source) {
+            Ok(decoded) => opened.push(write_scratch_page(decoded, opened.len(), &src_dir)?),
+            Err(err) => {
+                runtime_log::log_warn(format!("single image: skipped file {} of {total}: {err}", index + 1));
+                skipped.push(SkippedSource { path: source.clone(), message: err.user_message() });
+            }
+        }
+        progress(index + 1, total);
+    }
+    if opened.is_empty() {
+        runtime_log::log_warn(format!("single image: none of {total} file(s) could be opened ({} skipped)", skipped.len()));
+        return Err(SingleImageError::NothingOpened { skipped });
+    }
+    if cancel.load(AtomicOrdering::Relaxed) {
+        runtime_log::log_info("single image: open cancelled before the scratch chapter load");
+        return Err(SingleImageError::Cancelled);
+    }
 
     // D4: seed `comic_type` so the load yields `Some(Pages)` and no comic-type prompt opens.
     let settings_file = scratch.root().join(SCRATCH_TITLE_DIR).join(ms_config::PROJECT_SETTINGS_FILE);
     crate::save_comic_type_to_project_file(&settings_file, ComicType::Pages, ms_docstore::Durability::Contents)
         .map_err(|err| io_error("seed scratch comic type", &settings_file, io::Error::other(err)))?;
 
-    runtime_log::log_info(format!(
-        "single image: prepared {} (format {}, {width_px}x{height_px}, animated {source_animated}, orientation applied {exif_orientation_applied}, icc {}, extension matches content {extension_matches_content})",
-        source_path.display(),
-        source_format.as_str(),
-        if icc_profile.is_some() { "present" } else { "absent" },
-    ));
-
-    let session = Arc::new(SingleImageSession {
-        source_path,
-        source_format,
-        extension_matches_content,
-        source_animated,
-        exif_orientation_applied,
-        icc_profile,
-        scratch_root: scratch.root().to_path_buf(),
-    });
-    Ok(PreparedSingleImage { chapter_dir, session, width_px, height_px })
+    let mut data = ProjectData::load(&chapter_dir, user_settings).map_err(|err| SingleImageError::ProjectLoad { reason: format!("{err:#}") })?;
+    check_loaded_pages(&data, opened.len(), &chapter_dir)?;
+    let page_count = opened.len();
+    let skipped_count = skipped.len();
+    let session = SingleImageSession::new(opened, skipped, scratch.root().to_path_buf())
+        .ok_or_else(|| SingleImageError::ProjectLoad { reason: "image-set session built without a page".to_owned() })?;
+    runtime_log::log_info(format!("single image: opened an image set of {page_count} page(s), {skipped_count} file(s) skipped"));
+    data.session = SessionKind::SingleImage(Arc::new(session));
+    Ok(data)
 }
 
-/// Opens `source` as a single-image session: [`prepare_session`], then the regular
-/// `ProjectData::load` on the scratch chapter, then `session` set to
-/// `SessionKind::SingleImage`. Blocking: the studio load worker only.
-///
-/// # Errors
-/// Every [`prepare_session`] error, and `ProjectLoad` when the scratch chapter does not load
-/// or does not come out as exactly one page.
-pub fn open_single_image(source: &Path, scratch: &SingleImageScratch, user_settings: &Value) -> Result<ProjectData, SingleImageError> {
-    let prepared = prepare_session(source, scratch)?;
-    let mut data = ProjectData::load(&prepared.chapter_dir, user_settings)
-        .map_err(|err| SingleImageError::ProjectLoad { reason: format!("{err:#}") })?;
-    if data.pages.len() != 1 {
+/// Checks that the scratch chapter loaded as exactly `expected` pages named `000.png`,
+/// `001.png`, ... in that order, so `Page::idx == i` maps onto the `i`-th opened source.
+fn check_loaded_pages(data: &ProjectData, expected: usize, chapter_dir: &Path) -> Result<(), SingleImageError> {
+    if data.pages.len() != expected {
         return Err(SingleImageError::ProjectLoad {
-            reason: format!("scratch chapter {} has {} pages, expected 1", prepared.chapter_dir.display(), data.pages.len()),
+            reason: format!("scratch chapter {} has {} pages, expected {expected}", chapter_dir.display(), data.pages.len()),
         });
     }
-    data.session = SessionKind::SingleImage(prepared.session);
-    Ok(data)
+    for (position, page) in data.pages.iter().enumerate() {
+        let name = page.path.file_name().and_then(|name| name.to_str());
+        if page.idx != position || name != Some(scratch_page_file_name(position).as_str()) {
+            return Err(SingleImageError::ProjectLoad {
+                reason: format!("scratch page {position} loaded as {} (idx {}), expected {}", page.path.display(), page.idx, scratch_page_file_name(position)),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

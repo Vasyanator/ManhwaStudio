@@ -127,9 +127,11 @@ that defines the type.
   `auto`; the old key is always removed, an existing new key wins) and runs in
   `load_user_config` BEFORE the defaults backfill; the reader maps an unmigrated legacy key the
   same way. Applied to the forked winit by `ms_window_geometry` (Android only).
-- `single_image.rs`: the single-image editing mode's shared names — `INPUT_FILE_TYPES` (the ONE
-  readable-input table: extensions + MIME; consumed by the launcher picker, the Linux desktop
-  entry, the Windows "Open with" registration and the CLI error text), `scratch_base()`
+- `single_image.rs`: the image-set (single-image) editing mode's shared names — `INPUT_FILE_TYPES`
+  (the ONE readable-input table: extensions + MIME; consumed by the launcher picker, the Linux
+  desktop entry, the Windows "Open with" registration and the CLI error text), the soft size
+  limits `IMAGE_SET_CONFIRM_COUNT` (200 files) / `IMAGE_SET_CONFIRM_DECODED_BYTES` (2 GiB of
+  RGBA8) above which an open asks first, `scratch_base()`
   (native-only, per-user: `std::env::temp_dir()/manhwastudio-single-image-<user>` on Unix, where
   `/tmp` is shared; unsuffixed on Windows, whose temp dir is per-user) with the per-session
   `SCRATCH_MARKER_FILE` / `SCRATCH_LOCK_FILE` names, and the `SingleImage.jpeg_quality` setting

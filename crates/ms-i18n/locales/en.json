@@ -3518,8 +3518,14 @@
   "project.single_image.decode_error": "Could not read the image {path}. The file may be damaged, truncated or too large to open.",
   "project.single_image.io_error": "Could not prepare the image for editing (a file operation failed at {path}). Check free disk space and access rights to the temporary folder.",
   "project.single_image.lock_error": "Could not reserve a temporary working folder for the image ({path}). Check access rights to the temporary folder.",
+  "project.single_image.more_files_label": {
+    "one": "… and {n} more file",
+    "other": "… and {n} more files"
+  },
   "project.single_image.not_a_file_error": "{path} is not an image file. Choose a single image file, not a folder.",
   "project.single_image.not_found_error": "Image file not found: {path}. Check that the file exists and has not been moved or renamed.",
+  "project.single_image.nothing_opened_error": "None of the selected images could be opened:\n{files}\nCheck that the files exist, are readable and are in a supported format.",
+  "project.single_image.open_cancelled_status": "Opening the images was cancelled.",
   "project.single_image.project_load_error": "The image was decoded but could not be opened for editing. See the log for details.",
   "project.single_image.unsupported_format_error": "{path} is not a supported image. Supported types: {types}.",
   "ps_editor.active_controls.base_locked_tooltip": "Base layer: it cannot be moved, grouped, merged or deleted",

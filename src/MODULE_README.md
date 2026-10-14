@@ -450,7 +450,7 @@ positional path (what Linux `.desktop` `%f` and Windows "Open with" `"%1"` pass)
 like `--project`; a missing path, a directory (the message names `--project`) or a non-file shows
 `show_startup_error_dialog` and ends startup. The studio screen's open worker then reserves a
 scratch session (`SingleImageScratch::reserve` under `ms_config::single_image::scratch_base()`)
-and runs `open_single_image` in it (no unsaved detection); the studio screen OWNS the request for
+and runs `open_image_set` in it (no unsaved detection); the studio screen OWNS the request for
 the session's whole life and the Closing screen's teardown worker deletes the scratch after the app
 was dropped (never on the GUI thread). A reservation failure, like an open/decode failure, lands on
 the studio error screen as `SingleImageError::user_message` with the usual "Exit to launcher" /

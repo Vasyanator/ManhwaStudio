@@ -16,7 +16,8 @@ Key structures:
 Key functions:
 - `encode_rgba()`: RGBA8 image -> encoded file bytes in memory (no I/O).
 - `in_place_format()`: the in-place writability rule over primitive inputs;
-  `ImageSaveFormat::in_place_for()` is its adapter over an `ms_project::SingleImageSession`.
+  `ImageSaveFormat::in_place_for()` is its adapter over one opened file's
+  `ms_project::SourceImageFacts`.
 
 Notes:
 JPEG has no alpha, so it is always flattened over white by `ms_raster::rgba_over_white_to_rgb`
@@ -110,12 +111,13 @@ impl ImageSaveFormat {
         }
     }
 
-    /// The format «Сохранить» may overwrite `session`'s opened file in, or `None` when the save
-    /// must act as «Сохранить как». A thin adapter: maps the session's content format onto
-    /// `image::ImageFormat` and delegates to [`in_place_format`], the single owner of the rule.
+    /// The format «Сохранить» may overwrite the opened file described by `facts` in (one page of
+    /// an image-set session), or `None` when that page has no in-place target. A thin adapter:
+    /// maps the file's content format onto `image::ImageFormat` and delegates to
+    /// [`in_place_format`], the single owner of the rule.
     #[must_use]
-    pub fn in_place_for(session: &ms_project::SingleImageSession) -> Option<Self> {
-        in_place_format(source_format_to_image_format(session.source_format), session.source_animated, session.extension_matches_content)
+    pub fn in_place_for(facts: &ms_project::SourceImageFacts) -> Option<Self> {
+        in_place_format(source_format_to_image_format(facts.source_format), facts.source_animated, facts.extension_matches_content)
     }
 
     /// Short technical name used in `EncodeError` messages and logs.
@@ -494,20 +496,20 @@ mod tests {
         assert!(all.iter().all(|ext| ImageSaveFormat::from_extension(ext).is_some() && *ext == ext.to_ascii_lowercase()));
     }
 
-    fn session(source_format: ms_project::SourceImageFormat, animated: bool, extension_matches_content: bool) -> ms_project::SingleImageSession {
-        ms_project::SingleImageSession {
+    fn facts(source_format: ms_project::SourceImageFormat, animated: bool, extension_matches_content: bool) -> ms_project::SourceImageFacts {
+        ms_project::SourceImageFacts {
             source_path: std::path::PathBuf::from("/home/u/pictures/page.img"),
             source_format,
             extension_matches_content,
             source_animated: animated,
             exif_orientation_applied: false,
             icc_profile: None,
-            scratch_root: std::path::PathBuf::from("/home/u/scratch"),
+            opened_digest: ms_project::PixelDigest::of_rgba8(0, 0, &[]),
         }
     }
 
     #[test]
-    fn in_place_for_session_table() {
+    fn in_place_for_facts_table() {
         use ms_project::SourceImageFormat as S;
         let cases = [
             (S::Png, false, true, Some(ImageSaveFormat::Png)),
@@ -523,7 +525,7 @@ mod tests {
             (S::Jpeg, false, false, None),
         ];
         for (format, animated, ext_ok, want) in cases {
-            assert_eq!(ImageSaveFormat::in_place_for(&session(format, animated, ext_ok)), want, "{format:?} animated={animated} ext_ok={ext_ok}");
+            assert_eq!(ImageSaveFormat::in_place_for(&facts(format, animated, ext_ok)), want, "{format:?} animated={animated} ext_ok={ext_ok}");
         }
     }
 

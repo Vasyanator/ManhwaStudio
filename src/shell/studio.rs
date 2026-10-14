@@ -53,6 +53,7 @@ use ms_thread as thread;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 /// What the user asked the studio to open, before any scratch session exists: the output of
@@ -153,9 +154,9 @@ pub(crate) struct OpenOutcome {
 /// - `Project`: detect a `{chapter}_unsaved` folder next to the chapter, then
 ///   `load_resume_unsaved` vs `load`.
 /// - `Image`: reserve a scratch session under `scratch_base` (a failure is the B5 error screen),
-///   then `open_single_image` into it (no unsaved detection: a scratch is always fresh). Errors are
-///   logged in technical form here and reported as `SingleImageError::user_message`, the one owner
-///   of decode/open error text.
+///   then `open_image_set` of that one file into it (no unsaved detection: a scratch is always
+///   fresh). Errors are logged in technical form here and reported as
+///   `SingleImageError::user_message`, the one owner of decode/open error text.
 ///
 /// The user settings are re-read on the worker so a reload observes settings changed during the
 /// session; an unreadable config falls back to `fallback_user_settings` (logged). The outcome (or
@@ -196,7 +197,9 @@ fn open_target(target: StartupTarget, scratch_base: &Path, fallback_user_setting
     };
     let result = match &request {
         StudioOpenRequest::Project(project_dir) => load_project_dir(project_dir, &user_settings),
-        StudioOpenRequest::Image { source, scratch } => crate::project::single_image::open_single_image(source, scratch, &user_settings).map_err(|err| {
+        // A one-file image set: no progress observer and no cancel yet (the loading screen has a
+        // spinner only), so the flag never flips.
+        StudioOpenRequest::Image { source, scratch } => crate::project::single_image::open_image_set(std::slice::from_ref(source), Vec::new(), scratch, &user_settings, &mut |_, _| {}, &AtomicBool::new(false)).map_err(|err| {
             runtime_log::log_error(format!("[studio] failed to open single image: {err}"));
             anyhow::Error::msg(err.user_message())
         }),

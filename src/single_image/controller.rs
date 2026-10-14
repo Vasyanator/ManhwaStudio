@@ -103,15 +103,20 @@ impl SingleImageController {
         let SessionKind::SingleImage(session) = project.session() else {
             return None;
         };
-        let in_place = ImageSaveFormat::in_place_for(session).map(|format| SaveTarget { path: session.source_path.clone(), format });
+        // Only page 0 (the session's first file) is saved here. The studio still opens one-file
+        // sets only; removal condition: the per-page save sequencing of the image-set plan (WP6)
+        // replaces this single target.
+        let source = session.first_source();
+        let in_place = ImageSaveFormat::in_place_for(source).map(|format| SaveTarget { path: source.source_path.clone(), format });
         runtime_log::log_info(format!(
-            "[single_image] session opened.\nSource: {}\nFormat: {}\nIn-place save: {:?}\nAnimated: {}",
-            session.source_path.display(),
-            session.source_format.as_str(),
+            "[single_image] session opened.\nSource: {}\nPages: {}\nFormat: {}\nIn-place save: {:?}\nAnimated: {}",
+            source.source_path.display(),
+            session.page_count(),
+            source.source_format.as_str(),
             in_place.as_ref().map(|target| target.format),
-            session.source_animated
+            source.source_animated
         ));
-        let machine = SaveMachine::new(in_place, ms_config::single_image::jpeg_quality_from(user_settings), session.source_animated, picked_paths_are_user_files());
+        let machine = SaveMachine::new(in_place, ms_config::single_image::jpeg_quality_from(user_settings), source.source_animated, picked_paths_are_user_files());
         Some(Self { session: Arc::clone(session), machine, picker_rx: None, commit_rx: None, persist_rx: None, status_shown: None, deferred_step: Step::Nothing })
     }
 
@@ -294,7 +299,7 @@ impl SingleImageController {
     /// Where paths are not written in place (see `SaveMachine`), the answer's name is never changed,
     /// so there is nothing to re-ask.
     fn spawn_picker(&mut self, format: ImageSaveFormat) {
-        let (dir, file_name) = save_as_suggestion(&self.session.source_path, self.machine.target(), format);
+        let (dir, file_name) = save_as_suggestion(&self.session.first_source().source_path, self.machine.target(), format);
         let writes_in_place = picked_paths_are_user_files();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -396,7 +401,7 @@ impl SingleImageController {
             self.machine.dispatch_refused(SaveError::NoPage);
             return;
         };
-        let encoding = ImageEncoding { format: target.format, jpeg_quality: self.machine.jpeg_quality(), alpha: AlphaPolicy::DropIfOpaque, icc_profile: self.session.icc_profile.clone() };
+        let encoding = ImageEncoding { format: target.format, jpeg_quality: self.machine.jpeg_quality(), alpha: AlphaPolicy::DropIfOpaque, icc_profile: self.session.first_source().icc_profile.clone() };
         let request = FlattenToFileRequest { page_idx, target: target.path.clone(), encoding };
         match typing.request_flatten_to_file(ctx, project, request) {
             Ok(()) => self.machine.dispatched(baseline),

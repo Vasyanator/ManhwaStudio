@@ -3935,6 +3935,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "web-time",
 ]

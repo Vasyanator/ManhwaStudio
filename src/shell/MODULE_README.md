@@ -32,7 +32,7 @@ transition goes through `screen::on_event`; the shell only executes the returned
   from scratch. The only part compiled on wasm (the web entry uses it).
 - `studio.rs`: `StartupTarget` (+ window title), `StudioOpenRequest` (+ scratch `release`), the
   open worker (`spawn_open_thread`: scratch reservation, unsaved detection, `ProjectData::load*`
-  or `open_single_image`), `StudioScreen` (loading / error / running), `install_shader_layers`.
+  or `open_image_set`), `StudioScreen` (loading / error / running), `install_shader_layers`.
 - `closing.rs`: `StudioShutdownJob` (teardown worker, `poll`, `finish_blocking`),
   `ClosingScreen` (spinner, or the failure + Continue), `teardown_blocking`.
 
