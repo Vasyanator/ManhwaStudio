@@ -83,6 +83,11 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     short-lived background worker, or both — text above the animation. An optional
     `with_action` button sits below that content; `show_with_action` returns a
     `HelpHintResponse` reporting its click.
+  - `touch_nav` (`TouchRouter`, `TouchSurface`, `TouchOutput`, `TouchNavigation`,
+    `TouchSelection`, `context_menu_popup`, `publish_surface`, `take_touch_output`): the one
+    owner of finger input on canvases. A finger that starts on a published canvas surface
+    never reaches a tool: it pans / pinches, a long-press opens the canvas context menu on
+    release or turns a following drag into a typed selection. Mouse and pen are unchanged.
 */
 #![warn(clippy::all)]
 
@@ -112,6 +117,11 @@ pub mod bubble_status;
 // installs the same chain through it. It sits here because it is a pure egui-context
 // concern shared by every window, launcher and installer included.
 pub mod ui_fonts;
+// Canvas touch gestures: the one owner of the finger decision. The shell's `raw_input_hook`
+// drives `TouchRouter`; canvases publish surfaces and take typed navigation / long-press /
+// selection output; both canvas context menus open through `context_menu_popup`. Public
+// module so consumers name `ms_widgets::touch_nav::…`; the main types are re-exported below.
+pub mod touch_nav;
 
 mod ai_button;
 mod autocomplete_line;
@@ -194,6 +204,10 @@ pub use text_edit_plus::{TextEditPlus, TextEditPlusBackground, TextEditPlusTextC
 pub use viewport_color_selector::ViewportColorSelector;
 #[allow(unused_imports)]
 pub use wheel_combo_box::WheelComboBox;
+pub use touch_nav::{
+    TouchNavigation, TouchOutput, TouchRouter, TouchSelection, TouchSelectionEnd, TouchSurface,
+    context_menu_popup,
+};
 pub use wheel_input_guard::combo_popup_open;
 #[allow(unused_imports)]
 pub use wheel_slider::WheelSlider;

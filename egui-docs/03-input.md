@@ -223,8 +223,44 @@ a frame with `ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::User
   `.map(|range| range.start.0..range.end.0)` (`src/tabs/typing/panel/create_edit.rs:944-948`;
   selection is written back with `CCursorRange::two(CCursor::new(a), CCursor::new(b))` at :935).
 
+## Touch on canvases
+
+Facts the canvas finger gestures rely on (owner: `ms_widgets::touch_nav`,
+`crates/ms-widgets/src/touch_nav/`):
+
+- **egui-winit emulates the mouse from ONE touch.** `on_touch` pushes `Event::Touch` first and
+  then, only for the touch that owns the emulated pointer (`pointer_touch_id`, the first touch of
+  any device), Start → `PointerMoved` + `PointerButton{Primary, pressed}`, Move → `PointerMoved`,
+  End → `PointerButton{released}` + `PointerGone`, Cancel → `PointerGone`
+  (`egui-winit-0.36.2/src/lib.rs:878-935`; the fork's copy is
+  `crates/egui/crates/egui-winit/src/lib.rs` `on_touch`, :920). The release carries the last
+  MOVE position (`on_mouse_button_input` uses `pointer_pos_in_points`), not the End position.
+- **`eframe::App::raw_input_hook`** (`eframe-0.36.2/src/epi.rs:279`) sees that `RawInput` before
+  egui builds its pointer state, so removing the emulated events there means egui never sees a
+  press, click, drag or long-touch from that finger. It also runs for child viewports: check
+  `raw_input.viewport_id`.
+- **egui's own touch gestures are device-wide**: `InputState::multi_touch()`
+  (`egui-0.36.2/src/input_state/mod.rs:834`) mixes every finger, including one resting on a
+  panel; a long touch needs the emulated pointer pressed (`is_long_touch`, :917) and becomes
+  `Response::secondary_clicked()` (`egui-0.36.2/src/response.rs:211`).
+- **`Context::layer_id_at` over bare canvas returns the background layer**
+  (`Some(LayerId::background())`, pinned by the `touch_nav` test
+  `layer_id_at_over_bare_canvas_is_the_background_layer`), a Foreground area as itself, and the
+  top modal layer while a modal is open (`egui-0.36.2/src/memory/mod.rs:838-845`).
+- **`Popup::context_menu` anchors at the hover position of the opening frame**
+  (`egui-0.36.2/src/containers/popup.rs:248-260`, stored by the `pub(crate)`
+  `Memory::open_popup_at`, :522-523). A claimed finger has no hover position, so canvas menus use
+  `ms_widgets::touch_nav::context_menu_popup(response, long_press_at)`, which records the anchor
+  itself and is identical for the mouse (characterization test in `touch_nav/tests.rs`).
+- **A repaint requested before the pass is lost**: `begin_pass_repaint_logic` resets the delay
+  (`egui-0.36.2/src/context.rs:99-115`), so a timer decided in the hook is requested from inside
+  the pass (`touch_nav::take_touch_output`).
+
 ## Editing map
 
+- Finger pan / pinch / long-press on a canvas → `ms_widgets::touch_nav` (publish a
+  `TouchSurface`, take `TouchOutput`, open menus with `context_menu_popup`); never read
+  `multi_touch()` or touch events directly.
 - Wheel/zoom on any canvas → `ms_widgets::input_util::raw_wheel_delta` (`crates/ms-widgets/src/input_util.rs:31`).
 - "Did the click hit bare canvas?" → `ms_widgets::input_util::pointer_over_floating_area` (`crates/ms-widgets/src/input_util.rs:55`).
 - New hotkey → register a `HotkeySpecV2` (`src/input_manager_v2.rs`) + handle it in

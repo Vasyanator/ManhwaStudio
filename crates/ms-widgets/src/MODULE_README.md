@@ -33,6 +33,13 @@ crate's `[dev-dependencies]`, so no production build carries them.
 - `lib.rs`: public export surface for reusable widgets.
 - `input_util.rs`: shared egui input helpers — raw (unsmoothed) wheel delta and the
   "is the pointer over a floating egui layer" test. Both restore semantics egui removed after 0.31 (still absent in 0.36).
+- `touch_nav/`: the one owner of finger input on canvases (own `MODULE_README.md`). The shell's
+  `raw_input_hook` drives `TouchRouter`, which claims a touch that starts on a canvas surface
+  published last frame and strips egui-winit's emulated mouse events for it, so a finger never
+  reaches a tool; canvases publish `TouchSurface`s and take a typed `TouchOutput` (pan / pinch,
+  long-press feedback, long-press menu point, long-press selection drag) every frame. Both canvas
+  context menus open through `context_menu_popup` (secondary click and long-press share one
+  path). Ordinary UI, the mouse and the pen are untouched.
 - `input_manager_v2.rs`: the user-configurable hotkey registry — code-declared `HotkeySpecV2`
   specs, the persisted `Hotkeys` overrides in `user_config.json`, and the per-frame dispatch of
   triggered commands out of `egui::InputState` by id and `HotkeyScopeV2`. It lives at this layer
@@ -465,5 +472,7 @@ crate's `[dev-dependencies]`, so no production build carries them.
   not the widget.
 - To change jamo keyboard layout or latch semantics, edit `hangul_keyboard.rs`; the syllable
   arithmetic and the compatibility-jamo tables belong to `crates/ms-text-util/src/hangul.rs`.
+- To change finger gestures on canvases (claim rule, stripping, long-press, pan / pinch) or the
+  canvas context-menu open path, edit `touch_nav/` and read its `MODULE_README.md` first.
 - To change panel docking (arrangement rules, gaps, shrinking, or later the panel widgets), edit
   `panel_dock/` and read its own `MODULE_README.md` first.
