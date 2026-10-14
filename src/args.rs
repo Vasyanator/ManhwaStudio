@@ -4,9 +4,10 @@ CLI argument parsing for the main Rust app.
 
 Main items:
 - `Cli.project`: optional path to chapter/project directory.
-- `Cli.image` / `Cli.image_positional`: one picture file to open in single-image mode
-  (`--image <PATH>` or a bare positional path, the form OS "Open with" passes). Mutually
-  exclusive with `--project` (clap group `open_target`); `Cli::image_arg` merges the two.
+- `Cli.image` / `Cli.image_positional`: the ordered picture files to open as one image set
+  (`--image <PATH>`, repeatable, or bare positional paths, the form OS "Open with" passes).
+  Mutually exclusive with `--project` and with each other (clap group `open_target`);
+  `Cli::image_args` returns whichever was given, in command-line order.
 - `conflicting_image_flags` / `check_image_arg`: the image start's flag-combination rule and its
   path pre-check (missing, directory, not a regular file), run before any window exists.
 - `Cli.no_ai`: disables AI-dependent functionality at startup.
@@ -39,7 +40,7 @@ Notes:
 and `build.rs`), not the plain `CARGO_PKG_VERSION`.
 */
 
-use clap::{ArgGroup, Parser};
+use clap::{ArgAction, ArgGroup, Parser};
 #[cfg(any(target_os = "windows", test))]
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -55,22 +56,24 @@ use std::path::{Path, PathBuf};
     version = env!("MS_APP_VERSION"),
     about = "Minimal Rust project viewer for MangaFucker projects"
 )]
-// One open target at most: a chapter (`--project`) OR one image (`--image` / positional).
-// `ArgGroup::multiple` defaults to false, so clap itself rejects any two of them together.
+// One open target at most: a chapter (`--project`) OR an image set (`--image`, repeatable) OR
+// an image set as positional paths. `ArgGroup::multiple` defaults to false, so clap itself
+// rejects any two of these ARGUMENTS together (several values of one of them are fine).
 #[command(group(ArgGroup::new("open_target")))]
 pub struct Cli {
     #[arg(long, value_name = "PATH", group = "open_target")]
     pub project: Option<PathBuf>,
 
-    /// Open one image file in single-image mode, skipping the launcher.
-    #[arg(long, value_name = "PATH", group = "open_target")]
-    pub image: Option<PathBuf>,
+    /// Open image files as one image set (pages in the given order), skipping the launcher.
+    /// Repeat the flag for several files.
+    #[arg(long, value_name = "PATH", group = "open_target", action = ArgAction::Append)]
+    pub image: Vec<PathBuf>,
 
-    /// Image file to open in single-image mode (same as `--image`). This positional form is
-    /// what file managers pass (`.desktop` `%f`, Windows "Open with" `"%1"`); the path is kept
-    /// as an `OsString`, so spaces and non-UTF-8 names survive.
-    #[arg(value_name = "IMAGE", group = "open_target")]
-    pub image_positional: Option<PathBuf>,
+    /// Image files to open as one image set (same as `--image`, in the given order). This
+    /// positional form is what file managers pass (`.desktop` `%F`, Windows "Open with"
+    /// `"%1"`); each path is kept as an `OsString`, so spaces and non-UTF-8 names survive.
+    #[arg(value_name = "IMAGE", group = "open_target", num_args = 1..)]
+    pub image_positional: Vec<PathBuf>,
 
     #[arg(long, default_value_t = false)]
     pub no_ai: bool,
@@ -200,11 +203,12 @@ fn installed_copy_flags_present(cli: &Cli) -> [bool; INSTALLED_COPY_FLAGS.len()]
 const IMAGE_EXCLUSIVE_MODE_FLAGS: &[&str] = &["--check-venv", "--test-launcher"];
 
 impl Cli {
-    /// The image to open in single-image mode: `--image`, else the positional path. clap's
-    /// `open_target` group guarantees at most one of them (and no `--project`) is set.
+    /// The image files to open as one set, in command-line order: the `--image` values, else
+    /// the positional paths; empty when no image was given. clap's `open_target` group
+    /// guarantees at most one of the two forms (and no `--project`) is used.
     #[must_use]
-    pub fn image_arg(&self) -> Option<&Path> {
-        self.image.as_deref().or(self.image_positional.as_deref())
+    pub fn image_args(&self) -> &[PathBuf] {
+        if self.image.is_empty() { &self.image_positional } else { &self.image }
     }
 }
 
@@ -214,7 +218,7 @@ impl Cli {
 /// service action runs, for the same reason as [`conflicting_installed_copy_flags`].
 #[must_use]
 pub fn conflicting_image_flags(cli: &Cli) -> Vec<&'static str> {
-    if cli.image_arg().is_none() {
+    if cli.image_args().is_empty() {
         return Vec::new();
     }
     let modes = [cli.check_venv, cli.test_launcher];
@@ -384,22 +388,37 @@ mod tests {
     }
 
     #[test]
-    fn image_arguments_parse_into_image_arg() {
-        // (command line, expected image) -- the positional form is what file managers pass.
-        let cases: &[(&[&str], Option<&str>)] = &[
-            (&[], None),
-            (&["--project", "/tmp/title/ch"], None),
-            (&["--image", "/tmp/a.png"], Some("/tmp/a.png")),
-            (&["/tmp/a.png"], Some("/tmp/a.png")),
-            (&["--no-ai", "/tmp/a.png", "--trace"], Some("/tmp/a.png")),
+    fn image_arguments_parse_into_image_args() {
+        // (command line, expected images in order) -- the positional form is what file managers pass.
+        let cases: &[(&[&str], &[&str])] = &[
+            (&[], &[]),
+            (&["--project", "/tmp/title/ch"], &[]),
+            (&["--image", "/tmp/a.png"], &["/tmp/a.png"]),
+            (&["--image", "/tmp/b.png", "--image", "/tmp/a.png"], &["/tmp/b.png", "/tmp/a.png"]),
+            (&["/tmp/a.png"], &["/tmp/a.png"]),
+            // `.desktop` `%F`: every selected file as its own argument, order kept (not sorted).
+            (&["/tmp/b.png", "/tmp/a.jpg", "/tmp/c.webp"], &["/tmp/b.png", "/tmp/a.jpg", "/tmp/c.webp"]),
+            (&["--no-ai", "/tmp/a.png", "--trace"], &["/tmp/a.png"]),
             // Windows "Open with" passes `"%1"`: one argument with spaces and non-ASCII text.
-            (&["C:\\Users\\Юзер\\My Pictures\\стр 01.jpg"], Some("C:\\Users\\Юзер\\My Pictures\\стр 01.jpg")),
-            (&["/home/u/Картинки/page one.webp"], Some("/home/u/Картинки/page one.webp")),
+            (&["C:\\Users\\Юзер\\My Pictures\\стр 01.jpg"], &["C:\\Users\\Юзер\\My Pictures\\стр 01.jpg"]),
+            (&["/home/u/Картинки/page one.webp", "/home/u/Картинки/page two.webp"], &["/home/u/Картинки/page one.webp", "/home/u/Картинки/page two.webp"]),
         ];
         for (args, expected) in cases {
             let cli = parse(args);
-            assert_eq!(cli.image_arg(), expected.map(Path::new), "command line {args:?}");
+            let expected: Vec<PathBuf> = expected.iter().map(PathBuf::from).collect();
+            assert_eq!(cli.image_args(), expected.as_slice(), "command line {args:?}");
         }
+    }
+
+    /// A non-UTF-8 file name (possible on Linux) reaches `image_args` byte for byte.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_image_paths_survive_parsing() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = OsStr::from_bytes(b"/home/u/p\xffage.png");
+        let argv = [OsStr::new("manhwastudio_rs"), raw, OsStr::new("/home/u/b.png")];
+        let cli = Cli::try_parse_from(argv).expect("non-UTF-8 paths must parse");
+        assert_eq!(cli.image_args(), [PathBuf::from(raw), PathBuf::from("/home/u/b.png")].as_slice());
     }
 
     #[test]
@@ -407,9 +426,9 @@ mod tests {
         use clap::error::ErrorKind;
         assert_eq!(parse_error(&["--project", "/tmp/ch", "--image", "/tmp/a.png"]), ErrorKind::ArgumentConflict);
         assert_eq!(parse_error(&["--project", "/tmp/ch", "/tmp/a.png"]), ErrorKind::ArgumentConflict);
+        assert_eq!(parse_error(&["--project", "/tmp/ch", "/tmp/a.png", "/tmp/b.png"]), ErrorKind::ArgumentConflict);
+        // The two image forms do not mix: `--image` values XOR positional paths.
         assert_eq!(parse_error(&["--image", "/tmp/a.png", "/tmp/b.png"]), ErrorKind::ArgumentConflict);
-        // Only one positional exists: a second bare path is a usage error, not a second image.
-        assert_eq!(parse_error(&["/tmp/a.png", "/tmp/b.png"]), ErrorKind::UnknownArgument);
     }
 
     #[test]

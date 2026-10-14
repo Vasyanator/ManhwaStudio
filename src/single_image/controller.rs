@@ -209,7 +209,7 @@ impl SingleImageController {
             step = merge_steps(step, finished);
         }
         if let Some(path) = self.machine.take_retitle() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(image_window_title(env!("MS_APP_VERSION"), &path)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(image_window_title(env!("MS_APP_VERSION"), &path, 1)));
         }
         self.time_status(ctx);
         if self.machine.busy() && !self.machine.choosing_format() {

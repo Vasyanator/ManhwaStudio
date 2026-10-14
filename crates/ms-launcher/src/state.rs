@@ -52,10 +52,11 @@ pub struct UpdateNotification {
 pub enum LauncherOutcome {
     OpenProject(OpenProjectSelection),
     StartUpdate,
-    /// Open one picture file in single-image mode. The path was checked to exist and be a
-    /// file when picked; decodability is left to the studio loading screen. Never produced by
-    /// the wasm build (no picker there).
-    OpenImage(PathBuf),
+    /// Open picture files as one image set, pages in this order (the pick, natural-sorted by
+    /// file name). Never empty; at least one path was checked to exist and be a file when
+    /// picked, the others and decodability are left to the studio open (it lists what it
+    /// skipped). Never produced by the wasm build (no picker there).
+    OpenImages(Vec<PathBuf>),
 }
 
 /// Facts about the running process the launcher cannot derive itself, handed in by

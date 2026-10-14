@@ -2,33 +2,39 @@
 File: crates/ms-launcher/src/open_image.rs
 
 Purpose:
-"Open image" flow of the main menu (single-image mode entry): the native file picker on a
-worker thread, the launcher-side validation of the picked path, and the mapping of a pick
-onto the launcher outcome. Native only — the wasm build has no picker and no button (D10 of
-`dev-docs/single_image_mode_plan.md`).
+"Open image" flow of the main menu (image-set mode entry): the native multi-file picker on a
+worker thread, the natural sort of the pick, the launcher-side validation of the picked paths,
+and the mapping of a pick onto the launcher outcome. Native only — the wasm build has no picker
+and no button (D10 of `dev-docs/single_image_mode_plan.md`).
 
 Key items:
 - `spawn_image_picker()`: runs the blocking `ms_platform::file_dialog::pick_blocking` and the
   validation on a worker; the GUI thread only polls the returned channel.
-- `image_picker_request()`: the `OpenFile` request, its filter built from the ONE input-type
+- `image_picker_request()`: the `OpenFiles` request, its filter built from the ONE input-type
   table `ms_config::single_image::input_extensions()` (the dialog seam adds the uppercase
   spellings case-sensitive GTK globs need).
 - `pick_result_from_dialog()`: maps a dialog result onto `ImagePickResult` (cancel, dialog
-  failure, validated pick).
-- `validate_picked_path()`: the launcher's only check — the path exists and is a file.
+  failure, sorted and validated pick).
+- `selection_from_files()`: the page order (`natural_sort::natural_name_cmp` of the names the
+  user saw, full path as tie-break) and the "at least one usable file" rule.
+- `validate_picked_path()`: the launcher's only per-file check — the path exists and is a file.
 - `launcher_outcome_for_pick()`: pure mapping of an `ImagePickResult` onto
-  `LauncherOutcome::OpenImage`.
+  `LauncherOutcome::OpenImages`.
 
 Notes:
-Decoding is deliberately NOT attempted here: the studio loading screen owns every decode
-error (`SingleImageError::user_message`), so the launcher never duplicates that decision.
+Decoding is deliberately NOT attempted here: the studio open owns every decode error
+(`SingleImageError::user_message`), so the launcher never duplicates that decision. For the
+same reason a pick with at least one usable file goes to the studio WHOLE: the studio lists the
+unusable ones with the undecodable ones in its skipped-files notice (one place, and the launcher
+is gone by then). Only a pick with no usable file stays here with a status. One picked file
+behaves exactly as the single-file picker did.
 */
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
-use ms_platform::file_dialog::{self, DialogKind, DialogResult, FileDialogRequest};
+use ms_platform::file_dialog::{self, DialogKind, DialogResult, FileDialogRequest, PickedFile};
 
 use crate::state::LauncherOutcome;
 
@@ -37,9 +43,10 @@ use crate::state::LauncherOutcome;
 pub enum ImagePickResult {
     /// The user closed the dialog without choosing a file.
     Cancelled,
-    /// The chosen path exists and is a file (decodability is not checked).
-    Selected(PathBuf),
-    /// The chosen path failed launcher validation.
+    /// The chosen paths in page order (never empty); at least one exists and is a file
+    /// (decodability is not checked, nor are the others: the studio lists what it skips).
+    Selected(Vec<PathBuf>),
+    /// The dialog failed, or no chosen path passed launcher validation.
     Rejected(OpenImageRejection),
 }
 
@@ -55,6 +62,9 @@ pub enum OpenImageRejection {
     /// The file dialog itself failed (another dialog open, no picker on this platform, a
     /// backend failure). `message` is the localized status, `detail` the typed error for the log.
     Dialog { message: String, detail: String },
+    /// Several files were picked and none passed validation; one rejection per file, in page
+    /// order (each is a `NotFound`, `NotAFile` or `Inaccessible`).
+    NoneUsable(Vec<OpenImageRejection>),
 }
 
 impl OpenImageRejection {
@@ -65,6 +75,18 @@ impl OpenImageRejection {
             OpenImageRejection::NotAFile(path) => tf!("launcher.main.open_image_not_a_file_error", path = path.display()),
             OpenImageRejection::Inaccessible { path, .. } => tf!("launcher.main.open_image_access_error", path = path.display()),
             OpenImageRejection::Dialog { message, .. } => message.clone(),
+            OpenImageRejection::NoneUsable(rejections) => {
+                let names = rejections.iter().filter_map(OpenImageRejection::path).map(display_name_of).collect::<Vec<_>>().join(", ");
+                tf!("launcher.main.open_images_rejected_error", files = names)
+            }
+        }
+    }
+
+    /// The picked path this rejection is about; `None` for a dialog failure or a whole pick.
+    fn path(&self) -> Option<&Path> {
+        match self {
+            OpenImageRejection::NotFound(path) | OpenImageRejection::NotAFile(path) | OpenImageRejection::Inaccessible { path, .. } => Some(path),
+            OpenImageRejection::Dialog { .. } | OpenImageRejection::NoneUsable(_) => None,
         }
     }
 
@@ -78,37 +100,75 @@ impl OpenImageRejection {
                 path.display()
             ),
             OpenImageRejection::Dialog { detail, .. } => format!("[launcher-open-image] file dialog failed; error={detail}"),
+            OpenImageRejection::NoneUsable(rejections) => format!(
+                "[launcher-open-image] none of the {} picked files can be opened:\n{}",
+                rejections.len(),
+                rejections.iter().map(OpenImageRejection::log_message).collect::<Vec<_>>().join("\n")
+            ),
         }
     }
 }
 
-/// The single-file request of the "Open image" picker: one filter listing every input
-/// extension in table order. Uppercase spellings are not listed here: the desktop dialog
-/// backend adds them for the case-sensitive GTK / xdg-portal globs.
+/// The last path component, or the whole path when it has none.
+fn display_name_of(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned())
+}
+
+/// The multi-file request of the "Open image" picker: one filter listing every input extension
+/// in table order. Uppercase spellings are not listed here: the desktop dialog backend adds them
+/// for the case-sensitive GTK / xdg-portal globs.
 pub fn image_picker_request() -> FileDialogRequest {
     let extensions: Vec<&'static str> = ms_config::single_image::input_extensions().collect();
-    FileDialogRequest::new(DialogKind::OpenFile).filter(t!("launcher.main.open_image_filter"), &extensions)
+    FileDialogRequest::new(DialogKind::OpenFiles).filter(t!("launcher.main.open_image_filter"), &extensions)
 }
 
 /// Maps a finished dialog onto the pick result: a cancel stays `Cancelled`, a dialog failure
-/// becomes `Rejected(Dialog)`, a picked file goes through `validate_picked_path` (blocking
-/// metadata read: call only off the GUI thread).
+/// becomes `Rejected(Dialog)`, picked files go through [`selection_from_files`] (blocking
+/// metadata reads: call only off the GUI thread).
 pub fn pick_result_from_dialog(result: DialogResult) -> ImagePickResult {
     match result {
         Ok(None) => ImagePickResult::Cancelled,
-        Ok(Some(picked)) => match picked.into_file() {
-            Some(file) => match validate_picked_path(file.path) {
-                Ok(path) => ImagePickResult::Selected(path),
-                Err(rejection) => ImagePickResult::Rejected(rejection),
-            },
-            // `OpenFile` always yields `Picked::Files` with one file (the seam's contract);
-            // anything else is a backend bug, reported like a picker failure.
-            None => ImagePickResult::Rejected(OpenImageRejection::Dialog {
+        Ok(Some(picked)) => match picked.into_files() {
+            Some(files) if !files.is_empty() => selection_from_files(files),
+            // `OpenFiles` always yields `Picked::Files` with at least one file (the seam's
+            // contract); anything else is a backend bug, reported like a picker failure.
+            Some(_) | None => ImagePickResult::Rejected(OpenImageRejection::Dialog {
                 message: t!("launcher.main.open_image_picker_error").to_owned(),
-                detail: "OpenFile dialog returned a result without a file".to_owned(),
+                detail: "OpenFiles dialog returned a result without a file".to_owned(),
             }),
         },
         Err(error) => ImagePickResult::Rejected(OpenImageRejection::Dialog { message: error.user_message(), detail: format!("{error:?}") }),
+    }
+}
+
+/// Orders picked `files` into pages and applies the launcher's rule (blocking metadata reads):
+/// - order: `natural_sort::natural_name_cmp` of the name the user saw in the picker
+///   (`PickedFile::display_name`; on Android the path is a copy), the full path as tie-break;
+/// - one file: `Selected` when it validates, else `Rejected` with its own rejection (the
+///   single-file behaviour);
+/// - several: `Selected` with EVERY path, in order, when at least one validates (the unusable
+///   ones are logged here and listed by the studio as skipped); `Rejected(NoneUsable)` otherwise;
+/// - no file: a `Dialog` rejection (the dialog seam never returns one).
+pub fn selection_from_files(mut files: Vec<PickedFile>) -> ImagePickResult {
+    files.sort_by(|left, right| crate::natural_sort::natural_name_cmp(&left.display_name, &right.display_name).then_with(|| left.path.cmp(&right.path)));
+    let paths: Vec<PathBuf> = files.into_iter().map(|file| file.path).collect();
+    let rejections: Vec<OpenImageRejection> = paths.iter().filter_map(|path| validate_picked_path(path.clone()).err()).collect();
+    if paths.is_empty() {
+        return ImagePickResult::Rejected(OpenImageRejection::Dialog {
+            message: t!("launcher.main.open_image_picker_error").to_owned(),
+            detail: "the picker returned an empty file list".to_owned(),
+        });
+    }
+    if rejections.len() < paths.len() {
+        for rejection in &rejections {
+            ms_log::runtime_log::log_warn(format!("{}; the studio lists it as skipped", rejection.log_message()));
+        }
+        return ImagePickResult::Selected(paths);
+    }
+    // Every path was rejected: one file keeps its own message, several are listed together.
+    match <[OpenImageRejection; 1]>::try_from(rejections) {
+        Ok([only]) => ImagePickResult::Rejected(only),
+        Err(several) => ImagePickResult::Rejected(OpenImageRejection::NoneUsable(several)),
     }
 }
 
@@ -125,17 +185,22 @@ pub fn validate_picked_path(path: PathBuf) -> Result<PathBuf, OpenImageRejection
 }
 
 /// Maps a finished pick onto the launcher's exit intent: `Ok(None)` = cancelled (stay in the
-/// launcher), `Ok(Some(OpenImage))` = close the launcher and open the image, `Err` = stay and
-/// show the rejection.
+/// launcher), `Ok(Some(OpenImages))` = close the launcher and open the set, `Err` = stay and
+/// show the rejection. An empty `Selected` (never built by [`selection_from_files`]) is a
+/// picker failure: `OpenImages` must not be empty.
 pub fn launcher_outcome_for_pick(result: ImagePickResult) -> Result<Option<LauncherOutcome>, OpenImageRejection> {
     match result {
         ImagePickResult::Cancelled => Ok(None),
-        ImagePickResult::Selected(path) => Ok(Some(LauncherOutcome::OpenImage(path))),
+        ImagePickResult::Selected(paths) if paths.is_empty() => Err(OpenImageRejection::Dialog {
+            message: t!("launcher.main.open_image_picker_error").to_owned(),
+            detail: "an empty selection reached the outcome mapping".to_owned(),
+        }),
+        ImagePickResult::Selected(paths) => Ok(Some(LauncherOutcome::OpenImages(paths))),
         ImagePickResult::Rejected(rejection) => Err(rejection),
     }
 }
 
-/// Starts the single-file picker plus validation on a named worker thread and returns
+/// Starts the multi-file picker plus sort and validation on a named worker thread and returns
 /// the receiver of its one result. The dialog opens at the OS default location (Windows and
 /// GTK remember the last folder used): the projects root holds chapters, not loose pictures,
 /// so it would be a worse start. A disconnected receiver without a value means the worker
@@ -161,9 +226,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_is_one_open_file_filter_over_the_input_table() {
+    fn request_is_one_open_files_filter_over_the_input_table() {
         let request = image_picker_request();
-        assert_eq!(request.kind(), DialogKind::OpenFile);
+        assert_eq!(request.kind(), DialogKind::OpenFiles);
         let [filter] = request.filters() else {
             panic!("expected exactly one filter, got {:?}", request.filters());
         };
@@ -182,9 +247,14 @@ mod tests {
         assert_ne!(ms_platform::file_dialog::mime_types_for(image_picker_request().filters()), vec!["*/*"]);
     }
 
+    /// A picked file as the dialog seam reports it (display name = the path's file name).
+    fn picked(path: &Path) -> PickedFile {
+        PickedFile { path: path.to_path_buf(), display_name: display_name_of(path) }
+    }
+
     #[test]
     fn dialog_results_map_onto_pick_results() {
-        use ms_platform::file_dialog::{FileDialogError, Picked, PickedFile};
+        use ms_platform::file_dialog::{FileDialogError, Picked};
 
         assert_eq!(pick_result_from_dialog(Ok(None)), ImagePickResult::Cancelled);
         let ImagePickResult::Rejected(OpenImageRejection::Dialog { message, detail }) = pick_result_from_dialog(Err(FileDialogError::Busy)) else {
@@ -196,18 +266,66 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         let file = dir.path().join("page.png");
         std::fs::write(&file, b"not decoded here").expect("write fixture file");
-        let picked = Picked::Files(vec![PickedFile { path: file.clone(), display_name: "page.png".to_owned() }]);
-        assert_eq!(pick_result_from_dialog(Ok(Some(picked))), ImagePickResult::Selected(file));
+        let one = Picked::Files(vec![picked(&file)]);
+        assert_eq!(pick_result_from_dialog(Ok(Some(one))), ImagePickResult::Selected(vec![file]));
         let folder = Picked::Folder(dir.path().to_path_buf());
         assert!(matches!(pick_result_from_dialog(Ok(Some(folder))), ImagePickResult::Rejected(OpenImageRejection::Dialog { .. })));
+        assert!(matches!(pick_result_from_dialog(Ok(Some(Picked::Files(Vec::new())))), ImagePickResult::Rejected(OpenImageRejection::Dialog { .. })));
+    }
+
+    #[test]
+    fn a_multi_pick_is_natural_sorted_with_the_path_as_tie_break() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let sub = dir.path().join("b");
+        std::fs::create_dir(&sub).expect("create sub dir");
+        let files = [dir.path().join("p10.png"), sub.join("p2.png"), dir.path().join("p2.png"), dir.path().join("P3.png")];
+        for file in &files {
+            std::fs::write(file, b"not decoded here").expect("write fixture file");
+        }
+        let [p10, sub_p2, p2, upper_p3] = files;
+        let result = selection_from_files(vec![picked(&p10), picked(&sub_p2), picked(&p2), picked(&upper_p3)]);
+        // Byte order puts `P` before `p`; equal names fall back to the full path.
+        let mut expected_p2 = [p2, sub_p2];
+        expected_p2.sort();
+        let [first_p2, second_p2] = expected_p2;
+        assert_eq!(result, ImagePickResult::Selected(vec![upper_p3, first_p2, second_p2, p10]));
+    }
+
+    #[test]
+    fn a_multi_pick_keeps_unusable_files_while_one_is_usable() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let good = dir.path().join("a1.png");
+        std::fs::write(&good, b"not decoded here").expect("write fixture file");
+        let missing = dir.path().join("a2.png");
+        let folder = dir.path().join("a3.png");
+        std::fs::create_dir(&folder).expect("create folder named like an image");
+        let result = selection_from_files(vec![picked(&folder), picked(&missing), picked(&good)]);
+        assert_eq!(result, ImagePickResult::Selected(vec![good, missing, folder]), "every path goes on, in page order");
+    }
+
+    #[test]
+    fn a_pick_without_a_usable_file_stays_in_the_launcher() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let missing = dir.path().join("gone.png");
+        // One file: its own rejection, exactly as the single-file picker reported it.
+        assert_eq!(selection_from_files(vec![picked(&missing)]), ImagePickResult::Rejected(OpenImageRejection::NotFound(missing.clone())));
+        let folder = dir.path().join("folder.png");
+        std::fs::create_dir(&folder).expect("create folder named like an image");
+        let ImagePickResult::Rejected(rejection) = selection_from_files(vec![picked(&missing), picked(&folder)]) else {
+            panic!("no usable file must stay in the launcher");
+        };
+        assert_eq!(rejection, OpenImageRejection::NoneUsable(vec![OpenImageRejection::NotAFile(folder), OpenImageRejection::NotFound(missing)]));
+        assert!(!rejection.user_message().is_empty());
+        assert!(rejection.log_message().contains("gone.png"));
     }
 
     #[test]
     fn outcome_mapping_covers_every_pick_result() {
         assert_eq!(launcher_outcome_for_pick(ImagePickResult::Cancelled), Ok(None));
-        let path = PathBuf::from("/home/u/page.png");
-        assert_eq!(launcher_outcome_for_pick(ImagePickResult::Selected(path.clone())), Ok(Some(LauncherOutcome::OpenImage(path.clone()))));
-        let rejection = OpenImageRejection::NotAFile(path);
+        let paths = vec![PathBuf::from("/home/u/p2.png"), PathBuf::from("/home/u/p10.png")];
+        assert_eq!(launcher_outcome_for_pick(ImagePickResult::Selected(paths.clone())), Ok(Some(LauncherOutcome::OpenImages(paths.clone()))));
+        assert!(matches!(launcher_outcome_for_pick(ImagePickResult::Selected(Vec::new())), Err(OpenImageRejection::Dialog { .. })), "OpenImages is never empty");
+        let rejection = OpenImageRejection::NotAFile(paths[0].clone());
         assert_eq!(launcher_outcome_for_pick(ImagePickResult::Rejected(rejection.clone())), Err(rejection));
     }
 

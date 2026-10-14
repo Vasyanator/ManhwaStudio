@@ -17,8 +17,10 @@ Key modules:
 - `confirm_modal`: in-app Yes/No confirmation (`egui::Modal`) for overwrite questions
 - `first_run_language`: first-run interface/typesetting language-selection modal
 - `main_page`: rendering of the current main page
+- `natural_sort`: the shared natural file-name order (PSD import table, image multi-pick)
 - `new_project`: detached "New Project" window runtime and UI
-- `open_image`: main-menu "Open image" picker worker, path validation, outcome mapping (native only)
+- `open_image`: main-menu "Open image" multi-file picker worker, path validation, sort, outcome
+  mapping (native only)
 - `pages`: animated fullscreen launcher subpages
 - `psd_import_window`: detached PSD/PSB import window, parsed in-process by `ag-psd`
 - `state`: shared launcher UI state and page enum
@@ -27,7 +29,7 @@ Key modules:
 
 Notes:
 The launcher owns no window: its exit (`LauncherOutcome`: the selected or newly saved
-`project_dir`, a picked image for single-image mode, or "update") is taken by the host, which
+`project_dir`, picked images for image-set mode, or "update") is taken by the host, which
 switches the same window to the studio instead of spawning a second app process.
 */
 
@@ -52,6 +54,7 @@ pub mod background;
 mod confirm_modal;
 pub mod first_run_language;
 pub mod main_page;
+mod natural_sort;
 pub mod new_project;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod open_image;

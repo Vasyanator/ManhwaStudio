@@ -18,8 +18,9 @@ Main flow (`native_main` -> `run_main`):
   secondary windows) and starts the Python AI backend supervisor where
   `PlatformFeature::PythonBackend` exists.
 - `--check-venv` (terminal), `--continue-update` and `--update` run their own windows.
-- `resolve_start`: a valid `--project` chapter, or `--image <PATH>` / a positional image path
-  (OS "Open with", `.desktop` `%f`), opens the studio directly; an invalid one is reported in
+- `resolve_start`: a valid `--project` chapter, or an image set (`--image <PATH>`, repeatable, or
+  positional image paths: OS "Open with", `.desktop` `%F`), opens the studio directly; an
+  invalid project, or an image set none of whose paths is a file, is reported in
   the console and a modal error box (`ms_platform::message::show_error_blocking`; log-only where
   no native box exists). Without an open target the pure `startup_routing` decides: on a platform
   without installed-copy management straight to the launcher; otherwise installer continuation,
@@ -367,9 +368,9 @@ fn run_main() -> anyhow::Result<()> {
     }
     trace_log!(
         trace::cat::STARTUP,
-        "tracing enabled, args: project={:?} image={:?} no_ai={} update={} test_launcher={} trace={}",
+        "tracing enabled, args: project={:?} images={:?} no_ai={} update={} test_launcher={} trace={}",
         cli.project,
-        cli.image_arg(),
+        cli.image_args(),
         cli.no_ai,
         cli.update,
         cli.test_launcher,
@@ -740,8 +741,8 @@ struct StartPlan {
     update_check: bool,
 }
 
-/// Resolves where the main window starts: the CLI open target (`--project`, `--image` or the
-/// positional image) when present, else whatever the no-argument startup path (installer
+/// Resolves where the main window starts: the CLI open target (`--project`, or an image set from
+/// `--image` / the positional paths) when present, else whatever the no-argument startup path (installer
 /// prompts) yields — normally the launcher. `None` means "exit the program". The prompts run
 /// once per process: a later return to the launcher does not repeat them.
 ///
@@ -755,8 +756,9 @@ fn resolve_start(cli: &Cli) -> anyhow::Result<Option<StartPlan>> {
     if let Some(project_dir) = &cli.project {
         return Ok(resolve_cli_project_dir(project_dir)?.map(|target| StartPlan { initial: shell::InitialScreen::Studio(target), update_check: cli_update_check() }));
     }
-    if let Some(image) = cli.image_arg() {
-        let target = resolve_cli_image(image)?;
+    let images = cli.image_args();
+    if !images.is_empty() {
+        let target = resolve_cli_images(images)?;
         return Ok(Some(StartPlan { initial: shell::InitialScreen::Studio(target), update_check: cli_update_check() }));
     }
     resolve_start_without_cli_arg(
@@ -832,24 +834,43 @@ fn resolve_cli_project_dir(project_dir: &Path) -> anyhow::Result<Option<shell::s
     }
 }
 
-/// Validates a command-line image path (`--image` or positional) before any window exists.
-/// Only existence and kind are checked here; decodability is reported by the studio loading
-/// screen. Mirrors `resolve_cli_project_dir`: an unusable path shows the startup error dialog
-/// and ends startup.
+/// Validates the command-line image paths (`--image` values or positional paths, in order)
+/// before any window exists. Only existence and kind are checked here (`args::check_image_arg`).
+///
+/// When at least one path passes, ALL paths go to the studio open worker in the given order: the
+/// worker reports every unusable one in the session's skipped list, so a bad file is reported in
+/// one place only. When none passes, the startup error dialog shows each path's problem (for one
+/// path exactly the message a single-image start always showed) and startup ends, mirroring
+/// `resolve_cli_project_dir`.
 ///
 /// # Errors
-/// The path does not exist, is a directory (the message names `--project`), or is not a
-/// regular file.
+/// No path is an existing regular file (missing, a directory — the message names `--project` —
+/// or another kind of non-file).
 #[cfg(not(target_arch = "wasm32"))]
-fn resolve_cli_image(image: &Path) -> anyhow::Result<shell::studio::StartupTarget> {
+fn resolve_cli_images(images: &[PathBuf]) -> anyhow::Result<shell::studio::StartupTarget> {
     use crate::project::single_image::SingleImageError;
-    let path = image.to_path_buf();
-    let message = match args::check_image_arg(&path) {
-        Ok(()) => return Ok(shell::studio::StartupTarget::Image(path)),
-        Err(args::ImageArgProblem::NotFound) => SingleImageError::NotFound { path: path.clone() }.user_message(),
-        Err(args::ImageArgProblem::Directory) => tf!("startup.image.directory_error", path = path.display()),
-        Err(args::ImageArgProblem::NotAFile) => SingleImageError::NotAFile { path: path.clone() }.user_message(),
-    };
+    let mut problems = Vec::new();
+    for path in images {
+        let message = match args::check_image_arg(path) {
+            Ok(()) => continue,
+            Err(args::ImageArgProblem::NotFound) => SingleImageError::NotFound { path: path.clone() }.user_message(),
+            Err(args::ImageArgProblem::Directory) => tf!("startup.image.directory_error", path = path.display()),
+            Err(args::ImageArgProblem::NotAFile) => SingleImageError::NotAFile { path: path.clone() }.user_message(),
+        };
+        problems.push(message);
+    }
+    if problems.len() < images.len() {
+        if !problems.is_empty() {
+            runtime_log::log_warn(format!(
+                "[startup] {} of {} command-line image path(s) are not files; the open worker lists them as skipped",
+                problems.len(),
+                images.len()
+            ));
+        }
+        let sources = shell::studio::ImageSources::new(images.to_vec(), Vec::new(), Vec::new());
+        return sources.map(shell::studio::StartupTarget::Images).ok_or_else(|| anyhow::Error::msg("no image path was given"));
+    }
+    let message = problems.join("\n");
     show_startup_error_dialog(&message);
     anyhow::bail!("image path is invalid: {message}")
 }

@@ -30,9 +30,13 @@ transition goes through `screen::on_event`; the shell only executes the returned
   `on_os_close`), `ShellExit`, per-screen style / minimum size. Unit-tested row by row.
 - `style.rs`: `StyleScreen`, `style_for`, `apply` — the complete global style per screen, built
   from scratch. The only part compiled on wasm (the web entry uses it).
-- `studio.rs`: `StartupTarget` (+ window title), `StudioOpenRequest` (+ scratch `release`), the
-  open worker (`spawn_open_thread`: scratch reservation, unsaved detection, `ProjectData::load*`
-  or `open_image_set`), `StudioScreen` (loading / error / running), `install_shader_layers`.
+- `studio.rs`: `StartupTarget` (`Project` or `Images(ImageSources)`, + window title),
+  `ImageSources` (ordered files, already-rejected `SkippedSource`s, Android inbox batches;
+  `merged` concatenates), `StudioOpenRequest` (+ `release`: scratch delete, inbox batches), the
+  open worker (`spawn_open_thread` -> `OpenWorker`: scratch reservation, unsaved detection,
+  `ProjectData::load*`, or for an image set the size estimate, the large-set question and
+  `open_image_set` with `OpenEvent::Progress` and a shared cancel flag), `StudioScreen` (loading
+  with progress / confirmation / Cancel, error, cancelled, running), `install_shader_layers`.
 - `closing.rs`: `StudioShutdownJob` (teardown worker, `poll`, `finish_blocking`),
   `ClosingScreen` (spinner, or the failure + Continue), `teardown_blocking`.
 
@@ -65,8 +69,20 @@ transition goes through `screen::on_event`; the shell only executes the returned
 - **AI model folders** (`ms_config::ensure_model_dirs`) are created by the launcher-prepare worker
   on every launcher entry. A failure is logged as a warning and the launcher still opens — a
   deliberate (accepted) change from the old startup, where a failure aborted the process.
-- **Single-image scratch**: reserved by the open worker (a failure is the studio error screen),
-  owned by `StudioScreen`, released by the teardown worker after the app was dropped.
+- **Image-set scratch**: reserved by the open worker (a failure is the studio error screen),
+  owned by `StudioScreen`, released by the teardown worker after the app was dropped, together
+  with the set's Android inbox batches.
+- **Image-set open on the loading screen**: a set of 2+ files above the soft limits
+  (`needs_size_confirmation`) asks first; the worker blocks on the answer, and a dropped answer
+  channel is a cancel. A user Cancel ends as a cancelled load: the table's `StudioLoadFailed`
+  row enters the Failed phase and the screen exits with `FailedBack` at once (launcher +
+  scratch release). A deferred OS close cancels an image-set open itself (question answered
+  "no", cancel flag raised) so the close never waits on the user; it is applied from `ui`, so a
+  minimized window answers once it is drawn again. A one-file set opens with no estimate and no
+  question, exactly as the classic single-image mode.
+- **Bad image files are reported in one place**: the CLI rejects a start only when no path is a
+  file (startup error dialog), the launcher stays only when no picked file is usable; otherwise
+  every path goes to the open worker, which lists the unusable ones as skipped.
 - Android: one `run_native`; the fork's secondary-window policy is set before it and re-synced at
   creation and every switch. Nothing here relies on the winit fork re-emitting `Resumed` for a
   second event loop (`dev-docs/ANDROID_PORT.md`).
@@ -78,7 +94,8 @@ transition goes through `screen::on_event`; the shell only executes the returned
   effect in `mod.rs::run_effect`.
 - Window attributes per screen (title, minimum size, style): `screen.rs` (`style_screen`,
   `min_inner_size`), `mod.rs::enter_screen`, `style.rs`.
-- What the studio opens and how (unsaved detection, single image, error screen): `studio.rs`.
+- What the studio opens and how (unsaved detection, image set, progress / confirmation, error
+  screen): `studio.rs`.
 - Teardown order: `src/app/shutdown.rs`; how it runs and what the user sees: `closing.rs`.
 - Startup prompts and the post-window update: `src/lib.rs` (`resolve_start`,
-  `run_launcher_requested_update`).
+  `resolve_cli_images`, `run_launcher_requested_update`).

@@ -30,7 +30,7 @@ it would loop forever).
 */
 
 use crate::app::PendingCloseAction;
-use crate::shell::studio::StartupTarget;
+use crate::shell::studio::{ImageSources, StartupTarget};
 use crate::shell::style::StyleScreen;
 use crate::tabs::AppTab;
 use std::path::PathBuf;
@@ -85,7 +85,7 @@ pub(crate) enum ScreenKind {
 /// How the launcher screen was left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LauncherExit {
-    /// Open a chapter or an image in the studio.
+    /// Open a chapter or an image set in the studio.
     Open(StartupTarget),
     /// Close the window and run the update window.
     StartUpdate,
@@ -243,7 +243,8 @@ fn on_os_close(kind: &ScreenKind) -> Transition {
 }
 
 /// The exit a launcher `outcome` produces: a `--test-launcher` run (`test_mode`) quits on any
-/// outcome; otherwise a chapter or an image opens the studio and "Update" runs the update window.
+/// outcome; otherwise a chapter or an image set opens the studio and "Update" runs the update
+/// window. The launcher's image paths keep their (natural-sorted) order.
 #[must_use]
 pub(crate) fn launcher_exit_for(outcome: crate::launcher::state::LauncherOutcome, test_mode: bool) -> LauncherExit {
     use crate::launcher::state::LauncherOutcome;
@@ -252,7 +253,16 @@ pub(crate) fn launcher_exit_for(outcome: crate::launcher::state::LauncherOutcome
     }
     match outcome {
         LauncherOutcome::OpenProject(selection) => LauncherExit::Open(StartupTarget::Project(selection.project_dir)),
-        LauncherOutcome::OpenImage(path) => LauncherExit::Open(StartupTarget::Image(path)),
+        LauncherOutcome::OpenImages(paths) => match ImageSources::new(paths, Vec::new(), Vec::new()) {
+            Some(sources) => LauncherExit::Open(StartupTarget::Images(sources)),
+            // Unreachable: the launcher builds `OpenImages` only from a non-empty pick
+            // (`ms_launcher::open_image`). The launcher entry has already ended and the table has
+            // no "stay" exit, so the defect ends the program loudly instead of opening nothing.
+            None => {
+                crate::runtime_log::log_error("[shell] defect: the launcher asked to open an EMPTY image set; closing the window");
+                LauncherExit::Quit
+            }
+        },
         LauncherOutcome::StartUpdate => LauncherExit::StartUpdate,
     }
 }
@@ -348,7 +358,7 @@ mod tests {
             Effect::LoadStudio { target, tab: None },
             false,
         );
-        let image = StartupTarget::Image(PathBuf::from("/home/u/a.png"));
+        let image = StartupTarget::Images(ImageSources::new(vec![PathBuf::from("/home/u/a.png")], Vec::new(), Vec::new()).expect("one file"));
         assert_row(
             &ScreenKind::Launcher,
             ShellEvent::LauncherExit(LauncherExit::Open(image.clone())),
@@ -453,12 +463,14 @@ mod tests {
     fn launcher_outcomes_map_to_exits() {
         let selection = OpenProjectSelection { project_dir: reload_dir(), title: "Title".to_string(), chapter: "Chapter 1".to_string(), resume_unsaved: false };
         assert_eq!(launcher_exit_for(LauncherOutcome::OpenProject(selection.clone()), false), LauncherExit::Open(StartupTarget::Project(reload_dir())));
+        let picked = vec![PathBuf::from("/home/u/p2.png"), PathBuf::from("/home/u/p10.png")];
         assert_eq!(
-            launcher_exit_for(LauncherOutcome::OpenImage(PathBuf::from("/home/u/a.png")), false),
-            LauncherExit::Open(StartupTarget::Image(PathBuf::from("/home/u/a.png")))
+            launcher_exit_for(LauncherOutcome::OpenImages(picked.clone()), false),
+            LauncherExit::Open(StartupTarget::Images(ImageSources::new(picked.clone(), Vec::new(), Vec::new()).expect("two files"))),
+            "the launcher's order is kept"
         );
         assert_eq!(launcher_exit_for(LauncherOutcome::StartUpdate, false), LauncherExit::StartUpdate);
-        for outcome in [LauncherOutcome::OpenProject(selection), LauncherOutcome::OpenImage(PathBuf::from("/home/u/a.png")), LauncherOutcome::StartUpdate] {
+        for outcome in [LauncherOutcome::OpenProject(selection), LauncherOutcome::OpenImages(picked), LauncherOutcome::StartUpdate] {
             assert_eq!(launcher_exit_for(outcome, true), LauncherExit::Quit);
         }
     }

@@ -38,11 +38,14 @@ the same window to the studio. This crate runs no window of its own.
   storage-mode conversion status line (progress of the process-wide `storage_mode_job`, then a
   dismissable failure notice). Also the native-only small "Open image" button (drawn in a
   `Ui::new_child` over the title -> grid gap, so it takes no layout space) and its picking status.
-- `open_image.rs` (native only): single-image mode entry — `ms_platform::file_dialog::pick_blocking`
-  plus path validation (exists + is a file) on a worker, the filter built from
-  `ms_config::single_image::input_extensions()` (the dialog seam adds the uppercase spellings
-  case-sensitive GTK globs need), and the pure pick -> `LauncherOutcome::OpenImage` mapping.
-  `app.rs` polls it.
+- `open_image.rs` (native only): image-set mode entry — `ms_platform::file_dialog::pick_blocking`
+  (`OpenFiles`), the natural sort of the pick (`natural_sort`, by the name shown in the picker,
+  full path as tie-break) and path validation (exists + is a file) on a worker, the filter built
+  from `ms_config::single_image::input_extensions()` (the dialog seam adds the uppercase
+  spellings case-sensitive GTK globs need), and the pure pick -> `LauncherOutcome::OpenImages`
+  mapping. `app.rs` polls it.
+- `natural_sort.rs`: `natural_name_cmp`, the launcher's one natural name order (digit runs by
+  number, case-sensitive bytes otherwise), shared by the PSD import table and the image pick.
 - `state.rs`: page enum, shared UI state, typed launcher outcomes, and `LauncherHost` (the
   process facts `lib.rs` / `web_entry.rs` hand in: `--ignore-installed`, version core).
 - `background.rs`: background image plan and decode workers.
@@ -154,9 +157,12 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
 - Launcher outcomes are returned to startup flow; the launcher must not spawn a second main app.
 - Long scans, image decoding, probes, downloads, and shell work run on worker threads.
 - Settings changes to the projects root must be propagated to every page/window that caches it.
-- "Open image" exits the launcher with `LauncherOutcome::OpenImage(path)`; the host routes it.
-  The launcher validates only existence and file-ness; decode errors belong to the studio
-  loading screen (one owner). wasm has no button and `web_entry.rs` ignores the variant.
+- "Open image" exits the launcher with `LauncherOutcome::OpenImages(paths)` (never empty, page
+  order = natural sort); the host routes it. The launcher validates only existence and
+  file-ness: with at least one usable file EVERY picked path goes on and the studio lists the
+  unusable and undecodable ones (one owner); with none it stays and shows a status. One picked
+  file behaves as the single-file picker did. wasm has no button and `web_entry.rs` ignores the
+  variant.
 - The launcher never writes the egui global style itself: `ms_theme::install` is the only writer.
   New Project, PSD import and batch processing get their plain dark look only through the
   widget's `content_style` (see "Secondary windows"). Status colours (`error_fg` / `warn_fg`)
@@ -188,8 +194,9 @@ Per-setting "!" badges (core: `ms_settings_ui::settings_warnings`, see its MODUL
   edit `app.rs` (`draw_*_window`, `HostPassPlan`) and `main_page.rs` (restore buttons); how a
   window opens or stacks lives in `ms_widgets::embedded_window`.
 - To change the main menu or update notice, edit `main_page.rs`.
-- To change the "Open image" picker, its filter or validation, edit `open_image.rs`; the accepted
-  types themselves live in `ms_config::single_image::INPUT_FILE_TYPES`.
+- To change the "Open image" picker, its filter, page order or validation, edit `open_image.rs`
+  (the order itself: `natural_sort.rs`); the accepted types themselves live in
+  `ms_config::single_image::INPUT_FILE_TYPES`.
 - To change a specific page workflow, edit `pages/`.
 - To change when settings warnings run or which launcher events recheck them, edit
   `app.rs` (`poll_workers`, first-run confirm) and `pages/settings_page.rs` (`*_warning*`); badge

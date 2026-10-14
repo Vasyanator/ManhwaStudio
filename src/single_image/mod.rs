@@ -16,7 +16,8 @@ Key structures:
 
 Key functions:
 - `tab_visible()`: the tab filter of the mode.
-- `image_window_title()`: the studio window title of an image session (shared with startup).
+- `image_window_title()`: the studio window title of an image-set session (first file + count of
+  the others; shared with startup).
 - `hotkey_specs()`: Ctrl+S / Ctrl+Shift+S, registered only in a single-image session.
 
 Notes:
@@ -98,15 +99,21 @@ pub(crate) fn tab_visible(tab: AppTab, single_image: bool) -> bool {
     }
 }
 
-/// Studio window title of an image session: `ManhwaStudio v{version} - {file name}` (the whole
-/// path when it has no file-name component). `version` is the display version (`MS_APP_VERSION`).
-/// The one owner of this format: startup (`StudioOpenRequest::window_title`) and the controller
-/// (after «Сохранить как» moved the save target) both call it. Native-only like both callers.
+/// Studio window title of an image-set session: `ManhwaStudio v{version} - {file name}` for one
+/// page (the whole path when it has no file-name component); for `count` > 1 pages the name is
+/// followed by the number of the others (`single_image.window_title_more`, e.g. `b.png (+2)`).
+/// `first` is page 0's file; `version` is the display version (`MS_APP_VERSION`). The one owner
+/// of this format: startup (`StartupTarget::window_title`) and the controller (after «Сохранить
+/// как» moved the save target) both call it. Native-only like both callers.
 #[cfg(not(target_arch = "wasm32"))]
 #[must_use]
-pub(crate) fn image_window_title(version: &str, path: &std::path::Path) -> String {
-    let name = path.file_name().map_or_else(|| path.display().to_string(), |name| name.to_string_lossy().into_owned());
-    format!("ManhwaStudio v{version} - {name}")
+pub(crate) fn image_window_title(version: &str, first: &std::path::Path, count: usize) -> String {
+    let name = first.file_name().map_or_else(|| first.display().to_string(), |name| name.to_string_lossy().into_owned());
+    if count <= 1 {
+        return format!("ManhwaStudio v{version} - {name}");
+    }
+    let set_name = tf!("single_image.window_title_more", name = name, more = count - 1);
+    format!("ManhwaStudio v{version} - {set_name}")
 }
 
 /// The two save hotkeys of the mode, both `Global`. Registered ONLY for a single-image session so
@@ -210,8 +217,22 @@ mod tests {
 
     #[test]
     fn image_window_title_uses_the_file_name() {
-        assert_eq!(image_window_title("1.2.3", Path::new("/home/u/pics/page one.jpg")), "ManhwaStudio v1.2.3 - page one.jpg");
-        assert_eq!(image_window_title("1.2.3", Path::new("/")), "ManhwaStudio v1.2.3 - /");
+        assert_eq!(image_window_title("1.2.3", Path::new("/home/u/pics/page one.jpg"), 1), "ManhwaStudio v1.2.3 - page one.jpg");
+        assert_eq!(image_window_title("1.2.3", Path::new("/"), 1), "ManhwaStudio v1.2.3 - /");
+        // A count of 0 cannot name a set; it reads as one page.
+        assert_eq!(image_window_title("1.2.3", Path::new("/home/u/a.png"), 0), "ManhwaStudio v1.2.3 - a.png");
+    }
+
+    #[test]
+    fn image_window_title_of_a_set_names_the_first_file_and_the_others() {
+        // The test process installs no catalog, so the template is checked through the embedded
+        // English catalog text rather than `tf!`'s output.
+        let en: serde_json::Value = serde_json::from_str(include_str!("../../crates/ms-i18n/locales/en.json")).expect("en catalog parses");
+        let template = en["single_image.window_title_more"].as_str().expect("key exists in en");
+        assert_eq!(ms_i18n::interpolate(template, &[("name", &"b.png"), ("more", &2)]), "b.png (+2)");
+        let title = image_window_title("1.2.3", Path::new("/home/u/b.png"), 3);
+        assert!(title.starts_with("ManhwaStudio v1.2.3 - "), "{title}");
+        assert_ne!(title, image_window_title("1.2.3", Path::new("/home/u/b.png"), 1));
     }
 
     #[test]

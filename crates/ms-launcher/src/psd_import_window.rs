@@ -2409,7 +2409,7 @@ fn auto_assign_types(rows: &mut [PsdLayerRow]) {
 
 fn sort_rows_for_table(rows: &mut [PsdLayerRow]) {
     rows.sort_by(|left, right| {
-        natural_name_cmp(&left.file_name, &right.file_name)
+        crate::natural_sort::natural_name_cmp(&left.file_name, &right.file_name)
             .then_with(|| left.layer_title.cmp(&right.layer_title))
     });
 }
@@ -2426,70 +2426,6 @@ fn has_fully_skipped_document(rows: &[PsdLayerRow]) -> bool {
     has_imported_row_by_document
         .values()
         .any(|has_imported_row| !has_imported_row)
-}
-
-fn natural_name_cmp(left: &str, right: &str) -> std::cmp::Ordering {
-    let left_bytes = left.as_bytes();
-    let right_bytes = right.as_bytes();
-    let mut left_index = 0usize;
-    let mut right_index = 0usize;
-
-    while left_index < left_bytes.len() && right_index < right_bytes.len() {
-        let left_byte = left_bytes[left_index];
-        let right_byte = right_bytes[right_index];
-        if left_byte.is_ascii_digit() && right_byte.is_ascii_digit() {
-            let ordering =
-                digit_run_cmp(left_bytes, &mut left_index, right_bytes, &mut right_index);
-            if ordering != std::cmp::Ordering::Equal {
-                return ordering;
-            }
-        } else {
-            let ordering = left_byte.cmp(&right_byte);
-            if ordering != std::cmp::Ordering::Equal {
-                return ordering;
-            }
-            left_index += 1;
-            right_index += 1;
-        }
-    }
-
-    left_bytes.len().cmp(&right_bytes.len())
-}
-
-fn digit_run_cmp(
-    left: &[u8],
-    left_index: &mut usize,
-    right: &[u8],
-    right_index: &mut usize,
-) -> std::cmp::Ordering {
-    let left_start = *left_index;
-    let right_start = *right_index;
-    while *left_index < left.len() && left[*left_index].is_ascii_digit() {
-        *left_index += 1;
-    }
-    while *right_index < right.len() && right[*right_index].is_ascii_digit() {
-        *right_index += 1;
-    }
-
-    let left_significant = first_significant_digit(left, left_start, *left_index);
-    let right_significant = first_significant_digit(right, right_start, *right_index);
-    let left_significant_len = *left_index - left_significant;
-    let right_significant_len = *right_index - right_significant;
-
-    left_significant_len
-        .cmp(&right_significant_len)
-        .then_with(|| {
-            left[left_significant..*left_index].cmp(&right[right_significant..*right_index])
-        })
-        .then_with(|| (*left_index - left_start).cmp(&(*right_index - right_start)))
-}
-
-fn first_significant_digit(bytes: &[u8], start: usize, end: usize) -> usize {
-    let mut index = start;
-    while index < end && bytes[index] == b'0' {
-        index += 1;
-    }
-    index
 }
 
 /// Render the raster a preview should display, on the preview worker thread.

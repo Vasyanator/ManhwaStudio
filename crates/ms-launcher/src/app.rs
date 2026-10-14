@@ -13,7 +13,7 @@ Main responsibilities:
 - own launcher shell state;
 - drive background image plan generation and lazy batch decoding;
 - render the animated multi-column background with a separate post-image blur layer plus the central menu card;
-- poll the main-menu "Open image" picker worker and turn its pick into `LauncherOutcome::OpenImage`;
+- poll the main-menu "Open image" picker worker and turn its pick into `LauncherOutcome::OpenImages`;
 - start the settings-warnings checks on the first frame of each launcher entry, poll them every
   frame, and route launcher-side setting changes (first-run language confirm) to their recheck;
 - hold the one pending exit (`LauncherOutcome`) until the host takes it.
@@ -418,8 +418,8 @@ impl LauncherApp {
         self.open_image_pick.is_some()
     }
 
-    /// Applies a finished pick: a valid file becomes the pending exit
-    /// `LauncherOutcome::OpenImage`; a cancel clears the status; a rejection or a dead worker
+    /// Applies a finished pick: a pick with at least one valid file becomes the pending exit
+    /// `LauncherOutcome::OpenImages`; a cancel clears the status; a rejection or a dead worker
     /// stays in the launcher with a localized status (details in the log).
     #[cfg(not(target_arch = "wasm32"))]
     fn poll_open_image_pick(&mut self, ctx: &egui::Context) {
