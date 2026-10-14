@@ -16,7 +16,8 @@ StudioApp (studio.rs, eframe::App::ui driven by the shell's studio screen / the 
   residency       PageResidency (residency/)          decode pool, promotion, GPU upload, eviction
   writers         StagingWriters (staging_writers.rs) layer saver, bubbles saver, клин autosave, gate
   session         SessionMode (session/)              Project(ProjectSession) | ImageSet(ImageSetSession)
-  tabs            Tabs (tabs.rs)                      ten tab states + Translation canvas
+  tabs            Tabs (tabs.rs)                      ten program tabs (Translation = TranslationTab,
+                                                      owning its canvas); StudioTab hook fan-outs
   view            ViewSync (view_sync.rs)             shared viewport / page across view tabs
   close           CloseFlow (close_flow.rs)           exit dialog, close request, incoming question
   panel dock      PanelDockState + PanelLayoutWriter  one per studio window
@@ -26,19 +27,26 @@ Root responsibilities that stay in `studio.rs`:
 - **Construction.** `new` builds the models, the tabs, the hotkey registry, the session's one
   `AutosaveGate` (shared by the three staging writers through `StagingWriters::spawn`) and the
   `PageResidency` pool, and hands the process's `LocalAiAvailability` (from the AI backend handle)
-  to the Translation tab. It reads nothing from disk (see `bootstrap.rs`).
+  to the Translation tab. The shared canvas settings are seeded once into `BubblesModel` by the
+  pure `ms_canvas::shared_canvas_settings_from_project`; no canvas is seeded directly (each pulls
+  them on its first draw). The hotkey registry and the panel-dock restore are built from `Tabs`
+  after every tab exists. It reads nothing from disk (see `bootstrap.rs`).
 - **Residency glue.** `studio.rs` supplies what residency must not know: the active tab's page
   window (`active_source_page_window`; for the page manager the one page its viewer draws), the
-  pixel-inspection flag, the canvas `cache_pages` setting, and the eviction of the tabs' own GPU
-  caches (`evict_tab_gpu_caches`). Source textures are lent per frame to the canvas tabs and to
+  pixel-inspection flag, and the eviction of the tabs' own GPU caches (`Tabs::evict_tab_gpu_caches`),
+  each answered by the tabs' `ms_studio_tab::StudioTab` hooks.
+  The canvas `cache_pages` setting is owned by `CleanOverlaysModel`; residency reads it there. Source textures are lent per frame to the canvas tabs and to
   the page manager's viewer.
 - **Panel dock.** Exactly one `PanelDockState` per studio window, restored before the first frame
   from the bootstrap's `user_config` snapshot (`restore_panel_dock`, so a stored layout wins over a
   tab's default), lent to the drawing tab, polled for dirty layouts once per frame (persisted by
-  the `PanelLayoutWriter` thread, flushed by `shutdown_blocking`). The dock hosts are the three
-  CANVAS tabs (translation, cleaning, typing), each running the dock inside
-  `CanvasHooks::draw_canvas_overlay_top_left`; the state reaches them through
-  `CanvasDrawParams::panel_dock`, which the canvas only carries. On a frame whose active tab is not
+  the `PanelLayoutWriter` thread, flushed by `shutdown_blocking`). A tab hosts the dock iff its
+  `StudioTab::default_dock_layout` is `Some` (today translation, cleaning, typing and the PS
+  editor): that one hook feeds both the restore dictionary (`Tabs::dock_layout_defaults`) and the
+  per-frame host verdict (`Tabs::hosts_panel_dock`). The canvas tabs run the dock inside
+  `CanvasHooks::draw_canvas_overlay_top_left` (the state reaches them through
+  `CanvasDrawParams::panel_dock`, which the canvas only carries); the PS editor runs it in its own
+  draw. On a frame whose active tab is not
   a host, `PanelDockState::show_idle_sub_windows` keeps the detached OS windows alive (they are
   immediate viewports and exist only while shown). Persistence format: `ms-widgets`'
   `panel_dock/persist.rs`.
@@ -55,8 +63,9 @@ Root responsibilities that stay in `studio.rs`:
 - `shutdown.rs`: `StudioApp::shutdown_blocking() -> ShutdownReport`, the studio's blocking
   teardown: its ORDER (the all-canvas bubble flush unless discarding, writer steps from
   `StagingWriters`, the decode-pool release between them),
-  the exit-only settings, debounced typing stores and panel layouts, plus the permanent
-  compile-time `StudioApp: Send` guard.
+  the tabs' exit-only settings (ONE `user_config` read-modify-write over
+  `Tabs::write_exit_settings`), the tabs' debounced stores (`Tabs::flush_debounced_stores_blocking`)
+  and the panel layouts, plus the permanent compile-time `StudioApp: Send` guard.
 - `staging_writers.rs`: `StagingWriters`, the three `_unsaved` writers of the session as an owned
   struct (autosave gate, клин autosave thread + `OverlayAutosaveControl`, Arc clones of the layer
   document, bubbles and clean-overlay models, the staging клин dir, the DISCARD latch). One method
@@ -92,7 +101,8 @@ Root responsibilities that stay in `studio.rs`:
 - `busy.rs`: `PersistenceActivity`, the `Copy` snapshot of the persistence busy flags (save,
   save preload, page op / its failure / pending reload, discard delete job — the session's
   `PersistenceJobs` — plus typing export and page manager clean op), built by
-  `StudioApp::persistence_activity` / `PersistenceActivity::new`, and one named predicate per
+  `PersistenceActivity::of` (the one composition, used by `StudioApp::persistence_activity` and
+  the project session's flows), and one named predicate per
   subset the gates read (`structural_op_active`, `save_busy`, `blocks_page_op`,
   `clean_op_in_flight`, `exit_cleanup_running`), plus `save_blocker` (`SaveBlocker`: the one
   cause a project save is refused for; saves read the strict `blocks_page_op` set plus the clean worker).
@@ -106,14 +116,19 @@ Root responsibilities that stay in `studio.rs`:
   caller applies it with `apply_comic_type_preset` and reports back through `resolve` / `fail`)
   and `AiDevicePrompt` (`refresh` opens it from the health snapshot, `draw` sends the
   `SetDevice` / `SetOnnxDevice` probe commands and returns whether it is still open).
-- `tabs.rs`: `Tabs`, the ten program-tab states plus the Translation canvas (field `tabs`), and
-  `Tabs::draw(drawn, ui, TabFrame) -> Vec<AppRequest>`, the per-tab draw dispatch of `ui`. The
+- `tabs.rs`: `Tabs`, the ten program tabs (field `tabs`; the Translation tab is its host
+  `ms_tab_translation::TranslationTab`, which owns the Translation canvas), the one `AppTab` ->
+  tab mapping as `StudioTab` trait objects (`get` / `get_mut`) with the order-free fan-outs in
+  `AppTab::ALL` order (`for_each` / `for_each_mut`, `hotkey_specs`, `dock_layout_defaults`,
+  `hosts_panel_dock`, `evict_tab_gpu_caches`; the teardown's `write_exit_settings` and
+  `flush_debounced_stores_blocking`), and `Tabs::draw(drawn, ui, TabFrame) -> Vec<AppRequest>`, the per-tab
+  draw dispatch of `ui`. The
   frame context `TabFrame` is borrowed from `StudioApp` (project, page geometry + resident textures
   lent by `PageResidency`, panel dock, busy snapshot, canvas status, hotkey registry); every tab ->
   app request is an `AppRequest` (`PageOp`, `OpenPage`, `NavigateSettings`, `CharactersChanged`,
-  `OpenNotesForCharacter`, `TermsChanged`), applied by `StudioApp::apply_app_request`. Also the
-  canvas bottom-hint rows and the settings -> typing panel-layout hand-off. Direct app -> tab calls
-  (setters, flushes, hotkeys) stay method calls on `Tabs` fields.
+  `OpenNotesForCharacter`, `TermsChanged`), applied by `StudioApp::apply_app_request`. Ordered
+  app -> tab calls (setters, flushes, the §12
+  sequences) stay method calls on `Tabs` fields; order-free ones go through the trait.
 - `view_sync.rs`: `ViewSync`, the shared view state of the view tabs (the three canvas tabs and
   the PS editor): shared viewport snapshot and its owner tab, shared page and page-local center,
   previous view tab. `before_draw` (tab-leave flushes, then snapshot / page apply),
@@ -157,13 +172,18 @@ Root responsibilities that stay in `studio.rs`:
   new predicate instead of editing a shared one. The snapshot is taken where the decision is made,
   before tab states are borrowed for drawing.
 
-- `PageResidency` knows no tab type: the page window to keep, the pixel-inspection flag and the
-  canvas `cache_pages` setting are parameters, and tab GPU caches are evicted by `studio.rs`.
+- `PageResidency` knows no tab type: the page window to keep and the pixel-inspection flag are
+  parameters, the canvas `cache_pages` setting is read from `CleanOverlaysModel` (its owner; no
+  code reads a canvas's `state.cache_pages` copy for it), and tab GPU caches are evicted by
+  `studio.rs`.
   `shutdown_blocking` calls `PageResidency::shutdown` before the typing flush and layer barrier.
 
 - While either prompt is open the studio dispatches no hotkeys and repaints every frame
   (the `ui` call site in `studio.rs`). Applying a comic type stays in `studio.rs`: it writes the
-  project, the canvas, both shared models and the Settings tab.
+  project (memory + settings file), then applies the preset to the `BubblesModel` canvas-settings
+  snapshot (`SharedCanvasSettings::apply_comic_type_preset`, the one preset owner, also used by the
+  Settings pane) and pushes it to `BubblesModel`, `CleanOverlaysModel` and the Settings tab; the
+  canvases pull it by revision.
 
 - `ViewSync::before_draw` runs right before the active tab draws and `after_draw` at the end of
   the frame (after hotkeys), with the tab the frame ended on. Inside `before_draw` the PS-editor
@@ -173,18 +193,25 @@ Root responsibilities that stay in `studio.rs`:
   unwritten bubble edits. Every tab switch (tab bar, page-manager open, settings deep link,
   hotkeys) is covered because the destination tab first draws after a `before_draw`. The PS editor never owns the scroll
   snapshot; it only feeds the shared page, zoom and center. Non-view tabs leave the state alone.
-- Code in `src/studio` reaches a tab's canvas only through `canvas_slot` (cleaning and typing expose
-  theirs as `canvas()` / `canvas_mut()`) or, for all three at once, `for_each_canvas_mut`; no
-  site spells its own Translation / Cleaning / Typing match.
+- Code in `src/studio` reaches a tab's canvas only through `canvas_slot` (all three canvas tabs
+  expose theirs as `canvas()` / `canvas_mut()`; Translation's is `TranslationTab`'s) or, for all
+  three at once, `for_each_canvas_mut`; no site spells its own Translation / Cleaning / Typing match.
+- Per-tab ORDER-FREE questions go through `Tabs` and `ms_studio_tab::StudioTab`, never a per-tab
+  `match` in `studio.rs`: hotkey registration (`Tabs::hotkey_specs`, `AppTab::ALL` order, then the
+  session's specs, then the user overrides; within a scope the order is pinned by
+  `hotkey_registry_golden`), hotkey execution (the session's ids, then the ACTIVE tab's
+  `execute_hotkey`; a `false` answer is logged), dock hosts, GPU eviction, the active tab's
+  source-page window and NEAREST flag, the every-frame `poll_background` (after the residency's
+  decoded-page poll, before any busy gate reads `clean_op_in_flight`) and
+  `on_committed_tree_changed` (the session latch `take_committed_tree_changed`, drained right
+  after `SessionMode::tick`). Drawing and every ordered sequence stay explicit calls.
 
 - `Tabs::draw` never changes `StudioApp::active_tab` and never polls the panel dock: `ui` takes the
   panel-dock verdict (`PanelDockPass`) for the tab that draws, then after the draw polls the dirty
-  layouts (only when that tab hosts the dock, `tab_hosts_panel_dock`), then applies the requests in
+  layouts (only when that tab ran the dock, `PanelDockPass::dock_ran`), then applies the requests in
   the order the tab raised them — the tab switches (page open, deep link, «open notes») land there,
   before the idle sub-window pass, the trims, the hotkeys and `ViewSync::after_draw`. The frame
   context is built before any tab state is borrowed (the busy snapshot first).
-- The settings -> typing panel-layout request is a tab -> tab hand-off, applied at the START of the
-  frame (`Tabs::apply_typing_panel_layout_request`), not an `AppRequest`.
 
 ## Save / page-op / discard / exit choreography
 The project session (`session/project/`, `ProjectSession`) sequences the three staging writers
@@ -227,6 +254,11 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
   barriers the layer saver (failed pages are logged as a warning, not an abort), writes the
   snapshots to staging and dispatches the engine. Page ops are not staged; the shell rebuilds the
   app from disk (`StudioOutput::ReloadRequested`).
+- Unsaved work held inside tabs: `session::DeferredTabEdits` is the ONE owner of which tabs hold
+  edits not yet handed to a staging writer (typing's deferred text edits, the PS editor's deferred
+  layer edits); the project's dirty check (latched in `refresh_unsaved_changes_cache`, and read live
+  by `SessionMode::has_unsaved_changes` outside a discard) and the image set's both read it, so a
+  close with only such an edit pending still opens the exit dialog.
 - DISCARD (`start_exit_cleanup` = `StagingWriters::quiesce_discarding` + delete job): the quiesce
   latches the discard first, DROPS (never flushes) typing's deferred edits,
   `shutdown_saver_discarding` on the layer saver, pauses the bubbles saver, `request_stop_now` on
@@ -237,7 +269,7 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
   `close_image_set_discarding` in `session/mod.rs` (quiesce + `CloseFlow::finalize`, no delete
   job, клин thread joined in `shutdown_blocking`); `shutdown_blocking` itself quiesces first when
   no dialog did (`SessionMode::before_shutdown`). Dirty is the controller's (`AutosaveGate::
-  action_count` vs the last-write baseline, plus deferred typing edits, plus a write in flight),
+  action_count` vs the last-write baseline, plus the deferred tab edits, plus a write in flight),
   never the staging probe. The save-then-close keeps the window open on a failed write and
   re-opens the exit dialog when the user backed out of the picker / JPEG options. A second OS
   close while its exit dialog is open is ignored (`SessionMode::os_close_policy`): only the
@@ -249,19 +281,27 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
 - `shutdown_blocking` (`shutdown.rs`, run by the shell's Closing-screen worker for every leave of
   the studio — exit, return to the launcher, reload — or inline from the shell's `on_exit` when
   eframe ended the window with the studio open): unless discarding, flush the bubble edits of all
-  three canvases into the bubbles model (so the bubbles-saver shutdown below writes them), then
+  three canvases into the bubbles model (so the bubbles-saver shutdown below writes them) and the
+  PS editor's deferred layer edits onto the layer saver (`flush_layers_if_dirty`, so the barrier
+  below covers them; same bubbles -> PS -> typing order as the save and the page op), then
   flush-and-stop the клин autosave (stop-now when discarding) and join it
   (`StagingWriters::stop_overlay_autosave_blocking`), release the decode pool, then
   (`StagingWriters::drain_for_shutdown`) — unless discarding — enqueue typing's deferred edits
   INLINE, barrier the layer saver and report its failed pages, then shut down layer and bubbles
-  savers.
+  savers. Only after that drain: every tab's exit-only `user_config` keys in ONE read-modify-write
+  (`StudioTab::write_exit_settings`; a failure is logged, the file left as it was), then every
+  tab's debounced user-global stores (`StudioTab::flush_debounced_stores_blocking`; typing: the
+  per-font settings, then the default local-preset set), then the panel-layout poll and the
+  `PanelLayoutWriter` flush-and-join.
 
 ## Editing map
 - Add a construction-time read for the studio: a field of `StudioBootstrap` (`bootstrap.rs`),
   consumed in `StudioApp::new`.
 - Add a tab -> app request, or change what a tab gets for its draw: `tabs.rs` (`AppRequest`,
-  `TabFrame`), its application in `studio.rs` (`apply_app_request`). A new dock host: `tab_hosts_panel_dock`
-  and `panel_dock_default_layout_builders` in `studio.rs`.
+  `TabFrame`), its application in `studio.rs` (`apply_app_request`). A new dock host, hotkey,
+  GPU cache, page window or background poll of a tab: that tab's `impl StudioTab` (in its crate;
+  Settings: `src/tabs/settings/studio_tab.rs`); a new order-free hook: `ms-studio-tab` plus a
+  fan-out in `tabs.rs`.
 - Change the teardown order or what it reports: `shutdown.rs`, and the teardown bullet of the
   choreography above.
 - Change how a running session answers delivered images: `incoming_open.rs` (the dialog body:
@@ -277,7 +317,7 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
   `busy.rs` (predicates and their table tests), then the call site in `studio.rs` or
   `session/project/`.
 - Change page decode, promotion, upload budgets, the page cache loader or pressure eviction:
-  `residency/`; which pages the active tab keeps: `active_source_page_window` in `studio.rs`.
+  `residency/`; which pages the active tab keeps: the tab's `StudioTab::source_page_window`.
 - Change how the canvas tabs and the PS editor share zoom / scroll / page across tab switches, or
   which tab draws which canvas: `view_sync.rs` (its tests), call sites in `studio.rs` `ui` and
   `open_page_in_tab`.

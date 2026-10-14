@@ -39,7 +39,7 @@ use ms_config::{AiInstallType, AiRuntime, OrtLoadDecision};
 use ms_log::runtime_log;
 use ms_native_runtime::NativeFallbackReason;
 use ms_onnx::NativeDeviceSelection;
-use ms_tab_translation::local_ai::effective_ai_runtime;
+use ms_local_ai::local_ai::effective_ai_runtime;
 use serde_json::Value;
 
 use super::model::{FallbackCause, NATIVE_FAMILY, REGISTRATION_FAMILY, SettingKey, SettingWarning, WarningReason};

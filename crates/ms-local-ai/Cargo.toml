@@ -1,0 +1,37 @@
+[package]
+name = "ms-local-ai"
+version = "0.1.0"
+edition = "2024"
+
+# The process's LOCAL AI facts, shared by the tabs, the settings panes, the backend supervisor,
+# the launcher and the root: which local runtimes this process may use (`local_ai`: `--no-ai`
+# plus the platform, the one route-availability rule, the effective-runtime helper) and the
+# push-driven Python backend health model with its device-control probe thread
+# (`backend_health`). GUI-free: no egui, no tab state.
+#
+# Layer: the `ms-project / ms-widgets / ms-native-runtime` line. Every dependency sits below it,
+# and nothing on that line or below uses it. It must never depend on a tab crate,
+# `ms-settings-ui`, `ms-launcher` or the root package; those depend on it.
+
+[dependencies]
+# Framed IPC with the Python AI backend: the `health` pull, the `TOPIC_HEALTH` subscription and
+# the device-control calls all go through `shared_client()`.
+ms-backend-ipc = { path = "../ms-backend-ipc" }
+# `AiRuntime` (the stored runtime choice `effective_ai_runtime` reads).
+ms-config = { path = "../ms-config" }
+# Diagnostics (`runtime_log`) of the probe thread and the device-control calls.
+ms-log = { path = "../ms-log" }
+# The capability table (`PlatformFeature::{PythonBackend, NativeOnnxRuntime}`) and its typed
+# `Unavailable` reasons behind `LocalAiAvailability`.
+ms-platform = { path = "../ms-platform" }
+# `ai_backend_capabilities`: the process-wide torch / backend / backend-ORT availability slots
+# the health fold publishes.
+ms-sysprobe = { path = "../ms-sysprobe" }
+# The probe thread is spawned through the project thread wrapper.
+ms-thread = { path = "../ms-thread" }
+# Localized status and error texts (`t!` / `tf!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# Health / device payloads.
+serde_json.workspace = true
+# Monotonic time that also works in a web build (probe timeouts, `checked_at`).
+web-time.workspace = true

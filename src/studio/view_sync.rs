@@ -37,7 +37,7 @@ use eframe::egui;
 /// Which `CanvasView` a canvas tab draws with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CanvasSlot {
-    /// `Tabs::translation_canvas`, drawn by the Translation tab.
+    /// The canvas owned by `TranslationTab` (`canvas_mut`), drawn by the Translation tab.
     Translation,
     /// The canvas owned by `CleaningTabState`.
     Cleaning,
@@ -69,7 +69,7 @@ pub(super) fn canvas_slot(tab: AppTab) -> Option<CanvasSlot> {
 }
 
 /// Resolves `tab` to its canvas over shared borrows of the three canvas owners.
-pub(super) fn canvas_of<'a>(tab: AppTab, translation: &'a CanvasView, cleaning: &'a CleaningTabState, typing: &'a TypingTabState) -> Option<&'a CanvasView> {
+fn canvas_of<'a>(tab: AppTab, translation: &'a CanvasView, cleaning: &'a CleaningTabState, typing: &'a TypingTabState) -> Option<&'a CanvasView> {
     Some(match canvas_slot(tab)? {
         CanvasSlot::Translation => translation,
         CanvasSlot::Cleaning => cleaning.canvas(),
@@ -99,7 +99,7 @@ pub(super) fn for_each_canvas_mut(translation: &mut CanvasView, cleaning: &mut C
 
 /// The view tabs `ViewSync` drives: a borrow of four `Tabs` fields for one call (`Tabs::view_tabs`).
 pub(super) struct ViewTabs<'a> {
-    /// The Translation tab's canvas (`Tabs::translation_canvas`).
+    /// The Translation tab's canvas (`TranslationTab::canvas_mut`).
     pub(super) translation: &'a mut CanvasView,
     pub(super) cleaning: &'a mut CleaningTabState,
     pub(super) typing: &'a mut TypingTabState,

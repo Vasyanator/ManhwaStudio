@@ -31,6 +31,9 @@ ms-models = { path = "../ms-models" }
 ms-project = { path = "../ms-project" }
 # Every reusable widget the panel puts on screen, plus `input_util` and `ui_fonts`.
 ms-widgets = { path = "../ms-widgets" }
+# The studio root's order-free per-tab hook trait (`StudioTab`), implemented in
+# `tab/studio_tab.rs`. It sits below this crate (its own layer line under the tab crates).
+ms-studio-tab = { path = "../ms-studio-tab" }
 # Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
 # hand-typed here. A leaf over egui, so it adds no layering constraint.
 ms-theme = { path = "../ms-theme" }

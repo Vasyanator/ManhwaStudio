@@ -1,29 +1,39 @@
 /*
 FILE OVERVIEW: src/studio.rs
-Main eframe application orchestration (`StudioApp`): project/model initialization,
-background page/overlay loading, tab routing, and global hotkey dispatch.
+The studio screen's editor root (`StudioApp`): project/model initialization, tab routing, the
+per-frame order of `ui`, and hotkey dispatch. A screen of the main window (`src/shell/`), not a
+window: it implements `eframe::App` only for the `ui` frame entry the shell forwards.
 
 Main structs:
 - `StudioApp`: root app state (project, shared models, tab states, residency, hotkeys).
 The source-page residency pipeline (decode pool, in-order promotion, budgeted tiled GPU upload,
 overlay and page-cache loaders, memory-pressure eviction) is `PageResidency` in `studio/residency/`;
 this file only feeds it the tab knowledge it must not have: the active tab's page window and
-pixel-inspection state (`active_source_page_window`, `active_canvas_source_pixel_inspection`),
-the canvas `cache_pages` setting, and the tabs' own GPU caches (`evict_tab_gpu_caches`).
+pixel-inspection state (`active_source_page_window`, `active_canvas_source_pixel_inspection`)
+and the tabs' own GPU caches (`Tabs::evict_tab_gpu_caches`), each asked of the tabs through the
+`ms_studio_tab::StudioTab` hooks. The canvas `cache_pages` setting is not fed from here:
+residency reads it from its owner, `CleanOverlaysModel`.
 
 App/frame flow:
 - `new(project, bootstrap, ai_backend)`: builds models, tabs, and input manager registrations
   from the inputs `StudioBootstrap` (`studio/bootstrap.rs`) pre-read on the open worker; it reads
   no config or document itself, so it can run inside a GUI frame.
-- `new`: wires shared models (`bubbles`, `clean_overlays`, `text_mask`) between tabs.
-- `new`: also starts shared AI-backend health probe and wires it into Settings/Translation tabs.
-- `ui` (eframe::App, egui 0.35): frame tick (poll workers, draw active tab, dispatch hotkeys);
-  lends `PageResidency::lend_mut` (page geometry + resident textures) to the drawing tab.
-- Tabs: the ten tab states and the Translation canvas are `Tabs` (`studio/tabs.rs`). `ui` builds the
+- `new`: wires shared models (`bubbles`, `clean_overlays`, `text_mask`, the layer document)
+  between tabs, seeds the tabs' exit-only flags from the bootstrap's `user_config` (Translation in
+  `TranslationTab::new`, Typing via `load_exit_settings`), and shares the app-global AI backend's
+  health snapshot and probe channel (`AiBackendHandle`; the supervisor, not the studio, owns the
+  backend process and its probe) with the Translation, Cleaning and Settings tabs.
+- `ui` (`eframe::App::ui`, egui 0.36): frame tick (poll workers, draw active tab, dispatch
+  hotkeys); lends `PageResidency::lend_mut` (page geometry + resident textures) to the drawing tab.
+- Tabs: the ten program tabs are `Tabs` (`studio/tabs.rs`; the Translation tab is its host
+  `TranslationTab`, which owns the Translation canvas). Order-free per-tab questions (hotkeys,
+  dock host, GPU eviction, page window, background poll, committed-tree change) go through the
+  `StudioTab` fan-outs of `Tabs`. `ui` builds the
   frame context (`TabFrame`), calls `Tabs::draw` for the active tab, polls the panel dock's dirty
   layouts when that tab hosts the dock, then applies the returned `AppRequest`s
   (`apply_app_request`: page op, page open, settings deep link, characters / terms changed).
-- `dispatch_hotkeys` + `execute_hotkey_command`: execute `InputManagerV2` commands.
+- `dispatch_hotkeys` + `execute_hotkey_command`: execute `InputManagerV2` commands (the session's
+  ids here, every other id by the active tab, `StudioTab::execute_hotkey`).
 - Persistence busy gates (page op, save, save button, typing export, page manager, veil):
   named predicates over `persistence_activity()` in `studio/busy.rs`.
 - Modal prompts (comic type, AI device selection): `ComicTypePrompt` / `AiDevicePrompt` in
@@ -53,8 +63,8 @@ App/frame flow:
   (`studio/studio_output.rs`); the inbound calls are `request_os_close` and `request_close_for_incoming`.
 
 Hotkeys:
-- Translation canvas zoom/edit commands + panel toggles (`P/O/K/M/D` by default).
-- Cleaning canvas zoom commands.
+- Declared by the tabs (`StudioTab::hotkey_specs`: Translation canvas and panel commands,
+  Cleaning canvas zoom), registered in `AppTab::ALL` order.
 - Image-set save / save-as (registered only in that mode, `SessionMode::hotkey_specs`).
 
 Profiling (optional, behind the `profiling` cargo feature):
@@ -66,13 +76,10 @@ Profiling (optional, behind the `profiling` cargo feature):
 */
 
 use crate::ai_backend_supervisor::AiBackendHandle;
-use crate::canvas::{
-    AsideBubbleCompactMode, AsideBubbleSideMode, BubbleMode, BubbleTextField, BubbleType,
-    CanvasUiStatus, CanvasView, OnTopFocusMode, TranslationStatusDisplay,
-};
-use crate::input_manager_v2::{HotkeyOverrides, HotkeyScopeV2, HotkeySpecV2, InputManagerV2};
-use serde_json::{Map, Value};
-use crate::memory_manager::{CacheEvictionReport, CacheEvictionRequest, MemoryManager, MemoryPressure};
+use crate::canvas::CanvasUiStatus;
+use crate::input_manager_v2::{HotkeyOverrides, HotkeySpecV2, InputManagerV2};
+use serde_json::Value;
+use crate::memory_manager::{CacheEvictionRequest, MemoryManager, MemoryPressure};
 use crate::models::autosave_gate::AutosaveGate;
 use crate::models::bubbles_model::BubblesModel;
 use crate::models::clean_overlays_model::CleanOverlaysModel;
@@ -82,26 +89,18 @@ use crate::page_ops::PageOpKind;
 use crate::runtime_log;
 use crate::tabs::AppTab;
 use crate::tabs::characters::CharactersTabState;
-use crate::tabs::cleaning::{CleaningTabState, cleaning_default_dock_layout};
+use crate::tabs::cleaning::CleaningTabState;
 use crate::tabs::notes::NotesTabState;
 use crate::tabs::page_manager::PageManagerTabState;
-use crate::tabs::ps_editor::{PsEditorTabState, ps_editor_default_dock_layout};
+use crate::tabs::ps_editor::PsEditorTabState;
 use crate::tabs::settings::SettingsTabState;
 use crate::tabs::terms::TermsTabState;
-use crate::tabs::translation::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
-use crate::tabs::translation::{
-    HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL, HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION,
-    HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE, HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE,
-    HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL, HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION,
-    HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL, HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL,
-    HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL, HOTKEY_TRANSLATION_TOGGLE_MT_PANEL,
-    HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL, TranslationHotkeyHints, TranslationTabState,
-    translation_default_dock_layout,
-};
-use crate::tabs::typing::{TypingTabState, typing_default_dock_layout};
+use ms_local_ai::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
+use crate::tabs::translation::{TranslationTab, TranslationTabState};
+use crate::tabs::typing::TypingTabState;
 use crate::tabs::wiki::WikiTabState;
 use crate::widgets::panel_dock::persist as panel_dock_persist;
-use crate::widgets::panel_dock::{DockLayout, PanelDockState, PanelLayoutWriter};
+use crate::widgets::panel_dock::{PanelDockState, PanelLayoutWriter};
 use eframe::egui;
 use ms_thread as thread;
 use std::collections::{BTreeSet, HashSet};
@@ -121,7 +120,7 @@ mod incoming_open;
 mod busy;
 // Source-page residency (`PageResidency`): decode pool, in-order promotion, GPU upload, eviction.
 mod residency;
-use residency::{PageResidency, append_eviction_report};
+use residency::PageResidency;
 // The comic-type and AI device selection prompts (`ComicTypePrompt`, `AiDevicePrompt`).
 mod prompts;
 use prompts::{AiDevicePrompt, ComicTypePrompt};
@@ -149,40 +148,6 @@ use session::{SessionMode, SessionParts, image_set};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use shutdown::ShutdownReport;
 
-const HOTKEY_TRANSLATION_ZOOM_IN: &str = "translation.canvas.zoom_in";
-const HOTKEY_TRANSLATION_ZOOM_OUT: &str = "translation.canvas.zoom_out";
-const HOTKEY_TRANSLATION_ZOOM_RESET: &str = "translation.canvas.zoom_reset";
-const HOTKEY_TRANSLATION_DELETE_BUBBLE: &str = "translation.bubble.delete_selected";
-const HOTKEY_TRANSLATION_CREATE_BUBBLE: &str = "translation.bubble.create_at_cursor";
-const HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE: &str = "translation.bubble.create_hint_at_cursor";
-const HOTKEY_CLEANING_ZOOM_IN: &str = "cleaning.canvas.zoom_in";
-const HOTKEY_CLEANING_ZOOM_OUT: &str = "cleaning.canvas.zoom_out";
-const HOTKEY_CLEANING_ZOOM_RESET: &str = "cleaning.canvas.zoom_reset";
-/// `user_config.json` section holding the per-tab canvas bottom-hint collapsed flags.
-const CANVAS_CONFIG_SECTION: &str = "Canvas";
-/// Config keys (under [`CANVAS_CONFIG_SECTION`]) for each canvas tab's bottom-hint collapsed state.
-/// Default (absent) is `false` = expanded. Written only on exit; seeded once at construction. Only
-/// Translation and Typing have a bottom-hint; Cleaning's hint is disabled and has no key. A stale
-/// `cleaning_hint_collapsed` may linger in an old config; it is never read or written.
-const CANVAS_TRANSLATION_HINT_COLLAPSED_KEY: &str = "translation_hint_collapsed";
-const CANVAS_TYPING_HINT_COLLAPSED_KEY: &str = "typing_hint_collapsed";
-/// `user_config.json` section holding typing-tab settings (persisted centering-assist flags, etc.).
-const TEXT_TAB_CONFIG_SECTION: &str = "TextTab";
-/// Config keys (under [`TEXT_TAB_CONFIG_SECTION`]) for the two persisted centering-assist checkboxes.
-/// `centering_assist_enabled` defaults (absent) to `false` (off); `centering_show_center` defaults to
-/// `true` (marker shown). Written only on exit; seeded once at construction. The bound-center KIND is
-/// session-only and has no key. The dependent bound-center marker's default-on state is why its key
-/// uses a `true` default while the assist toggle uses `false`.
-const TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY: &str = "centering_assist_enabled";
-const TEXT_TAB_CENTERING_SHOW_CENTER_KEY: &str = "centering_show_center";
-
-#[derive(Debug, Clone, Default)]
-struct CachedHotkeyHints {
-    bindings_revision: u64,
-    create_bubble_hint: Option<String>,
-    translation_hints: TranslationHotkeyHints,
-}
-
 pub struct StudioApp {
     project: ProjectData,
     /// Source-page residency: decode pool, in-order promotion, budgeted GPU upload, overlay and
@@ -192,7 +157,6 @@ pub struct StudioApp {
     bubbles_model: Arc<Mutex<BubblesModel>>,
     clean_overlays_model: Arc<Mutex<CleanOverlaysModel>>,
     applied_bubbles_revision: u64,
-    cached_hotkey_hints: CachedHotkeyHints,
     active_tab: AppTab,
     /// Shared viewport / page / camera-center sync between the canvas tabs and the PS editor
     /// (`studio/view_sync.rs`), applied before the active tab draws and published after the frame.
@@ -203,7 +167,7 @@ pub struct StudioApp {
     /// health state several times per frame.
     ai_backend_health_cached: AiBackendHealthSnapshot,
     ai_backend_probe_tx: Option<Sender<AiBackendProbeCommand>>,
-    /// The ten program-tab states and the Translation canvas (`studio/tabs.rs`); the active one draws
+    /// The ten program tabs (`studio/tabs.rs`; Translation owns its canvas); the active one draws
     /// through `Tabs::draw` and asks the app for anything else through `AppRequest`s. Declared
     /// before the panel dock, layer document and staging writers, so every tab state (and its Arc
     /// clones of the shared models) is dropped before them.
@@ -292,22 +256,6 @@ impl StudioApp {
         let memory_manager = Arc::new(MemoryManager::new(
             crate::config::memory_profile_from_user_settings(&user_settings),
         ));
-        // Per-tab canvas bottom-hint collapsed state, seeded once from `user_config` (absent =>
-        // expanded). Read back on exit and persisted via `shutdown_blocking`; not saved on every toggle.
-        let translation_hint_collapsed =
-            hint_collapsed_from_user_settings(&user_settings, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY);
-        let typing_hint_collapsed =
-            hint_collapsed_from_user_settings(&user_settings, CANVAS_TYPING_HINT_COLLAPSED_KEY);
-        // Persisted centering-assist checkboxes, seeded once from `user_config` (absent => assist off,
-        // marker shown). Read back on exit and persisted via `shutdown_blocking`; not saved on every toggle. The
-        // bound-center KIND stays session-only.
-        let typing_centering_assist_enabled = text_tab_bool_from_user_settings(
-            &user_settings,
-            TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY,
-            false,
-        );
-        let typing_centering_show_center =
-            text_tab_bool_from_user_settings(&user_settings, TEXT_TAB_CENTERING_SHOW_CENTER_KEY, true);
         let cache_pages = project.canvas_settings.cache_pages;
         let residency = PageResidency::spawn(&project, cache_pages, Arc::clone(&memory_manager));
         // Warm the process-global text-render FontSystem pool off the GUI thread. The first lease
@@ -316,56 +264,10 @@ impl StudioApp {
         // warm system. Guarded by `Once` because `new` can run multiple times per process
         // (launcher<->studio transitions) and we want at most one prewarm thread.
         spawn_text_render_font_pool_prewarm();
-        let mut canvas = CanvasView::default();
-        let loaded_bubble_mode = BubbleMode::from_str(&project.canvas_settings.bubble_type);
-        canvas.state.bubble_mode = BubbleMode::Hybrid;
-        canvas.state.hybrid_editable_bubble_type = match loaded_bubble_mode {
-            BubbleMode::Aside => BubbleType::Aside,
-            BubbleMode::OnTop => BubbleType::OnTop,
-            BubbleMode::Hybrid => {
-                BubbleType::from_str(&project.canvas_settings.editable_bubble_type)
-                    .resolved(BubbleType::OnTop)
-            }
-        };
-        canvas.state.hybrid_readonly_bubble_type = match loaded_bubble_mode {
-            BubbleMode::Aside => BubbleType::Aside,
-            BubbleMode::OnTop => BubbleType::OnTop,
-            BubbleMode::Hybrid => {
-                BubbleType::from_str(&project.canvas_settings.readonly_bubble_type)
-                    .resolved(BubbleType::Aside)
-            }
-        };
-        canvas.state.show_bubbles = project.canvas_settings.show_bubbles;
-        canvas.state.show_bubble_status = project.canvas_settings.show_bubble_status;
-        canvas.state.bubble_status_rules = project.canvas_settings.bubble_status_rules.clone();
-        canvas.state.bubble_opacity = project.canvas_settings.bubble_opacity;
-        canvas.state.bubble_min_width = project.canvas_settings.aside_min_width_px as f32;
-        canvas.state.bubble_max_width = project.canvas_settings.aside_max_width_px as f32;
-        canvas.state.aside_compact_mode =
-            AsideBubbleCompactMode::from_str(&project.canvas_settings.aside_compact_mode);
-        canvas.state.aside_side_mode =
-            AsideBubbleSideMode::from_str(&project.canvas_settings.aside_side_mode);
-        canvas.state.aside_second_column = project.canvas_settings.aside_second_column;
-        canvas.state.on_top_focus_mode =
-            OnTopFocusMode::from_str(&project.canvas_settings.on_top_focus_mode);
-        canvas.state.scale_bubbles = project.canvas_settings.scale_bubbles;
-        canvas.state.page_spacing = project.canvas_settings.page_spacing_px as f32;
-        canvas.state.separate_pages = project.canvas_settings.separate_pages;
-        canvas.state.edge_margin = project.canvas_settings.vertical_edge_margin_px as f32;
-        canvas.state.side_margin = project.canvas_settings.side_margin_px as f32;
-        canvas.state.aside_scale_pct = project.canvas_settings.aside_scale_pct;
-        canvas.state.auto_insert_last_character =
-            project.canvas_settings.auto_insert_last_character;
-        canvas.state.spellcheck_original = project.canvas_settings.spellcheck_original;
-        canvas.state.spellcheck_translation = project.canvas_settings.spellcheck_translation;
-        canvas.state.tabs_autosync_enabled = project.canvas_settings.tabs_autosync_enabled;
-        canvas.state.cache_pages = cache_pages;
-        canvas.state.translation_status_display =
-            TranslationStatusDisplay::from_str(&project.canvas_settings.translation_status_display);
-        canvas.state.hint_show_outside_default =
-            project.canvas_settings.hint_show_outside_default;
-        canvas.set_bottom_hint_collapsed(translation_hint_collapsed);
-        let shared_canvas_settings = canvas.canvas_snapshot();
+        // The project's canvas settings, normalized exactly as a canvas stores them: the seed of
+        // the shared model's settings. No canvas is seeded directly: every canvas (the Translation
+        // one included) pulls them from `BubblesModel` by revision on its first draw.
+        let shared_canvas_settings = crate::canvas::shared_canvas_settings_from_project(&project.canvas_settings);
         // ONE autosave gate per project instance, shared by every `{chapter}_unsaved` writer: each
         // writer holds its changes in memory and writes them when the gate is due (interval since the
         // first pending change, or the action count, from the live global policy). Force points
@@ -379,9 +281,6 @@ impl StudioApp {
             Some(Arc::clone(&autosave_gate)),
             has_staged_bubbles,
         )));
-        canvas.set_scroll_area_id_salt("translation_canvas_scroll");
-        canvas.set_bubbles_model(Arc::clone(&bubbles_model));
-        let shared_canvas_viewport = canvas.viewport_snapshot();
         let applied_bubbles_revision = match bubbles_model.lock() {
             Ok(model) => model.revision(),
             Err(err) => {
@@ -400,12 +299,16 @@ impl StudioApp {
         let ai_backend_health = Arc::clone(&ai_backend.health);
         let ai_backend_probe_tx = ai_backend.probe_tx.clone();
         let text_mask_model = Arc::new(Mutex::new(TextMaskModel::new()));
-        let mut translation_tab = TranslationTabState::new(
+        let mut translation_state = TranslationTabState::new(
             local_ai,
             Arc::clone(&ai_backend_health),
             ai_backend_probe_tx.clone(),
         );
-        translation_tab.set_text_mask_model(Arc::clone(&text_mask_model));
+        translation_state.set_text_mask_model(Arc::clone(&text_mask_model));
+        // The host owns the Translation canvas (scroll salt, bubbles model, its bottom-hint
+        // collapsed flag from `user_settings`); the shared view starts from that canvas' viewport.
+        let mut translation_tab = TranslationTab::new(translation_state, Arc::clone(&bubbles_model), &user_settings);
+        let shared_canvas_viewport = translation_tab.canvas().viewport_snapshot();
         let mut cleaning_tab = CleaningTabState::default();
         cleaning_tab.set_canvas_scroll_area_id_salt("cleaning_canvas_scroll");
         cleaning_tab.set_bubbles_model(Arc::clone(&bubbles_model));
@@ -416,7 +319,8 @@ impl StudioApp {
         let clean_overlays_model =
             Arc::new(Mutex::new(CleanOverlaysModel::new_from_pages(&page_paths)));
         if let Ok(mut overlays) = clean_overlays_model.lock() {
-            overlays.set_cache_pages_enabled(canvas.state.cache_pages);
+            // Seeds the setting's owner from the project value (the canvases copy it from here).
+            overlays.set_cache_pages_enabled(cache_pages);
             overlays.set_memory_profile(memory_manager.profile());
             overlays.set_autosave_gate(Some(Arc::clone(&autosave_gate)));
         } else {
@@ -428,15 +332,10 @@ impl StudioApp {
         cleaning_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         let mut typing_tab = TypingTabState::from_seed(typing_seed);
         typing_tab.set_canvas_scroll_area_id_salt("typing_canvas_scroll");
-        // Dockable-panel arrangement of this studio window, restored from the snapshot already in
-        // hand. It must be installed BEFORE the first frame: the dock builds the default layout
-        // for any key that has none, and the default is what the restored layout has to win over.
-        let panel_dock = restore_panel_dock(&user_settings);
-        typing_tab.set_hint_collapsed(typing_hint_collapsed);
-        typing_tab.set_centering_assist_persisted_state(
-            typing_centering_assist_enabled,
-            typing_centering_show_center,
-        );
+        // The typing tab's exit-only flags (bottom-hint collapsed, both centering-assist checkboxes),
+        // seeded once from `user_config`; written back by the teardown (`shutdown.rs`), never per toggle.
+        // The Translation tab reads its own flag (`TranslationTab::new`).
+        typing_tab.load_exit_settings(&user_settings);
         typing_tab.set_bubbles_model(Arc::clone(&bubbles_model));
         typing_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         let mut ps_editor_tab = PsEditorTabState::default();
@@ -482,20 +381,16 @@ impl StudioApp {
             Arc::clone(&clean_overlays_model),
             spellcheck_words,
         );
-        if let Some(layout) = settings_tab.take_typing_panel_layout_request() {
-            typing_tab.set_panel_layout(layout);
-        }
         // The one session-kind decision of `src/studio`: every per-kind behaviour below dispatches on it.
         let session = SessionMode::from_project(&project, &user_settings, has_staging);
         // The ONE push of what the session offers into the tabs that gate a feature on it. Once is
         // enough: the session kind never changes during a `StudioApp` lifetime. The Settings push
         // must follow `set_canvas_settings_binding` (it may clear the project spellcheck target).
         let session_caps = session.capabilities();
-        translation_tab.set_session_capabilities(session_caps);
+        translation_tab.state_mut().set_session_capabilities(session_caps);
         cleaning_tab.set_session_capabilities(session_caps);
         typing_tab.set_session_capabilities(session_caps);
         settings_tab.set_session_capabilities(session_caps);
-        let input_manager_v2 = build_input_manager_v2(session.hotkey_specs(), &hotkey_overrides);
         let comic_type_prompt_open = project.comic_type.is_none();
 
         // Start the клин overlay autosave thread; it writes the dirty pages when the gate is due.
@@ -510,6 +405,26 @@ impl StudioApp {
         page_manager_tab.set_bubbles_model(Arc::clone(&bubbles_model));
         page_manager_tab.set_overlays_model(Arc::clone(&clean_overlays_model));
         page_manager_tab.set_layer_doc(Arc::clone(&layer_doc));
+        let tabs = Tabs {
+            translation: translation_tab,
+            cleaning: cleaning_tab,
+            typing: typing_tab,
+            ps_editor: ps_editor_tab,
+            page_manager: page_manager_tab,
+            characters: CharactersTabState::default(),
+            terms: TermsTabState::default(),
+            notes: NotesTabState::default(),
+            settings: settings_tab,
+            wiki: WikiTabState::new(),
+        };
+        // Every tab's declared hotkeys (`AppTab::ALL` order), then the session's own, then the
+        // user's overrides.
+        let input_manager_v2 = build_input_manager_v2(tabs.hotkey_specs(), session.hotkey_specs(), &hotkey_overrides);
+        // Dockable-panel arrangement of this studio window, restored from the snapshot already in
+        // hand against the dock hosts' default layouts. It must be installed BEFORE the first frame:
+        // the dock builds the default layout for any key that has none, and the default is what the
+        // restored layout has to win over.
+        let panel_dock = restore_panel_dock(&user_settings, &tabs.dock_layout_defaults());
 
         Self {
             project,
@@ -517,25 +432,12 @@ impl StudioApp {
             bubbles_model,
             clean_overlays_model,
             applied_bubbles_revision,
-            cached_hotkey_hints: CachedHotkeyHints::default(),
             active_tab: AppTab::Translation,
             view_sync: ViewSync::new(shared_canvas_viewport),
             ai_backend_health,
             ai_backend_health_cached: AiBackendHealthSnapshot::default(),
             ai_backend_probe_tx: ai_backend_probe_tx.clone(),
-            tabs: Tabs {
-                translation_canvas: canvas,
-                translation: translation_tab,
-                cleaning: cleaning_tab,
-                typing: typing_tab,
-                ps_editor: ps_editor_tab,
-                page_manager: page_manager_tab,
-                characters: CharactersTabState::default(),
-                terms: TermsTabState::default(),
-                notes: NotesTabState::default(),
-                settings: settings_tab,
-                wiki: WikiTabState::new(),
-            },
+            tabs,
             panel_dock,
             panel_layout_writer: PanelLayoutWriter::spawn(),
             layer_doc,
@@ -596,7 +498,7 @@ impl StudioApp {
                 close: &mut self.close,
                 typing: &mut self.tabs.typing,
                 ps_editor: &mut self.tabs.ps_editor,
-                translation_canvas: &mut self.tabs.translation_canvas,
+                translation_canvas: self.tabs.translation.canvas_mut(),
                 active_tab: self.active_tab,
                 cleaning: &mut self.tabs.cleaning,
                 page_manager: &mut self.tabs.page_manager,
@@ -641,6 +543,12 @@ impl StudioApp {
         session.draw_exit_dialog(ctx, kind, title, &mut parts)
     }
 
+    /// Applies the comic type the prompt returned: records it in the project (in memory and in
+    /// its settings file), then applies its canvas preset to the shared canvas settings — the
+    /// `BubblesModel` snapshot, through `SharedCanvasSettings::apply_comic_type_preset`, the one
+    /// preset owner — and pushes the result to `BubblesModel` (every canvas pulls it), to
+    /// `CleanOverlaysModel` (`cache_pages`) and to the Settings tab, in that order. A failed file
+    /// write is shown in the prompt and stops before the pushes. GUI thread; one small file write.
     fn apply_comic_type_preset(&mut self, comic_type: ComicType) {
         self.project.comic_type = Some(comic_type);
         if let Some(root) = self.project.settings_data.as_object_mut() {
@@ -652,9 +560,6 @@ impl StudioApp {
         if let Some((aside_compact_mode, separate_pages)) = comic_type.canvas_preset() {
             self.project.canvas_settings.aside_compact_mode = aside_compact_mode.to_string();
             self.project.canvas_settings.separate_pages = separate_pages;
-            self.tabs.translation_canvas.state.aside_compact_mode =
-                AsideBubbleCompactMode::from_str(aside_compact_mode);
-            self.tabs.translation_canvas.state.separate_pages = separate_pages;
         }
 
         // GUI thread: an atomic replace WITHOUT fsync (CLAUDE.md §5); the synchronous I/O
@@ -680,16 +585,26 @@ impl StudioApp {
             return;
         }
 
-        let snapshot = self.tabs.translation_canvas.canvas_snapshot();
-
-        if let Ok(mut bubbles_model) = self.bubbles_model.lock() {
-            bubbles_model.set_canvas_settings(snapshot.clone());
-        } else {
-            runtime_log::log_warn(
-                "[app] failed to lock BubblesModel while applying comic_type preset",
-            );
-            eprintln!("WARN app::apply_comic_type_preset: failed to lock BubblesModel");
-        }
+        // The preset goes onto the shared settings every canvas pulls from (one lock: read, apply,
+        // write back). Without that lock there is no current snapshot to apply it to: the project
+        // file already holds the comic type, the live settings keep their values.
+        let snapshot = match self.bubbles_model.lock() {
+            Ok(mut bubbles_model) => {
+                let mut snapshot = bubbles_model.canvas_snapshot();
+                snapshot.apply_comic_type_preset(comic_type);
+                bubbles_model.set_canvas_settings(snapshot.clone());
+                snapshot
+            }
+            Err(err) => {
+                runtime_log::log_warn(format!(
+                    "[app] failed to lock BubblesModel while applying comic_type preset; comic_type='{}' saved to the project file, canvas settings unchanged; error={err}",
+                    comic_type.as_config_str()
+                ));
+                eprintln!("WARN app::apply_comic_type_preset: failed to lock BubblesModel");
+                self.comic_type_prompt.resolve();
+                return;
+            }
+        };
         if let Ok(mut overlays_model) = self.clean_overlays_model.lock() {
             overlays_model.set_cache_pages_enabled(snapshot.cache_pages);
         } else {
@@ -749,7 +664,7 @@ impl StudioApp {
             }
             AppRequest::CharactersChanged => {
                 self.tabs.notes.notify_characters_changed();
-                self.tabs.translation.notify_characters_changed();
+                self.tabs.translation.state_mut().notify_characters_changed();
             }
             AppRequest::OpenNotesForCharacter(name) => {
                 self.tabs.notes.notify_characters_changed();
@@ -779,160 +694,35 @@ impl StudioApp {
         }
     }
 
+    /// Runs one triggered command: the session's own ids (image-set save hotkeys) here, every
+    /// other id by the active tab (`StudioTab::execute_hotkey`). `collect_triggered` only yields
+    /// global commands and the active tab's, so a tab id the active tab does not execute is a
+    /// registry / tab mismatch: logged, nothing done.
     fn execute_hotkey_command(&mut self, ctx: &egui::Context, command_id: &str) {
         match command_id {
             // Registered only in an image-set session (`SessionMode::hotkey_specs`).
             image_set::HOTKEY_SAVE_IMAGE | image_set::HOTKEY_SAVE_IMAGE_AS => {
                 self.session.on_save_hotkey(ctx, command_id);
             }
-            HOTKEY_TRANSLATION_ZOOM_IN => {
-                if !self.tabs.translation.blocks_canvas_zoom() {
-                    self.tabs.translation_canvas.zoom_by_shortcut(1.1);
+            _ => {
+                let active_tab = self.active_tab;
+                if !self.tabs.get_mut(active_tab).execute_hotkey(ctx, command_id, &self.project) {
+                    runtime_log::log_warn(format!("[app] hotkey '{command_id}' was triggered on {active_tab:?}, which does not execute it; ignored"));
                 }
             }
-            HOTKEY_TRANSLATION_ZOOM_OUT => {
-                if !self.tabs.translation.blocks_canvas_zoom() {
-                    self.tabs.translation_canvas.zoom_by_shortcut(1.0 / 1.1);
-                }
-            }
-            HOTKEY_TRANSLATION_ZOOM_RESET => {
-                if !self.tabs.translation.blocks_canvas_zoom() {
-                    self.tabs.translation_canvas.reset_zoom_shortcut();
-                }
-            }
-            HOTKEY_TRANSLATION_DELETE_BUBBLE => {
-                if !self.tabs.translation.blocks_canvas_bubble_hotkeys() {
-                    self.tabs.translation_canvas.delete_selected_bubble_shortcut();
-                }
-            }
-            HOTKEY_TRANSLATION_CREATE_BUBBLE => {
-                if !self.tabs.translation.blocks_canvas_bubble_hotkeys()
-                    && let Some(pointer_pos) = ctx.pointer_latest_pos()
-                {
-                    self.tabs.translation.create_bubble_at_pointer_shortcut(
-                        ctx,
-                        &mut self.tabs.translation_canvas,
-                        &self.project,
-                        pointer_pos,
-                    );
-                }
-            }
-            HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE => {
-                if !self.tabs.translation.blocks_canvas_bubble_hotkeys()
-                    && let Some(pointer_pos) = ctx.pointer_latest_pos()
-                {
-                    self.tabs.translation.create_hint_bubble_at_pointer_shortcut(
-                        ctx,
-                        &mut self.tabs.translation_canvas,
-                        pointer_pos,
-                    );
-                }
-            }
-            HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL => {
-                if !self.tabs.translation.blocks_canvas_bubble_hotkeys() {
-                    self.tabs.translation_canvas
-                        .copy_selected_bubble_text_shortcut(ctx, BubbleTextField::Original);
-                }
-            }
-            HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION => {
-                if !self.tabs.translation.blocks_canvas_bubble_hotkeys() {
-                    self.tabs.translation_canvas
-                        .copy_selected_bubble_text_shortcut(ctx, BubbleTextField::Translation);
-                }
-            }
-            HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL => {
-                if !self.tabs.translation.blocks_canvas_bubble_hotkeys() {
-                    self.tabs.translation_canvas
-                        .paste_selected_bubble_text_shortcut(ctx, BubbleTextField::Original);
-                }
-            }
-            HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION => {
-                if !self.tabs.translation.blocks_canvas_bubble_hotkeys() {
-                    self.tabs.translation_canvas
-                        .paste_selected_bubble_text_shortcut(ctx, BubbleTextField::Translation);
-                }
-            }
-            HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL => {
-                self.tabs.translation.toggle_bubbles_panel_hotkey();
-            }
-            HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL => {
-                self.tabs.translation.toggle_ocr_panel_hotkey();
-            }
-            HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL => {
-                self.tabs.translation.toggle_composition_panel_hotkey();
-            }
-            HOTKEY_TRANSLATION_TOGGLE_MT_PANEL => {
-                self.tabs.translation
-                    .toggle_machine_translation_panel_hotkey();
-            }
-            HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL => {
-                self.tabs.translation.toggle_text_detector_panel_hotkey();
-            }
-            HOTKEY_CLEANING_ZOOM_IN => {
-                self.tabs.cleaning.zoom_by_shortcut(1.1);
-            }
-            HOTKEY_CLEANING_ZOOM_OUT => {
-                self.tabs.cleaning.zoom_by_shortcut(1.0 / 1.1);
-            }
-            HOTKEY_CLEANING_ZOOM_RESET => {
-                self.tabs.cleaning.reset_zoom_shortcut();
-            }
-            _ => {}
         }
     }
 
+    /// Source pages the active tab needs resident (`StudioTab::source_page_window`): a canvas
+    /// tab's visible pages plus `neighbor_radius`, the page manager viewer's one page, nothing for
+    /// the others (the PS editor keeps its own residency through `CleanOverlaysModel`).
     fn active_source_page_window(&self, neighbor_radius: usize) -> HashSet<usize> {
-        if let Some(canvas) = self.tabs.canvas(self.active_tab) {
-            return canvas.active_source_page_window(neighbor_radius);
-        }
-        match self.active_tab {
-            // Not reached: `view_sync::canvas_slot` maps these tabs to a canvas, answered above.
-            AppTab::Translation | AppTab::Cleaning | AppTab::Typing => HashSet::new(),
-            // The page manager's viewer draws ONE page from these textures (lent in `draw`); its
-            // window is exactly that page, so the per-frame trim neither drops nor thrashes it.
-            AppTab::PageManager => self.tabs.page_manager.viewer_source_page().into_iter().collect(),
-            // The PS-like editor owns its own page residency through `CleanOverlaysModel`'s page
-            // cache, so it does not participate in the shared source-texture window.
-            AppTab::PsEditor
-            | AppTab::Characters
-            | AppTab::Terms
-            | AppTab::Notes
-            | AppTab::Settings
-            | AppTab::Wiki => HashSet::new(),
-        }
+        self.tabs.get(self.active_tab).source_page_window(neighbor_radius)
     }
 
+    /// Whether the active tab draws source pages with NEAREST sampling (`StudioTab::wants_nearest_source`).
     fn active_canvas_source_pixel_inspection(&self) -> bool {
-        if let Some(canvas) = self.tabs.canvas(self.active_tab) {
-            return canvas.source_pixel_inspection_active();
-        }
-        match self.active_tab {
-            // Not reached: `view_sync::canvas_slot` maps these tabs to a canvas, answered above.
-            AppTab::Translation | AppTab::Cleaning | AppTab::Typing => false,
-            // The viewer zoomed past its NEAREST threshold draws the page's nearest tiles.
-            AppTab::PageManager => self.tabs.page_manager.viewer_wants_nearest_source(),
-            AppTab::PsEditor
-            | AppTab::Characters
-            | AppTab::Terms
-            | AppTab::Notes
-            | AppTab::Settings
-            | AppTab::Wiki => false,
-        }
-    }
-
-    fn evict_tab_gpu_caches(&mut self, request: &CacheEvictionRequest) -> CacheEvictionReport {
-        let mut report = self.tabs.translation_canvas.evict_clean_overlay_gpu_cache(request);
-        let detector_report = self.tabs.translation.evict_text_detector_gpu_cache(request);
-        append_eviction_report(&mut report, detector_report);
-        let cleaning_overlay_report = self.tabs.cleaning.evict_clean_overlay_gpu_cache(request);
-        append_eviction_report(&mut report, cleaning_overlay_report);
-        let cleaning_mask_report = self.tabs.cleaning.evict_cleaning_mask_gpu_cache(request);
-        append_eviction_report(&mut report, cleaning_mask_report);
-        let typing_overlay_report = self.tabs.typing.evict_clean_overlay_gpu_cache(request);
-        append_eviction_report(&mut report, typing_overlay_report);
-        let typing_report = self.tabs.typing.evict_gpu_caches(request);
-        append_eviction_report(&mut report, typing_report);
-        report
+        self.tabs.get(self.active_tab).wants_nearest_source()
     }
 
     /// Per-frame source-texture trim: the active tab's page window and pixel-inspection state
@@ -964,10 +754,10 @@ impl StudioApp {
             pinned_pages,
         };
         // Eviction only runs under non-Normal pressure (Minimal profile / Soft pressure).
-        // `evict_tab_gpu_caches` builds its own per-tab sub-snapshots internally, so no
+        // `Tabs::evict_tab_gpu_caches` builds its own per-tab sub-snapshots internally, so no
         // separate snapshot is computed here.
         if request.pressure != MemoryPressure::Normal {
-            let report = self.evict_tab_gpu_caches(&request);
+            let report = self.tabs.evict_tab_gpu_caches(&request);
             if !report.resources.is_empty() {
                 runtime_log::log_info(format!(
                     "[memory] tab GPU trim freed {} resources, {} bytes",
@@ -993,7 +783,7 @@ impl StudioApp {
         let request = tick.eviction_request(pinned_pages);
 
         let mut report = self.residency.evict_for_pressure(&request, &self.clean_overlays_model);
-        append_eviction_report(&mut report, self.evict_tab_gpu_caches(&request));
+        report.append(self.tabs.evict_tab_gpu_caches(&request));
 
         if report.estimated_freed_bytes > 0 {
             runtime_log::log_info(format!(
@@ -1016,45 +806,6 @@ impl StudioApp {
         self.project.bubbles = model.snapshot_shared();
         self.applied_bubbles_revision = revision;
         self.session.note_unsaved();
-    }
-
-    fn refresh_hotkey_hints_cache(&mut self, ctx: &egui::Context) {
-        let bindings_revision = self.input_manager_v2.bindings_revision();
-        if bindings_revision == self.cached_hotkey_hints.bindings_revision {
-            return;
-        }
-
-        self.cached_hotkey_hints = CachedHotkeyHints {
-            bindings_revision,
-            create_bubble_hint: self
-                .input_manager_v2
-                .shortcut_text(ctx, HOTKEY_TRANSLATION_CREATE_BUBBLE),
-            translation_hints: TranslationHotkeyHints {
-                ocr_quick_selection_mode: self
-                    .input_manager_v2
-                    .shortcut_text(ctx, HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE),
-                ocr_quick_selection_mode_modifier_down: false,
-                ocr_advanced_selection_mode: self
-                    .input_manager_v2
-                    .shortcut_text(ctx, HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE),
-                ocr_advanced_selection_mode_modifier_down: false,
-                bubbles_panel: self
-                    .input_manager_v2
-                    .shortcut_text(ctx, HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL),
-                ocr_panel: self
-                    .input_manager_v2
-                    .shortcut_text(ctx, HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL),
-                composition_panel: self
-                    .input_manager_v2
-                    .shortcut_text(ctx, HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL),
-                machine_translation_panel: self
-                    .input_manager_v2
-                    .shortcut_text(ctx, HOTKEY_TRANSLATION_TOGGLE_MT_PANEL),
-                text_detector_panel: self
-                    .input_manager_v2
-                    .shortcut_text(ctx, HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL),
-            },
-        };
     }
 
     fn draw_tab_bar(&mut self, ui: &mut egui::Ui) {
@@ -1151,6 +902,11 @@ impl eframe::App for StudioApp {
         // one `poll_flatten_to_file` caller the typing tab requires) and its close outcome.
         let (session, mut parts) = self.session_parts();
         session.tick(ctx, now, &mut parts);
+        // A save-to-project merge that succeeded in this tick changed the committed chapter tree;
+        // the tabs caching a view of it reschedule their scans now, before any of them draws.
+        if self.session.take_committed_tree_changed() {
+            self.tabs.for_each_mut(|tab| tab.on_committed_tree_changed());
+        }
 
         {
             // Coarse marker for the per-frame worker polling + GPU upload phase: decoded page
@@ -1158,28 +914,17 @@ impl eframe::App for StudioApp {
             #[cfg(feature = "profiling")]
             puffin::profile_scope!("poll_loaders_and_upload");
             self.residency.poll_decoded(ctx, &self.clean_overlays_model);
-            // Before any gate reads `clean_op_in_flight` (page ops, save-to-project), and whether
-            // or not the page manager is the drawn tab.
-            self.tabs.page_manager.poll_clean_events(ctx, &self.project);
-            // Frees the page viewer's clean tiles and textures while the page manager is not the
-            // drawn tab (they are prepared again when it is drawn next).
-            self.tabs.page_manager.release_hidden_viewer_clean(ctx);
-            self.residency.poll_page_cache(&self.project, self.tabs.translation_canvas.state.cache_pages, &self.clean_overlays_model);
+            // Every tab's own background poll, whatever tab is active, before any gate reads
+            // `clean_op_in_flight` (page ops, save-to-project): the page manager drains its clean
+            // worker and frees the hidden viewer's clean tiles here (`StudioTab::poll_background`).
+            let project = &self.project;
+            self.tabs.for_each_mut(|tab| tab.poll_background(ctx, project));
+            self.residency.poll_page_cache(&self.project, &self.clean_overlays_model);
         }
         self.sync_project_from_bubbles_model();
-        self.refresh_hotkey_hints_cache(ctx);
-        self.tabs.translation_canvas
-            .set_create_bubble_shortcut_hint(self.cached_hotkey_hints.create_bubble_hint.clone());
-        let mut translation_hotkey_hints = self.cached_hotkey_hints.translation_hints.clone();
-        translation_hotkey_hints.ocr_quick_selection_mode_modifier_down = self
-            .input_manager_v2
-            .modifier_only_active(ctx, HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE);
-        translation_hotkey_hints.ocr_advanced_selection_mode_modifier_down = self
-            .input_manager_v2
-            .modifier_only_active(ctx, HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE);
-        self.tabs.translation
-            .set_hotkey_hints(translation_hotkey_hints);
-        self.tabs.apply_typing_panel_layout_request();
+        // The Translation tab's shortcut texts (rebuilt on a bindings change) and its two
+        // modifier-only "held" flags, every frame whatever tab is active.
+        self.tabs.translation.refresh_hotkey_hints(ctx, &self.input_manager_v2);
         if self.residency.background_loads_pending() {
             ctx.request_repaint();
         }
@@ -1212,7 +957,7 @@ impl eframe::App for StudioApp {
         // the draw), so a verdict read after them answers for the tab the frame ENDED on, not for
         // the one that drew.
         let drawn_tab = self.active_tab;
-        let dock_pass = PanelDockPass::begin(drawn_tab);
+        let dock_pass = PanelDockPass::begin(self.tabs.hosts_panel_dock(drawn_tab));
         // The frame context of the drawing tab. The busy snapshot is taken before the tab states
         // are borrowed (`busy.rs`); the rest are reads of the residency and the lent loan.
         let activity = self.persistence_activity();
@@ -1244,7 +989,7 @@ impl eframe::App for StudioApp {
         // flag DURING a gesture — on every frame a panel drag advances — so the flag must be picked
         // up in the same frame it was raised; the writer is what turns that per-frame stream into
         // one debounced write. Before the requests, as it ran before the typing deep link.
-        if tab_hosts_panel_dock(drawn_tab)
+        if dock_pass.dock_ran()
             && let Some(layouts) = self.panel_dock.take_dirty_layouts()
         {
             self.panel_layout_writer.store(layouts);
@@ -1324,12 +1069,19 @@ struct PanelDockPass {
 }
 
 impl PanelDockPass {
-    /// Opens the pass for the tab that is about to draw. Call before `Tabs::draw`.
+    /// Opens the pass for the tab that is about to draw; `drawn_tab_hosts_dock` is that tab's
+    /// answer to "is a dock host" (`Tabs::hosts_panel_dock`). Call before `Tabs::draw`.
     #[must_use]
-    fn begin(drawn_tab: AppTab) -> Self {
+    fn begin(drawn_tab_hosts_dock: bool) -> Self {
         Self {
-            dock_ran: tab_hosts_panel_dock(drawn_tab),
+            dock_ran: drawn_tab_hosts_dock,
         }
+    }
+
+    /// Whether the tab that drew this pass ran the dock (and may have raised its dirty flag).
+    #[must_use]
+    fn dock_ran(self) -> bool {
+        self.dock_ran
     }
 
     /// Whether `PanelDockState::show_idle_sub_windows` must run after the draw, i.e. whether the
@@ -1338,68 +1090,6 @@ impl PanelDockPass {
     fn needs_idle_sub_windows(self) -> bool {
         !self.dock_ran
     }
-}
-
-/// Whether `tab` draws the app-owned panel dock, i.e. whether `PanelDock::end` runs while it is
-/// the active program tab.
-///
-/// The single source of the "is this a dock host" question: it decides whether the dock's detached
-/// sub-windows still need the idle keep-alive pass (`PanelDockState::show_idle_sub_windows`), which
-/// must run on exactly the frames `PanelDock::end` does NOT. Adding a dock host means flipping its
-/// arm here. The `match` is exhaustive with no catch-all so a new `AppTab` variant has to answer it.
-#[must_use]
-fn tab_hosts_panel_dock(tab: AppTab) -> bool {
-    match tab {
-        // The three canvas tabs: each declares the canvas' own «Лента» tab and further tabs
-        // of its own — one for «Перевод», four for «Клининг», eight for «Текст». «PS редактор»
-        // is the first NON-canvas host: it declares five tabs of its own and no «Лента».
-        AppTab::Translation | AppTab::Cleaning | AppTab::Typing | AppTab::PsEditor => true,
-        AppTab::PageManager
-        | AppTab::Characters
-        | AppTab::Terms
-        | AppTab::Notes
-        | AppTab::Settings
-        | AppTab::Wiki => false,
-    }
-}
-
-/// The default-layout builder of every program tab that hosts the panel dock, keyed by
-/// `AppTab::key()`.
-///
-/// The dock migration's extension point: ONE entry per dock host, and the set of keys must match
-/// [`tab_hosts_panel_dock`] exactly. A builder must name every `TabId` its tab can declare —
-/// `persist` uses the default's tab set as the dictionary of known tabs, and a tab missing from it
-/// would be dropped from the user's arrangement on every load.
-///
-/// Each entry must be the SAME `fn` item the owning tab hands to
-/// `PanelDockState::ensure_default_layout` on every frame it draws: the state keeps that pointer to
-/// rebuild the arrangement for the header's «сбросить раскладку» item, so two different builders for
-/// one key would reset to something the user never saw. Pinned by
-/// `tests::the_dock_hosts_register_the_builders_their_tabs_declare`.
-///
-/// Every canvas program tab needs a builder of its own — «Перевод» adds «Последние персонажи» on top
-/// of the canvas' «Лента», «Клининг» adds four tabs and «Текст» eight — so there is no shared
-/// ribbon-only builder any of them could fall back to.
-#[must_use]
-fn panel_dock_default_layout_builders() -> [panel_dock_persist::LayoutDefault<'static>; 4] {
-    [
-        (
-            AppTab::Translation.key(),
-            translation_default_dock_layout as fn() -> DockLayout,
-        ),
-        (
-            AppTab::Cleaning.key(),
-            cleaning_default_dock_layout as fn() -> DockLayout,
-        ),
-        (
-            AppTab::Typing.key(),
-            typing_default_dock_layout as fn() -> DockLayout,
-        ),
-        (
-            AppTab::PsEditor.key(),
-            ps_editor_default_dock_layout as fn() -> DockLayout,
-        ),
-    ]
 }
 
 /// Builds this studio window's panel-dock state and restores the persisted arrangement — and the
@@ -1411,14 +1101,12 @@ fn panel_dock_default_layout_builders() -> [panel_dock_persist::LayoutDefault<'s
 /// is logged by `panel_dock::persist`). Tabs the stored layout does not mention are re-created by
 /// the dock on the frame that declares them.
 ///
-/// The defaults come from [`panel_dock_default_layout_builders`], which is where a newly migrated
-/// program tab is registered.
+/// `defaults` are the dock hosts' default-layout builders keyed by `AppTab::key()`
+/// (`Tabs::dock_layout_defaults`, from each tab's `StudioTab::default_dock_layout`): a tab starts
+/// hosting the dock by answering that hook, nowhere else.
 #[must_use]
-fn restore_panel_dock(user_settings: &Value) -> PanelDockState {
-    let restored = panel_dock_persist::layouts_from_user_settings(
-        user_settings,
-        &panel_dock_default_layout_builders(),
-    );
+fn restore_panel_dock(user_settings: &Value, defaults: &[panel_dock_persist::LayoutDefault<'static>]) -> PanelDockState {
+    let restored = panel_dock_persist::layouts_from_user_settings(user_settings, defaults);
     let mut state = PanelDockState::new();
     // Layouts first: the sub-window install drops a window no restored layout puts a panel in, so
     // it has to see them.
@@ -1430,259 +1118,13 @@ fn restore_panel_dock(user_settings: &Value) -> PanelDockState {
     state
 }
 
-/// Reads a per-tab canvas bottom-hint collapsed flag from the merged startup `user_settings`.
-///
-/// Looks up `Canvas.<key>` and returns its boolean value; a missing section, key, or non-boolean
-/// value yields `false` (expanded), matching the persistence default.
-#[must_use]
-fn hint_collapsed_from_user_settings(user_settings: &Value, key: &str) -> bool {
-    user_settings
-        .get(CANVAS_CONFIG_SECTION)
-        .and_then(Value::as_object)
-        .and_then(|canvas| canvas.get(key))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-/// Reads a `TextTab.<key>` boolean flag from the merged startup `user_settings`.
-///
-/// A missing section, missing key, or non-boolean value yields `default`, which differs per flag:
-/// the centering-assist toggle seeds `false` (off) and the show-center marker seeds `true` (shown).
-#[must_use]
-fn text_tab_bool_from_user_settings(user_settings: &Value, key: &str, default: bool) -> bool {
-    user_settings
-        .get(TEXT_TAB_CONFIG_SECTION)
-        .and_then(Value::as_object)
-        .and_then(|text_tab| text_tab.get(key))
-        .and_then(Value::as_bool)
-        .unwrap_or(default)
-}
-
-/// Inserts the per-tab canvas bottom-hint collapsed flags (Translation, Typing) into a
-/// `user_config.json` root value, creating the `Canvas` object if absent and preserving all other
-/// keys. Cleaning has no bottom-hint, so no cleaning flag is written; any stale
-/// `cleaning_hint_collapsed` key is left untouched.
-///
-/// Pure and side-effect-free (the caller runs it inside `update_user_config_file`), so
-/// the read-modify-merge contract is unit-testable without touching the filesystem. A non-object
-/// `root` is replaced with a fresh object so the flags are never silently dropped.
-fn apply_hint_collapsed_to_config_root(root: &mut Value, translation: bool, typing: bool) {
-    if !root.is_object() {
-        *root = Value::Object(Map::new());
-    }
-    let Some(root_obj) = root.as_object_mut() else {
-        return;
-    };
-    let mut canvas_obj = root_obj
-        .get(CANVAS_CONFIG_SECTION)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    canvas_obj.insert(
-        CANVAS_TRANSLATION_HINT_COLLAPSED_KEY.to_string(),
-        Value::Bool(translation),
-    );
-    canvas_obj.insert(
-        CANVAS_TYPING_HINT_COLLAPSED_KEY.to_string(),
-        Value::Bool(typing),
-    );
-    root_obj.insert(
-        CANVAS_CONFIG_SECTION.to_string(),
-        Value::Object(canvas_obj),
-    );
-}
-
-/// Persists the per-tab canvas bottom-hint collapsed flags (Translation, Typing) to
-/// `user_config.json`.
-///
-/// Called once from [`StudioApp::shutdown_blocking`]. Routes through [`crate::config::update_user_config_file`],
-/// the canonical serialized read-modify-write (atomic replace), so unrelated keys survive. A malformed
-/// existing document is NOT overwritten: the error is logged and the file is left as is.
-/// Teardown-only: on any read/parse/write failure it logs and returns without panicking, so a failed
-/// write never blocks shutdown.
-fn persist_canvas_hint_collapsed_state(translation: bool, typing: bool) {
-    let path = crate::config::user_config_path();
-    if let Err(err) = crate::config::update_user_config_file(&path, |root| {
-        apply_hint_collapsed_to_config_root(root, translation, typing);
-        Ok(())
-    }) {
-        runtime_log::log_error(format!(
-            "[app::canvas_hint] failed to persist canvas hint collapsed state; file left unchanged; path={}; cause={err:#}",
-            path.display()
-        ));
-    }
-}
-
-/// Inserts the two typing centering-assist flags (`centering_assist_enabled`, `centering_show_center`)
-/// into a `user_config.json` root value, get-or-creating the `TextTab` object and preserving all other
-/// keys. A non-object `root` or a non-object `TextTab` value is replaced with a fresh object so the
-/// flags are never silently dropped. The bound-center KIND is session-only and is not written.
-///
-/// Pure and side-effect-free (the caller runs it inside `update_user_config_file`), so
-/// the read-modify-merge contract is unit-testable without touching the filesystem.
-fn apply_centering_assist_to_config_root(root: &mut Value, enabled: bool, show_center: bool) {
-    if !root.is_object() {
-        *root = Value::Object(Map::new());
-    }
-    let Some(root_obj) = root.as_object_mut() else {
-        return;
-    };
-    // Get-or-create the TextTab object; a non-object sibling value is replaced (not merged).
-    let mut text_tab_obj = root_obj
-        .get(TEXT_TAB_CONFIG_SECTION)
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    text_tab_obj.insert(
-        TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY.to_string(),
-        Value::Bool(enabled),
-    );
-    text_tab_obj.insert(
-        TEXT_TAB_CENTERING_SHOW_CENTER_KEY.to_string(),
-        Value::Bool(show_center),
-    );
-    root_obj.insert(
-        TEXT_TAB_CONFIG_SECTION.to_string(),
-        Value::Object(text_tab_obj),
-    );
-}
-
-/// Persists the two typing centering-assist flags to `user_config.json`.
-///
-/// Called once from [`StudioApp::shutdown_blocking`]. Routes through [`crate::config::update_user_config_file`],
-/// the canonical locked read-modify-write primitive, so unrelated keys survive and the write is
-/// serialized with every other config writer. Teardown-only: on any read/parse/write failure it logs a
-/// warning and returns without panicking, so a failed write never blocks shutdown.
-fn persist_typing_centering_assist_state(enabled: bool, show_center: bool) {
-    let path = crate::config::user_config_path();
-    if let Err(err) = crate::config::update_user_config_file(&path, |root| {
-        apply_centering_assist_to_config_root(root, enabled, show_center);
-        Ok(())
-    }) {
-        runtime_log::log_warn(format!(
-            "[app::centering_assist] failed to persist centering-assist state; path={}; cause={err:#}",
-            path.display()
-        ));
-    }
-}
-
-/// Builds the hotkey registry: every code-declared spec, then the session's own `session_specs`
-/// (`SessionMode::hotkey_specs`: the image set's save hotkeys), then the pre-read user
-/// `overrides` (`StudioBootstrap::hotkey_overrides`). No I/O.
-fn build_input_manager_v2(session_specs: Vec<HotkeySpecV2>, overrides: &HotkeyOverrides) -> InputManagerV2 {
+/// Builds the hotkey registry: the tabs' code-declared `tab_specs` (`Tabs::hotkey_specs`, in
+/// `AppTab::ALL` order), then the session's own `session_specs` (`SessionMode::hotkey_specs`: the
+/// image set's save hotkeys), then the pre-read user `overrides` (`StudioBootstrap::hotkey_overrides`).
+/// No I/O.
+fn build_input_manager_v2(tab_specs: Vec<HotkeySpecV2>, session_specs: Vec<HotkeySpecV2>, overrides: &HotkeyOverrides) -> InputManagerV2 {
     let mut manager = InputManagerV2::default();
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_TRANSLATION_ZOOM_IN,
-        title: t!("app.hotkey.zoom_in"),
-        section: "Canvas",
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::COMMAND,
-            egui::Key::Equals,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Translation),
-        active_when_input: false,
-    });
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_TRANSLATION_ZOOM_OUT,
-        title: t!("app.hotkey.zoom_out"),
-        section: "Canvas",
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::COMMAND,
-            egui::Key::Minus,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Translation),
-        active_when_input: false,
-    });
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_TRANSLATION_ZOOM_RESET,
-        title: t!("app.hotkey.zoom_reset"),
-        section: "Canvas",
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::COMMAND,
-            egui::Key::Num0,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Translation),
-        active_when_input: false,
-    });
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_TRANSLATION_DELETE_BUBBLE,
-        title: t!("app.hotkey.delete_bubble"),
-        section: t!("app.hotkey.bubbles_category"),
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::NONE,
-            egui::Key::Delete,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Translation),
-        active_when_input: false,
-    });
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_TRANSLATION_CREATE_BUBBLE,
-        title: t!("app.hotkey.create_bubble"),
-        section: t!("app.hotkey.bubbles_category"),
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::NONE,
-            egui::Key::T,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Translation),
-        active_when_input: false,
-    });
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE,
-        title: t!("app.hotkey.create_hint_bubble"),
-        section: t!("app.hotkey.bubbles_category"),
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::NONE,
-            egui::Key::H,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Translation),
-        active_when_input: false,
-    });
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_CLEANING_ZOOM_IN,
-        title: t!("app.hotkey.zoom_in"),
-        section: "Canvas",
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::COMMAND,
-            egui::Key::Equals,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Cleaning),
-        active_when_input: false,
-    });
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_CLEANING_ZOOM_OUT,
-        title: t!("app.hotkey.zoom_out"),
-        section: "Canvas",
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::COMMAND,
-            egui::Key::Minus,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Cleaning),
-        active_when_input: false,
-    });
-    manager.register(HotkeySpecV2 {
-        id: HOTKEY_CLEANING_ZOOM_RESET,
-        title: t!("app.hotkey.zoom_reset"),
-        section: "Canvas",
-        default_shortcut: Some(egui::KeyboardShortcut::new(
-            egui::Modifiers::COMMAND,
-            egui::Key::Num0,
-        )),
-        default_modifier_only: None,
-        scope: HotkeyScopeV2::Tab(AppTab::Cleaning),
-        active_when_input: false,
-    });
-    for spec in TranslationTabState::hotkey_specs() {
-        manager.register(spec);
-    }
-    for spec in session_specs {
+    for spec in tab_specs.into_iter().chain(session_specs) {
         manager.register(spec);
     }
     manager.apply_overrides(overrides);
@@ -1709,163 +1151,16 @@ fn spawn_text_render_font_pool_prewarm() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CANVAS_CONFIG_SECTION, CANVAS_TRANSLATION_HINT_COLLAPSED_KEY,
-        CANVAS_TYPING_HINT_COLLAPSED_KEY,
-        TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY, TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
-        TEXT_TAB_CONFIG_SECTION,
-        apply_centering_assist_to_config_root, apply_hint_collapsed_to_config_root,
-        hint_collapsed_from_user_settings,
-        panel_dock_default_layout_builders,
-        DockLayout, PanelDockPass,
-        cleaning_default_dock_layout, tab_hosts_panel_dock, text_tab_bool_from_user_settings,
-        ps_editor_default_dock_layout, translation_default_dock_layout, typing_default_dock_layout,
-    };
-    use crate::canvas::CANVAS_RIBBON_TAB;
+    use super::{PanelDockPass, build_input_manager_v2};
+    use crate::input_manager_v2::{HotkeyOverrides, HotkeyScopeV2, HotkeySpecV2, ModifierOnlyV2};
+    use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
     use crate::tabs::AppTab;
-    use crate::widgets::panel_dock::TabId;
-    use serde_json::{Value, json};
-
-    /// The dock hosts are the tabs `PanelDock::end` runs for, and the idle sub-window keep-alive
-    /// must run on exactly the complementary frames. The hosts are the three CANVAS tabs — each
-    /// declares the canvas' own «Лента» tab — plus «PS редактор», which declares five tabs of its
-    /// own over a full-area editing surface and no «Лента». A tab that starts hosting the dock has
-    /// to be added here together with its default-layout entry in `restore_panel_dock`, while one
-    /// that is added by accident shows up as a double-shown viewport.
-    #[test]
-    fn exactly_the_registered_tabs_host_the_panel_dock() {
-        let hosts: Vec<AppTab> = AppTab::ALL
-            .into_iter()
-            .filter(|tab| tab_hosts_panel_dock(*tab))
-            .collect();
-        assert_eq!(
-            hosts,
-            vec![
-                AppTab::Translation,
-                AppTab::Cleaning,
-                AppTab::Typing,
-                AppTab::PsEditor
-            ]
-        );
-    }
-
-    /// A dock host with no entry in `panel_dock_default_layout_builders` loads with NO stored
-    /// arrangement at all (`persist` only decodes the keys it is given), and an entry for a tab
-    /// that does not host the dock is a builder nothing ever runs. The two lists are therefore one
-    /// list, and this is the only place that says so.
-    #[test]
-    fn every_dock_host_has_exactly_one_default_layout_builder() {
-        let mut registered: Vec<&str> = panel_dock_default_layout_builders()
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-        let before_dedup = registered.len();
-        registered.sort_unstable();
-        registered.dedup();
-        assert_eq!(
-            registered.len(),
-            before_dedup,
-            "a program-tab key is registered twice: {registered:?}"
-        );
-
-        let mut hosts: Vec<&str> = AppTab::ALL
-            .into_iter()
-            .filter(|tab| tab_hosts_panel_dock(*tab))
-            .map(AppTab::key)
-            .collect();
-        hosts.sort_unstable();
-        assert_eq!(
-            registered, hosts,
-            "the registered default layouts and the dock hosts must be the same set"
-        );
-    }
-
-    /// The contract the doc comments state as load-bearing: the builder registered here is the
-    /// SAME `fn` item the owning tab hands to `ensure_default_layout` every frame, because the dock
-    /// state keeps that pointer to serve the header's «сбросить раскладку» item.
-    ///
-    /// Checked twice on purpose. `fn_addr_eq` pins the identity itself, which is what the contract
-    /// is about; the `TabId` set is the semantic backstop, since function-pointer equality is
-    /// explicitly not guaranteed to survive codegen-unit merging and a builder swapped for one with
-    /// a different tab dictionary is the failure that actually costs the user their arrangement.
-    #[test]
-    fn the_dock_hosts_register_the_builders_their_tabs_declare() {
-        /// One row of the expectation table: the host tab, the builder it must be
-        /// registered with, and the `TabId`s that builder's layout has to name.
-        type ExpectedBuilder = (AppTab, fn() -> DockLayout, &'static [TabId]);
-
-        // `const` items, not inline slice literals: rvalue static promotion does not
-        // cover a `const fn` call, so an inline `&[TabId::new(..)]` would be a
-        // temporary the `'static` row type cannot borrow.
-        const TRANSLATION_TABS: &[TabId] = &[
-            CANVAS_RIBBON_TAB,
-            TabId::new("translation.recent_characters"),
-        ];
-        const CLEANING_TABS: &[TabId] = &[
-            CANVAS_RIBBON_TAB,
-            TabId::new("cleaning.clean"),
-            TabId::new("cleaning.tools"),
-            TabId::new("cleaning.active_tool"),
-            TabId::new("cleaning.quick_clean"),
-            TabId::new("cleaning.area_editor"),
-        ];
-        const TYPING_TABS: &[TabId] = &[
-            CANVAS_RIBBON_TAB,
-            TabId::new("typing.preview"),
-            TabId::new("typing.params"),
-            TabId::new("typing.effects"),
-            TabId::new("typing.actions"),
-            TabId::new("typing.layers"),
-            TabId::new("typing.mask"),
-            TabId::new("typing.deform"),
-            TabId::new("typing.layout_editor"),
-        ];
-
-        const PS_EDITOR_TABS: &[TabId] = &[
-            TabId::new("ps_editor.main"),
-            TabId::new("ps_editor.tools"),
-            TabId::new("ps_editor.active_tool"),
-            TabId::new("ps_editor.hotkeys"),
-            TabId::new("ps_editor.layers"),
-            TabId::new("ps_editor.correction"),
-        ];
-
-        let expected: [ExpectedBuilder; 4] = [
-            (
-                AppTab::Translation,
-                translation_default_dock_layout,
-                TRANSLATION_TABS,
-            ),
-            (AppTab::Cleaning, cleaning_default_dock_layout, CLEANING_TABS),
-            (AppTab::Typing, typing_default_dock_layout, TYPING_TABS),
-            (
-                AppTab::PsEditor,
-                ps_editor_default_dock_layout,
-                PS_EDITOR_TABS,
-            ),
-        ];
-        let registered = panel_dock_default_layout_builders();
-        for (tab, builder, tabs) in expected {
-            let (_, found) = registered
-                .into_iter()
-                .find(|(key, _)| *key == tab.key())
-                .unwrap_or_else(|| panic!("{} has no default-layout builder", tab.key()));
-            assert!(
-                std::ptr::fn_addr_eq(found, builder),
-                "{} is registered with a builder other than the one its tab declares",
-                tab.key()
-            );
-            let layout = found();
-            for id in tabs {
-                assert!(
-                    layout.panel_of_tab(*id).is_some(),
-                    "{}'s default layout does not name {id}, so a stored {id} would be dropped on \
-                     every load",
-                    tab.key()
-                );
-            }
-        }
-    }
+    use crate::tabs::cleaning::CleaningTabState;
+    use crate::tabs::translation::{TranslationTab, TranslationTabState};
+    use eframe::egui;
+    use ms_studio_tab::StudioTab;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     /// The idle sub-window pass must answer for the tab that DREW, and the two requests that
     /// reassign `active_tab` right after the draw are exactly what makes the two answers differ:
@@ -1875,205 +1170,87 @@ mod tests {
     /// top of `PanelDock::end` (one viewport shown twice in one pass).
     #[test]
     fn the_idle_sub_window_pass_answers_for_the_tab_that_drew() {
-        // Not a dock host -> the keep-alive is required, whatever the pass ends on.
-        let pass = PanelDockPass::begin(AppTab::PageManager);
-        assert!(tab_hosts_panel_dock(AppTab::Typing), "the fixture needs a host tab");
+        // Not a dock host (the page manager) -> the keep-alive is required, whatever the pass
+        // ends on, and no dirty layout is polled.
+        let pass = PanelDockPass::begin(false);
         assert!(
             pass.needs_idle_sub_windows(),
             "the page-manager pass drew no dock, so the windows still need showing"
         );
+        assert!(!pass.dock_ran());
 
-        // A dock host -> `PanelDock::end` already showed the viewports; showing them again
-        // in the same pass renders each of them twice.
-        let pass = PanelDockPass::begin(AppTab::Typing);
-        assert!(
-            !tab_hosts_panel_dock(AppTab::Settings),
-            "the fixture needs a non-host tab"
-        );
+        // A dock host (typing) -> `PanelDock::end` already showed the viewports; showing them
+        // again in the same pass renders each of them twice.
+        let pass = PanelDockPass::begin(true);
         assert!(!pass.needs_idle_sub_windows());
+        assert!(pass.dock_ran());
     }
 
+    /// One registry row as the golden pins it: id, scope, default shortcut as (modifiers, key),
+    /// default modifier-only binding, `active_when_input`. Titles and sections are localized and
+    /// deliberately left out.
+    type HotkeyRow = (&'static str, HotkeyScopeV2, Option<(egui::Modifiers, egui::Key)>, Option<ModifierOnlyV2>, bool);
+
+    /// [`HotkeyRow`] with an owned id, the shape `InputManagerV2::commands` yields.
+    type OwnedHotkeyRow = (String, HotkeyScopeV2, Option<(egui::Modifiers, egui::Key)>, Option<ModifierOnlyV2>, bool);
+
+    /// Pins today's code-declared hotkey registry (no session specs, no user overrides) ahead of
+    /// the tab-seam refactor that moves the Translation and Cleaning specs out of the root and
+    /// into their tab crates. The expectations were generated from the pre-refactor
+    /// `build_input_manager_v2` and must not be edited by that refactor: ids are persistence
+    /// keys in `user_config` -> `Hotkeys`, and registration order is observable within a scope
+    /// (`collect_triggered`). A refactor may change only HOW the registry is assembled.
     #[test]
-    fn apply_hint_collapsed_writes_two_flags_and_preserves_other_keys() {
-        // A pre-existing config with an unrelated Canvas key, a stale cleaning-hint key, and an
-        // unrelated section must all survive; only Translation + Typing flags are (re)written.
-        let mut root = json!({
-            "Canvas": { "cache_pages": true, "cleaning_hint_collapsed": true },
-            "General": { "memory_profile": "Medium" }
-        });
-        apply_hint_collapsed_to_config_root(&mut root, true, true);
-
-        let canvas = root
-            .get(CANVAS_CONFIG_SECTION)
-            .and_then(Value::as_object)
-            .expect("Canvas section present");
-        assert_eq!(
-            canvas.get(CANVAS_TRANSLATION_HINT_COLLAPSED_KEY),
-            Some(&Value::Bool(true))
-        );
-        assert_eq!(
-            canvas.get(CANVAS_TYPING_HINT_COLLAPSED_KEY),
-            Some(&Value::Bool(true))
-        );
-        // Cleaning has no bottom-hint: no cleaning flag is written by us, but a stale one is left
-        // untouched (no migration).
-        assert_eq!(
-            canvas.get("cleaning_hint_collapsed"),
-            Some(&Value::Bool(true))
-        );
-        // Unrelated Canvas key and unrelated section untouched.
-        assert_eq!(canvas.get("cache_pages"), Some(&Value::Bool(true)));
-        assert_eq!(
-            root.get("General")
-                .and_then(Value::as_object)
-                .and_then(|g| g.get("memory_profile")),
-            Some(&Value::String("Medium".to_string()))
-        );
-    }
-
-    #[test]
-    fn apply_hint_collapsed_replaces_non_object_root_and_creates_canvas() {
-        // A corrupt (non-object) root is replaced with a fresh object; flags are never dropped.
-        let mut root = Value::String("not an object".to_string());
-        apply_hint_collapsed_to_config_root(&mut root, false, true);
-        let canvas = root
-            .get(CANVAS_CONFIG_SECTION)
-            .and_then(Value::as_object)
-            .expect("Canvas section created");
-        assert_eq!(
-            canvas.get(CANVAS_TRANSLATION_HINT_COLLAPSED_KEY),
-            Some(&Value::Bool(false))
-        );
-        assert_eq!(
-            canvas.get(CANVAS_TYPING_HINT_COLLAPSED_KEY),
-            Some(&Value::Bool(true))
-        );
-    }
-
-    #[test]
-    fn hint_collapsed_defaults_to_false_when_absent_or_malformed() {
-        // Missing section, missing key, and non-boolean value all yield the expanded default.
-        assert!(!hint_collapsed_from_user_settings(
-            &json!({}),
-            CANVAS_TRANSLATION_HINT_COLLAPSED_KEY
-        ));
-        assert!(!hint_collapsed_from_user_settings(
-            &json!({ "Canvas": {} }),
-            CANVAS_TRANSLATION_HINT_COLLAPSED_KEY
-        ));
-        assert!(!hint_collapsed_from_user_settings(
-            &json!({ "Canvas": { "translation_hint_collapsed": "yes" } }),
-            CANVAS_TRANSLATION_HINT_COLLAPSED_KEY
-        ));
-        // A present true value round-trips.
-        assert!(hint_collapsed_from_user_settings(
-            &json!({ "Canvas": { "typing_hint_collapsed": true } }),
-            CANVAS_TYPING_HINT_COLLAPSED_KEY
-        ));
-    }
-
-    #[test]
-    fn apply_centering_assist_writes_both_flags_and_preserves_siblings_and_sections() {
-        // A pre-existing config with an unrelated TextTab sibling key and an unrelated section must all
-        // survive; only the two centering-assist flags are (re)written.
-        let mut root = json!({
-            "TextTab": { "text_language": "en", "hanging_punctuation": true },
-            "General": { "memory_profile": "Medium" }
-        });
-        apply_centering_assist_to_config_root(&mut root, true, false);
-
-        let text_tab = root
-            .get(TEXT_TAB_CONFIG_SECTION)
-            .and_then(Value::as_object)
-            .expect("TextTab section present");
-        assert_eq!(
-            text_tab.get(TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY),
-            Some(&Value::Bool(true))
-        );
-        assert_eq!(
-            text_tab.get(TEXT_TAB_CENTERING_SHOW_CENTER_KEY),
-            Some(&Value::Bool(false))
-        );
-        // Unrelated TextTab keys and the unrelated section are untouched.
-        assert_eq!(
-            text_tab.get("text_language"),
-            Some(&Value::String("en".to_string()))
-        );
-        assert_eq!(
-            text_tab.get("hanging_punctuation"),
-            Some(&Value::Bool(true))
-        );
-        assert_eq!(
-            root.get("General")
-                .and_then(Value::as_object)
-                .and_then(|g| g.get("memory_profile")),
-            Some(&Value::String("Medium".to_string()))
-        );
-    }
-
-    #[test]
-    fn apply_centering_assist_recovers_from_non_object_root_and_texttab() {
-        // A corrupt (non-object) root is replaced with a fresh object; flags are never dropped.
-        let mut root = Value::String("not an object".to_string());
-        apply_centering_assist_to_config_root(&mut root, false, true);
-        let text_tab = root
-            .get(TEXT_TAB_CONFIG_SECTION)
-            .and_then(Value::as_object)
-            .expect("TextTab section created");
-        assert_eq!(
-            text_tab.get(TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY),
-            Some(&Value::Bool(false))
-        );
-        assert_eq!(
-            text_tab.get(TEXT_TAB_CENTERING_SHOW_CENTER_KEY),
-            Some(&Value::Bool(true))
-        );
-
-        // A non-object TextTab value is replaced (not merged) so the flags still land.
-        let mut root = json!({ "TextTab": "corrupt" });
-        apply_centering_assist_to_config_root(&mut root, true, true);
-        let text_tab = root
-            .get(TEXT_TAB_CONFIG_SECTION)
-            .and_then(Value::as_object)
-            .expect("TextTab section replaced with object");
-        assert_eq!(
-            text_tab.get(TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY),
-            Some(&Value::Bool(true))
-        );
-        assert_eq!(
-            text_tab.get(TEXT_TAB_CENTERING_SHOW_CENTER_KEY),
-            Some(&Value::Bool(true))
-        );
-    }
-
-    #[test]
-    fn text_tab_bool_uses_asymmetric_defaults_when_absent_or_malformed() {
-        // Absent section, absent key, and non-boolean values all yield the per-flag default.
-        assert!(!text_tab_bool_from_user_settings(
-            &json!({}),
-            TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY,
-            false
-        ));
-        assert!(text_tab_bool_from_user_settings(
-            &json!({ "TextTab": {} }),
-            TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
-            true
-        ));
-        assert!(text_tab_bool_from_user_settings(
-            &json!({ "TextTab": { "centering_show_center": "yes" } }),
-            TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
-            true
-        ));
-        // Present values override the default in both directions.
-        assert!(text_tab_bool_from_user_settings(
-            &json!({ "TextTab": { "centering_assist_enabled": true } }),
-            TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY,
-            false
-        ));
-        assert!(!text_tab_bool_from_user_settings(
-            &json!({ "TextTab": { "centering_show_center": false } }),
-            TEXT_TAB_CENTERING_SHOW_CENTER_KEY,
-            true
-        ));
+    fn hotkey_registry_golden() {
+        use egui::Key;
+        use egui::Modifiers as M;
+        use HotkeyScopeV2::Tab;
+        const TR: HotkeyScopeV2 = Tab(AppTab::Translation);
+        const CL: HotkeyScopeV2 = Tab(AppTab::Cleaning);
+        let expected: Vec<HotkeyRow> = vec![
+            ("translation.canvas.zoom_in", TR, Some((M::COMMAND, Key::Equals)), None, false),
+            ("translation.canvas.zoom_out", TR, Some((M::COMMAND, Key::Minus)), None, false),
+            ("translation.canvas.zoom_reset", TR, Some((M::COMMAND, Key::Num0)), None, false),
+            ("translation.bubble.delete_selected", TR, Some((M::NONE, Key::Delete)), None, false),
+            ("translation.bubble.create_at_cursor", TR, Some((M::NONE, Key::T)), None, false),
+            ("translation.bubble.create_hint_at_cursor", TR, Some((M::NONE, Key::H)), None, false),
+            ("cleaning.canvas.zoom_in", CL, Some((M::COMMAND, Key::Equals)), None, false),
+            ("cleaning.canvas.zoom_out", CL, Some((M::COMMAND, Key::Minus)), None, false),
+            ("cleaning.canvas.zoom_reset", CL, Some((M::COMMAND, Key::Num0)), None, false),
+            ("translation.ocr.quick.selection_mode", TR, None, Some(ModifierOnlyV2::Shift), false),
+            ("translation.ocr.advanced.selection_mode", TR, None, Some(ModifierOnlyV2::Alt), false),
+            ("translation.panel.bubbles.toggle", TR, Some((M::NONE, Key::P)), None, false),
+            ("translation.panel.ocr.toggle", TR, Some((M::NONE, Key::S)), None, false),
+            ("translation.panel.composition.toggle", TR, Some((M::NONE, Key::K)), None, false),
+            ("translation.panel.machine_translation.toggle", TR, Some((M::NONE, Key::M)), None, false),
+            ("translation.panel.detector.toggle", TR, Some((M::NONE, Key::D)), None, false),
+            ("translation.bubble.copy_original", TR, None, None, false),
+            ("translation.bubble.copy_translation", TR, None, None, false),
+            ("translation.bubble.paste_original", TR, None, None, false),
+            ("translation.bubble.paste_translation", TR, None, None, false),
+        ];
+        // The only two tabs that declare hotkeys, in `AppTab::ALL` order as `Tabs::hotkey_specs`
+        // visits them (the other eight answer `StudioTab::hotkey_specs` with the empty default).
+        // The bubbles model's documents live under a unique temp path that is never created: the
+        // model writes nothing unless it is edited.
+        let model_dir = std::env::temp_dir().join(format!("ms_hotkey_golden_{}", std::process::id()));
+        let model = BubblesModel::new_with_staging_probe(Vec::new(), model_dir.join("bubbles.json"), model_dir.join("unsaved_bubbles.json"), SharedCanvasSettings::default(), None, false);
+        let translation = TranslationTab::new(TranslationTabState::default(), Arc::new(Mutex::new(model)), &json!({}));
+        let cleaning = CleaningTabState::default();
+        let tab_specs: Vec<HotkeySpecV2> = [&translation as &dyn StudioTab, &cleaning].into_iter().flat_map(StudioTab::hotkey_specs).collect();
+        let manager = build_input_manager_v2(tab_specs, Vec::new(), &HotkeyOverrides::default());
+        let actual: Vec<OwnedHotkeyRow> = manager
+            .commands()
+            .iter()
+            .map(|command| (command.id.clone(), command.scope, command.default_shortcut.map(|shortcut| (shortcut.modifiers, shortcut.logical_key)), command.default_modifier_only, command.active_when_input))
+            .collect();
+        let expected: Vec<OwnedHotkeyRow> = expected.into_iter().map(|(id, scope, shortcut, modifier_only, active_when_input)| (id.to_owned(), scope, shortcut, modifier_only, active_when_input)).collect();
+        // Order is compared per scope only: across scopes it is unobservable, so a refactor may
+        // interleave the Translation and Cleaning registrations differently.
+        let in_scope = |rows: &[OwnedHotkeyRow], scope: HotkeyScopeV2| -> Vec<OwnedHotkeyRow> { rows.iter().filter(|row| row.1 == scope).cloned().collect() };
+        for scope in [TR, CL] {
+            assert_eq!(in_scope(&actual, scope), in_scope(&expected, scope), "hotkey registry drifted in scope {scope:?}");
+        }
+        assert_eq!(actual.len(), expected.len(), "hotkey registry has commands outside the pinned scopes: {actual:?}");
     }
 }

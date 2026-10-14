@@ -15,6 +15,8 @@ StudioApp.session: SessionMode
 StudioApp::session_parts() -> (&mut SessionMode, SessionParts)
   SessionParts = project + StagingWriters + CloseFlow + typing / PS editor / translation canvas /
                  cleaning / page manager tab states, borrowed for one call;
+                 a successful merge only LATCHES "committed tree changed"
+                 (take_committed_tree_changed): the root tells the tabs, the flow never does;
                  flush_canvas_bubble_edits() = the all-canvas bubble flush of every persistence point
 ```
 Where the two layers of the session come from (`ARCHITECTURE.md` §4): the open worker decides the kind once; the shell keeps its half (`StudioSession`: scratch
@@ -32,11 +34,14 @@ Dispatch methods on `SessionMode` and their `StudioApp` call sites:
   (first step of `shutdown_blocking`);
 - project-state queries that answer "nothing" for an image set: `busy_jobs` (`studio/busy.rs`),
   `exit_cleanup_action` (`studio/incoming_open.rs`), `take_reload_request` (`take_outputs`),
-  `note_unsaved` (bubbles revision); `os_close_policy` (`request_os_close`); `take_title`
+  `take_committed_tree_changed` (`ui`, right after `tick`: a merge succeeded, so every tab gets
+  `StudioTab::on_committed_tree_changed` before any tab draws), `note_unsaved` (bubbles revision); `os_close_policy` (`request_os_close`); `take_title`
   (`take_outputs`; `None` for a project).
 
 ## Files and submodules
-- `mod.rs`: `SessionMode`, `SessionParts`, the dispatch methods, and the image-set close helpers
+- `mod.rs`: `SessionMode`, `SessionParts`, `DeferredTabEdits` (the one owner of "the tabs hold
+  edits not yet handed to a staging writer", read by both kinds' dirty checks; a new tab-held
+  deferred edit becomes a field here), the dispatch methods, and the image-set close helpers
   (`close_image_set_discarding`, `apply_image_set_outcome`); tests that build both kinds from real
   fixtures (a temp chapter, an opened image set) and check their dispatch answers.
 - `project/`: `ProjectSession`, the project persistence state and flows. See its `MODULE_README.md`.

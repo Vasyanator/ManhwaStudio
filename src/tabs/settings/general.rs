@@ -34,7 +34,6 @@ impl SettingsTabState {
         // rather than the shared widget. Persist off the GUI thread when it changes.
         if self.typing_panel_layout != TypingPanelLayout::Vertical {
             self.typing_panel_layout = TypingPanelLayout::Vertical;
-            self.pending_typing_panel_layout = Some(TypingPanelLayout::Vertical);
             let path = self.user_settings_file.clone();
             if let Err(err) = thread::Builder::new()
                 .name("settings-typing-layout-save".to_string())

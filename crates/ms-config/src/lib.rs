@@ -18,6 +18,9 @@ Main items:
 - `update_user_config_file`: serialized read-modify-write boundary for `user_config.json`
   (`ms_docstore::update` under the per-document lock).
 - `merge_missing`: the default-backfill rule (insert absent keys, never replace values).
+- `section_bool` / `set_section_bool` (+ `CANVAS_SECTION` / `TEXT_TAB_SECTION`): pure read and
+  write of one boolean `user_config` key under a section; the write runs inside a caller's
+  `update_user_config_file` (exit-only tab settings).
 - `user_config_defaults` / `project_config_defaults`: default trees for global and project settings.
 - `AiInstallType`: installed AI dependency level recorded in `user_config.json`.
 - `Flux2Variant`: which FLUX.2 klein checkpoint an «ИИ-редактор области» engine works with
@@ -281,6 +284,11 @@ pub const GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY: &str = "first_run_languages
 /// The section itself is owned by `widgets::panel_dock::persist`, which re-exports this
 /// constant; bump it there and here together with the shape.
 pub const PANEL_LAYOUT_SECTION_VERSION: u32 = 1;
+/// `user_config.json` section holding canvas preferences shared by the canvas tabs (cache flag,
+/// bubble-status rules, the per-tab bottom-hint collapsed flags, ...).
+pub const CANVAS_SECTION: &str = "Canvas";
+/// `user_config.json` section holding typing-tab settings (`TEXT_TAB_*` keys).
+pub const TEXT_TAB_SECTION: &str = "TextTab";
 pub const TEXT_TAB_HANGING_PUNCTUATION_KEY: &str = "hanging_punctuation";
 pub const TEXT_TAB_ROTATION_CTRL_WHEEL_MODE_KEY: &str = "rotation_ctrl_wheel_mode";
 /// `TextTab` key holding the advanced text-form search knobs as ONE JSON object
@@ -1811,6 +1819,29 @@ pub(crate) fn edit_section(root_obj: &mut Map<String, Value>, section: &str, edi
     root_obj.insert(section.to_owned(), Value::Object(section_obj));
 }
 
+/// Reads the boolean `root[section][key]`; a missing or non-object section, a missing key or a
+/// non-boolean value yields `default`. Pure: the reader side of [`set_section_bool`].
+#[must_use]
+pub fn section_bool(root: &Value, section: &str, key: &str, default: bool) -> bool {
+    root.get(section).and_then(Value::as_object).and_then(|obj| obj.get(key)).and_then(Value::as_bool).unwrap_or(default)
+}
+
+/// Writes the boolean `root[section][key] = value` into a `user_config.json` root value, the pure
+/// edit a caller runs inside [`update_user_config_file`]. A non-object `root` or a non-object
+/// `section` value is replaced by a fresh object (the value is never silently dropped); every other
+/// key of the root and of the section survives.
+pub fn set_section_bool(root: &mut Value, section: &str, key: &str, value: bool) {
+    if !root.is_object() {
+        *root = Value::Object(Map::new());
+    }
+    // Invariant: `root` was made an object just above, so this branch always binds.
+    if let Value::Object(root_obj) = root {
+        edit_section(root_obj, section, |section_obj| {
+            section_obj.insert(key.to_owned(), Value::Bool(value));
+        });
+    }
+}
+
 /// User-facing message (and a structured log line) for a failed user-config section
 /// write. Read/parse failures use the localized `settings.config_io.*` texts; write
 /// failures keep the technical text the savers always returned (the store has already
@@ -3251,5 +3282,82 @@ mod tests {
             flux2_klein_settings_path(Flux2Variant::Klein9B),
             flux2_klein_settings_path(Flux2Variant::Klein4B),
         );
+    }
+
+    #[test]
+    fn set_section_bool_writes_flags_and_preserves_other_keys() {
+        // An unrelated Canvas key, a stale key the caller never writes and an unrelated section
+        // all survive; only the written flags change.
+        let mut root = json!({
+            "Canvas": { "cache_pages": true, "cleaning_hint_collapsed": true },
+            "General": { "memory_profile": "Medium" }
+        });
+        set_section_bool(&mut root, CANVAS_SECTION, "translation_hint_collapsed", true);
+        set_section_bool(&mut root, CANVAS_SECTION, "typing_hint_collapsed", true);
+        assert_eq!(
+            root,
+            json!({
+                "Canvas": { "cache_pages": true, "cleaning_hint_collapsed": true, "translation_hint_collapsed": true, "typing_hint_collapsed": true },
+                "General": { "memory_profile": "Medium" }
+            })
+        );
+
+        let mut root = json!({
+            "TextTab": { "text_language": "en", "hanging_punctuation": true },
+            "General": { "memory_profile": "Medium" }
+        });
+        set_section_bool(&mut root, TEXT_TAB_SECTION, "centering_assist_enabled", true);
+        set_section_bool(&mut root, TEXT_TAB_SECTION, "centering_show_center", false);
+        assert_eq!(
+            root,
+            json!({
+                "TextTab": { "text_language": "en", "hanging_punctuation": true, "centering_assist_enabled": true, "centering_show_center": false },
+                "General": { "memory_profile": "Medium" }
+            })
+        );
+    }
+
+    #[test]
+    fn set_section_bool_replaces_non_object_root_and_section() {
+        // A corrupt (non-object) root is replaced with a fresh object; the flags are never dropped.
+        let mut root = Value::String("not an object".to_string());
+        set_section_bool(&mut root, CANVAS_SECTION, "translation_hint_collapsed", false);
+        set_section_bool(&mut root, CANVAS_SECTION, "typing_hint_collapsed", true);
+        assert_eq!(root, json!({ "Canvas": { "translation_hint_collapsed": false, "typing_hint_collapsed": true } }));
+
+        // A non-object section value is replaced (not merged) so the flags still land.
+        let mut root = json!({ "TextTab": "corrupt", "General": { "x": 1 } });
+        set_section_bool(&mut root, TEXT_TAB_SECTION, "centering_assist_enabled", true);
+        set_section_bool(&mut root, TEXT_TAB_SECTION, "centering_show_center", true);
+        assert_eq!(
+            root,
+            json!({ "TextTab": { "centering_assist_enabled": true, "centering_show_center": true }, "General": { "x": 1 } })
+        );
+    }
+
+    #[test]
+    fn section_bool_falls_back_to_default_when_absent_or_malformed() {
+        for default in [false, true] {
+            assert_eq!(section_bool(&json!({}), CANVAS_SECTION, "translation_hint_collapsed", default), default);
+            assert_eq!(section_bool(&json!({ "Canvas": {} }), CANVAS_SECTION, "translation_hint_collapsed", default), default);
+            assert_eq!(section_bool(&json!({ "Canvas": "corrupt" }), CANVAS_SECTION, "translation_hint_collapsed", default), default);
+            assert_eq!(
+                section_bool(&json!({ "Canvas": { "translation_hint_collapsed": "yes" } }), CANVAS_SECTION, "translation_hint_collapsed", default),
+                default
+            );
+            assert_eq!(section_bool(&Value::Null, TEXT_TAB_SECTION, "centering_show_center", default), default);
+        }
+        // A present boolean wins over either default.
+        assert!(section_bool(&json!({ "Canvas": { "typing_hint_collapsed": true } }), CANVAS_SECTION, "typing_hint_collapsed", false));
+        assert!(!section_bool(&json!({ "TextTab": { "centering_show_center": false } }), TEXT_TAB_SECTION, "centering_show_center", true));
+    }
+
+    #[test]
+    fn section_bool_reads_back_what_set_section_bool_wrote() {
+        let mut root = json!({});
+        set_section_bool(&mut root, TEXT_TAB_SECTION, "centering_show_center", false);
+        assert!(!section_bool(&root, TEXT_TAB_SECTION, "centering_show_center", true));
+        set_section_bool(&mut root, TEXT_TAB_SECTION, "centering_show_center", true);
+        assert!(section_bool(&root, TEXT_TAB_SECTION, "centering_show_center", false));
     }
 }

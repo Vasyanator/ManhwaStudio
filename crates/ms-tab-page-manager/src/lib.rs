@@ -35,6 +35,9 @@ Key functions:
   window.
 - release_hidden_viewer_clean() (viewer.rs): every-frame app hook that frees the
   viewer's clean tiles and textures while this tab is not drawn.
+- `impl StudioTab` (studio_tab.rs): routes the root's order-free hooks to the
+  functions above (background polls, source-page window, NEAREST sampling,
+  committed-tree rescan).
 
 Notes:
 This tab is NOT a `CanvasView`. It never executes structural operations itself:
@@ -65,6 +68,7 @@ mod split;
 mod split_layout;
 mod stitch;
 mod stitch_layout;
+mod studio_tab;
 mod thumbs;
 mod viewer;
 

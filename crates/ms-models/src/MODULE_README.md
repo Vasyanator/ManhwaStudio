@@ -43,7 +43,10 @@ candidate.
   a separate monotonic lifetime counter of noted actions (never reset by a flush); single-image
   mode compares it with its last-write baseline to decide "dirty" (`src/studio/session/image_set/`).
 - `bubbles_model.rs`: shared bubble list, revision tracking, canvas settings, and
-  coalesced background saving. The bubbles document is written only through
+  coalesced background saving. `SharedCanvasSettings::apply_comic_type_preset` is the one place a
+  comic-type preset (`ComicType::canvas_preset`) is written into shared canvas settings; the pure
+  project `CanvasSettings` -> `SharedCanvasSettings` conversion lives in `ms-canvas` (its
+  normalizing enums are there). The bubbles document is written only through
   `ms_docstore::write` (`write_bubbles_snapshot_to`) and its staging existence is
   probed with `ms_docstore::exists` (`staged_bubbles_exist`; `BubblesModel::new` probes it,
   `new_with_staging_probe` takes an answer pre-read off the GUI thread) — never a raw file write.
@@ -74,6 +77,8 @@ candidate.
   Windows, as the loader's open of `<stem>.png` is there).
 - `clean_overlays_model.rs`: shared clean overlay images, undo/redo history, per-consumer change
   revisions (`delta_since`), save-dirty tracking, autosave snapshots, and cached decoded page images.
+  It is the runtime owner of the canvas "cache pages" setting (`cache_pages_enabled`): readers that
+  need its current value (the studio's page-cache loader) ask the model, never a canvas copy.
 - `text_mask_model.rs`: shared text detector masks keyed by page index.
 - `session_caps.rs`: `SessionCapabilities`, the `Copy` set of features the open studio session
   offers (title documents, lasting chapter storage, clean scan, series watermark library, alt

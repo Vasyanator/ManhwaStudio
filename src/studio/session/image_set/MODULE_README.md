@@ -87,9 +87,10 @@ An image set (2+ pages):
 - Dirty = `edit_stamp != saved_baseline || deferred_edits`, both defined in
   `controller.rs`: `edit_stamp` = `AutosaveGate::action_count()` + `TypingTabState::mask_edit_count()`
   (the clip mask is outside the gated writers; both counters only grow, so the sum moves iff either
-  does); `deferred_edits` = `typing.has_pending_text_edits()` || `ps_editor.has_deferred_layer_edits()`
-  (edits that changed the image but have not noted an action yet). Any new edit source that bypasses
-  the gate must join one of the two. The baseline is captured AFTER the save's own flushes (they note
+  does); `deferred_edits` = `session::DeferredTabEdits::any` (typing's pending text edits, the PS
+  editor's deferred layer edits: edits that changed the image but have not noted an action yet; the
+  same owner answers the project's dirty check). Any new edit source that bypasses the gate must
+  join `edit_stamp` or `DeferredTabEdits`. The baseline is captured AFTER the save's own flushes (they note
   actions and clear the deferred flags) and applied only when the whole save succeeded: an edit
   during the write stays dirty; a failed, stopped or cancelled page leaves the session dirty (the
   pages that were written stay written). A write in flight also counts as unsaved for the close

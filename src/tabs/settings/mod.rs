@@ -30,6 +30,8 @@ Flow:
 mod canvas_ribbon;
 mod general;
 mod hotkeys;
+// `impl ms_studio_tab::StudioTab` (empty: every hook keeps its no-op default).
+mod studio_tab;
 mod typesetting;
 
 use crate::ai_backend_supervisor::AiBackendHandle;
@@ -153,7 +155,6 @@ pub struct SettingsTabState {
     active_pane: SettingsSectionId,
     user_settings_file: PathBuf,
     typing_panel_layout: TypingPanelLayout,
-    pending_typing_panel_layout: Option<TypingPanelLayout>,
     memory_manager: Arc<MemoryManager>,
     /// Container owning the three cross-surface "double-interface" panel states
     /// (General / AiBackend / Tutorials), the same states the launcher settings page
@@ -316,7 +317,6 @@ impl SettingsTabState {
             active_pane: SettingsSectionId::General,
             user_settings_file,
             typing_panel_layout,
-            pending_typing_panel_layout: Some(typing_panel_layout),
             memory_manager,
             shared,
             hanging_punctuation_input: hanging_punctuation.clone(),
@@ -412,10 +412,6 @@ impl SettingsTabState {
         if !caps.project_settings {
             set_project_spellcheck_settings_file(None);
         }
-    }
-
-    pub fn take_typing_panel_layout_request(&mut self) -> Option<TypingPanelLayout> {
-        self.pending_typing_panel_layout.take()
     }
 
     pub fn draw(&mut self, ui: &mut egui::Ui, hotkeys_v2: &mut InputManagerV2) {

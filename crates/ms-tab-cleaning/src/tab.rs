@@ -83,7 +83,7 @@ use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::TextMaskModel;
 use ms_project::ProjectData;
 use ms_config::app_tab::AppTab;
-use ms_tab_translation::backend_health::AiBackendHealthSnapshot;
+use ms_local_ai::backend_health::AiBackendHealthSnapshot;
 use ms_widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
     PanelNode, TabId,
@@ -2437,7 +2437,8 @@ impl CanvasHooks for CleaningHooks<'_> {
     /// all three canvas tabs then run their dock at the same point of the frame with
     /// the same dock-area rule. It must also run on EVERY frame this tab is active:
     /// the dock's detached sub-windows are immediate viewports kept alive by
-    /// `PanelDock::end` (`studio.rs::tab_hosts_panel_dock`).
+    /// `PanelDock::end` (this tab hosts the dock: `StudioTab::default_dock_layout`,
+    /// `studio_tab.rs`).
     fn draw_canvas_overlay_top_left(
         &mut self,
         ctx: &egui::Context,

@@ -57,10 +57,10 @@ use ms_sysprobe::python_manager;
 #[cfg(not(target_arch = "wasm32"))]
 use ms_sysprobe::python_manager::ManagedPythonChild;
 use ms_log::runtime_log;
-use ms_tab_translation::backend_health::{
+use ms_local_ai::backend_health::{
     AiBackendHealthSnapshot, AiBackendProbeCommand, spawn_ai_backend_probe,
 };
-use ms_tab_translation::local_ai::{LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
+use ms_local_ai::local_ai::{LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
 use serde_json::Value;
 use std::collections::VecDeque;
 #[cfg(not(target_arch = "wasm32"))]

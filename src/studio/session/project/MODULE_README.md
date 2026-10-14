@@ -58,4 +58,5 @@ flushes or notifies. Workers get Arc clones of the models from `StagingWriters`.
 - Discard / failed-discard handling: `discard.rs`; the writer half: `src/studio/staging_writers.rs`.
 - Exit dialog buttons: `exit_dialog.rs`; which dialog is open: `src/studio/close_flow.rs`; how a
   save-then-close ends: `mod.rs::save_then_close_end` + `CloseFlow::end_save_then_close`.
-- What counts as unsaved: `mod.rs::refresh_unsaved_changes_cache`.
+- What counts as unsaved: `mod.rs::refresh_unsaved_changes_cache`; which tab-held edits count:
+  `session::DeferredTabEdits` (`../mod.rs`).

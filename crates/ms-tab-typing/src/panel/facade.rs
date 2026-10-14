@@ -132,10 +132,6 @@ impl TypingTopPanelState {
         }
     }
 
-    pub(crate) fn set_panel_layout(&mut self, layout: TypingPanelLayout) {
-        let _ = layout;
-    }
-
     pub(crate) fn has_focused_text_input(&self, ctx: &egui::Context) -> bool {
         self.create_panel.has_focused_text_input(ctx) || self.edit_panel.has_focused_text_input(ctx)
     }
@@ -555,8 +551,8 @@ impl TypingTopPanelState {
     /// Writes a still-owed DEFAULT local-preset set immediately, on the calling thread.
     /// Returns whether there was anything to flush.
     ///
-    /// The app-exit hook (`StudioApp::on_exit`), alongside
-    /// `font_admin::flush_pending_saves`: the set is persisted through a multi-second
+    /// The studio-teardown flush (`StudioTab::flush_debounced_stores_blocking` of the tab),
+    /// right after `font_admin::flush_pending_saves`: the set is persisted through a multi-second
     /// debounce whose writer is a detached thread that dies with the process, so a rename or
     /// a parameter edit made a second before closing used to be lost. Local presets belong
     /// to the CREATE panel only, so only that one is asked.

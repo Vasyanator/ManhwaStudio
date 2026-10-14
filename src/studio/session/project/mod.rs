@@ -35,7 +35,7 @@ mod save;
 use crate::studio::PendingCloseAction;
 use crate::studio::busy::{PersistenceActivity, PersistenceJobs};
 use crate::studio::close_flow::SaveThenCloseEnd;
-use crate::studio::session::SessionParts;
+use crate::studio::session::{DeferredTabEdits, SessionParts};
 use crate::page_ops::PageOpOutcome;
 use crate::runtime_log;
 use eframe::egui;
@@ -112,6 +112,9 @@ pub(in crate::studio) struct ProjectSession {
     has_unsaved_changes_cached: bool,
     /// App time (seconds) of the next throttled unsaved-changes probe.
     next_unsaved_dir_check_s: f64,
+    /// A save-to-project merge succeeded since the last `take_committed_tree_changed`: the
+    /// committed chapter tree changed under the tabs that cache a view of it.
+    committed_tree_changed: bool,
 }
 
 impl ProjectSession {
@@ -130,7 +133,14 @@ impl ProjectSession {
             pending_project_reload: false,
             has_unsaved_changes_cached: has_staging,
             next_unsaved_dir_check_s: 0.0,
+            committed_tree_changed: false,
         }
+    }
+
+    /// Returns and clears the "committed tree changed" latch (set by a successful merge in
+    /// `poll_save_to_project`).
+    pub(in crate::studio) fn take_committed_tree_changed(&mut self) -> bool {
+        std::mem::take(&mut self.committed_tree_changed)
     }
 
     /// Whether the chapter has changes not yet merged into the project folder (the cached flag).
@@ -167,7 +177,7 @@ impl ProjectSession {
 
     /// The full busy snapshot (jobs plus the two tab facts), taken where a decision is made.
     fn activity(&self, parts: &SessionParts<'_>) -> PersistenceActivity {
-        PersistenceActivity::new(self.busy_jobs(), parts.typing.export_in_progress(), parts.page_manager.clean_op_in_flight())
+        PersistenceActivity::of(self.busy_jobs(), parts.typing, parts.page_manager)
     }
 
     /// Per-frame poll of every project job, in the fixed order of `StudioApp::ui`: advance a save
@@ -256,12 +266,13 @@ impl ProjectSession {
             return;
         }
         self.next_unsaved_dir_check_s = now + 1.0;
-        // A DEFERRED typing text edit is unsaved work that has not reached the disk yet, so the
-        // staging-dir probe at the end of this fn cannot see it. Ask the tab directly: otherwise an
-        // edit made shortly before closing (still inside its idle-debounce window, with no other
-        // unsaved state to have created the staging dir) would leave this false and the exit dialog
-        // would not offer to save the chapter.
-        if parts.typing.has_pending_text_edits() {
+        // A DEFERRED tab edit (typing text, PS-editor layer visibility / opacity / collapse) is
+        // unsaved work that has not reached the disk yet, so the staging-dir probe at the end of this
+        // fn cannot see it. Ask the one owner of that question (`DeferredTabEdits`, shared with the
+        // image set): otherwise an edit made shortly before closing, with no other unsaved state to
+        // have created the staging dir, would leave this false and the exit dialog would not offer
+        // to save the chapter. Latched here, so it survives the flush that writes it to staging.
+        if DeferredTabEdits::of(parts.typing, parts.ps_editor).any() {
             self.has_unsaved_changes_cached = true;
             return;
         }
@@ -295,7 +306,18 @@ impl ProjectSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{SavePoll, SaveThenCloseEnd, save_then_close_end};
+    use super::{ProjectSession, SavePoll, SaveThenCloseEnd, save_then_close_end};
+
+    /// The committed-tree latch is off for a freshly opened chapter, and a set latch is reported
+    /// exactly once: `StudioApp::ui` drains it every frame, so one merge notifies the tabs once.
+    #[test]
+    fn the_committed_tree_latch_is_drained_once() {
+        let mut session = ProjectSession::new(false);
+        assert!(!session.take_committed_tree_changed());
+        session.committed_tree_changed = true;
+        assert!(session.take_committed_tree_changed());
+        assert!(!session.take_committed_tree_changed());
+    }
 
     /// An armed save-then-close: a clean success closes; a success that left unsaved work, a failed
     /// save, and a save that never ran (refused or aborted before its worker) all end it without a

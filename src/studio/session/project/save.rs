@@ -15,7 +15,8 @@ Key functions:
   bubble flush (all three canvases) -> PS flush -> typing flush (abort on `Err` / failed pages) -> worker: bubbles barrier + hold -> layer
   barrier (abort on a failed owned text write) -> клин pause + snapshots + staging write -> merge
   -> resume -> bubbles re-barrier), `poll_save_to_project` (success: gate `force_flush`, both
-  models `mark_saved_to_project`, the Cleaning and Page Manager clean rescans, cache cleared).
+  models `mark_saved_to_project`, the committed-tree latch set — drained by `StudioApp::ui` into
+  `StudioTab::on_committed_tree_changed` — cache cleared).
 
 Notes:
 Order and abort rules: "Save / page-op / discard / exit choreography" in `src/studio/MODULE_README.md`.
@@ -370,11 +371,11 @@ impl ProjectSession {
                 if let Ok(mut model) = parts.writers.clean_overlays_model().lock() {
                     model.mark_saved_to_project();
                 }
-                // The merge rewrote the committed `clean_layers/`, which the Cleaning tab's
-                // clean-folder status area reports on; it cannot see that change by itself.
-                parts.cleaning.request_orphan_clean_rescan();
-                // Same for the page manager's clean cards (its staged paths no longer exist).
-                parts.page_manager.request_clean_rescan();
+                // The merge rewrote the committed tree (`clean_layers/` among it): tabs that cache a
+                // view of it (the Cleaning clean-folder status, the page manager's clean cards)
+                // cannot see that by themselves. Latched here, drained by `StudioApp::ui` right
+                // after this tick (`StudioTab::on_committed_tree_changed`), before any tab draws.
+                self.committed_tree_changed = true;
                 self.has_unsaved_changes_cached = false;
                 self.save_to_project_status = Some((t!("app.save.saved").to_string(), now));
                 runtime_log::log_info("[save_to_project] merge complete");

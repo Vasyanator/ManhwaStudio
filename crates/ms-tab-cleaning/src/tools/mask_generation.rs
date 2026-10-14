@@ -43,7 +43,7 @@ NOTHING here may be called on the GUI thread except the `draw_*` helpers, `poll_
 `spawn_*`: every other function performs a blocking IPC round trip.
 */
 use ms_backend_ipc::{self as backend_ipc, CallError};
-use ms_tab_translation::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 use ms_tab_translation::text_detector::{
     TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, detect_ai_ctd_mask_for_image,
     detect_paddle_mask_for_image, detect_surya_mask_for_image,

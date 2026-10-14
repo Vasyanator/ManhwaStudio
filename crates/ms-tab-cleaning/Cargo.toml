@@ -49,9 +49,11 @@ ms-project = { path = "../ms-project" }
 # The Hugging Face token store behind the model downloads, the AI model registry and the
 # backend capability probe.
 ms-sysprobe = { path = "../ms-sysprobe" }
-# The «Перевод» tab: AI backend health (`backend_health`), the text detector's mask helpers
-# and the MT service the Flux.2 engine translates prompts through.
+# The «Перевод» tab: the text detector's mask helpers and the MT service the Flux.2 engine
+# translates prompts through.
 ms-tab-translation = { path = "../ms-tab-translation" }
+# AI backend health (`backend_health`: the shared snapshot and the unified offline message).
+ms-local-ai = { path = "../ms-local-ai" }
 # The cloud image-edit layer behind «ИИ редактирование (API)» (`tools/ai_api_editor/`): the
 # provider/model catalogue and its size rules, the picker widget with its key block, and the
 # size-exact `run_image_edit` pipeline. Already below this crate through `ms-tab-translation`,
@@ -72,6 +74,9 @@ ms-text-detect = { path = "../ms-text-detect" }
 # Every reusable widget the panels put on screen, the dockable-panel subsystem and
 # `input_util`.
 ms-widgets = { path = "../ms-widgets" }
+# The studio root's order-free per-tab hook trait (`StudioTab`), implemented in
+# `studio_tab.rs`. It sits below this crate (its own layer line under the tab crates).
+ms-studio-tab = { path = "../ms-studio-tab" }
 # Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
 # hand-typed here. A leaf over egui, so it adds no layering constraint.
 ms-theme = { path = "../ms-theme" }

@@ -4,7 +4,8 @@ Shared runtime model for translation bubbles and canvas settings snapshots.
 
 Main items:
 - `SharedCanvasSettings`: lightweight cross-tab canvas settings payload, including
-  editable/readonly default display types for `default` bubbles.
+  editable/readonly default display types for `default` bubbles. It owns applying a comic-type
+  preset (`apply_comic_type_preset`) to the shared settings.
 - `BubblesModel`: thread-safe mutable bubbles store with revisions, async saver, and
   flush/hold barriers for destructive staging operations.
 - `runtime_bubble_to_record`: adapter from canvas runtime fields to persisted `Bubble`,
@@ -31,7 +32,7 @@ Threading/persistence:
 */
 
 use ms_config::bubble_status::{BubbleStatusRule, default_bubble_status_rules};
-use ms_project::Bubble;
+use ms_project::{Bubble, ComicType};
 use ms_docstore::{DocKind, DocRef};
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
@@ -162,6 +163,24 @@ impl Default for SharedCanvasSettings {
             translation_status_display: "marks".to_string(),
             hint_show_outside_default: false,
         }
+    }
+}
+
+impl SharedCanvasSettings {
+    /// Writes `comic_type`'s canvas preset (`ComicType::canvas_preset`: aside compact mode and
+    /// separate pages) into these settings — the one place a preset is applied to shared settings.
+    ///
+    /// Returns `true` iff a field value actually changed. `Custom` is no preset and leaves the
+    /// settings untouched (`false`). The preset strings are stored verbatim; they are exactly the
+    /// canvas enum's `as_str` forms, so a canvas pulling these settings stores the same values.
+    pub fn apply_comic_type_preset(&mut self, comic_type: ComicType) -> bool {
+        let Some((aside_compact_mode, separate_pages)) = comic_type.canvas_preset() else {
+            return false;
+        };
+        let changed = self.aside_compact_mode != aside_compact_mode || self.separate_pages != separate_pages;
+        self.aside_compact_mode = aside_compact_mode.to_string();
+        self.separate_pages = separate_pages;
+        changed
     }
 }
 
@@ -879,6 +898,54 @@ fn send_snapshot_to_bubbles_saver(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Each preset writes exactly its two fields and reports the change; re-applying is a no-op.
+    #[test]
+    fn comic_preset_writes_its_fields_and_reports_change() {
+        for comic_type in [ComicType::Pages, ComicType::Ribbon] {
+            let Some((aside_compact_mode, separate_pages)) = comic_type.canvas_preset() else {
+                panic!("{comic_type:?} must carry a canvas preset");
+            };
+            let mut settings = SharedCanvasSettings { aside_compact_mode: "strong".to_string(), separate_pages: !separate_pages, ..SharedCanvasSettings::default() };
+            let mut expected = settings.clone();
+            expected.aside_compact_mode = aside_compact_mode.to_string();
+            expected.separate_pages = separate_pages;
+            assert!(settings.apply_comic_type_preset(comic_type), "{comic_type:?}");
+            assert_eq!(settings, expected, "{comic_type:?}");
+            assert!(!settings.apply_comic_type_preset(comic_type), "{comic_type:?} re-apply");
+            assert_eq!(settings, expected, "{comic_type:?} re-apply");
+        }
+    }
+
+    /// A change of only one of the two fields still counts as a change.
+    #[test]
+    fn comic_preset_reports_a_single_field_change() {
+        let mut settings = SharedCanvasSettings { aside_compact_mode: "moderate".to_string(), separate_pages: false, ..SharedCanvasSettings::default() };
+        assert!(settings.apply_comic_type_preset(ComicType::Pages));
+        assert!(settings.separate_pages);
+        let mut settings = SharedCanvasSettings { aside_compact_mode: "strong".to_string(), separate_pages: false, ..SharedCanvasSettings::default() };
+        assert!(settings.apply_comic_type_preset(ComicType::Ribbon));
+        assert_eq!(settings.aside_compact_mode, "none");
+    }
+
+    /// `Custom` is not a preset: nothing changes.
+    #[test]
+    fn comic_preset_custom_leaves_settings_untouched() {
+        let mut settings = SharedCanvasSettings { aside_compact_mode: "strong".to_string(), ..SharedCanvasSettings::default() };
+        let before = settings.clone();
+        assert!(!settings.apply_comic_type_preset(ComicType::Custom));
+        assert_eq!(settings, before);
+    }
+
+    /// The applied fields derive back to the same preset (the settings combo's round trip).
+    #[test]
+    fn comic_preset_round_trips_through_preset_fields() {
+        for comic_type in [ComicType::Pages, ComicType::Ribbon] {
+            let mut settings = SharedCanvasSettings::default();
+            settings.apply_comic_type_preset(comic_type);
+            assert_eq!(ComicType::from_canvas_preset_fields(&settings.aside_compact_mode, settings.separate_pages), comic_type);
+        }
+    }
 
     /// Builds a unique temporary staging path so the background saver of each test model
     /// writes to its own file and tests do not collide.

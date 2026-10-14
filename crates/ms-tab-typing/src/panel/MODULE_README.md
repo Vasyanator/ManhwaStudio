@@ -265,8 +265,10 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   does NOT bump the revision: a profile is rewritten on every parameter edit, so an immediate
   atomic save per edit would be pure write amplification and a revision bump would force a font
   reload per keystroke. The accepted cost is a bounded loss window on a CRASH only — a normal
-  exit flushes it: `app::on_exit` calls `font_admin::flush_pending_saves()`, which writes the
-  pending snapshot synchronously (no GUI frame follows, and the detached debounce thread dies
+  exit flushes it: the studio teardown runs the typing tab's
+  `StudioTab::flush_debounced_stores_blocking` (`tab/studio_tab.rs`), which calls
+  `font_admin::flush_pending_saves()` and writes the
+  pending snapshot synchronously (no studio frame follows, and the detached debounce thread dies
   with the process, so closing the app inside the window used to lose the edit outright).
 - Per-font records are found and mutated CASE-INSENSITIVELY (`find_record_key`), matching the
   identity contract. An exact map lookup let a differently-cased caller create a SECOND record
@@ -690,14 +692,16 @@ newer on-disk schema, an unserializable snapshot), and not past
 `LOCAL_PRESETS_SAVE_MAX_RETRIES` consecutive attempts; both guards would otherwise spin a
 write-and-log loop every debounce window for the rest of the session. Neither guard loses
 data: the set stays dirty, so the next edit still writes it — and so does
-`flush_pending_local_presets_save`, the app-exit flush `StudioApp::on_exit` calls next to
+`flush_pending_local_presets_save`, the teardown flush the typing tab's
+`StudioTab::flush_debounced_stores_blocking` calls right after
 `font_admin::flush_pending_saves` (facade → `TypingTabState` → panel), which is what keeps an
 edit made inside the debounce window from dying with the detached writer thread.
 
-THE EXIT FLUSH WRITES SYNCHRONOUSLY ON THE GUI THREAD, AND THAT IS A DELIBERATE TRADE-OFF, not
-an oversight of the "never block the GUI thread" rule (CLAUDE.md §5). It is the same shape the
-PRE-EXISTING `font_admin::flush_pending_saves` uses in `src/studio/shutdown.rs` for `fonts_data.json`,
-and it is bounded in the only sense that matters: no GUI frame follows `on_exit` and no thread
+THE EXIT FLUSH WRITES SYNCHRONOUSLY, AND THAT IS A DELIBERATE TRADE-OFF. The studio teardown
+runs on the main window's Closing-screen worker (inline only in the window's `on_exit`, when
+eframe ends the process with the studio open). It is the same shape the
+PRE-EXISTING `font_admin::flush_pending_saves` uses in the same hook for `fonts_data.json`,
+and it is bounded in the only sense that matters: no studio frame follows the teardown and no thread
 outlives it, so there is nothing left to keep responsive, and the work is ONE atomic write of
 the same small document the debounced writer would have written. A deadline (write on a thread,
 give up after N ms) does not make this safe — it trades a hang the user can SEE for a silent

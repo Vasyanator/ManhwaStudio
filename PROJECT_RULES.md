@@ -94,6 +94,8 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   (`ms_canvas::pixel_inspection_recommended_for`, `pixel_grid::draw_pixel_grid`), page <-> clean
   binding (`ms_page_ops::clean_binding` + `ms_models::clean_assign`), text-detection scale and
   tiling decision (`ms_text_detect::plan_detection`, used by the detector worker and panel notice),
+  local-AI route availability (`ms_local_ai::local_ai::AiRouteKind::availability`: never test
+  `--no-ai` or the platform for an AI route anywhere else),
   OS integration records — record names (`ms_os_integration::identity`), expected registry
   values (`ms_os_integration::windows::values`) and the "Open with" ownership rule
   (`open_with_command_targets_install`); no other crate spells a record name or builds its values;

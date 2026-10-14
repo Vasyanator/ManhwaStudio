@@ -29,7 +29,7 @@ Notes:
 
 use crate::project::ComicType;
 use crate::runtime_log;
-use crate::tabs::translation::backend_health::{
+use ms_local_ai::backend_health::{
     AiBackendDeviceOption, AiBackendHealthSnapshot, AiBackendProbeCommand,
 };
 use eframe::egui;

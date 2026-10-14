@@ -4,21 +4,15 @@ Crate root of the «Перевод» (translation) tab. Re-exported by the binar
 `src/tabs/mod.rs` as `crate::tabs::translation`, so every existing
 `crate::tabs::translation::…` call site keeps its path.
 
-Layer: near the top of the library stack — above the canvas, the models, the widgets and
-`ms-tabs-simple` (it reads character and term note entries), and below `studio.rs`, the AI
-backend panel/supervisor, the launcher's reline flow and the `cleaning` tab, all of which
-reach into `backend_health` / `text_detector` / `machine_translation`. It must never name
-`studio` or `launcher`.
+Layer: near the top of the library stack — above the canvas, the models, the widgets,
+`ms-local-ai` (backend health, local-AI availability) and `ms-tabs-simple` (it reads character
+and term note entries), and below `studio.rs` and the `cleaning` tab, which reach into
+`text_detector` / `machine_translation`. It must never name `studio` or `launcher`.
 
 Submodules:
 - `adv_rec`: floating advanced-recognition window for manual OCR region selection.
 - `ai_mt_response`: reading, validating and merging AI API MT answers, content checks, the
   strict-output schema (native only).
-- `backend_health`: push-driven AI-backend health (`TOPIC_HEALTH` v2 events) + device-control helpers.
-- `local_ai`: which local AI runtimes (Python backend, native ONNX) the process may use
-  (`--no-ai` + platform), the one route-availability rule (`AiRouteKind::availability`) and
-  the effective-runtime helper (`effective_ai_runtime`); public for the supervisor, the AI
-  backend pane and the root.
 - `machine_translators`: concrete MT backends (Google/Yandex/DeepL) used by worker.
 - `machine_translation`: MT controller/worker and backend dispatch integration.
 - `ocr`: OCR controller/worker and backend transport.
@@ -29,6 +23,9 @@ Submodules:
 - `panels`: UI subpanels for Translation tab.
 - `tab`: top-level Translation tab state implementing `CanvasHooks`, plus this program tab's
   default panel-dock arrangement (`translation_default_dock_layout`).
+- `host`: `TranslationTab`, the program tab as the studio root holds it — the tab's own
+  `CanvasView` plus `TranslationTabState`, its draw, its canvas-level hotkeys and hint rows, and
+  its `ms_studio_tab::StudioTab` implementation.
 */
 
 #![warn(clippy::all)]
@@ -40,18 +37,13 @@ Submodules:
 extern crate ms_i18n;
 
 mod adv_rec;
+// `TranslationTab`: the program tab as the studio holds it (canvas + state + `StudioTab`).
+mod host;
 #[cfg(not(target_arch = "wasm32"))]
 mod ai_mt_response;
-// `pub` rather than crate-private: the binary's AI backend panel and supervisor, the
-// launcher's reline flow and the `cleaning` tab all read the push-driven health snapshot
-// through it.
-pub mod backend_health;
 // `pub` rather than crate-private: the `cleaning` tab's Flux.2 engine translates prompts
 // through `translate_texts_via_translator`.
 pub mod machine_translation;
-// `pub` rather than crate-private: the root builds `LocalAiAvailability`, the supervisor
-// carries it and the AI backend pane reads `effective_ai_runtime`.
-pub mod local_ai;
 mod machine_translators;
 mod ocr;
 mod ocr_case_fix;
@@ -62,14 +54,12 @@ mod tab;
 // watermark-removal tools drive the detector through it.
 pub mod text_detector;
 
-/// The «Перевод» dock arrangement builder, handed to the app-owned dock state by
-/// `studio.rs::restore_panel_dock` before the first frame.
-pub use tab::translation_default_dock_layout;
+/// The «Перевод» program tab (its canvas plus its state) the studio root holds and draws; its
+/// dock builder and hotkeys reach the root through `ms_studio_tab::StudioTab`.
+pub use host::{TranslationDrawParams, TranslationTab};
+/// The tab state the root constructs (services injected) before wrapping it in a
+/// `TranslationTab`, and the two modifier-only OCR ids the settings hotkey pane's test names.
 pub use tab::{
-    HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL, HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION,
     HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE, HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE,
-    HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL, HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION,
-    HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL, HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL,
-    HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL, HOTKEY_TRANSLATION_TOGGLE_MT_PANEL,
-    HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL, TranslationHotkeyHints, TranslationTabState,
+    TranslationTabState,
 };

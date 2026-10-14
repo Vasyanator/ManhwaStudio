@@ -19,6 +19,8 @@ Modules:
 - `terms`: glossary terms plus the `load_terms_for_notes` reader used by translation.
 - `notes`: the aggregated read-only notes view over `characters` and `terms`.
 - `wiki`: the bundled markdown documentation browser (also mounted by the launcher).
+- `studio_tab`: empty `ms_studio_tab::StudioTab` impls for the four tab states (none of
+  them has an order-free studio hook).
 
 Notes:
 The four tabs are independent except for `notes`, which reads the other two. They share
@@ -36,5 +38,6 @@ extern crate ms_i18n;
 
 pub mod characters;
 pub mod notes;
+mod studio_tab;
 pub mod terms;
 pub mod wiki;

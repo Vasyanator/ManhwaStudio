@@ -17,13 +17,16 @@ PageResidency::spawn(project, cache_pages, memory)
                              -> textures (PageTexture); frontier published to the workers
        OverlayLoaderEvent -> poll_decoded: CleanOverlaysModel::load_prepared_overlay on arrival
   -> poll_page_cache: once every page is uploaded and every overlay delivered (and the canvas
-     `cache_pages` setting + memory budget allow), loader::spawn_page_cache_loader_thread fills
-     the shared page RGBA cache of CleanOverlaysModel
+     `cache_pages` setting — read from its owner, CleanOverlaysModel::cache_pages_enabled — and the
+     memory budget allow), loader::spawn_page_cache_loader_thread fills the shared page RGBA cache
+     of CleanOverlaysModel
 StudioApp glue (studio.rs): page window + pixel inspection -> trim_gpu; pressure tick + window ->
   evict_for_pressure (source GPU, then the overlay model caches), then the tabs' own caches
 ```
-Inputs that depend on tabs (`active_source_page_window`, the pixel-inspection flag, the canvas
-`cache_pages` setting, tab GPU caches) stay in `studio.rs` and are passed in as values.
+Inputs that depend on tabs (`active_source_page_window`, the pixel-inspection flag, tab GPU
+caches) stay in `studio.rs` and are passed in as values. The canvas `cache_pages` setting is not a
+tab fact: `spawn` takes the project's open-time value, and `poll_page_cache` reads the live one
+from `CleanOverlaysModel` (Settings and every canvas write it there), never from a canvas copy.
 
 ## Files and submodules
 - `mod.rs`: `PageResidency` (fields, `spawn`, `poll_decoded`, `poll_page_cache`, `lend_mut`,
@@ -36,7 +39,7 @@ Inputs that depend on tabs (`active_source_page_window`, the pixel-inspection fl
 - `decode.rs`: worker-side decode (`decode_page` tiles, `decode_overlay`, `decode_page_rgba`), the
   env opt-in ffmpeg GPU decode, tile row copy.
 - `memory.rs`: `trim_gpu`, `poll_pressure` / `PressureTick`, `evict_for_pressure`, the source-page
-  GPU snapshot and eviction, `append_eviction_report`.
+  GPU snapshot and eviction (reports merged with `CacheEvictionReport::append`).
 
 ## Contracts and invariants
 - Source pages are promoted strictly in page order; a failed page is skipped, never waited on.

@@ -13,8 +13,8 @@ Key structures:
   image-set session).
 
 Key functions:
-- `StudioApp::persistence_activity()` / `PersistenceActivity::new`: build the snapshot from the
-  session's jobs and two tab getters.
+- `PersistenceActivity::of`: the one composition of the snapshot (the session's jobs plus two tab
+  getters), used by `StudioApp::persistence_activity()` and the project session's flows.
 - `PersistenceActivity::{structural_op_active, save_busy, blocks_page_op, clean_op_in_flight,
   exit_cleanup_running}`: one predicate per subset of flags in use today.
 - `PersistenceActivity::save_blocker` + `SaveBlocker`: why a project save cannot start, one cause.
@@ -27,6 +27,8 @@ a new predicate rather than an edited shared one.
 */
 
 use super::StudioApp;
+use crate::tabs::page_manager::PageManagerTabState;
+use crate::tabs::typing::TypingTabState;
 
 /// Snapshot of every flag a "persistence busy" decision reads.
 ///
@@ -164,10 +166,11 @@ pub(super) struct PersistenceJobs {
 
 impl PersistenceActivity {
     /// The snapshot of the session's `jobs` plus the two tab facts: the typing export worker
-    /// (`export_in_progress`) and the page manager's clean attach/detach worker
-    /// (`clean_op_in_flight`).
+    /// (`TypingTabState::export_in_progress`) and the page manager's clean attach/detach worker
+    /// (`PageManagerTabState::clean_op_in_flight`). The ONE composition of the snapshot: the app
+    /// (`StudioApp::persistence_activity`) and the project session's flows both build it here.
     #[must_use]
-    pub(super) const fn new(jobs: PersistenceJobs, export_in_progress: bool, clean_op_in_flight: bool) -> Self {
+    pub(super) fn of(jobs: PersistenceJobs, typing: &TypingTabState, page_manager: &PageManagerTabState) -> Self {
         Self {
             save_running: jobs.save_running,
             save_pending_preload: jobs.save_pending_preload,
@@ -175,8 +178,8 @@ impl PersistenceActivity {
             page_op_failed: jobs.page_op_failed,
             reload_pending: jobs.reload_pending,
             exit_cleanup_running: jobs.exit_cleanup_running,
-            export_in_progress,
-            clean_op_in_flight,
+            export_in_progress: typing.export_in_progress(),
+            clean_op_in_flight: page_manager.clean_op_in_flight(),
         }
     }
 }
@@ -186,11 +189,7 @@ impl StudioApp {
     /// where a decision is made, before tab states are borrowed for drawing.
     #[must_use]
     pub(super) fn persistence_activity(&self) -> PersistenceActivity {
-        PersistenceActivity::new(
-            self.session.busy_jobs(),
-            self.tabs.typing.export_in_progress(),
-            self.tabs.page_manager.clean_op_in_flight(),
-        )
+        PersistenceActivity::of(self.session.busy_jobs(), &self.tabs.typing, &self.tabs.page_manager)
     }
 }
 

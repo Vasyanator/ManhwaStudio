@@ -310,7 +310,12 @@ mod workers;
 pub use self::view_transform::ViewTransform;
 pub use self::touch::{TouchDrivenDrag, drive_touch_drag};
 
-pub use self::settings::{save_canvas_settings_to_project_file, save_canvas_settings_to_user_file};
+// Pure project `CanvasSettings` -> `SharedCanvasSettings` conversion (the shared model's seed); the
+// studio root builds `BubblesModel` from it before any canvas exists.
+pub use self::settings::{
+    canvas_state_from_project, save_canvas_settings_to_project_file, save_canvas_settings_to_user_file,
+    shared_canvas_settings_from_project, shared_settings_from_state,
+};
 
 pub use self::workers::{OverlayAutosaveControl, OverlayAutosavePauseGuard, spawn_overlay_autosave_thread};
 

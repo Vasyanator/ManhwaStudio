@@ -15,8 +15,8 @@ Key functions:
   order of the "Save / page-op / discard / exit choreography" (`src/studio/MODULE_README.md`). The writer
   steps themselves (клин autosave stop and join, typing flush, layer and bubbles saver drain) are
   `StagingWriters` methods (`studio/staging_writers.rs`); this file keeps their order, the all-canvas
-  bubble flush before them (skipped when discarding), the decode-pool release between them, and the
-  exit-only stores.
+  bubble flush and the PS-editor deferred layer flush before them (both skipped when discarding),
+  the decode-pool release between them, and the exit-only stores.
 
 Notes:
 A child module of `studio` so it reaches `StudioApp`'s private fields and helpers without widening
@@ -26,7 +26,8 @@ the window's `on_exit` when eframe ended the process with the studio open. The w
 runs it (it drops the app in place); the web port of the shell is deferred.
 */
 
-use super::{StudioApp, persist_canvas_hint_collapsed_state, persist_typing_centering_assist_state};
+use super::StudioApp;
+use super::tabs::Tabs;
 use crate::runtime_log;
 
 /// What [`StudioApp::shutdown_blocking`] could not make durable. Empty (`Default`) on a clean
@@ -51,7 +52,8 @@ const _: fn() = assert_send::<StudioApp>;
 
 impl StudioApp {
     /// Final shutdown drain for the background layer saver and the other writers: runs on real
-    /// process exit, return-to-launcher, and the structural-operation reload. Flushes the typing
+    /// process exit, return-to-launcher, and the structural-operation reload. Unless discarding,
+    /// flushes the canvases' bubble edits, the PS editor's deferred layer edits and the typing
     /// tab's deferred text edits, then blocks until every queued layer write is flushed and the
     /// worker thread is joined, so no pending raster/text/effects write is lost on exit. Must NOT hold
     /// the doc lock across the barrier: it clones the handle, drops the lock, then barriers; finally
@@ -73,13 +75,24 @@ impl StudioApp {
         // took that path).
         self.session.before_shutdown(&mut self.writers, &mut self.tabs.typing);
         // Push every canvas's pending bubble edits (the 1 s text debounce included) into the
-        // bubbles model, so the bubbles-saver shutdown in `drain_for_shutdown` writes them. Never on
-        // the DISCARD path (an image set always takes it): those edits are thrown away on purpose.
+        // bubbles model, so the bubbles-saver shutdown in `drain_for_shutdown` writes them; then
+        // enqueue the PS editor's deferred layer edits (visibility / opacity / collapse through
+        // `edit_doc_node`, otherwise written only on tab leave, page switch, save or page op) on the
+        // layer saver, so the barrier in `drain_for_shutdown` covers them. Same relative order as
+        // save-to-project and the page op (bubbles, PS layers, typing text) and as
+        // `ViewSync::before_draw` (PS before typing): typing's text flush is the first step of
+        // `drain_for_shutdown`, and nothing in between (клин stop, decode-pool release) touches
+        // the layer saver. Never on the DISCARD path (an image set always takes it): those edits
+        // are thrown away on purpose, and the PS fallback write would re-create deleted staging.
         if self.writers.is_discarding() {
-            runtime_log::log_info("[app] on_exit: discard path — pending canvas bubble edits dropped, not flushed");
+            runtime_log::log_info("[app] on_exit: discard path — pending canvas bubble edits and PS-editor layer edits dropped, not flushed");
         } else {
             let (_, mut parts) = self.session_parts();
             parts.flush_canvas_bubble_edits();
+            if parts.ps_editor.has_deferred_layer_edits() {
+                runtime_log::log_info("[app] on_exit: flushing the PS editor's deferred layer edits");
+            }
+            parts.ps_editor.flush_layers_if_dirty(parts.project);
         }
         self.writers.stop_overlay_autosave_blocking();
         // Release decode workers parked on the look-ahead window: after this frame nothing
@@ -91,44 +104,22 @@ impl StudioApp {
         // shutdown, bubbles-saver shutdown; failures are logged and written into `report`.
         self.writers.drain_for_shutdown(&mut self.tabs.typing, &mut report);
 
-        // 4) Persist per-tab canvas bottom-hint collapsed state (exit-only, single read-modify-write).
-        // `on_exit` fires on both program close and return-to-launcher, so this is the one save point.
-        persist_canvas_hint_collapsed_state(
-            self.tabs.translation_canvas.bottom_hint_collapsed(),
-            self.tabs.typing.hint_collapsed(),
-        );
+        // 4) Persist every tab's exit-only `user_config` keys (the Translation and Typing bottom-hint
+        // collapsed flags, the two typing centering-assist checkboxes) in ONE locked read-modify-write;
+        // each tab writes its own keys into the root (`StudioTab::write_exit_settings`). Exit-only:
+        // teardown runs on both program close and return-to-launcher, so this is the one save point.
+        persist_exit_settings(&self.tabs);
 
-        // 5) Persist the two typing centering-assist checkboxes (exit-only, single locked RMW). The
-        // bound-center KIND is deliberately session-only, so it is not written here.
-        persist_typing_centering_assist_state(
-            self.tabs.typing.centering_assist_enabled(),
-            self.tabs.typing.centering_show_center(),
-        );
-
-        // 6) Flush a still-pending per-font-settings write. A parameter edit stores the font's
-        // default profile through a multi-second DEBOUNCE (one document write per burst instead of
-        // one per keystroke), and the debounced writer is a detached thread that dies with the
-        // process — so changing a parameter and closing the app a second later used to lose the
-        // edit outright. Synchronous by necessity: no GUI frame follows this call and no thread
-        // outlives it. No-op when nothing is pending, which is the normal case.
-        if crate::tabs::typing::font_admin::flush_pending_saves() {
-            runtime_log::log_info("[app] on_exit: flushed a pending fonts_data.json write");
-        }
-
-        // 6a) Flush a still-pending DEFAULT local-preset set. Same shape and same reason as
-        // the step above, for the other debounced typing store: a local preset renamed or
-        // re-parameterised inside its debounce window would otherwise die with the detached
-        // writer thread. No-op when nothing is owed. Why this write is synchronous here — and
-        // why a deadline would trade a visible hang for a silent loss — is argued at
+        // 5) Flush the tabs' debounced user-global stores (typing: the per-font settings write, then
+        // the default local-preset set). Their debounced writers are detached threads that die with
+        // the process, so an edit made a second before closing would otherwise be lost. Synchronous
+        // by necessity: no GUI frame follows and no thread outlives this call. Why a deadline would
+        // trade a visible hang for a silent loss is argued at
         // `local_presets::flush_pending_local_presets_save` and in
         // `crates/ms-tab-typing/src/panel/MODULE_README.md`.
-        if self.tabs.typing.flush_pending_local_presets_save() {
-            runtime_log::log_info(
-                "[app] on_exit: flushed a pending fonts/presets.json local-preset write",
-            );
-        }
+        self.tabs.flush_debounced_stores_blocking();
 
-        // 7) Flush the dockable-panel layouts. A last poll first, because the frame that raised
+        // 6) Flush the dockable-panel layouts. A last poll first, because the frame that raised
         // the dirty flag may be the one the close arrived in and no further frame will poll it;
         // then the writer's own debounce window is drained synchronously and its thread joined.
         // Both steps are no-ops when nothing changed.
@@ -137,5 +128,22 @@ impl StudioApp {
         }
         self.panel_layout_writer.flush_and_join();
         report
+    }
+}
+
+/// Writes every tab's exit-only `user_config` keys (`Tabs::write_exit_settings`) in ONE call of
+/// `update_user_config_file`, the canonical locked read-modify-write (atomic replace), so unrelated
+/// keys survive. A malformed existing document is NOT overwritten. Teardown-only: a failure is
+/// logged and the file is left as it was, so a failed write never blocks shutdown.
+fn persist_exit_settings(tabs: &Tabs) {
+    let path = crate::config::user_config_path();
+    if let Err(err) = crate::config::update_user_config_file(&path, |root| {
+        tabs.write_exit_settings(root);
+        Ok(())
+    }) {
+        runtime_log::log_error(format!(
+            "[app] on_exit: failed to persist the tabs' exit settings; file left unchanged; path={}; cause={err:#}",
+            path.display()
+        ));
     }
 }

@@ -39,6 +39,9 @@ ms-memory = { path = "../ms-memory" }
 ms-models = { path = "../ms-models" }
 # The chapter domain model the page loader reads pages from.
 ms-project = { path = "../ms-project" }
+# The studio root's order-free per-tab hook trait (`StudioTab`), implemented in
+# `studio_tab.rs`. It sits below this crate (its own layer line under the tab crates).
+ms-studio-tab = { path = "../ms-studio-tab" }
 # The «Текст» tab: the layers panel renders its text preview label for text rows.
 ms-tab-typing = { path = "../ms-tab-typing" }
 # Every background worker this tab spawns goes through the project thread wrapper.

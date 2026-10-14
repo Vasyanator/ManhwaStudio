@@ -7,7 +7,7 @@ tools (regions): plan with `ms_text_detect::plan_detection`, run the plan throug
 Key items:
 - `DetectorRoute` / `detector_native_route()`: where a PaddleOCR forward runs (target-neutral,
   pure; the disk read lives in `native::current_detector_route`); `DetectorRoute::route_kind`
-  maps it onto the one local-AI availability rule (`crate::local_ai`).
+  maps it onto the one local-AI availability rule (`ms_local_ai::local_ai`).
 - `paddle_route()`: the current PaddleOCR route (always `Backend` on wasm).
 - `detect_image()`: plan + run one in-memory RGB page; native Paddle first when routed there,
   re-running the whole page on the backend after a native failure that the backend may not
@@ -24,7 +24,7 @@ Worker-thread only: decode, IPC and inference are blocking.
 */
 
 use super::TextDetectorPageResult;
-use crate::local_ai::AiRouteKind;
+use ms_local_ai::local_ai::AiRouteKind;
 use super::backend::{IpcRunner, SharedClientTransport, ensure_backend_models, forward_engine};
 use image::RgbImage;
 use ms_text_detect::mask::MaskError;

@@ -21,7 +21,7 @@ No detection rule lives here (scale, tiling, stitching, postprocess are `ms_text
 file only moves tiles and maps across the process boundary. Worker-thread only (blocking IPC).
 */
 
-use crate::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 use image::RgbImage;
 use ms_backend_ipc::textdetector::{
     ForwardEngine, ForwardMaps, ForwardWireError, build_forward_request, decode_forward_response, max_tiles_per_request,

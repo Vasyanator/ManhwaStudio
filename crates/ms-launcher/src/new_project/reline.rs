@@ -25,7 +25,7 @@ separately; failures are surfaced as backend connectivity errors.
 
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use crate::new_project::ribbon::{ImportedImage, RibbonPage, build_ribbon_pages};
-use ms_tab_translation::backend_health::{ai_backend_offline_error, check_ai_backend_health};
+use ms_local_ai::backend_health::{ai_backend_offline_error, check_ai_backend_health};
 use image::{ImageFormat, RgbaImage};
 use ms_thread as thread;
 use serde::Serialize;

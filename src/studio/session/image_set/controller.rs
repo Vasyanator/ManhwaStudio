@@ -46,6 +46,7 @@ cleaning and PS-editor canvas gates check on top of `layer_id_at`.
 use super::dialogs::{JpegOptionsChoice, draw_folder_overwrite_dialog, draw_jpeg_options_dialog, draw_skipped_notice};
 use super::machine::{Commit, FormatNote, Next, PageJob, PageResult, PageSource, SaveError, SaveMachine, SaveTarget, Status, Step, changed_name_needs_confirmation, save_as_filter_extensions, save_as_suggestion};
 use super::{SaveOutcome, SaveParts, image_window_title};
+use crate::studio::session::DeferredTabEdits;
 use crate::studio::PendingCloseAction;
 use crate::models::autosave_gate::AutosaveGate;
 use crate::project::{ProjectData, SessionKind, SingleImageSession};
@@ -760,11 +761,12 @@ fn edit_stamp(gate: &AutosaveGate, typing: &TypingTabState) -> u64 {
     gate.action_count().wrapping_add(typing.mask_edit_count())
 }
 
-/// An edit already changed the image but is not yet counted by [`edit_stamp`]: typing's deferred
-/// text-layer writes, or a PS-editor document edit whose persistence (and `note_action`) waits for
-/// the next flush. A save stage's first dispatch flushes both before the baseline is captured.
+/// An edit already changed the image but is not yet counted by [`edit_stamp`] (its persistence,
+/// and with it `note_action`, waits for the next flush). Which tabs hold such edits is decided by
+/// the session-wide owner [`DeferredTabEdits`], shared with the project's dirty check. A save
+/// stage's first dispatch flushes them before the baseline is captured.
 fn deferred_edits(typing: &TypingTabState, ps_editor: &PsEditorTabState) -> bool {
-    typing.has_pending_text_edits() || ps_editor.has_deferred_layer_edits()
+    DeferredTabEdits::of(typing, ps_editor).any()
 }
 
 /// Two save steps of one frame (a deferred format-panel close, the pickers, a stop and the write

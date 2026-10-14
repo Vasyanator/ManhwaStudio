@@ -11,7 +11,7 @@ This directory is the crate root of `ms-tab-cleaning`, re-exported by the binary
 `crate::tabs::cleaning::…` path stays valid. Layer: the TOP of the library stack — above
 `ms-canvas` / `ms-models` / `ms-tools` / `ms-widgets`, the level-0 `ms-raster` (square
 dilation), `ms-ai-api` (the cloud image-edit layer of «ИИ редактирование (API)») and
-`ms-tab-translation` (backend health, the text detector and the MT service), and below only `studio.rs`, which calls
+`ms-tab-translation` (the text detector and the MT service), `ms-local-ai` (backend health), and below only `studio.rs`, which calls
 `CleaningTabState::draw`. It must never name `studio` or `launcher`. There is NO dependency on
 `ms-tab-typing`: the only thing shared with it is the atomic document-write RECIPE that
 `tools/watermark_library.rs` reimplements, because that crate's `panel/doc_store.rs` is
@@ -52,7 +52,7 @@ plus the run/apply/cancel row and the frame's status line) and «Библиот�
 (`cleaning.watermark_library`: `CleaningTool::draw_library_panel`, a SECOND tool-owned panel — for
 the watermark tool that is the management screen of its on-disk library). Its default arrangement
 is `cleaning_default_dock_layout` — seven panels,
-handed to the dock both by `studio.rs::restore_panel_dock` and by `ensure_default_layout`. A tab body cannot mutate the tab: the
+handed to the dock both through `StudioTab::default_dock_layout` (restored by the studio's `restore_panel_dock`) and by `ensure_default_layout`. A tab body cannot mutate the tab: the
 dock runs inside `CanvasView::draw`, so a body only raises a flag on `CleaningDockOut` and
 `CleaningTabState::apply_dock_out` performs every mutation after that call returns, in the order the
 three floating surfaces these tabs replaced performed theirs. The dock state is NOT owned here: it is
@@ -104,8 +104,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   same owner the page manager uses), one scan at a time with an epoch that drops superseded
   replies. Rescans: the first draw, every entry into the tab (a gap in
   `Context::cumulative_frame_nr` between draws — so a return from the page manager counts), and
-  `CleaningTabState::request_orphan_clean_rescan`, which `studio.rs` calls after a successful
-  «Сохранить проект». Message selection is the pure, unit-tested
+  `CleaningTabState::request_orphan_clean_rescan`, which the studio reaches through
+  `StudioTab::on_committed_tree_changed` after a successful «Сохранить проект». Message selection is the pure, unit-tested
   `select_clean_status_messages`. Dismissals are session-only and never persisted.
 - `watermark_chapter.rs`: GUI-free chapter-level watermark decomposition engine — the exact,
   AI-free counterpart of the neural watermark path. A semi-transparent mark composites as
@@ -137,6 +137,11 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   inpaint tools (`tools/aot.rs`, FLUX.1 Fill in `tools/flux_fill.rs`), and the watermark tool that hosts the chapter-decomposition UI plus its on-disk
   watermark library, the library management panel and the reference-crop intake that builds an
   entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.
+- `studio_tab.rs`: `impl ms_studio_tab::StudioTab for CleaningTabState` — the studio root's
+  order-free per-tab hooks: the three canvas-zoom hotkeys (`cleaning.canvas.zoom_in` / `_out` /
+  `_reset`, persistence keys, registered in that order and refused while the active tool blocks
+  canvas zoom), the dock builder, GPU eviction (canvas clean overlay, then detector-mask textures),
+  the canvas source-page window / NEAREST sampling, and the committed-tree rescan.
 - `lib.rs`: module wiring and public re-export of `CleaningTabState`.
 
 ## Contracts and invariants
@@ -272,8 +277,10 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `cleaning_default_dock_layout` is dropped from the user's stored arrangement on every load, so
   adding a dock tab here means adding it to that builder too. It is this tab's OWN builder — every
   canvas program tab has one, there is no shared ribbon-only builder to fall back on — and
-  it is registered under `AppTab::Cleaning.key()` in `studio.rs::restore_panel_dock` as well; a builder
+  it is registered under `AppTab::Cleaning.key()` through `StudioTab::default_dock_layout` as well; a builder
   wired in only one of the two places silently resets the stored arrangement.
+  `StudioTab::default_dock_layout` (`studio_tab.rs`) returns that same `fn` item, and its crate test
+  checks both the identity and that the layout names every declared dock tab.
 - A dock tab body runs INSIDE `CanvasView::draw`. It edits the state its own widgets own — the
   active tool's UI mutates that tool, exactly as it did inside the tool window — but it may not
   perform, or invalidate the inputs of, anything the tab defers: the canvas' overlay edits, the job
@@ -350,6 +357,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   threshold.
 - To change what the «Клин» status area reports, when it rescans, or how a message looks, edit
   `clean_status.rs`; the classification of a clean file itself belongs to `ms_models::clean_assign`.
+- To change this tab's hotkeys, its GPU eviction, or any other studio-root hook, edit
+  `studio_tab.rs`; hotkey ids are persisted user bindings and must never be renamed.
 - To change brush, stamp, inpaint, or fill behavior, edit the relevant file under `tools/`.
 - To change text-mask loading or tiled mask drawing, start in `tab.rs` and check
   `TextMaskModel` contracts in `crates/ms-models/src/`.

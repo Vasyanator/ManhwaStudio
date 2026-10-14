@@ -29,8 +29,8 @@ Main modules:
 
 Why a crate: these four surfaces are needed by the launcher AND by the studio settings
 tab, so neither may own them. They sit ABOVE the primitive layers (`ms-widgets`,
-`ms-config`, `ms-sysprobe`, `ms-backend-ipc`) and depend on exactly one tab crate,
-`ms-tab-translation`, for the backend-health model — the tabs never depend back.
+`ms-config`, `ms-sysprobe`, `ms-backend-ipc`, `ms-local-ai` for the backend-health model and
+the local-AI availability) and depend on no tab crate — the tabs never depend back.
 */
 
 #![warn(clippy::all)]

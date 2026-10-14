@@ -5,23 +5,28 @@ edition = "2024"
 
 # The «Перевод» (translation) tab extracted whole from `src/tabs/translation/`: tab state
 # and canvas hooks, the OCR / text-detector / machine-translation controllers and their
-# workers, the concrete MT backends (Google / Yandex / DeepL / LLM), the push-driven AI
-# backend health model and every subpanel of the tab.
+# workers, the concrete MT backends (Google / Yandex / DeepL / LLM) and every subpanel of
+# the tab.
 #
 # Re-exported by the binary from `src/tabs/mod.rs` as `crate::tabs::translation`, so every
 # existing `crate::tabs::translation::…` call site keeps its path.
 #
 # Layer: near the TOP of the library stack — above the canvas, the models, the widgets,
-# the tooling primitives and `ms-tabs-simple` (it reads character and term note entries
-# for the MT glossary), and below `studio.rs`, `ai_backend_panel.rs`,
-# `ai_backend_supervisor.rs`, the launcher's reline flow and the `cleaning` tab, which all
-# reach into `backend_health` / `text_detector` / `machine_translation`. It must never
-# name `studio`, `launcher` or a tab above it.
+# the tooling primitives, `ms-local-ai` and `ms-tabs-simple` (it reads character and term
+# note entries for the MT glossary), and below `studio.rs` and the `cleaning` tab, which
+# reach into `text_detector` / `machine_translation`. It must never name `studio`,
+# `launcher`, `ms-settings-ui` or a tab above it.
 
 [dependencies]
 # Framed IPC with the Python AI backend: every OCR, detector and health request goes
 # through `shared_client()`; `textdetector` is the forward-only detector wire contract.
 ms-backend-ipc = { path = "../ms-backend-ipc" }
+# The backend health snapshot / probe commands the tab gates AI actions on, and the local-AI
+# availability rule (`--no-ai` + platform, `AiRouteKind::availability`) its OCR and detector
+# routers map onto.
+ms-local-ai = { path = "../ms-local-ai" }
+# The per-tab hook trait the studio root iterates; `host::TranslationTab` implements it.
+ms-studio-tab = { path = "../ms-studio-tab" }
 # The canvas this tab draws pages and bubble overlays into; it implements `CanvasHooks`.
 ms-canvas = { path = "../ms-canvas" }
 # `user_config.json` sections owned by this tab, the `AppTab` enum and the settings

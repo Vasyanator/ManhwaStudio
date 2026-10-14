@@ -45,10 +45,10 @@
 //   the runtime through `local_ai::effective_ai_runtime` (`read_ocr_route_inputs`).
 // ============================================================================
 use ms_backend_ipc::{self as backend_ipc, CallError, CallHandle};
-use crate::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::local_ai::effective_ai_runtime;
-use crate::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
+use ms_local_ai::local_ai::effective_ai_runtime;
+use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use crate::ocr_case_fix;
 use ms_config as config;
 use ms_sysprobe::ai_models;
@@ -1798,7 +1798,7 @@ mod tests {
         ocr_route, ocr_route_availability, ocr_route_kind, ocr_route_needs_backend_warmup,
         parse_ocr_response,
     };
-    use crate::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOffReason, LocalRuntime};
+    use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOffReason, LocalRuntime};
     use ms_platform::{PlatformFeature, Unavailable, UnavailableReason};
     use ms_sysprobe::ai_models::MangaOcrOnnxModel;
     use ms_backend_ipc::protocol;

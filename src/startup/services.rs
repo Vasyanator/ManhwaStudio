@@ -24,7 +24,7 @@ use super::launcher_host;
 use super::seed::{auto_detect_missing_ai_install_type_for_startup, seed_advanced_form_search_from_config, seed_hanging_punctuation_from_config, seed_rotation_ctrl_wheel_from_config, seed_text_language_from_config};
 use crate::args::Cli;
 use crate::{ai_backend_supervisor, config, general_settings_panel, hf_token, launcher, locale_store, runtime_log, storage_mode_job, tabs};
-use ms_tab_translation::local_ai::LocalAiAvailability;
+use ms_local_ai::local_ai::LocalAiAvailability;
 
 /// What the main run takes from the full seeding. Built only by [`init_full`], so holding one
 /// means the whole startup-order contract has run.

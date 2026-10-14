@@ -20,7 +20,7 @@ use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_canvas::CanvasView;
 use ms_project::ProjectData;
-use ms_tab_translation::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 use ms_widgets::WheelSlider;
 use ms_config as config;
 use ms_sysprobe::ai_models;

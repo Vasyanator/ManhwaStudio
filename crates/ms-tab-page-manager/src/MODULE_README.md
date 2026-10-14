@@ -211,6 +211,10 @@ draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerA
   (only an OK link of exactly the page's size). The rules (`resolve_target`,
   `over_page_available`, `clean_request_due`, `reply_is_current`, `same_model_pixels`,
   `newest_job` / `run_viewer_worker`, the camera fit / zoom, texture reuse) are unit-tested.
+- `studio_tab.rs`: `impl ms_studio_tab::StudioTab` — `poll_background` (`poll_clean_events`
+  then `release_hidden_viewer_clean`), `source_page_window` (the viewer page),
+  `wants_nearest_source` (`viewer_wants_nearest_source`) and `on_committed_tree_changed`
+  (`request_clean_rescan`). Not a dock host; no hotkeys; no root-driven GPU eviction.
 - `clean_link.rs`: GUI-free, I/O-free page <-> clean link state (`page_clean_link`, table-tested)
   and the "bind to …" menu split (`bind_targets`: pages without a clean / with one that will be
   replaced) plus `bind_fit` for the as-is mismatch warning.
@@ -386,8 +390,8 @@ draw(ctx, ui, project, page_infos, textures, op_in_progress) -> Vec<PageManagerA
 - Clean jobs carry FILE NAMES and page indices, never GUI-scanned paths: the worker re-resolves
   every file (staged over committed) at execution time.
 - Inventory scans are epoch-tagged (same pattern as the layers scan). Rescan triggers:
-  `notify_pages_changed`, the refresh button, `request_clean_rescan` (the app calls it after a
-  successful save-to-project), tab re-activation (a gap in `ctx.cumulative_frame_nr()` between
+  `notify_pages_changed`, the refresh button, `request_clean_rescan` (the app reaches it through
+  `StudioTab::on_committed_tree_changed` after a successful save-to-project), tab re-activation (a gap in `ctx.cumulative_frame_nr()` between
   two draws), and every finished clean operation (its `Finished` carries the fresh inventory,
   installed when its epoch is still current, in every outcome including partial failure). Every
   install bumps the thumbnail generation (mtime revalidation); a mutating install also

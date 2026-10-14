@@ -36,6 +36,8 @@ and image decode run on an `ms_thread` worker and reach the GUI through an mpsc 
   and re-scans when the interface language changes; pages share one `wiki/images/` tree via
   `../images/...` links, so image sources are normalized lexically. Also mounted by the
   launcher.
+- `studio_tab.rs`: empty `ms_studio_tab::StudioTab` impls for the four tab states; none has
+  an order-free studio hook (the notes refresh is an ordered `AppRequest`).
 
 ## Contracts and invariants
 - No literal user-visible strings: every label goes through `t!` / `tf!` / `tp!`.

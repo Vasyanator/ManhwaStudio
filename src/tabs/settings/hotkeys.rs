@@ -17,6 +17,8 @@ Key functions:
 
 Notes:
 - `Esc` cancels capture mode instead of being assigned as a binding.
+- Whether a command is modifier-only (Ctrl/Alt/Shift buttons instead of key capture) comes
+  from its spec (`default_modifier_only`); this file names no tab's command ids.
 - Persistence is offloaded to a small background thread to avoid sync file IO on the GUI thread.
 */
 
@@ -101,7 +103,7 @@ impl SettingsTabState {
 
             ui.horizontal_wrapped(|ui| {
                 if is_capturing {
-                    if hotkey_requires_modifier_only(&command.id) {
+                    if command_requires_modifier_only(command) {
                         ui.label(t!("settings.hotkeys.capture_modifier_hint"));
                     } else {
                         ui.label(
@@ -241,7 +243,14 @@ impl SettingsTabState {
             return;
         }
 
-        if hotkey_requires_modifier_only(&command_id) {
+        // A modifier-only command is rebound through its Ctrl/Alt/Shift buttons, never by a
+        // captured key: ignore key presses until the user cancels with Esc.
+        let modifier_only = hotkeys_v2
+            .commands()
+            .iter()
+            .find(|command| command.id == command_id)
+            .is_some_and(command_requires_modifier_only);
+        if modifier_only {
             return;
         }
 
@@ -297,12 +306,11 @@ impl SettingsTabState {
     }
 }
 
-fn hotkey_requires_modifier_only(command_id: &str) -> bool {
-    matches!(
-        command_id,
-        crate::tabs::translation::HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE
-            | crate::tabs::translation::HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE
-    )
+/// Whether `command` is bound by a held modifier alone (Ctrl / Alt / Shift) rather than by a key
+/// shortcut. Decided by the command's own spec (`default_modifier_only`), so the settings pane
+/// needs no knowledge of which tab declares such commands.
+fn command_requires_modifier_only(command: &HotkeyCommandV2) -> bool {
+    command.default_modifier_only.is_some()
 }
 
 fn format_scope_v2(scope: HotkeyScopeV2) -> String {
@@ -324,5 +332,46 @@ fn scope_group_title(scope: HotkeyScopeV2) -> String {
         HotkeyScopeV2::Global => t!("settings.hotkeys.global_scope_title").to_string(),
         HotkeyScopeV2::Tab(AppTab::Translation) => t!("settings.hotkeys.translation_scope_title").to_string(),
         HotkeyScopeV2::Tab(tab) => tf!("settings.hotkeys.tab_scope_title", tab = tab.title()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_requires_modifier_only;
+    use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, InputManagerV2};
+    use crate::tabs::AppTab;
+    use crate::tabs::translation::{
+        HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE, HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE,
+        TranslationTabState,
+    };
+
+    /// The spec-derived decision matches the former hard-coded id list: both translation OCR
+    /// selection modes are modifier-only, an ordinary shortcut command is not.
+    #[test]
+    fn modifier_only_follows_the_command_spec() {
+        const NORMAL_ID: &str = "test.settings.normal_shortcut";
+        let mut manager = InputManagerV2::default();
+        for spec in TranslationTabState::hotkey_specs() {
+            manager.register(spec);
+        }
+        manager.register(HotkeySpecV2 {
+            id: NORMAL_ID,
+            title: "normal",
+            section: "Test",
+            default_shortcut: Some(egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::K)),
+            default_modifier_only: None,
+            scope: HotkeyScopeV2::Tab(AppTab::Translation),
+            active_when_input: false,
+        });
+        let requires = |id: &str| {
+            manager
+                .commands()
+                .iter()
+                .find(|command| command.id == id)
+                .map(command_requires_modifier_only)
+        };
+        assert_eq!(requires(HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE), Some(true));
+        assert_eq!(requires(HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE), Some(true));
+        assert_eq!(requires(NORMAL_ID), Some(false));
     }
 }

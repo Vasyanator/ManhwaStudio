@@ -75,9 +75,9 @@ area rect on the page moves that area; an anchor point moves only inside its own
 The canvas owns a collapsible bottom-center keyboard-shortcut hint overlay, drawn centrally in
 `scene.rs::draw_canvas_bottom_hint` right after the floating controls. Content is opt-in per tab:
 the owning tab pushes `Option<CanvasBottomHint>` (label + key rows) every frame via
-`set_bottom_hint`, and `None` hides it. Rows are FIXED, hand-authored, localized pairs (built in
-`studio/tabs.rs::build_translation_hint_rows` / `build_typing_hint_rows` from `canvas.bottom_hint.*` `t!`
-keys), NOT derived from the hotkey registry; rebuilding them per frame re-localizes on a runtime
+`set_bottom_hint`, and `None` hides it. Rows are FIXED, hand-authored, localized pairs (built by
+the owning tab crate from `canvas.bottom_hint.*` `t!` keys: the Translation host's
+`translation_hint_rows`, the typing tab's `typing_hint_rows`), NOT derived from the hotkey registry; rebuilding them per frame re-localizes on a runtime
 language switch. A row may also carry an optional `CanvasHintHelp` (`CanvasHintRow::with_help`):
 a circled "?" (`widgets::HelpHint`) whose hover tooltip shows text, an animation, or both, drawn
 between the label and the keys. `scene.rs::draw_hint_rows_grid` switches to a three-column grid
@@ -390,9 +390,13 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   the ORT SIGILL guard marker written concurrently under the same lock. Its title `settings.json`
   half goes through `ms_docstore::update` for the same reason: the mutator edits only the canvas
   keys, so it cannot revert keys other writers (translation tab, spellcheck words) own.
-  `CanvasView::canvas_snapshot` (pub) is the one owner of the canvas state -> `SharedCanvasSettings`
-  mapping; callers outside the crate (the studio root's comic-type preset and initial model seed)
-  use it instead of spelling the struct literal.
+  It also owns the pure conversions: `canvas_state_from_project` (project `CanvasSettings` ->
+  `CanvasState`: legacy `bubble_type` resolution, enum normalization, no clamping),
+  `shared_settings_from_state` (the one owner of the `CanvasState` -> `SharedCanvasSettings`
+  mapping; `CanvasView::canvas_snapshot` delegates to it) and their composition
+  `shared_canvas_settings_from_project`, the seed of `BubblesModel`'s canvas settings. Callers
+  outside the crate use these instead of spelling either struct literal; a test pins the
+  composition to the studio's former field-by-field seeding.
 - `helpers.rs`: stateless geometry, image, and text helper functions.
 - `pixel_grid.rs`: the ONE per-source-pixel inspection grid, shared with `tabs::ps_editor`
   (`pub(crate)` for that reason). `pixel_grid_spans` is pure geometry (clip-bounded, unit-tested);

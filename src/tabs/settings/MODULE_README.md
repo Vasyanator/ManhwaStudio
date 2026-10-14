@@ -105,7 +105,11 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `crates/ms-project/src/lib.rs::canvas_settings_from_config`.
   Without `SessionCapabilities::project_settings` (a single-image session;
   `SettingsTabState::set_session_capabilities`, pushed once by `StudioApp::new`) it hides the comic-type preset and the project word list: their "project" is the throwaway scratch
-  chapter, and the spellcheck menu loses its project-dictionary target.
+  chapter, and the spellcheck menu loses its project-dictionary target. The comic-type preset
+  writes its fields through `SharedCanvasSettings::apply_comic_type_preset` (`ms-models`), the
+  same owner the studio uses when the comic-type prompt is answered.
+- `studio_tab.rs`: the tab's empty `impl ms_studio_tab::StudioTab` (every hook keeps its no-op
+  default), so the studio's `Tabs` can iterate all ten program tabs.
 - `typesetting/`: "Тайп" pane SUBMODULE (see its own `MODULE_README.md`). `mod.rs` is the
   orchestrator; `font_settings.rs` + `font_properties_window.rs` are the settings-local
   font-administration UI. The pane hosts the app-wide
@@ -147,7 +151,8 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `save_font_name_display_mode` and seeds the widget at construction. All
   blocks are wrapped in collapsed `CollapsingHeader`s.
 - `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
-  `user_config.json` override persistence.
+  `user_config.json` override persistence. Modifier-only commands are recognized from their
+  spec (`default_modifier_only`), never by id.
 
 The AI backend and tutorials sections have no studio-local file: they are rendered inline in
 `mod.rs::draw` through `SharedSettingsPanels::draw`, which forwards to the shared

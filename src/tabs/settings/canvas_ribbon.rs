@@ -102,14 +102,13 @@ impl SettingsTabState {
                         t!("settings.canvas_ribbon.preset_custom_hint"),
                     );
                 }
+                // The preset's fields are written by their one owner
+                // (`SharedCanvasSettings::apply_comic_type_preset`); `Custom` writes nothing.
                 if selected_preset != active_preset
-                    && let Some((aside_compact_mode, separate_pages)) =
-                        selected_preset.canvas_preset()
-                    {
-                        self.canvas_settings.aside_compact_mode = aside_compact_mode.to_string();
-                        self.canvas_settings.separate_pages = separate_pages;
-                        changed = true;
-                    }
+                    && self.canvas_settings.apply_comic_type_preset(selected_preset)
+                {
+                    changed = true;
+                }
                 ui.add_space(8.0);
 
                 ui.horizontal(|ui| {

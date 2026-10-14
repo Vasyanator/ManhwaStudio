@@ -39,6 +39,9 @@ ms-sysprobe = { path = "../ms-sysprobe" }
 # Background loaders (character portraits, note aggregation, wiki markdown parsing) go
 # through the project thread wrapper.
 ms-thread = { path = "../ms-thread" }
+# The studio root's order-free per-tab hook trait (`StudioTab`), implemented (empty) in
+# `studio_tab.rs`. It sits below this crate (its own layer line under `ms-tabs-simple`).
+ms-studio-tab = { path = "../ms-studio-tab" }
 # Localized labels (`t!` / `tf!` / `tp!`, mounted crate-wide in `lib.rs`) plus the active
 # locale tag the wiki uses to pick its per-language document directory.
 ms-i18n = { path = "../ms-i18n" }

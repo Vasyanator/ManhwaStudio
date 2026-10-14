@@ -13,7 +13,7 @@ Main types:
 - `DetectorUnavailable`: why the selected algorithm cannot run; produced only by
   `TextDetectorAlgorithm::availability`, the one owner of the "can detect" decision
   (panel button gate, panel hint and the tab's run-mode check all route through it). Its
-  local-AI half is the shared rule of `crate::local_ai` (`--no-ai` / platform per runtime).
+  local-AI half is the shared rule of `ms_local_ai::local_ai` (`--no-ai` / platform per runtime).
 
 Flow:
 - `draw_text_detector_panel(ui, options, plan_notices, view)`: renders status, options, the
@@ -33,7 +33,7 @@ Flow:
   детектора и режима редактирования маски.
 */
 
-use crate::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
+use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use crate::text_detector::{
     DetectorRoute, TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, TextDetectorRunMode, TextDetectorSuryaOptions,
 };
@@ -623,7 +623,7 @@ mod tests {
         TextDetectorPlanNoticeCache, algorithm_marker, algorithm_requirement, detector_page_size, plan_ctd_size_text,
         plan_notice_text,
     };
-    use crate::local_ai::{LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
+    use ms_local_ai::local_ai::{LocalAiAvailability, LocalAiOff, LocalAiOffReason, LocalRuntime};
     use crate::text_detector::{DetectorRoute, TextDetectorRunMode};
     use ms_models::page_view::{PageImageInfo, SourcePageLoadState};
     use ms_platform::{PlatformFeature, Unavailable, UnavailableReason};

@@ -49,7 +49,8 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
   <- ms-tools
   <- ms-canvas
   <- ms-models / ms-tabs-simple / ms-installer / ms-ai-api
-  <- ms-project / ms-widgets / ms-native-runtime
+  <- ms-studio-tab
+  <- ms-project / ms-widgets / ms-native-runtime / ms-local-ai
   <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration
   <- ms-config / ms-text-render
   <- ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx / ms-platform
@@ -60,7 +61,8 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
 Non-obvious edges: `ms-tools` sits ABOVE `ms-canvas`; `ms-widgets` does NOT depend on
 `ms-models`; `ms-models` depends on `ms-text-render` (layer effects). Tab-to-tab edges exist and
 point down only: page-manager -> ps-editor -> typing; cleaning -> translation -> tabs-simple;
-`ms-settings-ui` and `ms-launcher` also use `ms-tab-translation`. The studio never references
+`ms-settings-ui` depends on no tab crate and `ms-launcher` only on `ms-tabs-simple` (the
+shared wiki view). The studio never references
 `ms-launcher`; only the main window (`src/shell/`) / `web_entry.rs` host it.
 
 **Foundation (levels 0-2)**
@@ -96,7 +98,7 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   library directory (`native_libs`). The only crate naming `rfd` / `arboard`, and the one place JNI is used for
   platform services.
 
-**Core (levels 3-6)**
+**Core (levels 3-7)**
 - `ms-config` — runtime root (`data_dir` / `program_dir`), `user_config` sections and defaults,
   `ConfigSaver`, storage-mode startup, `AppTab`, version formatting.
 - `ms-text-render` — the production text renderer (cosmic-text shaping, vector-first glyph
@@ -116,6 +118,13 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - `ms-widgets` — project widget set (`panel_dock`, `Wheel*`, `AiButton`, spellchecked edits),
   `ui_fonts`, hotkey registry (`InputManagerV2`).
 - `ms-native-runtime` — process-global native ONNX manager (sessions, LRU, crash guard).
+- `ms-local-ai` — GUI-free local-AI facts: `local_ai` (which local runtimes the process may use:
+  `--no-ai` + platform, the route-availability rule, the effective runtime) and
+  `backend_health` (push-driven backend health snapshot, probe thread, device control).
+- `ms-studio-tab` — the `StudioTab` trait: order-free per-tab hooks (hotkeys, dock default
+  layout, GPU eviction, source-page window, background poll, exit settings, teardown store
+  flush, committed-tree change) that every tab implements and the studio root iterates. Draw
+  and ordered sequences stay explicit in the root.
 - `ms-models` — shared cross-tab state (`BubblesModel`, `CleanOverlaysModel`, `TextMaskModel`,
   `layer_model::LayerDoc`, `page_view`, `AutosaveGate`, `clean_assign`). Holds egui data types
   but never takes `Ui` / `Painter`.
@@ -134,7 +143,7 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   only inside the mask. The size VALIDITY decision stays with the cleaning frame
   (`region_edit_v2::geometry`); `image_edit` carries rule data mapped 1:1 onto it.
 
-**UI engines and tabs (levels 7-11)**
+**UI engines and tabs (levels 8-12)**
 - `ms-canvas` — the shared page + bubble canvas; declares `CanvasHooks`.
 - `ms-tools` — raster tool primitives (mask brush, polygon spans, SOR kernel, `patch` core).
 - `ms-tab-typing`, `ms-tab-translation`, `ms-tab-cleaning`, `ms-tab-ps-editor`,
@@ -283,8 +292,10 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   menu point, long-press-then-drag selection handed to the active mode via
   `CanvasView::set_long_press_selection` / `touch_selection`). Mouse and pen (Android stylus is
   routed as a mouse by the winit fork) keep tool behaviour.
-- **Hotkeys:** `ms_widgets::InputManagerV2` (code-declared specs, user overrides in
-  `user_config` -> `Hotkeys`), dispatched by `StudioApp` per active tab.
+- **Hotkeys:** `ms_widgets::InputManagerV2`: specs declared by each tab
+  (`ms_studio_tab::StudioTab::hotkey_specs`) plus the session's own, user overrides in
+  `user_config` -> `Hotkeys`; `StudioApp` runs the session's ids and hands every other one to
+  the active tab (`StudioTab::execute_hotkey`).
 
 ## 6. Canvas
 
@@ -310,7 +321,10 @@ Detail: `crates/ms-canvas/src/MODULE_README.md`.
 
 `AppTab` (`crates/ms-config/src/app_tab.rs`) fixes order and persistence ids. `StudioApp` owns
 every tab state, lends it shared models, textures and the panel dock each frame, and executes
-the actions tabs return. Canvas tabs implement `CanvasHooks`; the others draw their own UI.
+the actions tabs return. Canvas tabs implement `CanvasHooks` and own their canvas; the others
+draw their own UI. Every tab answers the root's order-free questions (hotkeys, dock host, GPU
+eviction, page window, background poll, exit settings, teardown store flush, committed-tree
+change) through `ms_studio_tab::StudioTab`; drawing and every ordered sequence stay explicit.
 
 - **Page Manager** — `ms-tab-page-manager` (+ engine `ms-page-ops`): page grid, clean cards,
   full-resolution viewer. Returns `PageManagerAction` (structural op, open page in a tab).
@@ -321,8 +335,9 @@ the actions tabs return. Canvas tabs implement `CanvasHooks`; the others draw th
   Save,
   export and page ops gate each other.
 - **Translation** — `ms-tab-translation`: bubbles, OCR, text detection, machine translation
-  (AI API OCR and MT go through `ms-ai-api`).
-  Talks to the backend only through `ms-backend-ipc`; owns the backend health probe.
+  (AI API OCR and MT go through `ms-ai-api`). Its host `TranslationTab` owns the Translation
+  canvas, its hotkeys and its bottom hint.
+  Talks to the backend only through `ms-backend-ipc`; reads the pushed backend health snapshot (`ms_local_ai::backend_health`).
 - **Cleaning** — `ms-tab-cleaning`: clean overlays, brush / region tools, two region-edit tools
   on ONE generic host (`tools/region_edit_v2`: `RegionEditHost` + `HostSpec`, engines behind
   `AiEngine`) — the local AI region editor (`tools/ai_editor`) and the cloud «ИИ редактирование
@@ -364,11 +379,11 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   On Android the native runtime loads the onnxruntime library bundled in the APK (official
   `onnxruntime-android` AAR; `bundled` rows of `ort_manifest.json`, located through
   `ms_platform::native_libs`); builds `cpu` and `xnnpack` (default), nothing is downloaded.
-  `ms_tab_translation::local_ai::effective_ai_runtime` picks the effective one: native unless the
+  `ms_local_ai::local_ai::effective_ai_runtime` picks the effective one: native unless the
   user explicitly chose the backend (`General.ai_runtime_configured`) on a platform that has it.
   `--no-ai` turns off the LOCAL runtimes only (backend and native ONNX); cloud AI API OCR / MT and
   non-AI machine translation are never gated by it. Per-route availability has one owner,
-  `local_ai::AiRouteKind::availability` (cloud / native / backend).
+  `ms_local_ai::local_ai::AiRouteKind::availability` (cloud / native / backend).
 - **Backend boundary.** Framed, multiplexed IPC (`ms-backend-ipc`): AF_UNIX socket on unix,
   token-authenticated loopback WebSocket on Windows. Every Rust caller uses
   `ms_backend_ipc::shared_client()`. Method and topic names live in
@@ -377,7 +392,7 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   gate, compared in the `hello` handshake; it also covers the on-disk `user_config` semantics.
 - **Process ownership.** One app-global supervisor (`ms_settings_ui::ai_backend_supervisor`)
   starts and stops the backend for studio and launcher; autostart waits for storage-mode
-  conversions. `ms_tab_translation::backend_health` keeps the pushed health snapshot that AI
+  conversions. `ms_local_ai::backend_health` keeps the pushed health snapshot that AI
   actions (`AiButton`) gate on.
 - **Backend package.** `server.py` is the composition root; handlers reach services only through
   `AppState` fields (their names are contract). Dependency direction: domains (`ocr`,
@@ -456,7 +471,8 @@ logged error); the GUI thread only polls and applies results.
 | Bubble and layer persistence (coalescing savers) | `ms-models` (`bubbles_model.rs`, `layer_model/saver.rs`) |
 | Clean overlay autosave, canvas settings saver, overlay tile prepare | `ms-canvas/src/workers.rs` |
 | Config sections `Window` / `PanelLayout` | `ms-config::config_saver` |
-| OCR, text detection, MT, crop recognition, backend health | `ms-tab-translation` |
+| OCR, text detection, MT, crop recognition | `ms-tab-translation` |
+| Backend health snapshot (pushed by the supervisor's probe) | `ms-local-ai` (`backend_health`), probe thread in `ms-settings-ui/src/ai_backend_supervisor.rs` |
 | Text detection plan / tiles / stitch / postprocess (one plan for worker and panel notice) | `ms-text-detect`, driven by `ms-tab-translation/src/text_detector/` |
 | Native ONNX load and inference | `ms-native-runtime` (called from those workers) |
 | AI backend process supervisor | `ms-settings-ui/src/ai_backend_supervisor.rs` |

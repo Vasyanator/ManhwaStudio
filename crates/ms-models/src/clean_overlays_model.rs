@@ -414,6 +414,11 @@ impl CleanOverlaysModel {
         out
     }
 
+    /// The canvas "cache pages" setting. This model is its runtime owner: the studio seeds it at
+    /// open, Settings and the canvases write it through [`Self::set_cache_pages_enabled`], and the
+    /// studio's page-cache loader reads it here (never from one canvas's copy, which refreshes only
+    /// while that canvas draws).
+    #[must_use]
     pub fn cache_pages_enabled(&self) -> bool {
         self.cache_pages_enabled
     }

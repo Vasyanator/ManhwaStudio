@@ -32,7 +32,7 @@ use web_time::Instant;
 /// [`DetectorRoute::Backend`] when the config cannot be read.
 pub(super) fn current_detector_route() -> DetectorRoute {
     let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
-    let runtime = crate::local_ai::effective_ai_runtime(&cfg);
+    let runtime = ms_local_ai::local_ai::effective_ai_runtime(&cfg);
     let scope = native_runtime::native_load_scope_key();
     let decision = config::ort_load_decision(config::read_ort_load_guard(&cfg, &scope));
     detector_native_route(runtime, decision)

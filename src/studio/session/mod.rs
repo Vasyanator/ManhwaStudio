@@ -11,13 +11,16 @@ Key structures:
 - `SessionMode`: `Project(ProjectSession)` | `ImageSet(Box<ImageSetSession>)`.
 - `SessionParts`: the `StudioApp` parts a session flow borrows for one call (project, staging
   writers, close intent, the tab states it flushes or notifies).
+- `DeferredTabEdits`: the ONE answer to "do the tabs hold edits not yet handed to a staging
+  writer" (typing's deferred text edits, the PS editor's deferred layer edits), read by both
+  session kinds' dirty checks.
 
 Key functions:
 - `SessionMode::from_project`: the one constructor (and the one session-kind decision in `src/studio`).
 - Dispatch: `has_unsaved_changes`, `tab_visible`, `hotkey_specs`, `capabilities` (the tabs' `SessionCapabilities`), `tick`, `draw_top_bar`,
   `draw_exit_dialog`, `draw_dialogs`, `on_save_hotkey`, `start_page_op`, `before_shutdown`, plus
   the project-state queries (`busy_jobs`, `exit_cleanup_action`, `take_reload_request`,
-  `note_unsaved`), which answer "nothing" for an image set; `take_title` (image set only); `os_close_policy` (a second OS close
+  `take_committed_tree_changed`, `note_unsaved`), which answer "nothing" for an image set; `take_title` (image set only); `os_close_policy` (a second OS close
   over the exit dialog: a project exits, an image set keeps the dialog).
 
 Notes:
@@ -69,9 +72,9 @@ pub(in crate::studio) struct SessionParts<'a> {
     pub(in crate::studio) translation_canvas: &'a mut CanvasView,
     /// The tab the user is on: its canvas (if any) is flushed LAST by `flush_canvas_bubble_edits`.
     pub(in crate::studio) active_tab: AppTab,
-    /// Told to rescan its clean-folder status after a merge; owns the cleaning canvas.
+    /// Owns the cleaning canvas (flushed by `flush_canvas_bubble_edits`).
     pub(in crate::studio) cleaning: &'a mut CleaningTabState,
-    /// Its clean-op flag gates saves and page ops; told to rescan its clean cards after a merge.
+    /// Its clean-op flag gates saves and page ops.
     pub(in crate::studio) page_manager: &'a mut PageManagerTabState,
 }
 
@@ -89,6 +92,50 @@ impl SessionParts<'_> {
         let project = self.project;
         for_each_canvas_mut(self.translation_canvas, self.cleaning, self.typing, canvas_slot(self.active_tab), |_, canvas| canvas.flush_all_bubble_edits_now(project));
     }
+}
+
+/// Edits a tab already applied to the session's shared state (or its own view of it) but has not
+/// handed to a staging writer yet, so neither the staging-dir probe nor the autosave gate's action
+/// count can see them. The ONE owner of which tabs hold such edits; both session kinds' dirty
+/// checks read it. Every term is cleared by its tab's flush, which every persistence point runs
+/// (save, page op, image-set save stage, non-discard teardown, tab leave).
+///
+/// Considered and NOT terms: canvas bubble edits (`ms-canvas` exposes no "pending" query; every
+/// persistence point, the non-discard teardown included, flushes them into the bubbles model, so
+/// they are not lost, but a close may not see them as unsaved), typing's clip-mask edits
+/// (written outside the gated writers; the image set counts them through its edit stamp) and the
+/// typing font / preset stores (user-global documents, not session state).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::studio) struct DeferredTabEdits {
+    /// Typing's deferred text-layer writes or an unsettled layer move
+    /// (`TypingTabState::has_pending_text_edits`).
+    pub(in crate::studio) typing_text: bool,
+    /// A PS-editor document edit (visibility / opacity / collapse through `edit_doc_node`) whose
+    /// page persist waits for the next flush (`PsEditorTabState::has_deferred_layer_edits`).
+    pub(in crate::studio) ps_layers: bool,
+}
+
+impl DeferredTabEdits {
+    /// Reads both tabs' deferred-edit flags (no lock, no I/O).
+    #[must_use]
+    pub(in crate::studio) fn of(typing: &TypingTabState, ps_editor: &PsEditorTabState) -> Self {
+        Self { typing_text: typing.has_pending_text_edits(), ps_layers: ps_editor.has_deferred_layer_edits() }
+    }
+
+    /// Whether any tab holds a deferred edit.
+    #[must_use]
+    pub(in crate::studio) const fn any(self) -> bool {
+        self.typing_text || self.ps_layers
+    }
+}
+
+/// A project session's "unsaved" answer: the sticky cached flag (`ProjectSession`, refreshed about
+/// once a second), or a deferred tab edit right now — so a close within that second of a PS or
+/// typing edit still opens the exit dialog. A deferred edit does not count while the DISCARD latch
+/// is set: the discard dropped (typing) or will never flush (PS) it.
+#[must_use]
+const fn project_has_unsaved_changes(cached: bool, discarding: bool, deferred: DeferredTabEdits) -> bool {
+    cached || (!discarding && deferred.any())
 }
 
 /// The session strategy of one `StudioApp` (see the file header). Built once; the kind never changes
@@ -132,12 +179,13 @@ impl SessionMode {
     }
 
     /// Whether the session has changes the user would lose by closing. Project: the cached
-    /// unsaved flag. Image set: the image differs from its last write or a write is in flight;
-    /// never while the DISCARD latch is set (the window is closing without saving).
+    /// unsaved flag, or a deferred tab edit right now ([`project_has_unsaved_changes`]). Image set:
+    /// the image differs from its last write (deferred tab edits included) or a write is in
+    /// flight; never while the DISCARD latch is set (the window is closing without saving).
     #[must_use]
     pub(in crate::studio) fn has_unsaved_changes(&self, writers: &StagingWriters, typing: &TypingTabState, ps_editor: &PsEditorTabState) -> bool {
         match self {
-            Self::Project(project) => project.has_unsaved_changes(),
+            Self::Project(project) => project_has_unsaved_changes(project.has_unsaved_changes(), writers.is_discarding(), DeferredTabEdits::of(typing, ps_editor)),
             Self::ImageSet(image_set) => !writers.is_discarding() && (image_set.is_dirty(writers.gate(), typing, ps_editor) || image_set.write_in_flight()),
         }
     }
@@ -183,6 +231,17 @@ impl SessionMode {
     pub(in crate::studio) fn take_reload_request(&mut self) -> bool {
         match self {
             Self::Project(project) => project.take_reload_request(),
+            Self::ImageSet(_) => false,
+        }
+    }
+
+    /// Returns and clears "the committed chapter tree changed" (a project's save-to-project merge
+    /// succeeded during `tick`). `StudioApp::ui` drains it right after `tick`, in the same frame
+    /// and before any tab draws, and tells every tab (`StudioTab::on_committed_tree_changed`).
+    /// Never set for an image set (it has no committed tree to merge into).
+    pub(in crate::studio) fn take_committed_tree_changed(&mut self) -> bool {
+        match self {
+            Self::Project(project) => project.take_committed_tree_changed(),
             Self::ImageSet(_) => false,
         }
     }
@@ -355,7 +414,7 @@ fn apply_image_set_outcome(image_set: &mut ImageSetSession, outcome: Option<Save
 
 #[cfg(test)]
 mod tests {
-    use super::{OsClosePolicy, SessionCapabilities, SessionMode, StagingWriters};
+    use super::{DeferredTabEdits, OsClosePolicy, SessionCapabilities, SessionMode, StagingWriters, project_has_unsaved_changes};
     use crate::studio::busy::PersistenceJobs;
     use crate::models::autosave_gate::AutosaveGate;
     use crate::models::bubbles_model::BubblesModel;
@@ -382,6 +441,36 @@ mod tests {
         let bubbles_model = Arc::new(Mutex::new(BubblesModel::new(Vec::new(), dir.join("bubbles"), dir.join("unsaved_bubbles"), Default::default(), Some(Arc::clone(gate)))));
         let clean_overlays_model = Arc::new(Mutex::new(CleanOverlaysModel::new_from_pages(&[])));
         StagingWriters::spawn(Arc::clone(gate), &layer_doc, &bubbles_model, &clean_overlays_model, dir.join("unsaved_clean_layers"))
+    }
+
+    /// Either tab's deferred edit alone counts (the PS-only case is the one the project dirty check
+    /// used to miss); fresh tabs hold none.
+    #[test]
+    fn any_single_deferred_tab_edit_counts() {
+        assert!(!DeferredTabEdits::default().any());
+        assert!(DeferredTabEdits { typing_text: true, ps_layers: false }.any());
+        assert!(DeferredTabEdits { typing_text: false, ps_layers: true }.any(), "a PS-only deferred layer edit is unsaved work");
+        assert!(DeferredTabEdits { typing_text: true, ps_layers: true }.any());
+        assert_eq!(DeferredTabEdits::of(&TypingTabState::default(), &PsEditorTabState::default()), DeferredTabEdits::default());
+    }
+
+    /// The project's answer: the cached flag always wins; a deferred tab edit counts live, but not
+    /// while the DISCARD latch is set.
+    #[test]
+    fn project_unsaved_is_cached_flag_or_live_deferred_edit_outside_discard() {
+        let none = DeferredTabEdits::default();
+        let ps_only = DeferredTabEdits { typing_text: false, ps_layers: true };
+        let typing_only = DeferredTabEdits { typing_text: true, ps_layers: false };
+        for discarding in [false, true] {
+            for deferred in [none, ps_only, typing_only] {
+                assert!(project_has_unsaved_changes(true, discarding, deferred), "the cached flag is sticky");
+            }
+            assert!(!project_has_unsaved_changes(false, discarding, none));
+        }
+        assert!(project_has_unsaved_changes(false, false, ps_only), "a PS edit the cache has not latched yet still asks");
+        assert!(project_has_unsaved_changes(false, false, typing_only));
+        assert!(!project_has_unsaved_changes(false, true, ps_only), "a discard dropped / never flushes the deferred edit");
+        assert!(!project_has_unsaved_changes(false, true, typing_only));
     }
 
     /// A project chapter (one page, no staging dir) builds a project session that shows every tab,

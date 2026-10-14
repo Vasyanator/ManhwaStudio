@@ -31,6 +31,9 @@ ms-models = { path = "../ms-models" }
 ms-page-ops = { path = "../ms-page-ops" }
 # The chapter domain model the grid enumerates pages from.
 ms-project = { path = "../ms-project" }
+# The studio root's order-free per-tab hook trait (`StudioTab`), implemented in
+# `studio_tab.rs`. It sits below this crate (its own layer line under the tab crates).
+ms-studio-tab = { path = "../ms-studio-tab" }
 # The PS editor's pan/zoom viewport camera, reused by the crop / split / stitch previews.
 ms-tab-ps-editor = { path = "../ms-tab-ps-editor" }
 # The thumbnail decode / `layers.json` scan workers go through the project thread wrapper.

@@ -23,7 +23,8 @@ Three layers, all pure except the middle one:
 3. Policy — `classify_memory_pressure()` turns availability + profile into a
    `MemoryPressure`, `MemoryBudget` derives per-profile limits, and
    `select_eviction_candidates()` orders `CacheResourceInfo` entries into a
-   `CacheEvictionReport`. All pure functions with unit tests.
+   `CacheEvictionReport`. All pure functions with unit tests. `CacheEvictionReport::append`
+  is the one place per-owner reports are summed (saturating byte total, resources in order).
 
 ## Files and submodules
 - `lib.rs`: everything above. Edit the profile enum for a new user-facing profile, the

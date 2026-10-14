@@ -238,8 +238,8 @@ use ms_tabs_simple::characters::load_character_names;
 use crate::adv_rec::{
     AdvancedRecognitionAction, AdvancedRecognitionSelection, AdvancedRecognitionWindow,
 };
-use crate::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand, paddle_vl_ready_for};
-use crate::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
+use ms_local_ai::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand, paddle_vl_ready_for};
+use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use crate::machine_translation::{
     AiMtContextSource, AiMtImageDetail, AiMtImageMode, AiMtOptions, AiMtReasoning, AiMtSortMode,
     MtControllerEvent, MtImageArea, MtImageInput, MtImageSource, MtRequestPreview,

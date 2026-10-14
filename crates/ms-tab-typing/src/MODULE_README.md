@@ -101,7 +101,7 @@ will drop that tab on every load.
 Any of these tabs can be pulled out into a real OS window (`widgets::panel_dock::window`). Such a
 window is an immediate child viewport and therefore exists only while it is SHOWN every frame —
 which `PanelDock::end` does only while a dock-hosting program tab draws. `StudioApp::ui` shows them
-on every other frame (`show_idle_sub_windows`, gated on `tab_hosts_panel_dock`), so the user's
+on every other frame (`show_idle_sub_windows`, gated on the drawn tab's `StudioTab::default_dock_layout`), so the user's
 detached windows survive a tab switch (empty and grey, by the user's decision). Exactly one of the
 two per frame, or the viewport would be shown twice in one pass.
 
@@ -427,6 +427,12 @@ saving, and export.
   fields directly; moved methods/free-fns are `pub(super)` (or `pub(crate)`
   when a typing-level sibling like `panel.rs`/`psd_export.rs` calls them).
 - `tab/` submodules (each an `impl TypingTextOverlayLayer` method group and/or free-fn slab):
+  - `studio_tab.rs`: `impl ms_studio_tab::StudioTab for TypingTabState` — the studio root's
+    order-free per-tab hooks: dock builder, GPU eviction (canvas clean overlay, then the tab's own
+    `evict_gpu_caches`), canvas source-page window / NEAREST sampling, the exit-only settings
+    writer and the teardown flush of the two debounced user-global stores (per-font settings, then
+    the default local-preset set). Also owns the exit-only `user_config` keys
+    (`load_exit_settings`) and the bottom-hint rows (`typing_hint_rows`) that `draw` sets every frame.
   - `doc_layers.rs`: shared `LayerDoc` sync, unified band-Z ordering, raster-layer projection, and the
     async whole-project page **preloader** (`all_pages_loaded` / `begin_preload_all_pages` /
     `preload_all_pages_active` / `preload_all_pages_progress` / `drive_page_preload`).
@@ -1313,9 +1319,10 @@ saving, and export.
   the guide frame, corner handles, binding/reconciliation, and renderer center computation stay governed
   by `centering_assist_enabled` alone. PERSISTENCE: `centering_assist_enabled` and `centering_show_center`
   persist in `user_config.json` under `TextTab` (keys `centering_assist_enabled`, `centering_show_center`),
-  seeded ONCE in `StudioApp::new` (via `TypingTabState::set_centering_assist_persisted_state`) and written
-  ONCE in `StudioApp::on_exit` (`persist_typing_centering_assist_state` → `config::update_user_config_file`,
-  the canonical locked RMW; enabled defaults absent→false, show-center absent→true). `centering_assist_kind`
+  seeded ONCE at construction (`TypingTabState::load_exit_settings`) and written ONCE at teardown
+  (`StudioTab::write_exit_settings`, run inside the root's one locked `user_config` RMW); both live in
+  `tab/studio_tab.rs` with `Canvas.typing_hint_collapsed` (enabled defaults absent→false, show-center
+  absent→true, hint collapsed absent→false). `centering_assist_kind`
   stays SESSION-ONLY (not persisted). When enabled, the
   production text renders request BOTH renderer centers (`RenderExtraInfoRequest`) at the five dispatch
   sites landing in the live overlay runtime (create, edit, vector re-render / Ctrl+wheel / width drag,
@@ -1540,6 +1547,9 @@ saving, and export.
   from inside that draw must follow the "apply after the paint pass" rule above — never `return` before
   the fill pass.
 - To change background render/save jobs, edit `tab/render_jobs.rs` / `tab/persist.rs`.
+- To change a studio-root hook (eviction, exit-only settings, teardown store flush, dock builder) or the
+  bottom-hint rows, edit `tab/studio_tab.rs`; the exit-only keys and their defaults are persisted user
+  data and must not change.
 - To change deform-mesh math or hit-testing, edit `tab/mesh_geometry.rs`.
 - To change the on-canvas VECTOR transform (seed/interaction/settle/reset), edit `tab/vector_transform.rs`;
   its pure page-px<->normalized conversions and the layout-gating predicate live in `tab/mesh_geometry.rs`.

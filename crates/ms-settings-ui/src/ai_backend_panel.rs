@@ -53,7 +53,7 @@ use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::settings_warnings::item_warning_badge;
 use ms_backend_ipc as backend_ipc;
-use ms_tab_translation::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
+use ms_local_ai::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
 use ms_widgets::WheelComboBox;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::onnx_caps::{OnnxCaps, device_id_offered, ep_device_ids, probe_onnx_caps};
@@ -62,7 +62,7 @@ use ms_onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
 #[cfg(not(target_arch = "wasm32"))]
 use ms_native_runtime::ort_provider_token;
 #[cfg(not(target_arch = "wasm32"))]
-use ms_tab_translation::backend_health::AiBackendDeviceOption;
+use ms_local_ai::backend_health::AiBackendDeviceOption;
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
@@ -2356,7 +2356,7 @@ fn draw_ai_runtime_section(
                     .unwrap_or(serde_json::Value::Null);
                 // The effective runtime: a stored `Backend` reads as `Native` where the
                 // platform has no Python backend (the same helper every router uses).
-                let runtime = ms_tab_translation::local_ai::effective_ai_runtime(&cfg);
+                let runtime = ms_local_ai::local_ai::effective_ai_runtime(&cfg);
                 if let Ok(mut guard) = slot.lock() {
                     *guard = Some(runtime);
                 }
@@ -2497,7 +2497,7 @@ mod tests {
         native_device_ep, ort_build_action, partition_builds, provider_runtime_state, report_landed,
     };
     use ms_config::AiRuntime;
-    use ms_tab_translation::backend_health::AiBackendDeviceOption;
+    use ms_local_ai::backend_health::AiBackendDeviceOption;
     use std::collections::HashMap;
 
     /// An offline backend (no reported providers): the union collapses to the

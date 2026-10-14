@@ -9,8 +9,8 @@ edition = "2024"
 # Neither shell may own them, so they live here.
 #
 # Layer position: above the primitives (`ms-widgets`, `ms-config`, `ms-sysprobe`,
-# `ms-backend-ipc`) and above exactly one tab crate (`ms-tab-translation`, for the
-# backend-health model). Nothing in the tabs depends back on this crate.
+# `ms-backend-ipc`, `ms-local-ai` for the backend-health model) and above NO tab crate.
+# Nothing in the tabs depends back on this crate.
 [features]
 # In-app onboarding tutorial. Off by default and forwarded from the ROOT crate's feature
 # of the same name (`tutorial = ["ms-settings-ui/tutorial"]`) — features are NOT inherited,
@@ -44,8 +44,9 @@ ms-backend-ipc = { path = "../ms-backend-ipc" }
 # `gpu_utils` (accelerator list of the AI pane) and `ai_backend_capabilities`.
 ms-sysprobe = { path = "../ms-sysprobe" }
 # `backend_health` — the health snapshot / probe-command model of the AI pane and the
-# supervisor. The ONLY tab crate this one depends on; the dependency never points back.
-ms-tab-translation = { path = "../ms-tab-translation" }
+# supervisor; `local_ai` — the process's local-AI availability and the effective runtime.
+# A GUI-free crate below every tab: this crate depends on no tab crate.
+ms-local-ai = { path = "../ms-local-ai" }
 # The typesetting-language model behind the General pane's language selector.
 ms-text-util = { path = "../ms-text-util" }
 # Named worker threads: no pane may probe, spawn or write on the GUI thread.

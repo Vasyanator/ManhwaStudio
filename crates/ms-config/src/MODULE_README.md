@@ -174,6 +174,10 @@ binary that installs a UI locale). Those crates enable `test-support` from their
 - **The document lock is the only lock of `user_config.json`, and it is NON-reentrant.**
   Inside an `update_user_config_file` mutator, or inside `ms_docstore::with_lock`/`update`
   of a user-config document, never call another user-config writer.
+- **One boolean key under one section has one read/write rule**: `section_bool` /
+  `set_section_bool` (pure; the write runs inside a caller's `update_user_config_file` and
+  replaces a non-object root or section rather than dropping the value). Section names come
+  from `CANVAS_SECTION` / `TEXT_TAB_SECTION`.
 - **Default backfill has one rule, `merge_missing`** (insert absent keys, never replace
   values). Writers outside `JsonConfig` that must produce the same document shape (the
   installer's install-target config) call it instead of copying it.

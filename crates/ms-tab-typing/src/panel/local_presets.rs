@@ -267,16 +267,17 @@ impl TypingCreatePanelState {
     /// Writes a still-owed DEFAULT local-set save immediately, on the CALLING thread.
     /// Returns whether there was anything to flush.
     ///
-    /// This is the app-exit flush (`StudioApp::on_exit`), modelled on
+    /// This is the studio-teardown flush (the typing tab's `StudioTab::flush_debounced_stores_blocking`,
+    /// run by the root's `shutdown_blocking`), modelled on
     /// `font_settings_store::flush_pending_saves`: the debounced writer is a detached thread
     /// that dies with the process, so renaming a local preset and closing the app a second
     /// later used to lose the rename outright.
     ///
-    /// SYNCHRONOUS ON THE GUI THREAD, AND DELIBERATELY SO. This is the one accepted exception
-    /// to the "never block the GUI thread" rule (CLAUDE.md §5), and it is not new: the
-    /// PRE-EXISTING `font_admin::flush_pending_saves` has the identical shape at
-    /// `src/studio.rs:3421`, one step above this one's call site. No GUI frame follows `on_exit`
-    /// and no thread outlives it, so there is no responsiveness left to protect, and the work
+    /// SYNCHRONOUS, AND DELIBERATELY SO. The teardown runs on the main window's Closing-screen
+    /// worker (or in the window's `on_exit` when eframe ends the process with the studio open), and
+    /// the PRE-EXISTING `font_admin::flush_pending_saves` has the identical shape, one step before
+    /// this one in the same hook. No studio frame follows the teardown and no thread outlives it,
+    /// so there is no responsiveness left to protect, and the work
     /// is ONE atomic write of the same small document the debounced writer would have
     /// written. A deadline would not make it safer: it trades a hang the user can see for a
     /// SILENT loss of the edit just made, on exactly the pathological (network/FUSE) fonts

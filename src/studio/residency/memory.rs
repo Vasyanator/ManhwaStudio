@@ -11,8 +11,8 @@ Key structures:
 - `PressureTick`: a due pressure poll that found non-Normal pressure.
 
 Key functions:
-- `PageResidency::trim_gpu`, `PageResidency::poll_pressure`, `PageResidency::evict_for_pressure`.
-- `append_eviction_report`: merges per-owner eviction reports.
+- `PageResidency::trim_gpu`, `PageResidency::poll_pressure`, `PageResidency::evict_for_pressure`
+  (per-owner reports merged with `CacheEvictionReport::append`, their one owner).
 
 Notes:
 Eviction drops only GPU handles; `PageImageInfo` (page geometry) is never evicted, so canvas
@@ -132,7 +132,7 @@ impl PageResidency {
         let mut report = self.evict_source_page_gpu_cache(request);
         match overlays.lock() {
             Ok(mut model) => {
-                append_eviction_report(&mut report, model.evict_cache(request));
+                report.append(model.evict_cache(request));
             }
             Err(_) => runtime_log::log_warn(
                 "[memory] failed to lock CleanOverlaysModel while evicting page cache",
@@ -213,14 +213,6 @@ impl PageResidency {
     }
 }
 
-/// Adds `source` (one cache owner's eviction report) to the running `target` report.
-pub(in crate::studio) fn append_eviction_report(target: &mut CacheEvictionReport, source: CacheEvictionReport) {
-    target.estimated_freed_bytes = target
-        .estimated_freed_bytes
-        .saturating_add(source.estimated_freed_bytes);
-    target.resources.extend(source.resources);
-}
-
 const fn pressure_target_free_bytes(pressure: MemoryPressure) -> u64 {
     match pressure {
         MemoryPressure::Normal => 0,
@@ -232,8 +224,8 @@ const fn pressure_target_free_bytes(pressure: MemoryPressure) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PressureTick, append_eviction_report};
-    use crate::memory_manager::{CacheEvictionReport, MemoryPressure, MemoryProfile};
+    use super::PressureTick;
+    use crate::memory_manager::{MemoryPressure, MemoryProfile};
     use std::collections::BTreeSet;
 
     /// The request keeps the classification's profile and pressure and scales its byte target
@@ -250,12 +242,5 @@ mod tests {
         assert_eq!(hard.target_free_bytes, 768 * 1024 * 1024);
         let critical = PressureTick { profile: MemoryProfile::Minimal, pressure: MemoryPressure::Critical }.eviction_request(BTreeSet::new());
         assert_eq!(critical.target_free_bytes, u64::MAX);
-    }
-
-    #[test]
-    fn appended_reports_saturate_the_freed_bytes() {
-        let mut total = CacheEvictionReport { estimated_freed_bytes: u64::MAX - 1, ..CacheEvictionReport::default() };
-        append_eviction_report(&mut total, CacheEvictionReport { estimated_freed_bytes: 5, ..CacheEvictionReport::default() });
-        assert_eq!(total.estimated_freed_bytes, u64::MAX);
     }
 }

@@ -7,15 +7,23 @@ editing, composed text export, and translation-specific canvas hooks.
 This directory is the crate root of `ms-tab-translation`, re-exported by the binary from
 `src/tabs/mod.rs` as `crate::tabs::translation`, so every existing
 `crate::tabs::translation::…` path stays valid. Layer: near the top of the library stack —
-above `ms-canvas` / `ms-models` / `ms-widgets` / `ms-tools` and `ms-tabs-simple` (character
-and term note entries feed the MT glossary), below `studio.rs`, `ai_backend_panel.rs`,
-`ai_backend_supervisor.rs`, the launcher reline flow and the `cleaning` tab. It must never
-name `studio`, `launcher` or a tab above it. Items reachable from outside the crate
-(`backend_health`, `machine_translation::translate_texts_via_translator`, `text_detector`'s
+above `ms-canvas` / `ms-models` / `ms-widgets` / `ms-tools`, `ms-local-ai` (backend health,
+local-AI availability) and `ms-tabs-simple` (character and term note entries feed the MT
+glossary), below `studio.rs` and the `cleaning` tab. It must never name `studio`, `launcher`,
+`ms-settings-ui` or a tab above it. Items reachable from outside the crate
+(`machine_translation::translate_texts_via_translator`, `text_detector`'s
 mask helpers, `panels::machine_translation::{MtLanguage, MT_SOURCE_LANGUAGES}`) are `pub`
 for that reason and carry a note saying so.
 
 ## Architecture
+`TranslationTab` in `host.rs` is the program tab as the studio root holds it: it owns the tab's
+`CanvasView` and its `TranslationTabState` (so the split borrow `(&mut canvas, &mut state)` the
+canvas draw needs stays inside this crate), draws them (`draw`: bottom-hint rows, lazy settings
+load, side panel, per-frame canvas flags, then the canvas inside the root's `CentralPanel`), and
+implements `ms_studio_tab::StudioTab` — the tab's whole hotkey set and its execution, the dock
+builder, GPU eviction (canvas clean overlay, then detector masks), the source-page window, NEAREST
+sampling and the exit-only `Canvas.translation_hint_collapsed` key.
+
 `TranslationTabState` in `tab.rs` is the tab orchestrator and `CanvasHooks` implementation. It owns
 panel state, controller instances, footer metadata caches, text-detection storage, OCR selection
 state, and debounced settings persistence.
@@ -41,8 +49,8 @@ Long work is delegated to focused controllers:
   runners here only run the forward pass (in-process or over IPC). The inline
   `detect_*_mask_for_image` helpers are the same pipeline reused by Cleaning's mask generation.
   The detector panel announces the current page's plan (resize, tile count) by planning with the
-  same `TextDetectorRunMode::plan_inputs` the worker uses; `studio.rs` lends the page sizes
-  (`page_infos`) through `draw_side_panel`.
+  same `TextDetectorRunMode::plan_inputs` the worker uses; the page sizes the root lends
+  (`page_infos`, `TranslationDrawParams`) reach it through `draw_side_panel`.
   Dilation and Otsu come from `ms-raster` (see `text_detector/MODULE_README.md`).
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
   cancellation, and stale-event filtering.
@@ -66,8 +74,9 @@ Long work is delegated to focused controllers:
   (`ocr_ai_api_tasks`, `mt_ai_api_tasks`), submits the panel's `AiApiConnectionActions` to it and
   applies its events in `poll_ai_api_events` (a model replaced by a refresh marks that panel's
   settings dirty; notices become toasts).
-- `backend_health.rs` owns the shared Python backend probe snapshot used by Translation and
-  Settings.
+- The shared Python backend probe snapshot (`AiBackendHealthSnapshot`) and the local-AI
+  availability rule come from `ms-local-ai` (`ms_local_ai::{backend_health, local_ai}`); the tab
+  only reads them.
 
 UI panels under `panels/` expose typed options/actions and avoid owning worker lifecycles. The tab
 converts panel actions into controller requests, canvas changes, persistent settings, or storage
@@ -80,8 +89,8 @@ through `canvas::declare_ribbon_tab`, the canvas' one declaration of it) and its
 the per-frame context `TranslationDockCx`. Its default arrangement is its OWN
 `translation_default_dock_layout`: the ribbon panel at the dock area's left edge and the cards
 docked to its right, top-aligned, which is where the row of cards floated before the migration. The
-same `fn` item is handed to the dock both by `studio.rs::restore_panel_dock` and by
-`ensure_default_layout`, since the dock state keeps it to rebuild the arrangement for the header's
+same `fn` item is handed to the dock both through `StudioTab::default_dock_layout` (which the
+studio's `restore_panel_dock` restores against) and by `ensure_default_layout`, since the dock state keeps it to rebuild the arrangement for the header's
 reset item.
 
 «Последние персонажи» is declared on EVERY frame with `visible(!recent_characters.is_empty())` and
@@ -146,7 +155,7 @@ text-mask data remain intact for redraw, editing, and disk persistence.
 Python-backed OCR/detector routes call the backend service over the framed IPC protocol (AF_UNIX
 socket on unix, token-authenticated loopback WebSocket on Windows; the transport is chosen inside
 `ms-backend-ipc`). All backend transport goes through `ms_backend_ipc::shared_client()`;
-`backend_health.rs` owns no TCP/port state. OCR requests use `begin_call`/`CallHandle` for explicit
+`ms_local_ai::backend_health` owns no TCP/port state. OCR requests use `begin_call`/`CallHandle` for explicit
 cancellation. App-managed
 model files must be resolved through `ms_sysprobe::ai_models` before backend initialization; EasyOCR
 and Surya library/Hugging Face caches remain backend/library-managed. PaddleOCR
@@ -265,8 +274,16 @@ any of the three collection paths (scope run, per-ImageBubble mode, explicit per
 is an author note addressed to the translator, not a replica.
 
 ## Files and submodules
-- `mod.rs`: module wiring and public re-exports for `TranslationTabState`, hotkey IDs, and hotkey
-  hint structs.
+- `lib.rs`: module wiring and public re-exports for `TranslationTab` (+ `TranslationDrawParams`),
+  `TranslationTabState` and the two modifier-only OCR hotkey ids (the settings hotkey pane's test);
+  everything else reaches the studio through `ms_studio_tab::StudioTab`.
+- `host.rs`: `TranslationTab` (canvas + state, `new` seeding only the scroll salt, bubbles model
+  and bottom-hint collapsed flag — canvas settings are pulled from `BubblesModel` on the first
+  draw), `TranslationDrawParams` / `draw`, the fixed bottom-hint rows
+  (`canvas.bottom_hint.translation.*`) and the `StudioTab` impl. `host/hotkeys.rs`: the six
+  canvas-level command ids and specs, the execute dispatch of all seventeen ids, and the
+  hotkey-hint cache (`refresh_hotkey_hints`). `host/tests.rs`: spec list pinned to the root's
+  `hotkey_registry_golden`, execute coverage, hint-collapsed round trip, dock builder.
 - `tab.rs`: main tab state, canvas hooks, panel routing, OCR region selection, advanced-recognition
   integration, footer metadata sync, text-detection mask/line editing, detector result storage,
   MT dispatch, and coalesced translation settings persistence. The title `settings.json` is
@@ -275,12 +292,6 @@ is an author note addressed to the translator, not a replica.
   and is left untouched. Retired `text_detector.params` keys (`STALE_TEXT_DETECTOR_PARAM_KEYS`:
   the old CTD font-size and rearrange-batch params) are ignored on read and stripped on write.
   The `characters.json` watch uses `ms_docstore::signature`.
-- `local_ai.rs`: `LocalAiAvailability` (may this process use the Python backend / native ONNX:
-  `--no-ai` switches both off, the platform capability table decides independently, a platform
-  reason wins), `LocalAiOff` (typed reason + `user_message`), `AiRouteKind` and its
-  `availability` (the ONE route-availability rule: cloud always, native needs native ONNX allowed,
-  backend needs the backend allowed), and `effective_ai_runtime` (the router's runtime: a stored
-  `Backend` reads as `Native` without `PlatformFeature::PythonBackend`).
 - `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
   `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR request building over
   `ms_ai_api` (tracked + stoppable via the controller's `GenerationTracker`), crop encoding, page
@@ -314,16 +325,14 @@ is an author note addressed to the translator, not a replica.
   text detector controls, composed text, and OCR language catalogs.
 - `adv_rec.rs`: floating advanced-recognition crop preview/editor with async crop preparation,
   brush overlay, rotation, zoom, and local quick-selection OCR actions.
-- `backend_health.rs`: push-driven backend health via `TOPIC_HEALTH` v2 events (with a one-shot
-  `health` pull as the startup/liveness fallback), plus `device` get/set, ONNX provider,
-  max-loaded-models, and CUDA diagnostics helpers. The snapshot's `backend_version` is DIAGNOSTIC
-  only — it is never compared with the program version and never gates a feature; compatibility is
-  decided by `PROTOCOL_VERSION` in the `hello` handshake (`crates/ms-backend-ipc/src/`).
-  It also carries the per-engine OCR readiness flags (`ocr.<engine>.ready`, incl. `baberuocr`)
-  and the resident PaddleOCR-VL variant (`ocr.paddleocrvl.model`); readiness of the SELECTED
-  variant is `paddle_vl_ready_for`, so a variant switch never shows a stale "ready".
 
 ## Contracts and invariants
+- Hotkey command ids are persistence keys (`user_config` -> `Hotkeys`): never rename one. The
+  Translation registration order is observable within the scope (`collect_triggered`), so
+  `TranslationTab::hotkey_specs` keeps the host's six before the state's eleven; every declared
+  id that is not modifier-only must have an execute arm (`host/tests.rs` checks both).
+- Only `TranslationTab` touches the Translation canvas on the root's behalf; the root reaches it
+  through `canvas()` / `canvas_mut()` (view sync, bubble flush) and the `StudioTab` hooks.
 - OCR, detector, MT, storage load/save, crop preparation, and backend health work must not block
   the GUI thread.
 - Canvas integration must stay behind `CanvasHooks` or typed `CanvasView` APIs; do not duplicate
@@ -334,7 +343,7 @@ is an author note addressed to the translator, not a replica.
 - The default dock layout is the DICTIONARY of this tab's dock tabs: a `TabId` missing from
   `translation_default_dock_layout` is dropped from the user's stored arrangement on every load, so
   adding a dock tab here means adding it to that builder too. It is registered under
-  `AppTab::Translation.key()` in `studio.rs::restore_panel_dock` as well; a builder wired in only one
+  `AppTab::Translation.key()` through `StudioTab::default_dock_layout` as well; a builder wired in only one
   of the two places silently resets the stored arrangement.
 - Text detector page results carry source size, block rectangles in source pixels, mask size, and
   mask alpha bytes. Mask buffers must match `width * height` and invalid geometry must be rejected.
@@ -364,7 +373,7 @@ is an author note addressed to the translator, not a replica.
   released, so a lingering `Q` (e.g. `Shift` released a frame earlier) cannot spawn an extra bubble.
 - Translation also owns the hint-bubble shortcut: `H` creates a `BubbleClass::Hint` under the
   pointer. Unlike `Q`/`Shift+Q` it is a REGISTERED hotkey
-  (`HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE`, `studio.rs`, default `Key::H` with no modifiers, scope
+  (`HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE`, `host/hotkeys.rs`, default `Key::H` with no modifiers, scope
   `Tab(Translation)`), so it appears in Settings → Hotkeys, is rebindable, and inherits the
   rising-edge semantics of the hotkey manager instead of a hand-rolled armed gate.
 - HINT ATTACHMENT is the reason a hint exists, and it is a contract of this tab, not a formatting
@@ -485,7 +494,7 @@ is an author note addressed to the translator, not a replica.
   `ProjectData::user_facing_dir`, never in the scratch. Every file dialog of this crate that sets a
   starting directory must use `user_facing_dir`.
 
-- Local-AI gating (`local_ai.rs`): `--no-ai` means "no LOCAL AI runtimes" (Python backend and
+- Local-AI gating (`ms_local_ai::local_ai`): `--no-ai` means "no LOCAL AI runtimes" (Python backend and
   native ONNX). Cloud AI API OCR/MT and the plain machine translators are NEVER gated by it or by
   the platform: the OCR and MT panels are never disabled as a whole, MT has no availability gate,
   and only a route needing an off runtime is refused, with `LocalAiOff::user_message` as the
@@ -495,8 +504,14 @@ is an author note addressed to the translator, not a replica.
   reads the runtime through `local_ai::effective_ai_runtime`, never `AiRuntime::from_user_settings`
   directly. The tab publishes native ORT as armed only when `local_ai.native_onnx` is `Ok`.
 ## Editing map
+- To change the Translation canvas hotkeys (zoom, bubble create/delete/copy/paste), what a
+  hotkey does, the hotkey hint texts or the bottom-hint rows, edit `host/hotkeys.rs` /
+  `host.rs`; panel-toggle and OCR selection-mode specs stay in `TranslationTabState::hotkey_specs`
+  (`tab.rs`). To change the per-frame canvas configuration or which caches the tab evicts, edit
+  `TranslationTab::draw` / the `StudioTab` impl in `host.rs`.
 - To change what `--no-ai` or a platform switches off, or which route kind needs which
-  runtime, edit `local_ai.rs` (`LocalAiAvailability::resolve`, `AiRouteKind::availability`);
+  runtime, edit `crates/ms-local-ai/src/local_ai.rs` (`LocalAiAvailability::resolve`,
+  `AiRouteKind::availability`);
   to change which OCR selection runs on what, edit `ocr::ocr_route_kind` / `ocr_route`.
 - To change top-level translation UI routing, canvas overlays/hooks, OCR selection behavior,
   detector storage, footer sync, or settings persistence, edit `tab.rs`.

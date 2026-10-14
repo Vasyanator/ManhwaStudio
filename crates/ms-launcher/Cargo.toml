@@ -54,7 +54,7 @@ ms-backend-ipc = { path = "../ms-backend-ipc" }
 # Torch re-install flow, and startup routes update intents through it.
 ms-installer = { path = "../ms-installer" }
 # `backend_health` — the reline flow checks the AI backend before starting.
-ms-tab-translation = { path = "../ms-tab-translation" }
+ms-local-ai = { path = "../ms-local-ai" }
 # `wiki::WikiTabState` — the launcher hosts the same wiki view as the editor.
 ms-tabs-simple = { path = "../ms-tabs-simple" }
 # The typesetting-language model behind the first-run language modal.

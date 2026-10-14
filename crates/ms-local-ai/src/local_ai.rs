@@ -1,5 +1,5 @@
 /*
-FILE OVERVIEW: crates/ms-tab-translation/src/local_ai.rs
+FILE OVERVIEW: crates/ms-local-ai/src/local_ai.rs
 Which LOCAL AI runtimes this process may use, and the one rule that turns an AI route into
 "can run here" or a typed reason.
 
@@ -18,7 +18,7 @@ Key items:
 - `LocalAiOff` / `LocalRuntime` / `LocalAiOffReason`: why one runtime is off; `user_message`
   is the localized text every refusal shows.
 - `AiRouteKind`: what an AI route runs on (cloud, native ONNX, backend);
-  `AiRouteKind::availability` is the ONE availability rule. OCR (`ocr::ocr_route_availability`)
+  `AiRouteKind::availability` is the ONE availability rule. OCR (`ms_tab_translation`'s `ocr::ocr_route_availability`)
   and text detection (`TextDetectorAlgorithm::availability`) map their routes onto it.
 - `effective_ai_runtime`: the runtime the routers use — `AiRuntime::from_user_settings`, except
   that a stored `Backend` choice reads as `Native` where the platform has no Python backend.

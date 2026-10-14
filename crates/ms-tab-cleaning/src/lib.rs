@@ -8,8 +8,8 @@ Crate root of the «Клининг» (cleaning) tab. Re-exported by the binary f
 
 Layer:
 The TOP of the library stack — above the canvas, the models, the tooling primitives, the
-widgets and `ms-tab-translation` (it drives the AI backend health, the text detector and
-the MT service through that crate), and below only `studio.rs`, which calls
+widgets, `ms-local-ai` (AI backend health) and `ms-tab-translation` (it drives the text
+detector and the MT service through that crate), and below only `studio.rs`, which calls
 `CleaningTabState::draw`. It must never name `studio` or `launcher`.
 It does NOT depend on `ms-tab-typing` and must not start to: the one thing the two share is
 the atomic document-write RECIPE that `tools/watermark_library.rs` documents and reimplements,
@@ -22,6 +22,8 @@ Modules:
 - `autoclean`: the batch "clean the whole chapter" driver.
 - `clean_status`: the «Клин» tab's clean-folder status area (worker scan + dismissible warnings).
 - `watermark_chapter`: the GUI-free chapter-level watermark decomposition engine.
+- `studio_tab`: `impl ms_studio_tab::StudioTab` (zoom hotkeys, dock builder, GPU eviction,
+  source-page window, committed-tree rescan) — the studio root's order-free per-tab hooks.
 - `touch_selection`: replays a finger long-press selection drag onto the active tool's stroke
   hooks (region tools only, `CleaningTool::accepts_touch_selection`).
 */
@@ -36,6 +38,7 @@ extern crate ms_i18n;
 
 mod autoclean;
 mod clean_status;
+mod studio_tab;
 mod tab;
 mod tools;
 mod touch_selection;

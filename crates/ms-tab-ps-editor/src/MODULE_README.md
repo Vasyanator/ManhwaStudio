@@ -11,7 +11,7 @@ This directory is the crate root of `ms-tab-ps-editor`, re-exported by the binar
 above `ms-canvas` / `ms-models` / `ms-tools` / `ms-widgets` and `ms-tab-typing` (the layers
 panel renders typing's text preview label), below `studio.rs` and the `page_manager` tab. It
 must never name `studio` or `launcher`. `ps_editor_default_dock_layout` is `pub` because
-`studio.rs::restore_panel_dock` calls it from the binary.
+the studio restores the stored arrangement against it (`StudioTab::default_dock_layout`).
 
 ## Architecture
 Data flow for one page:
@@ -222,6 +222,11 @@ tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited liv
   untracked, unevictable GPU memory (~+122 MB for the two base layers of a tall page).
   Also `draw_page_checkerboard`: the page's transparency board is the studio's
   `ms_theme::checkerboard::CANVAS` preset (one textured quad); no board palette lives here.
+- `studio_tab.rs`: `impl ms_studio_tab::StudioTab` — only `default_dock_layout`
+  (`ps_editor_default_dock_layout`, the same `fn` item `ensure_default_layout` gets). The other
+  hooks stay no-ops: no shared source-page window, no root-driven GPU eviction, no hotkey hook
+  (`handle_hotkeys` stays an ordered call from the root's draw arm). Its test owns the dock-builder
+  identity + `TabId` coverage assertion.
 - `page_loader.rs`: background worker producing the two base-layer images for a page.
 - `correction/`: the VIEW-ONLY «Коррекция» panel — its model and maths (`model.rs`, GUI-free and
   GL-free), the `egui-shader-layers` preset layer that renders it (`shader.rs`, no GL of its own)
@@ -260,8 +265,8 @@ The tab ids are PERSISTENCE identities (they key the panel inside `user_config.j
 `PanelDockState`), so they stay non-localized literals — a §A9 i18n exclusion
 (`dev-docs/i18n_exclusions.md`).
 
-**Default arrangement** (`ps_editor_default_dock_layout`, registered in
-`studio.rs::panel_dock_default_layout_builders`): two columns. Left — «PS редактор» on the viewport's left
+**Default arrangement** (`ps_editor_default_dock_layout`, registered through
+`StudioTab::default_dock_layout` in `studio_tab.rs`): two columns. Left — «PS редактор» on the viewport's left
 edge, «Инструменты» below it, «Выбранный инструмент» below that. Right — «Слои» on the viewport's
 right edge, then «Горячие клавиши» under it and «Коррекция» under THAT — a chain, not two panels on
 one target: `solver::place_outside` is a pure function of the target rect and does no occupancy
@@ -738,7 +743,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 - To change "select layer fully", edit `select_active_layer_fully` in `mod.rs`.
 - To change which panels exist, where they start, or what the «Панели…» menu offers, edit
   `ps_editor_default_dock_layout` / `PsEditorPanelVisibility` / `ps_editor_panels_menu` in `mod.rs`
-  (and register the builder in `studio.rs::panel_dock_default_layout_builders`).
+  (its builder reaches the studio through `StudioTab::default_dock_layout`, `studio_tab.rs`).
 - To change what a panel SHOWS, edit its `*_tab_contents` method in `mod.rs`
   (`main_tab_contents` / `tools_tab_contents` / `active_tool_tab_contents` / `hotkeys_tab_contents`
   / `layers_panel_body`); the «Коррекция» body lives in `correction/ui.rs`.

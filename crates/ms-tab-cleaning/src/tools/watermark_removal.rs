@@ -139,7 +139,7 @@ use crate::watermark_chapter::{
     calibration_sample_from_page, discover_anchors, find_matching_kind, find_occurrences,
     remove_occurrences_on_page, scan_page, validate_calibration_sample,
 };
-use ms_tab_translation::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 use super::region_png::{decode_mask_png, encode_color_image_png_rgba};
 use ms_widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;

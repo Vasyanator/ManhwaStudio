@@ -6,7 +6,8 @@ Main items:
 - `MemoryProfile`: user-selected memory usage profile persisted in `user_config.json`.
 - `MemoryManager`: small shared runtime handle for querying and hot-applying the profile.
 - `MemoryPressure` / `MemoryBudget`: pressure classification and profile-derived budgets.
-- `CacheResourceInfo` and eviction request/report types: typed policy boundary for cache owners.
+- `CacheResourceInfo` and eviction request/report types: typed policy boundary for cache owners;
+  `CacheEvictionReport::append` is the one owner of summing per-owner reports.
 
 Notes:
 This crate does not own pixels, `TextureHandle`s, or tab state. Cache owners keep storage local and
@@ -590,6 +591,16 @@ pub struct CacheEvictionReport {
     pub estimated_freed_bytes: u64,
 }
 
+impl CacheEvictionReport {
+    /// Adds `other` (one more cache owner's report) to this running total: its resources are
+    /// appended in order and its byte estimate is added with saturation, so a `u64::MAX`
+    /// ("everything") estimate never wraps. The one owner of summing per-owner reports.
+    pub fn append(&mut self, other: Self) {
+        self.estimated_freed_bytes = self.estimated_freed_bytes.saturating_add(other.estimated_freed_bytes);
+        self.resources.extend(other.resources);
+    }
+}
+
 #[cfg(test)]
 #[must_use]
 pub fn pinned_page_window(
@@ -718,6 +729,24 @@ mod tests {
             visible: false,
             reconstructable: true,
         }
+    }
+
+    #[test]
+    fn eviction_report_append_keeps_order_and_saturates_bytes() {
+        let mut total = CacheEvictionReport {
+            resources: vec![resource("a", CacheResourceKind::PageLinearGpu, Some(0))],
+            estimated_freed_bytes: u64::MAX - 1,
+        };
+        total.append(CacheEvictionReport {
+            resources: vec![resource("b", CacheResourceKind::CleanOverlayGpu, Some(1)), resource("c", CacheResourceKind::PreviewGpu, None)],
+            estimated_freed_bytes: 5,
+        });
+        let ids: Vec<&str> = total.resources.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        assert_eq!(total.estimated_freed_bytes, u64::MAX);
+        total.append(CacheEvictionReport::default());
+        assert_eq!(total.resources.len(), 3);
+        assert_eq!(total.estimated_freed_bytes, u64::MAX);
     }
 
     #[test]

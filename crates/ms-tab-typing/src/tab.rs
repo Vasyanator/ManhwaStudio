@@ -12,10 +12,10 @@ FILE HEADER (crates/ms-tab-typing/src/tab.rs)
   `pub(super)` (или `pub(crate)`, если их зовёт typing-сосед вроде `panel.rs`).
   Ниже описан общий контракт вкладки; конкретные реализации ищите в подмодулях каталога `tab/`.
 - Ключевые поля `TypingTabState`:
-  - `canvas`: отдельный инстанс холста для вкладки типинга (`editable = false`). Bottom-hint
-    forwarders (`set_hint_collapsed` / `hint_collapsed` / `set_bottom_hint`) let `studio.rs` seed the
-    collapsed flag from `user_config` at construction, read it back on exit, and push per-frame hint
-    content.
+  - `canvas`: отдельный инстанс холста для вкладки типинга (`editable = false`). The tab owns its
+    bottom hint: `draw` sets the rows (`tab/studio_tab.rs::typing_hint_rows`) every frame, and the
+    collapsed flag is seeded from `user_config` by `load_exit_settings` and written back at teardown
+    by `StudioTab::write_exit_settings` (both in `tab/studio_tab.rs`).
   - `text_overlays`: слой PNG-оверлеев (`text` + `image`). Text overlays persist as inline v3 text
     nodes of the chapter `LayerDoc` (`layers.json`); a legacy `text_images/text_info.json` is
     read-only input, migrated once into the doc (`tab/render_jobs.rs`),
@@ -99,7 +99,7 @@ use super::auto_typing::{
 use super::mask::{TypingMaskExportPage, TypingMaskLayer};
 use super::panel::{
     CenteringAssistCenterKind, TypingCreateImageRequest, TypingEditTarget, TypingEditorFontSpec,
-    TypingExportUiStatus, TypingOverlayEditRequest, TypingOverlayKind, TypingPanelLayout,
+    TypingExportUiStatus, TypingOverlayEditRequest, TypingOverlayKind,
     TypingSelectedOverlayForEdit,
 };
 use super::render_next::{apply_effects_to_image, render_text_to_image};
@@ -188,6 +188,9 @@ use touch_layers::{TypingTouchFrame, TypingTouchGates, TypingTouchLayerMenu, Typ
 mod vector_transform;
 mod layout_editor;
 use layout_editor::*;
+// `impl StudioTab` (the studio root's order-free hooks), the exit-only config keys and the
+// bottom-hint rows.
+mod studio_tab;
 mod helpers;
 // Single-image «Сохранить»: flatten one page into an image file (native only — the atomic write
 // it ends with does not exist on wasm).
@@ -763,10 +766,6 @@ impl TypingTabState {
         self.layer_doc = Some(doc);
     }
 
-    pub fn set_panel_layout(&mut self, layout: TypingPanelLayout) {
-        self.top_panel.set_panel_layout(layout);
-    }
-
     /// Sets what the open session offers (`SessionMode::capabilities` in the root). The root pushes it
     /// once, right after construction; the session kind never changes during the tab's lifetime.
     /// Without `project_export` (a single-image session, whose file is written by «Сохранить») the
@@ -860,8 +859,9 @@ impl TypingTabState {
         self.canvas.set_scroll_area_id_salt(id_salt);
     }
 
-    /// Seeds the canvas bottom-hint collapsed state ONCE at construction from `user_config`.
-    /// `false` = expanded (default). Must not be called every frame (would override the user toggle).
+    /// Sets the canvas bottom-hint collapsed state (`false` = expanded, the default). Called once at
+    /// construction by `load_exit_settings` (`tab/studio_tab.rs`) with the stored value; must not be
+    /// called every frame (it would override the user's toggle).
     pub fn set_hint_collapsed(&mut self, collapsed: bool) {
         self.canvas.set_bottom_hint_collapsed(collapsed);
     }
@@ -889,10 +889,11 @@ impl TypingTabState {
     /// Writes a still-owed DEFAULT local-preset set immediately, on the calling thread.
     /// Returns whether there was anything to flush.
     ///
-    /// Called from `StudioApp::on_exit` next to `font_admin::flush_pending_saves`, and for the
-    /// same reason: the create panel persists its local presets through a multi-second
-    /// debounce, and the debounced writer is a detached thread that dies with the process.
-    /// A no-op when nothing is owed, which is the normal case.
+    /// Called at studio teardown by `StudioTab::flush_debounced_stores_blocking`
+    /// (`tab/studio_tab.rs`), right after `font_admin::flush_pending_saves` and for the same
+    /// reason: the create panel persists its local presets through a multi-second debounce, and
+    /// the debounced writer is a detached thread that dies with the process. A no-op when nothing
+    /// is owed, which is the normal case.
     pub fn flush_pending_local_presets_save(&mut self) -> bool {
         self.top_panel.flush_pending_local_presets_save()
     }
@@ -1079,6 +1080,8 @@ impl TypingTabState {
             status,
             panel_dock,
         } = params;
+        // The tab owns its bottom-hint rows; rebuilt every frame so a language switch re-localizes them.
+        self.set_bottom_hint(Some(CanvasBottomHint { rows: studio_tab::typing_hint_rows() }));
         // A running single-image flatten-to-file blocks a project export exactly like a busy save
         // (both directions are exclusive; the flatten refuses while an export runs or is deferred), so
         // it is folded into the one "busy" term the export trigger and the deferred dispatch read.

@@ -2,13 +2,15 @@
 File: src/studio/tabs.rs
 
 Purpose:
-The studio's ten program-tab states plus the Translation tab's canvas, as one owned struct
-(`Tabs`), and the per-frame draw of the active tab. A tab never reaches `StudioApp`: what it needs
-for one frame comes in as a borrowed `TabFrame`, and what it asks of the app goes out as
-`AppRequest`s that `StudioApp` applies right after the draw.
+The studio's ten program tabs as one owned struct (`Tabs`), the ONE `AppTab` -> tab mapping
+(`Tabs::get` / `get_mut`, as `ms_studio_tab::StudioTab` trait objects) with the order-free hook
+fan-outs built on it, and the per-frame draw of the active tab. A tab never reaches `StudioApp`:
+what it needs for one frame comes in as a borrowed `TabFrame`, and what it asks of the app goes
+out as `AppRequest`s that `StudioApp` applies right after the draw.
 
 Key structures:
-- `Tabs`: the tab states (owned by `StudioApp`, field `tabs`).
+- `Tabs`: the tab states (owned by `StudioApp`, field `tabs`); the Translation tab is its host
+  `TranslationTab`, which owns the Translation canvas.
 - `TabFrame`: the borrowed frame context of one draw (project, page geometry + resident textures
   lent by `PageResidency`, panel dock, busy snapshot, canvas status, hotkey registry).
 - `AppRequest`: every tab -> app request of one draw (page op, page open, settings deep link,
@@ -16,23 +18,25 @@ Key structures:
 
 Key functions:
 - `Tabs::draw`: the per-tab draw dispatch of `StudioApp::ui`.
-- `Tabs::view_tabs` / `Tabs::canvas`: the borrows `ViewSync` and the per-canvas fan-outs use
-  (the tab -> canvas mapping stays `view_sync::canvas_slot`).
-- `Tabs::apply_typing_panel_layout_request`: the settings -> typing panel-layout hand-off.
-- `build_translation_hint_rows` / `build_typing_hint_rows`: the canvas bottom-hint rows.
+- `Tabs::get` / `get_mut` / `for_each` / `for_each_mut`: the tab -> `dyn StudioTab` mapping and
+  the fan-outs in `AppTab::ALL` order; `hotkey_specs`, `dock_layout_defaults`, `hosts_panel_dock`,
+  `evict_tab_gpu_caches` are the fan-outs `studio.rs` reads, `write_exit_settings` and
+  `flush_debounced_stores_blocking` the ones the teardown (`shutdown.rs`) calls.
+- `Tabs::view_tabs`: the borrow `ViewSync` and the per-canvas fan-outs use (the tab -> canvas
+  mapping stays `view_sync::canvas_slot`).
 
 Notes:
-`Tabs::draw` never changes `StudioApp::active_tab`: a switch is a request, applied by the app after
-the draw (and after the panel-layout poll), at the point today's arms used to switch.
+- `Tabs::draw` never changes `StudioApp::active_tab`: a switch is a request, applied by the app
+  after the draw (and after the panel-layout poll), at the point today's arms used to switch.
+- Only ORDER-FREE questions go through the trait fan-outs; drawing and every ordered §12 sequence
+  (flushes, staging writers, teardown) stay explicit calls on the concrete fields.
 */
 
 use super::busy::PersistenceActivity;
-use super::view_sync::{ViewTabs, canvas_of};
-use crate::canvas::{
-    CanvasBottomHint, CanvasDrawParams, CanvasHintHelp, CanvasHintRow, CanvasUiStatus, CanvasView,
-    SourceTextureUploadBudget,
-};
-use crate::input_manager_v2::InputManagerV2;
+use super::view_sync::ViewTabs;
+use crate::canvas::CanvasUiStatus;
+use crate::input_manager_v2::{HotkeySpecV2, InputManagerV2};
+use crate::memory_manager::{CacheEvictionReport, CacheEvictionRequest};
 use crate::page_ops::PageOpKind;
 use crate::page_view::{PageImageInfo, PageTexture};
 use crate::project::ProjectData;
@@ -45,19 +49,22 @@ use crate::tabs::page_manager::{PageManagerAction, PageManagerTabState};
 use crate::tabs::ps_editor::PsEditorTabState;
 use crate::tabs::settings::SettingsTabState;
 use crate::tabs::terms::TermsTabState;
-use crate::tabs::translation::TranslationTabState;
+use crate::tabs::translation::{TranslationDrawParams, TranslationTab};
 use crate::tabs::typing::{TypingDrawParams, TypingTabState};
 use crate::tabs::wiki::WikiTabState;
 use crate::widgets::panel_dock::PanelDockState;
+use crate::widgets::panel_dock::persist::LayoutDefault;
 use eframe::egui;
+use ms_studio_tab::StudioTab;
 use std::collections::HashMap;
 
 /// The studio's program-tab states (owned by `StudioApp`). Field order is the drop order of the
-/// tab states (the Translation canvas first), which is the order they had as `StudioApp` fields.
+/// tab states (the Translation canvas — first field of `TranslationTab` — first), which is the
+/// order they had as `StudioApp` fields.
 pub(super) struct Tabs {
-    /// The Translation tab's canvas (the cleaning and typing tabs own theirs).
-    pub(super) translation_canvas: CanvasView,
-    pub(super) translation: TranslationTabState,
+    /// The Translation tab: its canvas plus its state (the cleaning and typing tabs own their
+    /// canvases the same way).
+    pub(super) translation: TranslationTab,
     pub(super) cleaning: CleaningTabState,
     pub(super) typing: TypingTabState,
     pub(super) ps_editor: PsEditorTabState,
@@ -128,22 +135,102 @@ impl AppRequest {
 }
 
 impl Tabs {
+    /// The tab state `tab` names, as its order-free hook surface. The ONE `AppTab` -> tab mapping
+    /// of `src/studio` (exhaustive: a new tab must answer it).
+    pub(super) fn get(&self, tab: AppTab) -> &dyn StudioTab {
+        match tab {
+            AppTab::PageManager => &self.page_manager,
+            AppTab::Translation => &self.translation,
+            AppTab::Cleaning => &self.cleaning,
+            AppTab::Typing => &self.typing,
+            AppTab::PsEditor => &self.ps_editor,
+            AppTab::Characters => &self.characters,
+            AppTab::Terms => &self.terms,
+            AppTab::Notes => &self.notes,
+            AppTab::Settings => &self.settings,
+            AppTab::Wiki => &self.wiki,
+        }
+    }
+
+    /// [`Self::get`], mutably.
+    pub(super) fn get_mut(&mut self, tab: AppTab) -> &mut dyn StudioTab {
+        match tab {
+            AppTab::PageManager => &mut self.page_manager,
+            AppTab::Translation => &mut self.translation,
+            AppTab::Cleaning => &mut self.cleaning,
+            AppTab::Typing => &mut self.typing,
+            AppTab::PsEditor => &mut self.ps_editor,
+            AppTab::Characters => &mut self.characters,
+            AppTab::Terms => &mut self.terms,
+            AppTab::Notes => &mut self.notes,
+            AppTab::Settings => &mut self.settings,
+            AppTab::Wiki => &mut self.wiki,
+        }
+    }
+
+    /// Calls `f` for every tab, in `AppTab::ALL` order. Only for order-free hooks (the trait's
+    /// contract): no caller may depend on which tab is visited first.
+    pub(super) fn for_each_mut(&mut self, mut f: impl FnMut(&mut dyn StudioTab)) {
+        for tab in AppTab::ALL {
+            f(self.get_mut(tab));
+        }
+    }
+
+    /// Calls `f` for every tab, in `AppTab::ALL` order (shared borrow). Same contract as
+    /// [`Self::for_each_mut`]: order-free hooks only.
+    pub(super) fn for_each(&self, mut f: impl FnMut(&dyn StudioTab)) {
+        for tab in AppTab::ALL {
+            f(self.get(tab));
+        }
+    }
+
+    /// Writes every tab's exit-only `user_config` keys into `root` (pure; the caller runs it inside
+    /// its ONE `update_user_config_file`, `shutdown.rs`). Tabs write disjoint keys, so the visiting
+    /// order does not change the result.
+    pub(super) fn write_exit_settings(&self, root: &mut serde_json::Value) {
+        self.for_each(|tab| tab.write_exit_settings(root));
+    }
+
+    /// Teardown only: synchronously flushes every tab's debounced user-global stores (each tab
+    /// flushes its own stores in its own order and logs what it wrote). Blocking.
+    pub(super) fn flush_debounced_stores_blocking(&mut self) {
+        self.for_each_mut(|tab| tab.flush_debounced_stores_blocking());
+    }
+
+    /// Every tab's code-declared hotkey specs, tabs in `AppTab::ALL` order, each tab's own
+    /// registration order kept (observable within its scope; pinned by `hotkey_registry_golden`).
+    #[must_use]
+    pub(super) fn hotkey_specs(&self) -> Vec<HotkeySpecV2> {
+        AppTab::ALL.into_iter().flat_map(|tab| self.get(tab).hotkey_specs()).collect()
+    }
+
+    /// The default-layout builder of every tab that hosts the panel dock, keyed by
+    /// `AppTab::key()` — the dictionary `panel_dock::persist` restores the stored arrangement
+    /// against. Each builder is the SAME `fn` item its tab hands to `ensure_default_layout`
+    /// (pinned by the tab crates' tests), so «сбросить раскладку» resets to what the user saw.
+    #[must_use]
+    pub(super) fn dock_layout_defaults(&self) -> Vec<LayoutDefault<'static>> {
+        AppTab::ALL.into_iter().filter_map(|tab| self.get(tab).default_dock_layout().map(|builder| (tab.key(), builder))).collect()
+    }
+
+    /// Whether `tab` draws the app-owned panel dock (`PanelDock::end` runs while it is active).
+    /// The same answer as [`Self::dock_layout_defaults`], from the same hook.
+    #[must_use]
+    pub(super) fn hosts_panel_dock(&self, tab: AppTab) -> bool {
+        self.get(tab).default_dock_layout().is_some()
+    }
+
+    /// Frees every tab's own GPU caches under `request` (in `AppTab::ALL` order; the request is
+    /// immutable, so the order does not change what is freed) and returns the merged report.
+    pub(super) fn evict_tab_gpu_caches(&mut self, request: &CacheEvictionRequest) -> CacheEvictionReport {
+        let mut report = CacheEvictionReport::default();
+        self.for_each_mut(|tab| report.append(tab.evict_tab_gpu_caches(request)));
+        report
+    }
+
     /// The view tabs `ViewSync` drives, borrowed for one call.
     pub(super) fn view_tabs(&mut self) -> ViewTabs<'_> {
-        ViewTabs { translation: &mut self.translation_canvas, cleaning: &mut self.cleaning, typing: &mut self.typing, ps_editor: &mut self.ps_editor }
-    }
-
-    /// The canvas `tab` draws with, if any (the mapping is `view_sync::canvas_slot`).
-    pub(super) fn canvas(&self, tab: AppTab) -> Option<&CanvasView> {
-        canvas_of(tab, &self.translation_canvas, &self.cleaning, &self.typing)
-    }
-
-    /// Hands a panel layout the Settings tab picked to the typing tab. Called at the start of every
-    /// frame (`StudioApp::new` does the same hand-off for the seeded layout before `Tabs` exists).
-    pub(super) fn apply_typing_panel_layout_request(&mut self) {
-        if let Some(layout) = self.settings.take_typing_panel_layout_request() {
-            self.typing.set_panel_layout(layout);
-        }
+        ViewTabs { translation: self.translation.canvas_mut(), cleaning: &mut self.cleaning, typing: &mut self.typing, ps_editor: &mut self.ps_editor }
     }
 
     /// Draws `drawn` (the active tab) into a central panel of `ui` and returns what it asks of the
@@ -168,36 +255,9 @@ impl Tabs {
                 requests.extend(actions.into_iter().map(AppRequest::from_page_manager));
             }
             AppTab::Translation => {
-                self.translation_canvas.set_bottom_hint(Some(CanvasBottomHint {
-                    rows: build_translation_hint_rows(),
-                }));
-                self.translation.sync_with_project_settings(project);
-                self.translation.draw_side_panel(ctx, &mut self.translation_canvas, project, page_infos);
-                let canvas = &mut self.translation_canvas;
-                canvas.set_drag_scroll_blocked(false);
-                canvas.set_wheel_scroll_blocked(false);
-                canvas.set_zoom_blocked(self.translation.blocks_canvas_zoom());
-                canvas.set_overlay_render_suppressed(false);
-                canvas.set_overlay_upload_min_interval_s(0.0);
-                let hooks = &mut self.translation;
-                // `panel_dock` is lent for the frame and disjoint from `hooks` and `canvas`,
-                // exactly as for «Текст»; the canvas only carries it through to the overlay hook,
-                // where this tab runs its dock.
-                egui::CentralPanel::default().show(ui, |ui| {
-                    let mut source_upload_budget =
-                        SourceTextureUploadBudget::source_page_reupload_default();
-                    canvas.draw(CanvasDrawParams {
-                        ctx,
-                        ui,
-                        project,
-                        page_infos,
-                        texture_cache: textures,
-                        status,
-                        source_upload_budget: &mut source_upload_budget,
-                        hooks,
-                        panel_dock,
-                    });
-                });
+                // The host sets its hint rows, runs its side panel and opens its own central
+                // panel (`TranslationTab::draw`); the dock runs inside the canvas overlay hook.
+                self.translation.draw(TranslationDrawParams { ctx, ui, project, page_infos, texture_cache: textures, status, panel_dock });
             }
             AppTab::Cleaning => {
                 // The Cleaning tab has no bottom-hint: its canvas `bottom_hint` stays `None`, so
@@ -216,10 +276,8 @@ impl Tabs {
                 });
             }
             AppTab::Typing => {
+                // The typing tab sets its own bottom-hint rows at the start of its draw.
                 let typing = &mut self.typing;
-                typing.set_bottom_hint(Some(CanvasBottomHint {
-                    rows: build_typing_hint_rows(),
-                }));
                 // Export is mutually exclusive with a project save (Finding 2): the save may be pending
                 // on the whole-project preload or already running. Push it into the typing tab before
                 // draw so both the export trigger and the deferred-export gate can suppress dispatch.
@@ -287,95 +345,6 @@ impl Tabs {
         }
         requests
     }
-}
-
-/// Builds the fixed, hand-authored Translation-tab bottom-hint rows.
-///
-/// Content is a curated set of localized label/key pairs (via `t!`), NOT sourced from the hotkey
-/// registry. Rebuilt every frame so a runtime language switch re-localizes the rows. Order is
-/// canonical and must match the documented Translation shortcut set. No row carries help, so this
-/// hint stays two-column; attach one with `CanvasHintRow::with_help` when a shortcut needs it.
-#[must_use]
-fn build_translation_hint_rows() -> Vec<CanvasHintRow> {
-    vec![
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.create_bubble_label"),
-            t!("canvas.bottom_hint.translation.create_bubble_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.create_bubble_recent_char_label"),
-            t!("canvas.bottom_hint.translation.create_bubble_recent_char_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.ocr_bubble_label"),
-            t!("canvas.bottom_hint.translation.ocr_bubble_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_label"),
-            t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.advanced_ocr_label"),
-            t!("canvas.bottom_hint.translation.advanced_ocr_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.create_image_bubble_label"),
-            t!("canvas.bottom_hint.translation.create_image_bubble_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.create_image_bubble_crop_label"),
-            t!("canvas.bottom_hint.translation.create_image_bubble_crop_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.create_hint_bubble_label"),
-            t!("canvas.bottom_hint.translation.create_hint_bubble_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.translation.delete_bubble_label"),
-            t!("canvas.bottom_hint.translation.delete_bubble_keys"),
-        ),
-    ]
-}
-
-/// Builds the fixed, hand-authored Typing-tab bottom-hint rows.
-///
-/// Content is a curated set of localized label/key pairs (via `t!`), NOT sourced from the hotkey
-/// registry. Rebuilt every frame so a runtime language switch re-localizes the rows. Order is
-/// canonical and must match the documented Typing shortcut set. The select-text-area row carries an
-/// animated "?" help icon, which puts this hint into the grid's three-column mode.
-#[must_use]
-fn build_typing_hint_rows() -> Vec<CanvasHintRow> {
-    vec![
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.select_text_area_label"),
-            t!("canvas.bottom_hint.typing.select_text_area_keys"),
-        )
-        .with_help(CanvasHintHelp::Animation(ms_gifs::typing::SELECT_TEXT_AREA)),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.quick_font_size_label"),
-            t!("canvas.bottom_hint.typing.quick_font_size_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.rotate_label"),
-            t!("canvas.bottom_hint.typing.rotate_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.scale_label"),
-            t!("canvas.bottom_hint.typing.scale_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.nudge_label"),
-            t!("canvas.bottom_hint.typing.nudge_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.toggle_clean_label"),
-            t!("canvas.bottom_hint.typing.toggle_clean_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.toggle_centering_assist_label"),
-            t!("canvas.bottom_hint.typing.toggle_centering_assist_keys"),
-        ),
-    ]
 }
 
 #[cfg(test)]

@@ -30,10 +30,11 @@ theirs. Adding a pane means adding a `SettingsSectionId` variant and both entrie
 
 Layer position: above `ms-widgets` / `ms-config` / `ms-sysprobe` / `ms-backend-ipc` /
 `ms-memory` / `ms-onnx` / `ms-project` (the storage-mode driver) / `ms-os-integration`
-(native only: the OS-record probe behind the registration warnings), and above exactly ONE tab crate — `ms-tab-translation`, for
-`backend_health` (the health snapshot and probe-command model). The tabs never depend back
-on this crate; if a reference in that direction appears, the layering is wrong, not the
-dependency list.
+(native only: the OS-record probe behind the registration warnings) and `ms-local-ai`
+(`backend_health`: the health snapshot and probe-command model; `local_ai`: the process's
+local-AI availability and effective runtime). It depends on NO tab crate, and the tabs never
+depend back on this crate; if a reference in either direction appears, the layering is wrong,
+not the dependency list.
 
 ## Files and submodules
 - `lib.rs`: crate root and module list; the `tutorial` feature gate.
@@ -81,7 +82,7 @@ dependency list.
   ROCm) stay selectable for backend ONNX. Without `PlatformFeature::PythonBackend` (Android,
   web) it offers no "Backend" runtime and draws only the native ONNX selection (backend status,
   process control, log, PyTorch device and diagnostics hidden); the runtime it shows is the
-  EFFECTIVE one (`ms_tab_translation::local_ai::effective_ai_runtime`). Native build availability (picker groups,
+  EFFECTIVE one (`ms_local_ai::local_ai::effective_ai_runtime`). Native build availability (picker groups,
   "(unavailable)" label, auto-download gate) is NOT decided here: it is
   `ms_native_runtime::native_build_fallback_reason` over the caps probe's
   `NativeHardwareFacts`, so the panel shows what the runtime will do. Where nothing is

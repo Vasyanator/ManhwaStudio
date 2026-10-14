@@ -22,7 +22,7 @@ use super::classic::{classic_otsu_threshold, detect_classic_from_gray, dilate_bi
 use super::pipeline::detector_native_route;
 use super::pipeline::{backend_fallback_applies, ctd_detect_params, detect_error_message, native_applies};
 use super::region::{color_image_to_rgb, region_mask};
-use crate::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 use eframe::egui;
 use image::RgbImage;
 use ms_backend_ipc::textdetector::{ForwardEngine, ForwardWireError, decode_forward_response};

@@ -28,6 +28,8 @@ Architecture:
   arrangement, and the tab supplies its OWN `DockArea` rect (it is not a canvas tab, so
   `canvas::dock_area_rect` — which reserves the canvas' scrollbar strip — does not apply).
 - `viewport`: own camera (pan/zoom/fit), independent of the shared canvas engine.
+- `studio_tab`: `impl ms_studio_tab::StudioTab` — the tab's answers to the studio root's
+  order-free hooks (only the panel-dock default layout).
 - `canvas_touch`: finger input from `ms_widgets::touch_nav` (surface publication, long-press
   marker); `draw_canvas` applies its navigation to the camera, its selection drag to the active
   tool (`PsTool::touch_selection`) and its long-press to `draw_selection_menu`.
@@ -103,6 +105,7 @@ pub mod layer_render;
 pub mod layers;
 pub mod page_loader;
 pub mod selection;
+mod studio_tab;
 pub mod text_layers;
 pub mod tools;
 pub mod tree;

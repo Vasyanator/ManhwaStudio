@@ -290,7 +290,7 @@ use ms_config as config;
 use ms_config::Flux2Variant;
 use crate::tools::base::RegionEditToolBase;
 use crate::tools::region_edit_v2::geometry::{AspectLimit, FrameConstraints};
-use ms_tab_translation::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 use ms_tab_translation::machine_translation::{MtService, translate_texts_via_translator};
 use ms_tab_translation::panels::machine_translation::{MT_SOURCE_LANGUAGES, MtLanguage};
 use ms_widgets::{SeedSpinBox, WheelComboBox, WheelSlider};

@@ -1,6 +1,7 @@
 /*
-FILE OVERVIEW: crates/ms-tab-translation/src/backend_health.rs
-Shared health helpers for Python AI backend used by Settings and Translation tabs.
+FILE OVERVIEW: crates/ms-local-ai/src/backend_health.rs
+Shared health helpers for the Python AI backend, used by the Settings panes, the backend
+supervisor, the Translation and Cleaning tabs, the studio root and the launcher's reline flow.
 
 Transport:
 All backend requests go through the v2 framed IPC client (`ms_backend_ipc`),

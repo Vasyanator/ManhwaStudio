@@ -15,7 +15,7 @@ Main items:
   a usage error off Windows.
 - `Cli.no_ai`: switches off the LOCAL AI runtimes (Python backend and native ONNX) for the
   process; cloud AI API and machine translation stay available
-  (`ms_tab_translation::local_ai::LocalAiAvailability`).
+  (`ms_local_ai::local_ai::LocalAiAvailability`).
 - `Cli.update`: opens the Rust update window directly.
 - `Cli.test_launcher`: starts the new Rust launcher test mode instead of the main app.
 - `Cli.test_ver_check`: forces update checks to report an available update in launcher/update UI.

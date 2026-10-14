@@ -82,7 +82,7 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
 - `text_detector.rs`: detector algorithm/options UI, status/progress display, run/OCR/save/clear
   actions, and line/mask edit mode toggles. `tab.rs` lends it a per-frame
   `TextDetectorPanelView` snapshot. It also owns `TextDetectorAlgorithm::availability`, the ONE
-  "can this detector run" decision (the local-AI rule of `crate::local_ai` for the algorithm's
+  "can this detector run" decision (the local-AI rule of `ms_local_ai::local_ai` for the algorithm's
   route — Paddle native or backend, CTD/Surya backend — then reported-missing PyTorch) shared by the panel's
   detect-button gate and hint and by `tab.rs`'s run-mode refusal; never re-derive it elsewhere.
   The hint under disabled detect buttons names the same reason a refused run reports.

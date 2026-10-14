@@ -20,7 +20,7 @@ use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_canvas::CanvasView;
 use ms_config as config;
 use ms_project::ProjectData;
-use ms_tab_translation::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 use ms_widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
 use super::region_png::{encode_color_image_png_rgba, encode_mask_png_luma};

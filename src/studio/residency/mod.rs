@@ -9,8 +9,9 @@ loader, the source-page geometry (`PageImageInfo`) and resident textures (`PageT
 to the drawing tab, and the memory-pressure eviction of what it owns.
 
 Key structures:
-- `PageResidency`: all of the above; knows no tab type (the page window to keep, the pixel
-  inspection flag and the canvas `cache_pages` setting are passed in by `StudioApp`).
+- `PageResidency`: all of the above; knows no tab type (the page window to keep and the pixel
+  inspection flag are passed in by `StudioApp`; the live canvas `cache_pages` setting is read from
+  its owner, the `CleanOverlaysModel` it is handed).
 - `UploadTask`: the page whose tiles are being uploaded across frames.
 
 Key functions:
@@ -30,8 +31,6 @@ Everything here runs on the GUI thread and only polls channels and uploads prepa
 mod decode;
 mod loader;
 mod memory;
-
-pub(in crate::studio) use memory::append_eviction_report;
 
 use self::decode::{DecodedPage, DecodedTile};
 use self::loader::{
@@ -113,7 +112,9 @@ struct UploadTask {
 impl PageResidency {
     /// Builds the page metadata (every page `Loading`) and starts the unified loader pool for
     /// `project`'s source pages and their clean overlays. `cache_pages` is the canvas page-cache
-    /// setting; with a memory budget for it, the initial decode also seeds the shared page cache.
+    /// setting at open time (the project's value, which `CleanOverlaysModel` is seeded with); with a
+    /// memory budget for it, the initial decode also seeds the shared page cache. Later changes of
+    /// the setting are read from the model by [`Self::poll_page_cache`].
     pub(in crate::studio) fn spawn(project: &ProjectData, cache_pages: bool, memory_manager: Arc<MemoryManager>) -> Self {
         let cache_pages_on_initial_load =
             should_seed_page_cache_on_initial_load(cache_pages, memory_manager.budget());
@@ -194,10 +195,12 @@ impl PageResidency {
     }
 
     /// Per-frame page-cache step: starts the page-cache loader once every source page is uploaded
-    /// and every overlay delivered (when `cache_pages` is on and the memory profile allows a
-    /// source-page CPU cache), then drains its events into `overlays`' page cache.
-    pub(in crate::studio) fn poll_page_cache(&mut self, project: &ProjectData, cache_pages: bool, overlays: &Arc<Mutex<CleanOverlaysModel>>) {
-        self.ensure_page_cache_loader_started(project, cache_pages, overlays);
+    /// and every overlay delivered (when the canvas `cache_pages` setting — owned by `overlays`,
+    /// `CleanOverlaysModel::cache_pages_enabled`, whichever tab or Settings changed it — is on and
+    /// the memory profile allows a source-page CPU cache), then drains its events into `overlays`'
+    /// page cache.
+    pub(in crate::studio) fn poll_page_cache(&mut self, project: &ProjectData, overlays: &Arc<Mutex<CleanOverlaysModel>>) {
+        self.ensure_page_cache_loader_started(project, overlays);
         self.poll_page_cache_loader_events(overlays);
     }
 
@@ -400,13 +403,32 @@ impl PageResidency {
             && self.next_decode_idx_to_enqueue >= self.total_pages
     }
 
-    fn ensure_page_cache_loader_started(&mut self, project: &ProjectData, cache_pages: bool, overlays: &Arc<Mutex<CleanOverlaysModel>>) {
+    /// Starts the page-cache loader once (see [`Self::poll_page_cache`]). The cheap residency checks
+    /// run first, so the model lock is taken only once everything is loaded and the loader has not
+    /// started yet; it is held just for the flag read.
+    fn ensure_page_cache_loader_started(&mut self, project: &ProjectData, overlays: &Arc<Mutex<CleanOverlaysModel>>) {
         if self.page_cache_loader_started
-            || !cache_pages
             || !self.memory_manager_allows_source_page_cache()
             || !self.main_pages_fully_loaded()
             || !self.overlay_loader_finished
         {
+            return;
+        }
+        let cache_pages = match overlays.lock() {
+            Ok(model) => model.cache_pages_enabled(),
+            Err(err) => {
+                // The page cache is an optional accelerator and every later step (job collection,
+                // event delivery) needs this same lock, so give it up for the session — marked
+                // started AND finished, which also stops the per-frame retry (and its log line).
+                runtime_log::log_error(format!(
+                    "[residency] CleanOverlaysModel lock poisoned; page-cache loader not started for this session (the shared page RGBA cache is not pre-filled); error={err}"
+                ));
+                self.page_cache_loader_started = true;
+                self.page_cache_loader_finished = true;
+                return;
+            }
+        };
+        if !cache_pages {
             return;
         }
         let jobs = collect_missing_page_cache_jobs(project, overlays);

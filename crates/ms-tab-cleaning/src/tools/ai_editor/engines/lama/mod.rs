@@ -83,7 +83,7 @@ use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
 use crate::tools::region_edit_v2::geometry::FrameConstraints;
-use ms_tab_translation::backend_health::ai_backend_offline_error;
+use ms_local_ai::backend_health::ai_backend_offline_error;
 use ms_widgets::{WheelComboBox, WheelSlider};
 use eframe::egui;
 // The wire PNG encoders, shared by `wire.rs` (through its `use super::*`) and the tests.
