@@ -67,7 +67,7 @@ use ms_models::page_view::{PageImageInfo, PageTexture, SourcePageLoadState};
 use ms_project::ProjectData;
 use ms_log::runtime_log;
 use ms_widgets::panel_dock::PanelDockState;
-use ms_widgets::touch_nav::context_menu_popup;
+use ms_widgets::touch_nav::{TouchSelection, context_menu_popup};
 use ms_widgets::{HelpHint, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
@@ -224,6 +224,18 @@ pub(super) struct CanvasSceneState {
     /// next to each card's hit response. Holes of the touch surface: a finger on a card stays
     /// with egui. Cleared at the start of every `draw`.
     pub(super) aside_card_hit_rects: Vec<Rect>,
+    /// Screen hit rects of the small bubble handles drawn this frame (rect resize handles,
+    /// image-area resize handles and anchor points), each grown by egui's touch interact
+    /// radius. Holes of the touch surface, so a finger drags a handle; the large image-bubble
+    /// rects and text areas stay pannable. Cleared at the start of every `draw`.
+    pub(super) handle_hit_rects: Vec<Rect>,
+    /// Whether a finger long-press drag drives the active tab's selection this frame
+    /// (`TouchSurface::long_press_selection`). A one-frame flag: tabs set it every frame
+    /// (`CanvasView::set_long_press_selection`) and `publish_touch_surface` resets it.
+    pub(super) long_press_selection: bool,
+    /// This frame's long-press selection drag (`TouchOutput::selection`), read by the tab's
+    /// capture mode through `CanvasView::touch_selection`. Set by `handle_shortcuts`.
+    pub(super) touch_selection: Option<TouchSelection>,
     /// Finger long-press point of this frame (`TouchOutput::long_press_at`): the page under it
     /// opens its context menu through the secondary-click path. Set by `handle_shortcuts`.
     pub(super) touch_long_press_at: Option<Pos2>,
@@ -316,6 +328,9 @@ impl Default for CanvasSceneState {
             pending_focus: None,
             on_top_hit_rects: HashMap::new(),
             aside_card_hit_rects: Vec::new(),
+            handle_hit_rects: Vec::new(),
+            long_press_selection: false,
+            touch_selection: None,
             touch_long_press_at: None,
             touch_long_press_armed_at: None,
             canvas_bottom_hint_rect: None,

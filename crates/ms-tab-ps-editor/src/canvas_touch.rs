@@ -13,8 +13,10 @@ Key functions:
 - `draw_long_press_marker`: the ring shown while a finger's long-press is armed.
 
 Notes:
-The surface has NO holes: every dock panel, popup and region-tool `Area` over the canvas sits on
-a layer above `Order::Background`, and the router never claims a touch under such a layer.
+The surface has NO holes: every dock panel and popup over the canvas is an `Area` above
+`Order::Background`, and the router never claims a touch under such a layer. The patch tool's
+outline is a bare layer painter without an `Area`, invisible to `Context::layer_id_at`, so a finger
+over it is claimed like bare canvas (see `MODULE_README.md` «Finger input»).
 */
 
 use eframe::egui;

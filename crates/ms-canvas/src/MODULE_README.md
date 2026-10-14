@@ -414,10 +414,12 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `touch_nav::publish_capture_layer` for their capture overlays.
 - **Surface** (published last in `draw`): `scroll_inner_rect`, holes = on-top hit rects ∪ aside
   card hit rects (`scene.aside_card_hit_rects`, collected next to the card hit response) ∪ the
-  scrollbar rects ∪ the bottom-hint rect. Windows and dock panels are not holes: they are on
-  non-background layers, which the router never claims on. Image-bubble widgets on the page (red
-  rect, text areas, anchors, handles) are NOT holes: a finger there pans.
-  `long_press_selection` is `false` (see "Known limit" below).
+  scrollbar rects ∪ the bottom-hint rect ∪ the small bubble handles (`scene.handle_hit_rects`:
+  rect resize handles, image-area resize handles and movable anchors, each grown by egui's
+  `interact_radius`, collected next to their `ui.interact` through `note_touch_handle_hole`).
+  Windows and dock panels are not holes: they are on non-background layers, which the router
+  never claims on. The large image-bubble rects and text areas are NOT holes: a finger there pans.
+  `long_press_selection` is the tab's one-frame flag (see "Long-press selection").
 - **Navigation** (`handle_shortcuts`, after the wheel/keyboard zoom): `take_touch_output` runs every
   frame (it also schedules the long-press repaint). `apply_touch_navigation` captures
   `capture_pending_view_anchor(prev_centroid, centroid)` at the OLD zoom, then multiplies the zoom
@@ -432,10 +434,17 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   menu is drawn with `ms_widgets::touch_nav::context_menu_popup(response, long_press)` — never
   `response.context_menu`, which anchors at a hover position a finger does not have. The armed
   long-press draws a ring (`draw_touch_long_press_feedback`) while the finger is held.
-- **Known limit — long-press selection**: the canvas page row has no primary-drag selection of
-  its own; every selection drag lives in a tab (Translation OCR / image-crop capture areas, Typing
-  create/upload, Cleaning region selection). Until a hook delivers `TouchSelection` to them, a drag
-  after an armed long-press pans.
+- **Long-press selection**: the canvas page row has no selection drag of its own; every one lives
+  in a tab (Translation OCR / image-crop capture areas, Typing create rectangle, Cleaning region
+  tools). The hand-off is two methods, no `CanvasHooks` change: the tab calls
+  `set_long_press_selection(bool)` every frame its active mode has a selection (before `draw`, or
+  from a hook inside it holding `&mut CanvasView`); it is a ONE-FRAME flag consumed by the surface
+  publication, so a tab that stops setting it publishes `false` (a long-press drag then pans).
+  `touch_selection()` returns this frame's `TouchSelection` (stored by `handle_shortcuts`), valid
+  for hooks inside `draw` and code after it. Rectangle-drag capture modes map it through
+  `drive_touch_drag` + `TouchDrivenDrag` (begin at the press point, follow, `Released` commits like
+  a mouse release, `Cancelled` drops like Esc; a mouse drag in the slot is never touched); the
+  Cleaning tab replays it onto its tools' stroke hooks (`ms-tab-cleaning/src/touch_selection.rs`).
 
 ## Contracts and invariants
 - Do not block the GUI thread with image decoding, disk I/O, long computation, or worker waits.

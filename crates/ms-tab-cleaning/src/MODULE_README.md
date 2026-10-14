@@ -76,6 +76,12 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 ## Files and submodules
 - `tab.rs`: tab state, canvas orchestration, the dock tabs and their default arrangement, mask
   loading, quick text-clean job orchestration, and history hotkeys.
+- `touch_selection.rs`: `drive_tool_touch_selection`, the replay of a finger long-press selection
+  drag (`CanvasView::touch_selection`) onto the active tool's stroke hooks, for tools with
+  `CleaningTool::accepts_touch_selection`. Called by `tab.rs` right after `canvas.draw`, with its
+  own stroke state (`touch_selection_point`) apart from the mouse stroke; `tab.rs` declares the
+  tool's answer to the canvas before `draw` (`set_long_press_selection`) and drops a finger drag
+  on a tool switch. Never a synthesized mouse press: the mouse buttons paint and erase here.
 - `autoclean.rs`: quick text-clean image engine. GUI-free core (`run_autoclean_engine`)
   clusters the text mask, then per cluster runs: `has_text_structure` gate -> two candidates
   (A = strokes via `fill_holes`+dilate, B = detector-box union / cluster bbox) ->

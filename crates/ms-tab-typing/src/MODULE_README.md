@@ -429,6 +429,13 @@ saving, and export.
   - `render_jobs.rs`: background edit/create/raster/shape-variant render jobs, loader/migration start.
   - `persist.rs`: text placement save / staging flush / save-to-project (`flush_text_layers`).
   - `create_upload.rs`: create/shift-drag UI, text editor, status overlays, texture upload.
+    Finger input: the Shift+drag capture overlay (`shift_drag_capture_layer_id`) is a touch
+    capture layer of the canvas, so a plain finger pans under it; a finger long-press drag opens
+    the same create rectangle WITHOUT Shift (`ms_canvas::drive_touch_drag` onto
+    `create_selection`, marked `touch`; lift commits through `finish_create_selection`, cancel
+    drops it). `tab.rs` sets `CanvasView::set_long_press_selection` before `canvas.draw` with the
+    same gates the overlay hook applies (`touch_create_selection_available`, mask panel closed,
+    layout editor not editing) — the hook itself only gets `&CanvasView`.
   - `selection_rasters.rs`: overlay/raster selection, remove, text-layer duplication
     (`duplicate_overlay`), raster interact/menu/transform/deform and
     the NON-move raster drags (rotate, perspective corner handle) — a whole-layer move belongs to

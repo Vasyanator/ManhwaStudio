@@ -10,7 +10,7 @@ long-press selection drag. Ordinary UI (panels, menus, dialogs) is not touched.
 
 Main responsibilities:
 - the per-frame publication channel from canvases to the router (`publish_surface`,
-  `publish_capture_layer`), stored in `egui::Context` temp data;
+  `publish_capture_layer`, `publish_hole`), stored in `egui::Context` temp data;
 - the take-once delivery channel from the router to canvases (`take_touch_output`);
 - the public output types (`TouchNavigation`, `TouchSelection`, `TouchOutput`);
 - the long-press timing constant and the promotion-rule constants.
@@ -20,7 +20,7 @@ Key structures:
 - `TouchOutput`: everything one canvas gets from the router for one frame.
 
 Key functions:
-- `publish_surface`, `publish_capture_layer`, `take_touch_output`;
+- `publish_surface`, `publish_capture_layer`, `publish_hole`, `take_touch_output`;
 - `TouchRouter::route` (in `router.rs`), driven by the shell's `raw_input_hook`;
 - `context_menu_popup` (in `menu.rs`), the single open path of canvas context menus.
 
@@ -173,6 +173,10 @@ fn capture_layers_id() -> Id {
     Id::new("ms_touch_nav.capture_layers")
 }
 
+fn holes_id() -> Id {
+    Id::new("ms_touch_nav.holes")
+}
+
 fn deliveries_id() -> Id {
     Id::new("ms_touch_nav.deliveries")
 }
@@ -205,6 +209,19 @@ pub fn publish_capture_layer(ctx: &Context, owner: Id, layer: LayerId) {
     });
 }
 
+/// Publishes `rect` as an extra hole of `owner`'s surface for this frame: a touch that starts
+/// inside it is NOT claimed and egui handles it as usual.
+///
+/// For widgets drawn AFTER the owner published its surface (a tool's on-canvas chrome that
+/// runs after the canvas pass, such as the buttons and handles of a capture overlay), so they
+/// stay operable by a finger. Merged into the owner's surface when the router freezes the
+/// publications; a hole of an owner that published no surface this frame is dropped.
+pub fn publish_hole(ctx: &Context, owner: Id, rect: Rect) {
+    ctx.data_mut(|data| {
+        data.get_temp_mut_or_default::<Vec<(Id, Rect)>>(holes_id()).push((owner, rect));
+    });
+}
+
 /// Takes this frame's output for `owner` (take-once: a second call in the same frame, or a
 /// later pass of it, returns the default).
 ///
@@ -231,14 +248,27 @@ pub fn take_touch_output(ctx: &Context, owner: Id) -> TouchOutput {
     delivery.output
 }
 
-/// Takes the surfaces and capture layers published during the previous frame (the router's
-/// freeze step). Leaves both lists empty for the frame about to run.
+/// Takes the surfaces, extra holes and capture layers published during the previous frame
+/// (the router's freeze step), with every extra hole merged into its owner's surface. Leaves
+/// all lists empty for the frame about to run.
 fn freeze_publications(ctx: &Context) -> (Vec<TouchSurface>, Vec<(Id, LayerId)>) {
     ctx.data_mut(|data| {
-        let surfaces = data.remove_temp::<Vec<TouchSurface>>(surfaces_id()).unwrap_or_default();
+        let mut surfaces = data.remove_temp::<Vec<TouchSurface>>(surfaces_id()).unwrap_or_default();
+        let holes = data.remove_temp::<Vec<(Id, Rect)>>(holes_id()).unwrap_or_default();
+        merge_holes(&mut surfaces, holes);
         let capture = data.remove_temp::<Vec<(Id, LayerId)>>(capture_layers_id()).unwrap_or_default();
         (surfaces, capture)
     })
+}
+
+/// Appends each `(owner, rect)` hole to the surface of that owner; holes of an owner without
+/// a surface are dropped (there is nothing to claim on, so nothing to exempt).
+fn merge_holes(surfaces: &mut [TouchSurface], holes: Vec<(Id, Rect)>) {
+    for (owner, rect) in holes {
+        if let Some(surface) = surfaces.iter_mut().find(|surface| surface.owner == owner) {
+            surface.holes.push(rect);
+        }
+    }
 }
 
 /// Replaces the stored deliveries with this frame's (outputs not taken last frame are dropped).

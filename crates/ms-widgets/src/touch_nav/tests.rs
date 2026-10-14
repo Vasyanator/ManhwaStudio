@@ -25,8 +25,8 @@ use egui::{
 use super::router::{RouteResult, RouterConfig};
 use super::{
     LONG_PRESS_ARM_S, PROMOTION_GRACE_S, TouchOutput, TouchRouter, TouchSelection,
-    TouchSelectionEnd, TouchSurface, context_menu_popup, publish_capture_layer, publish_surface,
-    take_touch_output,
+    TouchSelectionEnd, TouchSurface, context_menu_popup, publish_capture_layer, publish_hole,
+    publish_surface, take_touch_output,
 };
 
 const CFG: RouterConfig = RouterConfig { slop_pt: 6.0, long_press_s: LONG_PRESS_ARM_S };
@@ -661,6 +661,54 @@ fn capture_layer_publication_reaches_the_router() {
     let mut raw = RawInput { time: Some(0.1), events: owning_start(2, floating.center()), ..RawInput::default() };
     router.route(&ctx, &mut raw);
     assert!(only_touch_events(&raw.events), "a touch under the owner's capture layer is claimed");
+}
+
+#[test]
+fn published_hole_of_the_owner_is_not_claimed() {
+    let ctx = Context::default();
+    let mut router = TouchRouter::new(true);
+    let late_hole = Rect::from_min_size(pos2(50.0, 50.0), vec2(40.0, 40.0));
+    publish_surface(&ctx, surface(true));
+    publish_hole(&ctx, owner(), late_hole);
+    // A hole of another owner (no surface of its own) is dropped and exempts nothing.
+    publish_hole(&ctx, Id::new("touch_nav.test.other"), Rect::from_min_size(pos2(150.0, 150.0), vec2(40.0, 40.0)));
+    let in_hole = owning_start(1, late_hole.center());
+    let mut raw = RawInput { time: Some(0.1), events: in_hole.clone(), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+    assert_eq!(raw.events, in_hole, "a touch in a late-published hole keeps egui's emulation");
+    let mut raw = RawInput { time: Some(0.12), events: owning_end(1, late_hole.center(), late_hole.center()), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+
+    // The hole lives one frame like every publication: published again, it still exempts;
+    // the other owner's hole never did.
+    publish_surface(&ctx, surface(true));
+    publish_hole(&ctx, owner(), late_hole);
+    let mut raw = RawInput { time: Some(0.2), events: owning_start(2, pos2(170.0, 170.0)), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+    assert!(only_touch_events(&raw.events), "a foreign owner's hole must not exempt this surface");
+}
+
+#[test]
+fn bare_layer_painter_does_not_block_a_claim() {
+    // A tool outline painted through `ctx.layer_painter` on a higher order (the patch tool's
+    // `Order::Middle` outline) registers no `Area`, so `layer_id_at` never reports it and a
+    // finger over it is claimed like one over bare canvas — no capture registration needed.
+    let ctx = Context::default();
+    let mut router = TouchRouter::new(true);
+    let _floating = warm_up(&ctx, Some(&mut router));
+    let over_outline = pos2(120.0, 120.0);
+    let raw = RawInput { screen_rect: Some(SCREEN), time: Some(0.05), ..RawInput::default() };
+    ctx.run_ui(raw, |ui: &mut Ui| {
+        let _canvas = ui.allocate_rect(canvas_rect(), Sense::click());
+        publish_surface(ui.ctx(), surface(true));
+        let painter = ui.ctx().layer_painter(LayerId::new(Order::Middle, Id::new("touch_nav.test.outline")));
+        painter.rect_filled(Rect::from_center_size(over_outline, vec2(80.0, 80.0)), 0.0, egui::Color32::WHITE);
+    })
+    .drop_without_applying_deltas();
+    assert_eq!(ctx.layer_id_at(over_outline), Some(LayerId::background()));
+    let mut raw = RawInput { time: Some(0.1), events: owning_start(1, over_outline), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+    assert!(only_touch_events(&raw.events), "a finger over a bare layer painter is claimed");
 }
 
 /// Opens the canvas menu with a mouse secondary click at `at` and returns the menu rect

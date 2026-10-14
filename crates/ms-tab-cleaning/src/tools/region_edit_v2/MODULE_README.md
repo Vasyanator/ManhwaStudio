@@ -162,6 +162,12 @@ that owns the context, the canvas and the project at once:
 - **The `Area` is sized to the hitbox, never to the viewport.** A viewport-sized area makes
   egui report the pointer as "over an area" everywhere and kills canvas wheel scrolling. It
   sits on `Order::Middle`, below the dock panels on `Order::Foreground`.
+- **Fingers: the body pans, the chrome stays operable.** After the pass the frame registers its
+  area as a touch capture layer of the canvas and publishes `geometry::chrome_touch_holes(hitbox,
+  body)` (strip, handles, rows and their margins) with `touch_nav::publish_hole`: a finger on the
+  body pans the canvas — the body's primary drag paints the mask, which a finger must never do —
+  and a finger on the chrome reaches its widgets through egui. The frame has no selection drag,
+  so the host keeps `CleaningTool::accepts_touch_selection` `false` and a long-press drag pans.
 - **Hover and drags go through a `Response`.** Never test a raw pointer position against a rect
   to decide hover (`egui-docs/06-overlays.md` §5); the two raw reads that remain — the pointer
   of a drag already claimed through a `Response`, and the mouse button state — are gated on one.

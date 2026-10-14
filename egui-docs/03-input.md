@@ -246,7 +246,16 @@ Facts the canvas finger gestures rely on (owner: `ms_widgets::touch_nav`,
 - **`Context::layer_id_at` over bare canvas returns the background layer**
   (`Some(LayerId::background())`, pinned by the `touch_nav` test
   `layer_id_at_over_bare_canvas_is_the_background_layer`), a Foreground area as itself, and the
-  top modal layer while a modal is open (`egui-0.36.2/src/memory/mod.rs:838-845`).
+  top modal layer while a modal is open (`egui-0.36.2/src/memory/mod.rs:838-845`). It walks only
+  layers that have AREA state (`Areas::layer_id_at`, `egui-0.36.2/src/memory/mod.rs:1245-1267`): a
+  bare `ctx.layer_painter(LayerId::new(Order::Middle, …))` is never reported, so it neither blocks
+  a claim nor needs a capture registration (pinned by `bare_layer_painter_does_not_block_a_claim`).
+  An `Area` over a canvas (a tool's capture overlay) does block it until the tool registers it
+  with `touch_nav::publish_capture_layer`; widgets inside such an area that a finger must still
+  operate are exempted with `touch_nav::publish_hole`.
+- **egui's hit test grows every widget by `interact_radius`** read from the GLOBAL style
+  (`egui-0.36.2/src/context.rs:486`), so a touch hole meant to cover a small handle is the
+  handle's hit rect expanded by that radius (`ms-canvas` `note_touch_handle_hole`).
 - **`Popup::context_menu` anchors at the hover position of the opening frame**
   (`egui-0.36.2/src/containers/popup.rs:248-260`, stored by the `pub(crate)`
   `Memory::open_popup_at`, :522-523). A claimed finger has no hover position, so canvas menus use
@@ -260,7 +269,9 @@ Facts the canvas finger gestures rely on (owner: `ms_widgets::touch_nav`,
 
 - Finger pan / pinch / long-press on a canvas → `ms_widgets::touch_nav` (publish a
   `TouchSurface`, take `TouchOutput`, open menus with `context_menu_popup`); never read
-  `multi_touch()` or touch events directly.
+  `multi_touch()` or touch events directly. A tab mode with a selection drag → set
+  `CanvasView::set_long_press_selection` every frame and map `CanvasView::touch_selection`
+  (`ms_canvas::drive_touch_drag` for a rectangle drag); never synthesize a mouse press.
 - Wheel/zoom on any canvas → `ms_widgets::input_util::raw_wheel_delta` (`crates/ms-widgets/src/input_util.rs:31`).
 - "Did the click hit bare canvas?" → `ms_widgets::input_util::pointer_over_floating_area` (`crates/ms-widgets/src/input_util.rs:55`).
 - New hotkey → register a `HotkeySpecV2` (`src/input_manager_v2.rs`) + handle it in

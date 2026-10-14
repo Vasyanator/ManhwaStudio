@@ -36,6 +36,11 @@ canvas wheel scrolling. The area sits on `Order::Middle`, below the dock panels
 (`Order::Foreground`), which is also what makes `tab.rs`'s z-order occlusion test treat the
 frame as canvas-blocking. Every hover and drag decision goes through a `Response` from
 `Ui::interact`, never through a raw pointer position (`egui-docs/06-overlays.md` §5).
+Touch: the area is a touch capture layer of the canvas, so a finger on the frame BODY pans the
+canvas (the body's primary drag paints the mask, never a finger's job), while the chrome around
+it — strip, handles, button rows — is published as touch holes (`geometry::chrome_touch_holes`)
+and a finger operates it through egui. The frame has no selection drag, so the host leaves the
+canvas' long-press selection off.
 The chrome row holds four buttons — «Применить», «Сравнить», «Отменить», «Стереть маску» —
 and «Сравнить» is a MOMENTARY HOLD, not a toggle: while its pointer button is down the pending
 result layer is not painted, so the original pixels show through. That is why the row is sensed
@@ -47,14 +52,15 @@ Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§1, §2 
 */
 
 use super::geometry::{
-    self, FrameChrome, FrameConstraints, PageChoice, PageView, SizeViolation, hitbox_rect,
-    keep_in_view_delta,
+    self, FrameChrome, FrameConstraints, PageChoice, PageView, SizeViolation, chrome_touch_holes,
+    hitbox_rect, keep_in_view_delta,
 };
 use super::input::{DragKind, DragState, HANDLE_RADIUS, HandleKind, correction_delta_to_px, handle_hit_rects, handle_points, moved_rect_px, resized_rect_px, screen_delta_to_px};
 use super::layers::{MaskLayerSpec, MaskStack, ResultLayer, hollow_rect_boxes};
 use super::render;
 use ms_canvas::{CanvasView, OverlayRectPx};
 use ms_tools::MaskBrush;
+use ms_widgets::touch_nav;
 use egui::{Color32, Id, Pos2, Rect, Sense, Vec2, pos2, vec2};
 
 /// Id source of the frame's `egui::Area` and the stem of every widget id inside it.
@@ -1181,7 +1187,22 @@ impl RegionFrame {
         // 5. The frame's own chrome asks for the same actions as the dock panel, so the two
         //    are merged rather than one replacing the other.
         outcome.merge(area.inner);
+        self.publish_touch_layout(ctx, canvas, anchor.page);
         outcome
+    }
+
+    /// Registers this frame's area as a touch capture layer of `canvas` (a finger on the body
+    /// pans) and its chrome as touch holes (a finger there operates the strip, the handles and
+    /// the buttons). Uses the rectangle the pass settled on, like the painting does.
+    fn publish_touch_layout(&self, ctx: &egui::Context, canvas: &CanvasView, page: PagePlacement) {
+        let owner = canvas.touch_owner_id();
+        touch_nav::publish_capture_layer(ctx, owner, egui::LayerId::new(egui::Order::Middle, Id::new(FRAME_AREA_ID)));
+        let (Some(hitbox), Some(rect_px)) = (self.hitbox, self.rect_px) else {
+            return;
+        };
+        for hole in chrome_touch_holes(hitbox, page.screen_rect(rect_px)) {
+            touch_nav::publish_hole(ctx, owner, hole);
+        }
     }
 
     /// Everything the pass needs about the page the frame is anchored to, this frame.

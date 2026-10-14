@@ -362,8 +362,14 @@ calls `canvas_touch::publish_and_take` every frame a page is resident and:
   through `ms_widgets::touch_nav::context_menu_popup` — the one open path for the secondary click
   and the long-press. `hud_gesture_possible` (Alt + brush) suppresses only the mouse path;
 - draws `canvas_touch::draw_long_press_marker` at `TouchOutput::long_press_armed_at`.
-The surface has no holes: dock panels, popups and region-tool areas are above `Order::Background`,
-and the router never claims a touch there.
+The surface has no holes: dock panels and popups are `Area`s above `Order::Background`, and the
+router never claims a touch there. The patch tool's outline is NOT an `Area` — a bare
+`ctx.layer_painter(Order::Middle)` (`ms_tools::patch`) — and `Context::layer_id_at` never reports a
+layer without area state, so a finger over the outline is claimed like bare canvas and needs no
+capture registration (pinned by the `touch_nav` test `bare_layer_painter_does_not_block_a_claim`).
+A future tool that opens a real `Area` over the canvas must register it through
+`touch_nav::publish_capture_layer` under the canvas' owner id (`canvas_touch::owner_id`) to keep
+the finger panning there.
 
 **The hint grid is a deliberate local duplicate.** `draw_hotkey_rows_grid` re-implements the
 canvas' `CanvasScene::draw_hint_rows_grid` in ~10 lines. That helper is private to the canvas impl,

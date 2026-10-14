@@ -58,7 +58,9 @@ Internal submodules:
 - `bubble_aside_ui`: aside bubble columns, repack, anchor links, and aside drag interactions.
 - `bubble_on_top_ui`: on-top bubble widgets, move/resize handles, and hit-rect tracking.
 - `overlay_runtime`: clean-overlay runtime bucket (state, worker, tile upload, draw/edit ops).
-- `touch`: finger gestures consumer (`touch_owner_id`, touch surface, navigation, long-press).
+- `touch`: finger gestures consumer (`touch_owner_id`, touch surface, navigation, long-press,
+  the long-press selection hand-off `set_long_press_selection` / `touch_selection` /
+  `drive_touch_drag`).
 - `settings`: canvas settings snapshot/publish/persistence logic.
 - `workers`: background worker bootstrap for overlay prepare and settings save.
 
@@ -306,6 +308,7 @@ mod workers;
 // Shadow-only world<->screen transform. Computed from the current ScrollArea
 // layout each frame but not yet consumed; future increments make it authoritative.
 pub use self::view_transform::ViewTransform;
+pub use self::touch::{TouchDrivenDrag, drive_touch_drag};
 
 pub use self::settings::{save_canvas_settings_to_project_file, save_canvas_settings_to_user_file};
 
@@ -1423,6 +1426,8 @@ impl CanvasView {
         self.scene.on_top_hit_rects.clear();
         // Rebuilt by the aside pass below, next to each card's hit response (touch holes).
         self.scene.aside_card_hit_rects.clear();
+        // Rebuilt next to each small handle's `ui.interact` during the scene pass (touch holes).
+        self.scene.handle_hit_rects.clear();
         self.refresh_page_aside_presence();
         let canvas_rect = ui.max_rect();
         let (suppress_wheel_scroll, zoom_drag_active) =

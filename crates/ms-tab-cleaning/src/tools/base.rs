@@ -57,6 +57,12 @@ FILE HEADER (cleaning/tools/base.rs)
     produced NO selection (empty rect, page without a laid-out rect, a violated size limit). The
     same reason stays in `load_error` for `draw_ui_hint`; this copy exists so a tool that draws the
     user's attention onto another surface can repeat it there instead of refusing in silence.
+  - `abort_selection_drag` у `RegionEditToolBase` — drops ONLY the drag in flight (the finger
+    long-press selection was cancelled: a second finger, a mouse press, focus loss); unlike
+    `cancel_selection` (Esc) it leaves a pending load, an open editor and a parked diverted rect
+    alone. `CleaningTool::accepts_touch_selection` / `cancel_touch_selection` are the trait side:
+    the tab drives a finger selection through the ordinary `stroke_begin` / `stroke_update` /
+    `stroke_end` of a tool that accepts it, without the Shift requirement of the mouse.
   - `draw_cursor_tinted` у `RegionEditToolBase` paints the crosshair and the rubber band with a
     caller-chosen INNER stroke colour (the black outer stroke is kept for legibility);
     `draw_cursor` is that with white. A tool tints the cursor when a drag is about to do
@@ -212,6 +218,22 @@ pub trait CleaningTool: Send {
     fn wants_primary_stroke(&self, _point: StrokePoint) -> bool {
         true
     }
+
+    /// Whether a finger long-press drag drives this tool's SELECTION right now.
+    ///
+    /// `true` only for a tool whose primary stroke is a selection drag (the region tools): the
+    /// tab then publishes the canvas with `long_press_selection` and replays the finger drag
+    /// through `stroke_begin` (at the press point) / `stroke_update` / `stroke_end` (on lift),
+    /// skipping `wants_primary_stroke` — the Shift the mouse needs does not apply to a finger.
+    /// A painting tool keeps `false`, so a long-press drag pans and never paints.
+    fn accepts_touch_selection(&self) -> bool {
+        false
+    }
+
+    /// Drops the finger selection drag in flight without committing it (the router reported
+    /// it cancelled: a second finger, a mouse/pen press, a focus loss). Only the drag: what an
+    /// earlier selection produced (a pending load, an open editor) stays.
+    fn cancel_touch_selection(&mut self) {}
 
     fn set_space_pan_active(&mut self, _active: bool) {}
 
@@ -1199,11 +1221,21 @@ impl RegionEditToolBase {
         false
     }
 
-    pub fn cancel_selection(&mut self) {
+    /// Drops the selection drag in flight (rubber band included) without routing it anywhere.
+    ///
+    /// The finger counterpart of releasing nothing: a cancelled touch selection must leave no
+    /// band and no refusal, but — unlike [`RegionEditToolBase::cancel_selection`] (Esc) — it
+    /// must not discard what an EARLIER selection produced (a load in flight, an open editor,
+    /// a parked diverted rect), because the user did not ask to abandon that.
+    pub fn abort_selection_drag(&mut self) {
         self.selecting_page_idx = None;
         self.selection_start_scene = None;
         self.selection_current_scene = None;
         self.selection_rect_scene = None;
+    }
+
+    pub fn cancel_selection(&mut self) {
+        self.abort_selection_drag();
         self.pending_selection = None;
         // A cancelled selection is cancelled whoever it was going to: an unclaimed diverted
         // rect must not survive Escape and be consumed by the next diversion.
@@ -2031,6 +2063,11 @@ impl RegionMaskInpaintToolBase {
     pub fn cancel_selection(&mut self) {
         self.region_base.cancel_selection();
         self.editor_state = None;
+    }
+
+    /// Drops only the selection drag in flight; see [`RegionEditToolBase::abort_selection_drag`].
+    pub fn abort_selection_drag(&mut self) {
+        self.region_base.abort_selection_drag();
     }
 
     pub fn draw_ui_hint(&self, ui: &mut egui::Ui) {

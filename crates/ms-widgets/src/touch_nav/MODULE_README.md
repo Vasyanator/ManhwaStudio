@@ -13,7 +13,7 @@ shell raw_input_hook ──► TouchRouter::route (ROOT viewport only, before eg
    freeze last frame's TouchSurface / capture layers ─► claim on Touch{Start}
    strip the claimed touch's egui-winit mouse emulation ─► gesture state machine
    store per-owner TouchOutput in ctx temp data
-canvas frame ──► publish_surface / publish_capture_layer (for next frame)
+canvas frame ──► publish_surface / publish_capture_layer / publish_hole (for next frame)
              ──► take_touch_output (navigation, long_press_armed_at, long_press_at, selection)
              ──► context_menu_popup(response, long_press_at).show(..)
 ```
@@ -24,8 +24,11 @@ canvas frame ──► publish_surface / publish_capture_layer (for next frame)
 
 ## Gesture contract (per claimed touch)
 - **Claim** on `Touch{Start}` only: inside a surface rect published last frame, outside its
-  holes, with the top layer the background layer (or `None`) or one of that owner's capture
-  layers. A claim lasts until End/Cancel; a claim start closes any open popup.
+  holes (the surface's own plus any `publish_hole` of that owner — for chrome a tool draws after
+  the canvas published, e.g. the buttons and handles of a capture overlay), with the top layer
+  the background layer (or `None`) or one of that owner's capture layers. A bare
+  `ctx.layer_painter` on a higher order is not an `Area` and never blocks a claim
+  (`Context::layer_id_at` skips layers without area state). A claim lasts until End/Cancel; a claim start closes any open popup.
 - **Pending** (sole claimed touch of its owner, no mouse/pen button held): no navigation while
   within `InputOptions::max_click_dist` of the start. Moving beyond it pans, catching up the
   whole distance from the start. After `LONG_PRESS_ARM_S` it **arms**

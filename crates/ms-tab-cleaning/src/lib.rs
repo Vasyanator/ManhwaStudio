@@ -22,6 +22,8 @@ Modules:
 - `autoclean`: the batch "clean the whole chapter" driver.
 - `clean_status`: the «Клин» tab's clean-folder status area (worker scan + dismissible warnings).
 - `watermark_chapter`: the GUI-free chapter-level watermark decomposition engine.
+- `touch_selection`: replays a finger long-press selection drag onto the active tool's stroke
+  hooks (region tools only, `CleaningTool::accepts_touch_selection`).
 */
 
 #![warn(clippy::all)]
@@ -36,6 +38,7 @@ mod autoclean;
 mod clean_status;
 mod tab;
 mod tools;
+mod touch_selection;
 // GUI-free chapter-level watermark decomposition engine (`I = c + s*B`, solved from several
 // occurrences), consumed by the «По главе (точное вычитание)» mode of
 // `tools/watermark_removal.rs`.

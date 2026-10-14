@@ -119,6 +119,17 @@ frame, because the two text-detector edit boxes that hang under it are drawn bef
 it is `None` while the tab is hidden or detached, since `PanelDockOutput::tab_rect` answers for the
 main window alone.
 
+Finger input on the selection modes (`ms_widgets::touch_nav`): both capture areas are registered
+as touch capture layers of the canvas (`publish_capture_layer` under `canvas.touch_owner_id()`), so
+a plain finger PANS under them. A finger long-press drag selects while a mode key is held — the
+hook sets `CanvasView::set_long_press_selection(touch_selection_mode().is_some())` every frame,
+with the pointer path's precedence (crop chord, then advanced, then quick OCR) — and is mapped
+through `ms_canvas::drive_touch_drag` onto the same `image_crop_selection` / `ocr_selection` slot,
+marked `touch` so the pointer path never moves or ends it; a lift commits through the same
+`finish_*` helpers as a mouse release, a cancel drops it. The crop chord predicate the finger uses
+(`image_crop_selection_keys_down`) omits the pointer path's `!any_touches()` gate, which would
+otherwise end the crop under the very finger driving it.
+
 Text-detector mask GPU textures are a reconstructable display cache. The tab exposes memory
 snapshots and coarse eviction methods for those textures, while detector result masks and stored
 text-mask data remain intact for redraw, editing, and disk persistence.

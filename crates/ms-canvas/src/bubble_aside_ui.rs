@@ -2870,6 +2870,12 @@ fn draw_image_bubble_page_overlay(
         // Anchor point: draggable only within its own area.
         let anchor_hit = Rect::from_center_size(anchor_pos, egui::vec2(16.0, 16.0));
         let anchor_resp = ui.interact(anchor_hit, Id::new(("aside_img_anchor", bid, idx)), sense);
+        // Small target: a finger drags the anchor instead of panning (touch hole). The large
+        // red rect and the area rects above stay pannable. Only while the anchor can move: a
+        // hole over an inert anchor would just cost the finger its pan there.
+        if can_drag {
+            canvas.note_touch_handle_hole(ui, anchor_hit);
+        }
         if can_drag
             && anchor_resp.drag_started()
             && let Some(pos) = anchor_resp.interact_pointer_pos()
@@ -2927,6 +2933,8 @@ fn draw_image_area_handles(
             Id::new(("aside_img_handle", bid, area_idx, handle_idx)),
             Sense::click_and_drag(),
         );
+        // A finger must reach the handle, not pan the page under it (touch hole).
+        canvas.note_touch_handle_hole(ui, handle_rect);
         ui.painter().circle_filled(*point, 4.0, Color32::WHITE);
         ui.painter()
             .circle_stroke(*point, 4.0, Stroke::new(1.0, color));

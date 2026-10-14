@@ -6,6 +6,10 @@ FILE HEADER (tabs/cleaning/tab.rs)
     `bottom_hint` stays `None`, so the overlay is not drawn) and does not persist a collapsed flag.
   - `tools` / `active_tool_idx`: набор инструментов и выбранный инструмент.
   - `stroke_active` / `last_stroke_point`: состояние текущего штриха.
+  - `touch_selection_point`: the finger long-press selection drag in flight (its own stroke
+    state, apart from the mouse one), replayed onto the active tool by
+    `crate::touch_selection::drive_tool_touch_selection` right after `canvas.draw`; the tool
+    declares it per frame through `canvas.set_long_press_selection` before `canvas.draw`.
   - `panel_rects`: прямоугольники панелей ДОКА, нарисованных в этом кадре (добавляются в список
     после `canvas.draw`), для фильтрации ввода. Своих плавающих окон у вкладки больше нет.
   - `text_mask_model`: shared-модель маски текста для mask-layer overlay в cleaning-canvas.
@@ -56,6 +60,7 @@ FILE HEADER (tabs/cleaning/tab.rs)
 */
 use super::autoclean::{autoclean_page, AutocleanInputError, UnevenBackgroundTool};
 use super::clean_status::{draw_clean_status, CleanFolderStatus, CleanStatusDismiss, CleanStatusView};
+use super::touch_selection::drive_tool_touch_selection;
 use super::tools::{
     ai_api_editor_tool, ai_editor_tool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
     FluxFillInpaintTool, GradientFillTool, PatchTool, StampTool,
@@ -770,6 +775,9 @@ pub struct CleaningTabState {
     stroke_active: bool,
     last_stroke_point: Option<StrokePoint>,
     active_stroke_page_idx: Option<usize>,
+    /// Last replayed point of the finger long-press selection drag in flight, `None` when
+    /// there is none (`crate::touch_selection`).
+    touch_selection_point: Option<StrokePoint>,
     panel_rects: Vec<egui::Rect>,
     text_mask_model: Option<Arc<Mutex<TextMaskModel>>>,
     quick_text_mask_panel_open: bool,
@@ -814,6 +822,7 @@ impl Default for CleaningTabState {
             stroke_active: false,
             last_stroke_point: None,
             active_stroke_page_idx: None,
+            touch_selection_point: None,
             // The six default dock panels, which is the most this tab puts on
             // screen at once. Nothing else is added: every floating surface of this
             // tab is a dock panel now.
@@ -1039,6 +1048,13 @@ impl CleaningTabState {
                 || (secondary_down && tool.block_canvas_drag_scroll_on_secondary())
         });
         self.canvas.set_drag_scroll_blocked(block_drag_scroll);
+        // A finger long-press drag selects only with a tool whose primary stroke is a selection
+        // (the region tools); with any other tool it pans. One-frame flag, consumed by `draw`.
+        self.canvas.set_long_press_selection(
+            self.tools
+                .get(self.active_tool_idx)
+                .is_some_and(|tool| tool.accepts_touch_selection()),
+        );
         self.canvas
             .set_overlay_upload_min_interval_s(if self.stroke_active {
                 STROKE_OVERLAY_UPLOAD_MIN_INTERVAL_S
@@ -1111,6 +1127,7 @@ impl CleaningTabState {
         // top-left corner (`PanelDockOutput`).
         self.panel_rects.extend(dock_panel_rects);
         self.apply_dock_out(dock_out, project);
+        self.handle_active_tool_touch_selection(ctx);
         self.handle_active_tool_input(ctx, canvas_rect, project);
         let ai_backend_available = self.ai_backend_available();
         let ai_backend_torch_available = self.ai_backend_torch_available();
@@ -1191,6 +1208,11 @@ impl CleaningTabState {
         self.finish_stroke();
 
         if let Some(current) = self.tools.get_mut(self.active_tool_idx) {
+            // A finger selection never outlives its tool: dropped, not committed, exactly as a
+            // tool switch mid-drag means "not this one".
+            if self.touch_selection_point.take().is_some() {
+                current.cancel_touch_selection();
+            }
             current.deactivate(&mut self.canvas);
         }
 
@@ -1586,6 +1608,31 @@ impl CleaningTabState {
                         | egui::Order::Debug
                 )
             })
+    }
+
+    /// Replays this frame's finger long-press selection drag (`CanvasView::touch_selection`,
+    /// set by `canvas.draw` this frame) onto the active tool; see `crate::touch_selection`.
+    fn handle_active_tool_touch_selection(&mut self, ctx: &egui::Context) {
+        let Some(selection) = self.canvas.touch_selection() else {
+            return;
+        };
+        let Some(tool) = self.tools.get_mut(self.active_tool_idx) else {
+            return;
+        };
+        let replayed = drive_tool_touch_selection(
+            tool.as_mut(),
+            &mut self.canvas,
+            &mut self.touch_selection_point,
+            selection,
+            |canvas, previous, pos| {
+                previous
+                    .filter(|idx| canvas.page_contains_scene_pos(*idx, pos))
+                    .or_else(|| canvas.page_index_at_scene_pos(pos))
+            },
+        );
+        if replayed {
+            ctx.request_repaint();
+        }
     }
 
     fn handle_active_tool_input(

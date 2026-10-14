@@ -264,6 +264,14 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - **Panel dock:** one `PanelDockState` per studio window, owned by `MangaApp` and lent to the
   active tab per frame; layouts are keyed by `AppTab::key()` and persisted through the
   `PanelLayout` config section.
+- **Touch on canvases:** one router (`ms_widgets::touch_nav`), run from the main window's
+  `raw_input_hook` (gated by `PlatformFeature::CanvasTouchGestures`, off on Windows/wasm),
+  claims a finger that lands on a published canvas surface and strips egui-winit's simulated
+  mouse press for it, so a finger never reaches a tool. Canvases (`CanvasView`, PS editor)
+  publish their surface + holes each frame and take a typed `TouchOutput` (pan/pinch, long-press
+  menu point, long-press-then-drag selection handed to the active mode via
+  `CanvasView::set_long_press_selection` / `touch_selection`). Mouse and pen (Android stylus is
+  routed as a mouse by the winit fork) keep tool behaviour.
 - **Hotkeys:** `ms_widgets::InputManagerV2` (code-declared specs, user overrides in
   `user_config` -> `Hotkeys`), dispatched by `MangaApp` per active tab.
 

@@ -120,7 +120,7 @@ use ms_canvas as canvas;
 use ms_canvas::{
     BubbleClass, CANVAS_RIBBON_TAB, CanvasBottomHint, CanvasDrawParams, CanvasHooks,
     CanvasUiStatus, CanvasView, CanvasViewportSnapshot, RectCoords, SourceTextureUploadBudget,
-    parse_image_text_areas,
+    TouchDrivenDrag, drive_touch_drag, parse_image_text_areas,
 };
 use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -1141,6 +1141,14 @@ impl TypingTabState {
         canvas.set_zoom_blocked(
             !mask_layer.is_panel_open()
                 && (text_overlays.has_selected_overlay() || layout_editor_active),
+        );
+        // A finger long-press drag creates a text box exactly where the Shift+drag create
+        // overlay can run this frame (the overlay hook below skips it under the same two
+        // conditions); elsewhere it pans. One-frame flag, consumed by this `draw`.
+        canvas.set_long_press_selection(
+            !top_panel.is_mask_panel_open()
+                && !text_overlays.layout_editor_editing_active()
+                && text_overlays.touch_create_selection_available(),
         );
         let mut hooks = TypingHooks {
             text_overlays,
@@ -2168,6 +2176,19 @@ fn scene_rect_from_rect_coords(page_rect: Rect, rect_coords: RectCoords) -> Rect
 struct TypingCreateSelection {
     start: Pos2,
     current: Pos2,
+    /// Started by a finger long-press (`drive_touch_drag`), not by a Shift+drag: the finger's
+    /// `TouchSelection` moves and ends it, and it needs no Shift held.
+    touch: bool,
+}
+
+impl TouchDrivenDrag for TypingCreateSelection {
+    fn is_touch_driven(&self) -> bool {
+        self.touch
+    }
+
+    fn set_current(&mut self, pos: Pos2) {
+        self.current = pos;
+    }
 }
 
 impl TypingCreateSelection {

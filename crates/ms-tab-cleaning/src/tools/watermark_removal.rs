@@ -3419,6 +3419,17 @@ impl CleaningTool for WatermarkRemovalTool {
         self.region_base.end_selection(canvas);
     }
 
+    /// The primary stroke is the region selection (diverted or not), so a finger long-press
+    /// drag selects too. The eyedropper guard of `wants_primary_stroke` does not apply: it
+    /// protects a mouse CLICK, and a finger on the canvas never clicks.
+    fn accepts_touch_selection(&self) -> bool {
+        true
+    }
+
+    fn cancel_touch_selection(&mut self) {
+        self.region_base.abort_selection_drag();
+    }
+
     fn draw_overlay_ui(
         &mut self,
         ctx: &egui::Context,

@@ -681,6 +681,8 @@ pub(super) fn draw_rect_handles(
         let handle_rect = Rect::from_center_size(*point, egui::vec2(10.0, 10.0));
         let id = Id::new(("rect_handle", bid, idx));
         let response = ui.interact(handle_rect, id, Sense::click_and_drag());
+        // A finger must reach the handle, not pan the page under it (touch hole).
+        canvas.note_touch_handle_hole(ui, handle_rect);
 
         ui.painter().circle_filled(*point, 4.0, Color32::WHITE);
         ui.painter().circle_stroke(

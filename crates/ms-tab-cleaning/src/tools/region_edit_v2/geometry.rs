@@ -665,6 +665,30 @@ pub fn hitbox_rect(frame: Rect, chrome: &FrameChrome) -> Rect {
     )
 }
 
+/// The part of `hitbox` outside the frame `body`, as up to four non-overlapping bands (above,
+/// below, left, right): the strip, the handles, the rows and their margins.
+///
+/// These are the frame's touch HOLES: a finger there operates the chrome through egui, while
+/// a finger on the body pans the canvas (the body's own primary drag paints the mask, which a
+/// finger must never do). An empty band is omitted; a body that does not overlap the hitbox
+/// leaves the whole hitbox as one band.
+#[must_use]
+pub fn chrome_touch_holes(hitbox: Rect, body: Rect) -> Vec<Rect> {
+    let inner = body.intersect(hitbox);
+    if !inner.is_positive() {
+        return if hitbox.is_positive() { vec![hitbox] } else { Vec::new() };
+    }
+    [
+        Rect::from_min_max(hitbox.min, pos2(hitbox.max.x, inner.min.y)),
+        Rect::from_min_max(pos2(hitbox.min.x, inner.max.y), hitbox.max),
+        Rect::from_min_max(pos2(hitbox.min.x, inner.min.y), pos2(inner.min.x, inner.max.y)),
+        Rect::from_min_max(pos2(inner.max.x, inner.min.y), pos2(hitbox.max.x, inner.max.y)),
+    ]
+    .into_iter()
+    .filter(Rect::is_positive)
+    .collect()
+}
+
 /// Width of the chrome rows for a frame `frame_w` screen points wide.
 ///
 /// One place, so the hitbox the viewport clamp works on and the rows the frame paints can
@@ -1004,6 +1028,27 @@ pub fn offscreen_arrow(target: Rect, viewport: Rect) -> Option<OffscreenArrow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_touch_holes_cover_the_hitbox_except_the_body() {
+        let body = Rect::from_min_max(pos2(100.0, 100.0), pos2(300.0, 250.0));
+        let hitbox = Rect::from_min_max(pos2(80.0, 60.0), pos2(320.0, 330.0));
+        let holes = chrome_touch_holes(hitbox, body);
+        assert_eq!(holes.len(), 4);
+        let area: f32 = holes.iter().map(|hole| hole.area()).sum();
+        assert!((area - (hitbox.area() - body.area())).abs() < 1e-3, "bands tile the ring exactly");
+        let in_holes = |pos| holes.iter().any(|hole: &Rect| hole.contains(pos));
+        assert!(!in_holes(body.center()), "the body pans");
+        for chrome in [pos2(200.0, 70.0), pos2(200.0, 300.0), pos2(90.0, 175.0), pos2(310.0, 175.0), pos2(81.0, 61.0)] {
+            assert!(in_holes(chrome), "{chrome:?} is chrome");
+        }
+        // No side margin: the side bands vanish.
+        let flush = Rect::from_min_max(pos2(100.0, 60.0), pos2(300.0, 330.0));
+        assert_eq!(chrome_touch_holes(flush, body).len(), 2);
+        // A body off the hitbox leaves it whole.
+        let away = Rect::from_min_max(pos2(900.0, 900.0), pos2(950.0, 950.0));
+        assert_eq!(chrome_touch_holes(hitbox, away), vec![hitbox]);
+    }
 
     /// The size contract FLUX.2 klein declares, reused as a realistic constraint set.
     fn klein() -> FrameConstraints {

@@ -41,6 +41,16 @@ Shift-drag hook), so accepting it takes nothing from any other gesture. The pair
 accepted IN THAT STATE, and a hint naming a gesture the tool refuses is the defect this rule
 exists to prevent. A tool that never diverts keeps the Shift-only gate unchanged.
 
+A FINGER selects without Shift (user decision): a finger never reaches the stroke pipeline as a
+pointer (`ms_widgets::touch_nav` claims it), and a long-press drag reaches a tool whose
+`CleaningTool::accepts_touch_selection` is `true` (every region tool over `RegionEditToolBase`)
+as a replay of `stroke_begin` at the press point / `stroke_update` / `stroke_end` on lift
+(`../touch_selection.rs`), skipping `wants_primary_stroke`. A cancelled finger drag calls
+`cancel_touch_selection` → `abort_selection_drag`, which drops only the drag in flight; Esc's
+`cancel_selection` also drops the pending load, the editor and a parked diverted rect, which a
+second finger touching the screen must not do. Painting tools keep the default `false`, so a
+long-press drag pans and never paints.
+
 A finished drag that produces NO rectangle is REFUSED WITH A REASON, never dropped: `load_error`
 holds it for `draw_ui_hint`, and `take_selection_refusal` is the one-shot drain a diverting tool
 uses to repeat it on the surface it drew the user's attention onto. The same applies to a

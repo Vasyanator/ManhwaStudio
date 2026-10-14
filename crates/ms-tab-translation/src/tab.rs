@@ -104,6 +104,9 @@ Characters/footer sync:
 OCR flow:
 - `poll_ocr_events`: consumes OCR controller events, toasts, optional bubble insert, retry logic.
 - `handle_ocr_selection`: OCR selection capture layer and finalize behavior.
+- `touch_selection_mode` / `begin_touch_ocr_selection`: the finger long-press selection drag of
+  the held OCR / crop mode (driven through `ms_canvas::drive_touch_drag`); the capture areas are
+  registered as touch capture layers of the canvas, so a plain finger pans under them.
 - `open_advanced_recognition_for_scene_rect`: opens advanced-recognition window for selected scene rect.
 - `wants_canvas_shift_drag_selection` (CanvasHooks): reserves canvas drag for OCR capture.
 
@@ -214,7 +217,7 @@ Key TranslationTabState field groups:
 use ms_widgets::bubble_status::{BubbleBorderStyle, BubbleStatusContext, evaluate_bubble_status_rules};
 use ms_canvas::{
     BubbleAction, BubbleClass, CANVAS_RIBBON_TAB, CanvasHooks, CanvasScrollbarContext,
-    CanvasUiStatus, CanvasView, TranslationStatusDisplay,
+    CanvasUiStatus, CanvasView, TouchDrivenDrag, TranslationStatusDisplay, drive_touch_drag,
 };
 use ms_widgets::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, ModifierOnlyV2};
 use ms_memory::{
@@ -524,18 +527,52 @@ enum OcrSelectionKind {
     Advanced,
 }
 
+/// The capture mode a finger long-press drag drives this frame (see `touch_selection_mode`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TouchSelectionMode {
+    /// Shift+Q held: page-crop selection for an image bubble.
+    ImageCrop,
+    /// An OCR selection modifier held: quick or advanced OCR of the selected rect.
+    Ocr(OcrSelectionKind),
+}
+
 #[derive(Debug, Clone)]
 struct OcrDragSelection {
     start: Pos2,
     current: Pos2,
     kind: OcrSelectionKind,
     recent_character_rank: Option<usize>,
+    /// Started by a finger long-press (`drive_touch_drag`), not by a mouse drag: the finger's
+    /// `TouchSelection` moves it and ends it, the pointer path never does.
+    touch: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ImageCropDragSelection {
     start: Pos2,
     current: Pos2,
+    /// Started by a finger long-press; see `OcrDragSelection::touch`.
+    touch: bool,
+}
+
+impl TouchDrivenDrag for OcrDragSelection {
+    fn is_touch_driven(&self) -> bool {
+        self.touch
+    }
+
+    fn set_current(&mut self, pos: Pos2) {
+        self.current = pos;
+    }
+}
+
+impl TouchDrivenDrag for ImageCropDragSelection {
+    fn is_touch_driven(&self) -> bool {
+        self.touch
+    }
+
+    fn set_current(&mut self, pos: Pos2) {
+        self.current = pos;
+    }
 }
 
 impl ImageCropDragSelection {
@@ -1306,10 +1343,39 @@ impl TranslationTabState {
         self.hotkey_hints.ocr_advanced_selection_mode_modifier_down
     }
 
+    /// Whether the crop mode's chord (Shift+Q) is held, with no text field taking the keys.
+    fn image_crop_selection_keys_down(ctx: &egui::Context) -> bool {
+        ctx.input(|input| input.modifiers.shift && input.key_down(egui::Key::Q))
+            && !ctx.egui_wants_keyboard_input()
+    }
+
+    /// The crop mode as the POINTER path sees it: the chord held and no finger on the screen.
+    /// The finger path asks `image_crop_selection_keys_down` instead — its own touch would
+    /// otherwise switch the mode off under the selection it drives.
     fn image_crop_selection_mode_active(ctx: &egui::Context) -> bool {
-        ctx.input(|input| {
-            input.modifiers.shift && input.key_down(egui::Key::Q) && !input.any_touches()
-        }) && !ctx.egui_wants_keyboard_input()
+        Self::image_crop_selection_keys_down(ctx) && !ctx.input(|input| input.any_touches())
+    }
+
+    /// The capture mode a finger long-press drag drives this frame, or `None` (the drag pans).
+    ///
+    /// The same precedence the pointer path applies: the crop chord wins over the OCR
+    /// modifiers, OCR needs the AI features and no open advanced-recognition window, and the
+    /// advanced modifier wins over the quick one. A mode is a held key here, so a finger
+    /// selects only while its mode is held, exactly like the mouse.
+    fn touch_selection_mode(&self, ctx: &egui::Context) -> Option<TouchSelectionMode> {
+        if Self::image_crop_selection_keys_down(ctx) {
+            return Some(TouchSelectionMode::ImageCrop);
+        }
+        if !self.ai_enabled || self.advanced_recognition.is_open() {
+            return None;
+        }
+        if self.ocr_advanced_selection_mode_active() {
+            Some(TouchSelectionMode::Ocr(OcrSelectionKind::Advanced))
+        } else if self.ocr_quick_selection_mode_active() {
+            Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple))
+        } else {
+            None
+        }
     }
 
     fn panel_title(&self, panel: TranslationPanel) -> String {
@@ -4671,14 +4737,33 @@ impl TranslationTabState {
         canvas: &mut CanvasView,
         project: &ProjectData,
     ) {
+        let crop_keys_down = Self::image_crop_selection_keys_down(ctx);
         let crop_mode_active = Self::image_crop_selection_mode_active(ctx);
+        let touch = canvas.touch_selection();
         let selection_active = self.image_crop_selection.is_some();
-        if !crop_mode_active && !selection_active {
+        if !crop_mode_active && !selection_active && !(crop_keys_down && touch.is_some()) {
             return;
         }
 
-        egui::Area::new("translation_image_crop_selection_capture".into())
-            .order(egui::Order::Foreground)
+        // The finger first (see `drive_touch_drag`): its selection starts at the long-press
+        // point and ends on lift exactly like a mouse release below.
+        if let Some(touch) = touch
+            && let Some(finished) = drive_touch_drag(&mut self.image_crop_selection, touch, |origin| {
+                (crop_keys_down && contains_any_page(canvas, project, origin))
+                    .then_some(ImageCropDragSelection { start: origin, current: origin, touch: true })
+            })
+        {
+            self.finish_image_crop_selection(ctx, canvas, project, finished);
+        }
+
+        let capture_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("translation_image_crop_selection_capture"),
+        );
+        // A finger under the capture area pans the canvas; only a long-press drag selects.
+        ms_widgets::touch_nav::publish_capture_layer(ctx, canvas.touch_owner_id(), capture_layer);
+        egui::Area::new(capture_layer.id)
+            .order(capture_layer.order)
             .fixed_pos(canvas_rect.min)
             .show(ctx, |ui| {
                 ui.set_min_size(canvas_rect.size());
@@ -4697,22 +4782,28 @@ impl TranslationTabState {
                     self.image_crop_selection = Some(ImageCropDragSelection {
                         start: pos,
                         current: pos,
+                        touch: false,
                     });
                 }
 
                 if let Some(selection) = self.image_crop_selection.as_mut()
+                    && !selection.touch
                     && let Some(pos) = ctx.input(|input| input.pointer.latest_pos())
                 {
                     selection.current = pos;
                 }
 
-                let should_finish = self.image_crop_selection.is_some()
-                    && (response.drag_stopped() || !crop_mode_active);
-                if should_finish && let Some(selection) = self.image_crop_selection.take() {
-                    let rect = selection.rect();
-                    if rect.width() >= 4.0 && rect.height() >= 4.0 {
-                        self.apply_image_crop_selection(ctx, canvas, project, rect);
+                // A finger selection ends on lift (above) or when the chord is released; a mouse
+                // selection on its drag stop or when the mode ends.
+                let should_finish = self.image_crop_selection.is_some_and(|selection| {
+                    if selection.touch {
+                        !crop_keys_down
+                    } else {
+                        response.drag_stopped() || !crop_mode_active
                     }
+                });
+                if should_finish && let Some(selection) = self.image_crop_selection.take() {
+                    self.finish_image_crop_selection(ctx, canvas, project, selection);
                 }
             });
 
@@ -4729,6 +4820,21 @@ impl TranslationTabState {
                 Stroke::new(2.0, Color32::from_rgb(220, 35, 35)),
                 egui::StrokeKind::Outside,
             );
+        }
+    }
+
+    /// Commits a finished crop drag (mouse release or finger lift): a rect of at least 4x4
+    /// points becomes the image bubble's page crop, a smaller one is dropped.
+    fn finish_image_crop_selection(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: &mut CanvasView,
+        project: &ProjectData,
+        selection: ImageCropDragSelection,
+    ) {
+        let rect = selection.rect();
+        if rect.width() >= 4.0 && rect.height() >= 4.0 {
+            self.apply_image_crop_selection(ctx, canvas, project, rect);
         }
     }
 
@@ -4824,8 +4930,26 @@ impl TranslationTabState {
             return;
         }
 
-        egui::Area::new("translation_ocr_selection_capture".into())
-            .order(egui::Order::Foreground)
+        // The finger first (see `drive_touch_drag`): its selection starts at the long-press
+        // point, takes the kind of the modifier held then, and ends on lift exactly like a
+        // mouse release below.
+        if let Some(touch) = canvas.touch_selection() {
+            let mode = self.touch_selection_mode(ctx);
+            if let Some(finished) = drive_touch_drag(&mut self.ocr_selection, touch, |origin| {
+                begin_touch_ocr_selection(mode, contains_any_page(canvas, project, origin), origin, recent_character_rank_from_input(ctx))
+            }) {
+                self.finish_ocr_selection(ctx, canvas, project, finished);
+            }
+        }
+
+        let capture_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("translation_ocr_selection_capture"),
+        );
+        // A finger under the capture area pans the canvas; only a long-press drag selects.
+        ms_widgets::touch_nav::publish_capture_layer(ctx, canvas.touch_owner_id(), capture_layer);
+        egui::Area::new(capture_layer.id)
+            .order(capture_layer.order)
             .fixed_pos(canvas_rect.min)
             .show(ctx, |ui| {
                 ui.set_min_size(canvas_rect.size());
@@ -4853,43 +4977,32 @@ impl TranslationTabState {
                         current: pos,
                         kind,
                         recent_character_rank: recent_character_rank_from_input(ctx),
+                        touch: false,
                     });
                 }
 
-                if let Some(selection) = self.ocr_selection.as_mut()
-                    && let Some(pos) = ctx.input(|i| i.pointer.latest_pos())
-                {
-                    selection.current = pos;
+                if let Some(selection) = self.ocr_selection.as_mut() {
+                    // The finger's corner comes from its `TouchSelection` (above), never from
+                    // the pointer; the character rank is a key either way.
+                    if !selection.touch
+                        && let Some(pos) = ctx.input(|i| i.pointer.latest_pos())
+                    {
+                        selection.current = pos;
+                    }
                     if let Some(rank) = recent_character_rank_from_input(ctx) {
                         selection.recent_character_rank = Some(rank);
                     }
                 }
 
+                // Releasing the selection's modifier ends it for both sources; a drag stop only
+                // ends a mouse selection (a finger one ended on lift above).
                 let should_finish = self.ocr_selection.as_ref().is_some_and(|selection| {
-                    response.drag_stopped()
+                    (!selection.touch && response.drag_stopped())
                         || (selection.kind == OcrSelectionKind::Advanced && !advanced_mode_active)
                         || (selection.kind == OcrSelectionKind::Simple && !quick_mode_active)
                 });
                 if should_finish && let Some(selection) = self.ocr_selection.take() {
-                    let rect = selection.rect();
-                    if rect.width() >= 4.0 && rect.height() >= 4.0 {
-                        match selection.kind {
-                            OcrSelectionKind::Simple => {
-                                self.start_ocr_for_scene_rect(
-                                    ctx,
-                                    canvas,
-                                    project,
-                                    rect,
-                                    selection.recent_character_rank,
-                                );
-                            }
-                            OcrSelectionKind::Advanced => {
-                                self.open_advanced_recognition_for_scene_rect(
-                                    ctx, canvas, project, rect,
-                                );
-                            }
-                        }
-                    }
+                    self.finish_ocr_selection(ctx, canvas, project, selection);
                 }
             });
 
@@ -4906,6 +5019,29 @@ impl TranslationTabState {
                 Stroke::new(2.0, ms_theme::canvas::SELECTION),
                 egui::StrokeKind::Outside,
             );
+        }
+    }
+
+    /// Commits a finished OCR drag (mouse release, finger lift or modifier release): a rect of
+    /// at least 4x4 points starts the quick OCR or opens the advanced recognition window.
+    fn finish_ocr_selection(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: &CanvasView,
+        project: &ProjectData,
+        selection: OcrDragSelection,
+    ) {
+        let rect = selection.rect();
+        if rect.width() < 4.0 || rect.height() < 4.0 {
+            return;
+        }
+        match selection.kind {
+            OcrSelectionKind::Simple => {
+                self.start_ocr_for_scene_rect(ctx, canvas, project, rect, selection.recent_character_rank);
+            }
+            OcrSelectionKind::Advanced => {
+                self.open_advanced_recognition_for_scene_rect(ctx, canvas, project, rect);
+            }
         }
     }
 
@@ -5707,6 +5843,9 @@ impl CanvasHooks for TranslationTabState {
         self.poll_mt_events(ctx, canvas);
         self.poll_ai_api_events(ctx);
         self.handle_image_bubble_hotkeys(ctx, canvas, project);
+        // Inside `draw`, before the canvas publishes its touch surface at the end of it: a
+        // finger claimed next frame drags a selection only while a selection mode is held.
+        canvas.set_long_press_selection(self.touch_selection_mode(ctx).is_some());
         self.handle_image_crop_selection(ctx, canvas_rect, canvas, project);
         self.handle_ocr_selection(ctx, canvas_rect, canvas, project);
         self.handle_advanced_recognition_window(ctx, canvas, project);
@@ -7350,6 +7489,56 @@ fn parse_u32_pair(value: Option<&Value>) -> Option<[u32; 2]> {
     let w = arr[0].as_u64().and_then(|v| u32::try_from(v).ok())?;
     let h = arr[1].as_u64().and_then(|v| u32::try_from(v).ok())?;
     Some([w, h])
+}
+
+/// The finger OCR drag a long-press at `origin` starts, or `None` when it must not start: the
+/// mode held is not an OCR mode (`None`, or the crop chord, which owns the gesture) or the
+/// press is not on a page (`on_page`), the same refusal the mouse drag applies.
+fn begin_touch_ocr_selection(
+    mode: Option<TouchSelectionMode>,
+    on_page: bool,
+    origin: Pos2,
+    recent_character_rank: Option<usize>,
+) -> Option<OcrDragSelection> {
+    let Some(TouchSelectionMode::Ocr(kind)) = mode else {
+        return None;
+    };
+    on_page.then_some(OcrDragSelection { start: origin, current: origin, kind, recent_character_rank, touch: true })
+}
+
+#[cfg(test)]
+mod touch_selection_tests {
+    use super::{OcrDragSelection, OcrSelectionKind, TouchSelectionMode, begin_touch_ocr_selection};
+    use eframe::egui::{Rect, pos2};
+    use ms_canvas::drive_touch_drag;
+    use ms_widgets::touch_nav::{TouchSelection, TouchSelectionEnd};
+
+    #[test]
+    fn a_finger_ocr_drag_starts_only_in_an_ocr_mode_on_a_page() {
+        let origin = pos2(40.0, 50.0);
+        for kind in [OcrSelectionKind::Simple, OcrSelectionKind::Advanced] {
+            let drag = begin_touch_ocr_selection(Some(TouchSelectionMode::Ocr(kind)), true, origin, Some(2))
+                .expect("an OCR mode on a page starts the drag");
+            assert_eq!((drag.start, drag.current, drag.kind, drag.recent_character_rank, drag.touch), (origin, origin, kind, Some(2), true));
+        }
+        assert!(begin_touch_ocr_selection(Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple)), false, origin, None).is_none(), "off-page press");
+        assert!(begin_touch_ocr_selection(Some(TouchSelectionMode::ImageCrop), true, origin, None).is_none(), "the crop chord owns the gesture");
+        assert!(begin_touch_ocr_selection(None, true, origin, None).is_none(), "no mode held");
+    }
+
+    #[test]
+    fn a_finger_ocr_drag_commits_the_rect_from_the_press_point_on_lift() {
+        let origin = pos2(10.0, 10.0);
+        let mut slot: Option<OcrDragSelection> = None;
+        let begin = |at| begin_touch_ocr_selection(Some(TouchSelectionMode::Ocr(OcrSelectionKind::Advanced)), true, at, None);
+        let step = TouchSelection { origin, pos: pos2(60.0, 30.0), began: true, end: None };
+        assert!(drive_touch_drag(&mut slot, step, begin).is_none());
+        let lift = TouchSelection { origin, pos: pos2(80.0, 90.0), began: false, end: Some(TouchSelectionEnd::Released) };
+        let finished = drive_touch_drag(&mut slot, lift, begin).expect("lift commits");
+        assert_eq!(finished.rect(), Rect::from_two_pos(origin, pos2(80.0, 90.0)));
+        assert_eq!(finished.kind, OcrSelectionKind::Advanced);
+        assert!(slot.is_none());
+    }
 }
 
 fn contains_any_page(canvas: &CanvasView, project: &ProjectData, pos: Pos2) -> bool {

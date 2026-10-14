@@ -143,6 +143,15 @@ impl CleaningTool for GradientFillTool {
         self.inpaint_base.end_selection(canvas);
     }
 
+    /// The primary stroke is the region selection, so a finger long-press drag selects too.
+    fn accepts_touch_selection(&self) -> bool {
+        true
+    }
+
+    fn cancel_touch_selection(&mut self) {
+        self.inpaint_base.abort_selection_drag();
+    }
+
     fn draw_overlay_ui(
         &mut self,
         ctx: &egui::Context,

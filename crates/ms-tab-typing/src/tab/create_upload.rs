@@ -8,6 +8,11 @@ create-overlay/create-raster render workers, transient status hints, runtime
 overlay insertion into the doc, raster mask-clip preparation, and the
 per-overlay texture upload/dirty-tracking helpers on `TypingTextOverlayLayer`.
 
+Touch: the Shift+drag capture overlay is a touch capture layer of the canvas, so a plain finger
+pans under it; a finger long-press drag (`CanvasView::touch_selection`) drives the same
+`create_selection` without Shift, through `ms_canvas::drive_touch_drag`, and commits on lift
+like a mouse release (`finish_create_selection`).
+
 Notes:
 Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
 submodules of `tab` can use them. `use super::*;` pulls in the parent module's
@@ -82,6 +87,12 @@ fn editor_font_family_name(font_identity: &str, content_id: u64, face_index: usi
     format!("typing-editor-font-{:016x}", hasher.finish())
 }
 
+/// The finger create drag a long-press at `origin` starts, or `None` when the press is not on a
+/// page (`on_page`) — the same refusal the Shift+drag applies.
+fn begin_touch_create_selection(on_page: bool, origin: Pos2) -> Option<TypingCreateSelection> {
+    on_page.then_some(TypingCreateSelection { start: origin, current: origin, touch: true })
+}
+
 impl TypingCreateTextEditor {
     /// Font size the FIELD is drawn at: the panel's size scaled to this editor's view of the
     /// page, so the glyphs being typed are already the size the render will put in this box.
@@ -152,6 +163,17 @@ impl TypingTextOverlayLayer {
         self.draw_status_warning(ctx, canvas_rect);
     }
 
+    /// Whether a new create selection may start now (nothing loading, no editor open and no
+    /// create / raster job in flight) — the gate of `capture_shift_drag_selection`, also used
+    /// for `CanvasView::set_long_press_selection` so a finger drag selects only when it can.
+    pub(super) fn touch_create_selection_available(&self) -> bool {
+        self.loading_rx.is_none()
+            && self.create_editor.is_none()
+            && self.create_render_state.is_none()
+            && self.create_raster_state.is_none()
+            && self.raster_effects_state.is_none()
+    }
+
     pub(super) fn capture_shift_drag_selection(
         &mut self,
         ctx: &egui::Context,
@@ -160,15 +182,22 @@ impl TypingTextOverlayLayer {
         project: &ProjectData,
         top_panel: &TypingTopPanelState,
     ) {
-        if self.loading_rx.is_some()
-            || self.create_editor.is_some()
-            || self.create_render_state.is_some()
-            || self.create_raster_state.is_some()
-            || self.raster_effects_state.is_some()
-        {
+        if !self.touch_create_selection_available() {
             return;
         }
         let shift_down = ctx.input(|i| i.modifiers.shift);
+
+        // The finger first (see `drive_touch_drag`): it needs no Shift, starts at the
+        // long-press point and commits on lift exactly like a mouse release below.
+        if let Some(touch) = canvas.touch_selection()
+            && let Some(finished) = drive_touch_drag(&mut self.create_selection, touch, |origin| {
+                begin_touch_create_selection(contains_any_page(canvas, project, origin), origin)
+            })
+        {
+            self.finish_create_selection(ctx, canvas, project, top_panel, finished);
+            return;
+        }
+
         let selection_active = self.create_selection.is_some();
         if !shift_down && !selection_active {
             return;
@@ -179,6 +208,8 @@ impl TypingTextOverlayLayer {
         // widgets keep receiving hover/scroll; Middle still sits above the Background canvas,
         // so drag-selection over bare canvas is unaffected.
         let capture_layer = shift_drag_capture_layer_id();
+        // A finger under the overlay pans the canvas; only a long-press drag selects.
+        ms_widgets::touch_nav::publish_capture_layer(ctx, canvas.touch_owner_id(), capture_layer);
         egui::Area::new(capture_layer.id)
             .order(capture_layer.order)
             .fixed_pos(canvas_rect.min)
@@ -201,26 +232,44 @@ impl TypingTextOverlayLayer {
                     self.create_selection = Some(TypingCreateSelection {
                         start: pos,
                         current: pos,
+                        touch: false,
                     });
                 }
 
                 if let Some(selection) = self.create_selection.as_mut()
+                    && !selection.touch
                     && let Some(pos) = ctx.input(|i| i.pointer.latest_pos())
                 {
                     selection.current = pos;
                 }
 
-                let should_finish =
-                    self.create_selection.is_some() && (response.drag_stopped() || !shift_down);
+                // Only a mouse selection ends here (drag stop or Shift released); a finger one
+                // ends on lift above and never depends on Shift.
+                let should_finish = self
+                    .create_selection
+                    .is_some_and(|selection| !selection.touch && (response.drag_stopped() || !shift_down));
                 if should_finish && let Some(selection) = self.create_selection.take() {
-                    let rect = selection.rect();
-                    if rect.width() >= TEXT_CREATE_SELECTION_MIN_SIDE_PX
-                        && rect.height() >= TEXT_CREATE_SELECTION_MIN_SIDE_PX
-                    {
-                        self.open_text_editor_for_selection(ctx, canvas, project, top_panel, rect);
-                    }
+                    self.finish_create_selection(ctx, canvas, project, top_panel, selection);
                 }
             });
+    }
+
+    /// Commits a finished create drag (mouse release, Shift release or finger lift): a rect of
+    /// at least `TEXT_CREATE_SELECTION_MIN_SIDE_PX` per side opens the on-canvas text editor.
+    fn finish_create_selection(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: &CanvasView,
+        project: &ProjectData,
+        top_panel: &TypingTopPanelState,
+        selection: TypingCreateSelection,
+    ) {
+        let rect = selection.rect();
+        if rect.width() >= TEXT_CREATE_SELECTION_MIN_SIDE_PX
+            && rect.height() >= TEXT_CREATE_SELECTION_MIN_SIDE_PX
+        {
+            self.open_text_editor_for_selection(ctx, canvas, project, top_panel, rect);
+        }
     }
 
     pub(super) fn draw_active_shift_selection(&self, ctx: &egui::Context) {
@@ -1388,5 +1437,26 @@ mod tests {
             "a vanishing box must still yield a layout-able size, got {size}"
         );
         assert!(size.is_finite(), "the drawn size must never be NaN or infinite");
+    }
+
+    #[test]
+    fn a_finger_create_drag_starts_on_a_page_and_commits_its_rect_on_lift() {
+        use ms_widgets::touch_nav::{TouchSelection, TouchSelectionEnd};
+        let origin = egui::pos2(20.0, 30.0);
+        assert!(begin_touch_create_selection(false, origin).is_none(), "an off-page press starts nothing");
+        let begin = |at| begin_touch_create_selection(true, at);
+        let mut slot: Option<TypingCreateSelection> = None;
+        let drag = TouchSelection { origin, pos: egui::pos2(90.0, 35.0), began: true, end: None };
+        assert!(drive_touch_drag(&mut slot, drag, begin).is_none());
+        assert!(slot.is_some_and(|selection| selection.touch && selection.start == origin));
+        let lift = TouchSelection { origin, pos: egui::pos2(120.0, 140.0), began: false, end: Some(TouchSelectionEnd::Released) };
+        let finished = drive_touch_drag(&mut slot, lift, begin).expect("lift commits");
+        assert_eq!(finished.rect(), Rect::from_two_pos(origin, egui::pos2(120.0, 140.0)));
+        assert!(slot.is_none());
+        // A cancel (second finger, mouse press) drops it without opening an editor.
+        assert!(drive_touch_drag(&mut slot, drag, begin).is_none());
+        let cancel = TouchSelection { end: Some(TouchSelectionEnd::Cancelled), began: false, ..drag };
+        assert!(drive_touch_drag(&mut slot, cancel, begin).is_none());
+        assert!(slot.is_none());
     }
 }
