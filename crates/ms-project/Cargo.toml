@@ -41,6 +41,11 @@ rayon.workspace = true
 # Wall-clock timestamps that also work on wasm32 (`SystemTime` is unusable there).
 web-time.workspace = true
 
+# Android only: `flock` for the single-image scratch lock, because the stable std's
+# `File::try_lock` returns `Unsupported` there (see `single_image::try_lock_exclusive`).
+[target.'cfg(target_os = "android")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 # Isolated on-disk chapter fixtures for the save-to-project merge tests.
 tempfile.workspace = true

@@ -61,7 +61,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   kind -> `Picked` mapping. `tests.rs` holds its host tests.
 - `file_dialog/{desktop,android,unavailable}.rs`: one backend per target (dispatch via
   `use … as backend`).
-- `file_dialog/mime.rs`: pure filter -> MIME mapping for SAF.
+- `file_dialog/mime.rs`: filter -> MIME mapping for SAF. One unmapped extension widens the whole
+  request to `*/*` (logged at info with the extension); callers guard their filters with a test.
 - `clipboard/{mod,desktop,android,unavailable}.rs`: clipboard API and backends.
 - `message.rs`: `show_error_blocking` (startup only).
 - `android/`: `jni_ctx.rs` (Android only), `saf.rs` (pure SAF half, host-tested in

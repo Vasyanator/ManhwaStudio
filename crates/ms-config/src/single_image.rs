@@ -68,8 +68,9 @@ const SCRATCH_DIR_NAME: &str = "manhwastudio-single-image";
 /// directory under [`scratch_base`] is never deleted.
 pub const SCRATCH_MARKER_FILE: &str = ".ms-single-image";
 
-/// Lock file at a session root, held with an exclusive `File::try_lock` for the session's whole
-/// life. A sweep that acquires it knows the owning process is gone.
+/// Lock file at a session root, held with an exclusive non-blocking advisory lock for the
+/// session's whole life (`File::try_lock`; on Android a direct `flock(LOCK_EX | LOCK_NB)`, see
+/// `ms_project::single_image`). A sweep that acquires it knows the owning process is gone.
 pub const SCRATCH_LOCK_FILE: &str = ".lock";
 
 /// Longest user-name suffix [`scratch_dir_name`] keeps (bytes of the sanitized ASCII name).

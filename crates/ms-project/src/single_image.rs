@@ -30,9 +30,10 @@ Key items:
 
 Notes:
 Native only (`cfg(not(target_arch = "wasm32"))` on the `mod` line): it needs the OS temp dir
-and file locks. Like `project_scan.rs` it uses `std::fs` directly rather than the
-`ms_storage` seam: the scratch and the user's file are real native paths, and the desktop
-seam is a passthrough anyway. Every function here blocks on disk I/O and decoding: call it on
+and file locks (`File::try_lock`; a direct `flock` on Android, see `try_lock_exclusive`).
+Like `project_scan.rs` it uses `std::fs` directly rather than the `ms_storage` seam: the
+scratch and the user's file are real native paths, and the desktop seam is a passthrough
+anyway. Every function here blocks on disk I/O and decoding: call it on
 a worker (the studio's open worker, or the teardown worker that releases the scratch), never on
 the GUI thread. Pixels and ICC bytes are
 never logged.
@@ -259,10 +260,52 @@ fn lock_and_mark(root: &Path) -> Result<File, SingleImageError> {
         .create_new(true)
         .open(&lock_path)
         .map_err(|err| SingleImageError::Lock { path: lock_path.clone(), reason: err.to_string() })?;
-    lock.try_lock().map_err(|err| SingleImageError::Lock { path: lock_path.clone(), reason: err.to_string() })?;
+    try_lock_exclusive(&lock).map_err(|err| SingleImageError::Lock { path: lock_path.clone(), reason: try_lock_error_text(&err) })?;
     let marker_path = root.join(SCRATCH_MARKER_FILE);
     std::fs::write(&marker_path, b"").map_err(|err| io_error("write scratch marker", &marker_path, err))?;
     Ok(lock)
+}
+
+/// Takes a non-blocking exclusive advisory lock on `file`, held until the handle is dropped.
+/// `WouldBlock` means another open handle (any process) holds it; `Error` carries the OS error.
+///
+/// Off Android this is exactly `File::try_lock`. The std of the stable toolchains this crate
+/// builds with returns `Unsupported` from `File::try_lock` on Android without making a syscall
+/// (Android is missing from std's flock cfg list), so there the same `flock(LOCK_EX | LOCK_NB)`
+/// newer std uses is called directly. Removal condition: drop the Android branch once the
+/// minimum toolchain (`rust-version` in the root `Cargo.toml`) ships a std whose
+/// `File::try_lock` supports Android.
+fn try_lock_exclusive(file: &File) -> Result<(), TryLockError> {
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: `flock` only reads the descriptor number; `file` is borrowed for the whole
+        // call, so the descriptor stays open and owned by it. No memory is passed.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = io::Error::last_os_error();
+        // EWOULDBLOCK == EAGAIN on Linux/bionic: the lock is held through another handle.
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Err(TryLockError::WouldBlock)
+        } else {
+            Err(TryLockError::Error(err))
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        file.try_lock()
+    }
+}
+
+/// Technical text of a lock failure. `TryLockError`'s own `Display` hides the inner OS error
+/// ("lock acquisition failed due to I/O error"), so the cause is spelled out here.
+fn try_lock_error_text(err: &TryLockError) -> String {
+    match err {
+        TryLockError::WouldBlock => "lock is held by another open handle".to_owned(),
+        TryLockError::Error(inner) => format!("{inner} ({:?})", inner.kind()),
+    }
 }
 
 /// Outcome of [`sweep_stale_sessions`].
@@ -351,7 +394,7 @@ fn session_is_stale(root: &Path) -> io::Result<bool> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(err) => return Err(err),
     };
-    match lock.try_lock() {
+    match try_lock_exclusive(&lock) {
         Ok(()) => Ok(true),
         Err(TryLockError::WouldBlock) => Ok(false),
         Err(TryLockError::Error(err)) => Err(err),

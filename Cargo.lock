@@ -3925,6 +3925,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "image 0.25.10",
+ "libc",
  "ms-config",
  "ms-docstore",
  "ms-i18n",

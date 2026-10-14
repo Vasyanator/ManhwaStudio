@@ -172,6 +172,17 @@ mod tests {
     }
 
     #[test]
+    fn image_picker_request_never_widens_to_any_file() {
+        // An extension unknown to the SAF MIME table widens the whole Android picker to `*/*`,
+        // so every input extension must have a MIME type there.
+        for extension in ms_config::single_image::input_extensions() {
+            let single = FileDialogRequest::new(DialogKind::OpenFile).filter("x", &[extension]);
+            assert_ne!(ms_platform::file_dialog::mime_types_for(single.filters()), vec!["*/*"], "{extension}");
+        }
+        assert_ne!(ms_platform::file_dialog::mime_types_for(image_picker_request().filters()), vec!["*/*"]);
+    }
+
+    #[test]
     fn dialog_results_map_onto_pick_results() {
         use ms_platform::file_dialog::{FileDialogError, Picked, PickedFile};
 

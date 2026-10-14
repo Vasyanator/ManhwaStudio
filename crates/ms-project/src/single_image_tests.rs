@@ -140,6 +140,30 @@ fn sweep_removes_only_marked_unlocked_sessions() {
 }
 
 #[test]
+fn exclusive_lock_is_refused_through_a_second_handle_until_released() {
+    let fixture = Fixture::new();
+    let path = fixture.dir.path().join("probe.lock");
+    let first = OpenOptions::new().write(true).create_new(true).open(&path).expect("create lock file");
+    let second = OpenOptions::new().write(true).open(&path).expect("reopen lock file");
+    try_lock_exclusive(&first).expect("first lock");
+    match try_lock_exclusive(&second) {
+        Err(TryLockError::WouldBlock) => {}
+        Ok(()) => panic!("second handle must not acquire a held lock"),
+        Err(TryLockError::Error(err)) => panic!("second handle failed instead of WouldBlock: {err}"),
+    }
+    drop(first);
+    try_lock_exclusive(&second).expect("lock after release");
+}
+
+#[test]
+fn lock_error_text_carries_the_inner_os_error() {
+    let err = TryLockError::Error(io::Error::new(io::ErrorKind::Unsupported, "try_lock() not supported"));
+    let text = try_lock_error_text(&err);
+    assert!(text.contains("try_lock() not supported"), "{text}");
+    assert!(text.contains("Unsupported"), "{text}");
+}
+
+#[test]
 fn sweep_of_a_missing_base_is_empty() {
     let fixture = Fixture::new();
     assert_eq!(sweep_stale_sessions(&fixture.scratch_base().join("absent")), SweepReport::default());

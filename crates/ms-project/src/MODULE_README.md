@@ -83,7 +83,9 @@ joined onto a chapter or title directory.
   scratch root; the source is only read. `SingleImageScratch`'s `Drop` does no I/O (a crash or
   plain drop leaves the root for the next sweep); `remove()` is a blocking recursive delete,
   never on the GUI thread. A sweep never touches an entry without the marker, and drops its
-  probe lock handle before deleting (Windows).
+  probe lock handle before deleting (Windows). Both lock sites go through the one helper
+  `try_lock_exclusive` (`File::try_lock`; a direct `flock` on Android, whose stable std
+  returns `Unsupported`).
 - **Journal first.** `load_internal` calls `ms_page_ops::recover_pending_page_op`
   before ANY reconcile or normalize pass. Until the journal is resolved the page-op
   transaction owns the page keying of every artifact, so a reconcile pass running

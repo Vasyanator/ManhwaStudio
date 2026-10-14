@@ -11,8 +11,12 @@ Key functions:
 Notes:
 SAF filters by MIME type only. An extension without a well-known type (`mschapter`,
 `safetensors`, ...) cannot be expressed, so ONE unknown extension widens the whole request to
-the catch-all type: hiding a file the user wants is worse than showing extra files.
+the catch-all type: hiding a file the user wants is worse than showing extra files. That
+widening is logged (info, the extension only), because a filter that silently shows every file
+looks like a broken picker.
 */
+
+use ms_log::runtime_log;
 
 use super::FileFilter;
 
@@ -20,12 +24,15 @@ use super::FileFilter;
 const ANY: &str = "*/*";
 
 /// The MIME types that cover `filters`, in first-seen order without duplicates. No filters, or
-/// any extension without a known type, yields `["*/*"]`.
+/// any extension without a known type, yields `["*/*"]`; the latter is logged with the
+/// offending extension.
 #[must_use]
 pub fn mime_types_for(filters: &[FileFilter]) -> Vec<&'static str> {
     let mut types: Vec<&'static str> = Vec::new();
     for extension in filters.iter().flat_map(|filter| filter.extensions.iter()) {
         let Some(mime) = mime_for_extension(extension) else {
+            // `ms-log` has no debug level; info keeps the widening visible in the session log.
+            runtime_log::log_info(format!("[file-dialog] extension '{extension}' has no known MIME type; filter widened to {ANY}"));
             return vec![ANY];
         };
         if !types.contains(&mime) {
@@ -42,11 +49,13 @@ pub fn mime_types_for(filters: &[FileFilter]) -> Vec<&'static str> {
 fn mime_for_extension(extension: &str) -> Option<&'static str> {
     let mime = match extension {
         "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
+        "jpg" | "jpeg" | "jpe" => "image/jpeg",
         "webp" => "image/webp",
         "bmp" => "image/bmp",
         "gif" => "image/gif",
         "tif" | "tiff" => "image/tiff",
+        "tga" => "image/x-tga",
+        "qoi" => "image/qoi",
         "psd" | "psb" => "image/vnd.adobe.photoshop",
         "pdf" => "application/pdf",
         "zip" => "application/zip",
@@ -93,7 +102,7 @@ mod tests {
 
     #[test]
     fn every_call_site_family_has_a_type() {
-        for extension in ["webp", "bmp", "tif", "tiff", "zip", "rar", "7z", "tar", "gz", "tgz", "json", "txt", "log", "html", "htm", "pdf", "docx", "gif"] {
+        for extension in ["jpe", "tga", "qoi", "webp", "bmp", "tif", "tiff", "zip", "rar", "7z", "tar", "gz", "tgz", "json", "txt", "log", "html", "htm", "pdf", "docx", "gif"] {
             let request = FileDialogRequest::new(DialogKind::OpenFile).filter("x", &[extension]);
             assert_ne!(filters_of(&request), vec!["*/*"], "{extension}");
         }
