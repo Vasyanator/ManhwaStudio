@@ -36,7 +36,9 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
 - **Armed, lifted within the slop** → `long_press_at` = start (open the menu there).
 - **Armed, moved beyond the slop** → `TouchSelection` from the start point (`began` on its first
   frame, `end` Released on lift); when the surface has `long_press_selection == false` the drag
-  pans instead.
+  pans instead. The flag is re-read from every publication of the owner until the drag starts
+  (not only at claim), so a mode that ended while the finger rested makes the drag pan; once
+  selecting, the drag stays a selection until lift or cancel.
 - **Second claimed finger of the same owner**: before arming → both pan/pinch; after arming →
   the long-press (or selection, `end` Cancelled) is cancelled and the first finger is spent
   (never navigates again); the second finger pans alone.
@@ -50,7 +52,10 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
 - Emulation matching follows egui-winit `on_touch` (fork `crates/egui/crates/egui-winit/src/lib.rs`):
   the `Touch` event first, then for the pointer-owning touch Start = `PointerMoved` + press,
   Move = `PointerMoved`, End = release + `PointerGone`, Cancel = `PointerGone`. Move/press are
-  matched by position, the release by variant only (it carries the last MOVE position).
+  matched by position, the release by variant only (it carries the last MOVE position) — so the
+  End/Cancel adjacency is consumed only for the touch whose Start was followed by the emulated
+  press (the pointer owner, claimed or not); after any other touch a following release or
+  `PointerGone` is a real pen/mouse event and takes the ordinary button bookkeeping.
 - Proximity rule (`PROMOTION_RADIUS_PT`, `PROMOTION_GRACE_S`): non-adjacent presses/moves next
   to a claimed or just-ended touch are platform-promoted copies and are stripped, the release of
   a stripped press with them. Inert on Linux and Android; values unverified (Windows is gated off).
@@ -65,6 +70,9 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
   is ROOT between root passes only while the app has no deferred viewports (it shows immediate
   ones only).
 - `owner` ids are content-named (stable across `MangaApp` rebuilds in one `egui::Context`).
+- Publishing is live only while an ENABLED router runs on the ROOT viewport: every routing call
+  writes a ctx flag (set when enabled, removed when disabled) and `publish_*` are no-ops without
+  it, because only the router's freeze step drains the lists (the wasm entry has no hook).
 
 ## Known limits
 - egui-winit gives the emulated pointer to the FIRST touch of any device (`on_touch`,
@@ -75,6 +83,9 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
 - A touch whose End/Cancel never arrives stays claimed until a focus loss or a new Start with the
   same id.
 - `LONG_PRESS_ARM_S` is a tuned value awaiting the device test; haptic feedback is not provided.
+- The drag mode is last frame's publication: a mode that ends in the very frame the drag starts
+  still yields a selection the owner may refuse (no "refused" back-channel); the finger then
+  neither pans nor selects until lifted.
 
 ## Editing map
 - Claim / strip / state machine / navigation math → `router.rs`.

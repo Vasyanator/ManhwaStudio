@@ -5533,15 +5533,18 @@ impl PsEditorTabState {
                     remove_point_pressed: input.remove_point_pressed,
                 };
                 let tool = &mut self.tools[self.active_tool_idx];
-                // A finger selection drag replaces the mouse frame: the finger's button is held
-                // but invisible to egui, so `interact` would read it as an interrupted drag.
-                match touch.selection.filter(|_| tool.accepts_touch_selection()) {
-                    Some(selection) => tool.touch_selection(
-                        &mut tool_ctx,
-                        TouchSelectionInput::from_touch(&selection, &view),
-                    ),
-                    None => tool.interact(&mut tool_ctx),
+                // A finger selection drag replaces the mouse frame; on the frame it is cancelled
+                // the pointer frame runs too, so a cancelling mouse/pen press starts its drag
+                // (`canvas_touch::tool_frame_route`).
+                let route = canvas_touch::tool_frame_route(touch.selection, tool.accepts_touch_selection());
+                let mut outcome = ToolOutcome::default();
+                if let Some(selection) = route.touch {
+                    outcome = tool.touch_selection(&mut tool_ctx, TouchSelectionInput::from_touch(&selection, &view));
                 }
+                if route.interact {
+                    outcome = outcome.merged(tool.interact(&mut tool_ctx));
+                }
+                outcome
             } else {
                 ToolOutcome::default()
             };

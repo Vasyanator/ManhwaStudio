@@ -145,8 +145,9 @@ doc falls back inside the enqueue.
   `apply_touch_navigation`) and the per-frame `ViewTransform` (image↔screen mapping). Independent
   of the shared canvas engine.
 - `canvas_touch.rs`: the canvas' side of `ms_widgets::touch_nav` — publishes the canvas as a touch
-  surface (owner `ps_editor.canvas`, no holes) and takes the frame's output; draws the long-press
-  marker. See «Finger input» below.
+  surface (owner `ps_editor.canvas`, no holes) and takes the frame's output; decides which of the
+  finger selection and the pointer frame reach the active tool; draws the long-press marker. See
+  «Finger input» below.
 - `text_layers.rs`: `PsTextLayer` — display of the typing tab's overlays, projected from the shared
   `LayerDoc` (the source of truth). `sync_view_from_doc` builds/reconciles one text layer per doc Text
   node (image + geometry + group from the node); `materialize_text_runtime_from_doc` (in `lib.rs`)
@@ -356,7 +357,9 @@ calls `canvas_touch::publish_and_take` every frame a page is resident and:
   camera input and BEFORE `viewport.transform`, so the frame is drawn with the moved camera;
 - routes `TouchOutput::selection` to the active tool's `PsTool::touch_selection` INSTEAD of
   `interact` while `PsTool::accepts_touch_selection` (the rect marquee and the lasso): the finger's
-  button is held but invisible, so `interact` would abort the outline. The surface's
+  button is held but invisible, so `interact` would abort the outline. On the frame the selection
+  is Cancelled both run (cancel first, outcomes merged with `ToolOutcome::merged`), so the
+  mouse/pen press that cancelled it starts its own drag (`canvas_touch::tool_frame_route`). The surface's
   `long_press_selection` is that same answer, so under any other tool a long-press drag pans;
 - passes `TouchOutput::long_press_at` to `draw_selection_menu`, which opens the copy/cut menu
   through `ms_widgets::touch_nav::context_menu_popup` — the one open path for the secondary click

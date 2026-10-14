@@ -29,6 +29,9 @@ Surfaces are published DURING frame N and frozen (taken) by the router at the st
 of frame N+1, before egui builds its pointer state, so a claim always tests last
 frame's layout — exactly what `Context::layer_id_at` reads too. Outputs live for one
 frame: the router replaces them every frame, a consumer takes them once.
+Publishing is live only while an enabled router runs on the ROOT viewport (a flag every
+routing call writes): without one nothing would ever drain the lists, so `publish_*` are
+no-ops on the wasm entry (no raw-input hook) and where gestures are unavailable.
 */
 
 //! Finger navigation and long-press gestures on canvases (see `MODULE_README.md`).
@@ -181,12 +184,40 @@ fn deliveries_id() -> Id {
     Id::new("ms_touch_nav.deliveries")
 }
 
+fn router_live_id() -> Id {
+    Id::new("ms_touch_nav.router_live")
+}
+
+/// Whether an enabled router drains this context's publications (see [`set_router_live`]).
+fn router_live(ctx: &Context) -> bool {
+    ctx.data(|data| data.get_temp::<bool>(router_live_id()).unwrap_or(false))
+}
+
+/// Records whether the router that just ran on the ROOT viewport is enabled.
+///
+/// The one gate of every `publish_*`: publications are drained only by an enabled router's
+/// freeze step, so without one (the wasm entry has no raw-input hook; a disabled router returns
+/// before routing) they would pile up in `ctx` data for the whole session. Written by every ROOT
+/// routing call, so it always follows the router that actually runs.
+fn set_router_live(ctx: &Context, live: bool) {
+    ctx.data_mut(|data| {
+        if live {
+            data.insert_temp(router_live_id(), true);
+        } else {
+            data.remove_temp::<bool>(router_live_id());
+        }
+    });
+}
+
 /// Publishes `surface` for this frame; the router claims touches on it next frame.
 ///
 /// Replaces an earlier publication of the same owner, so repeated passes of one frame are
 /// idempotent. Call it every frame the canvas is drawn; a frame without a publication means
-/// "no surface" for the next frame.
+/// "no surface" for the next frame. A no-op while no enabled router runs (see the module notes).
 pub fn publish_surface(ctx: &Context, surface: TouchSurface) {
+    if !router_live(ctx) {
+        return;
+    }
     ctx.data_mut(|data| {
         let surfaces = data.get_temp_mut_or_default::<Vec<TouchSurface>>(surfaces_id());
         if let Some(slot) = surfaces.iter_mut().find(|slot| slot.owner == surface.owner) {
@@ -199,8 +230,12 @@ pub fn publish_surface(ctx: &Context, surface: TouchSurface) {
 
 /// Publishes `layer` as a capture layer of `owner` for this frame: a touch that starts on
 /// `owner`'s surface under this layer is still claimed (tool capture overlays such as a
-/// selection or crop mode, where a finger must pan instead of operating the mode).
+/// selection or crop mode, where a finger must pan instead of operating the mode). A no-op
+/// while no enabled router runs.
 pub fn publish_capture_layer(ctx: &Context, owner: Id, layer: LayerId) {
+    if !router_live(ctx) {
+        return;
+    }
     ctx.data_mut(|data| {
         let layers = data.get_temp_mut_or_default::<Vec<(Id, LayerId)>>(capture_layers_id());
         if !layers.contains(&(owner, layer)) {
@@ -215,8 +250,12 @@ pub fn publish_capture_layer(ctx: &Context, owner: Id, layer: LayerId) {
 /// For widgets drawn AFTER the owner published its surface (a tool's on-canvas chrome that
 /// runs after the canvas pass, such as the buttons and handles of a capture overlay), so they
 /// stay operable by a finger. Merged into the owner's surface when the router freezes the
-/// publications; a hole of an owner that published no surface this frame is dropped.
+/// publications; a hole of an owner that published no surface this frame is dropped. A no-op
+/// while no enabled router runs.
 pub fn publish_hole(ctx: &Context, owner: Id, rect: Rect) {
+    if !router_live(ctx) {
+        return;
+    }
     ctx.data_mut(|data| {
         data.get_temp_mut_or_default::<Vec<(Id, Rect)>>(holes_id()).push((owner, rect));
     });

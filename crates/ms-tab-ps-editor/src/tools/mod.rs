@@ -143,6 +143,24 @@ pub struct ToolOutcome {
     pub selection_changed: bool,
 }
 
+impl ToolOutcome {
+    /// Combines two outcomes of the same frame (a finger-selection cancel followed by the
+    /// pointer frame): the union of both dirty rects, and a selection change if either had one.
+    #[must_use]
+    pub fn merged(self, other: Self) -> Self {
+        let dirty = match (self.dirty, other.dirty) {
+            (Some(a), Some(b)) => Some(DirtyRect {
+                min_x: a.min_x.min(b.min_x),
+                min_y: a.min_y.min(b.min_y),
+                max_x: a.max_x.max(b.max_x),
+                max_y: a.max_y.max(b.max_y),
+            }),
+            (dirty, None) | (None, dirty) => dirty,
+        };
+        Self { dirty, selection_changed: self.selection_changed || other.selection_changed }
+    }
+}
+
 /// One row of the «Горячие клавиши» panel: what the shortcut does, and which keys trigger it.
 ///
 /// Both fields are ALREADY LOCALIZED (`t!`/`tf!`) by the tool that built the row — the panel only
@@ -615,6 +633,20 @@ mod tests {
         sel.set_rect(0, 0, 1, 1);
         assert!(sel.any(), "the fixture must select at least one pixel");
         sel
+    }
+
+    #[test]
+    fn merged_outcome_unions_dirty_rects_and_selection_changes() {
+        let a = ToolOutcome { dirty: Some(DirtyRect { min_x: 2, min_y: 5, max_x: 4, max_y: 9 }), selection_changed: false };
+        let b = ToolOutcome { dirty: Some(DirtyRect { min_x: 0, min_y: 6, max_x: 3, max_y: 12 }), selection_changed: true };
+        let both = a.merged(b);
+        let dirty = both.dirty.map(|d| (d.min_x, d.min_y, d.max_x, d.max_y));
+        assert_eq!(dirty, Some((0, 5, 4, 12)));
+        assert!(both.selection_changed);
+        let one = ToolOutcome::default().merged(a);
+        assert_eq!(one.dirty.map(|d| (d.min_x, d.min_y, d.max_x, d.max_y)), Some((2, 5, 4, 9)));
+        assert!(!one.selection_changed);
+        assert!(ToolOutcome::default().merged(ToolOutcome::default()).dirty.is_none());
     }
 
     #[test]

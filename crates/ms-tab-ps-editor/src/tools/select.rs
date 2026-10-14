@@ -834,6 +834,28 @@ mod tests {
     }
 
     #[test]
+    fn mouse_press_in_the_frame_of_a_touch_cancel_starts_a_mouse_gesture() {
+        // The tab feeds the cancel first and then the pointer frame (`canvas_touch::
+        // tool_frame_route`): the press that cancelled the finger must begin its own drag.
+        let mut tool = SelectTool::new(SelectMode::Rect);
+        assert_eq!(tool.touch_step(touch((1.0, 1.0), (9.0, 9.0), true, None)), GestureAction::None);
+        assert_eq!(
+            tool.touch_step(touch((1.0, 1.0), (9.0, 9.0), false, Some(TouchSelectionEnd::Cancelled))),
+            GestureAction::Aborted
+        );
+        assert_eq!(tool.step(press(20.0, 20.0, mods(false, false))), GestureAction::None);
+        assert!(tool.gesture_in_flight(), "the press starts a mouse gesture");
+        assert_eq!(tool.step(drag(30.0, 25.0, mods(false, false))), GestureAction::None);
+        assert_eq!(
+            tool.step(release(40.0, 30.0, mods(false, false))),
+            GestureAction::Commit {
+                op: SelectionOp::Replace,
+                shape: CommitShape::Rect(Pos2::new(20.0, 20.0), Pos2::new(40.0, 30.0)),
+            }
+        );
+    }
+
+    #[test]
     fn touch_without_a_delivered_start_is_ignored() {
         let mut tool = SelectTool::new(SelectMode::Rect);
         assert_eq!(

@@ -263,6 +263,66 @@ fn unclaimed_finger_emulation_does_not_count_as_a_palm() {
     assert_eq!(navigation.pan_delta(), vec2(30.0, 0.0));
 }
 
+/// Asserts that a fresh canvas finger navigates, i.e. no mouse/pen button is still tracked as
+/// held (`passthrough_down` drained).
+fn assert_no_palm_left(bench: &mut Bench, id: u64, now: f64) {
+    let (_, _) = bench.step(owning_start(id, pos2(50.0, 50.0)), now);
+    let output = bench.output(owning_move(id, pos2(80.0, 50.0)), now + 0.01);
+    assert!(output.navigation.is_some(), "a held-button palm must not survive the real release");
+}
+
+#[test]
+fn real_release_after_a_claimed_non_emulating_touch_ends_survives() {
+    // Palm = two claimed contacts, only the first owns egui-winit's emulated pointer; the pen
+    // writes meanwhile. When the hand lifts, the pen's release lands right after the second
+    // contact's End: it is the pen's, not an emulated one, and must reach egui.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(100.0, 100.0)), 0.0);
+    let (_, _) = bench.step(bare(2, TouchPhase::Start, pos2(200.0, 200.0)), 0.01);
+    let pen = pos2(250.0, 40.0);
+    let press = button(pen, PointerButton::Primary, true);
+    let (out, _) = bench.step(vec![press.clone()], 0.02);
+    assert_eq!(out, vec![press]);
+    let release = button(pen, PointerButton::Primary, false);
+    let (out, _) = bench.step(
+        concat(vec![owning_end(1, pos2(100.0, 100.0), pos2(100.0, 100.0)), bare(2, TouchPhase::End, pos2(200.0, 200.0)), vec![release.clone()]]),
+        0.03,
+    );
+    assert_eq!(out, vec![touch(1, TouchPhase::End, pos2(100.0, 100.0)), touch(2, TouchPhase::End, pos2(200.0, 200.0)), release]);
+    assert_no_palm_left(&mut bench, 3, 0.04);
+}
+
+#[test]
+fn real_release_after_an_unclaimed_non_emulating_touch_ends_drains_the_palm() {
+    // Same shape off the canvas: the second contact lands on a panel (unclaimed) and does not
+    // own the emulated pointer. The pen's release after its End must still be accounted as the
+    // pen's, or the router keeps a phantom held button and navigation stays dead.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(500.0, 100.0)), 0.0);
+    let (_, _) = bench.step(bare(2, TouchPhase::Start, pos2(600.0, 100.0)), 0.01);
+    let pen = pos2(250.0, 40.0);
+    let (_, _) = bench.step(vec![button(pen, PointerButton::Primary, true)], 0.02);
+    let release = button(pen, PointerButton::Primary, false);
+    let (out, _) = bench.step(concat(vec![bare(2, TouchPhase::End, pos2(600.0, 100.0)), vec![release.clone()]]), 0.03);
+    assert_eq!(out, vec![touch(2, TouchPhase::End, pos2(600.0, 100.0)), release]);
+    let input = owning_end(1, pos2(500.0, 100.0), pos2(500.0, 100.0));
+    let (out, _) = bench.step(input.clone(), 0.035);
+    assert_eq!(out, input, "the unclaimed emulating finger keeps its release and PointerGone");
+    assert_no_palm_left(&mut bench, 3, 0.04);
+}
+
+#[test]
+fn pointer_gone_after_a_non_emulating_cancel_is_kept() {
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(100.0, 100.0)), 0.0);
+    let (_, _) = bench.step(bare(2, TouchPhase::Start, pos2(200.0, 200.0)), 0.01);
+    let (out, _) = bench.step(concat(vec![bare(2, TouchPhase::Cancel, pos2(200.0, 200.0)), vec![Event::PointerGone]]), 0.02);
+    assert_eq!(out, vec![touch(2, TouchPhase::Cancel, pos2(200.0, 200.0)), Event::PointerGone]);
+    // The emulating finger's own Cancel still strips its PointerGone.
+    let (out, _) = bench.step(owning_cancel(1, pos2(100.0, 100.0)), 0.03);
+    assert_eq!(out, vec![touch(1, TouchPhase::Cancel, pos2(100.0, 100.0))]);
+}
+
 // ---------------------------------------------------------------------------------------
 // Navigation
 // ---------------------------------------------------------------------------------------
@@ -499,6 +559,58 @@ fn drag_after_arming_pans_where_the_owner_has_no_selection() {
 }
 
 #[test]
+fn selection_mode_dropped_before_arming_makes_the_drag_pan() {
+    // Translation's mode is a held key: released while the finger rests, the owner publishes
+    // `long_press_selection == false` from then on, and the drag must pan instead of starting
+    // a selection the owner can no longer begin.
+    let mut bench = Bench::new();
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    bench.surfaces = vec![surface(false)];
+    let (_, _) = bench.step(Vec::new(), LONG_PRESS_ARM_S);
+    let output = bench.output(owning_move(1, pos2(130.0, 100.0)), LONG_PRESS_ARM_S + 0.1);
+    assert_eq!(output.selection, None);
+    assert_eq!(output.navigation.map(|navigation| navigation.pan_delta()), Some(vec2(30.0, 0.0)));
+}
+
+#[test]
+fn selection_mode_dropped_after_arming_before_the_drag_makes_it_pan() {
+    let mut bench = Bench::new();
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(Vec::new(), LONG_PRESS_ARM_S);
+    bench.surfaces = vec![surface(false)];
+    let output = bench.output(owning_move(1, pos2(130.0, 100.0)), LONG_PRESS_ARM_S + 0.1);
+    assert_eq!(output.selection, None);
+    assert_eq!(output.navigation.map(|navigation| navigation.pan_delta()), Some(vec2(30.0, 0.0)));
+}
+
+#[test]
+fn selection_mode_gained_before_the_drag_selects_and_a_running_selection_keeps_going() {
+    let mut bench = Bench::new();
+    bench.surfaces = vec![surface(false)];
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    bench.surfaces = vec![surface(true)];
+    let (_, _) = bench.step(Vec::new(), LONG_PRESS_ARM_S);
+    let output = bench.output(owning_move(1, pos2(150.0, 130.0)), LONG_PRESS_ARM_S + 0.1);
+    assert_eq!(output.selection.map(|selection| selection.began), Some(true));
+    // Once selecting, a later publication without the mode does not turn it into a pan: the
+    // owner already began its selection and ends it on lift.
+    bench.surfaces = vec![surface(false)];
+    let output = bench.output(owning_move(1, pos2(170.0, 130.0)), LONG_PRESS_ARM_S + 0.2);
+    assert_eq!(output.selection.map(|selection| selection.pos), Some(pos2(170.0, 130.0)));
+    assert_eq!(output.navigation, None);
+    // A frame without any publication of the owner keeps the last known mode.
+    let mut fresh = Bench::new();
+    let (_, _) = fresh.step(owning_start(1, start), 0.0);
+    fresh.surfaces = Vec::new();
+    let (_, _) = fresh.step(Vec::new(), LONG_PRESS_ARM_S);
+    let output = fresh.output(owning_move(1, pos2(150.0, 130.0)), LONG_PRESS_ARM_S + 0.1);
+    assert_eq!(output.selection.map(|selection| selection.began), Some(true));
+}
+
+#[test]
 fn focus_loss_drops_claims_and_cancels_the_selection() {
     let mut bench = Bench::new();
     let start = pos2(100.0, 100.0);
@@ -630,6 +742,7 @@ fn disabled_router_and_child_viewports_leave_input_untouched() {
     assert_eq!(raw.events, input);
 
     let mut enabled = TouchRouter::new(true);
+    prime(&ctx, &mut enabled);
     publish_surface(&ctx, surface(true));
     let mut raw = RawInput { viewport_id: ViewportId::from_hash_of("child"), time: Some(0.1), events: input.clone(), ..RawInput::default() };
     enabled.route(&ctx, &mut raw);
@@ -638,6 +751,62 @@ fn disabled_router_and_child_viewports_leave_input_untouched() {
     let mut raw = RawInput { time: Some(0.2), events: input, ..RawInput::default() };
     enabled.route(&ctx, &mut raw);
     assert!(only_touch_events(&raw.events));
+}
+
+/// One empty ROOT routing call: what the shell's hook does before the first pass, so the
+/// publications of the pass that follows are kept for the router.
+fn prime(ctx: &Context, router: &mut TouchRouter) {
+    let mut raw = RawInput::default();
+    router.route(ctx, &mut raw);
+}
+
+/// Number of entries of each publication list currently stored in `ctx`.
+fn stored_publications(ctx: &Context) -> (usize, usize, usize) {
+    ctx.data(|data| {
+        (
+            data.get_temp::<Vec<TouchSurface>>(super::surfaces_id()).map_or(0, |list| list.len()),
+            data.get_temp::<Vec<(Id, LayerId)>>(super::capture_layers_id()).map_or(0, |list| list.len()),
+            data.get_temp::<Vec<(Id, Rect)>>(super::holes_id()).map_or(0, |list| list.len()),
+        )
+    })
+}
+
+fn publish_all(ctx: &Context) {
+    publish_surface(ctx, surface(true));
+    publish_capture_layer(ctx, owner(), LayerId::new(Order::Middle, Id::new("touch_nav.test.capture")));
+    publish_hole(ctx, owner(), hole_rect());
+}
+
+#[test]
+fn publications_are_dropped_unless_a_live_router_drains_them() {
+    // No router at all (the wasm entry): every frame's publications would otherwise pile up in
+    // `ctx` data forever — `publish_hole` appends without dedup.
+    let ctx = Context::default();
+    for _ in 0..3 {
+        publish_all(&ctx);
+    }
+    assert_eq!(stored_publications(&ctx), (0, 0, 0), "nothing is stored without a router");
+
+    // A disabled router (gestures unavailable) does not make them live either.
+    let mut disabled = TouchRouter::new(false);
+    prime(&ctx, &mut disabled);
+    publish_all(&ctx);
+    assert_eq!(stored_publications(&ctx), (0, 0, 0));
+
+    // An enabled router makes them live, and its next call drains them.
+    let mut enabled = TouchRouter::new(true);
+    prime(&ctx, &mut enabled);
+    publish_all(&ctx);
+    publish_hole(&ctx, owner(), hole_rect());
+    assert_eq!(stored_publications(&ctx), (1, 1, 2));
+    prime(&ctx, &mut enabled);
+    assert_eq!(stored_publications(&ctx), (0, 0, 0), "the routing call freezes and drains them");
+
+    // Disabling turns publishing off again (the shell builds one router per window, but the
+    // flag must follow the router that runs, not the first one ever seen).
+    prime(&ctx, &mut disabled);
+    publish_all(&ctx);
+    assert_eq!(stored_publications(&ctx), (0, 0, 0));
 }
 
 #[test]
@@ -668,6 +837,7 @@ fn published_hole_of_the_owner_is_not_claimed() {
     let ctx = Context::default();
     let mut router = TouchRouter::new(true);
     let late_hole = Rect::from_min_size(pos2(50.0, 50.0), vec2(40.0, 40.0));
+    prime(&ctx, &mut router);
     publish_surface(&ctx, surface(true));
     publish_hole(&ctx, owner(), late_hole);
     // A hole of another owner (no surface of its own) is dropped and exempts nothing.

@@ -37,7 +37,9 @@ the `Touch` event first, then — only for the touch that owns the emulated poin
 Start: `PointerMoved` + `PointerButton{Primary, pressed}`; Move: `PointerMoved`;
 End: `PointerButton{released}` + `PointerGone`; Cancel: `PointerGone`. Move/press
 carry the touch position; the release carries the last MOVE position, so it is matched
-by variant and button only.
+by variant and button only — and therefore only after the End of the touch whose Start
+was followed by the emulated press (`TouchRouter::emulating`); after any other touch an
+adjacent release is a real pen/mouse release.
 */
 
 use std::collections::BTreeMap;
@@ -51,7 +53,7 @@ use ms_log::trace::cat;
 use super::{
     Delivery, LONG_PRESS_ARM_S, PROMOTION_GRACE_S, PROMOTION_RADIUS_PT, TouchNavigation,
     TouchOutput, TouchSelection, TouchSelectionEnd, TouchSurface, freeze_publications,
-    store_deliveries,
+    set_router_live, store_deliveries,
 };
 
 /// Identity of one touch: egui's device hash plus the platform's touch id.
@@ -124,11 +126,24 @@ enum Phase {
     Spent,
 }
 
+impl Phase {
+    /// Whether a later drag of this touch has yet to choose between selection and pan, so the
+    /// owner's current `long_press_selection` still decides it.
+    fn drag_mode_open(self) -> bool {
+        match self {
+            Phase::Pending | Phase::Held => true,
+            Phase::Pan | Phase::Selecting | Phase::Spent => false,
+        }
+    }
+}
+
 /// One claimed touch.
 #[derive(Clone, Copy, Debug)]
 struct Claim {
     owner: Id,
-    /// Copied from the surface at claim time (`TouchSurface::long_press_selection`).
+    /// The owner's `TouchSurface::long_press_selection`, refreshed from every publication of the
+    /// owner while the drag mode is open (`Phase::drag_mode_open`), so the value seen when the
+    /// drag starts is last frame's; a frame without a publication keeps the previous value.
     selection_mode: bool,
     start_pos: Pos2,
     start_time: f64,
@@ -203,11 +218,15 @@ pub struct TouchRouter {
     promoted_down: Vec<PointerButton>,
     /// End positions and times of claims, for the promotion grace period.
     recent_ends: Vec<(Pos2, f64)>,
+    /// The touch (claimed or not) that owns egui-winit's emulated pointer: set at its Start
+    /// when the adjacent emulated press is matched, cleared at its End/Cancel. Kept across a
+    /// focus loss, like egui-winit's own `pointer_touch_id`.
+    emulating: Option<TouchKey>,
 }
 
 impl TouchRouter {
-    /// Creates a router. A disabled router never changes the input (it only drops the
-    /// per-frame publications so they cannot pile up).
+    /// Creates a router. A disabled router never changes the input, and while it runs the
+    /// `publish_*` calls are no-ops (it also drops anything published before it was disabled).
     #[must_use]
     pub fn new(enabled: bool) -> Self {
         Self {
@@ -216,14 +235,15 @@ impl TouchRouter {
             passthrough_down: Vec::new(),
             promoted_down: Vec::new(),
             recent_ends: Vec::new(),
+            emulating: None,
         }
     }
 
     /// Routes one frame of raw input. Call it from `eframe::App::raw_input_hook`.
     ///
     /// Acts only on the ROOT viewport (the hook also runs for child viewports, whose input
-    /// carries no canvas). Freezes last frame's publications, strips claimed touches'
-    /// emulated mouse events from `raw.events`, closes open popups when a touch is claimed
+    /// carries no canvas). Freezes last frame's publications, marks publishing live (enabled
+    /// router) or off (disabled), strips claimed touches' emulated mouse events from `raw.events`, closes open popups when a touch is claimed
     /// and stores this frame's per-owner outputs for [`super::take_touch_output`].
     ///
     /// Hook-time `Context` reads (`layer_id_at`, popup memory) use egui memory of
@@ -234,6 +254,7 @@ impl TouchRouter {
             return;
         }
         let (surfaces, capture) = freeze_publications(ctx);
+        set_router_live(ctx, self.enabled);
         if !self.enabled {
             return;
         }
@@ -274,6 +295,14 @@ impl TouchRouter {
         layer_at: &dyn Fn(Pos2) -> Option<LayerId>,
     ) -> RouteResult {
         let scene = ClaimScene { surfaces, capture, layer_at };
+        // A mode can end while the finger rests (Translation's modes are held keys): the owner
+        // then publishes `long_press_selection == false` and the drag must pan, since the owner
+        // would refuse to begin a selection. Read up to the drag's start, not only at claim.
+        for claim in self.claims.values_mut().filter(|claim| claim.phase.drag_mode_open()) {
+            if let Some(surface) = surfaces.iter().find(|surface| surface.owner == claim.owner) {
+                claim.selection_mode = surface.long_press_selection;
+            }
+        }
         let mut acc = FrameAcc::default();
         let input = std::mem::take(events);
         events.reserve(input.len());
@@ -290,6 +319,9 @@ impl TouchRouter {
                                 keep_unless(events, moved, claimed);
                             }
                             if let Some(press) = input.next_if(|next| matches!(next, Event::PointerButton { pos: at, button: PointerButton::Primary, pressed: true, .. } if at.distance(pos) <= ADJACENT_POS_EPS_PT)) {
+                                // egui-winit presses only for the touch that takes its emulated
+                                // pointer, so this touch owns it until its End/Cancel.
+                                self.emulating = Some(key);
                                 keep_unless(events, press, claimed);
                             }
                         }
@@ -301,14 +333,22 @@ impl TouchRouter {
                         }
                         TouchPhase::End | TouchPhase::Cancel => {
                             let cancelled = phase == TouchPhase::Cancel;
-                            let claimed = self.claims.contains_key(&key);
-                            if !cancelled
-                                && let Some(release) = input.next_if(|next| matches!(next, Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }))
-                            {
-                                keep_unless(events, release, claimed);
-                            }
-                            if let Some(gone) = input.next_if(|next| matches!(next, Event::PointerGone)) {
-                                keep_unless(events, gone, claimed);
+                            // Only the emulated pointer's owner is followed by emulated events. The
+                            // release is matched by variant alone, so after any other touch an
+                            // adjacent release / `PointerGone` is a real pen or mouse event: it is
+                            // left to the loop below, which keeps the button bookkeeping (a stolen
+                            // pen release would leave Primary stuck and the palm state forever).
+                            if self.emulating == Some(key) {
+                                self.emulating = None;
+                                let claimed = self.claims.contains_key(&key);
+                                if !cancelled
+                                    && let Some(release) = input.next_if(|next| matches!(next, Event::PointerButton { button: PointerButton::Primary, pressed: false, .. }))
+                                {
+                                    keep_unless(events, release, claimed);
+                                }
+                                if let Some(gone) = input.next_if(|next| matches!(next, Event::PointerGone)) {
+                                    keep_unless(events, gone, claimed);
+                                }
                             }
                             self.on_touch_end(key, pos, now, cancelled, cfg, &mut acc);
                         }
