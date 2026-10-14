@@ -6,8 +6,8 @@ Public surface of the canvas touch-gesture owner. A finger that starts on a canv
 surface never reaches a tool: the router (`router.rs`) removes egui-winit's emulated
 mouse events for such a touch before egui sees them and turns the touch into typed,
 per-canvas output — navigation (axis-locked one-finger pan with a fling after the lift,
-free two-finger pan / pinch), a tap point, a long-press menu request and a long-press
-selection drag. Ordinary UI (panels, menus, dialogs) is not touched.
+free two-finger pan / pinch), a tap point, a long-press menu request, a long-press
+selection drag and an immediate drag from an owner-published drag region. Ordinary UI (panels, menus, dialogs) is not touched.
 
 Main responsibilities:
 - the per-frame publication channel from canvases to the router (`publish_surface`,
@@ -17,7 +17,8 @@ Main responsibilities:
 - the long-press timing constant and the promotion-rule constants.
 
 Key structures:
-- `TouchSurface`: one canvas' claimable rect, its holes and its long-press-drag mode.
+- `TouchSurface`: one canvas' claimable rect, its holes, its long-press-drag mode and its
+  drag regions.
 - `TouchOutput`: everything one canvas gets from the router for one frame.
 
 Key functions:
@@ -87,6 +88,35 @@ pub struct TouchSurface {
     /// `true` when the owner's active mode has a selection target, so a drag after the
     /// long-press armed becomes a [`TouchSelection`]; `false` makes that drag pan instead.
     pub long_press_selection: bool,
+    /// Closed polygon outlines (screen points, even-odd rule; fewer than three points never
+    /// contain anything) of objects a finger drags WITHOUT a long-press: a lone finger whose
+    /// claim starts inside one becomes [`TouchOutput::region_drag`] as soon as it leaves the
+    /// click distance — no pan, no axis lock, no fling. It still taps (lift within the click
+    /// distance before arming) and long-presses (lift after arming opens the menu; a drag after
+    /// arming is the same region drag). Typing: the selected text layer's grab area.
+    pub drag_regions: Vec<Vec<Pos2>>,
+}
+
+/// Whether `point` lies inside the closed polygon `outline` (even-odd rule). A polygon with
+/// fewer than three points contains nothing.
+pub(super) fn polygon_contains(outline: &[Pos2], point: Pos2) -> bool {
+    let (true, Some(&last)) = (outline.len() >= 3, outline.last()) else {
+        return false;
+    };
+    let mut inside = false;
+    let mut prev = last;
+    for &next in outline {
+        // A crossing of the horizontal ray from `point` to +x by the edge prev -> next; the
+        // half-open `>` test counts a vertex shared by two edges once.
+        if (next.y > point.y) != (prev.y > point.y) {
+            let cross_x = next.x + (point.y - next.y) * (prev.x - next.x) / (prev.y - next.y);
+            if point.x < cross_x {
+                inside = !inside;
+            }
+        }
+        prev = next;
+    }
+    inside
 }
 
 /// One frame of finger navigation for one owner.
@@ -127,7 +157,10 @@ pub enum TouchSelectionEnd {
     Cancelled,
 }
 
-/// A long-press selection drag: a finger armed its long-press and then moved.
+/// A finger drag delivered to the owner: a long-press selection drag (a finger armed its
+/// long-press and then moved; [`TouchOutput::selection`]) or a drag-region drag (a finger that
+/// started in one of the owner's [`TouchSurface::drag_regions`] and moved;
+/// [`TouchOutput::region_drag`]).
 ///
 /// It is NOT a synthesized mouse press (in Cleaning the mouse buttons paint and erase); the
 /// consumer drives the selection target of its active mode from it directly.
@@ -157,6 +190,10 @@ pub struct TouchOutput {
     pub long_press_armed_at: Option<Pos2>,
     /// The long-press selection drag, reported on every frame while it lasts.
     pub selection: Option<TouchSelection>,
+    /// The drag of a finger that started in one of the owner's
+    /// [`TouchSurface::drag_regions`], reported on every frame while it lasts. Never at the same
+    /// time as a `selection` of the same finger: a region drag is never a selection.
+    pub region_drag: Option<TouchSelection>,
     /// A finger tapped the canvas at this point (its press point): it was the owner's only
     /// claimed touch, was lifted within the click distance before its long-press armed, no
     /// mouse/pen button was held and the touch did not stop a running fling. Reported on the

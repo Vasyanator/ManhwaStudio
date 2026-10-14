@@ -43,7 +43,7 @@ fn owner_id() -> Id {
 pub(crate) fn publish_and_take(ctx: &Context, rect: Rect, long_press_selection: bool) -> TouchOutput {
     touch_nav::publish_surface(
         ctx,
-        TouchSurface { owner: owner_id(), rect, holes: Vec::new(), long_press_selection },
+        TouchSurface { owner: owner_id(), rect, holes: Vec::new(), long_press_selection, drag_regions: Vec::new() },
     );
     touch_nav::take_touch_output(ctx, owner_id())
 }

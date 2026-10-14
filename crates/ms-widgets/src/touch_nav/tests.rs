@@ -7,7 +7,7 @@ Contract tests of the canvas touch router and the context-menu helper.
 Main responsibilities:
 - pure tests of `TouchRouter::route_events` on synthetic event lists shaped exactly like
   egui-winit's touch emulation (claim, strip, pairing, pan, pinch, palm, long-press,
-  selection, axis lock, fling and its cancellation, tap);
+  selection, drag regions, axis lock, fling and its cancellation, tap);
 - pure and adapter tests of the live on/off request (`TouchRouter::set_enabled`);
 - headless `Context::run_ui` tests of the egui adapter (`TouchRouter::route`), of the
   background-layer fact `Context::layer_id_at` reports over bare canvas, and of
@@ -29,8 +29,8 @@ use super::router::{
 };
 use super::{
     LONG_PRESS_ARM_S, PROMOTION_GRACE_S, TouchOutput, TouchRouter, TouchSelection,
-    TouchSelectionEnd, TouchSurface, context_menu_popup, publish_capture_layer, publish_hole,
-    publish_surface, take_touch_output,
+    TouchSelectionEnd, TouchSurface, context_menu_popup, polygon_contains, publish_capture_layer,
+    publish_hole, publish_surface, take_touch_output,
 };
 
 const CFG: RouterConfig = RouterConfig { slop_pt: 6.0, long_press_s: LONG_PRESS_ARM_S };
@@ -48,7 +48,21 @@ fn hole_rect() -> Rect {
 }
 
 fn surface(long_press_selection: bool) -> TouchSurface {
-    TouchSurface { owner: owner(), rect: canvas_rect(), holes: vec![hole_rect()], long_press_selection }
+    TouchSurface { owner: owner(), rect: canvas_rect(), holes: vec![hole_rect()], long_press_selection, drag_regions: Vec::new() }
+}
+
+/// The drag region of the region tests: a diamond (a rotated square) centred at (100, 100), so
+/// the corners of its bounding box lie outside it.
+fn diamond() -> Vec<Pos2> {
+    vec![pos2(100.0, 60.0), pos2(140.0, 100.0), pos2(100.0, 140.0), pos2(60.0, 100.0)]
+}
+
+/// A bench whose surface has [`diamond`] as its only drag region; `long_press_selection` off,
+/// so a selection could come only from the region rule.
+fn region_bench() -> Bench {
+    let mut bench = Bench::new();
+    bench.surfaces = vec![TouchSurface { drag_regions: vec![diamond()], ..surface(false) }];
+    bench
 }
 
 fn touch(id: u64, phase: TouchPhase, pos: Pos2) -> Event {
@@ -618,8 +632,8 @@ fn selection_mode_gained_before_the_drag_selects_and_a_running_selection_keeps_g
     assert_eq!(output.selection.map(|selection| selection.began), Some(true));
 }
 
-/// The hand-off a consumer that selects only at certain points relies on (Typing: hold on the
-/// selected text layer): the mode is off at the claim, the owner sees `long_press_armed_at` in the
+/// The hand-off a consumer that selects only at certain points relies on (an owner that learns
+/// what the press is on from `long_press_armed_at`): the mode is off at the claim, the owner sees `long_press_armed_at` in the
 /// arming frame's output and publishes the mode in that same frame, and the very next frame's drag
 /// is a selection from the press point. Without the publication the same drag pans.
 #[test]
@@ -993,6 +1007,103 @@ fn pans_long_presses_and_interrupted_touches_are_not_taps() {
     let (_, _) = bench.step(owning_start(1, start), 0.0);
     let (_, _) = bench.step(vec![button(pos2(380.0, 20.0), PointerButton::Primary, true)], 0.02);
     assert_eq!(bench.output(owning_end(1, start, start), 0.05).tap_at, None, "pen press during the touch");
+}
+
+// ---------------------------------------------------------------------------------------
+// Drag regions (`TouchSurface::drag_regions` -> `TouchOutput::region_drag`)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn polygon_contains_follows_the_outline_not_its_bounding_box() {
+    let outline = diamond();
+    assert!(polygon_contains(&outline, pos2(100.0, 100.0)));
+    assert!(polygon_contains(&outline, pos2(125.0, 100.0)));
+    assert!(!polygon_contains(&outline, pos2(65.0, 65.0)), "a bounding-box corner is outside");
+    assert!(!polygon_contains(&outline, pos2(200.0, 100.0)));
+    assert!(!polygon_contains(&outline[..2], pos2(100.0, 80.0)), "fewer than three points contain nothing");
+}
+
+#[test]
+fn press_in_a_region_drags_at_once_without_arming_or_panning() {
+    let mut bench = region_bench();
+    let start = pos2(100.0, 100.0);
+    let (out, _) = bench.step(owning_start(1, start), 0.0);
+    assert!(only_touch_events(&out), "a region touch is claimed like any canvas touch");
+    let output = bench.output(owning_move(1, pos2(103.0, 100.0)), 0.02);
+    assert_eq!((output.region_drag, output.navigation), (None, None), "within the slop nothing happens yet");
+    let output = bench.output(owning_move(1, pos2(130.0, 110.0)), 0.04);
+    assert_eq!(output.region_drag, Some(TouchSelection { origin: start, pos: pos2(130.0, 110.0), began: true, end: None }));
+    assert_eq!((output.selection, output.navigation), (None, None), "a region drag is neither a selection nor a pan");
+    let output = bench.output(owning_move(1, pos2(180.0, 110.0)), 0.06);
+    assert_eq!(output.region_drag.map(|drag| (drag.pos, drag.began)), Some((pos2(180.0, 110.0), false)));
+    assert_eq!(output.navigation, None, "no axis lock catch-up either");
+    let (_, result) = bench.step(owning_end(1, pos2(181.0, 110.0), pos2(180.0, 110.0)), 0.08);
+    let output = result.output(owner());
+    assert_eq!(output.region_drag, Some(TouchSelection { origin: start, pos: pos2(181.0, 110.0), began: false, end: Some(TouchSelectionEnd::Released) }));
+    assert_eq!(result.next_deadline(), None, "a region drag lift never flings");
+    let output = bench.output(Vec::new(), 0.1);
+    assert_eq!(output, TouchOutput::default(), "nothing glides after the lift");
+}
+
+#[test]
+fn press_outside_the_region_still_pans() {
+    let mut bench = region_bench();
+    // Inside the diamond's bounding box but outside the diamond itself.
+    let start = pos2(65.0, 65.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(owning_move(1, pos2(65.0, 85.0)), 0.02);
+    let output = bench.output(owning_move(1, pos2(65.0, 95.0)), 0.04);
+    assert_eq!(output.region_drag, None);
+    assert!(output.navigation.is_some(), "a touch outside every region pans");
+}
+
+#[test]
+fn region_touch_still_taps_and_long_presses() {
+    let start = pos2(100.0, 100.0);
+    let mut bench = region_bench();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let output = bench.output(owning_end(1, pos2(102.0, 101.0), start), 0.1);
+    assert_eq!((output.tap_at, output.region_drag), (Some(start), None), "a short still touch is a tap");
+
+    let mut bench = region_bench();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let output = bench.output(Vec::new(), LONG_PRESS_ARM_S);
+    assert_eq!(output.long_press_armed_at, Some(start), "a still hold arms as anywhere else");
+    let output = bench.output(owning_end(1, pos2(101.0, 100.0), start), LONG_PRESS_ARM_S + 0.2);
+    assert_eq!((output.long_press_at, output.region_drag), (Some(start), None), "a lift after arming opens the menu");
+}
+
+#[test]
+fn drag_after_arming_in_a_region_is_the_same_region_drag() {
+    let mut bench = region_bench();
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(Vec::new(), LONG_PRESS_ARM_S);
+    let output = bench.output(owning_move(1, pos2(130.0, 100.0)), LONG_PRESS_ARM_S + 0.1);
+    assert_eq!(output.region_drag, Some(TouchSelection { origin: start, pos: pos2(130.0, 100.0), began: true, end: None }));
+    assert_eq!((output.selection, output.navigation), (None, None), "never a selection, even with long_press_selection on or off");
+}
+
+#[test]
+fn second_finger_cancels_a_region_drag() {
+    let mut bench = region_bench();
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(owning_move(1, pos2(130.0, 100.0)), 0.02);
+    let output = bench.output(bare(2, TouchPhase::Start, pos2(250.0, 250.0)), 0.04);
+    assert_eq!(output.region_drag.and_then(|drag| drag.end), Some(TouchSelectionEnd::Cancelled));
+    let output = bench.output(owning_move(1, pos2(160.0, 100.0)), 0.06);
+    assert_eq!(output.region_drag, None);
+    assert_eq!(output.navigation, None, "the cancelled finger never pans");
+}
+
+#[test]
+fn a_second_finger_starting_in_a_region_does_not_drag() {
+    let mut bench = region_bench();
+    let (_, _) = bench.step(owning_start(1, pos2(250.0, 250.0)), 0.0);
+    let (_, _) = bench.step(bare(2, TouchPhase::Start, pos2(100.0, 100.0)), 0.02);
+    let output = bench.output(bare(2, TouchPhase::Move, pos2(140.0, 100.0)), 0.04);
+    assert_eq!(output.region_drag, None, "only a lone finger drags a region");
 }
 
 // ---------------------------------------------------------------------------------------

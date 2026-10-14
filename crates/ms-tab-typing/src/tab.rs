@@ -134,6 +134,7 @@ use ms_config::app_tab::AppTab;
 use crate::TypingTopPanelState;
 // Re-exported to `tab`'s child modules (e.g. `panels`, `layout_editor`) via `use super::*`.
 use ms_widgets::WheelSlider;
+use ms_widgets::touch_nav::context_menu_popup;
 use ms_widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
     PanelNode, TabId,
@@ -181,7 +182,7 @@ mod autotype;
 mod draw_page;
 mod move_layer;
 mod touch_layers;
-use touch_layers::{TypingTouchFrame, TypingTouchGates, TypingTouchLayerMove, canvas_page_view, canvas_page_view_at};
+use touch_layers::{TypingTouchFrame, TypingTouchGates, TypingTouchLayerMenu, TypingTouchLayerMove, canvas_page_view, canvas_page_view_at};
 mod vector_transform;
 mod layout_editor;
 use layout_editor::*;
@@ -1762,26 +1763,30 @@ impl CanvasHooks for TypingHooks<'_> {
             self.top_panel.centering_assist_kind(),
             self.top_panel.centering_show_center(),
         );
-        // Finger input on text layers (tap selects / deselects, hold on the selected layer + drag
-        // moves it; `tab/touch_layers.rs`). Here because this hook runs after the canvas took this
-        // frame's touch output and before it publishes its touch surface: the long-press flag set
-        // below reaches the router before the drag can start. Before the selection sync below, so a
-        // finger selection change reaches the edit panel in the same frame, and before the create
-        // UI, which must not see a drag this consumed.
-        let touch_outcome = {
+        // Finger input on text layers (tap selects / deselects, a press-drag on the selected layer
+        // moves it, a long-press lift on a layer opens its menu; `tab/touch_layers.rs`). Here
+        // because this hook runs after the canvas took this frame's touch output and before it
+        // publishes its touch surface, so the drag region added below reaches the router for the
+        // next touch. Before the selection sync below, so a finger selection change reaches the
+        // edit panel in the same frame.
+        let touch_gates = TypingTouchGates {
+            panel_blocks: self.top_panel.is_mask_panel_open() || self.top_panel.eyedropper_active(),
+            strict_pixel_movement: self.top_panel.strict_pixel_movement(),
+        };
+        let (touch_outcome, touch_drag_region) = {
             let canvas_view: &CanvasView = canvas;
-            self.text_overlays.drive_touch_layer_input(
+            let outcome = self.text_overlays.drive_touch_layer_input(
                 TypingTouchFrame::from_canvas(canvas_view),
-                TypingTouchGates {
-                    panel_blocks: self.top_panel.is_mask_panel_open() || self.top_panel.eyedropper_active(),
-                    strict_pixel_movement: self.top_panel.strict_pixel_movement(),
-                },
+                touch_gates,
                 &|pos| canvas_page_view_at(canvas_view, pos),
                 &|page_idx| canvas_page_view(canvas_view, page_idx),
-            )
+            );
+            // After the driver, so a tap that selected a layer this frame publishes its region.
+            let region = self.text_overlays.touch_drag_region(touch_gates, &|page_idx| canvas_page_view(canvas_view, page_idx));
+            (outcome, region)
         };
-        if touch_outcome.long_press_selection {
-            canvas.set_long_press_selection(true);
+        if let Some(outline) = touch_drag_region {
+            canvas.add_touch_drag_region(outline);
         }
         if touch_outcome.changed {
             ctx.request_repaint();
@@ -1883,7 +1888,7 @@ impl CanvasHooks for TypingHooks<'_> {
                 canvas,
                 project,
                 self.top_panel,
-                if touch_outcome.selection_consumed { None } else { canvas.touch_selection() },
+                canvas.touch_selection(),
             );
         }
         // Every floating «Текст» panel is a dock tab. The visibility flags are read
@@ -2148,6 +2153,13 @@ impl CanvasHooks for TypingHooks<'_> {
                     .iter()
                     .any(|overlay_quad| segment_intersects_quad(line_start, line_end, overlay_quad))
             })
+    }
+
+    /// A finger long-press armed on a text layer of `page_idx` opens that layer's menu on lift,
+    /// so the page menu stays shut (`tab/touch_layers.rs`). Mouse right-clicks on a layer never
+    /// reach the page menu (the layer widget takes them), so only the finger needs this.
+    fn suppress_canvas_page_context_menu(&self, page_idx: usize) -> bool {
+        self.text_overlays.suppresses_canvas_page_menu_for_touch(page_idx)
     }
 }
 
@@ -3349,6 +3361,13 @@ pub(super) struct TypingTextOverlayLayer {
     /// The finger drag driving `move_session` (source `Touch`), with the geometry to restore when
     /// the drag is cancelled (`tab/touch_layers.rs`). `None` while no finger moves a layer.
     touch_layer_move: Option<TypingTouchLayerMove>,
+    /// The text layer an armed finger long-press sits on (recorded each frame while armed), whose
+    /// lift opens that layer's menu; it suppresses the canvas page menu meanwhile
+    /// (`tab/touch_layers.rs`).
+    touch_layer_menu_candidate: Option<TypingTouchLayerMenu>,
+    /// The layer menu a finger long-press lift asked for, opened by the next page pass
+    /// (`draw_page.rs`) and dropped by the next finger-driver run.
+    touch_layer_menu_request: Option<TypingTouchLayerMenu>,
     width_resize_drag: Option<WidthResizeDragState>,
     primary_pointer_targets_overlay_this_frame: bool,
     /// Page image path per page index (captured at project load), so the page's pixel size can be
@@ -3525,6 +3544,8 @@ impl Default for TypingTextOverlayLayer {
             drag_has_changes: false,
             move_session: None,
             touch_layer_move: None,
+            touch_layer_menu_candidate: None,
+            touch_layer_menu_request: None,
             width_resize_drag: None,
             primary_pointer_targets_overlay_this_frame: false,
             page_image_paths: HashMap::new(),

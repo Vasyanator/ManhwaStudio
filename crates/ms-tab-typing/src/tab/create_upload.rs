@@ -144,8 +144,8 @@ impl TypingTextOverlayLayer {
 
     /// Draws the create UI of this frame: the Shift+drag / finger create rectangle, the inline
     /// editor, the in-flight hint and the status toasts. `touch_selection` is this frame's finger
-    /// long-press drag for the create rectangle — `CanvasView::touch_selection`, or `None` when the
-    /// finger path already took it as a layer move (`touch_layers.rs`).
+    /// long-press drag for the create rectangle (`CanvasView::touch_selection`); a finger moving a
+    /// layer arrives on the separate region-drag channel (`touch_layers.rs`), never here.
     pub(super) fn draw_create_overlay_ui(
         &mut self,
         ctx: &egui::Context,

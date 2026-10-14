@@ -4,7 +4,8 @@
 The one owner of finger input on canvases. A finger that starts on a canvas never reaches a
 tool: one finger pans (axis-locked, with a fling after the lift), two or more pan and pinch-zoom
 freely, a short still touch is reported as a tap, a long-press opens the canvas context menu
-(lifted without moving) or starts a typed selection drag (moved after arming). Ordinary UI
+(lifted without moving) or starts a typed selection drag (moved after arming), and a finger
+pressed on an owner-published drag region drags it at once (a typed region drag). Ordinary UI
 (panels, menus, dialogs, bubble widgets) does not distinguish input and is left to egui. Mouse
 and pen are unchanged (Space+drag, tools, right-click menus).
 
@@ -15,7 +16,8 @@ shell raw_input_hook ──► TouchRouter::route (ROOT viewport only, before eg
    strip the claimed touch's egui-winit mouse emulation ─► gesture state machine
    store per-owner TouchOutput in ctx temp data
 canvas frame ──► publish_surface / publish_capture_layer / publish_hole (for next frame)
-             ──► take_touch_output (navigation, tap_at, long_press_armed_at, long_press_at, selection)
+             ──► take_touch_output (navigation, tap_at, long_press_armed_at, long_press_at,
+                                     selection, region_drag)
              ──► context_menu_popup(response, long_press_at).show(..)
 ```
 - `mod.rs`: public types, constants, the publication and take-once delivery channel.
@@ -58,9 +60,18 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
   pans instead. The flag is re-read from every publication of the owner until the drag starts
   (not only at claim), so a mode that ended while the finger rested makes the drag pan; once
   selecting, the drag stays a selection until lift or cancel. A consumer whose selection exists
-  only at some points (Typing: a hold on the selected text layer) publishes the flag in the frame
-  `long_press_armed_at` first appears: the drag cannot start before the next frame, which reads
-  that publication (pinned by `selection_mode_published_in_the_arming_frame_selects_the_next_drag`).
+  only at some points publishes the flag in the frame `long_press_armed_at` first appears: the
+  drag cannot start before the next frame, which reads that publication (pinned by
+  `selection_mode_published_in_the_arming_frame_selects_the_next_drag`).
+- **Drag region** (`TouchSurface::drag_regions`, closed polygons, even-odd): a claim that starts
+  `Pending` (lone, no button held) inside one of last frame's regions of its owner is a region
+  touch. Leaving the slop — before arming or after — makes it a drag at once, delivered as
+  `TouchOutput::region_drag` (`TouchSelection` shape: `began`, every frame, `end` Released on lift,
+  Cancelled on a second finger / button press / focus loss). It never pans, axis-locks, flings or
+  becomes a `selection`, whatever `long_press_selection` says. Within the slop it is an ordinary
+  touch: a quick lift taps, a hold arms and its lift opens the menu. Consumers use it for an
+  object a finger moves without a hold (Typing: the selected text layer's grab area); the owner
+  re-checks the press when `began` arrives (the region is one frame old).
 - **Second claimed finger of the same owner**: every claim of the owner becomes a free pan for the
   rest of the gesture (an undecided one catches up from its anchor); before arming → both
   pan/pinch; after arming →
@@ -119,7 +130,8 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
   applied.
 - The drag mode is last frame's publication: a mode that ends in the very frame the drag starts
   still yields a selection the owner may refuse (no "refused" back-channel); the finger then
-  neither pans nor selects until lifted.
+  neither pans nor selects until lifted. Drag regions likewise: a press on a region whose object
+  changed in that frame yields a region drag the owner refuses.
 
 ## Editing map
 - Claim / strip / state machine / navigation math / axis lock / fling / tap → `router.rs`.

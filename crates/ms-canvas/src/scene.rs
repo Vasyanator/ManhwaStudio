@@ -233,6 +233,13 @@ pub(super) struct CanvasSceneState {
     /// (`TouchSurface::long_press_selection`). A one-frame flag: tabs set it every frame
     /// (`CanvasView::set_long_press_selection`) and `publish_touch_surface` resets it.
     pub(super) long_press_selection: bool,
+    /// Drag regions of this frame's touch surface (`TouchSurface::drag_regions`), closed
+    /// outlines in screen points. One-frame like `long_press_selection`: tabs add them every
+    /// frame (`CanvasView::add_touch_drag_region`) and `publish_touch_surface` drains them.
+    pub(super) touch_drag_regions: Vec<Vec<Pos2>>,
+    /// This frame's drag-region drag (`TouchOutput::region_drag`), read by the tab through
+    /// `CanvasView::touch_region_drag`. Set by `handle_shortcuts`.
+    pub(super) touch_region_drag: Option<TouchSelection>,
     /// This frame's long-press selection drag (`TouchOutput::selection`), read by the tab's
     /// capture mode through `CanvasView::touch_selection`. Set by `handle_shortcuts`.
     pub(super) touch_selection: Option<TouchSelection>,
@@ -333,6 +340,8 @@ impl Default for CanvasSceneState {
             aside_card_hit_rects: Vec::new(),
             handle_hit_rects: Vec::new(),
             long_press_selection: false,
+            touch_drag_regions: Vec::new(),
+            touch_region_drag: None,
             touch_selection: None,
             touch_long_press_at: None,
             touch_long_press_armed_at: None,

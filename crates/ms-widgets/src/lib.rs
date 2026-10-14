@@ -87,7 +87,9 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     `TouchSelection`, `context_menu_popup`, `publish_surface`, `take_touch_output`): the one
     owner of finger input on canvases. A finger that starts on a published canvas surface
     never reaches a tool: it pans / pinches, a long-press opens the canvas context menu on
-    release or turns a following drag into a typed selection. Mouse and pen are unchanged.
+    release or turns a following drag into a typed selection, and a press on an
+    owner-published drag region drags it at once (typed region drag). Mouse and pen are
+    unchanged.
 */
 #![warn(clippy::all)]
 

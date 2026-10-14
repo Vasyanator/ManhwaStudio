@@ -396,8 +396,9 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   `draw_pixel_grid` emits one `Painter::line_segment` per line — never a polyline, which
   `tessellate_path` would blur. Gate-free by contract; see the file header.
 - `types.rs`: passive DTOs and runtime payload types.
-- `touch.rs`: the canvas side of finger gestures (`touch_owner_id`, surface publication, applying
-  `TouchNavigation`, the tap point, the long-press feedback ring, `context_menu_open_pos`); see
+- `touch.rs`: the canvas side of finger gestures (`touch_owner_id`, surface publication with the
+  tab's drag regions, applying `TouchNavigation`, the tap / long-press / region-drag hand-offs, the
+  long-press feedback ring, `context_menu_open_pos`); see
   "Touch gestures".
 - `view_transform.rs`: `ViewTransform` world<->screen affine map (`screen = world * scale + translation`).
   The `ScrollArea` allocates the page strip and owns scrolling; each page's authoritative screen
@@ -453,10 +454,19 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `drive_touch_drag` + `TouchDrivenDrag` (begin at the press point, follow, `Released` commits like
   a mouse release, `Cancelled` drops like Esc; a mouse drag in the slot is never touched); the
   Cleaning tab replays it onto its tools' stroke hooks (`ms-tab-cleaning/src/touch_selection.rs`).
-  A tab whose selection exists only at certain points (Typing: a drag that starts on the selected
-  text layer moves it) reads `touch_long_press_armed_at()` in a hook inside `draw` and sets the
-  flag in that same frame: the router re-reads it until the drag starts, and the first drag frame
-  is always a later frame than the one that reported the arm.
+  A tab whose selection exists only at certain points reads `touch_long_press_armed_at()` in a
+  hook inside `draw` and sets the flag in that same frame: the router re-reads it until the drag
+  starts, and the first drag frame is always a later frame than the one that reported the arm.
+- **Drag regions**: a tab with an object a finger drags WITHOUT a hold (Typing: the selected text
+  layer) adds its outline every frame with `add_touch_drag_region(Vec<Pos2>)` (one-frame, drained
+  by the surface publication into `TouchSurface::drag_regions`) and reads the finger's drag from
+  `touch_region_drag()` — a channel of its own, so a capture mode's `touch_selection` never sees
+  it. The canvas does nothing with either.
+- **Tab object menus**: `touch_long_press_at()` exposes the lift point. A tab that opens its own
+  object's menu for a long-press answers `suppress_canvas_page_context_menu` for that press (the
+  page menu runs BEFORE the top-left hook in the same frame, so it must decide from the armed
+  point of earlier frames; Typing: `tab/touch_layers.rs`) and opens the object menu with
+  `context_menu_popup(response, Some(point))`.
 
 ## Contracts and invariants
 - Do not block the GUI thread with image decoding, disk I/O, long computation, or worker waits.

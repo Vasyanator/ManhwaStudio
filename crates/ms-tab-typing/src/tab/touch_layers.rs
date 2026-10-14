@@ -4,22 +4,27 @@ File: tab/touch_layers.rs
 Purpose:
 Finger input on the typing tab's text layers (text/image overlays). The finger decision itself is
 owned by `ms_widgets::touch_nav` and reaches this tab only as typed canvas output
-(`CanvasView::touch_tap` / `touch_long_press_armed_at` / `touch_selection`); nothing here reads raw
-touches. The rules, kept deliberately small:
+(`CanvasView::touch_tap` / `touch_long_press_armed_at` / `touch_long_press_at` /
+`touch_region_drag`); nothing here reads raw touches. The rules, kept deliberately small:
 - a TAP on a text layer selects it (the selected layer keeps the tap inside its own grab area, like
   the mouse's sticky focus); a tap anywhere else deselects. A tap while the create editor is open
   only commits the editor (`create_upload.rs`).
-- a PRESS-AND-HOLD on the SELECTED layer, then a drag, moves that layer through the shared move
-  primitive (`move_layer.rs`, source `Touch`): one session per gesture, the lift settles it (one
-  deferred write), a cancel puts the layer back and writes nothing.
+- a finger PRESSED on the SELECTED layer and dragged (no hold needed; a hold first works too) moves
+  that layer through the shared move primitive (`move_layer.rs`, source `Touch`): the selected
+  layer's grab area is published as the canvas' touch drag region (`touch_drag_region`), so the
+  router delivers that finger as a region drag instead of a pan. One session per gesture, the lift
+  settles it (one deferred write), a cancel (second finger) puts the layer back and writes nothing.
+- a LONG-PRESS lifted without moving on a text layer opens THAT layer's context menu (the one a
+  right-click opens, with the same select side effect), never the canvas page menu.
 - everything else is the canvas' and the create tool's: a finger elsewhere pans, a hold lifted
-  without moving opens the canvas menu, a hold-drag on any other point is the create rectangle
-  when one can start (else it pans).
+  off every text layer opens the canvas menu, a hold-drag off the selected layer is the create
+  rectangle when one can start (else it pans).
 
 Key structures:
 - `TypingTouchFrame`: this frame's finger facts, copied from the canvas.
 - `TypingTouchGates`, `TypingTouchOutcome`: the driver's input gates and its answer to the hook.
 - `TypingTouchLayerMove`: the running finger move and the geometry a cancel restores.
+- `TypingTouchLayerMenu`: a long-press on a text layer whose lift opens that layer's menu.
 
 Key functions:
 - `TypingTextOverlayLayer::drive_touch_layer_input`: the once-per-frame driver, called from the
@@ -27,9 +32,19 @@ Key functions:
   canvas publishes its touch surface, so the long-press flag it answers reaches the router in time).
 - `touch_overlay_at` / `touch_move_target_at`: the hit-tests, over the mouse's grab rule
   (`overlay_grab_mesh_scene`) and the composite draw order.
+- `touch_drag_region`: the selected layer's grab outline, published as the touch drag region.
+- `suppresses_canvas_page_menu_for_touch` / `take_touch_layer_menu_at`: the layer-menu hand-off
+  to the canvas page menu (suppressed) and to `draw_page.rs` (opened).
 - `canvas_page_view` / `canvas_page_view_at`: the `PageView` of a page as the canvas drew it.
 
 Notes:
+The layer menu is decided from the ARMED press, one frame ahead: the canvas runs its page menu
+(`suppress_canvas_page_context_menu`) before this tab's top-left hook sees the lift, so the frame
+before the lift records which layer the armed press is on (`touch_layer_menu_candidate`; the router
+reports the arm every frame while held). The lift then turns exactly that candidate into the menu
+request, so the page menu is suppressed exactly when the layer menu opens — never both, never
+neither. The layer's own context-menu widget opens it on the next frame's page pass (one frame
+later than a right-click; a repaint is requested).
 Raster layers do not react to a finger (the mouse keeps selecting them); a tap on one reads as a tap
 outside any text layer. A layer in a transform mode (raster or vector) is never moved by a finger:
 its handles are mouse-only, and a whole-layer move there would fight them.
@@ -45,8 +60,11 @@ pub(super) struct TypingTouchFrame {
     pub(super) tap: Option<Pos2>,
     /// `CanvasView::touch_long_press_armed_at`: a held finger whose long-press armed.
     pub(super) armed_at: Option<Pos2>,
-    /// `CanvasView::touch_selection`: the long-press drag in progress, if the canvas reports one.
-    pub(super) selection: Option<TouchSelection>,
+    /// `CanvasView::touch_long_press_at`: an armed finger lifted without moving this frame.
+    pub(super) long_press_at: Option<Pos2>,
+    /// `CanvasView::touch_region_drag`: the drag of a finger that started in the published drag
+    /// region (the selected layer's grab area), if one is running.
+    pub(super) region_drag: Option<TouchSelection>,
 }
 
 impl TypingTouchFrame {
@@ -56,7 +74,8 @@ impl TypingTouchFrame {
         Self {
             tap: canvas.touch_tap(),
             armed_at: canvas.touch_long_press_armed_at(),
-            selection: canvas.touch_selection(),
+            long_press_at: canvas.touch_long_press_at(),
+            region_drag: canvas.touch_region_drag(),
         }
     }
 }
@@ -65,7 +84,8 @@ impl TypingTouchFrame {
 #[derive(Debug, Clone, Copy)]
 pub(super) struct TypingTouchGates {
     /// A panel owns the canvas clicks this frame (the mask panel is open, or the eyedropper is
-    /// active): no finger selection change and no new finger move starts. A running move still ends.
+    /// active): no finger selection change, no layer menu and no new finger move starts (and no
+    /// drag region is published). A running move still ends.
     pub(super) panel_blocks: bool,
     /// The panel's whole-pixel movement policy, applied to a finger move as to a mouse move.
     pub(super) strict_pixel_movement: bool,
@@ -74,13 +94,20 @@ pub(super) struct TypingTouchGates {
 /// What the finger driver tells the hook.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct TypingTouchOutcome {
-    /// This frame's `touch_selection` belongs to a layer move: the create tool must not see it.
-    pub(super) selection_consumed: bool,
-    /// The armed long-press sits on the selected layer: set `CanvasView::set_long_press_selection`
-    /// THIS frame, so the drag that follows arrives as a selection (it would otherwise pan).
-    pub(super) long_press_selection: bool,
-    /// Selection or geometry changed: request a repaint.
+    /// Selection, geometry or a layer-menu request changed: request a repaint.
     pub(super) changed: bool,
+}
+
+/// A finger long-press on a text layer: while armed, the candidate whose lift opens the layer's
+/// context menu; after the lift, the request `draw_page.rs` opens (see the file notes).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct TypingTouchLayerMenu {
+    /// The text layer under the press (`touch_overlay_at`).
+    pub(super) overlay_idx: usize,
+    /// Its page.
+    pub(super) page_idx: usize,
+    /// The press point (screen points): the menu anchor.
+    pub(super) at: Pos2,
 }
 
 /// A finger move in progress: which overlay, on which page, and its geometry before the gesture
@@ -110,9 +137,11 @@ impl TypingTextOverlayLayer {
     /// selection is synced into the edit panel.
     ///
     /// `view_at` resolves the page drawn under a screen point, `view_of` a page by index (see
-    /// [`canvas_page_view_at`] / [`canvas_page_view`]). Order: a running finger move is driven or
-    /// ended first; then a drag that began this frame on the selected layer opens a move; then a tap
-    /// selects / deselects; last, the armed point decides the long-press flag.
+    /// [`canvas_page_view_at`] /
+    /// [`canvas_page_view`]). Order: last frame's layer-menu request is dropped (its page pass has
+    /// run); a running finger move is driven or ended; a region drag that began this frame on the
+    /// selected layer opens a move; a tap selects / deselects; a long-press lift turns last frame's
+    /// menu candidate into this frame's request; last, the armed point decides the next candidate.
     pub(super) fn drive_touch_layer_input(
         &mut self,
         frame: TypingTouchFrame,
@@ -122,15 +151,15 @@ impl TypingTextOverlayLayer {
     ) -> TypingTouchOutcome {
         let mut outcome = TypingTouchOutcome::default();
         let may_start = !gates.panel_blocks && self.layout_editor.is_none();
+        // The request was for the page pass that ran before this hook: it opened there or its
+        // layer was not drawn; either way it is spent.
+        self.touch_layer_menu_request = None;
         if let Some(active) = self.touch_layer_move.take() {
             outcome.changed = true;
-            match frame.selection {
-                Some(selection) => {
-                    outcome.selection_consumed = true;
-                    self.step_touch_layer_move(active, selection, gates.strict_pixel_movement, view_of);
-                }
+            match frame.region_drag {
+                Some(drag) => self.step_touch_layer_move(active, drag, gates.strict_pixel_movement, view_of),
                 None => {
-                    // The router reports a running selection every frame until its end, so a
+                    // The router reports a running region drag every frame until its end, so a
                     // missing one means the end was never delivered (the canvas skipped a frame's
                     // take). Keep what the user sees: settle, as a lift would.
                     ms_log::runtime_log::log_warn(format!(
@@ -142,17 +171,23 @@ impl TypingTextOverlayLayer {
                     }
                 }
             }
-        } else if let Some(selection) = frame.selection
-            && selection.began
-            && may_start
-            && let Some(view) = view_at(selection.origin)
-            && let Some(overlay_idx) = self.touch_move_target_at(view, selection.origin)
+        } else if let Some(drag) = frame.region_drag
+            && drag.began
         {
-            // The drag started on the selected layer: it is a move, never the create rectangle,
-            // even when the move cannot open.
-            outcome.selection_consumed = true;
-            outcome.changed = true;
-            self.begin_touch_layer_move(overlay_idx, view, selection, gates.strict_pixel_movement, view_of);
+            // The router tested the press against LAST frame's region; re-check the target now. A
+            // refused drag (the selection or a gate changed in between) moves nothing until the lift.
+            let target = if may_start {
+                view_at(drag.origin).and_then(|view| self.touch_move_target_at(view, drag.origin).map(|overlay_idx| (overlay_idx, view)))
+            } else {
+                None
+            };
+            match target {
+                Some((overlay_idx, view)) => {
+                    outcome.changed = true;
+                    self.begin_touch_layer_move(overlay_idx, view, drag, gates.strict_pixel_movement, view_of);
+                }
+                None => ms_log::trace_log!(cat::INPUT, "touch_layer_move_refused origin={:?}", drag.origin),
+            }
         }
 
         // A tap while the create editor is open only commits it (`draw_text_editor`).
@@ -164,16 +199,81 @@ impl TypingTextOverlayLayer {
             outcome.changed |= self.apply_touch_tap(tap, view_at);
         }
 
-        outcome.long_press_selection = may_start
-            && self.touch_layer_move.is_none()
-            && frame
-                .armed_at
-                .is_some_and(|point| view_at(point).and_then(|view| self.touch_move_target_at(view, point)).is_some());
+        // The lift of the press the candidate was recorded for: the page menu was suppressed for
+        // it this frame, so the layer menu must open (see the file notes).
+        let candidate = self.touch_layer_menu_candidate.take();
+        if let Some(at) = frame.long_press_at
+            && let Some(menu) = candidate.filter(|menu| menu.at == at)
+        {
+            ms_log::trace_log!(cat::TYPING, "touch_layer_menu overlay_idx={} page={}", menu.overlay_idx, menu.page_idx);
+            self.touch_layer_menu_request = Some(menu);
+            outcome.changed = true;
+        }
+        // The tap's gates: a menu never opens over the create editor or under a running move.
+        self.touch_layer_menu_candidate = if may_start && self.create_editor.is_none() && self.touch_layer_move.is_none() {
+            frame.armed_at.and_then(|at| {
+                let view = view_at(at)?;
+                let overlay_idx = self.touch_overlay_at(view, at)?;
+                Some(TypingTouchLayerMenu { overlay_idx, page_idx: view.page_idx, at })
+            })
+        } else {
+            None
+        };
         outcome
     }
 
-    /// Opens the finger move of `overlay_idx` (the selected layer under `selection.origin`) and
-    /// applies the drag's first frame.
+    /// Whether the canvas page menu must stay shut on `page_idx` this frame: an armed finger
+    /// long-press there sits on a text layer, so its lift opens that layer's menu instead.
+    pub(super) fn suppresses_canvas_page_menu_for_touch(&self, page_idx: usize) -> bool {
+        self.touch_layer_menu_candidate.is_some_and(|menu| menu.page_idx == page_idx)
+    }
+
+    /// The anchor of the finger layer-menu request for `overlay_idx` on `page_idx`, taken (it opens
+    /// once). The vector-transform menu (`vector_transform.rs`) calls it directly: its right-click
+    /// has no side effects either.
+    pub(super) fn take_touch_layer_menu_at(&mut self, overlay_idx: usize, page_idx: usize) -> Option<Pos2> {
+        let menu = self.touch_layer_menu_request.filter(|menu| menu.overlay_idx == overlay_idx && menu.page_idx == page_idx)?;
+        self.touch_layer_menu_request = None;
+        Some(menu.at)
+    }
+
+    /// Takes the finger layer-menu request of `overlay_idx` on `page_idx` and applies what a mouse
+    /// right-click on the layer does before its menu opens (`draw_page.rs`): the layer becomes the
+    /// selected overlay and its shape-variant preview starts at the press point. Returns the menu
+    /// anchor to pass to `context_menu_popup`, `None` when no request is for this layer.
+    pub(super) fn open_touch_layer_menu(&mut self, ctx: &egui::Context, overlay_idx: usize, page_idx: usize) -> Option<Pos2> {
+        let at = self.take_touch_layer_menu_at(overlay_idx, page_idx)?;
+        self.selected_overlay_idx = Some(overlay_idx);
+        self.start_shape_variant_preview_if_available(ctx, overlay_idx, at);
+        Some(at)
+    }
+
+    /// The grab-area outline (screen points) of the selected text layer when a finger may move it —
+    /// the canvas' touch drag region for the next frame, so a finger pressed there drags it without
+    /// a hold. `None` while a gate blocks finger moves (`TypingTouchGates::panel_blocks`, the layout
+    /// editor), in a transform mode, or when the layer is not drawn. Same rule as
+    /// [`Self::touch_move_target_at`], which re-checks the press when the drag begins.
+    pub(super) fn touch_drag_region(&self, gates: TypingTouchGates, view_of: &dyn Fn(usize) -> Option<PageView>) -> Option<Vec<Pos2>> {
+        if gates.panel_blocks || self.layout_editor.is_some() {
+            return None;
+        }
+        let selected = self.selected_overlay_idx?;
+        if self.transform_mode_overlay_idx == Some(selected) {
+            return None;
+        }
+        let overlay = self.overlays.get(selected)?;
+        let view = view_of(overlay.page_idx)?;
+        if !self.touch_overlay_candidates(view).contains(&selected) {
+            return None;
+        }
+        let geometry = overlay_scene_geometry(overlay, view);
+        let grab = overlay_grab_mesh_scene(&geometry.mesh_scene, geometry.mesh_cols, geometry.mesh_rows, overlay.kind == TypingOverlayKind::Text);
+        let outline = mesh_boundary_path(&grab, geometry.mesh_cols, geometry.mesh_rows);
+        (!outline.is_empty()).then_some(outline)
+    }
+
+    /// Opens the finger move of `overlay_idx` (the selected layer under `selection.origin`, the
+    /// region drag's press point) and applies the drag's first frame.
     fn begin_touch_layer_move(
         &mut self,
         overlay_idx: usize,
@@ -197,7 +297,8 @@ impl TypingTextOverlayLayer {
         self.step_touch_layer_move(active, selection, strict_pixel_movement, view_of);
     }
 
-    /// One frame of a finger move: follow the finger, or end the gesture on its last frame —
+    /// One frame of a finger move (`selection` is the region drag): follow the finger, or end the
+    /// gesture on its last frame —
     /// `Released` settles (one deferred write), `Cancelled` restores the original geometry and
     /// writes nothing. A session that something else already ended (a selection change, a flush,
     /// an arrow key) leaves the finger with nothing to drive.
@@ -400,8 +501,17 @@ mod tests {
         TypingTouchFrame { tap: Some(at), ..TypingTouchFrame::default() }
     }
 
+    /// A region drag (the router's drag of a finger pressed in the published drag region).
     fn drag(origin: Pos2, pos: Pos2, began: bool, end: Option<TouchSelectionEnd>) -> TypingTouchFrame {
-        TypingTouchFrame { selection: Some(TouchSelection { origin, pos, began, end }), ..TypingTouchFrame::default() }
+        TypingTouchFrame { region_drag: Some(TouchSelection { origin, pos, began, end }), ..TypingTouchFrame::default() }
+    }
+
+    fn armed(at: Pos2) -> TypingTouchFrame {
+        TypingTouchFrame { armed_at: Some(at), ..TypingTouchFrame::default() }
+    }
+
+    fn lifted(at: Pos2) -> TypingTouchFrame {
+        TypingTouchFrame { long_press_at: Some(at), ..TypingTouchFrame::default() }
     }
 
     fn drive(layer: &mut TypingTextOverlayLayer, frame: TypingTouchFrame) -> TypingTouchOutcome {
@@ -415,7 +525,6 @@ mod tests {
         let outcome = drive(&mut layer, tap(Pos2::new(30.0, 30.0)));
         assert_eq!(layer.selected_overlay_idx, Some(0), "a tap on a layer selects it");
         assert!(outcome.changed);
-        assert!(!outcome.selection_consumed);
         drive(&mut layer, tap(Pos2::new(72.0, 68.0)));
         assert_eq!(layer.selected_overlay_idx, Some(1), "a tap on another layer switches to it");
         let outcome = drive(&mut layer, tap(Pos2::new(5.0, 90.0)));
@@ -447,28 +556,45 @@ mod tests {
         assert_eq!(layer.selected_overlay_idx, None);
     }
 
-    #[test]
-    fn armed_long_press_asks_for_a_selection_only_on_the_selected_layer() {
-        let ctx = egui::Context::default();
-        let mut layer = two_layers(&ctx);
-        layer.selected_overlay_idx = Some(0);
-        let armed = |at: Pos2| TypingTouchFrame { armed_at: Some(at), ..TypingTouchFrame::default() };
-        assert!(drive(&mut layer, armed(Pos2::new(30.0, 30.0))).long_press_selection, "hold on the selected layer");
-        assert!(!drive(&mut layer, armed(Pos2::new(70.0, 70.0))).long_press_selection, "hold on an unselected layer");
-        assert!(!drive(&mut layer, armed(Pos2::new(5.0, 90.0))).long_press_selection, "hold on bare page");
-        layer.transform_mode_overlay_idx = Some(0);
-        assert!(!drive(&mut layer, armed(Pos2::new(30.0, 30.0))).long_press_selection, "no finger move in a transform mode");
-        assert_eq!(layer.selected_overlay_idx, Some(0), "an armed hold never changes the selection");
+    /// Whether `outline` (a drag region) contains `point`, by the router's own even-odd rule
+    /// restated for the test (crossings of the ray to +x).
+    fn outline_contains(outline: &[Pos2], point: Pos2) -> bool {
+        let mut inside = false;
+        for (index, next) in outline.iter().enumerate() {
+            let prev = outline[(index + outline.len() - 1) % outline.len()];
+            if (next.y > point.y) != (prev.y > point.y) && point.x < next.x + (point.y - next.y) * (prev.x - next.x) / (prev.y - next.y) {
+                inside = !inside;
+            }
+        }
+        inside
     }
 
     #[test]
-    fn hold_drag_on_the_selected_layer_moves_it_and_the_lift_settles_once() {
+    fn drag_region_is_the_grab_area_of_the_selected_layer_only() {
+        let ctx = egui::Context::default();
+        let mut layer = two_layers(&ctx);
+        assert_eq!(layer.touch_drag_region(gates(), &view_of), None, "no selection, no region");
+        layer.selected_overlay_idx = Some(0);
+        let outline = layer.touch_drag_region(gates(), &view_of).unwrap_or_default();
+        assert!(outline_contains(&outline, Pos2::new(30.0, 30.0)), "the selected layer is a region: {outline:?}");
+        assert!(!outline_contains(&outline, Pos2::new(70.0, 70.0)), "an unselected layer is not");
+        assert!(!outline_contains(&outline, Pos2::new(5.0, 90.0)), "bare page is not");
+        let blocked = TypingTouchGates { panel_blocks: true, strict_pixel_movement: false };
+        assert_eq!(layer.touch_drag_region(blocked, &view_of), None, "a panel owning the clicks publishes none");
+        layer.transform_mode_overlay_idx = Some(0);
+        assert_eq!(layer.touch_drag_region(gates(), &view_of), None, "no finger move in a transform mode");
+        layer.transform_mode_overlay_idx = None;
+        assert_eq!(layer.touch_drag_region(gates(), &|_| None), None, "a page not drawn publishes none");
+    }
+
+    #[test]
+    fn press_drag_on_the_selected_layer_moves_it_and_the_lift_settles_once() {
         let ctx = egui::Context::default();
         let mut layer = two_layers(&ctx);
         layer.selected_overlay_idx = Some(0);
         let origin = Pos2::new(30.0, 30.0);
         let outcome = drive(&mut layer, drag(origin, Pos2::new(40.0, 35.0), true, None));
-        assert!(outcome.selection_consumed, "the create tool must not see a move drag");
+        assert!(outcome.changed);
         assert_eq!(layer.overlays[0].center_page_px, [40.0, 35.0]);
         assert!(layer.move_session.as_ref().is_some_and(|session| session.source == TypingLayerMoveSource::Touch));
         // A frame without a pointer button never settles a finger move (a claimed finger never
@@ -478,8 +604,7 @@ mod tests {
         assert!(!layer.has_pending_placement_save(), "nothing is written mid-gesture");
         drive(&mut layer, drag(origin, Pos2::new(50.0, 45.0), false, None));
         assert_eq!(layer.overlays[0].center_page_px, [50.0, 45.0], "the total delta is from the press point");
-        let outcome = drive(&mut layer, drag(origin, Pos2::new(55.0, 45.0), false, Some(TouchSelectionEnd::Released)));
-        assert!(outcome.selection_consumed);
+        drive(&mut layer, drag(origin, Pos2::new(55.0, 45.0), false, Some(TouchSelectionEnd::Released)));
         assert_eq!(layer.overlays[0].center_page_px, [55.0, 45.0]);
         assert!(layer.move_session.is_none() && layer.touch_layer_move.is_none(), "the lift ends the gesture");
         assert!(layer.has_pending_placement_save(), "one deferred write for the whole gesture");
@@ -487,14 +612,72 @@ mod tests {
     }
 
     #[test]
-    fn drag_from_an_unselected_layer_is_left_to_the_create_tool() {
+    fn region_drag_off_the_selected_layer_moves_nothing() {
+        // The region was last frame's; the selection changed since, so the press is no longer on it.
         let ctx = egui::Context::default();
         let mut layer = two_layers(&ctx);
         layer.selected_overlay_idx = Some(0);
-        let outcome = drive(&mut layer, drag(Pos2::new(70.0, 70.0), Pos2::new(90.0, 90.0), true, None));
-        assert!(!outcome.selection_consumed);
-        assert!(layer.move_session.is_none());
+        drive(&mut layer, drag(Pos2::new(70.0, 70.0), Pos2::new(90.0, 90.0), true, None));
+        drive(&mut layer, drag(Pos2::new(70.0, 70.0), Pos2::new(95.0, 95.0), false, None));
+        assert!(layer.move_session.is_none() && layer.touch_layer_move.is_none());
+        assert_eq!(layer.overlays[0].center_page_px, [30.0, 30.0]);
         assert_eq!(layer.overlays[1].center_page_px, [70.0, 70.0]);
+    }
+
+    #[test]
+    fn long_press_lift_on_a_layer_opens_its_menu_and_selects_it_like_a_right_click() {
+        let ctx = egui::Context::default();
+        let mut layer = two_layers(&ctx);
+        layer.selected_overlay_idx = Some(0);
+        let at = Pos2::new(70.0, 70.0);
+        drive(&mut layer, armed(at));
+        assert!(layer.suppresses_canvas_page_menu_for_touch(0), "an armed hold on a layer keeps the page menu shut");
+        assert!(!layer.suppresses_canvas_page_menu_for_touch(1), "only on its own page");
+        assert_eq!(layer.selected_overlay_idx, Some(0), "an armed hold never changes the selection");
+        // Lift frame: the canvas consults the hook BEFORE the driver runs, so the page menu is
+        // still suppressed when the router reports the lift.
+        assert!(layer.suppresses_canvas_page_menu_for_touch(0));
+        let outcome = drive(&mut layer, lifted(at));
+        assert!(outcome.changed, "the menu opens on the next frame: repaint");
+        assert!(!layer.suppresses_canvas_page_menu_for_touch(0), "the next frame's page menu is free again");
+        assert_eq!(layer.open_touch_layer_menu(&ctx, 0, 0), None, "the request is for the layer under the press");
+        assert_eq!(layer.open_touch_layer_menu(&ctx, 1, 0), Some(at), "anchored at the press point");
+        assert_eq!(layer.selected_overlay_idx, Some(1), "selected like a right-click");
+        assert_eq!(layer.open_touch_layer_menu(&ctx, 1, 0), None, "it opens once");
+    }
+
+    #[test]
+    fn long_press_lift_off_every_layer_leaves_the_page_menu() {
+        let ctx = egui::Context::default();
+        let mut layer = two_layers(&ctx);
+        let at = Pos2::new(5.0, 90.0);
+        drive(&mut layer, armed(at));
+        assert!(!layer.suppresses_canvas_page_menu_for_touch(0), "bare page: the canvas menu opens");
+        drive(&mut layer, lifted(at));
+        assert!(!layer.suppresses_canvas_page_menu_for_touch(0));
+        assert_eq!((layer.open_touch_layer_menu(&ctx, 0, 0), layer.open_touch_layer_menu(&ctx, 1, 0)), (None, None), "no layer menu");
+    }
+
+    #[test]
+    fn exactly_one_menu_per_long_press() {
+        let ctx = egui::Context::default();
+        let at = Pos2::new(30.0, 30.0);
+        // A lift the arm was not seen for (no candidate): the page menu ran unsuppressed, so no
+        // layer menu may open on top of it.
+        let mut layer = two_layers(&ctx);
+        drive(&mut layer, lifted(at));
+        assert_eq!(layer.open_touch_layer_menu(&ctx, 0, 0), None, "never both");
+        // Gates closed while armed (a panel owns the clicks): no candidate, so the page menu opens.
+        let mut layer = two_layers(&ctx);
+        let blocked = TypingTouchGates { panel_blocks: true, strict_pixel_movement: false };
+        layer.drive_touch_layer_input(armed(at), blocked, &view_at, &view_of);
+        assert!(!layer.suppresses_canvas_page_menu_for_touch(0));
+        // A request not opened by the next page pass is dropped by the next driver run.
+        let mut layer = two_layers(&ctx);
+        drive(&mut layer, armed(at));
+        drive(&mut layer, lifted(at));
+        drive(&mut layer, TypingTouchFrame::default());
+        assert_eq!(layer.open_touch_layer_menu(&ctx, 0, 0), None, "a stale request never opens later");
     }
 
     #[test]

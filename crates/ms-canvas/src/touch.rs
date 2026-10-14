@@ -19,7 +19,10 @@ Main responsibilities:
   rectangle-drag capture modes);
 - hand this frame's finger tap point to the tab (`touch_tap`), for dismiss/commit decisions
   and layer selection (the canvas itself does nothing on a tap), and the armed long-press point
-  (`touch_long_press_armed_at`), so a tab can make the drag a selection only on its objects;
+  (`touch_long_press_armed_at`) and lift (`touch_long_press_at`), so a tab can find what a
+  long-press is on and open that object's menu instead of the page menu;
+- publish the tab's drag regions (`add_touch_drag_region`: objects a finger drags without a
+  long-press) and hand their drag back (`touch_region_drag`);
 - draw the armed long-press feedback marker.
 
 Key functions:
@@ -27,7 +30,8 @@ Key functions:
 - `CanvasView::take_touch_output_for_frame` / `apply_touch_navigation`
 - `CanvasView::publish_touch_surface` / `draw_touch_long_press_feedback`
 - `CanvasView::set_long_press_selection` / `touch_selection` / `touch_tap` /
-  `touch_long_press_armed_at`
+  `touch_long_press_armed_at` / `touch_long_press_at` / `add_touch_drag_region` /
+  `touch_region_drag`
 - `drive_touch_drag` + `TouchDrivenDrag`: the one mapping of a `TouchSelection` onto a
   rectangle-drag capture mode (begin at the press point, follow, commit on release, drop on
   cancel).
@@ -140,6 +144,26 @@ impl CanvasView {
         self.scene.long_press_selection = enabled;
     }
 
+    /// Adds, for THIS frame, a drag region of the touch surface (`TouchSurface::drag_regions`):
+    /// a closed outline (screen points, even-odd rule) of an object a lone finger drags right
+    /// away, without a long-press. Its drag arrives as [`Self::touch_region_drag`] — never as a
+    /// pan or a [`Self::touch_selection`] — and a touch there still taps and long-presses.
+    ///
+    /// One-frame, like [`Self::set_long_press_selection`]: the publication at the end of `draw`
+    /// drains the list. Call it before `draw` or from a hook inside `draw` with `&mut
+    /// CanvasView`; the router tests a finger against the regions of the frame before its claim.
+    pub fn add_touch_drag_region(&mut self, outline: Vec<Pos2>) {
+        self.scene.touch_drag_regions.push(outline);
+    }
+
+    /// This frame's drag of a finger that started in one of this canvas' drag regions
+    /// ([`Self::add_touch_drag_region`]), if one is running. Valid from `draw`'s input step on;
+    /// reported every frame while it lasts, `began` on its first frame and `end` on its last.
+    #[must_use]
+    pub fn touch_region_drag(&self) -> Option<TouchSelection> {
+        self.scene.touch_region_drag
+    }
+
     /// This frame's long-press selection drag on this canvas, if a finger is performing one.
     ///
     /// Valid from `draw`'s input step on (hooks inside `draw` and code after it read the
@@ -178,6 +202,16 @@ impl CanvasView {
         self.scene.touch_long_press_armed_at
     }
 
+    /// This frame's finger long-press lifted without moving on this canvas (the press point,
+    /// screen points; `TouchOutput::long_press_at`), lift frame only, valid from `draw`'s input
+    /// step on. The canvas opens its page menu there unless the tab suppresses it
+    /// (`CanvasHooks::suppress_canvas_page_context_menu`); a tab whose own object sits under the
+    /// press opens that object's menu instead (Typing text layers).
+    #[must_use]
+    pub fn touch_long_press_at(&self) -> Option<Pos2> {
+        self.scene.touch_long_press_at
+    }
+
     /// Stable id under which this canvas publishes its touch surface and takes its touch
     /// output (`ms_widgets::touch_nav`). Tabs pass it to `touch_nav::publish_capture_layer` for
     /// their capture overlays, so a finger pans under them too.
@@ -194,6 +228,7 @@ impl CanvasView {
         self.scene.touch_long_press_at = output.long_press_at;
         self.scene.touch_long_press_armed_at = output.long_press_armed_at;
         self.scene.touch_selection = output.selection;
+        self.scene.touch_region_drag = output.region_drag;
         self.scene.touch_tap_at = output.tap_at;
         if let Some(navigation) = output.navigation
             && self.apply_touch_navigation(navigation, canvas_rect)
@@ -253,15 +288,17 @@ impl CanvasView {
     }
 
     /// Builds this frame's touch surface (`None` before the first scene pass) and consumes the
-    /// one-frame `long_press_selection` flag whether or not a surface results.
+    /// one-frame `long_press_selection` flag and drag regions whether or not a surface results.
     fn take_touch_surface(&mut self) -> Option<TouchSurface> {
         let long_press_selection = std::mem::take(&mut self.scene.long_press_selection);
+        let drag_regions = std::mem::take(&mut self.scene.touch_drag_regions);
         let rect = self.scene.scroll_inner_rect?;
         Some(TouchSurface {
             owner: self.touch_owner_id(),
             rect,
             holes: self.touch_surface_holes(),
             long_press_selection,
+            drag_regions,
         })
     }
 
@@ -577,6 +614,19 @@ mod tests {
         unlaid.set_long_press_selection(true);
         assert_eq!(unlaid.take_touch_surface(), None);
         assert!(!unlaid.scene.long_press_selection);
+    }
+
+    #[test]
+    fn drag_regions_are_one_frame() {
+        let outline = vec![pos2(10.0, 10.0), pos2(40.0, 10.0), pos2(40.0, 40.0)];
+        let mut view = view_with(1.0, Vec2::ZERO, viewport());
+        view.add_touch_drag_region(outline.clone());
+        assert_eq!(view.take_touch_surface().map(|surface| surface.drag_regions), Some(vec![outline.clone()]));
+        assert_eq!(view.take_touch_surface().map(|surface| surface.drag_regions), Some(Vec::new()), "a frame without regions publishes none");
+        let mut unlaid = CanvasView::default();
+        unlaid.add_touch_drag_region(outline);
+        assert_eq!(unlaid.take_touch_surface(), None);
+        assert!(unlaid.scene.touch_drag_regions.is_empty(), "consumed even without a surface");
     }
 
     #[test]

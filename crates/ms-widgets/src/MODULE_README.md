@@ -37,9 +37,9 @@ crate's `[dev-dependencies]`, so no production build carries them.
   `raw_input_hook` drives `TouchRouter`, which claims a touch that starts on a canvas surface
   published last frame and strips egui-winit's emulated mouse events for it, so a finger never
   reaches a tool; canvases publish `TouchSurface`s and take a typed `TouchOutput` (pan / pinch,
-  long-press feedback, long-press menu point, long-press selection drag) every frame. Both canvas
-  context menus open through `context_menu_popup` (secondary click and long-press share one
-  path). Ordinary UI, the mouse and the pen are untouched.
+  long-press feedback, long-press menu point, long-press selection drag, drag-region drag) every
+  frame. Both canvas context menus open through `context_menu_popup` (secondary click and
+  long-press share one path). Ordinary UI, the mouse and the pen are untouched.
 - `input_manager_v2.rs`: the user-configurable hotkey registry — code-declared `HotkeySpecV2`
   specs, the persisted `Hotkeys` overrides in `user_config.json`, and the per-frame dispatch of
   triggered commands out of `egui::InputState` by id and `HotkeyScopeV2`. It lives at this layer

@@ -13,7 +13,8 @@ Main responsibilities:
 - strip egui-winit's emulated mouse events of a claimed touch (they sit right after
   its `Touch` event), plus platform-promoted copies near it (proximity rule);
 - run the per-touch gesture state machine (pending long-press, pan, armed, selection,
-  spent) and compute pan / pinch per owner;
+  spent) and compute pan / pinch per owner; a lone touch that starts in one of the owner's
+  drag regions drags (`TouchOutput::region_drag`) instead of panning;
 - lock a one-finger pan to one axis (or none) and run the kinetic fling after its lift;
 - report a tap (a short, still, lone touch) to its owner;
 - hand the result to `mod.rs` for take-once delivery.
@@ -65,7 +66,7 @@ use ms_log::trace::cat;
 use super::{
     Delivery, LONG_PRESS_ARM_S, PROMOTION_GRACE_S, PROMOTION_RADIUS_PT, TouchNavigation,
     TouchOutput, TouchSelection, TouchSelectionEnd, TouchSurface, freeze_publications,
-    set_router_live, store_deliveries,
+    polygon_contains, set_router_live, store_deliveries,
 };
 
 /// Identity of one touch: egui's device hash plus the platform's touch id.
@@ -213,9 +214,10 @@ enum Phase {
     Pending,
     /// Navigates (pan, and pinch together with the owner's other `Pan` touches).
     Pan,
-    /// Long-press armed and still within the slop: lift = menu, move = selection.
+    /// Long-press armed and still within the slop: lift = menu, move = selection (or the
+    /// region drag of a `Claim::region` touch).
     Held,
-    /// Long-press selection drag in progress.
+    /// Drag in progress: a long-press selection, or the region drag of a `Claim::region` touch.
     Selecting,
     /// Interrupted after arming: never navigates or selects again; stripping continues.
     Spent,
@@ -240,6 +242,10 @@ struct Claim {
     /// owner while the drag mode is open (`Phase::drag_mode_open`), so the value seen when the
     /// drag starts is last frame's; a frame without a publication keeps the previous value.
     selection_mode: bool,
+    /// The touch was claimed `Pending` inside one of the owner's `TouchSurface::drag_regions`:
+    /// leaving the slop (armed or not) starts a region drag, never a pan or a selection; its
+    /// drag frames go to `TouchOutput::region_drag`.
+    region: bool,
     start_pos: Pos2,
     start_time: f64,
     /// Latest known position.
@@ -285,6 +291,7 @@ struct ClaimScene<'a> {
 struct OwnerFrame {
     long_press_at: Option<Pos2>,
     selection: Option<TouchSelection>,
+    region_drag: Option<TouchSelection>,
     tap_at: Option<Pos2>,
 }
 
@@ -307,12 +314,14 @@ impl FrameAcc {
         &mut self.owners[index].1
     }
 
-    /// Records the selection of `claim` at `pos`, keeping `began` of an entry made earlier in
-    /// the same frame.
+    /// Records the drag of `claim` at `pos` — in the region-drag slot for a `Claim::region`
+    /// touch, else in the selection slot — keeping `began` of an entry made earlier in the same
+    /// frame.
     fn selection(&mut self, claim: &Claim, pos: Pos2, began: bool, end: Option<TouchSelectionEnd>) {
         let frame = self.owner(claim.owner);
-        let began = began || frame.selection.is_some_and(|selection| selection.began);
-        frame.selection = Some(TouchSelection { origin: claim.start_pos, pos, began, end });
+        let slot = if claim.region { &mut frame.region_drag } else { &mut frame.selection };
+        let began = began || slot.is_some_and(|selection| selection.began);
+        *slot = Some(TouchSelection { origin: claim.start_pos, pos, began, end });
     }
 }
 
@@ -580,11 +589,14 @@ impl TouchRouter {
             ms_log::trace_log!(cat::INPUT, "touch_nav fling stopped owner={owner:?} cause=touch");
         }
         let pending = alone && self.passthrough_down.is_empty();
+        // Only a lone, palm-free touch can drag a region: any other claim already pans.
+        let region = pending && surface.drag_regions.iter().any(|outline| polygon_contains(outline, pos));
         self.claims.insert(
             key,
             Claim {
                 owner,
                 selection_mode: surface.long_press_selection,
+                region,
                 start_pos: pos,
                 start_time: now,
                 pos,
@@ -598,7 +610,7 @@ impl TouchRouter {
             },
         );
         acc.dismiss_popups = true;
-        ms_log::trace_log!(cat::INPUT, "touch_nav claim owner={owner:?} pos={pos:?} pending={pending}");
+        ms_log::trace_log!(cat::INPUT, "touch_nav claim owner={owner:?} pos={pos:?} pending={pending} region={region}");
         true
     }
 
@@ -611,14 +623,19 @@ impl TouchRouter {
         let beyond_slop = claim.start_pos.distance(pos) > cfg.slop_pt;
         match claim.phase {
             Phase::Pending => {
-                if beyond_slop {
+                if beyond_slop && claim.region {
+                    // A region drag needs no arming: it starts the moment the finger leaves the slop.
+                    claim.phase = Phase::Selecting;
+                    acc.selection(claim, pos, true, None);
+                    ms_log::trace_log!(cat::INPUT, "touch_nav region drag start owner={:?} origin={:?}", claim.owner, claim.start_pos);
+                } else if beyond_slop {
                     // `nav_prev` still holds the start position: the page catches up the slop.
                     claim.phase = Phase::Pan;
                 }
             }
             Phase::Held => {
                 if beyond_slop {
-                    if claim.selection_mode {
+                    if claim.region || claim.selection_mode {
                         claim.phase = Phase::Selecting;
                         acc.selection(claim, pos, true, None);
                         ms_log::trace_log!(cat::INPUT, "touch_nav selection start owner={:?} origin={:?}", claim.owner, claim.start_pos);
@@ -835,14 +852,16 @@ impl TouchRouter {
         for owner in owners {
             let frame = acc.owners.iter().find(|(id, _)| *id == owner).map(|(_, frame)| *frame).unwrap_or_default();
             let mine = || self.claims.values().filter(move |claim| claim.owner == owner);
-            let selection = frame.selection.or_else(|| {
-                mine().find(|claim| claim.phase == Phase::Selecting).map(|claim| TouchSelection {
+            let running = |region: bool| {
+                mine().find(|claim| claim.phase == Phase::Selecting && claim.region == region).map(|claim| TouchSelection {
                     origin: claim.start_pos,
                     pos: claim.pos,
                     began: false,
                     end: None,
                 })
-            });
+            };
+            let selection = frame.selection.or_else(|| running(false));
+            let region_drag = frame.region_drag.or_else(|| running(true));
             // A claim of the owner stops its fling, so at most one of the two navigates.
             let fling_navigation = flung.iter().find(|(id, _)| *id == owner).map(|(_, navigation)| *navigation);
             let output = TouchOutput {
@@ -850,6 +869,7 @@ impl TouchRouter {
                 long_press_at: frame.long_press_at,
                 long_press_armed_at: mine().find(|claim| claim.phase == Phase::Held).map(|claim| claim.start_pos),
                 selection,
+                region_drag,
                 tap_at: frame.tap_at,
             };
             // A gliding owner needs the very next frame (deadline = now), a pending long-press

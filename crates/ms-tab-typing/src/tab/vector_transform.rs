@@ -635,10 +635,12 @@ impl TypingTextOverlayLayer {
             self.primary_pointer_targets_overlay_this_frame = true;
         }
 
-        // Context menu: exit / reset the VECTOR transform.
+        // Context menu: exit / reset the VECTOR transform. A finger long-press lifted on this
+        // layer opens it too (`touch_layers.rs`), anchored at the press point.
+        let touch_menu_at = self.take_touch_layer_menu_at(overlay_idx, page_idx);
         let mut pending_exit = false;
         let mut pending_reset = false;
-        response.context_menu(|menu_ui| {
+        context_menu_popup(&response, touch_menu_at).show(|menu_ui| {
             if menu_ui
                 .button(t!("typing.context_menu.exit_transform_mode_vector"))
                 .clicked()

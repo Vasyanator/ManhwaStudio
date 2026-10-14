@@ -675,6 +675,10 @@ impl TypingTextOverlayLayer {
                         self.start_shape_variant_preview_if_available(ui.ctx(), entry.idx, origin);
                     }
                 }
+                // A finger long-press lifted on this layer (`touch_layers.rs`, hit-tested there with
+                // the grab rule): the same side effects as the right-click above, then the same menu,
+                // anchored at the press point.
+                let touch_menu_at = self.open_touch_layer_menu(ui.ctx(), entry.idx, page_idx);
 
                 // Vector-transform menu availability for this overlay: `Some(true)` = text overlay
                 // whose layout mode allows the vector warp; `Some(false)` = text overlay whose layout
@@ -686,7 +690,8 @@ impl TypingTextOverlayLayer {
                         ))
                     })
                 });
-                response.context_menu(|menu_ui| {
+                // `context_menu_popup` is `response.context_menu` for the mouse, plus the finger open.
+                context_menu_popup(&response, touch_menu_at).show(|menu_ui| {
                     if self.selected_overlay_idx != Some(entry.idx) {
                         menu_ui.label(t!("typing.canvas.select_overlay_hint"));
                         return;
