@@ -30,9 +30,8 @@ The APK is always Gradle's debug variant, signed with AGP's debug keystore
   ```
 
   Without an NDK location the newest NDK under `$ANDROID_HOME/ndk` is used.
-- A git checkout: the bundled files are taken from `git ls-files`, so local untracked fonts never
-  end up in the APK. The one exception is the launcher background folder `ui_new/menu_imgs`
-  (see "Bundled files and the runtime root").
+- A git checkout: the bundled files are taken from `git ls-files`, so local untracked files
+  never end up in the APK.
 - The winit / egui fork checkouts under `crates/` that the root `Cargo.toml` patches in.
 - Gradle itself is fetched by the wrapper (`gradlew`, pinned version + SHA-256); network access
   is needed on the first build for Gradle, AGP and the AndroidX libraries.
@@ -118,15 +117,11 @@ The Rust side runs with `filesDir/ms_root` as its working directory and runtime 
 (`ui_new/menu_imgs`, see below) and two control assets: `ms_root.files` (the file list) and
 `ms_root.stamp` (a content hash of the bundle: file paths and contents).
 
-The launcher backgrounds are third-party comic pages kept only locally: `ui_new/` is not tracked
-and must never be added to git or the `.gitignore` allowlist. The script therefore stages them
-from the working tree on every build (not only `--full`): the regular files directly in that
-folder with an image extension the launcher reads (`is_supported_image` in
-`crates/ms-launcher/src/background.rs`). When the folder is missing or empty (a fresh clone) it
-prints a warning and the APK builds without them; the launcher then shows no built-in
-background. AGP stores `.png` / `.jpg` / `.webp` assets uncompressed by default, so they cost
-their file size in the APK (~8.7 MB). The launcher finds them because the runtime root resolves
-to the working directory `ms_root` there (no program markers, `ms_config::runtime_root` rule 4).
+The launcher backgrounds are tracked, pre-compressed images (`ui_new/menu_imgs`, ~8.7 MB:
+downscaled to the size the launcher's blurred column background can show). AGP stores `.png` /
+`.jpg` / `.webp` assets uncompressed, so they cost their file size in the APK. The launcher
+finds them because the runtime root resolves to the working directory `ms_root` there (no
+program markers, `ms_config::runtime_root` rule 4).
 
 `AssetInstaller` deletes the installed stamp first, copies every file through a temporary file
 and an atomic rename, removes files that an earlier bundle installed and this one no longer

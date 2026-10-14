@@ -72,6 +72,14 @@ android/app/src/main/assets/
 !app_icon.ico
 !app_icon_512.png
 
+# Launcher background images (pre-compressed to the size the launcher shows; bundled into the APK).
+!ui_new/
+!ui_new/menu_imgs/
+!ui_new/menu_imgs/*.png
+!ui_new/menu_imgs/*.jpg
+!ui_new/menu_imgs/*.jpeg
+!ui_new/menu_imgs/*.webp
+
 # Rust source tree. Keep generated blobs such as src/python_modules.zip out.
 !src/
 !src/**/

@@ -2,8 +2,8 @@
 # build-android.sh — builds the ManhwaStudio Android APK (arm64-v8a) with one command.
 #
 # Steps: Rust cdylib via cargo-ndk -> stripped into android/app/src/main/jniLibs, bundled
-# runtime files (tracked fonts; --full adds the extended fonts and the wiki; plus the local,
-# untracked launcher backgrounds ui_new/menu_imgs when present) staged into
+# runtime files (tracked fonts and launcher backgrounds ui_new/menu_imgs; --full adds the
+# extended fonts and the wiki) staged into
 # android/app/src/main/assets, launcher icon staged, then the Gradle wrapper builds the APK
 # (debug variant, signed with AGP's debug keystore). Everything staged is generated and
 # gitignored. Details and prerequisites: android/README.md.
@@ -131,7 +131,7 @@ rm -rf "$assets_dir"
 mkdir -p "$assets_dir/ms_root"
 files_list="$assets_dir/ms_root.files"
 : > "$files_list"
-bundle_paths=(fonts)
+bundle_paths=(fonts ui_new/menu_imgs)
 [ "$full" = 1 ] && bundle_paths+=(wiki)
 while IFS= read -r -d '' path; do
   case "$path" in
@@ -147,40 +147,6 @@ while IFS= read -r -d '' path; do
   printf '%s\n' "$path" >> "$files_list"
 done < <(git -C "$REPO" ls-files -z -- "${bundle_paths[@]}")
 
-# Launcher background images: the one bundled path taken from the WORKING TREE, not from git.
-# They are third-party comic pages kept local and unpublished (not in the .gitignore allowlist),
-# so a fresh clone has none; the APK then builds without them and the launcher shows no
-# built-in background. Only what the launcher reads is staged: regular files directly in the
-# folder with an extension of `is_supported_image` (crates/ms-launcher/src/background.rs).
-menu_imgs_rel="ui_new/menu_imgs"
-menu_imgs_count=0
-if [ -d "$REPO/$menu_imgs_rel" ]; then
-  mkdir -p "$assets_dir/ms_root/$menu_imgs_rel"
-  while IFS= read -r -d '' file; do
-    name="${file##*/}"
-    case "$name" in
-      *$'\n'*) die "file name with a line break in '$menu_imgs_rel' cannot be listed in ms_root.files" ;;
-    esac
-    shopt -s nocasematch
-    case "$name" in
-      *.png|*.jpg|*.jpeg|*.webp|*.bmp) supported=1 ;;
-      *) supported=0 ;;
-    esac
-    shopt -u nocasematch
-    if [ "$supported" = 0 ]; then
-      echo "build-android.sh: note: skipping '$menu_imgs_rel/$name' (not an image the launcher reads)" >&2
-      continue
-    fi
-    cp "$file" "$assets_dir/ms_root/$menu_imgs_rel/$name"
-    printf '%s\n' "$menu_imgs_rel/$name" >> "$files_list"
-    menu_imgs_count=$((menu_imgs_count + 1))
-  done < <(find "$REPO/$menu_imgs_rel" -mindepth 1 -maxdepth 1 -type f -print0)
-fi
-if [ "$menu_imgs_count" = 0 ]; then
-  echo "build-android.sh: warning: no launcher background images in '$menu_imgs_rel' (local, untracked); the APK ships without them" >&2
-else
-  info "launcher background images: $menu_imgs_count from $menu_imgs_rel"
-fi
 LC_ALL=C sort -o "$files_list" "$files_list"
 file_count="$(wc -l < "$files_list" | tr -d ' ')"
 [ "$file_count" -gt 0 ] || die "no bundled files found"
