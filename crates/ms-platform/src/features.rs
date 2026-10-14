@@ -7,12 +7,14 @@ feature, and the typed error a gated entry point returns when it does not.
 
 Key structures:
 - PlatformFeature: every capability that differs between desktop, Android and wasm.
-- UnavailableReason: why a feature is missing (platform vs. missing Android bridge).
+- UnavailableReason: why a feature is missing (platform, missing Android bridge, or pen and
+  touch input the platform does not tell apart).
 - Unavailable: the typed error, with a localized `user_message()`.
 
 Key functions:
 - PlatformFeature::is_available(): `const fn` over `cfg!`, so a gated branch folds away.
-- PlatformFeature::require(): the same decision as a `Result`.
+- PlatformFeature::require(): the same decision as a `Result`, with the per-platform reason
+  (`unavailable_reason`).
 
 Notes:
 "Desktop" means every target that is neither wasm32 nor Android (Linux, Windows, macOS). Code
@@ -26,6 +28,8 @@ use std::fmt;
 const DESKTOP: bool = cfg!(not(any(target_arch = "wasm32", target_os = "android")));
 /// `true` on Android.
 const ANDROID: bool = cfg!(target_os = "android");
+/// `true` on Windows.
+const WINDOWS: bool = cfg!(target_os = "windows");
 
 /// A capability that differs between platforms. [`PlatformFeature::is_available`] is the single
 /// owner of the per-platform answer; callers never re-derive it from `cfg` themselves.
@@ -63,11 +67,16 @@ pub enum PlatformFeature {
     AppStorageVolumes,
     /// The Android "All files access" permission for a shared projects folder.
     AllFilesAccess,
+    /// Finger navigation on canvases (`ms_widgets::touch_nav`: pan, pinch-zoom, long-press
+    /// menu), driven by the main window's `raw_input_hook`. Off on Windows until winit tells a
+    /// pen from a finger there ([`UnavailableReason::PenTouchIndistinguishable`]); off on wasm,
+    /// whose web entry has no input hook.
+    CanvasTouchGestures,
 }
 
 impl PlatformFeature {
     /// Every feature, in declaration order (tests and diagnostics iterate it).
-    pub const ALL: [PlatformFeature; 15] = [
+    pub const ALL: [PlatformFeature; 16] = [
         PlatformFeature::PythonBackend,
         PlatformFeature::InstalledCopyManagement,
         PlatformFeature::NativeOnnxRuntime,
@@ -83,6 +92,7 @@ impl PlatformFeature {
         PlatformFeature::ClipboardRichFormats,
         PlatformFeature::AppStorageVolumes,
         PlatformFeature::AllFilesAccess,
+        PlatformFeature::CanvasTouchGestures,
     ];
 
     /// Whether the current build target offers this feature. Decided at compile time from
@@ -94,6 +104,9 @@ impl PlatformFeature {
             PlatformFeature::FilePicker | PlatformFeature::ClipboardText => DESKTOP || ANDROID,
             // Android-only storage model (app-specific external dirs, MANAGE_EXTERNAL_STORAGE).
             PlatformFeature::AppStorageVolumes | PlatformFeature::AllFilesAccess => ANDROID,
+            // Linux, macOS and Android. Windows delivers a pen as touch events (winit has no
+            // `PT_PEN` handling yet), so the router would turn pen strokes into navigation.
+            PlatformFeature::CanvasTouchGestures => (DESKTOP && !WINDOWS) || ANDROID,
             PlatformFeature::PythonBackend
             | PlatformFeature::InstalledCopyManagement
             | PlatformFeature::NativeOnnxRuntime
@@ -111,12 +124,38 @@ impl PlatformFeature {
     /// [`Self::is_available`] as a `Result`, for `?` at the top of a gated entry point.
     ///
     /// # Errors
-    /// [`Unavailable`] with [`UnavailableReason::NotOnThisPlatform`] when the feature is absent.
+    /// [`Unavailable`] with [`Self::unavailable_reason`] when the feature is absent.
     pub const fn require(self) -> Result<(), Unavailable> {
         if self.is_available() {
             Ok(())
         } else {
-            Err(Unavailable { feature: self, reason: UnavailableReason::NotOnThisPlatform })
+            Err(Unavailable { feature: self, reason: self.unavailable_reason() })
+        }
+    }
+
+    /// Why the capability table says no on this target. Meaningful only when
+    /// [`Self::is_available`] is `false`; a runtime [`UnavailableReason::BridgeMissing`] is the
+    /// caller's to report, never answered here.
+    #[must_use]
+    pub const fn unavailable_reason(self) -> UnavailableReason {
+        match self {
+            PlatformFeature::CanvasTouchGestures if WINDOWS => UnavailableReason::PenTouchIndistinguishable,
+            PlatformFeature::PythonBackend
+            | PlatformFeature::InstalledCopyManagement
+            | PlatformFeature::NativeOnnxRuntime
+            | PlatformFeature::ScreenCapture
+            | PlatformFeature::ExternalArchiveTools
+            | PlatformFeature::Waifu2xUpscaler
+            | PlatformFeature::CredentialStore
+            | PlatformFeature::FilePicker
+            | PlatformFeature::PersistentDirectoryPicker
+            | PlatformFeature::NativeMessageBox
+            | PlatformFeature::ClipboardText
+            | PlatformFeature::ClipboardImage
+            | PlatformFeature::ClipboardRichFormats
+            | PlatformFeature::AppStorageVolumes
+            | PlatformFeature::AllFilesAccess
+            | PlatformFeature::CanvasTouchGestures => UnavailableReason::NotOnThisPlatform,
         }
     }
 
@@ -138,6 +177,7 @@ impl PlatformFeature {
             PlatformFeature::ClipboardRichFormats => "platform.unavailable.clipboard_rich_formats_error",
             PlatformFeature::AppStorageVolumes => "platform.unavailable.app_storage_volumes_error",
             PlatformFeature::AllFilesAccess => "platform.unavailable.all_files_access_error",
+            PlatformFeature::CanvasTouchGestures => "platform.unavailable.canvas_touch_gestures_error",
         }
     }
 }
@@ -150,6 +190,9 @@ pub enum UnavailableReason {
     /// The platform offers it, but this build lacks the Android bridge it needs (the Kotlin
     /// class or its Rust launch path is not part of the build yet).
     BridgeMissing,
+    /// The platform reports pen input as touch, so finger gestures would capture pen strokes
+    /// (Windows until winit handles `PT_PEN`).
+    PenTouchIndistinguishable,
 }
 
 impl UnavailableReason {
@@ -158,6 +201,7 @@ impl UnavailableReason {
         match self {
             UnavailableReason::NotOnThisPlatform => "platform.unavailable.not_on_this_platform_hint",
             UnavailableReason::BridgeMissing => "platform.unavailable.bridge_missing_hint",
+            UnavailableReason::PenTouchIndistinguishable => "platform.unavailable.pen_touch_indistinguishable_hint",
         }
     }
 }
@@ -206,6 +250,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn linux_desktop_table() {
+        // `CanvasTouchGestures` is available on Linux, so it falls in the `true` branch.
         for feature in PlatformFeature::ALL {
             let expected = !matches!(feature, PlatformFeature::AppStorageVolumes | PlatformFeature::AllFilesAccess);
             assert_eq!(feature.is_available(), expected, "{feature:?}");
@@ -214,11 +259,32 @@ mod tests {
     }
 
     #[test]
-    fn require_reports_not_on_this_platform() {
+    fn require_reports_the_table_reason() {
         for feature in PlatformFeature::ALL {
             if let Err(err) = feature.require() {
-                assert_eq!(err, Unavailable::new(feature, UnavailableReason::NotOnThisPlatform));
+                assert_eq!(err, Unavailable::new(feature, feature.unavailable_reason()));
             }
+        }
+    }
+
+    #[test]
+    fn only_canvas_touch_gestures_on_windows_has_the_pen_reason() {
+        for feature in PlatformFeature::ALL {
+            let pen_reason = feature.unavailable_reason() == UnavailableReason::PenTouchIndistinguishable;
+            let expected = feature == PlatformFeature::CanvasTouchGestures && cfg!(target_os = "windows");
+            assert_eq!(pen_reason, expected, "{feature:?}");
+        }
+    }
+
+    #[test]
+    fn canvas_touch_gestures_table() {
+        let expected = cfg!(any(target_os = "linux", target_os = "macos", target_os = "android"));
+        assert_eq!(PlatformFeature::CanvasTouchGestures.is_available(), expected);
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                PlatformFeature::CanvasTouchGestures.require(),
+                Err(Unavailable::new(PlatformFeature::CanvasTouchGestures, UnavailableReason::PenTouchIndistinguishable))
+            );
         }
     }
 
@@ -227,7 +293,7 @@ mod tests {
         for feature in PlatformFeature::ALL {
             assert_key_in_shipped_catalogs(feature.message_key());
         }
-        for reason in [UnavailableReason::NotOnThisPlatform, UnavailableReason::BridgeMissing] {
+        for reason in [UnavailableReason::NotOnThisPlatform, UnavailableReason::BridgeMissing, UnavailableReason::PenTouchIndistinguishable] {
             assert_key_in_shipped_catalogs(reason.message_key());
         }
     }

@@ -396,6 +396,8 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   `draw_pixel_grid` emits one `Painter::line_segment` per line — never a polyline, which
   `tessellate_path` would blur. Gate-free by contract; see the file header.
 - `types.rs`: passive DTOs and runtime payload types.
+- `touch.rs`: the canvas side of finger gestures (`touch_owner_id`, surface publication, applying
+  `TouchNavigation`, the long-press feedback ring, `context_menu_open_pos`); see "Touch gestures".
 - `view_transform.rs`: `ViewTransform` world<->screen affine map (`screen = world * scale + translation`).
   The `ScrollArea` allocates the page strip and owns scrolling; each page's authoritative screen
   `image_rect` and its `page_in_view` visibility come from this transform: `reserve_canvas_page_frame`
@@ -403,6 +405,37 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   every page through `world_rect_to_screen`. A once-guarded equivalence check warns if the
   transform-derived rect drifts >0.5px from the allocated rect.
 - `workers.rs`: background worker startup for overlay preparation, autosave, and settings.
+
+## Touch gestures
+The finger decision is owned by `ms_widgets::touch_nav` (shell raw-input hook); the canvas is a
+consumer and never reads `Event::Touch` or `multi_touch()` itself.
+- **Owner id**: `CanvasView::touch_owner_id()` = `Id::new(("ms_canvas.touch_surface",
+  scroll_area_id_salt))` — content-named, distinct per tab canvas. Tabs pass it to
+  `touch_nav::publish_capture_layer` for their capture overlays.
+- **Surface** (published last in `draw`): `scroll_inner_rect`, holes = on-top hit rects ∪ aside
+  card hit rects (`scene.aside_card_hit_rects`, collected next to the card hit response) ∪ the
+  scrollbar rects ∪ the bottom-hint rect. Windows and dock panels are not holes: they are on
+  non-background layers, which the router never claims on. Image-bubble widgets on the page (red
+  rect, text areas, anchors, handles) are NOT holes: a finger there pans.
+  `long_press_selection` is `false` (see "Known limit" below).
+- **Navigation** (`handle_shortcuts`, after the wheel/keyboard zoom): `take_touch_output` runs every
+  frame (it also schedules the long-press repaint). `apply_touch_navigation` captures
+  `capture_pending_view_anchor(prev_centroid, centroid)` at the OLD zoom, then multiplies the zoom
+  (clamped to `CANVAS_ZOOM_MIN..=CANVAS_ZOOM_MAX`); with `zoom_blocked` only the pan applies. A
+  zoom anchor already recorded this frame wins and the finger delta of that frame is dropped. The
+  wheel zoom anchor is the `prev == new` case of the same capture (pinned by
+  `zoom_anchor_capture_matches_frozen_characterization`).
+- **Long-press menu**: `scene.touch_long_press_at` reaches `handle_canvas_page_interactions`;
+  `touch::context_menu_open_pos` picks the secondary-click position or, failing that, the
+  long-press point inside the row, and both go through `canvas_context_menu_target_at` and the same
+  gates (`hook_claims_shift_drag`, `zoom_drag_active`, `suppress_canvas_page_context_menu`). The
+  menu is drawn with `ms_widgets::touch_nav::context_menu_popup(response, long_press)` — never
+  `response.context_menu`, which anchors at a hover position a finger does not have. The armed
+  long-press draws a ring (`draw_touch_long_press_feedback`) while the finger is held.
+- **Known limit — long-press selection**: the canvas page row has no primary-drag selection of
+  its own; every selection drag lives in a tab (Translation OCR / image-crop capture areas, Typing
+  create/upload, Cleaning region selection). Until a hook delivers `TouchSelection` to them, a drag
+  after an armed long-press pans.
 
 ## Contracts and invariants
 - Do not block the GUI thread with image decoding, disk I/O, long computation, or worker waits.
@@ -547,6 +580,8 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
 - To change clean overlay visibility, upload, tiling, or editing runtime, edit
   `overlay_runtime.rs` and the facade methods in `lib.rs`.
 - To change page layout, scrolling, zooming, or context menus, edit `scene.rs`.
+- To change finger navigation, the touch surface and its holes, or the long-press feedback, edit
+  `touch.rs` (the gesture rules themselves are `ms_widgets::touch_nav`'s).
 - To change what the «Лента» tab SHOWS, edit `scene.rs::draw_ribbon_tab_body`; to change how big it
   starts or how small it may get, edit the two `CANVAS_RIBBON_TAB_*_SIZE_PX` constants in `lib.rs`.
   Where the panel holding it sits by default is a per-program-tab decision, and all three tabs have

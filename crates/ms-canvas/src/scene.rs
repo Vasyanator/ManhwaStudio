@@ -24,7 +24,9 @@ Key functions:
 - CanvasView::draw_canvas_page_base_layers()
 - CanvasView::draw_canvas_page_aside_layer()
 - CanvasView::draw_canvas_page_on_top_layer()
-- CanvasView::handle_canvas_page_interactions()
+- CanvasView::capture_pending_view_anchor() (wheel/keyboard zoom anchor = its `prev == new` case)
+- CanvasView::handle_canvas_page_interactions() / canvas_context_menu_target_at() (page menu:
+  secondary click and finger long-press share the target code and `context_menu_popup`)
 - CanvasView::draw_canvas_viewport_ui()
 - CanvasView::draw_ribbon_tab_body()
 - CanvasView::draw_canvas_bottom_hint()
@@ -55,6 +57,7 @@ use super::types::{
     CanvasContextMenuTarget, CanvasFrameParams, CanvasScenePageFrame, OverlayUploadBudget,
     PendingPageFocus, PendingScrollOffset, PendingZoomAnchor, SourceTextureUploadBudget,
 };
+use super::touch::context_menu_open_pos;
 use super::view_transform::DVec2;
 use super::{
     BubbleCopyPasteTarget, CanvasHintHelp, CanvasHintRow, CanvasHooks, CanvasUiStatus, CanvasView,
@@ -64,6 +67,7 @@ use ms_models::page_view::{PageImageInfo, PageTexture, SourcePageLoadState};
 use ms_project::ProjectData;
 use ms_log::runtime_log;
 use ms_widgets::panel_dock::PanelDockState;
+use ms_widgets::touch_nav::context_menu_popup;
 use ms_widgets::{HelpHint, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};
@@ -216,6 +220,16 @@ pub(super) struct CanvasSceneState {
     /// `apply_viewport_snapshot` call replaces/drops it.
     pub(super) pending_focus: Option<PendingPageFocus>,
     pub(super) on_top_hit_rects: HashMap<i64, Rect>,
+    /// Screen hit rects of the aside cards drawn this frame (clipped to the scene), collected
+    /// next to each card's hit response. Holes of the touch surface: a finger on a card stays
+    /// with egui. Cleared at the start of every `draw`.
+    pub(super) aside_card_hit_rects: Vec<Rect>,
+    /// Finger long-press point of this frame (`TouchOutput::long_press_at`): the page under it
+    /// opens its context menu through the secondary-click path. Set by `handle_shortcuts`.
+    pub(super) touch_long_press_at: Option<Pos2>,
+    /// Point of a finger long-press that is armed and still held (`TouchOutput::
+    /// long_press_armed_at`), drawn as feedback. Set by `handle_shortcuts`.
+    pub(super) touch_long_press_armed_at: Option<Pos2>,
     /// Screen rect of the collapsible bottom-center keyboard-shortcut hint drawn last frame, or
     /// `None` when the owning tab supplied no hint. Used to occlude canvas zoom/drag input under
     /// the hint. Reset each frame with the other per-frame scene rects.
@@ -301,6 +315,9 @@ impl Default for CanvasSceneState {
             last_strip_layout: None,
             pending_focus: None,
             on_top_hit_rects: HashMap::new(),
+            aside_card_hit_rects: Vec::new(),
+            touch_long_press_at: None,
+            touch_long_press_armed_at: None,
             canvas_bottom_hint_rect: None,
             canvas_hangul_keyboard_rect: None,
             bottom_hint_body_size: None,
@@ -718,9 +735,33 @@ impl CanvasView {
         })
     }
 
+    /// Records a zoom anchor: the world point under `anchor_pos` (the viewport center when
+    /// `None`) stays under it after a zoom change applied AFTER this call.
+    ///
+    /// The `prev == new` case of [`Self::capture_pending_view_anchor`].
     pub(super) fn capture_pending_zoom_anchor(
         &mut self,
         anchor_pos: Option<Pos2>,
+        fallback_rect: Rect,
+    ) {
+        let viewport_rect = self.scene.scroll_inner_rect.unwrap_or(fallback_rect);
+        let anchor_screen = anchor_pos.unwrap_or_else(|| viewport_rect.center());
+        self.capture_pending_view_anchor(anchor_screen, anchor_screen, fallback_rect);
+    }
+
+    /// Records a view anchor for the next scene pass: the world point under `prev_screen` (at
+    /// the CURRENT zoom and scroll offset) is placed under `new_screen` at whatever zoom is set
+    /// before that pass. Call it BEFORE changing `state.zoom`.
+    ///
+    /// The viewport is last frame's scroll inner rect, or `fallback_rect` before the first scene
+    /// pass; a non-positive viewport records no anchor. `prev_screen` is clamped into the
+    /// viewport (as a zoom anchor always was) and `new_screen` keeps its full displacement from
+    /// `prev_screen`, so a pan of `d` moves the scroll offset by exactly `-d` within the
+    /// scrollable range. The scene pass clamps the resulting offset (`scroll_offset_for_zoom_anchor`).
+    pub(super) fn capture_pending_view_anchor(
+        &mut self,
+        prev_screen: Pos2,
+        new_screen: Pos2,
         fallback_rect: Rect,
     ) {
         let viewport_rect = self.scene.scroll_inner_rect.unwrap_or(fallback_rect);
@@ -728,10 +769,9 @@ impl CanvasView {
             self.scene.pending_zoom_anchor = None;
             return;
         }
-        let anchor_screen = anchor_pos.unwrap_or_else(|| viewport_rect.center());
-        let viewport_local = egui::vec2(
-            (anchor_screen.x - viewport_rect.left()).clamp(0.0, viewport_rect.width()),
-            (anchor_screen.y - viewport_rect.top()).clamp(0.0, viewport_rect.height()),
+        let prev_local = egui::vec2(
+            (prev_screen.x - viewport_rect.left()).clamp(0.0, viewport_rect.width()),
+            (prev_screen.y - viewport_rect.top()).clamp(0.0, viewport_rect.height()),
         );
         let old_zoom = self.state.zoom.max(f32::EPSILON);
         let inset_x = self.viewport_content_inset_x(viewport_rect.width());
@@ -740,11 +780,11 @@ impl CanvasView {
             self.max_scroll_offset_x_for_viewport(viewport_rect.width()),
         );
         let content_focus = egui::vec2(
-            (clamped_scroll_x + viewport_local.x - inset_x).max(0.0),
-            (self.scene.scroll_offset.y + viewport_local.y).max(0.0),
+            (clamped_scroll_x + prev_local.x - inset_x).max(0.0),
+            (self.scene.scroll_offset.y + prev_local.y).max(0.0),
         );
         self.scene.pending_zoom_anchor = Some(PendingZoomAnchor {
-            viewport_local,
+            viewport_local: prev_local + (new_screen - prev_screen),
             world_focus: content_focus / old_zoom,
         });
     }
@@ -1480,6 +1520,29 @@ impl CanvasView {
         );
     }
 
+    /// The page context-menu target for a menu opened at `pos` (screen points) on `page_frame`:
+    /// the page and its uv when `pos` is on the page image and not on a bubble, else `None`
+    /// (the bubble's own menu handles it, or the point is in the row's side gutter).
+    pub(super) fn canvas_context_menu_target_at(
+        &self,
+        page_frame: CanvasScenePageFrame,
+        pos: Pos2,
+    ) -> Option<CanvasContextMenuTarget> {
+        if !page_frame.image_rect.contains(pos) {
+            return None;
+        }
+        let on_bubble = bubble_on_top_ui::on_top_hit_test(
+            self,
+            page_frame.page_idx,
+            page_frame.image_rect,
+            pos,
+        ) || bubble_aside_ui::aside_hit_test(self, page_frame.page_idx, pos);
+        (!on_bubble).then(|| CanvasContextMenuTarget {
+            page_idx: page_frame.page_idx,
+            page_uv: Self::uv_from_scene(page_frame.image_rect, pos),
+        })
+    }
+
     pub(super) fn handle_canvas_page_interactions(
         &mut self,
         response: &egui::Response,
@@ -1488,32 +1551,33 @@ impl CanvasView {
         hooks: &mut dyn CanvasHooks,
         frame: CanvasFrameParams,
     ) {
+        // A secondary click and a finger long-press open the page menu through the SAME target
+        // code; only the open position differs (see `touch::context_menu_open_pos`).
+        let secondary_click_pos = if response.secondary_clicked() {
+            response.interact_pointer_pos()
+        } else {
+            None
+        };
+        let open_pos = context_menu_open_pos(
+            secondary_click_pos,
+            self.scene.touch_long_press_at,
+            response.rect,
+        );
+        // The long-press that opened this page's menu this frame, handed to the popup as its
+        // anchor (a finger has no hover position for egui's own anchoring).
+        let mut menu_long_press_at = None;
         if self.editable
             && !frame.hook_claims_shift_drag
             && !frame.zoom_drag_active
             && !hooks.suppress_canvas_page_context_menu(page_frame.page_idx)
-            && response.secondary_clicked()
-            && let Some(mouse_pos) = response.interact_pointer_pos()
+            && let Some(open_pos) = open_pos
         {
-            if page_frame.image_rect.contains(mouse_pos) {
-                let clicked_on_bubble =
-                    bubble_on_top_ui::on_top_hit_test(
-                        self,
-                        page_frame.page_idx,
-                        page_frame.image_rect,
-                        mouse_pos,
-                    ) || bubble_aside_ui::aside_hit_test(self, page_frame.page_idx, mouse_pos);
-                if !clicked_on_bubble {
-                    self.bubble_runtime.canvas_context_menu_target =
-                        Some(CanvasContextMenuTarget {
-                            page_idx: page_frame.page_idx,
-                            page_uv: Self::uv_from_scene(page_frame.image_rect, mouse_pos),
-                        });
-                } else {
-                    self.bubble_runtime.canvas_context_menu_target = None;
-                }
-            } else {
-                self.bubble_runtime.canvas_context_menu_target = None;
+            self.bubble_runtime.canvas_context_menu_target =
+                self.canvas_context_menu_target_at(page_frame, open_pos);
+            if secondary_click_pos.is_none()
+                && self.bubble_runtime.canvas_context_menu_target.is_some()
+            {
+                menu_long_press_at = Some(open_pos);
             }
         }
         if self.editable
@@ -1523,7 +1587,7 @@ impl CanvasView {
                 .canvas_context_menu_target
                 .is_some_and(|target| target.page_idx == page_frame.page_idx)
         {
-            response.context_menu(|ui| {
+            context_menu_popup(response, menu_long_press_at).show(|ui| {
                 let handled_by_hook = self
                     .bubble_runtime
                     .canvas_context_menu_target
@@ -2117,6 +2181,70 @@ mod tests {
                 (reproduced.y - start_offset.y).abs() <= 1e-2,
                 "scale {scale}: y {reproduced:?} != {start_offset:?}"
             );
+        }
+    }
+
+
+    /// Input grid of the zoom-anchor characterization test: `(zoom, scroll offset, viewport,
+    /// anchor)`. Covers the zoom clamp endpoints, an offset past the horizontal range (clamped),
+    /// a viewport not at the origin, anchors outside the viewport (clamped), the `None` anchor
+    /// (viewport center) and a degenerate viewport (no anchor).
+    fn zoom_anchor_characterization_cases() -> Vec<(f32, f32, Vec2, Rect, Option<Pos2>)> {
+        let origin = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 800.0));
+        let shifted = Rect::from_min_size(egui::pos2(37.0, 64.0), egui::vec2(900.0, 700.0));
+        let empty = Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(0.0, 300.0));
+        vec![
+            (1.0, 1400.0, egui::vec2(120.0, 40.0), origin, Some(egui::pos2(640.0, 300.0))),
+            (1.0, 4000.0, egui::vec2(5000.0, 40.0), origin, Some(egui::pos2(640.0, 300.0))),
+            (0.2, 4000.0, egui::vec2(0.0, 0.0), origin, Some(egui::pos2(10.0, 790.0))),
+            (5.0, 4000.0, egui::vec2(30000.0, 9000.0), origin, Some(egui::pos2(999.0, 1.0))),
+            (5.0, 1400.0, egui::vec2(99999.0, 50.0), origin, Some(egui::pos2(500.0, 400.0))),
+            (2.5, 4000.0, egui::vec2(12000.0, 1200.0), shifted, Some(egui::pos2(-50.0, 2000.0))),
+            (2.5, 4000.0, egui::vec2(12000.0, 1200.0), shifted, Some(egui::pos2(400.0, 300.0))),
+            (0.7, 4000.0, egui::vec2(3500.0, 20.0), shifted, None),
+            (1.3, 4000.0, egui::vec2(10.0, 20.0), empty, Some(egui::pos2(12.0, 12.0))),
+        ]
+    }
+
+    /// Characterization of `capture_pending_zoom_anchor`, frozen from its output BEFORE it became
+    /// the `prev == new` case of `capture_pending_view_anchor`: `(viewport_local.x,
+    /// viewport_local.y, world_focus.x, world_focus.y)` per case of
+    /// [`zoom_anchor_characterization_cases`], `None` = no anchor.
+    #[test]
+    fn zoom_anchor_capture_matches_frozen_characterization() {
+        let golden: [Option<(f32, f32, f32, f32)>; 9] = [
+            Some((640.0, 300.0, 0.0, 340.0)),
+            Some((640.0, 300.0, 2040.0, 340.0)),
+            Some((10.0, 790.0, 0.0, 3950.0)),
+            Some((999.0, 1.0, 2599.8, 1800.2)),
+            Some((500.0, 400.0, 2560.0, 90.0)),
+            Some((0.0, 700.0, 1200.0, 760.0)),
+            Some((363.0, 236.0, 1345.2, 574.4)),
+            Some((450.0, 350.0, 2042.8572, 528.5714)),
+            None,
+        ];
+        let cases = zoom_anchor_characterization_cases();
+        assert_eq!(cases.len(), golden.len());
+        for (case_idx, ((zoom, content, offset, viewport, anchor), expected)) in
+            cases.into_iter().zip(golden).enumerate()
+        {
+            let mut view = view_with_layout(zoom, content, viewport);
+            view.scene.scroll_offset = offset;
+            view.capture_pending_zoom_anchor(anchor, viewport);
+            let got = view.scene.pending_zoom_anchor.map(|anchor| {
+                (anchor.viewport_local.x, anchor.viewport_local.y, anchor.world_focus.x, anchor.world_focus.y)
+            });
+            match (got, expected) {
+                (None, None) => {}
+                (Some(got), Some(expected)) => {
+                    let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * b.abs().max(1.0);
+                    assert!(
+                        close(got.0, expected.0) && close(got.1, expected.1) && close(got.2, expected.2) && close(got.3, expected.3),
+                        "case {case_idx}: {got:?} != {expected:?}"
+                    );
+                }
+                (got, expected) => panic!("case {case_idx}: {got:?} != {expected:?}"),
+            }
         }
     }
 

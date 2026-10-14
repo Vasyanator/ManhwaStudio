@@ -58,6 +58,7 @@ Internal submodules:
 - `bubble_aside_ui`: aside bubble columns, repack, anchor links, and aside drag interactions.
 - `bubble_on_top_ui`: on-top bubble widgets, move/resize handles, and hit-rect tracking.
 - `overlay_runtime`: clean-overlay runtime bucket (state, worker, tile upload, draw/edit ops).
+- `touch`: finger gestures consumer (`touch_owner_id`, touch surface, navigation, long-press).
 - `settings`: canvas settings snapshot/publish/persistence logic.
 - `workers`: background worker bootstrap for overlay prepare and settings save.
 
@@ -275,6 +276,12 @@ pub struct CanvasViewportSnapshot {
     pub laid_out: bool,
 }
 
+/// Smallest canvas zoom (screen points per world point); every zoom path clamps to
+/// `CANVAS_ZOOM_MIN..=CANVAS_ZOOM_MAX`.
+pub(crate) const CANVAS_ZOOM_MIN: f32 = 0.2;
+/// Largest canvas zoom; see [`CANVAS_ZOOM_MIN`].
+pub(crate) const CANVAS_ZOOM_MAX: f32 = 5.0;
+
 pub(crate) const BUBBLE_ORIGINAL_SPELLCHECK_DISABLED_KEY: &str = "spellcheck_original_disabled";
 pub(crate) const BUBBLE_TRANSLATION_SPELLCHECK_DISABLED_KEY: &str =
     "spellcheck_translation_disabled";
@@ -291,6 +298,7 @@ mod overlay_runtime;
 pub mod pixel_grid;
 mod scene;
 mod settings;
+mod touch;
 mod types;
 mod view_transform;
 mod workers;
@@ -1122,7 +1130,7 @@ impl CanvasView {
     /// navigation request as well as the automatic horizontal centering are left untouched — an
     /// unusable snapshot is not a navigation intent and must not supersede a pending focus.
     pub fn apply_viewport_snapshot(&mut self, snapshot: CanvasViewportSnapshot) {
-        self.state.zoom = snapshot.zoom.clamp(0.2, 5.0);
+        self.state.zoom = snapshot.zoom.clamp(CANVAS_ZOOM_MIN, CANVAS_ZOOM_MAX);
         if !snapshot.laid_out {
             return;
         }
@@ -1175,7 +1183,7 @@ impl CanvasView {
     /// that was never opened) scrolls right after its first frame instead of being lost. A newer
     /// `focus_page` or [`Self::apply_viewport_snapshot`] call replaces the pending request.
     pub fn focus_page(&mut self, page_idx: usize, center_px: Option<Vec2>, zoom: f32) {
-        self.state.zoom = zoom.clamp(0.2, 5.0);
+        self.state.zoom = zoom.clamp(CANVAS_ZOOM_MIN, CANVAS_ZOOM_MAX);
         // The focus is the newest navigation intent: stale zoom-anchor / raw-offset requests
         // must not override it when the next draw resolves its scroll offset.
         self.scene.pending_zoom_anchor = None;
@@ -1413,6 +1421,8 @@ impl CanvasView {
         // Per-frame registry: rebuilt by `note_focused_bubble_text_input` during the scene pass.
         self.bubble_runtime.bubble_text_edit_ids.clear();
         self.scene.on_top_hit_rects.clear();
+        // Rebuilt by the aside pass below, next to each card's hit response (touch holes).
+        self.scene.aside_card_hit_rects.clear();
         self.refresh_page_aside_presence();
         let canvas_rect = ui.max_rect();
         let (suppress_wheel_scroll, zoom_drag_active) =
@@ -1482,6 +1492,7 @@ impl CanvasView {
         self.scene.scroll_content_size = scroll_output.content_size;
         self.cache_scrollbar_rects(ctx, scroll_output.inner_rect, scroll_output.content_size);
         self.scene.pending_zoom_anchor = None;
+        self.draw_touch_long_press_feedback(ui);
         // Deferred focus, pass 2: a canvas drawn for the first time (or whose page metadata only
         // just loaded) gained its world rects in the scene pass above. The resolved offset lands
         // in `pending_scroll_offset` for the next frame, so request that frame explicitly. This
@@ -1512,6 +1523,8 @@ impl CanvasView {
         self.apply_deferred_remote_updates();
         self.flush_bubble_upserts_to_model(project);
         self.draw_canvas_viewport_ui(ctx, project, status, frame, hooks, panel_dock);
+        // Last: the surface needs this frame's viewport, hit rects, scrollbars and bottom hint.
+        self.publish_touch_surface(ctx);
         self.publish_canvas_settings(project);
         if self.has_pending_overlay_work() {
             ctx.request_repaint();
@@ -2065,6 +2078,10 @@ impl CanvasView {
                 }
             }
         }
+        // Finger pan / pinch, after the wheel and keyboard paths: a zoom anchor they recorded this
+        // frame wins (see `apply_touch_navigation`). Taken every frame, even while nothing
+        // touches, because the take also schedules the router's long-press repaint.
+        self.take_touch_output_for_frame(ctx, canvas_rect);
         let suppress_wheel_scroll = (zoom_modifier_down && inside_canvas) || zoom_drag_now;
 
         (suppress_wheel_scroll, zoom_drag_now)
@@ -2089,7 +2106,7 @@ impl CanvasView {
         fallback_rect: Option<Rect>,
     ) -> bool {
         let old_zoom = self.state.zoom;
-        let new_zoom = zoom.clamp(0.2, 5.0);
+        let new_zoom = zoom.clamp(CANVAS_ZOOM_MIN, CANVAS_ZOOM_MAX);
         if (new_zoom - old_zoom).abs() <= f32::EPSILON {
             return false;
         }

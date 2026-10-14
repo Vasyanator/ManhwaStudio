@@ -162,6 +162,10 @@ pub(crate) struct CanvasScenePageFrame {
     pub(crate) page_in_view: bool,
 }
 
+/// Deferred view anchor consumed by the next scene pass (`CanvasSceneState::pending_zoom_anchor`):
+/// the scroll offset is chosen so that `world_focus` (world points) lands at `viewport_local`
+/// (screen points from the viewport's top-left) at the zoom of that pass. A zoom anchor keeps one
+/// point fixed; a finger pan / pinch moves it (`CanvasView::capture_pending_view_anchor`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PendingZoomAnchor {
     pub(crate) viewport_local: Vec2,
@@ -740,7 +744,7 @@ pub(crate) struct HangulInsertTarget {
     pub(crate) text_edit_id: egui::Id,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CanvasContextMenuTarget {
     pub(crate) page_idx: usize,
     pub(crate) page_uv: Pos2,

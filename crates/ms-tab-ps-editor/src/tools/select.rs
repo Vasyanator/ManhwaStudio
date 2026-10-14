@@ -23,6 +23,8 @@ Key functions:
 - `PsTool::reset` / `PsTool::freeze`: the two lifecycle hooks. `reset` drops the outline when its
   context is gone (tool switch, page switch, Esc during suppressed input); `freeze` marks a frame
   the tab did not route here, so the release it swallowed commits instead of aborting.
+- `SelectTool::touch_step`: the finger long-press selection drag (`TouchSelectionInput`) mapped
+  onto the same state machine, pure and testable like `step`.
 - `PsTool::hotkey_rows`: the mode-dependent shortcut inventory (the lasso adds Alt straight
   segments, the Alt-release anchor and Backspace/Delete). `options_ui` holds only `mode_row`.
 
@@ -39,7 +41,8 @@ while `Add`/`Subtract`/`Intersect` leave the existing selection alone. The commi
 `PsToolContext::normalize_selection`, so an empty result is `None` and never `Some(all-zero)`.
 */
 
-use super::{PsHotkeyRow, PsTool, PsToolContext, PsToolId, ToolOutcome};
+use super::{PsHotkeyRow, PsTool, PsToolContext, PsToolId, ToolOutcome, TouchSelectionInput};
+use ms_widgets::touch_nav::TouchSelectionEnd;
 use crate::selection::SelectionOp;
 use crate::viewport::ViewTransform;
 use eframe::egui;
@@ -342,6 +345,50 @@ impl SelectTool {
         }
     }
 
+    /// Advances a FINGER selection drag by one frame, on the same state machine as [`Self::step`].
+    ///
+    /// `began` drops any outline still alive (a lasso polygon pending on Alt) and starts a fresh
+    /// gesture at `origin` with the tool's base combination mode: a finger carries no modifiers,
+    /// and a mouse gesture cannot be running beside it (the router cancels the finger selection
+    /// on any mouse/pen press). Every frame then feeds `pointer` as a held, or on `Released`
+    /// released, button — so the rect commits `origin`..`pointer` and the lasso the traced path.
+    /// `Cancelled` abandons the outline without touching the committed selection. Pure, like
+    /// `step`.
+    #[must_use]
+    fn touch_step(&mut self, input: TouchSelectionInput) -> GestureAction {
+        if input.end == Some(TouchSelectionEnd::Cancelled) {
+            self.suspended = false;
+            return if self.gesture.take().is_some() {
+                ms_log::trace_log!(ms_log::trace::cat::INPUT, "selection touch_cancel mode={:?}", self.mode);
+                GestureAction::Aborted
+            } else {
+                GestureAction::None
+            };
+        }
+        if input.began {
+            self.gesture = None;
+            self.suspended = false;
+            self.last_pointer = Some(input.origin);
+            self.begin_or_extend(input.origin, egui::Modifiers::NONE);
+        }
+        if self.gesture.is_none() {
+            // The `began` frame was never delivered (the tool became active mid-drag): there is
+            // no origin to select from, so the drag is ignored rather than started at the finger.
+            return GestureAction::None;
+        }
+        let released = input.end == Some(TouchSelectionEnd::Released);
+        self.step(GestureInput {
+            pointer: Some(input.pointer),
+            pointer_in_viewport: true,
+            primary_pressed: false,
+            primary_down: !released,
+            primary_released: released,
+            modifiers: egui::Modifiers::NONE,
+            cancel_pressed: false,
+            remove_point_pressed: false,
+        })
+    }
+
     /// Starts a new gesture, or places the next anchor of a pending polygon.
     ///
     /// A new gesture samples its combination mode here and keeps it until it commits.
@@ -491,6 +538,18 @@ impl PsTool for SelectTool {
             remove_point_pressed: ctx.remove_point_pressed,
         };
         match self.step(input) {
+            GestureAction::None | GestureAction::Aborted => ToolOutcome::default(),
+            GestureAction::Commit { op, shape } => self.apply_commit(ctx, op, &shape),
+        }
+    }
+
+    /// Both selection modes have a drag target, so a finger long-press drag selects.
+    fn accepts_touch_selection(&self) -> bool {
+        true
+    }
+
+    fn touch_selection(&mut self, ctx: &mut PsToolContext<'_>, input: TouchSelectionInput) -> ToolOutcome {
+        match self.touch_step(input) {
             GestureAction::None | GestureAction::Aborted => ToolOutcome::default(),
             GestureAction::Commit { op, shape } => self.apply_commit(ctx, op, &shape),
         }
@@ -710,6 +769,95 @@ mod tests {
 
     fn release(x: f32, y: f32, m: egui::Modifiers) -> GestureInput {
         GestureInput { pointer: Some(Pos2::new(x, y)), primary_released: true, ..idle(m) }
+    }
+
+    fn touch(origin: (f32, f32), pointer: (f32, f32), began: bool, end: Option<TouchSelectionEnd>) -> TouchSelectionInput {
+        TouchSelectionInput {
+            origin: Pos2::new(origin.0, origin.1),
+            pointer: Pos2::new(pointer.0, pointer.1),
+            began,
+            end,
+        }
+    }
+
+    #[test]
+    fn touch_rect_selects_from_the_press_point_to_the_release_point() {
+        let mut tool = SelectTool::new(SelectMode::Rect);
+        assert_eq!(tool.touch_step(touch((10.0, 10.0), (14.0, 12.0), true, None)), GestureAction::None);
+        assert!(tool.gesture_in_flight());
+        assert_eq!(tool.touch_step(touch((10.0, 10.0), (40.0, 30.0), false, None)), GestureAction::None);
+        assert_eq!(
+            tool.touch_step(touch((10.0, 10.0), (50.0, 35.0), false, Some(TouchSelectionEnd::Released))),
+            GestureAction::Commit {
+                op: SelectionOp::Replace,
+                shape: CommitShape::Rect(Pos2::new(10.0, 10.0), Pos2::new(50.0, 35.0)),
+            }
+        );
+        assert!(!tool.gesture_in_flight());
+    }
+
+    #[test]
+    fn touch_drag_within_one_frame_still_spans_origin_to_pointer() {
+        let mut tool = SelectTool::new(SelectMode::Rect);
+        assert_eq!(
+            tool.touch_step(touch((5.0, 6.0), (25.0, 26.0), true, Some(TouchSelectionEnd::Released))),
+            GestureAction::Commit {
+                op: SelectionOp::Replace,
+                shape: CommitShape::Rect(Pos2::new(5.0, 6.0), Pos2::new(25.0, 26.0)),
+            }
+        );
+    }
+
+    #[test]
+    fn touch_lasso_traces_from_the_press_point() {
+        let mut tool = SelectTool::new(SelectMode::Lasso);
+        assert_eq!(tool.touch_step(touch((0.0, 0.0), (10.0, 0.0), true, None)), GestureAction::None);
+        assert_eq!(tool.touch_step(touch((0.0, 0.0), (10.0, 10.0), false, None)), GestureAction::None);
+        match tool.touch_step(touch((0.0, 0.0), (0.0, 10.0), false, Some(TouchSelectionEnd::Released))) {
+            GestureAction::Commit { op, shape: CommitShape::Polygon(points) } => {
+                assert_eq!(op, SelectionOp::Replace);
+                assert_eq!(points, vec![(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]);
+            }
+            other => panic!("expected a polygon commit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn touch_cancel_abandons_without_committing() {
+        let mut tool = SelectTool::new(SelectMode::Rect);
+        assert_eq!(tool.touch_step(touch((1.0, 1.0), (9.0, 9.0), true, None)), GestureAction::None);
+        assert_eq!(
+            tool.touch_step(touch((1.0, 1.0), (9.0, 9.0), false, Some(TouchSelectionEnd::Cancelled))),
+            GestureAction::Aborted
+        );
+        assert!(!tool.gesture_in_flight());
+    }
+
+    #[test]
+    fn touch_without_a_delivered_start_is_ignored() {
+        let mut tool = SelectTool::new(SelectMode::Rect);
+        assert_eq!(
+            tool.touch_step(touch((1.0, 1.0), (9.0, 9.0), false, Some(TouchSelectionEnd::Released))),
+            GestureAction::None
+        );
+    }
+
+    #[test]
+    fn touch_start_replaces_a_pending_mouse_polygon_and_ignores_the_base_op_modifiers() {
+        let mut tool = SelectTool::new(SelectMode::Lasso);
+        tool.base_op = SelectionOp::Add;
+        // A mouse Alt-release leaves a pending polygon behind.
+        assert_eq!(tool.step(press(0.0, 0.0, mods(false, false))), GestureAction::None);
+        assert_eq!(tool.step(release(5.0, 5.0, mods(false, true))), GestureAction::None);
+        assert!(tool.gesture_in_flight());
+        assert_eq!(tool.touch_step(touch((20.0, 20.0), (30.0, 20.0), true, None)), GestureAction::None);
+        match tool.touch_step(touch((20.0, 20.0), (30.0, 30.0), false, Some(TouchSelectionEnd::Released))) {
+            GestureAction::Commit { op, shape: CommitShape::Polygon(points) } => {
+                assert_eq!(op, SelectionOp::Add);
+                assert_eq!(points, vec![(20.0, 20.0), (30.0, 20.0), (30.0, 30.0)]);
+            }
+            other => panic!("expected a polygon commit, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1956,6 +1956,12 @@ fn draw_aside_slots(
         if let Some(style) = status_stroke {
             paint_bubble_status_border(ui.painter(), response.rect, CornerRadius::same(6), style);
         }
+        // Touch hole: a finger on the card stays with egui (its fields, drag and long-touch
+        // menu) instead of panning the canvas.
+        let card_hit_rect = bubble_slot_rect.intersect(scene_clip_rect);
+        if card_hit_rect.is_positive() {
+            canvas.scene.aside_card_hit_rects.push(card_hit_rect);
+        }
         bubble_hit_response.context_menu(|ui| {
             let outcome = canvas.show_bubble_context_menu(
                 ui,

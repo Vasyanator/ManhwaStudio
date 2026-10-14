@@ -12,7 +12,9 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - **Capability table** (`features.rs`): `PlatformFeature::is_available()` is a `const fn` over
   `cfg!`, so code stays compiled on every target and a gated branch folds away. Gated entry
   points return the typed `Unavailable { feature, reason }` (`NotOnThisPlatform` /
-  `BridgeMissing`), whose `Display` is a localized two-sentence message.
+  `BridgeMissing` / `PenTouchIndistinguishable`), whose `Display` is a localized two-sentence
+  message. `unavailable_reason()` gives the table's reason per target (`CanvasTouchGestures` on
+  Windows: pen and touch indistinguishable until winit handles `PT_PEN`; also off on wasm).
 - **File dialogs** (`file_dialog/`): `request(req, waker) -> PendingDialog` never blocks; the
   GUI polls the handle each frame. `pick_blocking(req)` is the worker form. A backend gets a
   `Completion` and calls `finish(result)` exactly once; dropping it unfinished reads as
@@ -83,7 +85,7 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 
 ## Files and submodules
 - `lib.rs`: crate root, re-exports `PlatformFeature`, `Unavailable`, `UnavailableReason`.
-- `features.rs`: the capability table and `Unavailable`.
+- `features.rs`: the capability table (`is_available`, `unavailable_reason`) and `Unavailable`.
 - `file_dialog/mod.rs`: request/result types, `PendingDialog`, single-flight, outcome logging,
   kind -> `Picked` mapping. `tests.rs` holds its host tests.
 - `file_dialog/{desktop,android,unavailable}.rs`: one backend per target (dispatch via
@@ -133,7 +135,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 
 ## Editing map
 - New capability or a platform answer: `features.rs` (`PlatformFeature`, `ALL`,
-  `message_key`) plus the `platform.unavailable.*_error` key in `en.json` and `ru.json`.
+  `message_key`, and `unavailable_reason` when the reason is not `NotOnThisPlatform`) plus
+  the `platform.unavailable.*_error` key in `en.json` and `ru.json`.
 - New dialog kind: `DialogKind` (append only: its index is the Kotlin bridge contract),
   `picked_from_paths`, each backend, and the `Picked` table.
 - New extension family for SAF: `file_dialog/mime.rs`.

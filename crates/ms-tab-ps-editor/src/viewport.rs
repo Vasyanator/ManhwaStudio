@@ -10,6 +10,10 @@ Key structures:
 - `ViewTransform`: per-frame immutable snapshot used to convert between image (world) pixel
   coordinates and screen coordinates.
 
+Key functions:
+- `PsViewport::handle_input`: mouse wheel zoom and middle/Space drag pan.
+- `PsViewport::apply_touch_navigation`: finger pan / pinch from `ms_widgets::touch_nav`.
+
 Notes:
 World coordinates are image pixel coordinates: the top-left of the page is `(0, 0)` and the
 bottom-right is `(width, height)`. Screen coordinates are egui logical points inside the
@@ -18,6 +22,7 @@ allocated viewport rect.
 
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
+use ms_widgets::touch_nav::TouchNavigation;
 
 /// Minimum and maximum zoom factors (screen pixels per image pixel).
 const MIN_ZOOM: f32 = 0.02;
@@ -196,5 +201,98 @@ impl PsViewport {
                 );
             }
         }
+    }
+
+    /// Applies one frame of finger navigation (`ms_widgets::touch_nav::TouchNavigation`).
+    ///
+    /// Zooms by `nav.zoom_factor` about `nav.prev_centroid` (clamped to the viewport's zoom
+    /// limits), then moves the camera so the world point that was under `prev_centroid` lands
+    /// under `nav.centroid`: a one-finger drag pans, a pinch keeps the content under the fingers.
+    /// At a zoom limit the clamped zoom still keeps that world point under the centroid. A
+    /// non-finite or non-positive factor is ignored (pan only), never propagated into the camera.
+    pub fn apply_touch_navigation(&mut self, viewport_rect: Rect, nav: TouchNavigation) {
+        let anchor_world = self.transform(viewport_rect).screen_to_world(nav.prev_centroid);
+        let prev_zoom = self.zoom;
+        if nav.zoom_factor.is_finite() && nav.zoom_factor > 0.0 {
+            self.zoom = (self.zoom * nav.zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        }
+        // `world_to_screen(w) = rect.center + (w - center) * zoom`; requiring it to equal
+        // `centroid` for `w = anchor_world` gives `center = w - (centroid - rect.center) / zoom`.
+        self.center_world =
+            anchor_world.to_vec2() - (nav.centroid - viewport_rect.center()) / self.zoom;
+        if (self.zoom - prev_zoom).abs() > f32::EPSILON {
+            ms_log::trace_log!(
+                ms_log::trace::cat::INPUT,
+                "viewport touch zoom {:.3}->{:.3} touches={}",
+                prev_zoom,
+                self.zoom,
+                nav.touches
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 400x300 viewport at the origin, with the camera at zoom 2 centered on world (100, 50).
+    fn fixture() -> (PsViewport, Rect) {
+        let mut viewport = PsViewport::default();
+        viewport.set_camera(2.0, Vec2::new(100.0, 50.0));
+        (viewport, Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0)))
+    }
+
+    fn nav(prev: Pos2, now: Pos2, zoom_factor: f32) -> TouchNavigation {
+        TouchNavigation { prev_centroid: prev, centroid: now, zoom_factor, touches: 1 }
+    }
+
+    fn assert_close(a: Pos2, b: Pos2) {
+        assert!((a - b).length() < 1e-3, "{a:?} != {b:?}");
+    }
+
+    #[test]
+    fn one_finger_pan_moves_the_content_with_the_finger() {
+        let (mut viewport, rect) = fixture();
+        let prev = Pos2::new(150.0, 120.0);
+        let world = viewport.transform(rect).screen_to_world(prev);
+        viewport.apply_touch_navigation(rect, nav(prev, Pos2::new(180.0, 100.0), 1.0));
+        assert!((viewport.zoom() - 2.0).abs() < f32::EPSILON);
+        // A +30/-20 point drag moves the camera by -15/+10 world px at zoom 2.
+        assert!((viewport.center_world() - Vec2::new(85.0, 60.0)).length() < 1e-3);
+        assert_close(viewport.transform(rect).world_to_screen(world), Pos2::new(180.0, 100.0));
+    }
+
+    #[test]
+    fn pinch_keeps_the_world_point_under_the_fingers() {
+        let (mut viewport, rect) = fixture();
+        let prev = Pos2::new(250.0, 90.0);
+        let now = Pos2::new(240.0, 110.0);
+        let world = viewport.transform(rect).screen_to_world(prev);
+        viewport.apply_touch_navigation(rect, nav(prev, now, 1.5));
+        assert!((viewport.zoom() - 3.0).abs() < 1e-5);
+        assert_close(viewport.transform(rect).world_to_screen(world), now);
+    }
+
+    #[test]
+    fn pinch_zoom_is_clamped_and_still_anchored() {
+        let (mut viewport, rect) = fixture();
+        let prev = Pos2::new(50.0, 250.0);
+        let world = viewport.transform(rect).screen_to_world(prev);
+        viewport.apply_touch_navigation(rect, nav(prev, prev, 1000.0));
+        assert!((viewport.zoom() - MAX_ZOOM).abs() < f32::EPSILON);
+        assert_close(viewport.transform(rect).world_to_screen(world), prev);
+
+        viewport.apply_touch_navigation(rect, nav(prev, prev, 1e-6));
+        assert!((viewport.zoom() - MIN_ZOOM).abs() < f32::EPSILON);
+        assert_close(viewport.transform(rect).world_to_screen(world), prev);
+    }
+
+    #[test]
+    fn a_degenerate_zoom_factor_only_pans() {
+        let (mut viewport, rect) = fixture();
+        viewport.apply_touch_navigation(rect, nav(Pos2::new(10.0, 10.0), Pos2::new(20.0, 10.0), f32::NAN));
+        assert!((viewport.zoom() - 2.0).abs() < f32::EPSILON);
+        assert!((viewport.center_world() - Vec2::new(95.0, 50.0)).length() < 1e-3);
     }
 }

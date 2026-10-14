@@ -28,6 +28,9 @@ Architecture:
   arrangement, and the tab supplies its OWN `DockArea` rect (it is not a canvas tab, so
   `canvas::dock_area_rect` — which reserves the canvas' scrollbar strip — does not apply).
 - `viewport`: own camera (pan/zoom/fit), independent of the shared canvas engine.
+- `canvas_touch`: finger input from `ms_widgets::touch_nav` (surface publication, long-press
+  marker); `draw_canvas` applies its navigation to the camera, its selection drag to the active
+  tool (`PsTool::touch_selection`) and its long-press to `draw_selection_menu`.
 - `layers`: ordered layer stack with two locked base layers (source + clean) and user raster
   layers above them.
 - `page_loader`: background worker that produces the two base-layer images for the active page.
@@ -93,6 +96,7 @@ Base layers mirror existing models read-only and are never written back.
 #[macro_use]
 extern crate ms_i18n;
 
+mod canvas_touch;
 pub mod correction;
 pub mod edit_op;
 pub mod layer_render;
@@ -141,7 +145,7 @@ use tools::deform::DeformTool;
 use tools::patch::PatchTool;
 use tools::select::{SelectMode, SelectTool};
 use tools::transform::TransformTool;
-use tools::{PsTool, PsToolContext, PsToolId, PsToolSection, ToolOutcome};
+use tools::{PsTool, PsToolContext, PsToolId, PsToolSection, ToolOutcome, TouchSelectionInput};
 
 /// Max layer tiles uploaded to the GPU per frame across all layers (spreads big-page uploads).
 const TILE_UPLOAD_BUDGET_PER_FRAME: usize = 8;
@@ -5413,6 +5417,17 @@ impl PsEditorTabState {
         let anchor = input.hover_pos.filter(|p| rect.contains(*p));
         self.viewport
             .handle_input(rect, anchor, wheel_for_zoom, pan_delta);
+        // Finger input (`ms_widgets::touch_nav`): a claimed finger never reaches the tools; it
+        // pans / pinches here, BEFORE this frame's transform is taken, opens the selection menu
+        // on a long-press and drives the active selection tool on a long-press drag.
+        let touch = canvas_touch::publish_and_take(
+            ctx,
+            rect,
+            self.tools[self.active_tool_idx].accepts_touch_selection(),
+        );
+        if let Some(navigation) = touch.navigation {
+            self.viewport.apply_touch_navigation(rect, navigation);
+        }
 
         if self.active_tool_id() == PsToolId::Brush {
             self.brush_shortcuts(ctx);
@@ -5517,7 +5532,16 @@ impl PsEditorTabState {
                     cancel_pressed: input.cancel_pressed,
                     remove_point_pressed: input.remove_point_pressed,
                 };
-                self.tools[self.active_tool_idx].interact(&mut tool_ctx)
+                let tool = &mut self.tools[self.active_tool_idx];
+                // A finger selection drag replaces the mouse frame: the finger's button is held
+                // but invisible to egui, so `interact` would read it as an interrupted drag.
+                match touch.selection.filter(|_| tool.accepts_touch_selection()) {
+                    Some(selection) => tool.touch_selection(
+                        &mut tool_ctx,
+                        TouchSelectionInput::from_touch(&selection, &view),
+                    ),
+                    None => tool.interact(&mut tool_ctx),
+                }
             } else {
                 ToolOutcome::default()
             };
@@ -5700,7 +5724,7 @@ impl PsEditorTabState {
         // gesture: under any other tool Alt+right-click is an ordinary right-click and must still
         // open the menu.
         let hud_gesture_possible = input.modifiers.alt && self.active_tool_id() == PsToolId::Brush;
-        self.draw_selection_menu(&response, project, hud_gesture_possible);
+        self.draw_selection_menu(&response, project, hud_gesture_possible, touch.long_press_at);
 
         // Tool cursor / preview overlay. It obeys the SAME occlusion gate as the input path
         // (`pointer_occluded`, resolved once above): a brush circle that keeps tracking the cursor
@@ -5716,6 +5740,9 @@ impl PsEditorTabState {
         .map(|p| view.screen_to_world(p));
         let painter = ui.painter_at(rect);
         self.tools[self.active_tool_idx].draw_overlay(&painter, &view, pointer_image);
+        if let Some(armed_at) = touch.long_press_armed_at {
+            canvas_touch::draw_long_press_marker(&painter, armed_at);
+        }
 
         // Page border for orientation.
         let page_rect = view.world_rect_to_screen(Rect::from_min_size(
@@ -6317,32 +6344,36 @@ impl PsEditorTabState {
         painter.extend(shapes);
     }
 
-    /// Right-click menu on the canvas offering copy/cut of the selection from chosen layers.
+    /// Right-click / finger long-press menu on the canvas offering copy/cut of the selection from
+    /// chosen layers.
     ///
-    /// The touched-layer list is recomputed once per menu open (on the secondary click) so the
-    /// per-frame menu closure stays cheap even for large selections.
+    /// Opens on a secondary click or when `long_press_at` (this frame's
+    /// `TouchOutput::long_press_at`, screen points) is `Some`, anchored there; both take the one
+    /// open path `ms_widgets::touch_nav::context_menu_popup`. The touched-layer list is recomputed
+    /// once per menu open so the per-frame menu closure stays cheap even for large selections.
     ///
-    /// `hud_gesture_possible` suppresses the menu entirely for the frame: Alt + right-drag is the
-    /// brush's size/hardness HUD, and a short one still produces a secondary CLICK on this
-    /// `Sense::click_and_drag` canvas. `Popup::context_menu` opens itself from that click, so the
-    /// only way to keep the menu out of the gesture is not to call it. The caller must scope the
-    /// flag to the tool that owns the gesture — the brush — so Alt+right-click keeps opening the
-    /// menu under every other tool.
+    /// `hud_gesture_possible` suppresses the menu for the frame unless a long-press opens it: Alt +
+    /// right-drag is the brush's size/hardness HUD, and a short one still produces a secondary
+    /// CLICK on this `Sense::click_and_drag` canvas, which would open the menu, so the only way to
+    /// keep the menu out of the gesture is not to call it. The flag is mouse-only — a finger
+    /// long-press is no HUD gesture. The caller must scope the flag to the tool that owns the
+    /// gesture — the brush — so Alt+right-click keeps opening the menu under every other tool.
     fn draw_selection_menu(
         &mut self,
         response: &egui::Response,
         project: &ProjectData,
         hud_gesture_possible: bool,
+        long_press_at: Option<Pos2>,
     ) {
-        if hud_gesture_possible {
+        if hud_gesture_possible && long_press_at.is_none() {
             return;
         }
-        if response.secondary_clicked() {
+        if response.secondary_clicked() || long_press_at.is_some() {
             self.refresh_clip_touched_layers();
             self.clip_selected_layers.clear();
         }
         let has_selection = self.selection.as_ref().is_some_and(Selection::any);
-        egui::Popup::context_menu(response)
+        ms_widgets::touch_nav::context_menu_popup(response, long_press_at)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 if !has_selection {

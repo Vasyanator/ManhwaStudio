@@ -18,6 +18,8 @@ Key structures:
 - `PsToolAction` / `ToolRegionWrite`: the tool → tab out-channel, drained once per frame; the one
   capability today is "write this pixel rect into the active editable layer as ONE undo step".
 - `PsToolOverlayCx`: the page/view geometry an on-canvas `draw_overlay_ui` pass is handed.
+- `TouchSelectionInput`: one frame of a finger long-press selection drag in image pixels (the
+  typed tool-side form of `ms_widgets::touch_nav::TouchSelection`).
 - `PsTool`: trait every tool implements (interaction, overlay drawing, options UI, shortcut list,
   and the defaulted region-tool hooks below).
 
@@ -34,6 +36,8 @@ Key functions:
   own worker channels, one for the pixel writes it asks the tab to perform.
 - `PsTool::set_panel_rects` / `wants_main_panel` / `draw_main_panel` / `draw_overlay_ui` /
   `captures_canvas_pointer`: the on-canvas surface hooks, all defaulted to inert.
+- `PsTool::accepts_touch_selection` / `touch_selection`: the finger selection hooks, defaulted to
+  "not a selection tool".
 
 Notes:
 Tools never touch GPU textures, files, or shared models. They mutate the in-memory layer stack and
@@ -57,6 +61,7 @@ use super::selection::Selection;
 use super::viewport::ViewTransform;
 use eframe::egui;
 use egui::{ColorImage, Pos2, Rect};
+use ms_widgets::touch_nav::{TouchSelection, TouchSelectionEnd};
 
 /// Stable identifier for each tool, used by the toolbar and hotkeys.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -242,6 +247,36 @@ pub struct PsToolOverlayCx {
     pub page_size: [usize; 2],
     /// The resident page's index.
     pub page_idx: usize,
+}
+
+/// One frame of a finger long-press selection drag, mapped into image pixels.
+///
+/// The typed tool-side form of `ms_widgets::touch_nav::TouchSelection`: it is NOT a synthesized
+/// mouse press, and a tool reads it only through [`PsTool::touch_selection`]. The router reports
+/// it on every frame while the drag lasts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TouchSelectionInput {
+    /// The long-press point the selection starts from (image pixels, fractional).
+    pub origin: Pos2,
+    /// The finger's latest position (image pixels, fractional).
+    pub pointer: Pos2,
+    /// First frame of this selection: start it at `origin`.
+    pub began: bool,
+    /// `Some` on the frame the selection finished (`began` may be set on the same frame).
+    pub end: Option<TouchSelectionEnd>,
+}
+
+impl TouchSelectionInput {
+    /// Maps the router's screen-space `selection` into image pixels through this frame's `view`.
+    #[must_use]
+    pub fn from_touch(selection: &TouchSelection, view: &ViewTransform) -> Self {
+        Self {
+            origin: view.screen_to_world(selection.origin),
+            pointer: view.screen_to_world(selection.pos),
+            began: selection.began,
+            end: selection.end,
+        }
+    }
 }
 
 /// Mutable per-frame context handed to the active tool.
@@ -544,6 +579,29 @@ pub trait PsTool: Send {
     /// it must not grow a sibling that can.
     fn captures_canvas_pointer(&self, _pointer_pos: Pos2) -> bool {
         false
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // FINGER SELECTION HOOKS
+    //
+    // A finger never reaches `interact` (`ms_widgets::touch_nav` strips its mouse emulation); a
+    // finger long-press followed by a drag is delivered as a typed `TouchSelectionInput` instead.
+    // Defaulted to "not a selection tool", in which case the router turns that drag into a pan.
+    // ------------------------------------------------------------------------------------------
+
+    /// Whether a finger long-press drag should drive this tool's selection (published to the
+    /// router as `TouchSurface::long_press_selection`). Default `false`.
+    fn accepts_touch_selection(&self) -> bool {
+        false
+    }
+
+    /// One frame of a finger selection drag; called by the tab INSTEAD of
+    /// [`PsTool::interact`] on every frame the router reports a selection while
+    /// [`PsTool::accepts_touch_selection`] is `true` (a mouse frame would read the finger's
+    /// held-but-invisible button as an interrupted drag). `Cancelled` must leave the committed
+    /// selection untouched, exactly like [`PsTool::reset`]. The default does nothing.
+    fn touch_selection(&mut self, _ctx: &mut PsToolContext<'_>, _input: TouchSelectionInput) -> ToolOutcome {
+        ToolOutcome::default()
     }
 }
 

@@ -33,7 +33,9 @@ tab orchestration beyond registration.
   hooks `reset` / `freeze` (both default to a no-op), the `as_brush_mut` downcast hook used by
   the tab to forward the brush's wheel and key gestures without a full `Any` downcast, and the
   REGION-TOOL block — `poll_workers`, `take_actions`, `set_panel_rects`, `wants_main_panel`,
-  `draw_main_panel`, `draw_overlay_ui`, `captures_canvas_pointer` — all defaulted to inert.
+  `draw_main_panel`, `draw_overlay_ui`, `captures_canvas_pointer` — all defaulted to inert — and
+  the FINGER-SELECTION pair `accepts_touch_selection` / `touch_selection` (input type
+  `TouchSelectionInput`), defaulted to "not a selection tool".
 
 Tools never touch GPU textures, files, shared models, or the backend. They mutate the in-memory
 stack/selection only; the tab converts `ToolOutcome::dirty` into `TiledTexture` re-uploads. A tool
@@ -317,6 +319,14 @@ below. `TransformTool` / `DeformTool` drop their control drag and per-frame cach
   Alt closes the path). Esc aborts without touching the selection; Backspace/Delete pops the last
   lasso vertex and aborts at zero. `Gesture::rubber_band` is recomputed every frame because
   `draw_overlay` receives no modifiers.
+- **Finger selection.** A finger long-press drag (`ms_widgets::touch_nav::TouchSelection`) reaches
+  the tool as a typed `TouchSelectionInput` (image px) through `PsTool::touch_selection`, never as a
+  synthesized mouse press. `SelectTool::touch_step` (pure) maps it onto `step`: `began` drops any
+  live outline and starts a fresh one at `origin` with `base_op` (a finger carries no modifiers),
+  every frame feeds the finger as a held button, `Released` commits like a mouse release (rect
+  `origin`..pointer, lasso the traced path), `Cancelled` aborts like Esc. A drag whose `began`
+  frame was never delivered is ignored. Tools that keep the default `accepts_touch_selection`
+  (`false`) never see a finger: the router pans instead.
 - **A click is not a special case.** A degenerate rect / a sub-3-point polygon is committed like any
   other shape: `Replace` clears the mask (click to deselect), the other ops leave it alone. Do not
   add an early return for it.
@@ -469,6 +479,8 @@ below. `TransformTool` / `DeformTool` drop their control drag and per-frame cach
   it a `PsToolSection`, register it in `PsEditorTabState::default`, and add it to the
   `registered_tools` fixture in `mod.rs`'s tests. Add a hotkey in
   `PsEditorTabState::handle_hotkeys` if wanted.
+- To let a finger long-press drag drive a tool, override `accepts_touch_selection` and
+  `touch_selection` (the tab already routes them; see `select.rs` for the mapping).
 - To add a REGION tool (worker thread + on-canvas surface + own dock panel), implement the block
   above on top of that: `poll_workers` for its channels, `take_actions` for its pixel commits,
   `draw_overlay_ui` + `set_panel_rects` + `captures_canvas_pointer` for its surface, and

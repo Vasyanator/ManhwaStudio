@@ -12,6 +12,7 @@ AppShell (mod.rs, eframe::App)
   logic(): poll workers (launcher entry, studio load, studio teardown, update check,
            incoming-images take -> ExternalOpen) + root close_requested -> on_event(OsClose)
   ui():    geometry, Windows first-frame maximize, draw the active screen, UI exits
+  raw_input_hook(): TouchRouter::route (ms_widgets::touch_nav) before egui's pointer state
   dispatch(event) -> screen::on_event(kind, event) -> Transition { next, effect, cancel_os_close }
                   -> run_effect (moves data between screens) -> enter_screen on a switch
 screens:  PreparingLauncher (worker: ensure_model_dirs + ms_launcher::prepare_entry)
@@ -25,7 +26,7 @@ transition goes through `screen::on_event`; the shell only executes the returned
 
 ## Files and submodules
 - `mod.rs`: `run`, `ShellConfig`, `InitialScreen`, `AppShell` (creator, `logic`, `ui`,
-  `on_exit`), the PreparingLauncher worker and screen, the cached update notification.
+  `raw_input_hook`, `on_exit`), the PreparingLauncher worker and screen, the cached update notification.
 - `screen.rs`: the pure transition table (`on_event`, exhaustive OS-close policy
   `on_os_close`), `ShellExit`, per-screen style / minimum size. Unit-tested row by row.
 - `style.rs`: `StyleScreen`, `style_for`, `apply` — the complete global style per screen, built
@@ -101,6 +102,12 @@ transition goes through `screen::on_event`; the shell only executes the returned
   ask) is dropped by `incoming::discard_target`, which releases its inbox batches on a worker.
   Cold start: `run_main` takes the batches pre-window; they become `InitialScreen::Studio` when
   there is no CLI target. A failed take is logged and shown once in a small window.
+- **Canvas touch routing**: the shell owns the window's ONE `ms_widgets::touch_nav::TouchRouter`
+  (created once, lives across every screen) and feeds it from `raw_input_hook`, the only point
+  that sees `RawInput` before egui builds its pointer state. Enabled iff
+  `ms_platform::PlatformFeature::CanvasTouchGestures` is available (off on Windows: pen and
+  touch are indistinguishable there). Screens only publish surfaces and take outputs; the
+  launcher publishes none, so it is unaffected.
 - Android: one `run_native`; the fork's secondary-window policy is set before it and re-synced at
   creation and every switch. Nothing here relies on the winit fork re-emitting `Resumed` for a
   second event loop (`dev-docs/ANDROID_PORT.md`).
@@ -117,6 +124,9 @@ transition goes through `screen::on_event`; the shell only executes the returned
 - Teardown order: `src/app/shutdown.rs`; how it runs and what the user sees: `closing.rs`.
 - Startup prompts and the post-window update: `src/lib.rs` (`resolve_start`,
   `resolve_cli_images`, `run_launcher_requested_update`).
+- Finger gestures on canvases: the router and its contract live in
+  `crates/ms-widgets/src/touch_nav/`; the platform gate in `ms_platform` `features.rs`; the
+  shell only wires `raw_input_hook`.
 - Images other apps hand over: where they go per screen — `screen.rs` (`ExternalOpen` rows,
   `merge_open`); taking, mapping, dropping — `incoming.rs`; `pending_open` and the polling —
   `mod.rs`; the running studio's question — `src/app/incoming_open.rs`.

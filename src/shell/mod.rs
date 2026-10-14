@@ -21,6 +21,7 @@ Key functions:
   check, incoming-images take) and owns the root close decision, so a minimized window still
   progresses.
 - `AppShell::ui`: geometry, the Windows first-frame maximize, the active screen, UI exits.
+- `AppShell::raw_input_hook`: feeds every frame's raw input to the canvas `TouchRouter`.
 
 Notes:
 No blocking work on the GUI thread at any switch: the launcher entry is prepared on a worker
@@ -31,8 +32,10 @@ hands over (Android Share / "Open with") are taken on a worker when `ms_platform
 raises its flag and dispatched as `ShellEvent::ExternalOpen`; a target the table queues or asks
 about waits in `AppShell::pending_open` (`incoming.rs` moves the data). `on_exit` is the
 process-shutdown path only (eframe ended without the shell's consent, e.g. the Android Activity
-went away): it tears a running studio down inline. Native only, except `style`, which the web
-entry uses too.
+went away): it tears a running studio down inline. Finger input on canvases is routed here, in
+`raw_input_hook`, by ONE `ms_widgets::touch_nav::TouchRouter` per window (enabled by
+`PlatformFeature::CanvasTouchGestures`), before egui builds its pointer state. Native only,
+except `style`, which the web entry uses too.
 */
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -64,7 +67,9 @@ mod native {
     use crate::project::ProjectData;
     use crate::runtime_log;
     use crate::window_geometry::{self, WindowGeometryTracker};
+    use ms_platform::PlatformFeature;
     use ms_thread as thread;
+    use ms_widgets::touch_nav::TouchRouter;
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -240,6 +245,10 @@ mod native {
         incoming_take_unavailable: bool,
         /// A localized incoming-images error shown in a small window until dismissed.
         incoming_error: Option<String>,
+        /// The canvas finger router, fed by `raw_input_hook`. One per window (its claims span
+        /// frames and every screen); disabled where `CanvasTouchGestures` is unavailable, where
+        /// it only drops the per-frame surface publications.
+        touch_router: TouchRouter,
     }
 
     impl AppShell {
@@ -284,6 +293,7 @@ mod native {
                 incoming_take: None,
                 incoming_take_unavailable: false,
                 incoming_error,
+                touch_router: TouchRouter::new(PlatformFeature::CanvasTouchGestures.is_available()),
             };
             let effect = match initial {
                 InitialScreen::Launcher => Effect::PrepareLauncher,
@@ -731,6 +741,13 @@ mod native {
             if let Some(event) = event {
                 self.dispatch(&ctx, event, Payload::None);
             }
+        }
+
+        /// Routes canvas finger input before egui sees it (`ms_widgets::touch_nav`): claimed
+        /// touches lose their mouse emulation and become navigation / long-press outputs that the
+        /// canvases take this frame. Child viewports pass through untouched (the router checks).
+        fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+            self.touch_router.route(ctx, raw_input);
         }
 
         /// The process-shutdown path (eframe ended the window): finishes or performs the studio
