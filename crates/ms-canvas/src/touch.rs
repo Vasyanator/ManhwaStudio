@@ -17,13 +17,15 @@ Main responsibilities:
   active mode has a selection (`set_long_press_selection`), reads this frame's drag
   (`touch_selection`) and drives its own selection state with it (`drive_touch_drag` for
   rectangle-drag capture modes);
+- hand this frame's finger tap point to the tab (`touch_tap`), for dismiss/commit decisions
+  only (the canvas itself does nothing on a tap);
 - draw the armed long-press feedback marker.
 
 Key functions:
 - `CanvasView::touch_owner_id`
 - `CanvasView::take_touch_output_for_frame` / `apply_touch_navigation`
 - `CanvasView::publish_touch_surface` / `draw_touch_long_press_feedback`
-- `CanvasView::set_long_press_selection` / `touch_selection`
+- `CanvasView::set_long_press_selection` / `touch_selection` / `touch_tap`
 - `drive_touch_drag` + `TouchDrivenDrag`: the one mapping of a `TouchSelection` onto a
   rectangle-drag capture mode (begin at the press point, follow, commit on release, drop on
   cancel).
@@ -146,6 +148,18 @@ impl CanvasView {
         self.scene.touch_selection
     }
 
+    /// This frame's finger tap on this canvas (the press point, screen points), if any.
+    ///
+    /// A tap is a lone finger lifted within the click distance before its long-press armed
+    /// (`TouchOutput::tap_at`). Valid from `draw`'s input step on, like [`Self::touch_selection`],
+    /// and reported on the lift frame only. The canvas acts on no tap: a tab may use it ONLY
+    /// where a mouse click OUTSIDE something dismisses or commits it (the typing create editor),
+    /// never to place, select or paint — every other bare-canvas click action stays mouse-only.
+    #[must_use]
+    pub fn touch_tap(&self) -> Option<Pos2> {
+        self.scene.touch_tap_at
+    }
+
     /// Stable id under which this canvas publishes its touch surface and takes its touch
     /// output (`ms_widgets::touch_nav`). Tabs pass it to `touch_nav::publish_capture_layer` for
     /// their capture overlays, so a finger pans under them too.
@@ -162,6 +176,7 @@ impl CanvasView {
         self.scene.touch_long_press_at = output.long_press_at;
         self.scene.touch_long_press_armed_at = output.long_press_armed_at;
         self.scene.touch_selection = output.selection;
+        self.scene.touch_tap_at = output.tap_at;
         if let Some(navigation) = output.navigation
             && self.apply_touch_navigation(navigation, canvas_rect)
         {

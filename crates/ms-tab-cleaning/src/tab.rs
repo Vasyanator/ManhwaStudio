@@ -1872,15 +1872,20 @@ impl CleaningTabState {
         handled
     }
 
+    /// Where the active tool's cursor (and a region tool's rubber band) is drawn this frame:
+    /// see [`cursor_anchor_pos`].
+    fn active_cursor_pos(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
+        let (interact, hover) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.hover_pos()));
+        cursor_anchor_pos(self.touch_selection_point, interact, hover, self.last_stroke_point)
+    }
+
     fn draw_active_tool_cursor(
         &mut self,
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         canvas_rect: egui::Rect,
     ) {
-        let pointer_pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
-        let pointer_pos = pointer_pos.or_else(|| self.last_stroke_point.map(|p| p.scene_pos));
-        let Some(pointer_pos) = pointer_pos else {
+        let Some(pointer_pos) = self.active_cursor_pos(ctx) else {
             return;
         };
         if !canvas_rect.contains(pointer_pos) {
@@ -1915,9 +1920,7 @@ impl CleaningTabState {
         ctx: &egui::Context,
         canvas_rect: egui::Rect,
     ) -> Option<CleaningCursorOccluder> {
-        let pointer_pos = ctx.input(|i| i.pointer.interact_pos().or(i.pointer.hover_pos()));
-        let pointer_pos = pointer_pos.or_else(|| self.last_stroke_point.map(|p| p.scene_pos));
-        let pointer_pos = pointer_pos?;
+        let pointer_pos = self.active_cursor_pos(ctx)?;
         if !canvas_rect.contains(pointer_pos) {
             return None;
         }
@@ -1928,6 +1931,26 @@ impl CleaningTabState {
             .get(self.active_tool_idx)
             .and_then(|tool| tool.bubble_occluder(&self.canvas, Some(pointer_pos)))
     }
+}
+
+/// The scene position the active tool's cursor and rubber band are drawn at, in priority order:
+/// the finger selection drag in flight (`touch`), egui's interact / hover pointer, then the
+/// mouse stroke's last point.
+///
+/// The finger comes FIRST: the router claims the finger, so egui has no pointer for it, and a
+/// stale mouse hover elsewhere must not move the band's crosshair off the finger (the band itself
+/// is painted only when a position exists, `RegionEditToolBase::draw_cursor_tinted`).
+fn cursor_anchor_pos(
+    touch: Option<StrokePoint>,
+    interact: Option<Pos2>,
+    hover: Option<Pos2>,
+    last_stroke: Option<StrokePoint>,
+) -> Option<Pos2> {
+    touch
+        .map(|point| point.scene_pos)
+        .or(interact)
+        .or(hover)
+        .or_else(|| last_stroke.map(|point| point.scene_pos))
 }
 
 /// What one frame of the «Клининг» dock tab bodies decided, drained by
@@ -3158,13 +3181,29 @@ mod tests {
         CLEANING_AREA_EDITOR_TAB, CLEANING_CLEAN_TAB, CLEANING_PANEL_CHROME_WIDTH_PX,
         CLEANING_QUICK_CLEAN_TAB, CLEANING_TOOLS_TAB, CLEANING_WATERMARK_LIBRARY_TAB,
         CleaningTabState, MASK_REMOVAL_TOOL_INDICES, cleaning_default_dock_layout,
-        cleaning_row_width, cleaning_tab_outer_width, drawn_tool_indices,
+        cleaning_row_width, cleaning_tab_outer_width, cursor_anchor_pos, drawn_tool_indices,
         scale_blocks_source_to_page, scale_edge_to_i32,
     };
+    use crate::tools::{StrokeModifiers, StrokePoint};
     use ms_canvas::CANVAS_RIBBON_TAB;
     use ms_widgets::panel_dock::{DockEdge, PanelAnchor, PanelId};
     use egui::{Pos2, Rect, Vec2};
     use std::collections::BTreeSet;
+
+    /// A finger long-press drag gives egui no pointer (the router claims the touch), so the
+    /// region tools' rubber band is drawn only when the finger point anchors the cursor; it
+    /// must win over a stale mouse hover too.
+    #[test]
+    fn the_finger_selection_point_anchors_the_cursor_first() {
+        let point = |x: f32| StrokePoint { page_idx: 0, scene_pos: Pos2::new(x, 1.0), modifiers: StrokeModifiers::default() };
+        let (finger, interact, hover, stroke) = (point(1.0), Pos2::new(2.0, 1.0), Pos2::new(3.0, 1.0), point(4.0));
+        assert_eq!(cursor_anchor_pos(Some(finger), None, None, None), Some(finger.scene_pos));
+        assert_eq!(cursor_anchor_pos(Some(finger), Some(interact), Some(hover), Some(stroke)), Some(finger.scene_pos));
+        assert_eq!(cursor_anchor_pos(None, Some(interact), Some(hover), Some(stroke)), Some(interact));
+        assert_eq!(cursor_anchor_pos(None, None, Some(hover), Some(stroke)), Some(hover));
+        assert_eq!(cursor_anchor_pos(None, None, None, Some(stroke)), Some(stroke.scene_pos));
+        assert_eq!(cursor_anchor_pos(None, None, None, None), None);
+    }
 
     /// The default arrangement is the one the dock is handed on a first run AND the
     /// dictionary `panel_dock::persist` resolves stored tab keys against, so it has

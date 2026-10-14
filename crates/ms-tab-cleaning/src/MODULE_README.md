@@ -82,6 +82,9 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   own stroke state (`touch_selection_point`) apart from the mouse stroke; `tab.rs` declares the
   tool's answer to the canvas before `draw` (`set_long_press_selection`) and drops a finger drag
   on a tool switch. Never a synthesized mouse press: the mouse buttons paint and erase here.
+  egui has no pointer for the claimed finger, so the tool cursor and the region tools' rubber
+  band are anchored at the finger point first (`tab.rs` `cursor_anchor_pos`), then at egui's
+  pointer, then at the mouse stroke's last point.
 - `autoclean.rs`: quick text-clean image engine. GUI-free core (`run_autoclean_engine`)
   clusters the text mask, then per cluster runs: `has_text_structure` gate -> two candidates
   (A = strokes via `fill_holes`+dilate, B = detector-box union / cluster bbox) ->

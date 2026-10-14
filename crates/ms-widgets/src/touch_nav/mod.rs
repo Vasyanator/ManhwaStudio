@@ -5,8 +5,9 @@ Purpose:
 Public surface of the canvas touch-gesture owner. A finger that starts on a canvas
 surface never reaches a tool: the router (`router.rs`) removes egui-winit's emulated
 mouse events for such a touch before egui sees them and turns the touch into typed,
-per-canvas output — navigation (pan / pinch), a long-press menu request and a
-long-press selection drag. Ordinary UI (panels, menus, dialogs) is not touched.
+per-canvas output — navigation (axis-locked one-finger pan with a fling after the lift,
+free two-finger pan / pinch), a tap point, a long-press menu request and a long-press
+selection drag. Ordinary UI (panels, menus, dialogs) is not touched.
 
 Main responsibilities:
 - the per-frame publication channel from canvases to the router (`publish_surface`,
@@ -103,7 +104,8 @@ pub struct TouchNavigation {
     /// Ratio of the touches' mean spread now to their mean spread before; exactly `1.0` for a
     /// single touch or a degenerate (near-zero) previous spread.
     pub zoom_factor: f32,
-    /// Number of contributing touches (saturates at `u8::MAX`).
+    /// Number of contributing touches (saturates at `u8::MAX`); `0` on a kinetic (fling) frame,
+    /// which the router emits after a locked one-finger pan was lifted.
     pub touches: u8,
 }
 
@@ -155,6 +157,12 @@ pub struct TouchOutput {
     pub long_press_armed_at: Option<Pos2>,
     /// The long-press selection drag, reported on every frame while it lasts.
     pub selection: Option<TouchSelection>,
+    /// A finger tapped the canvas at this point (its press point): it was the owner's only
+    /// claimed touch, was lifted within the click distance before its long-press armed, no
+    /// mouse/pen button was held and the touch did not stop a running fling. Reported on the
+    /// lift frame only. Consumers use it ONLY for dismiss/commit decisions a mouse click outside
+    /// would make — never to place, select or paint (see `MODULE_README.md`).
+    pub tap_at: Option<Pos2>,
 }
 
 /// One owner's output plus the repaint the router needs from this frame.

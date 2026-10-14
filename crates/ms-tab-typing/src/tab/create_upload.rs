@@ -11,7 +11,8 @@ per-overlay texture upload/dirty-tracking helpers on `TypingTextOverlayLayer`.
 Touch: the Shift+drag capture overlay is a touch capture layer of the canvas, so a plain finger
 pans under it; a finger long-press drag (`CanvasView::touch_selection`) drives the same
 `create_selection` without Shift, through `ms_canvas::drive_touch_drag`, and commits on lift
-like a mouse release (`finish_create_selection`).
+like a mouse release (`finish_create_selection`). A finger tap outside the open create editor
+(`CanvasView::touch_tap`) commits it like a mouse click outside (`create_editor_commit_requested`).
 
 Notes:
 Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
@@ -93,6 +94,15 @@ fn begin_touch_create_selection(on_page: bool, origin: Pos2) -> Option<TypingCre
     on_page.then_some(TypingCreateSelection { start: origin, current: origin, touch: true })
 }
 
+/// Whether the open create editor commits this frame: a primary click (`clicked_outside`, already
+/// tested against the editor) or a finger tap (`tap`, `CanvasView::touch_tap`) outside
+/// `editor_rect`. The tap stands in for the click a claimed finger never produces; a tap inside
+/// the editor is not reachable anyway (the editor is an `Area`, the router never claims under it),
+/// and is rejected here too.
+fn create_editor_commit_requested(clicked_outside: bool, tap: Option<Pos2>, editor_rect: Rect) -> bool {
+    clicked_outside || tap.is_some_and(|pos| !editor_rect.contains(pos))
+}
+
 impl TypingCreateTextEditor {
     /// Font size the FIELD is drawn at: the panel's size scaled to this editor's view of the
     /// page, so the glyphs being typed are already the size the render will put in this box.
@@ -157,7 +167,7 @@ impl TypingTextOverlayLayer {
 
         self.capture_shift_drag_selection(ctx, canvas_rect, canvas, project, top_panel);
         self.draw_active_shift_selection(ctx);
-        self.draw_text_editor(ctx, project, top_panel);
+        self.draw_text_editor(ctx, project, top_panel, canvas.touch_tap());
         self.draw_render_inflight_hint(ctx);
         self.draw_status_error(ctx, canvas_rect);
         self.draw_status_warning(ctx, canvas_rect);
@@ -455,11 +465,14 @@ impl TypingTextOverlayLayer {
         }
     }
 
+    /// Draws the open on-canvas create editor and commits it (starts its render) on a primary
+    /// click or a finger tap (`touch_tap`, this frame's `CanvasView::touch_tap`) outside it.
     pub(super) fn draw_text_editor(
         &mut self,
         ctx: &egui::Context,
         project: &ProjectData,
         top_panel: &TypingTopPanelState,
+        touch_tap: Option<Pos2>,
     ) {
         // Runs before the early return: the resolve must be able to finish (and its family
         // to be cached) even on a frame where the editor has already been closed.
@@ -548,7 +561,9 @@ impl TypingTextOverlayLayer {
                     .interact_pos()
                     .is_some_and(|pos| !editor_rect.contains(pos))
         });
-        if clicked_outside && let Some(finished_editor) = self.create_editor.take() {
+        if create_editor_commit_requested(clicked_outside, touch_tap, editor_rect)
+            && let Some(finished_editor) = self.create_editor.take()
+        {
             self.start_create_overlay_render(ctx, project, top_panel, finished_editor);
         }
     }
@@ -1081,6 +1096,17 @@ impl TypingTextOverlayLayer {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+
+    /// A finger tap on the canvas commits the create editor exactly like a mouse click outside
+    /// it; a tap inside the editor, or no input at all, keeps it open.
+    #[test]
+    fn a_tap_outside_the_create_editor_commits_it_like_a_click() {
+        let editor = Rect::from_min_size(Pos2::new(100.0, 100.0), egui::vec2(200.0, 80.0));
+        assert!(create_editor_commit_requested(false, Some(Pos2::new(20.0, 20.0)), editor));
+        assert!(create_editor_commit_requested(true, None, editor));
+        assert!(!create_editor_commit_requested(false, Some(Pos2::new(150.0, 120.0)), editor));
+        assert!(!create_editor_commit_requested(false, None, editor));
+    }
 
     /// Test `FontProvider` that can be made to BLOCK inside `resolve`, so a test can prove
     /// the call does not happen on the calling (GUI) thread.

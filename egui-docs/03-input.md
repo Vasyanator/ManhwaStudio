@@ -264,10 +264,17 @@ Facts the canvas finger gestures rely on (owner: `ms_widgets::touch_nav`,
 - **A repaint requested before the pass is lost**: `begin_pass_repaint_logic` resets the delay
   (`egui-0.36.2/src/context.rs:99-115`), so a timer decided in the hook is requested from inside
   the pass (`touch_nav::take_touch_output`).
+- **`ScrollArea`'s kinetic fling cannot be driven from outside**: its velocity is the private
+  `State::vel` (getter only, `egui-0.36.2/src/containers/scroll_area.rs:44,84`), set from
+  `pointer.velocity()` on `drag_stopped` and decayed with friction 1000 pt/s², stop speed
+  20 pt/s and `dt.at_most(0.1)` (:829, :859-877). A claimed finger never drags it, so
+  `touch_nav` reruns the same law itself over an `egui::util::History<Pos2>` with egui's pointer
+  window (`History::new(2..1000, 0.1)`, velocity only with ≥3 samples over >0.01 s,
+  `input_state/mod.rs:1079,1234`).
 
 ## Editing map
 
-- Finger pan / pinch / long-press on a canvas → `ms_widgets::touch_nav` (publish a
+- Finger pan / pinch / fling / tap / long-press on a canvas → `ms_widgets::touch_nav` (publish a
   `TouchSurface`, take `TouchOutput`, open menus with `context_menu_popup`); never read
   `multi_touch()` or touch events directly. A tab mode with a selection drag → set
   `CanvasView::set_long_press_selection` every frame and map `CanvasView::touch_selection`

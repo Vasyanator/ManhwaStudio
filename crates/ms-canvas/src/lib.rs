@@ -60,7 +60,7 @@ Internal submodules:
 - `overlay_runtime`: clean-overlay runtime bucket (state, worker, tile upload, draw/edit ops).
 - `touch`: finger gestures consumer (`touch_owner_id`, touch surface, navigation, long-press,
   the long-press selection hand-off `set_long_press_selection` / `touch_selection` /
-  `drive_touch_drag`).
+  `drive_touch_drag`, the tap point `touch_tap`).
 - `settings`: canvas settings snapshot/publish/persistence logic.
 - `workers`: background worker bootstrap for overlay prepare and settings save.
 

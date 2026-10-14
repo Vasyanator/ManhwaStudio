@@ -397,7 +397,8 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   `tessellate_path` would blur. Gate-free by contract; see the file header.
 - `types.rs`: passive DTOs and runtime payload types.
 - `touch.rs`: the canvas side of finger gestures (`touch_owner_id`, surface publication, applying
-  `TouchNavigation`, the long-press feedback ring, `context_menu_open_pos`); see "Touch gestures".
+  `TouchNavigation`, the tap point, the long-press feedback ring, `context_menu_open_pos`); see
+  "Touch gestures".
 - `view_transform.rs`: `ViewTransform` world<->screen affine map (`screen = world * scale + translation`).
   The `ScrollArea` allocates the page strip and owns scrolling; each page's authoritative screen
   `image_rect` and its `page_in_view` visibility come from this transform: `reserve_canvas_page_frame`
@@ -426,7 +427,13 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   (clamped to `CANVAS_ZOOM_MIN..=CANVAS_ZOOM_MAX`); with `zoom_blocked` only the pan applies. A
   zoom anchor already recorded this frame wins and the finger delta of that frame is dropped. The
   wheel zoom anchor is the `prev == new` case of the same capture (pinned by
-  `zoom_anchor_capture_matches_frozen_characterization`).
+  `zoom_anchor_capture_matches_frozen_characterization`). The router's axis lock and the fling
+  after a locked lift arrive as ordinary navigation frames (a fling frame has `touches == 0` and
+  asks for the next frame itself), so the canvas has no kinetic state of its own.
+- **Tap**: `touch_tap()` returns this frame's `TouchOutput::tap_at` (stored by `handle_shortcuts`,
+  valid like `touch_selection`). The canvas acts on no tap. A tab may use it only where a mouse
+  click OUTSIDE something dismisses or commits it (today: the Typing create editor); bubble
+  placement, aside selection, Translation line presses and Cleaning/PS tools stay mouse-only.
 - **Long-press menu**: `scene.touch_long_press_at` reaches `handle_canvas_page_interactions`;
   `touch::context_menu_open_pos` picks the secondary-click position or, failing that, the
   long-press point inside the row, and both go through `canvas_context_menu_target_at` and the same

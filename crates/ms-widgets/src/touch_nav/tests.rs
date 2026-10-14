@@ -7,7 +7,7 @@ Contract tests of the canvas touch router and the context-menu helper.
 Main responsibilities:
 - pure tests of `TouchRouter::route_events` on synthetic event lists shaped exactly like
   egui-winit's touch emulation (claim, strip, pairing, pan, pinch, palm, long-press,
-  selection);
+  selection, axis lock, fling and its cancellation, tap);
 - pure and adapter tests of the live on/off request (`TouchRouter::set_enabled`);
 - headless `Context::run_ui` tests of the egui adapter (`TouchRouter::route`), of the
   background-layer fact `Context::layer_id_at` reports over bare canvas, and of
@@ -23,7 +23,10 @@ use egui::{
     Sense, TouchDeviceId, TouchId, TouchPhase, Ui, ViewportId, pos2, vec2,
 };
 
-use super::router::{RouteResult, RouterConfig};
+use super::router::{
+    AXIS_LOCK_DECIDE_PT, AXIS_LOCK_TAN, FLING_FRICTION_PT_S2, FLING_MAX_DT_S, FLING_STOP_SPEED_PT_S,
+    PanAxis, RouteResult, RouterConfig, classify_axis,
+};
 use super::{
     LONG_PRESS_ARM_S, PROMOTION_GRACE_S, TouchOutput, TouchRouter, TouchSelection,
     TouchSelectionEnd, TouchSurface, context_menu_popup, publish_capture_layer, publish_hole,
@@ -399,10 +402,14 @@ fn pen_button_held_blocks_navigation_and_long_press() {
     assert_eq!(output.navigation, None);
     let output = bench.output(Vec::new(), 1.0);
     assert_eq!(output, TouchOutput::default(), "the palm never arms a long-press");
-    // Pen lifts; further palm motion pans from where the palm IS, not from where it landed.
+    // Pen lifts; the palm's pan is measured from where the palm IS, not from where it landed:
+    // its axis decision waits for `AXIS_LOCK_DECIDE_PT` from there, then catches up.
     let (_, _) = bench.step(vec![button(pen, PointerButton::Primary, false)], 1.1);
-    let navigation = bench.output(bare(1, TouchPhase::Move, pos2(165.0, 100.0)), 1.2).navigation.expect("pan");
-    assert_eq!(navigation.pan_delta(), vec2(5.0, 0.0));
+    let output = bench.output(bare(1, TouchPhase::Move, pos2(165.0, 100.0)), 1.2);
+    assert_eq!(output.navigation, None, "5 pt from the lift point: still undecided");
+    let navigation = bench.output(bare(1, TouchPhase::Move, pos2(172.0, 101.0)), 1.25).navigation.expect("pan");
+    assert_eq!(navigation.prev_centroid, pos2(160.0, 100.0));
+    assert_eq!(navigation.pan_delta(), vec2(12.0, 0.0));
 }
 
 #[test]
@@ -622,6 +629,345 @@ fn focus_loss_drops_claims_and_cancels_the_selection() {
     assert_eq!(output.selection.and_then(|selection| selection.end), Some(TouchSelectionEnd::Cancelled));
     let (_, result) = bench.step(Vec::new(), LONG_PRESS_ARM_S + 0.3);
     assert_eq!(result.owners, Vec::new());
+}
+
+// ---------------------------------------------------------------------------------------
+// Axis lock
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn axis_classification_honours_the_tolerance_edges() {
+    let edge = 100.0 * AXIS_LOCK_TAN;
+    for (delta, expected) in [
+        (vec2(0.0, 30.0), PanAxis::Vertical),
+        (vec2(0.0, -30.0), PanAxis::Vertical),
+        (vec2(30.0, 0.0), PanAxis::Horizontal),
+        (vec2(-30.0, 0.0), PanAxis::Horizontal),
+        // Exactly on the 22.5° line still locks; just past it is free.
+        (vec2(edge, 100.0), PanAxis::Vertical),
+        (vec2(-edge, -100.0), PanAxis::Vertical),
+        (vec2(edge + 0.5, 100.0), PanAxis::Free),
+        (vec2(100.0, edge), PanAxis::Horizontal),
+        (vec2(-100.0, edge), PanAxis::Horizontal),
+        (vec2(100.0, edge + 0.5), PanAxis::Free),
+        (vec2(10.0, 10.0), PanAxis::Free),
+        (vec2(-10.0, 7.0), PanAxis::Free),
+    ] {
+        assert_eq!(classify_axis(delta), expected, "{delta:?}");
+    }
+    assert_close(AXIS_LOCK_TAN, 22.5_f32.to_radians().tan());
+}
+
+#[test]
+fn lone_finger_waits_for_the_decision_then_catches_up_along_the_axis() {
+    let mut bench = Bench::new();
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    // Beyond the slop but short of the decision distance: the page does not move yet.
+    let output = bench.output(owning_move(1, pos2(107.0, 102.0)), 0.02);
+    assert!(start.distance(pos2(107.0, 102.0)) < AXIS_LOCK_DECIDE_PT);
+    assert_eq!(output.navigation, None);
+    // Decided horizontal: the whole horizontal distance from the start, no vertical drift.
+    let navigation = bench.output(owning_move(1, pos2(112.0, 103.0)), 0.04).navigation.expect("pan");
+    assert_eq!(navigation.prev_centroid, start);
+    assert_eq!(navigation.pan_delta(), vec2(12.0, 0.0));
+    // Sticky: later vertical drift never pans, even a large one.
+    let navigation = bench.output(owning_move(1, pos2(120.0, 115.0)), 0.06).navigation.expect("pan");
+    assert_eq!(navigation.pan_delta(), vec2(8.0, 0.0));
+    let output = bench.output(owning_move(1, pos2(120.0, 190.0)), 0.08);
+    assert_eq!(output.navigation, None, "a locked horizontal pan ignores a vertical move");
+}
+
+#[test]
+fn vertical_and_diagonal_decisions() {
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(100.0, 100.0)), 0.0);
+    let navigation = bench.output(owning_move(1, pos2(103.0, 120.0)), 0.02).navigation.expect("pan");
+    assert_eq!(navigation.pan_delta(), vec2(0.0, 20.0));
+
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(100.0, 100.0)), 0.0);
+    let navigation = bench.output(owning_move(1, pos2(110.0, 110.0)), 0.02).navigation.expect("pan");
+    assert_eq!(navigation.pan_delta(), vec2(10.0, 10.0), "a diagonal move pans both axes");
+    let navigation = bench.output(owning_move(1, pos2(130.0, 112.0)), 0.04).navigation.expect("pan");
+    assert_eq!(navigation.pan_delta(), vec2(20.0, 2.0), "free stays free");
+}
+
+#[test]
+fn second_finger_makes_the_pan_free() {
+    // Locked first, then a second finger: both axes pan from then on.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(100.0, 100.0)), 0.0);
+    let (_, _) = bench.step(owning_move(1, pos2(120.0, 100.0)), 0.02);
+    let (_, _) = bench.step(bare(2, TouchPhase::Start, pos2(200.0, 100.0)), 0.04);
+    let navigation = bench
+        .output(concat(vec![owning_move(1, pos2(123.0, 105.0)), bare(2, TouchPhase::Move, pos2(203.0, 105.0))]), 0.06)
+        .navigation
+        .expect("two-finger pan");
+    assert_eq!(navigation.pan_delta(), vec2(3.0, 5.0));
+    // Finger 2 lifts: finger 1 stays free for the rest of the gesture.
+    let (_, _) = bench.step(bare(2, TouchPhase::End, pos2(203.0, 105.0)), 0.08);
+    let navigation = bench.output(owning_move(1, pos2(125.0, 115.0)), 0.1).navigation.expect("pan");
+    assert_eq!(navigation.pan_delta(), vec2(2.0, 10.0));
+
+    // Undecided when the second finger lands: it catches up from the start, unprojected.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(100.0, 100.0)), 0.0);
+    let (_, _) = bench.step(owning_move(1, pos2(107.0, 101.0)), 0.02);
+    let navigation = bench.output(bare(2, TouchPhase::Start, pos2(200.0, 100.0)), 0.04).navigation.expect("catch-up");
+    assert_eq!(navigation.pan_delta(), vec2(7.0, 1.0));
+    assert_eq!(navigation.touches, 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// Fling
+// ---------------------------------------------------------------------------------------
+
+/// Frame interval of the fling tests, seconds.
+const FRAME_S: f64 = 0.01;
+
+/// Drags finger 1 from `start` by `step` per frame for `frames` frames (one frame per
+/// `FRAME_S`, starting at `t0`) and lifts it one frame later, still moving. Returns the lift
+/// frame's result and its time.
+fn throw(bench: &mut Bench, start: Pos2, step: egui::Vec2, frames: u32, t0: f64) -> (RouteResult, f64) {
+    let (_, _) = bench.step(owning_start(1, start), t0);
+    let mut pos = start;
+    let mut now = t0;
+    for _ in 0..frames {
+        pos += step;
+        now += FRAME_S;
+        let (_, _) = bench.step(owning_move(1, pos), now);
+    }
+    now += FRAME_S;
+    let (_, result) = bench.step(owning_end(1, pos + step, pos), now);
+    (result, now)
+}
+
+#[test]
+fn locked_lift_flings_with_egui_kinetic_law() {
+    let mut bench = Bench::new();
+    // 6 pt per 10 ms = 600 pt/s horizontally, with a vertical drift the lock discards.
+    let (result, lift) = throw(&mut bench, pos2(50.0, 100.0), vec2(6.0, 0.5), 20, 0.0);
+    assert_eq!(result.next_deadline(), Some(lift), "the lift frame asks for the next frame at once");
+    let mut speed = 600.0_f32;
+    let mut total = 0.0_f32;
+    let mut now = lift;
+    let mut steps = 0_u32;
+    loop {
+        now += FRAME_S;
+        let (_, result) = bench.step(Vec::new(), now);
+        let Some(navigation) = result.output(owner()).navigation else {
+            assert_eq!(result.next_deadline(), None, "a finished glide requests nothing");
+            break;
+        };
+        steps += 1;
+        assert_eq!(navigation.touches, 0, "a kinetic frame has no touches");
+        assert_eq!(navigation.prev_centroid, pos2(176.0, 110.5), "anchored at the lift point");
+        assert_close(navigation.zoom_factor, 1.0);
+        assert_eq!(navigation.pan_delta().y, 0.0, "the glide follows the lock");
+        assert_eq!(result.next_deadline(), Some(now));
+        // egui's step (`scroll_area.rs:866-877`): v -= friction * dt, then move by v * dt.
+        speed -= FLING_FRICTION_PT_S2 * 0.01;
+        if steps <= 2 {
+            assert!((navigation.pan_delta().x - speed * 0.01).abs() < 0.01, "step {steps}: {navigation:?}");
+        }
+        total += navigation.pan_delta().x;
+        assert!(steps < 200, "the glide must stop");
+    }
+    // 600 pt/s minus 10 per step, stopping under 20 pt/s: about 59 steps and 177 pt.
+    assert!((58..=60).contains(&steps), "steps {steps}");
+    assert!((total - 177.0).abs() < 7.0, "total {total}");
+    assert!(speed < FLING_STOP_SPEED_PT_S * 2.0);
+}
+
+#[test]
+fn fling_steps_are_clamped_to_the_max_dt() {
+    let mut bench = Bench::new();
+    let (_, lift) = throw(&mut bench, pos2(50.0, 100.0), vec2(0.0, 6.0), 20, 0.0);
+    // A stalled frame (1 s) integrates at most `FLING_MAX_DT_S`.
+    let navigation = bench.output(Vec::new(), lift + 1.0).navigation.expect("glide");
+    let dt = FLING_MAX_DT_S;
+    let expected = (600.0 - FLING_FRICTION_PT_S2 * dt) * dt;
+    assert!((navigation.pan_delta().y - expected).abs() < 0.1, "{navigation:?}");
+    assert_eq!(navigation.pan_delta().x, 0.0);
+}
+
+#[test]
+fn diagonal_or_two_finger_lifts_never_fling() {
+    let mut bench = Bench::new();
+    let (result, lift) = throw(&mut bench, pos2(50.0, 50.0), vec2(6.0, 6.0), 20, 0.0);
+    assert_eq!(result.next_deadline(), None);
+    assert_eq!(bench.output(Vec::new(), lift + FRAME_S), TouchOutput::default());
+
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(concat(vec![owning_start(1, pos2(50.0, 100.0)), bare(2, TouchPhase::Start, pos2(50.0, 200.0))]), 0.0);
+    let mut now = 0.0;
+    for frame in 1..=10_u8 {
+        now += FRAME_S;
+        let x = 50.0 + 6.0 * f32::from(frame);
+        let (_, _) = bench.step(concat(vec![owning_move(1, pos2(x, 100.0)), bare(2, TouchPhase::Move, pos2(x, 200.0))]), now);
+    }
+    now += FRAME_S;
+    let (_, result) = bench.step(concat(vec![owning_end(1, pos2(116.0, 100.0), pos2(110.0, 100.0)), bare(2, TouchPhase::End, pos2(116.0, 200.0))]), now);
+    assert_eq!(result.next_deadline(), None);
+    assert_eq!(bench.output(Vec::new(), now + FRAME_S), TouchOutput::default());
+}
+
+#[test]
+fn a_finger_that_rested_before_lifting_does_not_fling() {
+    // Frames kept running while it rested (the per-frame samples age the motion out).
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(50.0, 100.0)), 0.0);
+    let mut now = 0.0;
+    let mut pos = pos2(50.0, 100.0);
+    for _ in 0..10 {
+        now += FRAME_S;
+        pos += vec2(6.0, 0.0);
+        let (_, _) = bench.step(owning_move(1, pos), now);
+    }
+    for _ in 0..20 {
+        now += FRAME_S;
+        let (_, _) = bench.step(Vec::new(), now);
+    }
+    now += FRAME_S;
+    let (_, result) = bench.step(owning_end(1, pos, pos), now);
+    assert_eq!(result.next_deadline(), None);
+    assert_eq!(bench.output(Vec::new(), now + FRAME_S).navigation, None);
+
+    // No frame ran while it rested: the lift still finds too few recent samples.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, pos2(50.0, 100.0)), 0.0);
+    let (_, _) = bench.step(owning_move(1, pos2(80.0, 100.0)), 0.01);
+    let (_, _) = bench.step(owning_move(1, pos2(110.0, 100.0)), 0.02);
+    let (_, result) = bench.step(owning_end(1, pos2(110.0, 100.0), pos2(110.0, 100.0)), 0.5);
+    assert_eq!(result.next_deadline(), None);
+    assert_eq!(bench.output(Vec::new(), 0.51).navigation, None);
+}
+
+/// Starts a horizontal glide and returns the lift time.
+fn gliding_bench() -> (Bench, f64) {
+    let mut bench = Bench::new();
+    let (_, lift) = throw(&mut bench, pos2(50.0, 100.0), vec2(6.0, 0.0), 20, 0.0);
+    let navigation = bench.output(Vec::new(), lift + FRAME_S).navigation;
+    assert!(navigation.is_some(), "the glide runs");
+    (bench, lift + FRAME_S)
+}
+
+#[test]
+fn every_cancel_cause_stops_the_fling() {
+    let wheel = Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: vec2(0.0, -3.0), phase: TouchPhase::Move, modifiers: Modifiers::NONE };
+    for (name, events) in [
+        ("mouse or pen press", vec![button(pos2(380.0, 20.0), PointerButton::Primary, true)]),
+        ("wheel", vec![wheel]),
+        ("pinch zoom event", vec![Event::Zoom(1.1)]),
+        ("focus loss", vec![Event::WindowFocused(false)]),
+    ] {
+        let (mut bench, now) = gliding_bench();
+        let (_, result) = bench.step(events, now + FRAME_S);
+        assert_eq!(result.output(owner()).navigation, None, "{name}");
+        assert_eq!(result.next_deadline(), None, "{name}");
+        assert_eq!(bench.output(Vec::new(), now + 2.0 * FRAME_S).navigation, None, "{name}: stays stopped");
+    }
+
+    // The canvas stopped publishing (tab switched): gone, and it does not resume.
+    let (mut bench, now) = gliding_bench();
+    let surfaces = std::mem::take(&mut bench.surfaces);
+    assert_eq!(bench.output(Vec::new(), now + FRAME_S).navigation, None);
+    bench.surfaces = surfaces;
+    assert_eq!(bench.output(Vec::new(), now + 2.0 * FRAME_S).navigation, None);
+
+    // Gestures switched off: the switch applies at once (a glide holds no claim) and resets it.
+    let (mut bench, now) = gliding_bench();
+    bench.router.set_enabled(false);
+    assert_eq!(bench.router.apply_requested(), Some(false));
+    bench.router.set_enabled(true);
+    assert_eq!(bench.router.apply_requested(), Some(true));
+    assert_eq!(bench.output(Vec::new(), now + FRAME_S).navigation, None);
+}
+
+#[test]
+fn a_touch_on_the_canvas_catches_the_fling_without_tapping() {
+    let (mut bench, now) = gliding_bench();
+    let catch = pos2(200.0, 200.0);
+    let (_, result) = bench.step(owning_start(2, catch), now + FRAME_S);
+    assert_eq!(result.output(owner()).navigation, None, "the catching finger stops the glide");
+    let output = bench.output(owning_end(2, catch, catch), now + 2.0 * FRAME_S);
+    assert_eq!(output.tap_at, None, "stopping a glide is not a tap");
+    assert_eq!(output.navigation, None);
+    // The next lone tap is a tap again.
+    let (_, _) = bench.step(owning_start(3, catch), now + 0.5);
+    assert_eq!(bench.output(owning_end(3, catch, catch), now + 0.55).tap_at, Some(catch));
+
+    // A touch outside the canvas (a panel) leaves the glide running.
+    let (mut bench, now) = gliding_bench();
+    let outside = pos2(600.0, 100.0);
+    let output = bench.output(owning_start(2, outside), now + FRAME_S);
+    assert!(output.navigation.is_some(), "an unclaimed touch does not stop the glide");
+}
+
+// ---------------------------------------------------------------------------------------
+// Tap
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn short_still_lone_touch_is_a_tap_at_its_press_point() {
+    let mut bench = Bench::new();
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(owning_move(1, pos2(103.0, 102.0)), 0.05);
+    let output = bench.output(owning_end(1, pos2(104.0, 102.0), pos2(103.0, 102.0)), 0.1);
+    assert_eq!(output.tap_at, Some(start));
+    assert_eq!(output.navigation, None);
+    assert_eq!(output.long_press_at, None);
+    // Reported on the lift frame only.
+    assert_eq!(bench.output(Vec::new(), 0.15), TouchOutput::default());
+    // A whole tap within one frame counts too.
+    let output = bench.output(concat(vec![owning_start(2, start), owning_end(2, start, start)]), 0.2);
+    assert_eq!(output.tap_at, Some(start));
+}
+
+#[test]
+fn pans_long_presses_and_interrupted_touches_are_not_taps() {
+    let start = pos2(100.0, 100.0);
+    // Moved beyond the slop and back.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(owning_move(1, pos2(120.0, 100.0)), 0.05);
+    assert_eq!(bench.output(owning_end(1, start, start), 0.1).tap_at, None, "pan");
+    // Lifted beyond the slop in the lift event itself.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    assert_eq!(bench.output(owning_end(1, pos2(110.0, 100.0), start), 0.05).tap_at, None, "lift beyond the slop");
+    // Armed: the menu, not a tap.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(Vec::new(), LONG_PRESS_ARM_S);
+    let output = bench.output(owning_end(1, start, start), LONG_PRESS_ARM_S + 0.1);
+    assert_eq!((output.tap_at, output.long_press_at), (None, Some(start)), "long-press");
+    // Held past the arm time with no frame in between: neither.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    assert_eq!(bench.output(owning_end(1, start, start), LONG_PRESS_ARM_S + 0.1).tap_at, None, "late lift");
+    // Cancelled by the platform.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    assert_eq!(bench.output(owning_cancel(1, start), 0.05).tap_at, None, "cancel");
+    // A second finger.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(bare(2, TouchPhase::Start, pos2(200.0, 100.0)), 0.02);
+    let output = bench.output(concat(vec![owning_end(1, start, start), bare(2, TouchPhase::End, pos2(200.0, 100.0))]), 0.05);
+    assert_eq!(output.tap_at, None, "two fingers");
+    // A pen held while the finger taps (palm).
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(vec![button(pos2(380.0, 20.0), PointerButton::Primary, true)], 0.0);
+    let (_, _) = bench.step(bare(1, TouchPhase::Start, start), 0.01);
+    assert_eq!(bench.output(bare(1, TouchPhase::End, start), 0.05).tap_at, None, "palm");
+    // A pen pressed during the touch.
+    let mut bench = Bench::new();
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    let (_, _) = bench.step(vec![button(pos2(380.0, 20.0), PointerButton::Primary, true)], 0.02);
+    assert_eq!(bench.output(owning_end(1, start, start), 0.05).tap_at, None, "pen press during the touch");
 }
 
 // ---------------------------------------------------------------------------------------

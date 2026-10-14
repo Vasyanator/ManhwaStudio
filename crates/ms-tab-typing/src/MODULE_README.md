@@ -435,7 +435,9 @@ saving, and export.
     `create_selection`, marked `touch`; lift commits through `finish_create_selection`, cancel
     drops it). `tab.rs` sets `CanvasView::set_long_press_selection` before `canvas.draw` with the
     same gates the overlay hook applies (`touch_create_selection_available`, mask panel closed,
-    layout editor not editing) — the hook itself only gets `&CanvasView`.
+    layout editor not editing) — the hook itself only gets `&CanvasView`. A finger tap outside
+    the open create editor (`CanvasView::touch_tap`) commits it like a mouse click outside
+    (`create_editor_commit_requested`); no other typing action reacts to a tap.
   - `selection_rasters.rs`: overlay/raster selection, remove, text-layer duplication
     (`duplicate_overlay`), raster interact/menu/transform/deform and
     the NON-move raster drags (rotate, perspective corner handle) — a whole-layer move belongs to

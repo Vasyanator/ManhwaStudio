@@ -14,11 +14,14 @@ Main responsibilities:
   its `Touch` event), plus platform-promoted copies near it (proximity rule);
 - run the per-touch gesture state machine (pending long-press, pan, armed, selection,
   spent) and compute pan / pinch per owner;
+- lock a one-finger pan to one axis (or none) and run the kinetic fling after its lift;
+- report a tap (a short, still, lone touch) to its owner;
 - hand the result to `mod.rs` for take-once delivery.
 
 Key structures:
 - `TouchRouter`: claims keyed by `(TouchDeviceId, TouchId)`, mouse/pen buttons held,
-  promoted presses stripped, recently ended claim positions.
+  promoted presses stripped, recently ended claim positions, running flings.
+- `PanAxis`: the axis lock of a one-finger pan; `Fling`: one owner's kinetic glide.
 - `RouterConfig`, `RouteResult`, `OwnerResult`: the pure core's input and output.
 
 Key functions:
@@ -41,13 +44,21 @@ carry the touch position; the release carries the last MOVE position, so it is m
 by variant and button only — and therefore only after the End of the touch whose Start
 was followed by the emulated press (`TouchRouter::emulating`); after any other touch an
 adjacent release is a real pen/mouse release.
+
+Axis lock and fling (one owner for both canvases, so the finger feels the same everywhere):
+a lone finger's pan does not move the page until it is `AXIS_LOCK_DECIDE_PT` from where it
+started; then `classify_axis` locks it (sticky until lift) and the page catches up the whole
+distance along the chosen axis. A second finger makes every claim of the owner free for the
+rest of the gesture. Lifting a locked lone finger starts a fling with egui's own `ScrollArea`
+kinetic law (`egui-0.36.2/src/containers/scroll_area.rs:829,859-877`), emitted as ordinary
+`TouchNavigation` frames with `touches == 0`; a free (diagonal) pan never flings.
 */
 
 use std::collections::BTreeMap;
 
 use egui::{
     Context, Event, Id, LayerId, Order, PointerButton, Popup, Pos2, RawInput, TouchDeviceId,
-    TouchId, TouchPhase, Vec2, ViewportId,
+    TouchId, TouchPhase, Vec2, ViewportId, util::History,
 };
 use ms_log::trace::cat;
 
@@ -68,6 +79,39 @@ const ADJACENT_POS_EPS_PT: f32 = 0.01;
 /// Below this mean spread (points) the previous touch layout is too degenerate to divide
 /// by, and the pinch reports no zoom for that frame.
 const MIN_PINCH_SPREAD_PT: f32 = 1.0;
+
+/// How far (points) a lone finger's pan must travel from its anchor (its press point) before
+/// its axis is decided; the page does not move before that. At least egui's default click
+/// distance (6 pt), so it never fires before the pan itself starts. Tuned value, unverified on
+/// hardware (the Galaxy Tab S9 device test decides it).
+pub(super) const AXIS_LOCK_DECIDE_PT: f32 = 10.0;
+
+/// Tolerance of the axis lock: a move is vertical when `|dx| <= |dy| * AXIS_LOCK_TAN` (within
+/// 22.5° of the vertical axis), horizontal when mirrored, and free otherwise. `tan 22.5° = √2 − 1`.
+pub(super) const AXIS_LOCK_TAN: f32 = std::f32::consts::SQRT_2 - 1.0;
+
+/// Age window of a claim's position history, seconds: egui's pointer history
+/// (`History::new(2..1000, 0.1)`, `egui-0.36.2/src/input_state/mod.rs:1079`).
+const FLING_HISTORY_S: f32 = 0.1;
+
+/// The fling velocity is measured only over at least this many samples spanning more than
+/// [`FLING_HISTORY_MIN_SPAN_S`], as egui's pointer velocity (`input_state/mod.rs:1234`).
+const FLING_HISTORY_MIN_SAMPLES: usize = 3;
+
+/// Minimal time span of the samples a fling velocity is measured over, seconds (egui's rule).
+const FLING_HISTORY_MIN_SPAN_S: f32 = 0.01;
+
+/// Below this speed (points per second, per axis) a fling stops — egui's kinetic scrolling
+/// `stop_speed` (`egui-0.36.2/src/containers/scroll_area.rs:866`).
+pub(super) const FLING_STOP_SPEED_PT_S: f32 = 20.0;
+
+/// Deceleration of a fling, points per second squared — egui's kinetic scrolling
+/// `friction_coeff` (`scroll_area.rs:867`).
+pub(super) const FLING_FRICTION_PT_S2: f32 = 1000.0;
+
+/// Longest time step one fling frame integrates, seconds — egui clamps its kinetic `dt` the
+/// same way (`scroll_area.rs:829`), so a stalled frame never throws the page far.
+pub(super) const FLING_MAX_DT_S: f32 = 0.1;
 
 /// Thresholds of one routing call.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -111,6 +155,56 @@ impl RouteResult {
     }
 }
 
+/// The axis lock of a lone finger's pan, decided once per gesture (see [`classify_axis`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PanAxis {
+    /// Only the horizontal component of the finger's motion pans.
+    Horizontal,
+    /// Only the vertical component pans.
+    Vertical,
+    /// Both components pan (a diagonal move, or two or more fingers); never flings.
+    Free,
+}
+
+impl PanAxis {
+    /// Keeps the components of `delta` this axis lets through.
+    fn project(self, delta: Vec2) -> Vec2 {
+        match self {
+            PanAxis::Horizontal => Vec2::new(delta.x, 0.0),
+            PanAxis::Vertical => Vec2::new(0.0, delta.y),
+            PanAxis::Free => delta,
+        }
+    }
+}
+
+/// Classifies a lone finger's displacement from its anchor: vertical within 22.5° of the
+/// vertical axis (`|dx| <= |dy| * AXIS_LOCK_TAN`), horizontal when mirrored, free otherwise.
+/// A zero displacement reads as vertical (the caller decides only beyond `AXIS_LOCK_DECIDE_PT`).
+pub(super) fn classify_axis(delta: Vec2) -> PanAxis {
+    let (dx, dy) = (delta.x.abs(), delta.y.abs());
+    if dx <= dy * AXIS_LOCK_TAN {
+        PanAxis::Vertical
+    } else if dy <= dx * AXIS_LOCK_TAN {
+        PanAxis::Horizontal
+    } else {
+        PanAxis::Free
+    }
+}
+
+/// One owner's kinetic glide after a locked lone finger was lifted.
+#[derive(Clone, Copy, Debug)]
+struct Fling {
+    owner: Id,
+    /// Current velocity, points per second (one component is zero: it follows the lock).
+    vel: Vec2,
+    /// The lift point (screen points), `prev_centroid` of every emitted frame. Only the delta
+    /// matters at zoom 1; a fixed point on the canvas keeps the consumers' view anchor inside
+    /// the viewport however far the glide goes.
+    pos: Pos2,
+    /// Time of the last integration step (same clock as `now`).
+    time: f64,
+}
+
 /// Gesture state of one claimed touch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -139,7 +233,7 @@ impl Phase {
 }
 
 /// One claimed touch.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Claim {
     owner: Id,
     /// The owner's `TouchSurface::long_press_selection`, refreshed from every publication of the
@@ -155,6 +249,19 @@ struct Claim {
     /// never jumps). A `Pending` touch keeps its start position here.
     nav_prev: Option<Pos2>,
     phase: Phase,
+    /// Axis lock of this touch's pan; `None` while undecided (the touch then does not navigate
+    /// and its `nav_prev` stays on `anchor`, so the decision frame catches up the whole way).
+    axis: Option<PanAxis>,
+    /// Where the axis decision is measured from: the press point, or the finger's position
+    /// when a held pen/mouse button (palm) was released.
+    anchor: Pos2,
+    /// Another claimed finger of the same owner was down at some point of this touch: free
+    /// pan, never a fling, never a tap.
+    multi: bool,
+    /// This touch stopped a running fling of its owner (a "catch" never counts as a tap).
+    stopped_fling: bool,
+    /// Recent positions (one sample per frame plus the lift), for the fling velocity.
+    samples: History<Pos2>,
 }
 
 /// Why a claim's long-press is interrupted.
@@ -178,6 +285,7 @@ struct ClaimScene<'a> {
 struct OwnerFrame {
     long_press_at: Option<Pos2>,
     selection: Option<TouchSelection>,
+    tap_at: Option<Pos2>,
 }
 
 /// Event-loop accumulator of one routing call.
@@ -226,6 +334,8 @@ pub struct TouchRouter {
     /// when the adjacent emulated press is matched, cleared at its End/Cancel. Kept across a
     /// focus loss, like egui-winit's own `pointer_touch_id`.
     emulating: Option<TouchKey>,
+    /// Running kinetic glides, at most one per owner.
+    flings: Vec<Fling>,
 }
 
 impl TouchRouter {
@@ -241,6 +351,7 @@ impl TouchRouter {
             promoted_down: Vec::new(),
             recent_ends: Vec::new(),
             emulating: None,
+            flings: Vec::new(),
         }
     }
 
@@ -265,7 +376,8 @@ impl TouchRouter {
     }
 
     /// Applies a pending [`Self::set_enabled`] request when it is safe (see there); returns the
-    /// new state when it changed. Either transition resets every gesture field.
+    /// new state when it changed. Either transition resets every gesture field (a running fling
+    /// included: it never waits for the switch).
     pub(super) fn apply_requested(&mut self) -> Option<bool> {
         if self.requested == self.enabled || (!self.requested && (!self.claims.is_empty() || !self.promoted_down.is_empty())) {
             return None;
@@ -346,6 +458,9 @@ impl TouchRouter {
                 claim.selection_mode = surface.long_press_selection;
             }
         }
+        // A fling glides only a canvas that is still on screen: an owner that published no
+        // surface last frame (tab switched, canvas hidden) loses it.
+        self.flings.retain(|fling| surfaces.iter().any(|surface| surface.owner == fling.owner));
         let mut acc = FrameAcc::default();
         let input = std::mem::take(events);
         events.reserve(input.len());
@@ -411,6 +526,11 @@ impl TouchRouter {
                     events.push(event);
                     self.on_focus_lost(&mut acc);
                 }
+                Event::MouseWheel { .. } | Event::Zoom(_) => {
+                    // The user navigates another way: a glide must not fight the wheel.
+                    self.cancel_flings("wheel");
+                    events.push(event);
+                }
                 other => events.push(other),
             }
         }
@@ -445,6 +565,19 @@ impl TouchRouter {
         for claim in self.claims.values_mut().filter(|claim| claim.owner == owner) {
             alone = false;
             interrupt(claim, Interrupt::SecondFinger, acc);
+            // Two fingers pan and pinch freely for the rest of the gesture; an undecided pan
+            // catches up from its anchor like a decided one.
+            if claim.axis.is_none() {
+                claim.nav_prev = claim.nav_prev.or(Some(claim.anchor));
+            }
+            claim.axis = Some(PanAxis::Free);
+            claim.multi = true;
+        }
+        let fling_count = self.flings.len();
+        self.flings.retain(|fling| fling.owner != owner);
+        let stopped_fling = self.flings.len() != fling_count;
+        if stopped_fling {
+            ms_log::trace_log!(cat::INPUT, "touch_nav fling stopped owner={owner:?} cause=touch");
         }
         let pending = alone && self.passthrough_down.is_empty();
         self.claims.insert(
@@ -457,6 +590,11 @@ impl TouchRouter {
                 pos,
                 nav_prev: pending.then_some(pos),
                 phase: if pending { Phase::Pending } else { Phase::Pan },
+                axis: (!alone).then_some(PanAxis::Free),
+                anchor: pos,
+                multi: !alone,
+                stopped_fling,
+                samples: History::new(2..1000, FLING_HISTORY_S),
             },
         );
         acc.dismiss_popups = true;
@@ -496,12 +634,35 @@ impl TouchRouter {
         true
     }
 
-    /// Ends (lift) or cancels a touch; a lifted armed long-press requests the menu.
+    /// Ends (lift) or cancels a touch; a lifted armed long-press requests the menu, a lifted
+    /// short still touch reports a tap, a lifted locked pan starts a fling.
     fn on_touch_end(&mut self, key: TouchKey, pos: Pos2, now: f64, cancelled: bool, cfg: RouterConfig, acc: &mut FrameAcc) {
-        let Some(claim) = self.claims.remove(&key) else {
+        let Some(mut claim) = self.claims.remove(&key) else {
             return;
         };
+        let palm = !self.passthrough_down.is_empty();
         match claim.phase {
+            Phase::Pending => {
+                // Pending already means: the owner's only claimed touch, never beyond the slop,
+                // no button held when it was claimed. The time check covers a lift that arrives
+                // before the frame that would have armed it.
+                let tap = !cancelled
+                    && !palm
+                    && !claim.multi
+                    && !claim.stopped_fling
+                    && claim.start_pos.distance(pos) <= cfg.slop_pt
+                    && now - claim.start_time < cfg.long_press_s;
+                if tap {
+                    acc.owner(claim.owner).tap_at = Some(claim.start_pos);
+                    ms_log::trace_log!(cat::INPUT, "touch_nav tap owner={:?} at={:?}", claim.owner, claim.start_pos);
+                }
+            }
+            Phase::Pan => {
+                if !cancelled && !palm && !claim.multi {
+                    claim.pos = pos;
+                    self.start_fling(&mut claim, now);
+                }
+            }
             Phase::Held => {
                 if !cancelled && claim.start_pos.distance(pos) <= cfg.slop_pt {
                     acc.owner(claim.owner).long_press_at = Some(claim.start_pos);
@@ -513,10 +674,76 @@ impl TouchRouter {
                 acc.selection(&claim, pos, false, Some(end));
                 ms_log::trace_log!(cat::INPUT, "touch_nav selection end owner={:?} end={end:?}", claim.owner);
             }
-            Phase::Pending | Phase::Pan | Phase::Spent => {}
+            Phase::Spent => {}
         }
         self.recent_ends.push((pos, now));
         ms_log::trace_log!(cat::INPUT, "touch_nav release owner={:?} cancelled={cancelled}", claim.owner);
+    }
+
+    /// Starts the fling of a lifted lone `claim` (already at its lift position) when its pan is
+    /// axis-locked and the finger was still moving: the velocity is egui's pointer-velocity rule
+    /// over the claim's samples, projected onto the locked axis. A free or undecided pan never
+    /// flings.
+    fn start_fling(&mut self, claim: &mut Claim, now: f64) {
+        let Some(axis @ (PanAxis::Horizontal | PanAxis::Vertical)) = claim.axis else {
+            return;
+        };
+        claim.samples.add(now, claim.pos);
+        claim.samples.flush(now);
+        if claim.samples.len() < FLING_HISTORY_MIN_SAMPLES || claim.samples.duration() <= FLING_HISTORY_MIN_SPAN_S {
+            return;
+        }
+        let vel = axis.project(claim.samples.velocity().unwrap_or_default());
+        if !vel.is_finite() || vel.length() < FLING_STOP_SPEED_PT_S {
+            return;
+        }
+        self.flings.retain(|fling| fling.owner != claim.owner);
+        self.flings.push(Fling { owner: claim.owner, vel, pos: claim.pos, time: now });
+        ms_log::trace_log!(cat::INPUT, "touch_nav fling start owner={:?} vel={vel:?}", claim.owner);
+    }
+
+    /// Stops every running fling (`cause` is for the trace log).
+    fn cancel_flings(&mut self, cause: &str) {
+        if !self.flings.is_empty() {
+            ms_log::trace_log!(cat::INPUT, "touch_nav fling stopped: {} fling(s), cause={cause}", self.flings.len());
+            self.flings.clear();
+        }
+    }
+
+    /// Integrates every fling up to `now` with egui's kinetic law and returns this frame's
+    /// navigation per owner; a fling that came to rest is dropped. A fling started in this very
+    /// frame (`time == now`) emits nothing yet.
+    fn step_flings(&mut self, now: f64) -> Vec<(Id, TouchNavigation)> {
+        let mut out = Vec::new();
+        self.flings.retain_mut(|fling| {
+            let elapsed = now - fling.time;
+            if elapsed <= 0.0 {
+                return true;
+            }
+            // Clamped to `0..=FLING_MAX_DT_S` first, so narrowing to f32 keeps far more precision
+            // than one frame needs (there is no lossless f64 -> f32 conversion; this one is bounded).
+            let dt = elapsed.min(f64::from(FLING_MAX_DT_S)) as f32;
+            fling.time = now;
+            let friction = FLING_FRICTION_PT_S2 * dt;
+            let mut delta = Vec2::ZERO;
+            for (vel, step) in [(&mut fling.vel.x, &mut delta.x), (&mut fling.vel.y, &mut delta.y)] {
+                if friction > vel.abs() || vel.abs() < FLING_STOP_SPEED_PT_S {
+                    *vel = 0.0;
+                } else {
+                    *vel -= friction * vel.signum();
+                    *step = *vel * dt;
+                }
+            }
+            if delta != Vec2::ZERO {
+                out.push((fling.owner, TouchNavigation { prev_centroid: fling.pos, centroid: fling.pos + delta, zoom_factor: 1.0, touches: 0 }));
+            }
+            let alive = fling.vel != Vec2::ZERO;
+            if !alive {
+                ms_log::trace_log!(cat::INPUT, "touch_nav fling end owner={:?}", fling.owner);
+            }
+            alive
+        });
+        out
     }
 
     /// Handles a mouse-button event that is NOT a touch's emulation; returns whether egui
@@ -530,6 +757,7 @@ impl TouchRouter {
             if !self.passthrough_down.contains(&button) {
                 self.passthrough_down.push(button);
             }
+            self.cancel_flings("mouse or pen press");
             for claim in self.claims.values_mut() {
                 interrupt(claim, Interrupt::PassthroughPress, acc);
             }
@@ -568,6 +796,7 @@ impl TouchRouter {
         self.claims.clear();
         self.passthrough_down.clear();
         self.promoted_down.clear();
+        self.cancel_flings("focus lost");
     }
 
     /// Arms due long-presses, builds per-owner outputs and rolls navigation positions over.
@@ -582,11 +811,24 @@ impl TouchRouter {
                 ms_log::trace_log!(cat::INPUT, "touch_nav long-press armed owner={:?} at={:?}", claim.owner, claim.start_pos);
             }
         }
+        for claim in self.claims.values_mut() {
+            // One sample per frame, as egui's pointer history: a finger that rests between
+            // events ages out of the window, so lifting it after a pause does not fling.
+            claim.samples.add(now, claim.pos);
+            if claim.phase == Phase::Pan && claim.axis.is_none() && !palm && claim.anchor.distance(claim.pos) >= AXIS_LOCK_DECIDE_PT {
+                let axis = classify_axis(claim.pos - claim.anchor);
+                claim.axis = Some(axis);
+                // Catch up the whole distance from the anchor along the chosen axis.
+                claim.nav_prev = Some(claim.anchor);
+                ms_log::trace_log!(cat::INPUT, "touch_nav pan axis owner={:?} axis={axis:?}", claim.owner);
+            }
+        }
+        let flung = self.step_flings(now);
 
         let mut owners: Vec<Id> = acc.owners.iter().map(|(owner, _)| *owner).collect();
-        for claim in self.claims.values() {
-            if !owners.contains(&claim.owner) {
-                owners.push(claim.owner);
+        for owner in self.claims.values().map(|claim| claim.owner).chain(self.flings.iter().map(|fling| fling.owner)).chain(flung.iter().map(|(owner, _)| *owner)) {
+            if !owners.contains(&owner) {
+                owners.push(owner);
             }
         }
         let mut result = RouteResult { owners: Vec::new(), dismiss_popups: acc.dismiss_popups };
@@ -601,15 +843,22 @@ impl TouchRouter {
                     end: None,
                 })
             });
+            // A claim of the owner stops its fling, so at most one of the two navigates.
+            let fling_navigation = flung.iter().find(|(id, _)| *id == owner).map(|(_, navigation)| *navigation);
             let output = TouchOutput {
-                navigation: if palm { None } else { navigation_of(mine()) },
+                navigation: if palm { None } else { navigation_of(mine()).or(fling_navigation) },
                 long_press_at: frame.long_press_at,
                 long_press_armed_at: mine().find(|claim| claim.phase == Phase::Held).map(|claim| claim.start_pos),
                 selection,
+                tap_at: frame.tap_at,
             };
+            // A gliding owner needs the very next frame (deadline = now), a pending long-press
+            // its arming time.
+            let gliding = self.flings.iter().any(|fling| fling.owner == owner).then_some(now);
             let deadline = mine()
                 .filter(|claim| claim.phase == Phase::Pending)
                 .map(|claim| claim.start_time + cfg.long_press_s)
+                .chain(gliding)
                 .reduce(f64::min);
             if output != TouchOutput::default() || deadline.is_some() {
                 result.owners.push(OwnerResult { owner, output, deadline });
@@ -617,9 +866,16 @@ impl TouchRouter {
         }
 
         // Navigating touches roll over to "frame start" for the next call; this also runs while
-        // a palm suppresses navigation, so lifting the palm never jumps.
+        // a palm suppresses navigation, so lifting the palm never jumps. An undecided pan keeps
+        // `nav_prev` on its anchor (the decision frame catches up from there); under a palm its
+        // anchor follows the finger, so the gesture is measured from where the palm lifted.
         for claim in self.claims.values_mut().filter(|claim| claim.phase == Phase::Pan) {
-            claim.nav_prev = Some(claim.pos);
+            if claim.axis.is_some() {
+                claim.nav_prev = Some(claim.pos);
+            } else if palm {
+                claim.anchor = claim.pos;
+                claim.nav_prev = Some(claim.pos);
+            }
         }
         result
     }
@@ -649,12 +905,16 @@ fn interrupt(claim: &mut Claim, cause: Interrupt, acc: &mut FrameAcc) {
     }
 }
 
-/// Pan / pinch over the navigating touches that existed at frame start and still exist.
+/// Pan / pinch over the navigating touches that existed at frame start and still exist, each
+/// projected onto its axis lock. A pan whose axis is still undecided does not navigate.
 /// `None` when nothing navigates or nothing moved.
 fn navigation_of<'a>(claims: impl Iterator<Item = &'a Claim>) -> Option<TouchNavigation> {
     let pairs: Vec<(Pos2, Pos2)> = claims
         .filter(|claim| claim.phase == Phase::Pan)
-        .filter_map(|claim| claim.nav_prev.map(|prev| (prev, claim.pos)))
+        .filter_map(|claim| {
+            let axis = claim.axis?;
+            claim.nav_prev.map(|prev| (prev, prev + axis.project(claim.pos - prev)))
+        })
         .collect();
     let count = pairs.len();
     if count == 0 {

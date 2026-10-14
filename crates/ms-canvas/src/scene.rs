@@ -242,6 +242,9 @@ pub(super) struct CanvasSceneState {
     /// Point of a finger long-press that is armed and still held (`TouchOutput::
     /// long_press_armed_at`), drawn as feedback. Set by `handle_shortcuts`.
     pub(super) touch_long_press_armed_at: Option<Pos2>,
+    /// Finger tap point of this frame (`TouchOutput::tap_at`), read by tabs through
+    /// `CanvasView::touch_tap` for dismiss/commit decisions only. Set by `handle_shortcuts`.
+    pub(super) touch_tap_at: Option<Pos2>,
     /// Screen rect of the collapsible bottom-center keyboard-shortcut hint drawn last frame, or
     /// `None` when the owning tab supplied no hint. Used to occlude canvas zoom/drag input under
     /// the hint. Reset each frame with the other per-frame scene rects.
@@ -333,6 +336,7 @@ impl Default for CanvasSceneState {
             touch_selection: None,
             touch_long_press_at: None,
             touch_long_press_armed_at: None,
+            touch_tap_at: None,
             canvas_bottom_hint_rect: None,
             canvas_hangul_keyboard_rect: None,
             bottom_hint_body_size: None,

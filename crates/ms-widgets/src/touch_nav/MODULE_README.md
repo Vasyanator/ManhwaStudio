@@ -2,8 +2,9 @@
 
 ## Purpose
 The one owner of finger input on canvases. A finger that starts on a canvas never reaches a
-tool: one finger pans, two or more pan and pinch-zoom, a long-press opens the canvas context
-menu (lifted without moving) or starts a typed selection drag (moved after arming). Ordinary UI
+tool: one finger pans (axis-locked, with a fling after the lift), two or more pan and pinch-zoom
+freely, a short still touch is reported as a tap, a long-press opens the canvas context menu
+(lifted without moving) or starts a typed selection drag (moved after arming). Ordinary UI
 (panels, menus, dialogs, bubble widgets) does not distinguish input and is left to egui. Mouse
 and pen are unchanged (Space+drag, tools, right-click menus).
 
@@ -14,7 +15,7 @@ shell raw_input_hook ──► TouchRouter::route (ROOT viewport only, before eg
    strip the claimed touch's egui-winit mouse emulation ─► gesture state machine
    store per-owner TouchOutput in ctx temp data
 canvas frame ──► publish_surface / publish_capture_layer / publish_hole (for next frame)
-             ──► take_touch_output (navigation, long_press_armed_at, long_press_at, selection)
+             ──► take_touch_output (navigation, tap_at, long_press_armed_at, long_press_at, selection)
              ──► context_menu_popup(response, long_press_at).show(..)
 ```
 - `mod.rs`: public types, constants, the publication and take-once delivery channel.
@@ -30,21 +31,40 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
   `ctx.layer_painter` on a higher order is not an `Area` and never blocks a claim
   (`Context::layer_id_at` skips layers without area state). A claim lasts until End/Cancel; a claim start closes any open popup.
 - **Pending** (sole claimed touch of its owner, no mouse/pen button held): no navigation while
-  within `InputOptions::max_click_dist` of the start. Moving beyond it pans, catching up the
-  whole distance from the start. After `LONG_PRESS_ARM_S` it **arms**
-  (`long_press_armed_at` = start, every frame while held).
+  within `InputOptions::max_click_dist` of the start. Moving beyond it starts a pan (below).
+  After `LONG_PRESS_ARM_S` it **arms** (`long_press_armed_at` = start, every frame while held).
+- **Tap**: a Pending touch lifted (not cancelled) within the click distance, before the arm
+  time, with no button held and without having stopped a fling → `tap_at` = start, lift frame
+  only. Consumers use it only for dismiss/commit decisions a mouse click outside would make.
+- **Axis lock** (lone finger): the pan does not move the page until the finger is
+  `AXIS_LOCK_DECIDE_PT` (10 pt) from its anchor (the press point; under a held pen/mouse button
+  the anchor follows the finger, so the gesture restarts where the palm lifted). Then
+  `classify_axis` decides once, sticky until lift: vertical when `|dx| <= |dy|·tan 22.5°`,
+  horizontal mirrored, free otherwise; the decision frame catches up the whole distance along
+  the chosen axis, later frames pan only that axis's component.
+- **Fling**: lifting a lone locked finger that was still moving starts a glide along its axis
+  with egui's `ScrollArea` kinetic law (velocity over a 0.1 s history, ≥3 samples spanning
+  >0.01 s; friction 1000 pt/s², stop below 20 pt/s, `dt` ≤ 0.1 s —
+  `egui-0.36.2/src/containers/scroll_area.rs:829,859-877`, `input_state/mod.rs:1079,1234`). It is
+  emitted as ordinary `TouchNavigation` frames with `touches == 0`, starting the frame after the
+  lift, each asking for the next frame at once. A free (diagonal) pan or any two-finger gesture
+  never flings. Stopped by: a new claimed touch of that owner (which is then never a tap), a
+  mouse/pen press, a wheel or `Zoom` event, focus loss, gestures switched off, the owner not
+  publishing its surface.
 - **Armed, lifted within the slop** → `long_press_at` = start (open the menu there).
 - **Armed, moved beyond the slop** → `TouchSelection` from the start point (`began` on its first
   frame, `end` Released on lift); when the surface has `long_press_selection == false` the drag
   pans instead. The flag is re-read from every publication of the owner until the drag starts
   (not only at claim), so a mode that ended while the finger rested makes the drag pan; once
   selecting, the drag stays a selection until lift or cancel.
-- **Second claimed finger of the same owner**: before arming → both pan/pinch; after arming →
+- **Second claimed finger of the same owner**: every claim of the owner becomes a free pan for the
+  rest of the gesture (an undecided one catches up from its anchor); before arming → both
+  pan/pinch; after arming →
   the long-press (or selection, `end` Cancelled) is cancelled and the first finger is spent
   (never navigates again); the second finger pans alone.
 - **Mouse/pen button held** (a press that is not a touch's emulation): no navigation, no
   long-press; a press cancels a pending/armed long-press or a selection.
-- **Focus loss** drops every claim (a running selection reports Cancelled).
+- **Focus loss** drops every claim (a running selection reports Cancelled) and stops every fling.
 
 ## Contracts and invariants
 - Pairing: a release is removed only when its press never reached egui (stripped, or never
@@ -88,13 +108,17 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
   the reverse order. The app does not enable it.
 - A touch whose End/Cancel never arrives stays claimed until a focus loss or a new Start with the
   same id; a pending switch-off waits for it too.
-- `LONG_PRESS_ARM_S` is a tuned value awaiting the device test; haptic feedback is not provided.
+- `LONG_PRESS_ARM_S` and `AXIS_LOCK_DECIDE_PT` are tuned values awaiting the device test; haptic
+  feedback is not provided.
+- The fling starts one frame after the lift (egui's own `ScrollArea` integrates its first step in
+  the release frame); the lift frame's last finger movement, like every lifted finger's, is not
+  applied.
 - The drag mode is last frame's publication: a mode that ends in the very frame the drag starts
   still yields a selection the owner may refuse (no "refused" back-channel); the finger then
   neither pans nor selects until lifted.
 
 ## Editing map
-- Claim / strip / state machine / navigation math → `router.rs`.
+- Claim / strip / state machine / navigation math / axis lock / fling / tap → `router.rs`.
 - New output field or publication → `mod.rs` (`TouchOutput`, `TouchSurface`) + `router.rs`
   `finish_frame`.
 - Context-menu open path → `menu.rs`.
