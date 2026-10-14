@@ -127,6 +127,14 @@ that defines the type.
   `auto`; the old key is always removed, an existing new key wins) and runs in
   `load_user_config` BEFORE the defaults backfill; the reader maps an unmigrated legacy key the
   same way. Applied to the forked winit by `ms_window_geometry` (Android only).
+- `touch_gestures.rs`: the touchscreen-gestures switch `General.touch_gestures` (frozen key, a
+  JSON boolean): whether canvas finger gestures (`ms_widgets::touch_nav`) run. Default per host
+  (`default_for(WindowHost)`: on for Android, off for desktop and web; `DEFAULT` goes into the
+  `General` tree), pure reader `touch_gestures_from_user_settings` (absent or non-boolean ->
+  `DEFAULT`), process-global live value (`current` / `set` / `seed_from_user_settings`, seeded
+  in `run_main`, edited by the shared General pane) and `effective(available, setting)` /
+  `enabled_with(available)`. The platform capability stays `ms_platform::PlatformFeature::
+  CanvasTouchGestures` (this crate does not depend on `ms-platform`): the caller passes it in.
 - `single_image.rs`: the image-set (single-image) editing mode's shared names — `INPUT_FILE_TYPES`
   (the ONE readable-input table: extensions + MIME; consumed by the launcher picker, the Linux
   desktop entry, the Windows "Open with" registration and the CLI error text), the soft size

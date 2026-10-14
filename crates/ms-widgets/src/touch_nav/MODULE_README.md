@@ -70,6 +70,12 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
   is ROOT between root passes only while the app has no deferred viewports (it shows immediate
   ones only).
 - `owner` ids are content-named (stable across `MangaApp` rebuilds in one `egui::Context`).
+- On/off is live, never by recreating the router: `TouchRouter::set_enabled` records a request
+  that `route` applies at a frame start. On applies at once from a fresh state; off waits until
+  no claim and no stripped promoted press is left, so every release whose press was stripped is
+  still stripped (a disabled router strips nothing). Either switch resets every gesture field;
+  switching off also drops undelivered outputs. The shell feeds it
+  `PlatformFeature::CanvasTouchGestures` AND the `General.touch_gestures` setting every frame.
 - Publishing is live only while an ENABLED router runs on the ROOT viewport: every routing call
   writes a ctx flag (set when enabled, removed when disabled) and `publish_*` are no-ops without
   it, because only the router's freeze step drains the lists (the wasm entry has no hook).
@@ -81,7 +87,7 @@ canvas frame ──► publish_surface / publish_capture_layer / publish_hole (f
 - egui-winit `simulate_touch_screen` (mouse posing as touch) is not supported: its events come in
   the reverse order. The app does not enable it.
 - A touch whose End/Cancel never arrives stays claimed until a focus loss or a new Start with the
-  same id.
+  same id; a pending switch-off waits for it too.
 - `LONG_PRESS_ARM_S` is a tuned value awaiting the device test; haptic feedback is not provided.
 - The drag mode is last frame's publication: a mode that ends in the very frame the drag starts
   still yields a selection the owner may refuse (no "refused" back-channel); the finger then

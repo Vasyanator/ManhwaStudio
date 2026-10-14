@@ -33,8 +33,9 @@ raises its flag and dispatched as `ShellEvent::ExternalOpen`; a target the table
 about waits in `AppShell::pending_open` (`incoming.rs` moves the data). `on_exit` is the
 process-shutdown path only (eframe ended without the shell's consent, e.g. the Android Activity
 went away): it tears a running studio down inline. Finger input on canvases is routed here, in
-`raw_input_hook`, by ONE `ms_widgets::touch_nav::TouchRouter` per window (enabled by
-`PlatformFeature::CanvasTouchGestures`), before egui builds its pointer state. Native only,
+`raw_input_hook`, by ONE `ms_widgets::touch_nav::TouchRouter` per window, before egui builds its
+pointer state; it is on while `PlatformFeature::CanvasTouchGestures` is available AND the
+`General.touch_gestures` setting is (`ms_config::touch_gestures`, re-read every frame). Native only,
 except `style`, which the web entry uses too.
 */
 
@@ -177,6 +178,12 @@ mod native {
         }
     }
 
+    /// Whether canvas finger gestures run now: the platform capability AND the live
+    /// `General.touch_gestures` setting (a relaxed atomic read, cheap enough for every frame).
+    fn touch_gestures_enabled() -> bool {
+        ms_config::touch_gestures::enabled_with(PlatformFeature::CanvasTouchGestures.is_available())
+    }
+
     /// The launcher screen's window title.
     fn launcher_title(test_mode: bool) -> &'static str {
         if test_mode { TEST_LAUNCHER_TITLE } else { LAUNCHER_TITLE }
@@ -246,8 +253,9 @@ mod native {
         /// A localized incoming-images error shown in a small window until dismissed.
         incoming_error: Option<String>,
         /// The canvas finger router, fed by `raw_input_hook`. One per window (its claims span
-        /// frames and every screen); disabled where `CanvasTouchGestures` is unavailable, where
-        /// it only drops the per-frame surface publications.
+        /// frames and every screen); off where `CanvasTouchGestures` is unavailable or the
+        /// user turned `General.touch_gestures` off, and then it only drops the per-frame
+        /// surface publications. Toggled live, never recreated (`TouchRouter::set_enabled`).
         touch_router: TouchRouter,
     }
 
@@ -293,7 +301,7 @@ mod native {
                 incoming_take: None,
                 incoming_take_unavailable: false,
                 incoming_error,
-                touch_router: TouchRouter::new(PlatformFeature::CanvasTouchGestures.is_available()),
+                touch_router: TouchRouter::new(touch_gestures_enabled()),
             };
             let effect = match initial {
                 InitialScreen::Launcher => Effect::PrepareLauncher,
@@ -747,6 +755,9 @@ mod native {
         /// touches lose their mouse emulation and become navigation / long-press outputs that the
         /// canvases take this frame. Child viewports pass through untouched (the router checks).
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+            // The General settings pane flips the live setting; the router applies a change at
+            // a safe frame start (never in the middle of a claimed gesture).
+            self.touch_router.set_enabled(touch_gestures_enabled());
             self.touch_router.route(ctx, raw_input);
         }
 

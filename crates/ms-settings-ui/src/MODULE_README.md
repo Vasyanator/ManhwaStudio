@@ -64,7 +64,9 @@ dependency list.
   `ms_docstore::default_format()`; web builds show an explanation only (Dev-only store).
 - `general_settings_panel.rs`: projects root, storage mode, memory profile, UI language, UI scale,
   autosave policy (interval + action threshold, live in `ms_config::autosave_policy`), typesetting
-  language, startup monitor. Also owns the process-wide UI-scale slot
+  language, startup monitor, secondary windows, the touchscreen-gestures switch
+  (`General.touch_gestures`, applied live to `ms_config::touch_gestures`; the row is drawn only
+  where `PlatformFeature::CanvasTouchGestures` is available). Also owns the process-wide UI-scale slot
   (`ui_scale_percent` / `apply_ui_scale`) the main window's creator applies once (launcher and
   studio share its `Context`, so a change rescales both), and
   the locale-catalog helpers the launcher's first-run language modal reuses. Its projects-root

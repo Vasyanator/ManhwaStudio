@@ -35,6 +35,8 @@ Main items:
 - `SecondaryWindows` / `WindowMode` / `WindowHost` (module `secondary_windows`): where
   secondary windows open (`auto` / `separate` / `embedded`) under `General.secondary_windows`,
   its per-platform resolution and the process-global live value.
+- `touch_gestures` (module): the touchscreen-gestures switch `General.touch_gestures` (boolean,
+  per-host default), its process-global live value and its combination with the capability.
 - `ui_scale_percent_from_user_settings` / `clamp_ui_scale_percent` / `ui_scale_factor_from_percent`:
   global interface scale (`General.ui_scale_percent`) and its conversion to the egui zoom factor.
 - `autosave_policy_from_user_settings`: the clamped autosave interval / action threshold
@@ -94,6 +96,13 @@ pub use storage_mode::{GENERAL_STORAGE_MODE_KEY, StorageMode, storage_mode_from_
 // applies it to the forked winit on Android) already depend on this crate.
 pub mod secondary_windows;
 pub use secondary_windows::{GENERAL_SECONDARY_WINDOWS_KEY, SecondaryWindows, WindowHost, WindowMode, secondary_windows_from_user_settings};
+
+// The touchscreen-gestures setting (`General.touch_gestures`): whether canvas finger
+// gestures run. It lives here because its key and per-host default are part of the `General`
+// tree, its seeder (the binary) and editor (the shared general-settings pane) already depend
+// on this crate, and its default follows `secondary_windows::WindowHost`.
+pub mod touch_gestures;
+pub use touch_gestures::{GENERAL_TOUCH_GESTURES_KEY, touch_gestures_from_user_settings};
 
 // Single-image editing mode: the readable input-type table, the scratch-root resolver and
 // the `SingleImage` section of `user_config`. It lives here because the table is pure data
@@ -1455,6 +1464,8 @@ pub fn user_config_defaults() -> Value {
             "memory_profile": MemoryProfile::default().as_config_str(),
             "storage_mode": StorageMode::default().as_config_str(),
             "secondary_windows": SecondaryWindows::default().as_config_str(),
+            // Per-host default: on for Android, off for a desktop and the web.
+            "touch_gestures": touch_gestures::DEFAULT,
             "typing_panel_layout": "vertical",
             // Built above from `AppTab::key()`. Older configs may still carry the
             // legacy Russian keys next to these; see the `enabled_tabs` note in

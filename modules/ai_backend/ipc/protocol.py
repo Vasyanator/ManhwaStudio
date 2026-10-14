@@ -36,8 +36,10 @@ from __future__ import annotations
 # Rust (docstore.py / ms-docstore: `.json` or SQLite `.db`).
 # 9: General.android_native_windows replaced by General.secondary_windows
 # (user_config migration on load).
+# 10: new General.touch_gestures boolean (canvas finger gestures; per-platform
+# default).
 # ============================================================================
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 
 # ============================================================================
 # FRAME SIZE GUARDS

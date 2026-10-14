@@ -104,9 +104,11 @@ transition goes through `screen::on_event`; the shell only executes the returned
   there is no CLI target. A failed take is logged and shown once in a small window.
 - **Canvas touch routing**: the shell owns the window's ONE `ms_widgets::touch_nav::TouchRouter`
   (created once, lives across every screen) and feeds it from `raw_input_hook`, the only point
-  that sees `RawInput` before egui builds its pointer state. Enabled iff
+  that sees `RawInput` before egui builds its pointer state. On iff
   `ms_platform::PlatformFeature::CanvasTouchGestures` is available (off on Windows: pen and
-  touch are indistinguishable there). Screens only publish surfaces and take outputs; the
+  touch are indistinguishable there) AND the user setting `General.touch_gestures` is on
+  (`ms_config::touch_gestures`, re-read every frame and handed to `TouchRouter::set_enabled`,
+  which switches at a safe frame start; the router is never recreated). Screens only publish surfaces and take outputs; the
   launcher publishes none, so it is unaffected.
 - Android: one `run_native`; the fork's secondary-window policy is set before it and re-synced at
   creation and every switch. Nothing here relies on the winit fork re-emitting `Resumed` for a
@@ -126,7 +128,7 @@ transition goes through `screen::on_event`; the shell only executes the returned
   `resolve_cli_images`, `run_launcher_requested_update`).
 - Finger gestures on canvases: the router and its contract live in
   `crates/ms-widgets/src/touch_nav/`; the platform gate in `ms_platform` `features.rs`; the
-  shell only wires `raw_input_hook`.
+  user switch in `ms_config::touch_gestures`; the shell only wires `raw_input_hook`.
 - Images other apps hand over: where they go per screen — `screen.rs` (`ExternalOpen` rows,
   `merge_open`); taking, mapping, dropping — `incoming.rs`; `pending_open` and the polling —
   `mod.rs`; the running studio's question — `src/app/incoming_open.rs`.

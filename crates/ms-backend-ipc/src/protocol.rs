@@ -47,7 +47,8 @@ use serde_json::{Map, Value, json};
 /// A backend payload that reads/writes it differently must be refused here.
 ///
 /// 9: `General.android_native_windows` replaced by `General.secondary_windows` (migrated on load).
-pub const PROTOCOL_VERSION: u32 = 9;
+/// 10: new `General.touch_gestures` boolean (canvas finger gestures; per-platform default).
+pub const PROTOCOL_VERSION: u32 = 10;
 
 // ============================================================================
 // FRAME SIZE GUARDS

@@ -8,6 +8,7 @@ Main responsibilities:
 - pure tests of `TouchRouter::route_events` on synthetic event lists shaped exactly like
   egui-winit's touch emulation (claim, strip, pairing, pan, pinch, palm, long-press,
   selection);
+- pure and adapter tests of the live on/off request (`TouchRouter::set_enabled`);
 - headless `Context::run_ui` tests of the egui adapter (`TouchRouter::route`), of the
   background-layer fact `Context::layer_id_at` reports over bare canvas, and of
   `context_menu_popup` against egui's own `Popup::context_menu`.
@@ -624,6 +625,62 @@ fn focus_loss_drops_claims_and_cancels_the_selection() {
 }
 
 // ---------------------------------------------------------------------------------------
+// Live on/off (`set_enabled`)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn off_request_waits_until_the_claimed_gesture_ends() {
+    let mut bench = Bench::new();
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    bench.router.set_enabled(false);
+    assert_eq!(bench.router.apply_requested(), None, "a live claim keeps the router on");
+    assert!(bench.router.is_enabled());
+    // The claimed touch's emulated release is still stripped under the old rules.
+    let (out, _) = bench.step(owning_end(1, start, start), 0.1);
+    assert!(only_touch_events(&out), "the release of a stripped press must stay stripped: {out:?}");
+    assert_eq!(bench.router.apply_requested(), Some(false));
+    assert!(!bench.router.is_enabled());
+    assert_eq!(bench.router.apply_requested(), None, "an applied request is not re-applied");
+}
+
+#[test]
+fn off_request_waits_for_a_stripped_promoted_release() {
+    let mut bench = Bench::new();
+    let finger = pos2(100.0, 100.0);
+    let (_, _) = bench.step(bare(1, TouchPhase::Start, finger), 0.0);
+    let promoted = pos2(101.0, 100.0);
+    let (_, _) = bench.step(vec![button(promoted, PointerButton::Primary, true)], 0.01);
+    let (_, _) = bench.step(bare(1, TouchPhase::End, finger), 0.02);
+    bench.router.set_enabled(false);
+    assert_eq!(bench.router.apply_requested(), None, "a stripped press still waits for its release");
+    let (out, _) = bench.step(vec![button(pos2(300.0, 10.0), PointerButton::Primary, false)], 0.03);
+    assert!(out.is_empty());
+    assert_eq!(bench.router.apply_requested(), Some(false));
+}
+
+#[test]
+fn on_request_applies_at_once_and_a_cancelled_off_request_keeps_the_gesture() {
+    let mut router = TouchRouter::new(false);
+    router.set_enabled(false);
+    assert_eq!(router.apply_requested(), None);
+    router.set_enabled(true);
+    assert_eq!(router.apply_requested(), Some(true));
+    assert!(router.is_enabled());
+
+    // Off then on again before the gesture ended: nothing changes, the claim survives.
+    let mut bench = Bench::new();
+    let start = pos2(100.0, 100.0);
+    let (_, _) = bench.step(owning_start(1, start), 0.0);
+    bench.router.set_enabled(false);
+    assert_eq!(bench.router.apply_requested(), None);
+    bench.router.set_enabled(true);
+    assert_eq!(bench.router.apply_requested(), None);
+    let (out, _) = bench.step(owning_end(1, start, start), 0.1);
+    assert!(only_touch_events(&out));
+}
+
+// ---------------------------------------------------------------------------------------
 // Headless egui: adapter, layer fact, menu helper
 // ---------------------------------------------------------------------------------------
 
@@ -751,6 +808,46 @@ fn disabled_router_and_child_viewports_leave_input_untouched() {
     let mut raw = RawInput { time: Some(0.2), events: input, ..RawInput::default() };
     enabled.route(&ctx, &mut raw);
     assert!(only_touch_events(&raw.events));
+}
+
+#[test]
+fn live_toggle_through_route_switches_routing_and_publishing() {
+    let ctx = Context::default();
+    let at = pos2(100.0, 100.0);
+    let mut router = TouchRouter::new(true);
+    prime(&ctx, &mut router);
+    publish_surface(&ctx, surface(true));
+    let mut raw = RawInput { time: Some(0.1), events: owning_start(1, at), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+    assert!(only_touch_events(&raw.events), "claimed while on");
+
+    // Off while the finger is down: the gesture finishes stripped, then the router turns off.
+    router.set_enabled(false);
+    publish_surface(&ctx, surface(true));
+    let mut raw = RawInput { time: Some(0.2), events: owning_end(1, at, at), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+    assert!(only_touch_events(&raw.events), "the claimed release stays stripped");
+    assert!(router.is_enabled());
+    publish_surface(&ctx, surface(true));
+    let input = owning_start(2, at);
+    let mut raw = RawInput { time: Some(0.3), events: input.clone(), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+    assert!(!router.is_enabled());
+    assert_eq!(raw.events, input, "an off router leaves a canvas touch to egui");
+    publish_all(&ctx);
+    assert_eq!(stored_publications(&ctx), (0, 0, 0), "publishing is off with the router");
+    let mut raw = RawInput { time: Some(0.4), events: owning_end(2, at, at), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+    assert_eq!(raw.events.len(), 3, "the unclaimed release reaches egui");
+
+    // On again: the next routing call applies it; the frame after claims.
+    router.set_enabled(true);
+    prime(&ctx, &mut router);
+    assert!(router.is_enabled());
+    publish_surface(&ctx, surface(true));
+    let mut raw = RawInput { time: Some(0.5), events: owning_start(3, at), ..RawInput::default() };
+    router.route(&ctx, &mut raw);
+    assert!(only_touch_events(&raw.events), "claimed again once back on");
 }
 
 /// One empty ROOT routing call: what the shell's hook does before the first pass, so the

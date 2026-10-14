@@ -43,7 +43,8 @@ Key items:
 - `build_locale_options`: pure, filesystem-free option builder (deterministic).
 - `draw_general_settings_panel`: renders the projects-dir editor + Dev/Prod storage row
   (`storage_mode_setting`) + memory-profile combo + interface-scale slider + autosave policy +
-  primary-monitor selector + secondary-window setting (not on the web) + UI-language
+  primary-monitor selector + secondary-window setting (not on the web) + touchscreen-gestures
+  switch (only where `CanvasTouchGestures` is available) + UI-language
   selector + typesetting-language selector. With a `WarningSet` (launcher) the
   projects-dir and UI-language labels carry their inline warning badges; `None` (studio)
   draws no badge and keeps the layout unchanged.
@@ -133,6 +134,10 @@ pub struct GeneralSettingsPanelState {
     /// row is not drawn on the web); a change is applied live to
     /// `ms_config::secondary_windows` and takes effect the next time a window opens.
     pub secondary_windows: ms_config::SecondaryWindows,
+    /// Whether canvas finger gestures are on (`General.touch_gestures`). Mirrors the live
+    /// `ms_config::touch_gestures` value; the row is drawn only where
+    /// `PlatformFeature::CanvasTouchGestures` is available.
+    pub touch_gestures: bool,
     /// Status line under the projects-dir editor.
     pub status: GeneralSettingsStatus,
     /// The Dev/Prod storage row (conversion job bookkeeping of this surface).
@@ -241,6 +246,9 @@ impl GeneralSettingsPanelState {
             #[cfg(not(target_arch = "wasm32"))]
             preferred_monitor: seed_preferred_monitor(),
             secondary_windows,
+            // The live value, seeded from disk at startup: what the main window's router obeys
+            // right now, even if a persist failed earlier in the session.
+            touch_gestures: ms_config::touch_gestures::current(),
             // Filesystem scan happens once here, at construction — never per frame.
             locale_options: scan_locale_options(),
             status: GeneralSettingsStatus::Idle,
@@ -398,6 +406,13 @@ pub fn draw_general_settings_panel(
     // there; the host decision has one owner (`WindowHost::current`), not a `PlatformFeature`.
     if ms_config::WindowHost::current() != ms_config::WindowHost::Web {
         draw_secondary_windows_setting(ui, state);
+        ui.separator();
+    }
+
+    // Finger gestures exist only where the platform can route touches (not on Windows, where
+    // a pen arrives as touch, nor on the web); elsewhere the switch would do nothing.
+    if PlatformFeature::CanvasTouchGestures.is_available() {
+        draw_touch_gestures_setting(ui, state);
         ui.separator();
     }
 
@@ -647,6 +662,31 @@ fn draw_secondary_windows_setting(ui: &mut egui::Ui, state: &mut GeneralSettings
             selected.as_config_str()
         ));
         state.status = GeneralSettingsStatus::Error(t!("settings.general.secondary_windows_save_error").to_string());
+    }
+}
+
+/// Renders the touchscreen-gestures switch (`General.touch_gestures`).
+///
+/// A change is applied live to `ms_config::touch_gestures` first (the main window's router
+/// picks it up on its next frame, once no finger gesture is in progress), then persisted
+/// synchronously; a failed write keeps the live value for this session and reports the error
+/// on the status line.
+fn draw_touch_gestures_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+    let mut enabled = state.touch_gestures;
+    // A checkbox keeps no state of its own; the scope pins the row's ids against the
+    // localized label all the same (`egui-docs/05-ids-and-i18n.md`).
+    ui.push_id("settings.general.touch_gestures_label", |ui| {
+        ui.checkbox(&mut enabled, t!("settings.general.touch_gestures_label"));
+    });
+    ui.small(t!("settings.general.touch_gestures_hint"));
+    if enabled == state.touch_gestures {
+        return;
+    }
+    state.touch_gestures = enabled;
+    ms_config::touch_gestures::set(enabled);
+    if let Err(err) = persist_general_key(ms_config::GENERAL_TOUCH_GESTURES_KEY, serde_json::Value::Bool(enabled)) {
+        runtime_log::log_error(format!("[general-settings] failed to persist the touchscreen-gestures setting '{enabled}'; error={err}"));
+        state.status = GeneralSettingsStatus::Error(t!("settings.general.touch_gestures_save_error").to_string());
     }
 }
 

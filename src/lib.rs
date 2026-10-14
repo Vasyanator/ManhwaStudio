@@ -452,6 +452,9 @@ fn run_main() -> anyhow::Result<()> {
     // Seed the process-global secondary-window setting (separate OS windows vs embedded);
     // the General settings pane changes it live afterwards.
     ms_config::secondary_windows::seed_from_user_settings(&user_settings);
+    // Seed the process-global touchscreen-gestures switch the main window's router reads
+    // every frame; the General settings pane changes it live afterwards.
+    ms_config::touch_gestures::seed_from_user_settings(&user_settings);
 
     // Environment check mode terminates the process: it must never fall through into the
     // launcher, the studio, or the AI backend supervisor. `process::exit` is used instead

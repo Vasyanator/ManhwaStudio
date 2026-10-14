@@ -22,8 +22,9 @@ Key structures:
 - `RouterConfig`, `RouteResult`, `OwnerResult`: the pure core's input and output.
 
 Key functions:
-- `TouchRouter::route` (egui adapter: viewport check, freeze, thresholds, dismiss,
-  store deliveries);
+- `TouchRouter::route` (egui adapter: viewport check, pending on/off request, freeze,
+  thresholds, dismiss, store deliveries);
+- `TouchRouter::set_enabled` (live on/off request, applied at a safe frame start);
 - `TouchRouter::route_events` (pure core over an event list, unit-tested).
 
 Notes:
@@ -211,6 +212,9 @@ impl FrameAcc {
 #[derive(Debug)]
 pub struct TouchRouter {
     enabled: bool,
+    /// The state [`TouchRouter::set_enabled`] asked for; [`TouchRouter::apply_requested`]
+    /// moves `enabled` onto it at a safe frame start.
+    requested: bool,
     claims: BTreeMap<TouchKey, Claim>,
     /// Mouse / pen buttons whose press reached egui and whose release has not arrived yet.
     passthrough_down: Vec<PointerButton>,
@@ -231,6 +235,7 @@ impl TouchRouter {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            requested: enabled,
             claims: BTreeMap::new(),
             passthrough_down: Vec::new(),
             promoted_down: Vec::new(),
@@ -239,10 +244,40 @@ impl TouchRouter {
         }
     }
 
+    /// Requests the router on or off (the user's touchscreen-gestures setting), applied at the
+    /// start of a later [`Self::route`] call without recreating the router.
+    ///
+    /// Turning on applies at the next routing call, from a fresh state (no claim, no tracked
+    /// button: a touch or button already down then simply passes through, its release
+    /// included). Turning off waits until no claim and no stripped promoted press is left, so
+    /// the gesture in progress finishes under the old rules and every release whose press was
+    /// stripped is still stripped (the pairing invariant: a disabled router strips nothing, so
+    /// switching mid-gesture could hand egui an unpaired release). Idempotent; call it every
+    /// frame with the live setting.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.requested = enabled;
+    }
+
+    /// Whether the router routes right now (an off request may still be waiting).
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Applies a pending [`Self::set_enabled`] request when it is safe (see there); returns the
+    /// new state when it changed. Either transition resets every gesture field.
+    pub(super) fn apply_requested(&mut self) -> Option<bool> {
+        if self.requested == self.enabled || (!self.requested && (!self.claims.is_empty() || !self.promoted_down.is_empty())) {
+            return None;
+        }
+        *self = Self::new(self.requested);
+        Some(self.enabled)
+    }
+
     /// Routes one frame of raw input. Call it from `eframe::App::raw_input_hook`.
     ///
     /// Acts only on the ROOT viewport (the hook also runs for child viewports, whose input
-    /// carries no canvas). Freezes last frame's publications, marks publishing live (enabled
+    /// carries no canvas). Applies a pending on/off request ([`Self::set_enabled`]), freezes last frame's publications, marks publishing live (enabled
     /// router) or off (disabled), strips claimed touches' emulated mouse events from `raw.events`, closes open popups when a touch is claimed
     /// and stores this frame's per-owner outputs for [`super::take_touch_output`].
     ///
@@ -252,6 +287,14 @@ impl TouchRouter {
     pub fn route(&mut self, ctx: &Context, raw: &mut RawInput) {
         if raw.viewport_id != ViewportId::ROOT {
             return;
+        }
+        if let Some(enabled) = self.apply_requested() {
+            ms_log::runtime_log::log_info(format!("[touch_nav] canvas touch gestures {}", if enabled { "enabled" } else { "disabled" }));
+            if !enabled {
+                // A disabled router never stores deliveries again: drop the last ones so no
+                // consumer can take a stale output later.
+                store_deliveries(ctx, Vec::new());
+            }
         }
         let (surfaces, capture) = freeze_publications(ctx);
         set_router_live(ctx, self.enabled);
