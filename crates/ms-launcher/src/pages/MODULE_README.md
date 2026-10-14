@@ -31,6 +31,10 @@ state arrives.
   Restore, names the damaged files, and offers only the discard path ("Discard session and
   open" = plain Open, which deletes `{chapter}_unsaved`). Committed-tree damage stays a
   non-discardable warning. Nothing is deleted without that explicit click.
+  Intended contract: a title keeps at most ONE unsaved session. The banner names the chapter it
+  belongs to (`project_scan::find_unsaved_chapter`), and a plain Open of ANY chapter of that
+  title discards that session first, whichever chapter is selected — opening something else
+  is the user's choice to drop it. Do not narrow the discard to the selected chapter.
 - `import_page.rs`: `.mschapter` metadata read, editable target title/chapter form, archive
   extraction into the projects root, safe path validation, and optional open-after-import action.
 - `export_page.rs`: title/chapter selection, project refresh, compression preset selection, and
