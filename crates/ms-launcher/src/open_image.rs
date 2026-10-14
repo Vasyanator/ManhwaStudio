@@ -284,11 +284,11 @@ mod tests {
         }
         let [p10, sub_p2, p2, upper_p3] = files;
         let result = selection_from_files(vec![picked(&p10), picked(&sub_p2), picked(&p2), picked(&upper_p3)]);
-        // Byte order puts `P` before `p`; equal names fall back to the full path.
+        // Case-insensitive: `p2 < P3 < p10`; equal names fall back to the full path.
         let mut expected_p2 = [p2, sub_p2];
         expected_p2.sort();
         let [first_p2, second_p2] = expected_p2;
-        assert_eq!(result, ImagePickResult::Selected(vec![upper_p3, first_p2, second_p2, p10]));
+        assert_eq!(result, ImagePickResult::Selected(vec![first_p2, second_p2, upper_p3, p10]));
     }
 
     #[test]
