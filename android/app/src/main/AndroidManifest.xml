@@ -5,6 +5,9 @@
   LaunchActivity is the launcher entry: it installs the bundled runtime files into
   filesDir/ms_root (AssetInstaller) off the UI thread, then starts MainActivity, the
   GameActivity that hosts the Rust library (android.app.lib_name = the cdylib name).
+  LaunchActivity is also the Share target and the "Open with" handler for images: it copies them
+  into the inbox (platform/IncomingImages.kt) before MainActivity starts. MainActivity is
+  singleTask, so an image that arrives while the app runs reaches the running instance.
 
   configChanges: the Rust app lives as long as its Activity, so every configuration change a
   desktop-class session produces (DeX / freeform resize, rotation, density, keyboard or mouse
@@ -47,17 +50,50 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- "Open with" for image files. The MIME list is EXACTLY the readable input types of
+                 ms_config::single_image::INPUT_FILE_TYPES (the one owner); the test
+                 crates/ms-config/tests/android_manifest_mime.rs keeps the two equal. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="image/png" />
+                <data android:mimeType="image/jpeg" />
+                <data android:mimeType="image/webp" />
+                <data android:mimeType="image/bmp" />
+                <data android:mimeType="image/tiff" />
+                <data android:mimeType="image/gif" />
+                <data android:mimeType="image/x-tga" />
+                <data android:mimeType="image/qoi" />
+            </intent-filter>
+            <!-- Share sheet, one or several images. image/* on purpose: a sender's type for a
+                 mixed selection is a wildcard, and unsupported files are listed as skipped by
+                 the app instead of hiding the target. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
         </activity>
 
         <!-- Edge-to-edge is enforced (targetSdk 35): the window is never resized for the system
              bars or the keyboard. adjustResize stays because it makes Android report the
              keyboard as an ime() window inset instead of panning the window; the winit fork
              folds that inset into the safe area egui lays out in (android/README.md, "Window
-             insets"). Do NOT add windowOptOutEdgeToEdgeEnforcement. -->
+             insets"). Do NOT add windowOptOutEdgeToEdgeEnforcement.
+             singleTask: android-activity runs one GameActivity per process, so a relaunch (from
+             LaunchActivity after a share) must reach the existing instance (onNewIntent). -->
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|density|keyboard|keyboardHidden|navigation|uiMode|locale|layoutDirection|fontScale|touchscreen|colorMode"
             android:exported="false"
+            android:launchMode="singleTask"
             android:resizeableActivity="true"
             android:theme="@style/Theme.ManhwaStudio"
             android:windowSoftInputMode="adjustResize">

@@ -12,12 +12,15 @@ Main responsibilities:
   on Android (Kotlin `SafBridge`), typed `Unavailable` on wasm;
 - system clipboard reads (`clipboard`): arboard on desktop, JNI text on Android, typed
   `Unavailable` for the rest;
+- images handed over by other apps (`incoming`): the Android Share / "Open with" inbox (Kotlin
+  `IncomingImages`), "nothing incoming" on every other target;
 - the pre-window error box (`message::show_error_blocking`).
 
 Key structures:
 - PlatformFeature, Unavailable, UnavailableReason (`features.rs`)
 - file_dialog::{FileDialogRequest, PendingDialog, Picked, SaveTarget, FolderTarget}
 - clipboard::{ClipboardRgba, ClipboardError}
+- incoming::{IncomingBatch, IncomingSkip, IncomingError}
 
 Notes:
 Holds no egui types: callers turn a dialog result into UI themselves and pass a repaint
@@ -32,6 +35,7 @@ mod features;
 
 pub mod clipboard;
 pub mod file_dialog;
+pub mod incoming;
 pub mod message;
 
 // Android JNI plumbing. `saf.rs` (the pure half of the SAF bridge) is pure Rust, so it is also

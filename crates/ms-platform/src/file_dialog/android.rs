@@ -54,7 +54,7 @@ use jni::{Env, EnvUnowned, JValue, NativeMethod, Outcome, jni_sig, jni_str};
 use ms_log::runtime_log;
 
 use super::{Completion, DialogKind, DialogResult, DropGuard, FileDialogError, FileDialogRequest, FolderTarget, Picked, PickedFile, SaveTarget, mime_types_for};
-use crate::android::jni_ctx::{self, JniBridgeError};
+use crate::android::jni_ctx::{self, JniBridgeError, read_string_array};
 use crate::android::saf::{
     BridgeOutcome, PendingRegistry, PickedDocument, SAF_BRIDGE_CLASS, create_document_mime, decode_outcome, decode_tree_listing, extension_of, kind_code,
     name_with_default_extension, plan_file_copies, plan_tree_copy, sanitize_file_name, staging_file_name,
@@ -607,23 +607,6 @@ fn required_string(env: &mut Env<'_>, object: JObject<'_>) -> Result<String, Jni
     }
     let text = env.cast_local::<JString>(object)?;
     text.try_to_string(env)
-}
-
-/// Every element of a `String[]` (null array = empty, null element = empty string). Each
-/// element's local reference is deleted at once, so long listings never fill the local frame.
-fn read_string_array(env: &mut Env<'_>, array: &JObjectArray<'_, JString<'_>>) -> Result<Vec<String>, JniError> {
-    if array.is_null() {
-        return Ok(Vec::new());
-    }
-    let len = array.len(env)?;
-    let mut items = Vec::with_capacity(len);
-    for index in 0..len {
-        let element = array.get_element(env, index)?;
-        let text = if element.is_null() { String::new() } else { element.try_to_string(env)? };
-        env.delete_local_ref(element);
-        items.push(text);
-    }
-    Ok(items)
 }
 
 /// Reads the arguments of `nativeOnResult` into a typed outcome.

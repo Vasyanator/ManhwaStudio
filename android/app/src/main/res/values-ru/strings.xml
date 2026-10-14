@@ -2,4 +2,6 @@
 <resources>
     <string name="launch_installing_status">Подготовка ресурсов… %1$d из %2$d файлов</string>
     <string name="launch_install_error">Не удалось подготовить ресурсы программы.\n\n%1$s\n\nОсвободите место в памяти устройства и запустите приложение снова.</string>
+    <string name="launch_receiving_start">Получение изображений…</string>
+    <string name="launch_receiving_status">Получение изображений… %1$d из %2$d</string>
 </resources>

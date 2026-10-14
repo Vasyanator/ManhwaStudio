@@ -285,7 +285,11 @@ The main data flow is:
    Cross-tab sync: both tabs hold the shared in-memory `LayerDoc` (`set_layer_doc`), which is the
    source of truth for per-page layer MODEL state. Edits route through it (`route_to_doc`), bumping its
    monotonic `version`; each frame `maybe_reproject_from_doc_version` re-projects the current page when
-   the version advanced. (The old disk-revision counter / app bridge are gone.)
+   the version moved since THAT page was projected (`projected_doc_version`: one entry per page, set by
+   `sync_from_doc` / the adopt-only path, removed by the doc-less fallbacks of
+   `ensure_raster_layers_for_page`). The doc has ONE global version, so a single remembered version
+   would let a sync of page A mark a page B the PS tab edited meanwhile as current — B would then be
+   shown and flattened stale; per-page entries make every page re-project on its own first use.
 
    **External images are raster layers**, not overlays: the "вставить/выбрать картинку" buttons now
    route through `request_create_image_overlay` → `render_and_store_created_raster` (worker: DECODE
@@ -500,12 +504,14 @@ saving, and export.
     into its write location and `export_typing_pages` commits it on the export worker only
     after the whole output was written; a failed run is never committed, and a commit failure
     is reported like any other export failure.
-  - `flatten_to_file.rs` (native only): the single-image «Сохранить» API of `TypingTabState` —
-    `prepare_flatten_to_file` / `request_flatten_to_file` / `poll_flatten_to_file` and the typed
-    `FlattenToFileRequest` / `FlattenReadiness` / `FlattenToFileReport` / `FlattenToFileError`
-    (re-exported from `lib.rs`). One page, the project export's composite (`build_page_job` +
-    `resolve_flatten_input` + `flatten_page_rgba`), `image_encode::encode_rgba`, then
-    `ms_docstore::write_bytes_atomic` on the worker. See "FLATTEN TO FILE" under contracts.
+  - `flatten_to_file.rs` (native only): the image-set (single-image) «Сохранить» API of
+    `TypingTabState` — `prepare_flatten_to_file` / `request_flatten_to_file` / `poll_flatten_to_file`
+    and the typed `FlattenToFileRequest` / `FlattenDestination` / `FlattenReadiness` /
+    `FlattenToFileReport` / `FlattenOutcome` / `FlattenToFileError` (re-exported from `lib.rs`). One
+    page, the project export's composite (`build_page_job` + `resolve_flatten_input` +
+    `flatten_page_rgba`), its `ms_project::PixelDigest`, then (changed page, file destination)
+    `image_encode::encode_rgba` and `ms_docstore::write_bytes_atomic` on the worker. See "FLATTEN TO
+    FILE" under contracts.
   - `codec.rs`: `render_data`/`TextRenderParams` parsers and overlay storage-entry normalize/parse.
   - `helpers.rs`: selection→page resolution, bubble/area seed text (incl. the `BubbleClass::Hint`
     exclusion predicates `is_hint_bubble` / `bubble_offers_create_text_header`), doc-node runtime,
@@ -1210,19 +1216,25 @@ saving, and export.
   no-resurrect on apply, snapshot-after-materialization, and the mask-loader gate — are covered directly
   against `insert_decoded_page`, `build_export_overlay_snapshots`, and `masks_loaded_for_dir`, the exact
   steps the driver and export perform.
-- FLATTEN TO FILE (single-image mode, `tab/flatten_to_file.rs`): the app's session controller calls
-  `prepare_flatten_to_file(ctx, project)` EVERY frame, from whatever tab is active, until it returns
+- FLATTEN TO FILE (image-set / single-image mode, `tab/flatten_to_file.rs`): the app's session
+  controller saves page by page; for each page it calls
+  `prepare_flatten_to_file(ctx, project, page_idx)` EVERY frame, from whatever tab is active, until it returns
   `Ready`; it starts and drives the overlay loader, the eager migration, ONE whole-chapter layer-preload
   pass and the clip-mask loader itself, because `TypingTabState::draw` drives them only while the typing
   tab is drawn. `request_flatten_to_file` refuses with `NoSuchPage`, or with `Busy` unless the gate holds:
   the export gate `export_dispatch_ready` (pass drained, masks loaded, no save) AND chapter load settled
   AND the page resident (or the preparation's pass drained — the export's give-up semantics) AND no
   flatten / no running or deferred project export AND the projection current with the shared
-  `LayerDoc` (`doc_synced`): a page already resident is never re-read by `build_page_job`, so
-  `prepare_flatten_to_file` re-projects a PS-tab doc edit itself (`drive_doc_sync_without_draw`: polls
-  the save / create / effects / edit jobs that make `maybe_reproject_from_doc_version` back off, then
-  re-projects the canvas's current page — the single-image chapter's only one). The worker barriers the
-  layer saver, snapshots the клин like the export, flattens, encodes and writes atomically; an EXISTING
+  `LayerDoc` FOR THAT PAGE (`doc_synced` = `page_projection_current(page_idx)`): a page already
+  resident is never re-read by `build_page_job`, so `prepare_flatten_to_file` re-projects a PS-tab doc
+  edit itself (`drive_doc_sync_without_draw(ctx, page_idx)`: polls the save / create / effects / edit
+  jobs that make `maybe_reproject_from_doc_version` back off, then re-projects the flattened page, which
+  need not be the canvas's current one). The worker barriers the layer saver, snapshots the клин like
+  the export, flattens and digests the straight RGBA8 composite (`PixelDigest`, before any encoding —
+  the layout `ms_project::single_image` hashed for `opened_digest`, so an untouched page compares
+  equal). Digest equal to the request's `unchanged_if` -> `FlattenOutcome::Unchanged`, nothing encoded or
+  written; `FlattenDestination::ComposeOnly` on a changed page -> `Composed`, nothing written; otherwise
+  it encodes and writes atomically (`Written`); an EXISTING
   target is canonicalized first so a symlink survives and its permissions are re-applied (owner, ACLs
   and hard links are not kept); a failed write leaves the old file and no temp. EXPORT⇄FLATTEN mutual
   exclusion: `draw` folds `flatten_to_file_in_progress()` into the `save_busy` term the export trigger and
@@ -1485,7 +1497,7 @@ saving, and export.
   its pure page-px<->normalized conversions and the layout-gating predicate live in `tab/mesh_geometry.rs`.
 - To change persisted overlay schema parsing/normalization, edit `tab/codec.rs`.
 - To change export composition or either export pipeline, edit `tab/export.rs`.
-- To change the single-image flatten-to-file (gates, preparation, target write), edit
+- To change the image-set flatten-to-file (gates, preparation, digest skip, target write), edit
   `tab/flatten_to_file.rs`; the composite itself stays in `tab/export.rs` and the encoders in
   `image_encode.rs`.
 - To change how re-paginated pages are stitched or sliced, edit `export_repaginate.rs`; to

@@ -48,7 +48,7 @@ use crate::project::{ProjectData, SessionKind, SingleImageSession};
 use crate::runtime_log;
 use crate::tabs::typing::image_encode::{AlphaPolicy, ImageEncoding, ImageSaveFormat};
 use crate::tabs::ps_editor::PsEditorTabState;
-use crate::tabs::typing::{FlattenReadiness, FlattenToFileRequest, TypingTabState};
+use crate::tabs::typing::{FlattenDestination, FlattenOutcome, FlattenReadiness, FlattenToFileRequest, TypingTabState};
 use eframe::egui;
 use ms_platform::PlatformFeature;
 use ms_platform::file_dialog::{self, DialogKind, FileDialogError, FileDialogRequest, Picked, SaveTarget as DialogTarget};
@@ -166,7 +166,10 @@ impl SingleImageController {
         let mut step = merge_steps(deferred, self.poll_picker());
         if let Phase::Preparing { target } = self.machine.phase() {
             let target = target.clone();
-            match typing.prepare_flatten_to_file(ctx, project) {
+            // The session saves its first page; a chapter without pages has nothing to prepare, and
+            // `dispatch` refuses it with `NoPage`.
+            let readiness = project.pages.first().map_or(FlattenReadiness::Ready, |page| typing.prepare_flatten_to_file(ctx, project, page.idx));
+            match readiness {
                 FlattenReadiness::Preparing { .. } => {}
                 FlattenReadiness::Ready => {
                     // Dispatch sequence (plan WP-2.4), all cheap GUI-thread calls: push the PS editor's
@@ -185,8 +188,11 @@ impl SingleImageController {
             }
         }
         if let Some(result) = typing.poll_flatten_to_file() {
-            let result = result.map(|report| {
-                runtime_log::log_info(format!("[single_image] saved.\nTarget: {}\nBytes: {}", report.target.display(), report.bytes_written));
+            let result = result.map(|report| match report.outcome {
+                FlattenOutcome::Written { target, bytes_written } => runtime_log::log_info(format!("[single_image] saved.\nPage: {}\nTarget: {}\nBytes: {bytes_written}", report.page_idx, target.display())),
+                // Not requested by this controller (it always writes, `unchanged_if: None`); logged
+                // should a future request shape reach this path.
+                outcome @ (FlattenOutcome::Unchanged | FlattenOutcome::Composed) => runtime_log::log_warn(format!("[single_image] the flatten wrote nothing.\nPage: {}\nOutcome: {outcome:?}", report.page_idx)),
             });
             let result = result.map_err(|err| SaveError::from_flatten(&err));
             if !self.machine.writing() {
@@ -402,7 +408,8 @@ impl SingleImageController {
             return;
         };
         let encoding = ImageEncoding { format: target.format, jpeg_quality: self.machine.jpeg_quality(), alpha: AlphaPolicy::DropIfOpaque, icc_profile: self.session.first_source().icc_profile.clone() };
-        let request = FlattenToFileRequest { page_idx, target: target.path.clone(), encoding };
+        // Every save writes (no digest skip yet): the single-page behaviour is unchanged.
+        let request = FlattenToFileRequest { page_idx, destination: FlattenDestination::File(target.path.clone()), encoding, unchanged_if: None };
         match typing.request_flatten_to_file(ctx, project, request) {
             Ok(()) => self.machine.dispatched(baseline),
             // Logged by the typing tab.

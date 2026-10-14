@@ -307,7 +307,7 @@ fn favorites_error_from_store(path: &Path, err: ms_docstore::DocStoreError) -> F
         ms_docstore::DocStoreError::Serialize { cause, .. } => {
             FavoritesError::Serialize { reason: cause }
         }
-        ms_docstore::DocStoreError::Write(ms_docstore::AtomicWriteError::Rename { path, reason }) => {
+        ms_docstore::DocStoreError::Write(ms_docstore::AtomicWriteError::Rename { path, reason, .. }) => {
             FavoritesError::Rename {
                 path: path.display().to_string(),
                 reason,

@@ -150,6 +150,10 @@ pub enum AtomicWriteError {
         path: PathBuf,
         /// OS reason.
         reason: String,
+        /// Kind of the underlying I/O error (`InvalidData` for a failed read-back
+        /// validation), so a caller can tell e.g. a permission problem from a full disk
+        /// without parsing the (possibly localized) `reason`.
+        kind: std::io::ErrorKind,
     },
     /// The finished temp file could not be renamed over the target.
     #[error("cannot replace {}: {reason}", path.display())]
@@ -158,6 +162,8 @@ pub enum AtomicWriteError {
         path: PathBuf,
         /// OS reason.
         reason: String,
+        /// Kind of the underlying I/O error of the (last) rename attempt.
+        kind: std::io::ErrorKind,
     },
     /// The rename succeeded but the containing directory could not be fsynced.
     #[error("the new file is written but directory {} could not be fsynced: {reason}", dir.display())]
@@ -239,16 +245,16 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8], durability: Durability)
     }
     let temp = temp_path_for(path);
 
-    if let Err(reason) = write_temp_file(&temp, contents, durability != Durability::None) {
+    if let Err((kind, reason)) = write_temp_file(&temp, contents, durability != Durability::None) {
         // The handle is already closed (see `write_temp_file`), so this cleanup can also
         // succeed on Windows. A failed cleanup cannot mask the real error — CLAUDE.md §7.
         remove_orphan_temp(&temp);
-        return Err(AtomicWriteError::TempWrite { path: temp, reason });
+        return Err(AtomicWriteError::TempWrite { path: temp, reason, kind });
     }
 
     if let Err(err) = rename_with_retry(&temp, path) {
         remove_orphan_temp(&temp);
-        return Err(AtomicWriteError::Rename { path: path.to_path_buf(), reason: err.to_string() });
+        return Err(AtomicWriteError::Rename { path: path.to_path_buf(), reason: err.to_string(), kind: err.kind() });
     }
     record_step(path, WriteStep::Renamed);
 
@@ -338,10 +344,12 @@ pub(crate) fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
 /// The handle is
 /// dropped before this returns in every path, success or failure, so the caller may delete
 /// or rename the file immediately (both fail on an open handle under Windows).
+/// An error carries the I/O error's kind and its technical text (for
+/// `AtomicWriteError::TempWrite`).
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn write_temp_file(temp: &Path, contents: &[u8], sync: bool) -> Result<(), String> {
-    let mut file = fs::File::create(temp).map_err(|err| format!("cannot create temp file {}: {err}", temp.display()))?;
-    let result = write_and_sync(&mut file, contents, sync).map_err(|err| err.to_string());
+pub(crate) fn write_temp_file(temp: &Path, contents: &[u8], sync: bool) -> Result<(), (std::io::ErrorKind, String)> {
+    let mut file = fs::File::create(temp).map_err(|err| (err.kind(), format!("cannot create temp file {}: {err}", temp.display())))?;
+    let result = write_and_sync(&mut file, contents, sync).map_err(|err| (err.kind(), err.to_string()));
     // Explicit, not scope-implicit: "handle closed, THEN cleanup" is the contract of this
     // function rather than an accident of where a block happens to end.
     drop(file);
@@ -715,7 +723,7 @@ mod tests {
         let missing = dir.path().join("missing");
         let path = missing.join("image.png");
         let err = write_bytes_atomic(&path, b"bytes", Durability::Contents).expect_err("a missing parent must fail");
-        assert!(matches!(err, AtomicWriteError::TempWrite { .. }), "{err:?}");
+        assert!(matches!(err, AtomicWriteError::TempWrite { kind: std::io::ErrorKind::NotFound, .. }), "{err:?}");
         assert!(!missing.exists(), "the parent must not be created");
         assert!(temp_leftovers(dir.path()).is_empty());
     }
@@ -734,5 +742,29 @@ mod tests {
         assert!(path.is_dir(), "the old entry must survive");
         assert_eq!(fs::read(&marker).expect("read marker"), b"old");
         assert!(temp_leftovers(dir.path()).is_empty(), "the temp must be removed");
+    }
+
+    /// A directory the process may not write into: the error carries `PermissionDenied`, so a
+    /// caller can tell it from other failures without parsing the OS text. Skipped (with a
+    /// note) when the process can write anyway, e.g. running as root.
+    #[cfg(unix)]
+    #[test]
+    fn write_bytes_atomic_reports_permission_denied_kind() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).expect("create dir");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).expect("chmod read-only");
+        let probe = locked.join("probe");
+        if fs::write(&probe, b"x").is_ok() {
+            eprintln!("skipped: this process can write into a read-only directory (running as root?)");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod back");
+            return;
+        }
+        let result = write_bytes_atomic(&locked.join("image.png"), b"bytes", Durability::Contents);
+        // Restore write access first so the temp dir can be removed whatever the assertions do.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).expect("chmod back");
+        let err = result.expect_err("a read-only directory must refuse the write");
+        assert!(matches!(err, AtomicWriteError::TempWrite { kind: std::io::ErrorKind::PermissionDenied, .. }), "{err:?}");
     }
 }

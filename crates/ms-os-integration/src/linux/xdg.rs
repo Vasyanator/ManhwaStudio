@@ -400,6 +400,25 @@ mod tests {
         assert!(entry.contains(&format!("\nPath={}\n", repo.display())), "{entry}");
     }
 
+    /// This copy's own entry written while `Exec=` passed one file (`%f`) is rewritten at
+    /// startup to the current multi-file `%F` text.
+    #[test]
+    fn refreshes_an_own_single_file_entry_to_multi_file() {
+        let scratch = Scratch::new("refresh-single-file");
+        let ours = scratch_identity(&scratch, "ours");
+        let dirs = dirs_in(&scratch);
+        let current = linux_desktop_entry_text(&ours);
+        let exec_line = format!("\nExec={} %F\n", super::super::desktop_entry::escape_desktop_exec_arg(&ours.exe));
+        assert!(current.contains(&exec_line), "{current}");
+        let single_file = current.replace(&exec_line, &exec_line.replace(" %F\n", " %f\n"));
+        write_atomically(&dirs.entry_path(), single_file.as_bytes()).expect("seed");
+
+        let (outcome, refreshed) = run(&ours, &dirs);
+        assert_eq!(outcome, StartupOutcome::Refreshed);
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(fs::read_to_string(dirs.entry_path()).expect("entry"), current);
+    }
+
     /// A pre-key entry whose `Exec` runs this executable is adopted and gains the key.
     #[test]
     fn refreshes_a_legacy_entry_whose_exec_is_ours() {

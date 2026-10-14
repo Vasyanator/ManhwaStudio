@@ -5,4 +5,6 @@
     <string name="app_name" translatable="false">ManhwaStudio</string>
     <string name="launch_installing_status">Preparing resources… %1$d of %2$d files</string>
     <string name="launch_install_error">Could not prepare the program resources.\n\n%1$s\n\nFree some storage space and start the app again.</string>
+    <string name="launch_receiving_start">Receiving images…</string>
+    <string name="launch_receiving_status">Receiving images… %1$d of %2$d</string>
 </resources>

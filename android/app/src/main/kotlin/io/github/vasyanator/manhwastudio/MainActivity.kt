@@ -7,6 +7,7 @@
  * (android-activity, src/android_entry.rs).
  *
  * Key functions:
+ * - onNewIntent(): records the new intent only (see "Incoming images").
  * - dispatchKeyEvent(): sends physical-keyboard keys straight to the native key path.
  * - isPhysicalKeyboardKey(): which key events take that route.
  *
@@ -16,6 +17,15 @@
  * super.onCreate cannot be skipped, so the native side checks the asset stamp itself and stops
  * without touching the runtime root; this Activity then finishes and hands over to
  * LaunchActivity, which installs the assets and starts a fresh MainActivity.
+ *
+ * Incoming images: the manifest makes this Activity singleTask, so a share or "Open with" that
+ * arrives while the app runs reuses this instance (onNewIntent) in its own task instead of
+ * starting a second GameActivity (android-activity supports one per process). Activities above
+ * it in its task (an open SAF picker) are cleared; the picker then reports a cancel. The images
+ * never travel in this Activity's intent: LaunchActivity copies them into the inbox first and
+ * Rust takes them from there (platform/IncomingImages, crates/ms-platform/src/incoming/).
+ * winit's secondary-window Activities live in their own tasks (taskAffinity "") and are not
+ * affected by singleTask.
  *
  * Keyboard routing: GameActivity's GameTextInput InputConnection is the OnKeyListener of the
  * surface view. While the soft input is active (a focused text field) it consumes every
@@ -48,6 +58,16 @@ class MainActivity : GameActivity() {
             startActivity(Intent(this, LaunchActivity::class.java))
             finish()
         }
+    }
+
+    /**
+     * A singleTask re-launch (LaunchActivity after a share or "Open with"): only remembers the
+     * intent. The batch is already in the inbox and the running Rust app was woken through
+     * IncomingImages.nativeOnIncoming.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
     }
 
     /**

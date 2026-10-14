@@ -2,8 +2,9 @@
 
 ## Purpose
 GUI-free platform seams. The one owner of "does this platform offer X" (`PlatformFeature`),
-of file open/save dialogs (`file_dialog`), of system clipboard reads (`clipboard`) and of the
-pre-window native error box (`message`). The only crate that names `rfd` and `arboard`; its
+of file open/save dialogs (`file_dialog`), of system clipboard reads (`clipboard`), of images
+other apps hand over (`incoming`: Android Share / "Open with") and of the pre-window native
+error box (`message`). The only crate that names `rfd` and `arboard`; its
 Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the crate stack
 (deps: `ms-i18n`, `ms-log`); compiles for desktop, wasm32 and Android.
 
@@ -27,6 +28,32 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - **JNI** (`android/jni_ctx.rs`): `with_env` attaches the thread and passes the application
   context; `load_app_class` uses `Context.getClassLoader()` because `FindClass` on a native
   thread cannot see app classes.
+
+- **Incoming images** (`incoming/`): every function exists on every target; outside Android it
+  answers "nothing incoming". Android: see "Incoming inbox" below.
+
+## Incoming inbox (Android)
+- Owner of the layout: the Kotlin `IncomingImages` (file header there). `LaunchActivity`
+  receives VIEW / SEND / SEND_MULTIPLE, copies every document (while it still holds the read
+  grants) into `<cacheDir>/incoming/<millis>-<n>/NNNNN/<name>` and publishes the batch:
+  `batch.tsv` (ordered `f\t<path>` / `s\t<name>\t<code>\t<detail>` lines) and then the
+  `ready` marker. NOT `saf_in`: the SAF bridge purges that root on its first request.
+- Hand-off is pull-plus-wake: Kotlin calls the native `nativeOnIncoming` (bound with
+  `RegisterNatives`) only after `markNativeReady`; the native raises an `AtomicBool` and calls
+  the registered `Waker`, nothing else. The GUI polls `has_pending()` (no JNI) and runs
+  `take_pending_blocking()` on a worker, which clears the flag BEFORE asking Kotlin, so a batch
+  published meanwhile is never missed. `takePending` renames `ready` to `claimed`.
+- Cold start: `init()` once per native session on the `run_main` thread before the first
+  frame (documented exception to "no JNI on the GUI thread"): load class, bind native,
+  `markNativeReady`, `sweepClaimed` (deletes batches an earlier session claimed and unfinished
+  leftovers), `takePending`.
+- Decoding (`incoming/listing.rs`, pure): a malformed entry (field count, unknown code, path
+  outside its batch folder) fails the WHOLE take with `IncomingError::Listing` and releases
+  every batch of it; empty batches are released silently. The consumer releases a taken batch
+  with `release_batch_blocking(batch_dir)` once its files are copied into a session.
+- Wire contract (both sides change together): the class name `INCOMING_CLASS`
+  (`incoming/android.rs`), the static method signatures listed in that file's header, the
+  listing format and the skip codes `copy_failed` / `no_stream`.
 
 ## SAF bridge (Android)
 - Flow: `request` registers the `Completion` and spawns a `platform-bridge` worker. The worker
@@ -64,12 +91,19 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - `file_dialog/mime.rs`: filter -> MIME mapping for SAF. One unmapped extension widens the whole
   request to `*/*` (logged at info with the extension); callers guard their filters with a test.
 - `clipboard/{mod,desktop,android,unavailable}.rs`: clipboard API and backends.
+- `incoming/mod.rs`: the cross-target API (`IncomingBatch`, `IncomingSkip`, `IncomingSkipKind`,
+  `IncomingError`, `init`, `set_waker`, `has_pending`, `take_pending_blocking`,
+  `release_batch_blocking`) and the pending flag + waker.
+- `incoming/listing.rs`: pure decoding of the Kotlin listing and the release policy (host-tested).
+- `incoming/android.rs`: the JNI half (class load, native binding, static calls).
 - `message.rs`: `show_error_blocking` (startup only).
-- `android/`: `jni_ctx.rs` (Android only), `saf.rs` (pure SAF half, host-tested in
+- `android/`: `jni_ctx.rs` (Android only; also the shared `read_string_array`), `saf.rs` (pure SAF half, host-tested in
   `saf/tests.rs`: the bridge class name `SAF_BRIDGE_CLASS`, wire codes and decoders, the
   pending-request registry, staging name rules).
 - Kotlin half: `android/app/src/main/kotlin/io/github/vasyanator/manhwastudio/platform/`
-  (`SafBridge.kt`, `SafRequestActivity.kt`; manifest entry for the latter).
+  (`SafBridge.kt`, `SafRequestActivity.kt`, `IncomingImages.kt`; manifest entry for
+  `SafRequestActivity`). The "Open with" MIME list of the manifest is guarded against
+  `ms_config::single_image::INPUT_FILE_TYPES` by `crates/ms-config/tests/android_manifest_mime.rs`.
 
 ## Contracts and invariants
 - One file dialog in flight process-wide: a second request resolves to
@@ -105,5 +139,8 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
 - New extension family for SAF: `file_dialog/mime.rs`.
 - Android SAF launch / result / commit path: `file_dialog/android.rs` (JNI) +
   `android/saf.rs` (wire codes, names) + the Kotlin `SafBridge.kt` / `SafRequestActivity.kt`.
+- Android incoming images: Kotlin `IncomingImages.kt` (layout, copy, markers) +
+  `incoming/android.rs` (JNI) + `incoming/listing.rs` (wire decoding); the intent filters are in
+  `android/app/src/main/AndroidManifest.xml` (`LaunchActivity`).
 - Android clipboard reads: `clipboard/android.rs` + the `read_text_backend` dispatch in
   `clipboard/mod.rs`.

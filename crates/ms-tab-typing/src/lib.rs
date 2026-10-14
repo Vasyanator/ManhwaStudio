@@ -78,7 +78,7 @@ pub use tab::TypingTabState;
 // `request_flatten_to_file` / `poll_flatten_to_file`), driven by the app's single-image session
 // controller. Native only.
 #[cfg(not(target_arch = "wasm32"))]
-pub use tab::{FlattenReadiness, FlattenToFileError, FlattenToFileReport, FlattenToFileRequest};
+pub use tab::{FlattenDestination, FlattenOutcome, FlattenReadiness, FlattenToFileError, FlattenToFileReport, FlattenToFileRequest};
 // Per-frame inputs of `TypingTabState::draw`, built by `app.rs` — it carries the
 // app-owned `PanelDockState` borrow the tab draws its panels from.
 pub use tab::TypingDrawParams;

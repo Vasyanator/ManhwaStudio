@@ -72,8 +72,9 @@ FILE HEADER (crates/ms-tab-typing/src/tab.rs)
     no overlay for a page, the export decodes (read-only, never written back into the model) the
     file the overlay loader would load (`clean_assign::LOADER_CLEAN_SCOPE`).
   - Single-image «Сохранить» (native): `prepare_flatten_to_file` / `request_flatten_to_file` /
-    `poll_flatten_to_file` in `tab/flatten_to_file.rs` flatten one page into an image file with the
-    export's composite; mutually exclusive with a project export.
+    `poll_flatten_to_file` in `tab/flatten_to_file.rs` flatten one page of the image set into an
+    image file with the export's composite (or only compose and digest it; a page whose digest
+    equals the caller's is skipped); mutually exclusive with a project export.
   - Clean overlay visibility in this tab is canvas-local UI state: toggling it must not
     mutate `CleanOverlaysModel` or affect the Cleaning tab.
 - Ключевые методы:
@@ -188,7 +189,7 @@ mod helpers;
 #[cfg(not(target_arch = "wasm32"))]
 mod flatten_to_file;
 #[cfg(not(target_arch = "wasm32"))]
-pub use flatten_to_file::{FlattenReadiness, FlattenToFileError, FlattenToFileReport, FlattenToFileRequest};
+pub use flatten_to_file::{FlattenDestination, FlattenOutcome, FlattenReadiness, FlattenToFileError, FlattenToFileReport, FlattenToFileRequest};
 use helpers::*;
 // `text_preview_label` moved into `mesh_geometry` but is re-exported by the
 // crate root (`lib.rs`) as `tab::text_preview_label`; a glob import
@@ -3323,10 +3324,14 @@ pub(super) struct TypingTextOverlayLayer {
     /// rewritten together with `bands_by_page` by every projection; the group-fold input of
     /// `ordering::composite_plan` for the overlay hit-test and the export job.
     groups_by_page: HashMap<usize, Vec<ms_models::layer_model::persist::GroupMeta>>,
-    /// Last `LayerDoc::version` this tab projected. Each frame, if the live doc version differs, the
-    /// tab re-projects its current page from the shared doc — the in-memory cross-tab sync. Initialized
-    /// to 0 (a fresh doc) and reconciled by every `sync_from_doc`.
-    last_doc_version: u64,
+    /// Per page: the `LayerDoc::version` at which this tab last projected that page FROM THE DOC
+    /// (`sync_from_doc`, or the adopt-only path of `maybe_reproject_from_doc_version` for a page the
+    /// doc does not hold). The doc has one global version, so a page whose entry differs from it MAY
+    /// be stale (any page may have been edited elsewhere) and is re-projected before it is shown or
+    /// flattened (`page_projection_current`). A projection built without the doc (the disk / empty
+    /// fallbacks of `ensure_raster_layers_for_page`) removes the entry. Entries of pages no longer
+    /// resident in the projection are ignored: such a page is re-projected fresh on its next use.
+    projected_doc_version: HashMap<usize, u64>,
     /// In-flight "create external image as a raster layer" job (replaces the old image-overlay path).
     create_raster_state: Option<TypingCreateRasterState>,
     /// In-flight "bake effects into the selected raster" job.
@@ -3478,7 +3483,7 @@ impl Default for TypingTextOverlayLayer {
             raster_layers_by_page: HashMap::new(),
             bands_by_page: HashMap::new(),
             groups_by_page: HashMap::new(),
-            last_doc_version: 0,
+            projected_doc_version: HashMap::new(),
             create_raster_state: None,
             raster_effects_state: None,
             pending_raster_effects: None,

@@ -316,6 +316,18 @@ mod tests {
         assert_eq!(judge(&linux_desktop_entry_text(&identity()), &[]), both(RecordStatus::OursOk));
     }
 
+    /// An own entry written before `Exec=` passed several files (`%f` instead of `%F`) still
+    /// works for one file, so the probe offers no repair; startup rewrites it (see
+    /// `xdg::tests::refreshes_an_own_single_file_entry_to_multi_file`).
+    #[test]
+    fn own_single_file_entry_is_ours_ok() {
+        let written = linux_desktop_entry_text(&identity());
+        let single_file = written.replace(&format!("Exec=\"{EXE}\" %F\n"), &format!("Exec=\"{EXE}\" %f\n"));
+        assert_ne!(single_file, written, "the writer's Exec line must end in %F");
+        assert_eq!(judge(&single_file, &[]), both(RecordStatus::OursOk));
+        assert!(exec_takes_a_file("\"/x/ms\" %f") && exec_takes_a_file("\"/x/ms\" %F"));
+    }
+
     #[test]
     fn missing_unreadable_and_ownerless_entries() {
         let exists = |_: &Path| true;
@@ -397,14 +409,14 @@ mod tests {
             judge(&try_elsewhere, &[]),
             both(RecordStatus::OursBroken(vec![Defect::WrongValue { value: RecordValue::DesktopTryExec, expected: EXE.to_owned(), found: "/gone/ms".to_owned() }]))
         );
-        let exec_elsewhere = written.replace(&format!("Exec=\"{EXE}\" %f"), "Exec=\"/x/ms\" %f");
+        let exec_elsewhere = written.replace(&format!("Exec=\"{EXE}\" %F"), "Exec=\"/x/ms\" %F");
         assert_eq!(
             judge(&exec_elsewhere, &[]),
             both(RecordStatus::OursBroken(vec![Defect::WrongValue { value: RecordValue::DesktopExec, expected: EXE.to_owned(), found: "/x/ms".to_owned() }]))
         );
-        let unterminated = written.replace(&format!("Exec=\"{EXE}\" %f"), "Exec=\"/x/ms %f");
-        assert_eq!(judge(&unterminated, &[]), both(RecordStatus::OursBroken(vec![Defect::MalformedCommand { command: "\"/x/ms %f".to_owned() }])));
-        let no_exec = written.replace(&format!("Exec=\"{EXE}\" %f\n"), "");
+        let unterminated = written.replace(&format!("Exec=\"{EXE}\" %F"), "Exec=\"/x/ms %F");
+        assert_eq!(judge(&unterminated, &[]), both(RecordStatus::OursBroken(vec![Defect::MalformedCommand { command: "\"/x/ms %F".to_owned() }])));
+        let no_exec = written.replace(&format!("Exec=\"{EXE}\" %F\n"), "");
         assert_eq!(judge(&no_exec, &[]), both(RecordStatus::OursBroken(vec![Defect::ValueMissing { value: RecordValue::DesktopExec }])));
     }
 
@@ -429,7 +441,7 @@ mod tests {
         let all_types: Vec<String> = desktop_mime_types().map(str::to_owned).collect();
         let no_types = written.lines().filter(|line| !line.starts_with("MimeType=")).map(|line| format!("{line}\n")).collect::<String>();
         assert_eq!(judge(&no_types, &[])[1], RecordStatus::OursStale(vec![Defect::MissingImageTypes { types: all_types }]));
-        let no_file = written.replace(&format!("Exec=\"{EXE}\" %f"), &format!("Exec=\"{EXE}\""));
+        let no_file = written.replace(&format!("Exec=\"{EXE}\" %F"), &format!("Exec=\"{EXE}\""));
         assert_eq!(judge(&no_file, &[]), [RecordStatus::OursOk, RecordStatus::OursBroken(vec![Defect::MalformedCommand { command: format!("\"{EXE}\"") }])]);
     }
 

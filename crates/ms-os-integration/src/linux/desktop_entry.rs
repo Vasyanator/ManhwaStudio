@@ -70,8 +70,10 @@ pub enum EntryOwner {
 
 /// Text of the Linux desktop entry for `identity`. Pure.
 ///
-/// `Exec=` ends in `%f` (one local file, or nothing when launched from a menu), which arrives
-/// as the positional image argument. `TryExec=` hides the entry once the executable is gone;
+/// `Exec=` ends in `%F` (every selected local file, or nothing when launched from a menu), so
+/// several files opened together from a file manager reach ONE process as positional image
+/// arguments. An own entry still written with `%f` differs from this text and is therefore
+/// rewritten by [`decide_startup`] (`Refreshed`). `TryExec=` hides the entry once the executable is gone;
 /// `Path=` starts a menu launch in the program root so the runtime-root resolution lands on this
 /// copy; `X-ManhwaStudio-Exe=` is the ownership key. `MimeType=` lists every readable input type
 /// (`ms_config::single_image::INPUT_FILE_TYPES`), so the program is OFFERED in "Open with";
@@ -85,7 +87,7 @@ Type=Application\n\
 Name=ManhwaStudio\n\
 Comment=Comic translation editor\n\
 TryExec={exe}\n\
-Exec={} %f\n\
+Exec={} %F\n\
 Path={}\n\
 Icon=manhwastudio_rs\n\
 Terminal=false\n\
@@ -323,9 +325,9 @@ mod tests {
     }
 
     #[test]
-    fn desktop_entry_passes_one_file_and_lists_every_input_mime_type() {
+    fn desktop_entry_passes_local_files_and_lists_every_input_mime_type() {
         let entry = linux_desktop_entry_text(&opt_identity());
-        assert!(entry.contains("\nExec=\"/opt/ManhwaStudio/manhwastudio_rs\" %f\n"), "{entry}");
+        assert!(entry.contains("\nExec=\"/opt/ManhwaStudio/manhwastudio_rs\" %F\n"), "{entry}");
         assert!(!entry.contains("%u"), "a URL field code would hand over non-file URIs");
         let mime_line = entry
             .lines()
@@ -340,9 +342,10 @@ mod tests {
     }
 
     /// Byte-exact golden of the whole entry. Pinned before the OS-integration extraction (R0)
-    /// and changed DELIBERATELY by the Linux startup-policy package (B1): it added `TryExec=`,
-    /// `Path=` and the `X-ManhwaStudio-Exe=` ownership key, and replaced the
-    /// "ManhwaStudio Rust Prototype" comment.
+    /// and changed DELIBERATELY twice: the Linux startup-policy package (B1) added `TryExec=`,
+    /// `Path=` and the `X-ManhwaStudio-Exe=` ownership key and replaced the
+    /// "ManhwaStudio Rust Prototype" comment; the image-set package moved `Exec=` from `%f` to
+    /// `%F` (several files from a file manager open in one process).
     #[test]
     fn desktop_entry_text_is_byte_exact() {
         let entry = linux_desktop_entry_text(&opt_identity());
@@ -351,7 +354,7 @@ Type=Application\n\
 Name=ManhwaStudio\n\
 Comment=Comic translation editor\n\
 TryExec=/opt/ManhwaStudio/manhwastudio_rs\n\
-Exec=\"/opt/ManhwaStudio/manhwastudio_rs\" %f\n\
+Exec=\"/opt/ManhwaStudio/manhwastudio_rs\" %F\n\
 Path=/opt/ManhwaStudio\n\
 Icon=manhwastudio_rs\n\
 Terminal=false\n\

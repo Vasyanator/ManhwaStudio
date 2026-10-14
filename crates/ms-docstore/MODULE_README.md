@@ -25,6 +25,9 @@ repo-root `docstore.py` (it touches only `user_config`).
   exist (never created); the old file is never deleted first; on failure it is intact and
   the temp is removed; the rename replaces the directory entry (a symlink is replaced, not
   followed — callers canonicalize); identical bytes are not rewritten; the caller logs.
+  `AtomicWriteError::{TempWrite, Rename}` carry the underlying `io::ErrorKind` (`kind`;
+  `InvalidData` for a failed whole-write read-back), so callers classify failures (e.g.
+  permission denied) without parsing the OS text.
 - `.db` writes to an existing file: ONE `BEGIN IMMEDIATE` transaction reads every row,
   joins, applies the caller's change (mutator / baseline check), splits and writes only the
   row diff: changed rows `UPDATE ... WHERE path` in place (rowid kept — `INSERT OR REPLACE`

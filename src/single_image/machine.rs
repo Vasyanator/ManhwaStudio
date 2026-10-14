@@ -148,7 +148,7 @@ impl SaveError {
             FlattenToFileError::NoSuchPage(_) => Self::NoPage,
             FlattenToFileError::Compose(message) => Self::Compose(message.clone()),
             FlattenToFileError::Encode(encode) => Self::Encode(encode.to_string()),
-            FlattenToFileError::Write { path, reason } => Self::Write { path: path.clone(), reason: reason.clone() },
+            FlattenToFileError::Write { path, reason, .. } => Self::Write { path: path.clone(), reason: reason.clone() },
             FlattenToFileError::WorkerLost => Self::WorkerLost,
         }
     }

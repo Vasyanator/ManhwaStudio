@@ -24,7 +24,7 @@ Notes:
   name. Replacing (or deleting) a `.db` therefore removes its `-journal` first; the caller
   holds the document lock and, for chapter documents, the page-op quiesce, so no live
   transaction owns that journal.
-- A validation mismatch is reported as `AtomicWriteError::TempWrite` (the previous document
+- A validation mismatch is reported as `AtomicWriteError::TempWrite` with kind `InvalidData` (the previous document
   is untouched, which is exactly that variant's contract).
 */
 
@@ -69,7 +69,7 @@ pub(crate) fn write_temp(doc: &DocRef, value: &Value, format: DocFormat, create_
     let written = match format {
         DocFormat::Json => {
             let text = serde_json::to_string_pretty(value).map_err(|err| DocStoreError::Serialize { path: target.clone(), cause: err.to_string() })?;
-            json::write_temp_file(&temp, text.as_bytes(), true).map_err(|reason| DocStoreError::Write(AtomicWriteError::TempWrite { path: temp.clone(), reason }))
+            json::write_temp_file(&temp, text.as_bytes(), true).map_err(|(kind, reason)| DocStoreError::Write(AtomicWriteError::TempWrite { path: temp.clone(), reason, kind }))
         }
         DocFormat::Db => {
             // Monotonic revision across a whole rewrite, so a revision probe sees a change.
@@ -115,7 +115,8 @@ pub(crate) fn validate_temp(temp: &Path, format: DocFormat, expected: &Value) ->
     };
     remove_temp(temp);
     ms_log::runtime_log::log_error(format!("docstore: whole-document write failed validation.\nTemp: {}\nError: {reason}", temp.display()));
-    Err(DocStoreError::Write(AtomicWriteError::TempWrite { path: temp.to_path_buf(), reason }))
+    // A failed read-back is a data problem of the written temp, whatever made it unreadable.
+    Err(DocStoreError::Write(AtomicWriteError::TempWrite { path: temp.to_path_buf(), reason, kind: std::io::ErrorKind::InvalidData }))
 }
 
 /// Makes `temp` the document's `format` file: fsync the temp, remove the replaced `.db`'s
@@ -133,7 +134,7 @@ pub(crate) fn commit_temp(doc: &DocRef, temp: &Path, format: DocFormat) -> Resul
     // (`File::open`), and that would refuse every `.db` creation and conversion there.
     if let Err(err) = std::fs::OpenOptions::new().write(true).open(temp).and_then(|file| file.sync_all()) {
         remove_temp(temp);
-        return Err(DocStoreError::Write(AtomicWriteError::TempWrite { path: temp.to_path_buf(), reason: format!("cannot fsync: {err}") }));
+        return Err(DocStoreError::Write(AtomicWriteError::TempWrite { path: temp.to_path_buf(), reason: format!("cannot fsync: {err}"), kind: err.kind() }));
     }
     if format == DocFormat::Db {
         let journal = journal_path(&target);
@@ -146,7 +147,7 @@ pub(crate) fn commit_temp(doc: &DocRef, temp: &Path, format: DocFormat) -> Resul
     }
     json::rename_with_retry(temp, &target).map_err(|err| {
         remove_temp(temp);
-        DocStoreError::Write(AtomicWriteError::Rename { path: target.clone(), reason: err.to_string() })
+        DocStoreError::Write(AtomicWriteError::Rename { path: target.clone(), reason: err.to_string(), kind: err.kind() })
     })?;
     let parent = target.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     json::sync_directory(parent).map_err(|reason| DocStoreError::Write(AtomicWriteError::DirSync { dir: parent.to_path_buf(), reason }))

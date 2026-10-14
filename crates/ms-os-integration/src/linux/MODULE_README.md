@@ -42,6 +42,10 @@ read-only registration probe.
   The probe compares it with that root for this copy and with the repository root for another
   copy that is a repository build; `Path=` still at the owner's exe directory is
   `WorkingDirOutdated` (stale), and startup rewrites this copy's entry anyway.
+- `Exec=` ends in `%F`: several files chosen together in a file manager reach ONE process as
+  positional image arguments. An own entry still carrying `%f` works for one file, so the probe
+  judges it `OursOk` (any file field code satisfies "Open with"); it differs from the expected
+  bytes, so startup rewrites it (`Refreshed`) — no separate outdated-field-code rule exists.
 - The probe judges each entry twice: the menu row (launch values + icon) and the "Open with" row
   (launch values + `MimeType=` coverage + an `Exec=` with a file field code). A legacy entry
   without `TryExec=` / `Path=` / ownership key is stale, never broken.

@@ -369,6 +369,7 @@ fn save_document(path: &Path, colors: &[[u8; 4]; PRESET_COUNT]) -> Result<(), Co
             ms_docstore::DocStoreError::Write(ms_docstore::AtomicWriteError::Rename {
                 path,
                 reason,
+                ..
             }) => ColorPresetsError::Rename {
                 path: path.display().to_string(),
                 reason,

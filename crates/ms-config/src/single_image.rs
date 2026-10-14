@@ -10,7 +10,8 @@ when a large set asks for confirmation, where its throwaway scratch chapters liv
 Key items:
 - `ImageFileType` / `INPUT_FILE_TYPES` / `input_extensions()`: the ONE table of readable input
   types. Consumed by the launcher picker filter, the Linux `.desktop` `MimeType=` line, the
-  Windows "Open with" `SupportedTypes`, and the CLI error text; a test in `ms-project` asserts
+  Windows "Open with" `SupportedTypes`, the Android manifest VIEW filter (guarded by
+  `tests/android_manifest_mime.rs`), and the CLI error text; a test in `ms-project` asserts
   every entry decodes.
 - `IMAGE_SET_CONFIRM_COUNT` / `IMAGE_SET_CONFIRM_DECODED_BYTES`: the soft size limits above which
   opening an image set asks the user first (the decision itself is
