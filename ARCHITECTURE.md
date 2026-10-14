@@ -174,9 +174,13 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
   macOS `.app` bundles use Application Support). Bundled resources, the Python
   environment, `user_config`, logs and app-managed models all resolve from it.
 - The studio screen (`src/shell/studio.rs`) loads the project off the GUI thread, then delegates
-  to `MangaApp`. It opens a typed `StartupTarget`: a project directory, or a single image (CLI
-  `--image` / positional path, launcher `OpenImage`, OS "Open with"); the open worker turns it
-  into a `StudioOpenRequest` (reserving a single-image scratch).
+  to `MangaApp`. It opens a typed `StartupTarget`: a project directory, or an ordered image set
+  (`Images(ImageSources)`: CLI `--image` / positional paths, launcher multi-pick, OS "Open with",
+  Android Share); the open worker turns it into a `StudioOpenRequest` (reserving the scratch).
+- **External opens while running** (Android Share / "Open with" via the `ms_platform::incoming`
+  inbox; cold start reads it in `run_main`): the main window's screen table decides — the
+  launcher opens them at once, the studio asks (its unsaved-changes flow or a confirmation),
+  Loading/Closing screens queue and merge them in arrival order.
 - **Every `MangaApp` and every launcher screen lives inside the same `egui::Context`** (reload,
   launcher <-> studio). Any egui resource a crate registers (font families, textures, ids) must be
   named by content, never by an instance counter; fonts are installed once per process.
@@ -194,12 +198,15 @@ point down only: page-manager -> ps-editor -> typing; cleaning -> translation ->
 - A project opened in the studio is one **chapter** inside a **title** directory.
   `ms_project::ProjectData::load` returns the chapter directories, `pages: Vec<Page>`, the
   bubble list, `ProjectPaths`, `comic_type`, `canvas_settings` and `settings_data`.
-- **Single image mode:** `ProjectData::session()` is a typed `SessionKind` set by the caller,
-  never inferred from paths. For `SingleImage`, `ms_project::single_image` decodes the image
-  (EXIF orientation applied) into a throwaway scratch chapter under the OS temp dir, and the
-  regular load runs on that scratch — never on the user's folder. Writers stay live against the
-  scratch; the user's file is written only by explicit Save / Save As (flattened composite via
-  the typing flatten, atomic write). The studio screen owns the scratch; the teardown worker
+- **Image-set mode** (`SessionKind::SingleImage`, one or more images): `ProjectData::session()`
+  is a typed `SessionKind` set by the caller, never inferred from paths. `ms_project::single_image`
+  decodes the images in the given order (EXIF orientation applied; unreadable files are skipped
+  and listed) into a throwaway scratch chapter under the OS temp dir, one page per image, and the
+  regular load runs on that scratch — never on the user's folders. Writers stay live against the
+  scratch; user files are written only by explicit Save / Save As (flattened composite per page
+  via the typing flatten, atomic write): Save writes each CHANGED page back to its own source
+  (unchanged pixels — `PixelDigest` of the opened image — are skipped), pages without a writable
+  source and Save As of a set go to one chosen folder. The studio screen owns the scratch; the teardown worker
   deletes it after the app was dropped; stale scratches (marker + released lock) are swept at startup. UI branches
   (tabs, top bar, exit dialog) live in `src/single_image/`.
 - `Page` and `ProjectPaths` are declared in `ms-page-ops` and re-exported by `ms-project`, so a
@@ -482,7 +489,7 @@ logged error); the GUI thread only polls and applies results.
   failed cleanup releases the latch and restarts all three writers.
 - Exit: deferred typing edits are enqueued inline BEFORE the exit barrier; failed pages are
   reported.
-- A single-image session never merges staging: every close takes the DISCARD quiesce (no
+- An image-set session never merges staging: every close takes the DISCARD quiesce (no
   flush, no delete job); the main window's teardown worker removes the scratch afterwards. Its dirty state is
   `AutosaveGate::action_count()` against the baseline of the last successful file write.
 
