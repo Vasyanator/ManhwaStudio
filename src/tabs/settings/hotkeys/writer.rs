@@ -10,14 +10,16 @@ Key structures:
 - `WriteFailure`: one failed write, for the pane's error line.
 
 Key functions:
-- `OverrideWriter::submit`, `OverrideWriter::drain_failures`.
+- `OverrideWriter::submit`, `OverrideWriter::drain_failures`, `OverrideWriter::shutdown_blocking`.
 
 Notes:
 - ONE worker thread per pane, fed through a channel: `write_override` is a read-modify-write
   of one id, so two writes of the same id on two threads could land in the wrong order and
   persist a stale list. The worker drains whatever queued up and keeps only the latest entry
   per id of that batch.
-- The worker exits when the pane (and with it the sender) is dropped, after the queued writes.
+- The worker exits once its sender is dropped, after the queued writes. Durability at teardown
+  comes ONLY from `shutdown_blocking` (closes the channel and joins the worker): a process that
+  exits without it may lose the last edit.
 - A failed spawn is logged and reported; the next change tries to spawn again.
 */
 
@@ -51,6 +53,7 @@ pub(super) struct WriteFailure {
 struct Worker {
     entries: Sender<OverrideEntry>,
     failures: Receiver<WriteFailure>,
+    handle: thread::JoinHandle<()>,
 }
 
 /// The pane-side handle of the override writer.
@@ -96,6 +99,29 @@ impl OverrideWriter {
         failures
     }
 
+    /// Teardown barrier (blocking; call from a worker, never the GUI thread): closes the queue,
+    /// waits until every queued entry was written in order, and returns every failure not yet
+    /// drained (each was already logged by the worker). A later `submit` starts a fresh worker.
+    ///
+    /// # Errors
+    /// `Err(failures)` when the worker thread panicked (the queued writes may be lost); the
+    /// failures collected before the panic are returned with it.
+    pub(super) fn shutdown_blocking(&mut self) -> Result<Vec<WriteFailure>, Vec<WriteFailure>> {
+        let mut failures = std::mem::take(&mut self.local_failures);
+        let Some(Worker { entries, failures: worker_failures, handle }) = self.worker.take() else { return Ok(failures) };
+        // Dropping the only sender ends the worker's `recv` loop after the queued entries.
+        drop(entries);
+        let joined = handle.join();
+        failures.extend(worker_failures.try_iter());
+        match joined {
+            Ok(()) => Ok(failures),
+            Err(_panic) => {
+                runtime_log::log_error(format!("[settings::hotkeys] hotkey override writer panicked; queued changes may be lost; path={}", self.path.display()));
+                Err(failures)
+            }
+        }
+    }
+
     fn spawn(&self, ctx: &egui::Context) -> Option<Worker> {
         let (entries_tx, entries_rx) = mpsc::channel::<OverrideEntry>();
         let (failures_tx, failures_rx) = mpsc::channel::<WriteFailure>();
@@ -103,9 +129,8 @@ impl OverrideWriter {
         let ctx = ctx.clone();
         let spawned = thread::Builder::new().name("settings-hotkeys-writer".to_owned()).spawn(move || run_worker(&path, &entries_rx, &failures_tx, &ctx));
         match spawned {
-            // Detached on purpose: the worker ends by itself once the pane drops the sender, and
-            // nothing ever waits for it (a join on the GUI thread would block).
-            Ok(_detached) => Some(Worker { entries: entries_tx, failures: failures_rx }),
+            // Joined only by `shutdown_blocking` on the teardown worker, never on the GUI thread.
+            Ok(handle) => Some(Worker { entries: entries_tx, failures: failures_rx, handle }),
             Err(err) => {
                 runtime_log::log_error(format!("[settings::hotkeys] failed to start the hotkey override writer; path={}; cause={err}", self.path.display()));
                 None

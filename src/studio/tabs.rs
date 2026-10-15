@@ -287,6 +287,7 @@ impl Tabs {
                         status,
                         panel_dock,
                         input: input.frame(),
+                        input_registry: input.registry(),
                     });
                 });
             }
@@ -309,6 +310,8 @@ impl Tabs {
                         texture_cache: textures,
                         status,
                         panel_dock,
+                        input: input.frame(),
+                        input_registry: input.registry(),
                     });
                 });
                 // In-app deep link from the typing panel's font-group "?" help icon: the app

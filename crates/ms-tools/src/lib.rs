@@ -7,7 +7,11 @@ FILE HEADER (crates/ms-tools/src/lib.rs)
   `tabs`, `studio` or `launcher`; hosts drive the patch core through `PatchHost`.
 - Экспорт:
   - `MaskBrush`: переиспользуемая кисть для рисования бинарной маски в `egui::ColorImage`
-    (радиус, hotkeys размера, Shift+wheel, отрисовка курсора, штрихи по сегменту).
+    (радиус, отрисовка курсора, штрихи по сегменту).
+  - `mask_brush`: also the shared brush OWNER of the unified input system — `declarations()`
+    (`brush.size` / `brush.smaller` / `brush.larger`, active under `BRUSH_ACTIVE`) and
+    `MaskBrush::apply_input`. The studio registers the declarations once; brush hosts publish
+    the context and call `apply_input`.
   - `fill_polygon_spans`: re-export of `ms_raster::fill_polygon_spans`, the one even-odd
     scanline polygon rasterizer (PS-editor lasso, cleaning tools, the patch core). It lives in
     `ms-raster` (level 0) so lower crates can use it; this path is kept for existing callers.
@@ -33,7 +37,7 @@ FILE HEADER (crates/ms-tools/src/lib.rs)
 #[macro_use]
 extern crate ms_i18n;
 
-mod mask_brush;
+pub mod mask_brush;
 mod overlay_pixel;
 pub mod patch;
 pub mod png_wire;

@@ -22,6 +22,8 @@ Key structures:
 - `PatchCommit`: what one finished patch hands the host.
 - `DragGeometry` / `DragRefusal`: what a source drag resolves to, or why it is refused.
 - `PatchInputError`: the refusal reasons of every ROI-sized buffer, core-side and host-side alike.
+- `PatchInput`: what the host decided about this frame's input (the cancel request); the core
+  reads no key itself.
 
 Key functions:
 - `drag_geometry()`: THE refusal predicate — the preview outline and the release both read it.
@@ -29,7 +31,9 @@ Key functions:
 - `run_patch_job()`: the whole worker-side pass (rasterize, solve, blend by coverage).
 - `gesture_for_press()`: the whole press-time state machine, host-free and unit-tested.
 - `resolve_pending_end()`: turns a parked `stroke_end` into a commit or a cancellation.
-- `clear_selection()`: drops the selection AND cancels the work in flight (Escape, the button).
+- `clear_selection()`: drops the selection AND cancels the work in flight (the cancel input, the
+  button).
+- `on_cancel()`: applies `PatchInput::cancel`.
 - `paint_outline()`: the zoom-invariant two-tone dashed outline, unclamped and marked when refused.
 - `scene_pos_in_page()`: the unclamped page-pixel -> scene map that outline is projected with.
 
@@ -50,6 +54,14 @@ use egui::{Color32, Pos2};
 use membrane::{PatchBlend, PatchRequest, solve_patch};
 use ms_thread as thread;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+
+/// What the host decided about this frame's input for the patch tool. The core reads no key: each
+/// host maps its own binding (a declared action, or the raw Escape a host still reads) onto it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PatchInput {
+    /// The cancel binding fired this frame: clear the selection and call off the work in flight.
+    pub cancel: bool,
+}
 
 /// Smallest bounding-box span, in page pixels, a selection must have on BOTH axes.
 ///
@@ -570,7 +582,7 @@ pub struct PatchToolCore {
     solve_rx: Option<Receiver<PatchOutcome>>,
     /// A cancellation that still has to reach the host.
     ///
-    /// `clear_selection` is reachable from hooks that are handed no host (the Escape key and the
+    /// `clear_selection` is reachable from hooks that are handed no host (the cancel input and the
     /// controls pane), so the host-facing half of the cancellation is parked here and flushed at
     /// the top of the next `draw_overlay_ui`.
     host_cancel_pending: bool,
@@ -669,7 +681,7 @@ impl PatchToolCore {
     ///
     /// The work in flight goes WITH the selection: a load or a solve that survived would land a
     /// patch for a selection the user has explicitly dismissed, over whatever was drawn in the
-    /// meantime — the hazard `cancel_in_flight` documents, reached here by Escape and by the
+    /// meantime — the hazard `cancel_in_flight` documents, reached here by the cancel input and by the
     /// «clear selection» button instead of by a tool switch. Cancelling first, so the log names
     /// what was actually dropped; the tool is immediately usable for a fresh selection because
     /// `busy()` reads the very fields this clears.
@@ -1083,8 +1095,10 @@ impl PatchToolCore {
         }
     }
 
-    /// Draws the tool's controls: shape, colour adaptation, feather, and the clear button.
-    pub fn draw_ui(&mut self, ui: &mut egui::Ui) {
+    /// Draws the tool's controls: shape, colour adaptation, feather, the clear button and the
+    /// usage hint, which names the host's cancel binding by `cancel_label` (its binding label;
+    /// empty = the hint omits the cancel sentence's binding).
+    pub fn draw_ui(&mut self, ui: &mut egui::Ui, cancel_label: &str) {
         ui.label(t!("tools.patch.shape_label"));
         ui.horizontal(|ui| {
             for shape in [PatchShape::Lasso, PatchShape::Rect] {
@@ -1147,7 +1161,7 @@ impl PatchToolCore {
         } else if let Some(status) = self.status.as_ref() {
             ui.small(status.clone());
         }
-        ui.small(t!("tools.patch.usage_hint"));
+        ui.small(tf!("tools.patch.usage_hint", cancel = cancel_label));
     }
 
     /// Begins a gesture at `scene_pos` on `page_idx`.
@@ -1254,14 +1268,15 @@ impl PatchToolCore {
         self.pending_end = Some(gesture);
     }
 
-    /// Escape clears the selection and cancels the gesture and everything in flight.
+    /// The cancel input (`PatchInput::cancel`) clears the selection and cancels the gesture and
+    /// everything in flight.
     ///
-    /// Answers `false` when there is nothing to clear, so the key stays available to whatever
-    /// else wants it.
-    pub fn on_escape(&mut self, ctx: &egui::Context) -> bool {
+    /// Answers `false` when there is nothing to clear or no cancel was requested, so the host can
+    /// leave the key to whatever else wants it.
+    pub fn on_cancel(&mut self, input: PatchInput) -> bool {
         // A parked gesture end counts as something to clear: it would otherwise be committed by
         // this frame's `draw_overlay_ui`, right after the user asked for it to go away. So does
-        // work in flight, which Escape must be able to call off even in the state where the
+        // work in flight, which the cancel must be able to call off even in the state where the
         // selection is already gone.
         if self.selection.is_none()
             && self.gesture.is_none()
@@ -1270,8 +1285,8 @@ impl PatchToolCore {
         {
             return false;
         }
-        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
-            self.clear_selection(&"Escape was pressed");
+        if input.cancel {
+            self.clear_selection(&"the cancel input fired");
             self.status = None;
             return true;
         }
@@ -1857,56 +1872,28 @@ mod tests {
         assert!(tool.selection.is_some(), "a real box must be accepted");
     }
 
-    /// Escape clears the selection, and is not consumed when there is nothing to clear.
+    /// The cancel input clears the selection; it is not consumed when there is nothing to clear,
+    /// and nothing happens without it.
     #[test]
-    fn escape_clears_the_selection_and_is_otherwise_not_consumed() {
-        let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.events.push(egui::Event::Key {
-            key: egui::Key::Escape,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        });
-
+    fn cancel_clears_the_selection_and_is_otherwise_not_consumed() {
+        let cancel = PatchInput { cancel: true };
         let mut tool = core();
-        let mut handled_when_empty = true;
-        // Headless pass: no renderer applies the font-atlas upload, and egui 0.36 panics on an
-        // unapplied `TexturesDelta` drop, so every pass's deltas are discarded explicitly.
-        ctx.run_ui(input.clone(), |ui| {
-            handled_when_empty = tool.on_escape(ui.ctx());
-        })
-        .drop_without_applying_deltas();
-        assert!(!handled_when_empty, "Escape must stay available when nothing is selected");
+        assert!(!tool.on_cancel(cancel), "the cancel key must stay available when nothing is selected");
 
         tool.selection = Some(selection(10.0, 10.0, 40.0, 40.0));
-        let mut handled = false;
-        ctx.run_ui(input, |ui| {
-            handled = tool.on_escape(ui.ctx());
-        })
-        .drop_without_applying_deltas();
-        assert!(handled, "Escape must be consumed when it clears a selection");
+        assert!(!tool.on_cancel(PatchInput::default()), "no cancel requested, nothing cleared");
+        assert!(tool.selection.is_some());
+        assert!(tool.on_cancel(cancel), "the cancel must be consumed when it clears a selection");
         assert!(tool.selection.is_none());
     }
 
-    /// Escape does not merely drop the selection: it CANCELS the work in flight.
+    /// The cancel does not merely drop the selection: it CANCELS the work in flight.
     ///
     /// A job that survived would land a patch for a selection the user has explicitly dismissed,
     /// over whatever was drawn in the meantime — and would keep `busy()` true, refusing the next
     /// selection with `status_busy`.
     #[test]
-    fn escape_cancels_the_work_in_flight() {
-        let ctx = egui::Context::default();
-        let mut input = egui::RawInput::default();
-        input.events.push(egui::Event::Key {
-            key: egui::Key::Escape,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::NONE,
-        });
-
+    fn cancel_stops_the_work_in_flight() {
         let mut tool = core();
         tool.selection = Some(selection(10.0, 10.0, 40.0, 40.0));
         tool.pending_offset = Some((5, 5));
@@ -1914,14 +1901,7 @@ mod tests {
         tool.solve_rx = Some(solve_rx);
         assert!(tool.busy(), "the fixture is a tool with a job in flight");
 
-        let mut handled = false;
-        // Headless pass: the unapplied font-atlas upload must be discarded explicitly (egui 0.36
-        // panics when a `TexturesDelta` is dropped with pending deltas).
-        ctx.run_ui(input, |ui| {
-            handled = tool.on_escape(ui.ctx());
-        })
-        .drop_without_applying_deltas();
-        assert!(handled, "Escape is consumed when it has something to cancel");
+        assert!(tool.on_cancel(PatchInput { cancel: true }), "the cancel is consumed when it has something to cancel");
         assert!(tool.selection.is_none());
         assert!(!tool.busy(), "a job the user dismissed must not still be in flight");
         assert!(tool.pending_offset.is_none() && tool.solve_rx.is_none());
@@ -1940,7 +1920,7 @@ mod tests {
 
     /// The «clear selection» button cancels the work in flight for the same reason.
     ///
-    /// It and Escape both go through `clear_selection`, which is what makes the two entry points
+    /// It and the cancel input both go through `clear_selection`, which is what makes the two entry points
     /// impossible to fix apart; a parked gesture end goes with them, so nothing can be committed
     /// after the selection it belongs to is gone.
     #[test]

@@ -52,6 +52,9 @@ ms-tools = { path = "../ms-tools" }
 # Every reusable widget the panels put on screen, the dockable-panel subsystem
 # (`panel_dock`) this tab's UI is built from, and `input_util`.
 ms-widgets = { path = "../ms-widgets" }
+# `button_label`: the patch tool's usage hint names the cancel key this editor reads (the core
+# reads no key; `ms_tools::patch::PatchInput`). Below `ms-widgets`, no layering constraint.
+ms-input = { path = "../ms-input" }
 # Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
 # hand-typed here. A leaf over egui, so it adds no layering constraint.
 ms-theme = { path = "../ms-theme" }

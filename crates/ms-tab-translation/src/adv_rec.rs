@@ -7,7 +7,9 @@ Main responsibilities:
 - show crop preview in a centered floating window with region-editor-style sizing and zoom;
 - maintain a small transparent paint overlay above the crop for OCR-guides drawn by user;
 - hold editable recognition result text and emit UI actions back to Translation tab;
-- support local quick-selection OCR inside the floating preview when brush mode is disabled.
+- support local quick-selection OCR inside the floating preview when brush mode is disabled;
+- resize its brush from the shared brush actions (`ms_tools::mask_brush`) while brush mode is on
+  (`brush_input_active` / `apply_brush_input`, called by the tab before drawing).
 
 Key types:
 - `AdvancedRecognitionWindow`: runtime state of the floating window and crop loader thread.
@@ -299,6 +301,22 @@ impl AdvancedRecognitionWindow {
 
     pub fn is_open(&self) -> bool {
         self.pending_job_id.is_some() || self.session.is_some()
+    }
+
+    /// Whether the window's brush is on, so the tab publishes `ms_tools::mask_brush::BRUSH_ACTIVE`
+    /// and the shared brush actions resize it ([`Self::apply_brush_input`]).
+    #[must_use]
+    pub fn brush_input_active(&self) -> bool {
+        self.session.as_ref().is_some_and(|session| session.brush_enabled)
+    }
+
+    /// Applies this frame's shared brush actions (`brush.size` / `smaller` / `larger`) to the
+    /// window's brush while it is on. Returns whether its radius changed.
+    pub fn apply_brush_input(&mut self, input: &ms_input::InputFrame) -> bool {
+        match self.session.as_mut() {
+            Some(session) if session.brush_enabled => session.brush.apply_input(input),
+            Some(_) | None => false,
+        }
     }
 
     pub fn set_request_running(&mut self, request_id: u64) {
@@ -607,7 +625,6 @@ fn draw_adv_rec_window_contents(
         }
         ui.label(format!("{:.0}%", session.zoom * 100.0));
     });
-    let _ = session.brush.handle_size_shortcuts(ui.ctx());
 
     ui.separator();
     ensure_adv_rec_texture(session, ui.ctx());
@@ -775,7 +792,6 @@ fn handle_adv_rec_image_input(
         interact_pos,
         mods,
         z_down,
-        smooth_scroll,
     ) = ui.ctx().input(|i| {
         (
             i.pointer.primary_down(),
@@ -784,7 +800,6 @@ fn handle_adv_rec_image_input(
             i.pointer.interact_pos(),
             i.modifiers,
             i.key_down(egui::Key::Z),
-            i.smooth_scroll_delta,
         )
     });
     let zoom_modifier_down = mods.ctrl || mods.command || z_down;
@@ -873,22 +888,6 @@ fn handle_adv_rec_image_input(
             session.preview_base_image.size,
             pointer_pos,
         );
-    }
-
-    let image_hovered = hover_pos.is_some_and(|p| image_rect.contains(p));
-    if image_hovered {
-        // Shift+wheel adjusts the brush; some backends deliver it as horizontal
-        // scroll, so fall back to the X component.
-        let mut wheel_delta = smooth_scroll.y;
-        if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = smooth_scroll.x;
-        }
-        if mods.shift && !zoom_modifier_down && session.brush.handle_wheel(wheel_delta, mods) {
-            ui.ctx().input_mut(|input| {
-                input.smooth_scroll_delta = egui::Vec2::ZERO;
-            });
-            ui.ctx().request_repaint();
-        }
     }
 
     if !session.brush_enabled || zoom_modifier_down || session.zoom_drag_active {

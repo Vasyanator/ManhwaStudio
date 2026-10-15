@@ -414,9 +414,12 @@ mod tests {
         let mut textures = std::collections::HashMap::new();
         let mut panel_dock = crate::widgets::panel_dock::PanelDockState::new();
         let status = CanvasUiStatus { loaded_pages: 0, total_pages: 0, load_errors_count: 0 };
+        // No input: a router over no declarations, whose frame never fires anything.
+        let empty = ms_input::InputRegistry::new(ms_input::Declarations::default()).expect("an empty declaration set is always valid");
+        let input = ms_input::InputRouter::new(empty);
         ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();
-            canvas.draw(CanvasDrawParams { ctx, ui, project, page_infos: &page_infos, texture_cache: &mut textures, status, source_upload_budget: &mut source_upload_budget, hooks: &mut NoHooks, panel_dock: &mut panel_dock });
+            canvas.draw(CanvasDrawParams { ctx, ui, project, page_infos: &page_infos, texture_cache: &mut textures, status, source_upload_budget: &mut source_upload_budget, hooks: &mut NoHooks, panel_dock: &mut panel_dock, input: input.frame(), input_registry: input.registry() });
         })
         .drop_without_applying_deltas();
     }

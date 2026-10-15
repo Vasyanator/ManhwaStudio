@@ -11,7 +11,7 @@ use ms_config::app_tab::AppTab;
 use ms_input::{ActionKind, Binding, Button, Chord, InputRegistry, ModifierKey, Scope, view};
 use ms_models::bubbles_model::{BubblesModel, SharedCanvasSettings};
 use ms_project::{CanvasSettings, ProjectData, ProjectPaths};
-use ms_studio_tab::{StudioTab, VIEW_ZOOM_COMMANDS};
+use ms_studio_tab::StudioTab;
 use ms_widgets::panel_dock::TabId;
 use serde_json::{Value, json};
 
@@ -121,9 +121,9 @@ fn the_advanced_ocr_mode_beats_the_quick_one() {
     assert_eq!(mode.beats, vec![ms_input::ActionId("translation.ocr.quick_mode")]);
 }
 
-/// Every declared command, and the three shared zoom commands, are executed by this tab (so the
-/// declarations and the execute arms cannot drift apart); modes, ids of the session or of another
-/// owner, and unknown ids are refused untouched.
+/// Every declared command is executed by this tab (so the declarations and the execute arms cannot
+/// drift apart); modes, ids of the session or of another owner (the shared zoom commands are the
+/// canvas's), and unknown ids are refused untouched.
 #[test]
 fn run_command_handles_exactly_its_own_commands() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -134,21 +134,22 @@ fn run_command_handles_exactly_its_own_commands() {
         assert!(!host.run_command(&ctx, &project, ms_input::ActionId(foreign)), "{foreign:?} must not be handled by Translation");
     }
     for zoom in [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET] {
-        assert!(host.run_command(&ctx, &project, zoom), "{zoom:?}");
+        assert!(!host.run_command(&ctx, &project, zoom), "{zoom:?} is executed by the canvas");
     }
     for (id, kind, _, _) in golden_translation_rows() {
         assert_eq!(host.run_command(&ctx, &project, ms_input::ActionId(id)), kind == ActionKind::Command, "{id}");
     }
 }
 
-/// With the advanced-recognition window closed the host executes the shared zoom commands, so it
-/// publishes the context that lets the router fire (and consume) them.
+/// The host forwards its canvas's contexts (the Translation canvas edits bubbles and, with the
+/// advanced-recognition window closed, zooms), and publishes no brush context while no brush is on.
 #[test]
-fn the_host_publishes_the_view_zoom_context_while_it_zooms_itself() {
+fn the_host_forwards_the_canvas_contexts() {
     let dir = tempfile::tempdir().expect("temp dir");
     let host = host_in(dir.path(), &Value::Null);
     assert!(!host.state().blocks_canvas_zoom());
-    assert_eq!(host.input_contexts(), vec![VIEW_ZOOM_COMMANDS]);
+    assert!(!host.state().brush_input_active());
+    assert_eq!(host.input_contexts(), vec![ms_canvas::input::EDITABLE, ms_canvas::input::ZOOM_ACCEPTED]);
 }
 
 /// `new` seeds the bottom-hint collapsed flag from `Canvas.translation_hint_collapsed` (missing or

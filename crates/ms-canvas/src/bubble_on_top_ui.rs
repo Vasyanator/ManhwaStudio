@@ -20,6 +20,10 @@ Key functions:
 Notes:
 - Business logic and persistence remain in `bubble_runtime.rs`.
 - This module only drives existing `CanvasView` geometry/runtime helpers.
+- Input: drags, clicks and menus resolve through the frame's gestures (`input.rs`: body
+  `canvas.bubble.{select,menu,drag}`, move handle `canvas.bubble.move`, resize handles
+  `canvas.bubble.resize`; left button by default). The primary press-select is widget-owned
+  feedback. Every widget senses hover only while `bubble_widgets_locked` (zoom drag, pan).
 */
 
 use super::helpers::{
@@ -30,6 +34,7 @@ use super::types::{
 };
 use super::{
     CanvasHooks, CanvasView, ON_TOP_FOCUS_GAP_PX, ON_TOP_FOOTER_RESERVED_HEIGHT_PX, OnTopFocusMode,
+    input,
 };
 use ms_widgets::bubble_status::paint_bubble_status_border;
 use ms_project::{ProjectData, Side};
@@ -100,13 +105,15 @@ pub(super) fn draw_on_top_for_page(
         let response = ui.interact(
             rect,
             id,
-            if canvas.scene.zoom_drag_active {
+            if canvas.bubble_widgets_locked() {
                 Sense::hover()
             } else {
                 Sense::click_and_drag()
             },
         );
         let mut interacted_with_bubble = false;
+        // Widget-owned press feedback (not a binding): a primary press selects at once, so the
+        // focus controls appear under the pointer before the click completes.
         let pressed_primary_on_bubble = canvas.editable
             && response.is_pointer_button_down_on()
             && ui.ctx().input(|i| i.pointer.primary_down());
@@ -114,7 +121,7 @@ pub(super) fn draw_on_top_for_page(
             canvas.bubble_runtime.selected_bubble = Some(bid);
             interacted_with_bubble = true;
         }
-        if canvas.editable && response.clicked() {
+        if canvas.editable && canvas.gesture_clicked(&response, input::TARGET_BODY, input::BUBBLE_SELECT) {
             canvas.bubble_runtime.selected_bubble = Some(bid);
             interacted_with_bubble = true;
         }
@@ -123,13 +130,13 @@ pub(super) fn draw_on_top_for_page(
             && canvas.state.on_top_focus_mode == OnTopFocusMode::Aside
             && interacted_with_bubble;
         if canvas.editable
-            && !canvas.scene.zoom_drag_active
+            && !canvas.bubble_widgets_locked()
             && selected_now
             && canvas
                 .bubble_runtime
                 .on_top_drag_state
                 .is_none_or(|drag_state| drag_state.bid != bid)
-            && response.dragged()
+            && canvas.drag_hit(&response, input::TARGET_BODY, input::BUBBLE_DRAG).active
             && let Some(pos) = response.interact_pointer_pos()
         {
             let uv = CanvasView::uv_from_scene(image_rect, pos);
@@ -278,27 +285,29 @@ pub(super) fn draw_on_top_for_page(
                                 &new_original,
                             );
                         }
-                        if text_resp.response.secondary_clicked() {
-                            canvas.bubble_runtime.bubble_context_menu_misspelled_word =
-                                text_misspelled_word.clone();
-                        }
-                        text_resp.response.context_menu(|ui| {
-                            let outcome = canvas.show_bubble_context_menu(
-                                ui,
-                                BubbleMenuContext {
-                                    project,
-                                    bubble_id: bid,
-                                    bubble_type: snapshot.bubble_type,
-                                    original_text: &new_original,
-                                    translated_text: &new_text,
-                                    field: Some(BubbleTextField::Translation),
-                                },
-                            );
-                            interacted_with_bubble |= outcome.interacted;
-                            if outcome.command.is_some() {
-                                menu_command = outcome.command;
+                        if let Some((menu_opened, menu)) = canvas.bubble_menu_popup(&text_resp.response, input::TARGET_BODY) {
+                            if menu_opened {
+                                canvas.bubble_runtime.bubble_context_menu_misspelled_word =
+                                    text_misspelled_word.clone();
                             }
-                        });
+                            menu.show(|ui| {
+                                let outcome = canvas.show_bubble_context_menu(
+                                    ui,
+                                    BubbleMenuContext {
+                                        project,
+                                        bubble_id: bid,
+                                        bubble_type: snapshot.bubble_type,
+                                        original_text: &new_original,
+                                        translated_text: &new_text,
+                                        field: Some(BubbleTextField::Translation),
+                                    },
+                                );
+                                interacted_with_bubble |= outcome.interacted;
+                                if outcome.command.is_some() {
+                                    menu_command = outcome.command;
+                                }
+                            });
+                        }
                     });
             } else {
                 egui::ScrollArea::vertical()
@@ -412,27 +421,29 @@ pub(super) fn draw_on_top_for_page(
             if orig_resp.response.lost_focus() {
                 canvas.commit_text_upsert_now(bid);
             }
-            if orig_resp.response.secondary_clicked() {
-                canvas.bubble_runtime.bubble_context_menu_misspelled_word =
-                    orig_misspelled_word.clone();
-            }
-            orig_resp.response.context_menu(|ui| {
-                let outcome = canvas.show_bubble_context_menu(
-                    ui,
-                    BubbleMenuContext {
-                        project,
-                        bubble_id: bid,
-                        bubble_type: snapshot.bubble_type,
-                        original_text: &new_original,
-                        translated_text: &new_text,
-                        field: Some(BubbleTextField::Original),
-                    },
-                );
-                interacted_with_bubble |= outcome.interacted;
-                if outcome.command.is_some() {
-                    menu_command = outcome.command;
+            if let Some((menu_opened, menu)) = canvas.bubble_menu_popup(&orig_resp.response, input::TARGET_BODY) {
+                if menu_opened {
+                    canvas.bubble_runtime.bubble_context_menu_misspelled_word =
+                        orig_misspelled_word.clone();
                 }
-            });
+                menu.show(|ui| {
+                    let outcome = canvas.show_bubble_context_menu(
+                        ui,
+                        BubbleMenuContext {
+                            project,
+                            bubble_id: bid,
+                            bubble_type: snapshot.bubble_type,
+                            original_text: &new_original,
+                            translated_text: &new_text,
+                            field: Some(BubbleTextField::Original),
+                        },
+                    );
+                    interacted_with_bubble |= outcome.interacted;
+                    if outcome.command.is_some() {
+                        menu_command = outcome.command;
+                    }
+                });
+            }
             if original_rect.intersect(scene_clip_rect).is_positive() {
                 hit_rect = hit_rect.union(original_rect.intersect(scene_clip_rect));
             }
@@ -481,26 +492,28 @@ pub(super) fn draw_on_top_for_page(
                 bubble.mounted = true;
             }
         }
-        response.context_menu(|ui| {
-            let outcome = canvas.show_bubble_context_menu(
-                ui,
-                BubbleMenuContext {
-                    project,
-                    bubble_id: bid,
-                    bubble_type: snapshot.bubble_type,
-                    original_text: &new_original,
-                    translated_text: &new_text,
-                    // Bubble-body menu: no target field, so no per-field items.
-                    field: None,
-                },
-            );
-            interacted_with_bubble |= outcome.interacted;
-            if outcome.command.is_some() {
-                menu_command = outcome.command;
+        if let Some((menu_opened, menu)) = canvas.bubble_menu_popup(&response, input::TARGET_BODY) {
+            if menu_opened {
+                canvas.bubble_runtime.bubble_context_menu_misspelled_word = None;
             }
-        });
-        if response.secondary_clicked() {
-            canvas.bubble_runtime.bubble_context_menu_misspelled_word = None;
+            menu.show(|ui| {
+                let outcome = canvas.show_bubble_context_menu(
+                    ui,
+                    BubbleMenuContext {
+                        project,
+                        bubble_id: bid,
+                        bubble_type: snapshot.bubble_type,
+                        original_text: &new_original,
+                        translated_text: &new_text,
+                        // Bubble-body menu: no target field, so no per-field items.
+                        field: None,
+                    },
+                );
+                interacted_with_bubble |= outcome.interacted;
+                if outcome.command.is_some() {
+                    menu_command = outcome.command;
+                }
+            });
         }
 
         let show_rect = canvas.editable
@@ -520,7 +533,7 @@ pub(super) fn draw_on_top_for_page(
             );
         }
 
-        if show_rect && !canvas.scene.zoom_drag_active {
+        if show_rect && !canvas.bubble_widgets_locked() {
             let handle_rect = on_top_move_handle_rect(rect);
             let handle_id = Id::new(("on_top_move_handle", bid));
             let handle_response = ui.interact(handle_rect, handle_id, Sense::click_and_drag());
@@ -564,21 +577,22 @@ pub(super) fn draw_on_top_for_page(
                 canvas.bubble_runtime.selected_bubble = Some(bid);
                 interacted_with_bubble = true;
             }
-            if handle_response.drag_started()
+            let handle_drag = canvas.drag_hit(&handle_response, input::TARGET_MOVE_HANDLE, input::BUBBLE_MOVE);
+            if handle_drag.started
                 && let Some(pos) = handle_response.interact_pointer_pos()
             {
                 start_on_top_drag(canvas, bid, pos);
                 canvas.bubble_runtime.selected_bubble = Some(bid);
                 interacted_with_bubble = true;
             }
-            if handle_response.dragged()
+            if handle_drag.active
                 && let Some(pos) = handle_response.interact_pointer_pos()
             {
                 drag_on_top_by_pointer(canvas, bid, image_rect, pos);
                 canvas.bubble_runtime.selected_bubble = Some(bid);
                 interacted_with_bubble = true;
             }
-            if handle_active && handle_response.drag_stopped() {
+            if handle_active && handle_drag.stopped {
                 finish_on_top_drag(canvas, bid);
                 interacted_with_bubble = true;
             }
@@ -680,7 +694,9 @@ pub(super) fn draw_rect_handles(
     for (idx, point) in points.iter().enumerate() {
         let handle_rect = Rect::from_center_size(*point, egui::vec2(10.0, 10.0));
         let id = Id::new(("rect_handle", bid, idx));
-        let response = ui.interact(handle_rect, id, Sense::click_and_drag());
+        // Gated like its sibling bubble widgets: a zoom drag or `view.pan` never resizes.
+        let sense = if canvas.bubble_widgets_locked() { Sense::hover() } else { Sense::click_and_drag() };
+        let response = ui.interact(handle_rect, id, sense);
         // A finger must reach the handle, not pan the page under it (touch hole).
         canvas.note_touch_handle_hole(ui, handle_rect);
 
@@ -691,7 +707,8 @@ pub(super) fn draw_rect_handles(
             Stroke::new(1.0, ms_theme::canvas::SELECTION),
         );
 
-        if response.dragged() {
+        let resize = canvas.drag_hit(&response, input::TARGET_HANDLE, input::BUBBLE_RESIZE);
+        if resize.active {
             canvas.bubble_runtime.active_rect_handle = Some((bid, idx));
             if let Some(pos) = response.interact_pointer_pos() {
                 // `resize_rect_by_handle` re-queues `bid` in `pending_upsert` every dragged frame
@@ -699,7 +716,7 @@ pub(super) fn draw_rect_handles(
                 resize_rect_by_handle(canvas, bid, idx, image_rect, pos);
             }
         }
-        if response.drag_stopped() {
+        if resize.stopped {
             // Clearing the active handle re-enables the debounced flush; the id is already in
             // `pending_upsert` from the final `resize_rect_by_handle` call above, so the next flush
             // commits the final rect. Unlike the area-handle `drag_stopped` path (which inserts

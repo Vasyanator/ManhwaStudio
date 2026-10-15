@@ -785,7 +785,9 @@ saving, and export.
   - `tests.rs`: `#[cfg(test)]` unit tests for the panel.
 - `mask.rs`: per-page binary clipping masks stored as `mask_page_{idx}.png`,
   tiled mask preview textures, brush/fill editing, async loading/saving, and export
-  snapshots. Its UI is the `typing.mask` dock tab body (`draw_mask_tab_body`); the
+  snapshots. The brush radius follows the shared brush actions (`ms_tools::mask_brush`):
+  `studio_tab` publishes `BRUSH_ACTIVE` while the panel is open and the tab applies them before
+  drawing (`apply_brush_input`). Its UI is the `typing.mask` dock tab body (`draw_mask_tab_body`); the
   status line's TTL is ticked every frame by `expire_status_error`, since the body only
   runs while the panel is open.
 - `auto_typing.rs`: optical center computation for rendered overlays and region-growing

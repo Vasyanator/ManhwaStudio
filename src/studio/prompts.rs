@@ -157,6 +157,15 @@ impl AiDevicePrompt {
         }
     }
 
+    /// Whether the prompt is shown this frame under `health`: exactly what [`Self::draw`] will
+    /// return for the same snapshot, without drawing. The studio reads it right after
+    /// [`Self::refresh`] and BEFORE the input router runs, so input is suppressed from the very
+    /// frame the prompt appears.
+    #[must_use]
+    pub(crate) fn is_open_for(&self, health: &AiBackendHealthSnapshot) -> bool {
+        self.open && needs_device_selection(health)
+    }
+
     /// Draws the prompt when open; returns whether it is still open after this frame.
     ///
     /// Closes (returning `false`) as soon as `health` no longer asks for a selection. Confirm
@@ -417,6 +426,16 @@ mod tests {
         let ctx = egui::Context::default();
         let mut prompt = ComicTypePrompt::new(false);
         assert_eq!(prompt.draw(&ctx), None);
+    }
+
+    #[test]
+    fn is_open_for_predicts_the_draw_result_without_drawing() {
+        let mut prompt = AiDevicePrompt::default();
+        let asking = health(true, false);
+        assert!(!prompt.is_open_for(&asking), "a prompt that was never refreshed is closed");
+        prompt.refresh(&asking, None);
+        assert!(prompt.is_open_for(&asking), "refresh opens it in the same frame");
+        assert!(!prompt.is_open_for(&health(false, false)), "a snapshot that no longer asks closes it at the next draw");
     }
 
     #[test]

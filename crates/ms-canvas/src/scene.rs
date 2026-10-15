@@ -26,7 +26,9 @@ Key functions:
 - CanvasView::draw_canvas_page_on_top_layer()
 - CanvasView::capture_pending_view_anchor() (wheel/keyboard zoom anchor = its `prev == new` case)
 - CanvasView::handle_canvas_page_interactions() / canvas_context_menu_target_at() (page menu:
-  secondary click and finger long-press share the target code and `context_menu_popup`)
+  the `canvas.page.menu` gesture and a finger long-press share the target code and
+  `context_menu_popup`; `canvas.page.click` goes to `CanvasHooks::on_page_click` first)
+- CanvasView::bubble_widgets_locked() (zoom drag or `view.pan`: bubble widgets sense hover only)
 - CanvasView::draw_canvas_viewport_ui()
 - CanvasView::draw_ribbon_tab_body()
 - CanvasView::draw_canvas_bottom_hint()
@@ -61,7 +63,7 @@ use super::touch::context_menu_open_pos;
 use super::view_transform::DVec2;
 use super::{
     BubbleCopyPasteTarget, CanvasHintHelp, CanvasHintRow, CanvasHooks, CanvasUiStatus, CanvasView,
-    OnTopFocusMode, ViewTransform,
+    OnTopFocusMode, ViewTransform, input,
 };
 use ms_models::page_view::{PageImageInfo, PageTexture, SourcePageLoadState};
 use ms_project::ProjectData;
@@ -196,6 +198,9 @@ pub(super) struct CanvasSceneState {
     pub(super) zoom_blocked: bool,
     pub(super) zoom_drag_active: bool,
     pub(super) zoom_drag_last_x: f32,
+    /// `view.pan` is held this frame (set by `begin_canvas_frame`): the ScrollArea drag-scrolls
+    /// and the bubble widgets sense hover only (`bubble_widgets_locked`).
+    pub(super) pan_mode_active: bool,
     pub(super) visible_scene_rect: Option<Rect>,
     pub(super) scroll_inner_rect: Option<Rect>,
     pub(super) scroll_content_size: Vec2,
@@ -238,28 +243,29 @@ pub(super) struct CanvasSceneState {
     /// frame (`CanvasView::add_touch_drag_region`) and `publish_touch_surface` drains them.
     pub(super) touch_drag_regions: Vec<Vec<Pos2>>,
     /// This frame's drag-region drag (`TouchOutput::region_drag`), read by the tab through
-    /// `CanvasView::touch_region_drag`. Set by `handle_shortcuts`.
+    /// `CanvasView::touch_region_drag`. Set by `apply_input_frame`.
     pub(super) touch_region_drag: Option<TouchSelection>,
     /// This frame's long-press selection drag (`TouchOutput::selection`), read by the tab's
-    /// capture mode through `CanvasView::touch_selection`. Set by `handle_shortcuts`.
+    /// capture mode through `CanvasView::touch_selection`. Set by `apply_input_frame`.
     pub(super) touch_selection: Option<TouchSelection>,
     /// Finger long-press point of this frame (`TouchOutput::long_press_at`): the page under it
-    /// opens its context menu through the secondary-click path. Set by `handle_shortcuts`.
+    /// opens its context menu through the secondary-click path. Set by `apply_input_frame`.
     pub(super) touch_long_press_at: Option<Pos2>,
     /// Point of a finger long-press that is armed and still held (`TouchOutput::
-    /// long_press_armed_at`), drawn as feedback. Set by `handle_shortcuts`.
+    /// long_press_armed_at`), drawn as feedback. Set by `apply_input_frame`.
     pub(super) touch_long_press_armed_at: Option<Pos2>,
     /// Finger tap point of this frame (`TouchOutput::tap_at`), read by tabs through
-    /// `CanvasView::touch_tap` for dismiss/commit decisions only. Set by `handle_shortcuts`.
+    /// `CanvasView::touch_tap` for dismiss/commit decisions only. Set by `apply_input_frame`.
     pub(super) touch_tap_at: Option<Pos2>,
-    /// Screen rect of the collapsible bottom-center keyboard-shortcut hint drawn last frame, or
-    /// `None` when the owning tab supplied no hint. Used to occlude canvas zoom/drag input under
-    /// the hint. Reset each frame with the other per-frame scene rects.
+    /// Screen rect of the collapsible bottom-center keyboard-shortcut hint drawn this frame, or
+    /// `None` when the owning tab supplied no hint. A hole of the view surface (no canvas zoom /
+    /// drag input under the hint) and of the touch surface. Reset each frame with the other
+    /// per-frame scene rects.
     pub(super) canvas_bottom_hint_rect: Option<Rect>,
-    /// Screen rect of the floating Hangul keyboard window drawn last frame, or `None` when the
-    /// panel is closed. Folded into the same `inside_canvas` occlusion test as
-    /// `canvas_bottom_hint_rect`: without it the mouse wheel over the panel would zoom the page
-    /// underneath. Reset each frame with the other per-frame scene rects.
+    /// Screen rect of the floating Hangul keyboard window drawn this frame, or `None` when the
+    /// panel is closed. A hole of the view surface like `canvas_bottom_hint_rect`: without it the
+    /// mouse wheel over the panel would zoom the page underneath. Reset each frame with the other
+    /// per-frame scene rects.
     pub(super) canvas_hangul_keyboard_rect: Option<Rect>,
     /// Fully-expanded size of the bottom-hint body measured on the last frame it was drawn at full
     /// reveal. Drives the height-clip reveal animation so the panel grows/shrinks from the bottom
@@ -324,6 +330,7 @@ impl Default for CanvasSceneState {
             zoom_blocked: false,
             zoom_drag_active: false,
             zoom_drag_last_x: 0.0,
+            pan_mode_active: false,
             visible_scene_rect: None,
             scroll_inner_rect: None,
             scroll_content_size: Vec2::ZERO,
@@ -832,6 +839,10 @@ impl CanvasView {
         )
     }
 
+    /// Selects the on-top bubble under a primary press in `OnTopFocusMode::Aside` before the
+    /// widgets run (their hit rects belong to the aside cards in that mode). Widget-owned press
+    /// feedback like the press-select of the bubble widgets, not a binding; off while the bubble
+    /// widgets are locked (zoom drag, `view.pan`).
     fn prime_on_top_aside_focus_selection(
         &mut self,
         ctx: &egui::Context,
@@ -841,6 +852,7 @@ impl CanvasView {
         if !self.editable
             || self.state.on_top_focus_mode != OnTopFocusMode::Aside
             || frame.zoom_drag_active
+            || frame.space_pan_drag_enabled
         {
             return;
         }
@@ -882,6 +894,13 @@ impl CanvasView {
         zoom_drag_active: bool,
         hooks: &mut dyn CanvasHooks,
     ) -> CanvasFrameParams {
+        // `view.pan` (Space by default) is a held mode the router reports; it never activates
+        // while a text edit has focus, so typing a space in a bubble field does not pan.
+        let pan_mode_active = self
+            .input_frame
+            .as_ref()
+            .is_some_and(|input| input.mode_active(ms_input::view::PAN));
+        self.scene.pan_mode_active = pan_mode_active;
         CanvasFrameParams {
             canvas_rect,
             suppress_wheel_scroll,
@@ -890,9 +909,16 @@ impl CanvasView {
             overlays_enabled: self.overlay_runtime.overlays_model.is_some()
                 && self.overlay_runtime.overlays_visible
                 && !self.overlay_runtime.overlay_render_suppressed,
-            space_pan_drag_enabled: ctx.input(|i| i.key_down(egui::Key::Space))
-                && !ctx.egui_wants_keyboard_input(),
+            space_pan_drag_enabled: pan_mode_active,
         }
+    }
+
+    /// Whether the bubble widgets sense hover only this frame: a zoom drag runs, or `view.pan` is
+    /// held — then a drag that starts on a bubble, card or handle goes to the `ScrollArea`
+    /// (pans) instead of moving the bubble.
+    #[must_use]
+    pub(super) fn bubble_widgets_locked(&self) -> bool {
+        self.scene.zoom_drag_active || self.scene.pan_mode_active
     }
 
     pub(super) fn draw_canvas_scene(
@@ -1579,21 +1605,26 @@ impl CanvasView {
         hooks: &mut dyn CanvasHooks,
         frame: CanvasFrameParams,
     ) {
-        // A secondary click and a finger long-press open the page menu through the SAME target
-        // code; only the open position differs (see `touch::context_menu_open_pos`).
-        let secondary_click_pos = if response.secondary_clicked() {
+        // The `canvas.page.menu` gesture and a finger long-press open the page menu through the
+        // SAME target code; only the open position differs (see `touch::context_menu_open_pos`).
+        // `None`: egui reports a secondary click the menu binding does not own (another modifier
+        // held, the menu rebound): the menu is skipped this frame.
+        let page_menu = self.page_menu_clicked(response);
+        let menu_click_pos = if page_menu == Some(true) {
             response.interact_pointer_pos()
         } else {
             None
         };
         let open_pos = context_menu_open_pos(
-            secondary_click_pos,
+            menu_click_pos,
             self.scene.touch_long_press_at,
             response.rect,
         );
-        // The long-press that opened this page's menu this frame, handed to the popup as its
-        // anchor (a finger has no hover position for egui's own anchoring).
-        let mut menu_long_press_at = None;
+        // The point that opened this page's menu this frame when it was not egui's own secondary
+        // click (a finger long-press, or a menu binding on another button), handed to the popup
+        // as its anchor: a finger has no hover position for egui's own anchoring, and the popup
+        // helper opens by itself only on a secondary click.
+        let mut menu_anchor_at = None;
         if self.editable
             && !frame.hook_claims_shift_drag
             && !frame.zoom_drag_active
@@ -1602,20 +1633,21 @@ impl CanvasView {
         {
             self.bubble_runtime.canvas_context_menu_target =
                 self.canvas_context_menu_target_at(page_frame, open_pos);
-            if secondary_click_pos.is_none()
+            if !response.secondary_clicked()
                 && self.bubble_runtime.canvas_context_menu_target.is_some()
             {
-                menu_long_press_at = Some(open_pos);
+                menu_anchor_at = Some(open_pos);
             }
         }
         if self.editable
+            && page_menu.is_some()
             && !hooks.suppress_canvas_page_context_menu(page_frame.page_idx)
             && self
                 .bubble_runtime
                 .canvas_context_menu_target
                 .is_some_and(|target| target.page_idx == page_frame.page_idx)
         {
-            context_menu_popup(response, menu_long_press_at).show(|ui| {
+            context_menu_popup(response, menu_anchor_at).show(|ui| {
                 let handled_by_hook = self
                     .bubble_runtime
                     .canvas_context_menu_target
@@ -1722,9 +1754,14 @@ impl CanvasView {
                 }
             });
         }
-        if !frame.hook_claims_shift_drag && !frame.zoom_drag_active && response.clicked() {
+        if !frame.hook_claims_shift_drag
+            && !frame.zoom_drag_active
+            && self.gesture_clicked(response, input::TARGET_PAGE, input::PAGE_CLICK)
+        {
             self.bubble_runtime.canvas_context_menu_target = None;
-            if let Some(mouse_pos) = response.interact_pointer_pos() {
+            if let Some(mouse_pos) = response.interact_pointer_pos()
+                && !hooks.on_page_click(page_frame.page_idx, mouse_pos)
+            {
                 if let Some(bid) = self.bubble_runtime.move_active_bid {
                     self.place_or_move_bubble(
                         bid,
@@ -1791,7 +1828,7 @@ impl CanvasView {
         };
         ui.label(format!("{} / {}", cur_page, total_pages.max(1)));
         ui.add_space(2.0);
-        Self::draw_zoom_and_shortcuts_row(ui, &format!("{:.1}×", self.state.zoom));
+        Self::draw_zoom_and_shortcuts_row(ui, &format!("{:.1}×", self.state.zoom), self.labels.chip_rows());
         ui.add_space(4.0);
         ui.checkbox(&mut self.state.show_bubbles, t!("canvas.controls.show_bubbles"));
         ui.add(
@@ -1810,13 +1847,15 @@ impl CanvasView {
     /// only: `CollapsiblePanel` reports back the width it was GIVEN, never the drawn one
     /// (`panel_dock/panel.rs::measured_size`). Stretching therefore cannot become a size request
     /// and the panel stays shrinkable, so the chip can simply right-align against the body.
-    fn draw_zoom_and_shortcuts_row(ui: &mut egui::Ui, zoom_text: &str) {
+    ///
+    /// `chip_rows` are the canvas' shortcut rows (`input::CanvasLabels`), rendered by the chip.
+    fn draw_zoom_and_shortcuts_row(ui: &mut egui::Ui, zoom_text: &str, chip_rows: &[CanvasHintRow]) {
         egui::containers::Sides::new().show(
             ui,
             |ui| {
                 ui.label(zoom_text);
             },
-            Self::draw_canvas_shortcuts_chip,
+            |ui| Self::draw_canvas_shortcuts_chip(ui, chip_rows),
         );
     }
 
@@ -1827,7 +1866,7 @@ impl CanvasView {
     /// is drawn) and never overlaps the bar. Collapsed shows only an up-arrow toggle; expanded
     /// slides a popup panel up from the anchor line with the arrow riding above it. Clicking the
     /// arrow toggles `bottom_hint_collapsed`; the reveal is animated via `animate_bool_responsive`.
-    /// Stores the drawn rect in `scene.canvas_bottom_hint_rect` for input occlusion.
+    /// Stores the drawn rect in `scene.canvas_bottom_hint_rect` (a view / touch surface hole).
     pub(super) fn draw_canvas_bottom_hint(&mut self, ctx: &egui::Context, frame: &CanvasFrameParams) {
         // Gap in logical points between the hint's bottom edge and the scrollbar / viewport bottom.
         const GAP: f32 = 6.0;
@@ -1960,7 +1999,7 @@ impl CanvasView {
     /// # Warnings
     /// - **`help` does not work inside a tooltip.** The icon reveals its payload through its own
     ///   hover tooltip, and egui cannot open a tooltip inside a tooltip. Call sites that render this
-    ///   grid within `on_hover_ui` (see `Self::canvas_shortcut_rows`) must keep every `help` at
+    ///   grid within `on_hover_ui` (the shortcuts chip, `input::CanvasLabels`) must keep every `help` at
     ///   `None`.
     /// - **`min_col_width(0.0)` assumes wide label/keys.** `Grid::min_col_width` is global to all
     ///   columns (`egui-0.35.0/src/grid.rs:372-378`) and defaults to `Spacing::interact_size.x`
@@ -1999,54 +2038,23 @@ impl CanvasView {
         });
     }
 
-    /// Fixed, localized list of the canvas's own navigation shortcuts (zoom, pan, scroll) shown by
-    /// the canvas-shortcuts hover chip. These are canvas-intrinsic behaviours, identical across all
-    /// tabs; rebuilt each call so a runtime language switch is reflected.
+    /// Renders the canvas-shortcuts hover chip inline into `ui`: a subtle, non-interactive weak
+    /// label (`canvas.shortcuts_hint.title`) that reveals the shared viewer actions (zoom, pan,
+    /// scroll) with their CURRENT bindings as a tooltip on hover. `rows` come from the input
+    /// registry (`input::CanvasLabels`: action title + binding label, alternatives " / "), so a
+    /// rebinding shows here at once. Drawn on the zoom row of the controls panel (see
+    /// `draw_ribbon_tab_body`); hover-only, so it takes no click and has no persisted state.
     ///
     /// # Warning
-    /// These rows must never carry `help`: the chip renders them inside its hover tooltip
-    /// (`Self::draw_canvas_shortcuts_chip`), and a "?" icon there could not open its own tooltip.
-    fn canvas_shortcut_rows() -> Vec<CanvasHintRow> {
-        vec![
-            CanvasHintRow::new(
-                t!("canvas.shortcuts_hint.zoom_cursor_label"),
-                t!("canvas.shortcuts_hint.zoom_cursor_keys"),
-            ),
-            CanvasHintRow::new(
-                t!("canvas.shortcuts_hint.zoom_in_out_label"),
-                t!("canvas.shortcuts_hint.zoom_in_out_keys"),
-            ),
-            CanvasHintRow::new(
-                t!("canvas.shortcuts_hint.zoom_reset_label"),
-                t!("canvas.shortcuts_hint.zoom_reset_keys"),
-            ),
-            CanvasHintRow::new(
-                t!("canvas.shortcuts_hint.pan_label"),
-                t!("canvas.shortcuts_hint.pan_keys"),
-            ),
-            CanvasHintRow::new(
-                t!("canvas.shortcuts_hint.scroll_label"),
-                t!("canvas.shortcuts_hint.scroll_keys"),
-            ),
-            CanvasHintRow::new(
-                t!("canvas.shortcuts_hint.scroll_horizontal_label"),
-                t!("canvas.shortcuts_hint.scroll_horizontal_keys"),
-            ),
-        ]
-    }
-
-    /// Renders the canvas-shortcuts hover chip inline into `ui`: a subtle, non-interactive weak
-    /// label (`canvas.shortcuts_hint.title`) that reveals the canvas's own navigation shortcuts
-    /// (zoom, pan, scroll) as a tooltip on hover. Drawn on the zoom row of the controls panel
-    /// (see `draw_ribbon_tab_body`); hover-only, so it takes no click and has no persisted state.
-    fn draw_canvas_shortcuts_chip(ui: &mut egui::Ui) {
-        let rows = Self::canvas_shortcut_rows();
+    /// These rows must never carry `help`: the chip renders them inside its hover tooltip, and a
+    /// "?" icon there could not open its own tooltip.
+    fn draw_canvas_shortcuts_chip(ui: &mut egui::Ui, rows: &[CanvasHintRow]) {
         let label = egui::Label::new(egui::RichText::new(t!("canvas.shortcuts_hint.title")).weak())
             // Keep the chip on a single line; the panel is sized by the wider rows below, so it fits.
             .wrap_mode(egui::TextWrapMode::Extend)
             .sense(egui::Sense::hover());
         ui.add(label).on_hover_ui(|ui| {
-            Self::draw_hint_rows_grid(ui, "canvas_shortcuts_hint_grid", &rows);
+            Self::draw_hint_rows_grid(ui, "canvas_shortcuts_hint_grid", rows);
         });
     }
 
@@ -2673,18 +2681,6 @@ mod tests {
             ]),
             3,
             "a single helped row switches the whole grid to three columns"
-        );
-    }
-
-    #[test]
-    fn canvas_shortcut_rows_carry_no_help() {
-        // Contract: the shortcuts chip renders these rows inside its hover tooltip, where a "?"
-        // icon could not open its own tooltip. Every row must stay help-free.
-        assert!(
-            CanvasView::canvas_shortcut_rows()
-                .iter()
-                .all(|row| row.help.is_none()),
-            "shortcut chip rows must not carry help"
         );
     }
 

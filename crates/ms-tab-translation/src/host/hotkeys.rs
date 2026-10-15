@@ -9,21 +9,19 @@ Key items:
 - `HOTKEY_TRANSLATION_DELETE_BUBBLE` / `_CREATE_BUBBLE` / `_CREATE_HINT_BUBBLE`: the three canvas
   command ids. They are persistence keys (`user_config` -> `Hotkeys`): never rename them.
 - `host_input_actions`: those three command specs, in declaration order.
-- `TranslationTab::run_fired_commands`: the execute arms (the shared view zoom commands, bubble
-  create/delete/copy/paste, panel toggles), each with the tab's own block check.
+- `TranslationTab::run_fired_commands`: the execute arms (bubble create/delete/copy/paste, panel
+  toggles), each with the tab's own block check.
 - `hotkey_hints`: the binding texts (registry labels, alternatives joined by " / ") and the two
   OCR selection-mode "held" flags, rebuilt every frame.
 
 Notes:
-- Zoom is the shared `ms_input::view` set. While `CanvasView` still reads its own zoom keys, the
-  host executes `view.zoom_in` / `zoom_out` / `zoom_reset` itself and publishes
-  `ms_studio_tab::VIEW_ZOOM_COMMANDS` only while it does (not while the advanced-recognition
-  window blocks canvas zoom), so the router consumes those keys only then (removed by WP5).
+- Zoom is the shared `ms_input::view` set, executed by the canvas itself (`CanvasView` reads it
+  from the frame); the host only forwards the canvas's contexts (`StudioTab::input_contexts`).
 - The OCR selection modes are `ModeSpec`s read through `InputFrame::mode_active`.
 */
 
 use ms_canvas::BubbleTextField;
-use ms_input::{ActionId, ActionSpec, InputFrame, InputRegistry, view};
+use ms_input::{ActionId, ActionSpec, InputFrame, InputRegistry};
 use ms_project::ProjectData;
 
 use super::TranslationTab;
@@ -43,9 +41,6 @@ pub(super) const HOTKEY_TRANSLATION_DELETE_BUBBLE: ActionId = ActionId("translat
 pub(super) const HOTKEY_TRANSLATION_CREATE_BUBBLE: ActionId = ActionId("translation.bubble.create_at_cursor");
 /// Creates a hint bubble at the pointer (default H). Persistence key, never rename.
 pub(super) const HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE: ActionId = ActionId("translation.bubble.create_hint_at_cursor");
-
-/// Zoom factor of one zoom-in command; zoom out divides by it.
-const ZOOM_SHORTCUT_STEP: f32 = 1.1;
 
 /// The three canvas-level Translation commands the host declares, in declaration order (delete,
 /// create, create hint). The tab state's own actions (`TranslationTabState::input_actions`)
@@ -100,21 +95,6 @@ impl TranslationTab {
     pub(super) fn run_command(&mut self, ctx: &egui::Context, project: &ProjectData, action: ActionId) -> bool {
         let Self { canvas, state, .. } = self;
         match action {
-            view::ZOOM_IN => {
-                if !state.blocks_canvas_zoom() {
-                    canvas.zoom_by_shortcut(ZOOM_SHORTCUT_STEP);
-                }
-            }
-            view::ZOOM_OUT => {
-                if !state.blocks_canvas_zoom() {
-                    canvas.zoom_by_shortcut(1.0 / ZOOM_SHORTCUT_STEP);
-                }
-            }
-            view::ZOOM_RESET => {
-                if !state.blocks_canvas_zoom() {
-                    canvas.reset_zoom_shortcut();
-                }
-            }
             HOTKEY_TRANSLATION_DELETE_BUBBLE => {
                 if !state.blocks_canvas_bubble_hotkeys() {
                     canvas.delete_selected_bubble_shortcut();

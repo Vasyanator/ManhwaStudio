@@ -95,6 +95,11 @@ impl TypingTextOverlayLayer {
         self.shape_variant_preview = None;
     }
 
+    /// Whether a raster layer is selected (its Ctrl+wheel rotation shadows the canvas zoom).
+    pub(super) fn has_selected_raster(&self) -> bool {
+        self.selected_raster_idx.is_some()
+    }
+
     pub(super) fn has_selected_overlay(&self) -> bool {
         self.selected_overlay_idx
             .and_then(|idx| self.overlays.get(idx))

@@ -6,10 +6,11 @@ The studio Settings tab's answer to the studio root's order-free per-tab hooks
 (`ms_studio_tab::StudioTab`), so `src/studio/tabs.rs` (`Tabs`) can iterate all ten program tabs.
 
 Key items:
-- `impl StudioTab for SettingsTabState`: empty.
+- `impl StudioTab for SettingsTabState`: only `flush_debounced_stores_blocking` (the hotkeys
+  pane's override-writer barrier).
 
 Notes:
-- Every hook keeps its no-op default on purpose: the Settings tab hosts no panel dock, declares
+- Every other hook keeps its no-op default on purpose: the Settings tab hosts no panel dock, declares
   no hotkeys (it EDITS the registry, lent through the draw frame), draws no source pages, owns no
   GPU cache in the root's pressure eviction, polls nothing outside its own draw, writes no
   exit-only setting (its own settings are persisted by its writers as they change) and caches no
@@ -20,4 +21,10 @@ use ms_studio_tab::StudioTab;
 
 use super::SettingsTabState;
 
-impl StudioTab for SettingsTabState {}
+impl StudioTab for SettingsTabState {
+    /// Waits until the hotkeys pane's queued binding changes are written (`user_config` ->
+    /// `Hotkeys`); runs on the studio teardown worker.
+    fn flush_debounced_stores_blocking(&mut self) {
+        self.hotkeys.flush_blocking();
+    }
+}

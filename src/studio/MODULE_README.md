@@ -39,14 +39,21 @@ Root responsibilities that stay in `studio.rs`:
   the worker polls and `sync_project_from_bubbles_model`, and BEFORE the top bar and the tab draw:
   matched keys are consumed before any widget sees them, and every consumer of the frame reads
   the same `InputFrame`. `FrameEnv` = the active tab, its `StudioTab::input_contexts`, and
-  `modal_open` (the comic-type prompt, or the AI device prompt as of the previous frame's draw).
+  `modal_open` (the comic-type prompt, or the AI device prompt: its health refresh and
+  `AiDevicePrompt::refresh` run right before the router and `is_open_for` decides this frame's
+  state; the prompt is still drawn after the tab). Also right before the router,
+  `cancel_capture_outside_settings` ends a binding capture whenever the active tab is not
+  Settings: the one owner of "a capture never outlives the Settings tab" (a capture suppresses
+  every binding).
   The session runs its own fired commands right after (`SessionMode::run_fired_commands`: the
   image set's save / save-as); the drawing tab gets the router through `TabFrame::input` (its
   frame and registry; the Settings pane edits the bindings, applied from the next frame).
-  Phase-B gate: the view set's zoom commands are registered with
-  `Condition::Context(ms_studio_tab::VIEW_ZOOM_COMMANDS)` (`gated_view_declarations`), so their
-  keys are consumed only while Translation or Cleaning executes them itself; removed by
-  input-unification WP5.
+  The registry also holds the canvas set (`ms_canvas::input::declarations`) and the shared brush
+  set (`ms_tools::mask_brush::declarations`). Canvas gate: the view set's zoom commands and zoom
+  axis are registered with `Condition::Context(ms_canvas::input::ZOOM_ACCEPTED)`
+  (`canvas_gated_view_declarations`), which a canvas tab forwards from its `CanvasView` while the
+  canvas executes them, so the keys and Ctrl+wheel stay with a tab's own readers while it blocks
+  canvas zoom, and with the PS editor; removed by input-unification WP6-WP8.
 - **Residency glue.** `studio.rs` supplies what residency must not know: the active tab's page
   window (`active_source_page_window`; for the page manager the one page its viewer draws), the
   pixel-inspection flag, and the eviction of the tabs' own GPU caches (`Tabs::evict_tab_gpu_caches`),

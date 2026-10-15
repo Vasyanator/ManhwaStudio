@@ -112,12 +112,17 @@ layer — instead of solving in a plane that does not contain it.
 - A gesture that crosses onto a DIFFERENT page is cancelled with a localized status and a log line,
   never applied and never truncated: a selection and the source it is dragged onto must live on one
   page. A COMPLETED selection survives that cancellation; a lasso still being drawn is discarded.
-- Dismissing the selection dismisses the WORK: Escape and the «clear selection» button both go
+- The core reads no key. The host turns its own cancel binding into `PatchInput { cancel }` and
+  calls `on_cancel` once per frame, and passes that binding's label to `draw_ui(ui, cancel_label)`
+  for the usage hint (`tools.patch.usage_hint`, `{cancel}`). Today both hosts still read Escape
+  themselves (the Cleaning tab until input-unification WP7 declares `cleaning.patch.cancel`; the
+  PS editor, outside the migration) and label it with `ms_input::button_label`.
+- Dismissing the selection dismisses the WORK: the cancel input and the «clear selection» button both go
   through `clear_selection`, which calls `cancel_in_flight` before it drops the selection, the live
   gesture and any parked end. A surviving job would land a patch for a selection the user has
   explicitly dismissed, over whatever was drawn in the meantime, and would keep `busy()` true so
   the next selection is refused with `status_busy`. Both entry points are pinned by a test.
-- `cancel_in_flight` is reachable from hooks that are handed no host (Escape, the controls pane),
+- `cancel_in_flight` is reachable from hooks that are handed no host (the cancel input, the controls pane),
   so it parks `host_cancel_pending` instead of calling the host; `draw_overlay_ui` and `deactivate`
   flush it. A host must therefore also make `start_region_load` reset its own retained state.
 - `deactivate` abandons everything in flight AND tells the host to drop what it retained: a host's

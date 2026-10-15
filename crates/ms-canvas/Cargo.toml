@@ -21,14 +21,18 @@ ms-project = { path = "../ms-project" }
 # document) plus `page_view`, the source-page geometry/texture view model it draws from.
 ms-models = { path = "../ms-models" }
 # Every reusable widget the canvas puts on screen (spellchecked fields, hangul keyboard,
-# marked scroll bars), plus `ui_fonts` (the bubble text family), `input_util` (raw wheel
-# delta for Ctrl+zoom) and `bubble_status` (the status-border painter).
+# marked scroll bars), plus `ui_fonts` (the bubble text family), `touch_nav` (finger gestures,
+# the canvas menu popup) and `bubble_status` (the status-border painter).
 ms-widgets = { path = "../ms-widgets" }
 # Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
 # hand-typed here. A leaf over egui, so it adds no layering constraint.
 ms-theme = { path = "../ms-theme" }
 # Localized canvas labels (`t!` / `tf!`), mounted crate-wide in `lib.rs`.
 ms-i18n = { path = "../ms-i18n" }
+# The unified input system: the canvas declares its actions / targets (`input.rs`), reads the
+# shared `view.*` set, its commands and its gestures from the frame's `InputFrame`, and publishes
+# its view surface. Sits below `ms-widgets`, so it adds no layering constraint.
+ms-input = { path = "../ms-input" }
 # Diagnostics for the canvas' own failure paths plus the `trace_log!` / `trace_scope!`
 # frame instrumentation.
 ms-log = { path = "../ms-log" }

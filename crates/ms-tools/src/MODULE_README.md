@@ -19,9 +19,18 @@ surroundings only through the `PatchHost` trait it defines, so it still depends 
 horizontal span to a caller-supplied closure, so the same geometry can be written into a `u8`
 selection mask, a `Vec<bool>` region mask, or anything else without duplicating the scanline code.
 
-`MaskBrush` stores only brush configuration and short-lived wheel gesture state. It handles brush
-radius changes from Shift+wheel and size hotkeys, draws a circle cursor in an egui image viewport,
-and paints continuous stroke segments by stamping filled circles along the segment.
+`MaskBrush` stores only brush configuration (radius and bounds). It draws a circle cursor in an
+egui image viewport and paints continuous stroke segments by stamping filled circles along the
+segment. `mask_brush` is also the shared BRUSH OWNER of the unified input system (`ms-input`):
+`declarations()` declares `brush.size` (Shift+wheel, also on the horizontal wheel), `brush.smaller`
+(-) and `brush.larger` (= / Shift+= / numpad +), scope `Sub(None)`, active only under the context
+`BRUSH_ACTIVE`; the studio registers them once, a brush host publishes `BRUSH_ACTIVE` while its
+brush mode is on and calls `MaskBrush::apply_input(&InputFrame)` once per frame (Translation mask
+edit and advanced recognition, Typing mask edit). The radius laws are `step_by_notches` (2 px per
+notch), `shrink_one_step` (`floor(r * 0.9)`) and `grow_one_step` (`ceil(r * 1.1)`), each at least
+one pixel and clamped. The raw `handle_wheel` / `handle_size_shortcuts` stay only as a
+transitional path for the Cleaning brushes until input-unification WP7 moves them to
+`apply_input`; no new host may call them.
 
 The painting functions are synchronous pixel-buffer helpers. Callers are responsible for invoking
 them only on appropriately scoped buffers, typically small masks, scratch overlays, or worker-owned
@@ -29,8 +38,9 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
 
 ## Files and submodules
 - `lib.rs`: crate root; shared-tool exports and the `ms-i18n` macro mount.
-- `mask_brush.rs`: `MaskBrush`, internal ColorImage painting helpers, binary-mask painting helpers,
-  radius input handling, and cursor drawing.
+- `mask_brush.rs` (public module): `MaskBrush`, internal ColorImage painting helpers, binary-mask
+  painting helpers, cursor drawing, and the shared brush input set (`declarations`,
+  `BRUSH_ACTIVE`, `apply_input`).
 - `sor.rs`: `red_black_sor_sweeps`, the ONE red-black SOR kernel of the project. Consumers are the
   cleaning tab's gradient fill and `patch/membrane.rs`.
 - `overlay_pixel.rs`: `overlay_pixel_for_final_color`, which solves the DENSE overlay pixel that
@@ -76,8 +86,9 @@ images. They perform bounds clipping and return early on invalid binary-mask dim
   behind `PatchHost`.
 
 ## Editing map
-- To change shared brush radius controls, cursor rendering, or stroke stamping, edit
-  `mask_brush.rs`.
+- To change shared brush radius controls (their bindings, laws or context), cursor rendering, or
+  stroke stamping, edit `mask_brush.rs` (bindings changes also show in the studio golden test
+  `input_registry_golden`).
 - To change lasso/polygon fill semantics (both the PS-editor selection and the cleaning tools),
   edit `crates/ms-raster/src/polygon.rs`; `ms_tools::fill_polygon_spans` is only a re-export.
 - To change the Laplacian/screened-Poisson solve shared by the gradient fill and the patch

@@ -61,7 +61,7 @@ use super::{
 use ms_canvas::OverlayRectPx;
 use ms_tools::overlay_pixel_for_final_color;
 use ms_tools::patch::{
-    PagePixelProjection, PatchCommit, PatchHost, PatchHostError, PatchRegionPoll,
+    PagePixelProjection, PatchCommit, PatchHost, PatchHostError, PatchInput, PatchRegionPoll,
     PatchRegionRequest, PatchToolCore,
 };
 use eframe::egui;
@@ -890,7 +890,8 @@ impl PsTool for PatchTool {
     /// only place the user can find out why a drag did nothing — so it belongs here rather than in
     /// `hotkey_rows`.
     fn options_ui(&mut self, ui: &mut egui::Ui) {
-        self.core.draw_ui(ui);
+        // The usage hint names the cancel key this host reads (`draw_overlay_ui`).
+        self.core.draw_ui(ui, &ms_input::button_label(&ms_input::Button::Key(egui::Key::Escape)));
         if let Some(Err(refusal)) = self.host.target {
             ui.colored_label(ui.visuals().error_fg_color, refusal.user_message());
         }
@@ -958,8 +959,8 @@ impl PsTool for PatchTool {
 
     /// The core's whole frame pass: resolve the parked gesture end, drive the job, paint.
     ///
-    /// Escape is handled here rather than from `PsToolContext::cancel_pressed` because the core's
-    /// `on_escape` reads the key from the `egui::Context`, which only this hook is handed.
+    /// Escape is read here (the PS editor still reads its keys raw) and handed to the core as
+    /// `PatchInput::cancel`; this is the hook that is handed the `egui::Context`.
     fn draw_overlay_ui(&mut self, ctx: &egui::Context, cx: PsToolOverlayCx) {
         self.host.geometry = Some(PageGeometry {
             view: cx.view,
@@ -967,7 +968,8 @@ impl PsTool for PatchTool {
             page_size: cx.page_size,
             page_idx: cx.page_idx,
         });
-        if self.core.on_escape(ctx) {
+        let cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        if self.core.on_cancel(PatchInput { cancel }) {
             self.host.status = None;
         }
         // Checked as `!primary_down || primary_released`, so a release followed by a fresh press

@@ -2,10 +2,16 @@
 FILE HEADER (tools/mask_brush.rs)
 - Назначение: общий примитив кисти для рисования маски в `egui::ColorImage`.
 - Ключевые сущности:
-  - `MaskBrush`: хранит радиус кисти и инкрементальный state wheel-жеста.
+  - `MaskBrush`: хранит радиус кисти и его границы.
+- Input (the shared brush owner of the unified input system, `ms-input`):
+  - `declarations()`: the brush actions every brush host shares — axis `brush.size` (Shift+wheel),
+    commands `brush.smaller` (-) / `brush.larger` (= / Shift+= / numpad +); scope `Sub(None)`,
+    active only while a host publishes `BRUSH_ACTIVE`.
+  - `MaskBrush::apply_input`: applies this frame's brush actions from an `InputFrame`.
+  - `MaskBrush::step_by_notches` / `shrink_one_step` / `grow_one_step`: the radius laws.
+  - `MaskBrush::handle_wheel` / `handle_size_shortcuts`: TRANSITIONAL raw-input path kept only
+    for the Cleaning brushes until input-unification WP7 moves them to `apply_input`.
 - Ключевые методы:
-  - `handle_wheel`: Shift+wheel меняет радиус без блокировки GUI потока.
-  - `handle_size_shortcuts`: hotkeys `-`, `=`, `+` для изменения размера.
   - `paint_mask_segment`: рисует/стирает сегмент маски круглой кистью.
   - `paint_binary_mask_segment`: рисует/стирает бинарную маску (`0/255`) без
     промежуточных аллокаций `ColorImage`.
@@ -17,13 +23,67 @@ FILE HEADER (tools/mask_brush.rs)
 
 use eframe::egui;
 use egui::{Color32, Pos2, Rect};
+use ms_input::{
+    ActionId, ActionMeta, ActionSpec, AxisSource, AxisSpec, Binding, Button, Chord, CommandSpec, Condition, ContextId, Declarations, InputFrame, ModifierKey, Scope,
+};
 
+/// Context a brush host publishes (`StudioTab::input_contexts`) while its brush mode is on; the
+/// brush actions are active only then.
+pub const BRUSH_ACTIVE: ContextId = ContextId("brush.active");
+/// Axis: brush size by wheel notches (Shift+wheel by default).
+pub const BRUSH_SIZE: ActionId = ActionId("brush.size");
+/// Command: shrink the brush one step.
+pub const BRUSH_SMALLER: ActionId = ActionId("brush.smaller");
+/// Command: grow the brush one step.
+pub const BRUSH_LARGER: ActionId = ActionId("brush.larger");
+
+const SECTION: &str = "tools.brush.section_title";
+
+fn brush_meta(id: ActionId, title_key: &'static str, defaults: Vec<Binding>) -> ActionMeta {
+    ActionMeta { id, title_key, section_key: SECTION, scope: Scope::Sub(None), when: vec![Condition::Context(BRUSH_ACTIVE)], defaults }
+}
+
+fn brush_command(id: ActionId, title_key: &'static str, chords: Vec<Chord>) -> ActionSpec {
+    ActionSpec::Command(CommandSpec { meta: brush_meta(id, title_key, chords.into_iter().map(Binding::command).collect()), accepts: Vec::new(), repeat: true })
+}
+
+/// The shared brush actions, registered once by the studio. Every brush host (Translation mask
+/// edit and advanced recognition, Typing mask edit, later the Cleaning brushes) publishes
+/// [`BRUSH_ACTIVE`] while its brush is on and calls [`MaskBrush::apply_input`].
+///
+/// Shift+wheel also has a horizontal-wheel alternative: some backends deliver Shift+wheel as
+/// horizontal scroll. The `+` key spellings (Shift+= and the numpad plus) keep the old `+` reading
+/// under physical-key matching.
+#[must_use]
+pub fn declarations() -> Declarations {
+    let shift = || Chord::new([Button::Modifier(ModifierKey::Shift)]);
+    let actions = vec![
+        ActionSpec::Axis(AxisSpec {
+            meta: brush_meta(BRUSH_SIZE, "tools.brush.size_title", vec![Binding::axis(AxisSource::WheelY, shift()), Binding::axis(AxisSource::WheelX, shift())]),
+        }),
+        brush_command(BRUSH_SMALLER, "tools.brush.smaller_title", vec![Chord::new([Button::Key(egui::Key::Minus)])]),
+        brush_command(
+            BRUSH_LARGER,
+            "tools.brush.larger_title",
+            vec![
+                Chord::new([Button::Key(egui::Key::Equals)]),
+                Chord::new([Button::Modifier(ModifierKey::Shift), Button::Key(egui::Key::Equals)]),
+                Chord::new([Button::Key(egui::Key::Plus)]),
+            ],
+        ),
+    ];
+    Declarations { actions, ..Declarations::default() }
+}
+
+/// A round mask brush: its radius in image pixels and the radius bounds.
 #[derive(Debug, Clone)]
 pub struct MaskBrush {
     radius_px: usize,
     min_radius_px: usize,
     max_radius_px: usize,
     wheel_step_px: usize,
+    /// Sub-notch wheel remainder of the transitional raw path (`handle_wheel`) only; the frame
+    /// path (`apply_input`) gets whole notches from the router.
     wheel_accum: f32,
 }
 
@@ -44,6 +104,7 @@ impl MaskBrush {
         self.radius_px
     }
 
+    /// Sets the radius, clamped to the brush bounds. Returns whether it changed.
     pub fn set_radius_px(&mut self, radius_px: usize) -> bool {
         let next = radius_px.clamp(self.min_radius_px, self.max_radius_px);
         if next == self.radius_px {
@@ -53,7 +114,56 @@ impl MaskBrush {
         true
     }
 
+    /// Applies this frame's brush actions from `input`: `brush.size` notches, then `brush.smaller`
+    /// / `brush.larger`. Call it once per frame while the host publishes [`BRUSH_ACTIVE`] (the
+    /// router fires them only then). Returns whether the radius changed.
+    pub fn apply_input(&mut self, input: &InputFrame) -> bool {
+        let mut changed = false;
+        if let Some(sample) = input.axis(BRUSH_SIZE) {
+            changed |= self.step_by_notches(sample.steps);
+        }
+        if input.fired(BRUSH_SMALLER).is_some() {
+            changed |= self.shrink_one_step();
+        }
+        if input.fired(BRUSH_LARGER).is_some() {
+            changed |= self.grow_one_step();
+        }
+        changed
+    }
+
+    /// Grows (positive) or shrinks (negative) the radius by `notches` wheel notches of
+    /// `wheel_step_px` each, clamped. Returns whether the radius changed.
+    pub fn step_by_notches(&mut self, notches: i32) -> bool {
+        if notches == 0 {
+            return false;
+        }
+        let step = self.wheel_step_px.saturating_mul(usize::try_from(notches.unsigned_abs()).unwrap_or(usize::MAX));
+        let next = if notches > 0 { self.radius_px.saturating_add(step) } else { self.radius_px.saturating_sub(step) };
+        self.set_radius_px(next.max(1))
+    }
+
+    /// Shrinks the radius to `floor(radius * 0.9)`, at least one pixel, never below the minimum.
+    /// Returns whether the radius changed.
+    pub fn shrink_one_step(&mut self) -> bool {
+        let next = (self.radius_px.saturating_mul(9) / 10).min(self.radius_px.saturating_sub(1));
+        self.set_radius_px(next.max(self.min_radius_px))
+    }
+
+    /// Grows the radius to `ceil(radius * 1.1)`, at least one pixel, never above the maximum.
+    /// Returns whether the radius changed.
+    pub fn grow_one_step(&mut self) -> bool {
+        let next = (self.radius_px.saturating_mul(11).saturating_add(9) / 10).max(self.radius_px.saturating_add(1));
+        self.set_radius_px(next.min(self.max_radius_px))
+    }
+
+    /// Transitional raw path: Shift + `delta_y` wheel points resize the brush (40 points per
+    /// notch). Returns `true` while Shift is held (the wheel belongs to the brush), `false` and a
+    /// reset remainder otherwise.
+    ///
+    /// Only for the Cleaning brushes, which still read the wheel themselves; removed when they
+    /// take [`Self::apply_input`] (input-unification WP7). New hosts never call it.
     pub fn handle_wheel(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
+        const WHEEL_NOTCH: f32 = 40.0;
         if !modifiers.shift {
             self.wheel_accum = 0.0;
             return false;
@@ -61,43 +171,31 @@ impl MaskBrush {
         if delta_y.abs() <= f32::EPSILON {
             return true;
         }
-        const WHEEL_NOTCH: f32 = 40.0;
         self.wheel_accum += delta_y;
-
-        let steps = (self.wheel_accum / WHEEL_NOTCH).trunc() as isize;
-        if steps == 0 {
+        let notches = (self.wheel_accum / WHEEL_NOTCH).trunc();
+        if notches == 0.0 {
             return true;
         }
-        self.wheel_accum -= steps as f32 * WHEEL_NOTCH;
-        let next = self.radius_px as isize + steps * self.wheel_step_px as isize;
-        self.set_radius_px(next.max(1) as usize);
+        self.wheel_accum -= notches * WHEEL_NOTCH;
+        // `notches` is a whole number bounded by one frame's wheel travel, and a float-to-int
+        // `as` saturates, so the conversion cannot wrap.
+        self.step_by_notches(notches as i32);
         true
     }
 
+    /// Transitional raw path: `-` shrinks, `=` / `+` grow the brush (any modifiers, as before).
+    /// Returns whether the radius changed.
+    ///
+    /// Only for the Cleaning brushes, which still read their keys themselves; removed when they
+    /// take [`Self::apply_input`] (input-unification WP7). New hosts never call it.
     pub fn handle_size_shortcuts(&mut self, ctx: &egui::Context) -> bool {
-        let (minus, equals, plus) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Minus),
-                i.key_pressed(egui::Key::Equals),
-                i.key_pressed(egui::Key::Plus),
-            )
-        });
+        let (minus, equals, plus) = ctx.input(|i| (i.key_pressed(egui::Key::Minus), i.key_pressed(egui::Key::Equals), i.key_pressed(egui::Key::Plus)));
         let mut changed = false;
         if minus {
-            let mut next = ((self.radius_px as f32) * 0.9).floor() as usize;
-            if next >= self.radius_px && self.radius_px > self.min_radius_px {
-                next = self.radius_px.saturating_sub(1);
-            }
-            next = next.max(self.min_radius_px);
-            changed |= self.set_radius_px(next);
+            changed |= self.shrink_one_step();
         }
         if equals || plus {
-            let mut next = ((self.radius_px as f32) * 1.1).ceil() as usize;
-            if next <= self.radius_px && self.radius_px < self.max_radius_px {
-                next = self.radius_px.saturating_add(1);
-            }
-            next = next.min(self.max_radius_px);
-            changed |= self.set_radius_px(next);
+            changed |= self.grow_one_step();
         }
         changed
     }
@@ -333,5 +431,70 @@ fn paint_circle_on_binary_mask(
         for px in &mut mask_data[row_off + sx0..=row_off + sx1] {
             *px = fill;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ms_input::{Declarations, InputRegistry, view};
+
+    use super::*;
+
+    fn brush(radius_px: usize) -> MaskBrush {
+        let mut brush = MaskBrush::default();
+        brush.set_radius_px(radius_px);
+        brush
+    }
+
+    #[test]
+    fn wheel_notches_step_by_two_pixels_and_clamp() {
+        let mut b = brush(24);
+        assert!(b.step_by_notches(3));
+        assert_eq!(b.radius_px(), 30);
+        assert!(b.step_by_notches(-2));
+        assert_eq!(b.radius_px(), 26);
+        assert!(!b.step_by_notches(0), "no notch, no change");
+        assert!(b.step_by_notches(-1000));
+        assert_eq!(b.radius_px(), 1, "clamped at the minimum");
+        assert!(b.step_by_notches(i32::MAX));
+        assert_eq!(b.radius_px(), 200, "clamped at the maximum, no overflow");
+        assert!(!b.step_by_notches(1), "already at the maximum");
+    }
+
+    #[test]
+    fn size_commands_scale_by_ten_percent_with_a_one_pixel_minimum_step() {
+        let mut b = brush(20);
+        assert!(b.shrink_one_step());
+        assert_eq!(b.radius_px(), 18);
+        assert!(b.grow_one_step());
+        assert_eq!(b.radius_px(), 20, "ceil(18 * 1.1) = 20");
+        let mut small = brush(3);
+        assert!(small.shrink_one_step());
+        assert_eq!(small.radius_px(), 2, "floor(2.7) = 2");
+        assert!(small.shrink_one_step());
+        assert_eq!(small.radius_px(), 1);
+        assert!(!small.shrink_one_step(), "the minimum stays");
+        assert!(small.grow_one_step());
+        assert_eq!(small.radius_px(), 2, "a small brush still grows by one pixel");
+        let mut big = brush(195);
+        assert!(big.grow_one_step());
+        assert_eq!(big.radius_px(), 200, "clamped at the maximum");
+        assert!(!big.grow_one_step());
+    }
+
+    /// The brush set registers next to the view set without conflicts (its keys sit on another
+    /// scope level than the view zoom commands, so an overlap there is a shadow, never a conflict).
+    #[test]
+    fn declarations_register_beside_the_view_set() {
+        let mut declarations = Declarations::default();
+        declarations.extend(view::declarations());
+        declarations.extend(super::declarations());
+        let registry = match InputRegistry::new(declarations) {
+            Ok(registry) => registry,
+            Err(err) => panic!("the brush declarations must be valid: {err}"),
+        };
+        let brush_conflicts: Vec<_> = registry.conflicts().conflicts.iter().filter(|conflict| conflict.a.0.starts_with("brush.") || conflict.b.is_some_and(|b| b.0.starts_with("brush."))).collect();
+        assert!(brush_conflicts.is_empty(), "{brush_conflicts:?}");
+        assert_eq!(registry.bindings(BRUSH_LARGER).len(), 3);
     }
 }

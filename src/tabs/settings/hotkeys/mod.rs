@@ -103,6 +103,21 @@ impl HotkeysPane {
         self.chips = None;
     }
 
+    /// Teardown barrier (blocking; the studio teardown worker only, never the GUI thread): every
+    /// queued binding change is written, in order, before this returns. Failures were logged by
+    /// the writer; this logs the summary.
+    pub(super) fn flush_blocking(&mut self) {
+        match self.writer.shutdown_blocking() {
+            Ok(failures) if failures.is_empty() => runtime_log::log_info("[settings::hotkeys] hotkey overrides flushed at teardown"),
+            Ok(failures) => runtime_log::log_warn(format!(
+                "[settings::hotkeys] hotkey overrides flushed at teardown with {} failed write(s); actions={}",
+                failures.len(),
+                failures.iter().map(|failure| failure.action.0).collect::<Vec<_>>().join(",")
+            )),
+            Err(failures) => runtime_log::log_error(format!("[settings::hotkeys] hotkey override writer failed at teardown; {} failure(s) reported before it stopped", failures.len())),
+        }
+    }
+
     /// Draws the pane for this frame and applies what the user did.
     pub(super) fn draw(&mut self, ui: &mut egui::Ui, router: &mut InputRouter) {
         let ctx = ui.ctx().clone();

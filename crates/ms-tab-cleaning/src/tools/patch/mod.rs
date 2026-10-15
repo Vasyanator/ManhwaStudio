@@ -46,8 +46,8 @@ use super::region_edit_v2::geometry::usable_viewport_for;
 use ms_canvas::{CanvasView, OverlayRectPx};
 use ms_project::ProjectData;
 use ms_tools::patch::{
-    PagePixelProjection, PatchBuffer, PatchCommit, PatchHost, PatchHostError, PatchInputError,
-    PatchRegionPoll, PatchRegionRequest, PatchToolCore, check_roi_buffer,
+    PagePixelProjection, PatchBuffer, PatchCommit, PatchHost, PatchHostError, PatchInput,
+    PatchInputError, PatchRegionPoll, PatchRegionRequest, PatchToolCore, check_roi_buffer,
 };
 use eframe::egui;
 use egui::{Color32, Pos2};
@@ -570,7 +570,8 @@ impl CleaningTool for PatchTool {
     }
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
-        self.core.draw_ui(ui);
+        // The usage hint names the cancel key this host reads (`on_key_event`).
+        self.core.draw_ui(ui, &ms_input::button_label(&ms_input::Button::Key(egui::Key::Escape)));
     }
 
     fn stroke_begin(&mut self, canvas: &mut CanvasView, point: StrokePoint) {
@@ -610,8 +611,11 @@ impl CleaningTool for PatchTool {
         !self.core.space_pan_active()
     }
 
+    /// Escape cancels the patch selection. Read raw here until the tab declares
+    /// `cleaning.patch.cancel` (input-unification WP7); the core reads no key itself.
     fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        self.core.on_escape(ctx)
+        let cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+        self.core.on_cancel(PatchInput { cancel })
     }
 
     fn set_panel_rects(&mut self, rects: &[egui::Rect]) {

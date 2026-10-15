@@ -324,7 +324,10 @@ is an author note addressed to the translator, not a replica.
 - `panels/`: side-panel UI modules for OCR, bubble cards/footer fields, machine translation,
   text detector controls, composed text, and OCR language catalogs.
 - `adv_rec.rs`: floating advanced-recognition crop preview/editor with async crop preparation,
-  brush overlay, rotation, zoom, and local quick-selection OCR actions.
+  brush overlay, rotation, zoom, and local quick-selection OCR actions. Its brush and the detector
+  mask-edit brush take the shared brush actions (`ms_tools::mask_brush`): the host publishes
+  `BRUSH_ACTIVE` while either is on (`TranslationTabState::brush_input_active`) and applies them
+  before drawing (`apply_brush_input`); the host also forwards its canvas's contexts.
 
 ## Contracts and invariants
 - Hotkey command ids are persistence keys (`user_config` -> `Hotkeys`): never rename one. The

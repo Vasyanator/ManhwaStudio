@@ -92,7 +92,8 @@ shows only an up-arrow toggle; expanded slides a popup panel up with the arrow r
 `set_bottom_hint_collapsed` at tab construction (default expanded) and read back with
 `bottom_hint_collapsed()` for persistence — persisted only for Translation and Typing (Cleaning has
 no hint). Per-tab content and config persistence live in the tabs, not here.
-`scene.canvas_bottom_hint_rect` (last-frame rect) occludes canvas zoom/drag input under the hint.
+`scene.canvas_bottom_hint_rect` is a hole of the canvas' view and touch surfaces: no canvas zoom /
+drag input under the hint.
 
 The canvas also owns the floating Hangul jamo keyboard (`widgets::show_hangul_keyboard`), opened
 from the ORIGINAL/TRANSLATION context menu of a text bubble. `BubbleMenuContext::field` carries
@@ -126,18 +127,17 @@ precomposed syllables and compat jamo are single scalars. The splice goes throug
 `commit_text_upsert_now` pair as `apply_paste_text`, and additionally stages
 `capture_bubble_history_before_mutation` first — which `apply_paste_text` does NOT do — so one
 insert becomes one bubble-history entry. That entry is not what Ctrl+Z hits right after an insert:
-the insert path deliberately restores focus to the `TextEdit` (the right UX), and `handle_shortcuts`
-gates the bubble history on `!ctx.egui_wants_keyboard_input()`, which in egui 0.36 is
-`memory.focused().is_some()` (`egui-0.36.2/src/context.rs:2987`). So while the field is focused Ctrl+Z is consumed by egui's own
-`TextEdit` undoer; the bubble-history entry is what applies once focus is elsewhere.
+the insert path deliberately restores focus to the `TextEdit` (the right UX), and the input router
+never matches a key chord (`canvas.bubble.undo`) while a text edit has focus
+(`Context::text_edit_focused`). So while the field is focused Ctrl+Z goes to egui's own `TextEdit`
+undoer; the bubble-history entry is what applies once the field loses focus.
 
 `lib.rs::draw_hangul_keyboard_panel` draws the panel after the scene pass as an `egui::Window` with
 a literal id, owns closing through `Window::open`, and publishes its rect into
-`scene.canvas_hangul_keyboard_rect`, which is folded into the same `handle_shortcuts` `inside_canvas`
-occlusion test as `canvas_bottom_hint_rect` — without it the wheel over the panel would zoom the page
-underneath. The rect is published only on the keep-open path: `handle_shortcuts` consumes last
-frame's value, so publishing it on the frame the window is closed would swallow one further frame of
-Ctrl+wheel zoom over dead space. Each frame it resolves the CURRENT valid target: "valid" now means
+`scene.canvas_hangul_keyboard_rect`, a hole of the view surface like `canvas_bottom_hint_rect` —
+without it the wheel over the panel would zoom the page underneath. The rect is published only on
+the keep-open path: the router reads the surface the NEXT frame, so publishing it on the frame the
+window is closed would swallow one further frame of Ctrl+wheel zoom over dead space. Each frame it resolves the CURRENT valid target: "valid" now means
 DRAWN this frame, i.e. present in `bubble_text_edit_ids` — existence alone is not enough, because an
 on-top ORIGINAL field after deselect or any bubble scrolled off-screen still has runtime text but no
 live widget, and an insert there would splice off-screen at a stale caret whose focus restore no-ops.
@@ -204,8 +204,9 @@ scrollbar.
 
 Its zoom row also carries the canvas-shortcuts hover chip (`canvas.shortcuts_hint.*`),
 right-aligned via `egui::containers::Sides` in `draw_zoom_and_shortcuts_row`; the chip lists the
-canvas-intrinsic navigation keys (zoom/pan/scroll) and is hover-only, so it has no click and no
-persisted state. `Sides` stretches the row to the full available width, which is exactly what the
+shared viewer actions (`view.*`: zoom, zoom keys, zoom drag, pan, scroll) as action title + CURRENT
+binding label from the input registry (`input::CanvasLabels`, rebuilt on a registry revision or
+locale change) and is hover-only, so it has no click and no persisted state. `Sides` stretches the row to the full available width, which is exactly what the
 pre-dock `Area` could not afford (auto-sized, "available" was the whole screen, and the stretched
 row fed its own width back in and grew the panel by one item-spacing per frame — hence the old
 `controls_content_width` measurement). A dock body has a finite width, and the dock re-measures a
@@ -354,7 +355,7 @@ extension point for tab behaviour:
 | Bubble cards | `has_bubble_header`, `build_bubble_header`, `readonly_aside_header_width_hint`, `build_bubble_footer`, `on_bubble_action` |
 | Bubble visibility / status | `should_hide_on_top_bubble`, `should_hide_aside_bubble_line`, `bubble_status_style` |
 | Page context menu | `draw_canvas_page_context_menu`, `suppress_canvas_page_context_menu` |
-| Gestures / scrollbar | `wants_canvas_shift_drag_selection`, `canvas_scrollbar_marks` |
+| Gestures / scrollbar | `on_page_click`, `wants_canvas_shift_drag_selection` (transitional), `canvas_scrollbar_marks` |
 
 Bubble status borders: the rules live in `SharedCanvasSettings` (edited only in the studio settings
 «Лента» pane), are evaluated by the GUI-free `ms_config::bubble_status` model and reach the canvas
@@ -403,6 +404,8 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   `draw_pixel_grid` emits one `Painter::line_segment` per line — never a polyline, which
   `tessellate_path` would blur. Gate-free by contract; see the file header.
 - `types.rs`: passive DTOs and runtime payload types.
+- `input.rs`: the canvas' side of the unified input system (`ms-input`): declarations, contexts,
+  view id, chip label snapshot, gesture / menu helpers, the zoom laws. See "Input".
 - `touch.rs`: the canvas side of finger gestures (`touch_owner_id`, surface publication with the
   tab's drag regions, applying `TouchNavigation`, the tap / long-press / region-drag hand-offs, the
   long-press feedback ring, `context_menu_open_pos`); see
@@ -414,6 +417,68 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
   every page through `world_rect_to_screen`. A once-guarded equivalence check warns if the
   transform-derived rect drifts >0.5px from the allocated rect.
 - `workers.rs`: background worker startup for overlay preparation, autosave, and settings.
+
+## Input
+The canvas reads NO key, modifier or wheel itself: the studio's `InputRouter::begin_frame` decides
+everything before any tab draws, and `CanvasDrawParams::{input, input_registry}` hand the frame and
+the registry to `draw` (`input_frame` holds the frame for the pass).
+- **Declared here** (`input::declarations`, scope `Canvas`, registered once by the studio):
+  commands `canvas.bubble.undo` (Ctrl+Z), `redo` (Ctrl+Shift+Z / Ctrl+Y), `duplicate` (Ctrl+D),
+  all under `Context(canvas.editable)`; fixed read-only rows `canvas.bubble.{copy,cut,paste}` (the
+  platform's clipboard chords: egui-winit turns them into `Event::Copy/Cut/Paste`, which
+  `bubble_runtime.rs::capture_clipboard_events` still reads); gestures, LEFT button unless noted:
+  `canvas.bubble.select` (click) / `menu` (RIGHT click) / `drag` on `canvas.bubble.body`,
+  `canvas.bubble.move` on `.move_handle`, `move_rect` on `.rect`, `resize` on `.handle`,
+  `canvas.image_area.{move_rect,move,move_anchor,resize}` on `canvas.image_rect` /
+  `canvas.image_area` / `.anchor` / `.handle`, `canvas.page.click` (click) / `menu` (RIGHT click)
+  on `canvas.page`. Drags and the page menu need `canvas.editable`; select, the bubble menu and the
+  page click also serve read-only canvases.
+- **Target priorities** (higher wins among hit candidates): bubble handle 90, image-area handle 85,
+  image-area anchor 84, image area 83, image rect 82, move handle 80, bubble rect 75, bubble body
+  60 (the on-top body AND the aside card: one gesture binds one target), page 10; `view.surface`
+  0 is the view set's canvas-wide target. They replace the hand-written "skip the red rect over a
+  handle / area / anchor" guards: a widget passes its candidates with hit flags to
+  `InputFrame::gesture_for` (`CanvasView::drag_hit_among`).
+- **Contexts the tab publishes** (`CanvasView::input_contexts`, forwarded by every canvas tab's
+  `StudioTab::input_contexts`): `canvas.editable` while `editable`; `canvas.zoom_accepted` while
+  the zoom is not blocked (`set_zoom_blocked`). The studio registers `view.zoom_in` / `zoom_out` /
+  `zoom_reset` and the `view.zoom` axis under `zoom_accepted`, so while a tab blocks canvas zoom
+  (advanced recognition open, a cleaning editor window, a selected typing layer that rotates with
+  Ctrl+wheel) those keys and Ctrl+wheel stay with the tab's own readers, and in the PS editor (no
+  canvas) they are never consumed. Removal of that gate: input-unification WP6-WP8.
+- **Read from the frame** (`apply_input_frame`, before the scene pass): the history commands; the
+  zoom commands at their focus (the pointer on this view, else this primary view's centre); the
+  `view.zoom` axis at the pointer (×1.1 per wheel notch; a pinch applies `exp(delta)`, recognized
+  by a non-consuming `Event::Zoom` peek until `AxisSample` carries its source); the
+  `view.zoom_drag` claim of this view (horizontal movement, `input::zoom_drag_factor`, until the
+  button or the zoom modifier is released); `view.pan` (`begin_canvas_frame`:
+  `DragScroll::Always`); wheel scrolling is off while the zoom modifier is held over the view or
+  a zoom drag runs. Everything zoom-related is skipped while the zoom is blocked.
+- **Bubble widgets lock** (`bubble_widgets_locked`: a zoom drag runs or `view.pan` is held): every
+  bubble widget, card, handle and image-area part senses hover only, so a Space+drag that starts
+  on a bubble pans instead of moving it, and no handle resizes during a zoom drag.
+- **View surface** (`publish_view_surface`, end of `draw`): `ViewId` content-named from the scroll
+  salt (`input::view_id_for`), rect = the canvas rect, holes = the bottom hint and the Hangul
+  window, `capture_layer`, `primary`, and the touch owner.
+- **Capture area** (`draw_capture_area`): a full-canvas `click_and_drag` `Area` raised only while
+  `InputFrame::canvas_wide_armed(view)` and the zoom is not blocked, so the press the router
+  claims reaches no widget. It is on `Order::Background` on purpose: above the central panel's
+  root layer, below dock panels / popups / windows (they keep their clicks), and code that treats
+  a non-background layer under the pointer as occlusion (Cleaning strokes, Typing deselect) still
+  sees bare canvas.
+- **Menus** open through the one canvas menu path (`touch_nav::context_menu_popup`) from the menu
+  gestures or egui's long touch on a touch hole; a secondary click the menu binding does not own
+  skips the popup for that frame (`CanvasView::bubble_menu_popup` / `page_menu_clicked`).
+- **Widget-owned, not bindings**: the primary press that selects a bubble at once (on-top body,
+  aside card, the `OnTopFocusMode::Aside` pre-pass), text editing in the bubble fields, the card
+  drag refusal while any widget has keyboard focus, buttons (translate, delete, add area), the
+  ribbon tab widgets, the scrollbars, the bottom-hint arrow and the Hangul keyboard.
+- **Transitional adapters** (tab behaviour not yet expressed as actions): `set_zoom_blocked`,
+  `set_wheel_scroll_blocked`, `set_drag_scroll_blocked` (Cleaning tools, WP7; Translation /
+  Typing zoom block, WP6 / WP8), `set_create_bubble_shortcut_hint` (Translation, WP6) and the hook
+  `wants_canvas_shift_drag_selection` (Translation / Typing, WP6 / WP8).
+- **Touch alternatives**: the touch surface's `long_press_selection` is also on while the router
+  would claim a long-press drag for a declared touch binding (`touch_selection_available`).
 
 ## Touch gestures
 The finger decision is owned by `ms_widgets::touch_nav` (shell raw-input hook); the canvas is a
@@ -429,7 +494,7 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   Windows and dock panels are not holes: they are on non-background layers, which the router
   never claims on. The large image-bubble rects and text areas are NOT holes: a finger there pans.
   `long_press_selection` is the tab's one-frame flag (see "Long-press selection").
-- **Navigation** (`handle_shortcuts`, after the wheel/keyboard zoom): `take_touch_output` runs every
+- **Navigation** (`apply_input_frame`, after the zoom paths): `take_touch_output` runs every
   frame (it also schedules the long-press repaint). `apply_touch_navigation` captures
   `capture_pending_view_anchor(prev_centroid, centroid)` at the OLD zoom, then multiplies the zoom
   (clamped to `CANVAS_ZOOM_MIN..=CANVAS_ZOOM_MAX`); with `zoom_blocked` only the pan applies. A
@@ -438,7 +503,7 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `zoom_anchor_capture_matches_frozen_characterization`). The router's axis lock and the fling
   after a locked lift arrive as ordinary navigation frames (a fling frame has `touches == 0` and
   asks for the next frame itself), so the canvas has no kinetic state of its own.
-- **Tap**: `touch_tap()` returns this frame's `TouchOutput::tap_at` (stored by `handle_shortcuts`,
+- **Tap**: `touch_tap()` returns this frame's `TouchOutput::tap_at` (stored by `apply_input_frame`,
   valid like `touch_selection`). The canvas acts on no tap. A tab may use it only where a mouse
   click OUTSIDE something dismisses or commits it (the Typing create editor) and to select /
   deselect its own layers (the Typing text layers); bubble placement, aside selection,
@@ -456,7 +521,7 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `set_long_press_selection(bool)` every frame its active mode has a selection (before `draw`, or
   from a hook inside it holding `&mut CanvasView`); it is a ONE-FRAME flag consumed by the surface
   publication, so a tab that stops setting it publishes `false` (a long-press drag then pans).
-  `touch_selection()` returns this frame's `TouchSelection` (stored by `handle_shortcuts`), valid
+  `touch_selection()` returns this frame's `TouchSelection` (stored by `apply_input_frame`), valid
   for hooks inside `draw` and code after it. Rectangle-drag capture modes map it through
   `drive_touch_drag` + `TouchDrivenDrag` (begin at the press point, follow, `Released` commits like
   a mouse release, `Cancelled` drops like Esc; a mouse drag in the slot is never touched); the
@@ -629,6 +694,10 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
 - To change clean overlay visibility, upload, tiling, or editing runtime, edit
   `overlay_runtime.rs` and the facade methods in `lib.rs`.
 - To change page layout, scrolling, zooming, or context menus, edit `scene.rs`.
+- To change what the canvas declares, its targets / priorities, its contexts or the chip labels,
+  edit `input.rs` (+ the studio golden test `input_registry_golden`); to change how a frame is
+  applied (zoom, history commands, capture area, view surface), `lib.rs::apply_input_frame` /
+  `draw_capture_area` / `publish_view_surface`.
 - To change finger navigation, the touch surface and its holes, or the long-press feedback, edit
   `touch.rs` (the gesture rules themselves are `ms_widgets::touch_nav`'s).
 - To change what the «Лента» tab SHOWS, edit `scene.rs::draw_ribbon_tab_body`; to change how big it

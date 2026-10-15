@@ -18,8 +18,7 @@ Layer: its own line between `ms-models / ms-tabs-simple / …` and
 `ms-project / ms-widgets / ms-native-runtime` (see `ARCHITECTURE.md` §2).
 
 ## Files and submodules
-- `lib.rs`: the trait, the temporary `VIEW_ZOOM_COMMANDS` context, and the object-safety /
-  default-behaviour test.
+- `lib.rs`: the trait and the object-safety / default-behaviour test.
 
 ## Contracts and invariants
 - **Order-free hooks only.** The root may call a hook for every tab in `AppTab::ALL` order; the
@@ -34,10 +33,8 @@ Layer: its own line between `ms-models / ms-tabs-simple / …` and
   the tab's actions; their ids are persisted user overrides and must never change.
   `input_contexts` (called every frame for the ACTIVE tab, before the input router runs) lists
   the contexts the tab publishes. There is no execute hook: a tab reads what fired from the
-  `ms_input::InputFrame` its draw receives.
-- `VIEW_ZOOM_COMMANDS` is a phase-B gate (removed by input-unification WP5): a tab lists it in
-  `input_contexts` exactly while it executes `view.zoom_in` / `zoom_out` / `zoom_reset` itself,
-  so the router consumes those keys nowhere else.
+  `ms_input::InputFrame` its draw receives. A canvas tab also forwards its canvas's contexts
+  (`CanvasView::input_contexts`: `canvas.editable`, `canvas.zoom_accepted`).
 - The trait stays object safe (no generic methods, no `Self` by value); a test guards it.
 - This crate must never depend on a tab crate, `ms-models` or the root package.
 

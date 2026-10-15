@@ -60,6 +60,12 @@ Notes:
   (`show_translate_action` / `show_delete_action`) because a hint card keeps delete but has nothing
   to translate. `estimate_aside_body_height` must mirror every shape change made there.
 - This module only drives `CanvasView` through existing runtime/edit helpers.
+- Input: clicks, drags and menus resolve through the frame's gestures (`input.rs`): the card is
+  `canvas.bubble.body` (`select` / `menu` / `drag`), the page rect `canvas.bubble.rect`, and the
+  image bubble's red rect / areas / anchors / area handles their own targets, whose declared
+  priorities replace the hand-written "skip the red rect over a handle / area / anchor" guards.
+  Left button by default; the primary press-select is widget-owned feedback; every widget senses
+  hover only while `bubble_widgets_locked` (zoom drag, pan).
 */
 
 use super::helpers::{
@@ -72,7 +78,7 @@ use super::types::{
     CanvasScenePageFrame, ImageTextArea, RectCoords, image_area_palette,
     image_bubble_side_from_areas,
 };
-use super::{CanvasHooks, CanvasView};
+use super::{CanvasHooks, CanvasView, input};
 use ms_widgets::bubble_status::paint_bubble_status_border;
 use ms_project::{Bubble, ProjectData, Side};
 use ms_widgets::{SpellcheckedTextEdit, misspelled_word_at_pointer};
@@ -1653,7 +1659,7 @@ fn draw_aside_slots(
             aside_visible_groups(canvas.editable, body_mode, has_header, snapshot.bubble_class);
 
         let scene_clip_rect = ui.clip_rect();
-        let zoom_drag_active = canvas.scene.zoom_drag_active;
+        let bubble_widgets_locked = canvas.bubble_widgets_locked();
 
         let mut bubble_body = |ui: &mut egui::Ui| {
             if !canvas.editable && rtl_align_frame {
@@ -1751,27 +1757,29 @@ fn draw_aside_slots(
                         if hint_resp.response.lost_focus() {
                             canvas.commit_text_upsert_now(bid);
                         }
-                        if hint_resp.response.secondary_clicked() {
-                            canvas.bubble_runtime.bubble_context_menu_misspelled_word =
-                                hint_misspelled_word.clone();
-                        }
-                        hint_resp.response.context_menu(|ui| {
-                            let outcome = canvas.show_bubble_context_menu(
-                                ui,
-                                BubbleMenuContext {
-                                    project,
-                                    bubble_id: bid,
-                                    bubble_type: snapshot.bubble_type,
-                                    original_text: &new_original,
-                                    translated_text: &new_text,
-                                    field: Some(BubbleTextField::Translation),
-                                },
-                            );
-                            interacted_with_bubble |= outcome.interacted;
-                            if outcome.command.is_some() {
-                                menu_command = outcome.command;
+                        if let Some((menu_opened, menu)) = canvas.bubble_menu_popup(&hint_resp.response, input::TARGET_BODY) {
+                            if menu_opened {
+                                canvas.bubble_runtime.bubble_context_menu_misspelled_word =
+                                    hint_misspelled_word.clone();
                             }
-                        });
+                            menu.show(|ui| {
+                                let outcome = canvas.show_bubble_context_menu(
+                                    ui,
+                                    BubbleMenuContext {
+                                        project,
+                                        bubble_id: bid,
+                                        bubble_type: snapshot.bubble_type,
+                                        original_text: &new_original,
+                                        translated_text: &new_text,
+                                        field: Some(BubbleTextField::Translation),
+                                    },
+                                );
+                                interacted_with_bubble |= outcome.interacted;
+                                if outcome.command.is_some() {
+                                    menu_command = outcome.command;
+                                }
+                            });
+                        }
                     }
                     if visible_groups.show_original {
                         let original_spellcheck_enabled = !canvas.bubble_spellcheck_disabled(
@@ -1813,27 +1821,29 @@ fn draw_aside_slots(
                         if orig_resp.response.lost_focus() {
                             canvas.commit_text_upsert_now(bid);
                         }
-                        if orig_resp.response.secondary_clicked() {
-                            canvas.bubble_runtime.bubble_context_menu_misspelled_word =
-                                orig_misspelled_word.clone();
-                        }
-                        orig_resp.response.context_menu(|ui| {
-                            let outcome = canvas.show_bubble_context_menu(
-                                ui,
-                                BubbleMenuContext {
-                                    project,
-                                    bubble_id: bid,
-                                    bubble_type: snapshot.bubble_type,
-                                    original_text: &new_original,
-                                    translated_text: &new_text,
-                                    field: Some(BubbleTextField::Original),
-                                },
-                            );
-                            interacted_with_bubble |= outcome.interacted;
-                            if outcome.command.is_some() {
-                                menu_command = outcome.command;
+                        if let Some((menu_opened, menu)) = canvas.bubble_menu_popup(&orig_resp.response, input::TARGET_BODY) {
+                            if menu_opened {
+                                canvas.bubble_runtime.bubble_context_menu_misspelled_word =
+                                    orig_misspelled_word.clone();
                             }
-                        });
+                            menu.show(|ui| {
+                                let outcome = canvas.show_bubble_context_menu(
+                                    ui,
+                                    BubbleMenuContext {
+                                        project,
+                                        bubble_id: bid,
+                                        bubble_type: snapshot.bubble_type,
+                                        original_text: &new_original,
+                                        translated_text: &new_text,
+                                        field: Some(BubbleTextField::Original),
+                                    },
+                                );
+                                interacted_with_bubble |= outcome.interacted;
+                                if outcome.command.is_some() {
+                                    menu_command = outcome.command;
+                                }
+                            });
+                        }
                     }
                     if visible_groups.show_translation {
                         let translation_spellcheck_enabled = !canvas.bubble_spellcheck_disabled(
@@ -1876,27 +1886,29 @@ fn draw_aside_slots(
                         if tr_resp.response.lost_focus() {
                             canvas.commit_text_upsert_now(bid);
                         }
-                        if tr_resp.response.secondary_clicked() {
-                            canvas.bubble_runtime.bubble_context_menu_misspelled_word =
-                                tr_misspelled_word.clone();
-                        }
-                        tr_resp.response.context_menu(|ui| {
-                            let outcome = canvas.show_bubble_context_menu(
-                                ui,
-                                BubbleMenuContext {
-                                    project,
-                                    bubble_id: bid,
-                                    bubble_type: snapshot.bubble_type,
-                                    original_text: &new_original,
-                                    translated_text: &new_text,
-                                    field: Some(BubbleTextField::Translation),
-                                },
-                            );
-                            interacted_with_bubble |= outcome.interacted;
-                            if outcome.command.is_some() {
-                                menu_command = outcome.command;
+                        if let Some((menu_opened, menu)) = canvas.bubble_menu_popup(&tr_resp.response, input::TARGET_BODY) {
+                            if menu_opened {
+                                canvas.bubble_runtime.bubble_context_menu_misspelled_word =
+                                    tr_misspelled_word.clone();
                             }
-                        });
+                            menu.show(|ui| {
+                                let outcome = canvas.show_bubble_context_menu(
+                                    ui,
+                                    BubbleMenuContext {
+                                        project,
+                                        bubble_id: bid,
+                                        bubble_type: snapshot.bubble_type,
+                                        original_text: &new_original,
+                                        translated_text: &new_text,
+                                        field: Some(BubbleTextField::Translation),
+                                    },
+                                );
+                                interacted_with_bubble |= outcome.interacted;
+                                if outcome.command.is_some() {
+                                    menu_command = outcome.command;
+                                }
+                            });
+                        }
                     }
                 } else if visible_groups.show_readonly_text {
                     with_bubble_text_font(ui, |ui| {
@@ -1928,7 +1940,7 @@ fn draw_aside_slots(
         let bubble_hit_response = ui.interact(
             bubble_slot_rect,
             Id::new(("aside_bubble_hit", item_key)),
-            if zoom_drag_active {
+            if bubble_widgets_locked {
                 Sense::hover()
             } else {
                 Sense::click_and_drag()
@@ -1962,35 +1974,40 @@ fn draw_aside_slots(
         if card_hit_rect.is_positive() {
             canvas.scene.aside_card_hit_rects.push(card_hit_rect);
         }
-        bubble_hit_response.context_menu(|ui| {
-            let outcome = canvas.show_bubble_context_menu(
-                ui,
-                BubbleMenuContext {
-                    project,
-                    bubble_id: bid,
-                    bubble_type: snapshot.bubble_type,
-                    original_text: &new_original,
-                    translated_text: &new_text,
-                    // Bubble-body menu: no target field, so no per-field items.
-                    field: None,
-                },
-            );
-            interacted_with_bubble |= outcome.interacted;
-            if outcome.command.is_some() {
-                menu_command = outcome.command;
+        if let Some((menu_opened, menu)) = canvas.bubble_menu_popup(&bubble_hit_response, input::TARGET_BODY) {
+            if menu_opened {
+                canvas.bubble_runtime.bubble_context_menu_misspelled_word = None;
             }
-        });
-        if bubble_hit_response.secondary_clicked() {
-            canvas.bubble_runtime.bubble_context_menu_misspelled_word = None;
+            menu.show(|ui| {
+                let outcome = canvas.show_bubble_context_menu(
+                    ui,
+                    BubbleMenuContext {
+                        project,
+                        bubble_id: bid,
+                        bubble_type: snapshot.bubble_type,
+                        original_text: &new_original,
+                        translated_text: &new_text,
+                        // Bubble-body menu: no target field, so no per-field items.
+                        field: None,
+                    },
+                );
+                interacted_with_bubble |= outcome.interacted;
+                if outcome.command.is_some() {
+                    menu_command = outcome.command;
+                }
+            });
         }
 
+        // Widget-owned press feedback (not a binding): a primary press selects at once.
         let pressed_primary_on_bubble = bubble_hit_response.is_pointer_button_down_on()
             && ui.ctx().input(|i| i.pointer.primary_down());
         if pressed_primary_on_bubble {
             canvas.bubble_runtime.selected_bubble = Some(bid);
             interacted_with_bubble = true;
         }
-        if response.clicked() || bubble_hit_response.clicked() {
+        if canvas.gesture_clicked(&response, input::TARGET_BODY, input::BUBBLE_SELECT)
+            || canvas.gesture_clicked(&bubble_hit_response, input::TARGET_BODY, input::BUBBLE_SELECT)
+        {
             canvas.bubble_runtime.selected_bubble = Some(bid);
             interacted_with_bubble = true;
         }
@@ -2030,9 +2047,11 @@ fn draw_aside_slots(
             );
         }
 
+        // `egui_wants_keyboard_input`: a focused field anywhere keeps the card still (dragging
+        // while editing would move the bubble under the caret) — widget focus, not a binding.
         let can_drag_aside = canvas.editable
             && selected_now
-            && !canvas.scene.zoom_drag_active
+            && !canvas.bubble_widgets_locked()
             && canvas.bubble_runtime.move_active_bid.is_none()
             && !ui.ctx().egui_wants_keyboard_input()
             && canvas
@@ -2044,10 +2063,11 @@ fn draw_aside_slots(
                 .active_area_handle
                 .is_none_or(|(active_bid, _, _)| active_bid != bid);
         let mut drag_stopped = false;
+        let card_drag = canvas.drag_hit(&bubble_hit_response, input::TARGET_BODY, input::BUBBLE_DRAG);
         // Card-body drag: a text bubble moves its anchor; an image bubble moves either the grabbed
         // row block's area, or (grabbed outside any block) the whole red rect with all areas.
         if can_drag_aside
-            && bubble_hit_response.drag_started()
+            && card_drag.started
             && let Some(pos) = bubble_hit_response.interact_pointer_pos()
         {
             let target = if is_image_bubble {
@@ -2063,7 +2083,7 @@ fn draw_aside_slots(
             start_aside_drag(canvas, bid, target, pos);
         }
         if can_drag_aside
-            && bubble_hit_response.dragged()
+            && card_drag.active
             && let Some(pos) = bubble_hit_response.interact_pointer_pos()
         {
             drag_aside_by_pointer(canvas, bid, image_rect, pos);
@@ -2072,7 +2092,7 @@ fn draw_aside_slots(
             .bubble_runtime
             .aside_drag_state
             .is_some_and(|state| state.bid == bid)
-            && bubble_hit_response.drag_stopped()
+            && card_drag.stopped
         {
             drag_stopped = true;
         }
@@ -2111,7 +2131,7 @@ fn draw_aside_slots(
                     let rect_drag_response = ui.interact(
                         rect,
                         Id::new(("aside_rect_drag", bid)),
-                        if canvas.scene.zoom_drag_active {
+                        if canvas.bubble_widgets_locked() {
                             Sense::hover()
                         } else {
                             Sense::click_and_drag()
@@ -2123,24 +2143,30 @@ fn draw_aside_slots(
                             .is_some_and(|pos| {
                                 super::bubble_on_top_ui::is_scene_pos_on_rect_handle(rect, pos)
                             });
-                    let can_drag_rect = can_drag_aside && !pointer_on_handle;
-                    if can_drag_rect
-                        && rect_drag_response.drag_started()
+                    // A resize handle outranks the rect under it (declared target priorities).
+                    let rect_drag = canvas.drag_hit_among(
+                        &rect_drag_response,
+                        &[(input::TARGET_RECT, true), (input::TARGET_HANDLE, pointer_on_handle)],
+                        input::BUBBLE_MOVE_RECT,
+                    );
+                    if can_drag_aside
+                        && rect_drag.started
                         && let Some(pos) = rect_drag_response.interact_pointer_pos()
                     {
                         start_aside_drag(canvas, bid, AsideDragTarget::RectArea, pos);
                     }
-                    if can_drag_rect
-                        && rect_drag_response.dragged()
+                    if can_drag_aside
+                        && rect_drag.active
                         && let Some(pos) = rect_drag_response.interact_pointer_pos()
                     {
                         drag_aside_by_pointer(canvas, bid, image_rect, pos);
                     }
+                    // The release ends the drag wherever the pointer is (no target competition).
                     if canvas
                         .bubble_runtime
                         .aside_drag_state
                         .is_some_and(|state| state.bid == bid)
-                        && rect_drag_response.drag_stopped()
+                        && canvas.drag_hit(&rect_drag_response, input::TARGET_RECT, input::BUBBLE_MOVE_RECT).stopped
                     {
                         drag_stopped = true;
                     }
@@ -2755,7 +2781,7 @@ fn draw_image_bubble_page_overlay(
     else {
         return false;
     };
-    let sense = if canvas.scene.zoom_drag_active {
+    let sense = if canvas.bubble_widgets_locked() {
         Sense::hover()
     } else {
         Sense::click_and_drag()
@@ -2797,24 +2823,36 @@ fn draw_image_bubble_page_overlay(
                 .iter()
                 .any(|area| anchor_scene(area).distance(pos) <= 8.0)
         });
-        let can_move_red = can_drag && !on_red_handle && !on_sub_area && !on_any_anchor;
-        if can_move_red
-            && red_resp.drag_started()
+        // The red rect moves only when it outranks everything else under the pointer (a resize
+        // handle, a sub-area, an anchor point): the declared target priorities decide.
+        let red_drag = canvas.drag_hit_among(
+            &red_resp,
+            &[
+                (input::TARGET_IMAGE_RECT, true),
+                (input::TARGET_HANDLE, on_red_handle),
+                (input::TARGET_IMAGE_AREA, on_sub_area),
+                (input::TARGET_IMAGE_AREA_ANCHOR, on_any_anchor),
+            ],
+            input::IMAGE_RECT_MOVE,
+        );
+        if can_drag
+            && red_drag.started
             && let Some(pos) = red_resp.interact_pointer_pos()
         {
             start_aside_drag(canvas, bid, AsideDragTarget::ImageRedRect, pos);
         }
-        if can_move_red
-            && red_resp.dragged()
+        if can_drag
+            && red_drag.active
             && let Some(pos) = red_resp.interact_pointer_pos()
         {
             drag_aside_by_pointer(canvas, bid, image_rect, pos);
         }
+        // The release ends the drag wherever the pointer is (no target competition).
         if canvas
             .bubble_runtime
             .aside_drag_state
             .is_some_and(|state| state.bid == bid)
-            && red_resp.drag_stopped()
+            && canvas.drag_hit(&red_resp, input::TARGET_IMAGE_RECT, input::IMAGE_RECT_MOVE).stopped
         {
             drag_stopped = true;
         }
@@ -2843,15 +2881,23 @@ fn draw_image_bubble_page_overlay(
             let on_anchor = area_resp
                 .interact_pointer_pos()
                 .is_some_and(|pos| anchor_pos.distance(pos) <= 8.0);
-            let can_move_area = can_drag && !on_handle && !on_anchor;
-            if can_move_area
-                && area_resp.drag_started()
+            let area_drag = canvas.drag_hit_among(
+                &area_resp,
+                &[
+                    (input::TARGET_IMAGE_AREA, true),
+                    (input::TARGET_IMAGE_AREA_HANDLE, on_handle),
+                    (input::TARGET_IMAGE_AREA_ANCHOR, on_anchor),
+                ],
+                input::IMAGE_AREA_MOVE,
+            );
+            if can_drag
+                && area_drag.started
                 && let Some(pos) = area_resp.interact_pointer_pos()
             {
                 start_aside_drag(canvas, bid, AsideDragTarget::ImageAreaRect(idx), pos);
             }
-            if can_move_area
-                && area_resp.dragged()
+            if can_drag
+                && area_drag.active
                 && let Some(pos) = area_resp.interact_pointer_pos()
             {
                 drag_aside_by_pointer(canvas, bid, image_rect, pos);
@@ -2860,7 +2906,7 @@ fn draw_image_bubble_page_overlay(
                 .bubble_runtime
                 .aside_drag_state
                 .is_some_and(|state| state.bid == bid)
-                && area_resp.drag_stopped()
+                && canvas.drag_hit(&area_resp, input::TARGET_IMAGE_AREA, input::IMAGE_AREA_MOVE).stopped
             {
                 drag_stopped = true;
             }
@@ -2876,14 +2922,15 @@ fn draw_image_bubble_page_overlay(
         if can_drag {
             canvas.note_touch_handle_hole(ui, anchor_hit);
         }
+        let anchor_drag = canvas.drag_hit(&anchor_resp, input::TARGET_IMAGE_AREA_ANCHOR, input::IMAGE_AREA_MOVE_ANCHOR);
         if can_drag
-            && anchor_resp.drag_started()
+            && anchor_drag.started
             && let Some(pos) = anchor_resp.interact_pointer_pos()
         {
             start_aside_drag(canvas, bid, AsideDragTarget::ImageAreaAnchor(idx), pos);
         }
         if can_drag
-            && anchor_resp.dragged()
+            && anchor_drag.active
             && let Some(pos) = anchor_resp.interact_pointer_pos()
         {
             drag_aside_by_pointer(canvas, bid, image_rect, pos);
@@ -2892,7 +2939,7 @@ fn draw_image_bubble_page_overlay(
             .bubble_runtime
             .aside_drag_state
             .is_some_and(|state| state.bid == bid)
-            && anchor_resp.drag_stopped()
+            && anchor_drag.stopped
         {
             drag_stopped = true;
         }
@@ -2928,23 +2975,26 @@ fn draw_image_area_handles(
     }
     for (handle_idx, point) in image_area_handle_points(rect).iter().enumerate() {
         let handle_rect = Rect::from_center_size(*point, egui::vec2(10.0, 10.0));
+        // Gated like its sibling bubble widgets: a zoom drag or `view.pan` never resizes.
+        let sense = if canvas.bubble_widgets_locked() { Sense::hover() } else { Sense::click_and_drag() };
         let response = ui.interact(
             handle_rect,
             Id::new(("aside_img_handle", bid, area_idx, handle_idx)),
-            Sense::click_and_drag(),
+            sense,
         );
         // A finger must reach the handle, not pan the page under it (touch hole).
         canvas.note_touch_handle_hole(ui, handle_rect);
         ui.painter().circle_filled(*point, 4.0, Color32::WHITE);
         ui.painter()
             .circle_stroke(*point, 4.0, Stroke::new(1.0, color));
-        if response.dragged() {
+        let resize = canvas.drag_hit(&response, input::TARGET_IMAGE_AREA_HANDLE, input::IMAGE_AREA_RESIZE);
+        if resize.active {
             canvas.bubble_runtime.active_area_handle = Some((bid, area_idx, handle_idx));
             if let Some(pos) = response.interact_pointer_pos() {
                 resize_image_area_by_handle(canvas, bid, area_idx, handle_idx, image_rect, pos);
             }
         }
-        if response.drag_stopped() {
+        if resize.stopped {
             canvas.bubble_runtime.active_area_handle = None;
             canvas.bubble_runtime.pending_upsert.insert(bid);
         }

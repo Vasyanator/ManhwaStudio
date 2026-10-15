@@ -5,8 +5,6 @@ Crate root of `ms-studio-tab`: the `StudioTab` trait, the per-tab hook surface t
 
 Key items:
 - `StudioTab`: order-free hooks, each with a no-op default, so a tab implements only what it has.
-- `VIEW_ZOOM_COMMANDS`: the input context that gates the shared `view.zoom_*` commands while the
-  canvases still read their own zoom keys (temporary, see its declaration comment).
 
 Notes:
 - Only ORDER-FREE hooks belong here: the root may call them for every tab in `AppTab::ALL`
@@ -24,18 +22,6 @@ use ms_input::{ContextId, Declarations};
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
 use ms_project::ProjectData;
 use ms_widgets::panel_dock::DockLayout;
-
-/// Input context a tab publishes (`StudioTab::input_contexts`) while the shared zoom commands
-/// (`ms_input::view::ZOOM_IN` / `ZOOM_OUT` / `ZOOM_RESET`) must reach it. The studio root
-/// registers those three commands with `Condition::Context(VIEW_ZOOM_COMMANDS)`, so the input
-/// router matches (and consumes) their keys only while a tab that executes them is active and
-/// not blocking canvas zoom; everywhere else the keys stay with the viewers that still read them
-/// raw (the typing canvas, the advanced-recognition window, the cleaning region editor, the PS
-/// editor's brush keys).
-///
-/// Temporary: removed, together with the root's gate, once `CanvasView` consumes the `view.*`
-/// set itself (input-unification package WP5).
-pub const VIEW_ZOOM_COMMANDS: ContextId = ContextId("studio.view_zoom_commands");
 
 /// Order-free per-tab hooks the studio root iterates (`Tabs`). Every method has a no-op default.
 ///

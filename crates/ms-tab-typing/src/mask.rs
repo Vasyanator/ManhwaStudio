@@ -557,11 +557,6 @@ impl TypingMaskLayer {
                 self.active_stroke = None;
             }
 
-            if response.hovered() {
-                let _ = self.handle_brush_wheel(ui);
-                let _ = self.handle_brush_size_shortcuts(ui);
-            }
-
             if let (Some(erase), Some(pos)) = (mode, pointer_pos)
                 && image_rect.contains(pos)
             {
@@ -911,48 +906,12 @@ impl TypingMaskLayer {
         [source_w.max(1), source_h.max(1)]
     }
 
-    fn handle_brush_wheel(&mut self, ui: &mut egui::Ui) -> bool {
-        let (mods, smooth_scroll, primary_down) = ui.ctx().input(|input| {
-            (
-                input.modifiers,
-                input.smooth_scroll_delta,
-                input.pointer.primary_down(),
-            )
-        });
-        if primary_down {
-            return false;
-        }
-        // Shift+wheel is delivered on the vertical axis by most backends, but some
-        // convert it to horizontal scroll, so fall back to the X component.
-        let mut wheel_delta = smooth_scroll.y;
-        if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = smooth_scroll.x;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
-            return false;
-        }
-        let changed = self.mask_brush.handle_wheel(wheel_delta, mods);
-        if !mods.shift {
-            return false;
-        }
-        ui.ctx().input_mut(|input| {
-            input.smooth_scroll_delta = egui::Vec2::ZERO;
-        });
-        if changed {
-            ui.ctx().request_repaint();
-        }
-        changed
-    }
-
-    fn handle_brush_size_shortcuts(&mut self, ui: &mut egui::Ui) -> bool {
-        if ui.ctx().egui_wants_keyboard_input() {
-            return false;
-        }
-        let changed = self.mask_brush.handle_size_shortcuts(ui.ctx());
-        if changed {
-            ui.ctx().request_repaint();
-        }
-        changed
+    /// Applies this frame's shared brush actions (`brush.size` / `smaller` / `larger`) to the
+    /// mask brush. The tab calls it once per frame while the mask panel is open (the router fires
+    /// them only while the tab publishes `ms_tools::mask_brush::BRUSH_ACTIVE`). Returns whether
+    /// the radius changed.
+    pub fn apply_brush_input(&mut self, input: &ms_input::InputFrame) -> bool {
+        self.mask_brush.apply_input(input)
     }
 
     fn start_fill_job(

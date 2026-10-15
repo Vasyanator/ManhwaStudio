@@ -36,7 +36,7 @@ use ms_models::bubbles_model::BubblesModel;
 use ms_models::page_view::{PageImageInfo, PageTexture};
 use ms_project::ProjectData;
 use ms_input::{ContextId, Declarations, InputFrame, InputRegistry};
-use ms_studio_tab::{StudioTab, VIEW_ZOOM_COMMANDS};
+use ms_studio_tab::StudioTab;
 use ms_widgets::panel_dock::{DockLayout, PanelDockState};
 use serde_json::Value;
 
@@ -122,6 +122,9 @@ impl TranslationTab {
     pub fn draw(&mut self, p: TranslationDrawParams<'_>) {
         let TranslationDrawParams { ctx, ui, project, page_infos, texture_cache, status, panel_dock, input, input_registry } = p;
         self.run_fired_commands(ctx, project, input);
+        if self.state.apply_brush_input(input) {
+            ctx.request_repaint();
+        }
         let (create_bubble_hint, hints) = hotkeys::hotkey_hints(input_registry, input);
         let Self { canvas, state } = self;
         canvas.set_create_bubble_shortcut_hint(create_bubble_hint);
@@ -148,6 +151,8 @@ impl TranslationTab {
                 source_upload_budget: &mut source_upload_budget,
                 hooks: state,
                 panel_dock,
+                input,
+                input_registry,
             });
         });
     }
@@ -163,10 +168,16 @@ impl StudioTab for TranslationTab {
         Declarations { actions, ..Declarations::default() }
     }
 
-    /// `VIEW_ZOOM_COMMANDS` while this tab executes the shared zoom commands itself (not while
-    /// the advanced-recognition window blocks canvas zoom: its own zoom keys must reach it).
+    /// The canvas's contexts (`CanvasView::input_contexts`: it edits bubbles; it zooms while
+    /// the advanced-recognition window does not block canvas zoom, so that window's own zoom keys
+    /// reach it), plus `ms_tools::mask_brush::BRUSH_ACTIVE` while a brush of this tab is on (the
+    /// detector mask edit, the advanced-recognition brush).
     fn input_contexts(&self) -> Vec<ContextId> {
-        if self.state.blocks_canvas_zoom() { Vec::new() } else { vec![VIEW_ZOOM_COMMANDS] }
+        let mut contexts = self.canvas.input_contexts();
+        if self.state.brush_input_active() {
+            contexts.push(ms_tools::mask_brush::BRUSH_ACTIVE);
+        }
+        contexts
     }
 
     fn default_dock_layout(&self) -> Option<fn() -> DockLayout> {

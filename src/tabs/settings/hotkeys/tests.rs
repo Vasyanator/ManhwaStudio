@@ -265,3 +265,47 @@ fn search_matches_case_insensitively_and_empty_matches_all() {
     assert!(!model::matches_query("pan", &["Zoom in", "Ctrl+="]));
     assert!(model::matches_query("масштаб", &["Сбросить МАСШТАБ"]));
 }
+
+/// The teardown barrier writes every queued change, in order, before it returns: the last of two
+/// edits of one action wins, an independent action is kept, and nothing is left for later.
+#[test]
+fn writer_shutdown_barrier_persists_every_queued_change_in_order() {
+    let dir = std::env::temp_dir().join(format!("ms-settings-hotkeys-writer-{}-{:?}", std::process::id(), std::thread::current().id()));
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        panic!("temp dir {}: {err}", dir.display());
+    }
+    let path = dir.join("user_config.json");
+    let mut registry = registry();
+    let mut entry = |id: ActionId, key: egui::Key| match registry.set_bindings(id, vec![Binding::mode([Button::Key(key)])]) {
+        Ok(entry) => entry,
+        Err(err) => panic!("override rejected: {err}"),
+    };
+    let first_pan = entry(view::PAN, egui::Key::B);
+    let tab_mode = entry(TAB_MODE, egui::Key::Y);
+    let last_pan = entry(view::PAN, egui::Key::N);
+    let ctx = egui::Context::default();
+    let mut writer = super::writer::OverrideWriter::new(path.clone());
+    writer.submit(&ctx, first_pan);
+    writer.submit(&ctx, tab_mode);
+    writer.submit(&ctx, last_pan);
+    let outcome = writer.shutdown_blocking();
+    let text = std::fs::read_to_string(&path);
+    if let Err(err) = std::fs::remove_dir_all(&dir) {
+        panic!("cleanup of {}: {err}", dir.display());
+    }
+    assert_eq!(outcome, Ok(Vec::new()));
+    let text = match text {
+        Ok(text) => text,
+        Err(err) => panic!("user config not written: {err}"),
+    };
+    let root: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(root) => root,
+        Err(err) => panic!("user config is not JSON: {err}"),
+    };
+    let actions = &root["Hotkeys"]["actions"];
+    let expected_pan = serde_json::Value::Array(vec![ms_input::persist::encode_binding(&Binding::mode([Button::Key(egui::Key::N)]))]);
+    assert_eq!(actions[view::PAN.0], expected_pan, "{text}");
+    assert!(actions[TAB_MODE.0].is_array(), "{text}");
+    // Nothing queued: a second barrier is a no-op.
+    assert_eq!(writer.shutdown_blocking(), Ok(Vec::new()));
+}

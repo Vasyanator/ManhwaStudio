@@ -64,9 +64,11 @@ App/frame flow:
   (`studio/studio_output.rs`); the inbound calls are `request_os_close` and `request_close_for_incoming`.
 
 Input actions (`build_input_registry`):
-- The shared `ms_input::view` set, its three zoom commands gated by
-  `ms_studio_tab::VIEW_ZOOM_COMMANDS` while the canvases still read their own zoom keys
-  (`gated_view_declarations`, removed by input-unification WP5).
+- The shared `ms_input::view` set, its zoom commands and zoom axis gated by the canvas context
+  `ms_canvas::input::ZOOM_ACCEPTED` (`canvas_gated_view_declarations`) while other viewers still
+  read those keys raw (input-unification WP6-WP8 remove the gate).
+- The canvas' own set (`ms_canvas::input::declarations`) and the shared brush set
+  (`ms_tools::mask_brush::declarations`).
 - Declared by the tabs (`StudioTab::input_declarations`: Translation canvas, OCR-mode and panel
   actions), merged in `AppTab::ALL` order.
 - Image-set save / save-as (declared only in that mode, `SessionMode::input_declarations`).
@@ -83,7 +85,6 @@ Profiling (optional, behind the `profiling` cargo feature):
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::canvas::CanvasUiStatus;
 use ms_input::{ActionSpec, Condition, DeclarationError, Declarations, FrameEnv, HotkeyOverrides, InputRegistry, InputRouter, view};
-use ms_studio_tab::VIEW_ZOOM_COMMANDS;
 use serde_json::Value;
 use crate::memory_manager::{CacheEvictionRequest, MemoryManager, MemoryPressure};
 use crate::models::autosave_gate::AutosaveGate;
@@ -215,10 +216,6 @@ pub struct StudioApp {
     /// the per-frame `InputFrame` every consumer reads (`begin_frame` once per frame in `ui`).
     /// Lent to the drawing tab through `TabFrame::input`; the Settings pane edits its bindings.
     input: InputRouter,
-    /// Whether the AI device prompt was open at the end of the previous frame. The prompt only
-    /// reports its state from its draw, which runs after the router, so the router's modal flag
-    /// lags by one frame at the prompt's opening and closing.
-    ai_device_prompt_open: bool,
     /// "Pages or ribbon?" prompt of a project without a comic type (`studio/prompts.rs`).
     comic_type_prompt: ComicTypePrompt,
     /// AI device selection prompt, opened from the per-frame health snapshot (`studio/prompts.rs`).
@@ -456,7 +453,6 @@ impl StudioApp {
             layer_doc,
             writers,
             input,
-            ai_device_prompt_open: false,
             comic_type_prompt: ComicTypePrompt::new(comic_type_prompt_open),
             ai_device_prompt: AiDevicePrompt::default(),
             storage_notice_dismissed_job: None,
@@ -912,10 +908,17 @@ impl eframe::App for StudioApp {
         // closed a dialog) and BEFORE the top bar and the tab draw, so every consumer of this
         // frame reads one `InputFrame` and the keys it matched are consumed before any widget
         // sees them. Contexts come from the active tab; the two modal prompts suppress input.
+        // The AI device prompt is opened (not drawn) here, from this frame's health snapshot, so
+        // its modal state is known before the router runs; it is drawn after the tab as before.
+        self.refresh_ai_backend_health_cache();
+        self.ai_device_prompt.refresh(&self.ai_backend_health_cached, self.ai_backend_probe_tx.as_ref());
+        // The one owner of "a binding capture never outlives the Settings tab": a capture
+        // suppresses every binding, so it ends as soon as another tab is active.
+        cancel_capture_outside_settings(&mut self.input, self.active_tab);
         let input_env = FrameEnv {
             active_tab: Some(self.active_tab),
             contexts: self.tabs.get(self.active_tab).input_contexts(),
-            modal_open: self.comic_type_prompt.is_open() || self.ai_device_prompt_open,
+            modal_open: self.comic_type_prompt.is_open() || self.ai_device_prompt.is_open_for(&self.ai_backend_health_cached),
         };
         let input_frame = self.input.begin_frame(ctx, &input_env);
         // The session's own commands (the image set's save / save-as); tab commands are read by
@@ -1014,15 +1017,14 @@ impl eframe::App for StudioApp {
         self.trim_tab_gpu_after_active_canvas();
         self.poll_memory_pressure_and_evict();
 
-        self.refresh_ai_backend_health_cache();
-        self.ai_device_prompt.refresh(&self.ai_backend_health_cached, self.ai_backend_probe_tx.as_ref());
         if let Some(comic_type) = self.comic_type_prompt.draw(ctx) {
             self.apply_comic_type_preset(comic_type);
         }
-        self.ai_device_prompt_open = self.ai_device_prompt.draw(ctx, &self.ai_backend_health_cached, self.ai_backend_probe_tx.as_ref());
-        // While a modal prompt is open the router suppresses input (next frame's `FrameEnv`);
-        // keep repainting so the prompt stays responsive.
-        if self.comic_type_prompt.is_open() || self.ai_device_prompt_open {
+        // Drawn with the snapshot `FrameEnv` was decided with (taken before the router ran).
+        let ai_device_prompt_open = self.ai_device_prompt.draw(ctx, &self.ai_backend_health_cached, self.ai_backend_probe_tx.as_ref());
+        // While a modal prompt is open the router suppresses input; keep repainting so the
+        // prompt stays responsive.
+        if self.comic_type_prompt.is_open() || ai_device_prompt_open {
             ctx.request_repaint();
         }
         // The tab the frame ENDED on (a page-manager open or a deep link may have switched it).
@@ -1115,26 +1117,31 @@ fn restore_panel_dock(user_settings: &Value, defaults: &[panel_dock_persist::Lay
 }
 
 /// The shared `view.*` declarations with the three zoom commands (`view::ZOOM_IN` / `ZOOM_OUT` /
-/// `ZOOM_RESET`) restricted to `Condition::Context(VIEW_ZOOM_COMMANDS)`: while `CanvasView`, the
-/// advanced-recognition window, the cleaning region editor and the PS editor still read their own
-/// zoom keys, the router may match (and consume) those keys only while the active tab executes
-/// the commands itself and publishes that context (Translation, Cleaning). Temporary: removed by
-/// input-unification WP5, when the canvas consumes the `view.*` set.
+/// `ZOOM_RESET`) and the zoom axis (`view::ZOOM`) restricted to
+/// `Condition::Context(ms_canvas::input::ZOOM_ACCEPTED)`, the context a canvas tab forwards from
+/// its `CanvasView` while the canvas executes them (its zoom not blocked). So the router consumes
+/// those keys and Ctrl+wheel only where a canvas acts on them; while the advanced-recognition
+/// window, a cleaning editor window or a selected typing layer blocks canvas zoom, and in the PS
+/// editor, they stay with those viewers' own readers. Transitional: removed when those readers
+/// consume the `view.*` set themselves (input-unification WP6-WP8; the PS editor is outside the
+/// migration and needs its own answer first).
 #[must_use]
-fn gated_view_declarations() -> Declarations {
+fn canvas_gated_view_declarations() -> Declarations {
     let mut declarations = view::declarations();
     for action in &mut declarations.actions {
-        if let ActionSpec::Command(command) = action
-            && [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET].contains(&command.meta.id)
-        {
-            command.meta.when.push(Condition::Context(VIEW_ZOOM_COMMANDS));
+        let gated = [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET, view::ZOOM];
+        match action {
+            ActionSpec::Command(command) if gated.contains(&command.meta.id) => command.meta.when.push(Condition::Context(ms_canvas::input::ZOOM_ACCEPTED)),
+            ActionSpec::Axis(axis) if gated.contains(&axis.meta.id) => axis.meta.when.push(Condition::Context(ms_canvas::input::ZOOM_ACCEPTED)),
+            ActionSpec::Command(_) | ActionSpec::Axis(_) | ActionSpec::Mode(_) | ActionSpec::Gesture(_) => {}
         }
     }
     declarations
 }
 
-/// Builds the studio's input registry: the shared view set (`gated_view_declarations`), then the
-/// tabs' `tab_declarations` (`Tabs::input_declarations`, `AppTab::ALL` order), then the session's
+/// Builds the studio's input registry: the shared view set (`canvas_gated_view_declarations`),
+/// the canvas set (`ms_canvas::input::declarations`), the shared brush set
+/// (`ms_tools::mask_brush::declarations`), then the tabs' `tab_declarations` (`Tabs::input_declarations`, `AppTab::ALL` order), then the session's
 /// own `session_declarations` (`SessionMode::input_declarations`: the image set's save commands),
 /// then the pre-read user `overrides` (`StudioBootstrap::hotkey_overrides`; an override that
 /// does not apply is skipped and logged by the registry, the action keeps its defaults). No I/O.
@@ -1143,7 +1150,9 @@ fn gated_view_declarations() -> Declarations {
 /// [`DeclarationError`] when the merged declarations are invalid (a duplicate id, a dangling mode
 /// reference): a programming error the golden test `input_registry_golden` pins.
 fn build_input_registry(tab_declarations: Declarations, session_declarations: Declarations, overrides: &HotkeyOverrides) -> Result<InputRegistry, DeclarationError> {
-    let mut declarations = gated_view_declarations();
+    let mut declarations = canvas_gated_view_declarations();
+    declarations.extend(ms_canvas::input::declarations());
+    declarations.extend(ms_tools::mask_brush::declarations());
     declarations.extend(tab_declarations);
     declarations.extend(session_declarations);
     let mut registry = InputRegistry::new(declarations)?;
@@ -1152,6 +1161,22 @@ fn build_input_registry(tab_declarations: Declarations, session_declarations: De
         runtime_log::log_warn(format!("[app] {} of {} stored input binding override(s) were skipped; those actions keep their defaults", skipped.len(), overrides.actions.len()));
     }
     Ok(registry)
+}
+
+/// Ends a running binding capture when `active_tab` is not the Settings tab (the only tab that
+/// draws the capture UI). Called once per frame right before `InputRouter::begin_frame`, so a
+/// capture started in Settings › Hotkeys ends on the first frame another tab is active and can
+/// never keep the studio's bindings suppressed. Returns whether a capture was cancelled.
+fn cancel_capture_outside_settings(input: &mut InputRouter, active_tab: AppTab) -> bool {
+    if active_tab == AppTab::Settings {
+        return false;
+    }
+    let Some(action) = input.capture_status().map(|status| status.action) else {
+        return false;
+    };
+    input.capture_cancel();
+    runtime_log::log_info(format!("[app] binding capture of {} cancelled: the Settings tab is no longer active ({active_tab:?} is)", action.0));
+    true
 }
 
 /// The registry `built`, or, when the declarations were invalid, an EMPTY registry: the session
@@ -1188,14 +1213,15 @@ fn spawn_text_render_font_pool_prewarm() {
 
 #[cfg(test)]
 mod tests {
-    use super::{PanelDockPass, build_input_registry, gated_view_declarations, input_registry_or_empty};
+    use super::{PanelDockPass, build_input_registry, cancel_capture_outside_settings, canvas_gated_view_declarations, input_registry_or_empty};
     use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
     use crate::tabs::AppTab;
     use crate::tabs::cleaning::CleaningTabState;
     use crate::tabs::translation::{TranslationTab, TranslationTabState};
     use eframe::egui;
     use ms_input::{ActionKind, Condition, Declarations, HotkeyOverrides, InputRegistry, Scope, view};
-    use ms_studio_tab::{StudioTab, VIEW_ZOOM_COMMANDS};
+    use ms_canvas::input::{EDITABLE, ZOOM_ACCEPTED};
+    use ms_studio_tab::StudioTab;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1236,14 +1262,16 @@ mod tests {
 
     /// Pins the studio's code-declared input registry (no session actions, no user overrides):
     /// every action's id, kind, scope, fixed flag and default label in English, in registry order
-    /// (actions in declaration order — view set, then tabs in `AppTab::ALL` order — then the fixed
-    /// rows). Ids are persistence keys in `user_config` -> `Hotkeys`; the format-1 ids they replace
-    /// migrate in `ms_input::persist`. Also pins the phase-B zoom gate and that the defaults hold
-    /// no conflict.
+    /// (actions in declaration order — view set, canvas set, brush set, then tabs in `AppTab::ALL`
+    /// order — then the fixed rows). Ids are persistence keys in `user_config` -> `Hotkeys`; the
+    /// format-1 ids they replace migrate in `ms_input::persist`. Also pins that the defaults hold no
+    /// conflict.
     #[test]
     fn input_registry_golden() {
         use ActionKind::{Axis, Command, Gesture, Mode};
         const TR: Scope = Scope::Tab(AppTab::Translation);
+        const CV: Scope = Scope::Canvas;
+        const BRUSH: Scope = Scope::Sub(None);
         // Held for the whole test: the active catalog is process-global.
         let _locale = crate::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
         ms_i18n::set_locale(&ms_i18n::LocaleTag::english()).expect("embedded English catalog installs");
@@ -1257,6 +1285,10 @@ mod tests {
         let ctrl = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
         let zoom = format!("({ctrl} / Z)");
         let minus = egui::Key::Minus.symbol_or_name();
+        let lmb_drag = "LMB drag".to_owned();
+        // The platform's clipboard chords (`egui-winit` adds the Insert / Delete spellings on
+        // Windows only).
+        let clipboard = |key: &str, windows: &str| if cfg!(target_os = "windows") { format!("{ctrl}+{key} / {windows}") } else { format!("{ctrl}+{key}") };
         let expected: Vec<(&str, ActionKind, Scope, bool, String)> = vec![
             ("view.zoom_modifier", Mode, Scope::View, false, format!("{ctrl} / Z")),
             ("view.pan", Mode, Scope::View, false, "Space".to_owned()),
@@ -1265,6 +1297,24 @@ mod tests {
             ("view.zoom_reset", Command, Scope::View, false, format!("{zoom}+0")),
             ("view.zoom", Axis, Scope::View, false, format!("{zoom}+Wheel / Pinch")),
             ("view.zoom_drag", Gesture, Scope::View, false, format!("{zoom}+LMB drag")),
+            ("canvas.bubble.undo", Command, CV, false, format!("{ctrl}+Z")),
+            ("canvas.bubble.redo", Command, CV, false, format!("{ctrl}+Shift+Z / {ctrl}+Y")),
+            ("canvas.bubble.duplicate", Command, CV, false, format!("{ctrl}+D")),
+            ("canvas.bubble.select", Gesture, CV, false, "LMB click".to_owned()),
+            ("canvas.bubble.menu", Gesture, CV, false, "RMB click".to_owned()),
+            ("canvas.bubble.drag", Gesture, CV, false, lmb_drag.clone()),
+            ("canvas.bubble.move", Gesture, CV, false, lmb_drag.clone()),
+            ("canvas.bubble.move_rect", Gesture, CV, false, lmb_drag.clone()),
+            ("canvas.bubble.resize", Gesture, CV, false, lmb_drag.clone()),
+            ("canvas.image_area.move_rect", Gesture, CV, false, lmb_drag.clone()),
+            ("canvas.image_area.move", Gesture, CV, false, lmb_drag.clone()),
+            ("canvas.image_area.move_anchor", Gesture, CV, false, lmb_drag.clone()),
+            ("canvas.image_area.resize", Gesture, CV, false, lmb_drag.clone()),
+            ("canvas.page.click", Gesture, CV, false, "LMB click".to_owned()),
+            ("canvas.page.menu", Gesture, CV, false, "RMB click".to_owned()),
+            ("brush.size", Axis, BRUSH, false, "Shift+Wheel / Shift+Horizontal wheel".to_owned()),
+            ("brush.smaller", Command, BRUSH, false, minus.to_owned()),
+            ("brush.larger", Command, BRUSH, false, "= / Shift+= / +".to_owned()),
             ("translation.bubble.delete_selected", Command, TR, false, "Del".to_owned()),
             ("translation.bubble.create_at_cursor", Command, TR, false, "T".to_owned()),
             ("translation.bubble.create_hint_at_cursor", Command, TR, false, "H".to_owned()),
@@ -1281,25 +1331,29 @@ mod tests {
             ("translation.bubble.paste_translation", Command, TR, false, "no binding".to_owned()),
             ("view.scroll", Axis, Scope::View, true, "Wheel".to_owned()),
             ("view.scroll_horizontal", Axis, Scope::View, true, "Shift+Wheel / Horizontal wheel".to_owned()),
+            ("canvas.bubble.copy", Command, CV, true, clipboard("C", &format!("{ctrl}+Ins"))),
+            ("canvas.bubble.cut", Command, CV, true, clipboard("X", "Shift+Del")),
+            ("canvas.bubble.paste", Command, CV, true, clipboard("V", "Shift+Ins")),
         ];
         let actual: Vec<(&str, ActionKind, Scope, bool, String)> = registry.actions().map(|action| (action.meta.id.0, action.kind, action.meta.scope, action.fixed, registry.label(action.meta.id))).collect();
         assert_eq!(actual, expected);
         assert!(registry.conflicts().conflicts.is_empty(), "the default bindings conflict: {:?}", registry.conflicts().conflicts);
     }
 
-    /// The phase-B gate: exactly the three zoom commands of the view set gain
-    /// `Context(VIEW_ZOOM_COMMANDS)`; every other view declaration is the crate's own, unchanged.
-    /// Both tabs that execute the commands publish the context by default.
+    /// The canvas gate: exactly the three zoom commands and the zoom axis of the view set gain
+    /// `Context(ZOOM_ACCEPTED)`; every other view declaration is the crate's own, unchanged. Both
+    /// canvas tabs forward their canvas's contexts: Translation edits bubbles, Cleaning does not,
+    /// and neither blocks zoom by default.
     #[test]
-    fn only_the_view_zoom_commands_are_gated() {
-        let gated = gated_view_declarations();
+    fn only_the_view_zoom_keys_are_gated_by_the_canvas() {
+        let gated = canvas_gated_view_declarations();
         let original = view::declarations();
         assert_eq!(gated.actions.len(), original.actions.len());
         for (gated, original) in gated.actions.iter().zip(&original.actions) {
             let id = gated.meta().id;
-            if [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET].contains(&id) {
+            if [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET, view::ZOOM].contains(&id) {
                 let mut expected_when = original.meta().when.clone();
-                expected_when.push(Condition::Context(VIEW_ZOOM_COMMANDS));
+                expected_when.push(Condition::Context(ZOOM_ACCEPTED));
                 assert_eq!(gated.meta().when, expected_when, "{id:?}");
             } else {
                 assert_eq!(gated, original, "{id:?} must stay as `ms_input::view` declares it");
@@ -1307,8 +1361,8 @@ mod tests {
         }
         assert_eq!((gated.targets, gated.fixed), (original.targets, original.fixed));
         let (translation, cleaning) = translation_and_cleaning();
-        assert_eq!(translation.input_contexts(), vec![VIEW_ZOOM_COMMANDS]);
-        assert_eq!(cleaning.input_contexts(), vec![VIEW_ZOOM_COMMANDS]);
+        assert_eq!(translation.input_contexts(), vec![EDITABLE, ZOOM_ACCEPTED]);
+        assert_eq!(cleaning.input_contexts(), vec![ZOOM_ACCEPTED]);
     }
 
     /// The image set's two save commands join the registry without a conflict (exact modifier sets:
@@ -1333,5 +1387,37 @@ mod tests {
         assert!(built.is_err(), "the view set declared twice must be rejected");
         let registry: InputRegistry = input_registry_or_empty(built);
         assert_eq!(registry.actions().count(), 0);
+    }
+
+    /// Runs one headless frame through `router.begin_frame` and returns whether input was
+    /// suppressed in it.
+    fn frame_suppressed(ctx: &egui::Context, router: &mut ms_input::InputRouter, active_tab: AppTab) -> bool {
+        let env = ms_input::FrameEnv { active_tab: Some(active_tab), contexts: Vec::new(), modal_open: false };
+        let mut suppressed = None;
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            suppressed = Some(router.begin_frame(ui.ctx(), &env).suppressed());
+        })
+        .drop_without_applying_deltas();
+        suppressed.expect("run_ui calls the frame closure")
+    }
+
+    /// A capture started in Settings › Hotkeys keeps suppressing input only while the Settings
+    /// tab is active: the first frame another tab is active ends it before the router runs, and
+    /// with no capture the helper does nothing.
+    #[test]
+    fn a_binding_capture_ends_when_the_settings_tab_is_left() {
+        let registry = build_input_registry(Declarations::default(), Declarations::default(), &HotkeyOverrides::default()).expect("valid declarations");
+        let mut router = ms_input::InputRouter::new(registry);
+        let ctx = egui::Context::default();
+        router.capture_begin(view::ZOOM_IN, ms_input::CaptureSlot::Append);
+
+        assert!(!cancel_capture_outside_settings(&mut router, AppTab::Settings), "Settings keeps its capture");
+        assert!(frame_suppressed(&ctx, &mut router, AppTab::Settings), "a running capture suppresses input");
+
+        // The user switched to Translation: the root's per-frame step before `begin_frame`.
+        assert!(cancel_capture_outside_settings(&mut router, AppTab::Translation));
+        assert!(router.capture_status().is_none());
+        assert!(!frame_suppressed(&ctx, &mut router, AppTab::Translation), "bindings work again on the first frame away from Settings");
+        assert!(!cancel_capture_outside_settings(&mut router, AppTab::Translation), "nothing to cancel any more");
     }
 }

@@ -63,6 +63,10 @@ Internal submodules:
   `drive_touch_drag`, the tap point `touch_tap`, the armed point `touch_long_press_armed_at`).
 - `settings`: canvas settings snapshot/publish/persistence logic.
 - `workers`: background worker bootstrap for overlay prepare and settings save.
+- `input` (public): the canvas' side of `ms-input` — its declarations (bubble history commands,
+  clipboard rows, gestures + targets), the contexts it asks its tab to publish
+  (`CanvasView::input_contexts`), its view id, the shortcuts-chip label snapshot, the gesture /
+  menu helpers the scene and bubble passes use.
 
 Key constants:
 - `TEXT_UPSERT_DEBOUNCE_SECS`: debounce for text writes to shared bubbles model.
@@ -78,8 +82,16 @@ Key constants:
 - `BUBBLE_HISTORY_LIMIT`: max undo/redo depth of the bubble `ms-actions` history.
 - `BUBBLE_ANCHOR_OUTSIDE_RECT_SPAN_MULT`: max anchor overshoot outside rect in multiples of rect span.
 
+Input (see `input.rs` and the MODULE_README "Input" section): `CanvasDrawParams` carries the
+frame's `InputFrame` and the registry; `draw` holds the frame for the pass, reads the shared
+`view.*` set / its commands / its gestures from it (`apply_input_frame`), raises the capture
+area while a canvas-wide gesture is armed (`draw_capture_area`) and publishes its view surface
+(`publish_view_surface`). No key, modifier or wheel is read here.
+
 CanvasHooks methods:
-- `wants_canvas_shift_drag_selection`: lets tab capture Shift+drag interactions.
+- `wants_canvas_shift_drag_selection`: lets tab capture Shift+drag interactions (transitional).
+- `on_page_click`: a `canvas.page.click` on a page, before the canvas' own handling (also on
+  read-only canvases).
 - `draw_canvas_mask_overlay_on_page`: tab-owned per-page mask-layer draw pass rendered above clean overlay.
 - `draw_canvas_overlay_on_page`: tab-owned per-page additional-elements draw pass rendered above mask.
 - `draw_canvas_overlay_top_left`: tab-owned overlay UI drawn above canvas.
@@ -105,12 +117,13 @@ CanvasView method map:
   `commit_overlay_page_to_model`.
 - External wiring/state toggles:
   `set_bubbles_model`, `set_overlays_model`, `set_drag_scroll_blocked`,
-  `set_wheel_scroll_blocked`, `set_zoom_blocked`, `set_overlay_render_suppressed`,
+  `set_wheel_scroll_blocked`, `set_zoom_blocked` (the three transitional input adapters),
+  `set_overlay_render_suppressed`,
   `set_overlay_upload_min_interval_s`, `set_clean_overlays_visible`,
   `set_clean_overlays_visible_for_canvas_only`, `set_scroll_area_id_salt`,
   `viewport_snapshot`, `apply_viewport_snapshot`, `clean_overlays_visible`.
 - Navigation/shortcuts/actions:
-  `current_page_idx`, `zoom_by_shortcut`, `reset_zoom_shortcut`,
+  `current_page_idx`,
   `delete_selected_bubble_shortcut`, `create_bubble_at_pointer_shortcut`,
   `copy_from_focused_bubble_shortcut`, `cut_focused_bubble_shortcut`,
   `copy_whole_bubble_to_internal_buffer`,
@@ -123,7 +136,8 @@ CanvasView method map:
   `paste_bubble_text_from_clipboard`,
   `flush_pending_bubble_upserts_now`, `flush_all_bubble_edits_now`, `apply_machine_translation_result`,
   `patch_bubble_extra_fields`, `capture_bubble_history_before_mutation`,
-  `try_undo_bubbles_history`, `try_redo_bubbles_history`, `handle_shortcuts`.
+  `try_undo_bubbles_history`, `try_redo_bubbles_history`, `apply_input_frame` (the frame
+  reader, with `draw_capture_area` / `publish_view_surface`).
 - Scene and overlay geometry API:
   `page_index_at_scene_pos`, `bubble_original_text`, `page_contains_scene_pos`,
   `visible_scene_rect`, `overlay_image`, `clear_overlay_index`,
@@ -202,7 +216,9 @@ Key CanvasView state groups (important fields):
   `overlay_upload_min_interval_s`, `overlay_last_upload_s`.
 - Shared-model bindings: `bubbles_model`, `overlays_model`, `synced_*_revision`.
 - Interaction gates: `drag_scroll_blocked`, `wheel_scroll_blocked`, `zoom_blocked`,
-  `zoom_drag_active`, `zoom_drag_last_x`, `overlay_render_suppressed`.
+  `zoom_drag_active`, `zoom_drag_last_x`, `pan_mode_active`, `overlay_render_suppressed`.
+- Input: `input_frame` (this frame's `InputFrame`, `Some` only during `draw`), `labels`
+  (`input::CanvasLabels`).
 - Async settings persistence: `last_published_canvas_snapshot`,
   `canvas_settings_save_tx`, `canvas_settings_save_thread`.
 - Pixel inspection: `pixel_sampling_nearest` and `pixel_grid_visible` are transient canvas render
@@ -223,6 +239,7 @@ extern crate ms_i18n;
 
 use self::bubble_runtime::BubbleRuntimeState;
 use self::helpers::*;
+use self::input::CanvasLabels;
 use self::overlay_runtime::OverlayRuntimeState;
 use self::scene::CanvasSceneState;
 use self::settings::CanvasSettingsRuntime;
@@ -235,6 +252,7 @@ use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
 use ms_models::bubbles_model::runtime_bubble_to_record;
 use ms_models::clean_overlays_model::CleanOverlaysModel;
 use ms_project::{Bubble, ProjectData};
+use ms_input::{ActionId, GesturePhase, InputFrame, InputRegistry, ViewSurface, view};
 use ms_log::runtime_log;
 use ms_widgets::panel_dock::{PanelDock, PanelDockState, TabId};
 use ms_widgets::{
@@ -293,6 +311,7 @@ mod bubble_aside_ui;
 mod bubble_on_top_ui;
 mod bubble_runtime;
 mod helpers;
+pub mod input;
 mod overlay_runtime;
 /// Shared per-source-pixel inspection grid. `pub(crate)` because the PS editor
 /// (`tabs::ps_editor`) paints the SAME grid from its own viewport under a manual checkbox — see
@@ -574,7 +593,22 @@ impl CanvasScrollbarContext<'_> {
 }
 
 pub trait CanvasHooks {
+    /// Whether the tab's own selection mode owns pointer drags on the page rows this frame: the
+    /// rows then sense hover only and the page click / page menu are off.
+    ///
+    /// Transitional adapter: the tabs still decide this from their own key reads (Translation
+    /// OCR / crop modes, Typing create mode). It goes when their selections become claimed
+    /// canvas-wide gestures (`InputFrame::claimed`), input-unification WP6 (Translation) and WP8
+    /// (Typing).
     fn wants_canvas_shift_drag_selection(&self, _ctx: &egui::Context) -> bool {
+        false
+    }
+
+    /// A `canvas.page.click` gesture on page `page_idx` at `scene_pos` (screen points). Called for
+    /// read-only canvases too, before the canvas' own handling; return `true` to consume the
+    /// click (the canvas then neither deselects nor places a bubble in move mode). Default:
+    /// `false`.
+    fn on_page_click(&mut self, _page_idx: usize, _scene_pos: Pos2) -> bool {
         false
     }
 
@@ -725,6 +759,11 @@ pub struct CanvasDrawParams<'a> {
     /// which it is by construction — all three are separate fields of `StudioApp`
     /// or of the drawing tab.
     pub panel_dock: &'a mut PanelDockState,
+    /// This frame's input, decided by the studio's `InputRouter::begin_frame` before any tab drew:
+    /// the canvas reads the shared `view.*` set, its own commands and its gestures from it.
+    pub input: &'a InputFrame,
+    /// The studio's input registry: binding labels of the canvas' own shortcuts chip.
+    pub input_registry: &'a InputRegistry,
 }
 
 pub struct CanvasView {
@@ -748,6 +787,11 @@ pub struct CanvasView {
     /// Live collapsed state of the bottom hint. Seeded once from `user_config` at tab construction
     /// via `set_bottom_hint_collapsed`, then toggled only by the arrow button. `false` = expanded.
     bottom_hint_collapsed: bool,
+    /// This frame's input, held for the duration of `draw` (the scene and bubble passes resolve
+    /// their gestures from it); `None` outside `draw`.
+    input_frame: Option<InputFrame>,
+    /// Binding labels of the shortcuts chip, rebuilt on a registry revision or locale change.
+    labels: CanvasLabels,
 }
 
 impl Default for CanvasView {
@@ -767,6 +811,8 @@ impl Default for CanvasView {
             pixel_grid_visible: false,
             bottom_hint: None,
             bottom_hint_collapsed: false,
+            input_frame: None,
+            labels: CanvasLabels::default(),
         }
     }
 }
@@ -802,6 +848,11 @@ impl Drop for CanvasView {
 }
 
 impl CanvasView {
+    /// The binding label the page menu shows next to "Create bubble" (`None` = no shortcut).
+    ///
+    /// Transitional adapter: the Translation host feeds it from the registry label of its own
+    /// create-bubble command; it goes when the page menu asks its tab for that label,
+    /// input-unification WP6.
     pub fn set_create_bubble_shortcut_hint(&mut self, shortcut_hint: Option<String>) {
         self.create_bubble_shortcut_hint = shortcut_hint;
     }
@@ -1012,14 +1063,30 @@ impl CanvasView {
             .wrapping_add(next_id_bits)
     }
 
+    /// Turns the `view.pan` drag scroll off for this and later frames (a tool owns drags).
+    ///
+    /// Transitional adapter (Cleaning tools); it goes when the tool strokes become claimed
+    /// gestures, input-unification WP7.
     pub fn set_drag_scroll_blocked(&mut self, blocked: bool) {
         self.scene.drag_scroll_blocked = blocked;
     }
 
+    /// Turns plain wheel scrolling off for this and later frames (a tool reads the wheel).
+    ///
+    /// Transitional adapter (Cleaning tools); it goes when the tools read declared axes,
+    /// input-unification WP7.
     pub fn set_wheel_scroll_blocked(&mut self, blocked: bool) {
         self.scene.wheel_scroll_blocked = blocked;
     }
 
+    /// Blocks this canvas' zoom: the canvas stops executing `view.zoom_in` / `zoom_out` /
+    /// `zoom_reset`, the `view.zoom` axis and the zoom drag, raises no capture area, pinch pans
+    /// only, and from the next frame its tab no longer publishes [`input::ZOOM_ACCEPTED`], so the
+    /// router leaves those keys and Ctrl+wheel to the tab's own readers.
+    ///
+    /// Transitional adapter (Translation advanced recognition, Cleaning tools, the Typing selected
+    /// layer); it goes when those readers become declared, shadowing actions, input-unification
+    /// WP6-WP8.
     pub fn set_zoom_blocked(&mut self, blocked: bool) {
         self.scene.zoom_blocked = blocked;
     }
@@ -1250,17 +1317,6 @@ impl CanvasView {
         true
     }
 
-    pub fn zoom_by_shortcut(&mut self, factor: f32) -> bool {
-        if factor <= 0.0 {
-            return false;
-        }
-        self.apply_zoom_value(self.state.zoom * factor, None, None)
-    }
-
-    pub fn reset_zoom_shortcut(&mut self) -> bool {
-        self.apply_zoom_value(1.0, None, None)
-    }
-
     pub fn zoom(&self) -> f32 {
         self.state.zoom
     }
@@ -1420,7 +1476,12 @@ impl CanvasView {
             source_upload_budget,
             hooks,
             panel_dock,
+            input,
+            input_registry,
         } = params;
+        // Held for the whole draw: the scene and bubble passes resolve their gestures from it.
+        self.input_frame = Some(input.clone());
+        self.labels.refresh(input_registry);
         self.poll_overlay_prepare_results();
         self.sync_overlays_from_model();
         self.sync_runtime_from_model_or_project(project);
@@ -1436,7 +1497,8 @@ impl CanvasView {
         self.refresh_page_aside_presence();
         let canvas_rect = ui.max_rect();
         let (suppress_wheel_scroll, zoom_drag_active) =
-            self.handle_shortcuts(ctx, project, canvas_rect);
+            self.apply_input_frame(ctx, project, canvas_rect);
+        self.draw_capture_area(ctx, canvas_rect);
         // Deferred focus, pass 1: an already-laid-out canvas still holds last frame's world rects
         // here, so a between-frames `focus_page` (tab switch, PS-editor return) resolves into
         // `pending_scroll_offset` before the scene pass below consumes it — a same-frame apply.
@@ -1445,11 +1507,11 @@ impl CanvasView {
         self.scene.page_world_rects.clear();
         self.scene.page_aside_widths.clear();
         self.scene.visible_scene_rect = None;
-        // Cleared here (after `handle_shortcuts` has consumed last frame's value for occlusion) and
-        // re-set by `draw_canvas_bottom_hint`; stays `None` when the tab supplies no hint.
+        // Cleared here and re-set by `draw_canvas_bottom_hint` (stays `None` when the tab supplies
+        // no hint); published as a view-surface hole at the end of this draw.
         self.scene.canvas_bottom_hint_rect = None;
-        // Same lifecycle as the bottom hint: consumed for occlusion by `handle_shortcuts` above,
-        // cleared here, and re-set by `draw_hangul_keyboard_panel` when the panel is open.
+        // Same lifecycle as the bottom hint: re-set by `draw_hangul_keyboard_panel` while the
+        // panel is open.
         self.scene.canvas_hangul_keyboard_rect = None;
         self.overlay_runtime
             .overlay_textures
@@ -1533,12 +1595,14 @@ impl CanvasView {
         self.apply_deferred_remote_updates();
         self.flush_bubble_upserts_to_model(project);
         self.draw_canvas_viewport_ui(ctx, project, status, frame, hooks, panel_dock);
-        // Last: the surface needs this frame's viewport, hit rects, scrollbars and bottom hint.
+        // Last: the surfaces need this frame's viewport, hit rects, scrollbars and bottom hint.
         self.publish_touch_surface(ctx);
+        self.publish_view_surface(ctx, canvas_rect);
         self.publish_canvas_settings(project);
         if self.has_pending_overlay_work() {
             ctx.request_repaint();
         }
+        self.input_frame = None;
     }
 
     /// Draws the floating Hangul jamo keyboard and applies its insert into the sticky target.
@@ -1562,8 +1626,8 @@ impl CanvasView {
     ///
     /// The widget state is taken out of the runtime for the duration so it can be borrowed mutably
     /// while `self` stays free for the text mutation, then put back (the panel stays open in every
-    /// non-user-close path). Publishes the window rect into `scene.canvas_hangul_keyboard_rect` for
-    /// input occlusion.
+    /// non-user-close path). Publishes the window rect into `scene.canvas_hangul_keyboard_rect`, a
+    /// hole of the view surface.
     fn draw_hangul_keyboard_panel(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
         let Some(mut state) = self.bubble_runtime.hangul_keyboard.take() else {
             return;
@@ -1622,9 +1686,9 @@ impl CanvasView {
             });
         if !keep_open {
             // The user closed the window; dropping `state` here is the close. The rect is
-            // deliberately NOT published on this path: `handle_shortcuts` reads last frame's
-            // value, so publishing a rect for a panel that is already gone would swallow one
-            // frame of Ctrl+wheel zoom over the area the panel used to occupy.
+            // deliberately NOT published on this path: it becomes a hole of the view surface the
+            // router reads next frame, so a rect for a panel that is already gone would swallow
+            // one frame of Ctrl+wheel zoom over the area the panel used to occupy.
             return;
         }
         if let Some(window_response) = window_response {
@@ -1940,161 +2004,156 @@ impl CanvasView {
         }
     }
 
-    fn handle_shortcuts(
-        &mut self,
-        ctx: &egui::Context,
-        project: &ProjectData,
-        canvas_rect: Rect,
-    ) -> (bool, bool) {
-        let (mods, wheel_delta_y, hover_pos, interact_pos, z_down, primary_down) = ctx.input(|i| {
-            (
-                i.modifiers,
-                // Raw wheel: stays non-zero under Ctrl/Cmd, where egui zeroes
-                // `smooth_scroll_delta` (it diverts Ctrl+wheel into `zoom_delta`).
-                ms_widgets::input_util::raw_wheel_delta(i).y,
-                i.pointer.hover_pos(),
-                i.pointer.interact_pos(),
-                i.key_down(egui::Key::Z),
-                i.pointer.primary_down(),
-            )
-        });
-        let ctrl_or_command = mods.ctrl || mods.command;
-        let zoom_modifier_down = ctrl_or_command || z_down;
-        let pointer_pos = interact_pos.or(hover_pos);
-        // Occlude the bottom-hint overlay: a pointer over the collapsible hint (its rect from last
-        // frame, since the hint draws after this pass) must not count as "inside the canvas", so
-        // canvas zoom/drag input does not leak through the floating hint.
-        let over_bottom_hint = pointer_pos.is_some_and(|p| {
-            self.scene
-                .canvas_bottom_hint_rect
-                .is_some_and(|rect| rect.contains(p))
-        });
-        // Same occlusion contract for the floating Hangul keyboard window (also drawn after this
-        // pass, so its rect is last frame's): without this the wheel over the panel would zoom the
-        // page underneath instead of scrolling the panel.
-        let over_hangul_keyboard = pointer_pos.is_some_and(|p| {
-            self.scene
-                .canvas_hangul_keyboard_rect
-                .is_some_and(|rect| rect.contains(p))
-        });
-        let inside_canvas = pointer_pos
-            .map(|p| canvas_rect.contains(p))
-            .unwrap_or(false)
-            && !over_bottom_hint
-            && !over_hangul_keyboard;
-        if self.editable && !ctx.egui_wants_keyboard_input() {
-            let command_shift_mods = egui::Modifiers {
-                command: true,
-                shift: true,
-                ..Default::default()
-            };
-            let (redo, undo) = ctx.input_mut(|i| {
-                (
-                    i.consume_key(command_shift_mods, egui::Key::Z),
-                    i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
-                )
-            });
-            if (redo && self.try_redo_bubbles_history())
-                || (undo && self.try_undo_bubbles_history())
-            {
+    /// Applies this frame's input (`self.input_frame`, set by `draw`) to the canvas, before the
+    /// scene pass: the bubble history commands, the shared `view.*` zoom commands / axis / drag,
+    /// and the finger navigation. Returns `(suppress_wheel_scroll, zoom_drag_active)` for the
+    /// scene's `ScrollArea` and widget senses.
+    ///
+    /// Nothing here reads a key, a modifier or the wheel: the router decided all of it.
+    /// - `canvas.bubble.undo` / `redo` / `duplicate` act only on an editable canvas (the router
+    ///   fires them only while the tab publishes `input::EDITABLE`).
+    /// - `view.zoom_in` / `zoom_out` / `zoom_reset` act when their focus is this view (the pointer
+    ///   on it, else this primary view's centre), anchored at the focus point; the `view.zoom`
+    ///   axis acts when the pointer is on this view; both are skipped while the tab blocks zoom.
+    /// - `view.zoom_drag` is the router's claim on this view: horizontal pointer movement zooms
+    ///   about the pointer until the button or the zoom modifier is released.
+    /// - Wheel scrolling is suppressed while the zoom modifier is held over this view or a zoom
+    ///   drag runs (the zoom modifier's wheel belongs to the zoom axis even when it is blocked).
+    fn apply_input_frame(&mut self, ctx: &egui::Context, project: &ProjectData, canvas_rect: Rect) -> (bool, bool) {
+        let view_id = self.view_id();
+        let Some(frame) = self.input_frame.as_ref() else {
+            self.scene.zoom_drag_active = false;
+            self.take_touch_output_for_frame(ctx, canvas_rect);
+            return (false, false);
+        };
+        let undo = frame.fired(input::BUBBLE_UNDO).is_some();
+        let redo = frame.fired(input::BUBBLE_REDO).is_some();
+        let duplicate = frame.fired(input::BUBBLE_DUPLICATE).is_some();
+        // At most one press fires per event, but several presses may land in one frame: keep the
+        // firing order (zoom in then out is a no-op, as typed).
+        let zoom_commands: Vec<(ActionId, Pos2)> = [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET]
+            .into_iter()
+            .filter_map(|id| frame.fired(id).and_then(|fired| fired.focus).filter(|focus| focus.view == view_id).map(|focus| (id, focus.pos)))
+            .collect();
+        let zoom_axis = frame.axis_for_view(view::ZOOM, view_id).copied();
+        let zoom_claim = frame.claimed(view_id).filter(|claim| claim.action == view::ZOOM_DRAG).cloned();
+        let zoom_modifier_on_view = frame.mode_active(view::ZOOM_MODIFIER) && frame.view_under_pointer() == Some(view_id);
+
+        if self.editable && (undo || redo) {
+            // Redo first, as the old consume order did; one press fires only one of them.
+            if (redo && self.try_redo_bubbles_history()) || (undo && self.try_undo_bubbles_history()) {
                 ctx.request_repaint();
             }
         }
-        let has_focused_bubble = self
-            .bubble_runtime
-            .selected_bubble
-            .is_some_and(|bid| self.bubble_runtime.runtime_bubbles.contains_key(&bid));
-        let keyboard_input_active = ctx.egui_wants_keyboard_input();
-        let can_duplicate_shortcut = self.editable && has_focused_bubble && !keyboard_input_active;
-        let duplicate_shortcut = ctx.input_mut(|i| {
-            if can_duplicate_shortcut {
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)
-            } else {
-                false
-            }
-        });
-        if duplicate_shortcut {
+        let has_selected_bubble = self.bubble_runtime.selected_bubble.is_some_and(|bid| self.bubble_runtime.runtime_bubbles.contains_key(&bid));
+        if duplicate && self.editable && has_selected_bubble {
             self.duplicate_focused_bubble_shortcut(project, ctx.input(|i| i.time));
         }
 
-        if !self.scene.zoom_blocked
-            && inside_canvas
-            && wheel_delta_y.abs() > f32::EPSILON
-            && (ctrl_or_command || z_down)
-        {
-            let factor = if wheel_delta_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
-            self.apply_zoom_with_anchor(factor, pointer_pos, canvas_rect);
-        }
-        if self.scene.zoom_blocked {
-            self.scene.zoom_drag_active = false;
-        } else if self.scene.zoom_drag_active {
-            if !zoom_modifier_down || !primary_down {
-                self.scene.zoom_drag_active = false;
-            } else if let Some(pos) = pointer_pos {
-                let dx = pos.x - self.scene.zoom_drag_last_x;
-                if dx.abs() > f32::EPSILON {
-                    let factor = (dx * 0.005).exp().clamp(0.5, 2.0);
-                    self.apply_zoom_with_anchor(factor, pointer_pos, canvas_rect);
+        if !self.scene.zoom_blocked {
+            for (id, anchor) in zoom_commands {
+                if id == view::ZOOM_RESET {
+                    self.apply_zoom_value(1.0, Some(anchor), Some(canvas_rect));
+                } else {
+                    let factor = if id == view::ZOOM_IN { input::wheel_zoom_factor(1) } else { input::wheel_zoom_factor(-1) };
+                    self.apply_zoom_with_anchor(factor, Some(anchor), canvas_rect);
                 }
-                self.scene.zoom_drag_last_x = pos.x;
             }
-        } else if zoom_modifier_down
-            && primary_down
-            && inside_canvas
-            && let Some(pos) = pointer_pos
-        {
-            self.scene.zoom_drag_active = true;
-            self.scene.zoom_drag_last_x = pos.x;
+            if let Some(sample) = zoom_axis
+                && let Some(focus) = sample.focus
+            {
+                let factor = if sample.steps != 0 {
+                    input::wheel_zoom_factor(sample.steps)
+                } else if input::pinch_this_frame(ctx) {
+                    sample.delta.exp()
+                } else {
+                    1.0
+                };
+                if (factor - 1.0).abs() > f32::EPSILON {
+                    self.apply_zoom_with_anchor(factor, Some(focus.pos), canvas_rect);
+                }
+            }
         }
-        let zoom_drag_now = self.scene.zoom_drag_active
-            || (!self.scene.zoom_blocked && zoom_modifier_down && primary_down && inside_canvas);
-        if zoom_drag_now {
+
+        self.scene.zoom_drag_active = match zoom_claim {
+            Some(claim) if !self.scene.zoom_blocked => match claim.phase {
+                GesturePhase::Started | GesturePhase::Active => {
+                    // A new drag measures from its press point; a drag that only now became
+                    // active (the tab lifted its zoom block mid-drag) from where it is, so the
+                    // view does not jump by the movement made while blocked.
+                    if claim.phase == GesturePhase::Started {
+                        self.scene.zoom_drag_last_x = claim.origin.x;
+                    } else if !self.scene.zoom_drag_active {
+                        self.scene.zoom_drag_last_x = claim.current.x;
+                    }
+                    let dx = claim.current.x - self.scene.zoom_drag_last_x;
+                    if dx.abs() > f32::EPSILON {
+                        self.apply_zoom_with_anchor(input::zoom_drag_factor(dx), Some(claim.current), canvas_rect);
+                    }
+                    self.scene.zoom_drag_last_x = claim.current.x;
+                    true
+                }
+                GesturePhase::Finished(_) => false,
+            },
+            Some(_) | None => false,
+        };
+        if self.scene.zoom_drag_active {
             ctx.request_repaint();
         }
-        if !self.scene.zoom_blocked
-            && zoom_modifier_down
-            && inside_canvas
-            && !ctx.egui_wants_keyboard_input()
-        {
-            let mut zoom_in = false;
-            let mut zoom_out = false;
-            let mut zoom_reset = false;
-            let key_modifiers = [
-                ctrl_or_command.then_some(egui::Modifiers::COMMAND),
-                z_down.then_some(egui::Modifiers::NONE),
-            ];
-            for key_mods in key_modifiers.into_iter().flatten() {
-                let (plus, equals, minus, zero) = ctx.input_mut(|i| {
-                    (
-                        i.consume_key(key_mods, egui::Key::Plus),
-                        i.consume_key(key_mods, egui::Key::Equals),
-                        i.consume_key(key_mods, egui::Key::Minus),
-                        i.consume_key(key_mods, egui::Key::Num0),
-                    )
-                });
-                zoom_in |= plus || equals;
-                zoom_out |= minus;
-                zoom_reset |= zero;
-            }
-
-            if zoom_reset {
-                let _ = self.apply_zoom_value(1.0, pointer_pos, Some(canvas_rect));
-            } else {
-                if zoom_in {
-                    self.apply_zoom_with_anchor(1.1, pointer_pos, canvas_rect);
-                }
-                if zoom_out {
-                    self.apply_zoom_with_anchor(1.0 / 1.1, pointer_pos, canvas_rect);
-                }
-            }
-        }
-        // Finger pan / pinch, after the wheel and keyboard paths: a zoom anchor they recorded this
-        // frame wins (see `apply_touch_navigation`). Taken every frame, even while nothing
-        // touches, because the take also schedules the router's long-press repaint.
+        // Finger pan / pinch, after the zoom paths: a zoom anchor they recorded this frame wins
+        // (see `apply_touch_navigation`). Taken every frame, even while nothing touches, because
+        // the take also schedules the router's long-press repaint.
         self.take_touch_output_for_frame(ctx, canvas_rect);
-        let suppress_wheel_scroll = (zoom_modifier_down && inside_canvas) || zoom_drag_now;
+        let suppress_wheel_scroll = zoom_modifier_on_view || self.scene.zoom_drag_active;
+        (suppress_wheel_scroll, self.scene.zoom_drag_active)
+    }
 
-        (suppress_wheel_scroll, zoom_drag_now)
+    /// Raises the canvas' full-surface capture `Area` while a canvas-wide gesture is armed on this
+    /// view (`InputFrame::canvas_wide_armed`: the pointer is on the view and a press would be
+    /// claimed, or a claimed mouse gesture still runs) and the tab does not block zoom.
+    ///
+    /// The area takes egui's press, so no bubble, field or row under it reacts to the press the
+    /// router claims (P2). It lives on `Order::Background`: above the central panel's root layer
+    /// (a layer with no area state sorts below every area of its order), below dock panels,
+    /// popups and windows, so those keep their clicks; and tab code that treats a non-background
+    /// layer under the pointer as "occluded" (Cleaning strokes, Typing deselect) still sees bare
+    /// canvas. The layer is published as the surface's `capture_layer` and as a touch capture
+    /// layer, so it occludes neither the router's view lookup nor a finger.
+    fn draw_capture_area(&self, ctx: &egui::Context, canvas_rect: Rect) {
+        let armed = self.input_frame.as_ref().is_some_and(|frame| frame.canvas_wide_armed(self.view_id()));
+        if !armed || self.scene.zoom_blocked || !canvas_rect.is_positive() {
+            return;
+        }
+        let layer = input::capture_layer_for(self.scroll_area_id_salt);
+        ms_widgets::touch_nav::publish_capture_layer(ctx, self.touch_owner_id(), layer);
+        egui::Area::new(layer.id)
+            .order(layer.order)
+            .fixed_pos(canvas_rect.min)
+            .constrain(false)
+            .movable(false)
+            .interactable(true)
+            .show(ctx, |ui| {
+                ui.set_min_size(canvas_rect.size());
+                ui.interact(canvas_rect, layer.id.with("sense"), egui::Sense::click_and_drag());
+            });
+    }
+
+    /// Publishes this frame's view surface for the router's next frame (`ms_input`): the canvas
+    /// rect, with the bottom hint and the Hangul keyboard window as holes, the capture layer, and
+    /// the touch owner. Called at the end of `draw`, once those rects are final.
+    fn publish_view_surface(&self, ctx: &egui::Context, canvas_rect: Rect) {
+        let holes = self.scene.canvas_bottom_hint_rect.into_iter().chain(self.scene.canvas_hangul_keyboard_rect).collect();
+        ms_input::publish_view_surface(
+            ctx,
+            ViewSurface {
+                id: self.view_id(),
+                rect: canvas_rect,
+                holes,
+                capture_layer: Some(input::capture_layer_for(self.scroll_area_id_salt)),
+                primary: true,
+                touch_owner: Some(self.touch_owner_id()),
+            },
+        );
     }
 
     fn apply_zoom_with_anchor(

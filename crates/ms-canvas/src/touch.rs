@@ -222,7 +222,7 @@ impl CanvasView {
 
     /// Takes this frame's touch output (once per frame; it also schedules the router's
     /// long-press repaint), applies its navigation and keeps the long-press points for the
-    /// scene pass. Called from `handle_shortcuts` after the wheel and keyboard zoom paths.
+    /// scene pass. Called from `apply_input_frame` after the zoom paths.
     pub(super) fn take_touch_output_for_frame(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
         let output = touch_nav::take_touch_output(ctx, self.touch_owner_id());
         self.scene.touch_long_press_at = output.long_press_at;
@@ -289,8 +289,11 @@ impl CanvasView {
 
     /// Builds this frame's touch surface (`None` before the first scene pass) and consumes the
     /// one-frame `long_press_selection` flag and drag regions whether or not a surface results.
+    /// A long-press drag also selects while the input router would claim it for a declared touch
+    /// binding (`InputFrame::touch_selection_available`, P8).
     fn take_touch_surface(&mut self) -> Option<TouchSurface> {
-        let long_press_selection = std::mem::take(&mut self.scene.long_press_selection);
+        let declared_selection = self.input_frame.as_ref().is_some_and(|frame| frame.touch_selection_available(self.view_id()));
+        let long_press_selection = std::mem::take(&mut self.scene.long_press_selection) || declared_selection;
         let drag_regions = std::mem::take(&mut self.scene.touch_drag_regions);
         let rect = self.scene.scroll_inner_rect?;
         Some(TouchSurface {

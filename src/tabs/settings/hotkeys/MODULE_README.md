@@ -22,7 +22,7 @@ Pure rules (grouping, ordering, modifier chips, templates, conflict-row mapping,
 `model.rs` and are unit-tested in `tests.rs`.
 
 ## Files and submodules
-- `mod.rs`: `HotkeysPane` (`new`, `draw`, `cancel_capture`), the `Intent` application, error
+- `mod.rs`: `HotkeysPane` (`new`, `draw`, `cancel_capture`, `flush_blocking`), the `Intent` application, error
   lines and the user-facing texts of `BindingError` / `CaptureError` / write failures.
 - `model.rs`: `Group` / `layout_rows` (session, view, canvas, shared tool contexts, one block per
   tab with its sub-contexts and windows), `offered_modes` / `template_modes` /
@@ -44,7 +44,9 @@ Pure rules (grouping, ordering, modifier chips, templates, conflict-row mapping,
 ## Contracts and invariants
 - No file I/O on the GUI thread: every change goes through `OverrideWriter::submit`. The worker
   is single so two writes of one id never land out of order; its spawn result is logged and a
-  failure is shown in the pane.
+  failure is shown in the pane. Durability at teardown comes only from
+  `HotkeysPane::flush_blocking` (closes the queue, joins the worker), called by the Settings tab's
+  `StudioTab::flush_debounced_stores_blocking` on the studio teardown worker.
 - Unlimited alternatives in the UI; the model's corruption guard (`MAX_ALTERNATIVES`) surfaces as
   an error line, never as a hidden cap.
 - Capture (plan P6): mouse buttons are recorded only inside the zone rect handed to

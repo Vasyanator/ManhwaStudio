@@ -11,6 +11,7 @@ Key items:
 - `typing_hint_rows`: the curated bottom-hint rows, set by `TypingTabState::draw` every frame.
 - `TypingTabState::load_exit_settings`: seeds the exit-only flags from the startup `user_config`.
 - `impl StudioTab for TypingTabState`:
+  - `input_contexts`: the canvas's contexts, plus the brush context while the mask panel is open;
   - `default_dock_layout`: `typing_default_dock_layout` (the tab hosts the panel dock);
   - `evict_tab_gpu_caches`: the canvas clean-overlay cache, then the tab's own mask and overlay
     textures (`evict_gpu_caches`);
@@ -25,8 +26,8 @@ Notes:
   = expanded (`false`), absent `centering_assist_enabled` = off (`false`), absent
   `centering_show_center` = shown (`true`). The bound-center KIND is session-only and has no key.
   They are written only at teardown, never per toggle.
-- No hotkeys (the tab reads its keys itself while drawing), no background poll, no
-  committed-tree view: those hooks keep their no-op defaults.
+- No declared actions yet (the tab reads its own keys while drawing, input-unification WP8), no
+  background poll, no committed-tree view: those hooks keep their no-op defaults.
 */
 
 use std::collections::HashSet;
@@ -104,6 +105,18 @@ impl TypingTabState {
 }
 
 impl StudioTab for TypingTabState {
+    /// The canvas's contexts (`CanvasView::input_contexts`: `canvas.zoom_accepted` while no
+    /// selected layer blocks canvas zoom, so Ctrl+wheel keeps rotating a selected layer), plus
+    /// `ms_tools::mask_brush::BRUSH_ACTIVE` while the mask panel is open (its brush takes the
+    /// shared brush actions).
+    fn input_contexts(&self) -> Vec<ms_input::ContextId> {
+        let mut contexts = self.canvas.input_contexts();
+        if self.mask_layer.is_panel_open() {
+            contexts.push(ms_tools::mask_brush::BRUSH_ACTIVE);
+        }
+        contexts
+    }
+
     /// The typing tab hosts the panel dock; its default arrangement is the SAME `fn` item the tab
     /// hands to `ensure_default_layout` every frame.
     fn default_dock_layout(&self) -> Option<fn() -> DockLayout> {

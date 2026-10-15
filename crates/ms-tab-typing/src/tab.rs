@@ -118,6 +118,7 @@ use super::render_next::types::{
 use ms_models::page_view::{PageImageInfo, PageTexture};
 use ms_log::trace::cat;
 use ms_canvas as canvas;
+use ms_input::{InputFrame, InputRegistry};
 use ms_canvas::{
     BubbleClass, CANVAS_RIBBON_TAB, CanvasBottomHint, CanvasDrawParams, CanvasHooks,
     CanvasUiStatus, CanvasView, RectCoords, SourceTextureUploadBudget,
@@ -562,6 +563,11 @@ pub struct TypingDrawParams<'a> {
     /// state: sub-window indices and the persisted `sub_windows` list are global, and
     /// the layouts of every program tab live in one map keyed by `AppTab::key()`.
     pub panel_dock: &'a mut PanelDockState,
+    /// This frame's input (`InputRouter::begin_frame`, run by the studio before any tab draws):
+    /// handed to the canvas (the shared `view.*` set, its gestures) and to the mask brush.
+    pub input: &'a InputFrame,
+    /// The studio's input registry (binding labels of the canvas' own chips).
+    pub input_registry: &'a InputRegistry,
 }
 
 pub struct TypingTabState {
@@ -1079,7 +1085,14 @@ impl TypingTabState {
             texture_cache,
             status,
             panel_dock,
+            input,
+            input_registry,
         } = params;
+        // The shared brush actions (Shift+wheel, - / =) resize the mask brush while its panel is
+        // open; `studio_tab` publishes `BRUSH_ACTIVE` exactly then.
+        if self.mask_layer.is_panel_open() && self.mask_layer.apply_brush_input(input) {
+            ctx.request_repaint();
+        }
         // The tab owns its bottom-hint rows; rebuilt every frame so a language switch re-localizes them.
         self.set_bottom_hint(Some(CanvasBottomHint { rows: studio_tab::typing_hint_rows() }));
         // A running single-image flatten-to-file blocks a project export exactly like a busy save
@@ -1157,7 +1170,9 @@ impl TypingTabState {
         );
         canvas.set_zoom_blocked(
             !mask_layer.is_panel_open()
-                && (text_overlays.has_selected_overlay() || layout_editor_active),
+                && (text_overlays.has_selected_overlay()
+                    || text_overlays.has_selected_raster()
+                    || layout_editor_active),
         );
         // A finger long-press drag creates a text box exactly where the Shift+drag create
         // overlay can run this frame (the overlay hook below skips it under the same two
@@ -1190,6 +1205,8 @@ impl TypingTabState {
             // tab runs the dock. The borrow is disjoint from `hooks` (which holds other fields
             // of `self`) and from `canvas`, so all three can be live at once.
             panel_dock,
+            input,
+            input_registry,
         });
         if Self::should_clear_overlay_selection_from_canvas_click(
             ctx,

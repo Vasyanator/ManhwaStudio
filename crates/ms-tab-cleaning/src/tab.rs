@@ -51,7 +51,6 @@ FILE HEADER (tabs/cleaning/tab.rs)
   - `handle_history_hotkeys`: Ctrl+Z / Ctrl+Shift+Z для committed overlay-дельт из shared history.
   - `handle_active_tool_input/hotkeys/wheel`: маршрутизация ввода в активный инструмент.
   - `canvas_pointer_occluded`: общий гейт ввода, когда pointer занят floating UI/popup/dialog поверх canvas.
-  - `zoom_by_shortcut/reset_zoom_shortcut`: прокси zoom-hotkeys CanvasView с учётом блокировок от инструмента.
   - `canvas` / `canvas_mut`: the tab's `CanvasView`, through which `StudioApp` syncs the shared
     viewport and page (`src/studio/view_sync.rs`) and reads the page window / pixel inspection.
 - Важно: если активный инструмент возвращает `block_canvas_zoom() = true` (например, открыт region editor),
@@ -83,7 +82,7 @@ use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::TextMaskModel;
 use ms_project::ProjectData;
 use ms_config::app_tab::AppTab;
-use ms_input::InputFrame;
+use ms_input::{InputFrame, InputRegistry};
 use ms_local_ai::backend_health::AiBackendHealthSnapshot;
 use ms_widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
@@ -769,9 +768,11 @@ pub struct CleaningDrawParams<'a> {
     /// (`src/widgets/panel_dock/MODULE_README.md`); the lent-in borrow is also
     /// what keeps it disjoint from the fields the tab bodies touch.
     pub panel_dock: &'a mut PanelDockState,
-    /// This frame's input (`InputRouter::begin_frame`, run by the studio before any tab draws):
-    /// the shared view zoom commands that fired (`studio_tab::run_fired_commands`).
+    /// This frame's input (`InputRouter::begin_frame`, run by the studio before any tab draws),
+    /// handed to the canvas (the shared `view.*` set, its gestures).
     pub input: &'a InputFrame,
+    /// The studio's input registry (binding labels of the canvas' own chips).
+    pub input_registry: &'a InputRegistry,
 }
 
 pub struct CleaningTabState {
@@ -962,33 +963,6 @@ impl CleaningTabState {
         self.canvas.evict_clean_overlay_gpu_cache(request)
     }
 
-    /// Whether the active tool blocks canvas zoom (it zooms its own view, e.g. the region editor
-    /// window, or a stroke needs a fixed camera).
-    #[must_use]
-    pub fn active_tool_blocks_canvas_zoom(&self) -> bool {
-        self.tools
-            .get(self.active_tool_idx)
-            .is_some_and(|tool| tool.block_canvas_zoom())
-    }
-
-    /// Zooms the canvas by `factor` around its centre unless the active tool blocks canvas zoom.
-    /// Returns whether the camera moved.
-    pub fn zoom_by_shortcut(&mut self, factor: f32) -> bool {
-        if self.active_tool_blocks_canvas_zoom() {
-            return false;
-        }
-        self.canvas.zoom_by_shortcut(factor)
-    }
-
-    /// Resets the canvas zoom unless the active tool blocks canvas zoom. Returns whether the
-    /// camera moved.
-    pub fn reset_zoom_shortcut(&mut self) -> bool {
-        if self.active_tool_blocks_canvas_zoom() {
-            return false;
-        }
-        self.canvas.reset_zoom_shortcut()
-    }
-
     /// Draws one frame of the «Клининг» tab into `params.ui`.
     ///
     /// The panel-dock state is LENT by the application for the frame (see
@@ -1003,8 +977,8 @@ impl CleaningTabState {
             status,
             panel_dock,
             input,
+            input_registry,
         } = params;
-        crate::studio_tab::run_fired_commands(self, input);
         if ctx.input(|i| i.pointer.primary_released()) {
             self.finish_stroke();
         }
@@ -1119,6 +1093,8 @@ impl CleaningTabState {
             source_upload_budget: &mut source_upload_budget,
             hooks: &mut hooks,
             panel_dock,
+            input,
+            input_registry,
         });
         // Taken while `hooks` is still alive and BEFORE the `&mut self` calls below, which would
         // otherwise conflict with the field borrows `hooks` holds.

@@ -224,7 +224,7 @@ use ms_canvas::{
     BubbleAction, BubbleClass, CANVAS_RIBBON_TAB, CanvasHooks, CanvasScrollbarContext,
     CanvasUiStatus, CanvasView, TouchDrivenDrag, TranslationStatusDisplay, drive_touch_drag,
 };
-use ms_input::{ActionId, ActionMeta, ActionSpec, Binding, Button, Chord, CommandSpec, ModeEffect, ModeSpec, ModifierKey, ReleasePolicy, Scope};
+use ms_input::{ActionId, ActionMeta, ActionSpec, Binding, Button, Chord, CommandSpec, InputFrame, ModeEffect, ModeSpec, ModifierKey, ReleasePolicy, Scope};
 use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
     CacheResourceKind, select_eviction_candidates,
@@ -1306,6 +1306,26 @@ impl TranslationTabState {
 
     pub fn blocks_canvas_zoom(&self) -> bool {
         self.advanced_recognition.is_open()
+    }
+
+    /// Whether a brush of this tab is on — the detector mask edit or the advanced-recognition
+    /// brush — so the host publishes `ms_tools::mask_brush::BRUSH_ACTIVE` and the shared brush
+    /// actions (`brush.size` / `smaller` / `larger`) reach [`Self::apply_brush_input`].
+    #[must_use]
+    pub fn brush_input_active(&self) -> bool {
+        self.text_detector_edit_mask_mode || self.advanced_recognition.brush_input_active()
+    }
+
+    /// Applies this frame's shared brush actions to the brushes that are on (the detector mask
+    /// brush in mask edit, the advanced-recognition brush). Called once per frame by the host
+    /// before drawing. Returns whether a radius changed.
+    pub fn apply_brush_input(&mut self, input: &InputFrame) -> bool {
+        let mut changed = false;
+        if self.text_detector_edit_mask_mode {
+            changed |= self.text_detector_mask_brush.apply_input(input);
+        }
+        changed |= self.advanced_recognition.apply_brush_input(input);
+        changed
     }
 
     /// Force an immediate refresh of the character names cache on the next frame,
@@ -3016,61 +3036,6 @@ impl TranslationTabState {
         Some(([source_w, source_h], [source_w, source_h]))
     }
 
-    fn text_detector_handle_mask_brush_wheel(&mut self, ui: &mut egui::Ui, hovered: bool) -> bool {
-        if !hovered {
-            return false;
-        }
-        let (mods, smooth_scroll, primary_down) = ui.ctx().input(|input| {
-            (
-                input.modifiers,
-                input.smooth_scroll_delta,
-                input.pointer.primary_down(),
-            )
-        });
-        if primary_down {
-            return false;
-        }
-        // Shift+wheel is delivered on the vertical axis by most backends, but some
-        // convert it to horizontal scroll, so fall back to the X component.
-        let mut wheel_delta = smooth_scroll.y;
-        if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = smooth_scroll.x;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
-            return false;
-        }
-        let changed = self
-            .text_detector_mask_brush
-            .handle_wheel(wheel_delta, mods);
-        if !mods.shift {
-            return false;
-        }
-        ui.ctx().input_mut(|input| {
-            input.smooth_scroll_delta = egui::Vec2::ZERO;
-        });
-        if changed {
-            ui.ctx().request_repaint();
-        }
-        changed
-    }
-
-    fn text_detector_handle_mask_brush_hotkeys(
-        &mut self,
-        ui: &mut egui::Ui,
-        hovered: bool,
-    ) -> bool {
-        if !hovered || ui.ctx().egui_wants_keyboard_input() {
-            return false;
-        }
-        let changed = self
-            .text_detector_mask_brush
-            .handle_size_shortcuts(ui.ctx());
-        if changed {
-            ui.ctx().request_repaint();
-        }
-        changed
-    }
-
     // All parameters are distinct pixel-buffer or layout properties; grouping would obscure rendering intent.
     #[allow(clippy::too_many_arguments)]
     fn paint_text_mask_segment(
@@ -3891,8 +3856,6 @@ impl TranslationTabState {
             self.text_detector_mask_stroke_state = None;
         }
 
-        let _ = self.text_detector_handle_mask_brush_wheel(ui, hovered);
-        let _ = self.text_detector_handle_mask_brush_hotkeys(ui, hovered);
 
         if let (Some(erase), Some(pos)) = (mode, pointer_pos)
             && page_rect.contains(pos)
