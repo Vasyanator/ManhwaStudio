@@ -20,9 +20,10 @@ CloudEditEngine (engine.rs)
                    (pinned above the scrolled parameters by the host)
   constraints()    selection.offer() -> constraints::frame_constraints(rule)  (host re-reads per frame)
   marks_support()  offer.accepts_references() ? reference (preferred) + layer + overlay : overlay only
-  run_block_reason decisions::run_block_reason(RunGate snapshot)
+  run_block_reason decisions::run_block_reason(RunGate snapshot; a cancelled run still ending blocks)
   start            geometry::upscale_factor_for -> k; worker::spawn_run(RunJob, CancelFlag)
-  poll             settings load -> key slot + ImageEditKeyRunner::pump -> settings save -> run events
+  cancel           raise the flag, keep the run as `detached` until its worker ends
+  poll             settings load -> key slot + ImageEditKeyRunner::pump -> settings save -> detached drain -> run events
 worker.rs          read_key -> RgbaRegion (+ marks_reference) -> run_image_edit(&req, key, cancel, on_stage) -> ColorImage
 ```
 
@@ -67,7 +68,10 @@ worker.rs          read_key -> RgbaRegion (+ marks_reference) -> run_image_edit(
   the provider's cancel request); an HTTP call already in flight completes and may be billed —
   the panel says so while a run is in flight. The flag is raised by `cancel`, by dropping the
   engine (`Drop`: the tab torn down without `deactivate`), and by the worker itself when its
-  event channel is closed.
+  event channel is closed. **At most one detached run per engine:** `cancel` keeps the cancelled
+  run (`detached`) and `poll` drains it until its worker ends (its answer dropped and logged);
+  meanwhile the gate refuses a new run with `cancelled_run_closing_status` (second reason, after
+  "run in flight"), so cancel-and-restart never stacks workers blocked in HTTP calls.
 - **Settings.** A user edit outranks a load that lands later; nothing is written before the load
   landed (`settings_save_due`); unknown provider keys are skipped, never remapped; a test process
   never writes the file: `save_api_edit_settings` refuses under `cfg!(test)` OR once the sticky

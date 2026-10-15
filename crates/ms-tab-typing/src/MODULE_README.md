@@ -362,7 +362,17 @@ The main data flow is:
    `build_page_job` (residency, raster + overlay snapshots carrying `uid`/`group_uid`/`visible`, the
    page's bands and groups), which `request_export` calls for every page. Export is GATED on full residency
    (Phase 2): the trigger defers dispatch behind the whole-project preload (see the preload contract
-   below) so EVERY page's text is materialized before snapshotting. ORDERING: `build_page_job`
+   below) so EVERY page's text is materialized before snapshotting. It is equally GATED on every page's
+   projection being current with the shared `LayerDoc` (`export_dispatch_ready`'s `docs_synced` term):
+   `build_page_job` never re-reads a RESIDENT page, so the trigger and `run_pending_export_if_ready`
+   call `drive_doc_sync_for_export` (the flatten's off-draw sync, over all pages: polls the jobs that
+   make `maybe_reproject_from_doc_version` back off, re-projects each page a PS-tab edit left stale)
+   and defer the export while any page still lags. That term is evaluated LAST, only once the cheap
+   terms hold (during the preload every applied page bumps the doc's global version, so evaluating it
+   earlier would re-project every resident page on every frame). It restores nothing: the selection
+   effects of `sync_from_doc` (uid remap of the tracked raster indices) are the correct ones, and
+   since the export dispatches only with every projection current, `build_page_job`'s own selection
+   restore never spans a re-projection of a resident page. ORDERING: `build_page_job`
    builds the page's text/image overlay snapshot (`export_overlay_snapshots_for_page`) AFTER that page's
    residency pass (`ensure_raster_layers_for_page` -> `sync_from_doc`), not before — building it earlier silently
    dropped the text of migrated/v3 pages the user never visited (their overlays materialize into
@@ -1341,10 +1351,11 @@ registry to `draw`. Everything is declared in `tab/input.rs` (ids are persistenc
   `Ready`; it starts and drives the overlay loader, the eager migration, ONE whole-chapter layer-preload
   pass and the clip-mask loader itself, because `TypingTabState::draw` drives them only while the typing
   tab is drawn. `request_flatten_to_file` refuses with `NoSuchPage`, or with `Busy` unless the gate holds:
-  the export gate `export_dispatch_ready` (pass drained, masks loaded, no save) AND chapter load settled
-  AND the page resident (or the preparation's pass drained — the export's give-up semantics) AND no
-  flatten / no running or deferred project export AND the projection current with the shared
-  `LayerDoc` FOR THAT PAGE (`doc_synced` = `page_projection_current(page_idx)`): a page already
+  the export gate `export_dispatch_ready` (pass drained, masks loaded, no save, and its doc-sync term
+  fed with the projection current with the shared `LayerDoc` FOR THAT PAGE: `doc_synced` =
+  `page_projection_current(page_idx)`) AND chapter load settled AND the page resident (or the
+  preparation's pass drained — the export's give-up semantics) AND no flatten / no running or deferred
+  project export. A page already
   resident is never re-read by `build_page_job`, so `prepare_flatten_to_file` re-projects a PS-tab doc
   edit itself (`drive_doc_sync_without_draw(ctx, page_idx)`: polls the save / create / effects / edit
   jobs that make `maybe_reproject_from_doc_version` back off, then re-projects the flattened page, which

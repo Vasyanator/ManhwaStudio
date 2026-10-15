@@ -444,14 +444,48 @@ impl TypingTextOverlayLayer {
     /// page was projected. Safe to run in the same frame as `draw` (every poll is a `try_recv`; a
     /// result is applied exactly once by whichever caller sees it first).
     pub(super) fn drive_doc_sync_without_draw(&mut self, ctx: &egui::Context, page_idx: usize) {
-        // The "did anything change" flags only drive `draw`'s repaint; the flatten preparation
-        // requests a repaint itself while it is not ready.
+        self.poll_doc_sync_blockers(ctx);
+        self.maybe_reproject_from_doc_version(page_idx);
+    }
+
+    /// The whole-project export's form of [`Self::drive_doc_sync_without_draw`]: polls the same
+    /// in-flight jobs once, then re-projects EVERY page of `project` whose projection lags the shared
+    /// `LayerDoc` (a page already resident is never re-read by `build_page_job`, so a PS-tab edit
+    /// made after its projection would otherwise be exported stale). Returns true when every page's
+    /// projection is current ([`Self::page_projection_current`]); false while an in-flight job still
+    /// holds a re-projection back — the caller then defers the export and calls this again on a later
+    /// frame (never blocks). Each lagging page costs one in-memory `sync_from_doc` on the GUI thread
+    /// (no I/O, but it clones the page's display images), so callers evaluate it LAST, only once the
+    /// cheap export gates hold (`export_dispatch_ready`): during the whole-chapter preload every
+    /// applied page bumps the doc's global version and would make every resident page re-project on
+    /// every frame.
+    ///
+    /// Nothing is restored afterwards, deliberately: this is the same per-page sync `draw` runs on a
+    /// page switch, and its selection effects are the correct ones — the tracked raster indices are
+    /// remapped to their uid's new position (restoring the old index would retarget the selection,
+    /// transform and drag to a different raster after a PS-tab reorder / delete), and a
+    /// `pending_select_raster_uid` resolves only on the page its just-created raster belongs to.
+    pub(super) fn drive_doc_sync_for_export(&mut self, ctx: &egui::Context, project: &ProjectData) -> bool {
+        self.poll_doc_sync_blockers(ctx);
+        let mut all_current = true;
+        for page in &project.pages {
+            self.maybe_reproject_from_doc_version(page.idx);
+            all_current &= self.page_projection_current(page.idx);
+        }
+        all_current
+    }
+
+    /// Polls every in-flight job that makes [`Self::maybe_reproject_from_doc_version`] back off
+    /// (placement save, create / effects / edit renders) — the same non-blocking `try_recv` polls
+    /// `draw` runs — for the off-draw sync drivers above.
+    fn poll_doc_sync_blockers(&mut self, ctx: &egui::Context) {
+        // The "did anything change" flags only drive `draw`'s repaint; every off-draw caller requests
+        // a repaint itself while it is not ready.
         self.poll_save_jobs(ctx);
         self.poll_create_overlay_jobs(ctx);
         self.poll_create_raster_jobs(ctx);
         self.poll_raster_effects_jobs(ctx);
         self.poll_edit_overlay_jobs(ctx);
-        self.maybe_reproject_from_doc_version(page_idx);
     }
 
     /// Page pixel size `[w, h]` for `page_idx`, resolved lazily from the cached page image path

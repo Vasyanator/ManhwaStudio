@@ -1006,6 +1006,12 @@ impl TypingTabState {
     /// - `!save_busy` — no project save is pending or running. Export and save share the preloader and
     ///   both mutate doc/staging state, so dispatching an export during a save would race the save's
     ///   text flush / staging merge. The save always completes, so the export is not starved.
+    /// - `docs_synced` — every page's projection is current with the shared `LayerDoc`; this call
+    ///   drives it itself (`drive_doc_sync_for_export`: re-projects each page a PS-tab edit left stale,
+    ///   off the per-frame current-page sync), so a resident page is never exported from a stale
+    ///   projection. Evaluated only once the three terms above hold (no per-frame re-projection
+    ///   during the preload). In-flight jobs that hold a re-projection back always finish (`draw`
+    ///   polls them every frame), so no hang.
     ///
     /// While any gate is unmet a repaint is requested so the frame loop advances instead of
     /// idle-stalling with an export pending. Once ready it consumes `pending_export_after_preload` via
@@ -1026,8 +1032,12 @@ impl TypingTabState {
         }
         let preload_active = self.text_overlays.preload_all_pages_active();
         let masks_ready = self.mask_layer.masks_loaded(project);
-        if !export_dispatch_ready(preload_active, masks_ready, save_busy) {
-            // Keep the frame loop alive so the preload/mask loader drain and any in-flight save clears.
+        // Last gate term, run only once the cheap ones hold: re-project every page a PS-tab edit left
+        // stale (S-029); dispatch only once all are current.
+        let text_overlays = &mut self.text_overlays;
+        if !export_dispatch_ready(preload_active, masks_ready, save_busy, || text_overlays.drive_doc_sync_for_export(ctx, project)) {
+            // Keep the frame loop alive so the preload/mask loader drain, any in-flight save clears and
+            // the jobs holding a re-projection back finish.
             ctx.request_repaint();
             return;
         }
@@ -1849,9 +1859,12 @@ impl CanvasHooks for TypingHooks<'_> {
             let masks_ready = self.mask_layer.masks_loaded(project);
             // Fast path ONLY when everything the composite reads is ready AND no save is busy: layers
             // resident, whole-chapter clip-mask store loaded, and no project save pending/in-flight
-            // (Finding 2 — export and save share the preloader and mutate doc/staging state). Otherwise
-            // the export is DEFERRED to `run_pending_export_if_ready`, which re-gates on all three.
-            if layers_ready && masks_ready && !self.save_busy {
+            // (Finding 2 — export and save share the preloader and mutate doc/staging state) AND every
+            // projection current with the shared document. That last term is evaluated only when the
+            // cheap ones hold: it re-projects each resident page a PS-tab edit left stale (S-029), and
+            // one still held back by an in-flight job defers the export. Otherwise the export is
+            // DEFERRED to `run_pending_export_if_ready`, which re-gates on all four.
+            if layers_ready && masks_ready && !self.save_busy && self.text_overlays.drive_doc_sync_for_export(ctx, project) {
                 let mask_snapshot = self.mask_layer.export_masks_snapshot();
                 self.text_overlays.request_export(ctx, project, mask_snapshot, export_request, self.top_panel.font_post_script_names());
             } else {
@@ -1865,8 +1878,9 @@ impl CanvasHooks for TypingHooks<'_> {
                     self.text_overlays.begin_preload_all_pages(project);
                 }
                 // Defer whenever a deferred gate CAN eventually become ready: layers already resident
-                // (only masks/save remain — both always clear), the layer preload started, or a save is
-                // busy (it always completes, then the deferred export dispatches). Otherwise (layers are
+                // (only masks/save remain — both always clear), the layer preload started, a save is
+                // busy (it always completes, then the deferred export dispatches); a projection lagging the
+                // document is only ever seen with layers resident, so it defers too. Otherwise (layers are
                 // the blocker, the preload could not start — no doc / no layers dir — AND no save is
                 // busy) fall back to a best-effort immediate export rather than hanging on a
                 // never-completing layer gate; its in-function residency pass materializes whatever it
@@ -2005,9 +2019,16 @@ struct BubbleCreateTextRequest {
 ///   silently drop clip masks; there is no per-page disk fallback at export time). Always completes.
 /// - `!save_busy`: no project save is pending/in-flight (Finding 2 — export and save share the
 ///   preloader and mutate doc/staging state, so they must not run concurrently). Always clears.
+/// - `docs_synced()`: the tab's projection of every composed page is current with the shared
+///   `LayerDoc` (`drive_doc_sync_for_export` for the project export, `page_projection_current` of the
+///   flattened page for the flatten): a resident page is never re-read by `build_page_job`, so a
+///   PS-tab edit made after its projection would be composed stale. Clears once the in-flight jobs
+///   that hold the re-projection back finish. Evaluated LAST and only when the three cheap terms
+///   hold (short-circuit): the export's form re-projects stale pages, which during the preload pass
+///   (every applied page bumps the doc version) would cost every resident page on every frame.
 #[must_use]
-fn export_dispatch_ready(preload_active: bool, masks_ready: bool, save_busy: bool) -> bool {
-    !preload_active && masks_ready && !save_busy
+fn export_dispatch_ready(preload_active: bool, masks_ready: bool, save_busy: bool, docs_synced: impl FnOnce() -> bool) -> bool {
+    !preload_active && masks_ready && !save_busy && docs_synced()
 }
 
 fn bubble_rect_coords(bubble: &Bubble) -> Option<RectCoords> {

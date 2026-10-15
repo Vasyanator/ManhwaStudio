@@ -25,6 +25,9 @@ use ms_ai_api::image_edit::{EndpointChoice, ImageEditError, ModelOffer};
 pub(super) struct RunGate<'a> {
     /// A run of this engine is in flight.
     pub run_in_flight: bool,
+    /// A cancelled run's worker has not ended yet (it may be blocked in an HTTP call); a new
+    /// run waits for it, so detached workers never stack.
+    pub cancelled_run_closing: bool,
     /// The settings file has been read (or its read failed): the selection is the user's.
     pub settings_loaded: bool,
     /// This is the web build, which has no HTTP executor.
@@ -45,7 +48,8 @@ pub(super) struct RunGate<'a> {
     pub constraints: FrameConstraints,
 }
 
-/// The first reason a run may not start, in the order: run in flight, settings still loading,
+/// The first reason a run may not start, in the order: run in flight, a cancelled run still
+/// ending, settings still loading,
 /// web build, no usable model, invalid endpoint, a key known to be missing, a blank prompt, a
 /// region the selected model cannot take at any allowed upscale. `None` when it may start.
 ///
@@ -55,6 +59,9 @@ pub(super) struct RunGate<'a> {
 pub(super) fn run_block_reason(gate: &RunGate<'_>) -> Option<String> {
     if gate.run_in_flight {
         return Some(t!("cleaning.mask_editor.processing_already_running_status").to_string());
+    }
+    if gate.cancelled_run_closing {
+        return Some(t!("cleaning.tools.ai_api_editor.cancelled_run_closing_status").to_string());
     }
     if !gate.settings_loaded {
         return Some(t!("cleaning.tools.ai_api_editor.settings_loading_status").to_string());
@@ -92,6 +99,7 @@ mod tests {
     fn open_gate() -> RunGate<'static> {
         RunGate {
             run_in_flight: false,
+            cancelled_run_closing: false,
             settings_loaded: true,
             web_build: false,
             offer: Ok(offer()),
@@ -121,6 +129,7 @@ mod tests {
 
         let every_reason = RunGate {
             run_in_flight: true,
+            cancelled_run_closing: true,
             settings_loaded: false,
             web_build: true,
             offer: Err(ImageEditError::UnknownModel { model_id: String::new() }),
@@ -133,6 +142,7 @@ mod tests {
         };
         let expected = [
             t!("cleaning.mask_editor.processing_already_running_status").to_string(),
+            t!("cleaning.tools.ai_api_editor.cancelled_run_closing_status").to_string(),
             t!("cleaning.tools.ai_api_editor.settings_loading_status").to_string(),
             ImageEditError::WebUnavailable.to_string(),
             ImageEditError::UnknownModel { model_id: String::new() }.to_string(),
@@ -146,13 +156,14 @@ mod tests {
             assert_eq!(run_block_reason(&gate).as_deref(), Some(sentence.as_str()), "step {step}");
             match step {
                 0 => gate.run_in_flight = false,
-                1 => gate.settings_loaded = true,
-                2 => gate.web_build = false,
-                3 => gate.offer = Ok(offer()),
-                4 => gate.endpoint = Ok(EndpointChoice::Default),
-                5 => gate.key_configured = Some(true),
-                6 => gate.prompt = "remove the text",
-                _ => unreachable!("only seven reasons precede the size check"),
+                1 => gate.cancelled_run_closing = false,
+                2 => gate.settings_loaded = true,
+                3 => gate.web_build = false,
+                4 => gate.offer = Ok(offer()),
+                5 => gate.endpoint = Ok(EndpointChoice::Default),
+                6 => gate.key_configured = Some(true),
+                7 => gate.prompt = "remove the text",
+                _ => unreachable!("only eight reasons precede the size check"),
             }
         }
         // Last: a 1×1 region no allowed upscale makes legal for the OpenAI rule.

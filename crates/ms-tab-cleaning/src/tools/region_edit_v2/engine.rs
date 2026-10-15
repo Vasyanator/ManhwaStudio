@@ -364,6 +364,10 @@ pub trait AiEngine: Send {
     fn poll(&mut self, ctx: &egui::Context) -> EnginePoll;
 
     /// Abandons the run in flight, if any. A no-op when nothing is running.
+    ///
+    /// The host treats the run as gone at once. An engine whose worker cannot be interrupted
+    /// mid-call may keep the abandoned worker until it ends (draining it in `poll`, never
+    /// reporting its answer) and refuse a new start meanwhile through `run_block_reason`.
     fn cancel(&mut self);
 
     /// Tells the engine whether the AI backend process is reachable.

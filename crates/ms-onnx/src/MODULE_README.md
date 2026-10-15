@@ -39,12 +39,10 @@ global session manager), `ms-onnx-runtime` (library resolver), `ms-tab-translati
 ## Contracts and invariants
 - Pure inference: no egui, no application config, no paths, no downloads. The caller supplies
   the dylib path, provider, and model / dictionary paths.
-- Built in the wasm32 graph (through `ms-settings-ui`, which depends on it unconditionally),
-  but the `ort` calls fail to compile there (STATE S-003: `ort::init_from`, `Session::run`,
-  `commit_from_file`), so the crate cannot run on wasm. New code stays pure Rust without
-  threads, so its only wasm errors are `ort` calls of that same S-003 class (the Baberu engine
-  adds three `Session::run` errors in `baberu_ocr/mod.rs`). Shared detection rules that must also build on
-  wasm belong in `ms-text-detect`.
+- Native-only: `ort` compiles its runtime surface (`ort::init_from`, `Session::run`,
+  `commit_from_file`) out on wasm32, so every dependent declares `ms-onnx` in its
+  `cfg(not(target_arch = "wasm32"))` target table and the crate is never built for wasm.
+  Shared detection rules that must also build on wasm belong in `ms-text-detect`.
 - No panics on bad input: shape and preprocessing failures return typed `OrtError` variants.
 - Execution-provider ids (`ExecutionProvider::id`) are persisted by higher layers and must stay
   stable.

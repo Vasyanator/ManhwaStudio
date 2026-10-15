@@ -1436,6 +1436,9 @@ impl TypingTextOverlayLayer {
     /// projecting a page may resolve `pending_select_raster_uid` and move the selection, so the
     /// selection is restored before returning. GUI thread, but no I/O beyond what the residency pass
     /// itself does. `output_path` is the page's own output file on a one-to-one route, else `None`.
+    /// An already-resident page is NOT re-projected here: callers dispatch only once its projection is
+    /// current with the shared `LayerDoc` (`drive_doc_sync_for_export` for the project export,
+    /// `page_projection_current` for the flatten), or the job would compose a stale PS-tab edit.
     pub(super) fn build_page_job(
         &mut self,
         project: &ProjectData,

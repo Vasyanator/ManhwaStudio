@@ -14,7 +14,7 @@ translated (bubbles, OCR, machine translation), cleaned (clean layers, inpaintin
 - **Rust application** — a Cargo workspace: the root package `manhwastudio_rs` (`src/`: a
   library holding the application, plus a thin binary entry) over 42 `ms-*` library crates in
   `crates/`. Builds for Linux and Windows (mandatory), macOS, `wasm32` (web entry,
-  `src/web_entry.rs`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
+  `src/web_entry.rs`; currently inactive and not kept building, `PROJECT_RULES.md`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
   exists so that build can export `android_main`).
 - **Python AI backend** — an optional separate process (`ai_backend.py` + `modules/ai_backend/`)
   for torch-based models. The app also has an in-process native ONNX runtime, so most basic AI

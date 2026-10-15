@@ -59,8 +59,6 @@ ms-platform = { path = "../ms-platform" }
 # Dev/Prod switch and the startup reconciliation run on a worker. A domain crate, not a
 # tab: it never depends back on this one.
 ms-project = { path = "../ms-project" }
-# `ExecutionProvider` — the ONNX provider tokens the AI pane offers.
-ms-onnx = { path = "../ms-onnx" }
 # The panes are egui widgets; `eframe::egui` is re-exported through eframe in some files,
 # so both are named. Same feature set the binary selects, so no second backend is built.
 egui.workspace = true
@@ -80,6 +78,10 @@ uuid.workspace = true
 # internally (there is no ONNX Runtime dylib, no OS monitor list and no subprocess AI
 # backend on the web), so these crates are only linked on native.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# `ExecutionProvider` / `NativeDeviceSelection` — the ONNX provider tokens the AI pane offers.
+# Native-only like every other ONNX crate: `ort` compiles its runtime surface out on wasm, so
+# `ms-onnx` must stay out of the wasm graph (every use site here is native-gated).
+ms-onnx = { path = "../ms-onnx" }
 # The ORT dylib resolver behind the AI pane's runtime/build selectors.
 ms-onnx-runtime = { path = "../ms-onnx-runtime" }
 # The native OCR runtime whose loaded-engine state the AI pane reports.

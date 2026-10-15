@@ -16,8 +16,10 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   launchers parse it); never copy the number elsewhere.
 - Mandatory targets for every change: `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-gnu`.
   The windows-gnu check needs `x86_64-w64-mingw32-gcc` (bundled SQLite in `ms-docstore`).
-- The code must also stay buildable for `wasm32-unknown-unknown` (`cargo +nightly wcheck`, see
-  `dev-docs/WEB_PORT.md`).
+- The web build (`wasm32-unknown-unknown`, `cargo +nightly wcheck`, `dev-docs/WEB_PORT.md`) is
+  INACTIVE: it is not a check target and a change need not keep it building (the user's decision;
+  the open blocker is `STATE.md` S-004). Keep existing wasm gating and `ms_thread` use intact; do
+  not delete web code.
 - macOS (`x86_64-apple-darwin`) is supported but NOT a mandatory check target: `cargo check-mac`
   / `cargo bmac` (zigbuild), `run-dev.MacOS.command`, `build-macos.sh`.
 - For Windows-target builds (including `cargo check-all`) set `MS_DISABLE_BUILD_CODESIGN=1`, or

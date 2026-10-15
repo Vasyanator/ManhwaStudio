@@ -109,7 +109,9 @@ only behind `keys.rs` / `key_state.rs`.
   capped at 3 s)`. Caps: API body 128 MiB, downloaded image 64 MiB (`DownloadTooLarge`).
   Cancel is checked between steps and every 100 ms of a wait; on a cancel AND on the run
   deadline the adapter's cancel request is sent best effort (a submit answer that arrived after
-  the cancel is still parsed for its job). A failing body reaches `runtime_log` only as the
+  the cancel is still parsed for its job). Once the cancel flag is set, ANY error that ends
+  the run (a poll out of retries, a non-transient transport error) resolves to `Cancelled` and
+  takes that same cancel-request path; a request already in flight is not aborted. A failing body reaches `runtime_log` only as the
   provider's error message (`failing_body_summary`: bodies may echo the prompt); the 2 KB
   digest, base64 runs elided, goes to the trace log.
 - **Logging**: never a key; the prompt only by length in `runtime_log`, its text only in the

@@ -750,6 +750,7 @@
   "cleaning.tools.ai_api_editor.blend_heading": "Blending into the page",
   "cleaning.tools.ai_api_editor.blend_hint": "The mask is widened, then softened, before the result is blended in; pixels farther away stay untouched.",
   "cleaning.tools.ai_api_editor.cancel_billing_hint": "A cancelled request may still be billed.",
+  "cleaning.tools.ai_api_editor.cancelled_run_closing_status": "The previous cancelled request is still finishing on the provider side (this can take up to a few minutes). Processing will be available again once it ends.",
   "cleaning.tools.ai_api_editor.dilate_label": "Widen mask, px",
   "cleaning.tools.ai_api_editor.engine_title": "Cloud models",
   "cleaning.tools.ai_api_editor.feather_label": "Soften edge, px",

@@ -3398,27 +3398,40 @@ fn export_overlay_snapshot_is_empty_before_residency_and_populated_after() {
 fn export_dispatch_gate_pass_completion_masks_and_mutual_exclusion() {
     // The pure export dispatch gate (`export_dispatch_ready`) is the testable core of
     // `run_pending_export_if_ready`. It gates on preload-pass COMPLETION (not residency), the mask
-    // loader, and mutual exclusion with save.
+    // loader, mutual exclusion with save, and projections current with the shared `LayerDoc`.
 
     // FINDING 1: once the preload pass has drained, the export dispatches even though a page that
     // failed to decode is still NOT resident — no residency term appears in the gate, so it cannot
     // hang on the give-up path. Masks ready, no save busy.
     assert!(
-        export_dispatch_ready(false, true, false),
+        export_dispatch_ready(false, true, false, || true),
         "pass drained + masks ready + no save → dispatch (no residency requirement → no hang)"
     );
 
     // Still waiting while the preload pass is applying pages.
-    assert!(!export_dispatch_ready(true, true, false));
+    assert!(!export_dispatch_ready(true, true, false, || true));
 
     // Masks not yet loaded → keep waiting (an empty mask snapshot would drop clip masks).
-    assert!(!export_dispatch_ready(false, false, false));
+    assert!(!export_dispatch_ready(false, false, false, || true));
 
     // FINDING 2: a project save is pending/in-flight → export must NOT dispatch, even when the
     // preload pass has drained and masks are ready (they share the preloader / doc / staging state).
-    assert!(!export_dispatch_ready(false, true, true));
+    assert!(!export_dispatch_ready(false, true, true, || true));
+    // S-029: a page's projection lags the shared `LayerDoc` (a PS-tab edit not yet re-projected) →
+    // keep waiting even when everything else is ready, or the export composes the stale projection.
+    assert!(!export_dispatch_ready(false, true, false, || false));
     // Every gate unmet at once stays blocked.
-    assert!(!export_dispatch_ready(true, false, true));
+    assert!(!export_dispatch_ready(true, false, true, || false));
+    // The doc-sync term (the export's re-projection of stale pages) is evaluated only once every
+    // cheap term holds: never during the preload pass, without masks, or while a save is busy.
+    for (preload_active, masks_ready, save_busy) in [(true, true, false), (false, false, false), (false, true, true)] {
+        let mut evaluated = false;
+        assert!(!export_dispatch_ready(preload_active, masks_ready, save_busy, || {
+            evaluated = true;
+            true
+        }));
+        assert!(!evaluated, "doc sync evaluated for gate ({preload_active}, {masks_ready}, {save_busy})");
+    }
 }
 
 #[test]

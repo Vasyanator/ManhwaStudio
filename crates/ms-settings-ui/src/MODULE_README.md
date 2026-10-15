@@ -29,7 +29,7 @@ one draw entry the launcher calls with its own frame, one the settings tab calls
 theirs. Adding a pane means adding a `SettingsSectionId` variant and both entries.
 
 Layer position: above `ms-widgets` / `ms-config` / `ms-sysprobe` / `ms-backend-ipc` /
-`ms-memory` / `ms-onnx` / `ms-project` (the storage-mode driver) / `ms-os-integration`
+`ms-memory` / `ms-onnx` (native only) / `ms-project` (the storage-mode driver) / `ms-os-integration`
 (native only: the OS-record probe behind the registration warnings) and `ms-local-ai`
 (`backend_health`: the health snapshot and probe-command model; `local_ai`: the process's
 local-AI availability and effective runtime). It depends on NO tab crate, and the tabs never

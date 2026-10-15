@@ -19,7 +19,7 @@ Main responsibilities:
   load/save workers from `poll`.
 
 Key structures:
-- `CloudEditEngine`, `RunInFlight`
+- `CloudEditEngine`, `RunInFlight` (the run in flight, and the cancelled one still ending)
 
 Notes:
 Nothing here blocks the GUI thread: the settings IO, every credential-store operation and the
@@ -32,7 +32,9 @@ only the last. A run carrying separate marks for a model that takes none (the ho
 switch lags one frame behind a model switch) is refused with a localized message, never sent
 without them. The mask means "the model MAY change this"; an empty mask means the whole region.
 A cancelled run is detached and its HTTP call may still complete and be billed (the panel says
-so); dropping the engine cancels its run the same way (`Drop`). A failure is logged with the
+so); dropping the engine cancels its run the same way (`Drop`). The detached run is KEPT
+(`detached`) until its worker ends, and a new run is refused meanwhile, so cancel-and-restart
+can never stack blocked workers (at most one detached run per engine). A failure is logged with the
 run's own provider and model snapshot (`RunInFlight`), not the picker's current selection. Errors reach the user as the localized `ImageEditError` text and the log as one line with
 the provider, model and error — never the key, never the prompt.
 */
@@ -77,7 +79,7 @@ const BUSY_REPAINT: Duration = Duration::from_millis(100);
 /// engines, whose mask means the opposite. Opaque on purpose: `MaskStack` scales the alpha.
 const MASK_TINT: egui::Color32 = egui::Color32::from_rgb(80, 200, 255);
 
-/// The run in flight.
+/// A run of this engine: the one in flight, or a cancelled one whose worker has not ended yet.
 #[derive(Debug)]
 struct RunInFlight {
     /// The worker's events.
@@ -131,6 +133,10 @@ pub(super) struct CloudEditEngine {
     key_notice: Option<AiApiNotice>,
     /// The run in flight.
     run: Option<RunInFlight>,
+    /// The cancelled run whose worker has not ended yet (its flag is raised; an HTTP call it is
+    /// blocked in cannot be aborted). Drained by `poll`, its answer dropped; while it is set a
+    /// new run is refused, so a cancel-and-restart never stacks a second detached worker.
+    detached: Option<RunInFlight>,
     /// The last run's outcome.
     status: Option<StatusLine>,
     /// The frame's current rectangle, for the size line and the run gate.
@@ -156,6 +162,7 @@ impl CloudEditEngine {
             key_slot_stale: true,
             key_notice: None,
             run: None,
+            detached: None,
             status: None,
             region: None,
         };
@@ -254,6 +261,7 @@ impl CloudEditEngine {
     fn gate(&self) -> RunGate<'_> {
         RunGate {
             run_in_flight: self.run.is_some(),
+            cancelled_run_closing: self.detached.is_some(),
             settings_loaded: self.settings_loaded,
             web_build: cfg!(target_arch = "wasm32"),
             offer: self.selection.offer(),
@@ -263,6 +271,36 @@ impl CloudEditEngine {
             prompt: &self.prompt,
             region: self.region.map(|rect| (rect.w, rect.h)),
             constraints: self.constraints(),
+        }
+    }
+
+    /// Drains the cancelled run's events until its worker ends, then forgets it (which reopens
+    /// the run gate). Its answer is dropped and only logged: the user already cancelled it.
+    fn poll_detached(&mut self, ctx: &egui::Context) {
+        let Some(detached) = self.detached.as_ref() else {
+            return;
+        };
+        loop {
+            match detached.events.try_recv() {
+                Ok(WorkerEvent::Stage(_)) => {}
+                Ok(WorkerEvent::Finished(result)) => {
+                    let outcome = result.map_or_else(|error| format!("{error:?}"), |_| "an image".to_string());
+                    ms_log::runtime_log::log_info(format!("{LOG_TAG} cancelled cloud edit worker ended (provider={} model={}); its answer is dropped: {outcome}", detached.provider.key(), detached.model_id));
+                    self.detached = None;
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    ms_log::runtime_log::log_warn(format!("{LOG_TAG} cancelled cloud edit worker stopped without answering (provider={} model={})", detached.provider.key(), detached.model_id));
+                    self.detached = None;
+                    return;
+                }
+                // Still blocked (an HTTP call in flight): look again soon, so the gate reopens
+                // without the user having to move the pointer.
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(BUSY_REPAINT);
+                    return;
+                }
+            }
         }
     }
 
@@ -569,16 +607,22 @@ impl AiEngine for CloudEditEngine {
             ctx.request_repaint_after(BUSY_REPAINT);
         }
         self.poll_and_maybe_save();
+        self.poll_detached(ctx);
         self.poll_run(ctx)
     }
 
     /// Raises the run's cancel flag and detaches it: the pipeline stops between steps, and an
     /// HTTP call already in flight completes on its own (and may be billed) with its answer
-    /// dropped.
+    /// dropped. The detached run is kept in `detached` until its worker ends; a new run is
+    /// refused until then (`RunGate::cancelled_run_closing`).
     fn cancel(&mut self) {
         if let Some(run) = self.run.take() {
             run.cancel.cancel();
             ms_log::runtime_log::log_info(format!("{LOG_TAG} cloud edit cancelled by the user"));
+            // The gate refuses a start while `detached` is set, so no earlier detached run can
+            // be here; were one ever replaced, dropping its receiver only makes its worker's
+            // stage sink raise the (already raised) flag again.
+            self.detached = Some(run);
             self.status = Some(StatusLine { text: t!("cleaning.mask_editor.processing_cancelled_status").to_string(), error: false });
         }
     }
@@ -732,7 +776,51 @@ mod tests {
         engine.cancel();
         assert!(cancel.is_cancelled());
         assert!(engine.run.is_none());
+        assert!(engine.detached.is_some(), "the cancelled run is kept until its worker ends");
         assert!(engine.status.is_some());
+    }
+
+    /// Cancel -> a new start is refused while the cancelled worker is still blocked -> its
+    /// worker ends (answer dropped) -> the gate opens again. At most one detached run exists.
+    #[test]
+    fn a_new_run_waits_for_the_cancelled_worker_to_end() {
+        let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
+        let en = ms_i18n::LocaleTag::parse("en").expect("en tag is valid");
+        ms_i18n::set_locale(&en).expect("en catalog installs");
+        let ctx = egui::Context::default();
+        let closing = t!("cleaning.tools.ai_api_editor.cancelled_run_closing_status").to_string();
+        let mut engine = engine_for(ImageEditProvider::OpenAi, "gpt-image-2");
+        assert_eq!(engine.run_block_reason(), None, "the gate is open before any run");
+
+        // The worker ends with an answer.
+        let (tx, events) = mpsc::channel();
+        engine.run = Some(RunInFlight { events, cancel: CancelFlag::new(), stage: ImageEditStage::Sending, provider: ImageEditProvider::OpenAi, model_id: "gpt-image-2".to_string() });
+        engine.cancel();
+        assert_eq!(engine.run_block_reason().as_deref(), Some(closing.as_str()));
+        let rect = OverlayRectPx { x: 0, y: 0, w: 1024, h: 1024 };
+        let request = EngineRunRequest { page_idx: 0, rect_px: rect, region: egui::ColorImage::filled([1024, 1024], egui::Color32::WHITE), masks: vec![vec![0u8; 1024 * 1024]], marks: RunMarks::None };
+        assert_eq!(engine.start(request).err().as_deref(), Some(closing.as_str()), "start refuses while the cancelled worker runs");
+        assert!(engine.run.is_none(), "a refused start leaves no run behind");
+        engine.poll_detached(&ctx);
+        assert!(engine.detached.is_some(), "still blocked: nothing arrived yet");
+        tx.send(WorkerEvent::Stage(ImageEditStage::Waiting { polls: 1 })).expect("the receiver is alive");
+        tx.send(WorkerEvent::Finished(Err(ms_ai_api::image_edit::ImageEditError::Cancelled))).expect("the receiver is alive");
+        // `poll` itself is never called in tests (it would reach the credential store); it runs
+        // exactly these two steps for the runs.
+        engine.poll_detached(&ctx);
+        assert!(matches!(engine.poll_run(&ctx), EnginePoll::Idle), "the dropped answer never reaches the host");
+        assert!(engine.detached.is_none());
+        assert_eq!(engine.run_block_reason(), None, "the gate opens once the worker ended");
+
+        // The worker dies without answering.
+        let (tx, events) = mpsc::channel();
+        engine.run = Some(RunInFlight { events, cancel: CancelFlag::new(), stage: ImageEditStage::Sending, provider: ImageEditProvider::OpenAi, model_id: "gpt-image-2".to_string() });
+        engine.cancel();
+        assert_eq!(engine.run_block_reason().as_deref(), Some(closing.as_str()));
+        drop(tx);
+        engine.poll_detached(&ctx);
+        assert!(engine.detached.is_none());
+        assert_eq!(engine.run_block_reason(), None);
     }
 
     /// Dropping the engine mid-run (no `deactivate`) raises the flag the worker and the

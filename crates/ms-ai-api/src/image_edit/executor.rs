@@ -23,7 +23,9 @@ Native only (the module is not compiled on wasm, where `run_image_edit` is a stu
 worker thread; it sleeps between polls in short slices so a cancel is seen within ~100 ms.
 A request already in flight cannot be aborted: its answer is dropped after a cancel, but it
 is still parsed for the provider job it created, and a user cancel or the run deadline sends
-the adapter's cancel request for the latest job (best effort). Requests that carry a key never
+the adapter's cancel request for the latest job (best effort). Any error that ends a run after
+the user cancelled (a poll out of retries, an oversized body) counts as the cancel, so it never
+skips that request. Requests that carry a key never
 follow redirects (a custom key header would otherwise travel to the redirect target);
 unauthenticated downloads do. The key is never logged; `runtime_log` keeps only the provider's
 error message of a failing JSON body (bodies may echo the prompt), the 2 KB digest with base64
@@ -335,6 +337,9 @@ pub(crate) struct RunContext<'a> {
 /// `on_stage`. A cancel is honoured between steps and during waits; when the cancel or the run
 /// deadline ends a run that already has a provider job, the adapter's cancel request is sent
 /// best effort (a submit answer that arrived after the cancel is still parsed for its job).
+/// Any error the step loop ends with while the cancel flag is set resolves to `Cancelled` and
+/// takes the same cancel-request path; an image that arrived after a cancel is still returned
+/// (the job is finished, the caller drops it).
 ///
 /// # Errors
 /// The adapter's typed provider errors; `Cancelled`; `Timeout` (a request or the run deadline);
@@ -346,7 +351,14 @@ pub(crate) fn execute(transport: &dyn HttpTransport, limits: &ExecutorLimits, pr
     let submit = protocol.submit(run.call)?;
     let mut state = JobState { phase: StepPhase::Submit, polls: 0, job: None };
     match exec.drive(&submit, &mut state, on_stage) {
-        Err(ImageEditError::Cancelled) => {
+        // Once the user cancelled, the cancel wins over whatever error ended the step loop (a
+        // poll whose retries ran out, a non-transient transport error such as an oversized
+        // body): the run is reported `Cancelled` and the provider job is cancelled, instead of
+        // a late error passing through and leaving the job running (and billing).
+        Err(error) if matches!(error, ImageEditError::Cancelled) || run.cancel.is_cancelled() => {
+            if !matches!(error, ImageEditError::Cancelled) {
+                runtime_log::log_info(format!("{LOG_TAG} {} run cancelled; the late error is dropped: {error:?}", run.call.provider.key()));
+            }
             exec.cancel_job(&state, "run cancelled");
             Err(ImageEditError::Cancelled)
         }
@@ -745,6 +757,32 @@ pub(crate) mod tests {
         assert!(matches!(result, Err(ImageEditError::Cancelled)));
         let sent = transport.sent.borrow();
         assert_eq!(sent.iter().map(|sent| (sent.method, sent.url.as_str(), sent.stage)).collect::<Vec<_>>(), [(HttpMethod::Post, "https://queue.example.run/jobs", "submit"), (HttpMethod::Put, "https://queue.example.run/jobs/j1/cancel", "cancel")]);
+    }
+
+    #[test]
+    fn a_poll_out_of_retries_after_a_cancel_still_cancels_the_job() {
+        let call = async_call();
+        let cancel = CancelFlag::new();
+        let network = || Err(ImageEditError::Network { detail: "reset".to_string() });
+        // The cancel lands during the LAST poll attempt: no backoff wait follows to see it.
+        let mut transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), network(), network(), network(), network(), Ok(resp(200, b""))]);
+        transport.cancel_after = Some((5, cancel.clone()));
+        let (result, _) = run(&transport, &AsyncProtocol { cancel_url: Some("https://queue.example.run/jobs/j1/cancel".to_string()) }, &call, &cancel);
+        assert!(matches!(result, Err(ImageEditError::Cancelled)));
+        let sent = transport.sent.borrow();
+        assert_eq!(sent.iter().map(|sent| (sent.method, sent.stage)).collect::<Vec<_>>(), [(HttpMethod::Post, "submit"), (HttpMethod::Get, "poll"), (HttpMethod::Get, "poll"), (HttpMethod::Get, "poll"), (HttpMethod::Get, "poll"), (HttpMethod::Put, "cancel")]);
+    }
+
+    #[test]
+    fn a_non_transient_error_after_a_cancel_still_cancels_the_job() {
+        let call = async_call();
+        let cancel = CancelFlag::new();
+        let mut transport = FakeTransport::new(vec![Ok(resp(200, b"queued")), Err(ImageEditError::DownloadTooLarge { limit_bytes: 1 }), Ok(resp(200, b""))]);
+        transport.cancel_after = Some((2, cancel.clone()));
+        let (result, _) = run(&transport, &AsyncProtocol { cancel_url: Some("https://queue.example.run/jobs/j1/cancel".to_string()) }, &call, &cancel);
+        assert!(matches!(result, Err(ImageEditError::Cancelled)));
+        let sent = transport.sent.borrow();
+        assert_eq!(sent.iter().map(|sent| (sent.method, sent.url.as_str(), sent.stage)).collect::<Vec<_>>(), [(HttpMethod::Post, "https://queue.example.run/jobs", "submit"), (HttpMethod::Get, "https://queue.example.run/jobs/j1", "poll"), (HttpMethod::Put, "https://queue.example.run/jobs/j1/cancel", "cancel")]);
     }
 
     #[test]

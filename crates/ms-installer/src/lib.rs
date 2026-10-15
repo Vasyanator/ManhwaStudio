@@ -19,7 +19,9 @@ native.
 
 #![warn(clippy::all)]
 
-// `t!` / `tf!` for every user-visible string of the installer and update windows.
+// `t!` / `tf!` for every user-visible string of the installer and update windows. Gated like
+// every module that uses it: `ms-i18n` sits in the native-only target table of `Cargo.toml`.
+#[cfg(not(target_arch = "wasm32"))]
 #[macro_use]
 extern crate ms_i18n;
 

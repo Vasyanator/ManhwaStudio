@@ -752,6 +752,7 @@
   "cleaning.tools.ai_api_editor.blend_heading": "Вклейка в страницу",
   "cleaning.tools.ai_api_editor.blend_hint": "Перед вклейкой маска расширяется и размывается; пиксели дальше от неё остаются нетронутыми.",
   "cleaning.tools.ai_api_editor.cancel_billing_hint": "Отменённый запрос может быть всё равно оплачен.",
+  "cleaning.tools.ai_api_editor.cancelled_run_closing_status": "Предыдущий отменённый запрос ещё завершается у провайдера (это может занять до нескольких минут). Обработка снова станет доступна, когда он закончится.",
   "cleaning.tools.ai_api_editor.dilate_label": "Расширить маску, пкс",
   "cleaning.tools.ai_api_editor.engine_title": "Облачные модели",
   "cleaning.tools.ai_api_editor.feather_label": "Размыть край, пкс",

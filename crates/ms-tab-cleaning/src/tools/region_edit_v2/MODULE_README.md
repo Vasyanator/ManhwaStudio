@@ -398,6 +398,10 @@ Host contracts:
   `geometry_settled`; an engine may DISPLAY an unsettled rectangle but must not start work off it.
 - **The engine is polled every frame, panel visible or not** — `poll` is where an engine drains
   its channels and runs its settings saver. A test pins it.
+- **`AiEngine::cancel` ends the run for the host at once; the engine may outlive it.** An engine
+  whose worker cannot be interrupted mid-call keeps the abandoned worker until it ends (drained
+  in `poll`, its answer never reported) and refuses a new start meanwhile through
+  `run_block_reason`, so cancel-and-restart never stacks blocked workers (the cloud engine does).
 - **`pytorch_required()` follows the SELECTED engine**: the tab gates the tool button on it.
 - **Mask generation belongs to the host; what the mask MEANS belongs to the engine.** The block is
   drawn for every engine and says nothing about meaning; `../mask_generation.rs` owns the

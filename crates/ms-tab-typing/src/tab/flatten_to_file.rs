@@ -205,12 +205,13 @@ struct FlattenGate {
 }
 
 /// The flatten-to-file dispatch decision: the project export's gate (`export_dispatch_ready`: preload
-/// pass drained, masks loaded, no save) plus mutual exclusion with a running/deferred export and with
-/// another flatten, a settled chapter load, resident layer inputs (so building the job never falls
-/// back to a synchronous page load on the GUI thread) and a projection that is current with the
-/// shared document (so the job never composes a stale snapshot of a PS-tab edit).
+/// pass drained, masks loaded, no save, and — for the one flattened page — a projection current with
+/// the shared document, so the job never composes a stale snapshot of a PS-tab edit) plus mutual
+/// exclusion with a running/deferred export and with another flatten, a settled chapter load and
+/// resident layer inputs (so building the job never falls back to a synchronous page load on the GUI
+/// thread).
 fn flatten_dispatch_ready(gate: FlattenGate) -> bool {
-    !gate.flatten_running && !gate.export_busy && gate.chapter_settled && gate.layers_ready && gate.doc_synced && export_dispatch_ready(gate.preload_active, gate.masks_ready, gate.save_busy)
+    !gate.flatten_running && !gate.export_busy && gate.chapter_settled && gate.layers_ready && export_dispatch_ready(gate.preload_active, gate.masks_ready, gate.save_busy, || gate.doc_synced)
 }
 
 impl TypingTabState {
@@ -1098,5 +1099,156 @@ mod tests {
         assert!(state.text_overlays.page_projection_current(1), "showing page 1 re-projects it");
         let projected_red = state.text_overlays.raster_layers_by_page.get(&1).and_then(|layers| layers.first()).is_some_and(|layer| layer.image.pixels[0] == egui::Color32::from_rgb(255, 0, 0));
         assert!(projected_red);
+    }
+
+    /// Seeds a chapter whose pages `0..` each carry the given raster uids (blue 4x4, stacked in
+    /// order), into `project`'s source and staging directories.
+    fn seed_pages(project: &ProjectData, rasters_per_page: &[&[&str]]) {
+        std::fs::create_dir_all(&project.paths.src_dir).expect("create src dir");
+        let transform = ms_models::layer_model::manifest::TransformRec { cx: 8.0, cy: 8.0, rotation: 0.0, scale: 1.0 };
+        let blue = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 0, 255));
+        for (page, uids) in project.pages.iter().zip(rasters_per_page) {
+            image::RgbaImage::from_pixel(PAGE_PX, PAGE_PX, image::Rgba([40, 80, 120, 255])).save(&page.path).expect("write page");
+            for uid in *uids {
+                ms_models::layer_model::persist::add_page_raster(&project.paths.unsaved_layers_dir, None, page.idx, uid, "R", true, 1.0, transform, &blue).expect("seed raster");
+            }
+        }
+    }
+
+    /// A two-page chapter (page 0: raster `r0`; page 1: `page1_rasters`) with both pages resident in
+    /// typing's projection and the clip masks loaded (warmed up by a flatten), the canvas on page 0.
+    fn resident_two_page_chapter(dir: &Path, page1_rasters: &[&str]) -> (ProjectData, Arc<Mutex<ms_models::layer_model::layer_doc::LayerDoc>>, TypingTabState, egui::Context) {
+        let mut project = project_under(dir);
+        project.pages.push(ms_project::Page { idx: 1, path: project.paths.src_dir.join("002.png") });
+        seed_pages(&project, &[&["r0"], page1_rasters]);
+        let doc = Arc::new(Mutex::new(ms_models::layer_model::layer_doc::LayerDoc::new()));
+        let mut state = TypingTabState::default();
+        state.set_layer_doc(Arc::clone(&doc));
+        let ctx = egui::Context::default();
+        flatten_until_done(&mut state, &ctx, &project, 1, &dir.join("warmup.png")).expect("warm-up flatten");
+        assert!(state.text_overlays.raster_layers_by_page.contains_key(&0) && state.text_overlays.raster_layers_by_page.contains_key(&1));
+        assert!(state.mask_layer.masks_loaded(&project));
+        assert_eq!(state.canvas.current_page_idx(), 0);
+        (project, doc, state, ctx)
+    }
+
+    /// A one-to-one PNG project export into `out`.
+    fn png_export_request(out: &Path) -> TypingExportRequest {
+        TypingExportRequest {
+            destination: TypingExportDestination::Folder(ms_platform::file_dialog::FolderTarget::for_test(out.to_path_buf())),
+            format: TypingExportFormat::Png,
+            repaginate: crate::export_repaginate::TypingRepaginateSettings::default(),
+            output_base_name: "export".to_string(),
+        }
+    }
+
+    /// Polls a dispatched project export until its worker reported, and asserts it succeeded.
+    fn wait_for_export(state: &mut TypingTabState, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while state.export_in_progress() {
+            state.text_overlays.poll_export_jobs(ctx);
+            assert!(std::time::Instant::now() < deadline, "the export worker never reported");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(matches!(state.text_overlays.export_status_for_ui(), TypingExportUiStatus::Success { .. }), "the export succeeds");
+    }
+
+    /// The uid of page 1's projected raster at `idx`.
+    fn page1_raster_uid(state: &TypingTabState, idx: usize) -> Option<String> {
+        state.text_overlays.raster_layers_by_page.get(&1).and_then(|layers| layers.get(idx)).map(|layer| layer.uid.clone())
+    }
+
+    /// S-029: the PROJECT export of a page already resident in typing's projection whose
+    /// `LayerDoc` the PS editor edited afterwards (typing shows page 0 and never re-projected page 1).
+    /// `build_page_job` never re-reads a resident page, so the export must re-project it itself: while
+    /// an in-flight job holds the re-projection back the deferred export stays pending; once it clears
+    /// the export dispatches and the written page holds the document's current pixels.
+    #[test]
+    fn project_export_of_a_resident_page_uses_its_reprojection_after_a_doc_edit() {
+        let dir = TempDir::new("export_doc_edit");
+        let (project, doc, mut state, ctx) = resident_two_page_chapter(&dir.0, &["r1"]);
+        let green = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 255, 0));
+        doc.lock().expect("doc lock").set_raster_pixels(1, "r1", green.clone(), green, Vec::new(), true);
+        state.text_overlays.maybe_reproject_from_doc_version(0);
+        assert!(!state.text_overlays.page_projection_current(1), "page 1 lags the document");
+
+        let out = dir.0.join("export");
+        state.text_overlays.set_pending_export(png_export_request(&out));
+        // An in-flight placement save makes the re-projection back off: the export stays deferred.
+        let (save_tx, save_rx) = mpsc::channel();
+        state.text_overlays.save_rx = Some(save_rx);
+        state.run_pending_export_if_ready(&ctx, &project, false);
+        assert!(!state.export_in_progress(), "no dispatch while page 1's projection is stale");
+        assert!(state.text_overlays.has_pending_export());
+        assert!(!state.text_overlays.page_projection_current(1));
+
+        // The save lands; the next frame re-projects page 1 and dispatches.
+        save_tx.send(Ok(())).expect("save job receiver alive");
+        state.run_pending_export_if_ready(&ctx, &project, false);
+        assert!(state.export_in_progress(), "dispatched once every projection is current");
+        assert!(state.text_overlays.page_projection_current(1));
+        wait_for_export(&mut state, &ctx);
+        let page1 = image::open(out.join("002.png")).expect("decode exported page 1").to_rgba8();
+        assert_eq!(page1.get_pixel(8, 8).0, [0, 255, 0, 255], "the export holds the document's current pixels");
+        let page0 = image::open(out.join("001.png")).expect("decode exported page 0").to_rgba8();
+        assert_eq!(page0.get_pixel(8, 8).0, [0, 0, 255, 255], "the untouched page keeps its raster");
+    }
+
+    /// The export's re-projection of a stale resident page keeps `sync_from_doc`'s uid remap: a
+    /// raster selected on page 1 (not the canvas's page) that the PS editor moved up through the
+    /// document stays selected by uid at its new index, never restored to the old index (which now
+    /// names the other raster).
+    #[test]
+    fn export_reprojection_keeps_a_selected_raster_by_uid_after_a_doc_reorder() {
+        let dir = TempDir::new("export_reorder");
+        let (project, doc, mut state, ctx) = resident_two_page_chapter(&dir.0, &["a", "b"]);
+        assert_eq!(page1_raster_uid(&state, 0).as_deref(), Some("a"), "seeded bottom-to-top");
+        state.text_overlays.selected_raster_idx = Some(0);
+        state.text_overlays.selected_raster_page = Some(1);
+        assert!(doc.lock().expect("doc lock").reorder_node_one(1, "a", true), "the doc moves `a` above `b`");
+        assert!(!state.text_overlays.page_projection_current(1));
+
+        state.text_overlays.set_pending_export(png_export_request(&dir.0.join("export")));
+        state.run_pending_export_if_ready(&ctx, &project, false);
+        assert!(state.export_in_progress(), "dispatched after the re-projection");
+        assert_eq!(page1_raster_uid(&state, 0).as_deref(), Some("b"), "page 1 was re-projected in the new order");
+        assert_eq!(state.text_overlays.selected_raster_page, Some(1));
+        let selected = state.text_overlays.selected_raster_idx.expect("a raster stays selected");
+        assert_eq!(page1_raster_uid(&state, selected).as_deref(), Some("a"), "the selection follows the uid");
+        wait_for_export(&mut state, &ctx);
+        assert_eq!(page1_raster_uid(&state, selected).as_deref(), Some("a"), "building the export jobs keeps the remapped selection");
+    }
+
+    /// While the whole-chapter preload pass runs (each applied page bumps the doc's global version),
+    /// the deferred export's gate never runs the per-page re-projection: a stale resident page keeps
+    /// its projected version until the pass drained; then the export re-projects and dispatches.
+    #[test]
+    fn deferred_export_does_not_reproject_while_the_preload_runs() {
+        let dir = TempDir::new("export_preload");
+        let (mut project, doc, mut state, ctx) = resident_two_page_chapter(&dir.0, &["r1"]);
+        let green = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 255, 0));
+        doc.lock().expect("doc lock").set_raster_pixels(1, "r1", green.clone(), green, Vec::new(), true);
+        let projected_before = state.text_overlays.projected_doc_version.get(&1).copied();
+        assert!(!state.text_overlays.page_projection_current(1));
+
+        // A third, never-loaded page gives the preload pass a target.
+        project.pages.push(ms_project::Page { idx: 2, path: project.paths.src_dir.join("003.png") });
+        seed_pages(&project, &[&[], &[], &["r2"]]);
+        state.begin_preload_all_pages(&project);
+        assert!(state.preload_all_pages_active(), "the preload pass runs");
+        state.text_overlays.set_pending_export(png_export_request(&dir.0.join("export")));
+        state.run_pending_export_if_ready(&ctx, &project, false);
+        assert!(!state.export_in_progress());
+        assert_eq!(state.text_overlays.projected_doc_version.get(&1).copied(), projected_before, "no re-projection while the preload runs");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while state.drive_page_preload() {
+            assert!(std::time::Instant::now() < deadline, "the preload never drained");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        state.run_pending_export_if_ready(&ctx, &project, false);
+        assert!(state.export_in_progress(), "dispatched once the pass drained");
+        assert!(state.text_overlays.page_projection_current(1));
+        wait_for_export(&mut state, &ctx);
     }
 }
