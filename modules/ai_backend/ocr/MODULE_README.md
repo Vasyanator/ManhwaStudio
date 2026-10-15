@@ -20,7 +20,8 @@ first recognition. Resident models are leased from `runtime/model_manager.py`
 them; an eviction callback that does not own the requested key returns `False`.
 
 Device selection is not decided here. Torch services resolve `General.ai_device` through
-`AIDevice.detect_available_devices()`; the ONNX services take provider/device from
+`runtime/torch_device.py` (`resolve_selected_backend_device`; `easy.py` binds it with
+`accept_mps=False`) and release the allocator cache through its `clear_torch_cache`; the ONNX services take provider/device from
 `runtime/device_service.py` or `engines/paddle_onnx.py` helpers. Baberu applies the selection to
 its vision graph only and keeps both decoders on the CPU provider (see its bullet).
 
@@ -44,7 +45,9 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
   detection and no language choice (fixed `OCR:` prompt). Each request names the variant
   (`paddle_vl_model`, an opaque `^[a-z0-9_]{1,64}$` label) and its absolute checkpoint directory
   (`paddle_vl_model_dir`); the resident identity is `(model, model_dir, device)` under the lease key
-  `paddlevlocr:<model>:<device>`, and `health()` echoes the resident `model`. Holds the
+  `paddlevlocr:<model>:<device>`, and `health()` echoes the resident `model`. A request reads its
+  device-resolution fallback (the resident or in-flight device) under a short private lock, never
+  under the instance lock, so it does not wait for another request's load to pick a device. Holds the
   transformers compat shims, the loading-info guard and the optional `script` restriction.
 - `paddle_vl_vendor/`: unmodified, sha256-pinned PaddleOCR-VL-1.6 model code (Apache-2.0) that
   serves every variant; see its `MODULE_README.md`. Never edited.

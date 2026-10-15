@@ -135,7 +135,8 @@ CanvasView method map:
   `request_delete_bubble`, `request_translate_bubble`,
   `set_bubble_texts_from_panel`, `copy_bubble_text_to_clipboard`,
   `paste_bubble_text_from_clipboard`,
-  `flush_pending_bubble_upserts_now`, `flush_all_bubble_edits_now`, `apply_machine_translation_result`,
+  `flush_pending_bubble_upserts_now`, `flush_all_bubble_edits_now`, `has_pending_bubble_edits`,
+  `apply_machine_translation_result`,
   `patch_bubble_extra_fields`, `capture_bubble_history_before_mutation`,
   `try_undo_bubbles_history`, `try_redo_bubbles_history`, `apply_input_frame` (the frame
   reader, with `draw_capture_area` / `publish_view_surface`).

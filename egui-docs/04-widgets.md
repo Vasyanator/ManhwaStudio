@@ -55,10 +55,14 @@ and is built on it (`src/tabs/typing/panel/create_presets.rs::draw_font_combo`);
 product call site so far, and it draws its own label, because unlike `ComboBox` the widget draws
 none.
 
-Known exceptions still in the tree: `src/ai_backend_panel.rs` (the "max loaded models"
-slider, drawn twice) and `src/launcher/new_project/window.rs` (fetch parallelism) use a raw
-`egui::Slider`. Treat them as debt, not a precedent — the typing layout editor's opacity
-slider, which used to head this list, is a `WheelSlider` now.
+**Disabled `Wheel*` widgets must ignore the wheel themselves.** egui keeps a disabled widget in
+the hit test and only strips its click/drag sense (`egui-0.36.2/src/hit_test.rs:131-138`), so
+`Response::contains_pointer()` stays true over a disabled widget, while `Response::hovered()`
+is set only for enabled ones (`egui-0.36.2/src/context.rs:1496-1500`) and a disabled widget
+surrenders focus (`egui-0.36.2/src/context.rs:1256-1277`). A wheel widget that reacts on
+`contains_pointer()` therefore checks `Response::enabled()` first: `WheelSlider` does
+(`crates/ms-widgets/src/wheel_slider.rs`, `apply_hovered_wheel_delta`), so
+`ui.add_enabled(false, WheelSlider::new(..))` neither changes nor reports `changed()`.
 
 ## 1. The project widget set (`crates/ms-widgets/src/`)
 
@@ -67,7 +71,7 @@ Public surface is `crates/ms-widgets/src/lib.rs:43-72`; the module contract is
 
 | Widget | File | What it is / when to use |
 |---|---|---|
-| `WheelSlider` | `crates/ms-widgets/src/wheel_slider.rs:39` | `Slider` replacement: hover+wheel = one step (Shift = 5, `SHIFT_WHEEL_STEP_MULTIPLIER`, :37), parent scroll suppressed. Use for every bounded numeric in a panel. |
+| `WheelSlider` | `crates/ms-widgets/src/wheel_slider.rs:41` | `Slider` replacement: hover+wheel = one step (Shift = 5, `SHIFT_WHEEL_STEP_MULTIPLIER`, :39), parent scroll suppressed; ignores the wheel while disabled. Use for every bounded numeric in a panel. |
 | `WheelComboBox` | `crates/ms-widgets/src/wheel_combo_box.rs:35` | `ComboBox` replacement for `show_index`-style enums. Wheel cycles the index when closed; when open it publishes the wheel guard. `new` / `from_label` / `from_id_salt`. |
 | `SearchableComboBox` | `crates/ms-widgets/src/searchable_combo_box.rs:334` | `ComboBox` replacement for a CATALOG: two-line rows (`RowLayout::Tall`/`Wide`), the main line optionally in that row's own `FontFamily`, per-row colour + tooltip, wheel-cycling when closed. Search is a MODE — the popup opens as a plain list and reveals a filtering field when the user types into it or presses the square magnifier button the widget draws beside the combo button. `width(..)` covers both buttons (ask `search_button_overhang` for the difference) and so does the popup. Draws NO label — the caller must. Call site: the typing font combo. |
 | `WheelSpinBox` | `crates/ms-widgets/src/wheel_spin_box.rs:31` | `DragValue` replacement: unbounded/precise numeric entry with the same wheel contract. |

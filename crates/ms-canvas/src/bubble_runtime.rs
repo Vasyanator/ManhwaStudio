@@ -19,6 +19,7 @@ Key functions:
 - apply_machine_translation_result()
 - flush_bubble_upserts_to_model(): the per-frame flush of pending upserts into `BubblesModel`
 - flush_all_bubble_edits_now(): the persistence-point flush (debounced text and focused bubbles too)
+- has_pending_bubble_edits(): whether an edit has not reached the model yet (close-time dirty check)
 - sync_runtime_from_model_or_project()
 - apply_pending_actions()
 - is_runtime_bubble_hidden(): the SINGLE hidden-hint visibility gate; every runtime-bubble scan
@@ -557,6 +558,23 @@ impl CanvasView {
             self.commit_text_upsert_now(bid);
         }
         self.flush_bubble_upserts(project, UpsertFlushScope::Everything);
+    }
+
+    /// Whether this canvas holds a bubble edit that has not reached the shared `BubblesModel` yet:
+    /// a queued upsert or a debounced text upsert of a bubble the runtime still holds, or a queued
+    /// delete. Such an edit is invisible to the model's unsaved flag and to the staging probe until
+    /// a flush (per frame, or [`Self::flush_all_bubble_edits_now`] at a persistence point) writes
+    /// it. Always `false` without a bound model: nothing would ever be written, so nothing is
+    /// pending. Ids of bubbles the runtime no longer holds are ignored (the next flush drops them
+    /// without a write). Cheap (no lock, no I/O), so the studio may ask it on every close check.
+    #[must_use]
+    pub fn has_pending_bubble_edits(&self) -> bool {
+        let runtime = &self.bubble_runtime;
+        if runtime.bubbles_model.is_none() {
+            return false;
+        }
+        !runtime.pending_delete.is_empty()
+            || runtime.pending_upsert.iter().chain(runtime.pending_text_upsert.keys()).any(|bid| runtime.runtime_bubbles.contains_key(bid))
     }
 
     pub fn apply_machine_translation_result(
@@ -3064,6 +3082,43 @@ mod tests {
         assert!(active.try_undo_bubbles_history());
         assert_eq!(model_text(), "older");
         assert!(!active.try_undo_bubbles_history());
+    }
+
+    /// `has_pending_bubble_edits` sees a queued or debounced edit until a flush wrote it, sees a
+    /// queued delete, ignores ids the runtime no longer holds, and is always false without a model.
+    #[test]
+    fn has_pending_bubble_edits_tracks_unflushed_edits() {
+        let project = empty_project();
+        let mut unbound = CanvasView::default();
+        unbound.bubble_runtime.pending_delete.insert(1);
+        assert!(!unbound.has_pending_bubble_edits(), "no model bound: nothing would be written");
+
+        let model = test_model(vec![text_bubble_record(1, 0, 0.30, 0.30, Side::Left)]);
+        let mut canvas = CanvasView::default();
+        canvas.set_bubbles_model(Arc::clone(&model));
+        canvas.sync_runtime_from_model_or_project(&project);
+        assert!(!canvas.has_pending_bubble_edits(), "a freshly synced canvas holds nothing");
+
+        // A debounced text edit of a focused bubble: pending until the persistence-point flush.
+        canvas.bubble_runtime.runtime_bubbles.get_mut(&1).expect("runtime bubble 1").text = "typed".to_string();
+        canvas.schedule_text_upsert(1, 0.0);
+        canvas.bubble_runtime.focused_bubbles.insert(1);
+        assert!(canvas.has_pending_bubble_edits());
+        canvas.flush_pending_bubble_upserts_now(&project);
+        assert!(canvas.has_pending_bubble_edits(), "the regular flush keeps the debounce");
+        canvas.flush_all_bubble_edits_now(&project);
+        assert!(!canvas.has_pending_bubble_edits(), "written: nothing pending");
+
+        // A queued upsert of a bubble the runtime no longer holds is not an edit.
+        canvas.bubble_runtime.pending_upsert.insert(99);
+        assert!(!canvas.has_pending_bubble_edits());
+        canvas.bubble_runtime.pending_upsert.insert(1);
+        assert!(canvas.has_pending_bubble_edits(), "a queued upsert of a held bubble is pending");
+        canvas.flush_all_bubble_edits_now(&project);
+        assert!(!canvas.has_pending_bubble_edits(), "the flush wrote bubble 1 and dropped the stale id");
+
+        canvas.bubble_runtime.pending_delete.insert(1);
+        assert!(canvas.has_pending_bubble_edits(), "a queued delete is pending");
     }
 
     /// A bubble with a pending paste is held back even by the persistence-point flush.

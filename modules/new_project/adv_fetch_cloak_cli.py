@@ -27,7 +27,8 @@ Main items:
   otherwise DOM/geometry/URL signals - and size-outlier pages are flagged as probable junk.
 
 Deep-capture diagnostics (all lines go to the runtime log through `_debug_log` /
-`_warn_log`, and every one of them is greppable by its `cloak deep <kind>:` prefix):
+`_warn_log` - the Python log when hosted in-process, a stdout JSON `log` event in the
+`--daemon` fallback - and every one of them is greppable by its `cloak deep <kind>:` prefix):
 - `cloak deep drain:`   one aggregated line per drain - wall time, per-stage time and
   new-record contribution, running totals, and the slowest browser calls made;
 - `cloak deep shape:`   page URL and element/img/canvas/iframe counts, logged on the
@@ -82,7 +83,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from config import VERSION  # noqa: E402
 from modules.browser_f import get_origin  # noqa: E402
-from modules.new_project.common import compile_wildcard_prefixes  # noqa: E402
+from modules.new_project.common import (  # noqa: E402
+    compile_wildcard_prefixes,
+    enable_daemon_stdout_log,
+    write_diagnostic,
+)
 
 LOG = logging.getLogger(__name__)
 CONTROL_TRANSLATION = {code: None for code in range(0x00, 0x20)} | {0x7F: None}
@@ -3979,34 +3984,25 @@ def _is_http_redirect_status(status_code: int) -> bool:
 
 
 def _debug_log(message: str, *args: object) -> None:
+    """Emit a routine (info-level) diagnostic, gated by `VERBOSE_DOWNLOAD_LOG`.
+
+    Written exactly once: through `LOG` when hosted in-process (the backend log reaches
+    `last.log`), or as a JSON ``log`` event on stdout in the `--daemon` fallback
+    (`common.write_diagnostic`).
+    """
     if not VERBOSE_DOWNLOAD_LOG:
         return
-    LOG.info(message, *args)
-    try:
-        formatted = message % args if args else message
-    except Exception:  # noqa: BLE001
-        formatted = f"{message} | args={args!r}"
-    with EMIT_LOCK:
-        sys.stdout.write(json.dumps({"event": "log", "level": "info", "message": formatted}, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+    write_diagnostic(LOG, EMIT_LOCK, logging.INFO, "info", message, args)
 
 
 def _warn_log(message: str, *args: object) -> None:
-    """Emit a warning-level diagnostic to both the Python log and the Rust runtime log.
+    """Emit a warning-level diagnostic the user must be able to find in `last.log`.
 
-    Same transport as `_debug_log` (a JSON ``log`` event on stdout, which the Rust side
-    forwards into the runtime log) but at ``warn`` level and **not** gated by
+    Same single channel as `_debug_log` but at warning level and **not** gated by
     `VERBOSE_DOWNLOAD_LOG`: the lines routed through here mark conditions the user needs
     to see, such as a capture that has stopped finding anything.
     """
-    LOG.warning(message, *args)
-    try:
-        formatted = message % args if args else message
-    except Exception:  # noqa: BLE001 - never lose a warning to a bad format string
-        formatted = f"{message} | args={args!r}"
-    with EMIT_LOCK:
-        sys.stdout.write(json.dumps({"event": "log", "level": "warn", "message": formatted}, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+    write_diagnostic(LOG, EMIT_LOCK, logging.WARNING, "warn", message, args)
 
 
 def _format_deep_call_stats(stats: dict[str, DeepCallStat], limit: int = 4) -> str:
@@ -5105,11 +5101,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Run the manual `--daemon` stdio fallback; returns the process exit code."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     args = parse_args()
     if not args.daemon:
         print("This helper is intended to run with --daemon.", file=sys.stderr)
         return 2
+    # Set once, before any daemon work: diagnostics go to stdout as JSON `log` events.
+    enable_daemon_stdout_log()
     daemon = CloakFetchDaemon()
     try:
         return daemon.run()

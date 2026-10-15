@@ -207,7 +207,7 @@ impl StagingWriters {
         self.bubbles_model
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .pause_saver_for_page_op();
+            .pause_saver_for_discard();
         // Stop the клин autosave without writing (discard). The project discard joins it on the delete
         // job before the delete (left running, a pass could re-create the staging dir after its
         // removal); otherwise the teardown joins it.

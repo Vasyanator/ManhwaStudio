@@ -23,12 +23,13 @@ Notes:
   Settings tab; it reports back through `fail` / `resolve`.
 - The device prompt only sends `AiBackendProbeCommand`s; it never blocks or waits for the
   backend. It closes itself once the pushed health snapshot no longer asks for a selection.
-- The two device pickers are stock `egui::ComboBox`es with a stable `id_salt`
-  (`egui-docs/05-ids-and-i18n.md`).
+- The two device pickers are `WheelComboBox`es (project rule: no stock `egui::ComboBox`) with a
+  stable `id_salt` (`egui-docs/05-ids-and-i18n.md`).
 */
 
 use crate::project::ComicType;
 use crate::runtime_log;
+use crate::widgets::WheelComboBox;
 use ms_local_ai::backend_health::{
     AiBackendDeviceOption, AiBackendHealthSnapshot, AiBackendProbeCommand,
 };
@@ -102,8 +103,8 @@ impl ComicTypePrompt {
 
 /// Maps the two button clicks of one frame to the chosen comic type.
 ///
-/// Both clicked in one frame resolves to `Ribbon`: the buttons used to apply in drawing order,
-/// so the later one (ribbon) was the state left behind.
+/// Both clicked in one frame resolves to `Ribbon`, the later-drawn button, matching what
+/// applying the two clicks in drawing order would leave behind.
 fn comic_choice(pages_clicked: bool, ribbon_clicked: bool) -> Option<ComicType> {
     if ribbon_clicked {
         Some(ComicType::Ribbon)
@@ -212,9 +213,8 @@ impl AiDevicePrompt {
                 if health.torch_device_needs_selection && !health.device_options.is_empty() {
                     let selected_text = option_label(&health.device_options, &self.pytorch_device);
                     // Stable id_salt so a live UI-language switch does not reset the
-                    // combo state (native `ComboBox` derives its id from the label text
-                    // unless given an explicit salt).
-                    egui::ComboBox::new("ai_device_prompt_pytorch_combo", t!("app.gpu_prompt.pytorch_device_label"))
+                    // combo state (an id derived from the label text would change with it).
+                    WheelComboBox::new("ai_device_prompt_pytorch_combo", t!("app.gpu_prompt.pytorch_device_label"))
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
                             for option in &health.device_options {
@@ -231,7 +231,7 @@ impl AiDevicePrompt {
                 if health.onnx_device_needs_selection {
                     let selected_text = option_label(&directml_options, &self.directml_device_id);
                     // Stable id_salt (see the PyTorch combo above).
-                    egui::ComboBox::new("ai_device_prompt_directml_combo", t!("app.gpu_prompt.directml_device_label"))
+                    WheelComboBox::new("ai_device_prompt_directml_combo", t!("app.gpu_prompt.directml_device_label"))
                         .selected_text(selected_text)
                         .show_ui(ui, |ui| {
                             for option in &directml_options {
@@ -362,7 +362,7 @@ fn option_label(options: &[AiBackendDeviceOption], selected_id: &str) -> String 
         .map(|option| option.label.clone())
         .unwrap_or_else(|| {
             if selected_id.trim().is_empty() {
-                t!("app.hotkey.no_binding").to_string()
+                t!("app.gpu_prompt.no_device_label").to_string()
             } else {
                 selected_id.to_string()
             }
@@ -528,5 +528,6 @@ mod tests {
         let options = [option("cuda:0", "CUDA 0")];
         assert_eq!(option_label(&options, "cuda:0"), "CUDA 0");
         assert_eq!(option_label(&options, "cpu"), "cpu");
+        assert_eq!(option_label(&options, " "), t!("app.gpu_prompt.no_device_label"), "a blank id shows the no-device text");
     }
 }

@@ -1,10 +1,10 @@
 /*
-FILE OVERVIEW: src/ai_backend_panel.rs
+FILE OVERVIEW: crates/ms-settings-ui/src/ai_backend_panel.rs
 Shared AI backend settings widget used by BOTH the studio settings tab and the
 launcher settings page.
 
 Why this is shared:
-The backend is now app-global (see `crate::ai_backend_supervisor`), so its status,
+The backend is app-global (see `crate::ai_backend_supervisor`), so its status,
 process controls, and device/ONNX selection must be reachable from the launcher as
 well as the studio. This module renders that one panel against an
 [`AiBackendHandle`] (the shared snapshots + command channels) plus a per-UI
@@ -25,7 +25,7 @@ ORT guard reset) send their `SettingChange` over the state's completion channel 
 write returned, and the pane drains it every frame. Autostart is persisted by the
 supervisor worker, so its change carries the new value and is reported on the click. With
 a `WarningSet` (launcher) the runtime combo, autostart checkbox, build / EP / device rows
-and the build-action row carry inline badges; `None` (studio) draws the pre-badge layout.
+and the build-action row carry inline badges; `None` (studio) draws the layout without badges.
 
 Platform gate:
 Where `ms_platform::PlatformFeature::PythonBackend` is unavailable (Android, web) the pane
@@ -54,7 +54,7 @@ use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
 use crate::settings_warnings::item_warning_badge;
 use ms_backend_ipc as backend_ipc;
 use ms_local_ai::backend_health::{AiBackendHealthSnapshot, AiBackendProbeCommand};
-use ms_widgets::WheelComboBox;
+use ms_widgets::{WheelComboBox, WheelSlider};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::onnx_caps::{OnnxCaps, device_id_offered, ep_device_ids, probe_onnx_caps};
 #[cfg(not(target_arch = "wasm32"))]
@@ -287,7 +287,7 @@ struct OnnxDeviceOptionUi {
 /// `state`, and returns the setting changes that landed this frame.
 ///
 /// `warnings` is the launcher's warning set (inline item badges); the studio passes
-/// `None`, which draws no badge and the pre-badge layout. Config writes never run on the
+/// `None`, which draws the layout without badges. Config writes never run on the
 /// GUI thread: they run on named workers and are reported here once they returned.
 pub fn draw_ai_backend_panel(
     ui: &mut egui::Ui,
@@ -1043,7 +1043,7 @@ fn draw_model_manager(
     ui.separator();
     ui.label(t!("ai_backend.model_manager_heading"));
     let slider_response = ui.add(
-        egui::Slider::new(&mut state.selected_max_loaded_models, 1..=10)
+        WheelSlider::new(&mut state.selected_max_loaded_models, 1..=10)
             .text(t!("ai_backend.max_loaded_models_label")),
     );
     if slider_response.changed() {
@@ -1191,7 +1191,7 @@ fn draw_onnx_and_models_section(
     ui.label(t!("ai_backend.model_manager_heading"));
     let slider_response = ui.add_enabled(
         snapshot.connected,
-        egui::Slider::new(&mut state.selected_max_loaded_models, 1..=10)
+        WheelSlider::new(&mut state.selected_max_loaded_models, 1..=10)
             .text(t!("ai_backend.max_loaded_models_label")),
     );
     if slider_response.changed() {
@@ -2992,12 +2992,10 @@ mod tests {
         let ships = ms_onnx_runtime::build_shipped_here;
         let empty = build_availability(&OnnxCaps::default());
         assert_eq!(empty.cpu, ships("cpu"));
-        // Formerly divergent (D1): the panel required a probed DirectML adapter, the
-        // runtime never did; the panel now follows the runtime's rule, so DirectML is
-        // available on Windows even with zero probed adapters.
-        // Formerly divergent (D3b): a build without an archive for this OS/arch is
-        // unavailable. The manifest ships DirectML only for Windows and CoreML only for
-        // macOS, where their headline EPs run.
+        // The panel follows the runtime's rule: DirectML needs no probed adapter, so it is
+        // available on Windows even with zero probed adapters (D1). A build without an
+        // archive for this OS/arch is unavailable (D3b). The manifest ships DirectML only
+        // for Windows and CoreML only for macOS, where their headline EPs run.
         assert_eq!(empty.directml, ships("directml"), "DirectML with zero adapters");
         assert!(!empty.webgpu);
         assert_eq!(empty.coreml, ships("coreml"));

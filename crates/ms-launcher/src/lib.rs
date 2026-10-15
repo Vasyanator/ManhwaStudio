@@ -17,7 +17,7 @@ Key modules:
 - `confirm_modal`: in-app Yes/No confirmation (`egui::Modal`) for overwrite questions
 - `first_run_language`: first-run interface/typesetting language-selection modal
 - `main_page`: rendering of the current main page
-- `natural_sort`: the shared natural file-name order (PSD import table, image multi-pick)
+- `natural_sort`: the shared natural file-name order (PSD import table, image multi-pick, New Project import)
 - `new_project`: detached "New Project" window runtime and UI
 - `open_image`: main-menu "Open image" multi-file picker worker, path validation, sort, outcome
   mapping (native only)

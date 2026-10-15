@@ -48,9 +48,9 @@ impl ProcessServices {
     /// reconciliation stays pending until the project is loaded, so the autostart does too.
     ///
     /// The one construction for every mode that runs the main window. It is deliberately NOT
-    /// started inside [`init_full`]: the update windows run between the two, and the test launcher
-    /// re-runs `init_runtime_logging` first, so each mode calls this where it starts the backend
-    /// today. The returned supervisor stops the backend process and its probe when dropped.
+    /// started inside [`init_full`]: the update windows run between the two, so each mode calls
+    /// this where it starts the backend. The returned supervisor stops the backend process and its
+    /// probe when dropped.
     pub(super) fn start_ai_backend_supervisor(&self) -> ai_backend_supervisor::AiBackendSupervisor {
         ai_backend_supervisor::AiBackendSupervisor::start_with_autostart_gate(self.local_ai, Some(storage_conversion_autostart_gate()))
     }

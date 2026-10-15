@@ -110,10 +110,20 @@ fn load_hotkey_overrides_blocking(user_settings: &Value, write_back: Option<&Pat
     overrides
 }
 
-/// Whether the staging directory `unsaved_dir` exists (`Path::exists`: an inspection error
-/// reads as absent, the long-standing rule of the unsaved-changes flag).
+/// Whether the staging directory `unsaved_dir` exists. Conservative: an inspection error other
+/// than not-found reads as PRESENT (logged), so an unreadable staging dir never hides unsaved work —
+/// the same rule as the periodic `staging_probe`.
 fn staging_dir_exists(unsaved_dir: &Path) -> bool {
-    unsaved_dir.exists()
+    match unsaved_dir.try_exists() {
+        Ok(exists) => exists,
+        Err(err) => {
+            runtime_log::log_warn(format!(
+                "[studio::bootstrap] could not inspect the staging directory; treating the session as unsaved; path={} error={err}",
+                unsaved_dir.display()
+            ));
+            true
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1474,7 +1474,6 @@ pub fn user_config_defaults() -> Value {
             "secondary_windows": SecondaryWindows::default().as_config_str(),
             // Per-host default: on for Android, off for a desktop and the web.
             "touch_gestures": touch_gestures::DEFAULT,
-            "typing_panel_layout": "vertical",
             // Built above from `AppTab::key()`. Older configs may still carry the
             // legacy Russian keys next to these; see the `enabled_tabs` note in
             // `src/MODULE_README.md` for why those stale keys are left inert.

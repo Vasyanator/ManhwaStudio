@@ -647,6 +647,9 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   canvas whose tab is not active, each frame (a no-op once clean), and on all three — the active
   one LAST — before save-to-project, a page op and the non-discard teardown; DISCARD never flushes.
   `flush_pending_bubble_upserts_now` stays the regular flush for tab-internal calls.
+  `has_pending_bubble_edits()` answers whether a canvas still holds such an unflushed edit (queued
+  or debounced upsert of a held bubble, queued delete; `false` without a model): the studio's
+  close-time dirty check reads it, because the model's unsaved flag cannot see those edits yet.
 - `hook_bubbles_revision()` is a cheap `u64` fingerprint of the bubble set `hook_bubbles_snapshot`
   would build: it folds `BubblesModel::revision()` with the runtime-only set
   (`runtime_bubbles` count + `next_bubble_id`), so a runtime-only, not-yet-flushed bubble bumps it.

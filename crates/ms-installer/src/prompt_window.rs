@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::install::resolve_installed_program_copy_path;
 use crate::utils::ExternalUpdateTarget;
-use crate::window::{WindowLook, prepare_window_context};
+use crate::window::prepare_window_context;
 
 /// The user's answer in the missing-environment prompt; closing the window counts as
 /// `LaunchLauncher`.
@@ -64,7 +64,7 @@ pub fn run_missing_python_env_prompt() -> Result<MissingPythonEnvAction, String>
         "ManhwaStudio",
         options,
         Box::new(move |cc| {
-            prepare_window_context(&cc.egui_ctx, WindowLook::StudioTheme);
+            prepare_window_context(&cc.egui_ctx);
             Ok(Box::new(MissingPythonEnvPromptApp {
                 output: output_for_app,
                 error_text: None,

@@ -3,7 +3,7 @@ FILE OVERVIEW: src/tabs/settings/canvas_ribbon.rs
 Ribbon/canvas settings pane UI for the settings tab.
 
 Main responsibilities:
-- Render shared canvas ribbon settings previously edited inside `CanvasView`.
+- Render the shared canvas / ribbon settings (`SharedCanvasSettings`) outside any canvas.
 - Publish updated `SharedCanvasSettings` into shared models so other tabs pick them up.
 
 Key types:

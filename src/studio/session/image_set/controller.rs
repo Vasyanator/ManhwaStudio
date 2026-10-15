@@ -764,9 +764,10 @@ fn edit_stamp(gate: &AutosaveGate, typing: &TypingTabState) -> u64 {
 /// An edit already changed the image but is not yet counted by [`edit_stamp`] (its persistence,
 /// and with it `note_action`, waits for the next flush). Which tabs hold such edits is decided by
 /// the session-wide owner [`DeferredTabEdits`], shared with the project's dirty check. A save
-/// stage's first dispatch flushes them before the baseline is captured.
+/// stage's first dispatch flushes them before the baseline is captured. The canvas bubble term is
+/// `false` here: an image-set save never writes bubbles (see `DeferredTabEdits::canvas_bubbles`).
 fn deferred_edits(typing: &TypingTabState, ps_editor: &PsEditorTabState) -> bool {
-    DeferredTabEdits::of(typing, ps_editor).any()
+    DeferredTabEdits::of(typing, ps_editor, false).any()
 }
 
 /// Two save steps of one frame (a deferred format-panel close, the pickers, a stop and the write

@@ -12,7 +12,8 @@ Key structures:
 - `SessionParts`: the `StudioApp` parts a session flow borrows for one call (project, staging
   writers, close intent, the tab states it flushes or notifies).
 - `DeferredTabEdits`: the ONE answer to "do the tabs hold edits not yet handed to a staging
-  writer" (typing's deferred text edits, the PS editor's deferred layer edits), read by both
+  writer" (typing's deferred text edits, the PS editor's deferred layer edits and — for a project
+  only, `canvas_bubble_edits_pending` — the canvases' unflushed bubble edits), read by both
   session kinds' dirty checks.
 
 Key functions:
@@ -98,13 +99,12 @@ impl SessionParts<'_> {
 /// handed to a staging writer yet, so neither the staging-dir probe nor the autosave gate's action
 /// count can see them. The ONE owner of which tabs hold such edits; both session kinds' dirty
 /// checks read it. Every term is cleared by its tab's flush, which every persistence point runs
-/// (save, page op, image-set save stage, non-discard teardown, tab leave).
+/// (save, page op, image-set save stage, non-discard teardown, tab leave; the canvas term also by
+/// the per-frame canvas flush).
 ///
-/// Considered and NOT terms: canvas bubble edits (`ms-canvas` exposes no "pending" query; every
-/// persistence point, the non-discard teardown included, flushes them into the bubbles model, so
-/// they are not lost, but a close may not see them as unsaved), typing's clip-mask edits
-/// (written outside the gated writers; the image set counts them through its edit stamp) and the
-/// typing font / preset stores (user-global documents, not session state).
+/// Considered and NOT terms: typing's clip-mask edits (written outside the gated writers; the image
+/// set counts them through its edit stamp) and the typing font / preset stores (user-global
+/// documents, not session state).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::studio) struct DeferredTabEdits {
     /// Typing's deferred text-layer writes or an unsettled layer move
@@ -113,20 +113,35 @@ pub(in crate::studio) struct DeferredTabEdits {
     /// A PS-editor document edit (visibility / opacity / collapse through `edit_doc_node`) whose
     /// page persist waits for the next flush (`PsEditorTabState::has_deferred_layer_edits`).
     pub(in crate::studio) ps_layers: bool,
+    /// A bubble edit one of the three canvases has not pushed into `BubblesModel` yet (debounced
+    /// or focused text, a queued upsert or delete: [`canvas_bubble_edits_pending`]). Answered by the
+    /// caller, because only a project session counts it: an image-set save never writes bubbles
+    /// (they live only in its scratch), so for it such an edit is not work a save could keep, and
+    /// counting it would hold a save-then-close on its exit dialog while a bubble field keeps focus.
+    pub(in crate::studio) canvas_bubbles: bool,
 }
 
 impl DeferredTabEdits {
-    /// Reads both tabs' deferred-edit flags (no lock, no I/O).
+    /// Reads both tabs' deferred-edit flags (no lock, no I/O) and takes the canvas term as given
+    /// (`canvas_bubbles`: [`canvas_bubble_edits_pending`] for a project, `false` for an image set).
     #[must_use]
-    pub(in crate::studio) fn of(typing: &TypingTabState, ps_editor: &PsEditorTabState) -> Self {
-        Self { typing_text: typing.has_pending_text_edits(), ps_layers: ps_editor.has_deferred_layer_edits() }
+    pub(in crate::studio) fn of(typing: &TypingTabState, ps_editor: &PsEditorTabState, canvas_bubbles: bool) -> Self {
+        Self { typing_text: typing.has_pending_text_edits(), ps_layers: ps_editor.has_deferred_layer_edits(), canvas_bubbles }
     }
 
     /// Whether any tab holds a deferred edit.
     #[must_use]
     pub(in crate::studio) const fn any(self) -> bool {
-        self.typing_text || self.ps_layers
+        self.typing_text || self.ps_layers || self.canvas_bubbles
     }
+}
+
+/// Whether any of the three canvases (translation, cleaning, typing) holds a bubble edit not yet in
+/// `BubblesModel` (`CanvasView::has_pending_bubble_edits`; no lock, no I/O). The canvas set is the
+/// one `SessionParts::flush_canvas_bubble_edits` flushes.
+#[must_use]
+pub(in crate::studio) fn canvas_bubble_edits_pending(translation_canvas: &CanvasView, cleaning: &CleaningTabState, typing: &TypingTabState) -> bool {
+    [translation_canvas, cleaning.canvas(), typing.canvas()].into_iter().any(CanvasView::has_pending_bubble_edits)
 }
 
 /// A project session's "unsaved" answer: the sticky cached flag (`ProjectSession`, refreshed about
@@ -158,7 +173,7 @@ impl SessionMode {
     pub(in crate::studio) fn from_project(project: &ProjectData, user_settings: &Value, has_staging: bool) -> Self {
         match ImageSetSession::from_project(project, user_settings) {
             Some(image_set) => Self::ImageSet(Box::new(image_set)),
-            None => Self::Project(ProjectSession::new(has_staging)),
+            None => Self::Project(ProjectSession::new(has_staging, project.paths.unsaved_dir.clone())),
         }
     }
 
@@ -179,13 +194,14 @@ impl SessionMode {
     }
 
     /// Whether the session has changes the user would lose by closing. Project: the cached
-    /// unsaved flag, or a deferred tab edit right now ([`project_has_unsaved_changes`]). Image set:
+    /// unsaved flag, or a deferred tab edit right now, unflushed canvas bubble edits included
+    /// ([`project_has_unsaved_changes`]). Image set:
     /// the image differs from its last write (deferred tab edits included) or a write is in
     /// flight; never while the DISCARD latch is set (the window is closing without saving).
     #[must_use]
-    pub(in crate::studio) fn has_unsaved_changes(&self, writers: &StagingWriters, typing: &TypingTabState, ps_editor: &PsEditorTabState) -> bool {
+    pub(in crate::studio) fn has_unsaved_changes(&self, writers: &StagingWriters, typing: &TypingTabState, ps_editor: &PsEditorTabState, translation_canvas: &CanvasView, cleaning: &CleaningTabState) -> bool {
         match self {
-            Self::Project(project) => project_has_unsaved_changes(project.has_unsaved_changes(), writers.is_discarding(), DeferredTabEdits::of(typing, ps_editor)),
+            Self::Project(project) => project_has_unsaved_changes(project.has_unsaved_changes(), writers.is_discarding(), DeferredTabEdits::of(typing, ps_editor, canvas_bubble_edits_pending(translation_canvas, cleaning, typing))),
             Self::ImageSet(image_set) => !writers.is_discarding() && (image_set.is_dirty(writers.gate(), typing, ps_editor) || image_set.write_in_flight()),
         }
     }
@@ -417,7 +433,9 @@ fn apply_image_set_outcome(image_set: &mut ImageSetSession, outcome: Option<Save
 
 #[cfg(test)]
 mod tests {
-    use super::{DeferredTabEdits, OsClosePolicy, SessionCapabilities, SessionMode, StagingWriters, project_has_unsaved_changes};
+    use super::{DeferredTabEdits, OsClosePolicy, SessionCapabilities, SessionMode, StagingWriters, canvas_bubble_edits_pending, project_has_unsaved_changes};
+    use crate::canvas::CanvasView;
+    use crate::tabs::cleaning::CleaningTabState;
     use crate::studio::busy::PersistenceJobs;
     use crate::models::autosave_gate::AutosaveGate;
     use crate::models::bubbles_model::BubblesModel;
@@ -451,10 +469,12 @@ mod tests {
     #[test]
     fn any_single_deferred_tab_edit_counts() {
         assert!(!DeferredTabEdits::default().any());
-        assert!(DeferredTabEdits { typing_text: true, ps_layers: false }.any());
-        assert!(DeferredTabEdits { typing_text: false, ps_layers: true }.any(), "a PS-only deferred layer edit is unsaved work");
-        assert!(DeferredTabEdits { typing_text: true, ps_layers: true }.any());
-        assert_eq!(DeferredTabEdits::of(&TypingTabState::default(), &PsEditorTabState::default()), DeferredTabEdits::default());
+        assert!(DeferredTabEdits { typing_text: true, ps_layers: false, canvas_bubbles: false }.any());
+        assert!(DeferredTabEdits { typing_text: false, ps_layers: true, canvas_bubbles: false }.any(), "a PS-only deferred layer edit is unsaved work");
+        assert!(DeferredTabEdits { typing_text: false, ps_layers: false, canvas_bubbles: true }.any(), "an unflushed canvas bubble edit is unsaved work");
+        assert!(DeferredTabEdits { typing_text: true, ps_layers: true, canvas_bubbles: true }.any());
+        assert_eq!(DeferredTabEdits::of(&TypingTabState::default(), &PsEditorTabState::default(), false), DeferredTabEdits::default());
+        assert!(DeferredTabEdits::of(&TypingTabState::default(), &PsEditorTabState::default(), true).canvas_bubbles);
     }
 
     /// The project's answer: the cached flag always wins; a deferred tab edit counts live, but not
@@ -462,10 +482,11 @@ mod tests {
     #[test]
     fn project_unsaved_is_cached_flag_or_live_deferred_edit_outside_discard() {
         let none = DeferredTabEdits::default();
-        let ps_only = DeferredTabEdits { typing_text: false, ps_layers: true };
-        let typing_only = DeferredTabEdits { typing_text: true, ps_layers: false };
+        let ps_only = DeferredTabEdits { typing_text: false, ps_layers: true, canvas_bubbles: false };
+        let typing_only = DeferredTabEdits { typing_text: true, ps_layers: false, canvas_bubbles: false };
+        let canvas_only = DeferredTabEdits { typing_text: false, ps_layers: false, canvas_bubbles: true };
         for discarding in [false, true] {
-            for deferred in [none, ps_only, typing_only] {
+            for deferred in [none, ps_only, typing_only, canvas_only] {
                 assert!(project_has_unsaved_changes(true, discarding, deferred), "the cached flag is sticky");
             }
             assert!(!project_has_unsaved_changes(false, discarding, none));
@@ -474,6 +495,8 @@ mod tests {
         assert!(project_has_unsaved_changes(false, false, typing_only));
         assert!(!project_has_unsaved_changes(false, true, ps_only), "a discard dropped / never flushes the deferred edit");
         assert!(!project_has_unsaved_changes(false, true, typing_only));
+        assert!(project_has_unsaved_changes(false, false, canvas_only), "an unflushed canvas bubble edit asks (S-044)");
+        assert!(!project_has_unsaved_changes(false, true, canvas_only), "a discard never flushes the canvases");
     }
 
     /// A project chapter (one page, no staging dir) builds a project session that shows every tab,
@@ -503,11 +526,14 @@ mod tests {
         let mut writers = writers_on(&gate, &dir.path().join("writers"));
         let typing = TypingTabState::default();
         let ps_editor = PsEditorTabState::default();
-        assert!(!mode.has_unsaved_changes(&writers, &typing, &ps_editor), "no staging dir: nothing unsaved");
+        let translation_canvas = CanvasView::default();
+        let cleaning = CleaningTabState::default();
+        assert!(!canvas_bubble_edits_pending(&translation_canvas, &cleaning, &typing), "fresh canvases hold no bubble edit");
+        assert!(!mode.has_unsaved_changes(&writers, &typing, &ps_editor, &translation_canvas, &cleaning), "no staging dir: nothing unsaved");
         mode.note_unsaved();
-        assert!(mode.has_unsaved_changes(&writers, &typing, &ps_editor), "a bubbles revision latches the cached flag");
+        assert!(mode.has_unsaved_changes(&writers, &typing, &ps_editor, &translation_canvas, &cleaning), "a bubbles revision latches the cached flag");
         let resumed = SessionMode::from_project(&project, &Value::Null, true);
-        assert!(resumed.has_unsaved_changes(&writers, &typing, &ps_editor), "a staging dir found at open starts unsaved");
+        assert!(resumed.has_unsaved_changes(&writers, &typing, &ps_editor, &translation_canvas, &cleaning), "a staging dir found at open starts unsaved");
         writers.stop_overlay_autosave_blocking();
     }
 
@@ -541,14 +567,16 @@ mod tests {
         let mut writers = writers_on(&gate, &dir.path().join("writers"));
         let mut typing = TypingTabState::default();
         let ps_editor = PsEditorTabState::default();
-        assert!(!mode.has_unsaved_changes(&writers, &typing, &ps_editor), "a freshly opened image is clean");
+        let translation_canvas = CanvasView::default();
+        let cleaning = CleaningTabState::default();
+        assert!(!mode.has_unsaved_changes(&writers, &typing, &ps_editor, &translation_canvas, &cleaning), "a freshly opened image is clean");
         mode.note_unsaved();
-        assert!(!mode.has_unsaved_changes(&writers, &typing, &ps_editor), "the bubbles revision is not the image set's dirty source");
+        assert!(!mode.has_unsaved_changes(&writers, &typing, &ps_editor, &translation_canvas, &cleaning), "the bubbles revision is not the image set's dirty source");
         gate.note_action();
-        assert!(mode.has_unsaved_changes(&writers, &typing, &ps_editor), "an edit moves the gate's action count");
+        assert!(mode.has_unsaved_changes(&writers, &typing, &ps_editor, &translation_canvas, &cleaning), "an edit moves the gate's action count");
         mode.before_shutdown(&mut writers, &mut typing);
         assert!(writers.is_discarding(), "an image set always closes the discard way");
-        assert!(!mode.has_unsaved_changes(&writers, &typing, &ps_editor), "never dirty while discarding");
+        assert!(!mode.has_unsaved_changes(&writers, &typing, &ps_editor, &translation_canvas, &cleaning), "never dirty while discarding");
         writers.stop_overlay_autosave_blocking();
         drop(mode);
         drop(project);

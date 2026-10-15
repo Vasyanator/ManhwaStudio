@@ -18,7 +18,9 @@ FILE HEADER (widgets/wheel_slider.rs)
     подавляется, даже если слайдер геометрически под списком;
   - hover/wheel определяются только z-order hit-test'ом egui (`response.hovered()`
     / `contains_pointer()`), поэтому слой поверх слайдера корректно забирает колесо;
-  - событие колеса потребляется локально, чтобы не скроллился контейнер выше.
+  - событие колеса потребляется локально, чтобы не скроллился контейнер выше;
+  - a disabled slider (`add_enabled(false, ..)`, a disabled parent `Ui`) ignores the wheel
+    and reports no change: egui still marks disabled widgets `contains_pointer`.
 */
 #![allow(dead_code)]
 
@@ -342,7 +344,12 @@ impl Widget for WheelSlider<'_> {
         } else {
             ui.add(self.build_slider())
         };
-        let pointer_over_slider = !pointer_blocked_by_combo_popup
+        // A disabled slider gets neither the hover highlight nor the wheel: egui still sets
+        // `contains_pointer` on disabled widgets (egui-0.36.2/src/hit_test.rs:131-138 strips
+        // only their click/drag sense), so the pointer test below alone would let a disabled
+        // slider react.
+        let pointer_over_slider = response.enabled()
+            && !pointer_blocked_by_combo_popup
             && !combo_popup_open(ui.ctx())
             && pointer_over_response_rect(&response);
         if pointer_over_slider && !response.hovered() {
@@ -383,6 +390,11 @@ fn apply_hovered_wheel_delta(
     range: &RangeInclusive<f64>,
     step_size: f64,
 ) -> bool {
+    // Disabled: no value change, no `changed()`, and the wheel is left to the parent
+    // `ScrollArea`, as with a stock disabled `Slider`.
+    if !response.enabled() {
+        return false;
+    }
     if combo_popup_blocks_pointer(ui.ctx()) || combo_popup_open(ui.ctx()) {
         return false;
     }
@@ -470,4 +482,51 @@ fn get(get_set_value: &mut GetSetValue<'_>) -> f64 {
 
 fn set(get_set_value: &mut GetSetValue<'_>, value: f64) {
     (get_set_value)(Some(value));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Event, MouseWheelUnit, Pos2, RawInput, Rect, TouchPhase, Vec2};
+
+    /// One headless pass that draws a `0..=10` slider over `value`, `enabled` or not, and
+    /// returns its rect and whether it reported a change.
+    fn pass(ctx: &egui::Context, value: &mut i32, enabled: bool, events: Vec<Event>) -> (Rect, bool) {
+        let input = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+            events,
+            ..RawInput::default()
+        };
+        let mut out = (Rect::NOTHING, false);
+        ctx.run_ui(input, |ui| {
+            let response = ui.add_enabled(enabled, WheelSlider::new(value, 0..=10));
+            out = (response.rect, response.changed());
+        })
+        .drop_without_applying_deltas();
+        out
+    }
+
+    /// Hovers the slider (hit-testing reads the previous pass), then sends one wheel notch.
+    fn wheel_once(enabled: bool) -> (i32, bool) {
+        let ctx = egui::Context::default();
+        let mut value = 5;
+        let (rect, _) = pass(&ctx, &mut value, enabled, Vec::new());
+        pass(&ctx, &mut value, enabled, vec![Event::PointerMoved(rect.center())]);
+        pass(&ctx, &mut value, enabled, Vec::new());
+        let wheel = Event::MouseWheel { unit: MouseWheelUnit::Line, delta: Vec2::new(0.0, 1.0), phase: TouchPhase::Move, modifiers: egui::Modifiers::NONE };
+        let (_, changed) = pass(&ctx, &mut value, enabled, vec![wheel]);
+        (value, changed)
+    }
+
+    #[test]
+    fn wheel_steps_an_enabled_slider() {
+        let (value, changed) = wheel_once(true);
+        assert_ne!(value, 5, "the notch must move an enabled slider (proves the pass reaches the wheel path)");
+        assert!(changed);
+    }
+
+    #[test]
+    fn wheel_leaves_a_disabled_slider_alone() {
+        assert_eq!(wheel_once(false), (5, false), "a disabled slider neither changes nor reports a change");
+    }
 }

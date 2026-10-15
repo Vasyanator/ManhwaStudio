@@ -3,7 +3,6 @@ FILE OVERVIEW: src/tabs/settings/general.rs
 Thin studio wrapper for the General settings pane.
 
 Main responsibilities:
-- Enforce the studio-only vertical typing-panel layout (persisted off the GUI thread).
 - Delegate the projects-directory editor and the global memory-profile combo to the
   shared `crate::general_settings_panel` widget (the same widget the launcher renders),
   then apply the studio-only runtime effect (memory profile -> `MemoryManager`) from the
@@ -13,48 +12,18 @@ Key functions:
 - `SettingsTabState::draw_general`
 
 Notes:
-- The projects-dir save and memory-profile persistence are handled synchronously inside
-  the shared widget; only the typing-panel-layout write is offloaded here.
+- The projects-dir save and memory-profile persistence are handled inside the shared widget.
 - The shared General section is rendered through `SharedSettingsPanels::draw` (owned by
   `SettingsTabState`), not by calling the widget directly, so the studio embeds one
   shared-panel container.
 */
 
-use super::{SettingsSectionId, SettingsSurface, SettingsTabState, save_typing_panel_layout};
-use crate::runtime_log;
-use crate::tabs::typing::TypingPanelLayout;
-use ms_thread as thread;
+use super::{SettingsSectionId, SettingsSurface, SettingsTabState};
 
 impl SettingsTabState {
     pub(super) fn draw_general(&mut self, ui: &mut egui::Ui) {
         ui.heading(t!("settings.general.heading"));
 
-        // Studio-only: the "Текст" tab panel is locked to the vertical layout. The
-        // launcher has no typing tab, so this enforcement stays in the studio wrapper
-        // rather than the shared widget. Persist off the GUI thread when it changes.
-        if self.typing_panel_layout != TypingPanelLayout::Vertical {
-            self.typing_panel_layout = TypingPanelLayout::Vertical;
-            let path = self.user_settings_file.clone();
-            if let Err(err) = thread::Builder::new()
-                .name("settings-typing-layout-save".to_string())
-                .spawn(move || {
-                    if let Err(err) = save_typing_panel_layout(&path, TypingPanelLayout::Vertical) {
-                        runtime_log::log_error(format!(
-                            "[settings] failed to persist typing panel layout to {}; error={err}",
-                            path.display()
-                        ));
-                    }
-                })
-            {
-                runtime_log::log_error(format!(
-                    "[settings] failed to start typing panel layout save thread; error={err}"
-                ));
-            }
-        }
-        ui.label(t!("settings.general.typing_panel_vertical_only_hint"));
-
-        ui.add_space(10.0);
-        ui.separator();
         ui.add_space(8.0);
 
         // Shared section: projects directory + memory profile + languages (identical to

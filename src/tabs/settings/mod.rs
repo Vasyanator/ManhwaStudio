@@ -9,7 +9,9 @@ Main types:
   memory profile binding to `MemoryManager`.
 - `SettingsTabSeed` / `SpellcheckWordsSeed`: the tab's construction-time and binding-time
   disk reads, done by `read_blocking` on a worker (the studio's open worker) so
-  `SettingsTabState::from_seed` and `set_canvas_settings_binding` perform no I/O.
+  `SettingsTabState::from_seed` and `set_canvas_settings_binding` perform no I/O. A later
+  dictionary change (words revision bump) re-reads `SpellcheckWordsSeed` on a short-lived
+  worker (`SpellcheckWordsReload`, polled by `refresh_spellcheck_words_if_needed`).
 
 Section identity is the cross-surface `crate::settings_shared::SettingsSectionId`; the
 tab bar and studio section order come from `settings_shared::sections_for(Studio)` and
@@ -48,7 +50,6 @@ use crate::runtime_log;
 use crate::settings_shared::{
     SettingsDeepLink, SettingsSectionId, SettingsSurface, SharedSettingsPanels,
 };
-use crate::tabs::typing::TypingPanelLayout;
 use crate::widgets::{
     current_spellcheck_words_revision, load_custom_spellcheck_words, load_project_spellcheck_words,
     save_custom_spellcheck_words, save_project_spellcheck_words,
@@ -66,8 +67,6 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::{Duration, Instant};
-
-pub(super) const GENERAL_TYPING_PANEL_LAYOUT_KEY: &str = "typing_panel_layout";
 
 #[derive(Debug, Clone)]
 pub(super) struct DraggedBubbleConditionNode {
@@ -154,7 +153,6 @@ pub struct SettingsTabState {
     /// set here; launcher-only ids are unreachable.
     active_pane: SettingsSectionId,
     user_settings_file: PathBuf,
-    typing_panel_layout: TypingPanelLayout,
     memory_manager: Arc<MemoryManager>,
     /// Container owning the three cross-surface "double-interface" panel states
     /// (General / AiBackend / Tutorials), the same states the launcher settings page
@@ -178,6 +176,9 @@ pub struct SettingsTabState {
     /// (`None`: a write failed, re-send at the next save).
     project_spellcheck_words_synced: Option<String>,
     spellcheck_words_revision_seen: u64,
+    /// The running background re-read of both word lists, started by
+    /// `refresh_spellcheck_words_if_needed` when the words revision moved; `None` when idle.
+    spellcheck_words_reload: Option<SpellcheckWordsReload>,
     ai_backend_handle: AiBackendHandle,
     dragged_bubble_condition_node: Option<DraggedBubbleConditionNode>,
     /// The Settings › Hotkeys pane (`hotkeys/`): search, capture chips, the override writer.
@@ -230,8 +231,6 @@ impl Default for SettingsTabState {
 pub struct SettingsTabSeed {
     /// `user_config.json` path the tab writes its settings back to.
     user_settings_file: PathBuf,
-    /// `General.typing_panel_layout`.
-    typing_panel_layout: TypingPanelLayout,
     /// The font-settings lists' name-display switches (`TextTab.font_list_name_mode_*`).
     font_name_display_modes: FontNameDisplayModes,
     /// The cross-surface panels, seeded from `user_config.json` (and the locale folder scan)
@@ -240,21 +239,19 @@ pub struct SettingsTabSeed {
 }
 
 impl SettingsTabSeed {
-    /// Reads the seed: the typing panel layout, the font-list name modes and the shared panels'
+    /// Reads the seed: the font-list name modes and the shared panels'
     /// startup state. Blocking document reads; never on the GUI thread of a running window.
     #[must_use]
     pub fn read_blocking() -> Self {
         let user_settings_file = config::user_config_path();
-        let typing_panel_layout = load_typing_panel_layout(&user_settings_file);
-        // Interface preference of the font-settings lists; read here (once, like the panel
-        // layout above) so the widget itself performs no I/O and still knows where to write a
-        // change back to.
+        // Interface preference of the font-settings lists; read here (once) so the widget
+        // itself performs no I/O and still knows where to write a change back to.
         let font_name_display_modes = load_font_name_display_modes(&user_settings_file);
         let shared = SharedSettingsPanels::new(
             #[cfg(feature = "tutorial")]
             crate::tutorial::shared_progress(),
         );
-        Self { user_settings_file, typing_panel_layout, font_name_display_modes, shared }
+        Self { user_settings_file, font_name_display_modes, shared }
     }
 }
 
@@ -306,7 +303,7 @@ impl SettingsTabState {
     /// Builds the tab from an already read `seed`: no file or document I/O. Applies the seeded
     /// memory profile to `memory_manager`.
     pub fn from_seed(seed: SettingsTabSeed, ai_backend_handle: AiBackendHandle, memory_manager: Arc<MemoryManager>) -> Self {
-        let SettingsTabSeed { user_settings_file, typing_panel_layout, font_name_display_modes, shared } = seed;
+        let SettingsTabSeed { user_settings_file, font_name_display_modes, shared } = seed;
         let font_settings_file = user_settings_file.clone();
         let hotkeys = hotkeys::HotkeysPane::new(user_settings_file.clone());
         // Seed the runtime memory profile from the shared general panel (loaded from
@@ -318,7 +315,6 @@ impl SettingsTabState {
         Self {
             active_pane: SettingsSectionId::General,
             user_settings_file,
-            typing_panel_layout,
             memory_manager,
             shared,
             hanging_punctuation_input: hanging_punctuation.clone(),
@@ -333,6 +329,7 @@ impl SettingsTabState {
             spellcheck_custom_words_synced: Some(String::new()),
             project_spellcheck_words_synced: Some(String::new()),
             spellcheck_words_revision_seen: current_spellcheck_words_revision(),
+            spellcheck_words_reload: None,
             ai_backend_handle,
             dragged_bubble_condition_node: None,
             hotkeys,
@@ -380,26 +377,24 @@ impl SettingsTabState {
         clean_overlays_model: Arc<Mutex<CleanOverlaysModel>>,
         words: SpellcheckWordsSeed,
     ) {
-        if let Some(runtime) = self.canvas_settings_runtime.take() {
-            let _ = runtime.tx.send(None);
-            let _ = runtime.thread.join();
-        }
+        // The previous saver (a re-binding) is told to stop and NOT joined here, on the GUI thread:
+        // the new saver joins it first (`spawn_canvas_settings_save_worker`), so its final save
+        // still lands before any write of the new binding.
+        let predecessor = self.canvas_settings_runtime.take().map(stop_canvas_settings_saver);
 
         self.project_settings_file = project_settings_file.clone();
         self.canvas_settings = initial_canvas_settings;
         set_project_spellcheck_settings_file(Some(project_settings_file.clone()));
-        let SpellcheckWordsSeed { custom, project, revision } = words;
-        self.spellcheck_custom_words = custom;
-        self.project_spellcheck_custom_words = project;
-        self.spellcheck_custom_words_synced = Some(self.spellcheck_custom_words.clone());
-        self.project_spellcheck_words_synced = Some(self.project_spellcheck_custom_words.clone());
-        self.spellcheck_words_revision_seen = revision;
+        // A re-read still running was asked for the previous binding's settings file.
+        self.spellcheck_words_reload = None;
+        self.install_spellcheck_words(words);
         self.bubbles_model = Some(bubbles_model);
         self.clean_overlays_model = Some(clean_overlays_model);
         self.apply_memory_profile_to_runtime(self.shared.memory_profile());
         self.canvas_settings_runtime = Some(spawn_canvas_settings_save_worker(
             self.user_settings_file.clone(),
             project_settings_file,
+            predecessor,
         ));
     }
 
@@ -572,52 +567,127 @@ impl SettingsTabState {
         }
     }
 
+    /// Installs both word lists of `words` as the editor's text and as what it last loaded
+    /// (nothing to re-send), and records the revision they were read at. No I/O.
+    fn install_spellcheck_words(&mut self, words: SpellcheckWordsSeed) {
+        let SpellcheckWordsSeed { custom, project, revision } = words;
+        self.spellcheck_custom_words = custom;
+        self.project_spellcheck_custom_words = project;
+        self.spellcheck_custom_words_synced = Some(self.spellcheck_custom_words.clone());
+        self.project_spellcheck_words_synced = Some(self.project_spellcheck_custom_words.clone());
+        self.spellcheck_words_revision_seen = revision;
+    }
+
+    /// Keeps the canvas pane's word lists in step with the disk when another writer (the
+    /// spellcheck context menu's worker) bumped the words revision: installs a finished
+    /// background re-read, or starts one ([`SpellcheckWordsSeed::read_blocking`] on a worker)
+    /// when the revision moved past the last one read. GUI thread, no I/O; the pane's periodic
+    /// repaint picks the answer up. A re-read is installed whole, exactly like the synchronous
+    /// reload it replaces; the revision it carries was taken before its reads, so a list written
+    /// meanwhile triggers the next re-read.
     fn refresh_spellcheck_words_if_needed(&mut self) {
+        if let Some(reload) = self.spellcheck_words_reload.as_ref() {
+            match reload.rx.try_recv() {
+                Ok(words) => {
+                    self.spellcheck_words_reload = None;
+                    self.install_spellcheck_words(words);
+                }
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // The worker died without answering. Treat its revision as seen so a reader
+                    // that keeps failing is not respawned every frame; the next bump retries.
+                    let revision = reload.revision;
+                    self.spellcheck_words_reload = None;
+                    self.spellcheck_words_revision_seen = revision;
+                    runtime_log::log_error(format!(
+                        "[settings] the spellcheck word-list reader ended without an answer; the lists shown may be stale until the next dictionary change.\nRevision: {revision}"
+                    ));
+                    return;
+                }
+            }
+        }
         let current_revision = current_spellcheck_words_revision();
         if current_revision == self.spellcheck_words_revision_seen {
             return;
         }
-
-        self.spellcheck_custom_words = load_custom_spellcheck_words().unwrap_or_else(|err| {
-            runtime_log::log_warn(format!(
-                "[settings] failed to refresh custom spellcheck dictionary: {err}"
-            ));
-            String::new()
+        let (tx, rx) = mpsc::channel::<SpellcheckWordsSeed>();
+        let project_settings_file = self.project_settings_file.clone();
+        let spawned = thread::Builder::new().name("settings-spellcheck-words-read".to_owned()).spawn(move || {
+            // A closed receiver only means the tab or its binding is gone; nothing waits for it.
+            if tx.send(SpellcheckWordsSeed::read_blocking(&project_settings_file)).is_err() {
+                runtime_log::log_info("[settings] spellcheck word-list re-read finished after its tab moved on; discarded");
+            }
         });
-        self.project_spellcheck_custom_words =
-            load_project_spellcheck_words(&self.project_settings_file).unwrap_or_else(|err| {
-                runtime_log::log_warn(format!(
-                    "[settings] failed to refresh project spellcheck words '{}': {err}",
-                    self.project_settings_file.display()
+        match spawned {
+            // Detached: it answers only through `rx` and ends right after.
+            Ok(_detached) => self.spellcheck_words_reload = Some(SpellcheckWordsReload { rx, revision: current_revision }),
+            Err(err) => {
+                // Not retried every frame: the next dictionary change tries again.
+                self.spellcheck_words_revision_seen = current_revision;
+                runtime_log::log_error(format!(
+                    "[settings] could not start the spellcheck word-list reader thread; the lists shown may be stale until the next dictionary change. Possible cause: the OS thread limit or low memory.\nError: {err}"
                 ));
-                String::new()
-            });
-        self.spellcheck_custom_words_synced = Some(self.spellcheck_custom_words.clone());
-        self.project_spellcheck_words_synced = Some(self.project_spellcheck_custom_words.clone());
-        self.spellcheck_words_revision_seen = current_revision;
+            }
+        }
     }
 }
 
+/// A background re-read of both spellcheck word lists (see
+/// `SettingsTabState::refresh_spellcheck_words_if_needed`).
+#[derive(Debug)]
+struct SpellcheckWordsReload {
+    /// The worker's single answer.
+    rx: Receiver<SpellcheckWordsSeed>,
+    /// The words revision that triggered the read.
+    revision: u64,
+}
+
 impl Drop for SettingsTabState {
+    /// Stops the canvas-settings saver and waits for its final coalesced save. The tab is owned by
+    /// `StudioApp`, which is dropped on the shell's teardown worker (`src/shell/closing.rs`), so
+    /// this join does not run on the GUI thread.
     fn drop(&mut self) {
         set_project_spellcheck_settings_file(None);
         if let Some(runtime) = self.canvas_settings_runtime.take() {
-            let _ = runtime.tx.send(None);
-            let _ = runtime.thread.join();
+            join_canvas_settings_saver(stop_canvas_settings_saver(runtime));
         }
+    }
+}
+
+/// Tells a canvas-settings saver to stop after the requests already queued (its loop saves them
+/// first, see `run_canvas_settings_saver`) and returns its thread handle for the caller to join
+/// off the GUI thread. A saver that is already gone is logged; its handle is still returned.
+fn stop_canvas_settings_saver(runtime: CanvasSettingsRuntime) -> JoinHandle<()> {
+    if runtime.tx.send(None).is_err() {
+        runtime_log::log_warn("[settings] the canvas settings saver had already stopped before its stop signal; a save queued since may not have been written");
+    }
+    runtime.thread
+}
+
+/// Joins a stopped canvas-settings saver (blocking: worker threads only), logging a saver that
+/// panicked (its last save may be missing).
+fn join_canvas_settings_saver(thread: JoinHandle<()>) {
+    if thread.join().is_err() {
+        runtime_log::log_error("[settings] the canvas settings saver thread panicked; its last canvas settings save may be missing");
     }
 }
 
 /// Spawns the settings saver thread: it persists each (coalesced) canvas-settings request
 /// to the project and user config and writes the word lists a request carries, reporting a
 /// failed word-list write on `word_failures` so the GUI retries it with the next save.
+/// `predecessor` is a previous binding's saver, already told to stop: the new thread joins it
+/// before its first save, so the old binding's final write never lands after a newer one.
 fn spawn_canvas_settings_save_worker(
     user_settings_file: PathBuf,
     project_settings_file: PathBuf,
+    predecessor: Option<JoinHandle<()>>,
 ) -> CanvasSettingsRuntime {
     let (tx, rx) = mpsc::channel::<Option<CanvasSettingsSaveRequest>>();
     let (failure_tx, word_failures) = mpsc::channel::<WordListSaveFailure>();
     let thread = thread::spawn(move || {
+        if let Some(previous) = predecessor {
+            join_canvas_settings_saver(previous);
+        }
         let report_failure = |list: WordList, words: &str| {
             // A closed receiver only means the settings tab is gone; nobody is left to retry.
             if failure_tx.send(WordListSaveFailure { list, words: words.to_owned() }).is_err() {
@@ -749,8 +819,8 @@ fn read_user_config_root_or_none(user_settings_file: &Path) -> Option<Value> {
 /// (`TextTab.font_list_name_mode_folder` / `…_imported` / `…_group`).
 ///
 /// A missing file, unparsable JSON, an absent key or an unrecognized token all yield
-/// [`FontNameDisplayMode::Custom`] for that surface — the historical behavior. Like
-/// [`load_typing_panel_layout`] this performs one blocking read, so call it at construction
+/// [`FontNameDisplayMode::Custom`] for that surface — the historical behavior. It performs one
+/// blocking read, so call it at construction
 /// time or off the GUI thread, never per frame.
 #[must_use]
 pub(super) fn load_font_name_display_modes(user_settings_file: &Path) -> FontNameDisplayModes {
@@ -787,34 +857,6 @@ pub(super) fn save_font_name_display_mode(
     mode: FontNameDisplayMode,
 ) -> Result<(), String> {
     upsert_user_config_string(user_settings_file, "TextTab", list.config_key(), mode.as_config_str())
-}
-
-/// Reads the typing panel layout (`General.typing_panel_layout`) from `user_config.json`.
-/// A missing/malformed document, absent key or unknown token yields
-/// [`TypingPanelLayout::Vertical`]. One blocking read — never call it per frame.
-pub(super) fn load_typing_panel_layout(user_settings_file: &Path) -> TypingPanelLayout {
-    let Some(payload) = read_user_config_root_or_none(user_settings_file) else {
-        return TypingPanelLayout::Vertical;
-    };
-    payload
-        .get("General")
-        .and_then(Value::as_object)
-        .and_then(|general| general.get(GENERAL_TYPING_PANEL_LAYOUT_KEY))
-        .and_then(Value::as_str)
-        .and_then(TypingPanelLayout::from_config_str)
-        .unwrap_or(TypingPanelLayout::Vertical)
-}
-
-/// Persists the typing panel layout to `General.typing_panel_layout` in `user_config.json`
-/// (one serialized read-modify-write, other keys preserved). Worker thread only.
-///
-/// # Errors
-/// A user-facing error string; a malformed file is reported and left untouched.
-pub(super) fn save_typing_panel_layout(
-    user_settings_file: &Path,
-    layout: TypingPanelLayout,
-) -> Result<(), String> {
-    upsert_user_config_string(user_settings_file, "General", GENERAL_TYPING_PANEL_LAYOUT_KEY, layout.as_config_str())
 }
 
 /// Persists the rotation Ctrl+wheel mode to `TextTab.rotation_ctrl_wheel_mode` in
@@ -997,22 +1039,6 @@ mod section_writer_tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn typing_panel_layout_round_trips_and_preserves_other_keys() {
-        let temp = tempfile::tempdir().expect("temp dir");
-        let path = temp.path().join("user_config.json");
-        fs::write(&path, r#"{"General":{"ui_language":"ru"},"TextTab":{"x":1}}"#).expect("write seed config");
-
-        save_typing_panel_layout(&path, TypingPanelLayout::Vertical).expect("save layout");
-        assert_eq!(load_typing_panel_layout(&path), TypingPanelLayout::Vertical);
-
-        let raw = fs::read_to_string(&path).expect("config written");
-        let root: Value = serde_json::from_str(&raw).expect("valid json");
-        assert_eq!(root["General"]["ui_language"], Value::String("ru".to_string()));
-        assert_eq!(root["General"][GENERAL_TYPING_PANEL_LAYOUT_KEY], Value::String(TypingPanelLayout::Vertical.as_config_str().to_string()));
-        assert_eq!(root["TextTab"]["x"], Value::from(1));
-    }
-
     /// Declared behavior change: these writers used to degrade an unparsable file to `{}` and
     /// write it back, destroying every other setting. Now the error is reported and the file
     /// is left byte-for-byte unchanged.
@@ -1023,13 +1049,12 @@ mod section_writer_tests {
         let malformed = r#"{"General":{"ui_language":"ru"},"TextTab":{"#;
         fs::write(&path, malformed).expect("write malformed config");
 
-        save_typing_panel_layout(&path, TypingPanelLayout::Vertical).expect_err("layout writer must not overwrite");
         save_rotation_ctrl_wheel_mode(&path, crate::tabs::typing::rotation_ctrl_wheel::RotationCtrlWheelMode::Raster)
             .expect_err("rotation writer must not overwrite");
         save_font_name_display_mode(&path, FontListKind::Folder, FontNameDisplayMode::Identity).expect_err("name-mode writer must not overwrite");
         assert_eq!(fs::read_to_string(&path).expect("file still present"), malformed);
         // Readers fall back to their defaults.
-        assert_eq!(load_typing_panel_layout(&path), TypingPanelLayout::Vertical);
+        assert_eq!(load_font_name_display_modes(&path), FontNameDisplayModes::default());
     }
 }
 

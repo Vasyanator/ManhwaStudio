@@ -48,7 +48,9 @@ Main responsibilities:
   `DeepCapturePageShape` parsing tolerates junk counters and its signature changes only
   with content, the DOM-order parser accepts both the `{items, shape}` payload and a bare
   list, and the stop summary / per-source breakdown / call and stage tables format as
-  documented.
+  documented;
+- `_debug_log` / `_warn_log` write each line exactly once: through `LOG` when hosted
+  in-process, as a stdout JSON `log` event in the `--daemon` fallback.
 
 Notes:
 Fake pages record `evaluate`/`bring_to_front` and never touch a real browser. `_valid_pages`
@@ -62,6 +64,9 @@ plain `python3` invocation.
 
 from __future__ import annotations
 
+import io
+import json
+import logging
 import random
 import shutil
 import sys
@@ -76,6 +81,8 @@ from typing import Any, Callable, Iterator, Optional
 
 from PIL import Image
 
+import modules.new_project.adv_fetch_cloak_cli as cloak_module
+import modules.new_project.common as common_module
 from modules.new_project.adv_fetch_cloak_cli import (
     DEEP_CAPTURE_MAX_ENTRY_ALTERNATES,
     CloakFetchDaemon,
@@ -1619,6 +1626,59 @@ def test_drain_stage_table_shows_time_and_contribution() -> None:
     assert _format_deep_drain_stages([]) == "-"
 
 
+class _LogRecorder(logging.Handler):
+    """Collects `(levelno, message)` of every record `cloak_module.LOG` emits."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[tuple[int, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append((record.levelno, record.getMessage()))
+
+
+def _capture_diagnostics(daemon_mode: bool) -> tuple[list[tuple[int, str]], str]:
+    """Run one `_debug_log` and one `_warn_log`; return the log records and stdout text."""
+    recorder = _LogRecorder()
+    logger = cloak_module.LOG
+    previous_level = logger.level
+    previous_mode = common_module._daemon_stdout_log
+    previous_stdout = sys.stdout
+    stdout = io.StringIO()
+    logger.addHandler(recorder)
+    logger.setLevel(logging.DEBUG)
+    common_module._daemon_stdout_log = daemon_mode
+    sys.stdout = stdout
+    try:
+        cloak_module._debug_log("cloak deep drain: %d new", 3)
+        cloak_module._warn_log("cloak deep stall: %s", "idle")
+    finally:
+        sys.stdout = previous_stdout
+        common_module._daemon_stdout_log = previous_mode
+        logger.removeHandler(recorder)
+        logger.setLevel(previous_level)
+    return recorder.records, stdout.getvalue()
+
+
+def test_in_process_diagnostics_go_through_the_logger_only() -> None:
+    records, stdout = _capture_diagnostics(daemon_mode=False)
+    assert records == [
+        (logging.INFO, "cloak deep drain: 3 new"),
+        (logging.WARNING, "cloak deep stall: idle"),
+    ]
+    assert stdout == ""
+
+
+def test_daemon_diagnostics_go_to_stdout_json_only() -> None:
+    records, stdout = _capture_diagnostics(daemon_mode=True)
+    assert records == []
+    events = [json.loads(line) for line in stdout.splitlines()]
+    assert events == [
+        {"event": "log", "level": "info", "message": "cloak deep drain: 3 new"},
+        {"event": "log", "level": "warn", "message": "cloak deep stall: idle"},
+    ]
+
+
 if __name__ == "__main__":
     test_picks_newest_activation_regardless_of_order()
     test_visibility_breaks_timestamp_tie()
@@ -1686,4 +1746,6 @@ if __name__ == "__main__":
     test_call_stats_are_rendered_slowest_first_and_capped()
     test_call_stat_record_aggregates()
     test_drain_stage_table_shows_time_and_contribution()
+    test_in_process_diagnostics_go_through_the_logger_only()
+    test_daemon_diagnostics_go_to_stdout_json_only()
     print("all active-tab resolution, deep-capture ordering and diagnostics tests passed")

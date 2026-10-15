@@ -177,8 +177,9 @@ handler reports `Interrupted`.
   way. Same shape in all five inpaint services.
 - **The lease is taken before `self._lock`, never inside it.** `begin_model_use` can block while
   another thread's eviction callback waits for this service's lock; the reverse order deadlocks.
-- The device comes from `General.ai_device` through the module-local
-  `_resolve_selected_backend_device()` (`not-selected` resolves to a runtime default). Unlike
+- The device comes from `General.ai_device` through the module-level binding
+  `_resolve_selected_backend_device()` of `runtime.torch_device.resolve_selected_backend_device`
+  (`mps_last_resort=True`; `not-selected` resolves to a runtime default). Unlike
   `flux_fill.py` this domain does **not** pin itself to a discrete GPU: the networks are small and
   must stay usable on CPU.
 - Weight moves use `runtime.rocm_mmap_transfer.move_module_to` (Form 1). The download always

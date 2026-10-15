@@ -39,6 +39,13 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   on-disk `user_config.json`/`.db` via the root `docstore.py`); automatic fallbacks and the
   model-limit normalization at startup are best-effort (logged, never abort a query) and the
   limit is written only when the stored value differs.
+- `torch_device.py`: the one owner of `General.ai_device` -> concrete Torch device resolution
+  (`resolve_selected_backend_device`, with `read_configured_device`, `normalize_backend_device`,
+  `safe_available_devices`) and of the allocator-cache release after a model drop
+  (`clear_torch_cache`). Each Torch service binds them once at module level under the private names
+  `_resolve_selected_backend_device` / `_clear_torch_cache` (the names the tests patch), with its
+  policy as the binding's arguments. `test_torch_device.py` covers the resolution order, both
+  device policies and the cache release.
 - `rocm_runtime.py`: `configure_rocm_runtime()` — MIOpen tuning and the allocator override, applied
   once at backend startup. It is also what tells `error_text` whether this process is on ROCm.
 - `error_text.py`: `sanitize_torch_error()` — strips Torch's `expandable_segments:True` out-of-memory
@@ -84,6 +91,13 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   - A DirectML selection with no configured device id is reported through `device.get` as needing
     manual confirmation (`_device_needs_manual_selection`) and must not be persisted until the user
     picks an adapter.
+- **Torch device resolution and the cache release have one owner, `torch_device.py`.** A service
+  never re-implements them; it states its policy at its binding: `accept_mps=False` (the service
+  does not run on MPS: EasyOCR, ComicTextDetector), `mps_last_resort=True` (prefer an available
+  `mps` over `cpu` when nothing else matches: LaMa, LaMa MPE, AOT, SDXL, watermark),
+  `include_mps=False` in `clear_torch_cache` (release only the CUDA cache: FLUX.1-Fill, FLUX.2
+  klein, watermark). Resolution never raises (a failing probe counts as CPU only); a failing cache
+  release is logged at WARNING with the service name, never raised.
 - Torch and ONNX model roots are separate trees (`ManhwaStudio_AI_Models/Torch` vs `.../ONNX`);
   device selection here is per-runtime for that reason and the two selections never alias.
 - **`health()` never takes a service's work lock.** A service's instance lock is held across a
@@ -178,6 +192,9 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - To place a new on-demand side model, use `side_models_root() / "<dir>"` and add its consumer to
   `test_paths.py`.
 - To change device selection, sentinel handling, or device-name probing, edit `device_service.py`.
+- To change how a Torch service turns `General.ai_device` into a device, or how it releases the
+  allocator cache, edit `torch_device.py` and `test_torch_device.py`; a per-service difference is a
+  keyword argument of the owner, never a local copy.
 - To change the resident-model cap or eviction policy, edit `model_manager.py`.
 - To add a health field to a service, publish it from that service's `_publish_health_locked()`
   (never read guarded state in `health()`); a new or changed field is an IPC contract change.

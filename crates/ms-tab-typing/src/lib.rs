@@ -60,7 +60,7 @@ pub use ms_text_render as render_next;
 pub use ms_text_util::segmentation;
 mod tab;
 
-pub use panel::{TypingPanelLayout, TypingTopPanelState};
+pub use panel::TypingTopPanelState;
 // The panels' `user_config.json` seed, read off the GUI thread for `TypingTabState::from_seed`.
 pub use panel::TypingPanelSeed;
 // Editor widget for per-effect-kind default parameters, rendered by the settings pane.

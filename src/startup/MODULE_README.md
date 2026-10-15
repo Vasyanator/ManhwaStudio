@@ -29,8 +29,9 @@ holds no state between calls: process-global services it starts (AI backend supe
 - `mod.rs`: `run_native` (parse -> decide -> match), `init_minimal` (the process-wide side
   effects every non-helper mode needs), `run_main` (update preludes, test launcher, main
   window), `HOST_VERSION` (the `ms_installer::HostVersion` pair
-  this package hands to the installer and IPC crates), `launcher_host`, the session-log init
-  functions.
+  this package hands to the installer and IPC crates), `launcher_host`, the ONE session-log
+  init (`init_startup_logging_best_effort`, called once before the mode split; no later window
+  re-opens the log).
 - `services.rs`: `init_full`, the ONE owner of the startup-order contract (its doc comment lists
   rules (a)-(f)), returning `ProcessServices` (user-settings snapshot, `LocalAiAvailability`,
   `LauncherHost`); `ProcessServices::start_ai_backend_supervisor`, the one construction of the
@@ -125,7 +126,9 @@ the prefix their mode needs, see "Run modes"):
    window in test mode).
 9. AI backend supervisor (`ProcessServices::start_ai_backend_supervisor`: the process's
    `LocalAiAvailability`; autostart waits for storage conversions) -> cold-start delivered images (`shell::incoming::cold_start_target`) ->
-   `resolve_start` -> `shell::run` -> the launcher-requested update window, if any.
+   `resolve_start` -> `shell::run` -> bounded wait for queued background `user_config` writes
+   (`ms_settings_ui::pending_config_writes`; no window is open any more) -> the
+   launcher-requested update window, if any.
 
 Precondition outside this module: on Android the working directory is the runtime root before
 the first `ms_config` call of the process (`android_entry.rs::start` -> `enter_runtime_root`,
@@ -151,9 +154,8 @@ calls that persist that migration, which the later snapshot (and the `secondary_
 then reads. Reading the snapshot would also move them after the locale reconcile.
 
 **One supervisor construction, two call sites.** The test launcher and the main window each
-start the supervisor where they did before (`start_ai_backend_supervisor`): inside `init_full`
-it would run before the update windows, and hoisting it above the mode split would move it
-before the test launcher's `init_runtime_logging`.
+start the supervisor where they did before (`start_ai_backend_supervisor`): inside `init_full`,
+or hoisted above the test-launcher / main split, it would run before the update windows.
 
 A pending storage reconciliation (user_config still in the other format than its recorded mode)
 is started on a worker whenever the main window enters the launcher, or — on a direct `--project`

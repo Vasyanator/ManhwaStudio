@@ -26,7 +26,10 @@ UI specifics:
   inside a collapsible "service, key and instruction" section (the shared
   `panels::section_header_button`, open state `ai_api_connection_open`, collapsed
   by default and not persisted, like the MT panel's connection section), wrapped
-  in the OCR panel's own height-capped `ScrollArea` and 300 px width.
+  in the OCR panel's own height-capped `ScrollArea` and 300 px width. Before it is drawn an
+  untouched default system instruction is re-worded for the OCR input language
+  (`OcrPanelOptions::sync_default_ai_api_instruction`, `OcrPanelModelView::source_lang`; the
+  rule is `ocr::is_default_ai_api_ocr_instruction`); a user-edited one is kept.
 - The shared `ms_ai_api::draw_generation_status` widget (live phase, received
   characters, "Stop" -> `OcrPanelActions::stop_generation`) sits right before the
   "Статус:" block, outside the engine options, whenever an AI API request is in flight.
@@ -53,8 +56,8 @@ UI specifics:
 
 use crate::model_download_status::draw_model_download_status;
 use crate::ocr::{
-    CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult, easyocr_lang_error_message, easyocr_selection,
-    external_model_specs,
+    CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult, default_ai_api_ocr_instruction,
+    easyocr_lang_error_message, easyocr_selection, external_model_specs, is_default_ai_api_ocr_instruction,
 };
 use crate::ocr_model_download::{OcrModelPanelSnapshot, bundle_key};
 use crate::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download, load_blocked_reason};
@@ -169,7 +172,9 @@ impl Default for OcrPanelOptions {
             surya_drop_repeated_text: false,
             surya_max_sliding_window: 0,
             surya_max_tokens: 0,
-            ai_api: AiApiConnectionState::new("You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /"),
+            // Language-less until the first draw syncs it to the OCR input language
+            // (`sync_default_ai_api_instruction`); requests resolve it themselves.
+            ai_api: AiApiConnectionState::new(default_ai_api_ocr_instruction("auto")),
             ai_api_connection_open: false,
             join_newlines: true,
             reflect_strings: false,
@@ -184,6 +189,17 @@ impl Default for OcrPanelOptions {
 }
 
 impl OcrPanelOptions {
+    /// Re-words the AI API system instruction for the OCR input language `source_lang` when it
+    /// is an untouched default (`ocr::is_default_ai_api_ocr_instruction`, the legacy Korean
+    /// text included); a user-edited instruction is left as typed. Display only: requests
+    /// resolve the same rule on their own (`OcrRuntimeOptions::ai_api_source_lang`), so a stale
+    /// shown text never reaches a request.
+    pub fn sync_default_ai_api_instruction(&mut self, source_lang: &str) {
+        if is_default_ai_api_ocr_instruction(&self.ai_api.system_instruction) {
+            self.ai_api.system_instruction = default_ai_api_ocr_instruction(source_lang);
+        }
+    }
+
     /// Builds the runtime substitution rules from the current panel state.
     ///
     /// Returns an empty vector when the master toggle is off. Each enabled UI
@@ -265,6 +281,9 @@ pub struct OcrPanelActions {
 pub struct OcrPanelModelView<'a> {
     /// The MT panel's source language is Korean: Baberu OCR cannot read it.
     pub korean_source: bool,
+    /// The MT panel's source-language code (the OCR input language): an untouched AI API
+    /// default instruction is shown for it (`OcrPanelOptions::sync_default_ai_api_instruction`).
+    pub source_lang: &'a str,
     /// Download snapshot of the external model bundle of the engine selected at the START of
     /// the frame (`ocr::external_model_specs`); `None` for engines without one. It is drawn
     /// only while it still matches the selection after this frame's widgets (`bundle_key`).
@@ -602,7 +621,7 @@ pub fn draw_ocr_panel(
                 }
             }
             OcrEngine::AiApi => {
-                draw_ai_api_options(ui, options, &mut actions);
+                draw_ai_api_options(ui, options, model.source_lang, &mut actions);
             }
         }
     });
@@ -844,10 +863,12 @@ fn draw_char_replacements(
 /// The AI API engine options: a collapsible "service, key and instruction" section holding the
 /// shared connection widget inside the OCR panel's own height-capped scroll area, at most 300 px
 /// wide. While collapsed the widget is not drawn (its first-draw metadata refresh waits for the
-/// first expand, as in the MT panel).
+/// first expand, as in the MT panel). An untouched default instruction is re-worded for
+/// `source_lang` before it is shown.
 fn draw_ai_api_options(
     ui: &mut egui::Ui,
     options: &mut OcrPanelOptions,
+    source_lang: &str,
     actions: &mut OcrPanelActions,
 ) {
     if section_header_button(ui, options.ai_api_connection_open, t!("translation.ocr_panel.service_key_instruction_heading")) {
@@ -856,6 +877,7 @@ fn draw_ai_api_options(
     if !options.ai_api_connection_open {
         return;
     }
+    options.sync_default_ai_api_instruction(source_lang);
     let max_width = ui.available_width().min(300.0);
     let max_height = ai_api_options_max_height(ui);
     egui::ScrollArea::vertical()
@@ -1174,6 +1196,26 @@ mod tests {
         AiRequirement, OcrEngine, OcrPanelOptions, PaddleVlVariant, engine_button_requirement, engine_marker,
         paddle_vl_variant_label, parse_replacement_targets, selected_mode_requirement,
     };
+    use crate::ocr::default_ai_api_ocr_instruction;
+
+    /// An untouched default instruction (the initial one, or the legacy Korean text older
+    /// settings stored) follows the OCR input language; a user edit is never rewritten.
+    #[test]
+    fn default_ai_api_instruction_follows_the_source_language_and_edits_are_kept() {
+        let mut options = OcrPanelOptions::default();
+        options.sync_default_ai_api_instruction("ja");
+        assert_eq!(options.ai_api.system_instruction, default_ai_api_ocr_instruction("ja"));
+        options.sync_default_ai_api_instruction("auto");
+        assert_eq!(options.ai_api.system_instruction, default_ai_api_ocr_instruction("auto"));
+
+        options.ai_api.system_instruction = default_ai_api_ocr_instruction("ko").replace("ko.", "Korean.");
+        options.sync_default_ai_api_instruction("zh-cn");
+        assert_eq!(options.ai_api.system_instruction, default_ai_api_ocr_instruction("zh-cn"));
+
+        options.ai_api.system_instruction = "Only read the speech bubbles.".to_string();
+        options.sync_default_ai_api_instruction("ja");
+        assert_eq!(options.ai_api.system_instruction, "Only read the speech bubbles.");
+    }
 
     #[test]
     fn selected_mode_requirement_is_model_aware() {

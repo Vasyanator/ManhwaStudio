@@ -30,25 +30,16 @@ weights in anonymous memory (see `_preferred_detector_dtype`).
 
 from __future__ import annotations
 
-import gc
+import functools
 import logging
 import threading
 from typing import Any
 
 import numpy as np
 
-try:
-    from ai_device import AIDevice
-except Exception:
-    from modules.ai_device import AIDevice
-
-try:
-    from config import UserConfig
-except Exception:
-    UserConfig = None
-
 from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
+from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from ..engines.surya_checkpoints import point_settings_at, require_local_checkpoint
 from .forward_maps import quantize_probability_maps, validate_tiles
 
@@ -64,25 +55,13 @@ SURYA_INPUT_ALIGN = 4
 SURYA_MAP_STRIDE = 4
 
 
-def _clear_torch_cache() -> None:
-    try:
-        import torch  # type: ignore
-    except Exception:
-        gc.collect()
-        return
+#: `General.ai_device` resolution with this service's device policy (owner:
+#: `runtime.torch_device`); patched by name in the test suite.
+_resolve_selected_backend_device = resolve_selected_backend_device
 
-    gc.collect()
-    try:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    except Exception:
-        pass
-    try:
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-    except Exception:
-        pass
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="Surya detection")
 
 
 class SuryaTextDetectorService:
@@ -280,58 +259,6 @@ def _forward_with_predictor(predictor, tiles: np.ndarray) -> np.ndarray:
     if tuple(heat.shape) != expected:
         raise RuntimeError(f"Surya detector output has shape {tuple(heat.shape)}, expected {expected}.")
     return quantize_probability_maps(heat, engine="surya")
-
-
-def _read_configured_device() -> str | None:
-    config_root = getattr(UserConfig, "config", None)
-    if not isinstance(config_root, dict):
-        return None
-    general = config_root.get("General")
-    if not isinstance(general, dict):
-        return None
-    value = general.get("ai_device")
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip().lower()
-    if normalized == "not-selected":
-        return None
-    return normalized or None
-
-
-def _safe_available_devices() -> set[str]:
-    try:
-        return set(AIDevice.detect_available_devices())
-    except Exception:
-        return {"cpu"}
-
-
-def _normalize_backend_device(raw: str, fallback: str) -> str:
-    normalized = str(raw or "").strip().lower()
-    if normalized == "cpu" or normalized == "cuda" or normalized.startswith("cuda:"):
-        return normalized
-    if normalized == "mps":
-        return normalized
-    return str(fallback or "cpu").strip().lower() or "cpu"
-
-
-def _resolve_selected_backend_device(fallback: str) -> str:
-    fallback_norm = _normalize_backend_device(fallback, "cpu")
-    configured = _read_configured_device()
-    if configured is None:
-        configured = fallback_norm
-
-    normalized = _normalize_backend_device(configured, fallback_norm)
-    available = _safe_available_devices()
-
-    if normalized in available:
-        return normalized
-    if normalized.startswith("cuda") and "cuda" in available:
-        return "cuda"
-    if fallback_norm in available:
-        return fallback_norm
-    if "cuda" in available:
-        return "cuda"
-    return "cpu"
 
 
 def _preferred_detector_dtype(device: str):

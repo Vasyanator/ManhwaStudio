@@ -16,6 +16,12 @@ The service does not reimplement scraping. It instantiates the daemon class of t
 
 - `progress` events are forwarded to the per-request IPC `ProgressEmitter`, so the launcher gets
   live progress frames;
+- `log` events (page console warnings, `pageerror`, canvas diagnostics) go to the Python logger
+  at their own level (`_DAEMON_LOG_LEVELS`; unknown levels at INFO) as `browser <backend>: …`,
+  which is how they reach `last.log` (the backend's output is piped there); they never travel
+  over IPC, so this adds nothing to the wire contract;
+- an `error` event's technical `log_message` is logged at ERROR here, because only its
+  `user_message` becomes the raised error;
 - the single terminal event (`opened` / `result` / `auto_result` / `link_collect_started` /
   `intercept_count` / …) is captured and returned as the IPC response header;
 - an exception out of `_handle_command` propagates, and the dispatcher reports `status:"error"`.

@@ -159,7 +159,7 @@ impl ProjectSession {
                 if let Ok(mut model) = parts.writers.clean_overlays_model().lock() {
                     model.mark_saved_to_project();
                 }
-                self.has_unsaved_changes_cached = false;
+                self.reset_unsaved_after_persist(false);
                 self.save_to_project_status = Some((t!("app.cleanup.cleaned").to_string(), now));
                 runtime_log::log_info("[exit] unsaved cleanup complete");
                 parts.close.finalize(action);

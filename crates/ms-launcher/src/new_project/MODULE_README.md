@@ -11,7 +11,8 @@ UI-facing state lives in `window.rs`. The launcher hosts it in an `ms_widgets::E
 `poll` (every worker; on every pass the window is open, also while covered or collapsed),
 `show_content` (form, ribbon preview, crop/manual-cut UI and the window's own dialogs; only while
 the window is visible) and `show_children` (the batch-processing child `EmbeddedWindow`). On a
-user close the launcher calls `on_window_closed`, which also closes batch processing. Long-running behavior is split into controller
+user close the launcher calls `on_window_closed`, which also closes batch processing and cancels the
+quick download together with its test-chapter check (`cancel_quick_download_slot`). Long-running behavior is split into controller
 modules that expose `begin`/`poll` style APIs over channels: source import, project catalog/save,
 quick download, advanced Selenium download, stitching, waifu2x, clipboard/screen capture, and
 batch processing.
@@ -86,7 +87,8 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   loading, and PNG saving stay off the main thread.
 - Unsupported or unreadable sources must return user-facing errors plus detailed log messages; do
   not add fake pages or placeholder outputs.
-- Imported pages preserve stable natural ordering before ribbon construction.
+- Imported pages preserve stable natural ordering before ribbon construction: `compare_import_names`
+  (all-numeric `X` / `X_Y` stems by number, everything else by `crate::natural_sort::natural_name_cmp`).
 - Source images are decoded from real bytes, not from filename labels.
 - Ribbon pages retain original pixels and crop metadata so crop/restore operations are
   non-destructive.

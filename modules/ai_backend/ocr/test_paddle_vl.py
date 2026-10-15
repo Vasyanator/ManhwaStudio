@@ -16,7 +16,9 @@ Main responsibilities:
   the constraint build and inference, a variant or device switch reports the
   old key unloaded (no phantom resident), a failed same-key reload leaves no
   phantom either;
-- unloading drops the model, the processor and the tokenizer-derived caches.
+- unloading drops the model, the processor and the tokenizer-derived caches;
+- the device fallback is read without the instance lock (the resident / in-flight
+  device, None after an unload or a failed load).
 
 Notes:
 Real weights are not needed: fake `torch`/`transformers` modules and fake
@@ -30,6 +32,7 @@ from __future__ import annotations
 import io
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -437,6 +440,39 @@ class ServiceLeaseTests(unittest.TestCase):
             self._recognize(model_dir=other_dir)
         self.assertEqual(self.manager._entries, {})
         self.assertFalse(self.service.health()["ready"])
+
+    def test_device_fallback_is_read_without_waiting_for_the_instance_lock(self) -> None:
+        fallbacks: list[str] = []
+        resolved = threading.Event()
+
+        def record(fallback: str) -> str:
+            fallbacks.append(fallback)
+            resolved.set()
+            return self.device
+
+        self.device = "cuda:0"
+        self._recognize()
+        with mock.patch.object(service_module, "_resolve_selected_backend_device", record):
+            # A model load in another request holds `_lock`; the resolution must
+            # still run (and see the resident device) before that lock is free.
+            with self.service._lock:
+                worker = threading.Thread(target=self._recognize)
+                worker.start()
+                self.assertTrue(resolved.wait(timeout=10), "device resolution waited for the instance lock")
+            worker.join(timeout=10)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(fallbacks, ["cuda:0"])
+
+    def test_device_fallback_is_cleared_by_unload_and_failed_load(self) -> None:
+        self.device = "cuda:0"
+        self._recognize()
+        self.assertEqual(self.service._read_device_hint(), "cuda:0")
+        self.assertTrue(self.service._unload_model_key("paddlevlocr:official_1_6:cuda:0"))
+        self.assertIsNone(self.service._read_device_hint())
+        self.fail_load = True
+        with self.assertRaises(RuntimeError):
+            self._recognize()
+        self.assertIsNone(self.service._read_device_hint())
 
 
 class UnloadTests(unittest.TestCase):

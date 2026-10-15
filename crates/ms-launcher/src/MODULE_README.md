@@ -45,7 +45,8 @@ the same window to the studio. This crate runs no window of its own.
   spellings case-sensitive GTK globs need), and the pure pick -> `LauncherOutcome::OpenImages`
   mapping. `app.rs` polls it.
 - `natural_sort.rs`: `natural_name_cmp`, the launcher's one natural name order (digit runs by
-  number, case-insensitive otherwise with a case-sensitive tie-break), shared by the PSD import table and the image pick.
+  number, case-insensitive otherwise with a case-sensitive tie-break), shared by the PSD import table,
+  the image pick and the New Project source import; no other natural comparison may exist in the crate.
 - `state.rs`: page enum, shared UI state, typed launcher outcomes, and `LauncherHost` (the
   process facts `lib.rs` / `web_entry.rs` hand in: `--ignore-installed`, version core).
 - `background.rs`: background image plan and decode workers.

@@ -39,7 +39,7 @@ previews. Do not rename or move it.
 
 from __future__ import annotations
 
-import gc
+import functools
 import io
 import threading
 from dataclasses import dataclass
@@ -49,19 +49,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     import numpy as np
 
-try:
-    from ai_device import AIDevice
-except Exception:
-    from modules.ai_device import AIDevice
-
-try:
-    from config import UserConfig
-except Exception:
-    UserConfig = None
-
 from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.rocm_mmap_transfer import patched_module_to
+from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from .lama import LamaInpaintService
 
 MODEL_SUFFIXES = (".safetensors", ".ckpt")
@@ -810,15 +801,6 @@ def _torch():
         ) from exc
 
 
-def _maybe_torch():
-    try:
-        import torch  # type: ignore
-
-        return torch
-    except Exception:
-        return None
-
-
 def _maybe_cv2():
     try:
         import cv2  # type: ignore
@@ -852,72 +834,10 @@ def _clamp_float(value: Any, *, default: float, low: float, high: float) -> floa
     return max(low, min(high, out))
 
 
-def _resolve_selected_backend_device(fallback: str) -> str:
-    fallback_norm = _normalize_backend_device(fallback, "cpu")
-    configured = _read_configured_device()
-    if configured is None:
-        configured = fallback_norm
-    normalized = _normalize_backend_device(configured, fallback_norm)
-    available = _safe_available_devices()
-    if normalized in available:
-        return normalized
-    if normalized.startswith("cuda") and "cuda" in available:
-        return "cuda"
-    if fallback_norm in available:
-        return fallback_norm
-    if "cuda" in available:
-        return "cuda"
-    if "mps" in available:
-        return "mps"
-    return "cpu"
+#: `General.ai_device` resolution with this service's device policy (owner:
+#: `runtime.torch_device`); patched by name in the test suite.
+_resolve_selected_backend_device = functools.partial(resolve_selected_backend_device, mps_last_resort=True)
 
-
-def _read_configured_device() -> str | None:
-    config_root = getattr(UserConfig, "config", None)
-    if not isinstance(config_root, dict):
-        return None
-    general = config_root.get("General")
-    if not isinstance(general, dict):
-        return None
-    value = general.get("ai_device")
-    if not isinstance(value, str):
-        return None
-    value = value.strip().lower()
-    if value == "not-selected":
-        return None
-    return value or None
-
-
-def _safe_available_devices() -> set[str]:
-    try:
-        return set(AIDevice.detect_available_devices())
-    except Exception:
-        return {"cpu"}
-
-
-def _normalize_backend_device(raw: str, fallback: str) -> str:
-    value = str(raw or "").strip().lower()
-    if value in {"cpu", "mps", "cuda"}:
-        return value
-    if value.startswith("cuda:"):
-        return value
-    return str(fallback or "cpu").strip().lower() or "cpu"
-
-
-def _clear_torch_cache() -> None:
-    torch = _maybe_torch()
-    if torch is None:
-        return
-    gc.collect()
-    try:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
-    except Exception:
-        pass
-    try:
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-    except Exception:
-        pass
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="SDXL")

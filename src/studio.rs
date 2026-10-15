@@ -38,7 +38,9 @@ App/frame flow:
 - Persistence busy gates (page op, save, save button, typing export, page manager, veil):
   named predicates over `persistence_activity()` in `studio/busy.rs`.
 - Modal prompts (comic type, AI device selection): `ComicTypePrompt` / `AiDevicePrompt` in
-  `studio/prompts.rs`; a chosen comic type is applied here (`apply_comic_type_preset`).
+  `studio/prompts.rs`; a chosen comic type is written to the project settings on a worker
+  (`start_comic_type_save` -> `ComicTypeSave`, polled by `poll_comic_type_save`) and applied here
+  once that write succeeded (`apply_comic_type_preset`).
 - Close: the close intent (exit dialog, close request, received-images question) is `CloseFlow`
   in `studio/close_flow.rs`; `request_os_close` and the dialogs record a `PendingCloseAction` that
   the window host takes through `take_outputs`; `StudioApp` never sends a root `Close` or `Title`,
@@ -221,6 +223,8 @@ pub struct StudioApp {
     input: InputRouter,
     /// "Pages or ribbon?" prompt of a project without a comic type (`studio/prompts.rs`).
     comic_type_prompt: ComicTypePrompt,
+    /// The prompt's choice while its project-settings write runs on a worker; `None` when idle.
+    comic_type_save: Option<ComicTypeSave>,
     /// AI device selection prompt, opened from the per-frame health snapshot (`studio/prompts.rs`).
     ai_device_prompt: AiDevicePrompt,
     /// Id of the storage-mode reconciliation whose failure notice the user dismissed in the
@@ -458,6 +462,7 @@ impl StudioApp {
             writers,
             input,
             comic_type_prompt: ComicTypePrompt::new(comic_type_prompt_open),
+            comic_type_save: None,
             ai_device_prompt: AiDevicePrompt::default(),
             storage_notice_dismissed_job: None,
             session,
@@ -471,7 +476,7 @@ impl StudioApp {
     /// (`SessionMode::has_unsaved_changes`): a project's changes not yet merged into the project
     /// folder; an image set's edits not yet written to its files, or a write still in flight.
     fn has_unsaved_changes(&self) -> bool {
-        self.session.has_unsaved_changes(&self.writers, &self.tabs.typing, &self.tabs.ps_editor)
+        self.session.has_unsaved_changes(&self.writers, &self.tabs.typing, &self.tabs.ps_editor, self.tabs.translation.canvas(), &self.tabs.cleaning)
     }
 
     /// Whether `tab` exists in this session (`SessionMode::tab_visible`).
@@ -557,12 +562,91 @@ impl StudioApp {
         session.draw_exit_dialog(ctx, kind, title, &mut parts)
     }
 
-    /// Applies the comic type the prompt returned: records it in the project (in memory and in
-    /// its settings file), then applies its canvas preset to the shared canvas settings — the
-    /// `BubblesModel` snapshot, through `SharedCanvasSettings::apply_comic_type_preset`, the one
-    /// preset owner — and pushes the result to `BubblesModel` (every canvas pulls it), to
-    /// `CleanOverlaysModel` (`cache_pages`) and to the Settings tab, in that order. A failed file
-    /// write is shown in the prompt and stops before the pushes. GUI thread; one small file write.
+    /// Starts persisting the comic type the prompt returned: one `comic_type` write into the
+    /// project's settings file on a worker (`Durability::Contents`); [`Self::poll_comic_type_save`]
+    /// applies the choice once the write succeeded. The write holds a `PendingConfigWrite` token,
+    /// so the process exit waits for it even when the studio closed first. A click while a write
+    /// runs is ignored (the prompt stays up until that write ends). A worker the OS refuses is shown in the prompt and
+    /// logged; nothing changes. GUI thread, no I/O.
+    fn start_comic_type_save(&mut self, comic_type: ComicType) {
+        if let Some(running) = self.comic_type_save.as_ref() {
+            runtime_log::log_info(format!(
+                "[app] comic_type='{}' chosen while the save of '{}' still runs; ignored",
+                comic_type.as_config_str(),
+                running.comic_type.as_config_str()
+            ));
+            return;
+        }
+        let settings_file = self.project.paths.settings_file.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        // Counted until the write returned, so a close right after the click (studio teardown,
+        // process exit) still waits for it (`startup` drains these tokens after the window closed).
+        let pending = ms_settings_ui::pending_config_writes::PendingConfigWrite::begin();
+        let spawned = thread::Builder::new().name("comic-type-save".to_owned()).spawn(move || {
+            let result = save_comic_type_to_project_file(&settings_file, comic_type, ms_docstore::Durability::Contents);
+            drop(pending);
+            // A closed receiver only means the studio is gone; the file write itself is complete.
+            if tx.send(result).is_err() {
+                runtime_log::log_info(format!(
+                    "[app] comic_type='{}' save finished after the studio closed",
+                    comic_type.as_config_str()
+                ));
+            }
+        });
+        match spawned {
+            // Detached: it answers only through `rx` and ends right after.
+            Ok(_detached) => self.comic_type_save = Some(ComicTypeSave { comic_type, rx }),
+            Err(err) => {
+                self.comic_type_prompt.fail(t!("app.comic_type.save_error").to_string());
+                runtime_log::log_error(format!(
+                    "[app] failed to persist comic_type='{}': the save thread could not be started: {err}. Possible cause: the OS thread limit or low memory. Nothing was changed.\nSettings file: {}",
+                    comic_type.as_config_str(),
+                    self.project.paths.settings_file.display()
+                ));
+            }
+        }
+    }
+
+    /// Takes the running comic-type write's result: on success applies the choice
+    /// ([`Self::apply_comic_type_preset`], which closes the prompt); on a failed write or a lost
+    /// worker shows the error in the prompt (which stays open for another try) and logs it, with
+    /// the project and the canvas settings unchanged. GUI thread, no I/O.
+    fn poll_comic_type_save(&mut self) {
+        let Some(save) = self.comic_type_save.as_ref() else {
+            return;
+        };
+        let comic_type = save.comic_type;
+        let error = match save.rx.try_recv() {
+            Ok(Ok(())) => {
+                self.comic_type_save = None;
+                self.apply_comic_type_preset(comic_type);
+                return;
+            }
+            Ok(Err(err)) => err,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => "the save thread ended without a result".to_string(),
+        };
+        self.comic_type_save = None;
+        self.comic_type_prompt.fail(t!("app.comic_type.save_error").to_string());
+        runtime_log::log_error(format!(
+            "[app] failed to persist comic_type='{}'; settings_file='{}'; cause={error}",
+            comic_type.as_config_str(),
+            self.project.paths.settings_file.display()
+        ));
+        eprintln!(
+            "ERROR app::poll_comic_type_save comic_type={} settings_file={} error={}",
+            comic_type.as_config_str(),
+            self.project.paths.settings_file.display(),
+            error
+        );
+    }
+
+    /// Applies a comic type whose project-settings write already succeeded
+    /// ([`Self::poll_comic_type_save`]): records it in the in-memory project, then applies its
+    /// canvas preset to the shared canvas settings — the `BubblesModel` snapshot, through
+    /// `SharedCanvasSettings::apply_comic_type_preset`, the one preset owner — and pushes the result
+    /// to `BubblesModel` (every canvas pulls it), to `CleanOverlaysModel` (`cache_pages`) and to the
+    /// Settings tab (whose saver also persists it), in that order, then closes the prompt. No I/O.
     fn apply_comic_type_preset(&mut self, comic_type: ComicType) {
         self.project.comic_type = Some(comic_type);
         if let Some(root) = self.project.settings_data.as_object_mut() {
@@ -574,29 +658,6 @@ impl StudioApp {
         if let Some((aside_compact_mode, separate_pages)) = comic_type.canvas_preset() {
             self.project.canvas_settings.aside_compact_mode = aside_compact_mode.to_string();
             self.project.canvas_settings.separate_pages = separate_pages;
-        }
-
-        // GUI thread: an atomic replace WITHOUT fsync (CLAUDE.md §5); the synchronous I/O
-        // itself is a recorded gap (`dev-docs/known_gaps.md`).
-        if let Err(err) = save_comic_type_to_project_file(
-            &self.project.paths.settings_file,
-            comic_type,
-            ms_docstore::Durability::None,
-        ) {
-            let user_message = t!("app.comic_type.save_error");
-            self.comic_type_prompt.fail(user_message.to_string());
-            runtime_log::log_error(format!(
-                "[app] failed to persist comic_type='{}'; settings_file='{}'; cause={err}",
-                comic_type.as_config_str(),
-                self.project.paths.settings_file.display()
-            ));
-            eprintln!(
-                "ERROR app::apply_comic_type_preset comic_type={} settings_file={} error={}",
-                comic_type.as_config_str(),
-                self.project.paths.settings_file.display(),
-                err
-            );
-            return;
         }
 
         // The preset goes onto the shared settings every canvas pulls from (one lock: read, apply,
@@ -1033,8 +1094,9 @@ impl eframe::App for StudioApp {
         self.trim_tab_gpu_after_active_canvas();
         self.poll_memory_pressure_and_evict();
 
+        self.poll_comic_type_save();
         if let Some(comic_type) = self.comic_type_prompt.draw(ctx) {
-            self.apply_comic_type_preset(comic_type);
+            self.start_comic_type_save(comic_type);
         }
         // Drawn with the snapshot `FrameEnv` was decided with (taken before the router ran).
         let ai_device_prompt_open = self.ai_device_prompt.draw(ctx, &self.ai_backend_health_cached, self.ai_backend_probe_tx.as_ref());
@@ -1062,6 +1124,16 @@ impl eframe::App for StudioApp {
             }
         }
     }
+}
+
+/// A comic-type choice whose project-settings write runs on a worker
+/// (`StudioApp::start_comic_type_save`, polled by `StudioApp::poll_comic_type_save`).
+#[derive(Debug)]
+struct ComicTypeSave {
+    /// The type being written; applied once the write succeeded.
+    comic_type: ComicType,
+    /// The worker's single answer: the write's result (technical message on failure).
+    rx: std::sync::mpsc::Receiver<Result<(), String>>,
 }
 
 /// What one `StudioApp::ui` pass did with the panel dock, decided BEFORE the active tab draws.

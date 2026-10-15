@@ -58,7 +58,7 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   folder / open the launcher), returning `MissingPythonEnvAction`; the binary's
   `src/startup/prompts.rs` runs it and maps a failed window to `LaunchLauncher`. It uses
   `ms_window_geometry` for the shared window icon and the Android Activity handle.
-- `window.rs`: `prepare_window_context(ctx, WindowLook)`, the one window-context preparation
+- `window.rs`: `prepare_window_context(ctx)`, the one window-context preparation
   every window of this crate calls first in its creator closure.
 - `venv_check.rs`: the non-interactive, GUI-free readiness check behind `--check-venv`. It
   lives here rather than in `ms-sysprobe` because it reads `utils.rs`' own package
@@ -69,8 +69,8 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 ## Contracts and invariants
 - Every `eframe::run_native` creator of this crate prepares its context ONLY through
   `window::prepare_window_context`: bundled UI fonts at `ui_fonts::Tier::Core` always, the studio
-  theme for `WindowLook::StudioTheme` (update window, missing-environment prompt) and egui's stock
-  visuals for `WindowLook::EguiDefault` (the three `install.rs` windows), then the process-global UI
+  theme (every window: installer, existing-install, uninstall, update, missing-environment
+  prompt), then the process-global UI
   scale (`ms_widgets::ui_scale::apply_ui_scale_to_context`). The scale is whatever the slot holds
   when the window is created: the startup seed (`init_full`) runs before the update windows,
   the startup prompts and the `--check-venv` repair window; a launcher-requested update window

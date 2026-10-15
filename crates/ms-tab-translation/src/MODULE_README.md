@@ -241,11 +241,19 @@ process-global state keeps it.
 AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`, streamed by
 `exec_chat_validated`) from the OCR worker thread; its answer is cleaned
 (`structured::strip_think_blocks` + `clean_plain_text`: `<think>` blocks and a code fence
-wrapping the whole answer; quotes are kept) before line splitting, and an answer left empty is asked for once
+wrapping the whole answer; quotes are kept) before line splitting — the split and "keep line breaks"
+join is the same `assemble_line_ocr_result` the native routes use (reflection is part of the
+prompt, never applied to the answer) — and an answer left empty is asked for once
 more (`ocr.rs::ai_api_ocr_validation`; nothing else is retried, plain text has no structure); provider API keys are read/written only through `ms_ai_api::keys` (OS credential
 store) and never persisted to project or user JSON settings. For an OpenAI-/Anthropic-compatible
 service the request goes to the panel's base URL (`ms_ai_api::AiApiTarget`) and a missing key is
 not an error; OCR and MT raise their "API key missing" errors only when `requires_key()`.
+The default AI API OCR system instruction has ONE owner, `ocr.rs::default_ai_api_ocr_instruction`,
+worded for the OCR input language (the MT panel's source-language code; `auto` names none). The
+instruction stays user-editable and persisted: a stored text that `is_default_ai_api_ocr_instruction`
+recognizes as untouched (blank, any generated default, the legacy hard-coded Korean text) follows
+the language — at request time (`OcrRuntimeOptions::ai_api_source_lang`) and in the panel
+(`OcrPanelOptions::sync_default_ai_api_instruction`); any other text is a user edit and is sent as is.
 The native ONNX Runtime OCR path (MangaOCR + PaddleOCR + Baberu OCR) is selected in `ocr.rs` by the
 pure `ocr_route` helper: with `General.ai_runtime == "native"` and a non-`Suspect` provider-scope
 SIGILL guard, MangaOCR with an ONNX export (`base_onnx`/`2025_onnx`; `base_torch` has no native path)
@@ -387,7 +395,9 @@ is an author note addressed to the translator, not a replica.
   item/request types including optional ImageBubble image payloads, per-run worker thread
   lifecycle, cancellation (`MtRunCancel`: flag + per-run generation tracker), chat context
   pruning, the validated AI exchange per batch / per ImageBubble, the run's issue list
-  (`MtRunIssue`), and backend dispatch.
+  (`MtRunIssue`), run-level context notices (`MtControllerEvent::ContextNotice`: an unreadable
+  notes template, character roster or term list is logged with its path and all of a prompt's
+  failures are shown as one warning toast; the request goes without those blocks), and backend dispatch.
 - `ai_mt_response.rs` (native): pure reading / validation / merging of AI MT answers
   (`BatchCollector`), the repair message, per-item failure reasons, canonical history JSON,
   content checks (`content_warnings`) and the strict-output schema (`strict_answer_schema`).

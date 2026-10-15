@@ -406,7 +406,7 @@ saving, and export.
 - `../examples/`: `test_center_find`, the standalone prototype of the auto-typing bubble-centre
   search (`auto_typing.rs`); see `../examples/MODULE_README.md`.
 - `lib.rs`: crate root — module wiring and public re-exports for `TypingTabState`, `TypingDrawParams`,
-  `TypingTopPanelState`, and `TypingPanelLayout`, plus the
+  and `TypingTopPanelState`, plus the
   `typing_default_dock_layout` the app hands to the shared dock state.
 - `font_admin.rs`: the ONE sanctioned `pub(crate)` entry point for NON-typing code into the
   font MODEL. Wraps the `panel::{fonts, font_settings_store, fonts_data}` internals (which stay

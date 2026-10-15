@@ -49,7 +49,7 @@ Notes:
 
 from __future__ import annotations
 
-import gc
+import functools
 import io
 import logging
 import re
@@ -58,19 +58,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
-try:
-    from ai_device import AIDevice
-except Exception:
-    from modules.ai_device import AIDevice
-
-try:
-    from config import UserConfig
-except Exception:
-    UserConfig = None
-
 from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.rocm_mmap_transfer import move_module_to
+from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from .result_format import format_recognition_lines
 from .script_constraint import ScriptConstraint, TokenByteIndex, normalize_script
 
@@ -92,25 +83,13 @@ CHAT_TEMPLATE_FILE = "chat_template.jinja"
 _LOADING_INFO_KEYS = ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
 
 
-def _clear_torch_cache() -> None:
-    try:
-        import torch  # type: ignore
-    except Exception:
-        gc.collect()
-        return
+#: `General.ai_device` resolution with this service's device policy (owner:
+#: `runtime.torch_device`); patched by name in the test suite.
+_resolve_selected_backend_device = resolve_selected_backend_device
 
-    gc.collect()
-    try:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    except Exception:
-        pass
-    try:
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-    except Exception:
-        pass
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="PaddleOCR-VL")
 
 
 @dataclass(frozen=True)
@@ -153,6 +132,14 @@ class PaddleVlOcrService:
         # Published copy of the health fields; `health()` never takes `_lock`,
         # which a model load holds (S-014).
         self._health = HealthSnapshot(ready=False, device=None, model=None, last_error=None)
+        # Device of the resident model or of the load in flight, None when nothing
+        # is loaded. A request reads it as its resolution fallback under this short
+        # lock instead of `_lock`, so it never waits for another request's model
+        # load just to learn the device. Written only while `_lock` is held (lock
+        # order `_lock` -> `_device_hint_lock`); the health snapshot cannot serve,
+        # because it reports `device=None` for the whole length of a reload.
+        self._device_hint_lock = threading.Lock()
+        self._device_hint: str | None = None
 
     def health(self) -> dict[str, Any]:
         """Return `{"ready", "device", "model", "last_error"}` for the health snapshot.
@@ -199,9 +186,10 @@ class PaddleVlOcrService:
         directory = _validate_model_dir(model_dir)
         image = self._decode_image(image_bytes)
         normalized_script = normalize_script(script)
-        with self._lock:
-            current_device = self._identity.device if self._identity is not None else None
-        selected_device = _resolve_selected_backend_device(current_device or "cpu")
+        # Only a resolution fallback: the identity check under `_lock` below still
+        # decides whether a (re)load happens, so a device switch racing this read
+        # costs at most one reload, exactly as before this read left `_lock`.
+        selected_device = _resolve_selected_backend_device(self._read_device_hint() or "cpu")
         identity = _ModelIdentity(model=label, model_dir=directory, device=selected_device)
         model_key = self._model_key(label, selected_device)
 
@@ -257,6 +245,16 @@ class PaddleVlOcrService:
             join_newlines=join_newlines,
             reflect_strings=reflect_strings,
         )
+
+    def _read_device_hint(self) -> str | None:
+        """Device of the resident model or of the load in flight; never waits for `_lock`."""
+        with self._device_hint_lock:
+            return self._device_hint
+
+    def _set_device_hint_locked(self, device: str | None) -> None:
+        """Publish the device hint; caller holds `self._lock`."""
+        with self._device_hint_lock:
+            self._device_hint = device
 
     def _constraint_for_script_locked(
         self, processor, script: str
@@ -359,9 +357,14 @@ class PaddleVlOcrService:
                 self._model_manager.mark_unloaded(previous_key)
                 log.info("PaddleOCR-VL model replaced: unloaded model_key=%s", previous_key)
 
+        # From here the device being loaded is the one the next request should
+        # fall back to, as it would after waiting for this load to finish.
+        self._set_device_hint_locked(identity.device)
         try:
             model, processor = _load_model_and_processor(identity.model_dir, identity.device)
         except Exception as exc:
+            # Nothing is resident any more (the previous model was dropped above).
+            self._set_device_hint_locked(None)
             self._last_error = f"PaddleOCR-VL init failed: {exc}"
             self._publish_health_locked()
             log.error(
@@ -409,6 +412,7 @@ class PaddleVlOcrService:
             if identity is None or model_key != self._model_key(identity.model, identity.device):
                 return False
             self._drop_model_locked()
+            self._set_device_hint_locked(None)
             _clear_torch_cache()
             self._model_manager.mark_unloaded(model_key)
         log.info("PaddleOCR-VL model unloaded: model_key=%s", model_key)
@@ -612,56 +616,3 @@ def _ensure_check_model_inputs_compat() -> None:
 
     _compat._paddle_vl_compat = True
     _generic.check_model_inputs = _compat
-
-
-def _resolve_selected_backend_device(fallback: str) -> str:
-    """Resolve the configured `General.ai_device` to an available torch device."""
-    fallback_norm = _normalize_backend_device(fallback, "cpu")
-    configured = _read_configured_device()
-    if configured is None:
-        configured = fallback_norm
-
-    normalized = _normalize_backend_device(configured, fallback_norm)
-    available = _safe_available_devices()
-
-    if normalized in available:
-        return normalized
-    if normalized.startswith("cuda") and "cuda" in available:
-        return "cuda"
-    if fallback_norm in available:
-        return fallback_norm
-    if "cuda" in available:
-        return "cuda"
-    return "cpu"
-
-
-def _read_configured_device() -> str | None:
-    config_root = getattr(UserConfig, "config", None)
-    if not isinstance(config_root, dict):
-        return None
-    general = config_root.get("General")
-    if not isinstance(general, dict):
-        return None
-    value = general.get("ai_device")
-    if not isinstance(value, str):
-        return None
-    normalized = value.strip().lower()
-    if normalized == "not-selected":
-        return None
-    return normalized or None
-
-
-def _safe_available_devices() -> set[str]:
-    try:
-        return set(AIDevice.detect_available_devices())
-    except Exception:
-        return {"cpu"}
-
-
-def _normalize_backend_device(raw: str, fallback: str) -> str:
-    normalized = str(raw or "").strip().lower()
-    if normalized == "cpu" or normalized == "cuda" or normalized.startswith("cuda:"):
-        return normalized
-    if normalized == "mps":
-        return normalized
-    return str(fallback or "cpu").strip().lower() or "cpu"

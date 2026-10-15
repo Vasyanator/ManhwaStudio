@@ -18,8 +18,11 @@ Every service follows the same shape and is safe to copy from when adding a seve
   (`begin_model_use` → `mark_loaded` / `mark_load_failed` → `release`), which is what lets an idle
   model be evicted by another service. **Load and inference are two separate `try` scopes**: see
   the lease-protocol section below;
-- the target device comes from `General.ai_device` through the module-local
-  `_resolve_selected_backend_device()` (`not-selected` resolves to a real runtime default). The one
+- the target device comes from `General.ai_device` through the module-level binding
+  `_resolve_selected_backend_device()` of `runtime.torch_device.resolve_selected_backend_device`
+  (the one owner; each service's policy is the binding's arguments, and the allocator cache is
+  released the same way through `_clear_torch_cache` -> `runtime.torch_device.clear_torch_cache`;
+  `not-selected` resolves to a real runtime default). The one
   exception is `flux_fill.py`, which ignores the user's device choice and pins itself to the
   discrete GPU via `_select_discrete_device()` — see the FLUX section;
 - `health()` / `unload()` are part of every service's contract, and `unload()` reports the dropped
@@ -735,7 +738,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     because that is what its run really does. A plain boolean, not the tri-state (`ipc/PROTOCOL.md`
     §5.4).
 - Unlike `flux_fill.py`, this service honours the user's `General.ai_device` choice through the
-  module-local `_resolve_selected_backend_device()`.
+  module-level `_resolve_selected_backend_device()` binding (`hardware.py`).
 - **The reported device is never a placeholder.** `status`, `health` and the generation answer take
   it from `_device_label()`: the loaded `self._device` when a pipeline is resident, otherwise the
   device `_resolve_selected_backend_device("cuda")` WILL pick — the same call the pipeline build

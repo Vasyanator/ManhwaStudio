@@ -20,7 +20,7 @@ naming that owner, a file with another digest a `RuntimeError`.
 
 from __future__ import annotations
 
-import gc
+import functools
 import hashlib
 import io
 import logging
@@ -32,14 +32,10 @@ if TYPE_CHECKING:
     import numpy as np
     import torch as torch_mod
 
-try:
-    from ai_device import AIDevice
-except Exception:
-    from modules.ai_device import AIDevice
-
 from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.paths import program_root
+from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 
 try:
     from config import LAMA_MPE_DIR
@@ -47,11 +43,6 @@ except Exception:
     LAMA_MPE_DIR = str(
         program_root() / "ManhwaStudio_AI_Models" / "Torch" / "LaMa_MPE"
     )
-
-try:
-    from config import UserConfig
-except Exception:
-    UserConfig = None
 
 try:
     from config import program_dir as _PROGRAM_DIR
@@ -74,23 +65,14 @@ log = logging.getLogger(__name__)
 #   (`ms_sysprobe::ai_models::ensure_lama_mpe`); never fetched here.
 # - Декодирование PNG-изображений (RGB image + mask) и кодирование raw PNG.
 # - Нормализация параметров endpoint (`inpaint_size`).
-# - Синхронизация устройства с backend-настройкой `General.ai_device`
-#   через `AIDevice`.
+# - Device sync with the backend setting `General.ai_device` through
+#   `runtime.torch_device`.
 # ============================================================================
 
 #: Digest of the published checkpoint; the copy the Rust catalog serves
 #: (`Torch/LaMa_MPE/inpainting_lama_mpe.ckpt`, 108 580 583 bytes) has these bytes.
 _LAMA_MPE_SHA256 = "d625aa1b3e0d0408acfd6928aa84f005867aa8dbb9162480346a4e20660786cc"
 _LAMA_MPE_CKPT_NAME = "inpainting_lama_mpe.ckpt"
-
-
-def _maybe_torch():
-    try:
-        import torch  # type: ignore
-
-        return torch
-    except Exception:
-        return None
 
 
 def _torch() -> torch_mod:
@@ -203,77 +185,13 @@ def _encode_png_bytes_rgb(image_rgb: np.ndarray) -> bytes:
         return buffer.getvalue()
 
 
-def _resolve_selected_backend_device(fallback: str) -> str:
-    fallback_norm = _normalize_backend_device(fallback, "cpu")
-    configured = _read_configured_device()
-    if configured is None:
-        configured = fallback_norm
+#: `General.ai_device` resolution with this service's device policy (owner:
+#: `runtime.torch_device`); patched by name in the test suite.
+_resolve_selected_backend_device = functools.partial(resolve_selected_backend_device, mps_last_resort=True)
 
-    normalized = _normalize_backend_device(configured, fallback_norm)
-    available = _safe_available_devices()
-
-    if normalized in available:
-        return normalized
-    if normalized.startswith("cuda") and "cuda" in available:
-        return "cuda"
-    if fallback_norm in available:
-        return fallback_norm
-    if "cuda" in available:
-        return "cuda"
-    if "mps" in available:
-        return "mps"
-    return "cpu"
-
-
-def _read_configured_device() -> str | None:
-    config_root = getattr(UserConfig, "config", None)
-    if not isinstance(config_root, dict):
-        return None
-    general = config_root.get("General")
-    if not isinstance(general, dict):
-        return None
-    value = general.get("ai_device")
-    if not isinstance(value, str):
-        return None
-    value = value.strip().lower()
-    if value == "not-selected":
-        return None
-    return value or None
-
-
-def _safe_available_devices() -> set[str]:
-    try:
-        return set(AIDevice.detect_available_devices())
-    except Exception:
-        return {"cpu"}
-
-
-def _normalize_backend_device(raw: str, fallback: str) -> str:
-    value = str(raw or "").strip().lower()
-    if value in {"cpu", "mps", "cuda"}:
-        return value
-    if value.startswith("cuda:"):
-        return value
-    return str(fallback or "cpu").strip().lower() or "cpu"
-
-
-def _clear_torch_cache() -> None:
-    torch = _maybe_torch()
-    if torch is None:
-        return
-    gc.collect()
-    try:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
-    except Exception:
-        pass
-    try:
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-    except Exception:
-        pass
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="LaMa MPE")
 
 
 def _resize_keepasp(
@@ -417,7 +335,9 @@ class LamaMpeInpaintService:
                 if callable(to_fn):
                     to_fn("cpu")
             except Exception:
-                pass
+                # The move to CPU only frees VRAM sooner; the reference is dropped
+                # below either way, so the unload still completes.
+                log.warning("LaMa MPE: moving the model to CPU before unload failed (key %s)", current_key, exc_info=True)
             self._model = None
             self._active_model_key = None
             self._publish_health_locked()

@@ -1562,6 +1562,7 @@ impl TranslationTabState {
                     &self.ocr_controller.generation_snapshot(),
                     OcrPanelModelView {
                         korean_source,
+                        source_lang: &self.mt_panel_options.source_lang,
                         download: model_snapshot.as_ref(),
                         // Only the engine whose command downloads shows its progress.
                         engine_download: self
@@ -1596,7 +1597,7 @@ impl TranslationTabState {
                         self.mark_ocr_load_requested_for_engine(self.ocr_panel_options.engine);
                         self.ocr_controller.request_load(
                             self.ocr_panel_options.engine,
-                            build_ocr_runtime_options(&self.ocr_panel_options),
+                            build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang),
                         );
                     }
                 }
@@ -3253,7 +3254,7 @@ impl TranslationTabState {
             let request = OcrRecognizeRequest {
                 request_id,
                 engine: self.ocr_panel_options.engine,
-                options: build_ocr_runtime_options(&self.ocr_panel_options),
+                options: build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang),
                 page_path: page.path.clone(),
                 uv_rect: task.uv_rect,
                 image_override_png: None,
@@ -3673,6 +3674,11 @@ impl TranslationTabState {
                             3.2,
                         );
                     }
+                }
+                // Arrives before the run's first request, so it shows until the first progress
+                // toast replaces it; the worker already logged it with the path.
+                MtControllerEvent::ContextNotice { notice } => {
+                    self.push_toast(ctx, notice, Severity::Warning, 6.0);
                 }
                 MtControllerEvent::Progress {
                     translated,
@@ -4399,6 +4405,7 @@ impl TranslationTabState {
             scene_rect,
             request_id,
             &self.ocr_panel_options,
+            &self.mt_panel_options.source_lang,
         ) else {
             self.push_toast(
                 ctx,
@@ -4604,6 +4611,7 @@ impl TranslationTabState {
             scene_rect,
             request_id,
             &self.ocr_panel_options,
+            &self.mt_panel_options.source_lang,
         ) else {
             self.push_toast(
                 ctx,
@@ -7553,7 +7561,9 @@ fn parse_single_ocr_lang_setting(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions) -> OcrRuntimeOptions {
+/// Snapshots the OCR panel state into worker options. `ocr_source_lang` is the OCR input
+/// language (the MT panel's source-language code) the AI API default instruction is worded for.
+fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions, ocr_source_lang: &str) -> OcrRuntimeOptions {
     let surya_is_active = ocr_options.engine == OcrEngine::Surya;
     OcrRuntimeOptions {
         manga_model: ocr_options.manga_model.clone(),
@@ -7595,15 +7605,19 @@ fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions) -> OcrRuntimeOptions
         ai_api_base_url: ocr_options.ai_api.base_url.clone(),
         ai_api_model: ocr_options.ai_api.model.clone(),
         ai_api_system_instruction: ocr_options.ai_api.system_instruction.clone(),
+        ai_api_source_lang: ocr_source_lang.to_string(),
     }
 }
 
+/// Builds the recognize request for a canvas selection on the page it overlaps most (`None`
+/// when it overlaps no page). `ocr_source_lang` as in `build_ocr_runtime_options`.
 fn build_ocr_request(
     canvas: &CanvasView,
     project: &ProjectData,
     selection_rect: Rect,
     request_id: u64,
     ocr_options: &OcrPanelOptions,
+    ocr_source_lang: &str,
 ) -> Option<BuiltOcrRequest> {
     let mut best_area = 0.0_f32;
     let mut best_page: Option<(&Page, Rect)> = None;
@@ -7640,7 +7654,7 @@ fn build_ocr_request(
         request: OcrRecognizeRequest {
             request_id,
             engine: ocr_options.engine,
-            options: build_ocr_runtime_options(ocr_options),
+            options: build_ocr_runtime_options(ocr_options, ocr_source_lang),
             page_path: page.path.clone(),
             uv_rect: [u1, v1, u2, v2],
             image_override_png: None,

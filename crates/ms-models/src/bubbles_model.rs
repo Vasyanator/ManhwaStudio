@@ -34,6 +34,7 @@ Threading/persistence:
 use ms_config::bubble_status::{BubbleStatusRule, default_bubble_status_rules};
 use ms_project::{Bubble, ComicType};
 use ms_docstore::{DocKind, DocRef};
+use ms_log::runtime_log;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -68,7 +69,7 @@ pub struct BubblesSaverBarrierGuard {
 impl Drop for BubblesSaverBarrierGuard {
     fn drop(&mut self) {
         if self.sender.send(BubblesSaverMessage::Resume).is_err() {
-            eprintln!("ERROR bubbles saver stopped before a held barrier could resume");
+            runtime_log::log_error("[bubbles_saver] saver stopped before a held barrier could resume; later snapshots of this session are not persisted");
         }
     }
 }
@@ -231,7 +232,28 @@ impl BubblesSaveTask {
 /// State shared by the coalescing saver and a structural-operation quiescence barrier.
 #[derive(Debug, Default)]
 struct BubblesSaverGate {
-    paused: bool,
+    /// Why the saver is paused; `None` while it runs. While paused, held and published snapshots
+    /// are dropped (the pausing operation owns the staging folder).
+    pause_reason: Option<SaverPauseReason>,
+}
+
+/// Which staging-owning operation paused the bubbles saver (named in its log lines).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaverPauseReason {
+    /// A structural page operation (`BubblesModel::pause_saver_for_page_op`).
+    PageOp,
+    /// A DISCARD of the session's staging (`BubblesModel::pause_saver_for_discard`).
+    Discard,
+}
+
+impl SaverPauseReason {
+    /// Log label of the reason.
+    fn label(self) -> &'static str {
+        match self {
+            Self::PageOp => "page operation",
+            Self::Discard => "discard",
+        }
+    }
 }
 
 /// Whether the staging bubbles document at `unsaved_bubbles_path` exists, in any format. Asks the
@@ -356,9 +378,21 @@ impl BubblesModel {
     /// model afterwards. The returned snapshot is therefore safe to write synchronously without
     /// a stale coalesced saver overwriting remapped page indices.
     pub fn pause_saver_for_page_op(&mut self) -> Arc<Vec<Bubble>> {
+        self.pause_saver(SaverPauseReason::PageOp)
+    }
+
+    /// Same quiescence as [`Self::pause_saver_for_page_op`], for a DISCARD of the staging folder:
+    /// held and later snapshots are dropped (logged as dropped for a discard). Permanent unless
+    /// [`Self::resume_saver_after_failed_discard`] reverses it.
+    pub fn pause_saver_for_discard(&mut self) -> Arc<Vec<Bubble>> {
+        self.pause_saver(SaverPauseReason::Discard)
+    }
+
+    /// Pauses the saver for `reason` (waits for an in-progress write) and returns the current state.
+    fn pause_saver(&mut self, reason: SaverPauseReason) -> Arc<Vec<Bubble>> {
         match self.saver_gate.lock() {
-            Ok(mut gate) => gate.paused = true,
-            Err(poisoned) => poisoned.into_inner().paused = true,
+            Ok(mut gate) => gate.pause_reason = Some(reason),
+            Err(poisoned) => poisoned.into_inner().pause_reason = Some(reason),
         }
         self.snapshot_shared()
     }
@@ -370,8 +404,8 @@ impl BubblesModel {
     /// cleanup worker was running and snapshot publication was suppressed.
     pub fn resume_saver_after_failed_discard(&mut self) {
         match self.saver_gate.lock() {
-            Ok(mut gate) => gate.paused = false,
-            Err(poisoned) => poisoned.into_inner().paused = false,
+            Ok(mut gate) => gate.pause_reason = None,
+            Err(poisoned) => poisoned.into_inner().pause_reason = None,
         }
         self.has_unsaved_changes = true;
         send_snapshot_to_bubbles_saver(
@@ -569,6 +603,16 @@ impl BubblesModel {
         self.touch_and_save()
     }
 
+    /// Marks the model saved after a save-to-project merge without any file access:
+    /// `saved_revision` is [`Self::revision`] read on the GUI thread when the save started (every
+    /// edit up to it was sent to the saver before the worker's first barrier, so it is in the
+    /// merge), and `staging_exists` the worker's post-merge stat of the staging directory. Any
+    /// edit since the save started (the revision moved) or a re-created staging keeps the model
+    /// unsaved; filesystem timing (a snapshot still queued in the saver) cannot hide such an edit.
+    pub fn mark_saved_to_project_as_of(&mut self, saved_revision: u64, staging_exists: bool) {
+        self.has_unsaved_changes = staging_exists || self.revision != saved_revision;
+    }
+
     pub fn mark_saved_to_project(&mut self) {
         // A mutation accepted while the save barrier was held is written to a newly recreated
         // staging file after the merge. Preserve that post-save dirty state instead of clearing it.
@@ -713,14 +757,19 @@ impl BubblesSaverWorker {
             Ok(gate) => gate,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if gate.paused {
-            eprintln!("INFO bubbles saver intentionally dropped a held snapshot while paused");
+        if let Some(reason) = gate.pause_reason {
+            let reason = reason.label();
+            runtime_log::log_info(format!(
+                "[bubbles_saver] dropped a held snapshot of {} bubbles for '{}': saver paused for a {reason}, which owns the staging folder",
+                snapshot.len(),
+                self.bubbles_path.display()
+            ));
             return;
         }
         self.last_write_error = write_bubbles_snapshot_to(&self.bubbles_path, snapshot.as_slice())
             .map_err(|err| {
                 let message = format!("failed to persist bubbles {}: {err:#}", self.bubbles_path.display());
-                eprintln!("{message}");
+                runtime_log::log_error(format!("[bubbles_saver] {message}; reported to the next barrier"));
                 message
             })
             .err();
@@ -739,13 +788,13 @@ impl BubblesSaverWorker {
                 self.write_pending();
                 let outcome = self.last_write_error.clone().map_or(Ok(()), Err);
                 if ack.send(outcome).is_err() {
-                    eprintln!("ERROR bubbles saver barrier requester dropped before acknowledgement");
+                    runtime_log::log_error("[bubbles_saver] barrier requester dropped before acknowledgement");
                 }
                 let mut hold_depth = 1_usize;
                 let mut shutdown_ack = None;
                 while hold_depth > 0 {
                     let Ok(message) = rx.recv() else {
-                        eprintln!("ERROR bubbles saver channel disconnected while snapshots were held");
+                        runtime_log::log_error("[bubbles_saver] channel disconnected while snapshots were held; ending the hold");
                         break;
                     };
                     match message {
@@ -755,12 +804,12 @@ impl BubblesSaverWorker {
                             hold_depth = hold_depth.saturating_add(1);
                             let outcome = self.last_write_error.clone().map_or(Ok(()), Err);
                             if nested_ack.send(outcome).is_err() {
-                                eprintln!("ERROR nested bubbles saver barrier requester dropped");
+                                runtime_log::log_error("[bubbles_saver] nested barrier requester dropped before acknowledgement");
                             }
                         }
                         BubblesSaverMessage::Shutdown(ack) => {
                             if shutdown_ack.replace(ack).is_some() {
-                                eprintln!("ERROR bubbles saver received duplicate shutdown requests");
+                                runtime_log::log_error("[bubbles_saver] duplicate shutdown request during a hold; only the latest is acknowledged");
                             }
                         }
                     }
@@ -768,7 +817,7 @@ impl BubblesSaverWorker {
                 if let Some(ack) = shutdown_ack {
                     self.write_pending();
                     if ack.send(()).is_err() {
-                        eprintln!("ERROR bubbles saver shutdown requester dropped");
+                        runtime_log::log_error("[bubbles_saver] shutdown requester dropped before acknowledgement");
                     }
                     return true;
                 }
@@ -777,7 +826,7 @@ impl BubblesSaverWorker {
             BubblesSaverMessage::Shutdown(ack) => {
                 self.write_pending();
                 if ack.send(()).is_err() {
-                    eprintln!("ERROR bubbles saver shutdown requester dropped");
+                    runtime_log::log_error("[bubbles_saver] shutdown requester dropped before acknowledgement");
                 }
                 return true;
             }
@@ -865,8 +914,8 @@ fn send_snapshot_to_bubbles_saver(
     autosave_gate: Option<&AutosaveGate>,
 ) {
     let paused = match saver_gate.lock() {
-        Ok(gate) => gate.paused,
-        Err(poisoned) => poisoned.into_inner().paused,
+        Ok(gate) => gate.pause_reason.is_some(),
+        Err(poisoned) => poisoned.into_inner().pause_reason.is_some(),
     };
     if paused {
         return;
@@ -887,11 +936,11 @@ fn send_snapshot_to_bubbles_saver(
         return;
     }
 
-    eprintln!(
-        "ERROR bubbles saver unavailable; snapshot for '{}' could not be queued to staging '{}'",
+    runtime_log::log_error(format!(
+        "[bubbles_saver] saver unavailable; snapshot for '{}' could not be queued to staging '{}'",
         bubbles_path.display(),
         unsaved_bubbles_path.display()
-    );
+    ));
 }
 
 #[cfg(test)]
@@ -1053,6 +1102,37 @@ mod tests {
         assert!(std::fs::remove_file(staging_path).is_ok());
     }
 
+    /// A save completion keeps the model unsaved for an edit made after the save started even
+    /// while that edit's snapshot is still held in the saver (no staging file yet), and for a
+    /// re-created staging; it is clean only when neither happened.
+    #[test]
+    fn mark_saved_as_of_sees_an_edit_whose_snapshot_is_still_queued() {
+        let mut model = model_with(Vec::new());
+        let staging_path = model.unsaved_bubbles_path.clone();
+        assert!(model.create_or_replace(bubble_with_extra(1, "k", "merged")).is_ok());
+        let hold = model.saver_handle().barrier_and_hold_blocking();
+        assert!(hold.is_ok(), "barrier must verify the queued write");
+        let saved_revision = model.revision();
+        assert!(std::fs::remove_file(&staging_path).is_ok(), "the merge deleted staging");
+
+        // An edit after the save started: its snapshot waits behind the hold, staging stays absent.
+        assert!(model.create_or_replace(bubble_with_extra(1, "k", "after")).is_ok());
+        assert!(!staged_bubbles_exist(&staging_path), "the held snapshot has not been written");
+        model.mark_saved_to_project_as_of(saved_revision, false);
+        assert!(model.has_unsaved_changes(), "the revision moved: the edit is not in the merge");
+
+        model.mark_saved_to_project_as_of(model.revision(), false);
+        assert!(!model.has_unsaved_changes(), "nothing since the save and no staging: clean");
+        model.mark_saved_to_project_as_of(model.revision(), true);
+        assert!(model.has_unsaved_changes(), "a re-created staging keeps it unsaved");
+
+        drop(hold);
+        assert!(model.shutdown_saver().is_ok());
+        if staging_path.exists() {
+            assert!(std::fs::remove_file(&staging_path).is_ok());
+        }
+    }
+
     /// Releasing a barrier resumes persistence instead of permanently pausing the saver.
     #[test]
     fn saver_continues_after_barrier() {
@@ -1098,7 +1178,7 @@ mod tests {
             panic!("initial barrier failed");
         };
         assert!(model.create_or_replace(bubble_with_extra(1, "k", "discarded")).is_ok());
-        model.pause_saver_for_page_op();
+        model.pause_saver_for_discard();
         assert!(std::fs::remove_dir_all(&staging_dir).is_ok() || !staging_dir.exists());
         drop(barrier);
         assert!(model.shutdown_saver().is_ok());
@@ -1220,7 +1300,7 @@ mod tests {
             assert!(model.create_or_replace(bubble_with_extra(3, "k", "held")).is_ok());
             std::thread::sleep(std::time::Duration::from_millis(50));
             if paused {
-                let _snapshot = model.pause_saver_for_page_op();
+                let _snapshot = model.pause_saver_for_discard();
             }
             assert!(model.shutdown_saver().is_ok());
             if paused {

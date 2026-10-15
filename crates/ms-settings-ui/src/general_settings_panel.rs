@@ -12,10 +12,19 @@ combo lived only in the studio. This module renders that one panel against a per
 returns a [`GeneralSettingsOutcome`] describing the per-call-site runtime effects the
 caller must apply (there is no app-global channel here, unlike `ai_backend_panel`).
 
-Persistence is SYNCHRONOUS and goes through `ms_config::update_user_config_file`, the
-serialized user-config read-modify-write, so a write never clobbers the ONNX Runtime
-SIGILL load-guard marker or another writer's keys (see the user_config write-lock
-invariant in `ARCHITECTURE.md`, "Config", and `crates/ms-config/src/MODULE_README.md`).
+Persistence runs OFF the GUI thread: each panel state owns one `ConfigKeyWriter`, a FIFO
+worker (spawned on the first write) that performs every write through
+`persist_config_keys_at` -> `ms_config::update_user_config_file`, the serialized user-config
+read-modify-write, so a write never clobbers the ONNX Runtime SIGILL load-guard marker or
+another writer's keys (see the user_config write-lock invariant in `ARCHITECTURE.md`,
+"Config", and `crates/ms-config/src/MODULE_README.md`). One worker per surface keeps that
+surface's writes in click order; the result of each (`PersistOrigin` tells what it was for)
+is applied by the next `draw_general_settings_panel` (status line, saved projects root,
+`GeneralSettingsOutcome`). The persisted values are exactly those of the former synchronous
+writes. Each queued job holds a `PendingConfigWrite` token until its write returned, and the
+binary waits for those tokens after the main window closed
+(`pending_config_writes::wait_for_pending_config_writes`), so a write queued in the last frame
+still lands before the process exits.
 
 The UI-language selector lists the locales found in the on-disk `locale/` folder
 (scanned ONCE at construction — never per frame; see CLAUDE.md §5), each shown by
@@ -35,7 +44,9 @@ per-`Context`, and the launcher and the studio are screens of ONE main window sh
 up from the process-global `ui_scale_percent()` through `apply_ui_scale_to_context`.
 
 Key items:
-- `GeneralSettingsPanelState`: per-UI scratch + mirrored persisted values.
+- `GeneralSettingsPanelState`: per-UI scratch + mirrored persisted values + its writer.
+- `ConfigKeyWriter` / `PersistJob` / `PersistOrigin` / `PersistResult`: the off-GUI-thread
+  writer of this pane's `user_config` keys and what each result is applied to.
 - `GeneralSettingsOutcome`: per-call-site runtime effects to apply after drawing,
   including the `SettingChange`s of the checked settings saved this frame (projects
   root, UI language) that drive the launcher's warning rechecks.
@@ -75,11 +86,13 @@ use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialo
 use ms_widgets::{WheelComboBox, WheelSlider};
 use ms_text_util::language::{ScriptGroup, TextLanguage, set_text_language, text_language};
 use ms_thread as thread;
+use crate::pending_config_writes::PendingConfigWrite;
 use crate::settings_shared::with_item_badge;
 use crate::settings_warnings::{SettingChange, SettingKey, WarningSet};
 use crate::storage_mode_setting::{StorageModeSettingState, draw_storage_mode_setting};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 /// Status line shown under the projects-directory editor.
 ///
@@ -146,6 +159,14 @@ pub struct GeneralSettingsPanelState {
     /// The projects-root folder picker while it is open (polled every frame; the "Browse"
     /// button is disabled meanwhile).
     projects_dir_pick: Option<PendingDialog>,
+    /// A projects-root save is queued on [`Self::config_writer`] and has not answered yet (the
+    /// save button and Enter do nothing meanwhile).
+    projects_dir_save_pending: bool,
+    /// This surface's `user_config` key writer, spawned on the first write; `None` before it.
+    config_writer: Option<ConfigKeyWriter>,
+    /// A projects root whose save landed through [`Self::take_finished_writes`] and is not yet
+    /// reported as `projects_dir_saved` by a draw.
+    landed_projects_dir_saved: Option<PathBuf>,
 }
 
 /// One selectable interface language for the UI-language selector.
@@ -168,14 +189,15 @@ pub struct LocaleOption {
 /// launcher acts on `projects_dir_saved`; the studio acts on `memory_profile_changed`.
 #[derive(Debug, Default)]
 pub struct GeneralSettingsOutcome {
-    /// Set to the normalized saved root when the user saved a NEW projects dir.
+    /// Set to the normalized saved root on the frame a projects-dir save SUCCEEDED (the write
+    /// runs in the background, so this is a later frame than the click).
     pub projects_dir_saved: Option<PathBuf>,
     /// Set to the new profile when the memory-profile selection changed.
     pub memory_profile_changed: Option<MemoryProfile>,
     /// Set to the target mode on the frame a storage-mode switch started by this pane
     /// finished converting (successfully or with per-document failures).
     pub storage_mode_changed: Option<ms_config::StorageMode>,
-    /// Checked settings whose synchronous save RAN this frame
+    /// Checked settings whose background save FINISHED this frame
     /// (`SettingChange::ProjectsRoot`, `SettingChange::UiLanguage`), reported whether the
     /// write succeeded or failed: the warning recheck re-reads the disk, so a failed write
     /// only re-confirms the old state.
@@ -255,6 +277,9 @@ impl GeneralSettingsPanelState {
             status: GeneralSettingsStatus::Idle,
             storage_mode: StorageModeSettingState::default(),
             projects_dir_pick: None,
+            projects_dir_save_pending: false,
+            config_writer: None,
+            landed_projects_dir_saved: None,
         }
     }
 
@@ -265,14 +290,32 @@ impl GeneralSettingsPanelState {
         self.projects_dir_input = normalized.clone();
         self.saved_projects_dir = normalized;
     }
+
+    /// Applies the background writes that finished since the last call WITHOUT drawing and
+    /// returns their checked-setting changes. [`draw_general_settings_panel`] does the same at its
+    /// start, so each result is applied exactly once by whichever runs first; a surface that must
+    /// see a landed write while another section or page is shown calls this every frame. A saved
+    /// projects root found here is kept for the next draw's `projects_dir_saved` (the outcome a
+    /// surface acts on). No I/O.
+    #[must_use]
+    pub fn take_finished_writes(&mut self) -> Vec<SettingChange> {
+        let mut outcome = GeneralSettingsOutcome::default();
+        apply_finished_writes(self, &mut outcome);
+        if outcome.projects_dir_saved.is_some() {
+            self.landed_projects_dir_saved = outcome.projects_dir_saved;
+        }
+        outcome.changed_settings
+    }
 }
 
 /// Renders the shared general-settings widget (projects-directory editor + global
 /// memory-profile combo) and returns the runtime effects the caller must apply.
 ///
-/// Persists a changed projects dir / memory profile synchronously (one serialized
-/// `ms_docstore` update of `user_config.json`, under its document lock); persistence failures set an error status and
-/// are logged. The folder picker button ("Browse") is drawn only where a picked folder can be
+/// Queues a changed projects dir / memory profile / scale / autosave / window / gesture /
+/// language value on the panel's background writer (one serialized `ms_docstore` update of
+/// `user_config.json` per change, under its document lock) and first applies the results that
+/// writer finished since the last frame: failures set an error status and are logged, a saved
+/// projects root fills `projects_dir_saved`. The folder picker button ("Browse") is drawn only where a picked folder can be
 /// used in place (`PlatformFeature::PersistentDirectoryPicker`); its dialog never blocks.
 ///
 /// `warnings` is the launcher's warning set: the projects-dir and UI-language labels get
@@ -286,6 +329,9 @@ pub fn draw_general_settings_panel(
 ) -> GeneralSettingsOutcome {
     let mut outcome = GeneralSettingsOutcome::default();
     poll_projects_dir_pick(state);
+    // A save that landed outside a draw first; one landing now (newer) overrides it.
+    outcome.projects_dir_saved = state.landed_projects_dir_saved.take();
+    apply_finished_writes(state, &mut outcome);
 
     // Projects-directory editor (rich variant: text field + folder picker + save).
     with_item_badge(ui, warnings, SettingKey::ProjectsRoot, |ui| ui.label(t!("settings.general.projects_dir_label")));
@@ -320,7 +366,7 @@ pub fn draw_general_settings_panel(
 
     draw_status(ui, &state.status);
 
-    let dirty = projects_dir_is_dirty(&state.projects_dir_input, &state.saved_projects_dir);
+    let dirty = !state.projects_dir_save_pending && projects_dir_is_dirty(&state.projects_dir_input, &state.saved_projects_dir);
     if ui
         .add_enabled(dirty, egui::Button::new(t!("settings.general.save_projects_dir_button")))
         .clicked()
@@ -328,29 +374,11 @@ pub fn draw_general_settings_panel(
         should_save = true;
     }
 
-    if should_save {
+    if should_save && !state.projects_dir_save_pending {
         let normalized = normalize_projects_dir_value(&state.projects_dir_input);
-        match persist_general_key(
-            ms_config::GENERAL_PROJECTS_DIR_KEY,
-            serde_json::Value::String(normalized.clone()),
-        ) {
-            Ok(()) => {
-                state.saved_projects_dir = normalized.clone();
-                state.projects_dir_input = normalized.clone();
-                state.status =
-                    GeneralSettingsStatus::Success(t!("settings.general.projects_dir_saved").to_string());
-                outcome.projects_dir_saved = Some(PathBuf::from(normalized));
-            }
-            Err(err) => {
-                runtime_log::log_error(format!(
-                    "[general-settings] failed to persist projects directory '{normalized}'; \
-                     error={err}"
-                ));
-                state.status = GeneralSettingsStatus::Error(tf!("settings.general.projects_dir_save_error", err = err));
-            }
-        }
-        // Reported after either arm: the write ran, and the recheck reads what is on disk.
-        outcome.changed_settings.push(SettingChange::ProjectsRoot);
+        state.projects_dir_save_pending = true;
+        let value = serde_json::Value::String(normalized.clone());
+        persist_general_key(ui.ctx(), state, ms_config::GENERAL_PROJECTS_DIR_KEY, value, PersistOrigin::ProjectsDir(normalized), &mut outcome);
     }
 
     ui.separator();
@@ -376,26 +404,18 @@ pub fn draw_general_settings_panel(
         // The runtime effect (applying the profile to the MemoryManager) is the
         // caller's job; the widget only persists the choice.
         outcome.memory_profile_changed = Some(selected_profile);
-        if let Err(err) = persist_general_key(
-            ms_config::GENERAL_MEMORY_PROFILE_KEY,
-            serde_json::Value::String(selected_profile.as_config_str().to_string()),
-        ) {
-            runtime_log::log_error(format!(
-                "[general-settings] failed to persist memory profile '{}'; error={err}",
-                selected_profile.as_config_str()
-            ));
-            state.status =
-                GeneralSettingsStatus::Error(t!("settings.general.memory_profile_save_error").to_string());
-        }
+        let config_str = selected_profile.as_config_str();
+        let value = serde_json::Value::String(config_str.to_string());
+        persist_general_key(ui.ctx(), state, ms_config::GENERAL_MEMORY_PROFILE_KEY, value, PersistOrigin::MemoryProfile(config_str), &mut outcome);
     }
 
     ui.separator();
 
-    draw_ui_scale_setting(ui, state);
+    draw_ui_scale_setting(ui, state, &mut outcome);
 
     ui.separator();
 
-    draw_autosave_settings(ui, state);
+    draw_autosave_settings(ui, state, &mut outcome);
 
     ui.separator();
 
@@ -406,14 +426,14 @@ pub fn draw_general_settings_panel(
     // The web has one canvas and no separate windows, so the choice would be meaningless
     // there; the host decision has one owner (`WindowHost::current`), not a `PlatformFeature`.
     if ms_config::WindowHost::current() != ms_config::WindowHost::Web {
-        draw_secondary_windows_setting(ui, state);
+        draw_secondary_windows_setting(ui, state, &mut outcome);
         ui.separator();
     }
 
     // Finger gestures exist only where the platform can route touches (not on Windows, where
     // a pen arrives as touch, nor on the web); elsewhere the switch would do nothing.
     if PlatformFeature::CanvasTouchGestures.is_available() {
-        draw_touch_gestures_setting(ui, state);
+        draw_touch_gestures_setting(ui, state, &mut outcome);
         ui.separator();
     }
 
@@ -444,9 +464,9 @@ pub fn draw_general_settings_panel(
             });
     });
     if state.ui_language_tag != previous_tag {
-        apply_ui_language_change(ui, state);
-        // The save ran (successfully or not); the recheck reads what is on disk.
-        outcome.changed_settings.push(SettingChange::UiLanguage);
+        // `SettingChange::UiLanguage` is reported when the queued save finishes
+        // (`apply_finished_writes`); the recheck then reads what is on disk.
+        apply_ui_language_change(ui, state, &mut outcome);
     }
 
     ui.separator();
@@ -631,9 +651,9 @@ fn draw_primary_monitor_setting(ui: &mut egui::Ui, _state: &mut GeneralSettingsP
 /// Renders the secondary-window selector (`General.secondary_windows`).
 ///
 /// A change is applied live to `ms_config::secondary_windows` first (read when the next
-/// secondary window opens), then persisted synchronously; a failed write keeps the live value
-/// for this session and reports the error on the status line.
-fn draw_secondary_windows_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+/// secondary window opens), then queued on the panel's writer; a failed write keeps the live
+/// value for this session and reports the error on the status line.
+fn draw_secondary_windows_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState, outcome: &mut GeneralSettingsOutcome) {
     use ms_config::SecondaryWindows;
 
     ui.label(t!("settings.general.secondary_windows_label"));
@@ -654,25 +674,18 @@ fn draw_secondary_windows_setting(ui: &mut egui::Ui, state: &mut GeneralSettings
     }
     state.secondary_windows = selected;
     ms_config::secondary_windows::set(selected);
-    if let Err(err) = persist_general_key(
-        ms_config::GENERAL_SECONDARY_WINDOWS_KEY,
-        serde_json::Value::String(selected.as_config_str().to_string()),
-    ) {
-        runtime_log::log_error(format!(
-            "[general-settings] failed to persist the secondary-window setting '{}'; error={err}",
-            selected.as_config_str()
-        ));
-        state.status = GeneralSettingsStatus::Error(t!("settings.general.secondary_windows_save_error").to_string());
-    }
+    let config_str = selected.as_config_str();
+    let value = serde_json::Value::String(config_str.to_string());
+    persist_general_key(ui.ctx(), state, ms_config::GENERAL_SECONDARY_WINDOWS_KEY, value, PersistOrigin::SecondaryWindows(config_str), outcome);
 }
 
 /// Renders the touchscreen-gestures switch (`General.touch_gestures`).
 ///
 /// A change is applied live to `ms_config::touch_gestures` first (the main window's router
-/// picks it up on its next frame, once no finger gesture is in progress), then persisted
-/// synchronously; a failed write keeps the live value for this session and reports the error
+/// picks it up on its next frame, once no finger gesture is in progress), then queued on the
+/// panel's writer; a failed write keeps the live value for this session and reports the error
 /// on the status line.
-fn draw_touch_gestures_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+fn draw_touch_gestures_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState, outcome: &mut GeneralSettingsOutcome) {
     let mut enabled = state.touch_gestures;
     // A checkbox keeps no state of its own; the scope pins the row's ids against the
     // localized label all the same (`egui-docs/05-ids-and-i18n.md`).
@@ -685,10 +698,7 @@ fn draw_touch_gestures_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPan
     }
     state.touch_gestures = enabled;
     ms_config::touch_gestures::set(enabled);
-    if let Err(err) = persist_general_key(ms_config::GENERAL_TOUCH_GESTURES_KEY, serde_json::Value::Bool(enabled)) {
-        runtime_log::log_error(format!("[general-settings] failed to persist the touchscreen-gestures setting '{enabled}'; error={err}"));
-        state.status = GeneralSettingsStatus::Error(t!("settings.general.touch_gestures_save_error").to_string());
-    }
+    persist_general_key(ui.ctx(), state, ms_config::GENERAL_TOUCH_GESTURES_KEY, serde_json::Value::Bool(enabled), PersistOrigin::TouchGestures(enabled), outcome);
 }
 
 /// Localized combo entry for one secondary-window setting.
@@ -738,7 +748,7 @@ fn monitor_display_name(monitor: &ms_window_geometry::MonitorKey, index: usize) 
 /// being dragged. Applying mid-drag would rescale the slider itself under the cursor
 /// and make the control fight the pointer; wheel, click and keyboard changes are not
 /// drags and therefore apply immediately.
-fn draw_ui_scale_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+fn draw_ui_scale_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState, outcome: &mut GeneralSettingsOutcome) {
     ui.label(t!("settings.general.ui_scale_label"));
     ui.small(t!("settings.general.ui_scale_hint"));
 
@@ -760,16 +770,7 @@ fn draw_ui_scale_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelStat
         let percent = state.ui_scale_percent;
         apply_ui_scale(ui.ctx(), percent);
         state.applied_ui_scale_percent = percent;
-        if let Err(err) = persist_general_key(
-            ms_config::GENERAL_UI_SCALE_PERCENT_KEY,
-            serde_json::Value::from(percent),
-        ) {
-            runtime_log::log_error(format!(
-                "[general-settings] failed to persist ui scale '{percent}%'; error={err}"
-            ));
-            state.status =
-                GeneralSettingsStatus::Error(t!("settings.general.ui_scale_save_error").to_string());
-        }
+        persist_general_key(ui.ctx(), state, ms_config::GENERAL_UI_SCALE_PERCENT_KEY, serde_json::Value::from(percent), PersistOrigin::UiScale(percent), outcome);
     }
 }
 
@@ -782,7 +783,7 @@ fn draw_ui_scale_setting(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelStat
 /// interface scale, a change settles only once the slider is no longer dragged, so a drag
 /// does not write the config on every frame. A persist failure is logged and shown in the
 /// panel status line. Shared by the studio settings tab and the launcher settings page.
-fn draw_autosave_settings(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState) {
+fn draw_autosave_settings(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelState, outcome: &mut GeneralSettingsOutcome) {
     // Stable id scope: the sliders' ids must not depend on the localized labels above them.
     ui.push_id("settings_general_autosave", |ui| {
         ui.strong(t!("settings.general.autosave_heading"));
@@ -805,7 +806,7 @@ fn draw_autosave_settings(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelSta
             // Mirror the stored (clamped) value so a clamp can never make this branch fire
             // again on every frame.
             state.autosave_interval_minutes = ms_config::autosave_policy::autosave_policy().interval_minutes();
-            persist_autosave_key(state, ms_config::GENERAL_AUTOSAVE_INTERVAL_MINUTES_KEY, state.autosave_interval_minutes);
+            persist_autosave_key(ui.ctx(), state, ms_config::GENERAL_AUTOSAVE_INTERVAL_MINUTES_KEY, state.autosave_interval_minutes, outcome);
         }
 
         ui.label(t!("settings.general.autosave_threshold_label"));
@@ -819,22 +820,18 @@ fn draw_autosave_settings(ui: &mut egui::Ui, state: &mut GeneralSettingsPanelSta
         if state.autosave_action_threshold != policy.action_threshold && !threshold_slider.dragged() {
             ms_config::autosave_policy::set_autosave_action_threshold(state.autosave_action_threshold);
             state.autosave_action_threshold = ms_config::autosave_policy::autosave_policy().action_threshold;
-            persist_autosave_key(state, ms_config::GENERAL_AUTOSAVE_ACTION_THRESHOLD_KEY, state.autosave_action_threshold);
+            persist_autosave_key(ui.ctx(), state, ms_config::GENERAL_AUTOSAVE_ACTION_THRESHOLD_KEY, state.autosave_action_threshold, outcome);
         }
 
         ui.small(t!("settings.general.autosave_hint"));
     });
 }
 
-/// Persists one `General.<key>` autosave value; on failure logs it and sets the panel's
-/// error status (the live value stays applied for the rest of the session).
-fn persist_autosave_key(state: &mut GeneralSettingsPanelState, key: &str, value: u32) {
-    if let Err(err) = persist_general_key(key, serde_json::Value::from(value)) {
-        runtime_log::log_error(format!(
-            "[general-settings] failed to persist autosave setting '{key}'={value}; error={err}"
-        ));
-        state.status = GeneralSettingsStatus::Error(tf!("settings.general.autosave_save_error", err = err));
-    }
+/// Queues one `General.<key>` autosave value on the panel's writer; a failure is logged and
+/// sets the panel's error status when it is reported (the live value stays applied for the
+/// rest of the session).
+fn persist_autosave_key(ctx: &egui::Context, state: &mut GeneralSettingsPanelState, key: &'static str, value: u32, outcome: &mut GeneralSettingsOutcome) {
+    persist_general_key(ctx, state, key, serde_json::Value::from(value), PersistOrigin::Autosave { key, value }, outcome);
 }
 
 /// Slider/wheel step of the interface-scale control, in percent.
@@ -872,24 +869,17 @@ fn persist_text_language(language: TextLanguage) {
     }
 }
 
-/// Persists the newly selected UI-language tag and live-installs its catalog.
+/// Queues the newly selected UI-language tag on the panel's writer and live-installs its
+/// catalog.
 ///
-/// Persistence is synchronous, matching this widget's projects-dir / memory-profile
-/// writes: one tiny key write on an explicit user action, serialized on the
-/// `user_config.json` document lock so it never clobbers the ORT load-guard marker. The install is live (no restart) and the frame is repainted so the new
+/// The write goes through the same background writer as this widget's other keys (one tiny
+/// key write, serialized on the `user_config.json` document lock so it never clobbers the ORT
+/// load-guard marker). The install is live (no restart) and the frame is repainted so the new
 /// strings show immediately.
-fn apply_ui_language_change(ui: &egui::Ui, state: &mut GeneralSettingsPanelState) {
+fn apply_ui_language_change(ui: &egui::Ui, state: &mut GeneralSettingsPanelState, outcome: &mut GeneralSettingsOutcome) {
     let tag = state.ui_language_tag.clone();
-    if let Err(err) = persist_general_key(
-        ms_config::GENERAL_UI_LANGUAGE_KEY,
-        serde_json::Value::String(tag.clone()),
-    ) {
-        runtime_log::log_error(format!(
-            "[general-settings] failed to persist ui language '{tag}'; error={err}"
-        ));
-        state.status =
-            GeneralSettingsStatus::Error(t!("settings.general.ui_language_save_error").to_string());
-    }
+    let value = serde_json::Value::String(tag.clone());
+    persist_general_key(ui.ctx(), state, ms_config::GENERAL_UI_LANGUAGE_KEY, value, PersistOrigin::UiLanguage(tag.clone()), outcome);
     install_selected_ui_locale(&tag);
     ui.ctx().request_repaint();
 }
@@ -1157,9 +1147,8 @@ fn normalize_projects_dir_value(raw_value: &str) -> String {
 /// as the localized parse error and is NEVER overwritten. Returns a user-facing error
 /// string on failure.
 ///
-/// Runs on the GUI thread (explicit user action, one tiny write). That is a known
-/// CLAUDE.md §5 exception kept as-is in this step; the write may briefly wait behind
-/// another user-config writer holding the transaction lock.
+/// Blocking: the may-wait-on-the-lock write itself. This pane calls it only from its
+/// background `ConfigKeyWriter`; the launcher's first-run modal still calls it directly.
 ///
 /// `pub` so the launcher's first-run language modal persists both language keys
 /// (`General.ui_language` + `TextTab.text_language`) atomically through this one path.
@@ -1224,9 +1213,221 @@ fn config_write_error_message(path: &std::path::Path, err: &anyhow::Error) -> St
     }
 }
 
-/// Thin wrapper over [`persist_config_keys`] for a single `General.<key>` write.
-fn persist_general_key(key: &str, value: serde_json::Value) -> Result<(), String> {
-    persist_config_keys(&[("General", key, value)])
+/// Queues one `General.<key> = value` write on the panel's background writer, spawning the
+/// writer on first use. `origin` says what the result is applied to
+/// ([`apply_finished_writes`]). A writer that cannot be started or is gone reports the write
+/// as failed at once (applied to `state` / `outcome` like any failure); the value is never
+/// written on the GUI thread instead.
+fn persist_general_key(ctx: &egui::Context, state: &mut GeneralSettingsPanelState, key: &'static str, value: serde_json::Value, origin: PersistOrigin, outcome: &mut GeneralSettingsOutcome) {
+    let job = PersistJob { entries: vec![("General", key, value)], origin, repaint: Some(ctx.clone()), pending: PendingConfigWrite::begin() };
+    if state.config_writer.is_none() {
+        match ConfigKeyWriter::spawn(ms_config::user_config_path()) {
+            Ok(writer) => state.config_writer = Some(writer),
+            Err(err) => {
+                let message = format!("the settings save thread could not be started: {err}");
+                runtime_log::log_error(format!("[general-settings] {message}; the change of General.{key} is not saved. Possible cause: the OS thread limit or low memory"));
+                apply_persist_result(state, outcome, PersistResult { origin: job.origin, result: Err(message) });
+                return;
+            }
+        }
+    }
+    let Some(writer) = state.config_writer.as_ref() else {
+        return;
+    };
+    if let Err(unsent) = writer.submit(job) {
+        // The worker never exits while its sender lives, so this means it died (a panic):
+        // drop it so the next write starts a fresh one, and report this write as failed.
+        state.config_writer = None;
+        let message = "the settings save thread stopped unexpectedly".to_string();
+        runtime_log::log_error(format!("[general-settings] {message}; the change of General.{key} is not saved"));
+        apply_persist_result(state, outcome, PersistResult { origin: unsent.origin, result: Err(message) });
+    }
+}
+
+/// What a queued write of this pane was for: decides where its result lands
+/// ([`apply_persist_result`]). Values are kept for the log lines and the saved projects root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PersistOrigin {
+    /// `General.projects_dir`, with the normalized root that was written.
+    ProjectsDir(String),
+    /// `General.memory_profile` (its config string).
+    MemoryProfile(&'static str),
+    /// `General.ui_scale_percent`.
+    UiScale(u32),
+    /// One of the two `General.autosave_*` keys.
+    Autosave { key: &'static str, value: u32 },
+    /// `General.secondary_windows` (its config string).
+    SecondaryWindows(&'static str),
+    /// `General.touch_gestures`.
+    TouchGestures(bool),
+    /// `General.ui_language` (the tag).
+    UiLanguage(String),
+}
+
+/// One write for [`ConfigKeyWriter`]: the `(section, key, value)` entries of ONE
+/// `persist_config_keys_at` transaction, what it was for, the context to wake when its
+/// result is ready (`None` in tests), and the token that keeps the process from exiting
+/// before the write returned (dropped by the worker right after it).
+struct PersistJob {
+    entries: Vec<(&'static str, &'static str, serde_json::Value)>,
+    origin: PersistOrigin,
+    repaint: Option<egui::Context>,
+    pending: PendingConfigWrite,
+}
+
+impl std::fmt::Debug for PersistJob {
+    // Manual: `egui::Context` is not the interesting part, and values may be long.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistJob").field("keys", &self.entries.iter().map(|(section, key, _)| format!("{section}.{key}")).collect::<Vec<_>>()).field("origin", &self.origin).finish_non_exhaustive()
+    }
+}
+
+/// A finished write: its origin and the user-facing error message on failure (already logged
+/// with the keys and the path by `persist_config_keys_at`).
+#[derive(Debug)]
+struct PersistResult {
+    origin: PersistOrigin,
+    result: Result<(), String>,
+}
+
+/// The background writer of one panel state: a single worker that performs the queued
+/// [`PersistJob`]s in submission order against one `user_config` path and reports each
+/// [`PersistResult`]. The worker ends once the writer is dropped and its queue is drained (it
+/// is detached: nothing joins it on the GUI thread).
+#[derive(Debug)]
+struct ConfigKeyWriter {
+    jobs: Sender<PersistJob>,
+    results: Receiver<PersistResult>,
+}
+
+impl ConfigKeyWriter {
+    /// Starts the worker writing to `path`.
+    ///
+    /// # Errors
+    /// The OS error when the thread cannot be started.
+    fn spawn(path: PathBuf) -> std::io::Result<Self> {
+        let (jobs, job_rx) = mpsc::channel::<PersistJob>();
+        let (result_tx, results) = mpsc::channel::<PersistResult>();
+        let _detached = thread::Builder::new().name("general-settings-config-writer".to_string()).spawn(move || {
+            while let Ok(job) = job_rx.recv() {
+                let result = persist_config_keys_at(&path, &job.entries);
+                // The write returned: the process may exit now without losing it.
+                drop(job.pending);
+                if result_tx.send(PersistResult { origin: job.origin, result }).is_err() {
+                    // The panel is gone; keep draining so every queued value still reaches the disk.
+                    runtime_log::log_info("[general-settings] a settings write finished after its panel closed");
+                }
+                if let Some(ctx) = job.repaint {
+                    ctx.request_repaint();
+                }
+            }
+        })?;
+        Ok(Self { jobs, results })
+    }
+
+    /// Queues `job`; gives it back when the worker is gone.
+    fn submit(&self, job: PersistJob) -> Result<(), PersistJob> {
+        self.jobs.send(job).map_err(|mpsc::SendError(job)| job)
+    }
+}
+
+/// Applies every result the panel's writer finished since the last frame, in order. A writer
+/// whose worker died is dropped (the next write starts a new one).
+fn apply_finished_writes(state: &mut GeneralSettingsPanelState, outcome: &mut GeneralSettingsOutcome) {
+    let Some(writer) = state.config_writer.as_ref() else {
+        return;
+    };
+    let mut finished = Vec::new();
+    let mut lost = false;
+    loop {
+        match writer.results.try_recv() {
+            Ok(result) => finished.push(result),
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                lost = true;
+                break;
+            }
+        }
+    }
+    if lost {
+        runtime_log::log_error("[general-settings] the settings save thread stopped unexpectedly; writes still queued on it are lost");
+        state.config_writer = None;
+        if state.projects_dir_save_pending && !finished.iter().any(|done| matches!(done.origin, PersistOrigin::ProjectsDir(_))) {
+            // Its answer will never come: release the save button.
+            state.projects_dir_save_pending = false;
+            state.status = GeneralSettingsStatus::Error(tf!("settings.general.projects_dir_save_error", err = "the settings save thread stopped unexpectedly"));
+            outcome.changed_settings.push(SettingChange::ProjectsRoot);
+        }
+    }
+    for result in finished {
+        apply_persist_result(state, outcome, result);
+    }
+}
+
+/// Applies one finished write to the panel: a saved projects root updates the saved value and
+/// the outcome; every failure is logged and shown on the status line with the setting's own
+/// message; the checked settings (projects root, UI language) are reported in
+/// `changed_settings` whatever the result (the recheck reads what is on disk).
+fn apply_persist_result(state: &mut GeneralSettingsPanelState, outcome: &mut GeneralSettingsOutcome, done: PersistResult) {
+    let PersistResult { origin, result } = done;
+    match origin {
+        PersistOrigin::ProjectsDir(normalized) => {
+            state.projects_dir_save_pending = false;
+            match result {
+                Ok(()) => {
+                    // The field shows the normalized form unless the user edited it meanwhile.
+                    if normalize_projects_dir_value(&state.projects_dir_input) == normalized {
+                        state.projects_dir_input.clone_from(&normalized);
+                    }
+                    state.saved_projects_dir.clone_from(&normalized);
+                    state.status = GeneralSettingsStatus::Success(t!("settings.general.projects_dir_saved").to_string());
+                    outcome.projects_dir_saved = Some(PathBuf::from(normalized));
+                }
+                Err(err) => {
+                    runtime_log::log_error(format!("[general-settings] failed to persist projects directory '{normalized}'; error={err}"));
+                    state.status = GeneralSettingsStatus::Error(tf!("settings.general.projects_dir_save_error", err = err));
+                }
+            }
+            outcome.changed_settings.push(SettingChange::ProjectsRoot);
+        }
+        PersistOrigin::MemoryProfile(profile) => {
+            if let Err(err) = result {
+                runtime_log::log_error(format!("[general-settings] failed to persist memory profile '{profile}'; error={err}"));
+                state.status = GeneralSettingsStatus::Error(t!("settings.general.memory_profile_save_error").to_string());
+            }
+        }
+        PersistOrigin::UiScale(percent) => {
+            if let Err(err) = result {
+                runtime_log::log_error(format!("[general-settings] failed to persist ui scale '{percent}%'; error={err}"));
+                state.status = GeneralSettingsStatus::Error(t!("settings.general.ui_scale_save_error").to_string());
+            }
+        }
+        PersistOrigin::Autosave { key, value } => {
+            if let Err(err) = result {
+                runtime_log::log_error(format!("[general-settings] failed to persist autosave setting '{key}'={value}; error={err}"));
+                state.status = GeneralSettingsStatus::Error(tf!("settings.general.autosave_save_error", err = err));
+            }
+        }
+        PersistOrigin::SecondaryWindows(setting) => {
+            if let Err(err) = result {
+                runtime_log::log_error(format!("[general-settings] failed to persist the secondary-window setting '{setting}'; error={err}"));
+                state.status = GeneralSettingsStatus::Error(t!("settings.general.secondary_windows_save_error").to_string());
+            }
+        }
+        PersistOrigin::TouchGestures(enabled) => {
+            if let Err(err) = result {
+                runtime_log::log_error(format!("[general-settings] failed to persist the touchscreen-gestures setting '{enabled}'; error={err}"));
+                state.status = GeneralSettingsStatus::Error(t!("settings.general.touch_gestures_save_error").to_string());
+            }
+        }
+        PersistOrigin::UiLanguage(tag) => {
+            if let Err(err) = result {
+                runtime_log::log_error(format!("[general-settings] failed to persist ui language '{tag}'; error={err}"));
+                state.status = GeneralSettingsStatus::Error(t!("settings.general.ui_language_save_error").to_string());
+            }
+            outcome.changed_settings.push(SettingChange::UiLanguage);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1275,6 +1476,92 @@ mod tests {
         assert!(result.is_err(), "a malformed config must fail the save");
         assert_eq!(std::fs::read_to_string(&path).expect("read back"), broken);
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// Waits (bounded) for the next result of `writer`.
+    fn next_result(writer: &ConfigKeyWriter) -> PersistResult {
+        writer.results.recv_timeout(std::time::Duration::from_secs(10)).expect("the writer answers")
+    }
+
+    /// The background writer performs queued writes in submission order (the last value of a
+    /// key wins on disk), preserves unrelated keys, and answers each with its origin.
+    #[test]
+    fn config_key_writer_writes_in_order_and_answers_each_job() {
+        let path = temp_config_path("writer-order");
+        let dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::fs::write(&path, r#"{"General":{"keep":1},"Other":{"x":true}}"#).expect("seed config");
+
+        let writer = ConfigKeyWriter::spawn(path.clone()).expect("spawn writer");
+        for percent in [110_u32, 125, 150] {
+            let job = PersistJob { entries: vec![("General", ms_config::GENERAL_UI_SCALE_PERCENT_KEY, serde_json::Value::from(percent))], origin: PersistOrigin::UiScale(percent), repaint: None, pending: PendingConfigWrite::begin() };
+            writer.submit(job).expect("queue job");
+        }
+        for percent in [110_u32, 125, 150] {
+            let done = next_result(&writer);
+            assert_eq!(done.origin, PersistOrigin::UiScale(percent), "answers come in submission order");
+            assert!(done.result.is_ok(), "{:?}", done.result);
+        }
+        let root: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("read back")).expect("parse back");
+        assert_eq!(root, serde_json::json!({"General": {"keep": 1, ms_config::GENERAL_UI_SCALE_PERCENT_KEY: 150}, "Other": {"x": true}}));
+        drop(writer);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A failed write (malformed config) is answered as an error and leaves the file untouched;
+    /// applied to the panel, a failed projects-root save releases the pending flag, shows the
+    /// error and still reports the checked setting.
+    #[test]
+    fn config_key_writer_reports_a_failed_write_and_the_panel_applies_it() {
+        let path = temp_config_path("writer-malformed");
+        let dir = path.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let broken = "{\"General\": ";
+        std::fs::write(&path, broken).expect("seed broken config");
+
+        let writer = ConfigKeyWriter::spawn(path.clone()).expect("spawn writer");
+        let origin = PersistOrigin::ProjectsDir("/home/u/Projects".to_string());
+        let job = PersistJob { entries: vec![("General", ms_config::GENERAL_PROJECTS_DIR_KEY, serde_json::json!("/home/u/Projects"))], origin: origin.clone(), repaint: None, pending: PendingConfigWrite::begin() };
+        writer.submit(job).expect("queue job");
+        let done = next_result(&writer);
+        assert_eq!(done.origin, origin);
+        assert!(done.result.is_err(), "a malformed config must fail the save");
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), broken);
+
+        let mut state = GeneralSettingsPanelState::new();
+        let saved_before = state.saved_projects_dir.clone();
+        state.projects_dir_save_pending = true;
+        let mut outcome = GeneralSettingsOutcome::default();
+        apply_persist_result(&mut state, &mut outcome, done);
+        assert!(!state.projects_dir_save_pending);
+        assert_eq!(state.saved_projects_dir, saved_before, "a failed save keeps the saved root");
+        assert!(matches!(state.status, GeneralSettingsStatus::Error(_)));
+        assert!(outcome.projects_dir_saved.is_none());
+        assert_eq!(outcome.changed_settings, vec![SettingChange::ProjectsRoot]);
+        drop(writer);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A successful projects-root save updates the saved root and the outcome, and normalizes the
+    /// field only when the user did not edit it meanwhile.
+    #[test]
+    fn a_successful_projects_root_save_updates_the_saved_root() {
+        let mut state = GeneralSettingsPanelState::new();
+        state.projects_dir_input = "  /home/u/Projects  ".to_string();
+        state.projects_dir_save_pending = true;
+        let mut outcome = GeneralSettingsOutcome::default();
+        apply_persist_result(&mut state, &mut outcome, PersistResult { origin: PersistOrigin::ProjectsDir("/home/u/Projects".to_string()), result: Ok(()) });
+        assert_eq!(state.saved_projects_dir, "/home/u/Projects");
+        assert_eq!(state.projects_dir_input, "/home/u/Projects", "the unedited field shows the normalized root");
+        assert!(matches!(state.status, GeneralSettingsStatus::Success(_)));
+        assert_eq!(outcome.projects_dir_saved, Some(PathBuf::from("/home/u/Projects")));
+        assert_eq!(outcome.changed_settings, vec![SettingChange::ProjectsRoot]);
+
+        state.projects_dir_input = "/home/u/Other".to_string();
+        let mut outcome = GeneralSettingsOutcome::default();
+        apply_persist_result(&mut state, &mut outcome, PersistResult { origin: PersistOrigin::ProjectsDir("/home/u/Projects2".to_string()), result: Ok(()) });
+        assert_eq!(state.projects_dir_input, "/home/u/Other", "an edit made meanwhile is kept");
+        assert_eq!(state.saved_projects_dir, "/home/u/Projects2");
     }
 
     #[test]

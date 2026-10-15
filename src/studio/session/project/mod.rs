@@ -31,14 +31,17 @@ mod discard;
 mod exit_dialog;
 mod page_op;
 mod save;
+mod staging_probe;
 
 use crate::studio::PendingCloseAction;
 use crate::studio::busy::{PersistenceActivity, PersistenceJobs};
 use crate::studio::close_flow::SaveThenCloseEnd;
-use crate::studio::session::{DeferredTabEdits, SessionParts};
+use crate::studio::session::{DeferredTabEdits, SessionParts, canvas_bubble_edits_pending};
+use self::staging_probe::StagingDirProbe;
 use crate::page_ops::PageOpOutcome;
 use crate::runtime_log;
 use eframe::egui;
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 /// What `poll_save_to_project` (`save.rs`) saw this frame.
@@ -78,7 +81,7 @@ struct PendingExitCleanup {
 /// in `save.rs`, `page_op.rs` and `discard.rs` use.
 pub(in crate::studio) struct ProjectSession {
     /// Active "save to project" merge job.
-    save_to_project_rx: Option<Receiver<Result<(), String>>>,
+    save_to_project_rx: Option<Receiver<Result<save::MergeDone, String>>>,
     /// Status text shown next to the "save to project" button, with the app time it was set
     /// (`0.0` = keep until replaced).
     save_to_project_status: Option<(String, f64)>,
@@ -112,6 +115,8 @@ pub(in crate::studio) struct ProjectSession {
     has_unsaved_changes_cached: bool,
     /// App time (seconds) of the next throttled unsaved-changes probe.
     next_unsaved_dir_check_s: f64,
+    /// The off-GUI-thread staging-directory check the throttled refresh asks (`staging_probe.rs`).
+    staging_probe: StagingDirProbe,
     /// A save-to-project merge succeeded since the last `take_committed_tree_changed`: the
     /// committed chapter tree changed under the tabs that cache a view of it.
     committed_tree_changed: bool,
@@ -120,8 +125,9 @@ pub(in crate::studio) struct ProjectSession {
 impl ProjectSession {
     /// The state of a freshly opened chapter: nothing running; unsaved iff a staging dir from an
     /// earlier session existed when it opened (`has_staging`, probed by `StudioBootstrap` off the
-    /// GUI thread). No I/O.
-    pub(in crate::studio) fn new(has_staging: bool) -> Self {
+    /// GUI thread). `unsaved_dir` is the chapter's staging directory, for the later probes. No I/O,
+    /// no thread (the probe worker starts on the first refresh that needs it).
+    pub(in crate::studio) fn new(has_staging: bool, unsaved_dir: PathBuf) -> Self {
         Self {
             save_to_project_rx: None,
             save_to_project_status: None,
@@ -133,6 +139,7 @@ impl ProjectSession {
             pending_project_reload: false,
             has_unsaved_changes_cached: has_staging,
             next_unsaved_dir_check_s: 0.0,
+            staging_probe: StagingDirProbe::new(unsaved_dir),
             committed_tree_changed: false,
         }
     }
@@ -151,6 +158,14 @@ impl ProjectSession {
     /// Latches the cached unsaved flag (the bubbles model changed revision).
     pub(in crate::studio) fn note_unsaved(&mut self) {
         self.has_unsaved_changes_cached = true;
+    }
+
+    /// Sets the cached unsaved flag after a save or a discard decided it (`unsaved`), and drops
+    /// every staging-probe answer asked before: that answer described the directory as it was
+    /// before the merge / delete and must not re-latch the flag.
+    fn reset_unsaved_after_persist(&mut self, unsaved: bool) {
+        self.has_unsaved_changes_cached = unsaved;
+        self.staging_probe.invalidate();
     }
 
     /// Returns and clears the request to rebuild the app from the project on disk.
@@ -241,11 +256,13 @@ impl ProjectSession {
     /// Refreshes the cached unsaved-changes flag.
     ///
     /// `has_unsaved_changes_cached` is a sticky latch that is only cleared on an explicit
-    /// save (`mark_saved_to_project`). While it is already true there is nothing to
-    /// recompute, so the per-frame model locks and the staging-dir probe are skipped.
-    /// While it is false the work is throttled to roughly once per second via the existing
+    /// save or discard (`reset_unsaved_after_persist`). While it is already true there is nothing
+    /// to recompute, so the per-frame model locks and the staging-dir probe are skipped.
+    /// While it is false the work is throttled to roughly once per second via the
     /// `next_unsaved_dir_check_s` timer; this keeps the GUI thread off the shared model
-    /// locks every frame while still surfacing new unsaved state within ~1s.
+    /// locks every frame while still surfacing new unsaved state within ~1s. The staging
+    /// directory itself is never stat-ed here: [`StagingDirProbe`] asks a worker and its answer
+    /// is taken on a later frame (it latches the flag when the directory exists).
     fn refresh_unsaved_changes_cache(&mut self, now: f64, parts: &SessionParts<'_>) {
         // The DISCARD path is already committed: the staging dir is being deleted and every pending
         // write was dropped, so there is nothing left to report and recomputing can only do harm.
@@ -258,21 +275,29 @@ impl ProjectSession {
         // `abort_discard_after_failed_cleanup`, which clears it and re-reports the session as unsaved,
         // so this fn starts answering honestly again for the app that keeps running. On SUCCESS the
         // latch stays set — that branch dispatches the window close itself, so the quiet is correct.
+        // A probe answer asked before the discard describes a directory being deleted: dropped.
         if parts.writers.is_discarding() {
-            self.has_unsaved_changes_cached = false;
+            self.reset_unsaved_after_persist(false);
             return;
+        }
+        // The answer to the last staging-dir question, asked on an earlier refresh. Taken before the
+        // throttle so it latches as soon as it arrives.
+        if self.staging_probe.poll() == Some(true) {
+            self.has_unsaved_changes_cached = true;
         }
         if self.has_unsaved_changes_cached || now < self.next_unsaved_dir_check_s {
             return;
         }
         self.next_unsaved_dir_check_s = now + 1.0;
-        // A DEFERRED tab edit (typing text, PS-editor layer visibility / opacity / collapse) is
-        // unsaved work that has not reached the disk yet, so the staging-dir probe at the end of this
-        // fn cannot see it. Ask the one owner of that question (`DeferredTabEdits`, shared with the
-        // image set): otherwise an edit made shortly before closing, with no other unsaved state to
-        // have created the staging dir, would leave this false and the exit dialog would not offer
-        // to save the chapter. Latched here, so it survives the flush that writes it to staging.
-        if DeferredTabEdits::of(parts.typing, parts.ps_editor).any() {
+        // A DEFERRED tab edit (typing text, PS-editor layer visibility / opacity / collapse, a canvas
+        // bubble edit not yet pushed into the bubbles model) is unsaved work that has not reached the
+        // disk yet, so the staging-dir probe cannot see it. Ask the one owner of that question
+        // (`DeferredTabEdits`, shared with the image set): otherwise an edit made shortly before
+        // closing, with no other unsaved state to have created the staging dir, would leave this
+        // false and the exit dialog would not offer to save the chapter. Latched here, so it survives
+        // the flush that writes it to staging.
+        let canvas_bubbles = canvas_bubble_edits_pending(parts.translation_canvas, parts.cleaning, parts.typing);
+        if DeferredTabEdits::of(parts.typing, parts.ps_editor, canvas_bubbles).any() {
             self.has_unsaved_changes_cached = true;
             return;
         }
@@ -300,7 +325,10 @@ impl ProjectSession {
             self.has_unsaved_changes_cached = true;
             return;
         }
-        self.has_unsaved_changes_cached = parts.project.paths.unsaved_dir.exists();
+        // No in-memory fact says unsaved: whatever else wrote staging (the translation tab and the
+        // canvas write some files there directly) shows only in the directory itself. Asked off the
+        // GUI thread; a positive answer latches the flag on the frame it arrives (above).
+        self.staging_probe.request();
     }
 }
 
@@ -312,7 +340,7 @@ mod tests {
     /// exactly once: `StudioApp::ui` drains it every frame, so one merge notifies the tabs once.
     #[test]
     fn the_committed_tree_latch_is_drained_once() {
-        let mut session = ProjectSession::new(false);
+        let mut session = ProjectSession::new(false, std::path::PathBuf::new());
         assert!(!session.take_committed_tree_changed());
         session.committed_tree_changed = true;
         assert!(session.take_committed_tree_changed());

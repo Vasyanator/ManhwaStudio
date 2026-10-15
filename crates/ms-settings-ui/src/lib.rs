@@ -13,6 +13,8 @@ Main modules:
 - `general_settings_panel`: the "Общие" pane (projects root, storage mode, memory profile,
   UI language, UI scale, typesetting language, startup monitor) plus the process-wide
   UI-scale slot every `eframe::run_native` creator applies.
+- `pending_config_writes`: the process-wide count of queued background `user_config` writes
+  (General pane, launcher last selection) that the binary waits for after the window closed.
 - `storage_mode_job` / `storage_mode_setting`: the process-wide Dev/Prod conversion job
   (named worker running `ms_project::storage_mode::convert_globals`) and its pane row.
 - `ai_backend_panel`: the AI-backend pane (runtime selection, ONNX provider/device/build,
@@ -42,6 +44,8 @@ extern crate ms_i18n;
 pub mod ai_backend_panel;
 pub mod ai_backend_supervisor;
 pub mod general_settings_panel;
+// Process-wide count of background `user_config` writes, waited for at process exit.
+pub mod pending_config_writes;
 // Probed ONNX capabilities and the device-id rule over them (native-only probes).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod onnx_caps;

@@ -20,9 +20,8 @@ GUI-free crate never carries localized text, but any label it hands the UI is a
 catalog key resolved here.
 */
 
-// `resolve_key` is DECLARED in `ms_i18n`; every caller now names it there directly (the
-// launcher and the settings panes became crates of their own, and both sit above `ms-i18n`).
-// This module is therefore no longer a re-export — it exists ONLY to host the tests below.
+// `resolve_key` is DECLARED in `ms_i18n` and every caller names it there directly; this
+// module re-exports nothing and exists ONLY to host the tests below.
 //
 // They stay HERE, not in `ms-i18n`: they assert against the key sets of `ms-text-util` and
 // against `ms_config::locale_store::GLOBAL_LOCALE_LOCK`, and `ms-i18n` sits BELOW both —

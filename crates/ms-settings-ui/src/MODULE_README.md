@@ -65,6 +65,9 @@ not the dependency list.
 - `storage_mode_setting.rs`: the General pane's storage row (radio Prod/Dev, explanation,
   progress, failure list — the list is reused by the launcher main page). The shown mode is
   `ms_docstore::default_format()`; web builds show an explanation only (Dev-only store).
+- `pending_config_writes.rs`: `PendingConfigWrite` tokens counting queued background
+  `user_config` writes (General pane writer, launcher last-selection writer) and
+  `wait_for_pending_config_writes`, the bounded wait the binary runs after the main window closed.
 - `general_settings_panel.rs`: projects root, storage mode, memory profile, UI language, UI scale,
   autosave policy (interval + action threshold, live in `ms_config::autosave_policy`), typesetting
   language, startup monitor, secondary windows, the touchscreen-gestures switch
@@ -143,8 +146,10 @@ not the dependency list.
   never by `std::fs` on `user_config.json` here; reads use the ms-config readers
   (`load_user_config`, `ort_load_guard::read_user_config_root`). A malformed file is surfaced
   and never overwritten. That is also why those writers live in `ms-config` and not in the
-  studio settings tab. Known exception to the GUI-thread rule: `persist_config_keys` runs
-  synchronously on the GUI thread (one tiny write per explicit user action).
+  studio settings tab. The General pane never writes on the GUI thread: its keys go through
+  its per-state `ConfigKeyWriter` worker (FIFO, results applied at the next draw or
+  `GeneralSettingsPanelState::take_finished_writes`). Known exception to the GUI-thread rule:
+  the launcher's first-run language modal still calls `persist_config_keys` synchronously.
 - **The `tutorial` feature is NOT inherited.** The root crate forwards it
   (`tutorial = ["ms-settings-ui/tutorial"]`). Enabling one without the other silently drops
   the tours from half the app.
@@ -160,8 +165,9 @@ not the dependency list.
   The autostart gate is polled on the supervisor worker, never on the GUI thread.
 - **Outcomes carry changed settings.** `SharedSectionOutcome::changed_settings` (fed by
   `GeneralSettingsOutcome` and `AiBackendPanelOutcome`) lists the checked settings whose
-  write ran this frame: the General pane's synchronous saves (projects root, UI language)
-  on the click; the AI pane's off-thread saves (runtime, build, EP/device, ORT guard reset)
+  write ran this frame: the General pane's background saves (projects root, UI language)
+  once the write returned (drained at the pane's draw or by
+  `GeneralSettingsPanelState::take_finished_writes`); the AI pane's off-thread saves (runtime, build, EP/device, ORT guard reset)
   only after the write returned, over the state's completion channel (`PendingChanges`),
   drained on every shared-section draw and by `SharedSettingsPanels::take_landed_changes`
   (no draw; the launcher calls it every frame, so a write landing while a launcher-only tab

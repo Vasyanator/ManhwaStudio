@@ -23,6 +23,10 @@
 //   stopped request is published as `RecognizeCancelled`, never as an error. The answer is
 //   cleaned (`<think>` blocks, a code fence wrapping the whole answer) before line
 //   splitting; an answer left empty by that is asked for ONCE more (`ai_api_ocr_validation`).
+//   Line split + "keep line breaks" join: the shared `assemble_line_ocr_result`. The default
+//   system instruction has one owner (`default_ai_api_ocr_instruction`, worded for the OCR
+//   input language); an untouched stored default follows the language
+//   (`effective_ai_api_ocr_instruction`), a user edit is sent as typed.
 // - Post-OCR processing (`apply_post_ocr_processing`) runs in the worker before
 //   the result is published, so every engine path and the stored last result
 //   share the same text: character substitution (`CharReplacementRule`) first,
@@ -173,6 +177,9 @@ pub struct OcrRuntimeOptions {
     pub ai_api_base_url: String,
     pub ai_api_model: String,
     pub ai_api_system_instruction: String,
+    /// OCR input language for the AI API default instruction (the MT source-language code;
+    /// `auto` names none), see `effective_ai_api_ocr_instruction`.
+    pub ai_api_source_lang: String,
 }
 
 /// A single post-OCR character-substitution rule applied to recognized text.
@@ -1205,12 +1212,13 @@ fn load_user_settings_for_routing() -> Value {
     }
 }
 
-/// Assembles an [`OcrRecognizeResult`] from a single native MangaOCR string,
-/// applying `join_newlines`/`reflect_strings` exactly like the backend path: split
-/// on newlines and drop blank lines; reverse line order when `reflect_strings`;
-/// join with `"\n"` (or `" "`) per `join_newlines`, then trim.
+/// Assembles an [`OcrRecognizeResult`] from one recognized string (native ONNX engines and
+/// the AI API answer), applying `join_newlines`/`reflect_strings` exactly like the backend
+/// path: split on newlines and drop blank lines; reverse line order when `reflect_strings`;
+/// join with `"\n"` (or `" "`) per `join_newlines`, then trim. The one owner of the
+/// Rust-side line join, so every route honours "keep line breaks" the same way.
 #[cfg(not(target_arch = "wasm32"))]
-fn assemble_native_ocr_result(
+fn assemble_line_ocr_result(
     text: &str,
     join_newlines: bool,
     reflect_strings: bool,
@@ -1352,7 +1360,7 @@ fn try_native_ocr(
     };
 
     // Run the native op. PaddleOCR returns lines already; join them so the shared
-    // `assemble_native_ocr_result` applies the same join/reflect logic as MangaOCR.
+    // `assemble_line_ocr_result` applies the same join/reflect logic as MangaOCR.
     let native_result: Result<String, native_runtime::NativeRuntimeError> = match route {
         OcrRoute::NativeManga(variant) => {
             native_runtime::recognize_manga(variant, &rgba, cancel, &mut progress)
@@ -1372,7 +1380,7 @@ fn try_native_ocr(
     };
 
     match native_result {
-        Ok(text) => NativeOcrOutcome::Ok(assemble_native_ocr_result(
+        Ok(text) => NativeOcrOutcome::Ok(assemble_line_ocr_result(
             &text,
             request.join_newlines,
             request.reflect_strings,
@@ -1885,14 +1893,16 @@ fn run_ai_api_ocr_request(
         Err(err) => return Err(OcrFailure::Failed(tf!("translation.ocr.ai_api_request_failed_error", err = err.chat_failure_detail()))),
     };
 
-    let lines = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    Ok(ai_api_ocr_result(&text, request.join_newlines))
+}
 
-    Ok(OcrRecognizeResult { lines, text })
+/// Turns a cleaned AI API OCR answer into the published result through the shared
+/// `assemble_line_ocr_result`, honouring `join_newlines`. `reflect_strings` is NOT applied
+/// here: for this route it is already part of the prompt (the model is asked to read columns
+/// right-to-left), so reversing the answer's lines again would undo that order.
+#[cfg(not(target_arch = "wasm32"))]
+fn ai_api_ocr_result(answer: &str, join_newlines: bool) -> OcrRecognizeResult {
+    assemble_line_ocr_result(answer, join_newlines, false)
 }
 
 /// Cleans an AI API OCR answer (`strip_think_blocks`, then `clean_plain_text`) and asks for ONE
@@ -1910,12 +1920,70 @@ fn ai_api_ocr_validation(answer: &TrackedAnswer, _attempt: u8) -> Validation<Str
     Validation { value: text, repair }
 }
 
+/// The instruction actually sent for an AI API OCR request (see
+/// `effective_ai_api_ocr_instruction`).
 fn normalized_ai_api_system_instruction(options: &OcrRuntimeOptions) -> String {
-    let trimmed = options.ai_api_system_instruction.trim();
-    if trimmed.is_empty() {
-        "You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /".to_string()
+    effective_ai_api_ocr_instruction(&options.ai_api_system_instruction, &options.ai_api_source_lang)
+}
+
+// The default AI API OCR system instruction, in three parts: the language clause sits between
+// HEAD and TAIL. These constants are the ONE owner of that text (the OCR panel's initial value
+// and the request-time fallback both come from `default_ai_api_ocr_instruction`). Editing them
+// changes what `is_default_ai_api_ocr_instruction` recognizes: a stored default written with
+// the old text then counts as a user edit and stops following the language.
+const AI_API_OCR_INSTRUCTION_HEAD: &str = "You are an OCR engine for manga and comics. Recognize text exactly as it is written";
+const AI_API_OCR_INSTRUCTION_LANGUAGE_PREFIX: &str = ", primarily in the following language: ";
+const AI_API_OCR_INSTRUCTION_TAIL: &str = ". Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /";
+/// Longest language slot `is_default_ai_api_ocr_instruction` accepts (longer = user prose).
+const AI_API_OCR_INSTRUCTION_MAX_LANGUAGE_CHARS: usize = 40;
+
+/// The default AI API OCR system instruction for the OCR input language `source_lang` (the MT
+/// panel's source-language code, e.g. `ko`, `ja`, `zh-cn`; the tab's documented OCR input
+/// language). `auto` or a blank code names no language: the language clause is left out.
+pub(crate) fn default_ai_api_ocr_instruction(source_lang: &str) -> String {
+    let lang = source_lang.trim();
+    if lang.is_empty() || lang.eq_ignore_ascii_case("auto") {
+        format!("{AI_API_OCR_INSTRUCTION_HEAD}{AI_API_OCR_INSTRUCTION_TAIL}")
     } else {
-        trimmed.to_string()
+        format!("{AI_API_OCR_INSTRUCTION_HEAD}{AI_API_OCR_INSTRUCTION_LANGUAGE_PREFIX}{lang}{AI_API_OCR_INSTRUCTION_TAIL}")
+    }
+}
+
+/// Whether `instruction` is an untouched default rather than a user edit: blank, the
+/// language-less default, or the default with any short single-line language slot (any
+/// language, including the legacy hard-coded `Korean` text older settings stored). Whitespace
+/// around the text is ignored.
+pub(crate) fn is_default_ai_api_ocr_instruction(instruction: &str) -> bool {
+    let text = instruction.trim();
+    if text.is_empty() {
+        return true;
+    }
+    let Some(rest) = text.strip_prefix(AI_API_OCR_INSTRUCTION_HEAD) else {
+        return false;
+    };
+    let Some(slot) = rest.strip_suffix(AI_API_OCR_INSTRUCTION_TAIL) else {
+        return false;
+    };
+    if slot.is_empty() {
+        return true;
+    }
+    let Some(language) = slot.strip_prefix(AI_API_OCR_INSTRUCTION_LANGUAGE_PREFIX) else {
+        return false;
+    };
+    let language = language.trim();
+    !language.is_empty()
+        && language.chars().count() <= AI_API_OCR_INSTRUCTION_MAX_LANGUAGE_CHARS
+        && !language.contains(['.', '\n'])
+}
+
+/// The instruction to use for the stored (persisted, user-editable) `instruction`: an untouched
+/// default (`is_default_ai_api_ocr_instruction`) follows the OCR input language `source_lang`;
+/// a user edit is kept as typed (trimmed).
+pub(crate) fn effective_ai_api_ocr_instruction(instruction: &str, source_lang: &str) -> String {
+    if is_default_ai_api_ocr_instruction(instruction) {
+        default_ai_api_ocr_instruction(source_lang)
+    } else {
+        instruction.trim().to_string()
     }
 }
 
@@ -2011,7 +2079,7 @@ mod tests {
         failure_state_changed,
         AiApiService, CallError, CharReplacementRule, OcrEngine, OcrRecognizeResult,
         OcrRecognizeRequest, OcrRoute, OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements,
-        apply_post_ocr_processing, assemble_native_ocr_result, interpret_call_result,
+        apply_post_ocr_processing, assemble_line_ocr_result, interpret_call_result,
         ExternalModelDirs, ExternalModelSpec, native_failure_should_surface, ocr_header_fields,
         ocr_route, ocr_route_availability, ocr_route_kind, ocr_route_needs_backend_warmup,
         parse_ocr_response,
@@ -2040,6 +2108,7 @@ mod tests {
             ai_api_base_url: String::new(),
             ai_api_model: "gpt-4o-mini".to_string(),
             ai_api_system_instruction: String::new(),
+            ai_api_source_lang: "auto".to_string(),
         }
     }
 
@@ -2670,7 +2739,7 @@ mod tests {
         // A one-line MangaOCR string: lines=[text], text=trimmed, join/reflect no-op.
         for join in [true, false] {
             for reflect in [true, false] {
-                let result = assemble_native_ocr_result("  こんにちは  ", join, reflect);
+                let result = assemble_line_ocr_result("  こんにちは  ", join, reflect);
                 assert_eq!(result.lines, vec!["こんにちは".to_string()]);
                 assert_eq!(result.text, "こんにちは");
             }
@@ -2680,18 +2749,72 @@ mod tests {
     #[test]
     fn assemble_native_result_splits_and_joins_lines() {
         // Blank lines are stripped; join controls the separator.
-        let joined = assemble_native_ocr_result("a\n\nb\n", true, false);
+        let joined = assemble_line_ocr_result("a\n\nb\n", true, false);
         assert_eq!(joined.lines, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(joined.text, "a\nb");
 
-        let spaced = assemble_native_ocr_result("a\n\nb\n", false, false);
+        let spaced = assemble_line_ocr_result("a\n\nb\n", false, false);
         assert_eq!(spaced.lines, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(spaced.text, "a b");
     }
 
+    /// The AI API route honours "keep line breaks" through the shared join (S-006) and never
+    /// reverses the answer's lines: right-to-left order is already asked of the model.
+    #[test]
+    fn ai_api_result_honours_join_newlines_without_reflecting() {
+        let kept = super::ai_api_ocr_result("  first\n\n second \nthird\n", true);
+        assert_eq!(kept.lines, vec!["first".to_string(), "second".to_string(), "third".to_string()]);
+        assert_eq!(kept.text, "first\nsecond\nthird");
+
+        let joined = super::ai_api_ocr_result("  first\n\n second \nthird\n", false);
+        assert_eq!(joined.lines, kept.lines);
+        assert_eq!(joined.text, "first second third");
+    }
+
+    /// The legacy hard-coded instruction older settings stored (S-008): it must still count as
+    /// an untouched default and therefore follow the OCR input language.
+    const LEGACY_KOREAN_INSTRUCTION: &str = "You are an OCR engine for manga and comics. Recognize text exactly as it is written, primarily in the following language: Korean. Pay special attention to the sounds. Do not translate, explain, describe the image, or add captions. Return only the recognized text. If a sound is particularly unclear and you are unsure, list several possible options separated by /";
+
+    #[test]
+    fn default_ai_api_instruction_names_the_source_language_or_none() {
+        let ja = super::default_ai_api_ocr_instruction(" ja ");
+        assert!(ja.contains("primarily in the following language: ja. Pay"), "{ja}");
+        assert_eq!(super::default_ai_api_ocr_instruction("ko"), LEGACY_KOREAN_INSTRUCTION.replace("Korean", "ko"));
+        for auto in ["auto", "AUTO", "  "] {
+            let text = super::default_ai_api_ocr_instruction(auto);
+            assert!(!text.contains("primarily"), "{text}");
+            assert!(text.starts_with("You are an OCR engine") && text.ends_with("separated by /"), "{text}");
+        }
+    }
+
+    #[test]
+    fn untouched_ai_api_instruction_follows_the_language_and_a_user_edit_is_kept() {
+        // Untouched forms: blank, the legacy Korean text, any generated default.
+        for stored in ["", "  \n", LEGACY_KOREAN_INSTRUCTION, &super::default_ai_api_ocr_instruction("auto"), &super::default_ai_api_ocr_instruction("zh-cn")] {
+            assert!(super::is_default_ai_api_ocr_instruction(stored), "{stored}");
+            assert_eq!(super::effective_ai_api_ocr_instruction(stored, "ja"), super::default_ai_api_ocr_instruction("ja"));
+        }
+        // User edits: other prose, an appended sentence, a long language slot.
+        let appended = format!("{LEGACY_KOREAN_INSTRUCTION} Keep the honorifics.");
+        let long_slot = LEGACY_KOREAN_INSTRUCTION.replace("Korean", "Korean, but also read the tiny side notes in the margins");
+        for stored in ["Read Japanese text only.", appended.as_str(), long_slot.as_str()] {
+            assert!(!super::is_default_ai_api_ocr_instruction(stored), "{stored}");
+            assert_eq!(super::effective_ai_api_ocr_instruction(&format!(" {stored} "), "ja"), stored);
+        }
+    }
+
+    /// The request-time instruction reads the stored text and the runtime's source language.
+    #[test]
+    fn request_instruction_resolves_from_runtime_options() {
+        let options = OcrRuntimeOptions { ai_api_source_lang: "ja".to_string(), ..sample_options() };
+        assert_eq!(super::normalized_ai_api_system_instruction(&options), super::default_ai_api_ocr_instruction("ja"));
+        let edited = OcrRuntimeOptions { ai_api_system_instruction: "Custom.".to_string(), ..options };
+        assert_eq!(super::normalized_ai_api_system_instruction(&edited), "Custom.");
+    }
+
     #[test]
     fn assemble_native_result_reflect_reverses_line_order() {
-        let result = assemble_native_ocr_result("first\nsecond\nthird", true, true);
+        let result = assemble_line_ocr_result("first\nsecond\nthird", true, true);
         assert_eq!(
             result.lines,
             vec!["third".to_string(), "second".to_string(), "first".to_string()]

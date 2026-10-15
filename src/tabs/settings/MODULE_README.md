@@ -39,7 +39,7 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   open worker; `new` reads it inline), the canvas binding's pre-read `SpellcheckWordsSeed`,
   section routing (over `settings_shared::sections_for(Studio)`),
   canvas settings binding, the shared `AiBackendHandle`, the `SharedSettingsPanels` container for
-  the General / AiBackend / Tutorials sections, typing-layout persistence helper, and the coalesced
+  the General / AiBackend / Tutorials sections, the `user_config.json` section writers, and the coalesced
   canvas settings save worker. The AiBackend and Tutorials sections are rendered inline in `draw` via
   `shared.draw(...)` (AiBackend inside the scroll area); the General section goes through `general.rs`.
   The projects-dir + memory-profile editing and persistence belong to the shared
@@ -76,15 +76,14 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   in the typing tab's advanced-form window, which spawns the write on its own named thread. Only the
   placement of the object lives here; its SHAPE belongs to `tabs::typing::advanced_form_params`.
   Every `user_config.json` writer of this surface — the `ms-config` savers AND this module's own
-  `save_font_name_display_mode` / `save_typing_panel_layout` / `save_rotation_ctrl_wheel_mode`
+  `save_font_name_display_mode` / `save_rotation_ctrl_wheel_mode`
   (one shared `upsert_user_config_string` helper in `mod.rs`) — is ONE call to
   `config::update_user_config_file` (serialized `ms_docstore::update`, atomic replace). Callers
   must not hold that document lock (`ms_docstore::with_lock`) themselves: it is taken inside and
   is not reentrant. A malformed `user_config.json` is REPORTED and left untouched, never degraded to an
   empty object. The matching readers go through `config::ort_load_guard::read_user_config_root`
   and fall back to their defaults on a missing or malformed document.
-- `general.rs`: thin studio wrapper for the general section. Enforces the studio-only vertical
-  typing-panel layout (persisted off-thread via `save_typing_panel_layout`), then renders the shared
+- `general.rs`: thin studio wrapper for the general section. Renders the shared
   General section through `SettingsTabState.shared.draw(General, ..)` (projects-directory editor,
   global memory-profile combo, UI-language selector, typesetting-language selector) and applies the
   memory-profile runtime effect from its outcome. Projects-dir + memory-profile + UI-language
@@ -197,6 +196,9 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   failed word-list write is reported back by the saver and makes the baseline unknown, so the
   next save retries it. A shutdown/rebind signal (`None`) found while coalescing queued requests
   stops the saver only after the coalesced request was written.
+- When that context-menu worker bumps the words revision, the pane re-reads both lists on a
+  short-lived worker (`refresh_spellcheck_words_if_needed` -> `SpellcheckWordsReload`) and installs
+  the answer whole on a later frame; the GUI thread never reads them.
 - Shared canvas settings changes must update the local snapshot, publish to bound shared models,
   and persist through the settings save worker.
 - Memory profile changes must update the shared `MemoryManager` immediately and persist

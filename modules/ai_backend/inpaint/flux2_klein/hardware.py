@@ -10,8 +10,10 @@ Main responsibilities:
 - `memory_snapshot` - `{vram_total, vram_free, ram_total, ram_free}`, with `0`
   meaning "unknown" rather than "none";
 - `_resolve_selected_backend_device` - `General.ai_device` (`not-selected`
-  included) resolved against the devices actually present;
-- `_clear_torch_cache` - best-effort release of cached device blocks.
+  included) resolved against the devices actually present (binding of
+  `runtime.torch_device.resolve_selected_backend_device`, default policy);
+- `_clear_torch_cache` - best-effort release of cached CUDA blocks (binding of
+  `runtime.torch_device.clear_torch_cache`, MPS cache left alone).
 
 Notes:
 - `memory_snapshot`, `_clear_torch_cache` and `_resolve_selected_backend_device`
@@ -22,19 +24,11 @@ Notes:
 
 from __future__ import annotations
 
+import functools
 import logging
 
-try:
-    from ai_device import AIDevice
-except Exception:  # pragma: no cover - one of the two import roots always works
-    from modules.ai_device import AIDevice
-
 from ...runtime.torch_support import is_torch_available
-
-try:
-    from config import UserConfig
-except Exception:  # pragma: no cover - config is always importable in-app
-    UserConfig = None
+from ...runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 
 log = logging.getLogger(__name__)
 
@@ -102,78 +96,13 @@ def _cuda_device_index(device: str | None) -> int | None:
         return None
 
 
-def _clear_torch_cache() -> None:
-    import gc
+#: `General.ai_device` resolution with this service's device policy (owner:
+#: `runtime.torch_device`); patched by name in the test suite. Unlike
+#: `flux_fill.py`, which pins itself to the discrete GPU, this service honours the
+#: user's device choice: a 9B model is the case where a user with two
+#: accelerators most needs to say which one to use.
+_resolve_selected_backend_device = resolve_selected_backend_device
 
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
-    except Exception:  # noqa: BLE001 - no torch / no accelerator is fine here
-        pass
-
-
-# =====================================================================
-#  Device selection (mirrors the other inpaint services)
-# =====================================================================
-def _resolve_selected_backend_device(fallback: str) -> str:
-    """Resolve `General.ai_device` into a concrete torch device string.
-
-    Unlike `flux_fill.py`, which pins itself to the discrete GPU, this service
-    honours the user's device choice: a 9B model is the case where a user with
-    two accelerators most needs to say which one to use.
-    """
-    fallback_norm = _normalize_backend_device(fallback, "cpu")
-    configured = _read_configured_device()
-    if configured is None:
-        configured = fallback_norm
-
-    normalized = _normalize_backend_device(configured, fallback_norm)
-    available = _safe_available_devices()
-
-    if normalized in available:
-        return normalized
-    if normalized.startswith("cuda") and "cuda" in available:
-        return "cuda"
-    if fallback_norm in available:
-        return fallback_norm
-    if "cuda" in available:
-        return "cuda"
-    return "cpu"
-
-
-def _read_configured_device() -> str | None:
-    """`General.ai_device` from the user config, `None` when unset."""
-    config_root = getattr(UserConfig, "config", None)
-    if not isinstance(config_root, dict):
-        return None
-    general = config_root.get("General")
-    if not isinstance(general, dict):
-        return None
-    value = general.get("ai_device")
-    if not isinstance(value, str):
-        return None
-    value = value.strip().lower()
-    if value == "not-selected":
-        return None
-    return value or None
-
-
-def _safe_available_devices() -> set[str]:
-    try:
-        return set(AIDevice.detect_available_devices())
-    except Exception:  # noqa: BLE001 - detection must never break a request
-        return {"cpu"}
-
-
-def _normalize_backend_device(raw: str, fallback: str) -> str:
-    value = str(raw or "").strip().lower()
-    if value in {"cpu", "mps", "cuda"}:
-        return value
-    if value.startswith("cuda:"):
-        return value
-    return str(fallback or "cpu").strip().lower() or "cpu"
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="FLUX.2 klein", include_mps=False)

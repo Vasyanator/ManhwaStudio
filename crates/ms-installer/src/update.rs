@@ -31,7 +31,7 @@ use ms_config as config;
 use ms_config::version_format::is_remote_newer;
 
 use crate::HostVersion;
-use crate::window::{WindowLook, prepare_window_context};
+use crate::window::prepare_window_context;
 
 use super::download::github_api_get;
 use super::install::TorchInstallSelection;
@@ -97,7 +97,7 @@ fn run_update_window_internal(mode: UpdateMode, host: HostVersion) -> Result<Upd
         t!("installer.update.window_title"),
         native_options,
         Box::new(move |cc| {
-            prepare_window_context(&cc.egui_ctx, WindowLook::StudioTheme);
+            prepare_window_context(&cc.egui_ctx);
             Ok(Box::new(UpdateApp::new(mode, output_for_app, host)))
         }),
     )

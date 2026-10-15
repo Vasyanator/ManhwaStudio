@@ -153,9 +153,9 @@ pub(crate) use ms_config::version_format;
 // The reusable UI-primitive layer — `crates/ms-widgets/src/` plus two neighbouring leaves of the
 // same layer: `ui_fonts` (the single owner of the bundled `fonts/ui` stack) and
 // `bubble_status` (the egui half of the bubble-status feature: it paints a rule's border and
-// re-exports the GUI-free model from `ms-config`) — now lives in the standalone `ms-widgets`
-// crate. The re-exports keep every `crate::widgets::…`, `crate::ui_fonts::…` and
-// `crate::bubble_status::…` path valid without touching call sites. The crate knows nothing
+// re-exports the GUI-free model from `ms-config`) — is the standalone `ms-widgets` crate.
+// The re-exports give root-package code the `crate::widgets::…`, `crate::ui_fonts::…` and
+// `crate::bubble_status::…` paths. The crate knows nothing
 // about the project domain: `canvas` and the tabs depend on IT, never the other way round.
 pub(crate) use ms_widgets as widgets;
 pub(crate) use ms_widgets::{bubble_status, ui_fonts};

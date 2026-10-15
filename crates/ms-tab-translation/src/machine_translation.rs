@@ -56,7 +56,10 @@ Context replicas:
   later window. Context replicas are flagged `"context": true` in the prompt and are never returned,
   counted, or reported as failures.
 - Which title documents (notes template, characters, terms) a system prompt reads is decided only by
-  `project_context_sources`; a single-image session reads none of them.
+  `project_context_sources`; a single-image session reads none of them. An unreadable notes
+  template, character roster or term list (anything but "not found" / absent) is logged with its
+  path and the prompt's failures reach the tab as ONE run-level `MtControllerEvent::ContextNotice`
+  (one line each); the prompt is built without those blocks (`MtSystemPrompt`).
 */
 
 // AI API machine translation runs over `genai` (reached through `ms_ai_api`, which also
@@ -454,6 +457,11 @@ pub enum MtControllerEvent {
     RunFailed {
         error: String,
     },
+    /// A run-level notice that does not stop the run (a project-context document could not be
+    /// read and the requests go without it). Localized text, already logged by the worker.
+    ContextNotice {
+        notice: String,
+    },
     Progress {
         translated: usize,
         errors: usize,
@@ -707,6 +715,11 @@ impl TranslationMtController {
                         out.push(MtControllerEvent::RunFailed { error });
                     }
                 }
+                Ok(WorkerEvent::ContextNotice { run_id, notice }) => {
+                    if self.is_active_run(run_id) {
+                        out.push(MtControllerEvent::ContextNotice { notice });
+                    }
+                }
                 Ok(WorkerEvent::Progress {
                     run_id,
                     translated,
@@ -826,6 +839,11 @@ enum WorkerEvent {
     RunFailed {
         run_id: u64,
         error: String,
+    },
+    /// See `MtControllerEvent::ContextNotice`.
+    ContextNotice {
+        run_id: u64,
+        notice: String,
     },
     Progress {
         run_id: u64,
@@ -1185,11 +1203,9 @@ async fn run_ai_translate_async(
     let target = AiApiTarget::new(options.service, &options.base_url).map_err(|err| err.to_string())?;
     let client = build_client(&target, api_key);
     let model = model_iden(options.service, &options.model).map_err(|err| err.to_string())?;
-    let mut chat_req = ChatRequest::default().with_system(build_ai_mt_system_prompt(
-        source_lang,
-        target_lang,
-        &options,
-    ));
+    let system_prompt = build_ai_mt_system_prompt(source_lang, target_lang, &options);
+    send_context_notice(run_id, system_prompt.context_notice, evt_tx);
+    let mut chat_req = ChatRequest::default().with_system(system_prompt.text);
     let chat_options = build_ai_mt_chat_options(options.reasoning);
     let batch_size = options.batch_size.clamp(1, 100);
     let context_budget = context_char_budget(options.context_limit_percent);
@@ -1375,7 +1391,8 @@ async fn run_ai_imagebubble_translate_async(
     let target = AiApiTarget::new(options.service, &options.base_url).map_err(|err| err.to_string())?;
     let client = build_client(&target, api_key);
     let model = model_iden(options.service, &options.model).map_err(|err| err.to_string())?;
-    let system_prompt = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, &options);
+    let MtSystemPrompt { text: system_prompt, context_notice } = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, &options);
+    send_context_notice(run_id, context_notice, evt_tx);
     // OpenAI-style providers route by this stable key; Anthropic gets message-level cache markers.
     let cache_key = format!(
         "mtimg-{}-{source_lang}-{target_lang}",
@@ -1798,11 +1815,13 @@ fn join_nonempty<'a>(parts: impl Iterator<Item = &'a str>) -> String {
         .join(" / ")
 }
 
+/// System prompt of the per-ImageBubble mode (static part; the chapter context travels
+/// separately). `context_notice` as in `MtSystemPrompt`.
 fn build_ai_mt_imagebubble_system_prompt(
     source_lang: &str,
     target_lang: &str,
     options: &AiMtOptions,
-) -> String {
+) -> MtSystemPrompt {
     let mut parts = Vec::new();
     let base = options.system_instruction.trim();
     if base.is_empty() {
@@ -1818,9 +1837,9 @@ fn build_ai_mt_imagebubble_system_prompt(
         parts.push("Use character names as speaker context, but do not add speaker labels unless they are present in the source text.".to_string());
     }
 
-    push_project_context_parts(&mut parts, options);
+    let context_notice = push_project_context_parts(&mut parts, options);
 
-    parts.join("\n\n")
+    MtSystemPrompt { text: parts.join("\n\n"), context_notice }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1891,11 +1910,13 @@ fn sort_ai_mt_items(items: &mut [MtTranslateItem], sort_mode: AiMtSortMode) {
     });
 }
 
+/// System prompt of the batched mode: instruction, languages, the answer format and the project
+/// context. `context_notice` as in `MtSystemPrompt`.
 fn build_ai_mt_system_prompt(
     source_lang: &str,
     target_lang: &str,
     options: &AiMtOptions,
-) -> String {
+) -> MtSystemPrompt {
     let mut parts = Vec::new();
     let base = options.system_instruction.trim();
     if base.is_empty() {
@@ -1915,9 +1936,9 @@ fn build_ai_mt_system_prompt(
         parts.push("Structured output is enforced: wrap the array in a JSON object as {\"items\": [...]}. Every other rule above still applies.".to_string());
     }
 
-    push_project_context_parts(&mut parts, options);
+    let context_notice = push_project_context_parts(&mut parts, options);
 
-    parts.join("\n\n")
+    MtSystemPrompt { text: parts.join("\n\n"), context_notice }
 }
 
 /// Which title documents the MT system prompt reads for project context.
@@ -1952,30 +1973,127 @@ fn project_context_sources(
     }
 }
 
+/// A built MT system prompt plus the run-level notice its project context produced.
+#[derive(Debug)]
+struct MtSystemPrompt {
+    text: String,
+    /// Localized notice when a project-context document could not be read and the prompt was
+    /// built without it (already logged); the run shows it (`MtControllerEvent::ContextNotice`).
+    #[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "read only by the AI API run paths, which are not compiled for wasm"))]
+    context_notice: Option<String>,
+}
+
+/// Sends a run's context notice (if any) to the controller. A closed channel means the
+/// controller is gone and nobody is left to show it, like every other worker event here.
+#[cfg(not(target_arch = "wasm32"))]
+fn send_context_notice(run_id: u64, notice: Option<String>, evt_tx: &Sender<WorkerEvent>) {
+    if let Some(notice) = notice {
+        let _ = evt_tx.send(WorkerEvent::ContextNotice { run_id, notice });
+    }
+}
+
 /// Appends the optional project-context prompt blocks (notes template, or characters + terms) shared
 /// by the normal and per-ImageBubble system prompts; which ones is `project_context_sources`.
-fn push_project_context_parts(parts: &mut Vec<String>, options: &AiMtOptions) {
+/// Returns a localized notice when the notes template could not be read (logged here with its
+/// path); the prompt then goes without notes.
+fn push_project_context_parts(parts: &mut Vec<String>, options: &AiMtOptions) -> Option<String> {
     let sources = project_context_sources(
         options.use_notes_prompt,
         options.include_characters,
         options.include_terms,
         options.session_caps.title_documents,
     );
-    if sources.notes
-        && let Some(notes) = build_notes_prompt(&options.project, true, true)
-    {
-        parts.push(format!("Secondary project notes:\n{notes}"));
+    let mut notices = Vec::new();
+    if sources.notes {
+        let notes = build_notes_prompt(&options.project, true, true, &mut notices)
+            .unwrap_or_else(|err| report_context_read_failure(ContextDocument::NotesTemplate, &options.project, &err, &mut notices));
+        if let Some(notes) = notes {
+            parts.push(format!("Secondary project notes:\n{notes}"));
+        }
     }
     if sources.characters
-        && let Some(chars) = build_characters_prompt(&options.project)
+        && let Some(chars) = context_block(build_characters_prompt(&options.project), ContextDocument::Characters, &options.project, &mut notices)
     {
         parts.push(chars);
     }
     if sources.terms
-        && let Some(terms) = build_terms_prompt(&options.project)
+        && let Some(terms) = context_block(build_terms_prompt(&options.project), ContextDocument::Terms, &options.project, &mut notices)
     {
         parts.push(terms);
     }
+    combined_context_notice(&notices)
+}
+
+/// A title document the MT system prompt reads for project context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextDocument {
+    NotesTemplate,
+    Characters,
+    Terms,
+}
+
+impl ContextDocument {
+    /// The configured location of the document (the characters DIRECTORY for the roster).
+    fn path(self, project: &ProjectData) -> &std::path::Path {
+        match self {
+            Self::NotesTemplate => &project.paths.notes_file,
+            Self::Characters => &project.paths.characters_dir,
+            Self::Terms => &project.paths.terms_file,
+        }
+    }
+
+    /// Log name of the document.
+    fn log_name(self) -> &'static str {
+        match self {
+            Self::NotesTemplate => "notes template",
+            Self::Characters => "character roster",
+            Self::Terms => "term list",
+        }
+    }
+
+    /// Localized run notice for a failed read of this document.
+    fn notice(self, path: &std::path::Path, err: &dyn std::fmt::Display) -> String {
+        let path = path.display();
+        match self {
+            Self::NotesTemplate => tf!("translation.mt.notes_read_error", path = path, err = err),
+            Self::Characters => tf!("translation.mt.characters_read_error", path = path, err = err),
+            Self::Terms => tf!("translation.mt.terms_read_error", path = path, err = err),
+        }
+    }
+}
+
+/// Logs a failed project-context read with its path and records its localized notice; the
+/// prompt goes without that block, so the result is always `None`.
+fn report_context_read_failure(
+    doc: ContextDocument,
+    project: &ProjectData,
+    err: &dyn std::fmt::Display,
+    notices: &mut Vec<String>,
+) -> Option<String> {
+    let path = doc.path(project);
+    ms_log::runtime_log::log_warn(format!(
+        "[MT] Failed to read the {}; the request is sent without it.\nPath: {}\nError: {err}\nPossible cause: the file is unreadable (permissions), not valid UTF-8 or malformed",
+        doc.log_name(),
+        path.display()
+    ));
+    notices.push(doc.notice(path, err));
+    None
+}
+
+/// The block of a project-context read, or `None` (reported through `notices`) when it failed.
+fn context_block(
+    result: Result<Option<String>, String>,
+    doc: ContextDocument,
+    project: &ProjectData,
+    notices: &mut Vec<String>,
+) -> Option<String> {
+    result.unwrap_or_else(|err| report_context_read_failure(doc, project, &err, notices))
+}
+
+/// One notice text for all project-context failures of a prompt (one line each), so a single
+/// toast shows every one of them; `None` when nothing failed.
+fn combined_context_notice(notices: &[String]) -> Option<String> {
+    (!notices.is_empty()).then(|| notices.join("\n"))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2184,7 +2302,9 @@ pub fn build_ai_mt_request_preview(
         return Err(t!("translation.mt.no_replicas_preview_status").to_string());
     };
 
-    let system_prompt = build_ai_mt_system_prompt(source_lang, target_lang, options);
+    // A context notice is already logged; the preview shows the prompt exactly as a run would
+    // build it, and the run itself surfaces the notice.
+    let system_prompt = build_ai_mt_system_prompt(source_lang, target_lang, options).text;
     let translate_count = first.iter().filter(|item| item.needs_translation).count();
     let context_count = first.len().saturating_sub(translate_count);
     let user_parts = build_ai_mt_user_parts(first, options)?;
@@ -2253,7 +2373,8 @@ fn build_ai_mt_imagebubble_request_preview(
         return Err(t!("translation.mt.no_imagebubble_preview_status").to_string());
     };
 
-    let system_prompt = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, options);
+    // Context notice: see `build_ai_mt_request_preview`.
+    let system_prompt = build_ai_mt_imagebubble_system_prompt(source_lang, target_lang, options).text;
     let encoded = imagebubble_target_image(options, target)?;
     let decoded = image::load_from_memory(&encoded.bytes)
         .map_err(|err| tf!("translation.mt.decode_preview_image_error", err = err))?
@@ -2544,19 +2665,28 @@ fn prune_ai_mt_chat_context(
     pruned_replicas
 }
 
+/// Fills the title's notes template (`{charas}` / `{terms}` placeholders; a block whose
+/// placeholder is absent is appended). `Ok(None)` when no template exists yet (file not found)
+/// or the result is blank; `Err` on any other read failure of the template. A failed character
+/// or term read inside it leaves that block empty and is reported through `notices`.
 fn build_notes_prompt(
     project: &ProjectData,
     include_characters: bool,
     include_terms: bool,
-) -> Option<String> {
-    let template = fs::read_to_string(&project.paths.notes_file).ok()?;
+    notices: &mut Vec<String>,
+) -> std::io::Result<Option<String>> {
+    let template = match fs::read_to_string(&project.paths.notes_file) {
+        Ok(template) => template,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
     let chars = if include_characters {
-        build_characters_prompt(project).unwrap_or_default()
+        context_block(build_characters_prompt(project), ContextDocument::Characters, project, notices).unwrap_or_default()
     } else {
         String::new()
     };
     let terms = if include_terms {
-        build_terms_prompt(project).unwrap_or_default()
+        context_block(build_terms_prompt(project), ContextDocument::Terms, project, notices).unwrap_or_default()
     } else {
         String::new()
     };
@@ -2571,13 +2701,15 @@ fn build_notes_prompt(
         text.push('\n');
         text.push_str(&terms);
     }
-    (!text.trim().is_empty()).then_some(text)
+    Ok((!text.trim().is_empty()).then_some(text))
 }
 
-fn build_characters_prompt(project: &ProjectData) -> Option<String> {
-    let chars = load_characters_for_notes(project).ok()?;
+/// The "Characters:" prompt block. `Ok(None)` for an absent or empty roster; `Err` (the
+/// loader's technical message) when the roster cannot be read or parsed.
+fn build_characters_prompt(project: &ProjectData) -> Result<Option<String>, String> {
+    let chars = load_characters_for_notes(project)?;
     if chars.is_empty() {
-        return None;
+        return Ok(None);
     }
     let lines = chars
         .into_iter()
@@ -2591,13 +2723,15 @@ fn build_characters_prompt(project: &ProjectData) -> Option<String> {
             }
         })
         .collect::<Vec<_>>();
-    (!lines.is_empty()).then(|| format!("Characters:\n{}", lines.join("\n")))
+    Ok((!lines.is_empty()).then(|| format!("Characters:\n{}", lines.join("\n"))))
 }
 
-fn build_terms_prompt(project: &ProjectData) -> Option<String> {
-    let terms = load_terms_for_notes(project).ok()?;
+/// The "Terms:" prompt block. `Ok(None)` for an absent or empty glossary; `Err` (the
+/// loader's technical message) when the glossary cannot be read or parsed.
+fn build_terms_prompt(project: &ProjectData) -> Result<Option<String>, String> {
+    let terms = load_terms_for_notes(project)?;
     if terms.is_empty() {
-        return None;
+        return Ok(None);
     }
     let lines = terms
         .into_iter()
@@ -2613,7 +2747,7 @@ fn build_terms_prompt(project: &ProjectData) -> Option<String> {
             format!("- {}", parts.join(" | "))
         })
         .collect::<Vec<_>>();
-    (!lines.is_empty()).then(|| format!("Terms:\n{}", lines.join("\n")))
+    Ok((!lines.is_empty()).then(|| format!("Terms:\n{}", lines.join("\n"))))
 }
 
 pub fn character_for_bubble(bubble: &Bubble, use_character_names: bool) -> String {
@@ -2714,6 +2848,77 @@ mod tests {
             settings_data: serde_json::Value::Null,
             session: Default::default(),
         }
+    }
+
+    /// A missing notes template is "no notes"; any other read failure is an error that the
+    /// system prompt turns into a logged run notice instead of silently dropping it (S-007).
+    /// Characters and terms stay off, so no title document other than the template is read.
+    #[test]
+    fn notes_template_read_failure_becomes_a_context_notice() {
+        let dir = std::env::temp_dir().join(format!("ms_mt_notes_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the test's temp dir");
+        let mut project = empty_project();
+
+        project.paths.notes_file = dir.join("missing_notes.txt");
+        assert!(matches!(super::build_notes_prompt(&project, false, false, &mut Vec::new()), Ok(None)));
+
+        project.paths.notes_file = dir.join("notes.txt");
+        std::fs::write(&project.paths.notes_file, "Keep honorifics.").expect("write the test template");
+        assert_eq!(super::build_notes_prompt(&project, false, false, &mut Vec::new()).ok().flatten().as_deref(), Some("Keep honorifics."));
+
+        // A directory cannot be read as a file: a real read failure, not "not found".
+        project.paths.notes_file = dir.clone();
+        assert!(super::build_notes_prompt(&project, false, false, &mut Vec::new()).is_err());
+        let mut options = ai_options(4);
+        options.use_notes_prompt = true;
+        options.project = project;
+        let mut parts = Vec::new();
+        let notice = super::push_project_context_parts(&mut parts, &options);
+        assert!(parts.is_empty(), "no notes block without a readable template: {parts:?}");
+        assert!(notice.is_some(), "the read failure must reach the run as a notice");
+        assert_eq!(super::build_ai_mt_system_prompt("en", "ru", &options).context_notice, notice);
+
+        std::fs::remove_dir_all(&dir).expect("remove the test's temp dir");
+    }
+
+    /// A character roster that cannot be read is reported like the notes template: the block
+    /// is left out (separately, and inside a readable notes template) and a notice is raised.
+    #[test]
+    fn character_roster_read_failure_becomes_a_context_notice() {
+        let dir = std::env::temp_dir().join(format!("ms_mt_chars_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the test's temp dir");
+        let mut project = empty_project();
+        // A regular file where the characters DIRECTORY is expected: the roster loader cannot
+        // create the directory, a real read failure (nothing else is touched).
+        project.paths.characters_dir = dir.join("not_a_dir");
+        std::fs::write(&project.paths.characters_dir, "x").expect("write the blocking file");
+        assert!(super::build_characters_prompt(&project).is_err());
+
+        let mut options = ai_options(4);
+        options.include_characters = true;
+        options.project = project.clone();
+        let mut parts = Vec::new();
+        let notice = super::push_project_context_parts(&mut parts, &options);
+        assert!(parts.is_empty(), "{parts:?}");
+        assert!(notice.is_some());
+
+        project.paths.notes_file = dir.join("notes.txt");
+        std::fs::write(&project.paths.notes_file, "Notes {charas} end").expect("write the test template");
+        let mut notices = Vec::new();
+        let notes = super::build_notes_prompt(&project, true, false, &mut notices).expect("the template is readable");
+        assert_eq!(notes.as_deref(), Some("Notes  end"));
+        assert_eq!(notices.len(), 1);
+
+        std::fs::remove_dir_all(&dir).expect("remove the test's temp dir");
+    }
+
+    /// Several failures of one prompt become ONE notice text (one line each), so a single toast
+    /// shows all of them instead of the last overwriting the others.
+    #[test]
+    fn context_notices_are_combined_into_one_text() {
+        assert_eq!(super::combined_context_notice(&[]), None);
+        let notices = ["notes failed".to_string(), "terms failed".to_string()];
+        assert_eq!(super::combined_context_notice(&notices).as_deref(), Some("notes failed\nterms failed"));
     }
 
     /// Builds plain AI MT options with the given batch size for preview/batching tests.
@@ -3131,9 +3336,9 @@ mod tests {
     #[test]
     fn strict_json_adds_the_wrapper_rule_to_the_system_prompt() {
         let mut options = ai_options(4);
-        let plain = super::build_ai_mt_system_prompt("en", "ru", &options);
+        let plain = super::build_ai_mt_system_prompt("en", "ru", &options).text;
         assert!(!plain.contains("{\"items\": [...]}"));
         options.strict_json = true;
-        assert!(super::build_ai_mt_system_prompt("en", "ru", &options).contains("{\"items\": [...]}"));
+        assert!(super::build_ai_mt_system_prompt("en", "ru", &options).text.contains("{\"items\": [...]}"));
     }
 }

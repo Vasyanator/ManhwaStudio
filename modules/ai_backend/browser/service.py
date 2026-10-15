@@ -76,6 +76,16 @@ _CANCELABLE_COMMANDS = frozenset(
 # Daemon events that are not a terminal command result; never captured as one.
 _NON_RESULT_EVENTS = frozenset({"progress", "log", "ready"})
 
+# ``level`` field of a daemon ``log`` event -> Python logging level. The daemons send
+# ``info`` / ``warn`` / ``error``; anything unknown is logged at INFO rather than lost.
+_DAEMON_LOG_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warn": logging.WARNING,
+    "warning": logging.WARNING,
+    "error": logging.ERROR,
+}
+
 
 class BrowserService:
     """In-process owner of the Selenium / CloakBrowser scraping session."""
@@ -174,8 +184,24 @@ class BrowserService:
     # -- internals ----------------------------------------------------------
 
     def _sink(self, payload: dict[str, Any]) -> None:
-        """Replacement for the daemon's ``_emit``: stream progress, capture result."""
+        """Replacement for the daemon's ``_emit``: stream progress, log, capture result.
+
+        ``log`` events (page console warnings, ``pageerror``, ...) go to the Python
+        logger at their own level, which is how they reach ``last.log``; an ``error``
+        event's technical ``log_message`` is logged here too, because only its
+        ``user_message`` travels on as the raised error. Runs on the browser owner
+        thread or a daemon background thread; never raises.
+        """
         event = payload.get("event")
+        if event == "log":
+            level_name = str(payload.get("level") or "").strip().lower()
+            LOG.log(
+                _DAEMON_LOG_LEVELS.get(level_name, logging.INFO),
+                "browser %s: %s",
+                self._backend,
+                payload.get("message") or "",
+            )
+            return
         if event == "progress":
             emitter = self._active_emitter
             if emitter is not None:
@@ -194,6 +220,13 @@ class BrowserService:
             return
         # Terminal result event (opened / result / auto_result / *_count / ...),
         # or a defensively-emitted error event.
+        if event == "error":
+            LOG.error(
+                "browser %s command failed: %s (user message: %s)",
+                self._backend,
+                payload.get("log_message") or "<no log_message>",
+                payload.get("user_message") or "<none>",
+            )
         self._captured = dict(payload)
 
     def _run_on_browser_thread(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:

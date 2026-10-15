@@ -45,6 +45,7 @@ the per-tensor file-backing checks keep those cases out of the workaround.
 
 from __future__ import annotations
 
+import functools
 import io
 import logging
 import os
@@ -69,6 +70,7 @@ from ..runtime.rocm_mmap_transfer import (
     patched_module_to,
     tensor_needs_staging,
 )
+from ..runtime.torch_device import clear_torch_cache
 
 log = logging.getLogger(__name__)
 
@@ -1012,19 +1014,9 @@ def _encode_png_bytes_rgb(image_rgb: np.ndarray) -> bytes:
         return buf.getvalue()
 
 
-def _clear_torch_cache() -> None:
-    import gc
-
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
-    except Exception as exc:  # noqa: BLE001 - cache release is best-effort
-        log.warning("FLUX Fill: could not release the torch CUDA cache: %s", exc)
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="FLUX Fill", include_mps=False)
 
 
 # =====================================================================

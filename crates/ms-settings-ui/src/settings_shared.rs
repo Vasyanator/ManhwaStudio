@@ -23,7 +23,7 @@ Key items:
 - `SharedSectionOutcome`: the per-surface runtime effects a shared section produced,
   including the `SettingChange`s whose writes landed (the launcher rechecks warnings on
   them; the studio ignores them). `SharedSettingsPanels::take_landed_changes` drains the
-  AI pane's landed writes without a draw (the launcher calls it every frame).
+  General and AI panes' landed writes without a draw (the launcher calls it every frame).
 - `with_item_badge`: the one layout rule for an item's inline warning badge.
 
 Contract notes:
@@ -340,14 +340,18 @@ impl SharedSettingsPanels {
         self.general.memory_profile
     }
 
-    /// Takes every AI-pane off-thread write that landed since the last drain, in
-    /// completion order, without drawing anything. A surface that rechecks warnings calls
+    /// Takes every off-thread write that landed since the last drain — the General pane's
+    /// (`GeneralSettingsPanelState::take_finished_writes`) first, then the AI pane's, each in
+    /// completion order — without drawing anything. A surface that rechecks warnings calls
     /// it every frame, so a write that lands while a surface-local section (or another
-    /// page) is shown is still reported; `draw` drains the same channel, so each change is
-    /// returned exactly once by whichever runs first. Always empty on wasm.
+    /// page) is shown is still reported; `draw` drains the same channels, so each change is
+    /// returned exactly once by whichever runs first. A projects root saved this way is
+    /// reported by the next General draw's `projects_dir_saved`. The AI part is always empty
+    /// on wasm.
     #[must_use]
-    pub fn take_landed_changes(&self) -> Vec<SettingChange> {
-        self.ai_backend.append_landed_changes(Vec::new())
+    pub fn take_landed_changes(&mut self) -> Vec<SettingChange> {
+        let general = self.general.take_finished_writes();
+        self.ai_backend.append_landed_changes(general)
     }
 
     /// Renders one SHARED section and returns its runtime effects.

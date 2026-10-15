@@ -2,7 +2,7 @@
 File: modules/ai_backend/browser/test_browser_service.py
 
 Purpose:
-Unit tests for `BrowserService`'s thread-affinity contract
+Unit tests for `BrowserService`'s thread-affinity and event-routing contracts
 (`modules/ai_backend/browser/service.py`).
 
 Main responsibilities:
@@ -13,7 +13,10 @@ Main responsibilities:
 - `close()` tears the daemon down on the same owner thread;
 - the daemon receives the `_run_on_browser_thread` hook, and calling it marshals
   work onto the owner thread (so the daemon's background loop can pin its
-  Playwright calls too).
+  Playwright calls too);
+- daemon `log` events reach the Python logger at their own level and are never
+  taken as the command result; an `error` event's `log_message` is logged while
+  its `user_message` becomes the raised error.
 
 Notes:
 A fake daemon records `threading.get_ident()` for each call, so the tests need no
@@ -23,8 +26,10 @@ they pass under both `pytest` and a plain `python3` invocation.
 
 from __future__ import annotations
 
+import logging
 import threading
 
+from modules.ai_backend.browser import service as service_module
 from modules.ai_backend.browser.service import BrowserService
 
 
@@ -115,9 +120,78 @@ def test_hook_injected_and_bound_to_service() -> None:
     assert fake._run_on_browser_thread == service._run_on_browser_thread
 
 
+class _RecordingHandler(logging.Handler):
+    """Collects `(levelno, message)` of every record the service logger emits."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[tuple[int, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append((record.levelno, record.getMessage()))
+
+
+def _dispatch_emitting(events: list[dict]) -> tuple[_RecordingHandler, object]:
+    """Dispatch one command whose fake daemon emits `events`; return the log and the outcome."""
+    service, fake = _service_with_fake()
+
+    def handle(_command: dict) -> None:
+        for event in events:
+            fake._emit(event)
+
+    fake._handle_command = handle  # type: ignore[method-assign]
+    handler = _RecordingHandler()
+    logger = service_module.LOG
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
+    try:
+        try:
+            outcome: object = service.dispatch({"command": "fetch"}, progress_emitter=None, cancel_event=None)
+        except RuntimeError as exc:
+            outcome = exc
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+        service.close()
+    return handler, outcome
+
+
+def test_log_events_reach_the_python_logger_with_their_level() -> None:
+    handler, outcome = _dispatch_emitting(
+        [
+            {"event": "log", "level": "warn", "message": "web page console warning: x"},
+            {"event": "log", "level": "error", "message": "web page error: y"},
+            {"event": "log", "level": "odd", "message": "z"},
+            {"event": "result", "count": 1},
+        ]
+    )
+    assert handler.records == [
+        (logging.WARNING, "browser selenium: web page console warning: x"),
+        (logging.ERROR, "browser selenium: web page error: y"),
+        (logging.INFO, "browser selenium: z"),
+    ]
+    # A log event is never mistaken for the terminal result.
+    assert outcome == {"event": "result", "count": 1}
+
+
+def test_error_event_logs_its_log_message_and_raises_the_user_message() -> None:
+    handler, outcome = _dispatch_emitting(
+        [{"event": "error", "user_message": "Не удалось.", "log_message": "driver crashed: boom"}]
+    )
+    assert isinstance(outcome, RuntimeError)
+    assert str(outcome) == "Не удалось."
+    assert len(handler.records) == 1
+    level, message = handler.records[0]
+    assert level == logging.ERROR
+    assert "driver crashed: boom" in message
+
+
 if __name__ == "__main__":
     test_commands_run_on_single_owner_thread_not_caller()
     test_hook_marshals_background_work_onto_owner_thread()
     test_close_runs_on_owner_thread()
     test_hook_injected_and_bound_to_service()
-    print("all browser_service thread-affinity tests passed")
+    test_log_events_reach_the_python_logger_with_their_level()
+    test_error_event_logs_its_log_message_and_raises_the_user_message()
+    print("all browser_service tests passed")

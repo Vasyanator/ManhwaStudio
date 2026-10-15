@@ -26,11 +26,12 @@ table-tested) -> match on the `RunMode`:
   switches off the Python backend and native ONNX), the images another app delivered at startup
   (Android Share / "Open with", `shell::incoming::cold_start_target`, pre-window),
   `resolve_start` (`routing.rs`), then `shell::run` — the ONE main window (`src/shell/`) on the
-  launcher or the studio. A launcher "Update" request runs the update window after the main
-  window has closed.
+  launcher or the studio. Once `shell::run` returns (the window is closed) the background
+  settings writes are waited for, bounded (`wait_for_settings_writes_after_window`). A launcher
+  "Update" request runs the update window after the main window has closed.
 
 Key items: `run_native`, `init_minimal`, `run_main`, `HOST_VERSION`, `launcher_host` and the
-two session-log init functions.
+one session-log init (`init_startup_logging_best_effort`, before the mode split).
 
 Submodules: `mode` (the run-mode decision), `routing` (where the main window starts, update
 routing), `service_flags` (usage-error report, the registration helper, `--check-venv`),
@@ -145,7 +146,6 @@ pub(crate) fn run_native() -> anyhow::Result<()> {
         RunMode::Service(ServiceMode::CheckVenv) => {
             init_minimal(&cli);
             init_full(&cli)?;
-            init_runtime_logging();
             std::process::exit(run_check_venv_flow(&config::program_dir()));
         }
         // Refused like a launcher-requested update on such a build
@@ -238,7 +238,6 @@ fn run_windows_uninstall(continuation: bool, signal_file: Option<&Path>) -> anyh
 /// failed startup prompt (`resolve_start`).
 fn run_main(cli: &Cli, run: MainRun, services: ProcessServices) -> anyhow::Result<()> {
     for prelude in run.preludes {
-        init_runtime_logging();
         // `--update` / `--continue-update` (like every other installed-copy flag) can no longer
         // arrive together with `--ignore-installed`: `decide` made that a usage error.
         let outcome = match prelude {
@@ -261,7 +260,6 @@ fn run_main(cli: &Cli, run: MainRun, services: ProcessServices) -> anyhow::Resul
 /// # Errors
 /// A main-window failure.
 fn run_test_launcher(cli: &Cli, services: ProcessServices) -> anyhow::Result<()> {
-    init_runtime_logging();
     let supervisor = services.start_ai_backend_supervisor();
     // Test mode routes nowhere: the shell quits on any launcher exit.
     let exit = shell::run(shell::ShellConfig {
@@ -272,7 +270,9 @@ fn run_test_launcher(cli: &Cli, services: ProcessServices) -> anyhow::Result<()>
         test_mode: true,
         update_check: update_check_enabled(cli.ignore_installed, installed_copy_management_available()).then_some(cli.test_ver_check),
         incoming_error: None,
-    })?;
+    });
+    wait_for_settings_writes_after_window();
+    let exit = exit?;
     runtime_log::log_info(format!("[startup] --test-launcher window closed ({exit:?})"));
     Ok(())
 }
@@ -312,25 +312,35 @@ fn run_main_window(cli: &Cli, services: ProcessServices) -> anyhow::Result<()> {
         test_mode: false,
         update_check: start.update_check.then_some(cli.test_ver_check),
         incoming_error,
-    })?;
+    });
+    wait_for_settings_writes_after_window();
+    let exit = exit?;
     match exit {
         shell::ShellExit::Quit => Ok(()),
         shell::ShellExit::StartUpdate => run_launcher_requested_update(cli),
     }
 }
 
-/// Opens the session log (rotating `last.log` -> `previous.log`); a failure is printed to stderr
-/// and startup continues without a file log.
-fn init_startup_logging_best_effort() {
-    let log_dir = config::data_dir();
-    if let Err(err) = runtime_log::init_session_logs(&log_dir) {
-        eprintln!("[runtime-log] failed to initialize logging: {err}");
-    }
+/// Upper bound of the exit wait for queued background `user_config` writes. A write is one small
+/// locked read-modify-write; the bound only stops a stuck disk from hanging the exit.
+const SETTINGS_WRITES_EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Waits (bounded, [`SETTINGS_WRITES_EXIT_WAIT`]) for the settings writes the screens handed to
+/// background threads (`ms_settings_ui::pending_config_writes`: General pane, launcher last
+/// selection) once the main window has CLOSED, on every return of `shell::run`. Blocking here is
+/// the documented exception to the GUI-thread rule: the window and its event loop are gone, no
+/// frame is left to keep responsive, and returning first would let the process exit with those
+/// writes unwritten. A timeout is logged by the wait itself.
+fn wait_for_settings_writes_after_window() {
+    // The result only says whether all landed; a timeout is already logged and the exit goes on.
+    ms_settings_ui::pending_config_writes::wait_for_pending_config_writes(SETTINGS_WRITES_EXIT_WAIT);
 }
 
-/// Opens the session log like `init_startup_logging_best_effort` and logs where its files are;
-/// called by the paths that run their own windows (`--check-venv`, update, test launcher).
-fn init_runtime_logging() {
+/// Opens the session log (rotating `last.log` -> `previous.log`) and logs where its files are.
+/// Called ONCE per process, by `run_native` before the mode split (every mode except the
+/// elevated registration helper), so no later window re-opens or re-announces it. A failure is
+/// printed to stderr and startup continues without a file log.
+fn init_startup_logging_best_effort() {
     let log_dir = config::data_dir();
     if let Err(err) = runtime_log::init_session_logs(&log_dir) {
         eprintln!("[runtime-log] failed to initialize logging: {err}");

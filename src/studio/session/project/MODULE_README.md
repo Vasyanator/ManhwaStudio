@@ -12,7 +12,7 @@ ProjectSession
   save_to_project_rx / _status, pending_save_after_preload, pending_save_completion_action  (save.rs)
   page_op_rx, page_op_error, pending_project_reload                                         (page_op.rs)
   pending_exit_cleanup (delete job + its close action)                                       (discard.rs)
-  has_unsaved_changes_cached, next_unsaved_dir_check_s                                       (mod.rs)
+  has_unsaved_changes_cached, next_unsaved_dir_check_s, staging_probe                        (mod.rs)
 tick(ctx, now, parts): drive preload -> poll save -> poll page op -> poll cleanup ->
                        refresh unsaved cache -> status expiry -> save-then-close
 ```
@@ -21,8 +21,12 @@ control and thread, DISCARD latch, the three shared models), `CloseFlow`, and th
 flushes or notifies. Workers get Arc clones of the models from `StagingWriters`.
 
 ## Files and submodules
-- `mod.rs`: the struct, `new` (one stat of the staging dir), `tick`, `draw_top_bar`, the busy jobs
-  (`busy_jobs` / `activity`, read by `studio/busy.rs` predicates), `refresh_unsaved_changes_cache`.
+- `mod.rs`: the struct, `new` (no I/O: the open-time staging stat comes from `StudioBootstrap`),
+  `tick`, `draw_top_bar`, the busy jobs (`busy_jobs` / `activity`, read by `studio/busy.rs`
+  predicates), `refresh_unsaved_changes_cache`.
+- `staging_probe.rs`: `StagingDirProbe`, the worker that answers "does the staging dir exist?"
+  for the refresh (generation-invalidated by a save or discard). Why the in-memory writer facts
+  cannot answer it alone: the file header.
 - `save.rs`: `request_save_to_project`, `drive_pending_save_preload`, `start_save_to_project`,
   `poll_save_to_project`; the pure gates `save_trigger_decision` / `deferred_save_ready` + tests.
 - `page_op.rs`: `start_page_op`, `poll_page_op`, `draw_page_op_overlays`; the pure
@@ -39,11 +43,18 @@ flushes or notifies. Workers get Arc clones of the models from `StagingWriters`.
   cannot start (the page-op and discard workers are started parked BEFORE any writer is quiesced
   and released through a start channel, so a refused thread leaves the session untouched); a
   discard latches first and never flushes; a failed discard restarts every writer and re-reports unsaved.
-- No I/O on the GUI thread except the documented per-second staging-dir probe of
-  `refresh_unsaved_changes_cache` (and one stat in `new`); merges, deletes and page ops run on
-  `ms_thread` workers.
-- The cached unsaved flag is sticky: only a successful save or discard clears it; it is forced to
-  false while the DISCARD latch is set.
+- A save's success is judged without file timing for bubbles: `BubblesModel::revision` read on
+  the GUI thread when the save starts travels through the worker (`MergeDone`), and a model past
+  it on receipt (an edit the merge did not include, even with its snapshot still queued) keeps
+  the session unsaved (`StillUnsaved` for a save-then-close).
+- No I/O on the GUI thread: the per-second staging-dir check runs on the `StagingDirProbe`
+  worker and the post-merge check inside the save worker (`MergeDone::staging_exists`); merges,
+  deletes and page ops run on `ms_thread` workers.
+- The cached unsaved flag is sticky: only a successful save or discard clears it
+  (`reset_unsaved_after_persist`, which also drops every probe answer asked before); it is forced
+  to false while the DISCARD latch is set. Besides the probe it latches on the in-memory facts:
+  `DeferredTabEdits` (with the canvases' unflushed bubble edits), unacked layer saves, the bubbles
+  model and the clean-overlay model.
 - The save-then-close (`pending_save_completion_action`) is armed ONLY by an exit dialog's Save,
   cleared by its Cancel, and taken by `tick` when that save ends (`save_then_close_end`): a clean
   success closes; a failed, refused or aborted save, or one that left unsaved work, closes the

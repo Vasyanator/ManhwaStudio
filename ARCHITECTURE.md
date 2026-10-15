@@ -470,7 +470,7 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   process-wide value seeded off-thread). Keyring I/O never runs on the GUI thread; a token is
   never logged and reaches the backend only as a per-request field.
 - **Threads** — spawned through `ms_thread` on any path that also runs on wasm; `rayon` for CPU
-  work; `tokio` only in the binary and `ms-ai-api`.
+  work; `tokio` only in `ms-ai-api`.
 - **Versions** — `MS_APP_VERSION` (git-derived in `build.rs`) is display-only;
   `CARGO_PKG_VERSION` is what is compared and parsed; cross-process comparisons reduce both via
   `version_format::version_core`. Libraries receive the version as `ms_installer::HostVersion`.

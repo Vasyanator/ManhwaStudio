@@ -108,7 +108,9 @@ no lease of its own: ONNX sessions are leased inside `PaddleOnnxRuntime`.
 - To change how the Surya checkpoint directory is checked or handed to the library, edit
   `../engines/surya_checkpoints.py`; which files it holds is the Rust catalog's
   (`crates/ms-sysprobe/src/ai_models/`).
-- To change device resolution, edit `_resolve_selected_backend_device` in the affected service.
+- To change device resolution, edit `../runtime/torch_device.py` (the one owner); a service's own
+  policy (`ctd.py`: `accept_mps=False`) is the arguments of its module-level
+  `_resolve_selected_backend_device` binding.
 - To add a fourth detector: add a module here with `forward_tiles`, wire it into `server.py`'s
   `AppState`, add the method constant, spec row and handler in `ipc/`, mirror it in
   `ms_backend_ipc::textdetector`, and leave `__init__.py` alone.

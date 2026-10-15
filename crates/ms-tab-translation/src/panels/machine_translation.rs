@@ -40,7 +40,7 @@ use crate::machine_translation::{
 };
 use crate::panels::section_header_button;
 use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, GenerationSnapshot, ImageInputSupport, draw_connection, draw_generation_status, image_input_support};
-use ms_widgets::{HelpHint, WheelComboBox};
+use ms_widgets::{HelpHint, WheelComboBox, WheelSlider};
 
 #[derive(Debug, Clone)]
 pub struct MtPanelOptions {
@@ -851,7 +851,7 @@ fn draw_ai_translation_section(
     ui.horizontal_wrapped(|ui| {
         ui.label(t!("translation.mt_panel.context_label"));
         actions.options_changed |= ui
-            .add(egui::Slider::new(
+            .add(WheelSlider::new(
                 &mut options.ai_context_limit_percent,
                 10..=100,
             ))

@@ -21,25 +21,16 @@ file instead of fetching it.
 
 from __future__ import annotations
 
-import gc
+import functools
 import io
 import logging
 import threading
 from pathlib import Path
 from typing import Any
 
-try:
-    from ai_device import AIDevice
-except Exception:
-    from modules.ai_device import AIDevice
-
-try:
-    from config import UserConfig
-except Exception:
-    UserConfig = None
-
 from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
+from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 
 log = logging.getLogger(__name__)
 
@@ -56,25 +47,13 @@ log = logging.getLogger(__name__)
 # ============================================================================
 
 
-def _clear_torch_cache() -> None:
-    try:
-        import torch  # type: ignore
-    except Exception:
-        gc.collect()
-        return
+#: `General.ai_device` resolution with this service's device policy (owner:
+#: `runtime.torch_device`); patched by name in the test suite.
+_resolve_selected_backend_device = functools.partial(resolve_selected_backend_device, accept_mps=False)
 
-    gc.collect()
-    try:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    except Exception:
-        pass
-    try:
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-    except Exception:
-        pass
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="EasyOCR")
 
 
 class EasyOcrService:
@@ -406,53 +385,3 @@ def _require_model_dir(model_dir: str) -> str:
     if not path.is_dir():
         raise FileNotFoundError(f"EasyOCR model is not downloaded: directory does not exist: {normalized}")
     return normalized
-
-
-def _resolve_selected_backend_device(fallback: str) -> str:
-    fallback_norm = _normalize_backend_device(fallback, "cpu")
-    configured = _read_configured_device()
-    if configured is None:
-        configured = fallback_norm
-
-    normalized = _normalize_backend_device(configured, fallback_norm)
-    available = _safe_available_devices()
-
-    if normalized in available:
-        return normalized
-    if normalized.startswith("cuda") and "cuda" in available:
-        return "cuda"
-    if fallback_norm in available:
-        return fallback_norm
-    if "cuda" in available:
-        return "cuda"
-    return "cpu"
-
-
-def _read_configured_device() -> str | None:
-    config_root = getattr(UserConfig, "config", None)
-    if not isinstance(config_root, dict):
-        return None
-    general = config_root.get("General")
-    if not isinstance(general, dict):
-        return None
-    value = general.get("ai_device")
-    if not isinstance(value, str):
-        return None
-    value = value.strip().lower()
-    if value == "not-selected":
-        return None
-    return value or None
-
-
-def _safe_available_devices() -> set[str]:
-    try:
-        return set(AIDevice.detect_available_devices())
-    except Exception:
-        return {"cpu"}
-
-
-def _normalize_backend_device(raw: str, fallback: str) -> str:
-    val = str(raw or "").strip().lower()
-    if val == "cpu" or val == "cuda" or val.startswith("cuda:"):
-        return val
-    return str(fallback or "cpu").strip().lower() or "cpu"

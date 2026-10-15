@@ -15,7 +15,9 @@ Main responsibilities:
   load resumes whenever it exists — `src/shell/chapter_load.rs`); when the validation worker finds a staging document that does not parse
   (`project_scan::damaged_unsaved_documents`), Restore is disabled and the banner names the
   damaged files and offers "Discard session and open" (the same discard path);
-- remember the last opened title and per-title last opened chapters in `user_config.json`.
+- remember the last opened title and per-title last opened chapters in `user_config.json`
+  (`spawn_persist_last_selection`: one locked read-modify-write on a detached worker, counted
+  as a `PendingConfigWrite` so the process waits for it after the window closed).
 
 Key structures:
 - `OpenPageState`: the page; `ChapterStorage` / `PendingChapterConvert` /
@@ -51,6 +53,7 @@ use std::time::Duration;
 use ms_docstore::{ChapterFormatReport, DocFormat};
 use ms_project::project_scan::{self, DamagedStagingDoc};
 use ms_thread as thread;
+use ms_settings_ui::pending_config_writes::PendingConfigWrite;
 use ms_settings_ui::storage_mode_job::{begin_chapter_conversion, failed_document_path, ChapterConversionLease};
 
 const LAST_OPEN_TITLE_KEY: &str = "open_page_last_title";
@@ -1026,26 +1029,60 @@ impl OpenPageState {
     }
 }
 
-pub fn persist_last_selection_values(title: &str, chapter: &str) -> anyhow::Result<()> {
-    let mut cfg = config::load_user_config()?;
-    cfg.set_path(
-        &["General", LAST_OPEN_TITLE_KEY],
-        Value::String(title.to_string()),
-    )?;
+/// Remembers `title` and its `chapter` as the last opened selection (`General.<last title>` and
+/// `General.<chapters by title>[title]`) WITHOUT blocking the caller: the write runs on a
+/// detached `launcher-persist-last-selection` worker that the launcher screen does not own, so it
+/// completes even though the screen is torn down right after an open-project exit. The write
+/// holds a `PendingConfigWrite` token from before the spawn until it returned, so a process
+/// that quits right after (e.g. the open failed and the user closed the window) waits for it
+/// (`startup` calls `wait_for_pending_config_writes` after the window closed). A failure
+/// (including a failed spawn) is logged with `context`; the selection is a convenience, so the
+/// open itself goes ahead either way.
+pub fn spawn_persist_last_selection(title: String, chapter: String, context: &'static str) {
+    let pending = PendingConfigWrite::begin();
+    let spawn_result = thread::Builder::new()
+        .name("launcher-persist-last-selection".to_string())
+        .spawn(move || {
+            let path = config::user_config_path();
+            if let Err(err) = persist_last_selection_values_at(&path, &title, &chapter) {
+                runtime_log::log_warn(format!("[launcher-open] failed to persist last selection {context}; path={}; title={title}; chapter={chapter}; error={err:#}", path.display()));
+            }
+            // The write returned (or failed): nothing is left for the exit to wait for. A refused
+            // spawn drops the closure, and with it this token, at once.
+            drop(pending);
+        });
+    if let Err(err) = spawn_result {
+        runtime_log::log_error(format!("[launcher-open] could not start the last-selection writer {context}; the selection is not remembered; error={err}"));
+    }
+}
 
-    let mut chapters_by_title = cfg
-        .data
-        .get("General")
-        .and_then(|general| general.get(LAST_OPEN_CHAPTERS_BY_TITLE_KEY))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    chapters_by_title.insert(title.to_string(), Value::String(chapter.to_string()));
-    cfg.set_path(
-        &["General", LAST_OPEN_CHAPTERS_BY_TITLE_KEY],
-        Value::Object(chapters_by_title),
-    )?;
-    Ok(())
+/// Writes the last opened `title` / `chapter` into the user config at `path` in ONE locked
+/// read-modify-write ([`config::update_user_config_file`]): backfills the missing default keys
+/// (the seeding `load_user_config` did before the write), sets `General.<last title>` to `title`
+/// and `General.<chapters by title>[title]` to `chapter`; every other key (other titles'
+/// chapters included) survives, and a non-object `General` section or chapters map is replaced
+/// by an object. Blocking; callers run it off the GUI thread.
+///
+/// # Errors
+/// A read/parse/write failure of the document (a malformed one is never overwritten).
+fn persist_last_selection_values_at(path: &Path, title: &str, chapter: &str) -> anyhow::Result<()> {
+    config::update_user_config_file(path, |root| {
+        config::merge_missing(root, &config::user_config_defaults());
+        let root_obj = root.as_object_mut().ok_or_else(|| anyhow::anyhow!("user config root is not an object"))?;
+        let general = root_obj.entry("General").or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !general.is_object() {
+            *general = Value::Object(serde_json::Map::new());
+        }
+        let general = general.as_object_mut().ok_or_else(|| anyhow::anyhow!("user config General section is not an object"))?;
+        general.insert(LAST_OPEN_TITLE_KEY.to_string(), Value::String(title.to_string()));
+        let chapters = general.entry(LAST_OPEN_CHAPTERS_BY_TITLE_KEY).or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !chapters.is_object() {
+            *chapters = Value::Object(serde_json::Map::new());
+        }
+        let chapters = chapters.as_object_mut().ok_or_else(|| anyhow::anyhow!("user config chapters-by-title map is not an object"))?;
+        chapters.insert(title.to_string(), Value::String(chapter.to_string()));
+        Ok(())
+    })
 }
 
 fn build_refresh_result(
@@ -1176,6 +1213,37 @@ mod tests {
     use super::*;
     use ms_docstore::DocKind;
     use serde_json::json;
+
+    #[test]
+    fn last_selection_write_keeps_other_titles_and_keys() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("user_config.json");
+        std::fs::write(&path, serde_json::to_vec(&json!({"General": {"theme": "light", LAST_OPEN_CHAPTERS_BY_TITLE_KEY: {"Other": "ch 3"}}}))?)?;
+        persist_last_selection_values_at(&path, "Title", "ch 1")?;
+        let value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(value["General"][LAST_OPEN_TITLE_KEY], json!("Title"));
+        assert_eq!(value["General"][LAST_OPEN_CHAPTERS_BY_TITLE_KEY], json!({"Other": "ch 3", "Title": "ch 1"}));
+        assert_eq!(value["General"]["theme"], json!("light"), "unrelated keys survive");
+        let selection = read_last_open_selection(&value);
+        assert_eq!(selection.title, "Title");
+        assert_eq!(selection.chapter_for_title("Title").as_deref(), Some("ch 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn last_selection_write_repairs_a_non_object_chapters_map_and_spares_a_malformed_file() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("user_config.json");
+        std::fs::write(&path, serde_json::to_vec(&json!({"General": {LAST_OPEN_CHAPTERS_BY_TITLE_KEY: 5}}))?)?;
+        persist_last_selection_values_at(&path, "T", "c")?;
+        let value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(value["General"][LAST_OPEN_CHAPTERS_BY_TITLE_KEY], json!({"T": "c"}));
+
+        std::fs::write(&path, b"{ broken")?;
+        assert!(persist_last_selection_values_at(&path, "T", "c").is_err());
+        assert_eq!(std::fs::read(&path)?, b"{ broken");
+        Ok(())
+    }
 
     fn report(committed: &[DocFormat], staging: &[DocFormat]) -> ChapterFormatReport {
         ChapterFormatReport {

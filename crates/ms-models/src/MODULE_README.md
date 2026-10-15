@@ -140,9 +140,11 @@ it from its `[dev-dependencies]`, so no production build carries them.
     nested inside an active hold acks immediately while pre-barrier snapshots still sit in
     the worker's `pending` snapshot. Safe today (only `shutdown_saver` nests, and Shutdown waits + persists), but do
     not build a new caller on the flush semantic under concurrency without fixing that.
-  - `pause_saver_for_page_op` — PERMANENT pause: waits for the in-flight write, then drops all later
-    publications and makes shutdown drain-and-join **without writing**. Safe for page-ops only
-    because they reload the project afterwards, and used by DISCARD because it must not write at all.
+  - `pause_saver_for_page_op` / `pause_saver_for_discard` — PERMANENT pause: waits for the
+    in-flight write, then drops all later publications and makes shutdown drain-and-join **without
+    writing**. Safe for page-ops only because they reload the project afterwards; DISCARD uses its
+    own entry point because it must not write at all. The two differ only in the reason the saver
+    names when it logs a dropped snapshot (`runtime_log`, `[bubbles_saver]`).
   - `resume_saver_after_failed_discard` — the ONLY resume. Exists solely because a failed discard
     hands a still-running app back to the user; do not generalize it into a `resume(scope)` (a
     post-remap resume would write obsolete page indices).

@@ -136,7 +136,8 @@ Root responsibilities that stay in `studio.rs`:
   is passed in by `studio.rs`. See `residency/MODULE_README.md`.
 - `prompts.rs`: the two modal prompts drawn over every tab, as owned structs with a narrow API
   (no `StudioApp` field access): `ComicTypePrompt` (`draw` returns the clicked `ComicType`; the
-  caller applies it with `apply_comic_type_preset` and reports back through `resolve` / `fail`)
+  caller writes it on a worker (`start_comic_type_save` / `poll_comic_type_save`), applies it with
+  `apply_comic_type_preset` once the write succeeded, and reports back through `resolve` / `fail`)
   and `AiDevicePrompt` (`refresh` opens it from the health snapshot, `draw` sends the
   `SetDevice` / `SetOnnxDevice` probe commands and returns whether it is still open).
 - `tabs.rs`: `Tabs`, the ten program tabs (field `tabs`; the Translation tab is its host
@@ -203,11 +204,12 @@ Root responsibilities that stay in `studio.rs`:
 
 - While either prompt is open the input router is suppressed (`FrameEnv::modal_open`; nothing
   fires, no mode is active) and the studio repaints every frame (the `ui` call site in
-  `studio.rs`). Applying a comic type stays in `studio.rs`: it writes the
-  project (memory + settings file), then applies the preset to the `BubblesModel` canvas-settings
-  snapshot (`SharedCanvasSettings::apply_comic_type_preset`, the one preset owner, also used by the
-  Settings pane) and pushes it to `BubblesModel`, `CleanOverlaysModel` and the Settings tab; the
-  canvases pull it by revision.
+  `studio.rs`). Applying a comic type stays in `studio.rs`: the settings-file write runs on a
+  worker (`ComicTypeSave`; a failure keeps the prompt open with its error and changes nothing),
+  and only after it succeeded the project in memory is updated, the preset applied to the
+  `BubblesModel` canvas-settings snapshot (`SharedCanvasSettings::apply_comic_type_preset`, the one
+  preset owner, also used by the Settings pane) and pushed to `BubblesModel`, `CleanOverlaysModel`
+  and the Settings tab; the canvases pull it by revision.
 
 - `ViewSync::before_draw` runs right before the active tab draws and `after_draw` at the end of
   the frame, with the tab the frame ended on. Inside `before_draw` the PS-editor
@@ -282,9 +284,11 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
   app from disk (`StudioOutput::ReloadRequested`).
 - Unsaved work held inside tabs: `session::DeferredTabEdits` is the ONE owner of which tabs hold
   edits not yet handed to a staging writer (typing's deferred text edits, the PS editor's deferred
-  layer edits); the project's dirty check (latched in `refresh_unsaved_changes_cache`, and read live
-  by `SessionMode::has_unsaved_changes` outside a discard) and the image set's both read it, so a
-  close with only such an edit pending still opens the exit dialog.
+  layer edits, and — project only, `canvas_bubble_edits_pending` over the three canvases'
+  `CanvasView::has_pending_bubble_edits` — unflushed canvas bubble edits; an image-set save never
+  writes bubbles); the project's dirty check (latched in `refresh_unsaved_changes_cache`, and read
+  live by `SessionMode::has_unsaved_changes` outside a discard) and the image set's both read it, so
+  a close with only such an edit pending still opens the exit dialog.
 - DISCARD (`start_exit_cleanup` = delete job started PARKED + `StagingWriters::quiesce_discarding`
   + job released with the клин thread): a job thread the OS refuses refuses the discard before
   anything is latched or stopped (dialog closed, status shown, session unsaved). The quiesce
@@ -351,5 +355,5 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
   which tab draws which canvas: `view_sync.rs` (its tests), call sites in `studio.rs` `ui` and
   `open_page_in_tab`.
 - Change the comic-type or AI device prompt UI or its send rules: `prompts.rs` (pure decisions
-  and their tests live there); what a chosen comic type changes: `apply_comic_type_preset` in
-  `studio.rs`.
+  and their tests live there); how a chosen comic type is written: `start_comic_type_save` /
+  `poll_comic_type_save` in `studio.rs`; what it changes: `apply_comic_type_preset` there.

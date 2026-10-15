@@ -41,6 +41,7 @@ Notes:
 
 from __future__ import annotations
 
+import functools
 import io
 import logging
 import re
@@ -52,16 +53,6 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     import numpy as np
 
-try:
-    from ai_device import AIDevice
-except Exception:  # pragma: no cover - resolved differently under the two roots
-    from modules.ai_device import AIDevice
-
-try:
-    from config import UserConfig
-except Exception:  # pragma: no cover - config is always importable in-app
-    UserConfig = None
-
 from ..engines.model_download import (
     GetFn,
     RetryEvent,
@@ -71,6 +62,7 @@ from ..engines.model_download import (
 from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.rocm_mmap_transfer import move_module_to
+from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from . import code_fetch
 
 log = logging.getLogger(__name__)
@@ -1107,88 +1099,15 @@ def _emit(callback: ProgressCb | None, phase: str, step: int, total: int, label:
         log.debug("watermark: progress callback raised", exc_info=True)
 
 
-def _clear_torch_cache() -> None:
-    """Collect garbage and free the accelerator allocator cache when torch is present."""
-    import gc
+#: `General.ai_device` resolution with this service's device policy (owner:
+#: `runtime.torch_device`); patched by name in the test suite. Unlike
+#: `flux_fill.py` this service does NOT pin itself to a discrete GPU: the three
+#: networks are small (1.9-4.8 GB at 1024²) and must remain usable on CPU.
+_resolve_selected_backend_device = functools.partial(resolve_selected_backend_device, mps_last_resort=True)
 
-    gc.collect()
-    try:
-        import torch
-
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
-    except Exception:
-        log.debug("watermark: could not clear the torch allocator cache", exc_info=True)
-
-
-# =====================================================================
-#  Device selection
-# =====================================================================
-def _resolve_selected_backend_device(fallback: str) -> str:
-    """Resolve `General.ai_device` to a device string usable right now.
-
-    `not-selected` (the config sentinel) and any unavailable choice fall back to
-    an available accelerator and finally to `cpu`. Unlike `flux_fill.py` this
-    service does NOT pin itself to a discrete GPU: the three networks are small
-    (1.9-4.8 GB at 1024²) and must remain usable on CPU.
-    """
-    fallback_norm = _normalize_backend_device(fallback, "cpu")
-    configured = _read_configured_device()
-    if configured is None:
-        configured = fallback_norm
-
-    normalized = _normalize_backend_device(configured, fallback_norm)
-    available = _safe_available_devices()
-
-    if normalized in available:
-        return normalized
-    if normalized.startswith("cuda") and "cuda" in available:
-        return "cuda"
-    if fallback_norm in available:
-        return fallback_norm
-    if "cuda" in available:
-        return "cuda"
-    if "mps" in available:
-        return "mps"
-    return "cpu"
-
-
-def _read_configured_device() -> str | None:
-    """`General.ai_device` from the user config, or `None` for the sentinel."""
-    config_root = getattr(UserConfig, "config", None)
-    if not isinstance(config_root, dict):
-        return None
-    general = config_root.get("General")
-    if not isinstance(general, dict):
-        return None
-    value = general.get("ai_device")
-    if not isinstance(value, str):
-        return None
-    value = value.strip().lower()
-    if value == "not-selected":
-        return None
-    return value or None
-
-
-def _safe_available_devices() -> set[str]:
-    """Devices Torch can actually use right now; `{"cpu"}` if probing fails."""
-    try:
-        return set(AIDevice.detect_available_devices())
-    except Exception:
-        log.debug("watermark: device probing failed, assuming CPU only", exc_info=True)
-        return {"cpu"}
-
-
-def _normalize_backend_device(raw: str, fallback: str) -> str:
-    """Coerce a device string to `cpu` / `mps` / `cuda` / `cuda:<n>`."""
-    value = str(raw or "").strip().lower()
-    if value in {"cpu", "mps", "cuda"}:
-        return value
-    if value.startswith("cuda:"):
-        return value
-    return str(fallback or "cpu").strip().lower() or "cpu"
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="watermark", include_mps=False)
 
 
 # =====================================================================

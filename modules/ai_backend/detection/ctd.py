@@ -26,7 +26,7 @@ Backs the `textdetector.ctd.forward` IPC method (`ipc/handlers/textdetector.py`)
 
 from __future__ import annotations
 
-import gc
+import functools
 import logging
 import threading
 from pathlib import Path
@@ -34,19 +34,10 @@ from typing import Any
 
 import numpy as np
 
-try:
-    from ai_device import AIDevice
-except Exception:
-    from modules.ai_device import AIDevice
-
 from config import TEXT_DETECTOR_DIR
-try:
-    from config import UserConfig
-except Exception:
-    UserConfig = None
-
 from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
+from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from .forward_maps import quantize_probability_maps, validate_tiles
 
 log = logging.getLogger(__name__)
@@ -58,17 +49,13 @@ MODEL_FILENAME = "comictextdetector.pt"
 CTD_INPUT_ALIGN = 64
 
 
-def _normalize_device(raw: Any, fallback: str) -> str:
-    if raw is None:
-        return fallback
-    value = str(raw).strip().lower()
-    if not value:
-        return fallback
-    if value == "cpu" or value.startswith("cuda"):
-        return value
-    if fallback == "cpu" or str(fallback).startswith("cuda"):
-        return str(fallback)
-    return "cpu"
+#: `General.ai_device` resolution with this service's device policy (owner:
+#: `runtime.torch_device`); patched by name in the test suite.
+_resolve_selected_backend_device = functools.partial(resolve_selected_backend_device, accept_mps=False)
+
+#: Allocator-cache release with this service's policy (owner: `runtime.torch_device`);
+#: patched by name in the test suite.
+_clear_torch_cache = functools.partial(clear_torch_cache, owner="ComicTextDetector")
 
 
 def _default_device() -> str:
@@ -80,27 +67,6 @@ def _default_device() -> str:
     except Exception:
         return "cpu"
     return "cpu"
-
-
-def _clear_torch_cache() -> None:
-    try:
-        import torch  # type: ignore
-    except Exception:
-        gc.collect()
-        return
-
-    gc.collect()
-    try:
-        if hasattr(torch, "cuda") and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-    except Exception:
-        pass
-    try:
-        if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-    except Exception:
-        pass
 
 
 class CtdTextDetectorService:
@@ -250,46 +216,3 @@ class CtdTextDetectorService:
     def _model_key_for(device: str) -> str:
         normalized = str(device).strip().lower() or "cpu"
         return f"ctd:{normalized}"
-
-
-def _resolve_selected_backend_device(fallback: str) -> str:
-    fallback_norm = _normalize_device(fallback, "cpu")
-    configured = _read_configured_device()
-    if configured is None:
-        configured = fallback_norm
-
-    normalized = _normalize_device(configured, fallback_norm)
-    available = _safe_available_devices()
-
-    if normalized in available:
-        return normalized
-    if normalized.startswith("cuda") and "cuda" in available:
-        return "cuda"
-    if fallback_norm in available:
-        return fallback_norm
-    if "cuda" in available:
-        return "cuda"
-    return "cpu"
-
-
-def _read_configured_device() -> str | None:
-    config_root = getattr(UserConfig, "config", None)
-    if not isinstance(config_root, dict):
-        return None
-    general = config_root.get("General")
-    if not isinstance(general, dict):
-        return None
-    value = general.get("ai_device")
-    if not isinstance(value, str):
-        return None
-    value = value.strip().lower()
-    if value == "not-selected":
-        return None
-    return value or None
-
-
-def _safe_available_devices() -> set[str]:
-    try:
-        return set(AIDevice.detect_available_devices())
-    except Exception:
-        return {"cpu"}

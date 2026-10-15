@@ -13,7 +13,9 @@ Main responsibilities:
 - `open_url` drops the driver and retries the navigation exactly once when the session
   died between the liveness probe and `driver.get` (the check-then-act race);
 - every other navigation error propagates with no retry and no relaunch, so a mistyped
-  link never costs the user their browser session.
+  link never costs the user their browser session;
+- `_debug_log` / `_warn_log` write each line exactly once: through `LOG` when hosted
+  in-process, as a stdout JSON `log` event in the `--daemon` fallback.
 
 Notes:
 No browser and no chromedriver are involved: `build_browser` / `cleanup_browser_runtime`
@@ -26,6 +28,10 @@ The tests avoid pytest fixtures and expose a `__main__` runner, matching
 
 from __future__ import annotations
 
+import io
+import json
+import logging
+import sys
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
@@ -36,6 +42,7 @@ from selenium.common.exceptions import (
 )
 
 from modules.new_project import adv_fetch_cli
+from modules.new_project import common as common_module
 from modules.new_project.adv_fetch_cli import AdvancedFetchDaemon, _is_dead_session
 
 
@@ -164,9 +171,63 @@ def test_open_url_propagates_other_errors_without_retry() -> None:
     assert daemon._driver is driver
 
 
+class _LogRecorder(logging.Handler):
+    """Collects `(levelno, message)` of every record `adv_fetch_cli.LOG` emits."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records: list[tuple[int, str]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append((record.levelno, record.getMessage()))
+
+
+def _capture_diagnostics(daemon_mode: bool) -> tuple[list[tuple[int, str]], str]:
+    """Run one `_debug_log` and one `_warn_log`; return the log records and stdout text."""
+    recorder = _LogRecorder()
+    logger = adv_fetch_cli.LOG
+    previous_level = logger.level
+    previous_mode = common_module._daemon_stdout_log
+    previous_stdout = sys.stdout
+    stdout = io.StringIO()
+    logger.addHandler(recorder)
+    logger.setLevel(logging.DEBUG)
+    common_module._daemon_stdout_log = daemon_mode
+    sys.stdout = stdout
+    try:
+        adv_fetch_cli._debug_log("download: selected %s method", "requests")
+        adv_fetch_cli._warn_log("selenium session: %s", "relaunching")
+    finally:
+        sys.stdout = previous_stdout
+        common_module._daemon_stdout_log = previous_mode
+        logger.removeHandler(recorder)
+        logger.setLevel(previous_level)
+    return recorder.records, stdout.getvalue()
+
+
+def test_in_process_diagnostics_go_through_the_logger_only() -> None:
+    records, stdout = _capture_diagnostics(daemon_mode=False)
+    assert records == [
+        (logging.INFO, "download: selected requests method"),
+        (logging.WARNING, "selenium session: relaunching"),
+    ]
+    assert stdout == ""
+
+
+def test_daemon_diagnostics_go_to_stdout_json_only() -> None:
+    records, stdout = _capture_diagnostics(daemon_mode=True)
+    assert records == []
+    assert [json.loads(line) for line in stdout.splitlines()] == [
+        {"event": "log", "level": "info", "message": "download: selected requests method"},
+        {"event": "log", "level": "warn", "message": "selenium session: relaunching"},
+    ]
+
+
 if __name__ == "__main__":
     test_dead_session_is_distinguished_from_a_navigation_failure()
     test_dead_session_is_found_through_the_cause_chain()
     test_open_url_relaunches_and_retries_once_on_a_dead_session()
     test_open_url_propagates_other_errors_without_retry()
-    print("all Selenium browser-session lifecycle tests passed")
+    test_in_process_diagnostics_go_through_the_logger_only()
+    test_daemon_diagnostics_go_to_stdout_json_only()
+    print("all Selenium browser-session lifecycle and diagnostics tests passed")

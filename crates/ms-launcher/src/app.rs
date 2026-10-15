@@ -788,14 +788,7 @@ impl LauncherApp {
             }
             PageNavAction::OpenProject(selection) => {
                 self.close_settings_resources_if_leaving(LauncherPage::Main);
-                if let Err(err) = crate::pages::open_page::persist_last_selection_values(
-                    &selection.title,
-                    &selection.chapter,
-                ) {
-                    ms_log::runtime_log::log_warn(format!(
-                        "[launcher-open] failed to persist last selection: {err:#}"
-                    ));
-                }
+                crate::pages::open_page::spawn_persist_last_selection(selection.title.clone(), selection.chapter.clone(), "on open");
                 keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
             }
             PageNavAction::StartUpdate => {
@@ -871,9 +864,7 @@ impl LauncherApp {
         };
 
         if let Some(selection) = self.new_project_window.take_open_project_selection() {
-            if let Err(err) = crate::pages::open_page::persist_last_selection_values(&selection.title, &selection.chapter) {
-                ms_log::runtime_log::log_warn(format!("[launcher-open] failed to persist last selection after save: {err:#}"));
-            }
+            crate::pages::open_page::spawn_persist_last_selection(selection.title.clone(), selection.chapter.clone(), "after save");
             keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
             self.state.new_project_window_state.close();
         } else if response.close_requested {
@@ -910,9 +901,7 @@ impl LauncherApp {
             .show(ui, |ui| window.show_content(ui), |_| {});
 
         if let Some(selection) = self.psd_import_window.take_open_project_selection() {
-            if let Err(err) = crate::pages::open_page::persist_last_selection_values(&selection.title, &selection.chapter) {
-                ms_log::runtime_log::log_warn(format!("[launcher-open] failed to persist last selection after psd import: {err:#}"));
-            }
+            crate::pages::open_page::spawn_persist_last_selection(selection.title.clone(), selection.chapter.clone(), "after psd import");
             keep_first_outcome(&mut self.outcome, LauncherOutcome::OpenProject(selection));
             self.state.psd_import_window_state.close();
         } else if response.close_requested {

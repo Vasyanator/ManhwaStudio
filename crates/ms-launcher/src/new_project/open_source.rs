@@ -16,6 +16,8 @@ Key structures:
 - SourceLoadEvent
 
 Notes:
+Imported pages are ordered by `compare_import_names`, which defers to the launcher's one natural
+order (`crate::natural_sort::natural_name_cmp`) for anything but all-numeric `X` / `X_Y` stems.
 The GUI polls this module for completed import events. Long-running file I/O stays off the
 main thread to keep the launcher responsive. The source picker is a non-blocking
 `ms_platform::file_dialog` request that `poll` drains before the import worker starts;
@@ -1310,10 +1312,13 @@ fn compare_import_paths(left: &Path, right: &Path) -> Ordering {
     compare_import_names(left_name, right_name)
 }
 
+/// Page order of imported image names: two all-numeric `X` / `X_Y` stems keep the legacy
+/// numeric key ([`python_sort_key`]); every other pair uses the launcher's one natural order
+/// (`natural_sort::natural_name_cmp`), shared with the PSD import table and the image pick.
 fn compare_import_names(left: &str, right: &str) -> Ordering {
     match (python_sort_key(left), python_sort_key(right)) {
         (Some(left_key), Some(right_key)) => left_key.cmp(&right_key),
-        _ => compare_natural_strings(left, right),
+        _ => crate::natural_sort::natural_name_cmp(left, right),
     }
 }
 
@@ -1337,68 +1342,6 @@ fn parse_numeric_part(input: &str) -> Option<(u64, usize)> {
         input.len().saturating_sub(stripped.len())
     };
     Some((value, zeros))
-}
-
-fn compare_natural_strings(left: &str, right: &str) -> Ordering {
-    let left_parts = tokenize_for_natural_sort(left);
-    let right_parts = tokenize_for_natural_sort(right);
-    for (left_part, right_part) in left_parts.iter().zip(right_parts.iter()) {
-        let order = match (left_part, right_part) {
-            (SortToken::Number(left_number), SortToken::Number(right_number)) => {
-                left_number.cmp(right_number)
-            }
-            (SortToken::Text(left_text), SortToken::Text(right_text)) => left_text.cmp(right_text),
-            (SortToken::Number(_), SortToken::Text(_)) => Ordering::Less,
-            (SortToken::Text(_), SortToken::Number(_)) => Ordering::Greater,
-        };
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    left_parts.len().cmp(&right_parts.len())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SortToken {
-    Number(u64),
-    Text(String),
-}
-
-fn tokenize_for_natural_sort(input: &str) -> Vec<SortToken> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut current_is_digit = None;
-    for character in input.chars() {
-        let is_digit = character.is_ascii_digit();
-        match current_is_digit {
-            Some(flag) if flag == is_digit => current.push(character.to_ascii_lowercase()),
-            Some(flag) => {
-                push_sort_token(&mut tokens, &current, flag);
-                current.clear();
-                current.push(character.to_ascii_lowercase());
-                current_is_digit = Some(is_digit);
-            }
-            None => {
-                current.push(character.to_ascii_lowercase());
-                current_is_digit = Some(is_digit);
-            }
-        }
-    }
-    if let Some(flag) = current_is_digit {
-        push_sort_token(&mut tokens, &current, flag);
-    }
-    tokens
-}
-
-fn push_sort_token(tokens: &mut Vec<SortToken>, current: &str, is_digit: bool) {
-    if is_digit {
-        match current.parse::<u64>() {
-            Ok(value) => tokens.push(SortToken::Number(value)),
-            Err(_) => tokens.push(SortToken::Text(current.to_string())),
-        }
-    } else {
-        tokens.push(SortToken::Text(current.to_string()));
-    }
 }
 
 fn parse_pattern_list(patterns: &str) -> Vec<String> {
@@ -1675,6 +1618,20 @@ mod tests {
         assert_eq!(batch.images.len(), 1);
         assert_eq!(batch.images[0].image.width(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn import_names_use_the_shared_natural_order() {
+        let mut names = vec!["P10.png", "p.png", "Глава2.png", "p2.png", "p02.png", "глава10.png", "page 1.png", "page1.png"];
+        names.sort_by(|left, right| compare_import_names(left, right));
+        assert_eq!(names, vec!["p.png", "p2.png", "p02.png", "P10.png", "page 1.png", "page1.png", "Глава2.png", "глава10.png"]);
+    }
+
+    #[test]
+    fn numeric_stems_keep_the_x_y_key() {
+        let mut names = vec!["2_10.jpg", "10.jpg", "2_2.jpg", "2.jpg", "1.jpg"];
+        names.sort_by(|left, right| compare_import_names(left, right));
+        assert_eq!(names, vec!["1.jpg", "2.jpg", "2_2.jpg", "2_10.jpg", "10.jpg"]);
     }
 
     #[test]

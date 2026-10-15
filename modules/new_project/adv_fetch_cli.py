@@ -66,7 +66,11 @@ from modules.browser_f import (  # noqa: E402
     cleanup_browser_runtime,
     get_origin,
 )
-from modules.new_project.common import compile_wildcard_prefixes  # noqa: E402
+from modules.new_project.common import (  # noqa: E402
+    compile_wildcard_prefixes,
+    enable_daemon_stdout_log,
+    write_diagnostic,
+)
 from config import VERSION  # noqa: E402
 
 import time
@@ -2381,46 +2385,25 @@ def _is_http_redirect_status(status_code: int) -> bool:
 
 
 def _debug_log(message: str, *args: object) -> None:
+    """Emit a routine (info-level) diagnostic, gated by `VERBOSE_DOWNLOAD_LOG`.
+
+    Written exactly once: through `LOG` when hosted in-process (the backend log reaches
+    `last.log`), or as a JSON ``log`` event on stdout in the `--daemon` fallback
+    (`common.write_diagnostic`).
+    """
     if not VERBOSE_DOWNLOAD_LOG:
         return
-    LOG.info(message, *args)
-    try:
-        formatted = message % args if args else message
-    except Exception:  # noqa: BLE001
-        formatted = f"{message} | args={args!r}"
-    _emit_daemon_log("info", formatted)
+    write_diagnostic(LOG, EMIT_LOCK, logging.INFO, "info", message, args)
 
 
 def _warn_log(message: str, *args: object) -> None:
-    """Emit a warning-level diagnostic to both the Python log and the Rust runtime log.
+    """Emit a warning-level diagnostic the user must be able to find in `last.log`.
 
-    Same transport as `_debug_log` (a JSON ``log`` event on stdout, which the Rust side
-    forwards into the runtime log) but at ``warn`` level and **not** gated by
-    `VERBOSE_DOWNLOAD_LOG`: it carries lifecycle conditions the user must be able to see
-    in `last.log`, such as the browser session being found dead and relaunched.
+    Same single channel as `_debug_log` but at warning level and **not** gated by
+    `VERBOSE_DOWNLOAD_LOG`: it carries lifecycle conditions such as the browser session
+    being found dead and relaunched.
     """
-    LOG.warning(message, *args)
-    try:
-        formatted = message % args if args else message
-    except Exception:  # noqa: BLE001 - never lose a warning to a bad format string
-        formatted = f"{message} | args={args!r}"
-    _emit_daemon_log("warn", formatted)
-
-
-def _emit_daemon_log(level: str, message: str) -> None:
-    with EMIT_LOCK:
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "event": "log",
-                    "level": level,
-                    "message": message,
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-        sys.stdout.flush()
+    write_diagnostic(LOG, EMIT_LOCK, logging.WARNING, "warn", message, args)
 
 
 def _decode_image_bytes(image_bytes: bytes, source: str) -> Image.Image:
@@ -2515,6 +2498,8 @@ def main() -> int:
     if not args.daemon:
         print("This helper is intended to run with --daemon.", file=sys.stderr)
         return 2
+    # Set once, before any daemon work: diagnostics go to stdout as JSON `log` events.
+    enable_daemon_stdout_log()
 
     daemon = AdvancedFetchDaemon()
     try:

@@ -342,10 +342,7 @@ from .hardware import (  # noqa: F401  - re-exported public surface
     memory_snapshot,
     _clear_torch_cache,
     _cuda_device_index,
-    _normalize_backend_device,
-    _read_configured_device,
     _resolve_selected_backend_device,
-    _safe_available_devices,
 )
 from .memory import (  # noqa: F401  - re-exported public surface
     ACTIVATION_BYTES_PER_LATENT_TOKEN,

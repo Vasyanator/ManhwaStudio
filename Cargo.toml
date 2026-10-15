@@ -132,8 +132,7 @@ profiling = ["dep:puffin", "dep:puffin_egui"]
 inspection = ["eframe/inspection"]
 
 # Cross-target dependencies. These compile on both native and wasm32 (pure Rust
-# or with first-class wasm support: egui/eframe, image, cosmic-text, serde, zip,
-# rayon under the atomics build, etc.). Native-only crates (sockets, native HTTP,
+# or with first-class wasm support: egui/eframe, image, serde_json, zip, etc.). Native-only crates (sockets, native HTTP,
 # subprocess/dylib) live in the cfg(not(wasm32)) block below and their call sites are
 # cfg-gated per WEB_PORT.md.
 [dependencies]
@@ -254,14 +253,11 @@ ms-tab-page-manager = { path = "crates/ms-tab-page-manager" }
 # between the two largest crates would serialize the build for nothing.
 ms-tab-cleaning = { path = "crates/ms-tab-cleaning" }
 ms-text-util = { path = "crates/ms-text-util" }
-ms-actions = { path = "crates/ms-actions", features = ["raster"] }
 ms-storage = { path = "crates/ms-storage" }
 ms-thread = { path = "crates/ms-thread" }
 ms-i18n = { path = "crates/ms-i18n" }
-ms-gifs = { path = "crates/ms-gifs" }
 web-time.workspace = true
 anyhow.workspace = true
-chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
 eframe.workspace = true
 egui.workspace = true
@@ -269,39 +265,13 @@ egui.workspace = true
 # exit; the layers themselves are painted by `ms-tab-ps-editor`.
 egui-shader-layers.workspace = true
 image.workspace = true
-minijinja.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-flate2.workspace = true
-tar.workspace = true
 zip.workspace = true
-zstd.workspace = true
-libc.workspace = true
-# System UI-locale probe (Windows + Linux). Used by the launcher's first-run
-# language modal to preselect the interface/typesetting language; already present
-# transitively (cosmic-text / zspell), pinned here as a direct dependency.
-sys-locale.workspace = true
 # Font table parser used by the font-properties window (glyph inventory + kerning
 # extraction). Already present transitively (owned_ttf_parser -> epaint) and pinned
-# to the same 0.25 line here as a direct dependency (precedent: sys-locale above).
+# to the same 0.25 line here as a direct dependency.
 ttf-parser = { workspace = true, default-features = true }
-# Writing-system classification for the post-OCR ALL-CAPS fix
-# (`tabs::translation::ocr_case_fix`), which must touch Latin/Cyrillic letters only.
-# Already in the tree at this version through cosmic-text / ms-text-render, so it
-# adds no build cost and pins nothing new (precedent: ttf-parser above).
-unicode-script.workspace = true
-texture-synthesis.workspace = true
-rayon.workspace = true
 ag-psd.workspace = true
-zspell.workspace = true
-uuid.workspace = true
-# Two users, both needing a hash whose algorithm is fixed forever: the app-managed
-# onnxruntime dylib downloader verifies archive checksums (native-only), and the typing
-# font loader derives a font file's content hash from it — that hash is spelled into a
-# PERSISTED font identity (`fonts::suffixed_font_identity_name`), so it may never change
-# with a toolchain upgrade the way `DefaultHasher` may. Kept in the SHARED dependency
-# section for the second user: the typing panel is compiled for wasm32 too.
-sha2.workspace = true
 # Typed public errors (`#[derive(thiserror::Error)]`) across the whole crate — the
 # native onnxruntime loader, but also plenty of cross-target code: `page_ops`,
 # `models::clean_assign`, `locale_store`, the typing tab and the dockable-panel
@@ -314,8 +284,8 @@ puffin = { version = "0.20.0", optional = true }
 # release when it was vendored. See crates/puffin_egui/Cargo.toml.
 puffin_egui = { path = "crates/puffin_egui", optional = true }
 
-# Native-only dependencies: native sockets / blocking HTTP (ms-download,
-# translators, genai+tokio) and dynamic library loading (libloading). None have
+# Native-only dependencies: native sockets / blocking HTTP (ms-download) and the
+# desktop subsystems below. None have
 # a usable wasm32-unknown-unknown path with the current API usage; the web build
 # replaces them (fetch, IndexedDB, download) in the web-glue phase. File dialogs and
 # the startup error box come from `ms-platform` (shared section), which owns `rfd`.
@@ -325,24 +295,9 @@ puffin_egui = { path = "crates/puffin_egui", optional = true }
 # disk, neither of which exists in a web build — `src/ui_fonts.rs` compiles to a no-op
 # there and the web entry point installs its own fonts.
 ms-fonts = { path = "crates/ms-fonts" }
-libloading.workspace = true
 # The startup update check (`src/update_check.rs`, `fetch_small`: timeouts, bounded retry
 # with backoff, size cap).
 ms-download = { path = "crates/ms-download" }
-translators.workspace = true
-genai.workspace = true
-tokio.workspace = true
-# Native ONNX Runtime inference infrastructure (load-dynamic; runtime-resolved
-# dylib). Native-only: onnxruntime is a native shared library.
-ms-onnx = { path = "crates/ms-onnx" }
-# The loader that resolves/downloads that dylib, named `ms_onnx_runtime::` directly by
-# the root package. Native-only for the same reason as `ms-onnx`, and because every
-# path in it is blocking download/extract I/O.
-ms-onnx-runtime = { path = "crates/ms-onnx-runtime" }
-# The native ONNX Runtime OCR manager (`src/native_runtime.rs`), named
-# `ms_native_runtime::` directly by the root package. Native-only for the same reason as
-# `ms-onnx`: it owns the process-global `OrtRuntime` and the engine LRU.
-ms-native-runtime = { path = "crates/ms-native-runtime" }
 # Startup monitor + main-window geometry (`src/window_geometry.rs`), re-exported as
 # `crate::window_geometry` from `src/lib.rs`. It owns the self-versioned `Window`
 # section of `user_config.json` and is the only place that talks to winit: egui/eframe
@@ -364,15 +319,15 @@ ms-os-integration = { path = "crates/ms-os-integration" }
 # it and read its outcome.
 ms-installer = { path = "crates/ms-installer" }
 
-# Web-only dependencies. `uuid`'s `js` feature routes its RNG through the browser
-# (getrandom js backend) so v4 UUID generation links on wasm. The wasm-bindgen /
+# Web-only dependencies. `uuid` is not named by this package: it is listed only to switch on
+# its `js` feature, which routes the RNG of the member crates' v4 UUIDs (ms-models, the typing,
+# PS-editor and settings crates) through the browser (getrandom js backend) so they link on wasm. The wasm-bindgen /
 # web-sys / futures stack drives the eframe `WebRunner` entry in `web_entry.rs`;
 # `console_error_panic_hook` surfaces Rust panics in the browser console.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 uuid = { workspace = true, features = ["js"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-js-sys = "0.3"
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "console"] }
 
@@ -394,9 +349,6 @@ log = "0.4"
 tracing = { version = "0.1.40", default-features = false, features = ["log"] }
 jni.workspace = true
 rustls-platform-verifier = "0.7"
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_UI_Shell", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Foundation", "Win32_System_SystemInformation", "Win32_Graphics_Gdi"] }
 
 [build-dependencies]
 winresource = "0.1"

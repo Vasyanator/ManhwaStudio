@@ -19,7 +19,7 @@ included); it depends on no workspace crate.
   inherited.
 - `apply(ctx)` = `install(ctx, base_style())`, for windows without a screen layer: the separate
   prompt windows (installer, update, missing-environment prompt), which take it through
-  `ms_installer::window` (`WindowLook::StudioTheme`), and the diagnostic examples. The main
+  `ms_installer::window::prepare_window_context`, and the diagnostic examples. The main
   window and the web entry install per-screen styles through `shell::style` instead.
 - `with_scoped_global_style(ctx, style, f)` installs `style` for the duration of `f` and then
   restores the previous slots and preference exactly (same `Arc`s, also on unwind). Reached through

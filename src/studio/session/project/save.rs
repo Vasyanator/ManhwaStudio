@@ -8,15 +8,18 @@ deferral behind the typing tab's whole-project layer preload, the merge worker, 
 Key structures:
 - `SaveGateDecision` + `save_trigger_decision`, `deferred_save_ready`: the pure trigger gates.
 - `save_blocker_text`: the user-visible text of a `SaveBlocker` (status line, hover texts).
+- `MergeDone`: what a successful merge worker reports (whether staging exists after it).
 
 Key functions:
 - `ProjectSession::request_save_to_project` (refused on any `SaveBlocker`, then save now or defer),
   `drive_pending_save_preload` (per frame), `start_save_to_project` (ONE method, fixed order: canvas
   bubble flush (all three canvases) -> PS flush -> typing flush (abort on `Err` / failed pages) -> worker: bubbles barrier + hold -> layer
   barrier (abort on a failed owned text write) -> клин pause + snapshots + staging write -> merge
-  -> resume -> bubbles re-barrier), `poll_save_to_project` (success: gate `force_flush`, both
-  models `mark_saved_to_project`, the committed-tree latch set — drained by `StudioApp::ui` into
-  `StudioTab::on_committed_tree_changed` — cache cleared).
+  -> resume -> bubbles re-barrier), `poll_save_to_project` (success: gate `force_flush`, bubbles
+  `mark_saved_to_project_as_of` the revision read when the save started, clean overlays
+  `mark_saved_to_project`, the committed-tree latch set — drained by `StudioApp::ui` into
+  `StudioTab::on_committed_tree_changed` — cache set from the worker's post-merge staging stat,
+  `MergeDone::staging_exists`, so the GUI thread never stats the directory).
 
 Notes:
 Order and abort rules: "Save / page-op / discard / exit choreography" in `src/studio/MODULE_README.md`.
@@ -32,6 +35,18 @@ use eframe::egui;
 use ms_thread as thread;
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// What the save worker reports for a successful merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MergeDone {
+    /// `BubblesModel::revision` at the start of the save (read on the GUI thread, echoed by the
+    /// worker): a model revision past it on receipt means a bubble edit the merge did not include.
+    pub(super) saved_bubbles_revision: u64,
+    /// Whether the chapter's staging directory exists once the merge and the post-merge bubbles
+    /// barrier are done: an edit accepted during the merge re-created it, so the session is still
+    /// unsaved. Stat-ed by the worker so the GUI-side poll needs no file access.
+    pub(super) staging_exists: bool,
+}
 
 impl ProjectSession {
     /// Entry point for every "save to project" trigger (the toolbar button and both exit-dialog
@@ -209,8 +224,11 @@ impl ProjectSession {
         // The worker barriers the bubble saver and holds post-barrier snapshots until the merge
         // finishes. This makes the committed bubbles file a precise snapshot while edits made during
         // the save remain queued for fresh staging after the destructive merge removes the old tree.
-        let bubbles_saver_handle = match parts.writers.bubbles_model().lock() {
-            Ok(model) => model.saver_handle(),
+        // The revision read here (GUI thread, after the canvas flush above: every edit up to it has
+        // already sent its snapshot, so the first barrier below writes it into the merged staging)
+        // is the bubble state this save commits; `poll_save_to_project` compares the model with it.
+        let (bubbles_saver_handle, saved_bubbles_revision) = match parts.writers.bubbles_model().lock() {
+            Ok(model) => (model.saver_handle(), model.revision()),
             Err(_) => {
                 runtime_log::log_error(
                     "[save_to_project] aborted: bubbles model lock poisoned; saver barrier unavailable",
@@ -230,7 +248,7 @@ impl ProjectSession {
         // here, with the autosave running, let a pass that had just taken the dirty set land its pages
         // in a staging dir re-created after the merge deleted it, while the app reported "saved".
         let overlay_autosave_control = parts.writers.overlay_control();
-        let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<MergeDone, String>>();
         let spawned = thread::Builder::new().name("save-to-project".to_owned()).spawn(move || {
             // Hold later bubble snapshots until every destructive staging operation below is done.
             // Dropping this guard on any return path resumes the saver.
@@ -343,6 +361,9 @@ impl ProjectSession {
                 }
                 return;
             }
+            // Stat-ed after the re-barrier, so a bubble edit accepted during the merge is already on
+            // the fresh staging it re-created (the answer the GUI used to stat for itself).
+            let result = result.map(|()| MergeDone { saved_bubbles_revision, staging_exists: unsaved_dir.exists() });
             if tx.send(result).is_err() {
                 runtime_log::log_error(
                     "[save_to_project] result receiver dropped before completion was reported",
@@ -373,14 +394,21 @@ impl ProjectSession {
             return SavePoll::NotFinished;
         };
         match rx.try_recv() {
-            Ok(Ok(())) => {
+            Ok(Ok(done)) => {
                 self.save_to_project_rx = None;
                 // Everything held was forced out and merged: close the gate's window so the interval
                 // and action count restart from the next edit. Abort paths leave the gate alone.
                 parts.writers.gate().force_flush();
-                if let Ok(mut model) = parts.writers.bubbles_model().lock() {
-                    model.mark_saved_to_project();
-                }
+                // A bubble edit made after the save started is not in the merge, whether or not its
+                // queued snapshot has reached staging yet: the revision decides, not file timing.
+                let bubbles_advanced = match parts.writers.bubbles_model().lock() {
+                    Ok(mut model) => {
+                        model.mark_saved_to_project_as_of(done.saved_bubbles_revision, done.staging_exists);
+                        model.revision() != done.saved_bubbles_revision
+                    }
+                    // Unknown: stay unsaved (conservative).
+                    Err(_) => true,
+                };
                 if let Ok(mut model) = parts.writers.clean_overlays_model().lock() {
                     model.mark_saved_to_project();
                 }
@@ -389,7 +417,10 @@ impl ProjectSession {
                 // cannot see that by themselves. Latched here, drained by `StudioApp::ui` right
                 // after this tick (`StudioTab::on_committed_tree_changed`), before any tab draws.
                 self.committed_tree_changed = true;
-                self.has_unsaved_changes_cached = false;
+                // Staging re-created during the merge, or a bubble edit since the save started, keeps
+                // the session unsaved (a save-then-close then ends as `StillUnsaved`); otherwise this
+                // frame's refresh re-checks the in-memory facts and asks the staging probe afresh.
+                self.reset_unsaved_after_persist(post_save_unsaved(done, bubbles_advanced));
                 self.save_to_project_status = Some((t!("app.save.saved").to_string(), now));
                 runtime_log::log_info("[save_to_project] merge complete");
                 SavePoll::Succeeded
@@ -411,6 +442,12 @@ impl ProjectSession {
             }
         }
     }
+}
+
+/// Whether the session is still unsaved right after a successful merge: the staging directory
+/// was re-created during it, or the bubbles model moved past the revision the save committed.
+fn post_save_unsaved(done: MergeDone, bubbles_advanced: bool) -> bool {
+    done.staging_exists || bubbles_advanced
 }
 
 /// The user-visible reason for `blocker` (save status line, disabled save buttons' hover text);

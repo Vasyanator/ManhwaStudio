@@ -5329,10 +5329,10 @@ impl NewProjectWindowState {
             format!("https://comic.naver.com/webtoon/detail?titleId=842647&no={chapter_number}");
         thread::spawn(move || {
             let result = check_test_chapter_site_availability(chapter_url);
+            // The receiver is dropped only when the window closed (`cancel_quick_download_slot`),
+            // so an undeliverable result is a cancelled check, not a failure.
             if tx.send(result).is_err() {
-                ms_log::runtime_log::log_warn(
-                    "[new-project] failed to send test chapter availability result to UI",
-                );
+                ms_log::runtime_log::log_info("[new-project] test chapter availability check finished after the window was closed; result dropped");
             }
         });
     }
@@ -6564,20 +6564,20 @@ impl NewProjectWindowState {
     }
 
     /// Resets the per-opening state when the window closes: pending questions and pickers,
-    /// the quick download (cancelled), and the waifu2x / Reline controllers.
+    /// the quick download and its test-chapter check (both cancelled), and the waifu2x / Reline
+    /// controllers.
     fn handle_window_closed(&mut self) {
         // A question or a picker answer belongs to the session that asked; never carry it into
         // the next opening of the window.
         self.overwrite_confirm = None;
         self.cut_like_folder_dialog = None;
         self.save_folder_dialog = None;
-        // A quick download must not outlive the window that asked for it: stop its worker and
-        // drop its progress, so a reopened window shows neither a stale bar nor a late result.
-        // The test-chapter check shares the "quick_download" progress slot and is left alone.
-        if self.quick_download.cancel() && self.test_chapter_check_rx.is_none() {
-            if self.active_progress.as_ref().is_some_and(|progress| progress.operation == "quick_download") {
-                self.active_progress = None;
-            }
+        // A quick download — and the test-chapter check that would start one — must not outlive
+        // the window that asked for it: stop the worker / drop the check's receiver and release
+        // their shared progress slot, so a reopened window shows neither a stale bar nor a late
+        // result (a check finishing later would otherwise start a download in a closed window).
+        let download_cancelled = self.quick_download.cancel();
+        if cancel_quick_download_slot(&mut self.test_chapter_check_rx, download_cancelled, &mut self.active_progress) {
             self.import_status = t!("launcher.new_project.quick_dl_cancelled_status").to_string();
         }
         self.waifu2x.shutdown();
@@ -7974,6 +7974,30 @@ fn progress_label(is_loading: bool) -> &'static str {
     }
 }
 
+/// Cancels whatever holds the shared "quick_download" progress slot when the window closes: the
+/// test-chapter check is cancelled by dropping its receiver (`check_rx` becomes `None`; the
+/// probe's single bounded request runs out on its worker and its result is discarded), and
+/// `download_cancelled` says whether the quick-download worker was just stopped. When either
+/// was cancelled, a "quick_download" progress is cleared and `true` is returned (the caller
+/// reports the cancellation); otherwise nothing changes.
+fn cancel_quick_download_slot(
+    check_rx: &mut Option<Receiver<TestChapterAvailabilityResult>>,
+    download_cancelled: bool,
+    progress: &mut Option<OperationProgress>,
+) -> bool {
+    let check_cancelled = check_rx.take().is_some();
+    if check_cancelled {
+        ms_log::runtime_log::log_info("[new-project] test chapter availability check cancelled: the window was closed");
+    }
+    if !check_cancelled && !download_cancelled {
+        return false;
+    }
+    if progress.as_ref().is_some_and(|progress| progress.operation == "quick_download") {
+        *progress = None;
+    }
+    true
+}
+
 fn random_test_chapter_number() -> usize {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -8355,9 +8379,39 @@ mod macos_capture_bounds_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchProcessingWindowState, RIBBON_MIN_WIDTH_FRACTION, clamp_ribbon_width_fraction, close_batch_window,
-        needs_overwrite_confirm, ribbon_page_display_size, ribbon_page_left_inset, ribbon_scale_base_px,
+        BatchProcessingWindowState, OperationProgress, RIBBON_MIN_WIDTH_FRACTION, TestChapterAvailabilityResult, cancel_quick_download_slot,
+        clamp_ribbon_width_fraction, close_batch_window, needs_overwrite_confirm, ribbon_page_display_size, ribbon_page_left_inset,
+        ribbon_scale_base_px,
     };
+    use std::sync::mpsc;
+
+    fn quick_download_progress() -> Option<OperationProgress> {
+        Some(OperationProgress { operation: "quick_download", stage: "connect".to_string(), current: 0, total: 1 })
+    }
+
+    #[test]
+    fn closing_cancels_an_in_flight_test_chapter_check() {
+        let (tx, rx) = mpsc::channel::<TestChapterAvailabilityResult>();
+        let mut check_rx = Some(rx);
+        let mut progress = quick_download_progress();
+        assert!(cancel_quick_download_slot(&mut check_rx, false, &mut progress));
+        assert!(check_rx.is_none(), "the check's receiver is dropped");
+        assert!(progress.is_none(), "its progress bar is released");
+        let late = TestChapterAvailabilityResult { available: true, chapter_url: String::new(), log_message: None };
+        assert!(tx.send(late).is_err(), "a late result can no longer reach the window");
+    }
+
+    #[test]
+    fn closing_releases_the_slot_of_a_cancelled_download_and_leaves_other_progress() {
+        let mut check_rx = None;
+        let mut progress = quick_download_progress();
+        assert!(cancel_quick_download_slot(&mut check_rx, true, &mut progress));
+        assert!(progress.is_none());
+
+        let mut other = Some(OperationProgress { operation: "waifu2x", stage: "prepare".to_string(), current: 0, total: 1 });
+        assert!(!cancel_quick_download_slot(&mut check_rx, false, &mut other), "nothing was running");
+        assert!(other.is_some(), "another operation's progress is not touched");
+    }
     use ms_widgets::embedded_window::covers_host;
     use ms_widgets::{EmbeddedWindow, EmbeddedWindowState};
 

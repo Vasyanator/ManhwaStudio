@@ -41,7 +41,8 @@ Dispatch methods on `SessionMode` and their `StudioApp` call sites:
 ## Files and submodules
 - `mod.rs`: `SessionMode`, `SessionParts`, `DeferredTabEdits` (the one owner of "the tabs hold
   edits not yet handed to a staging writer", read by both kinds' dirty checks; a new tab-held
-  deferred edit becomes a field here), the dispatch methods, and the image-set close helpers
+  deferred edit becomes a field here; its canvas term comes from `canvas_bubble_edits_pending`,
+  which a project passes and an image set does not), the dispatch methods, and the image-set close helpers
   (`close_image_set_discarding`, `apply_image_set_outcome`); tests that build both kinds from real
   fixtures (a temp chapter, an opened image set) and check their dispatch answers.
 - `project/`: `ProjectSession`, the project persistence state and flows. See its `MODULE_README.md`.

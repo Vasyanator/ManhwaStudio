@@ -3,8 +3,9 @@ File: crates/ms-launcher/src/natural_sort.rs
 
 Purpose:
 The launcher's one natural ("human") name order: digit runs compare by number, so `p2` sorts
-before `p10`. Shared by the PSD import table (`psd_import_window::sort_rows_for_table`) and the
-"Open image" multi-pick (`open_image`), so both lists order files the same way.
+before `p10`. Shared by the PSD import table (`psd_import_window::sort_rows_for_table`), the
+"Open image" multi-pick (`open_image`) and the New Project source import
+(`new_project::open_source::compare_import_names`), so every list orders files the same way.
 
 Key functions:
 - natural_name_cmp(): the comparison.

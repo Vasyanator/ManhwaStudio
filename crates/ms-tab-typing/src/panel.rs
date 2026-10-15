@@ -771,25 +771,6 @@ impl Default for TypingSCurveShapeLayoutParams {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum TypingPanelLayout {
-    Vertical,
-}
-
-impl TypingPanelLayout {
-    pub fn as_config_str(self) -> &'static str {
-        "vertical"
-    }
-
-    pub fn from_config_str(value: &str) -> Option<Self> {
-        match value {
-            "vertical" => Some(Self::Vertical),
-            "horizontal" => Some(Self::Vertical),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum TypingTopPanelMode {
     CreateText,
     EditText,
