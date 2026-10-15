@@ -1,49 +1,54 @@
-//! Tests of the `TranslationTab` host: the hotkey set it declares (pinned to the studio root's
-//! `hotkey_registry_golden` Translation slice), the execute dispatch, the exit-only hint-collapsed
-//! key round trip and the dock builder it hands the root.
+//! Tests of the `TranslationTab` host: the input actions it declares (pinned to the studio
+//! root's `input_registry_golden` Translation slice), the execute dispatch, the input contexts it
+//! publishes, the exit-only hint-collapsed key round trip and the dock builder it hands the root.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use egui::{Key, Modifiers as M};
+use egui::Key;
 use ms_canvas::CANVAS_RIBBON_TAB;
 use ms_config::app_tab::AppTab;
+use ms_input::{ActionKind, Binding, Button, Chord, InputRegistry, ModifierKey, Scope, view};
 use ms_models::bubbles_model::{BubblesModel, SharedCanvasSettings};
 use ms_project::{CanvasSettings, ProjectData, ProjectPaths};
-use ms_studio_tab::StudioTab;
-use ms_widgets::input_manager_v2::{HotkeyScopeV2, ModifierOnlyV2};
+use ms_studio_tab::{StudioTab, VIEW_ZOOM_COMMANDS};
 use ms_widgets::panel_dock::TabId;
 use serde_json::{Value, json};
 
 use super::TranslationTab;
 use crate::tab::{TranslationTabState, translation_default_dock_layout};
 
-/// (id, scope, default shortcut as (modifiers, key), default modifier-only, active when input).
-type HotkeyRow = (&'static str, HotkeyScopeV2, Option<(M, Key)>, Option<ModifierOnlyV2>, bool);
+/// (id, kind, scope, default alternatives).
+type ActionRow = (&'static str, ActionKind, Scope, Vec<Binding>);
 
-const TR: HotkeyScopeV2 = HotkeyScopeV2::Tab(AppTab::Translation);
+const TR: Scope = Scope::Tab(AppTab::Translation);
 
-/// The Translation slice of the studio root's `hotkey_registry_golden` (`src/studio.rs`), copied
-/// verbatim: ids are persistence keys and the order is observable within the scope.
-const GOLDEN_TRANSLATION_ROWS: [HotkeyRow; 17] = [
-    ("translation.canvas.zoom_in", TR, Some((M::COMMAND, Key::Equals)), None, false),
-    ("translation.canvas.zoom_out", TR, Some((M::COMMAND, Key::Minus)), None, false),
-    ("translation.canvas.zoom_reset", TR, Some((M::COMMAND, Key::Num0)), None, false),
-    ("translation.bubble.delete_selected", TR, Some((M::NONE, Key::Delete)), None, false),
-    ("translation.bubble.create_at_cursor", TR, Some((M::NONE, Key::T)), None, false),
-    ("translation.bubble.create_hint_at_cursor", TR, Some((M::NONE, Key::H)), None, false),
-    ("translation.ocr.quick.selection_mode", TR, None, Some(ModifierOnlyV2::Shift), false),
-    ("translation.ocr.advanced.selection_mode", TR, None, Some(ModifierOnlyV2::Alt), false),
-    ("translation.panel.bubbles.toggle", TR, Some((M::NONE, Key::P)), None, false),
-    ("translation.panel.ocr.toggle", TR, Some((M::NONE, Key::S)), None, false),
-    ("translation.panel.composition.toggle", TR, Some((M::NONE, Key::K)), None, false),
-    ("translation.panel.machine_translation.toggle", TR, Some((M::NONE, Key::M)), None, false),
-    ("translation.panel.detector.toggle", TR, Some((M::NONE, Key::D)), None, false),
-    ("translation.bubble.copy_original", TR, None, None, false),
-    ("translation.bubble.copy_translation", TR, None, None, false),
-    ("translation.bubble.paste_original", TR, None, None, false),
-    ("translation.bubble.paste_translation", TR, None, None, false),
-];
+/// A command alternative "this key, no modifier".
+fn key(key: Key) -> Vec<Binding> {
+    vec![Binding::command(Chord::new([Button::Key(key)]))]
+}
+
+/// The Translation slice of the studio root's `input_registry_golden` (`src/studio.rs`), copied
+/// verbatim: ids are persistence keys of the user's overrides.
+fn golden_translation_rows() -> Vec<ActionRow> {
+    use ActionKind::{Command, Mode};
+    vec![
+        ("translation.bubble.delete_selected", Command, TR, key(Key::Delete)),
+        ("translation.bubble.create_at_cursor", Command, TR, key(Key::T)),
+        ("translation.bubble.create_hint_at_cursor", Command, TR, key(Key::H)),
+        ("translation.ocr.quick_mode", Mode, TR, vec![Binding::mode([Button::Modifier(ModifierKey::Shift)])]),
+        ("translation.ocr.advanced_mode", Mode, TR, vec![Binding::mode([Button::Modifier(ModifierKey::Alt)])]),
+        ("translation.panel.bubbles.toggle", Command, TR, key(Key::P)),
+        ("translation.panel.ocr.toggle", Command, TR, key(Key::S)),
+        ("translation.panel.composition.toggle", Command, TR, key(Key::K)),
+        ("translation.panel.machine_translation.toggle", Command, TR, key(Key::M)),
+        ("translation.panel.detector.toggle", Command, TR, key(Key::D)),
+        ("translation.bubble.copy_original", Command, TR, Vec::new()),
+        ("translation.bubble.copy_translation", Command, TR, Vec::new()),
+        ("translation.bubble.paste_original", Command, TR, Vec::new()),
+        ("translation.bubble.paste_translation", Command, TR, Vec::new()),
+    ]
+}
 
 /// A host over a default tab state and an empty bubbles model whose (never written) documents
 /// live under `dir`, with `user_settings` as the startup config.
@@ -94,33 +99,56 @@ fn project_in(dir: &Path) -> ProjectData {
 }
 
 #[test]
-fn hotkey_specs_equal_the_root_golden_translation_slice() {
+fn input_declarations_equal_the_root_golden_translation_slice() {
     let dir = tempfile::tempdir().expect("temp dir");
     let host = host_in(dir.path(), &Value::Null);
-    let actual: Vec<HotkeyRow> = host
-        .hotkey_specs()
-        .iter()
-        .map(|spec| (spec.id, spec.scope, spec.default_shortcut.map(|shortcut| (shortcut.modifiers, shortcut.logical_key)), spec.default_modifier_only, spec.active_when_input))
-        .collect();
-    assert_eq!(actual, GOLDEN_TRANSLATION_ROWS.to_vec());
+    let declarations = host.input_declarations();
+    let actual: Vec<ActionRow> = declarations.actions.iter().map(|spec| (spec.meta().id.0, spec.kind(), spec.meta().scope, spec.meta().defaults.clone())).collect();
+    assert_eq!(actual, golden_translation_rows());
+    assert!(declarations.targets.is_empty() && declarations.fixed.is_empty() && declarations.exclusive_contexts.is_empty());
+    // Together with the shared view set they form a valid registry (no duplicate id, every
+    // `beats` names a declared mode).
+    let mut all = view::declarations();
+    all.extend(declarations);
+    InputRegistry::new(all).expect("the Translation declarations form a valid registry");
 }
 
-/// Every declared id is executed by this tab (so the spec list and the execute arms cannot drift
-/// apart), and an id of another tab, of the session or an unknown one is refused untouched.
+/// The advanced OCR mode beats the quick one when both are held (Shift+Alt).
 #[test]
-fn execute_hotkey_handles_exactly_its_own_ids() {
+fn the_advanced_ocr_mode_beats_the_quick_one() {
+    let advanced = TranslationTabState::input_actions().into_iter().find(|spec| spec.meta().id.0 == "translation.ocr.advanced_mode").expect("advanced mode declared");
+    let ms_input::ActionSpec::Mode(mode) = advanced else { panic!("the advanced OCR selection is a mode") };
+    assert_eq!(mode.beats, vec![ms_input::ActionId("translation.ocr.quick_mode")]);
+}
+
+/// Every declared command, and the three shared zoom commands, are executed by this tab (so the
+/// declarations and the execute arms cannot drift apart); modes, ids of the session or of another
+/// owner, and unknown ids are refused untouched.
+#[test]
+fn run_command_handles_exactly_its_own_commands() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut host = host_in(dir.path(), &Value::Null);
     let project = project_in(dir.path());
     let ctx = egui::Context::default();
-    for foreign in ["cleaning.canvas.zoom_in", "single_image.save", "", "translation.canvas.zoom"] {
-        assert!(!host.execute_hotkey(&ctx, foreign, &project), "{foreign:?} must not be handled by Translation");
+    for foreign in ["single_image.save", "", "view.zoom", "view.pan", "cleaning.canvas.zoom_in", "translation.canvas.zoom_in"] {
+        assert!(!host.run_command(&ctx, &project, ms_input::ActionId(foreign)), "{foreign:?} must not be handled by Translation");
     }
-    // The two modifier-only ids are never reported by `collect_triggered`; every other declared id
-    // must reach an execute arm.
-    for (id, _, _, modifier_only, _) in GOLDEN_TRANSLATION_ROWS {
-        assert_eq!(host.execute_hotkey(&ctx, id, &project), modifier_only.is_none(), "{id}");
+    for zoom in [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET] {
+        assert!(host.run_command(&ctx, &project, zoom), "{zoom:?}");
     }
+    for (id, kind, _, _) in golden_translation_rows() {
+        assert_eq!(host.run_command(&ctx, &project, ms_input::ActionId(id)), kind == ActionKind::Command, "{id}");
+    }
+}
+
+/// With the advanced-recognition window closed the host executes the shared zoom commands, so it
+/// publishes the context that lets the router fire (and consume) them.
+#[test]
+fn the_host_publishes_the_view_zoom_context_while_it_zooms_itself() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let host = host_in(dir.path(), &Value::Null);
+    assert!(!host.state().blocks_canvas_zoom());
+    assert_eq!(host.input_contexts(), vec![VIEW_ZOOM_COMMANDS]);
 }
 
 /// `new` seeds the bottom-hint collapsed flag from `Canvas.translation_hint_collapsed` (missing or

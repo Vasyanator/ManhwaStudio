@@ -5,6 +5,8 @@ Crate root of `ms-studio-tab`: the `StudioTab` trait, the per-tab hook surface t
 
 Key items:
 - `StudioTab`: order-free hooks, each with a no-op default, so a tab implements only what it has.
+- `VIEW_ZOOM_COMMANDS`: the input context that gates the shared `view.zoom_*` commands while the
+  canvases still read their own zoom keys (temporary, see its declaration comment).
 
 Notes:
 - Only ORDER-FREE hooks belong here: the root may call them for every tab in `AppTab::ALL`
@@ -18,10 +20,22 @@ Notes:
 
 use std::collections::HashSet;
 
+use ms_input::{ContextId, Declarations};
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
 use ms_project::ProjectData;
-use ms_widgets::input_manager_v2::HotkeySpecV2;
 use ms_widgets::panel_dock::DockLayout;
+
+/// Input context a tab publishes (`StudioTab::input_contexts`) while the shared zoom commands
+/// (`ms_input::view::ZOOM_IN` / `ZOOM_OUT` / `ZOOM_RESET`) must reach it. The studio root
+/// registers those three commands with `Condition::Context(VIEW_ZOOM_COMMANDS)`, so the input
+/// router matches (and consumes) their keys only while a tab that executes them is active and
+/// not blocking canvas zoom; everywhere else the keys stay with the viewers that still read them
+/// raw (the typing canvas, the advanced-recognition window, the cleaning region editor, the PS
+/// editor's brush keys).
+///
+/// Temporary: removed, together with the root's gate, once `CanvasView` consumes the `view.*`
+/// set itself (input-unification package WP5).
+pub const VIEW_ZOOM_COMMANDS: ContextId = ContextId("studio.view_zoom_commands");
 
 /// Order-free per-tab hooks the studio root iterates (`Tabs`). Every method has a no-op default.
 ///
@@ -29,16 +43,22 @@ use ms_widgets::panel_dock::DockLayout;
 /// tab, never blocks (except [`StudioTab::flush_debounced_stores_blocking`]) and does no I/O
 /// outside that method. Hooks are called on the GUI thread.
 pub trait StudioTab {
-    /// Code-declared hotkeys of this tab, in registration order (their scope is this tab).
+    /// The input actions this tab declares for the studio's `ms_input::InputRegistry` (merged in
+    /// `AppTab::ALL` order with the shared `view.*` set and the session's own). Pure and stable:
+    /// called once when the studio is built. Action ids are persistence keys of the user's
+    /// overrides (`user_config` -> `Hotkeys`) and must never be renamed. A tab reads what fired
+    /// from the `ms_input::InputFrame` it is handed for its draw; there is no execute hook.
     #[must_use]
-    fn hotkey_specs(&self) -> Vec<HotkeySpecV2> {
-        Vec::new()
+    fn input_declarations(&self) -> Declarations {
+        Declarations::default()
     }
 
-    /// Runs one triggered command of this tab. Returns `false` when `command_id` is not one of
-    /// this tab's ids (nothing was done), `true` when this tab handled it.
-    fn execute_hotkey(&mut self, _ctx: &egui::Context, _command_id: &str, _project: &ProjectData) -> bool {
-        false
+    /// The input contexts this tab publishes this frame while it is the active tab (a tool, an
+    /// edit mode, an open window). Pure, cheap, called once per frame before the input router
+    /// runs; actions declaring `Condition::Context(..)` are active only while it is listed.
+    #[must_use]
+    fn input_contexts(&self) -> Vec<ContextId> {
+        Vec::new()
     }
 
     /// The default-layout builder this tab passes to `PanelDockState::ensure_default_layout`.
@@ -97,7 +117,8 @@ mod tests {
     fn the_trait_is_object_safe_and_defaults_are_no_ops() {
         let mut bare = Bare;
         let tab: &mut dyn StudioTab = &mut bare;
-        assert!(tab.hotkey_specs().is_empty());
+        assert_eq!(tab.input_declarations(), ms_input::Declarations::default());
+        assert!(tab.input_contexts().is_empty());
         assert!(tab.default_dock_layout().is_none());
         assert!(tab.source_page_window(3).is_empty());
         assert!(!tab.wants_nearest_source());
@@ -114,6 +135,6 @@ mod tests {
         tab.flush_debounced_stores_blocking();
         tab.on_committed_tree_changed();
         let shared: &dyn StudioTab = &Bare;
-        assert!(shared.hotkey_specs().is_empty());
+        assert!(shared.input_contexts().is_empty());
     }
 }

@@ -17,8 +17,8 @@ Key structures:
 
 Key functions:
 - `SessionMode::from_project`: the one constructor (and the one session-kind decision in `src/studio`).
-- Dispatch: `has_unsaved_changes`, `tab_visible`, `hotkey_specs`, `capabilities` (the tabs' `SessionCapabilities`), `tick`, `draw_top_bar`,
-  `draw_exit_dialog`, `draw_dialogs`, `on_save_hotkey`, `start_page_op`, `before_shutdown`, plus
+- Dispatch: `has_unsaved_changes`, `tab_visible`, `input_declarations`, `capabilities` (the tabs' `SessionCapabilities`), `tick`, `draw_top_bar`,
+  `draw_exit_dialog`, `draw_dialogs`, `run_fired_commands`, `start_page_op`, `before_shutdown`, plus
   the project-state queries (`busy_jobs`, `exit_cleanup_action`, `take_reload_request`,
   `take_committed_tree_changed`, `note_unsaved`), which answer "nothing" for an image set; `take_title` (image set only); `os_close_policy` (a second OS close
   over the exit dialog: a project exits, an image set keeps the dialog).
@@ -41,7 +41,6 @@ use super::close_flow::{CloseFlow, OsClosePolicy};
 use super::staging_writers::StagingWriters;
 use super::view_sync::{canvas_slot, for_each_canvas_mut};
 use crate::canvas::CanvasView;
-use crate::input_manager_v2::HotkeySpecV2;
 use crate::models::SessionCapabilities;
 use crate::page_ops::PageOpKind;
 use crate::project::ProjectData;
@@ -52,6 +51,7 @@ use crate::tabs::page_manager::PageManagerTabState;
 use crate::tabs::ps_editor::PsEditorTabState;
 use crate::tabs::typing::TypingTabState;
 use eframe::egui;
+use ms_input::{Declarations, InputFrame};
 use serde_json::Value;
 
 /// The `StudioApp` parts a session flow borrows for one call (disjoint fields of the app, built by
@@ -197,13 +197,13 @@ impl SessionMode {
         image_set::tab_visible(tab, self.is_image_set())
     }
 
-    /// Hotkeys only this session kind registers (after the code-declared ones, before the user
-    /// overrides): the image set's save / save-as; none for a project.
+    /// Input actions only this session kind declares (merged after the view set and the tabs',
+    /// before the user overrides apply): the image set's save / save-as; none for a project.
     #[must_use]
-    pub(in crate::studio) fn hotkey_specs(&self) -> Vec<HotkeySpecV2> {
+    pub(in crate::studio) fn input_declarations(&self) -> Declarations {
         match self {
-            Self::Project(_) => Vec::new(),
-            Self::ImageSet(_) => image_set::hotkey_specs().into(),
+            Self::Project(_) => Declarations::default(),
+            Self::ImageSet(_) => image_set::input_declarations(),
         }
     }
 
@@ -368,16 +368,19 @@ impl SessionMode {
         }
     }
 
-    /// The image set's save hotkeys (`image_set::HOTKEY_SAVE_IMAGE` / `HOTKEY_SAVE_IMAGE_AS`,
-    /// registered only in that mode); a project session does nothing.
-    pub(in crate::studio) fn on_save_hotkey(&mut self, ctx: &egui::Context, command_id: &str) {
+    /// Runs the session's own commands that fired this frame: the image set's save / save-as
+    /// (`image_set::HOTKEY_SAVE_IMAGE` / `HOTKEY_SAVE_IMAGE_AS`, declared only in that mode).
+    /// Every other fired command belongs to a tab; a project session has none of its own.
+    pub(in crate::studio) fn run_fired_commands(&mut self, ctx: &egui::Context, input: &InputFrame) {
         let Self::ImageSet(image_set) = self else {
             return;
         };
-        match command_id {
-            image_set::HOTKEY_SAVE_IMAGE => image_set.request_save(),
-            image_set::HOTKEY_SAVE_IMAGE_AS => image_set.request_save_as(ctx),
-            other => runtime_log::log_warn(format!("[single_image] '{other}' is not a save hotkey; ignored")),
+        for fired in input.fired_commands() {
+            match fired.action {
+                image_set::HOTKEY_SAVE_IMAGE => image_set.request_save(),
+                image_set::HOTKEY_SAVE_IMAGE_AS => image_set.request_save_as(ctx),
+                _ => {}
+            }
         }
     }
 
@@ -490,7 +493,7 @@ mod tests {
         for tab in AppTab::ALL {
             assert!(mode.tab_visible(tab), "{tab:?} must exist in a project session");
         }
-        assert!(mode.hotkey_specs().is_empty());
+        assert_eq!(mode.input_declarations(), ms_input::Declarations::default());
         assert_eq!(mode.os_close_policy(), OsClosePolicy::SecondCloseExits, "a project's staging survives an exit");
         assert_eq!(mode.busy_jobs(), PersistenceJobs::default(), "a fresh session runs no job");
         assert_eq!(mode.exit_cleanup_action(), None);
@@ -509,7 +512,7 @@ mod tests {
     }
 
     /// An opened image set builds an image-set session: chapter tabs hidden, its two save hotkeys
-    /// (save-as first), no project job; dirty follows the autosave gate, and the DISCARD latch
+    /// (save, then save-as), no project job; dirty follows the autosave gate, and the DISCARD latch
     /// silences it (the window is closing without saving).
     #[test]
     fn an_image_set_builds_an_image_set_session() {
@@ -527,8 +530,8 @@ mod tests {
         for tab in AppTab::ALL {
             assert_eq!(mode.tab_visible(tab), !hidden.contains(&tab), "{tab:?} in an image set");
         }
-        let ids: Vec<&str> = mode.hotkey_specs().iter().map(|spec| spec.id).collect();
-        assert_eq!(ids, vec![super::image_set::HOTKEY_SAVE_IMAGE_AS, super::image_set::HOTKEY_SAVE_IMAGE]);
+        let ids: Vec<ms_input::ActionId> = mode.input_declarations().actions.iter().map(|spec| spec.meta().id).collect();
+        assert_eq!(ids, vec![super::image_set::HOTKEY_SAVE_IMAGE, super::image_set::HOTKEY_SAVE_IMAGE_AS]);
         assert_eq!(mode.os_close_policy(), OsClosePolicy::SecondCloseKeepsDialog, "an image-set exit discards its scratch");
         assert_eq!(mode.busy_jobs(), PersistenceJobs::default());
         assert_eq!(mode.exit_cleanup_action(), None);

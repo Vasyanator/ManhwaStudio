@@ -104,13 +104,6 @@ extern crate ms_i18n;
 // of the same UI-primitive layer as the widgets; `panel_dock/panel.rs` is one of its
 // callers, and the canvas/tabs above reach it through the binary's re-export.
 pub mod input_util;
-// The user-configurable hotkey registry (`InputManagerV2`): code-declared specs, the
-// persisted `Hotkeys` overrides in `user_config.json`, and the per-frame dispatch of
-// triggered commands from `egui::InputState`. It lives here rather than in the binary
-// because it is a pure egui-input primitive over `ms_config::app_tab::AppTab`, and both
-// the binary (`studio.rs`, the settings hotkeys pane) and the `translation` tab crate
-// register specs with it.
-pub mod input_manager_v2;
 // The egui half of the bubble-status feature: it paints a rule's border with a bare
 // `Painter` and re-exports the GUI-free rule model from `ms_config::bubble_status`. A
 // painting primitive with no domain knowledge, so it belongs to this layer; the canvas

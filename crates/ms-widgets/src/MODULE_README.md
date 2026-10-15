@@ -21,8 +21,9 @@ project domain: it may depend on `ms-config`, `ms-log`, `ms-i18n`, `ms-text-util
 re-exports as `touch_nav`) and `ms-fonts` (the last one native-only), and it may NOT depend on
 `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the canvas, the tabs and the
 launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its
-crate-root leaves as `crate::ui_fonts`, `crate::bubble_status` and
-`crate::input_manager_v2` (`input_util` has no root shim: `ms_widgets::input_util`).
+crate-root leaves as `crate::ui_fonts` and `crate::bubble_status` (`input_util` has no root
+shim: `ms_widgets::input_util`). Configurable bindings are not a widget concern: the studio's
+input registry and router live in `ms-input`.
 
 Two helpers this crate owns are TEST-ONLY and reach dependent crates through the `test-support`
 feature of `ms-config`, not through `#[cfg(test)]`: `ms_config::config_saver::test_harness`
@@ -43,18 +44,6 @@ crate's `[dev-dependencies]`, so no production build carries them.
   `ms_widgets::touch_nav::…` / `ms_widgets::TouchRouter` path compiling; it is removed (and the
   importers re-pointed to `ms_input::touch`) by the input-unification cleanup package (WP9). Add
   no new user of the shim.
-- `input_manager_v2.rs`: the user-configurable hotkey registry — code-declared `HotkeySpecV2`
-  specs, the persisted `Hotkeys` overrides in `user_config.json`, and the per-frame dispatch of
-  triggered commands out of `egui::InputState` by id and `HotkeyScopeV2`. It lives at this layer
-  (not in the binary) because it is a pure egui-input primitive over `ms_config::app_tab::AppTab`:
-  the binary's `studio.rs` and settings hotkeys pane AND the `ms-tab-translation` crate both register
-  specs with it. Defaults stay in Rust code; only user overrides are stored on disk (read via
-  `ms_docstore::read_value`, written via `ms_config::update_user_config_file`). The read can be
-  split from the apply: `HotkeyOverrides::read_blocking` on a worker, then
-  `InputManagerV2::apply_overrides` on the GUI thread (the studio does this).
-  `collect_triggered` consumes a `KeyboardShortcut` press (auto-repeats included) but fires the
-  command only on the RISING edge (per-command `last_shortcut_held`): holding a key triggers it
-  once. Modifier-only bindings are not dispatched there.
 - `ui_scale.rs`: the single owner of the process-global interface scale
   (`General.ui_scale_percent`, in percent): the startup seed, the live read, the live change
   (`apply_ui_scale`, used by the settings slider) and `apply_ui_scale_to_context`, which every

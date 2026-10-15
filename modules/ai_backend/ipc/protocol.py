@@ -38,8 +38,10 @@ from __future__ import annotations
 # (user_config migration on load).
 # 10: new General.touch_gestures boolean (canvas finger gestures; per-platform
 # default).
+# 11: Hotkeys section format 2 ({"format": 2, "actions": {id: [alternative, ...]}},
+# written by Rust ms-input; a version-1 section is migrated and rewritten on studio open).
 # ============================================================================
-PROTOCOL_VERSION = 10
+PROTOCOL_VERSION = 11
 
 # ============================================================================
 # FRAME SIZE GUARDS

@@ -30,7 +30,7 @@ ms-config = { path = "../ms-config" }
 # `ms_theme::with_scoped_global_style` (the one global-style owner). A leaf crate: downward edge.
 ms-theme = { path = "../ms-theme" }
 # Owned-document access: `spellchecked_line.rs` reads/updates/probes the title
-# `settings.json` and `input_manager_v2.rs` reads `user_config.json` through it.
+# `settings.json` through it.
 ms-docstore = { path = "../ms-docstore" }
 # `spellchecked_line.rs` picks its dictionary by the typesetting language
 # (`ms_text_util::language`); `hangul_keyboard.rs` uses `ms_text_util::hangul`.

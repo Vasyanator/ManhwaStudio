@@ -11,13 +11,15 @@ A single-file trait crate. Every tab crate implements the trait in its own `stud
 root implements it for the Settings tab. Every method has a no-op default, so an
 implementation states only the hooks the tab really has.
 
-Dependencies: `ms-widgets` (`HotkeySpecV2`, `DockLayout`), `ms-memory` (eviction request /
-report), `ms-project` (`ProjectData`), `egui` (`Context`), `serde_json` (exit-settings root).
+Dependencies: `ms-widgets` (`DockLayout`), `ms-input` (`Declarations`, `ContextId`), `ms-memory`
+(eviction request / report), `ms-project` (`ProjectData`), `egui` (`Context`), `serde_json`
+(exit-settings root).
 Layer: its own line between `ms-models / ms-tabs-simple / …` and
 `ms-project / ms-widgets / ms-native-runtime` (see `ARCHITECTURE.md` §2).
 
 ## Files and submodules
-- `lib.rs`: the trait and its object-safety / default-behaviour test.
+- `lib.rs`: the trait, the temporary `VIEW_ZOOM_COMMANDS` context, and the object-safety /
+  default-behaviour test.
 
 ## Contracts and invariants
 - **Order-free hooks only.** The root may call a hook for every tab in `AppTab::ALL` order; the
@@ -28,8 +30,14 @@ Layer: its own line between `ms-models / ms-tabs-simple / …` and
 - `write_exit_settings` is pure: the root owns the single `user_config` read-modify-write that
   runs every tab's writer (keys written with `ms_config::set_section_bool`).
 - `default_dock_layout` returning `Some` is the one answer to "does this tab host the panel dock".
-- `execute_hotkey` returns `false` for an id the tab does not own; hotkey id strings are
-  persisted user overrides and must never change.
+- Input: `input_declarations` (called once, when the studio builds its input registry) returns
+  the tab's actions; their ids are persisted user overrides and must never change.
+  `input_contexts` (called every frame for the ACTIVE tab, before the input router runs) lists
+  the contexts the tab publishes. There is no execute hook: a tab reads what fired from the
+  `ms_input::InputFrame` its draw receives.
+- `VIEW_ZOOM_COMMANDS` is a phase-B gate (removed by input-unification WP5): a tab lists it in
+  `input_contexts` exactly while it executes `view.zoom_in` / `zoom_out` / `zoom_reset` itself,
+  so the router consumes those keys nowhere else.
 - The trait stays object safe (no generic methods, no `Self` by value); a test guards it.
 - This crate must never depend on a tab crate, `ms-models` or the root package.
 

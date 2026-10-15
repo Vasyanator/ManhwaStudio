@@ -6,12 +6,13 @@ The «Клининг» tab's answers to the studio root's order-free per-tab hoo
 (`ms_studio_tab::StudioTab`).
 
 Key items:
-- `HOTKEY_CLEANING_ZOOM_IN` / `_OUT` / `_RESET`: the tab's three canvas-zoom hotkey ids. They are
-  persistence keys (`user_config` -> `Hotkeys`): never rename them.
+- `run_fired_commands`: executes the shared `ms_input::view` zoom commands (zoom in, zoom out,
+  reset) that fired this frame, through the tab's own zoom methods, which refuse while the
+  active tool blocks canvas zoom. Called at the top of `CleaningTabState::draw`.
 - `impl StudioTab for CleaningTabState`:
-  - `hotkey_specs` / `execute_hotkey`: the three zoom hotkeys (zoom in, zoom out, reset, in that
-    registration order); execution goes through the tab's own zoom methods, which refuse while
-    the active tool blocks canvas zoom;
+  - `input_contexts`: `ms_studio_tab::VIEW_ZOOM_COMMANDS` while no active tool blocks canvas
+    zoom, so the router fires (and consumes) the zoom keys only while this tab executes them
+    and a tool with its own zoom keys (the region editor) still gets them (removed by WP5);
   - `default_dock_layout`: `cleaning_default_dock_layout` (the tab hosts the panel dock);
   - `evict_tab_gpu_caches`: the canvas clean-overlay cache, then the detector-mask textures;
   - `source_page_window` / `wants_nearest_source`: answered by the tab's canvas;
@@ -20,76 +21,28 @@ Key items:
 Notes:
 - No background poll, exit-only setting or debounced store: those hooks keep their no-op
   defaults. Cleaning has no bottom hint, so it writes no `Canvas.*_hint_collapsed` key.
+- The tab declares no input action of its own yet: zoom is the shared `view.*` set (its former
+  `cleaning.canvas.zoom_*` overrides migrate to it in `ms_input::persist`).
 */
 
 use std::collections::HashSet;
 
-use eframe::egui;
-use ms_config::app_tab::AppTab;
+use ms_input::{ActionId, ContextId, InputFrame, view};
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
-use ms_project::ProjectData;
-use ms_studio_tab::StudioTab;
-use ms_widgets::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2};
+use ms_studio_tab::{StudioTab, VIEW_ZOOM_COMMANDS};
 use ms_widgets::panel_dock::DockLayout;
 
 use crate::tab::{CleaningTabState, cleaning_default_dock_layout};
-
-/// Zooms the cleaning canvas in by one shortcut step (persistence key, never rename).
-const HOTKEY_CLEANING_ZOOM_IN: &str = "cleaning.canvas.zoom_in";
-/// Zooms the cleaning canvas out by one shortcut step (persistence key, never rename).
-const HOTKEY_CLEANING_ZOOM_OUT: &str = "cleaning.canvas.zoom_out";
-/// Resets the cleaning canvas zoom (persistence key, never rename).
-const HOTKEY_CLEANING_ZOOM_RESET: &str = "cleaning.canvas.zoom_reset";
 
 /// Zoom factor of one zoom-in shortcut step; zoom out divides by it.
 const ZOOM_SHORTCUT_STEP: f32 = 1.1;
 
 impl StudioTab for CleaningTabState {
-    /// The three canvas-zoom hotkeys, in registration order: zoom in, zoom out, reset.
-    fn hotkey_specs(&self) -> Vec<HotkeySpecV2> {
-        vec![
-            HotkeySpecV2 {
-                id: HOTKEY_CLEANING_ZOOM_IN,
-                title: t!("app.hotkey.zoom_in"),
-                section: "Canvas",
-                default_shortcut: Some(egui::KeyboardShortcut::new(
-                    egui::Modifiers::COMMAND,
-                    egui::Key::Equals,
-                )),
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Cleaning),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_CLEANING_ZOOM_OUT,
-                title: t!("app.hotkey.zoom_out"),
-                section: "Canvas",
-                default_shortcut: Some(egui::KeyboardShortcut::new(
-                    egui::Modifiers::COMMAND,
-                    egui::Key::Minus,
-                )),
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Cleaning),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_CLEANING_ZOOM_RESET,
-                title: t!("app.hotkey.zoom_reset"),
-                section: "Canvas",
-                default_shortcut: Some(egui::KeyboardShortcut::new(
-                    egui::Modifiers::COMMAND,
-                    egui::Key::Num0,
-                )),
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Cleaning),
-                active_when_input: false,
-            },
-        ]
-    }
-
-    /// Runs one of the three zoom hotkeys (see [`run_zoom_hotkey`]).
-    fn execute_hotkey(&mut self, _ctx: &egui::Context, command_id: &str, _project: &ProjectData) -> bool {
-        run_zoom_hotkey(self, command_id)
+    /// `VIEW_ZOOM_COMMANDS` while no active tool blocks canvas zoom: only then does this tab
+    /// execute the shared zoom commands (`run_fired_commands`), and only then may the router
+    /// consume their keys.
+    fn input_contexts(&self) -> Vec<ContextId> {
+        if self.active_tool_blocks_canvas_zoom() { Vec::new() } else { vec![VIEW_ZOOM_COMMANDS] }
     }
 
     /// The cleaning tab hosts the panel dock; its default arrangement is the SAME `fn` item the
@@ -121,20 +74,27 @@ impl StudioTab for CleaningTabState {
     }
 }
 
-/// Runs the zoom hotkey `command_id` on `tab`. Returns `true` when the id is one of this tab's,
-/// even when the active tool blocked the zoom (the command was handled by being refused), and
+/// Runs every shared zoom command `input` reports as fired (`run_command`), in firing order.
+pub(crate) fn run_fired_commands(tab: &mut CleaningTabState, input: &InputFrame) {
+    for fired in input.fired_commands() {
+        run_command(tab, fired.action);
+    }
+}
+
+/// Runs the command `action` on `tab`. Returns `true` when the id is one this tab executes, even
+/// when the active tool blocked the zoom (the command was handled by being refused), and
 /// `false` for a foreign id (nothing was done).
-fn run_zoom_hotkey(tab: &mut CleaningTabState, command_id: &str) -> bool {
+fn run_command(tab: &mut CleaningTabState, action: ActionId) -> bool {
     // The zoom methods report whether the camera moved; a blocked zoom is a normal outcome the
-    // hotkey has nothing to add to, exactly as when the root dispatched it.
-    match command_id {
-        HOTKEY_CLEANING_ZOOM_IN => {
+    // command has nothing to add to.
+    match action {
+        view::ZOOM_IN => {
             tab.zoom_by_shortcut(ZOOM_SHORTCUT_STEP);
         }
-        HOTKEY_CLEANING_ZOOM_OUT => {
+        view::ZOOM_OUT => {
             tab.zoom_by_shortcut(1.0 / ZOOM_SHORTCUT_STEP);
         }
-        HOTKEY_CLEANING_ZOOM_RESET => {
+        view::ZOOM_RESET => {
             tab.reset_zoom_shortcut();
         }
         _ => return false,
@@ -144,46 +104,33 @@ fn run_zoom_hotkey(tab: &mut CleaningTabState, command_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use eframe::egui;
-    use ms_config::app_tab::AppTab;
-    use ms_studio_tab::StudioTab;
-    use ms_widgets::input_manager_v2::HotkeyScopeV2;
+    use ms_input::{ActionId, view};
+    use ms_studio_tab::{StudioTab, VIEW_ZOOM_COMMANDS};
     use ms_widgets::panel_dock::TabId;
 
-    use super::{HOTKEY_CLEANING_ZOOM_IN, HOTKEY_CLEANING_ZOOM_OUT, HOTKEY_CLEANING_ZOOM_RESET, run_zoom_hotkey};
+    use super::run_command;
     use crate::tab::{CleaningTabState, cleaning_default_dock_layout};
 
-    /// One expected registry row: id, default shortcut, modifier-only binding, active in text input.
-    type SpecRow = (&'static str, Option<(egui::Modifiers, egui::Key)>, bool, bool);
-
-    /// The ids, shortcuts and order must equal the Cleaning slice of the root's
-    /// `hotkey_registry_golden` (`src/studio.rs`): ids are persistence keys and the order is
-    /// observable within the scope.
+    /// The tab declares no action of its own (zoom is the shared `view.*` set), and with no tool
+    /// blocking zoom it publishes the context under which the router fires the zoom commands.
     #[test]
-    fn the_zoom_hotkeys_match_the_pinned_registry_slice() {
+    fn the_tab_declares_nothing_and_publishes_the_zoom_context() {
         let tab = CleaningTabState::default();
-        let specs = StudioTab::hotkey_specs(&tab);
-        let actual: Vec<SpecRow> = specs
-            .iter()
-            .map(|spec| (spec.id, spec.default_shortcut.map(|s| (s.modifiers, s.logical_key)), spec.default_modifier_only.is_some(), spec.active_when_input))
-            .collect();
-        let expected: Vec<SpecRow> = vec![
-            ("cleaning.canvas.zoom_in", Some((egui::Modifiers::COMMAND, egui::Key::Equals)), false, false),
-            ("cleaning.canvas.zoom_out", Some((egui::Modifiers::COMMAND, egui::Key::Minus)), false, false),
-            ("cleaning.canvas.zoom_reset", Some((egui::Modifiers::COMMAND, egui::Key::Num0)), false, false),
-        ];
-        assert_eq!(actual, expected);
-        assert!(specs.iter().all(|spec| spec.scope == HotkeyScopeV2::Tab(AppTab::Cleaning)));
+        assert_eq!(StudioTab::input_declarations(&tab), ms_input::Declarations::default());
+        assert_eq!(StudioTab::input_contexts(&tab), vec![VIEW_ZOOM_COMMANDS]);
     }
 
-    /// Every own id is handled; a foreign id is reported as not this tab's.
+    /// The three shared zoom commands are handled; a foreign id (including the migrated former
+    /// Cleaning zoom ids) is reported as not this tab's.
     #[test]
-    fn execute_hotkey_claims_only_its_own_ids() {
+    fn run_command_claims_only_the_zoom_commands() {
         let mut tab = CleaningTabState::default();
-        for id in [HOTKEY_CLEANING_ZOOM_IN, HOTKEY_CLEANING_ZOOM_OUT, HOTKEY_CLEANING_ZOOM_RESET] {
-            assert!(run_zoom_hotkey(&mut tab, id), "{id} must be handled");
+        for id in [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET] {
+            assert!(run_command(&mut tab, id), "{id:?} must be handled");
         }
-        assert!(!run_zoom_hotkey(&mut tab, "translation.canvas.zoom_in"));
+        for foreign in ["cleaning.canvas.zoom_in", "view.zoom", "translation.bubble.create_at_cursor"] {
+            assert!(!run_command(&mut tab, ActionId(foreign)), "{foreign}");
+        }
     }
 
     /// Every dock tab the cleaning tab declares; a default layout missing one drops a stored

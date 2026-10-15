@@ -72,7 +72,7 @@ mod tests {
         assert!(tab.source_page_window(3).is_empty());
         assert!(!tab.wants_nearest_source());
         assert!(tab.default_dock_layout().is_none());
-        assert!(tab.hotkey_specs().is_empty());
+        assert!(tab.input_contexts().is_empty());
     }
 
     /// A committed-tree change schedules exactly the clean rescan `request_clean_rescan` does.

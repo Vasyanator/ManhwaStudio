@@ -48,7 +48,9 @@ use serde_json::{Map, Value, json};
 ///
 /// 9: `General.android_native_windows` replaced by `General.secondary_windows` (migrated on load).
 /// 10: new `General.touch_gestures` boolean (canvas finger gestures; per-platform default).
-pub const PROTOCOL_VERSION: u32 = 10;
+/// 11: `Hotkeys` section format 2 (`{"format": 2, "actions": {id: [alternative, ...]}}`, written
+/// by `ms-input`; a version-1 section is migrated and rewritten on studio open).
+pub const PROTOCOL_VERSION: u32 = 11;
 
 // ============================================================================
 // FRAME SIZE GUARDS

@@ -19,7 +19,7 @@ StudioApp.session = SessionMode::ImageSet(Box<ImageSetSession>)   (only for Sess
      └─ machine.rs  SaveMachine — pure state: per-page target + written digest, dirty baseline,
                     Phase, the running save (Run: job queue, totals), Status
   dialogs.rs     exit dialogs, «Параметры JPEG», non-empty folder, skipped files (stateless draw fns)
-  mod.rs         tab_visible, image_window_title, hotkey_specs, SaveParts, SaveOutcome, wasm stub
+  mod.rs         tab_visible, image_window_title, input_declarations, SaveParts, SaveOutcome, wasm stub
 ```
 One page (one-image session): `Idle -> [ChoosingFormat -> PickingPath] -> [JpegOptions] -> Preparing -> Writing -> [Committing] -> Idle`.
 An image set (2+ pages):
@@ -122,8 +122,9 @@ An image set (2+ pages):
   a popup registration (`Context::any_popup_open`, checked by the cleaning and PS-editor canvas
   gates). Outside clicks are ignored (`IgnoreClicks`), so one click never both closes it and reaches
   the canvas. Never make it `interactable(false)` or draw it with a bare painter.
-- The save hotkeys (Ctrl+Shift+S before Ctrl+S, `Global` scope) are registered only in this mode;
-  egui matches shortcuts logically, so the Shift variant must consume the event first.
+- The save commands (`single_image.save` Ctrl+S, `single_image.save_as` Ctrl+Shift+S, `Session`
+  scope) are declared only in this mode (`input_declarations`); the input router matches modifier
+  sets exactly, so neither shadows the other.
 - Native only: the web build never opens an image; its controller is an uninhabited enum.
 
 ## Known limitations

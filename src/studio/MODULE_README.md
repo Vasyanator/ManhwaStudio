@@ -4,7 +4,7 @@
 The editor root `StudioApp` (`src/studio.rs`) and its parts. One `StudioApp` is one opened
 session (a project chapter or an image set) inside the main window's studio screen: it creates the
 shared chapter models, wires them into the tabs and canvases, drives the source-page residency,
-routes the active tab, dispatches global hotkeys and sequences persistence. It coordinates
+routes the active tab, runs the input router and sequences persistence. It coordinates
 subsystems; feature logic stays in the tab crates.
 
 ## Architecture
@@ -21,16 +21,32 @@ StudioApp (studio.rs, eframe::App::ui driven by the shell's studio screen / the 
   view            ViewSync (view_sync.rs)             shared viewport / page across view tabs
   close           CloseFlow (close_flow.rs)           exit dialog, close request, incoming question
   panel dock      PanelDockState + PanelLayoutWriter  one per studio window
+  input           InputRouter (ms-input)              registry (view set + tabs + session +
+                                                      user overrides), begin_frame once per frame
   outbound        StudioOutput queue (studio_output.rs) -> take_outputs -> the window host
 ```
 Root responsibilities that stay in `studio.rs`:
-- **Construction.** `new` builds the models, the tabs, the hotkey registry, the session's one
+- **Construction.** `new` builds the models, the tabs, the input registry, the session's one
   `AutosaveGate` (shared by the three staging writers through `StagingWriters::spawn`) and the
   `PageResidency` pool, and hands the process's `LocalAiAvailability` (from the AI backend handle)
   to the Translation tab. The shared canvas settings are seeded once into `BubblesModel` by the
   pure `ms_canvas::shared_canvas_settings_from_project`; no canvas is seeded directly (each pulls
-  them on its first draw). The hotkey registry and the panel-dock restore are built from `Tabs`
-  after every tab exists. It reads nothing from disk (see `bootstrap.rs`).
+  them on its first draw). The input registry (`build_input_registry`: the shared `view.*` set,
+  `Tabs::input_declarations`, `SessionMode::input_declarations`, then the bootstrap's overrides;
+  invalid declarations fall back to an empty, logged registry) and the panel-dock restore are
+  built from `Tabs` after every tab exists. It reads nothing from disk (see `bootstrap.rs`).
+- **Input frame.** `InputRouter::begin_frame` runs ONCE per frame in `ui`, after the session tick,
+  the worker polls and `sync_project_from_bubbles_model`, and BEFORE the top bar and the tab draw:
+  matched keys are consumed before any widget sees them, and every consumer of the frame reads
+  the same `InputFrame`. `FrameEnv` = the active tab, its `StudioTab::input_contexts`, and
+  `modal_open` (the comic-type prompt, or the AI device prompt as of the previous frame's draw).
+  The session runs its own fired commands right after (`SessionMode::run_fired_commands`: the
+  image set's save / save-as); the drawing tab gets the router through `TabFrame::input` (its
+  frame and registry; the Settings pane edits the bindings, applied from the next frame).
+  Phase-B gate: the view set's zoom commands are registered with
+  `Condition::Context(ms_studio_tab::VIEW_ZOOM_COMMANDS)` (`gated_view_declarations`), so their
+  keys are consumed only while Translation or Cleaning executes them itself; removed by
+  input-unification WP5.
 - **Residency glue.** `studio.rs` supplies what residency must not know: the active tab's page
   window (`active_source_page_window`; for the page manager the one page its viewer draws), the
   pixel-inspection flag, and the eviction of the tabs' own GPU caches (`Tabs::evict_tab_gpu_caches`),
@@ -57,7 +73,9 @@ Root responsibilities that stay in `studio.rs`:
 
 ## Files and submodules
 - `bootstrap.rs`: `StudioBootstrap` (`build_blocking(project)`), the pre-read inputs of
-  `StudioApp::new`: the merged startup `user_config` root, `HotkeyOverrides`, `SettingsTabSeed`,
+  `StudioApp::new`: the merged startup `user_config` root, the input `HotkeyOverrides` (read from
+  that root; a version-1 section is migrated and written back once, on the same worker),
+  `SettingsTabSeed`,
   `SpellcheckWordsSeed`, `TypingPanelSeed` and whether the `_unsaved` staging dir existed. Built
   on the shell's open worker (inline on the web); `new` performs no config or document read.
 - `shutdown.rs`: `StudioApp::shutdown_blocking() -> ShutdownReport`, the studio's blocking
@@ -119,12 +137,12 @@ Root responsibilities that stay in `studio.rs`:
 - `tabs.rs`: `Tabs`, the ten program tabs (field `tabs`; the Translation tab is its host
   `ms_tab_translation::TranslationTab`, which owns the Translation canvas), the one `AppTab` ->
   tab mapping as `StudioTab` trait objects (`get` / `get_mut`) with the order-free fan-outs in
-  `AppTab::ALL` order (`for_each` / `for_each_mut`, `hotkey_specs`, `dock_layout_defaults`,
+  `AppTab::ALL` order (`for_each` / `for_each_mut`, `input_declarations`, `dock_layout_defaults`,
   `hosts_panel_dock`, `evict_tab_gpu_caches`; the teardown's `write_exit_settings` and
   `flush_debounced_stores_blocking`), and `Tabs::draw(drawn, ui, TabFrame) -> Vec<AppRequest>`, the per-tab
   draw dispatch of `ui`. The
   frame context `TabFrame` is borrowed from `StudioApp` (project, page geometry + resident textures
-  lent by `PageResidency`, panel dock, busy snapshot, canvas status, hotkey registry); every tab ->
+  lent by `PageResidency`, panel dock, busy snapshot, canvas status, the input router); every tab ->
   app request is an `AppRequest` (`PageOp`, `OpenPage`, `NavigateSettings`, `CharactersChanged`,
   `OpenNotesForCharacter`, `TermsChanged`), applied by `StudioApp::apply_app_request`. Ordered
   app -> tab calls (setters, flushes, the §12
@@ -178,29 +196,29 @@ Root responsibilities that stay in `studio.rs`:
   `studio.rs`.
   `shutdown_blocking` calls `PageResidency::shutdown` before the typing flush and layer barrier.
 
-- While either prompt is open the studio dispatches no hotkeys and repaints every frame
-  (the `ui` call site in `studio.rs`). Applying a comic type stays in `studio.rs`: it writes the
+- While either prompt is open the input router is suppressed (`FrameEnv::modal_open`; nothing
+  fires, no mode is active) and the studio repaints every frame (the `ui` call site in
+  `studio.rs`). Applying a comic type stays in `studio.rs`: it writes the
   project (memory + settings file), then applies the preset to the `BubblesModel` canvas-settings
   snapshot (`SharedCanvasSettings::apply_comic_type_preset`, the one preset owner, also used by the
   Settings pane) and pushes it to `BubblesModel`, `CleanOverlaysModel` and the Settings tab; the
   canvases pull it by revision.
 
 - `ViewSync::before_draw` runs right before the active tab draws and `after_draw` at the end of
-  the frame (after hotkeys), with the tab the frame ended on. Inside `before_draw` the PS-editor
+  the frame, with the tab the frame ended on. Inside `before_draw` the PS-editor
   layer flush and the Typing deferred-text flush on tab leave, and the bubble flush of every canvas
   the active tab does not draw (each frame; a no-op once clean), run BEFORE the snapshot apply, so
   the destination tab reads the latest layer and bubble state and at most the active canvas holds
   unwritten bubble edits. Every tab switch (tab bar, page-manager open, settings deep link,
-  hotkeys) is covered because the destination tab first draws after a `before_draw`. The PS editor never owns the scroll
+  input commands) is covered because the destination tab first draws after a `before_draw`. The PS editor never owns the scroll
   snapshot; it only feeds the shared page, zoom and center. Non-view tabs leave the state alone.
 - Code in `src/studio` reaches a tab's canvas only through `canvas_slot` (all three canvas tabs
   expose theirs as `canvas()` / `canvas_mut()`; Translation's is `TranslationTab`'s) or, for all
   three at once, `for_each_canvas_mut`; no site spells its own Translation / Cleaning / Typing match.
 - Per-tab ORDER-FREE questions go through `Tabs` and `ms_studio_tab::StudioTab`, never a per-tab
-  `match` in `studio.rs`: hotkey registration (`Tabs::hotkey_specs`, `AppTab::ALL` order, then the
-  session's specs, then the user overrides; within a scope the order is pinned by
-  `hotkey_registry_golden`), hotkey execution (the session's ids, then the ACTIVE tab's
-  `execute_hotkey`; a `false` answer is logged), dock hosts, GPU eviction, the active tab's
+  `match` in `studio.rs`: input declarations (`Tabs::input_declarations`, `AppTab::ALL` order,
+  after the view set and before the session's; pinned by `input_registry_golden`), the ACTIVE
+  tab's `input_contexts` (every frame, before `begin_frame`), dock hosts, GPU eviction, the active tab's
   source-page window and NEAREST flag, the every-frame `poll_background` (after the residency's
   decoded-page poll, before any busy gate reads `clean_op_in_flight`) and
   `on_committed_tree_changed` (the session latch `take_committed_tree_changed`, drained right
@@ -210,7 +228,7 @@ Root responsibilities that stay in `studio.rs`:
   panel-dock verdict (`PanelDockPass`) for the tab that draws, then after the draw polls the dirty
   layouts (only when that tab ran the dock, `PanelDockPass::dock_ran`), then applies the requests in
   the order the tab raised them — the tab switches (page open, deep link, «open notes») land there,
-  before the idle sub-window pass, the trims, the hotkeys and `ViewSync::after_draw`. The frame
+  before the idle sub-window pass, the trims, the prompts and `ViewSync::after_draw`. The frame
   context is built before any tab state is borrowed (the busy snapshot first).
 
 ## Save / page-op / discard / exit choreography
@@ -298,7 +316,8 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
 - Add a construction-time read for the studio: a field of `StudioBootstrap` (`bootstrap.rs`),
   consumed in `StudioApp::new`.
 - Add a tab -> app request, or change what a tab gets for its draw: `tabs.rs` (`AppRequest`,
-  `TabFrame`), its application in `studio.rs` (`apply_app_request`). A new dock host, hotkey,
+  `TabFrame`), its application in `studio.rs` (`apply_app_request`). A new dock host, input action
+  or input context,
   GPU cache, page window or background poll of a tab: that tab's `impl StudioTab` (in its crate;
   Settings: `src/tabs/settings/studio_tab.rs`); a new order-free hook: `ms-studio-tab` plus a
   fan-out in `tabs.rs`.

@@ -15,7 +15,8 @@ so the launcher and studio share one source of truth for section metadata.
 The three cross-surface "double-interface" sections (General / AiBackend / Tutorials) are owned by
 a single `crate::settings_shared::SharedSettingsPanels` embedded on `SettingsTabState` and rendered
 via `shared.draw(id, ui, Studio, &ai_backend_handle)`; the studio-only sections
-(CanvasRibbon / Typesetting / Hotkeys) render through this module's own methods. The AI backend
+(CanvasRibbon / Typesetting / Hotkeys) render through this module's own methods (Hotkeys through
+the `hotkeys::HotkeysPane` it owns). The AI backend
 section does not own the backend process: `SettingsTabState` holds a cloned `AiBackendHandle`,
 passed by reference into `shared.draw`. Pane files render focused UI sections through methods on
 `SettingsTabState`.
@@ -150,9 +151,11 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   `fonts_data.json`; `mod.rs` owns its `load_font_name_display_modes` /
   `save_font_name_display_mode` and seeds the widget at construction. All
   blocks are wrapped in collapsed `CollapsingHeader`s.
-- `hotkeys.rs`: configurable hotkey list, live shortcut capture, reset/clear actions, and
-  `user_config.json` override persistence. Modifier-only commands are recognized from their
-  spec (`default_modifier_only`), never by id.
+- `hotkeys/`: the Hotkeys pane SUBMODULE (own `MODULE_README.md`): `HotkeysPane`, a field of
+  `SettingsTabState`, drawn as `draw(ui, &mut ms_input::InputRouter)` over the studio's input
+  router — every declared action grouped by scope, unlimited alternatives with rebind / remove /
+  add / reset, binding capture, axis and gesture editors, conflict and shadow display, and
+  ordered off-thread persistence into `user_config` -> `Hotkeys` (`ms_input::write_override`).
 
 The AI backend and tutorials sections have no studio-local file: they are rendered inline in
 `mod.rs::draw` through `SharedSettingsPanels::draw`, which forwards to the shared
@@ -199,8 +202,8 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   `General.memory_profile` in `user_config.json` without editing project canvas settings.
 - AI backend controls must respect `AiBackendHandle::local_ai` (`--no-ai`, platform): an off
   backend is never started or commanded, and health/probe UI shows the fixed unavailable snapshot.
-- Hotkey capture treats `Esc` as cancel; modifier-only bindings are explicit `Ctrl`/`Alt`/`Shift`
-  choices, not accidental raw key captures.
+- Hotkey capture records `Esc` like any key (it is bindable); a capture ends only by the pane's
+  Done / Cancel buttons, and mouse buttons are recorded only inside the pane's capture zone.
 - Persisted settings errors should be surfaced or logged with context; do not silently replace real
   failures with fake success.
 - UI-visible strings are localized through the `ms-i18n` `t!` / `tf!` macros (crate-wide via
@@ -246,5 +249,5 @@ model-limit slider; its persistence writers (`save_ai_runtime` / `save_onnx_buil
   block or the per-font properties window, edit `typesetting/font_settings.rs` /
   `typesetting/font_properties_window.rs` (settings-local UI); any new font MODEL access must go
   through the `crate::tabs::typing::font_admin` facade, never a fresh typing internal.
-- To change configurable shortcut UI or persistence, edit `hotkeys.rs` and coordinate with
-  `crates/ms-widgets/src/input_manager_v2.rs`.
+- To change the hotkeys pane, edit `hotkeys/` (see its `MODULE_README.md`); the binding model,
+  matching, conflicts, labels and the on-disk format belong to `crates/ms-input`.

@@ -83,6 +83,7 @@ use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::TextMaskModel;
 use ms_project::ProjectData;
 use ms_config::app_tab::AppTab;
+use ms_input::InputFrame;
 use ms_local_ai::backend_health::AiBackendHealthSnapshot;
 use ms_widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
@@ -768,6 +769,9 @@ pub struct CleaningDrawParams<'a> {
     /// (`src/widgets/panel_dock/MODULE_README.md`); the lent-in borrow is also
     /// what keeps it disjoint from the fields the tab bodies touch.
     pub panel_dock: &'a mut PanelDockState,
+    /// This frame's input (`InputRouter::begin_frame`, run by the studio before any tab draws):
+    /// the shared view zoom commands that fired (`studio_tab::run_fired_commands`).
+    pub input: &'a InputFrame,
 }
 
 pub struct CleaningTabState {
@@ -958,23 +962,28 @@ impl CleaningTabState {
         self.canvas.evict_clean_overlay_gpu_cache(request)
     }
 
-    pub fn zoom_by_shortcut(&mut self, factor: f32) -> bool {
-        if self
-            .tools
+    /// Whether the active tool blocks canvas zoom (it zooms its own view, e.g. the region editor
+    /// window, or a stroke needs a fixed camera).
+    #[must_use]
+    pub fn active_tool_blocks_canvas_zoom(&self) -> bool {
+        self.tools
             .get(self.active_tool_idx)
             .is_some_and(|tool| tool.block_canvas_zoom())
-        {
+    }
+
+    /// Zooms the canvas by `factor` around its centre unless the active tool blocks canvas zoom.
+    /// Returns whether the camera moved.
+    pub fn zoom_by_shortcut(&mut self, factor: f32) -> bool {
+        if self.active_tool_blocks_canvas_zoom() {
             return false;
         }
         self.canvas.zoom_by_shortcut(factor)
     }
 
+    /// Resets the canvas zoom unless the active tool blocks canvas zoom. Returns whether the
+    /// camera moved.
     pub fn reset_zoom_shortcut(&mut self) -> bool {
-        if self
-            .tools
-            .get(self.active_tool_idx)
-            .is_some_and(|tool| tool.block_canvas_zoom())
-        {
+        if self.active_tool_blocks_canvas_zoom() {
             return false;
         }
         self.canvas.reset_zoom_shortcut()
@@ -993,7 +1002,9 @@ impl CleaningTabState {
             texture_cache,
             status,
             panel_dock,
+            input,
         } = params;
+        crate::studio_tab::run_fired_commands(self, input);
         if ctx.input(|i| i.pointer.primary_released()) {
             self.finish_stroke();
         }

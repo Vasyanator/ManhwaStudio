@@ -1,11 +1,11 @@
 /*
 FILE OVERVIEW: src/studio.rs
 The studio screen's editor root (`StudioApp`): project/model initialization, tab routing, the
-per-frame order of `ui`, and hotkey dispatch. A screen of the main window (`src/shell/`), not a
+per-frame order of `ui`, and the input router (`ms_input::InputRouter`). A screen of the main window (`src/shell/`), not a
 window: it implements `eframe::App` only for the `ui` frame entry the shell forwards.
 
 Main structs:
-- `StudioApp`: root app state (project, shared models, tab states, residency, hotkeys).
+- `StudioApp`: root app state (project, shared models, tab states, residency, input router).
 The source-page residency pipeline (decode pool, in-order promotion, budgeted tiled GPU upload,
 overlay and page-cache loaders, memory-pressure eviction) is `PageResidency` in `studio/residency/`;
 this file only feeds it the tab knowledge it must not have: the active tab's page window and
@@ -15,7 +15,7 @@ and the tabs' own GPU caches (`Tabs::evict_tab_gpu_caches`), each asked of the t
 residency reads it from its owner, `CleanOverlaysModel`.
 
 App/frame flow:
-- `new(project, bootstrap, ai_backend)`: builds models, tabs, and input manager registrations
+- `new(project, bootstrap, ai_backend)`: builds models, tabs, and the input registry
   from the inputs `StudioBootstrap` (`studio/bootstrap.rs`) pre-read on the open worker; it reads
   no config or document itself, so it can run inside a GUI frame.
 - `new`: wires shared models (`bubbles`, `clean_overlays`, `text_mask`, the layer document)
@@ -23,17 +23,18 @@ App/frame flow:
   `TranslationTab::new`, Typing via `load_exit_settings`), and shares the app-global AI backend's
   health snapshot and probe channel (`AiBackendHandle`; the supervisor, not the studio, owns the
   backend process and its probe) with the Translation, Cleaning and Settings tabs.
-- `ui` (`eframe::App::ui`, egui 0.36): frame tick (poll workers, draw active tab, dispatch
-  hotkeys); lends `PageResidency::lend_mut` (page geometry + resident textures) to the drawing tab.
+- `ui` (`eframe::App::ui`, egui 0.36): frame tick (poll workers, run the input router, draw the
+  active tab); lends `PageResidency::lend_mut` (page geometry + resident textures) to the drawing tab.
 - Tabs: the ten program tabs are `Tabs` (`studio/tabs.rs`; the Translation tab is its host
-  `TranslationTab`, which owns the Translation canvas). Order-free per-tab questions (hotkeys,
-  dock host, GPU eviction, page window, background poll, committed-tree change) go through the
+  `TranslationTab`, which owns the Translation canvas). Order-free per-tab questions (input
+  declarations and contexts, dock host, GPU eviction, page window, background poll, committed-tree change) go through the
   `StudioTab` fan-outs of `Tabs`. `ui` builds the
   frame context (`TabFrame`), calls `Tabs::draw` for the active tab, polls the panel dock's dirty
   layouts when that tab hosts the dock, then applies the returned `AppRequest`s
   (`apply_app_request`: page op, page open, settings deep link, characters / terms changed).
-- `dispatch_hotkeys` + `execute_hotkey_command`: execute `InputManagerV2` commands (the session's
-  ids here, every other id by the active tab, `StudioTab::execute_hotkey`).
+- Input: `InputRouter::begin_frame` runs ONCE per frame, after the session tick and before the
+  top bar and the tab draw; the session executes its own fired commands right after it
+  (`SessionMode::run_fired_commands`), the drawing tab reads the same `InputFrame` (`TabFrame`).
 - Persistence busy gates (page op, save, save button, typing export, page manager, veil):
   named predicates over `persistence_activity()` in `studio/busy.rs`.
 - Modal prompts (comic type, AI device selection): `ComicTypePrompt` / `AiDevicePrompt` in
@@ -62,10 +63,14 @@ App/frame flow:
   received-images decline, window title) is ONE queue, `StudioOutput`, drained by `take_outputs`
   (`studio/studio_output.rs`); the inbound calls are `request_os_close` and `request_close_for_incoming`.
 
-Hotkeys:
-- Declared by the tabs (`StudioTab::hotkey_specs`: Translation canvas and panel commands,
-  Cleaning canvas zoom), registered in `AppTab::ALL` order.
-- Image-set save / save-as (registered only in that mode, `SessionMode::hotkey_specs`).
+Input actions (`build_input_registry`):
+- The shared `ms_input::view` set, its three zoom commands gated by
+  `ms_studio_tab::VIEW_ZOOM_COMMANDS` while the canvases still read their own zoom keys
+  (`gated_view_declarations`, removed by input-unification WP5).
+- Declared by the tabs (`StudioTab::input_declarations`: Translation canvas, OCR-mode and panel
+  actions), merged in `AppTab::ALL` order.
+- Image-set save / save-as (declared only in that mode, `SessionMode::input_declarations`).
+- The user's overrides (`StudioBootstrap::hotkey_overrides`), applied last.
 
 Profiling (optional, behind the `profiling` cargo feature):
 - `ui` is instrumented with coarse `puffin::profile_scope!` markers around the heavy
@@ -77,7 +82,8 @@ Profiling (optional, behind the `profiling` cargo feature):
 
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::canvas::CanvasUiStatus;
-use crate::input_manager_v2::{HotkeyOverrides, HotkeySpecV2, InputManagerV2};
+use ms_input::{ActionSpec, Condition, DeclarationError, Declarations, FrameEnv, HotkeyOverrides, InputRegistry, InputRouter, view};
+use ms_studio_tab::VIEW_ZOOM_COMMANDS;
 use serde_json::Value;
 use crate::memory_manager::{CacheEvictionRequest, MemoryManager, MemoryPressure};
 use crate::models::autosave_gate::AutosaveGate;
@@ -143,7 +149,7 @@ pub(crate) use studio_output::StudioOutput;
 // The session strategy (`SessionMode`: project chapter or image set) and the parts its flows
 // borrow. `image_set` is crate-visible for the window title rule the window host shares.
 pub(crate) mod session;
-use session::{SessionMode, SessionParts, image_set};
+use session::{SessionMode, SessionParts};
 // Named by the main window's Closing screen (`src/shell/closing.rs`), which runs the teardown.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use shutdown::ShutdownReport;
@@ -205,7 +211,14 @@ pub struct StudioApp {
     /// autosave gate and the DISCARD latch (`studio/staging_writers.rs`). Declared right after
     /// `layer_doc` so its model Arc clones are released at the same point of the drop.
     writers: StagingWriters,
-    input_manager_v2: InputManagerV2,
+    /// The studio's input runtime: the registry (view set + tabs + session + user overrides) and
+    /// the per-frame `InputFrame` every consumer reads (`begin_frame` once per frame in `ui`).
+    /// Lent to the drawing tab through `TabFrame::input`; the Settings pane edits its bindings.
+    input: InputRouter,
+    /// Whether the AI device prompt was open at the end of the previous frame. The prompt only
+    /// reports its state from its draw, which runs after the router, so the router's modal flag
+    /// lags by one frame at the prompt's opening and closing.
+    ai_device_prompt_open: bool,
     /// "Pages or ribbon?" prompt of a project without a comic type (`studio/prompts.rs`).
     comic_type_prompt: ComicTypePrompt,
     /// AI device selection prompt, opened from the per-frame health snapshot (`studio/prompts.rs`).
@@ -417,9 +430,9 @@ impl StudioApp {
             settings: settings_tab,
             wiki: WikiTabState::new(),
         };
-        // Every tab's declared hotkeys (`AppTab::ALL` order), then the session's own, then the
-        // user's overrides.
-        let input_manager_v2 = build_input_manager_v2(tabs.hotkey_specs(), session.hotkey_specs(), &hotkey_overrides);
+        // The shared view set, every tab's declarations (`AppTab::ALL` order), then the session's
+        // own, then the user's overrides.
+        let input = InputRouter::new(input_registry_or_empty(build_input_registry(tabs.input_declarations(), session.input_declarations(), &hotkey_overrides)));
         // Dockable-panel arrangement of this studio window, restored from the snapshot already in
         // hand against the dock hosts' default layouts. It must be installed BEFORE the first frame:
         // the dock builds the default layout for any key that has none, and the default is what the
@@ -442,7 +455,8 @@ impl StudioApp {
             panel_layout_writer: PanelLayoutWriter::spawn(),
             layer_doc,
             writers,
-            input_manager_v2,
+            input,
+            ai_device_prompt_open: false,
             comic_type_prompt: ComicTypePrompt::new(comic_type_prompt_open),
             ai_device_prompt: AiDevicePrompt::default(),
             storage_notice_dismissed_job: None,
@@ -685,34 +699,6 @@ impl StudioApp {
         )
     }
 
-    fn dispatch_hotkeys(&mut self, ctx: &egui::Context) {
-        let triggered_v2 = self
-            .input_manager_v2
-            .collect_triggered(ctx, self.active_tab);
-        for command_id in triggered_v2 {
-            self.execute_hotkey_command(ctx, &command_id);
-        }
-    }
-
-    /// Runs one triggered command: the session's own ids (image-set save hotkeys) here, every
-    /// other id by the active tab (`StudioTab::execute_hotkey`). `collect_triggered` only yields
-    /// global commands and the active tab's, so a tab id the active tab does not execute is a
-    /// registry / tab mismatch: logged, nothing done.
-    fn execute_hotkey_command(&mut self, ctx: &egui::Context, command_id: &str) {
-        match command_id {
-            // Registered only in an image-set session (`SessionMode::hotkey_specs`).
-            image_set::HOTKEY_SAVE_IMAGE | image_set::HOTKEY_SAVE_IMAGE_AS => {
-                self.session.on_save_hotkey(ctx, command_id);
-            }
-            _ => {
-                let active_tab = self.active_tab;
-                if !self.tabs.get_mut(active_tab).execute_hotkey(ctx, command_id, &self.project) {
-                    runtime_log::log_warn(format!("[app] hotkey '{command_id}' was triggered on {active_tab:?}, which does not execute it; ignored"));
-                }
-            }
-        }
-    }
-
     /// Source pages the active tab needs resident (`StudioTab::source_page_window`): a canvas
     /// tab's visible pages plus `neighbor_radius`, the page manager viewer's one page, nothing for
     /// the others (the PS editor keeps its own residency through `CleanOverlaysModel`).
@@ -922,9 +908,19 @@ impl eframe::App for StudioApp {
             self.residency.poll_page_cache(&self.project, &self.clean_overlays_model);
         }
         self.sync_project_from_bubbles_model();
-        // The Translation tab's shortcut texts (rebuilt on a bindings change) and its two
-        // modifier-only "held" flags, every frame whatever tab is active.
-        self.tabs.translation.refresh_hotkey_hints(ctx, &self.input_manager_v2);
+        // The input router, ONCE per frame: after the session tick (a save it finished may have
+        // closed a dialog) and BEFORE the top bar and the tab draw, so every consumer of this
+        // frame reads one `InputFrame` and the keys it matched are consumed before any widget
+        // sees them. Contexts come from the active tab; the two modal prompts suppress input.
+        let input_env = FrameEnv {
+            active_tab: Some(self.active_tab),
+            contexts: self.tabs.get(self.active_tab).input_contexts(),
+            modal_open: self.comic_type_prompt.is_open() || self.ai_device_prompt_open,
+        };
+        let input_frame = self.input.begin_frame(ctx, &input_env);
+        // The session's own commands (the image set's save / save-as); tab commands are read by
+        // the drawing tab from the same frame.
+        self.session.run_fired_commands(ctx, input_frame);
         if self.residency.background_loads_pending() {
             ctx.request_repaint();
         }
@@ -982,7 +978,7 @@ impl eframe::App for StudioApp {
                 overlays_loading,
                 activity,
                 panel_dock: &mut self.panel_dock,
-                hotkeys: &mut self.input_manager_v2,
+                input: &mut self.input,
             },
         );
         // Panel-layout persistence poll, right after a dock host drew: the dock raises its dirty
@@ -1023,10 +1019,10 @@ impl eframe::App for StudioApp {
         if let Some(comic_type) = self.comic_type_prompt.draw(ctx) {
             self.apply_comic_type_preset(comic_type);
         }
-        let ai_device_prompt_open = self.ai_device_prompt.draw(ctx, &self.ai_backend_health_cached, self.ai_backend_probe_tx.as_ref());
-        if !self.comic_type_prompt.is_open() && !ai_device_prompt_open {
-            self.dispatch_hotkeys(ctx);
-        } else {
+        self.ai_device_prompt_open = self.ai_device_prompt.draw(ctx, &self.ai_backend_health_cached, self.ai_backend_probe_tx.as_ref());
+        // While a modal prompt is open the router suppresses input (next frame's `FrameEnv`);
+        // keep repainting so the prompt stays responsive.
+        if self.comic_type_prompt.is_open() || self.ai_device_prompt_open {
             ctx.request_repaint();
         }
         // The tab the frame ENDED on (a page-manager open or a deep link may have switched it).
@@ -1118,17 +1114,58 @@ fn restore_panel_dock(user_settings: &Value, defaults: &[panel_dock_persist::Lay
     state
 }
 
-/// Builds the hotkey registry: the tabs' code-declared `tab_specs` (`Tabs::hotkey_specs`, in
-/// `AppTab::ALL` order), then the session's own `session_specs` (`SessionMode::hotkey_specs`: the
-/// image set's save hotkeys), then the pre-read user `overrides` (`StudioBootstrap::hotkey_overrides`).
-/// No I/O.
-fn build_input_manager_v2(tab_specs: Vec<HotkeySpecV2>, session_specs: Vec<HotkeySpecV2>, overrides: &HotkeyOverrides) -> InputManagerV2 {
-    let mut manager = InputManagerV2::default();
-    for spec in tab_specs.into_iter().chain(session_specs) {
-        manager.register(spec);
+/// The shared `view.*` declarations with the three zoom commands (`view::ZOOM_IN` / `ZOOM_OUT` /
+/// `ZOOM_RESET`) restricted to `Condition::Context(VIEW_ZOOM_COMMANDS)`: while `CanvasView`, the
+/// advanced-recognition window, the cleaning region editor and the PS editor still read their own
+/// zoom keys, the router may match (and consume) those keys only while the active tab executes
+/// the commands itself and publishes that context (Translation, Cleaning). Temporary: removed by
+/// input-unification WP5, when the canvas consumes the `view.*` set.
+#[must_use]
+fn gated_view_declarations() -> Declarations {
+    let mut declarations = view::declarations();
+    for action in &mut declarations.actions {
+        if let ActionSpec::Command(command) = action
+            && [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET].contains(&command.meta.id)
+        {
+            command.meta.when.push(Condition::Context(VIEW_ZOOM_COMMANDS));
+        }
     }
-    manager.apply_overrides(overrides);
-    manager
+    declarations
+}
+
+/// Builds the studio's input registry: the shared view set (`gated_view_declarations`), then the
+/// tabs' `tab_declarations` (`Tabs::input_declarations`, `AppTab::ALL` order), then the session's
+/// own `session_declarations` (`SessionMode::input_declarations`: the image set's save commands),
+/// then the pre-read user `overrides` (`StudioBootstrap::hotkey_overrides`; an override that
+/// does not apply is skipped and logged by the registry, the action keeps its defaults). No I/O.
+///
+/// # Errors
+/// [`DeclarationError`] when the merged declarations are invalid (a duplicate id, a dangling mode
+/// reference): a programming error the golden test `input_registry_golden` pins.
+fn build_input_registry(tab_declarations: Declarations, session_declarations: Declarations, overrides: &HotkeyOverrides) -> Result<InputRegistry, DeclarationError> {
+    let mut declarations = gated_view_declarations();
+    declarations.extend(tab_declarations);
+    declarations.extend(session_declarations);
+    let mut registry = InputRegistry::new(declarations)?;
+    let skipped = registry.apply_overrides(overrides);
+    if !skipped.is_empty() {
+        runtime_log::log_warn(format!("[app] {} of {} stored input binding override(s) were skipped; those actions keep their defaults", skipped.len(), overrides.actions.len()));
+    }
+    Ok(registry)
+}
+
+/// The registry `built`, or, when the declarations were invalid, an EMPTY registry: the session
+/// still opens (every binding inert) instead of failing the whole studio, and the error is logged.
+fn input_registry_or_empty(built: Result<InputRegistry, DeclarationError>) -> InputRegistry {
+    match built {
+        Ok(registry) => registry,
+        Err(err) => {
+            runtime_log::log_error(format!("[app] the studio's input declarations are invalid ({err}); no binding works in this session"));
+            // An empty declaration set has nothing to validate (no action, target, mode reference
+            // or default binding), so `InputRegistry::new` cannot fail on it.
+            InputRegistry::new(Declarations::default()).expect("an empty declaration set is always valid")
+        }
+    }
 }
 
 /// Spawns a one-shot background thread that warms the process-global text-render FontSystem
@@ -1151,14 +1188,14 @@ fn spawn_text_render_font_pool_prewarm() {
 
 #[cfg(test)]
 mod tests {
-    use super::{PanelDockPass, build_input_manager_v2};
-    use crate::input_manager_v2::{HotkeyOverrides, HotkeyScopeV2, HotkeySpecV2, ModifierOnlyV2};
+    use super::{PanelDockPass, build_input_registry, gated_view_declarations, input_registry_or_empty};
     use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
     use crate::tabs::AppTab;
     use crate::tabs::cleaning::CleaningTabState;
     use crate::tabs::translation::{TranslationTab, TranslationTabState};
     use eframe::egui;
-    use ms_studio_tab::StudioTab;
+    use ms_input::{ActionKind, Condition, Declarations, HotkeyOverrides, InputRegistry, Scope, view};
+    use ms_studio_tab::{StudioTab, VIEW_ZOOM_COMMANDS};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1186,71 +1223,115 @@ mod tests {
         assert!(pass.dock_ran());
     }
 
-    /// One registry row as the golden pins it: id, scope, default shortcut as (modifiers, key),
-    /// default modifier-only binding, `active_when_input`. Titles and sections are localized and
-    /// deliberately left out.
-    type HotkeyRow = (&'static str, HotkeyScopeV2, Option<(egui::Modifiers, egui::Key)>, Option<ModifierOnlyV2>, bool);
-
-    /// [`HotkeyRow`] with an owned id, the shape `InputManagerV2::commands` yields.
-    type OwnedHotkeyRow = (String, HotkeyScopeV2, Option<(egui::Modifiers, egui::Key)>, Option<ModifierOnlyV2>, bool);
-
-    /// Pins today's code-declared hotkey registry (no session specs, no user overrides) ahead of
-    /// the tab-seam refactor that moves the Translation and Cleaning specs out of the root and
-    /// into their tab crates. The expectations were generated from the pre-refactor
-    /// `build_input_manager_v2` and must not be edited by that refactor: ids are persistence
-    /// keys in `user_config` -> `Hotkeys`, and registration order is observable within a scope
-    /// (`collect_triggered`). A refactor may change only HOW the registry is assembled.
-    #[test]
-    fn hotkey_registry_golden() {
-        use egui::Key;
-        use egui::Modifiers as M;
-        use HotkeyScopeV2::Tab;
-        const TR: HotkeyScopeV2 = Tab(AppTab::Translation);
-        const CL: HotkeyScopeV2 = Tab(AppTab::Cleaning);
-        let expected: Vec<HotkeyRow> = vec![
-            ("translation.canvas.zoom_in", TR, Some((M::COMMAND, Key::Equals)), None, false),
-            ("translation.canvas.zoom_out", TR, Some((M::COMMAND, Key::Minus)), None, false),
-            ("translation.canvas.zoom_reset", TR, Some((M::COMMAND, Key::Num0)), None, false),
-            ("translation.bubble.delete_selected", TR, Some((M::NONE, Key::Delete)), None, false),
-            ("translation.bubble.create_at_cursor", TR, Some((M::NONE, Key::T)), None, false),
-            ("translation.bubble.create_hint_at_cursor", TR, Some((M::NONE, Key::H)), None, false),
-            ("cleaning.canvas.zoom_in", CL, Some((M::COMMAND, Key::Equals)), None, false),
-            ("cleaning.canvas.zoom_out", CL, Some((M::COMMAND, Key::Minus)), None, false),
-            ("cleaning.canvas.zoom_reset", CL, Some((M::COMMAND, Key::Num0)), None, false),
-            ("translation.ocr.quick.selection_mode", TR, None, Some(ModifierOnlyV2::Shift), false),
-            ("translation.ocr.advanced.selection_mode", TR, None, Some(ModifierOnlyV2::Alt), false),
-            ("translation.panel.bubbles.toggle", TR, Some((M::NONE, Key::P)), None, false),
-            ("translation.panel.ocr.toggle", TR, Some((M::NONE, Key::S)), None, false),
-            ("translation.panel.composition.toggle", TR, Some((M::NONE, Key::K)), None, false),
-            ("translation.panel.machine_translation.toggle", TR, Some((M::NONE, Key::M)), None, false),
-            ("translation.panel.detector.toggle", TR, Some((M::NONE, Key::D)), None, false),
-            ("translation.bubble.copy_original", TR, None, None, false),
-            ("translation.bubble.copy_translation", TR, None, None, false),
-            ("translation.bubble.paste_original", TR, None, None, false),
-            ("translation.bubble.paste_translation", TR, None, None, false),
-        ];
-        // The only two tabs that declare hotkeys, in `AppTab::ALL` order as `Tabs::hotkey_specs`
-        // visits them (the other eight answer `StudioTab::hotkey_specs` with the empty default).
-        // The bubbles model's documents live under a unique temp path that is never created: the
-        // model writes nothing unless it is edited.
-        let model_dir = std::env::temp_dir().join(format!("ms_hotkey_golden_{}", std::process::id()));
+    /// The tab-declared part of the studio's input: the only two tabs that declare or publish
+    /// anything input-related, Translation and Cleaning (the other eight answer the trait's empty
+    /// defaults). The bubbles model's documents live under a unique temp path that is never
+    /// created: the model writes nothing unless it is edited.
+    fn translation_and_cleaning() -> (TranslationTab, CleaningTabState) {
+        let model_dir = std::env::temp_dir().join(format!("ms_input_golden_{}", std::process::id()));
         let model = BubblesModel::new_with_staging_probe(Vec::new(), model_dir.join("bubbles.json"), model_dir.join("unsaved_bubbles.json"), SharedCanvasSettings::default(), None, false);
         let translation = TranslationTab::new(TranslationTabState::default(), Arc::new(Mutex::new(model)), &json!({}));
-        let cleaning = CleaningTabState::default();
-        let tab_specs: Vec<HotkeySpecV2> = [&translation as &dyn StudioTab, &cleaning].into_iter().flat_map(StudioTab::hotkey_specs).collect();
-        let manager = build_input_manager_v2(tab_specs, Vec::new(), &HotkeyOverrides::default());
-        let actual: Vec<OwnedHotkeyRow> = manager
-            .commands()
-            .iter()
-            .map(|command| (command.id.clone(), command.scope, command.default_shortcut.map(|shortcut| (shortcut.modifiers, shortcut.logical_key)), command.default_modifier_only, command.active_when_input))
-            .collect();
-        let expected: Vec<OwnedHotkeyRow> = expected.into_iter().map(|(id, scope, shortcut, modifier_only, active_when_input)| (id.to_owned(), scope, shortcut, modifier_only, active_when_input)).collect();
-        // Order is compared per scope only: across scopes it is unobservable, so a refactor may
-        // interleave the Translation and Cleaning registrations differently.
-        let in_scope = |rows: &[OwnedHotkeyRow], scope: HotkeyScopeV2| -> Vec<OwnedHotkeyRow> { rows.iter().filter(|row| row.1 == scope).cloned().collect() };
-        for scope in [TR, CL] {
-            assert_eq!(in_scope(&actual, scope), in_scope(&expected, scope), "hotkey registry drifted in scope {scope:?}");
+        (translation, CleaningTabState::default())
+    }
+
+    /// Pins the studio's code-declared input registry (no session actions, no user overrides):
+    /// every action's id, kind, scope, fixed flag and default label in English, in registry order
+    /// (actions in declaration order — view set, then tabs in `AppTab::ALL` order — then the fixed
+    /// rows). Ids are persistence keys in `user_config` -> `Hotkeys`; the format-1 ids they replace
+    /// migrate in `ms_input::persist`. Also pins the phase-B zoom gate and that the defaults hold
+    /// no conflict.
+    #[test]
+    fn input_registry_golden() {
+        use ActionKind::{Axis, Command, Gesture, Mode};
+        const TR: Scope = Scope::Tab(AppTab::Translation);
+        // Held for the whole test: the active catalog is process-global.
+        let _locale = crate::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
+        ms_i18n::set_locale(&ms_i18n::LocaleTag::english()).expect("embedded English catalog installs");
+        let (translation, cleaning) = translation_and_cleaning();
+        let mut tab_declarations = Declarations::default();
+        for tab in [&translation as &dyn StudioTab, &cleaning] {
+            tab_declarations.extend(tab.input_declarations());
         }
-        assert_eq!(actual.len(), expected.len(), "hotkey registry has commands outside the pinned scopes: {actual:?}");
+        let registry = build_input_registry(tab_declarations, Declarations::default(), &HotkeyOverrides::default()).expect("the studio declarations are valid");
+
+        let ctrl = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
+        let zoom = format!("({ctrl} / Z)");
+        let minus = egui::Key::Minus.symbol_or_name();
+        let expected: Vec<(&str, ActionKind, Scope, bool, String)> = vec![
+            ("view.zoom_modifier", Mode, Scope::View, false, format!("{ctrl} / Z")),
+            ("view.pan", Mode, Scope::View, false, "Space".to_owned()),
+            ("view.zoom_in", Command, Scope::View, false, format!("{zoom}+= / {zoom}+Shift+=")),
+            ("view.zoom_out", Command, Scope::View, false, format!("{zoom}+{minus}")),
+            ("view.zoom_reset", Command, Scope::View, false, format!("{zoom}+0")),
+            ("view.zoom", Axis, Scope::View, false, format!("{zoom}+Wheel / Pinch")),
+            ("view.zoom_drag", Gesture, Scope::View, false, format!("{zoom}+LMB drag")),
+            ("translation.bubble.delete_selected", Command, TR, false, "Del".to_owned()),
+            ("translation.bubble.create_at_cursor", Command, TR, false, "T".to_owned()),
+            ("translation.bubble.create_hint_at_cursor", Command, TR, false, "H".to_owned()),
+            ("translation.ocr.quick_mode", Mode, TR, false, "Shift".to_owned()),
+            ("translation.ocr.advanced_mode", Mode, TR, false, "Alt".to_owned()),
+            ("translation.panel.bubbles.toggle", Command, TR, false, "P".to_owned()),
+            ("translation.panel.ocr.toggle", Command, TR, false, "S".to_owned()),
+            ("translation.panel.composition.toggle", Command, TR, false, "K".to_owned()),
+            ("translation.panel.machine_translation.toggle", Command, TR, false, "M".to_owned()),
+            ("translation.panel.detector.toggle", Command, TR, false, "D".to_owned()),
+            ("translation.bubble.copy_original", Command, TR, false, "no binding".to_owned()),
+            ("translation.bubble.copy_translation", Command, TR, false, "no binding".to_owned()),
+            ("translation.bubble.paste_original", Command, TR, false, "no binding".to_owned()),
+            ("translation.bubble.paste_translation", Command, TR, false, "no binding".to_owned()),
+            ("view.scroll", Axis, Scope::View, true, "Wheel".to_owned()),
+            ("view.scroll_horizontal", Axis, Scope::View, true, "Shift+Wheel / Horizontal wheel".to_owned()),
+        ];
+        let actual: Vec<(&str, ActionKind, Scope, bool, String)> = registry.actions().map(|action| (action.meta.id.0, action.kind, action.meta.scope, action.fixed, registry.label(action.meta.id))).collect();
+        assert_eq!(actual, expected);
+        assert!(registry.conflicts().conflicts.is_empty(), "the default bindings conflict: {:?}", registry.conflicts().conflicts);
+    }
+
+    /// The phase-B gate: exactly the three zoom commands of the view set gain
+    /// `Context(VIEW_ZOOM_COMMANDS)`; every other view declaration is the crate's own, unchanged.
+    /// Both tabs that execute the commands publish the context by default.
+    #[test]
+    fn only_the_view_zoom_commands_are_gated() {
+        let gated = gated_view_declarations();
+        let original = view::declarations();
+        assert_eq!(gated.actions.len(), original.actions.len());
+        for (gated, original) in gated.actions.iter().zip(&original.actions) {
+            let id = gated.meta().id;
+            if [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET].contains(&id) {
+                let mut expected_when = original.meta().when.clone();
+                expected_when.push(Condition::Context(VIEW_ZOOM_COMMANDS));
+                assert_eq!(gated.meta().when, expected_when, "{id:?}");
+            } else {
+                assert_eq!(gated, original, "{id:?} must stay as `ms_input::view` declares it");
+            }
+        }
+        assert_eq!((gated.targets, gated.fixed), (original.targets, original.fixed));
+        let (translation, cleaning) = translation_and_cleaning();
+        assert_eq!(translation.input_contexts(), vec![VIEW_ZOOM_COMMANDS]);
+        assert_eq!(cleaning.input_contexts(), vec![VIEW_ZOOM_COMMANDS]);
+    }
+
+    /// The image set's two save commands join the registry without a conflict (exact modifier sets:
+    /// Ctrl+S is neither Ctrl+Shift+S nor the Translation panel's plain S), and a stored override
+    /// replaces a default.
+    #[test]
+    fn session_commands_and_overrides_apply() {
+        let (translation, _) = translation_and_cleaning();
+        let mut overrides = HotkeyOverrides::default();
+        overrides.actions.insert("translation.panel.ocr.toggle".to_owned(), Vec::new());
+        let registry = build_input_registry(translation.input_declarations(), crate::studio::session::image_set::input_declarations(), &overrides).expect("valid declarations");
+        assert!(registry.action("single_image.save").is_some() && registry.action("single_image.save_as").is_some());
+        assert!(registry.conflicts().conflicts.is_empty(), "{:?}", registry.conflicts().conflicts);
+        assert!(registry.bindings(ms_input::ActionId("translation.panel.ocr.toggle")).is_empty(), "the override unbinds the action");
+    }
+
+    /// Invalid declarations (a duplicate id) never fail the session: the studio gets an empty,
+    /// inert registry instead.
+    #[test]
+    fn invalid_declarations_fall_back_to_an_empty_registry() {
+        let built = build_input_registry(view::declarations(), Declarations::default(), &HotkeyOverrides::default());
+        assert!(built.is_err(), "the view set declared twice must be rejected");
+        let registry: InputRegistry = input_registry_or_empty(built);
+        assert_eq!(registry.actions().count(), 0);
     }
 }

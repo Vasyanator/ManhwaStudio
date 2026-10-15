@@ -5,17 +5,18 @@ FILE OVERVIEW: crates/ms-tab-translation/src/host.rs
 canvas directly. Mirrors what the Cleaning and Typing tabs already are (they own their canvases).
 
 Key items:
-- `TranslationTab`: owns the canvas, the tab state and the hotkey-hint cache.
+- `TranslationTab`: owns the canvas and the tab state.
 - `TranslationTab::new`: builds the canvas (scroll salt, bubbles model, bottom-hint collapsed
   seed from `user_config` `Canvas.translation_hint_collapsed`). It seeds NO canvas settings: the
   canvas pulls `SharedCanvasSettings` from the bubbles model on its first draw.
-- `TranslationDrawParams` / `TranslationTab::draw`: the per-frame canvas configuration, the
-  floating side panel and the canvas draw inside the root's central panel.
+- `TranslationDrawParams` / `TranslationTab::draw`: the fired input commands and the binding
+  hints of this frame, the per-frame canvas configuration, the floating side panel and the
+  canvas draw inside the root's central panel.
 - `translation_hint_rows`: the fixed bottom-hint rows (`canvas.bottom_hint.translation.*`).
-- `impl StudioTab for TranslationTab`: hotkeys, execute, dock builder, GPU eviction, source-page
-  window, NEAREST sampling, the exit-only hint-collapsed key.
-- `hotkeys` (submodule): the six canvas-level command ids, their specs, the execute arms and the
-  hint cache (`refresh_hotkey_hints`).
+- `impl StudioTab for TranslationTab`: input declarations and contexts, dock builder, GPU
+  eviction, source-page window, NEAREST sampling, the exit-only hint-collapsed key.
+- `hotkeys` (submodule): the three canvas-level command ids, their specs, the execute arms and
+  the per-frame binding hints (`hotkey_hints`).
 
 Notes:
 - Field order is drop order: the canvas drops before the tab state, as it did as a root field.
@@ -34,13 +35,12 @@ use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
 use ms_models::bubbles_model::BubblesModel;
 use ms_models::page_view::{PageImageInfo, PageTexture};
 use ms_project::ProjectData;
-use ms_studio_tab::StudioTab;
-use ms_widgets::input_manager_v2::HotkeySpecV2;
+use ms_input::{ContextId, Declarations, InputFrame, InputRegistry};
+use ms_studio_tab::{StudioTab, VIEW_ZOOM_COMMANDS};
 use ms_widgets::panel_dock::{DockLayout, PanelDockState};
 use serde_json::Value;
 
 use crate::tab::{TranslationTabState, translation_default_dock_layout};
-use hotkeys::HotkeyHintCache;
 
 /// `user_config` key (under `Canvas`) of the Translation canvas' bottom-hint collapsed flag.
 /// Absent = `false` (expanded). Read once in [`TranslationTab::new`], written only on exit
@@ -51,12 +51,11 @@ const TRANSLATION_HINT_COLLAPSED_KEY: &str = "translation_hint_collapsed";
 /// the three canvases never share scroll state).
 const TRANSLATION_CANVAS_SCROLL_SALT: &str = "translation_canvas_scroll";
 
-/// The «Перевод» program tab: its canvas, its state and its cached hotkey hints.
+/// The «Перевод» program tab: its canvas and its state.
 pub struct TranslationTab {
     // Declared first: dropped before the state, the order the root's fields had.
     canvas: CanvasView,
     state: TranslationTabState,
-    hints: HotkeyHintCache,
 }
 
 /// What [`TranslationTab::draw`] borrows from the root for one frame.
@@ -72,6 +71,11 @@ pub struct TranslationDrawParams<'a> {
     pub status: CanvasUiStatus,
     /// The studio window's panel dock; the canvas carries it through to this tab's overlay hook.
     pub panel_dock: &'a mut PanelDockState,
+    /// This frame's input (`InputRouter::begin_frame`, run by the root before any tab draws):
+    /// the fired commands this tab executes and its active modes.
+    pub input: &'a InputFrame,
+    /// The studio's input registry: binding labels for the hints.
+    pub input_registry: &'a InputRegistry,
 }
 
 impl TranslationTab {
@@ -86,7 +90,7 @@ impl TranslationTab {
         canvas.set_bottom_hint_collapsed(ms_config::section_bool(user_settings, CANVAS_SECTION, TRANSLATION_HINT_COLLAPSED_KEY, false));
         canvas.set_scroll_area_id_salt(TRANSLATION_CANVAS_SCROLL_SALT);
         canvas.set_bubbles_model(bubbles_model);
-        Self { canvas, state, hints: HotkeyHintCache::default() }
+        Self { canvas, state }
     }
 
     /// The tab's canvas (viewport snapshot, view sync, bubble flush).
@@ -111,12 +115,17 @@ impl TranslationTab {
         &mut self.state
     }
 
-    /// Draws the tab for one frame, in this order: bottom-hint rows, the lazy per-title settings
-    /// load, the floating side panel, the canvas' per-frame flags, then the canvas inside a
-    /// `CentralPanel` of `p.ui`. The panel dock runs inside the canvas draw (overlay hook).
+    /// Draws the tab for one frame, in this order: the fired input commands, the binding hints,
+    /// bottom-hint rows, the lazy per-title settings load, the floating side panel, the canvas'
+    /// per-frame flags, then the canvas inside a `CentralPanel` of `p.ui`. The panel dock runs
+    /// inside the canvas draw (overlay hook).
     pub fn draw(&mut self, p: TranslationDrawParams<'_>) {
-        let TranslationDrawParams { ctx, ui, project, page_infos, texture_cache, status, panel_dock } = p;
-        let Self { canvas, state, .. } = self;
+        let TranslationDrawParams { ctx, ui, project, page_infos, texture_cache, status, panel_dock, input, input_registry } = p;
+        self.run_fired_commands(ctx, project, input);
+        let (create_bubble_hint, hints) = hotkeys::hotkey_hints(input_registry, input);
+        let Self { canvas, state } = self;
+        canvas.set_create_bubble_shortcut_hint(create_bubble_hint);
+        state.set_hotkey_hints(hints);
         canvas.set_bottom_hint(Some(CanvasBottomHint { rows: translation_hint_rows() }));
         state.sync_with_project_settings(project);
         state.draw_side_panel(ctx, canvas, project, page_infos);
@@ -145,15 +154,19 @@ impl TranslationTab {
 }
 
 impl StudioTab for TranslationTab {
-    /// The host's six canvas-level specs first (zoom in/out/reset, delete, create, create hint),
-    /// then the tab state's eleven, all in the Translation scope. The order is observable within
-    /// the scope and pinned by the root's `hotkey_registry_golden`.
-    fn hotkey_specs(&self) -> Vec<HotkeySpecV2> {
-        hotkeys::host_hotkey_specs().into_iter().chain(TranslationTabState::hotkey_specs()).collect()
+    /// The host's three canvas commands (delete, create, create hint), then the tab state's own
+    /// actions (OCR selection modes, panel toggles, bubble copy / paste), all in the Translation
+    /// scope; pinned by `host/tests.rs` and the root's `input_registry_golden`.
+    fn input_declarations(&self) -> Declarations {
+        let mut actions = hotkeys::host_input_actions();
+        actions.extend(TranslationTabState::input_actions());
+        Declarations { actions, ..Declarations::default() }
     }
 
-    fn execute_hotkey(&mut self, ctx: &egui::Context, command_id: &str, project: &ProjectData) -> bool {
-        self.execute_hotkey_command(ctx, command_id, project)
+    /// `VIEW_ZOOM_COMMANDS` while this tab executes the shared zoom commands itself (not while
+    /// the advanced-recognition window blocks canvas zoom: its own zoom keys must reach it).
+    fn input_contexts(&self) -> Vec<ContextId> {
+        if self.state.blocks_canvas_zoom() { Vec::new() } else { vec![VIEW_ZOOM_COMMANDS] }
     }
 
     fn default_dock_layout(&self) -> Option<fn() -> DockLayout> {

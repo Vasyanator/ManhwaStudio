@@ -18,7 +18,8 @@ Key functions:
 - `tab_visible()`: the tab filter of the mode.
 - `image_window_title()`: the studio window title of an image-set session (first file + count of
   the others; shared with the window host, `src/shell/target.rs`).
-- `hotkey_specs()`: Ctrl+S / Ctrl+Shift+S, registered only in a single-image session.
+- `input_declarations()`: the save / save-as commands (Ctrl+S / Ctrl+Shift+S), declared only in
+  a single-image session.
 
 Notes:
 The save machinery is native-only (it drives `TypingTabState::*_flatten_to_file`, which does not
@@ -39,18 +40,19 @@ pub(crate) use dialogs::draw_exit_dialog;
 pub(crate) use dialogs::draw_open_incoming_exit_dialog;
 
 use crate::studio::PendingCloseAction;
-use crate::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2};
 use crate::models::autosave_gate::AutosaveGate;
 use crate::project::ProjectData;
 use crate::tabs::AppTab;
 use crate::tabs::ps_editor::PsEditorTabState;
 use crate::tabs::typing::TypingTabState;
 use eframe::egui;
+use ms_input::{ActionId, ActionMeta, ActionSpec, Binding, Button, Chord, CommandSpec, Declarations, ModifierKey, Scope};
 
-/// Hotkey id of «Сохранить» (Ctrl+S) in a single-image session.
-pub(crate) const HOTKEY_SAVE_IMAGE: &str = "single_image.save";
-/// Hotkey id of «Сохранить как» (Ctrl+Shift+S) in a single-image session.
-pub(crate) const HOTKEY_SAVE_IMAGE_AS: &str = "single_image.save_as";
+/// Command of «Сохранить» (Ctrl+S) in a single-image session. Persistence key, never rename.
+pub(crate) const HOTKEY_SAVE_IMAGE: ActionId = ActionId("single_image.save");
+/// Command of «Сохранить как» (Ctrl+Shift+S) in a single-image session. Persistence key, never
+/// rename.
+pub(crate) const HOTKEY_SAVE_IMAGE_AS: ActionId = ActionId("single_image.save_as");
 
 /// The `StudioApp` borrows one save tick needs (disjoint fields of the app).
 pub(crate) struct SaveParts<'a> {
@@ -117,32 +119,27 @@ pub(crate) fn image_window_title(version: &str, first: &std::path::Path, count: 
     format!("ManhwaStudio v{version} - {set_name}")
 }
 
-/// The two save hotkeys of the mode, both `Global`. Registered ONLY for a single-image session so
-/// a project session neither lists them in Settings nor reacts to them. «Сохранить как» comes
-/// FIRST: egui matches shortcuts logically (an extra Shift still matches Ctrl+S), so the more
-/// specific shortcut must consume the key event before the plain one sees it.
+/// The mode's two save commands, session scope. Declared ONLY for a single-image session so a
+/// project session neither lists them in Settings nor reacts to them. Modifier sets match
+/// exactly, so Ctrl+S never fires «Сохранить как» and Ctrl+Shift+S never fires «Сохранить».
 #[must_use]
-pub(crate) fn hotkey_specs() -> [HotkeySpecV2; 2] {
-    [
-        HotkeySpecV2 {
-            id: HOTKEY_SAVE_IMAGE_AS,
-            title: t!("app.hotkey.save_image_as"),
-            section: t!("app.hotkey.file_category"),
-            default_shortcut: Some(egui::KeyboardShortcut::new(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S)),
-            default_modifier_only: None,
-            scope: HotkeyScopeV2::Global,
-            active_when_input: false,
-        },
-        HotkeySpecV2 {
-            id: HOTKEY_SAVE_IMAGE,
-            title: t!("app.hotkey.save_image"),
-            section: t!("app.hotkey.file_category"),
-            default_shortcut: Some(egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S)),
-            default_modifier_only: None,
-            scope: HotkeyScopeV2::Global,
-            active_when_input: false,
-        },
-    ]
+pub(crate) fn input_declarations() -> Declarations {
+    let command = |id: ActionId, title_key: &'static str, buttons: Vec<Button>| {
+        ActionSpec::Command(CommandSpec {
+            meta: ActionMeta { id, title_key, section_key: "app.hotkey.file_category", scope: Scope::Session, when: Vec::new(), defaults: vec![Binding::command(Chord::new(buttons))] },
+            accepts: Vec::new(),
+            repeat: false,
+        })
+    };
+    let ctrl = Button::Modifier(ModifierKey::Command);
+    let s_key = Button::Key(egui::Key::S);
+    Declarations {
+        actions: vec![
+            command(HOTKEY_SAVE_IMAGE, "app.hotkey.save_image", vec![ctrl.clone(), s_key.clone()]),
+            command(HOTKEY_SAVE_IMAGE_AS, "app.hotkey.save_image_as", vec![ctrl, Button::Modifier(ModifierKey::Shift), s_key]),
+        ],
+        ..Declarations::default()
+    }
 }
 
 /// Web build stand-in: an UNINHABITED type. The web entry never opens an image (plan D10), so no
@@ -241,10 +238,20 @@ mod tests {
     }
 
     #[test]
-    fn save_as_hotkey_is_registered_before_save() {
-        let specs = hotkey_specs();
-        assert_eq!(specs[0].id, HOTKEY_SAVE_IMAGE_AS);
-        assert_eq!(specs[1].id, HOTKEY_SAVE_IMAGE);
-        assert!(specs.iter().all(|spec| spec.scope == HotkeyScopeV2::Global));
+    fn the_save_commands_are_session_scoped_with_exact_chords() {
+        use ms_input::{ActionKind, Binding, Button, Chord, ModifierKey, Scope};
+        let declarations = input_declarations();
+        let rows: Vec<(ms_input::ActionId, ActionKind, Scope, Vec<Binding>)> = declarations.actions.iter().map(|spec| (spec.meta().id, spec.kind(), spec.meta().scope, spec.meta().defaults.clone())).collect();
+        let ctrl = Button::Modifier(ModifierKey::Command);
+        let s_key = Button::Key(egui::Key::S);
+        assert_eq!(
+            rows,
+            vec![
+                (HOTKEY_SAVE_IMAGE, ActionKind::Command, Scope::Session, vec![Binding::command(Chord::new([ctrl.clone(), s_key.clone()]))]),
+                (HOTKEY_SAVE_IMAGE_AS, ActionKind::Command, Scope::Session, vec![Binding::command(Chord::new([ctrl, Button::Modifier(ModifierKey::Shift), s_key]))]),
+            ]
+        );
+        assert_eq!(HOTKEY_SAVE_IMAGE.0, "single_image.save");
+        assert_eq!(HOTKEY_SAVE_IMAGE_AS.0, "single_image.save_as");
     }
 }

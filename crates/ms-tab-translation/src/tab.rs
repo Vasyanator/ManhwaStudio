@@ -224,7 +224,7 @@ use ms_canvas::{
     BubbleAction, BubbleClass, CANVAS_RIBBON_TAB, CanvasHooks, CanvasScrollbarContext,
     CanvasUiStatus, CanvasView, TouchDrivenDrag, TranslationStatusDisplay, drive_touch_drag,
 };
-use ms_widgets::input_manager_v2::{HotkeyScopeV2, HotkeySpecV2, ModifierOnlyV2};
+use ms_input::{ActionId, ActionMeta, ActionSpec, Binding, Button, Chord, CommandSpec, ModeEffect, ModeSpec, ModifierKey, ReleasePolicy, Scope};
 use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
     CacheResourceKind, select_eviction_candidates,
@@ -464,22 +464,41 @@ pub fn translation_default_dock_layout() -> DockLayout {
     layout
 }
 
-pub const HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE: &str =
-    "translation.ocr.quick.selection_mode";
-pub const HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE: &str =
-    "translation.ocr.advanced.selection_mode";
-pub const HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL: &str = "translation.panel.bubbles.toggle";
-pub const HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL: &str = "translation.panel.ocr.toggle";
-pub const HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL: &str =
-    "translation.panel.composition.toggle";
-pub const HOTKEY_TRANSLATION_TOGGLE_MT_PANEL: &str = "translation.panel.machine_translation.toggle";
-pub const HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL: &str = "translation.panel.detector.toggle";
-pub const HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL: &str = "translation.bubble.copy_original";
-pub const HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION: &str = "translation.bubble.copy_translation";
-pub const HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL: &str = "translation.bubble.paste_original";
-pub const HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION: &str =
-    "translation.bubble.paste_translation";
+/// Mode: quick OCR selection while held (default Shift). Persistence key, never rename.
+pub const HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE: ActionId = ActionId("translation.ocr.quick_mode");
+/// Mode: advanced OCR selection while held (default Alt); beats the quick mode. Persistence key.
+pub const HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE: ActionId = ActionId("translation.ocr.advanced_mode");
+pub const HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL: ActionId = ActionId("translation.panel.bubbles.toggle");
+pub const HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL: ActionId = ActionId("translation.panel.ocr.toggle");
+pub const HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL: ActionId = ActionId("translation.panel.composition.toggle");
+pub const HOTKEY_TRANSLATION_TOGGLE_MT_PANEL: ActionId = ActionId("translation.panel.machine_translation.toggle");
+pub const HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL: ActionId = ActionId("translation.panel.detector.toggle");
+pub const HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL: ActionId = ActionId("translation.bubble.copy_original");
+pub const HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION: ActionId = ActionId("translation.bubble.copy_translation");
+pub const HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL: ActionId = ActionId("translation.bubble.paste_original");
+pub const HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION: ActionId = ActionId("translation.bubble.paste_translation");
 
+/// The declaration part every Translation action shares: tab scope, no extra condition.
+#[must_use]
+pub(crate) fn translation_action_meta(id: ActionId, title_key: &'static str, section_key: &'static str, defaults: Vec<Binding>) -> ActionMeta {
+    ActionMeta { id, title_key, section_key, scope: Scope::Tab(AppTab::Translation), when: Vec::new(), defaults }
+}
+
+/// A Translation-scope command (no accepted parameter modes, no auto-repeat).
+#[must_use]
+pub(crate) fn translation_command_spec(id: ActionId, title_key: &'static str, section_key: &'static str, defaults: Vec<Binding>) -> ActionSpec {
+    ActionSpec::Command(CommandSpec { meta: translation_action_meta(id, title_key, section_key, defaults), accepts: Vec::new(), repeat: false })
+}
+
+/// The default alternatives "this key, no modifier".
+#[must_use]
+pub(crate) fn single_key_binding(key: egui::Key) -> Vec<Binding> {
+    vec![Binding::command(Chord::new([Button::Key(key)]))]
+}
+
+/// Binding texts and held-mode flags the tab state shows, filled by the host every frame from
+/// the input registry's labels (`None` = the action has no binding: no hint is shown) and the
+/// input frame's active modes.
 #[derive(Debug, Clone, Default)]
 pub struct TranslationHotkeyHints {
     pub ocr_quick_selection_mode: Option<String>,
@@ -949,122 +968,38 @@ impl Default for TranslationTabState {
 }
 
 impl TranslationTabState {
-    pub fn hotkey_specs() -> [HotkeySpecV2; 11] {
-        [
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE,
-                title: t!("translation.tab.hotkey_quick_recognition"),
-                section: "OCR",
-                default_shortcut: None,
-                default_modifier_only: Some(ModifierOnlyV2::Shift),
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE,
-                title: t!("translation.tab.hotkey_advanced_recognition"),
-                section: "OCR",
-                default_shortcut: None,
-                default_modifier_only: Some(ModifierOnlyV2::Alt),
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL,
-                title: t!("translation.tab.hotkey_open_bubbles"),
-                section: t!("translation.tab.hotkey_scope_panels"),
-                default_shortcut: Some(egui::KeyboardShortcut::new(
-                    egui::Modifiers::NONE,
-                    egui::Key::P,
-                )),
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL,
-                title: t!("translation.tab.hotkey_open_ocr"),
-                section: t!("translation.tab.hotkey_scope_panels"),
-                default_shortcut: Some(egui::KeyboardShortcut::new(
-                    egui::Modifiers::NONE,
-                    egui::Key::S,
-                )),
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL,
-                title: t!("translation.tab.hotkey_open_composition"),
-                section: t!("translation.tab.hotkey_scope_panels"),
-                default_shortcut: Some(egui::KeyboardShortcut::new(
-                    egui::Modifiers::NONE,
-                    egui::Key::K,
-                )),
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_TOGGLE_MT_PANEL,
-                title: t!("translation.tab.hotkey_open_mt"),
-                section: t!("translation.tab.hotkey_scope_panels"),
-                default_shortcut: Some(egui::KeyboardShortcut::new(
-                    egui::Modifiers::NONE,
-                    egui::Key::M,
-                )),
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL,
-                title: t!("translation.tab.hotkey_open_text_detector"),
-                section: t!("translation.tab.hotkey_scope_panels"),
-                default_shortcut: Some(egui::KeyboardShortcut::new(
-                    egui::Modifiers::NONE,
-                    egui::Key::D,
-                )),
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL,
-                title: t!("translation.tab.hotkey_copy_original"),
-                section: t!("translation.tab.bubbles_title"),
-                default_shortcut: None,
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION,
-                title: t!("translation.tab.hotkey_copy_translation"),
-                section: t!("translation.tab.bubbles_title"),
-                default_shortcut: None,
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL,
-                title: t!("translation.tab.hotkey_paste_original"),
-                section: t!("translation.tab.bubbles_title"),
-                default_shortcut: None,
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
-            HotkeySpecV2 {
-                id: HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION,
-                title: t!("translation.tab.hotkey_paste_translation"),
-                section: t!("translation.tab.bubbles_title"),
-                default_shortcut: None,
-                default_modifier_only: None,
-                scope: HotkeyScopeV2::Tab(AppTab::Translation),
-                active_when_input: false,
-            },
+    /// The tab state's own input actions, in declaration order: the two OCR selection modes
+    /// (`advanced` beats `quick` when both are held), the five panel toggles and the four bubble
+    /// copy / paste commands (unbound by default). All in the Translation tab scope; the host
+    /// declares its canvas commands before them (`TranslationTab::input_declarations`). Ids are
+    /// persistence keys of the user's overrides: never rename them.
+    #[must_use]
+    pub fn input_actions() -> Vec<ActionSpec> {
+        let shift = Button::Modifier(ModifierKey::Shift);
+        let alt = Button::Modifier(ModifierKey::Alt);
+        let ocr_mode = |id: ActionId, title_key: &'static str, button: Button, beats: Vec<ActionId>| {
+            ActionSpec::Mode(ModeSpec {
+                meta: translation_action_meta(id, title_key, "app.hotkey.ocr_category", vec![Binding::mode([button])]),
+                effect: ModeEffect::Immediate,
+                on_release_mid_gesture: ReleasePolicy::Commit,
+                beats,
+                param: None,
+            })
+        };
+        const PANELS: &str = "translation.tab.hotkey_scope_panels";
+        const BUBBLES: &str = "translation.tab.bubbles_title";
+        vec![
+            ocr_mode(HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE, "translation.tab.hotkey_quick_recognition", shift, Vec::new()),
+            ocr_mode(HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE, "translation.tab.hotkey_advanced_recognition", alt, vec![HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE]),
+            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL, "translation.tab.hotkey_open_bubbles", PANELS, single_key_binding(egui::Key::P)),
+            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL, "translation.tab.hotkey_open_ocr", PANELS, single_key_binding(egui::Key::S)),
+            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL, "translation.tab.hotkey_open_composition", PANELS, single_key_binding(egui::Key::K)),
+            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_MT_PANEL, "translation.tab.hotkey_open_mt", PANELS, single_key_binding(egui::Key::M)),
+            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL, "translation.tab.hotkey_open_text_detector", PANELS, single_key_binding(egui::Key::D)),
+            translation_command_spec(HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL, "translation.tab.hotkey_copy_original", BUBBLES, Vec::new()),
+            translation_command_spec(HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION, "translation.tab.hotkey_copy_translation", BUBBLES, Vec::new()),
+            translation_command_spec(HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL, "translation.tab.hotkey_paste_original", BUBBLES, Vec::new()),
+            translation_command_spec(HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION, "translation.tab.hotkey_paste_translation", BUBBLES, Vec::new()),
         ]
     }
 

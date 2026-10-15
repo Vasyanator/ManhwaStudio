@@ -4,20 +4,23 @@ version = "0.1.0"
 edition = "2024"
 
 # The `StudioTab` trait: the small set of ORDER-FREE per-tab hooks the studio root iterates
-# (hotkey specs and execution, panel-dock default layout, GPU cache eviction, source-page
-# residency window, background polls, exit-only settings, teardown store flush, committed-tree
-# notification). Trait only — no implementation, no state, no I/O.
+# (input declarations and published input contexts, panel-dock default layout, GPU cache
+# eviction, source-page residency window, background polls, exit-only settings, teardown store
+# flush, committed-tree notification). Trait only — no implementation, no state, no I/O.
 #
 # Layer: its own line between `ms-models / ms-tabs-simple / …` and
 # `ms-project / ms-widgets / ms-native-runtime`: every tab crate (including `ms-tabs-simple`)
 # implements it, and it names only types from the line below. It must never depend on a tab
 # crate, `ms-models` or the root package.
 [dependencies]
-# `HotkeySpecV2` (code-declared hotkeys) and `DockLayout` (panel-dock default layout builder).
+# `DockLayout` (panel-dock default layout builder).
 ms-widgets = { path = "../ms-widgets" }
+# `Declarations` / `ContextId`: what a tab contributes to the studio's input registry and which
+# input contexts it publishes each frame. `ms-input` sits below this crate.
+ms-input = { path = "../ms-input" }
 # `CacheEvictionRequest` / `CacheEvictionReport`: the typed eviction boundary.
 ms-memory = { path = "../ms-memory" }
-# `ProjectData`, handed to hotkey execution and background polls.
+# `ProjectData`, handed to background polls.
 ms-project = { path = "../ms-project" }
 # `egui::Context` in the hook signatures.
 egui.workspace = true

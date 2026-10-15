@@ -3948,6 +3948,7 @@ name = "ms-studio-tab"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "ms-input",
  "ms-memory",
  "ms-project",
  "ms-widgets",
@@ -3987,6 +3988,7 @@ dependencies = [
  "ms-canvas",
  "ms-config",
  "ms-i18n",
+ "ms-input",
  "ms-local-ai",
  "ms-log",
  "ms-memory",
@@ -4075,6 +4077,7 @@ dependencies = [
  "ms-config",
  "ms-docstore",
  "ms-i18n",
+ "ms-input",
  "ms-local-ai",
  "ms-log",
  "ms-memory",

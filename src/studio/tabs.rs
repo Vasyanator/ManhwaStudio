@@ -12,15 +12,16 @@ Key structures:
 - `Tabs`: the tab states (owned by `StudioApp`, field `tabs`); the Translation tab is its host
   `TranslationTab`, which owns the Translation canvas.
 - `TabFrame`: the borrowed frame context of one draw (project, page geometry + resident textures
-  lent by `PageResidency`, panel dock, busy snapshot, canvas status, hotkey registry).
+  lent by `PageResidency`, panel dock, busy snapshot, canvas status, the input router: its
+  frame and registry for the drawing tab, the router itself for the Settings pane).
 - `AppRequest`: every tab -> app request of one draw (page op, page open, settings deep link,
   characters / terms changed, open notes for a character).
 
 Key functions:
 - `Tabs::draw`: the per-tab draw dispatch of `StudioApp::ui`.
 - `Tabs::get` / `get_mut` / `for_each` / `for_each_mut`: the tab -> `dyn StudioTab` mapping and
-  the fan-outs in `AppTab::ALL` order; `hotkey_specs`, `dock_layout_defaults`, `hosts_panel_dock`,
-  `evict_tab_gpu_caches` are the fan-outs `studio.rs` reads, `write_exit_settings` and
+  the fan-outs in `AppTab::ALL` order; `input_declarations`, `dock_layout_defaults`,
+  `hosts_panel_dock`, `evict_tab_gpu_caches` are the fan-outs `studio.rs` reads, `write_exit_settings` and
   `flush_debounced_stores_blocking` the ones the teardown (`shutdown.rs`) calls.
 - `Tabs::view_tabs`: the borrow `ViewSync` and the per-canvas fan-outs use (the tab -> canvas
   mapping stays `view_sync::canvas_slot`).
@@ -35,7 +36,6 @@ Notes:
 use super::busy::PersistenceActivity;
 use super::view_sync::ViewTabs;
 use crate::canvas::CanvasUiStatus;
-use crate::input_manager_v2::{HotkeySpecV2, InputManagerV2};
 use crate::memory_manager::{CacheEvictionReport, CacheEvictionRequest};
 use crate::page_ops::PageOpKind;
 use crate::page_view::{PageImageInfo, PageTexture};
@@ -55,6 +55,7 @@ use crate::tabs::wiki::WikiTabState;
 use crate::widgets::panel_dock::PanelDockState;
 use crate::widgets::panel_dock::persist::LayoutDefault;
 use eframe::egui;
+use ms_input::{Declarations, InputRouter};
 use ms_studio_tab::StudioTab;
 use std::collections::HashMap;
 
@@ -92,8 +93,9 @@ pub(super) struct TabFrame<'a> {
     pub(super) activity: PersistenceActivity,
     /// The studio window's panel dock, lent to the dock hosts.
     pub(super) panel_dock: &'a mut PanelDockState,
-    /// The hotkey registry, edited by the Settings tab.
-    pub(super) hotkeys: &'a mut InputManagerV2,
+    /// The input router after this frame's `begin_frame`: the drawing tab reads its frame and
+    /// registry, the Settings tab edits its bindings (applied from the next frame).
+    pub(super) input: &'a mut InputRouter,
 }
 
 /// A tab's request to the app, returned by [`Tabs::draw`] in the order the tab raised it and
@@ -197,11 +199,13 @@ impl Tabs {
         self.for_each_mut(|tab| tab.flush_debounced_stores_blocking());
     }
 
-    /// Every tab's code-declared hotkey specs, tabs in `AppTab::ALL` order, each tab's own
-    /// registration order kept (observable within its scope; pinned by `hotkey_registry_golden`).
+    /// Every tab's input declarations merged, tabs in `AppTab::ALL` order, each tab's own
+    /// declaration order kept (pinned by `input_registry_golden`).
     #[must_use]
-    pub(super) fn hotkey_specs(&self) -> Vec<HotkeySpecV2> {
-        AppTab::ALL.into_iter().flat_map(|tab| self.get(tab).hotkey_specs()).collect()
+    pub(super) fn input_declarations(&self) -> Declarations {
+        let mut merged = Declarations::default();
+        self.for_each(|tab| merged.extend(tab.input_declarations()));
+        merged
     }
 
     /// The default-layout builder of every tab that hosts the panel dock, keyed by
@@ -237,7 +241,7 @@ impl Tabs {
     /// app, in the order raised. Never switches tabs itself and never polls the panel dock's dirty
     /// layouts (the app does both after the draw).
     pub(super) fn draw(&mut self, drawn: AppTab, ui: &mut egui::Ui, frame: TabFrame<'_>) -> Vec<AppRequest> {
-        let TabFrame { ctx, project, page_infos, textures, status, overlays_loading, activity, panel_dock, hotkeys } = frame;
+        let TabFrame { ctx, project, page_infos, textures, status, overlays_loading, activity, panel_dock, input } = frame;
         let mut requests = Vec::new();
         match drawn {
             AppTab::PageManager => {
@@ -257,7 +261,17 @@ impl Tabs {
             AppTab::Translation => {
                 // The host sets its hint rows, runs its side panel and opens its own central
                 // panel (`TranslationTab::draw`); the dock runs inside the canvas overlay hook.
-                self.translation.draw(TranslationDrawParams { ctx, ui, project, page_infos, texture_cache: textures, status, panel_dock });
+                self.translation.draw(TranslationDrawParams {
+                    ctx,
+                    ui,
+                    project,
+                    page_infos,
+                    texture_cache: textures,
+                    status,
+                    panel_dock,
+                    input: input.frame(),
+                    input_registry: input.registry(),
+                });
             }
             AppTab::Cleaning => {
                 // The Cleaning tab has no bottom-hint: its canvas `bottom_hint` stays `None`, so
@@ -272,6 +286,7 @@ impl Tabs {
                         texture_cache: textures,
                         status,
                         panel_dock,
+                        input: input.frame(),
                     });
                 });
             }
@@ -336,7 +351,7 @@ impl Tabs {
             }
             AppTab::Settings => {
                 let settings = &mut self.settings;
-                egui::CentralPanel::default().show(ui, |ui| settings.draw(ui, hotkeys));
+                egui::CentralPanel::default().show(ui, |ui| settings.draw(ui, input));
             }
             AppTab::Wiki => {
                 let wiki = &mut self.wiki;

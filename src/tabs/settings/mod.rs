@@ -38,7 +38,7 @@ use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::bubble_status::BubbleStatusCondition;
 use crate::canvas::{save_canvas_settings_to_project_file, save_canvas_settings_to_user_file};
 use crate::config;
-use crate::input_manager_v2::InputManagerV2;
+use ms_input::InputRouter;
 use crate::memory_manager::{MemoryManager, MemoryProfile};
 use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
 use crate::models::SessionCapabilities;
@@ -180,7 +180,8 @@ pub struct SettingsTabState {
     spellcheck_words_revision_seen: u64,
     ai_backend_handle: AiBackendHandle,
     dragged_bubble_condition_node: Option<DraggedBubbleConditionNode>,
-    hotkey_capture_command_id: Option<String>,
+    /// The Settings › Hotkeys pane (`hotkeys/`): search, capture chips, the override writer.
+    hotkeys: hotkeys::HotkeysPane,
     /// Editor for per-effect-kind default parameters, shown in the "Тайп" pane.
     /// Self-contained typing-panel widget (double-interface pattern like
     /// `ai_backend_panel`): the effect model stays encapsulated behind this one
@@ -307,6 +308,7 @@ impl SettingsTabState {
     pub fn from_seed(seed: SettingsTabSeed, ai_backend_handle: AiBackendHandle, memory_manager: Arc<MemoryManager>) -> Self {
         let SettingsTabSeed { user_settings_file, typing_panel_layout, font_name_display_modes, shared } = seed;
         let font_settings_file = user_settings_file.clone();
+        let hotkeys = hotkeys::HotkeysPane::new(user_settings_file.clone());
         // Seed the runtime memory profile from the shared general panel (loaded from
         // config), the same value the shared widget starts with.
         memory_manager.set_profile(shared.memory_profile());
@@ -333,7 +335,7 @@ impl SettingsTabState {
             spellcheck_words_revision_seen: current_spellcheck_words_revision(),
             ai_backend_handle,
             dragged_bubble_condition_node: None,
-            hotkey_capture_command_id: None,
+            hotkeys,
             effect_defaults_editor: crate::tabs::typing::EffectDefaultsEditorState::new(),
             font_settings_editor: typesetting::FontSettingsEditorState::new(
                 font_settings_file,
@@ -414,7 +416,9 @@ impl SettingsTabState {
         }
     }
 
-    pub fn draw(&mut self, ui: &mut egui::Ui, hotkeys_v2: &mut InputManagerV2) {
+    /// Draws the settings tab. `input` is the studio's input router: the hotkeys pane lists and
+    /// edits its bindings (an edit applies from the next frame).
+    pub fn draw(&mut self, ui: &mut egui::Ui, input: &mut InputRouter) {
         let process_running = self.ai_backend_handle.process_snapshot().running();
         ui.heading(t!("settings.nav.title"));
         ui.horizontal_wrapped(|ui| {
@@ -432,6 +436,11 @@ impl SettingsTabState {
         });
         ui.separator();
 
+        // A binding capture suppresses every input of the studio while it runs: it must never
+        // outlive the Hotkeys pane, so any other section ends it.
+        if self.active_pane != SettingsSectionId::Hotkeys {
+            self.hotkeys.cancel_capture(input);
+        }
         match self.active_pane {
             SettingsSectionId::General => self.draw_general(ui),
             SettingsSectionId::CanvasRibbon => self.draw_canvas_ribbon(ui),
@@ -455,7 +464,7 @@ impl SettingsTabState {
                         );
                     });
             }
-            SettingsSectionId::Hotkeys => self.draw_hotkeys(ui, hotkeys_v2),
+            SettingsSectionId::Hotkeys => self.draw_hotkeys(ui, input),
             #[cfg(feature = "tutorial")]
             SettingsSectionId::Tutorials => {
                 // Shared tutorials pane; no studio runtime outcome to apply.

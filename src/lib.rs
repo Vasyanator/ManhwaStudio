@@ -159,11 +159,6 @@ pub(crate) use ms_config::version_format;
 // about the project domain: `canvas` and the tabs depend on IT, never the other way round.
 pub(crate) use ms_widgets as widgets;
 pub(crate) use ms_widgets::{bubble_status, ui_fonts};
-// The configurable-hotkey registry moved into `ms-widgets` (it is an egui-input
-// primitive over `AppTab`, and the `translation` tab crate registers specs with it).
-// This re-export keeps every `crate::input_manager_v2::…` path valid in `studio.rs` and the
-// settings hotkeys pane.
-pub(crate) use ms_widgets::input_manager_v2;
 
 // The shared runtime models — the bubble model, the layer document, the clean-overlay
 // model and the text-mask model — now live in the standalone `ms-models` crate, together

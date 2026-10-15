@@ -61,9 +61,11 @@ ms-raster = { path = "../ms-raster" }
 # The detection domain: the per-engine scale/tiling plan, the runner seam, stitching, the
 # CTD/Paddle/Surya postprocess, block rules and mask normalization. This tab supplies runners.
 ms-text-detect = { path = "../ms-text-detect" }
-# Every reusable widget the panels put on screen, plus `input_util`, `bubble_status` and
-# the configurable-hotkey registry (`input_manager_v2`) this tab registers specs with.
+# Every reusable widget the panels put on screen, plus `input_util` and `bubble_status`.
 ms-widgets = { path = "../ms-widgets" }
+# The unified input model: the actions this tab declares (`input_declarations`) and the
+# per-frame `InputFrame` / registry labels its draw reads. Sits below every tab crate.
+ms-input = { path = "../ms-input" }
 # Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
 # hand-typed here. A leaf over egui, so it adds no layering constraint.
 ms-theme = { path = "../ms-theme" }

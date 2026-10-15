@@ -24,13 +24,13 @@ lifetime, reload policy, `src/shell/studio/session.rs`); `ProjectData.session` (
 carries the data facts; this module is the app half, built from those facts.
 
 Dispatch methods on `SessionMode` and their `StudioApp` call sites:
-- `has_unsaved_changes`, `tab_visible`, `hotkey_specs` (`new`, `build_input_manager_v2`),
+- `has_unsaved_changes`, `tab_visible`, `input_declarations` (`new`, `build_input_registry`),
   `capabilities` (`new`: the ONE push of `ms_models::SessionCapabilities` into the translation,
   cleaning, typing and Settings tabs, once per `StudioApp` — the kind never changes; tab crates
   read those named features and never ask `ProjectData::is_single_image`);
 - `tick` (once per frame in `ui`, before the unsaved-cache-dependent steps), `draw_top_bar`
   (right of «to launcher»), `draw_exit_dialog`, `draw_dialogs` (right after the received-images
-  confirmation), `on_save_hotkey`, `start_page_op` (Page Manager action), `before_shutdown`
+  confirmation), `run_fired_commands` (right after `InputRouter::begin_frame`), `start_page_op` (Page Manager action), `before_shutdown`
   (first step of `shutdown_blocking`);
 - project-state queries that answer "nothing" for an image set: `busy_jobs` (`studio/busy.rs`),
   `exit_cleanup_action` (`studio/incoming_open.rs`), `take_reload_request` (`take_outputs`),
@@ -46,7 +46,7 @@ Dispatch methods on `SessionMode` and their `StudioApp` call sites:
   fixtures (a temp chapter, an opened image set) and check their dispatch answers.
 - `project/`: `ProjectSession`, the project persistence state and flows. See its `MODULE_README.md`.
 - `image_set/`: `ImageSetSession` (the save controller), its pure save machine, dialogs and rules
-  (`tab_visible`, `image_window_title`, `hotkey_specs`). See its `MODULE_README.md`.
+  (`tab_visible`, `image_window_title`, `input_declarations`). See its `MODULE_README.md`.
 
 ## Contracts and invariants
 - One decision: `SessionMode::from_project` is the only constructor; the kind is read from
