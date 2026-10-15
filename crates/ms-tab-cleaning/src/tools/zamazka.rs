@@ -314,10 +314,6 @@ impl ZamazkaTool {
 }
 
 impl CleaningTool for ZamazkaTool {
-    fn tool_id(&self) -> &'static str {
-        "zamazka"
-    }
-
     fn title(&self) -> &'static str {
         t!("cleaning.tools.zamazka.title")
     }

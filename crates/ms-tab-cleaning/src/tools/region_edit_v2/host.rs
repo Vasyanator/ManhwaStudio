@@ -1165,10 +1165,6 @@ impl RegionEditHost {
 }
 
 impl CleaningTool for RegionEditHost {
-    fn tool_id(&self) -> &'static str {
-        self.spec.tool_id
-    }
-
     fn title(&self) -> &'static str {
         (self.spec.title)()
     }

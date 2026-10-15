@@ -882,10 +882,10 @@ registry to `draw`. Everything is declared in `tab/input.rs` (ids are persistenc
   was open. A finger tap deselects through `touch_layers.rs`.
 - **Hints** come from registry labels (`TypingInputLabelCache`, rebuilt on a registry revision or a
   locale change, pushed to the panel, the layer menus and the mask tab).
-- **Raw reads that remain, and why**: `input::nudge_keys_held` (TRANSITIONAL: `InputFrame` cannot
-  report "the command's key is still held", which keeps ONE keyboard move session across the OS
-  repeat delay; it reads the keys of the nudge commands' current bindings; removal: `ms-input`
-  answers "command held"); the layer gesture button level (`layer_gesture_button_down`: drag
+- **Keyboard move session**: `input::nudge_keys_held` asks `InputFrame::command_held` for the
+  nudge commands, which keeps ONE keyboard move session open across the OS repeat delay whatever
+  the nudge commands are bound to.
+- **Raw reads that remain, and why**: the layer gesture button level (`layer_gesture_button_down`: drag
   continuation / pointer settle by the button the gesture's binding named); the sticky-frame click
   (`draw_page.rs::click_in_selected_frame`) and the text-vs-raster topmost gate
   (`interact_page_rasters`) read egui's primary click — hit-testing glue that assumes

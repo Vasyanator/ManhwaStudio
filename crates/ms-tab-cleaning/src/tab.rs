@@ -56,12 +56,10 @@ FILE HEADER (tabs/cleaning/tab.rs)
   (`crate::input`); the tab publishes the canvas' and the active tool's contexts
   (`StudioTab::input_contexts`), applies the history commands and the tool's `apply_input` before
   `canvas.draw`, drives strokes from the canvas claim after it, and hands the frame to the tool's
-  `draw_overlay_ui`. Transitional canvas adapters still called (`ms-canvas` README "Input"):
-  `set_wheel_scroll_blocked` while a stroke runs and `set_zoom_blocked` while a stroke runs or
-  `view.pan` is held — stroke points are screen positions, so the page must not scroll or zoom
-  under a running stroke, and the canvas raises its capture `Area` (which would take the
-  Space-pan press) unless its zoom is blocked. Removal: when the canvas stops raising the capture
-  area under `view.pan` and offers a "gesture running" scroll lock.
+  `draw_overlay_ui`. Stroke points are screen positions, so the page must not move under a
+  running stroke: the canvas locks its zoom and wheel scrolling itself while any claim of ours
+  runs on its view, and keeps its capture `Area` down while `view.pan` is held, so Space+drag
+  pans (the stroke driver ignores claims meanwhile).
 */
 use super::autoclean::{autoclean_page, AutocleanInputError, UnevenBackgroundTool};
 use super::clean_status::{draw_clean_status, CleanFolderStatus, CleanStatusDismiss, CleanStatusView};
@@ -1009,10 +1007,6 @@ impl CleaningTabState {
         let history_changed = self.apply_history_commands(input);
         let tool_changed = self.tools.get_mut(self.active_tool_idx).is_some_and(|tool| tool.apply_input(input));
         let stroking = self.strokes.stroking();
-        // Transitional canvas adapters (see the file header): no scroll and no zoom under a running
-        // stroke, and no capture area while Space-pan is held.
-        self.canvas.set_wheel_scroll_blocked(stroking);
-        self.canvas.set_zoom_blocked(stroking || input.mode_active(view::PAN));
         let suppress_overlay_render = self
             .tools
             .get(self.active_tool_idx)

@@ -117,10 +117,6 @@ impl AotInpaintTool {
 }
 
 impl CleaningTool for AotInpaintTool {
-    fn tool_id(&self) -> &'static str {
-        "aot_inpaint"
-    }
-
     fn title(&self) -> &'static str {
         t!("cleaning.tools.aot.title")
     }

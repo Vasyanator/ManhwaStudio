@@ -4877,6 +4877,12 @@ impl TranslationTabState {
 }
 
 impl CanvasHooks for TranslationTabState {
+    /// The create-bubble command's binding (`crate::input::CREATE_BUBBLE`), from this frame's
+    /// labels; `None` while it is unbound.
+    fn page_menu_create_bubble_shortcut(&self) -> Option<String> {
+        self.input_labels().create_bubble_menu.clone()
+    }
+
     fn canvas_scrollbar_marks(&mut self, ctx: &CanvasScrollbarContext<'_>) -> Vec<ScrollMark> {
         // Per-bubble translation status painted on the canvas scrollbar:
         // red while a bubble's translation is empty, blue once it is filled.

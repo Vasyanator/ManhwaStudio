@@ -601,8 +601,8 @@ mod tests {
         assert!(layer.move_session.as_ref().is_some_and(|session| session.source == TypingLayerMoveSource::Touch));
         // A frame without a pointer button never settles a finger move (a claimed finger never
         // presses), so the gesture stays one session. (No bindings: a finger session ignores keys.)
-        let registry = ms_input::InputRegistry::new(ms_input::Declarations::default()).expect("an empty input registry is valid");
-        layer.drive_layer_move_settle(&ctx, &registry);
+        let router = ms_input::InputRouter::new(ms_input::InputRegistry::empty());
+        layer.drive_layer_move_settle(&ctx, router.frame());
         assert!(layer.move_session.is_some());
         assert!(!layer.has_pending_placement_save(), "nothing is written mid-gesture");
         drive(&mut layer, drag(origin, Pos2::new(50.0, 45.0), false, None));

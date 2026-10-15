@@ -114,9 +114,9 @@ layer — instead of solving in a plane that does not contain it.
   page. A COMPLETED selection survives that cancellation; a lasso still being drawn is discarded.
 - The core reads no key. The host turns its own cancel binding into `PatchInput { cancel }` and
   calls `on_cancel` once per frame, and passes that binding's label to `draw_ui(ui, cancel_label)`
-  for the usage hint (`tools.patch.usage_hint`, `{cancel}`). Today both hosts still read Escape
-  themselves (the Cleaning tab until input-unification WP7 declares `cleaning.patch.cancel`; the
-  PS editor, outside the migration) and label it with `ms_input::button_label`.
+  for the usage hint (`tools.patch.usage_hint`, `{cancel}`). The Cleaning host fires it from its
+  declared `cleaning.patch.cancel` command and labels it from the registry; the PS editor (outside
+  the input migration) still reads Escape itself and labels it with `ms_input::button_label`.
 - Dismissing the selection dismisses the WORK: the cancel input and the «clear selection» button both go
   through `clear_selection`, which calls `cancel_in_flight` before it drops the selection, the live
   gesture and any parked end. A surviving job would land a patch for a selection the user has

@@ -154,6 +154,13 @@ pub struct InputRegistry {
 }
 
 impl InputRegistry {
+    /// A registry with no declaration at all: every input stays inert. Infallible, unlike
+    /// [`Self::new`], so a session whose declarations failed validation still gets a registry.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self { entries: Vec::new(), index: HashMap::new(), targets: Vec::new(), exclusive_contexts: Vec::new(), revision: 0, conflicts: ConflictReport::default() }
+    }
+
     /// Validates `decls` and builds the registry with every action on its defaults.
     ///
     /// # Errors

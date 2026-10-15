@@ -12,8 +12,11 @@ Key items:
 
 Notes:
 - Zoom commands carry no `PointerOnView` condition: their focus is the view under the pointer or,
-  without one, the active tab's primary view (centre anchor), so Ctrl+= works anywhere. The axis
-  and the drag require the pointer on a view, so Ctrl+wheel over a floating panel does nothing.
+  without one, the active tab's primary view (centre anchor), so Ctrl+= works anywhere. They do
+  need `ViewFocus` (some view is published): a tab without a viewer keeps its keys. The axis and
+  the drag require the pointer on a view, so Ctrl+wheel over a floating panel does nothing. Each
+  viewer acts only on input whose focus is ITS view, so viewers drawn over each other (the
+  advanced-recognition window over its canvas) never zoom together.
 */
 
 use crate::action::{ActionId, ActionMeta, ActionSpec, AxisSpec, CommandSpec, Declarations, FixedAction, GestureSpec, ModeEffect, ModeSpec, ReleasePolicy, Scope, TargetId, TargetSpec};
@@ -52,8 +55,10 @@ fn key(key: egui::Key) -> Button {
     Button::Key(key)
 }
 
+/// A zoom command: active only while some view takes focus-less input (`Condition::ViewFocus`), so
+/// on a tab that draws no viewer its keys are left to that tab.
 fn zoom_command(id: ActionId, title_key: &'static str, defaults: Vec<Binding>) -> ActionSpec {
-    ActionSpec::Command(CommandSpec { meta: meta(id, title_key, Vec::new(), defaults), accepts: Vec::new(), repeat: false })
+    ActionSpec::Command(CommandSpec { meta: meta(id, title_key, vec![Condition::ViewFocus], defaults), accepts: Vec::new(), repeat: false })
 }
 
 /// The `view.*` declarations.
@@ -86,6 +91,8 @@ pub fn declarations() -> Declarations {
             vec![
                 Binding::command(under_zoom(vec![key(egui::Key::Equals)])),
                 Binding::command(under_zoom(vec![Button::Modifier(ModifierKey::Shift), key(egui::Key::Equals)])),
+                // The keypad `+` (and layouts with a `+` key) report `Key::Plus` as the physical key.
+                Binding::command(under_zoom(vec![key(egui::Key::Plus)])),
             ],
         ),
         zoom_command(ZOOM_OUT, "input.view.zoom_out_title", vec![Binding::command(under_zoom(vec![key(egui::Key::Minus)]))]),

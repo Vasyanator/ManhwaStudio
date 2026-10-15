@@ -200,7 +200,8 @@ impl Tabs {
     }
 
     /// Every tab's input declarations merged, tabs in `AppTab::ALL` order, each tab's own
-    /// declaration order kept (pinned by `input_registry_golden`).
+    /// declaration order kept. `input_registry_golden` checks the merged registry is valid and
+    /// conflict-free; each tab's rows are pinned by that tab crate's own golden.
     #[must_use]
     pub(super) fn input_declarations(&self) -> Declarations {
         let mut merged = Declarations::default();

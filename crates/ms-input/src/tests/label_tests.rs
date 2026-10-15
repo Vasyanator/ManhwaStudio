@@ -16,14 +16,14 @@ fn alternatives_join_with_slash_and_mode_refs_print_the_current_chord() {
     english();
     let mut registry = registry_with_view(Vec::new(), Vec::new());
     let ctrl = ctrl_name();
-    assert_eq!(registry.label(view::ZOOM_IN), format!("({ctrl} / Z)+= / ({ctrl} / Z)+Shift+="));
+    assert_eq!(registry.label(view::ZOOM_IN), format!("({ctrl} / Z)+= / ({ctrl} / Z)+Shift+= / ({ctrl} / Z)++"));
     assert_eq!(registry.label(view::ZOOM), format!("({ctrl} / Z)+Wheel / Pinch"));
     assert_eq!(registry.label(view::ZOOM_DRAG), format!("({ctrl} / Z)+LMB drag"));
     assert_eq!(registry.label(view::PAN), "Space");
     assert_eq!(registry.label(view::SCROLL_HORIZONTAL), "Shift+Wheel / Horizontal wheel");
 
     assert!(registry.set_bindings(view::ZOOM_MODIFIER, vec![Binding::mode([super::ctrl()])]).is_ok());
-    assert_eq!(registry.label(view::ZOOM_IN), format!("{ctrl}+= / {ctrl}+Shift+="), "one alternative prints inline");
+    assert_eq!(registry.label(view::ZOOM_IN), format!("{ctrl}+= / {ctrl}+Shift+= / {ctrl}++"), "one alternative prints inline");
     assert!(registry.set_bindings(view::ZOOM_MODIFIER, Vec::new()).is_ok());
     assert_eq!(registry.label(view::ZOOM_OUT), format!("(no binding)+{}", egui::Key::Minus.symbol_or_name()));
     assert!(registry.set_bindings(view::ZOOM_OUT, Vec::new()).is_ok());

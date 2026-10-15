@@ -91,8 +91,8 @@ mod tests {
         assert_eq!(layers.len(), 1);
         assert!(ms_i18n::lookup(layers[0].label_key).is_some(), "unknown key {}", layers[0].label_key);
 
+        assert_eq!(AI_API_EDITOR_SPEC.tool_id, "ai_api_editor");
         let tool = tool();
-        assert_eq!(tool.tool_id(), "ai_api_editor");
         assert!(!tool.title().is_empty());
         assert!(!tool.pytorch_required(), "the tool button must not be gated on Torch");
         assert!(!tool.input_contexts().contains(&crate::input::EDITOR_WINDOW), "D5: the frame never takes the clean-overlay undo or the canvas zoom");

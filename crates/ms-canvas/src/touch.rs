@@ -12,11 +12,10 @@ Main responsibilities:
 - publish the `TouchSurface` (scroll viewport minus the holes where egui keeps the touch:
   on-top bubbles, aside cards, scrollbars, the bottom hint) once per frame;
 - take the frame's `TouchOutput` and apply its navigation (zoom about the previous centroid,
-  then move it onto the new one; pan only while the tab blocks zoom);
-- hand the long-press selection drag to the tab: the tab declares per frame whether its
-  active mode has a selection (`set_long_press_selection`), reads this frame's drag
-  (`touch_selection`) and drives its own selection state with it (`drive_touch_drag` for
-  rectangle-drag capture modes);
+  then move it onto the new one; pan only while a claim locks the view);
+- declare the long-press selection on the surface while the input router would claim a finger's
+  long-press drag for a declared touch binding (`InputFrame::touch_selection_available`); the
+  drag itself reaches the tab as the router's claim (`InputFrame::claimed`), not through here;
 - hand this frame's finger tap point to the tab (`touch_tap`), for dismiss/commit decisions
   and layer selection (the canvas itself does nothing on a tap), and the armed long-press point
   (`touch_long_press_armed_at`) and lift (`touch_long_press_at`), so a tab can find what a
@@ -29,28 +28,23 @@ Key functions:
 - `CanvasView::touch_owner_id`
 - `CanvasView::take_touch_output_for_frame` / `apply_touch_navigation`
 - `CanvasView::publish_touch_surface` / `draw_touch_long_press_feedback`
-- `CanvasView::set_long_press_selection` / `touch_selection` / `touch_tap` /
-  `touch_long_press_armed_at` / `touch_long_press_at` / `add_touch_drag_region` /
-  `touch_region_drag`
-- `drive_touch_drag` + `TouchDrivenDrag`: the one mapping of a `TouchSelection` onto a
-  rectangle-drag capture mode (begin at the press point, follow, commit on release, drop on
-  cancel).
+- `CanvasView::touch_tap` / `touch_long_press_armed_at` / `touch_long_press_at` /
+  `add_touch_drag_region` / `touch_region_drag`
 - `context_menu_open_pos`: the one rule for "where does the page menu open this frame".
 
 Notes:
 The page context menu itself stays in `scene.rs::handle_canvas_page_interactions`; a long-press
 reaches it through `context_menu_open_pos` and the same target code as a secondary click.
 The canvas itself has no selection target: every selection drag lives in a tab crate (Translation
-OCR / crop capture areas, Typing create rectangle, Cleaning region tools). A tab whose active
-mode has one sets `long_press_selection` for the frame and maps `touch_selection` onto that mode;
-otherwise the flag stays `false` and a drag after an armed long-press pans. See `MODULE_README.md`
-"Touch gestures".
+OCR / crop rectangles, Typing create rectangle, Cleaning strokes and region tools) as a declared
+`Touch(LongPressDrag)` binding the router claims; without one a drag after an armed long-press
+pans. See `MODULE_README.md` "Touch gestures".
 */
 
 use super::{CANVAS_ZOOM_MAX, CANVAS_ZOOM_MIN, CanvasView};
 use eframe::egui;
 use egui::{Id, Pos2, Rect, Stroke};
-use ms_widgets::touch_nav::{self, TouchNavigation, TouchSelection, TouchSelectionEnd, TouchSurface};
+use ms_widgets::touch_nav::{self, TouchNavigation, TouchSelection, TouchSurface};
 
 /// Radius (screen points) of the armed long-press feedback ring: about a fingertip, so the
 /// marker stays visible around the finger that covers its center.
@@ -82,75 +76,13 @@ pub(super) fn context_menu_open_pos(
     secondary_click_pos.or_else(|| long_press_at.filter(|pos| row_rect.contains(*pos)))
 }
 
-/// An in-flight rectangle drag of a tab's capture mode that a finger can drive.
-///
-/// Implemented by the mode's drag state (start point plus current corner). A drag started by
-/// the MOUSE never reports `is_touch_driven`, so [`drive_touch_drag`] leaves it alone and the
-/// mode's pointer path keeps owning it.
-pub trait TouchDrivenDrag {
-    /// Whether this drag was started by a finger long-press ([`drive_touch_drag`]'s `begin`).
-    fn is_touch_driven(&self) -> bool;
-    /// Moves the drag's current corner to `pos` (screen points).
-    fn set_current(&mut self, pos: Pos2);
-}
-
-/// Applies this frame's long-press `selection` to a rectangle-drag capture mode's `slot` and
-/// returns the drag to COMMIT, if the finger was lifted this frame.
-///
-/// The one mapping every rectangle-drag mode shares, so the finger behaves the same in all of
-/// them:
-/// - `began` with an empty slot: `begin(origin)` builds the touch-driven drag at the press
-///   point, or refuses (`None`, e.g. the press is not on a page) — then the rest of this
-///   gesture does nothing. A slot already holding a mouse drag is never replaced.
-/// - every frame: a touch-driven drag follows the finger (`set_current(pos)`).
-/// - `end == Released`: the touch-driven drag is taken out of the slot and returned; the
-///   caller commits it exactly as its mouse release would.
-/// - `end == Cancelled`: the touch-driven drag is dropped (like Esc), nothing is committed.
-///
-/// Call it BEFORE the mode's pointer path in the frame, so a mouse drag that starts on the
-/// frame the router cancels the finger (a press interrupts a selection) is not dropped with it.
-pub fn drive_touch_drag<S: TouchDrivenDrag>(
-    slot: &mut Option<S>,
-    selection: TouchSelection,
-    begin: impl FnOnce(Pos2) -> Option<S>,
-) -> Option<S> {
-    if selection.began && slot.is_none() {
-        *slot = begin(selection.origin);
-    }
-    let drag = slot.as_mut().filter(|drag| drag.is_touch_driven())?;
-    drag.set_current(selection.pos);
-    match selection.end {
-        None => None,
-        Some(TouchSelectionEnd::Released) => slot.take(),
-        Some(TouchSelectionEnd::Cancelled) => {
-            *slot = None;
-            None
-        }
-    }
-}
-
 impl CanvasView {
-    /// Declares, for THIS frame, whether the active tab mode has a selection a finger
-    /// long-press drag drives (`TouchSurface::long_press_selection`). With `false` (the default
-    /// every frame the tab does not set it) a drag after an armed long-press pans instead.
-    ///
-    /// A one-frame flag, unlike `set_zoom_blocked`: the surface publication at the end of
-    /// `draw` resets it, so a tab that stops setting it can never leave a stale `true`. Call it
-    /// before `draw`, or from a hook that runs inside `draw` with `&mut CanvasView`. The router
-    /// copies the flag when a finger is claimed and re-reads it from every later publication
-    /// until that finger's drag starts, so the flag of frame N decides a drag that starts in
-    /// frame N + 1 (see [`Self::touch_long_press_armed_at`]).
-    pub fn set_long_press_selection(&mut self, enabled: bool) {
-        self.scene.long_press_selection = enabled;
-    }
-
     /// Adds, for THIS frame, a drag region of the touch surface (`TouchSurface::drag_regions`):
     /// a closed outline (screen points, even-odd rule) of an object a lone finger drags right
     /// away, without a long-press. Its drag arrives as [`Self::touch_region_drag`] — never as a
-    /// pan or a [`Self::touch_selection`] — and a touch there still taps and long-presses.
+    /// pan or a long-press selection — and a touch there still taps and long-presses.
     ///
-    /// One-frame, like [`Self::set_long_press_selection`]: the publication at the end of `draw`
-    /// drains the list. Call it before `draw` or from a hook inside `draw` with `&mut
+    /// One-frame: the publication at the end of `draw` drains the list. Call it before `draw` or from a hook inside `draw` with `&mut
     /// CanvasView`; the router tests a finger against the regions of the frame before its claim.
     pub fn add_touch_drag_region(&mut self, outline: Vec<Pos2>) {
         self.scene.touch_drag_regions.push(outline);
@@ -164,22 +96,10 @@ impl CanvasView {
         self.scene.touch_region_drag
     }
 
-    /// This frame's long-press selection drag on this canvas, if a finger is performing one.
-    ///
-    /// Valid from `draw`'s input step on (hooks inside `draw` and code after it read the
-    /// current frame); reported on every frame while the drag lasts, with `began` on its first
-    /// frame and `end` on its last. Only reported while the tab declared a selection
-    /// ([`CanvasView::set_long_press_selection`]) when the finger was claimed.
-    #[must_use]
-    pub fn touch_selection(&self) -> Option<TouchSelection> {
-        self.scene.touch_selection
-    }
-
     /// This frame's finger tap on this canvas (the press point, screen points), if any.
     ///
     /// A tap is a lone finger lifted within the click distance before its long-press armed
-    /// (`TouchOutput::tap_at`). Valid from `draw`'s input step on, like [`Self::touch_selection`],
-    /// and reported on the lift frame only. The canvas acts on no tap. A tab may use it only for
+    /// (`TouchOutput::tap_at`). Valid from `draw`'s input step on, and reported on the lift frame only. The canvas acts on no tap. A tab may use it only for
     /// what a mouse click OUTSIDE something does (dismiss / commit, e.g. the typing create editor)
     /// and for selecting / deselecting its own layers (the typing text layers); never to place or
     /// paint — every other bare-canvas click action stays mouse-only.
@@ -192,11 +112,6 @@ impl CanvasView {
     /// finger is still down and has not moved beyond the click distance (`TouchOutput::
     /// long_press_armed_at`). Reported on every frame while armed, from `draw`'s input step on.
     ///
-    /// A tab that wants the drag of this press to be a selection only when it started on one of
-    /// its objects decides here and calls [`Self::set_long_press_selection`] in the SAME frame
-    /// (from a hook inside `draw` with `&mut CanvasView`): the router re-reads the flag from
-    /// every publication until the drag starts, and no drag can start before the frame after the
-    /// one that reported the arm.
     #[must_use]
     pub fn touch_long_press_armed_at(&self) -> Option<Pos2> {
         self.scene.touch_long_press_armed_at
@@ -227,7 +142,6 @@ impl CanvasView {
         let output = touch_nav::take_touch_output(ctx, self.touch_owner_id());
         self.scene.touch_long_press_at = output.long_press_at;
         self.scene.touch_long_press_armed_at = output.long_press_armed_at;
-        self.scene.touch_selection = output.selection;
         self.scene.touch_region_drag = output.region_drag;
         self.scene.touch_tap_at = output.tap_at;
         if let Some(navigation) = output.navigation
@@ -239,8 +153,8 @@ impl CanvasView {
 
     /// Applies one frame of finger navigation; returns whether the view will move.
     ///
-    /// Zoom is multiplied by `zoom_factor` (clamped to the canvas zoom range) unless the active
-    /// tab blocks zoom, in which case only the pan applies. The anchor is captured at the OLD
+    /// Zoom is multiplied by `zoom_factor` (clamped to the canvas zoom range) unless a claim locks
+    /// the view (`view_locked_by_claim`), in which case only the pan applies. The anchor is captured at the OLD
     /// zoom, then the zoom changes, so the scene pass places the world point that was under
     /// `prev_centroid` under `centroid`. A zoom or view request already recorded this frame (a
     /// Ctrl+wheel or keyboard zoom, a public zoom setter) wins: its anchor was captured against
@@ -255,7 +169,7 @@ impl CanvasView {
             return false;
         }
         let old_zoom = self.state.zoom;
-        let new_zoom = if self.scene.zoom_blocked {
+        let new_zoom = if self.scene.view_locked_by_claim {
             old_zoom
         } else {
             (old_zoom * navigation.zoom_factor).clamp(CANVAS_ZOOM_MIN, CANVAS_ZOOM_MAX)
@@ -288,12 +202,11 @@ impl CanvasView {
     }
 
     /// Builds this frame's touch surface (`None` before the first scene pass) and consumes the
-    /// one-frame `long_press_selection` flag and drag regions whether or not a surface results.
-    /// A long-press drag also selects while the input router would claim it for a declared touch
-    /// binding (`InputFrame::touch_selection_available`, P8).
+    /// one-frame drag regions whether or not a surface results. A long-press drag selects while
+    /// the input router would claim it for a declared touch binding
+    /// (`InputFrame::touch_selection_available`, P8).
     fn take_touch_surface(&mut self) -> Option<TouchSurface> {
-        let declared_selection = self.input_frame.as_ref().is_some_and(|frame| frame.touch_selection_available(self.view_id()));
-        let long_press_selection = std::mem::take(&mut self.scene.long_press_selection) || declared_selection;
+        let long_press_selection = self.input_frame.as_ref().is_some_and(|frame| frame.touch_selection_available(self.view_id()));
         let drag_regions = std::mem::take(&mut self.scene.touch_drag_regions);
         let rect = self.scene.scroll_inner_rect?;
         Some(TouchSurface {
@@ -452,10 +365,10 @@ mod tests {
     }
 
     #[test]
-    fn zoom_blocked_turns_a_pinch_into_a_pan() {
+    fn a_claim_locked_view_turns_a_pinch_into_a_pan() {
         let start = vec2(12000.0, 1200.0);
         let mut view = view_with(2.5, start, viewport());
-        view.scene.zoom_blocked = true;
+        view.scene.view_locked_by_claim = true;
         let prev = pos2(500.0, 400.0);
         let d = vec2(-10.0, 25.0);
         assert!(view.apply_touch_navigation(navigation(prev, prev + d, 1.5), viewport()));
@@ -526,97 +439,6 @@ mod tests {
         assert_eq!(a.touch_owner_id(), b.touch_owner_id());
         a.set_scroll_area_id_salt("typing_canvas_scroll");
         assert_ne!(a.touch_owner_id(), b.touch_owner_id());
-    }
-
-    /// A rectangle drag of a capture mode, as the tab crates model theirs.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    struct Drag {
-        start: Pos2,
-        current: Pos2,
-        touch: bool,
-    }
-
-    impl TouchDrivenDrag for Drag {
-        fn is_touch_driven(&self) -> bool {
-            self.touch
-        }
-
-        fn set_current(&mut self, pos: Pos2) {
-            self.current = pos;
-        }
-    }
-
-    fn sel(origin: Pos2, pos: Pos2, began: bool, end: Option<TouchSelectionEnd>) -> TouchSelection {
-        TouchSelection { origin, pos, began, end }
-    }
-
-    fn touch_drag_at(origin: Pos2) -> Option<Drag> {
-        Some(Drag { start: origin, current: origin, touch: true })
-    }
-
-    #[test]
-    fn a_touch_drag_begins_at_the_press_point_follows_and_commits_on_release() {
-        let origin = pos2(10.0, 20.0);
-        let mut slot = None;
-        assert_eq!(drive_touch_drag(&mut slot, sel(origin, pos2(30.0, 40.0), true, None), touch_drag_at), None);
-        assert_eq!(slot, Some(Drag { start: origin, current: pos2(30.0, 40.0), touch: true }));
-        assert_eq!(drive_touch_drag(&mut slot, sel(origin, pos2(50.0, 60.0), false, None), touch_drag_at), None);
-        let committed = drive_touch_drag(&mut slot, sel(origin, pos2(70.0, 80.0), false, Some(TouchSelectionEnd::Released)), touch_drag_at);
-        assert_eq!(committed, Some(Drag { start: origin, current: pos2(70.0, 80.0), touch: true }));
-        assert_eq!(slot, None);
-    }
-
-    #[test]
-    fn a_whole_drag_within_one_frame_begins_and_commits() {
-        let mut slot = None;
-        let committed = drive_touch_drag(&mut slot, sel(pos2(1.0, 1.0), pos2(9.0, 9.0), true, Some(TouchSelectionEnd::Released)), touch_drag_at);
-        assert_eq!(committed.map(|drag| (drag.start, drag.current)), Some((pos2(1.0, 1.0), pos2(9.0, 9.0))));
-        assert_eq!(slot, None);
-    }
-
-    #[test]
-    fn a_cancelled_touch_drag_is_dropped_without_a_commit() {
-        let origin = pos2(10.0, 20.0);
-        let mut slot = None;
-        assert_eq!(drive_touch_drag(&mut slot, sel(origin, origin, true, None), touch_drag_at), None);
-        assert!(slot.is_some());
-        assert_eq!(drive_touch_drag(&mut slot, sel(origin, pos2(5.0, 5.0), false, Some(TouchSelectionEnd::Cancelled)), touch_drag_at), None);
-        assert_eq!(slot, None);
-    }
-
-    #[test]
-    fn a_refused_begin_ignores_the_rest_of_the_gesture() {
-        let mut slot: Option<Drag> = None;
-        assert_eq!(drive_touch_drag(&mut slot, sel(pos2(1.0, 1.0), pos2(2.0, 2.0), true, None), |_| None), None);
-        assert_eq!(slot, None);
-        assert_eq!(drive_touch_drag(&mut slot, sel(pos2(1.0, 1.0), pos2(3.0, 3.0), false, Some(TouchSelectionEnd::Released)), touch_drag_at), None);
-        assert_eq!(slot, None);
-    }
-
-    #[test]
-    fn a_mouse_drag_in_the_slot_is_never_touched() {
-        let mouse = Drag { start: pos2(0.0, 0.0), current: pos2(4.0, 4.0), touch: false };
-        let mut slot = Some(mouse);
-        let begun = drive_touch_drag(&mut slot, sel(pos2(50.0, 50.0), pos2(60.0, 60.0), true, None), touch_drag_at);
-        assert_eq!(begun, None);
-        assert_eq!(slot, Some(mouse), "a finger never replaces or moves a mouse drag");
-        for end in [TouchSelectionEnd::Released, TouchSelectionEnd::Cancelled] {
-            assert_eq!(drive_touch_drag(&mut slot, sel(pos2(50.0, 50.0), pos2(70.0, 70.0), false, Some(end)), touch_drag_at), None);
-            assert_eq!(slot, Some(mouse), "{end:?} of a finger must not end a mouse drag");
-        }
-    }
-
-    #[test]
-    fn long_press_selection_is_a_one_frame_flag() {
-        let mut view = view_with(1.0, Vec2::ZERO, viewport());
-        view.set_long_press_selection(true);
-        assert_eq!(view.take_touch_surface().map(|surface| surface.long_press_selection), Some(true));
-        assert_eq!(view.take_touch_surface().map(|surface| surface.long_press_selection), Some(false), "a frame without the setter publishes false");
-        // Consumed even when no surface can be built yet.
-        let mut unlaid = CanvasView::default();
-        unlaid.set_long_press_selection(true);
-        assert_eq!(unlaid.take_touch_surface(), None);
-        assert!(!unlaid.scene.long_press_selection);
     }
 
     #[test]

@@ -1208,7 +1208,7 @@ impl TypingTabState {
         // observe the release only on the next frame — delaying the write by a frame and stranding
         // it entirely when the release frame is the last one drawn. Settling here also lets the
         // `mark_placement_save_dirty` it performs seed the debounce window on the same frame.
-        self.text_overlays.drive_layer_move_settle(ctx, input_registry);
+        self.text_overlays.drive_layer_move_settle(ctx, input);
         self.text_overlays.drive_placement_save_debounce(ctx);
 
         if needs_repaint || self.text_overlays.wants_repaint() || self.mask_layer.is_panel_open() {

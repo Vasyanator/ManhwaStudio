@@ -35,16 +35,17 @@ crate; `ms-widgets` re-exports `touch` as `touch_nav` until its importers are re
 - `src/binding.rs`: alternatives per kind (`Binding`), `Chord` (mode refs + buttons),
   `ButtonChord`, `BindingError`, `resolve_chord`.
 - `src/context.rs`: `ContextId`, `Condition`, `ActiveSet`, `may_be_co_active`.
-- `src/registry.rs`: `InputRegistry` (`new`, `apply_overrides`, `set_bindings`, `reset`,
-  queries), `OverrideEntry`, `DeclarationError`, `OverrideWarning`.
+- `src/registry.rs`: `InputRegistry` (`new`, `empty` — the infallible inert registry of a session
+  whose declarations failed —, `apply_overrides`, `set_bindings`, `reset`, queries), `OverrideEntry`, `DeclarationError`, `OverrideWarning`.
 - `src/matching.rs`: `MatchState::step` and the mode / gesture / axis queries.
 - `src/conflicts.rs`: `compute` -> `ConflictReport` (`Conflict`, `Shadow`).
 - `src/label.rs`: `label`, `alternative_label`, `chord_label`, `param_group_label`,
   `conflict_text`, `shadow_text`, `button_label`.
 - `src/persist.rs`: format-2 codec, `load_overrides` (+ v1 migration), `write_override`,
   `write_migrated_section`.
-- `src/view.rs`: the shared `view.*` set (zoom modifier / pan modes, zoom commands, zoom axis,
-  zoom drag on `view.surface`, fixed scroll rows).
+- `src/view.rs`: the shared `view.*` set (zoom modifier / pan modes, zoom commands — `=`,
+  `Shift+=` and the keypad `+` for zoom-in, all under `ViewFocus` —, zoom axis, zoom drag on
+  `view.surface`, fixed scroll rows).
 - `src/router.rs`: `InputRouter` — `begin_frame` (events -> matcher -> `InputFrame`, key / wheel
   consumption, claims, axes, focus loss) and the capture entry points.
 - `src/frame.rs`: `FrameEnv`, `ViewId`, `ViewSurface` + `publish_view_surface`, `InputFrame` and
@@ -111,8 +112,9 @@ crate; `ms-widgets` re-exports `touch` as `touch_nav` until its importers are re
 ## Runtime (router, frame, capture)
 - **Frame order**: the studio calls `InputRouter::begin_frame(ctx, &FrameEnv)` ONCE per frame,
   before any tab draws and before anything reads keys, the wheel or drags; every consumer then
-  reads the returned `InputFrame` (`fired`, `mode_active`, `axis` / `axis_for_view`, `claimed`,
-  `canvas_wide_armed`, `gesture_for`, `touch_selection_available`). There is no end-of-frame
+  reads the returned `InputFrame` (`fired`, `command_held`, `mode_active`, `axis` /
+  `axis_samples` / `axis_for_view` / `axis_samples_for_view`, `claimed`, `canvas_wide_armed`,
+  `gesture_for`, `touch_selection_available`). There is no end-of-frame
   call: publications are frozen by the next `begin_frame`. A rerun pass of egui's multi-pass
   (`request_discard`) calls it again with no events; it then behaves like a new frame (claims
   report `Active`, the first pass's publications are the frozen surfaces).
@@ -139,14 +141,19 @@ crate; `ms-widgets` re-exports `touch` as `touch_nav` until its importers are re
 - **View surfaces** (one-frame lag, like `touch/`): viewers call `publish_view_surface` while
   drawing; the next `begin_frame` freezes them. "Pointer on view" = inside the rect, outside its
   holes, and `Context::layer_id_at` is the background layer, `None` or the surface's
-  `capture_layer` — dock panels, popups, menus and windows occlude. Overlapping surfaces: among
+  `capture_layer` — dock panels, popups, menus and windows occlude. `Condition::ViewFocus` holds
+  while some view takes focus-less input (pointer on a view, or a `primary` surface published):
+  the zoom commands need it, so a tab that draws no viewer keeps their keys. Overlapping surfaces: among
   those passing that rule, the one whose `capture_layer` is the top layer wins, else the one
   published LATER in the frame. Focus of commands and axes =
   the view under the pointer at the pointer, else the first `primary` view at its centre (P7).
-- **Claims** (P2): a canvas-wide gesture is a `Drag` binding on a `canvas_wide` target. It is
-  ARMED (`canvas_wide_armed`) while the pointer is on the view and a press would match; the viewer
-  then raises its capture `Area`. A pointer press inside last frame's surface that matches becomes
-  CLAIMED: `Started` (press frame), `Active`, `Finished(Commit)` on the button release,
+- **Claims** (P2): a canvas-wide gesture is a `Drag` or `Click` binding on a `canvas_wide`
+  target (`ClaimedGesture::kind`; a `Drag` wins when both match the press). A `Click` is a press
+  action: claimed and acted on at the press (`Started`), never waiting to see whether the pointer
+  moves. It is ARMED (`canvas_wide_armed`) while the pointer is on the view and a press would
+  match; the viewer then raises its capture `Area`. Only a press starts a claim: an input that did
+  not match at its press is never claimed later, even if its condition starts to hold while the
+  button stays down. A pointer press inside last frame's surface that matches becomes CLAIMED: `Started` (press frame), `Active`, `Finished(Commit)` on the button release,
   `Finished(policy)` when a mode referenced by the WINNING alternative (`GestureMatch::modes`) is
   released mid-gesture
   (`ModeSpec::on_release_mid_gesture`, Cancel wins), `Finished(Cancel)` on focus loss or
@@ -160,7 +167,11 @@ crate; `ms-widgets` re-exports `touch` as `touch_nav` until its importers are re
   `Touch(LongPressDrag)` `Drag` binding with it (`Finished` per the selection's end; a claim whose
   owner got no selection this frame is cancelled). `touch_selection_available(view)` feeds
   `TouchSurface::long_press_selection`.
-- **Axis values** (`AxisSample`): wheel `delta` in notches (Line / Page value, Point value / 40)
+- **Command held**: `InputFrame::command_held(id)` is true while the button that fired `id` stays
+  down (the matcher's fired-by record: auto-repeats keep it, release / focus loss end it).
+- **Axis values** (`AxisSample`, one per axis AND source per frame — `source` decides the unit, so
+  a frame feeding one axis from the wheel and a pinch reports two samples; `axis` returns the
+  first, consumers of several sources iterate `axis_samples`): wheel `delta` in notches (Line / Page value, Point value / 40)
   times sensitivity, sign as egui (inverted when the binding says so); `steps` = ±1 per Line /
   Page event, a persistent 40-pt accumulator for Point events (`WHEEL_NOTCH_PT`); pinch `delta` =
   ln(zoom factor); drag `delta` in points.

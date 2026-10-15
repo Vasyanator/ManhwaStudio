@@ -11,7 +11,7 @@ Key structures:
   (`detector.mask_edit`, `brush.active`, ...).
 - `Condition`: one activation condition of an action.
 - `ActiveSet`: what is true this frame (active tab, published contexts, text edit focus, popup,
-  pointer over a view).
+  pointer over a view, a view taking focus-less input).
 
 Key functions:
 - `ActiveSet::meta_active`: scope + conditions of one action.
@@ -41,6 +41,10 @@ pub enum Condition {
     /// The pointer is over a published view surface (not over a dock panel, popup, menu or a
     /// hole the view declared).
     PointerOnView,
+    /// Some view takes focus-less input: the pointer is on a view, or a `primary` view surface is
+    /// published (the zoom commands' focus rule). False on a tab that draws no viewer (PS editor,
+    /// page manager, settings), so its keys are never consumed for a view nobody draws.
+    ViewFocus,
     /// The context is published this frame.
     Context(ContextId),
     /// The context is NOT published this frame.
@@ -48,6 +52,7 @@ pub enum Condition {
 }
 
 /// What holds this frame, as far as action activity is concerned.
+#[expect(clippy::struct_excessive_bools, reason = "independent per-frame facts, each tested on its own by one `Condition` variant (or the matcher's text-edit / popup rules); not a state machine")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ActiveSet {
     pub active_tab: Option<AppTab>,
@@ -58,6 +63,8 @@ pub struct ActiveSet {
     /// A popup is open: commands never fire (popup bodies consume Enter / Esc / arrows).
     pub popup_open: bool,
     pub pointer_on_view: bool,
+    /// A view takes focus-less input this frame ([`Condition::ViewFocus`]).
+    pub view_focus: bool,
 }
 
 impl ActiveSet {
@@ -67,6 +74,7 @@ impl ActiveSet {
         match condition {
             Condition::NoPopup => !self.popup_open,
             Condition::PointerOnView => self.pointer_on_view,
+            Condition::ViewFocus => self.view_focus,
             Condition::Context(id) => self.contexts.contains(id),
             Condition::NotContext(id) => !self.contexts.contains(id),
         }
@@ -102,7 +110,7 @@ pub fn may_be_co_active(a: &ActionMeta, b: &ActionMeta, exclusive: &[Vec<Context
             .iter()
             .filter_map(|condition| match condition {
                 Condition::Context(id) => Some(*id),
-                Condition::NotContext(_) | Condition::NoPopup | Condition::PointerOnView => None,
+                Condition::NotContext(_) | Condition::NoPopup | Condition::PointerOnView | Condition::ViewFocus => None,
             })
             .collect()
     };
@@ -111,7 +119,7 @@ pub fn may_be_co_active(a: &ActionMeta, b: &ActionMeta, exclusive: &[Vec<Context
             .iter()
             .filter_map(|condition| match condition {
                 Condition::NotContext(id) => Some(*id),
-                Condition::Context(_) | Condition::NoPopup | Condition::PointerOnView => None,
+                Condition::Context(_) | Condition::NoPopup | Condition::PointerOnView | Condition::ViewFocus => None,
             })
             .collect()
     };

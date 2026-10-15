@@ -27,13 +27,20 @@ Rules (they keep the old dispatch's behaviour):
 - a press action (`PICK_COLOR`, `STAMP_SET_ANCHOR`) fires once at the claim's `Started` frame;
 - while BLOCKED (Space-pan held, or a mouse pointer that left the canvas view for a dock panel or
   a floating window) no stroke starts, and a running one ends;
-- the claim's release commits (`End`), a cancelled claim (focus loss, a second finger) cancels.
+- the claim's release commits (`End`), a cancelled claim (focus loss, a second finger) cancels;
+- a claim that VANISHES without a `Finished` frame the driver saw (the tab was not drawn on that
+  frame, input became suppressed between frames) ends by the action's vanish policy
+  (`vanish_event`): a PAINT stroke (`STROKE`) commits — what the user painted stays, as the old
+  dispatch did — while a selection (`REGION_SELECT_RECT*`, `PATCH_DRAG`) cancels, so no region
+  load and no patch runs from a half gesture. The same policy ends a stroke left running when a
+  new claim starts. The router always reports a claim's end; it carries no other termination
+  reason, so the policy lives here.
 */
 
 use eframe::egui::Pos2;
 use ms_input::{ActionId, Button, GesturePhase, InputFrame, ReleasePolicy, ViewId};
 
-use crate::input::{PRESS_ACTIONS, STROKE_ACTIONS, StrokeModes};
+use crate::input::{PRESS_ACTIONS, STROKE, STROKE_ACTIONS, StrokeModes};
 use crate::tools::StrokePoint;
 
 /// The claim the driver acts on this frame.
@@ -91,8 +98,8 @@ enum DriverState {
     Idle,
     /// A stroke claim runs but has not reached a page yet.
     Pending,
-    /// A stroke runs; `last` is its last delivered point.
-    Stroking { last: StrokePoint, touch: bool },
+    /// A stroke of `action` runs; `last` is its last delivered point.
+    Stroking { action: ActionId, last: StrokePoint, touch: bool },
     /// The rest of the running claim does nothing (refused, blocked, a press action, aborted).
     Ignoring,
 }
@@ -123,7 +130,7 @@ impl StrokeDriver {
     #[must_use]
     pub(crate) fn touch_point(&self) -> Option<StrokePoint> {
         match self.state {
-            DriverState::Stroking { last, touch: true } => Some(last),
+            DriverState::Stroking { last, touch: true, .. } => Some(last),
             DriverState::Stroking { touch: false, .. } | DriverState::Idle | DriverState::Pending | DriverState::Ignoring => None,
         }
     }
@@ -154,10 +161,9 @@ impl StrokeDriver {
     ) -> Vec<StrokeEvent> {
         let mut out = Vec::new();
         let Some(claim) = claim else {
-            // The claim vanished without a finish (suppressed input, a modal prompt): commit
-            // what was drawn, as a release would.
-            if self.stroking() {
-                out.push(StrokeEvent::End);
+            // The claim vanished without a finish the driver saw: end by the action's policy.
+            if let DriverState::Stroking { action, .. } = self.state {
+                out.push(vanish_event(action));
             }
             self.state = DriverState::Idle;
             return out;
@@ -175,9 +181,10 @@ impl StrokeDriver {
                 return out;
             }
             GesturePhase::Started => {
-                // A new press: a stroke left over from a claim whose end was never seen ends first.
-                if self.stroking() {
-                    out.push(StrokeEvent::End);
+                // A new press: a stroke left over from a claim whose end was never seen ends first,
+                // by its vanish policy.
+                if let DriverState::Stroking { action, .. } = self.state {
+                    out.push(vanish_event(action));
                 }
                 if blocked {
                     self.state = DriverState::Ignoring;
@@ -205,13 +212,13 @@ impl StrokeDriver {
                     let point = point_at(page_idx);
                     if wants(point) {
                         out.push(StrokeEvent::Begin(point));
-                        self.state = DriverState::Stroking { last: point, touch: claim.touch };
+                        self.state = DriverState::Stroking { action: claim.action, last: point, touch: claim.touch };
                     } else {
                         self.state = DriverState::Ignoring;
                     }
                 }
             }
-            DriverState::Stroking { last, touch } => {
+            DriverState::Stroking { action, last, touch } => {
                 if blocked {
                     out.push(StrokeEvent::End);
                     self.state = DriverState::Ignoring;
@@ -220,7 +227,7 @@ impl StrokeDriver {
                 {
                     let point = point_at(page_idx);
                     out.push(if page_idx == last.page_idx { StrokeEvent::Update { from: last, to: point } } else { StrokeEvent::Seam(point) });
-                    self.state = DriverState::Stroking { last: point, touch };
+                    self.state = DriverState::Stroking { action, last: point, touch };
                 }
             }
         }
@@ -228,10 +235,17 @@ impl StrokeDriver {
     }
 }
 
+/// How a stroke of `action` ends when its claim vanishes without a seen `Finished` (see the file
+/// header): a paint stroke commits, a selection cancels.
+#[must_use]
+fn vanish_event(action: ActionId) -> StrokeEvent {
+    if action == STROKE { StrokeEvent::End } else { StrokeEvent::Cancel }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{PICK_COLOR, STROKE};
+    use crate::input::{PATCH_DRAG, PICK_COLOR, REGION_SELECT_RECT};
     use eframe::egui::pos2;
 
     /// Two pages stacked: page 0 is y < 100, page 1 is 100 <= y < 200; nothing below.
@@ -317,12 +331,38 @@ mod tests {
     }
 
     #[test]
-    fn a_cancelled_claim_cancels_and_a_vanished_one_commits() {
+    fn a_cancelled_claim_cancels() {
         let mut driver = StrokeDriver::default();
         step(&mut driver, sample(STROKE, GesturePhase::Started, pos2(10.0, 10.0)), false);
         assert_eq!(kinds(&step(&mut driver, sample(STROKE, GesturePhase::Finished(ReleasePolicy::Cancel), pos2(10.0, 10.0)), false)), ["cancel"]);
+    }
+
+    /// A paint stroke whose claim vanishes mid-stroke is committed exactly once: later frames
+    /// without a claim, and the next press, add no second end.
+    #[test]
+    fn a_vanished_paint_stroke_commits_once() {
+        let mut driver = StrokeDriver::default();
         step(&mut driver, sample(STROKE, GesturePhase::Started, pos2(10.0, 10.0)), false);
+        step(&mut driver, sample(STROKE, GesturePhase::Active, pos2(20.0, 10.0)), false);
         assert_eq!(kinds(&step(&mut driver, None, false)), ["end"]);
+        assert!(step(&mut driver, None, false).is_empty(), "no second commit");
+        assert_eq!(kinds(&step(&mut driver, sample(STROKE, GesturePhase::Started, pos2(30.0, 10.0)), false)), ["begin"], "the next press starts clean");
+    }
+
+    /// A region or patch selection whose claim vanishes mid-gesture is cancelled (no region load,
+    /// no patch commit from a half gesture), also when a new press replaces it.
+    #[test]
+    fn a_vanished_selection_cancels() {
+        for action in [REGION_SELECT_RECT, PATCH_DRAG] {
+            let mut driver = StrokeDriver::default();
+            step(&mut driver, sample(action, GesturePhase::Started, pos2(10.0, 10.0)), false);
+            step(&mut driver, sample(action, GesturePhase::Active, pos2(40.0, 30.0)), false);
+            assert_eq!(kinds(&step(&mut driver, None, false)), ["cancel"], "{action:?}");
+            assert!(step(&mut driver, None, false).is_empty(), "{action:?}: nothing more");
+
+            step(&mut driver, sample(action, GesturePhase::Started, pos2(10.0, 10.0)), false);
+            assert_eq!(kinds(&step(&mut driver, sample(action, GesturePhase::Started, pos2(60.0, 10.0)), false)), ["cancel", "begin"], "{action:?}: an unseen end before a new press");
+        }
     }
 
     #[test]

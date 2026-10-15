@@ -91,7 +91,7 @@ pub struct CommandBinding {
 }
 
 /// The continuous source of an axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AxisSource {
     WheelY,
     WheelX,

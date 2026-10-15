@@ -334,7 +334,8 @@ tab draws; `CleaningDrawParams::{input, input_registry}` carry the frame and the
   `cleaning.erase_mode` (Shift; not in a region selection state), `cleaning.rect_mode` (Ctrl, brush
   tools), `cleaning.select_mode` (Shift, region tools), `cleaning.stamp.rotate_mode` (R); canvas-wide
   gestures on `view.surface` — `cleaning.stroke` (LMB drag; accepts erase latest, rect at the
-  press), `cleaning.pick_color` / `cleaning.stamp.set_anchor` (RMB, acted on at the press),
+  press), `cleaning.pick_color` / `cleaning.stamp.set_anchor` (RMB click: a canvas-wide `Click`
+  claimed and acted on at the press),
   `cleaning.region.select_rect` ([select_mode]+LMB drag | finger long-press drag),
   `…select_rect_armed` (LMB drag while a selection is expected), `cleaning.patch.drag`; axes
   `cleaning.stamp.rotate` / `rotate_coarse` (R+wheel / Shift+R+wheel, over the canvas); commands
@@ -344,7 +345,8 @@ tab draws; `CleaningDrawParams::{input, input_registry}` carry the frame and the
   `cleaning.frame.undo_stroke` (Ctrl+Z, shadows the clean undo while the frame is up). Window
   scope — `cleaning.editor.{paint,erase}` on a legacy editor window's preview. Brush size is the
   shared `brush.*` set of `ms_tools::mask_brush` (one owner: `MaskBrush::apply_input`).
-- **Contexts** (`StudioTab::input_contexts`): the canvas's, then the active tool's
+- **Contexts** (`StudioTab::input_contexts`): the canvas's (none: it edits no bubbles), then the
+  active tool's
   (`CleaningTool::input_contexts`): `cleaning.tool.brush` + `cleaning.tool.zamazka` /
   `cleaning.tool.stamp`, `cleaning.tool.patch`, `cleaning.region.select` (+ `cleaning.region.armed`),
   `cleaning.region_frame`, `cleaning.editor_window`, and `brush.active` while a brush takes the size
@@ -360,10 +362,13 @@ tab draws; `CleaningDrawParams::{input, input_registry}` carry the frame and the
   a canvas scrollbar.
 - **Hints** name the current bindings (`CleaningLabels`, pushed to the active tool every frame
   through `CleaningTool::set_input_labels`); no locale string of this crate spells a binding.
-- **Canvas adapters still called** (`tab.rs`): `set_wheel_scroll_blocked` while a stroke runs and
-  `set_zoom_blocked` while a stroke runs or `view.pan` is held (stroke points are screen
-  positions; the canvas would raise its capture `Area` over a Space-pan press). Removal: when the
-  canvas stops raising the capture area under `view.pan` and offers a gesture-running scroll lock.
+- **No canvas adapters**: stroke points are screen positions, and the canvas itself locks its zoom
+  and wheel scrolling while any claim of ours runs on its view and keeps its capture `Area` down
+  while `view.pan` is held (Space+drag pans; the stroke driver ignores claims meanwhile). The
+  canvas scrollbars are view-surface holes, so they stay draggable with a brush tool active.
+- **A claim that vanishes** without a `Finished` frame the driver saw (`canvas_input.rs`): a paint
+  stroke (`cleaning.stroke`) is committed once; a region or patch selection is cancelled (no
+  region load, no patch from a half gesture).
 - **Widget-owned, not bindings**: text editing in the prompts, the «Сравнить» press-and-hold
   button of the frame, the `ViewportColorSelector` eyedropper (`ms-widgets` cannot see `ms-input`;
   its LMB-sample / RMB-or-Esc-cancel stays inside the widget), slider wheels.

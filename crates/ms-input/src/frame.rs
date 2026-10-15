@@ -34,7 +34,7 @@ use egui::{Context, Id, LayerId, PointerButton, Pos2, Rect, Response};
 use ms_config::app_tab::AppTab;
 
 use crate::action::{ActionId, ReleasePolicy, TargetId};
-use crate::binding::GestureKind;
+use crate::binding::{AxisSource, GestureKind};
 use crate::button::{Button, MouseButton};
 use crate::context::{ActiveSet, ContextId};
 use crate::matching::MatchState;
@@ -130,7 +130,8 @@ pub struct Fired {
     pub focus: Option<ViewFocus>,
 }
 
-/// One frame of an axis.
+/// One frame of an axis from ONE source (`source`): an axis fed by several sources in one frame
+/// (wheel and pinch, both wheel axes) reports one sample per source, because their units differ.
 ///
 /// Wheel sources: `delta` is in NOTCHES (a `Line` / `Page` event counts its value, a `Point`
 /// event its value / 40), sign as egui's wheel delta (positive = wheel turned away from the
@@ -142,6 +143,8 @@ pub struct Fired {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AxisSample {
     pub action: ActionId,
+    /// The input source this sample accumulates (decides the unit of `delta`).
+    pub source: AxisSource,
     pub delta: f32,
     pub steps: i32,
     pub focus: Option<ViewFocus>,
@@ -159,9 +162,10 @@ pub enum GesturePhase {
     Finished(ReleasePolicy),
 }
 
-/// A canvas-wide gesture the router claimed at its press (P2): a `Drag` binding on a
+/// A canvas-wide gesture the router claimed at its press (P2): a `Drag` or `Click` binding on a
 /// `canvas_wide` target pressed inside a view surface. The viewer drives it from here instead of
-/// from widget responses.
+/// from widget responses. A `Click` claim is acted on at its `Started` phase (the press) and ends
+/// on the release like a drag; the router never waits to see whether the pointer moved.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaimedGesture {
     pub action: ActionId,
@@ -176,6 +180,8 @@ pub struct ClaimedGesture {
     pub params: Vec<ActionId>,
     /// The mouse button or touch source that drives it.
     pub button: Button,
+    /// The kind of the matched binding (`Drag`, or `Click` for a press action).
+    pub kind: GestureKind,
 }
 
 /// The phase of a targeted gesture, read from an egui `Response`.
@@ -276,16 +282,36 @@ impl InputFrame {
         self.modes.contains(&id)
     }
 
-    /// The accumulated sample of axis `id` this frame, if its source moved under its chord.
+    /// The first sample of axis `id` this frame (in `AxisSource` order), if a source moved under
+    /// its chord. An axis that may be fed by several sources in one frame reads
+    /// [`Self::axis_samples`] instead.
     #[must_use]
     pub fn axis(&self, id: ActionId) -> Option<&AxisSample> {
         self.axes.iter().find(|sample| sample.action == id)
     }
 
-    /// The sample of axis `id` when its focus is `view`.
+    /// Every sample of axis `id` this frame, one per source, in `AxisSource` order.
+    pub fn axis_samples(&self, id: ActionId) -> impl Iterator<Item = &AxisSample> {
+        self.axes.iter().filter(move |sample| sample.action == id)
+    }
+
+    /// The samples of axis `id` whose focus is `view` (one per source).
+    pub fn axis_samples_for_view(&self, id: ActionId, view: ViewId) -> impl Iterator<Item = &AxisSample> {
+        self.axis_samples(id).filter(move |sample| sample.focus.is_some_and(|focus| focus.view == view))
+    }
+
+    /// The first sample of axis `id` whose focus is `view` (see [`Self::axis`]).
     #[must_use]
     pub fn axis_for_view(&self, id: ActionId, view: ViewId) -> Option<&AxisSample> {
-        self.axis(id).filter(|sample| sample.focus.is_some_and(|focus| focus.view == view))
+        self.axis_samples_for_view(id, view).next()
+    }
+
+    /// Whether command `id` fired on a press whose button is still held this frame (the button
+    /// that completed its chord; its auto-repeats keep it, its release ends it). False while input
+    /// is suppressed.
+    #[must_use]
+    pub fn command_held(&self, id: ActionId) -> bool {
+        !self.suppressed && self.state.command_held(id)
     }
 
     /// The canvas-wide gesture claimed on `view` (also in its `Finished` frame).
@@ -295,7 +321,7 @@ impl InputFrame {
     }
 
     /// Whether `view` must raise its full-surface capture `Area` this frame: the pointer is on it
-    /// and a canvas-wide `Drag` gesture's chord holds (a press would be claimed), or a claimed
+    /// and a canvas-wide `Drag` or `Click` gesture's chord holds (a press would be claimed), or a claimed
     /// mouse gesture on it is still running.
     #[must_use]
     pub fn canvas_wide_armed(&self, view: ViewId) -> bool {

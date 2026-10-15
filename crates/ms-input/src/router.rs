@@ -31,8 +31,9 @@ Frame contract (see also the crate `MODULE_README.md`, "Runtime"):
    and replaced by a copy with the owned components zeroed when they own only some. Pointer
    events are never removed (P2).
 4. Window focus loss resets everything held, cancels claims and drops the forming capture chord.
-5. Claims: a pointer-button press inside a surface that matches a `Drag` binding on a
-   `canvas_wide` target becomes a claimed gesture of that view (Started, Active, Finished).
+5. Claims: a pointer-button press inside a surface that matches a `Drag` (else a `Click`)
+   binding on a `canvas_wide` target becomes a claimed gesture of that view (Started, Active,
+   Finished). Only the press can start a claim.
 6. `FrameEnv::modal_open` or a running capture: the matcher only tracks held buttons (it is fed
    with a popup-open activity, under which the matcher contract fires no command and advances no
    sequence), nothing fires, no mode is active, nothing is claimed or resolved.
@@ -70,10 +71,17 @@ use crate::touch::{TouchSelection, TouchSelectionEnd, peek_selection};
 /// Points of `MouseWheelUnit::Point` scrolling that make one wheel notch (step).
 pub const WHEEL_NOTCH_PT: f32 = 40.0;
 
+/// The gesture kinds a canvas-wide press is claimed for, in preference order: a `Drag` binding
+/// wins over a `Click` binding of the same press (a click on a canvas-wide target is a press
+/// action, so the two could not be told apart at the press).
+const CLAIM_KINDS: [GestureKind; 2] = [GestureKind::Drag, GestureKind::Click];
+
 /// One running claimed gesture.
 #[derive(Debug, Clone)]
 struct Claim {
     matched: GestureMatch,
+    /// `Drag`, or `Click` for a canvas-wide press action.
+    kind: GestureKind,
     view: ViewId,
     driver: ClaimDriver,
     origin: Pos2,
@@ -111,7 +119,8 @@ struct AxisAcc {
 struct EventPass {
     consumed: Vec<usize>,
     fired: Vec<(ActionId, Vec<ActionId>)>,
-    axes: BTreeMap<ActionId, AxisAcc>,
+    /// One accumulator per axis AND source: sources of one axis have different units.
+    axes: BTreeMap<(ActionId, AxisSource), AxisAcc>,
     /// Wheel events whose owned components are zeroed in place (the rest stays egui's).
     replaced: Vec<(usize, Event)>,
     /// Per SMOOTHED axis (x, y): wheel input this frame that an axis owned / that egui keeps.
@@ -138,8 +147,8 @@ pub struct InputRouter {
     /// Buttons released last frame; their snapshots are dropped at the next frame start.
     released: Vec<MouseButton>,
     claims: Vec<Claim>,
-    /// `Point`-unit wheel remainders per axis action (sign included), in points.
-    wheel_remainder: BTreeMap<ActionId, f32>,
+    /// `Point`-unit wheel remainders per axis action and source (sign included), in points.
+    wheel_remainder: BTreeMap<(ActionId, AxisSource), f32>,
     /// Per smoothed axis (x, y): a matched wheel's smoothing is still being suppressed.
     wheel_owned: [bool; 2],
     focused: bool,
@@ -204,12 +213,14 @@ impl InputRouter {
         let (events, pointer, pointer_delta, focused, scrolling) =
             ctx.input(|input| (input.events.clone(), input.pointer.latest_pos(), input.pointer.delta(), input.focused, input.is_scrolling()));
         let view_under_pointer = pointer.and_then(|pos| self.surface_at(ctx, pos)).map(|surface| surface.id);
+        let focus = self.focus(pointer, view_under_pointer);
         let active = ActiveSet {
             active_tab: env.active_tab,
             contexts: env.contexts.iter().copied().collect(),
             text_edit_focused: ctx.text_edit_focused(),
             popup_open: Popup::is_any_open(ctx) || ctx.any_popup_open(),
             pointer_on_view: view_under_pointer.is_some(),
+            view_focus: focus.is_some(),
         };
         let suppressed = env.modal_open || self.capture.is_some();
 
@@ -276,7 +287,6 @@ impl InputRouter {
             }
         }
 
-        let focus = self.focus(pointer, view_under_pointer);
         let modes = if suppressed { BTreeSet::new() } else { self.state.active_modes(&self.registry, &active) };
         let armed = if suppressed { Vec::new() } else { self.armed_views(view_under_pointer, &active) };
         let touch_selectable = if suppressed { Vec::new() } else { self.touch_selectable_views(&active) };
@@ -287,7 +297,7 @@ impl InputRouter {
             state: self.state.clone(),
             fired: pass.fired.into_iter().map(|(action, params)| Fired { action, params, focus }).collect(),
             modes,
-            axes: pass.axes.into_iter().map(|(action, acc)| AxisSample { action, delta: acc.delta, steps: acc.steps, focus }).collect(),
+            axes: pass.axes.into_iter().map(|((action, source), acc)| AxisSample { action, source, delta: acc.delta, steps: acc.steps, focus }).collect(),
             claims,
             armed,
             touch_selectable,
@@ -463,7 +473,7 @@ impl InputRouter {
                 if !suppressed && factor.is_finite() && *factor > 0.0 {
                     let log = factor.ln();
                     if let Some(axis) = self.state.match_axis(&self.registry, AxisSource::Pinch, active) {
-                        let entry = pass.axes.entry(axis.action).or_insert(AxisAcc { delta: 0.0, steps: 0 });
+                        let entry = pass.axes.entry((axis.action, AxisSource::Pinch)).or_insert(AxisAcc { delta: 0.0, steps: 0 });
                         entry.delta += log * axis.sensitivity * sign(axis.invert);
                     }
                 }
@@ -519,7 +529,7 @@ impl InputRouter {
     fn wheel_axis(&mut self, source: AxisSource, value: f32, unit: MouseWheelUnit, active: &ActiveSet, pass: &mut EventPass) -> bool {
         let Some(axis) = self.state.match_axis(&self.registry, source, active) else { return false };
         let sign = sign(axis.invert);
-        let entry = pass.axes.entry(axis.action).or_insert(AxisAcc { delta: 0.0, steps: 0 });
+        let entry = pass.axes.entry((axis.action, source)).or_insert(AxisAcc { delta: 0.0, steps: 0 });
         match unit {
             MouseWheelUnit::Line | MouseWheelUnit::Page => {
                 entry.delta += value * axis.sensitivity * sign;
@@ -527,7 +537,7 @@ impl InputRouter {
             }
             MouseWheelUnit::Point => {
                 entry.delta += value / WHEEL_NOTCH_PT * axis.sensitivity * sign;
-                let remainder = self.wheel_remainder.entry(axis.action).or_insert(0.0);
+                let remainder = self.wheel_remainder.entry((axis.action, source)).or_insert(0.0);
                 *remainder += value * sign;
                 while *remainder >= WHEEL_NOTCH_PT {
                     *remainder -= WHEEL_NOTCH_PT;
@@ -542,7 +552,10 @@ impl InputRouter {
         true
     }
 
-    /// Claims a canvas-wide `Drag` gesture for a press of `mouse` at `pos` (P2).
+    /// Claims a canvas-wide gesture for a press of `mouse` at `pos` (P2): a `Drag` binding, else a
+    /// `Click` binding (a press action, acted on at `Started`). Only a press can start a claim: an
+    /// input that did not match at its press never becomes a claim later, whatever changes while
+    /// the button stays down.
     fn try_claim(&mut self, ctx: &Context, mouse: MouseButton, pos: Pos2, active: &ActiveSet) {
         let Some(view) = self.surface_at(ctx, pos).map(|surface| surface.id) else { return };
         if self.claims.iter().any(|claim| claim.view == view) {
@@ -552,9 +565,11 @@ impl InputRouter {
         env.pointer_on_view = true;
         let targets = self.canvas_wide_targets();
         let button = Button::Mouse(mouse);
-        let Some(matched) = self.state.match_gesture(&self.registry, &button, GestureKind::Drag, &targets, &env) else { return };
-        ms_log::trace_log!(cat::INPUT, "ms_input claim {} view={:?} button={mouse:?} pos={pos:?}", matched.action.0, view.0);
-        self.claims.push(Claim { matched, view, driver: ClaimDriver::Mouse(mouse), origin: pos, current: pos, phase: GesturePhase::Started });
+        let Some((matched, kind)) = CLAIM_KINDS.iter().find_map(|&kind| self.state.match_gesture(&self.registry, &button, kind, &targets, &env).map(|matched| (matched, kind))) else {
+            return;
+        };
+        ms_log::trace_log!(cat::INPUT, "ms_input claim {} kind={kind:?} view={:?} button={mouse:?} pos={pos:?}", matched.action.0, view.0);
+        self.claims.push(Claim { matched, kind, view, driver: ClaimDriver::Mouse(mouse), origin: pos, current: pos, phase: GesturePhase::Started });
     }
 
     /// Every declared canvas-wide target.
@@ -664,6 +679,7 @@ impl InputRouter {
             ms_log::trace_log!(cat::INPUT, "ms_input touch claim {} view={:?}", matched.action.0, view.0);
             self.claims.push(Claim {
                 matched,
+                kind: GestureKind::Drag,
                 view,
                 driver: ClaimDriver::Touch(owner),
                 origin: selection.origin,
@@ -693,7 +709,7 @@ impl InputRouter {
                 continue;
             }
             if let Some(axis) = self.state.match_axis(&self.registry, source, active) {
-                let entry = pass.axes.entry(axis.action).or_insert(AxisAcc { delta: 0.0, steps: 0 });
+                let entry = pass.axes.entry((axis.action, source)).or_insert(AxisAcc { delta: 0.0, steps: 0 });
                 entry.delta += value * axis.sensitivity * sign(axis.invert);
             }
         }
@@ -730,8 +746,8 @@ impl InputRouter {
         self.surfaces.iter().filter(|surface| surface.touch_owner.is_some()).map(|surface| surface.id).collect()
     }
 
-    /// Whether some canvas-wide `Drag` gesture whose button satisfies `button_filter` would match
-    /// a press of that button now.
+    /// Whether some canvas-wide `Drag` or `Click` gesture whose button satisfies `button_filter`
+    /// would be claimed by a press of that button now.
     fn canvas_wide_drag_holds(&self, env: &ActiveSet, button_filter: impl Fn(&Button) -> bool) -> bool {
         let targets = self.canvas_wide_targets();
         if targets.is_empty() {
@@ -743,11 +759,11 @@ impl InputRouter {
             .filter(|view| matches!(view.spec, Some(ActionSpec::Gesture(spec)) if targets.contains(&spec.target)))
             .flat_map(|view| view.bindings.iter())
             .filter_map(|binding| match binding {
-                Binding::Gesture(gesture) if gesture.kind == GestureKind::Drag && button_filter(&gesture.button) => Some(gesture.button.clone()),
+                Binding::Gesture(gesture) if CLAIM_KINDS.contains(&gesture.kind) && button_filter(&gesture.button) => Some(gesture.button.clone()),
                 Binding::Gesture(_) | Binding::Command(_) | Binding::Mode(_) | Binding::Axis(_) => None,
             })
             .collect();
-        buttons.iter().any(|button| self.state.match_gesture(&self.registry, button, GestureKind::Drag, &targets, env).is_some())
+        buttons.iter().any(|button| CLAIM_KINDS.iter().any(|&kind| self.state.match_gesture(&self.registry, button, kind, &targets, env).is_some()))
     }
 
     /// The public view of one claim with its parameters sampled now.
@@ -761,6 +777,7 @@ impl InputRouter {
             current: claim.current,
             params: self.state.gesture_params(&self.registry, &claim.matched, active),
             button: claim.driver.button(),
+            kind: claim.kind,
         }
     }
 }

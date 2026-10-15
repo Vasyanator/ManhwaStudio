@@ -354,8 +354,8 @@ extension point for tab behaviour:
 | Page overlays | `draw_canvas_mask_overlay_on_page`, `draw_canvas_overlay_on_page`, `draw_canvas_overlay_top_left` (tab panels + panel dock) |
 | Bubble cards | `has_bubble_header`, `build_bubble_header`, `readonly_aside_header_width_hint`, `build_bubble_footer`, `on_bubble_action` |
 | Bubble visibility / status | `should_hide_on_top_bubble`, `should_hide_aside_bubble_line`, `bubble_status_style` |
-| Page context menu | `draw_canvas_page_context_menu`, `suppress_canvas_page_context_menu` |
-| Gestures / scrollbar | `on_page_click`, `wants_canvas_shift_drag_selection` (transitional), `canvas_scrollbar_marks` |
+| Page context menu | `draw_canvas_page_context_menu`, `suppress_canvas_page_context_menu`, `page_menu_create_bubble_shortcut` (the tab's create-bubble binding text; the canvas names no tab action) |
+| Gestures / scrollbar | `on_page_click`, `canvas_scrollbar_marks` |
 
 Bubble status borders: the rules live in `SharedCanvasSettings` (edited only in the studio settings
 «Лента» pane), are evaluated by the GUI-free `ms_config::bubble_status` model and reach the canvas
@@ -440,29 +440,35 @@ the registry to `draw` (`input_frame` holds the frame for the pass).
   handle / area / anchor" guards: a widget passes its candidates with hit flags to
   `InputFrame::gesture_for` (`CanvasView::drag_hit_among`).
 - **Contexts the tab publishes** (`CanvasView::input_contexts`, forwarded by every canvas tab's
-  `StudioTab::input_contexts`): `canvas.editable` while `editable`; `canvas.zoom_accepted` while
-  the zoom is not blocked (`set_zoom_blocked`). The studio registers `view.zoom_in` / `zoom_out` /
-  `zoom_reset` and the `view.zoom` axis under `zoom_accepted`, so while a tab blocks canvas zoom
-  (advanced recognition open, a cleaning editor window, a selected typing layer that rotates with
-  Ctrl+wheel) those keys and Ctrl+wheel stay with the tab's own readers, and in the PS editor (no
-  canvas) they are never consumed. Removal of that gate: input-unification WP6-WP8.
+  `StudioTab::input_contexts`): `canvas.editable` while `editable`. The `view.*` set is not gated
+  by any canvas context: every viewer (this canvas, the advanced-recognition window, the Cleaning
+  editor window, each publishing its own surface) acts only on input focused on ITS view, and the
+  zoom commands need a view focus (`Condition::ViewFocus`), so a tab without a viewer (PS editor)
+  keeps those keys. A Typing layer rotates with Ctrl+wheel through its own Sub-scope axis, which
+  shadows `view.zoom` while it is active.
 - **Read from the frame** (`apply_input_frame`, before the scene pass): the history commands; the
   zoom commands at their focus (the pointer on this view, else this primary view's centre); the
-  `view.zoom` axis at the pointer (×1.1 per wheel notch; a pinch applies `exp(delta)`, recognized
-  by a non-consuming `Event::Zoom` peek until `AxisSample` carries its source); the
-  `view.zoom_drag` claim of this view (horizontal movement, `input::zoom_drag_factor`, until the
-  button or the zoom modifier is released); `view.pan` (`begin_canvas_frame`:
-  `DragScroll::Always`); wheel scrolling is off while the zoom modifier is held over the view or
-  a zoom drag runs. Everything zoom-related is skipped while the zoom is blocked.
+  `view.zoom` axis at the pointer, one sample per source (`input::zoom_axis_factor`: ×1.1 per
+  wheel notch, `exp(delta)` for a pinch); the `view.zoom_drag` claim of this view
+  (`input::ZoomDrag`: followed only from its `Started` frame, horizontal movement,
+  `input::zoom_drag_factor`, until the button or the zoom modifier is released); `view.pan`
+  (`begin_canvas_frame`: `DragScroll::Always`); wheel scrolling is off while the zoom modifier is
+  held over the view or a zoom drag runs.
+- **View lock under a claim** (`claim_locks_view`): while any other claim runs on this view (a
+  Cleaning stroke / selection / press action, a Translation OCR or crop rectangle, the Typing
+  create rectangle — all in screen positions) the canvas applies no zoom (keys, axis, finger
+  pinch: a pinch pans) and no wheel scrolling, so the page never moves under the gesture. One
+  rule for every tab; no tab blocks the canvas itself.
 - **Bubble widgets lock** (`bubble_widgets_locked`: a zoom drag runs or `view.pan` is held): every
   bubble widget, card, handle and image-area part senses hover only, so a Space+drag that starts
   on a bubble pans instead of moving it, and no handle resizes during a zoom drag.
 - **View surface** (`publish_view_surface`, end of `draw`): `ViewId` content-named from the scroll
-  salt (`input::view_id_for`), rect = the canvas rect, holes = the bottom hint and the Hangul
-  window, `capture_layer`, `primary`, and the touch owner.
+  salt (`input::view_id_for`), rect = the canvas rect, holes = the bottom hint, the Hangul window
+  and the scrollbars (so no canvas-wide gesture arms over a scrollbar and it stays draggable with
+  a Cleaning brush active), `capture_layer`, `primary`, and the touch owner.
 - **Capture area** (`draw_capture_area`): a full-canvas `click_and_drag` `Area` raised only while
-  `InputFrame::canvas_wide_armed(view)` and the zoom is not blocked, so the press the router
-  claims reaches no widget. It is on `Order::Background` on purpose: above the central panel's
+  `InputFrame::canvas_wide_armed(view)` and `view.pan` is NOT held (a Space+drag press must reach
+  the `ScrollArea`), so the press the router claims reaches no widget. It is on `Order::Background` on purpose: above the central panel's
   root layer, below dock panels / popups / windows (they keep their clicks), and code that treats
   a non-background layer under the pointer as occlusion (Cleaning strokes, Typing deselect) still
   sees bare canvas.
@@ -473,12 +479,11 @@ the registry to `draw` (`input_frame` holds the frame for the pass).
   aside card, the `OnTopFocusMode::Aside` pre-pass), text editing in the bubble fields, the card
   drag refusal while any widget has keyboard focus, buttons (translate, delete, add area), the
   ribbon tab widgets, the scrollbars, the bottom-hint arrow and the Hangul keyboard.
-- **Transitional adapters** (tab behaviour not yet expressed as actions): `set_zoom_blocked`,
-  `set_wheel_scroll_blocked`, `set_drag_scroll_blocked` (Cleaning tools, WP7; Translation /
-  Typing zoom block, WP6 / WP8), `set_create_bubble_shortcut_hint` (Translation, WP6) and the hook
-  `wants_canvas_shift_drag_selection` (Translation / Typing, WP6 / WP8).
-- **Touch alternatives**: the touch surface's `long_press_selection` is also on while the router
-  would claim a long-press drag for a declared touch binding (`touch_selection_available`).
+- **No per-tab input adapters**: tab behaviour reaches the canvas only as declared actions, claims,
+  contexts and `CanvasHooks`; the canvas exposes no zoom / scroll / drag blocking setters.
+- **Touch alternatives**: the touch surface's `long_press_selection` is on exactly while the router
+  would claim a long-press drag for a declared touch binding (`touch_selection_available`); the
+  drag then reaches the tab as that claim.
 
 ## Touch gestures
 The finger decision is owned by `ms_widgets::touch_nav` (shell raw-input hook); the canvas is a
@@ -493,47 +498,37 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `interact_radius`, collected next to their `ui.interact` through `note_touch_handle_hole`).
   Windows and dock panels are not holes: they are on non-background layers, which the router
   never claims on. The large image-bubble rects and text areas are NOT holes: a finger there pans.
-  `long_press_selection` is the tab's one-frame flag (see "Long-press selection").
+  `long_press_selection` follows the router (see "Long-press selection").
 - **Navigation** (`apply_input_frame`, after the zoom paths): `take_touch_output` runs every
   frame (it also schedules the long-press repaint). `apply_touch_navigation` captures
   `capture_pending_view_anchor(prev_centroid, centroid)` at the OLD zoom, then multiplies the zoom
-  (clamped to `CANVAS_ZOOM_MIN..=CANVAS_ZOOM_MAX`); with `zoom_blocked` only the pan applies. A
+  (clamped to `CANVAS_ZOOM_MIN..=CANVAS_ZOOM_MAX`); while a claim locks the view only the pan applies. A
   zoom anchor already recorded this frame wins and the finger delta of that frame is dropped. The
   wheel zoom anchor is the `prev == new` case of the same capture (pinned by
   `zoom_anchor_capture_matches_frozen_characterization`). The router's axis lock and the fling
   after a locked lift arrive as ordinary navigation frames (a fling frame has `touches == 0` and
   asks for the next frame itself), so the canvas has no kinetic state of its own.
 - **Tap**: `touch_tap()` returns this frame's `TouchOutput::tap_at` (stored by `apply_input_frame`,
-  valid like `touch_selection`). The canvas acts on no tap. A tab may use it only where a mouse
+  valid from `draw`'s input step on). The canvas acts on no tap. A tab may use it only where a mouse
   click OUTSIDE something dismisses or commits it (the Typing create editor) and to select /
   deselect its own layers (the Typing text layers); bubble placement, aside selection,
   Translation line presses and Cleaning/PS tools stay mouse-only.
 - **Long-press menu**: `scene.touch_long_press_at` reaches `handle_canvas_page_interactions`;
   `touch::context_menu_open_pos` picks the secondary-click position or, failing that, the
   long-press point inside the row, and both go through `canvas_context_menu_target_at` and the same
-  gates (`hook_claims_shift_drag`, `zoom_drag_active`, `suppress_canvas_page_context_menu`). The
+  gates (`zoom_drag_active`, `suppress_canvas_page_context_menu`). The
   menu is drawn with `ms_widgets::touch_nav::context_menu_popup(response, long_press)` — never
   `response.context_menu`, which anchors at a hover position a finger does not have. The armed
   long-press draws a ring (`draw_touch_long_press_feedback`) while the finger is held.
 - **Long-press selection**: the canvas page row has no selection drag of its own; every one lives
-  in a tab (Translation OCR / image-crop capture areas, Typing create rectangle, Cleaning region
-  tools). The hand-off is two methods, no `CanvasHooks` change: the tab calls
-  `set_long_press_selection(bool)` every frame its active mode has a selection (before `draw`, or
-  from a hook inside it holding `&mut CanvasView`); it is a ONE-FRAME flag consumed by the surface
-  publication, so a tab that stops setting it publishes `false` (a long-press drag then pans).
-  `touch_selection()` returns this frame's `TouchSelection` (stored by `apply_input_frame`), valid
-  for hooks inside `draw` and code after it. Rectangle-drag capture modes map it through
-  `drive_touch_drag` + `TouchDrivenDrag` (begin at the press point, follow, `Released` commits like
-  a mouse release, `Cancelled` drops like Esc; a mouse drag in the slot is never touched); the
-  Cleaning tab replays it onto its tools' stroke hooks (`ms-tab-cleaning/src/touch_selection.rs`).
-  A tab whose selection exists only at certain points reads `touch_long_press_armed_at()` in a
-  hook inside `draw` and sets the flag in that same frame: the router re-reads it until the drag
-  starts, and the first drag frame is always a later frame than the one that reported the arm.
+  in a tab (Translation OCR / image-crop rectangles, Typing create rectangle, Cleaning strokes and
+  region tools) as a declared `Touch(LongPressDrag)` gesture binding on `view.surface`. The router
+  claims the finger's drag for it (`InputFrame::claimed`, the same claim a mouse drag gives) and
+  the canvas only publishes `long_press_selection` while such a binding would match.
 - **Drag regions**: a tab with an object a finger drags WITHOUT a hold (Typing: the selected text
   layer) adds its outline every frame with `add_touch_drag_region(Vec<Pos2>)` (one-frame, drained
   by the surface publication into `TouchSurface::drag_regions`) and reads the finger's drag from
-  `touch_region_drag()` — a channel of its own, so a capture mode's `touch_selection` never sees
-  it. The canvas does nothing with either.
+  `touch_region_drag()` — a channel of its own, never a long-press selection claim. The canvas does nothing with either.
 - **Tab object menus**: `touch_long_press_at()` exposes the lift point. A tab that opens its own
   object's menu for a long-press answers `suppress_canvas_page_context_menu` for that press (the
   page menu runs BEFORE the top-left hook in the same frame, so it must decide from the armed

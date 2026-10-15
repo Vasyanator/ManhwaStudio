@@ -10,13 +10,16 @@ decisions (targeted gestures, menu opening, zoom factors).
 
 Key items:
 - `declarations()`: the canvas' `Declarations` (scope `Canvas`), registered once by the studio.
-- `EDITABLE`, `ZOOM_ACCEPTED`: the canvas contexts (`CanvasView::input_contexts`).
+- `EDITABLE`: the canvas context (`CanvasView::input_contexts`).
 - the `ActionId` / `TargetId` constants of the set, with the target priorities.
 - `CanvasLabels`: the shortcuts-chip rows, rebuilt only when the registry revision or the UI
   locale changes.
 - `CanvasView::{input_contexts, view_id}` and the per-frame helpers the scene / bubble passes
   use (`gesture_hit`, `drag_hit`, `gesture_clicked`, `bubble_menu_popup`).
-- `wheel_zoom_factor`, `zoom_drag_factor`: the pure zoom laws.
+- `wheel_zoom_factor`, `zoom_drag_factor`, `zoom_axis_factor`: the pure zoom laws (shared with
+  the Cleaning region-editor window, which zooms by the canvas' laws).
+- `ZoomDrag`: the one zoom-drag state machine of every viewer (canvas, Cleaning editor window,
+  Translation advanced-recognition window).
 
 Notes:
 - The shared viewer set (`view.*`: zoom keys / axis / drag, pan, scroll) is `ms_input::view`'s;
@@ -31,8 +34,8 @@ use eframe::egui;
 use egui::{Id, LayerId, Order, Pos2, Response};
 use ms_i18n::LocaleTag;
 use ms_input::{
-    ActionId, ActionMeta, ActionSpec, Binding, Button, Chord, CommandSpec, Condition, ContextId, Declarations, FixedAction, GestureKind, GestureSpec,
-    HitPhase, InputRegistry, ModifierKey, MouseButton, Scope, TargetId, TargetSpec, ViewId, view,
+    ActionId, ActionMeta, ActionSpec, AxisSample, AxisSource, Binding, Button, Chord, ClaimedGesture, CommandSpec, Condition, ContextId, Declarations,
+    FixedAction, GestureKind, GesturePhase, GestureSpec, HitPhase, InputRegistry, ModifierKey, MouseButton, Scope, TargetId, TargetSpec, ViewId, view,
 };
 use ms_widgets::touch_nav::context_menu_popup;
 
@@ -41,11 +44,6 @@ use super::{CanvasHintRow, CanvasView};
 /// Context: the canvas edits bubbles (Translation). Gates the bubble history commands, the bubble
 /// drag gestures and the page menu (the bubble menu and selection also serve read-only canvases).
 pub const EDITABLE: ContextId = ContextId("canvas.editable");
-/// Context: the canvas executes the shared zoom commands and the zoom axis (its zoom is not
-/// blocked by its tab). The studio registers `view.zoom_in` / `zoom_out` / `zoom_reset` and
-/// `view.zoom` under it, so while a tab blocks canvas zoom (advanced recognition open, a cleaning
-/// editor window, a selected typing layer) those keys and Ctrl+wheel reach the tab's own readers.
-pub const ZOOM_ACCEPTED: ContextId = ContextId("canvas.zoom_accepted");
 
 /// Command: undo the last bubble edit.
 pub const BUBBLE_UNDO: ActionId = ActionId("canvas.bubble.undo");
@@ -226,6 +224,65 @@ pub fn zoom_drag_factor(dx: f32) -> f32 {
     (dx * 0.005).exp().clamp(0.5, 2.0)
 }
 
+/// The zoom factor of one `view.zoom` sample, by its source: wheel notches by
+/// [`wheel_zoom_factor`] (a sub-notch wheel frame is `1.0`, it accumulates into later steps), a
+/// pinch as `exp(delta)`, a drag source by [`zoom_drag_factor`].
+#[must_use]
+pub fn zoom_axis_factor(sample: &AxisSample) -> f32 {
+    match sample.source {
+        AxisSource::WheelY | AxisSource::WheelX => wheel_zoom_factor(sample.steps),
+        AxisSource::Pinch => sample.delta.exp(),
+        AxisSource::DragX | AxisSource::DragY => zoom_drag_factor(sample.delta),
+    }
+}
+
+/// The state of one viewer's `view.zoom_drag`: whether a drag is followed and the pointer x it was
+/// last applied at.
+///
+/// A drag is followed only from its `Started` frame (the press, measured from the press point): a
+/// claim this viewer first sees `Active` (pressed while the viewer was not drawn) is ignored to
+/// its end, so a drag can never start zooming from its middle.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ZoomDrag {
+    active: bool,
+    last_x: f32,
+}
+
+impl ZoomDrag {
+    /// Whether a zoom drag runs on this viewer (its widgets sense hover only meanwhile).
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Advances by this frame's claim on the viewer (`None`, or a claim of another action, ends a
+    /// running drag) and returns the horizontal movement to zoom by, in points (`0.0` when
+    /// nothing moved or no drag runs). The caller turns it into a factor with its own law.
+    pub fn step(&mut self, claim: Option<&ClaimedGesture>) -> f32 {
+        let Some(claim) = claim.filter(|claim| claim.action == view::ZOOM_DRAG) else {
+            self.active = false;
+            return 0.0;
+        };
+        match claim.phase {
+            GesturePhase::Started => {
+                self.active = true;
+                self.last_x = claim.origin.x;
+            }
+            GesturePhase::Active => {}
+            GesturePhase::Finished(_) => {
+                self.active = false;
+                return 0.0;
+            }
+        }
+        if !self.active {
+            return 0.0;
+        }
+        let dx = claim.current.x - self.last_x;
+        self.last_x = claim.current.x;
+        dx
+    }
+}
+
 /// The binding-label snapshot of the canvas' own shortcuts chip: one row per shared viewer action
 /// (title + binding label, alternatives joined by " / "). Rebuilt by [`CanvasLabels::refresh`] only
 /// when the registry revision or the UI locale changed.
@@ -275,18 +332,10 @@ fn foreign_secondary_click(response: &Response, owned: bool) -> bool {
 
 impl CanvasView {
     /// The contexts the owning tab publishes for this canvas (`StudioTab::input_contexts`):
-    /// [`EDITABLE`] while it edits bubbles, [`ZOOM_ACCEPTED`] while its zoom is not blocked. Read
-    /// before the frame's `begin_frame`, so a block set during a draw applies from the next frame.
+    /// [`EDITABLE`] while it edits bubbles. Read before the frame's `begin_frame`.
     #[must_use]
     pub fn input_contexts(&self) -> Vec<ContextId> {
-        let mut contexts = Vec::with_capacity(2);
-        if self.editable {
-            contexts.push(EDITABLE);
-        }
-        if !self.scene.zoom_blocked {
-            contexts.push(ZOOM_ACCEPTED);
-        }
-        contexts
+        if self.editable { vec![EDITABLE] } else { Vec::new() }
     }
 
     /// The canvas' view identity (published surface, axis / command focus, claims).
@@ -358,14 +407,6 @@ impl CanvasView {
     }
 }
 
-/// Whether `frame` holds a pinch this frame (`Event::Zoom`), read without consuming: `view.zoom`
-/// samples carry no source, and a pinch is the only one with `steps == 0` worth applying (a
-/// sub-notch wheel accumulates into later steps). Removal condition: `ms_input::AxisSample` gains
-/// its source.
-pub(crate) fn pinch_this_frame(ctx: &egui::Context) -> bool {
-    ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Zoom(_))))
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -386,7 +427,7 @@ mod tests {
     }
 
     fn editable_env() -> ActiveSet {
-        ActiveSet { contexts: BTreeSet::from([EDITABLE, ZOOM_ACCEPTED]), ..ActiveSet::default() }
+        ActiveSet { contexts: BTreeSet::from([EDITABLE]), ..ActiveSet::default() }
     }
 
     fn english() {
@@ -524,6 +565,56 @@ mod tests {
         assert_ne!(labels.chip_rows()[1].keys, before);
     }
 
+    fn zoom_claim(phase: GesturePhase, origin_x: f32, current_x: f32) -> ClaimedGesture {
+        ClaimedGesture {
+            action: view::ZOOM_DRAG,
+            target: view::SURFACE,
+            view: view_id_for("canvas_scroll"),
+            phase,
+            origin: egui::pos2(origin_x, 10.0),
+            current: egui::pos2(current_x, 10.0),
+            params: Vec::new(),
+            button: Button::Mouse(MouseButton::Left),
+            kind: GestureKind::Drag,
+        }
+    }
+
+    /// A zoom drag is followed from its press: movement since the press, then since the last
+    /// frame; its release or any other claim ends it.
+    #[test]
+    fn a_zoom_drag_measures_from_its_press() {
+        let mut drag = ZoomDrag::default();
+        assert!((drag.step(Some(&zoom_claim(GesturePhase::Started, 100.0, 110.0))) - 10.0).abs() < f32::EPSILON);
+        assert!(drag.active());
+        assert!((drag.step(Some(&zoom_claim(GesturePhase::Active, 100.0, 130.0))) - 20.0).abs() < f32::EPSILON);
+        assert!(drag.step(Some(&zoom_claim(GesturePhase::Finished(ms_input::ReleasePolicy::Commit), 100.0, 150.0))).abs() < f32::EPSILON);
+        assert!(!drag.active());
+        drag.step(Some(&zoom_claim(GesturePhase::Started, 0.0, 0.0)));
+        assert!(drag.step(None).abs() < f32::EPSILON && !drag.active(), "a vanished claim ends it");
+    }
+
+    /// Review regression: a zoom-drag claim this viewer did not see start (pressed while the
+    /// viewer was blocked or not drawn) never starts zooming later, from wherever the pointer is.
+    #[test]
+    fn a_zoom_drag_first_seen_mid_gesture_never_zooms() {
+        let mut drag = ZoomDrag::default();
+        for current in [140.0, 180.0, 260.0] {
+            assert!(drag.step(Some(&zoom_claim(GesturePhase::Active, 100.0, current))).abs() < f32::EPSILON);
+            assert!(!drag.active());
+        }
+        assert!((drag.step(Some(&zoom_claim(GesturePhase::Started, 300.0, 305.0))) - 5.0).abs() < f32::EPSILON, "the next press is followed");
+    }
+
+    /// The zoom factor of a `view.zoom` sample follows its source.
+    #[test]
+    fn zoom_axis_factor_follows_the_source() {
+        let sample = |source: AxisSource, delta: f32, steps: i32| AxisSample { action: view::ZOOM, source, delta, steps, focus: None };
+        assert!((zoom_axis_factor(&sample(AxisSource::WheelY, 1.0, 1)) - 1.1).abs() < 1e-6);
+        assert!((zoom_axis_factor(&sample(AxisSource::WheelY, 0.3, 0)) - 1.0).abs() < f32::EPSILON, "a sub-notch wheel waits for its notch");
+        assert!((zoom_axis_factor(&sample(AxisSource::Pinch, 2.0_f32.ln(), 0)) - 2.0).abs() < 1e-5);
+        assert!((zoom_axis_factor(&sample(AxisSource::DragX, 0.0, 0)) - 1.0).abs() < f32::EPSILON);
+    }
+
     #[test]
     fn zoom_laws() {
         assert!((wheel_zoom_factor(1) - 1.1).abs() < 1e-6);
@@ -535,17 +626,14 @@ mod tests {
         assert!((zoom_drag_factor(-10_000.0) - 0.5).abs() < f32::EPSILON, "clamped at 0.5 per frame");
     }
 
-    /// The canvas asks its tab for `EDITABLE` while it edits and for `ZOOM_ACCEPTED` while its zoom
-    /// is not blocked; view ids differ per canvas and are content-named.
+    /// The canvas asks its tab for `EDITABLE` while it edits; view ids differ per canvas and are
+    /// content-named.
     #[test]
     fn contexts_and_view_ids_follow_the_canvas_state() {
         let mut canvas = CanvasView::default();
-        assert_eq!(canvas.input_contexts(), vec![EDITABLE, ZOOM_ACCEPTED]);
-        canvas.set_zoom_blocked(true);
         assert_eq!(canvas.input_contexts(), vec![EDITABLE]);
         canvas.editable = false;
-        canvas.set_zoom_blocked(false);
-        assert_eq!(canvas.input_contexts(), vec![ZOOM_ACCEPTED]);
+        assert!(canvas.input_contexts().is_empty());
         let first = canvas.view_id();
         canvas.set_scroll_area_id_salt("other_canvas_scroll");
         assert_ne!(canvas.view_id(), first);

@@ -1200,10 +1200,6 @@ impl StampTool {
 }
 
 impl CleaningTool for StampTool {
-    fn tool_id(&self) -> &'static str {
-        "stamp"
-    }
-
     fn title(&self) -> &'static str {
         t!("cleaning.tools.stamp.title")
     }
@@ -1352,12 +1348,10 @@ impl CleaningTool for StampTool {
     /// with Shift held, the router picks one axis per wheel event).
     fn apply_input(&mut self, input: &InputFrame) -> bool {
         let mut changed = self.brush_base.apply_input(input);
-        if let Some(sample) = input.axis(input::STAMP_ROTATE) {
-            changed |= self.rotate_by_steps(sample.steps, false);
-        }
-        if let Some(sample) = input.axis(input::STAMP_ROTATE_COARSE) {
-            changed |= self.rotate_by_steps(sample.steps, true);
-        }
+        // Summed over the sources a rebinding may give each axis (one sample per source).
+        let steps = |id| input.axis_samples(id).fold(0_i32, |sum, sample| sum.saturating_add(sample.steps));
+        changed |= self.rotate_by_steps(steps(input::STAMP_ROTATE), false);
+        changed |= self.rotate_by_steps(steps(input::STAMP_ROTATE_COARSE), true);
         changed
     }
 

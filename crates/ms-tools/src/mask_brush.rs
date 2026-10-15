@@ -109,14 +109,13 @@ impl MaskBrush {
         true
     }
 
-    /// Applies this frame's brush actions from `input`: `brush.size` notches, then `brush.smaller`
-    /// / `brush.larger`. Call it once per frame while the host publishes [`BRUSH_ACTIVE`] (the
-    /// router fires them only then). Returns whether the radius changed.
+    /// Applies this frame's brush actions from `input`: `brush.size` notches (summed over its
+    /// sources: the vertical and horizontal wheel may both move in one frame), then
+    /// `brush.smaller` / `brush.larger`. Call it once per frame while the host publishes
+    /// [`BRUSH_ACTIVE`] (the router fires them only then). Returns whether the radius changed.
     pub fn apply_input(&mut self, input: &InputFrame) -> bool {
-        let mut changed = false;
-        if let Some(sample) = input.axis(BRUSH_SIZE) {
-            changed |= self.step_by_notches(sample.steps);
-        }
+        let notches = input.axis_samples(BRUSH_SIZE).fold(0_i32, |sum, sample| sum.saturating_add(sample.steps));
+        let mut changed = self.step_by_notches(notches);
         if input.fired(BRUSH_SMALLER).is_some() {
             changed |= self.shrink_one_step();
         }

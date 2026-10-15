@@ -99,14 +99,14 @@ fn run_command_handles_exactly_its_own_commands() {
     }
 }
 
-/// The host forwards its canvas's contexts (the Translation canvas edits bubbles and zooms) and
+/// The host forwards its canvas's contexts (the Translation canvas edits bubbles) and
 /// adds the tab's own, none while no edit mode, window or brush is on.
 #[test]
 fn the_host_forwards_the_canvas_contexts() {
     let dir = tempfile::tempdir().expect("temp dir");
     let host = host_in(dir.path(), &Value::Null);
     assert!(host.state().input_contexts().is_empty());
-    assert_eq!(host.input_contexts(), vec![ms_canvas::input::EDITABLE, ms_canvas::input::ZOOM_ACCEPTED]);
+    assert_eq!(host.input_contexts(), vec![ms_canvas::input::EDITABLE]);
 }
 
 /// `new` seeds the bottom-hint collapsed flag from `Canvas.translation_hint_collapsed` (missing or

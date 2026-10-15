@@ -128,10 +128,6 @@ impl TranslationTab {
             ctx.request_repaint();
         }
         let Self { canvas, state } = self;
-        // Transitional canvas adapter: the page menu cannot name a tab's command itself yet, so
-        // the host hands it the create-bubble binding text (ms-canvas removes it, input WP9).
-        let create_bound = !input_registry.bindings(crate::input::CREATE_BUBBLE).is_empty();
-        canvas.set_create_bubble_shortcut_hint(create_bound.then(|| state.input_labels().create_bubble.clone()));
         canvas.set_bottom_hint(Some(CanvasBottomHint { rows: state.input_labels().hint_rows(state.lines_edit_active()) }));
         state.sync_with_project_settings(project);
         state.draw_side_panel(ctx, canvas, project, page_infos);
@@ -160,13 +156,13 @@ impl TranslationTab {
 }
 
 impl StudioTab for TranslationTab {
-    /// The tab's whole input set (`crate::input::declarations`); pinned by
-    /// `input/tests.rs` and the root's `input_registry_golden`.
+    /// The tab's whole input set (`crate::input::declarations`); pinned by `input/tests.rs`
+    /// (the root's `input_registry_golden` checks the merged registry stays conflict-free).
     fn input_declarations(&self) -> Declarations {
         crate::input::declarations()
     }
 
-    /// The canvas's contexts (`CanvasView::input_contexts`: it edits bubbles and accepts zoom),
+    /// The canvas's contexts (`CanvasView::input_contexts`: it edits bubbles),
     /// then the tab's (`TranslationTabState::input_contexts`: detector edit modes, the
     /// advanced-recognition window and its brush, `BRUSH_ACTIVE` while a brush is on).
     fn input_contexts(&self) -> Vec<ContextId> {

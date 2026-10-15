@@ -137,10 +137,6 @@ impl TextureSynthesisInpaintTool {
 }
 
 impl CleaningTool for TextureSynthesisInpaintTool {
-    fn tool_id(&self) -> &'static str {
-        "texture_synthesis_inpaint"
-    }
-
     fn title(&self) -> &'static str {
         t!("cleaning.tools.texture_synthesis.title")
     }

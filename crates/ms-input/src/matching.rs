@@ -12,7 +12,8 @@ Key structures:
 
 Key functions:
 - `MatchState::step`: one press / release / reset.
-- `MatchState::active_modes`, `mode_active`, `match_gesture`, `gesture_params`, `match_axis`.
+- `MatchState::active_modes`, `mode_active`, `command_held`, `match_gesture`, `gesture_params`,
+  `match_axis`.
 
 Matching contract:
 - A chord (resolved through mode references) matches when all its buttons are held and the held
@@ -118,6 +119,14 @@ impl MatchState {
     #[must_use]
     pub fn held(&self) -> &BTreeSet<Button> {
         &self.held
+    }
+
+    /// Whether command `id` was fired by a press whose button is still held (the button that
+    /// completed its chord; released, reset or re-used by another command ends it). Auto-repeats
+    /// keep it. Lets a consumer keep a session open while the key that started it stays down.
+    #[must_use]
+    pub fn command_held(&self, id: ActionId) -> bool {
+        self.fired_by.values().any(|fired| *fired == id)
     }
 
     /// Whether a key sequence is waiting for its next chord.

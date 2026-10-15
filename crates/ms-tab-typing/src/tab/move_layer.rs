@@ -568,8 +568,8 @@ impl TypingTextOverlayLayer {
     ///
     /// A `Pointer` session ends with the pointer button that started its gesture
     /// (`layer_gesture_button`), a `Keyboard` one with the last held key bound to a nudge command
-    /// (`input::nudge_keys_held`, read from `registry`).
-    pub(super) fn drive_layer_move_settle(&mut self, ctx: &egui::Context, registry: &InputRegistry) {
+    /// (`input::nudge_keys_held`, read from this frame's `input`).
+    pub(super) fn drive_layer_move_settle(&mut self, ctx: &egui::Context, input: &InputFrame) {
         // Publish a status message parked by a settle that had no `egui::Context` (one driven from a
         // flush point). Done here because this is the one per-frame settle driver that has one.
         if let Some(message) = self.pending_status_error.take() {
@@ -578,11 +578,11 @@ impl TypingTextOverlayLayer {
         let Some(source) = self.move_session.as_ref().map(|session| session.source) else {
             return;
         };
-        // Held keys are level-triggered and survive the router's consumption of the key events, and
-        // egui clears them on focus loss — so an alt-tab mid-hold settles the session instead of
-        // leaving it open forever.
+        // "Held" is level-triggered (the router's matcher state, unaffected by its consumption of
+        // the key events) and the router resets it on focus loss — so an alt-tab mid-hold settles
+        // the session instead of leaving it open forever.
         let gesture_down = self.layer_gesture_button_down(ctx);
-        let nudge_key_down = input::nudge_keys_held(ctx, registry);
+        let nudge_key_down = input::nudge_keys_held(input);
         if layer_move_settles(source, gesture_down, nudge_key_down) {
             self.settle_layer_move();
         }

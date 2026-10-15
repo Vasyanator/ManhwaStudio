@@ -9,9 +9,8 @@ Key items:
 - `impl StudioTab for CleaningTabState`:
   - `input_declarations`: `crate::input::declarations()` — the clean-overlay history, the tool
     modes / gestures / axes / commands, the region frame and the legacy editor window;
-  - `input_contexts`: the canvas's contexts (`CanvasView::input_contexts`: `canvas.zoom_accepted`
-    unless a running stroke or Space-pan blocks the canvas zoom) plus the active tool's
-    (`CleaningTool::input_contexts`);
+  - `input_contexts`: the canvas's contexts (`CanvasView::input_contexts`: none, the cleaning
+    canvas does not edit bubbles) plus the active tool's (`CleaningTool::input_contexts`);
   - `default_dock_layout`: `cleaning_default_dock_layout` (the tab hosts the panel dock);
   - `evict_tab_gpu_caches`: the canvas clean-overlay cache, then the detector-mask textures;
   - `source_page_window` / `wants_nearest_source`: answered by the tab's canvas;
@@ -41,8 +40,8 @@ impl StudioTab for CleaningTabState {
         crate::input::declarations()
     }
 
-    /// The canvas's contexts (`canvas.zoom_accepted` unless a running stroke or Space-pan blocks
-    /// the canvas zoom; the cleaning canvas does not edit bubbles), then the active tool's.
+    /// The canvas's contexts (none: the cleaning canvas does not edit bubbles), then the active
+    /// tool's.
     fn input_contexts(&self) -> Vec<ContextId> {
         let mut contexts = self.canvas().input_contexts();
         contexts.extend(self.active_tool_input_contexts());
@@ -85,7 +84,7 @@ mod tests {
 
     use crate::tab::{CleaningTabState, cleaning_default_dock_layout};
 
-    /// The tab declares the cleaning set and forwards the canvas's zoom context plus the active
+    /// The tab declares the cleaning set and forwards the canvas's contexts (none) plus the active
     /// tool's contexts (Замазка first: the brush tool, Замазка, the shared brush).
     #[test]
     fn the_tab_declares_its_set_and_forwards_canvas_and_tool_contexts() {
@@ -93,7 +92,7 @@ mod tests {
         assert_eq!(StudioTab::input_declarations(&tab), crate::input::declarations());
         assert_eq!(
             StudioTab::input_contexts(&tab),
-            vec![ms_canvas::input::ZOOM_ACCEPTED, crate::input::TOOL_BRUSH, crate::input::TOOL_ZAMAZKA, ms_tools::mask_brush::BRUSH_ACTIVE]
+            vec![crate::input::TOOL_BRUSH, crate::input::TOOL_ZAMAZKA, ms_tools::mask_brush::BRUSH_ACTIVE]
         );
     }
 

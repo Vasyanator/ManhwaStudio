@@ -415,6 +415,9 @@ pub fn recent_char_rank(params: &[ActionId]) -> Option<usize> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TranslationInputLabels {
     pub create_bubble: String,
+    /// The create-bubble binding for the canvas page menu's "Create bubble" item
+    /// (`CanvasHooks::page_menu_create_bubble_shortcut`): `None` while unbound.
+    pub create_bubble_menu: Option<String>,
     /// The recent-character ranks as a group ("1-6" by default).
     pub recent_chars: String,
     /// The binding of each recent-character rank, rank 1 first (the recent-character cards).
@@ -450,6 +453,7 @@ impl TranslationInputLabels {
         let quick_rect = if quick.is_empty() { registry.label(OCR_QUICK_RECT) } else { quick.join(ms_input::label::ALTERNATIVE_SEPARATOR) };
         Self {
             create_bubble: registry.label(CREATE_BUBBLE),
+            create_bubble_menu: bound(CREATE_BUBBLE),
             recent_chars: registry.param_group_label(&RECENT_CHARS),
             recent_char_keys: RECENT_CHARS.iter().map(|&id| registry.label(id)).collect(),
             create_hint_bubble: registry.label(CREATE_HINT_BUBBLE),

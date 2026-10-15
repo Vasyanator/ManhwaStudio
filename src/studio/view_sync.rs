@@ -415,7 +415,7 @@ mod tests {
         let mut panel_dock = crate::widgets::panel_dock::PanelDockState::new();
         let status = CanvasUiStatus { loaded_pages: 0, total_pages: 0, load_errors_count: 0 };
         // No input: a router over no declarations, whose frame never fires anything.
-        let empty = ms_input::InputRegistry::new(ms_input::Declarations::default()).expect("an empty declaration set is always valid");
+        let empty = ms_input::InputRegistry::empty();
         let input = ms_input::InputRouter::new(empty);
         ctx.run_ui(egui::RawInput::default(), |ui| {
             let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();

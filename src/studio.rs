@@ -64,9 +64,9 @@ App/frame flow:
   (`studio/studio_output.rs`); the inbound calls are `request_os_close` and `request_close_for_incoming`.
 
 Input actions (`build_input_registry`):
-- The shared `ms_input::view` set, its zoom commands and zoom axis gated by the canvas context
-  `ms_canvas::input::ZOOM_ACCEPTED` (`canvas_gated_view_declarations`) while other viewers still
-  read those keys raw (input-unification WP6-WP8 remove the gate).
+- The shared `ms_input::view` set as the crate declares it: every viewer (canvas, advanced
+  recognition, the Cleaning editor window) publishes its own view surface and acts only on input
+  focused on it, and the zoom commands need a view focus, so a tab without a viewer keeps its keys.
 - The canvas' own set (`ms_canvas::input::declarations`) and the shared brush set
   (`ms_tools::mask_brush::declarations`).
 - Declared by the tabs (`StudioTab::input_declarations`: Translation canvas, OCR-mode and panel
@@ -84,7 +84,7 @@ Profiling (optional, behind the `profiling` cargo feature):
 
 use crate::ai_backend_supervisor::AiBackendHandle;
 use crate::canvas::CanvasUiStatus;
-use ms_input::{ActionSpec, Condition, DeclarationError, Declarations, FrameEnv, HotkeyOverrides, InputRegistry, InputRouter, view};
+use ms_input::{DeclarationError, Declarations, FrameEnv, HotkeyOverrides, InputRegistry, InputRouter, view};
 use serde_json::Value;
 use crate::memory_manager::{CacheEvictionRequest, MemoryManager, MemoryPressure};
 use crate::models::autosave_gate::AutosaveGate;
@@ -1116,31 +1116,8 @@ fn restore_panel_dock(user_settings: &Value, defaults: &[panel_dock_persist::Lay
     state
 }
 
-/// The shared `view.*` declarations with the three zoom commands (`view::ZOOM_IN` / `ZOOM_OUT` /
-/// `ZOOM_RESET`) and the zoom axis (`view::ZOOM`) restricted to
-/// `Condition::Context(ms_canvas::input::ZOOM_ACCEPTED)`, the context a canvas tab forwards from
-/// its `CanvasView` while the canvas executes them (its zoom not blocked). So the router consumes
-/// those keys and Ctrl+wheel only where a canvas acts on them; while the advanced-recognition
-/// window, a cleaning editor window or a selected typing layer blocks canvas zoom, and in the PS
-/// editor, they stay with those viewers' own readers. Transitional: removed when those readers
-/// consume the `view.*` set themselves (input-unification WP6-WP8; the PS editor is outside the
-/// migration and needs its own answer first).
-#[must_use]
-fn canvas_gated_view_declarations() -> Declarations {
-    let mut declarations = view::declarations();
-    for action in &mut declarations.actions {
-        let gated = [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET, view::ZOOM];
-        match action {
-            ActionSpec::Command(command) if gated.contains(&command.meta.id) => command.meta.when.push(Condition::Context(ms_canvas::input::ZOOM_ACCEPTED)),
-            ActionSpec::Axis(axis) if gated.contains(&axis.meta.id) => axis.meta.when.push(Condition::Context(ms_canvas::input::ZOOM_ACCEPTED)),
-            ActionSpec::Command(_) | ActionSpec::Axis(_) | ActionSpec::Mode(_) | ActionSpec::Gesture(_) => {}
-        }
-    }
-    declarations
-}
-
-/// Builds the studio's input registry: the shared view set (`canvas_gated_view_declarations`),
-/// the canvas set (`ms_canvas::input::declarations`), the shared brush set
+/// Builds the studio's input registry: the shared view set (`ms_input::view::declarations`), the
+/// canvas set (`ms_canvas::input::declarations`), the shared brush set
 /// (`ms_tools::mask_brush::declarations`), then the tabs' `tab_declarations` (`Tabs::input_declarations`, `AppTab::ALL` order), then the session's
 /// own `session_declarations` (`SessionMode::input_declarations`: the image set's save commands),
 /// then the pre-read user `overrides` (`StudioBootstrap::hotkey_overrides`; an override that
@@ -1150,7 +1127,7 @@ fn canvas_gated_view_declarations() -> Declarations {
 /// [`DeclarationError`] when the merged declarations are invalid (a duplicate id, a dangling mode
 /// reference): a programming error the golden test `input_registry_golden` pins.
 fn build_input_registry(tab_declarations: Declarations, session_declarations: Declarations, overrides: &HotkeyOverrides) -> Result<InputRegistry, DeclarationError> {
-    let mut declarations = canvas_gated_view_declarations();
+    let mut declarations = view::declarations();
     declarations.extend(ms_canvas::input::declarations());
     declarations.extend(ms_tools::mask_brush::declarations());
     declarations.extend(tab_declarations);
@@ -1186,9 +1163,7 @@ fn input_registry_or_empty(built: Result<InputRegistry, DeclarationError>) -> In
         Ok(registry) => registry,
         Err(err) => {
             runtime_log::log_error(format!("[app] the studio's input declarations are invalid ({err}); no binding works in this session"));
-            // An empty declaration set has nothing to validate (no action, target, mode reference
-            // or default binding), so `InputRegistry::new` cannot fail on it.
-            InputRegistry::new(Declarations::default()).expect("an empty declaration set is always valid")
+            InputRegistry::empty()
         }
     }
 }
@@ -1213,15 +1188,15 @@ fn spawn_text_render_font_pool_prewarm() {
 
 #[cfg(test)]
 mod tests {
-    use super::{PanelDockPass, build_input_registry, cancel_capture_outside_settings, canvas_gated_view_declarations, input_registry_or_empty};
+    use super::{PanelDockPass, build_input_registry, cancel_capture_outside_settings, input_registry_or_empty};
     use crate::models::bubbles_model::{BubblesModel, SharedCanvasSettings};
     use crate::tabs::AppTab;
     use crate::tabs::cleaning::CleaningTabState;
     use crate::tabs::translation::{TranslationTab, TranslationTabState};
     use crate::tabs::typing::TypingTabState;
     use eframe::egui;
-    use ms_input::{ActionKind, Condition, Declarations, HotkeyOverrides, InputRegistry, Scope, view};
-    use ms_canvas::input::{EDITABLE, ZOOM_ACCEPTED};
+    use ms_input::{ActionKind, Declarations, DeclarationError, HotkeyOverrides, InputRegistry, Scope, view};
+    use ms_canvas::input::EDITABLE;
     use ms_studio_tab::StudioTab;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
@@ -1288,19 +1263,39 @@ mod tests {
     ///
     /// Also checks the FULL registry, built exactly as `StudioApp::new` builds it (view + canvas +
     /// brush + every tab + the image-set session): it must be valid and its defaults conflict-free.
+    /// The registry `built` returned, or a test failure naming `what`.
+    fn registry_or_panic(built: Result<InputRegistry, DeclarationError>, what: &str) -> InputRegistry {
+        match built {
+            Ok(registry) => registry,
+            Err(err) => panic!("{what} must be valid: {err}"),
+        }
+    }
+
+    /// Installs the embedded English catalog for a label assertion; the caller holds the global
+    /// locale lock (`english_locale`) for the whole test.
+    fn english_locale() -> std::sync::MutexGuard<'static, ()> {
+        let guard = match crate::locale_store::GLOBAL_LOCALE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Err(err) = ms_i18n::set_locale(&ms_i18n::LocaleTag::english()) {
+            panic!("the embedded English catalog must install: {err}");
+        }
+        guard
+    }
+
     #[test]
     fn input_registry_golden() {
         use ActionKind::{Axis, Command, Gesture, Mode};
         const CV: Scope = Scope::Canvas;
         const BRUSH: Scope = Scope::Sub(None);
         // Held for the whole test: the active catalog is process-global.
-        let _locale = crate::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
-        ms_i18n::set_locale(&ms_i18n::LocaleTag::english()).expect("embedded English catalog installs");
+        let _locale = english_locale();
 
-        let full = build_input_registry(all_tab_declarations(), crate::studio::session::image_set::input_declarations(), &HotkeyOverrides::default()).expect("the full studio declarations are valid");
+        let full = registry_or_panic(build_input_registry(all_tab_declarations(), crate::studio::session::image_set::input_declarations(), &HotkeyOverrides::default()), "the full studio declarations");
         assert!(full.conflicts().conflicts.is_empty(), "the default bindings of the full studio registry conflict: {:#?}", full.conflicts().conflicts);
 
-        let registry = build_input_registry(Declarations::default(), crate::studio::session::image_set::input_declarations(), &HotkeyOverrides::default()).expect("the root declarations are valid");
+        let registry = registry_or_panic(build_input_registry(Declarations::default(), crate::studio::session::image_set::input_declarations(), &HotkeyOverrides::default()), "the root declarations");
         let ctrl = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
         let zoom = format!("({ctrl} / Z)");
         let minus = egui::Key::Minus.symbol_or_name();
@@ -1311,7 +1306,7 @@ mod tests {
         let expected: Vec<(&str, ActionKind, Scope, bool, String)> = vec![
             ("view.zoom_modifier", Mode, Scope::View, false, format!("{ctrl} / Z")),
             ("view.pan", Mode, Scope::View, false, "Space".to_owned()),
-            ("view.zoom_in", Command, Scope::View, false, format!("{zoom}+= / {zoom}+Shift+=")),
+            ("view.zoom_in", Command, Scope::View, false, format!("{zoom}+= / {zoom}+Shift+= / {zoom}++")),
             ("view.zoom_out", Command, Scope::View, false, format!("{zoom}+{minus}")),
             ("view.zoom_reset", Command, Scope::View, false, format!("{zoom}+0")),
             ("view.zoom", Axis, Scope::View, false, format!("{zoom}+Wheel / Pinch")),
@@ -1346,33 +1341,20 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// The canvas gate: exactly the three zoom commands and the zoom axis of the view set gain
-    /// `Context(ZOOM_ACCEPTED)`; every other view declaration is the crate's own, unchanged. Both
-    /// canvas tabs forward their canvas's contexts: Translation edits bubbles, Cleaning does not,
-    /// and none of the three canvas tabs blocks zoom by default (Typing: no layer selected).
+    /// The view set is registered as `ms_input::view` declares it (no root gate: every viewer acts
+    /// only on input focused on its own view), and the canvas tabs forward their canvas's
+    /// contexts: Translation edits bubbles, Cleaning and Typing do not.
     #[test]
-    fn only_the_view_zoom_keys_are_gated_by_the_canvas() {
-        let gated = canvas_gated_view_declarations();
-        let original = view::declarations();
-        assert_eq!(gated.actions.len(), original.actions.len());
-        for (gated, original) in gated.actions.iter().zip(&original.actions) {
-            let id = gated.meta().id;
-            if [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET, view::ZOOM].contains(&id) {
-                let mut expected_when = original.meta().when.clone();
-                expected_when.push(Condition::Context(ZOOM_ACCEPTED));
-                assert_eq!(gated.meta().when, expected_when, "{id:?}");
-            } else {
-                assert_eq!(gated, original, "{id:?} must stay as `ms_input::view` declares it");
-            }
+    fn the_view_set_is_ungated_and_canvas_contexts_are_forwarded() {
+        let registry = registry_or_panic(build_input_registry(Declarations::default(), Declarations::default(), &HotkeyOverrides::default()), "the root declarations");
+        for action in view::declarations().actions {
+            let id = action.meta().id;
+            assert_eq!(registry.spec(id), Some(&action), "{id:?} must stay as `ms_input::view` declares it");
         }
-        assert_eq!((gated.targets, gated.fixed), (original.targets, original.fixed));
         let (translation, cleaning, typing) = input_tabs();
-        let translation = translation.input_contexts();
-        assert!(translation.contains(&EDITABLE) && translation.contains(&ZOOM_ACCEPTED), "{translation:?}");
-        let cleaning = cleaning.input_contexts();
-        assert!(cleaning.contains(&ZOOM_ACCEPTED), "{cleaning:?}");
-        let typing = typing.input_contexts();
-        assert!(typing.contains(&ZOOM_ACCEPTED), "{typing:?}");
+        assert!(translation.input_contexts().contains(&EDITABLE));
+        assert!(!cleaning.input_contexts().contains(&EDITABLE));
+        assert!(!typing.input_contexts().contains(&EDITABLE));
     }
 
     /// The image set's two save commands join the registry without a conflict (exact modifier sets:
@@ -1383,7 +1365,7 @@ mod tests {
         let (translation, _) = translation_and_cleaning();
         let mut overrides = HotkeyOverrides::default();
         overrides.actions.insert("translation.panel.ocr.toggle".to_owned(), Vec::new());
-        let registry = build_input_registry(translation.input_declarations(), crate::studio::session::image_set::input_declarations(), &overrides).expect("valid declarations");
+        let registry = registry_or_panic(build_input_registry(translation.input_declarations(), crate::studio::session::image_set::input_declarations(), &overrides), "the Translation and session declarations");
         assert!(registry.action("single_image.save").is_some() && registry.action("single_image.save_as").is_some());
         assert!(registry.conflicts().conflicts.is_empty(), "{:?}", registry.conflicts().conflicts);
         assert!(registry.bindings(ms_input::ActionId("translation.panel.ocr.toggle")).is_empty(), "the override unbinds the action");
@@ -1408,7 +1390,10 @@ mod tests {
             suppressed = Some(router.begin_frame(ui.ctx(), &env).suppressed());
         })
         .drop_without_applying_deltas();
-        suppressed.expect("run_ui calls the frame closure")
+        match suppressed {
+            Some(suppressed) => suppressed,
+            None => panic!("run_ui must call the frame closure"),
+        }
     }
 
     /// A capture started in Settings › Hotkeys keeps suppressing input only while the Settings
@@ -1416,7 +1401,7 @@ mod tests {
     /// with no capture the helper does nothing.
     #[test]
     fn a_binding_capture_ends_when_the_settings_tab_is_left() {
-        let registry = build_input_registry(Declarations::default(), Declarations::default(), &HotkeyOverrides::default()).expect("valid declarations");
+        let registry = registry_or_panic(build_input_registry(Declarations::default(), Declarations::default(), &HotkeyOverrides::default()), "the root declarations");
         let mut router = ms_input::InputRouter::new(registry);
         let ctx = egui::Context::default();
         router.capture_begin(view::ZOOM_IN, ms_input::CaptureSlot::Append);

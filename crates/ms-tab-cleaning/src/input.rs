@@ -20,11 +20,11 @@ Key items:
 - `editor_window_view_id`: the view identity of a legacy region-editor window.
 
 Notes:
-- Canvas-wide gestures are `Drag` bindings on `ms_input::view::SURFACE`: the router claims them at
-  the press and the canvas raises its capture `Area`, so no bubble or page row reacts. The two
-  right-button actions (`PICK_COLOR`, `STAMP_SET_ANCHOR`) are `Drag` bindings acted on at the
-  claim's `Started` phase, i.e. on the press: a `Click` on a canvas-wide target could only be
-  resolved from the canvas' private capture `Response`.
+- Canvas-wide gestures are bindings on `ms_input::view::SURFACE`: the router claims them at the
+  press and the canvas raises its capture `Area`, so no bubble or page row reacts. Strokes and
+  selections are `Drag` bindings; the two right-button press actions (`PICK_COLOR`,
+  `STAMP_SET_ANCHOR`) are `Click` bindings, claimed at the press and acted on at the claim's
+  `Started` phase (the press itself), as the old secondary-press handling did.
 - Scopes: the clean-overlay history is `Tab(Cleaning)`; tool modes, canvas gestures, the frame
   and the tool commands are `Sub(Some(Cleaning))`; the legacy window's brush gestures are
   `Window(Some(Cleaning))`. The frame's stroke undo (`FRAME_UNDO_STROKE`) therefore shadows the
@@ -77,9 +77,9 @@ pub const SELECT_MODE: ActionId = ActionId("cleaning.select_mode");
 pub const STAMP_ROTATE_MODE: ActionId = ActionId("cleaning.stamp.rotate_mode");
 /// Gesture: a brush stroke on the page (accepts `ERASE_MODE` latest, `RECT_MODE` at the press).
 pub const STROKE: ActionId = ActionId("cleaning.stroke");
-/// Gesture (acted on at the press): pick the colour under the pointer (Замазка).
+/// Gesture (`Click`, acted on at the press): pick the colour under the pointer (Замазка).
 pub const PICK_COLOR: ActionId = ActionId("cleaning.pick_color");
-/// Gesture (acted on at the press): set the clone-stamp source point (Штамп).
+/// Gesture (`Click`, acted on at the press): set the clone-stamp source point (Штамп).
 pub const STAMP_SET_ANCHOR: ActionId = ActionId("cleaning.stamp.set_anchor");
 /// Axis: rotate the stamp, fine steps.
 pub const STAMP_ROTATE: ActionId = ActionId("cleaning.stamp.rotate");
@@ -171,6 +171,11 @@ fn drag(chord: Chord, button: MouseButton) -> Binding {
     Binding::gesture(chord, mouse(button), GestureKind::Drag)
 }
 
+/// A plain click of `button` (a canvas-wide press action).
+fn click(button: MouseButton) -> Binding {
+    Binding::gesture(Chord::default(), mouse(button), GestureKind::Click)
+}
+
 /// The tab's input declarations: the clean-overlay history (tab scope), the tool modes, canvas
 /// gestures, axes and commands, the region frame's set (sub scope), the legacy editor window's
 /// brush gestures (window scope), the frame / window targets and the exclusive context groups.
@@ -220,9 +225,9 @@ pub fn declarations() -> Declarations {
             view::SURFACE,
             vec![Accept { mode: ERASE_MODE, sample: Sample::LatestDuringGesture }, Accept { mode: RECT_MODE, sample: Sample::AtPress }],
         ),
-        gesture(meta(PICK_COLOR, "cleaning.input.pick_color_title", SECTION_BRUSH, SUB, tool(TOOL_ZAMAZKA), vec![drag(Chord::default(), Right)]), view::SURFACE, Vec::new()),
+        gesture(meta(PICK_COLOR, "cleaning.input.pick_color_title", SECTION_BRUSH, SUB, tool(TOOL_ZAMAZKA), vec![click(Right)]), view::SURFACE, Vec::new()),
         gesture(
-            meta(STAMP_SET_ANCHOR, "cleaning.input.stamp_set_anchor_title", SECTION_BRUSH, SUB, tool(TOOL_STAMP), vec![drag(Chord::default(), Right)]),
+            meta(STAMP_SET_ANCHOR, "cleaning.input.stamp_set_anchor_title", SECTION_BRUSH, SUB, tool(TOOL_STAMP), vec![click(Right)]),
             view::SURFACE,
             Vec::new(),
         ),
@@ -568,8 +573,8 @@ mod tests {
             (SELECT_MODE, ActionKind::Mode, sub, "Shift".to_owned()),
             (STAMP_ROTATE_MODE, ActionKind::Mode, sub, "R".to_owned()),
             (STROKE, ActionKind::Gesture, sub, "LMB drag".to_owned()),
-            (PICK_COLOR, ActionKind::Gesture, sub, "RMB drag".to_owned()),
-            (STAMP_SET_ANCHOR, ActionKind::Gesture, sub, "RMB drag".to_owned()),
+            (PICK_COLOR, ActionKind::Gesture, sub, "RMB click".to_owned()),
+            (STAMP_SET_ANCHOR, ActionKind::Gesture, sub, "RMB click".to_owned()),
             (STAMP_ROTATE, ActionKind::Axis, sub, "R+Wheel".to_owned()),
             (STAMP_ROTATE_COARSE, ActionKind::Axis, sub, "R+Shift+Wheel".to_owned()),
             (REGION_SELECT_RECT, ActionKind::Gesture, sub, "Shift+LMB drag / Long press and drag".to_owned()),
@@ -608,23 +613,29 @@ mod tests {
         assert!(shadowed_by(STROKE).iter().any(|(_, outer)| *outer == view::ZOOM_DRAG), "Ctrl+drag (rect) shadows the Ctrl zoom drag");
     }
 
-    /// Canvas-wide claims: every stroke / press action is a `Drag` on `view.surface`.
+    /// Canvas-wide claims: every stroke is a `Drag`, every press action a `Click`, on
+    /// `view.surface`.
     #[test]
-    fn canvas_claims_are_surface_drags() {
+    fn canvas_claims_are_surface_drags_and_clicks() {
         let registry = registry();
-        for id in STROKE_ACTIONS.into_iter().chain(PRESS_ACTIONS) {
+        let kinds = STROKE_ACTIONS.into_iter().map(|id| (id, GestureKind::Drag)).chain(PRESS_ACTIONS.into_iter().map(|id| (id, GestureKind::Click)));
+        for (id, kind) in kinds {
             let Some(ActionSpec::Gesture(spec)) = registry.spec(id) else { panic!("{id:?} is a gesture") };
             assert_eq!(spec.target, view::SURFACE, "{id:?}");
-            assert!(spec.meta.defaults.iter().all(|binding| matches!(binding, Binding::Gesture(g) if g.kind == GestureKind::Drag)), "{id:?}");
+            assert!(spec.meta.defaults.iter().all(|binding| matches!(binding, Binding::Gesture(g) if g.kind == kind)), "{id:?}");
         }
     }
 
     fn env(contexts: &[ContextId]) -> ActiveSet {
-        ActiveSet { active_tab: Some(AppTab::Cleaning), contexts: contexts.iter().copied().collect(), pointer_on_view: true, ..ActiveSet::default() }
+        ActiveSet { active_tab: Some(AppTab::Cleaning), contexts: contexts.iter().copied().collect(), pointer_on_view: true, view_focus: true, ..ActiveSet::default() }
     }
 
     fn surface_drag(registry: &InputRegistry, state: &MatchState, button: MouseButton, contexts: &[ContextId]) -> Option<ActionId> {
-        state.match_gesture(registry, &Button::Mouse(button), GestureKind::Drag, &[view::SURFACE], &env(contexts)).map(|matched| matched.action)
+        surface_gesture(registry, state, button, GestureKind::Drag, contexts)
+    }
+
+    fn surface_gesture(registry: &InputRegistry, state: &MatchState, button: MouseButton, kind: GestureKind, contexts: &[ContextId]) -> Option<ActionId> {
+        state.match_gesture(registry, &Button::Mouse(button), kind, &[view::SURFACE], &env(contexts)).map(|matched| matched.action)
     }
 
     fn held(buttons: &[Button]) -> MatchState {
@@ -650,8 +661,9 @@ mod tests {
         assert_eq!(surface_drag(&registry, &held(&[ctrl.clone(), lmb.clone()]), MouseButton::Left, &brush), Some(STROKE), "Ctrl+drag is the rectangle");
         assert_eq!(surface_drag(&registry, &held(&[shift.clone(), lmb.clone()]), MouseButton::Left, &brush), Some(STROKE), "Shift+drag erases");
         assert_eq!(surface_drag(&registry, &held(&[z.clone(), lmb.clone()]), MouseButton::Left, &brush), Some(view::ZOOM_DRAG), "Z+drag zooms");
-        assert_eq!(surface_drag(&registry, &held(std::slice::from_ref(&lmb)), MouseButton::Right, &brush), Some(PICK_COLOR));
-        assert_eq!(surface_drag(&registry, &held(&[]), MouseButton::Right, &[TOOL_BRUSH, TOOL_STAMP]), Some(STAMP_SET_ANCHOR));
+        assert_eq!(surface_drag(&registry, &held(&[]), MouseButton::Right, &brush), None, "a right drag is no press action");
+        assert_eq!(surface_gesture(&registry, &held(&[]), MouseButton::Right, GestureKind::Click, &brush), Some(PICK_COLOR));
+        assert_eq!(surface_gesture(&registry, &held(&[]), MouseButton::Right, GestureKind::Click, &[TOOL_BRUSH, TOOL_STAMP]), Some(STAMP_SET_ANCHOR));
 
         let region = [REGION_SELECT];
         assert_eq!(surface_drag(&registry, &held(std::slice::from_ref(&lmb)), MouseButton::Left, &region), None, "a plain drag does not select");

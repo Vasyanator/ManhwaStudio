@@ -1434,6 +1434,7 @@ mod tests {
             current,
             params: Vec::new(),
             button: Button::Touch(ms_input::TouchSource::LongPressDrag),
+            kind: ms_input::GestureKind::Drag,
         };
         let on_page = |_: Pos2| true;
         let mut slot: Option<TypingCreateSelection> = None;

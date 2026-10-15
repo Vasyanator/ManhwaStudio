@@ -164,16 +164,18 @@ what (ids are persistence keys of the user's overrides, never renamed):
   its zoom keys need the zoom modifier and stay quiet while a text field has focus.
 - **Bubble card menu** (`translation.bubble_card.menu`, RMB click): the card's own `Ui` senses
   clicks behind its widgets; the menu opens on the gesture through `ms_input::touch::context_menu_popup`.
-- **Contexts** (`TranslationTab::input_contexts`): the canvas's (`EDITABLE`, `ZOOM_ACCEPTED`), then
-  the tab's (`crate::input::contexts`). The canvas's zoom is never blocked by this tab.
+- **Contexts** (`TranslationTab::input_contexts`): the canvas's (`EDITABLE`), then the tab's
+  (`crate::input::contexts`). The canvas's zoom is never blocked by this tab; the canvas locks it
+  itself while an OCR / crop rectangle claim runs (the page must not move under the rectangle).
 - **Labels**: every hint (bottom-hint rows, panel titles and open buttons, OCR panel selection
   hints, mask edit hints, the advanced window's controls hint, the recent-character cards) is
   built from `TranslationInputLabels::from_registry`, rebuilt every frame by the host.
 - **Hooks see the frame** through `TranslationTabState::input_frame`, a copy the host sets before
   its draw (`begin_input_frame`) and drops after it (`end_input_frame`), like `CanvasView` does.
-- **Remaining canvas adapter**: `CanvasView::set_create_bubble_shortcut_hint` (the page menu's
-  "create bubble" binding text), until the canvas can ask its tab for it. Widget-owned input (text
-  editing, `Wheel*` widgets, buttons, egui's own context menus of the MT buttons) is not a binding.
+- **Page menu label**: the canvas asks the tab for the "Create bubble" binding text through
+  `CanvasHooks::page_menu_create_bubble_shortcut` (`TranslationInputLabels::create_bubble_menu`,
+  `None` while unbound). Widget-owned input (text editing, `Wheel*` widgets, buttons, egui's own
+  context menus of the MT buttons) is not a binding.
 
 Text-detector mask GPU textures are a reconstructable display cache. The tab exposes memory
 snapshots and coarse eviction methods for those textures, while detector result masks and stored
@@ -366,8 +368,9 @@ is an author note addressed to the translator, not a replica.
 ## Contracts and invariants
 - Input action ids are persistence keys (`user_config` -> `Hotkeys`): never rename one. Every
   declared command has an execute arm in `host/hotkeys.rs` (`host/tests.rs` checks it); where a
-  command may run is its declared conditions, never a check in the arm. The root's
-  `input_registry_golden` pins the same set.
+  command may run is its declared conditions, never a check in the arm. `input/tests.rs`
+  (`declarations_golden`) pins the set; the root's `input_registry_golden` only checks that the
+  merged studio registry stays valid and conflict-free.
 - Only `TranslationTab` touches the Translation canvas on the root's behalf; the root reaches it
   through `canvas()` / `canvas_mut()` (view sync, bubble flush) and the `StudioTab` hooks.
 - OCR, detector, MT, storage load/save, crop preparation, and backend health work must not block
@@ -540,8 +543,8 @@ is an author note addressed to the translator, not a replica.
   directly. The tab publishes native ORT as armed only when `local_ai.native_onnx` is `Ok`.
 ## Editing map
 - To add or change an input action (its default binding, conditions, scope) or a hint text built
-  from bindings, edit `input.rs` (and its golden in `input/tests.rs`, plus the root's
-  `input_registry_golden`); what a command does, `host/hotkeys.rs`; how a canvas selection, the
+  from bindings, edit `input.rs` (and its golden in `input/tests.rs`; the root's
+  `input_registry_golden` checks the merged registry stays conflict-free); what a command does, `host/hotkeys.rs`; how a canvas selection, the
   lines editor or the mask brush reacts, `tab/canvas_input.rs`; the advanced window's gestures and
   zoom, `adv_rec.rs`. Zoom itself is the shared `view.*` set (`ms-input`, executed by the canvas).
   To change the per-frame canvas configuration or which caches the tab evicts, edit

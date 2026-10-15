@@ -26,7 +26,7 @@ Notes:
 - OCR dispatch and bubble creation stay in `tab.rs`, which already owns OCR controller/canvas logic.
 */
 
-use ms_input::{GesturePhase, HitPhase, InputFrame, ViewId, ViewSurface, publish_view_surface, view};
+use ms_input::{AxisSource, HitPhase, InputFrame, ViewId, ViewSurface, publish_view_surface, view};
 use ms_tools::MaskBrush;
 use ms_widgets::WheelSlider;
 use eframe::egui;
@@ -123,8 +123,9 @@ struct AdvancedRecognitionSession {
     status: Option<String>,
     zoom: f32,
     scroll_id: u64,
-    zoom_drag_active: bool,
-    zoom_drag_last_x: f32,
+    /// The preview view's `view.zoom_drag` (`apply_adv_rec_view_input`); the image takes no
+    /// gesture while it runs.
+    zoom_drag: ms_canvas::input::ZoomDrag,
     active_request_id: Option<u64>,
     brush_enabled: bool,
     brush: MaskBrush,
@@ -559,8 +560,7 @@ impl AdvancedRecognitionWindow {
                                 status: None,
                                 zoom: 1.0,
                                 scroll_id: self.session_id,
-                                zoom_drag_active: false,
-                                zoom_drag_last_x: 0.0,
+                                zoom_drag: ms_canvas::input::ZoomDrag::default(),
                                 active_request_id: None,
                                 brush_enabled: false,
                                 brush: MaskBrush::default(),
@@ -845,7 +845,7 @@ fn handle_adv_rec_image_input(
         ui.painter().rect_stroke(selection_rect, 0.0, egui::Stroke::new(2.0, ms_theme::canvas::SELECTION), egui::StrokeKind::Outside);
     }
 
-    let gesture = if session.zoom_drag_active { None } else { input.and_then(|input| input.gesture_for(response, &[(TARGET_ADV_REC_IMAGE, true)])) };
+    let gesture = if session.zoom_drag.active() { None } else { input.and_then(|input| input.gesture_for(response, &[(TARGET_ADV_REC_IMAGE, true)])) };
     let pointer = response.interact_pointer_pos();
     match gesture.map(|gesture| (gesture.action, gesture.phase)) {
         Some((ADV_REC_SELECT_RECT, phase)) => {
@@ -951,8 +951,10 @@ fn paint_adv_rec_brush_to(session: &mut AdvancedRecognitionSession, pointer_pos:
 }
 
 /// Applies this frame's shared `view.*` input aimed at the preview (`adv_rec_view_id`): zoom
-/// commands and the wheel zoom axis whose focus is this view, and its zoom-drag claim. Returns
-/// whether the zoom changed. A pinch (an axis sample without wheel steps) is not applied here.
+/// commands and the wheel zoom axis whose focus is this view (wheel notches of every wheel
+/// sample), and its zoom-drag claim (`ms_canvas::input::ZoomDrag`, the window's own drag law).
+/// Returns whether the zoom changed. A pinch sample is not applied here (the window never zoomed
+/// by pinch).
 fn apply_adv_rec_view_input(session: &mut AdvancedRecognitionSession, input: &InputFrame) -> bool {
     let view_id = adv_rec_view_id();
     let mut changed = false;
@@ -964,29 +966,16 @@ fn apply_adv_rec_view_input(session: &mut AdvancedRecognitionSession, input: &In
             _ => {}
         }
     }
-    if let Some(sample) = input.axis_for_view(view::ZOOM, view_id)
-        && sample.steps != 0
-    {
-        changed |= session.scale_zoom(ADV_REC_ZOOM_STEP.powi(sample.steps));
+    let steps = input
+        .axis_samples_for_view(view::ZOOM, view_id)
+        .filter(|sample| matches!(sample.source, AxisSource::WheelY | AxisSource::WheelX))
+        .fold(0_i32, |sum, sample| sum.saturating_add(sample.steps));
+    if steps != 0 {
+        changed |= session.scale_zoom(ADV_REC_ZOOM_STEP.powi(steps));
     }
-    let claim = input.claimed(view_id).filter(|claim| claim.action == view::ZOOM_DRAG);
-    match claim.map(|claim| (claim.phase, claim.origin.x, claim.current.x)) {
-        Some((phase @ (GesturePhase::Started | GesturePhase::Active), origin_x, current_x)) => {
-            // A new drag measures from its press point; one that only now reaches the window
-            // from where it is, so the zoom does not jump.
-            if phase == GesturePhase::Started {
-                session.zoom_drag_last_x = origin_x;
-            } else if !session.zoom_drag_active {
-                session.zoom_drag_last_x = current_x;
-            }
-            session.zoom_drag_active = true;
-            let dx = current_x - session.zoom_drag_last_x;
-            if dx.abs() > f32::EPSILON {
-                changed |= session.scale_zoom(adv_rec_zoom_drag_factor(dx));
-                session.zoom_drag_last_x = current_x;
-            }
-        }
-        Some((GesturePhase::Finished(_), _, _)) | None => session.zoom_drag_active = false,
+    let dx = session.zoom_drag.step(input.claimed(view_id));
+    if dx.abs() > f32::EPSILON {
+        changed |= session.scale_zoom(adv_rec_zoom_drag_factor(dx));
     }
     changed
 }

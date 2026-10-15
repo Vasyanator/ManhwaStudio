@@ -3,7 +3,7 @@
 //! the line move / resize geometry, and the contexts the tab state publishes per edit mode.
 
 use eframe::egui::{Rect, pos2};
-use ms_input::{ActionId, Button, ClaimedGesture, GesturePhase, MouseButton, ReleasePolicy, ViewId, view};
+use ms_input::{ActionId, Button, ClaimedGesture, GestureKind, GesturePhase, MouseButton, ReleasePolicy, ViewId, view};
 
 use super::{
     CanvasSelection, CanvasSelectionKind, LineEditHit, SelectionStep, advance_selection, is_committable, line_edit_hits, move_text_detector_rect,
@@ -24,6 +24,7 @@ fn claim(action: ActionId, phase: GesturePhase, current: (f32, f32), params: Vec
         current: pos2(current.0, current.1),
         params,
         button: Button::Mouse(MouseButton::Left),
+        kind: GestureKind::Drag,
     }
 }
 

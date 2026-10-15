@@ -513,8 +513,9 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   default is always the real spawner: a test opts OUT, and no product code path changes.
 - An open legacy region editor window is a VIEW of its own: it publishes a `ViewSurface` (its
   window layer as capture layer), so the shared `view.*` zoom keys, Ctrl+wheel and the zoom drag
-  aim at it while the pointer is over it (`apply_editor_window_zoom`); the canvas keeps its zoom
-  for the rest of the screen. The window's brush takes the shared `brush.*` actions once per frame
+  aim at it while the pointer is over it (`apply_editor_window_zoom`: the canvas' laws per axis
+  sample source, `ms_canvas::input::zoom_axis_factor`, and the shared `ZoomDrag`); the canvas keeps
+  its zoom for the rest of the screen. The window's brush takes the shared `brush.*` actions once per frame
   (`RegionMaskInpaintToolBase::apply_input`).
 - `CleaningTool` carries five additive, defaulted methods for tools that own something beyond
   «Выбранный инструмент»: `set_panel_rects` (pushed by the tab each frame after `canvas.draw` and

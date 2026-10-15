@@ -92,10 +92,6 @@ impl GradientFillTool {
 }
 
 impl CleaningTool for GradientFillTool {
-    fn tool_id(&self) -> &'static str {
-        "gradient_fill"
-    }
-
     fn title(&self) -> &'static str {
         t!("cleaning.tools.gradient.title")
     }

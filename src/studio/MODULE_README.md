@@ -49,11 +49,9 @@ Root responsibilities that stay in `studio.rs`:
   image set's save / save-as); the drawing tab gets the router through `TabFrame::input` (its
   frame and registry; the Settings pane edits the bindings, applied from the next frame).
   The registry also holds the canvas set (`ms_canvas::input::declarations`) and the shared brush
-  set (`ms_tools::mask_brush::declarations`). Canvas gate: the view set's zoom commands and zoom
-  axis are registered with `Condition::Context(ms_canvas::input::ZOOM_ACCEPTED)`
-  (`canvas_gated_view_declarations`), which a canvas tab forwards from its `CanvasView` while the
-  canvas executes them, so the keys and Ctrl+wheel stay with a tab's own readers while it blocks
-  canvas zoom, and with the PS editor; removed by input-unification WP6-WP8.
+  set (`ms_tools::mask_brush::declarations`). The view set is registered ungated, as `ms_input::view`
+  declares it: every viewer acts only on input focused on its own view surface, and the zoom
+  commands need a view focus, so a tab without a viewer (the PS editor) keeps those keys.
 - **Residency glue.** `studio.rs` supplies what residency must not know: the active tab's page
   window (`active_source_page_window`; for the page manager the one page its viewer draws), the
   pixel-inspection flag, and the eviction of the tabs' own GPU caches (`Tabs::evict_tab_gpu_caches`),
@@ -224,7 +222,8 @@ Root responsibilities that stay in `studio.rs`:
   three at once, `for_each_canvas_mut`; no site spells its own Translation / Cleaning / Typing match.
 - Per-tab ORDER-FREE questions go through `Tabs` and `ms_studio_tab::StudioTab`, never a per-tab
   `match` in `studio.rs`: input declarations (`Tabs::input_declarations`, `AppTab::ALL` order,
-  after the view set and before the session's; pinned by `input_registry_golden`), the ACTIVE
+  after the view set and before the session's; the merged registry is checked valid and
+  conflict-free by `input_registry_golden`, the tab rows are pinned by each tab crate's golden), the ACTIVE
   tab's `input_contexts` (every frame, before `begin_frame`), dock hosts, GPU eviction, the active tab's
   source-page window and NEAREST flag, the every-frame `poll_background` (after the residency's
   decoded-page poll, before any busy gate reads `clean_op_in_flight`) and

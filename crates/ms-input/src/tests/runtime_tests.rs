@@ -31,6 +31,11 @@ const H_SCROLL: ActionId = ActionId("test.h_scroll");
 const COMMIT_MODE: ActionId = ActionId("test.commit_mode");
 const CANCEL_MODE: ActionId = ActionId("test.cancel_mode");
 const POLICY_RECT: ActionId = ActionId("test.policy_rect");
+/// A canvas-wide RMB click (a press action).
+const PRESS: ActionId = ActionId("test.press");
+/// A canvas-wide MMB drag active only under the `GATE` context.
+const GATED: ActionId = ActionId("test.gated");
+const GATE: crate::ContextId = crate::ContextId("test.gate");
 /// The second view of the two-view tests: overlaps the first one in x 300..500, y 0..300.
 const SECOND_RECT: Rect = Rect { min: Pos2 { x: 300.0, y: 0.0 }, max: Pos2 { x: 700.0, y: 300.0 } };
 
@@ -112,6 +117,12 @@ fn declarations() -> Vec<ActionSpec> {
             ],
             Vec::new(),
         ),
+        gesture(PRESS.0, Scope::Tab(TAB), view::SURFACE.0, vec![Binding::gesture(Chord::default(), Button::Mouse(MouseButton::Right), GestureKind::Click)], Vec::new()),
+        ActionSpec::Gesture(crate::GestureSpec {
+            meta: meta(GATED.0, Scope::Tab(TAB), vec![crate::Condition::Context(GATE)], vec![Binding::gesture(Chord::default(), Button::Mouse(MouseButton::Middle), GestureKind::Drag)]),
+            target: view::SURFACE,
+            accepts: Vec::new(),
+        }),
     ]
 }
 
@@ -371,7 +382,6 @@ fn a_press_in_a_hole_or_without_a_chord_is_not_claimed() {
     bench.frame(vec![button_event(HOLE.center(), PointerButton::Primary, false, ctrl_mods()), Event::ModifiersChanged(Modifiers::NONE)], &env(), published());
     let out = bench.frame(vec![Event::PointerMoved(ON_VIEW), button_event(ON_VIEW, PointerButton::Primary, true, Modifiers::NONE)], &env(), published());
     assert!(out.frame.claimed(view_id()).is_none(), "plain LMB has no canvas-wide gesture here");
-    assert!(!out.frame.canvas_wide_armed(view_id()));
 }
 
 #[test]
@@ -653,4 +663,81 @@ fn an_overlap_under_a_capture_layer_belongs_to_the_view_that_owns_it() {
     bench.frame(Vec::new(), &env(), draw);
     let out = bench.frame(vec![Event::PointerMoved(pos2(370.0, 70.0))], &env(), draw);
     assert_eq!(out.frame.view_under_pointer(), Some(second_id()), "the view whose capture layer is on top wins, not the first published");
+}
+
+#[test]
+fn command_held_lasts_while_the_firing_key_is_down() {
+    let mut bench = Bench::new();
+    let out = bench.frame(vec![key_event(egui::Key::P, true, false, Modifiers::NONE)], &env(), Draw::default());
+    assert!(out.frame.fired(P).is_some() && out.frame.command_held(P));
+    let out = bench.frame(vec![key_event(egui::Key::P, true, true, Modifiers::NONE)], &env(), Draw::default());
+    assert!(out.frame.command_held(P), "an auto-repeat keeps it held");
+    let out = bench.frame(Vec::new(), &env(), Draw::default());
+    assert!(out.frame.fired(P).is_none() && out.frame.command_held(P), "held across frames without events (OS repeat delay)");
+    let out = bench.frame(vec![key_event(egui::Key::P, false, false, Modifiers::NONE)], &env(), Draw::default());
+    assert!(!out.frame.command_held(P), "the release ends it");
+    let out = bench.frame(vec![key_event(egui::Key::Q, true, false, Modifiers::NONE)], &env(), Draw::default());
+    assert!(!out.frame.command_held(P), "another key never holds it");
+    let out = bench.frame(vec![key_event(egui::Key::P, true, false, Modifiers::NONE), Event::WindowFocused(false)], &env(), Draw::default());
+    assert!(!out.frame.command_held(P), "focus loss releases everything");
+}
+
+/// A frame feeding one axis from the wheel and a pinch reports one sample per source, each in its
+/// own unit.
+#[test]
+fn axis_samples_carry_their_source() {
+    let mut bench = Bench::new();
+    bench.frame(vec![Event::PointerMoved(ON_VIEW), key_event(egui::Key::Z, true, false, Modifiers::NONE)], &env(), published());
+    let out = bench.frame(vec![wheel(MouseWheelUnit::Line, 1.0, Modifiers::NONE), Event::Zoom(2.0)], &env(), published());
+    let samples: Vec<_> = out.frame.axis_samples_for_view(view::ZOOM, view_id()).map(|sample| (sample.source, sample.steps)).collect();
+    assert_eq!(samples, vec![(crate::AxisSource::WheelY, 1), (crate::AxisSource::Pinch, 0)]);
+    let pinch = out.frame.axis_samples(view::ZOOM).find(|sample| sample.source == crate::AxisSource::Pinch).map(|sample| sample.delta);
+    assert!(pinch.is_some_and(|delta| (delta - 2.0_f32.ln()).abs() < 1e-5), "{pinch:?}");
+    assert_eq!(out.frame.axis(view::ZOOM).map(|sample| sample.source), Some(crate::AxisSource::WheelY), "`axis` is the first source");
+}
+
+/// The zoom commands need a view to act on: on a frame without any published view surface (a tab
+/// that draws no viewer) Ctrl+= neither fires nor is consumed; with one it fires at its centre.
+#[test]
+fn zoom_commands_need_a_view_focus_and_include_the_plus_key() {
+    let mut bench = Bench::new();
+    let out = bench.frame(vec![key_event(egui::Key::Equals, true, false, ctrl_mods())], &env(), Draw::default());
+    assert!(out.frame.fired(view::ZOOM_IN).is_none(), "no view, no zoom command");
+    assert_eq!(key_events(&out.events), 1, "the key stays with the tab");
+    bench.frame(vec![key_event(egui::Key::Equals, false, false, ctrl_mods())], &env(), published());
+    let out = bench.frame(vec![Event::PointerMoved(pos2(700.0, 550.0)), key_event(egui::Key::Plus, true, false, ctrl_mods())], &env(), published());
+    let fired = out.frame.fired(view::ZOOM_IN).and_then(|fired| fired.focus);
+    assert_eq!(fired.map(|focus| (focus.view, focus.pos)), Some((view_id(), VIEW_RECT.center())), "Ctrl+keypad + zooms the primary view");
+}
+
+/// A canvas-wide `Click` binding is claimed at its press (acted on at `Started`), arms the view,
+/// and ends on the release.
+#[test]
+fn a_canvas_wide_click_is_claimed_at_the_press() {
+    let mut bench = Bench::new();
+    bench.frame(vec![Event::PointerMoved(ON_VIEW)], &env(), published());
+    let out = bench.frame(Vec::new(), &env(), published());
+    assert!(out.frame.canvas_wide_armed(view_id()), "the RMB press action arms the view");
+    let out = bench.frame(vec![button_event(ON_VIEW, PointerButton::Secondary, true, Modifiers::NONE)], &env(), published());
+    let claim = out.frame.claimed(view_id()).map(|claim| (claim.action, claim.phase, claim.kind, claim.origin));
+    assert_eq!(claim, Some((PRESS, GesturePhase::Started, GestureKind::Click, ON_VIEW)));
+    let out = bench.frame(vec![button_event(ON_VIEW, PointerButton::Secondary, false, Modifiers::NONE)], &env(), published());
+    assert_eq!(out.frame.claimed(view_id()).map(|claim| claim.phase), Some(GesturePhase::Finished(ReleasePolicy::Commit)));
+}
+
+/// A press that matched no canvas-wide gesture never becomes a claim, even when the gesture's
+/// condition starts to hold while the button is still down (a viewer that lifts a block mid-press
+/// must not start a drag from the middle).
+#[test]
+fn a_gesture_inactive_at_its_press_is_never_claimed_later() {
+    let mut bench = Bench::new();
+    bench.frame(vec![Event::PointerMoved(ON_VIEW)], &env(), published());
+    let out = bench.frame(vec![button_event(ON_VIEW, PointerButton::Middle, true, Modifiers::NONE)], &env(), published());
+    assert!(out.frame.claimed(view_id()).is_none(), "blocked at the press");
+    let gated = FrameEnv { contexts: vec![GATE], ..env() };
+    let out = bench.frame(vec![Event::PointerMoved(ON_VIEW + vec2(30.0, 0.0))], &gated, published());
+    assert!(out.frame.claimed(view_id()).is_none(), "unblocked before the release: still no claim");
+    bench.frame(vec![button_event(ON_VIEW, PointerButton::Middle, false, Modifiers::NONE)], &gated, published());
+    let out = bench.frame(vec![button_event(ON_VIEW, PointerButton::Middle, true, Modifiers::NONE)], &gated, published());
+    assert_eq!(out.frame.claimed(view_id()).map(|claim| (claim.action, claim.phase)), Some((GATED, GesturePhase::Started)), "a press while it holds is claimed");
 }

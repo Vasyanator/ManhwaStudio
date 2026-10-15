@@ -567,31 +567,12 @@ pub(super) fn nudge_step_px(fired: impl Fn(ActionId) -> bool) -> [f32; 2] {
     arrow_nudge_step_px(NUDGE_PLAIN.map(&fired), NUDGE_FAST.map(&fired))
 }
 
-/// Whether a keyboard key bound to a nudge command is still held: the end of a keyboard move
-/// session (`move_layer.rs::drive_layer_move_settle`).
-///
-/// TRANSITIONAL raw read: `InputFrame` reports commands only when they fire (press and auto-repeat)
-/// and has no "the button that fired this command is still held" query, while a held arrow must
-/// keep ONE move session open across the OS repeat delay. The keys are taken from the commands'
-/// CURRENT bindings (the completing chord's keys), so a rebinding is honoured. Removal condition:
-/// `ms_input::InputFrame` answers "command held".
+/// Whether the button that fired a nudge command is still held (`InputFrame::command_held`): the
+/// end of a keyboard move session (`move_layer.rs::drive_layer_move_settle`). A held arrow keeps
+/// ONE move session open across the OS repeat delay, whatever the nudge commands are bound to.
 #[must_use]
-pub(super) fn nudge_keys_held(ctx: &egui::Context, registry: &InputRegistry) -> bool {
-    let keys: Vec<egui::Key> = NUDGE_PLAIN
-        .iter()
-        .chain(NUDGE_FAST.iter())
-        .flat_map(|id| registry.bindings(*id))
-        .filter_map(|binding| match binding {
-            Binding::Command(command) => command.sequence.last(),
-            Binding::Mode(_) | Binding::Axis(_) | Binding::Gesture(_) => None,
-        })
-        .flat_map(|chord| chord.buttons.iter())
-        .filter_map(|button| match button {
-            Button::Key(key) => Some(*key),
-            Button::Modifier(_) | Button::Mouse(_) | Button::Touch(_) | Button::Unknown { .. } => None,
-        })
-        .collect();
-    !keys.is_empty() && ctx.input(|input| keys.iter().any(|key| input.key_down(*key)))
+pub(super) fn nudge_keys_held(input: &InputFrame) -> bool {
+    NUDGE_PLAIN.iter().chain(NUDGE_FAST.iter()).any(|id| input.command_held(*id))
 }
 
 /// The egui pointer button of a binding's mouse button (`None` for an extra button egui has no
@@ -706,13 +687,13 @@ impl TypingTabState {
             changed = true;
         }
         let view_id = self.canvas.view_id();
-        if let Some(sample) = input.axis_for_view(FONT_SIZE, view_id)
-            && sample.steps != 0
-        {
+        // Axes report one sample per source; a rebinding may feed one axis from several.
+        let font_steps = input.axis_samples_for_view(FONT_SIZE, view_id).fold(0_i32, |sum, sample| sum.saturating_add(sample.steps));
+        if font_steps != 0 {
             changed |= if self.text_overlays.has_selected_overlay() {
-                self.top_panel.adjust_selected_text_overlay_font_size_by_wheel_steps(sample.steps)
+                self.top_panel.adjust_selected_text_overlay_font_size_by_wheel_steps(font_steps)
             } else {
-                self.top_panel.adjust_create_font_size_by_wheel_steps(sample.steps)
+                self.top_panel.adjust_create_font_size_by_wheel_steps(font_steps)
             };
         }
         if fired(LAYOUT_DELETE_POINT) {
@@ -726,8 +707,9 @@ impl TypingTabState {
         let layers = &mut self.text_overlays;
         // Rotation follows the continuous `delta` (trackpad point deltas rotate smoothly, a wheel's
         // line events by whole notches); the font size keeps whole `steps` (it walks a size list).
-        if let Some(sample) = input.axis_for_view(LAYER_ROTATE, view_id) {
-            changed |= layers.rotate_selected_layer_by_wheel(ctx, view, sample.delta);
+        let mut rotate = input.axis_samples_for_view(LAYER_ROTATE, view_id).map(|sample| sample.delta).peekable();
+        if rotate.peek().is_some() {
+            changed |= layers.rotate_selected_layer_by_wheel(ctx, view, rotate.sum());
         }
         if fired(LAYER_AUTOTYPE) {
             layers.trigger_selected_overlay_auto_typing(ctx, view, self.top_panel.auto_typing_settings());
@@ -787,9 +769,9 @@ mod tests {
     }
 
     fn typing_env(contexts: &[ContextId]) -> ActiveSet {
-        let mut all: BTreeSet<ContextId> = contexts.iter().copied().collect();
-        all.insert(ms_canvas::input::ZOOM_ACCEPTED);
-        ActiveSet { active_tab: Some(AppTab::Typing), contexts: all, pointer_on_view: true, ..ActiveSet::default() }
+        let all: BTreeSet<ContextId> = contexts.iter().copied().collect();
+        // The pointer on the canvas view: that view also takes the focus-less zoom commands.
+        ActiveSet { active_tab: Some(AppTab::Typing), contexts: all, pointer_on_view: true, view_focus: true, ..ActiveSet::default() }
     }
 
     fn press(state: &mut MatchState, registry: &InputRegistry, env: &ActiveSet, button: Button) -> Vec<ActionId> {

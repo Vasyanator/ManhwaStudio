@@ -3270,10 +3270,6 @@ impl WatermarkRemovalTool {
 }
 
 impl CleaningTool for WatermarkRemovalTool {
-    fn tool_id(&self) -> &'static str {
-        "watermark_removal"
-    }
-
     fn title(&self) -> &'static str {
         t!("cleaning.tools.watermark.title")
     }

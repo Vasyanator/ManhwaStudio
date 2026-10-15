@@ -326,10 +326,6 @@ impl FluxFillInpaintTool {
 }
 
 impl CleaningTool for FluxFillInpaintTool {
-    fn tool_id(&self) -> &'static str {
-        "flux_fill_inpaint"
-    }
-
     fn title(&self) -> &'static str {
         t!("cleaning.tools.flux.title")
     }

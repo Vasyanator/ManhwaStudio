@@ -559,10 +559,6 @@ impl PatchHost for CleaningPatchHost<'_> {
 }
 
 impl CleaningTool for PatchTool {
-    fn tool_id(&self) -> &'static str {
-        "patch"
-    }
-
     fn title(&self) -> &'static str {
         t!("cleaning.tools.patch.title")
     }

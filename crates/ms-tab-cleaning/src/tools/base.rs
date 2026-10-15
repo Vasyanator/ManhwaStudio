@@ -92,7 +92,7 @@ use super::mask_generation::{
     WatermarkProgress,
 };
 use crate::input::{self, CleaningLabels, StrokeModes};
-use ms_input::{ActionId, ContextId, GesturePhase, HitPhase, InputFrame, ViewId, ViewSurface, view};
+use ms_input::{ActionId, ContextId, HitPhase, InputFrame, ViewId, ViewSurface, view};
 use ms_tools::MaskBrush;
 use ms_widgets::WheelSlider;
 use eframe::egui;
@@ -157,8 +157,6 @@ pub struct CleaningCursorOccluder {
 /// (the region frame, the legacy editor window) from the `InputFrame` handed to
 /// [`CleaningTool::draw_overlay_ui`].
 pub trait CleaningTool: Send {
-    #[allow(dead_code)]
-    fn tool_id(&self) -> &'static str;
     fn title(&self) -> &'static str;
 
     fn pytorch_required(&self) -> bool {
@@ -804,11 +802,9 @@ pub struct RegionEditorSession {
     pub status: Option<String>,
     pub zoom: f32,
     pub scroll_id: u64,
-    /// A `view.zoom_drag` claim on the window's view runs (`apply_editor_window_zoom`): the
-    /// preview paints nothing meanwhile.
-    pub zoom_drag_active: bool,
-    /// The pointer x the running zoom drag was last applied at.
-    pub zoom_drag_last_x: f32,
+    /// The window view's `view.zoom_drag` (`apply_editor_window_zoom`); the preview paints
+    /// nothing while it runs.
+    pub zoom_drag: ms_canvas::input::ZoomDrag,
 }
 
 impl RegionEditorSession {
@@ -1419,7 +1415,7 @@ impl RegionEditToolBase {
                     ctx,
                     ViewSurface { id: view, rect: window_rect, holes: Vec::new(), capture_layer: Some(resp.response.layer_id), primary: false, touch_owner: None },
                 );
-                if apply_editor_window_zoom(ctx, input, editor, view) {
+                if apply_editor_window_zoom(input, editor, view) {
                     ctx.request_repaint();
                 }
             }
@@ -1654,8 +1650,7 @@ impl RegionEditToolBase {
                                 status: None,
                                 zoom: 1.0,
                                 scroll_id: self.editor_session_id,
-                                zoom_drag_active: false,
-                                zoom_drag_last_x: 0.0,
+                                zoom_drag: ms_canvas::input::ZoomDrag::default(),
                             };
                             on_open(&mut editor);
                             self.editor_session_id = self.editor_session_id.saturating_add(1);
@@ -2340,7 +2335,7 @@ impl RegionMaskInpaintToolBase {
             }
 
             let hit = input.gesture_for(&response, &[(input::TARGET_EDITOR_IMAGE, true)]);
-            let stroke = hit.filter(|hit| !editor.zoom_drag_active && matches!(hit.phase, HitPhase::DragStarted | HitPhase::Dragging));
+            let stroke = hit.filter(|hit| !editor.zoom_drag.active() && matches!(hit.phase, HitPhase::DragStarted | HitPhase::Dragging));
             let mut painted = false;
             if let Some(hit) = stroke.as_ref()
                 && let Some(pointer_pos) = response.interact_pointer_pos()
@@ -2659,11 +2654,12 @@ pub(super) fn build_tinted_mask_preview(mask: &egui::ColorImage, rgb: [u8; 3]) -
 }
 
 /// Applies the shared `view.*` zoom aimed at the legacy editor window `view` this frame: the zoom
-/// commands whose focus is the window, the `view.zoom` axis over it (whole wheel notches, and a
-/// trackpad pinch as `exp(delta)` — the canvas' own rule) and its `view.zoom_drag` claim (the canvas' drag law,
-/// `ms_canvas::input::zoom_drag_factor`). The window zooms its preview about the scroll origin, as
-/// it always did. Returns whether the zoom changed or a zoom drag runs (the caller repaints).
-fn apply_editor_window_zoom(ctx: &egui::Context, input: &InputFrame, editor: &mut RegionEditorSession, view_id: ViewId) -> bool {
+/// commands whose focus is the window, the `view.zoom` axis over it (per sample source, the
+/// canvas' laws: `ms_canvas::input::zoom_axis_factor` — wheel notches, trackpad pinch) and its
+/// `view.zoom_drag` claim (`ms_canvas::input::ZoomDrag` + `zoom_drag_factor`). The window zooms its
+/// preview about the scroll origin, as it always did. Returns whether the zoom changed or a zoom
+/// drag runs (the caller repaints).
+fn apply_editor_window_zoom(input: &InputFrame, editor: &mut RegionEditorSession, view_id: ViewId) -> bool {
     let mut changed = false;
     for id in [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET] {
         if !input.fired(id).and_then(|fired| fired.focus).is_some_and(|focus| focus.view == view_id) {
@@ -2677,42 +2673,17 @@ fn apply_editor_window_zoom(ctx: &egui::Context, input: &InputFrame, editor: &mu
             editor.scale_zoom(1.0 / REGION_EDITOR_ZOOM_STEP)
         };
     }
-    if let Some(sample) = input.axis_for_view(view::ZOOM, view_id) {
-        if sample.steps != 0 {
-            changed |= editor.scale_zoom(ms_canvas::input::wheel_zoom_factor(sample.steps));
-        } else if pinch_this_frame(ctx) {
-            changed |= editor.scale_zoom(sample.delta.exp());
+    for sample in input.axis_samples_for_view(view::ZOOM, view_id) {
+        let factor = ms_canvas::input::zoom_axis_factor(sample);
+        if (factor - 1.0).abs() > f32::EPSILON {
+            changed |= editor.scale_zoom(factor);
         }
     }
-    match input.claimed(view_id).filter(|claim| claim.action == view::ZOOM_DRAG) {
-        Some(claim) => match claim.phase {
-            GesturePhase::Started | GesturePhase::Active => {
-                // A new drag measures from its press point; one already running from where it
-                // was applied last.
-                if claim.phase == GesturePhase::Started || !editor.zoom_drag_active {
-                    editor.zoom_drag_last_x = if claim.phase == GesturePhase::Started { claim.origin.x } else { claim.current.x };
-                }
-                let dx = claim.current.x - editor.zoom_drag_last_x;
-                if dx.abs() > f32::EPSILON {
-                    changed |= editor.scale_zoom(ms_canvas::input::zoom_drag_factor(dx));
-                }
-                editor.zoom_drag_last_x = claim.current.x;
-                editor.zoom_drag_active = true;
-            }
-            GesturePhase::Finished(_) => editor.zoom_drag_active = false,
-        },
-        None => editor.zoom_drag_active = false,
+    let dx = editor.zoom_drag.step(input.claimed(view_id));
+    if dx.abs() > f32::EPSILON {
+        changed |= editor.scale_zoom(ms_canvas::input::zoom_drag_factor(dx));
     }
-    changed || editor.zoom_drag_active
-}
-
-/// Whether this frame holds a trackpad pinch (`Event::Zoom`), read without consuming: a
-/// `view.zoom` sample carries no source, and a pinch is the only one with `steps == 0` worth
-/// applying (a sub-notch wheel accumulates into later steps). The same rule as the canvas'
-/// `pinch_this_frame` (crate-private there). Removal condition: `ms_input::AxisSample` gains its
-/// source.
-fn pinch_this_frame(ctx: &egui::Context) -> bool {
-    ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Zoom(_))))
+    changed || editor.zoom_drag.active()
 }
 
 fn region_editor_target_window_size(content_size: egui::Vec2, max_size: egui::Vec2) -> egui::Vec2 {

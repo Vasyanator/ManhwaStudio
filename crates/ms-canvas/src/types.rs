@@ -149,7 +149,6 @@ pub(crate) struct CanvasFrameParams {
     pub(crate) canvas_rect: Rect,
     pub(crate) suppress_wheel_scroll: bool,
     pub(crate) zoom_drag_active: bool,
-    pub(crate) hook_claims_shift_drag: bool,
     pub(crate) overlays_enabled: bool,
     pub(crate) space_pan_drag_enabled: bool,
 }

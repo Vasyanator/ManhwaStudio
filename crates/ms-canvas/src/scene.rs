@@ -193,11 +193,11 @@ pub(super) struct CanvasSceneState {
     /// recomputed on every scene pass. `0` when no page has been laid out.
     pub(super) scroll_center_idx: usize,
     pub(super) scroll_offset: Vec2,
-    pub(super) drag_scroll_blocked: bool,
-    pub(super) wheel_scroll_blocked: bool,
-    pub(super) zoom_blocked: bool,
-    pub(super) zoom_drag_active: bool,
-    pub(super) zoom_drag_last_x: f32,
+    /// A claim other than the zoom drag runs on this view this frame (`claim_locks_view`): no
+    /// zoom (keys, axis, pinch) and no wheel scrolling. Set by `apply_input_frame`.
+    pub(super) view_locked_by_claim: bool,
+    /// This view's `view.zoom_drag` state (`input::ZoomDrag`), advanced by `apply_input_frame`.
+    pub(super) zoom_drag: super::input::ZoomDrag,
     /// `view.pan` is held this frame (set by `begin_canvas_frame`): the ScrollArea drag-scrolls
     /// and the bubble widgets sense hover only (`bubble_widgets_locked`).
     pub(super) pan_mode_active: bool,
@@ -234,20 +234,12 @@ pub(super) struct CanvasSceneState {
     /// radius. Holes of the touch surface, so a finger drags a handle; the large image-bubble
     /// rects and text areas stay pannable. Cleared at the start of every `draw`.
     pub(super) handle_hit_rects: Vec<Rect>,
-    /// Whether a finger long-press drag drives the active tab's selection this frame
-    /// (`TouchSurface::long_press_selection`). A one-frame flag: tabs set it every frame
-    /// (`CanvasView::set_long_press_selection`) and `publish_touch_surface` resets it.
-    pub(super) long_press_selection: bool,
     /// Drag regions of this frame's touch surface (`TouchSurface::drag_regions`), closed
-    /// outlines in screen points. One-frame like `long_press_selection`: tabs add them every
-    /// frame (`CanvasView::add_touch_drag_region`) and `publish_touch_surface` drains them.
+    /// outlines in screen points. One-frame: tabs add them every frame (`CanvasView::add_touch_drag_region`) and `publish_touch_surface` drains them.
     pub(super) touch_drag_regions: Vec<Vec<Pos2>>,
     /// This frame's drag-region drag (`TouchOutput::region_drag`), read by the tab through
     /// `CanvasView::touch_region_drag`. Set by `apply_input_frame`.
     pub(super) touch_region_drag: Option<TouchSelection>,
-    /// This frame's long-press selection drag (`TouchOutput::selection`), read by the tab's
-    /// capture mode through `CanvasView::touch_selection`. Set by `apply_input_frame`.
-    pub(super) touch_selection: Option<TouchSelection>,
     /// Finger long-press point of this frame (`TouchOutput::long_press_at`): the page under it
     /// opens its context menu through the secondary-click path. Set by `apply_input_frame`.
     pub(super) touch_long_press_at: Option<Pos2>,
@@ -325,11 +317,8 @@ impl Default for CanvasSceneState {
             page_aside_widths: HashMap::new(),
             scroll_center_idx: 0,
             scroll_offset: Vec2::ZERO,
-            drag_scroll_blocked: false,
-            wheel_scroll_blocked: false,
-            zoom_blocked: false,
-            zoom_drag_active: false,
-            zoom_drag_last_x: 0.0,
+            view_locked_by_claim: false,
+            zoom_drag: super::input::ZoomDrag::default(),
             pan_mode_active: false,
             visible_scene_rect: None,
             scroll_inner_rect: None,
@@ -346,10 +335,8 @@ impl Default for CanvasSceneState {
             on_top_hit_rects: HashMap::new(),
             aside_card_hit_rects: Vec::new(),
             handle_hit_rects: Vec::new(),
-            long_press_selection: false,
             touch_drag_regions: Vec::new(),
             touch_region_drag: None,
-            touch_selection: None,
             touch_long_press_at: None,
             touch_long_press_armed_at: None,
             touch_tap_at: None,
@@ -888,11 +875,9 @@ impl CanvasView {
 
     pub(super) fn begin_canvas_frame(
         &mut self,
-        ctx: &egui::Context,
         canvas_rect: Rect,
         suppress_wheel_scroll: bool,
         zoom_drag_active: bool,
-        hooks: &mut dyn CanvasHooks,
     ) -> CanvasFrameParams {
         // `view.pan` (Space by default) is a held mode the router reports; it never activates
         // while a text edit has focus, so typing a space in a bubble field does not pan.
@@ -905,7 +890,6 @@ impl CanvasView {
             canvas_rect,
             suppress_wheel_scroll,
             zoom_drag_active,
-            hook_claims_shift_drag: hooks.wants_canvas_shift_drag_selection(ctx),
             overlays_enabled: self.overlay_runtime.overlays_model.is_some()
                 && self.overlay_runtime.overlays_visible
                 && !self.overlay_runtime.overlay_render_suppressed,
@@ -918,7 +902,7 @@ impl CanvasView {
     /// (pans) instead of moving the bubble.
     #[must_use]
     pub(super) fn bubble_widgets_locked(&self) -> bool {
-        self.scene.zoom_drag_active || self.scene.pan_mode_active
+        self.scene.zoom_drag.active() || self.scene.pan_mode_active
     }
 
     pub(super) fn draw_canvas_scene(
@@ -985,14 +969,13 @@ impl CanvasView {
             .scroll_source(egui::scroll_area::ScrollSource {
                 scroll_bar: true,
                 drag: if frame.space_pan_drag_enabled
-                    && !self.scene.drag_scroll_blocked
                     && !frame.zoom_drag_active
                 {
                     egui::scroll_area::DragScroll::Always
                 } else {
                     egui::scroll_area::DragScroll::Never
                 },
-                mouse_wheel: !frame.suppress_wheel_scroll && !self.scene.wheel_scroll_blocked,
+                mouse_wheel: !frame.suppress_wheel_scroll,
             });
         if let Some(offset) = requested_offset {
             scroll_area = scroll_area.scroll_offset(offset);
@@ -1054,7 +1037,6 @@ impl CanvasView {
                     page_world_top,
                     viewport_rect,
                     viewport_center_y,
-                    frame.hook_claims_shift_drag,
                     &mut current_page,
                 ) else {
                     continue;
@@ -1251,7 +1233,6 @@ impl CanvasView {
         page_world_top: f32,
         viewport_rect: Rect,
         viewport_center_y: f32,
-        hook_claims_shift_drag: bool,
         current_page: &mut CurrentPageTracker,
     ) -> Option<(CanvasScenePageFrame, egui::Response)> {
         if page_size_px.x <= 0.0 || page_size_px.y <= 0.0 {
@@ -1271,11 +1252,7 @@ impl CanvasView {
             image_size.x,
         );
         let row_size = egui::vec2(row_screen_width, image_size.y);
-        let row_sense = if hook_claims_shift_drag {
-            Sense::hover()
-        } else {
-            Sense::click()
-        };
+        let row_sense = Sense::click();
         // The `ScrollArea` stays authoritative for content size, scrollbars, and scroll
         // offset read-back, so the row is allocated exactly as before.
         let (row_rect, response) = ui.allocate_exact_size(row_size, row_sense);
@@ -1626,7 +1603,6 @@ impl CanvasView {
         // helper opens by itself only on a secondary click.
         let mut menu_anchor_at = None;
         if self.editable
-            && !frame.hook_claims_shift_drag
             && !frame.zoom_drag_active
             && !hooks.suppress_canvas_page_context_menu(page_frame.page_idx)
             && let Some(open_pos) = open_pos
@@ -1647,6 +1623,7 @@ impl CanvasView {
                 .canvas_context_menu_target
                 .is_some_and(|target| target.page_idx == page_frame.page_idx)
         {
+            let create_label = create_bubble_context_menu_label(hooks.page_menu_create_bubble_shortcut());
             context_menu_popup(response, menu_anchor_at).show(|ui| {
                 let handled_by_hook = self
                     .bubble_runtime
@@ -1666,7 +1643,7 @@ impl CanvasView {
                 if ui
                     .add_enabled(
                         self.editable,
-                        egui::Button::new(self.create_bubble_context_menu_label()),
+                        egui::Button::new(create_label.as_str()),
                     )
                     .clicked()
                 {
@@ -1754,8 +1731,7 @@ impl CanvasView {
                 }
             });
         }
-        if !frame.hook_claims_shift_drag
-            && !frame.zoom_drag_active
+        if !frame.zoom_drag_active
             && self.gesture_clicked(response, input::TARGET_PAGE, input::PAGE_CLICK)
         {
             self.bubble_runtime.canvas_context_menu_target = None;
@@ -2057,12 +2033,14 @@ impl CanvasView {
             Self::draw_hint_rows_grid(ui, "canvas_shortcuts_hint_grid", rows);
         });
     }
+}
 
-    fn create_bubble_context_menu_label(&self) -> String {
-        match self.create_bubble_shortcut_hint.as_deref() {
-            Some(shortcut) if !shortcut.is_empty() => tf!("canvas.page_menu.create_bubble_shortcut", shortcut = shortcut),
-            _ => t!("canvas.page_menu.create_bubble").to_string(),
-        }
+/// The page menu's "Create bubble" label, with `shortcut` (the tab's binding text,
+/// `CanvasHooks::page_menu_create_bubble_shortcut`) when it has a non-empty one.
+fn create_bubble_context_menu_label(shortcut: Option<String>) -> String {
+    match shortcut.as_deref() {
+        Some(shortcut) if !shortcut.is_empty() => tf!("canvas.page_menu.create_bubble_shortcut", shortcut = shortcut),
+        Some(_) | None => t!("canvas.page_menu.create_bubble").to_string(),
     }
 }
 
