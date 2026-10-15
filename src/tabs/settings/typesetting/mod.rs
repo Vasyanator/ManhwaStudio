@@ -27,6 +27,8 @@ Submodules:
   text layer font = PostScript name), used to bulk-fill a virtual font group.
 - `font_properties_window`: the per-font properties window opened from the font rows.
 - `font_groups`: the "Группы" section (virtual font groups) + its group-editor window.
+- `hybrid_fonts`: the "Кастомные шрифты" section (saved custom fonts, the hybrid create
+  dialog) and the custom-font parts of the properties window (rename, hybrid editing).
 
 Key types:
 - `SettingsTabState` (methods only; the type lives in the parent `settings` module)
@@ -42,6 +44,7 @@ mod font_card_psd;
 mod font_groups;
 mod font_properties_window;
 mod font_settings;
+mod hybrid_fonts;
 
 pub(super) use font_settings::{
     FontListKind, FontNameDisplayMode, FontNameDisplayModes, FontSettingsEditorState,

@@ -111,8 +111,12 @@ pub(super) fn draw_faux_style_controls(
 }
 
 /// Принадлежит ли шрифт группе `group` (учитывает объединённые копии).
+///
+/// The ONE owner of the group-filter rule: the ad-hoc hybrid entry («Гибридный шрифт») is a
+/// member of EVERY group — it is a static item of the combo, not a font a group can list,
+/// so no group filter may hide it (`dev-docs/hybrid_fonts_plan.md` §3.5).
 pub(super) fn font_in_group(font: &FontEntry, group: &str) -> bool {
-    font.groups.iter().any(|g| g.as_deref() == Some(group))
+    font.is_adhoc_custom() || font.groups.iter().any(|g| g.as_deref() == Some(group))
 }
 
 /// Matches a font by its COLLISION-AWARE render identity (`identity_name`) — the PRIMARY
@@ -206,7 +210,13 @@ pub(super) fn font_matches_stem(font: &FontEntry, stem_norm: &str) -> bool {
 /// the only sanctioned caller is `create_state::find_font_idx_by_legacy_reference`, which
 /// resolves a `font_path` persisted by an older build. Nothing may key, cache, select or
 /// persist by path (`dev-docs/font_identity_postscript_plan.md`).
+///
+/// An EMPTY (or blank) `raw` never matches: entries without a file — custom fonts — carry an
+/// empty `path`, and an absent `font_path` must not resolve to one of them.
 pub(super) fn font_matches_path(font: &FontEntry, raw: &str) -> bool {
+    if raw.trim().is_empty() {
+        return false;
+    }
     let candidate = Path::new(raw);
     font.path == candidate
         || font.path.to_string_lossy() == raw

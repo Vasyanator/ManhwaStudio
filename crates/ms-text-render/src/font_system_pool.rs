@@ -23,15 +23,15 @@ Main responsibilities:
   by `EllipsisLigatureMode`;
 - lease a `FontSystem` + its per-system `FontFaceCache` for the duration of one
   render and return it afterward (`with_leased_font_system`);
-- bound growth by dropping systems whose face cache or the pool itself has grown
-  past fixed limits (resets cosmic-text shaping/db growth on a long-lived
-  `FontSystem`);
+- bound growth by dropping systems whose face cache (distinct contents OR resident
+  caller-font bytes) or the pool itself has grown past fixed limits (resets
+  cosmic-text shaping/db growth on a long-lived `FontSystem`);
 - expose `prewarm_font_system_pool` so the application can pay the first scan on
   a background thread before the first user render.
 
 Key structures:
 - `FontFaceCache`: per-`FontSystem` map of already-loaded font content (keyed by
-  content id), plus the pristine default-family names captured at system creation,
+  content id, with the resident byte length each content registered), plus the pristine default-family names captured at system creation,
   the face ids the system already held before this cache loaded anything (its
   bundled base) and a determinism taint flag.
 - `PooledFontSystem`: a `FontSystem` bundled with its `FontFaceCache`.
@@ -73,6 +73,24 @@ even on a reused pooled system):
   reason and dropped. `capture_preexisting_faces` is what tells the base apart from
   faces earlier renders added.
 
+Growth bounds (memory):
+- `MAX_CACHED_FILES` caps the NUMBER of distinct caller contents a system holds and
+  `MAX_CACHED_FONT_BYTES` caps their resident BYTES. Both are needed: a parked system
+  pins every caller buffer it ever registered (fontdb keeps the `Arc`), and callers
+  that compile fonts (the typing tab's custom/hybrid faces: every «Apply» is a new
+  content) supersede contents faster than any render reuses them. 64 Latin faces
+  are ~20 MB, but 64 CJK faces (~20-50 MB each) are gigabytes, so the count limit
+  alone does not bound memory. Only caller-registered buffers count (the bundled
+  base the system was built on is shared by every system and never counted), each
+  content id once, at the length of the buffer actually handed to fontdb (the
+  patched copy in `EllipsisLigatureMode::Remove`).
+- Over-budget eviction drops the WHOLE system, never individual faces: removing
+  caller faces from a live database would make later `Family::Name` matching depend
+  on what was loaded and removed before (see the taint rule above), whereas a
+  dropped system is simply rebuilt from the base — the same path a tainted system
+  already takes, so byte-identical output is preserved. Under both limits nothing
+  changes.
+
 Notes:
 `FontSystem` is `Send` but not `Sync`; ownership is moved in/out of the pool
 under a `Mutex`, so nothing is shared while leased. `with_leased_font_system`
@@ -104,6 +122,23 @@ use super::font_registry::RegisteredFontFace;
 /// (`fontdb::Source::File`) whose pages the kernel shares between every pooled
 /// system, so they do not scale with the pool size the way resident buffers do.
 const MAX_CACHED_FILES: usize = 64;
+
+/// Maximum resident bytes of CALLER font contents a pooled `FontSystem` may hold
+/// before it is dropped instead of returned (256 MiB).
+///
+/// Complements `MAX_CACHED_FILES`, which bounds the count but not the size: a CJK
+/// font or a CJK custom/hybrid face is ~20-50 MB, so 64 of them would pin gigabytes
+/// in ONE parked system, and superseded custom faces are never rendered again yet
+/// stay pinned until the system goes. 256 MiB keeps a realistic working set warm —
+/// a handful of CJK faces (one page rarely mixes more than 3-5 fonts) or every
+/// Latin font a project uses, for which the count limit binds first — while capping
+/// the pinned garbage per system. Worst case across the pool is
+/// `MAX_POOLED_SYSTEMS` times this (faces shared by several systems are one `Arc`
+/// and are not duplicated), plus at most one face per system of overshoot, because
+/// the check runs when a lease is returned. Counted per system by
+/// `FontFaceCache::cached_font_bytes`; the bundled base is excluded (shared, mapped,
+/// not caller data).
+const MAX_CACHED_FONT_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum number of `FontSystem` instances kept warm in the free list, across
 /// ALL ellipsis-patch modes. Extra systems returned beyond this are dropped.
@@ -196,8 +231,9 @@ impl PristineDefaultFamilies {
 /// entries always reflect exactly what that system's db has loaded.
 #[derive(Debug, Default)]
 pub struct FontFaceCache {
-    /// Font contents already loaded, mapped to the fontdb IDs they produced.
-    files: HashMap<u64, Vec<fontdb::ID>>,
+    /// Font contents already loaded, keyed by content id, with the fontdb IDs
+    /// they produced and the caller bytes they keep resident.
+    files: HashMap<u64, LoadedContent>,
     /// Resolved face metadata per `(content_id, face_index)` so a reused system
     /// does not re-read face records from the db.
     meta: HashMap<(u64, usize), RegisteredFontFace>,
@@ -215,6 +251,17 @@ pub struct FontFaceCache {
     /// ligatures removed. Fixed for the life of the owning `FontSystem`; see the
     /// ELLIPSIS-PATCH PARTITION contract in the file header.
     ellipsis_mode: EllipsisLigatureMode,
+}
+
+/// One content registered through a `FontFaceCache`: the faces it produced in the
+/// owning system's database and the bytes that registration keeps resident.
+#[derive(Debug)]
+struct LoadedContent {
+    /// fontdb IDs produced by (or, for bundled bytes, adopted for) this content.
+    ids: Vec<fontdb::ID>,
+    /// Length of the CALLER buffer handed to fontdb for this content; 0 when the
+    /// content was adopted from the bundled base (nothing new was registered).
+    resident_bytes: usize,
 }
 
 impl FontFaceCache {
@@ -338,15 +385,31 @@ impl FontFaceCache {
         self.files.len()
     }
 
+    /// Resident bytes of every caller content loaded through this cache, each
+    /// content id counted once (re-storing an id replaces its entry). Used to
+    /// bound pooled-system memory against `MAX_CACHED_FONT_BYTES`; saturates
+    /// instead of overflowing.
+    #[must_use]
+    pub(crate) fn cached_font_bytes(&self) -> usize {
+        self.files
+            .values()
+            .fold(0_usize, |total, loaded| total.saturating_add(loaded.resident_bytes))
+    }
+
     /// Returns the fontdb IDs previously loaded for `content_id`, if any.
     #[must_use]
     pub(crate) fn loaded_ids(&self, content_id: u64) -> Option<&[fontdb::ID]> {
-        self.files.get(&content_id).map(Vec::as_slice)
+        self.files.get(&content_id).map(|loaded| loaded.ids.as_slice())
     }
 
     /// Records the fontdb IDs produced by loading `content_id`'s bytes.
-    pub(crate) fn store_loaded(&mut self, content_id: u64, ids: Vec<fontdb::ID>) {
-        self.files.insert(content_id, ids);
+    ///
+    /// `resident_bytes` is the length of the CALLER buffer registered into the
+    /// owning system's database for this content (the buffer actually handed to
+    /// fontdb), or 0 when the faces were adopted from the bundled base. It feeds
+    /// the `MAX_CACHED_FONT_BYTES` budget.
+    pub(crate) fn store_loaded(&mut self, content_id: u64, ids: Vec<fontdb::ID>, resident_bytes: usize) {
+        self.files.insert(content_id, LoadedContent { ids, resident_bytes });
     }
 
     /// Returns cached face metadata for `(content_id, face_index)`, if resolved
@@ -446,15 +509,28 @@ fn checkout(mode: EllipsisLigatureMode) -> PooledFontSystem {
 ///
 /// Drops (does not requeue) the system when its matching has been tainted by a
 /// cross-file family-name collision (so a contaminated system can never serve a
-/// future render), when its face cache has grown past `MAX_CACHED_FILES`, when
-/// the pool already holds `MAX_POOLED_SYSTEMS`, or when this system's ellipsis
+/// future render), when its face cache has grown past `MAX_CACHED_FILES` or
+/// `MAX_CACHED_FONT_BYTES`, when the pool already holds `MAX_POOLED_SYSTEMS`, or when this system's ellipsis
 /// mode already occupies `MAX_POOLED_SYSTEMS_PER_MODE` slots. Dropping also
 /// resets cosmic-text shaping/db growth accumulated on a long-lived system.
 fn return_to_pool(pooled: PooledFontSystem) {
     if !should_requeue(&pooled.cache) {
-        // Dropped for determinism (tainted) or growth (too many cached files);
-        // see `should_requeue`. Dropping also resets cosmic-text's internal
-        // shaping/db growth accumulated on this long-lived system.
+        // Dropped for determinism (tainted) or growth (too many cached files or
+        // bytes); see `should_requeue`. Dropping also resets cosmic-text's internal
+        // shaping/db growth accumulated on this long-lived system. Only the byte
+        // budget is logged: it is the memory-relevant drop worth diagnosing, while
+        // taint already logged its cause at load time.
+        let cached_bytes = pooled.cache.cached_font_bytes();
+        if !pooled.cache.is_tainted() && cached_bytes > MAX_CACHED_FONT_BYTES {
+            ms_log::runtime_log::log_info(format!(
+                "render FontSystem dropped for the font byte budget: {cached_bytes} bytes of caller \
+                 fonts cached ({} contents, budget {MAX_CACHED_FONT_BYTES} bytes, {} renders, mode {:?}); \
+                 the pool rebuilds a fresh system on demand",
+                pooled.cache.distinct_file_count(),
+                pooled.render_count,
+                pooled.cache.ellipsis_mode(),
+            ));
+        }
         return;
     }
     let mode = pooled.cache.ellipsis_mode();
@@ -477,11 +553,14 @@ fn return_to_pool(pooled: PooledFontSystem) {
 /// Returns `false` — meaning DROP the system — when its matching was tainted by a
 /// cross-file family-name collision (reusing it would render identical params
 /// differently, so dropping it makes the regression self-healing) or when its
-/// face cache has grown past `MAX_CACHED_FILES`. The `MAX_POOLED_SYSTEMS` cap is
+/// face cache has grown past `MAX_CACHED_FILES` distinct contents or
+/// `MAX_CACHED_FONT_BYTES` resident caller bytes. The `MAX_POOLED_SYSTEMS` cap is
 /// enforced separately in `return_to_pool` because it depends on live pool state.
 #[must_use]
 fn should_requeue(cache: &FontFaceCache) -> bool {
-    !cache.is_tainted() && cache.distinct_file_count() <= MAX_CACHED_FILES
+    !cache.is_tainted()
+        && cache.distinct_file_count() <= MAX_CACHED_FILES
+        && cache.cached_font_bytes() <= MAX_CACHED_FONT_BYTES
 }
 
 /// Runs `f` with a leased `FontSystem` of `mode` and its `FontFaceCache`,
@@ -529,8 +608,8 @@ pub fn prewarm_font_system_pool() {
 #[cfg(test)]
 mod tests {
     use super::{
-        EllipsisLigatureMode, FontFaceCache, checkout, font_base, return_to_pool, should_requeue,
-        with_leased_font_system,
+        EllipsisLigatureMode, FontFaceCache, MAX_CACHED_FONT_BYTES, checkout, font_base,
+        return_to_pool, should_requeue, with_leased_font_system,
     };
     use crate::font_provider::{FontContent, font_content_id};
     use crate::font_registry::load_font_content;
@@ -758,6 +837,78 @@ mod tests {
         assert!(
             !should_requeue(&cache),
             "a tainted cache must be dropped by return_to_pool, not requeued"
+        );
+    }
+
+    /// The byte budget is a drop decision beside the count limit: a cache holding
+    /// more caller bytes than `MAX_CACHED_FONT_BYTES` is dropped, one at the budget
+    /// is still requeued. Byte counts are recorded directly (no real font needed):
+    /// the decision only reads what `store_loaded` recorded.
+    #[test]
+    fn cache_over_the_byte_budget_is_dropped_and_one_at_it_is_requeued() {
+        let mut cache = FontFaceCache::new();
+        cache.store_loaded(1, Vec::new(), MAX_CACHED_FONT_BYTES / 2);
+        cache.store_loaded(2, Vec::new(), MAX_CACHED_FONT_BYTES - MAX_CACHED_FONT_BYTES / 2);
+        assert_eq!(cache.cached_font_bytes(), MAX_CACHED_FONT_BYTES);
+        assert!(
+            should_requeue(&cache),
+            "a cache exactly at the byte budget must still be requeued"
+        );
+        cache.store_loaded(3, Vec::new(), 1);
+        assert!(
+            !should_requeue(&cache),
+            "a cache one byte over the budget must be dropped, never reused"
+        );
+    }
+
+    /// Bundled (adopted) contents record zero bytes, so even many of them never
+    /// push a system over the byte budget.
+    #[test]
+    fn adopted_bundled_contents_do_not_count_against_the_byte_budget() {
+        let mut cache = FontFaceCache::new();
+        cache.store_loaded(7, Vec::new(), 0);
+        cache.store_loaded(8, Vec::new(), 0);
+        assert_eq!(cache.cached_font_bytes(), 0);
+        assert!(should_requeue(&cache));
+    }
+
+    /// One content is counted once: re-storing the same content id replaces its
+    /// entry, and a cache hit through the real loader adds nothing.
+    #[test]
+    fn bytes_of_one_content_are_counted_once() {
+        let mut cache = FontFaceCache::new();
+        cache.store_loaded(42, Vec::new(), 1000);
+        cache.store_loaded(42, Vec::new(), 1000);
+        assert_eq!(
+            cache.cached_font_bytes(),
+            1000,
+            "re-storing one content id must not double its bytes"
+        );
+
+        let font_path = test_font_path();
+        if !font_path.exists() {
+            eprintln!(
+                "skipping the loader half of bytes_of_one_content_are_counted_once: font not found at {}",
+                font_path.display()
+            );
+            return;
+        }
+        let content = fixture_content(&font_path).expect("the fixture must be readable");
+        let mut system = font_base::new_render_font_system();
+        let mut cache = FontFaceCache::new();
+        load_font_content(&mut system, &mut cache, &content, 0)
+            .expect("first font load should succeed");
+        assert_eq!(
+            cache.cached_font_bytes(),
+            content.bytes().len(),
+            "a registered caller font must count its full resident length"
+        );
+        load_font_content(&mut system, &mut cache, &content, 0)
+            .expect("second font load should succeed");
+        assert_eq!(
+            cache.cached_font_bytes(),
+            content.bytes().len(),
+            "loading the same content again must not count its bytes twice"
         );
     }
 

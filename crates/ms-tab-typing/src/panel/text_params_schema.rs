@@ -16,7 +16,10 @@ Main responsibilities:
   codec's conversion and the PSD export cannot disagree about which key names the font;
 - own the read of any key whose TYPE changed across builds, so every reader resolves the
   old and the new shape identically, and the matching WRITER that picks the shape an
-  older build can still read (`hanging_punctuation_weight` / `hanging_punctuation_value`).
+  older build can still read (`hanging_punctuation_weight` / `hanging_punctuation_value`);
+- own the CUSTOM-FONT keys: `font_recipe` (the ad-hoc layer recipe, written only next to
+  the ad-hoc identity) and `custom_font_use`, the one reader that says whether a payload
+  uses a saved custom font, an ad-hoc recipe, or neither.
 
 Key functions:
 - text_params_schema_version()
@@ -27,6 +30,7 @@ Key functions:
 - legacy_font_name_candidates()
 - hanging_punctuation_weight()
 - hanging_punctuation_value()
+- custom_font_use()
 
 Notes:
 The frozen default set is a CONTRACT, not a mirror of the panel's current defaults: a
@@ -36,9 +40,17 @@ that key start being written explicitly. Changing a frozen value silently
 reinterprets already-written documents and is allowed only together with a bump of
 `TEXT_PARAMS_SCHEMA_VERSION` plus a read branch for the older version. `defaults_are_frozen`
 pins every value so such a change cannot pass unnoticed.
+
+`font_recipe` did NOT bump the version: it is a new sibling key, and an older build reading
+a layer that uses a custom font sees an unknown `font` identity and reports the font as
+missing — never a wrong render.
 */
 
+use crate::custom_fonts::identity::{is_adhoc_identity, is_saved_identity};
+use crate::panel::fonts::normalize_font_identity;
+use ms_custom_fonts::CustomFontRecipe;
 use serde_json::{Map, Value, json};
+use std::sync::Arc;
 use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +80,40 @@ const ALWAYS_WRITTEN_KEYS: [&str; 3] = ["font", "text", "width_px"];
 /// cannot change how anything renders.
 pub(crate) const DEAD_TEXT_PARAM_KEYS: [&str; 2] =
     ["strict_shape_fit", "aggressive_word_breaks"];
+
+/// Key of the AD-HOC custom font recipe (`CustomFontRecipe::to_json`), written next to
+/// `font = "MSCustom-adhoc-hybrid"` and nowhere else.
+pub(crate) const FONT_RECIPE_KEY: &str = "font_recipe";
+
+/// How a `text_params` payload uses a custom font (`custom_font_use`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CustomFontUse {
+    /// `font` names a saved custom font by its saved identity (as stored).
+    Saved(String),
+    /// `font` is the ad-hoc identity: the recipe stored under `font_recipe`, or the
+    /// log-ready reason it is missing or damaged (the layer then counts as using a missing
+    /// font — it is never rendered with something else).
+    AdHoc(Result<Arc<CustomFontRecipe>, String>),
+}
+
+/// Whether the `text_params` object `obj` uses a custom font, and which one. `None` for a
+/// real font (or no font). The ONE reader of the custom-font keys: the layer codec, the
+/// panel's layer load and the PSD export all go through it.
+#[must_use]
+pub(crate) fn custom_font_use(obj: &Map<String, Value>) -> Option<CustomFontUse> {
+    let font = obj.get("font").and_then(Value::as_str)?;
+    if is_adhoc_identity(font) {
+        let recipe = match obj.get(FONT_RECIPE_KEY) {
+            None => Err(format!("'{FONT_RECIPE_KEY}' is missing")),
+            Some(value) => CustomFontRecipe::from_json(value)
+                .and_then(|recipe| recipe.validate(&normalize_font_identity).map(|()| recipe))
+                .map(Arc::new)
+                .map_err(|err| err.to_string()),
+        };
+        return Some(CustomFontUse::AdHoc(recipe));
+    }
+    is_saved_identity(font).then(|| CustomFontUse::Saved(font.to_owned()))
+}
 
 /// Schema-1 font keys. Schema 2 carries the font identity in `font` and nothing else;
 /// these are read (never written) by the legacy path and dropped on conversion — but
@@ -357,10 +403,20 @@ fn default_vector_lines_layout() -> Value {
 ///
 /// Takes the map BY VALUE: the caller has just built it and the result is the same
 /// allocation with entries removed.
+///
+/// `font_recipe` survives only next to the ad-hoc custom identity: a recipe left behind
+/// after the layer switched to another font would otherwise travel on forever.
 #[must_use]
 pub(crate) fn write_text_params(mut params: Map<String, Value>) -> Value {
     for key in DEAD_TEXT_PARAM_KEYS {
         params.remove(key);
+    }
+    let adhoc_font = params
+        .get("font")
+        .and_then(Value::as_str)
+        .is_some_and(is_adhoc_identity);
+    if !adhoc_font {
+        params.remove(FONT_RECIPE_KEY);
     }
     for key in LEGACY_FONT_KEYS {
         params.remove(key);
@@ -422,6 +478,70 @@ pub(crate) fn read_text_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY;
+    use ms_custom_fonts::{CustomFontKind, HybridParams, HybridSource, MissingGlyphPolicy};
+
+    fn recipe_json() -> Value {
+        CustomFontRecipe {
+            kind: CustomFontKind::Hybrid(HybridParams {
+                sources: vec![
+                    HybridSource { identity: "Alpha-Regular".to_owned(), weight: 1.0, missing_override: None },
+                    HybridSource { identity: "Beta-Regular".to_owned(), weight: 2.0, missing_override: Some(MissingGlyphPolicy::Disable) },
+                ],
+                missing_default: MissingGlyphPolicy::NoInfluence,
+            }),
+        }
+        .to_json()
+    }
+
+    fn params(font: &str, recipe: Option<Value>) -> Map<String, Value> {
+        let mut obj = Map::new();
+        obj.insert("font".to_owned(), Value::from(font));
+        obj.insert("text".to_owned(), Value::from("x"));
+        if let Some(recipe) = recipe {
+            obj.insert(FONT_RECIPE_KEY.to_owned(), recipe);
+        }
+        obj
+    }
+
+    /// The recipe is written only next to the ad-hoc identity and dropped everywhere else.
+    #[test]
+    fn font_recipe_is_kept_only_for_the_adhoc_identity() {
+        let written = write_text_params(params(ADHOC_CUSTOM_FONT_IDENTITY, Some(recipe_json())));
+        assert_eq!(written.get(FONT_RECIPE_KEY), Some(&recipe_json()));
+        let written = write_text_params(params("Alpha-Regular", Some(recipe_json())));
+        assert!(written.get(FONT_RECIPE_KEY).is_none(), "a stale recipe must not survive a font change");
+        let written = write_text_params(params("MSCustom-0123456789abcdef", Some(recipe_json())));
+        assert!(written.get(FONT_RECIPE_KEY).is_none(), "a saved custom font carries no recipe");
+    }
+
+    #[test]
+    fn custom_font_use_tells_saved_adhoc_and_real_fonts_apart() {
+        assert_eq!(custom_font_use(&params("Alpha-Regular", None)), None);
+        assert_eq!(
+            custom_font_use(&params("MSCustom-0123456789abcdef", None)),
+            Some(CustomFontUse::Saved("MSCustom-0123456789abcdef".to_owned()))
+        );
+        match custom_font_use(&params(ADHOC_CUSTOM_FONT_IDENTITY, Some(recipe_json()))) {
+            Some(CustomFontUse::AdHoc(Ok(recipe))) => assert_eq!(recipe.to_json(), recipe_json()),
+            other => panic!("expected a valid ad-hoc recipe, got {other:?}"),
+        }
+        assert!(matches!(
+            custom_font_use(&params(ADHOC_CUSTOM_FONT_IDENTITY, None)),
+            Some(CustomFontUse::AdHoc(Err(_)))
+        ));
+        assert!(matches!(
+            custom_font_use(&params(ADHOC_CUSTOM_FONT_IDENTITY, Some(json!({"kind": "hybrid"})))),
+            Some(CustomFontUse::AdHoc(Err(_)))
+        ));
+        // A recipe naming one font twice breaks the recipe invariants.
+        let mut duplicate = recipe_json();
+        duplicate["sources"][1]["identity"] = json!("alpha-regular");
+        assert!(matches!(
+            custom_font_use(&params(ADHOC_CUSTOM_FONT_IDENTITY, Some(duplicate))),
+            Some(CustomFontUse::AdHoc(Err(_)))
+        ));
+    }
 
     /// Both historical representations of `hanging_punctuation` must read back as the
     /// same `0.0..=1.0` strength, out-of-range values must be clamped, and anything that

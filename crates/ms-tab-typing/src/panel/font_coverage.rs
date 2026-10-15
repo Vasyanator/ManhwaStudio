@@ -22,6 +22,8 @@ Key types:
 Key functions:
 - `classify_font_bytes` — classify against the current typesetting language.
 - `classify_font_bytes_for` — classify against an explicit `TextLanguage`.
+- `required_chars_for` / `classify_char_set_for` — the same decision for a font known
+  only by its mapped characters (custom fonts, `custom_font_entry.rs`).
 - `classify_with` — the core, font-file-free decision logic (tested directly).
 
 Notes:
@@ -255,6 +257,24 @@ pub(super) fn classify_font_bytes_for(
     classify_with(|ch| charmap.map(ch) != 0, lang)
 }
 
+/// Every character `lang` is judged on (script base plus the language's extras):
+/// the candidate set when the font is not a file, e.g. a custom font's recipe, whose
+/// covered subset its compiler answers (`panel/custom_font_entry.rs`).
+pub(super) fn required_chars_for(lang: TextLanguage) -> std::collections::BTreeSet<char> {
+    let spec = language_spec(lang);
+    spec.script_chars.iter().chain(spec.extra_chars).copied().collect()
+}
+
+/// Classify a font known only by the set of characters it maps (a subset of
+/// [`required_chars_for`] is enough) against `lang`. Same decision as
+/// [`classify_font_bytes_for`].
+pub(super) fn classify_char_set_for(
+    covered: &std::collections::BTreeSet<char>,
+    lang: TextLanguage,
+) -> FontLanguageCoverage {
+    classify_with(|ch| covered.contains(&ch), lang)
+}
+
 /// Core classification over a coverage predicate. Split out so the decision
 /// logic is testable without a real font file.
 fn classify_with(is_covered: impl Fn(char) -> bool, lang: TextLanguage) -> FontLanguageCoverage {
@@ -405,6 +425,28 @@ mod tests {
                 !spec.extra_chars.is_empty(),
                 "empty extra set for {lang:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_char_set_classifies_like_the_predicate() {
+        for lang in TextLanguage::all() {
+            let required = required_chars_for(lang);
+            assert_eq!(classify_char_set_for(&required, lang).support, FontLanguageSupport::Full, "{lang:?}");
+            assert_eq!(
+                classify_char_set_for(&std::collections::BTreeSet::new(), lang).support,
+                FontLanguageSupport::Unsupported,
+                "{lang:?}"
+            );
+            let spec = language_spec(lang);
+            let Some(&dropped) = spec.extra_chars.iter().find(|ch| !spec.script_chars.contains(ch)) else {
+                continue;
+            };
+            let without_one_extra: std::collections::BTreeSet<char> =
+                required.iter().copied().filter(|&ch| ch != dropped).collect();
+            let coverage = classify_char_set_for(&without_one_extra, lang);
+            assert_eq!(coverage.support, FontLanguageSupport::Partial, "{lang:?}");
+            assert!(coverage.missing.iter().all(|&ch| ch == dropped) && !coverage.missing.is_empty(), "{lang:?}");
         }
     }
 }

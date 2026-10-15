@@ -14,6 +14,12 @@ Contract:
   typing internal is `pub(crate)`.
 - `FontEntry` is re-exported as an OPAQUE type: its fields and constructors stay private
   to typing; external readers use the `pub(crate)` accessors on `FontEntry` itself.
+- Font BYTES are located only through `FontEntry::byte_source()` (re-exported
+  `FontByteSource`, matched exhaustively; its `Custom` arm names a `CustomFontRef`);
+  `FontEntry::file_path()` answers location questions (folder, import hint, file name
+  shown) and is never read for bytes. Own-typeface previews go through
+  `FontByteSource::preview_source()` -> `FontPreviewSource::request_family`; a worker that
+  needs the bytes themselves calls `font_bytes_blocking`.
 - Heavy font enumeration (`load_font_lists` / `load_system_catalog`) MUST run off the GUI
   thread — it walks the fonts dir / the OS font database.
 - The font lists are built as ONE combined pass, so the identities the settings UI writes
@@ -46,6 +52,22 @@ Key functions:
   `add_virtual_group_member` / `remove_virtual_group_member` /
   `set_virtual_group_member_alias` / `virtual_groups_for_font`
 - `list_folder_group_names` (real folder groups under `fonts/groups/`; HEAVY, off-thread)
+- SAVED CUSTOM FONTS IN THE FONT LISTS: `FontAdminLists::custom` (one `CustomFontRow` per
+  stored font, unavailable ones included, with the localized reason
+  `CustomFontUnavailability::tooltip`), `is_custom_font_identity`, `font_bytes_blocking`
+- SAVED CUSTOM FONTS (recipes, e.g. hybrids): `list_custom_fonts` (-> `CustomFontInfo`, a
+  facade-owned mirror like `VirtualFontGroupInfo`) / `custom_font_name` (one font's stored
+  name, for rows whose font is not loadable) / `create_custom_font` (returns the minted
+  saved identity) / `update_custom_font_recipe` / `rename_custom_font` / `delete_custom_font`
+  (also drops the font's own kerning record and group memberships), errors
+  `CustomFontStoreError`; the recipe model is re-exported from `ms_custom_fonts`
+  (`CustomFontRecipe`, `CustomFontKind`, `HybridParams`, `HybridSource`,
+  `MissingGlyphPolicy`). A stored entry this build cannot interpret is listed with
+  `CustomFontInfo::unsupported` set and may only be deleted
+- THE SHARED HYBRID EDITOR (`crate::hybrid_editor`, re-exported): `HybridEditorState`,
+  `HybridEditorCx`, `HybridEditorOutcome`, `CommittedRecipe`, `CommitButton`, `DraftError`,
+  `SourceCatalog`, `draw_hybrid_editor`, plus `hybrid_source_catalog` (the settings host's
+  source catalog over the folder + imported fonts and the bundled interface font)
 
 Key mapping:
 - EVERY per-font setting is keyed by the font's IDENTITY
@@ -60,15 +82,41 @@ Key mapping:
 */
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use super::panel::{fonts, font_settings_store};
+use super::panel::custom_font_entry::CustomFontUnavailable;
+use super::panel::{fonts, font_settings_store, fonts_data};
 // Re-exported crate-wide as an OPAQUE type (fields/constructors stay private to typing);
 // external readers use the `pub(crate)` accessors on `FontEntry`.
 pub use super::panel::FontEntry;
+// THE answer to "where do this font's bytes come from" (`FontEntry::byte_source`). Every
+// byte read of a font outside typing (the settings own-typeface previews and the
+// font-properties analysis) matches it instead of reading `FontEntry::file_path`.
+pub use super::panel::FontByteSource;
+// What an own-typeface preview draws from (`FontByteSource::preview_source`), and the
+// custom-font payload of `FontByteSource::Custom` (opaque).
+pub use super::panel::{CustomFontRef, FontPreviewSource};
+// Bounds the egui fonts registered for a saved custom font while its recipe is tuned: the
+// settings properties window holds the pin (`custom_font_entry::pin_custom_face_display`).
+pub use super::panel::custom_font_entry::{CustomFaceDisplayPin, pin_custom_face_display};
+// A font's whole byte buffer, as `font_bytes_blocking` returns it.
+pub use crate::render_next::FontBytes;
 // Re-exported with its FIELDS, unlike `FontEntry`: the settings font-properties window must
 // CONSTRUCT pairs to store them, and a mirror type here would be a third copy of a struct
 // that carries no invariant beyond "finite offset" (enforced on store and on save).
 pub use super::panel::fonts_data::CustomKerningPair;
+// The custom-font recipe model, owned by `ms-custom-fonts`: the settings editor builds and
+// reads recipes with these types, so a mirror here would only be a lossy copy.
+pub use ms_custom_fonts::{CustomFontKind, CustomFontRecipe, HybridParams, HybridSource, MissingGlyphPolicy};
+// The typed refusal of every custom-font mutation; the settings UI maps its variants to
+// localized messages.
+pub use super::panel::font_settings_store::CustomFontStoreError;
+// The shared hybrid editor body: the settings create dialog and properties window host it
+// exactly as the typing dock does (`dev-docs/hybrid_fonts_plan.md` §3.3).
+pub use crate::hybrid_editor::{
+    CommitButton, CommittedRecipe, DraftError, HybridEditorCx, HybridEditorOutcome, HybridEditorState, SourceCatalog,
+    draw_hybrid_editor,
+};
 
 /// Why an imported system font recorded in `fonts_data.json` could not be loaded this run.
 /// The UI maps each variant to a localized "unavailable" note on the row.
@@ -124,6 +172,49 @@ pub struct FontAdminLists {
     pub imported: Vec<FontEntry>,
     /// One row per stored imported system font, in document order, including unavailable ones.
     pub imported_rows: Vec<ImportedFontRow>,
+    /// One row per SAVED custom font, in identity order, including unavailable ones (a
+    /// missing source, a kind this build cannot compile, a damaged recipe). Built from the
+    /// same combined pass, so their sources are exactly the fonts listed above.
+    pub custom: Vec<CustomFontRow>,
+}
+
+/// Why a saved custom font cannot be used this run (facade mirror of the model's reason).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomFontUnavailability {
+    /// These source fonts (identities) are not installed or could not be read.
+    MissingSources(Vec<String>),
+    /// Created by a newer build: this build cannot compile its kind (carries the tag).
+    UnsupportedKind(String),
+    /// Its stored settings are damaged (carries the log-ready reason).
+    InvalidRecipe(String),
+}
+
+impl CustomFontUnavailability {
+    /// The localized explanation for the greyed row's tooltip. GUI thread (`t!`).
+    #[must_use]
+    pub fn tooltip(&self) -> String {
+        match self {
+            Self::MissingSources(sources) => {
+                tf!("typing.fonts.custom_font_missing_source_tooltip", font = sources.join(", "))
+            }
+            Self::UnsupportedKind(_) => t!("typing.fonts.custom_font_unsupported_kind_tooltip").to_string(),
+            Self::InvalidRecipe(_) => t!("typing.fonts.custom_font_invalid_recipe_tooltip").to_string(),
+        }
+    }
+}
+
+/// One saved custom font of the font lists: what the document records plus its entry when
+/// it can be used.
+pub struct CustomFontRow {
+    /// The saved identity (`MSCustom-<16 hex>`): the key layers, groups and kerning use.
+    pub identity: String,
+    /// The stored, user-visible name.
+    pub name: String,
+    /// The usable list entry (for previews, group pickers, the properties window), or
+    /// `None` when the font is unavailable.
+    pub font: Option<FontEntry>,
+    /// Why the font is unavailable; `None` exactly when `font` is `Some`.
+    pub unavailable: Option<CustomFontUnavailability>,
 }
 
 /// Loads the folder fonts and the imported system fonts as ONE identity-consistent snapshot.
@@ -139,7 +230,7 @@ pub fn load_font_lists() -> FontAdminLists {
     let folder: Vec<FontEntry> = combined
         .entries
         .iter()
-        .filter(|entry| entry.path().starts_with(&fonts_dir))
+        .filter(|entry| entry.file_path().starts_with(&fonts_dir))
         .cloned()
         .collect();
     let imported_rows: Vec<ImportedFontRow> = combined
@@ -176,10 +267,91 @@ pub fn load_font_lists() -> FontAdminLists {
         .filter_map(|row| row.font.clone())
         .filter(|font| !folder_identities.contains(&font.render_identity_name()))
         .collect();
+    let custom = combined
+        .custom_rows
+        .into_iter()
+        .map(|row| CustomFontRow {
+            identity: row.identity,
+            name: row.name,
+            font: row.entry,
+            unavailable: row.unavailable.map(|reason| match reason {
+                CustomFontUnavailable::MissingSources(sources) => CustomFontUnavailability::MissingSources(sources),
+                CustomFontUnavailable::UnsupportedKind(kind) => CustomFontUnavailability::UnsupportedKind(kind),
+                CustomFontUnavailable::InvalidRecipe(reason) => CustomFontUnavailability::InvalidRecipe(reason),
+            }),
+        })
+        .collect();
     FontAdminLists {
         folder,
         imported,
         imported_rows,
+        custom,
+    }
+}
+
+/// The hybrid editor's source catalog for the settings host: the bundled interface font plus
+/// every folder and imported font of `lists` (never a custom font, decision D4), with a
+/// source-only resolver over the same fonts.
+///
+/// Cheap (entry clones, no file read — the resolver reads lazily on the editor's workers),
+/// but call it where `lists` is built (the settings load worker) and share the `Arc`, so the
+/// editor sees one catalog per font-list load.
+#[must_use]
+pub fn hybrid_source_catalog(lists: &FontAdminLists) -> Arc<SourceCatalog> {
+    let real: Vec<FontEntry> = lists.folder.iter().chain(&lists.imported).cloned().collect();
+    let sources = super::panel::custom_font_entry::hybrid_source_fonts(&real);
+    let resolver = super::panel::custom_font_entry::source_only_resolver(&sources);
+    Arc::new(SourceCatalog::from_entries(&sources, resolver))
+}
+
+/// Whether `identity` names a custom font: a saved custom font (`MSCustom-<16 hex>`) or
+/// the typing panel's ad-hoc hybrid entry. Custom fonts are not in `folder` / `imported`,
+/// so an availability check over those lists must consult this (and
+/// `FontAdminLists::custom`). Pure and cheap; GUI-thread safe.
+#[must_use]
+pub fn is_custom_font_identity(identity: &str) -> bool {
+    crate::custom_fonts::identity::is_saved_identity(identity)
+        || crate::custom_fonts::identity::is_adhoc_identity(identity)
+}
+
+/// Why [`font_bytes_blocking`] could not produce a font's bytes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FontBytesError {
+    /// The font file (or the bundled font) could not be read; carries the location and
+    /// the OS reason.
+    #[error("font file could not be read: {0}")]
+    Unreadable(String),
+    /// The custom font could not be built (missing source, compile error); carries the
+    /// reason.
+    #[error("custom font could not be built: {0}")]
+    CustomFont(String),
+    /// The entry has no bytes of its own (the typing panel's ad-hoc custom entry).
+    #[error("this font entry has no bytes of its own")]
+    NoBytes,
+}
+
+/// The whole byte buffer of `font`: the file's current content, the resident bundled font,
+/// or a custom font's compiled full face.
+///
+/// BLOCKING — a file read, or for a custom font possibly a compile of several seconds:
+/// worker threads only (e.g. the settings font-properties analysis).
+///
+/// # Errors
+/// See [`FontBytesError`].
+pub fn font_bytes_blocking(font: &FontEntry) -> Result<FontBytes, FontBytesError> {
+    match font.byte_source() {
+        FontByteSource::File(path) => std::fs::read(path)
+            .map(|bytes| Arc::new(bytes) as FontBytes)
+            .map_err(|err| FontBytesError::Unreadable(format!("{}: {err}", path.display()))),
+        // `ms_fonts::bytes` logs its own failure with the path and the reason.
+        FontByteSource::Bundled(stack_font) => ms_fonts::bytes(stack_font)
+            .map(|bytes| Arc::new(bytes) as FontBytes)
+            .ok_or_else(|| FontBytesError::Unreadable(stack_font.path.display().to_string())),
+        FontByteSource::Custom(custom) => match custom.full_face_blocking() {
+            Some(Ok(face)) => Ok(Arc::clone(&face.bytes)),
+            Some(Err(err)) => Err(FontBytesError::CustomFont(err.to_string())),
+            None => Err(FontBytesError::NoBytes),
+        },
     }
 }
 
@@ -460,6 +632,101 @@ pub fn virtual_groups_for_font(identity: &str) -> Vec<(String, Option<String>)> 
 #[must_use]
 pub fn list_folder_group_names() -> Vec<String> {
     fonts::load_font_groups(&ms_config::storage_mode::app_fonts_dir())
+}
+
+/// Why a saved custom font cannot be used by this build (facade mirror of the store's reason).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomFontUnsupported {
+    /// Its kind is not implemented by this build (a newer build saved it); carries the tag.
+    UnknownKind(String),
+    /// Its recipe does not parse or breaks the recipe invariants; carries the log-ready reason.
+    Invalid(String),
+}
+
+/// One saved custom font exposed to non-typing code.
+///
+/// Exactly one of `recipe` / `unsupported` is `Some`: a usable font carries its recipe, an
+/// entry this build cannot interpret carries the reason (it is kept verbatim in the document
+/// and may only be deleted).
+#[derive(Debug, Clone)]
+pub struct CustomFontInfo {
+    /// The saved identity (`MSCustom-<16 hex>`): the key layers, groups and kerning use.
+    pub identity: String,
+    /// User-visible name (never blank).
+    pub name: String,
+    /// The recipe, when this build can use it.
+    pub recipe: Option<Arc<CustomFontRecipe>>,
+    /// Why the font cannot be used, when it cannot.
+    pub unsupported: Option<CustomFontUnsupported>,
+}
+
+/// Lists every saved custom font in identity order, unsupported ones included. Cheap
+/// (in-memory snapshot); GUI-thread safe.
+#[must_use]
+pub fn list_custom_fonts() -> Vec<CustomFontInfo> {
+    font_settings_store::custom_fonts()
+        .into_iter()
+        .map(|(identity, record)| {
+            let (recipe, unsupported) = match record.body {
+                fonts_data::CustomFontBody::Known(recipe) => (Some(recipe), None),
+                fonts_data::CustomFontBody::Unsupported { reason, .. } => (
+                    None,
+                    Some(match reason {
+                        fonts_data::UnsupportedCustomFont::UnknownKind(kind) => CustomFontUnsupported::UnknownKind(kind),
+                        fonts_data::UnsupportedCustomFont::Invalid(reason) => CustomFontUnsupported::Invalid(reason),
+                        fonts_data::UnsupportedCustomFont::IdentityCollision { kept } => {
+                            CustomFontUnsupported::Invalid(format!("the identity duplicates the custom font '{kept}'"))
+                        }
+                    }),
+                ),
+            };
+            CustomFontInfo { identity, name: record.name, recipe, unsupported }
+        })
+        .collect()
+}
+
+/// The user-visible name of the saved custom font `identity` (matched case-insensitively), or
+/// `None` when no custom font has it — e.g. to name a group member whose custom font is not
+/// loadable this run. Cheap (in-memory read); GUI-thread safe.
+#[must_use]
+pub fn custom_font_name(identity: &str) -> Option<String> {
+    font_settings_store::custom_font_name(identity)
+}
+
+/// Saves a new custom font named `name` with `recipe` and returns its minted saved identity.
+/// Persists off the GUI thread and bumps the store revision.
+///
+/// # Errors
+/// See [`CustomFontStoreError`]: blank or taken name (among custom fonts only — a clash with
+/// a real font's name is the caller's check), invalid recipe, identity collision.
+pub fn create_custom_font(name: &str, recipe: CustomFontRecipe) -> Result<String, CustomFontStoreError> {
+    font_settings_store::create_custom_font(name, recipe)
+}
+
+/// Replaces the recipe of the saved custom font `identity` (its identity is unchanged). An
+/// identical recipe is a no-op. Persists off the GUI thread and bumps the store revision on a
+/// real change.
+///
+/// # Errors
+/// Invalid recipe, unknown identity, or an unsupported entry (never overwritten).
+pub fn update_custom_font_recipe(identity: &str, recipe: CustomFontRecipe) -> Result<(), CustomFontStoreError> {
+    font_settings_store::update_custom_font_recipe(identity, recipe)
+}
+
+/// Renames the saved custom font `identity`. The unchanged name is a no-op. Persists off the
+/// GUI thread and bumps the store revision on a real change.
+///
+/// # Errors
+/// Blank or taken name, unknown identity, or an unsupported entry.
+pub fn rename_custom_font(identity: &str, new_name: &str) -> Result<(), CustomFontStoreError> {
+    font_settings_store::rename_custom_font(identity, new_name)
+}
+
+/// Deletes the saved custom font `identity` together with its own kerning/profile record and
+/// its virtual-group memberships, in one write. Returns `false` when no such font exists.
+/// Persists off the GUI thread and bumps the store revision.
+pub fn delete_custom_font(identity: &str) -> bool {
+    font_settings_store::delete_custom_font(identity)
 }
 
 /// Serializes every test that touches the PROCESS-GLOBAL font-settings store, across ALL

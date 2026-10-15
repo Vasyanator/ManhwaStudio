@@ -223,6 +223,10 @@ const TYPING_DEFORM_TAB: TabId = TabId::new("typing.deform");
 /// «Редактирование раскладки» — the vector layout editor; shown only while it owns
 /// the canvas.
 const TYPING_LAYOUT_EDITOR_TAB: TabId = TabId::new("typing.layout_editor");
+/// «Гибридный шрифт» — the hybrid editor over the active panel's ad-hoc recipe; shown
+/// only while the user opened it AND that panel's font is the ad-hoc entry
+/// (`TypingTopPanelState::hybrid_font_tab_visible`).
+const TYPING_HYBRID_FONT_TAB: TabId = TabId::new("typing.hybrid_font");
 
 /// Outer width, in points, the preview panel starts at — the width its own
 /// floating panel used before the migration.
@@ -272,6 +276,18 @@ const TYPING_DEFORM_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(260.0, 140.0);
 const TYPING_LAYOUT_EDITOR_TAB_INITIAL_SIZE_PX: egui::Vec2 = egui::Vec2::new(360.0, 420.0);
 /// Smallest outer size, in points, of the «Редактирование раскладки» panel.
 const TYPING_LAYOUT_EDITOR_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(300.0, 160.0);
+
+/// Outer size, in points, the «Гибридный шрифт» panel uses on its very first frame, before
+/// its content has been measured once (the panel is content-sized afterwards). The width is
+/// the «Параметры»/«Эффекты» column's ([`TYPING_DEFAULT_PARAMS_PANEL_SIZE_PX`]), so it does
+/// not stick out of the right-hand column it continues. The height is deliberately short:
+/// with «Маска» open too, the whole right-hand column — pinned «Параметры» + «Маска» + this
+/// one — still fits a 1000-point dock area without the solver shrinking anything
+/// (`tab::tests::the_default_dock_layout_places_every_panel_clear_of_the_others`).
+const TYPING_HYBRID_FONT_TAB_INITIAL_SIZE_PX: egui::Vec2 = egui::Vec2::new(435.0, 140.0);
+/// Smallest outer size, in points, of the «Гибридный шрифт» panel: one source row plus
+/// the commit line.
+const TYPING_HYBRID_FONT_TAB_MIN_SIZE_PX: egui::Vec2 = egui::Vec2::new(340.0, 120.0);
 
 /// Outer size, in points, the DEFAULT arrangement pins the «Превью текста» panel
 /// to (`typing_default_dock_layout`). Taken from the hand-tuned arrangement the
@@ -1265,7 +1281,7 @@ pub(crate) struct TypingPageInteractionPolicy {
 
 /// Default panel arrangement of the «Текст» program tab.
 ///
-/// Six panels in two columns. The arrangement is the one the maintainer settled on
+/// Eight panels in two columns. The arrangement is the one the maintainer settled on
 /// by hand and it was transcribed from the `PanelLayout` section their
 /// `user_config.json` held: the anchors and the pinned sizes below are that
 /// arrangement, with the sizes rounded to whole points and the anchor fractions —
@@ -1278,8 +1294,8 @@ pub(crate) struct TypingPageInteractionPolicy {
 /// it, so a panel with nothing to draw drops out of the frame's chain and the ones
 /// below it move up into its place (`panel_dock::frame_layout`). Top to bottom, that
 /// is «Лента» → «Превью текста» → «Действия»/«Слои» → «Режим деформации» →
-/// «Редактирование раскладки» on the left and «Параметры»/«Эффекты» → «Маска» on
-/// the right:
+/// «Редактирование раскладки» on the left and «Параметры»/«Эффекты» → «Маска» →
+/// «Гибридный шрифт» on the right:
 /// * `#0` — «Лента» ([`ms_canvas::CANVAS_RIBBON_TAB`]), flush with the left
 ///   edge of the dock area. Content-sized: it is the canvas' own controls panel and
 ///   has no reason to reserve more than its four rows;
@@ -1298,6 +1314,10 @@ pub(crate) struct TypingPageInteractionPolicy {
 /// * `#6` — «Редактирование раскладки», under `#5`. The two never show together —
 ///   opening the layout editor leaves transform mode — so it normally sits directly
 ///   under «Действия», whose anchor it inherits for that frame.
+/// * `#7` — «Гибридный шрифт», under `#4` (opened from the row under the font combo
+///   while the ad-hoc hybrid entry is selected). With the mask editor closed it inherits
+///   `#4`'s anchor and sits directly under «Параметры»/«Эффекты». Existing users get it
+///   seeded from this anchor (`panel_dock` "Declaration rules").
 ///
 /// The three panels that carry a size are pinned with a `size_override`, so they
 /// are the LAST to give when the chain does not fit the dock area
@@ -1327,6 +1347,7 @@ pub fn typing_default_dock_layout() -> DockLayout {
     let preview = PanelId::new(1);
     let params = PanelId::new(2);
     let actions = PanelId::new(3);
+    let mask = PanelId::new(4);
     let deform = PanelId::new(5);
     let panels = [
         // The ribbon is inserted FIRST because the preview anchors to it, and
@@ -1370,7 +1391,7 @@ pub fn typing_default_dock_layout() -> DockLayout {
             Some(TYPING_DEFAULT_ACTIONS_PANEL_SIZE_PX),
         ),
         (
-            PanelId::new(4),
+            mask,
             vec![TYPING_MASK_TAB],
             PanelAnchor::Panel {
                 target: params,
@@ -1394,6 +1415,16 @@ pub fn typing_default_dock_layout() -> DockLayout {
             vec![TYPING_LAYOUT_EDITOR_TAB],
             PanelAnchor::Panel {
                 target: deform,
+                edge: DockEdge::Bottom,
+                align: 0.0,
+            },
+            None,
+        ),
+        (
+            PanelId::new(7),
+            vec![TYPING_HYBRID_FONT_TAB],
+            PanelAnchor::Panel {
+                target: mask,
                 edge: DockEdge::Bottom,
                 align: 0.0,
             },
@@ -1472,8 +1503,8 @@ impl TypingDockTabVisibility {
 
 /// Per-frame context the panel dock hands to one «Текст» tab body at a time.
 ///
-/// The bodies capture nothing of their own on purpose: four of the eight tabs
-/// need `&mut TypingTopPanelState` (preview, params, effects, actions), three
+/// The bodies capture nothing of their own on purpose: five of the nine tabs
+/// need `&mut TypingTopPanelState` (preview, params, effects, actions, hybrid font), three
 /// need `&mut TypingTextOverlayLayer` («Слои», deformation, layout editor) and
 /// «Маска» needs `&mut TypingMaskLayer`. Closures capturing those borrows
 /// directly could not coexist in the dock's queue; exclusive, sequential access
@@ -1484,7 +1515,7 @@ impl TypingDockTabVisibility {
 /// the context constructible at all — and none of them is the `PanelDockState` the
 /// dock itself borrows for the frame.
 struct TypingDockCx<'a> {
-    /// Owner of the preview, parameters, effects and actions bodies.
+    /// Owner of the preview, parameters, effects, actions and hybrid-font bodies.
     top_panel: &'a mut TypingTopPanelState,
     /// Owner of the «Слои», «Режим деформации» and «Редактирование раскладки»
     /// bodies.
@@ -1749,6 +1780,10 @@ impl CanvasHooks for TypingHooks<'_> {
         // The panel's per-frame prologue runs first, then the dock: the tab bodies must
         // see THIS frame's polled render results, not the previous frame's.
         self.top_panel.begin_frame(ctx);
+        // Read after the prologue, which syncs the hybrid dock with this frame's panel
+        // state; owned by the panel (`panel/hybrid_dock.rs`), so it is not part of the
+        // mode-driven `TypingDockTabVisibility` rule set above.
+        let hybrid_font_visible = self.top_panel.hybrid_font_tab_visible();
         {
             panel_dock.ensure_default_layout(AppTab::Typing.key(), typing_default_dock_layout);
             let mut cx = TypingDockCx {
@@ -1837,6 +1872,12 @@ impl CanvasHooks for TypingHooks<'_> {
                 .show(|ui, cx: &mut TypingDockCx<'_>| {
                     cx.text_overlays.draw_layout_editor_tab_body(ui);
                 });
+            dock.tab(TYPING_HYBRID_FONT_TAB)
+                .title(|| t!("typing.hybrid_font.dock_tab_title"))
+                .visible(hybrid_font_visible)
+                .min_size(TYPING_HYBRID_FONT_TAB_MIN_SIZE_PX)
+                .initial_size(TYPING_HYBRID_FONT_TAB_INITIAL_SIZE_PX)
+                .show(|ui, cx: &mut TypingDockCx<'_>| cx.top_panel.draw_hybrid_font_tab_body(ui));
             // The drawn rects are deliberately dropped: every «Текст» surface that used
             // to anchor itself to another one is inside the dock's own layout now.
             drop(dock.end(&mut cx));
@@ -2743,6 +2784,13 @@ pub(super) struct TypingExportRequest {
     /// `"<title> <chapter>"`, already sanitized for a file name (see `export_base_name`).
     /// Re-paginated pages are named from it; the one-to-one paths keep the source page stem.
     pub(super) output_base_name: String,
+    /// PSD only: also write the compiled `.ttf` of every custom font the chapter's text layers
+    /// use next to the documents («Положить рядом кастомные шрифты»). Ignored by PNG / PDF.
+    pub(super) bundle_custom_fonts: bool,
+    /// PSD only: how the export worker finds the compiled faces of custom fonts (snapshot of
+    /// the panel's saved recipes + source resolver). `None` for PNG / PDF, or when the panel
+    /// had nothing to snapshot; custom layers then keep their stored font name.
+    pub(super) custom_fonts: Option<Arc<crate::custom_fonts::export::CustomFontExportResolver>>,
 }
 
 pub(super) struct TypingExportPageJob {
@@ -2792,9 +2840,10 @@ struct TypingExportResult {
     /// Display name of where the run wrote — the picked folder, or the picked `.pdf` file.
     destination_name: String,
     /// Localized, deduplicated notes about what the OUTPUT FORMAT could not express, in a
-    /// run that otherwise succeeded (every page was written). Today: PSD text layers whose
-    /// font name is claimed by several installed fonts — see
-    /// `psd_export::AmbiguousExportFont`. Empty in the normal case.
+    /// run that otherwise succeeded (every page was written): PSD text layers whose font name
+    /// is claimed by several installed fonts (`psd_export::AmbiguousExportFont`), and custom
+    /// fonts that got no compiled face or whose bundled `.ttf` could not be written
+    /// (`export::prepare_custom_font_export`). Empty in the normal case.
     warnings: Vec<String>,
 }
 

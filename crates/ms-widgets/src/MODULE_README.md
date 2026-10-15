@@ -97,7 +97,10 @@ crate's `[dev-dependencies]`, so no production build carries them.
   whole cache is cleared whenever the loaded dictionary set changes, so a verdict from one language
   never survives a switch. On wasm the download layer is unavailable; the word is left unmarked.
 - `font_preview.rs`: shared egui font-registration helpers for own-typeface font previews
-  (`combo_font_family_name`, `is_font_family_bound`, `request_font_family`). Deterministic
+  (`combo_font_family_name`, `is_font_family_bound`, `request_font_family`, and
+  `request_font_family_from_bytes` for a face already in memory — a compiled custom font —
+  whose `SharedFontBytes` are copied into egui's owned buffer on the same reader workers,
+  never on the GUI thread). Deterministic
   `(font identity, content hash, face_index)` → family naming plus the one-time registration
   of a font into egui. `request_font_family` returns a `PreviewFontFamily`
   (`Ready` / `Pending` / `Unavailable`): the file READ is queued on worker threads and only

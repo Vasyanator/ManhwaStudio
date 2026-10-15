@@ -4,9 +4,10 @@ File: panel/font_settings_store.rs
 Purpose:
 Process-global runtime store for the app-level per-font settings persisted in
 `fonts/fonts_data.json` (via `super::fonts_data`). It owns the authoritative runtime
-copy of three things: the user-imported system fonts, the per-font settings
-(display-name override + default parameter profile + user-defined custom kerning pairs), and
-the user-defined VIRTUAL font groups. A single monotonic revision counter lets a GUI poller detect any change and
+copy of four things: the user-imported system fonts, the per-font settings
+(display-name override + default parameter profile + user-defined custom kerning pairs),
+the user-defined VIRTUAL font groups and the saved CUSTOM FONTS (recipes keyed by a saved
+identity). A single monotonic revision counter lets a GUI poller detect any change and
 reload; every mutation snapshots the whole state and saves off-thread.
 
 EVERYTHING IS KEYED BY FONT IDENTITY (`FontEntry::render_identity_name`), never by a file
@@ -24,7 +25,7 @@ logged, because a key is the only remaining clue about the font it meant.
 
 Main responsibilities:
 - own a thread-safe runtime-global state (imported system fonts + per-font settings +
-  virtual groups + the pending-migration flag);
+  virtual groups + custom fonts + the pending-migration flag);
 - seed it at startup from `fonts_data.json`, migrating the legacy
   `TextTab.imported_system_fonts` list on first run (`seed_imported_system_fonts_from_config`);
 - expose the imported-fonts snapshot / mutate helpers, the display-name override and the
@@ -51,6 +52,12 @@ Key functions:
   the setter bumps the revision and persists IMMEDIATELY, so open panels reload their fonts
   and the new pairs reach the renderer without a restart)
 - `virtual_groups` / `create_virtual_group` / `delete_virtual_group` / `rename_virtual_group`
+- CUSTOM FONTS (saved recipes): `custom_fonts` / `custom_font_name` / `create_custom_font`
+  (mints the identity through `custom_fonts::identity`) / `update_custom_font_recipe` /
+  `rename_custom_font` / `delete_custom_font` (one write removes the record, its own
+  `fonts.<identity>` record and its virtual-group memberships); errors are
+  `CustomFontStoreError`. Entries this build cannot interpret are kept verbatim, listed, and
+  may only be deleted
 - `add_virtual_group_member` / `remove_virtual_group_member` / `set_virtual_group_member_alias`
 - `seed_imported_system_fonts_from_config` / `migrate_legacy_font_keys`
 
@@ -70,7 +77,9 @@ use super::*;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use ms_custom_fonts::CustomFontRecipe;
 
 /// How long a DEBOUNCED save waits before writing, so a burst of per-font profile updates
 /// (the panel rewrites a font's profile on every parameter change) collapses into one
@@ -92,6 +101,9 @@ struct StoreState {
     /// the mutators). The store cannot see folder groups (filesystem) — a collision of a
     /// virtual name with a real folder-group name is handled at the UI / panel-merge level.
     virtual_groups: Vec<fonts_data::VirtualFontGroup>,
+    /// Saved custom fonts keyed by their saved identity, unsupported entries included
+    /// (kept verbatim). Names are unique case-insensitively (enforced by the mutators).
+    custom_fonts: BTreeMap<String, fonts_data::CustomFontRecord>,
     /// `true` while a schema-1 document is waiting for the deferred re-key (see the file
     /// header). Cleared by `migrate_legacy_font_keys`.
     pending_migration: bool,
@@ -132,6 +144,7 @@ fn snapshot_data() -> fonts_data::FontsData {
         system_fonts: guard.system_fonts.clone(),
         fonts: guard.fonts.clone(),
         virtual_groups: guard.virtual_groups.clone(),
+        custom_fonts: guard.custom_fonts.clone(),
         pending_migration: guard.pending_migration,
     }
 }
@@ -187,8 +200,11 @@ fn arm_test_process_latch() {
 /// `cfg!(test)` covers this crate's own tests (which never take [`test_lock`]); the latch
 /// covers every OTHER crate's test binary. Both are checked on every writer path, so no
 /// test process can write to the real fonts directory.
+///
+/// `pub(crate)` because the custom-font disk cache (`custom_fonts::disk_cache`) obeys the same
+/// rule: no test process may read or write the real `fonts/custom_cache/` either.
 #[must_use]
-fn persistence_suppressed_by_tests() -> bool {
+pub(crate) fn persistence_suppressed_by_tests() -> bool {
     cfg!(test) || test_process_latch().load(Ordering::Acquire)
 }
 
@@ -321,7 +337,11 @@ fn merge_disk_document(disk: fonts_data::FontsData) {
 ///   theirs only where ours is unset, except the custom-kerning LIST, which is UNIONED by
 ///   `(left, right)` with ours first (see [`union_custom_kerning`]);
 /// - a virtual group we do not have is appended; a group we share gains the members we lack,
-///   and a member we hold without an alias picks up theirs.
+///   and a member we hold without an alias picks up theirs;
+/// - a custom font whose identity we do not hold is added (unsupported entries too, verbatim);
+///   one we hold is kept WHOLE — name and recipe are one definition, and mixing two halves
+///   would describe a font neither instance made. A name clash with one of ours is only
+///   warned about (renaming the user's font behind their back would be worse).
 fn merge_disk_into_state(state: &mut StoreState, disk: fonts_data::FontsData) {
     for entry in disk.system_fonts {
         let known = state.system_fonts.iter().any(|ours| {
@@ -392,6 +412,32 @@ fn merge_disk_into_state(state: &mut StoreState, disk: fonts_data::FontsData) {
                 }
             }
         }
+    }
+    for (identity, record) in disk.custom_fonts {
+        // A collision entry is by definition normalized-equal to another entry: matched by its
+        // exact raw key, or the normalized lookup would find that other entry and drop it.
+        let collision = matches!(
+            record.body,
+            fonts_data::CustomFontBody::Unsupported { reason: fonts_data::UnsupportedCustomFont::IdentityCollision { .. }, .. }
+        );
+        let present =
+            if collision { state.custom_fonts.contains_key(&identity) } else { find_custom_font_key(state, &identity).is_some() };
+        if present {
+            continue;
+        }
+        if let Some((clash, _)) = state
+            .custom_fonts
+            .iter()
+            .find(|(_, ours)| names_equal_ci(&ours.name, &record.name))
+        {
+            ms_log::runtime_log::log_warn(format!(
+                "typing: fonts_data: another app instance saved the custom font '{identity}' \
+                 under the name '{}', which this instance already uses for '{clash}'; both are \
+                 kept, rename one of them in Settings.",
+                record.name
+            ));
+        }
+        state.custom_fonts.insert(identity, record);
     }
 }
 
@@ -1354,6 +1400,263 @@ pub(crate) fn set_virtual_group_member_alias(
     changed
 }
 
+/// Why a custom-font store mutation was refused. Nothing changed when one is returned.
+///
+/// `Display` is the log text; the settings UI maps each variant to a localized message.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CustomFontStoreError {
+    /// The name is empty or whitespace-only.
+    #[error("the custom font name is blank")]
+    BlankName,
+    /// Another saved custom font already uses this name (compared case-insensitively). A
+    /// clash with a REAL font's name is not checked here: the store cannot see font files,
+    /// so the UI validates that.
+    #[error("another custom font already uses this name")]
+    NameTaken,
+    /// No saved custom font has this identity.
+    #[error("no custom font with this identity exists")]
+    UnknownIdentity,
+    /// The recipe breaks its invariants (`CustomFontRecipe::validate`) or names a custom font
+    /// as a source (only real fonts may be sources); carries the log-ready reason.
+    #[error("invalid custom font recipe: {0}")]
+    Invalid(String),
+    /// The stored entry is one this build cannot interpret (unknown kind or invalid recipe);
+    /// it is kept verbatim and may only be deleted, never edited.
+    #[error("this custom font was saved in a form this build cannot edit")]
+    Unsupported,
+    /// Every freshly minted identity was already in use. Practically unreachable (64 random
+    /// bits per identity); reported rather than looping forever or overwriting a font.
+    #[error("could not mint an unused custom font identity")]
+    IdentityCollision,
+}
+
+/// How many identities [`create_custom_font`] mints before giving up with
+/// [`CustomFontStoreError::IdentityCollision`].
+const CUSTOM_IDENTITY_MINT_ATTEMPTS: usize = 4;
+
+/// Checks a recipe before it is stored: its own invariants under the typing identity
+/// normalization, and that no source is a custom font (decision D4: custom fonts are built
+/// from REAL fonts only; the reserved namespace is owned by `custom_fonts::identity`).
+fn validate_custom_font_recipe(recipe: &CustomFontRecipe) -> Result<(), CustomFontStoreError> {
+    recipe
+        .validate(&fonts::normalize_font_identity)
+        .map_err(|err| CustomFontStoreError::Invalid(err.to_string()))?;
+    if let Some(source) = recipe
+        .source_identities()
+        .into_iter()
+        .find(|identity| crate::custom_fonts::identity::is_reserved_custom_identity(identity))
+    {
+        return Err(CustomFontStoreError::Invalid(format!(
+            "the custom font '{source}' cannot be a source of another custom font"
+        )));
+    }
+    Ok(())
+}
+
+/// The stored key of the custom font `identity`, compared case-insensitively like every
+/// identity (see [`find_record_key`]).
+#[must_use]
+fn find_custom_font_key(state: &StoreState, identity: &str) -> Option<String> {
+    if state.custom_fonts.contains_key(identity) {
+        return Some(identity.to_string());
+    }
+    let wanted = fonts::normalize_font_identity(identity);
+    state
+        .custom_fonts
+        .keys()
+        .find(|key| fonts::normalize_font_identity(key) == wanted)
+        .cloned()
+}
+
+/// Whether a custom font OTHER than `except` (a stored key) already uses `name`,
+/// case-insensitively. Unsupported entries count: their names are listed too.
+#[must_use]
+fn custom_font_name_taken(state: &StoreState, name: &str, except: Option<&str>) -> bool {
+    state
+        .custom_fonts
+        .iter()
+        .any(|(key, record)| Some(key.as_str()) != except && names_equal_ci(&record.name, name))
+}
+
+/// Saves a NEW custom font named `name` (trimmed) with `recipe`, under a freshly minted saved
+/// identity (`custom_fonts::identity::new_saved_identity`), and returns that identity.
+///
+/// On success bumps the shared revision (every font list reloads and lists the font) and
+/// persists off-thread.
+///
+/// # Errors
+/// `BlankName`, `NameTaken` (case-insensitive among custom fonts), `Invalid` (see
+/// [`validate_custom_font_recipe`]), `IdentityCollision`. Nothing changes on an error.
+pub(crate) fn create_custom_font(name: &str, recipe: CustomFontRecipe) -> Result<String, CustomFontStoreError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(CustomFontStoreError::BlankName);
+    }
+    validate_custom_font_recipe(&recipe)?;
+    let identity = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if custom_font_name_taken(&guard, name, None) {
+            return Err(CustomFontStoreError::NameTaken);
+        }
+        // An identity must be new to BOTH maps: a leftover `fonts.<identity>` record would
+        // otherwise hand its kerning/profile to an unrelated new font.
+        let identity = (0..CUSTOM_IDENTITY_MINT_ATTEMPTS)
+            .map(|_| crate::custom_fonts::identity::new_saved_identity())
+            .find(|candidate| find_custom_font_key(&guard, candidate).is_none() && find_record_key(&guard, candidate).is_none())
+            .ok_or(CustomFontStoreError::IdentityCollision)?;
+        guard.custom_fonts.insert(
+            identity.clone(),
+            fonts_data::CustomFontRecord {
+                name: name.to_string(),
+                body: fonts_data::CustomFontBody::Known(Arc::new(recipe)),
+            },
+        );
+        identity
+    };
+    bump_revision();
+    persist_off_thread();
+    Ok(identity)
+}
+
+/// Replaces the recipe of the saved custom font `identity`. The identity (and therefore every
+/// layer, group membership and own kerning pair that references it) is unchanged.
+///
+/// An identical recipe is a no-op: `Ok(())` without a revision bump or a write. A real change
+/// bumps the shared revision and persists off-thread.
+///
+/// # Errors
+/// `Invalid` (checked first), `UnknownIdentity`, `Unsupported` (an entry this build cannot
+/// interpret is never overwritten — it may belong to a newer build).
+pub(crate) fn update_custom_font_recipe(identity: &str, recipe: CustomFontRecipe) -> Result<(), CustomFontStoreError> {
+    validate_custom_font_recipe(&recipe)?;
+    let changed = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let key = find_custom_font_key(&guard, identity).ok_or(CustomFontStoreError::UnknownIdentity)?;
+        let record = guard.custom_fonts.get_mut(&key).ok_or(CustomFontStoreError::UnknownIdentity)?;
+        match &record.body {
+            fonts_data::CustomFontBody::Unsupported { .. } => return Err(CustomFontStoreError::Unsupported),
+            fonts_data::CustomFontBody::Known(existing) if **existing == recipe => false,
+            fonts_data::CustomFontBody::Known(_) => {
+                record.body = fonts_data::CustomFontBody::Known(Arc::new(recipe));
+                true
+            }
+        }
+    };
+    if changed {
+        bump_revision();
+        persist_off_thread();
+    }
+    Ok(())
+}
+
+/// Renames the saved custom font `identity` to `new_name` (trimmed). A case-only change of the
+/// font's own name is allowed; the unchanged name is a no-op (`Ok(())`, no bump, no write). A
+/// real rename bumps the shared revision and persists off-thread.
+///
+/// # Errors
+/// `BlankName`, `UnknownIdentity`, `Unsupported` (its verbatim entry is never rewritten),
+/// `NameTaken` (another custom font uses the name, case-insensitively).
+pub(crate) fn rename_custom_font(identity: &str, new_name: &str) -> Result<(), CustomFontStoreError> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(CustomFontStoreError::BlankName);
+    }
+    let changed = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let key = find_custom_font_key(&guard, identity).ok_or(CustomFontStoreError::UnknownIdentity)?;
+        if custom_font_name_taken(&guard, new_name, Some(&key)) {
+            return Err(CustomFontStoreError::NameTaken);
+        }
+        let record = guard.custom_fonts.get_mut(&key).ok_or(CustomFontStoreError::UnknownIdentity)?;
+        match &record.body {
+            fonts_data::CustomFontBody::Unsupported { .. } => return Err(CustomFontStoreError::Unsupported),
+            fonts_data::CustomFontBody::Known(_) => {}
+        }
+        if record.name == new_name {
+            false
+        } else {
+            record.name = new_name.to_string();
+            true
+        }
+    };
+    if changed {
+        bump_revision();
+        persist_off_thread();
+    }
+    Ok(())
+}
+
+/// Deletes the saved custom font `identity` together with everything keyed by it, in ONE
+/// mutation: its record, its own per-font record `fonts.<identity>` (custom kerning, display
+/// name, profile) and its membership in every virtual group. A saved identity is random and
+/// never minted again, so anything left keyed by it would be an orphan nothing could reach.
+///
+/// Returns `true` when the font existed (then bumps the shared revision once and persists
+/// once, off-thread); `false` when no custom font has this identity (nothing changes).
+/// Unsupported entries can be deleted like any other.
+pub(crate) fn delete_custom_font(identity: &str) -> bool {
+    let removed = {
+        let mut guard = match store().write() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match find_custom_font_key(&guard, identity) {
+            None => false,
+            Some(key) => {
+                guard.custom_fonts.remove(&key);
+                if let Some(record_key) = find_record_key(&guard, &key) {
+                    guard.fonts.remove(&record_key);
+                }
+                for group in &mut guard.virtual_groups {
+                    group.members.retain(|member| !identities_equal(&member.font, &key));
+                }
+                true
+            }
+        }
+    };
+    if removed {
+        bump_revision();
+        persist_off_thread();
+    }
+    removed
+}
+
+/// Snapshot of every saved custom font as `(identity, record)`, in identity order,
+/// unsupported entries included. Cheap (in-memory clone; recipes are shared `Arc`s);
+/// GUI-thread safe.
+#[must_use]
+pub(crate) fn custom_fonts() -> Vec<(String, fonts_data::CustomFontRecord)> {
+    let guard = match store().read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .custom_fonts
+        .iter()
+        .map(|(identity, record)| (identity.clone(), record.clone()))
+        .collect()
+}
+
+/// The user-visible name of the saved custom font `identity` (matched case-insensitively), or
+/// `None` when no custom font has it. Cheap; GUI-thread safe.
+#[must_use]
+pub(crate) fn custom_font_name(identity: &str) -> Option<String> {
+    let guard = match store().read() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    find_custom_font_key(&guard, identity).and_then(|key| guard.custom_fonts.get(&key).map(|record| record.name.clone()))
+}
+
 /// Everything a deferred v1 migration needs to translate legacy PATH keys into font
 /// IDENTITIES. Built by `fonts::run_pending_fonts_data_migration` from a finished font list.
 #[derive(Debug, Default)]
@@ -1702,6 +2005,7 @@ pub(crate) fn seed_from_fonts_dir(fonts_dir: &Path) {
     guard.system_fonts = dedup_system_fonts(loaded.system_fonts);
     guard.fonts = loaded.fonts;
     guard.virtual_groups = loaded.virtual_groups;
+    guard.custom_fonts = loaded.custom_fonts;
     guard.pending_migration = loaded.pending_migration;
 }
 
@@ -1725,6 +2029,7 @@ fn migrate_legacy_imported_fonts(fonts_dir: &Path) -> fonts_data::FontsData {
         system_fonts: dedup_system_fonts(legacy),
         fonts: BTreeMap::new(),
         virtual_groups: Vec::new(),
+        custom_fonts: BTreeMap::new(),
         pending_migration: true,
     };
     if !migrated.system_fonts.is_empty() && !persistence_blocked().load(Ordering::Acquire) {
@@ -1772,6 +2077,7 @@ pub(crate) fn test_reset() {
     guard.system_fonts.clear();
     guard.fonts.clear();
     guard.virtual_groups.clear();
+    guard.custom_fonts.clear();
     guard.pending_migration = false;
     drop(guard);
     persistence_blocked().store(false, Ordering::Release);
@@ -1798,6 +2104,7 @@ pub(crate) fn test_seed(data: fonts_data::FontsData) {
     guard.system_fonts = data.system_fonts;
     guard.fonts = data.fonts;
     guard.virtual_groups = data.virtual_groups;
+    guard.custom_fonts = data.custom_fonts;
     guard.pending_migration = data.pending_migration;
 }
 
@@ -1849,6 +2156,7 @@ mod tests {
         guard.system_fonts = data.system_fonts;
         guard.fonts = data.fonts;
         guard.virtual_groups = data.virtual_groups;
+        guard.custom_fonts = data.custom_fonts;
         guard.pending_migration = data.pending_migration;
     }
 
@@ -2175,6 +2483,7 @@ mod tests {
                     ],
                 },
             ],
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
 
@@ -2269,6 +2578,7 @@ mod tests {
                     alias: None,
                 }],
             }],
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
         let mut resolution = LegacyKeyResolution::default();
@@ -2302,6 +2612,7 @@ mod tests {
                     },
                 ],
             }],
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
         let mut resolution = LegacyKeyResolution::default();
@@ -2345,6 +2656,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
 
@@ -2397,6 +2709,7 @@ mod tests {
                     alias: None,
                 }],
             }],
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
         // No fonts loaded at all (missing fonts dir, failed scan): completing here would
@@ -2435,6 +2748,7 @@ mod tests {
             }],
             fonts: BTreeMap::new(),
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
         assert_eq!(system_font_identity_for_path(&path), None, "not learned yet");
@@ -2480,6 +2794,7 @@ mod tests {
                     },
                 ],
             }],
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
         let mut resolution = LegacyKeyResolution::default();
@@ -2546,6 +2861,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
         let mut resolution = LegacyKeyResolution::default();
@@ -2592,6 +2908,7 @@ mod tests {
                     },
                 ],
             }],
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
         let mut resolution = LegacyKeyResolution::default();
@@ -2922,6 +3239,7 @@ mod tests {
                     alias: None,
                 }],
             }],
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         state.fonts.insert(
@@ -2974,6 +3292,7 @@ mod tests {
                         }],
                     },
                 ],
+                custom_fonts: BTreeMap::new(),
                 pending_migration: false,
             },
         );
@@ -3152,6 +3471,7 @@ mod tests {
                 system_fonts: Vec::new(),
                 fonts: theirs,
                 virtual_groups: Vec::new(),
+                custom_fonts: BTreeMap::new(),
                 pending_migration: false,
             },
         );
@@ -3205,6 +3525,7 @@ mod tests {
                 system_fonts: Vec::new(),
                 fonts: theirs,
                 virtual_groups: Vec::new(),
+                custom_fonts: BTreeMap::new(),
                 pending_migration: false,
             },
         );
@@ -3246,6 +3567,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         });
         let mut resolution = LegacyKeyResolution::default();
@@ -3262,5 +3584,203 @@ mod tests {
             "the second key's own pair survives the collapse; the re-stated one keeps the \
              first key's offset"
         );
+    }
+
+    /// A two-source hybrid recipe over `a` and `b` with weights `wa`:1.
+    fn hybrid(a: &str, b: &str, wa: f32) -> CustomFontRecipe {
+        use ms_custom_fonts::{CustomFontKind, HybridParams, HybridSource, MissingGlyphPolicy};
+        CustomFontRecipe {
+            kind: CustomFontKind::Hybrid(HybridParams {
+                sources: vec![
+                    HybridSource { identity: a.to_string(), weight: wa, missing_override: None },
+                    HybridSource { identity: b.to_string(), weight: 1.0, missing_override: None },
+                ],
+                missing_default: MissingGlyphPolicy::Disable,
+            }),
+        }
+    }
+
+    /// An unsupported (unknown-kind) custom font record named `name`.
+    fn unsupported_custom_font(name: &str) -> fonts_data::CustomFontRecord {
+        fonts_data::CustomFontRecord {
+            name: name.to_string(),
+            body: fonts_data::CustomFontBody::Unsupported {
+                raw: serde_json::json!({ "name": name, "kind": "combined", "params": {} }),
+                reason: fonts_data::UnsupportedCustomFont::UnknownKind("combined".to_string()),
+            },
+        }
+    }
+
+    /// Seeds the store with exactly one unsupported custom font under `identity`.
+    fn seed_unsupported(identity: &str, name: &str) {
+        test_seed(fonts_data::FontsData {
+            custom_fonts: BTreeMap::from([(identity.to_string(), unsupported_custom_font(name))]),
+            ..fonts_data::FontsData::default()
+        });
+    }
+
+    /// Creating a custom font mints a saved identity, lists it under the trimmed name and bumps
+    /// the revision exactly once.
+    #[test]
+    fn creating_a_custom_font_lists_it_with_one_revision_bump() {
+        let _lock = lock_tests();
+        reset_store();
+        let before = imported_fonts_revision();
+        let identity = create_custom_font("  Гибрид  ", hybrid("A-Regular", "B-Regular", 2.0)).expect("create must succeed");
+        assert_eq!(imported_fonts_revision(), before + 1);
+        assert!(crate::custom_fonts::identity::is_saved_identity(&identity), "minted identity {identity}");
+        let listed = custom_fonts();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, identity);
+        assert_eq!(listed[0].1.name, "Гибрид");
+        assert!(matches!(&listed[0].1.body, fonts_data::CustomFontBody::Known(recipe) if **recipe == hybrid("A-Regular", "B-Regular", 2.0)));
+        assert_eq!(custom_font_name(&identity.to_uppercase()).as_deref(), Some("Гибрид"), "lookup is case-insensitive");
+    }
+
+    /// Every refusal of `create_custom_font` is typed and changes nothing.
+    #[test]
+    fn creating_a_custom_font_refuses_blank_taken_and_invalid() {
+        let _lock = lock_tests();
+        reset_store();
+        create_custom_font("Гибрид", hybrid("A-Regular", "B-Regular", 1.0)).expect("first create");
+        let before = imported_fonts_revision();
+        assert_eq!(create_custom_font("   ", hybrid("A-Regular", "B-Regular", 1.0)), Err(CustomFontStoreError::BlankName));
+        assert_eq!(create_custom_font("гИБРИД", hybrid("C-Regular", "D-Regular", 1.0)), Err(CustomFontStoreError::NameTaken));
+        // The same font twice under different casing is a duplicate source.
+        assert!(matches!(create_custom_font("Другой", hybrid("A-Regular", "a-regular", 1.0)), Err(CustomFontStoreError::Invalid(_))));
+        assert!(matches!(create_custom_font("Другой", hybrid("A-Regular", "B-Regular", 0.0)), Err(CustomFontStoreError::Invalid(_))));
+        // D4: a custom font is never a source of another custom font.
+        assert!(matches!(
+            create_custom_font("Другой", hybrid("MSCustom-0123456789abcdef", "B-Regular", 1.0)),
+            Err(CustomFontStoreError::Invalid(_))
+        ));
+        assert_eq!(imported_fonts_revision(), before, "a refused create bumps nothing");
+        assert_eq!(custom_fonts().len(), 1);
+    }
+
+    /// `update_custom_font_recipe`: unknown, unchanged (no bump), changed (one bump), and an
+    /// unsupported entry is never overwritten.
+    #[test]
+    fn updating_a_custom_font_recipe() {
+        let _lock = lock_tests();
+        reset_store();
+        let identity = create_custom_font("Гибрид", hybrid("A-Regular", "B-Regular", 1.0)).expect("create");
+        assert_eq!(
+            update_custom_font_recipe("MSCustom-ffffffffffffffff", hybrid("A-Regular", "B-Regular", 1.0)),
+            Err(CustomFontStoreError::UnknownIdentity)
+        );
+        let before = imported_fonts_revision();
+        assert_eq!(update_custom_font_recipe(&identity, hybrid("A-Regular", "B-Regular", 1.0)), Ok(()));
+        assert_eq!(imported_fonts_revision(), before, "an identical recipe is a no-op");
+        assert_eq!(update_custom_font_recipe(&identity, hybrid("A-Regular", "B-Regular", 3.0)), Ok(()));
+        assert_eq!(imported_fonts_revision(), before + 1);
+        assert!(matches!(&custom_fonts()[0].1.body, fonts_data::CustomFontBody::Known(recipe) if **recipe == hybrid("A-Regular", "B-Regular", 3.0)));
+        assert!(matches!(update_custom_font_recipe(&identity, hybrid("A-Regular", "A-Regular", 1.0)), Err(CustomFontStoreError::Invalid(_))));
+
+        seed_unsupported("MSCustom-1111111111111111", "Будущий");
+        assert_eq!(
+            update_custom_font_recipe("MSCustom-1111111111111111", hybrid("A-Regular", "B-Regular", 1.0)),
+            Err(CustomFontStoreError::Unsupported)
+        );
+        assert_eq!(custom_fonts()[0].1, unsupported_custom_font("Будущий"), "the verbatim entry is untouched");
+    }
+
+    /// `rename_custom_font`: collision (case-insensitive, with another font), case-only own
+    /// rename, no-op, blank, unknown, unsupported.
+    #[test]
+    fn renaming_a_custom_font() {
+        let _lock = lock_tests();
+        reset_store();
+        let first = create_custom_font("Первый", hybrid("A-Regular", "B-Regular", 1.0)).expect("create first");
+        create_custom_font("Второй", hybrid("A-Regular", "B-Regular", 2.0)).expect("create second");
+        let before = imported_fonts_revision();
+        assert_eq!(rename_custom_font(&first, "ВТОРОЙ"), Err(CustomFontStoreError::NameTaken));
+        assert_eq!(rename_custom_font(&first, "  "), Err(CustomFontStoreError::BlankName));
+        assert_eq!(rename_custom_font("MSCustom-ffffffffffffffff", "Третий"), Err(CustomFontStoreError::UnknownIdentity));
+        assert_eq!(rename_custom_font(&first, "Первый"), Ok(()));
+        assert_eq!(imported_fonts_revision(), before, "refusals and the unchanged name bump nothing");
+        assert_eq!(rename_custom_font(&first, "ПЕРВЫЙ"), Ok(()), "a case-only change of its own name is allowed");
+        assert_eq!(imported_fonts_revision(), before + 1);
+        assert_eq!(custom_font_name(&first).as_deref(), Some("ПЕРВЫЙ"));
+
+        seed_unsupported("MSCustom-1111111111111111", "Будущий");
+        assert_eq!(rename_custom_font("MSCustom-1111111111111111", "Новое"), Err(CustomFontStoreError::Unsupported));
+    }
+
+    /// Deleting a custom font removes, in ONE mutation, its record, its own `fonts.<identity>`
+    /// record (custom kerning) and its virtual-group memberships; other members stay.
+    #[test]
+    fn deleting_a_custom_font_cascades_to_its_kerning_and_group_memberships() {
+        let _lock = lock_tests();
+        reset_store();
+        let identity = create_custom_font("Гибрид", hybrid("A-Regular", "B-Regular", 1.0)).expect("create");
+        assert!(set_font_custom_kerning(&identity, vec![kern('A', 'V', -40.0)]));
+        assert!(create_virtual_group("G"));
+        assert!(add_virtual_group_member("G", &identity));
+        assert!(add_virtual_group_member("G", "A-Regular"));
+
+        let before = imported_fonts_revision();
+        assert!(delete_custom_font(&identity.to_uppercase()), "lookup is case-insensitive");
+        assert_eq!(imported_fonts_revision(), before + 1, "one mutation, one bump");
+        assert!(custom_fonts().is_empty());
+        assert!(font_custom_kerning(&identity).is_empty(), "its own kerning record is gone");
+        let groups = virtual_groups();
+        let members: Vec<&str> = groups[0].members.iter().map(|member| member.font.as_str()).collect();
+        assert_eq!(members, vec!["A-Regular"], "only its own membership is removed");
+
+        assert!(!delete_custom_font(&identity), "a second delete finds nothing");
+        assert_eq!(imported_fonts_revision(), before + 1);
+
+        seed_unsupported("MSCustom-1111111111111111", "Будущий");
+        assert!(delete_custom_font("MSCustom-1111111111111111"), "an unsupported entry can be deleted");
+    }
+
+    /// The conflict merge adds a custom font we lack (unsupported ones too, verbatim) and keeps
+    /// ours WHOLE when both sides hold the identity.
+    #[test]
+    fn merging_another_instances_document_adds_custom_fonts_and_keeps_ours() {
+        let ours = fonts_data::CustomFontRecord {
+            name: "Наш".to_string(),
+            body: fonts_data::CustomFontBody::Known(Arc::new(hybrid("A-Regular", "B-Regular", 1.0))),
+        };
+        let mut state = StoreState::default();
+        state.custom_fonts.insert("MSCustom-aaaaaaaaaaaaaaaa".to_string(), ours.clone());
+        let theirs_new = fonts_data::CustomFontRecord {
+            name: "Их".to_string(),
+            body: fonts_data::CustomFontBody::Known(Arc::new(hybrid("C-Regular", "D-Regular", 1.0))),
+        };
+        merge_disk_into_state(
+            &mut state,
+            fonts_data::FontsData {
+                custom_fonts: BTreeMap::from([
+                    (
+                        "MSCustom-AAAAAAAAAAAAAAAA".to_string(),
+                        fonts_data::CustomFontRecord {
+                            name: "Их вариант".to_string(),
+                            body: fonts_data::CustomFontBody::Known(Arc::new(hybrid("A-Regular", "B-Regular", 5.0))),
+                        },
+                    ),
+                    ("MSCustom-bbbbbbbbbbbbbbbb".to_string(), theirs_new.clone()),
+                    ("MSCustom-cccccccccccccccc".to_string(), unsupported_custom_font("Будущий")),
+                ]),
+                ..fonts_data::FontsData::default()
+            },
+        );
+        assert_eq!(state.custom_fonts.len(), 3, "the same identity in another casing is not added twice");
+        assert_eq!(state.custom_fonts["MSCustom-aaaaaaaaaaaaaaaa"], ours, "ours is kept whole");
+        assert_eq!(state.custom_fonts["MSCustom-bbbbbbbbbbbbbbbb"], theirs_new);
+        assert_eq!(state.custom_fonts["MSCustom-cccccccccccccccc"], unsupported_custom_font("Будущий"));
+    }
+
+    /// `test_seed` installs custom fonts and `test_reset` clears them, like every other field.
+    #[test]
+    fn test_seed_and_reset_cover_custom_fonts() {
+        let _lock = lock_tests();
+        reset_store();
+        seed_unsupported("MSCustom-1111111111111111", "Будущий");
+        assert_eq!(custom_fonts().len(), 1);
+        assert_eq!(snapshot_data().custom_fonts.len(), 1, "the snapshot that is persisted carries them");
+        reset_store();
+        assert!(custom_fonts().is_empty());
     }
 }

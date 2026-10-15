@@ -31,6 +31,11 @@ Extracted verbatim from `tab.rs`. Free fns and methods are `pub(super)` so `tab.
 and sibling submodules of `tab` can use them. `use super::*;` pulls in the parent
 module's types and imports. Some export helpers (compositing/deform variants) remain
 in `tab.rs` and are reused from here as descendants of module `tab`.
+PSD custom fonts (decision D2): before any page is built, `prepare_custom_font_export` resolves
+every custom font the chapter's text layers use to its compiled face (one per recipe), installs
+the face names into each job's `FontPostScriptNames` and, with «Положить рядом кастомные
+шрифты», writes the faces as `.ttf` next to the documents (a saved font's own kerning pairs
+baked in, `CustomExportFaces::bundle_plan`); failures are warnings only.
 The export worker barriers the shared layer saver before composing: under the autosave
 gate the saver holds enqueued writes, and the page flatten can fall back to the staging
 `layers.json`.
@@ -45,6 +50,9 @@ use crate::export_repaginate::{RibbonSlicer, TypingRepaginateSettings, group_pag
 use crate::pdf_export::TypingPdfBuilder;
 use super::doc_layers::{raster_composite_item, text_composite_item};
 use ms_models::clean_assign::{LOADER_CLEAN_SCOPE, PageCleanPaths, PageCleanResolution, probe_page_clean};
+use crate::custom_fonts::export::{
+    BundleIssue, BundledFontFile, CustomExportFailure, CustomFontExportResolver, ExportFontName, custom_font_use_of_render_data,
+};
 
 /// The checked pairing of an export format with its destination: the ONE place that decides
 /// which pipeline a request runs through.
@@ -142,7 +150,8 @@ pub(super) fn compose_window_pages(worker_count: usize) -> usize {
 /// Runs a whole export on the background thread that owns it.
 ///
 /// Validates the format/destination pairing, creates the output location, loads the клин
-/// snapshots, then drives the one-to-one or the collecting pipeline. `progress_tx` receives
+/// snapshots, runs the PSD custom-font pre-pass (`prepare_custom_font_export`; its warnings
+/// join the result's), then drives the one-to-one or the collecting pipeline. `progress_tx` receives
 /// one `Progress` event per SOURCE page processed, in both pipelines. Once the whole output is
 /// written the destination is committed (`TypingExportDestination::commit`; blocking on
 /// Android, which is why it happens here, on the export worker).
@@ -162,7 +171,7 @@ pub(super) fn export_typing_pages(
 ) -> Result<TypingExportResult, String> {
     let route = resolve_export_route(&request)?;
     prepare_export_output_location(&route)?;
-    let TypingExportRequest { destination, format: _, repaginate: repaginate_settings, output_base_name } = request;
+    let TypingExportRequest { destination, format, repaginate: repaginate_settings, output_base_name, bundle_custom_fonts, custom_fonts } = request;
     let destination_name = destination.display_name().to_owned();
     let total = jobs.len();
     if jobs.is_empty() {
@@ -170,10 +179,20 @@ pub(super) fn export_typing_pages(
         return Ok(TypingExportResult { exported: 0, total, destination_name, warnings: Vec::new() });
     }
     prepare_export_clean_overlay_snapshots(&mut jobs, clean_overlays_model)?;
+    // PSD only (always the one-to-one route): name custom-font layers by their compiled faces
+    // and, when asked, put the faces next to the documents. Never fails the run.
+    let custom_font_warnings = if format == TypingExportFormat::Psd
+        && let TypingExportRoute::StreamedFiles { dir } = &route
+        && let Some(resolver) = custom_fonts.as_deref()
+    {
+        prepare_custom_font_export(&mut jobs, resolver, bundle_custom_fonts.then_some(dir.as_path()))
+    } else {
+        Vec::new()
+    };
     // Only the collecting pipeline re-paginates; `resolve_export_route` has already rejected
     // the one format that cannot (PSD).
     let repaginate = repaginate_settings.enabled.then_some(repaginate_settings);
-    let result = match route {
+    let mut result = match route {
         TypingExportRoute::StreamedFiles { .. } => export_typing_pages_streamed(jobs, destination_name, progress_tx),
         TypingExportRoute::RepaginatedPng { dir } => {
             // The file NAMES of a re-paginated run need the run's final page count up front —
@@ -197,6 +216,7 @@ pub(super) fn export_typing_pages(
             export_typing_pages_collected(jobs, sink, repaginate, None, destination_name, progress_tx, compose_typing_export_page)
         }
     }?;
+    result.warnings.extend(custom_font_warnings);
     destination.commit().map_err(|err| {
         ms_log::runtime_log::log_warn(format!("[typing] export: committing the destination '{}' failed: {err:?}", result.destination_name));
         err.user_message()
@@ -273,6 +293,118 @@ fn export_typing_pages_streamed(jobs: Vec<TypingExportPageJob>, destination_name
     // Worker completion order is not deterministic, so sort for a stable status line.
     warnings.sort();
     Ok(TypingExportResult { exported, total, destination_name, warnings })
+}
+
+/// PSD pre-pass for custom fonts (decision D2), run on the export worker before any page is
+/// built.
+///
+/// Collects every custom font the jobs' text overlays use, resolves each distinct one ONCE to
+/// its compiled full face (`CustomFontExportResolver::resolve_chapter`: memory / disk cache /
+/// compile), installs `use key -> face PostScript name` into EVERY job's
+/// `FontPostScriptNames`, and — when `bundle_dir` is `Some` («Положить рядом кастомные
+/// шрифты») — writes each distinct face as `<bundle_dir>/<PostScript name>.ttf`, with a saved
+/// font's OWN kerning pairs baked into the written copy (`CustomExportFaces::bundle_plan`), so
+/// Photoshop spaces the text as the app does.
+///
+/// Returns localized warnings: one per font that has no face (its layers keep the stored font
+/// name), one per bundling issue (`BundleIssue`) and one per font file that could not be
+/// written. Nothing here fails the export.
+/// BLOCKS (source reads, compiles, file writes): the export worker only.
+pub(super) fn prepare_custom_font_export(
+    jobs: &mut [TypingExportPageJob],
+    resolver: &CustomFontExportResolver,
+    bundle_dir: Option<&Path>,
+) -> Vec<String> {
+    let uses: Vec<_> = jobs
+        .iter()
+        .flat_map(|job| job.overlays.iter())
+        .filter_map(|overlay| overlay.render_data_json.as_ref())
+        .filter_map(custom_font_use_of_render_data)
+        .collect();
+    if uses.is_empty() {
+        return Vec::new();
+    }
+    let resolved = resolver.resolve_chapter(uses);
+    for job in jobs.iter_mut() {
+        for (key, face) in &resolved.faces {
+            job.font_post_script_names.install_custom_face_name(key.clone(), face.post_script_name.clone());
+        }
+    }
+    let mut warnings = custom_font_failure_warnings(&resolved.failures);
+    if let Some(dir) = bundle_dir {
+        let plan = resolved.bundle_plan();
+        warnings.extend(plan.issues.iter().map(bundle_issue_warning));
+        warnings.extend(write_bundled_custom_fonts(&plan.files, dir));
+    }
+    warnings
+}
+
+/// The user-facing name of a custom font in an export warning.
+fn export_font_label(font: &ExportFontName) -> String {
+    match font {
+        ExportFontName::Saved(name) => name.clone(),
+        ExportFontName::AdHoc => t!("typing.fonts.adhoc_hybrid_font_label").to_string(),
+    }
+}
+
+/// One localized warning for a bundling issue (already logged with its cause by the plan).
+fn bundle_issue_warning(issue: &BundleIssue) -> String {
+    match issue {
+        BundleIssue::KerningConflict { face, kept, others } => {
+            let fonts = others.iter().map(|font| format!("«{}»", export_font_label(font))).collect::<Vec<_>>().join(", ");
+            tf!("typing.export.psd_custom_font_kerning_conflict_warning", font = export_font_label(kept), fonts = fonts, file = face)
+        }
+        BundleIssue::KerningNotApplied { font, error } => {
+            tf!("typing.export.psd_custom_font_kerning_error", font = export_font_label(font), err = error)
+        }
+    }
+}
+
+/// One localized warning per failed custom font (deduplicated by the shown name, in first-use
+/// order). The failures were already logged with their cause by the resolver.
+fn custom_font_failure_warnings(failures: &[CustomExportFailure]) -> Vec<String> {
+    let mut warnings: Vec<String> = Vec::new();
+    for failure in failures {
+        let warning = tf!("typing.export.psd_custom_font_failed_warning", font = export_font_label(&failure.font));
+        if !warnings.contains(&warning) {
+            warnings.push(warning);
+        }
+    }
+    warnings
+}
+
+/// Writes every planned file's bytes as `<dir>/<sanitized PostScript name>.ttf` through the
+/// storage seam (the destination's staging folder on Android; `commit` publishes it with the
+/// documents). Returns one localized warning per file that could not be written; each is also
+/// logged.
+fn write_bundled_custom_fonts(files: &[BundledFontFile], dir: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut written = 0_usize;
+    for BundledFontFile { face, bytes } in files {
+        // A compiled face's name is `MSCustom-<8 hex>`, always a valid file name; the key's hex
+        // is the fallback should sanitizing ever leave nothing.
+        let stem = sanitize_file_name_component(&face.post_script_name);
+        let stem = if stem.is_empty() { face.key.hex() } else { stem };
+        let path = dir.join(format!("{stem}.ttf"));
+        match ms_storage::global::storage().write(path.to_string_lossy().as_ref(), (**bytes).as_ref()) {
+            Ok(()) => written = written.saturating_add(1),
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!(
+                    "[typing] PSD export: could not write the custom font file '{}' ({} bytes, face {}): {err}",
+                    path.display(),
+                    (**bytes).as_ref().len(),
+                    face.post_script_name
+                ));
+                warnings.push(tf!("typing.export.psd_custom_font_file_error", file = path.display(), err = err));
+            }
+        }
+    }
+    ms_log::runtime_log::log_info(format!(
+        "[typing] PSD export: wrote {written} of {} custom font file(s) into '{}'",
+        files.len(),
+        dir.display()
+    ));
+    warnings
 }
 
 /// One composed page on its way from an export worker to the ordered consumer: straight
@@ -2125,5 +2257,216 @@ mod png_encode_tests {
     fn export_png_rejects_a_mismatched_buffer_instead_of_panicking() {
         assert!(encode_export_page_png(&[0u8; 15], 2, 2, Path::new("page.png")).is_err());
         assert!(encode_export_page_png(&[0u8; 17], 2, 2, Path::new("page.png")).is_err());
+    }
+}
+
+/// The PSD custom-font pre-pass (`prepare_custom_font_export`): names installed into every job,
+/// one face per recipe, files only when bundling, sanitized file names, failures as warnings.
+/// Compiles through a fake counting service (no real font, no disk cache); files go to a unique
+/// temp directory removed by each test.
+#[cfg(test)]
+mod custom_font_export_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::custom_fonts::export::CustomFontUseKey;
+    use crate::custom_fonts::export::test_support::{FAKE_SOURCES, export_resolver, recipe};
+    use crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY;
+
+    const SAVED_ID: &str = "MSCustom-0123456789abcdef";
+
+    /// A unique, initially empty scratch directory; removed on drop.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "ms-typing-psd-custom-fonts-{tag}-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&dir).expect("create scratch dir");
+            Self(dir)
+        }
+
+        fn file_names(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.0)
+                .expect("read scratch dir")
+                .map(|entry| entry.expect("dir entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            if let Err(err) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("could not remove scratch dir {}: {err}", self.0.display());
+            }
+        }
+    }
+
+    fn overlay(text_params: Value) -> TypingExportOverlaySnapshot {
+        TypingExportOverlaySnapshot {
+            page_idx: 0,
+            center_page_px: [0.0, 0.0],
+            mask_clip_enabled: false,
+            layer_idx: 0,
+            user_scale: 1.0,
+            angle_deg: 0.0,
+            deform_mesh: None,
+            size_px: [1, 1],
+            source_rgba: vec![0, 0, 0, 255],
+            render_data_json: Some(json!({ "text_params": text_params })),
+            uid: "ov".into(),
+            group_uid: None,
+            visible: true,
+        }
+    }
+
+    fn job(page_idx: usize, overlays: Vec<TypingExportOverlaySnapshot>) -> TypingExportPageJob {
+        TypingExportPageJob {
+            page_idx,
+            page_path: PathBuf::from(format!("page{page_idx}.png")),
+            output_path: None,
+            clean_paths: None,
+            clean_overlay_rgba: None,
+            overlays,
+            rasters: Vec::new(),
+            bands: Vec::new(),
+            groups: Vec::new(),
+            mask: None,
+            export_format: TypingExportFormat::Psd,
+            layers_primary_dir: None,
+            layers_fallback_dir: None,
+            font_post_script_names: crate::psd_export::FontPostScriptNames::default(),
+        }
+    }
+
+    fn adhoc_params(weight_b: f32) -> Value {
+        json!({ "schema": 2, "text": "x", "font": ADHOC_CUSTOM_FONT_IDENTITY, "font_recipe": recipe(FAKE_SOURCES, weight_b).to_json() })
+    }
+
+    /// Two pages: two ad-hoc layers sharing one recipe, a saved font, and a real font.
+    fn chapter() -> Vec<TypingExportPageJob> {
+        vec![
+            job(0, vec![overlay(adhoc_params(0.5)), overlay(json!({ "schema": 2, "text": "x", "font": "Alpha-Regular" }))]),
+            job(1, vec![overlay(adhoc_params(0.5)), overlay(json!({ "schema": 2, "text": "x", "font": SAVED_ID }))]),
+        ]
+    }
+
+    #[test]
+    fn bundling_writes_one_file_per_recipe_and_names_every_job() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = export_resolver(vec![(SAVED_ID.to_owned(), "Saved".to_owned(), recipe(FAKE_SOURCES, 3.0))], &calls);
+        let dir = ScratchDir::new("bundle");
+        let mut jobs = chapter();
+        let warnings = prepare_custom_font_export(&mut jobs, &resolver, Some(&dir.0));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one compile per distinct recipe");
+        let adhoc_key = CustomFontUseKey::AdHoc(recipe(FAKE_SOURCES, 0.5).to_json().to_string());
+        let saved_key = CustomFontUseKey::Saved(SAVED_ID.to_ascii_lowercase());
+        let adhoc_name = jobs[0].font_post_script_names.custom_face_name(&adhoc_key).expect("ad-hoc face installed").to_owned();
+        let saved_name = jobs[0].font_post_script_names.custom_face_name(&saved_key).expect("saved face installed").to_owned();
+        for job in &jobs {
+            assert_eq!(job.font_post_script_names.custom_face_name(&adhoc_key), Some(adhoc_name.as_str()));
+            assert_eq!(job.font_post_script_names.custom_face_name(&saved_key), Some(saved_name.as_str()));
+        }
+        let mut expected = vec![format!("{adhoc_name}.ttf"), format!("{saved_name}.ttf")];
+        expected.sort();
+        assert_eq!(dir.file_names(), expected);
+        let bytes = std::fs::read(dir.0.join(format!("{adhoc_name}.ttf"))).expect("bundled face");
+        assert_eq!(bytes, vec![7_u8; 16], "the compiled face's bytes are written as is");
+    }
+
+    #[test]
+    fn a_saved_fonts_own_kerning_is_baked_into_the_written_file() {
+        use crate::custom_fonts::export::test_support::{fixed_bytes_service, real_face_bytes, resolver};
+        use ms_custom_fonts::KerningPairPerMille;
+
+        let Some(real) = real_face_bytes() else {
+            return;
+        };
+        let service = fixed_bytes_service(real.clone(), Arc::new(AtomicUsize::new(0)));
+        let saved = vec![(SAVED_ID.to_owned(), "Saved".to_owned(), recipe(FAKE_SOURCES, 0.5))];
+        let resolver = CustomFontExportResolver::with_service(saved, resolver(), service)
+            .with_own_kerning(|_| vec![KerningPairPerMille { left: 'A', right: 'V', em: -150.0 }]);
+        ms_i18n::set_locale(&ms_i18n::LocaleTag::english()).expect("embedded English catalog installs");
+        let dir = ScratchDir::new("own-kerning");
+        // The ad-hoc layers use the SAME recipe as the saved font: one face, one file, a conflict.
+        let mut jobs = chapter();
+        let warnings = prepare_custom_font_export(&mut jobs, &resolver, Some(&dir.0));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Saved"), "{}", warnings[0]);
+        let [file] = dir.file_names().try_into().expect("one bundled file");
+        let written = std::fs::read(dir.0.join(file)).expect("bundled face");
+        assert_ne!(written, real, "the written copy differs from the cached face");
+        let face = ttf_parser::Face::parse(&written, 0).expect("the written face parses");
+        let (a, v) = (face.glyph_index('A').expect("A"), face.glyph_index('V').expect("V"));
+        let value = face.tables().kern.and_then(|kern| kern.subtables.into_iter().find_map(|subtable| subtable.glyphs_kerning(a, v)));
+        assert_eq!(value, Some(-150));
+    }
+
+    #[test]
+    fn without_bundling_names_are_installed_but_no_file_is_written() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = export_resolver(vec![(SAVED_ID.to_owned(), "Saved".to_owned(), recipe(FAKE_SOURCES, 3.0))], &calls);
+        let dir = ScratchDir::new("nobundle");
+        let mut jobs = chapter();
+        let warnings = prepare_custom_font_export(&mut jobs, &resolver, None);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(jobs[1].font_post_script_names.custom_face_name(&CustomFontUseKey::Saved(SAVED_ID.to_ascii_lowercase())).is_some());
+        assert!(dir.file_names().is_empty());
+    }
+
+    #[test]
+    fn a_failed_font_is_a_warning_and_keeps_no_installed_name() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // The saved font is not in the resolver: it fails; the ad-hoc one still resolves.
+        let resolver = export_resolver(Vec::new(), &calls);
+        // The active catalog is empty until a locale is installed; the assertion reads the text.
+        ms_i18n::set_locale(&ms_i18n::LocaleTag::english()).expect("embedded English catalog installs");
+        let dir = ScratchDir::new("fail");
+        let mut jobs = chapter();
+        let warnings = prepare_custom_font_export(&mut jobs, &resolver, Some(&dir.0));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(SAVED_ID), "{}", warnings[0]);
+        assert!(jobs[1].font_post_script_names.custom_face_name(&CustomFontUseKey::Saved(SAVED_ID.to_ascii_lowercase())).is_none());
+        assert_eq!(dir.file_names().len(), 1, "only the healthy face is bundled");
+    }
+
+    #[test]
+    fn a_chapter_without_custom_fonts_resolves_nothing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = export_resolver(Vec::new(), &calls);
+        let dir = ScratchDir::new("none");
+        let mut jobs = vec![job(0, vec![overlay(json!({ "schema": 2, "text": "x", "font": "Alpha-Regular" }))])];
+        assert!(prepare_custom_font_export(&mut jobs, &resolver, Some(&dir.0)).is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(dir.file_names().is_empty());
+    }
+
+    #[test]
+    fn bundled_file_names_are_sanitized() {
+        let dir = ScratchDir::new("sanitize");
+        let bytes: Vec<u8> = vec![1, 2, 3];
+        let content_id = crate::render_next::font_content_id(&bytes);
+        let byte_len = bytes.len();
+        let bytes: crate::render_next::FontBytes = Arc::new(bytes);
+        let face = Arc::new(crate::custom_fonts::service::CompiledFace {
+            content_id,
+            byte_len,
+            bytes: Arc::clone(&bytes),
+            post_script_name: "MS/Custom:1?".to_owned(),
+            family_name: "MS Custom 1".to_owned(),
+            key: ms_custom_fonts::RecipeKey([0_u8; 32]),
+            report: None,
+        });
+        assert!(write_bundled_custom_fonts(&[BundledFontFile { face, bytes }], &dir.0).is_empty());
+        assert_eq!(dir.file_names(), vec!["MS_Custom_1_.ttf".to_owned()]);
     }
 }

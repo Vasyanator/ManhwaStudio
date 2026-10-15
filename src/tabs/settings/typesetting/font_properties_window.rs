@@ -16,13 +16,21 @@ Main responsibilities:
 - own the sibling custom-kerning EDITOR window (two characters + an advance offset in
   thousandths of an em, plus a preview-only context on either side and a preview-only font
   size) and persist its result through `font_admin::set_custom_kerning`;
-- analyze the font file OFF the GUI thread (glyph inventory + kerning extraction via
-  `ttf-parser`) and deliver the result over an `mpsc` channel the window polls;
+- analyze the font's bytes OFF the GUI thread (`font_admin::font_bytes_blocking`, then glyph
+  inventory + kerning extraction via `ttf-parser`) and deliver the result over an `mpsc`
+  channel the window polls;
 - wire the display-name editor to `crate::tabs::typing::font_admin::set_display_name_override`
-  (which bumps the shared revision, so the category lists reload automatically).
+  (which bumps the shared revision, so the category lists reload automatically);
+- lay out a SAVED CUSTOM font's body as three sections (`draw_custom_body`: «Подробности»,
+  «Кернинговые пары» with the compiled face's inherited pairs read-only, «Редактирование
+  гибрида»), whose rename and hybrid-editor parts live in `hybrid_fonts.rs`
+  (`CustomFontProperties`); `sync_custom_font` adopts the owner's reloaded entry (analysis
+  only: the window holds a display pin, `font_admin::pin_custom_face_display`, so every
+  own-typeface draw of that font keeps the face it opened with and no «Применить» registers a
+  new egui font).
 
 Key types:
-- `FontPropertiesState` (owned by `FontSettingsEditorState`)
+- `FontPropertiesState` (owned by `FontSettingsEditorState`) / `PropertiesCx` (per-frame loan)
 - `FontAnalysis` / `KerningPairInfo` (off-thread analysis result)
 - `CustomKerningEditorState` / `KerningEditorAction` (the sibling editor window)
 
@@ -38,9 +46,10 @@ Key functions:
 Notes:
 The font MODEL is reached ONLY through the `crate::tabs::typing::font_admin` facade. Every
 per-font SETTING it mutates (display-name override, virtual-group membership and aliases) is
-keyed by the font's IDENTITY; the file path is kept purely as the byte source of the
-glyph/kerning analysis and the own-typeface preview. egui own-typeface registration reuses
-`crate::widgets::request_font_family` (ADD-ONLY, cached per family, bytes read OFF the GUI
+keyed by the font's IDENTITY; where its bytes come from (`FontEntry::byte_source`) is used
+purely by the glyph/kerning analysis (`font_admin::font_bytes_blocking`, on the analysis
+worker) and the own-typeface preview (`FontPreviewSource::request_family` over
+`crate::widgets::request_font_family*`: ADD-ONLY, cached per family, bytes read OFF the GUI
 thread), exactly like the category rows. The heavy ttf-parser work never runs on the GUI
 thread either; the window only polls the channel and repaints while pending.
 
@@ -67,12 +76,11 @@ at any size. The strip's height is derived from that size (`PAIR_PREVIEW_HEIGHT_
 the offset row's px read-out follows it too, so the number describes the strip on screen.
 */
 
-use crate::tabs::typing::font_admin::{self, CustomKerningPair, FontEntry};
-use crate::widgets::{PreviewFontFamily, WheelComboBox, WheelSpinBox, request_font_family};
+use super::hybrid_fonts::CustomFontProperties;
+use crate::tabs::typing::font_admin::{self, CustomKerningPair, FontEntry, FontPreviewSource, SourceCatalog};
+use crate::widgets::{PreviewFontFamily, WheelComboBox, WheelSpinBox};
 use ms_thread as thread;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::fs;
-use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
 
 // --- Layout constants -------------------------------------------------------
@@ -180,7 +188,7 @@ struct RawKerningPair {
 // --- Custom-kerning editor --------------------------------------------------
 
 /// The values that identify ONE font to the own-typeface preview helpers: the registration
-/// key (identity + content hash) plus the file and face its bytes come from.
+/// key (identity + content hash) plus where its bytes come from and the face.
 ///
 /// Bundled because every own-typeface draw site needs all four and nothing else; passing
 /// them one by one pushed helper signatures past the point clippy (and a reader) tolerates.
@@ -190,9 +198,9 @@ struct TypefaceRef<'a> {
     identity: &'a str,
     /// Hash of the representative file's bytes (`0` = unknown).
     content_hash: u64,
-    /// Representative font FILE (byte source only).
-    path: &'a Path,
-    /// Representative face index within `path`.
+    /// Where the preview bytes come from (byte source only).
+    source: &'a FontPreviewSource,
+    /// Representative face index within those bytes.
     rep_face: usize,
 }
 
@@ -200,7 +208,7 @@ impl TypefaceRef<'_> {
     /// The egui family drawing this font, or `None` while its bytes are still being read
     /// off the GUI thread (and permanently when it cannot be registered).
     fn family(&self, ctx: &egui::Context) -> Option<egui::FontFamily> {
-        own_typeface_family(ctx, self.identity, self.content_hash, self.path, self.rep_face)
+        own_typeface_family(ctx, self.identity, self.content_hash, self.source, self.rep_face)
     }
 }
 
@@ -294,10 +302,13 @@ enum KerningEditorAction {
 /// a `FontEntry` snapshot so it never aliases the live category lists. Owned by
 /// `FontSettingsEditorState`.
 pub(super) struct FontPropertiesState {
-    /// Representative font FILE path. ONLY the byte source of the glyph/kerning analysis
-    /// and the own-typeface preview — every per-font SETTING is keyed by `identity`.
-    path: PathBuf,
-    /// Representative face index within `path` (0 for single-face files).
+    /// The font snapshot the analysis worker obtains the bytes of
+    /// (`font_admin::font_bytes_blocking`). Every per-font SETTING is keyed by `identity`.
+    font: FontEntry,
+    /// Where the own-typeface previews take their bytes from
+    /// (`FontByteSource::preview_source`).
+    typeface_source: FontPreviewSource,
+    /// Representative face index within the font's bytes (0 for single-face files).
     rep_face: usize,
     /// Real family/name read from the font file (shown in the identity header).
     original_name: String,
@@ -310,7 +321,7 @@ pub(super) struct FontPropertiesState {
     /// Not shown: it is the byte discriminant of the own-typeface registrations below, so a
     /// font file replaced under the same PostScript name is previewed from its NEW bytes.
     content_hash: u64,
-    /// File name of `path` (shown in the identity header).
+    /// File name of the font's file (shown in the identity header; empty for a custom font).
     file_name: String,
     /// Representative face label, shown only for multi-face files (`None` otherwise).
     face_label: Option<String>,
@@ -347,25 +358,46 @@ pub(super) struct FontPropertiesState {
     /// The open custom-kerning editor window, if any. Living on this state is what makes
     /// closing the properties window discard an unsaved edit with it.
     custom_kerning_editor: Option<CustomKerningEditorState>,
+    /// Set for a SAVED custom font: its rename and hybrid-editing parts (`hybrid_fonts.rs`).
+    /// The window then draws the three custom-font sections instead of the file-font body.
+    custom: Option<CustomFontProperties>,
+    /// Held for a SAVED custom font while the window is open: every own-typeface draw of it
+    /// (this window, the list rows, group members) keeps the face the window opened with, so
+    /// an «Применить» registers no new egui font (egui cannot unload one). Released on close.
+    _display_pin: Option<font_admin::CustomFaceDisplayPin>,
+}
+
+/// What the owner lends the properties window for one frame (from its loaded snapshot).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PropertiesCx<'a> {
+    /// The hybrid editor's source catalog; `None` while the font lists load.
+    pub(super) catalog: Option<&'a SourceCatalog>,
+    /// Display labels of the real fonts, which a custom font's new name must not repeat.
+    pub(super) real_font_names: &'a [String],
 }
 
 impl FontPropertiesState {
     /// Builds the window state from a `FontEntry` snapshot. Reads the current display-name
     /// override for the font (via `font_admin`) so the editor is prefilled; does not start
-    /// the analysis (that begins lazily on the first `show`).
+    /// the analysis (that begins lazily on the first `show`). A saved custom font also gets
+    /// its rename and hybrid-editing parts, read from the store.
     pub(super) fn new(font: &FontEntry) -> Self {
+        let identity = font.render_identity_name();
+        let custom = font_admin::is_custom_font_identity(&identity)
+            .then(|| CustomFontProperties::open(&identity, font.label()));
         let rep_face = font.representative_face_index();
         let file_name = font
-            .path()
+            .file_path()
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| font.path().to_string_lossy().into_owned());
+            .unwrap_or_else(|| font.file_path().to_string_lossy().into_owned());
         let face_label = font.representative_face_label();
         let name_buf =
             font_admin::display_name_override(&font.render_identity_name()).unwrap_or_default();
         let default_label = super::font_settings::clean_font_display_name(font.label());
         Self {
-            path: font.path().to_path_buf(),
+            font: font.clone(),
+            typeface_source: font.byte_source().preview_source(),
             rep_face,
             original_name: font.original_name().to_string(),
             identity: font.render_identity_name(),
@@ -385,6 +417,32 @@ impl FontPropertiesState {
             custom_kerning: Vec::new(),
             custom_kerning_revision: None,
             custom_kerning_editor: None,
+            _display_pin: font_admin::pin_custom_face_display(font),
+            custom,
+        }
+    }
+
+    /// The saved identity when this window shows a saved custom font.
+    #[must_use]
+    pub(super) fn custom_identity(&self) -> Option<&str> {
+        self.custom.as_ref().map(CustomFontProperties::identity)
+    }
+
+    /// Adopts the RELOADED entry of the saved custom font this window shows (after a rename or
+    /// a new recipe the owner's snapshot holds a new entry). The name always follows; a changed
+    /// recipe key (content hash) restarts the analysis over the NEW face, so the glyph list and
+    /// inherited pairs describe the font as it is now. The own-typeface draws (`typeface`) keep
+    /// the face the window OPENED with, as the display pin does for every other row: egui
+    /// cannot unload a font, and registering a full face per «Применить» grew without bound
+    /// (the editor's own preview shows the new hybrid; reopening the window shows its face).
+    /// Cheap; called every frame.
+    pub(super) fn sync_custom_font(&mut self, fresh: &FontEntry) {
+        self.default_label = super::font_settings::clean_font_display_name(fresh.label());
+        if fresh.content_hash() != self.font.content_hash() {
+            self.font = fresh.clone();
+            // A still-running analysis of the old face is abandoned (its sender fails).
+            self.analysis = None;
+            self.analysis_rx = None;
         }
     }
 
@@ -393,7 +451,7 @@ impl FontPropertiesState {
         TypefaceRef {
             identity: self.identity.as_str(),
             content_hash: self.content_hash,
-            path: self.path.as_path(),
+            source: &self.typeface_source,
             rep_face: self.rep_face,
         }
     }
@@ -422,20 +480,21 @@ impl FontPropertiesState {
         font_admin::set_display_name_override(&self.identity, value);
     }
 
-    /// Starts the off-thread font analysis if none is cached or in flight. Reads the font
-    /// file and runs ttf-parser on a worker thread; the GUI thread only polls.
+    /// Starts the off-thread font analysis if none is cached or in flight. Obtains the font's
+    /// bytes (a file read, or a custom font's compiled face) and runs ttf-parser on a worker
+    /// thread; the GUI thread only polls.
     fn maybe_start_analysis(&mut self) {
         if self.analysis.is_some() || self.analysis_rx.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
-        let path = self.path.clone();
+        let font = self.font.clone();
         let face_index = self.rep_face;
         match thread::Builder::new()
             .name("font-properties-analyze".to_string())
             .spawn(move || {
                 // A disconnected receiver only means the window was closed; ignore.
-                let _ = tx.send(analyze_font_file(&path, face_index));
+                let _ = tx.send(analyze_font(&font, face_index));
             }) {
             Ok(_handle) => self.analysis_rx = Some(rx),
             Err(err) => {
@@ -471,8 +530,14 @@ impl FontPropertiesState {
         }
     }
 
-    /// Renders the whole window body (identity header, editor, preview, glyph grid, kerning).
-    fn draw_body(&mut self, ui: &mut egui::Ui) {
+    /// Renders the whole window body (identity header, editor, preview, glyph grid, kerning);
+    /// a saved custom font gets its three sections instead (`draw_custom_body`).
+    fn draw_body(&mut self, ui: &mut egui::Ui, cx: &PropertiesCx<'_>) {
+        if let Some(mut custom) = self.custom.take() {
+            self.draw_custom_body(ui, &mut custom, cx);
+            self.custom = Some(custom);
+            return;
+        }
         ui.label(tf!(
             "typing.font_settings.properties_original_name",
             name = self.original_name
@@ -526,17 +591,15 @@ impl FontPropertiesState {
                     ui,
                     &self.identity,
                     self.content_hash,
-                    &self.path,
+                    &self.typeface_source,
                     self.rep_face,
                     analysis,
                 );
                 ui.add_space(6.0);
                 Self::draw_kerning_section(
                     ui,
-                    &self.identity,
-                    self.content_hash,
-                    &self.path,
-                    self.rep_face,
+                    &tf!("typing.font_settings.properties_kerning_header", count = analysis.kerning.len()),
+                    self.typeface(),
                     analysis,
                 );
             }
@@ -549,6 +612,64 @@ impl FontPropertiesState {
         ui.add_space(6.0);
         ui.separator();
         self.draw_custom_kerning_section(ui);
+    }
+
+    /// The body of a SAVED custom font (decisions D6/D7): «Подробности» (identity, rename,
+    /// groups, preview, glyph grid of the COMPILED face), «Кернинговые пары» (the pairs baked
+    /// into the compiled face — inherited from the sources by weight, read-only — and the
+    /// font's own custom pairs keyed by its saved identity) and «Редактирование гибрида» (the
+    /// shared editor). The analysis builds the full face on its worker when it is not cached
+    /// yet; until then the sections say the font is not built.
+    fn draw_custom_body(&mut self, ui: &mut egui::Ui, custom: &mut CustomFontProperties, cx: &PropertiesCx<'_>) {
+        egui::CollapsingHeader::new(t!("typing.font_settings.custom_details_section"))
+            .id_salt("typing.font_settings.custom_details_section")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(tf!("typing.font_settings.properties_identity", name = self.identity));
+                custom.draw_rename(ui, cx.real_font_names);
+                ui.separator();
+                self.draw_groups_section(ui);
+                ui.separator();
+                self.draw_preview(ui);
+                ui.separator();
+                match &self.analysis {
+                    Some(Ok(analysis)) => Self::draw_glyph_grid(
+                        ui,
+                        &self.identity,
+                        self.content_hash,
+                        &self.typeface_source,
+                        self.rep_face,
+                        analysis,
+                    ),
+                    Some(Err(err)) => {
+                        ui.colored_label(ui.visuals().error_fg_color, t!("typing.font_settings.properties_analyze_error"));
+                        ui.small(err.as_str());
+                    }
+                    None => draw_not_built_status(ui),
+                }
+            });
+        egui::CollapsingHeader::new(t!("typing.font_settings.custom_kerning_section"))
+            .id_salt("typing.font_settings.custom_kerning_section")
+            .default_open(false)
+            .show(ui, |ui| {
+                match &self.analysis {
+                    Some(Ok(analysis)) => Self::draw_kerning_section(
+                        ui,
+                        t!("typing.font_settings.inherited_kerning_heading"),
+                        self.typeface(),
+                        analysis,
+                    ),
+                    // The error itself is shown once, in «Подробности».
+                    Some(Err(_)) => {}
+                    None => draw_not_built_status(ui),
+                }
+                ui.separator();
+                self.draw_custom_kerning_section(ui);
+            });
+        egui::CollapsingHeader::new(t!("typing.font_settings.custom_hybrid_section"))
+            .id_salt("typing.font_settings.custom_hybrid_section")
+            .default_open(false)
+            .show(ui, |ui| custom.draw_hybrid_section(ui, cx.catalog));
     }
 
     /// Renders the display-name editor: a text field prefilled with the override, plus an
@@ -728,13 +849,9 @@ impl FontPropertiesState {
                 .desired_width(f32::INFINITY),
         );
         let prev_override = ui.style().override_font_id.clone();
-        if let PreviewFontFamily::Ready(family) = request_font_family(
-            ui.ctx(),
-            &self.identity,
-            self.content_hash,
-            &self.path,
-            self.rep_face,
-        ) {
+        if let PreviewFontFamily::Ready(family) =
+            self.typeface_source.request_family(ui.ctx(), &self.identity, self.content_hash, self.rep_face)
+        {
             ui.style_mut().override_font_id = Some(egui::FontId::new(PREVIEW_FONT_SIZE, family));
         }
         ui.label(self.preview.as_str());
@@ -750,7 +867,7 @@ impl FontPropertiesState {
         ui: &mut egui::Ui,
         identity: &str,
         content_hash: u64,
-        path: &Path,
+        source: &FontPreviewSource,
         rep_face: usize,
         analysis: &FontAnalysis,
     ) {
@@ -762,7 +879,7 @@ impl FontPropertiesState {
         .id_salt("typing.font_settings.properties_glyphs_header")
         .default_open(false)
         .show(ui, |ui| {
-            Self::draw_glyph_grid_body(ui, identity, content_hash, path, rep_face, analysis);
+            Self::draw_glyph_grid_body(ui, identity, content_hash, source, rep_face, analysis);
         });
     }
 
@@ -771,7 +888,7 @@ impl FontPropertiesState {
         ui: &mut egui::Ui,
         identity: &str,
         content_hash: u64,
-        path: &Path,
+        source: &FontPreviewSource,
         rep_face: usize,
         analysis: &FontAnalysis,
     ) {
@@ -787,7 +904,7 @@ impl FontPropertiesState {
             ((ui.available_width() + spacing_x) / (GLYPH_CELL_SIZE + spacing_x)).floor() as usize,
         );
         let rows = count.div_ceil(columns);
-        let family = own_typeface_family(ui.ctx(), identity, content_hash, path, rep_face);
+        let family = own_typeface_family(ui.ctx(), identity, content_hash, source, rep_face);
         egui::ScrollArea::vertical()
             .id_salt("typing.font_settings.properties_glyph_grid")
             .max_height(GLYPH_GRID_MAX_HEIGHT)
@@ -808,22 +925,12 @@ impl FontPropertiesState {
             });
     }
 
-    /// Renders the collapsible kerning-pair list (virtualized). Shows the pair in the font's
-    /// own typeface, the two characters, the value in font units, and the value scaled to the
-    /// preview font size in pixels. Notes truncation when the list was capped.
-    fn draw_kerning_section(
-        ui: &mut egui::Ui,
-        identity: &str,
-        content_hash: u64,
-        path: &Path,
-        rep_face: usize,
-        analysis: &FontAnalysis,
-    ) {
+    /// Renders the collapsible kerning-pair list (virtualized) under `header`. Shows the pair
+    /// in the font's own typeface, the two characters, the value in font units, and the value
+    /// scaled to the preview font size in pixels. Notes truncation when the list was capped.
+    fn draw_kerning_section(ui: &mut egui::Ui, header: &str, typeface: TypefaceRef<'_>, analysis: &FontAnalysis) {
         let count = analysis.kerning.len();
-        egui::CollapsingHeader::new(tf!(
-            "typing.font_settings.properties_kerning_header",
-            count = count
-        ))
+        egui::CollapsingHeader::new(header)
         .id_salt("typing.font_settings.properties_kerning_header")
         .default_open(false)
         .show(ui, |ui| {
@@ -846,7 +953,7 @@ impl FontPropertiesState {
                     cap = MAX_KERNING_PAIRS
                 ));
             }
-            let family = own_typeface_family(ui.ctx(), identity, content_hash, path, rep_face);
+            let family = typeface.family(ui.ctx());
             let units_per_em = analysis.units_per_em;
             egui::ScrollArea::vertical()
                 .id_salt("typing.font_settings.properties_kerning_list")
@@ -1039,7 +1146,7 @@ impl FontPropertiesState {
 /// (via the window's close button), so the caller drops the state. Non-blocking: the glyph
 /// and kerning analysis runs on a worker thread; the window shows a loading state until it
 /// completes.
-pub(super) fn show(ctx: &egui::Context, state: &mut FontPropertiesState) -> bool {
+pub(super) fn show(ctx: &egui::Context, state: &mut FontPropertiesState, cx: &PropertiesCx<'_>) -> bool {
     state.maybe_start_analysis();
     state.poll_analysis(ctx);
 
@@ -1056,10 +1163,12 @@ pub(super) fn show(ctx: &egui::Context, state: &mut FontPropertiesState) -> bool
         .resizable(true)
         .default_size([560.0, 640.0])
         // Sections carry their own bounded scroll areas so both the glyph grid and the
-        // kerning list stay reachable; the outer window must not add a second vscroll.
-        .vscroll(false)
+        // kerning list stay reachable; the outer window must not add a second vscroll. A
+        // custom font's body also holds the hybrid editor, which is taller than any screen
+        // once its sections are open, so that body scrolls as a whole.
+        .vscroll(state.custom.is_some())
         .show(ctx, |ui| {
-            state.draw_body(ui);
+            state.draw_body(ui, cx);
         });
 
     // A SIBLING window, drawn at the top level of this function — never inside the closure
@@ -1071,20 +1180,29 @@ pub(super) fn show(ctx: &egui::Context, state: &mut FontPropertiesState) -> bool
     window_open
 }
 
+/// The "not built yet" status of a custom font whose compiled face the analysis is still
+/// producing (a spinner keeps the frame loop visibly alive meanwhile).
+fn draw_not_built_status(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        ui.spinner();
+        ui.label(t!("typing.font_settings.custom_font_not_built_hint"));
+    });
+}
+
 /// The egui family that draws this font's own typeface, or `None` while its bytes are
 /// still being read off the GUI thread (and permanently when it cannot be registered).
 ///
-/// A thin adapter over `widgets::request_font_family` for the two grids that take an
+/// A thin adapter over `FontPreviewSource::request_family` for the two grids that take an
 /// `Option<&egui::FontFamily>` per cell: their cells fall back to the interface font,
 /// which is exactly what `Pending` and `Unavailable` both mean for them.
 fn own_typeface_family(
     ctx: &egui::Context,
     identity: &str,
     content_hash: u64,
-    path: &Path,
+    source: &FontPreviewSource,
     rep_face: usize,
 ) -> Option<egui::FontFamily> {
-    match request_font_family(ctx, identity, content_hash, path, rep_face) {
+    match source.request_family(ctx, identity, content_hash, rep_face) {
         PreviewFontFamily::Ready(family) => Some(family),
         PreviewFontFamily::Pending | PreviewFontFamily::Unavailable => None,
     }
@@ -1726,12 +1844,13 @@ fn apply_pair_edit(
 
 // --- Off-thread analysis (pure over bytes) ----------------------------------
 
-/// Reads the font file at `path` and analyzes its representative `face_index`. Returns a
-/// human-readable error string on a read or parse failure. Runs on the analysis worker.
-fn analyze_font_file(path: &Path, face_index: usize) -> Result<FontAnalysis, String> {
-    let bytes = fs::read(path)
-        .map_err(|err| format!("cannot read font file {}: {err}", path.display()))?;
-    analyze_font_bytes(&bytes, face_index)
+/// Obtains `font`'s bytes (`font_admin::font_bytes_blocking`: a file read, or a custom
+/// font's compiled face — possibly a compile) and analyzes its representative `face_index`.
+/// Returns a human-readable error string on a read, build or parse failure. Runs on the
+/// analysis worker only.
+fn analyze_font(font: &FontEntry, face_index: usize) -> Result<FontAnalysis, String> {
+    let bytes = font_admin::font_bytes_blocking(font).map_err(|err| err.to_string())?;
+    analyze_font_bytes((*bytes).as_ref(), face_index)
 }
 
 /// Parses `data` as a font face and extracts its supported characters and non-default

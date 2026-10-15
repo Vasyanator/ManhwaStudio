@@ -7,8 +7,9 @@ typing fonts contain character X?" — so the expanded-symbol row can offer one
 variant cell per font that can actually draw the symbol.
 
 Main responsibilities:
-- snapshot the panel font list into a thread-safe `(index, path, face_index)`
-  form (the path is the worker's BYTE SOURCE, never an identity) plus a
+- snapshot the panel font list into a thread-safe `(index, byte source, face_index)`
+  form (a font FILE, or a saved custom font whose compiled face the worker obtains —
+  taken from `FontEntry::byte_source`, never an identity) plus a
   fingerprint of that list taken over the fonts' IDENTITIES;
 - compute, on a BACKGROUND thread, a `char -> Vec<font index>` map for the whole
   character table;
@@ -21,8 +22,9 @@ Key types:
 - `CoverageJob` (the poll-driven handle owned by `CharTableState`)
 
 Notes:
-The work is I/O bound (`std::fs::read` of every font file) plus a cmap probe per
-character, so it MUST NOT run on the GUI thread; the delivery shape mirrors
+The work is I/O bound (`std::fs::read` of every font file; a saved custom font may even
+be COMPILED on first use through the compile service) plus a cmap probe per character,
+so it MUST NOT run on the GUI thread; the delivery shape mirrors
 `create_state::spawn_font_reload` / `FontReloadResult`. The per-font cmap is
 built ONCE and every character is tested against it, exactly like
 `font_coverage::classify_font_bytes_for`.
@@ -32,29 +34,40 @@ it stands for the whole bundled `fonts/ui` fallback chain (core + bold + ~44
 `ext` files), not for the single file it points at, so a per-file cmap test
 would understate it — exactly the reason its language coverage is reported as
 `Full` without classification (see `panel/MODULE_README.md`). The window always
-offers it as the first variant instead.
+offers it as the first variant instead. The ad-hoc custom entry is excluded too: it has
+no recipe of its own (the layer owns it), hence no glyphs to probe.
 
 Font bytes are read with raw `std::fs`, like `fonts.rs` (the app font directory
 is a real directory on every supported target); only PROJECT files go through
 `ms_storage::global::storage()`.
 */
 
-use crate::panel::FontEntry;
+use crate::panel::{CustomFontRef, FontByteSource, FontEntry};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 
 use ms_thread as thread;
 
-/// One font the worker must probe: its index in the panel font list, the file to
-/// read, and the face inside that file.
+/// Where the worker gets one probed font's bytes.
+#[derive(Debug, Clone)]
+pub(super) enum ProbeBytes {
+    /// Read this representative font FILE.
+    File(PathBuf),
+    /// The compiled full face of this SAVED custom font (memory / disk cache / compile).
+    Custom(Arc<CustomFontRef>),
+}
+
+/// One font the worker must probe: its index in the panel font list, where its bytes
+/// come from, and the face inside them.
 #[derive(Debug, Clone)]
 pub(super) struct FontProbe {
     /// Index into `TypingCreatePanelState.fonts` — what the map stores.
     pub(super) index: usize,
-    /// Representative font FILE path.
-    pub(super) path: PathBuf,
-    /// Face index inside `path` (0 for single-face files).
+    /// Where the bytes come from.
+    pub(super) source: ProbeBytes,
+    /// Face index inside the bytes (0 for single-face files and compiled faces).
     pub(super) face_index: usize,
 }
 
@@ -117,18 +130,22 @@ impl CoverageJob {
         out
     }
 
-    /// Snapshots the probe list: every REAL font file of the panel list, with the
-    /// bundled-stack entry excluded (see the file header).
+    /// Snapshots the probe list: every REAL font file and every SAVED custom font of the
+    /// panel list, with the bundled-stack and ad-hoc entries excluded (see the file
+    /// header).
     #[must_use]
     fn probes(fonts: &[FontEntry]) -> Vec<FontProbe> {
         fonts
             .iter()
             .enumerate()
-            .filter(|(_, font)| font.bundled_stack_font().is_none())
-            .map(|(index, font)| FontProbe {
-                index,
-                path: font.path().to_path_buf(),
-                face_index: font.representative_face_index(),
+            .filter_map(|(index, font)| {
+                let source = match font.byte_source() {
+                    FontByteSource::File(path) => ProbeBytes::File(path.to_path_buf()),
+                    FontByteSource::Bundled(_) => return None,
+                    FontByteSource::Custom(custom) if custom.is_adhoc() => return None,
+                    FontByteSource::Custom(custom) => ProbeBytes::Custom(Arc::clone(custom)),
+                };
+                Some(FontProbe { index, source, face_index: font.representative_face_index() })
             })
             .collect()
     }
@@ -242,7 +259,7 @@ fn append_font_fingerprint(out: &mut String, identity: &str, content_hash: u64, 
     out.push_str(&face.to_string());
 }
 
-/// Pure mapping core: reads every probe's font file and returns the
+/// Pure mapping core: obtains every probe's font bytes and returns the
 /// character → font-index map.
 ///
 /// Runs on the worker thread. Per font the charmap is built ONCE and every
@@ -256,21 +273,13 @@ fn append_font_fingerprint(out: &mut String, identity: &str, content_hash: u64, 
 pub(super) fn compute_coverage(probes: &[FontProbe], chars: &[char]) -> HashMap<char, Vec<usize>> {
     let mut map: HashMap<char, Vec<usize>> = HashMap::new();
     for probe in probes {
-        let bytes = match std::fs::read(&probe.path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                ms_log::runtime_log::log_warn(format!(
-                    "typing: char table coverage: cannot read font file. Path: {} Error: {err}",
-                    probe.path.display()
-                ));
-                continue;
-            }
+        let Some(bytes) = probe_bytes(&probe.source) else {
+            continue;
         };
-        let Some(font) = swash::FontRef::from_index(&bytes, probe.face_index) else {
+        let Some(font) = swash::FontRef::from_index((*bytes).as_ref(), probe.face_index) else {
             ms_log::runtime_log::log_warn(format!(
-                "typing: char table coverage: cannot parse face {} of font file. Path: {}",
-                probe.face_index,
-                probe.path.display()
+                "typing: char table coverage: cannot parse face {} of font {:?}",
+                probe.face_index, probe.source
             ));
             continue;
         };
@@ -283,6 +292,31 @@ pub(super) fn compute_coverage(probes: &[FontProbe], chars: &[char]) -> HashMap<
         }
     }
     map
+}
+
+/// The bytes of one probe, or `None` (logged) when they cannot be obtained.
+fn probe_bytes(source: &ProbeBytes) -> Option<crate::render_next::FontBytes> {
+    match source {
+        ProbeBytes::File(path) => match std::fs::read(path) {
+            Ok(bytes) => Some(Arc::new(bytes)),
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!(
+                    "typing: char table coverage: cannot read font file. Path: {} Error: {err}",
+                    path.display()
+                ));
+                None
+            }
+        },
+        ProbeBytes::Custom(custom) => match custom.full_face_blocking()? {
+            Ok(face) => Some(Arc::clone(&face.bytes)),
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!(
+                    "typing: char table coverage: custom font {custom:?} could not be built: {err}"
+                ));
+                None
+            }
+        },
+    }
 }
 
 #[cfg(test)]
@@ -344,12 +378,12 @@ mod tests {
         let probes = vec![
             FontProbe {
                 index: 3,
-                path: core,
+                source: ProbeBytes::File(core),
                 face_index: 0,
             },
             FontProbe {
                 index: 7,
-                path: math,
+                source: ProbeBytes::File(math),
                 face_index: 0,
             },
         ];
@@ -378,12 +412,12 @@ mod tests {
         let probes = vec![
             FontProbe {
                 index: 2,
-                path: core.clone(),
+                source: ProbeBytes::File(core.clone()),
                 face_index: 0,
             },
             FontProbe {
                 index: 5,
-                path: core,
+                source: ProbeBytes::File(core),
                 face_index: 0,
             },
         ];
@@ -395,7 +429,7 @@ mod tests {
     fn an_unreadable_font_file_contributes_nothing() {
         let probes = vec![FontProbe {
             index: 0,
-            path: PathBuf::from("/nonexistent/char_table_coverage_fixture.ttf"),
+            source: ProbeBytes::File(PathBuf::from("/nonexistent/char_table_coverage_fixture.ttf")),
             face_index: 0,
         }];
         // A missing file must be skipped, not panic and not claim coverage.

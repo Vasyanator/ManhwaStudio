@@ -12,7 +12,7 @@ translated (bubbles, OCR, machine translation), cleaned (clean layers, inpaintin
 (rendered text layers) and exported.
 
 - **Rust application** — a Cargo workspace: the root package `manhwastudio_rs` (`src/`: a
-  library holding the application, plus a thin binary entry) over 42 `ms-*` library crates in
+  library holding the application, plus a thin binary entry) over 43 `ms-*` library crates in
   `crates/`. Builds for Linux and Windows (mandatory), macOS, `wasm32` (web entry,
   `src/web_entry.rs`; currently inactive and not kept building, `PROJECT_RULES.md`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
   exists so that build can export `android_main`).
@@ -55,7 +55,7 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
   <- ms-config / ms-text-render
   <- ms-backend-ipc / ms-docstore / ms-download / ms-fonts / ms-memory / ms-onnx / ms-platform
   <- ms-log / ms-text-detect
-  <- ms-actions / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
+  <- ms-actions / ms-custom-fonts / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
 ```
 
 Non-obvious edges: `ms-tools` sits ABOVE `ms-canvas`; `ms-widgets` does NOT depend on
@@ -85,6 +85,10 @@ shared wiki view). The studio never references
   postprocess, glyph mask, per-engine scale/tiling plan, tile stitching and the runner pipeline
   with the CTD, Paddle and Surya postprocess); the model forward pass is supplied by the caller
   through `ProbMapRunner`. No logging, wasm-buildable.
+- `ms-custom-fonts` — GUI-free custom fonts: the kind-tagged recipe (hybrid = weighted blend of
+  2-4 real fonts; combined planned), its SHA-256 key and the compiler that turns a recipe plus
+  source bytes into a real TrueType face (blend, metrics, inherited `kern`, sfnt writer), and the
+  export-time own-kerning rewrite. Bytes in, bytes out; no I/O, no logging.
 - `ms-docstore` — named logical documents (`DocRef`): per-document lock, atomic writes, JSON or
   SQLite. Must not depend on `ms-config`.
 - `ms-download` — native-only resumable HTTP download engine (`RangeFetcher` / `UreqFetcher`,
@@ -361,7 +365,8 @@ change) through `ms_studio_tab::StudioTab`; drawing and every ordered sequence s
   (API)» (`tools/ai_api_editor`, no Torch, over `ms_ai_api::image_edit`) — and the watermark
   engine. Writes only through `CleanOverlaysModel`.
 - **Typing** — `ms-tab-typing` (+ renderer `ms-text-render`): text layers in `LayerDoc`, masks,
-  export (PNG, PSD, lossless PDF).
+  export (PNG, PSD, lossless PDF), custom fonts (compile service, the shared hybrid editor hosted
+  as a dock panel here and as a dialog in Settings › Тайп).
 - **PS Editor** — `ms-tab-ps-editor`: single-page layered raster editor, NOT a `CanvasView`
   (own camera, layer stack, tools, tiled GPU cache). Base layers are the source page and its
   clean; user layers live in `LayerDoc`. Colour correction is a GPU shader pass
@@ -386,6 +391,13 @@ change) through `ms_studio_tab::StudioTab`; drawing and every ordered sequence s
 - UI language (`General.ui_language`, `ms_i18n::LocaleTag`) and typesetting language
   (`TextTab.text_language`, `ms_text_util::language::TextLanguage`) are independent;
   hyphenation, segmentation and font coverage follow the TEXT language.
+- **Custom fonts are recipes, never files.** A saved one lives in `fonts_data` (`custom_fonts`,
+  kind-tagged; unknown kinds kept verbatim), an ad-hoc one in the layer's
+  `text_params.font_recipe`. `ms-custom-fonts` compiles a recipe into an in-memory face; the
+  typing `custom_fonts` service (memory LRU + disk cache `fonts/custom_cache/<key>.ttf`, a
+  disposable artefact skipped by the font scanner) serves it to the typing `FontProvider`, so
+  the renderer sees an ordinary face. A missing source font blocks the layer (`missing_font`),
+  never a substitute.
 
 Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/MODULE_README.md`.
 
@@ -500,6 +512,7 @@ logged error); the GUI thread only polls and applies results.
 | Storage-mode conversion job | `ms-settings-ui/src/storage_mode_job.rs` |
 | Structural page ops, thumbnails, viewer clean decode | `ms-tab-page-manager` + `ms-page-ops` |
 | Typing live render (latest-wins), save, export | `ms-tab-typing/src/tab/` |
+| Custom font compile (one job per recipe key, memory LRU, disk cache, prune) and the editor's latest-wins subset preview | `ms-tab-typing/src/custom_fonts/` + `hybrid_editor/`, compiler `ms-custom-fonts` |
 | PS editor page decode, raster effects | `ms-tab-ps-editor` |
 | Cleaning region loader, inpaint runs, quick text clean | `ms-tab-cleaning` |
 | Cloud image-edit run (submit, poll, download, exact-size finish) | `ms-tab-cleaning/src/tools/ai_api_editor` + `ms_ai_api::image_edit` |
@@ -528,8 +541,9 @@ logged error); the GUI thread only polls and applies results.
   flatten/export and the PS composite, layers tree and structural order), platform
   capability decisions (`ms_platform::PlatformFeature`), file dialogs
   (`ms_platform::file_dialog`), system clipboard reads (`ms_platform::clipboard`), input
-  bindings, their labels and conflicts (`ms-input`) and finger gestures on canvases
-  (`ms_input::touch`).
+  bindings, their labels and conflicts (`ms-input`), finger gestures on canvases
+  (`ms_input::touch`), custom-font synthesis and compiled-face naming (`ms-custom-fonts`) and the
+  custom-font identity namespace (`ms_tab_typing` `custom_fonts::identity`).
   Layer and group visibility/opacity are `LayerDoc` facts, never one tab's view state.
 
 **Documents**

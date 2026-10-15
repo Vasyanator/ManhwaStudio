@@ -7,7 +7,8 @@ create-panel preset and formula-preset apply/save UI, the shared typing font
 combo, the initial preview request, and the face-index clamp.
 
 Main responsibilities:
-- draw and apply/create/rename/save/delete named create presets, and apply/save
+- draw and apply/create/rename/save/delete named create presets (a font-mode preset of
+  the ad-hoc custom font captures and applies its recipe, `font_recipe`), and apply/save
   formula-layout presets;
 - own the ONE font combo both typing panels draw (`draw_font_combo`): its rows,
   its own-typeface previews, its caption, its display clamp and its pick edge;
@@ -219,9 +220,10 @@ struct FontComboRow {
     /// `FontEntry::content_hash` — the byte discriminant of that registration, so a replaced
     /// file is never previewed from stale bytes. `0` = content unknown.
     content_hash: u64,
-    /// Where the preview's bytes are read from; never part of the registration key.
-    path: PathBuf,
-    /// The face of `path` the preview is rendered from.
+    /// Where the preview's bytes come from (`FontByteSource::preview_source`: a file, a
+    /// compiled custom face, or none); never part of the registration key.
+    preview: FontPreviewSource,
+    /// The face the preview is rendered from.
     face_index: usize,
     /// Coverage colour of the main line; `None` for a font that fully covers the language.
     color: Option<egui::Color32>,
@@ -573,6 +575,10 @@ impl TypingCreatePanelState {
     /// reachable for a preset saved with an empty font list) keeps the current selection
     /// and is not a missing font.
     ///
+    /// AD-HOC CUSTOM FONT. A preset naming the ad-hoc identity installs its `font_recipe`
+    /// through `custom_font_select::select_adhoc_font`: a missing source or an absent /
+    /// damaged recipe blocks the panel like a layer load; no per-font profile is applied.
+    ///
     /// The flag is cleared AFTER the apply, not where the selection is set: applying stores
     /// the panel's parameters through the ordinary dispatch (which raises the flag), and what
     /// is on screen at the end of an apply is the preset's own content — not a user edit. A
@@ -629,6 +635,17 @@ impl TypingCreatePanelState {
 
         let primary = preset.font.trim();
         let names_a_font = !primary.is_empty();
+        if crate::custom_fonts::identity::is_adhoc_identity(primary) {
+            // The ad-hoc custom font: its recipe travels with the preset and decides
+            // whether it can render (a source the list lacks, or a recipe that could not be
+            // read, blocks the panel exactly like a layer load does). It owns no per-font
+            // profile, so the parameters on screen stand (local-preset behaviour).
+            self.select_adhoc_font(
+                preset.font_recipe.ok_or_else(|| "the preset names the hybrid font without a usable recipe".to_owned()),
+            );
+            self.clamp_face_index();
+            return true;
+        }
         // The stored value is an identity; a leftover legacy value may be a name form or a
         // path, so it goes through the legacy door — where only NAME evidence may select.
         let target_idx = self.find_font_idx_by_identity(primary).or_else(|| {
@@ -778,7 +795,7 @@ impl TypingCreatePanelState {
     ///
     /// A pure READ of `self`: the caller stores the result and owns the live-set transition.
     #[must_use]
-    fn capture_current_preset(&self) -> TypingCreatePreset {
+    pub(super) fn capture_current_preset(&self) -> TypingCreatePreset {
         match self.identity_mode {
             ParamIdentityMode::Font => TypingCreatePreset {
                 font: self.current_font_identity().unwrap_or_default(),
@@ -786,6 +803,9 @@ impl TypingCreatePanelState {
                 identity_mode: ParamIdentityMode::Font,
                 local_presets: Vec::new(),
                 selected_local_preset: None,
+                // The ad-hoc entry's recipe IS its font: a preset naming it without the
+                // recipe would apply a hybrid it cannot describe (`selected_font_ref` rule).
+                font_recipe: self.selected_font_ref().and_then(|font_ref| font_ref.recipe),
             },
             ParamIdentityMode::LocalPreset => TypingCreatePreset {
                 font: String::new(),
@@ -793,6 +813,7 @@ impl TypingCreatePanelState {
                 identity_mode: ParamIdentityMode::LocalPreset,
                 local_presets: self.local_presets.clone(),
                 selected_local_preset: self.selected_local_preset,
+                font_recipe: None,
             },
         }
     }
@@ -852,6 +873,12 @@ impl TypingCreatePanelState {
         if !self.preview_enabled {
             return;
         }
+        // An ad-hoc hybrid without a recipe is blocked too (`missing_font` holds its caption),
+        // but the refusal names the real cause: the preset would store a font it cannot describe.
+        if self.selected_adhoc_without_recipe() {
+            self.status_line = Self::adhoc_unconfigured_status();
+            return;
+        }
         if self.missing_font.is_some() {
             self.status_line = t!("typing.presets.create_blocked_missing_font").to_string();
             return;
@@ -898,6 +925,12 @@ impl TypingCreatePanelState {
         let Some(current_name) = self.selected_preset_name.clone() else {
             return;
         };
+        // The capture would store the ad-hoc identity without its recipe, which reads back as
+        // a damaged preset (`custom_font_select::selected_adhoc_without_recipe`).
+        if self.selected_adhoc_without_recipe() {
+            self.status_line = Self::adhoc_unconfigured_status();
+            return;
+        }
         // VERBATIM (see the doc comment): the buffer IS the name, whitespace included.
         let new_name = self.preset_name_input.clone();
         if new_name.is_empty() {
@@ -1374,7 +1407,7 @@ impl TypingCreatePanelState {
                     label: self.font_display_label(font),
                     identity: font.render_identity_name(),
                     content_hash: font.content_hash(),
-                    path: font.path.clone(),
+                    preview: font.byte_source().preview_source(),
                     face_index: font.faces.first().map(|face| face.face_index).unwrap_or(0),
                     color,
                     tooltip: font_coverage_tooltip(&font.coverage),
@@ -1485,13 +1518,7 @@ impl TypingCreatePanelState {
         let ctx = ui.ctx().clone();
         let mut resolve_family = |index: usize| -> Option<egui::FontFamily> {
             let row = rows.get(index)?;
-            match ms_widgets::request_font_family(
-                &ctx,
-                &row.identity,
-                row.content_hash,
-                &row.path,
-                row.face_index,
-            ) {
+            match row.preview.request_family(&ctx, &row.identity, row.content_hash, row.face_index) {
                 ms_widgets::PreviewFontFamily::Ready(family) => Some(family),
                 // Both non-ready states draw the row in the interface font, which is what the
                 // widget does for a `None`. `Pending` retries by itself on a later frame.
@@ -1895,4 +1922,16 @@ pub(super) fn font_fallback_status_lines(
         });
     }
     lines
+}
+
+/// The hint that explains fallback rows for a CUSTOM font: characters a hybrid disables (or
+/// its sources lack under the `Disable` policy) are left out of the compiled face, so the
+/// renderer's fallback chain draws them and they show up in [`font_fallback_status_lines`].
+/// `Some` only when `selected_font_is_custom` and the report lists a fallback.
+///
+/// Drawn under the font combo (`custom_font_select::draw_custom_font_fallback_hint`), next
+/// to the font it explains; the wording stays here with the other diagnostic texts.
+#[must_use]
+pub(super) fn custom_font_fallback_hint(report: &FontFallbackReport, selected_font_is_custom: bool) -> Option<&'static str> {
+    (selected_font_is_custom && !report.fallbacks.is_empty()).then(|| t!("typing.hybrid_font.fallback_disabled_hint"))
 }

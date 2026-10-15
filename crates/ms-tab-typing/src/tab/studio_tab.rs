@@ -17,14 +17,15 @@ Key items:
     textures (`evict_gpu_caches`);
   - `source_page_window` / `wants_nearest_source`: answered by the tab's canvas;
   - `write_exit_settings`: `Canvas.typing_hint_collapsed`, `TextTab.centering_assist_enabled`,
-    `TextTab.centering_show_center`;
+    `TextTab.centering_show_center`, `TextTab.psd_bundle_custom_fonts`;
   - `flush_debounced_stores_blocking`: the per-font settings store, then the default
     local-preset set.
 
 Notes:
 - The exit-only keys and their defaults are persisted user data: absent `typing_hint_collapsed`
   = expanded (`false`), absent `centering_assist_enabled` = off (`false`), absent
-  `centering_show_center` = shown (`true`). The bound-center KIND is session-only and has no key.
+  `centering_show_center` = shown (`true`), absent `psd_bundle_custom_fonts` = off (`false`). The
+  bound-center KIND is session-only and has no key.
   They are written only at teardown, never per toggle.
 - No background poll and no committed-tree view: those hooks keep their no-op defaults.
 - The canvas bottom-hint rows are built from the input registry's labels in `tab/input.rs`.
@@ -47,10 +48,13 @@ const TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY: &str = "centering_assist_enabled";
 /// `TextTab` key of the «Показывать центр» marker (absent = `true`, shown: the dependent marker
 /// is on by default, which is why its default differs from the assist toggle's).
 const TEXT_TAB_CENTERING_SHOW_CENTER_KEY: &str = "centering_show_center";
+/// `TextTab` key of the PSD export's «Положить рядом кастомные шрифты» (absent = `false`, off).
+const TEXT_TAB_PSD_BUNDLE_CUSTOM_FONTS_KEY: &str = "psd_bundle_custom_fonts";
 
 impl TypingTabState {
     /// Seeds the exit-only flags ONCE at construction from the merged startup `user_settings`:
-    /// the bottom-hint collapsed state and both centering-assist checkboxes. A missing section or
+    /// the bottom-hint collapsed state, both centering-assist checkboxes and the PSD export's
+    /// custom-font bundle checkbox. A missing section or
     /// key, or a non-boolean value, yields the documented default. Must not be called every frame
     /// (it would override the user's live toggles). Pure: no I/O.
     pub fn load_exit_settings(&mut self, user_settings: &Value) {
@@ -59,6 +63,8 @@ impl TypingTabState {
             section_bool(user_settings, TEXT_TAB_SECTION, TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY, false),
             section_bool(user_settings, TEXT_TAB_SECTION, TEXT_TAB_CENTERING_SHOW_CENTER_KEY, true),
         );
+        self.top_panel
+            .set_psd_bundle_custom_fonts(section_bool(user_settings, TEXT_TAB_SECTION, TEXT_TAB_PSD_BUNDLE_CUSTOM_FONTS_KEY, false));
     }
 }
 
@@ -106,12 +112,13 @@ impl StudioTab for TypingTabState {
         self.canvas.source_pixel_inspection_active()
     }
 
-    /// Writes the three exit-only flags; every other key of `root` and of both sections survives,
+    /// Writes the four exit-only flags; every other key of `root` and of both sections survives,
     /// a non-object root or section is replaced (`ms_config::set_section_bool`).
     fn write_exit_settings(&self, root: &mut Value) {
         set_section_bool(root, CANVAS_SECTION, CANVAS_TYPING_HINT_COLLAPSED_KEY, self.hint_collapsed());
         set_section_bool(root, TEXT_TAB_SECTION, TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY, self.centering_assist_enabled());
         set_section_bool(root, TEXT_TAB_SECTION, TEXT_TAB_CENTERING_SHOW_CENTER_KEY, self.centering_show_center());
+        set_section_bool(root, TEXT_TAB_SECTION, TEXT_TAB_PSD_BUNDLE_CUSTOM_FONTS_KEY, self.top_panel.psd_bundle_custom_fonts());
     }
 
     /// Synchronously writes a still-pending per-font-settings save, then a still-owed default
@@ -144,7 +151,8 @@ mod tests {
         root
     }
 
-    /// Absent keys seed the documented defaults: expanded hint, assist off, center marker shown.
+    /// Absent keys seed the documented defaults: expanded hint, assist off, center marker shown,
+    /// custom-font bundling off.
     #[test]
     fn absent_keys_seed_the_documented_defaults() {
         let root = round_trip(&json!({}), json!({}));
@@ -152,7 +160,7 @@ mod tests {
             root,
             json!({
                 "Canvas": { "typing_hint_collapsed": false },
-                "TextTab": { "centering_assist_enabled": false, "centering_show_center": true },
+                "TextTab": { "centering_assist_enabled": false, "centering_show_center": true, "psd_bundle_custom_fonts": false },
             })
         );
     }
@@ -162,12 +170,13 @@ mod tests {
     fn non_boolean_values_read_as_defaults() {
         let stored = json!({
             "Canvas": { "typing_hint_collapsed": "yes" },
-            "TextTab": { "centering_assist_enabled": 1, "centering_show_center": null },
+            "TextTab": { "centering_assist_enabled": 1, "centering_show_center": null, "psd_bundle_custom_fonts": "yes" },
         });
         let root = round_trip(&stored, json!({}));
         assert_eq!(root["Canvas"]["typing_hint_collapsed"], json!(false));
         assert_eq!(root["TextTab"]["centering_assist_enabled"], json!(false));
         assert_eq!(root["TextTab"]["centering_show_center"], json!(true));
+        assert_eq!(root["TextTab"]["psd_bundle_custom_fonts"], json!(false));
     }
 
     /// Stored values survive a load -> write round trip.
@@ -175,7 +184,7 @@ mod tests {
     fn stored_values_round_trip() {
         let stored = json!({
             "Canvas": { "typing_hint_collapsed": true },
-            "TextTab": { "centering_assist_enabled": true, "centering_show_center": false },
+            "TextTab": { "centering_assist_enabled": true, "centering_show_center": false, "psd_bundle_custom_fonts": true },
         });
         let root = round_trip(&stored, json!({}));
         assert_eq!(root, stored);
@@ -195,7 +204,7 @@ mod tests {
             root,
             json!({
                 "Canvas": { "cache_pages": true, "translation_hint_collapsed": true, "cleaning_hint_collapsed": true, "typing_hint_collapsed": false },
-                "TextTab": { "text_language": "en", "centering_assist_enabled": false, "centering_show_center": true },
+                "TextTab": { "text_language": "en", "centering_assist_enabled": false, "centering_show_center": true, "psd_bundle_custom_fonts": false },
                 "General": { "x": 1 },
             })
         );
@@ -209,7 +218,7 @@ mod tests {
         assert_eq!(root["TextTab"]["centering_show_center"], json!(true));
         let root = round_trip(&json!({}), json!({ "Canvas": 3, "TextTab": "x" }));
         assert_eq!(root["Canvas"], json!({ "typing_hint_collapsed": false }));
-        assert_eq!(root["TextTab"], json!({ "centering_assist_enabled": false, "centering_show_center": true }));
+        assert_eq!(root["TextTab"], json!({ "centering_assist_enabled": false, "centering_show_center": true, "psd_bundle_custom_fonts": false }));
     }
 
     /// Every dock tab the typing tab declares; a default layout missing one drops a stored

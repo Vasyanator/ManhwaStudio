@@ -7,7 +7,7 @@ one-shot migration that moved it out of `user_config.json`
 (`dev-docs/font_identity_postscript_plan.md`, phase 5).
 
 Main responsibilities:
-- define the versioned schema (`version: 2`) and its serde mirror;
+- define the versioned schema (`version: 3`) and its serde mirror;
 - load the document as a typed `LoadOutcome` (`Missing` / `Loaded` / `Invalid`) so a corrupt
   file is never silently degraded to empty (which the next save would then overwrite);
 - quarantine a corrupt document to `presets.json.bad` (rename, else copy), and DISABLE saving
@@ -53,6 +53,13 @@ RESOLUTION of
 legacy font references to identities is deliberately NOT here either: it needs the panel's
 font list and lives in `create_presets::migrate_legacy_presets`.
 
+SCHEMA 3 added `font_recipe` next to a preset `font` that is the AD-HOC custom font identity
+(`MSCustom-adhoc-hybrid`): the hybrid recipe that preset applies. It is written only for that
+identity and decoded only next to it (`decode_font_recipe`); a damaged one decodes to `None`
+with a warning, and applying such a preset blocks the panel as a damaged hybrid. A `version: 2`
+document decodes unchanged; the bump is a gate, so an older build refuses a document whose
+recipes it would drop.
+
 SCHEMA 2 added the second PARAMETER IDENTITY MODE (`dev-docs/local_presets_plan.md` §6):
 each preset may carry `identity_mode` + `local_presets` + `selected_local_preset`, and the
 document carries the same pair at top level as the DEFAULT local set. A `version: 1`
@@ -77,12 +84,14 @@ collapsing them (which trimming did) destroyed one of them without a word.
 */
 
 use super::*;
+use crate::custom_fonts::identity::is_adhoc_identity;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Current on-disk schema version of `fonts/presets.json`. Bumped to 2 by the local-preset
-/// feature so an older build refuses the document instead of dropping its local presets.
-pub(super) const PRESETS_VERSION: u32 = 2;
+/// feature so an older build refuses the document instead of dropping its local presets, and
+/// to 3 by the ad-hoc custom font (`font_recipe`) for the same reason.
+pub(super) const PRESETS_VERSION: u32 = 3;
 
 /// File name of the create-preset document inside the app fonts directory.
 const PRESETS_FILE_NAME: &str = "presets.json";
@@ -158,6 +167,10 @@ struct PresetFileEntry {
     /// `None` when it does not address an existing entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     selected_local_preset: Option<usize>,
+    /// The ad-hoc custom font recipe (`CustomFontRecipe::to_json`) when `font` is the ad-hoc
+    /// identity; omitted otherwise (schema 3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    font_recipe: Option<Value>,
 }
 
 /// One local preset as stored on disk: a VERBATIM name plus a full render-data snapshot.
@@ -523,6 +536,7 @@ fn decode(file: PresetsFile) -> StoredDocument {
                 local_presets.len(),
                 &format!("preset '{name}'"),
             );
+            let font_recipe = decode_font_recipe(&name, &entry.font, entry.font_recipe.as_ref());
             (
                 name,
                 TypingCreatePreset {
@@ -531,6 +545,7 @@ fn decode(file: PresetsFile) -> StoredDocument {
                     identity_mode: decode_identity_mode(entry.identity_mode.as_deref()),
                     local_presets,
                     selected_local_preset,
+                    font_recipe,
                 },
             )
         })
@@ -547,6 +562,29 @@ fn decode(file: PresetsFile) -> StoredDocument {
             local_presets,
             selected_local_preset,
         },
+    }
+}
+
+/// Decodes the `font_recipe` of preset `name`, whose font is `font`.
+///
+/// A recipe is meaningful only next to the ad-hoc identity: elsewhere it is ignored (the
+/// writer never puts it there). A recipe that does not parse or validate decodes to `None`
+/// and is logged with the reason — the preset is kept, and applying it blocks the panel as a
+/// damaged hybrid instead of failing the whole document into `Invalid`.
+fn decode_font_recipe(name: &str, font: &str, stored: Option<&Value>) -> Option<Arc<CustomFontRecipe>> {
+    if !is_adhoc_identity(font) {
+        return None;
+    }
+    let stored = stored?;
+    match CustomFontRecipe::from_json(stored).and_then(|recipe| recipe.validate(&fonts::normalize_font_identity).map(|()| recipe)) {
+        Ok(recipe) => Some(Arc::new(recipe)),
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!(
+                "typing presets: the hybrid font recipe of preset '{name}' is damaged ({err}); \
+                 the preset is kept, and applying it shows the hybrid as damaged."
+            ));
+            None
+        }
     }
 }
 
@@ -670,6 +708,11 @@ fn encode(document: &StoredDocument) -> PresetsFile {
                         identity_mode: encode_identity_mode(preset.identity_mode),
                         local_presets: encode_local_presets(&preset.local_presets),
                         selected_local_preset: preset.selected_local_preset,
+                        font_recipe: preset
+                            .font_recipe
+                            .as_ref()
+                            .filter(|_| is_adhoc_identity(&preset.font))
+                            .map(|recipe| recipe.to_json()),
                     },
                 )
             })
@@ -1239,6 +1282,7 @@ fn present_text_tab_keys(user_settings_file: &Path, keys: &[&str]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1358,7 +1402,7 @@ mod tests {
     /// `primary_font_*` keys are gone for good, and the version is now 2, so an older build
     /// refuses the document instead of dropping the local presets it cannot represent.
     #[test]
-    fn written_document_is_version_two_with_a_single_font_key() {
+    fn written_document_is_the_current_version_with_a_single_font_key() {
         let dir = unique_temp_dir("shape");
         let mut presets = StoredPresets::new();
         presets.insert("A".to_string(), preset("Some-Font", &[]));
@@ -1366,7 +1410,7 @@ mod tests {
 
         let raw = fs::read_to_string(data_path(&dir)).expect("read written file");
         let value: Value = serde_json::from_str(&raw).expect("valid JSON");
-        assert_eq!(value.pointer("/version"), Some(&json!(2)));
+        assert_eq!(value.pointer("/version"), Some(&json!(PRESETS_VERSION)));
         assert_eq!(value.pointer("/presets/A/font"), Some(&json!("Some-Font")));
         let entry = value
             .pointer("/presets/A")
@@ -2284,6 +2328,89 @@ mod tests {
         let removed =
             drop_migrated_user_config_keys(&dir, &config).expect("cleanup must succeed");
         assert_eq!(removed, vec!["create_presets".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn hybrid_recipe() -> Arc<CustomFontRecipe> {
+        use ms_custom_fonts::{CustomFontKind, HybridParams, HybridSource, MissingGlyphPolicy};
+        Arc::new(CustomFontRecipe {
+            kind: CustomFontKind::Hybrid(HybridParams {
+                sources: vec![
+                    HybridSource { identity: "Alpha-Regular".to_owned(), weight: 1.0, missing_override: None },
+                    HybridSource { identity: "Beta-Regular".to_owned(), weight: 2.0, missing_override: None },
+                ],
+                missing_default: MissingGlyphPolicy::NoInfluence,
+            }),
+        })
+    }
+
+    /// Schema 3: the ad-hoc preset's recipe round-trips; a recipe next to any other font is
+    /// never written.
+    #[test]
+    fn an_adhoc_preset_round_trips_its_recipe_and_only_it() {
+        let dir = unique_temp_dir("v3_recipe");
+        let mut presets = StoredPresets::new();
+        presets.insert(
+            "Гибрид".to_string(),
+            TypingCreatePreset {
+                font: ADHOC_CUSTOM_FONT_IDENTITY.to_string(),
+                font_recipe: Some(hybrid_recipe()),
+                ..TypingCreatePreset::default()
+            },
+        );
+        presets.insert(
+            "Обычный".to_string(),
+            TypingCreatePreset {
+                font: "Alpha-Regular".to_string(),
+                font_recipe: Some(hybrid_recipe()),
+                ..TypingCreatePreset::default()
+            },
+        );
+        save(&dir, &document(presets), next_save_ticket()).expect("save presets");
+
+        let raw: Value = serde_json::from_str(&fs::read_to_string(data_path(&dir)).expect("read")).expect("json");
+        assert_eq!(raw.pointer("/version"), Some(&json!(3)));
+        assert_eq!(raw.pointer("/presets/Гибрид/font_recipe"), Some(&hybrid_recipe().to_json()));
+        assert!(raw.pointer("/presets/Обычный/font_recipe").is_none(), "a real font never carries a recipe");
+
+        let loaded = expect_loaded(load_outcome(&dir));
+        assert_eq!(loaded.presets.get("Гибрид").and_then(|p| p.font_recipe.as_deref()), Some(&*hybrid_recipe()));
+        assert!(loaded.presets.get("Обычный").is_some_and(|p| p.font_recipe.is_none()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A damaged recipe costs only the recipe (logged), never the preset or the document; a
+    /// version-2 document (no recipes) decodes unchanged.
+    #[test]
+    fn a_damaged_recipe_and_a_version_two_document_decode() {
+        let dir = unique_temp_dir("v2_and_damaged");
+        fs::write(
+            data_path(&dir),
+            json!({
+                "version": 2,
+                "presets": {
+                    "Битый": {"font": ADHOC_CUSTOM_FONT_IDENTITY, "font_recipe": {"kind": 7}},
+                    "Старый": {"font": "Alpha-Regular"}
+                }
+            })
+            .to_string(),
+        )
+        .expect("seed v2 document");
+        let loaded = expect_loaded(load_outcome(&dir));
+        let damaged = loaded.presets.get("Битый").expect("the preset survives a damaged recipe");
+        assert_eq!(damaged.font, ADHOC_CUSTOM_FONT_IDENTITY);
+        assert!(damaged.font_recipe.is_none());
+        assert_eq!(loaded.presets.get("Старый").map(|p| p.font.as_str()), Some("Alpha-Regular"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The version gate: a document of the NEXT schema is refused, not downgraded.
+    #[test]
+    fn a_version_four_document_is_refused() {
+        let dir = unique_temp_dir("v4_refused");
+        fs::write(data_path(&dir), json!({"version": PRESETS_VERSION + 1, "presets": {}}).to_string()).expect("seed v4");
+        let err = save(&dir, &StoredDocument::default(), next_save_ticket()).expect_err("a newer document must not be replaced");
+        assert!(matches!(err, PresetsStoreError::NewerVersion { found: 4 }), "unexpected variant: {err:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 }

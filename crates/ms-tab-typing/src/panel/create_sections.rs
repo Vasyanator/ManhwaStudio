@@ -647,6 +647,7 @@ impl TypingCreatePanelState {
             repaginate,
             repaginate_pages_warning,
             export_base_name,
+            psd_bundle_custom_fonts,
         } = inputs;
         let mut out = TypingRightSectionActions {
             toggle_mask: false,
@@ -656,6 +657,7 @@ impl TypingCreatePanelState {
             changed_repaginate: None,
             changed_repaginate_pages_warning: None,
             repaginate_block_drawn: false,
+            changed_psd_bundle_custom_fonts: None,
             round_text_positions: false,
             create_image_request: None,
             changed_strict_pixel_movement: None,
@@ -700,6 +702,17 @@ impl TypingCreatePanelState {
             out.repaginate_block_drawn = export_controls_visible && repaginate_block_visible(export_format);
             if out.repaginate_block_drawn {
                 draw_repaginate_block(ui, comic_type, repaginate, repaginate_pages_warning, &mut out);
+            }
+            // PSD only: the other formats are raster, a custom font needs no file there.
+            if export_controls_visible && export_format == TypingExportFormat::Psd {
+                let mut bundle = psd_bundle_custom_fonts;
+                if ui
+                    .checkbox(&mut bundle, t!("typing.export.psd_bundle_custom_fonts_checkbox"))
+                    .on_hover_text(t!("typing.export.psd_bundle_custom_fonts_tooltip"))
+                    .changed()
+                {
+                    out.changed_psd_bundle_custom_fonts = Some(bundle);
+                }
             }
             if export_controls_visible {
                 // Primary export action: painted green to stand out among the

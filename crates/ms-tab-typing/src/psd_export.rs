@@ -19,6 +19,11 @@ FILE HEADER (tabs/typing/psd_export.rs)
   равно записывается (потерять шрифт хуже), а факт неоднозначности возвращается наверх
   как `AmbiguousExportFont`: пишется в лог с контекстом и доходит до пользователя
   предупреждением в строке состояния экспорта.
+- Custom fonts (decision D2): a layer using a custom font (saved or ad-hoc,
+  `text_params_schema::custom_font_use`) is written as a normal text layer named by the
+  PostScript name of its COMPILED full face (`FontPostScriptNames::custom_face_name`, keyed by
+  `custom_fonts::export::CustomFontUseKey`). The export worker installs those names before any
+  page is built (`tab/export.rs`); a font whose face failed keeps its stored identity.
 
 Случай A (overlay.deform_mesh.is_none(), чистый аффин): один ВИДИМЫЙ текстовый слой
   с растровым превью (запечённый аффинный вид) + редактируемые данные текста (TySh).
@@ -35,6 +40,7 @@ use ag_psd::write_psd;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 
+use super::custom_fonts::export::CustomFontUseKey;
 use super::panel::text_params_schema;
 
 use super::tab::{
@@ -66,6 +72,10 @@ pub(crate) struct FontPostScriptNames {
     /// More than one owner means the name PSD writes cannot address a single font (see
     /// [`FontPostScriptNames::name_is_ambiguous`]).
     identities_by_name: HashMap<String, BTreeSet<String>>,
+    /// Custom font use -> PostScript name of its compiled full face. Empty in the panel's
+    /// snapshot; installed per job by the export worker once the faces are resolved
+    /// (`install_custom_face_name`).
+    custom_faces: HashMap<CustomFontUseKey, String>,
 }
 
 /// One exported text layer whose font could not be named unambiguously in the PSD.
@@ -160,6 +170,21 @@ impl FontPostScriptNames {
             .filter(non_empty)
             .or_else(|| faces.iter().find(non_empty))
             .map(|name| name.trim())
+    }
+}
+
+impl FontPostScriptNames {
+    /// Records the compiled face's PostScript name for one custom font use; a later
+    /// installation of the same key replaces the earlier one.
+    pub(crate) fn install_custom_face_name(&mut self, key: CustomFontUseKey, post_script_name: String) {
+        self.custom_faces.insert(key, post_script_name);
+    }
+
+    /// The PostScript name of the compiled face installed for `key`, or `None` when the font
+    /// has no face in this export (the layer then keeps its stored name).
+    #[must_use]
+    pub(crate) fn custom_face_name(&self, key: &CustomFontUseKey) -> Option<&str> {
+        self.custom_faces.get(key).map(String::as_str)
     }
 }
 
@@ -672,10 +697,21 @@ fn build_layer_text_data(
                 .next()
         }
     });
-    let font_name = stored_font_name
-        .as_deref()
-        .and_then(|identity| font_names.face_name(identity, face_index))
-        .map(ToOwned::to_owned)
+    // A custom font (saved or ad-hoc) is named by its COMPILED face, installed into the index
+    // by the export worker; without an installed face (resolution failed) the layer falls
+    // through to the chain above and keeps its stored identity.
+    let custom_face_name = stored
+        .and_then(text_params_schema::custom_font_use)
+        .and_then(|font_use| CustomFontUseKey::of(&font_use))
+        .and_then(|key| font_names.custom_face_name(&key))
+        .map(ToOwned::to_owned);
+    let font_name = custom_face_name
+        .or_else(|| {
+            stored_font_name
+                .as_deref()
+                .and_then(|identity| font_names.face_name(identity, face_index))
+                .map(ToOwned::to_owned)
+        })
         .or_else(|| stored_font_name.clone())
         .unwrap_or_else(|| "MyriadPro-Regular".to_string());
 
@@ -1191,6 +1227,46 @@ mod tests {
             &FontPostScriptNames::default(),
         ));
         assert_eq!(name, "SomeFont-Bold");
+    }
+
+    /// A custom font layer is named by the compiled face installed for its use key — saved
+    /// (identity matched case-insensitively) and ad-hoc (keyed by its recipe) alike; without
+    /// an installed face it keeps its stored identity.
+    #[test]
+    fn custom_font_layers_are_named_by_their_compiled_face() {
+        use crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY;
+        let saved_id = "MSCustom-0123456789abcdef";
+        let recipe = json!({
+            "kind": "hybrid",
+            "sources": [
+                { "identity": "Alpha-Regular", "weight": 1.0, "missing": null },
+                { "identity": "Beta-Regular", "weight": 1.0, "missing": null }
+            ],
+            "missing_default": "no_influence"
+        });
+        let adhoc_params = json!({ "schema": 2, "text": "x", "font": ADHOC_CUSTOM_FONT_IDENTITY, "font_recipe": recipe });
+        let adhoc_use = text_params_schema::custom_font_use(adhoc_params.as_object().expect("object"))
+            .expect("an ad-hoc layer uses a custom font");
+        let adhoc_key = CustomFontUseKey::of(&adhoc_use).expect("a valid ad-hoc recipe has a key");
+
+        // Nothing installed: both keep their stored identity.
+        let empty = FontPostScriptNames::default();
+        assert_eq!(font_name_of(text_data_for(json!({ "schema": 2, "text": "x", "font": saved_id }), &empty)), saved_id);
+        assert_eq!(font_name_of(text_data_for(adhoc_params.clone(), &empty)), ADHOC_CUSTOM_FONT_IDENTITY);
+
+        let mut index = FontPostScriptNames::default();
+        // Production keys come from `CustomFontUseKey::of`, which normalizes the saved identity.
+        let saved_use = text_params_schema::custom_font_use(json!({ "font": saved_id }).as_object().expect("object"))
+            .expect("a saved custom identity is a custom font use");
+        index.install_custom_face_name(CustomFontUseKey::of(&saved_use).expect("a saved use has a key"), "MSCustom-11111111".to_owned());
+        index.install_custom_face_name(adhoc_key, "MSCustom-22222222".to_owned());
+        assert_eq!(
+            font_name_of(text_data_for(json!({ "schema": 2, "text": "x", "font": saved_id.to_ascii_uppercase() }), &index)),
+            "MSCustom-11111111"
+        );
+        let (data, ambiguous) = text_data_and_ambiguity_for(adhoc_params, &index);
+        assert_eq!(font_name_of(data), "MSCustom-22222222");
+        assert_eq!(ambiguous, None);
     }
 
     /// A font whose declared PostScript name failed validation at load time carries an

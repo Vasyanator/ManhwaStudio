@@ -3572,6 +3572,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-custom-fonts"
+version = "0.1.0"
+dependencies = [
+ "image 0.25.10",
+ "kurbo",
+ "ms-text-render",
+ "rayon",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "ttf-parser 0.25.1",
+]
+
+[[package]]
 name = "ms-docstore"
 version = "0.1.0"
 dependencies = [
@@ -4111,6 +4125,7 @@ dependencies = [
  "image 0.25.10",
  "ms-canvas",
  "ms-config",
+ "ms-custom-fonts",
  "ms-docstore",
  "ms-fonts",
  "ms-gifs",
@@ -4137,6 +4152,7 @@ dependencies = [
  "sha2",
  "swash",
  "thiserror 2.0.18",
+ "ttf-parser 0.25.1",
  "uuid",
  "web-time",
 ]

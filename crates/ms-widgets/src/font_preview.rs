@@ -13,10 +13,14 @@ Key functions:
   `(font identity, content hash, face_index)`.
 - `is_font_family_bound`: whether an egui family is already registered in a context.
 - `request_font_family`: the whole preview lifecycle in one call — bound / loading /
-  unavailable.
+  unavailable — for a font FILE.
+- `request_font_family_from_bytes`: the same lifecycle for bytes already held in memory
+  (a compiled custom font face); the copy egui needs is made on a reader worker.
 
 Key structures:
 - `PreviewFontFamily`: the three states a preview font can be in for one frame.
+- `SharedFontBytes`: the shared in-memory font buffer type (same shape as the renderer's
+  `FontBytes`).
 - `PreviewFontLoader` (private): the process-global queue of preview font reads.
 
 Notes:
@@ -36,7 +40,9 @@ would draw one typeface while the renderer drew another.
 
 THE FILE IS NEVER READ ON THE GUI THREAD (`CLAUDE.md` §5). `request_font_family` hands
 the read to a process-global loader with a bounded number of worker threads and returns
-`Pending`; the caller draws in the default UI font for those frames and a repaint is
+`Pending`; `request_font_family_from_bytes` hands it the shared buffer instead, and the
+reader copies it into the owned `Vec` egui's `FontData` needs (a full CJK face is tens of
+megabytes, so even that copy stays off the GUI thread); the caller draws in the default UI font for those frames and a repaint is
 requested, so the preview appears by itself. Only `Context::add_font` — which needs the
 `Context` and therefore the GUI thread — runs here, and egui applies it at the start of
 the NEXT pass, so even a successful registration is `Pending` for one more frame. This
@@ -56,7 +62,68 @@ use ms_thread as thread;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+/// A font buffer already held in memory and shared by `Arc` — the same shape as the
+/// renderer's `FontBytes`, so a compiled face can be handed over without conversion.
+pub type SharedFontBytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
+
+/// Where a queued preview read takes its bytes from (owned, moved into the queue).
+enum PreviewByteSource {
+    /// Read this font file.
+    File(PathBuf),
+    /// Copy this shared in-memory buffer.
+    Shared(SharedFontBytes),
+}
+
+impl PreviewByteSource {
+    /// Human-readable origin for log lines (never the bytes themselves).
+    fn describe(&self) -> String {
+        match self {
+            Self::File(path) => format!("path '{}'", path.display()),
+            Self::Shared(bytes) => format!("in-memory face of {} bytes", (**bytes).as_ref().len()),
+        }
+    }
+
+    /// Produces the owned bytes egui needs. Runs on a reader worker only.
+    fn read(&self) -> std::io::Result<Vec<u8>> {
+        match self {
+            Self::File(path) => std::fs::read(path),
+            Self::Shared(bytes) => Ok((**bytes).as_ref().to_vec()),
+        }
+    }
+}
+
+/// Hand-written: the shared buffer is an erased `dyn AsRef<[u8]>` and must never be dumped
+/// into a log line anyway (`CLAUDE.md` §8).
+impl std::fmt::Debug for PreviewByteSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.describe())
+    }
+}
+
+/// Borrowed form of [`PreviewByteSource`] for the per-frame request path: converted to the
+/// owned form only when a read is actually queued.
+#[derive(Clone, Copy)]
+enum PreviewByteSourceRef<'a> {
+    File(&'a Path),
+    Shared(&'a SharedFontBytes),
+}
+
+impl PreviewByteSourceRef<'_> {
+    /// The owned source to queue.
+    fn to_owned_source(self) -> PreviewByteSource {
+        match self {
+            Self::File(path) => PreviewByteSource::File(path.to_path_buf()),
+            Self::Shared(bytes) => PreviewByteSource::Shared(Arc::clone(bytes)),
+        }
+    }
+
+    /// Human-readable origin for log lines.
+    fn describe(self) -> String {
+        self.to_owned_source().describe()
+    }
+}
 
 /// How many preview font files may be waiting for their bytes (being read, or read and
 /// not yet registered) at once.
@@ -117,7 +184,7 @@ enum PreviewLoad {
     Ready(Vec<u8>),
     /// The file could not be read. Process-global: a file that cannot be read cannot be
     /// read for any context either, and a font whose FILE is replaced gets a new family
-    /// name and is therefore tried again.
+    /// name and is therefore tried again. (An in-memory source cannot fail to read.)
     Failed,
 }
 
@@ -139,8 +206,8 @@ struct PreviewFontLoader {
 struct LoaderState {
     /// egui family name -> what is happening to that font.
     loads: HashMap<String, PreviewLoad>,
-    /// Not-yet-read jobs, in request order: `(family name, font file path)`.
-    queue: VecDeque<(String, PathBuf)>,
+    /// Not-yet-read jobs, in request order: `(family name, byte source)`.
+    queue: VecDeque<(String, PreviewByteSource)>,
     /// Names of the `Ready` entries, oldest first.
     ///
     /// It exists so the cap can EVICT rather than refuse: a row scrolled out of view
@@ -272,6 +339,35 @@ pub fn request_font_family(
     font_path: &Path,
     face_index: usize,
 ) -> PreviewFontFamily {
+    request_family_from(ctx, font_identity, content_hash, face_index, PreviewByteSourceRef::File(font_path))
+}
+
+/// [`request_font_family`] for a font whose bytes are ALREADY in memory (a compiled custom
+/// font face), with the same lifecycle, naming and failure memo.
+///
+/// `content_hash` must change whenever the bytes behind `font_identity` change (for a
+/// compiled face: derived from its recipe key), exactly as for a file. The buffer is cloned
+/// by `Arc` here; the owned copy egui's `FontData` needs is made on a loader worker, never
+/// on the calling (GUI) thread. Call from the GUI thread inside a frame.
+#[must_use]
+pub fn request_font_family_from_bytes(
+    ctx: &egui::Context,
+    font_identity: &str,
+    content_hash: u64,
+    face_index: usize,
+    bytes: &SharedFontBytes,
+) -> PreviewFontFamily {
+    request_family_from(ctx, font_identity, content_hash, face_index, PreviewByteSourceRef::Shared(bytes))
+}
+
+/// The shared body of both public request functions.
+fn request_family_from(
+    ctx: &egui::Context,
+    font_identity: &str,
+    content_hash: u64,
+    face_index: usize,
+    source: PreviewByteSourceRef<'_>,
+) -> PreviewFontFamily {
     let font_name = combo_font_family_name(font_identity, content_hash, face_index);
     let family = egui::FontFamily::Name(font_name.clone().into());
     if is_font_family_bound(ctx, &family) {
@@ -289,14 +385,14 @@ pub fn request_font_family(
         runtime_log::log_warn(format!(
             "widgets::font_preview: egui did not bind the preview font family after \
              registration; the name is shown in the interface font instead. \
-             Font: '{font_identity}' Path: '{}' Face index: {face_index}. \
-             Likely cause: the file is not a font egui can parse.",
-            font_path.display()
+             Font: '{font_identity}' Source: {} Face index: {face_index}. \
+             Likely cause: the data is not a font egui can parse.",
+            source.describe()
         ));
         return PreviewFontFamily::Unavailable;
     }
 
-    match take_or_request_bytes(&font_name, font_path) {
+    match take_or_request_bytes(&font_name, source) {
         PreviewBytes::Pending => {
             // The bytes arrive on a worker thread, which schedules no frame of its own.
             ctx.request_repaint();
@@ -353,12 +449,12 @@ enum PreviewBytes {
     Unavailable,
 }
 
-/// Consumes the loaded bytes of `font_name`, or queues the read of `font_path`.
+/// Consumes the loaded bytes of `font_name`, or queues the read of `source`.
 ///
 /// Taking the bytes REMOVES the entry in the same locked step, so two call sites drawing
 /// the same font in one frame cannot both get them (the second is answered `Pending` and
 /// finds the family bound on the next pass).
-fn take_or_request_bytes(font_name: &str, font_path: &Path) -> PreviewBytes {
+fn take_or_request_bytes(font_name: &str, source: PreviewByteSourceRef<'_>) -> PreviewBytes {
     let loader = loader();
     let mut guard = lock_loader(loader);
     let state = &mut *guard;
@@ -393,7 +489,7 @@ fn take_or_request_bytes(font_name: &str, font_path: &Path) -> PreviewBytes {
     state.pending += 1;
     state
         .queue
-        .push_back((font_name.to_string(), font_path.to_path_buf()));
+        .push_back((font_name.to_string(), source.to_owned_source()));
     spawn_readers_if_needed(state);
     PreviewBytes::Pending
 }
@@ -431,8 +527,8 @@ fn spawn_readers_if_needed(state: &mut LoaderState) {
     }
 }
 
-/// Reader-thread body: drains the loader queue, reading one font file at a time, and
-/// exits when the queue is empty.
+/// Reader-thread body: drains the loader queue, reading one font file (or copying one
+/// shared buffer) at a time, and exits when the queue is empty.
 ///
 /// The file read happens with the lock RELEASED, so a slow or network-backed font file
 /// blocks neither the GUI thread nor the other reader.
@@ -449,8 +545,8 @@ fn read_queued_fonts() {
                 }
             }
         };
-        let (font_name, path) = job;
-        let result = std::fs::read(&path);
+        let (font_name, source) = job;
+        let result = source.read();
         #[cfg(test)]
         record_read_thread();
         let mut guard = lock_loader(loader);
@@ -467,8 +563,8 @@ fn read_queued_fonts() {
                 runtime_log::log_warn(format!(
                     "widgets::font_preview: cannot read a font file for its own-typeface \
                      preview; the name is shown in the interface font instead. \
-                     Path: '{}' Error: {error}. Reported once per font.",
-                    path.display()
+                     Source: {} Error: {error}. Reported once per font.",
+                    source.describe()
                 ));
             }
         }
@@ -601,7 +697,7 @@ mod tests {
         let family = unique_family_name("off-thread");
 
         // The very first request must NOT read anything here: it queues the read.
-        let first = take_or_request_bytes(&family, &path);
+        let first = take_or_request_bytes(&family, PreviewByteSourceRef::File(&path));
         assert!(
             matches!(first, PreviewBytes::Pending),
             "the first request must be answered without reading the file"
@@ -612,7 +708,7 @@ mod tests {
         );
 
         assert!(wait_until_settled(&family), "the loader must settle");
-        match take_or_request_bytes(&family, &path) {
+        match take_or_request_bytes(&family, PreviewByteSourceRef::File(&path)) {
             PreviewBytes::Ready(bytes) => assert_eq!(
                 bytes, b"not a real font, but readable bytes",
                 "the worker must hand back the file's bytes"
@@ -637,13 +733,13 @@ mod tests {
         let path = Path::new("/definitely/not/a/font/dir/preview-ghost.ttf");
 
         assert!(matches!(
-            take_or_request_bytes(&family, path),
+            take_or_request_bytes(&family, PreviewByteSourceRef::File(path)),
             PreviewBytes::Pending
         ));
         assert!(wait_until_settled(&family), "the loader must settle");
         assert!(
             matches!(
-                take_or_request_bytes(&family, path),
+                take_or_request_bytes(&family, PreviewByteSourceRef::File(path)),
                 PreviewBytes::Unavailable
             ),
             "an unreadable file must be reported as unavailable, not retried"
@@ -662,12 +758,12 @@ mod tests {
         let family = unique_family_name("two-contexts");
 
         assert!(matches!(
-            take_or_request_bytes(&family, &path),
+            take_or_request_bytes(&family, PreviewByteSourceRef::File(&path)),
             PreviewBytes::Pending
         ));
         assert!(wait_until_settled(&family), "the loader must settle");
         assert!(matches!(
-            take_or_request_bytes(&family, &path),
+            take_or_request_bytes(&family, PreviewByteSourceRef::File(&path)),
             PreviewBytes::Ready(_)
         ));
 
@@ -677,7 +773,7 @@ mod tests {
         );
         assert!(
             matches!(
-                take_or_request_bytes(&family, &path),
+                take_or_request_bytes(&family, PreviewByteSourceRef::File(&path)),
                 PreviewBytes::Pending
             ),
             "a context that has not registered this family yet must get the bytes again"
@@ -699,7 +795,7 @@ mod tests {
         for idx in 0..(MAX_PENDING_PREVIEW_LOADS * 2) {
             let family = combo_font_family_name(&format!("font-preview-test-cap-{idx}"), 1, 0);
             assert!(
-                matches!(take_or_request_bytes(&family, &path), PreviewBytes::Pending),
+                matches!(take_or_request_bytes(&family, PreviewByteSourceRef::File(&path)), PreviewBytes::Pending),
                 "a first request is always queued"
             );
             assert!(wait_until_settled(&family), "the loader must settle");
@@ -708,19 +804,50 @@ mod tests {
         // A fresh request must still go through and still deliver its bytes.
         let family = unique_family_name("cap-after");
         assert!(matches!(
-            take_or_request_bytes(&family, &path),
+            take_or_request_bytes(&family, PreviewByteSourceRef::File(&path)),
             PreviewBytes::Pending
         ));
         assert!(wait_until_settled(&family), "the loader must settle");
         assert!(
             matches!(
-                take_or_request_bytes(&family, &path),
+                take_or_request_bytes(&family, PreviewByteSourceRef::File(&path)),
                 PreviewBytes::Ready(_)
             ),
             "the loader must still serve requests after the cap has been reached"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An in-memory face (a compiled custom font) goes through the same queue: the first
+    /// request is answered `Pending` without copying anything on the calling thread, and
+    /// the reader worker hands back an owned copy of exactly those bytes.
+    #[test]
+    fn shared_bytes_are_copied_on_a_worker_and_delivered() {
+        let _serialized = loader_test_lock();
+        let identity = unique_identity("shared-bytes");
+        let bytes: SharedFontBytes = Arc::new(b"an in-memory face".to_vec());
+
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput::default());
+        let outcome = request_font_family_from_bytes(&ctx, &identity, 0xdead_beef, 0, &bytes);
+        ctx.end_pass().drop_without_applying_deltas();
+        assert!(
+            matches!(outcome, PreviewFontFamily::Pending),
+            "an unbound in-memory face must be reported as pending"
+        );
+
+        let family = combo_font_family_name(&identity, 0xdead_beef, 0);
+        assert!(wait_until_settled(&family), "the loader must settle");
+        match take_or_request_bytes(&family, PreviewByteSourceRef::Shared(&bytes)) {
+            PreviewBytes::Ready(copy) => assert_eq!(copy, b"an in-memory face"),
+            PreviewBytes::Pending => panic!("the queued copy must have produced bytes"),
+            PreviewBytes::Unavailable => panic!("an in-memory source cannot fail"),
+        }
+        assert!(
+            !read_on_this_thread(),
+            "the shared buffer must be copied on a worker, never on the calling thread"
+        );
     }
 
     /// Two entries that differ ONLY in their content hash must never share one

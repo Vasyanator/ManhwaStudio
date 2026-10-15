@@ -47,7 +47,12 @@ Main responsibilities:
   returning just the confirmed identity plus the file path.
 - offer the bundled `fonts/ui` stack as ONE selectable font of the PANEL list
   (`BUNDLED_UI_FONT_IDENTITY`, `bundled_ui_font_entry`, `prepend_bundled_ui_font`);
-  see "Built-in interface font" in `MODULE_README.md` for the full contract.
+  see "Built-in interface font" in `MODULE_README.md` for the full contract;
+- append the SAVED custom fonts at the end of the combined list build and put the panel's
+  synthetic entries (bundled + ad-hoc custom) in front of a panel list
+  (`prepend_synthetic_entries`); the custom entries themselves are built by
+  `custom_font_entry.rs`. Keeps user fonts out of the reserved `MSCustom…` namespace
+  (`is_reserved_identity`).
 
 Notes:
 Extracted verbatim from panel.rs. Free fns are pub(super) so panel.rs can use
@@ -266,6 +271,16 @@ pub(crate) const BUNDLED_UI_FONT_IDENTITY: &str = "ManhwaStudio-UI";
 /// `tab/codec::upgrade_text_params_to_v2`.
 pub(crate) const BUNDLED_UI_FONT_LEGACY_IDENTITY: &str = "ManhwaStudio UI";
 
+/// Whether `name` is reserved for a synthetic entry: the bundled-UI identity in either
+/// spelling, or anything in the custom-font namespace (`MSCustom…`,
+/// `custom_fonts::identity::is_reserved_custom_identity`). A user font claiming such a
+/// name is suffixed by `assign_font_identity_names` and never becomes a resolution alias
+/// under it.
+#[must_use]
+pub(crate) fn is_reserved_identity(name: &str) -> bool {
+    is_reserved_bundled_identity(name) || crate::custom_fonts::identity::is_reserved_custom_identity(name)
+}
+
 /// Whether `name` claims the reserved bundled-UI identity in EITHER spelling
 /// (case-insensitively). Used to keep a user font from taking the reserved name.
 ///
@@ -420,10 +435,12 @@ fn font_claims_name_in_any_form(font: &FontEntry, name_norm: &str) -> bool {
 ///   added or removed, and the bare name stays a resolution alias for the lowest-hash
 ///   claimant (`TabFontProvider::from_fonts`). Logged once per contested name, listing
 ///   the files.
-/// - **Reserved name.** A user font claiming `BUNDLED_UI_FONT_IDENTITY` or
-///   `BUNDLED_UI_FONT_LEGACY_IDENTITY` is suffixed unconditionally, so the reserved name
-///   can never resolve to a user font — not even in a build where the bundled stack is
-///   unavailable and nothing would shadow it.
+/// - **Reserved name.** A user font claiming `BUNDLED_UI_FONT_IDENTITY`,
+///   `BUNDLED_UI_FONT_LEGACY_IDENTITY` or any name of the custom-font namespace
+///   (`MSCustom…`, see [`is_reserved_identity`]) is suffixed unconditionally, so the
+///   reserved name can never resolve to a user font — not even in a build where the
+///   bundled stack is unavailable, or a saved custom font is unavailable, and nothing
+///   would shadow it.
 /// - **Base carrying the separator.** Only reachable through the family-or-label
 ///   FALLBACK (a valid PostScript name cannot contain `IDENTITY_HASH_SEPARATOR`), e.g. a
 ///   broken file whose family name literally reads `"Acme%1122334455667788"`. Suffixing
@@ -434,16 +451,16 @@ fn font_claims_name_in_any_form(font: &FontEntry, name_norm: &str) -> bool {
 /// Idempotent: recomputes purely from `post_script_name`/`original_name`/`label` and the
 /// content hashes, so calling it again on an already-assigned list is a no-op.
 ///
-/// The synthetic bundled-stack entry is skipped ENTIRELY — it neither receives an
-/// identity here (its reserved one is fixed, `BUNDLED_UI_FONT_IDENTITY`) nor counts as a
-/// claimant of any name.
+/// The synthetic bundled-stack entry and every custom-font entry are skipped ENTIRELY —
+/// they neither receive an identity here (theirs are fixed at construction) nor count as
+/// claimants of any name.
 pub(super) fn assign_font_identity_names(fonts: &mut [FontEntry]) {
     // Base (unsuffixed) identity per entry, in list order. `None` marks the synthetic
     // bundled entry, whose reserved identity is fixed at construction.
     let bases: Vec<Option<String>> = fonts
         .iter()
         .map(|font| {
-            if font.bundled_stack_font().is_some() {
+            if font.bundled_stack_font().is_some() || font.custom_font().is_some() {
                 None
             } else {
                 Some(font.base_identity_name())
@@ -506,12 +523,13 @@ pub(super) fn assign_font_identity_names(fonts: &mut [FontEntry]) {
             // Reserved identity: fixed at construction, never recomputed.
             continue;
         };
-        let reserved = is_reserved_bundled_identity(base);
+        let reserved = is_reserved_identity(base);
         if reserved {
             ms_log::runtime_log::log_warn(format!(
-                "typing fonts: '{}' ({}) claims the reserved built-in-interface-font name \
-                 '{base}'; it is given a content-hash-suffixed identity instead, so the \
-                 reserved name keeps resolving to the built-in entry only.",
+                "typing fonts: '{}' ({}) claims the name '{base}', which is reserved for the \
+                 built-in interface font or for custom fonts; it is given a \
+                 content-hash-suffixed identity instead, so the reserved name never \
+                 resolves to this font.",
                 font.label,
                 font.path.display()
             ));
@@ -782,8 +800,25 @@ pub(super) fn load_fonts(fonts_dir: &Path, imported_system_paths: &[PathBuf]) ->
             .filter(|reference| reference.last_path.is_none()),
     );
     let mut entries = build_combined_font_list(fonts_dir, &refs).entries;
-    prepend_bundled_ui_font(&mut entries);
+    // The panel list is the first place every saved custom font's key is known: prune the
+    // disk cache of faces nothing references any more (once per process, on a worker).
+    let referenced: HashSet<RecipeKey> = entries
+        .iter()
+        .filter_map(|entry| entry.custom_font().and_then(|custom| custom.saved_key()))
+        .collect();
+    crate::custom_fonts::service::service().start_disk_prune_once(referenced);
+    prepend_synthetic_entries(&mut entries);
     entries
+}
+
+/// Puts the PANEL-ONLY synthetic entries in front of a finalized panel list: the bundled
+/// interface font at index 0 (`prepend_bundled_ui_font`, whose position is a contract),
+/// then the ad-hoc custom entry right after it (at index 0 when the bundle is
+/// unavailable). Both are panel-only: the settings font administration never lists them.
+pub(super) fn prepend_synthetic_entries(entries: &mut Vec<FontEntry>) {
+    prepend_bundled_ui_font(entries);
+    let position = usize::from(entries.first().is_some_and(|entry| entry.bundled_stack_font().is_some()));
+    entries.insert(position, super::custom_font_entry::adhoc_custom_font_entry());
 }
 
 /// The COMBINED font list — folder fonts and imported system fonts merged, sorted and
@@ -797,12 +832,15 @@ pub(super) fn load_fonts(fonts_dir: &Path, imported_system_paths: &[PathBuf]) ->
 /// did nothing.
 pub(crate) struct CombinedFontList {
     /// Merged, sorted, identity-assigned entries with display-name overrides and custom
-    /// kerning applied. Does NOT include the synthetic bundled-UI entry — that belongs to the
-    /// PANEL list only and is prepended by `load_fonts`.
+    /// kerning applied, plus the AVAILABLE saved custom fonts merged in by label. Does NOT
+    /// include the synthetic bundled-UI or ad-hoc custom entries — they belong to the PANEL
+    /// list only and are prepended by `load_fonts`.
     pub entries: Vec<FontEntry>,
     /// One row per entry of `fonts_data.json`'s `system_fonts`, in stored order, INCLUDING
     /// the ones that could not be loaded this run.
     pub imported_rows: Vec<ImportedSystemFontRow>,
+    /// One row per saved custom font, in identity order, INCLUDING the unavailable ones.
+    pub custom_rows: Vec<super::custom_font_entry::CustomFontRow>,
 }
 
 /// Why an imported system font recorded in `fonts_data.json` could not be loaded this run.
@@ -903,9 +941,19 @@ pub(crate) fn build_combined_font_list(
     apply_display_name_overrides(&mut entries);
     apply_custom_kerning(&mut entries);
     relink_imported_rows(&mut imported_rows, &entries);
+    // Saved custom fonts LAST: their sources are the finalized real fonts (identities,
+    // kerning) plus the bundled entry, and they never take part in the merge, the
+    // renumbering or the identity pass above (their identity is minted, not derived).
+    let (custom_entries, custom_rows) =
+        super::custom_font_entry::build_custom_font_entries(&entries, &font_settings_store::custom_fonts());
+    entries.extend(custom_entries);
+    // Stable and keyed exactly like the sort above, so the real fonts keep their order and
+    // each custom font lands among them by its label.
+    entries.sort_by_key(|font| font.label.to_lowercase());
     CombinedFontList {
         entries,
         imported_rows,
+        custom_rows,
     }
 }
 
@@ -2324,13 +2372,19 @@ pub(super) fn resolve_contested_catalog_content_hashes(entries: &mut [FontEntry]
             let Some(entry) = entries.get_mut(idx) else {
                 continue;
             };
-            match std::fs::read(&entry.path) {
+            let path = match entry.byte_source() {
+                FontByteSource::File(path) => path.to_path_buf(),
+                // The picker catalog lists installed files only; the built-in entry and
+                // custom fonts are never part of it and carry no file content hash.
+                FontByteSource::Bundled(_) | FontByteSource::Custom(_) => continue,
+            };
+            match std::fs::read(&path) {
                 Ok(bytes) => entry.content_hash = font_content_hash(&bytes),
                 Err(error) => ms_log::runtime_log::log_warn(format!(
                     "typing fonts: cannot read a system font file to tell two files claiming \
                      one name apart; the import picker may preview both rows in the same \
                      typeface. Identity: '{identity}' Path: '{}' Error: {error}",
-                    entry.path.display()
+                    path.display()
                 )),
             }
         }
@@ -2399,10 +2453,34 @@ pub(super) fn collect_font_files_recursive(root_dir: &Path, dir: &Path, out: &mu
     }
 }
 
+/// `true` for a top-level directory of the app fonts folder that holds no user fonts and must
+/// not be scanned (case-insensitive): `ui/` (the bundled interface stack, listed separately)
+/// and `custom_cache/` (compiled custom faces, `custom_fonts::disk_cache` — listing them would
+/// turn every cached face into a folder font). Deeper directories of the same name are scanned.
 pub(super) fn should_skip_font_dir(root_dir: &Path, dir: &Path) -> bool {
     dir.strip_prefix(root_dir)
         .ok()
         .and_then(|relative| relative.components().next())
         .and_then(|component| component.as_os_str().to_str())
-        .is_some_and(|component| component.eq_ignore_ascii_case("ui"))
+        .is_some_and(|component| {
+            component.eq_ignore_ascii_case("ui") || component.eq_ignore_ascii_case(crate::custom_fonts::disk_cache::CACHE_DIR_NAME)
+        })
+}
+
+#[cfg(test)]
+mod skip_font_dir_tests {
+    use super::should_skip_font_dir;
+    use std::path::Path;
+
+    #[test]
+    fn skips_only_the_reserved_top_level_dirs() {
+        let root = Path::new("/home/u/app/fonts");
+        assert!(should_skip_font_dir(root, &root.join("ui")));
+        assert!(should_skip_font_dir(root, &root.join("UI").join("core")));
+        assert!(should_skip_font_dir(root, &root.join("custom_cache")));
+        assert!(should_skip_font_dir(root, &root.join("Custom_Cache")));
+        assert!(!should_skip_font_dir(root, &root.join("groups").join("custom_cache")));
+        assert!(!should_skip_font_dir(root, &root.join("comic")));
+        assert!(!should_skip_font_dir(root, Path::new("/elsewhere/custom_cache")));
+    }
 }

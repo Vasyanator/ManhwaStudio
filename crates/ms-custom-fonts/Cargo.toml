@@ -1,0 +1,32 @@
+[package]
+name = "ms-custom-fonts"
+version = "0.1.0"
+edition = "2024"
+
+# Custom font recipes and their compiler: what a custom font recipe is (kind-tagged, the
+# hybrid kind implemented), its cache key, and how it compiles into an in-memory TrueType
+# face (source reading, unit normalization, outline blending, metrics, kerning, sfnt writer).
+# GUI-free, no i18n, no I/O: bytes in, bytes out. Callers own threads, caches and messages.
+
+[dependencies]
+# Outline fitting of the re-traced distance-field contours and cubic -> quadratic conversion.
+# Used by this crate only, so it stays local (workspace table rule); the version is the one
+# epaint already locks (0.13.1), so it adds no second copy.
+kurbo = "0.13"
+# Per-glyph blending runs on the caller's rayon pool.
+rayon.workspace = true
+# Recipe JSON (canonical form) is read and written over `serde_json::Value`.
+serde_json.workspace = true
+# Recipe key and source digests (SHA-256, stable across machines and Rust releases).
+sha2.workspace = true
+# Typed `RecipeError` / `CompileError`.
+thiserror.workspace = true
+# Source font reader (cmap, outlines incl. CFF and composites, metrics, `kern`). The GPOS
+# pair-kerning reader needs `opentype-layout`, which the workspace entry leaves off.
+ttf-parser = { workspace = true, features = ["opentype-layout"] }
+
+[dev-dependencies]
+# Tests and the gallery example load the compiled face through the production loader.
+ms-text-render = { path = "../ms-text-render" }
+# `examples/hybrid_gallery.rs`: PNG output.
+image.workspace = true

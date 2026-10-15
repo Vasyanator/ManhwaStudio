@@ -7,6 +7,11 @@ FILE HEADER (crates/ms-tab-typing/src/lib.rs)
   `studio.rs`, который зовёт `TypingTabState::draw`. Крейт не имеет права называть
   `studio`, `launcher` или другую вкладку.
 - Содержимое:
+  - `custom_fonts`: runtime side of custom (hybrid) fonts — identity namespace, compile
+    service (memory LRU + `fonts/custom_cache/` disk cache), ad-hoc recipe interner.
+  - `hybrid_editor`: the shared hybrid-font editor widget (draft, live subset preview,
+    coverage, full-face commit), hosted by the typing dock and Settings › Тайп through
+    `font_admin`.
   - `auto_typing`: алгоритм авто-тайпа (оптический центр оверлея + поиск пузыря по
     composited-странице `src + clean overlay` из shared cache).
   - `tab`: основное состояние вкладки и логика работы с `CanvasView`/оверлеями.
@@ -32,6 +37,13 @@ FILE HEADER (crates/ms-tab-typing/src/lib.rs)
 extern crate ms_i18n;
 
 mod auto_typing;
+// Custom fonts (recipes compiled by `ms-custom-fonts`): identity namespace, compile service,
+// disk cache, ad-hoc interner. Used by the font list, provider, previews, settings and the
+// hybrid editor.
+mod custom_fonts;
+// The shared hybrid-font editor widget; reached from outside the crate only through
+// `font_admin` (re-exports), from the typing dock directly.
+mod hybrid_editor;
 // The ONLY sanctioned entry point for non-typing code into font administration
 // (loaders, imported-fonts store, display-name overrides, the `FontEntry` type). The
 // settings font-settings UI (`src/tabs/settings/typesetting/`) imports this and nothing

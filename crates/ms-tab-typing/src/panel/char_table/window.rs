@@ -40,9 +40,7 @@ use super::{CharTableState, FAVORITES_TAB_KEY, MAX_CELL_FONT_SIZE, MIN_CELL_FONT
 use crate::panel::FontEntry;
 use crate::panel::fonts::BUNDLED_UI_FONT_IDENTITY;
 use ms_widgets::WheelSlider;
-use ms_widgets::{
-    PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
-};
+use ms_widgets::{PreviewFontFamily, combo_font_family_name, is_font_family_bound};
 use eframe::egui;
 
 /// Stable window identity. A literal persistence key (window position/size), not
@@ -680,8 +678,9 @@ fn variant_font_family(
 ) -> egui::FontFamily {
     // The identity names the font (and keys the egui family); the content hash pins WHICH
     // bytes that name stood for, so a replaced file is not drawn from the stale
-    // registration; the path is only where the bytes are read from on first registration.
-    let path = font.path();
+    // registration; the preview source is only where the bytes come from on first
+    // registration (a file, a compiled custom face, or none).
+    let preview = font.byte_source().preview_source();
     let identity = font.render_identity_name();
     let content_hash = font.content_hash();
     let face_index = font.representative_face_index();
@@ -697,7 +696,7 @@ fn variant_font_family(
     }
     budget.remaining -= 1;
 
-    match request_font_family(ctx, &identity, content_hash, path, face_index) {
+    match preview.request_family(ctx, &identity, content_hash, face_index) {
         PreviewFontFamily::Ready(family) => family,
         PreviewFontFamily::Pending => {
             budget.outstanding = true;

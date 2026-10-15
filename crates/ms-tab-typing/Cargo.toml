@@ -51,6 +51,12 @@ ms-text-render = { path = "../ms-text-render" }
 # Text segmentation (re-exported as `segmentation`), the typesetting-language model and
 # hanging-punctuation policy.
 ms-text-util = { path = "../ms-text-util" }
+# Custom font recipes and their compiler (`custom_fonts/`: compile service, disk cache, ad-hoc
+# render names). GUI-free and below this crate (level of `ms-text-render`).
+ms-custom-fonts = { path = "../ms-custom-fonts" }
+# Validation of a cached compiled face read back from `fonts/custom_cache/` (parses, names
+# the expected PostScript name) before it is trusted.
+ttf-parser.workspace = true
 # The bundled UI font stack consulted by the font administration layer.
 ms-fonts = { path = "../ms-fonts" }
 # Animated WebP hints shown by the panel's help rows.

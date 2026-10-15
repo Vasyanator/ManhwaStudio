@@ -11,7 +11,9 @@ Main responsibilities:
 - serialize and apply shape / formula / drawn-lines layout parameters;
 - store the current font profile in per-font memory and react to a font selection
   change (which is a no-op for the per-font memory in local-preset mode, where the
-  font is an ordinary parameter — see `local_presets.rs`).
+  font is an ordinary parameter — see `local_presets.rs` — and for the ad-hoc custom
+  font entry in either mode);
+- snapshot the real fonts' PostScript names for the PSD export (custom fonts excluded).
 
 Notes:
 `use super::*;` pulls in the parent module's types and imports. Methods are
@@ -47,39 +49,55 @@ impl TypingCreatePanelState {
     /// Profile JSON of the font at `font_idx` in the CURRENT schema, carrying that font's
     /// IDENTITY (`FontEntry::render_identity_name`) under `font`. An out-of-range index
     /// yields a payload with no font key — the profile is still usable for parameters.
+    /// For the ad-hoc custom entry the panel's recipe travels along under `font_recipe`
+    /// (`selected_font_ref` rule), which is how a LOCAL preset snapshot keeps it.
     pub(super) fn build_font_profile_json_for_idx(&self, font_idx: usize) -> Value {
         // Schema 2 stores ONE font key: the identity (the representative face's
         // PostScript name, `%hash`-suffixed only on a same-name/different-bytes
         // contest). Path, label, family name are neither written nor read here any
         // more; they survive only as the codec's legacy READ chain for schema-1
         // documents (`dev-docs/font_identity_postscript_plan.md` phase 3).
-        let font_identity = self.fonts.get(font_idx).map(FontEntry::render_identity_name);
-        self.build_render_data_json_with_font(self.text.clone(), self.width_px.max(1), font_identity)
+        let font_ref = self.fonts.get(font_idx).map(|font| self.custom_font.font_ref(font));
+        let (font_identity, font_recipe) = match font_ref {
+            Some(font_ref) => (Some(font_ref.identity), font_ref.recipe),
+            None => (None, None),
+        };
+        self.build_render_data_json_with_font_recipe(
+            self.text.clone(),
+            self.width_px.max(1),
+            font_identity,
+            font_recipe.as_deref(),
+        )
     }
 
     /// Full render-data JSON for the CURRENTLY selected font, or `None` when the panel
-    /// has no font selected (an empty font list).
+    /// has no font selected (an empty font list). The ad-hoc custom entry persists its
+    /// reserved identity plus the recipe under `font_recipe` (`selected_font_ref`).
     pub(super) fn build_render_data_json_for(&self, text: String, width_px: u32) -> Option<Value> {
-        let font = self.fonts.get(self.selected_font_idx)?;
-        Some(self.build_render_data_json_with_font(
+        let font_ref = self.selected_font_ref()?;
+        Some(self.build_render_data_json_with_font_recipe(
             text,
             width_px.max(1),
-            Some(font.render_identity_name()),
+            Some(font_ref.identity),
+            font_ref.recipe.as_deref(),
         ))
     }
 
     /// Builds the overlay's `render_data` in the CURRENT `text_params` schema.
     ///
     /// `font_identity` is the font's render identity (`FontEntry::render_identity_name`)
-    /// or `None` when no font is selected. The parameter object is assembled in full and
-    /// then handed to [`text_params_schema::write_text_params`], which stamps the schema
-    /// version and drops every value equal to its frozen default — so this function must
-    /// keep listing EVERY key, defaults included. An empty effect list is omitted.
-    pub(super) fn build_render_data_json_with_font(
+    /// or `None` when no font is selected; `font_recipe` is the ad-hoc custom font recipe,
+    /// written under `text_params.font_recipe` (the schema writer keeps it only next to the
+    /// ad-hoc identity). The parameter object is assembled in full and then handed to
+    /// [`text_params_schema::write_text_params`], which stamps the schema version and drops
+    /// every value equal to its frozen default — so this function must keep listing EVERY
+    /// key, defaults included. An empty effect list is omitted.
+    pub(super) fn build_render_data_json_with_font_recipe(
         &self,
         text: String,
         width_px: u32,
         font_identity: Option<String>,
+        font_recipe: Option<&CustomFontRecipe>,
     ) -> Value {
         let mut text_params = json!({
                 "text": text,
@@ -173,6 +191,9 @@ impl TypingCreatePanelState {
         if let Some(identity) = font_identity {
             text_params_obj.insert("font".to_string(), Value::String(identity));
         }
+        if let Some(recipe) = font_recipe {
+            text_params_obj.insert(text_params_schema::FONT_RECIPE_KEY.to_string(), recipe.to_json());
+        }
         text_params_obj.insert("faux_bold".to_string(), json!(self.faux_bold));
         text_params_obj.insert("faux_bold_thicken_percent".to_string(), json!(self.faux_bold_thicken_percent));
         text_params_obj.insert("faux_bold_expand_percent".to_string(), json!(self.faux_bold_expand_percent));
@@ -206,9 +227,12 @@ impl TypingCreatePanelState {
     /// Faces are indexed by their POSITION in the font's face list, which is what
     /// `text_params.selected_face_index` stores. Cheap (one small string per face) and
     /// built off any font file access.
+    ///
+    /// Custom fonts are left out: their PostScript name is the COMPILED face's, which only
+    /// the export's own custom-font pass knows.
     pub(crate) fn font_post_script_names(&self) -> FontPostScriptNames {
         let mut index = FontPostScriptNames::default();
-        for font in &self.fonts {
+        for font in self.fonts.iter().filter(|font| !matches!(font.kind, FontEntryKind::Custom(_))) {
             index.insert_font(
                 &font.render_identity_name(),
                 font.faces
@@ -526,8 +550,12 @@ impl TypingCreatePanelState {
     /// to that preset's working set and the font's PERSISTED DEFAULT is left alone; without
     /// one, the parameters on screen are what this font should remember by itself. See
     /// [`DefaultProfileWrite`].
+    ///
+    /// Also a no-op for the AD-HOC custom entry: it has no per-font memory (it behaves like
+    /// local-preset mode, its parameters stay with the panel), so nothing is ever stored
+    /// under — or persisted for — its shared identity.
     pub(super) fn store_current_font_profile_by_idx(&mut self, idx: usize) {
-        if !self.preview_enabled {
+        if !self.preview_enabled || self.fonts.get(idx).is_some_and(FontEntry::is_adhoc_custom) {
             return;
         }
         let Some(identity) = self.font_identity_name_by_idx(idx) else {
@@ -570,10 +598,17 @@ impl TypingCreatePanelState {
     /// In [`ParamIdentityMode::LocalPreset`] mode the font is an ORDINARY PARAMETER of the
     /// selected local preset: nothing is stored per font and nothing is restored, the
     /// selection simply stands and the new font becomes part of the preset's snapshot.
+    ///
+    /// The AD-HOC custom entry behaves like local-preset mode in both modes: nothing is
+    /// stored for it when it is left and nothing restored when it is picked (a saved custom
+    /// font keeps per-font memory by its identity like any font).
     pub(super) fn handle_create_font_selection_change(&mut self, prev_font_idx: usize) -> bool {
         if !self.preview_enabled {
             return false;
         }
+        // A pick of the ad-hoc custom entry: its recipe may name sources this list lacks,
+        // so its block state is derived on the switch (the picker cleared `missing_font`).
+        self.refresh_adhoc_missing_font();
         if self.identity_mode == ParamIdentityMode::LocalPreset {
             // No per-font store, no per-font restore: only the face index has to follow the
             // new font, and the snapshot the local preset owns has to record the change.
@@ -597,6 +632,12 @@ impl TypingCreatePanelState {
         // that finds a session profile returns early and would mark nothing at all, leaving
         // the user with no unsaved-changes warning for a change the save really writes.
         self.mark_selected_global_preset_dirty();
+        if self.selected_font_is_adhoc() {
+            // The ad-hoc custom entry owns no per-font profile: like local-preset mode, the
+            // parameters on screen simply stand.
+            self.clamp_face_index();
+            return true;
+        }
         if let Some(profile) = self.font_profiles_by_identity.get(&new_identity).cloned() {
             self.apply_render_data_json_with_options(&profile, false);
             self.clamp_face_index();

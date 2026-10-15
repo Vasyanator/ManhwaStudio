@@ -117,6 +117,18 @@ FILE HEADER (tabs/typing/panel.rs)
     (`FontEntryKind::BundledUiStack`) — бандловый стек `fonts/ui` как обычный выбираемый
     шрифт. Единственный пункт с локализуемой ПОДПИСЬЮ и зарезервированной, НЕ
     локализуемой идентичностью; полный контракт — в `panel/MODULE_README.md`.
+  - Where a font's BYTES come from has ONE owner: `FontEntry::byte_source()` ->
+    `FontByteSource` (`File` | `Bundled` | `Custom`), matched exhaustively by every byte
+    reader; its `preview_source()` owns what an own-typeface preview draws from;
+    `FontEntry::file_path()` is for location questions only (`panel/MODULE_README.md`,
+    font model exposure).
+  - Custom fonts (`FontEntryKind::Custom` + `CustomFontRef`): saved recipes become list
+    entries at the end of the combined list build, the panel list also carries ONE ad-hoc
+    entry right after the bundled one (`panel/custom_font_entry.rs`); the panel's
+    identity / render name / recipe triple has one owner, `panel/custom_font_select.rs`.
+    When the ad-hoc entry is selected, a row under the font combo opens the «Гибридный
+    шрифт» dock tab (`panel/hybrid_dock.rs`), which edits that panel's ad-hoc recipe and
+    changes the layer only on «Применить».
 
 Module root note (EN):
 This file is the module root of the top panel. It keeps ALL struct/enum/const
@@ -132,6 +144,8 @@ private fields directly. See `MODULE_README.md` for the per-file editing map.
 use ms_config as config;
 use ms_log::trace::cat;
 use crate::auto_typing::TypingAutoTypingSettings;
+use crate::custom_fonts::sources::SourceResolver;
+use ms_custom_fonts::{CustomFontRecipe, RecipeKey};
 use crate::tab::TypingExportFormat;
 use crate::tab::input::TypingInputLabels;
 // Typed export destination/request of the «Действия» export block: the panel queues one of
@@ -252,6 +266,16 @@ use effect_cards::*;
 // the settings font-settings UI, which lives OUTSIDE typing; nothing here is `pub(crate)`.
 pub(crate) mod fonts;
 use fonts::*;
+// Custom fonts in the font model: saved / ad-hoc entries, the custom byte and preview
+// sources, the unavailable-row reasons.
+pub(crate) mod custom_font_entry;
+// The panel's ONE owner of "persisted identity vs render name vs ad-hoc recipe".
+mod custom_font_select;
+use custom_font_select::CustomFontSelection;
+// The «Гибридный шрифт» dock tab: the shared hybrid editor over the active panel's ad-hoc
+// recipe (`typing.hybrid_font`, declared in `tab.rs`).
+mod hybrid_dock;
+use hybrid_dock::HybridDockState;
 mod font_provider;
 use font_provider::TabFontProvider;
 mod presets_io;
@@ -528,6 +552,10 @@ struct TypingCreatePreset {
     /// preset was saved, or `None` for "no local preset selected". Validated against the
     /// length of `local_presets` on read: an out-of-range index decodes to `None`.
     selected_local_preset: Option<usize>,
+    /// The ad-hoc custom font recipe that travels with `font` when `font` is the ad-hoc
+    /// identity (`MSCustom-adhoc-hybrid`); `None` for every other font, and for an ad-hoc
+    /// preset whose recipe was never configured or could not be read.
+    font_recipe: Option<Arc<CustomFontRecipe>>,
 }
 
 #[derive(Clone)]
@@ -829,6 +857,11 @@ pub struct TypingTopPanelState {
     /// by the section that decides its visibility ([`TypingRightSectionActions::repaginate_block_drawn`]).
     /// Read only by [`TypingTopPanelState::expire_repaginate_pages_warning`].
     repaginate_block_drawn: bool,
+    /// «Положить рядом кастомные шрифты»: a PSD export also writes the compiled `.ttf` of every
+    /// custom font the chapter's text layers use next to the documents. Persisted in
+    /// `user_config.json` (`TextTab.psd_bundle_custom_fonts`, seeded and written by
+    /// `tab/studio_tab.rs`); default `false`.
+    psd_bundle_custom_fonts: bool,
     /// Comic type of the OPEN title, pushed in every frame by the tab
     /// (`set_export_context`). `None` while no title is open. Only the re-pagination
     /// defaults and the page-title warning read it.
@@ -878,6 +911,9 @@ pub struct TypingTopPanelState {
     /// they differ (see `facade.rs`). Seeded from the current language so the first
     /// frame never triggers a spurious reload.
     coverage_language: TextLanguage,
+    /// The «Гибридный шрифт» dock tab (`panel/hybrid_dock.rs`): open flag, the editor bound
+    /// to the active panel's ad-hoc recipe, its source catalog.
+    hybrid_dock: HybridDockState,
 }
 
 #[derive(Clone, Default)]
@@ -1048,6 +1084,7 @@ impl TypingTopPanelState {
             repaginate: TypingRepaginateSettings::default(),
             repaginate_pages_warning: false,
             repaginate_block_drawn: false,
+            psd_bundle_custom_fonts: false,
             export_comic_type: None,
             export_base_name: String::new(),
             pending_round_text_positions: false,
@@ -1066,6 +1103,7 @@ impl TypingTopPanelState {
             centering_assist_kind: CenteringAssistCenterKind::Mean,
             centering_show_center: true,
             coverage_language: text_language(),
+            hybrid_dock: HybridDockState::default(),
         }
     }
 }
@@ -1084,19 +1122,120 @@ enum TypingMainTab {
 
 /// What a `FontEntry` stands for.
 ///
-/// Almost every entry is a real font FILE. The one exception is the synthetic entry
-/// for the bundled `fonts/ui` stack (`dev-docs/unicode_base_font_plan.md`, phase 5):
-/// it is shown in the typing font combo as the "built-in interface font", points at
-/// the FIRST core file of the stack (so previews, the advanced-form metric and PSD
-/// export all have a real file to work with), and gets the rest of the stack behind
-/// it for free through the renderer's `common_fallback` chain.
-#[derive(Clone, Copy, Debug)]
+/// Almost every entry is a real font FILE. The exceptions are synthetic: the entry for
+/// the bundled `fonts/ui` stack (`dev-docs/unicode_base_font_plan.md`, phase 5), shown
+/// in the typing font combo as the "built-in interface font" and getting the rest of
+/// the stack behind it for free through the renderer's `common_fallback` chain; and the
+/// CUSTOM fonts (`dev-docs/hybrid_fonts_plan.md`): a saved custom font per stored recipe,
+/// plus the one panel-only ad-hoc entry whose recipe lives in the layer.
+#[derive(Clone, Debug)]
 pub enum FontEntryKind {
     /// A real font file: found in the project fonts dir or imported by the user.
     File,
     /// The synthetic bundled-stack entry, carrying the core font whose bytes
     /// `ms-fonts` already holds resident for the whole process.
     BundledUiStack(&'static ms_fonts::StackFont),
+    /// A custom font: a recipe compiled on demand into an in-memory face
+    /// (`crate::custom_fonts`). No file stands behind it.
+    Custom(Arc<CustomFontRef>),
+}
+
+/// A custom font as one entry of a font list: WHAT it is (saved or the panel's ad-hoc
+/// entry), its recipe, the key of its compiled face and how its sources become bytes.
+///
+/// `pub` only because [`FontByteSource::Custom`] (re-exported through `font_admin`) names
+/// it; its fields stay private and are read through `pub(crate)` accessors
+/// (`panel/custom_font_entry.rs`). Built ONLY by the list build
+/// (`custom_font_entry::build_custom_font_entries`) and by
+/// `custom_font_entry::adhoc_custom_font_entry`.
+pub struct CustomFontRef {
+    /// Saved or the panel's ad-hoc entry. (A saved font's user-visible name is the entry's
+    /// `label`.)
+    origin: CustomFontOrigin,
+    /// The recipe of a SAVED font; `None` for the ad-hoc entry, whose recipe is owned by
+    /// the layer / the panel selection (`custom_font_select`), not by the list.
+    recipe: Option<Arc<CustomFontRecipe>>,
+    /// Key of the compiled full face over the sources as they were at list-build time;
+    /// `None` for the ad-hoc entry.
+    key: Option<RecipeKey>,
+    /// How the recipe's source identities become bytes: the list build's source-only
+    /// provider over the real + bundled fonts (never a custom font, decision D4). `None`
+    /// for the ad-hoc entry.
+    sources: Option<Arc<dyn SourceResolver>>,
+}
+
+/// Where a [`CustomFontRef`] comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CustomFontOrigin {
+    /// A saved custom font (`fonts_data.json` `custom_fonts`).
+    Saved,
+    /// The panel-only ad-hoc entry (persisted identity `MSCustom-adhoc-hybrid`).
+    AdHoc,
+}
+
+/// THE single answer to "where do this font's bytes come from", returned by
+/// [`FontEntry::byte_source`].
+///
+/// Every consumer that READS a font's bytes — the render-side `TabFontProvider`, the
+/// own-typeface previews (typing combos, character table, settings font UI), the
+/// character-table coverage probe, the advanced-form width metric — obtains them through
+/// this value and `match`es it EXHAUSTIVELY, never through `FontEntry::file_path`. That
+/// is what lets a new kind of entry (bytes compiled in memory from a recipe, no file)
+/// be added as one more variant: the compiler then names every consumer that has to
+/// decide what that variant means for it.
+///
+/// The face index is deliberately NOT part of it: which face of the bytes a consumer
+/// draws is a separate decision (the panel's SELECTED face, or the entry's
+/// representative face), not a property of where the bytes live.
+#[derive(Clone, Copy, Debug)]
+pub enum FontByteSource<'a> {
+    /// The current content of this font FILE on disk, read by the consumer itself (off
+    /// the GUI thread).
+    File(&'a Path),
+    /// A bundled `fonts/ui` stack font whose bytes `ms-fonts` holds resident for the
+    /// whole process (`ms_fonts::bytes`, fallible and lazily loaded, so the consumer
+    /// fetches them where it may block). Its `path` names which file of the bundle it
+    /// is.
+    Bundled(&'static ms_fonts::StackFont),
+    /// A custom font: its bytes are the compiled full face of its recipe
+    /// (`CustomFontRef::full_face_blocking`, worker threads only — it may compile). The
+    /// ad-hoc entry has no bytes of its own (its recipe lives in the layer).
+    Custom(&'a Arc<CustomFontRef>),
+}
+
+impl FontByteSource<'_> {
+    /// Where the egui own-typeface PREVIEW of this font takes its bytes from.
+    ///
+    /// The one owner of that decision for every preview site: a file is previewed from
+    /// itself, a bundled font from its own bundle file (the same content `ms-fonts` holds
+    /// resident), a SAVED custom font from its compiled full face — only once that face is
+    /// in memory or the disk cache; a preview never triggers a compile — and the ad-hoc
+    /// custom entry always in the interface font (egui cannot unload a font, so faces that
+    /// are being tuned are never registered).
+    #[must_use]
+    pub fn preview_source(self) -> FontPreviewSource {
+        match self {
+            Self::File(path) => FontPreviewSource::File(path.to_path_buf()),
+            Self::Bundled(stack_font) => FontPreviewSource::File(stack_font.path.clone()),
+            Self::Custom(custom) => custom
+                .saved_key()
+                .map_or(FontPreviewSource::InterfaceFont, FontPreviewSource::CompiledCustom),
+        }
+    }
+}
+
+/// Owned answer of [`FontByteSource::preview_source`], kept by preview rows that outlive
+/// the font-list borrow. Resolved per frame by `FontPreviewSource::request_family`
+/// (`panel/custom_font_entry.rs`), which wraps `ms_widgets::request_font_family*`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FontPreviewSource {
+    /// Read this font file (off the GUI thread).
+    File(PathBuf),
+    /// The compiled full face of a saved custom font, registered only while it is in the
+    /// compile service's memory (a disk-cache load is requested otherwise).
+    CompiledCustom(RecipeKey),
+    /// No own-typeface preview: always the interface font.
+    InterfaceFont,
 }
 
 // Re-exported (type only) through the crate's `font_admin` facade, so the settings
@@ -1204,21 +1343,46 @@ impl FontEntry {
     /// stored `label`/identity is a fixed reserved string (it is persisted into
     /// projects and must never depend on the interface language), so the human name
     /// is resolved here, at the presentation site, on every call.
+    ///
+    /// The ad-hoc custom entry is localized the same way (its stored identity is the
+    /// reserved `MSCustom-adhoc-hybrid`); a saved custom font shows its stored name.
     pub fn display_label(&self) -> &str {
-        match self.kind {
+        match &self.kind {
             FontEntryKind::BundledUiStack(_) => t!("typing.fonts.bundled_ui_font_label"),
-            FontEntryKind::File => self.display_name.as_deref().unwrap_or(&self.label),
+            FontEntryKind::Custom(custom) if custom.is_adhoc() => t!("typing.fonts.adhoc_hybrid_font_label"),
+            FontEntryKind::File | FontEntryKind::Custom(_) => self.display_name.as_deref().unwrap_or(&self.label),
         }
     }
 
     /// The bundled `fonts/ui` stack font this entry stands for, or `None` for a real
-    /// font file. `TabFontProvider` uses it to hand the renderer the process-resident
-    /// `'static` bytes instead of reading the file a second time.
+    /// font file. An IDENTITY/alias question only (reserved names, stem aliases, coverage
+    /// reporting); where the bytes come from is answered by [`Self::byte_source`].
     pub fn bundled_stack_font(&self) -> Option<&'static ms_fonts::StackFont> {
-        match self.kind {
+        match &self.kind {
             FontEntryKind::BundledUiStack(font) => Some(font),
-            FontEntryKind::File => None,
+            FontEntryKind::File | FontEntryKind::Custom(_) => None,
         }
+    }
+
+    /// The custom font this entry stands for, or `None` for a file / the bundled entry.
+    pub(crate) fn custom_font(&self) -> Option<&Arc<CustomFontRef>> {
+        match &self.kind {
+            FontEntryKind::Custom(custom) => Some(custom),
+            FontEntryKind::File | FontEntryKind::BundledUiStack(_) => None,
+        }
+    }
+
+    /// Whether this is the panel's ad-hoc custom entry (recipe owned by the layer).
+    pub(crate) fn is_adhoc_custom(&self) -> bool {
+        self.custom_font().is_some_and(|custom| custom.is_adhoc())
+    }
+
+    /// Whether this entry is one of the PANEL-ONLY synthetic entries (the bundled
+    /// interface font, the ad-hoc custom entry) rather than a font the user owns — a
+    /// real file or a saved custom font. Drives the "first of the user's own fonts"
+    /// initial selection.
+    pub(crate) fn is_panel_synthetic(&self) -> bool {
+        self.bundled_stack_font().is_some() || self.is_adhoc_custom()
     }
 
     /// Name to SHOW for this font WITHIN a given active font group.
@@ -1238,8 +1402,24 @@ impl FontEntry {
         }
     }
 
-    /// Representative font FILE path. `pub(crate)` accessor for the settings font UI.
-    pub fn path(&self) -> &Path {
+    /// THE single owner of "where do this font's bytes come from": the representative
+    /// file for a real font file, the process-resident bundle font for the synthetic
+    /// built-in entry. Every byte read of a font goes through this (see
+    /// [`FontByteSource`]); `file_path` is never a byte source.
+    #[must_use]
+    pub fn byte_source(&self) -> FontByteSource<'_> {
+        match &self.kind {
+            FontEntryKind::File => FontByteSource::File(&self.path),
+            FontEntryKind::BundledUiStack(stack_font) => FontByteSource::Bundled(stack_font),
+            FontEntryKind::Custom(custom) => FontByteSource::Custom(custom),
+        }
+    }
+
+    /// WHERE the representative font file lives: for LOCATION questions only — which
+    /// folder a font belongs to, the path hint stored with an import, the file name shown
+    /// to the user. Never read font bytes from it; use [`Self::byte_source`]. Empty for a
+    /// custom font (no file stands behind it).
+    pub fn file_path(&self) -> &Path {
         &self.path
     }
 
@@ -2065,6 +2245,8 @@ struct TypingRightSectionInputs<'a> {
     repaginate_pages_warning: bool,
     /// Base output name (no extension) used to prefill the PDF save dialog.
     export_base_name: &'a str,
+    /// «Положить рядом кастомные шрифты» (drawn for PSD only).
+    psd_bundle_custom_fonts: bool,
 }
 
 struct TypingRightSectionActions {
@@ -2081,6 +2263,8 @@ struct TypingRightSectionActions {
     /// frame. Reported by the ONE place that decides its visibility, so the facade can expire
     /// a confirmation the user can no longer see instead of re-deciding the visibility itself.
     repaginate_block_drawn: bool,
+    /// New «Положить рядом кастомные шрифты» state when the user toggled it this frame.
+    changed_psd_bundle_custom_fonts: Option<bool>,
     round_text_positions: bool,
     create_image_request: Option<TypingCreateImageRequest>,
     changed_strict_pixel_movement: Option<bool>,
@@ -2203,6 +2387,12 @@ struct TypingCreatePanelState {
     /// label) to bytes/face. Rebuilt whenever `fonts` is (re)assigned and shared
     /// (`Arc`) with background render threads.
     font_provider: Arc<dyn FontProvider>,
+    /// The SAME provider as `font_provider`, kept typed so it also serves as the
+    /// custom-font `SourceResolver` (`create_state::source_resolver`). Both fields are set
+    /// together, only by `create_state::install_font_provider`.
+    source_provider: Arc<TabFontProvider>,
+    /// The ad-hoc custom font recipe of this panel's selection (`custom_font_select`).
+    custom_font: CustomFontSelection,
     font_groups: Vec<String>,
     selected_font_group: Option<String>,
     /// Snapshot of the user-imported system-font FILE paths (from
@@ -2697,7 +2887,8 @@ struct AdvancedFormCache {
 /// Resolving means a possible `fs::read`, so it never happens on the GUI thread
 /// (`CLAUDE.md` §5); the window shows the coarse per-character metric until this arrives.
 struct AdvancedFormFont {
-    /// Font identity this was resolved FOR. A different selection invalidates it.
+    /// Font RENDER name this was resolved FOR (`selected_font_ref`: the identity, or an
+    /// ad-hoc recipe's render name). A different selection or recipe invalidates it.
     identity: String,
     /// `None` when the identity resolved to nothing (unknown name, unreadable file).
     /// Remembered rather than retried, so a missing font does not spawn a resolver per
@@ -2722,8 +2913,9 @@ struct AdvancedFormMetricSpec {
     /// Выбран синтетический «Встроенный шрифт интерфейса»: в базу метрики
     /// доливается остаток бандловой цепочки `core`.
     bundled_stack: bool,
-    /// Файл выбранного фейса — источник байт и то, что пропускается при доливке
-    /// цепочки, чтобы фейс не задвоился.
+    /// The file the selected font's `FontEntry::byte_source` names: what the diagnostics
+    /// print and what the bundled-chain pour skips so the face is not registered twice.
+    /// Never read: the bytes are `content`.
     path: PathBuf,
     /// Подпись шрифта для сообщений в лог.
     display_label: String,

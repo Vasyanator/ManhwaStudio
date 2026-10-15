@@ -25,7 +25,9 @@ pick the helper reports (`FontComboOutcome::user_pick`) — never from the per-f
 display-only clamp. Merely selecting text must not rewrite a span's font. The
 writeback below the call is this panel's own and is deliberately SHORTER than the
 create panel's (no `missing_font` reset, no per-font parameter memory): the missing
-font is reported here by the red banner above the section.
+font is reported here by the red banner above the section. Both font rows refuse the
+ad-hoc hybrid entry as a span font and draw its configure row
+(`custom_font_select::{refuse_inline_adhoc_pick, draw_custom_font_row}`).
 */
 
 use super::*;
@@ -258,16 +260,21 @@ impl TypingCreatePanelState {
                                                 // Edge-triggered writeback: only a real pick
                                                 // this frame writes the span font label, so
                                                 // selecting text can never insert a `<font>`
-                                                // tag on its own.
+                                                // tag on its own. The ad-hoc hybrid entry is
+                                                // refused as a span font.
                                                 if let Some(picked) = outcome.user_pick
+                                                    && !self.refuse_inline_adhoc_pick(picked)
                                                     && let Some(label) = self.font_identity_name_by_idx(picked)
                                                 {
                                                     style.font_label = Some(label);
                                                 }
                                             } else {
-                                                self.selected_font_idx = outcome.font_idx;
+                                                self.selected_font_idx = self.combo_font_idx_to_adopt(outcome.font_idx, outcome.user_pick);
                                                 if self.selected_font_idx != prev_font_idx {
                                                     self.selected_face_idx = 0;
+                                                    // The ad-hoc hybrid entry's block state is
+                                                    // derived on the pick (missing sources).
+                                                    self.refresh_adhoc_missing_font();
                                                     changed = true;
                                                 }
                                             }
@@ -322,6 +329,8 @@ impl TypingCreatePanelState {
                                                 }
                                             });
                                         });
+                                        self.draw_inline_adhoc_refusal(ui, selection_mode);
+                                        self.draw_custom_font_row(ui);
                                     });
 
                                     ui.add_space(4.0);

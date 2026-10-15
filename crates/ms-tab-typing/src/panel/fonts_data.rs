@@ -6,23 +6,41 @@ Serde schema and disk I/O for the app-level per-font settings document
 `fonts_data.json`, stored inside the app fonts directory (`ms_config::storage_mode::app_fonts_dir()`).
 This file is the single on-disk home for the user-imported system fonts, per-font
 settings (display-name override + default parameter profile + user-defined custom kerning
-pairs) and user-defined VIRTUAL font groups. Font discovery never picks it up because it
-only scans `.ttf/.otf/.ttc`.
+pairs), user-defined VIRTUAL font groups and the SAVED CUSTOM FONTS (recipes). Font discovery
+never picks it up because it only scans `.ttf/.otf/.ttc`.
 
-SCHEMA VERSION 3 — the font is named by its IDENTITY, never by a path:
+SCHEMA VERSION 4 — the font is named by its IDENTITY, never by a path:
 
 ```jsonc
 {
-  "version": 3,
+  "version": 4,
   "system_fonts": [ { "font": "Roboto-Medium", "last_path": "/home/…/Roboto-Medium.ttf" } ],
   "fonts": { "CCWildWordsLower-Regular": {
                "display_name": "Разговор",
                "profile": { … },
                "custom_kerning": [ { "left": "A", "right": "V", "em": -40.0 } ] } },
   "virtual_groups": [ { "name": "Возлюбленная",
-                        "members": [ { "font": "kCCAskForMercy-Regular", "alias": "Основа" } ] } ]
+                        "members": [ { "font": "kCCAskForMercy-Regular", "alias": "Основа" } ] } ],
+  "custom_fonts": { "MSCustom-0123456789abcdef": {
+                      "name": "Гибрид", "kind": "hybrid", "sources": [ … ],
+                      "missing_default": "disable" } }
 }
 ```
+
+CUSTOM FONTS ARE RECIPES. A `custom_fonts` entry is `ms_custom_fonts::CustomFontRecipe::to_json`
+plus a `name` key (the user-visible name); the key is the saved identity minted by
+`custom_fonts::identity::new_saved_identity` (opaque, stable across edits and renames). The
+compiled face is never stored here. An entry this build cannot use — an unknown `kind` (a
+newer build's kind) or a recipe that does not parse or validate — is decoded as
+`CustomFontBody::Unsupported` and KEPT VERBATIM (the whole entry object, `name` included), so
+decode → merge → encode never loses it. A blank or absent `name` decodes to the identity.
+Two keys that name one identity once normalized (trim + ASCII case) never overwrite each
+other: one decodes as the font (the app's minted spelling first), the other is kept
+verbatim under its raw key as an `IdentityCollision` (`decode_custom_fonts`).
+
+VERSION 4 IS A GATE, NOT A MIGRATION, exactly like version 3: `custom_fonts` is purely
+additive, every older document decodes unchanged, and an older build — which would drop the
+key on its next debounced rewrite — refuses to overwrite a v4 document instead.
 
 CUSTOM KERNING IS MEASURED IN THOUSANDTHS OF AN EM (`em`, ‰ em), never in font design
 units. The renderer applies `delta_px = em / 1000.0 * font_size_px`, so the user's tuning is
@@ -72,7 +90,7 @@ unresolved keys would be frozen forever (the "will apply again" promise in the m
 has to be true).
 
 Main responsibilities:
-- define the versioned JSON schema (`version: 3`) and its serde mirror, plus the read-only
+- define the versioned JSON schema (`version: 4`) and its serde mirror, plus the read-only
   v1 mirror;
 - load the document as a typed `LoadOutcome` (`Missing` / `Loaded` / `Invalid`) so the
   caller can distinguish "first run" from "corrupt file" — a corrupt file must NOT be
@@ -100,6 +118,8 @@ Key types:
   custom kerning pairs)
 - `VirtualFontGroup` / `VirtualFontGroupMember` (user-defined virtual font groups; serde
   mirror AND decoded form; sanitized by `sanitize_virtual_groups` on load and save)
+- `CustomFontRecord` / `CustomFontBody` / `UnsupportedCustomFont` (one saved custom font:
+  name + recipe, or an unsupported entry kept verbatim)
 
 Key functions:
 - `data_path` / `load_outcome` / `quarantine_bad_file` / `save_checked`
@@ -120,14 +140,23 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use ms_custom_fonts::{CustomFontRecipe, RecipeError};
 
 /// Current on-disk schema version of `fonts_data.json` (identity-keyed).
 ///
-/// Version 3 added `fonts.<identity>.custom_kerning`. It is a GATE, not a migration: the
-/// field is purely additive and every older document still decodes unchanged, but an older
-/// BUILD must refuse to rewrite a v3 document (see the file header) instead of dropping the
-/// key it cannot see on the next debounced profile write.
-pub(crate) const FONTS_DATA_VERSION: u32 = 3;
+/// Version 3 added `fonts.<identity>.custom_kerning`, version 4 the top-level
+/// `custom_fonts`. Both are GATES, not migrations: the fields are purely additive and every
+/// older document still decodes unchanged, but an older BUILD must refuse to rewrite a newer
+/// document (see the file header) instead of dropping the keys it cannot see on the next
+/// debounced profile write.
+pub(crate) const FONTS_DATA_VERSION: u32 = 4;
+
+/// JSON key of a custom font entry's user-visible name. It sits beside the recipe's own keys
+/// (`kind`, `sources`, …) in one object; `CustomFontRecipe::from_json` ignores unknown keys,
+/// but decode strips it anyway so the recipe parser sees exactly the recipe.
+const CUSTOM_FONT_NAME_KEY: &str = "name";
 
 /// Last schema version that keyed everything by FILE PATH. A document at or below this
 /// version is decoded with the legacy rules and flagged for the deferred re-key.
@@ -289,6 +318,11 @@ struct FontsDataFile {
     /// schema versions; only the MEANING of `members[].font` changed (path → identity).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     virtual_groups: Vec<VirtualFontGroup>,
+    /// Saved custom fonts keyed by their saved identity (v4). Each value is one entry
+    /// object (recipe JSON + `name`), kept as a raw `Value` so an entry this build cannot
+    /// interpret round-trips verbatim; [`decode`] / [`encode`] convert it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    custom_fonts: BTreeMap<String, Value>,
     /// v1 ONLY: user-imported system font FILE paths. Read forever, never written.
     #[serde(default, skip_serializing)]
     imported_system_fonts: Vec<String>,
@@ -332,6 +366,52 @@ impl FontSettingsRecord {
     }
 }
 
+/// Why a stored custom font entry cannot be used by this build. The entry is still listed
+/// (greyed, with this reason) and kept verbatim; only editing it is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnsupportedCustomFont {
+    /// The entry's `kind` is not one this build implements (a newer build wrote it); carries
+    /// the kind tag as written.
+    UnknownKind(String),
+    /// The entry does not parse as a recipe of a known kind, or the recipe breaks its
+    /// invariants (`CustomFontRecipe::validate`); carries the log-ready reason.
+    Invalid(String),
+    /// Its stored key names the same identity as another entry once normalized (trim +
+    /// ASCII case, `normalize_font_identity`) — a hand edit or a foreign writer. The other
+    /// entry (`kept`, its decoded key) is the font; this one is kept VERBATIM under its own
+    /// raw key so encode writes it back, and is listed greyed and deletable.
+    IdentityCollision {
+        /// The decoded key of the entry that owns the identity.
+        kept: String,
+    },
+}
+
+/// The definition part of a saved custom font.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CustomFontBody {
+    /// A valid recipe of a kind this build compiles.
+    Known(Arc<CustomFontRecipe>),
+    /// An entry this build cannot use, kept VERBATIM so it survives decode → merge → encode.
+    Unsupported {
+        /// The whole entry object exactly as read (its `name` key included); written back
+        /// unchanged by [`encode`].
+        raw: Value,
+        /// Why it cannot be used.
+        reason: UnsupportedCustomFont,
+    },
+}
+
+/// One saved custom font in the decoded runtime form, keyed by its saved identity in
+/// [`FontsData::custom_fonts`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CustomFontRecord {
+    /// User-visible name, trimmed and never blank (a blank stored name decodes to the
+    /// identity). Unique case-insensitively among custom fonts (enforced by the store).
+    pub name: String,
+    /// The recipe, or the verbatim entry this build cannot use.
+    pub body: CustomFontBody,
+}
+
 /// Decoded in-memory form of `fonts_data.json` consumed by `font_settings_store`.
 ///
 /// This is the boundary type between disk I/O and the runtime store. `pending_migration`
@@ -348,6 +428,9 @@ pub(crate) struct FontsData {
     /// User-defined virtual font groups, sanitized (blank names/keys dropped, blank aliases
     /// normalized to `None`, duplicate members/groups removed, user order preserved).
     pub virtual_groups: Vec<VirtualFontGroup>,
+    /// Saved custom fonts keyed by their saved identity (`MSCustom-<16 hex>`). Entries this
+    /// build cannot use are present as `CustomFontBody::Unsupported`, never dropped.
+    pub custom_fonts: BTreeMap<String, CustomFontRecord>,
     /// `true` while the deferred path → identity re-key is still owed: the document was read
     /// with the v1 (path-keyed) rules, or a previous re-key pass could not resolve every
     /// legacy reference and wrote the flag back so a later launch retries.
@@ -752,6 +835,132 @@ fn decode_settings_map(
         .collect()
 }
 
+/// Decodes one `custom_fonts` entry stored under `identity` (already trimmed, non-blank).
+///
+/// Never fails and never drops: a usable recipe becomes `CustomFontBody::Known`; anything
+/// else — not an object, an unknown `kind`, a malformed recipe, a recipe that breaks
+/// `validate` under the typing identity normalization — becomes `Unsupported` carrying the
+/// WHOLE entry verbatim, with a warning naming the identity and the reason.
+fn decode_custom_font_entry(identity: &str, raw: Value) -> CustomFontRecord {
+    let stored_name = raw
+        .get(CUSTOM_FONT_NAME_KEY)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string);
+    // A blank name would make the font unselectable by name and unrenameable in the list;
+    // the identity is the one label that is guaranteed to exist and to be unique.
+    let name = stored_name.unwrap_or_else(|| identity.to_string());
+    let parsed = match &raw {
+        Value::Object(object) => {
+            let mut recipe_json = object.clone();
+            recipe_json.remove(CUSTOM_FONT_NAME_KEY);
+            CustomFontRecipe::from_json(&Value::Object(recipe_json)).and_then(|recipe| {
+                recipe.validate(&fonts::normalize_font_identity)?;
+                Ok(recipe)
+            })
+        }
+        _ => Err(RecipeError::Malformed("the custom font entry is not a JSON object".to_string())),
+    };
+    match parsed {
+        Ok(recipe) => CustomFontRecord { name, body: CustomFontBody::Known(Arc::new(recipe)) },
+        Err(err) => {
+            let reason = match err {
+                RecipeError::UnknownKind(kind) => UnsupportedCustomFont::UnknownKind(kind),
+                other => UnsupportedCustomFont::Invalid(other.to_string()),
+            };
+            ms_log::runtime_log::log_warn(format!(
+                "typing: fonts_data: custom font '{identity}' ({name}) cannot be used by this \
+                 build and is kept verbatim. Reason: {reason:?}"
+            ));
+            CustomFontRecord { name, body: CustomFontBody::Unsupported { raw, reason } }
+        }
+    }
+}
+
+/// Decodes the `custom_fonts` map. A blank identity key addresses nothing any layer or group
+/// could reference, so that entry alone is dropped (with a warning); every other entry is
+/// kept, usable or not (see [`decode_custom_font_entry`]).
+///
+/// NEVER LOSES A DEFINITION TO A KEY COLLISION. Keys are trimmed, and the store compares
+/// identities normalized (`normalize_font_identity`), so two distinct JSON keys can name ONE
+/// identity (`"MSCustom-…"` and `" MSCustom-… "`, or two ASCII-case spellings). The entry
+/// under the app's minted spelling wins (`identity::is_minted_saved_identity`), else one whose
+/// raw key is already its trimmed form, else the first — in key order — and is decoded under
+/// the trimmed key; every other one is kept as
+/// [`UnsupportedCustomFont::IdentityCollision`] under its RAW key with the whole entry
+/// verbatim, logged as a warning. The raw keys are distinct JSON keys and the winner's key is
+/// either its own raw key or no entry's raw key, so no two records share a map key.
+fn decode_custom_fonts(entries: BTreeMap<String, Value>) -> BTreeMap<String, CustomFontRecord> {
+    let mut by_identity: BTreeMap<String, Vec<(String, Value)>> = BTreeMap::new();
+    for (raw_key, raw) in entries {
+        let identity = raw_key.trim();
+        if identity.is_empty() {
+            ms_log::runtime_log::log_warn(
+                "typing: fonts_data: dropping a custom font entry stored under a blank \
+                 identity; nothing can reference it.",
+            );
+            continue;
+        }
+        by_identity.entry(fonts::normalize_font_identity(identity)).or_default().push((raw_key, raw));
+    }
+    let mut decoded = BTreeMap::new();
+    for (_, mut group) in by_identity {
+        // `group` is in raw-key order (the source map is a BTreeMap). Precedence: the app's own
+        // minted spelling, then any key that is already trimmed, then the first.
+        let winner_at = group
+            .iter()
+            .position(|(raw_key, _)| crate::custom_fonts::identity::is_minted_saved_identity(raw_key))
+            .or_else(|| group.iter().position(|(raw_key, _)| raw_key.trim() == raw_key))
+            .unwrap_or(0);
+        let (winner_raw_key, winner_raw) = group.remove(winner_at);
+        let kept = winner_raw_key.trim().to_string();
+        for (raw_key, raw) in group {
+            let name = raw
+                .get(CUSTOM_FONT_NAME_KEY)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map_or_else(|| raw_key.trim().to_string(), str::to_string);
+            ms_log::runtime_log::log_warn(format!(
+                "typing: fonts_data: custom font entry stored under '{raw_key}' ({name}) names the \
+                 same identity as the entry under '{kept}'; the latter is used, this one is kept \
+                 verbatim and listed as unusable. Possible cause: a hand edit of fonts_data. \
+                 Delete one of them in Settings."
+            ));
+            let reason = UnsupportedCustomFont::IdentityCollision { kept: kept.clone() };
+            decoded.insert(raw_key, CustomFontRecord { name, body: CustomFontBody::Unsupported { raw, reason } });
+        }
+        let record = decode_custom_font_entry(&kept, winner_raw);
+        decoded.insert(kept, record);
+    }
+    decoded
+}
+
+/// The entry object written for one custom font: the recipe's canonical JSON plus `name`,
+/// or the verbatim entry of an unsupported one.
+#[must_use]
+fn encode_custom_font_entry(record: &CustomFontRecord) -> Value {
+    match &record.body {
+        CustomFontBody::Known(recipe) => {
+            let mut entry = recipe.to_json();
+            if let Value::Object(object) = &mut entry {
+                object.insert(CUSTOM_FONT_NAME_KEY.to_string(), Value::String(record.name.clone()));
+            } else {
+                // `to_json` always yields an object (it is the recipe's canonical form); a
+                // non-object would lose the name, so say so instead of writing it silently.
+                ms_log::runtime_log::log_error(format!(
+                    "typing: fonts_data: the recipe of custom font '{}' did not serialize to a \
+                     JSON object; its name is not written.",
+                    record.name
+                ));
+            }
+            entry
+        }
+        CustomFontBody::Unsupported { raw, .. } => raw.clone(),
+    }
+}
+
 /// Converts the serde mirror into the decoded runtime form, UNIONING both schema payloads.
 ///
 /// Neither payload is ever discarded: a document that carries identity-keyed (v2+) keys AND
@@ -760,14 +969,16 @@ fn decode_settings_map(
 /// `pending_migration`.
 ///
 /// VERSION INFERENCE. The `version` field decides when it is present. When it is ABSENT the
-/// PAYLOAD decides: a document carrying `system_fonts`/`fonts` is identity-keyed. The old
+/// PAYLOAD decides: a document carrying `system_fonts`/`fonts`/`custom_fonts` is identity-keyed. The old
 /// rule — serde's `0` default, therefore "≤ 1", therefore v1 — read such a document as an
 /// EMPTY v1 and the next save wrote that emptiness back, destroying every identity-keyed
 /// setting in it. With nothing to go on at all (no version, no payload) the document is
 /// treated as legacy, which is the harmless direction: a pending migration only ever re-keys
 /// and never drops.
 fn decode(file: FontsDataFile) -> FontsData {
-    let has_identity_payload = !file.system_fonts.is_empty() || !file.fonts.is_empty();
+    // `custom_fonts` exists only from v4 on, so it is identity-keyed payload too.
+    let has_identity_payload =
+        !file.system_fonts.is_empty() || !file.fonts.is_empty() || !file.custom_fonts.is_empty();
     let has_legacy_payload =
         !file.imported_system_fonts.is_empty() || !file.font_settings.is_empty();
     let declares_legacy = match file.version {
@@ -820,6 +1031,7 @@ fn decode(file: FontsDataFile) -> FontsData {
         system_fonts,
         fonts,
         virtual_groups: sanitize_virtual_groups(file.virtual_groups),
+        custom_fonts: decode_custom_fonts(file.custom_fonts),
         // An identity-keyed document carries the flag explicitly (a migration that could
         // not resolve everything writes it back), so it survives the rewrite the migration
         // itself performs — without that, the next launch would read an identity-keyed
@@ -977,6 +1189,11 @@ fn encode(data: &FontsData) -> FontsDataFile {
         system_fonts,
         fonts,
         virtual_groups: sanitize_virtual_groups(data.virtual_groups.clone()),
+        custom_fonts: data
+            .custom_fonts
+            .iter()
+            .map(|(identity, record)| (identity.clone(), encode_custom_font_entry(record)))
+            .collect(),
         // The v1 mirror is never written back.
         imported_system_fonts: Vec::new(),
         font_settings: BTreeMap::new(),
@@ -1049,6 +1266,7 @@ mod tests {
                 name: "Возлюбленная".to_string(),
                 members: vec![member_alias("kCCAskForMercy-Regular", "Основа")],
             }],
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
@@ -1058,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_document_declares_v3_and_omits_unset_fields() {
+    fn saved_document_declares_the_current_version_and_omits_unset_fields() {
         let path = unique_temp_path("slim_v2");
         let mut fonts = BTreeMap::new();
         fonts.insert("Comic-Regular".to_string(), named("Разговор"));
@@ -1069,11 +1287,15 @@ mod tests {
                 name: "G".to_string(),
                 members: vec![member("Comic-Regular")],
             }],
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
         let raw = fs::read_to_string(&path).expect("read back");
-        assert!(raw.contains("\"version\": 3"), "the document must declare v3");
+        assert!(
+            raw.contains(&format!("\"version\": {FONTS_DATA_VERSION}")),
+            "the document must declare the current schema version"
+        );
         // Unset optionals and empty collections are omitted, never written as null/[].
         assert!(!raw.contains("profile"), "an unset profile must be omitted");
         assert!(!raw.contains("alias"), "an unset alias must be omitted");
@@ -1082,6 +1304,7 @@ mod tests {
             !raw.contains("system_fonts"),
             "an empty system-font list must be omitted"
         );
+        assert!(!raw.contains("custom_fonts"), "no custom fonts -> no custom_fonts key");
         // The legacy mirror is never written back.
         assert!(!raw.contains("imported_system_fonts"));
         assert!(!raw.contains("font_settings"));
@@ -1253,6 +1476,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
@@ -1301,6 +1525,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts: BTreeMap::new(),
             virtual_groups: groups.clone(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
@@ -1470,11 +1695,15 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: true,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
         let raw = fs::read_to_string(&path).expect("read back");
-        assert!(raw.contains("\"version\": 3"), "it is written in the current schema");
+        assert!(
+            raw.contains(&format!("\"version\": {FONTS_DATA_VERSION}")),
+            "it is written in the current schema"
+        );
         let loaded = expect_loaded(load_outcome_from_file(&path));
         assert!(
             loaded.pending_migration,
@@ -1494,6 +1723,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
@@ -1521,6 +1751,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         let error = save_to_file(&path, &data, SaveBaseline::Unchecked)
@@ -1764,6 +1995,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
@@ -1791,6 +2023,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
@@ -1835,6 +2068,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
@@ -1859,6 +2093,7 @@ mod tests {
             system_fonts: Vec::new(),
             fonts,
             virtual_groups: Vec::new(),
+            custom_fonts: BTreeMap::new(),
             pending_migration: false,
         };
         save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
@@ -1943,5 +2178,225 @@ mod tests {
         assert_eq!(record.display_name.as_deref(), Some("Мысли"));
         assert!(record.custom_kerning.is_empty());
         let _ = fs::remove_file(&path);
+    }
+
+    /// A two-source hybrid recipe over `a` and `b` (weights 3:1, default policy `Disable`,
+    /// the second source overriding it with `NoInfluence`).
+    fn hybrid_recipe(a: &str, b: &str) -> CustomFontRecipe {
+        use ms_custom_fonts::{CustomFontKind, HybridParams, HybridSource, MissingGlyphPolicy};
+        CustomFontRecipe {
+            kind: CustomFontKind::Hybrid(HybridParams {
+                sources: vec![
+                    HybridSource { identity: a.to_string(), weight: 3.0, missing_override: None },
+                    HybridSource {
+                        identity: b.to_string(),
+                        weight: 1.0,
+                        missing_override: Some(MissingGlyphPolicy::NoInfluence),
+                    },
+                ],
+                missing_default: MissingGlyphPolicy::Disable,
+            }),
+        }
+    }
+
+    /// A saved custom font record holding a usable recipe.
+    fn known_custom_font(name: &str, recipe: CustomFontRecipe) -> CustomFontRecord {
+        CustomFontRecord { name: name.to_string(), body: CustomFontBody::Known(Arc::new(recipe)) }
+    }
+
+    /// v4: a saved custom font round-trips through the document, and its entry on disk is the
+    /// recipe's canonical JSON plus `name` — nothing else.
+    #[test]
+    fn custom_fonts_round_trip_in_schema_v4() {
+        let path = unique_temp_path("custom_fonts_v4");
+        let recipe = hybrid_recipe("Comic-Regular", "NotoSans-Bold");
+        let data = FontsData {
+            custom_fonts: BTreeMap::from([(
+                "MSCustom-0123456789abcdef".to_string(),
+                known_custom_font("Гибрид", recipe.clone()),
+            )]),
+            ..FontsData::default()
+        };
+        save_to_file(&path, &data, SaveBaseline::Unchecked).expect("save must succeed");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert_eq!(loaded, data, "a custom font must round-trip verbatim");
+        assert!(!loaded.pending_migration, "a document holding only custom fonts is not legacy");
+
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).expect("read back")).expect("valid JSON");
+        let mut expected = recipe.to_json();
+        if let Value::Object(object) = &mut expected {
+            object.insert("name".to_string(), Value::String("Гибрид".to_string()));
+        }
+        assert_eq!(written["custom_fonts"]["MSCustom-0123456789abcdef"], expected);
+        assert_eq!(written["version"], serde_json::json!(4));
+        fs::remove_file(&path).expect("remove the temp document");
+    }
+
+    /// An entry of an unknown kind and an entry whose recipe is invalid are listed as
+    /// unsupported and written back BYTE-FOR-BYTE (as JSON values), never dropped.
+    #[test]
+    fn unsupported_custom_fonts_survive_decode_and_encode_verbatim() {
+        let path = unique_temp_path("custom_fonts_unsupported");
+        let future = serde_json::json!({
+            "name": "Из будущего", "kind": "combined", "params": { "map": [1, 2, 3] }, "extra": true
+        });
+        // One source only: parses, but breaks `validate` (2..=4 sources).
+        let invalid = serde_json::json!({
+            "name": "Сломанный", "kind": "hybrid", "missing_default": "disable",
+            "sources": [ { "identity": "A-Regular", "weight": 1.0, "missing": null } ]
+        });
+        let not_an_object = serde_json::json!("garbage");
+        let doc = serde_json::json!({
+            "version": 4,
+            "custom_fonts": {
+                "MSCustom-1111111111111111": future,
+                "MSCustom-2222222222222222": invalid,
+                "MSCustom-3333333333333333": not_an_object,
+            }
+        });
+        fs::write(&path, doc.to_string()).expect("write the document");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        let future_record = &loaded.custom_fonts["MSCustom-1111111111111111"];
+        assert_eq!(future_record.name, "Из будущего");
+        assert!(matches!(
+            &future_record.body,
+            CustomFontBody::Unsupported { reason: UnsupportedCustomFont::UnknownKind(kind), .. } if kind == "combined"
+        ));
+        assert!(matches!(
+            &loaded.custom_fonts["MSCustom-2222222222222222"].body,
+            CustomFontBody::Unsupported { reason: UnsupportedCustomFont::Invalid(_), .. }
+        ));
+        let garbage = &loaded.custom_fonts["MSCustom-3333333333333333"];
+        assert_eq!(garbage.name, "MSCustom-3333333333333333", "no usable name -> the identity");
+        assert!(matches!(&garbage.body, CustomFontBody::Unsupported { reason: UnsupportedCustomFont::Invalid(_), .. }));
+
+        save_to_file(&path, &loaded, SaveBaseline::Unchecked).expect("save must succeed");
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).expect("read back")).expect("valid JSON");
+        assert_eq!(written["custom_fonts"], doc["custom_fonts"], "every unsupported entry is written back verbatim");
+        fs::remove_file(&path).expect("remove the temp document");
+    }
+
+    /// Keys that name ONE identity once normalized (padding, ASCII case) never overwrite each
+    /// other: the canonically keyed entry is the font, every other spelling is kept verbatim
+    /// under its raw key as an identity collision, and the document round-trips unchanged.
+    /// Among keys that are all already trimmed (ASCII-case variants) the app's minted spelling
+    /// wins even though `"MSCUSTOM-…"` sorts before it.
+    #[test]
+    fn custom_font_keys_colliding_after_normalization_are_all_kept() {
+        let path = unique_temp_path("custom_fonts_collision");
+        let mut first = hybrid_recipe("A-Regular", "B-Regular").to_json();
+        let mut padded = hybrid_recipe("C-Regular", "D-Regular").to_json();
+        let mut lower = hybrid_recipe("E-Regular", "F-Regular").to_json();
+        let mut upper = hybrid_recipe("G-Regular", "H-Regular").to_json();
+        for (entry, name) in
+            [(&mut first, "Первый"), (&mut padded, "С пробелами"), (&mut lower, "Строчный"), (&mut upper, "Заглавный")]
+        {
+            if let Value::Object(object) = entry {
+                object.insert("name".to_string(), Value::String(name.to_string()));
+            }
+        }
+        let canonical = "MSCustom-5555555555555555";
+        let doc = serde_json::json!({
+            "version": 4,
+            "custom_fonts": {
+                " MSCustom-5555555555555555 ": padded,
+                canonical: first,
+                "mscustom-5555555555555555": lower,
+                "MSCUSTOM-5555555555555555": upper,
+            }
+        });
+        fs::write(&path, doc.to_string()).expect("write the document");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert_eq!(loaded.custom_fonts.len(), 4, "no definition is lost to the collision");
+        let winner = &loaded.custom_fonts[canonical];
+        assert_eq!(winner.name, "Первый");
+        assert!(
+            matches!(&winner.body, CustomFontBody::Known(_)),
+            "the minted spelling wins, although a padded and an uppercase spelling sort first"
+        );
+        for (raw_key, name) in [
+            (" MSCustom-5555555555555555 ", "С пробелами"),
+            ("mscustom-5555555555555555", "Строчный"),
+            ("MSCUSTOM-5555555555555555", "Заглавный"),
+        ] {
+            let record = &loaded.custom_fonts[raw_key];
+            assert_eq!(record.name, name);
+            assert!(matches!(
+                &record.body,
+                CustomFontBody::Unsupported { reason: UnsupportedCustomFont::IdentityCollision { kept }, .. } if kept == canonical
+            ));
+        }
+
+        save_to_file(&path, &loaded, SaveBaseline::Unchecked).expect("save must succeed");
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).expect("read back")).expect("valid JSON");
+        assert_eq!(written["custom_fonts"], doc["custom_fonts"], "both spellings are written back verbatim");
+        fs::remove_file(&path).expect("remove the temp document");
+
+        // Without a canonically keyed entry the first spelling wins under its trimmed key.
+        let only_padded = serde_json::json!({ "MSCustom-6666666666666666 ": first_entry_for_collision(), " MSCustom-6666666666666666": first_entry_for_collision() });
+        let decoded = decode_custom_fonts(serde_json::from_value(only_padded).expect("a map"));
+        assert_eq!(decoded.len(), 2);
+        assert!(matches!(decoded["MSCustom-6666666666666666"].body, CustomFontBody::Known(_)));
+        assert!(matches!(
+            decoded["MSCustom-6666666666666666 "].body,
+            CustomFontBody::Unsupported { reason: UnsupportedCustomFont::IdentityCollision { .. }, .. }
+        ));
+    }
+
+    /// A valid custom font entry for the collision test.
+    fn first_entry_for_collision() -> Value {
+        hybrid_recipe("A-Regular", "B-Regular").to_json()
+    }
+
+    /// A blank stored name decodes to the identity; an entry under a blank identity is the
+    /// only one that is dropped (nothing can reference it).
+    #[test]
+    fn a_blank_custom_font_name_decodes_to_the_identity() {
+        let path = unique_temp_path("custom_fonts_blank_name");
+        let mut entry = hybrid_recipe("A-Regular", "B-Regular").to_json();
+        if let Value::Object(object) = &mut entry {
+            object.insert("name".to_string(), Value::String("   ".to_string()));
+        }
+        let doc = serde_json::json!({
+            "version": 4,
+            "custom_fonts": { "MSCustom-4444444444444444": entry.clone(), "  ": entry }
+        });
+        fs::write(&path, doc.to_string()).expect("write the document");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert_eq!(loaded.custom_fonts.len(), 1, "the blank-identity entry is dropped");
+        let record = &loaded.custom_fonts["MSCustom-4444444444444444"];
+        assert_eq!(record.name, "MSCustom-4444444444444444");
+        assert!(matches!(record.body, CustomFontBody::Known(_)));
+        fs::remove_file(&path).expect("remove the temp document");
+    }
+
+    /// A v3 document (before custom fonts existed) still decodes exactly as before, with no
+    /// custom fonts.
+    #[test]
+    fn a_v3_document_decodes_with_no_custom_fonts() {
+        let path = unique_temp_path("v3_compat");
+        let raw = r#"{
+            "version": 3,
+            "fonts": { "Comic-Regular": { "custom_kerning": [ { "left": "A", "right": "V", "em": -40.0 } ] } }
+        }"#;
+        fs::write(&path, raw).expect("write v3 doc");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert!(loaded.custom_fonts.is_empty());
+        assert!(!loaded.pending_migration);
+        assert_eq!(loaded.fonts["Comic-Regular"].custom_kerning, vec![kern('A', 'V', -40.0)]);
+        fs::remove_file(&path).expect("remove the temp document");
+    }
+
+    /// A document from the NEXT schema (v5) is never overwritten by this build: it may carry
+    /// fields this build would drop.
+    #[test]
+    fn a_v5_document_is_refused() {
+        let path = unique_temp_path("v5_refused");
+        let raw = r#"{ "version": 5, "custom_fonts": {}, "something_new": 1 }"#;
+        fs::write(&path, raw).expect("write v5 doc");
+        let result = save_to_file(&path, &FontsData::default(), SaveBaseline::Unchecked);
+        assert!(matches!(result, Err(SaveError::NewerVersion { found: 5 })), "got {result:?}");
+        assert_eq!(fs::read_to_string(&path).expect("read back"), raw, "the newer file is untouched");
+        fs::remove_file(&path).expect("remove the temp document");
     }
 }

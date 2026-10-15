@@ -4,7 +4,7 @@ File: settings/typesetting/font_settings.rs
 Purpose:
 Self-contained "Настройки шрифтов" editor widget rendered from the settings "Тайп"
 pane. Lists the app's fonts in three categories (folder fonts, imported system fonts,
-custom fonts), renders each font's name in its own typeface, and lets the user import
+saved custom fonts), renders each font's name in its own typeface, and lets the user import
 an installed system font or remove a previously imported one.
 
 Main responsibilities:
@@ -25,6 +25,11 @@ Main responsibilities:
   virtualized so only visible rows register into egui, and capped so a full-catalog scroll
   registers at most `PICKER_PREVIEW_FONT_CAP` own-typeface previews) to import a font by
   file path;
+- host the "Кастомные шрифты" category through `hybrid_fonts::HybridFontsSectionState`
+  (saved custom fonts, their delete, the hybrid create dialog). The same off-thread pass
+  delivers the custom rows, the hybrid editor's source catalog and the real fonts' labels
+  (which a custom name must not repeat); the open properties window of a saved custom font is
+  re-synced to each reloaded snapshot and closed when the font was deleted;
 - host the "Группы" (virtual font groups) sub-editor as a fourth category, delegating to
   `font_groups::FontGroupsEditorState`. The real folder-group names it needs for create-time
   validation are enumerated in the same off-thread category pass (`FontCategories`).
@@ -47,18 +52,17 @@ own-typeface registration reuses the shared `crate::widgets` font-preview helper
 enumeration is HEAVY, so both the category lists and the system-font catalog are built on
 background threads and delivered over `mpsc` channels; the GUI only polls. Registering a
 font into egui inherently needs its bytes, but READING them does not happen here either:
-`widgets::request_font_family` queues the read on its own worker threads and the row draws
-in the interface font for those frames.
+`FontPreviewSource::request_family` (over `widgets::request_font_family*`) queues the read on
+its own worker threads and the row draws in the interface font for those frames.
 */
 
 use crate::tabs::settings::save_font_name_display_mode;
 use crate::tabs::typing::font_admin::{self, FontEntry};
-use crate::widgets::{
-    PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
-};
+use crate::widgets::{PreviewFontFamily, combo_font_family_name, is_font_family_bound};
 use ms_thread as thread;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{self, TryRecvError};
 
 /// Upper bound on how many DISTINCT preview fonts the import picker registers into egui per
@@ -218,8 +222,14 @@ struct FontCategories {
     /// One row per stored imported system font — including the ones that could not be loaded,
     /// which is what makes an unavailable import visible and removable.
     imported_rows: Vec<font_admin::ImportedFontRow>,
-    /// Custom (virtual) fonts. Not supported yet; always empty.
-    custom: Vec<FontEntry>,
+    /// One row per SAVED custom font (recipes, e.g. hybrids), unavailable ones included.
+    custom: Vec<font_admin::CustomFontRow>,
+    /// The hybrid editor's source catalog over this snapshot's real fonts (built on the load
+    /// worker, `font_admin::hybrid_source_catalog`); `None` only when the load could not run.
+    catalog: Option<Arc<font_admin::SourceCatalog>>,
+    /// Display labels of the real (folder + imported) fonts, cleaned like their rows: a custom
+    /// font's name must not repeat one (`hybrid_fonts::validate_custom_font_name`).
+    real_font_names: Vec<String>,
     /// Real folder-group names under `fonts/groups/`, enumerated in this same off-thread pass
     /// (filesystem I/O). Used only by the "Группы" section to reject name collisions on create.
     folder_group_names: Vec<String>,
@@ -253,6 +263,8 @@ pub(crate) struct FontSettingsEditorState {
     picker_preview_families: HashSet<String>,
     /// The open per-font properties window, if any (at most one at a time).
     properties: Option<super::font_properties_window::FontPropertiesState>,
+    /// The "Кастомные шрифты" section (saved custom fonts + the hybrid create dialog).
+    custom_section: super::hybrid_fonts::HybridFontsSectionState,
     /// The "Группы" (virtual font groups) sub-editor rendered as the fourth category.
     groups_editor: super::font_groups::FontGroupsEditorState,
     /// Which name each switchable list shows. Seeded from `user_config.json` by the owner
@@ -274,6 +286,7 @@ impl std::fmt::Debug for FontSettingsEditorState {
             .field("picker_open", &self.picker_open)
             .field("picker_catalog_loaded", &self.picker_catalog.is_some())
             .field("properties_open", &self.properties.is_some())
+            .field("custom_section", &self.custom_section)
             .field("groups_editor", &self.groups_editor)
             .field("name_modes", &self.name_modes)
             .finish()
@@ -329,6 +342,7 @@ impl FontSettingsEditorState {
         self.categories = categories;
 
         self.draw_import_picker(ui.ctx());
+        self.draw_hybrid_create_dialog(ui.ctx());
         self.draw_properties_window(ui.ctx());
         groups_rect
     }
@@ -339,13 +353,55 @@ impl FontSettingsEditorState {
     }
 
     /// Renders the per-font properties window when open; drops its state once closed.
+    ///
+    /// A SAVED custom font's window follows the loaded snapshot: an edit there (rename, a new
+    /// recipe) bumps the store revision, and the reloaded entry is synced into the window so
+    /// its name and glyph analysis follow the font as it is NOW (its own-typeface draws keep
+    /// the face the window opened with: `FontPropertiesState::sync_custom_font`). A font
+    /// deleted meanwhile closes its window.
     fn draw_properties_window(&mut self, ctx: &egui::Context) {
         let Some(mut state) = self.properties.take() else {
             return;
         };
-        if super::font_properties_window::show(ctx, &mut state) {
+        let cats = self.categories.as_ref();
+        if let (Some(identity), Some(cats)) = (state.custom_identity().map(font_admin::normalize_font_identity), cats) {
+            match cats.custom.iter().find(|row| font_admin::normalize_font_identity(&row.identity) == identity) {
+                // Unavailable now (a source went missing): keep showing the last good entry.
+                Some(row) => {
+                    if let Some(font) = &row.font {
+                        state.sync_custom_font(font);
+                    }
+                }
+                None => return,
+            }
+        }
+        let cx = super::font_properties_window::PropertiesCx {
+            catalog: cats.and_then(|cats| cats.catalog.as_deref()),
+            real_font_names: cats.map_or(&[][..], |cats| cats.real_font_names.as_slice()),
+        };
+        if super::font_properties_window::show(ctx, &mut state, &cx) {
             self.properties = Some(state);
         }
+    }
+
+    /// Renders the hybrid create dialog when open. The names a new custom font must not repeat
+    /// (every custom font's name and every real font's label) are gathered only while it is.
+    fn draw_hybrid_create_dialog(&mut self, ctx: &egui::Context) {
+        if !self.custom_section.is_create_dialog_open() {
+            return;
+        }
+        let cats = self.categories.as_ref();
+        let taken: Vec<&str> = cats
+            .map(|cats| {
+                cats.custom
+                    .iter()
+                    .map(|row| row.name.as_str())
+                    .chain(cats.real_font_names.iter().map(String::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let catalog = cats.and_then(|cats| cats.catalog.as_deref());
+        self.custom_section.draw_create_dialog(ctx, catalog, &taken);
     }
 
     /// Renders the three category collapsing headers from a loaded snapshot plus the fourth
@@ -444,18 +500,8 @@ impl FontSettingsEditorState {
             .id_salt("font_settings_custom")
             .default_open(false)
             .show(ui, |ui| {
-                // `custom` is intentionally empty for now; still read it so the field is
-                // wired for the future virtual-font category.
-                if cats.custom.is_empty() {
-                    ui.small(t!("typing.font_settings.custom_fonts_unsupported_hint"));
-                } else if let Some(font) = Self::draw_font_rows_virtualized(
-                    ui,
-                    &cats.custom,
-                    "font_settings_custom_rows",
-                    // This category has no switch of its own (it is always empty today);
-                    // it draws the historical display label until it gains one.
-                    FontNameDisplayMode::Custom,
-                ) {
+                // Saved custom fonts, their delete and the create dialog: `hybrid_fonts.rs`.
+                if let Some(font) = self.custom_section.draw_section(ui, &cats.custom) {
                     to_open = Some(font);
                 }
             });
@@ -472,6 +518,7 @@ impl FontSettingsEditorState {
             folder_group_names: &cats.folder_group_names,
             folder: &cats.folder,
             imported: &cats.imported,
+            custom: &cats.custom,
             categories_revision: cats.loaded_revision,
         };
         // The group editor's switch writes straight into our own mode slot (the widget owns
@@ -651,21 +698,17 @@ impl FontSettingsEditorState {
     ///
     /// `mode` selects WHICH name is drawn; the typeface is unaffected, since the preview
     /// registration is keyed by the font's identity and content either way.
-    fn draw_font_name_row(ui: &mut egui::Ui, font: &FontEntry, mode: FontNameDisplayMode) -> bool {
+    pub(super) fn draw_font_name_row(ui: &mut egui::Ui, font: &FontEntry, mode: FontNameDisplayMode) -> bool {
         let rep_face = font.representative_face_index();
         let body_size = egui::TextStyle::Body.resolve(ui.style()).size;
         let prev_override = ui.style().override_font_id.clone();
         let identity = font.render_identity_name();
         // The font is IDENTIFIED by its identity and by the hash of its bytes (which
         // expires the registration when the file behind that identity is replaced); the
-        // path is only the byte source.
-        if let PreviewFontFamily::Ready(family) = request_font_family(
-            ui.ctx(),
-            &identity,
-            font.content_hash(),
-            font.path(),
-            rep_face,
-        ) {
+        // preview source (`FontByteSource::preview_source`) is only the byte source.
+        if let PreviewFontFamily::Ready(family) =
+            font.byte_source().preview_source().request_family(ui.ctx(), &identity, font.content_hash(), rep_face)
+        {
             ui.style_mut().override_font_id = Some(egui::FontId::new(body_size, family));
         }
         // Either name is DISPLAY only: `display_label()` applies the user display-name
@@ -709,11 +752,21 @@ impl FontSettingsEditorState {
                 let lists = font_admin::load_font_lists();
                 // Enumerated here (filesystem I/O) so the GUI thread never scans the groups dir.
                 let folder_group_names = font_admin::list_folder_group_names();
+                // Built where the lists are, so the hybrid editor sees one catalog per load.
+                let catalog = font_admin::hybrid_source_catalog(&lists);
+                let real_font_names = lists
+                    .folder
+                    .iter()
+                    .chain(&lists.imported)
+                    .map(|font| clean_font_display_name(font.display_label()))
+                    .collect();
                 let snapshot = FontCategories {
                     folder: lists.folder,
                     imported: lists.imported,
                     imported_rows: lists.imported_rows,
-                    custom: Vec::new(),
+                    custom: lists.custom,
+                    catalog: Some(catalog),
+                    real_font_names,
                     folder_group_names,
                     loaded_revision: current_revision,
                 };
@@ -740,6 +793,8 @@ impl FontSettingsEditorState {
                     imported: Vec::new(),
                     imported_rows: Vec::new(),
                     custom: Vec::new(),
+                    catalog: None,
+                    real_font_names: Vec::new(),
                     folder_group_names,
                     loaded_revision: current_revision,
                 });
@@ -967,13 +1022,10 @@ fn draw_picker_body(
                         || preview_families.len() < PICKER_PREVIEW_FONT_CAP;
                     let prev_override = ui.style().override_font_id.clone();
                     if allow_own
-                        && let PreviewFontFamily::Ready(family) = request_font_family(
-                            ui.ctx(),
-                            &identity,
-                            content_hash,
-                            font.path(),
-                            rep_face,
-                        )
+                        && let PreviewFontFamily::Ready(family) = font
+                            .byte_source()
+                            .preview_source()
+                            .request_family(ui.ctx(), &identity, content_hash, rep_face)
                     {
                         ui.style_mut().override_font_id =
                             Some(egui::FontId::new(body_size, family));
@@ -1005,7 +1057,7 @@ fn draw_picker_body(
                 fonts
                     .iter()
                     .find(|font| font.render_identity_name() == *identity)
-                    .map(|font| (identity.clone(), font.path().to_path_buf()))
+                    .map(|font| (identity.clone(), font.file_path().to_path_buf()))
             });
             *close_requested = true;
         }

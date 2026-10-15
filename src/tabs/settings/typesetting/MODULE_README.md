@@ -24,8 +24,8 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
 
 ## Files and submodules
 - `mod.rs`: pane orchestrator (`SettingsTabState::draw_typesetting` +
-  `draw_rotation_ctrl_wheel_setting`) and the `font_settings` / `font_properties_window`
-  submodule declarations. Re-exports `FontSettingsEditorState` to the parent `settings` module.
+  `draw_rotation_ctrl_wheel_setting`) and the `font_settings` / `font_properties_window` /
+  `font_groups` / `hybrid_fonts` / `font_card_psd` submodule declarations. Re-exports `FontSettingsEditorState` to the parent `settings` module.
 - `font_settings.rs`: `FontSettingsEditorState`, the "Настройки шрифтов" widget. Loads the
   three font categories (folder / imported system / custom) AND the real folder-group names
   off the GUI thread via `font_admin::{load_font_lists, list_folder_group_names}`, reloading
@@ -45,16 +45,30 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   `crates/ms-tab-typing/src/panel/MODULE_README.md`. The remove button
   passes `row.stored_identity` (the document key), NOT the loaded font's render identity, which
   may carry a collision suffix. Draws
-  each font's name in its own typeface (`crate::widgets::request_font_family`, keyed by the
+  each font's name in its own typeface (`FontEntry::byte_source().preview_source()
+  .request_family(..)` over `crate::widgets::request_font_family*`, keyed by the
   font's IDENTITY — `FontEntry::render_identity_name` — PLUS its `content_hash`, with the
-  path as the byte source only; the hash is what retires a binding whose file was replaced,
+  preview source — a file, or a saved custom font's compiled face — as the byte source only; the hash is what retires a binding whose file was replaced,
   and is `0`/"unknown" for the picker catalog, which never reads whole files);
   carries the name-display switch (see below) — the widget `draw_name_mode_switch` and the
   name selectors live here and are reused by `font_groups.rs`;
   and hosts a
   searchable, row-virtualized picker over `font_admin::load_system_catalog()` to import a system
   font (`font_admin::add_imported_font` / `remove_imported_font` / `is_font_imported`).
-  Folder/imported rows are BUTTONS that open the per-font properties window. Owns the
+  Folder/imported rows are BUTTONS that open the per-font properties window. The same
+  off-thread pass also delivers the saved custom fonts (`FontAdminLists::custom`, one
+  `CustomFontRow` per stored font), the hybrid editor's source catalog
+  (`font_admin::hybrid_source_catalog`, built on the worker so the editor sees one catalog per
+  load) and the real fonts' cleaned display labels (a custom name must not repeat one). The
+  "Кастомные шрифты" category is drawn by `hybrid_fonts.rs`. The open properties window of a
+  SAVED custom font follows the loaded snapshot: each frame the reloaded entry is synced into
+  it (`FontPropertiesState::sync_custom_font` — after a rename or a new recipe: the name and the
+  glyph analysis follow), and a font deleted meanwhile closes it. EGUI FONT BOUND: the window
+  holds a display pin (`font_admin::pin_custom_face_display`) while open, so every
+  own-typeface draw of that font — the window's preview and glyph grid, its list row, its
+  group-member rows — keeps the face the window OPENED with; «Применить» registers nothing
+  (the editor's live preview is textures). Worst case: ONE new egui face per properties-window
+  session that changed the recipe (shown once the window closes), never one per Apply. Owns the
   `font_groups::FontGroupsEditorState` rendered as the fourth "Группы" category. Pure helpers
   `font_row_matches` (`pub(super)`, reused by `font_groups`) / `clean_font_display_name` /
   `font_row_name_for_mode` / `unavailable_row_name` are unit-tested.
@@ -110,6 +124,30 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
   `PICKER_PREVIEW_FONT_CAP` (reused from `font_settings.rs`). The loaded font data the section
   draws from travels as one `GroupEditorFonts<'_>` borrow (folder-group names, the two loaded
   categories, the snapshot revision) instead of four parallel parameters.
+- `hybrid_fonts.rs`: SAVED CUSTOM FONTS (`dev-docs/hybrid_fonts_plan.md` §3.4, D6/D7).
+  `HybridFontsSectionState` draws the "Кастомные шрифты" category: one row per stored font —
+  an available one is a frameless button in its OWN compiled typeface (the shared
+  `FontSettingsEditorState::draw_font_name_row`, which never compiles: until the face is cached
+  it draws in the interface font) opening the properties window; an unavailable one (missing
+  source, kind this build cannot compile, damaged recipe) is greyed with the localized reason
+  (`CustomFontUnavailability::tooltip`) and can only be deleted. Delete is the inline two-step
+  confirm (pure transition `delete_step`: arm, confirm with a second SINGLE click, a double
+  click never confirms, auto-disarm when the pointer leaves) through
+  `font_admin::delete_custom_font` (which also drops the font's own kerning record and group
+  memberships). «+ Создать гибридный шрифт» opens the create DIALOG — an `egui::Window` with a
+  pinned `Id`, drawn at the top level of `FontSettingsEditorState::ui` (never nested): a name
+  field, the shared editor body (`font_admin::draw_hybrid_editor`, `CommitButton::HostDrawn`)
+  and «Сохранить» / «Отмена». «Сохранить» validates the name, then `start_commit` builds the
+  FULL face on the editor's worker; only on `HybridEditorOutcome::Committed` is the font stored
+  (`font_admin::create_custom_font`) under the name validated at the click. Closing the dialog
+  cancels a running build. NAME RULE (`validate_custom_font_name`, pure): trimmed, not blank,
+  and different — Unicode case-insensitively — from every other custom font's name AND every
+  real font's display label (the store checks only the custom half). Store refusals map to
+  localized lines (`store_error_message`, exhaustive). `CustomFontProperties` holds the
+  custom-font parts of the properties window: the rename editor (`rename_custom_font`) and the
+  «Редактирование гибрида» body (the shared editor on the stored recipe, `CommitButton::Apply`
+  -> `update_custom_font_recipe`; the identity never changes, so layers, groups and own
+  kerning pairs keep pointing at the font).
 - `font_card_psd.rs`: GUI-FREE reader of a "font card" PSD — a document whose every text layer
   is SET in some font and whose CONTENT is that font's human-readable title. The exact reverse
   of `crate::tabs::typing::psd_export`, and the bulk-fill source for a virtual group:
@@ -152,10 +190,23 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
 - `font_properties_window.rs`: the per-font PROPERTIES window (`FontPropertiesState`, one open
   at a time on `FontSettingsEditorState`). Identity header — family name, the render IDENTITY
   (the PostScript name the project persists) and the file/face — an editable display-name override
-  (wired to `font_admin::set_display_name_override(identity, ..)`; the window's `path` is only the
-  byte source of the analysis and the preview),
+  (wired to `font_admin::set_display_name_override(identity, ..)`; the analysis worker gets the
+  bytes through `font_admin::font_bytes_blocking` and the previews through
+  `FontByteSource::preview_source()`, while the file name shown comes from
+  `FontEntry::file_path()`),
   a live own-typeface preview, and three collapsible sections: the virtualized glyph grid, the
-  font's BUILT-IN kerning pairs, and the user's CUSTOM kerning pairs. The glyph grid and the
+  font's BUILT-IN kerning pairs, and the user's CUSTOM kerning pairs. A SAVED CUSTOM font
+  (`font_admin::is_custom_font_identity`) gets a different body of THREE sections
+  (`draw_custom_body`, decisions D6/D7): «Подробности» (identity, the rename editor from
+  `hybrid_fonts.rs` in place of the display-name override, groups, preview, glyph grid of the
+  COMPILED face), «Кернинговые пары» (the pairs baked into the compiled face — inherited from
+  the sources by weight — shown read-only as the built-in list under its own heading, then the
+  font's own custom pairs through the same custom-kerning section, keyed by the saved identity)
+  and «Редактирование гибрида» (the shared editor, from `hybrid_fonts.rs`). Its analysis gets
+  the bytes through `font_admin::font_bytes_blocking`, which builds the full face on the
+  worker when it is not cached; until then the sections say the font is not built yet. That
+  body scrolls as a whole (the file-font body does not: its sections carry their own bounded
+  scroll areas). The owner lends `PropertiesCx` (source catalog, real-font labels) per frame. The glyph grid and the
   built-in kerning list are collapsed by default (a CJK inventory is thousands of cells and would
   otherwise bury everything under it); the custom-kerning section is OPEN by default because it
   carries the feature's only entry point, the "+ Создать" button. Every localized header and
@@ -247,6 +298,12 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
 - The collision SUFFIX is part of the identity — normalization folds case and whitespace only.
   Folding an identity down to its base before `%` is `identity_base`, used solely by the card
   name resolution (a PSD records the bare PostScript name).
+- LOADED FONTS for group purposes are `GroupEditorFonts::loaded_fonts`: folder, imported and
+  the AVAILABLE saved custom fonts — the one list behind the availability set, the member
+  resolver and the add-member picker. A member whose custom font is unavailable this run is
+  flagged missing (the panel does not list it) and named by its stored custom name
+  (`font_admin::custom_font_name`). The font-card import still resolves against real fonts only
+  (a card carries real PostScript names, never a minted `MSCustom-…` identity).
 - AVAILABILITY (is a member one the typing panel will actually show?) is `member_is_available`,
   used by BOTH the group list's warning color and the member table's red flag, so the two
   surfaces cannot disagree. Besides the normalized loaded-identity lookup it accepts the
@@ -422,6 +479,11 @@ accessors). All heavy font enumeration runs on worker threads; the GUI only poll
 - To change how a custom kerning pair is STORED, resolved onto a font, or applied by the renderer,
   the change is NOT here: edit the typing model behind `font_admin::set_custom_kerning`. This
   module only reads and writes the whole list.
+- To change the saved-custom-font list, its delete, the hybrid create dialog, the custom-font
+  name rule, or the rename / hybrid-editing parts of a custom font's properties window, edit
+  `hybrid_fonts.rs`; the three-section LAYOUT of that window is `font_properties_window.rs`
+  (`draw_custom_body`), because it reuses the window's private grid / kerning / groups
+  sections. The editor body itself is `crates/ms-tab-typing/src/hybrid_editor/`.
 - To change the "Группы" section, the group-editor window or the font-card IMPORT policy (name
   resolution, deduplication, auto-import, the status-line counts), edit `font_groups.rs`.
 - To change how a font-card PSD is read (traversal, font-name pick, title normalization), edit

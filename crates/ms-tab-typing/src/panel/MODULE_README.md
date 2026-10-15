@@ -72,16 +72,17 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   unifies dev-dependency features into the binary it produces, which would silently disable
   persistence in a runnable build. The boundary is covered by
   `font_groups::tests::store_mutations_never_touch_the_real_fonts_directory` in the binary.
-- **SCHEMA 3 — the font is named by its IDENTITY, never by a path.**
+- **SCHEMA 4 — the font is named by its IDENTITY, never by a path.**
   ```jsonc
-  { "version": 3,
+  { "version": 4,
     "system_fonts": [ { "font": "Roboto-Medium", "last_path": "/home/…/Roboto-Medium.ttf" } ],
     "fonts": { "CCWildWordsLower-Regular": {
                  "display_name": "Разговор",
                  "profile": { … },
                  "custom_kerning": [ { "left": "A", "right": "V", "em": -40.0 } ] } },
     "virtual_groups": [ { "name": "Возлюбленная",
-                          "members": [ { "font": "kCCAskForMercy-Regular", "alias": "Основа" } ] } ] }
+                          "members": [ { "font": "kCCAskForMercy-Regular", "alias": "Основа" } ] } ],
+    "custom_fonts": { "MSCustom-0123456789abcdef": { "name": "Гибрид", "kind": "hybrid", … } } }
   ```
   `fonts` keys and `members[].font` are `FontEntry::render_identity_name()` values, so MOVING OR
   RENAMING a font file no longer drops its display name, its profile, its custom kerning or its
@@ -122,7 +123,27 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
     change it bumps the shared revision and persists IMMEDIATELY (not debounced). The bump is the
     delivery mechanism — it is what makes every open typing panel reload its fonts, which is how
     an edited pair reaches the renderer without a restart. A no-op bumps and persists nothing.
-- **VERSION 3 IS A GATE, NOT A MIGRATION.** `custom_kerning` is purely additive and a v2 (or v1)
+- **SAVED CUSTOM FONTS ARE RECIPES (`custom_fonts`, v4).** Each entry is
+  `ms_custom_fonts::CustomFontRecipe::to_json` plus a `name`, keyed by the saved identity
+  `create_custom_font` mints through `custom_fonts::identity` (opaque, stable across recipe
+  edits and renames, so layers, group memberships and the font's own `fonts.<identity>`
+  kerning follow it). The compiled face is never stored here. Decode (`fonts_data`):
+  `CustomFontBody::Known` for a recipe that parses AND validates under
+  `normalize_font_identity`; anything else (unknown `kind`, malformed, invalid) is
+  `CustomFontBody::Unsupported` and keeps the WHOLE entry object verbatim through decode →
+  merge → encode — listed, never edited, deletable. A blank name decodes to the identity;
+  only an entry under a blank identity is dropped. Two keys naming ONE identity once
+  normalized (padding, ASCII case) never overwrite each other: the app's minted spelling,
+  else an already-trimmed key, else the first is the font, every other spelling is `Unsupported` /
+  `IdentityCollision` under its RAW key, verbatim, logged (the merge matches such an entry by
+  its exact key, so it survives a cross-instance merge too). Store rules (`font_settings_store`):
+  names unique case-insensitively among custom fonts (a clash with a real font name is a UI
+  check); a recipe naming a custom font as a source is refused (D4); an unsupported entry is
+  never overwritten (`CustomFontStoreError::Unsupported`); `delete_custom_font` removes the
+  record, `fonts.<identity>` and the group memberships in ONE mutation; the conflict merge
+  adds identities we lack and keeps ours WHOLE (name + recipe are one definition).
+- **VERSIONS 3 AND 4 ARE GATES, NOT MIGRATIONS.** v4 added `custom_fonts` under the same rule
+  as v3: `custom_kerning` is purely additive and a v2 (or v1)
   document decodes exactly as before. The number was bumped because this document is REWRITTEN IN
   FULL on every debounced profile edit and carries no `deny_unknown_fields`: an older build would
   read a v3 document, drop the key it cannot see, and write that loss back within seconds —
@@ -240,7 +261,7 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   duplicate group names collapsed (first wins), user order preserved. Round-trip is lossless for
   sane data.
 - `font_settings_store.rs` is the single process-global runtime store backed by that file:
-  imported system fonts + per-font records + virtual groups + the pending-migration flag behind
+  imported system fonts + per-font records + virtual groups + custom fonts + the pending-migration flag behind
   one `RwLock`, sharing ONE revision counter. Any user-visible mutation bumps the revision (so
   settings lists and typing panels reload) and persists the whole snapshot off the GUI thread.
   `set_font_custom_kerning` is one of them; `set_font_profile` is the one exception (below).
@@ -841,7 +862,7 @@ session long before this call.
   from that pass (see the deferred-migration section). The file-stem
   `label` and any user display-name are for SHOWING the font (combos, lists) ONLY. Write
   sites — all of them write the identity and nothing else:
-  `create_render_data::build_render_data_json_with_font` (the schema-2 `font` key),
+  `create_render_data::build_render_data_json_with_font_recipe` (the schema-2 `font` key),
   `create_apply::build_render_params_for` (`TextRenderParams.font_name`),
   `create_state::font_identity_name_by_idx` (inline `<font=...>` tags), `create_presets`
   (`presets.json`'s `font` + profile keys) and `font_settings_store` (`fonts_data.json`'s
@@ -976,7 +997,7 @@ session long before this call.
   a PostScript name shared ONE preview registration and the second row showed the first one's
   typeface. Hashing the whole catalog was measured and rejected: 2126 files / 543 MiB / ~3.4 s
   warm, against ~12 files / 4.6 MiB / ~19 ms for the contested names alone.
-- THE PROVIDER'S BYTE CACHE EXPIRES, and is keyed by `FontByteSource` (`File` vs `Bundled` —
+- THE PROVIDER'S BYTE CACHE EXPIRES, and is keyed by `ByteCacheKey` (`File` vs `Bundled` —
   one path can be both). A file replaced IN PLACE, with no font-list reload to rebuild the
   provider, used to render from the first resolve's bytes for the rest of the session. The
   cache now re-checks size + mtime at most once per `CACHE_REVALIDATION_INTERVAL` per font
@@ -1016,7 +1037,7 @@ session long before this call.
   per-version default set, `write_text_params` (drops defaults / dead keys / legacy font keys
   and stamps `schema`) and `read_text_params` (fills the defaults of the schema the DOCUMENT
   declares). No other module may decide what an absent key means.
-- WRITE (schema 2, `create_render_data::build_render_data_json_with_font`): the font is named
+- WRITE (schema 2, `create_render_data::build_render_data_json_with_font_recipe`): the font is named
   ONCE, by IDENTITY, under `font`. `font_path` / `font_label` / `font_original_name` /
   `font_family` are never written again. Every value equal to its frozen default is omitted
   (`font`, `text` and `width_px` always survive), an empty `effects` array is omitted, and the
@@ -1149,8 +1170,27 @@ session long before this call.
   re-exports `FontEntry` as an opaque type (fields/constructors private; `pub(crate)`
   accessors). Everything the facade wraps stays `pub(crate)`; do not widen a
   loader/store item to `pub(crate)` — add a facade wrapper instead.
+- **ONE OWNER OF "WHERE ARE THIS FONT'S BYTES": `FontEntry::byte_source()`** (`panel.rs`),
+  returning `FontByteSource` (`File(&Path)` | `Bundled(&'static ms_fonts::StackFont)` |
+  `Custom(&Arc<CustomFontRef>)`; re-exported through `font_admin`). EVERY consumer that reads a font's bytes — the
+  `TabFontProvider` (snapshotted as its private `ProviderSource`), the own-typeface previews
+  (typing combo, advanced-form preview, character table, settings rows / group members /
+  properties window), the character-table coverage probe, the advanced-form metric spec, the
+  picker catalog's contest hashing and the properties-window analysis — `match`es it
+  EXHAUSTIVELY; no `_` arm. A new kind of entry (bytes built in memory, no file) is therefore
+  ONE new variant plus the compiler-listed consumers, never a hunt for `path` reads.
+  `FontByteSource::preview_source()` is the single owner of "what the egui preview draws
+  from" (`FontPreviewSource`: a file — a bundled font's own bundle file —, a saved custom
+  font's compiled face, or the interface font for the ad-hoc entry); every preview site calls
+  `FontPreviewSource::request_family`. The face index is NOT part of the source (the
+  consumer picks the selected or the representative face). `FontEntry::file_path()` answers
+  LOCATION questions only (folder-vs-imported split, the import's `last_path` hint, the file
+  name shown in the properties window, legacy path aliases) and is never read for bytes; the
+  `fonts.rs` loader internals that BUILD file entries (dedupe, `alt_paths`, legacy keys) work
+  on the paths directly by nature.
 - egui own-typeface registration for font previews lives in `ms_widgets::font_preview`
-  (`combo_font_family_name` / `is_font_family_bound` / `request_font_family`), shared by
+  (`combo_font_family_name` / `is_font_family_bound` / `request_font_family` /
+  `request_font_family_from_bytes`, reached through `FontPreviewSource::request_family`), shared by
   `create_presets::draw_font_combo` (through the per-row resolver it lends the combo widget)
   and the settings font UI. It is keyed by
   `(font identity, content hash, face index)` — see the CACHES bullet above for why the
@@ -1162,6 +1202,125 @@ session long before this call.
   the name must be rendered IN THAT FONT when the font is available, via the
   `ms_widgets::font_preview` helpers. Fall back to the default UI font only when the font
   cannot be registered (missing file, unreadable face). New font-name UI must follow this rule.
+
+## Custom fonts in the font model (`custom_font_entry.rs`, `custom_font_select.rs`)
+- A custom font is a RECIPE (`ms_custom_fonts`; saved ones in `fonts_data.json`
+  `custom_fonts`, an ad-hoc one in a layer's `text_params.font_recipe`); its compiled face is a
+  disposable derivative served by `crate::custom_fonts::service`. In the list it is
+  `FontEntryKind::Custom(Arc<CustomFontRef>)`: no file (`file_path()` is empty), one face, a
+  fixed identity, language coverage reported `Full` (the compiler's `CoverageReport` carries
+  counts, not the character set — a known gap).
+- SAVED fonts join at the END of `build_combined_font_list`
+  (`custom_font_entry::build_custom_font_entries`): each recipe's sources are resolved against
+  the finalized real fonts + the bundled entry through a SOURCE-ONLY `TabFontProvider` that the
+  entry keeps (so `CustomFontRef::full_face_blocking` works without the panel), the face key is
+  computed (`service().recipe_key`, hashing the sources — worker only), the entry gets its OWN
+  kerning pairs (`font_custom_kerning(saved identity)`), and the list is re-sorted stably by
+  label. Only AVAILABLE fonts become entries; EVERY record becomes a `CustomFontRow`
+  (`MissingSources` / `UnsupportedKind` / `InvalidRecipe`), mirrored by `font_admin` for the
+  settings rows. `content_hash` of a saved entry = the first 8 bytes of its recipe key, so a
+  recipe or source change re-keys its preview registration. The first PANEL list build of the
+  process starts the disk-cache prune with the listed keys (`load_fonts`).
+- The panel list carries ONE ad-hoc entry (`adhoc_custom_font_entry`, identity
+  `MSCustom-adhoc-hybrid`, label localized at display time), inserted by
+  `fonts::prepend_synthetic_entries` right after the bundled entry (index 0 without the
+  bundle). It is never the default selection (`FontEntry::is_panel_synthetic`), never a
+  provider key, never compiled by itself: the panel's recipe is.
+- RESERVED NAMESPACE: `fonts::is_reserved_identity` = bundled spellings OR `MSCustom…`
+  (`custom_fonts::identity`). A user font claiming such a name is `%hash`-suffixed by
+  `assign_font_identity_names`; the provider registers NO alias key in the custom namespace and
+  `find_font_idx_by_name_forms` stops after the identity pass for such a name, so a layer naming
+  an unavailable custom font is `missing_font`, never a user font.
+- ONE OWNER of "persisted identity vs render name vs recipe": `selected_font_ref`
+  (`custom_font_select.rs`). Real and saved fonts: identity = render name. The ad-hoc entry
+  persists `MSCustom-adhoc-hybrid` + `font_recipe` (`build_render_data_json_for`; the schema
+  writer drops `font_recipe` next to any other font) and renders by
+  `custom_fonts::adhoc::render_name(recipe)` (`build_render_params_for`, the advanced-form
+  metric resolve); unconfigured, it renders by the persisted identity, which resolves to nothing
+  (a missing font, never a substitute). `editor_font_spec` is `None` for it (interface font).
+  `text_params_schema::custom_font_use` is the one reader of these keys for the codec / export.
+- LAYERS AND BLOCKING: the codec (`tab/codec.rs::text_render_params_from_render_data`)
+  renders an ad-hoc layer by its recipe's render name and decodes a layer with a missing or
+  damaged `font_recipe` to `None` (never rendered). The panel's layer load selects the ad-hoc
+  entry through `select_adhoc_font` (installs the stored recipe, or marks it
+  `adhoc_recipe_damaged`); `adhoc_block_caption` then puts the panel into `missing_font` —
+  `typing.hybrid_font.missing_source_caption` when a recipe source is not among the
+  non-custom entries (matched by identity), `typing.hybrid_font.invalid_recipe_caption` for a
+  damaged recipe. `refresh_adhoc_missing_font` re-derives it after every font reload and on a
+  pick of the entry; `install_adhoc_recipe` is the door for a recipe the user configured. A
+  missing SAVED custom font is shown under its stored name (`missing_font_label`).
+- PROFILE MEMORY: the ad-hoc entry behaves like local-preset mode in both identity modes —
+  `store_current_font_profile_by_idx` is a no-op for it (no session profile, never a
+  persisted `set_font_profile` under its shared identity) and picking it restores nothing; a
+  saved custom font keeps per-font memory by its identity. Profile snapshots
+  (`build_font_profile_json_for_idx`, the local-preset payload) carry the ad-hoc recipe.
+- PRESETS: `presets.json` schema 3 (`PRESETS_VERSION`, a gate: an older build refuses it)
+  stores `font_recipe` next to a font-mode preset whose `font` is the ad-hoc identity
+  (`TypingCreatePreset.font_recipe`; written and decoded only there, a damaged one decodes to
+  `None` with a warning). `capture_current_preset` takes it from `selected_font_ref`;
+  `apply_preset_by_name` routes such a preset through `select_adhoc_font` (no profile
+  applied; an absent recipe blocks as damaged). Local presets carry it inside their snapshot.
+- PSD NAMES: `font_post_script_names` lists real fonts only; custom faces are named by the
+  export's own custom-font pass.
+- PROVIDER: a saved identity resolves to the compiled face (`full_face_blocking`, may compile on
+  the render worker) with the font's own pairs; an ad-hoc render name resolves through the
+  interner, compiled over THIS provider's fonts; failures are reported once per name. The
+  provider is also the `SourceResolver` (`create_state::source_resolver`; real + bundled only,
+  `CustomNotAllowed` for any custom name — decision D4), kept typed in
+  `TypingCreatePanelState::source_provider` next to the `dyn` render handle (both set by
+  `install_font_provider`).
+- PREVIEWS never compile and never register a face that is being tuned (egui cannot unload):
+  `FontPreviewSource::CompiledCustom` registers a saved font's full face only while it is in
+  the service's memory, asking for a disk-cache load at most once per 10 s otherwise; the
+  ad-hoc entry is always the interface font. A face is registered once per (identity, recipe
+  key) (`ms_widgets` memo). While a saved font's recipe is tuned (its settings properties
+  window open) the identity is PINNED (`custom_font_entry::pin_custom_face_display`, a
+  refcounted guard): every draw of it uses the key it was opened with, so the worst case is ONE
+  new registration per properties-window session that changed the recipe, not one per Apply.
+  The character table probes saved custom fonts
+  through their compiled face on its worker; the settings analysis uses
+  `font_admin::font_bytes_blocking`.
+
+## The ad-hoc hybrid in the typing UI (`custom_font_select.rs`, `hybrid_dock.rs`)
+- GROUP FILTER: `ui_helpers::font_in_group` (the one owner) makes the ad-hoc entry a member of
+  EVERY group, so no filter hides «Гибридный шрифт». It is never selected on the user's behalf:
+  `ensure_selected_font_in_group` takes the first non-synthetic member, and the combo's display
+  clamp (a font outside the group marks the first row) cannot adopt it
+  (`combo_font_idx_to_adopt`: only a genuine pick selects it).
+- INLINE SPANS: the ad-hoc entry is refused as a span font (`refuse_inline_adhoc_pick`, both
+  font rows; a span tag carries an identity only) and the refusal is explained under the combo
+  while the selection lasts. Saved custom fonts are valid span fonts.
+- ROW under the combo (both panels, only while the ad-hoc entry is selected,
+  `draw_custom_font_row`): «Настроить гибридный шрифт» raises `configure_requested`, which the
+  params body drains (`drain_hybrid_dock_request`) to toggle the dock tab; the recipe summary
+  (`hybrid_summary`, shares from `hybrid_editor::weight_shares`); the dock editor's commit status
+  (`HybridRowStatus`, pushed by `sync_hybrid_dock`). It is drawn outside the missing-font gate:
+  it is how a blocked ad-hoc layer is repaired.
+- DOCK TAB `typing.hybrid_font` (`hybrid_dock.rs`, declared in `tab.rs`, panel `#7` under «Маска»):
+  visible while opened AND the ACTIVE panel's font is the ad-hoc entry (`hybrid_dock_visible`).
+  The editor is bound to `(mode, edit target)`; another panel or layer rebuilds it (an unapplied
+  draft is discarded and a running full-face commit is cancelled by the editor's `Drop`, as on
+  «Закрыть» or when the tab hides), and a clean idle editor follows a changed panel recipe. Its catalog is
+  rebuilt when the panel's provider changes (font reload). The preview sample is the layer text
+  without inline markup (`preview_text_from_layer`).
+- THE CANVAS CHANGES ONLY ON «Применить» (D5): draft edits re-render only the editor's own
+  preview; a finished full-face commit is installed with `install_adhoc_recipe` (clears a
+  damaged / missing-source block when the sources are present) and propagates like a parameter
+  edit — create: parameter snapshot + preview render; edit: `emit_edit_request`. A commit whose
+  binding is no longer current is dropped with a warning. `emit_edit_request` sends nothing for
+  an unconfigured ad-hoc selection, so picking the entry alone never re-renders a layer.
+- UNCONFIGURED IS A BLOCK, NEVER PERSISTED: the ad-hoc entry without a recipe (just picked,
+  or a damaged stored one) sets `missing_font` to its own caption
+  (`typing.hybrid_font.not_configured_caption` / `invalid_recipe_caption`), and the create
+  preview is not even attempted for any blocked ad-hoc selection (`queue_preview_render`: the
+  caption is the status line). Nothing is persisted from it: `selected_adhoc_without_recipe`
+  refuses a new layer (`build_create_text_render_bundle`), a new or saved global preset and a
+  new local preset with `adhoc_unconfigured_status` (names the configure button); local preset
+  snapshots are already refused under `missing_font`. Hence a STORED ad-hoc identity without a
+  recipe can only come from a damaged / foreign document, and loads as damaged.
+- FALLBACK HINT: when the selected font is custom and the last preview render fell back,
+  `create_presets::custom_font_fallback_hint` explains that disabled characters come from the
+  fallback font; it is drawn under the font combo (create panel only).
 
 ## Font-coverage contract (`font_coverage.rs`)
 - Coverage follows the selected TYPESETTING language
@@ -1665,7 +1824,7 @@ of the comic type.
   see `local_preset_preview.rs`.
 - To change the persisted `text_params` FORMAT (a new key, a default, the version), see
   `text_params_schema.rs` — and only there; the writer is
-  `create_render_data::build_render_data_json_with_font`, the reader is
+  `create_render_data::build_render_data_json_with_font_recipe`, the reader is
   `create_apply::apply_render_data_json_with_options`, and the legacy conversion is
   `tab/codec.rs::upgrade_text_params_to_v2`.
 - To change an advanced-form search KNOB (its range, default, persisted name or how it maps
@@ -1683,6 +1842,17 @@ of the comic type.
   `color_presets_store.rs`; to change WHICH pickers offer them, see `ColorPresetsBinding` in
   `panel.rs` and its construction in `facade.rs`; to change the cells or the popup itself, see
   `ms_widgets::color_preset_picker`.
+- To change how a saved custom font becomes a list entry / row, or what a custom preview
+  draws, see `custom_font_entry.rs`; which name a selected font is persisted vs rendered
+  under, and what blocks the ad-hoc entry (missing source, damaged recipe), see
+  `custom_font_select.rs`; how a layer's ad-hoc recipe renders, see
+  `tab/codec.rs::render_font_name`; the provider's custom branches, see
+  `font_provider.rs` (`resolve`, `SourceResolver`); the reserved-name rule, see
+  `fonts::is_reserved_identity` (+ `custom_fonts::identity`).
+- To change the row under the font combo, the inline refusal or the group rule for the ad-hoc
+  entry, see `custom_font_select.rs` / `ui_helpers::font_in_group`; the typing dock host of the
+  hybrid editor (visibility, binding, commit), see `hybrid_dock.rs`; its panel and default
+  anchor, see `tab.rs` (`TYPING_HYBRID_FONT_TAB`, `typing_default_dock_layout`).
 - To change what a language requires, see `font_coverage.rs`
   (`script_chars_for_group`, `extra_chars_for_language`, the `*_EXTRA_CHARS` sets).
 - To change when coverage is recomputed, see `facade.rs::begin_frame` (language-change

@@ -942,18 +942,25 @@ impl TypingCreatePanelState {
             // Edge-triggered writeback (mirrors the non-selection branch's
             // `font_idx != prev_font_idx` guard): only a real pick this frame
             // writes the span font label, so selecting text can never insert a
-            // `<font>` tag on its own.
+            // `<font>` tag on its own. The ad-hoc hybrid entry is refused as a span
+            // font (`custom_font_select::refuse_inline_adhoc_pick`).
             if let Some(picked) = outcome.user_pick
+                && !self.refuse_inline_adhoc_pick(picked)
                 && let Some(label) = self.font_identity_name_by_idx(picked)
             {
                 style.font_label = Some(label);
             }
         } else {
-            self.selected_font_idx = outcome.font_idx;
+            self.selected_font_idx = self.combo_font_idx_to_adopt(outcome.font_idx, outcome.user_pick);
             if self.selected_font_idx != prev_font_idx {
                 // Любой выбор из списка — это доступный шрифт, поэтому снимаем
                 // блокировку рендера по ненайденному шрифту.
                 self.missing_font = None;
+                // Except the ad-hoc hybrid entry, whose recipe may name sources this list
+                // lacks: its block state is derived on the pick. The create panel also
+                // re-derives it in `handle_create_font_selection_change`; the EDIT panel
+                // (no per-font memory) relies on this call.
+                self.refresh_adhoc_missing_font();
                 if font_memory_enabled {
                     *changed |= self.handle_create_font_selection_change(prev_font_idx);
                 } else {
@@ -969,6 +976,11 @@ impl TypingCreatePanelState {
                 t!("typing.params.pick_available_font_hint"),
             );
         }
+        // Custom-font lines under the combo, outside the missing-font gate below: the
+        // «Настроить гибридный шрифт» button is how a blocked ad-hoc layer is repaired.
+        self.draw_inline_adhoc_refusal(ui, selection_mode);
+        self.draw_custom_font_row(ui);
+        self.draw_custom_font_fallback_hint(ui);
 
         // A font with one face (or none) offers no choice, so the combo is not drawn at all:
         // it could only ever re-select the face already selected. Nothing is lost by hiding

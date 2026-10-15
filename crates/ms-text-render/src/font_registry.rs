@@ -327,7 +327,9 @@ pub fn load_font_content(
     // the built-in font throw its pooled system away.
     if let Some(ids) = resident_ids_in(font_system, content.bytes()) {
         let selected = resolve_registered_face(font_system, &ids, face_index);
-        font_cache.store_loaded(content_id, ids);
+        // Adopted, not registered: the bundled buffer is the system's own base, so it
+        // adds no caller bytes to the pool's byte budget.
+        font_cache.store_loaded(content_id, ids, 0);
         font_cache.store_meta(content_id, face_index, selected.clone());
         apply_default_families(font_system, font_cache, &selected);
         return Ok(selected);
@@ -348,6 +350,8 @@ pub fn load_font_content(
     };
     // Register the bytes into this system's db. fontdb takes the same erased
     // `Arc<dyn AsRef<[u8]>>` the content holds, so the buffer is shared, not copied.
+    // Its length is what this system now keeps resident (the pool's byte budget).
+    let resident_bytes = (*data).as_ref().len();
     let source = fontdb::Source::Binary(data);
     let loaded_ids = font_system.db_mut().load_font_source(source);
     if loaded_ids.is_empty() {
@@ -383,7 +387,7 @@ pub fn load_font_content(
         ));
     }
     // `load_font_source` returns a `TinyVec`; store an owned `Vec` in the cache.
-    font_cache.store_loaded(content_id, loaded_ids.to_vec());
+    font_cache.store_loaded(content_id, loaded_ids.to_vec(), resident_bytes);
     font_cache.store_meta(content_id, face_index, selected.clone());
     apply_default_families(font_system, font_cache, &selected);
     Ok(selected)

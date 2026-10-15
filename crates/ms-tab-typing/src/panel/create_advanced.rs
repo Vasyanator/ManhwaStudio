@@ -993,14 +993,15 @@ impl TypingCreatePanelState {
                 .faces
                 .get(self.selected_face_idx)
                 .map_or(0, |face| face.face_index);
-            // The path is only the BYTE SOURCE for the one-time egui registration; the
-            // identity plus the content hash are what the family name and the cache key
-            // are derived from (the hash expires a binding whose file was replaced).
-            let path = font.path.clone();
+            // The preview source is only the BYTE SOURCE for the one-time egui
+            // registration; the identity plus the content hash are what the family name and
+            // the cache key are derived from (the hash expires a binding whose file was
+            // replaced). The ad-hoc custom entry previews in the interface font.
+            let preview = font.byte_source().preview_source();
             let identity = font.render_identity_name();
             let content_hash = font.content_hash();
             if let ms_widgets::PreviewFontFamily::Ready(family) =
-                ms_widgets::request_font_family(ctx, &identity, content_hash, &path, face_index)
+                preview.request_family(ctx, &identity, content_hash, face_index)
             {
                 return egui::FontId::new(PREVIEW_FONT_SIZE_PX, family);
             }
@@ -1057,7 +1058,7 @@ impl TypingCreatePanelState {
     /// the renderer performs, so the metric can never measure a different file than the
     /// one the page is drawn with.
     fn advanced_form_font_content(&self) -> Option<&FontContent> {
-        let identity = self.fonts.get(self.selected_font_idx)?.render_identity_name();
+        let identity = self.selected_font_ref()?.render_name;
         let loaded = self.advanced_form_font.as_ref()?;
         if loaded.identity != identity {
             return None;
@@ -1100,12 +1101,10 @@ impl TypingCreatePanelState {
             }
         }
 
-        // 2. Ask for the current selection when nothing answers for it yet.
-        let Some(identity) = self
-            .fonts
-            .get(self.selected_font_idx)
-            .map(FontEntry::render_identity_name)
-        else {
+        // 2. Ask for the current selection when nothing answers for it yet. The key is the
+        //    RENDER name (`selected_font_ref`): equal to the identity for every font but a
+        //    configured ad-hoc custom entry, whose bytes are those of its own recipe.
+        let Some(identity) = self.selected_font_ref().map(|font_ref| font_ref.render_name) else {
             return;
         };
         let answered = self
@@ -1194,6 +1193,16 @@ impl TypingCreatePanelState {
     /// в них означает «мерить посимвольно».
     pub(super) fn advanced_form_metric_spec(&self) -> AdvancedFormMetricSpec {
         let font = self.fonts.get(self.selected_font_idx);
+        // The metric's BYTES come from the provider resolve (`content`); the byte source
+        // only decides whether the bundled chain is poured in after them and which file
+        // the diagnostics name / the pour skips.
+        let (bundled_stack, path) = match font.map(FontEntry::byte_source) {
+            Some(FontByteSource::File(path)) => (false, path.to_path_buf()),
+            Some(FontByteSource::Bundled(stack_font)) => (true, stack_font.path.clone()),
+            // A custom face is ONE compiled file with no bundled chain behind it and no
+            // file of its own to name.
+            Some(FontByteSource::Custom(_)) | None => (false, PathBuf::new()),
+        };
         AdvancedFormMetricSpec {
             content: self.advanced_form_font_content().cloned(),
             // The FACE index is the panel's selection, not the content's representative
@@ -1201,8 +1210,8 @@ impl TypingCreatePanelState {
             face_index: font
                 .and_then(|font| font.faces.get(self.selected_face_idx))
                 .map_or(0, |face| face.face_index),
-            bundled_stack: font.is_some_and(|font| font.bundled_stack_font().is_some()),
-            path: font.map(|font| font.path.clone()).unwrap_or_default(),
+            bundled_stack,
+            path,
             display_label: font
                 .map(|font| font.display_label().to_string())
                 .unwrap_or_default(),

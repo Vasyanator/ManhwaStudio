@@ -440,7 +440,12 @@ impl TypingCreatePanelState {
         // `store_current_local_preset_snapshot` refuses to write — and the preset created
         // here would be persisted with a null profile: a row that renders nothing, restores
         // nothing and cannot be repaired. Refusing, and saying so in the status line the
-        // missing font is already reported through, is the only honest answer.
+        // missing font is already reported through, is the only honest answer. An ad-hoc
+        // hybrid without a recipe is refused by the same gate, with its own reason.
+        if self.selected_adhoc_without_recipe() {
+            self.status_line = Self::adhoc_unconfigured_status();
+            return;
+        }
         if self.missing_font.is_some() {
             self.status_line = t!("typing.local_presets.create_blocked_missing_font").to_string();
             return;

@@ -21,8 +21,9 @@ Key functions:
 - `TypingCreatePanelState::new` — construction; no font I/O.
 - `spawn_shared_font_reload` (free fn) — ONE background load serving BOTH panels.
 - `TypingCreatePanelState::poll_font_reload_results` — installs a finished load,
-  performs the INITIAL selection, marks the list authoritative and releases whatever
-  was waiting for it (the one-shot legacy-preset migration).
+  performs the INITIAL selection, re-derives the ad-hoc custom font's missing-source
+  block, marks the list authoritative and releases whatever was waiting for it (the
+  one-shot legacy-preset migration).
 - `panel_fonts_dir` / `set_test_fonts_dir` — the fonts directory a panel binds to;
   injectable under `#[cfg(test)]`, and never the checkout's own `fonts/` there.
 
@@ -113,12 +114,12 @@ impl TypingCreatePanelState {
         // config), so the background load merges exactly what the store knows now.
         let imported_system_fonts = super::font_settings_store::imported_system_fonts();
         let imported_fonts_revision = super::font_settings_store::imported_fonts_revision();
-        // The bundled-stack entry belongs to the PANEL list only (the settings
-        // font-administration list must not get it), so it is injected here and again by
-        // `load_fonts` in the reload worker. It carries `'static` bytes and reads no file,
-        // so it is the one entry a fresh panel may already hold.
+        // The synthetic entries (bundled interface font, ad-hoc custom font) belong to the
+        // PANEL list only (the settings font-administration list must not get them), so
+        // they are injected here and again by `load_fonts` in the reload worker. Neither
+        // reads a file, so they are the only entries a fresh panel may already hold.
         let mut fonts: Vec<FontEntry> = Vec::new();
-        prepend_bundled_ui_font(&mut fonts);
+        prepend_synthetic_entries(&mut fonts);
         // Font groups (real folder groups + virtual ones) arrive with the same background
         // load; an empty list means "no group filter offered yet", which the combo already
         // renders correctly.
@@ -134,12 +135,15 @@ impl TypingCreatePanelState {
         let (request_tx, result_rx) = spawn_preview_render_worker();
         // The list is not loaded yet, so the honest status is "loading", not "no fonts".
         let status_line = t!("typing.fonts.reloading_status").to_string();
-        let font_provider: Arc<dyn FontProvider> = Arc::new(TabFontProvider::from_fonts(&fonts));
+        let source_provider = Arc::new(TabFontProvider::from_fonts(&fonts));
+        let font_provider: Arc<dyn FontProvider> = Arc::clone(&source_provider) as Arc<dyn FontProvider>;
         let mut state = Self {
             input_labels: crate::tab::input::TypingInputLabels::default(),
             fonts_dir,
             fonts,
             font_provider,
+            source_provider,
+            custom_font: CustomFontSelection::default(),
             font_groups,
             selected_font_group: None,
             imported_system_fonts,
@@ -299,6 +303,20 @@ impl TypingCreatePanelState {
         Arc::clone(&self.font_provider)
     }
 
+    /// Installs `provider` as BOTH the render font source and the custom-font source
+    /// resolver, so the two can never disagree about the font list.
+    fn install_font_provider(&mut self, provider: Arc<TabFontProvider>) {
+        self.font_provider = Arc::clone(&provider) as Arc<dyn FontProvider>;
+        self.source_provider = provider;
+    }
+
+    /// The same provider as the custom-font SOURCE lookup (recipe source identity -> bytes
+    /// plus that font's user kerning; custom fonts refused), for the hybrid editor, the
+    /// compile tickets and the PSD export of the later custom-font packages. Cheap (Arc).
+    pub(super) fn source_resolver(&self) -> Arc<dyn SourceResolver> {
+        Arc::clone(&self.source_provider) as Arc<dyn SourceResolver>
+    }
+
     pub(super) fn eyedropper_active(&self) -> bool {
         if self.text_color_selector.eyedropper_active() {
             return true;
@@ -428,7 +446,7 @@ impl TypingCreatePanelState {
                     self.fonts = result.fonts;
                     // Rebuild the render font source from the new list so renders and
                     // inline `<font=...>` tags resolve against the reloaded fonts.
-                    self.font_provider = Arc::new(TabFontProvider::from_fonts(&self.fonts));
+                    self.install_font_provider(Arc::new(TabFontProvider::from_fonts(&self.fonts)));
                     // The local-preset row previews were rendered through the PREVIOUS
                     // provider and their cache key does not carry it, so a reload (an
                     // imported, replaced or removed font) must invalidate them wholesale.
@@ -458,19 +476,20 @@ impl TypingCreatePanelState {
                             self.missing_font = None;
                         }
                         None => {
-                            if let Some(identity) = previous_identity.clone() {
-                                self.missing_font = Some(identity);
+                            if let Some(identity) = previous_identity.as_deref() {
+                                self.missing_font = Some(custom_font_select::missing_font_label(identity));
                             } else {
                                 // Nothing was selected yet (this is the panel's FIRST
                                 // list): apply the historical default. The built-in
                                 // interface font heads the list for discoverability but
-                                // must not become the default, so pick the first of the
-                                // user's OWN fonts and fall back to index 0 — the built-in
-                                // entry — only when the user has none.
+                                // must not become the default (nor may the ad-hoc custom
+                                // entry after it), so pick the first of the user's OWN
+                                // fonts and fall back to index 0 — the built-in entry —
+                                // only when the user has none.
                                 self.selected_font_idx = self
                                     .fonts
                                     .iter()
-                                    .position(|font| font.bundled_stack_font().is_none())
+                                    .position(|font| !font.is_panel_synthetic())
                                     .unwrap_or(0);
                             }
                             // Keep the index inside the list so the rest of the panel
@@ -481,6 +500,10 @@ impl TypingCreatePanelState {
                                 .min(self.fonts.len().saturating_sub(1));
                         }
                     }
+                    // The ad-hoc entry is restored by its identity alone; whether it can
+                    // render depends on its recipe's SOURCES, which this reload may have
+                    // added or removed, so its block state is derived again.
+                    self.refresh_adhoc_missing_font();
                     self.ensure_selected_font_in_group();
                     self.clamp_face_index();
                     // The SOUGHT identity outlives a failed restore. Overwriting it with
@@ -520,6 +543,9 @@ impl TypingCreatePanelState {
                         // (`dev-docs/local_presets_plan.md` §5).
                         && self.identity_mode == ParamIdentityMode::Font
                         && restored.is_some()
+                        // The ad-hoc custom entry has no per-font memory (it behaves like
+                        // local-preset mode): nothing is restored for it.
+                        && !self.selected_font_is_adhoc()
                         && let Some(identity) = self.current_font_identity()
                     {
                         if let Some(profile) = self.font_profiles_by_identity.get(&identity).cloned()
@@ -660,7 +686,14 @@ impl TypingCreatePanelState {
             return;
         }
 
-        if let Some(filtered_idx) = self.filtered_font_indices().into_iter().next() {
+        // The first member that is a real choice: the ad-hoc hybrid entry belongs to every
+        // group (`font_in_group`) but must never be selected on the user's behalf — it is not
+        // a font until configured (`FontEntry::is_panel_synthetic`).
+        if let Some(filtered_idx) = self
+            .filtered_font_indices()
+            .into_iter()
+            .find(|&idx| self.fonts.get(idx).is_some_and(|font| !font.is_panel_synthetic()))
+        {
             self.selected_font_idx = filtered_idx;
             self.selected_face_idx = 0;
         }
@@ -733,7 +766,11 @@ impl TypingCreatePanelState {
     /// 5. the original family name, 6. the file-stem `label`, 7. the path stem.
     ///
     /// Forms 2-7 are READ-ONLY legacy aliases; nothing writes them any more. Returns
-    /// `None` for an empty name or no match.
+    /// `None` for an empty name or no match. A name in the reserved custom-font namespace
+    /// stops after form 1 (the provider registers no alias there). The one intended
+    /// difference from the provider: the panel's ad-hoc custom entry IS found by its
+    /// persisted identity here (selection), while the provider resolves ad-hoc layers only
+    /// by their per-recipe render names.
     pub(super) fn find_font_idx_by_name_forms(&self, font_name: &str) -> Option<usize> {
         self.find_font_idx_by_name_forms_in(font_name, None)
     }
@@ -765,6 +802,12 @@ impl TypingCreatePanelState {
 
         if let Some(idx) = first(&|font| font_matches_identity_name(font, &name_norm)) {
             return Some(idx);
+        }
+        // A name in the reserved custom-font namespace resolves by identity or not at all,
+        // exactly as in `TabFontProvider::from_fonts` (no alias key is registered there):
+        // a layer naming an unavailable custom font must not fall back to a user font.
+        if crate::custom_fonts::identity::is_reserved_custom_identity(&name_norm) {
+            return None;
         }
         if fonts::BUNDLED_UI_FONT_LEGACY_IDENTITY
             .trim()

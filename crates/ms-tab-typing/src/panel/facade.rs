@@ -12,9 +12,11 @@ Main responsibilities:
   render pump) before the dock, `end_frame` (settings deep-link drain) after it;
 - draw the four dock tab bodies — `draw_preview_tab_body`, `draw_params_tab_body`,
   `draw_effects_tab_body`, `draw_actions_tab_body` — into the `Ui` the dock gives
-  them. The surrounding panel (position, size, collapse, tab header) belongs to
+  them (the fifth, «Гибридный шрифт», lives in `hybrid_dock.rs`; `begin_frame` runs its
+  upkeep and the params body drains its open request). The surrounding panel (position, size, collapse, tab header) belongs to
   the dock layout; nothing here creates an `Area` or a `Frame` of its own;
-- turn what a section reports into a queued request for `tab.rs` to drain.
+- turn what a section reports into a queued request for `tab.rs` to drain (a PSD export
+  request also carries the custom-font snapshot, `custom_font_export_resolver`).
 
 Notes:
 Method visibility was escalated one level because the impl moved a directory
@@ -24,6 +26,7 @@ the sibling `tab.rs` can still call them, and the former private methods are now
 */
 
 use super::*;
+use crate::custom_fonts::export::CustomFontExportResolver;
 use crate::psd_export::FontPostScriptNames;
 use ms_models::SessionCapabilities;
 
@@ -55,6 +58,9 @@ impl TypingTopPanelState {
         self.edit_panel.poll_font_settings_changes();
         self.create_panel.poll_font_reload_results();
         self.edit_panel.poll_font_reload_results();
+        // After the reload results: the hybrid dock's catalog follows the provider the
+        // reload may just have replaced.
+        self.sync_hybrid_dock();
         // Presets belong to the CREATE panel only (`preview_enabled`): install the
         // off-thread seed, finish the one-shot `user_config` -> `fonts/presets.json`
         // migration once its background read lands, adopt what another app instance wrote,
@@ -250,6 +256,8 @@ impl TypingTopPanelState {
         if changed && self.mode == TypingTopPanelMode::EditText {
             self.emit_edit_request();
         }
+        // «Настроить гибридный шрифт» is drawn by this body (under either panel's font combo).
+        self.drain_hybrid_dock_request();
     }
 
     /// Body of the «Эффекты» dock tab (`typing.effects`).
@@ -302,6 +310,7 @@ impl TypingTopPanelState {
             repaginate: self.repaginate,
             repaginate_pages_warning: self.repaginate_pages_warning,
             export_base_name: self.export_base_name.as_str(),
+            psd_bundle_custom_fonts: self.psd_bundle_custom_fonts,
         };
         let actions = match self.mode {
             TypingTopPanelMode::CreateText => self.create_panel.draw_right_section(ui, inputs),
@@ -333,6 +342,9 @@ impl TypingTopPanelState {
         // Reported by the section, never re-derived here: `expire_repaginate_pages_warning`
         // drops the confirmation on the next frame unless the block was on screen in this one.
         self.repaginate_block_drawn = actions.repaginate_block_drawn;
+        if let Some(bundle) = actions.changed_psd_bundle_custom_fonts {
+            self.psd_bundle_custom_fonts = bundle;
+        }
         if let Some(destination) = actions.export_destination {
             self.pending_export_destination = Some(destination);
         }
@@ -416,6 +428,11 @@ impl TypingTopPanelState {
         text: String,
         width_px: u32,
     ) -> Result<(TextRenderParams, Value), String> {
+        // No layer is ever created from an ad-hoc hybrid without a recipe: it has no face, and
+        // the stored identity without its recipe would read back as a damaged layer.
+        if self.create_panel.selected_adhoc_without_recipe() {
+            return Err(TypingCreatePanelState::adhoc_unconfigured_status());
+        }
         let mut render_params = self
             .create_panel
             .build_render_params_for(text.clone(), width_px.max(1))
@@ -654,16 +671,46 @@ impl TypingTopPanelState {
     /// Drains the export the user confirmed in the dialog, if any.
     ///
     /// Returns the picked destination together with the settings that were in effect at the
-    /// moment of the click: the format, the re-pagination options, and the output base name
-    /// last pushed by [`Self::set_export_context`]. `None` while no export is queued; the
-    /// request is handed out exactly once.
+    /// moment of the click: the format, the re-pagination options, the output base name
+    /// last pushed by [`Self::set_export_context`] and, for PSD, the custom-font bundle flag
+    /// plus the custom-font snapshot ([`Self::custom_font_export_resolver`]). `None` while no
+    /// export is queued; the request is handed out exactly once.
     pub(crate) fn take_export_request(&mut self) -> Option<TypingExportRequest> {
-        self.pending_export_destination.take().map(|destination| TypingExportRequest {
+        let destination = self.pending_export_destination.take()?;
+        let psd = self.export_format == TypingExportFormat::Psd;
+        Some(TypingExportRequest {
             destination,
             format: self.export_format,
             repaginate: self.repaginate,
             output_base_name: self.export_base_name.clone(),
+            bundle_custom_fonts: psd && self.psd_bundle_custom_fonts,
+            custom_fonts: psd.then(|| Arc::new(self.custom_font_export_resolver())),
         })
+    }
+
+    /// Snapshot of how the PSD export finds custom-font faces: every AVAILABLE saved custom
+    /// font of the create panel's list (identity, shown name, recipe) plus the panel's source
+    /// resolver, the same one its renders use, so the export compiles the very faces the
+    /// canvas shows. Cheap (Arc clones over the font list); resolved on the export worker.
+    fn custom_font_export_resolver(&self) -> CustomFontExportResolver {
+        let saved = self.create_panel.fonts.iter().filter_map(|font| {
+            let custom = font.custom_font()?;
+            let recipe = custom.recipe.as_ref()?;
+            (!custom.is_adhoc()).then(|| (font.render_identity_name(), font.display_label().to_owned(), Arc::clone(recipe)))
+        });
+        CustomFontExportResolver::new(saved, self.create_panel.source_resolver())
+    }
+
+    /// «Положить рядом кастомные шрифты» (PSD export option); read on exit to persist.
+    pub(crate) fn psd_bundle_custom_fonts(&self) -> bool {
+        self.psd_bundle_custom_fonts
+    }
+
+    /// Seeds «Положить рядом кастомные шрифты» ONCE at startup from `user_config.json`
+    /// (`TextTab.psd_bundle_custom_fonts`). Must not be called every frame (it would override
+    /// the user's live toggle).
+    pub(crate) fn set_psd_bundle_custom_fonts(&mut self, bundle: bool) {
+        self.psd_bundle_custom_fonts = bundle;
     }
 
     pub(crate) fn take_round_text_positions_request(&mut self) -> bool {
@@ -759,6 +806,12 @@ impl TypingTopPanelState {
                 // выберет другой доступный шрифт. Иначе текст отрисовался бы чужим
                 // (подставленным) шрифтом.
                 if self.edit_panel.missing_font.is_some() {
+                    return;
+                }
+                // The ad-hoc hybrid entry picked but not configured yet: there is no face to
+                // render, and the layer must keep its font until «Применить» in the hybrid
+                // dock installs a recipe (`hybrid_dock::apply_committed_hybrid_recipe`).
+                if self.edit_panel.selected_font_is_adhoc() && self.edit_panel.custom_font.adhoc_recipe.is_none() {
                     return;
                 }
                 let Some(mut render_params) = self.edit_panel.build_render_params() else {

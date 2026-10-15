@@ -23,16 +23,28 @@ Main responsibilities:
   persisted in `fonts_data.json`) into the renderer's `CustomKerningTable` and attach
   them to every `FontContent` this provider hands out. This module is the ONLY seam
   between the persisted `CustomKerningPair` list and the render-side lookup table.
+- serve CUSTOM fonts: a saved custom font by its identity (its compiled full face, from
+  `CustomFontRef::full_face_blocking`), an AD-HOC layer recipe by its render name
+  (`MSCustom-adhoc-<16 hex>`, recovered through `custom_fonts::adhoc`) with this provider as
+  the source resolver; the persisted ad-hoc identity itself resolves to nothing;
+- implement `custom_fonts::sources::SourceResolver`: a recipe source identity -> bytes +
+  that font's user kerning, refusing custom fonts (decision D4).
 
 Key structures:
-- `ProviderEntry`: how to obtain one font's bytes (a file path, or a bundled stack
-  font whose bytes are already resident), plus that font's shared
+- `ProviderEntry`: how to obtain one font's bytes (`ProviderSource`: a file path, or a
+  bundled stack font whose bytes are already resident — taken from
+  `FontEntry::byte_source`, the one owner of that answer), plus that font's shared
   `CustomKerningTable`.
-- `FontByteSource`: what a cache slot belongs to — a file, or one bundled stack font.
+- `ByteCacheKey`: what a cache slot belongs to — a file, or one bundled stack font.
 - `FileStamp` / `CachedFontBytes`: the cached buffer and what proves it is still current.
 - `TabFontProvider`: the panel-owned `FontProvider`.
 
 Notes:
+RESERVED CUSTOM NAMES RESOLVE BY IDENTITY ONLY. No alias pass registers a key in the
+custom-font namespace (`MSCustom…`), so a layer naming an unavailable saved custom font can
+never fall back to a user font whose family name or label happens to read like it; the
+panel's `find_font_idx_by_name_forms` applies the same rule.
+
 Normalization mirrors the renderer's `normalize_inline_font_label`
 (`trim().to_ascii_lowercase()`) so a name resolves identically on both sides. The
 identity primary key is unique in the common case (`assign_font_identity_names`
@@ -69,9 +81,15 @@ the cache and re-reading the file on every resolve. Only an UNKNOWN name resolve
 */
 
 use super::*;
+use crate::custom_fonts::adhoc;
+use crate::custom_fonts::identity::{is_adhoc_render_name, is_reserved_custom_identity};
+use crate::custom_fonts::service::{FaceResult, service};
+use crate::custom_fonts::sources::{ResolvedSource, SourceError, user_kerning_per_mille};
+use crate::panel::custom_font_entry::resolve_recipe_sources;
 use crate::render_next::{
     CustomKerningTable, FontBytes, FontContent, FontProvider, font_content_id,
 };
+use ms_custom_fonts::KerningPairPerMille;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -95,7 +113,7 @@ const CACHE_REVALIDATION_INTERVAL: Duration = Duration::from_secs(2);
 /// file's current bytes. One cache slot for both would let whichever resolved first
 /// decide what the other gets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum FontByteSource {
+enum ByteCacheKey {
     /// Bytes read from this file on disk.
     File(PathBuf),
     /// Bytes of a bundled stack font, already resident for the process. The path only
@@ -140,18 +158,61 @@ struct CachedFontBytes {
     checked_at: Instant,
 }
 
+/// Owned snapshot of a font's [`FontByteSource`] (`FontEntry::byte_source`), so the
+/// provider can outlive the panel font list it was built from.
+#[derive(Debug, Clone)]
+enum ProviderSource {
+    /// Bytes are read from this file on disk (and revalidated, see `resolve`).
+    File(PathBuf),
+    /// The synthetic built-in entry: its bytes come from `ms_fonts::bytes` (read once
+    /// per process, shared with the egui UI and with the renderer's own font base)
+    /// instead of from a second read of the same file.
+    Bundled(&'static ms_fonts::StackFont),
+    /// A saved custom font: its bytes are its compiled full face (the compile service's
+    /// memory / disk cache, or a compile on this render worker). Never byte-cached here.
+    Custom(Arc<CustomFontRef>),
+}
+
+impl ProviderSource {
+    /// Snapshots `font`'s byte source.
+    fn of(font: &FontEntry) -> Self {
+        match font.byte_source() {
+            FontByteSource::File(path) => Self::File(path.to_path_buf()),
+            FontByteSource::Bundled(stack_font) => Self::Bundled(stack_font),
+            FontByteSource::Custom(custom) => Self::Custom(Arc::clone(custom)),
+        }
+    }
+
+    /// The file this source names: the file read for `File`, the bundle file a
+    /// `Bundled` font was loaded from, an empty path for a custom font. For diagnostics
+    /// and identity comparisons only.
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(path) => path,
+            Self::Bundled(stack_font) => &stack_font.path,
+            Self::Custom(_) => Path::new(""),
+        }
+    }
+
+    /// The byte-cache slot of this source (see [`ByteCacheKey`]); `None` for a custom
+    /// font, whose bytes the compile service caches.
+    fn cache_key(&self) -> Option<ByteCacheKey> {
+        match self {
+            Self::File(path) => Some(ByteCacheKey::File(path.clone())),
+            Self::Bundled(stack_font) => Some(ByteCacheKey::Bundled(stack_font.path.clone())),
+            Self::Custom(_) => None,
+        }
+    }
+}
+
 /// One resolvable font entry: how to obtain its bytes plus the face to use and the
 /// font's original name.
-///
-/// `bundled` is `Some` only for the synthetic built-in entry; its bytes come from
-/// `ms_fonts::bytes` (read once per process, shared with the egui UI and with the
-/// renderer's own font base) instead of from a second read of the same file.
 #[derive(Debug, Clone)]
 struct ProviderEntry {
-    path: PathBuf,
+    /// Where the bytes come from.
+    source: ProviderSource,
     face_index: usize,
     original_name: String,
-    bundled: Option<&'static ms_fonts::StackFont>,
     /// The font's user-authored kerning pair overrides
     /// (`FontEntry::custom_kerning`), already converted to the renderer's
     /// lookup-optimised form, or `None` when the font has none.
@@ -163,6 +224,10 @@ struct ProviderEntry {
     /// `spawn_font_reload` -> `poll_font_reload_results`), so there is nothing to
     /// invalidate here.
     custom_kerning: Option<Arc<CustomKerningTable>>,
+    /// The same pairs in the custom-font compiler's form, handed to a recipe that uses
+    /// this font as a SOURCE (`SourceResolver`), so a hybrid inherits the source's
+    /// effective kerning. Built once per provider like `custom_kerning`.
+    source_kerning: Arc<[KerningPairPerMille]>,
 }
 
 /// Converts a font entry's persisted kerning pairs into the renderer's runtime
@@ -200,11 +265,11 @@ pub(crate) struct TabFontProvider {
     by_name: HashMap<String, ProviderEntry>,
     /// byte source -> cached bytes; populated lazily on first resolve of a font and
     /// re-read when the file behind it changed (see [`CACHE_REVALIDATION_INTERVAL`]).
-    cache: Mutex<HashMap<FontByteSource, CachedFontBytes>>,
+    cache: Mutex<HashMap<ByteCacheKey, CachedFontBytes>>,
     /// `(path, operation)` pairs already reported. A failing resolve is retried on every
     /// later resolve (the file may reappear), so without this set the same warning would
     /// be written on every render.
-    reported_failures: Mutex<HashSet<(PathBuf, &'static str)>>,
+    reported_failures: Mutex<HashSet<(String, &'static str)>>,
     /// Set once a poisoned provider mutex has been reported, so the recovery is logged
     /// once per provider instead of on every resolve.
     poison_reported: AtomicBool,
@@ -289,14 +354,20 @@ impl TabFontProvider {
     fn with_revalidation(fonts: &[FontEntry], revalidate_after: Duration) -> Self {
         let mut by_name = HashMap::with_capacity(fonts.len());
         let entry_for = |font: &FontEntry| ProviderEntry {
-            path: font.path.clone(),
+            source: ProviderSource::of(font),
             face_index: font.faces.first().map(|face| face.face_index).unwrap_or(0),
             original_name: font.original_name.clone(),
-            bundled: font.bundled_stack_font(),
             custom_kerning: custom_kerning_table(font),
+            source_kerning: user_kerning_per_mille(font.custom_kerning()),
         };
+        // The panel's ad-hoc custom entry is never a key: its persisted identity is shared
+        // by every ad-hoc layer, so renders go through per-recipe render names instead.
+        let fonts: Vec<&FontEntry> = fonts.iter().filter(|font| !font.is_adhoc_custom()).collect();
+        // An alias key in the reserved custom-font namespace is never registered (see the
+        // file header): such a name resolves by identity or not at all.
+        let alias_allowed = |key: &str| !is_reserved_custom_identity(key);
         // Primary keys: normalized collision-aware identities, FIRST-wins on collision.
-        for font in fonts {
+        for &font in &fonts {
             let identity = font.identity_name.trim();
             if identity.is_empty() {
                 continue;
@@ -309,13 +380,13 @@ impl TabFontProvider {
                 std::collections::hash_map::Entry::Occupied(existing) => {
                     // Two entries resolved to the same identity (should be rare after
                     // `assign_font_identity_names`): keep the first and warn.
-                    if existing.get().path != font.path {
+                    if existing.get().source.path() != font.path.as_path() {
                         ms_log::runtime_log::log_warn(format!(
                             "TabFontProvider: render identity '{}' is shared by two files; \
                              resolving to '{}' and shadowing '{}'. The shadowed font \
                              stays reachable only by its file-stem/label alias.",
                             identity,
-                            existing.get().path.display(),
+                            existing.get().source.path().display(),
                             font.path.display(),
                         ));
                     }
@@ -325,7 +396,7 @@ impl TabFontProvider {
         // Legacy alias of the RESERVED bundled-UI name: projects saved before the
         // rename named the built-in font by its previous spelling. Inserted right after
         // the identities so no user font's family/label/stem alias can take it.
-        for font in fonts {
+        for &font in &fonts {
             if font.bundled_stack_font().is_none() {
                 continue;
             }
@@ -337,7 +408,7 @@ impl TabFontProvider {
         // have been contested when a document was written (and vice versa). Registering
         // its own suffixed form unconditionally means neither the bare nor the suffixed
         // spelling stops resolving when the other claimant comes or goes.
-        for font in fonts {
+        for &font in &fonts {
             if font.bundled_stack_font().is_some() {
                 continue;
             }
@@ -345,12 +416,10 @@ impl TabFontProvider {
             if base.trim().is_empty() {
                 continue;
             }
-            by_name
-                .entry(normalize_name(&fonts::suffixed_font_identity_name(
-                    &base,
-                    font.content_hash,
-                )))
-                .or_insert_with(|| entry_for(font));
+            let key = normalize_name(&fonts::suffixed_font_identity_name(&base, font.content_hash));
+            if alias_allowed(&key) {
+                by_name.entry(key).or_insert_with(|| entry_for(font));
+            }
         }
         // Bare (unsuffixed) base name for a CONTESTED name: `assign_font_identity_names`
         // suffixed every claimant, so nothing owns the bare form as an identity, yet
@@ -359,6 +428,7 @@ impl TabFontProvider {
         // of list order.
         let mut by_content_hash: Vec<&FontEntry> = fonts
             .iter()
+            .copied()
             .filter(|font| font.bundled_stack_font().is_none())
             .collect();
         // Stable sort: equal hashes keep list order, so the pass stays FIRST-wins there.
@@ -367,7 +437,7 @@ impl TabFontProvider {
             let base = font.base_identity_name();
             // A reserved spelling must never resolve to a user font, not even when the
             // bundled stack is unavailable and nothing shadows it.
-            if base.trim().is_empty() || fonts::is_reserved_bundled_identity(&base) {
+            if base.trim().is_empty() || fonts::is_reserved_identity(&base) {
                 continue;
             }
             by_name
@@ -377,9 +447,9 @@ impl TabFontProvider {
         // Family-name alias next (FIRST-wins), so a blob persisted with a family name
         // that later became a collision still resolves to the first declaring font —
         // matching the panel's whole-list first-match resolution.
-        for font in fonts {
+        for &font in &fonts {
             let original = font.original_name.trim();
-            if !original.is_empty() {
+            if !original.is_empty() && alias_allowed(original) {
                 by_name
                     .entry(normalize_name(original))
                     .or_insert_with(|| entry_for(font));
@@ -388,12 +458,14 @@ impl TabFontProvider {
         // Label/stem aliases, only for keys not already claimed (so an identity or
         // family key never loses to an alias). Labels before stems so a label beats
         // another font's identical stem, matching the historical alias precedence.
-        for font in fonts {
-            by_name
-                .entry(normalize_name(&font.label))
-                .or_insert_with(|| entry_for(font));
+        for &font in &fonts {
+            if alias_allowed(&font.label) {
+                by_name
+                    .entry(normalize_name(&font.label))
+                    .or_insert_with(|| entry_for(font));
+            }
         }
-        for font in fonts {
+        for &font in &fonts {
             // The bundled entry deliberately claims NO stem alias: its path is a file
             // of the shipped `fonts/ui` bundle, and letting it own that stem would
             // shadow a user's own copy of the same file for stem-only lookups. It is
@@ -402,7 +474,9 @@ impl TabFontProvider {
             if font.bundled_stack_font().is_some() {
                 continue;
             }
-            if let Some(stem) = font.path.file_stem().and_then(|s| s.to_str()) {
+            if let Some(stem) = font.path.file_stem().and_then(|s| s.to_str())
+                && alias_allowed(stem)
+            {
                 by_name
                     .entry(normalize_name(stem))
                     .or_insert_with(|| entry_for(font));
@@ -442,8 +516,8 @@ impl TabFontProvider {
         }
     }
 
-    /// Reports a font-file failure of `operation`, at most once per `(path, operation)`
-    /// for this provider.
+    /// Reports a font failure of `operation`, at most once per `(subject, operation)` for
+    /// this provider (`subject`: the file path, or the custom font's name).
     ///
     /// The resolve itself still behaves the same on every attempt (see `resolve`); only
     /// the log line is de-duplicated, so a font file that reappears is still picked up.
@@ -451,12 +525,12 @@ impl TabFontProvider {
     /// else — this runs on render threads, per text image.
     fn report_once(
         &self,
-        path: &Path,
+        subject: &str,
         operation: &'static str,
         message: impl FnOnce() -> String,
     ) {
         let mut reported = self.lock_map(&self.reported_failures, "failure-report");
-        if !reported.insert((path.to_path_buf(), operation)) {
+        if !reported.insert((subject.to_owned(), operation)) {
             return;
         }
         ms_log::runtime_log::log_warn(message());
@@ -475,7 +549,7 @@ impl TabFontProvider {
         &self,
         path: &Path,
         cached_stamp: Option<FileStamp>,
-        source: &FontByteSource,
+        source: &ByteCacheKey,
     ) -> bool {
         let Some(cached_stamp) = cached_stamp else {
             self.mark_checked(source);
@@ -485,7 +559,7 @@ impl TabFontProvider {
         let unchanged = match current {
             Some(current) => current == cached_stamp,
             None => {
-                self.report_once(path, "check font file freshness", || {
+                self.report_once(&path.display().to_string(), "check font file freshness", || {
                     format!(
                         "TabFontProvider: cannot read the metadata of a cached font file; \
                          operation: check whether the cached bytes are still current; path: \
@@ -508,7 +582,7 @@ impl TabFontProvider {
     ///
     /// A no-op when the entry has meanwhile been dropped or replaced by another thread —
     /// that thread stamped its own fresh entry.
-    fn mark_checked(&self, source: &FontByteSource) {
+    fn mark_checked(&self, source: &ByteCacheKey) {
         let mut cache = self.lock_map(&self.cache, "byte-cache");
         if let Some(cached) = cache.get_mut(source) {
             cached.checked_at = Instant::now();
@@ -554,13 +628,40 @@ impl FontProvider for TabFontProvider {
     /// already registered instead of adding a duplicate face
     /// (`ms_text_render::font_base::resident_face_ids`). Those bytes cannot change, so a
     /// bundled entry is never revalidated, and it holds its OWN cache slot: a user import
-    /// of the same file is a different byte source (see [`FontByteSource`]).
+    /// of the same file is a different byte source (see [`ByteCacheKey`]).
+    ///
+    /// CUSTOM FONTS: a saved custom font's identity resolves to its compiled full face
+    /// (with its own user kerning pairs); a name that is not listed but has the ad-hoc
+    /// render-name shape resolves to the interned layer recipe compiled over THIS
+    /// provider's fonts. Either may compile on first use, which is why this is only ever
+    /// called on worker threads. A build failure is reported once per name.
     fn resolve(&self, name: &str) -> Option<FontContent> {
-        let entry = self.by_name.get(&normalize_name(name))?.clone();
-        let source = match entry.bundled {
-            Some(_) => FontByteSource::Bundled(entry.path.clone()),
-            None => FontByteSource::File(entry.path.clone()),
+        let Some(entry) = self.by_name.get(&normalize_name(name)) else {
+            // Not a listed name: an ad-hoc layer recipe's render name, or unknown.
+            return self.resolve_adhoc_render_name(name);
         };
+        if let ProviderSource::Custom(custom) = &entry.source {
+            return self.resolve_saved_custom(name, custom, entry.custom_kerning.clone());
+        }
+        let (data, content_id) = self.entry_bytes(entry)?;
+        Some(FontContent {
+            name: name.to_string(),
+            original_name: entry.original_name.clone(),
+            data,
+            face_index: entry.face_index,
+            content_id,
+            custom_kerning: entry.custom_kerning.clone(),
+        })
+    }
+}
+
+impl TabFontProvider {
+    /// The bytes of a FILE or BUNDLED entry (+ their content id): served from the byte
+    /// cache, revalidated, or read outside the lock — see [`FontProvider::resolve`] for the
+    /// whole caching contract. `None` (reported once) when they cannot be obtained, and
+    /// always for a custom entry, whose bytes the compile service owns.
+    fn entry_bytes(&self, entry: &ProviderEntry) -> Option<(FontBytes, u64)> {
+        let source = entry.source.cache_key()?;
 
         // Fast path: bytes already cached. Clone the Arc + id and release the lock; the
         // freshness check below never runs with the lock held.
@@ -569,53 +670,52 @@ impl FontProvider for TabFontProvider {
             cache.get(&source).cloned()
         };
         if let Some(cached) = cached {
-            let fresh = entry.bundled.is_some()
-                || cached.checked_at.elapsed() < self.revalidate_after
-                || self.cached_bytes_still_current(&entry.path, cached.stamp, &source);
+            let fresh = match &entry.source {
+                // Resident bundle bytes cannot change, so they are never revalidated.
+                ProviderSource::Bundled(_) => true,
+                ProviderSource::File(path) => {
+                    cached.checked_at.elapsed() < self.revalidate_after
+                        || self.cached_bytes_still_current(path, cached.stamp, &source)
+                }
+                // `cache_key` is `None` for a custom source, so it never gets here.
+                ProviderSource::Custom(_) => false,
+            };
             if fresh {
-                return Some(FontContent {
-                    name: name.to_string(),
-                    original_name: entry.original_name,
-                    data: Arc::clone(&cached.data),
-                    face_index: entry.face_index,
-                    content_id: cached.content_id,
-                    custom_kerning: entry.custom_kerning.clone(),
-                });
+                return Some((Arc::clone(&cached.data), cached.content_id));
             }
             // The file changed: fall through and re-read it, replacing the entry.
         }
 
         // Slow path: obtain the bytes OUTSIDE the lock, then insert.
-        // The stamp is taken BEFORE the read (see `CachedFontBytes::stamp`).
-        let stamp = entry
-            .bundled
-            .is_none()
-            .then(|| self.file_stamp(&entry.path))
-            .flatten();
-        let (data, content_id): (FontBytes, u64) = match entry.bundled {
+        let (data, content_id, stamp): (FontBytes, u64, Option<FileStamp>) = match &entry.source {
             // `ms_fonts::bytes` logs its own failure with the path and the reason.
-            Some(font) => {
+            ProviderSource::Bundled(font) => {
                 let bytes = ms_fonts::bytes(font)?;
-                (Arc::new(bytes), font_content_id(bytes))
+                (Arc::new(bytes), font_content_id(bytes), None)
             }
-            None => match std::fs::read(&entry.path) {
-                Ok(bytes) => {
-                    let content_id = font_content_id(&bytes);
-                    (Arc::new(bytes), content_id)
+            ProviderSource::File(path) => {
+                // The stamp is taken BEFORE the read (see `CachedFontBytes::stamp`).
+                let stamp = self.file_stamp(path);
+                match std::fs::read(path) {
+                    Ok(bytes) => {
+                        let content_id = font_content_id(&bytes);
+                        (Arc::new(bytes), content_id, stamp)
+                    }
+                    Err(error) => {
+                        self.report_once(&path.display().to_string(), "read font bytes", || {
+                            format!(
+                                "TabFontProvider: cannot read font file; operation: resolve \
+                                 font bytes; path: '{}'; error: {error}. The name resolves to \
+                                 nothing, which the renderer reports as a missing font. \
+                                 Reported once per path.",
+                                path.display()
+                            )
+                        });
+                        return None;
+                    }
                 }
-                Err(error) => {
-                    self.report_once(&entry.path, "read font bytes", || {
-                        format!(
-                            "TabFontProvider: cannot read font file; operation: resolve font \
-                             bytes; path: '{}'; error: {error}. The name resolves to nothing, \
-                             which the renderer reports as a missing font. Reported once per \
-                             path.",
-                            entry.path.display()
-                        )
-                    });
-                    return None;
-                }
-            },
+            }
+            ProviderSource::Custom(_) => return None,
         };
         {
             let mut cache = self.lock_map(&self.cache, "byte-cache");
@@ -632,13 +732,105 @@ impl FontProvider for TabFontProvider {
                 },
             );
         }
-        Some(FontContent {
-            name: name.to_string(),
-            original_name: entry.original_name,
+        Some((data, content_id))
+    }
+
+    /// Serves a SAVED custom font: its compiled full face plus its OWN user kerning pairs
+    /// (the inherited pairs are baked into the face). Blocks on a first compile — this runs
+    /// on render workers only. A failure is reported once per font and resolves to nothing
+    /// (the renderer reports a missing font; nothing is substituted).
+    fn resolve_saved_custom(
+        &self,
+        name: &str,
+        custom: &CustomFontRef,
+        own_kerning: Option<Arc<CustomKerningTable>>,
+    ) -> Option<FontContent> {
+        // `None` only for the ad-hoc entry, which `from_fonts` never registers.
+        let result = custom.full_face_blocking()?;
+        self.custom_face_content(name, result, own_kerning)
+    }
+
+    /// Serves an AD-HOC layer recipe by its render name (`MSCustom-adhoc-<16 hex>`), with
+    /// THIS provider resolving the recipe's sources. `None` for any other unknown name
+    /// (not an error at this layer) and for a render name never interned in this process.
+    fn resolve_adhoc_render_name(&self, name: &str) -> Option<FontContent> {
+        if !is_adhoc_render_name(name) {
+            return None;
+        }
+        let Some(recipe) = adhoc::recipe_for_render_name(name) else {
+            self.report_once(name, "resolve ad-hoc custom font", || {
+                format!(
+                    "TabFontProvider: the ad-hoc custom font render name '{name}' names no recipe \
+                     known to this process; the layer is reported as using a missing font. \
+                     Reported once per name."
+                )
+            });
+            return None;
+        };
+        let result = resolve_recipe_sources(&recipe, self)
+            .map_err(Into::into)
+            .and_then(|sources| service().full_face_blocking(&recipe, &sources));
+        // An ad-hoc layer has no saved identity, hence no own kerning pairs (only the
+        // inherited ones baked into the face).
+        self.custom_face_content(name, result, None)
+    }
+
+    /// Turns a compiled-face result into `FontContent`, reporting a failure once per name.
+    fn custom_face_content(
+        &self,
+        name: &str,
+        result: FaceResult,
+        own_kerning: Option<Arc<CustomKerningTable>>,
+    ) -> Option<FontContent> {
+        match result {
+            Ok(face) => Some(FontContent {
+                name: name.to_string(),
+                original_name: face.family_name.clone(),
+                data: Arc::clone(&face.bytes),
+                face_index: 0,
+                content_id: face.content_id,
+                custom_kerning: own_kerning,
+            }),
+            Err(err) => {
+                self.report_once(name, "build custom font", || {
+                    format!(
+                        "TabFontProvider: custom font '{name}' could not be built: {err}. The \
+                         name resolves to nothing, which the renderer reports as a missing font. \
+                         Reported once per name."
+                    )
+                });
+                None
+            }
+        }
+    }
+}
+
+/// The font list as the custom-font compiler's source lookup: a recipe source identity
+/// resolves exactly as a layer's font name does (identity first, then the read-only
+/// aliases), but only to a real file or the bundled interface font.
+impl SourceResolver for TabFontProvider {
+    fn resolve_source(&self, identity: &str) -> Result<ResolvedSource, SourceError> {
+        // Decision D4: a custom font is never a source, also when it is not listed here.
+        if is_reserved_custom_identity(identity) {
+            return Err(SourceError::CustomNotAllowed(identity.to_owned()));
+        }
+        let entry = self
+            .by_name
+            .get(&normalize_name(identity))
+            .ok_or_else(|| SourceError::Unknown(identity.to_owned()))?;
+        if matches!(entry.source, ProviderSource::Custom(_)) {
+            return Err(SourceError::CustomNotAllowed(identity.to_owned()));
+        }
+        let (data, content_id) = self.entry_bytes(entry).ok_or_else(|| SourceError::Unreadable {
+            identity: identity.to_owned(),
+            reason: format!("the font bytes could not be read ({}); see the log", entry.source.path().display()),
+        })?;
+        Ok(ResolvedSource {
+            identity: identity.to_owned(),
             data,
             face_index: entry.face_index,
             content_id,
-            custom_kerning: entry.custom_kerning,
+            user_kerning: Arc::clone(&entry.source_kerning),
         })
     }
 }
@@ -651,7 +843,7 @@ impl TabFontProvider {
     pub(in crate::panel) fn resolved_path_for(&self, name: &str) -> Option<&Path> {
         self.by_name
             .get(&normalize_name(name))
-            .map(|entry| entry.path.as_path())
+            .map(|entry| entry.source.path())
     }
 }
 
@@ -754,12 +946,12 @@ mod tests {
             .by_name
             .get(&normalize_name("AnimeAcev05"))
             .expect("the PostScript name must be a key");
-        assert_eq!(entry.path, PathBuf::from("/fonts/основной.ttf"));
+        assert_eq!(entry.source.path(), Path::new("/fonts/основной.ttf"));
         // The legacy family and stem/label aliases still resolve to the same font.
         for legacy in ["Anime Ace v05", "основной"] {
             assert_eq!(
-                provider.by_name.get(&normalize_name(legacy)).map(|e| &e.path),
-                Some(&PathBuf::from("/fonts/основной.ttf")),
+                provider.by_name.get(&normalize_name(legacy)).map(|e| e.source.path()),
+                Some(Path::new("/fonts/основной.ttf")),
                 "the legacy form '{legacy}' must still resolve to the same font"
             );
         }
@@ -783,25 +975,25 @@ mod tests {
         let provider = TabFontProvider::from_fonts(&fonts);
         // Each file resolves to ITSELF by its own identity (its PostScript name).
         assert_eq!(
-            provider.by_name.get(&normalize_name("MyFont-Regular")).map(|e| &e.path),
-            Some(&PathBuf::from("/fonts/regular.ttf")),
+            provider.by_name.get(&normalize_name("MyFont-Regular")).map(|e| e.source.path()),
+            Some(Path::new("/fonts/regular.ttf")),
             "the Regular file resolves to itself"
         );
         assert_eq!(
-            provider.by_name.get(&normalize_name("MyFont-Bold")).map(|e| &e.path),
-            Some(&PathBuf::from("/fonts/bold.ttf")),
+            provider.by_name.get(&normalize_name("MyFont-Bold")).map(|e| e.source.path()),
+            Some(Path::new("/fonts/bold.ttf")),
             "the Bold file resolves to itself"
         );
         // Legacy stem/label tags keep resolving to their own file, too.
         assert_eq!(
-            provider.by_name.get(&normalize_name("myfont-bold")).map(|e| &e.path),
-            Some(&PathBuf::from("/fonts/bold.ttf")),
+            provider.by_name.get(&normalize_name("myfont-bold")).map(|e| e.source.path()),
+            Some(Path::new("/fonts/bold.ttf")),
             "a legacy stem tag still resolves to its own file"
         );
         // The shared family alias falls, FIRST-wins, to the first font in the list.
         assert_eq!(
-            provider.by_name.get(&normalize_name("MyFont")).map(|e| &e.path),
-            Some(&PathBuf::from("/fonts/regular.ttf")),
+            provider.by_name.get(&normalize_name("MyFont")).map(|e| e.source.path()),
+            Some(Path::new("/fonts/regular.ttf")),
             "a blob still naming the family resolves to the first declaring font"
         );
     }
@@ -1091,7 +1283,7 @@ mod tests {
             1,
             "the read failure must be logged once, not once per resolve"
         );
-        assert!(reported.contains(&(PathBuf::from(missing), "read font bytes")));
+        assert!(reported.contains(&(missing.to_owned(), "read font bytes")));
         let cache = provider
             .cache
             .lock()
@@ -1134,7 +1326,7 @@ mod tests {
         assert!(
             provider
                 .lock_map(&provider.cache, "byte-cache")
-                .contains_key(&FontByteSource::Bundled(fonts[0].path.clone())),
+                .contains_key(&ByteCacheKey::Bundled(fonts[0].path.clone())),
             "the recovered cache must still be populated"
         );
         let second = provider
@@ -1158,8 +1350,8 @@ mod tests {
             .get(&normalize_name("beta"))
             .expect("'beta' must resolve");
         assert_eq!(
-            entry.path,
-            PathBuf::from("/fonts/a.ttf"),
+            entry.source.path(),
+            Path::new("/fonts/a.ttf"),
             "a label must win over another font's stem alias"
         );
     }
@@ -1303,4 +1495,156 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A two-source hybrid recipe over the given identities.
+    fn hybrid_recipe(a: &str, b: &str) -> Arc<CustomFontRecipe> {
+        use ms_custom_fonts::{CustomFontKind, HybridParams, HybridSource, MissingGlyphPolicy};
+        Arc::new(CustomFontRecipe {
+            kind: CustomFontKind::Hybrid(HybridParams {
+                sources: vec![
+                    HybridSource { identity: a.to_owned(), weight: 1.0, missing_override: None },
+                    HybridSource { identity: b.to_owned(), weight: 1.0, missing_override: None },
+                ],
+                missing_default: MissingGlyphPolicy::NoInfluence,
+            }),
+        })
+    }
+
+    /// A user font whose PostScript name falls in the custom-font namespace is suffixed and
+    /// registers NO alias there, so a layer naming that (unavailable) custom font can never
+    /// render with it.
+    #[test]
+    fn a_user_font_never_claims_a_custom_font_name() {
+        let saved_shape = "MSCustom-0123456789abcdef";
+        let fonts = fonts_with_identities(vec![font_entry_with_post_script(
+            saved_shape,
+            "/fonts/impostor.ttf",
+            saved_shape,
+            saved_shape,
+            9,
+        )]);
+        let identity = fonts[0].render_identity_name();
+        assert_ne!(identity, saved_shape, "the reserved name must be suffixed");
+        assert!(identity.starts_with(saved_shape) && identity.contains(fonts::IDENTITY_HASH_SEPARATOR));
+        let provider = TabFontProvider::from_fonts(&fonts);
+        assert!(provider.resolved_path_for(saved_shape).is_none(), "no alias may take a custom-font name");
+        assert!(provider.resolved_path_for(&identity).is_some(), "the font stays reachable by its own identity");
+        assert!(provider.resolved_path_for("impostor").is_some(), "its non-reserved stem alias stays");
+    }
+
+    /// The custom-font source lookup: real fonts resolve with their user kerning in the
+    /// compiler's units, custom fonts are refused (D4), unknown names are reported as such.
+    #[test]
+    fn source_resolution_serves_real_fonts_and_refuses_custom_ones() {
+        let _lock = font_settings_store::test_lock();
+        font_settings_store::test_reset();
+        let (dir, path) = fixture_font_file("source_resolver", b"source font bytes");
+        let mut real = font_entry_with_post_script("Alpha", path.to_str().expect("utf-8 temp path"), "Alpha", "Alpha-Regular", 3);
+        real.custom_kerning = vec![fonts_data::CustomKerningPair { left: 'A', right: 'V', offset_per_mille: -25.0 }];
+        let real = fonts_with_identities(vec![real]);
+        let saved = crate::custom_fonts::identity::new_saved_identity();
+        let records = vec![(
+            saved.clone(),
+            fonts_data::CustomFontRecord {
+                name: "Hybrid".to_owned(),
+                body: fonts_data::CustomFontBody::Known(hybrid_recipe("Alpha-Regular", "alpha-regular")),
+            },
+        )];
+        // A duplicate source is refused by the recipe validation only at decode time; the
+        // list build just resolves, which is all this test needs.
+        let (custom_entries, _) = super::super::custom_font_entry::build_custom_font_entries(&real, &records);
+        assert_eq!(custom_entries.len(), 1);
+        let mut list = real.clone();
+        list.extend(custom_entries);
+        let provider = TabFontProvider::from_fonts(&list);
+
+        let resolved = provider.resolve_source("alpha-regular").expect("a real font is a valid source");
+        assert_eq!(resolved.identity, "alpha-regular", "the recipe's own spelling is kept");
+        assert_eq!(resolved.bytes(), b"source font bytes");
+        assert_eq!(
+            &*resolved.user_kerning,
+            &[ms_custom_fonts::KerningPairPerMille { left: 'A', right: 'V', em: -25.0 }]
+        );
+        assert_eq!(provider.resolve_source(&saved).map(|_| ()), Err(SourceError::CustomNotAllowed(saved.clone())));
+        assert_eq!(
+            provider.resolve_source("MSCustom-ffffffffffffffff").map(|_| ()),
+            Err(SourceError::CustomNotAllowed("MSCustom-ffffffffffffffff".to_owned())),
+            "an unlisted custom name is refused as custom, not reported as unknown"
+        );
+        assert_eq!(provider.resolve_source("Nobody").map(|_| ()), Err(SourceError::Unknown("Nobody".to_owned())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A saved custom font whose compile fails (its "sources" are not fonts) resolves to
+    /// nothing and is reported once — never substituted, never a panic.
+    #[test]
+    fn a_saved_custom_font_that_cannot_be_built_resolves_to_nothing() {
+        let _lock = font_settings_store::test_lock();
+        font_settings_store::test_reset();
+        let (dir_a, path_a) = fixture_font_file("custom_a", b"not a font a");
+        let (dir_b, path_b) = fixture_font_file("custom_b", b"not a font b");
+        let real = fonts_with_identities(vec![
+            font_entry_with_post_script("A", path_a.to_str().expect("utf-8 temp path"), "A", "A-Regular", 1),
+            font_entry_with_post_script("B", path_b.to_str().expect("utf-8 temp path"), "B", "B-Regular", 2),
+        ]);
+        let saved = crate::custom_fonts::identity::new_saved_identity();
+        let records = vec![(
+            saved.clone(),
+            fonts_data::CustomFontRecord {
+                name: "Broken".to_owned(),
+                body: fonts_data::CustomFontBody::Known(hybrid_recipe("A-Regular", "B-Regular")),
+            },
+        )];
+        let (custom_entries, _) = super::super::custom_font_entry::build_custom_font_entries(&real, &records);
+        let mut list = real.clone();
+        list.extend(custom_entries);
+        let provider = TabFontProvider::from_fonts(&list);
+        for _ in 0..2 {
+            assert!(provider.resolve(&saved).is_none());
+        }
+        let reported = provider.reported_failures.lock().expect("no test thread panics while holding this lock");
+        assert!(reported.contains(&(saved.clone(), "build custom font")));
+        assert_eq!(reported.len(), 1, "reported once per name");
+        drop(reported);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// An ad-hoc render name reaches the compile path only after its recipe was interned in
+    /// this process; the persisted ad-hoc identity itself is never a key.
+    #[test]
+    fn adhoc_render_names_resolve_only_through_the_interner() {
+        let (dir_a, path_a) = fixture_font_file("adhoc_a", b"not a font a");
+        let (dir_b, path_b) = fixture_font_file("adhoc_b", b"not a font b");
+        let mut list = fonts_with_identities(vec![
+            font_entry_with_post_script("A", path_a.to_str().expect("utf-8 temp path"), "A", "Adhoc-A", 1),
+            font_entry_with_post_script("B", path_b.to_str().expect("utf-8 temp path"), "B", "Adhoc-B", 2),
+        ]);
+        list.insert(0, super::super::custom_font_entry::adhoc_custom_font_entry());
+        let provider = TabFontProvider::from_fonts(&list);
+
+        assert!(provider.resolve(crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY).is_none());
+        assert!(provider.resolved_path_for(crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY).is_none());
+
+        let never_interned = "MSCustom-adhoc-0000000000000000";
+        assert!(provider.resolve(never_interned).is_none());
+
+        let interned = adhoc::render_name(&hybrid_recipe("Adhoc-A", "Adhoc-B"));
+        // The sources resolve through THIS provider; they are not fonts, so the compile
+        // fails — which proves the name reached the compile path.
+        assert!(provider.resolve(&interned).is_none());
+        let reported = provider.reported_failures.lock().expect("no test thread panics while holding this lock");
+        assert!(reported.contains(&(never_interned.to_owned(), "resolve ad-hoc custom font")));
+        assert!(reported.contains(&(interned.clone(), "build custom font")));
+        drop(reported);
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    /// The panel exposes its provider as the custom-font source lookup.
+    #[test]
+    fn the_panel_hands_out_its_provider_as_the_source_resolver() {
+        let state = TypingCreatePanelState::new(false);
+        let resolver = state.source_resolver();
+        assert_eq!(resolver.resolve_source("Nobody").map(|_| ()), Err(SourceError::Unknown("Nobody".to_owned())));
+    }
 }

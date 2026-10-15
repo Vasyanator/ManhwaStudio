@@ -1148,6 +1148,8 @@ mod tests {
             format: TypingExportFormat::Png,
             repaginate: crate::export_repaginate::TypingRepaginateSettings::default(),
             output_base_name: "export".to_string(),
+            bundle_custom_fonts: false,
+            custom_fonts: None,
         }
     }
 

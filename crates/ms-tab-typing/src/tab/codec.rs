@@ -11,6 +11,8 @@ Main responsibilities:
 - parse `render_data` / render-param JSON into `TextRenderParams` and the
   per-layout parameter structs, through the schema owner
   (`panel/text_params_schema.rs`) so the document's OWN schema decides its defaults;
+  an AD-HOC custom font renders by its recipe's render name (`render_font_name`, through
+  `text_params_schema::custom_font_use`), a damaged recipe renders nothing;
 - parse config-string enums (shape, wrap mode, anti-aliasing, line mode, etc.);
 - build, normalize, and decode overlay storage entries, including legacy formats;
 - convert a SCHEMA-1 `text_params` payload to the current schema
@@ -38,8 +40,31 @@ stored value dies on load.
 */
 
 use super::*;
-use crate::panel::text_params_schema;
+use crate::custom_fonts::adhoc;
+use crate::panel::text_params_schema::{self, CustomFontUse};
 use serde_json::Map;
+
+/// The name the renderer resolves for a layer whose persisted font name is `stored_name`.
+///
+/// Every font renders by its stored identity except the AD-HOC custom font: all ad-hoc
+/// layers persist the same identity next to their own `font_recipe`, and the provider is
+/// name-only, so such a layer renders by the recipe's render name
+/// (`custom_fonts::adhoc::render_name`, which also interns the recipe for the provider).
+/// A missing or damaged recipe yields `None` — the layer is treated like one that names no
+/// font (never rendered with a substitute); the reason is logged.
+fn render_font_name(text_params: &Map<String, Value>, stored_name: String) -> Option<String> {
+    match text_params_schema::custom_font_use(text_params) {
+        Some(CustomFontUse::AdHoc(Ok(recipe))) => Some(adhoc::render_name(&recipe)),
+        Some(CustomFontUse::AdHoc(Err(reason))) => {
+            ms_log::runtime_log::log_warn(format!(
+                "typing: a layer uses the ad-hoc custom font '{stored_name}' but its recipe is \
+                 unusable ({reason}); the layer is not rendered."
+            ));
+            None
+        }
+        Some(CustomFontUse::Saved(_)) | None => Some(stored_name),
+    }
+}
 
 /// Decodes a stored render-data object — `{"text_params": {…}, "effects": […]}` — into the
 /// renderer's `TextRenderParams`, folding the `effects` array into `effects_json` so the
@@ -51,7 +76,9 @@ use serde_json::Map;
 /// replaces `text` and forces `TextWrapMode::None`, matching what the panel renders.
 ///
 /// Returns `None` when the value is not an object, carries no `text_params` object, or
-/// names no font at all — the ONE thing that cannot be defaulted.
+/// names no font at all — the ONE thing that cannot be defaulted. A layer of the ad-hoc
+/// custom font renders by its recipe's render name, and a missing or damaged `font_recipe`
+/// also yields `None` (`render_font_name`).
 ///
 /// `pub(crate)` rather than `pub(super)`: besides `tab` and its submodules
 /// (the overlay render pipeline and the shape-variant preview grid), the typing panel's
@@ -88,6 +115,7 @@ pub(crate) fn text_render_params_from_render_data(
     } else {
         legacy_font_name_from_text_params(text_params)?
     };
+    let font_name = render_font_name(text_params, font_name)?;
     let effects_json = render_obj
         .get("effects")
         .and_then(Value::as_array)
@@ -2431,4 +2459,64 @@ pub(super) fn parse_image_overlay_render_data(obj: &serde_json::Map<String, Valu
         .cloned()
         .unwrap_or_default();
     json!({ "effects": effects })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::custom_fonts::identity::{ADHOC_CUSTOM_FONT_IDENTITY, is_adhoc_render_name};
+    use ms_custom_fonts::{CustomFontKind, CustomFontRecipe, HybridParams, HybridSource, MissingGlyphPolicy};
+
+    fn recipe() -> Arc<CustomFontRecipe> {
+        Arc::new(CustomFontRecipe {
+            kind: CustomFontKind::Hybrid(HybridParams {
+                sources: vec![
+                    HybridSource { identity: "Alpha-Regular".to_owned(), weight: 1.0, missing_override: None },
+                    HybridSource { identity: "Beta-Regular".to_owned(), weight: 3.0, missing_override: None },
+                ],
+                missing_default: MissingGlyphPolicy::Disable,
+            }),
+        })
+    }
+
+    fn layer(font: &str, font_recipe: Option<Value>) -> Value {
+        let mut text_params = json!({
+            "schema": text_params_schema::TEXT_PARAMS_SCHEMA_VERSION,
+            "text": "Hi",
+            "font": font,
+        });
+        if let (Some(font_recipe), Some(obj)) = (font_recipe, text_params.as_object_mut()) {
+            obj.insert(text_params_schema::FONT_RECIPE_KEY.to_owned(), font_recipe);
+        }
+        json!({ "text_params": text_params })
+    }
+
+    #[test]
+    fn an_adhoc_layer_renders_by_its_interned_render_name() {
+        let params = text_render_params_from_render_data(&layer(ADHOC_CUSTOM_FONT_IDENTITY, Some(recipe().to_json())))
+            .expect("a valid ad-hoc layer decodes");
+        assert!(is_adhoc_render_name(&params.font_name), "renders by the recipe's render name, not the shared identity");
+        assert_eq!(adhoc::render_name(&recipe()), params.font_name, "the render name is a pure function of the recipe");
+        assert_eq!(
+            adhoc::recipe_for_render_name(&params.font_name).as_deref(),
+            Some(&*recipe()),
+            "decoding interned the recipe for the provider"
+        );
+    }
+
+    #[test]
+    fn a_damaged_or_missing_adhoc_recipe_decodes_to_nothing() {
+        assert!(text_render_params_from_render_data(&layer(ADHOC_CUSTOM_FONT_IDENTITY, Some(json!({ "kind": 7 })))).is_none());
+        assert!(text_render_params_from_render_data(&layer(ADHOC_CUSTOM_FONT_IDENTITY, None)).is_none());
+    }
+
+    #[test]
+    fn saved_custom_and_real_fonts_render_by_their_stored_identity() {
+        let saved = "MSCustom-0123456789abcdef";
+        let params = text_render_params_from_render_data(&layer(saved, None)).expect("decodes");
+        assert_eq!(params.font_name, saved);
+        // A stray recipe next to a real font changes nothing.
+        let params = text_render_params_from_render_data(&layer("Alpha-Regular", Some(recipe().to_json()))).expect("decodes");
+        assert_eq!(params.font_name, "Alpha-Regular");
+    }
 }

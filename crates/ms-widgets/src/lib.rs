@@ -151,7 +151,8 @@ pub use embedded_window::{EmbeddedWindow, EmbeddedWindowResponse, EmbeddedWindow
 pub use editable_combo_box::{EditableComboBox, EditableComboBoxResponse};
 #[allow(unused_imports)]
 pub use font_preview::{
-    PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
+    PreviewFontFamily, SharedFontBytes, combo_font_family_name, is_font_family_bound,
+    request_font_family, request_font_family_from_bytes,
 };
 #[allow(unused_imports)]
 pub use hangul_keyboard::{

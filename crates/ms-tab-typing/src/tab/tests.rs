@@ -5904,7 +5904,7 @@ fn a_failed_raster_write_is_queued_and_retried_at_the_next_flush_point() {
 fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
     let layout = typing_default_dock_layout();
     assert_eq!(layout.validate(), Ok(()));
-    assert_eq!(layout.panels().len(), 7);
+    assert_eq!(layout.panels().len(), 8);
 
     // The canvas' own «Лента» tab heads the left column, where the canvas controls
     // panel used to float. It is content-sized: four rows need no pinned height.
@@ -6021,9 +6021,24 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
         }
     );
 
+    // «Гибридный шрифт» continues the right-hand column under «Маска»; with the mask
+    // editor closed it inherits the mask panel's anchor and sits under «Параметры».
+    let hybrid_font = layout
+        .panel(PanelId::new(7))
+        .expect("the hybrid-font panel exists");
+    assert_eq!(hybrid_font.tabs, vec![TYPING_HYBRID_FONT_TAB]);
+    assert_eq!(
+        hybrid_font.anchor,
+        PanelAnchor::Panel {
+            target: PanelId::new(4),
+            edge: DockEdge::Bottom,
+            align: 0.0,
+        }
+    );
+
     // The conditional panels follow their content instead of a pinned size: they
     // are the ones that give way when the column does not fit the dock area.
-    for id in [PanelId::new(4), PanelId::new(5), PanelId::new(6)] {
+    for id in [PanelId::new(4), PanelId::new(5), PanelId::new(6), PanelId::new(7)] {
         let panel = layout.panel(id).expect("a conditional panel exists");
         assert_eq!(panel.size_override, None, "{id} must stay content-sized");
     }
@@ -6065,6 +6080,7 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
         TYPING_MASK_TAB,
         TYPING_DEFORM_TAB,
         TYPING_LAYOUT_EDITOR_TAB,
+        TYPING_HYBRID_FONT_TAB,
     ] {
         assert!(layout.panel_of_tab(tab).is_some(), "{tab} has no panel");
     }
@@ -6075,7 +6091,7 @@ fn the_default_dock_layout_groups_the_typing_tabs_into_two_columns() {
 /// for, and it is what "разведены якорями" means in practice.
 ///
 /// Two frames are checked: the worst case, where EVERY conditional tab («Маска»,
-/// «Режим деформации», «Редактирование раскладки») is visible at once — more than
+/// «Режим деформации», «Редактирование раскладки», «Гибридный шрифт») is visible at once — more than
 /// the runtime ever shows together — and the ordinary frame where a conditional
 /// panel drops out of the chain and its dependants inherit its anchor
 /// (`panel_dock::frame_layout`, built on `DockLayout::remove_panel`).
@@ -6096,6 +6112,7 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
         (PanelId::new(4), TYPING_MASK_TAB_INITIAL_SIZE_PX),
         (PanelId::new(5), TYPING_DEFORM_TAB_INITIAL_SIZE_PX),
         (PanelId::new(6), TYPING_LAYOUT_EDITOR_TAB_INITIAL_SIZE_PX),
+        (PanelId::new(7), TYPING_HYBRID_FONT_TAB_INITIAL_SIZE_PX),
     ]
     .into_iter()
     .collect();
@@ -6107,6 +6124,7 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
         (PanelId::new(4), TYPING_MASK_TAB_MIN_SIZE_PX),
         (PanelId::new(5), TYPING_DEFORM_TAB_MIN_SIZE_PX),
         (PanelId::new(6), TYPING_LAYOUT_EDITOR_TAB_MIN_SIZE_PX),
+        (PanelId::new(7), TYPING_HYBRID_FONT_TAB_MIN_SIZE_PX),
     ]
     .into_iter()
     .collect();
@@ -6134,7 +6152,7 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
 
     let layout = typing_default_dock_layout();
     let solved = solve_default(&layout);
-    assert_eq!(solved.len(), 7, "every panel of the layout is placed");
+    assert_eq!(solved.len(), 8, "every panel of the layout is placed");
     assert_pairwise_disjoint(&solved, "every tab visible");
     // On a dock area of a typical maximized window the whole arrangement — pinned
     // sizes included — still fits, so nothing is pushed off screen or shrunk on the
@@ -6201,7 +6219,7 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
         .remove_panel(PanelId::new(5))
         .expect("the deformation panel is part of the default layout");
     let solved = solve_default(&without_deform);
-    assert_eq!(solved.len(), 6);
+    assert_eq!(solved.len(), 7);
     assert_pairwise_disjoint(&solved, "deformation hidden");
     let actions = solved
         .get(PanelId::new(3))
@@ -6229,7 +6247,7 @@ fn the_default_dock_layout_places_every_panel_clear_of_the_others() {
         &mins,
         PanelChrome::default(),
     );
-    assert_eq!(solved.len(), 7);
+    assert_eq!(solved.len(), 8);
     assert_pairwise_disjoint(&solved, "cramped dock area");
 }
 
@@ -6341,7 +6359,7 @@ fn pdf_destination(file: PathBuf) -> TypingExportDestination {
 /// Builds an export request; every test below varies only the three fields it cares about.
 fn export_request(destination: TypingExportDestination, format: TypingExportFormat, repaginate_enabled: bool) -> TypingExportRequest {
     let repaginate = crate::export_repaginate::TypingRepaginateSettings { enabled: repaginate_enabled, ..Default::default() };
-    TypingExportRequest { destination, format, repaginate, output_base_name: "Тайтл 1".to_string() }
+    TypingExportRequest { destination, format, repaginate, output_base_name: "Тайтл 1".to_string(), bundle_custom_fonts: false, custom_fonts: None }
 }
 
 #[test]
@@ -6521,6 +6539,8 @@ fn a_collecting_export_run_drains_its_window_and_writes_every_output_page() {
         format: TypingExportFormat::Png,
         repaginate: TypingRepaginateSettings { enabled: true, mode: TypingRepaginateMode::FixedHeight, fixed_height_px: 10, ..Default::default() },
         output_base_name: "Тайтл 1".to_string(),
+        bundle_custom_fonts: false,
+        custom_fonts: None,
     };
     let (tx, rx) = mpsc::channel::<TypingExportEvent>();
     let result = export_typing_pages(jobs, request, None, tx).unwrap();
@@ -6568,6 +6588,8 @@ fn a_pdf_export_run_writes_one_document_and_rejects_a_folder_destination() {
         format: TypingExportFormat::Pdf,
         repaginate: crate::export_repaginate::TypingRepaginateSettings::default(),
         output_base_name: "Тайтл 1 Глава 1".to_string(),
+        bundle_custom_fonts: false,
+        custom_fonts: None,
     };
     let (tx, _rx) = mpsc::channel::<TypingExportEvent>();
     let result = export_typing_pages(jobs, request, None, tx).unwrap();
@@ -6585,6 +6607,8 @@ fn a_pdf_export_run_writes_one_document_and_rejects_a_folder_destination() {
         format: TypingExportFormat::Pdf,
         repaginate: crate::export_repaginate::TypingRepaginateSettings::default(),
         output_base_name: String::new(),
+        bundle_custom_fonts: false,
+        custom_fonts: None,
     };
     let (tx, _rx) = mpsc::channel::<TypingExportEvent>();
     assert!(export_typing_pages(jobs, bad_request, None, tx).is_err());

@@ -29,6 +29,9 @@ Main responsibilities:
   font's user-facing name or its identity (PostScript name). The widget, the modes and the
   name selection all come from `font_settings.rs`; this module only borrows the mode slot and
   draws rows with it;
+- treat the AVAILABLE saved custom fonts as loaded fonts like the folder and imported ones
+  (`GroupEditorFonts::loaded_fonts`: availability, member resolver, add picker), naming an
+  unavailable custom member by its stored name;
 - cache the virtual-group snapshot and refresh it when `font_admin::fonts_revision` advances
   (every group mutation bumps the shared revision).
 
@@ -91,9 +94,7 @@ use super::font_settings::{
 use crate::runtime_log;
 use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, Picked};
 use crate::tabs::typing::font_admin::{self, FontEntry, VirtualFontGroupInfo, VirtualFontGroupMemberInfo};
-use crate::widgets::{
-    PreviewFontFamily, combo_font_family_name, is_font_family_bound, request_font_family,
-};
+use crate::widgets::{PreviewFontFamily, combo_font_family_name, is_font_family_bound};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -178,9 +179,10 @@ struct MemberRowFont {
     /// replaced font file is not drawn from the bytes egui cached for the old one.
     content_hash: u64,
     rep_face: usize,
-    /// Where the font's bytes live; passed to `widgets::request_font_family` as the byte
-    /// source of the one-time registration and never used as a key.
-    path: std::path::PathBuf,
+    /// Where the preview's bytes come from (`FontByteSource::preview_source`: a file, a
+    /// compiled custom face, or none); the byte source of the one-time registration, never
+    /// a key.
+    preview: font_admin::FontPreviewSource,
 }
 
 /// Geometry of the member table, computed ONCE per frame and reused by the header row and by
@@ -336,9 +338,25 @@ pub(super) struct GroupEditorFonts<'a> {
     pub(super) folder: &'a [FontEntry],
     /// The loadable imported system fonts.
     pub(super) imported: &'a [FontEntry],
+    /// The saved custom fonts, unavailable ones included. Only the AVAILABLE ones are loaded
+    /// fonts (the typing panel lists exactly those); an unavailable one still lends its stored
+    /// name to a member row.
+    pub(super) custom: &'a [font_admin::CustomFontRow],
     /// Revision of the snapshot these lists came from; the editor window's member resolver is
     /// cached against it and rebuilt only when it advances.
     pub(super) categories_revision: u64,
+}
+
+impl GroupEditorFonts<'_> {
+    /// Every LOADED font a group member can name: folder, imported, then the available saved
+    /// custom fonts. The one list behind the availability set, the member resolver and the
+    /// add-member picker, so the three cannot disagree about which fonts exist.
+    fn loaded_fonts(&self) -> impl Iterator<Item = &FontEntry> {
+        self.folder
+            .iter()
+            .chain(self.imported.iter())
+            .chain(self.custom.iter().filter_map(|row| row.font.as_ref()))
+    }
 }
 
 /// Editor for the "Группы" section: create/list/delete virtual groups plus the group-editor
@@ -555,9 +573,7 @@ impl FontGroupsEditorState {
         match self.loaded_identities.take() {
             Some((revision, set)) if revision == fonts.categories_revision => set,
             Some(_) | None => fonts
-                .folder
-                .iter()
-                .chain(fonts.imported.iter())
+                .loaded_fonts()
                 .map(|font| font_admin::normalize_font_identity(&font.render_identity_name()))
                 .collect(),
         }
@@ -658,7 +674,7 @@ impl FontGroupsEditorState {
             .is_none_or(|(rev, _)| *rev != fonts.categories_revision);
         let resolver: MemberResolver = if needs_rebuild {
             let mut map: MemberResolver = HashMap::new();
-            for font in fonts.folder.iter().chain(fonts.imported.iter()) {
+            for font in fonts.loaded_fonts() {
                 // Keyed NORMALIZED (see `MemberResolver`): a member persisted in another
                 // casing must resolve to the loaded font, exactly as it does in the panel.
                 map.entry(font_admin::normalize_font_identity(
@@ -668,7 +684,7 @@ impl FontGroupsEditorState {
                     display_label: font.display_label().to_string(),
                     content_hash: font.content_hash(),
                     rep_face: font.representative_face_index(),
-                    path: font.path().to_path_buf(),
+                    preview: font.byte_source().preview_source(),
                 });
             }
             map
@@ -966,6 +982,8 @@ impl GroupEditorState {
             return;
         }
         self.card_import_status = None;
+        // Real fonts only: a card names PostScript names of installed or folder fonts, and a
+        // saved custom font's identity is minted (`MSCustom-…`), never one a card can carry.
         let loaded: Vec<String> = fonts
             .folder
             .iter()
@@ -1350,8 +1368,11 @@ impl GroupEditorState {
         // Only an UNRESOLVED row consults the display-name override store: for a loaded font
         // the override is already baked into its display label. The lookup is an in-memory
         // read (no I/O) and runs for the handful of rows the virtualizer actually draws.
+        // A saved custom font that is unavailable this run has no override but a stored name,
+        // which names it far better than its minted identity.
         let display_override = match row_font {
-            None => font_admin::display_name_override(member.font.trim()),
+            None => font_admin::display_name_override(member.font.trim())
+                .or_else(|| font_admin::custom_font_name(member.font.trim())),
             Some(_) => None,
         };
         let custom_name = if bundled {
@@ -1385,7 +1406,7 @@ impl GroupEditorState {
                         ui.ctx(),
                         member.font.as_str(),
                         row_font.content_hash,
-                        row_font.path.as_path(),
+                        &row_font.preview,
                         row_font.rep_face,
                         body_size,
                         &mut self.preview_families,
@@ -1523,8 +1544,9 @@ impl GroupEditorState {
             return;
         }
 
-        // Candidates = folder + imported fonts that are not already members. Compared by
-        // NORMALIZED identity, the module's one identity rule: the store refuses a duplicate
+        // Candidates = loaded fonts (folder, imported, available custom) that are not already
+        // members. Compared by NORMALIZED identity, the module's one identity rule: the store
+        // refuses a duplicate
         // member the same way, so offering a font whose membership is recorded in another
         // casing would be a candidate that does nothing when picked.
         let member_identities: HashSet<String> = members
@@ -1532,9 +1554,7 @@ impl GroupEditorState {
             .map(|member| font_admin::normalize_font_identity(&member.font))
             .collect();
         let candidates: Vec<&FontEntry> = fonts
-            .folder
-            .iter()
-            .chain(fonts.imported.iter())
+            .loaded_fonts()
             .filter(|font| {
                 !member_identities
                     .contains(&font_admin::normalize_font_identity(&font.render_identity_name()))
@@ -1595,7 +1615,7 @@ impl GroupEditorState {
                             ui.ctx(),
                             &identity,
                             font.content_hash(),
-                            font.path(),
+                            &font.byte_source().preview_source(),
                             font.representative_face_index(),
                             body_size,
                             &mut self.preview_families,
@@ -1689,7 +1709,8 @@ fn member_row_name(
 ///
 /// The font is IDENTIFIED by `identity` and by `content_hash` (the hash of its file's bytes,
 /// `0` when unknown): the registration and the per-window preview budget are keyed by both,
-/// while `path` is only where the bytes are read from on first use. The hash is what expires
+/// while `preview` is only where the bytes come from on first use (a file, or a saved custom
+/// font's compiled face — `FontPreviewSource::request_family`). The hash is what expires
 /// a binding whose file was replaced — egui never re-reads registered font data.
 ///
 /// Mirrors the import picker's registration discipline (`font_settings::draw_picker_body`):
@@ -1704,7 +1725,7 @@ fn own_typeface_font_id(
     ctx: &egui::Context,
     identity: &str,
     content_hash: u64,
-    path: &Path,
+    preview: &font_admin::FontPreviewSource,
     face: usize,
     body_size: f32,
     preview_families: &mut HashSet<String>,
@@ -1716,9 +1737,7 @@ fn own_typeface_font_id(
     if !allow_own {
         return None;
     }
-    let PreviewFontFamily::Ready(family) =
-        request_font_family(ctx, identity, content_hash, path, face)
-    else {
+    let PreviewFontFamily::Ready(family) = preview.request_family(ctx, identity, content_hash, face) else {
         return None;
     };
     preview_families.insert(font_name);
@@ -2242,7 +2261,7 @@ mod tests {
             display_label: label.to_string(),
             content_hash: 0,
             rep_face: 0,
-            path: std::path::PathBuf::from("/nonexistent/font.ttf"),
+            preview: font_admin::FontPreviewSource::File(std::path::PathBuf::from("/nonexistent/font.ttf")),
         }
     }
 
@@ -2817,6 +2836,33 @@ mod tests {
         ));
         // A name that merely looks similar is not the reserved identity.
         assert!(!member_is_available("ManhwaStudio-UI-Bold", &loaded));
+    }
+
+    #[test]
+    fn a_custom_member_counts_as_loaded_only_while_its_font_is_available() {
+        // An unavailable saved custom font (missing source) has a row but no entry: the typing
+        // panel does not list it, so its group member must be flagged missing.
+        let custom = [font_admin::CustomFontRow {
+            identity: "MSCustom-0123456789abcdef".to_string(),
+            name: "Гибрид".to_string(),
+            font: None,
+            unavailable: Some(font_admin::CustomFontUnavailability::MissingSources(vec!["A-Regular".to_string()])),
+        }];
+        let fonts = GroupEditorFonts {
+            folder_group_names: &[],
+            folder: &[],
+            imported: &[],
+            custom: &custom,
+            categories_revision: 1,
+        };
+        assert_eq!(fonts.loaded_fonts().count(), 0);
+        let loaded = FontGroupsEditorState::default().loaded_identity_set(&fonts);
+        assert!(!member_is_available("MSCustom-0123456789abcdef", &loaded));
+        assert!(group_has_missing_font(&group_of(vec![member("MSCustom-0123456789abcdef", None)]), &loaded));
+        // Once it is loaded, its identity resolves under the module's one normalization rule
+        // (the set holds `loaded_fonts()` identities, normalized).
+        let loaded = loaded_set(&["MSCustom-0123456789abcdef"]);
+        assert!(member_is_available("mscustom-0123456789ABCDEF", &loaded));
     }
 
     #[test]

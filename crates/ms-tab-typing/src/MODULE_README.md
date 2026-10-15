@@ -416,7 +416,12 @@ saving, and export.
   group CRUD + membership/alias
   (config-only named font sets; members referenced by font IDENTITY on both sides of the facade),
   and `list_folder_group_names` (real `fonts/groups/` names, HEAVY/off-thread) — and
-  re-exports `FontEntry` as an opaque type. For a BULK import (many fonts at once) it also
+  re-exports `FontEntry` as an opaque type, plus `FontByteSource` — the answer of
+  `FontEntry::byte_source()`, the ONE owner of "where are this font's bytes" (see
+  `panel/MODULE_README.md`, font model exposure) — with `FontPreviewSource` (own-typeface
+  previews), `CustomFontRef` (opaque), `font_bytes_blocking` (worker-only bytes of any entry,
+  custom fonts included) and the saved-custom-font rows of `FontAdminLists::custom`
+  (`CustomFontRow`, `CustomFontUnavailability::tooltip`), `is_custom_font_identity`. For a BULK import (many fonts at once) it also
   exposes `locate_system_font_by_identity` (find an INSTALLED font by PostScript name →
   `SystemFontLocation { identity, path }`; BLOCKING, off-thread only), the batch mutators
   `add_imported_fonts` / `add_virtual_group_members` (ONE revision bump + ONE document write per
@@ -425,7 +430,14 @@ saving, and export.
   its fields (the settings font-properties window must construct pairs); everything else stays
   opaque. Used by the settings font-settings UI
   (`src/tabs/settings/typesetting/`, in the binary); nothing else in this crate is `pub` for it. Add a
-  wrapper here rather than widening a panel internal.
+  wrapper here rather than widening a panel internal. It also re-exports the shared hybrid
+  editor (`HybridEditorState`, `HybridEditorCx`, `HybridEditorOutcome`, `CommittedRecipe`,
+  `CommitButton`, `DraftError`, `SourceCatalog`, `draw_hybrid_editor`) and builds the settings
+  host's source catalog (`hybrid_source_catalog`).
+- `hybrid_editor/`: the shared hybrid-font editor widget (draft source rows, missing-glyph
+  policies, live subset-hybrid preview + coverage on one latest-wins worker per editor,
+  full-face commit with progress/cancel). Hosted by the typing dock and Settings › Тайп; it
+  persists nothing. See `hybrid_editor/MODULE_README.md`.
 - `tab.rs`: module root of the tab. Holds the data model (all `struct`/`enum`
   definitions incl. `TypingTabState`, `TypingTextOverlayLayer`, `TypingOverlayRuntime`,
   `TypingRasterLayer`, deform/export/create/edit/layout structs), the public
@@ -703,7 +715,16 @@ saving, and export.
     READ-ONLY legacy aliases (deterministic FIRST-wins; a display-name override is never a key;
     nothing writes an alias form any more). Reads bytes lazily OUTSIDE its lock and caches
     `Arc<Vec<u8>>` + content id, and carries each font's `original_name` to the renderer. Built from the
-    panel's font list; shared (`Arc`) with background render threads.
+    panel's font list; shared (`Arc`) with background render threads. Also serves CUSTOM fonts (a
+    saved custom font's compiled face by its identity, an ad-hoc layer recipe by its render name)
+    and is the custom-font `SourceResolver`; no alias key is ever registered in the reserved
+    `MSCustom…` namespace.
+  - `custom_font_entry.rs`: custom fonts as font-model entries — `build_custom_font_entries` (saved
+    recipes -> entries + `CustomFontRow`s, run at the end of `build_combined_font_list`), the
+    panel-only ad-hoc entry, `CustomFontRef::full_face_blocking`, and
+    `FontPreviewSource::request_family` (own-typeface previews of files and compiled faces).
+  - `custom_font_select.rs`: `CustomFontSelection` + `selected_font_ref` — the ONE owner of the
+    selected font's persisted identity vs render name vs ad-hoc recipe.
   - `font_coverage.rs`: pure classification of a font's support for the selected TYPESETTING language
     (`ms_text_util::language::text_language()`, independent of the UI language) → `Full`/`Partial`/
     `Unsupported` via the swash charmap. Script base alphabet comes from the language's `ScriptGroup`

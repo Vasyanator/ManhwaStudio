@@ -7,6 +7,12 @@ applying selected-overlay data into the panel (load and sync transform,
 apply render-data JSON with options), font selection, the preview render
 queue and poll, and the render-param builders for create and edit.
 
+A schema-2 payload naming the AD-HOC custom font selects it through
+`custom_font_select::select_adhoc_font` (installs the stored recipe; a missing source
+or a damaged recipe lands in `missing_font`); every other font goes through
+`select_font_by_identity`. The preview queue renders nothing for a blocked ad-hoc
+selection (`adhoc_block_caption`): its caption becomes the status line.
+
 Notes:
 Extracted verbatim from `panel.rs`. Methods are `pub(super)` so the panel
 module root and its siblings can call them. `use super::*;` pulls in the
@@ -69,6 +75,11 @@ impl TypingCreatePanelState {
         self.advanced_text_show_formed = false;
         // Кэш окна форм относится к прошлому оверлею — инвалидируем.
         self.advanced_form_cache = None;
+        // The ad-hoc recipe belongs to the layer too: a layer that does not use the ad-hoc
+        // font must not inherit the previous layer's recipe, or picking «Гибридный шрифт» on
+        // it would re-render it at once with a hybrid the user never configured for it. An
+        // ad-hoc layer installs its own recipe in the apply below (`select_adhoc_font`).
+        self.custom_font = CustomFontSelection::default();
         if let Some(render_data) = selected.render_data_json.as_ref() {
             self.apply_render_data_json_with_options(render_data, true);
         }
@@ -422,7 +433,13 @@ impl TypingCreatePanelState {
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
-                self.select_font_by_identity(identity);
+                // The ad-hoc custom font is the one identity that does not stand alone: its
+                // recipe travels next to it and decides whether the layer can render at all
+                // (`custom_font_select::select_adhoc_font`).
+                match text_params_schema::custom_font_use(text_params_obj) {
+                    Some(text_params_schema::CustomFontUse::AdHoc(recipe)) => self.select_adhoc_font(recipe),
+                    Some(text_params_schema::CustomFontUse::Saved(_)) | None => self.select_font_by_identity(identity),
+                }
             } else {
                 // Schema 1: EVERY stored name is tried, in the one read order the schema
                 // owns (`font_original_name` → `font_label` → `font_family` → `font` →
@@ -453,7 +470,8 @@ impl TypingCreatePanelState {
     /// missing-font block is cleared. On a miss — including a payload with no `font` key
     /// at all — the identity is remembered in `missing_font`, which blocks re-rendering
     /// until the user picks an available font: an overlay must never be silently
-    /// re-rendered with a substitute font.
+    /// re-rendered with a substitute font. A missing SAVED custom font is remembered under
+    /// its stored name (`custom_font_select::missing_font_label`).
     pub(super) fn select_font_by_identity(&mut self, identity: Option<&str>) {
         match identity.and_then(|identity| self.find_font_idx_by_identity(identity)) {
             Some(idx) => {
@@ -464,7 +482,7 @@ impl TypingCreatePanelState {
             None => {
                 self.missing_font = Some(
                     identity
-                        .map(str::to_string)
+                        .map(custom_font_select::missing_font_label)
                         .unwrap_or_else(|| t!("typing.params.font_unknown_placeholder").to_string()),
                 );
             }
@@ -533,6 +551,17 @@ impl TypingCreatePanelState {
 
     pub(super) fn queue_preview_render(&mut self) {
         if !self.preview_enabled {
+            return;
+        }
+        // A blocked ad-hoc hybrid (not configured, damaged, a missing source) has no face to
+        // render: say why instead of attempting a render that can only end in the renderer's
+        // generic "font not found". The token bump drops a render still in flight for the
+        // previous selection.
+        if let Some(caption) = self.adhoc_block_caption() {
+            self.latest_token = self.latest_token.saturating_add(1);
+            self.render_in_flight = false;
+            self.preview_font_fallbacks = FontFallbackReport::default();
+            self.status_line = caption;
             return;
         }
         let Some(params) = self.build_render_params() else {
@@ -663,10 +692,15 @@ impl TypingCreatePanelState {
     }
 
     /// Font the on-canvas create-text editor draws in: the selected font's IDENTITY plus
-    /// the selected face. `None` when no font is selected. The tab resolves the identity
+    /// the selected face. `None` when no font is selected, and for the ad-hoc custom entry
+    /// (the editor then draws in the interface font: a face that is being tuned is never
+    /// registered with egui, which cannot unload fonts). The tab resolves the identity
     /// through this panel's `FontProvider` to obtain the bytes.
     pub(super) fn editor_font_spec(&self) -> Option<TypingEditorFontSpec> {
         let font = self.fonts.get(self.selected_font_idx)?;
+        if font.is_adhoc_custom() {
+            return None;
+        }
         let face_index = font
             .faces
             .get(self.selected_face_idx)
@@ -681,6 +715,7 @@ impl TypingCreatePanelState {
 
     pub(super) fn build_render_params_for(&self, text: String, width_px: u32) -> Option<TextRenderParams> {
         let font = self.fonts.get(self.selected_font_idx)?;
+        let font_ref = self.selected_font_ref()?;
         let selected_face_index = font
             .faces
             .get(self.selected_face_idx)
@@ -701,9 +736,9 @@ impl TypingCreatePanelState {
             // The renderer resolves the main font by name through the provider
             // handed to `render_text_to_image`; inline `<font=...>` tags resolve
             // against the same provider. The name is the font's canonical render
-            // IDENTITY — its original family name (fallback file-stem label) — which
-            // the provider keys as its primary lookup (label/stem kept as aliases).
-            font_name: font.render_identity_name(),
+            // IDENTITY, which the provider keys as its primary lookup — except for the
+            // ad-hoc custom entry, whose per-recipe render name `selected_font_ref` owns.
+            font_name: font_ref.render_name,
             font_size_px: self.font_size_px.max(1.0),
             line_spacing_px: self.line_spacing.as_px_percent().0,
             line_spacing_percent: self.line_spacing.as_px_percent().1,

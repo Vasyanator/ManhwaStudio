@@ -1325,11 +1325,8 @@ paths change.
             "the constructor must not read a single font file"
         );
         assert!(
-            state
-                .fonts
-                .iter()
-                .all(|font| font.bundled_stack_font().is_some()),
-            "the list holds nothing but the synthetic built-in entry until the load lands"
+            state.fonts.iter().all(FontEntry::is_panel_synthetic),
+            "the list holds nothing but the synthetic entries until the load lands"
         );
         assert!(
             state.font_groups.is_empty(),
@@ -1382,10 +1379,7 @@ paths change.
         let mut state = TypingCreatePanelState::new(false);
         state.preview_enabled = true;
         assert!(
-            state
-                .fonts
-                .iter()
-                .all(|font| font.bundled_stack_font().is_some()),
+            state.fonts.iter().all(FontEntry::is_panel_synthetic),
             "a fresh panel holds no user font: its list is still being built off-thread"
         );
 
@@ -2778,7 +2772,7 @@ paths change.
         // Schema 2 takes ONE font key: the identity (phase 3 of
         // `dev-docs/font_identity_postscript_plan.md`); path/label/family are gone.
         let render_data =
-            state.build_render_data_json_with_font("Hi".to_string(), 100, Some("Test".to_string()));
+            state.build_render_data_json_with_font_recipe("Hi".to_string(), 100, Some("Test".to_string()), None);
         let tp = render_data
             .get("text_params")
             .and_then(Value::as_object)
@@ -3366,19 +3360,22 @@ paths change.
         let via_dir = folder_font_entries(&dir);
         assert!(via_dir.is_empty(), "an empty fonts dir holds no user fonts");
         assert!(
-            via_load_fonts
-                .iter()
-                .all(|font| font.bundled_stack_font().is_some()),
+            via_load_fonts.iter().all(FontEntry::is_panel_synthetic),
             "no user font may be invented for an empty fonts dir"
         );
         assert!(
-            via_load_fonts.len() <= 1,
-            "at most the single built-in entry may be added"
+            via_load_fonts.len() <= 2,
+            "at most the built-in and the ad-hoc custom entries may be added"
+        );
+        assert!(
+            via_load_fonts.iter().any(FontEntry::is_adhoc_custom),
+            "the ad-hoc custom entry is always offered in a panel list"
         );
         assert!(
             via_load_fonts
-                .first()
-                .is_none_or(|font| font.bundled_stack_font().is_some()),
+                .iter()
+                .position(|font| font.bundled_stack_font().is_some())
+                .is_none_or(|idx| idx == 0),
             "when present, the built-in entry heads the list"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -3412,7 +3409,7 @@ paths change.
         let entries = load_fonts(&dir, std::slice::from_ref(&imported_copy));
         let user: Vec<&FontEntry> = entries
             .iter()
-            .filter(|font| font.bundled_stack_font().is_none())
+            .filter(|font| !font.is_panel_synthetic())
             .collect();
         assert_eq!(
             user.len(),
@@ -3454,7 +3451,7 @@ paths change.
         let user_idx = state
             .fonts
             .iter()
-            .position(|entry| entry.bundled_stack_font().is_none())
+            .position(|entry| !entry.is_panel_synthetic())
             .expect("the user font is in the list");
         for path in [&folder_copy, &imported_copy] {
             assert_eq!(
@@ -4001,6 +3998,7 @@ paths change.
                     alias: Some("Основа".to_string()),
                 }],
             }],
+            custom_fonts: std::collections::BTreeMap::new(),
             pending_migration: true,
         });
 
@@ -4102,7 +4100,7 @@ paths change.
         let admin = fonts::build_combined_font_list(&dir, &refs);
         let panel: Vec<FontEntry> = load_fonts(&dir, std::slice::from_ref(&imported_copy))
             .into_iter()
-            .filter(|font| font.bundled_stack_font().is_none())
+            .filter(|font| !font.is_panel_synthetic())
             .collect();
 
         let mut panel_identities: Vec<String> = panel
@@ -4201,6 +4199,7 @@ paths change.
                     alias: Some("Осн".to_string()),
                 }],
             }],
+            custom_fonts: std::collections::BTreeMap::new(),
             pending_migration: true,
         });
 
@@ -5363,6 +5362,7 @@ paths change.
             }],
             fonts: std::collections::BTreeMap::new(),
             virtual_groups: Vec::new(),
+            custom_fonts: std::collections::BTreeMap::new(),
             pending_migration: false,
         });
     }
@@ -5611,6 +5611,69 @@ paths change.
         test_reset_system_font_index();
     }
 
+
+    /// The panel's synthetic entries lead every panel list in a fixed order: the built-in
+    /// interface font first (when the bundle is available), the ad-hoc custom entry right
+    /// after it; the user's own fonts follow untouched.
+    #[test]
+    fn synthetic_entries_lead_the_panel_list_in_a_fixed_order() {
+        let mut fonts = finalize_fonts(vec![raw_font_ps("/fonts/a.ttf", None, 1, "Alpha", "Alpha-Regular")]);
+        prepend_synthetic_entries(&mut fonts);
+        let adhoc_idx = fonts.iter().position(FontEntry::is_adhoc_custom).expect("the ad-hoc entry is offered");
+        if fonts.first().is_some_and(|font| font.bundled_stack_font().is_some()) {
+            assert_eq!(adhoc_idx, 1, "the ad-hoc entry follows the built-in entry");
+        } else {
+            assert_eq!(adhoc_idx, 0, "without the bundle the ad-hoc entry heads the list");
+        }
+        let user: Vec<String> = fonts.iter().filter(|font| !font.is_panel_synthetic()).map(FontEntry::render_identity_name).collect();
+        assert_eq!(user, vec!["Alpha-Regular".to_owned()]);
+        assert_eq!(fonts.last().map(FontEntry::render_identity_name).as_deref(), Some("Alpha-Regular"));
+    }
+
+    /// A real font FILE entry's bytes come from its representative file, and the preview
+    /// loader reads that same file.
+    #[test]
+    fn byte_source_of_a_file_entry_is_its_representative_file() {
+        let path = Path::new("/fonts/groups/main/Alpha-Regular.ttf");
+        let entry = catalog_entry(path, "Alpha", "Alpha-Regular");
+        match entry.byte_source() {
+            FontByteSource::File(source) => assert_eq!(source, path),
+            FontByteSource::Bundled(stack_font) => panic!(
+                "a file entry must not be served from the bundle (got {})",
+                stack_font.path.display()
+            ),
+            FontByteSource::Custom(custom) => panic!("a file entry must not be a custom font (got {custom:?})"),
+        }
+        assert_eq!(entry.byte_source().preview_source(), FontPreviewSource::File(path.to_path_buf()));
+    }
+
+    /// The synthetic built-in entry's bytes are the process-resident core font of the
+    /// bundled stack — never a file read of its own — and its preview reads that core file.
+    #[test]
+    fn byte_source_of_the_bundled_entry_is_the_resident_stack_font() {
+        let (Some(entry), Some(core)) = (
+            fonts::bundled_ui_font_entry(),
+            ms_fonts::stack().and_then(|stack| stack.core().first()),
+        ) else {
+            eprintln!(
+                "skipping byte_source_of_the_bundled_entry_is_the_resident_stack_font: \
+                 no fonts/ui stack"
+            );
+            return;
+        };
+        match entry.byte_source() {
+            FontByteSource::Bundled(stack_font) => assert!(
+                std::ptr::eq(stack_font, core),
+                "the bundled entry must name the process-global core stack font"
+            ),
+            FontByteSource::File(path) => panic!(
+                "the bundled entry must not be read as a plain file (got {})",
+                path.display()
+            ),
+            FontByteSource::Custom(custom) => panic!("the bundled entry must not be a custom font (got {custom:?})"),
+        }
+        assert_eq!(entry.byte_source().preview_source(), FontPreviewSource::File(core.path.clone()));
+    }
 
     /// Builds one row of the system-font PICKER catalog exactly the way
     /// `fonts::load_system_fonts` does: the base identity (no collision pass runs on that
@@ -7052,4 +7115,556 @@ paths change.
             state.repaginate_pages_warning,
             "only a real comic-type transition may clear the confirmation"
         );
+    }
+
+    // ---- Ad-hoc / saved custom fonts on layers, profile memory, PSD names (package P4) ----
+
+    /// A two-source hybrid recipe over `a` and `b` (identities).
+    fn adhoc_recipe(a: &str, b: &str) -> Arc<CustomFontRecipe> {
+        use ms_custom_fonts::{CustomFontKind, HybridParams, HybridSource, MissingGlyphPolicy};
+        Arc::new(CustomFontRecipe {
+            kind: CustomFontKind::Hybrid(HybridParams {
+                sources: vec![
+                    HybridSource { identity: a.to_owned(), weight: 1.0, missing_override: None },
+                    HybridSource { identity: b.to_owned(), weight: 2.0, missing_override: None },
+                ],
+                missing_default: MissingGlyphPolicy::NoInfluence,
+            }),
+        })
+    }
+
+    /// Alpha + Beta (real fonts) with the panel's synthetic entries in front, as a loaded
+    /// panel list has them.
+    fn fonts_with_adhoc_entry(raws: Vec<RawFontFile>) -> Vec<FontEntry> {
+        let mut fonts = fonts_with_identities(raws);
+        fonts::prepend_synthetic_entries(&mut fonts);
+        fonts
+    }
+
+    fn alpha_raw() -> RawFontFile {
+        raw_font_ps("/fonts/a.ttf", None, 1, "Alpha", "Alpha-Regular")
+    }
+
+    fn beta_raw() -> RawFontFile {
+        raw_font_ps("/fonts/b.ttf", None, 2, "Beta", "Beta-Regular")
+    }
+
+    /// A schema-2 layer `render_data` naming the ad-hoc identity with `recipe` (raw JSON,
+    /// so a damaged one can be stored too).
+    fn adhoc_layer(recipe: Option<Value>) -> Value {
+        let mut text_params = serde_json::json!({
+            "schema": text_params_schema::TEXT_PARAMS_SCHEMA_VERSION,
+            "text": "Hi",
+            "font": crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY,
+        });
+        if let (Some(recipe), Some(obj)) = (recipe, text_params.as_object_mut()) {
+            obj.insert(text_params_schema::FONT_RECIPE_KEY.to_owned(), recipe);
+        }
+        serde_json::json!({ "text_params": text_params })
+    }
+
+    /// Loading an ad-hoc layer selects the ad-hoc entry with the layer's recipe; a source
+    /// that is not in the list blocks the layer with the hybrid caption, and the next font
+    /// reload that brings the source back clears the block (re-checked, never guessed).
+    #[test]
+    fn an_adhoc_layer_selects_the_adhoc_entry_and_blocks_on_a_missing_source() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw()]);
+        state.selected_font_idx = state.fonts.len() - 1;
+        let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
+
+        state.apply_render_data_json_with_options(&adhoc_layer(Some(recipe.to_json())), true);
+
+        assert!(state.selected_font_is_adhoc(), "the ad-hoc entry is selected");
+        assert_eq!(state.custom_font.adhoc_recipe.as_deref(), Some(&*recipe));
+        assert_eq!(
+            state.missing_font.as_deref(),
+            Some(tf!("typing.hybrid_font.missing_source_caption", font = "Beta-Regular").as_str()),
+            "a recipe source absent from the list blocks the layer"
+        );
+
+        deliver_font_reload(&mut state, fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]));
+        assert!(state.selected_font_is_adhoc(), "the reload restores the ad-hoc entry by identity");
+        assert!(state.missing_font.is_none(), "the source is back, so the block is lifted");
+
+        deliver_font_reload(&mut state, fonts_with_adhoc_entry(vec![beta_raw()]));
+        assert_eq!(
+            state.missing_font.as_deref(),
+            Some(tf!("typing.hybrid_font.missing_source_caption", font = "Alpha-Regular").as_str()),
+            "a reload that removes a source blocks the layer again"
+        );
+    }
+
+    /// A damaged (or absent) stored recipe is never treated as "not configured yet": the
+    /// layer is blocked with the damaged caption, also after a font reload.
+    #[test]
+    fn a_damaged_adhoc_recipe_blocks_the_layer_with_its_own_caption() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        state.selected_font_idx = state.fonts.len() - 1;
+        let damaged = t!("typing.hybrid_font.invalid_recipe_caption").to_string();
+
+        state.apply_render_data_json_with_options(&adhoc_layer(Some(serde_json::json!({ "kind": 7 }))), true);
+        assert!(state.selected_font_is_adhoc());
+        assert!(state.custom_font.adhoc_recipe.is_none());
+        assert_eq!(state.missing_font.as_deref(), Some(damaged.as_str()));
+
+        deliver_font_reload(&mut state, fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]));
+        assert_eq!(state.missing_font.as_deref(), Some(damaged.as_str()), "a reload does not heal a damaged recipe");
+
+        state.apply_render_data_json_with_options(&adhoc_layer(None), true);
+        assert_eq!(state.missing_font.as_deref(), Some(damaged.as_str()), "an absent recipe is damaged too");
+
+        // A recipe the user configures (the hybrid editor's commit) heals it.
+        state.install_adhoc_recipe(Some(adhoc_recipe("Alpha-Regular", "Beta-Regular")));
+        assert!(state.missing_font.is_none());
+        assert!(!state.custom_font.adhoc_recipe_damaged);
+    }
+
+    /// What the panel writes for the ad-hoc entry loads back into an equal selection: the
+    /// reserved identity plus the recipe, rendered by the recipe's render name.
+    #[test]
+    fn an_adhoc_layer_round_trips_through_the_panel() {
+        let mut writer = TypingCreatePanelState::new(false);
+        writer.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        writer.selected_font_idx = writer.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
+        writer.install_adhoc_recipe(Some(Arc::clone(&recipe)));
+        let render_data = writer.build_render_data_json_for("Hi".to_string(), 100).expect("a font is selected");
+        let render_name = writer.build_render_params_for("Hi".to_string(), 100).expect("params").font_name;
+        assert!(crate::custom_fonts::identity::is_adhoc_render_name(&render_name));
+
+        let mut reader = TypingCreatePanelState::new(false);
+        reader.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        reader.selected_font_idx = reader.fonts.len() - 1;
+        reader.apply_render_data_json_with_options(&render_data, true);
+        assert!(reader.selected_font_is_adhoc());
+        assert!(reader.missing_font.is_none());
+        assert_eq!(reader.custom_font.adhoc_recipe.as_deref(), Some(&*recipe));
+        assert_eq!(reader.selected_font_ref().map(|font_ref| font_ref.render_name), Some(render_name));
+    }
+
+    /// A layer naming a SAVED custom font that is not in the list is reported under the
+    /// font's stored name, not its opaque identity — at load and after a reload.
+    #[test]
+    fn a_missing_saved_custom_font_is_shown_by_its_stored_name() {
+        let _lock = super::font_settings_store::test_lock();
+        super::font_settings_store::test_reset();
+        let identity = super::font_settings_store::create_custom_font(
+            "Мой гибрид",
+            (*adhoc_recipe("Alpha-Regular", "Beta-Regular")).clone(),
+        )
+        .expect("the test store accepts a valid recipe");
+
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw()]);
+        state.selected_font_idx = state.fonts.len() - 1;
+        state.select_font_by_identity(Some(&identity));
+        assert_eq!(state.missing_font.as_deref(), Some("Мой гибрид"));
+
+        state.font_list_is_authoritative = true;
+        state.active_font_identity = Some(identity.clone());
+        deliver_font_reload(&mut state, fonts_with_adhoc_entry(vec![alpha_raw()]));
+        assert_eq!(state.missing_font.as_deref(), Some("Мой гибрид"), "the reload keeps the stored name");
+
+        // An identity the store does not know is shown as it is.
+        state.select_font_by_identity(Some("MSCustom-0000000000000000"));
+        assert_eq!(state.missing_font.as_deref(), Some("MSCustom-0000000000000000"));
+        super::font_settings_store::test_reset();
+    }
+
+    /// The ad-hoc entry owns no per-font memory (local-preset behaviour) in FONT mode: it is
+    /// never stored — nor persisted — under its shared identity, picking it restores nothing,
+    /// and leaving it for a real font restores that font's own profile.
+    #[test]
+    fn the_adhoc_entry_has_no_per_font_profile_memory() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.preview_enabled = true;
+        state.identity_mode = ParamIdentityMode::Font;
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw()]);
+        let alpha_idx = state.fonts.iter().position(|font| font.render_identity_name() == "Alpha-Regular").expect("alpha");
+        let adhoc_idx = state.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        state.selected_font_idx = alpha_idx;
+        state.active_font_identity = state.current_font_identity();
+        state.font_size_px = 20.0;
+        state.sync_current_font_profile_memory();
+        let _ = take_persisted_default_writes();
+
+        // Real -> ad-hoc: Alpha's parameters are stored, nothing is restored for the entry.
+        state.font_size_px = 33.0;
+        state.selected_font_idx = adhoc_idx;
+        assert!(state.handle_create_font_selection_change(alpha_idx));
+        assert!((state.font_size_px - 33.0).abs() < f32::EPSILON, "the parameters on screen stand");
+
+        // Edits on the ad-hoc entry go nowhere per font.
+        state.font_size_px = 44.0;
+        state.sync_current_font_profile_memory();
+        let adhoc_identity = crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY;
+        assert!(state.font_profiles_by_identity.get(adhoc_identity).is_none(), "no session profile for the ad-hoc identity");
+        assert!(
+            !take_persisted_default_writes().iter().any(|identity| identity == adhoc_identity),
+            "no persisted default profile for the ad-hoc identity"
+        );
+
+        // Ad-hoc -> real: Alpha's own remembered parameters come back.
+        state.selected_font_idx = alpha_idx;
+        assert!(state.handle_create_font_selection_change(adhoc_idx));
+        assert!((state.font_size_px - 33.0).abs() < f32::EPSILON, "Alpha's stored profile is restored");
+        assert!(state.font_profiles_by_identity.get(adhoc_identity).is_none());
+    }
+
+    /// A LOCAL preset snapshot of the ad-hoc entry carries its recipe (the profile JSON is
+    /// recipe-aware), so applying the snapshot later restores the same hybrid.
+    #[test]
+    fn a_profile_snapshot_of_the_adhoc_entry_carries_its_recipe() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        let adhoc_idx = state.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        state.selected_font_idx = adhoc_idx;
+        let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
+        state.install_adhoc_recipe(Some(Arc::clone(&recipe)));
+
+        let snapshot = state.build_font_profile_json_for_idx(adhoc_idx);
+        assert_eq!(
+            snapshot.pointer("/text_params/font_recipe"),
+            Some(&recipe.to_json()),
+            "the ad-hoc snapshot keeps its recipe"
+        );
+        let alpha_idx = state.fonts.iter().position(|font| font.render_identity_name() == "Alpha-Regular").expect("alpha");
+        assert!(
+            state.build_font_profile_json_for_idx(alpha_idx).pointer("/text_params/font_recipe").is_none(),
+            "a real font's snapshot never carries a recipe"
+        );
+    }
+
+    /// The PSD name snapshot lists real fonts only: a custom font's PostScript name is its
+    /// compiled face's, which the export's custom-font pass installs.
+    #[test]
+    fn the_psd_name_snapshot_skips_custom_fonts() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw()]);
+        let names = state.font_post_script_names();
+        assert_eq!(names.face_name("Alpha-Regular", 0), Some("Alpha-Regular"));
+        assert!(names.face_name(crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY, 0).is_none());
+    }
+
+    /// A font-mode preset of the ad-hoc entry captures its recipe and applies it back:
+    /// equal recipe selected, a source the list lacks blocks the panel, a preset without a
+    /// usable recipe blocks it as damaged — and a real-font preset never carries a recipe.
+    #[test]
+    fn an_adhoc_preset_captures_and_applies_its_recipe() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.preview_enabled = true;
+        state.identity_mode = ParamIdentityMode::Font;
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        let alpha_idx = state.fonts.iter().position(|font| font.render_identity_name() == "Alpha-Regular").expect("alpha");
+        state.selected_font_idx = alpha_idx;
+        assert!(state.capture_current_preset().font_recipe.is_none(), "a real font carries no recipe");
+
+        state.selected_font_idx = state.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
+        state.install_adhoc_recipe(Some(Arc::clone(&recipe)));
+        let captured = state.capture_current_preset();
+        assert_eq!(captured.font, crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY);
+        assert_eq!(captured.font_recipe.as_deref(), Some(&*recipe));
+
+        // Apply on a panel sitting on Alpha, with the recipe's second source gone.
+        let mut target = TypingCreatePanelState::new(false);
+        target.preview_enabled = true;
+        target.fonts = fonts_with_adhoc_entry(vec![alpha_raw()]);
+        target.selected_font_idx = target.fonts.len() - 1;
+        target.presets_by_name.insert("Гибрид".to_string(), captured.clone());
+        target.apply_preset_by_name("Гибрид".to_string());
+        assert!(target.selected_font_is_adhoc());
+        assert_eq!(target.custom_font.adhoc_recipe.as_deref(), Some(&*recipe));
+        assert_eq!(
+            target.missing_font.as_deref(),
+            Some(tf!("typing.hybrid_font.missing_source_caption", font = "Beta-Regular").as_str())
+        );
+
+        // A preset naming the hybrid without a usable recipe is a damaged hybrid.
+        target.presets_by_name.insert(
+            "Битый".to_string(),
+            TypingCreatePreset { font_recipe: None, ..captured },
+        );
+        target.apply_preset_by_name("Битый".to_string());
+        assert_eq!(
+            target.missing_font.as_deref(),
+            Some(t!("typing.hybrid_font.invalid_recipe_caption").to_string().as_str())
+        );
+    }
+
+    // ---- Typing hybrid-font UI: group rule, row, inline refusal, dock commit (package P7) ----
+
+    /// Index of the entry whose identity is `identity` (test lists only).
+    fn idx_of(state: &TypingCreatePanelState, identity: &str) -> usize {
+        state.find_font_idx_by_identity(identity).expect("the test list holds the font")
+    }
+
+    #[test]
+    fn the_adhoc_entry_belongs_to_every_group_but_is_never_auto_selected() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        let adhoc = state.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        let (alpha, beta) = (idx_of(&state, "Alpha-Regular"), idx_of(&state, "Beta-Regular"));
+        assert!(font_in_group(&state.fonts[adhoc], "Any group"), "no group filter hides the ad-hoc entry");
+        state.fonts[beta].groups = vec![Some("G".to_string())];
+        assert!(!font_in_group(&state.fonts[alpha], "G"), "a real font still needs the membership");
+
+        // Alpha is outside G: the group switch moves to the first REAL member, even though the
+        // ad-hoc entry comes earlier in the list and belongs to G too.
+        state.selected_font_idx = alpha;
+        state.selected_font_group = Some("G".to_string());
+        state.ensure_selected_font_in_group();
+        assert_eq!(state.selected_font_idx, beta);
+
+        // A group whose only member is the ad-hoc entry leaves the selection where it was.
+        state.selected_font_idx = alpha;
+        state.selected_font_group = Some("Empty".to_string());
+        state.ensure_selected_font_in_group();
+        assert_eq!(state.selected_font_idx, alpha);
+    }
+
+    #[test]
+    fn an_empty_path_never_matches_an_entry_without_a_file() {
+        let adhoc = crate::panel::custom_font_entry::adhoc_custom_font_entry();
+        assert!(adhoc.path.as_os_str().is_empty(), "a custom entry has no file");
+        assert!(!font_matches_path(&adhoc, ""));
+        assert!(!font_matches_path(&adhoc, "   "));
+        let fonts = fonts_with_identities(vec![alpha_raw()]);
+        assert!(font_matches_path(&fonts[0], "/fonts/a.ttf"), "a real path still matches its file");
+        assert!(!font_matches_path(&fonts[0], ""));
+    }
+
+    #[test]
+    fn the_adhoc_entry_is_refused_as_a_span_font_and_never_adopted_by_the_display_clamp() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw()]);
+        let adhoc = state.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        let alpha = idx_of(&state, "Alpha-Regular");
+
+        assert!(state.refuse_inline_adhoc_pick(adhoc));
+        assert!(state.custom_font.inline_pick_refused, "the refusal stays explained");
+        assert!(!state.refuse_inline_adhoc_pick(alpha), "a real font is a valid span font");
+        assert!(!state.custom_font.inline_pick_refused, "an accepted pick clears the explanation");
+
+        state.selected_font_idx = alpha;
+        assert_eq!(state.combo_font_idx_to_adopt(adhoc, None), alpha, "the display clamp never selects the ad-hoc entry");
+        assert_eq!(state.combo_font_idx_to_adopt(adhoc, Some(adhoc)), adhoc, "a genuine pick does");
+        assert_eq!(state.combo_font_idx_to_adopt(alpha, None), alpha);
+    }
+
+    #[test]
+    fn the_hybrid_summary_names_every_source_with_its_share() {
+        let _locale_guard = ms_config::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
+        let en = ms_i18n::LocaleTag::parse("en").expect("en tag is valid");
+        ms_i18n::set_locale(&en).expect("en catalog installs");
+        // Weights 1 and 2: shares of one third and two thirds, rounded to whole percent.
+        let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
+        let summary = custom_font_select::hybrid_summary(&recipe, |identity| identity.trim_end_matches("-Regular").to_owned());
+        assert_eq!(summary, "Alpha 33% + Beta 67%");
+    }
+
+    #[test]
+    fn the_custom_font_fallback_hint_needs_a_custom_font_and_a_fallback() {
+        let report = fallback_report("Noto Sans", &['ж']);
+        assert!(create_presets::custom_font_fallback_hint(&report, true).is_some());
+        assert!(create_presets::custom_font_fallback_hint(&report, false).is_none(), "a real font's fallbacks need no hint");
+        assert!(create_presets::custom_font_fallback_hint(&FontFallbackReport::default(), true).is_none());
+    }
+
+    #[test]
+    fn the_layer_text_becomes_the_preview_sample_without_markup() {
+        assert_eq!(
+            hybrid_dock::preview_text_from_layer("<b>Привет</b>\nмир <font=Alpha-Regular>x</font> a <zzz> b <c"),
+            "Привет мир x a <zzz> b <c"
+        );
+        assert_eq!(hybrid_dock::preview_text_from_layer(""), "");
+    }
+
+    /// An UNCONFIGURED ad-hoc pick is an explicit block: its own caption (not the renderer's
+    /// generic "font not found"), no preview render attempt, and nothing persisted from it —
+    /// no global preset (created or saved), no local preset, no new layer — since the ad-hoc
+    /// identity without a recipe would read back as damaged.
+    #[test]
+    fn an_unconfigured_adhoc_pick_is_blocked_and_never_persisted() {
+        let caption = t!("typing.hybrid_font.not_configured_caption").to_string();
+        let refusal = TypingCreatePanelState::adhoc_unconfigured_status();
+        let mut state = TypingTopPanelState::default();
+        let panel = &mut state.create_panel;
+        panel.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        panel.preview_enabled = true;
+        panel.selected_font_idx = idx_of(panel, "Alpha-Regular");
+        panel.create_global_preset();
+        let preset_name = panel.selected_preset_name.clone().expect("a real font makes a preset");
+
+        panel.selected_font_idx = panel.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        panel.refresh_adhoc_missing_font();
+        assert!(panel.selected_adhoc_without_recipe());
+        assert_eq!(panel.missing_font.as_deref(), Some(caption.as_str()));
+
+        let token = panel.latest_token;
+        panel.queue_preview_render();
+        assert!(!panel.render_in_flight, "no render is attempted without a face");
+        assert_eq!(panel.status_line, caption);
+        assert!(panel.latest_token > token, "a render still in flight is superseded");
+
+        panel.preset_name_input.clone_from(&preset_name);
+        panel.save_current_preset();
+        assert_eq!(panel.status_line, refusal);
+        assert_eq!(
+            panel.presets_by_name.get(&preset_name).map(|preset| preset.font.as_str()),
+            Some("Alpha-Regular"),
+            "the saved preset keeps its real font"
+        );
+
+        let presets = panel.presets_by_name.len();
+        panel.create_global_preset();
+        assert_eq!(panel.presets_by_name.len(), presets);
+        assert_eq!(panel.status_line, refusal);
+
+        let local_presets = panel.local_presets.len();
+        panel.create_local_preset();
+        assert_eq!(panel.local_presets.len(), local_presets);
+        assert_eq!(panel.status_line, refusal);
+
+        assert_eq!(state.build_create_text_render_bundle("Hi".to_string(), 100).err(), Some(refusal));
+
+        // Configuring it lifts every block.
+        state.create_panel.install_adhoc_recipe(Some(adhoc_recipe("Alpha-Regular", "Beta-Regular")));
+        assert!(state.create_panel.missing_font.is_none());
+        assert!(!state.create_panel.selected_adhoc_without_recipe());
+    }
+
+    #[test]
+    fn the_hybrid_dock_tab_shows_only_when_opened_over_the_adhoc_entry() {
+        assert!(hybrid_dock::hybrid_dock_visible(true, true));
+        assert!(!hybrid_dock::hybrid_dock_visible(true, false));
+        assert!(!hybrid_dock::hybrid_dock_visible(false, true));
+        assert!(!hybrid_dock::hybrid_dock_visible(false, false));
+
+        let mut state = TypingTopPanelState::default();
+        state.create_panel.fonts = fonts_with_adhoc_entry(vec![alpha_raw()]);
+        let adhoc = state.create_panel.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        let alpha = idx_of(&state.create_panel, "Alpha-Regular");
+        state.create_panel.selected_font_idx = adhoc;
+        assert!(!state.hybrid_font_tab_visible(), "closed until the row's button is clicked");
+
+        state.create_panel.custom_font.configure_requested = true;
+        state.drain_hybrid_dock_request();
+        assert!(state.hybrid_font_tab_visible());
+        assert!(!state.create_panel.custom_font.configure_requested, "the click is drained once");
+
+        state.create_panel.selected_font_idx = alpha;
+        assert!(!state.hybrid_font_tab_visible(), "another font has no ad-hoc recipe to edit");
+
+        state.create_panel.selected_font_idx = adhoc;
+        state.create_panel.custom_font.configure_requested = true;
+        state.drain_hybrid_dock_request();
+        assert!(!state.hybrid_font_tab_visible(), "a second click closes the tab");
+    }
+
+    /// The canvas changes only on «Применить»: an unconfigured or damaged ad-hoc selection
+    /// emits no edit request, a commit for a layer the user has left is dropped, and a commit
+    /// for the current layer installs the recipe, clears the block and emits the edit.
+    #[test]
+    fn a_hybrid_commit_installs_the_recipe_only_for_its_own_layer() {
+        let mut state = TypingTopPanelState::default();
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(0)));
+        let stale = state.hybrid_binding();
+        state.sync_selected_overlay_for_edit(Some(text_overlay_for_edit(1)));
+        state.edit_panel.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        state.edit_panel.selected_font_idx =
+            state.edit_panel.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        state.edit_panel.custom_font.adhoc_recipe = None;
+        state.edit_panel.custom_font.adhoc_recipe_damaged = true;
+        state.edit_panel.refresh_adhoc_missing_font();
+        assert!(state.edit_panel.missing_font.is_some(), "a damaged recipe blocks the layer");
+        state.emit_edit_request();
+        assert!(state.take_edit_request().is_none());
+
+        state.edit_panel.custom_font.adhoc_recipe_damaged = false;
+        state.edit_panel.refresh_adhoc_missing_font();
+        assert_eq!(
+            state.edit_panel.missing_font.as_deref(),
+            Some(t!("typing.hybrid_font.not_configured_caption").to_string().as_str()),
+            "an unconfigured hybrid is blocked with its own caption"
+        );
+        state.emit_edit_request();
+        assert!(state.take_edit_request().is_none(), "an unconfigured hybrid never re-renders the layer");
+
+        let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
+        state.apply_committed_hybrid_recipe(&stale, Arc::clone(&recipe));
+        assert!(state.edit_panel.custom_font.adhoc_recipe.is_none(), "a commit for another layer is dropped");
+        assert!(state.take_edit_request().is_none());
+
+        state.edit_panel.custom_font.adhoc_recipe_damaged = true;
+        let binding = state.hybrid_binding();
+        state.apply_committed_hybrid_recipe(&binding, Arc::clone(&recipe));
+        assert_eq!(state.edit_panel.custom_font.adhoc_recipe.as_deref(), Some(&*recipe));
+        assert!(!state.edit_panel.custom_font.adhoc_recipe_damaged);
+        assert!(state.edit_panel.missing_font.is_none(), "the commit clears the block");
+        assert!(matches!(state.take_edit_request(), Some(TypingOverlayEditRequest::Text { overlay_idx: 1, .. })));
+    }
+
+    #[test]
+    fn a_hybrid_commit_in_create_mode_writes_the_panel_recipe() {
+        let mut state = TypingTopPanelState::default();
+        state.create_panel.fonts = fonts_with_adhoc_entry(vec![alpha_raw()]);
+        state.create_panel.selected_font_idx =
+            state.create_panel.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        // Beta is not in this list: the committed recipe still blocks, with the source named.
+        let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
+        let binding = state.hybrid_binding();
+        state.apply_committed_hybrid_recipe(&binding, Arc::clone(&recipe));
+        assert_eq!(state.create_panel.custom_font.adhoc_recipe.as_deref(), Some(&*recipe));
+        assert!(state.create_panel.missing_font.is_some(), "a missing source still blocks after the commit");
+
+        state.create_panel.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        state.create_panel.selected_font_idx =
+            state.create_panel.fonts.iter().position(FontEntry::is_adhoc_custom).expect("ad-hoc entry");
+        state.apply_committed_hybrid_recipe(&binding, Arc::clone(&recipe));
+        assert!(state.create_panel.missing_font.is_none(), "with every source present the commit clears the block");
+    }
+
+    /// The EDIT panel's ad-hoc recipe belongs to the loaded layer: loading a real-font layer
+    /// after an ad-hoc one clears it (and the damaged flag), so picking «Гибридный шрифт» on
+    /// the real-font layer starts unconfigured instead of re-rendering it with the previous
+    /// layer's hybrid. Loading an ad-hoc layer again installs that layer's own recipe.
+    #[test]
+    fn loading_a_real_font_layer_drops_the_previous_layers_adhoc_recipe() {
+        let mut state = TypingCreatePanelState::new(false);
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        state.selected_font_idx = state.fonts.len() - 1;
+        let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
+
+        let mut adhoc = text_overlay_for_edit(0);
+        adhoc.render_data_json = Some(adhoc_layer(Some(recipe.to_json())));
+        state.load_from_selected_overlay(&adhoc);
+        assert_eq!(state.custom_font.adhoc_recipe.as_deref(), Some(&*recipe));
+
+        let mut real = text_overlay_for_edit(1);
+        real.render_data_json = Some(serde_json::json!({ "text_params": {
+            "schema": text_params_schema::TEXT_PARAMS_SCHEMA_VERSION,
+            "text": "Hi",
+            "font": "Alpha-Regular",
+        }}));
+        state.load_from_selected_overlay(&real);
+        assert_eq!(state.current_font_identity().as_deref(), Some("Alpha-Regular"));
+        assert!(state.custom_font.adhoc_recipe.is_none(), "the real-font layer carries no hybrid");
+        assert!(!state.custom_font.adhoc_recipe_damaged);
+        let adhoc_entry = crate::panel::custom_font_entry::adhoc_custom_font_entry();
+        assert!(
+            state.custom_font.font_ref(&adhoc_entry).recipe.is_none(),
+            "a pick of the ad-hoc entry now starts unconfigured"
+        );
+
+        // A damaged ad-hoc layer, then a real one: the damaged flag does not leak either.
+        let mut damaged = text_overlay_for_edit(2);
+        damaged.render_data_json = Some(adhoc_layer(None));
+        state.load_from_selected_overlay(&damaged);
+        assert!(state.custom_font.adhoc_recipe_damaged);
+        state.load_from_selected_overlay(&real);
+        assert!(!state.custom_font.adhoc_recipe_damaged);
+        assert!(state.missing_font.is_none());
     }

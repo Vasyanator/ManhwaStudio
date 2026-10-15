@@ -520,8 +520,16 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
   contract above): `with_leased_font_system` takes the mode and never hands a
   render a system of the other partition.
   Growth is bounded — a leased system is dropped instead of requeued once its
-  cache exceeds `MAX_CACHED_FILES`, the pool holds `MAX_POOLED_SYSTEMS`, or this
-  mode already holds `MAX_POOLED_SYSTEMS_PER_MODE` of them. The
+  cache exceeds `MAX_CACHED_FILES` distinct contents or `MAX_CACHED_FONT_BYTES`
+  (256 MiB) of resident CALLER font bytes, the pool holds `MAX_POOLED_SYSTEMS`, or
+  this mode already holds `MAX_POOLED_SYSTEMS_PER_MODE` of them. The byte budget
+  exists because a parked system pins every caller buffer it registered: superseded
+  custom/hybrid faces (each «Apply» is a new content) and large CJK fonts would
+  otherwise stay resident by the gigabyte under the count limit. Bytes are counted
+  per content id once, at the length of the buffer handed to fontdb (the patched copy
+  in the `Remove` partition); bundled base faces adopted by the loader count 0. Over
+  budget the WHOLE system is dropped (never individual faces, which would make
+  matching history-dependent) and logged via `runtime_log::log_info`. The
   renderer must not panic while a system is leased (a panic leaks that one system;
   the pool recreates it). `prewarm_font_system_pool` (re-exported) lets the app
   pay the first scan on a background thread. The pool is NOT used by the throwaway
