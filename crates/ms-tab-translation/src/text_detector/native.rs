@@ -10,6 +10,8 @@ Key items:
 - `NativePaddleRunner`: `ms_text_detect::ProbMapRunner` over
   `ms_native_runtime::paddle_det_forward` (batched, already-planned tiles in, one quantized
   probability map per tile out; batch size from `paddle_det_max_batch`, provider-dependent).
+  It carries the detection's `EnsureCtx`: the cancel flag reaches the detector-model download,
+  whose events go to the context's progress sink.
 
 Notes:
 The runner only runs the model; planning, stitching, the DB postprocess and the glyph mask are
@@ -20,8 +22,8 @@ whether the page is re-run on the backend (`pipeline::backend_fallback_applies`)
 use super::pipeline::{DetectorRoute, detector_native_route};
 use image::RgbImage;
 use ms_config as config;
-use ms_native_runtime::{self as native_runtime, NativeRuntimeError};
-use ms_onnx_runtime::OrtDownloadProgress;
+use ms_native_runtime::{self as native_runtime, NativeProgress, NativeRuntimeError};
+use ms_sysprobe::ai_models::EnsureCtx;
 use ms_text_detect::{ProbMapRunner, RunnerError, TileMaps};
 use serde_json::Value;
 use std::num::NonZeroUsize;
@@ -38,10 +40,13 @@ pub(super) fn current_detector_route() -> DetectorRoute {
     detector_native_route(runtime, decision)
 }
 
-/// `ProbMapRunner` running the PaddleOCR detection model in-process.
-pub(super) struct NativePaddleRunner;
+/// `ProbMapRunner` running the PaddleOCR detection model in-process. `ctx` is the detection's
+/// cancel flag and model-download progress sink (the detector model may be fetched on first use).
+pub(super) struct NativePaddleRunner<'c, 'a> {
+    pub(super) ctx: &'c mut EnsureCtx<'a>,
+}
 
-impl ProbMapRunner for NativePaddleRunner {
+impl ProbMapRunner for NativePaddleRunner<'_, '_> {
     /// `ms_native_runtime::paddle_det_max_batch`: 4 tiles on the CPU provider, 1 on any
     /// accelerator (bounds GPU memory; an OOM would send the page to the backend). Runs on the
     /// detector worker; the provider selection is cached by `current_detector_route` before.
@@ -52,11 +57,19 @@ impl ProbMapRunner for NativePaddleRunner {
     /// Runs the shared native detector on `tiles` (guarded load, serialized with OCR).
     ///
     /// # Errors
-    /// [`runner_error_from_native`] of the runtime error (logged with its stable variant name).
+    /// [`runner_error_from_native`] of the runtime error (logged with its stable variant name);
+    /// a cancelled model download is one too, and the pipeline tells it apart by the context's
+    /// cancel flag.
     fn forward(&mut self, tiles: &[RgbImage]) -> Result<Vec<TileMaps>, RunnerError> {
-        let mut progress = |_snapshot: OrtDownloadProgress| {};
+        let cancel = self.ctx.cancel;
+        let model_progress = &mut self.ctx.progress;
+        // The dylib download keeps no UI here (as before); model events reach the sink.
+        let mut progress = |update: NativeProgress<'_>| match update {
+            NativeProgress::Runtime(_) => {}
+            NativeProgress::Model(event) => model_progress(event),
+        };
         let started = Instant::now();
-        let maps = native_runtime::paddle_det_forward(tiles, &mut progress).map_err(|err| {
+        let maps = native_runtime::paddle_det_forward(tiles, cancel, &mut progress).map_err(|err| {
             // Debug (stable English variant name) keeps logs grep-able regardless of the UI
             // language; the localized Display goes to the user.
             ms_log::runtime_log::log_error(format!("[text-detector] native Paddle forward of {} tiles failed: {err:?}", tiles.len()));

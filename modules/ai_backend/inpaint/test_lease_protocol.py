@@ -156,7 +156,7 @@ def _case_sdxl(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Call
     # prefill that uses it lives inside `_inpaint_locked`, which never runs here.
     service = sdxl.SdxlInpaintService(manager, lama.LamaInpaintService(manager))
 
-    def ensure(*, model_path: str, mode: str, device: str, model_key: str) -> _StubModel:
+    def ensure(*, source: Any, mode: str, device: str, model_key: str) -> _StubModel:
         service._pipe = _StubModel()
         service._active_device = device
         service._active_model_key = model_key
@@ -164,10 +164,15 @@ def _case_sdxl(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Call
 
     stack.enter_context(patch.object(sdxl, "_resolve_selected_backend_device", lambda _f: "cpu"))
     stack.enter_context(patch.object(sdxl, "_clear_torch_cache", lambda: None))
+    # The fictional checkpoint does not exist; resolution is `test_sdxl.py`'s subject.
+    source = sdxl.SdxlModelSource(kind="single_file", path=_SDXL_MODEL_PATH, config_dir="/models/sdxl-config")
+    stack.enter_context(patch.object(sdxl, "resolve_model_source", lambda *_a, **_k: source))
     stack.enter_context(patch.object(service, "_ensure_pipeline_locked", ensure))
     stack.enter_context(patch.object(service, "_inpaint_locked", _explode))
     params = {"model_path": _SDXL_MODEL_PATH, "mode": "nine_channel"}
-    return service, lambda: service.inpaint_image_bytes(IMAGE_PNG, MASK_PNG, params=params)
+    return service, lambda: service.inpaint_image_bytes(
+        IMAGE_PNG, MASK_PNG, config_dir="/models/sdxl-config", params=params
+    )
 
 
 def _case_flux_fill(
@@ -181,7 +186,7 @@ def _case_flux_fill(
         return service._pipe
 
     stack.enter_context(patch.object(flux_fill, "_clear_torch_cache", lambda: None))
-    stack.enter_context(patch.object(service, "ensure_model", lambda _quant, _cb: None))
+    stack.enter_context(patch.object(service, "ensure_model", lambda _quant, _cb, _cancel=None: None))
     stack.enter_context(patch.object(service, "_ensure_pipeline_locked", ensure))
     stack.enter_context(patch.object(service, "_generate_locked", _explode))
     return service, lambda: service.inpaint_image_bytes(

@@ -95,6 +95,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use web_time::Duration;
+// The run in flight (worker + channel + cancel flag set on drop), shared with `sdxl`.
+use super::run_job::EngineRunJob;
+use ms_tab_translation::model_download_status::draw_model_download_status;
+use ms_sysprobe::ai_models::{EnsureCtx, ModelEnsureError};
 
 // The four model entries, the method each one runs and the ensure-before-run path.
 mod catalog;

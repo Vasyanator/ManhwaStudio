@@ -55,7 +55,8 @@ one opened session and talks to the window only through its `StudioOutput` queue
   (`conflicting_installed_copy_flags`, `conflicting_image_flags`, `conflicting_project_flags`,
   `windows_only_flags`) and the image path pre-check. Consumed by `startup/mode.rs`.
 - `update_check.rs` (native): the startup check for a newer GitHub release on a worker
-  (comparison on `CARGO_PKG_VERSION`), started once by the shell on the first launcher entry.
+  (comparison on `CARGO_PKG_VERSION`), started once by the shell on the first launcher entry;
+  the release list comes through `ms_download::fetch_small` with at most 2 retries.
 - `web_entry.rs` (`wasm32`): the browser entry — in-memory storage, a generated demo chapter, a
   launcher -> `StudioApp` swap behind one `eframe::App`. It shares only `shell::style` and
   `shell::chapter_load` with the native window; the studio's outbound queue is drained and

@@ -9,18 +9,25 @@ Main types:
 - `TextDetectorAiCtdOptions`: CTD options (detection size -> plan; region dilation).
 - `TextDetectorPaddleOcrOptions`: PaddleOCR options (region dilation).
 - `TextDetectorSuryaOptions`: Surya options (none today).
+- `SURYA_DETECTOR_SPECS` (from `backend`): the Surya detector's explicit-download bundle (the
+  pinned `text_detection` checkpoint), checked before a Surya batch and every Surya forward.
 - `TextDetectorRunMode`: detector mode (`Classic` local, `PaddleOcr` native or backend,
   `AiCtd` via backend, `Surya` via backend); `plan_inputs()` is the one mode -> plan-input
   mapping, shared by the page worker and the panel's per-page plan notice.
-- `TextDetectorControllerEvent`: UI-facing detection progress/results/errors.
-- `TranslationTextDetectorController`: command/event bridge + busy-state lifecycle.
+- `TextDetectorControllerEvent`: UI-facing detection progress/results/errors, model-download
+  progress and the cancelled outcome.
+- `TranslationTextDetectorController`: command/event bridge + busy-state lifecycle; owns the
+  running batch's cancel flag (set on drop).
+- `DetectFailure` (from `pipeline`): cancelled vs localized failure of one detection.
 
 Worker flow:
 - `worker_loop` receives `WorkerCommand::Detect` and runs `run_detect_batch`.
 - `run_detect_batch` reads the PaddleOCR route once, gates the backend, ensures models,
   processes pages sequentially in background (model engines through
   `pipeline::detect_page_file`), applies the Rust mask dilation to every page result and emits
-  progress.
+  progress. One `ai_models::EnsureCtx` per batch: the batch's cancel flag (checked before
+  every page and polled by every model download) and a sink that forwards download events.
+  A cancel ends the batch with `DetectCancelled`, never `DetectFailed`.
 
 Submodules:
 - `classic`: the local classic detector (decode wrapper + pure gray-image pipeline).
@@ -47,14 +54,20 @@ mod tests;
 
 // Public paths kept stable for the `cleaning` tab (`mask_generation.rs`).
 pub use ms_text_detect::DetectRect as TextDetectorRect;
+pub use pipeline::DetectFailure;
 pub use region::{detect_ai_ctd_mask_for_image, detect_paddle_mask_for_image, detect_surya_mask_for_image};
 
 use ms_config as config;
 use ms_sysprobe::ai_models;
+use ms_sysprobe::ai_models::{EnsureCtx, ModelDownloadEvent, ModelEnsureError};
 use ms_text_detect::{DetectParams, EngineKind};
 // The tab's detector availability gate maps the Paddle route onto the local-AI rule.
 pub(crate) use pipeline::{DetectorRoute, detector_native_route};
+// The Surya detector's download bundle: the panel's download block and the tab's re-probe.
+pub(crate) use backend::SURYA_DETECTOR_SPECS;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread::{self as thread, JoinHandle};
 
@@ -118,7 +131,10 @@ impl TextDetectorRunMode {
 
 #[derive(Debug, Clone)]
 pub enum TextDetectorControllerEvent {
+    /// The batch's first model download began (once per batch).
     ModelDownloadStarted,
+    /// One (thinned) model-download event of the batch; retries are progress, not failures.
+    ModelDownloadProgress(ModelDownloadEvent),
     DetectStarted {
         total: usize,
         replace: bool,
@@ -142,6 +158,9 @@ pub enum TextDetectorControllerEvent {
     DetectFailed {
         error: String,
     },
+    /// The batch's cancel flag stopped it (a model download or the page loop): a neutral end,
+    /// not a failure. Pages detected before it were already delivered.
+    DetectCancelled,
 }
 
 #[derive(Debug)]
@@ -150,6 +169,9 @@ pub struct TranslationTextDetectorController {
     cmd_tx: Sender<WorkerCommand>,
     evt_rx: Receiver<WorkerEvent>,
     worker_thread: Option<JoinHandle<()>>,
+    /// Cancel flag of the most recent batch; set on drop so a running model download or page
+    /// loop stops before the worker join.
+    batch_cancel: Arc<AtomicBool>,
 }
 
 impl Default for TranslationTextDetectorController {
@@ -168,6 +190,7 @@ impl TranslationTextDetectorController {
             cmd_tx,
             evt_rx,
             worker_thread: Some(worker_thread),
+            batch_cancel: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -189,6 +212,8 @@ impl TranslationTextDetectorController {
             return Err(t!("translation.text_detector.no_pages_status").to_string());
         }
         self.busy = true;
+        // A fresh flag per batch: the previous batch has ended (`busy` was clear).
+        self.batch_cancel = Arc::new(AtomicBool::new(false));
         if self
             .cmd_tx
             .send(WorkerCommand::Detect {
@@ -196,6 +221,7 @@ impl TranslationTextDetectorController {
                 replace,
                 mode,
                 mask_dilate_size: mask_dilate_size.clamp(0, 30),
+                cancel: Arc::clone(&self.batch_cancel),
             })
             .is_err()
         {
@@ -205,12 +231,28 @@ impl TranslationTextDetectorController {
         Ok(())
     }
 
+    /// Stops the running batch (the panel's Cancel of a model download): a download stops
+    /// keeping its staged bytes, the page loop stops before its next page, and the batch ends
+    /// with `DetectCancelled`. A no-op while idle (the next batch gets a fresh flag).
+    pub fn cancel_detection(&self) {
+        if self.busy {
+            self.batch_cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     pub fn poll_events(&mut self) -> Vec<TextDetectorControllerEvent> {
         let mut out = Vec::new();
         for _ in 0..DETECTOR_EVENT_POLL_BUDGET {
             match self.evt_rx.try_recv() {
                 Ok(WorkerEvent::ModelDownloadStarted) => {
                     out.push(TextDetectorControllerEvent::ModelDownloadStarted);
+                }
+                Ok(WorkerEvent::ModelDownloadProgress(event)) => {
+                    out.push(TextDetectorControllerEvent::ModelDownloadProgress(event));
+                }
+                Ok(WorkerEvent::DetectCancelled) => {
+                    self.busy = false;
+                    out.push(TextDetectorControllerEvent::DetectCancelled);
                 }
                 Ok(WorkerEvent::DetectStarted { total, replace }) => {
                     out.push(TextDetectorControllerEvent::DetectStarted { total, replace });
@@ -254,6 +296,9 @@ impl TranslationTextDetectorController {
 
 impl Drop for TranslationTextDetectorController {
     fn drop(&mut self) {
+        // Stop a running batch first (model download, page loop), so the join below does not
+        // wait for a download nobody will see.
+        self.batch_cancel.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(WorkerCommand::Stop);
         if let Some(handle) = self.worker_thread.take() {
             let _ = handle.join();
@@ -268,6 +313,8 @@ enum WorkerCommand {
         replace: bool,
         mode: TextDetectorRunMode,
         mask_dilate_size: i32,
+        /// The batch's cancel flag (`TranslationTextDetectorController::batch_cancel`).
+        cancel: Arc<AtomicBool>,
     },
     Stop,
 }
@@ -275,6 +322,8 @@ enum WorkerCommand {
 #[derive(Debug)]
 enum WorkerEvent {
     ModelDownloadStarted,
+    ModelDownloadProgress(ModelDownloadEvent),
+    DetectCancelled,
     DetectStarted {
         total: usize,
         replace: bool,
@@ -309,8 +358,9 @@ fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
                 replace,
                 mode,
                 mask_dilate_size,
+                cancel,
             } => {
-                run_detect_batch(pages, replace, mode, mask_dilate_size, &evt_tx);
+                run_detect_batch(pages, replace, mode, mask_dilate_size, &cancel, &evt_tx);
             }
         }
     }
@@ -321,8 +371,21 @@ fn run_detect_batch(
     replace: bool,
     mode: TextDetectorRunMode,
     mask_dilate_size: i32,
+    cancel: &AtomicBool,
     evt_tx: &Sender<WorkerEvent>,
 ) {
+    // One download context for the whole batch: `ModelDownloadStarted` once, then every
+    // (thinned) event. Sends are best effort: a gone controller ends the batch at the next
+    // page through `cancel` (set on drop).
+    let mut download_reported = false;
+    let mut forward = |event: &ModelDownloadEvent| {
+        if !download_reported {
+            download_reported = true;
+            let _ = evt_tx.send(WorkerEvent::ModelDownloadStarted);
+        }
+        let _ = evt_tx.send(WorkerEvent::ModelDownloadProgress(event.clone()));
+    };
+    let mut ctx = EnsureCtx { cancel, progress: &mut forward };
     let total = pages.len();
     let _ = evt_tx.send(WorkerEvent::DetectStarted { total, replace });
     // The PaddleOCR route is read ONCE per batch (a disk read), so the backend gate below and
@@ -344,21 +407,32 @@ fn run_detect_batch(
         let _ = evt_tx.send(WorkerEvent::DetectFailed { error });
         return;
     }
-    if let Err(error) = ensure_detector_models_for_mode(&mode, evt_tx) {
-        let _ = evt_tx.send(WorkerEvent::DetectFailed { error });
-        return;
+    match ensure_detector_models_for_mode(&mode, &mut ctx) {
+        Ok(()) => {}
+        Err(ModelEnsureError::Cancelled) => {
+            let _ = evt_tx.send(WorkerEvent::DetectCancelled);
+            return;
+        }
+        Err(ModelEnsureError::Failed(error)) => {
+            let _ = evt_tx.send(WorkerEvent::DetectFailed { error });
+            return;
+        }
     }
     let mut total_blocks = 0usize;
     let mut failed_pages = 0usize;
 
     for (done, (page_idx, path)) in pages.into_iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = evt_tx.send(WorkerEvent::DetectCancelled);
+            return;
+        }
         // Model engines plan with `mode.plan_inputs()` (the same inputs the panel notice uses);
         // `route` is `Backend` for every mode but PaddleOCR (see above).
         let detect_result = match &mode {
-            TextDetectorRunMode::Classic => classic::detect_page_classic(&path),
+            TextDetectorRunMode::Classic => classic::detect_page_classic(&path).map_err(DetectFailure::Failed),
             TextDetectorRunMode::PaddleOcr(_) | TextDetectorRunMode::AiCtd(_) | TextDetectorRunMode::Surya(_) => {
                 let (engine, params) = mode.plan_inputs();
-                pipeline::detect_page_file(&path, engine, &params, route)
+                pipeline::detect_page_file(&path, engine, &params, route, &mut ctx)
             }
         };
         match detect_result {
@@ -367,7 +441,11 @@ fn run_detect_batch(
                 total_blocks += result.blocks.len();
                 let _ = evt_tx.send(WorkerEvent::PageDetected { page_idx, result });
             }
-            Err(error) => {
+            Err(DetectFailure::Cancelled) => {
+                let _ = evt_tx.send(WorkerEvent::DetectCancelled);
+                return;
+            }
+            Err(DetectFailure::Failed(error)) => {
                 failed_pages += 1;
                 let _ = evt_tx.send(WorkerEvent::PageFailed { page_idx, error });
             }
@@ -395,34 +473,17 @@ fn detector_mode_needs_backend(mode: &TextDetectorRunMode, paddle_route: Detecto
     }
 }
 
-fn ensure_detector_models_for_mode(
-    mode: &TextDetectorRunMode,
-    evt_tx: &Sender<WorkerEvent>,
-) -> Result<(), String> {
+/// Ensures the app-managed model the batch's mode needs before the first page (cancellable and
+/// reporting through `ctx`). Classic needs none; Surya's checkpoint is only checked (its
+/// download is explicit), so a missing one fails the batch once with the "not downloaded"
+/// error instead of once per page.
+fn ensure_detector_models_for_mode(mode: &TextDetectorRunMode, ctx: &mut EnsureCtx<'_>) -> Result<(), ModelEnsureError> {
     let models_root = config::models_dir();
-    let mut reported = false;
-    let mut report_download = || {
-        if !reported {
-            let _ = evt_tx.send(WorkerEvent::ModelDownloadStarted);
-            reported = true;
-        }
-    };
     match mode {
-        TextDetectorRunMode::Classic | TextDetectorRunMode::Surya(_) => Ok(()),
-        TextDetectorRunMode::PaddleOcr(_) => {
-            ai_models::ensure_paddle_ocr_detector_with_reporter(
-                &models_root,
-                Some(&mut report_download),
-            )?;
-            Ok(())
-        }
-        TextDetectorRunMode::AiCtd(_) => {
-            ai_models::ensure_comic_text_detector_torch_with_reporter(
-                &models_root,
-                Some(&mut report_download),
-            )?;
-            Ok(())
-        }
+        TextDetectorRunMode::Classic => Ok(()),
+        TextDetectorRunMode::Surya(_) => backend::surya_detection_dir_in(&config::side_models_dir()).map(|_| ()),
+        TextDetectorRunMode::PaddleOcr(_) => ai_models::ensure_paddle_ocr_detector(&models_root, ctx).map(|_| ()),
+        TextDetectorRunMode::AiCtd(_) => ai_models::ensure_comic_text_detector_torch(&models_root, ctx).map(|_| ()),
     }
 }
 

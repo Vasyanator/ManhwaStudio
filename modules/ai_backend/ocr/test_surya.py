@@ -2,28 +2,31 @@
 File: modules/ai_backend/ocr/test_surya.py
 
 Purpose:
-Unit tests for the Surya OCR predictor loading contract: the checkpoint is
-downloaded *before* the ROCm mmap->GPU staging patch is installed, only the
-predictor construction runs inside it, the patch is released again when the
-construction fails, recognition itself never runs under it, and unloading drops
-the right predictors.
+Unit tests for the Surya OCR predictor loading contract: each predictor loads
+from the local checkpoint directory of the request (passed as `checkpoint=`
+and assigned to Surya's settings), a missing or incomplete directory is a
+"not downloaded" error and nothing is ever downloaded, the presence check runs
+*before* the ROCm mmap->GPU staging patch is installed, only the predictor
+construction runs inside it, the patch is released again when the construction
+fails, recognition itself never runs under it, and unloading drops the right
+predictors.
 
 Notes:
 - Fake `surya.*` and `torch` modules are injected into `sys.modules`, so the
-  tests need neither the Surya package, nor Torch, nor a GPU.
+  tests need neither the Surya package, nor Torch, nor a GPU. The fake
+  `surya.common.s3.download_directory` raises, so any download attempt fails.
 - Whether the staging patch is a no-op on the current host is
   `runtime/rocm_mmap_transfer.py`'s own contract (covered by
   `runtime/test_rocm_mmap_transfer.py`).
   What is pinned down here is only how the service drives it.
-- The download/patch ordering is the fragile part of the wiring: the patch is
-  process-global and `surya`'s `s3://` resolution retries three times with a 5 s
-  sleep, so the tests record the patch depth observed at download time as well
-  as at construction time.
 """
 
 from __future__ import annotations
 
+import io
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -39,8 +42,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 from modules.ai_backend.ocr import surya as service_module  # noqa: E402
 from modules.ai_backend.runtime.model_manager import LoadedModelManager  # noqa: E402
 
-FOUNDATION_CHECKPOINT = "s3://text_recognition/test"
-DETECTOR_CHECKPOINT = "s3://text_detection/test"
+# Surya's own defaults; a load must never reach them.
+S3_FOUNDATION_DEFAULT = "s3://text_recognition/2025_09_23"
+S3_DETECTOR_DEFAULT = "s3://text_detection/2025_05_07"
 
 
 class _PatchRecorder:
@@ -78,15 +82,31 @@ class SuryaPredictorLoadTests(unittest.TestCase):
         # `events` collects (what, argument, patch_depth_when_it_happened).
         self.events: list[tuple[str, object, int]] = []
         self.fail_construction = False
-        self.fail_download = False
 
         recorder = self.recorder
         events = self.events
         test_case = self
 
+        tmp = tempfile.TemporaryDirectory(prefix="ms_surya_ocr_")
+        self.addCleanup(tmp.cleanup)
+        self.rec_dir = str(Path(tmp.name) / "text_recognition")
+        self.det_dir = str(Path(tmp.name) / "text_detection")
+        Path(self.rec_dir).mkdir()
+        Path(self.det_dir).mkdir()
+        # Directories whose manifest is complete; the fake `check_manifest` reads it.
+        self.ready = {self.rec_dir, self.det_dir}
+        settings = types.SimpleNamespace(
+            FOUNDATION_MODEL_CHECKPOINT=S3_FOUNDATION_DEFAULT,
+            RECOGNITION_MODEL_CHECKPOINT=S3_FOUNDATION_DEFAULT,
+            DETECTOR_MODEL_CHECKPOINT=S3_DETECTOR_DEFAULT,
+        )
+        self.settings = settings
+
         class FoundationPredictor:
-            def __init__(self, device: object = None, **_kwargs: object) -> None:
-                events.append(("foundation", device, recorder.depth))
+            def __init__(self, checkpoint: object = None, device: object = None, **_kwargs: object) -> None:
+                # The settings must already point at the local dir when the
+                # library code runs.
+                events.append(("foundation", (checkpoint, device, settings.FOUNDATION_MODEL_CHECKPOINT), recorder.depth))
                 if test_case.fail_construction:
                     raise RuntimeError("simulated foundation load failure")
 
@@ -95,10 +115,17 @@ class SuryaPredictorLoadTests(unittest.TestCase):
                 events.append(("recognition", None, recorder.depth))
 
         class DetectionPredictor:
-            def __init__(self, device: object = None, **_kwargs: object) -> None:
-                events.append(("detection", device, recorder.depth))
+            def __init__(self, checkpoint: object = None, device: object = None, **_kwargs: object) -> None:
+                events.append(("detection", (checkpoint, device, settings.DETECTOR_MODEL_CHECKPOINT), recorder.depth))
                 if test_case.fail_construction:
                     raise RuntimeError("simulated detection load failure")
+
+        def check_manifest(local_dir: str) -> bool:
+            events.append(("check", local_dir, recorder.depth))
+            return local_dir in test_case.ready
+
+        def download_directory(remote_dir: str, local_dir: str) -> None:
+            raise AssertionError(f"download_directory must never be called ({remote_dir} -> {local_dir})")
 
         surya = types.ModuleType("surya")
         foundation_mod = types.ModuleType("surya.foundation")
@@ -108,14 +135,17 @@ class SuryaPredictorLoadTests(unittest.TestCase):
         detection_mod = types.ModuleType("surya.detection")
         detection_mod.DetectionPredictor = DetectionPredictor
         settings_mod = types.ModuleType("surya.settings")
-        settings_mod.settings = types.SimpleNamespace(
-            FOUNDATION_MODEL_CHECKPOINT=FOUNDATION_CHECKPOINT,
-            DETECTOR_MODEL_CHECKPOINT=DETECTOR_CHECKPOINT,
-        )
+        settings_mod.settings = settings
+        common_mod = types.ModuleType("surya.common")
+        s3_mod = types.ModuleType("surya.common.s3")
+        s3_mod.check_manifest = check_manifest
+        s3_mod.download_directory = download_directory
         surya.foundation = foundation_mod
         surya.recognition = recognition_mod
         surya.detection = detection_mod
         surya.settings = settings_mod
+        surya.common = common_mod
+        common_mod.s3 = s3_mod
 
         # A bare fake `torch` keeps `_clear_torch_cache` from initializing a real
         # CUDA/HIP context: it has neither `cuda` nor `mps`, so both guards fail.
@@ -129,6 +159,8 @@ class SuryaPredictorLoadTests(unittest.TestCase):
                 "surya.recognition": recognition_mod,
                 "surya.detection": detection_mod,
                 "surya.settings": settings_mod,
+                "surya.common": common_mod,
+                "surya.common.s3": s3_mod,
                 "torch": fake_torch,
             },
         )
@@ -139,77 +171,99 @@ class SuryaPredictorLoadTests(unittest.TestCase):
         staging_patch.start()
         self.addCleanup(staging_patch.stop)
 
-        def fake_download(checkpoint: str, *, label: str) -> None:
-            events.append(("download", checkpoint, recorder.depth))
-            if test_case.fail_download:
-                raise RuntimeError(f"simulated {label} download failure")
-
-        download_patch = patch.object(
-            service_module, "ensure_checkpoint_downloaded", fake_download
-        )
-        download_patch.start()
-        self.addCleanup(download_patch.stop)
-
         self.service = service_module.SuryaOcrService(LoadedModelManager())
 
-    def test_recognition_checkpoint_is_downloaded_outside_the_patch(self) -> None:
-        predictor = self.service._ensure_recognition_loaded_locked("cuda:0")
+    def _load_recognition(self, device: str = "cuda:0"):
+        return self.service._ensure_recognition_loaded_locked(device, self.rec_dir)
+
+    def _load_detection(self, device: str = "cuda:0"):
+        return self.service._ensure_detection_loaded_locked(device, self.det_dir)
+
+    def test_recognition_loads_the_local_dir_outside_the_patch(self) -> None:
+        predictor = self._load_recognition()
 
         self.assertIsNotNone(predictor)
-        # Depth 0 for the download, depth 1 for both constructions: the
+        # Depth 0 for the presence check, depth 1 for both constructions: the
         # process-global patch must cover the weight transfer and nothing else.
         self.assertEqual(
             self.events,
             [
-                ("download", FOUNDATION_CHECKPOINT, 0),
-                ("foundation", "cuda:0", 1),
+                ("check", self.rec_dir, 0),
+                ("foundation", (self.rec_dir, "cuda:0", self.rec_dir), 1),
                 ("recognition", None, 1),
             ],
         )
+        self.assertEqual(self.settings.RECOGNITION_MODEL_CHECKPOINT, self.rec_dir)
+        self.assertEqual(self.settings.DETECTOR_MODEL_CHECKPOINT, S3_DETECTOR_DEFAULT)
         self.assertEqual(self.recorder.enters, 1)
         self.assertEqual(self.recorder.depth, 0, "staging patch must be released")
 
-    def test_detection_checkpoint_is_downloaded_outside_the_patch(self) -> None:
-        self.service._ensure_detection_loaded_locked("cuda:0")
+    def test_detection_loads_the_local_dir_outside_the_patch(self) -> None:
+        self._load_detection()
 
         self.assertEqual(
             self.events,
-            [("download", DETECTOR_CHECKPOINT, 0), ("detection", "cuda:0", 1)],
+            [("check", self.det_dir, 0), ("detection", (self.det_dir, "cuda:0", self.det_dir), 1)],
         )
         self.assertEqual(self.recorder.enters, 1)
         self.assertEqual(self.recorder.depth, 0, "staging patch must be released")
 
-    def test_failed_download_never_installs_the_patch(self) -> None:
-        self.fail_download = True
+    def test_incomplete_checkpoint_is_not_downloaded_and_never_installs_the_patch(self) -> None:
+        self.ready.discard(self.rec_dir)
 
-        with self.assertRaises(RuntimeError):
-            self.service._ensure_recognition_loaded_locked("cuda:0")
+        with self.assertRaises(FileNotFoundError) as raised:
+            self._load_recognition()
 
-        self.assertEqual(self.events, [("download", FOUNDATION_CHECKPOINT, 0)])
+        self.assertIn("not downloaded", str(raised.exception))
+        self.assertEqual(self.events, [("check", self.rec_dir, 0)])
         self.assertEqual(self.recorder.enters, 0)
+        self.assertEqual(self.service.health()["last_error"], str(raised.exception))
+        self.assertEqual(self.settings.FOUNDATION_MODEL_CHECKPOINT, S3_FOUNDATION_DEFAULT)
+
+    def test_missing_directories_are_explicit_errors(self) -> None:
+        missing = str(Path(self.rec_dir) / "absent")
+        with self.assertRaises(FileNotFoundError):
+            self.service._ensure_recognition_loaded_locked("cuda:0", missing)
+        with self.assertRaises(FileNotFoundError):
+            self.service._ensure_detection_loaded_locked("cuda:0", missing)
+        with self.assertRaises(ValueError):
+            self.service._ensure_recognition_loaded_locked("cuda:0", "")
+        self.assertEqual(self.recorder.enters, 0)
+        self.assertFalse(Path(missing).exists())
 
     def test_cached_predictors_do_not_reload_or_reinstall_the_patch(self) -> None:
-        self.service._ensure_recognition_loaded_locked("cuda:0")
-        self.service._ensure_recognition_loaded_locked("cuda:0")
+        self._load_recognition()
+        self._load_recognition()
 
         self.assertEqual(len(self.events), 3, "second call must reuse the predictor")
         self.assertEqual(self.recorder.enters, 1)
 
-    def test_device_change_reloads_and_redownloads(self) -> None:
-        self.service._ensure_recognition_loaded_locked("cuda:0")
-        self.service._ensure_recognition_loaded_locked("cpu")
+    def test_device_change_reloads(self) -> None:
+        self._load_recognition("cuda:0")
+        self._load_recognition("cpu")
 
-        self.assertEqual([event[0] for event in self.events][3:], ["download", "foundation", "recognition"])
+        self.assertEqual([event[0] for event in self.events][3:], ["check", "foundation", "recognition"])
         self.assertEqual(self.recorder.enters, 2)
         self.assertEqual(self.recorder.depth, 0)
+
+    def test_directory_change_reloads(self) -> None:
+        self._load_recognition()
+        other = str(Path(self.rec_dir).parent / "other_recognition")
+        Path(other).mkdir()
+        self.ready.add(other)
+
+        self.service._ensure_recognition_loaded_locked("cuda:0", other)
+
+        self.assertEqual(self.events[3:5], [("check", other, 0), ("foundation", (other, "cuda:0", other), 1)])
+        self.assertEqual(self.service._recognition_dir, other)
 
     def test_staging_patch_released_when_load_fails(self) -> None:
         self.fail_construction = True
 
         with self.assertRaises(RuntimeError):
-            self.service._ensure_recognition_loaded_locked("cuda:0")
+            self._load_recognition()
         with self.assertRaises(RuntimeError):
-            self.service._ensure_detection_loaded_locked("cuda:0")
+            self._load_detection()
 
         self.assertEqual(self.recorder.enters, 2)
         self.assertEqual(self.recorder.exits, 2)
@@ -242,8 +296,8 @@ class SuryaPredictorLoadTests(unittest.TestCase):
         self.assertEqual(observed, [0])
 
     def test_unload_drops_every_predictor(self) -> None:
-        self.service._ensure_recognition_loaded_locked("cuda:0")
-        self.service._ensure_detection_loaded_locked("cuda:0")
+        self._load_recognition()
+        self._load_detection()
         model_key = service_module.SuryaOcrService._foundation_model_key("cuda:0")
 
         self.assertTrue(self.service._unload_foundation_key(model_key))
@@ -256,15 +310,15 @@ class SuryaPredictorLoadTests(unittest.TestCase):
         self.assertFalse(self.service._unload_foundation_key(model_key))
 
     def test_unload_of_a_foreign_key_is_refused(self) -> None:
-        self.service._ensure_recognition_loaded_locked("cuda:0")
+        self._load_recognition()
         other_key = service_module.SuryaOcrService._foundation_model_key("cpu")
 
         self.assertFalse(self.service._unload_foundation_key(other_key))
         self.assertIsNotNone(self.service._recognition_predictor)
 
     def test_detector_unload_keeps_the_recognition_predictors(self) -> None:
-        self.service._ensure_recognition_loaded_locked("cuda:0")
-        self.service._ensure_detection_loaded_locked("cuda:0")
+        self._load_recognition()
+        self._load_detection()
         model_key = service_module.SuryaOcrService._detector_model_key("cuda:0")
 
         self.assertTrue(self.service._unload_detector_key(model_key))
@@ -272,6 +326,38 @@ class SuryaPredictorLoadTests(unittest.TestCase):
         self.assertIsNone(self.service._detection_predictor)
         self.assertIsNotNone(self.service._recognition_predictor)
         self.assertFalse(self.service._unload_detector_key(model_key))
+
+
+
+@unittest.skipUnless(
+    os.environ.get("MS_SURYA_RECOGNITION_DIR") and os.environ.get("MS_SURYA_DETECTION_DIR"),
+    "set MS_SURYA_RECOGNITION_DIR and MS_SURYA_DETECTION_DIR to run",
+)
+class RealCheckpointTests(unittest.TestCase):
+    """Opt-in: the real Surya predictors (both tasks) load offline from the given directories."""
+
+    def test_recognition_with_boxes_runs_offline(self) -> None:
+        import surya.common.s3 as s3
+        from PIL import Image
+
+        def no_download(*args: object, **kwargs: object) -> None:
+            raise AssertionError(f"download_directory must never be called: {args}")
+
+        image = Image.new("RGB", (64, 32), "white")
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        with patch.object(s3, "download_directory", no_download), patch.object(
+            service_module, "_resolve_selected_backend_device", lambda _fallback: "cpu"
+        ):
+            service = service_module.SuryaOcrService(LoadedModelManager())
+            result = service.recognize_image_bytes(
+                buffer.getvalue(),
+                recognition_dir=str(Path(os.environ["MS_SURYA_RECOGNITION_DIR"]).resolve()),
+                detection_dir=str(Path(os.environ["MS_SURYA_DETECTION_DIR"]).resolve()),
+                task_name=service_module.SURYA_TASK_OCR_WITH_BOXES,
+            )
+        self.assertIsInstance(result["lines"], list)
+        self.assertTrue(service.health()["detector_ready"])
 
 
 if __name__ == "__main__":

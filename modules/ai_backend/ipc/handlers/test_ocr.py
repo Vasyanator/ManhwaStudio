@@ -46,6 +46,13 @@ from modules.ai_backend.ipc.registry import HandlerContext, Interrupted
 
 IMG = b"\x89PNG\r\n\x1a\nFAKEIMAGEBYTES"
 
+# Fictional model directories: the handlers forward them without opening them.
+EASY_DIR = "/m/EasyOCR"
+EASY = {"easyocr_model_dir": EASY_DIR}
+SURYA_REC_DIR = "/m/Surya/text_recognition/2025_09_23"
+SURYA_DET_DIR = "/m/Surya/text_detection/2025_05_07"
+SURYA = {"surya_recognition_dir": SURYA_REC_DIR, "surya_detection_dir": SURYA_DET_DIR}
+
 
 class _FakeOcr:
     """A stand-in OCR service: records the last call and returns a fixed result."""
@@ -109,10 +116,11 @@ def test_easy_defaults_and_response() -> None:
     fake = _FakeOcr({"lines": ["a", "b"], "text": "a\nb"})
     ctx = _make_ctx(easy_ocr=fake)
 
-    header, blob = ocr_handlers._handle_ocr_easy(ctx, {}, IMG, _no_cancel())
+    header, blob = ocr_handlers._handle_ocr_easy(ctx, dict(EASY), IMG, _no_cancel())
 
     assert fake.last_image == IMG
     assert fake.last_kwargs == {
+        "model_dir": EASY_DIR,
         "join_newlines": True,
         "reflect_strings": False,
         "langs": "ko",
@@ -125,12 +133,14 @@ def test_easy_parses_params() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(easy_ocr=fake)
     req = {
+        **EASY,
         "join_newlines": False,
         "reflect_strings": True,
         "easy_langs": "  ja  ",
     }
     ocr_handlers._handle_ocr_easy(ctx, req, IMG, _no_cancel())
     assert fake.last_kwargs == {
+        "model_dir": EASY_DIR,
         "join_newlines": False,
         "reflect_strings": True,
         "langs": "ja",
@@ -140,35 +150,45 @@ def test_easy_parses_params() -> None:
 def test_easy_blank_langs_falls_back_to_ko() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(easy_ocr=fake)
-    ocr_handlers._handle_ocr_easy(ctx, {"easy_langs": "   "}, IMG, _no_cancel())
+    ocr_handlers._handle_ocr_easy(ctx, {**EASY, "easy_langs": "   "}, IMG, _no_cancel())
     assert fake.last_kwargs["langs"] == "ko"
 
 
 def test_easy_none_langs_falls_back_to_ko() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(easy_ocr=fake)
-    ocr_handlers._handle_ocr_easy(ctx, {"easy_langs": None}, IMG, _no_cancel())
+    ocr_handlers._handle_ocr_easy(ctx, {**EASY, "easy_langs": None}, IMG, _no_cancel())
     assert fake.last_kwargs["langs"] == "ko"
 
 
 def test_easy_non_string_langs_errors() -> None:
     ctx = _make_ctx(easy_ocr=_FakeOcr({"lines": [], "text": ""}))
     with pytest.raises(ValueError, match="easy_langs"):
-        ocr_handlers._handle_ocr_easy(ctx, {"easy_langs": 5}, IMG, _no_cancel())
+        ocr_handlers._handle_ocr_easy(ctx, {**EASY, "easy_langs": 5}, IMG, _no_cancel())
 
 
 def test_easy_empty_blob_errors() -> None:
     ctx = _make_ctx(easy_ocr=_FakeOcr({"lines": [], "text": ""}))
     with pytest.raises(ValueError, match="frame blob"):
-        ocr_handlers._handle_ocr_easy(ctx, {}, b"", _no_cancel())
+        ocr_handlers._handle_ocr_easy(ctx, dict(EASY), b"", _no_cancel())
 
 
 def test_easy_canceled_before_start() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(easy_ocr=fake)
     with pytest.raises(Interrupted):
-        ocr_handlers._handle_ocr_easy(ctx, {}, IMG, _canceled())
+        ocr_handlers._handle_ocr_easy(ctx, dict(EASY), IMG, _canceled())
     assert fake.calls == []  # service never invoked
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", 7])
+def test_easy_requires_the_model_dir(value: Any) -> None:
+    fake = _FakeOcr({"lines": [], "text": ""})
+    ctx = _make_ctx(easy_ocr=fake)
+    req = {} if value is None else {"easyocr_model_dir": value}
+    with pytest.raises(ValueError, match="easyocr_model_dir"):
+        ocr_handlers._handle_ocr_easy(ctx, req, IMG, _no_cancel())
+    assert fake.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -306,9 +326,11 @@ def test_paddle_vl_canceled() -> None:
 def test_surya_defaults_and_response() -> None:
     fake = _FakeOcr({"lines": ["s"], "text": "s"})
     ctx = _make_ctx(surya_ocr=fake)
-    header, blob = ocr_handlers._handle_ocr_surya(ctx, {}, IMG, _no_cancel())
+    header, blob = ocr_handlers._handle_ocr_surya(ctx, dict(SURYA), IMG, _no_cancel())
     assert fake.last_image == IMG
     assert fake.last_kwargs == {
+        "recognition_dir": SURYA_REC_DIR,
+        "detection_dir": SURYA_DET_DIR,
         "join_newlines": True,
         "reflect_strings": False,
         "task_name": "ocr_without_boxes",
@@ -331,6 +353,7 @@ def test_surya_parses_all_params() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(surya_ocr=fake)
     req = {
+        **SURYA,
         "join_newlines": False,
         "reflect_strings": True,
         "surya_task_name": "  OCR_WITH_BOXES  ",
@@ -342,6 +365,8 @@ def test_surya_parses_all_params() -> None:
     }
     header, _ = ocr_handlers._handle_ocr_surya(ctx, req, IMG, _no_cancel())
     assert fake.last_kwargs == {
+        "recognition_dir": SURYA_REC_DIR,
+        "detection_dir": SURYA_DET_DIR,
         "join_newlines": False,
         "reflect_strings": True,
         "task_name": "ocr_with_boxes",
@@ -358,7 +383,7 @@ def test_surya_parses_all_params() -> None:
 def test_surya_non_string_task_name_errors() -> None:
     ctx = _make_ctx(surya_ocr=_FakeOcr({"lines": [], "text": ""}))
     with pytest.raises(ValueError, match="surya_task_name"):
-        ocr_handlers._handle_ocr_surya(ctx, {"surya_task_name": 3}, IMG, _no_cancel())
+        ocr_handlers._handle_ocr_surya(ctx, {**SURYA, "surya_task_name": 3}, IMG, _no_cancel())
 
 
 @pytest.mark.parametrize("field", ["surya_max_sliding_window", "surya_max_tokens"])
@@ -366,20 +391,35 @@ def test_surya_non_string_task_name_errors() -> None:
 def test_surya_invalid_positive_int_errors(field: str, bad: Any) -> None:
     ctx = _make_ctx(surya_ocr=_FakeOcr({"lines": [], "text": ""}))
     with pytest.raises(ValueError, match=field):
-        ocr_handlers._handle_ocr_surya(ctx, {field: bad}, IMG, _no_cancel())
+        ocr_handlers._handle_ocr_surya(ctx, {**SURYA, field: bad}, IMG, _no_cancel())
 
 
 def test_surya_empty_blob_errors() -> None:
     ctx = _make_ctx(surya_ocr=_FakeOcr({"lines": [], "text": ""}))
     with pytest.raises(ValueError, match="frame blob"):
-        ocr_handlers._handle_ocr_surya(ctx, {}, b"", _no_cancel())
+        ocr_handlers._handle_ocr_surya(ctx, dict(SURYA), b"", _no_cancel())
 
 
 def test_surya_canceled() -> None:
     fake = _FakeOcr({"lines": [], "text": ""})
     ctx = _make_ctx(surya_ocr=fake)
     with pytest.raises(Interrupted):
-        ocr_handlers._handle_ocr_surya(ctx, {}, IMG, _canceled())
+        ocr_handlers._handle_ocr_surya(ctx, dict(SURYA), IMG, _canceled())
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("field", ["surya_recognition_dir", "surya_detection_dir"])
+@pytest.mark.parametrize("value", [None, "", "   ", 7])
+def test_surya_requires_both_checkpoint_dirs(field: str, value: Any) -> None:
+    fake = _FakeOcr({"lines": [], "text": ""})
+    ctx = _make_ctx(surya_ocr=fake)
+    req = dict(SURYA)
+    if value is None:
+        del req[field]
+    else:
+        req[field] = value
+    with pytest.raises(ValueError, match=field):
+        ocr_handlers._handle_ocr_surya(ctx, req, IMG, _no_cancel())
     assert fake.calls == []
 
 

@@ -8,7 +8,8 @@ Methods hosted here (forward-only text detection, PROTOCOL.md §5.3):
 
 Purpose:
 Owns the wire contract of the three forward methods: the request
-`{n, width, height}` + RGB tile blob, the response
+`{n, width, height}` (plus the REQUIRED `surya_detection_dir` for Surya, the
+absolute checkpoint directory Rust downloaded) + RGB tile blob, the response
 `{engine, n, map_width, map_height, channels}` + `uint8` map blob, and every
 validation on both directions. Rust (`crates/ms-text-detect`) plans, resizes,
 tiles, stitches and post-processes; the services only run the network.
@@ -67,6 +68,14 @@ def _require_int(header: dict[str, Any], name: str) -> int:
     value = header.get(name)
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"Field '{name}' must be an integer, got {value!r}.")
+    return value
+
+
+def _require_non_empty_str(header: dict[str, Any], name: str) -> str:
+    """Return header field `name` when it is a non-empty string; `ValueError` naming it otherwise."""
+    value = header.get(name)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Field '{name}' is required and must be a non-empty string.")
     return value
 
 
@@ -142,14 +151,24 @@ def encode_forward_response(spec: ForwardSpec, n: int, width: int, height: int, 
     return header, blob
 
 
-def _forward(spec: ForwardSpec, service: Any, header: dict[str, Any], blob: bytes) -> tuple[dict[str, Any], bytes]:
-    """Shared body of the three handlers: validate, run the service, encode."""
+def _forward(
+    spec: ForwardSpec,
+    service: Any,
+    header: dict[str, Any],
+    blob: bytes,
+    **service_kwargs: Any,
+) -> tuple[dict[str, Any], bytes]:
+    """Shared body of the three handlers: validate, run the service, encode.
+
+    `service_kwargs` are the engine-specific keyword arguments of
+    `service.forward_tiles` (Surya's `model_dir`).
+    """
     n, width, height = parse_forward_request(spec, header, blob)
     # Lazy: keeps `ipc/` importable without numpy-backed services loaded.
     import numpy as np
 
     tiles = np.frombuffer(blob, dtype=np.uint8).reshape(n, height, width, 3)
-    maps = service.forward_tiles(tiles)
+    maps = service.forward_tiles(tiles, **service_kwargs)
     return encode_forward_response(spec, n, width, height, maps)
 
 
@@ -179,8 +198,13 @@ def _handle_textdetector_surya_forward(
     blob: bytes,
     cancel_event: threading.Event,
 ) -> tuple[dict[str, Any], bytes]:
-    """`textdetector.surya.forward`: Surya text heatmap at a quarter of the tile size."""
-    return _forward(FORWARD_SPECS["surya"], ctx.state.text_detector_surya, header, blob)
+    """`textdetector.surya.forward`: Surya text heatmap at a quarter of the tile size.
+
+    Requires `surya_detection_dir`, forwarded verbatim as the service's
+    `model_dir` (the service checks the directory).
+    """
+    model_dir = _require_non_empty_str(header, "surya_detection_dir")
+    return _forward(FORWARD_SPECS["surya"], ctx.state.text_detector_surya, header, blob, model_dir=model_dir)
 
 
 register(METHOD_TEXTDETECTOR_CTD_FORWARD, _handle_textdetector_ctd_forward)

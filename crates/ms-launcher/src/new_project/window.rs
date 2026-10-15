@@ -6464,6 +6464,7 @@ impl NewProjectWindowState {
             && !self.waifu2x.is_loading()
             && !self.reline.is_loading()
             && !self.ribbon.pages().is_empty()
+            && self.waifu2x.platform_supported()
     }
 
     fn can_start_reline(&self) -> bool {
@@ -6562,12 +6563,23 @@ impl NewProjectWindowState {
         self.waifu2x.backend_path().display().to_string()
     }
 
+    /// Resets the per-opening state when the window closes: pending questions and pickers,
+    /// the quick download (cancelled), and the waifu2x / Reline controllers.
     fn handle_window_closed(&mut self) {
         // A question or a picker answer belongs to the session that asked; never carry it into
         // the next opening of the window.
         self.overwrite_confirm = None;
         self.cut_like_folder_dialog = None;
         self.save_folder_dialog = None;
+        // A quick download must not outlive the window that asked for it: stop its worker and
+        // drop its progress, so a reopened window shows neither a stale bar nor a late result.
+        // The test-chapter check shares the "quick_download" progress slot and is left alone.
+        if self.quick_download.cancel() && self.test_chapter_check_rx.is_none() {
+            if self.active_progress.as_ref().is_some_and(|progress| progress.operation == "quick_download") {
+                self.active_progress = None;
+            }
+            self.import_status = t!("launcher.new_project.quick_dl_cancelled_status").to_string();
+        }
         self.waifu2x.shutdown();
         self.waifu2x = Waifu2xController::new();
         self.reline = RelineController::new();
@@ -8060,6 +8072,8 @@ fn progress_stage_title(stage: &str) -> &'static str {
         "parse_html" => t!("launcher.new_project.progress_parse_html"),
         "archive" => t!("launcher.new_project.progress_extract_archive"),
         "download_waifu2x" => t!("launcher.new_project.progress_download_waifu2x"),
+        "verify_waifu2x" => t!("launcher.new_project.progress_verify_waifu2x"),
+        "download_waifu2x_retry" => t!("launcher.new_project.progress_download_waifu2x_retry"),
         "extract_waifu2x" => t!("launcher.new_project.progress_extract_waifu2x"),
         "download" => t!("launcher.new_project.progress_download_pages"),
         "save_canvas" => t!("launcher.new_project.progress_save_canvas"),

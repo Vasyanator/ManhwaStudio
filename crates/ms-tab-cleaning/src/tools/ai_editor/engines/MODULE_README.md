@@ -15,7 +15,7 @@ entry in `tab.rs`; it reaches the user only through the host's panels.
 mod.rs::all_engines()      -> one instance of every engine, in picker order
 AiEngine::constraints()    -> the frame's size rules
 AiEngine::mask_layers()    -> the frame's mask stack (tint + name key per layer)
-AiEngine::draw_progress    -> the pinned top of «Редактор области» (FLUX.2 / SDXL bar; LaMa none)
+AiEngine::draw_progress    -> the pinned top of «Редактор области» (FLUX.2 / SDXL bar; LaMa / SDXL model download)
 AiEngine::draw_parameters  -> the scrolled body of «Редактор области»
 AiEngine::draw_run_options -> per-run options pinned under «Обработать» (FLUX.2 klein only)
 AiEngine::start(request)   -> region + masks in, worker thread out
@@ -52,6 +52,12 @@ functions with unit tests, not conditionals inside the drawing code.
   is why FLUX.2 klein 9B stays at the head and `lama` then `sdxl` are appended after it. Screen
   order is unaffected — the picker draws «Без промпта» before «С промптом», so «Lama» appears first
   regardless.
+- `run_job.rs`: `EngineRunJob` — the run in flight of an engine whose run may download an
+  app-managed model before its backend call (`lama`, `sdxl` through its LaMa prefill): worker
+  thread, message channel (`ModelDownload` events, then `Finished`) and a cancel flag the job's
+  DROP sets, so `AiEngine::cancel` and the engine's own drop stop the download. It keeps the
+  latest download event (`download()`), which `lama` / `sdxl` draw in `draw_progress` through
+  `ms_tab_translation::model_download_status` (the one owner of that text and bar).
 - `flux2_klein/`: the FLUX.2 klein engine — a DIRECTORY, because it outgrew one file, and the
   source of TWO picker entries (9B and 4B, one per `config::Flux2Variant`); its own
   `MODULE_README.md` is the map of the split and is where to look before editing it (IPC methods

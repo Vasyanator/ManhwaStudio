@@ -28,23 +28,25 @@ Main responsibilities:
 Notes:
 The initial install flow intentionally does not download application AI model weights. Runtime
 code downloads app-managed models lazily through `ai_models.rs` when a feature needs them.
-Direct HTTP downloads are connection-failure tolerant: `download_asset` streams into a `.part`
-file, retries with exponential backoff, resumes via HTTP Range requests, verifies the final size
-against the server-reported total, and renames the finished file into place. GitHub API metadata
-requests go through `github_api_get`, which retries transient failures.
+Release metadata and asset downloads live in `download.rs` (`github_api_get`,
+`download_asset`); this file only picks the assets (`fetch_latest_*`, `select_uv_asset`) and
+sequences the downloads. Every worker takes a cancel flag (`&AtomicBool`, set when its window
+closes) and hands it to the downloads and to `run_command_with_retry`, whose failed commands are
+retried after a capped 2 / 4 / 8 s backoff that the flag interrupts.
 */
 
 use std::collections::HashMap;
 use std::env;
 use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use ms_thread as thread;
 use web_time::SystemTime;
-use web_time::{Duration, Instant};
+use web_time::Duration;
 
 use ms_config as config;
 use ms_sysprobe::gpu_utils::{
@@ -87,6 +89,7 @@ use super::install::{
 #[cfg(target_os = "windows")]
 use super::install::{UninstallEvent, run_windows_uninstall_window, send_uninstall_progress};
 use super::update::{APP_RELEASES_API, APP_ZIP_ASSET_NAME};
+use super::download::{AssetDownload, GithubAsset, INSTALLER_USER_AGENT, download_asset, github_api_get};
 
 const UV_RELEASE_API: &str = "https://api.github.com/repos/astral-sh/uv/releases/latest";
 // Per-platform × per-arch GitHub *release asset* names of the main executable,
@@ -124,10 +127,11 @@ const BASE_DEPENDENCIES: &[&str] = &[
     "wsproto",
 ];
 const TORCH_DEPENDENCIES: &[&str] = &[
-    "certifi",
     "diffusers",
     "easydict",
-    "easyocr",
+    // easyocr / surya-ocr are pinned to the versions whose weight layout the app-managed model
+    // catalog mirrors (same pins as `requirements/torch.txt`).
+    "easyocr==1.7.2",
     "einops",
     "kornia",
     "manga-ocr",
@@ -138,11 +142,11 @@ const TORCH_DEPENDENCIES: &[&str] = &[
     "PyYAML",
     "reline",
     "shapely",
-    "surya-ocr",
+    "surya-ocr==0.17.1",
     "tqdm",
 ];
 
-fn send_progress(
+pub(super) fn send_progress(
     tx: &mpsc::Sender<InstallEvent>,
     stage_value: f32,
     stage_label: impl Into<String>,
@@ -172,12 +176,6 @@ struct GithubReleaseListItem {
     name: Option<String>,
     #[serde(default)]
     assets: Vec<GithubAsset>,
-}
-
-#[derive(Deserialize, Clone)]
-pub(crate) struct GithubAsset {
-    pub(crate) name: String,
-    pub(crate) browser_download_url: String,
 }
 
 #[derive(Debug)]
@@ -277,6 +275,7 @@ pub(super) fn run_install_worker(
     dependency_profile: InstallDependencyProfile,
     torch_selection: TorchInstallSelection,
     tx: &mpsc::Sender<InstallEvent>,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     // Более равномерные веса этапов общего прогресса.
     let mut progress_cursor = 0.0_f32;
@@ -302,17 +301,19 @@ pub(super) fn run_install_worker(
     let platform = detect_platform()?;
 
     let _ = tx.send(InstallEvent::Step(tf!("installer.utils.searching_uv_status", platform = platform, resolved_arch = resolved_arch)));
-    let asset = fetch_latest_uv_asset(platform, &resolved_arch)?;
+    let asset = fetch_latest_uv_asset(platform, &resolved_arch, cancel)?;
     let archive_path = downloads_dir.join(&asset.name);
 
     let _ = tx.send(InstallEvent::Step(tf!("installer.utils.downloading_asset_status", asset = asset.name)));
     download_asset(
-        &asset.browser_download_url,
-        &archive_path,
+        &AssetDownload {
+            asset: &asset,
+            dst_path: &archive_path,
+            label_prefix: "uv",
+            overall_range: (python_range.0, lerp(python_range.0, python_range.1, 0.55)),
+        },
         tx,
-        python_range.0,
-        lerp(python_range.0, python_range.1, 0.55),
-        "uv",
+        cancel,
     )?;
 
     let uv_dir = installer_dir.join("uv");
@@ -360,9 +361,7 @@ pub(super) fn run_install_worker(
         &uv_exe,
         &root_dir,
         &["python", "install", PYTHON_VERSION_REQUEST],
-        &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST),
-        2,
-        Some(tx),
+        RetryRun { action_name: &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST), attempts: 2, tx: Some(tx), cancel },
         &uv_env,
     )?;
 
@@ -389,9 +388,7 @@ pub(super) fn run_install_worker(
             PYTHON_VERSION_REQUEST,
             &managed_venv_dir_str,
         ],
-        t!("installer.utils.create_venv_action"),
-        2,
-        Some(tx),
+        RetryRun { action_name: t!("installer.utils.create_venv_action"), attempts: 2, tx: Some(tx), cancel },
         &uv_env,
     )?;
     let python_exe = python_manager::resolve_python_executable_in_dir(&managed_venv_dir)?;
@@ -399,19 +396,21 @@ pub(super) fn run_install_worker(
     let _ = tx.send(InstallEvent::Step(
         t!("installer.utils.searching_app_zip_status").to_string(),
     ));
-    let app_asset = fetch_latest_app_zip_asset()?;
+    let app_asset = fetch_latest_app_zip_asset(cancel)?;
     let app_zip_path = downloads_dir.join(APP_ZIP_ASSET_NAME);
 
     let _ = tx.send(InstallEvent::Step(
         t!("installer.utils.downloading_app_zip_status").to_string(),
     ));
     download_asset(
-        &app_asset.browser_download_url,
-        &app_zip_path,
+        &AssetDownload {
+            asset: &app_asset,
+            dst_path: &app_zip_path,
+            label_prefix: APP_ZIP_ASSET_NAME,
+            overall_range: (app_range.0, lerp(app_range.0, app_range.1, 0.50)),
+        },
         tx,
-        app_range.0,
-        lerp(app_range.0, app_range.1, 0.50),
-        APP_ZIP_ASSET_NAME,
+        cancel,
     )?;
 
     let app_extract_dir = downloads_dir.join("manhwastudio_extract");
@@ -462,6 +461,7 @@ pub(super) fn run_install_worker(
         pip_runner: &pip_runner,
         python_exe: &python_exe,
         tx,
+        cancel,
         label: t!("installer.utils.base_deps_label"),
         dependencies: BASE_DEPENDENCIES,
         overall_start: base_deps_range.0,
@@ -492,8 +492,8 @@ pub(super) fn run_install_worker(
                 &python_exe,
                 &torch_selection,
                 tx,
-                torch_range.0,
-                torch_range.1,
+                (torch_range.0, torch_range.1),
+                cancel,
             )?;
             let install_cuda_extra_packages = ENABLE_PADDLE_CUDA_EXTRA_PACKAGES_INSTALL
                 && matches!(&torch_selection, TorchInstallSelection::InstallGpu(option) if option.backend == TorchBackend::Cuda);
@@ -503,8 +503,8 @@ pub(super) fn run_install_worker(
                 &python_exe,
                 tx,
                 install_cuda_extra_packages,
-                torch_deps_range.0,
-                torch_deps_range.1,
+                (torch_deps_range.0, torch_deps_range.1),
+                cancel,
             )?;
         }
     }
@@ -541,6 +541,7 @@ pub(super) fn run_environment_repair_worker(
     dependency_profile: InstallDependencyProfile,
     torch_selection: TorchInstallSelection,
     tx: &mpsc::Sender<InstallEvent>,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     let mut progress_cursor = 0.0_f32;
     let prep_range = alloc_progress_range(&mut progress_cursor, 0.05);
@@ -569,8 +570,8 @@ pub(super) fn run_environment_repair_worker(
         t!("installer.utils.preparation_done"),
     );
 
-    let uv_exe = ensure_uv_runtime(&root_dir, tx, uv_range.0, uv_range.1)?;
-    let python_exe = ensure_repair_python_environment(&root_dir, &uv_exe, tx, python_range)?;
+    let uv_exe = ensure_uv_runtime(&root_dir, tx, uv_range.0, uv_range.1, cancel)?;
+    let python_exe = ensure_repair_python_environment(&root_dir, &uv_exe, tx, python_range, cancel)?;
     let pip_runner = resolve_runtime_pip_runner(&root_dir, &python_exe);
     send_console_line(
         tx,
@@ -591,6 +592,7 @@ pub(super) fn run_environment_repair_worker(
             pip_runner: &pip_runner,
             python_exe: &python_exe,
             tx,
+            cancel,
             label: t!("installer.utils.base_deps_label"),
             dependencies: BASE_DEPENDENCIES,
             overall_start: base_deps_range.0,
@@ -643,8 +645,8 @@ pub(super) fn run_environment_repair_worker(
                     &python_exe,
                     &torch_selection,
                     tx,
-                    torch_range.0,
-                    torch_range.1,
+                    (torch_range.0, torch_range.1),
+                    cancel,
                 )?,
             }
 
@@ -657,6 +659,7 @@ pub(super) fn run_environment_repair_worker(
                     pip_runner: &pip_runner,
                     python_exe: &python_exe,
                     tx,
+                    cancel,
                     label: t!("installer.utils.torch_deps_label"),
                     dependencies: TORCH_DEPENDENCIES,
                     overall_start: torch_deps_range.0,
@@ -696,6 +699,7 @@ fn ensure_repair_python_environment(
     uv_exe: &Path,
     tx: &mpsc::Sender<InstallEvent>,
     overall_range: (f32, f32),
+    cancel: &AtomicBool,
 ) -> Result<PathBuf, String> {
     if let Ok(python_exe) = python_manager::resolve_python_executable(root_dir) {
         send_console_line(
@@ -729,9 +733,7 @@ fn ensure_repair_python_environment(
         uv_exe,
         root_dir,
         &["python", "install", PYTHON_VERSION_REQUEST],
-        &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST),
-        2,
-        Some(tx),
+        RetryRun { action_name: &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST), attempts: 2, tx: Some(tx), cancel },
         &uv_env.as_env_slice(),
     )?;
     send_progress(
@@ -751,9 +753,7 @@ fn ensure_repair_python_environment(
             PYTHON_VERSION_REQUEST,
             &managed_venv_dir_str,
         ],
-        t!("installer.utils.create_venv_action"),
-        2,
-        Some(tx),
+        RetryRun { action_name: t!("installer.utils.create_venv_action"), attempts: 2, tx: Some(tx), cancel },
         &uv_env.as_env_slice(),
     )?;
     let python_exe = python_manager::resolve_python_executable_in_dir(&managed_venv_dir)?;
@@ -800,6 +800,10 @@ pub fn run_torch_upgrade_worker(
     install_full_dependencies: bool,
     tx: &mpsc::Sender<InstallEvent>,
 ) -> Result<(), String> {
+    // The launcher's settings page offers no cancel for this worker (it runs to completion
+    // while the page shows its progress), so its command retries see a flag that never sets.
+    let never_cancelled = AtomicBool::new(false);
+    let cancel = &never_cancelled;
     let _ = tx.send(InstallEvent::Step(
         t!("installer.utils.preparing_pytorch_env_status").to_string(),
     ));
@@ -826,8 +830,8 @@ pub fn run_torch_upgrade_worker(
         &python_exe,
         &torch_selection,
         tx,
-        torch_range.0,
-        torch_range.1,
+        (torch_range.0, torch_range.1),
+        cancel,
     )?;
 
     if install_full_dependencies {
@@ -839,8 +843,8 @@ pub fn run_torch_upgrade_worker(
             &python_exe,
             tx,
             install_cuda_extra_packages,
-            0.42,
-            1.0,
+            (0.42, 1.0),
+            cancel,
         )?;
     }
 
@@ -848,8 +852,8 @@ pub fn run_torch_upgrade_worker(
     Ok(())
 }
 
-pub(crate) fn run_update_binary_stage(root_dir: PathBuf, tx: &mpsc::Sender<UpdateWorkerEvent>) {
-    let result = run_update_binary_stage_inner(&root_dir, None, tx);
+pub(crate) fn run_update_binary_stage(root_dir: PathBuf, tx: &mpsc::Sender<UpdateWorkerEvent>, cancel: &AtomicBool) {
+    let result = run_update_binary_stage_inner(&root_dir, None, tx, cancel);
     match result {
         Ok(UpdateBinaryStageOutcome::RelaunchStarted) => {
             let _ = tx.send(UpdateWorkerEvent::RelaunchStarted);
@@ -872,8 +876,9 @@ pub(crate) fn run_update_binary_stage(root_dir: PathBuf, tx: &mpsc::Sender<Updat
 pub(crate) fn run_external_update_binary_stage(
     target: ExternalUpdateTarget,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
+    cancel: &AtomicBool,
 ) {
-    let result = run_update_binary_stage_inner(&target.root_dir, Some(&target.executable_path), tx);
+    let result = run_update_binary_stage_inner(&target.root_dir, Some(&target.executable_path), tx, cancel);
     match result {
         Ok(UpdateBinaryStageOutcome::RelaunchStarted) => {
             let _ = tx.send(UpdateWorkerEvent::RelaunchStarted);
@@ -897,8 +902,9 @@ pub(crate) fn run_update_continuation_stage(
     root_dir: PathBuf,
     torch_selection: Option<TorchInstallSelection>,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
+    cancel: &AtomicBool,
 ) {
-    match run_update_continuation_stage_inner(&root_dir, torch_selection, tx) {
+    match run_update_continuation_stage_inner(&root_dir, torch_selection, tx, cancel) {
         Ok(UpdateContinuationOutcome::Completed) => {
             let _ = tx.send(UpdateWorkerEvent::Finished(Ok(())));
         }
@@ -926,6 +932,7 @@ fn run_update_binary_stage_inner(
     root_dir: &Path,
     target_executable: Option<&Path>,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
+    cancel: &AtomicBool,
 ) -> Result<UpdateBinaryStageOutcome, String> {
     let current_exe = match target_executable {
         Some(executable) => executable.to_path_buf(),
@@ -947,7 +954,7 @@ fn run_update_binary_stage_inner(
     ));
     send_update_progress(tx, 0.0, t!("installer.common.preparation"), 0.0, t!("installer.utils.stage_update_binary"));
     let remote_version =
-        fetch_latest_app_release_tag_with_required_asset(platform_binary_asset_name())?;
+        fetch_latest_app_release_tag_with_required_asset(platform_binary_asset_name(), cancel)?;
     // The probed binary prints the EXTENDED version (`--version` -> `MS_APP_VERSION`), so
     // both sides are reduced to their semver core before comparing: build metadata such as
     // `+1cd9638-83-dirty` carries no ordering meaning, and leaving it in would make a
@@ -960,7 +967,7 @@ fn run_update_binary_stage_inner(
     }
 
     let _ = tx.send(UpdateWorkerEvent::Step(tf!("installer.utils.version_available_status", remote_version = remote_version)));
-    let binary_asset = fetch_latest_app_asset_by_name(platform_binary_asset_name())?;
+    let binary_asset = fetch_latest_app_asset_by_name(platform_binary_asset_name(), cancel)?;
     let downloads_dir = root_dir.join("installer_files").join("downloads");
     fs::create_dir_all(&downloads_dir)
         .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
@@ -968,12 +975,14 @@ fn run_update_binary_stage_inner(
 
     let install_tx = UpdateToInstallEventBridge { tx }.sender();
     download_asset(
-        &binary_asset.browser_download_url,
-        &downloaded_binary,
+        &AssetDownload {
+            asset: &binary_asset,
+            dst_path: &downloaded_binary,
+            label_prefix: &binary_asset.name,
+            overall_range: (0.0, 0.82),
+        },
         &install_tx,
-        0.0,
-        0.82,
-        &binary_asset.name,
+        cancel,
     )?;
 
     send_update_console_line(
@@ -1010,6 +1019,7 @@ fn run_update_continuation_stage_inner(
     root_dir: &Path,
     torch_selection: Option<TorchInstallSelection>,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
+    cancel: &AtomicBool,
 ) -> Result<UpdateContinuationOutcome, String> {
     let mut progress_cursor = 0.0_f32;
     let env_range = alloc_progress_range(&mut progress_cursor, 0.22);
@@ -1017,8 +1027,7 @@ fn run_update_continuation_stage_inner(
     let deps_range = alloc_progress_range(&mut progress_cursor, 0.28);
     let app_range = (progress_cursor, 1.0_f32);
 
-    let install_tx = UpdateToInstallEventBridge { tx }.sender();
-    let (uv_exe, python_exe) = ensure_uv_managed_python_environment(root_dir, tx, env_range)?;
+    let (uv_exe, python_exe) = ensure_uv_managed_python_environment(root_dir, tx, env_range, cancel)?;
     let pip_runner = PipInstallRunner::Uv(uv_exe);
     let install_type = read_current_ai_install_type(root_dir);
     send_update_console_line(
@@ -1033,8 +1042,8 @@ fn run_update_continuation_stage_inner(
             &python_exe,
             torch_selection,
             tx,
-            &install_tx,
             torch_range,
+            cancel,
         )? {
             UpdateContinuationOutcome::Completed => {}
             UpdateContinuationOutcome::WaitingForTorchChoice => {
@@ -1058,8 +1067,9 @@ fn run_update_continuation_stage_inner(
         install_type,
         tx,
         deps_range,
+        cancel,
     )?;
-    download_and_extract_app_archive_for_update(root_dir, tx, app_range)?;
+    download_and_extract_app_archive_for_update(root_dir, tx, app_range, cancel)?;
     send_update_progress(tx, 1.0, t!("installer.utils.update_complete_status"), 1.0, t!("installer.common.ready"));
     Ok(UpdateContinuationOutcome::Completed)
 }
@@ -1234,6 +1244,7 @@ fn ensure_uv_managed_python_environment(
     root_dir: &Path,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
     overall_range: (f32, f32),
+    cancel: &AtomicBool,
 ) -> Result<(PathBuf, PathBuf), String> {
     // `ensure_uv_runtime` reports on the installer event channel (it is shared with the
     // install/repair workers), so the update channel is bridged into it here.
@@ -1243,6 +1254,7 @@ fn ensure_uv_managed_python_environment(
         &install_tx,
         overall_range.0,
         lerp(overall_range.0, overall_range.1, 0.45),
+        cancel,
     )?;
     let managed_venv_dir = root_dir.join("installer_files").join("venv");
     let has_uv_managed_venv = python_manager::detect_python_environment(root_dir)
@@ -1268,9 +1280,7 @@ fn ensure_uv_managed_python_environment(
             &uv_exe,
             root_dir,
             &["python", "install", PYTHON_VERSION_REQUEST],
-            &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST),
-            2,
-            None,
+            RetryRun { action_name: &tf!("installer.utils.install_python_action", python_version_request = PYTHON_VERSION_REQUEST), attempts: 2, tx: None, cancel },
             &uv_env.as_env_slice(),
         )?;
         let venv_dir = managed_venv_dir.to_string_lossy().into_owned();
@@ -1278,9 +1288,7 @@ fn ensure_uv_managed_python_environment(
             &uv_exe,
             root_dir,
             &["venv", "--python", PYTHON_VERSION_REQUEST, &venv_dir],
-            t!("installer.utils.create_venv_action"),
-            2,
-            None,
+            RetryRun { action_name: t!("installer.utils.create_venv_action"), attempts: 2, tx: None, cancel },
             &uv_env.as_env_slice(),
         )?;
     }
@@ -1338,6 +1346,7 @@ fn ensure_uv_runtime(
     tx: &mpsc::Sender<InstallEvent>,
     overall_start: f32,
     overall_end: f32,
+    cancel: &AtomicBool,
 ) -> Result<PathBuf, String> {
     let uv_dir = root_dir.join("installer_files").join("uv");
     if uv_dir.is_dir()
@@ -1355,15 +1364,17 @@ fn ensure_uv_runtime(
     let downloads_dir = root_dir.join("installer_files").join("downloads");
     fs::create_dir_all(&downloads_dir)
         .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
-    let asset = fetch_latest_uv_asset(detect_platform()?, &detect_arch()?)?;
+    let asset = fetch_latest_uv_asset(detect_platform()?, &detect_arch()?, cancel)?;
     let archive_path = downloads_dir.join(&asset.name);
     download_asset(
-        &asset.browser_download_url,
-        &archive_path,
+        &AssetDownload {
+            asset: &asset,
+            dst_path: &archive_path,
+            label_prefix: "uv",
+            overall_range: (overall_start, lerp(overall_start, overall_end, 0.55)),
+        },
         tx,
-        overall_start,
-        lerp(overall_start, overall_end, 0.55),
-        "uv",
+        cancel,
     )?;
     if uv_dir.exists() {
         fs::remove_dir_all(&uv_dir)
@@ -1410,8 +1421,8 @@ fn maybe_update_torch(
     python_exe: &Path,
     torch_selection: Option<TorchInstallSelection>,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
-    install_tx: &mpsc::Sender<InstallEvent>,
     overall_range: (f32, f32),
+    cancel: &AtomicBool,
 ) -> Result<UpdateContinuationOutcome, String> {
     let installed = freeze_installed_packages(pip_runner, python_exe, root_dir, Some(tx))?;
     // Same predicate as the repair worker and the readiness check: one definition of
@@ -1447,9 +1458,9 @@ fn maybe_update_torch(
         pip_runner,
         python_exe,
         &selection,
-        install_tx,
-        overall_range.0,
-        overall_range.1,
+        &UpdateToInstallEventBridge { tx }.sender(),
+        (overall_range.0, overall_range.1),
+        cancel,
     )?;
     Ok(UpdateContinuationOutcome::Completed)
 }
@@ -1461,6 +1472,7 @@ fn install_missing_dependencies_for_update(
     install_type: config::AiInstallType,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
     overall_range: (f32, f32),
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     let installed = freeze_installed_packages(pip_runner, python_exe, root_dir, Some(tx))?;
     // PyTorch itself is deliberately absent from this list: the update flow installs
@@ -1494,9 +1506,7 @@ fn install_missing_dependencies_for_update(
             python_exe,
             root_dir,
             &[*dep],
-            &tf!("installer.utils.install_missing_dep_action", dep = dep),
-            3,
-            Some(&install_tx),
+            RetryRun { action_name: &tf!("installer.utils.install_missing_dep_action", dep = dep), attempts: 3, tx: Some(&install_tx), cancel },
         )?;
         send_update_progress(
             tx,
@@ -1516,6 +1526,7 @@ fn download_and_extract_app_archive_for_update(
     root_dir: &Path,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
     overall_range: (f32, f32),
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     let _ = tx.send(UpdateWorkerEvent::Step(
         t!("installer.utils.downloading_app_zip_status").to_string(),
@@ -1523,16 +1534,18 @@ fn download_and_extract_app_archive_for_update(
     let downloads_dir = root_dir.join("installer_files").join("downloads");
     fs::create_dir_all(&downloads_dir)
         .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
-    let app_asset = fetch_latest_app_zip_asset()?;
+    let app_asset = fetch_latest_app_zip_asset(cancel)?;
     let archive_path = downloads_dir.join(&app_asset.name);
     let install_tx = UpdateToInstallEventBridge { tx }.sender();
     download_asset(
-        &app_asset.browser_download_url,
-        &archive_path,
+        &AssetDownload {
+            asset: &app_asset,
+            dst_path: &archive_path,
+            label_prefix: APP_ZIP_ASSET_NAME,
+            overall_range: (overall_range.0, lerp(overall_range.0, overall_range.1, 0.45)),
+        },
         &install_tx,
-        overall_range.0,
-        lerp(overall_range.0, overall_range.1, 0.45),
-        APP_ZIP_ASSET_NAME,
+        cancel,
     )?;
 
     let staging_dir = root_dir.join("installer_files").join("update_extract");
@@ -2904,6 +2917,8 @@ struct DependencyInstallRequest<'a> {
     pip_runner: &'a PipInstallRunner,
     python_exe: &'a Path,
     tx: &'a mpsc::Sender<InstallEvent>,
+    /// Checked before every pip command and during its retry backoff.
+    cancel: &'a AtomicBool,
     label: &'a str,
     dependencies: &'a [&'a str],
     overall_start: f32,
@@ -2916,6 +2931,7 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
         pip_runner,
         python_exe,
         tx,
+        cancel,
         label,
         dependencies,
         overall_start,
@@ -2938,9 +2954,7 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
         python_exe,
         root_dir,
         &["--upgrade", "pip", "wheel", "setuptools"],
-        t!("installer.utils.update_pip_action"),
-        1,
-        Some(tx),
+        RetryRun { action_name: t!("installer.utils.update_pip_action"), attempts: 1, tx: Some(tx), cancel },
     )?;
 
     let mut completed_units = 1.0;
@@ -2968,9 +2982,7 @@ fn install_static_python_dependencies(request: DependencyInstallRequest<'_>) -> 
             python_exe,
             root_dir,
             &[*dep],
-            &tf!("installer.utils.install_dep_action", dep = dep),
-            3,
-            Some(tx),
+            RetryRun { action_name: &tf!("installer.utils.install_dep_action", dep = dep), attempts: 3, tx: Some(tx), cancel },
         )?;
 
         completed_units += 1.0;
@@ -2993,14 +3005,16 @@ fn install_torch_python_dependencies(
     python_exe: &Path,
     tx: &mpsc::Sender<InstallEvent>,
     install_cuda_extra_packages: bool,
-    overall_start: f32,
-    overall_end: f32,
+    overall_range: (f32, f32),
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let (overall_start, overall_end) = overall_range;
     install_static_python_dependencies(DependencyInstallRequest {
         root_dir,
         pip_runner,
         python_exe,
         tx,
+        cancel,
         label: t!("installer.utils.torch_deps_label"),
         dependencies: TORCH_DEPENDENCIES,
         overall_start,
@@ -3019,6 +3033,7 @@ fn install_torch_python_dependencies(
             tx,
             lerp(overall_start, overall_end, 0.88),
             overall_end,
+            cancel,
         )?;
     }
 
@@ -3032,6 +3047,7 @@ fn install_cuda_paddle_packages(
     tx: &mpsc::Sender<InstallEvent>,
     overall_start: f32,
     overall_end: f32,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     let cuda_packages = ["paddlepaddle-gpu==3.3.0", "nvidia-cuda-cccl-cu12"];
     let _ = tx.send(InstallEvent::Step(
@@ -3055,9 +3071,7 @@ fn install_cuda_paddle_packages(
             cuda_packages[0],
             cuda_packages[1],
         ],
-        t!("installer.utils.install_paddle_cuda_action"),
-        3,
-        Some(tx),
+        RetryRun { action_name: t!("installer.utils.install_paddle_cuda_action"), attempts: 3, tx: Some(tx), cancel },
     )?;
     send_progress(
         tx,
@@ -3077,9 +3091,10 @@ fn install_python_dependencies_from_requirements_file(
     python_exe: &Path,
     tx: &mpsc::Sender<InstallEvent>,
     install_cuda_extra_packages: bool,
-    overall_start: f32,
-    overall_end: f32,
+    overall_range: (f32, f32),
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let (overall_start, overall_end) = overall_range;
     let requirements = load_requirements_lines(&root_dir.join("requirements.txt"))?;
     let total_units =
         (requirements.len() + 2 + usize::from(install_cuda_extra_packages)).max(2) as f32;
@@ -3099,9 +3114,7 @@ fn install_python_dependencies_from_requirements_file(
         python_exe,
         root_dir,
         &["--upgrade", "pip", "wheel", "setuptools"],
-        t!("installer.utils.update_pip_action"),
-        1,
-        Some(tx),
+        RetryRun { action_name: t!("installer.utils.update_pip_action"), attempts: 1, tx: Some(tx), cancel },
     )?;
     let mut completed_units = 1.0;
     send_progress(
@@ -3128,9 +3141,7 @@ fn install_python_dependencies_from_requirements_file(
             python_exe,
             root_dir,
             &[dep.as_str()],
-            &tf!("installer.utils.install_dep_action", dep = dep),
-            3,
-            Some(tx),
+            RetryRun { action_name: &tf!("installer.utils.install_dep_action", dep = dep), attempts: 3, tx: Some(tx), cancel },
         )?;
 
         completed_units += 1.0;
@@ -3168,9 +3179,7 @@ fn install_python_dependencies_from_requirements_file(
                 cuda_packages[0],
                 cuda_packages[1],
             ],
-            t!("installer.utils.install_paddle_cuda_action"),
-            3,
-            Some(tx),
+            RetryRun { action_name: t!("installer.utils.install_paddle_cuda_action"), attempts: 3, tx: Some(tx), cancel },
         )?;
         completed_units += 1.0;
         let ratio = completed_units / total_units;
@@ -3198,9 +3207,7 @@ fn install_python_dependencies_from_requirements_file(
         python_exe,
         root_dir,
         &[pinned_dep],
-        &tf!("installer.utils.install_pinned_action", pinned_dep = pinned_dep),
-        3,
-        Some(tx),
+        RetryRun { action_name: &tf!("installer.utils.install_pinned_action", pinned_dep = pinned_dep), attempts: 3, tx: Some(tx), cancel },
     )?;
     completed_units += 1.0;
     let ratio = completed_units / total_units;
@@ -3221,9 +3228,10 @@ fn install_torch_stage(
     python_exe: &Path,
     selection: &TorchInstallSelection,
     tx: &mpsc::Sender<InstallEvent>,
-    overall_start: f32,
-    overall_end: f32,
+    overall_range: (f32, f32),
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
+    let (overall_start, overall_end) = overall_range;
     match selection {
         TorchInstallSelection::SkipCpu => {
             let _ = tx.send(InstallEvent::Step(t!("installer.utils.installing_cpu_pytorch_status").to_string()));
@@ -3247,9 +3255,7 @@ fn install_torch_stage(
                     &torch_spec,
                     &torchvision_spec,
                 ],
-                t!("installer.utils.install_cpu_pytorch_action"),
-                3,
-                Some(tx),
+                RetryRun { action_name: t!("installer.utils.install_cpu_pytorch_action"), attempts: 3, tx: Some(tx), cancel },
             )?;
 
             send_progress(
@@ -3289,9 +3295,7 @@ fn install_torch_stage(
                 python_exe,
                 root_dir,
                 &args_ref,
-                &tf!("installer.utils.install_pytorch_action", option = option.label),
-                3,
-                Some(tx),
+                RetryRun { action_name: &tf!("installer.utils.install_pytorch_action", option = option.label), attempts: 3, tx: Some(tx), cancel },
             )?;
 
             send_progress(
@@ -3465,14 +3469,22 @@ fn load_requirements_lines(path: &Path) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// How a retried command is run: its user-facing name, the attempt budget, the console sink
+/// (`None` = silent) and the cancel flag checked before every attempt and during the backoff.
+#[derive(Clone, Copy)]
+struct RetryRun<'a> {
+    action_name: &'a str,
+    attempts: usize,
+    tx: Option<&'a mpsc::Sender<InstallEvent>>,
+    cancel: &'a AtomicBool,
+}
+
 fn run_uv_pip_install_with_retry(
     uv_exe: &Path,
     python_exe: &Path,
     cwd: &Path,
     pip_args: &[&str],
-    action_name: &str,
-    attempts: usize,
-    tx: Option<&mpsc::Sender<InstallEvent>>,
+    run: RetryRun<'_>,
 ) -> Result<(), String> {
     let python_arg = python_exe.to_string_lossy().into_owned();
     let mut args = vec![
@@ -3483,7 +3495,7 @@ fn run_uv_pip_install_with_retry(
     ];
     args.extend(pip_args.iter().map(|arg| (*arg).to_string()));
     let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
-    run_command_with_retry(uv_exe, cwd, &args_ref, action_name, attempts, tx, &[])
+    run_command_with_retry(uv_exe, cwd, &args_ref, run, &[])
 }
 
 fn run_pip_install_with_retry(
@@ -3491,9 +3503,7 @@ fn run_pip_install_with_retry(
     python_exe: &Path,
     cwd: &Path,
     pip_args: &[&str],
-    action_name: &str,
-    attempts: usize,
-    tx: Option<&mpsc::Sender<InstallEvent>>,
+    run: RetryRun<'_>,
 ) -> Result<(), String> {
     match pip_runner {
         PipInstallRunner::Uv(uv_exe) => run_uv_pip_install_with_retry(
@@ -3501,30 +3511,66 @@ fn run_pip_install_with_retry(
             python_exe,
             cwd,
             pip_args,
-            action_name,
-            attempts,
-            tx,
+            run,
         ),
         PipInstallRunner::PythonPip => {
             let mut args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
             args.extend(pip_args.iter().map(|arg| (*arg).to_string()));
             let args_ref = args.iter().map(String::as_str).collect::<Vec<_>>();
-            run_command_with_retry(python_exe, cwd, &args_ref, action_name, attempts, tx, &[])
+            run_command_with_retry(python_exe, cwd, &args_ref, run, &[])
         }
     }
 }
 
+/// Wait before the retry that follows `failed_attempts` failed runs of a command: 2, 4, 8 s,
+/// capped at 8 s.
+fn command_retry_delay(failed_attempts: usize) -> Duration {
+    let exponent = u32::try_from(failed_attempts.saturating_sub(1)).unwrap_or(u32::MAX).min(2);
+    Duration::from_secs(2_u64 << exponent)
+}
+
+/// Sleeps `delay` in 100 ms slices through `sleep`, polling `cancel` before every slice.
+/// Returns `true` as soon as the flag is seen (the wait is abandoned).
+fn wait_unless_cancelled(delay: Duration, cancel: &AtomicBool, sleep: &dyn Fn(Duration)) -> bool {
+    const SLICE: Duration = Duration::from_millis(100);
+    let mut remaining = delay;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        if remaining.is_zero() {
+            return false;
+        }
+        let slice = remaining.min(SLICE);
+        sleep(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+}
+
+/// Runs `executable` up to `run.attempts` times until it exits successfully, streaming its
+/// output to the console sink.
+///
+/// Every failed run is retried after a capped exponential backoff (`command_retry_delay`).
+/// pip / uv failures cannot be told apart (a network blip and an unsatisfiable requirement
+/// both end in a non-zero exit), so every failure is retried and the attempt budget stays
+/// small and per call site. `run.cancel` is checked before every attempt and during the
+/// backoff; a running child process is not interrupted.
+///
+/// # Errors
+/// The localized cancel text, a spawn failure, or the last output after the final attempt.
 fn run_command_with_retry(
     executable: &Path,
     cwd: &Path,
     args: &[&str],
-    action_name: &str,
-    attempts: usize,
-    tx: Option<&mpsc::Sender<InstallEvent>>,
+    run: RetryRun<'_>,
     extra_env: &[(&str, &str)],
 ) -> Result<(), String> {
+    let RetryRun { action_name, attempts, tx, cancel } = run;
     let mut last_output = String::new();
     for attempt in 1..=attempts.max(1) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(tf!("installer.utils.command_cancelled_error", action_name = action_name));
+        }
         if let Some(tx) = tx {
             send_console_line(tx, format!("$ {} {}", executable.display(), args.join(" ")));
             if attempts > 1 {
@@ -3546,8 +3592,9 @@ fn run_command_with_retry(
                     tf!("installer.utils.retry_after_error_status", action_name = action_name),
                 );
             }
-            std::thread::sleep(Duration::from_millis(600));
-            continue;
+            if wait_unless_cancelled(command_retry_delay(attempt), cancel, &std::thread::sleep) {
+                return Err(tf!("installer.utils.command_cancelled_error", action_name = action_name));
+            }
         }
     }
 
@@ -3691,70 +3738,8 @@ fn lerp(start: f32, end: f32, t: f32) -> f32 {
     start + (end - start) * t.clamp(0.0, 1.0)
 }
 
-/// User-Agent header sent with installer HTTP requests.
-const INSTALLER_USER_AGENT: &str = "ManhwaStudioMiniLauncher/installer";
-
-/// Number of attempts `github_api_get` makes before giving up.
-const GITHUB_API_ATTEMPTS: u32 = 5;
-
-/// Returns true when an HTTP status is worth retrying: request timeout (408),
-/// rate limiting (429), or any server-side failure (5xx). Other statuses are
-/// deterministic and retrying cannot change the outcome.
-fn is_retryable_http_status(code: u16) -> bool {
-    matches!(code, 408 | 429) || code >= 500
-}
-
-/// Performs a GitHub API GET with retries for transient network failures.
-///
-/// `user_agent` identifies the calling window. Transport errors, mid-body
-/// disconnects, and retryable HTTP statuses (see `is_retryable_http_status`)
-/// are retried with exponential backoff; other HTTP errors fail immediately.
-/// Returns the response body on success and the last error text on failure;
-/// callers wrap that text into their own localized message.
-pub(crate) fn github_api_get(url: &str, user_agent: &str) -> Result<String, String> {
-    let mut last_error = String::new();
-    for attempt in 0..GITHUB_API_ATTEMPTS {
-        if attempt > 0 {
-            // 1s, 2s, 4s, 8s between attempts.
-            std::thread::sleep(Duration::from_secs(1_u64 << (attempt - 1)));
-        }
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(45))
-            .build();
-        let mut req = agent
-            .get(url)
-            .set("Accept", "application/vnd.github+json")
-            .set("User-Agent", user_agent);
-        if let Ok(token) = env::var("GITHUB_TOKEN") {
-            let token = token.trim();
-            if !token.is_empty() {
-                req = req.set("Authorization", &format!("Bearer {token}"));
-            }
-        }
-        match req.call() {
-            Ok(response) => match response.into_string() {
-                Ok(body) => return Ok(body),
-                // The connection dropped mid-body; the request is worth retrying.
-                Err(e) => last_error = e.to_string(),
-            },
-            Err(e) => {
-                let retryable = match &e {
-                    ureq::Error::Status(code, _) => is_retryable_http_status(*code),
-                    ureq::Error::Transport(_) => true,
-                };
-                last_error = e.to_string();
-                if !retryable {
-                    return Err(last_error);
-                }
-            }
-        }
-    }
-    Err(last_error)
-}
-
-fn fetch_latest_uv_asset(platform: Platform, arch: &str) -> Result<GithubAsset, String> {
-    let body = github_api_get(UV_RELEASE_API, INSTALLER_USER_AGENT)
+fn fetch_latest_uv_asset(platform: Platform, arch: &str, cancel: &AtomicBool) -> Result<GithubAsset, String> {
+    let body = github_api_get(UV_RELEASE_API, INSTALLER_USER_AGENT, cancel)
         .map_err(|e| tf!("installer.utils.get_uv_release_error", e = e))?;
     let release: GithubRelease = serde_json::from_str(&body)
         .map_err(|e| tf!("installer.utils.parse_uv_release_error", e = e))?;
@@ -3762,20 +3747,20 @@ fn fetch_latest_uv_asset(platform: Platform, arch: &str) -> Result<GithubAsset, 
     select_uv_asset(&release.assets, platform, arch)
 }
 
-fn fetch_latest_app_zip_asset() -> Result<GithubAsset, String> {
-    fetch_latest_app_asset_by_name(APP_ZIP_ASSET_NAME)
+fn fetch_latest_app_zip_asset(cancel: &AtomicBool) -> Result<GithubAsset, String> {
+    fetch_latest_app_asset_by_name(APP_ZIP_ASSET_NAME, cancel)
 }
 
-fn fetch_latest_app_asset_by_name(asset_name: &str) -> Result<GithubAsset, String> {
-    fetch_latest_app_release_with_asset(asset_name).map(|(_, asset)| asset)
+fn fetch_latest_app_asset_by_name(asset_name: &str, cancel: &AtomicBool) -> Result<GithubAsset, String> {
+    fetch_latest_app_release_with_asset(asset_name, cancel).map(|(_, asset)| asset)
 }
 
-fn fetch_latest_app_release_tag_with_required_asset(asset_name: &str) -> Result<String, String> {
-    fetch_latest_app_release_with_asset(asset_name).map(|(tag, _)| tag)
+fn fetch_latest_app_release_tag_with_required_asset(asset_name: &str, cancel: &AtomicBool) -> Result<String, String> {
+    fetch_latest_app_release_with_asset(asset_name, cancel).map(|(tag, _)| tag)
 }
 
-fn fetch_latest_app_release_with_asset(asset_name: &str) -> Result<(String, GithubAsset), String> {
-    let body = github_api_get(APP_RELEASES_API, INSTALLER_USER_AGENT)
+fn fetch_latest_app_release_with_asset(asset_name: &str, cancel: &AtomicBool) -> Result<(String, GithubAsset), String> {
+    let body = github_api_get(APP_RELEASES_API, INSTALLER_USER_AGENT, cancel)
         .map_err(|e| tf!("installer.utils.get_releases_error", e = e))?;
     let releases: Vec<GithubReleaseListItem> = serde_json::from_str(&body)
         .map_err(|e| tf!("installer.utils.parse_releases_error", e = e))?;
@@ -3820,314 +3805,6 @@ fn select_uv_asset(
         .ok_or_else(|| {
             tf!("installer.utils.uv_build_not_found_error", platform = platform, arch = arch, expected_name = expected_name)
         })
-}
-
-/// Consecutive download attempts that may fail without adding a single new
-/// byte before `download_asset` gives up. Attempts that grow the partial file
-/// reset this budget, so a flaky-but-alive connection can finish arbitrarily
-/// large files as long as each round makes some progress.
-const DOWNLOAD_STALLED_ATTEMPT_LIMIT: u32 = 10;
-
-/// Progress-reporting context shared by `download_asset` retry attempts.
-struct DownloadProgressCtx<'a> {
-    tx: &'a mpsc::Sender<InstallEvent>,
-    progress_start: f32,
-    progress_end: f32,
-    label_prefix: &'a str,
-}
-
-/// Failure of a single `download_asset_attempt`.
-enum DownloadAttemptError {
-    /// Retrying cannot help (deterministic HTTP error, local filesystem failure).
-    Permanent(String),
-    /// Network-shaped failure; a retry resuming from the partial file may succeed.
-    Transient(String),
-}
-
-/// Extracts the total size from a `Content-Range: bytes <start>-<end>/<total>`
-/// header value. Returns `None` when the total is absent (`*`) or malformed.
-fn parse_content_range_total(value: &str) -> Option<u64> {
-    value.rsplit('/').next()?.trim().parse::<u64>().ok()
-}
-
-/// Downloads `url` into `dst_path`, tolerating an unreliable connection.
-///
-/// The body streams into a sibling `<file>.part` file; failed attempts are
-/// retried with exponential backoff and resumed via HTTP `Range` requests, and
-/// the completed file is renamed into place, so `dst_path` never holds a
-/// partial download. When the server reports a size, a stream that ends early
-/// is treated as a failure and resumed. Consecutive attempts without byte
-/// progress are limited by `DOWNLOAD_STALLED_ATTEMPT_LIMIT`; attempts that
-/// advance the file reset that budget. Progress events sent through `tx` map
-/// onto `progress_start..=progress_end`.
-fn download_asset(
-    url: &str,
-    dst_path: &Path,
-    tx: &mpsc::Sender<InstallEvent>,
-    progress_start: f32,
-    progress_end: f32,
-    label_prefix: &str,
-) -> Result<(), String> {
-    let part_file_name = dst_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|name| format!("{name}.part"))
-        .ok_or_else(|| {
-            tf!("installer.utils.create_dst_path_error", dst_path = dst_path.display(), e = "invalid file name")
-        })?;
-    let part_path = dst_path.with_file_name(part_file_name);
-    let progress = DownloadProgressCtx {
-        tx,
-        progress_start,
-        progress_end,
-        label_prefix,
-    };
-
-    let mut expected_total: Option<u64> = None;
-    let mut stalled_attempts: u32 = 0;
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        // Attempt 1 always starts from zero: a leftover `.part` file from an
-        // older run may belong to a different asset with the same name, so
-        // resume only within this call.
-        let offset = if attempt == 1 {
-            0
-        } else {
-            fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0)
-        };
-        match download_asset_attempt(url, &part_path, offset, &mut expected_total, &progress) {
-            Ok(()) => break,
-            Err(DownloadAttemptError::Permanent(message)) => return Err(message),
-            Err(DownloadAttemptError::Transient(message)) => {
-                let new_len = fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
-                if new_len > offset {
-                    stalled_attempts = 0;
-                } else {
-                    stalled_attempts += 1;
-                }
-                if stalled_attempts >= DOWNLOAD_STALLED_ATTEMPT_LIMIT {
-                    return Err(tf!(
-                        "installer.utils.download_failed_after_retries_error",
-                        label_prefix = label_prefix,
-                        attempts = attempt,
-                        e = message
-                    ));
-                }
-                send_console_line(
-                    tx,
-                    tf!(
-                        "installer.utils.download_retry_status",
-                        label_prefix = label_prefix,
-                        attempt = attempt + 1,
-                        e = message
-                    ),
-                );
-                // Exponential backoff capped at 16s, so a long download over a
-                // flaky link is not dominated by waiting between attempts.
-                let backoff_exp = stalled_attempts.min(5);
-                std::thread::sleep(Duration::from_millis(500_u64 << backoff_exp));
-            }
-        }
-    }
-
-    // Move the finished `.part` file into place; remove a stale destination
-    // first because `fs::rename` does not replace existing files on Windows.
-    if dst_path.exists() {
-        fs::remove_file(dst_path).map_err(|e| {
-            tf!(
-                "installer.utils.download_finalize_rename_error",
-                part_path = part_path.display(),
-                dst_path = dst_path.display(),
-                e = e
-            )
-        })?;
-    }
-    fs::rename(&part_path, dst_path).map_err(|e| {
-        tf!(
-            "installer.utils.download_finalize_rename_error",
-            part_path = part_path.display(),
-            dst_path = dst_path.display(),
-            e = e
-        )
-    })?;
-
-    send_progress(
-        tx,
-        1.0,
-        tf!("installer.utils.download_done_progress", label_prefix = label_prefix),
-        progress_end,
-        tf!("installer.utils.download_done_progress", label_prefix = label_prefix),
-    );
-    Ok(())
-}
-
-/// Runs one HTTP attempt for `download_asset`, writing into `part_path`.
-///
-/// `offset > 0` resumes with an HTTP `Range` request appending to the partial
-/// file; a server that ignores the range restarts the file from zero.
-/// `expected_total` is filled from response headers the first time the server
-/// reports a size and is used to reject streams that end early.
-fn download_asset_attempt(
-    url: &str,
-    part_path: &Path,
-    mut offset: u64,
-    expected_total: &mut Option<u64>,
-    progress: &DownloadProgressCtx<'_>,
-) -> Result<(), DownloadAttemptError> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(15))
-        // Short per-read timeout: a stalled link should fail fast and resume
-        // with a `Range` request instead of hanging for minutes.
-        .timeout_read(Duration::from_secs(30))
-        .build();
-    let mut req = agent.get(url).set("User-Agent", INSTALLER_USER_AGENT);
-    if let Ok(token) = env::var("GITHUB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
-        }
-    }
-    if offset > 0 {
-        req = req.set("Range", &format!("bytes={offset}-"));
-    }
-
-    let response = match req.call() {
-        Ok(response) => response,
-        Err(e) => {
-            let retryable = match &e {
-                ureq::Error::Status(code, _) => is_retryable_http_status(*code),
-                ureq::Error::Transport(_) => true,
-            };
-            let message =
-                tf!("installer.utils.download_error", label_prefix = progress.label_prefix, e = e);
-            return Err(if retryable {
-                DownloadAttemptError::Transient(message)
-            } else {
-                DownloadAttemptError::Permanent(message)
-            });
-        }
-    };
-
-    // 206 means the server honored the resume request; a plain 200 means it
-    // ignored the `Range` header and is sending the whole body again.
-    if offset > 0 && response.status() != 206 {
-        offset = 0;
-    }
-    if offset == 0 {
-        if let Some(total) = response
-            .header("Content-Length")
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|total| *total > 0)
-        {
-            *expected_total = Some(total);
-        }
-    } else if expected_total.is_none() {
-        // A resumed response reports only the remaining length in
-        // Content-Length; the full size lives in Content-Range.
-        *expected_total = response
-            .header("Content-Range")
-            .and_then(parse_content_range_total);
-    }
-
-    let mut reader = response.into_reader();
-    let mut file = if offset > 0 {
-        OpenOptions::new().append(true).open(part_path)
-    } else {
-        File::create(part_path)
-    }
-    .map_err(|e| {
-        DownloadAttemptError::Permanent(
-            tf!("installer.utils.create_dst_path_error", dst_path = part_path.display(), e = e),
-        )
-    })?;
-
-    let mut downloaded = offset;
-    let mut buf = vec![0_u8; 256 * 1024];
-    let mut last_emit = Instant::now() - Duration::from_secs(1);
-    loop {
-        let read = match reader.read(&mut buf) {
-            Ok(read) => read,
-            // Bytes written so far stay in the `.part` file, so the next
-            // attempt resumes from them instead of restarting.
-            Err(e) => {
-                return Err(DownloadAttemptError::Transient(
-                    tf!("installer.utils.read_http_stream_error", e = e),
-                ));
-            }
-        };
-        if read == 0 {
-            break;
-        }
-        file.write_all(&buf[..read]).map_err(|e| {
-            DownloadAttemptError::Permanent(
-                tf!("installer.utils.write_dst_path_error", dst_path = part_path.display(), e = e),
-            )
-        })?;
-        downloaded += read as u64;
-
-        if last_emit.elapsed() >= Duration::from_millis(120) {
-            let total = expected_total.unwrap_or(0);
-            let stage_progress = if total > 0 {
-                downloaded as f32 / total as f32
-            } else {
-                0.0
-            };
-            send_progress(
-                progress.tx,
-                stage_progress.clamp(0.0, 1.0),
-                if total > 0 {
-                    format!(
-                        "{}: {} / {}",
-                        progress.label_prefix,
-                        format_bytes(downloaded),
-                        format_bytes(total)
-                    )
-                } else {
-                    format!("{}: {}", progress.label_prefix, format_bytes(downloaded))
-                },
-                progress.progress_start
-                    + stage_progress.clamp(0.0, 1.0)
-                        * (progress.progress_end - progress.progress_start),
-                tf!("installer.utils.downloading_progress", label_prefix = progress.label_prefix),
-            );
-            last_emit = Instant::now();
-        }
-    }
-    file.flush().map_err(|e| {
-        DownloadAttemptError::Permanent(
-            tf!("installer.utils.finalize_file_error", dst_path = part_path.display(), e = e),
-        )
-    })?;
-
-    if let Some(total) = *expected_total {
-        if downloaded < total {
-            // The server closed the stream early; the next attempt resumes.
-            return Err(DownloadAttemptError::Transient(tf!(
-                "installer.utils.download_incomplete_error",
-                label_prefix = progress.label_prefix,
-                downloaded = format_bytes(downloaded),
-                total = format_bytes(total)
-            )));
-        }
-        if downloaded > total {
-            // Overlapping resume or an asset that changed mid-download: the
-            // partial file cannot be trusted, restart from scratch.
-            drop(file);
-            fs::remove_file(part_path).map_err(|e| {
-                DownloadAttemptError::Permanent(
-                    tf!("installer.utils.remove_partial_error", path = part_path.display(), e = e),
-                )
-            })?;
-            return Err(DownloadAttemptError::Transient(tf!(
-                "installer.utils.download_incomplete_error",
-                label_prefix = progress.label_prefix,
-                downloaded = format_bytes(downloaded),
-                total = format_bytes(total)
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn extract_archive(
@@ -4435,7 +4112,7 @@ fn merge_dir_contents(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn format_bytes(bytes: u64) -> String {
+pub(super) fn format_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
@@ -4476,8 +4153,8 @@ mod tests {
         WINDOWS_BINARY_ASSET_NAME_AARCH64, WINDOWS_BINARY_ASSET_NAME_X86_64,
         BASE_DEPENDENCIES, ONNXRUNTIME_DISTRIBUTIONS, REQUIRED_TORCH_VERSION, TORCH_DEPENDENCIES,
         dependency_package_name, installed_torch_is_current,
-        installed_torch_version, is_retryable_http_status, missing_dependency_specs,
-        missing_specs_for_readiness, normalize_package_name, parse_content_range_total,
+        installed_torch_version, missing_dependency_specs,
+        missing_specs_for_readiness, normalize_package_name,
         parse_executable_version_output, parse_pip_freeze_packages, platform_binary_asset_name,
         platform_executable_file_name, required_dependency_specs,
         sanitize_windows_archive_path_component,
@@ -4486,6 +4163,8 @@ mod tests {
         ReplaceTargetAccess, classify_replace_target_access, replace_executable_with_local_file,
         staged_replacement_file_name,
     };
+    use super::{command_retry_delay, wait_unless_cancelled};
+    use std::time::Duration;
     use ms_config::AiInstallType;
     use std::collections::HashMap;
 
@@ -4659,120 +4338,30 @@ mod tests {
     }
 
     #[test]
-    fn parse_content_range_total_extracts_total_size() {
-        assert_eq!(parse_content_range_total("bytes 100-199/12345"), Some(12345));
-        assert_eq!(parse_content_range_total("bytes 0-0/1"), Some(1));
+    fn command_retry_backoff_doubles_from_two_seconds_and_caps_at_eight() {
+        let delays: Vec<u64> = (1..=5).map(|attempt| command_retry_delay(attempt).as_secs()).collect();
+        assert_eq!(delays, vec![2, 4, 8, 8, 8]);
     }
 
     #[test]
-    fn parse_content_range_total_rejects_unknown_or_malformed_totals() {
-        assert_eq!(parse_content_range_total("bytes 100-199/*"), None);
-        assert_eq!(parse_content_range_total("garbage"), None);
-        assert_eq!(parse_content_range_total(""), None);
-    }
+    fn command_retry_wait_sleeps_in_slices_and_stops_on_cancel() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
-    #[test]
-    fn retryable_http_statuses_are_timeouts_rate_limits_and_server_errors() {
-        assert!(is_retryable_http_status(408));
-        assert!(is_retryable_http_status(429));
-        assert!(is_retryable_http_status(500));
-        assert!(is_retryable_http_status(503));
-        assert!(!is_retryable_http_status(400));
-        assert!(!is_retryable_http_status(403));
-        assert!(!is_retryable_http_status(404));
-        assert!(!is_retryable_http_status(416));
-    }
-
-    /// Reads one HTTP request head (through the blank line) from `stream`.
-    fn read_request_head(stream: &mut std::net::TcpStream) -> String {
-        use std::io::Read as _;
-        let mut head = Vec::new();
-        let mut byte = [0_u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            match stream.read(&mut byte) {
-                Ok(1) => head.push(byte[0]),
-                _ => break,
+        let slices = Mutex::new(Vec::new());
+        let cancel = AtomicBool::new(false);
+        let record = |slice: Duration| {
+            if let Ok(mut slices) = slices.lock() {
+                slices.push(slice);
             }
-        }
-        String::from_utf8_lossy(&head).into_owned()
-    }
+        };
+        assert!(!wait_unless_cancelled(Duration::from_millis(250), &cancel, &record));
+        assert_eq!(slices.lock().map(|slices| slices.len()).unwrap_or(0), 3, "250 ms = 100 + 100 + 50 ms slices");
 
-    /// Extracts the start offset from a `Range: bytes=<start>-` request header.
-    fn parse_range_start(request_head: &str) -> Option<u64> {
-        let lower = request_head.to_ascii_lowercase();
-        let after = lower.split("range: bytes=").nth(1)?;
-        after.split('-').next()?.trim().parse::<u64>().ok()
-    }
-
-    #[test]
-    fn download_asset_resumes_after_mid_body_disconnect() {
-        use std::io::Write as _;
-        use std::net::TcpListener;
-
-        // Deterministic 400 KB payload so a mid-body cut is unambiguous.
-        let body: Vec<u8> = (0..100_000_u32).flat_map(u32::to_le_bytes).collect();
-        let half = body.len() / 2;
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let server_body = body.clone();
-        let server = std::thread::spawn(move || {
-            // First request: full Content-Length, but only half the bytes
-            // arrive before the connection drops.
-            let (mut stream, _) = listener.accept().expect("accept first request");
-            let _ = read_request_head(&mut stream);
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                server_body.len()
-            );
-            stream.write_all(head.as_bytes()).expect("write first head");
-            stream
-                .write_all(&server_body[..half])
-                .expect("write first half");
-            drop(stream);
-
-            // Second request must resume with a Range header; serve the rest.
-            let (mut stream, _) = listener.accept().expect("accept resume request");
-            let request_head = read_request_head(&mut stream);
-            let start_u64 = parse_range_start(&request_head).expect("resume request has Range");
-            let start = usize::try_from(start_u64).expect("range offset fits usize");
-            assert_eq!(start, half, "resume must continue exactly where the cut happened");
-            let head = format!(
-                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
-                server_body.len() - start,
-                start,
-                server_body.len() - 1,
-                server_body.len()
-            );
-            stream.write_all(head.as_bytes()).expect("write resume head");
-            stream
-                .write_all(&server_body[start..])
-                .expect("write resume body");
-        });
-
-        let dir = std::env::temp_dir().join(format!("ms_download_asset_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create test dir");
-        let dst_path = dir.join("asset.bin");
-        let (tx, _rx) = std::sync::mpsc::channel();
-
-        let result = super::download_asset(
-            &format!("http://{addr}/asset.bin"),
-            &dst_path,
-            &tx,
-            0.0,
-            1.0,
-            "test-asset",
-        );
-
-        server.join().expect("server thread");
-        assert_eq!(result, Ok(()));
-        let downloaded = std::fs::read(&dst_path).expect("read downloaded file");
-        assert_eq!(downloaded, body, "resumed file must match the original byte-for-byte");
-        assert!(
-            !dir.join("asset.bin.part").exists(),
-            "no partial file may remain after a successful download"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        // The flag set during the wait ends it at the next slice boundary.
+        let cancel_on_sleep = |_slice: Duration| cancel.store(true, Ordering::Relaxed);
+        assert!(wait_unless_cancelled(Duration::from_secs(8), &cancel, &cancel_on_sleep));
+        assert!(wait_unless_cancelled(Duration::from_secs(8), &cancel, &|_| panic!("a set flag must not sleep")));
     }
 
     #[test]

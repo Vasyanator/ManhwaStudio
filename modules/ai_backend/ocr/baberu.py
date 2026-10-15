@@ -53,6 +53,7 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import numpy as np
 
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from .result_format import format_recognition_lines
 
@@ -495,20 +496,29 @@ class BaberuOcrService:
         self._runtime: _BaberuOnnxRuntime | None = None
         self._runtime_key: str | None = None
         self._last_error: str | None = None
+        # Published copy of the health fields; `health()` never takes `_lock`,
+        # which a session build holds (S-014).
+        self._health = HealthSnapshot(ready=False, device=None, last_error=None)
 
     def health(self) -> dict[str, Any]:
         """Return `{"ready", "device", "last_error"}` for the health snapshot.
 
         `device` is the effective vision device of the resident runtime (e.g.
         `CUDAExecutionProvider:0`, `CPUExecutionProvider`), None when none is
-        resident; the decoders always run on the CPU.
+        resident; the decoders always run on the CPU. Reads only the published
+        snapshot, so it answers while a session build holds the instance lock
+        (`ready` is False while sessions are being rebuilt).
         """
-        with self._lock:
-            return {
-                "ready": self._runtime is not None,
-                "device": self._runtime.vision_device if self._runtime is not None else None,
-                "last_error": self._last_error,
-            }
+        return self._health.read()
+
+    def _publish_health_locked(self) -> None:
+        """Republish the health fields from the guarded state; caller holds `self._lock`."""
+        runtime = self._runtime
+        self._health.publish(
+            ready=runtime is not None,
+            device=runtime.vision_device if runtime is not None else None,
+            last_error=self._last_error,
+        )
 
     def recognize_image_bytes(
         self,
@@ -554,12 +564,14 @@ class BaberuOcrService:
                 log.error("Baberu OCR inference failed: vision=%s error=%s", files.vision, exc)
                 with self._lock:
                     self._last_error = message
+                    self._publish_health_locked()
                 raise RuntimeError(message) from exc
         finally:
             lease.release()
 
         with self._lock:
             self._last_error = None
+            self._publish_health_locked()
         return format_recognition_lines(
             text,
             join_newlines=join_newlines,
@@ -600,6 +612,7 @@ class BaberuOcrService:
         previous_key = self._runtime_key
         self._runtime = None
         self._runtime_key = None
+        self._publish_health_locked()
         if previous_key is not None and previous_key != model_key:
             self._model_manager.mark_unloaded(previous_key)
             log.info("Baberu OCR runtime unloaded for a new provider selection: old=%s new=%s", previous_key, model_key)
@@ -607,6 +620,7 @@ class BaberuOcrService:
             runtime = _BaberuOnnxRuntime(files, settings)
         except Exception as exc:
             self._last_error = f"Baberu OCR init failed: {exc}"
+            self._publish_health_locked()
             log.error("Baberu OCR init failed: model_key=%s vision=%s error=%s", model_key, files.vision, exc)
             if not lease_needs_load:
                 self._model_manager.mark_unloaded(model_key)
@@ -615,6 +629,7 @@ class BaberuOcrService:
         self._runtime = runtime
         self._runtime_key = model_key
         self._last_error = None
+        self._publish_health_locked()
         log.info(
             "Baberu OCR runtime ready: model_key=%s vision_device=%s decoders=%s vision=%s prefill=%s step=%s",
             model_key,
@@ -633,6 +648,7 @@ class BaberuOcrService:
                 return False
             self._runtime = None
             self._runtime_key = None
+            self._publish_health_locked()
             self._model_manager.mark_unloaded(model_key)
         log.info("Baberu OCR runtime unloaded: model_key=%s", model_key)
         return True

@@ -1,0 +1,395 @@
+{
+  "sources": [
+    {
+      "id": "ort/linux-x86_64-cpu",
+      "kind": "url",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-1.27.0.tgz",
+      "expected_sha256": "547e40a48f1fe73e3f812d7c88a948612c23f896b91e4e2ee1e232d7b468246f",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/windows-x86_64-cpu",
+      "kind": "url",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-1.27.0.zip",
+      "expected_sha256": "c5c81710938e68079ff1a192b04897faabe4b43830d48f39f27ecd4e16138bfc",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/macos-aarch64-cpu",
+      "kind": "url",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz",
+      "expected_sha256": "545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/macos-aarch64-coreml",
+      "kind": "url",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-osx-arm64-1.27.0.tgz",
+      "expected_sha256": "545e81c58152353acb0d1e8bd6ce4b62f830c0961f5b3acfedc790ffd76e477a",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/windows-x86_64-directml",
+      "kind": "url",
+      "url": "https://files.pythonhosted.org/packages/88/ea/33814eb0ec96775eda4c1d30b0d86e91d7d2cd0d84c66d3915aef0e06fa3/onnxruntime_directml-1.24.4-cp312-cp312-win_amd64.whl",
+      "expected_sha256": "f2ecb68b7b7b259d2ef3112ae760149f9b5a1e7c0fbb73d539da6250a648a614",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/windows-x86_64-webgpu",
+      "kind": "url",
+      "url": "https://files.pythonhosted.org/packages/df/28/016260c51c877ba5b3eba823b43107e894659e73e0ecf250eb07e801e3c2/onnxruntime_webgpu-1.27.0-cp312-cp312-win_amd64.whl",
+      "expected_sha256": "7ef99275b13e8cb9584bd0db7a6f00ebf76095601eeccf7d34749b89ee991c19",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/linux-x86_64-webgpu",
+      "kind": "url",
+      "url": "https://files.pythonhosted.org/packages/24/11/6cd5f840be97819cbd172bacc1868726ab5fa54ceaaa79508c5a64e61233/onnxruntime_webgpu-1.27.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+      "expected_sha256": "fe5e49e00ad71bc667316d57670bfbf525438783d4a3468e0d337314ec985cbe",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/macos-aarch64-webgpu",
+      "kind": "url",
+      "url": "https://files.pythonhosted.org/packages/b4/1f/be670672fa0dc367fd28113b5e410a6e71cb6ee66c188ed1a8eb1439c941/onnxruntime_webgpu-1.27.0-cp312-cp312-macosx_14_0_arm64.whl",
+      "expected_sha256": "8e6c43281318283a31977ebe752e7b0454db9b2dc42c768ac88641952357196a",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/windows-x86_64-cuda13",
+      "kind": "url",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-win-x64-gpu_cuda13-1.27.0.zip",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row (sha256 null in manifest)"
+    },
+    {
+      "id": "ort/linux-x86_64-cuda13",
+      "kind": "url",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.27.0/onnxruntime-linux-x64-gpu_cuda13-1.27.0.tgz",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row (sha256 null in manifest)"
+    },
+    {
+      "id": "ort/windows-x86_64-cuda12",
+      "kind": "url",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.1/onnxruntime-win-x64-gpu-1.24.1.zip",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row (sha256 null in manifest)"
+    },
+    {
+      "id": "ort/linux-x86_64-cuda12",
+      "kind": "url",
+      "url": "https://github.com/microsoft/onnxruntime/releases/download/v1.24.1/onnxruntime-linux-x64-gpu-1.24.1.tgz",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row (sha256 null in manifest)"
+    },
+    {
+      "id": "ort/windows-x86_64-openvino",
+      "kind": "url",
+      "url": "https://files.pythonhosted.org/packages/59/37/d301f2c68b19a9485ed5db3047e0fb52478f3e73eb08c7d2a7c61be7cc1c/onnxruntime_openvino-1.24.1-cp312-cp312-win_amd64.whl",
+      "expected_sha256": "f186335a9c9b255633275290da7521d3d4d14c7773fee3127bfa040234d3fa5a",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "ort/linux-x86_64-openvino",
+      "kind": "url",
+      "url": "https://files.pythonhosted.org/packages/50/cf/17ba72de2df0fcba349937d2788f154397bbc2d1a2d67772a97e26f6bc5f/onnxruntime_openvino-1.24.1-cp312-cp312-manylinux_2_28_x86_64.whl",
+      "expected_sha256": "d617fac2f59a6ab5ea59a788c3e1592240a129642519aaeaa774761dfe35150e",
+      "note": "crates/ms-onnx-runtime/src/ort_manifest.json row"
+    },
+    {
+      "id": "watermark/slbr",
+      "kind": "gdrive",
+      "file_id": "1uTCzubnWZtu3HIXaK8xsXX-7x302ss13",
+      "file_name": "model_best.pth.tar",
+      "approx_size": 85674000,
+      "note": "modules/ai_backend/watermark/service.py WEIGHTS"
+    },
+    {
+      "id": "watermark/wdnet",
+      "kind": "gdrive",
+      "file_id": "1Tv0iM3ZbM0j3akP9uI1myC18IUnyDNjL",
+      "file_name": "WDNet_G.pkl",
+      "approx_size": 80400000,
+      "note": "modules/ai_backend/watermark/service.py WEIGHTS"
+    },
+    {
+      "id": "watermark/splitnet",
+      "kind": "gdrive",
+      "file_id": "1KpSJ6385CHN6WlAINqB3CYrJdleQTJBc",
+      "file_name": "27kpng_model_best.pth.tar",
+      "approx_size": 130600000,
+      "note": "modules/ai_backend/watermark/service.py WEIGHTS"
+    },
+    {
+      "id": "waifu2x/win",
+      "kind": "url",
+      "url": "https://github.com/Vasyanator/libwaifu2x-ncnn-vulkan/releases/download/1.0/Win.zip",
+      "note": "crates/ms-launcher/src/new_project/waifu2x.rs waifu2x_package_url"
+    },
+    {
+      "id": "waifu2x/lin",
+      "kind": "url",
+      "url": "https://github.com/Vasyanator/libwaifu2x-ncnn-vulkan/releases/download/1.0/Lin.zip",
+      "note": "crates/ms-launcher/src/new_project/waifu2x.rs waifu2x_package_url"
+    },
+    {
+      "id": "waifu2x/mac",
+      "kind": "url",
+      "url": "https://github.com/Vasyanator/libwaifu2x-ncnn-vulkan/releases/download/1.0/Mac.zip",
+      "note": "crates/ms-launcher/src/new_project/waifu2x.rs waifu2x_package_url"
+    },
+    {
+      "id": "easyocr/craft_mlt_25k",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/craft_mlt_25k.zip",
+      "zip_members": [
+        {
+          "member": "craft_mlt_25k.pth",
+          "md5": "2f8227d2def4037cdb3b34389dcf9ec1"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; detector, stored once (shared by every script)"
+    },
+    {
+      "id": "easyocr/english_g2",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/english_g2.zip",
+      "zip_members": [
+        {
+          "member": "english_g2.pth",
+          "md5": "5864788e1821be9e454ec108d61b887d"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py"
+    },
+    {
+      "id": "easyocr/latin_g2",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/latin_g2.zip",
+      "zip_members": [
+        {
+          "member": "latin_g2.pth",
+          "md5": "469869130aad1a34e8f9086f4262bc59"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py"
+    },
+    {
+      "id": "easyocr/zh_sim_g2",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/zh_sim_g2.zip",
+      "zip_members": [
+        {
+          "member": "zh_sim_g2.pth",
+          "md5": "b601ce7143293387d3ec4f41a66edc07"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py"
+    },
+    {
+      "id": "easyocr/japanese_g2",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/japanese_g2.zip",
+      "zip_members": [
+        {
+          "member": "japanese_g2.pth",
+          "md5": "bad5146990ccb1272cb0908440fbe15e"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py"
+    },
+    {
+      "id": "easyocr/korean_g2",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.3/korean_g2.zip",
+      "zip_members": [
+        {
+          "member": "korean_g2.pth",
+          "md5": "befecf7b1ca2fffb5af814a51443682d"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py"
+    },
+    {
+      "id": "easyocr/telugu",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.2/telugu.zip",
+      "zip_members": [
+        {
+          "member": "telugu.pth",
+          "md5": "f7576012a3abe593950c47bfa1bd8ddc"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; telugu_g2"
+    },
+    {
+      "id": "easyocr/kannada",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.2/kannada.zip",
+      "zip_members": [
+        {
+          "member": "kannada.pth",
+          "md5": "c240c97e4adb8773b53b3b3dec728627"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; kannada_g2"
+    },
+    {
+      "id": "easyocr/cyrillic_g2",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.6.1/cyrillic_g2.zip",
+      "zip_members": [
+        {
+          "member": "cyrillic_g2.pth",
+          "md5": "19f85f43d9128a89ac21b8d6a06973fe"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py"
+    },
+    {
+      "id": "easyocr/chinese",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/chinese.zip",
+      "zip_members": [
+        {
+          "member": "chinese.pth",
+          "md5": "dfba8e364cd98ed4fed7ad54d71e3965"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; zh_tra_g1"
+    },
+    {
+      "id": "easyocr/thai",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/thai.zip",
+      "zip_members": [
+        {
+          "member": "thai.pth",
+          "md5": "40a06b563a2b3d7897e2d19df20dc709"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; thai_g1"
+    },
+    {
+      "id": "easyocr/devanagari",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/devanagari.zip",
+      "zip_members": [
+        {
+          "member": "devanagari.pth",
+          "md5": "db6b1f074fae3070f561675db908ac08"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; devanagari_g1"
+    },
+    {
+      "id": "easyocr/arabic",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/pre-v1.1.6/arabic.zip",
+      "zip_members": [
+        {
+          "member": "arabic.pth",
+          "md5": "993074555550e4e06a6077d55ff0449a"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; arabic_g1"
+    },
+    {
+      "id": "easyocr/tamil",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.1.7/tamil.zip",
+      "zip_members": [
+        {
+          "member": "tamil.pth",
+          "md5": "4b93972fdacdcdabe6d57097025d4dc2"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; tamil_g1"
+    },
+    {
+      "id": "easyocr/bengali",
+      "kind": "url",
+      "url": "https://github.com/JaidedAI/EasyOCR/releases/download/v1.1.8/bengali.zip",
+      "zip_members": [
+        {
+          "member": "bengali.pth",
+          "md5": "cea9e897e2c0576b62cbb1554997ce1c"
+        }
+      ],
+      "note": "easyocr==1.7.2 config.py; bengali_g1"
+    },
+    {
+      "id": "surya/text_detection/2025_05_07",
+      "kind": "url_manifest",
+      "base_url": "https://models.datalab.to",
+      "path": "text_detection/2025_05_07",
+      "note": "surya-ocr==0.17.1 settings.py S3_BASE_URL + *_MODEL_CHECKPOINT, common/s3.py download_directory"
+    },
+    {
+      "id": "surya/text_recognition/2025_09_23",
+      "kind": "url_manifest",
+      "base_url": "https://models.datalab.to",
+      "path": "text_recognition/2025_09_23",
+      "note": "surya-ocr==0.17.1 settings.py S3_BASE_URL + *_MODEL_CHECKPOINT, common/s3.py download_directory"
+    },
+    {
+      "id": "sdxl-config/stabilityai/stable-diffusion-xl-base-1.0",
+      "kind": "hf_repo",
+      "repo": "stabilityai/stable-diffusion-xl-base-1.0",
+      "revision": "main",
+      "allow_patterns": [
+        "**/*.json",
+        "*.json",
+        "*.txt",
+        "**/*.txt",
+        "**/*.model"
+      ],
+      "note": "diffusers 0.39.0 single-file config repo (single_file_utils.py DIFFUSERS_DEFAULT_PIPELINE_PATHS, allow patterns single_file.py _download_diffusers_model_config_from_hub)"
+    },
+    {
+      "id": "sdxl-config/diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+      "kind": "hf_repo",
+      "repo": "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+      "revision": "main",
+      "allow_patterns": [
+        "**/*.json",
+        "*.json",
+        "*.txt",
+        "**/*.txt",
+        "**/*.model"
+      ],
+      "note": "diffusers 0.39.0 single-file config repo (single_file_utils.py DIFFUSERS_DEFAULT_PIPELINE_PATHS, allow patterns single_file.py _download_diffusers_model_config_from_hub)"
+    },
+    {
+      "id": "sdxl-inpaint/diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+      "kind": "hf_repo",
+      "repo": "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
+      "revision": "main",
+      "allow_patterns": [
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "*/config.json",
+        "tokenizer/*",
+        "tokenizer_2/*",
+        "*.fp16.safetensors"
+      ],
+      "note": "curated SDXL inpaint repo (named in modules/ai_backend/inpaint/sdxl.py), files StableDiffusionXLInpaintPipeline.from_pretrained(..., variant='fp16') loads"
+    },
+    {
+      "id": "lama-mpe/main-repo",
+      "kind": "hf_repo",
+      "repo": "Vasyanator2/ManhwaStudio_AI_Models",
+      "revision": "main",
+      "paths": [
+        "Torch/LaMa_MPE/inpainting_lama_mpe.ckpt"
+      ],
+      "expected_sha256": "d625aa1b3e0d0408acfd6928aa84f005867aa8dbb9162480346a4e20660786cc",
+      "note": "ms-sysprobe ai_models::ensure_lama_mpe; expected = modules/ai_backend/inpaint/lama_mpe.py _LAMA_MPE_SHA256"
+    },
+    {
+      "id": "lama-mpe/github",
+      "kind": "url",
+      "url": "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/inpainting_lama_mpe.ckpt",
+      "expected_sha256": "d625aa1b3e0d0408acfd6928aa84f005867aa8dbb9162480346a4e20660786cc",
+      "note": "modules/ai_backend/inpaint/lama_mpe.py _LAMA_MPE_URL / _LAMA_MPE_SHA256"
+    }
+  ]
+}

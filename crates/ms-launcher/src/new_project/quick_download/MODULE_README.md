@@ -18,8 +18,9 @@ sites/*.rs         one file per supported site: URL shapes, endpoints, markers, 
 http.rs  url_util.rs  html.rs  base64.rs      site-agnostic primitives
 ```
 
-`window.rs` only sees `mod.rs`. It calls `QuickDownloadController::begin_download(url)` and drains
-`QuickDownloadEvent`s in `poll(ctx)`; everything below the controller runs on the worker thread.
+`window.rs` only sees `mod.rs`. It calls `QuickDownloadController::begin_download(url)`, drains
+`QuickDownloadEvent`s in `poll(ctx)` and calls `cancel()` when the window closes; everything below
+the controller runs on the worker thread.
 A site module never downloads images itself — it returns a `SiteDownloadPlan` (pages in reading
 order plus the optional `Referer` that site's CDN requires) and the controller does the fetching.
 Each page is a site-agnostic `PlannedImage`: a primary `url`, ordered `fallbacks` (the same image
@@ -32,8 +33,9 @@ list with `PlannedImage::from_urls`.
 - `controller.rs`: `QuickDownloadController`, the UI/worker event types, `spawn_quick_download`,
   `load_quick_download`, `download_images_ordered`, and the per-page retry/fallback state machine
   `fetch_page_with_fallbacks` over a per-download `PageFetcher` (attempt budgets, backoff,
-  hedging, `DeadHosts`, digest check, decode). Edit it for progress, threading, the retry
-  policy, or the ribbon handoff.
+  hedging, `DeadHosts`, digest check, decode), the run's cancel flag with `cancellable_sleep`
+  and the typed `QuickDownloadAbort` (cancelled vs failed). Edit it for progress, threading,
+  cancel, the retry policy, or the ribbon handoff.
 - `plan.rs`: `SiteDownloadPlan`, `PlannedImage`, `QuickDownloadError`, the digest hex helpers, and
   `build_site_download_plan` — the single host switch of the module.
 - `http.rs`: `execute_request` and the fetch entry points on top of it — `fetch_text`/
@@ -92,14 +94,24 @@ list with `PlannedImage::from_urls`.
   undecodable bytes moves to the next URL immediately. Every retry/fallback is logged (page
   number, URL, error; error bodies cut to 512 bytes); the final error keeps the last failure's
   user message and its log message lists every attempt and skip. No HTTP `Range` resume: pages
-  are fetched whole and a cut transfer is simply retried. There is no cancel path (a new download
-  only replaces the receiver; tracked as `STATE.md` S-022), so the waits are kept short and
-  bounded. Fetch, sleep and the hedge delay are injected, so the tests never touch the network or
-  wait on the clock.
+  are fetched whole and a cut transfer is simply retried. Fetch, sleep and the hedge delay are
+  injected, so the tests never touch the network or wait on the clock.
+- **Cancel.** Every run owns one cancel flag (`Arc<AtomicBool>`) and its own channel.
+  `begin_download` cancels the run still in flight before starting the next, `cancel()` (called
+  by `window.rs` when the window closes) and dropping the controller cancel too, and the
+  controller forgets the run at once, so a cancelled run's events can never reach a later
+  receiver. The worker checks the flag after resolving the plan, before every page, before every
+  attempt, inside the backoff wait (the injected sleep takes the flag; production
+  `cancellable_sleep` polls it every `CANCEL_POLL_INTERVAL`) and inside both hedge waits. A
+  cancelled run ends `QuickDownloadAbort::Cancelled`: logged at info level, no event, no pages
+  (the downloader writes no files, so nothing is staged or left behind). Residual: an HTTP request
+  already in flight is not interrupted (`ureq` has no cancel); it ends within the socket timeouts
+  and its result is dropped, which bounds how long a cancelled worker can still run.
 - **Hedging** (the official MangaDex reader's scheme): an attempt on a URL that still has a later
   candidate runs on its own thread; if it has not finished within `HEDGE_DELAY` (5 s), the rest
   of the page's candidates start on a second thread and the first validated image wins. The
-  loser is not cancelled — it ends within the socket timeouts and its result is dropped. These
+  loser's request is not interrupted — it ends within the socket timeouts and its result is
+  dropped (a loser walking further URLs stops at its next cancel check once the run is cancelled). These
   lanes are dedicated short-lived threads, NEVER tasks on the download pool: the pool's workers
   block waiting for them, so lanes queued on the same fixed-size pool could deadlock.
 - **Dead hosts** (`DeadHosts`, one per `download_images_ordered` run): once a host has failed 3

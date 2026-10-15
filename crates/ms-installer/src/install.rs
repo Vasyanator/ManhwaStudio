@@ -12,7 +12,8 @@ Main responsibilities:
 - surface actions for a detected existing install, including launching, shortcut creation,
   reinstall, updating that installed executable, replacing the installed executable with the
   running one (executable ONLY), and running this copy standalone;
-- start background installer workers and consume their progress events;
+- start background installer workers and consume their progress events; the install / repair
+  worker shares `InstallerApp`'s cancel flag, set when the window closes (`Drop`);
 - persist the selected AI dependency level into the installed `user_config.json`
   (one `ms_docstore::update` of the install target's document);
 - expose startup service entry points used by `lib.rs`.
@@ -30,6 +31,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use web_time::Duration;
 #[cfg(target_os = "windows")]
@@ -941,6 +943,16 @@ struct InstallerApp {
     pending_ai_install_type: config::AiInstallType,
     invite_telegram: bool,
     invite_discord: bool,
+    /// Cancel flag shared with the install / repair worker; set when the window is dropped,
+    /// i.e. when it closes (the window does not block a close during the install), so a
+    /// download or a pip retry wait stops instead of running on behind a closed window.
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for InstallerApp {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl InstallerApp {
@@ -1013,6 +1025,7 @@ impl InstallerApp {
             pending_ai_install_type: config::AiInstallType::None,
             invite_telegram: true,
             invite_discord: false,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         match purpose {
             InstallerPurpose::FullInstall { .. } => {
@@ -1238,6 +1251,7 @@ impl InstallerApp {
         };
 
         let purpose = self.purpose;
+        let cancel = Arc::clone(&self.cancel);
         let _ = ms_thread::Builder::new()
             .name("mini-launcher-python-installer".to_string())
             .spawn(move || {
@@ -1249,12 +1263,14 @@ impl InstallerApp {
                         dependency_profile,
                         torch_selection,
                         &tx,
+                        &cancel,
                     ),
                     InstallerPurpose::EnvironmentRepair => run_environment_repair_worker(
                         root_dir,
                         dependency_profile,
                         torch_selection,
                         &tx,
+                        &cancel,
                     ),
                 };
                 let _ = tx.send(InstallEvent::Finished(result));

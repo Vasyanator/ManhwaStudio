@@ -8,6 +8,9 @@ FILE HEADER (cleaning/tools/aot.rs)
   - `AotParams`: параметры AOT для backend (`inpaint_size`).
   - `run_aot(...)`: конвертация region image + mask в PNG, отправка через v2 framed
     IPC (`inpaint.aot`) и разбор результата из RESPONSE BLOB.
+  - Model download (English): `run_aot` first ensures the AOT checkpoint through
+    `ai_models::ensure_aot` with the job's `EnsureCtx` (`draw_overlay_ui_custom_with_downloads`):
+    «Отменить обработку» / closing the editor stops the download, its events reach the job channel.
 - Поведение:
   - the region-selection gesture (`cleaning.region.select_rect`) on the canvas opens the region
     mask editor (через `RegionMaskInpaintToolBase`).
@@ -27,7 +30,7 @@ use ms_project::ProjectData;
 use ms_local_ai::backend_health::ai_backend_offline_error;
 use ms_widgets::WheelSlider;
 use ms_config as config;
-use ms_sysprobe::ai_models;
+use ms_sysprobe::ai_models::{self, EnsureCtx, ModelEnsureError};
 use eframe::egui;
 use super::region_png::{encode_color_image_png_rgba, encode_mask_png_luma};
 use serde_json::{Value, json};
@@ -65,10 +68,18 @@ impl Default for AotInpaintTool {
 }
 
 impl AotInpaintTool {
+    /// Runs AOT on the region (worker thread): ensures the checkpoint through `downloads`
+    /// (cancellable), then one `inpaint.aot` call. An empty mask returns the region unchanged.
+    ///
+    /// # Errors
+    /// A localized message for a size mismatch, a failed model download, a backend failure or a
+    /// malformed answer. A cancelled download becomes the "processing cancelled" sentence; it
+    /// only reaches a job the editor already dropped.
     fn run_aot(
         image: &egui::ColorImage,
         mask: &egui::ColorImage,
         params: AotParams,
+        downloads: &mut EnsureCtx<'_>,
     ) -> Result<egui::ColorImage, String> {
         if image.size != mask.size {
             return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
@@ -81,7 +92,10 @@ impl AotInpaintTool {
         if !mask.pixels.iter().any(|px| px.a() > 0) {
             return Ok(image.clone());
         }
-        ai_models::ensure_aot(&config::models_dir())?;
+        ai_models::ensure_aot(&config::models_dir(), downloads).map_err(|error| match error {
+            ModelEnsureError::Cancelled => t!("cleaning.mask_editor.processing_cancelled_status").to_string(),
+            ModelEnsureError::Failed(text) => text,
+        })?;
 
         let image_png = encode_color_image_png_rgba(image)?;
         let mask_png = encode_mask_png_luma(mask)?;
@@ -184,7 +198,7 @@ impl CleaningTool for AotInpaintTool {
             &mut self.params,
             &mut self.unload_status,
         );
-        inpaint_base.draw_overlay_ui_custom(
+        inpaint_base.draw_overlay_ui_custom_with_downloads(
             ctx,
             canvas,
             project,
@@ -192,7 +206,7 @@ impl CleaningTool for AotInpaintTool {
             t!("cleaning.tools.aot.title"),
             {
                 let params = *params;
-                move |image, mask| Self::run_aot(image, mask, params)
+                move |image, mask, downloads| Self::run_aot(image, mask, params, downloads)
             },
             move |ui| {
                 ui.separator();

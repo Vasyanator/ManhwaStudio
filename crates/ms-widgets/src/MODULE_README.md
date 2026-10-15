@@ -17,7 +17,7 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 ## Crate boundary
 `ms-widgets` is the reusable UI-primitive layer of the workspace. It knows NOTHING about the
 project domain: it may depend on `ms-config`, `ms-log`, `ms-i18n`, `ms-text-util`, `ms-sysprobe`,
-`ms-gifs`, `ms-thread`, `ms-theme` and `ms-fonts` (the last one native-only), and it may NOT depend on
+`ms-gifs`, `ms-thread`, `ms-theme`, `ms-fonts` and `ms-download` (the last two native-only), and it may NOT depend on
 `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the canvas, the tabs and the
 launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its
 crate-root leaves as `crate::ui_fonts` and `crate::bubble_status` (`input_util` has no root
@@ -85,7 +85,10 @@ crate's `[dev-dependencies]`, so no production build carries them.
   rejects — do not "fix" these back). The background worker compares `text_language()` each batch
   and downloads the active language's dictionary at most once per language
   (`download_attempted: HashSet<TextLanguage>`), so a failed download of one language never blocks
-  another. Per-word matching is language-first, script-second: a word in the active language's own
+  another. The download goes through `ms_download::fetch_small` (retry with capped backoff,
+  `Range` resume, timeouts, 32 MiB cap); both bodies are fetched first, then each file is written
+  temp + fsync + rename with `.dic` last, so discovery never pairs an incomplete download. It has no
+  cancel: the spellcheck worker lives for the whole process. Per-word matching is language-first, script-second: a word in the active language's own
   script is judged ONLY by that language's dictionary (a stale same-script dictionary left on disk,
   e.g. `uk_UA` after switching to Russian, must not vote), while a word of the other script is judged
   by any dictionary of that script so mixed-script text keeps working. If the active language's

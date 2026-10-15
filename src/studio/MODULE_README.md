@@ -264,7 +264,8 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
   клин autosave and takes the dirty клин snapshots (a failed write restores them via
   `restore_dirty_save_snapshots` and aborts), merges (`ms_project::save_merge`, with the per-page
   layer-manifest merge injected from `layer_model::persist`), resumes, and re-barriers; success
-  calls `AutosaveGate::force_flush`.
+  calls `AutosaveGate::force_flush`. A save worker the OS refuses aborts like the GUI-side aborts
+  (nothing merged, no `rx` stored, status shown).
 - Save-then-close (an exit dialog's «Сохранить главу»): arms the dialog's close action, then
   requests the save; Cancel clears the arm. The arm ends with THAT save (`ProjectSession::tick`):
   a clean success closes the dialog and requests the close; a failed, refused or aborted save, or a
@@ -272,9 +273,10 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
   save's own error). The OS close button never arms it.
 - `start_page_op`: flushes the bubble edits of all three canvases (same flush as the save), PS
   layers and typing text; `page_op_text_quiesce` refuses the op when edits stay unwritten or the
-  doc lock is poisoned (`NoLayersDir` / `NoLayerDoc` pass only when nothing was pending). Then
-  `StagingWriters::quiesce_for_page_op`: `force_flush`, клин autosave `request_stop_now`, its
-  thread handed over; the worker joins it, takes клин snapshots, pauses the bubbles saver,
+  doc lock is poisoned (`NoLayersDir` / `NoLayerDoc` pass only when nothing was pending). The
+  worker thread is then started PARKED (a refused thread refuses the op here, on the status line,
+  before any writer stops). Then `StagingWriters::quiesce_for_page_op`: `force_flush`, клин autosave `request_stop_now`, its
+  thread handed over through the worker's start channel; the worker joins it, takes клин snapshots, pauses the bubbles saver,
   barriers the layer saver (failed pages are logged as a warning, not an abort), writes the
   snapshots to staging and dispatches the engine. Page ops are not staged; the shell rebuilds the
   app from disk (`StudioOutput::ReloadRequested`).
@@ -283,7 +285,9 @@ The writers' own contracts: `crates/ms-models/src/MODULE_README.md`,
   layer edits); the project's dirty check (latched in `refresh_unsaved_changes_cache`, and read live
   by `SessionMode::has_unsaved_changes` outside a discard) and the image set's both read it, so a
   close with only such an edit pending still opens the exit dialog.
-- DISCARD (`start_exit_cleanup` = `StagingWriters::quiesce_discarding` + delete job): the quiesce
+- DISCARD (`start_exit_cleanup` = delete job started PARKED + `StagingWriters::quiesce_discarding`
+  + job released with the клин thread): a job thread the OS refuses refuses the discard before
+  anything is latched or stopped (dialog closed, status shown, session unsaved). The quiesce
   latches the discard first, DROPS (never flushes) typing's deferred edits,
   `shutdown_saver_discarding` on the layer saver, pauses the bubbles saver, `request_stop_now` on
   the клин autosave; then staging is deleted on a job that joins that thread.

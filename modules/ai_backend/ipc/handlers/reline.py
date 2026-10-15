@@ -25,6 +25,11 @@ Response fields for reline.process (status=ok):
     Full Reline service result object passed through verbatim (includes at
     least ``ok``); the processed PNG is written to ``output_path`` on disk.
     No image bytes cross the socket.
+
+Cancel: both methods hand ``cancel_event.is_set`` to the service as
+``should_cancel``, so a catalog fetch or a model download (and its retry waits)
+stops mid-flight; any service error raised while the event is set becomes
+``Interrupted``.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ import traceback
 from typing import Any
 
 from ..protocol import METHOD_RELINE_MODELS, METHOD_RELINE_PROCESS
-from ..registry import HandlerContext, register
+from ..registry import HandlerContext, Interrupted, register
 
 
 def _handle_reline_models(
@@ -47,10 +52,17 @@ def _handle_reline_models(
 
     Calls ``ctx.state.reline.list_models()`` and returns the list under
     ``models``.  No request fields; no blob in either direction.
+
+    Raises Interrupted when ``cancel_event`` is set before the call or while the
+    catalog fetch runs.
     """
+    if cancel_event.is_set():
+        raise Interrupted("reline.models canceled before start.")
     try:
-        models = ctx.state.reline.list_models()
+        models = ctx.state.reline.list_models(should_cancel=cancel_event.is_set)
     except Exception as exc:
+        if cancel_event.is_set():
+            raise Interrupted("reline.models canceled.") from None
         traceback.print_exc()
         raise RuntimeError(str(exc)) from exc
 
@@ -75,7 +87,12 @@ def _handle_reline_process(
 
     Returns the service result dict verbatim (opaque pass-through); only
     ``ok`` is guaranteed by the protocol.  No blob in either direction.
+
+    Raises Interrupted when ``cancel_event`` is set before the call or while a
+    model download it needs runs (the pipeline itself is not interruptible).
     """
+    if cancel_event.is_set():
+        raise Interrupted("reline.process canceled before start.")
     image_path_raw = header.get("image_path")
     if not isinstance(image_path_raw, str) or not image_path_raw.strip():
         raise ValueError("Field 'image_path' is required.")
@@ -100,6 +117,7 @@ def _handle_reline_process(
             image_path=image_path,
             output_path=output_path,
             params=params_raw,
+            should_cancel=cancel_event.is_set,
         )
     except (ValueError, FileNotFoundError):
         # Invalid input or missing file: propagate the original type so the
@@ -108,6 +126,8 @@ def _handle_reline_process(
         # both into response{status:error} on the wire regardless.
         raise
     except Exception as exc:
+        if cancel_event.is_set():
+            raise Interrupted("reline.process canceled.") from None
         traceback.print_exc()
         raise RuntimeError(str(exc)) from exc
 

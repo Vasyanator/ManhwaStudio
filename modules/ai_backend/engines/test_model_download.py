@@ -2,8 +2,8 @@
 File: modules/ai_backend/engines/test_model_download.py
 
 Purpose:
-Unit tests for the shared staged-download primitive used by `inpaint/flux_fill.py`
-and `watermark/service.py`.
+Unit tests for the shared staged-download primitive used by `inpaint/flux_fill.py`,
+`inpaint/flux2_download.py` and `watermark/service.py`.
 
 Main responsibilities:
 - verify a destination that is already on disk is not fetched again;
@@ -14,31 +14,42 @@ Main responsibilities:
   the staging file, a rejected or failed transfer leaves nothing behind, and a
   present destination is never replaced by a failed attempt;
 - verify calls for different destinations are not serialized against each other;
-- verify `stream_response_to_file` reports cumulative bytes and tolerates a
-  missing `Content-Length`, and that an appended (resumed) body counts from the
-  offset it was given rather than restarting at zero;
-- verify resume is OPT-IN: the default failure path still unlinks and parks
-  nothing, while `resumable=True` parks the partial under the stable `.part`
-  name, claims it back by an atomic rename that only one owner can win, and never
-  inherits a stale pid-scoped leftover;
+- verify `download_to_path`'s resume is OPT-IN: its default failure path still
+  unlinks and parks nothing, while a resumable transfer parks the partial under
+  the stable `.part` name, claims it back by an atomic rename that only one owner
+  can win, and never inherits a stale pid-scoped leftover;
+- verify `download_http_to_path` sends caller headers on every hop, follows an
+  interstitial INSIDE each attempt (a retry repeats the confirm step and resumes
+  with `Range`), refuses a follow loop, propagates a follow refusal, deletes
+  bytes its `verify` rejected, and with an unknown size trusts `Content-Length`;
+- verify `fetch_small_body` retries transient failures (including a short body),
+  gives up after the budget, never retries a permanent status, refuses a body
+  over its ceiling and stops on cancel during a backoff wait;
 - verify `download_bearer_to_path` builds the `Authorization: Bearer` header from
-  the token it is GIVEN, sends none for an empty token, skips a destination that
-  is already on disk, forwards the caller's `verify` gate so it runs on the
-  STAGED bytes before the publish, and — the cancellation contract both Hugging
-  Face callers rely on — leaves neither destination nor staging file behind when
-  the progress callback or the gate raises.
+  the token it is GIVEN (none for an empty token) with split `(15, 60)` timeouts;
+  treats a destination as present only at the expected size; retries connect
+  errors, timeouts, broken bodies, clean short bodies and 408 / 429 / 5xx with
+  capped exponential backoff (`Retry-After` honoured, capped) while RESUMING the
+  staged bytes; resets the budget after a retry that made progress; gives up
+  after the budget with the bytes kept; never retries a permanent status;
+  deletes the staged bytes only when they are proven wrong (overflow, a `206`
+  announcing another total, a sha256 mismatch); never appends a `206` that
+  starts elsewhere; never stages an answer that cannot be the file (a portal
+  page, a wrong `Content-Length`, a 200 to a resume without the full length),
+  keeps a partial until a from-zero restart is longer than it, measures
+  progress against the furthest byte ever staged; and stops at a chunk or within 100 ms of a backoff wait when
+  cancelled, parking the bytes.
 
 Notes:
 The network is never involved. `download_to_path` takes the transport as a
-callable and `stream_response_to_file` only needs an object with `headers` and
-`iter_content`; the `download_bearer_to_path` tests install a fake `requests`
-module in `sys.modules` for their duration, so the real one is never called.
+callable; the `download_http_to_path` / `download_bearer_to_path` tests inject a scripted `get` and
+a recording `sleep`, so neither the real transport nor the real clock is used.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
-import sys
 import tempfile
 import threading
 import time
@@ -182,249 +193,691 @@ class DownloadToPathTests(unittest.TestCase):
         self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
 
 
-class _FakeResponse:
-    """Minimal stand-in for a streaming `requests.Response`."""
+class _Step:
+    """One scripted server answer: a status, a body, headers, and how it ends.
 
-    def __init__(self, payload: bytes, *, content_length: str | None) -> None:
-        self._payload = payload
-        self.headers: dict[str, str] = {}
-        if content_length is not None:
-            self.headers["Content-Length"] = content_length
+    `raise_after` makes the body iterator raise that exception after yielding
+    the body (a dropped connection mid-transfer); `announce` overrides the
+    `Content-Length` so a body can claim more than it delivers and then end
+    NORMALLY (the clean-truncation case).
+    """
 
-    def iter_content(self, chunk_size: int = 1 << 20):
-        for start in range(0, len(self._payload), chunk_size):
-            yield self._payload[start : start + chunk_size]
-        # Keep-alive padding: `requests` can yield empty chunks, which must not
-        # be reported as progress.
-        yield b""
-
-
-class StreamResponseToFileTests(unittest.TestCase):
-    PAYLOAD = b"0123456789" * 300
-
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.dest = Path(tmp.name) / "blob.bin"
-        self.progress: list[tuple[int, int]] = []
-
-    def _on_chunk(self, done: int, expected: int) -> None:
-        self.progress.append((done, expected))
-
-    def test_body_is_written_and_progress_is_cumulative(self) -> None:
-        response = _FakeResponse(self.PAYLOAD, content_length=str(len(self.PAYLOAD)))
-        md.stream_response_to_file(response, self.dest, self._on_chunk, chunk_size=1024)
-
-        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
-        self.assertEqual([done for done, _ in self.progress], [1024, 2048, 3000])
-        self.assertEqual({expected for _, expected in self.progress}, {len(self.PAYLOAD)})
-
-    def test_a_missing_content_length_is_reported_as_zero(self) -> None:
-        response = _FakeResponse(self.PAYLOAD, content_length=None)
-        md.stream_response_to_file(response, self.dest, self._on_chunk)
-
-        self.assertEqual(self.progress, [(len(self.PAYLOAD), 0)])
-
-    def test_an_appended_body_counts_from_the_offset_it_was_given(self) -> None:
-        # A resumed transfer must report the WHOLE file's progress. Counting from
-        # zero would make an overall bar jump backwards and turn the first delta
-        # a consumer measures into a nonsense transfer rate.
-        self.dest.write_bytes(b"HEAD" * 250)  # 1000 bytes already on disk
-        tail = b"T" * 2000
-        response = _FakeResponse(tail, content_length=str(len(tail)))
-
-        md.stream_response_to_file(
-            response, self.dest, self._on_chunk, chunk_size=1000, mode="ab", initial_done=1000
-        )
-
-        self.assertEqual(self.dest.stat().st_size, 3000)
-        self.assertEqual([done for done, _ in self.progress], [2000, 3000])
-        # `expected` is the whole file, not just this range's length.
-        self.assertEqual({expected for _, expected in self.progress}, {3000})
-
-    def test_an_appended_body_without_a_content_length_reports_unknown(self) -> None:
-        self.dest.write_bytes(b"x" * 10)
-        response = _FakeResponse(b"y" * 20, content_length=None)
-
-        md.stream_response_to_file(
-            response, self.dest, self._on_chunk, mode="ab", initial_done=10
-        )
-
-        # `0` keeps meaning "the server did not say", rather than being mistaken
-        # for a total that happens to equal the offset.
-        self.assertEqual(self.progress, [(30, 0)])
-
-    def test_an_unwritable_destination_is_an_explicit_error(self) -> None:
-        response = _FakeResponse(self.PAYLOAD, content_length=None)
-        with self.assertRaises(RuntimeError) as caught:
-            md.stream_response_to_file(response, self.dest.parent / "missing" / "x.bin", self._on_chunk)
-
-        self.assertIn("x.bin", str(caught.exception))
+    def __init__(
+        self,
+        body: bytes = b"",
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+        announce: int | None = None,
+        raise_after: BaseException | None = None,
+        raise_on_get: BaseException | None = None,
+    ) -> None:
+        self.body = body
+        self.status = status
+        self.headers = dict(headers or {})
+        self.headers.setdefault("Content-Length", str(len(body) if announce is None else announce))
+        self.raise_after = raise_after
+        self.raise_on_get = raise_on_get
 
 
-class _BearerRequestsModule:
-    """`sys.modules['requests']` stand-in recording the headers of each GET."""
+class _ScriptedResponse:
+    """`requests.Response` surface the primitive uses, driven by one `_Step`."""
 
-    def __init__(self, payload: bytes, *, chunk: int = 1024) -> None:  # noqa: D107
-        self._payload = payload
+    def __init__(self, step: _Step, chunk: int) -> None:
+        self._step = step
         self._chunk = chunk
-        self.calls: list[tuple[str, dict[str, str]]] = []
+        self.status_code = step.status
+        self.headers = step.headers
+        # What an interstitial `follow` hook parses; latin-1 maps every byte.
+        self.text = step.body.decode("latin-1")
 
-    def get(self, url: str, **kwargs):
-        self.calls.append((url, dict(kwargs.get("headers") or {})))
-        return _BearerResponse(self._payload, self._chunk)
-
-
-class _BearerResponse(_FakeResponse):
-    """`_FakeResponse` plus the context-manager and status surface `requests.get` has."""
-
-    def __init__(self, payload: bytes, chunk: int) -> None:
-        super().__init__(payload, content_length=str(len(payload)))
-        self._chunk_hint = chunk
-
-    def __enter__(self) -> "_BearerResponse":
+    def __enter__(self) -> "_ScriptedResponse":
         return self
 
     def __exit__(self, *exc_info) -> None:
         return None
 
     def raise_for_status(self) -> None:
-        return None
+        import requests
+
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
 
     def iter_content(self, chunk_size: int = 1 << 20):
-        return super().iter_content(chunk_size=self._chunk_hint)
+        body = self._step.body
+        for start in range(0, len(body), self._chunk):
+            yield body[start : start + self._chunk]
+        if self._step.raise_after is not None:
+            raise self._step.raise_after
+
+
+class _ScriptedGet:
+    """Injected `get`: answers from a script and records every call's kwargs."""
+
+    def __init__(self, steps: list[_Step], *, chunk: int = 256) -> None:
+        self._steps = list(steps)
+        self._chunk = chunk
+        self.calls: list[dict] = []
+        self.urls: list[str] = []
+
+    def __call__(self, url: str, **kwargs) -> _ScriptedResponse:
+        self.calls.append(dict(kwargs))
+        self.urls.append(url)
+        if not self._steps:
+            raise AssertionError("more requests than the script allows")
+        step = self._steps.pop(0)
+        if step.raise_on_get is not None:
+            raise step.raise_on_get
+        return _ScriptedResponse(step, self._chunk)
+
+    @property
+    def ranges(self) -> list[str | None]:
+        """The `Range` header of each call, `None` when absent."""
+        return [(call.get("headers") or {}).get("Range") for call in self.calls]
+
+    @property
+    def remaining(self) -> int:
+        return len(self._steps)
+
+
+def _partial(body: bytes, *, start: int, total: int, **kwargs) -> _Step:
+    """A well-formed `206` continuing at `start` of a `total`-byte file."""
+    headers = {"Content-Range": f"bytes {start}-{start + len(body) - 1}/{total}"}
+    return _Step(body, status=206, headers=headers, **kwargs)
 
 
 class DownloadBearerToPathTests(unittest.TestCase):
-    """The Hugging Face composition: bearer header, staging, cancel-by-raising."""
+    """The Hugging Face transfer: header, retry, resume, size and hash gates, cancel."""
 
-    PAYLOAD = b"weights" * 512
+    PAYLOAD = bytes(range(256)) * 16  # 4096 bytes
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.dest = Path(tmp.name) / "shard.safetensors"
+        self.sleeps: list[float] = []
+        self.progress: list[tuple[int, int]] = []
+        self.retries: list[md.RetryEvent] = []
 
-    def _install(self, module: _BearerRequestsModule) -> None:
-        saved = sys.modules.get("requests")
-
-        def restore() -> None:
-            if saved is None:
-                sys.modules.pop("requests", None)
-            else:
-                sys.modules["requests"] = saved
-
-        self.addCleanup(restore)
-        sys.modules["requests"] = module
-
-    def test_the_token_becomes_a_bearer_header(self) -> None:
-        fake = _BearerRequestsModule(self.PAYLOAD)
-        self._install(fake)
-
-        seen: list[tuple[int, int]] = []
-        self.assertTrue(
-            md.download_bearer_to_path(
-                "https://example/x", self.dest, lambda d, e: seen.append((d, e)), token="tok"
-            )
+    def _run(self, get: _ScriptedGet, **overrides) -> bool:
+        kwargs = dict(
+            token="tok",
+            expected_size=len(self.PAYLOAD),
+            on_progress=lambda done, total: self.progress.append((done, total)),
+            on_retry=self.retries.append,
+            get=get,
+            sleep=self.sleeps.append,
         )
+        kwargs.update(overrides)
+        return md.download_bearer_to_path("https://example/x", self.dest, **kwargs)
+
+    def _parked(self) -> bytes:
+        return md.resumable_staging_path(self.dest).read_bytes()
+
+    # -- the plain path --------------------------------------------------
+    def test_the_token_becomes_a_bearer_header_with_split_timeouts(self) -> None:
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
+
+        self.assertTrue(self._run(get))
 
         self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
-        self.assertEqual(fake.calls[0][1].get("Authorization"), "Bearer tok")
-        self.assertEqual(seen[-1][0], len(self.PAYLOAD))
+        call = get.calls[0]
+        self.assertEqual(call["headers"].get("Authorization"), "Bearer tok")
+        self.assertEqual(call["timeout"], (md.CONNECT_TIMEOUT_S, md.READ_TIMEOUT_S))
+        self.assertEqual((md.CONNECT_TIMEOUT_S, md.READ_TIMEOUT_S), (15.0, 60.0))
+        self.assertTrue(call["stream"])
+        self.assertEqual(self.progress[-1], (len(self.PAYLOAD), len(self.PAYLOAD)))
+        self.assertFalse(list(self.dest.parent.glob("*.part")))
 
     def test_an_empty_token_sends_no_authorization_header(self) -> None:
-        fake = _BearerRequestsModule(self.PAYLOAD)
-        self._install(fake)
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
 
-        md.download_bearer_to_path("https://example/x", self.dest, lambda d, e: None, token="")
+        self._run(get, token="")
 
-        self.assertNotIn("Authorization", fake.calls[0][1])
+        self.assertNotIn("Authorization", get.calls[0]["headers"])
 
-    def test_a_present_destination_is_not_refetched(self) -> None:
-        self.dest.parent.mkdir(parents=True, exist_ok=True)
-        self.dest.write_bytes(b"already here")
-        fake = _BearerRequestsModule(self.PAYLOAD)
-        self._install(fake)
+    def test_a_destination_at_the_expected_size_is_not_refetched(self) -> None:
+        self.dest.write_bytes(self.PAYLOAD)
+        get = _ScriptedGet([])
 
-        self.assertFalse(
-            md.download_bearer_to_path("https://example/x", self.dest, lambda d, e: None, token="t")
-        )
-        self.assertEqual(fake.calls, [])
+        self.assertFalse(self._run(get))
+        self.assertEqual(get.calls, [])
 
-    def test_the_verify_gate_is_forwarded_and_runs_before_the_publish(self) -> None:
-        # Without forwarding, a body that ends cleanly but SHORT is published
-        # under the final name and is then indistinguishable from a complete
-        # file. The gate is the caller's only chance to notice.
-        fake = _BearerRequestsModule(self.PAYLOAD)
-        self._install(fake)
-        staged: list[int] = []
+    def test_a_destination_at_the_wrong_size_is_refetched_and_replaced(self) -> None:
+        self.dest.write_bytes(b"short")
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
 
-        def verify(path: Path) -> None:
-            staged.append(path.stat().st_size)
-            raise RuntimeError("wrong length")
-
-        with self.assertRaises(RuntimeError):
-            md.download_bearer_to_path(
-                "https://example/x", self.dest, lambda d, e: None, token="t", verify=verify
-            )
-
-        self.assertEqual(staged, [len(self.PAYLOAD)])
-        self.assertFalse(self.dest.exists())
-        self.assertFalse(list(self.dest.parent.glob("*.part")))
-
-    def test_a_passing_verify_publishes(self) -> None:
-        fake = _BearerRequestsModule(self.PAYLOAD)
-        self._install(fake)
-
-        def verify(path: Path) -> None:
-            if path.stat().st_size != len(self.PAYLOAD):
-                raise RuntimeError("wrong length")
-
-        self.assertTrue(
-            md.download_bearer_to_path(
-                "https://example/x", self.dest, lambda d, e: None, token="t", verify=verify
-            )
-        )
+        self.assertTrue(self._run(get))
         self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
 
-    def test_a_failure_unlinks_by_default_and_parks_nothing(self) -> None:
-        # Resume is OPT-IN. The default must keep the semantics `flux_fill.py`
-        # has always had, under BOTH staging names.
-        fake = _BearerRequestsModule(self.PAYLOAD)
-        self._install(fake)
+    def test_an_unknown_size_falls_back_to_non_empty_presence(self) -> None:
+        self.dest.write_bytes(b"short")
+        get = _ScriptedGet([])
 
-        def on_chunk(done: int, expected: int) -> None:
-            raise RuntimeError("dropped")
+        self.assertFalse(self._run(get, expected_size=0))
 
-        with self.assertRaises(RuntimeError):
-            md.download_bearer_to_path("https://example/x", self.dest, on_chunk, token="t")
+    # -- transient failures: retry + resume ------------------------------
+    def test_a_dropped_connection_is_retried_and_resumed(self) -> None:
+        import requests
+
+        get = _ScriptedGet([
+            _Step(self.PAYLOAD[:1000], announce=4096, raise_after=requests.exceptions.ChunkedEncodingError("reset")),
+            _partial(self.PAYLOAD[1000:], start=1000, total=4096),
+        ], chunk=100)
+
+        self.assertTrue(self._run(get))
+
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, [None, "bytes=1000-"])
+        self.assertEqual(len(self.retries), 1)
+        event = self.retries[0]
+        self.assertEqual((event.attempt, event.max_attempts), (1, 5))
+        self.assertEqual(event.staged_bytes, 1000)
+        self.assertEqual(event.delay_s, 2.0)
+        self.assertAlmostEqual(sum(self.sleeps), 2.0)
+        # Cancel is polled in 100 ms slices of the wait.
+        self.assertTrue(all(step <= 0.1 + 1e-9 for step in self.sleeps))
+        # Progress resumes at the staged offset instead of jumping back to zero.
+        dones = [done for done, _total in self.progress]
+        self.assertEqual(dones, sorted(dones))
+
+    def test_a_clean_short_body_is_resumed(self) -> None:
+        get = _ScriptedGet([
+            _Step(self.PAYLOAD[:3000], announce=4096),
+            _partial(self.PAYLOAD[3000:], start=3000, total=4096),
+        ])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, [None, "bytes=3000-"])
+
+    def test_connect_errors_timeouts_and_5xx_are_transient_and_retry_after_is_honoured(self) -> None:
+        import requests
+
+        get = _ScriptedGet([
+            _Step(raise_on_get=requests.exceptions.ConnectionError("dns")),
+            _Step(raise_on_get=requests.exceptions.ReadTimeout("slow")),
+            _Step(status=503, headers={"Retry-After": "7"}),
+            _Step(status=429, headers={"Retry-After": "600"}),
+            _Step(status=408),
+            _Step(self.PAYLOAD),
+        ])
+
+        self.assertTrue(self._run(get))
+
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual([event.delay_s for event in self.retries], [2.0, 4.0, 7.0, 60.0, 30.0])
+        self.assertEqual([event.attempt for event in self.retries], [1, 2, 3, 4, 5])
+
+    def test_the_budget_runs_out_without_progress_and_keeps_the_bytes(self) -> None:
+        import requests
+
+        steps = [_Step(self.PAYLOAD[:500], announce=4096, raise_after=requests.exceptions.ConnectionError("reset"))]
+        steps += [_Step(status=502) for _ in range(5)]
+        get = _ScriptedGet(steps)
+
+        with self.assertRaises(md.RetriesExhaustedError) as caught:
+            self._run(get)
+
+        self.assertIsInstance(caught.exception, RuntimeError)
+        self.assertNotIn("tok", str(caught.exception))
+        self.assertEqual(len(get.calls), 6)
+        self.assertEqual(len(self.retries), 5)
+        self.assertFalse(self.dest.exists())
+        # A transient failure never deletes staged bytes: the next run resumes.
+        self.assertEqual(self._parked(), self.PAYLOAD[:500])
+
+    def test_the_budget_resets_after_a_retry_that_made_progress(self) -> None:
+        import requests
+
+        reset = requests.exceptions.ConnectionError("reset")
+        # Four failures without progress, then one that stages bytes (which
+        # restarts the count at 1), then four more: nine failures in all, which
+        # a lifetime budget of five would have refused at the sixth.
+        steps = [_Step(status=500) for _ in range(4)]
+        steps.append(_Step(self.PAYLOAD[:1000], announce=4096, raise_after=reset))
+        steps += [_Step(status=500) for _ in range(4)]
+        steps.append(_partial(self.PAYLOAD[1000:], start=1000, total=4096))
+        get = _ScriptedGet(steps)
+
+        self.assertTrue(self._run(get))
+
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual([event.attempt for event in self.retries], [1, 2, 3, 4, 1, 2, 3, 4, 5])
+        self.assertEqual(get.remaining, 0)
+
+    # -- permanent failures ----------------------------------------------
+    def test_a_permanent_status_is_not_retried(self) -> None:
+        import requests
+
+        get = _ScriptedGet([_Step(status=401), _Step(self.PAYLOAD)])
+
+        with self.assertRaises(requests.HTTPError):
+            self._run(get)
+
+        self.assertEqual(len(get.calls), 1)
+        self.assertEqual(self.retries, [])
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_body_longer_than_expected_deletes_the_staged_bytes(self) -> None:
+        # The length header matches, the body then delivers more: proven wrong.
+        get = _ScriptedGet([_Step(self.PAYLOAD + b"extra", announce=4096)])
+
+        with self.assertRaises(md.SizeMismatchError) as caught:
+            self._run(get)
+
+        self.assertEqual(caught.exception.expected, 4096)
+        self.assertEqual(len(get.calls), 1)
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(list(self.dest.parent.glob("*.part")))
+        # The user-facing text names the model file, never the pid staging file.
+        self.assertIn(self.dest.name, str(caught.exception))
+        self.assertNotIn(".part", str(caught.exception))
+
+    # -- answers that cannot be the file (M1) -------------------------------
+    HTML = b"<html>blocked</html>" * 10
+
+    def _portal(self) -> _Step:
+        return _Step(self.HTML, headers={"Content-Type": "text/html"})
+
+    def test_a_portal_page_is_never_staged_or_completed_by_a_resume(self) -> None:
+        # The probe scenario: a 200 block page, then the real server. The page
+        # must not become a staged prefix that a `Range` resume completes.
+        get = _ScriptedGet([self._portal(), _Step(self.PAYLOAD)])
+
+        self.assertTrue(self._run(get))
+
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, [None, None])
+        self.assertEqual(len(self.retries), 1)
+        self.assertEqual(self.retries[0].staged_bytes, 0)
+
+    def test_an_html_page_without_a_length_is_refused(self) -> None:
+        page = _Step(self.HTML, headers={"Content-Type": "text/html; charset=utf-8"})
+        page.headers.pop("Content-Length")
+        get = _ScriptedGet([page, _Step(self.PAYLOAD)])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+
+    def test_a_portal_answer_to_a_resume_leaves_the_partial_untouched(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(self.PAYLOAD[:3000])
+        get = _ScriptedGet([self._portal() for _ in range(6)])
+
+        with self.assertRaises(md.RetriesExhaustedError):
+            self._run(get)
+
+        self.assertEqual(self._parked(), self.PAYLOAD[:3000])
+        self.assertEqual(get.ranges, ["bytes=3000-"] * 6)
+
+    def test_a_200_to_a_resume_without_a_length_is_refused(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(self.PAYLOAD[:3000])
+        bare = _Step(self.PAYLOAD)
+        bare.headers.pop("Content-Length")
+        get = _ScriptedGet([bare, _partial(self.PAYLOAD[3000:], start=3000, total=4096)])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, ["bytes=3000-", "bytes=3000-"])
+
+    def test_a_206_whose_length_does_not_end_the_file_is_refused(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(self.PAYLOAD[:1000])
+        wrong = _partial(self.PAYLOAD[1000:2000], start=1000, total=4096)
+        get = _ScriptedGet([wrong, _partial(self.PAYLOAD[1000:], start=1000, total=4096)])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(len(self.retries), 1)
+
+    def test_a_restart_that_fails_early_keeps_the_longer_partial(self) -> None:
+        import requests
+
+        md.resumable_staging_path(self.dest).write_bytes(self.PAYLOAD[:2000])
+        # The server ignores the range (full-length 200) and drops at 1000
+        # bytes: shorter than the partial, so the partial must survive.
+        dropped = _Step(self.PAYLOAD[:1000], announce=4096, raise_after=requests.ConnectionError("reset"))
+        get = _ScriptedGet([dropped, _partial(self.PAYLOAD[2000:], start=2000, total=4096)])
+
+        self.assertTrue(self._run(get))
+
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, ["bytes=2000-", "bytes=2000-"])
+        self.assertEqual(self.retries[0].staged_bytes, 2000)
+        self.assertFalse(list(self.dest.parent.glob("*.restart")))
+
+    def test_a_restart_that_passes_the_partial_replaces_it(self) -> None:
+        import requests
+
+        md.resumable_staging_path(self.dest).write_bytes(b"?" * 1000)
+        dropped = _Step(self.PAYLOAD[:3000], announce=4096, raise_after=requests.ConnectionError("reset"))
+        get = _ScriptedGet([dropped, _partial(self.PAYLOAD[3000:], start=3000, total=4096)])
+
+        self.assertTrue(self._run(get))
+
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, ["bytes=1000-", "bytes=3000-"])
+
+    def test_progress_is_measured_against_the_furthest_byte_ever_staged(self) -> None:
+        import requests
+
+        # 1000 bytes staged, then the server keeps refusing the range (416, a
+        # restart from zero) and dropping at 500: never beyond the high-water
+        # mark, so the budget runs out instead of resetting forever.
+        def drop(at: int) -> _Step:
+            return _Step(self.PAYLOAD[:at], announce=4096, raise_after=requests.ConnectionError("reset"))
+
+        steps = [drop(1000)]
+        for _ in range(5):
+            steps += [_Step(status=416), drop(500)]
+        get = _ScriptedGet(steps)
+
+        with self.assertRaises(md.RetriesExhaustedError):
+            self._run(get)
+
+        self.assertEqual([event.attempt for event in self.retries], [1, 2, 3, 4, 5])
+        self.assertEqual(get.remaining, 0)
+
+    def test_a_206_announcing_another_total_deletes_the_staged_bytes(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(self.PAYLOAD[:1000])
+        get = _ScriptedGet([_partial(self.PAYLOAD[1000:], start=1000, total=9999)])
+
+        with self.assertRaises(md.SizeMismatchError) as caught:
+            self._run(get)
+
+        self.assertEqual(caught.exception.actual, 9999)
+        self.assertFalse(list(self.dest.parent.glob("*.part")))
+
+    def test_a_sha256_mismatch_deletes_the_staged_bytes(self) -> None:
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
+
+        with self.assertRaises(md.HashMismatchError):
+            self._run(get, expected_sha256="0" * 64)
 
         self.assertFalse(self.dest.exists())
         self.assertFalse(list(self.dest.parent.glob("*.part")))
-        self.assertEqual(md.staged_bytes(self.dest), 0)
 
-    def test_a_resumable_failure_parks_the_partial_under_the_stable_name(self) -> None:
-        fake = _BearerRequestsModule(self.PAYLOAD, chunk=64)
-        self._install(fake)
-        seen: list[int] = []
+    def test_a_matching_sha256_publishes(self) -> None:
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
 
-        def on_chunk(done: int, expected: int) -> None:
-            seen.append(done)
-            if len(seen) >= 3:
-                raise RuntimeError("dropped")
+        self.assertTrue(self._run(get, expected_sha256=hashlib.sha256(self.PAYLOAD).hexdigest().upper()))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
 
-        with self.assertRaises(RuntimeError):
-            md.download_bearer_to_path(
-                "https://example/x", self.dest, on_chunk, token="t", resumable=True
-            )
+    # -- resume answers ---------------------------------------------------
+    def test_a_parked_partial_is_resumed_with_range(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(self.PAYLOAD[:1000])
+        get = _ScriptedGet([_partial(self.PAYLOAD[1000:], start=1000, total=4096)])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, ["bytes=1000-"])
+        self.assertEqual(self.progress[0][0], 1000 + 256)
+
+    def test_a_206_starting_elsewhere_is_never_appended(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(self.PAYLOAD[:1000])
+        get = _ScriptedGet([
+            _partial(self.PAYLOAD[500:], start=500, total=4096),
+            _Step(self.PAYLOAD),
+        ])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, ["bytes=1000-", None])
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_server_ignoring_the_range_rewrites_from_zero(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(b"?" * 1000)
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+
+    def test_a_416_discards_and_refetches_at_once(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(b"?" * 1000)
+        get = _ScriptedGet([_Step(status=416), _Step(self.PAYLOAD)])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, ["bytes=1000-", None])
+        self.assertEqual(self.retries, [])
+
+    def test_leftovers_longer_than_expected_are_dropped_before_any_request(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(b"?" * 5000)
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(get.ranges, [None])
+
+    def test_a_complete_staged_file_is_published_without_a_request(self) -> None:
+        md.resumable_staging_path(self.dest).write_bytes(self.PAYLOAD)
+        get = _ScriptedGet([])
+
+        self.assertTrue(self._run(get))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+
+    # -- cancellation -----------------------------------------------------
+    def test_a_cancel_during_the_backoff_wait_stops_and_parks(self) -> None:
+        get = _ScriptedGet([_Step(self.PAYLOAD[:700], announce=4096), _Step(self.PAYLOAD)])
+
+        def should_cancel() -> bool:
+            return len(self.sleeps) >= 3
+
+        with self.assertRaises(md.DownloadCancelled) as caught:
+            self._run(get, should_cancel=should_cancel)
+
+        self.assertNotIsInstance(caught.exception, RuntimeError)
+        # Stopped three 100 ms slices into a 2 s wait, never reaching the retry.
+        self.assertEqual(len(self.sleeps), 3)
+        self.assertEqual(len(get.calls), 1)
+        self.assertEqual(self._parked(), self.PAYLOAD[:700])
+
+    def test_a_cancel_during_the_transfer_stops_at_a_chunk_and_parks(self) -> None:
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
+
+        with self.assertRaises(md.DownloadCancelled):
+            self._run(get, should_cancel=lambda: len(self.progress) >= 2)
 
         self.assertFalse(self.dest.exists())
-        parked = md.resumable_staging_path(self.dest)
-        self.assertTrue(parked.is_file())
-        self.assertEqual(parked.stat().st_size, seen[-1])
-        self.assertEqual(md.staged_bytes(self.dest), seen[-1])
+        self.assertEqual(self._parked(), self.PAYLOAD[:512])
+
+    def test_a_raising_progress_callback_aborts_and_parks(self) -> None:
+        class _Stop(Exception):
+            pass
+
+        def on_progress(done: int, total: int) -> None:
+            raise _Stop()
+
+        get = _ScriptedGet([_Step(self.PAYLOAD)])
+        with self.assertRaises(_Stop):
+            self._run(get, on_progress=on_progress)
+
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(self._parked(), self.PAYLOAD[:256])
         # The pid-scoped name is free again: a parked partial has one owner.
         self.assertFalse(md.staging_path(self.dest).exists())
+
+    # -- policy and labels -------------------------------------------------
+    def test_backoff_is_exponential_and_capped(self) -> None:
+        policy = md.RetryPolicy()
+        self.assertEqual([policy.delay_for(n, None) for n in range(1, 7)], [2.0, 4.0, 8.0, 16.0, 30.0, 30.0])
+        self.assertEqual(policy.delay_for(1, 90.0), 60.0)
+
+    def test_the_retry_label_names_the_wait_the_attempt_and_the_file(self) -> None:
+        event = md.RetryEvent(attempt=2, max_attempts=5, delay_s=4.0, staged_bytes=10, reason="HTTP 503")
+        label = md.retry_progress_label("vae/model.safetensors", event)
+        self.assertIn("4", label)
+        self.assertIn("2/5", label)
+        self.assertTrue(label.endswith("vae/model.safetensors"))
+
+
+class DownloadHttpToPathTests(unittest.TestCase):
+    """The generic transfer's seams: extra headers, the interstitial hook, `verify`."""
+
+    PAYLOAD = b"PK\x03\x04" + bytes(range(256)) * 8
+    PAGE = b"<html><form><input name=confirm value=abc></form></html>"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dest = Path(tmp.name) / "weights.pth"
+        self.sleeps: list[float] = []
+
+    def _run(self, get: _ScriptedGet, **overrides) -> bool:
+        kwargs = dict(
+            expected_size=len(self.PAYLOAD),
+            on_progress=lambda _done, _total: None,
+            get=get,
+            sleep=self.sleeps.append,
+        )
+        kwargs.update(overrides)
+        return md.download_http_to_path("https://example/first", self.dest, **kwargs)
+
+    @staticmethod
+    def _confirm_follow(response, hop: int) -> str | None:
+        if "text/html" not in response.headers.get("Content-Type", ""):
+            return None
+        return f"https://example/confirmed?hop={hop}"
+
+    def _page(self) -> _Step:
+        return _Step(self.PAGE, headers={"Content-Type": "text/html"})
+
+    def test_extra_headers_are_sent_on_every_hop_without_authorization(self) -> None:
+        get = _ScriptedGet([self._page(), _Step(self.PAYLOAD)])
+
+        self.assertTrue(self._run(get, headers={"User-Agent": "UA/1"}, follow=self._confirm_follow))
+
+        self.assertEqual(get.urls, ["https://example/first", "https://example/confirmed?hop=0"])
+        for call in get.calls:
+            self.assertEqual(call["headers"].get("User-Agent"), "UA/1")
+            self.assertNotIn("Authorization", call["headers"])
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+
+    def test_a_retry_repeats_the_confirm_step_and_resumes_with_range(self) -> None:
+        half = len(self.PAYLOAD) // 2
+        import requests
+
+        get = _ScriptedGet([
+            self._page(),
+            _Step(self.PAYLOAD[:half], announce=len(self.PAYLOAD), raise_after=requests.ConnectionError("reset")),
+            self._page(),
+            _partial(self.PAYLOAD[half:], start=half, total=len(self.PAYLOAD)),
+        ])
+
+        self.assertTrue(self._run(get, follow=self._confirm_follow))
+
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+        self.assertEqual(get.ranges, [None, None, f"bytes={half}-", f"bytes={half}-"])
+        self.assertAlmostEqual(sum(self.sleeps), md.RetryPolicy().delay_for(1, None))
+
+    def test_a_follow_that_never_ends_is_a_permanent_error(self) -> None:
+        get = _ScriptedGet([self._page() for _ in range(md._MAX_FOLLOW_HOPS + 1)])
+
+        with self.assertRaises(md.DownloadError):
+            self._run(get, follow=self._confirm_follow)
+
+        self.assertEqual(get.remaining, 0)
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_follow_refusal_propagates_unchanged(self) -> None:
+        class _Refused(RuntimeError):
+            pass
+
+        def refuse(_response, hop: int) -> str | None:
+            raise _Refused(f"hop {hop}")
+
+        with self.assertRaises(_Refused):
+            self._run(_ScriptedGet([_Step(self.PAYLOAD)]), follow=refuse)
+
+    def test_a_verify_rejection_deletes_the_bytes_instead_of_parking_them(self) -> None:
+        def reject(_staging: Path) -> None:
+            raise RuntimeError("not a checkpoint")
+
+        with self.assertRaises(RuntimeError):
+            self._run(_ScriptedGet([_Step(self.PAYLOAD)]), verify=reject)
+
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(md.staged_bytes(self.dest), 0)
+        self.assertFalse(list(self.dest.parent.glob("*.part")))
+
+    def test_an_unknown_size_trusts_the_announced_length(self) -> None:
+        import requests
+
+        get = _ScriptedGet([
+            _Step(self.PAYLOAD[:100], announce=len(self.PAYLOAD), raise_after=requests.ConnectionError("x")),
+            _partial(self.PAYLOAD[100:], start=100, total=len(self.PAYLOAD)),
+        ])
+
+        self.assertTrue(self._run(get, expected_size=0))
+        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
+
+
+class FetchSmallBodyTests(unittest.TestCase):
+    """The in-memory GET for catalogs: same retry rules, no staging."""
+
+    BODY = b'[{"filename": "a.pth"}]'
+
+    def setUp(self) -> None:
+        self.sleeps: list[float] = []
+        self.retries: list[md.RetryEvent] = []
+
+    def _fetch(self, get: _ScriptedGet, **overrides) -> bytes:
+        kwargs = dict(label="catalog", get=get, sleep=self.sleeps.append, on_retry=self.retries.append)
+        kwargs.update(overrides)
+        return md.fetch_small_body("https://example/catalog", **kwargs)
+
+    def test_a_transient_failure_is_retried_and_the_body_returned(self) -> None:
+        import requests
+
+        get = _ScriptedGet([
+            _Step(raise_on_get=requests.ConnectionError("dns")),
+            _Step(self.BODY[:5], announce=len(self.BODY)),
+            _Step(self.BODY),
+        ])
+
+        self.assertEqual(self._fetch(get, headers={"User-Agent": "UA"}), self.BODY)
+
+        self.assertEqual([event.attempt for event in self.retries], [1, 2])
+        self.assertEqual(get.calls[0]["timeout"], (md.CONNECT_TIMEOUT_S, md.READ_TIMEOUT_S))
+        self.assertEqual(get.calls[-1]["headers"], {"User-Agent": "UA"})
+
+    def test_the_budget_runs_out(self) -> None:
+        get = _ScriptedGet([_Step(status=503) for _ in range(6)])
+
+        with self.assertRaises(md.RetriesExhaustedError):
+            self._fetch(get)
+        self.assertEqual(len(self.retries), 5)
+
+    def test_a_permanent_status_is_not_retried(self) -> None:
+        import requests
+
+        with self.assertRaises(requests.HTTPError):
+            self._fetch(_ScriptedGet([_Step(status=404)]))
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_body_over_the_ceiling_is_refused(self) -> None:
+        with self.assertRaises(md.DownloadError):
+            self._fetch(_ScriptedGet([_Step(b"x" * 1000)]), max_bytes=100)
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_cancel_during_the_backoff_wait_stops(self) -> None:
+        flag = {"cancel": False}
+
+        def sleep(seconds: float) -> None:
+            self.sleeps.append(seconds)
+            flag["cancel"] = True
+
+        with self.assertRaises(md.DownloadCancelled):
+            self._fetch(_ScriptedGet([_Step(status=503)]), sleep=sleep, should_cancel=lambda: flag["cancel"])
+        self.assertEqual(len(self.sleeps), 1)
+
+
+class StagingHelperTests(unittest.TestCase):
+    """The resumable-staging claim, park and discard helpers."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dest = Path(tmp.name) / "shard.safetensors"
 
     def test_claiming_a_parked_partial_is_a_rename_so_only_one_owner_wins(self) -> None:
         staging = md.staging_path(self.dest)
@@ -453,25 +906,6 @@ class DownloadBearerToPathTests(unittest.TestCase):
         self.assertFalse(md.staging_path(self.dest).exists())
         self.assertFalse(md.resumable_staging_path(self.dest).exists())
         self.assertEqual(md.staged_bytes(self.dest), 0)
-
-    def test_a_raising_progress_callback_aborts_and_leaves_nothing_behind(self) -> None:
-        # This is the supported cancellation mechanism: `stream_response_to_file`
-        # has no cancel hook, so the caller raises from `on_chunk` and the
-        # staging file must not survive it.
-        fake = _BearerRequestsModule(self.PAYLOAD)
-        self._install(fake)
-
-        class _Stop(Exception):
-            pass
-
-        def on_chunk(done: int, expected: int) -> None:
-            raise _Stop()
-
-        with self.assertRaises(_Stop):
-            md.download_bearer_to_path("https://example/x", self.dest, on_chunk, token="t")
-
-        self.assertFalse(self.dest.exists())
-        self.assertFalse(list(self.dest.parent.glob("*.part")))
 
 
 if __name__ == "__main__":

@@ -77,7 +77,8 @@ status lines. Nothing here is behind a fold except the parameters, which open by
   handed over can disagree, and the user must be told which rule broke.
 - **Nothing blocks the GUI thread.** The settings load and save, the model scan, the unload call
   and the run itself all live on `ms_thread::spawn` workers; `poll` only drains channels. The
-  ensure-before-run step is on the run worker because it may download hundreds of megabytes.
+  ensure-before-run step is on the run worker because it may download hundreds of megabytes;
+  that download is drawn by `draw_progress` (the host's Cancel stops it).
 - **`poll` is the only writer of the settings file.** The saver runs there and writes on the
   first poll a save is due on — there is no time debounce — gated by
   `settings_save_due(dirty, settings_loaded, save_in_flight)`: a write before the initial load
@@ -90,9 +91,12 @@ status lines. Nothing here is behind a fold except the parameters, which open by
   price of never losing a visible edit.
 - **The parameters of the UNSELECTED method are persisted too.** Switching model and back must
   not reset the other method's values, so one settings file carries all of them.
-- **There is no progress and no backend-side cancel.** Both methods are plain request/response
-  calls: no streamed frames to draw a bar from, and the plain `Client::call` never hands out the
-  request id `Client::cancel` needs. `cancel` detaches the answer; the backend finishes the pass.
+- **There is no backend progress and no backend-side cancel.** Both methods are plain
+  request/response calls: no streamed frames to draw a bar from, and the plain `Client::call`
+  never hands out the request id `Client::cancel` needs. `cancel` detaches the answer; the
+  backend finishes the pass. The ensure-before-run checkpoint DOWNLOAD is cancellable: the run
+  is an `EngineRunJob` (`../run_job.rs`), whose drop — `cancel`, or the engine's own drop —
+  sets the flag `ai_models::ensure_*` polls; its events reach the job channel, not drawn yet.
   `poll` calls `ctx.request_repaint()` while a run is in flight, or a finished run would sit in
   the channel until the next click.
 - **The catalog is shared with the sibling `../sdxl/` engine, and only in its LaMa-v2 VIEW.** Its

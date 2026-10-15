@@ -20,6 +20,12 @@ FILE HEADER (cleaning/tools/base.rs)
     custom-UI callback внутри окна редактора (для инструмент-специфичных параметров). Для отдельных
     инструментов есть расширенный режим второй маски (например, маска области примера).
     Вызов `run(image, mask[, sample_mask])` выполняется в фоне (worker-thread), результат поллится в UI.
+    Cancel (English): a run is a `RegionInpaintJob` (channel + cancel flag); «Отменить обработку»
+    and closing the editor drop it, which sets the flag. A tool whose run downloads an
+    app-managed model (AOT) uses `draw_overlay_ui_custom_with_downloads`, whose `run` gets an
+    `ai_models::EnsureCtx` carrying that flag and a sink whose events reach the job channel
+    (`RegionInpaintJobResult::ModelDownload`; the job keeps the latest and the editor body draws
+    it through `ms_tab_translation::model_download_status`); the other entry points ignore it.
     The «Сгенерировать маску» button, its source catalog, its worker and the whole watermark
     plumbing live in the shared `mask_generation` module, NOT here: this base owns only the
     `MaskGenerationState` it hands that module and the mask layer the answer is written into.
@@ -88,9 +94,11 @@ use ms_models::SessionCapabilities;
 use ms_models::clean_overlays_model::CleanOverlaysModel;
 use ms_project::ProjectData;
 use super::mask_generation::{
-    self, GeneratedMask, MaskGenerationParams, MaskGenerationPoll, MaskGenerationState, MaskSource,
+    self, MaskGenerationJob, MaskGenerationParams, MaskGenerationPoll, MaskGenerationState, MaskSource,
     WatermarkProgress,
 };
+use ms_sysprobe::ai_models::{EnsureCtx, ModelDownloadEvent};
+use ms_tab_translation::model_download_status::{ModelDownloadStatus, draw_model_download_status};
 use crate::input::{self, CleaningLabels, StrokeModes};
 use ms_input::{ActionId, ContextId, HitPhase, InputFrame, ViewId, ViewSurface, view};
 use ms_tools::MaskBrush;
@@ -99,6 +107,7 @@ use eframe::egui;
 use egui::{Color32, Pos2, Rect, TextureHandle, TextureOptions};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
@@ -1744,18 +1753,44 @@ struct RegionInpaintRunSource {
     sample_mask: Option<egui::ColorImage>,
 }
 
+/// The worker body of one run: region image, removal mask, optional sample mask, and the job's
+/// download context (cancel flag + event sink; ignored by runs that download nothing).
 type RegionInpaintRunFn = dyn Fn(
         &egui::ColorImage,
         &egui::ColorImage,
         Option<&egui::ColorImage>,
+        &mut EnsureCtx<'_>,
     ) -> Result<egui::ColorImage, String>
     + Send
     + Sync
     + 'static;
 
-struct RegionInpaintJobResult {
-    source: RegionInpaintRunSource,
-    result: Result<egui::ColorImage, String>,
+/// One message of a run's worker.
+enum RegionInpaintJobResult {
+    /// A (thinned) model-download event of the run; drained by the poll into the job's latest
+    /// download, drawn under the mask-generation progress.
+    ModelDownload(ModelDownloadEvent),
+    /// The run's answer for `source`; the last message of a job.
+    Finished {
+        source: RegionInpaintRunSource,
+        result: Result<egui::ColorImage, String>,
+    },
+}
+
+/// A running region-inpaint job. Dropping it («Отменить обработку», closing the editor) sets
+/// the cancel flag, so a model download the run performs stops; the backend call itself is not
+/// interruptible and its answer is discarded on arrival.
+struct RegionInpaintJob {
+    rx: Receiver<RegionInpaintJobResult>,
+    cancel: Arc<AtomicBool>,
+    /// Latest model download of the run (AOT), shown while it is in progress.
+    download: ModelDownloadStatus,
+}
+
+impl Drop for RegionInpaintJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 struct RegionInpaintEditorState {
@@ -1771,8 +1806,8 @@ struct RegionInpaintEditorState {
     last_drag_px: Option<(i32, i32)>,
     undo_stack: Vec<RegionInpaintRunSource>,
     rerun_source: Option<RegionInpaintRunSource>,
-    processing_rx: Option<Receiver<RegionInpaintJobResult>>,
-    mask_generation_rx: Option<Receiver<Result<GeneratedMask, String>>>,
+    processing_rx: Option<RegionInpaintJob>,
+    mask_generation_rx: Option<MaskGenerationJob>,
 }
 
 impl RegionInpaintEditorState {
@@ -1953,7 +1988,8 @@ impl RegionMaskInpaintToolBase {
         let run = Arc::new(
             move |image: &egui::ColorImage,
                   mask: &egui::ColorImage,
-                  _sample_mask: Option<&egui::ColorImage>| { run(image, mask) },
+                  _sample_mask: Option<&egui::ColorImage>,
+                  _downloads: &mut EnsureCtx<'_>| { run(image, mask) },
         ) as Arc<RegionInpaintRunFn>;
         self.draw_overlay_ui_custom_impl(
             ctx,
@@ -1989,7 +2025,12 @@ impl RegionMaskInpaintToolBase {
             + 'static,
         DrawCustomUi: FnMut(&mut egui::Ui),
     {
-        let run = Arc::new(run) as Arc<RegionInpaintRunFn>;
+        let run = Arc::new(
+            move |image: &egui::ColorImage,
+                  mask: &egui::ColorImage,
+                  sample_mask: Option<&egui::ColorImage>,
+                  _downloads: &mut EnsureCtx<'_>| { run(image, mask, sample_mask) },
+        ) as Arc<RegionInpaintRunFn>;
         self.draw_overlay_ui_custom_impl(
             ctx,
             canvas,
@@ -1998,6 +2039,46 @@ impl RegionMaskInpaintToolBase {
             window_title,
             run,
             true,
+            draw_custom_ui,
+        );
+    }
+
+    /// [`Self::draw_overlay_ui_custom`] for a run that may download an app-managed model: `run`
+    /// also gets the job's `EnsureCtx` — its cancel flag is set when the user cancels the
+    /// processing or closes the editor, and its events go to the job channel.
+    // All parameters are distinct per-frame inputs of the window pass (same shape as
+    // `draw_overlay_ui_custom`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_overlay_ui_custom_with_downloads<Run, DrawCustomUi>(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: &mut CanvasView,
+        project: &ProjectData,
+        input: &InputFrame,
+        window_title: &str,
+        run: Run,
+        draw_custom_ui: DrawCustomUi,
+    ) where
+        Run: Fn(&egui::ColorImage, &egui::ColorImage, &mut EnsureCtx<'_>) -> Result<egui::ColorImage, String>
+            + Send
+            + Sync
+            + 'static,
+        DrawCustomUi: FnMut(&mut egui::Ui),
+    {
+        let run = Arc::new(
+            move |image: &egui::ColorImage,
+                  mask: &egui::ColorImage,
+                  _sample_mask: Option<&egui::ColorImage>,
+                  downloads: &mut EnsureCtx<'_>| { run(image, mask, downloads) },
+        ) as Arc<RegionInpaintRunFn>;
+        self.draw_overlay_ui_custom_impl(
+            ctx,
+            canvas,
+            project,
+            input,
+            window_title,
+            run,
+            false,
             draw_custom_ui,
         );
     }
@@ -2091,6 +2172,7 @@ impl RegionMaskInpaintToolBase {
                 &egui::ColorImage,
                 &egui::ColorImage,
                 Option<&egui::ColorImage>,
+                &mut EnsureCtx<'_>,
             ) -> Result<egui::ColorImage, String>
             + Send
             + Sync
@@ -2186,7 +2268,11 @@ impl RegionMaskInpaintToolBase {
                 .body(|ui| mask_generation.draw_source_params(ui));
                 // Drawn outside the collapsible so a running detection stays visible
                 // while the parameter section is folded.
-                mask_generation.draw_progress(ui);
+                mask_generation.draw_progress(ui, editor_state.mask_generation_rx.as_ref());
+                // The run's model download (AOT); «Отменить обработку» drops the job, stopping it.
+                if let Some(event) = editor_state.processing_rx.as_ref().and_then(|job| job.download.current()) {
+                    draw_model_download_status(ui, event);
+                }
                 draw_custom_ui(ui);
                 Self::draw_mask_editor_image(ui, input, editor, brush_base, editor_state);
 
@@ -2264,6 +2350,7 @@ impl RegionMaskInpaintToolBase {
                         .on_hover_text(t!("cleaning.mask_editor.cancel_processing_tooltip"))
                         .clicked()
                     {
+                        // Dropping the job sets its cancel flag: a model download stops.
                         editor_state.processing_rx = None;
                         editor.status = Some(t!("cleaning.mask_editor.processing_cancelled_status").to_string());
                     }
@@ -2465,6 +2552,7 @@ impl RegionMaskInpaintToolBase {
                 &egui::ColorImage,
                 &egui::ColorImage,
                 Option<&egui::ColorImage>,
+                &mut EnsureCtx<'_>,
             ) -> Result<egui::ColorImage, String>
             + Send
             + Sync
@@ -2490,19 +2578,28 @@ impl RegionMaskInpaintToolBase {
         };
 
         let (tx, rx) = mpsc::channel::<RegionInpaintJobResult>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
         let source_for_worker = source.clone();
         thread::spawn(move || {
+            let events = tx.clone();
+            let mut forward = |event: &ModelDownloadEvent| {
+                // A gone receiver means the job was dropped, which also set the cancel flag.
+                let _ = events.send(RegionInpaintJobResult::ModelDownload(event.clone()));
+            };
+            let mut downloads = EnsureCtx { cancel: &worker_cancel, progress: &mut forward };
             let result = run(
                 &source_for_worker.image,
                 &source_for_worker.mask,
                 source_for_worker.sample_mask.as_ref(),
+                &mut downloads,
             );
-            let _ = tx.send(RegionInpaintJobResult {
+            let _ = tx.send(RegionInpaintJobResult::Finished {
                 source: source_for_worker,
                 result,
             });
         });
-        editor_state.processing_rx = Some(rx);
+        editor_state.processing_rx = Some(RegionInpaintJob { rx, cancel, download: ModelDownloadStatus::default() });
         editor.status = Some(t!("cleaning.mask_editor.processing_background_status").to_string());
     }
 
@@ -2532,43 +2629,44 @@ impl RegionMaskInpaintToolBase {
         editor: &mut RegionEditorSession,
         editor_state: &mut RegionInpaintEditorState,
     ) -> bool {
-        let mut still_processing = false;
-        let Some(rx) = editor_state.processing_rx.as_ref() else {
-            return false;
-        };
-        match rx.try_recv() {
-            Ok(job) => {
-                editor_state.processing_rx = None;
-                match job.result {
-                    Ok(out) => {
-                        let prev_size = job.source.image.size;
-                        let out_size = out.size;
-                        editor_state.undo_stack.push(job.source.clone());
-                        editor.image = out;
-                        editor.texture_dirty = true;
-                        editor_state.rerun_source = Some(job.source);
-                        editor_state.reset_masks(editor.image.size);
-                        if prev_size != out_size {
-                            editor.status = Some(tf!("cleaning.mask_editor.size_changed_warning", prev_w = prev_size[0], prev_h = prev_size[1], out_w = out_size[0], out_h = out_size[1]));
-                        } else {
-                            editor.status = Some(t!("cleaning.mask_editor.processing_done_status").to_string());
+        loop {
+            let Some(job) = editor_state.processing_rx.as_mut() else {
+                return false;
+            };
+            match job.rx.try_recv() {
+                Ok(RegionInpaintJobResult::ModelDownload(event)) => job.download.record(event),
+                Ok(RegionInpaintJobResult::Finished { source, result }) => {
+                    editor_state.processing_rx = None;
+                    match result {
+                        Ok(out) => {
+                            let prev_size = source.image.size;
+                            let out_size = out.size;
+                            editor_state.undo_stack.push(source.clone());
+                            editor.image = out;
+                            editor.texture_dirty = true;
+                            editor_state.rerun_source = Some(source);
+                            editor_state.reset_masks(editor.image.size);
+                            if prev_size != out_size {
+                                editor.status = Some(tf!("cleaning.mask_editor.size_changed_warning", prev_w = prev_size[0], prev_h = prev_size[1], out_w = out_size[0], out_h = out_size[1]));
+                            } else {
+                                editor.status = Some(t!("cleaning.mask_editor.processing_done_status").to_string());
+                            }
+                        }
+                        Err(err) => {
+                            editor.status = Some(tf!("cleaning.mask_editor.processing_error", err = err));
                         }
                     }
-                    Err(err) => {
-                        editor.status = Some(tf!("cleaning.mask_editor.processing_error", err = err));
-                    }
+                    return false;
+                }
+                Err(TryRecvError::Empty) => return true,
+                Err(TryRecvError::Disconnected) => {
+                    editor_state.processing_rx = None;
+                    editor.status =
+                        Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
+                    return false;
                 }
             }
-            Err(TryRecvError::Empty) => {
-                still_processing = true;
-            }
-            Err(TryRecvError::Disconnected) => {
-                editor_state.processing_rx = None;
-                editor.status =
-                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
-            }
         }
-        still_processing
     }
 
     /// Drains the mask-generation worker and replaces the removal mask with its answer.

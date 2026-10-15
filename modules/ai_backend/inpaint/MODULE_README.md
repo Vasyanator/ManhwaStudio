@@ -12,7 +12,7 @@ Every service follows the same shape and is safe to copy from when adding a seve
 - construction is cheap; torch / diffusers / cv2 are imported lazily inside the methods that need
   them, so importing one inpainter never pulls in another one's dependencies;
 - one resident model at a time, guarded by an `RLock`, keyed by a service-specific `model_key`
-  (`lama_v2:<device>:<ckpt>`, `aot:<device>`, `sdxl:<mode>:<device>:<path>`, `flux_fill:<quant>`,
+  (`lama_v2:<device>:<ckpt>`, `aot:<device>`, `sdxl:<mode>:<device>:<source>`, `flux_fill:<quant>`,
   `flux2_klein:<dtype>|<placement>|…|<paths>`, …);
 - the key is leased from the shared `runtime.model_manager.LoadedModelManager`
   (`begin_model_use` → `mark_loaded` / `mark_load_failed` → `release`), which is what lets an idle
@@ -23,7 +23,10 @@ Every service follows the same shape and is safe to copy from when adding a seve
   exception is `flux_fill.py`, which ignores the user's device choice and pins itself to the
   discrete GPU via `_select_discrete_device()` — see the FLUX section;
 - `health()` / `unload()` are part of every service's contract, and `unload()` reports the dropped
-  key back to the model manager.
+  key back to the model manager. `health()` never takes the service lock (which spans load AND
+  inference here): it reads the service's `HealthSnapshot`, republished by `_publish_health_locked()`
+  at every reported-state change (`runtime/MODULE_README.md`; pinned for AOT by
+  `test_health_during_load.py`).
 
 ## Files and submodules
 - `lama.py`: `LamaInpaintService` — LaMa V2 (`inpaint.lama_v2`). Discovers `.ckpt`/`.pt` checkpoints
@@ -35,9 +38,11 @@ Every service follows the same shape and is safe to copy from when adding a seve
 - `lama_runtime_bundle/`: vendored `saicinpainting` (training modules, evaluation, refinement) that
   `InpainterV2` imports. Loaded via `sys.path`, never as a subpackage of `modules.ai_backend`. See
   `lama_runtime_bundle/MODULE_README.md`.
-- `lama_mpe.py`: `LamaMpeInpaintService` — LaMa MPE (`inpaint.lama_mpe`). Downloads and SHA256-checks
-  `inpainting_lama_mpe.ckpt` into `ManhwaStudio_AI_Models/Torch/LaMa_MPE`, and requires a
-  `lama_modernised/` checkout in the program root (`_validate_runtime_layout_locked`).
+- `lama_mpe.py`: `LamaMpeInpaintService` — LaMa MPE (`inpaint.lama_mpe`). SHA-256-checks
+  `inpainting_lama_mpe.ckpt` in `ManhwaStudio_AI_Models/Torch/LaMa_MPE` before every load and never
+  downloads it: the Rust side (`ms_sysprobe::ai_models::ensure_lama_mpe`) owns the fetch, and a
+  missing file is a `FileNotFoundError` naming it. Requires a `lama_modernised/` checkout in the
+  program root (`_validate_runtime_layout_locked`). Tests: `test_lama_mpe.py`.
 - `aot.py`: `AotInpaintService` — AOT-GAN (`inpaint.aot`), including the ported generator
   (`AOTGenerator` and its scaled-weight-standardized conv blocks). Weights:
   `ManhwaStudio_AI_Models/Torch/AOT/inpainting.ckpt`.
@@ -62,6 +67,8 @@ Every service follows the same shape and is safe to copy from when adding a seve
   gated, `4b` public). NOT a service and deliberately so: it holds no
   resident model, takes no lease and has no `AppState` field — it is a module of functions the
   handler imports lazily. See the FLUX.2 klein download section.
+- `test_health_during_load.py`: `health()` answers while AOT's lock section loads and infers, and
+  reflects loading -> ready and a load error (stubbed load and inference, no torch).
 - `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_download.py`, `test_lease_protocol.py` (and the
   `test_*.py` modules inside `flux2_klein/`): pure-Python
   unit tests (no torch, no diffusers, no weights, no GPU — fake `torch`/`diffusers`/`transformers`
@@ -122,8 +129,15 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   context) before a moderate-denoise latent-blend pass; `normalize_sdxl_params` therefore caps
   `denoise_strength` below 1.0 in that mode, because strength 1.0 re-noises the hole to pure noise
   and throws the prefill away.
-- Weights are user-supplied (a ckpt/safetensors file, a local diffusers folder, or an HF repo id), so
-  this service owns no fixed model directory.
+- **Never downloads; every load is `local_files_only=True`.** `resolve_model_source()` turns the
+  user's `model_path` into an `SdxlModelSource` before any load: a ckpt/safetensors file loads via
+  `from_single_file(path, config=sdxl_config_dir)` — the pinned diffusers config repo Rust
+  downloaded for the mode, checked to hold `model_index.json` first, because a `config` that is not
+  an existing directory makes diffusers fetch the configs from the Hub even with
+  `local_files_only=True`; a local diffusers folder loads via `from_pretrained`; the one curated id
+  `CURATED_INPAINT_REPO_ID` loads from Rust's download (`sdxl_model_dir`) with `variant="fp16"`
+  (the variant is decided by that id, never by sniffing file names). Any other repo id is a
+  `ValueError`. The resolved source (path, config dir, variant) is part of the lease key.
 - Progress streaming: when a `progress_callback` is given, a diffusers `callback_on_step_end` emits a
   cheap linear latent→RGB preview per step (`_latent_preview_rgb`, no VAE decode); `ipc/handlers/
   sdxl.py` turns those into `progress` frames carrying a latent-preview PNG blob, followed by a
@@ -138,18 +152,26 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
 - All weights live under `ManhwaStudio_AI_Models/side_models/FLUX.1-Fill-dev-GGUF/`, **not** the
   Hugging Face cache: the chosen GGUF quant from `YarvixPA/FLUX.1-Fill-dev-GGUF`, plus the diffusers
   components (VAE / CLIP-L / T5-XXL / scheduler / tokenizers) from the open `ostris/Flex.1-alpha`
-  repo under `components/`. Downloads go through `../engines/model_download.py` (shared with
-  `watermark/service.py`): serialized per destination file, staged into a process-private
-  `<name>.<pid>.part` and published with an atomic `os.replace`. `ensure_model()` deliberately runs
+  repo under `components/`. Downloads go through `../engines/model_download.download_bearer_to_path`
+  (shared with `flux2_download.py`): serialized per destination file, staged into a process-private
+  `<name>.<pid>.part`, retried with backoff and resumed with `Range` on transient failures (bytes of
+  a failed call are parked for the next one), checked against the size the hub listing announced,
+  and published with an atomic `os.replace`. The listing is mandatory: `_build_download_plan`
+  raises when a listing fails or the quant is missing from it, so no file is ever sized `0` by
+  accident; a file on disk at another size is re-downloaded. `ensure_model()` deliberately runs
   outside `self._lock` and the IPC layer dispatches onto a thread pool, so two first uses of the
   same quant do reach it at once; the loser of each file's lock re-checks and skips instead of
-  refetching. The bearer header itself is NOT duplicated here: `_download_file_streaming` is a thin
-  call into `../engines/model_download.download_bearer_to_path`, which takes the token as an
-  argument, so this module keeps only the DECISION that its token comes from `HF_TOKEN` /
-  `HUGGING_FACE_HUB_TOKEN` in the process environment.
+  refetching. `_download_file_streaming` is a thin call into the shared helper, which takes the
+  token as an argument, so this module keeps only the DECISION that its token comes from
+  `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN` in the process environment.
+- Cancellation: `inpaint_image_bytes` / `ensure_model` take `should_cancel` (the handler passes
+  `cancel_event.is_set`); the helper polls it per chunk and per 100 ms of a retry wait and raises
+  `DownloadCancelled`. Generation itself is not interruptible.
 - `progress_callback(phase, step, total, label)` has two phases: `download` (byte-level) and
   `generate` (step-level). `ipc/handlers/flux_fill.py` streams both as `progress` frames with header
-  `phase`/`step`/`total`/`label` and no preview blob.
+  `phase`/`step`/`total`/`label` and no preview blob. A retry wait is an ordinary `download` frame
+  whose `label` is `engines.model_download.retry_progress_label` — no extra field. A failing
+  progress callback is logged once per call and never aborts the download or the generation.
 - The pipeline is pinned to the DISCRETE GPU; `_select_discrete_device()` excludes the Ryzen iGPU and
   falls back to CPU rather than using it.
 
@@ -861,30 +883,30 @@ or `text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config
   `RepositoryNotFoundError`, so type order alone separates nothing. The six `state` values are a wire
   contract: the Rust UI gives three of them three different links.
 - **A staged file is published only after its length matches the announced size**
-  (`_size_verifier` -> the `verify` gate `download_to_path` already runs before the rename), and
+  (`item.size` -> the shared primitive's `expected_size` gate, checked before the rename), and
   `is_complete_on_disk` treats a file as present only at that same length. Neither `requests` nor
-  `stream_response_to_file` treats a SHORT body that ends cleanly as an error, so without both
+  a plain streaming loop treats a SHORT body that ends cleanly as an error, so without both
   halves a truncated shard is renamed to its final name and then skipped by every later run —
   reproduced during review (100 bytes announced, 7 delivered, ended normally) and surfacing much
   later as corrupt weights. The length check on the planning side is also what REPAIRS a file an
   earlier run already left behind. A listing that announces no size falls back to the non-empty
   rule and logs why: a missing size must neither disable the check silently nor force an endless
   re-download.
-- **An interrupted file RESUMES; it does not restart.** `_fetch_one` asks the shared primitive for
-  resumable staging, so a connection dropped at 8 of 9.8 GB parks those bytes as `<name>.part` and
-  the next run continues from them with `Range: bytes=<n>-`. On a 35 GB plan over a flaky link that
-  is the difference between a feature that finishes and one that never does. Resume is opt-in in
-  `../engines/model_download.py`; `flux_fill.py` keeps its unlink-on-failure semantics untouched.
-- **The size gate keeps the last word over the resume, with exactly ONE recovery.** A resumed file
-  whose final length is wrong raises `IncompleteDownload`, `_fetch_one` discards the staged bytes
-  and fetches that file once more from zero, and a second failure is a `RuntimeError` naming the
-  file. That covers a stale partial whose remote blob changed underneath it. There is deliberately
-  no ETag/`If-Range` sidecar: the size check plus one clean retry is proportionate, and a sidecar
-  would be a second source of truth about what is on disk.
-- **A retry-from-zero is the one place `step` may move backwards**, because the file genuinely
-  restarts. Everything else is monotone: a resumed file's `file_step` and the overall `step` both
-  begin at the resumed offset (`initial_done`), so a consumer deriving speed from consecutive
-  frames never sees a bogus first delta.
+- **An interrupted file RESUMES; it does not restart.** `_fetch_one` delegates to
+  `../engines/model_download.download_bearer_to_path`, so a connection dropped at 8 of 9.8 GB parks
+  those bytes as `<name>.part` and the transfer continues from them with `Range: bytes=<n>-` — within
+  the same call after a backoff wait (transient failures are retried, the budget resetting after
+  progress), or on the next run once the budget ran out or the user cancelled. A body that ends
+  cleanly but short is resumed the same way: a short body is not proof of wrong bytes.
+- **The listing size is the integrity gate (`item.size`), and only proven-wrong bytes are
+  discarded**: more bytes than announced, a `206` announcing another total, or leftovers already
+  longer than the file (dropped and refetched). There is deliberately no ETag/`If-Range` sidecar: a
+  same-size change of a parked partial's remote blob stays undetectable, which the size gate bounds.
+- **A retry is a progress frame, not a failure.** `_retry_reporter` sends one FORCED frame (bypassing
+  the throttle) with the staged bytes as `step` / `file_step` and the retry text as `label`; no
+  field is added. `step` is monotone: a resumed file's `file_step` and the overall `step` both begin
+  at the resumed offset, so a consumer deriving speed from consecutive frames never sees a bogus
+  first delta; only a restart from zero after proven-wrong bytes moves it backwards.
 - **The free-space guard subtracts what is already staged** (`staged_bytes`), or it would refuse a
   download that plainly fits when 8 of 9.8 GB are on the disk already.
 - **`check_access`'s `plan` is NULLABLE and zeros are never synthesised.** Auth and listing are two
@@ -904,10 +926,11 @@ or `text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config
   additive and optional; `ProgressThrottle` requires BOTH ~100 ms and 4 MiB to have passed, and the
   terminal frame is forced so the last thing a consumer sees is the completed count. `flux_fill`
   reports on every chunk; at 35 GB that would be 35 000 frames.
-- **Cancellation reaches the socket.** `should_cancel` is polled before each file and at every chunk
-  boundary, where it raises `DownloadCanceled`. That exception travels out of `stream_response_to_file`
-  — which has no cancel hook of its own — and `download_to_path`'s `finally` removes the staging
-  file. Files already published stay: they are complete and were renamed atomically.
+- **Cancellation reaches the socket.** `should_cancel` is polled before each file, at every chunk
+  boundary and every 100 ms of a retry wait, and the run ends with `DownloadCanceled` (the shared
+  primitive's `DownloadCancelled` is translated in `_fetch_one`). The bytes of the file in flight
+  are parked for the next run; files already published stay: they are complete and were renamed
+  atomically.
 - **Free space is checked before the first byte** (`require_free_space`), and the refusal names both
   the required and the available number of bytes. A filesystem that cannot be queried is not treated
   as full.
@@ -955,6 +978,9 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
 - To change SDXL param validation, sampler mapping, or the latent preview, see `sdxl.py`
   (`normalize_sdxl_params`, `SAMPLER_CONFIGS`, `_latent_preview_rgb`); keep `SAMPLER_CONFIGS` in sync
   with `SDXL_SAMPLERS` in `crates/ms-tab-cleaning/src/tools/ai_editor/engines/sdxl/mod.rs`.
+- To change which SDXL model sources are accepted or how they load, see `resolve_model_source` /
+  `_build_sdxl_inpaint_pipeline` in `sdxl.py`; the config and curated files themselves are the Rust
+  catalog's (`crates/ms-sysprobe/src/ai_models/`), and the wire fields are `ipc/PROTOCOL.md §5.4`.
 - To change the FLUX quant catalog, download layout, or device pinning, see `flux_fill.py`
   (`AVAILABLE_QUANTS`, `_build_download_plan`, `_select_discrete_device`); the staging /
   serialization / atomic-publish envelope itself lives in `../engines/model_download.py` and is
@@ -1007,8 +1033,8 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   `shared_manifest` is fetched in BOTH toggle states and by BOTH variants; the two encoder
   tuples stay mutually exclusive. To change the access states, see `classify_repo_error` (status before
   type); to change the frame shape or the throttle, `_chunk_reporter` / `ProgressThrottle`; to change
-  where it all lands, `model_root` / `component_paths`; to change resume, the one retry or the
-  integrity gate, `_fetch_one` / `_size_verifier` — the staging, claiming and parking themselves
+  where it all lands, `model_root` / `component_paths`; to change how a file is fetched, `_fetch_one`
+  / `_retry_reporter` — retry, resume, the size gate, staging, claiming and parking themselves
   belong to `../engines/model_download.py` and are shared, so do not re-implement them here. Keep every wire literal in step with
   `dev-docs/flux2_model_download.md` and `ipc/PROTOCOL.md`; the Rust side is written against the same
   document.

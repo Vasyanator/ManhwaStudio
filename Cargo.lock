@@ -3322,6 +3322,7 @@ dependencies = [
  "ms-canvas",
  "ms-config",
  "ms-docstore",
+ "ms-download",
  "ms-fonts",
  "ms-gifs",
  "ms-i18n",
@@ -3372,7 +3373,6 @@ dependencies = [
  "translators",
  "ttf-parser 0.25.1",
  "unicode-script",
- "ureq",
  "uuid",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -3611,6 +3611,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-download"
+version = "0.1.0"
+dependencies = [
+ "ms-log",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "ureq",
+ "zip",
+]
+
+[[package]]
 name = "ms-fonts"
 version = "0.1.0"
 dependencies = [
@@ -3660,6 +3672,7 @@ dependencies = [
  "libc",
  "ms-config",
  "ms-docstore",
+ "ms-download",
  "ms-i18n",
  "ms-log",
  "ms-os-integration",
@@ -3671,9 +3684,9 @@ dependencies = [
  "ms-window-geometry",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "tempfile",
- "ureq",
  "web-time",
  "zip",
  "zstd",
@@ -3695,6 +3708,7 @@ dependencies = [
  "ms-backend-ipc",
  "ms-config",
  "ms-docstore",
+ "ms-download",
  "ms-i18n",
  "ms-installer",
  "ms-local-ai",
@@ -3820,6 +3834,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "ms-config",
+ "ms-download",
  "ms-i18n",
  "ms-log",
  "ms-onnx",
@@ -3828,7 +3843,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
- "ureq",
+ "tempfile",
  "zip",
  "zstd",
 ]
@@ -3963,6 +3978,7 @@ dependencies = [
  "image 0.25.10",
  "keyring",
  "ms-config",
+ "ms-download",
  "ms-i18n",
  "ms-log",
  "ms-platform",
@@ -3972,7 +3988,6 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.18",
- "ureq",
  "windows-sys 0.59.0",
 ]
 
@@ -4159,6 +4174,7 @@ dependencies = [
  "image 0.25.10",
  "ms-config",
  "ms-docstore",
+ "ms-download",
  "ms-i18n",
  "ms-log",
  "ms-project",
@@ -4171,7 +4187,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "ureq",
  "web-time",
 ]
 
@@ -4257,6 +4272,7 @@ dependencies = [
  "egui",
  "ms-config",
  "ms-docstore",
+ "ms-download",
  "ms-fonts",
  "ms-gifs",
  "ms-i18n",
@@ -4270,7 +4286,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "ttf-parser 0.25.1",
- "ureq",
  "web-time",
  "zspell",
 ]

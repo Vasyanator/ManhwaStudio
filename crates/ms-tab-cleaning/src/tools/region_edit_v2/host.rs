@@ -72,7 +72,7 @@ use crate::tools::base::{
     CleaningTool, RegionLoadRequest, RegionLoadResult, capture_overlay_chunk, overlay_rect_to_scene_rect,
     spawn_region_loader_thread,
 };
-use crate::tools::mask_generation::{self, GeneratedMask, MaskGenerationPoll, MaskGenerationSpawner, MaskGenerationState, MaskSource};
+use crate::tools::mask_generation::{self, GeneratedMask, MaskGenerationJob, MaskGenerationPoll, MaskGenerationSpawner, MaskGenerationState, MaskSource};
 use crate::input::{self, CleaningLabels};
 use ms_input::{ContextId, InputFrame};
 use ms_canvas::{CanvasView, OverlayRectPx};
@@ -404,8 +404,9 @@ pub struct RegionEditHost {
     /// leaves `start_mask_detection` with ONE code path, so the test drives exactly what ships.
     spawn_detection: MaskGenerationSpawner,
     /// `Some` while a detector is running on a worker. The frame is `Processing` for as long,
-    /// so its rectangle and its mask cannot move under the job.
-    pub(super) mask_generation_rx: Option<Receiver<Result<GeneratedMask, String>>>,
+    /// so its rectangle and its mask cannot move under the job. Dropping the job (cancel, host
+    /// drop) stops a model download the detection runs.
+    pub(super) mask_generation_rx: Option<MaskGenerationJob>,
     /// Raised by «Сгенерировать маску» in the compact panel and consumed by the next
     /// `draw_overlay_ui`. A panel body may mutate only the tool, and starting the job needs
     /// the canvas and the project — the same reason «Обработать» goes through the frame.
@@ -1111,9 +1112,9 @@ impl RegionEditHost {
     /// Abandons everything in flight: the engine's run, a mask detection, the region load that
     /// precedes either, and a queued generation request.
     ///
-    /// Dropping `mask_generation_rx` is what cancels a detection: the worker cannot be stopped
-    /// mid-call, so its answer is discarded on arrival instead of reaching a mask the user has
-    /// meanwhile taken back.
+    /// Dropping `mask_generation_rx` is what cancels a detection: it stops a model download the
+    /// detection runs, and the backend call itself cannot be stopped mid-call, so its answer is
+    /// discarded on arrival instead of reaching a mask the user has meanwhile taken back.
     fn cancel_run(&mut self) {
         self.pending_load = None;
         self.marks_restore = None;
@@ -1348,9 +1349,9 @@ mod tests {
     use super::super::engine::{EngineSection, MaskLayerSpec};
     use super::super::frame::PaintTarget;
     use super::super::geometry::SizeViolation;
-    use crate::tools::mask_generation::{MaskGenerationParams, WatermarkProgress};
+    use crate::tools::mask_generation::{MaskGenerationMessage, MaskGenerationParams, WatermarkProgress};
     use egui::Color32;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
     fn rect(x: usize, y: usize, w: usize, h: usize) -> OverlayRectPx {
@@ -1396,12 +1397,12 @@ mod tests {
         image: egui::ColorImage,
         _params: MaskGenerationParams,
         _progress: Arc<Mutex<WatermarkProgress>>,
-    ) -> Receiver<Result<GeneratedMask, String>> {
+    ) -> MaskGenerationJob {
         let (tx, rx) = std::sync::mpsc::channel();
         let alpha = vec![255u8; image.size[0] * image.size[1]];
         // The receiver is alive in this scope, so the send cannot fail.
-        tx.send(Ok(GeneratedMask::from_parts_for_test(image.size, alpha))).expect("the stub answer is queued");
-        rx
+        tx.send(MaskGenerationMessage::Finished(Ok(GeneratedMask::from_parts_for_test(image.size, alpha)))).expect("the stub answer is queued");
+        MaskGenerationJob::new(rx, Arc::new(AtomicBool::new(false)))
     }
 
     #[test]
@@ -1705,24 +1706,26 @@ mod tests {
         );
     }
 
-    /// Cancelling abandons a detection in flight: the worker cannot be stopped mid-call, so
-    /// dropping the receiver is what keeps its answer from reaching a mask the user took back.
+    /// Cancelling abandons a detection in flight: dropping the job raises its cancel flag (a
+    /// model download stops) and keeps its answer from reaching a mask the user took back.
     #[test]
     fn cancelling_abandons_a_running_detection() {
         let mut tool = test_host();
         tool.frame.place_for_test(0, rect(0, 0, 8, 8));
-        let (tx, rx) = std::sync::mpsc::channel::<Result<GeneratedMask, String>>();
-        tool.mask_generation_rx = Some(rx);
+        let (tx, rx) = std::sync::mpsc::channel::<MaskGenerationMessage>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        tool.mask_generation_rx = Some(MaskGenerationJob::new(rx, Arc::clone(&cancel)));
         tool.generate_mask_requested = true;
         tool.frame.set_processing(true);
 
         tool.cancel_run();
 
         assert!(tool.mask_generation_rx.is_none());
+        assert!(cancel.load(Ordering::Relaxed), "the worker's model download is told to stop");
         assert!(!tool.generate_mask_requested, "a queued request must not survive a cancel");
         assert_eq!(tool.frame.lock(), FrameLock::Free);
         // The worker's answer now has nowhere to go, which is the point.
-        assert!(tx.send(Ok(GeneratedMask::from_parts_for_test([8, 8], vec![255u8; 64]))).is_err());
+        assert!(tx.send(MaskGenerationMessage::Finished(Ok(GeneratedMask::from_parts_for_test([8, 8], vec![255u8; 64])))).is_err());
     }
 
     /// A region loaded for a detection must NOT reach the engine, and vice versa: the purpose
@@ -1744,7 +1747,7 @@ mod tests {
         assert_eq!(tool.frame.lock(), FrameLock::Processing, "the frame stays locked for the detection");
         // The stored receiver is the spawner's own, and it carries a mask of exactly the region
         // that was handed over: the loaded region travelled THROUGH the detection path.
-        let answer = tool.mask_generation_rx.as_ref().expect("the receiver is stored").recv().expect("the stub answered");
+        let answer = tool.mask_generation_rx.as_ref().expect("the job is stored").recv_finished().expect("the stub answered");
         assert_eq!(answer.expect("the stub answers a mask").size(), [4, 4]);
     }
 

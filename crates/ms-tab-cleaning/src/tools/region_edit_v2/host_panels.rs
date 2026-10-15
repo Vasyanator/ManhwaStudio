@@ -296,7 +296,7 @@ impl RegionEditHost {
             .body(|ui| self.mask_generation.draw_source_params(ui));
         // Outside the collapsible, so a running detection stays visible while the parameters
         // are folded away.
-        self.mask_generation.draw_progress(ui);
+        self.mask_generation.draw_progress(ui, self.mask_generation_rx.as_ref());
 
         // The button's enablement and its tooltip come from the SAME rule the click is checked
         // against, so a greyed-out button and a refused click can never give different reasons.

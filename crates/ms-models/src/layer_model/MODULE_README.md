@@ -130,7 +130,14 @@ GUI thread WITHOUT holding the shared doc lock across a multi-MB decode:
     `text_images/text_info.json` can never resurrect a deleted overlay.
 - `insert_decoded_page(&mut self, page_idx, payload)` — takes the doc lock only to MOVE the payload into
   `self.pages` (no I/O). Memoized: an already-resident page discards the incoming payload (live in-memory
-  edits are never clobbered) and does NOT bump the version; a real insert bumps it.
+  edits are never clobbered) and does NOT bump; a real insert bumps the page (its `page_revision` and
+  the document `version`).
+- Change tracking: every mutator records its page through the private `bump_page(page)` (advances
+  `version`, stamps `page_revisions[page]` with it); there is no page-less bump. Callers that edit
+  through `node_mut` call `mark_page_changed(page)`. Persistence bookkeeping (`pixels_dirty`, save
+  epochs, acks) never bumps. Contract and the property test guarding it
+  (`page_revision_tracks_every_content_change`, exhaustive field fingerprint — a new node / group field
+  fails to compile there until classified): see `../MODULE_README.md` "Model revisions".
 `ensure_page_loaded` = `decode_page_payload` + `insert_decoded_page` (unchanged behavior for the
 synchronous callers and all tests). The PS page loader (`ps_editor/page_loader.rs`) calls
 `decode_page_payload` lock-free on its worker and `poll_loader` calls `insert_decoded_page` under a brief
@@ -330,7 +337,7 @@ own runtime and draws the returned `CompositeStep`s; none re-implements a band-Z
     written: the text writer always emits `pinned = true`.
   - PS group composite meta: `DocPage::groups` is the ONE in-session source of a group's visibility /
     opacity for every composite consumer (typing canvas + export via `groups_by_page`, PS via
-    `sync_view_from_doc`). `LayerDoc::set_group_meta` edits it (version bump on change; non-finite
+    `sync_view_from_doc`). `LayerDoc::set_group_meta` edits it (page bump on change; non-finite
     opacity refused; `collapsed` untouched), and the page's next doc save writes it through
     `save_page_rasters`' `groups` argument — no dedicated job, format unchanged. `collapsed` is panel-only
     PS view state with the same single owner (`LayerDoc::set_group_collapsed`, same persistence).

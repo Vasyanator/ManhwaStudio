@@ -64,6 +64,10 @@ pub mod window;
 // would be free to drift from the installer's.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod utils;
+// GitHub release metadata and asset downloads on the shared `ms-download` engine (retry,
+// resume, verification, cancel); crate-private, used by `utils` and `update`.
+#[cfg(not(target_arch = "wasm32"))]
+mod download;
 // The non-interactive, GUI-free readiness check behind the `--check-venv` startup flag.
 // It lives here rather than next to the other host probes (`ms-sysprobe`) because it reads
 // the installer's OWN package requirements and its two drift-prone predicates

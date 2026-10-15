@@ -127,8 +127,9 @@ class AppState:
 def _safe_service_health(service: Any) -> dict[str, Any]:
     """Call `service.health()` but never let one failing service kill the snapshot.
 
-    `_build_health_snapshot` aggregates every service's `.health()`; some of those
-    (e.g. `surya.health()` imports torch unconditionally) can raise. If any single
+    `_build_health_snapshot` aggregates every service's `.health()`; one of those
+    can still raise (e.g. a filesystem or optional-package probe it runs, such as
+    the Surya detector's checkpoint lookup). If any single
     call threw, the whole snapshot build would throw and the periodic `health`
     event would never be published. We isolate each sub-entry: a raising/missing
     service yields a `{"status":"error","error":...}` placeholder instead, keeping

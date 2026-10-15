@@ -17,7 +17,8 @@ handlers are driven directly (no socket), verifying:
 2. the response header (`engine`, `n`, `map_width`, `map_height`, `channels`)
    and the blob layout (tile-major, then channel-major) per engine;
 3. request validation: `n`, size, alignment, exact blob length, request and
-   response size limits — each a ``ValueError`` before the service runs;
+   response size limits, Surya's required `surya_detection_dir` — each a
+   ``ValueError`` before the service runs;
 4. service-output validation: shape, dtype, response size — ``RuntimeError``.
 """
 
@@ -49,11 +50,16 @@ from modules.ai_backend.ipc.registry import METHOD_HANDLERS, HandlerContext
 
 _NO_CANCEL = threading.Event()
 
-# (handler, AppState field, engine) for the parametrized round-trip tests.
+# Fictional checkpoint directory; the handler forwards it without opening it.
+_SURYA_DIR = "/m/Surya/text_detection/2025_05_07"
+_SURYA_FIELDS = {"surya_detection_dir": _SURYA_DIR}
+
+# (handler, AppState field, engine, extra header fields, expected service kwargs)
+# for the parametrized round-trip tests.
 _ENGINES = [
-    (_handle_textdetector_ctd_forward, "text_detector_ctd", "ctd"),
-    (_handle_textdetector_paddle_forward, "text_detector_paddle", "paddle"),
-    (_handle_textdetector_surya_forward, "text_detector_surya", "surya"),
+    (_handle_textdetector_ctd_forward, "text_detector_ctd", "ctd", {}, {}),
+    (_handle_textdetector_paddle_forward, "text_detector_paddle", "paddle", {}, {}),
+    (_handle_textdetector_surya_forward, "text_detector_surya", "surya", _SURYA_FIELDS, {"model_dir": _SURYA_DIR}),
 ]
 
 
@@ -107,18 +113,20 @@ def test_forward_specs_match_the_protocol_table() -> None:
     assert FORWARD_SPECS["surya"].channels == ("text",)
 
 
-@pytest.mark.parametrize("handler, field, engine", _ENGINES)
-def test_round_trip_layout(handler, field: str, engine: str) -> None:
+@pytest.mark.parametrize("handler, field, engine, extra, service_kwargs", _ENGINES)
+def test_round_trip_layout(handler, field: str, engine: str, extra: dict, service_kwargs: dict) -> None:
     spec = FORWARD_SPECS[engine]
     n, width, height = 2, 2 * 64, 64
     tiles = _tiles(n, width, height)
     state = MagicMock()
     service = getattr(state, field)
-    service.forward_tiles.side_effect = lambda arr: _fake_maps(spec, arr)
+    service.forward_tiles.side_effect = lambda arr, **_kwargs: _fake_maps(spec, arr)
 
-    header, blob = handler(_ctx(state), {"n": n, "width": width, "height": height}, tiles.tobytes(), _NO_CANCEL)
+    request = {"n": n, "width": width, "height": height, **extra}
+    header, blob = handler(_ctx(state), request, tiles.tobytes(), _NO_CANCEL)
 
     service.forward_tiles.assert_called_once()
+    assert service.forward_tiles.call_args.kwargs == service_kwargs
     received = service.forward_tiles.call_args.args[0]
     assert received.dtype == np.uint8
     assert received.shape == (n, height, width, 3)
@@ -167,7 +175,9 @@ def test_paddle_and_surya_alignment() -> None:
     with pytest.raises(ValueError, match="multiple of 32"):
         _handle_textdetector_paddle_forward(_ctx(state), {"n": 1, "width": 48, "height": 32}, bytes(48 * 32 * 3), _NO_CANCEL)
     with pytest.raises(ValueError, match="multiple of 4"):
-        _handle_textdetector_surya_forward(_ctx(state), {"n": 1, "width": 6, "height": 4}, bytes(6 * 4 * 3), _NO_CANCEL)
+        _handle_textdetector_surya_forward(
+            _ctx(state), {"n": 1, "width": 6, "height": 4, **_SURYA_FIELDS}, bytes(6 * 4 * 3), _NO_CANCEL
+        )
     state.text_detector_paddle.forward_tiles.assert_not_called()
     state.text_detector_surya.forward_tiles.assert_not_called()
 
@@ -209,4 +219,17 @@ def test_service_errors_propagate() -> None:
     state = MagicMock()
     state.text_detector_surya.forward_tiles.side_effect = RuntimeError("non-finite heatmap")
     with pytest.raises(RuntimeError, match="non-finite"):
-        _handle_textdetector_surya_forward(_ctx(state), {"n": 1, "width": 8, "height": 8}, bytes(8 * 8 * 3), _NO_CANCEL)
+        _handle_textdetector_surya_forward(
+            _ctx(state), {"n": 1, "width": 8, "height": 8, **_SURYA_FIELDS}, bytes(8 * 8 * 3), _NO_CANCEL
+        )
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", 5])
+def test_surya_requires_the_detection_dir(value) -> None:
+    state = MagicMock()
+    header = {"n": 1, "width": 8, "height": 8}
+    if value is not None:
+        header["surya_detection_dir"] = value
+    with pytest.raises(ValueError, match="surya_detection_dir"):
+        _handle_textdetector_surya_forward(_ctx(state), header, bytes(8 * 8 * 3), _NO_CANCEL)
+    state.text_detector_surya.forward_tiles.assert_not_called()

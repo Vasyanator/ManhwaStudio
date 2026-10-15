@@ -16,9 +16,10 @@ path, and hands the JSON to `reline.Pipeline`. The Torch-backed pipeline is impo
 that call, so nothing here is imported at backend startup beyond the stdlib-only `runtime.paths`.
 
 Model resolution order: an existing local file under `MODEL_DIR` → the remote catalog
-(`CATALOG_URL`) → the built-in `EXTRA_MODELS` list. Downloads land in `MODEL_DIR/.download`;
-`.tar.xz`/`.txz` archives are extracted to a stable `<archive stem>.pth` cache name so a later
-catalog-name lookup finds them.
+(`CATALOG_URL`) → the built-in `EXTRA_MODELS` list. Downloads go through the shared retrying
+transfer `../engines/model_download.download_http_to_path` (retry with backoff, `Range` resume,
+process-private staging, atomic publish) into `MODEL_DIR/.download`; `.tar.xz`/`.txz` archives are
+extracted to a stable `<archive stem>.pth` cache name so a later catalog-name lookup finds them.
 
 ### Upstream model sources
 The third-party stack ships no weights and no downloader of its own: `reline` runs the pipeline,
@@ -40,8 +41,10 @@ two places:
   fetch/match helpers, the downloader/extractor, and the params → pipeline-JSON mapping. Edit here
   for anything Reline.
 - `test_service.py`: unit tests for catalog-name matching, compound archive suffixes, direct-URL
-  filenames, extracted-checkpoint reuse, and the `EXTRA_MODELS` manual-download hint. Runs with no
-  network and no Torch (catalog/download/model-lookup helpers are patched).
+  filenames, extracted-checkpoint reuse, the `EXTRA_MODELS` manual-download hint, and the download
+  (retry + resume, archive extraction, corrupt-archive removal, permanent status, suffix refusal,
+  cancel), the catalog fetch, and that construction creates no directory.
+  Runs with no network and no Torch (the transport and clock are injected, helpers patched).
 
 ## Contracts and invariants
 - Reline checkpoints are Torch files kept under `ManhwaStudio_AI_Models/side_models/Reline`
@@ -56,7 +59,23 @@ two places:
   load time. An ONNX SR path needs its own node/service (the project's ONNX runtime lives elsewhere,
   see `crates/ms-onnx`), not a wider filter here.
 - The third-party `reline` package receives LOCAL model paths only; it never downloads. Catalog
-  resolution, download, and archive extraction are owned by `service.py`.
+  resolution and archive extraction are owned by `service.py`; the transfer itself is the shared
+  `download_http_to_path` (never a private loop here).
+- Catalog models are user-chosen and NOT pinned: a download passes `expected_size=0`, so the
+  server's `Content-Length` is the only size check (a short body is still detected and resumed).
+  A filename without a supported model/archive suffix is refused before any request; an archive
+  that cannot be extracted is deleted so the next request refetches it. Every GET sends
+  `USER_AGENT`.
+- `reline.process` has no progress channel; retries are logged. Both handlers pass their cancel
+  event as `should_cancel`, which reaches the catalog fetch and the model download (per chunk and
+  during retry waits); a cancelled download keeps its bytes for a resume. The pipeline itself is
+  not interruptible.
+- The catalog is fetched with `../engines/model_download.fetch_small_body` (timeouts, retry with
+  backoff, cancel, size ceiling); a non-array response is a `RuntimeError`.
+- Constructing `RelineService` has no side effect: `MODEL_DIR` / `DOWNLOAD_DIR` are created only
+  by a download, and a missing `MODEL_DIR` means "nothing downloaded". Tests point both at a
+  temporary directory.
+- Diagnostics go through the module logger (`log`), never `print`.
 - `EXTRA_MODELS` is the escape hatch for models the remote catalog does not publish. An entry with
   an empty `url` must be placed manually under `MODEL_DIR`; resolution otherwise raises
   `FileNotFoundError` naming the model and its `source` URL. No silent fallback.
@@ -72,7 +91,7 @@ two places:
 ## Editing map
 - Catalog resolution, download, or archive extraction: `service.py` (`_fetch_catalog`,
   `_find_catalog_entry`, `_find_existing_model`, `_download_model`,
-  `_extract_first_model_from_archive`).
+  `_extract_first_model_from_archive`). Retry/resume behaviour: `../engines/model_download.py`.
 - A new pipeline node or option: `RelineService._build_pipeline_json` plus the matching allowed-value
   set; mirror the field in the Rust `RelineOptions`.
 - A model missing from the remote catalog: add an `EXTRA_MODELS` entry.

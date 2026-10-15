@@ -26,6 +26,10 @@ Key structures:
 - `MaskGenerationParams`: source, mask dilation, watermark model — one `Copy` bundle
 - `MaskGenerationState`: the params plus the watermark catalog state and the live progress
 - `GeneratedMask`: a validated 0/255 alpha buffer with its size
+- `MaskGenerationJob`: a running detection (message channel + cancel flag + its latest
+  model-download event); dropping it is the cancel — it sets the flag, which stops a model
+  download the detection runs
+- `MaskGenerationMessage`: what the worker sends (model-download events, the final answer)
 - `MaskGenerationPoll`: what a host learns from one poll of a running job
 - `MaskGenerationSpawner`: the type of `spawn_mask_generation`, so a host can hold the spawner
   in a field and its unit tests can install a stub instead of starting the real detector
@@ -35,7 +39,9 @@ Key structures:
 Key functions:
 - `spawn_mask_generation` / `poll_mask_generation`: the whole worker lifecycle
 - `generate_mask`: the blocking detection, called only from the worker
-- `draw_source_picker` / `draw_source_params` / `generate_button_hover_text`: the shared UI
+- `draw_source_picker` / `draw_source_params` / `draw_progress` / `generate_button_hover_text`:
+  the shared UI (`draw_progress` also shows a running job's model download through
+  `ms_tab_translation::model_download_status`)
 - `detect_watermark_mask`, `spawn_watermark_status_query`: the streaming watermark calls
 
 Notes:
@@ -44,8 +50,10 @@ NOTHING here may be called on the GUI thread except the `draw_*` helpers, `poll_
 */
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_local_ai::backend_health::ai_backend_offline_error;
+use ms_sysprobe::ai_models::{EnsureCtx, ModelDownloadEvent};
+use ms_tab_translation::model_download_status::{ModelDownloadStatus, draw_model_download_status};
 use ms_tab_translation::text_detector::{
-    TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, detect_ai_ctd_mask_for_image,
+    DetectFailure, TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, detect_ai_ctd_mask_for_image,
     detect_paddle_mask_for_image, detect_surya_mask_for_image,
 };
 use super::region_png::{decode_mask_png, encode_color_image_png_rgba};
@@ -54,6 +62,7 @@ use eframe::egui;
 use egui::Color32;
 use ms_thread as thread;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use web_time::Duration;
@@ -355,6 +364,60 @@ pub(super) enum MaskGenerationPoll {
     Failed(String),
 }
 
+/// One message of a mask-generation worker.
+#[derive(Debug)]
+pub(super) enum MaskGenerationMessage {
+    /// A (thinned) model-download event of the detection; retries are progress, not failures.
+    /// Drained by [`poll_mask_generation`] into the job's latest download.
+    ModelDownload(ModelDownloadEvent),
+    /// The detection's answer; the last message of a job.
+    Finished(Result<GeneratedMask, String>),
+}
+
+/// A running detection: its message channel, its cancel flag and its latest model download.
+///
+/// Dropping the job IS the cancel: both hosts' «cancel generation», closing the editor and
+/// dropping the host all drop it, and the drop sets the flag, so a model download the worker
+/// runs stops (the staged bytes are kept for the next run) instead of finishing for nobody.
+/// The detection call itself (a backend round trip) cannot be interrupted; its answer is
+/// discarded on arrival.
+#[derive(Debug)]
+pub(super) struct MaskGenerationJob {
+    rx: Receiver<MaskGenerationMessage>,
+    cancel: Arc<AtomicBool>,
+    download: ModelDownloadStatus,
+}
+
+impl MaskGenerationJob {
+    /// A job over `rx` whose worker polls `cancel`.
+    pub(super) fn new(rx: Receiver<MaskGenerationMessage>, cancel: Arc<AtomicBool>) -> Self {
+        Self { rx, cancel, download: ModelDownloadStatus::default() }
+    }
+
+    /// The model download the detection is performing, if any (for `draw_progress`).
+    pub(super) fn download(&self) -> Option<&ModelDownloadEvent> {
+        self.download.current()
+    }
+
+    /// Blocks for the job's final answer, skipping download events; `None` when the worker
+    /// is gone without one. Test helper: hosts poll instead.
+    #[cfg(test)]
+    pub(super) fn recv_finished(&self) -> Option<Result<GeneratedMask, String>> {
+        loop {
+            match self.rx.recv().ok()? {
+                MaskGenerationMessage::ModelDownload(_) => {}
+                MaskGenerationMessage::Finished(result) => return Some(result),
+            }
+        }
+    }
+}
+
+impl Drop for MaskGenerationJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Signature of [`spawn_mask_generation`], so a host can hold the spawner instead of naming it
 /// at the call site.
 ///
@@ -363,50 +426,61 @@ pub(super) enum MaskGenerationPoll {
 /// trip and, for the Torch sources, a model download into the runtime data root. A host stores
 /// this pointer, defaults it to `spawn_mask_generation` and lets its tests install a stub — see
 /// `region_edit_v2::host::RegionEditHost::spawn_detection`.
-pub(super) type MaskGenerationSpawner = fn(egui::ColorImage, MaskGenerationParams, Arc<Mutex<WatermarkProgress>>) -> Receiver<Result<GeneratedMask, String>>;
+pub(super) type MaskGenerationSpawner = fn(egui::ColorImage, MaskGenerationParams, Arc<Mutex<WatermarkProgress>>) -> MaskGenerationJob;
 
-/// Starts a detection on a worker thread and returns its result channel.
+/// Starts a detection on a worker thread and returns the job (channel + cancel flag).
 ///
 /// `image` is moved into the worker: the detection encodes it to PNG, which must not happen on
-/// the GUI thread. `progress` is written only by the watermark source.
+/// the GUI thread. `progress` is written only by the watermark source. Model-download events
+/// of the detector sources go into the job's channel; dropping the job stops such a download.
 #[must_use]
 pub(super) fn spawn_mask_generation(
     image: egui::ColorImage,
     params: MaskGenerationParams,
     progress: Arc<Mutex<WatermarkProgress>>,
-) -> Receiver<Result<GeneratedMask, String>> {
+) -> MaskGenerationJob {
     let (tx, rx) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
     thread::spawn(move || {
-        let result = generate_mask(&image, params, &progress);
+        let events = tx.clone();
+        let mut forward = |event: &ModelDownloadEvent| {
+            // A gone receiver means the job was dropped, which also set the cancel flag.
+            let _ = events.send(MaskGenerationMessage::ModelDownload(event.clone()));
+        };
+        let mut ctx = EnsureCtx { cancel: &worker_cancel, progress: &mut forward };
+        let result = generate_mask(&image, params, &progress, &mut ctx);
         // The receiver is gone when the host abandoned the job; there is nothing to report.
-        let _ = tx.send(result);
+        let _ = tx.send(MaskGenerationMessage::Finished(result));
     });
-    rx
+    MaskGenerationJob::new(rx, cancel)
 }
 
-/// Polls a running job, clearing `rx` on any terminal answer so the caller cannot poll a
-/// finished job twice.
-pub(super) fn poll_mask_generation(
-    rx: &mut Option<Receiver<Result<GeneratedMask, String>>>,
-) -> MaskGenerationPoll {
-    let Some(receiver) = rx.as_ref() else {
-        return MaskGenerationPoll::Idle;
-    };
-    match receiver.try_recv() {
-        Ok(Ok(mask)) => {
-            *rx = None;
-            MaskGenerationPoll::Done(mask)
-        }
-        Ok(Err(err)) => {
-            *rx = None;
-            MaskGenerationPoll::Failed(tf!("cleaning.mask_editor.mask_gen_error", err = err))
-        }
-        Err(TryRecvError::Empty) => MaskGenerationPoll::Running,
-        Err(TryRecvError::Disconnected) => {
-            *rx = None;
-            MaskGenerationPoll::Failed(
-                t!("cleaning.mask_editor.mask_gen_thread_crashed_error").to_string(),
-            )
+/// Polls a running job, clearing `job` on any terminal answer so the caller cannot poll a
+/// finished job twice. Model-download events are drained into the job's latest download (the
+/// job is `Running` meanwhile).
+pub(super) fn poll_mask_generation(job: &mut Option<MaskGenerationJob>) -> MaskGenerationPoll {
+    loop {
+        let Some(running) = job.as_mut() else {
+            return MaskGenerationPoll::Idle;
+        };
+        match running.rx.try_recv() {
+            Ok(MaskGenerationMessage::ModelDownload(event)) => running.download.record(event),
+            Ok(MaskGenerationMessage::Finished(Ok(mask))) => {
+                *job = None;
+                return MaskGenerationPoll::Done(mask);
+            }
+            Ok(MaskGenerationMessage::Finished(Err(err))) => {
+                *job = None;
+                return MaskGenerationPoll::Failed(tf!("cleaning.mask_editor.mask_gen_error", err = err));
+            }
+            Err(TryRecvError::Empty) => return MaskGenerationPoll::Running,
+            Err(TryRecvError::Disconnected) => {
+                *job = None;
+                return MaskGenerationPoll::Failed(
+                    t!("cleaning.mask_editor.mask_gen_thread_crashed_error").to_string(),
+                );
+            }
         }
     }
 }
@@ -415,15 +489,18 @@ pub(super) fn poll_mask_generation(
 ///
 /// Blocking: it performs a backend round trip and must only ever be called from a worker
 /// thread. `watermark_progress` is written only by the watermark source, whose first call
-/// downloads network code and weights on the backend side.
+/// downloads network code and weights on the backend side. `ctx` carries the job's cancel
+/// flag and download sink into the detector sources (their app-managed models).
 ///
 /// # Errors
 /// Returns a user-facing message when the backend fails, when the returned mask does not match
-/// the region size, or when its buffer length is wrong.
+/// the region size, or when its buffer length is wrong. A cancelled model download becomes the
+/// "generation cancelled" sentence; it only ever reaches a job its host already dropped.
 pub(super) fn generate_mask(
     image: &egui::ColorImage,
     params: MaskGenerationParams,
     watermark_progress: &Arc<Mutex<WatermarkProgress>>,
+    ctx: &mut EnsureCtx<'_>,
 ) -> Result<GeneratedMask, String> {
     let method_label = params.source.label();
     let (mask_size, mask_alpha) = match params.source {
@@ -432,15 +509,15 @@ pub(super) fn generate_mask(
                 mask_dilate_size: params.dilate_size,
                 ..TextDetectorAiCtdOptions::default()
             };
-            detect_ai_ctd_mask_for_image(image, &options)?
+            detect_ai_ctd_mask_for_image(image, &options, ctx).map_err(detect_failure_text)?
         }
         MaskSource::PaddleOcr => {
             let options = TextDetectorPaddleOcrOptions {
                 mask_dilate_size: params.dilate_size,
             };
-            detect_paddle_mask_for_image(image, &options)?
+            detect_paddle_mask_for_image(image, &options, ctx).map_err(detect_failure_text)?
         }
-        MaskSource::Surya => detect_surya_mask_for_image(image, params.dilate_size)?,
+        MaskSource::Surya => detect_surya_mask_for_image(image, params.dilate_size, ctx).map_err(detect_failure_text)?,
         MaskSource::Watermark => detect_watermark_mask(image, params, watermark_progress)?,
     };
     let mask_w = usize::try_from(mask_size[0])
@@ -465,6 +542,14 @@ pub(super) fn generate_mask(
         size: [mask_w, mask_h],
         alpha,
     })
+}
+
+/// The user-facing text of a detector failure (see [`generate_mask`] for the cancelled case).
+fn detect_failure_text(failure: DetectFailure) -> String {
+    match failure {
+        DetectFailure::Cancelled => t!("cleaning.mask_editor.generation_cancelled_status").to_string(),
+        DetectFailure::Failed(text) => text,
+    }
 }
 
 impl MaskGenerationState {
@@ -509,9 +594,13 @@ impl MaskGenerationState {
         }
     }
 
-    /// Draws the progress bar of a running watermark detection; a no-op for every other source
-    /// and while the watermark source is idle.
-    pub(super) fn draw_progress(&self, ui: &mut egui::Ui) {
+    /// Draws the model download of the running `job` (if it performs one), then the progress
+    /// bar of a running watermark detection; nothing while idle. The host's «cancel
+    /// generation» drops the job, which stops the download.
+    pub(super) fn draw_progress(&self, ui: &mut egui::Ui, job: Option<&MaskGenerationJob>) {
+        if let Some(event) = job.and_then(MaskGenerationJob::download) {
+            draw_model_download_status(ui, event);
+        }
         draw_watermark_progress_ui(ui, &self.watermark_progress);
     }
 }
@@ -945,12 +1034,12 @@ mod tests {
     /// sentence rather than an error wrapped as a backend failure.
     #[test]
     fn polling_reports_idle_and_a_dead_worker() {
-        let mut rx: Option<Receiver<Result<GeneratedMask, String>>> = None;
+        let mut rx: Option<MaskGenerationJob> = None;
         assert!(matches!(poll_mask_generation(&mut rx), MaskGenerationPoll::Idle));
 
-        let (tx, receiver) = mpsc::channel::<Result<GeneratedMask, String>>();
+        let (tx, receiver) = mpsc::channel::<MaskGenerationMessage>();
         drop(tx);
-        let mut rx = Some(receiver);
+        let mut rx = Some(MaskGenerationJob::new(receiver, Arc::new(AtomicBool::new(false))));
         match poll_mask_generation(&mut rx) {
             MaskGenerationPoll::Failed(text) => {
                 assert_eq!(text, t!("cleaning.mask_editor.mask_gen_thread_crashed_error"));
@@ -964,9 +1053,9 @@ mod tests {
     /// receiver is cleared so the job cannot be polled twice.
     #[test]
     fn a_backend_failure_becomes_the_generation_error_sentence() {
-        let (tx, receiver) = mpsc::channel::<Result<GeneratedMask, String>>();
-        tx.send(Err("boom".to_string())).expect("the receiver is alive");
-        let mut rx = Some(receiver);
+        let (tx, receiver) = mpsc::channel::<MaskGenerationMessage>();
+        tx.send(MaskGenerationMessage::Finished(Err("boom".to_string()))).expect("the receiver is alive");
+        let mut rx = Some(MaskGenerationJob::new(receiver, Arc::new(AtomicBool::new(false))));
         match poll_mask_generation(&mut rx) {
             MaskGenerationPoll::Failed(text) => {
                 assert_eq!(text, tf!("cleaning.mask_editor.mask_gen_error", err = "boom"));
@@ -975,6 +1064,31 @@ mod tests {
         }
         assert!(rx.is_none());
         assert!(matches!(poll_mask_generation(&mut rx), MaskGenerationPoll::Idle));
+    }
+
+    /// Download events keep a job running (they are drained, not terminal; the latest is kept
+    /// for the progress), and dropping the job — every host's cancel — raises the flag the
+    /// worker's model download polls.
+    #[test]
+    fn download_events_keep_a_job_running_and_dropping_it_cancels() {
+        let (tx, receiver) = mpsc::channel::<MaskGenerationMessage>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let event = ModelDownloadEvent {
+            file: "Torch/ComicTextDetector/comictextdetector.pt".to_string(),
+            file_index: 0,
+            file_count: 1,
+            phase: ms_sysprobe::ai_models::ModelDownloadPhase::Downloading,
+            staged: 10,
+            total: Some(100),
+        };
+        tx.send(MaskGenerationMessage::ModelDownload(event.clone())).expect("the receiver is alive");
+        tx.send(MaskGenerationMessage::ModelDownload(event.clone())).expect("the receiver is alive");
+        let mut job = Some(MaskGenerationJob::new(receiver, Arc::clone(&cancel)));
+        assert!(matches!(poll_mask_generation(&mut job), MaskGenerationPoll::Running));
+        assert_eq!(job.as_ref().and_then(MaskGenerationJob::download), Some(&event), "the drained event is kept for the progress");
+        assert!(!cancel.load(Ordering::Relaxed));
+        drop(job.take());
+        assert!(cancel.load(Ordering::Relaxed), "dropping the job must cancel its download");
     }
 
     /// `watermark.status` fields are optional and may hold non-string entries;

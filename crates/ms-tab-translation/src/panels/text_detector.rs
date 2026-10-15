@@ -29,13 +29,26 @@ Flow:
 - AI mode advanced params hold the CTD detection size (the plan's tile side); shared mask
   dilation lives in the common section with other detector-wide options; device selection
   is configured globally in `Настройки -> ИИ бэкенд`.
+- While the batch downloads a model, the status line is followed by that download
+  (`model_download_status::draw_model_download_status`, `view.model_download`) and a Cancel
+  -> `TextDetectorPanelActions::cancel_detection` (the batch ends with `DetectCancelled`).
+- With `Surya` selected, the shared external-model download block
+  (`panels::ocr_model_download`) is drawn for its checkpoint bundle
+  (`text_detector::SURYA_DETECTOR_SPECS`, snapshot `view.surya_model`, request
+  `TextDetectorPanelActions::surya_model_download`); a run with the checkpoint missing fails
+  with the "not downloaded" error naming that block's button.
 - Строка кнопок под чекбоксами: вход/выход из режима редактирования строк
   детектора и режима редактирования маски.
 */
 
+use crate::model_download_status::draw_model_download_status;
+use crate::ocr_model_download::{OcrModelPanelSnapshot, bundle_key};
+use crate::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download};
 use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
+use ms_sysprobe::ai_models::ModelDownloadEvent;
 use crate::text_detector::{
-    DetectorRoute, TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, TextDetectorRunMode, TextDetectorSuryaOptions,
+    DetectorRoute, SURYA_DETECTOR_SPECS, TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, TextDetectorRunMode,
+    TextDetectorSuryaOptions,
 };
 use ms_models::page_view::{PageImageInfo, SourcePageLoadState};
 use ms_text_detect::{DetectParams, EngineKind, PlanMode, PlanNotice, plan_detection};
@@ -373,6 +386,10 @@ pub struct TextDetectorPanelActions {
     pub toggle_edit_lines_mode: bool,
     pub toggle_edit_mask_mode: bool,
     pub options_changed: bool,
+    /// Cancel of the running batch, offered while it downloads a model.
+    pub cancel_detection: bool,
+    /// Download / cancel requested in the Surya checkpoint's download block.
+    pub surya_model_download: ModelDownloadAction,
 }
 
 /// Read-only per-frame state the tab lends to [`draw_text_detector_panel`]. Every
@@ -384,6 +401,11 @@ pub struct TextDetectorPanelView<'a> {
     pub status_color: egui::Color32,
     /// `(done, total)` pages of the running detection, shown when `total > 0`.
     pub progress: Option<(usize, usize)>,
+    /// Latest model download of the running batch (`model_download_status::ModelDownloadStatus`).
+    pub model_download: Option<&'a ModelDownloadEvent>,
+    /// Download snapshot of the Surya checkpoint bundle (`SURYA_DETECTOR_SPECS`), taken while
+    /// `Surya` was selected at the start of the frame; drawn only while `Surya` is selected.
+    pub surya_model: Option<&'a OcrModelPanelSnapshot>,
     pub detect_busy: bool,
     pub ocr_busy: bool,
     pub has_pages: bool,
@@ -419,6 +441,8 @@ pub fn draw_text_detector_panel(
         status_text,
         status_color,
         progress,
+        model_download,
+        surya_model,
         detect_busy,
         ocr_busy,
         has_pages,
@@ -440,6 +464,12 @@ pub fn draw_text_detector_panel(
     {
         ui.small(format!("{done} / {total}"));
     }
+    if let Some(event) = model_download {
+        draw_model_download_status(ui, event);
+        if ui.button(t!("translation.common.cancel_button")).clicked() {
+            actions.cancel_detection = true;
+        }
+    }
     ui.separator();
 
     // Algorithm selector: frameless self-gating toggle buttons (no "Алгоритм:"
@@ -453,6 +483,14 @@ pub fn draw_text_detector_panel(
             }
         }
     });
+    // Surya's checkpoint is downloaded explicitly here (needs only the network, so it is not
+    // gated on the algorithm's runtime).
+    if options.algorithm == TextDetectorAlgorithm::Surya
+        && let Some(snapshot) = surya_model
+        && snapshot.bundle_key == bundle_key(&SURYA_DETECTOR_SPECS)
+    {
+        actions.surya_model_download = draw_ocr_model_download(ui, snapshot);
+    }
 
     actions.options_changed |= ui
         .checkbox(&mut options.draw_lines, t!("translation.text_detector_panel.show_blocks_label"))

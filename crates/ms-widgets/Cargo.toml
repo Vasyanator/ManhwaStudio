@@ -66,9 +66,10 @@ ms-fonts = { path = "../ms-fonts" }
 # title-local override registers under. Native-only with `ms-fonts`: only the
 # desktop half of the module parses files from disk.
 ttf-parser = { workspace = true, default-features = true }
-# Blocking download of a spellcheck dictionary pair (`spellchecked_line`). Native-only:
-# there is no synchronous HTTP client on wasm, where the download path returns an error.
-ureq.workspace = true
+# Download of a spellcheck dictionary pair (`spellchecked_line`, `fetch_small`: retry with
+# capped backoff, `Range` resume, timeouts, size cap). Native-only: there is no synchronous
+# HTTP client on wasm, where the download path returns an error.
+ms-download = { path = "../ms-download" }
 
 [dev-dependencies]
 # Same crate as in `[dependencies]`, re-declared only to switch on `test-support`

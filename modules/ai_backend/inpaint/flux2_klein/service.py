@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     import numpy as np
 
+from ...runtime.health_snapshot import HealthSnapshot
 from ...runtime.model_manager import LoadedModelManager
 from . import attention, hardware, pipeline, prompt_cache
 from .components import (
@@ -166,6 +167,9 @@ class Flux2KleinInpaintService:
         self._active_key: str | None = None
         self._device: Any = None
         self._last_error: str | None = None
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a pipeline load and a generation hold (S-014).
+        self._health = HealthSnapshot(ready=False, active_key=None, last_error=None)
         # Whether the pipeline in `self._pipe` has been warmed up SINCE its
         # weights were last placed. The warm-up is a property of a PLACEMENT, not
         # of a request: everything it proves (nothing left on `meta`, the queued
@@ -371,17 +375,26 @@ class Flux2KleinInpaintService:
         """Snapshot for the periodic backend health event.
 
         `device` follows `_device_label`: the loaded device, or the one that
-        would be used, never a placeholder. `ready` tells the two apart.
+        would be used, never a placeholder. `ready` tells the two apart. The
+        other fields come from the published snapshot, so this answers while a
+        load or a generation holds the instance lock.
         """
-        device = self._device_label()
-        with self._lock:
-            return {
-                "ready": self._pipe is not None,
-                "model": "flux2_klein",
-                "device": device,
-                "active_key": self._active_key,
-                "last_error": self._last_error,
-            }
+        fields = self._health.read()
+        return {
+            "ready": fields["ready"],
+            "model": "flux2_klein",
+            "device": self._device_label(),
+            "active_key": fields["active_key"],
+            "last_error": fields["last_error"],
+        }
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock`."""
+        self._health.publish(
+            ready=self._pipe is not None,
+            active_key=self._active_key,
+            last_error=self._last_error,
+        )
 
     def unload(self) -> bool:
         """Drop the resident pipeline and text encoder; `False` when nothing was loaded.
@@ -415,6 +428,7 @@ class Flux2KleinInpaintService:
         key = self._active_key
         self._pipe = None
         self._active_key = None
+        self._publish_health_locked()
         # The weights are gone, so the warm-up that proved where they sat is
         # meaningless; the pipeline built next owes a fresh one.
         self._pipeline_warmed = False
@@ -566,8 +580,10 @@ class Flux2KleinInpaintService:
                     reference_rgb=reference_rgb,
                 )
                 self._last_error = None
+                self._publish_health_locked()
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 raise
             finally:
                 lease.release()
@@ -656,8 +672,10 @@ class Flux2KleinInpaintService:
                     )
                     encoded = True
                 self._last_error = None
+                self._publish_health_locked()
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 raise
 
         log.info(
@@ -798,8 +816,10 @@ class Flux2KleinInpaintService:
                     )
                 except Exception as exc:
                     self._last_error = str(exc)
+                    self._publish_health_locked()
                     raise
                 self._last_error = None
+                self._publish_health_locked()
                 components = self._components_locked()
             finally:
                 self._lock.release()
@@ -1862,6 +1882,7 @@ class Flux2KleinInpaintService:
         prev = self._active_key
         self._pipe = None
         self._active_key = None
+        self._publish_health_locked()
         # A pipeline that is about to be built has not been warmed up, and the one
         # being dropped takes its warm-up with it.
         self._pipeline_warmed = False
@@ -2019,6 +2040,7 @@ class Flux2KleinInpaintService:
         self._pipe = pipe
         self._device = device
         self._active_key = model_key
+        self._publish_health_locked()
         return pipe
 
     # ---- warm-up: proof that the weights really left the host ----
@@ -2437,6 +2459,7 @@ class Flux2KleinInpaintService:
         key = self._active_key
         self._pipe = None
         self._active_key = None
+        self._publish_health_locked()
         # The pipeline this warm-up described is gone with it.
         self._pipeline_warmed = False
         hardware._clear_torch_cache()

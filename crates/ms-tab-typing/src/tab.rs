@@ -1106,8 +1106,8 @@ impl TypingTabState {
         // it is folded into the one "busy" term the export trigger and the deferred dispatch read.
         let save_busy = self.save_busy || self.flatten_to_file_in_progress();
         let _frame_span = ms_log::trace_scope!(cat::FRAME, "typing.draw page={}", self.canvas.current_page_idx());
-        // Cross-tab sync: if the shared LayerDoc changed (version advanced) since we last projected,
-        // re-project the current page from it (in-memory; no disk reload).
+        // Cross-tab sync: if the shared LayerDoc changed the current page (its page revision advanced)
+        // since we last projected it, re-project that page from it (in-memory; no disk reload).
         self.text_overlays
             .maybe_reproject_from_doc_version(self.canvas.current_page_idx());
         self.text_overlays.ensure_loader_started(project);
@@ -2024,8 +2024,8 @@ struct BubbleCreateTextRequest {
 ///   flattened page for the flatten): a resident page is never re-read by `build_page_job`, so a
 ///   PS-tab edit made after its projection would be composed stale. Clears once the in-flight jobs
 ///   that hold the re-projection back finish. Evaluated LAST and only when the three cheap terms
-///   hold (short-circuit): the export's form re-projects stale pages, which during the preload pass
-///   (every applied page bumps the doc version) would cost every resident page on every frame.
+///   hold (short-circuit): both forms may re-project a stale page (clone its display images on the
+///   GUI thread), which is wasted per-frame work while the preload is still inserting pages.
 #[must_use]
 fn export_dispatch_ready(preload_active: bool, masks_ready: bool, save_busy: bool, docs_synced: impl FnOnce() -> bool) -> bool {
     !preload_active && masks_ready && !save_busy && docs_synced()
@@ -3241,14 +3241,15 @@ pub(super) struct TypingTextOverlayLayer {
     /// rewritten together with `bands_by_page` by every projection; the group-fold input of
     /// `ordering::composite_plan` for the overlay hit-test and the export job.
     groups_by_page: HashMap<usize, Vec<ms_models::layer_model::persist::GroupMeta>>,
-    /// Per page: the `LayerDoc::version` at which this tab last projected that page FROM THE DOC
-    /// (`sync_from_doc`, or the adopt-only path of `maybe_reproject_from_doc_version` for a page the
-    /// doc does not hold). The doc has one global version, so a page whose entry differs from it MAY
-    /// be stale (any page may have been edited elsewhere) and is re-projected before it is shown or
-    /// flattened (`page_projection_current`). A projection built without the doc (the disk / empty
-    /// fallbacks of `ensure_raster_layers_for_page`) removes the entry. Entries of pages no longer
-    /// resident in the projection are ignored: such a page is re-projected fresh on its next use.
-    projected_doc_version: HashMap<usize, u64>,
+    /// Per page: the `LayerDoc::page_revision` at which this tab last projected that page FROM THE
+    /// DOC (`sync_from_doc`, or the adopt-only path of `maybe_reproject_from_doc_version` for a page
+    /// the doc does not hold). A page whose entry differs from its current page revision was changed
+    /// in the doc since (by the PS tab, or by a load / evict) and is re-projected before it is shown,
+    /// flattened or exported (`page_projection_current`); an edit of another page leaves the entry
+    /// current. A projection built without the doc (the disk / empty fallbacks of
+    /// `ensure_raster_layers_for_page`) removes the entry. Entries of pages no longer resident in the
+    /// projection are ignored: such a page is re-projected fresh on its next use.
+    projected_page_revision: HashMap<usize, u64>,
     /// In-flight "create external image as a raster layer" job (replaces the old image-overlay path).
     create_raster_state: Option<TypingCreateRasterState>,
     /// In-flight "bake effects into the selected raster" job.
@@ -3405,7 +3406,7 @@ impl Default for TypingTextOverlayLayer {
             raster_layers_by_page: HashMap::new(),
             bands_by_page: HashMap::new(),
             groups_by_page: HashMap::new(),
-            projected_doc_version: HashMap::new(),
+            projected_page_revision: HashMap::new(),
             create_raster_state: None,
             raster_effects_state: None,
             pending_raster_effects: None,

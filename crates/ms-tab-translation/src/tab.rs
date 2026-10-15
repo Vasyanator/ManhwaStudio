@@ -9,6 +9,8 @@ Main types:
 - `canvas_input::CanvasSelection` (child module `tab/canvas_input.rs`): the running canvas-wide
   rect selection (quick OCR, advanced recognition, image-bubble page crop) driven from the input
   router's claim; the crop writes crop metadata instead of dispatching OCR.
+- `route_inputs::OcrRouteInputsRefresh` (child module `tab/route_inputs.rs`, desktop-only): the
+  cached OCR/detector routing inputs, re-read from `user_config` by a background worker.
 - `AdvancedRecognitionWindow`: floating OCR preview/editor for manual region recognition.
 - `OcrToast`: short-lived foreground notification (`text`, `severity`, `hide_at_s`); its colour
   comes from `ms_theme::Severity` (toasts and detector status never hand-type colours).
@@ -184,7 +186,9 @@ Key TranslationTabState field groups:
   may use; OCR/detector routes are gated per route through it, MT and AI API never are),
   `ocr_controller`, `ocr_panel_options`,
   `ocr_engine_states` + `ocr_loading_engine` (runtime per-engine OCR statuses),
-  `ocr_model_downloads` (external OCR model status/download controller, polled per frame),
+  `ocr_model_downloads` (external model status/download controller, polled per frame; it
+  serves the OCR panel's bundles AND the detector panel's Surya checkpoint, so one download
+  runs at a time across both),
   `ocr_last_panel_engine`/`ocr_last_health_check_request_s`,
   `ai_backend_health*`,
   `mt_controller`, `mt_panel_options`, `text_detector_controller`,
@@ -192,7 +196,11 @@ Key TranslationTabState field groups:
 - Detector runtime/cache: `text_detector_results`, `text_detector_mask_textures`,
   shared `text_mask_model`, `text_mask_synced_revision`,
   `text_detector_status`, `text_detector_status_severity`, `text_detector_progress`,
-  `text_detection_storage_*`.
+  `text_detector_model_download`, `text_detection_storage_*`.
+- Model downloads of OCR loads / detector batches: `ocr_model_download` and
+  `text_detector_model_download` (`model_download_status::ModelDownloadStatus`), drawn by the
+  panels with a Cancel (`TranslationOcrController::cancel_model_download`,
+  `TranslationTextDetectorController::cancel_detection`).
 - Input: `input_frame` (this frame's `InputFrame`, `Some` only during the host's draw),
   `input_labels` (this frame's binding texts).
 - OCR interaction runtime: `canvas_selection`, `ocr_toast`, `next_ocr_request_id`,
@@ -244,10 +252,12 @@ use crate::machine_translation::{
 };
 use crate::ocr::{
     OcrControllerEvent, OcrEngine, OcrLoadState, OcrRecognizeRequest, OcrRuntimeOptions,
-    TranslationOcrController, external_model_spec,
+    TranslationOcrController, external_model_specs,
 };
+use crate::model_download_status::ModelDownloadStatus;
 use crate::ocr_model_download::OcrModelDownloadController;
 use crate::panels::ocr_model_download::ModelDownloadAction;
+use ms_sysprobe::ai_models::external::ExternalModelSpec;
 use ms_sysprobe::ai_models::external_catalog::PaddleVlVariant;
 use ms_ai_api::{AiApiService, AiApiTaskRunner, GenerationSnapshot, ImageInputSupport, image_input_support, is_probable_quota_or_limit_error};
 use crate::panels::bubbles::{
@@ -271,7 +281,7 @@ use crate::panels::text_detector::{
     detector_page_size, draw_text_detector_panel,
 };
 use crate::text_detector::{
-    TextDetectorControllerEvent, TextDetectorPageResult, TextDetectorRect, TextDetectorRunMode,
+    SURYA_DETECTOR_SPECS, TextDetectorControllerEvent, TextDetectorPageResult, TextDetectorRect, TextDetectorRunMode,
     TranslationTextDetectorController,
 };
 use ms_models::page_view::PageImageInfo;
@@ -298,6 +308,9 @@ use web_time::Duration;
 
 // The canvas pointer drivers (rect selections, lines / mask edit), fed by the input frame.
 mod canvas_input;
+// Off-GUI-thread refresh of the OCR / detector routing inputs (desktop-only).
+#[cfg(not(target_arch = "wasm32"))]
+mod route_inputs;
 
 use canvas_input::CanvasSelection;
 
@@ -335,10 +348,11 @@ fn footer_additional_character_names() -> [&'static str; 13] {
 }
 const TEXT_DETECTOR_OCR_RETRY_DELAY_SECS: f64 = 3.0;
 const OCR_HEALTH_CHECK_THROTTLE_SECS: f64 = 0.5;
-/// Minimum interval between disk reads of the native-runtime routing inputs
-/// (selected `AiRuntime` + SIGILL load guard) that back the route-aware OCR
-/// readiness gate. The gate runs every frame, so the read is cached and refreshed
-/// no more than this often to keep the GUI thread off the disk. Desktop-only.
+/// Minimum interval between starts of the background read of the native-runtime
+/// routing inputs (selected `AiRuntime` + SIGILL load guard) that back the
+/// route-aware OCR readiness gate (`route_inputs::OcrRouteInputsRefresh`). The gate
+/// runs every frame against the cached snapshot; the read itself never runs on the
+/// GUI thread. Desktop-only.
 #[cfg(not(target_arch = "wasm32"))]
 const OCR_ROUTE_INPUTS_CACHE_TTL: web_time::Duration = web_time::Duration::from_millis(500);
 const FOOTER_CHARACTER_AUTOCOMPLETE_MAX: usize = 7;
@@ -648,17 +662,19 @@ pub struct TranslationTabState {
     /// PaddleOCR-VL variants); polled every frame by `poll_ocr_model_downloads`.
     ocr_model_downloads: OcrModelDownloadController,
     ocr_loading_engine: Option<OcrEngine>,
+    /// Latest app-managed model download of the OCR command in flight (shown under the OCR
+    /// panel's status for `ocr_loading_engine`); cleared on every state change that ends it.
+    ocr_model_download: ModelDownloadStatus,
     ocr_last_panel_engine: Option<OcrEngine>,
     ocr_last_health_check_request_s: f64,
     /// Cached native-runtime routing inputs (selected `AiRuntime` + provider-scoped
     /// SIGILL load guard) that drive the route-aware "does OCR need the Python
-    /// backend?" gate. Read from disk lazily and refreshed at most every
-    /// `OCR_ROUTE_INPUTS_CACHE_TTL` so the per-frame gate never blocks the GUI
-    /// thread on disk I/O. Desktop-only: the native runtime is compiled out on web.
+    /// backend?" gate. Re-read by a background worker at most every
+    /// `OCR_ROUTE_INPUTS_CACHE_TTL` (`refresh_ocr_route_inputs_cache`), so the GUI
+    /// thread never touches the disk for it. Desktop-only: the native runtime is
+    /// compiled out on web.
     #[cfg(not(target_arch = "wasm32"))]
-    ocr_route_inputs_cached: (ms_config::AiRuntime, ms_config::OrtLoadDecision),
-    #[cfg(not(target_arch = "wasm32"))]
-    ocr_route_inputs_checked_at: Option<web_time::Instant>,
+    ocr_route_inputs: route_inputs::OcrRouteInputsRefresh,
     mt_controller: TranslationMtController,
     mt_panel_options: MtPanelOptions,
     /// Key / metadata requests of the MT panel's AI API connection widget
@@ -674,6 +690,9 @@ pub struct TranslationTabState {
     text_detector_status: String,
     text_detector_status_severity: Severity,
     text_detector_progress: Option<(usize, usize)>,
+    /// Latest model download of the running detector batch; cleared by every non-download
+    /// event of the batch (pages, end).
+    text_detector_model_download: ModelDownloadStatus,
     text_detector_edit_lines_mode: bool,
     text_detector_edit_mask_mode: bool,
     /// Outer rect the dock panel holding the «Лента» tab was drawn at on the LAST
@@ -823,18 +842,15 @@ impl TranslationTabState {
             ocr_engine_states: [OcrLoadState::NotLoaded; 7],
             ocr_model_downloads: OcrModelDownloadController::new(),
             ocr_loading_engine: None,
+            ocr_model_download: ModelDownloadStatus::default(),
             ocr_last_panel_engine: None,
             ocr_last_health_check_request_s: -10_000.0,
-            // Safe defaults (Backend runtime, Safe guard) until the first lazy
-            // refresh reads the real values off disk; `None` forces that refresh on
-            // first use so the very first gate decision is accurate.
+            // Unknown until the first background read lands (started on the first
+            // refresh); the gates are evaluated optimistically meanwhile
+            // (`route_inputs::gate_over_inputs`) and the native-ORT capability slot stays
+            // as primed (unknown).
             #[cfg(not(target_arch = "wasm32"))]
-            ocr_route_inputs_cached: (
-                ms_config::AiRuntime::Backend,
-                ms_config::OrtLoadDecision::Safe,
-            ),
-            #[cfg(not(target_arch = "wasm32"))]
-            ocr_route_inputs_checked_at: None,
+            ocr_route_inputs: route_inputs::OcrRouteInputsRefresh::new(),
             mt_controller: TranslationMtController::default(),
             mt_panel_options: MtPanelOptions::default(),
             mt_ai_api_tasks: AiApiTaskRunner::default(),
@@ -848,6 +864,7 @@ impl TranslationTabState {
             text_detector_status: t!("translation.tab.ready_status").to_string(),
             text_detector_status_severity: Severity::Success,
             text_detector_progress: None,
+            text_detector_model_download: ModelDownloadStatus::default(),
             text_detector_edit_lines_mode: false,
             text_detector_edit_mask_mode: false,
             ribbon_panel_rect: None,
@@ -1043,26 +1060,46 @@ impl TranslationTabState {
         sync_engine(self, OcrEngine::Baberu, baberu_ready);
     }
 
+    /// The external model bundle of the OCR panel's current selection
+    /// (`ocr::external_model_specs`); empty for engines without one.
+    fn selected_ocr_model_specs(&self) -> Vec<&'static ExternalModelSpec> {
+        let options = &self.ocr_panel_options;
+        external_model_specs(options.engine, options.paddle_vl_model, &options.easy_langs)
+    }
+
     /// Applies the OCR panel's external-model outcome of one frame: a requested download /
-    /// cancel, a fresh status probe when the engine or the PaddleOCR-VL variant changed (an
-    /// earlier "installed" may be stale), and `NotLoaded` for PaddleOCR-VL after a variant
-    /// switch (the loaded weights are the old variant's).
-    fn apply_ocr_model_panel_changes(&mut self, engine_before: OcrEngine, variant_before: PaddleVlVariant, action: ModelDownloadAction) {
-        let engine = self.ocr_panel_options.engine;
-        let variant = self.ocr_panel_options.paddle_vl_model;
-        let spec = external_model_spec(engine, variant);
-        if variant != variant_before {
+    /// cancel, a fresh status probe when the selected bundle changed (engine, PaddleOCR-VL
+    /// variant or the EasyOCR languages' script; an earlier "installed" may be stale), and
+    /// `NotLoaded` for PaddleOCR-VL after a variant switch (the loaded weights are the old
+    /// variant's). `specs_before` is the bundle selected at the start of the frame.
+    fn apply_ocr_model_panel_changes(
+        &mut self,
+        specs_before: &[&'static ExternalModelSpec],
+        variant_before: PaddleVlVariant,
+        action: ModelDownloadAction,
+    ) {
+        let specs = self.selected_ocr_model_specs();
+        if self.ocr_panel_options.paddle_vl_model != variant_before {
             self.set_ocr_state_for_engine(OcrEngine::PaddleVl, OcrLoadState::NotLoaded);
         }
-        if (engine != engine_before || variant != variant_before)
-            && let Some(spec) = spec
-        {
-            self.ocr_model_downloads.request_status(spec);
+        if specs != specs_before {
+            self.ocr_model_downloads.request_bundle_status(&specs);
         }
-        match (action, spec) {
-            (ModelDownloadAction::Download, Some(spec)) => self.ocr_model_downloads.start_download(spec),
-            (ModelDownloadAction::Cancel, Some(_)) => self.ocr_model_downloads.cancel(),
-            (ModelDownloadAction::None, _) | (ModelDownloadAction::Download | ModelDownloadAction::Cancel, None) => {}
+        match action {
+            ModelDownloadAction::Download if !specs.is_empty() => self.ocr_model_downloads.start_download(&specs),
+            ModelDownloadAction::Verify if !specs.is_empty() => self.ocr_model_downloads.start_verify(&specs),
+            ModelDownloadAction::Cancel if !specs.is_empty() => self.ocr_model_downloads.cancel(),
+            ModelDownloadAction::None | ModelDownloadAction::Download | ModelDownloadAction::Verify | ModelDownloadAction::Cancel => {}
+        }
+    }
+
+    /// Applies the detector panel's Surya-checkpoint download / verify request of one frame.
+    fn apply_detector_model_panel_action(&mut self, action: ModelDownloadAction) {
+        match action {
+            ModelDownloadAction::Download => self.ocr_model_downloads.start_download(&SURYA_DETECTOR_SPECS),
+            ModelDownloadAction::Verify => self.ocr_model_downloads.start_verify(&SURYA_DETECTOR_SPECS),
+            ModelDownloadAction::Cancel => self.ocr_model_downloads.cancel(),
+            ModelDownloadAction::None => {}
         }
     }
 
@@ -1317,17 +1354,25 @@ impl TranslationTabState {
     }
 
     /// The routing inputs (effective `AiRuntime` + provider-scoped SIGILL load guard) the
-    /// route gates use, from the short-lived cache (see `refresh_ocr_route_inputs_cache`);
-    /// callers that may run before any refresh this frame refresh first. Never reads disk.
+    /// route gates use, evaluated through `gate`: against the background-refreshed snapshot
+    /// (see `refresh_ocr_route_inputs_cache`), or — before the first read landed —
+    /// optimistically over the possible inputs (`route_inputs::gate_over_inputs`), so nothing
+    /// is refused that the real inputs might allow. Never reads disk.
     #[cfg(not(target_arch = "wasm32"))]
-    fn ocr_route_inputs(&self) -> (ms_config::AiRuntime, ms_config::OrtLoadDecision) {
-        self.ocr_route_inputs_cached
+    fn gate_over_ocr_route_inputs<T, E>(
+        &self,
+        gate: impl Fn((ms_config::AiRuntime, ms_config::OrtLoadDecision)) -> Result<T, E>,
+    ) -> Result<T, E> {
+        route_inputs::gate_over_inputs(self.ocr_route_inputs.snapshot(), gate)
     }
 
     /// Web build: no native runtime, so every local route is a backend route.
     #[cfg(target_arch = "wasm32")]
-    fn ocr_route_inputs(&self) -> (ms_config::AiRuntime, ms_config::OrtLoadDecision) {
-        (ms_config::AiRuntime::Backend, ms_config::OrtLoadDecision::Safe)
+    fn gate_over_ocr_route_inputs<T, E>(
+        &self,
+        gate: impl Fn((ms_config::AiRuntime, ms_config::OrtLoadDecision)) -> Result<T, E>,
+    ) -> Result<T, E> {
+        gate((ms_config::AiRuntime::Backend, ms_config::OrtLoadDecision::Safe))
     }
 
     /// Route-aware gate for the selected OCR engine/model: what it runs on, or why it cannot
@@ -1337,14 +1382,15 @@ impl TranslationTabState {
     /// Uses the cached route inputs (no disk I/O); `&mut self` callers refresh them first
     /// through [`Self::current_ocr_route_availability`].
     fn selected_ocr_route_availability(&self) -> Result<AiRouteKind, LocalAiOff> {
-        let (runtime, guard) = self.ocr_route_inputs();
-        crate::ocr::ocr_route_availability(
-            self.ocr_panel_options.engine,
-            &self.ocr_panel_options.manga_model,
-            runtime,
-            guard,
-            &self.local_ai,
-        )
+        self.gate_over_ocr_route_inputs(|(runtime, guard)| {
+            crate::ocr::ocr_route_availability(
+                self.ocr_panel_options.engine,
+                &self.ocr_panel_options.manga_model,
+                runtime,
+                guard,
+                &self.local_ai,
+            )
+        })
     }
 
     /// [`Self::selected_ocr_route_availability`] after refreshing the throttled route-input
@@ -1362,7 +1408,9 @@ impl TranslationTabState {
 
     /// Why an OCR request for the selected engine/model must be refused now, or `None`: the
     /// route's local runtime is off (its reason), or the route needs the backend and the
-    /// backend is unavailable. The OCR triggers toast it as an error.
+    /// backend is unavailable. The OCR triggers toast it as an error. Before the first
+    /// route-inputs read landed a native-capable selection is not refused for the backend
+    /// (see [`Self::gate_over_ocr_route_inputs`]); the OCR worker routes with the real inputs.
     fn ocr_request_refusal(&mut self) -> Option<String> {
         match self.current_ocr_route_availability() {
             Err(off) => Some(off.user_message()),
@@ -1377,33 +1425,35 @@ impl TranslationTabState {
     /// the cached route inputs (`detector_native_route`, the rule the detector worker applies),
     /// checked against `local_ai` and the backend's PyTorch report.
     fn text_detector_availability(&self) -> Result<(), DetectorUnavailable> {
-        let (runtime, guard) = self.ocr_route_inputs();
-        self.text_detector_options.algorithm.availability(
-            crate::text_detector::detector_native_route(runtime, guard),
-            &self.local_ai,
-            self.ai_backend_torch_available(),
-        )
+        let torch_available = self.ai_backend_torch_available();
+        self.gate_over_ocr_route_inputs(|(runtime, guard)| {
+            self.text_detector_options.algorithm.availability(
+                crate::text_detector::detector_native_route(runtime, guard),
+                &self.local_ai,
+                torch_available,
+            )
+        })
     }
 
-    /// Refreshes the cached native-runtime routing inputs from disk at most once per
-    /// `OCR_ROUTE_INPUTS_CACHE_TTL`. Cheap no-op inside the throttle window, so the
-    /// per-frame route-aware gate can call it freely without per-frame disk reads.
+    /// Non-blocking refresh step of the cached native-runtime routing inputs: adopts a
+    /// background read that landed and, at most once per `OCR_ROUTE_INPUTS_CACHE_TTL` with
+    /// none in flight, starts the next one (`route_inputs::spawn_route_inputs_read`). Never
+    /// touches the disk on the calling (GUI) thread, so the per-frame gate calls it freely.
+    /// Each landed snapshot republishes the native-ORT capability slot.
     #[cfg(not(target_arch = "wasm32"))]
     fn refresh_ocr_route_inputs_cache(&mut self) {
-        let now = web_time::Instant::now();
-        let stale = self
-            .ocr_route_inputs_checked_at
-            .is_none_or(|checked| now.duration_since(checked) >= OCR_ROUTE_INPUTS_CACHE_TTL);
-        if stale {
-            self.ocr_route_inputs_cached = crate::ocr::read_ocr_route_inputs();
-            self.ocr_route_inputs_checked_at = Some(now);
+        let landed = self.ocr_route_inputs.poll(
+            web_time::Instant::now(),
+            OCR_ROUTE_INPUTS_CACHE_TTL,
+            route_inputs::spawn_route_inputs_read,
+        );
+        if let Some((runtime, guard)) = landed {
             // Publish native onnxruntime availability for UI gating. Native ORT is
             // "armed" — considered available even before its dylib loads — when native ONNX
             // is allowed in this process (`local_ai.native_onnx`: not `--no-ai`, and the
             // platform has it), the effective runtime is Native and the SIGILL load guard is
             // Safe. Otherwise native is not the ORT path, so this slot is false and ORT
             // availability falls to the backend slot (backend connected + providers).
-            let (runtime, guard) = self.ocr_route_inputs_cached;
             let native_armed = self.local_ai.native_onnx.is_ok()
                 && runtime == ms_config::AiRuntime::Native
                 && guard == ms_config::OrtLoadDecision::Safe;
@@ -1475,14 +1525,11 @@ impl TranslationTabState {
             TranslationPanel::Ocr => {
                 let selected_engine_before = self.ocr_panel_options.engine;
                 let selected_variant_before = self.ocr_panel_options.paddle_vl_model;
-                let model_spec = external_model_spec(selected_engine_before, selected_variant_before);
+                let model_specs = self.selected_ocr_model_specs();
                 // Opening the panel on (or switching to) a model never probed this session.
-                if let Some(spec) = model_spec
-                    && self.ocr_model_downloads.state_for(spec.id) == crate::ocr_model_download::OcrModelDownloadState::Unknown
-                {
-                    self.ocr_model_downloads.request_status(spec);
-                }
-                let model_snapshot = model_spec.map(|spec| self.ocr_model_downloads.panel_snapshot(spec));
+                self.ocr_model_downloads.probe_unknown(&model_specs);
+                let model_snapshot =
+                    (!model_specs.is_empty()).then(|| self.ocr_model_downloads.panel_snapshot(&model_specs));
                 // The MT source language is the input language of OCR; `TextTab.text_language` is the
                 // typesetting (output) language and the wrong signal here.
                 let korean_source = self.mt_panel_options.source_lang.trim().eq_ignore_ascii_case("ko");
@@ -1513,7 +1560,15 @@ impl TranslationTabState {
                         advanced_active: advanced_selection_active,
                     },
                     &self.ocr_controller.generation_snapshot(),
-                    OcrPanelModelView { korean_source, download: model_snapshot.as_ref() },
+                    OcrPanelModelView {
+                        korean_source,
+                        download: model_snapshot.as_ref(),
+                        // Only the engine whose command downloads shows its progress.
+                        engine_download: self
+                            .ocr_model_download
+                            .current()
+                            .filter(|_| self.ocr_loading_engine == Some(selected_engine_before)),
+                    },
                 );
                 if actions.options_changed {
                     self.ocr_settings_dirty = true;
@@ -1525,9 +1580,12 @@ impl TranslationTabState {
                     }
                 }
                 self.ocr_ai_api_tasks.submit_actions(&mut self.ocr_panel_options.ai_api, actions.ai_api);
-                self.apply_ocr_model_panel_changes(selected_engine_before, selected_variant_before, actions.model_download);
+                self.apply_ocr_model_panel_changes(&model_specs, selected_variant_before, actions.model_download);
                 if let Some(shown) = actions.stop_generation {
                     self.stop_ocr_generation(ctx, shown);
+                }
+                if actions.cancel_model_download {
+                    self.ocr_controller.cancel_model_download();
                 }
                 if actions.request_load && !backend_unavailable {
                     if let Err(off) = route {
@@ -1624,10 +1682,17 @@ impl TranslationTabState {
                     !self.text_detector_results.is_empty() && !self.text_detection_storage_busy;
                 let ocr_busy = self.textdetector_ocr_is_running();
                 let page_size = detector_page_size(page_infos.get(&canvas.current_page_idx()));
+                // The Surya checkpoint's install state, probed once per session on selection.
+                let surya_model = (self.text_detector_options.algorithm == TextDetectorAlgorithm::Surya).then(|| {
+                    self.ocr_model_downloads.probe_unknown(&SURYA_DETECTOR_SPECS);
+                    self.ocr_model_downloads.panel_snapshot(&SURYA_DETECTOR_SPECS)
+                });
                 let view = TextDetectorPanelView {
                     status_text: &self.text_detector_status,
                     status_color: self.text_detector_status_severity.color(),
                     progress: self.text_detector_progress,
+                    model_download: self.text_detector_model_download.current(),
+                    surya_model: surya_model.as_ref(),
                     detect_busy: self.text_detector_controller.is_busy(),
                     ocr_busy,
                     has_pages,
@@ -1649,6 +1714,10 @@ impl TranslationTabState {
                 if actions.options_changed {
                     self.text_detector_settings_dirty = true;
                 }
+                if actions.cancel_detection {
+                    self.text_detector_controller.cancel_detection();
+                }
+                self.apply_detector_model_panel_action(actions.surya_model_download);
                 if actions.toggle_edit_lines_mode {
                     self.set_text_detector_edit_lines_mode(!self.text_detector_edit_lines_mode);
                 }
@@ -2140,66 +2209,87 @@ impl TranslationTabState {
     ) {
         for event in self.ocr_controller.poll_events() {
             match event {
-                OcrControllerEvent::ExternalModelMissing(spec) => {
+                OcrControllerEvent::ExternalModelMissing(specs) => {
                     // The gate's error names the button of the disk state it just probed;
                     // re-probe so the panel draws that same button (it may still show a
                     // stale `Installed` or an older state).
-                    self.ocr_model_downloads.request_status(spec);
+                    self.ocr_model_downloads.request_bundle_status(&specs);
                 }
-                OcrControllerEvent::StateChanged(state) => match state {
-                    OcrLoadState::DownloadingModel => {
-                        let engine = self
-                            .ocr_loading_engine
-                            .unwrap_or(self.ocr_panel_options.engine);
-                        self.mark_ocr_model_download_started_for_engine(engine);
-                        self.push_toast(
-                            ctx,
-                            t!("translation.common.downloading_model_status").to_string(),
-                            Severity::Info,
-                            2.2,
-                        );
+                OcrControllerEvent::StateChanged(state) => {
+                    // Any other state ends the command's download (finished, cancelled, failed).
+                    if state != OcrLoadState::DownloadingModel {
+                        self.ocr_model_download.clear();
                     }
-                    OcrLoadState::Loading => {
-                        let engine = self
-                            .ocr_loading_engine
-                            .unwrap_or(self.ocr_panel_options.engine);
-                        self.mark_ocr_load_requested_for_engine(engine);
-                        self.push_toast(
-                            ctx,
-                            t!("translation.tab.engine_loading_status").to_string(),
-                            Severity::Info,
-                            2.2,
-                        );
-                    }
-                    OcrLoadState::Error => {
-                        let engine = self
-                            .ocr_loading_engine
-                            .take()
-                            .unwrap_or(self.ocr_panel_options.engine);
-                        self.set_ocr_state_for_engine(engine, OcrLoadState::Error);
-                        // A load error of an external-model engine may come from its files
-                        // (deleted, damaged): refresh the panel's install state too.
-                        if let Some(spec) = external_model_spec(engine, self.ocr_panel_options.paddle_vl_model) {
-                            self.ocr_model_downloads.request_status(spec);
+                    match state {
+                        OcrLoadState::DownloadingModel => {
+                            let engine = self
+                                .ocr_loading_engine
+                                .unwrap_or(self.ocr_panel_options.engine);
+                            self.mark_ocr_model_download_started_for_engine(engine);
+                            self.push_toast(
+                                ctx,
+                                t!("translation.common.downloading_model_status").to_string(),
+                                Severity::Info,
+                                2.2,
+                            );
                         }
-                        self.push_toast(
-                            ctx,
-                            t!("translation.tab.engine_load_error").to_string(),
-                            Severity::Error,
-                            3.0,
-                        );
+                        OcrLoadState::Loading => {
+                            let engine = self
+                                .ocr_loading_engine
+                                .unwrap_or(self.ocr_panel_options.engine);
+                            self.mark_ocr_load_requested_for_engine(engine);
+                            self.push_toast(
+                                ctx,
+                                t!("translation.tab.engine_loading_status").to_string(),
+                                Severity::Info,
+                                2.2,
+                            );
+                        }
+                        OcrLoadState::Error => {
+                            let engine = self
+                                .ocr_loading_engine
+                                .take()
+                                .unwrap_or(self.ocr_panel_options.engine);
+                            self.set_ocr_state_for_engine(engine, OcrLoadState::Error);
+                            // A load error of an external-model engine may come from its files
+                            // (deleted, damaged): refresh the panel's install state too.
+                            let options = &self.ocr_panel_options;
+                            let specs = external_model_specs(engine, options.paddle_vl_model, &options.easy_langs);
+                            self.ocr_model_downloads.request_bundle_status(&specs);
+                            self.push_toast(
+                                ctx,
+                                t!("translation.tab.engine_load_error").to_string(),
+                                Severity::Error,
+                                3.0,
+                            );
+                        }
+                        OcrLoadState::Ready => {
+                            let engine = self
+                                .ocr_loading_engine
+                                .take()
+                                .unwrap_or(self.ocr_panel_options.engine);
+                            self.set_ocr_state_for_engine(engine, OcrLoadState::Ready);
+                        }
+                        // A load whose model download was cancelled: the engine is not loaded
+                        // (the next request loads it again and resumes the staged bytes).
+                        OcrLoadState::NotLoaded => {
+                            if let Some(engine) = self.ocr_loading_engine.take() {
+                                self.set_ocr_state_for_engine(engine, OcrLoadState::NotLoaded);
+                            }
+                            self.push_toast(
+                                ctx,
+                                t!("translation.tab.model_download_cancelled_status").to_string(),
+                                Severity::Info,
+                                2.2,
+                            );
+                        }
                     }
-                    OcrLoadState::Ready => {
-                        let engine = self
-                            .ocr_loading_engine
-                            .take()
-                            .unwrap_or(self.ocr_panel_options.engine);
-                        self.set_ocr_state_for_engine(engine, OcrLoadState::Ready);
-                    }
-                    OcrLoadState::NotLoaded => {
-                        self.ocr_loading_engine = None;
-                    }
-                },
+                }
+                // The state already reads `DownloadingModel`; the panel draws the latest event.
+                OcrControllerEvent::ModelDownloadProgress(event) => {
+                    self.ocr_model_download.record(event);
+                    ctx.request_repaint();
+                }
                 OcrControllerEvent::Recognized { request_id, result } => {
                     let manual_target = if self.manual_ocr_active_request_id == Some(request_id) {
                         self.manual_ocr_active_request_id = None;
@@ -2373,6 +2463,10 @@ impl TranslationTabState {
 
     fn poll_text_detector_events(&mut self, ctx: &egui::Context) {
         for event in self.text_detector_controller.poll_events() {
+            // Pages and the batch end follow a finished (or stopped) download.
+            if !matches!(event, TextDetectorControllerEvent::ModelDownloadStarted | TextDetectorControllerEvent::ModelDownloadProgress(_)) {
+                self.text_detector_model_download.clear();
+            }
             match event {
                 TextDetectorControllerEvent::ModelDownloadStarted => {
                     self.set_text_detector_status(
@@ -2427,10 +2521,24 @@ impl TranslationTabState {
                 }
                 TextDetectorControllerEvent::DetectFailed { error } => {
                     self.text_detector_progress = None;
+                    // A Surya batch fails up front when its checkpoint is missing: re-probe
+                    // so the panel draws the button that error names.
+                    if self.text_detector_options.algorithm == TextDetectorAlgorithm::Surya {
+                        self.ocr_model_downloads.request_bundle_status(&SURYA_DETECTOR_SPECS);
+                    }
                     self.set_text_detector_status(
                         tf!("translation.tab.detector_error", error = error),
                         Severity::Error,
                     );
+                }
+                // `ModelDownloadStarted` already set the status; the panel draws the event.
+                TextDetectorControllerEvent::ModelDownloadProgress(event) => {
+                    self.text_detector_model_download.record(event);
+                    ctx.request_repaint();
+                }
+                TextDetectorControllerEvent::DetectCancelled => {
+                    self.text_detector_progress = None;
+                    self.set_text_detector_status(t!("translation.tab.detector_cancelled_status"), Severity::Info);
                 }
             }
         }
@@ -8238,7 +8346,7 @@ mod ocr_model_settings_tests {
 #[cfg(test)]
 mod ocr_model_download_wiring_tests {
     use super::{ModelDownloadAction, OcrEngine, OcrLoadState, OcrModelDownloadController, PaddleVlVariant, TranslationTabState};
-    use crate::ocr_model_download::fakes::{missing_probe, waits_for_cancel};
+    use crate::ocr_model_download::fakes::{intact_verify, missing_probe, waits_for_cancel};
     use crate::ocr_model_download::{DownloadNotice, Jobs, OcrModelDownloadState};
     use ms_sysprobe::ai_models::external_catalog::BABERU_OCR;
     use std::time::{Duration, Instant};
@@ -8246,7 +8354,7 @@ mod ocr_model_download_wiring_tests {
     /// A tab whose download controller runs fakes (no filesystem, no network).
     fn tab_with_fake_downloads() -> TranslationTabState {
         let mut tab = TranslationTabState::default();
-        tab.ocr_model_downloads = OcrModelDownloadController::with_jobs(Jobs { status: missing_probe, download: waits_for_cancel });
+        tab.ocr_model_downloads = OcrModelDownloadController::with_jobs(Jobs { status: missing_probe, download: waits_for_cancel, verify: intact_verify });
         tab
     }
 
@@ -8270,11 +8378,13 @@ mod ocr_model_download_wiring_tests {
         tab.ocr_panel_options.engine = OcrEngine::PaddleVl;
         tab.ocr_panel_options.paddle_vl_model = PaddleVlVariant::MangaJa;
         tab.set_ocr_state_for_engine(OcrEngine::PaddleVl, OcrLoadState::Ready);
-        tab.apply_ocr_model_panel_changes(OcrEngine::PaddleVl, PaddleVlVariant::MangaJa, ModelDownloadAction::None);
+        let manga_ja = tab.selected_ocr_model_specs();
+        tab.apply_ocr_model_panel_changes(&manga_ja, PaddleVlVariant::MangaJa, ModelDownloadAction::None);
         assert_eq!(tab.ocr_state_for_engine(OcrEngine::PaddleVl), OcrLoadState::Ready);
         assert_eq!(tab.ocr_model_downloads.state_for(PaddleVlVariant::MangaJa.spec().id), OcrModelDownloadState::Unknown);
 
-        tab.apply_ocr_model_panel_changes(OcrEngine::PaddleVl, PaddleVlVariant::Official16, ModelDownloadAction::None);
+        let official = [PaddleVlVariant::Official16.spec()];
+        tab.apply_ocr_model_panel_changes(&official, PaddleVlVariant::Official16, ModelDownloadAction::None);
         assert_eq!(tab.ocr_state_for_engine(OcrEngine::PaddleVl), OcrLoadState::NotLoaded);
         assert_eq!(tab.ocr_model_downloads.state_for(PaddleVlVariant::MangaJa.spec().id), OcrModelDownloadState::Checking);
         settle(&mut tab);
@@ -8282,27 +8392,59 @@ mod ocr_model_download_wiring_tests {
 
         // An engine switch to Baberu probes Baberu and leaves PaddleOCR-VL's load state.
         tab.ocr_panel_options.engine = OcrEngine::Baberu;
-        tab.apply_ocr_model_panel_changes(OcrEngine::PaddleVl, PaddleVlVariant::MangaJa, ModelDownloadAction::None);
+        tab.apply_ocr_model_panel_changes(&manga_ja, PaddleVlVariant::MangaJa, ModelDownloadAction::None);
         assert_eq!(tab.ocr_model_downloads.state_for(BABERU_OCR.id), OcrModelDownloadState::Checking);
         settle(&mut tab);
     }
 
-    /// Download and Cancel go to the selected engine's spec; an engine without an external
-    /// model ignores them.
+    /// An EasyOCR language change that switches the script probes the new script's model.
+    #[test]
+    fn an_easyocr_script_switch_probes_the_new_model() {
+        use ms_sysprobe::ai_models::easyocr::{EasyOcrScript, easyocr_spec};
+        let mut tab = tab_with_fake_downloads();
+        tab.ocr_panel_options.engine = OcrEngine::EasyOcr;
+        tab.ocr_panel_options.easy_langs = "ko".to_string();
+        let korean = tab.selected_ocr_model_specs();
+        assert_eq!(korean.iter().map(|spec| spec.id).collect::<Vec<_>>(), [easyocr_spec(EasyOcrScript::Korean).id]);
+        tab.ocr_panel_options.easy_langs = "ja, en".to_string();
+        tab.apply_ocr_model_panel_changes(&korean, PaddleVlVariant::Official16, ModelDownloadAction::None);
+        assert_eq!(tab.ocr_model_downloads.state_for(easyocr_spec(EasyOcrScript::Japanese).id), OcrModelDownloadState::Checking);
+        assert_eq!(tab.ocr_model_downloads.state_for(easyocr_spec(EasyOcrScript::Korean).id), OcrModelDownloadState::Unknown);
+        settle(&mut tab);
+    }
+
+    /// Download and Cancel go to the selected engine's bundle (Surya: both checkpoints); an
+    /// engine without an external model ignores them.
     #[test]
     fn download_and_cancel_route_to_the_selected_spec() {
         let mut tab = tab_with_fake_downloads();
         tab.ocr_panel_options.engine = OcrEngine::MangaOcr;
-        tab.apply_ocr_model_panel_changes(OcrEngine::MangaOcr, PaddleVlVariant::Official16, ModelDownloadAction::Download);
+        tab.apply_ocr_model_panel_changes(&[], PaddleVlVariant::Official16, ModelDownloadAction::Download);
         assert!(!tab.ocr_model_downloads.is_active());
 
         tab.ocr_panel_options.engine = OcrEngine::Baberu;
-        tab.apply_ocr_model_panel_changes(OcrEngine::Baberu, PaddleVlVariant::Official16, ModelDownloadAction::Download);
+        let baberu = tab.selected_ocr_model_specs();
+        tab.apply_ocr_model_panel_changes(&baberu, PaddleVlVariant::Official16, ModelDownloadAction::Download);
         assert!(matches!(tab.ocr_model_downloads.state_for(BABERU_OCR.id), OcrModelDownloadState::Downloading(_)));
-        tab.apply_ocr_model_panel_changes(OcrEngine::Baberu, PaddleVlVariant::Official16, ModelDownloadAction::Cancel);
+        tab.apply_ocr_model_panel_changes(&baberu, PaddleVlVariant::Official16, ModelDownloadAction::Cancel);
         settle(&mut tab);
-        let snapshot = tab.ocr_model_downloads.panel_snapshot(&BABERU_OCR);
+        let snapshot = tab.ocr_model_downloads.panel_snapshot(&baberu);
         assert_eq!(snapshot.notice, Some(DownloadNotice::Cancelled));
         assert_eq!(snapshot.state, OcrModelDownloadState::Missing);
+
+        tab.ocr_panel_options.engine = OcrEngine::Surya;
+        let surya = tab.selected_ocr_model_specs();
+        assert_eq!(surya.len(), 2);
+        tab.apply_ocr_model_panel_changes(&surya, PaddleVlVariant::Official16, ModelDownloadAction::Download);
+        for spec in &surya {
+            assert!(matches!(tab.ocr_model_downloads.state_for(spec.id), OcrModelDownloadState::Downloading(_)), "{}", spec.id);
+        }
+        // The detector panel's Surya bundle shares the detection spec: it sees the running
+        // download as another bundle's and cannot start its own.
+        let detector = tab.ocr_model_downloads.panel_snapshot(&super::SURYA_DETECTOR_SPECS);
+        assert!(detector.other_download.is_some());
+        tab.apply_detector_model_panel_action(ModelDownloadAction::Cancel);
+        settle(&mut tab);
+        assert_eq!(tab.ocr_model_downloads.panel_snapshot(&surya).notice, Some(DownloadNotice::Cancelled));
     }
 }

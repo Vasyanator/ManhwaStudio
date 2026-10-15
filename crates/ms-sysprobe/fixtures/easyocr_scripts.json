@@ -1,0 +1,488 @@
+{
+  "_comment": "Mirror of easyocr 1.7.2 config.py (detector, recognizers, language lists) and of the recognizer choice in easyocr.Reader.__init__ (easyocr.py:111-167). Owner: crates/ms-sysprobe/src/ai_models/easyocr.rs (Rust test: table == fixture). Generated from the installed library; regenerate when the pinned easyocr version changes.",
+  "easyocr_version": "1.7.2",
+  "release_base_url": "https://github.com/JaidedAI/EasyOCR/releases/download",
+  "detector": {
+    "filename": "craft_mlt_25k.pth",
+    "md5": "2f8227d2def4037cdb3b34389dcf9ec1",
+    "archive": "pre-v1.1.6/craft_mlt_25k.zip"
+  },
+  "lang_lists": {
+    "latin": [
+      "af",
+      "az",
+      "bs",
+      "cs",
+      "cy",
+      "da",
+      "de",
+      "en",
+      "es",
+      "et",
+      "fr",
+      "ga",
+      "hr",
+      "hu",
+      "id",
+      "is",
+      "it",
+      "ku",
+      "la",
+      "lt",
+      "lv",
+      "mi",
+      "ms",
+      "mt",
+      "nl",
+      "no",
+      "oc",
+      "pi",
+      "pl",
+      "pt",
+      "ro",
+      "rs_latin",
+      "sk",
+      "sl",
+      "sq",
+      "sv",
+      "sw",
+      "tl",
+      "tr",
+      "uz",
+      "vi"
+    ],
+    "arabic": [
+      "ar",
+      "fa",
+      "ug",
+      "ur"
+    ],
+    "bengali": [
+      "bn",
+      "as",
+      "mni"
+    ],
+    "cyrillic": [
+      "ru",
+      "rs_cyrillic",
+      "be",
+      "bg",
+      "uk",
+      "mn",
+      "abq",
+      "ady",
+      "kbd",
+      "ava",
+      "dar",
+      "inh",
+      "che",
+      "lbe",
+      "lez",
+      "tab",
+      "tjk"
+    ],
+    "devanagari": [
+      "hi",
+      "mr",
+      "ne",
+      "bh",
+      "mai",
+      "ang",
+      "bho",
+      "mah",
+      "sck",
+      "new",
+      "gom",
+      "sa",
+      "bgc"
+    ],
+    "other": [
+      "th",
+      "ch_sim",
+      "ch_tra",
+      "ja",
+      "ko",
+      "ta",
+      "te",
+      "kn"
+    ]
+  },
+  "unusable_langs": [
+    "sa",
+    "bgc",
+    "mni"
+  ],
+  "scripts": [
+    {
+      "script": "english",
+      "model": "english_g2",
+      "model_script": "english",
+      "filename": "english_g2.pth",
+      "md5": "5864788e1821be9e454ec108d61b887d",
+      "archive": "v1.3/english_g2.zip",
+      "compatible": [
+        "en"
+      ]
+    },
+    {
+      "script": "thai",
+      "model": "thai_g1",
+      "model_script": "thai",
+      "filename": "thai.pth",
+      "md5": "40a06b563a2b3d7897e2d19df20dc709",
+      "archive": "pre-v1.1.6/thai.zip",
+      "compatible": [
+        "th",
+        "en"
+      ]
+    },
+    {
+      "script": "chinese_tra",
+      "model": "zh_tra_g1",
+      "model_script": "chinese_tra",
+      "filename": "chinese.pth",
+      "md5": "dfba8e364cd98ed4fed7ad54d71e3965",
+      "archive": "pre-v1.1.6/chinese.zip",
+      "compatible": [
+        "ch_tra",
+        "en"
+      ]
+    },
+    {
+      "script": "chinese_sim",
+      "model": "zh_sim_g2",
+      "model_script": "chinese_sim",
+      "filename": "zh_sim_g2.pth",
+      "md5": "b601ce7143293387d3ec4f41a66edc07",
+      "archive": "v1.3/zh_sim_g2.zip",
+      "compatible": [
+        "ch_sim",
+        "en"
+      ]
+    },
+    {
+      "script": "japanese",
+      "model": "japanese_g2",
+      "model_script": "japanese",
+      "filename": "japanese_g2.pth",
+      "md5": "bad5146990ccb1272cb0908440fbe15e",
+      "archive": "v1.3/japanese_g2.zip",
+      "compatible": [
+        "ja",
+        "en"
+      ]
+    },
+    {
+      "script": "korean",
+      "model": "korean_g2",
+      "model_script": "korean",
+      "filename": "korean_g2.pth",
+      "md5": "befecf7b1ca2fffb5af814a51443682d",
+      "archive": "v1.3/korean_g2.zip",
+      "compatible": [
+        "ko",
+        "en"
+      ]
+    },
+    {
+      "script": "tamil",
+      "model": "tamil_g1",
+      "model_script": "tamil",
+      "filename": "tamil.pth",
+      "md5": "4b93972fdacdcdabe6d57097025d4dc2",
+      "archive": "v1.1.7/tamil.zip",
+      "compatible": [
+        "ta",
+        "en"
+      ]
+    },
+    {
+      "script": "telugu",
+      "model": "telugu_g2",
+      "model_script": "telugu",
+      "filename": "telugu.pth",
+      "md5": "f7576012a3abe593950c47bfa1bd8ddc",
+      "archive": "v1.2/telugu.zip",
+      "compatible": [
+        "te",
+        "en"
+      ]
+    },
+    {
+      "script": "kannada",
+      "model": "kannada_g2",
+      "model_script": "kannada",
+      "filename": "kannada.pth",
+      "md5": "c240c97e4adb8773b53b3b3dec728627",
+      "archive": "v1.2/kannada.zip",
+      "compatible": [
+        "kn",
+        "en"
+      ]
+    },
+    {
+      "script": "bengali",
+      "model": "bengali_g1",
+      "model_script": "bengali",
+      "filename": "bengali.pth",
+      "md5": "cea9e897e2c0576b62cbb1554997ce1c",
+      "archive": "v1.1.8/bengali.zip",
+      "compatible": [
+        "bn",
+        "as",
+        "mni",
+        "en"
+      ]
+    },
+    {
+      "script": "arabic",
+      "model": "arabic_g1",
+      "model_script": "arabic",
+      "filename": "arabic.pth",
+      "md5": "993074555550e4e06a6077d55ff0449a",
+      "archive": "pre-v1.1.6/arabic.zip",
+      "compatible": [
+        "ar",
+        "fa",
+        "ug",
+        "ur",
+        "en"
+      ]
+    },
+    {
+      "script": "devanagari",
+      "model": "devanagari_g1",
+      "model_script": "devanagari",
+      "filename": "devanagari.pth",
+      "md5": "db6b1f074fae3070f561675db908ac08",
+      "archive": "pre-v1.1.6/devanagari.zip",
+      "compatible": [
+        "hi",
+        "mr",
+        "ne",
+        "bh",
+        "mai",
+        "ang",
+        "bho",
+        "mah",
+        "sck",
+        "new",
+        "gom",
+        "sa",
+        "bgc",
+        "en"
+      ]
+    },
+    {
+      "script": "cyrillic",
+      "model": "cyrillic_g2",
+      "model_script": "cyrillic",
+      "filename": "cyrillic_g2.pth",
+      "md5": "19f85f43d9128a89ac21b8d6a06973fe",
+      "archive": "v1.6.1/cyrillic_g2.zip",
+      "compatible": [
+        "ru",
+        "rs_cyrillic",
+        "be",
+        "bg",
+        "uk",
+        "mn",
+        "abq",
+        "ady",
+        "kbd",
+        "ava",
+        "dar",
+        "inh",
+        "che",
+        "lbe",
+        "lez",
+        "tab",
+        "tjk",
+        "en"
+      ]
+    },
+    {
+      "script": "latin",
+      "model": "latin_g2",
+      "model_script": "latin",
+      "filename": "latin_g2.pth",
+      "md5": "469869130aad1a34e8f9086f4262bc59",
+      "archive": "v1.3/latin_g2.zip",
+      "compatible": null
+    }
+  ],
+  "cases": [
+    {
+      "langs": [
+        "en"
+      ],
+      "expect": "english"
+    },
+    {
+      "langs": [
+        "en",
+        "de"
+      ],
+      "expect": "latin"
+    },
+    {
+      "langs": [
+        "de"
+      ],
+      "expect": "latin"
+    },
+    {
+      "langs": [
+        "ko"
+      ],
+      "expect": "korean"
+    },
+    {
+      "langs": [
+        "ko",
+        "en"
+      ],
+      "expect": "korean"
+    },
+    {
+      "langs": [
+        "ja"
+      ],
+      "expect": "japanese"
+    },
+    {
+      "langs": [
+        "ch_sim",
+        "en"
+      ],
+      "expect": "chinese_sim"
+    },
+    {
+      "langs": [
+        "ch_tra"
+      ],
+      "expect": "chinese_tra"
+    },
+    {
+      "langs": [
+        "th"
+      ],
+      "expect": "thai"
+    },
+    {
+      "langs": [
+        "ta"
+      ],
+      "expect": "tamil"
+    },
+    {
+      "langs": [
+        "te"
+      ],
+      "expect": "telugu"
+    },
+    {
+      "langs": [
+        "kn"
+      ],
+      "expect": "kannada"
+    },
+    {
+      "langs": [
+        "bn",
+        "as"
+      ],
+      "expect": "bengali"
+    },
+    {
+      "langs": [
+        "mni"
+      ],
+      "expect": "error:unsupported"
+    },
+    {
+      "langs": [
+        "hi",
+        "sa"
+      ],
+      "expect": "error:unsupported"
+    },
+    {
+      "langs": [
+        "ar",
+        "fa",
+        "en"
+      ],
+      "expect": "arabic"
+    },
+    {
+      "langs": [
+        "hi",
+        "mr"
+      ],
+      "expect": "devanagari"
+    },
+    {
+      "langs": [
+        "ru",
+        "uk",
+        "en"
+      ],
+      "expect": "cyrillic"
+    },
+    {
+      "langs": [
+        "mn"
+      ],
+      "expect": "cyrillic"
+    },
+    {
+      "langs": [
+        "vi",
+        "rs_latin"
+      ],
+      "expect": "latin"
+    },
+    {
+      "langs": [
+        "en",
+        "th"
+      ],
+      "expect": "thai"
+    },
+    {
+      "langs": [
+        "ko",
+        "ja"
+      ],
+      "expect": "error:incompatible"
+    },
+    {
+      "langs": [
+        "ru",
+        "de"
+      ],
+      "expect": "error:incompatible"
+    },
+    {
+      "langs": [
+        "ch_sim",
+        "ch_tra"
+      ],
+      "expect": "error:incompatible"
+    },
+    {
+      "langs": [
+        "xx"
+      ],
+      "expect": "error:unsupported"
+    },
+    {
+      "langs": [
+        "ko",
+        "zz"
+      ],
+      "expect": "error:unsupported"
+    }
+  ]
+}

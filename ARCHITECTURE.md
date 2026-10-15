@@ -53,7 +53,7 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
   <- ms-project / ms-widgets / ms-native-runtime / ms-local-ai
   <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration / ms-input
   <- ms-config / ms-text-render
-  <- ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx / ms-platform
+  <- ms-backend-ipc / ms-docstore / ms-download / ms-fonts / ms-memory / ms-onnx / ms-platform
   <- ms-log / ms-text-detect
   <- ms-actions / ms-gifs / ms-i18n / ms-raster / ms-storage / ms-text-util / ms-theme / ms-thread
 ```
@@ -87,6 +87,9 @@ shared wiki view). The studio never references
   through `ProbMapRunner`. No logging, wasm-buildable.
 - `ms-docstore` — named logical documents (`DocRef`): per-document lock, atomic writes, JSON or
   SQLite. Must not depend on `ms-config`.
+- `ms-download` — native-only resumable HTTP download engine (`RangeFetcher` / `UreqFetcher`,
+  `RetryPolicy`, `ResumableFetch::fetch_part` into a `.part`, process-wide `BusyGuard`); GUI-free, no
+  i18n; consumers own threads, URLs, verification, publishing and UI text.
 - `ms-fonts` — the bundled `fonts/ui` stack, shared by egui UI fonts and the text renderer.
 - `ms-memory` — image-memory profiles and eviction policy; owns no pixels.
 - `ms-onnx` — onnxruntime (`ort`, load-dynamic) inference: MangaOCR, PaddleOCR.
@@ -428,12 +431,16 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   `textdetector.{ctd,paddle,surya}.forward` only runs the network and returns u8 probability
   maps (wire codec: `ms_backend_ipc::textdetector`).
 - **App-managed models** live under `ManhwaStudio_AI_Models/` and are fetched by Rust through
-  `ms_sysprobe::ai_models` before a backend feature initializes them. Third-party OCR models
-  (Baberu OCR, the PaddleOCR-VL variants) come from the pinned external catalog
-  (`ai_models::external_catalog`: repo, commit, per-file size + sha256, `side_models/` dir) — the
-  one owner of those facts; Rust downloads them explicitly (never implicitly on use) and sends the
-  backend absolute paths, so the backend only loads them offline. Other `side_models/` models
-  (FLUX, watermark, Reline) are still downloaded by the backend.
+  `ms_sysprobe::ai_models` (engine: `ms-download`) before a backend feature initializes them; every
+  download is explicit (never implicit on use), resumable and cancellable. The main model repo is
+  unpinned (size + server identity, LFS sha256 when announced). Third-party models — Baberu OCR,
+  the PaddleOCR-VL variants, EasyOCR (one shared dir, detector stored once), Surya, the SDXL configs
+  and the one curated SDXL inpaint repo — come from the pinned external catalog
+  (`ai_models::external_catalog`: source, commit/URL, per-file size + sha256; regenerated with
+  `tools/model_pins/`), the one owner of those facts. Rust sends the backend absolute paths and the
+  backend loads them offline only (`local_files_only`, no library downloads); EasyOCR / Surya
+  library versions are pinned to match the catalog. The backend itself still downloads only FLUX,
+  watermark and Reline weights, through `engines/model_download.py` (same network rules).
 - **Downloaded code.** PaddleOCR-VL model code is vendored (`ocr/paddle_vl_vendor/`, no
   `trust_remote_code`). `modules/ai_backend/watermark/` is the only place that executes
   network-downloaded code (pinned commit, SHA-256 verified, hashed bytes are executed bytes).

@@ -9,6 +9,11 @@ Main responsibilities:
 - verify numeric clamping of steps/cfg/denoise/mask parameters;
 - verify the four-channel denoise cap keeps the LaMa prefill meaningful;
 - verify sampler names map to the expected diffusers scheduler config;
+- verify the model source resolution: a single file needs the config dir, a
+  folder needs `model_index.json`, the curated repo id resolves to Rust's
+  download, any other repo id is refused, a missing path is explicit;
+- verify every load passes `local_files_only=True` (plus `config=` / the fp16
+  `variant`) and that no Hugging Face download function is ever called;
 - verify the pipeline's host->device move happens inside the ROCm mmap->GPU
   staging patch, and that unloading drops the pipeline and reports it to the
   shared model manager.
@@ -24,8 +29,10 @@ only that the service wraps the move in it.
 from __future__ import annotations
 
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from modules.ai_backend.inpaint import sdxl as svc
@@ -215,15 +222,34 @@ class SdxlPipelinePlacementTests(unittest.TestCase):
         pipes: list[_FakePipe] = []
         self.pipes = pipes
 
+        # (loader name, path, kwargs) of every pipeline load.
+        loads: list[tuple[str, str, dict[str, object]]] = []
+        self.loads = loads
+
+        def _load(name: str, path: str, kwargs: dict[str, object]) -> _FakePipe:
+            loads.append((name, path, dict(kwargs)))
+            pipe = _FakePipe(recorder)
+            pipes.append(pipe)
+            return pipe
+
         class StableDiffusionXLInpaintPipeline:
             @staticmethod
-            def from_pretrained(_path: str, **_kwargs: object) -> _FakePipe:
-                pipe = _FakePipe(recorder)
-                pipes.append(pipe)
-                return pipe
+            def from_pretrained(path: str, **kwargs: object) -> _FakePipe:
+                return _load("from_pretrained", path, kwargs)
+
+            @staticmethod
+            def from_single_file(path: str, **kwargs: object) -> _FakePipe:
+                return _load("from_single_file", path, kwargs)
 
         diffusers = types.ModuleType("diffusers")
         diffusers.StableDiffusionXLInpaintPipeline = StableDiffusionXLInpaintPipeline
+
+        def _no_download(*args: object, **kwargs: object) -> None:
+            raise AssertionError(f"snapshot_download must never be called: {args} {kwargs}")
+
+        hub = types.ModuleType("huggingface_hub")
+        hub.snapshot_download = _no_download
+        hub.hf_hub_download = _no_download
 
         # `float16` only needs identity, and the absence of `cuda` keeps
         # `_clear_torch_cache` from initializing a real accelerator context.
@@ -232,7 +258,7 @@ class SdxlPipelinePlacementTests(unittest.TestCase):
         fake_torch.float32 = object()
 
         modules_patch = patch.dict(
-            sys.modules, {"diffusers": diffusers, "torch": fake_torch}
+            sys.modules, {"diffusers": diffusers, "torch": fake_torch, "huggingface_hub": hub}
         )
         modules_patch.start()
         self.addCleanup(modules_patch.stop)
@@ -241,10 +267,11 @@ class SdxlPipelinePlacementTests(unittest.TestCase):
         staging_patch.start()
         self.addCleanup(staging_patch.stop)
 
+        self.fake_torch = fake_torch
+
     def test_move_to_gpu_runs_inside_staging_patch(self) -> None:
-        # A path that is neither a file nor a directory is treated as a HF repo
-        # id, which keeps the test off the filesystem.
-        pipe = svc._build_sdxl_inpaint_pipeline("org/sdxl-inpaint", "cuda:0")
+        # A pre-resolved source keeps the build itself off the filesystem.
+        pipe = svc._build_sdxl_inpaint_pipeline(svc.SdxlModelSource(kind="folder", path="/m/sdxl"), "cuda:0")
 
         self.assertIs(pipe, self.pipes[0])
         self.assertEqual(pipe.moves, [("cuda:0", 1)])
@@ -253,8 +280,102 @@ class SdxlPipelinePlacementTests(unittest.TestCase):
 
     def test_fp16_pipeline_keeps_vae_force_upcast(self) -> None:
         # The staging wrapper must not disturb the fp16 VAE contract.
-        pipe = svc._build_sdxl_inpaint_pipeline("org/sdxl-inpaint", "cuda:0")
+        pipe = svc._build_sdxl_inpaint_pipeline(svc.SdxlModelSource(kind="folder", path="/m/sdxl"), "cuda:0")
         self.assertTrue(pipe.vae.config.force_upcast)
+
+    def test_every_source_loads_offline(self) -> None:
+        sources = [
+            svc.SdxlModelSource(kind="single_file", path="/m/a.safetensors", config_dir="/m/cfg"),
+            svc.SdxlModelSource(kind="folder", path="/m/folder"),
+            svc.SdxlModelSource(kind="curated", path="/m/curated", variant=svc.CURATED_INPAINT_VARIANT),
+        ]
+        for source in sources:
+            svc._build_sdxl_inpaint_pipeline(source, "cpu")
+
+        dtype = self.fake_torch.float32
+        self.assertEqual(
+            self.loads,
+            [
+                ("from_single_file", "/m/a.safetensors", {"config": "/m/cfg", "local_files_only": True, "torch_dtype": dtype}),
+                ("from_pretrained", "/m/folder", {"local_files_only": True, "torch_dtype": dtype}),
+                ("from_pretrained", "/m/curated", {"variant": "fp16", "local_files_only": True, "torch_dtype": dtype}),
+            ],
+        )
+
+
+class SdxlModelSourceTests(unittest.TestCase):
+    """Pin `resolve_model_source`: local paths only, plus the one curated repo id."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="ms_sdxl_src_")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.config_dir = self._diffusers_dir("config")
+        self.checkpoint = self.root / "model.safetensors"
+        self.checkpoint.write_bytes(b"")
+
+    def _diffusers_dir(self, name: str) -> Path:
+        path = self.root / name
+        path.mkdir()
+        (path / "model_index.json").write_text("{}", encoding="utf-8")
+        return path
+
+    def test_single_file_takes_the_config_dir(self) -> None:
+        source = svc.resolve_model_source(str(self.checkpoint), config_dir=str(self.config_dir), curated_model_dir=None)
+
+        self.assertEqual(source, svc.SdxlModelSource(kind="single_file", path=str(self.checkpoint), config_dir=str(self.config_dir)))
+
+    def test_single_file_without_a_downloaded_config_is_refused(self) -> None:
+        missing = self.root / "absent"
+        with self.assertRaises(FileNotFoundError) as raised:
+            svc.resolve_model_source(str(self.checkpoint), config_dir=str(missing), curated_model_dir=None)
+        self.assertIn("не скачана", str(raised.exception))
+        self.assertFalse(missing.exists())
+        with self.assertRaises(ValueError):
+            svc.resolve_model_source(str(self.checkpoint), config_dir="", curated_model_dir=None)
+        with self.assertRaises(ValueError):
+            svc.resolve_model_source(str(self.checkpoint), config_dir="relative/cfg", curated_model_dir=None)
+
+    def test_wrong_file_suffix_is_refused(self) -> None:
+        other = self.root / "model.bin"
+        other.write_bytes(b"")
+        with self.assertRaises(FileNotFoundError):
+            svc.resolve_model_source(str(other), config_dir=str(self.config_dir), curated_model_dir=None)
+
+    def test_folder_needs_model_index(self) -> None:
+        folder = self._diffusers_dir("folder")
+        self.assertEqual(
+            svc.resolve_model_source(str(folder), config_dir=str(self.config_dir), curated_model_dir=None),
+            svc.SdxlModelSource(kind="folder", path=str(folder)),
+        )
+        bare = self.root / "bare"
+        bare.mkdir()
+        with self.assertRaises(FileNotFoundError):
+            svc.resolve_model_source(str(bare), config_dir=str(self.config_dir), curated_model_dir=None)
+
+    def test_curated_repo_id_resolves_to_the_downloaded_dir(self) -> None:
+        curated = self._diffusers_dir("curated")
+        source = svc.resolve_model_source(
+            svc.CURATED_INPAINT_REPO_ID, config_dir=str(self.config_dir), curated_model_dir=str(curated)
+        )
+        self.assertEqual(source, svc.SdxlModelSource(kind="curated", path=str(curated), variant="fp16"))
+
+    def test_curated_repo_id_without_its_download_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            svc.resolve_model_source(svc.CURATED_INPAINT_REPO_ID, config_dir=str(self.config_dir), curated_model_dir=None)
+        with self.assertRaises(FileNotFoundError):
+            svc.resolve_model_source(
+                svc.CURATED_INPAINT_REPO_ID, config_dir=str(self.config_dir), curated_model_dir=str(self.root / "absent")
+            )
+
+    def test_other_repo_ids_are_refused(self) -> None:
+        for repo_id in ("stabilityai/stable-diffusion-xl-base-1.0", "org/sdxl-inpaint", "model"):
+            with self.subTest(repo_id=repo_id), self.assertRaises(ValueError):
+                svc.resolve_model_source(repo_id, config_dir=str(self.config_dir), curated_model_dir=None)
+
+    def test_missing_absolute_path_is_explicit(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            svc.resolve_model_source(str(self.root / "gone.safetensors"), config_dir=str(self.config_dir), curated_model_dir=None)
 
 
 class SdxlUnloadTests(unittest.TestCase):

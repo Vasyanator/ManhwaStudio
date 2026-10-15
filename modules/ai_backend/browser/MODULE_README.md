@@ -38,6 +38,8 @@ The service does not reimplement scraping. It instantiates the daemon class of t
   import time. `test_browser_service.py` is what keeps this honest.
 - A single `RLock` serialises browser commands (mirroring the old single stdin loop). The lock gives
   mutual exclusion; the executor gives the single-thread guarantee — they are not interchangeable.
+  `health()` never takes that lock (a command holds it for its whole run): it reads the
+  `runtime.health_snapshot.HealthSnapshot` republished whenever the daemon or backend changes.
 - Downloaded images are handed to the launcher as an on-disk directory path + count in the response
   header. No image bytes travel over IPC for downloads, and there is no response blob.
 - Selenium / Playwright are imported lazily, only when a browser command first runs, so an AI-only

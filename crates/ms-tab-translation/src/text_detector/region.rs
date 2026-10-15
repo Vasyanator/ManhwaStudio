@@ -14,28 +14,32 @@ Key functions:
 
 Notes:
 Every helper returns `([w, h], alpha)` at the REGION size with 0/255 alpha, and the empty mask
-for an empty region. The one square dilation owner is `ms_raster` (via `dilate_mask_alpha`).
+for an empty region. Each takes the caller's `ai_models::EnsureCtx`: its cancel flag stops a
+model download (`DetectFailure::Cancelled`) and its sink receives the download events. The one square dilation owner is `ms_raster` (via `dilate_mask_alpha`).
 */
 
-use super::pipeline::{self, DetectorRoute};
+use super::pipeline::{self, DetectFailure, DetectorRoute};
 use super::{TextDetectorAiCtdOptions, TextDetectorPaddleOcrOptions, dilate_mask_alpha};
 use eframe::egui;
 use image::RgbImage;
+use ms_sysprobe::ai_models::EnsureCtx;
 use ms_text_detect::{DetectParams, Detection, EngineKind};
 
 /// Runs CTD on an in-memory region and returns its mask dilated in Rust by
 /// `options.mask_dilate_size` (clamped 0..=30). Worker-thread only (blocking IPC).
 ///
 /// # Errors
-/// A localized message on conversion, model, IPC or pipeline failure.
+/// [`DetectFailure::Cancelled`] when `ctx.cancel` stopped the model download, else `Failed`
+/// with a localized message on conversion, model, IPC or pipeline failure.
 // `pub`, not crate-private: consumed by the `cleaning` tab, which lives in another crate.
 pub fn detect_ai_ctd_mask_for_image(
     image: &egui::ColorImage,
     options: &TextDetectorAiCtdOptions,
-) -> Result<([u32; 2], Vec<u8>), String> {
+    ctx: &mut EnsureCtx<'_>,
+) -> Result<([u32; 2], Vec<u8>), DetectFailure> {
     let params = pipeline::ctd_detect_params(options);
     region_mask(image, options.mask_dilate_size, |page| {
-        pipeline::detect_image(EngineKind::Ctd, page, &params, DetectorRoute::Backend)
+        pipeline::detect_image(EngineKind::Ctd, page, &params, DetectorRoute::Backend, ctx)
     })
 }
 
@@ -43,14 +47,16 @@ pub fn detect_ai_ctd_mask_for_image(
 /// returns its glyph mask dilated in Rust by `options.mask_dilate_size`. Worker-thread only.
 ///
 /// # Errors
-/// A localized message on conversion, model, inference, IPC or pipeline failure.
+/// [`DetectFailure::Cancelled`] when `ctx.cancel` stopped the model download, else `Failed`
+/// with a localized message on conversion, model, inference, IPC or pipeline failure.
 // `pub`, not crate-private: consumed by the `cleaning` tab, which lives in another crate.
 pub fn detect_paddle_mask_for_image(
     image: &egui::ColorImage,
     options: &TextDetectorPaddleOcrOptions,
-) -> Result<([u32; 2], Vec<u8>), String> {
+    ctx: &mut EnsureCtx<'_>,
+) -> Result<([u32; 2], Vec<u8>), DetectFailure> {
     region_mask(image, options.mask_dilate_size, |page| {
-        pipeline::detect_image(EngineKind::Paddle, page, &DetectParams::default(), pipeline::paddle_route())
+        pipeline::detect_image(EngineKind::Paddle, page, &DetectParams::default(), pipeline::paddle_route(), ctx)
     })
 }
 
@@ -58,14 +64,16 @@ pub fn detect_paddle_mask_for_image(
 /// dilated in Rust by `dilate_size` (clamped 0..=30). Worker-thread only.
 ///
 /// # Errors
-/// A localized message on conversion, IPC or pipeline failure.
+/// `Failed` with a localized message on conversion, IPC or pipeline failure (Surya downloads
+/// nothing here, so `ctx` is only passed through).
 // `pub`, not crate-private: consumed by the `cleaning` tab, which lives in another crate.
 pub fn detect_surya_mask_for_image(
     image: &egui::ColorImage,
     dilate_size: i32,
-) -> Result<([u32; 2], Vec<u8>), String> {
+    ctx: &mut EnsureCtx<'_>,
+) -> Result<([u32; 2], Vec<u8>), DetectFailure> {
     region_mask(image, dilate_size, |page| {
-        pipeline::detect_image(EngineKind::Surya, page, &DetectParams::default(), DetectorRoute::Backend)
+        pipeline::detect_image(EngineKind::Surya, page, &DetectParams::default(), DetectorRoute::Backend, ctx)
     })
 }
 
@@ -74,12 +82,12 @@ pub fn detect_surya_mask_for_image(
 /// dilated by `dilate_size` (clamped 0..=30).
 ///
 /// # Errors
-/// The conversion error or `detect`'s error.
-pub(super) fn region_mask(
+/// The conversion error (through `E: From<String>`) or `detect`'s error.
+pub(super) fn region_mask<E: From<String>>(
     image: &egui::ColorImage,
     dilate_size: i32,
-    detect: impl FnOnce(&RgbImage) -> Result<Detection, String>,
-) -> Result<([u32; 2], Vec<u8>), String> {
+    detect: impl FnOnce(&RgbImage) -> Result<Detection, E>,
+) -> Result<([u32; 2], Vec<u8>), E> {
     if image.size[0] == 0 || image.size[1] == 0 {
         return Ok(([0, 0], Vec::new()));
     }

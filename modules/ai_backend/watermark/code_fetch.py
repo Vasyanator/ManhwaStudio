@@ -12,8 +12,10 @@ SHA-256, and imported without ever being modified.
 Main responsibilities:
 - own the pinned manifest (commit SHA + per-file size and SHA-256) of the ten
   files that make up the three closures;
-- download them atomically (`.part` + `os.replace`) and reject any byte that
-  does not match its pinned hash;
+- download them through the shared retrying transfer
+  (`engines.model_download.download_http_to_path`: retry with backoff, `Range`
+  resume, staged `.part` + atomic `os.replace`) and reject any byte that does
+  not match its pinned size and hash;
 - import them without touching `sys.path` and without ever handing a path to the
   import system: every file's bytes are read ONCE, hashed, and executed from
   memory, under pinned-`__path__` package stubs for SLBR (`src.*`) and SplitNet
@@ -36,8 +38,11 @@ Notes:
   would happily merge into the `src` package.
 - Downloaded code is executed. The SHA-256 check is therefore a hard failure,
   not a warning, and the pinned commit SHAs must never be replaced by branch
-  names. Verification and execution operate on the same in-memory bytes, so a
-  file swapped between the two cannot slip through.
+  names. The download-time check (inside the shared transfer) only decides what
+  gets published; the guarantee that matters is the LOAD-time one:
+  verification and execution operate on the same in-memory bytes
+  (`_read_verified_source`), so a file swapped between the two cannot slip
+  through.
 - The loader leaves `sys.modules` exactly as it found it: names as generic as
   `src`, `scripts`, `unet_parts`, `vgg` or `dataloader` are shadowed only for
   the duration of the import and every pre-existing entry is restored.
@@ -48,7 +53,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import logging
-import os
 import sys
 import threading
 import types
@@ -56,6 +60,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from ..engines.model_download import (
+    GetFn,
+    HashMismatchError,
+    RetryEvent,
+    SizeMismatchError,
+    download_http_to_path,
+    retry_progress_label,
+)
 from ..runtime.paths import side_models_root
 
 log = logging.getLogger(__name__)
@@ -67,7 +79,6 @@ ProgressCb = Callable[[str, int, int, str], None]
 MODEL_IDS: tuple[str, ...] = ("slbr", "wdnet", "splitnet")
 
 _RAW_URL = "https://raw.githubusercontent.com/{owner}/{repo}/{commit}/{path}"
-_DOWNLOAD_TIMEOUT_S = 60
 
 
 @dataclass(frozen=True)
@@ -348,21 +359,35 @@ def is_code_ready(model_id: str) -> bool:
     return True
 
 
-def ensure_model_code(model_id: str, progress_callback: ProgressCb | None = None) -> None:
+def ensure_model_code(
+    model_id: str,
+    progress_callback: ProgressCb | None = None,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    get: GetFn | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> None:
     """Download the pinned network code of `model_id` if it is not already valid.
 
     Files that are present with the right size and hash are skipped, so a second
-    call is a no-op plus ten hashes. Every download is atomic (`.part` +
-    `os.replace`) and is verified before it is renamed into place.
+    call is a no-op plus ten hashes. A file present with the wrong bytes is
+    deleted first (proven wrong) and fetched again. Every download goes through
+    the shared retrying transfer, is verified against its pinned size and
+    SHA-256 and only then renamed into place.
 
     Progress is reported as `progress_callback("download", done, total, label)`
-    in bytes, matching the FLUX two-phase contract.
+    in bytes, matching the FLUX two-phase contract; a wait before a network
+    retry reports `retry_progress_label` as its label. `get` / `sleep` are the
+    transport and clock seams of the shared transfer (`None`: `requests.get` /
+    `time.sleep`); tests inject them. `should_cancel` is polled per chunk and
+    during retry waits.
 
     # Raises
     `ValueError` for an unknown `model_id`; `RuntimeError` when a download
-    fails, when `requests` is missing, or when a downloaded file does not match
-    its pinned size/SHA-256 - a hash mismatch is never tolerated, because these
-    files are executed.
+    fails permanently or exhausts its retries, or when a downloaded file does not
+    match its pinned size/SHA-256 - a hash mismatch is never tolerated, because
+    these files are executed. `DownloadCancelled` when `should_cancel` stopped
+    a download.
     """
     spec = _REPOS[_validate_model_id(model_id)]
     root = code_root(model_id)
@@ -407,7 +432,19 @@ def ensure_model_code(model_id: str, progress_callback: ProgressCb | None = None
                 done_bytes = _base + count
                 report(f"Скачивание {_name}")
 
-            _download_verified(url, dest, entry, on_chunk)
+            def on_retry(event: RetryEvent, _base: int = base, _name: str = name) -> None:
+                nonlocal done_bytes
+                done_bytes = _base + event.staged_bytes
+                report(retry_progress_label(_name, event))
+
+            # Present with the wrong bytes (that is why it is in `missing`):
+            # proven wrong, and the transfer would otherwise take a file at the
+            # pinned size for a finished one.
+            _unlink_quietly(dest)
+            _download_verified(
+                url, dest, entry, on_chunk, on_retry,
+                should_cancel=should_cancel, get=get, sleep=sleep,
+            )
             done_bytes = base + entry.size
             report(f"Скачано {name}")
 
@@ -673,71 +710,55 @@ def _download_verified(
     dest: Path,
     entry: _RemoteFile,
     on_chunk: Callable[[int], None],
+    on_retry: Callable[[RetryEvent], None],
+    *,
+    should_cancel: Callable[[], bool] | None,
+    get: GetFn | None,
+    sleep: Callable[[float], None] | None,
 ) -> None:
-    """Stream `url` into `dest` atomically, verifying size and SHA-256 first.
+    """Fetch `url` into `dest` through the shared transfer, pinned by size and SHA-256.
 
-    The bytes are written to `dest.part` and hashed while streaming; the file is
-    renamed into place only after both the length and the digest match the
-    manifest. A failed verification removes the partial file and raises.
+    `download_http_to_path` owns the retry, the `Range` resume, the staged
+    `.part` and the atomic rename; it publishes `dest` only after the length and
+    the digest match the manifest, and deletes bytes proven wrong.
 
     # Raises
-    `RuntimeError` on a transport error, a missing `requests`, or a size/digest
-    mismatch.
+    `RuntimeError` on a size/digest mismatch (with this domain's integrity
+    message), on a permanent HTTP status, or when the retries run out.
     """
-    try:
-        import requests
-    except Exception as exc:  # pragma: no cover - requests is in requirements.txt
-        raise RuntimeError(
-            "Для загрузки кода модели удаления водяных знаков требуется пакет requests."
-        ) from exc
+    import requests
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_name(dest.name + ".part")
-    digest = hashlib.sha256()
-    written = 0
     try:
-        with requests.get(
-            url, stream=True, allow_redirects=True, timeout=_DOWNLOAD_TIMEOUT_S
-        ) as response:
-            response.raise_for_status()
-            with tmp.open("wb") as handle:
-                for chunk in response.iter_content(chunk_size=1 << 16):
-                    if not chunk:
-                        continue
-                    handle.write(chunk)
-                    digest.update(chunk)
-                    written += len(chunk)
-                    on_chunk(written)
-    except Exception as exc:
-        _unlink_quietly(tmp)
-        # One message for both failure modes on purpose: `requests`' exceptions
-        # derive from `OSError`, so a transport error and a disk error cannot be
-        # told apart here. Both operands are named so the log stays actionable.
-        raise RuntimeError(
-            f"Не удалось получить файл кода модели.\nИсточник: {url}\nФайл: {dest}\n"
-            f"Ошибка: {exc}"
-        ) from exc
-
-    actual = digest.hexdigest()
-    if written != entry.size or actual != entry.sha256:
-        _unlink_quietly(tmp)
+        download_http_to_path(
+            url,
+            dest,
+            expected_size=entry.size,
+            expected_sha256=entry.sha256,
+            on_progress=lambda done, _total: on_chunk(done),
+            on_retry=on_retry,
+            should_cancel=should_cancel,
+            get=get,
+            sleep=sleep,
+        )
+    except (SizeMismatchError, HashMismatchError) as exc:
         log.error(
-            "watermark: integrity check failed for %s (expected %d bytes / %s, "
-            "got %d bytes / %s)",
+            "watermark: integrity check failed for %s (expected %d bytes / %s): %s",
             url,
             entry.size,
             entry.sha256,
-            written,
-            actual,
+            exc,
         )
         raise RuntimeError(
             "Проверка целостности скачанного кода не пройдена — файл не будет "
             f"использован.\nФайл: {entry.path}\nИсточник: {url}\n"
-            f"Ожидалось: {entry.size} байт, SHA-256 {entry.sha256}\n"
-            f"Получено:  {written} байт, SHA-256 {actual}"
-        )
-
-    os.replace(tmp, dest)
+            f"Ожидалось: {entry.size} байт, SHA-256 {entry.sha256}\n{exc}"
+        ) from exc
+    except requests.HTTPError as exc:
+        log.error("watermark: source file request refused for %s: %s", url, exc)
+        raise RuntimeError(
+            f"Не удалось получить файл кода модели.\nИсточник: {url}\nФайл: {dest}\n"
+            f"Ошибка: {exc}"
+        ) from exc
 
 
 def _file_matches(path: Path, entry: _RemoteFile) -> bool:

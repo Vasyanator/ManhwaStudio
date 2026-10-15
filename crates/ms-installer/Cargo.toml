@@ -60,8 +60,9 @@ ms-window-geometry = { path = "../ms-window-geometry" }
 # (`eframe::run_native`), with the same feature set the binary selects so no second
 # copy of the backend is built.
 eframe.workspace = true
-# Release metadata from the GitHub API and the pip/Torch index queries.
-ureq.workspace = true
+# Release metadata (`fetch_small`) and release-asset downloads (`fetch_verified`): retry with
+# capped backoff, `Range` resume, size / sha256 verification, cancel (`src/download.rs`).
+ms-download = { path = "../ms-download" }
 serde.workspace = true
 serde_json.workspace = true
 # The Python runtime and the release payloads ship as `.tar.gz` (flate2 + tar) and
@@ -82,5 +83,10 @@ web-time.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-# Isolated on-disk fixtures for the layout/venv-inspection tests in `utils.rs`.
+# Isolated on-disk fixtures for the layout/venv-inspection tests in `utils.rs` and the download
+# tests in `download/tests.rs`.
 tempfile.workspace = true
+# `test_support::ScriptedFetcher`: the in-memory server of the download tests.
+ms-download = { path = "../ms-download", features = ["test-support"] }
+# sha256 of the test content (asset digest pins).
+sha2.workspace = true

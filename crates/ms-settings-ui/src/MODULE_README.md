@@ -88,7 +88,14 @@ not the dependency list.
   `NativeHardwareFacts`, so the panel shows what the runtime will do. Where nothing is
   downloadable (`ms_onnx_runtime::ort_downloads_offered_here() == false`, Android: every build
   is bundled in the APK) the picker lists only the runnable builds, and a bundled build never
-  starts or offers a download (`build_source_kind_here`). EP tokens are written and read
+  starts or offers a download (`build_source_kind_here`). The ORT auto-download runs on an
+  `ort-download` worker (`maybe_start_ort_download`, one at a time) with a per-run cancel
+  flag: the block shows the stage (including the retry countdown "attempt k/n") and a Cancel
+  button; a cancelled build is not auto-restarted, its Resume button restarts it and the
+  resolver resumes the kept `.part`. A concurrent native OCR load of the same build is
+  serialized by the resolver itself (the block then shows "waiting"). Whether a build is
+  installed (button state, auto-download gate) is `ms_onnx_runtime::ort_build_installed`,
+  probed once per build on an `ort-build-presence` worker and cached in `ort_build_present`. EP tokens are written and read
   through `ms_native_runtime::{ort_provider_token, parse_ort_provider_token}`. The Backend-branch
   provider list's `native_available` flag is a separate local-capability heuristic (DirectML
   adapter detected, CUDA 12 probe) that only seeds the Backend default provider. Selections persist off-thread through

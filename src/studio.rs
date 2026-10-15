@@ -164,6 +164,9 @@ pub struct StudioApp {
     bubbles_model: Arc<Mutex<BubblesModel>>,
     clean_overlays_model: Arc<Mutex<CleanOverlaysModel>>,
     applied_bubbles_revision: u64,
+    /// Latched by `sync_project_from_bubbles_model` the first time it finds the bubbles lock
+    /// poisoned, so the per-frame skip is logged once, not every frame.
+    bubbles_sync_poison_logged: bool,
     active_tab: AppTab,
     /// Shared viewport / page / camera-center sync between the canvas tabs and the PS editor
     /// (`studio/view_sync.rs`), applied before the active tab draws and published after the frame.
@@ -442,6 +445,7 @@ impl StudioApp {
             bubbles_model,
             clean_overlays_model,
             applied_bubbles_revision,
+            bubbles_sync_poison_logged: false,
             active_tab: AppTab::Translation,
             view_sync: ViewSync::new(shared_canvas_viewport),
             ai_backend_health,
@@ -777,9 +781,21 @@ impl StudioApp {
         }
     }
 
+    /// Copies the shared bubble list into `self.project` when the model's revision moved, and notes
+    /// the session unsaved. A poisoned model lock skips the sync (the project copy keeps its last
+    /// state) and is logged once per app, not per frame (`bubbles_sync_poison_logged`).
     fn sync_project_from_bubbles_model(&mut self) {
-        let Ok(model) = self.bubbles_model.lock() else {
-            return;
+        let model = match self.bubbles_model.lock() {
+            Ok(model) => model,
+            Err(err) => {
+                if !self.bubbles_sync_poison_logged {
+                    self.bubbles_sync_poison_logged = true;
+                    runtime_log::log_error(format!(
+                        "[app] BubblesModel lock poisoned; the project's bubble copy is no longer synced from the model for this session (logged once). Error: {err}"
+                    ));
+                }
+                return;
+            }
         };
         let revision = model.revision();
         if revision == self.applied_bubbles_revision {
@@ -1175,14 +1191,23 @@ fn input_registry_or_empty(built: Result<InputRegistry, DeclarationError>) -> In
 /// ~32ms afterwards). Running that scan here, on a detached background thread, moves it off the
 /// GUI thread and off the first text render's critical path. Idempotent across repeated
 /// `StudioApp::new` calls (launcher<->studio transitions) via a `Once` guard, so no redundant
-/// prewarm threads are spawned.
+/// prewarm threads are spawned. A thread the OS refuses is logged and not retried; the first
+/// text render then does the scan itself.
 fn spawn_text_render_font_pool_prewarm() {
     static PREWARM_ONCE: std::sync::Once = std::sync::Once::new();
     PREWARM_ONCE.call_once(|| {
         runtime_log::log_info("[app] prewarming text-render font system pool in background");
         // Detached: the pool is process-global, the work is idempotent, and nothing on the GUI
         // thread waits on it. We must never join this on the GUI thread.
-        thread::spawn(crate::tabs::typing::render_next::prewarm_font_system_pool);
+        if let Err(err) = thread::Builder::new()
+            .name("font-pool-prewarm".to_owned())
+            .spawn(crate::tabs::typing::render_next::prewarm_font_system_pool)
+        {
+            // Only a warm-up: the first text render then scans the fonts itself (slower, correct).
+            runtime_log::log_warn(format!(
+                "[app] could not start the text-render font pool prewarm thread; the first text render scans the fonts itself. Error: {err}"
+            ));
+        }
     });
 }
 

@@ -86,13 +86,14 @@ impl SdxlMode {
 /// The full generation parameter set of ONE mode.
 ///
 /// Persisted per mode, so the modes never overwrite each other's prompts or weights path.
-/// `model_path` is a ckpt / safetensors path, a diffusers folder, or a Hugging Face repo id —
-/// the backend decides which; `lama_model` is a LaMa-v2 catalog FILE NAME and is read only in
-/// [`SdxlMode::FourChannel`].
+/// `model_path` is an absolute ckpt / safetensors path, a local diffusers folder, or the one
+/// curated repository id (what is accepted is `source::classify_model_path`'s rule; an older
+/// file may hold another repo id, which the run gate then refuses); `lama_model` is a LaMa-v2
+/// catalog FILE NAME and is read only in [`SdxlMode::FourChannel`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct SdxlSettings {
-    /// ckpt / safetensors path, diffusers folder, or a Hugging Face repo id.
+    /// ckpt / safetensors path, diffusers folder, or the curated repository id.
     pub(super) model_path: String,
     pub(super) positive_prompt: String,
     pub(super) negative_prompt: String,

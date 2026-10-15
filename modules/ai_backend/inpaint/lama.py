@@ -46,6 +46,7 @@ try:
 except Exception:
     from modules.ai_device import AIDevice
 
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.paths import program_root
 
@@ -117,26 +118,49 @@ class LamaInpaintService:
         self._last_error: str | None = None
         self._module_source_path: Path | None = None
         self._model_dir = Path(str(LAMA_DIR))
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a load and inference hold (S-014).
+        self._health = HealthSnapshot()
+        self._publish_health_locked()
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            ckpts = self._collect_checkpoints()
-            checkpoint_names = [path.name for path in ckpts]
-            default_checkpoint = self._pick_default_checkpoint_name(ckpts)
-            return {
-                "ready": self._inpainter is not None,
-                "model": "lama_v2",
-                "device": self._active_device,
-                "model_dir": str(self._model_dir),
-                "config_exists": (self._model_dir / "config.yaml").is_file(),
-                "checkpoint_count": len(ckpts),
-                "available_models": checkpoint_names,
-                "selected_model": self._active_checkpoint_name or default_checkpoint,
-                "loaded_model": self._active_checkpoint_name,
-                "module_source_path": str(self._module_source_path) if self._module_source_path else None,
-                "last_error": self._last_error,
-                "memory": self._safe_memory_stats_locked(),
-            }
+        """Return the LaMa V2 health entry for the backend snapshot.
+
+        State fields come from the published snapshot; the checkpoint listing
+        and the memory counters are read here, outside any service lock, so
+        this answers while a load or an inference holds the instance lock.
+        """
+        fields = self._health.read()
+        ckpts = self._collect_checkpoints()
+        checkpoint_names = [path.name for path in ckpts]
+        default_checkpoint = self._pick_default_checkpoint_name(ckpts)
+        return {
+            "ready": fields["ready"],
+            "model": "lama_v2",
+            "device": fields["device"],
+            "model_dir": str(self._model_dir),
+            "config_exists": (self._model_dir / "config.yaml").is_file(),
+            "checkpoint_count": len(ckpts),
+            "available_models": checkpoint_names,
+            "selected_model": fields["loaded_model"] or default_checkpoint,
+            "loaded_model": fields["loaded_model"],
+            "module_source_path": fields["module_source_path"],
+            "last_error": fields["last_error"],
+            # One unlocked reference read: the stats only read the inpainter's
+            # `device`/`model` and process-wide CUDA counters, and an inpainter
+            # unloaded concurrently is still a valid object to ask.
+            "memory": self._safe_memory_stats(self._inpainter, fields["device"]),
+        }
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock` (or is `__init__`)."""
+        self._health.publish(
+            ready=self._inpainter is not None,
+            device=self._active_device,
+            loaded_model=self._active_checkpoint_name,
+            module_source_path=str(self._module_source_path) if self._module_source_path else None,
+            last_error=self._last_error,
+        )
 
     def inpaint_image_bytes(
         self,
@@ -179,8 +203,10 @@ class LamaInpaintService:
                 )
                 out_rgb = inpainter(image_rgb, mask_u8)
                 self._last_error = None
+                self._publish_health_locked()
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 raise
             finally:
                 lease.release()
@@ -206,6 +232,7 @@ class LamaInpaintService:
                 self._inpainter = None
                 self._active_checkpoint_name = None
                 self._active_model_key = None
+                self._publish_health_locked()
                 if current_key is not None:
                     self._model_manager.mark_unloaded(current_key)
             return True
@@ -229,6 +256,7 @@ class LamaInpaintService:
             except Exception:
                 pass
             self._inpainter = None
+            self._publish_health_locked()
             if previous_key is not None:
                 self._model_manager.mark_unloaded(previous_key)
 
@@ -243,6 +271,7 @@ class LamaInpaintService:
         self._active_device = device
         self._active_checkpoint_name = checkpoint_name
         self._active_model_key = requested_key
+        self._publish_health_locked()
         return self._inpainter
 
     def _unload_key(self, model_key: str) -> bool:
@@ -277,6 +306,8 @@ class LamaInpaintService:
 
         self._inpainter_cls = cls
         self._module_source_path = module_path
+        # Published at once: the inpainter construction that follows may raise.
+        self._publish_health_locked()
         return cls
 
     @staticmethod
@@ -441,10 +472,12 @@ class LamaInpaintService:
             )
         return np.where(mask > 0, 255, 0).astype(np.uint8)
 
-    def _safe_memory_stats_locked(self) -> dict[str, Any]:
-        if self._inpainter is None:
+    @staticmethod
+    def _safe_memory_stats(inpainter: Any, device: str) -> dict[str, Any]:
+        """Memory counters of `inpainter` for health; `device` labels the fallback entry."""
+        if inpainter is None:
             return {"model_loaded": False}
-        get_stats = getattr(self._inpainter, "get_memory_stats", None)
+        get_stats = getattr(inpainter, "get_memory_stats", None)
         if callable(get_stats):
             try:
                 raw = get_stats()
@@ -452,7 +485,7 @@ class LamaInpaintService:
                     return raw
             except Exception:
                 pass
-        return {"model_loaded": True, "device": self._active_device}
+        return {"model_loaded": True, "device": device}
 
 
 def _maybe_cv2():

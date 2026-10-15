@@ -114,6 +114,8 @@ android/app/src/main/assets/
 # Golden split/join fixtures of the document store, shared by the Rust crate and the
 # Python codec (docstore.py). Both implementations are tested against them.
 !crates/ms-docstore/fixtures/*.json
+# Pinned EasyOCR language -> script -> file/md5 table (S-016), guarded by Rust and Python tests.
+!crates/ms-sysprobe/fixtures/*.json
 
 # Golden text-detector postprocess fixtures of ms-text-detect (inputs and expected outputs
 # recorded from the reference Python implementation). The parity tests read them, so a clean
@@ -187,6 +189,12 @@ tools/egui_docs/*.py[cod]
 !tools/run-dev/*.sh
 !tools/run-dev/*.ps1
 !tools/run-dev/MODULE_README.md
+# Model pin generator (S-016): prints catalog rows (size + sha256) for pinned downloads.
+!tools/model_pins/
+!tools/model_pins/*.py
+!tools/model_pins/sources.json
+!tools/model_pins/MODULE_README.md
+tools/model_pins/__pycache__/
 
 # Python backend and helper modules. Keep bytecode and local browser profiles out.
 !modules/

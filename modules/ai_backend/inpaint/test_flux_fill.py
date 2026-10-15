@@ -18,14 +18,20 @@ Main responsibilities:
 - verify unloading and swapping quants drop the pipeline and report it;
 - verify two concurrent first uses of the same quant stage the download once,
   into a process-private file, instead of writing over each other;
-- verify this path is NOT resumable: a failed transfer unlinks its staging file
-  and parks nothing, and no `Range` header is ever sent. Resume is opt-in in
-  `../engines/model_download.py`, and these two assertions are what keep it that
-  way for a shipped feature.
+- verify the download rides the shared retrying primitive: a dropped connection
+  is retried and resumed with `Range`, a failure that ends the call parks the
+  bytes for the next attempt, and the listing size is the integrity gate;
+- verify the download plan refuses instead of guessing: a failed GGUF listing or
+  a quant missing from it raises, and every planned size comes from the listing;
+- verify `ensure_model` reports a retry as an ordinary `download` frame with a
+  retry label, threads `should_cancel` into the transfer, and logs (once) rather
+  than swallows a failing progress callback.
 
 Notes:
 - Fake `torch` and `diffusers` modules are injected into `sys.modules`, so the
-  tests need neither package, nor the FLUX weights, nor a GPU.
+  tests need neither package, nor the FLUX weights, nor a GPU. The weight
+  transfer runs for real against a fake transport installed in the shared
+  primitive's `_default_get` / `_default_sleep` seams; no network, no waiting.
 - Whether the staging patch does anything on the current host is
   `rocm_mmap_transfer`'s own contract (covered by `test_rocm_mmap_transfer.py`).
   What is pinned here is only how the service drives it.
@@ -33,6 +39,7 @@ Notes:
 
 from __future__ import annotations
 
+import hashlib
 import sys
 import tempfile
 import threading
@@ -42,6 +49,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from modules.ai_backend.engines import model_download as md
 from modules.ai_backend.inpaint import flux_fill as svc
 from modules.ai_backend.runtime.model_manager import LoadedModelManager
 
@@ -520,15 +528,24 @@ class WeightDownloadConcurrencyTests(unittest.TestCase):
                 self.payloads.append(payload)
             return _SlowFluxResponse(payload)
 
-        module = types.ModuleType("requests")
-        module.get = get
-        modules_patch = patch.dict(sys.modules, {"requests": module})
-        modules_patch.start()
-        self.addCleanup(modules_patch.stop)
+        self.sleeps: list[float] = []
+        self._install(get)
+
+    def _install(self, get: object) -> None:
+        """Route the shared primitive's transport and clock seams to fakes."""
+        for name, value in (("_default_get", get), ("_default_sleep", self.sleeps.append)):
+            seam = patch.object(md, name, value)
+            seam.start()
+            self.addCleanup(seam.stop)
+
+    def _fetch(self, expected_size: int = 40960) -> bool:
+        return svc._download_file_streaming(
+            "https://hf/flux.gguf", str(self.dest), expected_size, lambda _n: None
+        )
 
     def _download(self, errors: list[BaseException]) -> None:
         try:
-            svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
+            self._fetch()
         except BaseException as exc:  # noqa: BLE001 - re-raised by the assertion below
             errors.append(exc)
 
@@ -547,64 +564,249 @@ class WeightDownloadConcurrencyTests(unittest.TestCase):
         self.assertEqual(list(self.root.glob("*.part")), [])
 
     def test_a_present_file_is_not_downloaded_again(self) -> None:
-        self.dest.write_bytes(b"already here")
+        self.dest.write_bytes(b"A" * 40960)
 
-        self.assertFalse(
-            svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
-        )
+        self.assertFalse(self._fetch())
         self.assertEqual(self.requests_seen, [])
 
-    def test_a_failed_download_unlinks_and_never_parks_a_partial(self) -> None:
-        """FLUX.1-Fill is NOT resumable, and must not become so by accident.
+    def test_a_present_file_at_the_wrong_size_is_replaced(self) -> None:
+        self.dest.write_bytes(b"truncated")
 
-        Resume is opt-in in the shared primitive precisely so that this path keeps
-        its long-standing semantics: a failure leaves NOTHING behind, under either
-        staging name. A stray `.part` here would be a behaviour change to a
-        shipped feature, which is why it is asserted rather than assumed.
-        """
+        self.assertTrue(self._fetch())
+        self.assertEqual(self.dest.read_bytes(), self.payloads[0])
 
-        class _Failing:
-            headers = {"Content-Length": "40960"}
+    def test_a_dropped_connection_is_retried_and_resumed(self) -> None:
+        import requests
 
-            def __enter__(self) -> "_Failing":
-                return self
+        full = bytes(range(256)) * 160
+        calls: list[dict[str, str]] = []
 
-            def __exit__(self, *_exc_info: object) -> bool:
-                return False
+        def get(url: str, **kwargs: object) -> _ScriptedFluxResponse:
+            headers = dict(kwargs.get("headers") or {})  # type: ignore[arg-type]
+            calls.append(headers)
+            if "Range" not in headers:
+                return _ScriptedFluxResponse(
+                    full[:4096], status=200, announce=len(full),
+                    raise_after=requests.exceptions.ChunkedEncodingError("reset"),
+                )
+            start = int(headers["Range"].split("=", 1)[1].rstrip("-"))
+            return _ScriptedFluxResponse(full[start:], status=206, start=start, total=len(full))
 
-            def raise_for_status(self) -> None:
-                return None
+        self._install(get)
 
-            def iter_content(self, chunk_size: int = 1 << 20):
-                yield b"A" * 4096
-                raise OSError("connection reset")
-
-        sys.modules["requests"].get = lambda url, **kwargs: _Failing()
-
-        with self.assertRaises(OSError):
-            svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
-
-        self.assertFalse(self.dest.exists())
+        self.assertTrue(self._fetch(len(full)))
+        self.assertEqual(self.dest.read_bytes(), full)
+        self.assertEqual([headers.get("Range") for headers in calls], [None, "bytes=4096-"])
+        self.assertTrue(self.sleeps)
         self.assertEqual(list(self.root.glob("*.part")), [])
 
-    def test_no_range_header_is_ever_sent(self) -> None:
-        """The non-resumable path must not ask for a range even after a failure."""
-        self.dest.with_name(self.dest.name + ".part").write_bytes(b"B" * 1024)
+    def test_a_failure_that_ends_the_call_parks_the_bytes(self) -> None:
+        """FLUX.1-Fill resumes: a ~12 GB quant must not restart from zero."""
 
-        self.assertTrue(
-            svc._download_file_streaming("https://hf/flux.gguf", str(self.dest), lambda _n: None)
-        )
-        self.assertEqual([headers for headers in self.requests_seen if "Range" in headers], [])
+        def get(url: str, **kwargs: object) -> _ScriptedFluxResponse:
+            return _ScriptedFluxResponse(b"A" * 4096, status=200, announce=40960, raise_after=OSError("disk gone"))
+
+        self._install(get)
+
+        # `OSError` is not a transport error, so it is permanent: no retry.
+        with self.assertRaises(OSError):
+            self._fetch()
+
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(md.staged_bytes(self.dest), 4096)
+        self.assertEqual(self.sleeps, [])
 
     def test_the_hf_token_is_still_sent_as_a_bearer_header(self) -> None:
         with patch.dict("os.environ", {"HF_TOKEN": "hf_secret"}):
-            self.assertTrue(
-                svc._download_file_streaming(
-                    "https://hf/flux.gguf", str(self.dest), lambda _n: None
-                )
-            )
+            self.assertTrue(self._fetch())
 
         self.assertEqual(self.requests_seen[0].get("Authorization"), "Bearer hf_secret")
+
+
+class _ScriptedFluxResponse:
+    """Streaming stand-in with a status, an optional `Content-Range` and a scripted end."""
+
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int,
+        announce: int | None = None,
+        start: int = 0,
+        total: int | None = None,
+        raise_after: BaseException | None = None,
+    ) -> None:
+        self._body = body
+        self._raise_after = raise_after
+        self.status_code = status
+        self.headers = {"Content-Length": str(len(body) if announce is None else announce)}
+        if status == 206:
+            self.headers["Content-Range"] = f"bytes {start}-{start + len(body) - 1}/{total}"
+
+    def __enter__(self) -> "_ScriptedFluxResponse":
+        return self
+
+    def __exit__(self, *_exc_info: object) -> bool:
+        return False
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def iter_content(self, chunk_size: int = 1 << 20):
+        for start in range(0, len(self._body), 1024):
+            yield self._body[start : start + 1024]
+        if self._raise_after is not None:
+            raise self._raise_after
+
+
+class _Sibling:
+    def __init__(self, rfilename: str, size: int | None, sha256: str | None = None) -> None:
+        self.rfilename = rfilename
+        self.size = size
+        # `BlobLfsInfo` surface: LFS files carry their digest, small configs none.
+        self.lfs = types.SimpleNamespace(size=size, sha256=sha256, pointer_size=134) if sha256 else None
+
+
+class _HubInfo:
+    def __init__(self, siblings: list[_Sibling]) -> None:
+        self.siblings = siblings
+
+
+class DownloadPlanTests(unittest.TestCase):
+    """The plan's sizes are the integrity gate, so the listing is mandatory."""
+
+    VAE_SHA = "ab" * 32
+    COMPONENTS = [
+        _Sibling("model_index.json", 500),
+        _Sibling("vae/diffusion_pytorch_model.safetensors", 9000, VAE_SHA),
+    ]
+
+    def _plan(self, gguf_listing: object) -> list[dict[str, object]]:
+        components = self.COMPONENTS
+
+        class _Api:
+            def __init__(self, token: object = None) -> None:
+                del token
+
+            def model_info(self, repo: str, files_metadata: bool = False) -> _HubInfo:
+                if repo == svc.GGUF_REPO:
+                    if isinstance(gguf_listing, BaseException):
+                        raise gguf_listing
+                    return gguf_listing  # type: ignore[return-value]
+                return _HubInfo(components)
+
+        hub = types.ModuleType("huggingface_hub")
+        hub.HfApi = _Api  # type: ignore[attr-defined]
+        hub.hf_hub_url = lambda repo, path: f"https://hf/{repo}/{path}"  # type: ignore[attr-defined]
+        with patch.dict(sys.modules, {"huggingface_hub": hub}):
+            return svc._build_download_plan("Q8_0")
+
+    def test_sizes_come_from_the_listing(self) -> None:
+        plan = self._plan(_HubInfo([_Sibling(svc.gguf_filename("Q8_0"), 12_000)]))
+
+        self.assertEqual([item["size"] for item in plan], [12_000, 500, 9000])
+
+    def test_lfs_digests_come_from_the_listing(self) -> None:
+        gguf_sha = "CD" * 32
+        plan = self._plan(_HubInfo([_Sibling(svc.gguf_filename("Q8_0"), 12_000, gguf_sha)]))
+
+        # Lowercased; a non-LFS config has none and is checked by size alone.
+        self.assertEqual([item["sha256"] for item in plan], [gguf_sha.lower(), None, self.VAE_SHA])
+
+    def test_a_failed_gguf_listing_raises_instead_of_planning_size_zero(self) -> None:
+        with self.assertRaises(RuntimeError) as caught:
+            self._plan(ConnectionError("hub down"))
+
+        self.assertIn(svc.GGUF_REPO, str(caught.exception))
+
+    def test_a_quant_missing_from_the_listing_raises(self) -> None:
+        with self.assertRaises(RuntimeError) as caught:
+            self._plan(_HubInfo([_Sibling("other.gguf", 1)]))
+
+        self.assertIn(svc.gguf_filename("Q8_0"), str(caught.exception))
+
+
+class EnsureModelTests(unittest.TestCase):
+    """`ensure_model` drives the transfer: retry frames, cancel, callback failures."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.dest = root / "flux1-fill-dev-Q8_0.gguf"
+        self.plan = [
+            {
+                "url": "https://hf/flux.gguf",
+                "dest": str(self.dest),
+                "size": 2048,
+                "sha256": hashlib.sha256(b"A" * 2048).hexdigest(),
+            }
+        ]
+        for target, value in (
+            ("_flux_dir", lambda: str(root)),
+            ("_components_dir", lambda: str(root / "components")),
+            ("_build_download_plan", lambda quant: self.plan),
+        ):
+            seam = patch.object(svc, target, value)
+            seam.start()
+            self.addCleanup(seam.stop)
+        self.service = svc.FluxFillInpaintService(LoadedModelManager())
+        self.calls: list[dict[str, str]] = []
+        self.sleeps: list[float] = []
+
+        def get(url: str, **kwargs: object) -> _ScriptedFluxResponse:
+            headers = dict(kwargs.get("headers") or {})  # type: ignore[arg-type]
+            self.calls.append(headers)
+            if len(self.calls) == 1:
+                return _ScriptedFluxResponse(b"A" * 1024, status=200, announce=2048)
+            return _ScriptedFluxResponse(b"A" * 1024, status=206, start=1024, total=2048)
+
+        for name, value in (("_default_get", get), ("_default_sleep", self.sleeps.append)):
+            seam = patch.object(md, name, value)
+            seam.start()
+            self.addCleanup(seam.stop)
+
+    def test_a_retry_is_a_download_frame_with_a_retry_label(self) -> None:
+        frames: list[tuple[str, int, int, str]] = []
+
+        self.service.ensure_model("Q8_0", lambda *frame: frames.append(frame))
+
+        self.assertEqual(self.dest.read_bytes(), b"A" * 2048)
+        retry = [frame for frame in frames if frame[3].startswith("Сеть недоступна")]
+        self.assertEqual(len(retry), 1)
+        self.assertEqual(retry[0][0], "download")
+        self.assertIn("1/5", retry[0][3])
+        self.assertTrue(retry[0][3].endswith(self.dest.name))
+        self.assertEqual(frames[-1][1], 2048)
+
+    def test_a_digest_mismatch_deletes_the_file_and_fails(self) -> None:
+        self.plan[0]["sha256"] = "0" * 64
+
+        with self.assertRaises(md.HashMismatchError):
+            self.service.ensure_model("Q8_0", None)
+
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(md.staged_bytes(self.dest), 0)
+
+    def test_should_cancel_reaches_the_backoff_wait(self) -> None:
+        with self.assertRaises(md.DownloadCancelled):
+            self.service.ensure_model("Q8_0", None, lambda: bool(self.sleeps))
+
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(md.staged_bytes(self.dest), 1024)
+
+    def test_a_failing_progress_callback_is_logged_once_and_does_not_abort(self) -> None:
+        def broken(*_frame: object) -> None:
+            raise ValueError("peer gone")
+
+        with self.assertLogs(svc.log, level="WARNING") as logs:
+            self.service.ensure_model("Q8_0", broken)
+
+        self.assertEqual(self.dest.read_bytes(), b"A" * 2048)
+        callback_lines = [line for line in logs.output if "progress callback failed" in line]
+        self.assertEqual(len(callback_lines), 1)
 
 
 class UnloadTests(unittest.TestCase):

@@ -119,12 +119,17 @@ def _handle_ocr_easy(
 ) -> tuple[dict[str, Any], bytes]:
     """`ocr.easy`: recognize the request-blob image via EasyOCR.
 
-    Request fields: ``join_newlines`` (default true), ``reflect_strings``
-    (default false), ``easy_langs`` (default ``"ko"``).  Returns
-    ``engine``/``lines``/``text`` inline; no response blob.
+    Request fields: the REQUIRED ``easyocr_model_dir`` (absolute directory of
+    the EasyOCR weights; Rust owns the download), ``join_newlines`` (default
+    true), ``reflect_strings`` (default false), ``easy_langs`` (canonical
+    EasyOCR codes, comma-separated; default ``"ko"``).  This layer checks only
+    that the directory field is a non-empty string; the directory itself is
+    the service's single answer.  Returns ``engine``/``lines``/``text``
+    inline; no response blob.
     """
     if not blob:
         raise ValueError("ocr.easy requires the input image in the frame blob.")
+    model_dir = _require_non_empty_str(header, "easyocr_model_dir")
     if cancel_event.is_set():
         raise Interrupted("ocr.easy canceled before start.")
 
@@ -137,6 +142,7 @@ def _handle_ocr_easy(
 
     result = ctx.state.easy_ocr.recognize_image_bytes(
         blob,
+        model_dir=model_dir,
         join_newlines=bool(header.get("join_newlines", True)),
         reflect_strings=bool(header.get("reflect_strings", False)),
         langs=easy_langs,
@@ -267,15 +273,20 @@ def _handle_ocr_surya(
 ) -> tuple[dict[str, Any], bytes]:
     """`ocr.surya`: recognize the request-blob image via Surya OCR.
 
-    Request fields: ``join_newlines`` (default true), ``reflect_strings``
-    (default false), ``surya_task_name`` (default ``"ocr_without_boxes"``,
-    lowercased), ``surya_recognize_math``/``surya_sort_lines``/
-    ``surya_drop_repeated_text`` (bool, default false), and the optional
-    positive ints ``surya_max_sliding_window``/``surya_max_tokens``.  Returns
+    Request fields: the REQUIRED ``surya_recognition_dir`` and
+    ``surya_detection_dir`` (absolute checkpoint directories; Rust owns the
+    download; the detector one is loaded only for ``ocr_with_boxes``),
+    ``join_newlines`` (default true), ``reflect_strings`` (default false),
+    ``surya_task_name`` (default ``"ocr_without_boxes"``, lowercased),
+    ``surya_recognize_math``/``surya_sort_lines``/``surya_drop_repeated_text``
+    (bool, default false), and the optional positive ints
+    ``surya_max_sliding_window``/``surya_max_tokens``.  Returns
     ``engine``/``task_name``/``lines``/``text`` inline; no response blob.
     """
     if not blob:
         raise ValueError("ocr.surya requires the input image in the frame blob.")
+    recognition_dir = _require_non_empty_str(header, "surya_recognition_dir")
+    detection_dir = _require_non_empty_str(header, "surya_detection_dir")
     if cancel_event.is_set():
         raise Interrupted("ocr.surya canceled before start.")
 
@@ -291,6 +302,8 @@ def _handle_ocr_surya(
 
     result = ctx.state.surya_ocr.recognize_image_bytes(
         blob,
+        recognition_dir=recognition_dir,
+        detection_dir=detection_dir,
         join_newlines=bool(header.get("join_newlines", True)),
         reflect_strings=bool(header.get("reflect_strings", False)),
         task_name=task_name,

@@ -231,7 +231,7 @@ impl ProjectSession {
         // in a staging dir re-created after the merge deleted it, while the app reported "saved".
         let overlay_autosave_control = parts.writers.overlay_control();
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        thread::spawn(move || {
+        let spawned = thread::Builder::new().name("save-to-project".to_owned()).spawn(move || {
             // Hold later bubble snapshots until every destructive staging operation below is done.
             // Dropping this guard on any return path resumes the saver.
             let bubbles_barrier = match bubbles_saver_handle.barrier_and_hold_blocking() {
@@ -349,6 +349,19 @@ impl ProjectSession {
                 );
             }
         });
+        // The handle is dropped: the worker is detached and answers only through `tx`.
+        if let Err(err) = spawned {
+            // Same outcome as the GUI-side aborts above: everything done so far only ENQUEUED
+            // staging writes, so nothing was merged, no barrier is held, the gate and both models
+            // are untouched and the session stays unsaved. No `rx` is stored, so the save is not
+            // "running" and a save-then-close ends as failed (`save_then_close_end`).
+            runtime_log::log_error(format!(
+                "[save_to_project] aborted: the save worker thread could not be started: {err}. Possible cause: the OS thread limit or low memory. Nothing was merged and '{}' is intact; the session stays unsaved",
+                parts.project.paths.unsaved_dir.display()
+            ));
+            self.save_to_project_status = Some((t!("app.save.worker_start_error").to_string(), 0.0));
+            return;
+        }
         self.save_to_project_rx = Some(rx);
         self.save_to_project_status = Some((t!("app.save.saving").to_string(), 0.0));
     }

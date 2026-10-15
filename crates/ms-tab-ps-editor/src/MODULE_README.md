@@ -168,11 +168,13 @@ doc in-memory — group
 create/assign/ungroup/delete via `add_group`/`set_group`/`remove_group`, a single-band intra-group
 move via `reorder_node_one`, a group-block move via `reorder_group_block`, and any wider reorder
 (ungrouped block-hop, grouping reorder, pin/unpin) via `set_z_order` over the expanded node order
-(`expand_order_to_node_uids`). Either way the doc's monotonic `version` is bumped (no disk round-trip
-needed for cross-tab sync). Each frame `refresh_view_if_doc_version_changed` re-projects the current page (via
-`sync_view_from_doc`, preceded by `materialize_text_runtime_from_doc` so a text node created in the
-typing tab has a runtime)
-when the version advanced. The old disk-revision counter / app bridge are gone. Limitation: editing is
+(`expand_order_to_node_uids`). Either way the edited page's `LayerDoc::page_revision` advances (no disk
+round-trip needed for cross-tab sync). Each frame `refresh_view_if_doc_version_changed` re-projects the
+active page (via `sync_view_from_doc`, preceded by `materialize_text_runtime_from_doc` so a text node
+created in the typing tab has a runtime) when `(active page, its page revision)` differs from
+`last_projected_revision`; an edit of another page never re-projects it. The edit funnels
+(`route_to_doc`, `edit_doc_node`) call `mark_page_changed(page)` only when the edit did not already
+advance that page's revision, so one edit is one step. The old disk-revision counter / app bridge are gone. Limitation: editing is
 tab-switch-driven (the idle tab isn't mid-edit); the same node is not edited live in both tabs at once.
 - `layers.rs`: `LayerStack`, `Layer`, `LayerKind`, `LayerTransform` (center/rotation/scale + local↔
   world helpers); base-layer invariants, add/remove/reorder, `add_raster_layer_image` (paste a

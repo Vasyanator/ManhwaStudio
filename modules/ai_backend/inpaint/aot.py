@@ -27,6 +27,7 @@ try:
 except Exception:
     from modules.ai_device import AIDevice
 
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.paths import program_root
 
@@ -410,18 +411,35 @@ class AotInpaintService:
         self._active_device = "cpu"
         self._active_model_key: str | None = None
         self._last_error: str | None = None
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a load and inference hold (S-014).
+        self._health = HealthSnapshot(ready=False, device="cpu", last_error=None)
         self._model_path = Path(str(AOT_DIR)) / "inpainting.ckpt"
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "ready": self._model is not None,
-                "model": "aot",
-                "device": self._active_device,
-                "model_path": str(self._model_path),
-                "model_exists": self._model_path.is_file(),
-                "last_error": self._last_error,
-            }
+        """Return the aot health entry for the backend snapshot.
+
+        State fields come from the published snapshot and `model_exists` is a
+        filesystem probe taken here, outside any service lock, so this answers
+        while a load or an inference holds the instance lock.
+        """
+        fields = self._health.read()
+        return {
+            "ready": fields["ready"],
+            "model": "aot",
+            "device": fields["device"],
+            "model_path": str(self._model_path),
+            "model_exists": self._model_path.is_file(),
+            "last_error": fields["last_error"],
+        }
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock`."""
+        self._health.publish(
+            ready=self._model is not None,
+            device=self._active_device,
+            last_error=self._last_error,
+        )
 
     def inpaint_image_bytes(
         self,
@@ -463,8 +481,10 @@ class AotInpaintService:
                     device=device,
                 )
                 self._last_error = None
+                self._publish_health_locked()
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 raise
             finally:
                 lease.release()
@@ -483,6 +503,7 @@ class AotInpaintService:
             current_key = self._active_model_key
             self._model = None
             self._active_model_key = None
+            self._publish_health_locked()
             _clear_torch_cache()
             if current_key is not None:
                 self._model_manager.mark_unloaded(current_key)
@@ -500,6 +521,7 @@ class AotInpaintService:
         previous_key = self._active_model_key
         self._model = None
         self._active_model_key = None
+        self._publish_health_locked()
         _clear_torch_cache()
         if previous_key is not None:
             self._model_manager.mark_unloaded(previous_key)
@@ -510,6 +532,7 @@ class AotInpaintService:
         self._model = load_aot_model(str(self._model_path), device)
         self._active_device = device
         self._active_model_key = requested_key
+        self._publish_health_locked()
         return self._model
 
     def _unload_key(self, model_key: str) -> bool:

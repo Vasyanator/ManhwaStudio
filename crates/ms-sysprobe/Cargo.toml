@@ -37,12 +37,11 @@ ms-platform = { path = "../ms-platform" }
 
 # Native-only half of `ai_models`: it builds Hugging Face resolve URLs itself and streams
 # each file with resumable ranged requests (no HF cache). Compiled out on wasm, where the module
-# keeps its signatures and returns a typed "unavailable on web" error — the same feature
-# sets the binary already selects, so no second copy is built.
+# keeps its signatures and returns a typed "unavailable on web" error.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# `ai_models` streams each resolved file itself (into the app model tree, no HF cache
-# blobs or symlinks) over this HTTP client.
-ureq.workspace = true
+# The resumable, retrying per-file HTTP stream and the per-spec busy guard both `ai_models`
+# downloaders use; each file goes into the app model tree (no HF cache blobs or symlinks).
+ms-download = { path = "../ms-download" }
 
 # The OS secret store `hf_token` keeps the access token in. Not on wasm (no store) and not
 # on Android: keyring has no Android backend there and would silently link its in-memory
@@ -59,3 +58,8 @@ windows-sys = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "W
 [dev-dependencies]
 # Unique, self-removing scratch directories for the `ai_models::external` download tests.
 tempfile.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# The scripted in-memory `RangeFetcher` (`ms_download::test_support`) for the main-repository
+# downloader tests (`ai_models/main_repo_tests.rs`).
+ms-download = { path = "../ms-download", features = ["test-support"] }

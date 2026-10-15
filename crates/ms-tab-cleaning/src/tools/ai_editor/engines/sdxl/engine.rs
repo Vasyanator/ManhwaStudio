@@ -7,12 +7,15 @@ Purpose:
 
 Main responsibilities:
 - hold the two per-mode parameter sets, their persistence, the shared run progress, the
-  latent-preview texture, the run channel and the unload channel;
+  latent-preview texture, the run channel, the unload channel and the explicit-download
+  controller of the pinned SDXL downloads;
 - implement `AiEngine` — id, caption, section, constraints, mask layer, the run gate, the run
   itself and the per-frame `poll`;
 - draw the «Редактор области» panel: the progress bar in the pinned top section
   (`draw_progress`), and in the scrolled body the mask note, the live latent preview, the
-  collapsible generation parameters and the unload button.
+  download block of the pinned download the weights field needs (above the fold, so the
+  button a "not downloaded" refusal names is always on screen), the collapsible generation
+  parameters and the unload button.
 
 Key structures:
 - `SdxlEngine`
@@ -27,6 +30,11 @@ the first poll `settings_save_due` answers yes on.
 The mask is MANDATORY (`allows_empty_mask` is unconditionally `false`): SDXL inpainting has
 no whole-region mode, so an empty mask describes no work at all. The host disables
 «Обработать» on an empty mask and draws no «работает без маски» hint.
+
+Downloads are EXPLICIT: the run gate refuses while the field's required download (the mode's
+config spec for a single file, the curated model for the curated id, see `source.rs`) is not
+installed, and only the block's button starts one. The controller is polled from `poll`, so a
+probe or a download lands with the panel closed too.
 
 Parameters follow the SELECTED MODE, not the user: each mode owns a complete parameter set,
 and the LaMa prefill picker is offered only in the 4-channel mode — the one that has a
@@ -65,14 +73,19 @@ pub struct SdxlEngine {
     /// `SdxlSharedProgress::preview_seq` of the preview currently uploaded, so an unchanged
     /// preview is never re-uploaded to the GPU.
     preview_uploaded_seq: u64,
-    /// Channel of the run in flight, `None` when idle.
-    run_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
+    /// The run in flight, `None` when idle. Dropping it (cancel, engine drop) stops a LaMa
+    /// prefill checkpoint download the run performs.
+    run_rx: Option<EngineRunJob>,
     /// The engine's own status line under the parameters.
     run_status: Option<String>,
     /// Channel of the unload call in flight.
     unload_rx: Option<Receiver<Result<(), String>>>,
     /// What the last unload attempt reported.
     unload_status: Option<String>,
+    /// Probes and explicit downloads of the pinned SDXL specs (configs, curated model).
+    downloads: OcrModelDownloadController,
+    /// The 9-channel weights field: free text plus the curated model as its one listed choice.
+    weights_combo: EditableComboBox,
 }
 
 impl Default for SdxlEngine {
@@ -100,6 +113,8 @@ impl SdxlEngine {
             run_status: None,
             unload_rx: None,
             unload_status: None,
+            downloads: OcrModelDownloadController::new(),
+            weights_combo: EditableComboBox::new("cleaning_sdxl_engine_weights_path"),
         };
         engine.request_settings_load();
         engine
@@ -234,6 +249,30 @@ impl SdxlEngine {
         }
     }
 
+    /// The pinned download the SELECTED mode's weights field needs (empty: none, or refused).
+    #[must_use]
+    fn required_download(&self) -> &'static [&'static ExternalModelSpec] {
+        required_download_for(self.mode, &self.active_settings().model_path)
+    }
+
+    /// Draws the download block of the field's required download, if it needs one, and
+    /// forwards the click to the controller.
+    fn draw_required_download(&mut self, ui: &mut egui::Ui) {
+        let specs = self.required_download();
+        let Some(first) = specs.first() else {
+            return;
+        };
+        ui.strong(external_model_display_name(first));
+        let snapshot = self.downloads.panel_snapshot(specs);
+        match draw_ocr_model_download(ui, &snapshot) {
+            ModelDownloadAction::Download => self.downloads.start_download(specs),
+            ModelDownloadAction::Verify => self.downloads.start_verify(specs),
+            ModelDownloadAction::Cancel => self.downloads.cancel(),
+            ModelDownloadAction::None => {}
+        }
+        ui.separator();
+    }
+
     /// Draws the channel-mode picker and reports whether the selection changed.
     fn draw_mode_picker(&mut self, ui: &mut egui::Ui) -> bool {
         let mut changed = false;
@@ -271,7 +310,19 @@ impl SdxlEngine {
         };
 
         ui.label(t!("cleaning.tools.sdxl.weights_path_label"));
-        changed |= ui.text_edit_singleline(&mut settings.model_path).changed();
+        // The curated model is a 9-channel inpainting UNet, so it is offered (and accepted,
+        // `source::classify_model_path`) only in that mode; the value is its repository id,
+        // a wire token the list shows verbatim.
+        match (self.mode, curated_repo_id()) {
+            (SdxlMode::NineChannel, Some(curated)) => {
+                changed |= self.weights_combo.draw(ui, &mut settings.model_path, &[curated]).changed;
+                ui.small(tf!("cleaning.tools.sdxl.weights_path_9ch_hint", model = external_model_display_name(&SDXL_INPAINT_FP16)));
+            }
+            (SdxlMode::NineChannel, None) | (SdxlMode::FourChannel, _) => {
+                changed |= ui.text_edit_singleline(&mut settings.model_path).changed();
+                ui.small(t!("cleaning.tools.sdxl.weights_path_4ch_hint"));
+            }
+        }
 
         ui.label(t!("cleaning.tools.sdxl.positive_prompt_label"));
         changed |= ui
@@ -420,8 +471,12 @@ impl AiEngine for SdxlEngine {
         false
     }
 
-    /// The step bar, pinned above the parameters; nothing while idle with no preview shown.
+    /// The LaMa prefill checkpoint's download while the run performs it, then the step bar,
+    /// pinned above the parameters; nothing while idle with no preview shown.
     fn draw_progress(&mut self, ui: &mut egui::Ui) {
+        if let Some(event) = self.run_rx.as_ref().and_then(EngineRunJob::download) {
+            draw_model_download_status(ui, event);
+        }
         draw_sdxl_progress_bar(ui, &self.progress, self.preview_texture.is_some());
     }
 
@@ -436,6 +491,7 @@ impl AiEngine for SdxlEngine {
             let Self { progress, preview_texture, preview_uploaded_seq, .. } = self;
             draw_sdxl_latent_preview(ui, progress, preview_texture, preview_uploaded_seq);
         }
+        self.draw_required_download(ui);
 
         let mut changed = false;
         let mut unload_clicked = false;
@@ -474,17 +530,25 @@ impl AiEngine for SdxlEngine {
 
     /// The engine's own half of the run gate.
     ///
-    /// Two reasons, both of which no frame state describes: a run already in flight, and a
-    /// missing weights path — SDXL has no default checkpoint to fall back on, so a run
-    /// without one could only fail in the backend.
+    /// Three reasons, none of which a frame state describes: a run already in flight; a
+    /// weights field that is refused (`source::classify_model_path`: empty — SDXL has no
+    /// default checkpoint —, any repository id but the curated one, a relative path, the
+    /// curated model outside the 9-channel mode), so nothing the backend would refuse is sent;
+    /// and the field's required pinned download not installed, naming the button that
+    /// downloads it. Reads only the controller's last probe: no I/O on the GUI thread.
     fn run_block_reason(&self) -> Option<String> {
         if self.run_rx.is_some() {
             return Some(t!("cleaning.mask_editor.processing_already_running_status").to_string());
         }
-        if self.active_settings().model_path.trim().is_empty() {
-            return Some(t!("cleaning.tools.sdxl.weights_path_required_error").to_string());
+        let source = match classify_model_path(self.mode, &self.active_settings().model_path) {
+            Ok(source) => source,
+            Err(refusal) => return Some(refusal.message()),
+        };
+        let specs = required_download(self.mode, source);
+        if specs.is_empty() {
+            return None;
         }
-        None
+        download_block_reason(specs, &self.downloads.panel_snapshot(specs))
     }
 
     /// Starts one pass on a worker thread.
@@ -496,7 +560,8 @@ impl AiEngine for SdxlEngine {
     /// # Errors
     /// Returns a localized message when a run is already in flight, when the region is empty,
     /// when the mask does not match the region the host declared, when the region violates
-    /// the engine's own `constraints()`, or when no weights path is set.
+    /// the engine's own `constraints()`, when the weights field is refused, or when its
+    /// required download is not installed.
     fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
         if let Some(reason) = self.run_block_reason() {
             return Err(reason);
@@ -534,11 +599,7 @@ impl AiEngine for SdxlEngine {
         let progress = Arc::clone(&self.progress);
         let mask = mask.clone();
         let region = request.region;
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let _send_result = tx.send(run_sdxl(&region, &mask, &cfg, &progress, generation));
-        });
-        self.run_rx = Some(rx);
+        self.run_rx = Some(EngineRunJob::spawn(move |downloads| run_sdxl(&region, &mask, &cfg, &progress, generation, downloads)));
         // Cleared, not set to «идёт обработка»: the progress bar above it, the host's own
         // panel line and the frame chrome already say a run is in flight. What this must not
         // do is keep showing the PREVIOUS run's outcome underneath a new one.
@@ -550,11 +611,17 @@ impl AiEngine for SdxlEngine {
         self.poll_settings_load();
         self.poll_unload();
         self.poll_and_maybe_save();
+        // Probed here, not in the panel: the run gate reads this state with the panel closed.
+        let required = self.required_download();
+        self.downloads.probe_unknown(required);
+        if self.downloads.poll() || self.downloads.is_active() {
+            ctx.request_repaint();
+        }
 
-        let Some(rx) = self.run_rx.as_ref() else {
+        let Some(job) = self.run_rx.as_mut() else {
             return EnginePoll::Idle;
         };
-        match rx.try_recv() {
+        match job.try_finished() {
             Ok(Ok(image)) => {
                 self.run_rx = None;
                 self.run_status =
@@ -563,6 +630,9 @@ impl AiEngine for SdxlEngine {
             }
             Ok(Err(err)) => {
                 self.run_rx = None;
+                // The worker re-checks the disk; a refusal there (a download removed since the
+                // last probe) must also refresh the block that offers the button.
+                self.downloads.request_bundle_status(required);
                 let message = tf!("cleaning.mask_editor.processing_error", err = err);
                 self.run_status = Some(message.clone());
                 EnginePoll::Failed(message)
@@ -616,6 +686,11 @@ impl AiEngine for SdxlEngine {
 mod tests {
     use super::*;
     use crate::tools::region_edit_v2::engine::RunMarks;
+
+    /// An absolute local path for the host platform (`Path::is_absolute` is platform-defined).
+    fn local(tail: &str) -> String {
+        if cfg!(windows) { format!("C:\\models\\{tail}") } else { format!("/models/{tail}") }
+    }
 
     /// Whether `key` exists in the EMBEDDED English catalog, read straight from the tracked
     /// JSON.
@@ -687,8 +762,9 @@ mod tests {
         );
     }
 
-    /// The run gate closes on a run in flight and on a missing weights path — the two things
-    /// no frame state describes. It reads the SELECTED mode's path, not the other one's.
+    /// The run gate closes on a run in flight and on a missing or refused weights field — the
+    /// things no frame state describes. It reads the SELECTED mode's field, not the other one's.
+    /// A local diffusers folder needs no pinned download, so it passes outright.
     #[test]
     fn the_run_gate_reports_a_run_in_flight_and_a_missing_weights_path() {
         let mut engine = SdxlEngine::new();
@@ -697,7 +773,7 @@ mod tests {
             "there is no default checkpoint, so a fresh engine cannot run"
         );
 
-        engine.nine_channel.model_path = "/nine.safetensors".to_string();
+        engine.nine_channel.model_path = local("nine-diffusers");
         engine.mode = SdxlMode::NineChannel;
         assert!(engine.run_block_reason().is_none());
 
@@ -708,15 +784,43 @@ mod tests {
         );
         engine.four_channel.model_path = "   ".to_string();
         assert!(engine.run_block_reason().is_some(), "whitespace is not a path");
-        engine.four_channel.model_path = "/four.safetensors".to_string();
+        engine.four_channel.model_path = "stabilityai/stable-diffusion-xl-base-1.0".to_string();
+        assert_eq!(
+            engine.run_block_reason(),
+            Some(SdxlSourceRefusal::NotLocal("stabilityai/stable-diffusion-xl-base-1.0".to_string()).message()),
+            "a repository id other than the curated one never reaches the backend"
+        );
+        engine.four_channel.model_path = local("four-diffusers");
         assert!(engine.run_block_reason().is_none());
 
-        let (_tx, rx) = mpsc::channel();
-        engine.run_rx = Some(rx);
+        let (job, _tx, download_cancel) = EngineRunJob::for_test();
+        engine.run_rx = Some(job);
         assert!(engine.run_block_reason().is_some());
         engine.cancel();
+        assert!(download_cancel.load(std::sync::atomic::Ordering::Relaxed), "cancel stops the prefill checkpoint download");
         assert!(engine.run_block_reason().is_none(), "cancel releases the gate");
         assert!(engine.run_status.is_some(), "cancel says so in the status slot");
+    }
+
+    /// A single-file checkpoint and the curated id wait for their pinned download: refused
+    /// while the controller has not reported it installed (here: never probed), and the
+    /// required bundle is the mode's config spec or the curated model respectively.
+    #[test]
+    fn the_run_gate_waits_for_the_required_download() {
+        let mut engine = SdxlEngine::new();
+        engine.mode = SdxlMode::NineChannel;
+        engine.nine_channel.model_path = local("anime.safetensors");
+        assert_eq!(engine.required_download().first().map(|spec| spec.id), Some(SDXL_CONFIG_INPAINT.id));
+        assert!(engine.run_block_reason().is_some(), "the config spec is not known to be installed");
+
+        engine.nine_channel.model_path = curated_repo_id().expect("a Hugging Face spec").to_string();
+        assert_eq!(engine.required_download().first().map(|spec| spec.id), Some(SDXL_INPAINT_FP16.id));
+        assert!(engine.run_block_reason().is_some(), "the curated model is not known to be installed");
+
+        engine.mode = SdxlMode::FourChannel;
+        engine.four_channel.model_path = curated_repo_id().expect("a Hugging Face spec").to_string();
+        assert!(engine.required_download().is_empty(), "a refused field offers no download");
+        assert_eq!(engine.run_block_reason(), Some(SdxlSourceRefusal::CuratedNeedsNineChannel.message()));
     }
 
     /// A cancelled run also retires its progress generation, so the detached worker's frames
@@ -726,8 +830,8 @@ mod tests {
         let mut engine = SdxlEngine::new();
         let generation = begin_progress_generation(&engine.progress, 30);
         publish_progress_frame(&engine.progress, generation, 5, 30, None);
-        let (_tx, rx) = mpsc::channel();
-        engine.run_rx = Some(rx);
+        let (job, _tx, _download_cancel) = EngineRunJob::for_test();
+        engine.run_rx = Some(job);
 
         engine.cancel();
         publish_progress_frame(&engine.progress, generation, 6, 30, None);
@@ -743,7 +847,7 @@ mod tests {
         let rect = OverlayRectPx { x: 0, y: 0, w: 8, h: 8 };
         let mut engine = SdxlEngine::new();
         // Past the weights-path half of the gate, so the size checks are what is exercised.
-        engine.nine_channel.model_path = "/nine.safetensors".to_string();
+        engine.nine_channel.model_path = local("nine-diffusers");
 
         let short_mask = EngineRunRequest {
             page_idx: 0,
@@ -791,7 +895,7 @@ mod tests {
         for (w, h) in [(7usize, 8usize), (9, 16)] {
             let mut engine = SdxlEngine::new();
             // Past the weights-path half of the gate, so the size rule is what is exercised.
-            engine.nine_channel.model_path = "/nine.safetensors".to_string();
+            engine.nine_channel.model_path = local("nine-diffusers");
             engine.mode = SdxlMode::NineChannel;
             let pixels = w * h;
             let request = EngineRunRequest {

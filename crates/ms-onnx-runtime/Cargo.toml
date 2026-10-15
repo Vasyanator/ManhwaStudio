@@ -26,13 +26,20 @@ ms-onnx = { path = "../ms-onnx" }
 # entries.
 serde.workspace = true
 serde_json.workspace = true
-# SHA256 verification of every downloaded archive.
+# The download engine: resumable `.part`, retry with backoff, timeouts, cancel, exact
+# size + SHA256 verification (`fetch_verified`) and the per-build busy guard.
+ms-download = { path = "../ms-download" }
+# SHA256 of every extracted library, recorded in the cache completion marker.
 sha2.workspace = true
-# Blocking HTTP download of the official release archives.
-ureq.workspace = true
 # The archive shapes the official releases ship in: .zip, .tgz (gzip + tar) and
 # .tar.zst (zstd + tar).
 zip.workspace = true
 flate2.workspace = true
 tar.workspace = true
 zstd.workspace = true
+
+[dev-dependencies]
+# The scripted in-memory `RangeFetcher` (`ms_download::test_support`) for the download tests.
+ms-download = { path = "../ms-download", features = ["test-support"] }
+# Self-removing scratch cache directories for the download tests.
+tempfile.workspace = true

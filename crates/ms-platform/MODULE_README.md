@@ -16,6 +16,7 @@ Android backends talk to the JVM through `jni` + `ndk-context`. Level 2 of the c
   `BridgeMissing` / `PenTouchIndistinguishable`), whose `Display` is a localized two-sentence
   message. `unavailable_reason()` gives the table's reason per target (`CanvasTouchGestures` on
   Windows: pen and touch indistinguishable until winit handles `PT_PEN`; also off on wasm).
+  `Waifu2xUpscaler` is Linux and Windows only (the pinned waifu2x release has no macOS package).
 - **File dialogs** (`file_dialog/`): `request(req, waker) -> PendingDialog` never blocks; the
   GUI polls the handle each frame. `pick_blocking(req)` is the worker form. A backend gets a
   `Completion` and calls `finish(result)` exactly once; dropping it unfinished reads as

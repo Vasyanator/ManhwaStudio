@@ -35,8 +35,10 @@ flushes or notifies. Workers get Arc clones of the models from `StagingWriters`.
 ## Contracts and invariants
 - Each sequence stays in ONE method, in the order of "Save / page-op / discard / exit
   choreography" (`src/studio/MODULE_README.md`): a save aborts on any unverified text flush or barrier; a
-  page op refuses before anything moves when the typing text quiesce fails; a discard latches
-  first and never flushes; a failed discard restarts every writer and re-reports unsaved.
+  page op refuses before anything moves when the typing text quiesce fails or its worker thread
+  cannot start (the page-op and discard workers are started parked BEFORE any writer is quiesced
+  and released through a start channel, so a refused thread leaves the session untouched); a
+  discard latches first and never flushes; a failed discard restarts every writer and re-reports unsaved.
 - No I/O on the GUI thread except the documented per-second staging-dir probe of
   `refresh_unsaved_changes_cache` (and one stat in `new`); merges, deletes and page ops run on
   `ms_thread` workers.

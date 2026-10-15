@@ -6,8 +6,16 @@ LaMa MPE inpainting service adapter for the Python AI backend.
 
 Main responsibilities:
 - load the LaMa MPE runtime lazily;
+- check the `inpainting_lama_mpe.ckpt` checkpoint against its pinned SHA-256
+  before every load;
 - synchronize model device with backend AI device settings;
 - run inpainting requests and unload idle models through the model manager.
+
+Notes:
+The checkpoint is NOT downloaded here. Its one owner is the Rust side
+(`ms_sysprobe::ai_models::ensure_lama_mpe`, called by the cleaning tab before
+every `inpaint.lama_mpe` request); a missing file is a `FileNotFoundError`
+naming that owner, a file with another digest a `RuntimeError`.
 """
 
 from __future__ import annotations
@@ -15,8 +23,8 @@ from __future__ import annotations
 import gc
 import hashlib
 import io
+import logging
 import threading
-import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +37,7 @@ try:
 except Exception:
     from modules.ai_device import AIDevice
 
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.paths import program_root
 
@@ -49,6 +58,8 @@ try:
 except Exception:
     _PROGRAM_DIR = program_root()
 
+log = logging.getLogger(__name__)
+
 
 # ============================================================================
 # LAMA MPE INPAINT SERVICE
@@ -58,19 +69,17 @@ except Exception:
 #   `/inpaint/lama_mpe`.
 # - Порт инференса из legacy `ui_new/tools/region_edit_lama_mpe.py`
 #   (без Qt-слоя): resize->pad->MPE forward->композит по маске.
-# - Автоподготовка веса `inpainting_lama_mpe.ckpt`:
-#   SHA256-проверка, при отсутствии/порче скачивание в
-#   `ManhwaStudio_AI_Models/Torch/LaMa_MPE`.
+# - Checkpoint `inpainting_lama_mpe.ckpt` in `ManhwaStudio_AI_Models/Torch/LaMa_MPE`:
+#   SHA-256 check before every load. Downloaded by Rust only
+#   (`ms_sysprobe::ai_models::ensure_lama_mpe`); never fetched here.
 # - Декодирование PNG-изображений (RGB image + mask) и кодирование raw PNG.
 # - Нормализация параметров endpoint (`inpaint_size`).
 # - Синхронизация устройства с backend-настройкой `General.ai_device`
 #   через `AIDevice`.
 # ============================================================================
 
-_LAMA_MPE_URL = (
-    "https://github.com/zyddnys/manga-image-translator/releases/download/beta-0.3/"
-    "inpainting_lama_mpe.ckpt"
-)
+#: Digest of the published checkpoint; the copy the Rust catalog serves
+#: (`Torch/LaMa_MPE/inpainting_lama_mpe.ckpt`, 108 580 583 bytes) has these bytes.
 _LAMA_MPE_SHA256 = "d625aa1b3e0d0408acfd6928aa84f005867aa8dbb9162480346a4e20660786cc"
 _LAMA_MPE_CKPT_NAME = "inpainting_lama_mpe.ckpt"
 
@@ -151,18 +160,6 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-
-
-def _download_file(url: str, dst: Path) -> None:
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_suffix(dst.suffix + ".part")
-    with urllib.request.urlopen(url) as response, tmp.open("wb") as out:
-        while True:
-            chunk = response.read(8192)
-            if not chunk:
-                break
-            out.write(chunk)
-    tmp.replace(dst)
 
 
 def _decode_image_any(image_bytes: bytes) -> np.ndarray:
@@ -323,19 +320,36 @@ class LamaMpeInpaintService:
         self._active_device = "cpu"
         self._active_model_key: str | None = None
         self._last_error: str | None = None
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a load and inference hold (S-014).
+        self._health = HealthSnapshot(ready=False, device="cpu", last_error=None)
         self._model_dir = Path(str(LAMA_MPE_DIR))
         self._model_path = self._model_dir / _LAMA_MPE_CKPT_NAME
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "ready": self._model is not None,
-                "model": "lama_mpe",
-                "device": self._active_device,
-                "model_path": str(self._model_path),
-                "model_exists": self._model_path.is_file(),
-                "last_error": self._last_error,
-            }
+        """Return the lama_mpe health entry for the backend snapshot.
+
+        State fields come from the published snapshot and `model_exists` is a
+        filesystem probe taken here, outside any service lock, so this answers
+        while a load or an inference holds the instance lock.
+        """
+        fields = self._health.read()
+        return {
+            "ready": fields["ready"],
+            "model": "lama_mpe",
+            "device": fields["device"],
+            "model_path": str(self._model_path),
+            "model_exists": self._model_path.is_file(),
+            "last_error": fields["last_error"],
+        }
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock`."""
+        self._health.publish(
+            ready=self._model is not None,
+            device=self._active_device,
+            last_error=self._last_error,
+        )
 
     def inpaint_image_bytes(
         self,
@@ -378,8 +392,10 @@ class LamaMpeInpaintService:
                     device=device,
                 )
                 self._last_error = None
+                self._publish_health_locked()
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 raise
             finally:
                 lease.release()
@@ -404,6 +420,7 @@ class LamaMpeInpaintService:
                 pass
             self._model = None
             self._active_model_key = None
+            self._publish_health_locked()
             _clear_torch_cache()
             if current_key is not None:
                 self._model_manager.mark_unloaded(current_key)
@@ -421,6 +438,7 @@ class LamaMpeInpaintService:
         previous_key = self._active_model_key
         self._model = None
         self._active_model_key = None
+        self._publish_health_locked()
         _clear_torch_cache()
         if previous_key is not None:
             self._model_manager.mark_unloaded(previous_key)
@@ -431,6 +449,7 @@ class LamaMpeInpaintService:
         self._model = load_lama_mpe(str(ckpt_path), device, use_mpe=True)
         self._active_device = device
         self._active_model_key = requested_key
+        self._publish_health_locked()
         return self._model
 
     def _unload_key(self, model_key: str) -> bool:
@@ -451,17 +470,42 @@ class LamaMpeInpaintService:
             )
 
     def _ensure_checkpoint_locked(self) -> Path:
-        if self._model_path.is_file():
-            try:
-                if _sha256(self._model_path) == _LAMA_MPE_SHA256:
-                    return self._model_path
-            except Exception:
-                pass
+        """Return the checkpoint path once it is present with the pinned SHA-256.
 
-        _download_file(_LAMA_MPE_URL, self._model_path)
-        if _sha256(self._model_path) != _LAMA_MPE_SHA256:
-            raise RuntimeError("Повреждена скачанная lama_mpe.ckpt (SHA256 mismatch)")
-        return self._model_path
+        Never downloads: the Rust side (`ms_sysprobe::ai_models::ensure_lama_mpe`)
+        owns the fetch and runs before every `inpaint.lama_mpe` request.
+
+        # Errors
+        `FileNotFoundError` when the checkpoint is missing (naming the Rust owner);
+        `RuntimeError` when it cannot be read or its digest differs.
+        """
+        path = self._model_path
+        if not path.is_file():
+            log.error("lama_mpe: checkpoint missing at %s", path)
+            raise FileNotFoundError(
+                f"Не найден checkpoint LaMa-MPE: {path}\n"
+                "Его скачивает приложение (ms_sysprobe::ai_models::ensure_lama_mpe) перед "
+                "запуском LaMa-MPE; запустите инструмент ещё раз, чтобы скачать файл."
+            )
+        try:
+            actual = _sha256(path)
+        except OSError as exc:
+            log.error("lama_mpe: could not read checkpoint %s: %s", path, exc)
+            raise RuntimeError(
+                f"Не удалось прочитать checkpoint LaMa-MPE: {path}\nОшибка: {exc}"
+            ) from exc
+        if actual != _LAMA_MPE_SHA256:
+            log.error(
+                "lama_mpe: checkpoint %s has sha256 %s, expected %s",
+                path,
+                actual,
+                _LAMA_MPE_SHA256,
+            )
+            raise RuntimeError(
+                f"Checkpoint LaMa-MPE повреждён (не совпала контрольная сумма SHA-256): {path}\n"
+                "Удалите файл — приложение скачает его заново при следующем запуске."
+            )
+        return path
 
     def _normalize_params(self, params: dict[str, Any] | None) -> dict[str, Any]:
         merged: dict[str, Any] = {}

@@ -5,7 +5,8 @@ Purpose:
 Unit tests of the external-model downloader core (`download_with`), its transient-failure
 retry, and the stat-only status probe, driven by in-memory `RangeFetcher`s (one plain, one
 scripted with drops / short bodies / error statuses) and an injected backoff sleep that only
-records — no network, no real waiting, scratch data only under a unique `tempfile`
+records — plus the repair path `verify_with` (shared-file corruption invalidating every
+spec that lists it) — no network, no real waiting, scratch data only under a unique `tempfile`
 directory removed on drop. One opt-in `#[ignore]` test downloads the real Baberu
 spec when `MS_TEST_EXTERNAL_DOWNLOAD=1`.
 
@@ -71,9 +72,9 @@ impl RangeFetcher for FakeFetcher {
         if self.mode == RangeMode::Honour && offset > 0 {
             let start = usize::try_from(offset).map_err(permanent)?;
             let suffix = body.get(start..).ok_or_else(|| classify_status(416, None))?.to_vec();
-            return Ok(FetchResponse { status: FetchStatus::Partial, total_len: Some(total_len(body)), body: Box::new(Cursor::new(suffix)) });
+            return Ok(FetchResponse { status: FetchStatus::Partial, total_len: Some(total_len(body)), identity: None, body: Box::new(Cursor::new(suffix)) });
         }
-        Ok(FetchResponse { status: FetchStatus::Full, total_len: Some(total_len(body)), body: Box::new(Cursor::new(body.clone())) })
+        Ok(FetchResponse { status: FetchStatus::Full, total_len: Some(total_len(body)), identity: None, body: Box::new(Cursor::new(body.clone())) })
     }
 }
 
@@ -88,7 +89,7 @@ fn total_len(body: &[u8]) -> u64 {
 }
 
 fn url_of(file: &ExternalFile) -> String {
-    format!("mem://{}", file.path)
+    format!("mem://{}", file.remote_path())
 }
 
 fn sha_hex(bytes: &[u8]) -> String {
@@ -108,18 +109,14 @@ fn leak(value: String) -> &'static str {
 fn make_spec(id: &str, revision: &str, files: &[(&str, &[u8])]) -> (&'static ExternalModelSpec, BTreeMap<String, Vec<u8>>) {
     let entries: Vec<ExternalFile> = files
         .iter()
-        .map(|(path, body)| ExternalFile {
-            path: leak((*path).to_owned()),
-            size: u64::try_from(body.len()).unwrap_or(u64::MAX),
-            sha256: leak(sha_hex(body)),
-        })
+        .map(|(path, body)| ExternalFile::direct(leak((*path).to_owned()), u64::try_from(body.len()).unwrap_or(u64::MAX), leak(sha_hex(body))))
         .collect();
     let bodies = entries.iter().zip(files).map(|(file, (_, body))| (url_of(file), body.to_vec())).collect();
     let spec = Box::leak(Box::new(ExternalModelSpec {
         id: leak(id.to_owned()),
-        repo_id: "owner/repo",
-        revision: leak(revision.to_owned()),
+        source: ExternalSource::HuggingFace { repo_id: "owner/repo", revision: leak(revision.to_owned()) },
         dir: leak(format!("Test/{id}")),
+        layout: DirLayout::Exclusive,
         files: Box::leak(entries.into_boxed_slice()),
     }));
     (spec, bodies)
@@ -435,7 +432,7 @@ fn a_second_concurrent_download_of_the_same_spec_is_busy() {
 
 #[test]
 fn invalid_specs_are_rejected_before_any_io() {
-    let good = ExternalFile { path: "a.bin", size: 1, sha256: leak("0".repeat(64)) };
+    let good = ExternalFile::direct("a.bin", 1, leak("0".repeat(64)));
     let cases: Vec<(&str, &str, &str, ExternalFile)> = vec![
         ("bad-rev", "main", "Dir", good),
         ("upper-rev", leak("A".repeat(40)), "Dir", good),
@@ -445,19 +442,41 @@ fn invalid_specs_are_rejected_before_any_io() {
         ("backslash", REV_A, "Dir", ExternalFile { path: "a\\b", ..good }),
         ("drive", REV_A, "Dir", ExternalFile { path: "C:evil", ..good }),
         ("reserved", REV_A, "Dir", ExternalFile { path: ".download/x", ..good }),
+        ("marker", REV_A, "Dir", ExternalFile { path: ".ms_model_complete.other.json", ..good }),
         ("bad-dir", REV_A, "../Dir", good),
     ];
     let root = temp_root();
     let fetcher = FakeFetcher::new(BTreeMap::new(), RangeMode::Honour);
+    let hf = |revision: &'static str| ExternalSource::HuggingFace { repo_id: "owner/repo", revision };
+    let leak_spec = |id: &'static str, source: ExternalSource, layout: DirLayout, files: &[ExternalFile]| -> &'static ExternalModelSpec {
+        Box::leak(Box::new(ExternalModelSpec { id, source, dir: "Dir", layout, files: Box::leak(files.to_vec().into_boxed_slice()) }))
+    };
     for (id, revision, dir, file) in cases {
-        let spec = Box::leak(Box::new(ExternalModelSpec { id, repo_id: "owner/repo", revision, dir, files: Box::leak(Box::new([file])) }));
+        let spec = Box::leak(Box::new(ExternalModelSpec { id, source: hf(revision), dir, layout: DirLayout::Exclusive, files: Box::leak(Box::new([file])) }));
         let result = run(&fetcher, root.path(), spec, &AtomicBool::new(false));
         assert!(matches!(result, Err(ExternalModelError::InvalidSpec(_))), "{id}: {result:?}");
     }
-    let duplicate = Box::leak(Box::new(ExternalModelSpec { id: "dup", repo_id: "owner/repo", revision: REV_A, dir: "Dir", files: Box::leak(Box::new([good, good])) }));
+    let duplicate = leak_spec("dup", hf(REV_A), DirLayout::Exclusive, &[good, good]);
     assert!(matches!(validate_spec(duplicate), Err(ExternalModelError::InvalidSpec(_))));
-    let bad_repo = Box::leak(Box::new(ExternalModelSpec { id: "repo", repo_id: "no-slash", revision: REV_A, dir: "Dir", files: Box::leak(Box::new([good])) }));
+    let bad_repo = leak_spec("repo", ExternalSource::HuggingFace { repo_id: "no-slash", revision: REV_A }, DirLayout::Exclusive, &[good]);
     assert!(matches!(validate_spec(bad_repo), Err(ExternalModelError::InvalidSpec(_))));
+    for base_url in ["http://h.example/x", "https://", "https://h.example/x/", "https://h.example/x?y=1", "https://h.example/../x", "https://u@h.example", "https://h.example/a b"] {
+        let spec = leak_spec("url", ExternalSource::Url { base_url }, DirLayout::Exclusive, &[good]);
+        assert!(matches!(validate_spec(spec), Err(ExternalModelError::InvalidSpec(_))), "{base_url}");
+    }
+    let fine_url = leak_spec("url_ok", ExternalSource::Url { base_url: "https://h.example:8443/a/b" }, DirLayout::Exclusive, &[good]);
+    assert!(validate_spec(fine_url).is_ok());
+    let shared_bad_id = leak_spec("Bad-Id", hf(REV_A), DirLayout::Shared, &[good]);
+    assert!(matches!(validate_spec(shared_bad_id), Err(ExternalModelError::InvalidSpec(_))));
+    let member = |archive: &'static str, archive_size: u64, archive_sha256: &'static str, member: &'static str| ExternalFile {
+        origin: FileOrigin::ZipMember { archive, archive_size, archive_sha256, member },
+        ..good
+    };
+    let sha = leak("1".repeat(64));
+    for file in [member("../a.zip", 1, sha, "a"), member("a.zip", 0, sha, "a"), member("a.zip", 1, "abc", "a"), member("a.zip", 1, sha, ""), member(".download/a.zip", 1, sha, "a")] {
+        let spec = leak_spec("zip", hf(REV_A), DirLayout::Exclusive, &[file]);
+        assert!(matches!(validate_spec(spec), Err(ExternalModelError::InvalidSpec(_))), "{file:?}");
+    }
     assert!(fetcher.calls().is_empty());
     let entries = std::fs::read_dir(root.path()).map(Iterator::count).unwrap_or(usize::MAX);
     assert_eq!(entries, 0, "an invalid spec must not touch the filesystem");
@@ -542,7 +561,7 @@ impl RangeFetcher for ScriptedFetcher {
             Some(Step::Short(len)) => Box::new(Cursor::new(rest[..len.min(rest.len())].to_vec())),
             Some(Step::Status(code, retry_after)) => return Err(classify_status(code, retry_after)),
         };
-        Ok(FetchResponse { status, total_len: Some(total_len(&self.body)), body })
+        Ok(FetchResponse { status, total_len: Some(total_len(&self.body)), identity: None, body })
     }
 }
 
@@ -752,4 +771,280 @@ fn real_baberu_download_when_opted_in() {
     let dir = download_external_model(root.path(), spec, &AtomicBool::new(false), &mut |_| {}).unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
     assert_eq!(installed_dir(root.path(), spec).ok(), Some(dir));
+}
+
+/// CRC-32 (IEEE) of `bytes`, for the hand-built test archives.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+/// A minimal single-member STORED zip archive (no dependency on a zip writer).
+fn stored_zip(name: &str, data: &[u8]) -> Vec<u8> {
+    let crc = crc32(data);
+    let size = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    let name_len = u16::try_from(name.len()).unwrap_or(u16::MAX);
+    let mut out = Vec::new();
+    // Local file header.
+    out.extend_from_slice(&0x0403_4b50_u32.to_le_bytes());
+    out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // version, flags, method=stored, time, date
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&name_len.to_le_bytes());
+    out.extend_from_slice(&0_u16.to_le_bytes());
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(data);
+    let central_offset = u32::try_from(out.len()).unwrap_or(u32::MAX);
+    // Central directory entry.
+    out.extend_from_slice(&0x0201_4b50_u32.to_le_bytes());
+    out.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // made by, needed, flags, method, time, date
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&name_len.to_le_bytes());
+    out.extend_from_slice(&[0; 12]); // extra, comment, disk, internal attrs, external attrs
+    out.extend_from_slice(&0_u32.to_le_bytes()); // local header offset
+    out.extend_from_slice(name.as_bytes());
+    let central_size = u32::try_from(out.len()).unwrap_or(u32::MAX) - central_offset;
+    // End of central directory.
+    out.extend_from_slice(&0x0605_4b50_u32.to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+    out.extend_from_slice(&central_size.to_le_bytes());
+    out.extend_from_slice(&central_offset.to_le_bytes());
+    out.extend_from_slice(&0_u16.to_le_bytes());
+    out
+}
+
+/// A zip-member file pinned to `data` inside the archive `archive_body` served at `archive`.
+fn member_file(path: &str, data: &[u8], archive: &str, archive_body: &[u8]) -> ExternalFile {
+    ExternalFile {
+        path: leak(path.to_owned()),
+        size: u64::try_from(data.len()).unwrap_or(u64::MAX),
+        sha256: leak(sha_hex(data)),
+        origin: FileOrigin::ZipMember {
+            archive: leak(archive.to_owned()),
+            archive_size: u64::try_from(archive_body.len()).unwrap_or(u64::MAX),
+            archive_sha256: leak(sha_hex(archive_body)),
+            member: leak(path.to_owned()),
+        },
+    }
+}
+
+/// A leaked `Url`-source spec in the shared directory `dir`.
+fn shared_spec(id: &str, dir: &str, files: Vec<ExternalFile>) -> &'static ExternalModelSpec {
+    Box::leak(Box::new(ExternalModelSpec {
+        id: leak(id.to_owned()),
+        source: ExternalSource::Url { base_url: "https://models.example/releases" },
+        dir: leak(dir.to_owned()),
+        layout: DirLayout::Shared,
+        files: Box::leak(files.into_boxed_slice()),
+    }))
+}
+
+#[test]
+fn zip_members_are_fetched_verified_extracted_and_their_archives_removed() {
+    let detector = content(9000, 50);
+    let recognizer = content(7000, 51);
+    let detector_zip = stored_zip("det.pth", &detector);
+    let recognizer_zip = stored_zip("rec_a.pth", &recognizer);
+    let files = vec![member_file("det.pth", &detector, "v1/det.zip", &detector_zip), member_file("rec_a.pth", &recognizer, "v2/rec_a.zip", &recognizer_zip)];
+    let spec = shared_spec("zip_flow", "Shared/zipflow", files);
+    let bodies = BTreeMap::from([("mem://v1/det.zip".to_owned(), detector_zip.clone()), ("mem://v2/rec_a.zip".to_owned(), recognizer_zip.clone())]);
+    let root = temp_root();
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+    let mut last = None;
+    let dir = download_with(&fetcher, &url_of, root.path(), spec, &AtomicBool::new(false), &quiet_policy(), &mut |progress| {
+        assert!(progress.file_done <= progress.file_total);
+        last = Some(*progress);
+    })
+    .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(read(&dir.join("det.pth")), detector);
+    assert_eq!(read(&dir.join("rec_a.pth")), recognizer);
+    assert!(dir.join(".ms_model_complete.zip_flow.json").is_file());
+    assert!(!dir.join(COMPLETE_MARKER).exists(), "a shared directory never writes the exclusive marker");
+    assert!(!dir.join(STAGING_DIR).exists(), "archives and staging are removed");
+    assert_eq!(spec.total_bytes(), total_len(&detector_zip) + total_len(&recognizer_zip));
+    assert_eq!(last.map(|progress| progress.total_done), Some(spec.total_bytes()));
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+}
+
+#[test]
+fn a_corrupt_archive_is_rejected_and_nothing_is_published() {
+    let data = content(5000, 52);
+    let archive = stored_zip("w.pth", &data);
+    let file = member_file("w.pth", &data, "w.zip", &archive);
+    let spec = shared_spec("zip_corrupt", "Shared/zipcorrupt", vec![file]);
+    let mut served = archive.clone();
+    served[40] ^= 0xFF;
+    let root = temp_root();
+    let fetcher = FakeFetcher::new(BTreeMap::from([("mem://w.zip".to_owned(), served)]), RangeMode::Honour);
+    let result = run(&fetcher, root.path(), spec, &AtomicBool::new(false));
+    assert!(matches!(result, Err(ExternalModelError::HashMismatch { expected, .. }) if expected == sha_hex(&archive)), "{result:?}");
+    assert!(!spec.local_dir(root.path()).join("w.pth").exists());
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Missing);
+}
+
+#[test]
+fn specs_sharing_a_directory_keep_independent_status_and_share_the_common_file() {
+    let detector = content(8000, 53);
+    let rec_a = content(3000, 54);
+    let rec_b = content(3500, 55);
+    let (det_zip, a_zip, b_zip) = (stored_zip("det.pth", &detector), stored_zip("a.pth", &rec_a), stored_zip("b.pth", &rec_b));
+    let det = member_file("det.pth", &detector, "det.zip", &det_zip);
+    let spec_a = shared_spec("shared_a", "Shared/common", vec![det, member_file("a.pth", &rec_a, "a.zip", &a_zip)]);
+    let spec_b = shared_spec("shared_b", "Shared/common", vec![det, member_file("b.pth", &rec_b, "b.zip", &b_zip)]);
+    let bodies = BTreeMap::from([("mem://det.zip".to_owned(), det_zip), ("mem://a.zip".to_owned(), a_zip), ("mem://b.zip".to_owned(), b_zip)]);
+    let root = temp_root();
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+
+    run(&fetcher, root.path(), spec_a, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(external_model_status(root.path(), spec_a), ExternalModelStatus::Installed);
+    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Missing);
+
+    let before = fetcher.calls().len();
+    let dir = run(&fetcher, root.path(), spec_b, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    let fetched: Vec<String> = fetcher.calls()[before..].iter().map(|(url, _)| url.clone()).collect();
+    assert_eq!(fetched, vec!["mem://b.zip".to_owned()], "the shared detector is found verified, not downloaded again");
+    // Installing B neither retired A's marker nor deleted A's recognizer.
+    assert_eq!(external_model_status(root.path(), spec_a), ExternalModelStatus::Installed);
+    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Installed);
+    assert_eq!(read(&dir.join("a.pth")), rec_a);
+    assert_eq!(read(&dir.join("det.pth")), detector);
+
+    // A corrupted recognizer of A breaks only A.
+    std::fs::write(dir.join("a.pth"), b"x").unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(external_model_status(root.path(), spec_a), ExternalModelStatus::Missing);
+    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Installed);
+}
+
+/// The completion marker exactly as releases before `Url` sources / zip members wrote it for
+/// a Hugging Face spec (`serde_json::to_vec_pretty` of `{id, repo_id, revision, files}`).
+const LEGACY_MARKER: &str = r#"{
+  "id": "legacy",
+  "repo_id": "owner/repo",
+  "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "files": [
+    {
+      "path": "model.bin",
+      "size": 3,
+      "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    }
+  ]
+}"#;
+
+#[test]
+fn hugging_face_markers_stay_byte_identical_and_old_installs_read_installed() {
+    let (spec, bodies) = make_spec("legacy", REV_A, &[("model.bin", b"abc")]);
+    assert_eq!(serde_json::to_string_pretty(&Marker::for_spec(spec)).ok().as_deref(), Some(LEGACY_MARKER));
+
+    // An install written by an older build: the files plus today's marker bytes.
+    let root = temp_root();
+    let dir = spec.local_dir(root.path());
+    std::fs::create_dir_all(&dir).unwrap_or_else(|err| panic!("{err}"));
+    std::fs::write(dir.join("model.bin"), b"abc").unwrap_or_else(|err| panic!("{err}"));
+    std::fs::write(dir.join(COMPLETE_MARKER), LEGACY_MARKER).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(external_model_status(root.path(), spec), ExternalModelStatus::Installed);
+
+    // And a fresh download writes exactly those bytes.
+    let fresh = temp_root();
+    let dir = run(&FakeFetcher::new(bodies, RangeMode::Honour), fresh.path(), spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(std::fs::read_to_string(dir.join(COMPLETE_MARKER)).ok().as_deref(), Some(LEGACY_MARKER));
+}
+
+#[test]
+fn url_and_zip_pins_are_part_of_the_marker_identity() {
+    let data = content(100, 56);
+    let archive = stored_zip("w.pth", &data);
+    let spec = shared_spec("marker_zip", "Shared/markerzip", vec![member_file("w.pth", &data, "w.zip", &archive)]);
+    let json = serde_json::to_value(Marker::for_spec(spec)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(json["url"], "https://models.example/releases");
+    assert!(json.get("repo_id").is_none() && json.get("revision").is_none());
+    assert_eq!(json["files"][0]["archive"]["path"], "w.zip");
+    assert_eq!(json["files"][0]["archive"]["member"], "w.pth");
+}
+
+/// Runs `verify_with` with `related` as the catalog.
+fn verify(root: &Path, spec: &'static ExternalModelSpec, related: &[&'static ExternalModelSpec]) -> Result<VerifyReport, ExternalModelError> {
+    verify_with(root, spec, related, &AtomicBool::new(false), &quiet_policy(), &mut |progress| assert!(progress.file_done <= progress.file_total))
+}
+
+#[test]
+fn verify_repairs_a_same_size_corruption_of_a_shared_file_for_every_spec() {
+    let detector = content(6000, 60);
+    let (rec_a, rec_b) = (content(2000, 61), content(2100, 62));
+    let (det_zip, a_zip, b_zip) = (stored_zip("det.pth", &detector), stored_zip("a.pth", &rec_a), stored_zip("b.pth", &rec_b));
+    let det = member_file("det.pth", &detector, "det.zip", &det_zip);
+    let spec_a = shared_spec("verify_a", "Shared/verify", vec![det, member_file("a.pth", &rec_a, "a.zip", &a_zip)]);
+    let spec_b = shared_spec("verify_b", "Shared/verify", vec![det, member_file("b.pth", &rec_b, "b.zip", &b_zip)]);
+    let bodies = BTreeMap::from([("mem://det.zip".to_owned(), det_zip), ("mem://a.zip".to_owned(), a_zip), ("mem://b.zip".to_owned(), b_zip)]);
+    let root = temp_root();
+    let fetcher = FakeFetcher::new(bodies, RangeMode::Honour);
+    let dir = run(&fetcher, root.path(), spec_a, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    run(&fetcher, root.path(), spec_b, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+
+    // Same length, other bytes: the stat-only probe cannot see it.
+    std::fs::write(dir.join("det.pth"), content(6000, 99)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(external_model_status(root.path(), spec_a), ExternalModelStatus::Installed);
+
+    let report = verify(root.path(), spec_a, &[spec_a, spec_b]).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(report.removed, vec!["det.pth"]);
+    assert_eq!(report.verified, vec!["a.pth"]);
+    assert_eq!(report.invalidated, vec!["verify_a", "verify_b"]);
+    assert!(!report.is_intact());
+    assert!(!dir.join("det.pth").exists());
+    assert_eq!(external_model_status(root.path(), spec_a), ExternalModelStatus::Missing);
+    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Missing);
+    assert_eq!(read(&dir.join("b.pth")), rec_b, "the other spec's own file is untouched");
+
+    // A normal download repairs both.
+    run(&fetcher, root.path(), spec_a, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    let before = fetcher.calls().len();
+    run(&fetcher, root.path(), spec_b, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(fetcher.calls().len(), before, "B finds both of its files verified");
+    assert_eq!(read(&dir.join("det.pth")), detector);
+    assert_eq!(external_model_status(root.path(), spec_b), ExternalModelStatus::Installed);
+    assert!(verify(root.path(), spec_b, &[spec_a, spec_b]).is_ok_and(|report| report.is_intact()));
+}
+
+#[test]
+fn verify_reports_missing_files_and_keeps_intact_ones() {
+    let (spec, bodies) = make_spec("verify_missing", REV_A, &[("a.bin", &content(500, 63)), ("b.bin", &content(600, 64))]);
+    let root = temp_root();
+    let dir = run(&FakeFetcher::new(bodies, RangeMode::Honour), root.path(), spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    std::fs::remove_file(dir.join("b.bin")).unwrap_or_else(|err| panic!("{err}"));
+    let report = verify(root.path(), spec, &[spec]).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!((report.verified, report.missing, report.removed, report.invalidated), (vec!["a.bin"], vec!["b.bin"], Vec::new(), Vec::new()));
+    assert_eq!(read(&dir.join("a.bin")), content(500, 63));
+}
+
+#[test]
+fn verify_removes_a_wrong_size_file_and_its_marker() {
+    let (spec, bodies) = make_spec("verify_size", REV_A, &[("a.bin", &content(500, 65))]);
+    let root = temp_root();
+    let dir = run(&FakeFetcher::new(bodies, RangeMode::Honour), root.path(), spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    std::fs::write(dir.join("a.bin"), b"short").unwrap_or_else(|err| panic!("{err}"));
+    let report = verify(root.path(), spec, &[spec]).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!((report.removed, report.invalidated), (vec!["a.bin"], vec!["verify_size"]));
+    assert!(!dir.join(COMPLETE_MARKER).exists() && !dir.join("a.bin").exists());
+}
+
+#[test]
+fn verify_is_busy_while_the_spec_downloads_and_honours_cancel() {
+    let (spec, bodies) = make_spec("verify_busy", REV_A, &[("a.bin", &content(300_000, 66))]);
+    let root = temp_root();
+    run(&FakeFetcher::new(bodies, RangeMode::Honour), root.path(), spec, &AtomicBool::new(false)).unwrap_or_else(|err| panic!("{err}"));
+    let held = BusyGuard::try_acquire(spec.id).unwrap_or_else(|_| panic!("free id"));
+    assert!(matches!(verify(root.path(), spec, &[spec]), Err(ExternalModelError::Busy { .. })));
+    drop(held);
+    let cancel = AtomicBool::new(true);
+    let result = verify_with(root.path(), spec, &[spec], &cancel, &quiet_policy(), &mut |_| {});
+    assert!(matches!(result, Err(ExternalModelError::Cancelled)), "{result:?}");
+    assert!(spec.local_dir(root.path()).join("a.bin").exists(), "cancel deletes nothing");
 }

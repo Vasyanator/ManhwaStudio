@@ -15,7 +15,8 @@ Key structures:
 - `UploadTask`: the page whose tiles are being uploaded across frames.
 
 Key functions:
-- `PageResidency::spawn`: builds the page metadata and starts the unified loader pool.
+- `PageResidency::spawn`: builds the page metadata and starts the unified loader pool (a refused
+  loader thread fails every page, `fail_unstarted_loader`).
 - `PageResidency::poll_decoded`: drains source events (in-order promotion), uploads tiles under the
   per-frame budget, applies overlays as they arrive.
 - `PageResidency::poll_page_cache`: starts the page-cache loader once everything is loaded, drains it.
@@ -115,6 +116,9 @@ impl PageResidency {
     /// setting at open time (the project's value, which `CleanOverlaysModel` is seeded with); with a
     /// memory budget for it, the initial decode also seeds the shared page cache. Later changes of
     /// the setting are read from the model by [`Self::poll_page_cache`].
+    ///
+    /// When the OS refuses the loader thread, every page is reported failed at once
+    /// ([`Self::fail_unstarted_loader`]), so no page stays `Loading` forever.
     pub(in crate::studio) fn spawn(project: &ProjectData, cache_pages: bool, memory_manager: Arc<MemoryManager>) -> Self {
         let cache_pages_on_initial_load =
             should_seed_page_cache_on_initial_load(cache_pages, memory_manager.budget());
@@ -139,8 +143,8 @@ impl PageResidency {
             .collect();
         let (tx, rx) = sync_channel(LOADER_QUEUE_CAPACITY);
         let (overlay_tx, overlay_rx) = sync_channel(LOADER_QUEUE_CAPACITY);
-        let residency = Self::from_channels(project.pages.len(), page_infos, rx, overlay_rx, memory_manager);
-        spawn_loader_thread(
+        let mut residency = Self::from_channels(project.pages.len(), page_infos, rx, overlay_rx, memory_manager);
+        if let Err(err) = spawn_loader_thread(
             pages,
             collect_overlay_job_candidates(project),
             tx,
@@ -148,8 +152,28 @@ impl PageResidency {
             cache_pages_on_initial_load,
             Arc::clone(&residency.decode_promotion_progress),
             Arc::clone(&residency.loader_shutdown),
-        );
+        ) {
+            runtime_log::log_error(format!(
+                "[residency] could not start the page loader thread; every page of '{}' is reported as failed to load. Error: {err}. Possible cause: the OS thread limit or low memory; reopening the project retries",
+                project.paths.project_dir.display()
+            ));
+            residency.fail_unstarted_loader(&err.to_string());
+        }
         residency
+    }
+
+    /// The loader pool never started (`spawn`): marks every page `Failed`, records one load error
+    /// naming `error`, and finishes both loader streams, so promotion skips every page, nothing is
+    /// waited on or repainted for, and the page-cache step may proceed.
+    fn fail_unstarted_loader(&mut self, error: &str) {
+        for (idx, info) in &mut self.page_infos {
+            info.load_state = SourcePageLoadState::Failed;
+            self.failed_pages.insert(*idx);
+        }
+        self.load_errors.push(format!("page loader thread: {error}"));
+        self.loader_finished = true;
+        self.overlay_loader_finished = true;
+        self.promote_decoded_pages_in_order();
     }
 
     /// The pipeline state over already-created loader channels, before anything was received.
@@ -438,8 +462,17 @@ impl PageResidency {
         }
         self.page_cache_loader_started = true;
         let (tx, rx) = sync_channel(LOADER_QUEUE_CAPACITY);
-        spawn_page_cache_loader_thread(jobs, tx);
-        self.page_cache_loader_rx = Some(rx);
+        match spawn_page_cache_loader_thread(jobs, tx) {
+            Ok(()) => self.page_cache_loader_rx = Some(rx),
+            Err(err) => {
+                // Optional accelerator: give it up for the session (started AND finished), as for
+                // the poisoned lock above, so no per-frame retry spins on a refused thread.
+                runtime_log::log_error(format!(
+                    "[residency] could not start the page-cache loader thread; the shared page RGBA cache is not pre-filled this session. Error: {err}. Possible cause: the OS thread limit or low memory"
+                ));
+                self.page_cache_loader_finished = true;
+            }
+        }
     }
 
     fn poll_overlay_loader_events(&mut self, overlays: &Arc<Mutex<CleanOverlaysModel>>) {
@@ -619,6 +652,19 @@ mod tests {
         residency.decoded_queue.clear();
         assert!(residency.main_pages_fully_loaded());
         Ok(())
+    }
+
+    /// A loader that never started reports every page as failed (none stays `Loading`), records
+    /// the error once, and counts as finished for both streams.
+    #[test]
+    fn an_unstarted_loader_fails_every_page() {
+        let (mut residency, _tx) = residency(3);
+        residency.fail_unstarted_loader("thread limit");
+        assert!((0..3).all(|idx| residency.page_infos[&idx].load_state == SourcePageLoadState::Failed));
+        assert_eq!(residency.load_errors(), ["page loader thread: thread limit".to_string()]);
+        assert!(residency.loader_finished && residency.overlay_loader_finished);
+        assert_eq!(residency.decode_promotion_progress.load(Ordering::Acquire), 3);
+        assert!(residency.main_pages_fully_loaded());
     }
 
     /// A dropped loader (disconnected channel) counts as finished, so a crashed pool cannot keep

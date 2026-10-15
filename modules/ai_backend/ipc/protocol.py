@@ -40,8 +40,14 @@ from __future__ import annotations
 # default).
 # 11: Hotkeys section format 2 ({"format": 2, "actions": {id: [alternative, ...]}},
 # written by Rust ms-input; a version-1 section is migrated and rewritten on studio open).
+# 12: EasyOCR / Surya / SDXL load offline from Rust-downloaded directories: new
+# required fields `easyocr_model_dir` (ocr.easy), `surya_recognition_dir` +
+# `surya_detection_dir` (ocr.surya), `surya_detection_dir`
+# (textdetector.surya.forward), `sdxl_config_dir` (inpaint.sdxl), plus
+# `sdxl_model_dir` (inpaint.sdxl, required for the curated repo id);
+# `easy_langs` is no longer aliased; other SDXL repo ids are refused.
 # ============================================================================
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 
 # ============================================================================
 # FRAME SIZE GUARDS

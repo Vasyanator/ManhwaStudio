@@ -30,6 +30,8 @@ const DESKTOP: bool = cfg!(not(any(target_arch = "wasm32", target_os = "android"
 const ANDROID: bool = cfg!(target_os = "android");
 /// `true` on Windows.
 const WINDOWS: bool = cfg!(target_os = "windows");
+/// `true` on macOS.
+const MACOS: bool = cfg!(target_os = "macos");
 
 /// A capability that differs between platforms. [`PlatformFeature::is_available`] is the single
 /// owner of the per-platform answer; callers never re-derive it from `cfg` themselves.
@@ -46,7 +48,9 @@ pub enum PlatformFeature {
     ScreenCapture,
     /// RAR / 7z extraction through external command-line tools.
     ExternalArchiveTools,
-    /// The external waifu2x upscaler executable.
+    /// The waifu2x ncnn-vulkan upscaler: a shared library the New Project window downloads from
+    /// a pinned release package and loads at runtime. Packages exist for Linux and Windows
+    /// only; macOS has none, so it is unavailable there as well as on Android and wasm.
     Waifu2xUpscaler,
     /// The OS credential store for AI API keys and the Hugging Face token (desktop keyring;
     /// on Android the Keystore-backed `credentials` store).
@@ -115,11 +119,12 @@ impl PlatformFeature {
             // Linux, macOS and Android. Windows delivers a pen as touch events (winit has no
             // `PT_PEN` handling yet), so the router would turn pen strokes into navigation.
             PlatformFeature::CanvasTouchGestures => (DESKTOP && !WINDOWS) || ANDROID,
+            // The pinned waifu2x release ships `Lin.zip` and `Win.zip` only (no macOS build).
+            PlatformFeature::Waifu2xUpscaler => DESKTOP && !MACOS,
             PlatformFeature::PythonBackend
             | PlatformFeature::InstalledCopyManagement
             | PlatformFeature::ScreenCapture
             | PlatformFeature::ExternalArchiveTools
-            | PlatformFeature::Waifu2xUpscaler
             | PlatformFeature::PersistentDirectoryPicker
             | PlatformFeature::NativeMessageBox
             | PlatformFeature::ClipboardImage
@@ -287,6 +292,19 @@ mod tests {
             let pen_reason = feature.unavailable_reason() == UnavailableReason::PenTouchIndistinguishable;
             let expected = feature == PlatformFeature::CanvasTouchGestures && cfg!(target_os = "windows");
             assert_eq!(pen_reason, expected, "{feature:?}");
+        }
+    }
+
+    #[test]
+    fn waifu2x_upscaler_table() {
+        // Pinned packages exist for Linux and Windows only.
+        let expected = cfg!(any(target_os = "linux", target_os = "windows"));
+        assert_eq!(PlatformFeature::Waifu2xUpscaler.is_available(), expected);
+        if !expected {
+            assert_eq!(
+                PlatformFeature::Waifu2xUpscaler.require(),
+                Err(Unavailable::new(PlatformFeature::Waifu2xUpscaler, UnavailableReason::NotOnThisPlatform))
+            );
         }
     }
 

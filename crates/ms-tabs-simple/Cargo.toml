@@ -56,12 +56,11 @@ serde_json.workspace = true
 # Monotonic time that also works in a web build (note-refresh debounce).
 web-time.workspace = true
 
-# Native-only: the wiki's remote-image loader is a blocking HTTP GET. There is no
-# synchronous HTTP client on wasm, where `load_remote_image_rgba` compiles to an error
-# stub instead. Same version and feature set as the root manifest, so the two share one
-# copy in the graph.
+# Native-only: the wiki's remote-image loader is a blocking download (`fetch_small`:
+# retry with capped backoff, `Range` resume, timeouts, size cap). There is no synchronous
+# HTTP client on wasm, where `load_remote_image_rgba` compiles to an error stub instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ureq.workspace = true
+ms-download = { path = "../ms-download" }
 
 [dev-dependencies]
 # Same crate the binary declares, pulled in for TEST builds only to switch on

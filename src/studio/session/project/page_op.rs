@@ -13,8 +13,9 @@ Key structures:
 Key functions:
 - `ProjectSession::start_page_op`: ONE method, fixed order: busy gate -> clean-op gate -> bubble
   flush of all three canvases (debounced text included) -> PS flush -> typing quiesce (REFUSES before anything moves) ->
-  `StagingWriters::quiesce_for_page_op` -> worker (join клин autosave, клин snapshots, bubbles pause,
-  layer barrier, staging writes, `execute_page_op`).
+  worker thread started parked (a refused thread REFUSES the op here, before any writer stops) ->
+  `StagingWriters::quiesce_for_page_op` -> worker released (join клин autosave, клин snapshots,
+  bubbles pause, layer barrier, staging writes, `execute_page_op`).
 - `ProjectSession::poll_page_op`, `ProjectSession::draw_page_op_overlays`.
 
 Notes:
@@ -103,17 +104,24 @@ impl ProjectSession {
             }
         }
 
-        // Force the gate and stop-now the клин autosave; its thread is joined in the worker, never
-        // here (`StagingWriters::quiesce_for_page_op` documents why stop-now, not flush).
-        let overlay_autosave_thread = parts.writers.quiesce_for_page_op();
-
         let saver_handle = parts.writers.layer_doc().lock().ok().and_then(|guard| guard.saver_handle());
         let overlays_model = Arc::clone(parts.writers.clean_overlays_model());
         let bubbles_model = Arc::clone(parts.writers.bubbles_model());
         let paths = parts.project.paths.clone();
         let pages = parts.project.pages.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        thread::spawn(move || {
+        // The worker is started PARKED, before any writer is quiesced, and released below with the
+        // клин autosave thread: a thread the OS refuses then refuses the operation while the session
+        // is still exactly as it was (no writer stopped, nothing on disk moved).
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<Option<thread::JoinHandle<()>>>();
+        let spawned = thread::Builder::new().name("page-op".to_owned()).spawn(move || {
+            // A closed start channel means `start_page_op` dropped the worker without releasing it;
+            // nothing was quiesced for it, so it must not touch the staging trees. Dropping `tx`
+            // reports that as a lost worker.
+            let Ok(overlay_autosave_thread) = start_rx.recv() else {
+                runtime_log::log_error("[page_op] worker released without a start signal; nothing was changed");
+                return;
+            };
             if let Some(handle) = overlay_autosave_thread
                 && handle.join().is_err()
             {
@@ -181,6 +189,29 @@ impl ProjectSession {
                 runtime_log::log_error("[page_op] result receiver dropped before transaction completed");
             }
         });
+        // The handle is dropped: the worker is detached and answers only through `tx`.
+        if let Err(err) = spawned {
+            runtime_log::log_error(format!(
+                "[page_op] request aborted: the page operation worker thread could not be started: {err}. Possible cause: the OS thread limit or low memory. No writer was stopped and nothing on disk moved"
+            ));
+            // The status line, like the other refusals above: nothing changed, so the failure dialog
+            // (which offers only a reload) does not apply.
+            self.save_to_project_status = Some((t!("page_manager.op_worker_start_error").to_string(), 0.0));
+            return;
+        }
+        // Force the gate and stop-now the клин autosave; its thread is joined in the worker, never
+        // here (`StagingWriters::quiesce_for_page_op` documents why stop-now, not flush).
+        let overlay_autosave_thread = parts.writers.quiesce_for_page_op();
+        if let Err(unsent) = start_tx.send(overlay_autosave_thread) {
+            // Unreachable while the worker is parked on `recv` (it returns only after receiving); if
+            // it happens anyway, `rx` is disconnected and `poll_page_op` shows the lost-worker
+            // dialog. The клин thread was told to stop-now and writes nothing more, so dropping its
+            // handle detaches a thread that is already exiting.
+            runtime_log::log_error(format!(
+                "[page_op] worker gone before its start signal; the operation is reported as failed (autosave handle present={})",
+                unsent.0.is_some()
+            ));
+        }
         self.page_op_rx = Some(rx);
     }
 

@@ -4,7 +4,8 @@ Forward-only Surya text detector service.
 
 Main responsibilities:
 - lazy init and health reporting for the Surya detection-only predictor;
-- explicit checkpoint presence check and auto-download for the detector model;
+- explicit presence check of the detector checkpoint directory Rust downloaded
+  (sent per request as `surya_detection_dir`; never downloaded here);
 - run ONE batched forward pass over equal-size RGB tiles prepared by Rust and
   return the text heatmap (model channel 0, at a quarter of the tile size) as
   `uint8`;
@@ -19,9 +20,10 @@ Backs the `textdetector.surya.forward` IPC method (`ipc/handlers/textdetector.py
 Resizing, page chunking, stitching and the CRAFT-style post-process (dynamic
 thresholds, components, boxes, mask) live in Rust (`crates/ms-text-detect`);
 this service only applies the library processor's normalization (no resize)
-and the network. Checkpoint presence and download are delegated to
-`engines/surya_checkpoints.py`, shared with the Surya OCR service
-(`ocr/surya.py`). This service needs no ROCm mmap staging: it loads the float16
+and the network. The checkpoint presence check and the settings pointer are
+delegated to `engines/surya_checkpoints.py`, shared with the Surya OCR service
+(`ocr/surya.py`); the directory is passed as `checkpoint=` so the load stays
+offline. This service needs no ROCm mmap staging: it loads the float16
 detector checkpoint as float32, and that host-side cast already materializes the
 weights in anonymous memory (see `_preferred_detector_dtype`).
 """
@@ -45,17 +47,14 @@ try:
 except Exception:
     UserConfig = None
 
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
-from ..engines.surya_checkpoints import (
-    checkpoint_local_dir,
-    checkpoint_ready,
-    ensure_checkpoint_downloaded,
-)
+from ..engines.surya_checkpoints import point_settings_at, require_local_checkpoint
 from .forward_maps import quantize_probability_maps, validate_tiles
 
 log = logging.getLogger(__name__)
 
-# Names this service in checkpoint download errors.
+# Names this service in "not downloaded" errors.
 CHECKPOINT_LABEL = "Surya detector"
 
 # Input alignment and output stride of the Surya segformer: the heatmap is
@@ -94,34 +93,48 @@ class SuryaTextDetectorService:
         self._model_manager = model_manager
         self._predictor = None
         self._device: str | None = None
+        # Checkpoint directory the resident predictor was built from; part of
+        # its identity next to `_device`.
+        self._model_dir: str | None = None
         self._last_error: str | None = None
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a load and the forward pass hold (S-014).
+        self._health = HealthSnapshot(ready=False, device=None, model_dir=None, last_error=None)
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            checkpoint = self._checkpoint_name()
-            model_dir = checkpoint_local_dir(checkpoint)
-            model_exists = bool(model_dir) and checkpoint_ready(model_dir)
-            return {
-                "ready": self._predictor is not None,
-                "device": self._device,
-                "model": "surya_detection",
-                "checkpoint": checkpoint,
-                "model_dir": model_dir,
-                "model_exists": model_exists,
-                "last_error": self._last_error,
-            }
+        """Return `{"ready", "device", "model", "model_dir", "last_error"}` for the health snapshot.
 
-    def forward_tiles(self, tiles: np.ndarray) -> np.ndarray:
+        `model_dir` is the directory of the RESIDENT predictor (`None` when
+        nothing is loaded): the checkpoint location is Rust's and arrives per
+        request, so there is no library cache to probe. Reads only the published
+        snapshot, so it answers while a load or a forward pass holds the lock.
+        """
+        return {"model": "surya_detection", **self._health.read()}
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock`."""
+        self._health.publish(
+            ready=self._predictor is not None,
+            device=self._device,
+            model_dir=self._model_dir,
+            last_error=self._last_error,
+        )
+
+    def forward_tiles(self, tiles: np.ndarray, *, model_dir: str) -> np.ndarray:
         """Run the Surya detector on RGB tiles and return `uint8` maps `[n, 1, h/4, w/4]`.
 
-        `tiles` is `uint8 [n, h, w, 3]`, RGB, both sides a multiple of 4. The
-        single channel is the model's text heatmap (channel 0, sigmoid already
-        applied inside the model) at its native quarter resolution; the
-        library's bilinear upsample to the processor size is NOT applied.
+        `tiles` is `uint8 [n, h, w, 3]`, RGB, both sides a multiple of 4.
+        `model_dir` is the absolute detector checkpoint directory Rust
+        downloaded. The single channel is the model's text heatmap (channel 0,
+        sigmoid already applied inside the model) at its native quarter
+        resolution; the library's bilinear upsample to the processor size is
+        NOT applied.
 
-        Raises `ValueError` for an invalid batch and `RuntimeError` for an
-        unavailable package, a failed load, an unexpected output shape or
-        non-finite heatmap values (float16 NaN on some CUDA setups).
+        Raises `ValueError` for an invalid batch or path, `FileNotFoundError`
+        ("not downloaded") for a missing or incomplete `model_dir`, and
+        `RuntimeError` for an unavailable package, a failed load, an unexpected
+        output shape or non-finite heatmap values (float16 NaN on some CUDA
+        setups).
         """
         n, height, width = validate_tiles(tiles, align=SURYA_INPUT_ALIGN, engine="surya")
         selected_device = _resolve_selected_backend_device(self._device or "cpu")
@@ -140,11 +153,14 @@ class SuryaTextDetectorService:
         )
         try:
             with self._lock:
-                predictor = self._ensure_predictor_locked(selected_device)
+                predictor = self._ensure_predictor_locked(selected_device, model_dir)
                 maps = _forward_with_predictor(predictor, tiles)
             if lease.needs_load:
                 lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
             self._last_error = None
+            # Set outside `_lock` (a forward must not wait for another request's
+            # load just to clear its error), so only this field is republished.
+            self._health.publish(last_error=None)
             log.info("Surya forward done device=%s map_size=%sx%s", selected_device, maps.shape[3], maps.shape[2])
             return maps
         except Exception as exc:
@@ -152,59 +168,61 @@ class SuryaTextDetectorService:
             if lease.needs_load:
                 lease.mark_load_failed()
             self._last_error = str(exc)
+            self._health.publish(last_error=self._last_error)
             raise
         finally:
             lease.release()
 
-    def _ensure_predictor_locked(self, device: str):
-        if self._predictor is not None and self._device == device:
+    def _ensure_predictor_locked(self, device: str, model_dir: str):
+        """Return the predictor for `device` built from `model_dir`, loading it if needed.
+
+        Caller must hold `self._lock`. Reloads when the resident predictor lives
+        on another device or came from another directory. Raises what
+        `forward_tiles` documents for the load.
+        """
+        if self._predictor is not None and self._device == device and self._model_dir == model_dir:
             return self._predictor
 
-        if self._device is not None and self._device != device:
+        if self._device is not None and (self._device != device or self._model_dir != model_dir):
             self._drop_predictor_locked()
 
-        self._ensure_checkpoint_downloaded_locked()
+        checkpoint = require_local_checkpoint(model_dir, label=CHECKPOINT_LABEL)
 
         try:
             from surya.detection import DetectionPredictor  # type: ignore
         except Exception as exc:
             self._last_error = f"Surya detection package is not available: {exc}"
+            self._publish_health_locked()
             raise RuntimeError(self._last_error) from exc
 
         try:
+            # The settings AND the explicit `checkpoint=`: nothing inside the
+            # library may fall back to the `s3://` default and download it.
+            point_settings_at(detection_dir=checkpoint)
             predictor_dtype = _preferred_detector_dtype(device)
             if predictor_dtype is None:
-                self._predictor = DetectionPredictor(device=device)
-                log.info("Surya detection predictor init device=%s dtype=default", device)
+                self._predictor = DetectionPredictor(checkpoint=checkpoint, device=device)
+                log.info("Surya detection predictor init device=%s dtype=default checkpoint=%s", device, checkpoint)
             else:
-                self._predictor = DetectionPredictor(device=device, dtype=predictor_dtype)
+                self._predictor = DetectionPredictor(checkpoint=checkpoint, device=device, dtype=predictor_dtype)
                 log.info(
-                    "Surya detection predictor init device=%s dtype=%s",
+                    "Surya detection predictor init device=%s dtype=%s checkpoint=%s",
                     device,
                     predictor_dtype,
+                    checkpoint,
                 )
         except Exception as exc:
             self._predictor = None
             self._device = None
             self._last_error = f"Surya detection init failed: {exc}"
+            self._publish_health_locked()
             raise RuntimeError(self._last_error) from exc
 
         self._device = device
+        self._model_dir = checkpoint
         self._last_error = None
+        self._publish_health_locked()
         return self._predictor
-
-    def _ensure_checkpoint_downloaded_locked(self) -> None:
-        """Fetch the detector checkpoint if it is not complete on disk.
-
-        Caller must hold `self._lock`. Delegates to `engines/surya_checkpoints.py`,
-        which the Surya OCR service shares; see that module for why the download
-        must finish before the predictor is constructed.
-
-        # Raises
-        `FileNotFoundError` / `RuntimeError` as documented on
-        `engines.surya_checkpoints.ensure_checkpoint_downloaded`.
-        """
-        ensure_checkpoint_downloaded(self._checkpoint_name(), label=CHECKPOINT_LABEL)
 
     def _unload_key(self, model_key: str) -> bool:
         with self._lock:
@@ -217,18 +235,15 @@ class SuryaTextDetectorService:
             return True
 
     def _drop_predictor_locked(self) -> None:
+        """Forget the predictor, its device and directory; caller holds `self._lock`."""
         self._predictor = None
         self._device = None
+        self._model_dir = None
+        self._publish_health_locked()
 
     @classmethod
     def _model_key(cls, device: str) -> str:
         return f"{cls.MODEL_KEY_PREFIX}:{device}"
-
-    @staticmethod
-    def _checkpoint_name() -> str:
-        from surya.settings import settings  # type: ignore
-
-        return str(settings.DETECTOR_MODEL_CHECKPOINT)
 
 
 def _forward_with_predictor(predictor, tiles: np.ndarray) -> np.ndarray:

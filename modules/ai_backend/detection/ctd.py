@@ -45,6 +45,7 @@ try:
 except Exception:
     UserConfig = None
 
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from .forward_maps import quantize_probability_maps, validate_tiles
 
@@ -118,17 +119,31 @@ class CtdTextDetectorService:
         self._device = _resolve_selected_backend_device(_default_device())
         self._last_error: str | None = None
         self._model_path = Path(TEXT_DETECTOR_DIR) / MODEL_FILENAME
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a load and the forward pass hold (S-014).
+        self._health = HealthSnapshot()
+        self._publish_health_locked()
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "ready": self._net is not None,
-                "model": "ctd",
-                "model_path": str(self._model_path),
-                "model_exists": self._model_path.exists(),
-                "device": self._device,
-                "last_error": self._last_error,
-            }
+        """Return the CTD health entry for the backend snapshot.
+
+        State fields come from the published snapshot and `model_exists` is a
+        filesystem probe taken here, outside any service lock, so this answers
+        while a load or a forward pass holds the instance lock.
+        """
+        fields = self._health.read()
+        return {
+            "ready": fields["ready"],
+            "model": "ctd",
+            "model_path": str(self._model_path),
+            "model_exists": self._model_path.exists(),
+            "device": fields["device"],
+            "last_error": fields["last_error"],
+        }
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock` (or is `__init__`)."""
+        self._health.publish(ready=self._net is not None, device=self._device, last_error=self._last_error)
 
     def forward_tiles(self, tiles: np.ndarray) -> np.ndarray:
         """Run CTD on a batch of RGB tiles and return `uint8` maps `[n, 2, h, w]`.
@@ -156,12 +171,14 @@ class CtdTextDetectorService:
                 if lease.needs_load:
                     lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 self._last_error = None
+                self._publish_health_locked()
                 log.info("CTD forward done device=%s tiles=%s size=%sx%s", device, n, width, height)
                 return maps
             except Exception as exc:
                 if lease.needs_load:
                     lease.mark_load_failed()
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 log.exception("CTD forward failed device=%s tiles=%s size=%sx%s", device, n, width, height)
                 raise
             finally:
@@ -181,6 +198,7 @@ class CtdTextDetectorService:
         if self._net is not None:
             self._net = None
             self._net_model_key = None
+            self._publish_health_locked()
             _clear_torch_cache()
             if previous_key is not None:
                 self._model_manager.mark_unloaded(previous_key)
@@ -190,6 +208,7 @@ class CtdTextDetectorService:
         self._net = TextDetBase(str(self._model_path), device=device, act="leaky")
         self._net_model_key = model_key
         self._device = device
+        self._publish_health_locked()
         log.info("CTD network loaded device=%s path=%s", device, self._model_path)
         return self._net
 
@@ -222,6 +241,7 @@ class CtdTextDetectorService:
                 return False
             self._net = None
             self._net_model_key = None
+            self._publish_health_locked()
             _clear_torch_cache()
             self._model_manager.mark_unloaded(model_key)
             return True

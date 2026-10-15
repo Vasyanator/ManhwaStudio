@@ -91,7 +91,12 @@ def _handle_inpaint_sdxl(
     """`inpaint.sdxl`: streaming SDXL inpaint (mirrors HTTP ``_handle_inpaint_sdxl``).
 
     Request: ``image_len``/``mask_len`` split the ``image_png ++ mask_png`` blob;
-    ``params`` is an inline object forwarded to the service. During diffusion the
+    ``params`` is an inline object forwarded to the service; the REQUIRED
+    ``sdxl_config_dir`` (the pinned diffusers config repo Rust downloaded for
+    the mode) and the optional ``sdxl_model_dir`` (Rust's download of the
+    curated inpaint repo, required by the service when ``params.model_path``
+    names it) are forwarded verbatim; this layer checks only their types and
+    the service checks the directories. During diffusion the
     handler emits one ``progress{id}`` frame per step with ``{step, total}`` in
     the header and the raw preview PNG in the frame blob (when a preview is
     available). On success it returns the terminal ``response`` fields
@@ -114,6 +119,13 @@ def _handle_inpaint_sdxl(
         params_raw = {}
     if not isinstance(params_raw, dict):
         raise ValueError("Field 'params' must be an object.")
+
+    config_dir = header.get("sdxl_config_dir")
+    if not isinstance(config_dir, str) or not config_dir.strip():
+        raise ValueError("Field 'sdxl_config_dir' is required and must be a non-empty string.")
+    curated_model_dir = header.get("sdxl_model_dir")
+    if curated_model_dir is not None and not isinstance(curated_model_dir, str):
+        raise ValueError("Field 'sdxl_model_dir' must be a string.")
 
     emitter = getattr(ctx, _PROGRESS_EMITTER_ATTR, None)
 
@@ -149,6 +161,8 @@ def _handle_inpaint_sdxl(
         result = ctx.state.sdxl_inpaint.inpaint_image_bytes(
             image_png,
             mask_png,
+            config_dir=config_dir,
+            curated_model_dir=curated_model_dir,
             params=params_raw,
             progress_callback=on_progress,
         )

@@ -75,7 +75,10 @@ is ephemeral and published per process.
   `ocr.manga`, `inpaint.lama_v2`, `textdetector.ctd.forward`, …), not HTTP paths. Values must
   match Python byte-for-byte. Edit here when the shared contract changes. Its
   `python_protocol_version_matches_rust` test reads the Python file and asserts the
-  two `PROTOCOL_VERSION` constants agree.
+  two `PROTOCOL_VERSION` constants agree. The model-location keys Rust sends (`HEADER_*_DIR`,
+  `HEADER_EASY_LANGS`; the backend never downloads those models) are named here too; callers
+  add them to their own headers — `surya_detection_dir` of `textdetector.surya.forward` is
+  merged by the caller onto the `build_forward_request` header, which stays model-agnostic.
 - `textdetector.rs`: the forward-only text-detector wire contract (`PROTOCOL.md` §5.3):
   `ForwardEngine` (method, align, map stride, channel names per engine — mirrored by
   `FORWARD_SPECS` in `modules/ai_backend/ipc/handlers/textdetector.py`), `build_forward_request`

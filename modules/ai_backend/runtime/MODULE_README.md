@@ -46,6 +46,9 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   `rocm_advice_rewrite_enabled()`, the ROCm gate that decides whether it strips anything at all.
   Stdlib only, like `paths.py`, because the torch-free `ipc/` layer imports it — which is exactly
   why the ROCm fact is pushed IN rather than probed here.
+- `health_snapshot.py`: `HealthSnapshot` — the copy-on-write health fields every model service
+  publishes so `health()` never takes the service's work lock. Stdlib only.
+- `test_health_snapshot.py`: merge / copy semantics of `HealthSnapshot`.
 - `rocm_mmap_transfer.py`: the ROCm host->device weight-transfer workaround
   (`mmap_staging_required()`, `stage_cpu_tensor()`, `move_module_to()`, `patched_module_to()`,
   `invalidate_maps_cache()`).
@@ -83,6 +86,16 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
     picks an adapter.
 - Torch and ONNX model roots are separate trees (`ManhwaStudio_AI_Models/Torch` vs `.../ONNX`);
   device selection here is per-runtime for that reason and the two selections never alias.
+- **`health()` never takes a service's work lock.** A service's instance lock is held across a
+  model load (and, in most services, inference) for seconds to minutes, and `server.py`'s health
+  worker calls every `health()` in turn, so one locking `health()` froze the whole pushed health
+  snapshot that Rust gates AI actions on. Every service with such a lock keeps its state-derived
+  health fields in a `HealthSnapshot` and republishes them (`_publish_health_locked()`, under its
+  own lock) at EVERY change of a field it reports: model resident / dropped, device, model id,
+  `last_error`. `health()` reads the snapshot plus lock-free filesystem probes only. Lock order is
+  service lock -> snapshot lock, never the reverse. While a load runs, `ready` is `False` (the old
+  model was dropped first) and `last_error` keeps its previous value; no extra state field is sent,
+  because the health payload is part of the IPC contract (`PROTOCOL_VERSION`).
 - `LoadedModelManager` eviction callbacks always run outside the manager lock, so a service-local
   lock can be taken inside them without deadlock.
 - **`ModelUsageLease.mark_load_failed()` means the LOAD failed, nothing else.** It reaches
@@ -166,6 +179,8 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   `test_paths.py`.
 - To change device selection, sentinel handling, or device-name probing, edit `device_service.py`.
 - To change the resident-model cap or eviction policy, edit `model_manager.py`.
+- To add a health field to a service, publish it from that service's `_publish_health_locked()`
+  (never read guarded state in `health()`); a new or changed field is an IPC contract change.
 - To change MIOpen tuning, the MIOpen cache location, the allocator override, or an environment
   default applied at ROCm startup, edit `rocm_runtime.py`; add the case to `test_rocm_runtime.py`
   and add the env key to that file's save/restore list or the value leaks into the next test — for

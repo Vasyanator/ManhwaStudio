@@ -30,9 +30,11 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
   request's `manga_model`; unknown values fall back to `base_onnx`) and run beam search here rather
   than in transformers. The `base_torch` variant lazily imports the original `manga_ocr` PyTorch
   package and its locally cached `kha-white/manga-ocr-base` weights and never downloads.
-- `easy.py`: EasyOCR (`ocr.easy`). Owns language-code normalization, the GPU/CPU retry ladder, and
-  the Windows-standalone SSL fallbacks (certifi CA bundle, then optional unverified HTTPS gated by
-  `MF_EASYOCR_INSECURE_SSL_FALLBACK`). Image decoding happens outside the service lock.
+- `easy.py`: EasyOCR (`ocr.easy`). Loads `easyocr.Reader(model_storage_directory=<request
+  easyocr_model_dir>, download_enabled=False)` and owns the GPU/CPU retry ladder (a missing or
+  md5-mismatched weight file is "not downloaded", never retried on the CPU). The language list is
+  used verbatim: Rust owns code canonicalization and the script choice. The reader identity (lease
+  key) is languages + device + directory. Image decoding happens outside the service lock.
 - `paddle.py`: PaddleOCR ONNX (`ocr.paddle`, and `ocr.paddle_onnx` which is served by the same
   service). A thin adapter: all model resolution and session handling lives in
   `engines/paddle_onnx.py`. The request field `paddle_lang` carries a model key such as
@@ -62,16 +64,24 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
   bubbles only, not Korean.
 - `result_format.py`: `format_recognition_lines`, the single owner of the `{"lines", "text"}`
   shape for engines that return one raw text block (`paddle_vl.py`, `baberu.py`).
-- `surya.py`: Surya OCR (`ocr.surya`). Foundation + recognition predictors, plus an optional
-  detection predictor for the `ocr_with_boxes` task; each is leased under its own model key.
+- `surya.py`: Surya OCR (`ocr.surya`). Foundation + recognition predictors from the request's
+  `surya_recognition_dir`, plus an optional detection predictor from `surya_detection_dir` for the
+  `ocr_with_boxes` task; each is leased under its own model key, and the directory is part of the
+  resident identity next to the device.
 - `script_constraint.py`: stateful UTF-8 `prefix_allowed_tokens_fn` used only by `paddle_vl.py`.
-- `test_manga.py`, `test_paddle_vl.py`, `test_surya.py`, `test_script_constraint.py`,
+- `test_manga.py`, `test_paddle_vl.py`, `test_surya.py`, `test_easy.py`, `test_script_constraint.py`,
   `test_baberu.py`, `test_paddle_vl_vendor.py`: unit tests for the contracts below. They fake
-  `torch`/`transformers`/`surya`/`manga_ocr` in `sys.modules` or stub the runtime, so no weights,
-  GPU, or heavy packages are needed. `test_paddle_vl_vendor.py` pins the vendored bytes.
+  `torch`/`transformers`/`surya`/`easyocr`/`manga_ocr` in `sys.modules` or stub the runtime, so no
+  weights, GPU, or heavy packages are needed; the fake download functions raise, so a download
+  attempt fails the test. `test_paddle_vl_vendor.py` pins the vendored bytes. `test_easy.py` also
+  holds the guard that Rust's EasyOCR table (`crates/ms-sysprobe/fixtures/easyocr_scripts.json`)
+  names the file names and md5 sums of the installed `easyocr.config` (skipped when either is
+  absent).
 - Opt-in real-weight checks, skipped unless their variable is set: `test_baberu.py`
-  `RealWeightsTests` (`MS_BABERU_MODEL_DIR`) and `test_paddle_vl_real.py` (`MS_PADDLE_VL_DIR`,
-  optional `MS_PADDLE_VL_DEVICE`: K/V-cache parity and timing).
+  `RealWeightsTests` (`MS_BABERU_MODEL_DIR`), `test_paddle_vl_real.py` (`MS_PADDLE_VL_DIR`,
+  optional `MS_PADDLE_VL_DEVICE`: K/V-cache parity and timing), `test_easy.py` `RealWeightsTests`
+  (`MS_EASYOCR_MODEL_DIR`) and `test_surya.py` `RealCheckpointTests` (`MS_SURYA_RECOGNITION_DIR` +
+  `MS_SURYA_DETECTION_DIR`); the last two patch the library download function to fail.
 
 ## Contracts and invariants
 - `__init__.py` must stay a docstring only. Re-exporting any service would make importing one engine
@@ -80,16 +90,22 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
 - Missing packages, missing weights, and unsupported requests surface as explicit errors with the
   offending path/package in the message. No silent fallback to another engine or another model.
 - Model roots: MangaOCR ONNX weights live under `ManhwaStudio_AI_Models/ONNX/MangaOCR`, PaddleOCR
-  ONNX weights under `ManhwaStudio_AI_Models/ONNX/PaddleOCR`. EasyOCR and Surya deliberately use
-  their own library caches, because those packages own the download behavior — do not redirect
-  them into the app model tree.
-- PaddleOCR-VL (`side_models/PaddleOCR-VL/<variant>/`) and Baberu (`side_models/BaberuOCR/`) are
-  downloaded and verified by RUST (`ms_sysprobe::ai_models::external`: pinned commit, sha256 per
-  file, completion marker); Rust is the only owner of their repos, commits, file lists and
-  directories. The backend receives absolute paths per request, loads them offline
-  (`local_files_only=True` / plain ORT sessions), NEVER downloads, never reads the Hugging Face
-  cache for them, and answers a missing directory or file with an explicit error naming it. No
-  network-downloaded Python runs for them: PaddleOCR-VL uses `paddle_vl_vendor/`.
+  ONNX weights under `ManhwaStudio_AI_Models/ONNX/PaddleOCR`.
+- PaddleOCR-VL (`side_models/PaddleOCR-VL/<variant>/`), Baberu (`side_models/BaberuOCR/`), EasyOCR
+  and Surya are downloaded and verified by RUST (`ms_sysprobe::ai_models::external`: pinned
+  source, sha256 per file, completion marker); Rust is the only owner of their sources, file lists
+  and directories. The backend receives absolute paths per request, loads them offline
+  (`local_files_only=True`, plain ORT sessions, `download_enabled=False`, a local Surya
+  `checkpoint=`), NEVER downloads, never reads a library or Hugging Face cache for them, and
+  answers a missing directory or file with an explicit error naming it ("not downloaded" for a
+  missing directory or an incomplete Surya manifest). The weights are only valid for the pinned
+  library versions (`easyocr==1.7.2`, `surya-ocr==0.17.1`, `requirements/torch.txt`), whose file
+  layout the catalog mirrors. No network-downloaded Python runs for them: PaddleOCR-VL uses
+  `paddle_vl_vendor/`.
+- Surya: before constructing a predictor the service proves the directory complete
+  (`engines/surya_checkpoints.require_local_checkpoint`), points Surya's process-global checkpoint
+  settings at it (`point_settings_at`) AND passes it as `checkpoint=`, so no library code can fall
+  back to an `s3://` default and download it.
 - PaddleOCR-VL refuses a checkpoint whose loading info lists missing, unexpected or mismatched
   keys: transformers would otherwise random-initialize them and return garbage instead of an error.
   Generation always passes `use_cache=True` (the shipped generation configs disable the cache).
@@ -99,8 +115,7 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
   - `manga.py` and `paddle_vl.py` own the `nn.Module` and move it with `move_module_to(...)`;
   - `surya.py` cannot reach the transfer (the surya loader moves the weights itself), so predictor
     construction — and nothing else — runs inside `with patched_module_to():`.
-  The patch is process-global: the Surya checkpoint download
-  (`engines/surya_checkpoints.ensure_checkpoint_downloaded`) must stay outside the block, and
+  The patch is process-global: the Surya checkpoint presence check stays outside the block, and
   inference must never run inside it. Both helpers are strict no-ops off ROCm.
 - MangaOCR's `MangaOcrModel.from_pretrained` and PaddleOCR-VL's `from_pretrained(dtype=<checkpoint
   dtype>)` intentionally request no host-side cast; that is what makes the weights mmap-backed and
@@ -129,19 +144,24 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
   column reading.
 - Services are shared across dispatcher threads: guard mutable state with the instance lock, and do
   not hold that lock across a download, a network wait, or inference.
+- `health()` reads only the service's `runtime.health_snapshot.HealthSnapshot` (plus filesystem
+  probes), never the instance lock that a load holds; every change of a reported field is
+  republished through `_publish_health_locked()` (contract: `runtime/MODULE_README.md`).
+  `test_baberu.py` `HealthDuringLoadTests` pins it.
 
 ## Editing map
 - To change how an engine is invoked or how its result is normalized, edit that engine's file here.
 - To change PaddleOCR ONNX model layout, provider selection, or session/caching, edit
   `../engines/paddle_onnx.py`, not `paddle.py`.
-- To change Surya checkpoint location or download behavior, edit `../engines/surya_checkpoints.py`;
-  the detector service under `../detection/` shares it.
+- To change how a Surya checkpoint directory is checked or handed to the library, edit
+  `../engines/surya_checkpoints.py`; the detector service under `../detection/` shares it.
 - To change the request/response wire shape or add an OCR IPC method, edit `../ipc/handlers/ocr.py`
   (and the protocol constants next to it), then add the matching service method here.
 - To change the Baberu decode or preprocessing, edit `baberu.py` AND the native port in
   `crates/ms-onnx/src/baberu_ocr/` together; `test_baberu.py` mirrors the Rust decode cases.
-- To change which PaddleOCR-VL or Baberu files exist or where they live, edit the Rust catalog
-  (`crates/ms-sysprobe/src/ai_models/external_catalog.rs`), not this package.
+- To change which PaddleOCR-VL, Baberu, EasyOCR or Surya files exist or where they live, edit the
+  Rust catalog (`crates/ms-sysprobe/src/ai_models/`), not this package; a library version bump
+  needs the catalog, the pins in `requirements/torch.txt` and the installer list together.
 - To change where the installation root is, edit `../runtime/paths.py`.
 - To change model residency, eviction, or lease behavior, edit `../runtime/model_manager.py`.
 - To add or widen a supported writing system for PaddleOCR-VL, edit `script_constraint.py`

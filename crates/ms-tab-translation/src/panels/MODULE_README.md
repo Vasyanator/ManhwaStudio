@@ -61,19 +61,27 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   "ja/zh/en only" hint and a warning when the MT source language is `ko`, lent as
   `OcrPanelModelView::korean_source`) and PaddleOCR-VL (weight-variant `WheelComboBox`
   `paddle_vl_model`, id salt `translation.ocr_panel.paddle_vl_model_label`, above the script
-  restriction; the manga_ja choice shows its hint). For both, the download block is drawn outside
-  the engine-options gate (`OcrPanelModelView::download`, the `OcrModelPanelSnapshot` of
-  `ocr::external_model_spec(engine, variant)` taken at frame start; drawn only while its
-  `spec_id` matches the selection after this frame's widgets), its clicks return in
-  `OcrPanelActions::model_download`, and the load button is enabled only when that state is
-  `Installed` (`load_blocked_reason` gives the disabled hover: checking / downloading / not
-  downloaded).
-- `ocr_model_download.rs`: the shared external-model download block (status line, the last
-  cancel / failure notice, Download / Resume button, `ProgressBar` with file N of M and byte
-  counters or the automatic-retry countdown, Cancel; while ANOTHER model downloads, a line naming it with its progress over a
-  disabled Download button). The pure `download_block_view` maps `OcrModelPanelSnapshot` -> what
-  is shown; button captions come from `crate::ocr_model_download::offered_download_label` (shared
-  with the OCR "not downloaded" error).
+  restriction; the manga_ja choice shows its hint). EasyOCR (the model of the selected languages'
+  script) and Surya (detection + recognition) have download blocks too. For all of them the
+  download block is drawn outside the engine-options gate (`OcrPanelModelView::download`, the
+  `OcrModelPanelSnapshot` of the bundle `ocr::external_model_specs(engine, variant, easy_langs)`
+  taken at frame start; drawn only while its `bundle_key` matches the selection after this frame's
+  widgets), its clicks return in `OcrPanelActions::model_download`, and the load button is enabled
+  only when that state is `Installed` (`load_blocked_reason` gives the disabled hover: checking /
+  downloading / not downloaded). An EasyOCR language list easyocr refuses shows its localized
+  error in red and blocks the load button.
+- `ocr_model_download.rs`: the shared external-model download block of one bundle (status line,
+  the last cancel / failure / verify notice, Download / Resume button, "Verify files" once
+  installed (`ModelDownloadAction::Verify`, the repair path for a same-size corruption), `ProgressBar` with file N of M and
+  byte counters over the bundle or the automatic-retry countdown, Cancel; while ANOTHER bundle
+  downloads, a line naming it with its progress over a disabled Download button). The pure
+  `download_block_view` maps `OcrModelPanelSnapshot` -> what is shown; button captions come from
+  `crate::ocr_model_download::offered_download_label` (shared with the "not downloaded" errors);
+  `external_model_display_name` names every catalog spec. `pub` items (`draw_ocr_model_download`,
+  `load_blocked_reason`, `ModelDownloadAction`): the OCR and detector panels here and the
+  Cleaning tab's SDXL engine draw it. The detector panel draws it for
+  `text_detector::SURYA_DETECTOR_SPECS` while Surya is selected
+  (`TextDetectorPanelView::surya_model`, `TextDetectorPanelActions::surya_model_download`).
 - `ocr_langs.rs`: static EasyOCR and PaddleOCR language catalogs used by the OCR panel.
   Each entry is `(wire_code, display_key)`: the wire code is the persisted identity
   sent to the backend, the display key is an i18n catalog key resolved to a localized
@@ -85,6 +93,11 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   route — Paddle native or backend, CTD/Surya backend — then reported-missing PyTorch) shared by the panel's
   detect-button gate and hint and by `tab.rs`'s run-mode refusal; never re-derive it elsewhere.
   The hint under disabled detect buttons names the same reason a refused run reports.
+  A batch's model download (`TextDetectorPanelView::model_download`) is drawn under the status
+  with a Cancel (`TextDetectorPanelActions::cancel_detection`).
+- Both `ocr.rs` (engine load / recognize downloads, `OcrPanelModelView::engine_download`, Cancel
+  -> `OcrPanelActions::cancel_model_download`) and `text_detector.rs` draw app-managed model
+  downloads only through `crate::model_download_status`; never format that text here.
   `TextDetectorPanelOptions::run_mode` builds the run mode `tab.rs` starts (availability is
   checked separately). The per-page plan notice (full resolution / scaled with percent / tiled
   with tile count, grid and tile size / both, plus the effective CTD detection size) comes from

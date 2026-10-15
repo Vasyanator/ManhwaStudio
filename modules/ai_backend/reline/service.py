@@ -6,7 +6,9 @@ Reline service adapter for the Python AI backend.
 
 Main responsibilities:
 - resolve local or catalog-backed Reline super-resolution model files;
-- download direct model files or extract model checkpoints from tar.xz archives;
+- download direct model files through the shared retrying transfer
+  (`engines.model_download.download_http_to_path`) or extract model checkpoints
+  from tar.xz archives;
 - build and run a Reline pipeline for one image file;
 - expose a compact model catalog payload for Rust UI helpers.
 
@@ -14,6 +16,10 @@ Notes:
 The Python `reline` package does not own model downloads. This adapter keeps Reline
 checkpoint files under `ManhwaStudio_AI_Models/side_models/Reline` and passes the resolved
 local checkpoint path into the standard Reline `upscale` node.
+
+The models are user-chosen from a live catalog, so nothing is pinned: the expected size of a
+download is the server's `Content-Length` (`expected_size=0`), which still lets a short body be
+detected and resumed with `Range`.
 
 Besides the remote catalog (`CATALOG_URL`), a small built-in `EXTRA_MODELS` list exposes models
 that the remote catalog does not yet publish. Entries with an empty `url` (e.g. only a Google
@@ -24,17 +30,24 @@ download hint pointing at `source`.
 from __future__ import annotations
 
 import json
+import logging
+import lzma
 import shutil
 import tarfile
 import tempfile
-import traceback
 from pathlib import Path
-from typing import Any
-from urllib.error import HTTPError, URLError
+from typing import Any, Callable
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
+from ..engines.model_download import (
+    DownloadError,
+    GetFn,
+    download_http_to_path,
+    fetch_small_body,
+)
 from ..runtime.paths import side_models_root
+
+log = logging.getLogger(__name__)
 
 CATALOG_URL = "https://mdb.yor.ovh/v1/files"
 # Module attribute (not a function) on purpose: the tests patch it. The root comes from the
@@ -43,7 +56,9 @@ MODEL_DIR = side_models_root() / "Reline"
 DOWNLOAD_DIR = MODEL_DIR / ".download"
 MODEL_SUFFIXES = (".pt", ".pth", ".ckpt", ".safetensors")
 ARCHIVE_SUFFIXES = (".tar.xz", ".txz")
-DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+#: Sent with the catalog request and every model GET; the catalog host has served
+#: this agent since the adapter was written.
+USER_AGENT = "ManhwaStudio/Reline"
 
 # Built-in models not (yet) present in the remote catalog. Each entry is resolved from a local
 # checkpoint placed in MODEL_DIR. `url` may be empty when only a non-direct source exists (e.g. a
@@ -127,9 +142,12 @@ CVT_TYPES = {"RGB2Gray2020", "RGB2Gray709", "RGB2Gray", "Gray2RGB"}
 
 
 class RelineService:
-    def __init__(self) -> None:
-        MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    """`reline.models` / `reline.process` adapter.
+
+    Construction has no side effect: `MODEL_DIR` and `DOWNLOAD_DIR` are created only when a
+    model is actually downloaded, so building the service (the backend's `AppState`, tests)
+    never writes into the model tree.
+    """
 
     def health(self) -> dict[str, Any]:
         return {
@@ -137,8 +155,14 @@ class RelineService:
             "model_dir": str(MODEL_DIR),
         }
 
-    def list_models(self) -> list[dict[str, Any]]:
-        catalog = _fetch_catalog()
+    def list_models(self, *, should_cancel: Callable[[], bool] | None = None) -> list[dict[str, Any]]:
+        """The remote catalog plus `EXTRA_MODELS`, each marked with whether it is on disk.
+
+        # Errors
+        `RuntimeError` when the catalog cannot be fetched or parsed; `DownloadCancelled` when
+        `should_cancel` stopped the fetch.
+        """
+        catalog = _fetch_catalog(should_cancel=should_cancel)
         models: list[dict[str, Any]] = []
         seen: set[str] = set()
         for entry in catalog:
@@ -175,7 +199,18 @@ class RelineService:
         image_path: str,
         output_path: str | None,
         params: dict[str, Any],
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        """Run the Reline pipeline `params` describes on `image_path`.
+
+        `should_cancel` is polled by a model download or catalog fetch the upscale node needs
+        (per chunk and during retry waits); the pipeline itself is not interruptible.
+
+        # Errors
+        `FileNotFoundError` for a missing input or model, `ValueError` for an invalid option,
+        `RuntimeError` when a download or the pipeline fails, `DownloadCancelled` when
+        `should_cancel` stopped a download.
+        """
         input_path = Path(image_path).expanduser()
         if not input_path.is_file():
             raise FileNotFoundError(f"Reline input image not found: {input_path}")
@@ -189,11 +224,12 @@ class RelineService:
             result_path = Path(cleanup_dir.name) / "output.png"
 
         try:
-            pipeline_json = self._build_pipeline_json(input_path, result_path, params)
-            print(
-                "[AI Backend][reline] process start "
-                f"input='{input_path}' output='{result_path}' nodes={len(pipeline_json)}",
-                flush=True,
+            pipeline_json = self._build_pipeline_json(input_path, result_path, params, should_cancel)
+            log.info(
+                "reline: process start input=%s output=%s nodes=%d",
+                input_path,
+                result_path,
+                len(pipeline_json),
             )
             # Absolute import of the THIRD-PARTY top-level `reline` package, not
             # this sub-package (`modules.ai_backend.reline`): Python 3 imports are
@@ -212,7 +248,7 @@ class RelineService:
                 "pipeline": pipeline_json,
             }
         except Exception:
-            traceback.print_exc()
+            log.exception("reline: processing failed for input=%s", input_path)
             raise
         finally:
             if cleanup_dir is not None:
@@ -223,6 +259,7 @@ class RelineService:
         input_path: Path,
         result_path: Path,
         params: dict[str, Any],
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         reader_mode = _choice(params.get("reader_mode", "rgb"), READER_MODES, "reader_mode")
         nodes: list[dict[str, Any]] = [
@@ -237,7 +274,7 @@ class RelineService:
 
         upscale = _object(params.get("upscale"))
         if _bool(upscale.get("enabled"), False):
-            model_path = _resolve_model(upscale)
+            model_path = _resolve_model(upscale, should_cancel=should_cancel)
             nodes.append(
                 {
                     "type": "upscale",
@@ -374,7 +411,13 @@ class RelineService:
         return nodes
 
 
-def _resolve_model(options: dict[str, Any]) -> Path:
+def _resolve_model(
+    options: dict[str, Any], *, should_cancel: Callable[[], bool] | None = None
+) -> Path:
+    """Local checkpoint path for the `upscale` options, downloading the model when needed.
+
+    `should_cancel` reaches the catalog fetch and the download.
+    """
     model_path_raw = str(options.get("model_path", "") or "").strip()
     if model_path_raw:
         path = Path(model_path_raw).expanduser()
@@ -412,7 +455,7 @@ def _resolve_model(options: dict[str, Any]) -> Path:
                     f"download URL.{hint}"
                 )
         else:
-            catalog_entry = _find_catalog_entry(model_name)
+            catalog_entry = _find_catalog_entry(model_name, should_cancel=should_cancel)
             if catalog_entry is None:
                 raise FileNotFoundError(
                     f"Reline model '{model_name}' was not found locally or in the model catalog."
@@ -428,7 +471,7 @@ def _resolve_model(options: dict[str, Any]) -> Path:
         filename = _safe_filename(model_name)
     else:
         filename = _filename_from_url(model_url)
-    return _download_model(model_url, filename)
+    return _download_model(model_url, filename, should_cancel=should_cancel)
 
 
 def _find_extra_model(model_name: str) -> dict[str, str] | None:
@@ -441,9 +484,12 @@ def _find_extra_model(model_name: str) -> dict[str, str] | None:
     return None
 
 
-def _find_catalog_entry(model_name: str) -> dict[str, Any] | None:
+def _find_catalog_entry(
+    model_name: str, *, should_cancel: Callable[[], bool] | None = None
+) -> dict[str, Any] | None:
+    """The catalog entry matching `model_name` by filename, name or URL, or `None`."""
     wanted = _model_lookup_key(model_name)
-    for entry in _fetch_catalog():
+    for entry in _fetch_catalog(should_cancel=should_cancel):
         candidate_values = [
             _entry_filename(entry),
             str(entry.get("name", "") or "").strip(),
@@ -454,12 +500,36 @@ def _find_catalog_entry(model_name: str) -> dict[str, Any] | None:
     return None
 
 
-def _fetch_catalog() -> list[dict[str, Any]]:
-    request = Request(CATALOG_URL, headers={"User-Agent": "ManhwaStudio/Reline"})
+def _fetch_catalog(
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    get: GetFn | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch the remote model catalog (`CATALOG_URL`) as a list of entry objects.
+
+    Rides `fetch_small_body`, so it has the shared network rules: connect/read timeouts,
+    transient failures retried with backoff, cancel polled per chunk and during waits. `get` /
+    `sleep` are the transport and clock seams (`None`: `requests.get` / `time.sleep`).
+
+    # Errors
+    `RuntimeError` for a permanent HTTP status, exhausted retries, an oversized body or a
+    response that is not a JSON array; `DownloadCancelled` when `should_cancel` stopped it.
+    """
+    import requests
+
     try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        body = fetch_small_body(
+            CATALOG_URL,
+            label="каталог моделей Reline",
+            headers={"User-Agent": USER_AGENT},
+            should_cancel=should_cancel,
+            get=get,
+            sleep=sleep,
+        )
+        payload = json.loads(body.decode("utf-8"))
+    except (requests.HTTPError, DownloadError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        log.error("reline: could not fetch the model catalog from %s: %s", CATALOG_URL, exc)
         raise RuntimeError(f"Could not fetch Reline model catalog from {CATALOG_URL}: {exc}") from exc
 
     if not isinstance(payload, list):
@@ -467,48 +537,81 @@ def _fetch_catalog() -> list[dict[str, Any]]:
     return [entry for entry in payload if isinstance(entry, dict)]
 
 
-def _download_model(url: str, filename: str) -> Path:
+def _download_model(
+    url: str,
+    filename: str,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
+    get: GetFn | None = None,
+    sleep: Callable[[float], None] | None = None,
+) -> Path:
+    """Download a Reline model from `url` and return the local checkpoint path.
+
+    The transfer is `download_http_to_path` into `DOWNLOAD_DIR/<filename>`: transient network
+    failures are retried with backoff and resumed with `Range`, a failed run keeps its bytes for
+    the next one, and the file appears only complete. The expected size is the server's
+    `Content-Length` (catalog models are not pinned). An archive is then extracted into
+    `MODEL_DIR`; a plain checkpoint is moved there. `should_cancel` is polled per chunk and
+    during retry waits (a cancel parks the bytes for a resume). `get` / `sleep` are the
+    transport and clock seams (`None`: `requests.get` / `time.sleep`).
+
+    # Errors
+    `ValueError` for a non-http(s) URL or a filename without a supported model/archive suffix
+    (refused before any request); `RuntimeError` for a permanent HTTP status, exhausted retries,
+    a staging write failure, or an archive that cannot be extracted; `DownloadCancelled` when
+    `should_cancel` stopped the transfer.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError(f"Reline model URL must be http or https: {url}")
 
     safe_filename = _safe_filename(filename)
+    if not _has_supported_download_suffix(safe_filename):
+        raise ValueError(f"Reline model download has unsupported suffix: {safe_filename}")
     final_candidate = _find_existing_model(safe_filename)
     if final_candidate is not None:
         return final_candidate
 
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    partial_path = DOWNLOAD_DIR / f"{safe_filename}.part"
-    archive_or_model_path = DOWNLOAD_DIR / safe_filename
-    if partial_path.exists():
-        partial_path.unlink()
+    import requests
 
-    print(f"[AI Backend][reline] downloading model url='{url}' filename='{safe_filename}'", flush=True)
-    request = Request(url, headers={"User-Agent": "ManhwaStudio/Reline"})
+    archive_or_model_path = DOWNLOAD_DIR / safe_filename
+    log.info("reline: downloading model %s from %s", safe_filename, url)
     try:
-        with urlopen(request, timeout=60) as response, partial_path.open("wb") as out:
-            while True:
-                chunk = response.read(DOWNLOAD_CHUNK_SIZE)
-                if not chunk:
-                    break
-                out.write(chunk)
-    except (HTTPError, URLError, TimeoutError, OSError) as exc:
-        if partial_path.exists():
-            partial_path.unlink()
+        download_http_to_path(
+            url,
+            archive_or_model_path,
+            expected_size=0,
+            headers={"User-Agent": USER_AGENT},
+            # `reline.process` has no progress channel; retries are logged by the transfer.
+            on_progress=lambda _done, _total: None,
+            should_cancel=should_cancel,
+            get=get,
+            sleep=sleep,
+        )
+    except requests.HTTPError as exc:
+        log.error("reline: model request refused for %s: %s", url, exc)
         raise RuntimeError(f"Could not download Reline model from {url}: {exc}") from exc
 
-    partial_path.replace(archive_or_model_path)
     if _has_archive_suffix(archive_or_model_path.name):
         return _extract_first_model_from_archive(archive_or_model_path)
 
-    if archive_or_model_path.suffix.lower() not in MODEL_SUFFIXES:
-        raise ValueError(f"Downloaded Reline model has unsupported suffix: {archive_or_model_path}")
     target_path = MODEL_DIR / archive_or_model_path.name
     _replace_file(archive_or_model_path, target_path)
     return target_path
 
 
 def _extract_first_model_from_archive(archive_path: Path) -> Path:
+    """Extract the first supported checkpoint of `archive_path` into `MODEL_DIR`.
+
+    The checkpoint is stored under the archive's stem (`<stem><suffix>`) so a later
+    catalog-name lookup finds it, and the archive is removed. An archive that cannot be read
+    or holds no supported checkpoint is proven wrong and is removed too, so the next request
+    downloads it again instead of re-extracting the same bad bytes.
+
+    # Errors
+    `RuntimeError` for an unreadable archive or one without a supported checkpoint.
+    """
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
     try:
         with tarfile.open(archive_path, mode="r:xz") as archive:
             for member in archive.getmembers():
@@ -532,16 +635,25 @@ def _extract_first_model_from_archive(archive_path: Path) -> Path:
                 target_path.with_suffix(target_path.suffix + ".part").replace(target_path)
                 archive_path.unlink(missing_ok=True)
                 return target_path
-    except tarfile.TarError as exc:
+    except (tarfile.TarError, lzma.LZMAError, EOFError) as exc:
+        # A truncated or corrupt xz stream surfaces as `LZMAError` / `EOFError`, not `TarError`.
+        log.error("reline: could not extract %s: %s; removing it", archive_path, exc)
+        archive_path.unlink(missing_ok=True)
         raise RuntimeError(f"Could not extract Reline model archive {archive_path}: {exc}") from exc
+    log.error("reline: %s holds no supported checkpoint; removing it", archive_path)
+    archive_path.unlink(missing_ok=True)
     raise RuntimeError(f"Reline archive does not contain a supported model file: {archive_path}")
 
 
 def _find_existing_model(model_name: str) -> Path | None:
+    """The checkpoint under `MODEL_DIR` matching `model_name`, or `None` (also when the
+    directory does not exist yet: nothing was downloaded)."""
     safe_name = _safe_filename(model_name)
     direct = MODEL_DIR / safe_name
     if direct.is_file() and direct.suffix.lower() in MODEL_SUFFIXES:
         return direct
+    if not MODEL_DIR.is_dir():
+        return None
 
     wanted_key = _model_lookup_key(safe_name)
     for path in MODEL_DIR.iterdir():

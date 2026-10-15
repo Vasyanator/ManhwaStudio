@@ -161,7 +161,7 @@ The main data flow is:
    PS unified group visibility/opacity fold, stable input-order ties). The tab projects its inputs —
    `bands_by_page` (`ordering::doc_page_bands`), `groups_by_page` (the doc page's PS groups; disk:
    `PageRasters::groups`), and per runtime `group_uid` (+ the text node's `visible`) — in `sync_from_doc`,
-   which `maybe_reproject_from_doc_version` reruns on every doc version bump, so a PS group eye / opacity
+   which `maybe_reproject_from_doc_version` reruns on every page-revision bump, so a PS group eye / opacity
    (`LayerDoc::set_group_meta`) or PS text eye (`set_visibility`) reaches the canvas and the export live;
    `raster_band_z` / `overlay_band_z` delegate to `band_z`, and BOTH the canvas and the export flatten
    draw in plan order. Canvas (`tab/draw_page.rs`): `page_fill_plan` (over `page_composite_inputs`)
@@ -255,7 +255,7 @@ The main data flow is:
    reused with the overlay reorder); "Удалить слой" (`remove_raster` → `doc.remove_node` +
    `enqueue_page_save_dropping_raster`, enqueued eagerly; its `removed_uids` survive saver coalescing, so
    the deleted raster does not resurrect on disk). Everything routes
-   through the shared doc; the PS tab sees it via the version watch. The LAYERS list is the «Слои» dock
+   through the shared doc; the PS tab sees it via its page-revision watch. The LAYERS list is the «Слои» dock
    tab (`typing.layers`), sharing a panel with «Действия»; its body is
    `TypingTextOverlayLayer::draw_layers_tab_body(ui, page_idx)`, because the layer state lives on
    `text_overlays`. The «Слои» body is ONE unified,
@@ -284,13 +284,13 @@ The main data flow is:
    measured `оооооооооо` galley (`ctx.fonts_mut(layout_no_wrap)`). Image rows show `Картинка`, rasters
    `🖼 {name}`.
    Cross-tab sync: both tabs hold the shared in-memory `LayerDoc` (`set_layer_doc`), which is the
-   source of truth for per-page layer MODEL state. Edits route through it (`route_to_doc`), bumping its
-   monotonic `version`; each frame `maybe_reproject_from_doc_version` re-projects the current page when
-   the version moved since THAT page was projected (`projected_doc_version`: one entry per page, set by
-   `sync_from_doc` / the adopt-only path, removed by the doc-less fallbacks of
-   `ensure_raster_layers_for_page`). The doc has ONE global version, so a single remembered version
-   would let a sync of page A mark a page B the PS tab edited meanwhile as current — B would then be
-   shown and flattened stale; per-page entries make every page re-project on its own first use.
+   source of truth for per-page layer MODEL state. Edits route through it (`route_to_doc`), advancing
+   the edited page's `LayerDoc::page_revision`; each frame `maybe_reproject_from_doc_version`
+   re-projects the current page when ITS revision moved since it was projected
+   (`projected_page_revision`: one entry per page, set by `sync_from_doc` / the adopt-only path,
+   removed by the doc-less fallbacks of `ensure_raster_layers_for_page`). An edit of page A never
+   makes page B read stale (`page_projection_current`), and a page B the PS tab edited meanwhile
+   re-projects on its own first use (shown, flattened or exported).
 
    **External images are raster layers**, not overlays: the "вставить/выбрать картинку" buttons now
    route through `request_create_image_overlay` → `render_and_store_created_raster` (worker: DECODE
@@ -368,8 +368,7 @@ The main data flow is:
    call `drive_doc_sync_for_export` (the flatten's off-draw sync, over all pages: polls the jobs that
    make `maybe_reproject_from_doc_version` back off, re-projects each page a PS-tab edit left stale)
    and defer the export while any page still lags. That term is evaluated LAST, only once the cheap
-   terms hold (during the preload every applied page bumps the doc's global version, so evaluating it
-   earlier would re-project every resident page on every frame). It restores nothing: the selection
+   terms hold (while the preload still inserts pages a re-projection is wasted GUI-thread work). It restores nothing: the selection
    effects of `sync_from_doc` (uid remap of the tracked raster indices) are the correct ones, and
    since the export dispatches only with every projection current, `build_page_job`'s own selection
    restore never spans a re-projection of a resident page. ORDERING: `build_page_job`
@@ -1359,7 +1358,8 @@ registry to `draw`. Everything is declared in `tab/input.rs` (ids are persistenc
   resident is never re-read by `build_page_job`, so `prepare_flatten_to_file` re-projects a PS-tab doc
   edit itself (`drive_doc_sync_without_draw(ctx, page_idx)`: polls the save / create / effects / edit
   jobs that make `maybe_reproject_from_doc_version` back off, then re-projects the flattened page, which
-  need not be the canvas's current one). The worker barriers the layer saver, snapshots the клин like
+  need not be the canvas's current one). Like the export, that drive is the gate's LAST, lazy term
+  (`flatten_dispatch_ready(gate, doc_synced)`), run only once every cheap term holds. The worker barriers the layer saver, snapshots the клин like
   the export, flattens and digests the straight RGBA8 composite (`PixelDigest`, before any encoding —
   the layout `ms_project::single_image` hashed for `opened_digest`, so an untouched page compares
   equal). Digest equal to the request's `unchanged_if` -> `FlattenOutcome::Unchanged`, nothing encoded or

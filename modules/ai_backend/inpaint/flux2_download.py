@@ -43,7 +43,11 @@ Main responsibilities:
   the socket;
 - publish a file only once its length matches the size the hub listing announced,
   because a body that ends CLEANLY but short raises nothing anywhere in the stack
-  and would otherwise be renamed to its final name and skipped forever.
+  and would otherwise be renamed to its final name and skipped forever — and,
+  for an LFS file, only once its sha256 matches the listing's digest;
+- survive an unstable network: the shared primitive retries transient failures
+  with backoff and a `Range` resume (a short body included), and every retry is
+  a progress frame whose `label` says so, never a failure.
 
 Key structures:
 - `ModelVariant` — one downloadable variant (repo, destination directory,
@@ -94,9 +98,16 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Protocol
+from typing import Any, Callable, Iterable, Mapping, NamedTuple, Protocol
 
-from ..engines.model_download import discard_staging, download_bearer_to_path, staged_bytes
+from ..engines.model_download import (
+    DownloadCancelled,
+    RetryEvent,
+    download_bearer_to_path,
+    hub_lfs_sha256,
+    retry_progress_label,
+    staged_bytes,
+)
 from ..runtime.paths import side_models_root
 
 log = logging.getLogger(__name__)
@@ -177,25 +188,15 @@ class ProgressCb(Protocol):
     ) -> None: ...
 
 
-class IncompleteDownload(RuntimeError):
-    """A transfer ended without delivering the number of bytes the listing announced.
-
-    Raised by the publish-time gate, so it is always raised BEFORE anything is
-    published. It is a distinct type because `download()` answers it specifically:
-    the staged bytes are discarded and the file is fetched once more from zero,
-    which is the one recovery that covers a stale partial whose remote blob has
-    changed. Any other failure is not retried.
-    """
-
-
 class DownloadCanceled(Exception):
-    """Raised at a chunk boundary when the caller's cancel signal went up.
+    """Raised at a chunk boundary or a retry wait when the caller's cancel signal went up.
 
     The handler maps this to the dispatcher's `Interrupted`. Files already
-    published stay — they are complete and were renamed atomically; the staging
-    `.part` of the file in flight is removed by `download_to_path`'s failure
-    path, which is what makes raising from the progress callback a safe way to
-    stop a multi-gigabyte transfer.
+    published stay — they are complete and were renamed atomically; the bytes of
+    the file in flight are parked by the shared primitive's resumable failure
+    path, so the next run continues them. The shared primitive's own
+    `DownloadCancelled` (raised while it waits out a retry) is translated into
+    this type, so the handler has one cancellation type to answer.
     """
 
 
@@ -472,13 +473,27 @@ def uncensored_encoder_manifest(variant: ModelVariant) -> tuple[ManifestEntry, .
     return (ManifestEntry(str(variant.uncensored_repo), "", TEXT_ENCODER_UNCENSORED_SUBDIR),)
 
 
+class ListedFile(NamedTuple):
+    """One file of a repository listing: its size and, for an LFS file, its sha256.
+
+    `size` is in bytes (`0` when the hub announced none); `sha256` is lowercase
+    hex, `None` for a non-LFS file (small configs), which is then checked by
+    size alone.
+    """
+
+    size: int
+    sha256: str | None = None
+
+
 @dataclass(frozen=True)
 class PlannedFile:
     """One file of the resolved download plan.
 
     `label` is the destination path relative to `model_root()` and is what the
     progress frames carry; `dest` is the absolute path on disk. `size` is the
-    size the repository listing announced, `0` when it announced none.
+    size the repository listing announced, `0` when it announced none;
+    `sha256` the LFS digest it announced, `None` when there is none. Both gate
+    the publish of a downloaded file.
     """
 
     repo: str
@@ -486,6 +501,7 @@ class PlannedFile:
     dest: str
     label: str
     size: int
+    sha256: str | None = None
 
 
 def model_root(variant: ModelVariant) -> Path:
@@ -572,7 +588,7 @@ def is_excluded(path: str) -> bool:
 
 
 def resolve_plan(
-    listings: Mapping[str, Mapping[str, int]],
+    listings: Mapping[str, Mapping[str, ListedFile | int]],
     *,
     variant: ModelVariant,
     uncensored: bool,
@@ -580,8 +596,9 @@ def resolve_plan(
 ) -> list[PlannedFile]:
     """Resolve the manifest prefixes against live repository listings.
 
-    `listings` maps a repository id to `{path inside the repo: size in bytes}`,
-    which is exactly what `repo_listing()` returns. The result is ordered by
+    `listings` maps a repository id to `{path inside the repo: ListedFile}`,
+    which is exactly what `repo_listing()` returns (a bare `int` size is also
+    accepted and means "no digest"). The result is ordered by
     destination so a run is reproducible and a resumed run continues in the same
     order.
 
@@ -609,12 +626,15 @@ def resolve_plan(
                 continue
             matched += 1
             label = entry.destination(path)
+            listed = listing[path]
+            size, sha256 = (listed.size, listed.sha256) if isinstance(listed, ListedFile) else (listed, None)
             planned[label] = PlannedFile(
                 repo=entry.repo,
                 source=path,
                 dest=str(base.joinpath(*label.split("/"))),
                 label=label,
-                size=max(0, int(listing.get(path) or 0)),
+                size=max(0, int(size or 0)),
+                sha256=sha256,
             )
         if matched == 0:
             raise RuntimeError(
@@ -763,8 +783,8 @@ def probe_repo_access(repo: str, token: str) -> tuple[str, str]:
     return STATE_OK, ""
 
 
-def repo_listing(repo: str, token: str) -> dict[str, int]:
-    """`{path inside the repo: size in bytes}` for every file of `repo`.
+def repo_listing(repo: str, token: str) -> dict[str, ListedFile]:
+    """`{path inside the repo: ListedFile(size, sha256)}` for every file of `repo`.
 
     One metadata request, no file bytes. The token is filtered through
     `repo_token`: a gated repository gets it (a private one would need it), a
@@ -778,16 +798,18 @@ def repo_listing(repo: str, token: str) -> dict[str, int]:
     from huggingface_hub import HfApi
 
     info = HfApi(token=repo_token(repo, token) or None).model_info(repo, files_metadata=True)
-    listing: dict[str, int] = {}
+    listing: dict[str, ListedFile] = {}
     for sibling in info.siblings or []:
         name = getattr(sibling, "rfilename", None)
         if not name:
             continue
-        listing[str(name)] = max(0, int(getattr(sibling, "size", 0) or 0))
+        listing[str(name)] = ListedFile(
+            max(0, int(getattr(sibling, "size", 0) or 0)), hub_lfs_sha256(sibling)
+        )
     return listing
 
 
-def fetch_listings(repos: Iterable[str], token: str) -> dict[str, dict[str, int]]:
+def fetch_listings(repos: Iterable[str], token: str) -> dict[str, dict[str, ListedFile]]:
     """Listings of every repository in `repos`, keyed by repository id."""
     return {repo: repo_listing(repo, token) for repo in repos}
 
@@ -1012,16 +1034,18 @@ def download(
     service lock, because a multi-gigabyte transfer must never block `health()`,
     `unload()` or an eviction callback.
 
-    `should_cancel()` is polled before every file and at every chunk boundary.
-    Files already published stay; the staging file of the one in flight is
-    removed by the shared primitive.
+    `should_cancel()` is polled before every file, at every chunk boundary and
+    during every retry wait. Files already published stay; the bytes of the one
+    in flight are parked for the next run.
 
     # Errors
     Raises `ValueError` for an unknown variant, for an uncensored request on a
     variant that has no uncensored encoder, and for an empty token on a gated
     request; `DownloadCanceled` when the caller canceled; and `RuntimeError` for
     an inaccessible repository, a manifest prefix that resolved to nothing,
-    insufficient free space, or a transport failure.
+    insufficient free space, or a transport failure (permanent, or transient
+    with the retry budget exhausted — the `engines.model_download.DownloadError`
+    family).
     """
     selected = resolve_variant(variant)
     require_uncensored_supported(selected, uncensored)
@@ -1065,7 +1089,16 @@ def download(
             progress_callback=progress_callback,
             should_cancel=should_cancel,
         )
-        ran = _fetch_one(item, token=token, on_chunk=on_chunk)
+        on_retry = _retry_reporter(
+            item,
+            offset=overall_done,
+            total=total,
+            throttle=throttle,
+            progress_callback=progress_callback,
+        )
+        ran = _fetch_one(
+            item, token=token, on_chunk=on_chunk, on_retry=on_retry, should_cancel=should_cancel
+        )
         if ran:
             downloaded += _file_size_on_disk(item)
         else:
@@ -1102,11 +1135,12 @@ def _chunk_reporter(
     the frame's `step` stays an OVERALL figure while `file_step` describes the
     file in flight.
 
-    The returned callable RAISES `DownloadCanceled` when the caller canceled.
-    That is deliberate and is the only thing that actually stops a multi-gigabyte
-    transfer: `stream_response_to_file` has no cancel hook, but an exception from
-    the chunk callback propagates out of the streaming loop and
-    `download_to_path` removes the staging file on the way out.
+    The returned callable RAISES `DownloadCanceled` when the caller canceled, so
+    a cancel surfaces as this domain's own error type at the next chunk. The
+    shared transfer (`download_bearer_to_path`) also polls `should_cancel`
+    itself, per chunk and during backoff waits; either way the exception
+    propagates out of the streaming loop and the staged bytes are PARKED for a
+    resume, not deleted.
     """
 
     def on_chunk(done: int, expected: int) -> None:
@@ -1126,11 +1160,48 @@ def _chunk_reporter(
     return on_chunk
 
 
+def _retry_reporter(
+    item: PlannedFile,
+    *,
+    offset: int,
+    total: int,
+    throttle: ProgressThrottle,
+    progress_callback: ProgressCb | None,
+) -> Callable[[RetryEvent], None]:
+    """Retry sink: one FORCED progress frame whose `label` announces the retry.
+
+    The frame keeps the ordinary shape — `step` / `file_step` are the bytes
+    already staged, which the retry resumes — so no consumer has to learn a new
+    field; only the `label` text changes. Forced, because a retry wait is exactly
+    when the throttle would otherwise leave the bar silent for up to a minute.
+    """
+
+    def on_retry(event: RetryEvent) -> None:
+        if progress_callback is None:
+            return
+        current = offset + event.staged_bytes
+        throttle.should_emit(current, force=True)
+        file_name = item.label.rsplit("/", 1)[-1]
+        progress_callback(
+            PROGRESS_PHASE,
+            current,
+            total,
+            retry_progress_label(item.label, event),
+            file_step=event.staged_bytes,
+            file_total=item.size,
+            file_label=file_name,
+        )
+
+    return on_retry
+
+
 def _fetch_one(
     item: PlannedFile,
     *,
     token: str,
     on_chunk: Callable[[int, int], None],
+    on_retry: Callable[[RetryEvent], None],
+    should_cancel: Callable[[], bool] | None,
 ) -> bool:
     """Fetch one planned file, resuming what an earlier run left. Returns whether it ran.
 
@@ -1139,78 +1210,34 @@ def _fetch_one(
     with no `Authorization` header even when the request carries a token. The
     decision is per FILE because the plan may mix repositories.
 
-    Resumable: a connection that dropped at 8 of 9.8 GB leaves those bytes parked
-    beside the destination, and this run continues from them instead of paying for
-    them twice. On a 35 GB plan over a flaky link that is the difference between a
-    feature that finishes and one that never does.
-
-    The publish-time size gate stays the last word, and its ONE recovery lives
-    here: a length mismatch discards the staged bytes and refetches the file from
-    zero exactly once. That covers the case the resume cannot — a stale partial
-    whose remote blob has changed underneath it — without an ETag/`If-Range`
-    sidecar, which the size check plus one clean retry makes unnecessary.
+    Resume, retry and the size gate all live in the shared primitive: a dropped
+    connection or a body that ended cleanly but short is resumed with `Range`
+    from the staged bytes (a short body is not proof of wrong bytes), and only
+    bytes PROVEN wrong — more than the announced size, or a `206` announcing a
+    different total, or a complete file whose sha256 differs from the listing's
+    LFS digest (`item.sha256`) — are discarded. `item.size` is the size gate (`0` when the
+    listing gave no size; `is_complete_on_disk` logs that on the planning side).
 
     # Errors
-    Raises `RuntimeError` when the second, from-zero attempt is also incomplete,
-    naming the file. Every other failure propagates unretried.
+    `DownloadCanceled` when the caller canceled during a retry wait (a cancel at
+    a chunk boundary already raises it from `on_chunk`); everything else
+    propagates from the shared primitive.
     """
-    verify = _size_verifier(item)
     url = _file_url(item)
     sent = repo_token(item.repo, token)
     try:
         return download_bearer_to_path(
-            url, item.dest, on_chunk, token=sent, verify=verify, resumable=True
+            url,
+            item.dest,
+            token=sent,
+            expected_size=item.size,
+            expected_sha256=item.sha256,
+            should_cancel=should_cancel,
+            on_progress=on_chunk,
+            on_retry=on_retry,
         )
-    except IncompleteDownload as first:
-        log.warning(
-            "FLUX.2 klein: %s — %s Повторная загрузка с нуля.",
-            item.label,
-            str(first).replace("\n", " "),
-        )
-
-    # The parked bytes are not merely incomplete, they are unusable: resuming from
-    # them again could only reproduce the same wrong length.
-    discard_staging(item.dest)
-    try:
-        return download_bearer_to_path(
-            url, item.dest, on_chunk, token=sent, verify=verify, resumable=True
-        )
-    except IncompleteDownload as second:
-        raise RuntimeError(
-            f"Не удалось полностью скачать файл модели: {item.label}\n"
-            f"{second}\n"
-            "Попытка повторной загрузки с нуля тоже завершилась неполным файлом — "
-            "проверьте соединение или прокси и повторите позже."
-        ) from second
-
-
-def _size_verifier(item: PlannedFile) -> Callable[[Path], None] | None:
-    """Integrity gate for `item`: the staged length must equal the announced size.
-
-    Returns `None` when the listing announced no size, because there is then
-    nothing to compare against; `is_complete_on_disk` logs that fallback on the
-    planning side, so the same file is not reported twice per run.
-
-    The gate exists because neither `stream_response_to_file` nor `requests`
-    treats a SHORT body that ends cleanly as an error: a proxy or transport that
-    closes without raising otherwise reaches the publish as a success, the
-    truncated file is renamed to its final name, and every later run skips it.
-    `download_to_path` runs this before the rename and deletes the staging file
-    when it raises, so a rejected transfer leaves nothing behind.
-    """
-    if item.size <= 0:
-        return None
-
-    def verify(staging: Path) -> None:
-        actual = int(os.path.getsize(staging))
-        if actual == item.size:
-            return
-        raise IncompleteDownload(
-            f"Файл модели скачан не полностью: {item.label}\n"
-            f"Ожидалось: {item.size} Б, получено: {actual} Б."
-        )
-
-    return verify
+    except DownloadCancelled as exc:
+        raise DownloadCanceled("Загрузка модели FLUX.2 klein отменена.") from exc
 
 
 def _file_url(item: PlannedFile) -> str:

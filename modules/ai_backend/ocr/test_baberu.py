@@ -19,7 +19,9 @@ Main responsibilities:
   unloads the old key;
 - session placement: vision on the selected provider (TensorRT -> CUDA),
   decoders on CPU, CPU fallback with a WARN on an unavailable provider, a
-  failed build or a silent onnxruntime drop (fake `onnxruntime` module).
+  failed build or a silent onnxruntime drop (fake `onnxruntime` module);
+- health never waits for a session build that holds the instance lock (S-014):
+  it answers during the build and then reflects ready or the load error.
 
 Notes:
 The default tests need no model and no onnxruntime session: the runtime class
@@ -33,6 +35,7 @@ from __future__ import annotations
 import io
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Any
@@ -362,6 +365,98 @@ class LeaseProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.service.recognize_image_bytes(_png_bytes(), model_files={"vision": "rel"})
         self.assertEqual(self.manager._entries, {})
+
+
+class _BlockingRuntime(_StubRuntime):
+    """`_StubRuntime` whose construction (the session build) blocks on `gate`."""
+
+    started = threading.Event()
+    gate = threading.Event()
+
+    def __init__(self, files: BaberuFiles, settings: ProviderSettings) -> None:
+        _BlockingRuntime.started.set()
+        if not _BlockingRuntime.gate.wait(10.0):
+            raise RuntimeError("test gate never opened")
+        super().__init__(files, settings)
+
+
+class HealthDuringLoadTests(unittest.TestCase):
+    """`health()` answers while a session build holds `_lock` (S-014)."""
+
+    def setUp(self) -> None:
+        _StubRuntime.fail_load = False
+        _StubRuntime.fail_inference = False
+        _StubRuntime.on_recognize = None
+        _StubRuntime.loads = []
+        _BlockingRuntime.started = threading.Event()
+        _BlockingRuntime.gate = threading.Event()
+        # Never leave a worker blocked on the gate if an assertion fails.
+        self.addCleanup(lambda: _BlockingRuntime.gate.set())
+        patcher = mock.patch.object(baberu_module, "_BaberuOnnxRuntime", _BlockingRuntime)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self._tmp = tempfile.TemporaryDirectory(prefix="ms_baberu_health_")
+        self.addCleanup(self._tmp.cleanup)
+        self.service = BaberuOcrService(LoadedModelManager(), _FakeDeviceService())
+        self.errors: list[BaseException] = []
+
+    def _files(self) -> dict[str, str]:
+        paths: dict[str, str] = {}
+        for name in ("vision", "prefill", "step", "vocab"):
+            path = Path(self._tmp.name) / f"{name}.bin"
+            path.write_bytes(b"x")
+            paths[name] = str(path)
+        return paths
+
+    def _start_request(self) -> threading.Thread:
+        files = self._files()
+
+        def run() -> None:
+            try:
+                self.service.recognize_image_bytes(_png_bytes(), model_files=files)
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the test
+                self.errors.append(exc)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        self.assertTrue(_BlockingRuntime.started.wait(5.0), "the session build never started")
+        return worker
+
+    def _health_within(self, seconds: float) -> dict[str, Any]:
+        results: list[dict[str, Any]] = []
+        reader = threading.Thread(target=lambda: results.append(self.service.health()), daemon=True)
+        reader.start()
+        reader.join(seconds)
+        self.assertFalse(reader.is_alive(), "health() blocked on the instance lock")
+        return results[0]
+
+    def test_health_answers_during_the_build_then_reports_ready(self) -> None:
+        worker = self._start_request()
+        self.assertTrue(self.service._lock.locked(), "the build must hold the instance lock")
+        self.assertEqual(
+            self._health_within(2.0),
+            {"ready": False, "device": None, "last_error": None},
+        )
+        _BlockingRuntime.gate.set()
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.errors, [])
+        self.assertEqual(
+            self.service.health(),
+            {"ready": True, "device": "CPUExecutionProvider:0", "last_error": None},
+        )
+
+    def test_health_reports_the_load_error_after_a_failed_build(self) -> None:
+        _StubRuntime.fail_load = True
+        worker = self._start_request()
+        self.assertFalse(self._health_within(2.0)["ready"])
+        _BlockingRuntime.gate.set()
+        worker.join(5.0)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(self.errors), 1)
+        health = self.service.health()
+        self.assertFalse(health["ready"])
+        self.assertIn("stub load failure", health["last_error"])
 
 
 class _FakeNode:

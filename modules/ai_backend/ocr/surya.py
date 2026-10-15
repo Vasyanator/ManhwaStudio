@@ -16,14 +16,21 @@ Key runtime options:
 - `drop_repeated_text`: suppress repeated decoded text;
 - `max_sliding_window` / `max_tokens`: optional decoder limits.
 
+Checkpoints:
+Rust downloads both checkpoints (pinned external catalog) and sends their
+absolute directories with every request (`surya_recognition_dir`,
+`surya_detection_dir`). The service proves each directory complete
+(`engines.surya_checkpoints.require_local_checkpoint`), points Surya's
+settings at it and passes it as `checkpoint=`, so a load never touches the
+network; a missing or incomplete directory is a "not downloaded" error.
+
 Notes:
 Surya owns the host->device transfer of its own weights, so every predictor
 construction here is wrapped in `runtime.rocm_mmap_transfer.patched_module_to()`;
-see `_ensure_recognition_loaded_locked` for why. The checkpoint is downloaded
-before that block through `engines.surya_checkpoints.ensure_checkpoint_downloaded`,
-because the patch is process-global and must never be held around network waits. Predictor
-loads are logged with their duration so a slow start can be attributed to weight
-loading rather than package import.
+see `_ensure_recognition_loaded_locked` for why. The presence check runs before
+that block, which covers the weight transfer only. Predictor loads are logged
+with their duration so a slow start can be attributed to weight loading rather
+than package import.
 """
 
 from __future__ import annotations
@@ -45,14 +52,15 @@ try:
 except Exception:
     UserConfig = None
 
-from ..engines.surya_checkpoints import ensure_checkpoint_downloaded
+from ..engines.surya_checkpoints import point_settings_at, require_local_checkpoint
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.rocm_mmap_transfer import patched_module_to
 
 log = logging.getLogger(__name__)
 
-# Name the recognition and detection models carry in checkpoint download errors.
-FOUNDATION_CHECKPOINT_LABEL = "Surya OCR foundation"
+# Name the recognition and detection models carry in "not downloaded" errors.
+FOUNDATION_CHECKPOINT_LABEL = "Surya OCR recognition"
 DETECTION_CHECKPOINT_LABEL = "Surya OCR detection"
 
 SURYA_TASK_OCR_WITH_BOXES = "ocr_with_boxes"
@@ -97,23 +105,44 @@ class SuryaOcrService:
         self._recognition_predictor = None
         self._detection_predictor = None
         self._device: str | None = None
+        # Checkpoint directories the resident predictors were built from; part
+        # of their identity next to `_device`.
+        self._recognition_dir: str | None = None
+        self._detection_dir: str | None = None
         self._last_error: str | None = None
+        # Published copy of the health fields; `health()` never takes `_lock`,
+        # which a predictor load holds (S-014).
+        self._health = HealthSnapshot(ready=False, device=None, detector_ready=False, last_error=None)
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "ready": self._recognition_predictor is not None,
-                "device": self._device,
-                "detector_ready": self._detection_predictor is not None,
-                "last_error": self._last_error,
-            }
+        """Return `{"ready", "device", "detector_ready", "last_error"}` for the health snapshot.
+
+        Reads only the published snapshot, so it answers while a predictor load
+        holds the instance lock.
+        """
+        return self._health.read()
+
+    def _publish_health_locked(self) -> None:
+        """Republish the health fields from the guarded state; caller holds `self._lock`."""
+        self._health.publish(
+            ready=self._recognition_predictor is not None,
+            device=self._device,
+            detector_ready=self._detection_predictor is not None,
+            last_error=self._last_error,
+        )
 
     def warmup(
         self,
         *,
+        recognition_dir: str,
+        detection_dir: str,
         task_name: str = SURYA_TASK_OCR_WITHOUT_BOXES,
         recognize_math: bool = False,
     ) -> None:
+        """Load the predictors for `task_name` by recognizing a blank image.
+
+        The directories are those of `recognize_image_bytes`; raises what it raises.
+        """
         from PIL import Image
 
         dummy = Image.new("RGB", (32, 32), (255, 255, 255))
@@ -121,6 +150,8 @@ class SuryaOcrService:
         dummy.save(encoded, format="PNG")
         self.recognize_image_bytes(
             encoded.getvalue(),
+            recognition_dir=recognition_dir,
+            detection_dir=detection_dir,
             task_name=task_name,
             recognize_math=recognize_math,
         )
@@ -129,6 +160,8 @@ class SuryaOcrService:
         self,
         image_bytes: bytes,
         *,
+        recognition_dir: str,
+        detection_dir: str,
         join_newlines: bool = True,
         reflect_strings: bool = False,
         task_name: str = SURYA_TASK_OCR_WITHOUT_BOXES,
@@ -138,6 +171,14 @@ class SuryaOcrService:
         max_sliding_window: int | None = None,
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
+        """Recognize `image_bytes` and return `{"lines", "text"}`.
+
+        `recognition_dir` (foundation + recognition checkpoint) and
+        `detection_dir` (line detector, read only for `ocr_with_boxes`) are
+        absolute directories Rust downloaded. Raises `ValueError` /
+        `FileNotFoundError` ("not downloaded") for a bad directory and
+        `RuntimeError` for a missing package or a failed load.
+        """
         normalized_task = _normalize_task_name(task_name)
         image = self._decode_image(image_bytes)
         selected_device = _resolve_selected_backend_device(self._device or "cpu")
@@ -158,14 +199,14 @@ class SuryaOcrService:
 
         try:
             with self._lock:
-                recognition_predictor = self._ensure_recognition_loaded_locked(selected_device)
+                recognition_predictor = self._ensure_recognition_loaded_locked(selected_device, recognition_dir)
             if foundation_lease.needs_load:
                 foundation_lease.mark_loaded(
                     unload_callback=lambda: self._unload_foundation_key(foundation_key)
                 )
             with self._lock:
                 detection_predictor = (
-                    self._ensure_detection_loaded_locked(selected_device)
+                    self._ensure_detection_loaded_locked(selected_device, detection_dir)
                     if detector_needed
                     else None
                 )
@@ -216,45 +257,51 @@ class SuryaOcrService:
             "text": output_text.strip(),
         }
 
-    def _ensure_recognition_loaded_locked(self, device: str):
-        """Return the recognition predictor for `device`, loading it if needed.
+    def _ensure_recognition_loaded_locked(self, device: str, recognition_dir: str):
+        """Return the recognition predictor for `device` and `recognition_dir`, loading it if needed.
 
         Caller must hold `self._lock`. Reloads from scratch when the previously
-        loaded predictors live on another device.
+        loaded predictors live on another device or came from another directory.
 
         # Raises
-        `RuntimeError` if the Surya package is missing or the load fails; in
-        that case the service is left with no predictors and `_last_error` set.
+        `ValueError` / `FileNotFoundError` ("not downloaded") for an invalid or
+        incomplete `recognition_dir`, `RuntimeError` if the Surya package is
+        missing or the load fails; in every case the service is left with no
+        recognition predictors and `_last_error` set.
         """
         if (
             self._foundation_predictor is not None
             and self._recognition_predictor is not None
             and self._device == device
+            and self._recognition_dir == recognition_dir
         ):
             return self._recognition_predictor
 
-        if self._device is not None and self._device != device:
+        if self._device is not None and (self._device != device or self._recognition_dir != recognition_dir):
             self._drop_all_predictors_locked()
+
+        try:
+            checkpoint = require_local_checkpoint(recognition_dir, label=FOUNDATION_CHECKPOINT_LABEL)
+        except Exception as exc:
+            self._last_error = str(exc)
+            self._publish_health_locked()
+            raise
 
         try:
             from surya.foundation import FoundationPredictor  # type: ignore
             from surya.recognition import RecognitionPredictor  # type: ignore
         except Exception as exc:
             self._last_error = f"Surya OCR package is not available: {exc}"
+            self._publish_health_locked()
             raise RuntimeError(self._last_error) from exc
 
-        log.info("Surya OCR recognition predictor load start device=%s", device)
+        log.info("Surya OCR recognition predictor load start device=%s checkpoint=%s", device, checkpoint)
         started_at = time.perf_counter()
         try:
-            # Download first, load second. `FoundationPredictor` resolves its
-            # `s3://` checkpoint lazily inside `from_pretrained` (3 attempts with
-            # a 5 s sleep between them), which on a clean install is minutes of
-            # network wait for ~1.4 GiB. The staging patch below is
-            # process-global and its contract covers weight transfers only, so
-            # the download must not happen while it is installed.
-            ensure_checkpoint_downloaded(
-                self._foundation_checkpoint_name(), label=FOUNDATION_CHECKPOINT_LABEL
-            )
+            # The settings AND the explicit `checkpoint=`: the loader reads the
+            # argument, and the settings cover any library code that reads its
+            # default instead (an `s3://` default would be downloaded).
+            point_settings_at(recognition_dir=checkpoint)
             # Surya loads the checkpoint and moves it to the GPU inside its own
             # loader (`surya/foundation/loader.py`: `from_pretrained(...).to(dev)`),
             # so there is no CPU-resident module we could hand to
@@ -272,13 +319,14 @@ class SuryaOcrService:
             # token tensors that a later move would leave behind.
             # The patch is process-global, so it is held around loading only.
             with patched_module_to():
-                foundation_predictor = FoundationPredictor(device=device)
+                foundation_predictor = FoundationPredictor(checkpoint=checkpoint, device=device)
                 recognition_predictor = RecognitionPredictor(foundation_predictor)
         except Exception as exc:
             self._foundation_predictor = None
             self._recognition_predictor = None
             self._device = None
             self._last_error = f"Surya OCR init failed: {exc}"
+            self._publish_health_locked()
             log.error(
                 "Surya OCR recognition predictor load failed device=%s duration_s=%.2f error=%s",
                 device,
@@ -295,45 +343,60 @@ class SuryaOcrService:
         self._foundation_predictor = foundation_predictor
         self._recognition_predictor = recognition_predictor
         self._device = device
+        self._recognition_dir = checkpoint
         self._last_error = None
+        self._publish_health_locked()
         return recognition_predictor
 
-    def _ensure_detection_loaded_locked(self, device: str):
+    def _ensure_detection_loaded_locked(self, device: str, detection_dir: str):
         """Return the `ocr_with_boxes` line detector, loading it if needed.
 
         Caller must hold `self._lock`. The detector shares `self._device` with
-        the recognition predictors, so it is only reused when both agree.
+        the recognition predictors, so it is only reused when both agree and it
+        came from `detection_dir`.
 
         # Raises
-        `RuntimeError` if the Surya detection package is missing or the load
-        fails; `_last_error` is set and no detector is retained.
+        `ValueError` / `FileNotFoundError` ("not downloaded") for an invalid or
+        incomplete `detection_dir`, `RuntimeError` if the Surya detection package
+        is missing or the load fails; `_last_error` is set and no detector is
+        retained.
         """
-        if self._detection_predictor is not None and self._device == device:
+        if (
+            self._detection_predictor is not None
+            and self._device == device
+            and self._detection_dir == detection_dir
+        ):
             return self._detection_predictor
+        self._detection_predictor = None
+        self._detection_dir = None
+
+        try:
+            checkpoint = require_local_checkpoint(detection_dir, label=DETECTION_CHECKPOINT_LABEL)
+        except Exception as exc:
+            self._last_error = str(exc)
+            self._publish_health_locked()
+            raise
 
         try:
             from surya.detection import DetectionPredictor  # type: ignore
         except Exception as exc:
             self._last_error = f"Surya detection package is not available: {exc}"
+            self._publish_health_locked()
             raise RuntimeError(self._last_error) from exc
 
-        log.info("Surya OCR detection predictor load start device=%s", device)
+        log.info("Surya OCR detection predictor load start device=%s checkpoint=%s", device, checkpoint)
         started_at = time.perf_counter()
         try:
-            # Same ordering rule as in `_ensure_recognition_loaded_locked`: the
-            # `s3://` checkpoint is fetched before the patch is installed, so the
-            # process-global patch never wraps a network wait.
-            ensure_checkpoint_downloaded(
-                self._detection_checkpoint_name(), label=DETECTION_CHECKPOINT_LABEL
-            )
+            point_settings_at(detection_dir=checkpoint)
             # Same ROCm mmap->GPU stall as in `_ensure_recognition_loaded_locked`:
             # `surya/detection/loader.py` also moves the checkpoint to the device
             # itself, so the transfer is only reachable through the patch.
             with patched_module_to():
-                self._detection_predictor = DetectionPredictor(device=device)
+                self._detection_predictor = DetectionPredictor(checkpoint=checkpoint, device=device)
         except Exception as exc:
             self._detection_predictor = None
             self._last_error = f"Surya detection init failed: {exc}"
+            self._publish_health_locked()
             log.error(
                 "Surya OCR detection predictor load failed device=%s duration_s=%.2f error=%s",
                 device,
@@ -347,7 +410,9 @@ class SuryaOcrService:
             device,
             time.perf_counter() - started_at,
         )
+        self._detection_dir = checkpoint
         self._last_error = None
+        self._publish_health_locked()
         return self._detection_predictor
 
     def _recognize_with_predictors(
@@ -423,29 +488,21 @@ class SuryaOcrService:
             if self._detection_predictor is None:
                 return False
             self._detection_predictor = None
+            self._detection_dir = None
+            self._publish_health_locked()
             _clear_torch_cache()
             self._model_manager.mark_unloaded(model_key)
             return True
 
     def _drop_all_predictors_locked(self) -> None:
+        """Forget every predictor and the device; caller holds `self._lock`."""
         self._foundation_predictor = None
         self._recognition_predictor = None
         self._detection_predictor = None
         self._device = None
-
-    @staticmethod
-    def _foundation_checkpoint_name() -> str:
-        """Checkpoint `FoundationPredictor()` resolves when given no explicit one."""
-        from surya.settings import settings  # type: ignore
-
-        return str(settings.FOUNDATION_MODEL_CHECKPOINT)
-
-    @staticmethod
-    def _detection_checkpoint_name() -> str:
-        """Checkpoint `DetectionPredictor()` resolves when given no explicit one."""
-        from surya.settings import settings  # type: ignore
-
-        return str(settings.DETECTOR_MODEL_CHECKPOINT)
+        self._recognition_dir = None
+        self._detection_dir = None
+        self._publish_health_locked()
 
     @classmethod
     def _foundation_model_key(cls, device: str) -> str:

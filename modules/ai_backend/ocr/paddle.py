@@ -35,6 +35,7 @@ from ..engines.paddle_onnx import (
     resolve_models_root,
     resolve_provider_settings,
 )
+from ..runtime.health_snapshot import HealthSnapshot
 
 
 class PaddleOcrService:
@@ -45,26 +46,44 @@ class PaddleOcrService:
         self._provider: str | None = None
         self._device_id: str | None = None
         self._last_error: str | None = None
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a session load and inference hold (S-014).
+        self._health = HealthSnapshot()
+        self._publish_health_locked()
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            model_key = self._model_key or DEFAULT_REC_MODEL_KEY
-            provider = self._provider or "CPUExecutionProvider"
-            device_id = self._device_id or "0"
-            try:
-                model_paths = resolve_model_paths(model_key)
-                model_exists = model_paths.rec_model_path.is_file()
-            except Exception:
-                model_exists = False
-            return {
-                "ready": self._model_key is not None and self._last_error is None,
-                "model": model_key,
-                "provider": provider,
-                "device_id": device_id,
-                "models_root": str(resolve_models_root()),
-                "model_exists": model_exists,
-                "last_error": self._last_error,
-            }
+        """Return the PaddleOCR health entry for the backend snapshot.
+
+        `ready`/`model`/`provider`/`device_id`/`last_error` come from the
+        published snapshot; `models_root` and `model_exists` are filesystem
+        probes taken here, outside any service lock, so this answers while a
+        session load or an inference holds the instance lock.
+        """
+        fields = self._health.read()
+        try:
+            model_paths = resolve_model_paths(fields["model"])
+            model_exists = model_paths.rec_model_path.is_file()
+        except Exception:
+            model_exists = False
+        return {
+            "ready": fields["ready"],
+            "model": fields["model"],
+            "provider": fields["provider"],
+            "device_id": fields["device_id"],
+            "models_root": str(resolve_models_root()),
+            "model_exists": model_exists,
+            "last_error": fields["last_error"],
+        }
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock` (or is `__init__`)."""
+        self._health.publish(
+            ready=self._model_key is not None and self._last_error is None,
+            model=self._model_key or DEFAULT_REC_MODEL_KEY,
+            provider=self._provider or "CPUExecutionProvider",
+            device_id=self._device_id or "0",
+            last_error=self._last_error,
+        )
 
     def warmup(self, *, lang: str = DEFAULT_REC_MODEL_KEY, device: str | None = None) -> None:
         dummy = np.zeros((16, 16, 3), dtype="uint8")
@@ -102,12 +121,14 @@ class PaddleOcrService:
                 self._provider = provider_settings.provider
                 self._device_id = provider_settings.device_id
                 self._last_error = None
+                self._publish_health_locked()
                 return {
                     "lines": lines,
                     "text": output_text.strip(),
                 }
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 raise
 
     @staticmethod

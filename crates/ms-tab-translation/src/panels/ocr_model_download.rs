@@ -2,30 +2,42 @@
 File: crates/ms-tab-translation/src/panels/ocr_model_download.rs
 
 Purpose:
-The OCR panel's download block for an external OCR model (Baberu OCR, the selected
-PaddleOCR-VL variant): install status, the outcome of the last unsuccessful download, the
-"Download (size)" / "Resume download" button, a progress bar with Cancel while a download
-runs (its text also shows the automatic retry countdown after a network failure), and — while ANOTHER model downloads — a line naming it with its progress over a
-disabled download button. It only draws and returns a `ModelDownloadAction`; the tab hands
-the action to `OcrModelDownloadController`.
+The download / verify block of an app-managed external model bundle (`ocr_model_download` bundles:
+Baberu OCR, the selected PaddleOCR-VL variant, the EasyOCR model of the selected languages,
+the two Surya OCR checkpoints, the Surya text-detection checkpoint; the Cleaning tab draws it
+for its SDXL configs): install status, the outcome of the last unsuccessful download, the
+"Download (size)" / "Resume download" button, a "Verify files" button once the bundle is
+installed (hashes every file against its pin: the repair path for a damaged file the stat-only
+probe cannot see; it ends with an intact / N-files-removed notice), a progress bar with Cancel
+while a download or verify runs (its text also shows the automatic retry countdown after a
+network failure), and — while ANOTHER bundle's job runs — a line naming it with its progress
+over the disabled button.
+It only draws and returns a `ModelDownloadAction`; the caller hands the action to
+`OcrModelDownloadController`.
 
 Key items:
 - `ModelDownloadAction`: what the user asked for this frame.
 - `download_block_view()`: pure snapshot -> (lines, progress, button) mapping, unit-tested.
-- `draw_ocr_model_download()`: renders that view.
-- `load_blocked_reason()`: why the panel's Load button is disabled for the model's state.
+- `draw_ocr_model_download()`: renders that view (`pub`: the Cleaning tab draws it too).
+- `load_blocked_reason()`: why a Load / Run button is disabled for the bundle's state.
+- `external_model_display_name()`: the user-facing name of every catalog spec.
 
 Notes:
 - Download / resume captions come from `ocr_model_download::offered_download_label`, the
-  same owner the OCR "model is not downloaded" error uses, so the error names exactly the
+  same owner the "model is not downloaded" errors use, so an error names exactly the
   button drawn here.
 */
 
 use crate::ocr_model_download::{
-    DownloadNotice, OcrModelDownloadState, OcrModelPanelSnapshot, OtherDownload, format_bytes, offered_download_label,
+    DownloadNotice, JobKind, OcrModelDownloadState, OcrModelPanelSnapshot, OtherDownload, download_button_label, format_bytes,
+    offered_download_label,
 };
+use ms_sysprobe::ai_models::easyocr::{EasyOcrScript, easyocr_spec};
 use ms_sysprobe::ai_models::external::{ExternalDownloadPhase, ExternalDownloadProgress, ExternalModelSpec};
-use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant};
+use ms_sysprobe::ai_models::external_catalog::{
+    BABERU_OCR, PaddleVlVariant, SDXL_CONFIG_BASE, SDXL_CONFIG_INPAINT, SDXL_INPAINT_FP16, SURYA_DETECTION_2025_05_07,
+    SURYA_RECOGNITION_2025_09_23,
+};
 
 /// The user's request from the download block in this frame.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -35,6 +47,8 @@ pub enum ModelDownloadAction {
     None,
     /// Start (or resume) downloading the shown model.
     Download,
+    /// Verify the installed files of the shown model against their pins.
+    Verify,
     /// Cancel the running download.
     Cancel,
 }
@@ -68,31 +82,53 @@ struct DownloadBlockView {
 }
 
 /// Display name of an external model spec for user-facing text: the engine's product name
-/// for Baberu OCR, the localized variant label for a PaddleOCR-VL variant.
-fn external_model_display_name(spec: &ExternalModelSpec) -> String {
+/// for Baberu OCR, the localized variant label for a PaddleOCR-VL variant, "EasyOCR" with the
+/// recognizer file of its script, localized names for the Surya checkpoints and the SDXL
+/// downloads; the spec id for a spec this table does not know (logged once per call site
+/// would be noise: the id is the diagnostic itself).
+#[must_use]
+pub fn external_model_display_name(spec: &ExternalModelSpec) -> String {
     if spec.id == BABERU_OCR.id {
         // Product name, not translated (the engine selector shows the same literal).
         return "Baberu OCR".to_owned();
     }
-    PaddleVlVariant::ALL
-        .into_iter()
-        .find(|variant| variant.spec().id == spec.id)
-        .map_or_else(|| spec.id.to_owned(), |variant| crate::panels::ocr::paddle_vl_variant_label(variant).to_owned())
+    if let Some(variant) = PaddleVlVariant::ALL.into_iter().find(|variant| variant.spec().id == spec.id) {
+        return crate::panels::ocr::paddle_vl_variant_label(variant).to_owned();
+    }
+    if let Some(script) = EasyOcrScript::ALL.into_iter().find(|script| easyocr_spec(*script).id == spec.id) {
+        return tf!("translation.ocr_model.easyocr_model_name", file = script.recognizer_file());
+    }
+    let key = match spec.id {
+        id if id == SURYA_DETECTION_2025_05_07.id => "translation.ocr_model.surya_detection_name",
+        id if id == SURYA_RECOGNITION_2025_09_23.id => "translation.ocr_model.surya_recognition_name",
+        id if id == SDXL_CONFIG_BASE.id => "translation.ocr_model.sdxl_config_base_name",
+        id if id == SDXL_CONFIG_INPAINT.id => "translation.ocr_model.sdxl_config_inpaint_name",
+        id if id == SDXL_INPAINT_FP16.id => "translation.ocr_model.sdxl_inpaint_fp16_name",
+        other => return other.to_owned(),
+    };
+    // The key is chosen at runtime from the table above, so `resolve_key` replaces `t!`.
+    ms_i18n::resolve_key(key).to_string()
 }
 
-/// The line naming the other model's running download with its byte progress.
+/// Display name of a bundle: its specs' names joined with " + ".
+fn bundle_display_name(specs: &[&'static ExternalModelSpec]) -> String {
+    specs.iter().map(|spec| external_model_display_name(spec)).collect::<Vec<_>>().join(" + ")
+}
+
+/// The line naming the other bundle's running download / verify with its byte progress.
 fn other_download_line(other: &OtherDownload) -> String {
-    tf!(
-        "translation.ocr_model.other_download_status",
-        name = external_model_display_name(other.spec),
-        done = format_bytes(other.progress.total_done),
-        total = format_bytes(other.progress.total_bytes)
-    )
+    let name = bundle_display_name(&other.specs);
+    let done = format_bytes(other.progress.total_done);
+    let total = format_bytes(other.progress.total_bytes);
+    match other.kind {
+        JobKind::Download => tf!("translation.ocr_model.other_download_status", name = name, done = done, total = total),
+        JobKind::Verify => tf!("translation.ocr_model.other_verify_status", name = name, done = done, total = total),
+    }
 }
 
-/// Maps the download snapshot of `spec` to what the block shows. Pure (reads only the
-/// active i18n catalog), so the mapping is unit-tested without a `Ui`.
-fn download_block_view(spec: &ExternalModelSpec, snapshot: &OcrModelPanelSnapshot) -> DownloadBlockView {
+/// Maps a bundle's download snapshot to what the block shows. Pure (reads only the active
+/// i18n catalog), so the mapping is unit-tested without a `Ui`.
+fn download_block_view(snapshot: &OcrModelPanelSnapshot) -> DownloadBlockView {
     let mut lines = Vec::new();
     let status = match &snapshot.state {
         OcrModelDownloadState::Unknown | OcrModelDownloadState::Checking => {
@@ -105,23 +141,49 @@ fn download_block_view(spec: &ExternalModelSpec, snapshot: &OcrModelPanelSnapsho
             Some((StatusTone::Warning, t!("translation.ocr_model.interrupted_status").to_string()))
         }
         OcrModelDownloadState::Installed => Some((StatusTone::Success, t!("translation.ocr_model.installed_status").to_string())),
-        OcrModelDownloadState::Downloading(_) => None,
+        OcrModelDownloadState::Downloading(_) | OcrModelDownloadState::Verifying(_) => None,
         OcrModelDownloadState::Unavailable(reason) => Some((StatusTone::Error, reason.clone())),
     };
     lines.extend(status);
+    let offered = offered_download_label(snapshot);
     match &snapshot.notice {
         Some(DownloadNotice::Cancelled) => lines.push((StatusTone::Weak, t!("translation.ocr_model.cancelled_status").to_string())),
         Some(DownloadNotice::Failed(err)) => lines.push((StatusTone::Error, tf!("translation.ocr_model.failed_error", err = err))),
+        Some(DownloadNotice::VerifyIntact) => lines.push((StatusTone::Weak, t!("translation.ocr_model.verify_intact_status").to_string())),
+        Some(DownloadNotice::VerifyRemoved { files }) => {
+            // Names the button the re-probed state offers (normally "Download (size)").
+            let button = offered.clone().unwrap_or_else(|| download_button_label(snapshot.missing_bytes));
+            lines.push((StatusTone::Warning, tf!("translation.ocr_model.verify_removed_status", count = files, button = button)));
+        }
+        Some(DownloadNotice::VerifyCancelled) => {
+            lines.push((StatusTone::Weak, t!("translation.ocr_model.verify_cancelled_status").to_string()));
+        }
         None => {}
     }
-    let offered = offered_download_label(spec, &snapshot.state);
-    // Only a state that offers a download is blocked by another running download.
-    if offered.is_some()
+    // The button the state offers: download / resume, or verify once installed.
+    let idle_button = if let Some(caption) = offered {
+        Some((caption, ModelDownloadAction::Download))
+    } else if snapshot.state == OcrModelDownloadState::Installed {
+        Some((t!("translation.ocr_model.verify_button").to_string(), ModelDownloadAction::Verify))
+    } else {
+        None
+    };
+    // Only a state that offers a button is blocked by another bundle's running job.
+    if idle_button.is_some()
         && let Some(other) = &snapshot.other_download
     {
         lines.push((StatusTone::Weak, other_download_line(other)));
     }
-    let (progress, button) = if let OcrModelDownloadState::Downloading(progress) = &snapshot.state {
+    let running = match &snapshot.state {
+        OcrModelDownloadState::Downloading(progress) | OcrModelDownloadState::Verifying(progress) => Some(progress),
+        OcrModelDownloadState::Unknown
+        | OcrModelDownloadState::Checking
+        | OcrModelDownloadState::Missing
+        | OcrModelDownloadState::Partial { .. }
+        | OcrModelDownloadState::Installed
+        | OcrModelDownloadState::Unavailable(_) => None,
+    };
+    let (progress, button) = if let Some(progress) = running {
         let cancel = BlockButton {
             caption: t!("translation.common.cancel_button").to_string(),
             action: ModelDownloadAction::Cancel,
@@ -129,27 +191,26 @@ fn download_block_view(spec: &ExternalModelSpec, snapshot: &OcrModelPanelSnapsho
         };
         (Some((progress_fraction(progress), progress_text(progress))), Some(cancel))
     } else {
-        let button = offered.map(|caption| BlockButton {
-            caption,
-            action: ModelDownloadAction::Download,
-            enabled: snapshot.other_download.is_none(),
-        });
+        let button = idle_button.map(|(caption, action)| BlockButton { caption, action, enabled: snapshot.other_download.is_none() });
         (None, button)
     };
     DownloadBlockView { lines, progress, button }
 }
 
-/// Why the panel's Load button is disabled for this snapshot of `spec`, or `None` when the
-/// model is installed. A snapshot of another spec (taken before an engine / variant switch
-/// in this frame) counts as still checking.
-pub(crate) fn load_blocked_reason(spec: &ExternalModelSpec, snapshot: Option<&OcrModelPanelSnapshot>) -> Option<String> {
-    let Some(snapshot) = snapshot.filter(|snapshot| snapshot.spec_id == spec.id) else {
+/// Why a Load / Run button is disabled for this snapshot of the bundle with key `bundle_key`
+/// (`ocr_model_download::bundle_key`), or `None` when the bundle is installed. A snapshot of
+/// another bundle (taken before an engine / variant / language switch in this frame) counts
+/// as still checking.
+#[must_use]
+pub fn load_blocked_reason(bundle_key: &str, snapshot: Option<&OcrModelPanelSnapshot>) -> Option<String> {
+    let Some(snapshot) = snapshot.filter(|snapshot| snapshot.bundle_key == bundle_key) else {
         return Some(t!("translation.ocr_model.checking_status").to_string());
     };
     match &snapshot.state {
         OcrModelDownloadState::Installed => None,
         OcrModelDownloadState::Unknown | OcrModelDownloadState::Checking => Some(t!("translation.ocr_model.checking_status").to_string()),
         OcrModelDownloadState::Downloading(_) => Some(t!("translation.common.downloading_model_status").to_string()),
+        OcrModelDownloadState::Verifying(_) => Some(t!("translation.ocr_model.verifying_files_status").to_string()),
         OcrModelDownloadState::Missing | OcrModelDownloadState::Partial { .. } => {
             Some(t!("translation.ocr_model.not_downloaded_status").to_string())
         }
@@ -200,13 +261,10 @@ fn progress_text(progress: &ExternalDownloadProgress) -> String {
     }
 }
 
-/// Draws the download block of `spec` from `snapshot` and returns the clicked action.
-pub(crate) fn draw_ocr_model_download(
-    ui: &mut egui::Ui,
-    spec: &ExternalModelSpec,
-    snapshot: &OcrModelPanelSnapshot,
-) -> ModelDownloadAction {
-    let view = download_block_view(spec, snapshot);
+/// Draws the download block of a bundle from its `snapshot` and returns the clicked action.
+/// The caller draws it only when `snapshot.bundle_key` matches the bundle it currently needs.
+pub fn draw_ocr_model_download(ui: &mut egui::Ui, snapshot: &OcrModelPanelSnapshot) -> ModelDownloadAction {
+    let view = download_block_view(snapshot);
     let mut action = ModelDownloadAction::None;
     for (tone, text) in &view.lines {
         let color = match tone {
@@ -231,6 +289,9 @@ pub(crate) fn draw_ocr_model_download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ocr_model_download::bundle_key;
+
+    const BABERU: &[&ExternalModelSpec] = &[&BABERU_OCR];
 
     fn progress(phase: ExternalDownloadPhase, total_done: u64) -> ExternalDownloadProgress {
         ExternalDownloadProgress {
@@ -246,7 +307,7 @@ mod tests {
     }
 
     fn snapshot(state: OcrModelDownloadState) -> OcrModelPanelSnapshot {
-        OcrModelPanelSnapshot { spec_id: BABERU_OCR.id, state, notice: None, other_download: None }
+        OcrModelPanelSnapshot { bundle_key: bundle_key(BABERU), state, missing_bytes: BABERU_OCR.total_bytes(), notice: None, other_download: None }
     }
 
     fn download_button(caption: String, enabled: bool) -> Option<BlockButton> {
@@ -256,13 +317,14 @@ mod tests {
     #[test]
     fn missing_and_partial_offer_the_owned_download_caption() {
         for state in [OcrModelDownloadState::Missing, OcrModelDownloadState::Partial { bytes_present: 1024 }] {
-            let view = download_block_view(&BABERU_OCR, &snapshot(state.clone()));
-            let caption = offered_download_label(&BABERU_OCR, &state).expect("a download state");
+            let shown = snapshot(state.clone());
+            let view = download_block_view(&shown);
+            let caption = offered_download_label(&shown).expect("a download state");
             assert_eq!(view.button, download_button(caption, true), "{state:?}");
             assert_eq!(view.lines.len(), 1, "{state:?}");
         }
         // An unfinished download without a notice is reported as interrupted (L2).
-        let partial = download_block_view(&BABERU_OCR, &snapshot(OcrModelDownloadState::Partial { bytes_present: 1024 }));
+        let partial = download_block_view(&snapshot(OcrModelDownloadState::Partial { bytes_present: 1024 }));
         assert_eq!(partial.lines, vec![(StatusTone::Warning, t!("translation.ocr_model.interrupted_status").to_string())]);
     }
 
@@ -271,28 +333,32 @@ mod tests {
     #[test]
     fn notices_keep_the_reprobed_button() {
         let state = OcrModelDownloadState::Partial { bytes_present: 1024 };
-        let caption = offered_download_label(&BABERU_OCR, &state).expect("a download state");
+        let caption = offered_download_label(&snapshot(state.clone())).expect("a download state");
         let cancelled = OcrModelPanelSnapshot { notice: Some(DownloadNotice::Cancelled), ..snapshot(state.clone()) };
-        let view = download_block_view(&BABERU_OCR, &cancelled);
+        let view = download_block_view(&cancelled);
         assert_eq!(view.lines, vec![(StatusTone::Weak, t!("translation.ocr_model.cancelled_status").to_string())]);
         assert_eq!(view.button, download_button(caption, true));
 
         let failed = OcrModelPanelSnapshot { notice: Some(DownloadNotice::Failed("boom".to_owned())), ..snapshot(OcrModelDownloadState::Missing) };
-        let view = download_block_view(&BABERU_OCR, &failed);
+        let view = download_block_view(&failed);
         assert_eq!(view.lines.last(), Some(&(StatusTone::Error, tf!("translation.ocr_model.failed_error", err = "boom"))));
-        assert_eq!(view.button, download_button(offered_download_label(&BABERU_OCR, &OcrModelDownloadState::Missing).expect("missing"), true));
+        assert_eq!(view.button, download_button(offered_download_label(&failed).expect("missing"), true));
     }
 
-    /// M2: another model's download is named with its progress and disables the button.
+    /// M2: another bundle's download is named with its progress and disables the button.
     #[test]
     fn another_running_download_is_named_and_disables_the_button() {
-        let other_spec = PaddleVlVariant::Official16.spec();
-        let other = OtherDownload { spec: other_spec, progress: progress(ExternalDownloadPhase::Downloading, 1024) };
-        let blocked = OcrModelPanelSnapshot { other_download: Some(other), ..snapshot(OcrModelDownloadState::Missing) };
-        let view = download_block_view(&BABERU_OCR, &blocked);
+        let other_specs = vec![&SURYA_DETECTION_2025_05_07, &SURYA_RECOGNITION_2025_09_23];
+        let other = OtherDownload { specs: other_specs, kind: JobKind::Download, progress: progress(ExternalDownloadPhase::Downloading, 1024) };
+        let blocked = OcrModelPanelSnapshot { other_download: Some(other.clone()), ..snapshot(OcrModelDownloadState::Missing) };
+        let view = download_block_view(&blocked);
         let expected_line = tf!(
             "translation.ocr_model.other_download_status",
-            name = crate::panels::ocr::paddle_vl_variant_label(PaddleVlVariant::Official16),
+            name = format!(
+                "{} + {}",
+                external_model_display_name(&SURYA_DETECTION_2025_05_07),
+                external_model_display_name(&SURYA_RECOGNITION_2025_09_23)
+            ),
             done = format_bytes(1024),
             total = format_bytes(BABERU_OCR.total_bytes())
         );
@@ -300,22 +366,60 @@ mod tests {
         let button = view.button.expect("the download button stays visible");
         assert!(!button.enabled);
         assert_eq!(button.action, ModelDownloadAction::Download);
-        // An installed model has nothing to download, so nothing blocks it.
+        // An installed model offers Verify, which the running download disables too.
         let installed = OcrModelPanelSnapshot { other_download: Some(other), ..snapshot(OcrModelDownloadState::Installed) };
-        let view = download_block_view(&BABERU_OCR, &installed);
-        assert_eq!(view.lines.len(), 1);
-        assert_eq!(view.button, None);
+        let view = download_block_view(&installed);
+        assert_eq!(view.lines.len(), 2);
+        assert_eq!(view.button.map(|button| (button.action, button.enabled)), Some((ModelDownloadAction::Verify, false)));
+    }
+
+    /// An installed bundle offers "Verify files" (disabled while another job runs); a running
+    /// verify shows its progress and Cancel and blocks loading.
+    #[test]
+    fn installed_offers_verify_and_a_running_verify_shows_progress() {
+        let installed = download_block_view(&snapshot(OcrModelDownloadState::Installed));
+        let verify = Some(BlockButton { caption: t!("translation.ocr_model.verify_button").to_string(), action: ModelDownloadAction::Verify, enabled: true });
+        assert_eq!(installed.button, verify);
+        let other = OtherDownload { specs: vec![&SURYA_DETECTION_2025_05_07], kind: JobKind::Verify, progress: progress(ExternalDownloadPhase::Verifying, 5) };
+        let blocked = download_block_view(&OcrModelPanelSnapshot { other_download: Some(other.clone()), ..snapshot(OcrModelDownloadState::Installed) });
+        assert_eq!(blocked.button.map(|button| (button.action, button.enabled)), Some((ModelDownloadAction::Verify, false)));
+        assert_eq!(blocked.lines.last(), Some(&(StatusTone::Weak, other_download_line(&other))));
+
+        let running = snapshot(OcrModelDownloadState::Verifying(progress(ExternalDownloadPhase::Verifying, 0)));
+        let view = download_block_view(&running);
+        assert_eq!(view.button.map(|button| button.action), Some(ModelDownloadAction::Cancel));
+        assert!(view.progress.is_some());
+        assert_eq!(load_blocked_reason(&running.bundle_key, Some(&running)), Some(t!("translation.ocr_model.verifying_files_status").to_string()));
+    }
+
+    /// The verify notices: intact (neutral, next to Verify), N files removed naming the
+    /// re-probed state's Download button, cancelled.
+    #[test]
+    fn verify_notices_are_shown_next_to_the_state() {
+        let intact = OcrModelPanelSnapshot { notice: Some(DownloadNotice::VerifyIntact), ..snapshot(OcrModelDownloadState::Installed) };
+        let view = download_block_view(&intact);
+        assert_eq!(view.lines.last(), Some(&(StatusTone::Weak, t!("translation.ocr_model.verify_intact_status").to_string())));
+        assert_eq!(view.button.map(|button| button.action), Some(ModelDownloadAction::Verify));
+
+        let removed = OcrModelPanelSnapshot { notice: Some(DownloadNotice::VerifyRemoved { files: 2 }), ..snapshot(OcrModelDownloadState::Missing) };
+        let view = download_block_view(&removed);
+        let caption = offered_download_label(&removed).expect("missing offers a download");
+        assert_eq!(view.lines.last(), Some(&(StatusTone::Warning, tf!("translation.ocr_model.verify_removed_status", count = 2, button = caption.clone()))));
+        assert_eq!(view.button, download_button(caption, true));
+
+        let cancelled = OcrModelPanelSnapshot { notice: Some(DownloadNotice::VerifyCancelled), ..snapshot(OcrModelDownloadState::Installed) };
+        let view = download_block_view(&cancelled);
+        assert_eq!(view.lines.last(), Some(&(StatusTone::Weak, t!("translation.ocr_model.verify_cancelled_status").to_string())));
     }
 
     #[test]
-    fn installed_checking_and_unavailable_offer_no_button() {
+    fn checking_and_unavailable_offer_no_button() {
         for state in [
-            OcrModelDownloadState::Installed,
             OcrModelDownloadState::Checking,
             OcrModelDownloadState::Unknown,
             OcrModelDownloadState::Unavailable("gone".to_owned()),
         ] {
-            let view = download_block_view(&BABERU_OCR, &snapshot(state.clone()));
+            let view = download_block_view(&snapshot(state.clone()));
             assert_eq!(view.button, None, "{state:?}");
             assert!(view.progress.is_none(), "{state:?}");
         }
@@ -324,7 +428,7 @@ mod tests {
     #[test]
     fn downloading_shows_progress_and_cancel() {
         let half = BABERU_OCR.total_bytes() / 2;
-        let view = download_block_view(&BABERU_OCR, &snapshot(OcrModelDownloadState::Downloading(progress(ExternalDownloadPhase::Downloading, half))));
+        let view = download_block_view(&snapshot(OcrModelDownloadState::Downloading(progress(ExternalDownloadPhase::Downloading, half))));
         assert_eq!(
             view.button,
             Some(BlockButton { caption: t!("translation.common.cancel_button").to_string(), action: ModelDownloadAction::Cancel, enabled: true })
@@ -361,36 +465,45 @@ mod tests {
             tf!("translation.ocr_model.reconnecting_status", attempt = 2, max = 5, done = format_bytes(1024), total = total)
         );
         assert_ne!(progress_text(&waiting), progress_text(&now));
-        let view = download_block_view(&BABERU_OCR, &snapshot(OcrModelDownloadState::Downloading(waiting)));
+        let view = download_block_view(&snapshot(OcrModelDownloadState::Downloading(waiting)));
         assert_eq!(view.button.map(|button| button.action), Some(ModelDownloadAction::Cancel));
         assert_eq!(view.progress.map(|(_, text)| text), Some(progress_text(&waiting)));
     }
 
     /// N2 / N3: the Load button's disabled reason follows the state, and a snapshot of a
-    /// different spec (stale for one frame after a switch) never counts as installed.
+    /// different bundle (stale for one frame after a switch) never counts as installed.
     #[test]
-    fn load_blocked_reason_follows_the_state_and_the_spec() {
+    fn load_blocked_reason_follows_the_state_and_the_bundle() {
+        let key = bundle_key(BABERU);
         let checking = t!("translation.ocr_model.checking_status").to_string();
-        assert_eq!(load_blocked_reason(&BABERU_OCR, None), Some(checking.clone()));
-        assert_eq!(load_blocked_reason(&BABERU_OCR, Some(&snapshot(OcrModelDownloadState::Installed))), None);
-        assert_eq!(load_blocked_reason(&BABERU_OCR, Some(&snapshot(OcrModelDownloadState::Checking))), Some(checking.clone()));
+        assert_eq!(load_blocked_reason(&key, None), Some(checking.clone()));
+        assert_eq!(load_blocked_reason(&key, Some(&snapshot(OcrModelDownloadState::Installed))), None);
+        assert_eq!(load_blocked_reason(&key, Some(&snapshot(OcrModelDownloadState::Checking))), Some(checking.clone()));
         assert_eq!(
-            load_blocked_reason(&BABERU_OCR, Some(&snapshot(OcrModelDownloadState::Downloading(progress(ExternalDownloadPhase::Downloading, 0))))),
+            load_blocked_reason(&key, Some(&snapshot(OcrModelDownloadState::Downloading(progress(ExternalDownloadPhase::Downloading, 0))))),
             Some(t!("translation.common.downloading_model_status").to_string())
         );
         assert_eq!(
-            load_blocked_reason(&BABERU_OCR, Some(&snapshot(OcrModelDownloadState::Missing))),
+            load_blocked_reason(&key, Some(&snapshot(OcrModelDownloadState::Missing))),
             Some(t!("translation.ocr_model.not_downloaded_status").to_string())
         );
-        let stale = OcrModelPanelSnapshot { spec_id: PaddleVlVariant::Official16.spec().id, ..snapshot(OcrModelDownloadState::Installed) };
-        assert_eq!(load_blocked_reason(&BABERU_OCR, Some(&stale)), Some(checking));
+        let stale = OcrModelPanelSnapshot { bundle_key: bundle_key(&[PaddleVlVariant::Official16.spec()]), ..snapshot(OcrModelDownloadState::Installed) };
+        assert_eq!(load_blocked_reason(&key, Some(&stale)), Some(checking));
     }
 
+    /// Every catalog spec a panel can show has its own name, never the raw id.
     #[test]
     fn display_names_cover_every_external_spec() {
         assert_eq!(external_model_display_name(&BABERU_OCR), "Baberu OCR");
         for variant in PaddleVlVariant::ALL {
             assert_eq!(external_model_display_name(variant.spec()), crate::panels::ocr::paddle_vl_variant_label(variant));
+        }
+        for script in EasyOcrScript::ALL {
+            let spec = easyocr_spec(script);
+            assert_eq!(external_model_display_name(spec), tf!("translation.ocr_model.easyocr_model_name", file = script.recognizer_file()));
+        }
+        for spec in [&SURYA_DETECTION_2025_05_07, &SURYA_RECOGNITION_2025_09_23, &SDXL_CONFIG_BASE, &SDXL_CONFIG_INPAINT, &SDXL_INPAINT_FP16] {
+            assert_ne!(external_model_display_name(spec), spec.id, "{}", spec.id);
         }
     }
 

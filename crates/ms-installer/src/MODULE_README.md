@@ -18,8 +18,8 @@ replacement.
 and screens but fixes the target to the given root, starts on the dependency-profile screen, runs
 `utils::run_environment_repair_worker`, and finishes with a plain "environment is ready" screen.
 
-`utils.rs` owns the non-UI installer/update backend: release lookup, downloads, executable
-replacement handoff, archive extraction, managed Python/venv setup, static dependency
+`utils.rs` owns the non-UI installer/update backend: release lookup, the sequencing of
+downloads (the network layer itself is `download.rs`), executable replacement handoff, archive extraction, managed Python/venv setup, static dependency
 installation, optional full PyTorch setup, the install-continuation elevation wrappers, the
 sequencing of the Windows integration inside install and uninstall, and uninstall cleanup. The
 Windows records themselves (registry keys, `.lnk` shortcuts, elevation probe and UAC relaunch,
@@ -50,6 +50,10 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - `update.rs`: update window shell, background release re-check, test-version override,
   executable-update progress, PyTorch choice continuation, completion state, and no-update exit.
 - `utils.rs`: worker pipeline and platform helpers used by installer and updater UI.
+- `download.rs` (+ `download/tests.rs`): the network layer on `ms-download` — `GithubAsset`
+  (name, URL, `size`, `digest`), `github_api_get` (`fetch_small`), `download_asset`
+  (`fetch_verified`, identity sidecar, progress / retry text). Edit it for how anything is
+  fetched; edit `utils.rs` for what is fetched and when.
 - `prompt_window.rs`: the missing-environment startup prompt (install / update a custom install
   folder / open the launcher), returning `MissingPythonEnvAction`; the binary's
   `src/startup/prompts.rs` runs it and maps a failed window to `LaunchLauncher`. It uses
@@ -80,10 +84,32 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   that create shortcuts and registry entries, and uninstall cleanup belong in `utils.rs`, not in
   egui window code. Registry / shortcut / elevation primitives and record names belong in
   `ms_os_integration::windows`, never here; this crate must not depend on `windows-sys` for them.
-- Direct HTTP file downloads must go through `utils.rs::download_asset` (retry with exponential
-  backoff, HTTP Range resume into a `.part` file, size verification, atomic rename into place —
-  the destination path never holds a partial file). GitHub API metadata requests must go through
-  `utils.rs::github_api_get`, which retries transient failures and is shared with `update.rs`.
+- Direct HTTP file downloads must go through `download.rs::download_asset`, which runs
+  `ms_download::fetch_verified` (`RetryPolicy::standard`, `Range` resume into `<file>.part`,
+  15 s connect / 60 s read timeouts, fsync + rename; the destination never holds a partial or
+  unverified file). The pin is the GitHub asset's `size` plus its sha256 when the API publishes
+  a `digest` (`sha256:<hex>`), else the size alone; a hash mismatch deletes the `.part`.
+  Retries are shown as stage progress ("network error, retrying in N s (k/n)"), not as errors.
+- Cross-run resume: `<file>.identity.json` records the `{url, size, digest}` the staged files
+  (`<file>.part`, the verified `<file>.download`) belong to; when it is missing, unreadable or
+  names another asset, the staged files are deleted before the transfer, so bytes of another
+  release are never resumed. A matching sidecar is necessary, not sufficient: `fetch_verified`
+  resumes a `.part` of an earlier run only for a sha256-pinned asset (or a strong server ETag);
+  a digest-less asset restarts from zero. The published destination is never deleted up front: it is
+  replaced only by the final rename of a verified `<file>.download`, so a failed or offline
+  attempt leaves a previously downloaded asset intact.
+- GitHub API metadata requests must go through `download.rs::github_api_get` (`fetch_small`,
+  16 MiB cap), shared with `update.rs`. `GITHUB_TOKEN` (when set) is sent as a bearer header on
+  API and asset requests only through `ms_download::FetcherConfig`; it is never logged.
+- Cancel: `InstallerApp` and `UpdateApp` own an `Arc<AtomicBool>` handed to every worker they
+  start and set it in `Drop`, i.e. when the window closes (no window blocks a close during the
+  install, so no separate Cancel button exists). Downloads, metadata requests and the retry
+  backoff of `utils.rs::run_command_with_retry` stop on it; a running pip / uv child process is
+  not interrupted. `run_torch_upgrade_worker` (launcher settings) has no cancel and passes a flag
+  that never sets.
+- `run_command_with_retry` retries every failed command (pip / uv exit codes cannot tell a
+  network blip from an unsatisfiable requirement) up to the per-call-site attempt budget, waiting
+  2, 4, 8 s (capped) between attempts.
 - Unsupported installer operations must return explicit user-facing errors.
 - Initial installation must not eagerly download AI model weights.
 - Fast installation must install only the base dependency group.
@@ -218,6 +244,8 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - To change what environment repair does (or must not do), edit
   `utils.rs::run_environment_repair_worker` and keep the invariants above in sync.
 - To change the update window shell, edit `update.rs`.
+- To change how release metadata or assets are fetched (retry, resume, pins, progress text),
+  edit `download.rs`.
 - To change install/update worker steps, release assets, command execution, or archive handling,
   edit `utils.rs`.
 - To change PyTorch preflight, backend selection, or dependency groups, edit `utils.rs` and keep

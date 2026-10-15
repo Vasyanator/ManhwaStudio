@@ -5,8 +5,15 @@ Purpose:
 SDXL inpainting service adapter for the Python AI backend (endpoint `/inpaint/sdxl`).
 
 Main responsibilities:
-- lazily build and cache a `StableDiffusionXLInpaintPipeline` from a local
-  ckpt/safetensors file or a Hugging Face repo id;
+- lazily build and cache a `StableDiffusionXLInpaintPipeline`, strictly offline
+  (`local_files_only=True`), from one of three model sources:
+  - a local ckpt/safetensors file, with the pinned diffusers config repo Rust
+    downloaded (`sdxl_config_dir`, chosen by Rust per channel mode) as its
+    `config=`;
+  - a local diffusers folder;
+  - the one curated repo id `CURATED_INPAINT_REPO_ID`, loaded (fp16 variant)
+    from the directory Rust downloaded it to (`sdxl_model_dir`);
+  any other repo id is rejected, never fetched;
 - support two channel modes:
   - `nine_channel`: dedicated 9-channel inpaint UNet (clean masked-image channel,
     full denoise);
@@ -35,6 +42,7 @@ from __future__ import annotations
 import gc
 import io
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -51,11 +59,19 @@ try:
 except Exception:
     UserConfig = None
 
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.rocm_mmap_transfer import patched_module_to
 from .lama import LamaInpaintService
 
 MODEL_SUFFIXES = (".safetensors", ".ckpt")
+
+# The only Hugging Face repo id `model_path` may name. Rust downloads its pinned
+# fp16 files (`ms_sysprobe` external catalog) and sends that directory as the
+# `sdxl_model_dir` request field; the backend never resolves a repo id itself.
+CURATED_INPAINT_REPO_ID = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
+# Weight variant of the curated download: its catalog pins only `*.fp16.*` files.
+CURATED_INPAINT_VARIANT = "fp16"
 
 # Sampler name -> (diffusers scheduler class name, from_config kwargs).
 # Keep names in sync with `SDXL_SAMPLERS` in
@@ -182,38 +198,62 @@ class SdxlInpaintService:
         self._active_device = "cpu"
         self._active_model_key: str | None = None
         self._last_error: str | None = None
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a load and inference hold (S-014).
+        self._health = HealthSnapshot(ready=False, device="cpu", active_model_key=None, last_error=None)
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "ready": self._pipe is not None,
-                "model": "sdxl_inpaint",
-                "device": self._active_device,
-                "active_model_key": self._active_model_key,
-                "last_error": self._last_error,
-            }
+        """Return `{"ready", "model", "device", "active_model_key", "last_error"}` for health.
+
+        Reads only the published snapshot, so it answers while a load or an
+        inference holds the instance lock.
+        """
+        return {"model": "sdxl_inpaint", **self._health.read()}
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock`."""
+        self._health.publish(
+            ready=self._pipe is not None,
+            device=self._active_device,
+            active_model_key=self._active_model_key,
+            last_error=self._last_error,
+        )
 
     def inpaint_image_bytes(
         self,
         image_bytes: bytes,
         mask_bytes: bytes,
         *,
+        config_dir: str,
+        curated_model_dir: str | None = None,
         params: dict[str, Any] | None = None,
         progress_callback: Any = None,
     ) -> dict[str, Any]:
         """Runs SDXL inpainting and returns the composited region as raw PNG bytes.
 
+        `config_dir` is the pinned diffusers config repo Rust downloaded for the
+        requested mode; it is read only for a single-file checkpoint.
+        `curated_model_dir` is Rust's download of `CURATED_INPAINT_REPO_ID`,
+        required when `params["model_path"]` names that repo id.
+
         `progress_callback`, if given, is called once per diffusion step as
         `progress_callback(step, total, preview_rgb)` where `preview_rgb` is a
         small `H x W x 3` uint8 latent preview (or `None`). It runs on the
         worker thread inside the generation lock.
+
+        Raises `ValueError` for invalid parameters, a repo id other than the
+        curated one, or a curated id without `curated_model_dir`;
+        `FileNotFoundError` for a missing model path or an absent ("not
+        downloaded") config / curated directory; `RuntimeError` for a missing
+        package.
         """
         normalized = normalize_sdxl_params(params)
+        source = resolve_model_source(normalized["model_path"], config_dir=config_dir, curated_model_dir=curated_model_dir)
         image_rgb = self._decode_image_rgb(image_bytes)
         mask_u8 = self._decode_mask(mask_bytes, expected_hw=image_rgb.shape[:2])
 
         device = _resolve_selected_backend_device(self._active_device)
-        model_key = self._model_key_for(normalized["model_path"], normalized["mode"], device)
+        model_key = self._model_key_for(source, normalized["mode"], device)
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
@@ -225,7 +265,7 @@ class SdxlInpaintService:
                 # then may the manager drop its entry for `model_key`.
                 try:
                     pipe = self._ensure_pipeline_locked(
-                        model_path=normalized["model_path"],
+                        source=source,
                         mode=normalized["mode"],
                         device=device,
                         model_key=model_key,
@@ -251,8 +291,10 @@ class SdxlInpaintService:
                     progress_callback=progress_callback,
                 )
                 self._last_error = None
+                self._publish_health_locked()
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 raise
             finally:
                 lease.release()
@@ -271,6 +313,7 @@ class SdxlInpaintService:
             current_key = self._active_model_key
             self._pipe = None
             self._active_model_key = None
+            self._publish_health_locked()
             _clear_torch_cache()
             if current_key is not None:
                 self._model_manager.mark_unloaded(current_key)
@@ -279,7 +322,7 @@ class SdxlInpaintService:
     def _ensure_pipeline_locked(
         self,
         *,
-        model_path: str,
+        source: SdxlModelSource,
         mode: str,
         device: str,
         model_key: str,
@@ -294,17 +337,19 @@ class SdxlInpaintService:
         previous_key = self._active_model_key
         self._pipe = None
         self._active_model_key = None
+        self._publish_health_locked()
         _clear_torch_cache()
         if previous_key is not None:
             self._model_manager.mark_unloaded(previous_key)
 
-        pipe = _build_sdxl_inpaint_pipeline(model_path, device)
+        pipe = _build_sdxl_inpaint_pipeline(source, device)
         in_channels = int(pipe.unet.config.in_channels)
         _validate_mode_channels(mode, in_channels)
 
         self._pipe = pipe
         self._active_device = device
         self._active_model_key = model_key
+        self._publish_health_locked()
         return pipe
 
     def _unload_key(self, model_key: str) -> bool:
@@ -314,8 +359,9 @@ class SdxlInpaintService:
             return self.unload()
 
     @staticmethod
-    def _model_key_for(model_path: str, mode: str, device: str) -> str:
-        return f"sdxl:{mode}:{device}:{model_path}"
+    def _model_key_for(source: SdxlModelSource, mode: str, device: str) -> str:
+        """Lease key: the resolved source (path, config, variant), mode and device are the identity."""
+        return f"sdxl:{mode}:{device}:{source.kind}:{source.path}:{source.config_dir or ''}:{source.variant or ''}"
 
     def _inpaint_locked(
         self,
@@ -495,20 +541,97 @@ def _validate_mode_channels(mode: str, in_channels: int) -> None:
         )
 
 
-def _build_sdxl_inpaint_pipeline(model_path: str, device: str) -> Any:
-    """Build a `StableDiffusionXLInpaintPipeline` and move it onto `device`.
+@dataclass(frozen=True)
+class SdxlModelSource:
+    """Where an SDXL pipeline is loaded from, resolved before any load.
 
-    `model_path` is a local ckpt/safetensors file, a local diffusers folder, or a
-    Hugging Face repo id. Weights are loaded in fp16 for a `cuda` device and fp32
-    otherwise. The returned pipeline has progress bars disabled, attention
-    slicing enabled and, in fp16, the VAE `force_upcast` flag set.
+    `kind` is `"single_file"` (`path` is a ckpt/safetensors file, `config_dir`
+    its diffusers config repo), `"folder"` (`path` is a diffusers folder) or
+    `"curated"` (`path` is Rust's download of `CURATED_INPAINT_REPO_ID`,
+    loaded with weight `variant`). Every path exists when this is built.
+    """
+
+    kind: str
+    path: str
+    config_dir: str | None = None
+    variant: str | None = None
+
+
+def _require_diffusers_dir(raw: str | None, *, field: str, what: str) -> Path:
+    """Return `raw` as an absolute directory holding `model_index.json`.
+
+    `field` names the request field in errors, `what` the model. Raises
+    `ValueError` for an empty or relative path and `FileNotFoundError` ("not
+    downloaded") when the directory or its `model_index.json` is missing.
+    """
+    normalized = str(raw or "").strip()
+    if not normalized:
+        raise ValueError(f"SDXL: поле {field!r} обязательно ({what}).")
+    path = Path(normalized)
+    if not path.is_absolute():
+        raise ValueError(f"SDXL: поле {field!r} должно быть абсолютным путём: {normalized}")
+    if not (path / "model_index.json").is_file():
+        raise FileNotFoundError(f"SDXL: {what} не скачана (нет {path / 'model_index.json'}).")
+    return path
+
+
+def resolve_model_source(model_path: str, *, config_dir: str, curated_model_dir: str | None) -> SdxlModelSource:
+    """Resolve the user's `model_path` into a loadable `SdxlModelSource`.
+
+    A local file must be a ckpt/safetensors checkpoint and takes `config_dir`
+    (checked here: `from_single_file` would otherwise fetch the configs from
+    the Hub even with `local_files_only=True`). A local folder must be a
+    diffusers repo. `CURATED_INPAINT_REPO_ID` resolves to `curated_model_dir`.
+    Anything else is refused: no repo id is ever downloaded by the backend.
+
+    Raises `ValueError` / `FileNotFoundError` as documented on
+    `SdxlInpaintService.inpaint_image_bytes`.
+    """
+    if model_path == CURATED_INPAINT_REPO_ID:
+        curated = _require_diffusers_dir(
+            curated_model_dir, field="sdxl_model_dir", what=f"модель {CURATED_INPAINT_REPO_ID}"
+        )
+        return SdxlModelSource(kind="curated", path=str(curated), variant=CURATED_INPAINT_VARIANT)
+    candidate = Path(model_path).expanduser()
+    if candidate.is_file():
+        if candidate.suffix.lower() not in MODEL_SUFFIXES:
+            raise FileNotFoundError(
+                f"Путь к весам SDXL не является ckpt/safetensors файлом: {candidate}"
+            )
+        config = _require_diffusers_dir(config_dir, field="sdxl_config_dir", what="конфигурация SDXL")
+        return SdxlModelSource(kind="single_file", path=str(candidate), config_dir=str(config))
+    if candidate.is_dir():
+        # Local diffusers-format repo (folder with model_index.json, unet/, vae/, ...).
+        if not (candidate / "model_index.json").is_file():
+            raise FileNotFoundError(
+                "Папка SDXL не похожа на diffusers-репозиторий "
+                f"(нет model_index.json): {candidate}"
+            )
+        return SdxlModelSource(kind="folder", path=str(candidate))
+    if candidate.is_absolute():
+        raise FileNotFoundError(f"Путь к весам SDXL не найден: {candidate}")
+    raise ValueError(
+        f"SDXL: {model_path!r} не является локальным файлом или папкой. Идентификаторы "
+        f"Hugging Face не загружаются; поддерживается только {CURATED_INPAINT_REPO_ID}, "
+        "скачиваемая приложением."
+    )
+
+
+def _build_sdxl_inpaint_pipeline(source: SdxlModelSource, device: str) -> Any:
+    """Build a `StableDiffusionXLInpaintPipeline` from `source` and move it onto `device`.
+
+    Every load passes `local_files_only=True`: `source` was resolved to
+    existing local paths, so nothing reaches the network. Weights are loaded
+    in fp16 for a `cuda` device and fp32 otherwise. The returned pipeline has
+    progress bars disabled, attention slicing enabled and, in fp16, the VAE
+    `force_upcast` flag set.
 
     The host->device move runs inside `patched_module_to()` (ROCm mmap staging);
     it is a strict no-op on every other build.
 
     # Raises
-    `RuntimeError` if `diffusers` is missing and `FileNotFoundError` if the path
-    is neither a ckpt/safetensors file nor a diffusers repo folder.
+    `RuntimeError` if `diffusers` is missing; loader errors (a missing
+    component file in an incomplete folder, for example) propagate.
     """
     torch = _torch()
     try:
@@ -520,28 +643,20 @@ def _build_sdxl_inpaint_pipeline(model_path: str, device: str) -> Any:
         ) from exc
 
     dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
-    candidate = Path(model_path).expanduser()
-    if candidate.is_file():
-        if candidate.suffix.lower() not in MODEL_SUFFIXES:
-            raise FileNotFoundError(
-                f"Путь к весам SDXL не является ckpt/safetensors файлом: {candidate}"
-            )
+    if source.kind == "single_file":
         pipe = StableDiffusionXLInpaintPipeline.from_single_file(
-            str(candidate), torch_dtype=dtype
+            source.path, config=source.config_dir, local_files_only=True, torch_dtype=dtype
         )
-    elif candidate.is_dir():
-        # Local diffusers-format repo (folder with model_index.json, unet/, vae/, ...).
-        if not (candidate / "model_index.json").is_file():
-            raise FileNotFoundError(
-                "Папка SDXL не похожа на diffusers-репозиторий "
-                f"(нет model_index.json): {candidate}"
-            )
+    elif source.kind == "folder":
         pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
-            str(candidate), torch_dtype=dtype
+            source.path, local_files_only=True, torch_dtype=dtype
+        )
+    elif source.kind == "curated":
+        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+            source.path, variant=source.variant, local_files_only=True, torch_dtype=dtype
         )
     else:
-        # Not a local path: treat as a remote Hugging Face repo id.
-        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(model_path, torch_dtype=dtype)
+        raise ValueError(f"SDXL: неизвестный источник модели {source.kind!r}")
 
     # On a ROCm build a host->device copy whose source is the writable private
     # file mapping that safetensors hands out stalls ~1-2 s per tensor of >=1 MiB

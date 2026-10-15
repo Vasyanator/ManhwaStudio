@@ -29,12 +29,17 @@
 //   then the optional ALL-CAPS -> sentence-case fix (`ocr_case_fix`).
 // - Вспомогательные функции: crop по UV, PNG-кодирование, сборка/разбор
 //   framed-заголовков `BackendClient`/`CallHandle` и JSON.
-// - External models (Baberu OCR, PaddleOCR-VL variants): `external_model_spec` names the
-//   pinned spec an engine needs; `gate_external_models` is the ONE pre-dispatch gate
+// - External models (Baberu OCR, PaddleOCR-VL variants, the EasyOCR model of the selected
+//   languages' script, the two Surya checkpoints): `external_model_specs` names the pinned
+//   spec bundle an engine needs; `gate_external_models` is the ONE pre-dispatch gate
 //   (load warmup and every non-AI-API recognize) that turns "not downloaded" into a
-//   localized error naming the panel's download button, and reports the missing spec
+//   localized error naming the panel's download button (an EasyOCR language list easyocr
+//   cannot read into its own localized error first), and reports the missing bundle
 //   (`OcrControllerEvent::ExternalModelMissing`) so the tab re-probes the panel's state and
-//   the button the error names is the one drawn. Nothing here downloads them; the
+//   the button the error names is the one drawn. The resolved directories travel in the
+//   request header (`ocr_header_fields`, protocol v12 keys). EasyOCR languages are sent
+//   canonical (`ms_sysprobe::ai_models::easyocr::normalize_easyocr_langs`, the one owner of
+//   the code table and the script choice). Nothing here downloads them; the
 //   download controller is `ocr_model_download.rs`. Baberu routes like MangaOCR/PaddleOCR:
 //   native ONNX (vision on the selected EP, decoders on CPU) under the native runtime + Safe
 //   guard, else backend `ocr.baberu`.
@@ -52,14 +57,18 @@ use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use crate::ocr_case_fix;
 use ms_config as config;
 use ms_sysprobe::ai_models;
+use ms_sysprobe::ai_models::{EnsureCtx, ModelDownloadEvent, ModelEnsureError};
+use ms_sysprobe::ai_models::easyocr::{EasyOcrLangError, EasyOcrScript, easyocr_script_for, easyocr_spec, normalize_easyocr_langs};
 use ms_sysprobe::ai_models::external::{ExternalModelSpec, ExternalModelStatus, external_model_status};
-use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, BaberuFiles, PaddleVlVariant, baberu_files};
+use ms_sysprobe::ai_models::external_catalog::{
+    BABERU_OCR, BaberuFiles, PaddleVlVariant, SURYA_DETECTION_2025_05_07, SURYA_RECOGNITION_2025_09_23, baberu_files,
+};
 // Native ONNX Runtime OCR path (Phase 1: MangaOCR only). Desktop-only: the native
 // runtime + ORT loader depend on `ms-onnx`/`ort`, which are not part of the web build.
 #[cfg(not(target_arch = "wasm32"))]
 use ms_native_runtime as native_runtime;
 #[cfg(not(target_arch = "wasm32"))]
-use ms_onnx_runtime::{OrtDownloadProgress, OrtDownloadStage};
+use ms_onnx_runtime::OrtDownloadStage;
 // AI API OCR (`genai`, reached through `ms_ai_api`) is native-only: `genai` is not
 // compiled for wasm. The worker command/event enums and the controller stay
 // target-neutral; only the bodies that build `genai` requests are gated below.
@@ -75,6 +84,8 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::Duration;
@@ -272,10 +283,13 @@ pub enum OcrControllerEvent {
     RecognizeCancelled {
         request_id: u64,
     },
-    /// The pre-dispatch gate found this external model not installed (the load or
+    /// The pre-dispatch gate found this external model bundle not installed (the load or
     /// recognize also fails with the "not downloaded" error): the tab re-probes its
     /// download state so the panel shows the button that error names.
-    ExternalModelMissing(&'static ExternalModelSpec),
+    ExternalModelMissing(Vec<&'static ExternalModelSpec>),
+    /// Progress of an app-managed model download of the running load or recognize (thinned
+    /// by `ai_models`); the state is `DownloadingModel` meanwhile. Retries are progress.
+    ModelDownloadProgress(ModelDownloadEvent),
 }
 
 #[derive(Debug)]
@@ -289,6 +303,9 @@ pub struct TranslationOcrController {
     worker_thread: Option<JoinHandle<()>>,
     /// Live state and Stop switch of the AI API request the worker runs (shared with it).
     generation: GenerationTracker,
+    /// Cancel token of the most recently sent Load / Recognize: set when a newer command
+    /// supersedes it and on drop, so a model download it runs stops (`OcrFailure::Cancelled`).
+    command_cancel: Arc<AtomicBool>,
 }
 
 impl Default for TranslationOcrController {
@@ -313,6 +330,25 @@ impl TranslationOcrController {
             evt_rx,
             worker_thread: Some(worker_thread),
             generation,
+            command_cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Supersedes the previous command (its model download, if any, stops) and returns the
+    /// fresh cancel token of the command about to be sent.
+    fn next_command_cancel(&mut self) -> Arc<AtomicBool> {
+        self.command_cancel.store(true, Ordering::Relaxed);
+        self.command_cancel = Arc::new(AtomicBool::new(false));
+        Arc::clone(&self.command_cancel)
+    }
+
+    /// The OCR panel's Cancel of a running model download: stops the download of the newest
+    /// Load / Recognize (older ones were already superseded). A no-op unless the state is
+    /// `DownloadingModel`. The command then ends as a cancelled load (`StateChanged(NotLoaded)`)
+    /// or `RecognizeCancelled`; the staged bytes are kept for the next attempt.
+    pub fn cancel_model_download(&self) {
+        if self.state == OcrLoadState::DownloadingModel {
+            self.command_cancel.store(true, Ordering::Relaxed);
         }
     }
 
@@ -347,9 +383,10 @@ impl TranslationOcrController {
         }
         self.set_state(OcrLoadState::Loading);
         self.last_error = None;
+        let cancel = self.next_command_cancel();
         if self
             .cmd_tx
-            .send(WorkerCommand::Load { engine, options })
+            .send(WorkerCommand::Load { engine, options, cancel })
             .is_err()
         {
             self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
@@ -360,7 +397,8 @@ impl TranslationOcrController {
     pub fn request_recognize(&mut self, request: OcrRecognizeRequest) {
         match self.state {
             OcrLoadState::Ready => {
-                if self.cmd_tx.send(WorkerCommand::Recognize(request)).is_err() {
+                let cancel = self.next_command_cancel();
+                if self.cmd_tx.send(WorkerCommand::Recognize { request, cancel }).is_err() {
                     self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
                     self.set_state(OcrLoadState::Error);
                 }
@@ -381,8 +419,8 @@ impl TranslationOcrController {
         let mut out = Vec::new();
         for _ in 0..OCR_EVENT_POLL_BUDGET {
             match self.evt_rx.try_recv() {
-                Ok(WorkerEvent::ExternalModelMissing(spec)) => {
-                    out.push(OcrControllerEvent::ExternalModelMissing(spec));
+                Ok(WorkerEvent::ExternalModelMissing(specs)) => {
+                    out.push(OcrControllerEvent::ExternalModelMissing(specs));
                 }
                 Ok(WorkerEvent::ModelDownloadStarted) => {
                     if self.state != OcrLoadState::DownloadingModel {
@@ -390,6 +428,26 @@ impl TranslationOcrController {
                         out.push(OcrControllerEvent::StateChanged(
                             OcrLoadState::DownloadingModel,
                         ));
+                    }
+                }
+                Ok(WorkerEvent::ModelDownloadProgress(event)) => {
+                    if self.state != OcrLoadState::DownloadingModel {
+                        self.set_state(OcrLoadState::DownloadingModel);
+                        out.push(OcrControllerEvent::StateChanged(
+                            OcrLoadState::DownloadingModel,
+                        ));
+                    }
+                    out.push(OcrControllerEvent::ModelDownloadProgress(event));
+                }
+                Ok(WorkerEvent::LoadCancelled) => {
+                    // A cancelled model download is not an engine error: back to NotLoaded
+                    // (the next request loads again and resumes the staged bytes), and the
+                    // request that waited for this load ends as cancelled.
+                    let dropped_request_id = self.pending_request.take().map(|req| req.request_id);
+                    self.set_state(OcrLoadState::NotLoaded);
+                    out.push(OcrControllerEvent::StateChanged(OcrLoadState::NotLoaded));
+                    if let Some(request_id) = dropped_request_id {
+                        out.push(OcrControllerEvent::RecognizeCancelled { request_id });
                     }
                 }
                 Ok(WorkerEvent::BackendLoadStarted) => {
@@ -404,12 +462,13 @@ impl TranslationOcrController {
                         self.set_state(OcrLoadState::Ready);
                         out.push(OcrControllerEvent::StateChanged(OcrLoadState::Ready));
                     }
-                    if let Some(request) = self.pending_request.take()
-                        && self.cmd_tx.send(WorkerCommand::Recognize(request)).is_err()
-                    {
-                        self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
-                        self.set_state(OcrLoadState::Error);
-                        out.push(OcrControllerEvent::StateChanged(OcrLoadState::Error));
+                    if let Some(request) = self.pending_request.take() {
+                        let cancel = self.next_command_cancel();
+                        if self.cmd_tx.send(WorkerCommand::Recognize { request, cancel }).is_err() {
+                            self.last_error = Some(t!("translation.ocr.worker_unavailable_error").to_string());
+                            self.set_state(OcrLoadState::Error);
+                            out.push(OcrControllerEvent::StateChanged(OcrLoadState::Error));
+                        }
                     }
                 }
                 Ok(WorkerEvent::LoadErr(err)) => {
@@ -471,8 +530,12 @@ impl Drop for TranslationOcrController {
         // Abort the AI API request in flight first, and make every queued AI API request return
         // before its keyring read (`run_ai_api_ocr_request` checks `is_closed`): the join below
         // would otherwise block the GUI thread until the provider answers. Queued non-AI
-        // (backend / native) requests still run before the worker sees `Stop`.
+        // (backend / native) requests still run before the worker sees `Stop`, but none of
+        // them downloads a model (their tokens are set).
         self.generation.close();
+        // Stop the model download the newest command may run; older queued commands were
+        // already superseded, so none of them downloads either.
+        self.command_cancel.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(WorkerCommand::Stop);
         if let Some(handle) = self.worker_thread.take() {
             let _ = handle.join();
@@ -485,19 +548,29 @@ enum WorkerCommand {
     Load {
         engine: OcrEngine,
         options: OcrRuntimeOptions,
+        /// Stops this load's model download (see `TranslationOcrController::command_cancel`).
+        cancel: Arc<AtomicBool>,
     },
-    Recognize(OcrRecognizeRequest),
+    Recognize {
+        request: OcrRecognizeRequest,
+        /// Stops this request's model download.
+        cancel: Arc<AtomicBool>,
+    },
     Stop,
 }
 
 #[derive(Debug)]
 enum WorkerEvent {
-    /// Sent by the external-model gate right before the error it causes.
-    ExternalModelMissing(&'static ExternalModelSpec),
+    /// Sent by the external-model gate right before the error it causes (the whole bundle).
+    ExternalModelMissing(Vec<&'static ExternalModelSpec>),
     ModelDownloadStarted,
+    /// One (thinned) app-managed model download event.
+    ModelDownloadProgress(ModelDownloadEvent),
     BackendLoadStarted,
     LoadOk,
     LoadErr(String),
+    /// The load's model download was cancelled (superseded or controller dropped).
+    LoadCancelled,
     RecognizeOk {
         request_id: u64,
         result: OcrRecognizeResult,
@@ -517,18 +590,17 @@ fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>, gen
     while let Ok(command) = cmd_rx.recv() {
         match command {
             WorkerCommand::Stop => break,
-            WorkerCommand::Load { engine, options } => {
-                match warmup_ocr_engine(engine, &options, &evt_tx) {
-                    Ok(()) => {
-                        let _ = evt_tx.send(WorkerEvent::LoadOk);
-                    }
-                    Err(err) => {
-                        let _ = evt_tx.send(WorkerEvent::LoadErr(err));
-                    }
-                }
+            WorkerCommand::Load { engine, options, cancel } => {
+                let event = match warmup_ocr_engine(engine, &options, &cancel, &evt_tx) {
+                    Ok(()) => WorkerEvent::LoadOk,
+                    Err(OcrFailure::Cancelled) => WorkerEvent::LoadCancelled,
+                    Err(OcrFailure::Failed(err)) => WorkerEvent::LoadErr(err),
+                };
+                let _ = evt_tx.send(event);
             }
-            WorkerCommand::Recognize(request) => {
-                if run_recognize_command(request, &mut page_cache, &cmd_rx, &evt_tx, generation).is_break() {
+            WorkerCommand::Recognize { request, cancel } => {
+                let job = QueuedRecognize { request, cancel };
+                if run_recognize_command(job, &mut page_cache, &cmd_rx, &evt_tx, generation).is_break() {
                     break;
                 }
             }
@@ -536,16 +608,39 @@ fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>, gen
     }
 }
 
+/// A recognize command as the worker runs it: the request plus its cancel token.
+#[derive(Debug)]
+struct QueuedRecognize {
+    request: OcrRecognizeRequest,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Runs an `ai_models::ensure_*` call for the OCR worker: `cancel` is the command's token and
+/// every (thinned) download event goes to the controller as `ModelDownloadProgress`.
+fn ensure_with_events<T>(
+    cancel: &AtomicBool,
+    evt_tx: &Sender<WorkerEvent>,
+    ensure: impl FnOnce(&mut EnsureCtx<'_>) -> Result<T, ModelEnsureError>,
+) -> Result<T, ModelEnsureError> {
+    let mut forward = |event: &ModelDownloadEvent| {
+        // A gone controller is noticed by the caller's next send; progress is best effort.
+        let _ = evt_tx.send(WorkerEvent::ModelDownloadProgress(event.clone()));
+    };
+    ensure(&mut EnsureCtx { cancel, progress: &mut forward })
+}
+
 fn warmup_ocr_engine(
     engine: OcrEngine,
     options: &OcrRuntimeOptions,
+    cancel: &AtomicBool,
     evt_tx: &Sender<WorkerEvent>,
-) -> Result<(), String> {
+) -> Result<(), OcrFailure> {
     if engine == OcrEngine::AiApi {
-        return validate_ai_api_options(options).map(|_target| ());
+        return validate_ai_api_options(options).map(|_target| ()).map_err(OcrFailure::from);
     }
-    // External models are never downloaded implicitly: a missing Baberu / PaddleOCR-VL
-    // model fails the load here, on both routes, with the error naming the panel button.
+    // External models are never downloaded implicitly: a missing Baberu / PaddleOCR-VL /
+    // EasyOCR / Surya model fails the load here, on every route, with the error naming the
+    // panel button.
     let model_dirs = gate_external_models(engine, options, evt_tx)?;
 
     // Route-aware readiness gate. When the active route is the native ONNX Runtime,
@@ -565,7 +660,7 @@ fn warmup_ocr_engine(
         return Ok(());
     }
 
-    warmup_backend_ocr_engine(engine, options, &model_dirs, evt_tx)
+    warmup_backend_ocr_engine(engine, options, &model_dirs, cancel, evt_tx)
 }
 
 /// Whether an OCR route requires warming the Python backend at load time.
@@ -585,9 +680,10 @@ fn warmup_backend_ocr_engine(
     engine: OcrEngine,
     options: &OcrRuntimeOptions,
     model_dirs: &ExternalModelDirs,
+    cancel: &AtomicBool,
     evt_tx: &Sender<WorkerEvent>,
-) -> Result<(), String> {
-    ensure_backend_ocr_models(engine, options, evt_tx)?;
+) -> Result<(), OcrFailure> {
+    ensure_backend_ocr_models(engine, options, cancel, evt_tx)?;
     ensure_v2_backend_ready()?;
     let _ = evt_tx.send(WorkerEvent::BackendLoadStarted);
     let method = engine
@@ -602,7 +698,7 @@ fn warmup_backend_ocr_engine(
     match ocr_backend_call(method, header_fields, &dummy_png) {
         Ok(_) => Ok(()),
         Err(CallError::Interrupted(_)) => Ok(()),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(OcrFailure::Failed(err.to_string())),
     }
 }
 
@@ -612,9 +708,11 @@ fn warmup_backend_ocr_engine(
 /// The image itself is NOT in the header — it travels as the request blob.
 ///
 /// `model_dirs` carries the resolved external models: `paddle_vl_model_dir` (absolute
-/// checkpoint directory, `ocr.paddle_vl` requires it) and `baberu_model_files`
-/// (`{vision, prefill, step, vocab}` absolute paths, `ocr.baberu` requires it); each is
-/// `null` when not resolved for this request.
+/// checkpoint directory, `ocr.paddle_vl` requires it), `baberu_model_files`
+/// (`{vision, prefill, step, vocab}` absolute paths, `ocr.baberu` requires it),
+/// `easyocr_model_dir` (`ocr.easy`, v12) and `surya_recognition_dir` + `surya_detection_dir`
+/// (`ocr.surya`, v12); each is `null` when not resolved for this request. `easy_langs` is
+/// the CANONICAL list (`normalize_easyocr_langs`, comma-joined), which the backend uses as is.
 ///
 /// # Errors
 /// A model path that is not valid UTF-8 (it could not be sent without being mangled, so
@@ -626,6 +724,9 @@ fn ocr_header_fields(
     reflect_strings: bool,
 ) -> Result<Value, String> {
     let paddle_vl_model_dir = model_dirs.paddle_vl.as_deref().map(wire_path).transpose()?;
+    let easyocr_model_dir = model_dirs.easyocr.as_deref().map(wire_path).transpose()?;
+    let surya_recognition_dir = model_dirs.surya_recognition.as_deref().map(wire_path).transpose()?;
+    let surya_detection_dir = model_dirs.surya_detection.as_deref().map(wire_path).transpose()?;
     let baberu_model_files = model_dirs
         .baberu
         .as_ref()
@@ -638,7 +739,7 @@ fn ocr_header_fields(
             }))
         })
         .transpose()?;
-    Ok(json!({
+    let mut fields = json!({
         "join_newlines": join_newlines,
         "reflect_strings": reflect_strings,
         "manga_model": options.manga_model,
@@ -647,14 +748,21 @@ fn ocr_header_fields(
         "paddle_vl_model": options.paddle_vl_model.key(),
         "paddle_vl_model_dir": paddle_vl_model_dir,
         "baberu_model_files": baberu_model_files,
-        "easy_langs": options.easy_langs,
         "surya_task_name": options.surya_task_name,
         "surya_recognize_math": options.surya_recognize_math,
         "surya_sort_lines": options.surya_sort_lines,
         "surya_drop_repeated_text": options.surya_drop_repeated_text,
         "surya_max_sliding_window": non_zero_u32_to_option(options.surya_max_sliding_window),
         "surya_max_tokens": non_zero_u32_to_option(options.surya_max_tokens)
-    }))
+    });
+    // The v12 keys come from the protocol mirror (one spelling for both sides).
+    if let Value::Object(map) = &mut fields {
+        map.insert(backend_ipc::protocol::HEADER_EASY_LANGS.to_owned(), json!(normalize_easyocr_langs(&options.easy_langs).join(",")));
+        map.insert(backend_ipc::protocol::HEADER_EASYOCR_MODEL_DIR.to_owned(), json!(easyocr_model_dir));
+        map.insert(backend_ipc::protocol::HEADER_SURYA_RECOGNITION_DIR.to_owned(), json!(surya_recognition_dir));
+        map.insert(backend_ipc::protocol::HEADER_SURYA_DETECTION_DIR.to_owned(), json!(surya_detection_dir));
+    }
+    Ok(fields)
 }
 
 /// A model path as a wire string; never lossy.
@@ -670,17 +778,56 @@ pub(crate) struct ExternalModelDirs {
     pub paddle_vl: Option<PathBuf>,
     /// Installed Baberu OCR files.
     pub baberu: Option<BaberuFiles>,
+    /// The shared EasyOCR directory (detector + the selected script's recognizer installed).
+    pub easyocr: Option<PathBuf>,
+    /// Installed Surya `text_recognition` checkpoint.
+    pub surya_recognition: Option<PathBuf>,
+    /// Installed Surya `text_detection` checkpoint.
+    pub surya_detection: Option<PathBuf>,
 }
 
-/// The pinned external model `engine` needs (`paddle_vl` picks the PaddleOCR-VL variant),
-/// or `None` for engines whose models are app-managed elsewhere or library-managed.
-/// Single owner of the engine -> external spec mapping (gate, panel download block, tab
-/// status probes).
-pub(crate) fn external_model_spec(engine: OcrEngine, paddle_vl: PaddleVlVariant) -> Option<&'static ExternalModelSpec> {
+/// The Surya OCR bundle: the detection checkpoint first (shared with the Surya text
+/// detector), then recognition. `ocr.surya` requires both directories.
+pub(crate) const SURYA_OCR_SPECS: [&ExternalModelSpec; 2] = [&SURYA_DETECTION_2025_05_07, &SURYA_RECOGNITION_2025_09_23];
+
+/// The pinned external model bundle `engine` needs: `paddle_vl` picks the PaddleOCR-VL
+/// variant, `easy_langs` (the raw setting) the EasyOCR script. Empty for engines whose models
+/// are app-managed elsewhere, and for an EasyOCR language list easyocr cannot read
+/// ([`easyocr_selection`] explains why). Single owner of the engine -> external spec mapping
+/// (gate, panel download block, tab status probes).
+pub(crate) fn external_model_specs(engine: OcrEngine, paddle_vl: PaddleVlVariant, easy_langs: &str) -> Vec<&'static ExternalModelSpec> {
     match engine {
-        OcrEngine::Baberu => Some(&BABERU_OCR),
-        OcrEngine::PaddleVl => Some(paddle_vl.spec()),
-        OcrEngine::MangaOcr | OcrEngine::EasyOcr | OcrEngine::PaddleOcr | OcrEngine::Surya | OcrEngine::AiApi => None,
+        OcrEngine::Baberu => vec![&BABERU_OCR],
+        OcrEngine::PaddleVl => vec![paddle_vl.spec()],
+        OcrEngine::EasyOcr => easyocr_selection(easy_langs).map(|(_, script)| vec![easyocr_spec(script)]).unwrap_or_default(),
+        OcrEngine::Surya => SURYA_OCR_SPECS.to_vec(),
+        OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi => Vec::new(),
+    }
+}
+
+/// The canonical EasyOCR language list of the raw setting and the recognizer script easyocr
+/// selects for it (both owned by `ms_sysprobe::ai_models::easyocr`).
+///
+/// # Errors
+/// [`EasyOcrLangError`] exactly where easyocr would refuse the list.
+pub(crate) fn easyocr_selection(easy_langs: &str) -> Result<(Vec<String>, EasyOcrScript), EasyOcrLangError> {
+    let langs = normalize_easyocr_langs(easy_langs);
+    let script = easyocr_script_for(&langs)?;
+    Ok((langs, script))
+}
+
+/// Localized user-facing text for an EasyOCR language-list error (the error's `Display` is
+/// English diagnostic text for logs). Only language-neutral facts are substituted: language
+/// codes and the recognizer file name.
+pub(crate) fn easyocr_lang_error_message(err: &EasyOcrLangError) -> String {
+    match err {
+        EasyOcrLangError::Empty => t!("translation.ocr.easyocr_no_language_error").to_string(),
+        EasyOcrLangError::Unsupported { codes } => tf!("translation.ocr.easyocr_unsupported_language_error", codes = codes.join(", ")),
+        EasyOcrLangError::Incompatible { script, compatible } => tf!(
+            "translation.ocr.easyocr_incompatible_languages_error",
+            model = script.recognizer_file(),
+            codes = compatible.join(", ")
+        ),
     }
 }
 
@@ -696,70 +843,86 @@ fn gate_external_models(
     gate_external_models_in(&config::side_models_dir(), engine, options, evt_tx)
 }
 
-/// [`resolve_external_model_dirs_in`] plus the miss report: when the model is not
-/// installed, `WorkerEvent::ExternalModelMissing(spec)` is sent BEFORE the caller publishes
+/// Why the gate refused a request: the localized message, and the bundle that is not
+/// installed (empty when the refusal is not about a download, e.g. an EasyOCR language list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateRefusal {
+    message: String,
+    missing: Vec<&'static ExternalModelSpec>,
+}
+
+/// [`resolve_external_model_dirs_in`] plus the miss report: when the bundle is not
+/// installed, `WorkerEvent::ExternalModelMissing(bundle)` is sent BEFORE the caller publishes
 /// the error, so the tab re-probes the panel state in the same poll.
 ///
 /// # Errors
-/// See [`resolve_external_model_dirs_in`].
+/// The refusal's localized message (see [`resolve_external_model_dirs_in`]).
 fn gate_external_models_in(
     side_models_root: &Path,
     engine: OcrEngine,
     options: &OcrRuntimeOptions,
     evt_tx: &Sender<WorkerEvent>,
 ) -> Result<ExternalModelDirs, String> {
-    resolve_external_model_dirs_in(side_models_root, engine, options).inspect_err(|_| {
-        // Only an external-model engine can fail the gate, so the spec is always `Some`.
-        if let Some(spec) = external_model_spec(engine, options.paddle_vl_model)
-            && evt_tx.send(WorkerEvent::ExternalModelMissing(spec)).is_err()
-        {
-            ms_log::runtime_log::log_info(format!("[ocr] controller gone; cannot report missing model '{}'", spec.id));
+    resolve_external_model_dirs_in(side_models_root, engine, options).map_err(|refusal| {
+        if !refusal.missing.is_empty() {
+            let key = crate::ocr_model_download::bundle_key(&refusal.missing);
+            if evt_tx.send(WorkerEvent::ExternalModelMissing(refusal.missing)).is_err() {
+                ms_log::runtime_log::log_info(format!("[ocr] controller gone; cannot report missing model '{key}'"));
+            }
         }
+        refusal.message
     })
 }
 
-/// Resolves the installed external model of `engine` under `side_models_root` (stat-only,
-/// never downloads). Engines without an external model get `ExternalModelDirs::default()`.
+/// Resolves the installed external model bundle of `engine` under `side_models_root`
+/// (stat-only, never downloads). Engines without an external model get
+/// `ExternalModelDirs::default()`.
 ///
 /// # Errors
-/// The localized "model is not downloaded" message naming the exact download / resume
-/// button the OCR panel shows for the model's current state.
+/// For EasyOCR first the localized language-list error (`missing` empty); then, when any spec
+/// of the bundle is not installed, the localized "model is not downloaded" message naming the
+/// exact download / resume button the OCR panel shows for the bundle's current state.
 fn resolve_external_model_dirs_in(
     side_models_root: &Path,
     engine: OcrEngine,
     options: &OcrRuntimeOptions,
-) -> Result<ExternalModelDirs, String> {
-    let Some(spec) = external_model_spec(engine, options.paddle_vl_model) else {
-        return Ok(ExternalModelDirs::default());
-    };
-    match external_model_status(side_models_root, spec) {
-        ExternalModelStatus::Installed => {}
-        status @ (ExternalModelStatus::Partial { .. } | ExternalModelStatus::Missing) => {
-            ms_log::runtime_log::log_info(format!(
-                "[ocr] external model '{}' is not installed ({status:?}); asking the user to download it",
-                spec.id
-            ));
-            return Err(model_not_downloaded_error(spec, status));
-        }
+) -> Result<ExternalModelDirs, GateRefusal> {
+    if engine == OcrEngine::EasyOcr
+        && let Err(err) = easyocr_selection(&options.easy_langs)
+    {
+        ms_log::runtime_log::log_info(format!("[ocr] EasyOCR language list '{}' refused: {err}", options.easy_langs));
+        return Err(GateRefusal { message: easyocr_lang_error_message(&err), missing: Vec::new() });
     }
-    let dir = spec.local_dir(side_models_root);
+    let specs = external_model_specs(engine, options.paddle_vl_model, &options.easy_langs);
+    let statuses: Vec<(&'static ExternalModelSpec, ExternalModelStatus)> =
+        specs.iter().map(|spec| (*spec, external_model_status(side_models_root, spec))).collect();
+    if let Some((spec, status)) = statuses.iter().find(|(_, status)| *status != ExternalModelStatus::Installed) {
+        ms_log::runtime_log::log_info(format!(
+            "[ocr] external model '{}' is not installed ({status:?}); asking the user to download it",
+            spec.id
+        ));
+        return Err(GateRefusal { message: model_not_downloaded_error(&statuses), missing: specs });
+    }
+    let dir_of = |index: usize| specs.get(index).map(|spec| spec.local_dir(side_models_root));
     Ok(match engine {
-        OcrEngine::Baberu => ExternalModelDirs { baberu: Some(baberu_files(&dir)), ..ExternalModelDirs::default() },
-        OcrEngine::PaddleVl => ExternalModelDirs { paddle_vl: Some(dir), ..ExternalModelDirs::default() },
-        // `external_model_spec` returned `None` for these, so they returned above.
-        OcrEngine::MangaOcr | OcrEngine::EasyOcr | OcrEngine::PaddleOcr | OcrEngine::Surya | OcrEngine::AiApi => {
-            ExternalModelDirs::default()
-        }
+        OcrEngine::Baberu => ExternalModelDirs { baberu: dir_of(0).map(|dir| baberu_files(&dir)), ..ExternalModelDirs::default() },
+        OcrEngine::PaddleVl => ExternalModelDirs { paddle_vl: dir_of(0), ..ExternalModelDirs::default() },
+        // Every script spec lives in the one shared EasyOCR directory.
+        OcrEngine::EasyOcr => ExternalModelDirs { easyocr: dir_of(0), ..ExternalModelDirs::default() },
+        // `SURYA_OCR_SPECS` order: detection, recognition.
+        OcrEngine::Surya => ExternalModelDirs { surya_detection: dir_of(0), surya_recognition: dir_of(1), ..ExternalModelDirs::default() },
+        // `external_model_specs` is empty for these: nothing to resolve.
+        OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi => ExternalModelDirs::default(),
     })
 }
 
-/// The localized "not downloaded" error for `spec` in `status`, naming the button the
-/// panel shows for that state ("Download (size)" or "Resume download (done of total)").
-/// The caption comes from `ocr_model_download::download_label_for_status`, the panel's own
-/// owner of the visible caption; the tab re-probes the panel on the accompanying
+/// The localized "not downloaded" error for a bundle with these probe answers, naming the
+/// button the panel shows for that state ("Download (size)" or "Resume download (done of
+/// total)"). The caption comes from `ocr_model_download::download_label_for_statuses`, the
+/// panel's own owner of the visible caption; the tab re-probes the panel on the accompanying
 /// `ExternalModelMissing`, so both read the same disk state.
-fn model_not_downloaded_error(spec: &ExternalModelSpec, status: ExternalModelStatus) -> String {
-    let button = crate::ocr_model_download::download_label_for_status(spec, status);
+fn model_not_downloaded_error(statuses: &[(&'static ExternalModelSpec, ExternalModelStatus)]) -> String {
+    let button = crate::ocr_model_download::download_label_for_statuses(statuses);
     tf!("translation.ocr.model_not_downloaded_error", button = button)
 }
 
@@ -989,16 +1152,57 @@ pub(crate) fn ocr_route_availability(
 /// load guard) fresh off disk.
 ///
 /// Kept as one helper so [`current_ocr_route`] and the UI-side readiness gate read
-/// the exact same inputs. Involves disk I/O; callers must not invoke it on the
-/// GUI thread's hot path without their own caching. Desktop-only: the native
-/// runtime is compiled out on the web build.
+/// the exact same inputs. Disk I/O (and, on the process's first call, the native
+/// selection's hardware probes): worker threads only — the tab reads it through the
+/// background refresh in `tab/route_inputs.rs`. Desktop-only: the native runtime is
+/// compiled out on the web build.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn read_ocr_route_inputs() -> (config::AiRuntime, config::OrtLoadDecision) {
-    let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
+    let cfg = load_user_settings_for_routing();
     let runtime = effective_ai_runtime(&cfg);
     let scope = native_runtime::native_load_scope_key();
     let decision = config::ort_load_decision(config::read_ort_load_guard(&cfg, &scope));
     (runtime, decision)
+}
+
+/// Whether the last [`load_user_settings_for_routing`] failed; only edges are logged, so
+/// the tab's background refresh (every `OCR_ROUTE_INPUTS_CACHE_TTL`) does not spam the log.
+#[cfg(not(target_arch = "wasm32"))]
+static ROUTING_SETTINGS_READ_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records `failed` in `flag` and returns whether that changed the recorded state (the
+/// edge that is worth one log line).
+#[cfg(not(target_arch = "wasm32"))]
+fn failure_state_changed(flag: &std::sync::atomic::AtomicBool, failed: bool) -> bool {
+    flag.swap(failed, std::sync::atomic::Ordering::Relaxed) != failed
+}
+
+/// Reads `user_config` as stored for the OCR routing decision; worker threads only (disk I/O).
+///
+/// A failed read or parse keeps the routing fallback `Value::Null` (its defaults: the
+/// effective runtime of an empty config, no SIGILL guard entry) and is logged with the
+/// error (which names the document path) when the state changes (first failure, recovery), not on
+/// every repeat.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_user_settings_for_routing() -> Value {
+    match config::load_raw_user_settings_for_startup() {
+        Ok(cfg) => {
+            if failure_state_changed(&ROUTING_SETTINGS_READ_FAILED, false) {
+                ms_log::runtime_log::log_info("[ocr] user_config readable again for OCR routing");
+            }
+            cfg
+        }
+        Err(err) => {
+            if failure_state_changed(&ROUTING_SETTINGS_READ_FAILED, true) {
+                ms_log::runtime_log::log_warn(format!(
+                    "[ocr] failed to read user_config for OCR routing; routing with default \
+                     settings (empty config) until it is readable again.\nError (names the \
+                     document path): {err:#}\nPossible cause: the document is unreadable or malformed"
+                ));
+            }
+            Value::Null
+        }
+    }
 }
 
 /// Assembles an [`OcrRecognizeResult`] from a single native MangaOCR string,
@@ -1059,7 +1263,7 @@ fn current_ocr_route(engine: OcrEngine, manga_model_key: &str) -> OcrRoute {
 /// "no native path, using backend" log.
 #[cfg(not(target_arch = "wasm32"))]
 fn native_ai_runtime_selected() -> bool {
-    let cfg = config::load_raw_user_settings_for_startup().unwrap_or(Value::Null);
+    let cfg = load_user_settings_for_routing();
     effective_ai_runtime(&cfg) == config::AiRuntime::Native
 }
 
@@ -1078,6 +1282,9 @@ enum NativeOcrOutcome {
     Ok(OcrRecognizeResult),
     /// The native route was taken but failed. The string is the user-facing error.
     Failed(String),
+    /// The request's cancel token stopped a model download: published as
+    /// `RecognizeCancelled`, never retried on the backend.
+    Cancelled,
 }
 
 /// Attempts the native ONNX Runtime OCR path (MangaOCR, PaddleOCR or Baberu OCR) for
@@ -1086,7 +1293,8 @@ enum NativeOcrOutcome {
 /// Returns [`NativeOcrOutcome::Ok`] on success, [`NativeOcrOutcome::NotNative`]
 /// when the request has no native path (so the backend handles it), and
 /// [`NativeOcrOutcome::Failed`] when the native route was taken but crop decode or
-/// inference failed. The caller decides whether a `Failed` outcome falls back to
+/// inference failed, and [`NativeOcrOutcome::Cancelled`] when `cancel` stopped a model
+/// download (model events go to the controller as `ModelDownloadProgress`). The caller decides whether a `Failed` outcome falls back to
 /// the backend (if it is up) or is surfaced to the user (if the backend is offline).
 /// Failures are always logged with diagnostic context, never hidden. Runs on the
 /// OCR worker thread (blocking download/inference).
@@ -1095,6 +1303,7 @@ fn try_native_ocr(
     request: &OcrRecognizeRequest,
     model_dirs: &ExternalModelDirs,
     page_cache: &mut PageImageCache,
+    cancel: &AtomicBool,
     evt_tx: &Sender<WorkerEvent>,
 ) -> NativeOcrOutcome {
     let route = current_ocr_route(request.engine, &request.options.manga_model);
@@ -1119,20 +1328,26 @@ fn try_native_ocr(
         }
     };
 
-    // Adapt ORT dylib/model download progress to the OCR download-state event so
-    // the UI shows activity while the runtime/model is fetched on first use.
+    // Adapt ORT dylib progress to the OCR download-state event (once) and forward model
+    // download events, so the UI shows activity while the runtime/model is fetched on first
+    // use. Sends are best effort: a gone controller is noticed by the publish that follows.
     let mut reported = false;
-    let mut progress = |snapshot: OrtDownloadProgress| {
-        if !reported
-            && matches!(
-                snapshot.stage,
-                OrtDownloadStage::Downloading
-                    | OrtDownloadStage::Verifying
-                    | OrtDownloadStage::Extracting
-            )
-        {
-            reported = true;
-            let _ = evt_tx.send(WorkerEvent::ModelDownloadStarted);
+    let mut progress = |update: native_runtime::NativeProgress<'_>| match update {
+        native_runtime::NativeProgress::Runtime(snapshot) => {
+            if !reported
+                && matches!(
+                    snapshot.stage,
+                    OrtDownloadStage::Downloading
+                        | OrtDownloadStage::Verifying
+                        | OrtDownloadStage::Extracting
+                )
+            {
+                reported = true;
+                let _ = evt_tx.send(WorkerEvent::ModelDownloadStarted);
+            }
+        }
+        native_runtime::NativeProgress::Model(event) => {
+            let _ = evt_tx.send(WorkerEvent::ModelDownloadProgress(event.clone()));
         }
     };
 
@@ -1140,17 +1355,17 @@ fn try_native_ocr(
     // `assemble_native_ocr_result` applies the same join/reflect logic as MangaOCR.
     let native_result: Result<String, native_runtime::NativeRuntimeError> = match route {
         OcrRoute::NativeManga(variant) => {
-            native_runtime::recognize_manga(variant, &rgba, &mut progress)
+            native_runtime::recognize_manga(variant, &rgba, cancel, &mut progress)
         }
         OcrRoute::NativePaddle => {
-            native_runtime::recognize_paddle(&request.options.paddle_lang, &rgba, &mut progress)
+            native_runtime::recognize_paddle(&request.options.paddle_lang, &rgba, cancel, &mut progress)
                 .map(|lines| lines.join("\n"))
         }
         OcrRoute::NativeBaberu => match model_dirs.baberu.as_ref() {
-            Some(files) => native_runtime::recognize_baberu(&baberu_model_paths(files), &rgba, &mut progress),
+            Some(files) => native_runtime::recognize_baberu(&baberu_model_paths(files), &rgba, cancel, &mut progress),
             // The gate resolves Baberu files before any Baberu dispatch; without them the
             // model is simply not installed.
-            None => return NativeOcrOutcome::Failed(model_not_downloaded_error(&BABERU_OCR, ExternalModelStatus::Missing)),
+            None => return NativeOcrOutcome::Failed(model_not_downloaded_error(&[(&BABERU_OCR, ExternalModelStatus::Missing)])),
         },
         // `Backend` is handled above; unreachable here but matched exhaustively.
         OcrRoute::Backend => return NativeOcrOutcome::NotNative,
@@ -1162,6 +1377,10 @@ fn try_native_ocr(
             request.join_newlines,
             request.reflect_strings,
         )),
+        Err(native_runtime::NativeRuntimeError::Cancelled) => {
+            ms_log::runtime_log::log_info(format!("[ocr] native {} request cancelled during a model download", native_ocr_engine_label(route)));
+            NativeOcrOutcome::Cancelled
+        }
         Err(err) => {
             // Log with the fallback framing for diagnostics; a Suspect guard never
             // reaches here (it routes to Backend). Log the `Debug` form (a stable
@@ -1222,28 +1441,29 @@ fn native_failure_should_surface(backend_available: bool) -> bool {
 /// Returns `ControlFlow::Break` only when the worker should stop (Stop received
 /// or the event channel is gone).
 fn run_recognize_command(
-    mut request: OcrRecognizeRequest,
+    mut job: QueuedRecognize,
     page_cache: &mut PageImageCache,
     cmd_rx: &Receiver<WorkerCommand>,
     evt_tx: &Sender<WorkerEvent>,
     generation: &GenerationTracker,
 ) -> std::ops::ControlFlow<()> {
     loop {
+        let request = &job.request;
         let request_id = request.request_id;
 
         // The AI-API engine runs over `genai`, not the framed socket, so it has
         // no IPC cancel; it runs synchronously and is stopped through the
         // generation tracker instead (the panel's "Stop", or the controller drop).
         if request.engine == OcrEngine::AiApi {
-            let result = match run_ai_api_ocr_request(&request, page_cache, generation) {
+            let result = match run_ai_api_ocr_request(request, page_cache, generation) {
                 Ok(mut result) => {
-                    apply_post_ocr_processing(&mut result, &request);
+                    apply_post_ocr_processing(&mut result, request);
                     Ok(result)
                 }
-                Err(AiApiOcrFailure::Cancelled) => {
+                Err(OcrFailure::Cancelled) => {
                     return publish_worker_event(WorkerEvent::RecognizeCancelled { request_id }, evt_tx);
                 }
-                Err(AiApiOcrFailure::Failed(error)) => Err(error),
+                Err(OcrFailure::Failed(error)) => Err(error),
             };
             return publish_recognize(request_id, result, evt_tx);
         }
@@ -1262,10 +1482,13 @@ fn run_recognize_command(
         // "backend offline" message. A non-native op falls through to the backend.
         // Desktop-only: the native runtime is compiled out on the web build.
         #[cfg(not(target_arch = "wasm32"))]
-        match try_native_ocr(&request, &model_dirs, page_cache, evt_tx) {
+        match try_native_ocr(request, &model_dirs, page_cache, &job.cancel, evt_tx) {
             NativeOcrOutcome::Ok(mut result) => {
-                apply_post_ocr_processing(&mut result, &request);
+                apply_post_ocr_processing(&mut result, request);
                 return publish_recognize(request_id, Ok(result), evt_tx);
+            }
+            NativeOcrOutcome::Cancelled => {
+                return publish_worker_event(WorkerEvent::RecognizeCancelled { request_id }, evt_tx);
             }
             NativeOcrOutcome::Failed(native_error) => {
                 // Only path is native when the backend is down: surface its error.
@@ -1279,13 +1502,16 @@ fn run_recognize_command(
             }
         }
 
-        match run_backend_recognize(&request, &model_dirs, page_cache, cmd_rx) {
+        match run_backend_recognize(request, &model_dirs, page_cache, &job.cancel, cmd_rx, evt_tx) {
             BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(result)) => {
                 let result = result.map(|mut result| {
-                    apply_post_ocr_processing(&mut result, &request);
+                    apply_post_ocr_processing(&mut result, request);
                     result
                 });
                 return publish_recognize(request_id, result, evt_tx);
+            }
+            BackendRecognizeFlow::Cancelled => {
+                return publish_worker_event(WorkerEvent::RecognizeCancelled { request_id }, evt_tx);
             }
             // The in-flight request was superseded but no follow-up was captured
             // (e.g. cancel raced an empty queue): drop it silently, like the old
@@ -1296,7 +1522,7 @@ fn run_recognize_command(
             // A newer selection superseded this one: drop the old request silently
             // and loop to process the newer request next.
             BackendRecognizeFlow::Superseded(next) => {
-                request = *next;
+                job = *next;
             }
             BackendRecognizeFlow::Stop => return std::ops::ControlFlow::Break(()),
         }
@@ -1308,7 +1534,9 @@ enum BackendRecognizeFlow {
     /// Terminal outcome for the current request (deliver it).
     Outcome(RecognizeOutcome),
     /// A newer `Recognize` arrived and cancelled this one; process `next`.
-    Superseded(Box<OcrRecognizeRequest>),
+    Superseded(Box<QueuedRecognize>),
+    /// The request's cancel token stopped its model download (published as cancelled).
+    Cancelled,
     /// A `Stop` arrived; the worker should break.
     Stop,
 }
@@ -1321,10 +1549,14 @@ fn run_backend_recognize(
     request: &OcrRecognizeRequest,
     model_dirs: &ExternalModelDirs,
     page_cache: &mut PageImageCache,
+    cancel: &AtomicBool,
     cmd_rx: &Receiver<WorkerCommand>,
+    evt_tx: &Sender<WorkerEvent>,
 ) -> BackendRecognizeFlow {
-    if let Err(err) = ensure_backend_ocr_models_for_request(request.engine, &request.options) {
-        return BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(Err(err)));
+    match ensure_backend_ocr_models(request.engine, &request.options, cancel, evt_tx) {
+        Ok(()) => {}
+        Err(ModelEnsureError::Cancelled) => return BackendRecognizeFlow::Cancelled,
+        Err(ModelEnsureError::Failed(err)) => return BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(Err(err))),
     }
     if let Err(err) = ensure_v2_backend_ready() {
         return BackendRecognizeFlow::Outcome(RecognizeOutcome::Done(Err(err)));
@@ -1400,7 +1632,7 @@ fn watch_for_supersede(
 
         // 2) Otherwise, check for a superseding command.
         let superseding = match cmd_rx.try_recv() {
-            Ok(WorkerCommand::Recognize(next)) => Some(WorkerCommand::Recognize(next)),
+            Ok(WorkerCommand::Recognize { request, cancel }) => Some(WorkerCommand::Recognize { request, cancel }),
             Ok(WorkerCommand::Stop) => Some(WorkerCommand::Stop),
             // Ignore non-superseding commands mid-recognize.
             Ok(_) | Err(TryRecvError::Empty) => None,
@@ -1416,7 +1648,7 @@ fn watch_for_supersede(
             let _ = client.cancel(in_flight_id);
             let _ = result_rx.recv_timeout(OCR_SUPERSEDE_DRAIN_TIMEOUT);
             return match command {
-                WorkerCommand::Recognize(next) => BackendRecognizeFlow::Superseded(Box::new(next)),
+                WorkerCommand::Recognize { request, cancel } => BackendRecognizeFlow::Superseded(Box::new(QueuedRecognize { request, cancel })),
                 _ => BackendRecognizeFlow::Stop,
             };
         }
@@ -1433,50 +1665,26 @@ fn interpret_call_result(result: Result<(Value, Vec<u8>), CallError>) -> Recogni
     }
 }
 
+/// Ensures the app-managed model files a backend OCR `engine` needs (PaddleOCR, MangaOCR
+/// ONNX); download events go to the controller and `cancel` stops a download. External
+/// models (PaddleOCR-VL, Baberu, EasyOCR, Surya) are only gated (`gate_external_models`), never
+/// fetched here; AI API has no local model.
 fn ensure_backend_ocr_models(
     engine: OcrEngine,
     options: &OcrRuntimeOptions,
+    cancel: &AtomicBool,
     evt_tx: &Sender<WorkerEvent>,
-) -> Result<(), String> {
-    let mut reported = false;
-    let mut report_download = || {
-        if !reported {
-            let _ = evt_tx.send(WorkerEvent::ModelDownloadStarted);
-            reported = true;
-        }
-    };
-    ensure_backend_ocr_models_inner(engine, options, Some(&mut report_download))
-}
-
-fn ensure_backend_ocr_models_for_request(
-    engine: OcrEngine,
-    options: &OcrRuntimeOptions,
-) -> Result<(), String> {
-    ensure_backend_ocr_models_inner(engine, options, None)
-}
-
-fn ensure_backend_ocr_models_inner(
-    engine: OcrEngine,
-    options: &OcrRuntimeOptions,
-    reporter: ai_models::ModelDownloadReporter<'_>,
-) -> Result<(), String> {
+) -> Result<(), ModelEnsureError> {
     let models_root = config::models_dir();
     match engine {
         OcrEngine::PaddleOcr => {
-            ai_models::ensure_paddle_ocr_full_with_reporter(
-                &models_root,
-                &options.paddle_lang,
-                reporter,
-            )?;
+            ensure_with_events(cancel, evt_tx, |ctx| ai_models::ensure_paddle_ocr_full(&models_root, &options.paddle_lang, ctx))?;
         }
         OcrEngine::MangaOcr => {
             if let Some(model) = ai_models::manga_ocr_model_from_key(&options.manga_model) {
-                ai_models::ensure_manga_ocr_onnx_with_reporter(&models_root, model, reporter)?;
+                ensure_with_events(cancel, evt_tx, |ctx| ai_models::ensure_manga_ocr_onnx(&models_root, model, ctx))?;
             }
         }
-        // PaddleOCR-VL and Baberu use pinned external models that only the panel's explicit
-        // download installs (`gate_external_models` gates them; nothing is fetched
-        // here). EasyOCR/Surya keep their library-managed caches; AI API has no local model.
         OcrEngine::EasyOcr | OcrEngine::PaddleVl | OcrEngine::Surya | OcrEngine::Baberu | OcrEngine::AiApi => {}
     }
     Ok(())
@@ -1591,19 +1799,28 @@ fn validate_ai_api_options(options: &OcrRuntimeOptions) -> Result<AiApiTarget, S
     Ok(target)
 }
 
-/// Why an AI API recognize produced no result.
+/// Why a load or recognize step produced no result (AI API request, model download).
 #[derive(Debug)]
-enum AiApiOcrFailure {
-    /// The user stopped the request (or the controller was dropped): published as
-    /// `RecognizeCancelled`, never as an error.
+enum OcrFailure {
+    /// The user stopped the request, a newer command superseded it, or the controller was
+    /// dropped: published as `RecognizeCancelled` / a cancelled load, never as an error.
     Cancelled,
     /// A real failure; the text is the user-facing error.
     Failed(String),
 }
 
-impl From<String> for AiApiOcrFailure {
+impl From<String> for OcrFailure {
     fn from(error: String) -> Self {
         Self::Failed(error)
+    }
+}
+
+impl From<ModelEnsureError> for OcrFailure {
+    fn from(error: ModelEnsureError) -> Self {
+        match error {
+            ModelEnsureError::Cancelled => Self::Cancelled,
+            ModelEnsureError::Failed(text) => Self::Failed(text),
+        }
     }
 }
 
@@ -1614,8 +1831,8 @@ fn run_ai_api_ocr_request(
     _request: &OcrRecognizeRequest,
     _page_cache: &mut PageImageCache,
     _generation: &GenerationTracker,
-) -> Result<OcrRecognizeResult, AiApiOcrFailure> {
-    Err(AiApiOcrFailure::Failed(t!("translation.ocr.ai_api_web_unavailable_error").to_string()))
+) -> Result<OcrRecognizeResult, OcrFailure> {
+    Err(OcrFailure::Failed(t!("translation.ocr.ai_api_web_unavailable_error").to_string()))
 }
 
 /// Recognizes the request's crop with the selected AI API model through
@@ -1626,10 +1843,10 @@ fn run_ai_api_ocr_request(
     request: &OcrRecognizeRequest,
     page_cache: &mut PageImageCache,
     generation: &GenerationTracker,
-) -> Result<OcrRecognizeResult, AiApiOcrFailure> {
+) -> Result<OcrRecognizeResult, OcrFailure> {
     // The controller is gone: skip the crop and the (possibly blocking) keyring read.
     if generation.is_closed() {
-        return Err(AiApiOcrFailure::Cancelled);
+        return Err(OcrFailure::Cancelled);
     }
     let target = validate_ai_api_options(&request.options)?;
     let crop_png = crop_image_as_png(request, page_cache)?;
@@ -1664,8 +1881,8 @@ fn run_ai_api_ocr_request(
     .map_err(|err| tf!("translation.ocr.async_runtime_error", err = err))?;
     let text = match text {
         Ok(validated) => validated.value,
-        Err(AiApiError::Cancelled) => return Err(AiApiOcrFailure::Cancelled),
-        Err(err) => return Err(AiApiOcrFailure::Failed(tf!("translation.ocr.ai_api_request_failed_error", err = err.chat_failure_detail()))),
+        Err(AiApiError::Cancelled) => return Err(OcrFailure::Cancelled),
+        Err(err) => return Err(OcrFailure::Failed(tf!("translation.ocr.ai_api_request_failed_error", err = err.chat_failure_detail()))),
     };
 
     let lines = text
@@ -1791,10 +2008,11 @@ fn approx_image_size_bytes(image: &DynamicImage) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
+        failure_state_changed,
         AiApiService, CallError, CharReplacementRule, OcrEngine, OcrRecognizeResult,
         OcrRecognizeRequest, OcrRoute, OcrRuntimeOptions, RecognizeOutcome, apply_char_replacements,
         apply_post_ocr_processing, assemble_native_ocr_result, interpret_call_result,
-        ExternalModelDirs, native_failure_should_surface, ocr_header_fields,
+        ExternalModelDirs, ExternalModelSpec, native_failure_should_surface, ocr_header_fields,
         ocr_route, ocr_route_availability, ocr_route_kind, ocr_route_needs_backend_warmup,
         parse_ocr_response,
     };
@@ -2321,6 +2539,17 @@ mod tests {
         ocr_route_kind(engine, manga_model_key, runtime, guard) == AiRouteKind::Backend
     }
 
+    /// Only the first failure and the recovery are edges; repeats of either state are not.
+    #[test]
+    fn failure_state_changes_only_on_edges() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!failure_state_changed(&flag, false));
+        assert!(failure_state_changed(&flag, true));
+        assert!(!failure_state_changed(&flag, true));
+        assert!(failure_state_changed(&flag, false));
+        assert!(!failure_state_changed(&flag, false));
+    }
+
     const ALL_ENGINES: [OcrEngine; 7] = [
         OcrEngine::MangaOcr,
         OcrEngine::EasyOcr,
@@ -2549,22 +2778,51 @@ mod tests {
     }
 
     #[test]
-    fn external_model_spec_maps_only_baberu_and_paddle_vl() {
-        use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant};
+    fn external_model_specs_map_each_engine_to_its_bundle() {
+        use ms_sysprobe::ai_models::easyocr::{EasyOcrScript, easyocr_spec};
+        use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant, SURYA_DETECTION_2025_05_07, SURYA_RECOGNITION_2025_09_23};
+        let ids = |specs: Vec<&'static ExternalModelSpec>| specs.iter().map(|spec| spec.id).collect::<Vec<_>>();
         for engine in all_engines() {
             for variant in PaddleVlVariant::ALL {
-                let spec = super::external_model_spec(engine, variant);
+                let specs = ids(super::external_model_specs(engine, variant, "ko"));
                 match engine {
-                    OcrEngine::Baberu => assert_eq!(spec.map(|s| s.id), Some(BABERU_OCR.id)),
-                    OcrEngine::PaddleVl => assert_eq!(spec.map(|s| s.id), Some(variant.spec().id)),
-                    OcrEngine::MangaOcr
-                    | OcrEngine::EasyOcr
-                    | OcrEngine::PaddleOcr
-                    | OcrEngine::Surya
-                    | OcrEngine::AiApi => assert!(spec.is_none(), "{engine:?}"),
+                    OcrEngine::Baberu => assert_eq!(specs, [BABERU_OCR.id]),
+                    OcrEngine::PaddleVl => assert_eq!(specs, [variant.spec().id]),
+                    OcrEngine::EasyOcr => assert_eq!(specs, [easyocr_spec(EasyOcrScript::Korean).id]),
+                    OcrEngine::Surya => assert_eq!(specs, [SURYA_DETECTION_2025_05_07.id, SURYA_RECOGNITION_2025_09_23.id]),
+                    OcrEngine::MangaOcr | OcrEngine::PaddleOcr | OcrEngine::AiApi => assert!(specs.is_empty(), "{engine:?}"),
                 }
             }
         }
+        // The EasyOCR spec follows the script of the (normalized) language list.
+        let easy = |langs: &str| ids(super::external_model_specs(OcrEngine::EasyOcr, PaddleVlVariant::MangaJa, langs));
+        assert_eq!(easy("en"), [easyocr_spec(EasyOcrScript::English).id]);
+        assert_eq!(easy("ja, en"), [easyocr_spec(EasyOcrScript::Japanese).id]);
+        assert_eq!(easy("zh"), [easyocr_spec(EasyOcrScript::ChineseSim).id]);
+        assert_eq!(easy("de, fr"), [easyocr_spec(EasyOcrScript::Latin).id]);
+        // A list easyocr refuses has no spec (the gate reports the language error instead).
+        assert!(easy("ko, ja").is_empty());
+        assert!(easy("xx").is_empty());
+    }
+
+    /// Every EasyOCR language-list error maps to its own localized message, carrying only
+    /// codes and the recognizer file name.
+    #[test]
+    fn easyocr_language_errors_are_localized_per_variant() {
+        use ms_sysprobe::ai_models::easyocr::{EasyOcrLangError, EasyOcrScript};
+        assert_eq!(super::easyocr_lang_error_message(&EasyOcrLangError::Empty), t!("translation.ocr.easyocr_no_language_error"));
+        let unsupported = EasyOcrLangError::Unsupported { codes: vec!["xx".to_owned(), "yy".to_owned()] };
+        assert_eq!(
+            super::easyocr_lang_error_message(&unsupported),
+            tf!("translation.ocr.easyocr_unsupported_language_error", codes = "xx, yy")
+        );
+        let incompatible = super::easyocr_selection("ko, ja").expect_err("korean + japanese is refused by easyocr");
+        assert!(matches!(incompatible, EasyOcrLangError::Incompatible { script: EasyOcrScript::Japanese, .. }), "{incompatible:?}");
+        assert_eq!(
+            super::easyocr_lang_error_message(&incompatible),
+            tf!("translation.ocr.easyocr_incompatible_languages_error", model = EasyOcrScript::Japanese.recognizer_file(), codes = "ja, en")
+        );
+        assert_eq!(super::easyocr_selection(" KOR , en,ko"), Ok((vec!["ko".to_owned(), "en".to_owned()], EasyOcrScript::Korean)));
     }
 
     #[test]
@@ -2573,6 +2831,9 @@ mod tests {
         let dirs = ExternalModelDirs {
             paddle_vl: Some(std::path::PathBuf::from("/models/side_models/PaddleOCR-VL/manga_ja")),
             baberu: Some(baberu_files(std::path::Path::new("/models/side_models/BaberuOCR"))),
+            easyocr: Some(std::path::PathBuf::from("/models/side_models/EasyOCR")),
+            surya_recognition: Some(std::path::PathBuf::from("/models/side_models/Surya/text_recognition/2025_09_23")),
+            surya_detection: Some(std::path::PathBuf::from("/models/side_models/Surya/text_detection/2025_05_07")),
         };
         let header = ocr_header_fields(&sample_options(), &dirs, true, false).expect("utf-8 paths");
         assert_eq!(header["paddle_vl_model"], json!("manga_ja"));
@@ -2583,13 +2844,36 @@ mod tests {
         assert_eq!(files["prefill"], json!(expected.prefill.to_str().expect("utf-8")));
         assert_eq!(files["step"], json!(expected.step.to_str().expect("utf-8")));
         assert_eq!(files["vocab"], json!(expected.vocab.to_str().expect("utf-8")));
+        // The v12 directories under the protocol mirror's key names.
+        assert_eq!(header[protocol::HEADER_EASYOCR_MODEL_DIR], json!("/models/side_models/EasyOCR"));
+        assert_eq!(header[protocol::HEADER_SURYA_RECOGNITION_DIR], json!("/models/side_models/Surya/text_recognition/2025_09_23"));
+        assert_eq!(header[protocol::HEADER_SURYA_DETECTION_DIR], json!("/models/side_models/Surya/text_detection/2025_05_07"));
 
-        // Without resolved models both fields are explicit nulls (the backend ignores them
-        // for other methods; `ocr.paddle_vl` / `ocr.baberu` never get here unresolved).
+        // Without resolved models every field is an explicit null (the backend ignores them
+        // for other methods; the methods requiring them never get here unresolved).
         let bare = ocr_header_fields(&sample_options(), &ExternalModelDirs::default(), true, false).expect("no paths");
-        assert_eq!(bare["paddle_vl_model_dir"], Value::Null);
-        assert_eq!(bare["baberu_model_files"], Value::Null);
+        for key in [
+            "paddle_vl_model_dir",
+            "baberu_model_files",
+            protocol::HEADER_EASYOCR_MODEL_DIR,
+            protocol::HEADER_SURYA_RECOGNITION_DIR,
+            protocol::HEADER_SURYA_DETECTION_DIR,
+        ] {
+            assert_eq!(bare[key], Value::Null, "{key}");
+        }
         assert_eq!(bare["paddle_vl_model"], json!("manga_ja"));
+    }
+
+    /// `easy_langs` goes out canonical (aliases mapped, trimmed, deduplicated), because the
+    /// backend no longer normalizes it (v12).
+    #[test]
+    fn header_sends_canonical_easyocr_languages() {
+        let options = super::OcrRuntimeOptions { easy_langs: " Kor, EN , jp, ko".to_string(), ..sample_options() };
+        let header = ocr_header_fields(&options, &ExternalModelDirs::default(), true, false).expect("no paths");
+        assert_eq!(header[protocol::HEADER_EASY_LANGS], json!("ko,en,ja"));
+        let empty = super::OcrRuntimeOptions { easy_langs: " , ".to_string(), ..sample_options() };
+        let header = ocr_header_fields(&empty, &ExternalModelDirs::default(), true, false).expect("no paths");
+        assert_eq!(header[protocol::HEADER_EASY_LANGS], json!("ko"));
     }
 
     /// A model path that is not UTF-8 must be rejected, never sent lossily.
@@ -2598,57 +2882,165 @@ mod tests {
     fn non_utf8_model_path_is_a_header_error() {
         use std::os::unix::ffi::OsStrExt;
         let bad = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/models/\xff\xfe"));
-        let dirs = ExternalModelDirs { paddle_vl: Some(bad), baberu: None };
+        let dirs = ExternalModelDirs { paddle_vl: Some(bad.clone()), ..ExternalModelDirs::default() };
+        assert!(ocr_header_fields(&sample_options(), &dirs, true, false).is_err());
+        let dirs = ExternalModelDirs { surya_detection: Some(bad), ..ExternalModelDirs::default() };
         assert!(ocr_header_fields(&sample_options(), &dirs, true, false).is_err());
     }
 
-    /// The gate on a fresh (empty) `side_models` root: Baberu and every PaddleOCR-VL variant
-    /// fail with the localized "not downloaded" error naming the download button; engines
-    /// without an external model pass with empty dirs. Stat-only, nothing is written.
+    /// The "not downloaded" refusal the gate builds for `specs`, all missing.
+    fn not_downloaded(specs: &[&'static ExternalModelSpec]) -> super::GateRefusal {
+        let statuses: Vec<(&ExternalModelSpec, super::ExternalModelStatus)> =
+            specs.iter().map(|spec| (*spec, super::ExternalModelStatus::Missing)).collect();
+        let button = crate::ocr_model_download::download_label_for_statuses(&statuses);
+        super::GateRefusal { message: tf!("translation.ocr.model_not_downloaded_error", button = button), missing: specs.to_vec() }
+    }
+
+    /// The gate on a fresh (empty) `side_models` root: every external-model engine (Baberu,
+    /// each PaddleOCR-VL variant, EasyOCR, Surya) fails with the localized "not downloaded"
+    /// error naming the download button of its whole bundle; engines without an external
+    /// model pass with empty dirs; an EasyOCR list easyocr refuses fails with the language
+    /// error and no bundle. Stat-only, nothing is written.
     #[test]
     fn gate_reports_not_downloaded_on_an_empty_root() {
+        use ms_sysprobe::ai_models::easyocr::{EasyOcrScript, easyocr_spec};
         use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant};
         let root = std::env::temp_dir().join(format!("ms_tab_translation_gate_{}_absent", std::process::id()));
         assert!(!root.exists(), "the probe root must not exist: {}", root.display());
-        let baberu = super::resolve_external_model_dirs_in(&root, OcrEngine::Baberu, &sample_options());
-        let missing = super::ExternalModelStatus::Missing;
-        let expected_button = crate::ocr_model_download::download_label_for_status(&BABERU_OCR, missing);
-        assert_eq!(baberu, Err(tf!("translation.ocr.model_not_downloaded_error", button = expected_button)));
+        let resolve = |engine, options: &super::OcrRuntimeOptions| super::resolve_external_model_dirs_in(&root, engine, options);
+        assert_eq!(resolve(OcrEngine::Baberu, &sample_options()), Err(not_downloaded(&[&BABERU_OCR])));
         for variant in PaddleVlVariant::ALL {
             let options = super::OcrRuntimeOptions { paddle_vl_model: variant, ..sample_options() };
-            let result = super::resolve_external_model_dirs_in(&root, OcrEngine::PaddleVl, &options);
-            let button = crate::ocr_model_download::download_label_for_status(variant.spec(), missing);
-            assert_eq!(result, Err(tf!("translation.ocr.model_not_downloaded_error", button = button)), "{variant:?}");
+            assert_eq!(resolve(OcrEngine::PaddleVl, &options), Err(not_downloaded(&[variant.spec()])), "{variant:?}");
         }
-        for engine in [OcrEngine::MangaOcr, OcrEngine::EasyOcr, OcrEngine::PaddleOcr, OcrEngine::Surya, OcrEngine::AiApi] {
-            assert_eq!(
-                super::resolve_external_model_dirs_in(&root, engine, &sample_options()),
-                Ok(ExternalModelDirs::default()),
-                "{engine:?}"
-            );
+        assert_eq!(resolve(OcrEngine::EasyOcr, &sample_options()), Err(not_downloaded(&[easyocr_spec(EasyOcrScript::Korean)])));
+        assert_eq!(resolve(OcrEngine::Surya, &sample_options()), Err(not_downloaded(&super::SURYA_OCR_SPECS)));
+        let bad_langs = super::OcrRuntimeOptions { easy_langs: "ko, ja".to_string(), ..sample_options() };
+        let refusal = resolve(OcrEngine::EasyOcr, &bad_langs).expect_err("korean + japanese is refused");
+        assert!(refusal.missing.is_empty());
+        let lang_err = super::easyocr_selection("ko, ja").expect_err("refused");
+        assert_eq!(refusal.message, super::easyocr_lang_error_message(&lang_err));
+        for engine in [OcrEngine::MangaOcr, OcrEngine::PaddleOcr, OcrEngine::AiApi] {
+            assert_eq!(resolve(engine, &sample_options()), Ok(ExternalModelDirs::default()), "{engine:?}");
         }
         assert!(!root.exists(), "the gate must not create anything");
     }
 
-    /// M1: a gate miss reports WHICH spec is missing (so the tab re-probes the panel) before
-    /// the caller publishes the error; a pass, or an engine without an external model,
-    /// reports nothing.
+    /// M1: a gate miss reports WHICH bundle is missing (so the tab re-probes the panel) before
+    /// the caller publishes the error; a pass, an engine without an external model, or a
+    /// language-list refusal reports nothing.
     #[test]
     fn gate_miss_reports_the_missing_spec() {
         use ms_sysprobe::ai_models::external_catalog::{BABERU_OCR, PaddleVlVariant};
         let root = std::env::temp_dir().join(format!("ms_tab_translation_gate_report_{}_absent", std::process::id()));
         assert!(!root.exists(), "the probe root must not exist: {}", root.display());
         let (tx, rx) = std::sync::mpsc::channel();
+        let reported = |rx: &std::sync::mpsc::Receiver<super::WorkerEvent>| match rx.try_recv() {
+            Ok(super::WorkerEvent::ExternalModelMissing(specs)) => Some(crate::ocr_model_download::bundle_key(&specs)),
+            Ok(_) | Err(_) => None,
+        };
         assert!(super::gate_external_models_in(&root, OcrEngine::Baberu, &sample_options(), &tx).is_err());
-        assert!(matches!(rx.try_recv(), Ok(super::WorkerEvent::ExternalModelMissing(spec)) if spec.id == BABERU_OCR.id));
+        assert_eq!(reported(&rx), Some(BABERU_OCR.id.to_owned()));
         let options = super::OcrRuntimeOptions { paddle_vl_model: PaddleVlVariant::MangaJa, ..sample_options() };
         assert!(super::gate_external_models_in(&root, OcrEngine::PaddleVl, &options, &tx).is_err());
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(super::WorkerEvent::ExternalModelMissing(spec)) if spec.id == PaddleVlVariant::MangaJa.spec().id
-        ));
+        assert_eq!(reported(&rx), Some(PaddleVlVariant::MangaJa.spec().id.to_owned()));
+        assert!(super::gate_external_models_in(&root, OcrEngine::Surya, &sample_options(), &tx).is_err());
+        assert_eq!(reported(&rx), Some(crate::ocr_model_download::bundle_key(&super::SURYA_OCR_SPECS)));
+        let bad_langs = super::OcrRuntimeOptions { easy_langs: "xx".to_string(), ..sample_options() };
+        assert!(super::gate_external_models_in(&root, OcrEngine::EasyOcr, &bad_langs, &tx).is_err());
+        assert!(rx.try_recv().is_err(), "a language refusal reports no bundle");
         assert!(super::gate_external_models_in(&root, OcrEngine::MangaOcr, &sample_options(), &tx).is_ok());
         assert!(rx.try_recv().is_err(), "a pass reports nothing");
         assert!(!root.exists(), "the gate must not create anything");
+    }
+
+    /// A controller over in-test channels instead of a worker thread: the test plays the
+    /// worker (reads the commands, sends the events).
+    fn controller_with_fake_worker() -> (super::TranslationOcrController, std::sync::mpsc::Sender<super::WorkerEvent>, std::sync::mpsc::Receiver<super::WorkerCommand>) {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+        let controller = super::TranslationOcrController {
+            state: super::OcrLoadState::NotLoaded,
+            last_error: None,
+            last_result: None,
+            pending_request: None,
+            cmd_tx,
+            evt_rx,
+            worker_thread: None,
+            generation: super::GenerationTracker::new(),
+            command_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        (controller, evt_tx, cmd_rx)
+    }
+
+    fn download_event() -> ms_sysprobe::ai_models::ModelDownloadEvent {
+        ms_sysprobe::ai_models::ModelDownloadEvent {
+            file: "ONNX/MangaOCR/base/encoder_model.onnx".to_string(),
+            file_index: 0,
+            file_count: 6,
+            phase: ms_sysprobe::ai_models::ModelDownloadPhase::Downloading,
+            staged: 1024,
+            total: Some(4096),
+        }
+    }
+
+    /// The panel's Cancel reaches the running command's token only while a model download
+    /// runs; in any other state it is a no-op.
+    #[test]
+    fn cancel_model_download_sets_the_running_commands_token_only_while_downloading() {
+        let (mut controller, evt_tx, cmd_rx) = controller_with_fake_worker();
+        controller.request_recognize(sample_post_processing_request(Vec::new(), false));
+        let Ok(super::WorkerCommand::Load { cancel, .. }) = cmd_rx.try_recv() else {
+            panic!("the request must start a load");
+        };
+        controller.cancel_model_download();
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed), "a plain load is not cancelled");
+        evt_tx.send(super::WorkerEvent::ModelDownloadProgress(download_event())).expect("the controller listens");
+        let _ = controller.poll_events();
+        controller.cancel_model_download();
+        assert!(cancel.load(std::sync::atomic::Ordering::Relaxed), "the download of the load must stop");
+    }
+
+    /// A load whose model download is cancelled ends neutrally: back to `NotLoaded`, and the
+    /// request that waited for it is reported as cancelled — never as an error. Download events
+    /// move the state to `DownloadingModel` and reach the tab.
+    #[test]
+    fn a_cancelled_model_download_during_load_ends_as_cancelled_not_as_an_error() {
+        let (mut controller, evt_tx, cmd_rx) = controller_with_fake_worker();
+        controller.request_recognize(sample_post_processing_request(Vec::new(), false));
+        assert!(matches!(cmd_rx.try_recv(), Ok(super::WorkerCommand::Load { .. })));
+
+        evt_tx.send(super::WorkerEvent::ModelDownloadProgress(download_event())).expect("the controller listens");
+        let events = controller.poll_events();
+        assert!(matches!(events.first(), Some(super::OcrControllerEvent::StateChanged(super::OcrLoadState::DownloadingModel))));
+        assert!(matches!(events.get(1), Some(super::OcrControllerEvent::ModelDownloadProgress(event)) if event.staged == 1024));
+
+        evt_tx.send(super::WorkerEvent::LoadCancelled).expect("the controller listens");
+        let events = controller.poll_events();
+        assert!(matches!(events.first(), Some(super::OcrControllerEvent::StateChanged(super::OcrLoadState::NotLoaded))));
+        assert!(matches!(events.get(1), Some(super::OcrControllerEvent::RecognizeCancelled { request_id: 1 })));
+        assert_eq!(events.len(), 2);
+        assert_eq!(controller.state(), super::OcrLoadState::NotLoaded);
+        assert!(controller.last_error().is_none());
+    }
+
+    /// Every Load / Recognize carries its own cancel token: a newer command sets the previous
+    /// one (its model download stops) and dropping the controller sets the newest.
+    #[test]
+    fn a_newer_command_and_the_drop_cancel_the_previous_download() {
+        let (mut controller, _evt_tx, cmd_rx) = controller_with_fake_worker();
+        controller.state = super::OcrLoadState::Ready;
+        controller.request_recognize(sample_post_processing_request(Vec::new(), false));
+        controller.request_recognize(sample_post_processing_request(Vec::new(), false));
+        let token = |command| match command {
+            Ok(super::WorkerCommand::Recognize { cancel, .. }) => cancel,
+            other => panic!("expected a Recognize, got {other:?}"),
+        };
+        let first = token(cmd_rx.try_recv());
+        let second = token(cmd_rx.try_recv());
+        assert!(first.load(std::sync::atomic::Ordering::Relaxed), "superseded");
+        assert!(!second.load(std::sync::atomic::Ordering::Relaxed));
+        drop(controller);
+        assert!(second.load(std::sync::atomic::Ordering::Relaxed), "the drop stops the newest download");
     }
 }

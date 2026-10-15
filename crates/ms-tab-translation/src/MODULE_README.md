@@ -38,9 +38,11 @@ Long work is delegated to focused controllers:
   (backend IPC methods `ocr.*`; MangaOCR/PaddleOCR/Baberu also native ONNX) and AI API (`genai`,
   no backend).
 - `ocr_model_download.rs` owns the install status and the explicit, user-started downloads of the
-  EXTERNAL OCR models (Baberu OCR, the three PaddleOCR-VL variants; pinned specs in
-  `ms_sysprobe::ai_models::external_catalog`). The tab polls it per frame; the OCR panel draws its
-  state through `panels/ocr_model_download.rs`.
+  EXTERNAL model bundles (Baberu OCR, the three PaddleOCR-VL variants, the EasyOCR model of each
+  script, the Surya detection + recognition checkpoints; pinned specs in
+  `ms_sysprobe::ai_models::{external_catalog, easyocr}`). The tab polls it per frame; the OCR and
+  text-detector panels draw its state through `panels/ocr_model_download.rs`. It is `pub`: the
+  Cleaning tab reuses controller and block for its SDXL configs.
 - `text_detector/` owns the text detector worker and returns page boxes plus editable binary
   masks. Detector modes (`TextDetectorRunMode`): `Classic` (local Otsu threshold + dilation +
   connected components), `PaddleOcr` (native ONNX or backend `textdetector.paddle.forward`),
@@ -187,30 +189,55 @@ socket on unix, token-authenticated loopback WebSocket on Windows; the transport
 `ms_local_ai::backend_health` owns no TCP/port state. OCR requests use `begin_call`/`CallHandle` for explicit
 cancellation. App-managed
 model files must be resolved through `ms_sysprobe::ai_models` before backend initialization; EasyOCR
-and Surya library/Hugging Face caches remain backend/library-managed. PaddleOCR
+and Surya weights are external models too (below): the backend loads them offline and never
+downloads (protocol v12). PaddleOCR
 detector-only downloads only detection files, while full PaddleOCR also downloads the selected
-recognition language. PaddleOCR-VL (IPC method `ocr.paddle_vl`) is a PyTorch/Transformers OCR
+recognition language. Those app-managed downloads are cancellable and report progress: every
+`ai_models::ensure_*` call takes an `EnsureCtx` (cancel flag + event sink). The OCR controller
+gives each Load / Recognize its own cancel token (a newer command sets the previous one, the drop
+sets the newest; `TranslationOcrController::command_cancel`) and forwards the thinned events as
+`OcrControllerEvent::ModelDownloadProgress` (state `DownloadingModel`); a cancelled download
+ends as `RecognizeCancelled` (a load: `StateChanged(NotLoaded)` + `RecognizeCancelled` for the
+waiting request), never as an error. The detector batch has one flag per batch (set on drop,
+checked before every page) and emits `TextDetectorControllerEvent::{ModelDownloadStarted,
+ModelDownloadProgress, DetectCancelled}`; the region helpers used by Cleaning take the caller's
+`EnsureCtx` and return `DetectFailure::{Cancelled, Failed}`. The tab keeps the latest event per
+job (`model_download_status::ModelDownloadStatus`) and the OCR / detector panels draw it with a
+Cancel (`TranslationOcrController::cancel_model_download`, active only in `DownloadingModel`;
+`TranslationTextDetectorController::cancel_detection`). How a download reads — file, `a / b`, the
+filled bar when the size is known, the retry wait as progress — has ONE owner,
+`model_download_status.rs`, which the Cleaning tools draw too. PaddleOCR-VL (IPC method `ocr.paddle_vl`) is a PyTorch/Transformers OCR
 engine that needs no text detection and no language selection; it is shown on a second engine row in
 the OCR panel so the side panel stays narrow, next to Baberu OCR (`ocr.baberu` / native).
-EXTERNAL models (Baberu OCR, the selected PaddleOCR-VL variant `OcrRuntimeOptions::paddle_vl_model`,
-persisted per title as `OCR.params.paddle_vl.model`, missing/unknown -> `official_1_6`) are NEVER
-downloaded implicitly: `ocr.rs::gate_external_models` is the one pre-dispatch gate (load
-warmup before the route decision, every non-AI-API recognize) and turns "not installed" into a
-localized error naming the panel's download/resume button (caption owner:
-`ocr_model_download::offered_download_label`); a miss also emits
-`OcrControllerEvent::ExternalModelMissing(spec)`, on which the tab re-probes the panel state, so the
-button the error names is the one drawn. The resolved paths travel in the
-request header (`paddle_vl_model` key + absolute `paddle_vl_model_dir`; `baberu_model_files`
-`{vision, prefill, step, vocab}`), so the backend owns no layout. The only downloader is the
-panel's Download button -> `OcrModelDownloadController` (one download at a time, worker threads,
-byte progress, Cancel; `ms_sysprobe::ai_models::external::download_external_model`, which retries
-transient network failures itself and reports the wait as the `Retrying` phase). A download
-that ends without installing (cancel, failure) leaves a `DownloadNotice` and re-probes the spec; a
-second spec's Download is disabled in the panel while one runs (busy line names the running one).
+EXTERNAL models are downloaded as BUNDLES (`ocr::external_model_specs`): Baberu OCR, the selected
+PaddleOCR-VL variant (`OcrRuntimeOptions::paddle_vl_model`, persisted per title as
+`OCR.params.paddle_vl.model`, missing/unknown -> `official_1_6`), the EasyOCR model of the script
+the selected languages pick (`ms_sysprobe::ai_models::easyocr`, the one owner of the code table
+and the script choice; all scripts share one directory), and Surya OCR = detection +
+recognition checkpoints. They are NEVER downloaded implicitly: `ocr.rs::gate_external_models` is
+the one pre-dispatch gate (load warmup before the route decision, every non-AI-API recognize).
+For EasyOCR it first refuses a language list easyocr cannot read (`easyocr_lang_error_message`,
+one message per `EasyOcrLangError` variant); then it turns "not installed" into a localized error
+naming the panel's download/resume button for the whole bundle (caption owner:
+`ocr_model_download::offered_download_label`, the same aggregation through
+`download_label_for_statuses`); a miss also emits `OcrControllerEvent::ExternalModelMissing(bundle)`,
+on which the tab re-probes the panel state, so the button the error names is the one drawn. The
+resolved paths travel in the request header (`paddle_vl_model` key + absolute
+`paddle_vl_model_dir`; `baberu_model_files` `{vision, prefill, step, vocab}`; v12
+`easyocr_model_dir`, `surya_recognition_dir` + `surya_detection_dir`, key names from
+`ms_backend_ipc::protocol`), and `easy_langs` is sent canonical, so the backend owns no layout and
+no aliasing. The Surya text detector uses the same detection checkpoint
+(`text_detector::SURYA_DETECTOR_SPECS`, its own download block in the detector panel). The only
+downloader is a panel's Download button -> `OcrModelDownloadController` (one download at a time
+across both panels, worker threads, one byte progress over the bundle, Cancel;
+`ms_sysprobe::ai_models::external::download_external_model` per spec, which retries transient
+network failures itself and reports the wait as the `Retrying` phase). A download that ends
+without installing (cancel, failure) leaves a `DownloadNotice` and re-probes the bundle's specs; a
+second bundle's Download is disabled while one runs (busy line names the running one).
 A download interrupted by a tab rebuild (controller drop) or a crash is recognized by its staged
 bytes: the next probe reports `Partial`, shown as "download was interrupted" + Resume; no
 process-global state keeps it.
-`ocr::external_model_spec` is the single owner of the engine -> external spec mapping.
+`ocr::external_model_specs` is the single owner of the engine -> external bundle mapping.
 AI API OCR bypasses the Python backend and uses Rust `genai` (through `ms_ai_api`, streamed by
 `exec_chat_validated`) from the OCR worker thread; its answer is cleaned
 (`structured::strip_think_blocks` + `clean_plain_text`: `<think>` blocks and a code fence
@@ -252,8 +279,12 @@ local_ai)` is the single source of truth for "can this OCR selection run here, a
 `ocr_route_kind` maps the selection to `AiRouteKind::{Cloud, Native, Backend}` (native ONNX routes,
 backend routes, and `AiApi` over `genai` = `Cloud`), and `AiRouteKind::availability` checks it
 against the process's `LocalAiAvailability`; `tab.rs` (`current_ocr_route_availability`,
-`ocr_request_refusal`) calls it, reading the runtime+guard from a per-tab cache refreshed at most
-every `OCR_ROUTE_INPUTS_CACHE_TTL` so the per-frame gate never blocks on disk I/O. Every OCR trigger
+`ocr_request_refusal`) calls it, reading the runtime+guard from a per-tab snapshot that a background worker
+(`tab/route_inputs.rs`) re-reads at most every `OCR_ROUTE_INPUTS_CACHE_TTL`, one read in flight,
+so the GUI thread never touches the disk for it (until the first read lands the snapshot is
+unknown and the gates pass when any possible input would, `route_inputs::gate_over_inputs`, so no
+false refusal; the workers route with their own fresh read; each landed read republishes the
+native-ORT capability slot). Every OCR trigger
 (drag-box, advanced/quick recognize, the load button, block OCR, the proactive health check)
 consults it, so a native selection dispatches with the backend offline. Only backend routes warm
 the backend and probe backend health. The native→backend fallback still applies when native
@@ -327,17 +358,26 @@ is an author note addressed to the translator, not a replica.
 - `ocr.rs`: `TranslationOcrController`, OCR load/recognize worker, framed IPC calls via
   `shared_client()` (with `begin_call`/`CallHandle` for cancel), AI API OCR request building over
   `ms_ai_api` (tracked + stoppable via the controller's `GenerationTracker`), crop encoding, page
-  image LRU cache, and model-download/load-state events.
+  image LRU cache, and model-download/load-state events (per-command cancel tokens for the
+  app-managed model downloads).
+- `model_download_status.rs` (`pub`): `ModelDownloadStatus` (latest event of a job, empty once
+  its last file is in) and `draw_model_download_status` (localized line / per-file bar); used by
+  the OCR and detector panels and by `ms-tab-cleaning`.
 - `ocr_case_fix.rs`: pure, GUI-free post-OCR ALL-CAPS normalization (detector +
   character state machine) used by `ocr.rs`'s post-processing helper.
-- `ocr_model_download.rs`: `OcrModelDownloadController` (stat-only status worker + at most one
-  download thread, progress coalesced in a mutex snapshot, injected worker bodies for tests; a
-  running download is cancelled and DETACHED on drop, never joined on the GUI thread),
-  `OcrModelDownloadState` + `DownloadNotice` + `OcrModelPanelSnapshot` (what the panel block
-  draws), `offered_download_label` (the one owner of the visible download caption, also named by
-  the OCR gate error), the `ExternalModelError` -> localized message mapping (no English detail
-  reaches the user; the full `Display` is logged) and the localized byte formatter. Test fakes
-  (`fakes`) are shared with the tab's wiring tests.
+- `ocr_model_download.rs` (`pub`, reused by `ms-tab-cleaning`): `OcrModelDownloadController`
+  (stat-only per-spec status worker + at most one job thread — a download of a bundle's
+  not-installed specs in order, or a verify (`start_verify`, `ms_sysprobe` `verify_external_model`
+  per spec: damaged files and the markers sharing them are deleted, then the bundle and every
+  invalidated spec are re-probed and an intact / N-removed notice is left) — with progress over
+  the whole bundle coalesced in a mutex snapshot,
+  injected worker bodies for tests; a running download is cancelled and DETACHED on drop, never
+  joined on the GUI thread), `bundle_key`, `OcrModelDownloadState` + `DownloadNotice` +
+  `OcrModelPanelSnapshot` (what the panel block draws: aggregated state, missing bytes),
+  `offered_download_label` / `download_label_for_statuses` (the one owner of the visible download
+  caption, also named by the gate errors), the `ExternalModelError` -> localized message mapping
+  (no English detail reaches the user; the full `Display` is logged) and the localized byte
+  formatter. Test fakes (`fakes`) are shared with the tab's wiring tests.
 - `text_detector/`: `TranslationTextDetectorController` and batch worker (`mod.rs`), the
   model-based entry point and fallback policy (`pipeline.rs`), the backend forward runner
   (`backend.rs`), native Paddle routing and runner (`native.rs`, desktop only), local classic
@@ -364,6 +404,9 @@ is an author note addressed to the translator, not a replica.
 - `tab/canvas_input.rs` (child module of `tab`): the canvas pointer drivers — the claimed rect
   selections (`advance_selection`, `drive_canvas_selection`), the lines editor and the mask brush
   on the page, the lines edit commands; `tab/canvas_input/tests.rs` covers the pure helpers.
+- `tab/route_inputs.rs` (child module of `tab`, desktop-only): `OcrRouteInputsRefresh`, the
+  non-blocking refresh state machine of the OCR/detector routing inputs (injected reader, unit
+  tests inline) and its production spawner over `ocr::read_ocr_route_inputs`.
 
 ## Contracts and invariants
 - Input action ids are persistence keys (`user_config` -> `Hotkeys`): never rename one. Every
@@ -572,8 +615,9 @@ is an author note addressed to the translator, not a replica.
   `footer_autocomplete_candidates`.
 - To change OCR engine options, loading, recognition requests, IPC method names, crop handling, or
   page image caching, edit `ocr.rs` and the OCR panel in `panels/ocr.rs`.
-- To change which external model an OCR engine needs or how a missing one is reported, edit
-  `external_model_spec` / `resolve_external_model_dirs_in` / `gate_external_models_in` in `ocr.rs`; to change how such a model
+- To change which external models an OCR engine needs or how a missing one is reported, edit
+  `external_model_specs` / `resolve_external_model_dirs_in` / `gate_external_models_in` in `ocr.rs`
+  (the Surya detector's: `text_detector/backend.rs`); to change how such a model
   is probed or downloaded, `ocr_model_download.rs` (pins and files live in `ms-sysprobe`); to change
   the download block's look, `panels/ocr_model_download.rs`.
 - To change text detector algorithms, masks, backend IPC methods, or cleaning-tool detector

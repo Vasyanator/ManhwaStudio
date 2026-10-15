@@ -10,7 +10,8 @@ Main responsibilities:
 - own `LAMA_MODEL_SPECS` and the default selection;
 - own `LamaMethod`, the two-method dispatch shared by the run, the unload and the scan;
 - resolve a persisted/selected file name back to a spec, refusing an unknown one;
-- ensure the selected checkpoint is on disk before a run (download when missing).
+- ensure the selected checkpoint is on disk before a run (download when missing; the MPE
+  checkpoint is also verified against its pin and repaired).
 
 Key structures:
 - `LamaMethod`: `inpaint.lama_v2` vs `inpaint.lama_mpe`
@@ -208,26 +209,39 @@ pub(super) fn lama_model_spec_or_default(model_name: &str) -> &'static LamaModel
     })
 }
 
-/// Ensures `spec`'s checkpoint is on disk, downloading it through `ai_models` when missing.
+/// Ensures `spec`'s checkpoint is on disk, downloading it through `ai_models` when missing
+/// (`downloads` carries the run's cancel flag and event sink).
+///
+/// A v2 checkpoint is accepted when present (the main repository pins no hash for it). The
+/// MPE checkpoint is ALWAYS routed through `ai_models::ensure_lama_mpe`, which verifies it
+/// against its pinned size + sha256 (stat-only while its verified marker holds, one hash
+/// pass otherwise) and re-downloads a corrupt or truncated file: the backend refuses a
+/// wrong-hash file and no longer fetches it itself.
 ///
 /// Intended to run OFF the GUI thread: the download is a multi-hundred-megabyte transfer.
 ///
 /// # Errors
-/// Returns the localized `ai_models` message when the download fails.
-pub(super) fn ensure_lama_model_ready(spec: &LamaModelSpec) -> Result<(), String> {
+/// Returns the localized `ai_models` message when the download fails; a cancelled download
+/// becomes the "processing cancelled" sentence, which only reaches a run its engine already
+/// dropped.
+pub(super) fn ensure_lama_model_ready(spec: &LamaModelSpec, downloads: &mut EnsureCtx<'_>) -> Result<(), String> {
     let local_path = spec.method.models_dir().join(spec.file_name);
-    if local_path.exists() {
+    if spec.method == LamaMethod::V2 && local_path.exists() {
         return Ok(());
     }
     // The fetched PATH is discarded: the backend resolves the checkpoint by BARE FILE NAME
     // inside its own model directory, so the local path has no reader here.
-    match spec.method {
+    let ensured = match spec.method {
         // The v2 fetch also brings `Torch/LaMa/config.yaml`, which the backend requires
         // before ANY v2 load — including a TorchScript one that never reads it.
-        LamaMethod::V2 => ai_models::ensure_lama_model(&config::models_dir(), spec.file_name)?,
-        LamaMethod::Mpe => ai_models::ensure_lama_mpe(&config::models_dir())?,
+        LamaMethod::V2 => ai_models::ensure_lama_model(&config::models_dir(), spec.file_name, downloads),
+        LamaMethod::Mpe => ai_models::ensure_lama_mpe(&config::models_dir(), downloads),
     };
-    Ok(())
+    match ensured {
+        Ok(_) => Ok(()),
+        Err(ModelEnsureError::Cancelled) => Err(t!("cleaning.mask_editor.processing_cancelled_status").to_string()),
+        Err(ModelEnsureError::Failed(text)) => Err(text),
+    }
 }
 
 /// Ensures a LaMa-v2 checkpoint named by an outside caller is present, and echoes back the
@@ -239,16 +253,17 @@ pub(super) fn ensure_lama_model_ready(spec: &LamaModelSpec) -> Result<(), String
 ///
 /// # Errors
 /// Returns a localized message when `model_name` is not a LaMa-v2 catalog entry, or when the
-/// download fails.
+/// download fails or is cancelled through `downloads`.
 pub(in crate::tools::ai_editor::engines) fn ensure_lama_model_for_external(
     model_name: &str,
+    downloads: &mut EnsureCtx<'_>,
 ) -> Result<&'static str, String> {
     let spec = lama_v2_model_catalog()
         .find(|spec| spec.file_name == model_name.trim())
         .ok_or_else(|| {
             tf!("cleaning.tools.lama.unsupported_model_error", selected_name = model_name)
         })?;
-    ensure_lama_model_ready(spec)?;
+    ensure_lama_model_ready(spec, downloads)?;
     Ok(spec.file_name)
 }
 
@@ -338,11 +353,15 @@ mod tests {
             v2,
             ["best.ckpt", "lama_large_512px.ckpt", "anime-manga-big-lama.pt"]
         );
+        // Both names are refused before any model lookup, so the context is never used.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut ignore = |_: &ms_sysprobe::ai_models::ModelDownloadEvent| {};
+        let mut downloads = EnsureCtx { cancel: &cancel, progress: &mut ignore };
         assert!(
-            ensure_lama_model_for_external("inpainting_lama_mpe.ckpt").is_err(),
+            ensure_lama_model_for_external("inpainting_lama_mpe.ckpt", &mut downloads).is_err(),
             "the MPE checkpoint must never reach the SDXL prefill path"
         );
-        assert!(ensure_lama_model_for_external("no such model").is_err());
+        assert!(ensure_lama_model_for_external("no such model", &mut downloads).is_err());
     }
 
     /// Every display key must resolve in the embedded catalog: the picker shows these

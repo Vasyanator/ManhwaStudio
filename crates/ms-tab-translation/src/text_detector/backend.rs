@@ -14,7 +14,12 @@ Key items:
 - `ipc_max_batch()`: tiles per request = min(`IPC_MAX_TILES_PER_REQUEST`, the tiles that fit
   `IPC_FRAME_BUDGET_PERCENT` (90 %) of the frame in the larger direction, computed by
   `ms_backend_ipc::textdetector::max_tiles_per_request`), at least 1.
-- `forward_engine()` / `ensure_backend_models()`: engine mapping and app-managed model gate.
+- `forward_engine()` / `ensure_backend_models()`: engine mapping and app-managed model gate;
+  for Surya the gate is stat-only (`surya_detection_dir_in`: the pinned
+  `SURYA_DETECTOR_SPECS` checkpoint must be installed, else the localized "not downloaded"
+  error naming the detector panel's download button) and its directory travels in every
+  forward header as `surya_detection_dir` (protocol v12; merged by `IpcRunner`, because
+  `ms_backend_ipc::textdetector::build_forward_request` is model-agnostic).
 
 Notes:
 No detection rule lives here (scale, tiling, stitching, postprocess are `ms_text_detect`); this
@@ -29,9 +34,13 @@ use ms_backend_ipc::textdetector::{
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use ms_config as config;
 use ms_sysprobe::ai_models;
+use ms_sysprobe::ai_models::external::{ExternalModelSpec, ExternalModelStatus, external_model_status};
+use ms_sysprobe::ai_models::external_catalog::SURYA_DETECTION_2025_05_07;
+use ms_sysprobe::ai_models::{EnsureCtx, ModelEnsureError};
 use ms_text_detect::{EngineKind, ProbMap, ProbMapRunner, RunnerError, TileMaps};
 use serde_json::Value;
 use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use web_time::{Duration, Instant};
 
 /// Per-call timeout for the framed backend. Model warmup on first use plus a batch of large
@@ -68,19 +77,53 @@ pub(super) fn forward_engine(engine: EngineKind) -> Option<ForwardEngine> {
     }
 }
 
-/// Makes sure the app-managed model files the backend engine loads are present (downloads them
-/// when missing). Surya's weights are managed by its library, so it needs nothing here.
-/// Worker-thread only (disk and network I/O).
+/// The download bundle of the Surya text detector: the pinned `text_detection` checkpoint
+/// (shared with the Surya OCR bundle). Downloaded only explicitly, from the detector panel.
+pub(crate) const SURYA_DETECTOR_SPECS: [&ExternalModelSpec; 1] = [&SURYA_DETECTION_2025_05_07];
+
+/// The model directories one backend forward needs besides the tiles: only Surya has one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct BackendModelDirs {
+    /// Installed Surya `text_detection` checkpoint (`surya_detection_dir` on the wire).
+    pub(super) surya_detection: Option<PathBuf>,
+}
+
+/// Makes sure the model files the backend engine loads are present: CTD and Paddle files are
+/// downloaded when missing (cancellable, reporting through `ctx`); the Surya checkpoint is
+/// only CHECKED (its download is explicit, from the panel). Worker-thread only (disk and
+/// network I/O).
 ///
 /// # Errors
-/// The localized model-ensure message.
-pub(super) fn ensure_backend_models(engine: ForwardEngine) -> Result<(), String> {
+/// `Cancelled`, or `Failed` with the localized model-ensure / "not downloaded" message.
+pub(super) fn ensure_backend_models(engine: ForwardEngine, ctx: &mut EnsureCtx<'_>) -> Result<BackendModelDirs, ModelEnsureError> {
     let models_root = config::models_dir();
     match engine {
-        ForwardEngine::Ctd => ai_models::ensure_comic_text_detector_torch(&models_root).map(|_| ()),
-        ForwardEngine::Paddle => ai_models::ensure_paddle_ocr_detector(&models_root).map(|_| ()),
-        ForwardEngine::Surya => Ok(()),
+        ForwardEngine::Ctd => ai_models::ensure_comic_text_detector_torch(&models_root, ctx).map(|_| BackendModelDirs::default()),
+        ForwardEngine::Paddle => ai_models::ensure_paddle_ocr_detector(&models_root, ctx).map(|_| BackendModelDirs::default()),
+        ForwardEngine::Surya => {
+            surya_detection_dir_in(&config::side_models_dir()).map(|dir| BackendModelDirs { surya_detection: Some(dir) })
+        }
     }
+}
+
+/// The installed Surya detection checkpoint under `side_models_root` (stat-only, never
+/// downloads).
+///
+/// # Errors
+/// `Failed` with the localized "not downloaded" message naming the download / resume button
+/// the detector panel shows for the checkpoint's current state.
+pub(super) fn surya_detection_dir_in(side_models_root: &Path) -> Result<PathBuf, ModelEnsureError> {
+    let statuses: Vec<(&ExternalModelSpec, ExternalModelStatus)> =
+        SURYA_DETECTOR_SPECS.iter().map(|spec| (*spec, external_model_status(side_models_root, spec))).collect();
+    if let Some((spec, status)) = statuses.iter().find(|(_, status)| *status != ExternalModelStatus::Installed) {
+        ms_log::runtime_log::log_info(format!(
+            "[text-detector] external model '{}' is not installed ({status:?}); asking the user to download it",
+            spec.id
+        ));
+        let button = crate::ocr_model_download::download_label_for_statuses(&statuses);
+        return Err(ModelEnsureError::Failed(tf!("translation.text_detector.surya_model_not_downloaded_error", button = button)));
+    }
+    Ok(SURYA_DETECTION_2025_05_07.local_dir(side_models_root))
 }
 
 /// How many tiles of `tile_input` fit `IPC_FRAME_BUDGET_PERCENT` % of the frame limit in the
@@ -134,13 +177,31 @@ impl DetectorTransport for SharedClientTransport {
 pub(super) struct IpcRunner<T> {
     engine: ForwardEngine,
     transport: T,
+    /// Model directories merged into every request header (see [`forward_header`]).
+    model_dirs: BackendModelDirs,
 }
 
 impl<T: DetectorTransport> IpcRunner<T> {
-    /// A runner for `engine` over `transport`.
-    pub(super) fn new(engine: ForwardEngine, transport: T) -> Self {
-        Self { engine, transport }
+    /// A runner for `engine` over `transport`, sending `model_dirs` with every request.
+    pub(super) fn new(engine: ForwardEngine, transport: T, model_dirs: BackendModelDirs) -> Self {
+        Self { engine, transport, model_dirs }
     }
+}
+
+/// Adds the model directories to a `build_forward_request` header: `surya_detection_dir`
+/// (protocol v12, required by `textdetector.surya.forward`) when resolved. Other engines get
+/// none, so their headers are unchanged.
+///
+/// # Errors
+/// A localized message when the directory is not valid UTF-8 (never sent lossily).
+fn forward_header(mut header: Value, model_dirs: &BackendModelDirs) -> Result<Value, String> {
+    if let Some(dir) = &model_dirs.surya_detection {
+        let dir = dir.to_str().ok_or_else(|| tf!("translation.ocr.model_path_not_utf8_error", path = dir.display()))?;
+        if let Value::Object(map) = &mut header {
+            map.insert(backend_ipc::protocol::HEADER_SURYA_DETECTION_DIR.to_owned(), Value::String(dir.to_owned()));
+        }
+    }
+    Ok(header)
 }
 
 impl<T: DetectorTransport> ProbMapRunner for IpcRunner<T> {
@@ -158,6 +219,7 @@ impl<T: DetectorTransport> ProbMapRunner for IpcRunner<T> {
         let [width, height] = tiles.first().map_or([0, 0], |tile| [tile.width(), tile.height()]);
         let raw: Vec<&[u8]> = tiles.iter().map(|tile| tile.as_raw().as_slice()).collect();
         let (header, blob) = build_forward_request(engine, width, height, &raw).map_err(|err| wire_error(engine, &err))?;
+        let header = forward_header(header, &self.model_dirs).map_err(|message| RunnerError { message })?;
         let started = Instant::now();
         let (response_header, response_blob) = self
             .transport

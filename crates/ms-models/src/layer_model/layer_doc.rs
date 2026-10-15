@@ -275,11 +275,16 @@ impl std::fmt::Debug for DecodedPagePayload {
 /// The shared in-memory layer document: pages loaded on demand, keyed by page index.
 pub struct LayerDoc {
     pages: HashMap<usize, DocPage>,
-    /// Monotonic version, bumped by EVERY mutating operation (page load/evict, node/group adds and
-    /// removes, transform/effects/pixels/text/visibility/opacity/group/reorder edits). Both view tabs
-    /// store the last version they projected and re-project their current page whenever it changes;
-    /// this is the in-memory cross-tab sync (replacing the old disk-revision bridge).
+    /// Monotonic document-wide version, bumped by EVERY mutating operation (page load/evict, node/group
+    /// adds and removes, transform/effects/pixels/text/visibility/opacity/group/reorder edits) on ANY
+    /// page. Means "something in the doc changed"; whole-doc readers (the page manager's node count)
+    /// gate on it. A reader that projects ONE page gates on [`Self::page_revision`] instead.
     version: u64,
+    /// Per-page revision stamps: `page_idx -> version` right after the last mutation of that page
+    /// (the `CleanOverlaysModel::page_change_revision` pattern). Written only by [`Self::bump_page`].
+    /// Stamps are NEVER removed (an evict is itself a bump of the page), so a stamp only grows and is
+    /// never reused across evict + re-insert; the map is bounded by the chapter's page count.
+    page_revisions: HashMap<usize, u64>,
     /// Optional background saver (additive). When present, `enqueue_page_save` /
     /// `enqueue_page_text_save` route page persistence off-thread (coalescing); when absent (the
     /// default — e.g. unit tests that construct a bare `LayerDoc`), those entry points fall back to the
@@ -303,6 +308,7 @@ impl LayerDoc {
         Self {
             pages: HashMap::new(),
             version: 0,
+            page_revisions: HashMap::new(),
             saver: None,
             save_epoch: 0,
             latest_epoch: HashMap::new(),
@@ -310,24 +316,42 @@ impl LayerDoc {
         }
     }
 
-    /// The current document version. A tab compares this against its last-projected value each frame
-    /// and re-projects the current page when it differs (cheap: a lock + a `u64` read).
+    /// The current document-wide version: advances on every mutation of any page. For whole-doc
+    /// readers only; a tab projecting one page compares [`Self::page_revision`] instead, so an edit
+    /// on another page does not make its projection look stale.
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
     }
 
-    /// Bumps the document version. Called by every mutator so cross-tab listeners re-project.
-    fn bump_version(&mut self) {
-        self.version = self.version.wrapping_add(1);
-        ms_log::trace_log!(cat::SYNC, "bump_version version={}", self.version);
+    /// The revision of `page_idx`: the document [`Self::version`] right after that page's last
+    /// mutation (load, evict, or any content edit), or 0 for a page never touched this session.
+    ///
+    /// Contract: a content change of the page always changes this value; a mutation of another page
+    /// never does; the value never decreases and is never reused (it survives evict + re-insert), and
+    /// it is always `<= version()`. A spurious advance (a call that changed nothing visible) is
+    /// allowed and costs the reader one re-projection. Cheap: one map lookup under the doc lock.
+    #[must_use]
+    pub fn page_revision(&self, page_idx: usize) -> u64 {
+        self.page_revisions.get(&page_idx).copied().unwrap_or(0)
     }
 
-    /// Explicitly bumps the version. For callers that mutate node fields directly via `node_mut`
-    /// (bypassing the version-bumping mutators) and still need cross-tab listeners to re-project.
-    pub fn mark_changed(&mut self) {
-        ms_log::trace_log!(cat::SYNC, "mark_changed version_before={}", self.version);
-        self.bump_version();
+    /// Records a mutation of `page_idx`: advances the document version and stamps the page with it.
+    /// The ONLY bump of the doc — there is deliberately no page-less variant, so a new mutator cannot
+    /// bump without naming the page it changed. A new mutator must also get a step in the
+    /// `page_revision_tracks_every_content_change` property test.
+    fn bump_page(&mut self, page_idx: usize) {
+        self.version = self.version.wrapping_add(1);
+        self.page_revisions.insert(page_idx, self.version);
+        ms_log::trace_log!(cat::SYNC, "bump_page page={} version={}", page_idx, self.version);
+    }
+
+    /// Explicitly records a change of `page_idx` (advances its [`Self::page_revision`] and the
+    /// document version). For callers that mutate node fields directly via [`Self::node_mut`]
+    /// (bypassing the bumping mutators) and still need cross-tab listeners to re-project that page.
+    pub fn mark_page_changed(&mut self, page_idx: usize) {
+        ms_log::trace_log!(cat::SYNC, "mark_page_changed page={} version_before={}", page_idx, self.version);
+        self.bump_page(page_idx);
     }
 
     /// Loads `page_idx` into memory if not already resident.
@@ -370,7 +394,8 @@ impl LayerDoc {
 
     /// Inserts an already-decoded page payload into the doc, taking effect only if `page_idx` is not
     /// already resident (memoization: a live page's in-memory edits are NEVER clobbered by a stale
-    /// background decode). On a real insert the document `version` is bumped so both tabs re-project.
+    /// background decode). On a real insert the page's revision (and the document `version`) is bumped
+    /// so both tabs re-project it.
     ///
     /// This is the ONLY lock-held step of a page load: it moves an OWNED [`DecodedPagePayload`] (built
     /// lock-free by [`Self::decode_page_payload`]) into `self.pages`. No disk I/O or PNG decode happens
@@ -401,7 +426,7 @@ impl LayerDoc {
                 groups: payload.groups,
             },
         );
-        self.bump_version();
+        self.bump_page(page_idx);
     }
 
     /// Decodes a page's full layer payload from disk WITHOUT touching `LayerDoc` state, so it can run
@@ -863,7 +888,7 @@ impl LayerDoc {
             evicted
         );
         if evicted {
-            self.bump_version();
+            self.bump_page(page_idx);
         }
     }
 
@@ -880,6 +905,8 @@ impl LayerDoc {
             .find(|n| n.uid == uid)
     }
 
+    /// Raw mutable access to a resident node. Does NOT bump: a caller that changes anything through it
+    /// must call [`Self::mark_page_changed`]`(page_idx)` afterwards, or no tab re-projects the page.
     pub fn node_mut(&mut self, page_idx: usize, uid: &str) -> Option<&mut LayerNode> {
         self.pages
             .get_mut(&page_idx)?
@@ -920,7 +947,7 @@ impl LayerDoc {
         );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.transform = transform;
-            self.bump_version();
+            self.bump_page(page_idx);
         }
     }
 
@@ -938,7 +965,7 @@ impl LayerDoc {
         );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.deform = deform;
-            self.bump_version();
+            self.bump_page(page_idx);
         }
     }
 
@@ -958,7 +985,7 @@ impl LayerDoc {
         {
             *m = mask_clip;
             node.bump_generation();
-            self.bump_version();
+            self.bump_page(page_idx);
         }
     }
 
@@ -991,7 +1018,7 @@ impl LayerDoc {
             *e = effects;
             *d = display_image;
             node.bump_generation();
-            self.bump_version();
+            self.bump_page(page_idx);
             changed = true;
         }
         if changed {
@@ -1030,7 +1057,7 @@ impl LayerDoc {
         let dirty_kind = node.pixels_dirty.then_some(node.kind);
         page.nodes.push(node);
         page.nodes.sort_by_key(|n| n.z);
-        self.bump_version();
+        self.bump_page(page_idx);
         if let Some(kind) = dirty_kind {
             let save_kind = match kind {
                 NodeKind::Raster => SaveKind::Raster,
@@ -1072,7 +1099,7 @@ impl LayerDoc {
         let dirty_kind = node.pixels_dirty.then_some(node.kind);
         page.nodes.push(node);
         page.nodes.sort_by_key(|n| n.z);
-        self.bump_version();
+        self.bump_page(page_idx);
         if let Some(kind) = dirty_kind {
             let save_kind = match kind {
                 NodeKind::Raster => SaveKind::Raster,
@@ -1100,7 +1127,7 @@ impl LayerDoc {
             page.nodes.len()
         );
         if removed {
-            self.bump_version();
+            self.bump_page(page_idx);
         }
         removed
     }
@@ -1116,7 +1143,7 @@ impl LayerDoc {
         );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.visible = visible;
-            self.bump_version();
+            self.bump_page(page_idx);
         }
     }
 
@@ -1131,7 +1158,7 @@ impl LayerDoc {
         );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.opacity = opacity.clamp(0.0, 1.0);
-            self.bump_version();
+            self.bump_page(page_idx);
         }
     }
 
@@ -1146,7 +1173,7 @@ impl LayerDoc {
         );
         if let Some(node) = self.node_mut(page_idx, uid) {
             node.group_uid = group_uid;
-            self.bump_version();
+            self.bump_page(page_idx);
         }
     }
 
@@ -1172,7 +1199,7 @@ impl LayerDoc {
         node.text_pinned = pinned;
         node.text_pinned_by_group = pinned_by_group;
         if changed {
-            self.bump_version();
+            self.bump_page(page_idx);
         }
         true
     }
@@ -1198,14 +1225,14 @@ impl LayerDoc {
                 page.groups.len() + 1
             );
             page.groups.push(group);
-            self.bump_version();
+            self.bump_page(page_idx);
         }
     }
 
     /// Sets the composite meta (`visible`, `opacity` clamped to `0.0..=1.0`) of the PS unified group
     /// `group_uid` on a resident page, bumping the version when either value changed. This is the
     /// group fold every composite consumer reads (typing canvas, typing export, PS composite), so a
-    /// group toggle made in one tab reaches the others through the doc version. Persistence is NOT
+    /// group toggle made in one tab reaches the others through the page revision. Persistence is NOT
     /// triggered here: the page's groups are written by the next doc page save (`flush_page` /
     /// `enqueue_page_save` pass `DocPage::groups` to `save_page_rasters`), in the unchanged manifest
     /// format. The panel-only `collapsed` flag is untouched. Returns `false` when the page or the
@@ -1235,7 +1262,7 @@ impl LayerDoc {
         group.visible = visible;
         group.opacity = opacity;
         if changed {
-            self.bump_version();
+            self.bump_page(page_idx);
         }
         true
     }
@@ -1263,7 +1290,7 @@ impl LayerDoc {
         let changed = group.collapsed != collapsed;
         group.collapsed = collapsed;
         if changed {
-            self.bump_version();
+            self.bump_page(page_idx);
         }
         true
     }
@@ -1286,7 +1313,7 @@ impl LayerDoc {
                 node.group_uid = None;
             }
         }
-        self.bump_version();
+        self.bump_page(page_idx);
     }
 
     /// Replaces a RASTER node's base image, display image, and effects chain, sets `pixels_dirty`, and
@@ -1326,7 +1353,7 @@ impl LayerDoc {
             *e = effects;
             node.pixels_dirty = pixels_dirty;
             node.bump_generation();
-            self.bump_version();
+            self.bump_page(page_idx);
             changed = pixels_dirty;
         }
         if changed {
@@ -1377,7 +1404,7 @@ impl LayerDoc {
             *c = extra_centers;
             node.pixels_dirty = true;
             node.bump_generation();
-            self.bump_version();
+            self.bump_page(page_idx);
             changed = true;
         }
         if changed {
@@ -1421,7 +1448,7 @@ impl LayerDoc {
             z_a,
             z_b
         );
-        self.bump_version();
+        self.bump_page(page_idx);
         true
     }
 
@@ -1487,7 +1514,7 @@ impl LayerDoc {
             group_uid,
             if up { "up" } else { "down" }
         );
-        self.bump_version();
+        self.bump_page(page_idx);
         true
     }
 
@@ -1536,7 +1563,7 @@ impl LayerDoc {
                 .unwrap_or(unlisted_base) as u32;
         }
         page.nodes.sort_by_key(|n| n.z);
-        self.bump_version();
+        self.bump_page(page_idx);
     }
 
     /// Persists a page's RASTER nodes back to disk via `persist::ManifestTxn::save_page_rasters` seeded
@@ -2339,8 +2366,8 @@ impl LayerDoc {
     }
 
     /// Sets `pixels_dirty` on every RASTER node of a resident page after its current raster epoch
-    /// FAILED, so the next save carries (and rewrites) every raster's pixels. Does not bump the
-    /// version: nothing visible changed.
+    /// FAILED, so the next save carries (and rewrites) every raster's pixels. Does not bump the page
+    /// revision or the version: nothing visible changed.
     fn mark_page_rasters_dirty(&mut self, page_idx: usize) {
         if let Some(page) = self.pages.get_mut(&page_idx) {
             for node in &mut page.nodes {
@@ -4323,6 +4350,7 @@ mod tests {
                 "{what} must bump the version (was {last}, now {})",
                 doc.version()
             );
+            assert_eq!(doc.page_revision(0), doc.version(), "{what} must stamp page 0 with the new version");
             last = doc.version();
         };
 
@@ -4403,6 +4431,228 @@ mod tests {
             after_evict,
             "evicting an absent page is a no-op"
         );
+    }
+
+    /// Hashes every content field of a resident page (`None` when the page is not resident), for the
+    /// page-revision property test. It destructures `DocPage`, `LayerNode`, `NodeBody`, `GroupMeta`
+    /// and `ColorImage` EXHAUSTIVELY (no `..`), so a new field fails to compile here until it is
+    /// classified as content (hashed) or bookkeeping (named and ignored, with the reason).
+    fn page_content_hash(page: Option<&DocPage>) -> Option<u64> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        fn hash_image(h: &mut DefaultHasher, image: &ColorImage) {
+            let ColorImage { size, source_size, pixels } = image;
+            size.hash(h);
+            source_size.x.to_bits().hash(h);
+            source_size.y.to_bits().hash(h);
+            pixels.hash(h);
+        }
+
+        let DocPage { nodes, groups } = page?;
+        let mut h = DefaultHasher::new();
+        for node in nodes {
+            let LayerNode {
+                uid,
+                name,
+                kind,
+                z,
+                visible,
+                opacity,
+                group_uid,
+                text_layer_idx,
+                text_pinned,
+                text_pinned_by_group,
+                transform,
+                deform,
+                // Bookkeeping, not content: `generation` is the GPU-cache counter that content
+                // mutators advance alongside the page revision, and `pixels_dirty` is persistence
+                // state that saves and acks flip without changing anything visible.
+                generation: _,
+                pixels_dirty: _,
+                body,
+            } = node;
+            uid.hash(&mut h);
+            name.hash(&mut h);
+            matches!(kind, NodeKind::Raster).hash(&mut h);
+            z.hash(&mut h);
+            visible.hash(&mut h);
+            opacity.to_bits().hash(&mut h);
+            group_uid.hash(&mut h);
+            text_layer_idx.hash(&mut h);
+            text_pinned.hash(&mut h);
+            text_pinned_by_group.hash(&mut h);
+            // `Debug` of these records prints every field (f32 in round-trip form).
+            format!("{transform:?}|{deform:?}").hash(&mut h);
+            match body {
+                NodeBody::Raster { base_image, display_image, effects, base_file, mask_clip } => {
+                    0_u8.hash(&mut h);
+                    hash_image(&mut h, base_image);
+                    hash_image(&mut h, display_image);
+                    serde_json::Value::Array(effects.clone()).to_string().hash(&mut h);
+                    base_file.hash(&mut h);
+                    mask_clip.hash(&mut h);
+                }
+                NodeBody::Text { render_data, image, is_image, payload_uid, mask_clip, extra_centers, centering_frame } => {
+                    1_u8.hash(&mut h);
+                    render_data.to_string().hash(&mut h);
+                    hash_image(&mut h, image);
+                    is_image.hash(&mut h);
+                    payload_uid.hash(&mut h);
+                    mask_clip.hash(&mut h);
+                    format!("{extra_centers:?}|{centering_frame:?}").hash(&mut h);
+                }
+            }
+        }
+        for group in groups {
+            let GroupMeta { uid, name, visible, opacity, collapsed } = group;
+            uid.hash(&mut h);
+            name.hash(&mut h);
+            visible.hash(&mut h);
+            opacity.to_bits().hash(&mut h);
+            collapsed.hash(&mut h);
+        }
+        Some(h.finish())
+    }
+
+    /// A fresh three-node, one-group page payload for the property test.
+    fn property_page_payload() -> DecodedPagePayload {
+        let mut r1 = raster_node("r1", [2, 2], Color32::BLUE);
+        r1.z = 1;
+        r1.group_uid = Some("g0".into());
+        let mut t0 = text_node("t0", [2, 2], Color32::WHITE);
+        t0.z = 2;
+        DecodedPagePayload {
+            nodes: vec![raster_node("r0", [2, 2], Color32::RED), r1, t0],
+            groups: vec![GroupMeta { uid: "g0".into(), name: "G".into(), visible: true, opacity: 1.0, collapsed: false }],
+        }
+    }
+
+    /// Number of operations in the property test's table (`apply_property_op`).
+    const PROPERTY_OPS: usize = 24;
+
+    /// Applies operation `op` (0..PROPERTY_OPS) to `page` with arguments drawn from `pick` (a value in
+    /// a small range, so unchanged values, absent uids and absent pages occur). Every `LayerDoc`
+    /// mutator has a step here; a new mutator must get one too.
+    fn apply_property_op(doc: &mut LayerDoc, op: usize, page: usize, pick: &mut impl FnMut(usize) -> usize) {
+        const UIDS: [&str; 5] = ["r0", "r1", "t0", "n0", "missing"];
+        const GROUPS: [&str; 3] = ["g0", "g1", "gone"];
+        let uid = UIDS[pick(UIDS.len())];
+        let group = GROUPS[pick(GROUPS.len())];
+        let color = [Color32::RED, Color32::GREEN][pick(2)];
+        let flag = pick(2) == 1;
+        let node_count = doc.page(page).map_or(0, |p| p.nodes.len());
+        match op {
+            0 => doc.insert_decoded_page(page, property_page_payload()),
+            1 => doc.evict_page(page),
+            2 => doc.set_transform(page, uid, tf(if flag { 1.0 } else { 0.0 }, 0.0, 1.0)),
+            3 => doc.set_deform(page, uid, flag.then(|| DeformRec { cols: 1, rows: 1, points_px: vec![[0.0, 0.0]; 4] })),
+            4 => doc.set_raster_mask_clip(page, uid, [None, Some(true), Some(false)][pick(3)]),
+            5 => doc.set_effects(page, uid, if flag { vec![serde_json::json!({"x": 1})] } else { Vec::new() }, img([2, 2], color)),
+            6 if node_count < 6 => {
+                doc.add_node(page, raster_node("n0", [2, 2], color));
+            }
+            7 if node_count < 6 => {
+                doc.add_node_at_z(page, text_node("n0", [2, 2], color), 10 + u32::from(flag));
+            }
+            6 | 7 => {}
+            8 => {
+                doc.remove_node(page, uid);
+            }
+            9 => doc.set_visibility(page, uid, flag),
+            10 => doc.set_opacity(page, uid, [0.5, 1.0, 1.5][pick(3)]),
+            11 => doc.set_group(page, uid, flag.then(|| group.to_owned())),
+            12 => {
+                doc.set_text_pin_meta(page, uid, flag, pick(2) == 1);
+            }
+            13 => doc.add_group(page, GroupMeta { uid: group.into(), name: "G".into(), visible: true, opacity: 1.0, collapsed: false }),
+            14 => {
+                doc.set_group_meta(page, group, flag, [0.5, 1.0, f32::NAN][pick(3)]);
+            }
+            15 => {
+                doc.set_group_collapsed(page, group, flag);
+            }
+            16 => doc.remove_group(page, group),
+            17 => doc.set_raster_pixels(page, uid, img([2, 2], color), img([2, 2], color), Vec::new(), flag),
+            18 => doc.set_text_render(page, uid, serde_json::json!({"text": if flag { "a" } else { "b" }}), img([2, 2], color), RenderedTextExtraInfo::default()),
+            19 => {
+                doc.reorder_node_one(page, uid, flag);
+            }
+            20 => {
+                doc.reorder_group_block(page, group, flag);
+            }
+            21 => {
+                let mut order: Vec<String> = UIDS.iter().map(|u| (*u).to_owned()).collect();
+                if flag {
+                    order.reverse();
+                }
+                doc.set_z_order(page, &order);
+            }
+            22 => {
+                // A raw `node_mut` edit through a funnel: the caller marks the page itself.
+                if let Some(node) = doc.node_mut(page, uid) {
+                    node.name = if flag { "renamed".into() } else { node.uid.clone() };
+                    doc.mark_page_changed(page);
+                }
+            }
+            23 => {
+                // Bookkeeping that must not count as content: re-dirtying rasters after a failed ack.
+                doc.mark_page_rasters_dirty(page);
+            }
+            _ => unreachable!("op {op} is outside the PROPERTY_OPS table"),
+        }
+    }
+
+    /// S-050 contract over a seeded random walk of every mutator (incl. no-ops): a content change of a
+    /// page always changes that page's revision (I1), never another page's revision or content (I4),
+    /// the document version advances iff some page stamp did (I2), and stamps only grow and never
+    /// exceed the version (I3), across evict and re-insert.
+    #[test]
+    fn page_revision_tracks_every_content_change() {
+        const PAGES: usize = 3;
+        let mut doc = LayerDoc::new();
+        for page in 0..PAGES {
+            doc.insert_decoded_page(page, property_page_payload());
+        }
+        // Seeded LCG (Knuth MMIX constants): deterministic, no dependency.
+        let mut state: u64 = 0x5EED_0050;
+        let mut pick = move |n: usize| -> usize {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            let high = usize::try_from(state >> 33).expect("a 31-bit value fits in usize");
+            high % n
+        };
+        let mut content_changes = [0_usize; PROPERTY_OPS];
+        for step in 0..4000 {
+            let op = pick(PROPERTY_OPS);
+            let target = pick(PAGES);
+            let before: Vec<(Option<u64>, u64)> =
+                (0..PAGES).map(|p| (page_content_hash(doc.page(p)), doc.page_revision(p))).collect();
+            let version_before = doc.version();
+            apply_property_op(&mut doc, op, target, &mut pick);
+            let mut any_stamp_moved = false;
+            for (page, (hash_before, rev_before)) in before.into_iter().enumerate() {
+                let hash_after = page_content_hash(doc.page(page));
+                let rev_after = doc.page_revision(page);
+                let ctx = format!("step {step} op {op} target {target} page {page}");
+                assert!(rev_after >= rev_before, "{ctx}: a page revision never decreases");
+                assert!(rev_after <= doc.version(), "{ctx}: a page revision never exceeds the version");
+                if hash_after != hash_before {
+                    assert_ne!(rev_after, rev_before, "{ctx}: a content change must advance the page revision");
+                    content_changes[op] += 1;
+                }
+                if page != target {
+                    assert_eq!(hash_after, hash_before, "{ctx}: an op on another page changed this page");
+                    assert_eq!(rev_after, rev_before, "{ctx}: an op on another page moved this page's revision");
+                }
+                any_stamp_moved |= rev_after != rev_before;
+            }
+            assert_eq!(doc.version() != version_before, any_stamp_moved, "step {step} op {op}: the version advances iff a page stamp did");
+        }
+        // Every content mutator must really have changed content at least once, or its step in the
+        // table is vacuous; op 23 is the bookkeeping-only control.
+        for (op, count) in content_changes.iter().enumerate().take(PROPERTY_OPS - 1) {
+            assert!(*count > 0, "op {op} never changed page content in the walk");
+        }
+        assert_eq!(content_changes[PROPERTY_OPS - 1], 0, "bookkeeping changed page content");
     }
 
     #[test]

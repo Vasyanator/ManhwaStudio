@@ -14,8 +14,8 @@ process or model files.
 
 use super::*;
 use super::backend::{
-    DetectorTransport, IPC_MAX_TILES_PER_REQUEST, IpcRunner, ensure_v2_backend_ready, ipc_frame_budget_tiles,
-    ipc_max_batch,
+    BackendModelDirs, DetectorTransport, IPC_MAX_TILES_PER_REQUEST, IpcRunner, SURYA_DETECTOR_SPECS, ensure_v2_backend_ready,
+    ipc_frame_budget_tiles, ipc_max_batch, surya_detection_dir_in,
 };
 use super::classic::{classic_otsu_threshold, detect_classic_from_gray, dilate_binary};
 #[cfg(not(target_arch = "wasm32"))]
@@ -520,7 +520,7 @@ fn ipc_runner_round_trips_a_valid_forward() {
         let blob = (0..n).flat_map(|tile| (0..2).flat_map(move |channel| std::iter::repeat_n(u8::try_from(10 * tile + channel).unwrap_or(0), plane))).collect();
         Ok((json!({"engine": "ctd", "n": n, "map_width": width, "map_height": height, "channels": ["seg", "shrink"]}), blob))
     });
-    let mut runner = IpcRunner::new(ForwardEngine::Ctd, &transport);
+    let mut runner = IpcRunner::new(ForwardEngine::Ctd, &transport, BackendModelDirs::default());
     let tiles = vec![RgbImage::new(64, 128); 2];
     let maps = runner.forward(&tiles).expect("valid forward");
     assert_eq!(maps.len(), 2);
@@ -538,6 +538,40 @@ fn ipc_runner_round_trips_a_valid_forward() {
     assert_eq!(calls[0].2, 2 * 64 * 128 * 3);
 }
 
+/// A Surya forward carries the resolved checkpoint directory under the v12 key; the other
+/// engines' headers stay `{n, width, height}` (covered above).
+#[test]
+fn ipc_runner_sends_the_surya_detection_dir() {
+    let transport = FakeTransport::new(|_, _| Err("stop after the request".to_string()));
+    let dirs = BackendModelDirs { surya_detection: Some(std::path::PathBuf::from("/models/side_models/Surya/text_detection/2025_05_07")) };
+    let err = IpcRunner::new(ForwardEngine::Surya, &transport, dirs).forward(&[RgbImage::new(64, 64)]).expect_err("fake transport fails");
+    assert_eq!(err.message, "stop after the request");
+    let calls = transport.calls.borrow();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].1,
+        json!({"n": 1, "width": 64, "height": 64, "surya_detection_dir": "/models/side_models/Surya/text_detection/2025_05_07"})
+    );
+    assert_eq!(ms_backend_ipc::protocol::HEADER_SURYA_DETECTION_DIR, "surya_detection_dir");
+}
+
+/// The Surya gate on an empty root refuses with the localized "not downloaded" error naming
+/// the detector panel's download button, and creates nothing.
+#[test]
+fn surya_gate_refuses_a_missing_checkpoint() {
+    use ms_sysprobe::ai_models::ModelEnsureError;
+    use ms_sysprobe::ai_models::external::ExternalModelStatus;
+    let root = std::env::temp_dir().join(format!("ms_tab_translation_surya_gate_{}_absent", std::process::id()));
+    assert!(!root.exists(), "the probe root must not exist: {}", root.display());
+    let statuses: Vec<_> = SURYA_DETECTOR_SPECS.iter().map(|spec| (*spec, ExternalModelStatus::Missing)).collect();
+    let button = crate::ocr_model_download::download_label_for_statuses(&statuses);
+    assert_eq!(
+        surya_detection_dir_in(&root),
+        Err(ModelEnsureError::Failed(tf!("translation.text_detector.surya_model_not_downloaded_error", button = button)))
+    );
+    assert!(!root.exists(), "the gate must not create anything");
+}
+
 /// Every response-contract violation becomes the localized `forward_response_error` carrying the
 /// wire error; a transport failure passes through unchanged.
 #[test]
@@ -552,18 +586,18 @@ fn ipc_runner_rejects_malformed_responses() {
     for (header, blob) in cases {
         let expected_wire = decode_forward_response(ForwardEngine::Paddle, 1, 32, 32, &header, blob.clone()).expect_err("malformed");
         let transport = FakeTransport::new(move |_, _| Ok((header.clone(), blob.clone())));
-        let err = IpcRunner::new(ForwardEngine::Paddle, &transport).forward(&tiles).expect_err("malformed reply");
+        let err = IpcRunner::new(ForwardEngine::Paddle, &transport, BackendModelDirs::default()).forward(&tiles).expect_err("malformed reply");
         let expected = tf!("translation.text_detector.forward_response_error", engine = "paddle", err = expected_wire);
         assert_eq!(err, RunnerError { message: expected });
     }
 
     let transport = FakeTransport::new(|_, _| Err("backend exploded".to_string()));
-    let err = IpcRunner::new(ForwardEngine::Paddle, &transport).forward(&tiles).expect_err("transport error");
+    let err = IpcRunner::new(ForwardEngine::Paddle, &transport, BackendModelDirs::default()).forward(&tiles).expect_err("transport error");
     assert_eq!(err.message, "backend exploded");
 
     // A request the wire refuses never reaches the transport.
     let transport = FakeTransport::new(|_, _| Err("must not be called".to_string()));
-    let err = IpcRunner::new(ForwardEngine::Paddle, &transport).forward(&[RgbImage::new(30, 32)]).expect_err("misaligned tile");
+    let err = IpcRunner::new(ForwardEngine::Paddle, &transport, BackendModelDirs::default()).forward(&[RgbImage::new(30, 32)]).expect_err("misaligned tile");
     let wire = ForwardWireError::Misaligned { engine: "paddle", width: 30, height: 32, align: 32 };
     assert_eq!(err.message, tf!("translation.text_detector.forward_response_error", engine = "paddle", err = wire));
     assert!(transport.calls.borrow().is_empty());
@@ -582,10 +616,10 @@ fn region_mask_over_a_fake_backend_has_the_region_size() {
     let mut detection_blocks = Vec::new();
     let (size, alpha) = region_mask(&region, 2, |page| {
         let plan = plan_detection(EngineKind::Paddle, [page.width(), page.height()], &DetectParams::default()).map_err(|err| err.to_string())?;
-        let mut runner = IpcRunner::new(ForwardEngine::Paddle, &transport);
+        let mut runner = IpcRunner::new(ForwardEngine::Paddle, &transport, BackendModelDirs::default());
         let detection = run_detection(&plan, page, &mut runner).map_err(|err| err.to_string())?;
         detection_blocks.clone_from(&detection.blocks);
-        Ok(detection)
+        Ok::<_, String>(detection)
     })
     .expect("fake backend detection");
     assert_eq!(size, [width, height]);
@@ -638,7 +672,7 @@ fn region_mask_skips_empty_regions_and_dilates() {
     let single_pixel = |_page: &RgbImage| {
         let mut alpha = vec![0u8; 25];
         alpha[12] = 255;
-        Ok(Detection {
+        Ok::<_, String>(Detection {
             source_size: [5, 5],
             blocks: Vec::new(),
             mask: BinaryMask { size: [5, 5], alpha },
@@ -652,4 +686,57 @@ fn region_mask_skips_empty_regions_and_dilates() {
     assert_eq!(undilated.iter().filter(|&&px| px == 255).count(), 1);
     let detector_error = region_mask(&region, 1, |_| Err("offline".to_string()));
     assert_eq!(detector_error, Err("offline".to_string()));
+}
+
+// -------------------------------------------------------------------------
+// Batch cancel
+// -------------------------------------------------------------------------
+
+/// A batch whose cancel flag is set ends as `DetectCancelled` (no page runs, no failure), and
+/// the controller turns that into a neutral end that releases `busy`.
+#[test]
+fn a_cancelled_batch_ends_as_cancelled_not_as_an_error() {
+    let (evt_tx, evt_rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    run_detect_batch(vec![(0, PathBuf::from("never-read.png"))], false, TextDetectorRunMode::Classic, 0, &cancel, &evt_tx);
+    let events: Vec<WorkerEvent> = evt_rx.try_iter().collect();
+    assert!(matches!(events.first(), Some(WorkerEvent::DetectStarted { total: 1, .. })));
+    assert!(matches!(events.last(), Some(WorkerEvent::DetectCancelled)), "{events:?}");
+    assert!(!events.iter().any(|event| matches!(event, WorkerEvent::DetectFailed { .. } | WorkerEvent::PageFailed { .. })));
+
+    let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+    let (worker_tx, worker_rx) = std::sync::mpsc::channel();
+    let mut controller = TranslationTextDetectorController {
+        busy: true,
+        cmd_tx,
+        evt_rx: worker_rx,
+        worker_thread: None,
+        batch_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let flag = std::sync::Arc::clone(&controller.batch_cancel);
+    worker_tx.send(WorkerEvent::DetectCancelled).expect("the controller listens");
+    assert!(matches!(controller.poll_events().as_slice(), [TextDetectorControllerEvent::DetectCancelled]));
+    assert!(!controller.is_busy());
+    drop(controller);
+    assert!(flag.load(std::sync::atomic::Ordering::Relaxed), "the drop stops a running batch");
+}
+
+/// The panel's Cancel sets the running batch's flag and is a no-op while idle.
+#[test]
+fn cancel_detection_sets_the_flag_only_while_busy() {
+    let (cmd_tx, _cmd_rx) = std::sync::mpsc::channel();
+    let (_worker_tx, worker_rx) = std::sync::mpsc::channel();
+    let mut controller = TranslationTextDetectorController {
+        busy: false,
+        cmd_tx,
+        evt_rx: worker_rx,
+        worker_thread: None,
+        batch_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let flag = std::sync::Arc::clone(&controller.batch_cancel);
+    controller.cancel_detection();
+    assert!(!flag.load(std::sync::atomic::Ordering::Relaxed), "an idle controller has no batch to stop");
+    controller.busy = true;
+    controller.cancel_detection();
+    assert!(flag.load(std::sync::atomic::Ordering::Relaxed), "the running batch must stop");
 }

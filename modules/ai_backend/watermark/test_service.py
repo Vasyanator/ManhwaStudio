@@ -17,8 +17,13 @@ Main responsibilities:
 - verify `_load_state_dict` requests `weights_only=True` explicitly, unwraps
   `state_dict`, strips a `module.` prefix and turns torch's restricted-unpickler
   refusal into an explicit message rather than a blanket `weights_only=False`;
+- verify every checkpoint is pinned by size and SHA-256; the Drive confirm form
+  is followed, a dropped transfer repeats the confirm step and resumes with
+  `Range` (with a retry progress label), a digest mismatch / second HTML page /
+  HTML payload / permanent status is fatal and publishes nothing, and a file at
+  the wrong size is refetched;
 - verify two concurrent first-use requests download the checkpoint exactly once,
-  into a process-private staging file, and leave nothing behind on failure;
+  and that an exhausted retry budget parks only the pid-free `.part` for a resume;
 - verify a failed forward is reported as a failed INFERENCE, not a failed load:
   the network stays resident, counted and evictable;
 - verify the tiling geometry (tile count, full coverage) and that the
@@ -27,6 +32,8 @@ Main responsibilities:
   source resolution and the location of the marked region.
 
 Notes:
+- The weight download gets an injected `get` / `sleep` and a small synthetic
+  pin, so the real transfer code runs without the network or a real wait.
 - A fake `torch` module is injected into `sys.modules` with `patch.dict` +
   `addCleanup` where torch is needed at all, so the tests need neither torch,
   nor weights, nor a GPU, nor the network. `numpy` and `Pillow` are real (they
@@ -37,6 +44,7 @@ Notes:
 
 from __future__ import annotations
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -176,24 +184,14 @@ class CheckpointMagicTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             svc._validate_checkpoint_magic(self.dir / "absent.pth.tar", "slbr")
 
-    def test_no_digest_is_pinned_yet_and_none_is_fabricated(self) -> None:
-        # The digests could not be captured (Drive was unreachable); `None` means
-        # "unverified" and must never be replaced by an invented value.
-        self.assertEqual(set(svc._WEIGHT_SHA256), set(svc.MODEL_IDS))
-        for model_id, digest in svc._WEIGHT_SHA256.items():
+    def test_every_checkpoint_is_pinned_by_size_and_sha256(self) -> None:
+        self.assertEqual(set(svc.WEIGHTS), set(svc.MODEL_IDS))
+        for model_id, spec in svc.WEIGHTS.items():
             with self.subTest(model=model_id):
-                self.assertTrue(digest is None or len(digest) == 64)
-
-    def test_unverified_digest_skips_the_comparison(self) -> None:
-        path = self._write(b"\x80\x02}q\x00.")
-        with self.assertLogs(svc.log, level="INFO"):
-            svc._verify_optional_sha256(path, "slbr")
-
-    def test_known_digest_mismatch_is_fatal(self) -> None:
-        path = self._write(b"\x80\x02}q\x00.")
-        with patch.dict(svc._WEIGHT_SHA256, {"slbr": "0" * 64}):
-            with self.assertRaises(RuntimeError):
-                svc._verify_optional_sha256(path, "slbr")
+                self.assertGreater(spec.size, 0)
+                self.assertRegex(spec.sha256, r"^[0-9a-f]{64}$")
+        # The value captured from a real download; the old estimate was 80.4 MB.
+        self.assertEqual(svc.WEIGHTS["wdnet"].size, 84_295_087)
 
 
 class ConfirmUrlTests(unittest.TestCase):
@@ -216,12 +214,34 @@ class ConfirmUrlTests(unittest.TestCase):
         self.assertEqual(url, "https://example/download?id=X&confirm=t")
 
 
-class _FakeDriveResponse:
-    """Stand-in for `requests.Response` from Google Drive."""
+class _DriveAnswer:
+    """One scripted Drive answer: body, content type, status, and how it ends."""
 
-    def __init__(self, payload: bytes, content_type: str) -> None:
-        self._payload = payload
+    def __init__(
+        self,
+        payload: bytes,
+        content_type: str = "application/octet-stream",
+        *,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+        raise_after: BaseException | None = None,
+        delay_s: float = 0.0,
+    ) -> None:
+        self.payload = payload
+        self.status = status
         self.headers = {"Content-Type": content_type, "Content-Length": str(len(payload))}
+        self.headers.update(headers or {})
+        self.raise_after = raise_after
+        self.delay_s = delay_s
+
+
+class _FakeDriveResponse:
+    """Stand-in for `requests.Response` from Google Drive, driven by a `_DriveAnswer`."""
+
+    def __init__(self, answer: _DriveAnswer) -> None:
+        self._answer = answer
+        self.status_code = answer.status
+        self.headers = answer.headers
 
     def __enter__(self) -> "_FakeDriveResponse":
         return self
@@ -230,123 +250,56 @@ class _FakeDriveResponse:
         return False
 
     def raise_for_status(self) -> None:
-        return None
+        import requests
+
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
 
     @property
     def text(self) -> str:
-        return self._payload.decode("utf-8", "replace")
+        return self._answer.payload.decode("utf-8", "replace")
 
     def iter_content(self, chunk_size: int = 1 << 20):
-        for start in range(0, len(self._payload), chunk_size):
-            yield self._payload[start : start + chunk_size]
+        payload = self._answer.payload
+        step = 4096
+        for start in range(0, len(payload), step):
+            if self._answer.delay_s:
+                time.sleep(self._answer.delay_s)
+            yield payload[start : start + step]
+        if self._answer.raise_after is not None:
+            raise self._answer.raise_after
 
 
-def _fake_drive_requests(responses: dict[str, _FakeDriveResponse], seen: list[str]):
-    """A `requests` module whose `Session.get` serves `responses[url]`."""
+class _FakeDriveGet:
+    """Injected `get`: serves scripted answers per URL, in order, and records calls."""
 
-    class Session:
-        def __enter__(self) -> "Session":
-            return self
+    def __init__(self, script: dict[str, list[_DriveAnswer]]) -> None:
+        self._script = {url: list(answers) for url, answers in script.items()}
+        self.calls: list[tuple[str, dict[str, str]]] = []
+        self._lock = threading.Lock()
 
-        def __exit__(self, *_exc_info: object) -> bool:
-            return False
-
-        def get(self, url: str, **_kwargs: object) -> _FakeDriveResponse:
-            seen.append(url)
-            if url not in responses:
+    def __call__(self, url: str, **kwargs: object) -> _FakeDriveResponse:
+        with self._lock:
+            self.calls.append((url, dict(kwargs.get("headers") or {})))
+            answers = self._script.get(url)
+            if not answers:
                 raise AssertionError(f"unexpected request: {url}")
-            return responses[url]
+            return _FakeDriveResponse(answers.pop(0))
 
-    module = types.ModuleType("requests")
-    module.Session = Session
-    return module
-
-
-class DriveDownloadTests(unittest.TestCase):
-    """The confirm flow and the HTML-interstitial backstop, without the network."""
-
-    FILE_ID = "TESTID"
-    PAYLOAD = b"\x80\x02" + b"weights" * 100
-
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.dest = Path(tmp.name) / "model_best.pth.tar.part"
-        self.base = svc._DRIVE_URL.format(file_id=self.FILE_ID)
-        self.seen: list[str] = []
-        self.progress: list[tuple[int, int]] = []
-
-    def _download(self, responses: dict[str, _FakeDriveResponse]) -> None:
-        module = _fake_drive_requests(responses, self.seen)
-        with patch.dict(sys.modules, {"requests": module}):
-            svc._download_from_google_drive(
-                self.FILE_ID, self.dest, lambda done, expected: self.progress.append((done, expected))
-            )
-
-    def test_plain_get_is_used_when_drive_serves_the_payload(self) -> None:
-        self._download({self.base: _FakeDriveResponse(self.PAYLOAD, "application/octet-stream")})
-
-        self.assertEqual(self.seen, [self.base])
-        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
-        self.assertEqual(self.progress[-1], (len(self.PAYLOAD), len(self.PAYLOAD)))
-
-    def test_confirm_flow_is_followed_for_the_large_file(self) -> None:
-        html = (
-            b'<form><input name="confirm" value="t">'
-            b'<input name="uuid" value="u-1"></form>'
-        )
-        confirm_url = f"{self.base}&confirm=t&uuid=u-1"
-        self._download(
-            {
-                self.base: _FakeDriveResponse(html, "text/html; charset=utf-8"),
-                confirm_url: _FakeDriveResponse(self.PAYLOAD, "application/octet-stream"),
-            }
-        )
-
-        self.assertEqual(self.seen, [self.base, confirm_url])
-        self.assertEqual(self.dest.read_bytes(), self.PAYLOAD)
-
-    def test_a_second_html_answer_is_a_loud_failure(self) -> None:
-        html = b"<html>Quota exceeded</html>"
-        confirm_url = f"{self.base}&confirm=t"
-        with self.assertRaises(RuntimeError) as caught:
-            self._download(
-                {
-                    self.base: _FakeDriveResponse(html, "text/html"),
-                    confirm_url: _FakeDriveResponse(html, "text/html"),
-                }
-            )
-
-        self.assertIn("HTML", str(caught.exception))
-        # Nothing was written: an interstitial must never reach the disk as a
-        # checkpoint.
-        self.assertFalse(self.dest.exists())
-
-    def test_transport_failure_is_wrapped_with_context(self) -> None:
-        module = types.ModuleType("requests")
-
-        class Session:
-            def __enter__(self) -> "Session":
-                return self
-
-            def __exit__(self, *_exc_info: object) -> bool:
-                return False
-
-            def get(self, *_args: object, **_kwargs: object) -> None:
-                raise ConnectionError("name resolution failed")
-
-        module.Session = Session
-        with patch.dict(sys.modules, {"requests": module}):
-            with self.assertRaises(RuntimeError) as caught:
-                svc._download_from_google_drive(self.FILE_ID, self.dest, lambda *_: None)
-
-        self.assertIn(self.FILE_ID, str(caught.exception))
+    @property
+    def urls(self) -> list[str]:
+        return [url for url, _headers in self.calls]
 
 
-class WeightDownloadConcurrencyTests(unittest.TestCase):
-    """The IPC layer dispatches onto a thread pool, so two first uses can race."""
+class _SmallPinnedWeightTestCase(unittest.TestCase):
+    """Redirects the model root and pins `slbr` to a small synthetic checkpoint.
+
+    The real pins describe 80-130 MB files; the transfer under test runs
+    unmodified against a payload whose size and digest are pinned the same way.
+    """
 
     MODEL = "slbr"
+    FILE_ID = "TESTID"
     PAYLOAD = b"\x80\x02" + b"weights" * 4096
 
     def setUp(self) -> None:
@@ -356,86 +309,251 @@ class WeightDownloadConcurrencyTests(unittest.TestCase):
         root_patch = patch.object(cf, "_watermark_dir", lambda: self.root)
         root_patch.start()
         self.addCleanup(root_patch.stop)
-
-        self.staging: list[Path] = []
+        self._pin(self.PAYLOAD)
+        self.base = svc._DRIVE_URL.format(file_id=self.FILE_ID)
+        self.sleeps: list[float] = []
+        self.frames: list[tuple[str, int, int, str]] = []
         self.service = svc.WatermarkRemovalService(LoadedModelManager(max_loaded_models=1))
 
-    def _fake_download(self, _file_id: str, dest: Path, on_chunk) -> None:
-        """Write the payload slowly, so an unserialized second writer interleaves."""
-        self.staging.append(dest)
-        with dest.open("wb") as handle:
-            for start in range(0, len(self.PAYLOAD), 4096):
-                handle.write(self.PAYLOAD[start : start + 4096])
-                time.sleep(0.01)
-        on_chunk(len(self.PAYLOAD), len(self.PAYLOAD))
+    def _pin(self, payload: bytes) -> None:
+        spec = svc._WeightSpec(
+            svc.WEIGHTS[self.MODEL].file_name,
+            self.FILE_ID,
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+        )
+        weights_patch = patch.dict(svc.WEIGHTS, {self.MODEL: spec})
+        weights_patch.start()
+        self.addCleanup(weights_patch.stop)
 
-    def test_two_concurrent_first_uses_download_once_and_do_not_corrupt(self) -> None:
-        errors: list[BaseException] = []
+    def _ensure(self, get: _FakeDriveGet) -> None:
+        self.service._ensure_weights(
+            self.MODEL, lambda *frame: self.frames.append(frame), get=get, sleep=self.sleeps.append
+        )
 
-        def worker() -> None:
-            try:
-                self.service._ensure_weights(self.MODEL, None)
-            except BaseException as exc:  # noqa: BLE001 - re-raised by the assertion below
-                errors.append(exc)
+    def _parts(self) -> list[Path]:
+        return list((self.root / self.MODEL).glob("*.part"))
 
-        with patch.object(svc, "_download_from_google_drive", self._fake_download):
-            threads = [threading.Thread(target=worker) for _ in range(2)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=30)
 
-        self.assertEqual(errors, [])
-        # The loser of the lock re-checks and skips the 80-130 MiB refetch.
-        self.assertEqual(len(self.staging), 1)
+class DriveDownloadTests(_SmallPinnedWeightTestCase):
+    """The confirm flow, retry/resume, the pins and the HTML backstop, without the network."""
+
+    CONFIRM_HTML = b'<form><input name="confirm" value="t"><input name="uuid" value="u-1"></form>'
+
+    def test_plain_get_is_used_when_drive_serves_the_payload(self) -> None:
+        get = _FakeDriveGet({self.base: [_DriveAnswer(self.PAYLOAD)]})
+
+        self._ensure(get)
+
+        self.assertEqual(get.urls, [self.base])
         self.assertEqual(svc.weights_path(self.MODEL).read_bytes(), self.PAYLOAD)
-        self.assertEqual(list((self.root / self.MODEL).glob("*.part")), [])
+        self.assertTrue(svc.are_weights_ready(self.MODEL))
+        self.assertEqual(self.frames[-1][1:3], (len(self.PAYLOAD), len(self.PAYLOAD)))
 
-    def test_the_staging_file_is_process_private(self) -> None:
-        # Threads are serialized by the lock; a second PROCESS is not, so the
-        # staging name must not be shared either.
-        with patch.object(svc, "_download_from_google_drive", self._fake_download):
-            self.service._ensure_weights(self.MODEL, None)
+    def test_confirm_flow_is_followed_for_the_large_file(self) -> None:
+        confirm_url = f"{self.base}&confirm=t&uuid=u-1"
+        get = _FakeDriveGet(
+            {
+                self.base: [_DriveAnswer(self.CONFIRM_HTML, "text/html; charset=utf-8")],
+                confirm_url: [_DriveAnswer(self.PAYLOAD)],
+            }
+        )
 
-        self.assertEqual(len(self.staging), 1)
-        self.assertIn(str(os.getpid()), self.staging[0].name)
-        self.assertTrue(self.staging[0].name.endswith(".part"))
+        self._ensure(get)
 
-    def test_a_failed_download_leaves_no_staging_file_behind(self) -> None:
-        def boom(_file_id: str, dest: Path, _on_chunk) -> None:
-            self.staging.append(dest)
-            dest.write_bytes(b"<!DOCTYPE html>partial")
-            raise RuntimeError("transport died")
+        self.assertEqual(get.urls, [self.base, confirm_url])
+        self.assertEqual(svc.weights_path(self.MODEL).read_bytes(), self.PAYLOAD)
 
-        with patch.object(svc, "_download_from_google_drive", boom):
-            with self.assertRaises(RuntimeError):
-                self.service._ensure_weights(self.MODEL, None)
+    def test_a_drop_after_the_confirm_step_repeats_it_and_resumes_with_range(self) -> None:
+        import requests
 
-        self.assertFalse(self.staging[0].exists())
-        self.assertFalse(svc.are_weights_ready(self.MODEL))
+        half = len(self.PAYLOAD) // 2
+        confirm_url = f"{self.base}&confirm=t&uuid=u-1"
+        total = len(self.PAYLOAD)
+        get = _FakeDriveGet(
+            {
+                self.base: [
+                    _DriveAnswer(self.CONFIRM_HTML, "text/html"),
+                    _DriveAnswer(self.CONFIRM_HTML, "text/html"),
+                ],
+                confirm_url: [
+                    _DriveAnswer(
+                        self.PAYLOAD[:half],
+                        headers={"Content-Length": str(total)},
+                        raise_after=requests.ConnectionError("connection reset"),
+                    ),
+                    _DriveAnswer(
+                        self.PAYLOAD[half:],
+                        status=206,
+                        headers={"Content-Range": f"bytes {half}-{total - 1}/{total}"},
+                    ),
+                ],
+            }
+        )
 
-    def test_an_html_interstitial_never_becomes_the_checkpoint(self) -> None:
-        def html(_file_id: str, dest: Path, _on_chunk) -> None:
-            self.staging.append(dest)
-            dest.write_bytes(b"<!DOCTYPE html><html>Google Drive</html>")
+        self._ensure(get)
 
-        with patch.object(svc, "_download_from_google_drive", html):
-            with self.assertRaises(RuntimeError):
-                self.service._ensure_weights(self.MODEL, None)
+        self.assertEqual(get.urls, [self.base, confirm_url, self.base, confirm_url])
+        self.assertEqual(get.calls[3][1].get("Range"), f"bytes={half}-")
+        self.assertEqual(svc.weights_path(self.MODEL).read_bytes(), self.PAYLOAD)
+        self.assertEqual(self._parts(), [])
+        retry_labels = [frame[3] for frame in self.frames if "1/5" in frame[3]]
+        self.assertEqual(len(retry_labels), 1)
+        self.assertTrue(retry_labels[0].endswith(svc.WEIGHTS[self.MODEL].file_name))
+        self.assertGreater(sum(self.sleeps), 0)
+
+    def test_a_sha256_mismatch_is_fatal_and_deletes_the_bytes(self) -> None:
+        # Same length, different bytes: only the digest can catch this.
+        wrong = b"\x80\x02" + b"x" * (len(self.PAYLOAD) - 2)
+        get = _FakeDriveGet({self.base: [_DriveAnswer(wrong)]})
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._ensure(get)
+
+        self.assertIn("SHA-256", str(caught.exception))
+        self.assertFalse(svc.weights_path(self.MODEL).exists())
+        self.assertEqual(self._parts(), [])
+
+    def test_a_second_html_answer_is_a_loud_failure(self) -> None:
+        html = b"<html>Quota exceeded</html>"
+        get = _FakeDriveGet(
+            {
+                self.base: [_DriveAnswer(html, "text/html")],
+                f"{self.base}&confirm=t": [_DriveAnswer(html, "text/html")],
+            }
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._ensure(get)
+
+        self.assertIn("HTML", str(caught.exception))
+        # An interstitial must never reach the disk as a checkpoint.
+        self.assertFalse(svc.weights_path(self.MODEL).exists())
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_permanent_status_is_wrapped_with_context_and_not_retried(self) -> None:
+        get = _FakeDriveGet({self.base: [_DriveAnswer(b"denied", "text/plain", status=403)]})
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._ensure(get)
+
+        self.assertIn(self.FILE_ID, str(caught.exception))
+        self.assertEqual(self.sleeps, [])
+
+    def test_an_html_payload_never_becomes_the_checkpoint(self) -> None:
+        # A page served as octet-stream at the pinned size and digest still
+        # fails the magic-byte gate.
+        page = b"<!DOCTYPE html><html>Google Drive</html>"
+        self._pin(page)
+        get = _FakeDriveGet({self.base: [_DriveAnswer(page)]})
+
+        with self.assertRaises(RuntimeError):
+            self._ensure(get)
 
         self.assertFalse(svc.weights_path(self.MODEL).exists())
-        self.assertFalse(self.staging[0].exists())
+        self.assertEqual(self._parts(), [])
+
+    def test_a_checkpoint_at_the_wrong_size_is_refetched(self) -> None:
+        path = svc.weights_path(self.MODEL)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x80\x02short")
+        self.assertFalse(svc.are_weights_ready(self.MODEL))
+        get = _FakeDriveGet({self.base: [_DriveAnswer(self.PAYLOAD)]})
+
+        self._ensure(get)
+
+        self.assertEqual(path.read_bytes(), self.PAYLOAD)
+
+    def test_a_cancel_during_the_retry_wait_stops_and_parks_the_bytes(self) -> None:
+        import requests
+
+        from modules.ai_backend.engines.model_download import DownloadCancelled
+
+        get = _FakeDriveGet(
+            {
+                self.base: [
+                    _DriveAnswer(
+                        self.PAYLOAD[:4096],
+                        headers={"Content-Length": str(len(self.PAYLOAD))},
+                        raise_after=requests.ConnectionError("down"),
+                    )
+                ]
+            }
+        )
+        cancelled = {"now": False}
+
+        def sleep(seconds: float) -> None:
+            self.sleeps.append(seconds)
+            cancelled["now"] = True
+
+        with self.assertRaises(DownloadCancelled):
+            self.service._ensure_weights(
+                self.MODEL, None, should_cancel=lambda: cancelled["now"], get=get, sleep=sleep
+            )
+
+        self.assertEqual(len(self.sleeps), 1)
+        self.assertFalse(svc.weights_path(self.MODEL).exists())
+        self.assertEqual([p.name for p in self._parts()], [f"{svc.WEIGHTS[self.MODEL].file_name}.part"])
 
     def test_a_present_checkpoint_is_not_re_downloaded(self) -> None:
         path = svc.weights_path(self.MODEL)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(self.PAYLOAD)
 
-        def unexpected(*_args: object, **_kwargs: object) -> None:
-            raise AssertionError("the checkpoint was already on disk")
+        self._ensure(_FakeDriveGet({}))
 
-        with patch.object(svc, "_download_from_google_drive", unexpected):
-            self.service._ensure_weights(self.MODEL, None)
+
+class WeightDownloadConcurrencyTests(_SmallPinnedWeightTestCase):
+    """The IPC layer dispatches onto a thread pool, so two first uses can race."""
+
+    def test_two_concurrent_first_uses_download_once_and_do_not_corrupt(self) -> None:
+        # Slow chunks, so an unserialized second writer would interleave.
+        get = _FakeDriveGet({self.base: [_DriveAnswer(self.PAYLOAD, delay_s=0.002)]})
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                self.service._ensure_weights(self.MODEL, None, get=get, sleep=self.sleeps.append)
+            except BaseException as exc:  # noqa: BLE001 - re-raised by the assertion below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        # The loser of the lock re-checks and skips the 80-130 MiB refetch.
+        self.assertEqual(len(get.calls), 1)
+        self.assertEqual(svc.weights_path(self.MODEL).read_bytes(), self.PAYLOAD)
+        self.assertEqual(self._parts(), [])
+
+    def test_a_failed_download_parks_only_the_pid_free_file_for_a_resume(self) -> None:
+        # Six transient failures in a row exhaust the budget of five retries.
+        import requests
+
+        get = _FakeDriveGet(
+            {
+                self.base: [
+                    _DriveAnswer(
+                        self.PAYLOAD[:4096],
+                        headers={"Content-Length": str(len(self.PAYLOAD))},
+                        raise_after=requests.ConnectionError("down"),
+                    ),
+                    *[_DriveAnswer(b"", status=503) for _ in range(5)],
+                ]
+            }
+        )
+
+        with self.assertRaises(RuntimeError):
+            self.service._ensure_weights(self.MODEL, None, get=get, sleep=self.sleeps.append)
+
+        names = [p.name for p in self._parts()]
+        # Only the stable, pid-free parked file survives, for the next run to resume.
+        self.assertEqual(names, [f"{svc.WEIGHTS[self.MODEL].file_name}.part"])
+        self.assertNotIn(str(os.getpid()), names[0])
+        self.assertFalse(svc.are_weights_ready(self.MODEL))
 
 
 # =====================================================================
@@ -541,10 +659,21 @@ class ResidencyTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
 
+        checkpoint = b"\x80\x02}q\x00."
+        # "Ready" means "at the pinned size", so each pin is shrunk to the stub.
+        pins = {
+            model_id: svc._WeightSpec(
+                spec.file_name, spec.drive_id, len(checkpoint), hashlib.sha256(checkpoint).hexdigest()
+            )
+            for model_id, spec in svc.WEIGHTS.items()
+        }
+        weights_patch = patch.dict(svc.WEIGHTS, pins)
+        weights_patch.start()
+        self.addCleanup(weights_patch.stop)
         for model_id in svc.MODEL_IDS:
             path = self.root / model_id / svc.WEIGHTS[model_id].file_name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"\x80\x02}q\x00.")
+            path.write_bytes(checkpoint)
 
         self.built: list[_FakeNet] = []
         self.moves: list[tuple[object, object]] = []

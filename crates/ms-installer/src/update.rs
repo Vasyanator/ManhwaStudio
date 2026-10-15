@@ -17,10 +17,12 @@ Main responsibilities:
 
 Notes:
 Updater work runs on background workers. The GUI thread only polls channels and draws progress or
-choice state.
+choice state. Every worker shares the window's cancel flag, which `Drop for UpdateApp` sets when the
+window closes; downloads, release requests and command retry waits stop on it.
 */
 
 use eframe::egui;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use ms_thread as thread;
 use web_time::Duration;
@@ -31,9 +33,10 @@ use ms_config::version_format::is_remote_newer;
 use crate::HostVersion;
 use crate::window::{WindowLook, prepare_window_context};
 
+use super::download::github_api_get;
 use super::install::TorchInstallSelection;
 use super::utils::{
-    ExternalUpdateTarget, UpdateWorkerEvent, github_api_get, load_embedded_icon_data,
+    ExternalUpdateTarget, UpdateWorkerEvent, load_embedded_icon_data,
     platform_binary_asset_name, run_external_update_binary_stage, run_update_binary_stage,
     run_update_continuation_stage,
 };
@@ -158,6 +161,16 @@ struct UpdateApp {
     console_lines: Vec<String>,
     torch_prompt: Option<super::install::TorchChoicePrompt>,
     selected_torch_index: Option<usize>,
+    /// Cancel flag shared with every worker this window starts (release check, binary and
+    /// continuation stages); set when the window is dropped, i.e. when it closes, so a
+    /// download or a pip retry wait stops instead of running on behind a closed window.
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for UpdateApp {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
 }
 
 impl UpdateApp {
@@ -178,6 +191,7 @@ impl UpdateApp {
             console_lines: Vec::new(),
             torch_prompt: None,
             selected_torch_index: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         };
         match mode {
             UpdateMode::Initial {
@@ -203,6 +217,7 @@ impl UpdateApp {
 
     fn start_check(&mut self) {
         let local_version = self.local_version.clone();
+        let cancel = Arc::clone(&self.cancel);
         let (tx, rx) = mpsc::channel();
         self.pending_check = Some(rx);
         self.page = UpdatePage::Check;
@@ -212,7 +227,7 @@ impl UpdateApp {
             .name("update-window-version-check".to_string())
             .spawn(move || {
                 let result =
-                    fetch_latest_app_release_tag().map(|remote_version| UpdateCheckResult {
+                    fetch_latest_app_release_tag(&cancel).map(|remote_version| UpdateCheckResult {
                         update_available: is_remote_newer(&local_version, &remote_version),
                         remote_version,
                     });
@@ -271,9 +286,10 @@ impl UpdateApp {
         self.overall_label = t!("installer.update.updating_binary_stage").to_string();
         self.console_lines.clear();
 
+        let cancel = Arc::clone(&self.cancel);
         let _ = thread::Builder::new()
             .name("update-binary-stage".to_string())
-            .spawn(move || run_update_binary_stage(root_dir, &tx));
+            .spawn(move || run_update_binary_stage(root_dir, &tx, &cancel));
     }
 
     fn start_external_binary_update(&mut self, target: ExternalUpdateTarget) {
@@ -288,9 +304,10 @@ impl UpdateApp {
         self.overall_label = tf!("installer.update.updating_target_status", target = target.root_dir.display());
         self.console_lines.clear();
 
+        let cancel = Arc::clone(&self.cancel);
         let _ = thread::Builder::new()
             .name("external-update-binary-stage".to_string())
-            .spawn(move || run_external_update_binary_stage(target, &tx));
+            .spawn(move || run_external_update_binary_stage(target, &tx, &cancel));
     }
 
     fn start_continuation_update(&mut self, torch_selection: Option<TorchInstallSelection>) {
@@ -307,9 +324,10 @@ impl UpdateApp {
         self.torch_prompt = None;
         self.selected_torch_index = None;
 
+        let cancel = Arc::clone(&self.cancel);
         let _ = thread::Builder::new()
             .name("update-continuation-stage".to_string())
-            .spawn(move || run_update_continuation_stage(root_dir, torch_selection, &tx));
+            .spawn(move || run_update_continuation_stage(root_dir, torch_selection, &tx, &cancel));
     }
 
     fn poll_worker_events(&mut self, ctx: &egui::Context) {
@@ -556,9 +574,11 @@ impl eframe::App for UpdateApp {
     }
 }
 
-fn fetch_latest_app_release_tag() -> Result<String, String> {
+/// The newest release tag that carries both the app archive and this platform's binary.
+/// `cancel` stops the request and its retry waits (window closed).
+fn fetch_latest_app_release_tag(cancel: &AtomicBool) -> Result<String, String> {
     // Shared installer helper: retries transient network failures with backoff.
-    let body = github_api_get(APP_RELEASES_API, "ManhwaStudio/update-window")
+    let body = github_api_get(APP_RELEASES_API, "update-window", cancel)
         .map_err(|e| tf!("installer.update.get_releases_error", e = e))?;
     let releases: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| tf!("installer.update.parse_releases_error", e = e))?;

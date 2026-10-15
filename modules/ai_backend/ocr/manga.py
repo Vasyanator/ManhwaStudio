@@ -49,6 +49,7 @@ from ..engines.paddle_onnx import (
     resolve_compiled_cache_root,
 )
 from ..runtime.device_service import AiDeviceService
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.paths import program_root
 from ..runtime.rocm_mmap_transfer import move_module_to
@@ -399,15 +400,31 @@ class MangaOcrService:
         self._runtime: _OnnxMangaOcrRuntime | _TorchMangaOcrRuntime | None = None
         self._runtime_key: str | None = None
         self._last_error: str | None = None
+        # Published copy of the health fields; `health()` never takes `_lock`,
+        # which a model load holds (S-014).
+        self._health = HealthSnapshot(
+            ready=False,
+            backend=self._runtime_backend_name(None),
+            runtime_key=None,
+            last_error=None,
+        )
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "ready": self._runtime is not None,
-                "backend": self._runtime_backend_name(self._runtime_key),
-                "runtime_key": self._runtime_key,
-                "last_error": self._last_error,
-            }
+        """Return `{"ready", "backend", "runtime_key", "last_error"}` for the health snapshot.
+
+        Reads only the published snapshot, so it answers while a load holds the
+        instance lock (`ready` is False while a runtime is being (re)loaded).
+        """
+        return self._health.read()
+
+    def _publish_health_locked(self) -> None:
+        """Republish the health fields from the guarded state; caller holds `self._lock`."""
+        self._health.publish(
+            ready=self._runtime is not None,
+            backend=self._runtime_backend_name(self._runtime_key),
+            runtime_key=self._runtime_key,
+            last_error=self._last_error,
+        )
 
     def warmup(self) -> None:
         lease_ctx = self._begin_model_use()
@@ -600,11 +617,13 @@ class MangaOcrService:
             self._runtime = None
             self._runtime_key = None
             self._last_error = f"MangaOCR init failed: {exc}"
+            self._publish_health_locked()
             raise RuntimeError(self._last_error) from exc
 
         self._runtime = runtime
         self._runtime_key = model_key
         self._last_error = None
+        self._publish_health_locked()
         return runtime
 
     def _unload_key(self, model_key: str) -> bool:
@@ -618,6 +637,7 @@ class MangaOcrService:
         runtime = self._runtime
         self._runtime = None
         self._runtime_key = None
+        self._publish_health_locked()
         runtime.close()
         _clear_runtime_cache()
         self._model_manager.mark_unloaded(model_key)

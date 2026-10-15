@@ -10,8 +10,9 @@ Key structures:
 - `PendingExitCleanup` (in `mod.rs`): the running delete job and the close it ends in.
 
 Key functions:
-- `ProjectSession::start_exit_cleanup`: `StagingWriters::quiesce_discarding` -> delete job (joins
-  the клин autosave thread BEFORE deleting).
+- `ProjectSession::start_exit_cleanup`: start the delete job thread (parked) -> on success
+  `StagingWriters::quiesce_discarding` -> hand the клин autosave thread to the job (joined BEFORE
+  deleting); a refused thread aborts before anything is latched or stopped.
 - `ProjectSession::poll_pending_exit_cleanup`: success -> close the dialog, mark both models saved,
   `CloseFlow::finalize`; failure -> `abort_discard_after_failed_cleanup`.
 
@@ -27,19 +28,36 @@ use crate::runtime_log;
 use ms_thread::{self as thread, JoinHandle};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
+
+/// The parked delete job of a DISCARD (`spawn_unsaved_delete_job`): `start` releases it with the
+/// клин autosave thread to join; `result` carries its verdict.
+struct UnsavedDeleteJob {
+    start: Sender<Option<JoinHandle<()>>>,
+    result: Receiver<Result<(), String>>,
+}
 
 impl ProjectSession {
-    /// Delete the unsaved staging folder in a background thread and report the result.
+    /// Starts the thread that deletes the unsaved staging folder and reports the result. The thread
+    /// PARKS until `start` delivers the клин autosave thread (already told to stop-now by the
+    /// caller); it joins that thread BEFORE the delete, so a finishing autosave pass cannot re-create
+    /// the staging dir after it was removed, and the GUI thread never waits on it. Spawning first is
+    /// what lets a refused thread abort the discard before anything was latched or stopped.
     ///
-    /// `overlay_autosave_thread` (already told to stop-now by the caller) is joined on the job
-    /// thread BEFORE the delete, so a finishing autosave pass cannot re-create the staging dir
-    /// after it was removed, and the GUI thread never waits on it.
-    fn spawn_unsaved_delete_job(
-        unsaved_dir: PathBuf,
-        overlay_autosave_thread: Option<JoinHandle<()>>,
-    ) -> std::sync::mpsc::Receiver<Result<(), String>> {
+    /// # Errors
+    /// The OS error when the thread could not be started; nothing ran.
+    fn spawn_unsaved_delete_job(unsaved_dir: PathBuf) -> std::io::Result<UnsavedDeleteJob> {
         let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
-        thread::spawn(move || {
+        let (start_tx, start_rx) = std::sync::mpsc::channel::<Option<JoinHandle<()>>>();
+        // The handle is dropped: the job is detached and answers only through `tx`.
+        let _detached = thread::Builder::new().name("discard-staging".to_owned()).spawn(move || {
+            // A closed start channel means `start_exit_cleanup` dropped the job without releasing
+            // it; nothing was quiesced for it, so it must not delete anything. Dropping `tx` reports
+            // that as a lost worker.
+            let Ok(overlay_autosave_thread) = start_rx.recv() else {
+                runtime_log::log_error("[exit] discard cleanup: released without a start signal; nothing deleted");
+                return;
+            };
             if let Some(handle) = overlay_autosave_thread
                 && handle.join().is_err()
             {
@@ -57,23 +75,47 @@ impl ProjectSession {
                 // already ran, only its report has nowhere to go.
                 runtime_log::log_warn(format!("[app] discard cleanup: result not delivered, receiver gone: {err}"));
             }
-        });
-        rx
+        })?;
+        Ok(UnsavedDeleteJob { start: start_tx, result: rx })
     }
 
-    /// Starts the DISCARD exit: drops pending edits, quiesces every staging writer
-    /// (`StagingWriters::quiesce_discarding`) and spawns the staging-dir delete job; `action` runs once the
-    /// delete succeeds (`poll_pending_exit_cleanup`).
+    /// Starts the DISCARD exit: starts the staging-dir delete job, then drops pending edits and
+    /// quiesces every staging writer (`StagingWriters::quiesce_discarding`) and releases the job;
+    /// `action` runs once the delete succeeds (`poll_pending_exit_cleanup`).
+    ///
+    /// When the OS refuses the job thread, the discard is refused BEFORE anything changed: nothing
+    /// is latched, no writer is stopped and no edit dropped, the dialog closes and the status line
+    /// reports the failure (as a failed cleanup does); the session keeps running unsaved and the
+    /// next close offers save/discard again.
     pub(super) fn start_exit_cleanup(&mut self, action: PendingCloseAction, parts: &mut SessionParts<'_>) {
         if self.activity(parts).exit_cleanup_running() {
             return;
         }
+        let job = match Self::spawn_unsaved_delete_job(parts.project.paths.unsaved_dir.clone()) {
+            Ok(job) => job,
+            Err(err) => {
+                runtime_log::log_error(format!(
+                    "[exit] discard refused: the staging cleanup thread could not be started: {err}. Possible cause: the OS thread limit or low memory. Nothing was discarded or stopped; '{}' is intact and the session stays unsaved",
+                    parts.project.paths.unsaved_dir.display()
+                ));
+                parts.close.close_dialog();
+                self.has_unsaved_changes_cached = true;
+                self.save_to_project_status = Some((t!("app.cleanup.worker_start_error").to_string(), 0.0));
+                return;
+            }
+        };
         parts.writers.quiesce_discarding(parts.typing);
-        let rx = Self::spawn_unsaved_delete_job(
-            parts.project.paths.unsaved_dir.clone(),
-            parts.writers.take_overlay_thread(),
-        );
-        self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx });
+        if let Err(unsent) = job.start.send(parts.writers.take_overlay_thread()) {
+            // Unreachable while the job is parked on `recv` (it returns only after receiving); if
+            // it happens anyway, `result` is disconnected and `poll_pending_exit_cleanup` takes the
+            // lost-worker path (un-latch + restart). The клин thread was told to stop-now and writes
+            // nothing more, so dropping its handle detaches a thread that is already exiting.
+            runtime_log::log_error(format!(
+                "[exit] discard cleanup job gone before its start signal; the cleanup is reported as failed (autosave handle present={})",
+                unsent.0.is_some()
+            ));
+        }
+        self.pending_exit_cleanup = Some(PendingExitCleanup { action, rx: job.result });
         self.save_to_project_status = Some((t!("app.cleanup.cleaning").to_string(), 0.0));
     }
 

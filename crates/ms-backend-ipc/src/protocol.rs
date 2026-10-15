@@ -50,7 +50,13 @@ use serde_json::{Map, Value, json};
 /// 10: new `General.touch_gestures` boolean (canvas finger gestures; per-platform default).
 /// 11: `Hotkeys` section format 2 (`{"format": 2, "actions": {id: [alternative, ...]}}`, written
 /// by `ms-input`; a version-1 section is migrated and rewritten on studio open).
-pub const PROTOCOL_VERSION: u32 = 11;
+/// 12: EasyOCR / Surya / SDXL load offline from Rust-downloaded directories: new required
+/// fields [`HEADER_EASYOCR_MODEL_DIR`] (`ocr.easy`), [`HEADER_SURYA_RECOGNITION_DIR`] +
+/// [`HEADER_SURYA_DETECTION_DIR`] (`ocr.surya`), [`HEADER_SURYA_DETECTION_DIR`]
+/// (`textdetector.surya.forward`), [`HEADER_SDXL_CONFIG_DIR`] (`inpaint.sdxl`), plus
+/// [`HEADER_SDXL_MODEL_DIR`] (`inpaint.sdxl`, required for the curated repo id);
+/// [`HEADER_EASY_LANGS`] is no longer aliased by the backend; other SDXL repo ids are refused.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -278,6 +284,26 @@ pub const HEADER_TOPIC: &str = "topic";
 pub const HEADER_STATUS: &str = "status";
 pub const HEADER_ERROR: &str = "error";
 pub const HEADER_BACKEND_VERSION: &str = "backend_version";
+
+// --- Model locations sent by Rust (the backend never downloads these models) ---
+/// `ocr.easy` (v12, required): absolute directory holding the EasyOCR detector
+/// `craft_mlt_25k.pth` and every downloaded recognizer (one shared directory).
+pub const HEADER_EASYOCR_MODEL_DIR: &str = "easyocr_model_dir";
+/// `ocr.easy`: canonical EasyOCR language codes, comma-separated; since v12 the backend uses
+/// them verbatim (Rust owns normalization and the script choice).
+pub const HEADER_EASY_LANGS: &str = "easy_langs";
+/// `ocr.surya` (v12, required): absolute `text_recognition` checkpoint directory (foundation +
+/// recognition, Surya's `manifest.json` layout).
+pub const HEADER_SURYA_RECOGNITION_DIR: &str = "surya_recognition_dir";
+/// `ocr.surya` and `textdetector.surya.forward` (v12, required): absolute `text_detection`
+/// checkpoint directory.
+pub const HEADER_SURYA_DETECTION_DIR: &str = "surya_detection_dir";
+/// `inpaint.sdxl` (v12, required): absolute directory of the pinned diffusers config repo for
+/// the channel mode (9-ch -> inpaint config, 4-ch -> base config).
+pub const HEADER_SDXL_CONFIG_DIR: &str = "sdxl_config_dir";
+/// `inpaint.sdxl` (v12): absolute directory of the curated fp16 inpaint model; required iff
+/// `params.model_path` is the curated repo id, otherwise `null`.
+pub const HEADER_SDXL_MODEL_DIR: &str = "sdxl_model_dir";
 
 /// Builds a `hello` frame header (`{ v, id: 0, kind: "hello" }`).
 #[must_use]

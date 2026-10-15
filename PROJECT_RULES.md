@@ -143,7 +143,8 @@ survive an unstable network:
 - every request has connect and read timeouts; cancel interrupts both the transfer and the
   backoff wait;
 - retries are logged with context and visible in the UI as progress, not as a failure.
-Reference implementation: `ms_sysprobe::ai_models::external`. Tests use an injected fetcher and
+Reference implementation: `ms_download` (engine) + `ms_sysprobe::ai_models::external` (pinned
+multi-file use). Tests use an injected fetcher and
 an injectable sleep, never the network.
 
 ## House style: no formatter (global §4)

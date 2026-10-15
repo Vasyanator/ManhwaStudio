@@ -1,125 +1,28 @@
 /*
-File: crates/ms-sysprobe/src/ai_models/resumable/tests.rs
+File: crates/ms-download/src/resumable/tests.rs
 
 Purpose:
-Unit tests of the shared HTTP mechanics: `hf_resolve_url_at` / `endpoint_from_env_value`
-(encoding, `HF_ENDPOINT` override as a parameter — no process environment is touched), the
-resumable per-file fetch without a pinned size (size from the server's announcement), and the
-main-repository downloader `download_hf_file_with` that is built on it. The pinned
-(size + sha256) path is covered by `external/tests.rs`.
+Unit tests of the resumable per-file fetch without a pinned size (size from the server's
+announcement): resume after drops and short bodies, retry with backoff and `Retry-After`,
+permanent statuses, proven-wrong staged bytes, cancel during the backoff, 416 handling.
+The pinned (size + sha256) path is covered by `ms_sysprobe::ai_models::external` tests.
 
 Notes:
-- A scripted in-memory fetcher replays drops, short bodies, error statuses and size
-  announcements; the backoff sleep only records. No network, no real waiting; scratch data
-  lives in a self-removing `tempfile` directory.
+- The scripted in-memory fetcher (`crate::test_support`) replays drops, short bodies, error
+  statuses and size announcements; the backoff sleep only records. No network, no real
+  waiting; scratch data lives in a self-removing `tempfile` directory.
 */
 
-use std::collections::VecDeque;
-use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use super::*;
-
-const REPO: &str = "Vasyanator2/ManhwaStudio_AI_Models";
-
-#[test]
-fn resolve_url_encodes_every_segment_and_keeps_separators() {
-    assert_eq!(
-        hf_resolve_url_at(DEFAULT_HF_ENDPOINT, REPO, "main", "ONNX/PaddleOCR/detection/v5/det.onnx"),
-        "https://huggingface.co/Vasyanator2/ManhwaStudio_AI_Models/resolve/main/ONNX/PaddleOCR/detection/v5/det.onnx"
-    );
-    assert_eq!(
-        hf_resolve_url_at("https://hf.example", "owner/repo", "main", "dir name/a+b#c?.pt"),
-        "https://hf.example/owner/repo/resolve/main/dir%20name/a%2Bb%23c%3F.pt"
-    );
-    // Non-ASCII is encoded byte by byte; unreserved punctuation stays.
-    assert_eq!(hf_resolve_url_at("https://hf.example", "o/r", "main", "ä/x-y_z.~1"), "https://hf.example/o/r/resolve/main/%C3%A4/x-y_z.~1");
-    // The revision is one segment: a branch-name slash is encoded as the Hub expects.
-    assert_eq!(hf_resolve_url_at("https://hf.example", "o/r", "refs/pr/1", "f.bin"), "https://hf.example/o/r/resolve/refs%2Fpr%2F1/f.bin");
-}
-
-#[test]
-fn hf_endpoint_value_overrides_the_default() {
-    assert_eq!(endpoint_from_env_value(None), DEFAULT_HF_ENDPOINT);
-    assert_eq!(endpoint_from_env_value(Some("")), DEFAULT_HF_ENDPOINT);
-    assert_eq!(endpoint_from_env_value(Some("   ")), DEFAULT_HF_ENDPOINT);
-    assert_eq!(endpoint_from_env_value(Some(" https://hf-mirror.example/ ")), "https://hf-mirror.example");
-    assert_eq!(endpoint_from_env_value(Some("http://127.0.0.1:8080//")), "http://127.0.0.1:8080");
-    let url = hf_resolve_url_at(endpoint_from_env_value(Some("https://hf-mirror.example/")), REPO, "main", "a.json");
-    assert_eq!(url, "https://hf-mirror.example/Vasyanator2/ManhwaStudio_AI_Models/resolve/main/a.json");
-}
-
-/// One scripted answer; once the script is empty the server answers normally.
-#[derive(Clone, Copy)]
-enum Step {
-    /// Serve `n` bytes from the requested offset, then fail the body read (connection reset).
-    Drop(usize),
-    /// Serve `n` bytes from the requested offset, then end the body cleanly.
-    Short(usize),
-    /// Answer with an HTTP error status and an optional `Retry-After`.
-    Status(u16, Option<&'static str>),
-    /// Serve the requested range normally but announce this whole-file size.
-    Announce(Option<u64>),
-}
-
-/// Single-body server: honours ranges (416 with the real total at or past the end) and
-/// replays a script of failures.
-struct ScriptedFetcher {
-    body: Vec<u8>,
-    script: Mutex<VecDeque<Step>>,
-    offsets: Mutex<Vec<u64>>,
-}
-
-impl ScriptedFetcher {
-    fn new(body: &[u8], script: &[Step]) -> Self {
-        Self { body: body.to_vec(), script: Mutex::new(script.iter().copied().collect()), offsets: Mutex::new(Vec::new()) }
-    }
-
-    fn offsets(&self) -> Vec<u64> {
-        self.offsets.lock().map(|offsets| offsets.clone()).unwrap_or_default()
-    }
-}
-
-/// A body reader whose every read fails like a reset connection.
-struct ResetReader;
-
-impl Read for ResetReader {
-    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-        Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset by peer"))
-    }
-}
-
-fn permanent(err: impl std::fmt::Display) -> FetchError {
-    FetchError::Permanent { detail: err.to_string() }
-}
+use crate::test_support::{ScriptedFetcher, Step};
 
 fn len_u64(bytes: &[u8]) -> u64 {
     u64::try_from(bytes.len()).unwrap_or(u64::MAX)
-}
-
-impl RangeFetcher for ScriptedFetcher {
-    fn fetch(&self, _url: &str, offset: u64) -> Result<FetchResponse, FetchError> {
-        self.offsets.lock().map_err(permanent)?.push(offset);
-        let step = self.script.lock().map_err(permanent)?.pop_front();
-        let total = len_u64(&self.body);
-        if offset > 0 && offset >= total {
-            return Err(FetchError::RangeNotSatisfiable { total: Some(total) });
-        }
-        let start = usize::try_from(offset).map_err(permanent)?;
-        let rest = self.body.get(start..).ok_or_else(|| permanent("offset past the body"))?;
-        let status = if offset > 0 { FetchStatus::Partial } else { FetchStatus::Full };
-        let (total_len, body): (Option<u64>, Box<dyn Read + Send>) = match step {
-            None => (Some(total), Box::new(Cursor::new(rest.to_vec()))),
-            Some(Step::Drop(len)) => (Some(total), Box::new(Cursor::new(rest[..len.min(rest.len())].to_vec()).chain(ResetReader))),
-            Some(Step::Short(len)) => (Some(total), Box::new(Cursor::new(rest[..len.min(rest.len())].to_vec()))),
-            Some(Step::Status(code, retry_after)) => return Err(classify_status(code, retry_after)),
-            Some(Step::Announce(announced)) => (announced, Box::new(Cursor::new(rest.to_vec()))),
-        };
-        Ok(FetchResponse { status, total_len, body })
-    }
 }
 
 /// Records every backoff sleep slice; optionally sets `cancel` on the first one.
@@ -157,7 +60,7 @@ fn content(len: usize, seed: u8) -> Vec<u8> {
 }
 
 fn temp_root() -> tempfile::TempDir {
-    match tempfile::Builder::new().prefix("ms-sysprobe-resumable-").tempdir_in(std::env::temp_dir()) {
+    match tempfile::Builder::new().prefix("ms-download-resumable-").tempdir_in(std::env::temp_dir()) {
         Ok(dir) => dir,
         Err(err) => panic!("cannot create a temp dir: {err}"),
     }
@@ -218,6 +121,29 @@ fn unpinned_download_takes_its_size_from_the_announcement() {
     assert_eq!(result.ok(), Some(len_u64(&body)));
     assert_eq!(read(&part), body);
     assert!(retries.is_empty());
+}
+
+/// Every `Downloading` event of an unpinned stream carries the size the server announced, so
+/// a consumer can draw a determinate bar without a pin.
+#[test]
+fn downloading_events_carry_the_announced_total() {
+    let body = content(300 * 1024, 7);
+    let root = temp_root();
+    let part = part_in(&root);
+    let fetcher = ScriptedFetcher::new(&body, &[]);
+    let policy = quiet_policy();
+    let cancel = AtomicBool::new(false);
+    let engine = ResumableFetch { fetcher: &fetcher, retry: &policy, cancel: &cancel, log_tag: "[test]", log_context: "file=model.bin" };
+    let request = PartRequest { url: "mem://model.bin", part: &part, offset: 0, expected_size: None };
+    let mut totals = Vec::new();
+    let result = engine.fetch_part(&request, None, &mut |event| {
+        if let StreamEvent::Downloading { total, .. } = event {
+            totals.push(total);
+        }
+    });
+    assert_eq!(result.ok(), Some(len_u64(&body)));
+    assert!(!totals.is_empty());
+    assert!(totals.iter().all(|total| *total == Some(len_u64(&body))));
 }
 
 #[test]
@@ -359,44 +285,76 @@ fn a_416_with_a_pinned_size_is_permanent() {
     assert_eq!(file_len(&part), Some(1500));
 }
 
-// --- main-repository downloader (`ai_models::download_hf_file_with`) -------------------
-
 #[test]
-fn main_repo_download_publishes_the_file_and_removes_the_part() {
-    let body = content(200_000, 20);
-    let root = temp_root();
-    let local = root.path().join("ONNX").join("det.onnx");
-    let fetcher = ScriptedFetcher::new(&body, &[Step::Drop(70_000)]);
-    let result = crate::ai_models::download_hf_file_with(&fetcher, &quiet_policy(), "mem://det.onnx", &local, "ONNX/det.onnx");
-    assert_eq!(result, Ok(()));
-    assert_eq!(read(&local), body);
-    assert!(!root.path().join("ONNX").join("det.onnx.part").exists());
-    assert_eq!(fetcher.offsets(), vec![0, 70_000]);
+fn redirect_targets_resolve_against_the_current_url() {
+    let base = "https://huggingface.co/owner/repo/resolve/main/dir/file.bin?download=1";
+    let ok = |location: &str| resolve_location(base, location).ok();
+    assert_eq!(ok("https://cdn.example/x?sig=1").as_deref(), Some("https://cdn.example/x?sig=1"));
+    assert_eq!(ok("//cdn.example/x").as_deref(), Some("https://cdn.example/x"));
+    assert_eq!(ok("/api/resolve-cache/x").as_deref(), Some("https://huggingface.co/api/resolve-cache/x"));
+    assert_eq!(ok("other.bin").as_deref(), Some("https://huggingface.co/owner/repo/resolve/main/dir/other.bin"));
+    // Query-only: same resource, new query (RFC 3986 §5.2.2).
+    assert_eq!(ok("?sig=2").as_deref(), Some("https://huggingface.co/owner/repo/resolve/main/dir/file.bin?sig=2"));
+    // Empty reference keeps the base query; a fragment is dropped.
+    assert_eq!(ok("#frag").as_deref(), Some(base));
+    // Dot segments are removed.
+    assert_eq!(ok("../up/./x.bin").as_deref(), Some("https://huggingface.co/owner/repo/resolve/main/up/x.bin"));
+    assert_eq!(ok("/a/b/../../../c").as_deref(), Some("https://huggingface.co/c"));
+    assert_eq!(resolve_location("https://host", "x").ok().as_deref(), Some("https://host/x"));
+    assert_eq!(resolve_location("http://host/a", "HTTPS://secure/b").ok().as_deref(), Some("https://secure/b"));
 }
 
 #[test]
-fn main_repo_download_resumes_a_part_left_by_an_earlier_run() {
-    let body = content(10_000, 21);
-    let root = temp_root();
-    let local = root.path().join("config.json");
-    write(&root.path().join("config.json.part"), &body[..2500]);
-    let fetcher = ScriptedFetcher::new(&body, &[]);
-    let result = crate::ai_models::download_hf_file_with(&fetcher, &quiet_policy(), "mem://config.json", &local, "config.json");
-    assert_eq!(result, Ok(()));
-    assert_eq!(fetcher.offsets(), vec![2500]);
-    assert_eq!(read(&local), body);
+fn rfc3986_reference_resolution_examples() {
+    // RFC 3986 §5.4.1 normal examples (fragments dropped, base made http(s)).
+    let base = "http://a/b/c/d;p?q";
+    for (reference, expected) in [
+        ("g", "http://a/b/c/g"),
+        ("./g", "http://a/b/c/g"),
+        ("g/", "http://a/b/c/g/"),
+        ("/g", "http://a/g"),
+        ("//g", "http://g"),
+        ("?y", "http://a/b/c/d;p?y"),
+        ("g?y", "http://a/b/c/g?y"),
+        ("", "http://a/b/c/d;p?q"),
+        (".", "http://a/b/c/"),
+        ("./", "http://a/b/c/"),
+        ("..", "http://a/b/"),
+        ("../g", "http://a/b/g"),
+        ("../..", "http://a/"),
+        ("../../g", "http://a/g"),
+        ("../../../g", "http://a/g"),
+        ("g;x=1/../y", "http://a/b/c/y"),
+    ] {
+        assert_eq!(resolve_location(base, reference).ok().as_deref(), Some(expected), "{reference}");
+    }
 }
 
 #[test]
-fn main_repo_download_failure_publishes_nothing_and_keeps_the_part() {
-    let body = content(10_000, 22);
-    let root = temp_root();
-    let local = root.path().join("model.onnx");
-    let mut script = vec![Step::Short(4000)];
-    script.extend([Step::Status(503, None); 6]);
-    let fetcher = ScriptedFetcher::new(&body, &script);
-    let result = crate::ai_models::download_hf_file_with(&fetcher, &quiet_policy(), "mem://model.onnx", &local, "model.onnx");
-    assert!(result.is_err());
-    assert!(!local.exists());
-    assert_eq!(file_len(&root.path().join("model.onnx.part")), Some(4000));
+fn downgrades_and_foreign_schemes_are_refused() {
+    let base = "https://huggingface.co/x";
+    assert!(resolve_location(base, "http://cdn.example/x").is_err());
+    assert!(resolve_location(base, "HTTP://cdn.example/x").is_err());
+    assert!(resolve_location(base, "ftp://elsewhere/x").is_err());
+    assert!(resolve_location(base, "file:/etc/passwd").is_err());
+    assert!(resolve_location("file:///etc/x", "/y").is_err());
+    assert!(resolve_location("http://plain/x", "http://other/y").is_ok());
+}
+
+#[test]
+fn identities_prefer_the_linked_etag_and_read_only_it_as_a_hash() {
+    let sha = "D625AA1B3E0D0408ACFD6928AA84F005867AA8DBB9162480346A4E20660786CC";
+    let lfs = RemoteIdentity::from_headers(Some(&format!("\"{sha}\"")), Some("\"cdn\""));
+    assert_eq!(lfs.as_ref().map(|identity| identity.etag.as_str()), Some(sha));
+    assert_eq!(lfs.and_then(|identity| identity.lfs_sha256), Some(sha.to_ascii_lowercase()));
+
+    // A 64-hex plain ETag is still only a version tag, never a content hash.
+    let plain = RemoteIdentity::from_headers(None, Some(&format!("\"{sha}\"")));
+    assert_eq!(plain, Some(RemoteIdentity { etag: sha.to_owned(), lfs_sha256: None }));
+    // Weak validators never make an identity (no byte-equality promise).
+    assert_eq!(RemoteIdentity::from_headers(None, Some("W/\"v1\"")), None);
+    assert_eq!(RemoteIdentity::from_headers(Some("W/\"abc\""), Some("\"strong\"")), Some(RemoteIdentity { etag: "strong".to_owned(), lfs_sha256: None }));
+    let blob = RemoteIdentity::from_headers(Some("\"abc\""), None);
+    assert_eq!(blob, Some(RemoteIdentity { etag: "abc".to_owned(), lfs_sha256: None }));
+    assert_eq!(RemoteIdentity::from_headers(Some("\"\""), Some(" ")), None);
 }

@@ -1,12 +1,16 @@
 /*
-File: src/launcher/new_project/waifu2x.rs
+File: crates/ms-launcher/src/new_project/waifu2x.rs
 
 Purpose:
 Background waifu2x pipeline for the New Project launcher window.
 
 Main responsibilities:
-- resolve the bundled waifu2x shared library and model directory for the current platform;
-- download and extract the platform waifu2x package when the bundled runtime is missing;
+- resolve the waifu2x shared library and model directory for the current platform, or the
+  typed "not on this platform" answer of `PlatformFeature::Waifu2xUpscaler` (macOS, Android
+  and wasm have no package);
+- download the pinned platform package (`ms_download::fetch_verified`: size + sha256,
+  retry with backoff, `.part` resume, cancel on window close) and unpack it through a
+  `.staging/` tree that is renamed into place;
 - lazily load the shared library on first use and keep the model/context alive while the
   New Project window stays open;
 - process ribbon pages directly from memory in a worker thread and stream progress back to egui;
@@ -21,9 +25,13 @@ Key structures:
 
 Notes:
 The backend is dynamically loaded at runtime via `libloading`; the application must start
-without the library present. If the bundled shared library or default model directory is
-missing, the worker downloads the platform archive from the configured GitHub release and
-extracts it into `data_dir()/waifu2x` before processing.
+without the library present. If the shared library or model directory is missing, the worker
+downloads the platform archive (`PLATFORM_PACKAGE`, pinned) into
+`data_dir()/waifu2x/.download/`, unpacks it into `data_dir()/waifu2x/.staging/`, renames that
+tree to the pin's generation folder `gen-<sha256 prefix>/` and then atomically switches the
+`active` marker to it; older generations are removed only after the switch. The probe accepts
+only the generation the marker names. A `.part` survives a failure or cancel and is resumed
+by the next run; a stale `.staging/` is deleted.
 */
 
 use ms_config as config;
@@ -38,7 +46,11 @@ use std::ffi::{CString, c_char, c_int, c_void};
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{self, File};
 #[cfg(not(target_arch = "wasm32"))]
-use std::io::{self, Read, Write};
+use ms_download::resumable::{RangeFetcher, ResumableFetch, RetryPolicy, StreamEvent, UreqFetcher};
+#[cfg(not(target_arch = "wasm32"))]
+use ms_download::{DownloadError, Expected, FileEvent, FileRequest, fetch_verified};
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,10 +135,16 @@ pub struct Waifu2xBackendProbe {
     availability: Waifu2xAvailability,
 }
 
+/// What the probe found for this platform's waifu2x backend.
 #[derive(Clone)]
 enum Waifu2xAvailability {
+    /// Library and model folder are present.
     Available,
-    Unavailable { user_message: String },
+    /// The package is not installed (yet): the worker downloads it on first use.
+    Missing { user_message: String },
+    /// The capability table has no waifu2x on this platform (`PlatformFeature::Waifu2xUpscaler`);
+    /// nothing is ever downloaded.
+    PlatformUnsupported { user_message: String },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -219,8 +237,6 @@ struct Waifu2xLoadParams {
 
 #[cfg(not(target_arch = "wasm32"))]
 const WAIFU2X_ABI_VERSION: i32 = 1;
-#[cfg(not(target_arch = "wasm32"))]
-const DOWNLOAD_BUFFER_SIZE: usize = 64 * 1024;
 
 impl Waifu2xController {
     #[cfg(not(target_arch = "wasm32"))]
@@ -250,6 +266,13 @@ impl Waifu2xController {
 
     pub fn unavailable_reason(&self) -> Option<&str> {
         self.backend.unavailable_reason()
+    }
+
+    /// Whether this platform has waifu2x at all (`PlatformFeature::Waifu2xUpscaler`). When
+    /// `false`, [`Self::unavailable_reason`] is the localized "not on this platform" text and
+    /// a run fails with it without any download.
+    pub fn platform_supported(&self) -> bool {
+        !matches!(self.backend.availability, Waifu2xAvailability::PlatformUnsupported { .. })
     }
 
     pub fn backend_path(&self) -> &Path {
@@ -345,7 +368,7 @@ impl Waifu2xBackendProbe {
     fn unavailable_reason(&self) -> Option<&str> {
         match &self.availability {
             Waifu2xAvailability::Available => None,
-            Waifu2xAvailability::Unavailable { user_message } => Some(user_message.as_str()),
+            Waifu2xAvailability::Missing { user_message } | Waifu2xAvailability::PlatformUnsupported { user_message } => Some(user_message.as_str()),
         }
     }
 
@@ -460,8 +483,18 @@ impl Waifu2xSharedRuntime {
         if backend.is_available() {
             return Ok(backend.clone());
         }
+        let package = match waifu2x_package() {
+            Ok(package) => package,
+            Err(unavailable) => {
+                return Err(Waifu2xError {
+                    user_message: unavailable.user_message(),
+                    log_message: format!("waifu2x is not available on this platform: {unavailable:?}"),
+                });
+            }
+        };
 
-        install_waifu2x_backend(progress_tx)?;
+        // Window close sets `shutdown_requested`; it cancels the transfer and the backoff too.
+        install_waifu2x_backend(package, &self.shutdown_requested, progress_tx)?;
         *backend = probe_waifu2x_backend();
         if backend.is_available() {
             Ok(backend.clone())
@@ -643,47 +676,111 @@ impl Drop for Waifu2xRuntime {
     }
 }
 
-pub fn default_waifu2x_backend_path() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    let relative = Path::new("waifu2x")
-        .join("Win")
-        .join("waifu2x-ncnn-vulkan.dll");
-
-    #[cfg(target_os = "macos")]
-    let relative = Path::new("waifu2x")
-        .join("Mac")
-        .join("libwaifu2x-ncnn-vulkan.dylib");
-
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    let relative = Path::new("waifu2x")
-        .join("Lin")
-        .join("libwaifu2x-ncnn-vulkan.so");
-
-    config::data_dir().join(relative)
+/// The pinned waifu2x release package of one platform: where it unpacks and what the
+/// download must match. Pins come from the release assets themselves (GitHub's size and
+/// `sha256:` digest agree with the hashed bytes).
+#[derive(Debug, Clone, Copy)]
+// The download fields are read only by the native installer; the web build has no waifu2x.
+#[cfg_attr(target_arch = "wasm32", expect(dead_code, reason = "the archive/url/size/sha256 pins are read only by the native installer; the web build has no waifu2x"))]
+struct Waifu2xPackage {
+    /// Top-level folder of the archive, unpacked as `data_dir()/waifu2x/<dir>`.
+    dir: &'static str,
+    /// The shared library inside `dir`.
+    library: &'static str,
+    /// The model folder inside `dir`.
+    model_dir: &'static str,
+    /// Archive file name (also the staged `.download/<archive>` name).
+    archive: &'static str,
+    /// Release asset URL.
+    url: &'static str,
+    /// Exact archive size in bytes.
+    size: u64,
+    /// sha256 of the archive (64 lowercase hex digits).
+    sha256: &'static str,
 }
 
-pub fn default_waifu2x_model_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    let relative = Path::new("waifu2x").join("Win").join("models-cunet");
+/// The package of this build. Which OS builds have a package at all is decided by
+/// `PlatformFeature::Waifu2xUpscaler` (Linux and Windows); this only picks the data.
+#[cfg(target_os = "windows")]
+const PLATFORM_PACKAGE: Waifu2xPackage = Waifu2xPackage {
+    dir: "Win",
+    library: "waifu2x-ncnn-vulkan.dll",
+    model_dir: "models-cunet",
+    archive: "Win.zip",
+    url: "https://github.com/Vasyanator/libwaifu2x-ncnn-vulkan/releases/download/1.0/Win.zip",
+    size: 36_873_220,
+    sha256: "8a087d5f5f35a4eeaa29e95a10741cad1c7890d19c8ddff9a5f0eb78c8844fbb",
+};
 
-    #[cfg(target_os = "macos")]
-    let relative = Path::new("waifu2x").join("Mac").join("models-cunet");
+/// The package of this build (see the Windows twin above).
+#[cfg(not(target_os = "windows"))]
+const PLATFORM_PACKAGE: Waifu2xPackage = Waifu2xPackage {
+    dir: "Lin",
+    library: "libwaifu2x-ncnn-vulkan.so",
+    model_dir: "models-cunet",
+    archive: "Lin.zip",
+    url: "https://github.com/Vasyanator/libwaifu2x-ncnn-vulkan/releases/download/1.0/Lin.zip",
+    size: 36_131_839,
+    sha256: "6379c582c3966173504f2ddc0da00fbb29f41528c12b108fe2691317ded2cc06",
+};
 
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    let relative = Path::new("waifu2x").join("Lin").join("models-cunet");
-
-    config::data_dir().join(relative)
+/// The waifu2x package of this platform, or the typed "not on this platform" answer of the
+/// capability table (macOS, Android and wasm have no package).
+fn waifu2x_package() -> Result<&'static Waifu2xPackage, ms_platform::Unavailable> {
+    ms_platform::PlatformFeature::Waifu2xUpscaler.require().map(|()| &PLATFORM_PACKAGE)
 }
 
+/// `data_dir()/waifu2x`: every package unpacks below it.
+fn waifu2x_root() -> PathBuf {
+    config::data_dir().join("waifu2x")
+}
+
+/// Name of the marker file in the waifu2x root that names the ACTIVE generation folder. It is
+/// replaced atomically (temp + fsync + rename), so it always names one complete generation.
+const ACTIVE_MARKER: &str = "active";
+
+/// The generation folder of `package`: `gen-<first 16 hex digits of its sha256>`. A new pin
+/// unpacks into a new folder, so the current generation is never touched while the next one
+/// is being published.
+fn generation_name(package: &Waifu2xPackage) -> String {
+    let prefix = package.sha256.get(..16).unwrap_or(package.sha256);
+    format!("gen-{prefix}")
+}
+
+/// Resolves the backend of this platform: unsupported platform, missing library or model
+/// folder, or available. Reads the small active-generation marker and probes two paths; no
+/// network.
 fn probe_waifu2x_backend() -> Waifu2xBackendProbe {
-    let library_path = default_waifu2x_backend_path();
-    let model_dir = default_waifu2x_model_dir();
-    let availability = if !library_path.is_file() {
-        Waifu2xAvailability::Unavailable {
+    let root = waifu2x_root();
+    let package = match waifu2x_package() {
+        Ok(package) => package,
+        Err(unavailable) => {
+            return Waifu2xBackendProbe {
+                library_path: root.clone(),
+                model_dir: root,
+                availability: Waifu2xAvailability::PlatformUnsupported { user_message: unavailable.user_message() },
+            };
+        }
+    };
+    probe_package(&root, package)
+}
+
+/// [`probe_waifu2x_backend`] for a supported platform under an explicit `root`: available
+/// only when the marker names THIS pin's generation and that generation holds the library
+/// and the model folder. A tree without the marker (a legacy unversioned install, or a
+/// generation whose switch never completed) is not available and gets reinstalled.
+fn probe_package(root: &Path, package: &Waifu2xPackage) -> Waifu2xBackendProbe {
+    let generation = generation_name(package);
+    let generation_dir = root.join(&generation);
+    let library_path = generation_dir.join(package.dir).join(package.library);
+    let model_dir = generation_dir.join(package.dir).join(package.model_dir);
+    let active = std::fs::read_to_string(root.join(ACTIVE_MARKER)).is_ok_and(|marker| marker.trim() == generation);
+    let availability = if !active || !library_path.is_file() {
+        Waifu2xAvailability::Missing {
             user_message: tf!("launcher.new_project.waifu2x.library_missing_error", library_path = library_path.display()),
         }
     } else if !model_dir.is_dir() {
-        Waifu2xAvailability::Unavailable {
+        Waifu2xAvailability::Missing {
             user_message: tf!("launcher.new_project.waifu2x.models_dir_missing_error", model_dir = model_dir.display()),
         }
     } else {
@@ -696,128 +793,131 @@ fn probe_waifu2x_backend() -> Waifu2xBackendProbe {
     }
 }
 
+/// Downloads the platform package and unpacks it under `waifu2x_root()`.
+///
+/// The archive is fetched by `ms_download::fetch_verified` against the pinned size and
+/// sha256 (retry with backoff, `Range` resume of `.download/<archive>.part` across runs,
+/// cancel through `cancel`), then unpacked by [`extract_waifu2x_package`] and deleted.
+///
+/// # Errors
+/// A [`Waifu2xError`] for the download (see [`waifu2x_download_error`]) or the extraction.
 #[cfg(not(target_arch = "wasm32"))]
-fn install_waifu2x_backend(progress_tx: &Sender<Waifu2xWorkerEvent>) -> Result<(), Waifu2xError> {
-    send_progress(progress_tx, "download_waifu2x", 0, 1);
-    let package_path = download_waifu2x_package(progress_tx)?;
-    extract_waifu2x_package(&package_path, progress_tx)?;
-    if let Err(err) = fs::remove_file(&package_path) {
+fn install_waifu2x_backend(package: &Waifu2xPackage, cancel: &AtomicBool, progress_tx: &Sender<Waifu2xWorkerEvent>) -> Result<(), Waifu2xError> {
+    let root = waifu2x_root();
+    let fetcher = UreqFetcher::new(None);
+    let retry = RetryPolicy::standard();
+    let archive_path = download_waifu2x_package(&fetcher, &retry, cancel, package, &root, progress_tx)?;
+    extract_waifu2x_package(&archive_path, &root, &generation_name(package), cancel, progress_tx)?;
+    if let Err(err) = fs::remove_file(&archive_path) {
         ms_log::runtime_log::log_warn(format!(
-            "[new-project] failed to remove temporary waifu2x archive '{}': {err}",
-            package_path.display()
+            "[new-project] failed to remove the unpacked waifu2x archive '{}': {err}",
+            archive_path.display()
         ));
     }
     Ok(())
 }
 
+/// Makes `<root>/.download/<archive>` present and verified, and returns its path.
+///
+/// An archive left by an earlier run that already matches the pins is kept without a
+/// request; a `.part` is resumed. Progress: `download_waifu2x` (bytes staged / total),
+/// `verify_waifu2x` (bytes hashed of an existing prefix) and `download_waifu2x_retry`
+/// (retry `k` of `n` after a transient network failure).
+///
+/// # Errors
+/// A [`Waifu2xError`] mapped from the `DownloadError` by [`waifu2x_download_error`].
 #[cfg(not(target_arch = "wasm32"))]
 fn download_waifu2x_package(
+    fetcher: &dyn RangeFetcher,
+    retry: &RetryPolicy<'_>,
+    cancel: &AtomicBool,
+    package: &Waifu2xPackage,
+    root: &Path,
     progress_tx: &Sender<Waifu2xWorkerEvent>,
 ) -> Result<PathBuf, Waifu2xError> {
-    let download_dir = config::data_dir().join("waifu2x").join(".download");
-    fs::create_dir_all(&download_dir).map_err(|err| Waifu2xError {
-        user_message: t!("launcher.new_project.waifu2x.prepare_download_dir_error").to_string(),
-        log_message: format!(
-            "failed to create waifu2x download dir '{}': {err}",
-            download_dir.display()
-        ),
-    })?;
-
-    let archive_path = download_dir.join(waifu2x_archive_name());
-    let partial_path = archive_path.with_extension("zip.part");
-    if partial_path.exists() {
-        fs::remove_file(&partial_path).map_err(|err| Waifu2xError {
-            user_message: t!("launcher.new_project.waifu2x.update_temp_file_error").to_string(),
-            log_message: format!(
-                "failed to remove old partial waifu2x archive '{}': {err}",
-                partial_path.display()
-            ),
-        })?;
-    }
-
-    let url = waifu2x_package_url();
+    let download_dir = root.join(".download");
+    let archive_path = download_dir.join(package.archive);
+    let part_path = download_dir.join(format!("{}.part", package.archive));
+    send_progress(progress_tx, "download_waifu2x", 0, 0);
     ms_log::runtime_log::log_info(format!(
-        "[new-project] downloading waifu2x backend from {url}"
+        "[new-project] downloading waifu2x backend: url={} dest='{}' size={}",
+        package.url,
+        archive_path.display(),
+        package.size
     ));
-    let response = ureq::AgentBuilder::new()
-        .timeout_connect(web_time::Duration::from_secs(20))
-        .timeout_read(web_time::Duration::from_secs(120))
-        .build()
-        .get(url)
-        .call()
-        .map_err(|err| waifu2x_download_error(url, err))?;
-
-    let total_bytes = response
-        .header("Content-Length")
-        .and_then(|value| value.parse::<u64>().ok())
-        .map(saturating_usize)
-        .unwrap_or(0);
-
-    let mut reader = response.into_reader();
-    let mut output = File::create(&partial_path).map_err(|err| Waifu2xError {
-        user_message: t!("launcher.new_project.waifu2x.create_archive_file_error").to_string(),
-        log_message: format!(
-            "failed to create waifu2x archive '{}': {err}",
-            partial_path.display()
-        ),
-    })?;
-    let mut buffer = vec![0_u8; DOWNLOAD_BUFFER_SIZE];
-    let mut downloaded = 0_u64;
-    loop {
-        let read = reader.read(&mut buffer).map_err(|err| Waifu2xError {
-            user_message: t!("launcher.new_project.waifu2x.download_archive_error").to_string(),
-            log_message: format!("failed to read waifu2x response from '{url}': {err}"),
-        })?;
-        if read == 0 {
-            break;
+    let context = format!("waifu2x package {}", package.archive);
+    let engine = ResumableFetch {
+        fetcher,
+        retry,
+        cancel,
+        log_tag: "[new-project]",
+        log_context: &context,
+    };
+    let request = FileRequest {
+        url: package.url,
+        part: &part_path,
+        dest: &archive_path,
+        expected: Expected::SizeSha256 { size: package.size, sha256: package.sha256 },
+    };
+    let mut on_event = |event: FileEvent| match event {
+        FileEvent::Waiting => send_progress(progress_tx, "download_waifu2x", 0, 0),
+        FileEvent::Verifying { done, total } => {
+            send_progress(progress_tx, "verify_waifu2x", saturating_usize(done), saturating_usize(total));
         }
-        output
-            .write_all(&buffer[..read])
-            .map_err(|err| Waifu2xError {
-                user_message: t!("launcher.new_project.waifu2x.write_archive_error").to_string(),
-                log_message: format!(
-                    "failed to write waifu2x archive '{}': {err}",
-                    partial_path.display()
-                ),
-            })?;
-        let read_u64 = u64::try_from(read).map_err(|err| Waifu2xError {
-            user_message: t!("launcher.new_project.waifu2x.download_archive_error").to_string(),
-            log_message: format!("failed to convert downloaded chunk size {read}: {err}"),
-        })?;
-        downloaded = downloaded.saturating_add(read_u64);
-        send_progress(
-            progress_tx,
-            "download_waifu2x",
-            saturating_usize(downloaded),
-            total_bytes,
-        );
+        FileEvent::Stream(StreamEvent::Downloading { staged, total }) => {
+            send_progress(progress_tx, "download_waifu2x", saturating_usize(staged), total.map_or(0, saturating_usize));
+        }
+        FileEvent::Stream(StreamEvent::Retrying { attempt, max_attempts, .. }) => {
+            send_progress(progress_tx, "download_waifu2x_retry", saturating_usize(u64::from(attempt)), saturating_usize(u64::from(max_attempts)));
+        }
+    };
+    match fetch_verified(&engine, &request, &mut on_event) {
+        Ok(_) => {
+            ms_log::runtime_log::log_info(format!("[new-project] waifu2x package ready: '{}'", archive_path.display()));
+            Ok(archive_path)
+        }
+        Err(err) => Err(waifu2x_download_error(package.url, &err)),
     }
-    output.flush().map_err(|err| Waifu2xError {
-        user_message: t!("launcher.new_project.waifu2x.save_archive_error").to_string(),
-        log_message: format!(
-            "failed to flush waifu2x archive '{}': {err}",
-            partial_path.display()
-        ),
-    })?;
-    drop(output);
-
-    fs::rename(&partial_path, &archive_path).map_err(|err| Waifu2xError {
-        user_message: t!("launcher.new_project.waifu2x.finish_download_error").to_string(),
-        log_message: format!(
-            "failed to move waifu2x archive '{}' to '{}': {err}",
-            partial_path.display(),
-            archive_path.display()
-        ),
-    })?;
-    Ok(archive_path)
 }
 
+/// Maps a download failure to the user text and a log line with the typed detail.
+#[cfg(not(target_arch = "wasm32"))]
+fn waifu2x_download_error(url: &str, err: &DownloadError) -> Waifu2xError {
+    let user_message = match err {
+        DownloadError::Cancelled => t!("launcher.new_project.waifu2x.stopped_on_close"),
+        DownloadError::Http { .. } => t!("launcher.new_project.waifu2x.download_error_check_internet"),
+        DownloadError::Io { .. } => t!("launcher.new_project.waifu2x.write_archive_error"),
+        DownloadError::Busy { .. }
+        | DownloadError::InvalidRequest { .. }
+        | DownloadError::SizeMismatch { .. }
+        | DownloadError::HashMismatch { .. }
+        | DownloadError::Archive { .. } => t!("launcher.new_project.waifu2x.download_error"),
+    };
+    Waifu2xError {
+        user_message: user_message.to_string(),
+        log_message: format!("waifu2x download failed for '{url}': {err}"),
+    }
+}
+
+/// Unpacks `archive_path` into `<root>/.staging/`, fsyncing every file and directory, then
+/// publishes it as generation `generation` through [`publish_generation`].
+///
+/// The active generation is never written: a stale `.staging/` is incomplete by definition
+/// and is deleted at the next start, and nothing becomes available before the marker
+/// switch. Entries escaping the archive root are rejected.
+///
+/// # Errors
+/// A [`Waifu2xError`] for an unreadable archive, an unsafe entry, a filesystem failure, or
+/// `cancel` (checked per entry).
 #[cfg(not(target_arch = "wasm32"))]
 fn extract_waifu2x_package(
     archive_path: &Path,
+    root: &Path,
+    generation: &str,
+    cancel: &AtomicBool,
     progress_tx: &Sender<Waifu2xWorkerEvent>,
 ) -> Result<(), Waifu2xError> {
-    send_progress(progress_tx, "extract_waifu2x", 0, 1);
+    send_progress(progress_tx, "extract_waifu2x", 0, 0);
     let archive_file = File::open(archive_path).map_err(|err| Waifu2xError {
         user_message: t!("launcher.new_project.waifu2x.open_archive_error").to_string(),
         log_message: format!(
@@ -832,17 +932,25 @@ fn extract_waifu2x_package(
             archive_path.display()
         ),
     })?;
-    let total = archive.len();
-    let extract_root = config::data_dir().join("waifu2x");
-    fs::create_dir_all(&extract_root).map_err(|err| Waifu2xError {
+    let staging = root.join(".staging");
+    let folder_error = |path: &Path, err: io::Error| Waifu2xError {
         user_message: t!("launcher.new_project.waifu2x.prepare_folder_error").to_string(),
-        log_message: format!(
-            "failed to create waifu2x root '{}': {err}",
-            extract_root.display()
-        ),
-    })?;
+        log_message: format!("failed to prepare waifu2x folder '{}': {err}", path.display()),
+    };
+    if staging.exists() {
+        // Left by an interrupted extraction: never published, so never complete.
+        fs::remove_dir_all(&staging).map_err(|err| folder_error(&staging, err))?;
+    }
+    fs::create_dir_all(&staging).map_err(|err| folder_error(&staging, err))?;
 
+    let total = archive.len();
     for index in 0..total {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(Waifu2xError {
+                user_message: t!("launcher.new_project.waifu2x.stopped_on_close").to_string(),
+                log_message: "waifu2x extraction cancelled because the new project window closed".to_string(),
+            });
+        }
         let mut entry = archive.by_index(index).map_err(|err| Waifu2xError {
             user_message: t!("launcher.new_project.waifu2x.extract_archive_error").to_string(),
             log_message: format!(
@@ -860,7 +968,7 @@ fn extract_waifu2x_package(
                 ),
             });
         };
-        let output_path = extract_root.join(relative_path);
+        let output_path = staging.join(relative_path);
         if entry.is_dir() {
             fs::create_dir_all(&output_path).map_err(|err| Waifu2xError {
                 user_message: t!("launcher.new_project.waifu2x.create_dir_from_archive_error").to_string(),
@@ -879,13 +987,14 @@ fn extract_waifu2x_package(
                     ),
                 })?;
             }
-            let mut output = File::create(&output_path).map_err(|err| Waifu2xError {
+            let write_error = |err: io::Error| Waifu2xError {
                 user_message: t!("launcher.new_project.waifu2x.write_file_from_archive_error").to_string(),
                 log_message: format!(
-                    "failed to create waifu2x extracted file '{}': {err}",
+                    "failed to write waifu2x extracted file '{}': {err}",
                     output_path.display()
                 ),
-            })?;
+            };
+            let mut output = File::create(&output_path).map_err(write_error)?;
             io::copy(&mut entry, &mut output).map_err(|err| Waifu2xError {
                 user_message: t!("launcher.new_project.waifu2x.extract_file_error").to_string(),
                 log_message: format!(
@@ -894,6 +1003,8 @@ fn extract_waifu2x_package(
                     output_path.display()
                 ),
             })?;
+            // Durable before the publishing rename below.
+            output.sync_all().map_err(write_error)?;
         }
         send_progress(
             progress_tx,
@@ -902,69 +1013,121 @@ fn extract_waifu2x_package(
             total,
         );
     }
+    sync_tree(&staging).map_err(|err| folder_error(&staging, err))?;
+    publish_generation(&staging, root, generation, &|from, to| fs::rename(from, to))
+}
+
+/// The rename step of [`publish_generation`], injectable so tests can make it fail.
+#[cfg(not(target_arch = "wasm32"))]
+type RenameFn<'a> = &'a dyn Fn(&Path, &Path) -> io::Result<()>;
+
+/// Publishes the complete, fsynced `staging` tree as generation `generation` of `root` and
+/// makes it the active one, without ever touching the generation that is active now:
+///
+/// 1. a leftover `<root>/<generation>` (a switch that never reached step 3, or a broken
+///    tree of the same pin) is removed;
+/// 2. `staging` is renamed to `<root>/<generation>` (one directory rename) and `root` is
+///    fsynced;
+/// 3. the [`ACTIVE_MARKER`] is replaced atomically (temp + fsync + rename) to name it, and
+///    `root` is fsynced: this is the switch;
+/// 4. only then other generations and legacy unversioned package folders are removed
+///    (failures are logged; they only cost disk space).
+///
+/// A failure or crash before step 3 leaves the marker naming the previous generation, which
+/// stays usable; [`probe_package`] never reports a generation the marker does not name.
+///
+/// # Errors
+/// A [`Waifu2xError`] naming the step that failed (steps 1-3).
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_generation(staging: &Path, root: &Path, generation: &str, rename: RenameFn<'_>) -> Result<(), Waifu2xError> {
+    let publish_error = |path: &Path, err: io::Error| Waifu2xError {
+        user_message: t!("launcher.new_project.waifu2x.prepare_folder_error").to_string(),
+        log_message: format!("failed to publish the unpacked waifu2x generation at '{}': {err}", path.display()),
+    };
+    let target = root.join(generation);
+    // `symlink_metadata`: a link in place of the generation folder is removed, not followed.
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(&target).map_err(|err| publish_error(&target, err))?,
+        Ok(_) => fs::remove_file(&target).map_err(|err| publish_error(&target, err))?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(publish_error(&target, err)),
+    }
+    rename(staging, &target).map_err(|err| publish_error(&target, err))?;
+    sync_dir(root).map_err(|err| publish_error(root, err))?;
+
+    let marker = root.join(ACTIVE_MARKER);
+    let marker_tmp = root.join(format!("{ACTIVE_MARKER}.tmp"));
+    File::create(&marker_tmp)
+        .and_then(|mut file| {
+            file.write_all(format!("{generation}\n").as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| rename(&marker_tmp, &marker))
+        .and_then(|()| sync_dir(root))
+        .map_err(|err| publish_error(&marker, err))?;
+    ms_log::runtime_log::log_info(format!("[new-project] waifu2x generation '{generation}' is active in '{}'", root.display()));
+
+    remove_stale_generations(root, generation);
     Ok(())
 }
 
+/// Removes every generation folder other than `active` and the legacy unversioned package
+/// folders (`Lin`, `Win`, `Mac`) of `root`. Runs only after the switch; failures are logged.
 #[cfg(not(target_arch = "wasm32"))]
-fn waifu2x_download_error(url: &str, err: ureq::Error) -> Waifu2xError {
-    match err {
-        ureq::Error::Status(status, response) => Waifu2xError {
-            user_message: t!("launcher.new_project.waifu2x.download_error").to_string(),
-            log_message: format!(
-                "waifu2x download failed for '{url}' with HTTP {status}: {}",
-                response.status_text()
-            ),
-        },
-        ureq::Error::Transport(transport) => Waifu2xError {
-            user_message: t!("launcher.new_project.waifu2x.download_error_check_internet")
-                .to_string(),
-            log_message: format!("waifu2x download transport error for '{url}': {transport}"),
-        },
+fn remove_stale_generations(root: &Path, active: &str) {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!("[new-project] failed to list '{}' for waifu2x cleanup: {err}", root.display()));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                ms_log::runtime_log::log_warn(format!("[new-project] failed to read an entry of '{}' for waifu2x cleanup: {err}", root.display()));
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let stale = (name.starts_with("gen-") && name != active) || matches!(name, "Lin" | "Win" | "Mac");
+        if !stale || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        if let Err(err) = fs::remove_dir_all(entry.path()) {
+            ms_log::runtime_log::log_warn(format!(
+                "[new-project] failed to remove the stale waifu2x folder '{}': {err}",
+                entry.path().display()
+            ));
+        }
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
-fn waifu2x_archive_name() -> &'static str {
-    "Win.zip"
-}
-
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(target_os = "windows"),
-    not(target_os = "macos")
-))]
-fn waifu2x_archive_name() -> &'static str {
-    "Lin.zip"
-}
-
-#[cfg(all(not(target_arch = "wasm32"), target_os = "macos"))]
-fn waifu2x_archive_name() -> &'static str {
-    "Mac.zip"
-}
-
+/// fsyncs every directory of the tree under `dir` (children first), so the entries the
+/// extraction created are durable before the tree is published. No-op off unix.
 #[cfg(not(target_arch = "wasm32"))]
-fn waifu2x_package_url() -> &'static str {
-    #[cfg(target_os = "windows")]
-    {
-        concat!(
-            "https://github.com/Vasyanator/libwaifu2x-ncnn-vulkan/releases/download/1.0",
-            "/Win.zip"
-        )
+fn sync_tree(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_tree(&entry.path())?;
+        }
     }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        concat!(
-            "https://github.com/Vasyanator/libwaifu2x-ncnn-vulkan/releases/download/1.0",
-            "/Lin.zip"
-        )
+    sync_dir(dir)
+}
+
+/// fsyncs the directory `dir` (unix: makes renames and creations inside it durable).
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    // Windows cannot open a directory as a `File`; NTFS journals the rename itself.
+    if cfg!(unix) {
+        File::open(dir)?.sync_all()?;
     }
-    #[cfg(target_os = "macos")]
-    {
-        concat!(
-            "https://github.com/Vasyanator/libwaifu2x-ncnn-vulkan/releases/download/1.0",
-            "/Mac.zip"
-        )
-    }
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1288,4 +1451,236 @@ pub fn run_waifu2x_sync(
                 .collect()
         })
         .map_err(|err| err.log_message)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use ms_download::test_support::{ScriptedFetcher, Step};
+    use sha2::{Digest, Sha256};
+    use std::io::{Cursor, Write};
+    use std::time::Duration;
+    use zip::write::SimpleFileOptions;
+
+    /// Retry schedule without real waits.
+    fn instant_retry() -> RetryPolicy<'static> {
+        RetryPolicy {
+            max_retries: 5,
+            first_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            retry_after_cap: Duration::ZERO,
+            wait_slice: Duration::from_millis(1),
+            sleep: &|_| {},
+        }
+    }
+
+    /// A stored (uncompressed) zip holding `entries` (name, content).
+    fn zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, content) in entries {
+            writer.start_file(*name, options).expect("start zip entry");
+            writer.write_all(content).expect("write zip entry");
+        }
+        writer.finish().expect("finish zip").into_inner()
+    }
+
+    /// A package pinned to `body` (or to `sha256` when given).
+    fn package_for(body: &[u8], sha256: Option<&'static str>) -> Waifu2xPackage {
+        // The pin must be `'static` like the production table; leaking one short string per
+        // test is harmless.
+        let sha256 = sha256.unwrap_or_else(|| Box::leak(format!("{:x}", Sha256::digest(body)).into_boxed_str()));
+        Waifu2xPackage {
+            dir: "Lin",
+            library: "lib.so",
+            model_dir: "models-cunet",
+            archive: "Lin.zip",
+            url: "https://example.invalid/Lin.zip",
+            size: u64::try_from(body.len()).expect("test body fits u64"),
+            sha256,
+        }
+    }
+
+    #[test]
+    fn platform_package_follows_the_capability_table() {
+        let available = ms_platform::PlatformFeature::Waifu2xUpscaler.is_available();
+        assert_eq!(waifu2x_package().is_ok(), available);
+        assert_eq!(PLATFORM_PACKAGE.sha256.len(), 64);
+        assert!(PLATFORM_PACKAGE.sha256.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert!(PLATFORM_PACKAGE.url.starts_with("https://") && PLATFORM_PACKAGE.url.ends_with(PLATFORM_PACKAGE.archive));
+        if !available {
+            assert!(!probe_waifu2x_backend().is_available());
+        }
+    }
+
+    #[test]
+    fn download_resumes_after_a_drop_and_reports_the_retry() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let body: Vec<u8> = (0..50_000_u32).map(|i| u8::try_from(i % 251).expect("< 256")).collect();
+        let package = package_for(&body, None);
+        let fetcher = ScriptedFetcher::new(&body, &[Step::Drop(10_000)]);
+        let (tx, rx) = mpsc::channel();
+        let cancel = AtomicBool::new(false);
+        let archive = download_waifu2x_package(&fetcher, &instant_retry(), &cancel, &package, root.path(), &tx).expect("download");
+        assert_eq!(fs::read(&archive).expect("archive"), body);
+        assert!(!root.path().join(".download/Lin.zip.part").exists());
+        assert_eq!(fetcher.offsets(), vec![0, 10_000]);
+        let stages: Vec<&str> = rx.try_iter().filter_map(|event| match event {
+            Waifu2xWorkerEvent::Progress { stage, .. } => Some(stage),
+            Waifu2xWorkerEvent::Finished(_) => None,
+        }).collect();
+        assert!(stages.contains(&"download_waifu2x_retry"), "{stages:?}");
+
+        // A second run finds the verified archive and makes no request.
+        let idle = ScriptedFetcher::new(&body, &[]);
+        download_waifu2x_package(&idle, &instant_retry(), &cancel, &package, root.path(), &tx).expect("second run");
+        assert!(idle.offsets().is_empty());
+    }
+
+    #[test]
+    fn hash_mismatch_fails_and_drops_the_staged_bytes() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let body = vec![7_u8; 4096];
+        let package = package_for(&body, Some("0000000000000000000000000000000000000000000000000000000000000000"));
+        let fetcher = ScriptedFetcher::new(&body, &[]);
+        let (tx, _rx) = mpsc::channel();
+        let err = download_waifu2x_package(&fetcher, &instant_retry(), &AtomicBool::new(false), &package, root.path(), &tx).expect_err("mismatch");
+        assert!(err.log_message.contains("sha256 mismatch"), "{}", err.log_message);
+        assert!(!root.path().join(".download/Lin.zip").exists());
+        assert!(!root.path().join(".download/Lin.zip.part").exists());
+    }
+
+    #[test]
+    fn cancel_stops_the_download_and_keeps_the_part() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let body = vec![3_u8; 8192];
+        let package = package_for(&body, None);
+        // The first attempt drops after 1000 bytes; the cancel set meanwhile ends the backoff.
+        let cancel = AtomicBool::new(false);
+        let sleep_cancel = |_: Duration| cancel.store(true, Ordering::SeqCst);
+        let retry = RetryPolicy { sleep: &sleep_cancel, first_delay: Duration::from_millis(5), max_delay: Duration::from_millis(5), ..instant_retry() };
+        let fetcher = ScriptedFetcher::new(&body, &[Step::Drop(1000)]);
+        let (tx, _rx) = mpsc::channel();
+        let err = download_waifu2x_package(&fetcher, &retry, &cancel, &package, root.path(), &tx).expect_err("cancelled");
+        assert!(err.log_message.contains("cancelled"), "{}", err.log_message);
+        assert_eq!(fs::metadata(root.path().join(".download/Lin.zip.part")).expect("part kept").len(), 1000);
+    }
+
+    const OLD_SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const NEW_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// A package archive with the library and one model file.
+    fn package_zip(root: &Path) -> PathBuf {
+        let archive = root.join(".download").join("pkg.zip");
+        fs::create_dir_all(archive.parent().expect("has parent")).expect("download dir");
+        fs::write(&archive, zip_bytes(&[("Lin/lib.so", b"library"), ("Lin/models-cunet/model.bin", b"weights")])).expect("write zip");
+        archive
+    }
+
+    /// Installs `package` as the active generation by hand (the state after a good install).
+    fn install_by_hand(root: &Path, package: &Waifu2xPackage) {
+        let generation = root.join(generation_name(package));
+        fs::create_dir_all(generation.join("Lin/models-cunet")).expect("generation dirs");
+        fs::write(generation.join("Lin/lib.so"), b"old library").expect("library");
+        fs::write(root.join(ACTIVE_MARKER), format!("{}\n", generation_name(package))).expect("marker");
+    }
+
+    #[test]
+    fn extraction_publishes_a_new_generation_and_switches_the_marker() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let old = package_for(b"x", Some(OLD_SHA));
+        let new = package_for(b"x", Some(NEW_SHA));
+        install_by_hand(root.path(), &old);
+        // Leftovers: an interrupted extraction and a legacy unversioned install.
+        fs::create_dir_all(root.path().join(".staging/Lin")).expect("stale staging");
+        fs::write(root.path().join(".staging/Lin/junk"), b"junk").expect("stale staging file");
+        fs::create_dir_all(root.path().join("Lin")).expect("legacy tree");
+        let archive = package_zip(root.path());
+        let (tx, _rx) = mpsc::channel();
+        extract_waifu2x_package(&archive, root.path(), &generation_name(&new), &AtomicBool::new(false), &tx).expect("extract");
+
+        let generation = root.path().join(generation_name(&new));
+        assert_eq!(fs::read(generation.join("Lin/lib.so")).expect("library"), b"library");
+        assert_eq!(fs::read(generation.join("Lin/models-cunet/model.bin")).expect("model"), b"weights");
+        assert!(!generation.join("Lin/junk").exists());
+        assert!(probe_package(root.path(), &new).is_available());
+        assert!(!probe_package(root.path(), &old).is_available());
+        assert!(!root.path().join(generation_name(&old)).exists());
+        assert!(!root.path().join("Lin").exists());
+        assert!(!root.path().join(".staging").exists());
+        assert!(!root.path().join("active.tmp").exists());
+    }
+
+    #[test]
+    fn a_failed_rename_keeps_the_old_generation_usable_and_the_next_run_repairs() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let old = package_for(b"x", Some(OLD_SHA));
+        let new = package_for(b"x", Some(NEW_SHA));
+        install_by_hand(root.path(), &old);
+        let (tx, _rx) = mpsc::channel();
+        let unpack = |root: &Path| {
+            let archive = package_zip(root);
+            let staging = root.join(".staging");
+            fs::create_dir_all(&staging).expect("staging");
+            let mut zip = ZipArchive::new(File::open(&archive).expect("open zip")).expect("read zip");
+            zip.extract(&staging).expect("extract to staging");
+            staging
+        };
+
+        // Step 2 (tree rename) fails: nothing new is visible.
+        let staging = unpack(root.path());
+        let fail_all = |_: &Path, _: &Path| Err(io::Error::other("injected rename failure"));
+        assert!(publish_generation(&staging, root.path(), &generation_name(&new), &fail_all).is_err());
+        assert!(probe_package(root.path(), &old).is_available());
+        assert!(!probe_package(root.path(), &new).is_available());
+
+        // Step 3 (marker switch) fails: the new tree exists but is not active.
+        let fail_marker = |from: &Path, to: &Path| {
+            if to.ends_with(ACTIVE_MARKER) { Err(io::Error::other("injected marker failure")) } else { fs::rename(from, to) }
+        };
+        assert!(publish_generation(&staging, root.path(), &generation_name(&new), &fail_marker).is_err());
+        assert!(root.path().join(generation_name(&new)).join("Lin/lib.so").is_file());
+        assert!(probe_package(root.path(), &old).is_available());
+        assert!(!probe_package(root.path(), &new).is_available());
+
+        // The next run repairs the interrupted switch.
+        let archive = package_zip(root.path());
+        extract_waifu2x_package(&archive, root.path(), &generation_name(&new), &AtomicBool::new(false), &tx).expect("repair");
+        assert!(probe_package(root.path(), &new).is_available());
+        assert!(!root.path().join(generation_name(&old)).exists());
+    }
+
+    #[test]
+    fn an_unmarked_tree_is_never_available() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let package = package_for(b"x", Some(NEW_SHA));
+        install_by_hand(root.path(), &package);
+        fs::remove_file(root.path().join(ACTIVE_MARKER)).expect("drop marker");
+        assert!(!probe_package(root.path(), &package).is_available());
+        fs::write(root.path().join(ACTIVE_MARKER), "gen-somethingelse\n").expect("foreign marker");
+        assert!(!probe_package(root.path(), &package).is_available());
+    }
+
+    #[test]
+    fn extraction_rejects_unsafe_entries_and_publishes_nothing() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let archive = root.path().join("pkg.zip");
+        fs::write(&archive, zip_bytes(&[("Lin/lib.so", b"library"), ("../evil", b"x")])).expect("write zip");
+        let (tx, _rx) = mpsc::channel();
+        let err = extract_waifu2x_package(&archive, root.path(), "gen-test", &AtomicBool::new(false), &tx).expect_err("unsafe entry");
+        assert!(err.log_message.contains("unsafe waifu2x zip entry"), "{}", err.log_message);
+        assert!(!root.path().join("gen-test").exists());
+        assert!(!root.path().join(ACTIVE_MARKER).exists());
+    }
+
+    #[test]
+    fn extraction_honours_cancel() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let archive = root.path().join("pkg.zip");
+        fs::write(&archive, zip_bytes(&[("Lin/lib.so", b"library")])).expect("write zip");
+        let (tx, _rx) = mpsc::channel();
+        let err = extract_waifu2x_package(&archive, root.path(), "gen-test", &AtomicBool::new(true), &tx).expect_err("cancelled");
+        assert!(err.log_message.contains("cancelled"), "{}", err.log_message);
+        assert!(!root.path().join("gen-test").exists());
+    }
 }

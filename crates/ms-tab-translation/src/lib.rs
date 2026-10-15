@@ -16,8 +16,11 @@ Submodules:
 - `machine_translators`: concrete MT backends (Google/Yandex/DeepL) used by worker.
 - `machine_translation`: MT controller/worker and backend dispatch integration.
 - `ocr`: OCR controller/worker and backend transport.
-- `ocr_model_download`: status/download controller of the external OCR models (Baberu OCR,
-  PaddleOCR-VL variants) the OCR panel downloads explicitly.
+- `ocr_model_download`: status/download controller of the app-managed external model bundles
+  (Baberu OCR, PaddleOCR-VL variants, EasyOCR scripts, Surya checkpoints; the Cleaning tab's
+  SDXL configs) that panels download explicitly.
+- `model_download_status`: the one owner of how an app-managed model download is shown
+  (latest event, text, progress bar); `pub` because the Cleaning tools draw it too.
 - `ocr_case_fix`: pure post-OCR "ALL CAPS" -> sentence-case normalization.
 - `text_detector`: text detector controller/worker (classic + Paddle/CTD/Surya backend modes).
 - `panels`: UI subpanels for Translation tab.
@@ -48,9 +51,15 @@ mod ai_mt_response;
 // through `translate_texts_via_translator`.
 pub mod machine_translation;
 mod machine_translators;
+// `pub` rather than crate-private: the `cleaning` tab's mask generation, region-inpaint editor
+// and LaMa / SDXL engines show their model downloads through it.
+pub mod model_download_status;
 mod ocr;
 mod ocr_case_fix;
-mod ocr_model_download;
+// `pub` rather than crate-private: the `cleaning` tab's SDXL engine downloads its pinned
+// config specs through the same controller and draws the same block
+// (`panels::ocr_model_download`).
+pub mod ocr_model_download;
 pub mod panels;
 mod tab;
 // `pub` rather than crate-private: the `cleaning` tab's mask-generation and

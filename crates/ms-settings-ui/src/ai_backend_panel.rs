@@ -235,6 +235,12 @@ pub struct OrtDownloadStatus {
     pub done: bool,
     /// Error text when the last download failed.
     pub error: Option<String>,
+    /// Whether the user cancelled the last download (its `.part` is kept; the panel
+    /// offers to resume instead of auto-restarting it).
+    pub cancelled: bool,
+    /// Cancel flag of the running download, polled by `resolve_or_download_ort_dylib`;
+    /// replaced by a fresh flag at every start.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One selectable ONNX execution provider in the UNIFIED list (local-native ∪
@@ -1847,8 +1853,9 @@ fn reconcile_native_ep(
 }
 
 /// Ensures a background presence probe for build `slug` runs once (idempotent): a cache
-/// miss marks the slot in-flight (`None`) and spawns a worker that scans the build's cache
-/// directory and records `Some(present)`. The blocking scan never runs on the GUI thread.
+/// miss marks the slot in-flight (`None`) and spawns a worker that asks
+/// `ms_onnx_runtime::ort_build_installed` and records `Some(present)`. The blocking check
+/// never runs on the GUI thread.
 #[cfg(not(target_arch = "wasm32"))]
 fn ensure_build_presence_probe(state: &AiBackendPanelState, slug: &str) {
     {
@@ -1866,7 +1873,9 @@ fn ensure_build_presence_probe(state: &AiBackendPanelState, slug: &str) {
     if let Err(err) = std::thread::Builder::new()
         .name("ort-build-presence".to_string())
         .spawn(move || {
-            let present = build_dylib_present_on_disk(&owned);
+            // The resolver's own "installed" rule (marker + member sizes), so the panel
+            // never disagrees with what `resolve_or_download_ort_dylib` would do.
+            let present = ms_onnx_runtime::ort_build_installed(&owned);
             if let Ok(mut map) = slot.lock() {
                 map.insert(owned, Some(present));
             }
@@ -1880,35 +1889,6 @@ fn ensure_build_presence_probe(state: &AiBackendPanelState, slug: &str) {
             map.remove(slug);
         }
     }
-}
-
-/// Whether build `slug`'s onnxruntime dylib is already extracted in its cache directory.
-///
-/// Scans `ort_dylib_dir(slug, version)` for at least one dynamic-library file
-/// (`*.so` / `*.so.*` / `*.dll` / `*.dylib`). A heuristic presence check (not a full
-/// member-completeness check) used only to choose the button state and gate the
-/// auto-download; the authoritative resolve still runs in `resolve_or_download_ort_dylib`.
-/// Blocking disk I/O — worker-thread only.
-#[cfg(not(target_arch = "wasm32"))]
-fn build_dylib_present_on_disk(slug: &str) -> bool {
-    let Some(build) = ms_onnx_runtime::builds::build_by_slug(slug) else {
-        return false;
-    };
-    if build.execution_providers.is_empty() {
-        return false; // informational build — no binary is ever fetched.
-    }
-    let dir = ms_onnx_runtime::ort_dylib_dir(slug, build.onnx_version);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        let name = entry.file_name();
-        let lower = name.to_string_lossy().to_ascii_lowercase();
-        lower.ends_with(".dll")
-            || lower.ends_with(".dylib")
-            || lower.ends_with(".so")
-            || lower.contains(".so.")
-    })
 }
 
 /// The cached presence answer for build `slug`: `Some(true/false)` once probed, `None`
@@ -2105,20 +2085,26 @@ fn start_onnx_config_read(state: &mut AiBackendPanelState) {
     }
 }
 
-/// Russian label for an onnxruntime download stage.
+/// Localized label for an onnxruntime download stage (a retry names the remaining wait
+/// and the attempt).
 #[cfg(not(target_arch = "wasm32"))]
-fn ort_stage_label_ru(stage: OrtDownloadStage) -> &'static str {
+fn ort_stage_label(stage: OrtDownloadStage) -> String {
     match stage {
-        OrtDownloadStage::Probing => t!("ai_backend.ort_stage_probe"),
-        OrtDownloadStage::Downloading => t!("ai_backend.ort_stage_download"),
-        OrtDownloadStage::Verifying => t!("ai_backend.ort_stage_verify"),
-        OrtDownloadStage::Extracting => t!("ai_backend.ort_stage_extract"),
-        OrtDownloadStage::Done => t!("ai_backend.ort_stage_done"),
+        OrtDownloadStage::Probing => t!("ai_backend.ort_stage_probe").to_owned(),
+        OrtDownloadStage::WaitingForOtherDownload => t!("ai_backend.ort_stage_waiting").to_owned(),
+        OrtDownloadStage::Downloading => t!("ai_backend.ort_stage_download").to_owned(),
+        OrtDownloadStage::Retrying { attempt, max_attempts, delay_secs } => {
+            tf!("ai_backend.ort_stage_retrying", seconds = delay_secs, attempt = attempt, max = max_attempts)
+        }
+        OrtDownloadStage::Verifying => t!("ai_backend.ort_stage_verify").to_owned(),
+        OrtDownloadStage::Extracting => t!("ai_backend.ort_stage_extract").to_owned(),
+        OrtDownloadStage::Done => t!("ai_backend.ort_stage_done").to_owned(),
     }
 }
 
 /// Starts a background onnxruntime dylib download for BUILD `build`, unless one is
-/// already running or this exact build has already finished/errored.
+/// already running or this exact build has already finished, errored or been cancelled
+/// (the resume button clears `cancelled` first).
 ///
 /// Never dlopens/loads here — it only fetches the library (or returns immediately when
 /// the build is already cached) so the native OCR load (via `native_runtime`, still under
@@ -2138,7 +2124,7 @@ fn maybe_start_ort_download(state: &AiBackendPanelState, build: &str) {
             return;
         }
         if status.build_slug.as_deref() == Some(build.as_str())
-            && (status.done || status.error.is_some())
+            && (status.done || status.error.is_some() || status.cancelled)
         {
             return;
         }
@@ -2146,11 +2132,17 @@ fn maybe_start_ort_download(state: &AiBackendPanelState, build: &str) {
         status.progress = None;
         status.done = false;
         status.error = None;
+        status.cancelled = false;
         status.running = true;
+        status.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     }
 
     let slot = state.ort_download.clone();
     let present = state.ort_build_present.clone();
+    let cancel = match state.ort_download.lock() {
+        Ok(status) => status.cancel.clone(),
+        Err(poisoned) => poisoned.into_inner().cancel.clone(),
+    };
     if let Err(err) = std::thread::Builder::new()
         .name("ort-download".to_string())
         .spawn(move || {
@@ -2159,7 +2151,7 @@ fn maybe_start_ort_download(state: &AiBackendPanelState, build: &str) {
                     status.progress = Some(progress);
                 }
             };
-            let result = ms_onnx_runtime::resolve_or_download_ort_dylib(&build, &mut report);
+            let result = ms_onnx_runtime::resolve_or_download_ort_dylib(&build, &cancel, &mut report);
             let mut status = match slot.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -2177,6 +2169,12 @@ fn maybe_start_ort_download(state: &AiBackendPanelState, build: &str) {
                     if let Ok(mut map) = present.lock() {
                         map.insert(build.clone(), Some(true));
                     }
+                }
+                Err(ms_onnx_runtime::OrtRuntimeError::Cancelled) => {
+                    status.cancelled = true;
+                    ms_log::runtime_log::log_info(format!(
+                        "[ai-backend-panel] onnxruntime download cancelled for build '{build}'; staged bytes kept for resume"
+                    ));
                 }
                 Err(err) => {
                     // `status.error` is user-facing, so it uses the localized Display;
@@ -2200,17 +2198,37 @@ fn maybe_start_ort_download(state: &AiBackendPanelState, build: &str) {
     }
 }
 
-/// Renders the onnxruntime auto-download progress/result (a determinate
-/// `ProgressBar` when the total size is known, otherwise a spinner + stage text).
+/// Renders the onnxruntime auto-download progress/result: a determinate `ProgressBar`
+/// when the total size is known, otherwise a spinner + stage text (a retry shows its
+/// countdown and attempt), with a Cancel button while the worker runs. A cancelled
+/// download shows a Resume button that restarts it (the worker resumes the kept `.part`).
 #[cfg(not(target_arch = "wasm32"))]
 fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
-    let (progress, running, done, error) = match state.ort_download.lock() {
-        Ok(status) => (status.progress, status.running, status.done, status.error.clone()),
+    let (progress, running, done, error, cancelled, cancel, build_slug) = match state.ort_download.lock() {
+        Ok(status) => (status.progress, status.running, status.done, status.error.clone(), status.cancelled, status.cancel.clone(), status.build_slug.clone()),
         Err(poisoned) => {
             let status = poisoned.into_inner();
-            (status.progress, status.running, status.done, status.error.clone())
+            (status.progress, status.running, status.done, status.error.clone(), status.cancelled, status.cancel.clone(), status.build_slug.clone())
         }
     };
+
+    if cancelled && !running {
+        ui.horizontal(|ui| {
+            ui.colored_label(ms_theme::status::WARNING, t!("ai_backend.ort_cancelled"));
+            if ui.button(t!("ai_backend.ort_resume_button")).clicked()
+                && let Some(build) = build_slug
+            {
+                // Clear the latch that keeps the auto-download from restarting a build
+                // the user cancelled, then start it again (the `.part` resumes).
+                match state.ort_download.lock() {
+                    Ok(mut status) => status.cancelled = false,
+                    Err(poisoned) => poisoned.into_inner().cancelled = false,
+                }
+                maybe_start_ort_download(state, &build);
+            }
+        });
+        return;
+    }
 
     if let Some(error) = error {
         ui.colored_label(
@@ -2236,9 +2254,10 @@ fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
     if running || progress.is_some() {
         match progress {
             Some(progress) => {
-                let stage = ort_stage_label_ru(progress.stage);
+                let stage = ort_stage_label(progress.stage);
+                let retrying = matches!(progress.stage, OrtDownloadStage::Retrying { .. });
                 match progress.total {
-                    Some(total) if total > 0 => {
+                    Some(total) if total > 0 && !retrying => {
                         // Display-only ratio; the f64/f32 casts cannot meaningfully
                         // lose precision for a 0..=1 progress fraction.
                         let fraction =
@@ -2259,6 +2278,14 @@ fn draw_ort_download_progress(ui: &mut egui::Ui, state: &AiBackendPanelState) {
                     ui.spinner();
                     ui.label(t!("ai_backend.ort_preparing"));
                 });
+            }
+        }
+        // The worker polls the flag during the busy wait, the transfer, the retry wait and
+        // the hash pass; it then reports `Cancelled` and clears `running`.
+        if running {
+            let requested = cancel.load(std::sync::atomic::Ordering::Relaxed);
+            if ui.add_enabled(!requested, egui::Button::new(t!("ai_backend.ort_cancel_button"))).clicked() {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }

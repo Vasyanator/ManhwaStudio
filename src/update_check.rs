@@ -13,7 +13,7 @@ Key functions:
 Notes:
 The release comparison is `ms_config::version_format::is_remote_newer` and the release feed
 (URL, archive asset name) is `ms_installer::update`'s; this file owns neither.
-Native only (`ureq`, OS threads). The shell (`src/shell/`) starts it on the first launcher entry
+Native only (`ms_download::fetch_small`, OS threads). The shell (`src/shell/`) starts it on the first launcher entry
 and caches the answer for every later entry. The comparison runs on `CARGO_PKG_VERSION`, never
 on the git-derived display version (see the version split in `src/MODULE_README.md`).
 */
@@ -22,9 +22,15 @@ use crate::launcher::state::UpdateNotification;
 use crate::runtime_log;
 use crate::version_format::is_remote_newer;
 use ms_installer::update::{APP_RELEASES_API, APP_ZIP_ASSET_NAME};
+use ms_download::resumable::{FetcherConfig, RetryPolicy, UreqFetcher};
+use ms_download::{SmallRequest, fetch_small};
 use ms_thread as thread;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use web_time::Duration;
+
+/// Largest accepted release-list answer (one page of releases is well under 1 MiB).
+const RELEASES_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Starts the update check on a named worker and returns its one-shot receiver.
 ///
@@ -72,26 +78,30 @@ pub(crate) fn spawn(force_update_available: bool) -> mpsc::Receiver<Option<Updat
 }
 
 /// The tag of the newest release that carries [`APP_ZIP_ASSET_NAME`]. Blocking network I/O
-/// (connect timeout 10 s, read timeout 30 s); worker only. `GITHUB_TOKEN`, when set, is sent as
-/// a bearer token (rate limits), never logged.
+/// through `ms_download::fetch_small` (connect timeout 10 s, read timeout 30 s, at most 2
+/// retries of a transient failure with backoff, `Range` resume); worker only, never
+/// cancelled (the result is dropped when the window is gone). `GITHUB_TOKEN`, when set, is
+/// sent as a bearer token (rate limits), never logged.
 ///
 /// # Errors
 /// A localized message for a failed request, an unreadable or malformed response, or no
 /// release with the asset.
 fn fetch_latest_release_tag() -> Result<String, String> {
-    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10)).timeout_read(Duration::from_secs(30)).build();
-
-    let mut req = agent.get(APP_RELEASES_API).set("Accept", "application/vnd.github+json").set("User-Agent", "UpdateScript/1.0");
-
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        let token = token.trim();
-        if !token.is_empty() {
-            req = req.set("Authorization", &format!("Bearer {token}"));
-        }
-    }
-
-    let resp = req.call().map_err(|e| tf!("startup.update_check.request_error", e = e))?;
-    let body = resp.into_string().map_err(|e| tf!("startup.update_check.response_read_error", e = e))?;
+    let bearer = std::env::var("GITHUB_TOKEN").ok().map(|token| token.trim().to_string()).filter(|token| !token.is_empty());
+    let fetcher = UreqFetcher::with_config(FetcherConfig {
+        user_agent: Some("UpdateScript/1.0".to_string()),
+        bearer,
+        headers: vec![("Accept".to_string(), "application/vnd.github+json".to_string())],
+        connect_timeout: Duration::from_secs(10),
+        read_timeout: Duration::from_secs(30),
+    });
+    // A startup notice is not worth minutes of retries: two, then give up until next start.
+    let retry = RetryPolicy { max_retries: 2, ..RetryPolicy::standard() };
+    let never_cancelled = AtomicBool::new(false);
+    let request = SmallRequest { url: APP_RELEASES_API, max_bytes: RELEASES_MAX_BYTES };
+    let body = fetch_small(&fetcher, &retry, &never_cancelled, &request, "[startup-version-check]", "release list")
+        .map_err(|e| tf!("startup.update_check.request_error", e = e))?;
+    let body = String::from_utf8(body).map_err(|e| tf!("startup.update_check.response_read_error", e = e))?;
 
     let releases: serde_json::Value = serde_json::from_str(&body).map_err(|e| tf!("startup.update_check.json_error", e = e))?;
     let releases = releases.as_array().ok_or_else(|| t!("startup.update_check.unexpected_format").to_string())?;

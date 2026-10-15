@@ -44,8 +44,10 @@ Submodules (each re-exported into this root with `use <name>::*;`):
   and the save gate.
 - `progress.rs`: the progress state shared between the worker and the panel, and the
   progress bar plus live latent preview drawn from it.
-- `wire.rs`: the streaming run call, the unload call, the request header of each mode and
-  the PNG/L8 blob encoding.
+- `source.rs`: what the weights field may name (a local file, a local diffusers folder,
+  the one curated repository id) and which pinned download a run of it needs.
+- `wire.rs`: the streaming run call, the unload call, the request header of each mode (with
+  the resolved download directories) and the PNG/L8 blob encoding.
 - `engine.rs`: `SdxlEngine`, its `AiEngine` contract and its parameter panel.
 
 Key items:
@@ -66,6 +68,11 @@ Notes:
   run's detached worker can no longer drive the bar of whatever runs next.
 - A run cannot be stopped backend-side: `cancel` detaches the answer and the backend finishes
   the pass.
+- The backend never downloads (protocol v12). A single-file checkpoint loads against the mode's
+  pinned diffusers config spec, the curated repository id from its pinned fp16 download; both
+  are downloaded EXPLICITLY through the engine's download block (`source.rs` decides which one
+  a field needs, the run gate refuses until it is installed). Any other repository id is
+  refused here, never sent.
 */
 use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MaskLayerSpec};
 use super::lama::{
@@ -90,9 +97,26 @@ use ms_thread as thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use web_time::Duration;
+// The run in flight (worker + channel + cancel flag set on drop), shared with `lama`.
+use super::run_job::EngineRunJob;
+use ms_tab_translation::model_download_status::draw_model_download_status;
+use ms_sysprobe::ai_models::EnsureCtx;
+// The pinned SDXL downloads (configs per mode, the curated model) and their stat-only probes.
+use ms_sysprobe::ai_models::external::{ExternalModelSpec, ExternalSource, external_model_status, installed_dir};
+use ms_sysprobe::ai_models::external_catalog::{SDXL_CONFIG_BASE, SDXL_CONFIG_INPAINT, SDXL_INPAINT_FP16};
+// The explicit-download controller and its panel block, shared with the Translation tab.
+use ms_tab_translation::ocr_model_download::{
+    OcrModelDownloadController, OcrModelDownloadState, OcrModelPanelSnapshot, bundle_key, download_label_for_statuses,
+    offered_download_label,
+};
+use ms_tab_translation::panels::ocr_model_download::{
+    ModelDownloadAction, draw_ocr_model_download, external_model_display_name, load_blocked_reason,
+};
+use ms_widgets::EditableComboBox;
 
 // The channel modes, the persisted parameter sets and their file IO.
 mod settings;
@@ -100,6 +124,9 @@ use settings::*;
 // The shared progress state and the bar plus latent preview drawn from it.
 mod progress;
 use progress::*;
+// What the weights field may name and which pinned download a run of it needs.
+mod source;
+use source::*;
 // The streaming run call, the unload call and the blob encoding they carry.
 mod wire;
 use wire::*;

@@ -54,7 +54,9 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
 - `stitching.rs`: vertical stitch/split heuristics, heterogeneous-bottom adjacent-page merge,
   cut-like-reference, manual cut apply, progress events, and synchronous helpers reused by batch
   execution.
-- `waifu2x.rs`: platform runtime discovery/download/extraction, dynamic shared-library loading,
+- `waifu2x.rs`: platform runtime discovery/download/extraction (pinned package per OS,
+  `ms_download::fetch_verified`, unpack via `.staging/` into a per-pin generation folder
+  `gen-<sha>/` switched by an atomic `active` marker), dynamic shared-library loading,
   cached model/context lifetime, cancellation, worker processing, and synchronous helpers reused by
   batch execution.
 - `reline.rs`: worker bridge to the already running Python AI backend `/reline/process` and
@@ -109,7 +111,16 @@ runs inside the app-global AI backend and is driven over framed IPC (`backend_ip
   first calls `prepare_simple_deep_capture` to force Cloak + `DeepCapture` since it has no
   backend/mode selectors.
 - Waifu2x must keep the application usable when the shared library is absent; the worker either
-  downloads/extracts the real runtime or returns a clear error.
+  downloads/extracts the real runtime or returns a clear error. Whether a platform has waifu2x at all
+  is `ms_platform::PlatformFeature::Waifu2xUpscaler` (Linux and Windows; macOS has no release
+  package): elsewhere the probe reports the localized "not on this platform" text, the run button is
+  disabled and nothing is downloaded. The package download follows the network rule through
+  `fetch_verified` (size + sha256 pins, retry shown as the `download_waifu2x_retry` progress stage,
+  `.part` resumed across runs, cancelled by the window close via `shutdown`). Install never touches
+  the active generation: the new tree is renamed into its own `gen-<sha>/` folder, the `active`
+  marker is replaced atomically, and only then old generations / legacy `Lin`/`Win` folders are
+  removed; the probe reports available only for the generation the marker names (a legacy
+  unmarked install is reinstalled once).
 - Reline processing depends on an externally running AI backend reached through `crate::backend_ipc`
   (HTTP/1.1 over the AF_UNIX socket); `reline.rs` uses `get_request`/`post_json` and no longer uses
   `ureq`. The launcher must not start that backend from `new_project`; it should report connectivity

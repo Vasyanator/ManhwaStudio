@@ -65,13 +65,8 @@ Image rendering notes:
 use eframe::egui;
 use egui::{ColorImage, TextureOptions};
 use std::collections::HashMap;
-// `Read` and `Duration` are only used by the native remote-image loader below.
-#[cfg(not(target_arch = "wasm32"))]
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-#[cfg(not(target_arch = "wasm32"))]
-use web_time::Duration;
 
 #[derive(Debug, Clone)]
 struct WikiFileEntry {
@@ -1327,21 +1322,27 @@ fn load_local_image_rgba(path: &Path) -> Result<(usize, usize, Vec<u8>), String>
     Ok((w as usize, h as usize, image.into_raw()))
 }
 
+/// Largest accepted remote wiki image; the cap only stops a wrong URL from filling memory.
+#[cfg(not(target_arch = "wasm32"))]
+const REMOTE_IMAGE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Fetches a remote image over HTTP and decodes it to RGBA.
 ///
-/// Native builds use `ureq`. On wasm there is no synchronous HTTP client here, so
-/// remote image loading is unavailable and this returns an error instead of a
-/// blank image.
+/// Native builds use `ms_download::fetch_small`: transient failures are retried with
+/// capped backoff and `Range` resume, 15 s connect / 60 s read timeouts, a
+/// [`REMOTE_IMAGE_MAX_BYTES`] cap. There is no cancel: the per-image worker is detached
+/// and its result is simply dropped when the tab no longer waits for it. On wasm there is
+/// no synchronous HTTP client here, so remote image loading is unavailable and this
+/// returns an error instead of a blank image.
 #[cfg(not(target_arch = "wasm32"))]
 fn load_remote_image_rgba(url: &str) -> Result<(usize, usize, Vec<u8>), String> {
-    let response = ureq::get(url)
-        .timeout(Duration::from_secs(20))
-        .call()
-        .map_err(|e: ureq::Error| e.to_string())?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut bytes)
+    use ms_download::resumable::{RetryPolicy, UreqFetcher};
+    use std::sync::atomic::AtomicBool;
+
+    // Never set: see the doc comment (no cancel for a detached image worker).
+    let never_cancelled = AtomicBool::new(false);
+    let request = ms_download::SmallRequest { url, max_bytes: REMOTE_IMAGE_MAX_BYTES };
+    let bytes = ms_download::fetch_small(&UreqFetcher::new(None), &RetryPolicy::standard(), &never_cancelled, &request, "[wiki]", url)
         .map_err(|e| e.to_string())?;
     let image = image::load_from_memory(&bytes)
         .map_err(|e: image::ImageError| e.to_string())?

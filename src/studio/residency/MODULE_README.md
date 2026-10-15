@@ -52,6 +52,11 @@ from `CleanOverlaysModel` (Settings and every canvas write it there), never from
   before the layer flush), or parked workers leak.
 - `Finished` is sent by each pool only after every worker returned; a worker panic is logged by
   the joiner and does not suppress `Finished`.
+- Threads start through `ms_thread::Builder` (`run_decode_pool`): a refused decode worker is
+  logged and the pool runs with the workers it has, or one inline on the pool thread when none
+  started. A refused pool thread is an `Err` to `PageResidency`: the main pool's marks every page
+  `Failed` with one load error (`fail_unstarted_loader`; no page stays `Loading`), the page-cache
+  pool's gives the optional cache up for the session.
 - `page_infos` survive GPU eviction (layout stays stable); eviction drops GPU handles only, and
   every dropped texture is reconstructable from the kept tile bytes.
 - The per-frame call order is decided by `StudioApp::ui`: `poll_decoded`, then the page manager's

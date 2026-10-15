@@ -10,19 +10,23 @@ Streaming: like ``inpaint.sdxl`` the handler pushes ``progress{id}`` frames via
 the dispatcher's ``ProgressEmitter`` (``HandlerContext.progress_emitter``). Flux
 Fill reports TWO phases, distinguished by a ``phase`` header field:
     - ``phase:"download"`` — ``step``/``total`` are BYTES downloaded / total, with
-      a human ``label`` (which file).
+      a human ``label`` (which file, or the retry notice while the download waits
+      out a transient network failure — no extra field, so no protocol change).
     - ``phase:"generate"`` — ``step``/``total`` are diffusion steps.
 No preview blob is sent (the GGUF transformer has no cheap latent preview here).
 
 Blob convention (same as the other inpaint methods):
     request blob = image_png ++ mask_png   (split via image_len / mask_len)
 The result PNG goes in the response blob (raw bytes).
+
+Cancellation: ``cancel_event.is_set`` is passed to the service as
+``should_cancel`` and observed inside the weight download.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
-import traceback
 from typing import Any
 
 from ..protocol import (
@@ -31,6 +35,8 @@ from ..protocol import (
     METHOD_INPAINT_FLUX_FILL_UNLOAD,
 )
 from ..registry import HandlerContext, Interrupted, register
+
+log = logging.getLogger(__name__)
 
 _PROGRESS_EMITTER_ATTR = "progress_emitter"
 
@@ -91,18 +97,24 @@ def _handle_inpaint_flux_fill(
             pass
 
     try:
+        # `cancel_event.is_set` reaches the weight download, which polls it per
+        # chunk and per backoff slice: a cancel that only stopped the frames
+        # while the socket kept pulling gigabytes would be a lie. The service
+        # then raises `DownloadCancelled`, mapped to `Interrupted` below because
+        # the event is set.
         result = ctx.state.flux_fill_inpaint.inpaint_image_bytes(
             image_png,
             mask_png,
             params=params_raw,
             progress_callback=on_progress,
+            should_cancel=cancel_event.is_set,
         )
     except (ValueError, FileNotFoundError):
         raise
     except Exception:  # noqa: BLE001
         if cancel_event.is_set():
             raise Interrupted("inpaint.flux_fill canceled.") from None
-        traceback.print_exc()
+        log.exception("inpaint.flux_fill failed (quant=%r)", params_raw.get("quant"))
         raise
 
     if cancel_event.is_set():

@@ -199,9 +199,6 @@ struct FlattenGate {
     masks_ready: bool,
     /// A project save is pending or in flight.
     save_busy: bool,
-    /// The tab's layer projection of the flattened page reflects the shared document's current
-    /// version (a PS-tab edit re-projected; `page_projection_current`).
-    doc_synced: bool,
 }
 
 /// The flatten-to-file dispatch decision: the project export's gate (`export_dispatch_ready`: preload
@@ -210,8 +207,13 @@ struct FlattenGate {
 /// exclusion with a running/deferred export and with another flatten, a settled chapter load and
 /// resident layer inputs (so building the job never falls back to a synchronous page load on the GUI
 /// thread).
-fn flatten_dispatch_ready(gate: FlattenGate) -> bool {
-    !gate.flatten_running && !gate.export_busy && gate.chapter_settled && gate.layers_ready && export_dispatch_ready(gate.preload_active, gate.masks_ready, gate.save_busy, || gate.doc_synced)
+///
+/// `doc_synced` answers whether the flattened page's projection is current with the shared document
+/// (`page_projection_current`, possibly after re-projecting it). It is LAZY and evaluated last, only
+/// when every cheap term of `gate` holds (short-circuit), exactly like the export's `docs_synced`:
+/// the prepare form re-projects a stale page, which must not run every frame of the preload pass.
+fn flatten_dispatch_ready(gate: FlattenGate, doc_synced: impl FnOnce() -> bool) -> bool {
+    !gate.flatten_running && !gate.export_busy && gate.chapter_settled && gate.layers_ready && export_dispatch_ready(gate.preload_active, gate.masks_ready, gate.save_busy, doc_synced)
 }
 
 impl TypingTabState {
@@ -224,9 +226,10 @@ impl TypingTabState {
     /// Each call: wires the overlay and clip-mask loaders for `project` (idempotent), polls the
     /// overlay loader, the eager migration and the mask loader, applies a bounded batch of the
     /// whole-chapter layer preload, starts that preload once when pages are not resident, and
-    /// re-projects `page_idx` from the shared `LayerDoc` when another tab (the PS editor) changed
-    /// the document since this tab last projected that page — first polling the in-flight jobs
-    /// that hold that re-projection back. Not ready while that page's projection lags the document.
+    /// and — LAST, only once every cheap gate term holds — re-projects `page_idx` from the shared
+    /// `LayerDoc` when another tab (the PS editor) changed that page since this tab last projected it,
+    /// first polling the in-flight jobs that hold that re-projection back. Not ready while that page's
+    /// projection lags the document.
     /// Polling here as well as in `draw` is harmless (non-blocking `try_recv`s). Requests a repaint
     /// while not ready so the frame loop keeps draining the workers.
     ///
@@ -240,12 +243,6 @@ impl TypingTabState {
         self.text_overlays.poll_migration();
         self.mask_layer.poll_loader(ctx);
         self.text_overlays.drive_page_preload();
-        // Cross-tab sync without `draw` (review High-1): a page already resident in this tab's
-        // projection is never re-read by `build_page_job`, so an edit the PS tab made in the shared
-        // document since typing last projected THIS page must be re-projected here, or the file would
-        // be written from the stale projection. The flattened page need not be the canvas's current
-        // one (an image set saves every page), so the page is named explicitly.
-        self.text_overlays.drive_doc_sync_without_draw(ctx, page_idx);
 
         let chapter_settled = self.text_overlays.chapter_load_settled(project);
         let mut preload_active = self.text_overlays.preload_all_pages_active();
@@ -279,9 +276,19 @@ impl TypingTabState {
             preload_active,
             masks_ready: self.mask_layer.masks_loaded(project),
             save_busy: self.save_busy,
-            doc_synced: self.text_overlays.page_projection_current(page_idx),
         };
-        if flatten_dispatch_ready(gate) {
+        // Cross-tab sync without `draw` (review High-1), as the gate's LAST term: a page already
+        // resident in this tab's projection is never re-read by `build_page_job`, so an edit the PS
+        // tab made in the shared document since typing last projected THIS page must be re-projected
+        // here, or the file would be written from the stale projection. The flattened page need not
+        // be the canvas's current one (an image set saves every page), so the page is named
+        // explicitly. Deferred behind the cheap terms (S-050): none of them depends on the polls the
+        // drive runs, and while the preload pass inserts pages a re-projection is wasted work.
+        let text_overlays = &mut self.text_overlays;
+        if flatten_dispatch_ready(gate, || {
+            text_overlays.drive_doc_sync_without_draw(ctx, page_idx);
+            text_overlays.page_projection_current(page_idx)
+        }) {
             return FlattenReadiness::Ready;
         }
         ctx.request_repaint();
@@ -320,11 +327,12 @@ impl TypingTabState {
             preload_active,
             masks_ready: self.mask_layer.masks_loaded(project),
             save_busy: self.save_busy,
-            doc_synced: self.text_overlays.page_projection_current(page_idx),
         };
-        if !flatten_dispatch_ready(gate) {
+        // `None` in the refusal log: a cheap term failed first, so the projection was not consulted.
+        let mut doc_synced = None;
+        if !flatten_dispatch_ready(gate, || *doc_synced.insert(self.text_overlays.page_projection_current(page_idx))) {
             ms_log::runtime_log::log_warn(format!(
-                "[typing] flatten to file refused: busy or not prepared.\nPage: {page_idx}\nDestination: {}\nGate: {gate:?}\nPossible cause: the caller did not wait for prepare_flatten_to_file(page {page_idx}) to report Ready",
+                "[typing] flatten to file refused: busy or not prepared.\nPage: {page_idx}\nDestination: {}\nGate: {gate:?}\nDoc synced: {doc_synced:?}\nPossible cause: the caller did not wait for prepare_flatten_to_file(page {page_idx}) to report Ready",
                 destination_label(&destination)
             ));
             return Err(FlattenToFileError::Busy);
@@ -747,8 +755,9 @@ mod tests {
 
     #[test]
     fn dispatch_gate_table() {
-        let ready = FlattenGate { flatten_running: false, export_busy: false, chapter_settled: true, layers_ready: true, preload_active: false, masks_ready: true, save_busy: false, doc_synced: true };
-        assert!(flatten_dispatch_ready(ready));
+        let ready = FlattenGate { flatten_running: false, export_busy: false, chapter_settled: true, layers_ready: true, preload_active: false, masks_ready: true, save_busy: false };
+        assert!(flatten_dispatch_ready(ready, || true));
+        assert!(!flatten_dispatch_ready(ready, || false), "a stale projection blocks the dispatch");
         let blocked = [
             FlattenGate { flatten_running: true, ..ready },
             FlattenGate { export_busy: true, ..ready },
@@ -757,10 +766,10 @@ mod tests {
             FlattenGate { preload_active: true, ..ready },
             FlattenGate { masks_ready: false, ..ready },
             FlattenGate { save_busy: true, ..ready },
-            FlattenGate { doc_synced: false, ..ready },
         ];
         for gate in blocked {
-            assert!(!flatten_dispatch_ready(gate), "{gate:?}");
+            // A failed cheap term short-circuits: the (re-projecting) doc term is never evaluated.
+            assert!(!flatten_dispatch_ready(gate, || panic!("doc term evaluated although {gate:?} blocks")), "{gate:?}");
         }
     }
 
@@ -1219,7 +1228,7 @@ mod tests {
         assert_eq!(page1_raster_uid(&state, selected).as_deref(), Some("a"), "building the export jobs keeps the remapped selection");
     }
 
-    /// While the whole-chapter preload pass runs (each applied page bumps the doc's global version),
+    /// While the whole-chapter preload pass runs (each applied page bumps the doc's version),
     /// the deferred export's gate never runs the per-page re-projection: a stale resident page keeps
     /// its projected version until the pass drained; then the export re-projects and dispatches.
     #[test]
@@ -1228,7 +1237,7 @@ mod tests {
         let (mut project, doc, mut state, ctx) = resident_two_page_chapter(&dir.0, &["r1"]);
         let green = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 255, 0));
         doc.lock().expect("doc lock").set_raster_pixels(1, "r1", green.clone(), green, Vec::new(), true);
-        let projected_before = state.text_overlays.projected_doc_version.get(&1).copied();
+        let projected_before = state.text_overlays.projected_page_revision.get(&1).copied();
         assert!(!state.text_overlays.page_projection_current(1));
 
         // A third, never-loaded page gives the preload pass a target.
@@ -1239,7 +1248,7 @@ mod tests {
         state.text_overlays.set_pending_export(png_export_request(&dir.0.join("export")));
         state.run_pending_export_if_ready(&ctx, &project, false);
         assert!(!state.export_in_progress());
-        assert_eq!(state.text_overlays.projected_doc_version.get(&1).copied(), projected_before, "no re-projection while the preload runs");
+        assert_eq!(state.text_overlays.projected_page_revision.get(&1).copied(), projected_before, "no re-projection while the preload runs");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while state.drive_page_preload() {
@@ -1250,5 +1259,78 @@ mod tests {
         assert!(state.export_in_progress(), "dispatched once the pass drained");
         assert!(state.text_overlays.page_projection_current(1));
         wait_for_export(&mut state, &ctx);
+    }
+
+    /// S-050: an edit of page 1 in the shared document advances only page 1's revision, so typing's
+    /// projection of page 0 stays current and the per-frame sync of page 0 does not re-project it.
+    #[test]
+    fn a_doc_edit_on_another_page_leaves_this_page_projection_current() {
+        let dir = TempDir::new("other_page_edit");
+        let (_project, doc, mut state, _ctx) = resident_two_page_chapter(&dir.0, &["r1"]);
+        state.text_overlays.maybe_reproject_from_doc_version(0);
+        assert!(state.text_overlays.page_projection_current(0) && state.text_overlays.page_projection_current(1));
+        let page0_projected = state.text_overlays.projected_page_revision.get(&0).copied();
+        let green = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 255, 0));
+        doc.lock().expect("doc lock").set_raster_pixels(1, "r1", green.clone(), green, Vec::new(), true);
+        assert!(state.text_overlays.page_projection_current(0), "an edit of page 1 does not make page 0 stale");
+        assert!(!state.text_overlays.page_projection_current(1), "page 1 lags the document");
+        state.text_overlays.maybe_reproject_from_doc_version(0);
+        assert_eq!(state.text_overlays.projected_page_revision.get(&0).copied(), page0_projected, "page 0 was not re-projected");
+    }
+
+    /// S-050: a doc-funnel edit made only through `node_mut` (no bumping mutator) still advances the
+    /// edited page's revision, so the PS tab re-projects it, and leaves the other page's alone.
+    #[test]
+    fn a_node_mut_only_funnel_edit_advances_its_page_revision() {
+        let dir = TempDir::new("node_mut_funnel");
+        let (_project, doc, mut state, _ctx) = resident_two_page_chapter(&dir.0, &["r1"]);
+        let (rev0, rev1) = {
+            let guard = doc.lock().expect("doc lock");
+            (guard.page_revision(0), guard.page_revision(1))
+        };
+        assert!(state.text_overlays.route_to_doc(1, |doc| {
+            if let Some(node) = doc.node_mut(1, "r1") {
+                node.opacity = 0.25;
+            }
+        }));
+        let guard = doc.lock().expect("doc lock");
+        assert!(guard.page_revision(1) > rev1, "the funnel marked page 1 changed");
+        assert_eq!(guard.page_revision(0), rev0, "page 0 is untouched");
+        drop(guard);
+        assert!(state.text_overlays.page_projection_current(1), "the funnel re-projected page 1 itself");
+    }
+
+    /// S-050: while the whole-chapter preload pass runs, the flatten preparation never runs the
+    /// per-page re-projection (it is the gate's last, lazy term): a stale resident page keeps its
+    /// projected revision and the preparation is not ready; once the pass drained it re-projects and
+    /// reports ready. The pass is held open by a test-owned channel, so the preparation's own
+    /// `drive_page_preload` cannot drain it early (no timing dependence).
+    #[test]
+    fn flatten_prepare_does_not_reproject_while_the_preload_runs() {
+        let dir = TempDir::new("flatten_preload");
+        let (project, doc, mut state, ctx) = resident_two_page_chapter(&dir.0, &["r1"]);
+        let green = egui::ColorImage::filled([4, 4], egui::Color32::from_rgb(0, 255, 0));
+        doc.lock().expect("doc lock").set_raster_pixels(1, "r1", green.clone(), green, Vec::new(), true);
+        let projected_before = state.text_overlays.projected_page_revision.get(&1).copied();
+        assert!(!state.text_overlays.page_projection_current(1));
+
+        // A preload pass with one outstanding (fictional) target page, released by `held_tx`.
+        let (held_tx, rx) = mpsc::channel::<TypingPreloadPageResponse>();
+        state.text_overlays.preload_all_state = Some(TypingPreloadAllState { rx, remaining: HashSet::from([7]), total: 1, decode_errors: 0 });
+        for _ in 0..3 {
+            let readiness = state.prepare_flatten_to_file(&ctx, &project, 1);
+            assert!(matches!(readiness, FlattenReadiness::Preparing { .. }), "{readiness:?}");
+            assert_eq!(state.text_overlays.projected_page_revision.get(&1).copied(), projected_before, "no re-projection while the preload runs");
+        }
+
+        // The pass drains (its last target reports a decode failure, which still completes it).
+        held_tx.send((7, Err("released by the test".to_string()))).expect("preload receiver alive");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !matches!(state.prepare_flatten_to_file(&ctx, &project, 1), FlattenReadiness::Ready) {
+            assert!(std::time::Instant::now() < deadline, "the flatten preparation never became ready");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!state.preload_all_pages_active());
+        assert!(state.text_overlays.page_projection_current(1), "the preparation re-projected page 1");
     }
 }

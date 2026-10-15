@@ -53,8 +53,9 @@ and image decode run on an `ms_thread` worker and reach the GUI through an mpsc 
   document under its lock and refuses an unreadable or malformed one. The legacy
   `characters/*.txt` migration runs only when `characters.json` is absent, and its write is
   directory-fsynced before the `*.txt` sources are deleted.
-- The wiki's remote-image loader is native-only (`ureq`); the wasm build compiles an error
-  stub in its place.
+- The wiki's remote-image loader is native-only (`ms_download::fetch_small`: retry, resume,
+  timeouts, 32 MiB cap; no cancel, the per-image worker is detached); the wasm build compiles an
+  error stub in its place.
 - Tests that assert a `t!` / `tf!` / `tp!` rendering must install a catalog under
   `ms_config::locale_store::GLOBAL_LOCALE_LOCK` — the active catalog is one process-global
   `ArcSwap`, so those tests have to serialize. `ms-config` is a `[dev-dependencies]` entry

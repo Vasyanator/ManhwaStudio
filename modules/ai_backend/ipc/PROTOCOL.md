@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `8` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `12` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 8. Optional/ignored on others.   |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 12. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -242,10 +242,10 @@ becomes explicit cancel).
 | HTTP path        | method            | request fields (inline)                                                                                                                                                                                 | blob(req)       | response fields (status=ok)                                 | blob(resp) | stream | cancel |
 |------------------|-------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------|-------------------------------------------------------------|------------|--------|--------|
 | POST /ocr/manga  | `ocr.manga`       | `join_newlines: bool=true`, `reflect_strings: bool=false`, `manga_model: string\|null`                                                                                                                   | input image PNG | `engine:"mangaocr"`, `lines: string[]`, `text: string`      | none       | no     | yes    |
-| POST /ocr/easy   | `ocr.easy`        | `join_newlines: bool=true`, `reflect_strings: bool=false`, `easy_langs: string="ko"`                                                                                                                     | input image PNG | `engine:"easyocr"`, `lines: string[]`, `text: string`       | none       | no     | yes    |
+| POST /ocr/easy   | `ocr.easy`        | `easyocr_model_dir: string` (required, absolute directory), `join_newlines: bool=true`, `reflect_strings: bool=false`, `easy_langs: string="ko"` (canonical EasyOCR codes, comma-separated, used verbatim) | input image PNG | `engine:"easyocr"`, `lines: string[]`, `text: string`       | none       | no     | yes    |
 | POST /ocr/paddle | `ocr.paddle`      | `join_newlines: bool=true`, `reflect_strings: bool=false`, `paddle_lang: string="korean_v5"`                                                                                                             | input image PNG | `engine:"paddleocr"`, `lines: string[]`, `text: string`     | none       | no     | yes    |
 | POST /ocr/paddle_vl | `ocr.paddle_vl`| `paddle_vl_model: string` (required, `^[a-z0-9_]{1,64}$`), `paddle_vl_model_dir: string` (required, absolute directory), `join_newlines: bool=true`, `reflect_strings: bool=false`, `paddle_vl_script: string\|null` (lowercased) | input image PNG | `engine:"paddleocrvl"`, `lines: string[]`, `text: string`   | none       | no     | yes    |
-| POST /ocr/surya  | `ocr.surya`       | `join_newlines: bool=true`, `reflect_strings: bool=false`, `surya_task_name: string="ocr_without_boxes"`, `surya_recognize_math: bool=false`, `surya_sort_lines: bool=false`, `surya_drop_repeated_text: bool=false`, `surya_max_sliding_window: int>0\|null`, `surya_max_tokens: int>0\|null` | input image PNG | `engine:"suryaocr"`, `task_name: string`, `lines: string[]`, `text: string` | none | no | yes |
+| POST /ocr/surya  | `ocr.surya`       | `surya_recognition_dir: string` (required, absolute directory), `surya_detection_dir: string` (required, absolute directory), `join_newlines: bool=true`, `reflect_strings: bool=false`, `surya_task_name: string="ocr_without_boxes"`, `surya_recognize_math: bool=false`, `surya_sort_lines: bool=false`, `surya_drop_repeated_text: bool=false`, `surya_max_sliding_window: int>0\|null`, `surya_max_tokens: int>0\|null` | input image PNG | `engine:"suryaocr"`, `task_name: string`, `lines: string[]`, `text: string` | none | no | yes |
 | POST /ocr/paddle_onnx | `ocr.paddle_onnx` | `join_newlines: bool=true`, `reflect_strings: bool=false`, `paddle_onnx_model: string="korean_v5"` (lowercased), `paddle_onnx_device: string="cpu"` (lowercased)                                    | input image PNG | `engine:"paddleocr_onnx"`, `model: string`, `device: string`, `lines: string[]`, `text: string` | none | no | yes |
 |                  | `ocr.baberu`      | `baberu_model_files: {vision, prefill, step, vocab}` (required; each an absolute file path), `join_newlines: bool=true`, `reflect_strings: bool=false`                                                    | input image PNG | `engine:"baberuocr"`, `lines: string[]`, `text: string`     | none       | no     | yes    |
 
@@ -264,6 +264,17 @@ Notes:
   vision encoder, decoder prefill, decoder step and `vocab.json`. A missing field is
   a `ValueError` naming it; a non-absolute or missing path is an error naming the
   path. PaddleOCR-VL runs vendored model code (no `trust_remote_code`).
+- **EasyOCR and Surya are Rust's too (v12).** The backend loads them offline and never
+  downloads them: `easyocr_model_dir` is ONE shared directory holding the
+  `craft_mlt_25k.pth` detector once and every downloaded recognizer (easyocr 1.7.2
+  file names; `Reader(model_storage_directory=..., download_enabled=False)`, so a
+  missing or md5-mismatched file is an error, never a fetch). `easy_langs` arrives
+  canonical (Rust owns the code table and the script choice); the backend no longer
+  aliases codes such as `zh`. `surya_recognition_dir` is the `text_recognition`
+  checkpoint (foundation + recognition), `surya_detection_dir` the `text_detection`
+  one, each a directory with Surya's `manifest.json` and every file it lists (surya-ocr
+  0.17.1 layout); the detector directory is loaded only for `ocr_with_boxes`. A missing
+  directory or an incomplete manifest is a "not downloaded" error naming the path.
 - `paddle_onnx_model` is one of the keys in `PADDLE_ONNX_MODEL_TO_LANG`
   (`korean_v5`, `chinese_v5`, ..., `tamil_v3`).
 
@@ -286,7 +297,11 @@ PNG out) were removed in v4.
 |-------------------------------|---------------------------------------------|-----------------------------------|---------------------------------------------------------------------------------------------|------------------|--------|--------|
 | `textdetector.ctd.forward`    | `n: int`, `width: int`, `height: int`       | `n` RGB u8 tiles                  | `engine:"ctd"`, `n: int`, `map_width: int`, `map_height: int`, `channels: ["seg","shrink"]` | u8 maps          | no     | no     |
 | `textdetector.paddle.forward` | `n: int`, `width: int`, `height: int`       | `n` RGB u8 tiles                  | `engine:"paddle"`, `n`, `map_width`, `map_height`, `channels: ["prob"]`                     | u8 maps          | no     | no     |
-| `textdetector.surya.forward`  | `n: int`, `width: int`, `height: int`       | `n` RGB u8 tiles                  | `engine:"surya"`, `n`, `map_width`, `map_height`, `channels: ["text"]`                      | u8 maps          | no     | no     |
+| `textdetector.surya.forward`  | `n: int`, `width: int`, `height: int`, `surya_detection_dir: string` (required, absolute directory) | `n` RGB u8 tiles                  | `engine:"surya"`, `n`, `map_width`, `map_height`, `channels: ["text"]`                      | u8 maps          | no     | no     |
+
+`surya_detection_dir` (v12) is the same Rust-downloaded `text_detection` checkpoint
+directory as in `ocr.surya`; the backend loads it offline and answers a missing
+directory or incomplete `manifest.json` with a "not downloaded" error.
 
 Engine table (both sides hold it: `FORWARD_SPECS` in `handlers/textdetector.py`,
 `ForwardEngine` in `crates/ms-backend-ipc/src/textdetector.rs`):
@@ -342,8 +357,27 @@ result image. Encoding convention (v2):
 | POST /inpaint/lama_mpe/unload | `inpaint.lama_mpe.unload` | (none)                                                             | none                 | `unloaded: bool`                                                                    | none       | no     | no     |
 | POST /inpaint/aot        | `inpaint.aot`             | `image_len: int`, `mask_len: int`, `params: object` (`inpaint_size`)     | image PNG ++ mask PNG | `engine:"aot"`, `source_size: [w,h]`, `device: string`, `inpaint_size: int`        | result PNG | no     | yes    |
 | POST /inpaint/aot/unload | `inpaint.aot.unload`      | (none)                                                                   | none                 | `unloaded: bool`                                                                    | none       | no     | no     |
-| POST /inpaint/sdxl       | `inpaint.sdxl`            | `image_len: int`, `mask_len: int`, `params: object` (`mode, model_path, positive_prompt, negative_prompt, steps, cfg_scale, denoise_strength, seed, sampler, mask_blur, mask_dilation, lama_model?`) | image PNG ++ mask PNG | `engine:"sdxl"`, `source_size: [w,h]`, `device: string`, `mode: string` | result PNG | **yes** | yes |
+| POST /inpaint/sdxl       | `inpaint.sdxl`            | `image_len: int`, `mask_len: int`, `sdxl_config_dir: string` (required, absolute directory), `sdxl_model_dir: string\|null` (required iff `params.model_path` is the curated repo id), `params: object` (`mode, model_path, positive_prompt, negative_prompt, steps, cfg_scale, denoise_strength, seed, sampler, mask_blur, mask_dilation, lama_model?`) | image PNG ++ mask PNG | `engine:"sdxl"`, `source_size: [w,h]`, `device: string`, `mode: string` | result PNG | **yes** | yes |
 | POST /inpaint/sdxl/unload | `inpaint.sdxl.unload`    | (none)                                                                   | none                 | `unloaded: bool`                                                                    | none       | no     | no     |
+
+**SDXL model sources** (v12; the backend never downloads, every load is
+`local_files_only=True`):
+- `params.model_path` a local `.safetensors` / `.ckpt` file -> `from_single_file(path,
+  config=sdxl_config_dir)`. `sdxl_config_dir` is the pinned diffusers config repo Rust
+  downloaded (configs and tokenizer files only, with `model_index.json`), chosen by
+  Rust per mode: `nine_channel` -> `diffusers/stable-diffusion-xl-1.0-inpainting-0.1`,
+  `four_channel` -> `stabilityai/stable-diffusion-xl-base-1.0`. Without it diffusers
+  would fetch those configs from the Hub, so a missing directory or `model_index.json`
+  is a "not downloaded" error. The field is required on every request and read only for
+  this source.
+- `params.model_path` a local diffusers folder (with `model_index.json`) ->
+  `from_pretrained(path)`.
+- `params.model_path == "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"` (the one
+  curated repo id) -> `from_pretrained(sdxl_model_dir, variant="fp16")`, where
+  `sdxl_model_dir` is Rust's pinned download of that repo's fp16 files. Missing field:
+  `ValueError`; missing directory or `model_index.json`: "not downloaded".
+- Any other value (another repo id) is refused with a `ValueError`; a missing absolute
+  path is a `FileNotFoundError` naming it.
 
 **SDXL streaming detail** (replaces the legacy NDJSON-over-HTTP frames): the
 server emits `progress` frames during diffusion:

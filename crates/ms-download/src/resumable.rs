@@ -1,22 +1,21 @@
 /*
-File: crates/ms-sysprobe/src/ai_models/resumable.rs
+File: crates/ms-download/src/resumable.rs
 
 Purpose:
-The one HTTP download mechanism of `ai_models`: Hugging Face resolve URLs and the resumable,
-retrying, cancellable per-file fetch into a `.part` staging file. Both downloaders use it —
-the pinned external-model downloader (`external.rs`, size + sha256 known up front) and the
-app-managed main-repository downloader (`ai_models.rs`, size learned from the server).
-Native-only (the parent mounts it under `cfg(not(wasm32))`).
+The resumable, retrying, cancellable per-file HTTP fetch into a `.part` staging file. Every
+Rust downloader uses it: today the pinned external-model downloader
+(`ms_sysprobe::ai_models::external`, size + sha256 known up front) and the app-managed
+main-repository downloader (`ms_sysprobe::ai_models`, size learned from the server).
 
 Key items:
-- `hf_resolve_url()`: `{HF_ENDPOINT or https://huggingface.co}/{repo}/resolve/{rev}/{path}`
-  with every component percent-encoded. Replaces `hf_hub::ApiBuilder::from_env`, which
-  panics without a home directory (Android app processes have none).
-- `RangeFetcher` + `FetchResponse` + `FetchError` + `classify_status()`: the HTTP seam;
-  `UreqFetcher` is the production implementation, tests inject in-memory ones.
+- `RangeFetcher` + `FetchResponse` (+ `RemoteIdentity`) + `FetchError` + `classify_status()`: the HTTP seam;
+  `UreqFetcher` (built from `FetcherConfig`: user agent, bearer, extra headers, timeouts) is
+  the production implementation, tests inject in-memory ones.
 - `RetryPolicy`: capped exponential backoff with an injected sleep.
 - `ResumableFetch::fetch_part()`: streams one file into its `.part` from the staged length
   until the whole file is staged and fsynced; the caller verifies and publishes it.
+- `sleep_cancellable()` (crate-internal): the sliced, cancel-polling wait shared by the
+  in-memory fetch and the busy wait.
 
 Notes:
 - Size rule: a pinned size (`PartRequest::expected_size`) is authoritative. Without one the
@@ -29,7 +28,9 @@ Notes:
   total differs from the size already learned (the remote file changed), or a 416 showing
   that the `.part` is longer than the remote file. A transfer that stops early keeps them.
 - The bearer token (if a caller passes one) is only ever a request header; it is never
-  logged, and ureq drops `Authorization` on every redirect.
+  logged and is sent only to the first hop of a redirect chain.
+- `UreqFetcher` follows redirects itself so a response can carry its `RemoteIdentity`
+  (`X-Linked-Etag` of a Hugging Face LFS redirect, else the final `ETag`).
 */
 
 use std::io::{Read, Write};
@@ -39,65 +40,9 @@ use std::time::Duration;
 
 use sha2::Digest;
 
-/// Environment variable that redirects Hugging Face requests (mirrors, proxies, tests);
-/// the same name `huggingface_hub` and `hf-hub` honour.
-pub(crate) const HF_ENDPOINT_ENV: &str = "HF_ENDPOINT";
-/// Endpoint used when `HF_ENDPOINT` is unset or empty.
-pub(crate) const DEFAULT_HF_ENDPOINT: &str = "https://huggingface.co";
-
-/// Resolve URL of `path` in the model repository `repo_id` at `revision`, on the endpoint
-/// named by `HF_ENDPOINT` (default `https://huggingface.co`). Reads the environment on every
-/// call and never touches the home directory.
-#[must_use]
-pub(crate) fn hf_resolve_url(repo_id: &str, revision: &str, path: &str) -> String {
-    let configured = std::env::var(HF_ENDPOINT_ENV).ok();
-    hf_resolve_url_at(endpoint_from_env_value(configured.as_deref()), repo_id, revision, path)
-}
-
-/// The endpoint a raw `HF_ENDPOINT` value selects: the default for an absent or blank value,
-/// otherwise the trimmed value without trailing slashes.
-#[must_use]
-pub(crate) fn endpoint_from_env_value(value: Option<&str>) -> &str {
-    match value.map(str::trim) {
-        Some(endpoint) if !endpoint.is_empty() => endpoint.trim_end_matches('/'),
-        Some(_) | None => DEFAULT_HF_ENDPOINT,
-    }
-}
-
-/// [`hf_resolve_url`] with an explicit endpoint (no trailing slash). `repo_id` (`owner/name`)
-/// and `path` are `/`-separated: each segment is percent-encoded and the separators kept;
-/// `revision` is encoded as ONE segment (a `/` in a branch name becomes `%2F`, as the Hub
-/// expects).
-#[must_use]
-pub(crate) fn hf_resolve_url_at(endpoint: &str, repo_id: &str, revision: &str, path: &str) -> String {
-    format!("{endpoint}/{}/resolve/{}/{}", encode_segments(repo_id), percent_encode(revision), encode_segments(path))
-}
-
-/// Percent-encodes every `/`-separated segment of `value`, keeping the separators.
-fn encode_segments(value: &str) -> String {
-    value.split('/').map(percent_encode).collect::<Vec<_>>().join("/")
-}
-
-/// RFC 3986 percent-encoding of one path segment: unreserved characters stay, every other
-/// UTF-8 byte becomes `%XX` (uppercase hex).
-fn percent_encode(segment: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(segment.len());
-    for byte in segment.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            out.push('%');
-            out.push(char::from(HEX[usize::from(byte >> 4)]));
-            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-    }
-    out
-}
-
 /// Response status the downloader distinguishes: a whole body or the requested suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FetchStatus {
+pub enum FetchStatus {
     /// HTTP 200: the body is the whole file, whatever offset was asked for.
     Full,
     /// HTTP 206: the body starts at the requested offset.
@@ -105,20 +50,68 @@ pub(crate) enum FetchStatus {
 }
 
 /// An opened HTTP response body.
-pub(crate) struct FetchResponse {
+pub struct FetchResponse {
     /// How `body` relates to the requested offset.
     pub status: FetchStatus,
     /// Size of the WHOLE file as the server announced it: `Content-Length` of a 200, the
     /// total of a 206's `Content-Range`; `None` when not announced (or `*`).
     pub total_len: Option<u64>,
+    /// Which version of the remote object answered, when the server said so (see
+    /// [`RemoteIdentity`]); `None` when it sent no entity tag.
+    pub identity: Option<RemoteIdentity>,
     /// The streamed body.
     pub body: Box<dyn Read + Send>,
+}
+
+/// The server's name for one version of a remote file: its entity tag, so two responses with
+/// equal identities belong to the same bytes and a staged prefix may be extended across them.
+///
+/// `UreqFetcher` takes `etag` from the first `X-Linked-Etag` seen on the redirect chain
+/// (Hugging Face sends it on the resolve hop of an LFS file, before redirecting to the CDN),
+/// otherwise from the final response's `ETag`; both without quotes. Weak tags (`W/…`) are
+/// ignored: they never make an identity. `lfs_sha256` is set ONLY from `X-Linked-Etag` and only when it is 64 hex digits:
+/// for a Hugging Face LFS (or Xet) file that tag is the sha256 of the whole file, so it can
+/// verify content that has no pinned hash. A plain `ETag` is never read as a hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteIdentity {
+    /// Normalized entity tag (never empty).
+    pub etag: String,
+    /// Lowercase sha256 of the whole file announced by `X-Linked-Etag`, if any.
+    pub lfs_sha256: Option<String>,
+}
+
+impl RemoteIdentity {
+    /// The identity a response's raw headers give: `linked_etag` is the first `X-Linked-Etag`
+    /// of the redirect chain, `etag` the final response's `ETag`. `None` when neither holds a
+    /// non-empty STRONG tag.
+    #[must_use]
+    pub fn from_headers(linked_etag: Option<&str>, etag: Option<&str>) -> Option<Self> {
+        let linked = linked_etag.and_then(normalize_etag);
+        let lfs_sha256 = linked
+            .as_deref()
+            .filter(|tag| tag.len() == 64 && tag.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .map(str::to_ascii_lowercase);
+        let etag = linked.or_else(|| etag.and_then(normalize_etag))?;
+        Some(Self { etag, lfs_sha256 })
+    }
+}
+
+/// A STRONG entity tag without surrounding whitespace and quotes; `None` when nothing is
+/// left or the tag is weak (`W/…`): a weak validator does not promise byte-equal content
+/// (RFC 9110 §8.8.1), so it can never bind a staged prefix to the remote bytes.
+fn normalize_etag(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with("W/") || trimmed.starts_with("w/") {
+        return None;
+    }
+    let unquoted = trimmed.trim_matches('"').trim();
+    (!unquoted.is_empty()).then(|| unquoted.to_owned())
 }
 
 /// Why a request could not be opened; decides whether the downloader retries it. `detail`
 /// is English diagnostic text without secrets (it reaches the log only).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FetchError {
+pub enum FetchError {
     /// Worth retrying: connect / DNS / I/O transport failures, HTTP 408, 429 and 5xx.
     /// `retry_after` is the server's `Retry-After` when it sent one in delta-seconds form.
     Transient { detail: String, retry_after: Option<Duration> },
@@ -134,7 +127,7 @@ pub(crate) enum FetchError {
 /// are transient, everything else permanent. `retry_after` is the raw `Retry-After` header;
 /// only the delta-seconds form is honoured (an HTTP-date falls back to the backoff).
 #[must_use]
-pub(crate) fn classify_status(code: u16, retry_after: Option<&str>) -> FetchError {
+pub fn classify_status(code: u16, retry_after: Option<&str>) -> FetchError {
     let detail = format!("HTTP status {code}");
     if code == 408 || code == 429 || (500..=599).contains(&code) {
         let retry_after = retry_after.and_then(|value| value.trim().parse::<u64>().ok()).map(Duration::from_secs);
@@ -145,7 +138,7 @@ pub(crate) fn classify_status(code: u16, retry_after: Option<&str>) -> FetchErro
 }
 
 /// The HTTP seam of the downloaders; tests inject an in-memory implementation.
-pub(crate) trait RangeFetcher {
+pub trait RangeFetcher {
     /// Opens `url`, asking for the bytes from `offset` on when `offset > 0`. A `Partial`
     /// answer must start exactly at `offset` (the implementation checks it). Errors while
     /// READING the returned body are always treated as transient by the downloader.
@@ -163,7 +156,7 @@ pub(crate) trait RangeFetcher {
 /// `first_delay * 2^(n-1)`, capped at `max_delay`, or the server's `Retry-After` when that is
 /// longer (itself capped at `retry_after_cap`). After `max_retries` such retries the last
 /// failure is returned as [`StreamError::Http`].
-pub(crate) struct RetryPolicy<'a> {
+pub struct RetryPolicy<'a> {
     /// Retries allowed in a row without progress.
     pub max_retries: u32,
     /// Wait before the first retry.
@@ -182,7 +175,7 @@ impl RetryPolicy<'static> {
     /// Production schedule: 5 retries without progress, waiting 2, 4, 8, 16 and 30 s
     /// (`Retry-After` honoured up to 60 s), cancel polled every 100 ms. With the ureq read
     /// timeout of 60 s, a link that is completely down fails after about 6 minutes.
-    pub(crate) fn standard() -> Self {
+    pub fn standard() -> Self {
         Self {
             max_retries: 5,
             first_delay: Duration::from_secs(2),
@@ -196,7 +189,7 @@ impl RetryPolicy<'static> {
 
 impl RetryPolicy<'_> {
     /// Wait before retry `attempt` (1-based); see the type comment for the formula.
-    pub(crate) fn delay_for(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    pub fn delay_for(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
         // 2^(attempt-1) saturates at u32::MAX for absurd attempt counts; the cap applies anyway.
         let factor = 1_u32.checked_shl(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
         let backoff = self.first_delay.saturating_mul(factor).min(self.max_delay);
@@ -206,7 +199,7 @@ impl RetryPolicy<'_> {
 
 /// One file to stage.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PartRequest<'a> {
+pub struct PartRequest<'a> {
     /// Resolve URL of the file.
     pub url: &'a str,
     /// The `.part` staging file; its parent directory must exist.
@@ -219,9 +212,11 @@ pub(crate) struct PartRequest<'a> {
 
 /// Progress of [`ResumableFetch::fetch_part`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StreamEvent {
-    /// `staged` bytes of the file are in the `.part` (after every read of at most 128 KiB).
-    Downloading { staged: u64 },
+pub enum StreamEvent {
+    /// `staged` bytes of the file are in the `.part` (after every read of at most 128 KiB);
+    /// `total` is the file size (pinned, or as announced by the server so far), `None` while
+    /// no size is known.
+    Downloading { staged: u64, total: Option<u64> },
     /// A transient failure; waiting before retry `attempt` of `max_attempts`, `delay_secs`
     /// left (rounded up; re-sent whenever it changes, last with `0`). `staged` is the length
     /// the retry resumes from.
@@ -230,7 +225,7 @@ pub(crate) enum StreamEvent {
 
 /// Failure of [`ResumableFetch::fetch_part`]. Callers map it into their own typed error.
 #[derive(Debug)]
-pub(crate) enum StreamError {
+pub enum StreamError {
     /// The cancel flag was set (also seen during a retry wait); the `.part` is kept.
     Cancelled,
     /// A filesystem operation on `path` failed; the `.part` is kept.
@@ -245,8 +240,10 @@ pub(crate) enum StreamError {
 }
 
 /// The per-file download engine: fetcher, retry schedule, cancel flag and log labels.
-pub(crate) struct ResumableFetch<'a> {
+pub struct ResumableFetch<'a> {
+    /// The HTTP seam every request goes through.
     pub fetcher: &'a dyn RangeFetcher,
+    /// Schedule of transient-failure retries.
     pub retry: &'a RetryPolicy<'a>,
     /// Polled before every request, after every read and every `wait_slice` of a backoff.
     pub cancel: &'a AtomicBool,
@@ -258,7 +255,7 @@ pub(crate) struct ResumableFetch<'a> {
 
 /// Read buffer size: the upper bound of one read, hence the coarsest cancel and progress
 /// granularity (a network read usually returns far less).
-pub(crate) const CHUNK: usize = 128 * 1024;
+pub const CHUNK: usize = 128 * 1024;
 
 /// Mutable state of one `fetch_part` call.
 struct Staged {
@@ -307,7 +304,7 @@ impl ResumableFetch<'_> {
     /// # Errors
     /// `Cancelled`, `Io`, `SizeMismatch` (`.part` deleted), `Http` (permanent failure,
     /// retries exhausted, or no size known at the end of the body; `.part` kept).
-    pub(crate) fn fetch_part(
+    pub fn fetch_part(
         &self,
         request: &PartRequest<'_>,
         mut hasher: Option<&mut sha2::Sha256>,
@@ -439,7 +436,7 @@ impl ResumableFetch<'_> {
                 hasher.update(chunk);
             }
             state.written = next;
-            progress(StreamEvent::Downloading { staged: next });
+            progress(StreamEvent::Downloading { staged: next, total: state.total });
         }
         match state.total {
             Some(total) if state.written == total => {
@@ -522,6 +519,24 @@ impl ResumableFetch<'_> {
     }
 }
 
+/// Sleeps `delay` in `retry.wait_slice` steps (at least 1 ms each), polling `cancel` before
+/// every slice. Returns `true` as soon as the flag is seen (the wait is abandoned), `false`
+/// after the whole delay.
+pub(crate) fn sleep_cancellable(retry: &RetryPolicy<'_>, cancel: &AtomicBool, delay: Duration) -> bool {
+    let mut remaining = delay;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return true;
+        }
+        if remaining.is_zero() {
+            return false;
+        }
+        let slice = remaining.min(retry.wait_slice.max(Duration::from_millis(1)));
+        (retry.sleep)(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+}
+
 /// Opens an existing file for writing and fsyncs it.
 fn sync_file(path: &Path) -> Result<(), StreamError> {
     let handle = std::fs::OpenOptions::new().write(true).open(path).map_err(|source| io_error(path, source))?;
@@ -542,7 +557,7 @@ fn io_error(path: &Path, source: std::io::Error) -> StreamError {
 
 /// A read length as `u64`. `usize` is at most 64 bits on every supported target, so the
 /// saturating fallback is unreachable; it only avoids a lossy `as`.
-pub(crate) fn chunk_len(read: usize) -> u64 {
+pub fn chunk_len(read: usize) -> u64 {
     u64::try_from(read).unwrap_or(u64::MAX)
 }
 
@@ -552,70 +567,270 @@ fn content_range_total(value: &str) -> Option<u64> {
     value.rsplit_once('/').and_then(|(_, total)| total.trim().parse::<u64>().ok())
 }
 
+/// Construction options of [`UreqFetcher`]. `Default` is the project's network rule: 15 s
+/// connect, 60 s read, no token, no extra headers, ureq's own user agent.
+#[derive(Clone)]
+pub struct FetcherConfig {
+    /// `User-Agent` of every request; `None` keeps ureq's default.
+    pub user_agent: Option<String>,
+    /// Access token sent as `Authorization: Bearer …`; never logged (see [`UreqFetcher`]).
+    pub bearer: Option<String>,
+    /// Extra request headers (name, value), sent on every request after the built-in ones.
+    /// Values may be secrets: they are never logged and `Debug` prints only the names.
+    pub headers: Vec<(String, String)>,
+    /// Upper bound of DNS + TCP/TLS connect.
+    pub connect_timeout: Duration,
+    /// Upper bound of one socket read; a stalled body fails (transiently) after it.
+    pub read_timeout: Duration,
+}
+
+impl Default for FetcherConfig {
+    fn default() -> Self {
+        Self {
+            user_agent: None,
+            bearer: None,
+            headers: Vec::new(),
+            connect_timeout: Duration::from_secs(15),
+            read_timeout: Duration::from_secs(60),
+        }
+    }
+}
+
+impl std::fmt::Debug for FetcherConfig {
+    // Redacts the token and the header values, which may carry credentials.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let header_names: Vec<&str> = self.headers.iter().map(|(name, _)| name.as_str()).collect();
+        f.debug_struct("FetcherConfig")
+            .field("user_agent", &self.user_agent)
+            .field("bearer", &self.bearer.as_ref().map(|_| "<redacted>"))
+            .field("header_names", &header_names)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("read_timeout", &self.read_timeout)
+            .finish()
+    }
+}
+
+/// Redirect hops [`UreqFetcher`] follows per request (ureq's own default).
+const MAX_REDIRECTS: usize = 5;
+
 /// The production [`RangeFetcher`] over a ureq agent.
-pub(crate) struct UreqFetcher {
+///
+/// Redirects are followed HERE, not by ureq (the agent is built with `redirects(0)`), because
+/// the response identity of a Hugging Face LFS file (`X-Linked-Etag`) is a header of the
+/// redirect hop that ureq would discard. Hop rules: at most [`MAX_REDIRECTS`] hops, targets
+/// resolved per RFC 3986, only same-scheme or `http` -> `https` (an `https` -> `http`
+/// downgrade is a permanent, logged failure), `Authorization` only on the first request,
+/// every other header (`Range`, `Accept-Encoding`, the configured extras) on every hop.
+pub struct UreqFetcher {
     agent: ureq::Agent,
-    /// Hugging Face token; sent as a bearer header, never logged. ureq's default redirect
-    /// policy drops `Authorization` on every redirect (the LFS CDN is another host), while
-    /// keeping `Range`.
+    /// Access token (e.g. the Hugging Face token); sent as a bearer header to the FIRST hop
+    /// only (the LFS CDN is another host), never logged.
     bearer: Option<String>,
+    /// Extra headers of [`FetcherConfig::headers`], set on every request and every hop.
+    headers: Vec<(String, String)>,
 }
 
 impl UreqFetcher {
     /// An agent with a 15 s connect and 60 s read timeout that honours the proxy
-    /// environment; `bearer` is the Hugging Face token, if the caller uses one.
-    pub(crate) fn new(bearer: Option<String>) -> Self {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(60))
-            .try_proxy_from_env(true)
-            .build();
-        Self { agent, bearer }
+    /// environment; `bearer` is an access token (e.g. the Hugging Face token), if the caller uses one.
+    pub fn new(bearer: Option<String>) -> Self {
+        Self::with_config(FetcherConfig { bearer, ..FetcherConfig::default() })
     }
-}
 
-impl RangeFetcher for UreqFetcher {
-    fn fetch(&self, url: &str, offset: u64) -> Result<FetchResponse, FetchError> {
+    /// An agent built from `config` that honours the proxy environment.
+    pub fn with_config(config: FetcherConfig) -> Self {
+        let FetcherConfig { user_agent, bearer, headers, connect_timeout, read_timeout } = config;
+        let mut builder = ureq::AgentBuilder::new()
+            .timeout_connect(connect_timeout)
+            .timeout_read(read_timeout)
+            .try_proxy_from_env(true)
+            // 3xx answers come back as responses; `fetch` follows them itself (type comment).
+            .redirects(0);
+        if let Some(user_agent) = &user_agent {
+            builder = builder.user_agent(user_agent);
+        }
+        Self { agent: builder.build(), bearer, headers }
+    }
+
+    /// Sends one GET of `url` (hop `hop` of the redirect chain) and maps a failure.
+    fn send(&self, url: &str, offset: u64, hop: usize) -> Result<ureq::Response, FetchError> {
         // Identity encoding: byte offsets and Content-Length must describe the file itself
         // (see the file header).
         let mut request = self.agent.get(url).set("Accept-Encoding", "identity");
         if offset > 0 {
             request = request.set("Range", &format!("bytes={offset}-"));
         }
-        if let Some(token) = &self.bearer {
+        if hop == 0
+            && let Some(token) = &self.bearer
+        {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
-        let response = match request.call() {
-            Ok(response) => response,
+        for (name, value) in &self.headers {
+            request = request.set(name, value);
+        }
+        match request.call() {
+            Ok(response) => Ok(response),
             Err(ureq::Error::Status(416, response)) if offset > 0 => {
-                return Err(FetchError::RangeNotSatisfiable { total: response.header("Content-Range").and_then(content_range_total) });
+                Err(FetchError::RangeNotSatisfiable { total: response.header("Content-Range").and_then(content_range_total) })
             }
-            Err(ureq::Error::Status(code, response)) => return Err(classify_status(code, response.header("Retry-After"))),
+            Err(ureq::Error::Status(code, response)) => Err(classify_status(code, response.header("Retry-After"))),
             Err(ureq::Error::Transport(transport)) => {
                 let detail = transport.to_string();
-                return Err(if transport_is_transient(transport.kind()) {
+                Err(if transport_is_transient(transport.kind()) {
                     FetchError::Transient { detail, retry_after: None }
                 } else {
                     FetchError::Permanent { detail }
-                });
+                })
             }
-        };
-        let (status, total_len) = match response.status() {
-            // ureq removes Content-Length when it decompresses a body, so a size read here
-            // always counts the bytes the reader yields.
-            200 => (FetchStatus::Full, response.header("Content-Length").and_then(|value| value.trim().parse::<u64>().ok())),
-            206 => {
-                // A 206 for another range would silently corrupt the resumed file.
-                let range = response.header("Content-Range").unwrap_or_default();
-                if !range.starts_with(&format!("bytes {offset}-")) {
-                    return Err(FetchError::Permanent { detail: format!("unexpected Content-Range '{range}' for offset {offset}") });
-                }
-                (FetchStatus::Partial, content_range_total(range))
-            }
-            other => return Err(FetchError::Permanent { detail: format!("unexpected HTTP status {other}") }),
-        };
-        Ok(FetchResponse { status, total_len, body: Box::new(response.into_reader()) })
+        }
     }
+}
+
+impl RangeFetcher for UreqFetcher {
+    fn fetch(&self, url: &str, offset: u64) -> Result<FetchResponse, FetchError> {
+        let mut current = url.to_owned();
+        let mut linked_etag: Option<String> = None;
+        for hop in 0..=MAX_REDIRECTS {
+            let response = self.send(&current, offset, hop)?;
+            if linked_etag.is_none() {
+                linked_etag = response.header("X-Linked-Etag").map(str::to_owned);
+            }
+            if (300..400).contains(&response.status()) {
+                let location = response.header("Location").ok_or_else(|| FetchError::Permanent {
+                    detail: format!("HTTP status {} without a Location header", response.status()),
+                })?;
+                current = resolve_location(&current, location).map_err(|detail| {
+                    // Never logs the target URL itself (a signed CDN URL); the reason is enough.
+                    ms_log::runtime_log::log_warn(format!("[download] redirect not followed: hop={hop} reason={detail}"));
+                    FetchError::Permanent { detail }
+                })?;
+                continue;
+            }
+            let (status, total_len) = match response.status() {
+                // ureq removes Content-Length when it decompresses a body, so a size read here
+                // always counts the bytes the reader yields.
+                200 => (FetchStatus::Full, response.header("Content-Length").and_then(|value| value.trim().parse::<u64>().ok())),
+                206 => {
+                    // A 206 for another range would silently corrupt the resumed file.
+                    let range = response.header("Content-Range").unwrap_or_default();
+                    if !range.starts_with(&format!("bytes {offset}-")) {
+                        return Err(FetchError::Permanent { detail: format!("unexpected Content-Range '{range}' for offset {offset}") });
+                    }
+                    (FetchStatus::Partial, content_range_total(range))
+                }
+                other => return Err(FetchError::Permanent { detail: format!("unexpected HTTP status {other}") }),
+            };
+            let identity = RemoteIdentity::from_headers(linked_etag.as_deref(), response.header("ETag"));
+            return Ok(FetchResponse { status, total_len, identity, body: Box::new(response.into_reader()) });
+        }
+        Err(FetchError::Permanent { detail: format!("more than {MAX_REDIRECTS} redirects") })
+    }
+}
+
+/// The components of a URI reference (RFC 3986 appendix B); the fragment is dropped
+/// (requests never carry one).
+struct UriRef<'a> {
+    scheme: Option<&'a str>,
+    authority: Option<&'a str>,
+    path: &'a str,
+    query: Option<&'a str>,
+}
+
+/// Splits `reference` per RFC 3986 appendix B
+/// (`^(([^:/?#]+):)?(//([^/?#]*))?([^?#]*)(\?([^#]*))?(#(.*))?`).
+fn parse_uri_ref(reference: &str) -> UriRef<'_> {
+    let without_fragment = reference.split_once('#').map_or(reference, |(head, _)| head);
+    let (scheme, rest) = match without_fragment.find([':', '/', '?']) {
+        Some(index) if index > 0 && without_fragment.as_bytes()[index] == b':' => (Some(&without_fragment[..index]), &without_fragment[index + 1..]),
+        _ => (None, without_fragment),
+    };
+    let (authority, rest) = match rest.strip_prefix("//") {
+        Some(after) => {
+            let end = after.find(['/', '?']).unwrap_or(after.len());
+            (Some(&after[..end]), &after[end..])
+        }
+        None => (None, rest),
+    };
+    let (path, query) = match rest.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (rest, None),
+    };
+    UriRef { scheme, authority, path, query }
+}
+
+/// RFC 3986 §5.2.4 `remove_dot_segments`.
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    let mut output = String::with_capacity(path.len());
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../").or_else(|| input.strip_prefix("./")) {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") || input == "/.." {
+            input = if input == "/.." { "/" } else { &input[3..] };
+            let cut = output.rfind('/').unwrap_or(0);
+            output.truncate(cut);
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            // Move the first segment (with its leading `/`, if any) to the output.
+            let start = usize::from(input.starts_with('/'));
+            let end = input[start..].find('/').map_or(input.len(), |index| start + index);
+            output.push_str(&input[..end]);
+            input = &input[end..];
+        }
+    }
+    output
+}
+
+/// The absolute URL a `Location` header names, resolved against the current request URL
+/// `base` per RFC 3986 §5.2.2 (dot segments removed, fragment dropped).
+///
+/// # Errors
+/// English detail for a `base` without scheme and authority, a target scheme other than
+/// http(s), or an `https` -> `http` downgrade (only same-scheme and `http` -> `https`
+/// redirects are followed).
+fn resolve_location(base: &str, location: &str) -> Result<String, String> {
+    let base_ref = parse_uri_ref(base.trim());
+    let (Some(base_scheme), Some(base_authority)) = (base_ref.scheme, base_ref.authority) else {
+        return Err(format!("cannot resolve a redirect against '{base}'"));
+    };
+    let reference = parse_uri_ref(location.trim());
+    let (scheme, authority, path, query) = if let Some(scheme) = reference.scheme {
+        (scheme, reference.authority, remove_dot_segments(reference.path), reference.query)
+    } else if reference.authority.is_some() {
+        (base_scheme, reference.authority, remove_dot_segments(reference.path), reference.query)
+    } else if reference.path.is_empty() {
+        (base_scheme, Some(base_authority), base_ref.path.to_owned(), reference.query.or(base_ref.query))
+    } else if reference.path.starts_with('/') {
+        (base_scheme, Some(base_authority), remove_dot_segments(reference.path), reference.query)
+    } else {
+        // §5.2.3 merge: an empty base path with an authority becomes "/".
+        let merged = match base_ref.path.rfind('/') {
+            Some(index) => format!("{}{}", &base_ref.path[..=index], reference.path),
+            None => format!("/{}", reference.path),
+        };
+        (base_scheme, Some(base_authority), remove_dot_segments(&merged), reference.query)
+    };
+    let scheme_lower = scheme.to_ascii_lowercase();
+    if scheme_lower != "https" && scheme_lower != "http" {
+        return Err(format!("redirect to an unsupported scheme '{scheme}'"));
+    }
+    if base_scheme.eq_ignore_ascii_case("https") && scheme_lower == "http" {
+        return Err("redirect from https to plain http refused".to_owned());
+    }
+    let Some(authority) = authority.filter(|authority| !authority.is_empty()) else {
+        return Err(format!("redirect target '{location}' has no host"));
+    };
+    let mut url = format!("{scheme_lower}://{authority}{path}");
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
+    Ok(url)
 }
 
 /// Whether a ureq transport failure may pass on its own: network-level failures (DNS,

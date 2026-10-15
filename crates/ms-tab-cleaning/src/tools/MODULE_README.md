@@ -93,6 +93,16 @@ and mask as raw PNG bytes in the IPC request blob (no base64). Every one of them
 RGBA8 region, L8 mask); no tool or engine owns a PNG encoder. They also ensure required app-managed models through `ai_models.rs`,
 verify backend health, call the Python AI backend via `backend_ipc::shared_client()`, validate the
 returned PNG size (from the response blob), and surface backend errors in the region editor status.
+Those model downloads are cancellable: the run receives an `ai_models::EnsureCtx` whose flag is
+owned by the run's JOB object and set when the job is dropped — `base.rs::RegionInpaintJob`
+(«Отменить обработку», closing the editor; AOT reaches it through
+`draw_overlay_ui_custom_with_downloads`), `ai_editor/engines/run_job.rs::EngineRunJob` (LaMa,
+SDXL's LaMa prefill; `AiEngine::cancel`, engine drop) and `mask_generation::MaskGenerationJob`
+(both hosts' «cancel generation», editor / host drop; detector models through the
+`text_detector` region helpers). Their download events go into the job's channel as a
+`ModelDownload` message; each job keeps the latest one and its owner draws it (the base editor
+body, `MaskGenerationState::draw_progress`, the engines' `AiEngine::draw_progress`) through
+`ms_tab_translation::model_download_status`, the one owner of that text and bar.
 All backend transport goes through `crate::backend_ipc` (framed IPC over the AF_UNIX socket), in
 three shapes. A method that answers once uses `shared_client().call(...)` — `aot`, the two
 `inpaint.lama_*` methods, and every query/unload method of the other tools and engines. A method

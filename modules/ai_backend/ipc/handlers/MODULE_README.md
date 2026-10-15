@@ -26,7 +26,8 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - `health.py`: `health` (`ctx.get_health_snapshot`, not a service call).
 - `ocr.py`: `ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya` / `.paddle_onnx` /
   `.baberu` (`paddle_onnx` routes through the same `state.paddle_ocr` service as `ocr.paddle`).
-  The model-location fields Rust sends (`paddle_vl_model` + `paddle_vl_model_dir`, and the
+  The model-location fields Rust sends (`paddle_vl_model` + `paddle_vl_model_dir`,
+  `easyocr_model_dir`, `surya_recognition_dir` + `surya_detection_dir`, and the
   `baberu_model_files` object) are REQUIRED; this layer checks only their presence and type and
   forwards them verbatim — the label syntax and every path check are the service's single answer.
   `ocr.baberu` is not Torch-gated (ONNX Runtime: vision on the selected EP, decoders on CPU).
@@ -35,9 +36,12 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   `parse_forward_request` / `encode_forward_response`) and validates BOTH directions: `n`, tile
   alignment, exact blob length, `MAX_BLOB_BYTES` for the request and the response it implies, and
   the service's map shape/dtype. Services receive `uint8 [n, h, w, 3]` and return `uint8` maps;
-  numpy is imported inside the handler. The table is mirrored by `ms_backend_ipc::textdetector`.
+  Surya also requires `surya_detection_dir`, forwarded as the service's `model_dir`. numpy is
+  imported inside the handler. The table is mirrored by `ms_backend_ipc::textdetector`.
 - `inpaint.py`: `inpaint.lama_v2` / `.lama_mpe` / `.aot` and their `.unload` methods.
 - `sdxl.py`: `inpaint.sdxl` (+ `.unload`) — streaming, with a latent-preview PNG blob per `progress`.
+  Requires `sdxl_config_dir` and forwards the optional `sdxl_model_dir` (type checks only; the
+  service resolves the model source, `PROTOCOL.md §5.4`).
 - `flux_fill.py`: `inpaint.flux_fill` (+ `.unload`, `.status`) — streaming `download` and `generate`
   phases, no preview blob.
 - `flux2_klein.py`: `inpaint.flux2_klein` (+ `.status`, `.estimate`, `.unload`,

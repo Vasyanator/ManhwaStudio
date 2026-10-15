@@ -61,7 +61,11 @@ Key items:
   / PaddleRec(lang) / Baberu(paths)).
 - LruCache              : the pure, capacity-bounded LRU behind the engine cache.
 - NativeRuntimeError    : typed failure surface (guard-disabled, dylib resolve,
-  ORT load, model ensure / not downloaded, engine load, inference, guard write).
+  ORT load, model ensure / not downloaded, cancelled download, engine load,
+  inference, guard write).
+- NativeProgress        : what the entry points' progress callback receives (dylib progress
+  or an `ai_models` model download event); every entry point also takes the caller's cancel
+  flag, polled by the onnxruntime library download and the model downloads.
 - recognize_manga       : native MangaOCR entry point (guard -> load -> recognize).
 - recognize_paddle      : native PaddleOCR OCR entry point (shared detector + per-lang
   recognizer).
@@ -152,14 +156,24 @@ use ms_log::runtime_log;
 use ms_config::ort_load_guard as settings;
 use ms_onnx_runtime as onnx_runtime;
 use ms_onnx_runtime::{
-    OrtDownloadProgress, OrtDownloadStage, OrtRuntimeError, resolve_or_download_ort_dylib,
+    OrtDownloadProgress, OrtRuntimeError, resolve_or_download_ort_dylib,
 };
 use ms_sysprobe::ai_models;
+use ms_sysprobe::ai_models::{EnsureCtx, ModelDownloadEvent, ModelEnsureError};
 use ms_sysprobe::gpu_utils;
 
 /// Which MangaOCR ONNX export to run natively. Reuses the app-managed model enum
 /// so the OCR router and this manager agree on the variant identity.
 pub type MangaVariant = ai_models::MangaOcrOnnxModel;
+
+/// Progress of a native op, reported on the calling (worker) thread.
+#[derive(Debug, Clone, Copy)]
+pub enum NativeProgress<'a> {
+    /// The onnxruntime library is being downloaded / verified / extracted.
+    Runtime(OrtDownloadProgress),
+    /// A model file of the app-managed repository is being downloaded (`ai_models`).
+    Model(&'a ModelDownloadEvent),
+}
 
 /// Default engine-LRU capacity when `General.ai_max_loaded_models` is absent or
 /// unusable (matches the config default and the Python backend LRU default).
@@ -194,8 +208,12 @@ pub enum NativeRuntimeError {
     /// Loading (dlopen + committing the environment) the onnxruntime library failed.
     OrtLoad(OrtError),
 
-    /// Resolving/downloading the MangaOCR model files failed.
+    /// Resolving/downloading the model files failed (localized `ai_models` text).
     ModelEnsure(String),
+
+    /// The caller's cancel flag stopped the onnxruntime library download or a model
+    /// download; nothing ran. Not a failure of the runtime: callers report it as a cancelled request, never fall back to the backend.
+    Cancelled,
 
     /// Building the native MangaOCR engine (encoder/decoder sessions + vocab) failed.
     EngineLoad(OrtError),
@@ -267,6 +285,7 @@ impl std::fmt::Display for NativeRuntimeError {
             Self::ModelEnsure(detail) => {
                 f.write_str(&tf!("native_runtime.error.model_ensure", detail = detail))
             }
+            Self::Cancelled => f.write_str(t!("native_runtime.error.cancelled")),
             Self::EngineLoad(source) => {
                 f.write_str(&tf!("native_runtime.error.engine_load", detail = source))
             }
@@ -327,6 +346,7 @@ impl std::error::Error for NativeRuntimeError {
             Self::GuardDisabled { .. }
             | Self::ModelNotDownloaded(_)
             | Self::ModelEnsure(_)
+            | Self::Cancelled
             | Self::GuardWrite(_)
             | Self::EngineUnavailable => None,
         }
@@ -335,9 +355,14 @@ impl std::error::Error for NativeRuntimeError {
 
 impl From<OrtRuntimeError> for NativeRuntimeError {
     /// Replaces the removed `#[from]` on `DylibResolve`, so `?` on a
-    /// [`OrtRuntimeError`] keeps converting into this error unchanged.
+    /// [`OrtRuntimeError`] keeps converting into this error. A cancelled library
+    /// download becomes [`Self::Cancelled`] (a request the caller stopped, never a reason
+    /// to fall back to the backend); every other failure is [`Self::DylibResolve`].
     fn from(source: OrtRuntimeError) -> Self {
-        Self::DylibResolve(source)
+        match source {
+            OrtRuntimeError::Cancelled => Self::Cancelled,
+            other => Self::DylibResolve(other),
+        }
     }
 }
 
@@ -1243,8 +1268,10 @@ struct MangaModelPaths {
 /// Runs the full SIGILL-guarded sequence: consult the on-disk load guard, resolve the
 /// onnxruntime dylib, persist the fsync'd attempt marker BEFORE dlopen, load the
 /// runtime + engine, run inference, and mark the runtime proven-safe after the first
-/// successful inference. `progress` reports dylib/model download activity and is
-/// invoked on the calling (worker) thread.
+/// successful inference. `progress` reports dylib ([`NativeProgress::Runtime`]) and model
+/// ([`NativeProgress::Model`]) download activity and is invoked on the calling (worker)
+/// thread; `cancel` stops the onnxruntime library download or a model download, ending
+/// the call with [`NativeRuntimeError::Cancelled`].
 ///
 /// # Threading
 /// Worker-thread only: performs blocking download, dlopen, and inference.
@@ -1255,13 +1282,15 @@ struct MangaModelPaths {
 ///   [`NativeRuntimeError::ModelEnsure`] / [`NativeRuntimeError::EngineLoad`] /
 ///   [`NativeRuntimeError::Inference`] / [`NativeRuntimeError::GuardWrite`] on the
 ///   corresponding stage failing.
+/// - [`NativeRuntimeError::Cancelled`] when `cancel` stopped the library or a model download.
 pub fn recognize_manga(
     variant: MangaVariant,
     image: &image::RgbaImage,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<String, NativeRuntimeError> {
-    run_guarded(progress, |ort, progress| {
-        ensure_engine(variant, ort, progress)?;
+    run_guarded(cancel, progress, |ort, progress| {
+        ensure_engine(variant, ort, cancel, progress)?;
         run_inference(variant, image)
     })
 }
@@ -1284,16 +1313,17 @@ pub fn recognize_manga(
 pub fn recognize_paddle(
     paddle_lang: &str,
     image: &image::RgbaImage,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<Vec<String>, NativeRuntimeError> {
     let lang = paddle_lang.trim().to_string();
-    run_guarded(progress, |ort, progress| {
+    run_guarded(cancel, progress, |ort, progress| {
         // Serialize all PaddleOCR ops on the single shared detector: a concurrent
         // caller blocks here instead of racing to `take()` the detector (spurious
         // backend fallback) or rebuilding a duplicate detector session.
         let _paddle_op = lock_paddle_op();
-        ensure_paddle_detector(ort, progress)?;
-        ensure_paddle_recognizer(&lang, ort, progress)?;
+        ensure_paddle_detector(ort, cancel, progress)?;
+        ensure_paddle_recognizer(&lang, ort, cancel, progress)?;
         run_paddle_inference(&lang, image)
     })
 }
@@ -1340,22 +1370,24 @@ impl BaberuModelPaths {
 /// Vision on the selected EP, decoders on CPU (why: int8 decoder ops fall back to CPU on
 /// GPU EPs; benchmark 2026-10-06); the placement rule is `ms_onnx::baberu_ocr`'s, and a
 /// vision build that fails on the EP runs on the CPU with a WARN instead of failing.
-/// `progress` reports onnxruntime dylib download activity on the calling (worker) thread.
+/// `progress` reports onnxruntime dylib download activity on the calling (worker) thread;
+/// `cancel` stops that download ([`NativeRuntimeError::Cancelled`]).
 ///
 /// # Threading
 /// Worker-thread only: performs blocking download, dlopen, and inference.
 ///
 /// # Errors
-/// [`NativeRuntimeError::ModelNotDownloaded`], the guard/dylib/ORT-load surface of
-/// [`recognize_manga`], plus [`NativeRuntimeError::BaberuEngineLoad`] /
+/// [`NativeRuntimeError::ModelNotDownloaded`], [`NativeRuntimeError::Cancelled`], the
+/// guard/dylib/ORT-load surface of [`recognize_manga`], plus [`NativeRuntimeError::BaberuEngineLoad`] /
 /// [`NativeRuntimeError::BaberuInference`].
 pub fn recognize_baberu(
     paths: &BaberuModelPaths,
     image: &image::RgbaImage,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<String, NativeRuntimeError> {
     paths.ensure_present()?;
-    run_guarded(progress, |ort, _progress| {
+    run_guarded(cancel, progress, |ort, _progress| {
         ensure_baberu_engine(paths, ort)?;
         run_baberu_inference(paths, image)
     })
@@ -1375,13 +1407,14 @@ pub fn recognize_baberu(
 /// [`NativeRuntimeError::PaddleDetectorLoad`] / [`NativeRuntimeError::PaddleDetect`].
 pub fn detect_paddle(
     image: &image::RgbaImage,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<PaddleDetection, NativeRuntimeError> {
-    run_guarded(progress, |ort, progress| {
+    run_guarded(cancel, progress, |ort, progress| {
         // Serialize with `recognize_paddle` on the shared detector (see there); a
         // concurrent caller blocks rather than finding the detector taken.
         let _paddle_op = lock_paddle_op();
-        ensure_paddle_detector(ort, progress)?;
+        ensure_paddle_detector(ort, cancel, progress)?;
         run_paddle_detect(image)
     })
 }
@@ -1405,12 +1438,13 @@ pub fn detect_paddle(
 /// (which also carries a tile-shape rejection or a non-finite model output).
 pub fn paddle_det_forward(
     tiles: &[image::RgbImage],
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<Vec<ProbMap>, NativeRuntimeError> {
-    run_guarded(progress, |ort, progress| {
+    run_guarded(cancel, progress, |ort, progress| {
         // Serialize with `recognize_paddle` / `detect_paddle` on the shared detector.
         let _paddle_op = lock_paddle_op();
-        ensure_paddle_detector(ort, progress)?;
+        ensure_paddle_detector(ort, cancel, progress)?;
         run_paddle_forward(tiles)
     })
 }
@@ -1462,11 +1496,14 @@ const PADDLE_DET_CPU_BATCH: NonZeroUsize = match NonZeroUsize::new(4) {
 /// failure at any stage clears the unconfirmed attempt marker (the process survived,
 /// so it was not a SIGILL); the first full success marks the runtime proven-safe.
 /// Factored here so the manga/paddle/detector ops share one guard implementation.
+/// `cancel` is handed to the onnxruntime library download (`ensure_ort_runtime`); `work`
+/// captures it itself for its model downloads.
 fn run_guarded<T>(
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
     work: impl FnOnce(
         &Arc<OrtRuntime>,
-        &mut dyn FnMut(OrtDownloadProgress),
+        &mut dyn FnMut(NativeProgress<'_>),
     ) -> Result<T, NativeRuntimeError>,
 ) -> Result<T, NativeRuntimeError> {
     let selection = native_selection();
@@ -1499,7 +1536,8 @@ fn run_guarded<T>(
         &selection.device,
         &cfg_path,
         &scope,
-        progress,
+        cancel,
+        &mut |snapshot| progress(NativeProgress::Runtime(snapshot)),
     ) {
         Ok(ort) => ort,
         Err(err) => {
@@ -1566,13 +1604,15 @@ pub fn reset_load_latch() {
 ///
 /// On the first load this process it consults the on-disk SIGILL guard and refuses a
 /// Suspect scope. The heavy work (download, dlopen) runs with the global lock
-/// released; the lock is taken only to read/store the cached handle.
+/// released; the lock is taken only to read/store the cached handle. `cancel` stops the
+/// library download (resumed by the next call), before any attempt marker is written.
 fn ensure_ort_runtime(
     build: &str,
     provider: ExecutionProvider,
     device: &NativeDeviceSelection,
     cfg_path: &std::path::Path,
     scope: &str,
+    cancel: &AtomicBool,
     progress: &mut dyn FnMut(OrtDownloadProgress),
 ) -> Result<Arc<OrtRuntime>, NativeRuntimeError> {
     // Fast path: already loaded.
@@ -1610,7 +1650,7 @@ fn ensure_ort_runtime(
     // Resolve/download the onnxruntime dylib for the SELECTED build (blocking;
     // worker-thread only). The build slug keys both the manifest lookup and the
     // per-build cache directory.
-    let dylib = resolve_or_download_ort_dylib(build, progress)?;
+    let dylib = resolve_or_download_ort_dylib(build, cancel, progress)?;
 
     // Persist the aborted-attempt marker (fsync'd) BEFORE the dlopen so a SIGILL
     // during load or first inference leaves a Suspect marker for the next launch.
@@ -1644,7 +1684,8 @@ fn ensure_ort_runtime(
 fn ensure_engine(
     variant: MangaVariant,
     ort: &OrtRuntime,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<(), NativeRuntimeError> {
     let id = manga_model_id(variant);
     {
@@ -1655,7 +1696,7 @@ fn ensure_engine(
         }
     }
 
-    let paths = ensure_model_paths(variant, progress)?;
+    let paths = ensure_model_paths(variant, cancel, progress)?;
     runtime_log::log_info(format!(
         "[native-runtime] building MangaOCR engine (variant={variant:?}) enc={} dec={} vocab={}",
         paths.encoder.display(),
@@ -1681,29 +1722,15 @@ fn ensure_engine(
 /// 2025 export directory and is used for BOTH variants.
 fn ensure_model_paths(
     variant: MangaVariant,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<MangaModelPaths, NativeRuntimeError> {
     let models_root = config::models_dir();
-
-    // The `ai_models` reporter is a zero-arg `FnMut` fired once when a download
-    // starts; adapt it to a coarse "Downloading" progress so the OCR UI shows
-    // activity. Scoped in a block so the mutable borrow of `progress` is released
-    // before the shared-vocab step reuses it.
-    let model_dir = {
-        let mut reported = false;
-        let mut reporter = || {
-            if !reported {
-                reported = true;
-                emit_downloading(progress);
-            }
-        };
-        ai_models::ensure_manga_ocr_onnx_with_reporter(&models_root, variant, Some(&mut reporter))
-            .map_err(NativeRuntimeError::ModelEnsure)?
-    };
+    let model_dir = ensure_models(cancel, progress, |ctx| ai_models::ensure_manga_ocr_onnx(&models_root, variant, ctx))?;
 
     let encoder = model_dir.join("encoder_model.onnx");
     let decoder = model_dir.join("decoder_model.onnx");
-    let vocab = ensure_shared_vocab(&models_root, progress)?;
+    let vocab = ensure_shared_vocab(&models_root, cancel, progress)?;
     Ok(MangaModelPaths {
         encoder,
         decoder,
@@ -1724,7 +1751,8 @@ fn ensure_model_paths(
 /// correct-but-heavy here rather than reaching into `ai_models` internals.
 fn ensure_shared_vocab(
     models_root: &std::path::Path,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<PathBuf, NativeRuntimeError> {
     let vocab = models_root
         .join("ONNX")
@@ -1735,21 +1763,7 @@ fn ensure_shared_vocab(
         return Ok(vocab);
     }
 
-    {
-        let mut reported = false;
-        let mut reporter = || {
-            if !reported {
-                reported = true;
-                emit_downloading(progress);
-            }
-        };
-        ai_models::ensure_manga_ocr_onnx_with_reporter(
-            models_root,
-            MangaVariant::Model2025,
-            Some(&mut reporter),
-        )
-        .map_err(NativeRuntimeError::ModelEnsure)?;
-    }
+    ensure_models(cancel, progress, |ctx| ai_models::ensure_manga_ocr_onnx(models_root, MangaVariant::Model2025, ctx))?;
 
     if !vocab.is_file() {
         return Err(NativeRuntimeError::ModelEnsure(tf!("native_runtime.vocab_missing_2025", vocab = vocab.display())));
@@ -1801,7 +1815,8 @@ fn take_manga_engine(id: &NativeModelId) -> Result<MangaOcrEngine, NativeRuntime
 fn ensure_paddle_recognizer(
     lang: &str,
     ort: &OrtRuntime,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<(), NativeRuntimeError> {
     let id = NativeModelId::PaddleRec(lang.to_string());
     {
@@ -1813,21 +1828,7 @@ fn ensure_paddle_recognizer(
     }
 
     let models_root = config::models_dir();
-    let paths = {
-        let mut reported = false;
-        let mut reporter = || {
-            if !reported {
-                reported = true;
-                emit_downloading(progress);
-            }
-        };
-        ai_models::ensure_paddle_ocr_full_paths_with_reporter(
-            &models_root,
-            lang,
-            Some(&mut reporter),
-        )
-        .map_err(NativeRuntimeError::ModelEnsure)?
-    };
+    let paths = ensure_models(cancel, progress, |ctx| ai_models::ensure_paddle_ocr_full(&models_root, lang, ctx))?;
     runtime_log::log_info(format!(
         "[native-runtime] building PaddleOCR recognizer (lang='{lang}') rec={} dict={} \
          (shared det={})",
@@ -1902,7 +1903,8 @@ fn run_paddle_inference(
 /// detector build run with the global lock released.
 fn ensure_paddle_detector(
     ort: &OrtRuntime,
-    progress: &mut dyn FnMut(OrtDownloadProgress),
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
 ) -> Result<(), NativeRuntimeError> {
     {
         let state = lock_state();
@@ -1912,17 +1914,7 @@ fn ensure_paddle_detector(
     }
 
     let models_root = config::models_dir();
-    let det_path = {
-        let mut reported = false;
-        let mut reporter = || {
-            if !reported {
-                reported = true;
-                emit_downloading(progress);
-            }
-        };
-        ai_models::ensure_paddle_ocr_detector_with_reporter(&models_root, Some(&mut reporter))
-            .map_err(NativeRuntimeError::ModelEnsure)?
-    };
+    let det_path = ensure_models(cancel, progress, |ctx| ai_models::ensure_paddle_ocr_detector(&models_root, ctx))?;
     runtime_log::log_info(format!(
         "[native-runtime] building shared PaddleOCR text detector det={}",
         det_path.display()
@@ -2113,13 +2105,20 @@ fn reset_guard_if_unproven(cfg_path: &std::path::Path, scope: &str) {
     }
 }
 
-/// Emits a coarse "Downloading" progress snapshot (no byte counters known).
-fn emit_downloading(progress: &mut dyn FnMut(OrtDownloadProgress)) {
-    progress(OrtDownloadProgress {
-        downloaded: 0,
-        total: None,
-        stage: OrtDownloadStage::Downloading,
-    });
+/// Runs one `ai_models::ensure_*` call with `cancel` and its download events forwarded as
+/// [`NativeProgress::Model`]; a cancel becomes [`NativeRuntimeError::Cancelled`], any other
+/// failure [`NativeRuntimeError::ModelEnsure`].
+fn ensure_models<T>(
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(NativeProgress<'_>),
+    ensure: impl FnOnce(&mut EnsureCtx<'_>) -> Result<T, ModelEnsureError>,
+) -> Result<T, NativeRuntimeError> {
+    let mut forward = |event: &ModelDownloadEvent| progress(NativeProgress::Model(event));
+    let mut ctx = EnsureCtx { cancel, progress: &mut forward };
+    ensure(&mut ctx).map_err(|error| match error {
+        ModelEnsureError::Cancelled => NativeRuntimeError::Cancelled,
+        ModelEnsureError::Failed(detail) => NativeRuntimeError::ModelEnsure(detail),
+    })
 }
 
 #[cfg(test)]
@@ -2732,10 +2731,10 @@ mod tests {
             other => panic!("expected ModelNotDownloaded, got {other:?}"),
         }
         // The public entry point refuses before touching the ORT guard or dylib.
-        let mut progress = |_: OrtDownloadProgress| {};
+        let mut progress = |_: NativeProgress<'_>| {};
         let image = image::RgbaImage::new(4, 4);
         assert!(matches!(
-            recognize_baberu(&paths, &image, &mut progress),
+            recognize_baberu(&paths, &image, &AtomicBool::new(false), &mut progress),
             Err(NativeRuntimeError::ModelNotDownloaded(_))
         ));
         assert!(!root.exists());

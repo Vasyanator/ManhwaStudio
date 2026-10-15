@@ -19,10 +19,18 @@ It reaches the user only through the host's panels.
 engine.rs   SdxlEngine  -> AiEngine: constraints, mask layer, run gate, start/poll/cancel,
                            and the parameter panel body
 settings.rs SdxlMode / SdxlSettings / SdxlPersisted -> the on-disk document and the save gate
+source.rs   SdxlModelSource -> what the weights field may name, which pinned download it needs,
+                           the download half of the run gate
 progress.rs SdxlSharedProgress -> the worker<->panel progress state, its generation stamp,
                            the bar and the live latent preview
-wire.rs     run_sdxl / unload_sdxl -> the request header, the blob encoding, the streaming call
+wire.rs     run_sdxl / unload_sdxl -> the download dirs, the request header, the blob encoding,
+                           the streaming call
 ```
+The pinned downloads (`ms_sysprobe::ai_models::external_catalog::{SDXL_CONFIG_INPAINT,
+SDXL_CONFIG_BASE, SDXL_INPAINT_FP16}`) are probed and downloaded by the engine's own
+`ms_tab_translation::ocr_model_download::OcrModelDownloadController` and drawn by that crate's
+`draw_ocr_model_download` block (the cleaning -> translation edge; its Download / Verify files /
+Cancel actions go to that controller), polled from `AiEngine::poll`.
 `mod.rs` is the module ROOT and holds no logic: the file header, the module declarations, the
 imports every submodule shares through `use super::*;`, and the constants (timeout, size grid,
 sampler list, parameter ranges, the `-1` random-seed sentinel).
@@ -51,7 +59,11 @@ subtree and it is one-directional.
   above the parameters) and `draw_sdxl_latent_preview` (inside the scrolled parameters, because it
   persists after the run). Edit it to change what a run reports while
   it is in flight.
-- `wire.rs`: `lama_model_for_run` (the prefill gate), `sdxl_run_header`, `run_sdxl`, `unload_sdxl`,
+- `source.rs`: `classify_model_path` (curated id / absolute single file / absolute folder, or a
+  typed refusal), `required_download` (mode config spec for a file, the curated fp16 model for
+  the curated id, nothing for a folder), `download_block_reason` and the "not downloaded"
+  message. Edit it to change what the weights field accepts.
+- `wire.rs`: `lama_model_for_run` (the prefill gate), `resolve_sdxl_dirs`, `sdxl_run_header`, `run_sdxl`, `unload_sdxl`,
   the streaming call, the `CallError` mapping and the request-blob packing (the PNGs come from `tools/region_png.rs`). Edit it to change what
   travels on the wire — and read the protocol contract below first.
 - `engine.rs`: `SdxlEngine`, its `AiEngine` impl and its parameter panel. Edit it to change the
@@ -64,7 +76,9 @@ subtree and it is one-directional.
   carries the shared removal-mask tint `ms_theme::canvas::MASK_TINT` (the mask-inpaint editor's
   yellow), the same colour `../lama/` uses, because the meaning is the inpainting hole in both.
 - **The wire is the backend's contract, not this engine's.** One `inpaint.sdxl` method,
-  `image_len` / `mask_len` header ints, an `image_png ++ mask_png` request blob, the result PNG in
+  `image_len` / `mask_len` header ints, the top-level `sdxl_config_dir` string (EVERY request:
+  the mode's config spec directory, verified installed only for a single file, the one source
+  that reads it) and `sdxl_model_dir` (the curated download, else `null`), an `image_png ++ mask_png` request blob, the result PNG in
   the RESPONSE BLOB, `progress` frames (counters in the frame HEADER, latent preview PNG in the
   frame BLOB) and a 20 minute timeout. It is shared with `modules/ai_backend/inpaint/sdxl.py` and
   with `PROTOCOL_VERSION`: changing any of it is a protocol change, not an engine-local one.
@@ -96,7 +110,10 @@ subtree and it is one-directional.
 - **The progress bar is claimed by GENERATION.** A cancelled run is DETACHED: `call_streaming` never
   hands out the request id `Client::cancel` would need, so the backend finishes the pass and there
   is no backend-side cancel. Every publication into the shared progress therefore carries the
-  generation that claimed the bar, and writes from a retired run are dropped.
+  generation that claimed the bar, and writes from a retired run are dropped. The 4-channel LaMa
+  prefill checkpoint DOWNLOAD before the call is cancellable: the run is an `EngineRunJob`
+  (`../run_job.rs`) whose drop (`cancel`, engine drop) sets the flag the download polls; the
+  download is drawn above the step bar in `draw_progress`.
 - **The result size is checked, never rescaled.** `run_sdxl` refuses a response image that is not
   exactly the region it asked about, and `start` refuses a request whose region or mask does not
   match `rect_px` rather than encoding it onto the wire.
@@ -106,8 +123,20 @@ subtree and it is one-directional.
   `engines::region_size_refusal`, i.e. through `geometry::check_size`, the one authority on what a
   valid size is — rather than trusting the host: the frame's rectangle and the region handed over
   can disagree, and the user must be told which rule broke.
-- **The run gate is the engine's own half only.** A run already in flight, and a missing weights
-  path — SDXL has no default checkpoint, so a run without one could only fail in the backend. The
+- **The weights field accepts three things, decided in `source.rs` alone:** an absolute (or
+  `~`) path to a `.safetensors` / `.ckpt` file, an absolute path to a diffusers folder, or the
+  ONE curated repository id — read from the `SDXL_INPAINT_FP16` catalog spec, never spelled
+  here — and that only in the 9-channel mode (it is a 9-channel UNet). Classification is TEXT
+  only (the gate runs on the GUI thread); relative paths are refused because they would resolve
+  against the backend's working directory and look exactly like a repository id. Any other repo
+  id is refused with a localized error and never sent: the backend (v12) downloads nothing.
+- **Downloads are explicit.** The block above the parameter fold shows the field's required
+  download and its button; nothing downloads on a run. The worker re-checks the disk
+  (`resolve_sdxl_dirs`, stat-only) and refuses with the same "press {button}" message.
+- **The run gate is the engine's own half only.** A run already in flight; a refused weights
+  field (empty — SDXL has no default checkpoint —, another repo id, a relative path, the curated
+  id in the 4-channel mode); and the field's required download not reported installed by the
+  controller (unknown / checking / downloading count as not yet). The
   non-empty-mask rule is `allows_empty_mask()`, and the rectangle is the frame's to validate; the
   size re-check above is the run path's own last guard, not part of this gate.
 - **Literals that are wire tokens stay literal.** The sampler names, the mode tokens, «CFG» and
@@ -121,7 +150,10 @@ subtree and it is one-directional.
 - To add or re-default a persisted field: `settings.rs` — and keep the field NAME, or an existing
   user's file silently loses that value.
 - To change what travels on the wire, or the prefill gate: `wire.rs` (`sdxl_run_header`,
-  `lama_model_for_run`). The method names live in `backend_ipc::protocol`.
+  `resolve_sdxl_dirs`, `lama_model_for_run`). The method and header names live in
+  `backend_ipc::protocol`.
+- To change what the weights field accepts or which download it needs: `source.rs`; the pins
+  themselves: `ms_sysprobe::ai_models::external_catalog`, never here.
 - To change the panel layout, the run gate or the polling: `engine.rs`.
 - To change what a run reports while in flight: `progress.rs`.
 - To change which LaMa checkpoints the prefill picker offers: `../lama/catalog.rs`, never here.

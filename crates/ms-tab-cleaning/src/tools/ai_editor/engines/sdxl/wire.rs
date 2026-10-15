@@ -9,6 +9,9 @@ mapping. Everything here runs on a WORKER thread.
 Main responsibilities:
 - decide which LaMa prefill checkpoint (if any) rides along with a run
   (`lama_model_for_run`) — the one place that rule lives;
+- resolve the pinned download directories a run sends (`resolve_sdxl_dirs`): the mode's
+  config spec always, the curated model for the curated id — refusing a required one that is
+  not installed;
 - build the request header (`sdxl_run_header`);
 - run one streaming pass (`run_sdxl`) and one unload (`unload_sdxl`);
 - pack the region PNG and the L8 mask PNG (encoded by `tools::region_png`, the cleaning face
@@ -16,11 +19,12 @@ Main responsibilities:
 - decode a streamed latent preview.
 
 Key functions:
-- `lama_model_for_run()`, `sdxl_run_header()`, `run_sdxl()`, `unload_sdxl()`
+- `lama_model_for_run()`, `resolve_sdxl_dirs()`, `sdxl_run_header()`, `run_sdxl()`, `unload_sdxl()`
 
 Notes:
 The wire belongs to the BACKEND, not to this engine: the `inpaint.sdxl` method, the
-`image_len` / `mask_len` header ints, the `image_png ++ mask_png` request blob, the result PNG
+`image_len` / `mask_len` header ints, the `sdxl_config_dir` (every request) and
+`sdxl_model_dir` (the curated id, else `null`) header strings (protocol v12), the `image_png ++ mask_png` request blob, the result PNG
 in the RESPONSE BLOB, the `progress` frames carrying `step` / `total` in the header and a
 preview PNG in the frame blob, and the 20 minute timeout. Changing any of it is a
 `PROTOCOL_VERSION` change agreed with the Python side, never an engine-local edit.
@@ -39,30 +43,69 @@ use super::*;
 ///
 /// The name is resolved through the LaMa engine's own catalog
 /// ([`ensure_lama_model_for_external`]), which also fetches the file when it is missing —
-/// so this is worker-thread only and may take as long as a download.
+/// so this is worker-thread only and may take as long as a download (cancellable and
+/// reported through `downloads`).
 ///
 /// # Errors
 /// Returns a localized message when the selected name is not a LaMa-v2 catalog entry or when
 /// the checkpoint cannot be fetched.
-pub(super) fn lama_model_for_run(cfg: &SdxlRunConfig) -> Result<Option<String>, String> {
+pub(super) fn lama_model_for_run(cfg: &SdxlRunConfig, downloads: &mut EnsureCtx<'_>) -> Result<Option<String>, String> {
     match cfg.mode {
         SdxlMode::FourChannel => {
-            Ok(Some(ensure_lama_model_for_external(&cfg.settings.lama_model)?.to_string()))
+            Ok(Some(ensure_lama_model_for_external(&cfg.settings.lama_model, downloads)?.to_string()))
         }
         // No prefill: the 9-channel UNet takes the clean masked image as its own channel.
         SdxlMode::NineChannel => Ok(None),
     }
 }
 
+/// The pinned download directories one run sends (protocol v12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SdxlDirs {
+    /// `sdxl_config_dir`: the mode's config spec directory. Sent on EVERY request (the field
+    /// is required); verified installed only for a single-file source, the one that reads it.
+    pub(super) config_dir: PathBuf,
+    /// `sdxl_model_dir`: the installed curated model, `Some` iff the source is curated.
+    pub(super) model_dir: Option<PathBuf>,
+}
+
+/// Resolves the directories a run of `source` in `mode` sends under `side_models_root`.
+/// Stat-only (never downloads), so worker-thread only.
+///
+/// # Errors
+/// The localized "not downloaded, press {button}" message (the caption the download block
+/// shows for that probe answer) when the download `source` requires is not installed.
+pub(super) fn resolve_sdxl_dirs(side_models_root: &Path, mode: SdxlMode, source: SdxlModelSource) -> Result<SdxlDirs, String> {
+    let config_spec = config_spec_for(mode);
+    let installed = |spec: &'static ExternalModelSpec| {
+        installed_dir(side_models_root, spec).map_err(|err| {
+            ms_log::runtime_log::log_info(format!("[cleaning] SDXL run refused, '{}' is not installed: {err}", spec.id));
+            let button = download_label_for_statuses(&[(spec, external_model_status(side_models_root, spec))]);
+            not_downloaded_message(spec, &button)
+        })
+    };
+    let config_dir = match source {
+        SdxlModelSource::SingleFile => installed(config_spec)?,
+        SdxlModelSource::Folder | SdxlModelSource::Curated => config_spec.local_dir(side_models_root),
+    };
+    let model_dir = match source {
+        SdxlModelSource::Curated => Some(installed(&SDXL_INPAINT_FP16)?),
+        SdxlModelSource::SingleFile | SdxlModelSource::Folder => None,
+    };
+    Ok(SdxlDirs { config_dir, model_dir })
+}
+
 /// Builds the request header of one run.
 ///
 /// `image_len` / `mask_len` name the two segments of the request blob so the backend can
-/// split it. `lama_model` is what [`lama_model_for_run`] resolved and is inserted into
-/// `params` only when it is `Some`, i.e. only for the 4-channel mode.
+/// split it; `dirs` fills `sdxl_config_dir` and `sdxl_model_dir` (`null` when not curated).
+/// `lama_model` is what [`lama_model_for_run`] resolved and is inserted into `params` only
+/// when it is `Some`, i.e. only for the 4-channel mode.
 #[must_use]
 pub(super) fn sdxl_run_header(
     cfg: &SdxlRunConfig,
     lama_model: Option<&str>,
+    dirs: &SdxlDirs,
     image_len: usize,
     mask_len: usize,
 ) -> Value {
@@ -84,11 +127,17 @@ pub(super) fn sdxl_run_header(
     {
         obj.insert("lama_model".to_string(), Value::String(lama_model.to_string()));
     }
-    json!({
+    let model_dir = dirs.model_dir.as_ref().map_or(Value::Null, |dir| Value::String(dir.display().to_string()));
+    let mut header = json!({
         "image_len": image_len,
         "mask_len": mask_len,
         "params": params,
-    })
+    });
+    if let Some(obj) = header.as_object_mut() {
+        obj.insert(backend_ipc::protocol::HEADER_SDXL_CONFIG_DIR.to_string(), Value::String(dirs.config_dir.display().to_string()));
+        obj.insert(backend_ipc::protocol::HEADER_SDXL_MODEL_DIR.to_string(), model_dir);
+    }
+    header
 }
 
 /// Runs one streaming inpaint pass and returns the result image, exactly the size of
@@ -103,8 +152,9 @@ pub(super) fn sdxl_run_header(
 /// already cancelled are dropped instead of driving the next run's bar.
 ///
 /// # Errors
-/// Returns a localized message when the mask does not match the region, when no weights path
-/// is set, when the prefill checkpoint cannot be fetched, when the backend refuses the call,
+/// Returns a localized message when the mask does not match the region, when the weights
+/// field is refused ([`classify_model_path`]), when a pinned download it needs is not
+/// installed ([`resolve_sdxl_dirs`]), when the prefill checkpoint cannot be fetched, when the backend refuses the call,
 /// when the response carries no PNG, or when the returned image is not the size that was
 /// asked for.
 pub(super) fn run_sdxl(
@@ -113,22 +163,22 @@ pub(super) fn run_sdxl(
     cfg: &SdxlRunConfig,
     progress: &Arc<Mutex<SdxlSharedProgress>>,
     generation: u64,
+    downloads: &mut EnsureCtx<'_>,
 ) -> Result<egui::ColorImage, String> {
     let (width, height) = (region.size[0], region.size[1]);
     if mask.len() != width.saturating_mul(height) {
         return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
     }
-    // Re-checked on the worker as well as in the run gate: the gate closes the button, but a
-    // path emptied between the click and the encode must not reach the backend as an empty
-    // string it would have to invent a message for.
-    if cfg.settings.model_path.trim().is_empty() {
-        return Err(t!("cleaning.tools.sdxl.weights_path_required_error").to_string());
-    }
+    // Re-checked on the worker as well as in the run gate: the gate reads the controller's
+    // last probe, this reads the disk — a download removed or a field changed between the
+    // click and the encode must not reach the backend as a request it can only refuse.
+    let source = classify_model_path(cfg.mode, &cfg.settings.model_path).map_err(|refusal| refusal.message())?;
+    let dirs = resolve_sdxl_dirs(&config::side_models_dir(), cfg.mode, source)?;
 
-    let lama_model = lama_model_for_run(cfg)?;
+    let lama_model = lama_model_for_run(cfg, downloads)?;
     let image_png = encode_color_image_png_rgba(region)?;
     let mask_png = encode_mask_png_l8(mask, width, height)?;
-    let header = sdxl_run_header(cfg, lama_model.as_deref(), image_png.len(), mask_png.len());
+    let header = sdxl_run_header(cfg, lama_model.as_deref(), &dirs, image_png.len(), mask_png.len());
     let blob = concat_image_mask(&image_png, &mask_png);
 
     let stream_result = sdxl_stream_call(header, &blob, |step, total, preview| {
@@ -262,6 +312,18 @@ fn concat_image_mask(image_png: &[u8], mask_png: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ms_sysprobe::ai_models::external::ExternalModelStatus;
+
+    /// Directories as `resolve_sdxl_dirs` would return them for a non-curated source.
+    fn dirs() -> SdxlDirs {
+        SdxlDirs { config_dir: PathBuf::from("/side/SDXL/configs/x"), model_dir: None }
+    }
+
+    /// A unique, not-yet-existing `side_models` root under the system temp dir.
+    fn empty_side_models_root(tag: &str) -> PathBuf {
+        let nanos = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_nanos());
+        std::env::temp_dir().join(format!("ms_sdxl_dirs_{tag}_{}_{nanos}", std::process::id()))
+    }
 
     fn config(mode: SdxlMode) -> SdxlRunConfig {
         SdxlRunConfig {
@@ -283,6 +345,7 @@ mod tests {
         let header = sdxl_run_header(
             &config(SdxlMode::NineChannel),
             None,
+            &dirs(),
             image_png.len(),
             mask_png.len(),
         );
@@ -298,7 +361,7 @@ mod tests {
     #[test]
     fn the_header_carries_every_generation_parameter() {
         let cfg = config(SdxlMode::NineChannel);
-        let header = sdxl_run_header(&cfg, None, 1, 1);
+        let header = sdxl_run_header(&cfg, None, &dirs(), 1, 1);
         let params = &header["params"];
         assert!(params.is_object());
         assert_eq!(params["mode"].as_str(), Some("nine_channel"));
@@ -318,23 +381,64 @@ mod tests {
     /// it in the 9-channel mode would name a checkpoint nothing loads.
     #[test]
     fn the_lama_prefill_model_travels_only_in_the_four_channel_mode() {
-        let four = sdxl_run_header(&config(SdxlMode::FourChannel), Some("best.ckpt"), 1, 1);
+        let four = sdxl_run_header(&config(SdxlMode::FourChannel), Some("best.ckpt"), &dirs(), 1, 1);
         assert_eq!(four["params"]["mode"].as_str(), Some("four_channel"));
         assert_eq!(four["params"]["lama_model"].as_str(), Some("best.ckpt"));
 
-        let nine = sdxl_run_header(&config(SdxlMode::NineChannel), None, 1, 1);
+        let nine = sdxl_run_header(&config(SdxlMode::NineChannel), None, &dirs(), 1, 1);
         assert!(
             nine["params"].get("lama_model").is_none(),
             "the 9-channel pipeline has no prefill step"
         );
     }
 
+    /// `sdxl_config_dir` travels on EVERY request as a string, `sdxl_model_dir` is the curated
+    /// download or an explicit `null` (protocol v12: both are top-level header fields).
+    #[test]
+    fn the_header_carries_both_download_directories() {
+        let cfg = config(SdxlMode::NineChannel);
+        let plain = sdxl_run_header(&cfg, None, &dirs(), 1, 1);
+        assert_eq!(plain[backend_ipc::protocol::HEADER_SDXL_CONFIG_DIR].as_str(), Some(PathBuf::from("/side/SDXL/configs/x").display().to_string().as_str()));
+        assert!(plain[backend_ipc::protocol::HEADER_SDXL_MODEL_DIR].is_null());
+        assert!(plain.get(backend_ipc::protocol::HEADER_SDXL_MODEL_DIR).is_some(), "an explicit null, not an absent field");
+        assert!(plain["params"].get(backend_ipc::protocol::HEADER_SDXL_CONFIG_DIR).is_none(), "top-level, not a param");
+
+        let curated = SdxlDirs { model_dir: Some(PathBuf::from("/side/SDXL/curated")), ..dirs() };
+        let header = sdxl_run_header(&cfg, None, &curated, 1, 1);
+        assert_eq!(header[backend_ipc::protocol::HEADER_SDXL_MODEL_DIR].as_str(), Some(PathBuf::from("/side/SDXL/curated").display().to_string().as_str()));
+    }
+
+    /// Per mode and source kind: the config dir is the MODE's spec directory whatever the
+    /// source, a folder needs nothing installed and sends no model dir, while a single file
+    /// (config spec) and the curated id (fp16 model) are refused while their download is
+    /// missing, with the "press {button}" message. Nothing is created under the root.
+    #[test]
+    fn the_directories_follow_the_mode_and_refuse_a_missing_download() {
+        let root = empty_side_models_root("resolve");
+        for mode in [SdxlMode::NineChannel, SdxlMode::FourChannel] {
+            let folder = resolve_sdxl_dirs(&root, mode, SdxlModelSource::Folder).expect("a folder needs no download");
+            assert_eq!(folder.config_dir, config_spec_for(mode).local_dir(&root));
+            assert_eq!(folder.model_dir, None);
+
+            let single = resolve_sdxl_dirs(&root, mode, SdxlModelSource::SingleFile).expect_err("the config is not installed");
+            let button = download_label_for_statuses(&[(config_spec_for(mode), ExternalModelStatus::Missing)]);
+            assert_eq!(single, not_downloaded_message(config_spec_for(mode), &button));
+        }
+        let curated = resolve_sdxl_dirs(&root, SdxlMode::NineChannel, SdxlModelSource::Curated).expect_err("the model is not installed");
+        let button = download_label_for_statuses(&[(&SDXL_INPAINT_FP16, ExternalModelStatus::Missing)]);
+        assert_eq!(curated, not_downloaded_message(&SDXL_INPAINT_FP16, &button));
+        assert!(!root.exists(), "a stat-only resolve creates nothing");
+    }
+
     /// And the rule is decided in ONE place: the mode alone says whether a prefill model is
     /// resolved at all, so no call site can put one on the wire behind the gate's back.
     #[test]
     fn only_the_four_channel_mode_resolves_a_prefill_model() {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut ignore = |_: &ms_sysprobe::ai_models::ModelDownloadEvent| {};
+        let mut downloads = EnsureCtx { cancel: &cancel, progress: &mut ignore };
         assert_eq!(
-            lama_model_for_run(&config(SdxlMode::NineChannel)),
+            lama_model_for_run(&config(SdxlMode::NineChannel), &mut downloads),
             Ok(None),
             "the 9-channel mode never even asks the LaMa catalog"
         );

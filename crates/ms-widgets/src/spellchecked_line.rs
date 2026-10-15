@@ -26,6 +26,9 @@ Notes:
   словарями `.aff` + `.dic`.
 - Словари читаются из app-local папки `spell_check`; GUI-поток не делает
   файловых и сетевых операций.
+- Downloads use `ms_download::fetch_small` (retry, `Range` resume, timeouts,
+  size cap) and publish each file temp + fsync + rename, `.dic` last; no cancel,
+  because the worker lives for the whole process.
 - Активный словарь следует за ЯЗЫКОМ ВЁРСТКИ (как переносы и покрытие шрифта), а
   не за языком интерфейса. Воркер сравнивает `text_language()` каждый батч
   (паттерн `panel/facade.rs`) и докачивает словарь нового языка. Скачивание
@@ -56,10 +59,8 @@ use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::Hash;
-// `Read::read_to_string` is only used by the native dictionary downloader below.
 use ms_thread as thread;
-#[cfg(not(target_arch = "wasm32"))]
-use std::io::Read;
+use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -197,10 +198,16 @@ enum SpellStatus {
 #[derive(Debug, Clone)]
 struct SpellRequest(SpellCacheKey);
 
+/// The process-wide spellcheck worker handle and its verdict cache.
+///
+/// `available` is `false` when the worker thread could not be spawned: every word then
+/// reads `Unsupported` (left unmarked, exactly like a language without a dictionary)
+/// instead of staying `Pending` forever.
 #[derive(Clone)]
 struct SpellcheckService {
     tx: Sender<Vec<SpellRequest>>,
     cache: Arc<Mutex<HashMap<SpellCacheKey, SpellStatus>>>,
+    available: bool,
 }
 
 impl SpellcheckService {
@@ -212,10 +219,19 @@ impl SpellcheckService {
         let cache = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = mpsc::channel();
         let worker_cache = Arc::clone(&cache);
-        let _ = thread::Builder::new()
+        let available = match thread::Builder::new()
             .name("spellcheck-worker".to_string())
-            .spawn(move || spellcheck_worker_loop(worker_cache, rx));
-        Self { tx, cache }
+            .spawn(move || spellcheck_worker_loop(worker_cache, rx))
+        {
+            Ok(_) => true,
+            Err(err) => {
+                runtime_log::log_error(format!(
+                    "[widgets::spellchecked_line] failed to spawn the spellcheck worker; spellchecking is unavailable for this process (words stay unmarked); error={err}"
+                ));
+                false
+            }
+        };
+        Self { tx, cache, available }
     }
 }
 
@@ -243,9 +259,16 @@ impl SpellcheckCustomWordsService {
 
     fn spawn() -> Self {
         let (tx, rx) = mpsc::channel();
-        let _ = thread::Builder::new()
+        // On a failed spawn the closure (and `rx`) is dropped, so every later `enqueue`
+        // fails with "worker is unavailable" and its caller logs the lost word.
+        if let Err(err) = thread::Builder::new()
             .name("spellcheck-custom-words-worker".to_string())
-            .spawn(move || spellcheck_custom_words_worker_loop(rx));
+            .spawn(move || spellcheck_custom_words_worker_loop(rx))
+        {
+            runtime_log::log_error(format!(
+                "[widgets::spellchecked_line] failed to spawn the custom-words worker; adding spellcheck exceptions is unavailable for this process; error={err}"
+            ));
+        }
         Self { tx }
     }
 
@@ -668,6 +691,10 @@ fn classify_word(word: &str) -> Option<ScriptGroup> {
 
 fn statuses_for_tokens(ui: &Ui, tokens: &[WordToken]) -> Vec<SpellStatus> {
     let service = SpellcheckService::global();
+    if !service.available {
+        // No worker (spawn failed, logged once): nothing is ever checked.
+        return vec![SpellStatus::Unsupported; tokens.len()];
+    }
     let mut requests = Vec::new();
     let mut statuses = Vec::with_capacity(tokens.len());
 
@@ -693,8 +720,23 @@ fn statuses_for_tokens(ui: &Ui, tokens: &[WordToken]) -> Vec<SpellStatus> {
     }
 
     if !requests.is_empty() {
-        if service.tx.send(requests).is_err() {
-            runtime_log::log_warn("[widgets::spellchecked_line] failed to queue spellcheck batch");
+        if let Err(mpsc::SendError(lost)) = service.tx.send(requests) {
+            // The worker is gone: resolve the lost words as unchecked instead of leaving
+            // them `Pending` (which would repaint and retry every frame forever).
+            runtime_log::log_warn("[widgets::spellchecked_line] the spellcheck worker is gone; the queued words stay unmarked");
+            let mut cache = match service.cache.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for SpellRequest(key) in lost {
+                cache.insert(key, SpellStatus::Unsupported);
+            }
+            drop(cache);
+            for status in &mut statuses {
+                if *status == SpellStatus::Pending {
+                    *status = SpellStatus::Unsupported;
+                }
+            }
         }
         ui.ctx().request_repaint_after(Duration::from_millis(120));
     } else if statuses.contains(&SpellStatus::Pending) {
@@ -1071,14 +1113,28 @@ fn infer_script_group(stem: &str) -> Option<ScriptGroup> {
     None
 }
 
+/// Largest accepted `.aff` / `.dic` body. The biggest shipped dictionaries are a few MiB;
+/// the cap only stops a wrong URL from filling memory.
+#[cfg(not(target_arch = "wasm32"))]
+const DICTIONARY_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Downloads a language's Hunspell dictionary described by `spec` into
 /// `root_dir`, writing `<stem>.aff` and `<stem>.dic`.
 ///
+/// Both bodies are fetched before either file is written, and each file is
+/// published atomically (temp, fsync, rename), `.dic` LAST: discovery pairs files
+/// by stem, so no failure or crash can leave a pair that looks complete but is not
+/// (a lone `.aff` is ignored and replaced by the next download).
+///
+/// There is no cancel: the caller is the process-lifetime spellcheck worker, which
+/// is never stopped; the download only bounds its time through the retry budget and
+/// the connect / read timeouts of `ms_download`.
+///
 /// # Errors
-/// Returns an error string (no network, HTTP failure, or write failure) without
-/// writing a partial/fake dictionary: both bodies are fetched before either file
-/// is written. Runs only on the background spellcheck worker thread; on wasm the
-/// download layer is unavailable and this returns an error.
+/// Returns an error string (no network, HTTP failure, a non-UTF-8 body, or a write
+/// failure) without writing a partial/fake dictionary. Runs only on the background
+/// spellcheck worker thread; on wasm the download layer is unavailable and this
+/// returns an error.
 fn download_dictionary(root_dir: &Path, spec: DictionarySpec) -> Result<(), String> {
     runtime_log::log_info(format!(
         "[widgets::spellchecked_line] downloading '{}' dictionary into '{}'",
@@ -1086,31 +1142,32 @@ fn download_dictionary(root_dir: &Path, spec: DictionarySpec) -> Result<(), Stri
         root_dir.display()
     ));
 
-    // Fetch both bodies first so a mid-download failure never leaves a lone
-    // `.aff`/`.dic` on disk that would look like a valid pair to discovery.
     let aff_content = download_text_file(spec.aff_url)?;
     let dic_content = download_text_file(spec.dic_url)?;
-    write_text_file(&root_dir.join(format!("{}.aff", spec.stem)), &aff_content)?;
-    write_text_file(&root_dir.join(format!("{}.dic", spec.stem)), &dic_content)?;
+    write_text_file_atomic(&root_dir.join(format!("{}.aff", spec.stem)), &aff_content)?;
+    write_text_file_atomic(&root_dir.join(format!("{}.dic", spec.stem)), &dic_content)?;
+    runtime_log::log_info(format!("[widgets::spellchecked_line] downloaded '{}' dictionary", spec.stem));
     Ok(())
 }
 
-/// Downloads a text file over HTTP into a `String`.
+/// Downloads a UTF-8 text file into a `String` through `ms_download::fetch_small`
+/// (transient failures retried with capped backoff and `Range` resume, 15 s connect /
+/// 60 s read timeouts, [`DICTIONARY_MAX_BYTES`] cap).
 ///
-/// Native builds use `ureq`. On wasm there is no synchronous HTTP client here, so
-/// dictionary download is unavailable and this returns an error instead of a fake
-/// empty file.
+/// On wasm there is no synchronous HTTP client here, so dictionary download is
+/// unavailable and this returns an error instead of a fake empty file.
 #[cfg(not(target_arch = "wasm32"))]
 fn download_text_file(url: &str) -> Result<String, String> {
-    let response = ureq::get(url)
-        .call()
-        .map_err(|err| format!("request failed for '{url}': {err}"))?;
-    let mut reader = response.into_reader();
-    let mut body = String::new();
-    reader
-        .read_to_string(&mut body)
-        .map_err(|err| format!("failed to read response body for '{url}': {err}"))?;
-    Ok(body)
+    use ms_download::resumable::{RetryPolicy, UreqFetcher};
+    use std::sync::atomic::AtomicBool;
+
+    // Never set: the spellcheck worker lives as long as the process (see `download_dictionary`).
+    let never_cancelled = AtomicBool::new(false);
+    let fetcher = UreqFetcher::new(None);
+    let request = ms_download::SmallRequest { url, max_bytes: DICTIONARY_MAX_BYTES };
+    let body = ms_download::fetch_small(&fetcher, &RetryPolicy::standard(), &never_cancelled, &request, "[widgets::spellchecked_line]", url)
+        .map_err(|err| format!("download failed for '{url}': {err}"))?;
+    String::from_utf8(body).map_err(|err| format!("the body of '{url}' is not UTF-8: {err}"))
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1120,6 +1177,40 @@ fn download_text_file(_url: &str) -> Result<String, String> {
 
 fn write_text_file(path: &Path, content: &str) -> Result<(), String> {
     fs::write(path, content).map_err(|err| format!("failed to write '{}': {err}", path.display()))
+}
+
+/// Publishes `content` at `path` atomically: written to `<path>.tmp` (an extension
+/// discovery ignores), fsynced, renamed over `path`, and on unix the directory is
+/// fsynced so the rename survives a crash. A failed attempt removes its temp file.
+///
+/// # Errors
+/// The failed step with the path and the I/O error.
+fn write_text_file_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp_path = PathBuf::from(tmp_name);
+    let written = fs::File::create(&tmp_path).and_then(|mut file| {
+        file.write_all(content.as_bytes())?;
+        file.sync_all()
+    });
+    if let Err(err) = written.and_then(|()| fs::rename(&tmp_path, path)) {
+        if let Err(remove_err) = fs::remove_file(&tmp_path)
+            && remove_err.kind() != std::io::ErrorKind::NotFound
+        {
+            runtime_log::log_warn(format!(
+                "[widgets::spellchecked_line] failed to remove temp file '{}': {remove_err}",
+                tmp_path.display()
+            ));
+        }
+        return Err(format!("failed to write '{}': {err}", path.display()));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| format!("failed to fsync '{}': {err}", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn project_spellcheck_settings_slot() -> &'static Mutex<Option<PathBuf>> {
@@ -1612,6 +1703,36 @@ mod tests {
             assert!(save_project_spellcheck_words(&path, "word").is_err());
             assert_eq!(std::fs::read_to_string(&path).map_err(|err| err.to_string())?, seed);
         }
+        Ok(())
+    }
+
+    /// A downloaded dictionary file replaces an existing one atomically, leaves no temp
+    /// file, and the temp name is one discovery never pairs.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn atomic_dictionary_write_replaces_and_leaves_no_temp() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let dic = dir.path().join("xx_XX.dic");
+        std::fs::write(&dic, "old").map_err(|err| err.to_string())?;
+        write_text_file_atomic(&dic, "1\nword\n")?;
+        assert_eq!(std::fs::read_to_string(&dic).map_err(|err| err.to_string())?, "1\nword\n");
+        assert!(!dir.path().join("xx_XX.dic.tmp").exists());
+        // A lone `.aff` (the state between the two renames) is not a dictionary.
+        std::fs::remove_file(&dic).map_err(|err| err.to_string())?;
+        write_text_file_atomic(&dir.path().join("xx_XX.aff"), "SET UTF-8\n")?;
+        assert!(discover_dictionary_files(dir.path()).is_empty());
+        Ok(())
+    }
+
+    /// A write into a missing directory fails with the path and creates nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn atomic_dictionary_write_reports_failure() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
+        let path = dir.path().join("missing").join("xx_XX.dic");
+        let err = write_text_file_atomic(&path, "x").expect_err("missing parent");
+        assert!(err.contains("xx_XX.dic"), "{err}");
+        assert!(!dir.path().join("missing").exists());
         Ok(())
     }
 }

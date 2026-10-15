@@ -9,7 +9,7 @@ release archive for the current platform/provider.
 
 Key types:
 - ArchiveKind    : how a release archive is packed (Zip / TarGz / TarZst)
-- ManifestSource : one download+extract recipe (url, sha256, archive, members)
+- ManifestSource : one download+extract recipe (url, size, sha256, archive, members)
 - ManifestEntry  : one (os, arch, provider, build) -> version + primary source + extras
 - BundledEntry   : one (os, arch, provider, build) -> version + the library the app
   package ships (Android APK); no download recipe
@@ -27,9 +27,6 @@ Key functions:
 - provider_version  : back-compat shim — the version of a provider's DEFAULT build
 - current_platform  : the (os, arch) pair this binary was built for
 - platform_keys     : pure target_os/target_arch -> manifest (os, arch) key mapping
-- sha256_hex        : lowercase hex SHA256 of a byte slice (pure)
-- sha256_hex_of_file: streaming lowercase hex SHA256 of a file
-- verify_sha256_file: compare a file's SHA256 against an expected hex string
 
 Notes:
 The manifest is keyed by `(os, arch, provider, build)`: a "build" (see `builds.rs`) is
@@ -38,10 +35,10 @@ builds may share one `provider` but differ by version/binary — e.g. the `cuda1
 (1.24.1) and `cuda13` (1.27.0) builds both carry `provider = "cuda"`. Each entry pins
 its OWN ONNX Runtime `version`, so builds coexist on different releases. `ORT_VERSION`
 is only a legacy fallback floor used when no build entry exists on a platform.
-Non-GPU/non-OpenVINO entries carry a real, end-to-end-verifiable SHA256 (GitHub release
-digests / PyPI wheel digests). `sha256` is modeled as `Option` so the large GPU builds
-can ship before a maintainer pins their hash; see the unverified-hash handling in
-`onnx_runtime::mod` and the module README. An entry may pull additional libraries from
+Every download source pins its archive's exact `size` and `sha256` (GitHub release
+digests / PyPI wheel digests); both fields are required, so an unpinned row does not
+parse and fails the manifest tests — nothing is ever extracted from an unverified
+archive. An entry may pull additional libraries from
 extra archives via `additional_sources` (multi-source entries), each extracted into the
 same cache directory as the primary source.
 Bundled rows live in their own `bundled` table, so the download schema stays strict
@@ -49,13 +46,7 @@ Bundled rows live in their own `bundled` table, so the download schema stays str
 is part of the app package. A `(os, arch, build)` key is in at most one table (test).
 */
 
-use std::fs::File;
-use std::path::Path;
 use std::sync::OnceLock;
-
-use sha2::{Digest, Sha256};
-
-use super::OrtRuntimeError;
 
 /// The legacy fallback ONNX Runtime version.
 ///
@@ -98,9 +89,10 @@ pub enum ArchiveKind {
 pub struct ManifestSource {
     /// Absolute download URL of the additional archive.
     pub url: String,
-    /// Expected lowercase hex SHA256 of the archive, or `None` if unpinned.
-    #[serde(default)]
-    pub sha256: Option<String>,
+    /// Pinned lowercase hex SHA256 of the archive (required).
+    pub sha256: String,
+    /// Pinned exact byte size of the archive (required).
+    pub size: u64,
     /// Packing format of the archive at `url`.
     pub archive: ArchiveKind,
     /// Archive-internal paths of libraries to extract into the cache directory.
@@ -118,8 +110,7 @@ pub struct ManifestSource {
 /// the SAME archive that must be placed next to it (e.g.
 /// `onnxruntime_providers_shared.dll`); it may be empty. `additional_sources` names
 /// extra archives to also download and extract into the cache directory (empty for
-/// single-archive providers). `sha256` is a lowercase hex digest of the whole
-/// primary archive, or `None` when a hash has not yet been pinned for this entry.
+/// single-archive providers). `size` and `sha256` pin the whole primary archive.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ManifestEntry {
     /// Normalized OS key: `"windows"`, `"linux"`, or `"macos"`.
@@ -140,9 +131,10 @@ pub struct ManifestEntry {
     pub version: String,
     /// Absolute download URL of the primary release archive.
     pub url: String,
-    /// Expected lowercase hex SHA256 of the primary archive, or `None` if unpinned.
-    #[serde(default)]
-    pub sha256: Option<String>,
+    /// Pinned lowercase hex SHA256 of the primary archive (required).
+    pub sha256: String,
+    /// Pinned exact byte size of the primary archive (required).
+    pub size: u64,
     /// Packing format of the primary archive at `url`.
     pub archive: ArchiveKind,
     /// Archive-internal path of the primary onnxruntime library.
@@ -383,62 +375,6 @@ pub fn platform_keys(target_os: &str, target_arch: &str) -> (&'static str, &'sta
     (os, arch)
 }
 
-/// Lowercase hex SHA256 of `data`.
-#[must_use]
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hex_lower(&hasher.finalize())
-}
-
-/// Streaming lowercase hex SHA256 of the file at `path`.
-///
-/// # Errors
-/// Returns [`OrtRuntimeError::Io`] if the file cannot be opened or read.
-pub fn sha256_hex_of_file(path: &Path) -> Result<String, OrtRuntimeError> {
-    let mut file = File::open(path).map_err(|err| {
-        OrtRuntimeError::Io(tf!("onnx_runtime.manifest.checksum_open_error", path = path.display(), err = err))
-    })?;
-    let mut hasher = Sha256::new();
-    // `Sha256` implements `std::io::Write`, so the file is hashed in a streaming
-    // pass without buffering the whole (up to ~65 MB) archive in memory.
-    std::io::copy(&mut file, &mut hasher).map_err(|err| {
-        OrtRuntimeError::Io(tf!("onnx_runtime.manifest.checksum_read_error", path = path.display(), err = err))
-    })?;
-    Ok(hex_lower(&hasher.finalize()))
-}
-
-/// Verifies that the file at `path` has SHA256 equal to `expected_hex`.
-///
-/// Comparison is case-insensitive. On mismatch the file is left in place for the
-/// caller to remove.
-///
-/// # Errors
-/// - [`OrtRuntimeError::Io`] if the file cannot be read.
-/// - [`OrtRuntimeError::ChecksumMismatch`] if the digest differs from `expected_hex`.
-pub fn verify_sha256_file(path: &Path, expected_hex: &str) -> Result<(), OrtRuntimeError> {
-    let actual = sha256_hex_of_file(path)?;
-    if actual.eq_ignore_ascii_case(expected_hex) {
-        Ok(())
-    } else {
-        Err(OrtRuntimeError::ChecksumMismatch {
-            expected: expected_hex.to_string(),
-            actual,
-        })
-    }
-}
-
-/// Lowercase hex encoding of a byte buffer without any fallible formatting call.
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: [u8; 16] = *b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,7 +433,7 @@ mod tests {
         assert_eq!(win.version, "1.27.0");
         assert_eq!(win.archive, ArchiveKind::Zip);
         assert_eq!(win.dylib_member, "onnxruntime/capi/onnxruntime.dll");
-        assert_eq!(win.sha256.as_deref().map(str::len), Some(64));
+        assert_eq!(win.sha256.len(), 64);
         // The 1.27.0 Windows wheel already bundles the DirectX Shader Compiler
         // runtime (dxil.dll + dxcompiler.dll) that Dawn's D3D12 backend needs, so
         // they are extracted from the wheel itself — no separate DXC download.
@@ -516,13 +452,13 @@ mod tests {
             linux.dylib_member,
             "onnxruntime/capi/libonnxruntime.so.1.27.0"
         );
-        assert_eq!(linux.sha256.as_deref().map(str::len), Some(64));
+        assert_eq!(linux.sha256.len(), 64);
 
         let mac = lookup_download("macos", "aarch64", "webgpu").expect("macos webgpu entry");
         assert_eq!(mac.version, "1.27.0");
         assert_eq!(mac.archive, ArchiveKind::Zip);
         assert_eq!(mac.dylib_member, "onnxruntime/capi/libonnxruntime.1.27.0.dylib");
-        assert_eq!(mac.sha256.as_deref().map(str::len), Some(64));
+        assert_eq!(mac.sha256.len(), 64);
     }
 
     #[test]
@@ -577,7 +513,8 @@ mod tests {
             "os": "windows", "arch": "x86_64", "provider": "example", "build": "example",
             "version": "9.9.9",
             "url": "https://example/primary.zip",
-            "sha256": null,
+            "sha256": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+            "size": 10,
             "archive": "zip",
             "dylib_member": "lib/primary.dll",
             "extra_members": [],
@@ -585,6 +522,7 @@ mod tests {
                 {
                     "url": "https://example/extra.zip",
                     "sha256": "0011223344556677889900112233445566778899001122334455667788990011",
+                    "size": 20,
                     "archive": "zip",
                     "members": ["bin/x64/a.dll", "bin/x64/b.dll"]
                 }
@@ -596,7 +534,8 @@ mod tests {
         let source = &entry.additional_sources[0];
         assert_eq!(source.archive, ArchiveKind::Zip);
         assert_eq!(source.members, vec!["bin/x64/a.dll", "bin/x64/b.dll"]);
-        assert_eq!(source.sha256.as_deref().map(str::len), Some(64));
+        assert_eq!(source.sha256.len(), 64);
+        assert_eq!(source.size, 20);
     }
 
     #[test]
@@ -609,17 +548,38 @@ mod tests {
         assert!(lookup_download("macos", "x86_64", "cpu").is_none());
     }
 
+    /// Every download source (primary and additional) pins a non-zero size and a
+    /// 64-digit lowercase hex sha256: nothing is extracted from an unverified archive.
     #[test]
-    fn cpu_and_coreml_entries_have_real_pinned_hashes() {
-        // The CPU and CoreML builds pin verified GitHub release digests; none null.
+    fn every_source_pins_size_and_sha256() {
+        fn assert_pinned(what: &str, size: u64, sha256: &str) {
+            assert!(size > 0, "{what}: size must be pinned");
+            assert!(
+                sha256.len() == 64 && sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{what}: sha256 must be 64 lowercase hex digits, got '{sha256}'"
+            );
+        }
         for entry in &manifest().entries {
-            if entry.build == "cpu" || entry.build == "coreml" {
-                let hash = entry.sha256.as_deref().unwrap_or_else(|| {
-                    panic!("{} entry {}/{} lacks a hash", entry.build, entry.os, entry.arch)
-                });
-                assert_eq!(hash.len(), 64, "SHA256 hex must be 64 chars");
+            let what = format!("{}/{}/{}", entry.os, entry.arch, entry.build);
+            assert_pinned(&what, entry.size, &entry.sha256);
+            for source in &entry.additional_sources {
+                assert_pinned(&format!("{what} additional {}", source.url), source.size, &source.sha256);
             }
         }
+    }
+
+    /// A row without a sha256 (or a size) is rejected at parse time, never accepted as
+    /// "unverified".
+    #[test]
+    fn a_row_without_sha256_or_size_does_not_parse() {
+        let base = r#""os": "linux", "arch": "x86_64", "provider": "cpu", "build": "cpu",
+            "version": "1.0.0", "url": "https://example/a.tgz", "archive": "tar_gz",
+            "dylib_member": "lib/a.so""#;
+        let pinned_sha = r#""sha256": "0011223344556677889900112233445566778899001122334455667788990011""#;
+        assert!(serde_json::from_str::<ManifestEntry>(&format!("{{{base}, \"size\": 1}}")).is_err());
+        assert!(serde_json::from_str::<ManifestEntry>(&format!("{{{base}, \"size\": 1, \"sha256\": null}}")).is_err());
+        assert!(serde_json::from_str::<ManifestEntry>(&format!("{{{base}, {pinned_sha}}}")).is_err());
+        assert!(serde_json::from_str::<ManifestEntry>(&format!("{{{base}, {pinned_sha}, \"size\": 1}}")).is_ok());
     }
 
     #[test]
@@ -640,9 +600,8 @@ mod tests {
     fn cuda_builds_present_with_expected_extras() {
         // Two CUDA builds share provider "cuda" but differ by build slug + version:
         // cuda13 (1.27.0) and cuda12 (1.24.1). Each extracts the CUDA + TensorRT +
-        // shared provider libs next to the primary library. Hashes are intentionally
-        // unpinned (the GPU archives are hundreds of MB); `onnx_runtime::mod` computes
-        // and logs the digest instead (removal condition in MODULE_README).
+        // shared provider libs next to the primary library. Their hashes are pinned
+        // like every other row (`every_source_pins_size_and_sha256`).
         let cases = [
             (
                 "cuda13",
@@ -664,7 +623,6 @@ mod tests {
             assert_eq!(win.version, version);
             assert_eq!(win.archive, ArchiveKind::Zip);
             assert_eq!(win.dylib_member, win_member);
-            assert!(win.sha256.is_none(), "{build} windows hash stays unpinned");
             for needle in [
                 "onnxruntime_providers_cuda.dll",
                 "onnxruntime_providers_tensorrt.dll",
@@ -681,7 +639,6 @@ mod tests {
             assert_eq!(linux.version, version);
             assert_eq!(linux.archive, ArchiveKind::TarGz);
             assert_eq!(linux.dylib_member, linux_member);
-            assert!(linux.sha256.is_none(), "{build} linux hash stays unpinned");
             for needle in [
                 "libonnxruntime_providers_cuda.so",
                 "libonnxruntime_providers_tensorrt.so",
@@ -704,8 +661,8 @@ mod tests {
         assert_eq!(entry.archive, ArchiveKind::Zip);
         assert_eq!(entry.dylib_member, "onnxruntime/capi/onnxruntime.dll");
         assert_eq!(
-            entry.sha256.as_deref().map(str::len),
-            Some(64),
+            entry.sha256.len(),
+            64,
             "directml archive must carry a pinned 64-char SHA256"
         );
         assert!(
@@ -729,7 +686,7 @@ mod tests {
         let win = lookup_download("windows", "x86_64", "openvino").expect("openvino windows entry");
         assert_eq!(win.version, "1.24.1");
         assert_eq!(win.dylib_member, "onnxruntime/capi/onnxruntime.dll");
-        assert_eq!(win.sha256.as_deref().map(str::len), Some(64));
+        assert_eq!(win.sha256.len(), 64);
         assert!(
             win.extra_members
                 .iter()
@@ -741,7 +698,7 @@ mod tests {
         let linux = lookup_download("linux", "x86_64", "openvino").expect("openvino linux entry");
         assert_eq!(linux.version, "1.24.1");
         assert_eq!(linux.dylib_member, "onnxruntime/capi/libonnxruntime.so.1.24.1");
-        assert_eq!(linux.sha256.as_deref().map(str::len), Some(64));
+        assert_eq!(linux.sha256.len(), 64);
         assert!(
             linux
                 .extra_members
@@ -763,6 +720,7 @@ mod tests {
         let cpu = lookup_download("macos", "aarch64", "cpu").expect("macos cpu entry");
         assert_eq!(coreml.url, cpu.url, "coreml must reuse the cpu osx archive");
         assert_eq!(coreml.sha256, cpu.sha256);
+        assert_eq!(coreml.size, cpu.size);
         assert_eq!(coreml.dylib_member, cpu.dylib_member);
     }
 
@@ -873,32 +831,5 @@ mod tests {
             );
         }
         assert!(!build_shipped_here("no-such-build"));
-    }
-
-    #[test]
-    fn sha256_matches_known_vector() {
-        // NIST test vector: SHA256("abc").
-        assert_eq!(
-            sha256_hex(b"abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-    }
-
-    #[test]
-    fn verify_sha256_file_accepts_and_rejects() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("ort_manifest_test_{}.bin", std::process::id()));
-        std::fs::write(&path, b"abc").expect("write temp fixture");
-
-        let ok = verify_sha256_file(
-            &path,
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        );
-        assert!(ok.is_ok());
-
-        let bad = verify_sha256_file(&path, &"0".repeat(64));
-        assert!(matches!(bad, Err(OrtRuntimeError::ChecksumMismatch { .. })));
-
-        std::fs::remove_file(&path).ok();
     }
 }

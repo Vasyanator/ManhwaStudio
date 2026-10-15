@@ -27,7 +27,9 @@ Coverage:
 - no emitter => no frames, still a correct terminal response;
 - request validation: empty blob, non-object ``params``, ``params`` absent/None;
 - error mapping: ValueError / FileNotFoundError / generic Exception propagate;
-- cancel before start and cancel observed after the service returns;
+- cancel before start and cancel observed after the service returns; the cancel
+  event reaches the service as ``should_cancel`` and a cancelled download
+  becomes ``Interrupted``;
 - `watermark.status` passes the catalog through; `watermark.unload` returns
   ``{"unloaded": bool}``.
 """
@@ -116,7 +118,9 @@ class _FakeWatermarkService:
         image_png: bytes,
         params: dict[str, Any] | None = None,
         progress_callback: Any = None,
+        should_cancel: Any = None,
     ) -> dict[str, Any]:
+        self.should_cancel = should_cancel
         self.detect_calls.append((image_png, params if params is not None else {}))
         self._replay(progress_callback)
         if self._raise_exc is not None:
@@ -128,7 +132,9 @@ class _FakeWatermarkService:
         image_png: bytes,
         params: dict[str, Any] | None = None,
         progress_callback: Any = None,
+        should_cancel: Any = None,
     ) -> dict[str, Any]:
+        self.should_cancel = should_cancel
         self.remove_calls.append((image_png, params if params is not None else {}))
         self._replay(progress_callback)
         if self._raise_exc is not None:
@@ -519,6 +525,42 @@ def test_exception_during_cancel_maps_to_interrupted(
     handler = get_handler(method)
     with pytest.raises(Interrupted):
         handler(ctx, {"params": {}}, IMAGE_PNG, cancel)
+
+
+@pytest.mark.parametrize(
+    ("method", "service_attr"),
+    [
+        (METHOD_WATERMARK_DETECT, "detect_mask_bytes"),
+        (METHOD_WATERMARK_REMOVE, "remove_watermark_bytes"),
+    ],
+)
+def test_the_cancel_event_reaches_the_service_and_a_cancelled_download_is_interrupted(
+    method: str, service_attr: str
+) -> None:
+    # The service's downloads poll `should_cancel`; a cancel mid-download raises
+    # `DownloadCancelled` (deliberately not a RuntimeError), which the handler
+    # must report as an interruption.
+    from modules.ai_backend.engines.model_download import DownloadCancelled
+
+    svc = _FakeWatermarkService(progress=[])
+    ctx = _ctx(svc)
+    cancel = threading.Event()
+    orig = getattr(svc, service_attr)
+    seen: list[bool] = []
+
+    def download_then_cancel(*args: Any, **kwargs: Any) -> Any:
+        orig(*args, **kwargs)
+        should_cancel = kwargs["should_cancel"]
+        seen.append(should_cancel())
+        cancel.set()
+        seen.append(should_cancel())
+        raise DownloadCancelled("Загрузка файла отменена: model_best.pth.tar")
+
+    setattr(svc, service_attr, download_then_cancel)
+    handler = get_handler(method)
+    with pytest.raises(Interrupted):
+        handler(ctx, {"params": {}}, IMAGE_PNG, cancel)
+    assert seen == [False, True]
 
 
 # ---------------------------------------------------------------------------

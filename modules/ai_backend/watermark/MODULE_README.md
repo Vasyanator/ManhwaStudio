@@ -13,12 +13,13 @@ watermark adequately but reconstruct comic line art badly, so the intended flow 
 
 ## Architecture
 ```
-service.py  WatermarkRemovalService  — params, weights download, residency, detect/remove
-     │
+service.py  WatermarkRemovalService  — params, weight pins + Drive confirm, residency,
+     │                                 detect/remove
      ▼
-code_fetch.py                        — pinned manifest, SHA-256 download, sandboxed import,
+code_fetch.py                        — pinned manifest, verified download, sandboxed import,
      │                                 network construction (no weights)
      ▼
+../engines/model_download.py         — the retrying transfer both files download through
 ../runtime/                          — paths, LoadedModelManager, rocm_mmap_transfer
 ```
 `code_fetch.py` never touches weights and never imports `service.py`. `service.py` is the only
@@ -41,12 +42,16 @@ package-absolute imports and do not import from a flat dump.
   download, the import machinery, and `build_network()`. Edit this to add a model, change a pin,
   or change how the closures are imported.
 - `service.py`: `WatermarkRemovalService`, `normalize_detect_params`, `normalize_remove_params`,
-  the Google Drive weight download, and the detect/remove algorithms. Edit this for parameters,
+  the weight pins (`WEIGHTS`), the Google Drive confirm hook, and the detect/remove algorithms. Edit this for parameters,
   tiling, device handling or residency.
 - `test_code_fetch.py`, `test_service.py`: unit tests. Neither needs torch, weights, a GPU, or
-  the network.
+  the network: the transport and the clock are injected (`get=`, `sleep=`).
 
 ## Contracts and invariants
+
+`health()` never takes `_lock` (held across load and run): it reads the service's
+`runtime.health_snapshot.HealthSnapshot`, republished by `_publish_health_locked()` at every
+reported-state change (`runtime/MODULE_README.md`).
 
 ### The network code is downloaded, never vendored
 None of the three upstream repositories has a LICENSE file, so their source must not enter this
@@ -56,7 +61,11 @@ this imposes are not negotiable:
 - **Commit SHAs are pinned**, never branch names — a moved branch silently changes what the user
   executes.
 - **Every downloaded file is SHA-256 verified and a mismatch is fatal.** This is executable code
-  arriving over the network; the check is not a warning and has no override.
+  arriving over the network; the check is not a warning and has no override. The transfer itself
+  (`../engines/model_download.download_http_to_path`: retry, `Range` resume, staged publish) checks
+  the pinned size and digest before publishing; a file present with the wrong bytes is deleted
+  and fetched again. That download-time check only decides what is published — the guarantee the
+  loader relies on is the next rule.
 - **The bytes that are hashed are the bytes that run.** `_load_module` reads each manifest file
   ONCE into memory, hashes that buffer, and `compile()`s + `exec()`s that same buffer. The import
   system is never handed a path, so there is no window in which a file could be swapped between
@@ -93,17 +102,17 @@ difference that fails `load_state_dict`. `use_refine=True`, `k_refine=3` and `k_
 equally mandatory. Verified parameter counts: SLBR 21 390 953, WDNet 21 043 848,
 SplitNet 32 606 396.
 
-### Weight integrity is only partially verifiable today
+### Weight integrity
 The three checkpoints come from their authors' original Google Drive locations (they are not
-re-hosted — that would be republication of unlicensed weights). **Their SHA-256 digests are not
-known yet**: Drive was unreachable when the manifest was captured, so `_WEIGHT_SHA256` holds
-`None` for all three, meaning "unverified", and the digest comparison is skipped with a log line
-saying so. Fill an entry in once a real download has been hashed; never invent a value.
+re-hosted — that would be republication of unlicensed weights). Each is pinned in `WEIGHTS` by its
+exact size and SHA-256, hashed from a real download: a file at another size is not "present" (and
+`are_weights_ready` / `watermark.status` say so) and is refetched; a completed download whose
+digest differs is deleted, never published. Change a pin only from a real download's hash; never
+invent a value.
 
 Independently of that, `_validate_checkpoint_magic` runs on **every** download and **every** load
-and rejects anything whose first bytes are neither a zip container nor a protocol≥2 pickle stream.
-That is what catches a Google Drive HTML interstitial silently saved as a `.pth.tar`, which is the
-realistic failure mode here.
+and rejects anything whose first bytes are neither a zip container nor a protocol≥2 pickle stream,
+so an HTML page never reaches torch.
 
 Checkpoints load with `map_location="cpu"` (their tensors are tagged `cuda:0`) and an **explicit**
 `weights_only=True` — not inherited from the installed torch's default, which only flipped in
@@ -112,14 +121,23 @@ defensively. `load_state_dict` is strict: a partially loaded network produces ga
 degraded result. Torch's restricted unpickler is **never** bypassed — its refusal is turned into
 an explicit error instead.
 
-Checkpoint downloads go through `../engines/model_download.py`, shared with `inpaint/flux_fill.py`:
-serialized per destination path, staged into a **process-private** `<name>.<pid>.part`, gated by
-`verify` (the magic-byte check plus the optional SHA-256) and only then published with `os.replace`.
+Checkpoint downloads go through `../engines/model_download.download_http_to_path`: serialized per
+destination path, staged into a **process-private** `<name>.<pid>.part`, retried with backoff and
+resumed with `Range` on a transient failure (a failed run parks its bytes under `<name>.part` for
+the next one), gated by the pinned size + SHA-256 and the magic-byte `verify`, and only then
+published with `os.replace`. Drive's virus-scan confirm form is the transfer's `follow` hook
+(`_drive_confirm_follow`): files over ~100 MB answer the first GET with an HTML form, the hook
+parses `confirm` / `uuid` and the transfer requests the confirm URL over the same
+`requests.Session` (the cookie); because the hook runs INSIDE each attempt, a retry repeats the
+confirm step against a fresh form. A second HTML page is a permanent refusal, never streamed.
 `ensure_model_assets` deliberately runs outside the service lock (a download must never block
-`health()`, `unload()` or an eviction) and the IPC layer dispatches onto a thread pool, so without
-that serialization two concurrent first-use requests would stream into one destination. The waiter
-re-checks after acquiring the lock rather than refetching 80–130 MiB. `service.py` still owns the
-transport (the `requests.Session` and Drive's confirm interstitial) and the integrity gate.
+`health()`, `unload()` or an eviction) and the IPC layer dispatches onto a thread pool; the
+per-destination serialization makes the waiter of two concurrent first uses re-check and skip the
+80–130 MiB refetch. Retry waits reach the UI as `download` progress frames whose label is
+`retry_progress_label` (no protocol field). The `watermark.detect` / `.remove` handlers pass
+their cancel event as `should_cancel`, which both downloads (code and weights) poll per chunk and
+during retry waits; a cancel raises `DownloadCancelled`, parks the bytes for a resume, and the
+handler reports `Interrupted`.
 
 ### Resolution strategy
 - **`detect` never tiles.** The image is downscaled so its long side is `downscale_to`
@@ -175,15 +193,16 @@ transport (the `requests.Session` and Drive's confirm interstitial) and the inte
 ## Editing map
 - To change the pinned upstream commits, the file manifest or the import/stub machinery, see
   `code_fetch.py` (`_REPOS`, `_NETWORK_MODULE`, `_PACKAGE_STUBS`, `_MODULE_STUBS`,
-  `_OWNED_NAMESPACES`).
+  `_OWNED_NAMESPACES`) — and `_download_verified` for how a manifest file is fetched.
 - To add a fourth model: add a `_RepoSpec` **in dependency order** with a `module` name per file,
   plus `_NETWORK_MODULE`, `_OWNED_NAMESPACES`, `_PACKAGE_STUBS`, `_MODULE_STUBS` entries and a
-  `build_network` branch in `code_fetch.py`; a `_WeightSpec` and a `_WEIGHT_SHA256` entry in
-  `service.py`; and an output case in `_select_outputs`.
-- To record a checkpoint digest once one is known: `_WEIGHT_SHA256` in `service.py`.
+  `build_network` branch in `code_fetch.py`; a `_WeightSpec` (Drive id, file name, exact size,
+  SHA-256 from a real download) in `service.py`; and an output case in `_select_outputs`.
+- To change a checkpoint pin: `WEIGHTS` in `service.py`.
 - To change parameters, clamping, tiling geometry or the feather: `normalize_*_params`,
   `_plan_tiles`, `_axis_offsets`, `_feather_window` in `service.py`.
-- To change the Drive download or the confirm flow: `_download_from_google_drive` /
-  `_build_confirm_url` in `service.py`. To change the staging/serialization/atomic-publish envelope
-  itself, edit `../engines/model_download.py` — `inpaint/flux_fill.py` shares it.
+- To change the Drive confirm flow: `_drive_confirm_follow` / `_build_confirm_url` in
+  `service.py`; the weight transfer call: `_ensure_weights` / `_download_weights`. To change retry,
+  resume, staging, serialization or the atomic publish, edit `../engines/model_download.py` —
+  FLUX and Reline share it.
 - The IPC surface (`watermark.*` handlers, method constants) lives in `../ipc/`, not here.

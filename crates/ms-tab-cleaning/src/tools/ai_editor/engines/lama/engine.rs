@@ -10,7 +10,7 @@ Main responsibilities:
 - hold the settings, the model-scan state, the run channel and the unload channel;
 - implement `AiEngine` — id, caption, section, constraints, mask layer, the run gate, the
   run itself and the per-frame `poll`;
-- draw the «Редактор области» panel body: the mask note, the model picker with its presence
+- draw the pinned progress (the checkpoint download a run performs) and the «Редактор области» panel body: the mask note, the model picker with its presence
   status, the parameters of the SELECTED model's method, and the unload button.
 
 Key structures:
@@ -57,8 +57,9 @@ pub struct LamaEngine {
     save_rx: Option<Receiver<()>>,
     /// Lifecycle of the background presence scan of both model directories.
     model_list: LamaModelListState,
-    /// Channel of the run in flight, `None` when idle.
-    run_rx: Option<Receiver<Result<egui::ColorImage, String>>>,
+    /// The run in flight, `None` when idle. Dropping it (cancel, engine drop) stops a
+    /// checkpoint download the run performs.
+    run_rx: Option<EngineRunJob>,
     /// The engine's own status line under the parameters.
     run_status: Option<String>,
     /// Channel of the unload call in flight, paired with the METHOD it was sent for.
@@ -408,6 +409,13 @@ impl AiEngine for LamaEngine {
         false
     }
 
+    /// The checkpoint's download while the run performs it; nothing otherwise.
+    fn draw_progress(&mut self, ui: &mut egui::Ui) {
+        if let Some(event) = self.run_rx.as_ref().and_then(EngineRunJob::download) {
+            draw_model_download_status(ui, event);
+        }
+    }
+
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
         // The mask MEANING, stated in the engine's own body: it is the inverse of FLUX.2
         // klein's, and the two engines share one frame and one brush.
@@ -503,11 +511,7 @@ impl AiEngine for LamaEngine {
         let spec = settings.spec();
         let mask = mask.clone();
         let region = request.region;
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let _send_result = tx.send(run_lama(&region, &mask, spec, &settings));
-        });
-        self.run_rx = Some(rx);
+        self.run_rx = Some(EngineRunJob::spawn(move |downloads| run_lama(&region, &mask, spec, &settings, downloads)));
         // Cleared, not set to «идёт обработка»: the host's own panel line and the frame
         // chrome already say a run is in flight. What this must not do is keep showing the
         // PREVIOUS run's outcome underneath a new one.
@@ -521,10 +525,10 @@ impl AiEngine for LamaEngine {
         self.poll_unload();
         self.poll_and_maybe_save();
 
-        let Some(rx) = self.run_rx.as_ref() else {
+        let Some(job) = self.run_rx.as_mut() else {
             return EnginePoll::Idle;
         };
-        match rx.try_recv() {
+        match job.try_finished() {
             Ok(Ok(image)) => {
                 self.run_rx = None;
                 self.run_status =
@@ -555,7 +559,8 @@ impl AiEngine for LamaEngine {
         }
     }
 
-    /// Detaches the run in flight: its answer is dropped and the next poll answers `Idle`.
+    /// Detaches the run in flight: its answer is dropped and the next poll answers `Idle`;
+    /// dropping the job stops a checkpoint download it is still performing.
     ///
     /// The backend keeps working to the end of the pass. `inpaint.lama_v2` /
     /// `inpaint.lama_mpe` are plain request/response calls, and the plain `call` never hands
@@ -666,12 +671,13 @@ mod tests {
     fn the_run_gate_reports_only_a_run_in_flight() {
         let mut engine = LamaEngine::new();
         assert!(engine.run_block_reason().is_none());
-        let (_tx, rx) = mpsc::channel();
-        engine.run_rx = Some(rx);
+        let (job, _tx, download_cancel) = EngineRunJob::for_test();
+        engine.run_rx = Some(job);
         assert!(engine.run_block_reason().is_some());
         engine.cancel();
         assert!(engine.run_block_reason().is_none(), "cancel releases the gate");
         assert!(engine.run_status.is_some(), "cancel says so in the status slot");
+        assert!(download_cancel.load(std::sync::atomic::Ordering::Relaxed), "cancel stops the run's model download");
     }
 
     /// A region that breaks the DECLARED constraints is refused by `start`, not encoded onto

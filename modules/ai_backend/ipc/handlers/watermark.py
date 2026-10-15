@@ -25,6 +25,11 @@ FLUX two-phase contract — ``phase:"download"`` (``step``/``total`` in BYTES,
 ``label`` naming the file) and ``phase:"generate"`` (tiles/steps done / total).
 No preview blob. The emitter is read defensively: when the dispatcher attached
 none (non-streaming call path, tests), progress emission is a no-op.
+
+Cancel: both long methods hand ``cancel_event.is_set`` to the service as
+``should_cancel``, so a first-use download (and its retry waits) stops
+mid-flight; any service error raised while the event is set becomes
+``Interrupted``.
 """
 
 from __future__ import annotations
@@ -117,8 +122,8 @@ def _handle_watermark_detect(
     dilate_px) inline. Response: blob = L8 mask PNG at the input resolution,
     header = ``model`` / ``device`` / ``source_size`` / ``mask_coverage``.
 
-    Raises Interrupted when ``cancel_event`` is set before the service call or
-    once it returns; ValueError for a malformed request.
+    Raises Interrupted when ``cancel_event`` is set before the service call, while
+    it runs (the service's downloads poll it), or once it returns; ValueError for a malformed request.
     """
     if cancel_event.is_set():
         raise Interrupted("watermark.detect canceled before start.")
@@ -132,6 +137,9 @@ def _handle_watermark_detect(
             image_png,
             params=params,
             progress_callback=on_progress,
+            # Stops a first-use download (and its retry waits) mid-flight; the
+            # `except` below turns the resulting error into `Interrupted`.
+            should_cancel=cancel_event.is_set,
         )
     except (ValueError, FileNotFoundError):
         raise
@@ -166,8 +174,8 @@ def _handle_watermark_remove(
     ``mask_len`` header ints naming the two segment lengths (their sum is always
     the blob length), plus ``model`` / ``device`` / ``source_size``.
 
-    Raises Interrupted when ``cancel_event`` is set before the service call or
-    once it returns; ValueError for a malformed request.
+    Raises Interrupted when ``cancel_event`` is set before the service call, while
+    it runs (the service's downloads poll it), or once it returns; ValueError for a malformed request.
     """
     if cancel_event.is_set():
         raise Interrupted("watermark.remove canceled before start.")
@@ -181,6 +189,9 @@ def _handle_watermark_remove(
             image_png,
             params=params,
             progress_callback=on_progress,
+            # Stops a first-use download (and its retry waits) mid-flight; the
+            # `except` below turns the resulting error into `Interrupted`.
+            should_cancel=cancel_event.is_set,
         )
     except (ValueError, FileNotFoundError):
         raise

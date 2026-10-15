@@ -68,6 +68,7 @@ try:
 except Exception:
     UserConfig = None
 
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.rocm_mmap_transfer import move_module_to
 from .result_format import format_recognition_lines
@@ -149,21 +150,29 @@ class PaddleVlOcrService:
         # Lazily built once per loaded tokenizer; reused across script modes.
         self._token_index: TokenByteIndex | None = None
         self._constraints: dict[str, ScriptConstraint] = {}
+        # Published copy of the health fields; `health()` never takes `_lock`,
+        # which a model load holds (S-014).
+        self._health = HealthSnapshot(ready=False, device=None, model=None, last_error=None)
 
     def health(self) -> dict[str, Any]:
         """Return `{"ready", "device", "model", "last_error"}` for the health snapshot.
 
         `model` echoes the resident variant label (None when nothing is loaded)
-        so Rust can tell whether the ready model is the one it selected.
+        so Rust can tell whether the ready model is the one it selected. Reads
+        only the published snapshot, so it answers while a load holds the
+        instance lock (`ready` is False while a model is being (re)loaded).
         """
-        with self._lock:
-            identity = self._identity
-            return {
-                "ready": self._model is not None,
-                "device": identity.device if identity is not None else None,
-                "model": identity.model if identity is not None else None,
-                "last_error": self._last_error,
-            }
+        return self._health.read()
+
+    def _publish_health_locked(self) -> None:
+        """Republish the health fields from the guarded state; caller holds `self._lock`."""
+        identity = self._identity
+        self._health.publish(
+            ready=self._model is not None,
+            device=identity.device if identity is not None else None,
+            model=identity.model if identity is not None else None,
+            last_error=self._last_error,
+        )
 
     def recognize_image_bytes(
         self,
@@ -235,12 +244,14 @@ class PaddleVlOcrService:
                 )
                 with self._lock:
                     self._last_error = f"PaddleOCR-VL recognition failed: {exc}"
+                    self._publish_health_locked()
                 raise
         finally:
             lease.release()
 
         with self._lock:
             self._last_error = None
+            self._publish_health_locked()
         return format_recognition_lines(
             text,
             join_newlines=join_newlines,
@@ -352,6 +363,7 @@ class PaddleVlOcrService:
             model, processor = _load_model_and_processor(identity.model_dir, identity.device)
         except Exception as exc:
             self._last_error = f"PaddleOCR-VL init failed: {exc}"
+            self._publish_health_locked()
             log.error(
                 "PaddleOCR-VL init failed: model=%s model_dir=%s device=%s error=%s",
                 identity.model,
@@ -367,6 +379,7 @@ class PaddleVlOcrService:
         self._processor = processor
         self._identity = identity
         self._last_error = None
+        self._publish_health_locked()
         log.info(
             "PaddleOCR-VL model ready: model=%s model_dir=%s device=%s",
             identity.model,
@@ -402,12 +415,14 @@ class PaddleVlOcrService:
         return True
 
     def _drop_model_locked(self) -> None:
+        """Forget the resident model, processor and their caches; caller holds `self._lock`."""
         self._model = None
         self._processor = None
         self._identity = None
         # Tokenizer/byte-index belongs to the dropped processor; rebuild on reload.
         self._token_index = None
         self._constraints = {}
+        self._publish_health_locked()
 
     @classmethod
     def _model_key(cls, model: str, device: str) -> str:

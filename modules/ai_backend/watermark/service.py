@@ -8,10 +8,11 @@ Three upstream networks are supported: SLBR (default), WDNet and SplitNet.
 
 Main responsibilities:
 - own the Google-Drive weight download into
-  `ManhwaStudio_AI_Models/side_models/WatermarkRemoval/<model>/`, with byte-level
-  progress and an integrity gate; the serialization, the process-private `.part`
-  staging file and the atomic publish come from `engines/model_download.py`,
-  which `inpaint/flux_fill.py` shares;
+  `ManhwaStudio_AI_Models/side_models/WatermarkRemoval/<model>/`: the Drive
+  confirm-form parsing and the per-file pins (size + SHA-256); the retry with
+  backoff, the `Range` resume, the serialization, the process-private `.part`
+  staging file and the atomic publish come from
+  `engines/model_download.download_http_to_path`;
 - lazily build one resident network at a time under an `RLock`, leased from the
   shared `LoadedModelManager` with key `watermark:<model>:<device>`;
 - `detect_mask_bytes`: a single whole-image pass on a downscaled square copy,
@@ -22,7 +23,7 @@ Main responsibilities:
 
 Key structures:
 - `WatermarkRemovalService`
-- `WEIGHTS` — per-model checkpoint spec (Drive id, file name, expected size).
+- `WEIGHTS` — per-model checkpoint pin (Drive id, file name, exact size, SHA-256).
 
 Key functions:
 - `normalize_detect_params()`, `normalize_remove_params()`
@@ -31,10 +32,9 @@ Notes:
 - The network code itself is NOT vendored (no upstream repository has a
   LICENSE); it is downloaded and imported by `code_fetch.py`.
 - Torch is imported lazily, inside the methods that need it.
-- The SHA-256 of the three checkpoints is not known yet (Google Drive was
-  unreachable when the manifest was captured), so `_WEIGHT_SHA256` holds `None`
-  for all three, meaning "unverified". The magic-byte gate always runs and is
-  what rejects an HTML interstitial silently saved as a `.pth.tar`.
+- The three checkpoints are pinned by exact size and SHA-256 (hashed from a
+  real download). The magic-byte gate additionally runs on every download and
+  every load, so an HTML page never reaches torch.
 - Weight moves go through `runtime.rocm_mmap_transfer.move_module_to` (Form 1);
   the download always completes before that call.
 """
@@ -45,6 +45,7 @@ import io
 import logging
 import re
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -61,7 +62,13 @@ try:
 except Exception:  # pragma: no cover - config is always importable in-app
     UserConfig = None
 
-from ..engines.model_download import download_to_path, stream_response_to_file
+from ..engines.model_download import (
+    GetFn,
+    RetryEvent,
+    download_http_to_path,
+    retry_progress_label,
+)
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.rocm_mmap_transfer import move_module_to
 from . import code_fetch
@@ -87,38 +94,45 @@ DEFAULT_TILE = 512
 DEFAULT_OVERLAP = 64
 
 _DRIVE_URL = "https://drive.usercontent.google.com/download?id={file_id}&export=download"
-_DOWNLOAD_TIMEOUT_S = 120
 
 
+@dataclass(frozen=True)
 class _WeightSpec:
-    """Checkpoint of one model: where it comes from and what it is called on disk."""
+    """Checkpoint of one model: its Drive source, its on-disk name and its pin.
 
-    __slots__ = ("file_name", "drive_id", "size")
+    `size` (bytes) and `sha256` (lowercase hex) are the exact values of the
+    authors' published file, hashed from a real download: a file at another size
+    is not "present" and is refetched, and a completed download whose digest
+    differs is deleted, never published.
+    """
 
-    def __init__(self, file_name: str, drive_id: str, size: int) -> None:
-        self.file_name = file_name
-        self.drive_id = drive_id
-        #: Expected size in bytes, used only for progress accounting - Google
-        #: Drive does not always send a Content-Length.
-        self.size = size
+    file_name: str
+    drive_id: str
+    size: int
+    sha256: str
 
 
-#: Per-model checkpoint sources (dev-docs/watermark_removal_plan.md §3.4).
+#: Per-model checkpoint pins (sources: dev-docs/watermark_removal_plan.md §3.4).
 WEIGHTS: dict[str, _WeightSpec] = {
-    "slbr": _WeightSpec("model_best.pth.tar", "1uTCzubnWZtu3HIXaK8xsXX-7x302ss13", 85_674_000),
-    "wdnet": _WeightSpec("WDNet_G.pkl", "1Tv0iM3ZbM0j3akP9uI1myC18IUnyDNjL", 80_400_000),
+    "slbr": _WeightSpec(
+        "model_best.pth.tar",
+        "1uTCzubnWZtu3HIXaK8xsXX-7x302ss13",
+        85_707_015,
+        "be5c0a89513803c8ce56b1768e0c6296900f6ef76df8cbda12900324f9b1caf9",
+    ),
+    "wdnet": _WeightSpec(
+        "WDNet_G.pkl",
+        "1Tv0iM3ZbM0j3akP9uI1myC18IUnyDNjL",
+        84_295_087,
+        "0156ef376692c911e4804d7226656c9fd395c84ff63ef99411e7b4d5b779686f",
+    ),
     "splitnet": _WeightSpec(
-        "27kpng_model_best.pth.tar", "1KpSJ6385CHN6WlAINqB3CYrJdleQTJBc", 130_600_000
+        "27kpng_model_best.pth.tar",
+        "1KpSJ6385CHN6WlAINqB3CYrJdleQTJBc",
+        130_581_464,
+        "46de16a8a38e4be2c72ac0d8f9971de885fd83c8e8c498d78d0217c05c500719",
     ),
 }
-
-#: Expected SHA-256 per model, or `None` for "not captured yet, unverified".
-#: These are third-party Google Drive files whose digests could not be recorded
-#: when the manifest was written. A `None` entry disables the digest comparison
-#: ONLY - `_validate_checkpoint_magic` still runs on every download and on every
-#: load. Fill an entry in as soon as a real download has been hashed; never
-#: invent a value.
-_WEIGHT_SHA256: dict[str, str | None] = {"slbr": None, "wdnet": None, "splitnet": None}
 
 # Accepted first bytes of a Torch checkpoint: the modern zip container, or a
 # protocol>=2 pickle stream (all three of these files are legacy non-zip saves).
@@ -203,10 +217,15 @@ def weights_path(model_id: str) -> Path:
 
 
 def are_weights_ready(model_id: str) -> bool:
-    """Whether `model_id`'s checkpoint exists and is non-empty."""
+    """Whether `model_id`'s checkpoint exists at exactly its pinned size.
+
+    The same "present" rule the download uses, so the status never reports a
+    file ready that the next run would refetch. The digest is not hashed here
+    (status is queried often; the download verified it before publishing).
+    """
     try:
         path = weights_path(model_id)
-        return path.is_file() and path.stat().st_size > 0
+        return path.is_file() and path.stat().st_size == WEIGHTS[model_id].size
     except (OSError, ValueError):
         return False
 
@@ -230,18 +249,29 @@ class WatermarkRemovalService:
         self._active_model: str | None = None
         self._active_device: str = "cpu"
         self._last_error: str | None = None
+        # Published copy of the health fields; `health()` never takes `_lock`,
+        # which a load and a run hold (S-014).
+        self._health = HealthSnapshot()
+        self._publish_health_locked()
 
     # ---- status / health ----
     def health(self) -> dict[str, Any]:
-        """Current residency snapshot for the `health` IPC method."""
-        with self._lock:
-            return {
-                "ready": self._net is not None,
-                "model": self._active_model or DEFAULT_MODEL,
-                "device": self._active_device,
-                "active_key": self._active_key,
-                "last_error": self._last_error,
-            }
+        """Current residency snapshot for the `health` IPC method.
+
+        Reads only the published snapshot, so it answers while a load or a run
+        holds the instance lock.
+        """
+        return self._health.read()
+
+    def _publish_health_locked(self) -> None:
+        """Republish the health fields from the guarded state; caller holds `self._lock` (or is `__init__`)."""
+        self._health.publish(
+            ready=self._net is not None,
+            model=self._active_model or DEFAULT_MODEL,
+            device=self._active_device,
+            active_key=self._active_key,
+            last_error=self._last_error,
+        )
 
     def status(self) -> dict[str, Any]:
         """Model catalog plus what is already on disk (weights and network code)."""
@@ -269,6 +299,7 @@ class WatermarkRemovalService:
             self._net = None
             self._active_key = None
             self._active_model = None
+            self._publish_health_locked()
             _clear_torch_cache()
             if key is not None:
                 self._model_manager.mark_unloaded(key)
@@ -280,6 +311,7 @@ class WatermarkRemovalService:
         image_png: bytes,
         params: dict[str, Any] | None = None,
         progress_callback: ProgressCb | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Predict the watermark mask of `image_png` at its SOURCE resolution.
 
@@ -292,10 +324,15 @@ class WatermarkRemovalService:
         Returns `{mask_png (L8), model, device, source_size [w, h], mask_coverage}`
         where `mask_coverage` is the fraction of source pixels inside the mask.
 
+        `should_cancel` is polled by the asset downloads (per chunk and during
+        retry waits); the handler passes its cancel event's `is_set`.
+
         # Errors
         Raises `ValueError` for bad parameters or an undecodable image,
         `RuntimeError` for a failed download/load, `FileNotFoundError` when the
-        checkpoint is missing after a download attempt.
+        checkpoint is missing after a download attempt, and
+        `engines.model_download.DownloadCancelled` when `should_cancel` stopped a
+        download.
         """
         import numpy as np
 
@@ -304,7 +341,7 @@ class WatermarkRemovalService:
         source_h, source_w = image_rgb.shape[:2]
         model_id = normalized["model"]
 
-        self.ensure_model_assets(model_id, progress_callback)
+        self.ensure_model_assets(model_id, progress_callback, should_cancel=should_cancel)
 
         work_rgb = _downscale_long_side(image_rgb, normalized["downscale_to"])
         padded, (crop_h, crop_w) = _pad_square_multiple(
@@ -335,6 +372,7 @@ class WatermarkRemovalService:
         image_png: bytes,
         params: dict[str, Any] | None = None,
         progress_callback: ProgressCb | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Run the direct (experimental) network cleaning pass over `image_png`.
 
@@ -357,7 +395,7 @@ class WatermarkRemovalService:
         source_h, source_w = image_rgb.shape[:2]
         model_id = normalized["model"]
 
-        self.ensure_model_assets(model_id, progress_callback)
+        self.ensure_model_assets(model_id, progress_callback, should_cancel=should_cancel)
 
         clean_rgb, soft_mask = self._run_tiled(
             model_id,
@@ -378,58 +416,131 @@ class WatermarkRemovalService:
 
     # ---- assets ----
     def ensure_model_assets(
-        self, model_id: str, progress_callback: ProgressCb | None = None
+        self,
+        model_id: str,
+        progress_callback: ProgressCb | None = None,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> None:
         """Make sure both the network code and the checkpoint of `model_id` are on disk.
 
         Always completes BEFORE any weight is moved to the GPU: the ROCm staging
-        context must never wrap a download.
+        context must never wrap a download. `should_cancel` is polled by both
+        downloads, per chunk and during retry waits.
 
         # Errors
-        Raises `ValueError` for an unknown model and `RuntimeError` when a
-        download or an integrity check fails.
+        Raises `ValueError` for an unknown model, `RuntimeError` when a
+        download or an integrity check fails, and `DownloadCancelled` when
+        `should_cancel` stopped a download (its bytes stay parked for a resume).
         """
         model_id = _normalize_model(model_id)
-        code_fetch.ensure_model_code(model_id, progress_callback)
-        self._ensure_weights(model_id, progress_callback)
+        code_fetch.ensure_model_code(model_id, progress_callback, should_cancel=should_cancel)
+        self._ensure_weights(model_id, progress_callback, should_cancel=should_cancel)
 
-    def _ensure_weights(self, model_id: str, progress_callback: ProgressCb | None) -> None:
-        """Download `model_id`'s checkpoint from Google Drive if it is not present.
+    def _ensure_weights(
+        self,
+        model_id: str,
+        progress_callback: ProgressCb | None,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+        get: GetFn | None = None,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        """Download `model_id`'s checkpoint from Google Drive unless it is present.
 
-        Serialization per destination, the process-private `.part` staging file
-        and the atomic publish belong to `engines.model_download`, so two
-        concurrent first-use requests cannot interleave their bytes into one
-        destination and the loser skips the 80-130 MiB refetch. Every completed
-        download is gated by `_validate_checkpoint_magic` and, when a digest is
-        known, by SHA-256 — before it becomes the checkpoint.
+        The transfer is `download_http_to_path`: serialized per destination (the
+        loser of a race skips the 80-130 MiB refetch), staged into a
+        process-private `.part`, retried with backoff and resumed with `Range`
+        on a transient failure — Drive's confirm form is followed INSIDE every
+        attempt — and published only after the pinned size and SHA-256 and
+        `_validate_checkpoint_magic` passed. `get` / `sleep` are the transport
+        and clock seams; `None` means one `requests.Session` (which carries the
+        confirm cookie between the form and the payload) and `time.sleep`.
+        `should_cancel` is polled per chunk and during retry waits.
 
         # Errors
-        Raises `RuntimeError` on a transport failure, on an HTML interstitial
-        saved instead of a checkpoint, or on a digest mismatch.
+        Raises `RuntimeError` on a permanent transport failure, on exhausted
+        retries, on a second HTML page instead of the checkpoint, or on a size /
+        digest / magic-byte mismatch (the staged bytes are then deleted);
+        `DownloadCancelled` when `should_cancel` stopped the transfer.
         """
+        import requests
+
         spec = WEIGHTS[model_id]
-        total = max(spec.size, 1)
+        dest = weights_path(model_id)
+        if are_weights_ready(model_id):
+            return
         label = f"Скачивание {spec.file_name}"
 
-        def on_chunk(done: int, expected: int) -> None:
-            _emit(progress_callback, "download", done, max(expected, total), label)
+        def on_progress(done: int, expected: int) -> None:
+            _emit(progress_callback, "download", done, max(expected, spec.size), label)
 
-        def fetch(staging: Path) -> None:
-            log.info(
-                "watermark: downloading checkpoint %r (%s) from Google Drive id %s",
-                model_id,
-                spec.file_name,
-                spec.drive_id,
+        def on_retry(event: RetryEvent) -> None:
+            _emit(
+                progress_callback,
+                "download",
+                event.staged_bytes,
+                spec.size,
+                retry_progress_label(spec.file_name, event),
             )
-            _emit(progress_callback, "download", 0, total, "Подготовка загрузки весов…")
-            _download_from_google_drive(spec.drive_id, staging, on_chunk)
 
         def verify(staging: Path) -> None:
             _validate_checkpoint_magic(staging, model_id)
-            _verify_optional_sha256(staging, model_id)
 
-        if download_to_path(weights_path(model_id), fetch, verify=verify):
-            _emit(progress_callback, "download", total, total, f"Скачано {spec.file_name}")
+        url = _DRIVE_URL.format(file_id=spec.drive_id)
+        log.info(
+            "watermark: downloading checkpoint %r (%s, %d bytes) from Google Drive id %s",
+            model_id,
+            spec.file_name,
+            spec.size,
+            spec.drive_id,
+        )
+        _emit(progress_callback, "download", 0, spec.size, "Подготовка загрузки весов…")
+        try:
+            if get is not None:
+                ran = self._download_weights(
+                    url, dest, spec, get, sleep, on_progress, on_retry, verify, should_cancel
+                )
+            else:
+                with requests.Session() as session:
+                    ran = self._download_weights(
+                        url, dest, spec, session.get, sleep, on_progress, on_retry, verify,
+                        should_cancel,
+                    )
+        except requests.HTTPError as exc:
+            log.error("watermark: Google Drive refused %s (id %s): %s", spec.file_name, spec.drive_id, exc)
+            raise RuntimeError(
+                f"Не удалось скачать веса модели с Google Drive (id {spec.drive_id}).\nОшибка: {exc}"
+            ) from exc
+        if ran:
+            _emit(progress_callback, "download", spec.size, spec.size, f"Скачано {spec.file_name}")
+
+    @staticmethod
+    def _download_weights(
+        url: str,
+        dest: Path,
+        spec: _WeightSpec,
+        get: GetFn,
+        sleep: Callable[[float], None] | None,
+        on_progress: Callable[[int, int], None],
+        on_retry: Callable[[RetryEvent], None],
+        verify: Callable[[Path], None],
+        should_cancel: Callable[[], bool] | None,
+    ) -> bool:
+        """One `download_http_to_path` call for `spec`; returns whether a transfer ran."""
+        return download_http_to_path(
+            url,
+            dest,
+            expected_size=spec.size,
+            expected_sha256=spec.sha256,
+            follow=_drive_confirm_follow(url),
+            verify=verify,
+            should_cancel=should_cancel,
+            on_progress=on_progress,
+            on_retry=on_retry,
+            get=get,
+            sleep=sleep,
+        )
 
     # ---- model residency ----
     def _ensure_model_locked(self, model_id: str, device: str, model_key: str) -> Any:
@@ -450,6 +561,7 @@ class WatermarkRemovalService:
         self._net = None
         self._active_key = None
         self._active_model = None
+        self._publish_health_locked()
         _clear_torch_cache()
         if previous is not None:
             self._model_manager.mark_unloaded(previous)
@@ -471,6 +583,7 @@ class WatermarkRemovalService:
         self._active_key = model_key
         self._active_model = model_id
         self._active_device = device
+        self._publish_health_locked()
         log.info("watermark: model %r ready on %s (key %s)", model_id, device, model_key)
         return net
 
@@ -514,9 +627,11 @@ class WatermarkRemovalService:
                     lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 result = run(net)
                 self._last_error = None
+                self._publish_health_locked()
                 return result
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 log.exception("watermark: %r failed on %s", model_id, device)
                 raise
             finally:
@@ -724,61 +839,29 @@ def _is_restricted_unpickler_error(exc: BaseException) -> bool:
 # =====================================================================
 #  Weight download (Google Drive)
 # =====================================================================
-def _download_from_google_drive(
-    file_id: str, dest: Path, on_chunk: Callable[[int, int], None]
-) -> None:
-    """Stream the Drive file `file_id` into `dest`, handling the confirm interstitial.
+def _drive_confirm_follow(base_url: str) -> Callable[[Any, int], str | None]:
+    """The interstitial hook of a Drive transfer from `base_url`.
 
     Files over Drive's 100 MB virus-scan threshold answer the first GET with an
-    HTML form instead of the payload; the `confirm` token and the per-session
-    `uuid` are parsed out of it and the request is repeated over the same
-    `requests.Session`, which carries the cookie. Harmless for the smaller files.
-
-    `on_chunk(done_bytes, expected_bytes)` is called per chunk.
-
-    # Errors
-    Raises `RuntimeError` on a transport error, on a missing `requests`, or when
-    the second attempt is still an HTML interstitial.
+    HTML form instead of the payload; the hook parses the `confirm` token and
+    the per-session `uuid` out of it and hands back the confirm URL, which the
+    shared transfer requests over the same session (the cookie). Any non-HTML
+    answer is the payload. A SECOND HTML page (quota exceeded, file removed) is
+    a permanent refusal, never streamed into the checkpoint.
     """
-    try:
-        import requests
-    except Exception as exc:  # pragma: no cover - requests is in requirements.txt
-        raise RuntimeError(
-            "Для загрузки весов модели удаления водяных знаков требуется пакет requests."
-        ) from exc
 
-    url = _DRIVE_URL.format(file_id=file_id)
-    try:
-        with requests.Session() as session:
-            with session.get(
-                url, stream=True, allow_redirects=True, timeout=_DOWNLOAD_TIMEOUT_S
-            ) as first:
-                first.raise_for_status()
-                if not _looks_like_html(first.headers.get("Content-Type", "")):
-                    stream_response_to_file(first, dest, on_chunk)
-                    return
-                # Over the 100 MB virus-scan threshold: the payload is behind a
-                # confirmation form. `session` carries the cookie it sets.
-                confirm_url = _build_confirm_url(url, first.text)
-            with session.get(
-                confirm_url, stream=True, allow_redirects=True, timeout=_DOWNLOAD_TIMEOUT_S
-            ) as second:
-                second.raise_for_status()
-                if _looks_like_html(second.headers.get("Content-Type", "")):
-                    raise RuntimeError(
-                        "Google Drive вернул HTML-страницу вместо файла весов. "
-                        "Возможно, превышен лимит скачиваний или файл более недоступен."
-                    )
-                stream_response_to_file(second, dest, on_chunk)
-    except RuntimeError:
-        # Already carries an actionable message (interstitial, disk failure).
-        raise
-    except Exception as exc:
-        # `requests`' own exceptions derive from `OSError`, so a disk error must
-        # never be diagnosed here - `stream_response_to_file` owns that case.
-        raise RuntimeError(
-            f"Не удалось скачать веса модели с Google Drive (id {file_id}).\nОшибка: {exc}"
-        ) from exc
+    def follow(response: Any, hop: int) -> str | None:
+        if not _looks_like_html(response.headers.get("Content-Type", "")):
+            return None
+        if hop >= 1:
+            log.error("watermark: Google Drive answered the confirm request with HTML again")
+            raise RuntimeError(
+                "Google Drive вернул HTML-страницу вместо файла весов. "
+                "Возможно, превышен лимит скачиваний или файл более недоступен."
+            )
+        return _build_confirm_url(base_url, response.text)
+
+    return follow
 
 
 def _build_confirm_url(base_url: str, html: str) -> str:
@@ -837,40 +920,6 @@ def _validate_checkpoint_magic(path: Path, model_id: str) -> None:
         f"Файл весов модели «{model_id}» не является checkpoint'ом torch. {hint}\n"
         f"Файл: {path}\nПервые байты: {head!r}"
     )
-
-
-def _verify_optional_sha256(path: Path, model_id: str) -> None:
-    """Compare `path` against the pinned digest when one is known.
-
-    A `None` entry in `_WEIGHT_SHA256` means the digest has not been captured
-    yet; the file is then accepted on the magic-byte gate alone and the fact is
-    logged, so an unverified weight is never silently indistinguishable from a
-    verified one.
-
-    # Errors
-    Raises `RuntimeError` on a mismatch.
-    """
-    import hashlib
-
-    expected = _WEIGHT_SHA256.get(model_id)
-    if expected is None:
-        log.info(
-            "watermark: checkpoint %r accepted without a SHA-256 comparison "
-            "(no digest recorded for this file yet); magic-byte check passed",
-            model_id,
-        )
-        return
-
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(chunk)
-    actual = digest.hexdigest()
-    if actual != expected:
-        raise RuntimeError(
-            f"Проверка целостности весов модели «{model_id}» не пройдена.\n"
-            f"Файл: {path}\nОжидалось: {expected}\nПолучено:  {actual}"
-        )
 
 
 # =====================================================================

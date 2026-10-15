@@ -1,0 +1,32 @@
+[package]
+name = "ms-download"
+version = "0.1.0"
+edition = "2024"
+
+# Resumable, retrying, cancellable HTTP download engine (one file into a `.part`, verified
+# publishing, small in-memory bodies, atomic zip-member extraction) and the process-wide
+# busy guard. GUI-free, no i18n, no config: consumers own the worker thread, the URL,
+# the staging and destination paths, the pins and all user-facing text.
+# Native-only: `lib.rs` is `#![cfg(not(target_arch = "wasm32"))]`, so on wasm the crate is
+# empty and pulls nothing in.
+
+[features]
+# Exposes `test_support` (a scripted in-memory `RangeFetcher`) to dependents' tests. Enabled
+# only from `[dev-dependencies]`, never from a normal dependency edge.
+test-support = []
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Retry and restart warnings of the stream (`ms_log::runtime_log`).
+ms-log = { path = "../ms-log" }
+# The caller's running content hash is a `sha2::Sha256`; the stream feeds and resets it.
+sha2.workspace = true
+# Typed public error `DownloadError`.
+thiserror.workspace = true
+# Production HTTP client behind `UreqFetcher`.
+ureq.workspace = true
+# Archive reader of `unpack::zip_member_atomic`.
+zip.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Unique, self-removing scratch directories for the stream tests.
+tempfile.workspace = true

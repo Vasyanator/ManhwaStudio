@@ -18,10 +18,15 @@ Key functions:
 - `loadable_clean_overlay`: the "staged over committed" clean resolution per page.
 - `decode_idx_within_window`, `decode_worker_count`, `should_seed_page_cache_on_initial_load`.
 
+- `run_decode_pool`: starts and joins the workers of one pool (spawn failures handled here).
+
 Notes:
 Both pool joiners send `Finished` only after every worker returned, so a `Finished` event means
 every job kind of that pool is done. A worker panic is logged by the joiner and does not stop the
-`Finished` event.
+`Finished` event. Every thread goes through `ms_thread::Builder`: a pool thread the OS refuses is
+returned as `Err` to the GUI-side caller (which reports the pages); a refused decode worker is
+logged and the pool runs with fewer workers, or with one inline on the joiner thread when none
+started.
 */
 
 use super::decode::{DecodedPage, PreparedOverlay, decode_overlay, decode_page, decode_page_rgba};
@@ -125,6 +130,11 @@ pub(super) enum PageCacheLoaderEvent {
 /// pages ahead of it so decoded-but-unpromotable pages cannot pile up unbounded. The job queue is
 /// popped in ascending page-index order, which keeps that look-ahead window deadlock-free.
 /// `shutdown` releases parked workers once the GUI stops draining the channels.
+///
+/// # Errors
+/// Returns the OS error when the pool thread itself could not be started: nothing runs and no
+/// event is ever sent (both senders are dropped, so the receivers disconnect); the caller must
+/// report every page as failed itself (`PageResidency::spawn`).
 pub(super) fn spawn_loader_thread(
     pages: Vec<(usize, PathBuf)>,
     overlay_candidates: Vec<(usize, PageCleanPaths, PathBuf)>,
@@ -133,8 +143,9 @@ pub(super) fn spawn_loader_thread(
     cache_pages_immediately: bool,
     promotion_progress: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
-) {
-    thread::spawn(move || {
+) -> std::io::Result<()> {
+    // The handle is dropped: the pool thread is detached and answers only through its channels.
+    let _detached = thread::Builder::new().name("page-loader-pool".to_owned()).spawn(move || {
         // Overlay candidates are filtered for existence here, off the GUI thread, so opening a
         // project does not pay a per-page `stat` on slow filesystems. Pages without an overlay
         // file simply contribute no overlay job.
@@ -172,15 +183,14 @@ pub(super) fn spawn_loader_thread(
 
         let worker_count = decode_worker_count(merged.len());
         let jobs = Arc::new(Mutex::new(VecDeque::from(merged)));
-        let mut workers = Vec::with_capacity(worker_count);
 
-        for _ in 0..worker_count {
+        let make_worker = || {
             let tx = tx.clone();
             let overlay_tx = overlay_tx.clone();
             let jobs = Arc::clone(&jobs);
             let promotion_progress = Arc::clone(&promotion_progress);
             let shutdown = Arc::clone(&shutdown);
-            workers.push(thread::spawn(move || {
+            move || {
                 loop {
                     let job = {
                         let mut queue =
@@ -251,10 +261,9 @@ pub(super) fn spawn_loader_thread(
                         }
                     }
                 }
-            }));
-        }
-
-        join_decode_workers(workers, "source/overlay");
+            }
+        };
+        run_decode_pool("source/overlay", worker_count, make_worker, spawn_decode_worker);
 
         // Both `Finished` events are deliberately sent only after the whole pool drains, so
         // `loader_finished` and `overlay_loader_finished` each imply both job kinds are done.
@@ -262,7 +271,48 @@ pub(super) fn spawn_loader_thread(
         // is nobody left to tell, so the error carries no information.
         let _ = tx.send(LoaderEvent::Finished);
         let _ = overlay_tx.send(OverlayLoaderEvent::Finished);
-    });
+    })?;
+    Ok(())
+}
+
+/// Starts one decode worker thread (the production `spawn` of [`run_decode_pool`]).
+fn spawn_decode_worker<W: FnOnce() + Send + 'static>(work: W) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new().name("page-decode-worker".to_owned()).spawn(work)
+}
+
+/// Runs one decode pool (`pool` names it in the log): starts up to `worker_count` workers, each
+/// built by `make_worker` and started through `spawn`, then joins them (`join_decode_workers`).
+///
+/// The workers share one job queue, so any number of them drains it. When `spawn` refuses a
+/// worker (OS thread limit, low memory) the refusal is logged and no further start is tried; when
+/// it refused the very first one, one worker runs inline on the calling joiner thread instead, so
+/// every job is still decoded and the pool's `Finished` still follows. Returns once every worker
+/// (inline or spawned) returned.
+fn run_decode_pool<W, M, S>(pool: &str, worker_count: usize, mut make_worker: M, mut spawn: S)
+where
+    W: FnOnce() + Send + 'static,
+    M: FnMut() -> W,
+    S: FnMut(W) -> std::io::Result<JoinHandle<()>>,
+{
+    let mut workers = Vec::with_capacity(worker_count);
+    for started in 0..worker_count {
+        match spawn(make_worker()) {
+            Ok(worker) => workers.push(worker),
+            Err(err) => {
+                runtime_log::log_error(format!(
+                    "[loader] could not start a {pool} decode worker thread ({started} of {worker_count} started); error={err}. Possible cause: the OS thread limit or low memory; the pool continues with the workers it has"
+                ));
+                break;
+            }
+        }
+    }
+    if workers.is_empty() {
+        runtime_log::log_warn(format!(
+            "[loader] no {pool} decode worker thread could be started; decoding on the pool thread itself"
+        ));
+        make_worker()();
+    }
+    join_decode_workers(workers, pool);
 }
 
 /// Joins every worker of one decode pool (`pool` names it in the log). A panicked worker is
@@ -386,11 +436,16 @@ pub(super) fn collect_missing_page_cache_jobs(
 
 /// Spawns the page-cache loader: decodes `jobs` (`(page_idx, path)`) into plain RGBA in a worker
 /// pool and streams them over `tx`, then sends `Finished` once every worker returned.
+///
+/// # Errors
+/// Returns the OS error when the pool thread could not be started: nothing runs, `tx` is dropped
+/// and the caller gives the optional page cache up (`PageResidency::ensure_page_cache_loader_started`).
 pub(super) fn spawn_page_cache_loader_thread(
     jobs: Vec<(usize, PathBuf)>,
     tx: SyncSender<PageCacheLoaderEvent>,
-) {
-    thread::spawn(move || {
+) -> std::io::Result<()> {
+    // The handle is dropped: the pool thread is detached and answers only through `tx`.
+    let _detached = thread::Builder::new().name("page-cache-loader-pool".to_owned()).spawn(move || {
         if jobs.is_empty() {
             // A send error means the GUI side dropped its receiver (the app was torn down):
             // there is nobody left to tell, so the error carries no information.
@@ -400,12 +455,11 @@ pub(super) fn spawn_page_cache_loader_thread(
 
         let worker_count = decode_worker_count(jobs.len());
         let queue = Arc::new(Mutex::new(VecDeque::from(jobs)));
-        let mut workers = Vec::with_capacity(worker_count);
 
-        for _ in 0..worker_count {
+        let make_worker = || {
             let tx = tx.clone();
             let queue = Arc::clone(&queue);
-            workers.push(thread::spawn(move || {
+            move || {
                 loop {
                     let job = {
                         let mut q = queue.lock().unwrap_or_else(|p| p.into_inner());
@@ -426,20 +480,65 @@ pub(super) fn spawn_page_cache_loader_thread(
                         return;
                     }
                 }
-            }));
-        }
-
-        join_decode_workers(workers, "page-cache");
+            }
+        };
+        run_decode_pool("page-cache", worker_count, make_worker, spawn_decode_worker);
         // A send error means the GUI side dropped its receiver (the app was torn down): there is
         // nobody left to tell, so the error carries no information.
         let _ = tx.send(PageCacheLoaderEvent::Finished);
-    });
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DECODE_AHEAD_WINDOW, decode_idx_within_window, should_seed_page_cache_on_initial_load};
+    use super::{DECODE_AHEAD_WINDOW, decode_idx_within_window, run_decode_pool, should_seed_page_cache_on_initial_load, spawn_decode_worker};
     use crate::memory_manager::{MemoryBudget, MemoryProfile};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A worker that only counts how many times it ran.
+    fn counting_worker(runs: &Arc<AtomicUsize>) -> impl FnOnce() + Send + 'static {
+        let runs = Arc::clone(runs);
+        move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// When the OS refuses every decode worker, one worker runs inline on the pool thread, so the
+    /// jobs are still decoded and `Finished` still follows.
+    #[test]
+    fn decode_pool_runs_inline_when_no_worker_starts() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut attempts = 0usize;
+        run_decode_pool("test", 4, || counting_worker(&runs), |_work| {
+            attempts += 1;
+            Err(std::io::Error::other("thread limit"))
+        });
+        assert_eq!(attempts, 1, "a refused start stops further attempts");
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "exactly one inline worker ran");
+    }
+
+    /// A refusal after some workers started keeps the pool on those workers (no inline run).
+    #[test]
+    fn decode_pool_keeps_the_workers_that_started() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut attempts = 0usize;
+        run_decode_pool("test", 4, || counting_worker(&runs), |work| {
+            attempts += 1;
+            if attempts <= 2 { spawn_decode_worker(work) } else { Err(std::io::Error::other("thread limit")) }
+        });
+        assert_eq!(attempts, 3);
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "the two started workers ran and were joined");
+    }
+
+    /// Without refusals every requested worker is started and joined.
+    #[test]
+    fn decode_pool_starts_every_worker() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        run_decode_pool("test", 3, || counting_worker(&runs), spawn_decode_worker);
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+    }
 
     #[test]
     fn initial_page_cache_seed_requires_enabled_cache_and_memory_budget() {

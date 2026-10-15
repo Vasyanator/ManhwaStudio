@@ -13,7 +13,7 @@ edition = "2024"
 rust-version = "1.95"
 
 [workspace]
-members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-local-ai", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-studio-tab", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-input", "crates/ms-platform", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
+members = [".", "crates/ms-backend-ipc", "crates/ms-config", "crates/ms-docstore", "crates/ms-page-ops", "crates/ms-project", "crates/ms-onnx-runtime", "crates/ms-log", "crates/ms-memory", "crates/ms-text-util", "crates/ms-text-render", "crates/ms-actions", "crates/ms-storage", "crates/ms-sysprobe", "crates/ms-download", "crates/ms-thread", "crates/ms-onnx", "crates/ms-i18n", "crates/ms-gifs", "crates/ms-fonts", "crates/ms-widgets", "crates/ms-theme", "crates/ms-models", "crates/ms-canvas", "crates/ms-tools", "crates/ms-raster", "crates/ms-text-detect", "crates/ms-native-runtime", "crates/ms-local-ai", "crates/ms-tab-typing", "crates/ms-tabs-simple", "crates/ms-studio-tab", "crates/ms-tab-translation", "crates/ms-ai-api", "crates/ms-tab-ps-editor", "crates/ms-tab-page-manager", "crates/ms-tab-cleaning", "crates/ms-window-geometry", "crates/ms-os-integration", "crates/ms-input", "crates/ms-platform", "crates/ms-installer", "crates/ms-settings-ui", "crates/ms-launcher", "crates/puffin_egui"]
 # The Android port forks under `crates/` are separate workspaces patched in below; without
 # this exclusion Cargo would adopt them as implicit members of this workspace.
 exclude = ["crates/winit", "crates/egui"]
@@ -314,7 +314,7 @@ puffin = { version = "0.20.0", optional = true }
 # release when it was vendored. See crates/puffin_egui/Cargo.toml.
 puffin_egui = { path = "crates/puffin_egui", optional = true }
 
-# Native-only dependencies: native sockets / blocking HTTP (ureq,
+# Native-only dependencies: native sockets / blocking HTTP (ms-download,
 # translators, genai+tokio) and dynamic library loading (libloading). None have
 # a usable wasm32-unknown-unknown path with the current API usage; the web build
 # replaces them (fetch, IndexedDB, download) in the web-glue phase. File dialogs and
@@ -326,7 +326,9 @@ puffin_egui = { path = "crates/puffin_egui", optional = true }
 # there and the web entry point installs its own fonts.
 ms-fonts = { path = "crates/ms-fonts" }
 libloading.workspace = true
-ureq.workspace = true
+# The startup update check (`src/update_check.rs`, `fetch_small`: timeouts, bounded retry
+# with backoff, size cap).
+ms-download = { path = "crates/ms-download" }
 translators.workspace = true
 genai.workspace = true
 tokio.workspace = true

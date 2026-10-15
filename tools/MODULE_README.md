@@ -80,6 +80,10 @@ detection cannot be fooled by punctuation inside strings or comments.
   plus its contract tests. Boundary: it may read `Cargo.toml` and drive `git`,
   `rustup` and `cargo`, but must never import or be imported by anything in
   `src/`. See its own `MODULE_README.md`.
+- `model_pins/`: stdlib-only pin generator (`compute_pins.py` + `sources.json`). Downloads
+  each pinned source once into a scratch dir OUTSIDE the repo, hashes it (zip members too)
+  and prints catalog rows (size + sha256) for the Rust / Python download catalogs. Never
+  runs in the app; never imports or unpickles what it downloads. See its `MODULE_README.md`.
 - `i18n_extract.py`: the extraction tool. Modes: `--dry-run` (default, writes
   nothing except an optional `--report` under `docs/`), `--propose <path> -o FILE`
   (emit a key proposal, no `.rs` writes), `--apply <path> --keys FILE` (rewrite

@@ -30,11 +30,18 @@ UI specifics:
 - The shared `ms_ai_api::draw_generation_status` widget (live phase, received
   characters, "Stop" -> `OcrPanelActions::stop_generation`) sits right before the
   "Статус:" block, outside the engine options, whenever an AI API request is in flight.
+- While the shown engine's load / recognize downloads an app-managed model (state
+  `DownloadingModel`), the status line is followed by that download
+  (`model_download_status::draw_model_download_status`, `OcrPanelModelView::engine_download`)
+  and a Cancel -> `OcrPanelActions::cancel_model_download`.
 - Legacy local PaddleOCR engine keys are normalized back to `PaddleOCR`
   by the Translation tab loader.
-- External-model engines (Baberu OCR, PaddleOCR-VL) show the shared download
-  block (`panels::ocr_model_download`) under their options; their load button is
-  enabled only once the model is `Installed`. Baberu OCR sits on the second engine
+- External-model engines (Baberu OCR, PaddleOCR-VL, EasyOCR, Surya) show the shared download
+  block (`panels::ocr_model_download`) for their bundle (`ocr::external_model_specs`: EasyOCR
+  the model of the selected languages' script, Surya both checkpoints) under their options;
+  their load button is enabled only once the bundle is `Installed`. An EasyOCR language list
+  easyocr cannot read is explained by a red line (`ocr::easyocr_lang_error_message`) and
+  blocks the load button instead. Baberu OCR sits on the second engine
   row with a "ja/zh/en only" hint and a warning when the MT source language is
   Korean (`OcrPanelModelView::korean_source`). PaddleOCR-VL has a weight-variant
   `WheelComboBox` (`OcrPanelOptions::paddle_vl_model`) above the script restriction.
@@ -44,10 +51,15 @@ UI specifics:
   `OCR.finger_selection` is ignored.
 */
 
-use crate::ocr::{CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult, external_model_spec};
-use crate::ocr_model_download::OcrModelPanelSnapshot;
+use crate::model_download_status::draw_model_download_status;
+use crate::ocr::{
+    CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult, easyocr_lang_error_message, easyocr_selection,
+    external_model_specs,
+};
+use crate::ocr_model_download::{OcrModelPanelSnapshot, bundle_key};
 use crate::panels::ocr_model_download::{ModelDownloadAction, draw_ocr_model_download, load_blocked_reason};
 use crate::panels::section_header_button;
+use ms_sysprobe::ai_models::ModelDownloadEvent;
 use ms_sysprobe::ai_models::external_catalog::PaddleVlVariant;
 use ms_ai_api::{AiApiConnectionActions, AiApiConnectionState, GenerationSnapshot, draw_connection, draw_generation_status};
 use crate::panels::ocr_langs::{
@@ -243,6 +255,9 @@ pub struct OcrPanelActions {
     pub stop_generation: Option<GenerationSnapshot>,
     /// Download / cancel requested in the external-model download block.
     pub model_download: ModelDownloadAction,
+    /// Cancel of the app-managed model download the engine's load / recognize runs (drawn
+    /// under the status line while the state is `DownloadingModel`).
+    pub cancel_model_download: bool,
 }
 
 /// Per-frame inputs of the OCR panel's external-model parts, lent by the tab.
@@ -250,10 +265,13 @@ pub struct OcrPanelActions {
 pub struct OcrPanelModelView<'a> {
     /// The MT panel's source language is Korean: Baberu OCR cannot read it.
     pub korean_source: bool,
-    /// Download snapshot of the external model of the engine selected at the START of the
-    /// frame (`ocr::external_model_spec`); `None` for engines without one. It is drawn only
-    /// while it still matches the selection after this frame's widgets (`spec_id`).
+    /// Download snapshot of the external model bundle of the engine selected at the START of
+    /// the frame (`ocr::external_model_specs`); `None` for engines without one. It is drawn
+    /// only while it still matches the selection after this frame's widgets (`bundle_key`).
     pub download: Option<&'a OcrModelPanelSnapshot>,
+    /// Latest event of the app-managed model download the shown engine's load / recognize
+    /// runs (`model_download_status::ModelDownloadStatus`); `None` before the first one.
+    pub engine_download: Option<&'a ModelDownloadEvent>,
 }
 
 /// AiRequirement gating the engine-SELECTION button (permissive: MangaOCR is
@@ -593,13 +611,24 @@ pub fn draw_ocr_panel(
     // The snapshot was taken before this frame's engine / variant widgets: right after a
     // switch it describes the previous model, so it is drawn only for the spec it belongs
     // to (the next frame brings the new spec's snapshot).
-    let selected_spec = external_model_spec(options.engine, options.paddle_vl_model);
-    if let (Some(spec), Some(snapshot)) = (selected_spec, model.download)
-        && snapshot.spec_id == spec.id
+    let selected_specs = external_model_specs(options.engine, options.paddle_vl_model, &options.easy_langs);
+    let selected_key = bundle_key(&selected_specs);
+    if !selected_specs.is_empty()
+        && let Some(snapshot) = model.download
+        && snapshot.bundle_key == selected_key
     {
-        actions.model_download = draw_ocr_model_download(ui, spec, snapshot);
+        actions.model_download = draw_ocr_model_download(ui, snapshot);
     }
-    let model_blocked_reason = selected_spec.and_then(|spec| load_blocked_reason(spec, model.download));
+    // An EasyOCR language list easyocr refuses selects no model: say why, and block loading.
+    let easy_lang_error = (options.engine == OcrEngine::EasyOcr)
+        .then(|| easyocr_selection(&options.easy_langs).err())
+        .flatten()
+        .map(|err| easyocr_lang_error_message(&err));
+    if let Some(error) = &easy_lang_error {
+        ui.colored_label(ms_theme::status::ERROR, error);
+    }
+    let model_blocked_reason = easy_lang_error
+        .or_else(|| (!selected_specs.is_empty()).then(|| load_blocked_reason(&selected_key, model.download)).flatten());
     // Outside the engine options (and their collapsible section), so an AI API request in
     // flight stays visible and stoppable whatever is selected or collapsed.
     if generation.active {
@@ -624,6 +653,16 @@ pub fn draw_ocr_panel(
         ui.label(t!("translation.ocr_panel.status_label"));
         ui.colored_label(status_color, status_text);
     });
+    // The engine's own model download (not the external-model block above): which file, the
+    // bar or the retry wait, and a Cancel that ends the command neutrally.
+    if state == OcrLoadState::DownloadingModel {
+        if let Some(event) = model.engine_download {
+            draw_model_download_status(ui, event);
+        }
+        if ui.button(t!("translation.common.cancel_button")).clicked() {
+            actions.cancel_model_download = true;
+        }
+    }
 
     if let Some(err) = last_error
         && !err.is_empty()

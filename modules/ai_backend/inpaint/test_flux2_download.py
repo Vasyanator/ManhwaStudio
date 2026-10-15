@@ -47,31 +47,36 @@ Main responsibilities:
 - verify resume: a parked partial is claimed and continued with `Range`, its
   progress frames start at the resumed offset instead of jumping backwards, a
   server that IGNORES the range rewrites the file instead of appending (the
-  double-length corruption case), a 416 discards and refetches, a cancellation
-  parks the bytes for a second call to finish, a stale partial whose resumed
-  length is wrong is retried exactly once from zero, and the free-space guard
+  double-length corruption case), a 416 discards and refetches, leftovers longer
+  than the announced size are dropped and refetched, a cancellation parks the
+  bytes for a second call to finish, a body that ends cleanly but short is
+  RESUMED (not discarded) after one backoff wait, and the free-space guard
   subtracts what is already staged;
-- verify a body that ends CLEANLY but short is refused before the publish and
-  leaves nothing on disk, that the same file is planned again afterwards, and
-  that a file whose listing announced no size is still published;
+- verify a body that keeps ending short is never published: the retry budget
+  runs out with both lengths in the message, the bytes stay parked, and the same
+  file is planned again afterwards; a file whose listing announced no size is
+  still published;
+- verify a retry is reported as an ordinary progress frame whose `label`
+  announces it, and that a cancel during the backoff wait is `DownloadCanceled`;
 - verify the free-space guard refuses before the first byte with both numbers.
 
 Notes:
-Nothing here touches the network. The listings are fakes, and the one test that
-exercises the real streaming path injects a fake `requests` module into
-`sys.modules` for the duration, so `download_to_path`, `stream_response_to_file`
-and `download_bearer_to_path` all run for real against it.
+Nothing here touches the network. The listings are fakes, and the tests that
+exercise the real streaming path replace the shared primitive's two seams —
+`model_download._default_get` and `model_download._default_sleep` — for the
+duration, so `download_to_path` and `download_bearer_to_path` run for real
+against a fake transport and a clock that never waits.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from modules.ai_backend.engines import model_download as md
 from modules.ai_backend.inpaint import flux2_download as fd
 
 OFFICIAL = fd.OFFICIAL_REPO_9B
@@ -585,6 +590,60 @@ class _FakeHfApi:
         huggingface_hub.HfApi = self._saved  # type: ignore[assignment]
 
 
+class ListingDigestTests(unittest.TestCase):
+    """LFS digests travel from the hub listing into the plan and the transfer."""
+
+    SHA = "ef" * 32
+
+    def test_repo_listing_keeps_the_lfs_digest_and_the_plan_carries_it(self) -> None:
+        import types as _types
+
+        listing = dict(FAKE_4B)
+        planned = fd.resolve_plan({V4B.repo: listing}, variant=V4B, uncensored=False, root="/m")
+        shard = next(item.source for item in planned if item.source.endswith(".safetensors"))
+
+        class _Api:
+            def __init__(self, token: str | None = None) -> None:
+                del token
+
+            def model_info(self, repo: str, files_metadata: bool = False) -> Any:
+                siblings = []
+                for name, size in sorted(listing.items()):
+                    sib = _Sibling(name, size)
+                    sib.lfs = _types.SimpleNamespace(sha256=self_sha) if name == shard else None
+                    siblings.append(sib)
+                return _types.SimpleNamespace(siblings=siblings)
+
+        self_sha = self.SHA
+        with _FakeHfApi(_Api):
+            got = fd.repo_listing(V4B.repo, "")
+
+        self.assertEqual(got[shard], fd.ListedFile(listing[shard], self.SHA))
+        self.assertTrue(all(value.sha256 is None for path, value in got.items() if path != shard))
+        plan = fd.resolve_plan({V4B.repo: got}, variant=V4B, uncensored=False, root="/m")
+        by_source = {item.source: item for item in plan}
+        self.assertEqual(by_source[shard].sha256, self.SHA)
+
+    def test_the_transfer_gets_the_planned_digest(self) -> None:
+        item = fd.PlannedFile(V4B.repo, "a.safetensors", "/m/a.safetensors", "a.safetensors", 10, self.SHA)
+        seen: dict[str, Any] = {}
+
+        def fake_transfer(url: str, dest: str, **kwargs: Any) -> bool:
+            seen.update(kwargs)
+            return True
+
+        saved = (fd.download_bearer_to_path, fd._file_url)
+        fd.download_bearer_to_path = fake_transfer  # type: ignore[assignment]
+        fd._file_url = lambda _item: "https://hf/a"  # type: ignore[assignment]
+        try:
+            fd._fetch_one(item, token="", on_chunk=lambda *_: None, on_retry=lambda _e: None, should_cancel=None)
+        finally:
+            fd.download_bearer_to_path, fd._file_url = saved  # type: ignore[assignment]
+
+        self.assertEqual(seen["expected_sha256"], self.SHA)
+        self.assertEqual(seen["expected_size"], 10)
+
+
 class PerRepositoryTokenTests(unittest.TestCase):
     """The token is put on the wire for GATED repositories only.
 
@@ -1092,32 +1151,52 @@ class _FakeRequests:
 
 
 class _FakeRequestsModule:
-    """`sys.modules` patch installing `_FakeRequests` for the duration of a test."""
+    """Installs a fake transport into the shared primitive's seams for a block.
 
-    def __init__(self, fake: _FakeRequests) -> None:
+    `model_download._default_get` becomes the fake's `get`, and
+    `model_download._default_sleep` records the backoff waits in `sleeps`
+    instead of sleeping, so a retry costs no wall-clock time.
+    """
+
+    def __init__(self, fake: Any) -> None:
         self._fake = fake
         self._saved: Any = None
+        self.sleeps: list[float] = []
 
-    def __enter__(self) -> _FakeRequests:
-        self._saved = sys.modules.get("requests")
-        sys.modules["requests"] = self._fake  # type: ignore[assignment]
+    def __enter__(self) -> Any:
+        self._saved = (md._default_get, md._default_sleep)
+        md._default_get = self._fake.get  # type: ignore[assignment]
+        md._default_sleep = self.sleeps.append  # type: ignore[assignment]
+        self._fake.sleeps = self.sleeps
         return self._fake
 
     def __exit__(self, *exc_info: Any) -> None:
-        if self._saved is None:
-            sys.modules.pop("requests", None)
-        else:
-            sys.modules["requests"] = self._saved
+        md._default_get, md._default_sleep = self._saved  # type: ignore[assignment]
 
 
 class _RangeResponse:
-    """Response that knows its own status, for exercising the resume answers."""
+    """Response that knows its own status, for exercising the resume answers.
 
-    def __init__(self, body: bytes, chunk: int, status: int) -> None:
+    A `206` carries `Content-Range: bytes <start>-<end>/<total>`, which the
+    primitive checks before it appends anything.
+    """
+
+    def __init__(
+        self,
+        body: bytes,
+        chunk: int,
+        status: int,
+        *,
+        start: int = 0,
+        total: int | None = None,
+    ) -> None:
         self._body = body
         self._chunk = chunk
         self.status_code = status
         self.headers = {"Content-Length": str(len(body))}
+        if status == 206:
+            whole = total if total is not None else start + len(body)
+            self.headers["Content-Range"] = f"bytes {start}-{start + len(body) - 1}/{whole}"
 
     def __enter__(self) -> "_RangeResponse":
         return self
@@ -1139,8 +1218,9 @@ class _RangeRequests:
 
     `on_range` picks which legal answer the server gives to a range request:
     `"206"` resumes properly, `"200"` ignores the range and sends the whole body,
-    `"416"` refuses it, and `"short"` resumes but stops ten bytes early WITHOUT
-    raising — the clean-truncation case.
+    `"416"` refuses it, and `"short_once"` resumes but its FIRST ranged answer
+    stops ten bytes early WITHOUT raising — the clean-truncation case — while
+    later ones complete.
     """
 
     def __init__(self, full: bytes, chunk: int = 1024, on_range: str = "206") -> None:
@@ -1148,6 +1228,8 @@ class _RangeRequests:
         self.chunk = chunk
         self.on_range = on_range
         self.calls: list[dict[str, str]] = []
+        self.sleeps: list[float] = []
+        self._short_sent = False
 
     def get(self, url: str, **kwargs: Any) -> _RangeResponse:
         headers = dict(kwargs.get("headers") or {})
@@ -1161,9 +1243,13 @@ class _RangeRequests:
         if self.on_range == "200":
             return _RangeResponse(self.full, self.chunk, 200)
         rest = self.full[start:]
-        if self.on_range == "short":
-            rest = rest[:-10]
-        return _RangeResponse(rest, self.chunk, 206)
+        if self.on_range == "short_once" and not self._short_sent:
+            self._short_sent = True
+            # Announces the whole remainder, delivers less, ends normally.
+            response = _RangeResponse(rest[:-10], self.chunk, 206, start=start, total=len(self.full))
+            response.headers["Content-Length"] = str(len(rest))
+            return response
+        return _RangeResponse(rest, self.chunk, 206, start=start)
 
     @property
     def ranged(self) -> list[str]:
@@ -1300,12 +1386,13 @@ class DownloadLoopTests(unittest.TestCase):
     def test_a_clean_short_body_is_never_published(self) -> None:
         # THE defect this pins. A body that advertises the full length, delivers
         # 7 bytes and ends NORMALLY raises nothing anywhere in the stack: without
-        # the `verify` gate it is renamed to the final name, and every later run
+        # the size gate it is renamed to the final name, and every later run
         # then skips a truncated multi-gigabyte shard forever, surfacing as
-        # corrupt weights at load time.
+        # corrupt weights at load time. A server that keeps doing it exhausts
+        # the retry budget instead.
         short = _FakeRequests(lambda url: b"x" * 7, 1024, announced=4096)
         with _FakeRequestsModule(short) as fake:
-            with self.assertRaises(RuntimeError) as caught:
+            with self.assertRaises(md.RetriesExhaustedError) as caught:
                 fd.download("token", uncensored=False)
 
         message = str(caught.exception)
@@ -1315,8 +1402,14 @@ class DownloadLoopTests(unittest.TestCase):
         self.assertFalse(
             [path for path in self.root.rglob("*") if path.is_file() and path.suffix != ".part"]
         )
-        # It was tried exactly twice: once resuming, once from zero (R4).
-        self.assertEqual(len(fake.calls), 2)
+        # The first attempt made progress, then every retry ended at the same
+        # 7 bytes: one call plus the whole no-progress budget.
+        self.assertEqual(len(fake.calls), 1 + md.RetryPolicy().max_retries)
+        policy = md.RetryPolicy()
+        expected_wait = sum(policy.delay_for(n, None) for n in range(1, policy.max_retries + 1))
+        self.assertAlmostEqual(sum(fake.sleeps), expected_wait)
+        # A short body is not proof of wrong bytes: they stay parked.
+        self.assertEqual(len(list(self.root.rglob("*.part"))), 1)
 
     def test_a_refused_short_file_is_still_planned_afterwards(self) -> None:
         short = _FakeRequests(lambda url: b"x" * 7, 1024, announced=4096)
@@ -1421,44 +1514,124 @@ class DownloadLoopTests(unittest.TestCase):
     def test_a_416_answer_discards_the_partial_and_refetches(self) -> None:
         dest = self._one_file_plan()
         full = b"w" * 4096
-        self._park(dest, b"?" * 9000)
+        self._park(dest, b"?" * 1000)
 
         transport = _RangeRequests(full, on_range="416")
         with _FakeRequestsModule(transport):
             fd.download("token", uncensored=False)
 
         self.assertEqual(dest.read_bytes(), full)
-        # One ranged attempt, refused, then one plain refetch.
+        # One ranged attempt, refused, then one plain refetch — no backoff,
+        # because nothing failed on the network.
         self.assertEqual(len(transport.calls), 2)
-        self.assertEqual(transport.ranged, ["bytes=9000-"])
+        self.assertEqual(transport.ranged, ["bytes=1000-"])
+        self.assertEqual(transport.sleeps, [])
 
-    def test_a_stale_partial_with_a_wrong_length_is_retried_once_from_zero(self) -> None:
+    def test_a_published_file_at_the_wrong_size_is_replaced(self) -> None:
+        # The planner already re-plans it; the transfer must not then skip it as
+        # "present" merely because it is non-empty.
         dest = self._one_file_plan()
-        full = b"e" * 4096
-        self._park(dest, b"?" * 1000)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"?" * 100)
+        full = b"w" * 4096
 
-        # Resuming yields 4086 bytes and ends cleanly: the size gate rejects it,
-        # the staged bytes are discarded, and the file is fetched once from zero.
-        transport = _RangeRequests(full, on_range="short")
+        transport = _RangeRequests(full)
         with _FakeRequestsModule(transport):
             result = fd.download("token", uncensored=False)
 
         self.assertEqual(dest.read_bytes(), full)
-        self.assertEqual(len(transport.calls), 2)
-        self.assertEqual(transport.ranged, ["bytes=1000-"])
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(result["skipped_files"], len(self.SMALL_OFFICIAL) - 1)
+
+    def test_leftovers_longer_than_the_announced_size_are_dropped_and_refetched(self) -> None:
+        dest = self._one_file_plan()
+        full = b"w" * 4096
+        self._park(dest, b"?" * 9000)
+
+        transport = _RangeRequests(full)
+        with _FakeRequestsModule(transport):
+            fd.download("token", uncensored=False)
+
+        self.assertEqual(dest.read_bytes(), full)
+        # Proven-wrong bytes are never offered to the server as a resume point.
+        self.assertEqual(transport.ranged, [])
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_a_clean_short_body_is_resumed_instead_of_discarded(self) -> None:
+        dest = self._one_file_plan()
+        full = bytes(range(256)) * 16
+        self._park(dest, full[:1000])
+
+        # The first resume ends cleanly ten bytes early. Those 3086 new bytes are
+        # right, so the next attempt continues from 4086 instead of from zero.
+        transport = _RangeRequests(full, on_range="short_once")
+        with _FakeRequestsModule(transport):
+            result = fd.download("token", uncensored=False)
+
+        self.assertEqual(dest.read_bytes(), full)
+        self.assertEqual(transport.ranged, ["bytes=1000-", "bytes=4086-"])
+        self.assertAlmostEqual(sum(transport.sleeps), md.RetryPolicy().base_delay_s)
         self.assertFalse(list(self.root.rglob("*.part")))
         self.assertEqual(result["downloaded_bytes"], 4096)
+
+    def test_a_retry_is_an_ordinary_frame_with_a_retry_label(self) -> None:
+        dest = self._one_file_plan()
+        full = b"e" * 4096
+        self._park(dest, full[:1000])
+        frames: list[dict[str, Any]] = []
+
+        def progress(phase: str, step: int, total: int, label: str, **extra: Any) -> None:
+            frames.append({"phase": phase, "step": step, "total": total, "label": label, **extra})
+
+        with _FakeRequestsModule(_RangeRequests(full, on_range="short_once")):
+            fd.download("token", uncensored=False, progress_callback=progress)
+
+        retry = [frame for frame in frames if frame["label"].startswith("Сеть недоступна")]
+        self.assertEqual(len(retry), 1)
+        frame = retry[0]
+        self.assertEqual(frame["phase"], "download")
+        # The staged bytes the retry resumes, at both levels; same frame shape.
+        self.assertEqual(frame["file_step"], 4086)
+        self.assertEqual(frame["file_total"], 4096)
+        self.assertEqual(frame["file_label"], "model_index.json")
+        self.assertIn("1/5", frame["label"])
+        self.assertTrue(frame["label"].endswith("model_index.json"))
+
+    def test_a_cancel_during_the_backoff_wait_is_download_canceled(self) -> None:
+        dest = self._one_file_plan()
+        full = b"e" * 4096
+        self._park(dest, full[:1000])
+        transport = _RangeRequests(full, on_range="short_once")
+
+        def should_cancel() -> bool:
+            # Up only once the first backoff slice has been slept.
+            return bool(transport.sleeps)
+
+        with _FakeRequestsModule(transport):
+            with self.assertRaises(fd.DownloadCanceled):
+                fd.download("token", uncensored=False, should_cancel=should_cancel)
+
+        self.assertEqual(len(transport.sleeps), 1)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertFalse(dest.exists())
+        # The 4086 good bytes are parked for the next run.
+        self.assertEqual(md.staged_bytes(dest), 4086)
 
     def test_cancellation_parks_bytes_that_a_second_call_finishes(self) -> None:
         dest = self._one_file_plan()
         full = b"r" * 4096
-        chunks = {"seen": 0}
+        first = _RangeRequests(full)
+        polls = {"since_get": 0}
 
         def should_cancel() -> bool:
-            chunks["seen"] += 1
-            return chunks["seen"] > 2
+            # Up a few chunk-boundary polls into the transfer, so some bytes but
+            # not all of them are staged when it stops.
+            if not first.calls:
+                return False
+            polls["since_get"] += 1
+            return polls["since_get"] > 3
 
-        with _FakeRequestsModule(_RangeRequests(full)):
+        with _FakeRequestsModule(first):
             with self.assertRaises(fd.DownloadCanceled):
                 fd.download("token", uncensored=False, should_cancel=should_cancel)
 

@@ -55,6 +55,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from ..runtime.health_snapshot import HealthSnapshot
+
 LOG = logging.getLogger(__name__)
 
 BACKEND_SELENIUM = "selenium"
@@ -82,6 +84,10 @@ class BrowserService:
         self._lock = threading.RLock()
         self._backend = BACKEND_SELENIUM
         self._daemon: Optional[Any] = None
+        # Published copy of the health fields; `health()` never takes `_lock`,
+        # which a browser command holds for its whole run (S-014).
+        self._health = HealthSnapshot()
+        self._publish_health_locked()
         # Per-dispatch slots, set under the lock; read by ``_sink`` (which may also
         # run on a daemon background thread, where ``_active_emitter`` is ``None``
         # so stray background progress is harmlessly dropped).
@@ -152,11 +158,18 @@ class BrowserService:
             self._close_daemon()
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "status": "ready" if self._daemon is not None else "idle",
-                "backend": self._backend,
-            }
+        """Return `{"status": "ready" | "idle", "backend"}` from the published snapshot.
+
+        Never takes the command lock, so it answers while a browser command runs.
+        """
+        return self._health.read()
+
+    def _publish_health_locked(self) -> None:
+        """Republish the health fields; caller holds `self._lock` (or is `__init__`)."""
+        self._health.publish(
+            status="ready" if self._daemon is not None else "idle",
+            backend=self._backend,
+        )
 
     # -- internals ----------------------------------------------------------
 
@@ -204,6 +217,7 @@ class BrowserService:
             # Playwright calls on the same owner thread instead of its worker
             # thread, which would otherwise trip the greenlet cross-thread error.
             self._daemon._run_on_browser_thread = self._run_on_browser_thread
+            self._publish_health_locked()
         return self._daemon
 
     def _build_daemon(self, backend: str) -> Any:
@@ -221,10 +235,12 @@ class BrowserService:
             return
         self._close_daemon()
         self._backend = backend
+        self._publish_health_locked()
 
     def _close_daemon(self) -> None:
         daemon = self._daemon
         self._daemon = None
+        self._publish_health_locked()
         if daemon is not None:
             try:
                 # Playwright teardown must run on the same owner thread that

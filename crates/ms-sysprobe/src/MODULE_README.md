@@ -36,22 +36,32 @@ Callers own the threading: nothing here spawns a worker for you.
 - `ai_models.rs`: the app-managed model catalog (`Vasyanator2/ManhwaStudio_AI_Models`).
   Resolves the files a given model needs, then STREAMS each one straight into a
   caller-supplied model root — no Hugging Face cache blobs, no symlinks — through a
-  `<file>.part` next to the target that resumes with `Range`, retries transient failures
-  with backoff (`ai_models/resumable.rs`, shared with the external downloader) and is
-  renamed only after exactly the server-announced size is staged and fsynced, so an
-  interrupted download never leaves a half file that looks present. Download is serialized
-  by a process mutex; the `ensure_*` API has no cancel parameter.
+  `<file>.part` next to the target with `ms_download::fetch_verified` (`Expected::Announced`:
+  `Range` resume, retry with backoff, renamed only after exactly the server-announced size is
+  staged and fsynced; a `.part` resumes only while the server names the same object, and an
+  announced LFS sha256 is checked), so an interrupted download never leaves a half file that
+  looks present. LaMa-MPE is the one pinned file (`LAMA_MPE_SIZE` / `LAMA_MPE_SHA256`):
+  `ensure_lama_mpe` repairs a wrong file and trusts a correct one without hashing only
+  through its `<file>.verified.json` marker (unix: size + dev + inode + mtime + ctime + pin;
+  other platforms hash on every call).
+  One download per file per process (busy id `ai-models:<absolute local path>`; a second
+  caller waits, cancellable, then finds the file). Every `ensure_*` takes an `EnsureCtx`: the
+  caller's cancel flag (`ModelEnsureError::Cancelled`, staged bytes kept) and a progress sink
+  of thinned `ModelDownloadEvent`s (waiting / downloading with the announced total /
+  retrying); a failure is `ModelEnsureError::Failed` with localized text.
   Native-only for the network half; on wasm the signatures stay and return a typed
   "unavailable on web" error. The model ROOT is a parameter: this module reads no config.
   Every Rust path that needs an app-managed model (native runtime, OCR/detector workers,
   cleaning inpaint engines) resolves it here BEFORE loading it natively or asking the
-  backend to use it. Library-managed caches (EasyOCR, Surya) are deliberately not in the
-  catalog.
-- `ai_models/`: EXTERNAL third-party models pinned to a commit (`external_catalog.rs`:
-  Baberu OCR, PaddleOCR-VL variants; `external.rs`: stat-only status probe and the
+  backend to use it. Third-party models (EasyOCR, Surya, SDXL configs, Baberu,
+  PaddleOCR-VL) are the pinned external catalog below, not this resolver.
+- `ai_models/`: EXTERNAL third-party models pinned to a commit or by size + sha256 at a
+  plain HTTPS URL (`external_catalog.rs`: Baberu OCR, PaddleOCR-VL variants, Surya, SDXL
+  configs + the curated SDXL inpainting model; `easyocr.rs`: EasyOCR language rule and
+  per-script specs; `external.rs`: stat-only status probe and the
   verified, resumable, cancellable downloader that retries transient network failures with
-  backoff, with a completion marker; `resumable.rs`: the HTTP layer both downloaders share,
-  including `hf_resolve_url`). Catalog is the
+  backoff, with a completion marker; `hf_url.rs`: the Hugging Face resolve URLs both
+  downloaders use; the HTTP stream itself is the `ms-download` crate). Catalog is the
   single owner of repo/revision/files/dir; nothing downloads implicitly. Detail:
   `ai_models/MODULE_README.md`.
 - `hf_token.rs`: the process-wide Hugging Face access token. Cached value plus free
@@ -110,7 +120,7 @@ Callers own the threading: nothing here spawns a worker for you.
 - Crate boundary: dependencies are `ms-log` (diagnostics), `ms-i18n` (user-facing strings),
   `ms-config` (the `AiInstallType` level only), `ms-thread` (the AI probe's worker),
   `image` (the capture contract), `serde`/`serde_json` (probe output, model markers),
-  `sha2` + `thiserror` (`ai_models::external`), `ureq` (`ai_models`, native-only), `keyring` (`hf_token`, not wasm/Android), `ms-platform` (clipboard reads, capability table), and `windows-sys` on
+  `sha2` + `thiserror` (`ai_models::external`), `ms-download` (`ai_models`, native-only: the resumable HTTP stream and the busy guard), `keyring` (`hf_token`, not wasm/Android), `ms-platform` (clipboard reads, capability table), and `windows-sys` on
   Windows. No probe may READ OR WRITE a config document, and the crate must NOT gain a
   dependency on the application's upper layers (`project`, `studio`, the tabs) or on egui —
   being a GUI-free leaf is what lets it type-check in parallel with the binary.
@@ -129,8 +139,9 @@ Callers own the threading: nothing here spawns a worker for you.
 - To add a model or change which files one needs, see `ai_models.rs`; a new caller must go
   through it rather than downloading into the model tree itself.
 - To add or re-pin an external third-party model, see `ai_models/external_catalog.rs`;
-  pinned download mechanics live in `ai_models/external.rs`, HTTP / resume / retry for both
-  downloaders in `ai_models/resumable.rs`.
+  pinned download mechanics live in `ai_models/external.rs`, resolve URLs in
+  `ai_models/hf_url.rs`, HTTP / resume / retry for both downloaders in `ms-download`
+  (`crates/ms-download/src/resumable.rs`).
 - To change how the Hugging Face token is stored or seeded, see `hf_token.rs` — and keep
   the rule that no message may interpolate the value.
 - To let a new consumer reach these modules, no change is needed here: it already sees them

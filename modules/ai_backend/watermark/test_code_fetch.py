@@ -10,7 +10,10 @@ Main responsibilities:
   owned namespace) and that unknown model ids are rejected everywhere;
 - verify a hash mismatch is fatal, leaves nothing behind and never renames the
   `.part` file into place — this is executable code arriving over the network;
-- verify a matching download lands atomically and is reported as ready;
+- verify a matching download lands atomically and is reported as ready; a
+  dropped connection is retried (with a retry progress label) and a clean short
+  body is retried until the budget runs out, never published; a permanent HTTP
+  status is an explicit error without retry;
 - verify `ensure_model_code` re-downloads a corrupted file and is otherwise a
   no-op;
 - verify the loader executes only bytes it has just hashed (a file tampered with
@@ -20,8 +23,9 @@ Main responsibilities:
 - verify the per-model size/square contracts and the on-disk layout.
 
 Notes:
-- A fake `requests` module is injected into `sys.modules` with `patch.dict` +
-  `addCleanup`, so no test needs network access, torch, or weights.
+- The transport and the clock are injected into `ensure_model_code` (`get=`,
+  `sleep=`), so no test needs network access, torch, or weights, and a retry
+  never waits.
 - The download root is redirected to a temporary directory by patching
   `_watermark_dir`, so no test writes into the user's model tree.
 - The real manifest pins the real upstream digests, which an offline test cannot
@@ -47,11 +51,17 @@ from modules.ai_backend.watermark import code_fetch as cf
 
 
 class _FakeResponse:
-    """Minimal stand-in for `requests.Response` used as a context manager."""
+    """Minimal stand-in for `requests.Response` used as a context manager.
 
-    def __init__(self, payload: bytes, status: int = 200) -> None:
+    `raise_after` ends the body with that exception (a dropped connection).
+    """
+
+    def __init__(
+        self, payload: bytes, status: int = 200, raise_after: BaseException | None = None
+    ) -> None:
         self._payload = payload
-        self._status = status
+        self.status_code = status
+        self._raise_after = raise_after
         self.headers: dict[str, str] = {"Content-Length": str(len(payload))}
 
     def __enter__(self) -> "_FakeResponse":
@@ -61,29 +71,40 @@ class _FakeResponse:
         return False
 
     def raise_for_status(self) -> None:
-        if self._status >= 400:
-            raise RuntimeError(f"HTTP {self._status}")
+        import requests
+
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
 
     def iter_content(self, chunk_size: int = 1 << 16):
         for start in range(0, len(self._payload), chunk_size):
             yield self._payload[start : start + chunk_size]
+        if self._raise_after is not None:
+            raise self._raise_after
 
 
-def _fake_requests(payload_for: dict[str, bytes]) -> types.ModuleType:
-    """A `requests` module serving `payload_for[url]`.
+class _FakeGet:
+    """Injected `get` serving `payload_for[url]` (bytes, or a list of responses in order).
 
     A URL absent from the mapping raises, which is how a test asserts that
     nothing unexpected was fetched.
     """
 
-    def get(url: str, **_kwargs: object) -> _FakeResponse:
-        if url not in payload_for:
-            raise AssertionError(f"unexpected download: {url}")
-        return _FakeResponse(payload_for[url])
+    def __init__(self, payload_for: dict[str, object]) -> None:
+        self._payload_for = {
+            url: (list(value) if isinstance(value, list) else value)
+            for url, value in payload_for.items()
+        }
+        self.urls: list[str] = []
 
-    module = types.ModuleType("requests")
-    module.get = get
-    return module
+    def __call__(self, url: str, **_kwargs: object) -> _FakeResponse:
+        self.urls.append(url)
+        if url not in self._payload_for:
+            raise AssertionError(f"unexpected download: {url}")
+        value = self._payload_for[url]
+        if isinstance(value, list):
+            return value.pop(0)
+        return _FakeResponse(value)
 
 
 def _deterministic_payload(path: str, size: int) -> bytes:
@@ -205,16 +226,16 @@ class DownloadTests(_TempRootTestCase):
         repos_patch.start()
         self.addCleanup(repos_patch.stop)
 
-    def _with_requests(self, payloads: dict[str, bytes] | None = None):
-        return patch.dict(
-            sys.modules,
-            {"requests": _fake_requests(self.payloads if payloads is None else payloads)},
-        )
+        self.sleeps: list[float] = []
+
+    def _ensure(self, payloads: dict[str, object] | None = None, progress=None) -> _FakeGet:
+        get = _FakeGet(self.payloads if payloads is None else payloads)
+        cf.ensure_model_code(self.MODEL, progress, get=get, sleep=self.sleeps.append)
+        return get
 
     def test_matching_download_lands_atomically_and_reports_ready(self) -> None:
-        with self._with_requests():
-            self.assertFalse(cf.is_code_ready(self.MODEL))
-            cf.ensure_model_code(self.MODEL)
+        self.assertFalse(cf.is_code_ready(self.MODEL))
+        self._ensure()
 
         self.assertTrue(cf.is_code_ready(self.MODEL))
         root = cf.code_root(self.MODEL)
@@ -224,8 +245,7 @@ class DownloadTests(_TempRootTestCase):
 
     def test_progress_is_reported_in_bytes_under_the_download_phase(self) -> None:
         frames: list[tuple[str, int, int, str]] = []
-        with self._with_requests():
-            cf.ensure_model_code(self.MODEL, lambda *frame: frames.append(frame))
+        self._ensure(progress=lambda *frame: frames.append(frame))
 
         self.assertTrue(frames)
         self.assertEqual({frame[0] for frame in frames}, {"download"})
@@ -239,44 +259,72 @@ class DownloadTests(_TempRootTestCase):
         # Same length, different bytes: only the digest can catch this.
         payloads[url] = b"\x00" * len(payloads[url])
 
-        with self._with_requests(payloads):
-            with self.assertRaises(RuntimeError) as caught:
-                cf.ensure_model_code(self.MODEL)
+        with self.assertRaises(RuntimeError) as caught:
+            self._ensure(payloads)
 
         self.assertIn("целостности", str(caught.exception))
         root = cf.code_root(self.MODEL)
         self.assertFalse((root / "WDNet.py").exists())
-        self.assertFalse((root / "WDNet.py.part").exists())
+        self.assertEqual(list(root.glob("WDNet.py*.part")), [])
         self.assertFalse(cf.is_code_ready(self.MODEL))
+        # Proven-wrong bytes are not a transient failure: no retry.
+        self.assertEqual(self.sleeps, [])
 
     def test_truncated_download_is_rejected(self) -> None:
         payloads = dict(self.payloads)
         url = self._url_for(self.MODEL, "unet_parts.py")
         payloads[url] = payloads[url][:100]
 
-        with self._with_requests(payloads):
-            with self.assertRaises(RuntimeError):
-                cf.ensure_model_code(self.MODEL)
+        # A body that ends cleanly but short is resumable, not wrong: it is
+        # retried until the budget runs out, and never published.
+        with self.assertRaises(RuntimeError):
+            self._ensure(payloads)
 
         self.assertFalse((cf.code_root(self.MODEL) / "unet_parts.py").exists())
+        self.assertGreater(len(self.sleeps), 0)
+
+    def test_a_dropped_connection_is_retried_and_resumed(self) -> None:
+        import requests
+
+        payloads: dict[str, object] = dict(self.payloads)
+        url = self._url_for(self.MODEL, "unet_parts.py")
+        body = self.payloads[url]
+        dropped = _FakeResponse(body[:100], raise_after=requests.ConnectionError("reset"))
+        dropped.headers["Content-Length"] = str(len(body))
+        payloads[url] = [dropped, _FakeResponse(body)]
+        frames: list[tuple[str, int, int, str]] = []
+
+        get = self._ensure(payloads, progress=lambda *frame: frames.append(frame))
+
+        self.assertTrue(cf.is_code_ready(self.MODEL))
+        self.assertEqual(get.urls.count(url), 2)
+        self.assertTrue(any("1/5" in frame[3] for frame in frames))
+
+    def test_a_permanent_status_is_an_explicit_error(self) -> None:
+        payloads: dict[str, object] = dict(self.payloads)
+        url = self._url_for(self.MODEL, "WDNet.py")
+        payloads[url] = [_FakeResponse(b"not found", status=404)]
+
+        with self.assertRaises(RuntimeError) as caught:
+            self._ensure(payloads)
+
+        self.assertIn(url, str(caught.exception))
+        self.assertEqual(self.sleeps, [])
 
     def test_second_call_downloads_nothing(self) -> None:
-        with self._with_requests():
-            cf.ensure_model_code(self.MODEL)
+        self._ensure()
 
         # An empty payload map turns any request into an assertion failure.
-        with self._with_requests({}):
-            cf.ensure_model_code(self.MODEL)
+        self._ensure({})
 
         self.assertTrue(cf.is_code_ready(self.MODEL))
 
     def test_corrupted_file_on_disk_is_re_downloaded(self) -> None:
-        with self._with_requests():
-            cf.ensure_model_code(self.MODEL)
-            target = cf.code_root(self.MODEL) / "WDNet.py"
-            target.write_bytes(b"\x01" * target.stat().st_size)
-            self.assertFalse(cf.is_code_ready(self.MODEL))
-            cf.ensure_model_code(self.MODEL)
+        self._ensure()
+        target = cf.code_root(self.MODEL) / "WDNet.py"
+        target.write_bytes(b"\x01" * target.stat().st_size)
+        self.assertFalse(cf.is_code_ready(self.MODEL))
+        self._ensure()
 
         self.assertTrue(cf.is_code_ready(self.MODEL))
 

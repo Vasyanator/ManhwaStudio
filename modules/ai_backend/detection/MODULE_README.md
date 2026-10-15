@@ -17,8 +17,9 @@ Three independent service classes, one per engine, plus the vendored ComicTextDe
   `ManhwaStudio_AI_Models/ONNX/PaddleOCR`. The session, the ImageNet normalization and the
   provider rule come from `../engines/paddle_onnx.py` (`PaddleOnnxRuntime.forward_det`), shared
   with the Paddle OCR service; returns `[prob]` at the tile resolution.
-- `surya.py` -> `SuryaTextDetectorService` — Torch, checkpoints owned by the `surya` library's own
-  cache; presence and download go through `../engines/surya_checkpoints.py`, shared with
+- `surya.py` -> `SuryaTextDetectorService` — Torch; the checkpoint directory is Rust's download
+  (pinned external catalog), sent per request as `surya_detection_dir` and loaded offline. The
+  presence check and the settings pointer go through `../engines/surya_checkpoints.py`, shared with
   `../ocr/surya.py`. Normalizes with the library's own processor (no resize) and returns the text
   heatmap (model channel 0) at a quarter of the tile resolution, then releases Torch's CUDA cache
   (the upstream `batch_detection` did, and ONNX Runtime GPU sessions share the device).
@@ -34,7 +35,8 @@ Services are constructed once in `server.py` and reach the IPC layer only as fie
 (`text_detector_ctd`, `text_detector_paddle`, `text_detector_surya`). The handler
 `ipc/handlers/textdetector.py` backs `textdetector.{ctd,paddle,surya}.forward`, owns the wire
 contract and its validation, and touches services exclusively through `HandlerContext.state` — it
-never imports this package. Its only service call is `forward_tiles(tiles)`.
+never imports this package. Its only service call is `forward_tiles(tiles)` (Surya:
+`forward_tiles(tiles, model_dir=...)`).
 
 `ctd.py` and `surya.py` take a `LoadedModelManager` (`../runtime/model_manager.py`) and hold a lease
 around every forward pass so the process-wide resident-model budget can unload them. `paddle.py` has
@@ -52,10 +54,16 @@ no lease of its own: ONNX sessions are leased inside `PaddleOnnxRuntime`.
   fake nets and predictors injected at `CtdTextDetectorService._forward_locked`,
   `surya._forward_with_predictor` and the Paddle service's runtime factory (Torch tests skip when
   Torch is absent).
+- `test_surya_service.py`: the Surya checkpoint contract with fake `surya.*` modules (local dir as
+  `checkpoint=` and in the settings, "not downloaded" errors, directory identity, health; a fake
+  `download_directory` raises), plus the opt-in `RealCheckpointTests` (`MS_SURYA_DETECTION_DIR`).
 - `textdetector/`: vendored ComicTextDetector network (`ctd/basemodel.py` + `yolov5/`). See
   `textdetector/MODULE_README.md`.
 
 ## Contracts and invariants
+- `health()` never takes a service's lock (held across load and forward pass): it reads the
+  service's `runtime.health_snapshot.HealthSnapshot`, republished by `_publish_health_locked()` at
+  every reported-state change, plus lock-free model-path probes (`runtime/MODULE_README.md`).
 - `forward_tiles(tiles)` takes `uint8 [n, h, w, 3]` RGB (both sides a multiple of the engine
   align: CTD 64, Paddle 32, Surya 4) and returns a C-contiguous `uint8 [n, C, mh, mw]`. The
   handler re-checks the shape and dtype; the channel order is the wire's (`PROTOCOL.md` §5.3).
@@ -65,6 +73,10 @@ no lease of its own: ONNX sessions are leased inside `PaddleOnnxRuntime`.
   one engine's weights under the other's root.
 - Missing weights, a missing package, or a failed load surface as an explicit error; no service may
   fall back to another engine or return an empty result to hide a failure.
+- Surya never downloads: a missing directory or an incomplete `manifest.json` is a
+  `FileNotFoundError` ("not downloaded") raised before any load. The directory is part of the
+  resident identity next to the device, and `health()` reports the resident one as `model_dir`
+  (`None` when nothing is loaded); it does not probe any library cache.
 - Every Torch service resolves its device from `General.ai_device`, treating `not-selected` as "no
   choice yet" and falling back through `AIDevice.detect_available_devices()`. CPU is a fallback,
   never a silent preference.
@@ -93,7 +105,9 @@ no lease of its own: ONNX sessions are leased inside `PaddleOnnxRuntime`.
 - To change the CTD network code: `textdetector/ctd/basemodel.py` (vendored; keep edits minimal).
 - To change Paddle model-path, provider resolution or the input normalization, edit
   `../engines/paddle_onnx.py` — it is shared with OCR, so a change there affects both.
-- To change Surya checkpoint location or download, edit `../engines/surya_checkpoints.py`.
+- To change how the Surya checkpoint directory is checked or handed to the library, edit
+  `../engines/surya_checkpoints.py`; which files it holds is the Rust catalog's
+  (`crates/ms-sysprobe/src/ai_models/`).
 - To change device resolution, edit `_resolve_selected_backend_device` in the affected service.
 - To add a fourth detector: add a module here with `forward_tiles`, wire it into `server.py`'s
   `AppState`, add the method constant, spec row and handler in `ipc/`, mirror it in

@@ -175,8 +175,15 @@ it from its `[dev-dependencies]`, so no production build carries them.
   pixels only for `pixels_dirty` rasters + dirty/missing text renders of pending pages (which stay
   resident) + the PS active page's raster set; bubbles hold one `Arc`; clean holds nothing extra.
 - Model revisions and dirty sets are the synchronization contract with canvas/runtime
-  subscribers; update them whenever visible shared state changes. `LayerDoc` has no model-wide
-  revision: GPU texture caches key on the per-node pixel `generation` (`LayerNode::bump_generation`).
+  subscribers; update them whenever visible shared state changes. `LayerDoc` keeps a document-wide
+  `version` (whole-doc readers, e.g. the page manager's node count) and a per-page
+  `page_revision(page)`: the `version` right after that page's last mutation (the
+  `CleanOverlaysModel::page_change_revision` pattern), never removed (survives evict + re-insert), so a
+  stamp only grows and is never reused. A content change of a page always advances its revision; a
+  mutation of another page never does. Tabs projecting one page (typing, PS editor) gate on the page
+  revision, so an edit elsewhere costs them no re-projection. Every mutator bumps through the private
+  `bump_page(page)`; a raw `node_mut` edit must be followed by `mark_page_changed(page)`. GPU texture
+  caches key on the per-node pixel `generation` (`LayerNode::bump_generation`), which is orthogonal.
 - Bubble ids are the stable identity for updates. Maintain the id index whenever the stored bubble
   list changes.
 - Bubble autosave writes the latest snapshot to the unsaved staging path and must preserve

@@ -7,7 +7,8 @@ download per URL, streams progress back to the launcher window, and converts the
 images into ribbon pages.
 
 Main responsibilities:
-- own the worker channel and expose a non-blocking `begin_download` / `poll` pair;
+- own the worker channel and its cancel flag and expose a non-blocking `begin_download` /
+  `poll` / `cancel` set (a new download, `cancel` and drop all stop the running worker);
 - run URL normalization, plan building and image download off the GUI thread;
 - download images in parallel while preserving the plan order;
 - fetch each page through its candidate URLs with retry, hedged fallback and verification.
@@ -16,19 +17,23 @@ Key structures:
 - QuickDownloadController
 - QuickDownloadEvent
 - QuickDownloadSuccess
+- QuickDownloadAbort, ChainError, Cancelled - typed "cancelled vs failed" outcomes of a run
 
 Key functions:
 - spawn_quick_download()
 - load_quick_download()
 - download_images_ordered()
+- cancellable_sleep() - the production backoff wait, interrupted by the run's cancel flag
 - fetch_page_with_fallbacks() - per-page retry/fallback/hedging state machine
 - PageFetcher - per-download shared state (injected fetch + sleep, referer, hedge delay)
 - DeadHosts - per-download memory of hosts that failed whole pages, so later pages skip them
 
 Notes:
 Nothing here knows about a specific site; host handling lives in `plan.rs` and `sites/`.
-The retry policy follows the project "Network downloads" rule; there is no cancel path (a new
-download only replaces the receiver), so backoff waits are short and bounded instead.
+The retry policy follows the project "Network downloads" rule. Each run owns one cancel flag,
+checked before every page, before every attempt, inside the backoff wait and inside the hedge
+waits; an HTTP request already in flight is not interrupted (`ureq` has no cancel) and ends
+within the socket timeouts, its result dropped.
 */
 
 use super::http::{FetchFailureKind, ImageFetchFailure, fetch_image_bytes, install_on_download_pool};
@@ -42,7 +47,7 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use ms_thread as thread;
 use std::time::Duration;
@@ -66,6 +71,72 @@ const HEDGE_DELAY: Duration = Duration::from_secs(5);
 /// Pages that must have failed on a host (every attempt on its URL spent, any failure kind)
 /// before the rest of the download skips that host for pages that still have another URL.
 const DEAD_HOST_PAGE_THRESHOLD: usize = 3;
+/// Longest slice a cancellable wait (backoff, hedge delay, waiting for hedge lanes) sleeps or
+/// blocks before it looks at the cancel flag again: the bound on how late a cancel is noticed
+/// by a waiting worker.
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Marker error: the run's cancel flag was set, so the operation stopped early.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cancelled;
+
+/// Why a download run produced no pages.
+#[derive(Debug)]
+enum QuickDownloadAbort {
+    /// The controller cancelled the run (a newer download, `cancel`, or the controller being
+    /// dropped). Not a failure: logged at info level and never shown to the user.
+    Cancelled,
+    /// The run failed; the error carries the user and log messages.
+    Failed(QuickDownloadError),
+}
+
+impl From<QuickDownloadError> for QuickDownloadAbort {
+    fn from(error: QuickDownloadError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl From<Cancelled> for QuickDownloadAbort {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+/// Why a walk over a page's candidate URLs produced no image.
+#[derive(Debug)]
+enum ChainError {
+    /// The run was cancelled during the walk; nothing about the URLs is concluded.
+    Cancelled,
+    /// Every candidate failed or was skipped.
+    Failed(ChainFailure),
+}
+
+impl From<Cancelled> for ChainError {
+    fn from(_: Cancelled) -> Self {
+        Self::Cancelled
+    }
+}
+
+/// Production backoff wait of the quick downloader: sleeps `wait` in slices of at most
+/// `CANCEL_POLL_INTERVAL`, checking `cancel` before each slice, so a cancel interrupts the wait
+/// instead of being noticed only after it.
+///
+/// # Errors
+/// Returns `Cancelled` as soon as `cancel` is seen set (also when it was set before the call).
+fn cancellable_sleep(wait: Duration, cancel: &AtomicBool) -> Result<(), Cancelled> {
+    let mut remaining = wait;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled);
+        }
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        let slice = remaining.min(CANCEL_POLL_INTERVAL);
+        thread::sleep(slice);
+        remaining = remaining.saturating_sub(slice);
+    }
+}
 
 /// Per-download memory of failing hosts, shared by the parallel page workers of one
 /// `download_images_ordered` run (never across downloads).
@@ -102,14 +173,21 @@ impl DeadHosts {
     }
 }
 
-/// Handle of the single in-flight download: the receiving end of the worker channel.
+/// Handle of the single in-flight download: the receiving end of the worker channel and the
+/// run's cancel flag (shared with the worker, its page tasks and their hedge threads).
 #[derive(Debug)]
 struct PendingQuickDownload {
     rx: Receiver<QuickDownloadWorkerEvent>,
+    cancel: Arc<AtomicBool>,
 }
 
 /// Launcher-side state of the quick downloader. Holds at most one running download and
 /// never blocks the GUI thread.
+///
+/// Every channel belongs to one run, so events of a cancelled or replaced run can never reach
+/// a later run's receiver. Starting a new download, `cancel`, and dropping the controller set
+/// the running worker's cancel flag; that worker then stops at its next cancel check and
+/// delivers nothing.
 pub struct QuickDownloadController {
     pending: Option<PendingQuickDownload>,
 }
@@ -164,11 +242,38 @@ impl QuickDownloadController {
         self.pending.is_some()
     }
 
-    /// Starts a download for `url`, replacing any previously tracked worker handle.
+    /// Starts a download for `url`. A download still running is cancelled first (its worker
+    /// stops and its events are dropped with its channel).
     pub fn begin_download(&mut self, url: String) {
-        self.pending = Some(PendingQuickDownload {
-            rx: spawn_quick_download(url),
-        });
+        let label = url.clone();
+        self.begin_with(label, move |progress_tx, cancel| load_quick_download(&url, progress_tx, cancel));
+    }
+
+    /// Cancels the running download, if any, and forgets it; returns `true` when one was
+    /// running. The worker notices the flag within `CANCEL_POLL_INTERVAL` while waiting, or
+    /// once its in-flight requests end (bounded by the socket timeouts); it delivers no event.
+    pub fn cancel(&mut self) -> bool {
+        let Some(pending) = self.pending.take() else {
+            return false;
+        };
+        pending.cancel.store(true, Ordering::Relaxed);
+        ms_log::runtime_log::log_info("[new-project] quick download cancel requested");
+        true
+    }
+
+    /// Cancels any running download, then starts `job` on a new worker with a fresh channel
+    /// and cancel flag. `label` names the run in logs (the URL in production). Production
+    /// passes `load_quick_download`; tests pass scripted jobs.
+    fn begin_with<J>(&mut self, label: String, job: J)
+    where
+        J: FnOnce(&Sender<QuickDownloadWorkerEvent>, &Arc<AtomicBool>) -> Result<LoadedQuickDownload, QuickDownloadAbort>
+            + Send
+            + 'static,
+    {
+        self.cancel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rx = spawn_quick_download(label, Arc::clone(&cancel), job);
+        self.pending = Some(PendingQuickDownload { rx, cancel });
     }
 
     /// Drains the worker channel without blocking; returns the terminal event, or the
@@ -218,23 +323,55 @@ impl QuickDownloadController {
     }
 }
 
-/// Spawns the download worker thread and returns the receiving end of its event channel.
-/// A spawn failure is reported through the same channel instead of panicking.
-fn spawn_quick_download(url: String) -> Receiver<QuickDownloadWorkerEvent> {
+impl Drop for QuickDownloadController {
+    /// Dropping the controller (launcher teardown) stops its worker instead of letting it
+    /// download into a channel nobody reads.
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// Spawns the download worker thread running `job` and returns the receiving end of its event
+/// channel. A spawn failure is reported through the same channel instead of panicking.
+///
+/// A run that ends `QuickDownloadAbort::Cancelled` is logged at info level and sends nothing
+/// (its receiver is already gone); a result that cannot be delivered because the run was
+/// cancelled meanwhile is logged at info level too, any other undeliverable result as a warning.
+fn spawn_quick_download<J>(url: String, cancel: Arc<AtomicBool>, job: J) -> Receiver<QuickDownloadWorkerEvent>
+where
+    J: FnOnce(&Sender<QuickDownloadWorkerEvent>, &Arc<AtomicBool>) -> Result<LoadedQuickDownload, QuickDownloadAbort>
+        + Send
+        + 'static,
+{
     let (tx, rx) = mpsc::channel();
     let tx_worker = tx.clone();
     let url_for_thread = url.clone();
     match thread::Builder::new()
         .name("new-project-quick-download".to_string())
         .spawn(move || {
-            let result = load_quick_download(&url_for_thread, &tx_worker);
+            let result = match job(&tx_worker, &cancel) {
+                Ok(loaded) => Ok(loaded),
+                Err(QuickDownloadAbort::Failed(err)) => Err(err),
+                Err(QuickDownloadAbort::Cancelled) => {
+                    ms_log::runtime_log::log_info(format!(
+                        "[new-project] quick download of '{url_for_thread}' cancelled; nothing downloaded is kept"
+                    ));
+                    return;
+                }
+            };
             if tx_worker
                 .send(QuickDownloadWorkerEvent::Finished(result))
                 .is_err()
             {
-                ms_log::runtime_log::log_warn(
-                    "[new-project] failed to send quick download result to UI",
-                );
+                if cancel.load(Ordering::Relaxed) {
+                    ms_log::runtime_log::log_info(format!(
+                        "[new-project] quick download of '{url_for_thread}' finished after it was cancelled; result discarded"
+                    ));
+                } else {
+                    ms_log::runtime_log::log_warn(
+                        "[new-project] failed to send quick download result to UI",
+                    );
+                }
             }
         }) {
         Ok(_) => {}
@@ -261,27 +398,39 @@ fn spawn_quick_download(url: String) -> Receiver<QuickDownloadWorkerEvent> {
 }
 
 /// Worker body: normalizes the URL, resolves the site plan, downloads every image and
-/// builds ribbon pages.
+/// builds ribbon pages. `cancel` is checked after the plan was resolved, throughout the image
+/// download, and before the ribbon is built.
 ///
 /// # Errors
-/// Returns `QuickDownloadError` for an invalid URL, an unsupported/failed site plan, an
-/// empty image list, or any download/decode failure.
+/// Returns `QuickDownloadAbort::Failed` for an invalid URL, an unsupported/failed site plan,
+/// an empty image list, or any download/decode failure, and `QuickDownloadAbort::Cancelled`
+/// when `cancel` was set (no partial pages are returned).
 fn load_quick_download(
     url: &str,
     progress_tx: &Sender<QuickDownloadWorkerEvent>,
-) -> Result<LoadedQuickDownload, QuickDownloadError> {
+    cancel: &Arc<AtomicBool>,
+) -> Result<LoadedQuickDownload, QuickDownloadAbort> {
     let normalized = normalize_http_url(url).map_err(|err| QuickDownloadError {
         user_message: t!("launcher.new_project.quick_dl.invalid_url_error").to_string(),
         log_message: format!("invalid quick download url '{url}': {err}"),
     })?;
     let plan = build_site_download_plan(&normalized)?;
+    // Resolving the plan is network work of its own (site pages, APIs) that is not
+    // cancellable from inside; a cancel that arrived meanwhile stops the run here.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(QuickDownloadAbort::Cancelled);
+    }
     if plan.images.is_empty() {
         return Err(QuickDownloadError {
             user_message: t!("launcher.new_project.quick_dl.no_chapter_images_error").to_string(),
             log_message: format!("quick downloader found zero images for '{normalized}'"),
-        });
+        }
+        .into());
     }
-    let images = download_images_ordered(&plan, progress_tx, fetch_image_bytes, thread::sleep, HEDGE_DELAY)?;
+    let images = download_images_ordered(&plan, progress_tx, fetch_image_bytes, cancellable_sleep, HEDGE_DELAY, cancel)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err(QuickDownloadAbort::Cancelled);
+    }
     let pages = build_ribbon_pages(images);
     Ok(LoadedQuickDownload {
         source_url: normalized,
@@ -301,21 +450,25 @@ fn load_quick_download(
 /// Each page goes through `fetch_page_with_fallbacks` (retries, hedged fallback URLs, digest
 /// check), so a page fails only after all of its candidate URLs did. All pages of this run
 /// share one `PageFetcher`, and with it one `DeadHosts`. `fetch`, `sleep` and `hedge_delay`
-/// are injected (production: `fetch_image_bytes`, `thread::sleep`, `HEDGE_DELAY`).
+/// are injected (production: `fetch_image_bytes`, `cancellable_sleep`, `HEDGE_DELAY`); `sleep`
+/// gets the run's `cancel` flag and must return `Cancelled` once it sees it set. `cancel` is
+/// checked before each page starts, before each attempt and during every wait.
 ///
 /// # Errors
-/// Returns the error of the first page that failed on every candidate URL, or a pool-creation
-/// failure; no partial result is produced.
+/// Returns `QuickDownloadAbort::Failed` with the error of the first page that failed on every
+/// candidate URL, or a pool-creation failure, and `QuickDownloadAbort::Cancelled` when `cancel`
+/// was set; no partial result is produced either way.
 fn download_images_ordered<F, S>(
     plan: &SiteDownloadPlan,
     progress_tx: &Sender<QuickDownloadWorkerEvent>,
     fetch: F,
     sleep: S,
     hedge_delay: Duration,
-) -> Result<Vec<ImportedImage>, QuickDownloadError>
+    cancel: &Arc<AtomicBool>,
+) -> Result<Vec<ImportedImage>, QuickDownloadAbort>
 where
     F: Fn(&str, Option<&str>) -> Result<Vec<u8>, ImageFetchFailure> + Send + Sync + 'static,
-    S: Fn(Duration) + Send + Sync + 'static,
+    S: Fn(Duration, &AtomicBool) -> Result<(), Cancelled> + Send + Sync + 'static,
 {
     let total = plan.images.len();
     let downloaded = Arc::new(AtomicUsize::new(0));
@@ -326,6 +479,7 @@ where
         referer: plan.referer.clone(),
         dead_hosts: DeadHosts::default(),
         hedge_delay,
+        cancel: Arc::clone(cancel),
     });
 
     // One image per rayon task (`with_max_len(1)`): the default chunking would hand several
@@ -336,6 +490,11 @@ where
             .enumerate()
             .with_max_len(1)
             .map(|(index, page)| {
+                // Between pages: a cancelled run starts no further page (the collect below
+                // stops at the first error, pages already running stop at their own checks).
+                if fetcher.is_cancelled() {
+                    return Err(QuickDownloadAbort::Cancelled);
+                }
                 let image = fetch_page_with_fallbacks(index, page, &fetcher)?;
                 let current = downloaded.fetch_add(1, Ordering::Relaxed) + 1;
                 let _ = progress_tx.send(QuickDownloadWorkerEvent::Progress {
@@ -343,7 +502,7 @@ where
                     current,
                     total,
                 });
-                Ok::<(usize, ImportedImage), QuickDownloadError>((
+                Ok::<(usize, ImportedImage), QuickDownloadAbort>((
                     index,
                     ImportedImage {
                         name: format!("{:04}.png", index + 1),
@@ -367,14 +526,16 @@ fn retry_backoff(retry: u32) -> Duration {
 }
 
 /// Everything one download run shares between its page workers and their hedge threads: the
-/// injected fetch and sleep, the plan's `Referer`, the run's `DeadHosts`, and the hedge delay.
-/// Held in an `Arc` because a hedged attempt may outlive the page that started it.
+/// injected fetch and sleep, the plan's `Referer`, the run's `DeadHosts`, the hedge delay and
+/// the run's cancel flag. Held in an `Arc` because a hedged attempt may outlive the page that
+/// started it.
 struct PageFetcher<F, S> {
     fetch: F,
     sleep: S,
     referer: Option<String>,
     dead_hosts: DeadHosts,
     hedge_delay: Duration,
+    cancel: Arc<AtomicBool>,
 }
 
 /// What a page's walk over (a suffix of) its candidate URLs tried before failing.
@@ -390,7 +551,7 @@ struct ChainFailure {
 
 impl ChainFailure {
     /// Appends `other`'s attempts and skips; its last error wins if it has one.
-    fn absorb(&mut self, other: ChainFailure) {
+    fn absorb(&mut self, other: Self) {
         self.attempts.extend(other.attempts);
         self.skipped.extend(other.skipped);
         if other.last_error.is_some() {
@@ -407,6 +568,9 @@ enum HedgedAttempt {
     /// The delay passed, so the rest of the chain raced the attempt; this is the race's
     /// outcome, which already covers every later candidate URL.
     Raced(Result<DynamicImage, ChainFailure>),
+    /// The run was cancelled while waiting for the attempt or the race; the lanes are
+    /// abandoned (they stop at their own cancel checks, results dropped).
+    Cancelled,
 }
 
 /// A message to the page thread from one of the two racing lanes of a hedge.
@@ -414,13 +578,13 @@ enum LaneResult {
     /// The hedged attempt on the current URL.
     Current(Result<DynamicImage, ImageFetchFailure>),
     /// The walk over the remaining candidate URLs.
-    Rest(Result<DynamicImage, ChainFailure>),
+    Rest(Result<DynamicImage, ChainError>),
 }
 
 impl<F, S> PageFetcher<F, S>
 where
     F: Fn(&str, Option<&str>) -> Result<Vec<u8>, ImageFetchFailure> + Send + Sync + 'static,
-    S: Fn(Duration) + Send + Sync + 'static,
+    S: Fn(Duration, &AtomicBool) -> Result<(), Cancelled> + Send + Sync + 'static,
 {
     /// One request to `url`, then the digest check and decode. A wrong digest or undecodable
     /// bytes are what this URL serves, not network weather, so they are `Permanent`.
@@ -430,6 +594,11 @@ where
             kind: FetchFailureKind::Permanent,
             error,
         })
+    }
+
+    /// Whether the run's cancel flag is set.
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 
     /// Counts one page whose attempts on `url`'s host are spent, logging the dead transition.
@@ -443,16 +612,18 @@ where
     }
 
     /// Walks `urls` (a page's candidates, or a suffix of them) in order with the retry,
-    /// fallback, dead-host and hedging rules described on `fetch_page_with_fallbacks`.
+    /// fallback, dead-host and hedging rules described on `fetch_page_with_fallbacks`, checking
+    /// the cancel flag before every attempt and inside every wait.
     ///
     /// # Errors
-    /// Returns `ChainFailure` with every attempt and skip when no URL produced a valid image.
+    /// Returns `ChainError::Failed` with every attempt and skip when no URL produced a valid
+    /// image, and `ChainError::Cancelled` as soon as the run is seen cancelled.
     fn fetch_chain(
         self: &Arc<Self>,
         page_number: usize,
         urls: &[String],
         sha256: Option<[u8; 32]>,
-    ) -> Result<DynamicImage, ChainFailure> {
+    ) -> Result<DynamicImage, ChainError> {
         let mut chain = ChainFailure::default();
         for (url_index, url) in urls.iter().enumerate() {
             let rest = &urls[url_index + 1..];
@@ -470,6 +641,10 @@ where
                 ATTEMPTS_BEFORE_FALLBACK
             };
             for attempt in 1..=budget {
+                // Between attempts (and URLs): a cancelled run sends no further request.
+                if self.is_cancelled() {
+                    return Err(ChainError::Cancelled);
+                }
                 let outcome = if is_last_url {
                     // Nothing left to hedge with: plain attempt on this thread.
                     self.attempt(url, sha256.as_ref())
@@ -479,8 +654,9 @@ where
                         HedgedAttempt::Raced(Ok(image)) => return Ok(image),
                         HedgedAttempt::Raced(Err(raced)) => {
                             chain.absorb(raced);
-                            return Err(chain);
+                            return Err(ChainError::Failed(chain));
                         }
+                        HedgedAttempt::Cancelled => return Err(ChainError::Cancelled),
                     }
                 };
                 let failure = match outcome {
@@ -505,7 +681,9 @@ where
                         failure.error.log_message
                     ));
                     chain.last_error = Some(failure.error);
-                    (self.sleep)(wait);
+                    // The injected sleep must return `Cancelled` once it sees the flag, so a
+                    // cancel interrupts the wait instead of being noticed after it.
+                    (self.sleep)(wait, &self.cancel)?;
                     continue;
                 }
                 let next = if is_last_url { "no source left" } else { "falling back to the next source" };
@@ -519,13 +697,43 @@ where
             // Reaching here means every attempt on this URL failed (success returned above).
             self.record_host_failure(url);
         }
-        Err(chain)
+        Err(ChainError::Failed(chain))
+    }
+
+    /// Waits up to `timeout` for a lane message, in slices of at most `CANCEL_POLL_INTERVAL`
+    /// with a cancel check before each, so a waiting page notices a cancel promptly.
+    ///
+    /// # Errors
+    /// Returns `Cancelled` when the run is seen cancelled before a message arrived.
+    fn recv_lane_unless_cancelled(
+        &self,
+        lane_rx: &Receiver<LaneResult>,
+        timeout: Duration,
+    ) -> Result<Result<LaneResult, mpsc::RecvTimeoutError>, Cancelled> {
+        let mut remaining = timeout;
+        loop {
+            if self.is_cancelled() {
+                return Err(Cancelled);
+            }
+            let slice = remaining.min(CANCEL_POLL_INTERVAL);
+            match lane_rx.recv_timeout(slice) {
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    remaining = remaining.saturating_sub(slice);
+                    if remaining.is_zero() {
+                        return Ok(Err(mpsc::RecvTimeoutError::Timeout));
+                    }
+                }
+                other => return Ok(other),
+            }
+        }
     }
 
     /// Runs attempt `attempt` on `url` on its own thread and waits up to `hedge_delay` for it.
     /// If it has not finished by then, the walk over `rest` starts on a second thread and the
     /// first VALID image from either lane wins (the official MangaDex reader does the same
-    /// with a 5 s delay). A hedged attempt gets no further retries on `url`.
+    /// with a 5 s delay). A hedged attempt gets no further retries on `url`. Both waits check
+    /// the cancel flag (`recv_lane_unless_cancelled`); a cancel returns
+    /// `HedgedAttempt::Cancelled` and abandons the lanes.
     ///
     /// The lanes run on dedicated short-lived threads, never on the download pool: the pool
     /// is fixed-size and its workers block right here waiting for the lanes, so lanes queued
@@ -567,11 +775,12 @@ where
             ));
             return HedgedAttempt::Finished(self.attempt(url, sha256.as_ref()));
         }
-        match lane_rx.recv_timeout(self.hedge_delay) {
-            Ok(LaneResult::Current(outcome)) => return HedgedAttempt::Finished(outcome),
+        match self.recv_lane_unless_cancelled(&lane_rx, self.hedge_delay) {
+            Err(Cancelled) => return HedgedAttempt::Cancelled,
+            Ok(Ok(LaneResult::Current(outcome))) => return HedgedAttempt::Finished(outcome),
             // Only the current lane exists so far.
-            Ok(LaneResult::Rest(_)) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(Ok(LaneResult::Rest(_)) | Err(mpsc::RecvTimeoutError::Timeout)) => {}
+            Ok(Err(mpsc::RecvTimeoutError::Disconnected)) => {
                 return HedgedAttempt::Finished(Err(lost_lane_failure(url)));
             }
         }
@@ -604,7 +813,15 @@ where
         let mut current_pending = true;
         let mut raced = ChainFailure::default();
         while current_pending || rest_pending {
-            match lane_rx.recv() {
+            // No overall deadline: each lane ends within the socket timeouts. The timeout only
+            // bounds one slice between cancel checks, so `Timeout` just waits again.
+            let message = match self.recv_lane_unless_cancelled(&lane_rx, CANCEL_POLL_INTERVAL) {
+                Err(Cancelled) => return HedgedAttempt::Cancelled,
+                Ok(Err(mpsc::RecvTimeoutError::Timeout)) => continue,
+                Ok(Ok(message)) => Ok(message),
+                Ok(Err(mpsc::RecvTimeoutError::Disconnected)) => Err(mpsc::RecvError),
+            };
+            match message {
                 Ok(LaneResult::Current(Ok(image))) => {
                     ms_log::runtime_log::log_info(format!(
                         "[new-project] quick download page {page_number}: '{url}' answered first after hedging"
@@ -627,10 +844,12 @@ where
                     raced.last_error = Some(failure.error);
                     self.record_host_failure(url);
                 }
-                Ok(LaneResult::Rest(Err(rest_failure))) => {
+                Ok(LaneResult::Rest(Err(ChainError::Failed(rest_failure)))) => {
                     rest_pending = false;
                     raced.absorb(rest_failure);
                 }
+                // The rest lane only stops this way when the run is cancelled.
+                Ok(LaneResult::Rest(Err(ChainError::Cancelled))) => return HedgedAttempt::Cancelled,
                 Err(mpsc::RecvError) => {
                     // Every sender is gone without a verdict: a lane thread panicked.
                     let lost = lost_lane_failure(url);
@@ -669,23 +888,29 @@ fn lost_lane_failure(url: &str) -> ImageFetchFailure {
 /// retry, fallback, hedge, skip and newly dead host is logged with the page number and URL.
 ///
 /// # Errors
-/// When every URL failed, returns the LAST failure's user message and a log message listing
-/// every attempt made and every URL skipped.
+/// Returns `QuickDownloadAbort::Cancelled` when the run's cancel flag was seen set (also when
+/// the walk failed after a cancel: that failure may be the cancel's doing). Otherwise, when
+/// every URL failed, `QuickDownloadAbort::Failed` with the LAST failure's user message and a
+/// log message listing every attempt made and every URL skipped.
 fn fetch_page_with_fallbacks<F, S>(
     index: usize,
     page: &PlannedImage,
     fetcher: &Arc<PageFetcher<F, S>>,
-) -> Result<DynamicImage, QuickDownloadError>
+) -> Result<DynamicImage, QuickDownloadAbort>
 where
     F: Fn(&str, Option<&str>) -> Result<Vec<u8>, ImageFetchFailure> + Send + Sync + 'static,
-    S: Fn(Duration) + Send + Sync + 'static,
+    S: Fn(Duration, &AtomicBool) -> Result<(), Cancelled> + Send + Sync + 'static,
 {
     let page_number = index + 1;
     let urls = page.candidate_urls().map(str::to_string).collect::<Vec<_>>();
     let chain = match fetcher.fetch_chain(page_number, &urls, page.sha256) {
         Ok(image) => return Ok(image),
-        Err(chain) => chain,
+        Err(ChainError::Cancelled) => return Err(QuickDownloadAbort::Cancelled),
+        Err(ChainError::Failed(chain)) => chain,
     };
+    if fetcher.is_cancelled() {
+        return Err(QuickDownloadAbort::Cancelled);
+    }
     let user_message = match chain.last_error {
         Some(error) => error.user_message,
         // Unreachable in practice (the last URL is never skipped and every budget is >= 1),
@@ -697,7 +922,7 @@ where
     } else {
         format!("; skipped (host marked dead): {}", chain.skipped.join(", "))
     };
-    Err(QuickDownloadError {
+    Err(QuickDownloadAbort::Failed(QuickDownloadError {
         user_message,
         log_message: format!(
             "page {page_number} failed on all {} source URL(s) after {} attempt(s): {}{skipped_note}",
@@ -705,7 +930,7 @@ where
             chain.attempts.len(),
             chain.attempts.join("; ")
         ),
-    })
+    }))
 }
 
 /// Checks `bytes` against the expected SHA-256 (when the plan has one), then decodes them as an
@@ -742,18 +967,21 @@ fn verify_and_decode(
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTEMPTS_ON_LAST_URL, DEAD_HOST_PAGE_THRESHOLD, DeadHosts, FetchFailureKind,
-        ImageFetchFailure, PageFetcher, QuickDownloadError, RETRY_BACKOFF_BASE,
-        download_images_ordered, fetch_page_with_fallbacks, retry_backoff,
+        ATTEMPTS_ON_LAST_URL, CANCEL_POLL_INTERVAL, Cancelled, DEAD_HOST_PAGE_THRESHOLD, DeadHosts,
+        FetchFailureKind, ImageFetchFailure, LoadedQuickDownload, PageFetcher, QuickDownloadAbort,
+        QuickDownloadController, QuickDownloadError, QuickDownloadEvent, QuickDownloadWorkerEvent,
+        RETRY_BACKOFF_BASE, cancellable_sleep, download_images_ordered, fetch_page_with_fallbacks,
+        retry_backoff,
     };
     use crate::new_project::quick_download::plan::{PlannedImage, SiteDownloadPlan};
     use image::{DynamicImage, GenericImageView, ImageFormat};
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     const PRIMARY: &str = "https://node.example/data/h/1.png";
     const FALLBACK: &str = "https://origin.example/data/h/1.png";
@@ -782,7 +1010,20 @@ mod tests {
 
     /// The scripted fetcher and recording sleep as trait objects, so the fetcher type is nameable.
     type TestFetch = Box<dyn Fn(&str, Option<&str>) -> Result<Vec<u8>, ImageFetchFailure> + Send + Sync>;
-    type TestSleep = Box<dyn Fn(Duration) + Send + Sync>;
+    type TestSleep = Box<dyn Fn(Duration, &AtomicBool) -> Result<(), Cancelled> + Send + Sync>;
+
+    /// The failure inside an abort; a cancel where none was requested fails the test.
+    fn failed(abort: QuickDownloadAbort) -> QuickDownloadError {
+        match abort {
+            QuickDownloadAbort::Failed(error) => error,
+            QuickDownloadAbort::Cancelled => panic!("the run was not cancelled, it must not report a cancel"),
+        }
+    }
+
+    /// A cancel flag that is not set.
+    fn not_cancelled() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
 
     /// One scripted answer of the fake fetcher.
     enum Answer {
@@ -805,6 +1046,8 @@ mod tests {
         answers: Mutex<HashMap<String, Vec<Answer>>>,
         calls: Mutex<Vec<String>>,
         sleeps: Mutex<Vec<Duration>>,
+        /// The cancel flag of every fetcher built from this script.
+        cancel: Arc<AtomicBool>,
     }
 
     impl Script {
@@ -821,6 +1064,7 @@ mod tests {
                 ),
                 calls: Mutex::new(Vec::new()),
                 sleeps: Mutex::new(Vec::new()),
+                cancel: not_cancelled(),
             })
         }
 
@@ -867,15 +1111,19 @@ mod tests {
                     assert_eq!(referer, Some("https://ref.example/"));
                     for_fetch.answer(url)
                 }),
-                sleep: Box::new(move |wait: Duration| for_sleep.sleeps.lock().expect("sleeps lock").push(wait)),
+                sleep: Box::new(move |wait: Duration, _cancel: &AtomicBool| {
+                    for_sleep.sleeps.lock().expect("sleeps lock").push(wait);
+                    Ok(())
+                }),
                 referer: Some("https://ref.example/".to_string()),
                 dead_hosts: DeadHosts::default(),
                 hedge_delay,
+                cancel: Arc::clone(&self.cancel),
             })
         }
 
         fn run(self: &Arc<Self>, page: &PlannedImage) -> Result<DynamicImage, QuickDownloadError> {
-            fetch_page_with_fallbacks(0, page, &self.fetcher(NO_HEDGE))
+            fetch_page_with_fallbacks(0, page, &self.fetcher(NO_HEDGE)).map_err(failed)
         }
     }
 
@@ -1016,7 +1264,7 @@ mod tests {
             ),
         ]);
         let fetcher = script.fetcher(Duration::ZERO);
-        let Err(err) = fetch_page_with_fallbacks(0, &page_with_fallback(None), &fetcher) else {
+        let Err(err) = fetch_page_with_fallbacks(0, &page_with_fallback(None), &fetcher).map_err(failed) else {
             panic!("both lanes failed, the page must fail");
         };
         // Both lanes ran concurrently, so their call order is not fixed.
@@ -1114,9 +1362,9 @@ mod tests {
                 Ok(png(1))
             }
         };
-        let sleep = |_wait: Duration| panic!("a permanent failure must not wait");
+        let sleep = |_wait: Duration, _cancel: &AtomicBool| panic!("a permanent failure must not wait");
         let (tx, _rx) = mpsc::channel();
-        let Err(err) = download_images_ordered(&plan, &tx, fetch, sleep, NO_HEDGE) else {
+        let Err(err) = download_images_ordered(&plan, &tx, fetch, sleep, NO_HEDGE, &not_cancelled()).map_err(failed) else {
             panic!("one page failing on every URL must fail the chapter");
         };
         assert_eq!(err.user_message, "user: status 410 gone");
@@ -1140,14 +1388,196 @@ mod tests {
             std::thread::sleep(Duration::from_millis(u64::from(7 - number) * 15));
             Ok(png(number))
         };
-        let sleep = |_wait: Duration| panic!("no retry expected");
+        let sleep = |_wait: Duration, _cancel: &AtomicBool| panic!("no retry expected");
         let (tx, rx) = mpsc::channel();
-        let images = download_images_ordered(&plan, &tx, fetch, sleep, NO_HEDGE).expect("all pages load");
+        let images = download_images_ordered(&plan, &tx, fetch, sleep, NO_HEDGE, &not_cancelled()).expect("all pages load");
         let widths = images.iter().map(|page| page.image.width()).collect::<Vec<_>>();
         assert_eq!(widths, [1, 2, 3, 4, 5, 6]);
         let names = images.iter().map(|page| page.name.as_str()).collect::<Vec<_>>();
         assert_eq!(names, ["0001.png", "0002.png", "0003.png", "0004.png", "0005.png", "0006.png"]);
         drop(tx);
         assert_eq!(rx.iter().count(), 6, "one progress event per page");
+    }
+
+    /// Upper bound for "promptly" in the cancel tests: far below every wait being cancelled
+    /// (60 s sleeps, the 3600 s hedge delay), far above `CANCEL_POLL_INTERVAL`.
+    const PROMPT: Duration = Duration::from_secs(5);
+
+    /// Sets `cancel` from another thread after `delay`.
+    fn cancel_after(cancel: &Arc<AtomicBool>, delay: Duration) {
+        let cancel = Arc::clone(cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            cancel.store(true, Ordering::Relaxed);
+        });
+    }
+
+    #[test]
+    fn cancellable_sleep_waits_out_an_uncancelled_wait() {
+        let started = Instant::now();
+        assert_eq!(cancellable_sleep(CANCEL_POLL_INTERVAL * 2, &AtomicBool::new(false)), Ok(()));
+        assert!(started.elapsed() >= CANCEL_POLL_INTERVAL * 2);
+        assert_eq!(cancellable_sleep(Duration::ZERO, &AtomicBool::new(true)), Err(Cancelled));
+    }
+
+    #[test]
+    fn cancel_interrupts_a_running_backoff_sleep() {
+        let cancel = not_cancelled();
+        cancel_after(&cancel, Duration::from_millis(30));
+        let started = Instant::now();
+        assert_eq!(cancellable_sleep(Duration::from_secs(60), &cancel), Err(Cancelled));
+        assert!(started.elapsed() < PROMPT, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn cancel_during_backoff_returns_promptly_without_another_attempt() {
+        let cancel = not_cancelled();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in_fetch = Arc::clone(&calls);
+        let cancel_in_fetch = Arc::clone(&cancel);
+        let fetcher = Arc::new(PageFetcher {
+            fetch: move |_url: &str, _referer: Option<&str>| {
+                calls_in_fetch.fetch_add(1, Ordering::Relaxed);
+                // The cancel lands while the worker sits in the following backoff wait.
+                cancel_after(&cancel_in_fetch, Duration::from_millis(20));
+                Err(failure(FetchFailureKind::Transient, "connection reset"))
+            },
+            sleep: cancellable_sleep,
+            referer: None,
+            dead_hosts: DeadHosts::default(),
+            hedge_delay: NO_HEDGE,
+            cancel: Arc::clone(&cancel),
+        });
+        let started = Instant::now();
+        let outcome = fetch_page_with_fallbacks(0, &PlannedImage::single(PRIMARY.to_string()), &fetcher);
+        assert!(matches!(outcome, Err(QuickDownloadAbort::Cancelled)), "{outcome:?}");
+        assert!(started.elapsed() < RETRY_BACKOFF_BASE, "the 500 ms backoff was waited out: {:?}", started.elapsed());
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "no attempt after the cancel");
+        assert!(fetcher.dead_hosts.counters().is_empty(), "a cancel is not a host failure");
+    }
+
+    #[test]
+    fn cancel_while_waiting_for_a_hung_attempt_returns_promptly() {
+        let (release, hang) = mpsc::channel();
+        let script = Script::new(vec![(
+            PRIMARY,
+            vec![Answer::After(hang, Err(failure(FetchFailureKind::Transient, "tls init failed")))],
+        )]);
+        cancel_after(&script.cancel, Duration::from_millis(30));
+        let started = Instant::now();
+        let outcome = fetch_page_with_fallbacks(0, &page_with_fallback(None), &script.fetcher(NO_HEDGE));
+        assert!(matches!(outcome, Err(QuickDownloadAbort::Cancelled)), "{outcome:?}");
+        assert!(started.elapsed() < PROMPT, "took {:?}", started.elapsed());
+        assert!(!script.calls().contains(&FALLBACK.to_string()), "a cancelled page starts no hedge");
+        // Let the abandoned attempt finish; its result is discarded.
+        drop(release);
+    }
+
+    #[test]
+    fn cancelled_run_starts_no_page() {
+        let plan = SiteDownloadPlan {
+            images: PlannedImage::from_urls(vec![PRIMARY.to_string()]),
+            referer: None,
+        };
+        let fetch = |url: &str, _referer: Option<&str>| panic!("a cancelled run must not fetch '{url}'");
+        let sleep = |_wait: Duration, _cancel: &AtomicBool| panic!("a cancelled run must not wait");
+        let (tx, _rx) = mpsc::channel();
+        let outcome = download_images_ordered(&plan, &tx, fetch, sleep, NO_HEDGE, &Arc::new(AtomicBool::new(true)));
+        assert!(matches!(outcome, Err(QuickDownloadAbort::Cancelled)), "the run must end cancelled");
+    }
+
+    /// Polls `controller` until it returns a terminal event or `PROMPT` passes; returns every
+    /// progress stage seen and the terminal event.
+    fn poll_until_finished(controller: &mut QuickDownloadController) -> (Vec<String>, QuickDownloadEvent) {
+        let ctx = egui::Context::default();
+        let started = Instant::now();
+        let mut stages = Vec::new();
+        while started.elapsed() < PROMPT {
+            match controller.poll(&ctx) {
+                Some(QuickDownloadEvent::Progress { stage, .. }) => stages.push(stage),
+                Some(terminal) => return (stages, terminal),
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        panic!("the download did not finish within {PROMPT:?}");
+    }
+
+    #[test]
+    fn second_download_stops_the_first_and_never_sees_its_events() {
+        let mut controller = QuickDownloadController::new();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        controller.begin_with("old".to_string(), move |tx, cancel| {
+            let plan = SiteDownloadPlan {
+                images: PlannedImage::from_urls(vec![PRIMARY.to_string()]),
+                referer: None,
+            };
+            let started_tx = Mutex::new(started_tx);
+            // Always transient: without a cancel this page would wait 500 ms + 1 s in backoff.
+            let fetch = move |_url: &str, _referer: Option<&str>| {
+                started_tx.lock().expect("started lock").send(()).expect("the test waits for the start");
+                Err(failure(FetchFailureKind::Transient, "connection reset"))
+            };
+            let result = download_images_ordered(&plan, tx, fetch, cancellable_sleep, NO_HEDGE, cancel);
+            // An event of the old run after its cancel: its channel is gone, so it can reach
+            // nobody, least of all the new run's receiver.
+            let delivered = tx
+                .send(QuickDownloadWorkerEvent::Progress { stage: "old-run", current: 1, total: 1 })
+                .is_ok();
+            stopped_tx
+                .send((matches!(result, Err(QuickDownloadAbort::Cancelled)), delivered))
+                .expect("the test waits for the stop");
+            result.map(|images| LoadedQuickDownload {
+                source_url: "old".to_string(),
+                downloaded_images: images.len(),
+                pages: Vec::new(),
+            })
+        });
+        started_rx.recv_timeout(PROMPT).expect("the first download started");
+        let replaced_at = Instant::now();
+        controller.begin_with("new".to_string(), |tx, _cancel| {
+            tx.send(QuickDownloadWorkerEvent::Progress { stage: "new-run", current: 0, total: 1 })
+                .expect("the controller holds the new receiver");
+            Ok(LoadedQuickDownload {
+                source_url: "new".to_string(),
+                downloaded_images: 0,
+                pages: Vec::new(),
+            })
+        });
+
+        let (was_cancelled, delivered) = stopped_rx.recv_timeout(PROMPT).expect("the first worker stopped");
+        assert!(was_cancelled, "the first run ends cancelled, not failed");
+        assert!(!delivered, "the first run's channel must be closed");
+        assert!(replaced_at.elapsed() < RETRY_BACKOFF_BASE * 2, "the first worker sat out its backoff");
+
+        let (stages, terminal) = poll_until_finished(&mut controller);
+        assert!(stages.iter().all(|stage| stage != "old-run"), "{stages:?}");
+        let QuickDownloadEvent::Loaded(success) = terminal else {
+            panic!("the second download must load");
+        };
+        assert_eq!(success.source_url, "new");
+        assert!(!controller.is_loading());
+    }
+
+    #[test]
+    fn dropping_or_cancelling_the_controller_stops_its_worker() {
+        for drop_it in [true, false] {
+            let mut controller = QuickDownloadController::new();
+            let (stopped_tx, stopped_rx) = mpsc::channel();
+            controller.begin_with("held".to_string(), move |_tx, cancel| {
+                let outcome = cancellable_sleep(Duration::from_secs(60), cancel);
+                stopped_tx.send(outcome).expect("the test waits for the stop");
+                Err(QuickDownloadAbort::Cancelled)
+            });
+            if drop_it {
+                drop(controller);
+            } else {
+                assert!(controller.cancel());
+                assert!(!controller.is_loading());
+                assert!(!controller.cancel(), "nothing left to cancel");
+            }
+            let outcome = stopped_rx.recv_timeout(PROMPT).expect("the worker stopped promptly");
+            assert_eq!(outcome, Err(Cancelled));
+        }
     }
 }

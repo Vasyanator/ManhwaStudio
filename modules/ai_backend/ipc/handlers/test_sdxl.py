@@ -85,6 +85,8 @@ class _FakeSdxlService:
         self._preview = preview
         self._raise_exc = raise_exc
         self.calls: list[tuple[bytes, bytes, dict[str, Any]]] = []
+        # (config_dir, curated_model_dir) of every call, in call order.
+        self.dirs: list[tuple[str, str | None]] = []
         self.unload_return = True
         self.unload_calls = 0
 
@@ -93,10 +95,13 @@ class _FakeSdxlService:
         image_bytes: bytes,
         mask_bytes: bytes,
         *,
+        config_dir: str,
+        curated_model_dir: str | None = None,
         params: dict[str, Any],
         progress_callback: Any = None,
     ) -> dict[str, Any]:
         self.calls.append((image_bytes, mask_bytes, params))
+        self.dirs.append((config_dir, curated_model_dir))
         if progress_callback is not None:
             for step in range(1, self._n_steps + 1):
                 progress_callback(step, self._n_steps, self._preview)
@@ -138,10 +143,15 @@ def _ctx(svc: _FakeSdxlService, *, emitter: Any = None) -> HandlerContext:
     return ctx
 
 
+# Fictional config directory: the handler forwards it without opening it.
+CONFIG_DIR = "/m/SDXL/config/inpaint"
+
+
 def _header(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     header: dict[str, Any] = {
         "image_len": len(IMAGE_PNG),
         "mask_len": len(MASK_PNG),
+        "sdxl_config_dir": CONFIG_DIR,
     }
     if extra:
         header.update(extra)
@@ -197,6 +207,7 @@ def test_streaming_emits_progress_then_terminal_response() -> None:
 
     # Blob split: image and mask reach the service intact; params forwarded.
     assert svc.calls == [(IMAGE_PNG, MASK_PNG, params)]
+    assert svc.dirs == [(CONFIG_DIR, None)]
 
     # Terminal response: result PNG as the RESPONSE BLOB (raw, byte-identical).
     assert resp_blob == RESULT_PNG
@@ -255,10 +266,39 @@ def test_blob_split_by_lengths() -> None:
     ctx = _ctx(svc)
     image = b"IMAGE-DATA-1234567890"
     mask = b"MASK-XYZ"
-    header = {"image_len": len(image), "mask_len": len(mask), "params": {}}
+    header = {"image_len": len(image), "mask_len": len(mask), "params": {}, "sdxl_config_dir": CONFIG_DIR}
     handler = get_handler(METHOD_INPAINT_SDXL)
     handler(ctx, header, image + mask, _no_cancel())
     assert svc.calls == [(image, mask, {})]
+
+
+def test_curated_model_dir_is_forwarded() -> None:
+    svc = _FakeSdxlService(n_steps=0)
+    handler = get_handler(METHOD_INPAINT_SDXL)
+    handler(_ctx(svc), _header({"sdxl_model_dir": "/m/SDXL/curated"}), IMAGE_PNG + MASK_PNG, _no_cancel())
+    assert svc.dirs == [(CONFIG_DIR, "/m/SDXL/curated")]
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", 3])
+def test_config_dir_is_required(value: Any) -> None:
+    svc = _FakeSdxlService(n_steps=0)
+    header = _header()
+    if value is None:
+        del header["sdxl_config_dir"]
+    else:
+        header["sdxl_config_dir"] = value
+    handler = get_handler(METHOD_INPAINT_SDXL)
+    with pytest.raises(ValueError, match="sdxl_config_dir"):
+        handler(_ctx(svc), header, IMAGE_PNG + MASK_PNG, _no_cancel())
+    assert svc.calls == []
+
+
+def test_non_string_curated_model_dir_raises() -> None:
+    svc = _FakeSdxlService(n_steps=0)
+    handler = get_handler(METHOD_INPAINT_SDXL)
+    with pytest.raises(ValueError, match="sdxl_model_dir"):
+        handler(_ctx(svc), _header({"sdxl_model_dir": 5}), IMAGE_PNG + MASK_PNG, _no_cancel())
+    assert svc.calls == []
 
 
 def test_params_defaults_to_empty_dict_when_absent() -> None:

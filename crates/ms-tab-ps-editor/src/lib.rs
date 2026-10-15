@@ -672,9 +672,12 @@ pub struct PsEditorTabState {
     text_drag_last: Vec2,
     /// Reference for a rotate (last angle, rad) or scale (last distance, px) drag.
     text_drag_ref: f32,
-    /// Last `LayerDoc::version` this tab projected. Each frame, if the live doc version differs, the
-    /// tab re-projects its current page from the shared doc — the in-memory cross-tab sync.
-    last_doc_version: u64,
+    /// `(page, LayerDoc::page_revision)` of this tab's last projection from the doc. Each frame, if
+    /// the active page or its live page revision differs, the tab re-projects the active page from
+    /// the shared doc — the in-memory cross-tab sync. Keyed by page so an edit of ANOTHER page (the
+    /// typing preload, a typing edit elsewhere) never re-projects the active one. `None` before the
+    /// first projection.
+    last_projected_revision: Option<(usize, u64)>,
     /// Trace-only: number of composite steps emitted on the previous frame. Used to gate the
     /// per-frame `draw_composite` detail log so it only fires when the plan size changes (the
     /// composite is rebuilt every frame, so unconditional logging would flood the trace at 60/s).
@@ -1047,7 +1050,7 @@ impl Default for PsEditorTabState {
             text_drag_mode: TextDragMode::Translate,
             text_drag_last: Vec2::ZERO,
             text_drag_ref: 0.0,
-            last_doc_version: 0,
+            last_projected_revision: None,
             trace_last_composite_steps: usize::MAX,
             layer_doc: None,
             pending_actual_size: false,
@@ -1206,9 +1209,9 @@ impl PsEditorTabState {
 
         let _s = ms_log::trace_scope!(
             cat::SYNC,
-            "sync_view_from_doc page={} doc_version={}",
+            "sync_view_from_doc page={} page_revision={}",
             page_idx,
-            guard.version()
+            guard.page_revision(page_idx)
         );
 
         // --- Groups: rebuild from the doc, reusing session ids for surviving uids. ---
@@ -1417,9 +1420,9 @@ impl PsEditorTabState {
         // --- Bands: derive unified Z directly from the doc node z (the shared ordering owner). ---
         self.bands = ordering::doc_page_bands(page);
 
-        // Record the doc version we just projected so the per-frame version check does not
-        // redundantly re-project until the doc changes again.
-        self.last_doc_version = guard.version();
+        // Record the page revision we just projected so the per-frame check does not redundantly
+        // re-project until the doc changes this page again.
+        self.last_projected_revision = Some((page_idx, guard.page_revision(page_idx)));
 
         drop(guard);
         for id in drop_caches {
@@ -1434,8 +1437,8 @@ impl PsEditorTabState {
 
     /// Routes a raster/group MODEL edit to the shared `LayerDoc`: locks it, runs `edit` against the
     /// resident page (loaded by `poll_loader`), flushes the page to disk (so it survives reloads /
-    /// save-to-project), and re-projects the view from the doc. The doc mutation bumps the doc
-    /// version, so the typing tab re-projects via its per-frame version check. Returns false (the
+    /// save-to-project), and re-projects the view from the doc. The doc mutation advances the page's
+    /// revision, so the typing tab re-projects via its per-frame revision check. Returns false (the
     /// caller keeps its legacy path) when no doc is wired or the page isn't resident.
     fn route_to_doc<F>(&mut self, page_idx: usize, project: &ProjectData, edit: F) -> bool
     where
@@ -1451,13 +1454,13 @@ impl PsEditorTabState {
             if guard.page(page_idx).is_none() {
                 return false;
             }
-            let version_before = guard.version();
+            let revision_before = guard.page_revision(page_idx);
             edit(&mut guard);
             // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
-            // `node_mut` (which does not bump the version); skipped when a mutator already bumped, so
-            // one edit is one version step.
-            if guard.version() == version_before {
-                guard.mark_changed();
+            // `node_mut` (which does not bump); skipped when a mutator already bumped THIS page, so
+            // one edit is one revision step.
+            if guard.page_revision(page_idx) == revision_before {
+                guard.mark_page_changed(page_idx);
             }
             // Persist so the change survives a reload / save-to-project. ASYNC: enqueue the page job
             // to the background saver (PNG encode + manifest RMW off the GUI thread); falls back to a
@@ -1618,7 +1621,7 @@ impl PsEditorTabState {
             && guard.page(page_idx).is_some()
         {
             guard.set_raster_pixels(page_idx, &uid, reverted.clone(), reverted, Vec::new(), true);
-            guard.mark_changed();
+            guard.mark_page_changed(page_idx);
         }
         Ok(())
     }
@@ -1905,14 +1908,14 @@ impl PsEditorTabState {
                     node.deform = layer.deform.clone();
                     let added = guard.add_node_at_z(page_idx, node, z);
                     if added {
-                        guard.mark_changed();
+                        guard.mark_page_changed(page_idx);
                     }
                     added
                 }
                 LifecycleDir::Removed => {
                     let removed = guard.remove_node(page_idx, &uid);
                     if removed {
-                        guard.mark_changed();
+                        guard.mark_page_changed(page_idx);
                     }
                     removed
                 }
@@ -2274,13 +2277,13 @@ impl PsEditorTabState {
             if guard.page(page_idx).is_none() {
                 return false;
             }
-            let version_before = guard.version();
+            let revision_before = guard.page_revision(page_idx);
             edit(&mut guard);
             // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
-            // `node_mut` (which does not bump the version); skipped when a mutator already bumped, so
-            // one edit (e.g. one opacity drag tick) is one version step.
-            if guard.version() == version_before {
-                guard.mark_changed();
+            // `node_mut` (which does not bump); skipped when a mutator already bumped THIS page, so
+            // one edit (e.g. one opacity drag tick) is one revision step.
+            if guard.page_revision(page_idx) == revision_before {
+                guard.mark_page_changed(page_idx);
             }
         }
         // This edit only changed in-memory MODEL state (it deferred disk persistence to page-leave /
@@ -2311,40 +2314,40 @@ impl PsEditorTabState {
         }
     }
 
-    /// Per-frame cross-tab sync: re-project the current page when the shared `LayerDoc` changed
-    /// (its `version` advanced) since this tab last projected. Any edit in the typing tab (or our own
-    /// that routed through the doc) bumps the doc version; this is the in-memory cross-tab path
-    /// (replacing the old disk-revision bridge).
+    /// Per-frame cross-tab sync: re-project the active page when the shared `LayerDoc` changed THAT
+    /// page (its `page_revision` advanced, or the active page differs from the last projected one)
+    /// since this tab last projected. Any edit of the page in the typing tab (or our own that routed
+    /// through the doc) advances its page revision; an edit of another page does not. This is the
+    /// in-memory cross-tab path (replacing the old disk-revision bridge). Cheap when nothing changed:
+    /// one lock and one map lookup.
     fn refresh_view_if_doc_version_changed(&mut self) {
         let Some(doc) = self.layer_doc.clone() else {
             return;
         };
+        // No active page: nothing to project (re-checked next frame, still only a field read).
+        let Some(page_idx) = self.active_page_idx else {
+            return;
+        };
         let current = match doc.lock() {
-            Ok(guard) => guard.version(),
+            Ok(guard) => (page_idx, guard.page_revision(page_idx)),
             Err(_) => return,
         };
-        if current == self.last_doc_version {
+        if Some(current) == self.last_projected_revision {
             return;
         }
         if self.dragging_text_layer.is_some() {
             return; // don't yank a layer out from under an in-progress drag
         }
-        let Some(page_idx) = self.active_page_idx else {
-            // No active page to project yet; adopt the version so we don't re-check every frame.
-            self.last_doc_version = current;
-            return;
-        };
         ms_log::trace_log!(
             cat::SYNC,
-            "doc_version_changed old={} new={} page={} -> reproject",
-            self.last_doc_version,
-            current,
-            page_idx
+            "page_revision_changed old={:?} new={:?} -> reproject",
+            self.last_projected_revision,
+            current
         );
         // Materialize the text-layer RUNTIMES from the doc (so a text layer the typing tab just created
         // has a local `PsTextLayer` for the projection to reconcile onto — no disk read), then project
         // the shared doc over the stack rasters / text model / bands. `sync_view_from_doc` updates
-        // `last_doc_version` and preserves uncommitted in-memory edits (pixels_dirty layers).
+        // `last_projected_revision` and preserves uncommitted in-memory edits (pixels_dirty layers).
         self.materialize_text_runtime_from_doc(page_idx);
         self.sync_view_from_doc(page_idx);
     }
@@ -10496,9 +10499,68 @@ mod tests {
         let dir = ScratchDir::new("opacity_bump");
         let project = project_in(&dir);
         let (mut ps, doc) = ps_on_doc_page_with_group(&project);
-        let v0 = doc.lock().expect("doc lock").version();
+        let (v0, r0) = {
+            let guard = doc.lock().expect("doc lock");
+            (guard.version(), guard.page_revision(0))
+        };
         ps.apply_group_op(GroupOp::GroupOpacity(G.to_string(), 0.5), &project);
-        assert_eq!(doc.lock().expect("doc lock").version(), v0 + 1);
+        let guard = doc.lock().expect("doc lock");
+        assert_eq!(guard.version(), v0 + 1);
+        assert!(guard.page_revision(0) > r0, "the edited page's revision advanced");
+        assert_eq!(guard.page_revision(0), guard.version(), "one step: the page stamp is the new version");
+    }
+
+    /// S-050: the per-frame sync keys on the ACTIVE page's revision. An edit of another doc page (a
+    /// typing edit or preload elsewhere) does not re-project the active page; an edit of the active
+    /// page does, and records its new revision.
+    #[test]
+    fn only_an_edit_of_the_active_page_reprojects_it() {
+        let dir = ScratchDir::new("page_revision_sync");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page(&project, false);
+        let projected = ps.last_projected_revision;
+        assert_eq!(projected, Some((0, doc.lock().expect("doc lock").page_revision(0))), "the load projection recorded page 0");
+        // A marker only a re-projection would undo: `sync_view_from_doc` rebuilds the bands.
+        ps.bands.clear();
+
+        {
+            let mut guard = doc.lock().expect("doc lock");
+            guard.insert_decoded_page(1, DecodedPagePayload { nodes: vec![doc_node(R1, NodeKind::Raster, 0, false)], groups: Vec::new() });
+            guard.set_opacity(1, R1, 0.5);
+        }
+        ps.refresh_view_if_doc_version_changed();
+        assert!(ps.bands.is_empty(), "an edit of page 1 did not re-project page 0");
+        assert_eq!(ps.last_projected_revision, projected);
+
+        doc.lock().expect("doc lock").set_opacity(0, R1, 0.5);
+        ps.refresh_view_if_doc_version_changed();
+        assert!(!ps.bands.is_empty(), "an edit of the active page re-projected it");
+        assert_eq!(ps.last_projected_revision, Some((0, doc.lock().expect("doc lock").page_revision(0))));
+    }
+
+    /// S-050: a PS funnel edit made only through `node_mut` (no bumping mutator) still marks the edited
+    /// page changed, so the typing tab re-projects it, and leaves other pages' revisions alone.
+    #[test]
+    fn a_node_mut_only_funnel_edit_marks_its_page_changed() {
+        let dir = ScratchDir::new("node_mut_funnel");
+        let project = project_in(&dir);
+        let (mut ps, doc) = ps_on_doc_page(&project, false);
+        let r1 = {
+            let mut guard = doc.lock().expect("doc lock");
+            guard.insert_decoded_page(1, DecodedPagePayload { nodes: Vec::new(), groups: Vec::new() });
+            guard.page_revision(1)
+        };
+        let r0 = doc.lock().expect("doc lock").page_revision(0);
+        assert!(ps.edit_doc_node(0, |doc| {
+            if let Some(node) = doc.node_mut(0, R1) {
+                node.name = "renamed".to_string();
+            }
+        }));
+        let guard = doc.lock().expect("doc lock");
+        assert!(guard.page_revision(0) > r0, "the funnel marked page 0 changed");
+        assert_eq!(guard.page_revision(1), r1, "page 1 is untouched");
+        drop(guard);
+        assert_eq!(ps.last_projected_revision, Some((0, doc.lock().expect("doc lock").page_revision(0))), "the funnel re-projected page 0");
     }
 
     /// Review High-2: a deferred (`edit_doc_node`) edit has not reached the autosave gate yet, so it

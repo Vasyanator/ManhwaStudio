@@ -2,24 +2,27 @@
 File: modules/ai_backend/engines/surya_checkpoints.py
 
 Purpose:
-Presence check and eager download of the `s3://` checkpoints used by the
+Presence check of the Surya checkpoint directories that Rust downloads, and the
+one place that points Surya's process-global settings at them, for the
 Surya-backed services (`ocr/surya.py`, `detection/surya.py`).
 
 Why it exists:
-Surya resolves an `s3://` checkpoint lazily, inside the very `from_pretrained`
-call that also builds the model and moves it onto the device
-(`surya/common/s3.py::S3DownloaderMixin.from_pretrained` -> `download_directory`,
-3 attempts with a 5 s sleep between them). A service that wraps such a call in
-`rocm_mmap_transfer.patched_module_to` would hold a process-global patch around
-minutes of network I/O on a clean install, which that helper's contract
-explicitly forbids. Fetching the checkpoint through
-`ensure_checkpoint_downloaded()` first leaves only the weight transfer inside
-the patch.
+Rust owns the Surya weights (pinned external catalog, `manifest.json` plus the
+files it lists): the backend receives each absolute checkpoint directory per
+request and loads it offline. Left alone, Surya resolves its built-in `s3://`
+defaults (`surya/settings.py`) and downloads them inside the very
+`from_pretrained` call that builds the model
+(`surya/common/s3.py::S3DownloaderMixin.from_pretrained` -> `download_directory`).
+A local directory instead goes straight to transformers' `from_pretrained`, so
+proving the directory complete first and passing it as `checkpoint=` is what
+keeps every Surya load free of network access.
 
 Key functions:
-- `checkpoint_local_dir()`: directory Surya keeps (or would keep) a checkpoint in;
-- `checkpoint_ready()`: whether that directory holds a complete checkpoint;
-- `ensure_checkpoint_downloaded()`: download once and verify the manifest.
+- `checkpoint_ready()`: whether a directory holds every file of its manifest;
+- `require_local_checkpoint()`: the same as a typed precondition with an
+  explicit "not downloaded" error;
+- `point_settings_at()`: assign the local directories to Surya's checkpoint
+  settings, so no code path inside the library falls back to an `s3://` default.
 
 Notes:
 The Surya package is imported lazily, so a backend installation without it can
@@ -30,37 +33,16 @@ instead of guessing.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 log = logging.getLogger(__name__)
-
-# Prefix Surya uses for checkpoints it downloads from its own object storage.
-S3_PREFIX = "s3://"
-
-
-def checkpoint_local_dir(checkpoint: str) -> str:
-    """Local directory Surya uses for `checkpoint`, or `""` when unknown.
-
-    A non-`s3://` value is already a local path and is returned unchanged.
-    Returns `""` only when the Surya package - which owns the cache layout - is
-    not importable, i.e. "cannot tell", never a guessed path.
-    """
-    normalized = str(checkpoint or "").strip()
-    if not normalized.startswith(S3_PREFIX):
-        return normalized
-    try:
-        from surya.common.s3 import S3DownloaderMixin  # type: ignore
-    except Exception as exc:
-        log.debug("Cannot resolve the Surya cache path for %s: %s", normalized, exc)
-        return ""
-    return str(S3DownloaderMixin.get_local_path(normalized))
 
 
 def checkpoint_ready(local_dir: str) -> bool:
     """Whether `local_dir` holds every file listed in its `manifest.json`.
 
     `False` for an empty path and when Surya is not importable: the answer is
-    "cannot prove the checkpoint is complete", which callers must treat as
-    "download it", never as an optimistic yes.
+    "cannot prove the checkpoint is complete", never an optimistic yes.
     """
     normalized = str(local_dir or "").strip()
     if not normalized:
@@ -73,45 +55,59 @@ def checkpoint_ready(local_dir: str) -> bool:
     return bool(check_manifest(normalized))
 
 
-def ensure_checkpoint_downloaded(checkpoint: str, *, label: str) -> None:
-    """Make sure `checkpoint` is complete on disk, downloading it when it is not.
+def require_local_checkpoint(local_dir: str, *, label: str) -> str:
+    """Return `local_dir` when it is an absolute directory with a complete manifest.
 
     `label` names the model in error messages (for example
-    `"Surya OCR foundation"`). On return the checkpoint can be loaded without
-    any further network access, which is what lets a caller keep
-    `rocm_mmap_transfer.patched_module_to` around the weight transfer alone.
-    A checkpoint that is already complete costs one manifest check.
+    `"Surya OCR recognition"`). Never downloads: the directory is Rust's, so an
+    absent or incomplete one is reported as "not downloaded".
 
     # Raises
-    `FileNotFoundError` if a non-`s3://` checkpoint does not hold a complete
-    checkpoint on disk, and `RuntimeError` if the Surya download helpers are
-    missing, the cache path cannot be resolved, or the download finishes with an
-    incomplete manifest.
+    `ValueError` for an empty or relative path, `FileNotFoundError` ("not
+    downloaded") when the directory is missing or its `manifest.json` is
+    missing, unreadable or lists a missing file, and `RuntimeError` when the
+    Surya package is not importable (the manifest cannot be checked).
     """
-    normalized = str(checkpoint or "").strip()
-    local_dir = checkpoint_local_dir(normalized)
-    if local_dir and checkpoint_ready(local_dir):
-        return
-    if not normalized.startswith(S3_PREFIX):
-        raise FileNotFoundError(f"{label} checkpoint not found: {normalized}")
-
+    normalized = str(local_dir or "").strip()
+    if not normalized:
+        raise ValueError(f"{label} checkpoint directory is required.")
+    if not Path(normalized).is_absolute():
+        raise ValueError(f"{label} checkpoint directory must be absolute: {normalized}")
+    if not Path(normalized).is_dir():
+        raise FileNotFoundError(
+            f"{label} model is not downloaded: directory does not exist: {normalized}"
+        )
     try:
-        from surya.common.s3 import download_directory  # type: ignore
+        from surya.common.s3 import check_manifest  # type: ignore
     except Exception as exc:
-        raise RuntimeError(
-            f"{label} download helpers are not available: {exc}"
-        ) from exc
-
-    if not local_dir:
-        raise RuntimeError(
-            f"{label} checkpoint path is invalid for download: {normalized}"
+        raise RuntimeError(f"{label}: the Surya package is not available: {exc}") from exc
+    if not check_manifest(normalized):
+        raise FileNotFoundError(
+            f"{label} model is not downloaded: {normalized} has no complete manifest.json"
         )
+    return normalized
 
-    remote_dir = normalized.removeprefix(S3_PREFIX)
-    log.info("%s checkpoint download start remote=%s local_dir=%s", label, remote_dir, local_dir)
-    download_directory(remote_dir, local_dir)
-    if not checkpoint_ready(local_dir):
-        raise RuntimeError(
-            f"{label} checkpoint download finished but manifest is incomplete: {local_dir}"
-        )
-    log.info("%s checkpoint ready local_dir=%s", label, local_dir)
+
+def point_settings_at(*, detection_dir: str | None = None, recognition_dir: str | None = None) -> None:
+    """Assign local checkpoint directories to Surya's process-global settings.
+
+    `detection_dir` sets `DETECTOR_MODEL_CHECKPOINT`; `recognition_dir` sets
+    `FOUNDATION_MODEL_CHECKPOINT` and `RECOGNITION_MODEL_CHECKPOINT` (one
+    checkpoint serves both in surya-ocr 0.17.1). `None` leaves a setting as it
+    is. Callers pass the directory as `checkpoint=` too; this is the second
+    line, so a library default read elsewhere (a loader or a tokenizer built
+    without an explicit checkpoint) cannot resolve an `s3://` default and
+    download it. Call it under the service lock, right before construction.
+
+    # Raises
+    `RuntimeError` when `surya.settings` is not importable.
+    """
+    try:
+        from surya.settings import settings  # type: ignore
+    except Exception as exc:
+        raise RuntimeError(f"Surya settings are not available: {exc}") from exc
+    if detection_dir is not None:
+        settings.DETECTOR_MODEL_CHECKPOINT = detection_dir
+    if recognition_dir is not None:
+        settings.FOUNDATION_MODEL_CHECKPOINT = recognition_dir
+        settings.RECOGNITION_MODEL_CHECKPOINT = recognition_dir

@@ -75,7 +75,7 @@ pub(super) fn lama_run_header(
 /// Runs one inpaint pass and returns the result image, exactly the size of `region`.
 ///
 /// Blocking, and therefore worker-thread only. It also performs the ensure-before-run step,
-/// which may download the checkpoint.
+/// which may download the checkpoint (cancellable and reported through `downloads`).
 ///
 /// `mask` is the host's painted layer as L8 bytes, exactly `region.size[0] * region.size[1]`
 /// of them. It is put on the wire verbatim: the meaning is "remove what is under it".
@@ -89,12 +89,13 @@ pub(super) fn run_lama(
     mask: &[u8],
     spec: &LamaModelSpec,
     settings: &LamaSettings,
+    downloads: &mut EnsureCtx<'_>,
 ) -> Result<egui::ColorImage, String> {
     let (width, height) = (region.size[0], region.size[1]);
     if mask.len() != width.saturating_mul(height) {
         return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
     }
-    ensure_lama_model_ready(spec)?;
+    ensure_lama_model_ready(spec, downloads)?;
 
     let image_png = encode_color_image_png_rgba(region)?;
     let mask_png = encode_mask_png_l8(mask, width, height)?;

@@ -5,8 +5,9 @@ App-layer loader that lazily resolves the official ONNX Runtime dynamic library
 for the current platform and a selected BUILD, so the `ms-onnx` crate can
 `dlopen` it. A **build** is a concrete onnxruntime binary of a specific version
 exposing a specific execution-provider set (see `builds.rs`). It probes a portable
-cache, and on first use downloads the pinned official release archive, verifies its
-SHA256, and extracts the loadable library (plus any extra sibling libs). On Android the
+cache, and on first use downloads the pinned official release archive through
+`ms-download` (resumable, retried, cancellable, exact size + SHA256 verified), and
+extracts the loadable library (plus any extra sibling libs) atomically. On Android the
 library is BUNDLED in the APK instead (official `onnxruntime-android` AAR) and is only
 located, never downloaded. It delivers
 dylib RESOLUTION only: it does not link, initialize, or run onnxruntime.
@@ -15,7 +16,8 @@ dylib RESOLUTION only: it does not link, initialize, or run onnxruntime.
 
 ## Architecture
 `ms_config::data_dir()/onnxruntime/<build_slug>/<version>/` is the per-build,
-per-version cache root. Resolution flow (`resolve_or_download_ort_dylib(build)`):
+per-version cache root. Resolution flow (`resolve_or_download_ort_dylib(build, cancel,
+progress)`; the download-row half is `resolve_download_entry` over an injected fetcher):
 
 ```
 PlatformFeature::NativeOnnxRuntime unavailable (wasm) -> Unavailable, nothing touched
@@ -23,11 +25,20 @@ manifest lookup_build (os, arch, build) -> (miss) NoManifestEntry, no network
     -> (bundled row) <package nativeLibraryDir>/<library>, is_file -> return path
                      (else BundledLibraryMissing / NativeLibraryDir), no network, no cache
     -> (download row) version = entry.version (per-entry, NOT global)
-    -> probe cache: ALL expected members present? -> (hit) return path, no network
-    -> (miss) for the primary source AND each additional_source:
-            download archive to <name>.part -> atomic rename
-            -> SHA256 verify (mismatch = hard error, delete file)
-            -> extract only the needed library member(s) into the cache dir
+    -> probe cache: marker `.ort-cache-complete` matches this row's recipe AND every
+       expected member exists at its recorded size? -> (hit) return path, no network
+    -> (miss) BusyGuard::acquire_waiting("ort:<build>:<version>")  [WaitingForOtherDownload]
+    -> re-probe (the other holder may have finished) -> (hit) return path
+    -> remove the marker + fsync dir (BEFORE any member is replaced)
+    -> for each additional_source, then the primary source (published LAST):
+            claim .download/<name>.part (its .part.id = url + sha256; foreign -> delete)
+            -> ms_download::fetch_verified(SizeSha256): resume, retry [Retrying],
+               hash, mismatch deletes the .part, fsync + rename to .download/<name>
+            -> extract wanted members to <dest>.tmp (fsync), all found? rename each
+               (primary library last), fsync dir; else remove the temporaries
+            -> delete the archive
+    -> write the marker (recipe + `member <name> <size> <sha256>` lines) via .tmp,
+       fsync, rename, fsync dir
     -> return primary dylib path
 ```
 
@@ -74,10 +85,14 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
 
 ## Files and submodules
 - `lib.rs`: crate root and public API — `OrtRuntimeError`, `OrtDownloadProgress`/`OrtDownloadStage`,
-  `ort_dylib_dir`, `resolve_or_download_ort_dylib(build, ...)`. Owns download (ureq
-  streaming), archive extraction dispatch (zip / tar.gz / tar.zst, with `./` tar-key
-  normalization), and the cfg-selected expected library filename. Edit here for
-  download/extract/progress behavior.
+  `ort_dylib_dir`, `resolve_or_download_ort_dylib(build, cancel, progress)`,
+  `ort_build_installed(build)` (the single owner of "is this build installed": the same
+  marker + member-size rule as the resolver's fast path; stat-only, worker thread). Owns the
+  per-build busy wait, the `.part` identity (`claim_part`), the mapping of `ms-download`
+  events / errors onto progress / `OrtRuntimeError`, atomic archive extraction (zip /
+  tar.gz / tar.zst, with `./` tar-key normalization), and the cfg-selected expected
+  library filename. Edit here for download/extract/progress behavior; the HTTP, retry and
+  verification mechanics themselves are `ms-download`'s.
 - `builds.rs`: the static build catalog (`OrtBuild`, `BuildCategory`) and its API
   (`all_builds`, `build_by_slug`, `build_execution_providers`,
   `default_build_for_current_os`, `default_build_for_provider`). Edit here to add a
@@ -93,8 +108,8 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
   `build_source_kind_here` / `ort_downloads_offered_here` (download vs bundled, for the panel),
   `BundledEntry` / `BuildSource`,
   `provider_version` (compat shim), `current_platform` over the pure `platform_keys`
-  (`android` is its own os key with only bundled rows, never `linux`), and SHA256 helpers. Edit here
-  to change the manifest schema or integrity checks.
+  (`android` is its own os key with only bundled rows, never `linux`). Edit here
+  to change the manifest schema or the pins (`size` + `sha256` per source).
 - `ort_manifest.json`: the pinned per-`(os, arch, provider, build)` download recipes,
   each carrying its `build` slug, `version`, and (optionally) `additional_sources`; plus the
   `bundled` table (libraries shipped inside the app package, Android only).
@@ -109,20 +124,30 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
   `BundledLibraryMissing` (logged with the path), never a download.
 - App-starts-without-library: resolution is lazy and first-use only; a missing
   library is never an error until a caller asks for it.
-- Integrity: a pinned SHA256 that mismatches is a HARD error — the archive is
-  deleted and resolution aborts; extraction never runs on an unverified-mismatch
-  file. When an entry has `sha256: null`, integrity is NOT verified: the actual
-  digest is computed and logged via `runtime_log` (a documented, visible gap, not
-  a silent fallback).
-  - Removal condition for the null-hash gap: paste the logged SHA256 into the
-    corresponding `ort_manifest.json` entry. Every non-GPU shipping build carries a
-    real, verified hash: CPU (Linux x64 / Windows x64 / macOS arm64) and CoreML
-    (macOS arm64) use GitHub release digests; DirectML, WebGPU, and OpenVINO use PyPI
-    wheel digests. Only the four large GPU builds — cuda13 (Windows/Linux, 1.27.0) and
-    cuda12 (Windows/Linux, 1.24.1) — ship with `sha256: null` on purpose: the archives
-    are hundreds of MB (cuda13 win ~329 MB / linux ~212 MB; cuda12 win ~281 MB / linux
-    ~205 MB) and integrity is computed-and-logged, not verified. Removal condition:
-    download each GPU archive once, copy the logged SHA256 into its entry.
+- Integrity: every download source pins `size` and `sha256` (required fields: an unpinned
+  row does not parse; tests `every_source_pins_size_and_sha256`,
+  `a_row_without_sha256_or_size_does_not_parse`). GitHub release assets use GitHub's
+  digests, PyPI wheels the PyPI digests. A mismatch is a HARD error
+  (`ChecksumMismatch`): the `.part` is deleted and nothing is extracted.
+- Network contract (`PROJECT_RULES.md` "Network downloads"): `ms-download`'s standard
+  retry schedule and timeouts; the `.part` survives a failure, a cancel or an app exit and
+  is resumed by the next call; the sidecar `<archive>.part.id` (url + sha256) discards a
+  `.part` staged for another manifest row (missing or unreadable identity = discard).
+  Retries surface as `OrtDownloadStage::Retrying`, a cancel as `OrtRuntimeError::Cancelled`.
+- One resolution per build at a time in the process (busy id `ort:<build>:<version>`):
+  the settings panel and a native OCR load never write one build's files concurrently;
+  the second caller waits (`WaitingForOtherDownload`) and then takes the fast path.
+- Atomic extraction: a member is published only by renaming its fsynced `<dest>.tmp`, and
+  only once every member of the archive was found; the primary library is renamed last.
+- Cache trust = the completion marker (`CACHE_MARKER`, format line `CACHE_MARKER_FORMAT`):
+  its recipe header (format, build, version, every source's url + sha256 in fetch order)
+  must equal the current manifest row, it must list exactly the expected member file
+  names, and each must exist at the recorded size (sizes only on the fast path; the
+  recorded sha256 is diagnostic). The marker is removed durably before the first member
+  rename and written atomically after the last, so a crash mid-publication, a truncated
+  member, a re-pinned row or a cache from a program without markers is rebuilt — from the
+  still-staged verified archive when it exists (`fetch_verified` keeps a matching `dest`),
+  else by downloading again.
 - Multi-lib builds: `extra_members` lists additional archive-internal libraries
   extracted next to the primary `dylib_member` in the SAME cache directory. DirectML
   (PyPI `onnxruntime-directml` **1.24.4** wheel, members under `onnxruntime/capi/`)
@@ -178,7 +203,7 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
   rows' `version` and the `cpu` / `xnnpack` catalog `onnx_version` together (tests pin all
   three; a different `cpu` version per OS is not expressible today).
 - Bump a build's version, add a platform, or add a build: `ort_manifest.json` (per-entry
-  `provider`, `build`, `version`, `url`, `sha256`, `archive`, `dylib_member`,
+  `provider`, `build`, `version`, `url`, `sha256`, `size`, `archive`, `dylib_member`,
   `extra_members`, and optional `additional_sources`) AND the `builds.rs` catalog row.
   `ORT_VERSION` is only the legacy 1.20.1 fallback floor.
 - Change a build's EP set, category, display name, or the per-OS/per-provider default:
@@ -188,5 +213,5 @@ This module produces the dylib path that `ms-onnx` consumes; it never depends on
 - Change download/progress/extraction behavior: `lib.rs`.
 - Change manifest schema, lookup, platform keys, hashing, or the version shims:
   `manifest.rs`.
-- Resolve a build's dylib: call `resolve_or_download_ort_dylib(build, ...)` from a
-  worker, pass the returned path to `ms_onnx::OrtRuntime::load`.
+- Resolve a build's dylib: call `resolve_or_download_ort_dylib(build, cancel, progress)`
+  from a worker, pass the returned path to `ms_onnx::OrtRuntime::load`.

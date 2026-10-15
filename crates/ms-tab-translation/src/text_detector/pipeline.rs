@@ -15,24 +15,54 @@ Key items:
 - `detect_page_file()`: decode a page file on the worker and run `detect_image`.
 - `ctd_detect_params()`: the CTD options' share of `DetectParams`.
 - `detect_error_message()`: `DetectError` -> localized text.
+- `DetectFailure`: a detection's failure — cancelled (the caller's flag stopped a model
+  download) or a localized message.
 
 Notes:
 Logs (`ms_log::runtime_log`, `[text-detector]` prefix): the plan (engine, source size, scale,
 scaled size, grid, tiles), each runner batch (in the runners), and the outcome with timings.
 No mask dilation here: the caller dilates (page batches in `mod.rs`, regions in `region.rs`).
-Worker-thread only: decode, IPC and inference are blocking.
+Worker-thread only: decode, IPC and inference are blocking. Every entry takes the caller's
+`ai_models::EnsureCtx`: its cancel flag stops a model download (native detector model or the
+backend engine's files) and its progress sink receives the download events.
 */
 
 use super::TextDetectorPageResult;
 use ms_local_ai::local_ai::AiRouteKind;
 use super::backend::{IpcRunner, SharedClientTransport, ensure_backend_models, forward_engine};
 use image::RgbImage;
+use ms_sysprobe::ai_models::{EnsureCtx, ModelEnsureError};
 use ms_text_detect::mask::MaskError;
 use ms_text_detect::{
     DetectError, DetectParams, Detection, DetectionPlan, EngineKind, PlanError, plan_detection, run_detection,
 };
 use std::path::Path;
 use web_time::Instant;
+
+/// Why a detection produced no result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetectFailure {
+    /// The caller's cancel flag stopped a model download: a neutral outcome, never an error and
+    /// never retried on the backend.
+    Cancelled,
+    /// A real failure; the localized user-facing message.
+    Failed(String),
+}
+
+impl From<String> for DetectFailure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<ModelEnsureError> for DetectFailure {
+    fn from(error: ModelEnsureError) -> Self {
+        match error {
+            ModelEnsureError::Cancelled => Self::Cancelled,
+            ModelEnsureError::Failed(message) => Self::Failed(message),
+        }
+    }
+}
 
 /// Where a PaddleOCR text-detection forward pass runs. CTD and Surya always run on the backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,13 +204,15 @@ fn log_outcome(engine: EngineKind, route: &str, detection: &Detection, started: 
 ///
 /// `route` is consulted only for PaddleOCR (CTD and Surya always use the backend). Under the
 /// native route a failure for which [`backend_fallback_applies`] is logged and the WHOLE page is
-/// re-run on the backend, so the user still gets a result when the backend is up.
-/// Worker-thread only (blocking inference / IPC, model ensure).
+/// re-run on the backend, so the user still gets a result when the backend is up — unless
+/// `ctx.cancel` is set, which ends the detection as cancelled. Worker-thread only (blocking
+/// inference / IPC, model ensure).
 ///
 /// # Errors
-/// The localized text of a plan failure, an unsupported engine (`Classic` has no runner), a
+/// [`DetectFailure::Cancelled`] when `ctx.cancel` stopped a model download; otherwise `Failed`
+/// with the localized text of a plan failure, an unsupported engine (`Classic` has no runner), a
 /// missing model, a runner failure or a postprocess failure (all logged).
-pub(super) fn detect_image(engine: EngineKind, page: &RgbImage, params: &DetectParams, route: DetectorRoute) -> Result<Detection, String> {
+pub(super) fn detect_image(engine: EngineKind, page: &RgbImage, params: &DetectParams, route: DetectorRoute, ctx: &mut EnsureCtx<'_>) -> Result<Detection, DetectFailure> {
     let plan = plan_detection(engine, [page.width(), page.height()], params).map_err(|err| {
         ms_log::runtime_log::log_error(format!("[text-detector] {} plan failed: {err}", engine_label(engine)));
         detect_error_message(engine, &DetectError::Plan(err))
@@ -188,7 +220,7 @@ pub(super) fn detect_image(engine: EngineKind, page: &RgbImage, params: &DetectP
     log_plan(&plan);
 
     if native_applies(engine, route)
-        && let Some(done) = try_native(engine, &plan, page)
+        && let Some(done) = try_native(engine, &plan, page, ctx)
     {
         return done;
     }
@@ -196,11 +228,11 @@ pub(super) fn detect_image(engine: EngineKind, page: &RgbImage, params: &DetectP
     let Some(forward) = forward_engine(engine) else {
         let err = DetectError::Unsupported { engine };
         ms_log::runtime_log::log_error(format!("[text-detector] {err}"));
-        return Err(detect_error_message(engine, &err));
+        return Err(DetectFailure::Failed(detect_error_message(engine, &err)));
     };
-    ensure_backend_models(forward)?;
+    let model_dirs = ensure_backend_models(forward, ctx)?;
     let started = Instant::now();
-    let mut runner = IpcRunner::new(forward, SharedClientTransport);
+    let mut runner = IpcRunner::new(forward, SharedClientTransport, model_dirs);
     match run_detection(&plan, page, &mut runner) {
         Ok(detection) => {
             log_outcome(engine, "backend", &detection, started);
@@ -208,21 +240,28 @@ pub(super) fn detect_image(engine: EngineKind, page: &RgbImage, params: &DetectP
         }
         Err(err) => {
             ms_log::runtime_log::log_error(format!("[text-detector] {} via backend failed: {err:?}", engine_label(engine)));
-            Err(detect_error_message(engine, &err))
+            Err(DetectFailure::Failed(detect_error_message(engine, &err)))
         }
     }
 }
 
-/// Runs the plan on the native Paddle runner. `Some` is final (success, or a failure the
-/// backend would share); `None` means "re-run on the backend" (the reason is logged).
+/// Runs the plan on the native Paddle runner. `Some` is final (success, a cancel, or a failure
+/// the backend would share); `None` means "re-run on the backend" (the reason is logged).
 #[cfg(not(target_arch = "wasm32"))]
-fn try_native(engine: EngineKind, plan: &DetectionPlan, page: &RgbImage) -> Option<Result<Detection, String>> {
+fn try_native(engine: EngineKind, plan: &DetectionPlan, page: &RgbImage, ctx: &mut EnsureCtx<'_>) -> Option<Result<Detection, DetectFailure>> {
     let started = Instant::now();
-    let mut runner = super::native::NativePaddleRunner;
+    let cancel = ctx.cancel;
+    let mut runner = super::native::NativePaddleRunner { ctx };
     match run_detection(plan, page, &mut runner) {
         Ok(detection) => {
             log_outcome(engine, "native", &detection, started);
             Some(Ok(detection))
+        }
+        // A runner failure while the flag is set is the cancelled model download (or a run the
+        // caller no longer wants): never re-run it on the backend.
+        Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+            ms_log::runtime_log::log_info(format!("[text-detector] native {} detection cancelled", engine_label(engine)));
+            Some(Err(DetectFailure::Cancelled))
         }
         Err(err) if backend_fallback_applies(&err) => {
             ms_log::runtime_log::log_error(format!(
@@ -233,14 +272,14 @@ fn try_native(engine: EngineKind, plan: &DetectionPlan, page: &RgbImage) -> Opti
         }
         Err(err) => {
             ms_log::runtime_log::log_error(format!("[text-detector] native {} detection failed: {err:?}", engine_label(engine)));
-            Some(Err(detect_error_message(engine, &err)))
+            Some(Err(DetectFailure::Failed(detect_error_message(engine, &err))))
         }
     }
 }
 
 /// The web build has no native runtime: every page goes to the backend.
 #[cfg(target_arch = "wasm32")]
-fn try_native(_engine: EngineKind, _plan: &DetectionPlan, _page: &RgbImage) -> Option<Result<Detection, String>> {
+fn try_native(_engine: EngineKind, _plan: &DetectionPlan, _page: &RgbImage, _ctx: &mut EnsureCtx<'_>) -> Option<Result<Detection, DetectFailure>> {
     None
 }
 
@@ -255,11 +294,11 @@ pub(super) fn detection_into_page_result(detection: Detection) -> TextDetectorPa
 }
 
 /// Decodes the page file `path` to RGB (alpha dropped) on the calling worker and runs
-/// [`detect_image`]. The returned mask is NOT dilated (the batch driver does it).
+/// [`detect_image`] with `ctx`. The returned mask is NOT dilated (the batch driver does it).
 ///
 /// # Errors
 /// The localized open / empty-image message, or [`detect_image`]'s error.
-pub(super) fn detect_page_file(path: &Path, engine: EngineKind, params: &DetectParams, route: DetectorRoute) -> Result<TextDetectorPageResult, String> {
+pub(super) fn detect_page_file(path: &Path, engine: EngineKind, params: &DetectParams, route: DetectorRoute, ctx: &mut EnsureCtx<'_>) -> Result<TextDetectorPageResult, DetectFailure> {
     let page = image::open(path)
         .map_err(|err| {
             ms_log::runtime_log::log_error(format!("[text-detector] cannot open page {}: {err}", path.display()));
@@ -267,8 +306,8 @@ pub(super) fn detect_page_file(path: &Path, engine: EngineKind, params: &DetectP
         })?
         .to_rgb8();
     if page.width() == 0 || page.height() == 0 {
-        return Err(tf!("translation.text_detector.empty_image_error", path = path.display()));
+        return Err(DetectFailure::Failed(tf!("translation.text_detector.empty_image_error", path = path.display())));
     }
     ms_log::runtime_log::log_info(format!("[text-detector] {} page {}", engine_label(engine), path.display()));
-    detect_image(engine, &page, params, route).map(detection_into_page_result)
+    detect_image(engine, &page, params, route, ctx).map(detection_into_page_result)
 }

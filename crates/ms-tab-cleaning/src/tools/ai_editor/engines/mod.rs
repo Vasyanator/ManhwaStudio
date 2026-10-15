@@ -29,6 +29,10 @@ checkpoints behind two backend methods and two channel modes behind one backend 
 respectively — because the choice there is a parameter of a single engine, not a separate
 picker entry per model.
 
+`run_job` is the run in flight of the engines whose run may download an app-managed model
+before the backend call (`lama`, `sdxl` through its LaMa prefill): dropping the job — which is
+what `AiEngine::cancel` and the engine's own drop do — stops that download.
+
 `lama` also exports the LaMa-v2 model catalog to its sibling `sdxl`, whose 4-channel mode
 prefills the hole with LaMa before generating. That is the only cross-engine dependency in
 this subtree, and it is one-directional.
@@ -38,6 +42,9 @@ mod flux2_klein;
 // Private, like every other engine: the LaMa model catalog it exports reaches only its
 // sibling `sdxl`, whose 4-channel prefill sends a checkpoint file name to the backend.
 mod lama;
+// The run in flight of an engine whose run may download an app-managed model first (`lama`,
+// `sdxl`): worker, channel, and the cancel flag its drop sets.
+mod run_job;
 mod sdxl;
 
 use crate::tools::region_edit_v2::engine::AiEngine;

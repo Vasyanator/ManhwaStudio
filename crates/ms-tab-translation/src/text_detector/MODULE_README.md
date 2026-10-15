@@ -31,13 +31,17 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
 - `mod.rs`: types, controller, worker loop, batch driver, the pure backend-gate decision
   (`detector_mode_needs_backend(mode, paddle_route)`), model-ensure, `dilate_mask_alpha`; `pub use`
   re-exports of every path used outside the crate.
-- `pipeline.rs`: `DetectorRoute` + `detector_native_route` (pure) + `paddle_route`, `detect_image`,
+- `pipeline.rs`: `DetectFailure`, `DetectorRoute` + `detector_native_route` (pure) + `paddle_route`, `detect_image`,
   `detect_page_file` (decode on the worker with `image::open(..).to_rgb8()`), `ctd_detect_params`,
   `backend_fallback_applies`, `detect_error_message` (DetectError -> localized text), the plan /
   outcome logs.
 - `backend.rs`: `ensure_v2_backend_ready`, `DetectorTransport` / `SharedClientTransport`,
-  `IpcRunner`, `ipc_max_batch` / `ipc_frame_budget_tiles`, `forward_engine`,
-  `ensure_backend_models`.
+  `IpcRunner` (merges `BackendModelDirs` into every forward header: `surya_detection_dir`, v12),
+  `ipc_max_batch` / `ipc_frame_budget_tiles`, `forward_engine`, `ensure_backend_models` (CTD /
+  Paddle files downloaded on demand; the Surya checkpoint only checked, `surya_detection_dir_in`)
+  and `SURYA_DETECTOR_SPECS` (the Surya checkpoint's explicit-download bundle, re-exported by
+  `mod.rs` for the panel and the tab). A Surya batch checks it before the first page, so a missing
+  checkpoint fails the batch once with the "not downloaded, press <button>" error.
 - `native.rs` (desktop only): `current_detector_route` (disk read), `NativePaddleRunner`,
   `runner_error_from_native`.
 - `classic.rs`: `detect_page_classic` (decode wrapper) over the pure `detect_classic_from_gray`
@@ -76,6 +80,14 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
   `detect_error_message`. Logs carry the technical detail with the `[text-detector]` prefix.
 - Everything here except the controller's channel calls runs on the worker or the Cleaning tool
   worker, never the GUI thread (file decode, IPC, native inference, model ensure).
+- Cancel and download progress: every model-based entry (`detect_image`, `detect_page_file`,
+  the region helpers) takes the caller's `ai_models::EnsureCtx`; its flag stops a model download
+  (native detector model through `NativePaddleRunner`, backend engine files through
+  `ensure_backend_models`) and its sink receives the download events. A cancel is
+  `DetectFailure::Cancelled`: never retried on the backend (a native runner failure while the
+  flag is set is treated as the cancel), never a page failure; the batch ends with
+  `DetectCancelled`. The page batch owns one flag per batch, set by the controller's drop and
+  checked before every page.
 - The `characterization_*` expected values in `tests.rs` were observed before the Phase 1
   refactor; never edit them to make a change pass.
 

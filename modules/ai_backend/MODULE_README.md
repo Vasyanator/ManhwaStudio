@@ -49,8 +49,8 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
 - `server.py`: composition root — service construction, `AppState` wiring, framed IPC startup.
 - `__init__.py`: PEP 562 lazy re-export of `run_server`, so importing a light submodule (e.g.
   `ipc.framing`) never drags in the AI stack.
-- `test_health_snapshot.py`: covers `server._build_health_snapshot`; lives here because `server.py`
-  does.
+- `test_health_snapshot.py`: covers `server._build_health_snapshot` (a raising service, and a build
+  while every real service's instance lock is held); lives here because `server.py` does.
 - `runtime/`: program root (`paths.program_root()`), Torch availability, device/provider selection,
   `LoadedModelManager`, and the two ROCm workarounds. See `runtime/MODULE_README.md`.
 - `engines/`: cross-domain model-family runtime and model acquisition (`paddle_onnx`,
@@ -104,12 +104,11 @@ the convention `browser/` already used.
 - Service initialization is lazy and must surface missing packages or weights as explicit errors —
   never a silent fallback to a different model, device, or channel mode.
 - Torch and ONNX model roots are separate: `ManhwaStudio_AI_Models/Torch` vs `.../ONNX`. Do not write
-  ONNX weights under `Torch/` or Torch checkpoints under `ONNX/`. Library-managed caches (EasyOCR,
-  Surya) stay under those libraries' own default paths unless a service explicitly owns the download
-  contract. PaddleOCR-VL and Baberu OCR are downloaded by RUST into
-  `ManhwaStudio_AI_Models/side_models/` (pinned commit, sha256 per file); the backend receives their
-  absolute paths per request, never downloads them, never reads the Hugging Face cache for them, and
-  never runs `trust_remote_code`.
+  ONNX weights under `Torch/` or Torch checkpoints under `ONNX/`. PaddleOCR-VL, Baberu OCR,
+  EasyOCR, Surya and the SDXL config / curated inpaint repos are downloaded by RUST (pinned
+  external catalog, sha256 per file; locations are the catalog's); the backend receives their
+  absolute paths per request, loads them offline, never downloads them, never reads a library or
+  Hugging Face cache for them, and never runs `trust_remote_code`.
 - `General.ai_device`, `General.ai_onnx_provider` and `General.ai_onnx_device_id` use `not-selected`
   as the config sentinel; a service must resolve it to a real runtime default before constructing a
   Torch device or ONNX provider settings, and must never persist that automatic resolution as an

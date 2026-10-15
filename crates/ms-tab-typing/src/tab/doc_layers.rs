@@ -364,16 +364,16 @@ impl TypingTextOverlayLayer {
         self.persist_unified_band_order(page_idx, &primary, &order, uid);
     }
 
-    /// Once-per-frame check: if the shared `LayerDoc` changed since we last projected `current_page`
-    /// (its `version` differs from that page's `projected_doc_version` entry), and we are idle (not
-    /// loading/saving), re-project that page from the doc.
+    /// Once-per-frame check: if the shared `LayerDoc` changed `current_page` since we last projected
+    /// it (its `LayerDoc::page_revision` differs from that page's `projected_page_revision` entry),
+    /// and we are idle (not loading/saving), re-project that page from the doc.
     ///
-    /// The doc is the in-memory source of truth shared with the PS tab, so any edit there (or our own
-    /// that routed through the doc) bumps `version`; we just `sync_from_doc(current_page)` to rebuild
-    /// this tab's projections. This is the in-memory cross-tab sync (no disk reload, no revision Arc).
-    /// The version is tracked PER PAGE: re-projecting one page says nothing about another resident
-    /// page the doc may have changed meanwhile, so a page switch (or a flatten of another page)
-    /// re-projects that page on its own.
+    /// The doc is the in-memory source of truth shared with the PS tab, so any edit of the page there
+    /// (or our own that routed through the doc) advances its page revision; we just
+    /// `sync_from_doc(current_page)` to rebuild this tab's projections. This is the in-memory cross-tab
+    /// sync (no disk reload, no revision Arc). An edit of ANOTHER page leaves this page's revision
+    /// alone, so it costs no re-projection here; that page is re-projected on its own when it is next
+    /// shown, flattened or exported.
     pub(super) fn maybe_reproject_from_doc_version(&mut self, current_page: usize) {
         let Some(doc) = self.layer_doc.clone() else {
             return;
@@ -391,37 +391,39 @@ impl TypingTextOverlayLayer {
         let Ok(guard) = doc.lock() else {
             return;
         };
-        let projected = self.projected_doc_version.get(&current_page).copied();
-        if projected == Some(guard.version()) {
+        let projected = self.projected_page_revision.get(&current_page).copied();
+        let revision = guard.page_revision(current_page);
+        if projected == Some(revision) {
             return;
         }
         if guard.page(current_page).is_some() {
             ms_log::trace_log!(
                 cat::SYNC,
-                "reproject_from_doc page={} old_version={:?} new_version={} resident=true",
+                "reproject_from_doc page={} old_revision={:?} new_revision={} resident=true",
                 current_page,
                 projected,
-                guard.version()
+                revision
             );
             self.sync_from_doc(current_page, &guard);
         } else {
             // The current page is not resident (e.g. just evicted by a self-write that will reload it
-            // shortly). Adopt the version so we don't spin; the page-load path re-projects on arrival.
+            // shortly). Adopt the revision so we don't spin; the page-load path re-projects on arrival.
             ms_log::trace_log!(
                 cat::SYNC,
-                "reproject_from_doc page={} old_version={:?} new_version={} resident=false adopt_only",
+                "reproject_from_doc page={} old_revision={:?} new_revision={} resident=false adopt_only",
                 current_page,
                 projected,
-                guard.version()
+                revision
             );
-            self.projected_doc_version.insert(current_page, guard.version());
+            self.projected_page_revision.insert(current_page, revision);
         }
     }
 
     /// True when this tab's projection of `page_idx` reflects the shared `LayerDoc`'s current
-    /// `version`, i.e. a composite built from it now would not be stale. True when no doc is wired;
-    /// when the page is not resident in the projection (`build_page_job` then projects it fresh from
-    /// the doc); or when the page was last projected at the doc's current version. False while a doc
+    /// revision of that page, i.e. a composite built from it now would not be stale. True when no doc
+    /// is wired; when the page is not resident in the projection (`build_page_job` then projects it
+    /// fresh from the doc); or when the page was last projected at its current page revision. An edit
+    /// of another page never makes it read stale. False while a doc
     /// edit made elsewhere (the PS tab) still awaits [`Self::maybe_reproject_from_doc_version`] for
     /// this page. A poisoned doc lock reads as current: nothing can re-project from it any more, so
     /// waiting on it would block a caller forever; the composite then uses the last projection,
@@ -433,7 +435,7 @@ impl TypingTextOverlayLayer {
         if !self.raster_layers_by_page.contains_key(&page_idx) {
             return true;
         }
-        doc.lock().map_or(true, |guard| self.projected_doc_version.get(&page_idx) == Some(&guard.version()))
+        doc.lock().map_or(true, |guard| self.projected_page_revision.get(&page_idx) == Some(&guard.page_revision(page_idx)))
     }
 
     /// Off-draw driver of the cross-tab sync, for callers that compose while this tab is NOT drawn
@@ -457,8 +459,8 @@ impl TypingTextOverlayLayer {
     /// frame (never blocks). Each lagging page costs one in-memory `sync_from_doc` on the GUI thread
     /// (no I/O, but it clones the page's display images), so callers evaluate it LAST, only once the
     /// cheap export gates hold (`export_dispatch_ready`): during the whole-chapter preload every
-    /// applied page bumps the doc's global version and would make every resident page re-project on
-    /// every frame.
+    /// applied page is still being inserted and projected, so syncing before it drained is wasted
+    /// work at best.
     ///
     /// Nothing is restored afterwards, deliberately: this is the same per-page sync `draw` runs on a
     /// page switch, and its selection effects are the correct ones — the tracked raster indices are
@@ -527,8 +529,8 @@ impl TypingTextOverlayLayer {
             return;
         }
         let Some(primary) = self.layers_primary_dir.clone() else {
-            // An empty projection not taken from the doc: no doc version describes it.
-            self.projected_doc_version.remove(&page_idx);
+            // An empty projection not taken from the doc: no page revision describes it.
+            self.projected_page_revision.remove(&page_idx);
             self.raster_layers_by_page.insert(page_idx, Vec::new());
             self.bands_by_page.insert(page_idx, Vec::new());
             self.groups_by_page.insert(page_idx, Vec::new());
@@ -578,9 +580,9 @@ impl TypingTextOverlayLayer {
 
         if !populated_from_doc {
             // Without a resident shared-doc page, the disk cache remains the source of truth. No doc
-            // version describes this projection, so the page reads as possibly stale until the doc
+            // revision describes this projection, so the page reads as possibly stale until the doc
             // path re-projects (or adopts) it.
-            self.projected_doc_version.remove(&page_idx);
+            self.projected_page_revision.remove(&page_idx);
             let bands = ms_models::layer_model::persist::load_page_bands(
                 &primary,
                 fallback.as_deref(),
@@ -661,9 +663,9 @@ impl TypingTextOverlayLayer {
         use ms_models::layer_model::layer_doc::NodeBody;
         let _sync_span = ms_log::trace_scope!(
             cat::SYNC,
-            "sync_from_doc page={} doc_version={}",
+            "sync_from_doc page={} page_revision={}",
             page_idx,
-            doc.version()
+            doc.page_revision(page_idx)
         );
         let Some(page) = doc.page(page_idx) else {
             return;
@@ -972,10 +974,10 @@ impl TypingTextOverlayLayer {
         // both stores and after the raster uid remap that keeps the session addressing its own layer.
         self.reapply_layer_move_after_reproject(page_idx);
 
-        // Record the doc version we just projected THIS page at, so the per-frame
+        // Record the page revision we just projected THIS page at, so the per-frame
         // `maybe_reproject_from_doc_version` check does not redundantly re-project it until the doc
-        // changes again. Other pages keep their own entries: this sync did not refresh them.
-        self.projected_doc_version.insert(page_idx, doc.version());
+        // changes this page again. Other pages keep their own entries: this sync did not refresh them.
+        self.projected_page_revision.insert(page_idx, doc.page_revision(page_idx));
     }
 
     /// Routes an edit to the shared `LayerDoc`: locks it, runs `edit` against the resident page (it
@@ -1032,8 +1034,9 @@ impl TypingTextOverlayLayer {
             return false;
         }
         // Guarantee a cross-tab notification even if `edit` mutated node fields directly via
-        // `node_mut` (which does not bump the version). Idempotent if `edit` already bumped.
-        guard.mark_changed();
+        // `node_mut` (which does not bump). One extra page bump if `edit` already bumped: harmless,
+        // the sync below records the resulting revision.
+        guard.mark_page_changed(page_idx);
         self.sync_from_doc(page_idx, &guard);
         true
     }

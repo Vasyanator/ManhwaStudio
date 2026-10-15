@@ -77,7 +77,18 @@ translation text-detector pipeline wraps it as its native Paddle runner).
 accelerator provider (a 4 x 960^2 batch can exhaust a small GPU, and an OOM would silently
 send every page to the backend).
 
-`recognize_baberu(&BaberuModelPaths, image, progress)` is the Baberu OCR entry. Unlike the
+Cancel and progress: every entry point takes the caller's `cancel: &AtomicBool` (it may
+download the onnxruntime library, and all but `recognize_baberu` a model) and a
+`progress` callback of `NativeProgress` (`Runtime(OrtDownloadProgress)` for the onnxruntime
+library, `Model(&ai_models::ModelDownloadEvent)` for app-managed model files). The model
+downloads (`ai_models::ensure_*` through an `EnsureCtx`) poll the flag; a cancel ends the op
+with `NativeRuntimeError::Cancelled`, which callers report as a cancelled request and never
+answer with a backend fallback. The onnxruntime library download
+(`ms_onnx_runtime::resolve_or_download_ort_dylib`, inside `ensure_ort_runtime`) polls the
+same flag; its `OrtRuntimeError::Cancelled` converts to `NativeRuntimeError::Cancelled`, and
+it ends before any guard marker is written.
+
+`recognize_baberu(&BaberuModelPaths, image, cancel, progress)` is the Baberu OCR entry. Unlike the
 other engines it resolves NO model itself: the caller (the external-model catalog in
 `ms-sysprobe`, through the OCR router) passes the four absolute file paths, and a missing
 file is `ModelNotDownloaded` — checked before the dylib is resolved, never answered with a

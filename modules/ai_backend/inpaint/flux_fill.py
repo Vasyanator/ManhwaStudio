@@ -16,7 +16,9 @@ cache):
   `runtime.paths.side_models_root()`, the backend's single owner of that root.
 
 Main responsibilities:
-- list/quant management + on-demand download with byte-level progress;
+- list/quant management + on-demand download with byte-level progress, sized
+  from the hub listing and retried / resumed / cancelled through
+  `engines/model_download.download_bearer_to_path`;
 - lazy pipeline build (GGUF transformer + local components), pinned to the
   DISCRETE GPU (the integrated Ryzen iGPU is explicitly excluded);
 - MIOpen immediate mode on ROCm (set before torch import);
@@ -53,7 +55,13 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     import numpy as np
 
-from ..engines.model_download import download_bearer_to_path
+from ..engines.model_download import (
+    RetryEvent,
+    download_bearer_to_path,
+    hub_lfs_sha256,
+    retry_progress_label,
+)
+from ..runtime.health_snapshot import HealthSnapshot
 from ..runtime.model_manager import LoadedModelManager
 from ..runtime.paths import side_models_root
 from ..runtime.rocm_mmap_transfer import (
@@ -181,6 +189,10 @@ class FluxFillInpaintService:
         self._active_key: str | None = None
         self._device: Any = None
         self._last_error: str | None = None
+        # Published copy of the state-derived health fields; `health()` never
+        # takes `_lock`, which a pipeline load and generation hold (S-014).
+        self._health = HealthSnapshot()
+        self._publish_health_locked()
 
     # ---- status / health ----
     def status(self) -> dict[str, Any]:
@@ -196,16 +208,31 @@ class FluxFillInpaintService:
         }
 
     def health(self) -> dict[str, Any]:
-        with self._lock:
-            return {
-                "ready": self._pipe is not None,
-                "model": "flux_fill",
-                "device": str(self._device) if self._device is not None else "cpu",
-                "active_key": self._active_key,
-                "downloaded_quants": [q for q in AVAILABLE_QUANTS if _is_nonempty_file(gguf_path(q))],
-                "components_ready": _components_present(),
-                "last_error": self._last_error,
-            }
+        """Return the FLUX.1-Fill health entry for the backend snapshot.
+
+        State fields come from the published snapshot; the on-disk quant and
+        component probes run here, outside any service lock, so this answers
+        while a pipeline load or a generation holds the instance lock.
+        """
+        fields = self._health.read()
+        return {
+            "ready": fields["ready"],
+            "model": "flux_fill",
+            "device": fields["device"],
+            "active_key": fields["active_key"],
+            "downloaded_quants": [q for q in AVAILABLE_QUANTS if _is_nonempty_file(gguf_path(q))],
+            "components_ready": _components_present(),
+            "last_error": fields["last_error"],
+        }
+
+    def _publish_health_locked(self) -> None:
+        """Republish the state-derived health fields; caller holds `self._lock` (or is `__init__`)."""
+        self._health.publish(
+            ready=self._pipe is not None,
+            device=str(self._device) if self._device is not None else "cpu",
+            active_key=self._active_key,
+            last_error=self._last_error,
+        )
 
     def unload(self) -> bool:
         """Drop the resident pipeline; `False` when nothing was loaded."""
@@ -215,6 +242,7 @@ class FluxFillInpaintService:
             key = self._active_key
             self._pipe = None
             self._active_key = None
+            self._publish_health_locked()
             _clear_torch_cache()
             if key is not None:
                 self._model_manager.mark_unloaded(key)
@@ -228,13 +256,21 @@ class FluxFillInpaintService:
         *,
         params: dict[str, Any] | None = None,
         progress_callback: ProgressCb | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        """Inpaint `image_bytes` under `mask_bytes`, downloading the weights first if needed.
+
+        `should_cancel` is polled during the weight download (every chunk and
+        every backoff slice); a cancel there raises
+        `engines.model_download.DownloadCancelled`. Generation itself is not
+        interruptible here.
+        """
         normalized = normalize_flux_fill_params(params)
         image_rgb = _decode_image_rgb(image_bytes)
         mask_u8 = _decode_mask(mask_bytes, expected_hw=image_rgb.shape[:2])
 
         # 1) Make sure the weights are on disk (streams download progress).
-        self.ensure_model(normalized["quant"], progress_callback)
+        self.ensure_model(normalized["quant"], progress_callback, should_cancel)
 
         quant = normalized["quant"]
         model_key = f"flux_fill:{quant}"
@@ -260,8 +296,10 @@ class FluxFillInpaintService:
                     pipe, image_rgb, mask_u8, normalized, progress_callback
                 )
                 self._last_error = None
+                self._publish_health_locked()
             except Exception as exc:
                 self._last_error = str(exc)
+                self._publish_health_locked()
                 raise
             finally:
                 lease.release()
@@ -275,11 +313,19 @@ class FluxFillInpaintService:
         }
 
     # ---- model download ----
-    def ensure_model(self, quant: str, progress_callback: ProgressCb | None) -> None:
+    def ensure_model(
+        self,
+        quant: str,
+        progress_callback: ProgressCb | None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> None:
         """Download the selected GGUF quant + diffusers components into side_models.
 
-        Files already present (non-empty) are skipped. Progress is reported in
-        bytes via `progress_callback("download", done, total, label)`.
+        Files already present at the size the hub listing announced are skipped.
+        Progress is reported in bytes via `progress_callback("download", done,
+        total, label)`; a transient network failure is retried by the shared
+        helper and shown as a retry `label` on the same frame shape, not as an
+        error. `should_cancel` is polled per chunk and during every backoff wait.
 
         Runs OUTSIDE `self._lock` on purpose — a multi-GB download must never
         block `health()`, `unload()` or an eviction callback — so two concurrent
@@ -293,20 +339,33 @@ class FluxFillInpaintService:
 
         plan = _build_download_plan(quant)
         # Filter to missing files only.
-        missing = [item for item in plan if not _is_nonempty_file(item["dest"])]
+        missing = [item for item in plan if not _is_complete_file(item["dest"], int(item["size"]))]
         if not missing:
             return
 
-        total_bytes = sum(int(item.get("size") or 0) for item in missing)
+        total_bytes = sum(int(item["size"]) for item in missing)
         done_bytes = 0
         cb = progress_callback
+        callback_failed = False
 
         def report(label: str) -> None:
-            if cb is not None:
-                try:
-                    cb("download", int(done_bytes), int(max(total_bytes, 1)), label)
-                except Exception:
-                    pass
+            nonlocal callback_failed
+            if cb is None:
+                return
+            try:
+                cb("download", int(done_bytes), int(max(total_bytes, 1)), label)
+            except Exception as exc:  # noqa: BLE001 - progress is best-effort, the download is not
+                # A broken progress sink must not abort a multi-GB transfer, but
+                # it must not vanish either. Logged once per call: it fires per
+                # chunk, and thousands of identical lines bury the log.
+                if not callback_failed:
+                    callback_failed = True
+                    log.warning(
+                        "FLUX Fill: progress callback failed during the weight download "
+                        "(label=%r); further progress errors of this download are not logged",
+                        label,
+                        exc_info=exc,
+                    )
 
         report("Подготовка загрузки модели…")
         for item in missing:
@@ -318,8 +377,14 @@ class FluxFillInpaintService:
                 done_bytes = base + n
                 report(f"Скачивание {name}")
 
-            _download_file_streaming(item["url"], item["dest"], on_chunk)
-            done_bytes = base + int(item.get("size") or 0)
+            def on_retry(event: RetryEvent) -> None:
+                report(retry_progress_label(name, event))
+
+            _download_file_streaming(
+                item["url"], item["dest"], int(item["size"]), on_chunk,
+                expected_sha256=item["sha256"], on_retry=on_retry, should_cancel=should_cancel,
+            )
+            done_bytes = base + int(item["size"])
             report(f"Скачано {name}")
 
     # ---- pipeline ----
@@ -343,6 +408,7 @@ class FluxFillInpaintService:
         prev = self._active_key
         self._pipe = None
         self._active_key = None
+        self._publish_health_locked()
         _clear_torch_cache()
         if prev is not None:
             self._model_manager.mark_unloaded(prev)
@@ -354,8 +420,8 @@ class FluxFillInpaintService:
 
         try:
             torch.backends.cudnn.benchmark = False
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 - an optional tuning knob, never a load failure
+            log.warning("FLUX Fill: could not disable cudnn.benchmark: %s", exc)
 
         from diffusers import (
             FluxFillPipeline,
@@ -390,8 +456,8 @@ class FluxFillInpaintService:
             try:
                 pipe.vae.enable_tiling()
                 pipe.vae.enable_slicing()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - optional memory saver, never a load failure
+                log.warning("FLUX Fill: could not enable VAE tiling/slicing: %s", exc)
         if normalized["cpu_offload"] and getattr(device, "type", "cpu") != "cpu":
             _materialize_components_for_offload(pipe, device)
             pipe.enable_model_cpu_offload(device=str(device))
@@ -411,6 +477,7 @@ class FluxFillInpaintService:
         self._pipe = pipe
         self._device = device
         self._active_key = model_key
+        self._publish_health_locked()
         return pipe
 
     def _unload_key(self, model_key: str) -> bool:
@@ -457,13 +524,23 @@ class FluxFillInpaintService:
 
         steps = int(normalized["steps"])
         cb = progress_callback
+        callback_failed = False
 
         def _on_step(_pipe: Any, step: int, _t: Any, kwargs: dict[str, Any]):
+            nonlocal callback_failed
             if cb is not None:
                 try:
                     cb("generate", int(step) + 1, steps, "Генерация")
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 - progress is best-effort, generation is not
+                    # Logged once: it fires per diffusion step.
+                    if not callback_failed:
+                        callback_failed = True
+                        log.warning(
+                            "FLUX Fill: progress callback failed at generation step %d; "
+                            "further progress errors of this run are not logged",
+                            int(step) + 1,
+                            exc_info=exc,
+                        )
             return kwargs
 
         if cb is not None:
@@ -490,8 +567,12 @@ class FluxFillInpaintService:
         if normalized["seamless"] and mask.any():
             try:
                 return _seamless_composite(image_rgb, out, mask)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - falls back to the plain feathered composite
+                log.warning(
+                    "FLUX Fill: seamless (Poisson) composite failed, using the feathered composite: %s",
+                    exc,
+                    exc_info=exc,
+                )
 
         m = mask.astype(np.float32) / 255.0
         if normalized["feather"] > 0:
@@ -511,7 +592,18 @@ class FluxFillInpaintService:
 #  Download plumbing
 # =====================================================================
 def _build_download_plan(quant: str) -> list[dict[str, Any]]:
-    """Returns [{url, dest, size}] for the GGUF quant + all component files."""
+    """Returns [{url, dest, size, sha256}] for the GGUF quant + all component files.
+
+    `sha256` is the listing's LFS digest (`None` for a non-LFS file) and is
+    checked on the complete file before it is published. `size` is the length
+    the hub listing announced, in bytes; it is the download's size gate (`0` only when the listing named the file without
+    a size, which is logged). The listing is mandatory: without it there is no
+    size to check a ~12 GB file against.
+
+    # Errors
+    `RuntimeError` when a repository listing cannot be fetched or the selected
+    GGUF quant is not in its repository.
+    """
     from huggingface_hub import HfApi, hf_hub_url
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -520,19 +612,19 @@ def _build_download_plan(quant: str) -> list[dict[str, Any]]:
 
     # GGUF transformer (single file).
     gname = gguf_filename(quant)
-    gsize = 0
     try:
         info = api.model_info(GGUF_REPO, files_metadata=True)
-        for sib in info.siblings or []:
-            if sib.rfilename == gname:
-                gsize = int(sib.size or 0)
-                break
-    except Exception:
-        gsize = 0
+    except Exception as exc:  # noqa: BLE001 - every hub failure is the same refusal here
+        log.error("FLUX Fill: listing of %s failed: %s", GGUF_REPO, exc)
+        raise RuntimeError(f"Не удалось получить список файлов {GGUF_REPO}: {exc}") from exc
+    gsib = next((sib for sib in info.siblings or [] if sib.rfilename == gname), None)
+    if gsib is None:
+        raise RuntimeError(f"Файл {gname} не найден в репозитории {GGUF_REPO}.")
     plan.append({
         "url": hf_hub_url(GGUF_REPO, gname),
         "dest": gguf_path(quant),
-        "size": gsize,
+        "size": _listed_size(GGUF_REPO, gsib),
+        "sha256": hub_lfs_sha256(gsib),
     })
 
     # diffusers components from the open Flex.1-alpha repo.
@@ -548,29 +640,67 @@ def _build_download_plan(quant: str) -> list[dict[str, Any]]:
         plan.append({
             "url": hf_hub_url(COMPONENTS_REPO, path),
             "dest": os.path.join(_components_dir(), *path.split("/")),
-            "size": int(sib.size or 0),
+            "size": _listed_size(COMPONENTS_REPO, sib),
+            "sha256": hub_lfs_sha256(sib),
         })
     return plan
 
 
-def _download_file_streaming(url: str, dest: str, on_chunk: Callable[[int], None]) -> bool:
+def _listed_size(repo: str, sib: Any) -> int:
+    """The announced size of listing entry `sib`, `0` (logged) when the hub gave none."""
+    size = int(getattr(sib, "size", 0) or 0)
+    if size <= 0:
+        log.warning(
+            "FLUX Fill: %s announced no size for %s; only a body shorter than its own "
+            "Content-Length can be detected for this file",
+            repo,
+            getattr(sib, "rfilename", "?"),
+        )
+    return size
+
+
+def _download_file_streaming(
+    url: str,
+    dest: str,
+    expected_size: int,
+    on_chunk: Callable[[int], None],
+    *,
+    expected_sha256: str | None = None,
+    on_retry: Callable[[RetryEvent], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> bool:
     """Download `url` to `dest`, reporting cumulative bytes. Returns whether it ran.
 
     The bearer header, the serialization, the process-private `.part` staging
-    file and the atomic publish all belong to
-    `engines.model_download.download_bearer_to_path`: IPC dispatches onto a
+    file, the retry/resume loop, the size gate and the atomic publish all belong
+    to `engines.model_download.download_bearer_to_path`: IPC dispatches onto a
     thread pool, so two first uses of the same quant can otherwise write into one
     staging file at the same time — a ~22 GB corruption window here. A file
-    another thread already finished is skipped, not refetched.
+    another thread already finished is skipped, not refetched; a failed transfer
+    keeps its bytes so the next attempt resumes them.
 
-    The token stays THIS module's business: FLUX.1-Fill reads it from the process
-    environment (`HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`), while the FLUX.2 klein
-    downloader receives it as a request field, so the shared helper takes it as an
-    argument and never looks the environment up itself.
+    `expected_size` is the listing's size (`0` = unknown) and `expected_sha256`
+    the listing's LFS digest (`None` for a non-LFS file): together they are the
+    gate a staged file passes before it is published. The token stays THIS
+    module's business: FLUX.1-Fill reads it from the process environment
+    (`HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`), while the FLUX.2 klein downloader
+    receives it as a request field, so the shared helper takes it as an argument
+    and never looks the environment up itself.
+
+    # Errors
+    Propagates the helper's errors (`DownloadCancelled`, `DownloadError`
+    subclasses, `requests.HTTPError`, `RuntimeError` for disk failures).
     """
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     return download_bearer_to_path(
-        url, dest, lambda done, _expected: on_chunk(done), token=token
+        url,
+        dest,
+        token=token,
+        expected_size=expected_size,
+        expected_sha256=expected_sha256,
+        should_cancel=should_cancel,
+        on_progress=lambda done, _expected: on_chunk(done),
+        on_retry=on_retry,
     )
 
 
@@ -590,6 +720,16 @@ def _components_present() -> bool:
 def _is_nonempty_file(path: str) -> bool:
     try:
         return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _is_complete_file(path: str, expected_size: int) -> bool:
+    """Whether `path` is on disk at `expected_size` bytes (non-empty when the size is unknown)."""
+    if expected_size <= 0:
+        return _is_nonempty_file(path)
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) == expected_size
     except OSError:
         return False
 
@@ -883,8 +1023,8 @@ def _clear_torch_cache() -> None:
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, "ipc_collect"):
                 torch.cuda.ipc_collect()
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001 - cache release is best-effort
+        log.warning("FLUX Fill: could not release the torch CUDA cache: %s", exc)
 
 
 # =====================================================================

@@ -9,6 +9,9 @@ Covered:
     reline.process — parses image_path/output_path/params from header,
                      calls process_image_file(), returns result dict verbatim,
                      empty blob.
+    cancel         — both hand ``cancel_event.is_set`` to the service as
+                     ``should_cancel``; a cancel before start or a service error
+                     raised while the event is set becomes ``Interrupted``.
 
 All service calls are mocked; no torch or real models are needed.
 """
@@ -23,7 +26,7 @@ import pytest
 
 from modules.ai_backend.ipc.handlers import reline as reline_mod
 from modules.ai_backend.ipc.protocol import METHOD_RELINE_MODELS, METHOD_RELINE_PROCESS
-from modules.ai_backend.ipc.registry import HandlerContext, METHOD_HANDLERS
+from modules.ai_backend.ipc.registry import HandlerContext, Interrupted, METHOD_HANDLERS
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +70,8 @@ class TestRelineModels:
 
         resp, blob = _call(METHOD_HANDLERS[METHOD_RELINE_MODELS], ctx, {})
 
-        svc.list_models.assert_called_once_with()
+        svc.list_models.assert_called_once()
+        assert set(svc.list_models.call_args.kwargs) == {"should_cancel"}
         assert blob == b""
 
     def test_response_contains_models_key(self):
@@ -130,11 +134,12 @@ class TestRelineProcess:
 
         _call(METHOD_HANDLERS[METHOD_RELINE_PROCESS], ctx, header)
 
-        svc.process_image_file.assert_called_once_with(
-            image_path="/in/page.png",
-            output_path="/out/page.png",
-            params={},
-        )
+        _, kwargs = svc.process_image_file.call_args
+        assert svc.process_image_file.call_count == 1
+        assert kwargs["image_path"] == "/in/page.png"
+        assert kwargs["output_path"] == "/out/page.png"
+        assert kwargs["params"] == {}
+        assert callable(kwargs["should_cancel"])
 
     def test_output_path_none_when_absent(self):
         svc = self._svc()
@@ -292,3 +297,57 @@ class TestRelineProcess:
         _, blob = _call(METHOD_HANDLERS[METHOD_RELINE_PROCESS], ctx, header)
 
         assert blob == b""
+
+
+# ---------------------------------------------------------------------------
+# cancel
+# ---------------------------------------------------------------------------
+
+_PROCESS_HEADER = {"image_path": "/in/page.png"}
+
+
+@pytest.mark.parametrize(
+    ("method", "service_attr", "header"),
+    [
+        (METHOD_RELINE_MODELS, "list_models", {}),
+        (METHOD_RELINE_PROCESS, "process_image_file", _PROCESS_HEADER),
+    ],
+)
+def test_cancel_before_start_never_reaches_the_service(method, service_attr, header):
+    svc = MagicMock()
+    cancel = threading.Event()
+    cancel.set()
+
+    with pytest.raises(Interrupted):
+        METHOD_HANDLERS[method](_make_ctx(svc), header, b"", cancel)
+
+    getattr(svc, service_attr).assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("method", "service_attr", "header"),
+    [
+        (METHOD_RELINE_MODELS, "list_models", {}),
+        (METHOD_RELINE_PROCESS, "process_image_file", _PROCESS_HEADER),
+    ],
+)
+def test_a_download_cancelled_through_the_event_is_interrupted(method, service_attr, header):
+    # The service polls `should_cancel`; a cancel mid-download raises
+    # `DownloadCancelled`, which must not be wrapped into a RuntimeError.
+    from modules.ai_backend.engines.model_download import DownloadCancelled
+
+    svc = MagicMock()
+    cancel = threading.Event()
+    seen = []
+
+    def run(**kwargs):
+        seen.append(kwargs["should_cancel"]())
+        cancel.set()
+        seen.append(kwargs["should_cancel"]())
+        raise DownloadCancelled("Загрузка файла отменена: model.pth")
+
+    getattr(svc, service_attr).side_effect = run
+
+    with pytest.raises(Interrupted):
+        METHOD_HANDLERS[method](_make_ctx(svc), header, b"", cancel)
+    assert seen == [False, True]
