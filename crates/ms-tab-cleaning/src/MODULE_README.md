@@ -19,8 +19,8 @@ crate-private and unreachable from here.
 
 ## Architecture
 `CleaningTabState` owns a dedicated `CanvasView`, the active `CleaningTool`, cleaning UI state,
-and optional shared models injected by `StudioApp`. The tab routes pointer, keyboard, wheel,
-and overlay-window events into the active tool. Tools edit canvas overlay scratch state and
+and optional shared models injected by `StudioApp`. The tab routes this frame's declared input
+(`ms-input`, see "Input" below) into the active tool and lends it the frame for its own surfaces. Tools edit canvas overlay scratch state and
 commit through `CanvasView`, which synchronizes committed pages into `CleanOverlaysModel`
 and its diff-based undo/redo history.
 
@@ -75,16 +75,18 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
 
 ## Files and submodules
 - `tab.rs`: tab state, canvas orchestration, the dock tabs and their default arrangement, mask
-  loading, quick text-clean job orchestration, and history hotkeys.
-- `touch_selection.rs`: `drive_tool_touch_selection`, the replay of a finger long-press selection
-  drag (`CanvasView::touch_selection`) onto the active tool's stroke hooks, for tools with
-  `CleaningTool::accepts_touch_selection`. Called by `tab.rs` right after `canvas.draw`, with its
-  own stroke state (`touch_selection_point`) apart from the mouse stroke; `tab.rs` declares the
-  tool's answer to the canvas before `draw` (`set_long_press_selection`) and drops a finger drag
-  on a tool switch. Never a synthesized mouse press: the mouse buttons paint and erase here.
-  egui has no pointer for the claimed finger, so the tool cursor and the region tools' rubber
-  band are anchored at the finger point first (`tab.rs` `cursor_anchor_pos`), then at egui's
-  pointer, then at the mouse stroke's last point.
+  loading, quick text-clean job orchestration, the clean-overlay history commands
+  (`apply_history_commands`) and the stroke dispatch (`drive_strokes`).
+- `input.rs`: the tab's `ms-input` declarations (`declarations()`), its contexts, the frame /
+  editor-window gesture targets, `STROKE_ACTIONS` / `PRESS_ACTIONS`, `StrokeModes`, the hint
+  labels (`CleaningLabels` + `CleaningLabelsCache`) and the crate's headless input test bench
+  (`test_support`).
+- `canvas_input.rs`: `StrokeDriver`, the pure state machine that turns this frame's canvas-wide
+  claim (`InputFrame::claimed(canvas view)`: a mouse drag or a finger long-press drag alike) into
+  the active tool's `stroke_begin` / `update` / `end` / `stroke_cancel` and `on_page_press`.
+  egui has no pointer for a claimed finger, so the tool cursor and the region tools' rubber band
+  are anchored at the finger stroke's point first (`tab.rs` `cursor_anchor_pos`), then at egui's
+  pointer, then at the stroke's last point.
 - `autoclean.rs`: quick text-clean image engine. GUI-free core (`run_autoclean_engine`)
   clusters the text mask, then per cluster runs: `has_text_structure` gate -> two candidates
   (A = strokes via `fill_holes`+dilate, B = detector-box union / cluster bbox) ->
@@ -138,10 +140,10 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   watermark library, the library management panel and the reference-crop intake that builds an
   entry from the mark supplied on two known uniform backgrounds. See `tools/MODULE_README.md`.
 - `studio_tab.rs`: `impl ms_studio_tab::StudioTab for CleaningTabState` — the studio root's
-  order-free per-tab hooks: the three canvas-zoom hotkeys (`cleaning.canvas.zoom_in` / `_out` /
-  `_reset`, persistence keys, registered in that order and refused while the active tool blocks
-  canvas zoom), the dock builder, GPU eviction (canvas clean overlay, then detector-mask textures),
-  the canvas source-page window / NEAREST sampling, and the committed-tree rescan.
+  order-free per-tab hooks: the input declarations (`input::declarations`) and contexts (the
+  canvas's plus the active tool's), the dock builder, GPU eviction (canvas clean overlay, then
+  detector-mask textures), the canvas source-page window / NEAREST sampling, and the
+  committed-tree rescan.
 - `lib.rs`: module wiring and public re-export of `CleaningTabState`.
 
 ## Contracts and invariants
@@ -246,7 +248,8 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   `CleaningDockOut::clean_status_dismiss`. With nothing to say it lays out nothing at all.
 - Text-mask GPU cache eviction must not mutate `TextMaskModel`, loaded mask data, quick-clean jobs,
   or committed clean-overlay edits.
-- Canvas zoom, drag-scroll, and context menus must respect active tool capture/blocking signals.
+- No raw key, modifier or wheel read anywhere in this crate (see "Input"); the canvas adapters
+  still called are listed there with their removal condition.
 - `panel_rects` is a SAME-FRAME list, cleared once per frame after `canvas.draw`. Every floating
   surface that may swallow a tool click has to be in it, and they are all dock panels now, which is
   why their rects are carried out of the hook rather than pushed straight into the field. A rect is
@@ -323,6 +326,48 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   file dialog that sets a starting directory must use `ProjectData::user_facing_dir` (none of
   this crate's dialogs sets one today).
 
+## Input
+The studio's `InputRouter::begin_frame` decides every key, wheel and canvas-wide drag before the
+tab draws; `CleaningDrawParams::{input, input_registry}` carry the frame and the registry.
+- **Declared here** (`input.rs`): tab scope — `cleaning.clean.undo` (Ctrl+Z) / `redo`
+  (Ctrl+Shift+Z | Ctrl+Y), off while a legacy editor window is open. Sub scope — modes
+  `cleaning.erase_mode` (Shift; not in a region selection state), `cleaning.rect_mode` (Ctrl, brush
+  tools), `cleaning.select_mode` (Shift, region tools), `cleaning.stamp.rotate_mode` (R); canvas-wide
+  gestures on `view.surface` — `cleaning.stroke` (LMB drag; accepts erase latest, rect at the
+  press), `cleaning.pick_color` / `cleaning.stamp.set_anchor` (RMB, acted on at the press),
+  `cleaning.region.select_rect` ([select_mode]+LMB drag | finger long-press drag),
+  `…select_rect_armed` (LMB drag while a selection is expected), `cleaning.patch.drag`; axes
+  `cleaning.stamp.rotate` / `rotate_coarse` (R+wheel / Shift+R+wheel, over the canvas); commands
+  `cleaning.region.cancel` / `cleaning.patch.cancel` (Esc); the region frame's mode
+  `cleaning.frame.marks_rect_mode` (Ctrl), gestures `cleaning.frame.{paint,erase,marks_rect}` on
+  the frame body (60), `move` on the grip (70), `resize` on a handle (90), command
+  `cleaning.frame.undo_stroke` (Ctrl+Z, shadows the clean undo while the frame is up). Window
+  scope — `cleaning.editor.{paint,erase}` on a legacy editor window's preview. Brush size is the
+  shared `brush.*` set of `ms_tools::mask_brush` (one owner: `MaskBrush::apply_input`).
+- **Contexts** (`StudioTab::input_contexts`): the canvas's, then the active tool's
+  (`CleaningTool::input_contexts`): `cleaning.tool.brush` + `cleaning.tool.zamazka` /
+  `cleaning.tool.stamp`, `cleaning.tool.patch`, `cleaning.region.select` (+ `cleaning.region.armed`),
+  `cleaning.region_frame`, `cleaning.editor_window`, and `brush.active` while a brush takes the size
+  actions. The tool-state contexts form one exclusive group (and zamazka / stamp another), so
+  equal bindings of different tools are no conflict.
+- **Order in `draw`**: history commands and the active tool's `apply_input` before
+  `canvas.draw`; the stroke driver (`canvas_input.rs`) after it; the tool's `draw_overlay_ui`
+  gets the frame for the region frame (targeted gestures through `gesture_for` on its own
+  `Response`s) and the legacy window (which publishes its own `ViewSurface`, so the shared
+  `view.*` zoom aims at it while the pointer is over it).
+- **Occlusion** is the router's: the stroke driver and the tool cursor act only while the pointer
+  is on the canvas view (dock panels, the frame's `Area`, windows and popups are not) and not over
+  a canvas scrollbar.
+- **Hints** name the current bindings (`CleaningLabels`, pushed to the active tool every frame
+  through `CleaningTool::set_input_labels`); no locale string of this crate spells a binding.
+- **Canvas adapters still called** (`tab.rs`): `set_wheel_scroll_blocked` while a stroke runs and
+  `set_zoom_blocked` while a stroke runs or `view.pan` is held (stroke points are screen
+  positions; the canvas would raise its capture `Area` over a Space-pan press). Removal: when the
+  canvas stops raising the capture area under `view.pan` and offers a gesture-running scroll lock.
+- **Widget-owned, not bindings**: text editing in the prompts, the «Сравнить» press-and-hold
+  button of the frame, the `ViewportColorSelector` eyedropper (`ms-widgets` cannot see `ms-input`;
+  its LMB-sample / RMB-or-Esc-cancel stays inside the widget), slider wheels.
+
 ## Editing map
 - To change top-level cleaning UI, history, or quick-clean orchestration,
   edit `tab.rs`.
@@ -357,8 +402,9 @@ backend requests inside tool worker paths. App-managed inpaint weights must be r
   threshold.
 - To change what the «Клин» status area reports, when it rescans, or how a message looks, edit
   `clean_status.rs`; the classification of a clean file itself belongs to `ms_models::clean_assign`.
-- To change this tab's hotkeys, its GPU eviction, or any other studio-root hook, edit
-  `studio_tab.rs`; hotkey ids are persisted user bindings and must never be renamed.
+- To change a binding default, add an action or a context, edit `input.rs` (ids are persisted
+  user bindings and must never be renamed); how a claimed canvas drag reaches the tool is
+  `canvas_input.rs`; GPU eviction or any other studio-root hook is `studio_tab.rs`.
 - To change brush, stamp, inpaint, or fill behavior, edit the relevant file under `tools/`.
 - To change text-mask loading or tiled mask drawing, start in `tab.rs` and check
   `TextMaskModel` contracts in `crates/ms-models/src/`.

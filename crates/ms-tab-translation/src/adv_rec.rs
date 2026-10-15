@@ -9,7 +9,11 @@ Main responsibilities:
 - hold editable recognition result text and emit UI actions back to Translation tab;
 - support local quick-selection OCR inside the floating preview when brush mode is disabled;
 - resize its brush from the shared brush actions (`ms_tools::mask_brush`) while brush mode is on
-  (`brush_input_active` / `apply_brush_input`, called by the tab before drawing).
+  (`brush_input_active` / `apply_brush_input`, called by the tab before drawing);
+- take all input from the frame (`ms_input::InputFrame`): the window publishes its own view
+  surface (`adv_rec_view_id`) and zooms by the shared `view.*` set (commands, wheel axis, zoom
+  drag) when its focus is this view; select / paint / erase are the gestures
+  `translation.adv_rec.*` on the preview (`crate::input`).
 
 Key types:
 - `AdvancedRecognitionWindow`: runtime state of the floating window and crop loader thread.
@@ -22,6 +26,7 @@ Notes:
 - OCR dispatch and bubble creation stay in `tab.rs`, which already owns OCR controller/canvas logic.
 */
 
+use ms_input::{GesturePhase, HitPhase, InputFrame, ViewId, ViewSurface, publish_view_surface, view};
 use ms_tools::MaskBrush;
 use ms_widgets::WheelSlider;
 use eframe::egui;
@@ -33,6 +38,8 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use ms_thread::{self as thread, JoinHandle};
+
+use crate::input::{ADV_REC_ERASE, ADV_REC_PAINT, ADV_REC_SELECT_RECT, TARGET_ADV_REC_IMAGE, TranslationInputLabels};
 
 const ADV_REC_TEXTURE_OPTIONS: TextureOptions = TextureOptions::LINEAR;
 const ADV_REC_MIN_ZOOM: f32 = 0.1;
@@ -49,6 +56,21 @@ const ADV_REC_LOADING_WINDOW_W: f32 = 340.0;
 const ADV_REC_LOADING_WINDOW_H: f32 = 120.0;
 const ADV_REC_ROTATION_EPSILON_DEG: f32 = 0.01;
 const ADV_REC_ROTATION_PARALLEL_PIXELS_THRESHOLD: usize = 262_144;
+/// Horizontal drag distance (points) of the zoom drag that scales the preview by one zoom step.
+const ADV_REC_ZOOM_DRAG_PT_PER_STEP: f32 = 80.0;
+
+/// The view identity of the advanced-recognition preview (content-named: one window at a time).
+#[must_use]
+pub fn adv_rec_view_id() -> ViewId {
+    ViewId(egui::Id::new("translation.adv_rec.view"))
+}
+
+/// Zoom factor of a zoom drag of `dx` points: one zoom step per
+/// [`ADV_REC_ZOOM_DRAG_PT_PER_STEP`], to the right zooms in.
+#[must_use]
+fn adv_rec_zoom_drag_factor(dx: f32) -> f32 {
+    ADV_REC_ZOOM_STEP.powf(dx / ADV_REC_ZOOM_DRAG_PT_PER_STEP)
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct AdvancedRecognitionSelection {
@@ -369,7 +391,10 @@ impl AdvancedRecognitionWindow {
         true
     }
 
-    pub fn draw(&mut self, ctx: &egui::Context) -> Option<AdvancedRecognitionAction> {
+    /// Draws the window for one frame from this frame's `input` (`None` outside the tab's draw:
+    /// nothing zooms, selects or paints) and returns the action the user took. `labels` names
+    /// the bindings in the controls hint.
+    pub fn draw(&mut self, ctx: &egui::Context, input: Option<&InputFrame>, labels: &TranslationInputLabels) -> Option<AdvancedRecognitionAction> {
         self.poll_loaded_region();
         if self.pending_job_id.is_some() {
             ctx.request_repaint();
@@ -386,6 +411,11 @@ impl AdvancedRecognitionWindow {
         self.window_rect = None;
 
         if let Some(session) = self.session.as_mut() {
+            if let Some(input) = input
+                && apply_adv_rec_view_input(session, input)
+            {
+                ctx.request_repaint();
+            }
             let viewport = ctx.content_rect();
             let viewport_cap = viewport.size() * ADV_REC_WINDOW_VIEWPORT_CAP_FRAC;
             let window_size = adv_rec_target_window_size(session.zoomed_image_size(), viewport_cap);
@@ -408,12 +438,17 @@ impl AdvancedRecognitionWindow {
                 .collapsible(false)
                 .open(&mut keep_open)
                 .show(ctx, |ui| {
-                    action = draw_adv_rec_window_contents(ui, session, &mut request_close);
+                    action = draw_adv_rec_window_contents(ui, session, &mut request_close, input, labels);
                 });
             if let Some(resp) = shown {
                 let window_rect = resp.response.rect;
                 self.window_rect = Some(window_rect);
-                handle_adv_rec_zoom_input(ctx, session, window_rect);
+                // The whole window is the view (zoom keys and wheel act anywhere over it); its
+                // own layer does not occlude it, any layer above it does.
+                publish_view_surface(
+                    ctx,
+                    ViewSurface { id: adv_rec_view_id(), rect: window_rect, holes: Vec::new(), capture_layer: Some(resp.response.layer_id), primary: false, touch_owner: None },
+                );
             }
             if request_close || !keep_open {
                 self.close();
@@ -582,6 +617,8 @@ fn draw_adv_rec_window_contents(
     ui: &mut egui::Ui,
     session: &mut AdvancedRecognitionSession,
     request_close: &mut bool,
+    input: Option<&InputFrame>,
+    labels: &TranslationInputLabels,
 ) -> Option<AdvancedRecognitionAction> {
     let mut action = None;
 
@@ -649,9 +686,12 @@ fn draw_adv_rec_window_contents(
                 .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
         );
     });
-    ui.small(
-        t!("translation.adv_rec.controls_hint"),
-    );
+    ui.small(tf!(
+        "translation.adv_rec.controls_binding_hint",
+        select = labels.adv_rec_select,
+        paint = labels.adv_rec_paint,
+        erase = labels.adv_rec_erase
+    ));
 
     let preview_size = session.zoomed_image_size();
     egui::ScrollArea::both()
@@ -676,7 +716,7 @@ fn draw_adv_rec_window_contents(
                         Color32::WHITE,
                     );
                 }
-                if let Some(image_action) = handle_adv_rec_image_input(ui, session, &response) {
+                if let Some(image_action) = handle_adv_rec_image_input(ui, session, &response, input) {
                     action = Some(image_action);
                 }
             });
@@ -779,242 +819,176 @@ fn ensure_adv_rec_texture(session: &mut AdvancedRecognitionSession, ctx: &egui::
     }
 }
 
+/// The preview's pointer gestures for one frame: the quick-selection rect while the brush is off
+/// (`ADV_REC_SELECT_RECT`, committed on its drag stop when large enough), paint / erase strokes
+/// (from the press point) and click dabs while it is on (`ADV_REC_PAINT` / `ADV_REC_ERASE`);
+/// nothing while a zoom drag runs. Also paints
+/// the selection rect and the brush cursor. Returns the quick-recognition action of a committed
+/// selection.
 fn handle_adv_rec_image_input(
     ui: &mut egui::Ui,
     session: &mut AdvancedRecognitionSession,
     response: &egui::Response,
+    input: Option<&InputFrame>,
 ) -> Option<AdvancedRecognitionAction> {
     let image_rect = response.rect;
-    let (
-        primary_down,
-        secondary_down,
-        hover_pos,
-        interact_pos,
-        mods,
-        z_down,
-    ) = ui.ctx().input(|i| {
-        (
-            i.pointer.primary_down(),
-            i.pointer.secondary_down(),
-            i.pointer.hover_pos(),
-            i.pointer.interact_pos(),
-            i.modifiers,
-            i.key_down(egui::Key::Z),
-        )
-    });
-    let zoom_modifier_down = mods.ctrl || mods.command || z_down;
+    let hover_pos = response.hover_pos();
 
-    if !session.brush_enabled {
-        if let Some(selection) = session.quick_selection
-            && let Some(selection_rect) =
-                selection.scene_rect(image_rect, session.preview_base_image.size)
-        {
-            ui.painter().rect_filled(
-                selection_rect,
-                0.0,
-                ms_theme::canvas::SELECTION.gamma_multiply_u8(60),
-            );
-            ui.painter().rect_stroke(
-                selection_rect,
-                0.0,
-                egui::Stroke::new(2.0, ms_theme::canvas::SELECTION),
-                egui::StrokeKind::Outside,
-            );
+    if session.brush_enabled {
+        if let Some(pointer_pos) = hover_pos.filter(|p| image_rect.contains(*p)) {
+            session.brush.draw_circle_cursor_on_image(ui, image_rect, session.preview_base_image.size, pointer_pos);
         }
-    } else if let Some(pointer_pos) = hover_pos.filter(|p| image_rect.contains(*p)) {
-        session.brush.draw_circle_cursor_on_image(
-            ui,
-            image_rect,
-            session.preview_base_image.size,
-            pointer_pos,
-        );
+    } else if let Some(selection) = session.quick_selection
+        && let Some(selection_rect) = selection.scene_rect(image_rect, session.preview_base_image.size)
+    {
+        ui.painter().rect_filled(selection_rect, 0.0, ms_theme::canvas::SELECTION.gamma_multiply_u8(60));
+        ui.painter().rect_stroke(selection_rect, 0.0, egui::Stroke::new(2.0, ms_theme::canvas::SELECTION), egui::StrokeKind::Outside);
     }
 
-    if !session.brush_enabled && !zoom_modifier_down && !session.zoom_drag_active {
-        if response.drag_started()
-            && let Some(pointer_pos) = response
-                .interact_pointer_pos()
-                .filter(|p| image_rect.contains(*p))
-        {
-            let start_px = adv_rec_pointer_to_image_px(
-                pointer_pos,
-                image_rect,
-                session.preview_base_image.size,
-            );
-            session.quick_selection = Some(AdvancedRecognitionQuickSelection {
-                start_px,
-                current_px: start_px,
-            });
-            ui.ctx().request_repaint();
-        }
-        if let Some(selection) = session.quick_selection.as_mut()
-            && let Some(pointer_pos) = ui.ctx().input(|i| i.pointer.latest_pos())
-            && image_rect.contains(pointer_pos)
-        {
-            selection.current_px = adv_rec_pointer_to_image_px(
-                pointer_pos,
-                image_rect,
-                session.preview_base_image.size,
-            );
-        }
-        let should_finish = session.quick_selection.is_some()
-            && (response.drag_stopped()
-                || (!primary_down && !ui.ctx().input(|i| i.pointer.any_down())));
-        if should_finish && let Some(selection) = session.quick_selection.take() {
-            if selection.is_large_enough(session.preview_base_image.size) {
-                match encode_adv_rec_selection_png(session, selection) {
-                    Ok(image_override_png) => {
-                        return Some(AdvancedRecognitionAction::QuickRecognizeSelection {
-                            image_override_png,
-                        });
-                    }
-                    Err(error) => {
-                        session.status = Some(error);
+    let gesture = if session.zoom_drag_active { None } else { input.and_then(|input| input.gesture_for(response, &[(TARGET_ADV_REC_IMAGE, true)])) };
+    let pointer = response.interact_pointer_pos();
+    match gesture.map(|gesture| (gesture.action, gesture.phase)) {
+        Some((ADV_REC_SELECT_RECT, phase)) => {
+            reset_adv_rec_brush_stroke(session);
+            if phase == HitPhase::DragStarted {
+                // The selection starts where the button went down, not where the drag threshold
+                // was crossed.
+                let press = ui.ctx().input(|i| i.pointer.press_origin()).or(pointer).filter(|p| image_rect.contains(*p));
+                session.quick_selection = press.map(|press| {
+                    let start_px = adv_rec_pointer_to_image_px(press, image_rect, session.preview_base_image.size);
+                    AdvancedRecognitionQuickSelection { start_px, current_px: start_px }
+                });
+                ui.ctx().request_repaint();
+            }
+            if let Some(selection) = session.quick_selection.as_mut()
+                && let Some(pointer_pos) = pointer.filter(|p| image_rect.contains(*p))
+            {
+                selection.current_px = adv_rec_pointer_to_image_px(pointer_pos, image_rect, session.preview_base_image.size);
+            }
+            if phase == HitPhase::DragStopped
+                && let Some(selection) = session.quick_selection.take()
+            {
+                ui.ctx().request_repaint();
+                if selection.is_large_enough(session.preview_base_image.size) {
+                    match encode_adv_rec_selection_png(session, selection) {
+                        Ok(image_override_png) => return Some(AdvancedRecognitionAction::QuickRecognizeSelection { image_override_png }),
+                        Err(error) => session.status = Some(error),
                     }
                 }
             }
-            ui.ctx().request_repaint();
+            None
         }
-    } else if !primary_down {
-        session.quick_selection = None;
-    }
-
-    if session.brush_enabled
-        && let Some(pointer_pos) = hover_pos.filter(|p| image_rect.contains(*p))
-    {
-        session.brush.draw_circle_cursor_on_image(
-            ui,
-            image_rect,
-            session.preview_base_image.size,
-            pointer_pos,
-        );
-    }
-
-    if !session.brush_enabled || zoom_modifier_down || session.zoom_drag_active {
-        if !(primary_down || secondary_down) {
-            reset_adv_rec_brush_stroke(session);
-        } else {
-            session.brush_last_drag_px = None;
-            session.brush_last_drag_erase = false;
+        Some((action @ (ADV_REC_PAINT | ADV_REC_ERASE), HitPhase::Clicked)) => {
+            // A click dabs one brush footprint at the press point, as its own stroke.
+            session.quick_selection = None;
+            let press = ui.ctx().input(|i| i.pointer.press_origin()).or(pointer).filter(|p| image_rect.contains(*p));
+            if let Some(press) = press {
+                reset_adv_rec_brush_stroke(session);
+                paint_adv_rec_brush_to(session, press, image_rect, action == ADV_REC_ERASE);
+                reset_adv_rec_brush_stroke(session);
+                ui.ctx().request_repaint();
+            }
+            None
         }
-        return None;
+        Some((action @ (ADV_REC_PAINT | ADV_REC_ERASE), phase @ (HitPhase::DragStarted | HitPhase::Dragging))) => {
+            session.quick_selection = None;
+            let erase = action == ADV_REC_ERASE;
+            // A new stroke starts at the press point, not where the drag threshold was crossed.
+            if phase == HitPhase::DragStarted
+                && let Some(press) = ui.ctx().input(|i| i.pointer.press_origin()).filter(|p| image_rect.contains(*p))
+            {
+                session.brush_last_drag_px = None;
+                paint_adv_rec_brush_to(session, press, image_rect, erase);
+            }
+            if let Some(pointer_pos) = pointer.filter(|p| image_rect.contains(*p)) {
+                paint_adv_rec_brush_to(session, pointer_pos, image_rect, erase);
+                ui.ctx().request_repaint();
+            }
+            None
+        }
+        _ => {
+            // No gesture of the preview runs (released, a zoom drag, or an unbound button).
+            if !response.dragged() {
+                session.quick_selection = None;
+                reset_adv_rec_brush_stroke(session);
+            } else {
+                session.brush_last_drag_px = None;
+                session.brush_last_drag_erase = false;
+            }
+            None
+        }
     }
-
-    let erase = secondary_down || (primary_down && mods.shift);
-    let draw = primary_down && !mods.shift;
-    let paint_active = erase || draw;
-
-    if let Some(pointer_pos) = interact_pos
-        && image_rect.contains(pointer_pos)
-        && paint_active
-    {
-        let preview_px =
-            adv_rec_pointer_to_image_px(pointer_pos, image_rect, session.preview_base_image.size);
-        let Some((to_x, to_y)) = adv_rec_preview_px_to_working_px(session, preview_px) else {
-            session.brush_last_drag_px = None;
-            session.brush_last_drag_erase = erase;
-            return None;
-        };
-        let (from_x, from_y) = match session.brush_last_drag_px {
-            Some((from_x, from_y)) if session.brush_last_drag_erase == erase => (from_x, from_y),
-            _ => (to_x, to_y),
-        };
-        begin_adv_rec_brush_stroke(session, erase);
-        paint_line_mask_with_hardness(
-            &mut session.brush_stroke_mask,
-            session.working_overlay_image.size,
-            from_x,
-            from_y,
-            to_x,
-            to_y,
-            session.brush.radius_px().max(1) as i32,
-            session.brush_hardness,
-        );
-        apply_adv_rec_brush_stroke(session);
-        session.refresh_preview_overlay();
-        session.brush_last_drag_px = Some((to_x, to_y));
-        session.brush_last_drag_erase = erase;
-        ui.ctx().request_repaint();
-        return None;
-    }
-
-    if !(primary_down || secondary_down) {
-        reset_adv_rec_brush_stroke(session);
-    }
-    None
 }
 
-fn handle_adv_rec_zoom_input(
-    ctx: &egui::Context,
-    session: &mut AdvancedRecognitionSession,
-    window_rect: Rect,
-) {
-    let (mods, hover_pos, interact_pos, z_down, primary_down, wheel_delta_y) = ctx.input(|i| {
-        (
-            i.modifiers,
-            i.pointer.hover_pos(),
-            i.pointer.interact_pos(),
-            i.key_down(egui::Key::Z),
-            i.pointer.primary_down(),
-            // Raw wheel: stays non-zero under Ctrl/Cmd (egui zeroes
-            // `smooth_scroll_delta` there, diverting the wheel into zoom).
-            ms_widgets::input_util::raw_wheel_delta(i).y,
-        )
-    });
-    let zoom_modifier_down = mods.ctrl || mods.command || z_down;
-    let pointer_pos = interact_pos.or(hover_pos);
-    let inside_window = pointer_pos
-        .map(|pointer| window_rect.contains(pointer))
-        .unwrap_or(false);
+/// Extends the running brush stroke (paint or `erase`) to `pointer_pos` (screen points inside
+/// `image_rect`), continuing from its last point while the stroke kind stays the same.
+fn paint_adv_rec_brush_to(session: &mut AdvancedRecognitionSession, pointer_pos: Pos2, image_rect: Rect, erase: bool) {
+    let preview_px = adv_rec_pointer_to_image_px(pointer_pos, image_rect, session.preview_base_image.size);
+    let Some((to_x, to_y)) = adv_rec_preview_px_to_working_px(session, preview_px) else {
+        session.brush_last_drag_px = None;
+        session.brush_last_drag_erase = erase;
+        return;
+    };
+    let (from_x, from_y) = match session.brush_last_drag_px {
+        Some((from_x, from_y)) if session.brush_last_drag_erase == erase => (from_x, from_y),
+        _ => (to_x, to_y),
+    };
+    begin_adv_rec_brush_stroke(session, erase);
+    paint_line_mask_with_hardness(
+        &mut session.brush_stroke_mask,
+        session.working_overlay_image.size,
+        from_x,
+        from_y,
+        to_x,
+        to_y,
+        i32::try_from(session.brush.radius_px().max(1)).unwrap_or(i32::MAX),
+        session.brush_hardness,
+    );
+    apply_adv_rec_brush_stroke(session);
+    session.refresh_preview_overlay();
+    session.brush_last_drag_px = Some((to_x, to_y));
+    session.brush_last_drag_erase = erase;
+}
+
+/// Applies this frame's shared `view.*` input aimed at the preview (`adv_rec_view_id`): zoom
+/// commands and the wheel zoom axis whose focus is this view, and its zoom-drag claim. Returns
+/// whether the zoom changed. A pinch (an axis sample without wheel steps) is not applied here.
+fn apply_adv_rec_view_input(session: &mut AdvancedRecognitionSession, input: &InputFrame) -> bool {
+    let view_id = adv_rec_view_id();
     let mut changed = false;
-
-    if inside_window && zoom_modifier_down && wheel_delta_y.abs() > f32::EPSILON {
-        let factor = if wheel_delta_y > 0.0 {
-            ADV_REC_ZOOM_STEP
-        } else {
-            1.0 / ADV_REC_ZOOM_STEP
-        };
-        changed |= session.scale_zoom(factor);
-        ctx.input_mut(|input| {
-            input.smooth_scroll_delta = egui::Vec2::ZERO;
-        });
+    for fired in input.fired_commands().iter().filter(|fired| fired.focus.is_some_and(|focus| focus.view == view_id)) {
+        match fired.action {
+            view::ZOOM_IN => changed |= session.scale_zoom(ADV_REC_ZOOM_STEP),
+            view::ZOOM_OUT => changed |= session.scale_zoom(1.0 / ADV_REC_ZOOM_STEP),
+            view::ZOOM_RESET => changed |= session.set_zoom(1.0),
+            _ => {}
+        }
     }
-
-    if session.zoom_drag_active {
-        if !zoom_modifier_down || !primary_down {
-            session.zoom_drag_active = false;
-        } else if let Some(pointer) = pointer_pos {
-            let dx = pointer.x - session.zoom_drag_last_x;
+    if let Some(sample) = input.axis_for_view(view::ZOOM, view_id)
+        && sample.steps != 0
+    {
+        changed |= session.scale_zoom(ADV_REC_ZOOM_STEP.powi(sample.steps));
+    }
+    let claim = input.claimed(view_id).filter(|claim| claim.action == view::ZOOM_DRAG);
+    match claim.map(|claim| (claim.phase, claim.origin.x, claim.current.x)) {
+        Some((phase @ (GesturePhase::Started | GesturePhase::Active), origin_x, current_x)) => {
+            // A new drag measures from its press point; one that only now reaches the window
+            // from where it is, so the zoom does not jump.
+            if phase == GesturePhase::Started {
+                session.zoom_drag_last_x = origin_x;
+            } else if !session.zoom_drag_active {
+                session.zoom_drag_last_x = current_x;
+            }
+            session.zoom_drag_active = true;
+            let dx = current_x - session.zoom_drag_last_x;
             if dx.abs() > f32::EPSILON {
-                let factor = ADV_REC_ZOOM_STEP.powf(dx / 80.0);
-                changed |= session.scale_zoom(factor);
-                session.zoom_drag_last_x = pointer.x;
+                changed |= session.scale_zoom(adv_rec_zoom_drag_factor(dx));
+                session.zoom_drag_last_x = current_x;
             }
         }
-    } else if inside_window
-        && zoom_modifier_down
-        && primary_down
-        && let Some(pointer) = pointer_pos
-    {
-        session.zoom_drag_active = true;
-        session.zoom_drag_last_x = pointer.x;
+        Some((GesturePhase::Finished(_), _, _)) | None => session.zoom_drag_active = false,
     }
-
-    if inside_window {
-        if ctx.input_mut(|input| input.consume_key(mods, egui::Key::Equals)) {
-            changed |= session.scale_zoom(ADV_REC_ZOOM_STEP);
-        }
-        if ctx.input_mut(|input| input.consume_key(mods, egui::Key::Minus)) {
-            changed |= session.scale_zoom(1.0 / ADV_REC_ZOOM_STEP);
-        }
-        if ctx.input_mut(|input| input.consume_key(mods, egui::Key::Num0)) {
-            changed |= session.set_zoom(1.0);
-        }
-    }
-
-    if changed {
-        ctx.request_repaint();
-    }
+    changed
 }
 
 fn adv_rec_pointer_to_image_px(

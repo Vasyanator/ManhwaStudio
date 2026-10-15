@@ -26,11 +26,10 @@ segment. `mask_brush` is also the shared BRUSH OWNER of the unified input system
 (-) and `brush.larger` (= / Shift+= / numpad +), scope `Sub(None)`, active only under the context
 `BRUSH_ACTIVE`; the studio registers them once, a brush host publishes `BRUSH_ACTIVE` while its
 brush mode is on and calls `MaskBrush::apply_input(&InputFrame)` once per frame (Translation mask
-edit and advanced recognition, Typing mask edit). The radius laws are `step_by_notches` (2 px per
-notch), `shrink_one_step` (`floor(r * 0.9)`) and `grow_one_step` (`ceil(r * 1.1)`), each at least
-one pixel and clamped. The raw `handle_wheel` / `handle_size_shortcuts` stay only as a
-transitional path for the Cleaning brushes until input-unification WP7 moves them to
-`apply_input`; no new host may call them.
+edit and advanced recognition, Typing mask edit, the Cleaning brushes, region frame and region
+editor window). The radius laws are `step_by_notches` (2 px per notch), `shrink_one_step`
+(`floor(r * 0.9)`) and `grow_one_step` (`ceil(r * 1.1)`), each at least one pixel and clamped;
+`MaskBrush` reads no raw input.
 
 The painting functions are synchronous pixel-buffer helpers. Callers are responsible for invoking
 them only on appropriately scoped buffers, typically small masks, scratch overlays, or worker-owned

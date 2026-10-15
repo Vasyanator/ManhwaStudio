@@ -33,8 +33,10 @@ so the same loader is asked twice for the same rectangle; both answers are deriv
 rectangle and therefore cannot disagree on size.
 
 This tool is NOT a region editor: no floating window, no main dock panel. It rides the tab's
-ordinary stroke pipeline, which is why `captures_canvas_pointer()` and `block_canvas_zoom()` both
-stay `false` — see the tests at the bottom of this file for what each of them would break.
+ordinary stroke pipeline: its gesture is the canvas-wide claim `cleaning.patch.drag` (the core
+decides select vs. source drag from the press point), its cancel the command
+`cleaning.patch.cancel` (`apply_input`); while `view.pan` is held the core takes no gesture. The
+clean-overlay undo is never disabled by it.
 */
 use super::base::{
     BrushToolBase, CleaningTool, RegionLoadRequest, RegionLoadResult, StrokePoint,
@@ -43,8 +45,11 @@ use super::base::{
 };
 use super::region_edit_v2::frame::page_source_size;
 use super::region_edit_v2::geometry::usable_viewport_for;
+use crate::input::{self, CleaningLabels, StrokeModes};
 use ms_canvas::{CanvasView, OverlayRectPx};
+use ms_input::{ContextId, GesturePhase, InputFrame, view};
 use ms_project::ProjectData;
+use std::sync::Arc;
 use ms_tools::patch::{
     PagePixelProjection, PatchBuffer, PatchCommit, PatchHost, PatchHostError, PatchInput,
     PatchInputError, PatchRegionPoll, PatchRegionRequest, PatchToolCore, check_roi_buffer,
@@ -280,6 +285,8 @@ pub struct PatchTool {
     /// The dock-panel rectangles this frame, cut out of the viewport before the outline is
     /// painted so it never lands on a panel.
     panel_rects: Vec<egui::Rect>,
+    /// The binding texts of the usage hint (`set_input_labels`).
+    labels: Arc<CleaningLabels>,
 }
 
 impl Default for PatchTool {
@@ -288,6 +295,7 @@ impl Default for PatchTool {
             core: PatchToolCore::new(LOG_TAG, OUTLINE_LAYER_ID),
             loader: PatchLoader::default(),
             panel_rects: Vec::new(),
+            labels: Arc::default(),
         }
     }
 }
@@ -338,7 +346,7 @@ impl PatchHost for CleaningPatchHost<'_> {
             StrokePoint {
                 page_idx,
                 scene_pos,
-                modifiers: super::base::StrokeModifiers::default(),
+                modes: StrokeModes::default(),
             },
         );
     }
@@ -570,8 +578,23 @@ impl CleaningTool for PatchTool {
     }
 
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
-        // The usage hint names the cancel key this host reads (`on_key_event`).
-        self.core.draw_ui(ui, &ms_input::button_label(&ms_input::Button::Key(egui::Key::Escape)));
+        // The usage hint names the current binding of `cleaning.patch.cancel`.
+        self.core.draw_ui(ui, &self.labels.patch_cancel);
+    }
+
+    fn input_contexts(&self) -> Vec<ContextId> {
+        vec![input::TOOL_PATCH]
+    }
+
+    /// `cleaning.patch.cancel` clears the selection / cancels the work in flight; `view.pan`
+    /// held keeps the core from taking a gesture.
+    fn apply_input(&mut self, input: &InputFrame) -> bool {
+        self.core.set_space_pan_active(input.mode_active(view::PAN));
+        self.core.on_cancel(PatchInput { cancel: input.fired(input::PATCH_CANCEL).is_some() })
+    }
+
+    fn set_input_labels(&mut self, labels: &Arc<CleaningLabels>) {
+        self.labels = Arc::clone(labels);
     }
 
     fn stroke_begin(&mut self, canvas: &mut CanvasView, point: StrokePoint) {
@@ -599,25 +622,6 @@ impl CleaningTool for PatchTool {
         self.core.stroke_end();
     }
 
-    fn set_space_pan_active(&mut self, active: bool) {
-        self.core.set_space_pan_active(active);
-    }
-
-    fn space_pan_active(&self) -> bool {
-        self.core.space_pan_active()
-    }
-
-    fn block_canvas_drag_scroll_on_primary(&self) -> bool {
-        !self.core.space_pan_active()
-    }
-
-    /// Escape cancels the patch selection. Read raw here until the tab declares
-    /// `cleaning.patch.cancel` (input-unification WP7); the core reads no key itself.
-    fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        let cancel = ctx.input(|input| input.key_pressed(egui::Key::Escape));
-        self.core.on_cancel(PatchInput { cancel })
-    }
-
     fn set_panel_rects(&mut self, rects: &[egui::Rect]) {
         self.panel_rects.clear();
         self.panel_rects.extend_from_slice(rects);
@@ -628,14 +632,16 @@ impl CleaningTool for PatchTool {
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
     ) {
-        // The only place in the frame where the pointer state is available (`../../tab.rs` runs
+        // The only place in the frame where the gesture's state is settled (`../../tab.rs` runs
         // this after all stroke dispatch), and therefore the only place a parked `stroke_end` that
-        // no `stroke_begin` claimed can be judged. `primary_released` is checked as well as
-        // `primary_down`, so a release followed by a fresh press inside one frame still counts as
-        // the release it was.
-        let released =
-            ctx.input(|input| !input.pointer.primary_down() || input.pointer.primary_released());
+        // no `stroke_begin` claimed can be judged: the button counts as released unless this
+        // frame's `cleaning.patch.drag` claim still runs (its release frame reports `Finished`, so
+        // a release and a fresh press inside one frame still count as the release they were).
+        let released = !input
+            .claimed(canvas.view_id())
+            .is_some_and(|claim| claim.action == input::PATCH_DRAG && matches!(claim.phase, GesturePhase::Started | GesturePhase::Active));
         let mut host = CleaningPatchHost {
             canvas,
             project: Some(project),
@@ -643,24 +649,6 @@ impl CleaningTool for PatchTool {
             panel_rects: &self.panel_rects,
         };
         self.core.draw_overlay_ui(ctx, &mut host, released);
-    }
-
-    /// Never `true`.
-    ///
-    /// `block_canvas_zoom` also disables the clean-overlay Ctrl+Z / Ctrl+Shift+Z shortcuts
-    /// (`tab.rs::handle_history_hotkeys`), which is acceptable for a modal editor window but not
-    /// for a surface that lives on the canvas for a whole session.
-    fn block_canvas_zoom(&self) -> bool {
-        false
-    }
-
-    /// Never `true`.
-    ///
-    /// The tab ORs this flag into `canvas_pointer_occluded` and then refuses every stroke, key
-    /// and cursor callback over the captured area — and this tool drives its entire gesture
-    /// through those callbacks.
-    fn captures_canvas_pointer(&self, _pointer_pos: Pos2) -> bool {
-        false
     }
 
     fn ensure_hover_overlay(&mut self, canvas: &mut CanvasView, point: StrokePoint) {
@@ -674,27 +662,10 @@ impl CleaningTool for PatchTool {
 mod tests {
     use super::*;
 
-    /// `block_canvas_zoom` must stay `false`.
-    ///
-    /// The flag also disables the clean-overlay Ctrl+Z / Ctrl+Shift+Z shortcuts
-    /// (`tab.rs::handle_history_hotkeys`), and this tool's selection lives on the canvas for a
-    /// whole session — undo has to keep working the entire time.
+    /// The patch publishes its own tool context and nothing else: no brush, no region state.
     #[test]
-    fn canvas_zoom_is_never_blocked() {
-        assert!(!PatchTool::default().block_canvas_zoom());
-    }
-
-    /// `captures_canvas_pointer` must stay `false`.
-    ///
-    /// The tab ORs it into `canvas_pointer_occluded` and then calls `finish_stroke()` and
-    /// returns, so a capturing tool receives no `stroke_begin`/`stroke_update`/`stroke_end`, no
-    /// `on_key_event` and no `draw_cursor` — and this tool's entire gesture rides those.
-    #[test]
-    fn the_canvas_pointer_is_never_captured() {
-        let tool = PatchTool::default();
-        for pos in [egui::pos2(0.0, 0.0), egui::pos2(500.0, 500.0)] {
-            assert!(!tool.captures_canvas_pointer(pos));
-        }
+    fn the_patch_publishes_its_tool_context_only() {
+        assert_eq!(PatchTool::default().input_contexts(), vec![input::TOOL_PATCH]);
     }
 
     /// The commit refuses a chunk that does not fit the LIVE overlay instead of letting

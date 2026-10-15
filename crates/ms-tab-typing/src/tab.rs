@@ -13,8 +13,8 @@ FILE HEADER (crates/ms-tab-typing/src/tab.rs)
   Ниже описан общий контракт вкладки; конкретные реализации ищите в подмодулях каталога `tab/`.
 - Ключевые поля `TypingTabState`:
   - `canvas`: отдельный инстанс холста для вкладки типинга (`editable = false`). The tab owns its
-    bottom hint: `draw` sets the rows (`tab/studio_tab.rs::typing_hint_rows`) every frame, and the
-    collapsed flag is seeded from `user_config` by `load_exit_settings` and written back at teardown
+    bottom hint: `draw` sets the rows (`tab/input.rs::typing_hint_rows`, binding texts from the input
+    registry) every frame, and the collapsed flag is seeded from `user_config` by `load_exit_settings` and written back at teardown
     by `StudioTab::write_exit_settings` (both in `tab/studio_tab.rs`).
   - `text_overlays`: слой PNG-оверлеев (`text` + `image`). Text overlays persist as inline v3 text
     nodes of the chapter `LayerDoc` (`layers.json`); a legacy `text_images/text_info.json` is
@@ -23,32 +23,20 @@ FILE HEADER (crates/ms-tab-typing/src/tab.rs)
     загрузка/редактирование сохраняемой `deform_mesh` как общей high-res surface
     and LRU snapshots/eviction for reconstructable display textures while keeping `source_rgba`;
     (legacy `transform_uv`/низкое разрешение читается с конвертацией и ресемплингом),
-    контекстное меню ПКМ, удаление (`ПКМ/Del`),
-    ручка вращения выделенного оверлея (вне transform-mode), поворот `Ctrl+колесо`
-    на `2°` за шаг при выделенном оверлее (иначе событие остаётся у canvas-zoom),
-    сдвиг ВЫДЕЛЕННОГО слоя (текстового или растрового) стрелками (`1px`,
-    `Shift+стрелки` = `5px`; не срабатывает, когда клавиатуру ждёт любой сфокусированный
-    виджет, и в режимах трансформации, где мышь тоже не двигает слой). Мышь и стрелки
-    используют ОДИН примитив перемещения (`tab/move_layer.rs`), поэтому побочные эффекты
-    (кламп страницы, попиксельная привязка, лимит видимости, инвалидация обрезки маской,
-    отложенная запись) у них общие; перетаскиванием слой НИКОГДА не меняет страницу,
-    `Shift+колесо` меняет размер шрифта: в режиме без выделения — на панели `Создание текста`,
-    при выделенном `text`-оверлее — в edit-параметрах с live-рендером (в обоих случаях
-    с consume wheel-события до `CanvasView`, чтобы не скроллить холст; когда курсор
-    поверх любой панели (Foreground-слой над холстом по z-order), обработчик уступает
-    событие виджету панели и шрифт холста не меняется),
-    hotkey `V` для выделенного `text`-оверлея запускает фоновый авто-тайп:
-    берётся оптический центр оверлея, от него ищется пузырь на composited-странице
-    (`src + clean overlay` из shared cache), после чего оверлей центрируется по пузырю;
-    hotkey `C` переключает видимость клина, hotkey `H` — помощь с центровкой
-    (тот же state, что у чекбоксов `Показывать клин` / `Помочь с центровкой` на панели
-    действий; оба обрабатываются в `draw_canvas_overlay_top_left`);
+    the layer context menu, delete, the rotation handle of the selected overlay (outside transform
+    mode), wheel rotation by 2° per notch, nudging the SELECTED layer (text or raster; 1 px / 5 px),
+    the quick font-size wheel, auto-typing over the bubble under a text layer, the clean / centering
+    toggles. EVERY binding of these is a declared `ms-input` action (`tab/input.rs`: declarations,
+    contexts, the once-per-frame dispatch before `canvas.draw`, the binding labels); no handler
+    in this tab reads a key, a modifier or the wheel. Mouse and nudge commands use ONE move
+    primitive (`tab/move_layer.rs`), so the side effects (page clamp, pixel snap, visibility limit,
+    mask-clip invalidation, deferred write) are shared; dragging NEVER changes a layer's page;
     при выделении оверлея верхняя панель auto-переключается в режим редактирования,
     изменения текста/параметров рендерятся в тот же PNG в фоне по схеме latest-wins:
     новый запрос сразу вытесняет предыдущий и устаревший результат не применяется,
     and the edit is written to the doc later, at a deferred-save flush point (`tab/persist.rs`);
-    масштаб выделенного оверлея через `-` / `=` / `0` (уменьшить/увеличить/сброс), Shift-выделение
-    под создание нового текстового оверлея, inline-редактор и фоновый финальный рендер+сохранение;
+    the scale commands of the selected layer, the create rectangle (`typing.create_rect`) for a new
+    text overlay, the inline editor and the background final render+save;
     новый оверлей после рендера создаётся с `scale = 1.0` (без fit-подгонки под ширину выделения);
     режимы `Perspective`/`Изгиб`/`Рамка`/кистевые warp-инструменты (`Выпуклость`, `Впуклость`,
     `Сдвиг`, `Закрутка`, `Восстановление`, `Разгладить`, `Растянуть`, `Складка`)
@@ -118,11 +106,11 @@ use super::render_next::types::{
 use ms_models::page_view::{PageImageInfo, PageTexture};
 use ms_log::trace::cat;
 use ms_canvas as canvas;
-use ms_input::{InputFrame, InputRegistry};
+use ms_input::{HitPhase, InputFrame, InputRegistry};
 use ms_canvas::{
     BubbleClass, CANVAS_RIBBON_TAB, CanvasBottomHint, CanvasDrawParams, CanvasHooks,
     CanvasUiStatus, CanvasView, RectCoords, SourceTextureUploadBudget,
-    TouchDrivenDrag, drive_touch_drag, parse_image_text_areas,
+    parse_image_text_areas,
 };
 use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
@@ -155,7 +143,7 @@ use std::sync::{Arc, Mutex};
 use ms_thread as thread;
 
 mod geometry;
-use geometry::{ctrl_wheel_raster_rotation_step_rad, lerp, normalize_angle_deg, normalize_angle_rad};
+use geometry::{lerp, normalize_angle_deg, normalize_angle_rad, wheel_rotation_step_deg};
 mod export;
 pub(super) use export::*;
 // The schema-1 -> schema-2 `text_params` conversion is the ONE owner of what a legacy
@@ -189,9 +177,12 @@ use touch_layers::{TypingTouchFrame, TypingTouchGates, TypingTouchLayerMenu, Typ
 mod vector_transform;
 mod layout_editor;
 use layout_editor::*;
-// `impl StudioTab` (the studio root's order-free hooks), the exit-only config keys and the
-// bottom-hint rows.
+// `impl StudioTab` (the studio root's order-free hooks) and the exit-only config keys.
 mod studio_tab;
+// The tab's input declarations, contexts, binding labels (bottom hint, panels, mask) and the
+// once-per-frame command / axis dispatch (`ms-input`).
+pub(crate) mod input;
+use input::{TypingInputLabelCache, TypingInputLabels, TypingScaleStep};
 mod helpers;
 // Single-image «Сохранить»: flatten one page into an image file (native only — the atomic write
 // it ends with does not exist on wasm).
@@ -587,6 +578,9 @@ pub struct TypingTabState {
     /// project export in both directions.
     #[cfg(not(target_arch = "wasm32"))]
     flatten_to_file: flatten_to_file::FlattenToFileState,
+    /// The tab's binding texts (bottom hint, panels, layer menus, mask tab), rebuilt when the
+    /// input registry or the UI locale changes (`tab/input.rs`).
+    input_labels: TypingInputLabelCache,
 }
 
 /// Why a deferred text-layer save was flushed. Diagnostics only — every reason performs the same
@@ -746,6 +740,7 @@ impl TypingTabState {
             save_busy: false,
             #[cfg(not(target_arch = "wasm32"))]
             flatten_to_file: flatten_to_file::FlattenToFileState::default(),
+            input_labels: TypingInputLabelCache::default(),
         }
     }
 }
@@ -1093,14 +1088,14 @@ impl TypingTabState {
         if self.mask_layer.is_panel_open() && self.mask_layer.apply_brush_input(input) {
             ctx.request_repaint();
         }
-        // The tab owns its bottom-hint rows; rebuilt every frame so a language switch re-localizes them.
-        self.set_bottom_hint(Some(CanvasBottomHint { rows: studio_tab::typing_hint_rows() }));
+        // The tab's bottom-hint rows and the binding texts of its panels: every binding text comes
+        // from the registry (rebuilt on a rebinding or a language switch).
+        self.refresh_input_labels(input_registry);
         // A running single-image flatten-to-file blocks a project export exactly like a busy save
         // (both directions are exclusive; the flatten refuses while an export runs or is deferred), so
         // it is folded into the one "busy" term the export trigger and the deferred dispatch read.
         let save_busy = self.save_busy || self.flatten_to_file_in_progress();
         let _frame_span = ms_log::trace_scope!(cat::FRAME, "typing.draw page={}", self.canvas.current_page_idx());
-        let canvas_rect = ui.max_rect();
         // Cross-tab sync: if the shared LayerDoc changed (version advanced) since we last projected,
         // re-project the current page from it (in-memory; no disk reload).
         self.text_overlays
@@ -1145,13 +1140,9 @@ impl TypingTabState {
         needs_repaint |= self
             .text_overlays
             .upload_pending_textures(ctx, &self.mask_layer);
-        let layout_editor_active = self.text_overlays.layout_editor_active();
-        if !layout_editor_active {
-            needs_repaint |=
-                self.try_adjust_create_panel_font_size_by_shift_wheel(ctx, canvas_rect);
-            needs_repaint |=
-                self.try_adjust_selected_overlay_font_size_by_shift_wheel(ctx, canvas_rect);
-        }
+        // This frame's Typing commands and axes, ONCE, before the page passes (no per-page key
+        // handler and no per-page "the selection lives here" guard): `tab/input.rs`.
+        needs_repaint |= self.run_input_frame(ctx, input);
         if self.top_panel.is_mask_panel_open() {
             self.text_overlays.clear_selection();
         }
@@ -1168,27 +1159,20 @@ impl TypingTabState {
             &mut self.top_panel,
             &mut self.mask_layer,
         );
-        canvas.set_zoom_blocked(
-            !mask_layer.is_panel_open()
-                && (text_overlays.has_selected_overlay()
-                    || text_overlays.has_selected_raster()
-                    || layout_editor_active),
-        );
-        // A finger long-press drag creates a text box exactly where the Shift+drag create
-        // overlay can run this frame (the overlay hook below skips it under the same two
-        // conditions); elsewhere it pans. One-frame flag, consumed by this `draw`.
-        canvas.set_long_press_selection(
-            !top_panel.is_mask_panel_open()
-                && !text_overlays.layout_editor_editing_active()
-                && text_overlays.touch_create_selection_available(),
-        );
+        // Canvas zoom is never blocked here: a selected layer's Ctrl+wheel rotation SHADOWS only
+        // the wheel alternative of `view.zoom` (`typing.layer.rotate`), and the finger create drag
+        // is the touch alternative of `typing.create_rect`, which the router claims itself.
+        let popup_open = ctx.any_popup_open() || egui::Popup::is_any_open(ctx);
         let mut hooks = TypingHooks {
             text_overlays,
             top_panel,
             mask_layer,
             pending_create_text_from_bubble: None,
             page_overlay_occluders: HashMap::new(),
+            page_views: HashMap::new(),
             save_busy,
+            input,
+            popup_open,
         };
         hooks.text_overlays.begin_canvas_frame();
         let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();
@@ -1208,15 +1192,6 @@ impl TypingTabState {
             input,
             input_registry,
         });
-        if Self::should_clear_overlay_selection_from_canvas_click(
-            ctx,
-            canvas_rect,
-            hooks.top_panel,
-            hooks.text_overlays,
-        ) {
-            hooks.text_overlays.clear_selection();
-            needs_repaint = true;
-        }
 
         // Idle-debounce safety net for an edit that never loses focus, driven LAST — it MUST run after
         // `canvas.draw`, because nearly every `mark_placement_save_dirty` lives inside `canvas.draw`'s
@@ -1233,183 +1208,12 @@ impl TypingTabState {
         // observe the release only on the next frame — delaying the write by a frame and stranding
         // it entirely when the release frame is the last one drawn. Settling here also lets the
         // `mark_placement_save_dirty` it performs seed the debounce window on the same frame.
-        self.text_overlays.drive_layer_move_settle(ctx);
+        self.text_overlays.drive_layer_move_settle(ctx, input_registry);
         self.text_overlays.drive_placement_save_debounce(ctx);
 
         if needs_repaint || self.text_overlays.wants_repaint() || self.mask_layer.is_panel_open() {
             ctx.request_repaint();
         }
-    }
-
-    fn should_clear_overlay_selection_from_canvas_click(
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-        top_panel: &TypingTopPanelState,
-        text_overlays: &TypingTextOverlayLayer,
-    ) -> bool {
-        if !text_overlays.has_selected_overlay() {
-            return false;
-        }
-        if top_panel.is_mask_panel_open() || top_panel.eyedropper_active() {
-            return false;
-        }
-        if text_overlays.layout_editor_active() {
-            return false;
-        }
-        if top_panel.eyedropper_consumed_primary_click_this_frame() {
-            return false;
-        }
-        if text_overlays.primary_pointer_targets_overlay_this_frame() {
-            return false;
-        }
-
-        let pointer_over_area = ms_widgets::input_util::pointer_over_floating_area(ctx);
-        let popup_open = ctx.any_popup_open();
-        ctx.input(|input| {
-            input.pointer.primary_clicked()
-                && input
-                    .pointer
-                    .interact_pos()
-                    .is_some_and(|pos| canvas_rect.contains(pos))
-                && !pointer_over_area
-                && !popup_open
-        })
-    }
-
-    /// True when the pointer sits over a panel/popup drawn above the canvas, so the
-    /// canvas Shift+wheel font handler must defer to that widget instead of firing.
-    ///
-    /// The bare canvas is [`egui::Order::Background`]; the Shift+drag selection-capture
-    /// overlay ([`egui::Order::Middle`]) counts as bare canvas. Any other floating layer
-    /// (a Foreground panel, popup or tooltip) means the wheel belongs to that widget.
-    fn pointer_over_panel_over_canvas(ctx: &egui::Context, pos: egui::Pos2) -> bool {
-        ctx.layer_id_at(pos).is_some_and(|layer| {
-            layer.order != egui::Order::Background
-                && layer != create_upload::shift_drag_capture_layer_id()
-        })
-    }
-
-    fn try_adjust_create_panel_font_size_by_shift_wheel(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-    ) -> bool {
-        if self.top_panel.is_mask_panel_open() {
-            return false;
-        }
-        if self.text_overlays.has_selected_overlay() {
-            return false;
-        }
-        let (shift_down, raw_wheel_delta, primary_down, hover_pos, interact_pos) =
-            ctx.input(|input| {
-                (
-                    input.modifiers.shift,
-                    ms_widgets::input_util::raw_wheel_delta(input),
-                    input.pointer.primary_down(),
-                    input.pointer.hover_pos(),
-                    input.pointer.interact_pos(),
-                )
-            });
-        if !shift_down || primary_down {
-            return false;
-        }
-
-        let Some(pointer_pos) = interact_pos
-            .or(hover_pos)
-            .filter(|pos| canvas_rect.contains(*pos))
-        else {
-            return false;
-        };
-        // Fire only over bare canvas (or the Shift-drag selection overlay). A panel/popup
-        // above the canvas owns the wheel — its own Wheel widget applies the 5x Shift step.
-        if Self::pointer_over_panel_over_canvas(ctx, pointer_pos) {
-            return false;
-        }
-
-        // Use the one-frame raw wheel delta, not the smoothed inertia (which ramps over
-        // ~a dozen frames and would apply one step per ramp frame): one physical notch =
-        // one discrete step.
-        let mut wheel_delta = raw_wheel_delta.y;
-        if wheel_delta.abs() <= f32::EPSILON {
-            // Some backends convert Shift+wheel into horizontal scroll.
-            wheel_delta = raw_wheel_delta.x;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
-            return false;
-        }
-
-        let steps = if wheel_delta > 0.0 { 1 } else { -1 };
-        if !self.top_panel.adjust_create_font_size_by_wheel_steps(steps) {
-            return false;
-        }
-
-        ctx.input_mut(|input| {
-            input.smooth_scroll_delta = Vec2::ZERO;
-        });
-        true
-    }
-
-    fn try_adjust_selected_overlay_font_size_by_shift_wheel(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-    ) -> bool {
-        if self.top_panel.is_mask_panel_open() {
-            return false;
-        }
-        if !self.text_overlays.has_selected_overlay() {
-            return false;
-        }
-        if self.top_panel.has_focused_text_input(ctx) {
-            return false;
-        }
-        let (shift_down, raw_wheel_delta, primary_down, hover_pos, interact_pos) =
-            ctx.input(|input| {
-                (
-                    input.modifiers.shift,
-                    ms_widgets::input_util::raw_wheel_delta(input),
-                    input.pointer.primary_down(),
-                    input.pointer.hover_pos(),
-                    input.pointer.interact_pos(),
-                )
-            });
-        if !shift_down || primary_down {
-            return false;
-        }
-
-        let Some(pointer_pos) = interact_pos
-            .or(hover_pos)
-            .filter(|pos| canvas_rect.contains(*pos))
-        else {
-            return false;
-        };
-        // Fire only over bare canvas (or the Shift-drag selection overlay); defer to a
-        // panel/popup above the canvas so its Wheel widget handles the Shift+wheel.
-        if Self::pointer_over_panel_over_canvas(ctx, pointer_pos) {
-            return false;
-        }
-
-        // One-frame raw wheel delta (not smoothed inertia): one notch = one step.
-        let mut wheel_delta = raw_wheel_delta.y;
-        if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = raw_wheel_delta.x;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
-            return false;
-        }
-
-        let steps = if wheel_delta > 0.0 { 1 } else { -1 };
-        if !self
-            .top_panel
-            .adjust_selected_text_overlay_font_size_by_wheel_steps(steps)
-        {
-            return false;
-        }
-
-        ctx.input_mut(|input| {
-            input.smooth_scroll_delta = Vec2::ZERO;
-        });
-        true
     }
 }
 
@@ -1438,11 +1242,10 @@ pub(crate) struct TypingCenteringAssistConfig {
 pub(crate) struct TypingPageInteractionPolicy {
     /// True while the clipping-mask panel is open (suppresses overlay selection/interaction).
     pub mask_panel_open: bool,
-    /// True while a panel text input has keyboard focus (suppresses canvas hotkeys).
-    pub panel_text_input_focused: bool,
     /// True while the eyedropper should retain the primary click (blocks focus-clear on empty click).
     pub eyedropper_blocks_focus_clear: bool,
-    /// Auto-typing hotkey settings snapshot (`C` centers the selected overlay over a bubble).
+    /// Auto-typing settings snapshot: the debug visuals the page pass draws for a running
+    /// `typing.layer.autotype` job.
     pub auto_typing: TypingAutoTypingSettings,
     /// True when overlay moves snap to whole page pixels.
     pub strict_pixel_movement: bool,
@@ -1695,17 +1498,22 @@ struct TypingHooks<'a> {
     mask_layer: &'a mut TypingMaskLayer,
     pending_create_text_from_bubble: Option<BubbleCreateTextRequest>,
     page_overlay_occluders: HashMap<usize, Vec<[Pos2; 4]>>,
+    /// The view of every page whose overlay pass ran this frame, for `on_page_click` (the canvas
+    /// calls it after that page's passes).
+    page_views: HashMap<usize, PageView>,
     /// True while a project save is pending/in flight (Finding 2) or a single-image flatten-to-file
     /// runs. A new export trigger is deferred (never dispatched inline) while this holds, so export and
     /// save cannot mutate shared doc/staging state concurrently, and export and flatten never overlap.
     save_busy: bool,
+    /// This frame's input (the studio router's `InputFrame`): the layer, layout-editor and mask
+    /// gestures resolve through it (`InputFrame::gesture_for`), the create rectangle reads its claim.
+    input: &'a InputFrame,
+    /// A popup or menu was open when the frame began: a click that closes it is not a page click
+    /// (no deselect).
+    popup_open: bool,
 }
 
 impl CanvasHooks for TypingHooks<'_> {
-    fn wants_canvas_shift_drag_selection(&self, ctx: &egui::Context) -> bool {
-        self.text_overlays.wants_canvas_shift_drag_selection(ctx)
-    }
-
     fn draw_canvas_mask_overlay_on_page(
         &mut self,
         ui: &mut egui::Ui,
@@ -1721,7 +1529,7 @@ impl CanvasHooks for TypingHooks<'_> {
         };
         if self
             .mask_layer
-            .draw_page_mask_overlay_and_handle_input(ui, view)
+            .draw_page_mask_overlay_and_handle_input(ui, view, self.input)
         {
             self.text_overlays.mark_page_texture_dirty(page_idx);
             ctx.request_repaint();
@@ -1731,7 +1539,7 @@ impl CanvasHooks for TypingHooks<'_> {
     fn draw_canvas_overlay_on_page(
         &mut self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         page_idx: usize,
         image_rect: Rect,
         zoom: f32,
@@ -1740,11 +1548,7 @@ impl CanvasHooks for TypingHooks<'_> {
         // mutably, preserving the disjoint borrows (the panel is not touched inside the draw).
         let policy = TypingPageInteractionPolicy {
             mask_panel_open: self.mask_layer.is_panel_open(),
-            panel_text_input_focused: self.top_panel.has_focused_text_input(ctx),
-            eyedropper_blocks_focus_clear: self.top_panel.eyedropper_active()
-                || self
-                    .top_panel
-                    .eyedropper_consumed_primary_click_this_frame(),
+            eyedropper_blocks_focus_clear: self.top_panel.eyedropper_blocks_focus_clear(),
             auto_typing: self.top_panel.auto_typing_settings(),
             strict_pixel_movement: self.top_panel.strict_pixel_movement(),
             centering: TypingCenteringAssistConfig {
@@ -1758,8 +1562,29 @@ impl CanvasHooks for TypingHooks<'_> {
             image_rect,
             zoom,
         };
-        let occluders = self.text_overlays.draw_page_overlays(ui, view, &policy);
+        let occluders = self.text_overlays.draw_page_overlays(ui, view, &policy, self.input);
         self.page_overlay_occluders.insert(page_idx, occluders);
+        self.page_views.insert(page_idx, view);
+    }
+
+    /// The ONE deselect owner: a `canvas.page.click` that reached the page row (no layer, handle,
+    /// panel or popup took it) clears the layer selection. Gated like every empty-canvas click: not
+    /// while the mask or the layout editor owns the canvas, the eyedropper holds the click, a layer
+    /// claimed the pointer this frame, or a popup was open. Returns `false`: the canvas still runs
+    /// its own read-only page-click handling (bubble deselect).
+    fn on_page_click(&mut self, page_idx: usize, _scene_pos: Pos2) -> bool {
+        let gates = selection_rasters::TypingEmptyClickGates {
+            mask_panel_open: self.mask_layer.is_panel_open(),
+            layout_editor_active: self.text_overlays.layout_editor_active(),
+            eyedropper_blocks: self.top_panel.eyedropper_blocks_focus_clear(),
+            layer_claimed_pointer: self.text_overlays.primary_pointer_targets_overlay_this_frame(),
+            popup_open: self.popup_open,
+        };
+        if selection_rasters::empty_click_deselects(gates) {
+            let view = self.page_views.get(&page_idx).copied();
+            self.text_overlays.deselect_by_empty_click(view, self.top_panel.strict_pixel_movement());
+        }
+        false
     }
 
     fn draw_canvas_overlay_top_left(
@@ -1834,32 +1659,6 @@ impl CanvasHooks for TypingHooks<'_> {
         }
         self.top_panel
             .sync_clean_overlays_visible_from_canvas(canvas.clean_overlays_visible());
-        // Keyboard twins of two Actions-panel checkboxes. Both flip the PANEL state rather than the
-        // downstream consumer, so checkbox and hotkey share one source of truth:
-        //   `C` — clean-overlay («клин») visibility. The canvas→panel sync above is one-shot, so the
-        //         panel owns the value afterwards and the queued request reaches the canvas further
-        //         down this same method. Placed AFTER that sync so the initial seed cannot overwrite
-        //         a toggle.
-        //   `H` — centering assist («Помочь с центровкой»), including the checkbox's turn-on side
-        //         effect (re-emitted edit request while editing). Read back into the overlay layer
-        //         on the next frame's policy snapshot, exactly like the checkbox.
-        //
-        // Shared gate: suppressed while a panel text input or any egui widget holds the keyboard,
-        // and while the layout editor owns the canvas. Keys are consumed so no other canvas handler
-        // sees them.
-        let canvas_hotkeys_active = !self.top_panel.has_focused_text_input(ctx)
-            && !ctx.egui_wants_keyboard_input()
-            && !self.text_overlays.layout_editor_active();
-        if canvas_hotkeys_active
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::C))
-        {
-            self.top_panel.toggle_clean_overlays_visible();
-        }
-        if canvas_hotkeys_active
-            && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::H))
-        {
-            self.top_panel.toggle_centering_assist();
-        }
         // The user-facing folder, never the hidden single-image scratch chapter (deleted on exit), so
         // the export / image-import dialogs never default into a directory that vanishes.
         self.top_panel.set_export_default_dir(project.user_facing_dir());
@@ -1916,7 +1715,7 @@ impl CanvasHooks for TypingHooks<'_> {
                 canvas,
                 project,
                 self.top_panel,
-                canvas.touch_selection(),
+                self.input,
             );
         }
         // Every floating «Текст» panel is a dock tab. The visibility flags are read
@@ -2239,23 +2038,12 @@ fn scene_rect_from_rect_coords(page_rect: Rect, rect_coords: RectCoords) -> Rect
     Rect::from_two_pos(p1, p2)
 }
 
-#[derive(Debug, Clone, Copy)]
+/// The create rectangle being dragged (screen points), driven by the router's claim of
+/// `typing.create_rect` (`create_upload.rs::step_create_selection`), mouse and finger alike.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct TypingCreateSelection {
     start: Pos2,
     current: Pos2,
-    /// Started by a finger long-press (`drive_touch_drag`), not by a Shift+drag: the finger's
-    /// `TouchSelection` moves and ends it, and it needs no Shift held.
-    touch: bool,
-}
-
-impl TouchDrivenDrag for TypingCreateSelection {
-    fn is_touch_driven(&self) -> bool {
-        self.touch
-    }
-
-    fn set_current(&mut self, pos: Pos2) {
-        self.current = pos;
-    }
 }
 
 impl TypingCreateSelection {
@@ -3398,6 +3186,12 @@ pub(super) struct TypingTextOverlayLayer {
     touch_layer_menu_request: Option<TypingTouchLayerMenu>,
     width_resize_drag: Option<WidthResizeDragState>,
     primary_pointer_targets_overlay_this_frame: bool,
+    /// The pointer button of the running layer pointer gesture (the button its binding names,
+    /// recorded at the gesture's start by `begin_layer_gesture`): the drag continues while it is
+    /// held, and a pointer move session settles when it is released.
+    layer_gesture_button: egui::PointerButton,
+    /// Binding texts the layer menus show (`tab/input.rs`, pushed when they change).
+    input_labels: TypingInputLabels,
     /// Page image path per page index (captured at project load), so the page's pixel size can be
     /// resolved lazily for legacy-overlay uv→px decoding when handing a page to the shared doc.
     page_image_paths: HashMap<usize, PathBuf>,
@@ -3576,6 +3370,8 @@ impl Default for TypingTextOverlayLayer {
             touch_layer_menu_request: None,
             width_resize_drag: None,
             primary_pointer_targets_overlay_this_frame: false,
+            layer_gesture_button: egui::PointerButton::Primary,
+            input_labels: TypingInputLabels::default(),
             page_image_paths: HashMap::new(),
             page_sizes_px: HashMap::new(),
             clean_overlays_model: None,

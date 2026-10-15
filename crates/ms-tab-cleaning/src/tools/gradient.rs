@@ -21,6 +21,9 @@ FILE HEADER (cleaning/tools/gradient.rs)
     (iterated 3×3 growth = one square window of radius `iters`); no morphology lives here.
 */
 use super::base::{CleaningTool, RegionMaskInpaintToolBase, StrokePoint};
+use std::sync::Arc;
+use crate::input::CleaningLabels;
+use ms_input::{ContextId, InputFrame};
 use ms_canvas::CanvasView;
 use ms_project::ProjectData;
 use ms_tools::red_black_sor_sweeps;
@@ -104,19 +107,20 @@ impl CleaningTool for GradientFillTool {
     fn draw_ui(&mut self, ui: &mut egui::Ui) {
         self.inpaint_base.draw_ui_hint(ui);
         ui.small(t!("cleaning.tools.gradient.description_hint"));
-        ui.small(t!("cleaning.tools.gradient.select_region_hint"));
+        ui.small(tf!("cleaning.tools.gradient.select_region_gesture_hint", gesture = self.inpaint_base.labels().select_rect));
     }
 
-    fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        self.inpaint_base.on_key_event(ctx)
+
+    fn input_contexts(&self) -> Vec<ContextId> {
+        self.inpaint_base.input_contexts()
     }
 
-    fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        self.inpaint_base.on_wheel_event(delta_y, modifiers)
+    fn apply_input(&mut self, input: &InputFrame) -> bool {
+        self.inpaint_base.apply_input(input)
     }
 
-    fn set_space_pan_active(&mut self, active: bool) {
-        self.inpaint_base.set_space_pan_active(active);
+    fn set_input_labels(&mut self, labels: &Arc<CleaningLabels>) {
+        self.inpaint_base.set_input_labels(labels);
     }
 
     fn set_ai_backend_available(&mut self, available: bool) {
@@ -125,10 +129,6 @@ impl CleaningTool for GradientFillTool {
 
     fn set_ai_backend_torch_available(&mut self, available: bool) {
         self.inpaint_base.set_ai_backend_torch_available(available);
-    }
-
-    fn wants_primary_stroke(&self, point: StrokePoint) -> bool {
-        self.inpaint_base.wants_primary_stroke(point)
     }
 
     fn stroke_begin(&mut self, canvas: &mut CanvasView, point: StrokePoint) {
@@ -143,12 +143,8 @@ impl CleaningTool for GradientFillTool {
         self.inpaint_base.end_selection(canvas);
     }
 
-    /// The primary stroke is the region selection, so a finger long-press drag selects too.
-    fn accepts_touch_selection(&self) -> bool {
-        true
-    }
-
-    fn cancel_touch_selection(&mut self) {
+    /// A cancelled selection claim (a second finger, focus loss) drops only the drag in flight.
+    fn stroke_cancel(&mut self, _canvas: &mut CanvasView) {
         self.inpaint_base.abort_selection_drag();
     }
 
@@ -157,9 +153,10 @@ impl CleaningTool for GradientFillTool {
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
     ) {
         self.inpaint_base
-            .draw_overlay_ui(ctx, canvas, project, t!("cleaning.tools.gradient.overlay_title"), Self::run);
+            .draw_overlay_ui(ctx, canvas, project, input, t!("cleaning.tools.gradient.overlay_title"), Self::run);
     }
 
     fn draw_cursor(
@@ -169,14 +166,6 @@ impl CleaningTool for GradientFillTool {
         pointer_scene_pos: Option<egui::Pos2>,
     ) {
         self.inpaint_base.draw_cursor(ui, canvas, pointer_scene_pos);
-    }
-
-    fn captures_canvas_pointer(&self, pointer_pos: egui::Pos2) -> bool {
-        self.inpaint_base.editor_window_contains(pointer_pos)
-    }
-
-    fn block_canvas_zoom(&self) -> bool {
-        self.inpaint_base.has_open_editor()
     }
 }
 

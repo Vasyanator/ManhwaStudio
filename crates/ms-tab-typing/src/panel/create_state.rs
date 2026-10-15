@@ -136,6 +136,7 @@ impl TypingCreatePanelState {
         let status_line = t!("typing.fonts.reloading_status").to_string();
         let font_provider: Arc<dyn FontProvider> = Arc::new(TabFontProvider::from_fonts(&fonts));
         let mut state = Self {
+            input_labels: crate::tab::input::TypingInputLabels::default(),
             fonts_dir,
             fonts,
             font_provider,
@@ -257,7 +258,6 @@ impl TypingCreatePanelState {
             preview_font_fallbacks: FontFallbackReport::default(),
             preview_texture: None,
             preview_size: [1, 1],
-            tracked_text_input_ids: Vec::new(),
             text_selection_char_range: None,
             pending_text_selection_restore: None,
             inline_text_target: InlineTextTarget::Source,
@@ -297,21 +297,6 @@ impl TypingCreatePanelState {
     /// Cheap to clone (Arc); hand it to every background render worker.
     pub(crate) fn font_provider(&self) -> Arc<dyn FontProvider> {
         Arc::clone(&self.font_provider)
-    }
-
-    pub(super) fn reset_text_input_focus_tracking(&mut self) {
-        self.tracked_text_input_ids.clear();
-    }
-
-    pub(super) fn track_text_input(&mut self, response: &egui::Response) {
-        self.tracked_text_input_ids.push(response.id);
-    }
-
-    pub(super) fn has_focused_text_input(&self, ctx: &egui::Context) -> bool {
-        let Some(focused) = ctx.memory(|mem| mem.focused()) else {
-            return false;
-        };
-        self.tracked_text_input_ids.contains(&focused)
     }
 
     pub(super) fn eyedropper_active(&self) -> bool {

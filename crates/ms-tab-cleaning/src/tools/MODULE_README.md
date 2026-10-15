@@ -6,8 +6,14 @@ connect tool input, preview state, region editing, mask editing, and final overl
 
 ## Architecture
 `base.rs` defines the `CleaningTool` trait consumed by `CleaningTabState`. The tab owns tool
-selection and dispatches canvas pointer events, wheel/key events, floating-window drawing, cursor
-painting, and backend availability into the active tool.
+selection and hands the active tool its input (`ms-input`, `../input.rs`): the tool publishes its
+contexts (`input_contexts`, read before the router's frame), takes this frame's commands, axes and
+shared brush actions in `apply_input` (before `canvas.draw`), receives its canvas gestures from the
+tab's stroke driver (`../canvas_input.rs`: `stroke_begin` / `stroke_update` / `stroke_end` /
+`stroke_cancel`, `on_page_press` for the press actions, `wants_primary_stroke` as a state veto),
+reads its own surfaces' targeted gestures from the `InputFrame` of `draw_overlay_ui`, and names
+the current bindings in its hints (`set_input_labels`). No tool reads a key, a modifier or the
+wheel. The tab also dispatches floating-window drawing, cursor painting and backend availability.
 
 Brush tools use `BrushToolBase` to draw into a local scratch overlay. Scratch previews are tiled
 for large images and are committed to `CanvasView` only at stroke boundaries. Region tools use
@@ -32,23 +38,22 @@ keeps in its private `RegionInpaintEditorState` — the run channel, the undo st
 preview and the Escape handling — is then owned by the tool itself. `watermark_removal.rs` does
 this because it has NO mask to paint: the network predicts its own.
 
-The SELECTION GESTURE is Shift+ЛКМ, with ONE documented exception: while a tool has armed a
-DIVERSION (`set_selection_diverted`), a plain ЛКМ drag starts the selection too. Arming is the
-explicit statement of intent Shift stands for otherwise, and a plain drag is inert on a
-region-edit tool (the canvas pans only with Space held, and the cleaning tab claims no
-Shift-drag hook), so accepting it takes nothing from any other gesture. The pair
-`wants_primary_stroke` / `selection_hint` must move together: the hint names the gesture
-accepted IN THAT STATE, and a hint naming a gesture the tool refuses is the defect this rule
-exists to prevent. A tool that never diverts keeps the Shift-only gate unchanged.
+The SELECTION GESTURE is `cleaning.region.select_rect` (Shift+LMB drag by default), with ONE
+documented exception: while a tool has armed a DIVERSION (`set_selection_diverted`), the base
+publishes `cleaning.region.armed` and a plain drag (`cleaning.region.select_rect_armed`) starts
+the selection too. Arming is the explicit statement of intent the selection mode stands for
+otherwise, and a plain drag is inert on a region-edit tool, so accepting it takes nothing from any
+other gesture. The pair `RegionEditToolBase::input_contexts` / `selection_hint` must move
+together: the hint names the gesture accepted IN THAT STATE, from the current bindings. While a
+legacy editor window is open the base publishes `cleaning.editor_window` instead: no canvas
+selection, no Esc cancel (Esc never wipes a painted mask), the clean-overlay undo off.
 
-A FINGER selects without Shift (user decision): a finger never reaches the stroke pipeline as a
-pointer (`ms_widgets::touch_nav` claims it), and a long-press drag reaches a tool whose
-`CleaningTool::accepts_touch_selection` is `true` (every region tool over `RegionEditToolBase`)
-as a replay of `stroke_begin` at the press point / `stroke_update` / `stroke_end` on lift
-(`../touch_selection.rs`), skipping `wants_primary_stroke`. A cancelled finger drag calls
-`cancel_touch_selection` → `abort_selection_drag`, which drops only the drag in flight; Esc's
+A FINGER selects without the selection mode (user decision): the finger long-press drag is the
+touch alternative of `cleaning.region.select_rect`, claimed by the router and driven through the
+same `stroke_begin` / `stroke_update` / `stroke_end`. A cancelled claim (a second finger, a focus
+loss) calls `stroke_cancel` → `abort_selection_drag`, which drops only the drag in flight; Esc's
 `cancel_selection` also drops the pending load, the editor and a parked diverted rect, which a
-second finger touching the screen must not do. Painting tools keep the default `false`, so a
+second finger touching the screen must not do. Painting tools have no touch alternative, so a
 long-press drag pans and never paints.
 
 A finished drag that produces NO rectangle is REFUSED WITH A REASON, never dropped: `load_error`
@@ -187,10 +192,11 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   the tool with no reservation left to claim it (`take_reservation_for_diverted`) and a drag
   that produced no rectangle at all (`report_selection_refusal`): a gesture dropped in silence
   is indistinguishable from one that did nothing.
-  While a reservation is live the canvas ALSO accepts a plain ЛКМ drag, and the panel says so —
-  `library_arm_gesture_hint` is drawn beside the cancel button, because the only other place
-  that names the gesture (`cleaning.region.selection_hint`) lives in a different dock tab from
-  the one the user is reading while arming.
+  While a reservation is live the canvas ALSO accepts a plain drag
+  (`cleaning.region.select_rect_armed`), and the panel says so — `library_arm_select_hint`,
+  built from the current bindings, is drawn beside the cancel button, because the only other
+  place that names the gesture (the region base's selection hint) lives in a different dock tab
+  from the one the user is reading while arming.
   A capture is also refused outright when the ring could not be MEASURED at all: no stated
   level can license such a crop, so it must not be offered a colour control.
   A capture is NOT refused for sitting against the page border. `grow_page_rect` takes the ring
@@ -342,8 +348,6 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   `CleaningTool` (a lasso has no radius, no hardness and no axis-aligned scratch rect, so
   `BrushToolBase` fits none of it), it rides the tab's ordinary stroke pipeline. Own
   `MODULE_README.md`.
-- `region_edit_test.rs`: development-only mask-inpaint pipeline test tool; it is not exported by
-  `mod.rs`.
 - `region_edit_v2/`: the on-canvas region-editing FRAMEWORK (frame, mask layers, geometry,
   painting, input) and the generic HOST tool over it (`host.rs` + `host_panels.rs`:
   `RegionEditHost`, `HostSpec`; `engine.rs`: the `AiEngine` contract). It has its own
@@ -507,8 +511,11 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   the spawner in a field of type `MaskGenerationSpawner`, defaulted to `spawn_mask_generation`, and
   its tests install a stub instead of calling the host method that would spawn the real one. The
   default is always the real spawner: a test opts OUT, and no product code path changes.
-- Tool pointer capture and zoom/scroll blocking are part of the canvas contract. An open region
-  editor must block canvas zoom and capture pointer input inside its window.
+- An open legacy region editor window is a VIEW of its own: it publishes a `ViewSurface` (its
+  window layer as capture layer), so the shared `view.*` zoom keys, Ctrl+wheel and the zoom drag
+  aim at it while the pointer is over it (`apply_editor_window_zoom`); the canvas keeps its zoom
+  for the rest of the screen. The window's brush takes the shared `brush.*` actions once per frame
+  (`RegionMaskInpaintToolBase::apply_input`).
 - `CleaningTool` carries five additive, defaulted methods for tools that own something beyond
   «Выбранный инструмент»: `set_panel_rects` (pushed by the tab each frame after `canvas.draw` and
   before `draw_overlay_ui`, so a tool can cut the dock panels out of the viewport), plus two
@@ -537,16 +544,13 @@ so the id is what buys a real cancel rather than a detached answer (`flux2_klein
   `scene_pos_to_overlay_pos` / `overlay_pos_to_scene_pos` are the FRACTIONAL point pair and exact
   inverses of each other; `scene_pos_to_source_xy` is the rounding, non-`Option` variant that takes
   an explicit page rect and source size instead of resolving them from the canvas.
-- An on-canvas tool must NOT return `true` from `block_canvas_zoom()`: that flag also disables
-  the clean-overlay undo shortcuts (`tab.rs`), which is acceptable for a modal editor window but
-  not for a surface that lives on the canvas for a whole session. Block precisely instead
-  (`captures_canvas_pointer` over the surface, drag-scroll only while a drag is live).
-- A tool that drives its gesture through the TAB'S STROKE PIPELINE must also leave
-  `captures_canvas_pointer()` `false`: the tab ORs that flag into `canvas_pointer_occluded` and
-  then calls `finish_stroke()` and returns, so a capturing tool receives no stroke, key or cursor
-  callback at all. `region_edit_v2` can capture only because it senses everything through its own
-  `Area` and sets `wants_primary_stroke() = false`; `patch/` does the opposite and therefore pins
-  BOTH flags to `false` with tests.
+- An on-canvas tool must NOT publish `cleaning.editor_window`: that context also switches off the
+  clean-overlay undo, which is acceptable for a modal editor window but not for a surface that
+  lives on the canvas for a whole session (`region_edit_v2` publishes `cleaning.region_frame`,
+  `patch/` `cleaning.tool.patch`; both pinned by tests).
+- A surface of its own (`region_edit_v2`'s frame `Area`) is not the canvas view for the router, so
+  the tab's strokes and cursor stop over it by themselves; its gestures are targeted ones resolved
+  from its own `Response`s (`InputFrame::gesture_for`).
 - A surface that must stay visible while the pointer is elsewhere is painted from
   `draw_overlay_ui` through `ctx.layer_painter(LayerId::new(Order::Middle, …))`, never from
   `draw_cursor`, which is pointer-gated. A bare layer painter registers no interactable `Area`, so

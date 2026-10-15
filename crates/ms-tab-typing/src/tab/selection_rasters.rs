@@ -37,7 +37,50 @@ use super::*;
 /// reads as "just below the original" without throwing the copy across the page.
 pub(super) const DUPLICATE_OVERLAY_OFFSET_PAGE_PX: f32 = 40.0;
 
+/// Why a click on empty canvas may NOT deselect, from state the layer does not own. One gate set
+/// for every trigger of the deselect (`empty_click_deselects`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct TypingEmptyClickGates {
+    /// The clipping-mask tab owns the canvas clicks.
+    pub(super) mask_panel_open: bool,
+    /// The layout editor owns the canvas and its selection.
+    pub(super) layout_editor_active: bool,
+    /// The eyedropper is active or took this click.
+    pub(super) eyedropper_blocks: bool,
+    /// A layer (or its sticky frame) took the pointer this frame.
+    pub(super) layer_claimed_pointer: bool,
+    /// A popup or menu was open: the click closes it, nothing else.
+    pub(super) popup_open: bool,
+}
+
+/// Whether a click on empty canvas deselects the layer selection under `gates` (the ONE decision;
+/// its triggers are `CanvasHooks::on_page_click` and a select click that landed on a layer
+/// widget's bounding rect but on no part of the layer).
+#[must_use]
+pub(super) fn empty_click_deselects(gates: TypingEmptyClickGates) -> bool {
+    !(gates.mask_panel_open || gates.layout_editor_active || gates.eyedropper_blocks || gates.layer_claimed_pointer || gates.popup_open)
+}
+
 impl TypingTextOverlayLayer {
+    /// Deselects after an empty-canvas click (`empty_click_deselects` decided it). When the
+    /// selected overlay lives on the clicked page (`view`), the click-away is its focus loss: its
+    /// on-screen visibility clamp and whole-pixel snap run first and the placement is marked dirty
+    /// (the selection change flushes it this frame). Raster selection and transform modes end too.
+    pub(super) fn deselect_by_empty_click(&mut self, view: Option<PageView>, strict_pixel_movement: bool) {
+        if let (Some(view), Some(idx)) = (view, self.selected_overlay_idx)
+            && self.overlays.get(idx).is_some_and(|overlay| overlay.page_idx == view.page_idx)
+            && self.enforce_overlay_visibility_limit(idx, view, strict_pixel_movement)
+        {
+            if let Some(overlay) = self.overlays.get_mut(idx) {
+                snap_overlay_center_to_pixels_if_enabled(overlay, strict_pixel_movement, view.page_size_px());
+            }
+            self.mark_overlay_geometry_changed(idx, false);
+            // EDIT (clamp on click-away): deferred; the deselect below is the focus loss that flushes it.
+            self.mark_placement_save_dirty();
+        }
+        self.clear_selection();
+    }
+
     pub(super) fn clear_selection(&mut self) {
         // A move gesture interrupted by a selection change must still land its write, so settle it
         // (a no-op when nothing moved) before the selection state is torn down.
@@ -568,43 +611,42 @@ impl TypingTextOverlayLayer {
         self.dispatch_structural_placement_save("raster delete");
     }
 
-    /// Ctrl/Cmd+wheel rotation of the selected text overlay by ±2° per notch. Which rotation is driven
-    /// is chosen by the app-wide `rotation_ctrl_wheel::rotation_ctrl_wheel_mode()` setting:
+    /// `typing.layer.rotate` (default Ctrl+wheel): rotates the selected layer by
+    /// 2° per wheel notch (`notches`, signed and continuous: the axis
+    /// sample's `delta`, so a trackpad's point deltas rotate smoothly and a mouse wheel's line
+    /// events rotate by whole notches). `view` is the selected layer's
+    /// page as the canvas drew it. Dispatches to the overlay or the raster rotation; returns whether
+    /// anything changed. The router only delivers the axis while the selection is rotatable (no
+    /// transform mode) and the pointer is on the canvas.
+    pub(super) fn rotate_selected_layer_by_wheel(&mut self, ctx: &egui::Context, view: PageView, notches: f32) -> bool {
+        if self.selected_overlay_idx.is_some() {
+            self.rotate_selected_overlay_by_wheel(ctx, view, notches)
+        } else {
+            self.rotate_selected_raster_by_wheel(view.page_idx, notches)
+        }
+    }
+
+    /// Wheel rotation of the selected text / image overlay by ±2° per notch. Which rotation is
+    /// driven is chosen by the app-wide `rotation_ctrl_wheel::rotation_ctrl_wheel_mode()` setting:
     /// `Raster` rotates the rasterized PNG placement (`angle_deg` / deform-mesh), while `Vector` adds
     /// to the render param `global_rotation_deg` and re-renders the glyph outlines sharply. Vector is
     /// only valid for an eligible text overlay (allowed layout mode, no raster deform mesh); when it is
     /// not, this quietly falls back to the raster rotation so the wheel still visibly rotates. No-op
-    /// unless a text overlay on `page_idx` is selected, not in transform mode, and Ctrl/Cmd is held.
-    pub(super) fn try_rotate_selected_overlay_by_ctrl_wheel(&mut self, ui: &mut egui::Ui, view: PageView) {
+    /// unless an overlay on `view.page_idx` is selected and not in transform mode.
+    fn rotate_selected_overlay_by_wheel(&mut self, ctx: &egui::Context, view: PageView, notches: f32) -> bool {
         let page_idx = view.page_idx;
         let Some(selected_idx) = self.selected_overlay_idx else {
-            return;
+            return false;
+        };
+        let Some(delta_deg) = wheel_rotation_step_deg(notches) else {
+            return false;
         };
         if self.transform_mode_overlay_idx == Some(selected_idx) {
-            return;
+            return false;
         }
-
-        let Some(selected_overlay) = self.overlays.get(selected_idx) else {
-            return;
-        };
-        if selected_overlay.page_idx != page_idx {
-            return;
+        if self.overlays.get(selected_idx).is_none_or(|overlay| overlay.page_idx != page_idx) {
+            return false;
         }
-
-        let (ctrl_or_command, scroll_delta_y) = ui.ctx().input(|input| {
-            (
-                input.modifiers.ctrl || input.modifiers.command,
-                // Raw wheel: this rotation is Ctrl-gated, and egui zeroes
-                // `smooth_scroll_delta` while Ctrl/Cmd is held.
-                ms_widgets::input_util::raw_wheel_delta(input).y,
-            )
-        });
-        if !ctrl_or_command || scroll_delta_y.abs() <= f32::EPSILON {
-            return;
-        }
-
-        let steps: f32 = if scroll_delta_y > 0.0 { 1.0 } else { -1.0 };
-        let delta_deg: f32 = steps * 2.0;
         let delta_rad = delta_deg.to_radians();
 
         // Snapshot the overlay's rotation inputs AND its vector eligibility in one borrow.
@@ -650,20 +692,12 @@ impl TypingTextOverlayLayer {
             );
         }
 
-        // Zero the wheel delta regardless of branch (Ctrl-gated raw wheel; egui already zeroes the
-        // smooth delta while Ctrl/Cmd is held, but the raw notch must not scroll the page too).
-        ui.ctx().input_mut(|input| {
-            input.smooth_scroll_delta = Vec2::ZERO;
-        });
-
         // VECTOR: add the delta to the render param `global_rotation_deg` and re-render sharply. When
         // the overlay has no usable render_data/text_params (should not happen for an eligible text
-        // overlay), fall through to the raster path so Ctrl+wheel still visibly rotates.
-        if use_vector {
-            let ctx = ui.ctx().clone();
-            if self.rotate_selected_overlay_global_rotation(selected_idx, delta_deg, &ctx) {
-                return;
-            }
+        // overlay), fall through to the raster path so Ctrl+wheel still visibly rotates. (The router
+        // consumed the wheel input: it never scrolls the page as well.)
+        if use_vector && self.rotate_selected_overlay_global_rotation(selected_idx, delta_deg, ctx) {
+            return true;
         }
 
         // RASTER: rotate the already-rasterized placement (EXACT prior behavior; also the fallback).
@@ -692,6 +726,7 @@ impl TypingTextOverlayLayer {
         // EDIT (Ctrl+wheel raster rotation): deferred — a wheel spin marks once per notch and writes
         // once the gesture settles, instead of once per notch.
         self.mark_placement_save_dirty();
+        true
     }
 
     /// Applies a Ctrl+wheel VECTOR rotation to a text overlay: adds `delta_deg` to its render param
@@ -777,115 +812,54 @@ impl TypingTextOverlayLayer {
         self.dispatch_vector_rerender(overlay_idx, render_data, ctx)
     }
 
-    pub(super) fn try_scale_selected_overlay_by_shortcuts(&mut self, ui: &mut egui::Ui, page_idx: usize) {
-        // Do not hijack typing in any focused text field.
-        if ui.ctx().egui_wants_keyboard_input() {
-            return;
-        }
-
-        let Some(selected_idx) = self.selected_overlay_idx else {
-            return;
+    /// `typing.layer.scale_up` / `scale_down` / `scale_reset` (default `=` / `-` / `0`): scales the
+    /// selected layer by ×1.1 / ÷1.1 or back to 1, clamped to 0.05..=20. An overlay carrying a
+    /// deform mesh is not scaled (its mesh owns its geometry). Overlay edits are deferred placement
+    /// writes (auto-repeat marks per press and writes once on settle); a raster's write is deferred
+    /// to the doc saver. Returns whether the scale changed.
+    pub(super) fn scale_selected_layer(&mut self, step: TypingScaleStep) -> bool {
+        let apply = |scale: f32| match step {
+            TypingScaleStep::Up => (scale * 1.1).clamp(0.05, 20.0),
+            TypingScaleStep::Down => (scale / 1.1).clamp(0.05, 20.0),
+            TypingScaleStep::Reset => 1.0,
         };
-        let Some(selected_overlay) = self.overlays.get(selected_idx) else {
-            return;
-        };
-        if selected_overlay.page_idx != page_idx || selected_overlay.deform_mesh.is_some() {
-            return;
-        }
-
-        let (increase, decrease, reset) = ui.ctx().input_mut(|input| {
-            (
-                input.consume_key(egui::Modifiers::NONE, egui::Key::Equals)
-                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Plus)
-                    || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Equals),
-                input.consume_key(egui::Modifiers::NONE, egui::Key::Minus),
-                input.consume_key(egui::Modifiers::NONE, egui::Key::Num0),
-            )
-        });
-
-        if !increase && !decrease && !reset {
-            return;
-        }
-
-        let mut changed = false;
-        if let Some(overlay) = self.overlays.get_mut(selected_idx) {
-            let prev_scale = overlay.user_scale;
-            if reset {
-                overlay.user_scale = 1.0;
-            } else {
-                let factor = if increase {
-                    1.1
-                } else if decrease {
-                    1.0 / 1.1
-                } else {
-                    1.0
-                };
-                overlay.user_scale = (overlay.user_scale * factor).clamp(0.05, 20.0);
+        if let Some(selected_idx) = self.selected_overlay_idx {
+            let Some(overlay) = self.overlays.get_mut(selected_idx) else {
+                return false;
+            };
+            if overlay.deform_mesh.is_some() {
+                return false;
             }
-            changed = (overlay.user_scale - prev_scale).abs() > 1e-6;
-        }
-
-        if changed {
+            let prev_scale = overlay.user_scale;
+            overlay.user_scale = apply(prev_scale);
+            if (overlay.user_scale - prev_scale).abs() <= 1e-6 {
+                return false;
+            }
             self.mark_overlay_geometry_changed(selected_idx, false);
             // EDIT (`-`/`=`/`0` scale): deferred; key repeat marks per frame and writes once on settle.
             self.mark_placement_save_dirty();
-            ui.ctx().request_repaint();
+            return true;
         }
-    }
-
-    /// Scale the selected raster with the `-` / `=` / `0` keys (parity with the overlay shortcut).
-    /// Guards on `selected_raster_page == Some(page_idx)` so, on a multi-page canvas, the keys only
-    /// scale the raster on the page that owns the selection (this runs once per visible page).
-    pub(super) fn try_scale_selected_raster_by_shortcuts(&mut self, ui: &mut egui::Ui, page_idx: usize) {
-        if ui.ctx().egui_wants_keyboard_input() {
-            return;
-        }
-        let Some(idx) = self.selected_raster_idx else {
-            return;
+        let (Some(idx), Some(page_idx)) = (self.selected_raster_idx, self.selected_raster_page) else {
+            return false;
         };
-        if self.selected_raster_page != Some(page_idx) {
-            return;
-        }
-        let (increase, decrease, reset) = ui.ctx().input_mut(|input| {
-            (
-                input.consume_key(egui::Modifiers::NONE, egui::Key::Equals)
-                    || input.consume_key(egui::Modifiers::NONE, egui::Key::Plus)
-                    || input.consume_key(egui::Modifiers::SHIFT, egui::Key::Equals),
-                input.consume_key(egui::Modifiers::NONE, egui::Key::Minus),
-                input.consume_key(egui::Modifiers::NONE, egui::Key::Num0),
-            )
-        });
-        if !increase && !decrease && !reset {
-            return;
-        }
-        let Some(layer) = self
-            .raster_layers_by_page
-            .get_mut(&page_idx)
-            .and_then(|v| v.get_mut(idx))
-        else {
-            return;
+        let Some(layer) = self.raster_layers_by_page.get_mut(&page_idx).and_then(|v| v.get_mut(idx)) else {
+            return false;
         };
         let prev = layer.transform.scale;
-        if reset {
-            layer.transform.scale = 1.0;
-        } else if increase {
-            layer.transform.scale = (layer.transform.scale * 1.1).clamp(0.05, 20.0);
-        } else if decrease {
-            layer.transform.scale = (layer.transform.scale / 1.1).clamp(0.05, 20.0);
-        }
+        layer.transform.scale = apply(prev);
         if (layer.transform.scale - prev).abs() <= 1e-6 {
-            return;
+            return false;
         }
         let (uid, transform) = (layer.uid.clone(), layer.transform);
         // Nothing is retired on this write and a failure is already logged with full context
         // inside, so the dispatch outcome is informational at this call site.
-        let _: RasterPersistDispatch =
-            self.persist_raster_transform_deferred(page_idx, &uid, transform);
-        ui.ctx().request_repaint();
+        let _: RasterPersistDispatch = self.persist_raster_transform_deferred(page_idx, &uid, transform);
+        true
     }
 
-    /// Ctrl/Cmd+wheel rotation of the selected RASTER layer by ±2° per notch (parity with the text-
-    /// overlay Ctrl+wheel rotate `try_rotate_selected_overlay_by_ctrl_wheel`).
+    /// Wheel rotation of the selected RASTER layer by ±2° per notch (parity with the overlay
+    /// rotation).
     ///
     /// Raster layers (imported rasters, rasterized text, cutouts) have NO vector rotation, so this
     /// ALWAYS applies the ordinary affine `transform.rotation` regardless of the app-wide
@@ -893,42 +867,18 @@ impl TypingTextOverlayLayer {
     /// `Raster` branch). The delta is added in RADIANS with the SAME sign and WITHOUT normalization as
     /// the raster mouse drag-rotate (`apply_raster_drag` `Rotate`), so wheel and drag stay consistent.
     ///
-    /// No-op unless a raster on `page_idx` is selected AND that selection BELONGS to `page_idx`
-    /// (`selected_raster_page`), it is not in perspective transform mode, and Ctrl/Cmd is held with a
-    /// non-zero wheel notch. The page guard is essential: `draw_page_overlays` runs once per visible
-    /// page and this reads the RAW (summed) wheel delta, so without it one notch would rotate the same
-    /// index on every simultaneously-visible page. The `selected_*` selections are mutually exclusive,
-    /// so this and the overlay handler never both fire for one event. The change routes through the
-    /// shared doc and DEFERS the disk write off the GUI thread via `persist_raster_transform_deferred`.
-    pub(super) fn try_rotate_selected_raster_by_ctrl_wheel(
-        &mut self,
-        ui: &mut egui::Ui,
-        page_idx: usize,
-    ) {
+    /// No-op unless the selected raster lives on `page_idx` and is not in perspective transform mode.
+    /// The change routes through the shared doc and DEFERS the disk write off the GUI thread via
+    /// `persist_raster_transform_deferred`. Returns whether it rotated.
+    fn rotate_selected_raster_by_wheel(&mut self, page_idx: usize, notches: f32) -> bool {
         let Some(idx) = self.selected_raster_idx else {
-            return;
+            return false;
         };
-        // Only rotate the raster whose selection lives on THIS page (per-page invocation guard).
-        if self.selected_raster_page != Some(page_idx) {
-            return;
+        if self.selected_raster_page != Some(page_idx) || self.transform_mode_raster_idx == Some(idx) {
+            return false;
         }
-        if self.transform_mode_raster_idx == Some(idx) {
-            return;
-        }
-
-        let (ctrl_or_command, scroll_delta_y) = ui.ctx().input(|input| {
-            (
-                input.modifiers.ctrl || input.modifiers.command,
-                // Raw wheel: this rotation is Ctrl-gated, and egui zeroes `smooth_scroll_delta`
-                // while Ctrl/Cmd is held.
-                ms_widgets::input_util::raw_wheel_delta(input).y,
-            )
-        });
-        if !ctrl_or_command {
-            return;
-        }
-        let Some(delta_rad) = ctrl_wheel_raster_rotation_step_rad(scroll_delta_y) else {
-            return;
+        let Some(delta_rad) = wheel_rotation_step_deg(notches).map(f32::to_radians) else {
+            return false;
         };
 
         let Some(layer) = self
@@ -936,14 +886,8 @@ impl TypingTextOverlayLayer {
             .get_mut(&page_idx)
             .and_then(|v| v.get_mut(idx))
         else {
-            return;
+            return false;
         };
-
-        // Zero the wheel delta so the Ctrl-gated raw notch does not also scroll the page (egui
-        // already zeroes the smooth delta while Ctrl/Cmd is held, but the raw notch remains).
-        ui.ctx().input_mut(|input| {
-            input.smooth_scroll_delta = Vec2::ZERO;
-        });
 
         layer.transform.rotation += delta_rad;
         let (uid, transform) = (layer.uid.clone(), layer.transform);
@@ -953,11 +897,11 @@ impl TypingTextOverlayLayer {
             idx,
             transform.rotation
         );
-// Nothing is retired on this write and a failure is already logged with full context
+        // Nothing is retired on this write and a failure is already logged with full context
         // inside, so the dispatch outcome is informational at this call site.
         let _: RasterPersistDispatch =
             self.persist_raster_transform_deferred(page_idx, &uid, transform);
-        ui.ctx().request_repaint();
+        true
     }
 
     /// Routes one raster's transform to the shared doc (the cross-tab source of truth) and persists
@@ -1284,16 +1228,23 @@ impl TypingTextOverlayLayer {
     /// raster, and a single DEFERRED write per gesture. Rotation and the perspective corner handles
     /// keep their own `raster_drag_state`.
     ///
-    /// `strict_pixel_movement` is the tab's "move layers by whole pixels" policy for this frame; it
-    /// is only forwarded to the move session (rotation and the corner handles are not pixel-snapped),
-    /// which quantizes the drag delta and keeps the layer on the pixel grid.
+    /// `policy.strict_pixel_movement` is the tab's "move layers by whole pixels" policy for this
+    /// frame; it is only forwarded to the move session (rotation and the corner handles are not
+    /// pixel-snapped), which quantizes the drag delta and keeps the layer on the pixel grid.
+    ///
+    /// Gestures resolve through `input` with the same layer actions and targets as the overlays
+    /// (`tab/input.rs`): select / menu on the body, move on the body, rotate on the rotation handle,
+    /// the perspective corners as deformation handles. A select click that lands on the selected
+    /// raster's widget but off the raster is an empty-canvas click (`empty_click_deselects`).
     pub(super) fn interact_page_rasters(
         &mut self,
         ui: &mut egui::Ui,
         view: PageView,
         painter: &egui::Painter,
-        strict_pixel_movement: bool,
+        policy: &TypingPageInteractionPolicy,
+        input: &InputFrame,
     ) {
+        let strict_pixel_movement = policy.strict_pixel_movement;
         let page_idx = view.page_idx;
         let image_rect = view.image_rect;
         let count = self
@@ -1331,9 +1282,10 @@ impl TypingTextOverlayLayer {
         }
 
         // Drag-end: persist the final geometry of a NON-move drag (rotation, or the mesh for a
-        // perspective edit). A move settles through `drive_layer_move_settle` instead.
-        let primary_down = ui.input(|i| i.pointer.primary_down());
-        if !primary_down
+        // perspective edit). A move settles through `drive_layer_move_settle` instead. The drag lives
+        // as long as the pointer button that started its gesture is held.
+        let gesture_down = self.layer_gesture_button_down(ui.ctx());
+        if !gesture_down
             && let Some(state) = self.raster_drag_state.take()
         {
             if self.raster_drag_has_changes
@@ -1392,12 +1344,17 @@ impl TypingTextOverlayLayer {
                     egui::Id::new(("typing_raster_xform", page_idx, sel)),
                     egui::Sense::click_and_drag(),
                 );
-                // Start a corner-handle drag.
+                // Start a corner-handle drag (`typing.layer.deform` on a corner).
+                let handle_hit = pointer.and_then(|p| hit_test_transform_handle(p, &corners));
+                let corner_drag = input
+                    .gesture_for(&resp, &[(input::TARGET_DEFORM_HANDLE, handle_hit.is_some())])
+                    .filter(|hit| hit.action == input::LAYER_DEFORM && hit.phase == HitPhase::DragStarted);
                 if self.raster_drag_state.is_none()
-                    && resp.drag_started()
+                    && let Some(corner_drag) = corner_drag
                     && let Some(p) = pointer
-                    && let Some(handle_idx) = hit_test_transform_handle(p, &corners)
+                    && let Some(handle_idx) = handle_hit
                 {
+                    self.begin_layer_gesture(corner_drag.button);
                     let page_size = view.page_size_px();
                     let start_mesh =
                         TypingOverlayDeformMesh::from_deform_rec(&deform, page_size);
@@ -1428,14 +1385,16 @@ impl TypingTextOverlayLayer {
                 if let Some(state) = self.raster_drag_state.clone()
                     && state.raster_idx == sel
                     && matches!(state.mode, TypingRasterDragMode::PerspectiveHandle(_))
-                    && (resp.dragged() || primary_down)
+                    && (resp.dragged() || gesture_down)
                     && let Some(p) = pointer
                 {
                     self.apply_raster_drag(&state, p, view);
                     self.primary_pointer_targets_overlay_this_frame = true;
                 }
                 self.raster_context_menu(
+                    input,
                     &resp,
+                    true,
                     page_idx,
                     sel,
                     true,
@@ -1533,6 +1492,8 @@ impl TypingTextOverlayLayer {
             }
         }
 
+        // A select click on the selected raster's widget that missed the raster (decided below).
+        let mut raster_click_through = false;
         if let Some(active_idx) = active_gesture_idx {
             // Continue an active gesture (same Id keeps egui's drag association). This owns the
             // raster's `("typing_raster", page_idx, raster_idx)` Id for the frame, so the branches
@@ -1543,7 +1504,7 @@ impl TypingTextOverlayLayer {
                     egui::Id::new(("typing_raster", page_idx, active_idx)),
                     egui::Sense::click_and_drag(),
                 );
-                if (resp.dragged() || primary_down)
+                if (resp.dragged() || gesture_down)
                     && let Some(p) = pointer
                 {
                     // A rotate / perspective drag applies itself; a MOVE is driven by the shared
@@ -1566,7 +1527,9 @@ impl TypingTextOverlayLayer {
                 }
                 // Keep the menu attached to the selected raster's resp even mid-drag, so it persists.
                 self.raster_context_menu(
+                    input,
                     &resp,
+                    true,
                     page_idx,
                     active_idx,
                     false,
@@ -1599,19 +1562,27 @@ impl TypingTextOverlayLayer {
                     egui::Id::new(("typing_raster", page_idx, sel)),
                     egui::Sense::click_and_drag(),
                 );
+                let on_rotate = pointer.is_some_and(|p| {
+                    let (_, handle) = rotation_handle_scene_with_corner(&sel_quad, image_rect);
+                    p.distance(handle) <= TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX * 2.0
+                });
+                let over_quad = pointer.is_some_and(|p| point_in_quad(p, &sel_quad));
+                let over = over_quad || on_rotate;
                 if !gated {
-                    let on_rotate = pointer.is_some_and(|p| {
-                        let (_, handle) = rotation_handle_scene_with_corner(&sel_quad, image_rect);
-                        p.distance(handle) <= TEXT_OVERLAY_ROTATE_HANDLE_RADIUS_PX * 2.0
-                    });
-                    let over = pointer
-                        .is_some_and(|p| point_in_quad(p, &sel_quad) || on_rotate);
-                    if over && (resp.clicked() || resp.secondary_clicked()) {
+                    let clicked = input
+                        .gesture_for(&resp, &[(input::TARGET_BODY, true)])
+                        .filter(|hit| hit.phase == HitPhase::Clicked && (hit.action == input::LAYER_SELECT || hit.action == input::LAYER_MENU));
+                    if over && clicked.is_some() {
                         // Already selected; just claim the click so the deselect-on-empty doesn't fire.
                         self.primary_pointer_targets_overlay_this_frame = true;
+                    } else if clicked.is_some_and(|hit| hit.action == input::LAYER_SELECT) {
+                        // On the widget's bounding rect but off the raster: an empty-canvas click.
+                        raster_click_through = true;
                     }
-                    if over
-                        && resp.drag_started()
+                    let drag = input
+                        .gesture_for(&resp, &[(input::TARGET_ROTATE_HANDLE, on_rotate), (input::TARGET_BODY, over_quad)])
+                        .filter(|hit| hit.phase == HitPhase::DragStarted);
+                    if let Some(drag) = drag
                         && let Some(p) = pointer
                         && let Some(start_transform) = self
                             .raster_layers_by_page
@@ -1619,7 +1590,8 @@ impl TypingTextOverlayLayer {
                             .and_then(|v| v.get(sel))
                             .map(|l| l.transform)
                     {
-                        if on_rotate {
+                        self.begin_layer_gesture(drag.button);
+                        if drag.action == input::LAYER_ROTATE_DRAG {
                             ms_log::trace_log!(
                                 cat::INPUT,
                                 "raster_drag_begin owner=selected idx={} mode=Rotate reason=selected_under_pointer",
@@ -1663,7 +1635,9 @@ impl TypingTextOverlayLayer {
                     }
                 }
                 self.raster_context_menu(
+                    input,
                     &resp,
+                    over,
                     page_idx,
                     sel,
                     false,
@@ -1707,16 +1681,19 @@ impl TypingTextOverlayLayer {
                         egui::Id::new(("typing_raster", page_idx, idx)),
                         sense,
                     );
-                    if resp.clicked() {
+                    // The select click, or the menu click (it selects the raster first, mirroring the
+                    // overlay menu, then opens the menu).
+                    let clicked = input
+                        .gesture_for(&resp, &[(input::TARGET_BODY, true)])
+                        .is_some_and(|hit| hit.phase == HitPhase::Clicked && (hit.action == input::LAYER_SELECT || hit.action == input::LAYER_MENU));
+                    if clicked {
                         self.select_raster(page_idx, idx);
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
-                    // Right-click selects the raster (mirror the overlay menu), then opens the menu.
-                    if resp.secondary_clicked() {
-                        self.select_raster(page_idx, idx);
-                        self.primary_pointer_targets_overlay_this_frame = true;
-                    }
-                    if resp.drag_started()
+                    let drag = input
+                        .gesture_for(&resp, &[(input::TARGET_ROTATE_HANDLE, on_rotate), (input::TARGET_BODY, true)])
+                        .filter(|hit| hit.phase == HitPhase::DragStarted);
+                    if let Some(drag) = drag
                         && let Some(p) = pointer
                         && let Some(start_transform) = self
                             .raster_layers_by_page
@@ -1734,7 +1711,8 @@ impl TypingTextOverlayLayer {
                         // `select_raster` funnels through `clear_selection`-like teardown, so it must
                         // run BEFORE the gesture state is set, not after.
                         self.select_raster(page_idx, idx);
-                        if on_rotate {
+                        self.begin_layer_gesture(drag.button);
+                        if drag.action == input::LAYER_ROTATE_DRAG {
                             self.raster_drag_state = Some(TypingRasterDragState {
                                 page_idx,
                                 raster_idx: idx,
@@ -1766,7 +1744,9 @@ impl TypingTextOverlayLayer {
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
                     self.raster_context_menu(
+                        input,
                         &resp,
+                        true,
                         page_idx,
                         idx,
                         false,
@@ -1781,24 +1761,18 @@ impl TypingTextOverlayLayer {
             }
         }
 
-        // Deselect when clicking empty image area (no raster and no overlay targeted this frame).
-        // An active gesture — including a move session, which has no `raster_drag_state` — owns the
-        // pointer, so it must never be read as a click on empty canvas.
-        if self.selected_raster_idx.is_some()
-            && active_gesture_idx.is_none()
-            && !self.primary_pointer_targets_overlay_this_frame
-        {
-            let clicked_empty = ui.input(|i| {
-                i.pointer.primary_clicked()
-                    && i.pointer
-                        .interact_pos()
-                        .is_some_and(|p| image_rect.contains(p))
-            }) && !ms_widgets::input_util::pointer_over_floating_area(ui.ctx());
-            if clicked_empty {
-                self.selected_raster_idx = None;
-                self.selected_raster_page = None;
-                self.transform_mode_raster_idx = None;
-            }
+        // A select click on the selected raster's widget that missed the raster is a click on empty
+        // canvas: the ONE deselect decision. (A click on bare page reaches the canvas page row and
+        // `TypingHooks::on_page_click` instead.) An active gesture owns the pointer: never a click.
+        let gates = TypingEmptyClickGates {
+            mask_panel_open: policy.mask_panel_open,
+            layout_editor_active: self.layout_editor.is_some(),
+            eyedropper_blocks: policy.eyedropper_blocks_focus_clear,
+            layer_claimed_pointer: self.primary_pointer_targets_overlay_this_frame,
+            popup_open: ui.ctx().any_popup_open(),
+        };
+        if raster_click_through && active_gesture_idx.is_none() && empty_click_deselects(gates) {
+            self.deselect_by_empty_click(Some(view), strict_pixel_movement);
         }
 
         // Selection decoration (dashed boundary + rotate handle).
@@ -1823,11 +1797,15 @@ impl TypingTextOverlayLayer {
 
     /// Attaches the raster context menu to `resp`, recording chosen actions into the deferred `out_*`
     /// slots (applied after the closure by `apply_raster_menu_actions`, avoiding mid-closure mutation).
-    /// `is_transform_mode` toggles the enter/exit/reset items. Mirrors the text-overlay canvas menu.
+    /// `is_transform_mode` toggles the enter/exit/reset items. Mirrors the text-overlay canvas menu,
+    /// and opens through the same layer-menu path (`input::layer_menu_popup`: the `typing.layer.menu`
+    /// gesture with the pointer on the raster, `hit`).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn raster_context_menu(
         &self,
+        input: &InputFrame,
         resp: &egui::Response,
+        hit: bool,
         _page_idx: usize,
         idx: usize,
         is_transform_mode: bool,
@@ -1844,9 +1822,12 @@ impl TypingTextOverlayLayer {
             .and_then(|v| v.get(idx))
             .map(|l| l.mask_clip_enabled)
             .unwrap_or(false);
-        resp.context_menu(|menu_ui| {
+        let Some((_, menu_popup)) = input::layer_menu_popup(input, resp, hit, None) else {
+            return;
+        };
+        menu_popup.show(|menu_ui| {
             if self.selected_raster_idx != Some(idx) {
-                menu_ui.label(t!("typing.context_menu.select_layer_hint"));
+                menu_ui.label(tf!("typing.context_menu.select_layer_binding_hint", binding = self.input_labels.layer_select.as_str()));
                 return;
             }
             if !is_transform_mode {

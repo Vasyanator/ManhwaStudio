@@ -3,16 +3,19 @@ File: tab/create_upload.rs
 
 Purpose:
 Text/image overlay creation UI and GPU texture upload plumbing for the typing
-tab. Covers shift-drag selection capture, the inline text editor, dispatching the
+tab. Covers the create rectangle, the inline text editor, dispatching the
 create-overlay/create-raster render workers, transient status hints, runtime
 overlay insertion into the doc, raster mask-clip preparation, and the
 per-overlay texture upload/dirty-tracking helpers on `TypingTextOverlayLayer`.
 
-Touch: the Shift+drag capture overlay is a touch capture layer of the canvas, so a plain finger
-pans under it; a finger long-press drag (`CanvasView::touch_selection`) drives the same
-`create_selection` without Shift, through `ms_canvas::drive_touch_drag`, and commits on lift
-like a mouse release (`finish_create_selection`). A finger tap outside the open create editor
-(`CanvasView::touch_tap`) commits it like a mouse click outside (`create_editor_commit_requested`).
+Input: the create rectangle is the canvas-wide gesture `typing.create_rect` (default LMB drag
+under the `typing.create_mode` modifier, Shift; or a finger long-press drag). The router claims
+it at the press and the canvas raises its own capture area while it is armed, so no layer widget
+under the pointer reacts; this file only follows the claim (`step_create_selection`): it starts
+on a page, follows the pointer / finger, commits on release (a release of the modifier
+mid-drag commits too) and drops on a cancel. A click or a finger tap outside the open create
+editor commits it (`create_editor_commit_requested`): the click is egui's
+`Response::clicked_elsewhere` of the editor area — widget semantics, any button, not a binding.
 
 Notes:
 Extracted verbatim from `tab.rs`. Methods are `pub(super)` so `tab.rs` and sibling
@@ -39,21 +42,7 @@ the render keeps taking the panel's unscaled size.
 */
 
 use super::*;
-use ms_widgets::touch_nav::TouchSelection;
-
-/// Layer id of the full-canvas Shift+drag selection-capture overlay.
-///
-/// Kept on [`egui::Order::Middle`] so it sits BELOW the Foreground typing panels (their
-/// Wheel widgets keep winning the z-order hit-test over their own rects and keep
-/// receiving hover/scroll) but ABOVE the Background canvas content (bare-canvas
-/// drag-selection is unaffected). Shared by the spawn site here and the tab's canvas
-/// Shift+wheel font handler so both agree on one layer identity.
-pub(super) fn shift_drag_capture_layer_id() -> egui::LayerId {
-    egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("typing_text_create_shift_capture"),
-    )
-}
+use ms_input::{Button, ClaimedGesture, GesturePhase, ReleasePolicy};
 
 /// Deterministic egui family name for the on-canvas create editor's own-typeface font of
 /// `(font_identity, content_id, face_index)`.
@@ -89,10 +78,41 @@ fn editor_font_family_name(font_identity: &str, content_id: u64, face_index: usi
     format!("typing-editor-font-{:016x}", hasher.finish())
 }
 
-/// The finger create drag a long-press at `origin` starts, or `None` when the press is not on a
-/// page (`on_page`) — the same refusal the Shift+drag applies.
-fn begin_touch_create_selection(on_page: bool, origin: Pos2) -> Option<TypingCreateSelection> {
-    on_page.then_some(TypingCreateSelection { start: origin, current: origin, touch: true })
+/// One frame of the create rectangle in `slot` from this frame's claim of `typing.create_rect` on
+/// the canvas (`claim`; `None` when the canvas has no such claim). A claim that starts off every
+/// page (`on_page(origin)` is `false`) starts nothing, like the old Shift+drag refusal; a running
+/// selection follows `current`; `Finished(Commit)` (button / finger released, or the create
+/// modifier released mid-drag) returns the finished selection to commit; `Finished(Cancel)` (second
+/// finger, focus loss) and a vanished claim drop it.
+fn step_create_selection(
+    slot: &mut Option<TypingCreateSelection>,
+    claim: Option<&ClaimedGesture>,
+    on_page: impl Fn(Pos2) -> bool,
+) -> Option<TypingCreateSelection> {
+    let Some(claim) = claim else {
+        *slot = None;
+        return None;
+    };
+    match claim.phase {
+        GesturePhase::Started => {
+            *slot = on_page(claim.origin).then_some(TypingCreateSelection { start: claim.origin, current: claim.current });
+            None
+        }
+        GesturePhase::Active => {
+            if let Some(selection) = slot.as_mut() {
+                selection.current = claim.current;
+            }
+            None
+        }
+        GesturePhase::Finished(ReleasePolicy::Commit) => slot.take().map(|mut selection| {
+            selection.current = claim.current;
+            selection
+        }),
+        GesturePhase::Finished(ReleasePolicy::Cancel) => {
+            *slot = None;
+            None
+        }
+    }
 }
 
 /// Whether the open create editor commits this frame: a primary click (`clicked_outside`, already
@@ -133,19 +153,9 @@ impl TypingCreateTextEditor {
 }
 
 impl TypingTextOverlayLayer {
-    pub(super) fn wants_canvas_shift_drag_selection(&self, ctx: &egui::Context) -> bool {
-        self.create_selection.is_some()
-            || self.create_editor.is_some()
-            || self.create_render_state.is_some()
-            || self.create_raster_state.is_some()
-            || self.raster_effects_state.is_some()
-            || ctx.input(|i| i.modifiers.shift)
-    }
-
-    /// Draws the create UI of this frame: the Shift+drag / finger create rectangle, the inline
-    /// editor, the in-flight hint and the status toasts. `touch_selection` is this frame's finger
-    /// long-press drag for the create rectangle (`CanvasView::touch_selection`); a finger moving a
-    /// layer arrives on the separate region-drag channel (`touch_layers.rs`), never here.
+    /// Draws the create UI of this frame: the create rectangle (`input`'s claim of
+    /// `typing.create_rect`), the inline editor, the in-flight hint and the status toasts. A finger
+    /// moving a layer arrives on the separate region-drag channel (`touch_layers.rs`), never here.
     pub(super) fn draw_create_overlay_ui(
         &mut self,
         ctx: &egui::Context,
@@ -153,7 +163,7 @@ impl TypingTextOverlayLayer {
         canvas: &CanvasView,
         project: &ProjectData,
         top_panel: &TypingTopPanelState,
-        touch_selection: Option<TouchSelection>,
+        input: &InputFrame,
     ) {
         let now_s = ctx.input(|i| i.time);
         if self
@@ -171,8 +181,8 @@ impl TypingTextOverlayLayer {
             self.create_status_warning = None;
         }
 
-        self.capture_shift_drag_selection(ctx, canvas_rect, canvas, project, top_panel, touch_selection);
-        self.draw_active_shift_selection(ctx);
+        self.drive_create_selection(ctx, canvas, project, top_panel, input);
+        self.draw_active_create_selection(ctx);
         self.draw_text_editor(ctx, project, top_panel, canvas.touch_tap());
         self.draw_render_inflight_hint(ctx);
         self.draw_status_error(ctx, canvas_rect);
@@ -180,8 +190,8 @@ impl TypingTextOverlayLayer {
     }
 
     /// Whether a new create selection may start now (nothing loading, no editor open and no
-    /// create / raster job in flight) — the gate of `capture_shift_drag_selection`, also used
-    /// for `CanvasView::set_long_press_selection` so a finger drag selects only when it can.
+    /// create / raster job in flight) — published as the `typing.create_available` context, which
+    /// `typing.create_rect` requires, so neither the mouse nor a finger arms it otherwise.
     pub(super) fn touch_create_selection_available(&self) -> bool {
         self.loading_rx.is_none()
             && self.create_editor.is_none()
@@ -190,90 +200,30 @@ impl TypingTextOverlayLayer {
             && self.raster_effects_state.is_none()
     }
 
-    /// Runs the create rectangle: a Shift+drag of the mouse, or the finger long-press drag
-    /// `touch_selection` (see `draw_create_overlay_ui`). Commits through `finish_create_selection`.
-    pub(super) fn capture_shift_drag_selection(
+    /// Follows this frame's claim of `typing.create_rect` on the canvas (mouse or finger, see
+    /// `step_create_selection`) and commits a finished rectangle through `finish_create_selection`.
+    fn drive_create_selection(
         &mut self,
         ctx: &egui::Context,
-        canvas_rect: Rect,
         canvas: &CanvasView,
         project: &ProjectData,
         top_panel: &TypingTopPanelState,
-        touch_selection: Option<TouchSelection>,
+        input: &InputFrame,
     ) {
-        if !self.touch_create_selection_available() {
-            return;
+        let claim = input.claimed(canvas.view_id()).filter(|claim| claim.action == input::CREATE_RECT);
+        if claim.is_some_and(|claim| claim.phase == GesturePhase::Started) {
+            ms_log::trace_log!(
+                cat::INPUT,
+                "typing create_rect claim touch={}",
+                claim.is_some_and(|claim| matches!(claim.button, Button::Touch(_)))
+            );
         }
-        let shift_down = ctx.input(|i| i.modifiers.shift);
-
-        // The finger first (see `drive_touch_drag`): it needs no Shift, starts at the
-        // long-press point and commits on lift exactly like a mouse release below.
-        if let Some(touch) = touch_selection
-            && let Some(finished) = drive_touch_drag(&mut self.create_selection, touch, |origin| {
-                begin_touch_create_selection(contains_any_page(canvas, project, origin), origin)
-            })
-        {
+        if let Some(finished) = step_create_selection(&mut self.create_selection, claim, |origin| contains_any_page(canvas, project, origin)) {
             self.finish_create_selection(ctx, canvas, project, top_panel, finished);
-            return;
         }
-
-        let selection_active = self.create_selection.is_some();
-        if !shift_down && !selection_active {
-            return;
-        }
-
-        // Middle order (not Foreground): the capture overlay must sit below the Foreground
-        // panels so the panels win the z-order hit-test over their own rects and their Wheel
-        // widgets keep receiving hover/scroll; Middle still sits above the Background canvas,
-        // so drag-selection over bare canvas is unaffected.
-        let capture_layer = shift_drag_capture_layer_id();
-        // A finger under the overlay pans the canvas; only a long-press drag selects.
-        ms_widgets::touch_nav::publish_capture_layer(ctx, canvas.touch_owner_id(), capture_layer);
-        egui::Area::new(capture_layer.id)
-            .order(capture_layer.order)
-            .fixed_pos(canvas_rect.min)
-            .show(ctx, |ui| {
-                ui.set_min_size(canvas_rect.size());
-                let local_rect = Rect::from_min_size(Pos2::ZERO, canvas_rect.size());
-                let sense = if shift_down {
-                    egui::Sense::click_and_drag()
-                } else {
-                    egui::Sense::hover()
-                };
-                let response =
-                    ui.interact(local_rect, ui.id().with("typing_text_shift_drag"), sense);
-
-                if shift_down
-                    && response.drag_started()
-                    && let Some(pos) = response.interact_pointer_pos()
-                    && contains_any_page(canvas, project, pos)
-                {
-                    self.create_selection = Some(TypingCreateSelection {
-                        start: pos,
-                        current: pos,
-                        touch: false,
-                    });
-                }
-
-                if let Some(selection) = self.create_selection.as_mut()
-                    && !selection.touch
-                    && let Some(pos) = ctx.input(|i| i.pointer.latest_pos())
-                {
-                    selection.current = pos;
-                }
-
-                // Only a mouse selection ends here (drag stop or Shift released); a finger one
-                // ends on lift above and never depends on Shift.
-                let should_finish = self
-                    .create_selection
-                    .is_some_and(|selection| !selection.touch && (response.drag_stopped() || !shift_down));
-                if should_finish && let Some(selection) = self.create_selection.take() {
-                    self.finish_create_selection(ctx, canvas, project, top_panel, selection);
-                }
-            });
     }
 
-    /// Commits a finished create drag (mouse release, Shift release or finger lift): a rect of
+    /// Commits a finished create drag (mouse release, modifier release or finger lift): a rect of
     /// at least `TEXT_CREATE_SELECTION_MIN_SIDE_PX` per side opens the on-canvas text editor.
     fn finish_create_selection(
         &mut self,
@@ -291,7 +241,7 @@ impl TypingTextOverlayLayer {
         }
     }
 
-    pub(super) fn draw_active_shift_selection(&self, ctx: &egui::Context) {
+    pub(super) fn draw_active_create_selection(&self, ctx: &egui::Context) {
         let Some(selection) = self.create_selection else {
             return;
         };
@@ -490,7 +440,7 @@ impl TypingTextOverlayLayer {
             return;
         }
 
-        let editor_rect = {
+        let (editor_rect, clicked_outside) = {
             let editor = self.create_editor.as_mut().expect("checked above");
             let desired_rect = Rect::from_min_size(
                 editor.scene_rect.min,
@@ -561,15 +511,10 @@ impl TypingTextOverlayLayer {
                         editor.window_focused_last_frame = viewport_focused;
                     });
             });
-            area_response.response.rect
+            (area_response.response.rect, area_response.response.clicked_elsewhere())
         };
 
-        let clicked_outside = ctx.input(|i| {
-            i.pointer.primary_clicked()
-                && i.pointer
-                    .interact_pos()
-                    .is_some_and(|pos| !editor_rect.contains(pos))
-        });
+        // Widget semantics, not a binding: a click anywhere outside the editor area commits it.
         if create_editor_commit_requested(clicked_outside, touch_tap, editor_rect)
             && let Some(finished_editor) = self.create_editor.take()
         {
@@ -1474,24 +1419,42 @@ mod tests {
         assert!(size.is_finite(), "the drawn size must never be NaN or infinite");
     }
 
+    /// A claim of `typing.create_rect` that starts on a page drives the rectangle (mouse or finger
+    /// alike) and commits its rect on release; an off-page start, a cancel and a vanished claim
+    /// open nothing.
     #[test]
-    fn a_finger_create_drag_starts_on_a_page_and_commits_its_rect_on_lift() {
-        use ms_widgets::touch_nav::{TouchSelection, TouchSelectionEnd};
+    fn the_create_claim_starts_on_a_page_and_commits_its_rect_on_release() {
         let origin = egui::pos2(20.0, 30.0);
-        assert!(begin_touch_create_selection(false, origin).is_none(), "an off-page press starts nothing");
-        let begin = |at| begin_touch_create_selection(true, at);
+        let claim = |phase: GesturePhase, current: Pos2| ClaimedGesture {
+            action: input::CREATE_RECT,
+            target: ms_input::view::SURFACE,
+            view: ms_input::ViewId(egui::Id::new("typing_test_view")),
+            phase,
+            origin,
+            current,
+            params: Vec::new(),
+            button: Button::Touch(ms_input::TouchSource::LongPressDrag),
+        };
+        let on_page = |_: Pos2| true;
         let mut slot: Option<TypingCreateSelection> = None;
-        let drag = TouchSelection { origin, pos: egui::pos2(90.0, 35.0), began: true, end: None };
-        assert!(drive_touch_drag(&mut slot, drag, begin).is_none());
-        assert!(slot.is_some_and(|selection| selection.touch && selection.start == origin));
-        let lift = TouchSelection { origin, pos: egui::pos2(120.0, 140.0), began: false, end: Some(TouchSelectionEnd::Released) };
-        let finished = drive_touch_drag(&mut slot, lift, begin).expect("lift commits");
+        assert!(step_create_selection(&mut slot, Some(&claim(GesturePhase::Started, origin)), |_| false).is_none());
+        assert!(slot.is_none(), "an off-page press starts nothing");
+
+        assert!(step_create_selection(&mut slot, Some(&claim(GesturePhase::Started, origin)), on_page).is_none());
+        assert!(step_create_selection(&mut slot, Some(&claim(GesturePhase::Active, egui::pos2(90.0, 35.0))), on_page).is_none());
+        assert_eq!(slot.map(|selection| selection.current), Some(egui::pos2(90.0, 35.0)));
+        let finished = step_create_selection(&mut slot, Some(&claim(GesturePhase::Finished(ReleasePolicy::Commit), egui::pos2(120.0, 140.0))), on_page)
+            .expect("a release commits");
         assert_eq!(finished.rect(), Rect::from_two_pos(origin, egui::pos2(120.0, 140.0)));
         assert!(slot.is_none());
-        // A cancel (second finger, mouse press) drops it without opening an editor.
-        assert!(drive_touch_drag(&mut slot, drag, begin).is_none());
-        let cancel = TouchSelection { end: Some(TouchSelectionEnd::Cancelled), began: false, ..drag };
-        assert!(drive_touch_drag(&mut slot, cancel, begin).is_none());
+
+        // A cancel (second finger, focus loss) drops it without opening an editor.
+        step_create_selection(&mut slot, Some(&claim(GesturePhase::Started, origin)), on_page);
+        assert!(step_create_selection(&mut slot, Some(&claim(GesturePhase::Finished(ReleasePolicy::Cancel), origin)), on_page).is_none());
+        assert!(slot.is_none());
+        // A claim that vanished (another gesture took the view) drops a stale selection.
+        step_create_selection(&mut slot, Some(&claim(GesturePhase::Started, origin)), on_page);
+        assert!(step_create_selection(&mut slot, None, on_page).is_none());
         assert!(slot.is_none());
     }
 }

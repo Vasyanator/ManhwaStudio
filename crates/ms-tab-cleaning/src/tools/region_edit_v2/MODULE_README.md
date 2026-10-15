@@ -155,10 +155,10 @@ that owns the context, the canvas and the project at once:
   and after a run, and blinking them would disturb the comparison rather than help it. This is
   also why the button row is sensed BEFORE the frame's contents are painted — a hold sensed
   after them would apply one frame late, and egui may not repaint again until the release.
-- **`block_canvas_zoom()` must stay `false` in the host tool.** That flag also disables the
-  clean-overlay undo shortcuts for the whole session (`tab.rs`). Block precisely instead:
-  `RegionFrame::captures_pointer` over the hitbox, and `drag_active()` for
-  `block_canvas_drag_scroll_on_primary`.
+- **The host never publishes `cleaning.editor_window`.** That context also switches off the
+  clean-overlay undo for the whole session; the host publishes `cleaning.region_frame` and
+  `brush.active` only. The frame's `Area` is not the canvas view for the input router, so the
+  canvas strokes, cursor and zoom drag stop over it by themselves.
 - **The `Area` is sized to the hitbox, never to the viewport.** A viewport-sized area makes
   egui report the pointer as "over an area" everywhere and kills canvas wheel scrolling. It
   sits on `Order::Middle`, below the dock panels on `Order::Foreground`.
@@ -167,10 +167,14 @@ that owns the context, the canvas and the project at once:
   body)` (strip, handles, rows and their margins) with `touch_nav::publish_hole`: a finger on the
   body pans the canvas — the body's primary drag paints the mask, which a finger must never do —
   and a finger on the chrome reaches its widgets through egui. The frame has no selection drag,
-  so the host keeps `CleaningTool::accepts_touch_selection` `false` and a long-press drag pans.
-- **Hover and drags go through a `Response`.** Never test a raw pointer position against a rect
-  to decide hover (`egui-docs/06-overlays.md` §5); the two raw reads that remain — the pointer
-  of a drag already claimed through a `Response`, and the mouse button state — are gated on one.
+  so the host declares no touch alternative and a long-press drag pans.
+- **Hover and drags go through a `Response`, gestures through `gesture_for`.** Never test a raw
+  pointer position against a rect to decide hover (`egui-docs/06-overlays.md` §5), and never read
+  a key, modifier or button: `InputFrame::gesture_for` on the body / grip / handle `Response`
+  resolves `cleaning.frame.{paint,erase,marks_rect}` / `move` / `resize` with the chord held at
+  the PRESS (LEFT button by default; another button's drag does nothing). The one raw read left is
+  the pointer POSITION of a drag already claimed through a `Response`. The body senses `drag()`
+  only, so a stroke starts at the press and a click paints a dot.
 - **Colours: red wins over green.** A locked frame whose size stopped satisfying the consumer is
   drawn red and its status line says it must be released first.
 - **The size rules have ONE owner: `geometry.rs`.** A consumer declares DATA
@@ -229,29 +233,21 @@ that owns the context, the canvas and the project at once:
   «Стереть маску» clears both. «Сравнить» still hides only the result.
 - **Two brushes, one policy.** The mask brush and the marks brush are both `MaskBrush`es with
   separate radii; the first switch to marks creates the marks brush at `max(1, mask / 4)`. The
-  slider, the wheel and the `-`/`=`/`+` shortcuts act on the ACTIVE brush through
-  `active_brush_mut`, inside the frame and through the host hooks alike.
-- **Ctrl/Cmd+drag over the body in marks mode is the frame's, not the canvas'.** It draws an
+  slider and the shared `brush.*` actions (the host's `apply_input`) act on the ACTIVE brush
+  through `active_brush_mut`.
+- **`cleaning.frame.marks_rect` (Ctrl+drag by default) over the body in marks mode** draws an
   unfilled rectangle (walls of the brush diameter, inside the dragged rect, clamped to the frame;
   a drag along one axis is a line of that thickness; live preview drawn where the result lands,
   between the marks and the masks; one undo step on release; a release where it started commits
-  nothing). The canvas zoom drag is blocked for it through
-  `CleaningTool::block_canvas_zoom_on_ctrl_primary`, answered by
-  `RegionFrame::blocks_ctrl_primary_zoom`: true only in marks mode while the frame is ARMED, or
-  while a rectangle is in flight — never a constant, because switching it on mid-gesture cancels
-  a running canvas zoom drag. The arm is decided only in a pass with NO pointer button down (the
-  body `hovered`, `Z` up, the frame paintable) and frozen while a button is held: the canvas zoom
-  drag is raw input, not an egui-dragged widget, so `hovered` turns true as soon as such a drag
-  crosses the body, and re-arming then would cut that zoom. In mask mode Ctrl still zooms.
-- **The brush is the region editor's brush, and the frame answers its gestures itself.**
-  Radius, wheel and the `-`/`=`/`+` shortcuts all live in `crate::tools::MaskBrush`; erasing
-  follows the same rule the region editor uses (`stroke_erases`: the right button erases unless
-  the left is held too, Shift+left erases, and the panel's `set_erase` mode erases). The
-  gestures are handled INSIDE the pass — over the frame's hitbox for the shortcuts and
-  Shift+wheel, and on the frame body for the brush ring — because `tab.rs` refuses to deliver
-  a tool's key, wheel or cursor hook while the canvas pointer is occluded, and the frame
-  occludes exactly its own hitbox (`captures_pointer`). The host tool's `on_key_event` /
-  `on_wheel_event` cover the pointer OUTSIDE the frame; neither surface can be dropped.
+  nothing; the erase mode held at the press erases). In mask mode the gesture paints nothing.
+  Nothing has to be blocked for the canvas zoom: the router never sees the canvas under the frame.
+- **Erasing** follows the region editor's rule (`stroke_erases`): `cleaning.frame.erase` (the
+  right button, or the erase mode held at the press) erases whatever the panel says, and the
+  panel's `set_erase` mode turns `cleaning.frame.paint` into an erase. A paint / erase drag does
+  not start while the view zoom modifier is held (Z+drag leaves no stroke). The brush ring is
+  painted INSIDE the pass, on the frame body, because `tab.rs` draws a tool cursor only over the
+  canvas view. The stroke undo is `cleaning.frame.undo_stroke` (Ctrl+Z by default, the host's
+  `apply_input`), which shadows the clean-overlay undo while the frame is up.
 - Every `t!` key of this module lives under `cleaning.region_frame.*`.
 
 ## Editing map
@@ -314,10 +310,10 @@ CleaningTool::draw_main_panel_top     «Редактор области», pinne
 CleaningTool::draw_main_panel         «Редактор области», scrolled: engine.draw_parameters
 CleaningTool::draw_main_panel_bottom  «Редактор области», pinned bottom: host actions
                                       (draw_host_actions), then engine.draw_run_options(RunOptionsCtx)
-CleaningTool::draw_overlay_ui   the per-frame pass (order below), the run, the generation, the apply
-CleaningTool::on_key_event      `-` / `=` / `+` on the active brush, for the pointer OUTSIDE the frame
-CleaningTool::on_wheel_event    Shift+wheel on the active brush, for the pointer OUTSIDE the frame
-CleaningTool::block_canvas_zoom_on_ctrl_primary   the marks rectangle's claim on Ctrl+drag
+CleaningTool::draw_overlay_ui   the per-frame pass (order below), the run, the generation, the apply;
+                                the frame's gestures come from the `InputFrame` it is handed
+CleaningTool::input_contexts    `cleaning.region_frame` + `brush.active`
+CleaningTool::apply_input       the shared brush actions on the active brush, the stroke undo
 ```
 
 `draw_overlay_ui` is the whole per-frame pass and its ORDER is load-bearing:
@@ -416,10 +412,9 @@ Host contracts:
   or wrong-size capture is a `CaptureError` with a user message and a log.
 - **User message and technical detail are separate.** `report_error` shows a localized sentence
   and logs `"{log_tag} {text} | {detail}"`; a technical reason never enters a translated string.
-- **`block_canvas_zoom()` stays `false` (D5)** and `wants_primary_stroke` is `false`; a test pins
-  the former (`the_area_editor_never_blocks_canvas_zoom_...`). `block_canvas_zoom_on_ctrl_primary`
-  is `false` on an idle host and in mask mode, and answers the frame's marks-rectangle claim
-  otherwise.
+- **The host's contexts are `cleaning.region_frame` + `brush.active`, never
+  `cleaning.editor_window` (D5)**; a test pins it
+  (`the_area_editor_never_publishes_the_editor_window_context`). It takes no canvas gesture.
 - **Nothing blocks the GUI thread**: the only GUI-thread work of a job is capturing an
   in-memory overlay chunk when it starts and, when marks are drawn, ONE per-pixel pass over the
   region at hand-off (`prepare_run_marks`: a composite or a copy of the marks layer) plus the

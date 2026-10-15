@@ -1287,8 +1287,8 @@ impl TypingCreatePanelState {
     /// never trims, folds or de-duplicates it, because the name is not a key: a local preset
     /// is SELECTED by its index (plan §3, D3) and IDENTIFIED by its stable id
     /// (`LocalPreset::id`), so two presets may carry the same name and a rename changes
-    /// nothing but the caption. The box is registered with the panel's focus tracking, so the
-    /// typing tab's hotkeys stay quiet while the user types a name into it.
+    /// nothing but the caption. While the box has focus the typing tab's key bindings stay quiet
+    /// (the input router never matches a key chord while a text field has focus).
     fn draw_local_preset_name_row(&mut self, ui: &mut egui::Ui) -> egui::Response {
         let selected = self.selected_local_preset;
         ui.add_enabled_ui(selected.is_some(), |ui| {
@@ -1299,7 +1299,6 @@ impl TypingCreatePanelState {
                         .hint_text(t!("typing.local_presets.name_hint"))
                         .desired_width((ui.available_width() - 96.0).max(120.0)),
                 );
-                self.track_text_input(&name_resp);
                 let delete_clicked = ui
                     .button(t!("typing.local_presets.delete_button"))
                     .clicked();

@@ -7,10 +7,11 @@ The «Клининг» tab's answers to the studio root's order-free per-tab hoo
 
 Key items:
 - `impl StudioTab for CleaningTabState`:
-  - `input_contexts`: the canvas's contexts (`CanvasView::input_contexts`): `canvas.zoom_accepted`
-    while the active tool does not block canvas zoom (the tab sets that block on the canvas every
-    frame), so the shared zoom keys and Ctrl+wheel reach a tool with its own zoom (the region
-    editor window) while it does;
+  - `input_declarations`: `crate::input::declarations()` — the clean-overlay history, the tool
+    modes / gestures / axes / commands, the region frame and the legacy editor window;
+  - `input_contexts`: the canvas's contexts (`CanvasView::input_contexts`: `canvas.zoom_accepted`
+    unless a running stroke or Space-pan blocks the canvas zoom) plus the active tool's
+    (`CleaningTool::input_contexts`);
   - `default_dock_layout`: `cleaning_default_dock_layout` (the tab hosts the panel dock);
   - `evict_tab_gpu_caches`: the canvas clean-overlay cache, then the detector-mask textures;
   - `source_page_window` / `wants_nearest_source`: answered by the tab's canvas;
@@ -19,13 +20,14 @@ Key items:
 Notes:
 - No background poll, exit-only setting or debounced store: those hooks keep their no-op
   defaults. Cleaning has no bottom hint, so it writes no `Canvas.*_hint_collapsed` key.
-- The tab declares no input action of its own yet: zoom is the shared `view.*` set, executed by
-  the canvas (its former `cleaning.canvas.zoom_*` overrides migrate to it in `ms_input::persist`).
+- Zoom is the shared `view.*` set, executed by the canvas or, over an open legacy editor window,
+  by that window (its former `cleaning.canvas.zoom_*` overrides migrate to `view.*` in
+  `ms_input::persist`).
 */
 
 use std::collections::HashSet;
 
-use ms_input::ContextId;
+use ms_input::{ContextId, Declarations};
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
 use ms_studio_tab::StudioTab;
 use ms_widgets::panel_dock::DockLayout;
@@ -33,11 +35,18 @@ use ms_widgets::panel_dock::DockLayout;
 use crate::tab::{CleaningTabState, cleaning_default_dock_layout};
 
 impl StudioTab for CleaningTabState {
-    /// The canvas's contexts: `canvas.zoom_accepted` while the active tool does not block canvas
-    /// zoom (the router then consumes the zoom keys and Ctrl+wheel for the canvas); the cleaning
-    /// canvas does not edit bubbles.
+    /// Every action of the tab, its tools, the region frame and the legacy editor window
+    /// (`crate::input`).
+    fn input_declarations(&self) -> Declarations {
+        crate::input::declarations()
+    }
+
+    /// The canvas's contexts (`canvas.zoom_accepted` unless a running stroke or Space-pan blocks
+    /// the canvas zoom; the cleaning canvas does not edit bubbles), then the active tool's.
     fn input_contexts(&self) -> Vec<ContextId> {
-        self.canvas().input_contexts()
+        let mut contexts = self.canvas().input_contexts();
+        contexts.extend(self.active_tool_input_contexts());
+        contexts
     }
 
     /// The cleaning tab hosts the panel dock; its default arrangement is the SAME `fn` item the
@@ -76,13 +85,28 @@ mod tests {
 
     use crate::tab::{CleaningTabState, cleaning_default_dock_layout};
 
-    /// The tab declares no action of its own (zoom is the shared `view.*` set, executed by the
-    /// canvas), and with no tool blocking zoom it forwards the canvas's zoom context.
+    /// The tab declares the cleaning set and forwards the canvas's zoom context plus the active
+    /// tool's contexts (Замазка first: the brush tool, Замазка, the shared brush).
     #[test]
-    fn the_tab_declares_nothing_and_forwards_the_canvas_contexts() {
+    fn the_tab_declares_its_set_and_forwards_canvas_and_tool_contexts() {
         let tab = CleaningTabState::default();
-        assert_eq!(StudioTab::input_declarations(&tab), ms_input::Declarations::default());
-        assert_eq!(StudioTab::input_contexts(&tab), vec![ms_canvas::input::ZOOM_ACCEPTED]);
+        assert_eq!(StudioTab::input_declarations(&tab), crate::input::declarations());
+        assert_eq!(
+            StudioTab::input_contexts(&tab),
+            vec![ms_canvas::input::ZOOM_ACCEPTED, crate::input::TOOL_BRUSH, crate::input::TOOL_ZAMAZKA, ms_tools::mask_brush::BRUSH_ACTIVE]
+        );
+    }
+
+    /// Every registered tool publishes exactly one owner state of the canvas (the exclusive
+    /// group of `crate::input::declarations`) in its idle state.
+    #[test]
+    fn every_tool_publishes_one_canvas_owner_context() {
+        let owners = [crate::input::TOOL_BRUSH, crate::input::TOOL_PATCH, crate::input::REGION_SELECT, crate::input::REGION_FRAME, crate::input::EDITOR_WINDOW];
+        let tab = CleaningTabState::default();
+        for (idx, contexts) in tab.tool_input_contexts_for_tests().into_iter().enumerate() {
+            let published = contexts.iter().filter(|context| owners.contains(context)).count();
+            assert_eq!(published, 1, "tool {idx}: {contexts:?}");
+        }
     }
 
     /// Every dock tab the cleaning tab declares; a default layout missing one drops a stored

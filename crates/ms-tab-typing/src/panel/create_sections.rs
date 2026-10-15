@@ -812,7 +812,7 @@ impl TypingCreatePanelState {
             let mut show_clean = clean_overlays_visible;
             if ui
                 .checkbox(&mut show_clean, t!("typing.export.show_clean_overlay"))
-                .on_hover_text(t!("typing.export.show_clean_overlay_hotkey_hint"))
+                .on_hover_text(tf!("typing.export.show_clean_overlay_shortcut_hint", binding = self.input_labels.toggle_clean.as_str()))
                 .changed()
             {
                 out.changed_clean_overlays = Some(show_clean);

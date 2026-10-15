@@ -11,14 +11,15 @@ Main types:
   translation+original, image controls, character controls, «Перевести» action).
 - `BubblesPanelState`: panel runtime state (filters, editor cache, pending flushes, visible list cache).
 - `BubblesPanelContext`: shared tab state links (footer overrides, pending patches, character refresh flags,
-  the tab's image-bubble file-dialog slot).
+  the tab's image-bubble file-dialog slot, this frame's input).
 - `ImageBubbleFilePick`: a pending «choose file» dialog for one external image bubble; started here
   or from the canvas footer, resolved by the tab (`tab.rs::poll_image_bubble_pick`).
 
 Main flow:
 - `draw_bubbles_panel` -> `BubblesPanelState::draw`: renders controls, applies filters, draws card list.
 - `flush_text_updates`: debounced write-through of text/original text into `CanvasView`.
-- `draw_card`: renders one bubble card, queues footer/ImageBubble patches, and exposes card-level context menu actions.
+- `draw_card`: renders one bubble card, queues footer/ImageBubble patches, and exposes card-level context menu actions
+  (the card senses clicks behind its widgets; the menu opens on the `translation.bubble_card.menu` gesture).
 - filter/cache helpers: `sync_editor_from_project`, `character_options`, `ensure_visible_cache`, `matches_filters`.
 
 Utilities:
@@ -30,6 +31,7 @@ Utilities:
 */
 
 use ms_canvas::{BubbleClass, BubbleTextField, CanvasView};
+use ms_input::{HitPhase, InputFrame};
 use ms_sysprobe::paste_image;
 use ms_project::{Bubble, ProjectData};
 use ms_widgets::{WheelComboBox, WheelSpinBox};
@@ -264,6 +266,8 @@ pub struct BubblesPanelContext<'a> {
     pub last_bubble_order: &'a mut i32,
     /// The tab's one «choose file» slot for external image bubbles (see [`ImageBubbleFilePick`]).
     pub image_bubble_pick: &'a mut Option<ImageBubbleFilePick>,
+    /// This frame's input (`None` outside the tab's draw): the card menu gesture.
+    pub input: Option<&'a InputFrame>,
 }
 
 /// Which class-dependent rows one bubble card draws.
@@ -542,205 +546,268 @@ impl BubblesPanelState {
                 .entry(bubble_id)
                 .or_insert_with(|| BubblePanelEditorState::from_bubble(bubble, footer));
 
-            let card_response = egui::Frame::new()
-                .fill(Color32::from_rgb(31, 31, 31))
-                .stroke(Stroke::new(1.0, Color32::from_gray(60)))
-                .corner_radius(egui::CornerRadius::same(6))
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        if placed {
-                            ui.strong(tf!("translation.bubbles.image_number", bubble = bubble.img_idx.saturating_add(1)));
-                        } else {
-                            ui.colored_label(ms_theme::status::ERROR, t!("translation.bubbles.not_bound"));
-                        }
-                        ui.label(format!("#{}", bubble_id));
-                    });
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(t!("translation.bubbles.class_label"));
-                        if ui
-                            .selectable_label(bubble_class == BubbleClass::Text, "TextBubble")
-                            .clicked()
-                        {
-                            bubble_class = BubbleClass::Text;
-                            class_changed = true;
-                        }
-                        if ui
-                            .selectable_label(bubble_class == BubbleClass::Image, "ImageBubble")
-                            .clicked()
-                        {
-                            bubble_class = BubbleClass::Image;
-                            class_changed = true;
-                        }
-                        if ui
-                            .selectable_label(
-                                bubble_class == BubbleClass::Hint,
-                                t!("translation.bubbles.class_hint_label"),
-                            )
-                            .clicked()
-                        {
-                            bubble_class = BubbleClass::Hint;
-                            class_changed = true;
-                        }
-                    });
-
-                    // Resolved AFTER the selector so a class switch reshapes the card in the same
-                    // frame it is clicked (matching the pre-existing ImageBubble behavior).
-                    let card_body = BubbleCardBody::for_class(bubble_class);
-
-                    ui.add_space(4.0);
-                    if card_body.single_line_text {
-                        // A hint owns exactly ONE canonical line, stored in `Bubble.text`;
-                        // `original_text` stays empty for the class, so the ORIGINAL field is
-                        // dropped and the line is single-line, mirroring the canvas hint card.
-                        let hint_resp = ui.add(
-                            egui::TextEdit::singleline(&mut editor.text)
-                                .hint_text(t!("canvas.bubble.hint_text_placeholder")),
-                        );
-                        if hint_resp.changed() {
-                            translation_changed = true;
-                            text_search_dirty = true;
-                            editor.refresh_text_lc();
-                        }
-                    } else {
-                        let translated_resp = ui.add(
-                            egui::TextEdit::multiline(&mut editor.text)
-                                .desired_rows(3)
-                                .hint_text(t!("translation.common.translation_label")),
-                        );
-                        if translated_resp.changed() {
-                            translation_changed = true;
-                            text_search_dirty = true;
-                            editor.refresh_text_lc();
-                        }
-
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new(t!("translation.bubbles.original_field_label")).small());
-                        let original_resp = ui.add(
-                            egui::TextEdit::multiline(&mut editor.original_text)
-                                .desired_rows(2)
-                                .hint_text(t!("translation.bubbles.original_placeholder")),
-                        );
-                        if original_resp.changed() {
-                            original_changed = true;
-                            text_search_dirty = true;
-                            editor.refresh_original_text_lc();
-                        }
-                    }
-
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(t!("translation.bubbles.order_label"));
-                        let mut bubble_order = editor.bubble_order;
-                        let order_resp = ui.add(
-                            WheelSpinBox::new(&mut bubble_order)
-                                .range(0..=100_000)
-                                .speed(0.25),
-                        );
-                        if order_resp.changed() {
-                            editor.bubble_order = bubble_order.clamp(0, 100_000);
-                            queue_footer_patch(
-                                panel_ctx.pending_footer_patches,
-                                panel_ctx.pending_footer_patch_changed_at,
-                                bubble_id,
-                                "bubble_order",
-                                Value::Number(editor.bubble_order.into()),
-                                now_s,
-                            );
-                            *panel_ctx.last_page_idx = bubble.img_idx as i64;
-                            *panel_ctx.last_bubble_order = editor.bubble_order;
-                        }
-                    });
-
-                    // Class dispatch AFTER the order spin box: every class keeps the replica order,
-                    // but the rows below it differ (see `BubbleCardBody`).
-                    if card_body.image_controls {
-                        Self::draw_image_bubble_controls(
-                            ui,
-                            project,
-                            bubble,
-                            bubble_id,
-                            now_s,
-                            panel_ctx,
-                            &mut image_error,
-                        );
-                    } else if card_body.character_controls {
+            // The card's own Ui senses clicks BEHIND its widgets (a `Ui`'s widget is registered
+            // when it is created, before its children; `Frame::show`'s response is hover-only
+            // and allocated after them), so the buttons and fields keep their clicks and a click
+            // on the card's background reaches the card menu gesture.
+            let card_response = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::click()), |ui| {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(31, 31, 31))
+                    .stroke(Stroke::new(1.0, Color32::from_gray(60)))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if placed {
+                                ui.strong(tf!("translation.bubbles.image_number", bubble = bubble.img_idx.saturating_add(1)));
+                            } else {
+                                ui.colored_label(ms_theme::status::ERROR, t!("translation.bubbles.not_bound"));
+                            }
+                            ui.label(format!("#{}", bubble_id));
+                        });
                         ui.horizontal_wrapped(|ui| {
-                            let known_resp = ui
-                                .checkbox(&mut editor.is_known_character, t!("translation.bubbles.nominative_case_label"))
-                                .on_hover_text(
-                                    t!("translation.bubbles.character_name_hint"),
-                                );
-                            if known_resp.changed() {
-                                queue_footer_patch(
-                                    panel_ctx.pending_footer_patches,
-                                    panel_ctx.pending_footer_patch_changed_at,
-                                    bubble_id,
-                                    "is_known_character",
-                                    Value::Bool(editor.is_known_character),
-                                    now_s,
-                                );
-                                let prev_character_name = editor.character_name.clone();
-                                if editor.is_known_character {
-                                    if panel_ctx.character_names.is_empty() {
-                                        editor.character_name.clear();
-                                    } else if editor.character_name == footer_no_characters()
-                                        || !panel_ctx
-                                            .character_names
-                                            .iter()
-                                            .any(|item| item == &editor.character_name)
-                                    {
-                                        editor.character_name =
-                                            panel_ctx.character_names[0].clone();
-                                    }
-                                    if editor.character_name == footer_no_characters() {
-                                        editor.character_name.clear();
-                                    }
-                                }
-                                if editor.character_name != prev_character_name {
-                                    editor.refresh_character_name_lc();
-                                    character_dirty = true;
-                                }
-                                queue_footer_patch(
-                                    panel_ctx.pending_footer_patches,
-                                    panel_ctx.pending_footer_patch_changed_at,
-                                    bubble_id,
-                                    "character_name",
-                                    Value::String(editor.character_name.clone()),
-                                    now_s,
-                                );
-                                *panel_ctx.last_is_known_character = editor.is_known_character;
-                                *panel_ctx.last_character_name = editor.character_name.clone();
+                            ui.label(t!("translation.bubbles.class_label"));
+                            if ui
+                                .selectable_label(bubble_class == BubbleClass::Text, "TextBubble")
+                                .clicked()
+                            {
+                                bubble_class = BubbleClass::Text;
+                                class_changed = true;
+                            }
+                            if ui
+                                .selectable_label(bubble_class == BubbleClass::Image, "ImageBubble")
+                                .clicked()
+                            {
+                                bubble_class = BubbleClass::Image;
+                                class_changed = true;
+                            }
+                            if ui
+                                .selectable_label(
+                                    bubble_class == BubbleClass::Hint,
+                                    t!("translation.bubbles.class_hint_label"),
+                                )
+                                .clicked()
+                            {
+                                bubble_class = BubbleClass::Hint;
+                                class_changed = true;
                             }
                         });
 
+                        // Resolved AFTER the selector so a class switch reshapes the card in the same
+                        // frame it is clicked (matching the pre-existing ImageBubble behavior).
+                        let card_body = BubbleCardBody::for_class(bubble_class);
+
+                        ui.add_space(4.0);
+                        if card_body.single_line_text {
+                            // A hint owns exactly ONE canonical line, stored in `Bubble.text`;
+                            // `original_text` stays empty for the class, so the ORIGINAL field is
+                            // dropped and the line is single-line, mirroring the canvas hint card.
+                            let hint_resp = ui.add(
+                                egui::TextEdit::singleline(&mut editor.text)
+                                    .hint_text(t!("canvas.bubble.hint_text_placeholder")),
+                            );
+                            if hint_resp.changed() {
+                                translation_changed = true;
+                                text_search_dirty = true;
+                                editor.refresh_text_lc();
+                            }
+                        } else {
+                            let translated_resp = ui.add(
+                                egui::TextEdit::multiline(&mut editor.text)
+                                    .desired_rows(3)
+                                    .hint_text(t!("translation.common.translation_label")),
+                            );
+                            if translated_resp.changed() {
+                                translation_changed = true;
+                                text_search_dirty = true;
+                                editor.refresh_text_lc();
+                            }
+
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(t!("translation.bubbles.original_field_label")).small());
+                            let original_resp = ui.add(
+                                egui::TextEdit::multiline(&mut editor.original_text)
+                                    .desired_rows(2)
+                                    .hint_text(t!("translation.bubbles.original_placeholder")),
+                            );
+                            if original_resp.changed() {
+                                original_changed = true;
+                                text_search_dirty = true;
+                                editor.refresh_original_text_lc();
+                            }
+                        }
+
+                        ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
-                            if editor.is_known_character {
-                                if panel_ctx.character_names.is_empty() {
-                                    ui.label(footer_no_characters());
-                                } else {
-                                    let mut selected_name = editor.character_name.clone();
-                                    WheelComboBox::from_id_salt((
-                                        "translation_bubbles_panel_character",
+                            ui.label(t!("translation.bubbles.order_label"));
+                            let mut bubble_order = editor.bubble_order;
+                            let order_resp = ui.add(
+                                WheelSpinBox::new(&mut bubble_order)
+                                    .range(0..=100_000)
+                                    .speed(0.25),
+                            );
+                            if order_resp.changed() {
+                                editor.bubble_order = bubble_order.clamp(0, 100_000);
+                                queue_footer_patch(
+                                    panel_ctx.pending_footer_patches,
+                                    panel_ctx.pending_footer_patch_changed_at,
+                                    bubble_id,
+                                    "bubble_order",
+                                    Value::Number(editor.bubble_order.into()),
+                                    now_s,
+                                );
+                                *panel_ctx.last_page_idx = bubble.img_idx as i64;
+                                *panel_ctx.last_bubble_order = editor.bubble_order;
+                            }
+                        });
+
+                        // Class dispatch AFTER the order spin box: every class keeps the replica order,
+                        // but the rows below it differ (see `BubbleCardBody`).
+                        if card_body.image_controls {
+                            Self::draw_image_bubble_controls(
+                                ui,
+                                project,
+                                bubble,
+                                bubble_id,
+                                now_s,
+                                panel_ctx,
+                                &mut image_error,
+                            );
+                        } else if card_body.character_controls {
+                            ui.horizontal_wrapped(|ui| {
+                                let known_resp = ui
+                                    .checkbox(&mut editor.is_known_character, t!("translation.bubbles.nominative_case_label"))
+                                    .on_hover_text(
+                                        t!("translation.bubbles.character_name_hint"),
+                                    );
+                                if known_resp.changed() {
+                                    queue_footer_patch(
+                                        panel_ctx.pending_footer_patches,
+                                        panel_ctx.pending_footer_patch_changed_at,
                                         bubble_id,
-                                    ))
-                                    .selected_text(if selected_name.trim().is_empty() {
-                                        footer_no_character().to_string()
-                                    } else {
-                                        selected_name.clone()
-                                    })
-                                    .width(160.0)
-                                    .show_ui(ui, |ui| {
-                                        for item in panel_ctx.character_names {
-                                            ui.selectable_value(
-                                                &mut selected_name,
-                                                item.clone(),
-                                                item,
-                                            );
+                                        "is_known_character",
+                                        Value::Bool(editor.is_known_character),
+                                        now_s,
+                                    );
+                                    let prev_character_name = editor.character_name.clone();
+                                    if editor.is_known_character {
+                                        if panel_ctx.character_names.is_empty() {
+                                            editor.character_name.clear();
+                                        } else if editor.character_name == footer_no_characters()
+                                            || !panel_ctx
+                                                .character_names
+                                                .iter()
+                                                .any(|item| item == &editor.character_name)
+                                        {
+                                            editor.character_name =
+                                                panel_ctx.character_names[0].clone();
                                         }
-                                    });
-                                    if selected_name != editor.character_name {
-                                        editor.character_name = selected_name;
+                                        if editor.character_name == footer_no_characters() {
+                                            editor.character_name.clear();
+                                        }
+                                    }
+                                    if editor.character_name != prev_character_name {
+                                        editor.refresh_character_name_lc();
+                                        character_dirty = true;
+                                    }
+                                    queue_footer_patch(
+                                        panel_ctx.pending_footer_patches,
+                                        panel_ctx.pending_footer_patch_changed_at,
+                                        bubble_id,
+                                        "character_name",
+                                        Value::String(editor.character_name.clone()),
+                                        now_s,
+                                    );
+                                    *panel_ctx.last_is_known_character = editor.is_known_character;
+                                    *panel_ctx.last_character_name = editor.character_name.clone();
+                                }
+                            });
+
+                            ui.horizontal_wrapped(|ui| {
+                                if editor.is_known_character {
+                                    if panel_ctx.character_names.is_empty() {
+                                        ui.label(footer_no_characters());
+                                    } else {
+                                        let mut selected_name = editor.character_name.clone();
+                                        WheelComboBox::from_id_salt((
+                                            "translation_bubbles_panel_character",
+                                            bubble_id,
+                                        ))
+                                        .selected_text(if selected_name.trim().is_empty() {
+                                            footer_no_character().to_string()
+                                        } else {
+                                            selected_name.clone()
+                                        })
+                                        .width(160.0)
+                                        .show_ui(ui, |ui| {
+                                            for item in panel_ctx.character_names {
+                                                ui.selectable_value(
+                                                    &mut selected_name,
+                                                    item.clone(),
+                                                    item,
+                                                );
+                                            }
+                                        });
+                                        if selected_name != editor.character_name {
+                                            editor.character_name = selected_name;
+                                            editor.refresh_character_name_lc();
+                                            character_dirty = true;
+                                            queue_footer_patch(
+                                                panel_ctx.pending_footer_patches,
+                                                panel_ctx.pending_footer_patch_changed_at,
+                                                bubble_id,
+                                                "character_name",
+                                                Value::String(editor.character_name.clone()),
+                                                now_s,
+                                            );
+                                            if !editor.clarification.is_empty() {
+                                                editor.clarification.clear();
+                                                queue_footer_patch(
+                                                    panel_ctx.pending_footer_patches,
+                                                    panel_ctx.pending_footer_patch_changed_at,
+                                                    bubble_id,
+                                                    "clarification",
+                                                    Value::String(String::new()),
+                                                    now_s,
+                                                );
+                                            }
+                                            *panel_ctx.last_character_name =
+                                                editor.character_name.clone();
+                                            panel_ctx.last_clarification.clear();
+                                        }
+                                    }
+
+                                    if ui
+                                        .small_button("↻")
+                                        .on_hover_text(t!("translation.bubbles.refresh_characters_tooltip"))
+                                        .clicked()
+                                    {
+                                        *panel_ctx.pending_characters_refresh = true;
+                                    }
+
+                                    let clarification_resp = ui.add(
+                                        egui::TextEdit::singleline(&mut editor.clarification)
+                                            .hint_text(t!("translation.bubbles.clarification_placeholder"))
+                                            .desired_width(150.0),
+                                    );
+                                    if clarification_resp.changed() {
+                                        queue_footer_patch(
+                                            panel_ctx.pending_footer_patches,
+                                            panel_ctx.pending_footer_patch_changed_at,
+                                            bubble_id,
+                                            "clarification",
+                                            Value::String(editor.clarification.clone()),
+                                            now_s,
+                                        );
+                                        *panel_ctx.last_clarification = editor.clarification.clone();
+                                    }
+                                } else {
+                                    let character_resp = ui.add(
+                                        egui::TextEdit::singleline(&mut editor.character_name)
+                                            .hint_text(t!("translation.bubbles.character_name_placeholder"))
+                                            .desired_width(180.0),
+                                    );
+                                    if character_resp.changed() {
                                         editor.refresh_character_name_lc();
                                         character_dirty = true;
                                         queue_footer_patch(
@@ -751,121 +818,72 @@ impl BubblesPanelState {
                                             Value::String(editor.character_name.clone()),
                                             now_s,
                                         );
-                                        if !editor.clarification.is_empty() {
-                                            editor.clarification.clear();
-                                            queue_footer_patch(
-                                                panel_ctx.pending_footer_patches,
-                                                panel_ctx.pending_footer_patch_changed_at,
-                                                bubble_id,
-                                                "clarification",
-                                                Value::String(String::new()),
-                                                now_s,
-                                            );
-                                        }
-                                        *panel_ctx.last_character_name =
-                                            editor.character_name.clone();
-                                        panel_ctx.last_clarification.clear();
+                                        *panel_ctx.last_character_name = editor.character_name.clone();
                                     }
                                 }
+                            });
+                        }
 
-                                if ui
-                                    .small_button("↻")
-                                    .on_hover_text(t!("translation.bubbles.refresh_characters_tooltip"))
-                                    .clicked()
-                                {
-                                    *panel_ctx.pending_characters_refresh = true;
-                                }
-
-                                let clarification_resp = ui.add(
-                                    egui::TextEdit::singleline(&mut editor.clarification)
-                                        .hint_text(t!("translation.bubbles.clarification_placeholder"))
-                                        .desired_width(150.0),
-                                );
-                                if clarification_resp.changed() {
-                                    queue_footer_patch(
-                                        panel_ctx.pending_footer_patches,
-                                        panel_ctx.pending_footer_patch_changed_at,
-                                        bubble_id,
-                                        "clarification",
-                                        Value::String(editor.clarification.clone()),
-                                        now_s,
-                                    );
-                                    *panel_ctx.last_clarification = editor.clarification.clone();
-                                }
+                        ui.add_space(4.0);
+                        ui.horizontal_wrapped(|ui| {
+                            let move_btn = if canvas.is_bubble_move_mode_active(bubble_id) {
+                                t!("translation.bubbles.cancel_move_button")
+                            } else if placed {
+                                t!("translation.bubbles.move_button")
                             } else {
-                                let character_resp = ui.add(
-                                    egui::TextEdit::singleline(&mut editor.character_name)
-                                        .hint_text(t!("translation.bubbles.character_name_placeholder"))
-                                        .desired_width(180.0),
-                                );
-                                if character_resp.changed() {
-                                    editor.refresh_character_name_lc();
-                                    character_dirty = true;
-                                    queue_footer_patch(
-                                        panel_ctx.pending_footer_patches,
-                                        panel_ctx.pending_footer_patch_changed_at,
-                                        bubble_id,
-                                        "character_name",
-                                        Value::String(editor.character_name.clone()),
-                                        now_s,
-                                    );
-                                    *panel_ctx.last_character_name = editor.character_name.clone();
-                                }
+                                t!("translation.bubbles.place_button")
+                            };
+                            if ui.small_button(move_btn).clicked() {
+                                move_clicked = true;
+                            }
+                            // A hint is not a replica: translating it would overwrite the author's own
+                            // note with machine output, so the action is not offered for that class.
+                            if card_body.translate_action
+                                && ui.small_button(t!("translation.common.translate_button")).clicked()
+                            {
+                                translate_clicked = true;
+                            }
+                            if ui.small_button(t!("translation.common.delete_button")).clicked() {
+                                delete_clicked = true;
                             }
                         });
-                    }
-
-                    ui.add_space(4.0);
-                    ui.horizontal_wrapped(|ui| {
-                        let move_btn = if canvas.is_bubble_move_mode_active(bubble_id) {
-                            t!("translation.bubbles.cancel_move_button")
-                        } else if placed {
-                            t!("translation.bubbles.move_button")
-                        } else {
-                            t!("translation.bubbles.place_button")
-                        };
-                        if ui.small_button(move_btn).clicked() {
-                            move_clicked = true;
-                        }
-                        // A hint is not a replica: translating it would overwrite the author's own
-                        // note with machine output, so the action is not offered for that class.
-                        if card_body.translate_action
-                            && ui.small_button(t!("translation.common.translate_button")).clicked()
-                        {
-                            translate_clicked = true;
-                        }
-                        if ui.small_button(t!("translation.common.delete_button")).clicked() {
-                            delete_clicked = true;
-                        }
                     });
-                })
-                .response;
+            })
+            .response;
 
-            card_response.context_menu(|ui| {
-                if ui.button(t!("translation.common.copy_original_button")).clicked() {
-                    copy_original_clicked = true;
-                    ui.close();
-                }
-                if ui.button(t!("translation.common.copy_translation_button")).clicked() {
-                    copy_translation_clicked = true;
-                    ui.close();
-                }
-                ui.separator();
-                if ui
-                    .add_enabled(allow_paste, egui::Button::new(t!("translation.common.paste_original_button")))
-                    .clicked()
-                {
-                    paste_original_clicked = true;
-                    ui.close();
-                }
-                if ui
-                    .add_enabled(allow_paste, egui::Button::new(t!("translation.common.paste_translation_button")))
-                    .clicked()
-                {
-                    paste_translation_clicked = true;
-                    ui.close();
-                }
-            });
+            let menu_hit = panel_ctx.input.and_then(|input| input.gesture_for(&card_response, &[(crate::input::TARGET_BUBBLE_CARD, true)]));
+            let menu_opened = menu_hit.is_some_and(|hit| hit.action == crate::input::BUBBLE_CARD_MENU && hit.phase == HitPhase::Clicked);
+            // A secondary click the menu binding does not own opens nothing (the menu may be bound
+            // elsewhere); a binding on another button opens it at the pointer.
+            let foreign_secondary = card_response.secondary_clicked() && !menu_opened;
+            let anchor = (menu_opened && !card_response.secondary_clicked()).then(|| card_response.interact_pointer_pos().or_else(|| card_response.hover_pos())).flatten();
+            if !foreign_secondary {
+                ms_input::touch::context_menu_popup(&card_response, anchor).show(|ui| {
+                    if ui.button(t!("translation.common.copy_original_button")).clicked() {
+                        copy_original_clicked = true;
+                        ui.close();
+                    }
+                    if ui.button(t!("translation.common.copy_translation_button")).clicked() {
+                        copy_translation_clicked = true;
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(allow_paste, egui::Button::new(t!("translation.common.paste_original_button")))
+                        .clicked()
+                    {
+                        paste_original_clicked = true;
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(allow_paste, egui::Button::new(t!("translation.common.paste_translation_button")))
+                        .clicked()
+                    {
+                        paste_translation_clicked = true;
+                        ui.close();
+                    }
+                });
+            }
             footer_state = editor.footer_state();
         }
 

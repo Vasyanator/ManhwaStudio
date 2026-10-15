@@ -64,8 +64,6 @@ impl TypingTopPanelState {
         // global preset applied marks the set dirty, and this is the tick that turns it into
         // one off-thread document write per burst (`local_presets::LOCAL_PRESETS_SAVE_DEBOUNCE`).
         self.create_panel.tick_local_presets_save();
-        self.create_panel.reset_text_input_focus_tracking();
-        self.edit_panel.reset_text_input_focus_tracking();
         if self.create_panel.fonts_reload_in_flight() || self.edit_panel.fonts_reload_in_flight() {
             ctx.request_repaint();
         }
@@ -132,12 +130,31 @@ impl TypingTopPanelState {
         }
     }
 
-    pub(crate) fn has_focused_text_input(&self, ctx: &egui::Context) -> bool {
-        self.create_panel.has_focused_text_input(ctx) || self.edit_panel.has_focused_text_input(ctx)
-    }
-
     pub(crate) fn eyedropper_active(&self) -> bool {
         self.create_panel.eyedropper_active() || self.edit_panel.eyedropper_active()
+    }
+
+    /// Whether the eyedropper holds the canvas click this frame (active, or it took the click):
+    /// an empty-canvas click must not deselect then.
+    pub(crate) fn eyedropper_blocks_focus_clear(&self) -> bool {
+        self.eyedropper_active() || self.eyedropper_consumed_primary_click_this_frame()
+    }
+
+    /// Sets the binding texts the panels' shortcut hints show (`tab/input.rs`), in both panels.
+    pub(crate) fn set_input_labels(&mut self, labels: crate::tab::input::TypingInputLabels) {
+        self.create_panel.input_labels = labels.clone();
+        self.edit_panel.input_labels = labels.clone();
+        self.input_labels = labels;
+    }
+
+    /// Whether the quick font-size axis (`typing.font_size`) has a target: the create panel in
+    /// create mode, or the edit panel of a selected TEXT layer (an image overlay or a raster has
+    /// no font size).
+    pub(crate) fn font_size_wheel_target(&self) -> bool {
+        match self.mode {
+            TypingTopPanelMode::CreateText => true,
+            TypingTopPanelMode::EditText => self.edit_overlay_kind == Some(TypingOverlayKind::Text),
+        }
     }
 
     pub(crate) fn eyedropper_consumed_primary_click_this_frame(&self) -> bool {
@@ -340,7 +357,7 @@ impl TypingTopPanelState {
                 &mut self.centering_assist_enabled,
                 t!("typing.panel.centering_assist_toggle"),
             )
-            .on_hover_text(t!("typing.panel.centering_assist_hotkey_hint"));
+            .on_hover_text(tf!("typing.panel.centering_assist_shortcut_hint", binding = self.input_labels.toggle_centering_assist.as_str()));
         if centering_toggle.changed()
             && self.centering_assist_enabled
             && self.mode == TypingTopPanelMode::EditText
@@ -577,7 +594,7 @@ impl TypingTopPanelState {
 
     /// Flips centering assist ("Помочь с центровкой"), exactly as the panel checkbox does.
     ///
-    /// Used by the `H` hotkey. Turning it ON while editing re-emits the edit request so the
+    /// Used by the `typing.toggle_centering_assist` command (default H). Turning it ON while editing re-emits the edit request so the
     /// renderer computes the mean/median centers and the guide frame appears without a further
     /// text/param edit — the same side effect the checkbox has.
     pub(crate) fn toggle_centering_assist(&mut self) {
@@ -621,9 +638,10 @@ impl TypingTopPanelState {
     /// Flips the «Показывать клин» state and queues the canvas request, exactly as the panel
     /// checkbox does.
     ///
-    /// Used by the `C` hotkey so the checkbox and the hotkey share one source of truth: the panel
-    /// field is the authority after the one-shot [`Self::sync_clean_overlays_visible_from_canvas`]
-    /// seed, and the queued request is drained by the tab into the canvas in the same frame.
+    /// Used by the `typing.toggle_clean` command (default C) so the checkbox and the command share
+    /// one source of truth: the panel field is the authority after the one-shot
+    /// [`Self::sync_clean_overlays_visible_from_canvas`] seed, and the queued request is drained by
+    /// the tab into the canvas in the same frame.
     pub(crate) fn toggle_clean_overlays_visible(&mut self) {
         self.clean_overlays_visible = !self.clean_overlays_visible;
         self.pending_clean_overlays_visible = Some(self.clean_overlays_visible);
@@ -828,7 +846,7 @@ impl TypingTopPanelState {
         ui.add_space(4.0);
         ui.group(|ui| {
             ui.label(egui::RichText::new(t!("typing.autotype.heading")).strong());
-            ui.label(t!("typing.autotype.hotkey_hint"));
+            ui.label(tf!("typing.autotype.shortcut_hint", binding = self.input_labels.autotype.as_str()));
             ui.checkbox(&mut self.auto_typing_debug_visuals, t!("typing.autotype.show_debug"));
             ui.add(
                 WheelSlider::new(

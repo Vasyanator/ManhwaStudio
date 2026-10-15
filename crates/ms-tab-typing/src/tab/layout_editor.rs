@@ -488,13 +488,17 @@ pub(super) fn apply_layout_frame_drag(
     Rect::from_min_max(min, max)
 }
 
-/// Handles pointer/keyboard input for the vector-line canvas in the layout editor's
-/// Editing sub-mode (add / move / delete line points).
+/// Handles pointer input for the vector-line canvas in the layout editor's Editing sub-mode
+/// (add / append / move line points) through the declared layout gestures (`tab/input.rs`):
+/// `typing.layout.add_point` (click in the frame, only while the line is empty),
+/// `typing.layout.append_point` ([extend] + click or drag on the LAST point) and
+/// `typing.layout.move_point` (drag on a point). Deleting the last point is the
+/// `typing.layout.delete_point` command (`TypingTextOverlayLayer::layout_editor_delete_last_point`).
 ///
-/// Returns `true` when a COMPLETED, discrete edit happened this frame — a point added,
-/// a point deleted, or a point-drag that just finished. Returns `false` while a drag is
-/// in progress (per-frame point moves), so the caller re-renders the overlay only once
-/// the edit is settled instead of on every dragged frame.
+/// Returns `true` when a COMPLETED, discrete edit happened this frame — a point added or a
+/// point-drag that just finished. Returns `false` while a drag is in progress (per-frame point
+/// moves), so the caller re-renders the overlay only once the edit is settled instead of on every
+/// dragged frame.
 pub(super) fn handle_layout_editor_vector_canvas_input(
     editor: &mut TypingLayoutEditorState,
     line_idx: usize,
@@ -502,19 +506,10 @@ pub(super) fn handle_layout_editor_vector_canvas_input(
     view: PageView,
     response: &egui::Response,
     ctx: &egui::Context,
+    input: &InputFrame,
 ) -> bool {
     let zoom = view.zoom;
     let mut completed_change = false;
-    if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
-        && let Some(line) = editor.lines.get_mut(line_idx)
-    {
-        // Only count as a change (worth re-rendering) if a point was actually removed.
-        if line.points.pop().is_some() {
-            completed_change = true;
-        }
-        ctx.request_repaint();
-    }
-
     let Some(pointer_scene) = response.interact_pointer_pos() else {
         return completed_change;
     };
@@ -525,39 +520,44 @@ pub(super) fn handle_layout_editor_vector_canvas_input(
         (pointer_page[1] - editor.frame_page_rect.top())
             .clamp(0.0, editor.frame_page_rect.height().max(1.0)),
     );
-    if response.clicked()
-        && frame_scene.contains(pointer_scene)
+    let (hit_point_idx, last_point_idx) = editor.lines.get(line_idx).map_or((None, None), |line| {
+        (hit_test_layout_editor_line_point(line, frame_scene, zoom, pointer_scene), line.points.len().checked_sub(1))
+    });
+    let candidates = [
+        (input::TARGET_LAYOUT_FRAME, frame_scene.contains(pointer_scene)),
+        (input::TARGET_LAYOUT_POINT, hit_point_idx.is_some()),
+        (input::TARGET_LAYOUT_LAST_POINT, hit_point_idx.is_some() && hit_point_idx == last_point_idx),
+    ];
+    let hit = input.gesture_for(response, &candidates);
+    if let Some(hit) = hit
         && let Some(line) = editor.lines.get_mut(line_idx)
     {
-        let shift_creates_next = ctx.input(|input| input.modifiers.shift)
-            && hit_test_layout_editor_line_point(line, frame_scene, zoom, pointer_scene)
-                == line.points.len().checked_sub(1);
-        if line.points.is_empty() || shift_creates_next {
-            line.points.push(local);
-            completed_change = true;
-            ctx.request_repaint();
-        }
-    }
-    if response.drag_started()
-        && let Some(line) = editor.lines.get_mut(line_idx)
-    {
-        let hit_point_idx =
-            hit_test_layout_editor_line_point(line, frame_scene, zoom, pointer_scene);
-        let shift_pressed = ctx.input(|input| input.modifiers.shift);
-        let last_point_idx = line.points.len().checked_sub(1);
-        if shift_pressed && hit_point_idx.is_some() && hit_point_idx == last_point_idx {
-            line.points.push(local);
-            editor.line_drag = Some(TypingLayoutLineDragState {
-                line_idx,
-                point_idx: line.points.len().saturating_sub(1),
-            });
-            ctx.request_repaint();
-        } else if let Some(point_idx) = hit_point_idx {
-            editor.line_drag = Some(TypingLayoutLineDragState {
-                line_idx,
-                point_idx,
-            });
-            ctx.request_repaint();
+        match (hit.phase, hit.action) {
+            (HitPhase::Clicked, action) if action == input::LAYOUT_ADD_POINT && line.points.is_empty() => {
+                line.points.push(local);
+                completed_change = true;
+                ctx.request_repaint();
+            }
+            (HitPhase::Clicked, action) if action == input::LAYOUT_APPEND_POINT => {
+                line.points.push(local);
+                completed_change = true;
+                ctx.request_repaint();
+            }
+            (HitPhase::DragStarted, action) if action == input::LAYOUT_APPEND_POINT => {
+                line.points.push(local);
+                editor.line_drag = Some(TypingLayoutLineDragState {
+                    line_idx,
+                    point_idx: line.points.len().saturating_sub(1),
+                });
+                ctx.request_repaint();
+            }
+            (HitPhase::DragStarted, action) if action == input::LAYOUT_MOVE_POINT => {
+                if let Some(point_idx) = hit_point_idx {
+                    editor.line_drag = Some(TypingLayoutLineDragState { line_idx, point_idx });
+                    ctx.request_repaint();
+                }
+            }
+            (HitPhase::Clicked | HitPhase::DoubleClicked | HitPhase::DragStarted | HitPhase::Dragging | HitPhase::DragStopped, _) => {}
         }
     }
     if response.dragged()

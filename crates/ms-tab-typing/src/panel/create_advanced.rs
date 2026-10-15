@@ -254,9 +254,7 @@ impl TypingCreatePanelState {
                     TextLayoutMode::CustomRasterLines => {}
                     TextLayoutMode::CustomVectorLines => {
                         ui.add_space(4.0);
-                        ui.label(
-                            t!("typing.advanced.vector_layout_hint"),
-                        );
+                        ui.label(tf!("typing.advanced.vector_layout_menu_hint", binding = self.input_labels.layer_menu.as_str()));
                     }
                 }
             });
@@ -345,7 +343,6 @@ impl TypingCreatePanelState {
                     .hint_text(t!("typing.presets.save_preset_button"))
                     .desired_width((ui.available_width() - 96.0).max(120.0)),
             );
-            self.track_text_input(&preset_name_resp);
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &preset_name_resp);
             if ui.button(t!("typing.presets.save_button")).clicked() {
                 self.save_current_formula_preset();
@@ -359,7 +356,6 @@ impl TypingCreatePanelState {
                     .hint_text("x(t, ...)")
                     .desired_width(150.0),
             );
-            self.track_text_input(&x_resp);
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &x_resp);
             formula_direct_edit_changed |= x_resp.changed();
             *changed |= x_resp.changed();
@@ -379,7 +375,6 @@ impl TypingCreatePanelState {
                     .hint_text("y(t, ...)")
                     .desired_width(150.0),
             );
-            self.track_text_input(&y_resp);
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &y_resp);
             formula_direct_edit_changed |= y_resp.changed();
             *changed |= y_resp.changed();
@@ -392,7 +387,6 @@ impl TypingCreatePanelState {
                     .hint_text("rot (rad)")
                     .desired_width(110.0),
             );
-            self.track_text_input(&rot_resp);
             mark_hscroll_block_on_hover(block_hscroll_by_hovered_param, &rot_resp);
             formula_direct_edit_changed |= rot_resp.changed();
             *changed |= rot_resp.changed();
@@ -912,7 +906,6 @@ impl TypingCreatePanelState {
                 .text_colors(text_colors)
                 .show(ui);
             self.paint_persistent_text_selection_if_needed(ui, &text_output);
-            self.track_text_input(&text_output.response);
             self.sync_text_selection_from_text_edit(
                 ui.ctx(),
                 text_output.response.id,
@@ -934,7 +927,6 @@ impl TypingCreatePanelState {
                 .text_colors(text_colors)
                 .show(ui);
             self.paint_persistent_text_selection_if_needed(ui, &formed_output);
-            self.track_text_input(&formed_output.response);
             self.sync_text_selection_from_text_edit(
                 ui.ctx(),
                 formed_output.response.id,

@@ -18,10 +18,10 @@ for that reason and carry a note saying so.
 ## Architecture
 `TranslationTab` in `host.rs` is the program tab as the studio root holds it: it owns the tab's
 `CanvasView` and its `TranslationTabState` (so the split borrow `(&mut canvas, &mut state)` the
-canvas draw needs stays inside this crate), draws them (`draw`: bottom-hint rows, lazy settings
-load, side panel, per-frame canvas flags, then the canvas inside the root's `CentralPanel`), and
-implements `ms_studio_tab::StudioTab` — the tab's whole hotkey set and its execution, the dock
-builder, GPU eviction (canvas clean overlay, then detector masks), the source-page window, NEAREST
+canvas draw needs stays inside this crate), draws them (`draw`: this frame's input handed to the
+state, fired commands, bottom-hint rows, lazy settings load, side panel, per-frame canvas flags,
+then the canvas inside the root's `CentralPanel`), and implements `ms_studio_tab::StudioTab` —
+the tab's input declarations and contexts, the dock builder, GPU eviction (canvas clean overlay, then detector masks), the source-page window, NEAREST
 sampling and the exit-only `Canvas.translation_hint_collapsed` key.
 
 `TranslationTabState` in `tab.rs` is the tab orchestrator and `CanvasHooks` implementation. It owns
@@ -100,7 +100,8 @@ skipped declaration would make the dock treat the tab as another program tab's a
 panel. Transparency is what keeps the cards looking exactly as they did as a bare `egui::Area` —
 the panel paints no frame, border, arrow or grip until the pointer is over it, and geometry is
 identical in both states. The cards are display-only in both states too: a character is activated by
-its digit together with the bubble-create hotkey or the Shift+drag OCR gesture, never by a click.
+its recent-character binding (shown on the card) together with the bubble-create command or the
+quick OCR gesture, never by a click.
 
 A card is PAINTED, not built from an `egui::Frame`, and that is a contract of the body rather than a
 style choice. `Frame` reserves its space through `Ui::allocate_rect`, which advances the cursor past
@@ -119,34 +120,60 @@ window) and reaches this tab through `CanvasDrawParams::panel_dock`, which the c
 that hook, and what that placement buys is ONE thing: running inside `CanvasView::draw` keeps a
 «Лента» edit ahead of `publish_canvas_settings`. It buys no z-order — within one `Order` egui's
 layer list is persistent and re-sorted stably each pass, so creation order inside the frame decides
-nothing (`egui-docs/06-overlays.md` §1.1). The standing consequence is that the OCR and image-crop
-capture surfaces, full-canvas `Order::Foreground` areas, rise above the dock's panels every time
-their selection mode is ENTERED (`Area::begin` raises an area that was not visible last frame) and
-take the clicks meant for a panel until the mode ends — as they did from the pre-dock controls
-panel on the lower `Order::Middle`. The panel's rect is stored in `ribbon_panel_rect` for the NEXT
+nothing (`egui-docs/06-overlays.md` §1.1). The canvas-wide selections need no area of this tab:
+the canvas raises its own capture area on `Order::Background` while a selection is armed, below the
+dock's panels, so a held selection mode no longer takes a panel's clicks. The panel's rect is stored in `ribbon_panel_rect` for the NEXT
 frame, because the two text-detector edit boxes that hang under it are drawn before the dock runs;
 it is `None` while the tab is hidden or detached, since `PanelDockOutput::tab_rect` answers for the
 main window alone.
 
-Finger input on the selection modes (`ms_widgets::touch_nav`): both capture areas are registered
-as touch capture layers of the canvas (`publish_capture_layer` under `canvas.touch_owner_id()`), so
-a plain finger PANS under them. A finger long-press drag selects — the hook sets
-`CanvasView::set_long_press_selection(touch_selection_mode().is_some())` every frame, with the
-pointer path's precedence (crop chord, then advanced, then quick OCR) and, with NO key held, the
-OCR kind chosen in the OCR panel (`OcrPanelOptions::finger_selection`, quick by default, persisted
-per title as `OCR.finger_selection`; the choice and a finger hint are shown only while finger
-gestures are effective, `ms_config::touch_gestures::enabled_with(CanvasTouchGestures)`). The
-key-less finger default is off while the advanced window is open or a text-detector edit mode is
-on (rules: pure `touch_selection_mode_for`). The drag is mapped through
-`ms_canvas::drive_touch_drag` onto the same `image_crop_selection` / `ocr_selection` slot, marked
-`touch` so the pointer path never moves or ends it — including the modifier-release finish rule
-(`OcrDragSelection::pointer_should_finish`); a lift commits through the same `finish_*` helpers as
-a mouse release, a cancel drops it. The OCR route is not part of the mode decision: on an
-unavailable route the drag stays claimed and its start toasts the route's refusal
-(`finger_ocr_selection_refused`) instead of drawing a rect that cannot run. Mouse and pen read
-only the modifier flags. The crop chord predicate the finger uses
-(`image_crop_selection_keys_down`) omits the pointer path's `!any_touches()` gate, which would
-otherwise end the crop under the very finger driving it.
+## Input
+The tab reads no key, modifier, wheel or raw pointer button itself: the studio's
+`InputRouter::begin_frame` decides everything before any tab draws, and this crate reads the
+resulting `InputFrame` (`TranslationDrawParams::input`). `input.rs` is the one owner of what does
+what (ids are persistence keys of the user's overrides, never renamed):
+- **Commands** (scope `Tab(Translation)`): bubble delete (Del), create (T, accepts the
+  recent-character parameter at the press), create hint (H), create image bubble (Q), copy / paste
+  original / translation (unbound); all under `NotContext` of the two detector edit modes and the
+  advanced-recognition window — the one place that keeps bubble commands out of those states.
+  Panel toggles P S K M D (exact modifiers: Shift+S is not S). Executed in `host/hotkeys.rs`.
+- **Modes**: quick OCR (Shift), advanced OCR (Alt, beats quick), image crop (Shift+Q, beats both),
+  the recent-character parameter modes `translation.recent_char.1..6` (digits 1-6), and in the
+  `Sub` scope the brush erase mode (Shift, under `brush.active`, beats quick OCR: Shift in a brush
+  erases and never arms OCR).
+- **Canvas-wide gestures** on `ms_input::view::SURFACE`: quick OCR rect (Shift + LMB drag, or a
+  finger long-press drag with no key), advanced rect, crop rect (their modes + LMB drag or + finger
+  drag); they sample the recent-character parameter during the gesture. The router claims them at
+  the press; the canvas raises its capture area while one is armed; `tab/canvas_input.rs` drives the
+  claim (`advance_selection`: starts on a page, commits on the button or mode release, a cancel drops
+  it, rects under 4x4 points are dropped; an OCR start on an unavailable route is refused with a
+  toast). Quick OCR is off in the mask edit and with the advanced window open, advanced OCR with the
+  window open. Which OCR a finger makes is a binding (rebind the touch alternative), not an OCR
+  panel setting; a title's stored `OCR.finger_selection` is ignored and left untouched.
+- **Lines edit** (`Sub`, context `translation.detector.lines_edit`): commands Delete / N, gestures
+  select / deselect (LMB click on a line / outside every line), move (LMB drag on a line), resize
+  (LMB drag on a handle of the selected line); targets handle 50 > line 40 > lines page 5, hits
+  taken at the PRESS point (`line_edit_hits`).
+- **Mask edit** (`Sub`, context `translation.detector.mask_edit`): paint (LMB drag), erase (RMB drag
+  or erase mode + LMB drag) on the mask page target; the brush size is the shared `brush.*` set
+  (`MaskBrush::apply_input`, `BRUSH_ACTIVE` published while a brush is on).
+- **Advanced-recognition window** (`Window`, context `translation.adv_rec.open`, brush context
+  `translation.adv_rec.brush`): select rect (brush off), paint / erase (brush on) on the preview
+  target. The window publishes its own view surface (`adv_rec_view_id`, the window rect, its layer
+  as capture layer) and zooms by the shared `view.*` set when the router's focus is that view, so
+  its zoom keys need the zoom modifier and stay quiet while a text field has focus.
+- **Bubble card menu** (`translation.bubble_card.menu`, RMB click): the card's own `Ui` senses
+  clicks behind its widgets; the menu opens on the gesture through `ms_input::touch::context_menu_popup`.
+- **Contexts** (`TranslationTab::input_contexts`): the canvas's (`EDITABLE`, `ZOOM_ACCEPTED`), then
+  the tab's (`crate::input::contexts`). The canvas's zoom is never blocked by this tab.
+- **Labels**: every hint (bottom-hint rows, panel titles and open buttons, OCR panel selection
+  hints, mask edit hints, the advanced window's controls hint, the recent-character cards) is
+  built from `TranslationInputLabels::from_registry`, rebuilt every frame by the host.
+- **Hooks see the frame** through `TranslationTabState::input_frame`, a copy the host sets before
+  its draw (`begin_input_frame`) and drops after it (`end_input_frame`), like `CanvasView` does.
+- **Remaining canvas adapter**: `CanvasView::set_create_bubble_shortcut_hint` (the page menu's
+  "create bubble" binding text), until the canvas can ask its tab for it. Widget-owned input (text
+  editing, `Wheel*` widgets, buttons, egui's own context menus of the MT buttons) is not a binding.
 
 Text-detector mask GPU textures are a reconstructable display cache. The tab exposes memory
 snapshots and coarse eviction methods for those textures, while detector result masks and stored
@@ -274,18 +301,21 @@ any of the three collection paths (scope run, per-ImageBubble mode, explicit per
 is an author note addressed to the translator, not a replica.
 
 ## Files and submodules
-- `lib.rs`: module wiring and public re-exports for `TranslationTab` (+ `TranslationDrawParams`),
-  `TranslationTabState` and the two modifier-only OCR hotkey ids (the settings hotkey pane's test);
-  everything else reaches the studio through `ms_studio_tab::StudioTab`.
+- `lib.rs`: module wiring and public re-exports for `TranslationTab` (+ `TranslationDrawParams`)
+  and `TranslationTabState`; everything else reaches the studio through
+  `ms_studio_tab::StudioTab`.
+- `input.rs`: every input action of the tab (ids, contexts, targets, `declarations`), the
+  context rule (`contexts`), the recent-character parameter (`recent_char_rank`) and the binding
+  texts of all hints (`TranslationInputLabels`, incl. the bottom-hint rows). `input/tests.rs`:
+  the declarations golden (ids, kinds, scopes, default labels), conflict-freedom next to the view,
+  canvas and brush sets, mode precedence, contexts per state, label-built hint rows.
 - `host.rs`: `TranslationTab` (canvas + state, `new` seeding only the scroll salt, bubbles model
   and bottom-hint collapsed flag — canvas settings are pulled from `BubblesModel` on the first
-  draw), `TranslationDrawParams` / `draw`, the fixed bottom-hint rows
-  (`canvas.bottom_hint.translation.*`) and the `StudioTab` impl. `host/hotkeys.rs`: the six
-  canvas-level command ids and specs, the execute dispatch of all seventeen ids, and the
-  hotkey-hint cache (`refresh_hotkey_hints`). `host/tests.rs`: spec list pinned to the root's
-  `hotkey_registry_golden`, execute coverage, hint-collapsed round trip, dock builder.
-- `tab.rs`: main tab state, canvas hooks, panel routing, OCR region selection, advanced-recognition
-  integration, footer metadata sync, text-detection mask/line editing, detector result storage,
+  draw), `TranslationDrawParams` / `draw` and the `StudioTab` impl. `host/hotkeys.rs`: the execute
+  dispatch of every fired command. `host/tests.rs`: declarations identity, execute coverage of
+  every declared command, contexts, hint-collapsed round trip, dock builder.
+- `tab.rs`: main tab state, canvas hooks, panel routing, OCR request building, advanced-recognition
+  integration, footer metadata sync, text-detection mask/line storage, detector result storage,
   MT dispatch, and coalesced translation settings persistence. The title `settings.json` is
   written only via `ms_docstore::update` touching the tab's four sections (`OCR`,
   `machine_translation`, `composition`, `text_detector`); a malformed file makes the save fail
@@ -327,13 +357,17 @@ is an author note addressed to the translator, not a replica.
   brush overlay, rotation, zoom, and local quick-selection OCR actions. Its brush and the detector
   mask-edit brush take the shared brush actions (`ms_tools::mask_brush`): the host publishes
   `BRUSH_ACTIVE` while either is on (`TranslationTabState::brush_input_active`) and applies them
-  before drawing (`apply_brush_input`); the host also forwards its canvas's contexts.
+  before drawing (`apply_brush_input`); its view zoom and its preview gestures come from the input
+  frame (see "Input").
+- `tab/canvas_input.rs` (child module of `tab`): the canvas pointer drivers — the claimed rect
+  selections (`advance_selection`, `drive_canvas_selection`), the lines editor and the mask brush
+  on the page, the lines edit commands; `tab/canvas_input/tests.rs` covers the pure helpers.
 
 ## Contracts and invariants
-- Hotkey command ids are persistence keys (`user_config` -> `Hotkeys`): never rename one. The
-  Translation registration order is observable within the scope (`collect_triggered`), so
-  `TranslationTab::hotkey_specs` keeps the host's six before the state's eleven; every declared
-  id that is not modifier-only must have an execute arm (`host/tests.rs` checks both).
+- Input action ids are persistence keys (`user_config` -> `Hotkeys`): never rename one. Every
+  declared command has an execute arm in `host/hotkeys.rs` (`host/tests.rs` checks it); where a
+  command may run is its declared conditions, never a check in the arm. The root's
+  `input_registry_golden` pins the same set.
 - Only `TranslationTab` touches the Translation canvas on the root's behalf; the root reaches it
   through `canvas()` / `canvas_mut()` (view sync, bubble flush) and the `StudioTab` hooks.
 - OCR, detector, MT, storage load/save, crop preparation, and backend health work must not block
@@ -363,22 +397,20 @@ is an author note addressed to the translator, not a replica.
 - Footer metadata and ImageBubble metadata live in `Bubble.extra` fields and are synchronized
   through debounced `CanvasView::patch_bubble_extra_fields` calls. Image bubbles do not expose the
   translation character autocomplete; their panel controls edit source type, image path/crop page,
-  description, original text, and translation. Translation owns ImageBubble shortcuts: `Q` creates
-  an empty external-image bubble under the pointer, and `Shift+Q` captures a drag rectangle as the
-  page crop for the selected ImageBubble or creates one at the crop center. External ImageBubble
+  description, original text, and translation. Translation owns the ImageBubble actions: the
+  create-image command (Q) creates an empty external-image bubble under the pointer, and the crop
+  gesture (Shift+Q + drag) captures a rectangle as the page crop for the selected ImageBubble or
+  creates one at the crop center. External ImageBubble
   files are picked through ONE tab-level file-dialog slot (`TranslationTabState::image_bubble_pick`,
   an `ImageBubbleFilePick` started by the canvas footer or a bubbles-panel card and resolved per
   frame by `poll_image_bubble_pick`, which keeps both «choose file» buttons disabled while it is
   open). They are written to the chapter unsaved staging `image_bubbles/` directory and stored as
-  chapter-relative paths so the saved chapter can resolve them after commit. `Q`/`Shift+Q` are
-  NOT registered hotkeys: plain `Q` is edge-gated by `image_create_q_armed`, cleared while `Q`
-  takes part in a `Shift+Q` crop session or after a creation and re-armed only once `Q` is fully
-  released, so a lingering `Q` (e.g. `Shift` released a frame earlier) cannot spawn an extra bubble.
-- Translation also owns the hint-bubble shortcut: `H` creates a `BubbleClass::Hint` under the
-  pointer. Unlike `Q`/`Shift+Q` it is a REGISTERED hotkey
-  (`HOTKEY_TRANSLATION_CREATE_HINT_BUBBLE`, `host/hotkeys.rs`, default `Key::H` with no modifiers, scope
-  `Tab(Translation)`), so it appears in Settings → Hotkeys, is rebindable, and inherits the
-  rising-edge semantics of the hotkey manager instead of a hand-rolled armed gate.
+  chapter-relative paths so the saved chapter can resolve them after commit. The create command
+  fires on the press completing its exact chord (Shift+Q never fires it); the press then cannot
+  activate the crop mode until Q is released, so pressing Q before Shift creates a bubble and
+  starts no crop.
+- Translation also owns the hint-bubble command (`crate::input::CREATE_HINT_BUBBLE`, default H):
+  it creates a `BubbleClass::Hint` under the pointer.
 - HINT ATTACHMENT is the reason a hint exists, and it is a contract of this tab, not a formatting
   detail. A hint is an author note addressed to the translator: it carries ONE line in
   `Bubble.text`, points at an anchor and owns an area exactly like an ordinary aside text bubble
@@ -507,10 +539,12 @@ is an author note addressed to the translator, not a replica.
   reads the runtime through `local_ai::effective_ai_runtime`, never `AiRuntime::from_user_settings`
   directly. The tab publishes native ORT as armed only when `local_ai.native_onnx` is `Ok`.
 ## Editing map
-- To change the Translation canvas hotkeys (zoom, bubble create/delete/copy/paste), what a
-  hotkey does, the hotkey hint texts or the bottom-hint rows, edit `host/hotkeys.rs` /
-  `host.rs`; panel-toggle and OCR selection-mode specs stay in `TranslationTabState::hotkey_specs`
-  (`tab.rs`). To change the per-frame canvas configuration or which caches the tab evicts, edit
+- To add or change an input action (its default binding, conditions, scope) or a hint text built
+  from bindings, edit `input.rs` (and its golden in `input/tests.rs`, plus the root's
+  `input_registry_golden`); what a command does, `host/hotkeys.rs`; how a canvas selection, the
+  lines editor or the mask brush reacts, `tab/canvas_input.rs`; the advanced window's gestures and
+  zoom, `adv_rec.rs`. Zoom itself is the shared `view.*` set (`ms-input`, executed by the canvas).
+  To change the per-frame canvas configuration or which caches the tab evicts, edit
   `TranslationTab::draw` / the `StudioTab` impl in `host.rs`.
 - To change what `--no-ai` or a platform switches off, or which route kind needs which
   runtime, edit `crates/ms-local-ai/src/local_ai.rs` (`LocalAiAvailability::resolve`,

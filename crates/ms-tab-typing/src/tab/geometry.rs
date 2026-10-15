@@ -26,18 +26,15 @@ pub(super) fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t.clamp(0.0, 1.0)
 }
 
-/// Ctrl/Cmd+wheel rotation step for a RASTER layer, in RADIANS, matching the ±2°/notch of the
-/// text-overlay Ctrl+wheel rotate. Returns `None` when the raw wheel delta is effectively zero (no
-/// rotation). The sign follows `scroll_delta_y` (wheel up → positive); the result is intentionally
-/// NOT normalized because a raster stores its rotation in radians and the drag-rotate path
-/// (`apply_raster_drag` `Rotate`) also lets `transform.rotation` grow unbounded, so wheel and drag
-/// stay consistent.
-pub(super) fn ctrl_wheel_raster_rotation_step_rad(scroll_delta_y: f32) -> Option<f32> {
-    if scroll_delta_y.abs() <= f32::EPSILON {
-        return None;
-    }
-    let steps = if scroll_delta_y > 0.0 { 1.0 } else { -1.0 };
-    Some((steps * 2.0_f32).to_radians())
+/// Degrees one wheel notch of `typing.layer.rotate` turns the selected layer (overlay or raster).
+pub(super) const WHEEL_ROTATION_STEP_DEG: f32 = 2.0;
+
+/// Wheel rotation for `notches` (signed, continuous — the axis sample's `delta`), in DEGREES:
+/// ±2° per notch for overlays and rasters alike. `None` for a zero or non-finite delta (nothing to
+/// rotate). A raster adds it, in radians, un-normalized, to `transform.rotation` exactly as its
+/// drag-rotate does (`apply_raster_drag` `Rotate`), so wheel and drag stay consistent.
+pub(super) fn wheel_rotation_step_deg(notches: f32) -> Option<f32> {
+    (notches.is_finite() && notches.abs() > f32::EPSILON).then_some(notches * WHEEL_ROTATION_STEP_DEG)
 }
 
 #[cfg(test)]
@@ -45,19 +42,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ctrl_wheel_raster_step_matches_overlay_two_degrees() {
-        // Wheel up → +2°, wheel down → -2°, both expressed in radians (raster rotation unit).
-        let up = ctrl_wheel_raster_rotation_step_rad(1.0);
-        let down = ctrl_wheel_raster_rotation_step_rad(-1.0);
-        assert!(matches!(up, Some(v) if (v - 2.0_f32.to_radians()).abs() < 1e-6));
-        assert!(matches!(down, Some(v) if (v + 2.0_f32.to_radians()).abs() < 1e-6));
-        // Magnitude is independent of the raw delta size (per-notch step, not proportional).
-        assert_eq!(ctrl_wheel_raster_rotation_step_rad(37.5), up);
+    fn wheel_rotation_is_two_degrees_per_notch_and_continuous() {
+        assert!(matches!(wheel_rotation_step_deg(1.0), Some(v) if (v - 2.0).abs() < 1e-6));
+        assert!(matches!(wheel_rotation_step_deg(-3.0), Some(v) if (v + 6.0).abs() < 1e-6));
+        // A trackpad's 10-point event is a quarter notch: half a degree.
+        assert!(matches!(wheel_rotation_step_deg(0.25), Some(v) if (v - 0.5).abs() < 1e-6));
     }
 
     #[test]
-    fn ctrl_wheel_raster_step_zero_delta_is_none() {
-        assert_eq!(ctrl_wheel_raster_rotation_step_rad(0.0), None);
-        assert_eq!(ctrl_wheel_raster_rotation_step_rad(f32::EPSILON), None);
+    fn wheel_rotation_zero_or_non_finite_is_none() {
+        assert_eq!(wheel_rotation_step_deg(0.0), None);
+        assert_eq!(wheel_rotation_step_deg(f32::NAN), None);
     }
 }

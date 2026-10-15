@@ -2,12 +2,18 @@
 FILE HEADER (cleaning/tools/base.rs)
 - Назначение: базовые кирпичики инструментов клининга (общий трейt инструмента, база кисти и база region-edit).
 - Ключевые типы:
-  - `CleaningTool`: контракт инструмента (UI, stroke-события, хоткеи, overlay-окна, курсор).
-  - `BrushToolBase`: переиспользуемая логика кисти (радиус, hardness, subpixel coverage/strict
-    pixel режим, хоткеи размера, scratch-штрих, tiled preview с обновлением только dirty-тайлов,
-    без full-size scratch texture).
+  - `CleaningTool`: контракт инструмента (UI, stroke-события, overlay-окна, курсор). Input
+    contract (English): contexts (`input_contexts`), this frame's commands / axes / brush actions
+    (`apply_input`), gestures from the tab's stroke driver (`stroke_*`, `on_page_press`), the
+    tool's own surfaces' gestures from the `InputFrame` of `draw_overlay_ui`, hint texts
+    (`set_input_labels`). No raw key / modifier / wheel read anywhere in this subtree.
+  - `StrokePoint`: page, screen position and the sampled `StrokeModes` of one stroke point.
+  - `BrushToolBase`: переиспользуемая логика кисти (радиус через единственного владельца
+    `ms_tools::MaskBrush` и общие `brush.*`, hardness, subpixel coverage/strict pixel режим,
+    scratch-штрих, tiled preview с обновлением только dirty-тайлов, без full-size scratch texture).
   - `RegionEditToolBase`: каркас выделения региона, фоновой загрузки композита `base+overlay`,
-    показа отдельного окна редактора, zoom-жестов (как в CanvasView) и вставки результата обратно в overlay.
+    показа отдельного окна редактора (its own `ms_input` view: the shared `view.*` zoom aims at it,
+    `apply_editor_window_zoom`) и вставки результата обратно в overlay.
   - `RegionMaskInpaintToolBase`: база для mask-inpaint инструментов поверх region-edit:
     маска удаления (жёлтый полупрозрачный overlay), кисть `MaskBrush` из `src/tools/mask_brush.rs`,
     кнопки `Сгенерировать маску/Обработать/Переделать/Вернуть/Отмена/Применить`, run-пайплайн для наследника и optional
@@ -37,19 +43,18 @@ FILE HEADER (cleaning/tools/base.rs)
     сворачиваемых секций интерфейса внутри окна region editor.
   - `draw_overlay_ui_custom_with_sample_mask` у `RegionMaskInpaintToolBase` включает второй слой маски
     и передаёт его в run-closure (для инструментов, которым нужна отдельная область примера).
-  - `draw_region_editor_image_with_stroke_input` даёт общий интерактивный viewport изображения
-    с конвертацией pointer->image px и drag-сегментами штриха.
-  - `handle_region_editor_zoom_input` обрабатывает Ctrl/Z zoom-shortcuts:
-    `-`/`=`, `0`, колесо и scrub-zoom (Ctrl/Z + ЛКМ drag).
-  - `has_open_editor` используется вкладкой cleaning, чтобы блокировать zoom CanvasView,
-    пока открыто окно region editor.
+  - `apply_editor_window_zoom`: the shared `view.*` zoom commands / axis / drag claim aimed at an
+    open editor window (published as a view surface by `draw_overlay_ui_custom`).
+  - `input_contexts` у `RegionEditToolBase`: `EDITOR_WINDOW` while the window is open, otherwise
+    `REGION_SELECT` (+ `REGION_ARMED` while a diversion is armed); the mask base adds
+    `BRUSH_ACTIVE` for the window's brush.
   - `set_selection_diverted` / `take_diverted_selection` у `RegionEditToolBase` — SELECTION
     DIVERSION. While a tool has diversion armed, a finished drag is parked for that tool
     (`route_finished_selection`) instead of becoming a pending load: no loader job, no loading
     window, no editor, no `load_error`. The size limits and the rubber band are untouched and the
     parked rect is the loader's own `source_rect`, so nothing is lost; the one thing diversion DOES
-    change about the drag is that a plain ЛКМ drag starts it too, not only Shift+ЛКМ
-    (`wants_primary_stroke`, `draw_ui_hint`). Turning
+    change about the drag is that a plain drag starts it too, not only the selection-mode drag
+    (`REGION_ARMED` in `input_contexts`, `draw_ui_hint`). Turning
     diversion off — and `cancel_selection` — DROP an unclaimed rect, so a tool must keep the flag
     in step with the reason it armed it on every frame. Default is off: a tool that never diverts
     is unaffected.
@@ -60,9 +65,9 @@ FILE HEADER (cleaning/tools/base.rs)
   - `abort_selection_drag` у `RegionEditToolBase` — drops ONLY the drag in flight (the finger
     long-press selection was cancelled: a second finger, a mouse press, focus loss); unlike
     `cancel_selection` (Esc) it leaves a pending load, an open editor and a parked diverted rect
-    alone. `CleaningTool::accepts_touch_selection` / `cancel_touch_selection` are the trait side:
-    the tab drives a finger selection through the ordinary `stroke_begin` / `stroke_update` /
-    `stroke_end` of a tool that accepts it, without the Shift requirement of the mouse.
+    alone. `CleaningTool::stroke_cancel` is the trait side: a finger selection is the touch
+    alternative of `cleaning.region.select_rect`, driven through the ordinary `stroke_begin` /
+    `stroke_update` / `stroke_end`, and a cancelled claim calls `stroke_cancel`.
   - `draw_cursor_tinted` у `RegionEditToolBase` paints the crosshair and the rubber band with a
     caller-chosen INNER stroke colour (the black outer stroke is kept for legibility);
     `draw_cursor` is that with white. A tool tints the cursor when a drag is about to do
@@ -86,6 +91,8 @@ use super::mask_generation::{
     self, GeneratedMask, MaskGenerationParams, MaskGenerationPoll, MaskGenerationState, MaskSource,
     WatermarkProgress,
 };
+use crate::input::{self, CleaningLabels, StrokeModes};
+use ms_input::{ActionId, ContextId, GesturePhase, HitPhase, InputFrame, ViewId, ViewSurface, view};
 use ms_tools::MaskBrush;
 use ms_widgets::WheelSlider;
 use eframe::egui;
@@ -120,17 +127,13 @@ struct BrushFalloff {
     hardness: f32,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// One point of a canvas stroke: the page under it, its screen position and the stroke modes the
+/// claimed gesture sampled (`crate::input::StrokeModes`).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StrokePoint {
     pub page_idx: usize,
     pub scene_pos: egui::Pos2,
-    pub modifiers: StrokeModifiers,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct StrokeModifiers {
-    pub shift: bool,
-    pub ctrl: bool,
+    pub modes: StrokeModes,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -145,6 +148,14 @@ pub struct CleaningCursorOccluder {
 /// `Send` is a supertrait because the whole studio root (`StudioApp`, which owns the cleaning tab)
 /// is moved to a worker thread for its blocking teardown (`src/studio/shutdown.rs` asserts it); a tool
 /// must therefore keep only `Send` state (channels, `Arc<Mutex<_>>`, join handles), never `Rc`.
+///
+/// Input (`crate::input`): a tool never reads a key, a modifier or the wheel. It publishes its
+/// contexts ([`CleaningTool::input_contexts`], read before the router's frame), takes this frame's
+/// commands, axes and brush actions in [`CleaningTool::apply_input`], receives its canvas gestures
+/// from the tab's stroke driver (`crate::canvas_input`: `stroke_begin` / `stroke_update` /
+/// `stroke_end` / `stroke_cancel`, `on_page_press`), and reads its own surfaces' targeted gestures
+/// (the region frame, the legacy editor window) from the `InputFrame` handed to
+/// [`CleaningTool::draw_overlay_ui`].
 pub trait CleaningTool: Send {
     #[allow(dead_code)]
     fn tool_id(&self) -> &'static str;
@@ -160,12 +171,29 @@ pub trait CleaningTool: Send {
 
     fn draw_ui(&mut self, _ui: &mut egui::Ui) {}
 
-    fn secondary_click(
-        &mut self,
-        _canvas: &mut CanvasView,
-        _project: &ProjectData,
-        _point: StrokePoint,
-    ) -> bool {
+    /// The input contexts this tool publishes in its current state (`crate::input`: its tool
+    /// context, the region / frame / editor-window states, `ms_tools::mask_brush::BRUSH_ACTIVE`
+    /// while a brush of it takes the shared size actions). Read every frame BEFORE the router's
+    /// `begin_frame`, so a state change applies from the next frame. Default: none.
+    fn input_contexts(&self) -> Vec<ContextId> {
+        Vec::new()
+    }
+
+    /// Applies this frame's commands, axes and brush actions (`InputFrame::fired` / `axis` /
+    /// `MaskBrush::apply_input`). Called once per frame by the tab BEFORE `canvas.draw`; returns
+    /// whether something visible changed (the tab repaints). Gestures do not arrive here.
+    fn apply_input(&mut self, _input: &InputFrame) -> bool {
+        false
+    }
+
+    /// The binding texts this tool's hints are built from. Pushed by the tab to the active tool
+    /// every frame before `canvas.draw` (the dock bodies run inside it); a cheap `Arc` clone that
+    /// changes only when the registry or the UI language does. Default: ignored.
+    fn set_input_labels(&mut self, _labels: &Arc<CleaningLabels>) {}
+
+    /// A press action (`crate::input::PRESS_ACTIONS`: pick colour, set the stamp point) at
+    /// `point`. Returns whether the tool used it (the tab repaints).
+    fn on_page_press(&mut self, _canvas: &mut CanvasView, _project: &ProjectData, _action: ActionId, _point: StrokePoint) -> bool {
         false
     }
 
@@ -175,68 +203,23 @@ pub trait CleaningTool: Send {
 
     fn stroke_end(&mut self, _canvas: &mut CanvasView) {}
 
-    fn set_temporary_erase(&mut self, _erase: bool) {}
-
-    fn block_canvas_drag_scroll_on_primary(&self) -> bool {
-        false
-    }
-
-    fn block_canvas_drag_scroll_on_secondary(&self) -> bool {
-        false
-    }
-
-    fn block_canvas_zoom(&self) -> bool {
-        false
-    }
-
-    fn block_canvas_zoom_on_ctrl_primary(&self) -> bool {
-        false
+    /// Ends the running stroke WITHOUT its normal completion (the claim was cancelled: a focus
+    /// loss, a second finger). Default: the normal end, which commits what was drawn; a selection
+    /// tool drops only the drag in flight instead.
+    fn stroke_cancel(&mut self, canvas: &mut CanvasView) {
+        self.stroke_end(canvas);
     }
 
     fn suppress_base_overlay_render(&self) -> bool {
         false
     }
 
-    fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        let _ = (delta_y, modifiers);
-        false
-    }
-
-    fn on_wheel_event_with_keys(
-        &mut self,
-        delta_y: f32,
-        modifiers: egui::Modifiers,
-        r_down: bool,
-    ) -> bool {
-        let _ = r_down;
-        self.on_wheel_event(delta_y, modifiers)
-    }
-
-    fn on_key_event(&mut self, _ctx: &egui::Context) -> bool {
-        false
-    }
-
+    /// The tool's veto on a stroke whose gesture already matched (a state the binding cannot
+    /// express: no stamp source yet, an eyedropper owning the click). Asked once, at the stroke's
+    /// first point on a page.
     fn wants_primary_stroke(&self, _point: StrokePoint) -> bool {
         true
     }
-
-    /// Whether a finger long-press drag drives this tool's SELECTION right now.
-    ///
-    /// `true` only for a tool whose primary stroke is a selection drag (the region tools): the
-    /// tab then publishes the canvas with `long_press_selection` and replays the finger drag
-    /// through `stroke_begin` (at the press point) / `stroke_update` / `stroke_end` (on lift),
-    /// skipping `wants_primary_stroke` — the Shift the mouse needs does not apply to a finger.
-    /// A painting tool keeps `false`, so a long-press drag pans and never paints.
-    fn accepts_touch_selection(&self) -> bool {
-        false
-    }
-
-    /// Drops the finger selection drag in flight without committing it (the router reported
-    /// it cancelled: a second finger, a mouse/pen press, a focus loss). Only the drag: what an
-    /// earlier selection produced (a pending load, an open editor) stays.
-    fn cancel_touch_selection(&mut self) {}
-
-    fn set_space_pan_active(&mut self, _active: bool) {}
 
     fn set_ai_backend_available(&mut self, _available: bool) {}
 
@@ -249,10 +232,6 @@ pub trait CleaningTool: Send {
     /// and the other dock bodies run inside that call and must already hide what the session does
     /// not offer. A tool with no such feature ignores it.
     fn set_session_capabilities(&mut self, _caps: SessionCapabilities) {}
-
-    fn space_pan_active(&self) -> bool {
-        false
-    }
 
     /// Rects of the dock panels drawn over the canvas THIS frame, in screen points.
     ///
@@ -308,11 +287,14 @@ pub trait CleaningTool: Send {
     /// `draw_overlay_ui`. Reached only while `wants_library_panel` answered `true`.
     fn draw_library_panel(&mut self, _ui: &mut egui::Ui) {}
 
+    /// The tool's per-frame pass after the canvas draw: its floating surfaces (the region frame,
+    /// the legacy editor window), their targeted gestures and zoom (from `input`), job polling.
     fn draw_overlay_ui(
         &mut self,
         _ctx: &egui::Context,
         _canvas: &mut CanvasView,
         _project: &ProjectData,
+        _input: &InputFrame,
     ) {
     }
 
@@ -325,10 +307,6 @@ pub trait CleaningTool: Send {
         pointer_scene_pos: Option<Pos2>,
     ) {
         let _ = (ui, canvas, pointer_scene_pos);
-    }
-
-    fn captures_canvas_pointer(&self, _pointer_pos: Pos2) -> bool {
-        false
     }
 
     fn bubble_occluder(
@@ -359,31 +337,30 @@ struct ScratchStroke {
     dirty_rect: Option<OverlayRectPx>,
 }
 
+/// The shared base of the canvas brush tools (Замазка, Штамп): radius (through the one brush-size
+/// owner, `ms_tools::MaskBrush`), hardness, colour blending, the strict-pixel mode, the scratch
+/// stroke and its tiled preview.
 pub struct BrushToolBase {
-    radius_px: usize,
+    /// The radius and its laws (`-` / `=` steps, wheel notches, bounds): the shared brush owner,
+    /// so the Cleaning brushes resize exactly like every other brush of the studio.
+    brush: MaskBrush,
     hardness: f32,
     blend_colors: bool,
     strict_pixel_painting: bool,
-    min_radius_px: usize,
-    max_radius_px: usize,
-    wheel_step_px: usize,
-    wheel_accum: f32,
-    space_pan_active: bool,
+    /// `view.pan` is held this frame (`apply_input`): the brush hides its cursor and paints
+    /// nothing, the drag pans the canvas.
+    pan_active: bool,
     scratch: Option<ScratchStroke>,
 }
 
 impl Default for BrushToolBase {
     fn default() -> Self {
         Self {
-            radius_px: 24,
+            brush: MaskBrush::default(),
             hardness: 0.99,
             blend_colors: true,
             strict_pixel_painting: false,
-            min_radius_px: 1,
-            max_radius_px: 200,
-            wheel_step_px: 2,
-            wheel_accum: 0.0,
-            space_pan_active: false,
+            pan_active: false,
             scratch: None,
         }
     }
@@ -391,16 +368,11 @@ impl Default for BrushToolBase {
 
 impl BrushToolBase {
     pub fn radius_px(&self) -> usize {
-        self.radius_px
+        self.brush.radius_px()
     }
 
     pub fn set_radius_px(&mut self, radius_px: usize) -> bool {
-        let next = radius_px.clamp(self.min_radius_px, self.max_radius_px);
-        if next == self.radius_px {
-            return false;
-        }
-        self.radius_px = next;
-        true
+        self.brush.set_radius_px(radius_px)
     }
 
     pub fn hardness(&self) -> f32 {
@@ -440,65 +412,18 @@ impl BrushToolBase {
         true
     }
 
-    pub fn handle_wheel(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        if !modifiers.shift {
-            self.wheel_accum = 0.0;
-            return false;
-        }
-        if delta_y.abs() <= f32::EPSILON {
-            return true;
-        }
-        const WHEEL_NOTCH: f32 = 40.0;
-        self.wheel_accum += delta_y;
-
-        let steps = (self.wheel_accum / WHEEL_NOTCH).trunc() as isize;
-        if steps == 0 {
-            return true;
-        }
-        self.wheel_accum -= steps as f32 * WHEEL_NOTCH;
-        let next = self.radius_px as isize + steps * self.wheel_step_px as isize;
-        self.set_radius_px(next.max(1) as usize);
-        true
+    /// Applies this frame's shared brush actions (`brush.size` / `brush.smaller` /
+    /// `brush.larger`, active while the tool publishes `BRUSH_ACTIVE`) and notes whether
+    /// `view.pan` is held. Returns whether the radius changed.
+    pub fn apply_input(&mut self, input: &InputFrame) -> bool {
+        self.pan_active = input.mode_active(view::PAN);
+        self.brush.apply_input(input)
     }
 
-    pub fn handle_size_shortcuts(&mut self, ctx: &egui::Context) -> bool {
-        let (minus, equals, plus) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Minus),
-                i.key_pressed(egui::Key::Equals),
-                i.key_pressed(egui::Key::Plus),
-            )
-        });
-        let mut changed = false;
-        if minus {
-            let mut next = ((self.radius_px as f32) * 0.9).floor() as usize;
-            if next >= self.radius_px && self.radius_px > self.min_radius_px {
-                next = self.radius_px.saturating_sub(1);
-            }
-            next = next.max(self.min_radius_px);
-            changed |= self.set_radius_px(next);
-        }
-        if equals || plus {
-            let mut next = ((self.radius_px as f32) * 1.1).ceil() as usize;
-            if next <= self.radius_px && self.radius_px < self.max_radius_px {
-                next = self.radius_px.saturating_add(1);
-            }
-            next = next.min(self.max_radius_px);
-            changed |= self.set_radius_px(next);
-        }
-        changed
-    }
-
-    pub fn set_space_pan_active(&mut self, active: bool) {
-        self.space_pan_active = active;
-    }
-
-    pub fn space_pan_active(&self) -> bool {
-        self.space_pan_active
-    }
-
+    /// Whether the brush stays idle this frame: `view.pan` is held, so a drag pans the canvas and
+    /// no cursor or hover overlay is drawn.
     pub fn should_ignore_drawing(&self) -> bool {
-        self.space_pan_active
+        self.pan_active
     }
 
     pub fn draw_circle_cursor(
@@ -537,8 +462,8 @@ impl BrushToolBase {
         if overlay_w == 0 || overlay_h == 0 {
             return None;
         }
-        let radius_x_scene = self.radius_px as f32 * (page_rect.width() / overlay_w as f32);
-        let radius_y_scene = self.radius_px as f32 * (page_rect.height() / overlay_h as f32);
+        let radius_x_scene = self.brush.radius_px() as f32 * (page_rect.width() / overlay_w as f32);
+        let radius_y_scene = self.brush.radius_px() as f32 * (page_rect.height() / overlay_h as f32);
         Some(((radius_x_scene + radius_y_scene) * 0.5).max(0.5))
     }
 
@@ -596,7 +521,7 @@ impl BrushToolBase {
             return false;
         };
         let expanded_rect =
-            expand_overlay_rect(base_rect, overlay_w, overlay_h, self.radius_px.max(1) + 2);
+            expand_overlay_rect(base_rect, overlay_w, overlay_h, self.brush.radius_px().max(1) + 2);
         let Some(scene_rect) =
             overlay_rect_to_scene_rect(page_scene_rect, overlay_w, overlay_h, expanded_rect)
         else {
@@ -628,7 +553,7 @@ impl BrushToolBase {
     ) -> bool {
         let strict_pixel_painting = self.strict_pixel_painting;
         let paint_margin = self.paint_dirty_margin();
-        let radius_px = self.radius_px.max(1);
+        let radius_px = self.brush.radius_px().max(1);
         let hardness = self.hardness;
         let blend_colors = self.blend_colors;
         let Some(stroke) = self.scratch.as_mut() else {
@@ -737,7 +662,7 @@ impl BrushToolBase {
             y0f - dirty_overlay.y as f32,
             x1f - dirty_overlay.x as f32,
             y1f - dirty_overlay.y as f32,
-            self.radius_px.max(1) as i32,
+            self.brush.radius_px().max(1) as i32,
             self.hardness,
             self.strict_pixel_painting,
         );
@@ -782,7 +707,7 @@ impl BrushToolBase {
     }
 
     fn paint_dirty_margin(&self) -> usize {
-        let radius = self.radius_px.max(1);
+        let radius = self.brush.radius_px().max(1);
         if self.strict_pixel_painting {
             radius
         } else {
@@ -879,19 +804,11 @@ pub struct RegionEditorSession {
     pub status: Option<String>,
     pub zoom: f32,
     pub scroll_id: u64,
+    /// A `view.zoom_drag` claim on the window's view runs (`apply_editor_window_zoom`): the
+    /// preview paints nothing meanwhile.
     pub zoom_drag_active: bool,
+    /// The pointer x the running zoom drag was last applied at.
     pub zoom_drag_last_x: f32,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
-pub struct RegionEditorStrokeSegment {
-    pub from_x: i32,
-    pub from_y: i32,
-    pub to_x: i32,
-    pub to_y: i32,
-    pub erase: bool,
-    pub shift: bool,
 }
 
 impl RegionEditorSession {
@@ -961,6 +878,8 @@ pub struct RegionEditToolBase {
     editor_window_rect: Option<Rect>,
     editor: Option<RegionEditorSession>,
     force_center_after_load: bool,
+    /// The binding texts of the selection hints (`set_input_labels`).
+    labels: Arc<CleaningLabels>,
 }
 
 impl RegionEditToolBase {
@@ -990,6 +909,7 @@ impl RegionEditToolBase {
             editor_window_rect: None,
             editor: None,
             force_center_after_load: false,
+            labels: Arc::default(),
         }
     }
 
@@ -1032,30 +952,49 @@ impl RegionEditToolBase {
         Ok(())
     }
 
-    /// Decides whether a primary drag on the canvas starts a region selection.
-    ///
-    /// Shift+ЛКМ is the ordinary gesture, and it stays the ONLY one while nothing is armed:
-    /// a plain primary drag belongs to whatever else the tool does with it.
-    ///
-    /// While a DIVERSION is armed ([`RegionEditToolBase::set_selection_diverted`]) a PLAIN
-    /// primary drag starts the selection too. Arming is already an explicit statement of
-    /// intent — the user pressed a button that says "the next selection is mine" — so
-    /// demanding an undocumented modifier on top of it drops the gesture with no feedback at
-    /// all: a plain drag is inert on a region-edit tool (the canvas pans only with Space held,
-    /// `ms-canvas/src/scene.rs` `space_pan_drag_enabled`, and the cleaning tab claims no
-    /// Shift-drag hook), so accepting it while armed steals nothing from any other gesture.
+    /// The contexts this base publishes: [`input::EDITOR_WINDOW`] while its editor window is open
+    /// (the window's own gestures, no canvas selection, no Esc cancel); otherwise
+    /// [`input::REGION_SELECT`] (`select_mode` + drag selects, Esc cancels), plus
+    /// [`input::REGION_ARMED`] while a diversion is armed (a plain drag selects too: arming is
+    /// already the statement of intent the selection mode stands for elsewhere).
     #[must_use]
-    pub fn wants_primary_stroke(&self, point: StrokePoint) -> bool {
-        point.modifiers.shift || self.selection_diverted
+    pub fn input_contexts(&self) -> Vec<ContextId> {
+        if self.has_open_editor() {
+            return vec![input::EDITOR_WINDOW];
+        }
+        let mut contexts = vec![input::REGION_SELECT];
+        if self.selection_diverted {
+            contexts.push(input::REGION_ARMED);
+        }
+        contexts
+    }
+
+    /// Whether this frame's `cleaning.region.cancel` fired (the command is active only while the
+    /// base publishes `REGION_SELECT`). The owning tool decides what a cancel drops besides the
+    /// selection.
+    #[must_use]
+    pub fn cancel_fired(input: &InputFrame) -> bool {
+        input.fired(input::REGION_CANCEL).is_some()
+    }
+
+    /// Stores the binding texts the selection hints name.
+    pub fn set_input_labels(&mut self, labels: &Arc<CleaningLabels>) {
+        self.labels = Arc::clone(labels);
+    }
+
+    /// The binding texts last stored by [`Self::set_input_labels`].
+    #[must_use]
+    pub fn labels(&self) -> &CleaningLabels {
+        &self.labels
     }
 
     /// Routes the NEXT finished selection to the owning tool instead of to the region editor.
     ///
     /// The drag itself keeps its rubber band, its clamping and its multiple-snapping, and on
     /// release the rect is parked in [`take_diverted_selection`] instead of becoming a pending
-    /// load. It also becomes EASIER TO START: while a diversion is armed a plain primary drag
-    /// selects as well as Shift+ЛКМ does, because arming is already the statement of intent
-    /// that Shift stands for elsewhere (see [`RegionEditToolBase::wants_primary_stroke`]).
+    /// load. It also becomes EASIER TO START: while a diversion is armed the base publishes
+    /// `REGION_ARMED`, under which a plain drag selects as well as the selection-mode drag does
+    /// (`cleaning.region.select_rect_armed`, see [`RegionEditToolBase::input_contexts`]).
     /// Nothing downstream then fires: no loader job, no
     /// modal «Подготовка выделения» window, no editor, no `load_error`, no cursor change. That
     /// is the whole point: a tool that wants the RECTANGLE and not the editor would otherwise
@@ -1123,18 +1062,24 @@ impl RegionEditToolBase {
         self.selection_refusal.take()
     }
 
-    /// The localized hint naming the gesture that starts a selection IN THE CURRENT STATE.
+    /// The localized hint naming the gesture that starts a selection IN THE CURRENT STATE, from
+    /// the current bindings.
     ///
-    /// Must track [`RegionEditToolBase::wants_primary_stroke`] exactly: a hint that names a
-    /// gesture the tool refuses sends the user to do something that does nothing, which is the
-    /// defect this pair exists to close.
+    /// Must track [`RegionEditToolBase::input_contexts`] exactly: a hint that names a gesture the
+    /// tool refuses sends the user to do something that does nothing, which is the defect this
+    /// pair exists to close.
     #[must_use]
     pub fn selection_hint(&self) -> String {
         if self.selection_diverted {
-            t!("cleaning.region.selection_hint_armed").to_string()
+            tf!("cleaning.region.select_armed_gesture_hint", armed = self.labels.select_rect_armed, gesture = self.labels.select_rect)
         } else {
-            t!("cleaning.region.selection_hint").to_string()
+            tf!("cleaning.region.select_gesture_hint", gesture = self.labels.select_rect)
         }
+    }
+
+    /// The gesture text a refusal names: the selection gesture accepted in the current state.
+    fn selection_gesture_label(&self) -> &str {
+        if self.selection_diverted { &self.labels.select_rect_armed } else { &self.labels.select_rect }
     }
 
     pub fn begin_selection(&mut self, canvas: &CanvasView, point: StrokePoint) {
@@ -1177,7 +1122,7 @@ impl RegionEditToolBase {
             // different user-facing stories. Re-asking the canvas is cheap and is the only way
             // to tell them apart without threading an error type through the two callers that
             // legitimately ignore it (`begin_selection`, `update_selection`).
-            let reason = no_selection_reason(canvas.page_scene_rect(page_idx).is_some(), page_idx);
+            let reason = no_selection_reason(canvas.page_scene_rect(page_idx).is_some(), page_idx, self.selection_gesture_label());
             ms_log::runtime_log::log_warn(format!(
                 "[cleaning] region selection on page {page_idx} produced no rectangle: {reason}"
             ));
@@ -1248,12 +1193,6 @@ impl RegionEditToolBase {
         self.force_center_after_load = false;
     }
 
-    pub fn editor_window_contains(&self, pointer_pos: Pos2) -> bool {
-        self.editor_window_rect
-            .as_ref()
-            .is_some_and(|rect| rect.contains(pointer_pos))
-    }
-
     pub fn has_open_editor(&self) -> bool {
         self.editor.is_some()
     }
@@ -1261,12 +1200,13 @@ impl RegionEditToolBase {
     /// Draws the selection hints of the region base, naming the gesture that is actually
     /// accepted IN THE CURRENT STATE.
     ///
-    /// While a diversion is armed a plain ЛКМ drag selects as well
-    /// ([`RegionEditToolBase::wants_primary_stroke`]), so the hint must say so then and must
-    /// NOT say so otherwise — a hint that names a gesture the tool refuses is worse than none.
+    /// While a diversion is armed a plain drag selects as well
+    /// ([`RegionEditToolBase::input_contexts`]), so the hint must say so then and must NOT say
+    /// so otherwise — a hint that names a gesture the tool refuses is worse than none. Every
+    /// binding text comes from the current bindings (`set_input_labels`).
     pub fn draw_ui_hint(&self, ui: &mut egui::Ui) {
         ui.label(self.selection_hint());
-        ui.small(t!("cleaning.region.esc_cancel_hint"));
+        ui.small(tf!("cleaning.region.cancel_key_hint", key = self.labels.region_cancel));
         if let Some(mult) = self.selection_multiple
             && mult > 1
         {
@@ -1363,88 +1303,19 @@ impl RegionEditToolBase {
             .show(ui, add_contents);
     }
 
-    #[allow(dead_code)]
-    pub fn draw_region_editor_image_with_stroke_input<OnStroke>(
-        ui: &mut egui::Ui,
-        editor: &mut RegionEditorSession,
-        last_drag_px: &mut Option<(i32, i32)>,
-        mut on_stroke: OnStroke,
-    ) where
-        OnStroke: FnMut(&mut RegionEditorSession, RegionEditorStrokeSegment) -> bool,
-    {
-        Self::ensure_region_editor_texture(editor, ui.ctx());
-        let preview_size = editor.zoomed_image_size();
-        let scroll_id = editor.scroll_id;
-        Self::draw_region_editor_scroll_area(ui, scroll_id, preview_size, |ui| {
-            let Some(texture) = editor.texture.as_ref() else {
-                return;
-            };
-            let response = ui.add(
-                egui::Image::new((texture.id(), preview_size)).sense(egui::Sense::click_and_drag()),
-            );
-
-            let (primary_down, secondary_down, mods, z_down) = ui.ctx().input(|i| {
-                (
-                    i.pointer.primary_down(),
-                    i.pointer.secondary_down(),
-                    i.modifiers,
-                    i.key_down(egui::Key::Z),
-                )
-            });
-            let zoom_modifier_down = mods.ctrl || mods.command || z_down;
-            if zoom_modifier_down || editor.zoom_drag_active {
-                *last_drag_px = None;
-            }
-
-            let mut painted = false;
-            let mut base_image_changed = false;
-            if let Some(pointer_pos) = response.interact_pointer_pos()
-                && response.rect.contains(pointer_pos)
-                && (primary_down || secondary_down)
-                && !zoom_modifier_down
-                && !editor.zoom_drag_active
-            {
-                let (to_x, to_y) =
-                    scene_pointer_to_image_px(pointer_pos, response.rect, editor.image.size);
-                let (from_x, from_y) = last_drag_px.unwrap_or((to_x, to_y));
-                let erase = secondary_down && !primary_down;
-                base_image_changed |= on_stroke(
-                    editor,
-                    RegionEditorStrokeSegment {
-                        from_x,
-                        from_y,
-                        to_x,
-                        to_y,
-                        erase,
-                        shift: mods.shift,
-                    },
-                );
-                *last_drag_px = Some((to_x, to_y));
-                painted = true;
-            }
-
-            if painted {
-                if base_image_changed {
-                    editor.texture_dirty = true;
-                }
-                ui.ctx().request_repaint();
-            }
-
-            if !(primary_down || secondary_down) {
-                *last_drag_px = None;
-            }
-        });
-    }
-
     /// General region-editor frame for a tool that owns its window body but wants
     /// the shared footer: `draw_editor` fills the body, then the status line and
     /// the Отмена/Применить row are appended. Apply inserts `editor.image` back
     /// into the page overlay through `CanvasView::replace_overlay_region_px`.
+    // All parameters are distinct per-frame inputs of the window pass; grouping would hide which
+    // one a caller supplies.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_overlay_ui<OnOpen, DrawEditor>(
         &mut self,
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
         window_title: &str,
         on_open: OnOpen,
         mut draw_editor: DrawEditor,
@@ -1456,6 +1327,7 @@ impl RegionEditToolBase {
             ctx,
             canvas,
             project,
+            input,
             window_title,
             on_open,
             |ui, editor, request_close, apply_clicked| {
@@ -1477,11 +1349,18 @@ impl RegionEditToolBase {
         );
     }
 
+    /// The window pass: starts / polls the region load, shows the loading window or the editor
+    /// window (`draw_window` fills its body), publishes the editor window's view surface and
+    /// applies the shared `view.*` zoom aimed at it (`input`), then applies or closes.
+    // All parameters are distinct per-frame inputs of the window pass; grouping would hide which
+    // one a caller supplies.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_overlay_ui_custom<OnOpen, DrawWindow>(
         &mut self,
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
         window_title: &str,
         mut on_open: OnOpen,
         mut draw_window: DrawWindow,
@@ -1531,7 +1410,18 @@ impl RegionEditToolBase {
             if let Some(resp) = shown {
                 let window_rect = resp.response.rect;
                 self.editor_window_rect = Some(window_rect);
-                Self::handle_region_editor_zoom_input(ctx, editor, window_rect);
+                let view = input::editor_window_view_id(&self.window_id);
+                // The window is a view of its own: the router aims the shared zoom keys, Ctrl+wheel
+                // and the zoom drag at it while the pointer is over it. Its own layer is the
+                // capture layer, so the window does not occlude itself; published after the
+                // canvas, so it wins where both contain the pointer.
+                ms_input::publish_view_surface(
+                    ctx,
+                    ViewSurface { id: view, rect: window_rect, holes: Vec::new(), capture_layer: Some(resp.response.layer_id), primary: false, touch_owner: None },
+                );
+                if apply_editor_window_zoom(ctx, input, editor, view) {
+                    ctx.request_repaint();
+                }
             }
         } else if let Some(pending_job_id) = self.pending_job_id {
             let viewport = ctx.content_rect();
@@ -1602,102 +1492,6 @@ impl RegionEditToolBase {
             self.editor = None;
             self.editor_window_rect = None;
             self.force_center_after_load = false;
-        }
-    }
-
-    fn handle_region_editor_zoom_input(
-        ctx: &egui::Context,
-        editor: &mut RegionEditorSession,
-        window_rect: Rect,
-    ) {
-        let (mods, hover_pos, interact_pos, z_down, primary_down, wheel_delta_y) = ctx.input(|i| {
-            (
-                i.modifiers,
-                i.pointer.hover_pos(),
-                i.pointer.interact_pos(),
-                i.key_down(egui::Key::Z),
-                i.pointer.primary_down(),
-                // Raw wheel: stays non-zero under Ctrl/Cmd (egui zeroes
-                // `smooth_scroll_delta` there, diverting the wheel into zoom).
-                ms_widgets::input_util::raw_wheel_delta(i).y,
-            )
-        });
-        let ctrl_or_command = mods.ctrl || mods.command;
-        let zoom_modifier_down = ctrl_or_command || z_down;
-        let pointer_pos = interact_pos.or(hover_pos);
-        let inside_window = pointer_pos
-            .map(|pos| window_rect.contains(pos))
-            .unwrap_or(false);
-        let mut changed = false;
-
-        if inside_window && zoom_modifier_down && wheel_delta_y.abs() > f32::EPSILON {
-            let factor = if wheel_delta_y > 0.0 {
-                REGION_EDITOR_ZOOM_STEP
-            } else {
-                1.0 / REGION_EDITOR_ZOOM_STEP
-            };
-            changed |= editor.scale_zoom(factor);
-            // Keep wheel delta from being interpreted as content scroll in the same frame.
-            ctx.input_mut(|i| {
-                i.smooth_scroll_delta = egui::Vec2::ZERO;
-            });
-        }
-
-        if editor.zoom_drag_active {
-            if !zoom_modifier_down || !primary_down {
-                editor.zoom_drag_active = false;
-            } else if let Some(pos) = pointer_pos {
-                let dx = pos.x - editor.zoom_drag_last_x;
-                if dx.abs() > f32::EPSILON {
-                    let factor = (dx * 0.005).exp().clamp(0.5, 2.0);
-                    changed |= editor.scale_zoom(factor);
-                }
-                editor.zoom_drag_last_x = pos.x;
-            }
-        } else if zoom_modifier_down
-            && primary_down
-            && inside_window
-            && let Some(pos) = pointer_pos
-        {
-            editor.zoom_drag_active = true;
-            editor.zoom_drag_last_x = pos.x;
-        }
-
-        if zoom_modifier_down && inside_window && !ctx.egui_wants_keyboard_input() {
-            let mut zoom_in = false;
-            let mut zoom_out = false;
-            let mut zoom_reset = false;
-            let key_modifiers = [
-                ctrl_or_command.then_some(egui::Modifiers::COMMAND),
-                z_down.then_some(egui::Modifiers::NONE),
-            ];
-            for key_mods in key_modifiers.into_iter().flatten() {
-                let (plus, equals, minus, zero) = ctx.input_mut(|i| {
-                    (
-                        i.consume_key(key_mods, egui::Key::Plus),
-                        i.consume_key(key_mods, egui::Key::Equals),
-                        i.consume_key(key_mods, egui::Key::Minus),
-                        i.consume_key(key_mods, egui::Key::Num0),
-                    )
-                });
-                zoom_in |= plus || equals;
-                zoom_out |= minus;
-                zoom_reset |= zero;
-            }
-            if zoom_reset {
-                changed |= editor.set_zoom(1.0);
-            } else {
-                if zoom_in {
-                    changed |= editor.scale_zoom(REGION_EDITOR_ZOOM_STEP);
-                }
-                if zoom_out {
-                    changed |= editor.scale_zoom(1.0 / REGION_EDITOR_ZOOM_STEP);
-                }
-            }
-        }
-
-        if changed || editor.zoom_drag_active {
-            ctx.request_repaint();
         }
     }
 
@@ -2045,8 +1839,41 @@ impl RegionMaskInpaintToolBase {
         }
     }
 
-    pub fn wants_primary_stroke(&self, point: StrokePoint) -> bool {
-        self.region_base.wants_primary_stroke(point)
+    /// The region base's contexts, plus `BRUSH_ACTIVE` while the mask editor window is open (its
+    /// brush takes the shared size actions).
+    #[must_use]
+    pub fn input_contexts(&self) -> Vec<ContextId> {
+        let mut contexts = self.region_base.input_contexts();
+        if self.has_open_editor() {
+            contexts.push(ms_tools::mask_brush::BRUSH_ACTIVE);
+        }
+        contexts
+    }
+
+    /// This frame's commands: the selection cancel (only while no editor window is open, so Esc
+    /// never wipes a painted mask) and the shared brush-size actions of the mask editor. Returns
+    /// whether anything changed.
+    pub fn apply_input(&mut self, input: &InputFrame) -> bool {
+        let mut changed = false;
+        if RegionEditToolBase::cancel_fired(input) {
+            self.cancel_selection();
+            changed = true;
+        }
+        if self.has_open_editor() {
+            changed |= self.brush_base.apply_input(input);
+        }
+        changed
+    }
+
+    /// Stores the binding texts the hints name.
+    pub fn set_input_labels(&mut self, labels: &Arc<CleaningLabels>) {
+        self.region_base.set_input_labels(labels);
+    }
+
+    /// The binding texts last stored by [`Self::set_input_labels`].
+    #[must_use]
+    pub fn labels(&self) -> &CleaningLabels {
+        self.region_base.labels()
     }
 
     pub fn begin_selection(&mut self, canvas: &CanvasView, point: StrokePoint) {
@@ -2073,12 +1900,16 @@ impl RegionMaskInpaintToolBase {
 
     pub fn draw_ui_hint(&self, ui: &mut egui::Ui) {
         self.region_base.draw_ui_hint(ui);
-        ui.small(t!("cleaning.mask_editor.paint_erase_hint"));
+        let labels = &self.region_base.labels;
+        ui.small(tf!(
+            "cleaning.mask_editor.window_controls_hint",
+            paint = labels.editor_paint,
+            erase = labels.editor_erase,
+            size = labels.brush_size,
+            smaller = labels.brush_smaller,
+            larger = labels.brush_larger
+        ));
         ui.small(t!("cleaning.mask_editor.buttons_hint"));
-    }
-
-    pub fn set_space_pan_active(&mut self, active: bool) {
-        let _ = active;
     }
 
     pub fn set_ai_backend_available(&mut self, available: bool) {
@@ -2089,24 +1920,12 @@ impl RegionMaskInpaintToolBase {
         self.ai_backend_torch_available = available;
     }
 
-    pub fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        self.brush_base.handle_wheel(delta_y, modifiers)
-    }
-
-    pub fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        let mut handled = self.brush_base.handle_size_shortcuts(ctx);
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.cancel_selection();
-            handled = true;
-        }
-        handled
-    }
-
     pub fn draw_overlay_ui<Run>(
         &mut self,
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
         window_title: &str,
         run: Run,
     ) where
@@ -2115,14 +1934,17 @@ impl RegionMaskInpaintToolBase {
             + Sync
             + 'static,
     {
-        self.draw_overlay_ui_custom(ctx, canvas, project, window_title, run, |_ui| {});
+        self.draw_overlay_ui_custom(ctx, canvas, project, input, window_title, run, |_ui| {});
     }
 
+    // All parameters are distinct per-frame inputs of the window pass.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_overlay_ui_custom<Run, DrawCustomUi>(
         &mut self,
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
         window_title: &str,
         run: Run,
         draw_custom_ui: DrawCustomUi,
@@ -2142,6 +1964,7 @@ impl RegionMaskInpaintToolBase {
             ctx,
             canvas,
             project,
+            input,
             window_title,
             run,
             false,
@@ -2149,11 +1972,14 @@ impl RegionMaskInpaintToolBase {
         );
     }
 
+    // All parameters are distinct per-frame inputs of the window pass.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_overlay_ui_custom_with_sample_mask<Run, DrawCustomUi>(
         &mut self,
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
         window_title: &str,
         run: Run,
         draw_custom_ui: DrawCustomUi,
@@ -2173,6 +1999,7 @@ impl RegionMaskInpaintToolBase {
             ctx,
             canvas,
             project,
+            input,
             window_title,
             run,
             true,
@@ -2187,6 +2014,7 @@ impl RegionMaskInpaintToolBase {
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
         window_title: &str,
         run: Arc<RegionInpaintRunFn>,
         sample_mask_enabled: bool,
@@ -2200,10 +2028,12 @@ impl RegionMaskInpaintToolBase {
             &mut self.editor_state,
         );
         let mask_generation = &mut self.mask_generation;
+        let labels = Arc::clone(&region_base.labels);
         region_base.draw_overlay_ui_custom(
             ctx,
             canvas,
             project,
+            input,
             window_title,
             |editor| {
                 if editor.status.is_none() {
@@ -2213,6 +2043,8 @@ impl RegionMaskInpaintToolBase {
             |ui, editor, request_close, apply_clicked| {
                 Self::draw_mask_editor_window(
                     ui,
+                    input,
+                    &labels,
                     editor,
                     brush_base,
                     editor_state,
@@ -2238,10 +2070,6 @@ impl RegionMaskInpaintToolBase {
         self.region_base.draw_cursor(ui, canvas, pointer_scene_pos);
     }
 
-    pub fn editor_window_contains(&self, pointer_pos: Pos2) -> bool {
-        self.region_base.editor_window_contains(pointer_pos)
-    }
-
     pub fn has_open_editor(&self) -> bool {
         self.region_base.has_open_editor()
     }
@@ -2250,6 +2078,8 @@ impl RegionMaskInpaintToolBase {
     #[allow(clippy::too_many_arguments)]
     fn draw_mask_editor_window<Run, DrawCustomUi>(
         ui: &mut egui::Ui,
+        input: &InputFrame,
+        labels: &CleaningLabels,
         editor: &mut RegionEditorSession,
         brush_base: &mut MaskBrush,
         editor_state_slot: &mut Option<RegionInpaintEditorState>,
@@ -2277,9 +2107,6 @@ impl RegionMaskInpaintToolBase {
             Self::ensure_editor_state(editor, editor_state_slot, sample_mask_enabled);
         let mut processing = Self::poll_processing_result(editor, editor_state);
         let mut generating_mask = Self::poll_mask_generation_result(editor, editor_state);
-        if brush_base.handle_size_shortcuts(ui.ctx()) {
-            ui.ctx().request_repaint();
-        }
 
         // The ✓/«скачать» marks come from the backend, so they are fetched lazily:
         // once when the watermark source is first shown, and once more after a run
@@ -2307,7 +2134,7 @@ impl RegionMaskInpaintToolBase {
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(t!("cleaning.mask_editor.paint_erase_short_hint"));
+                    ui.label(tf!("cleaning.mask_editor.paint_erase_controls_hint", paint = labels.editor_paint, erase = labels.editor_erase));
                     let mut radius = brush_base.radius_px();
                     if ui
                         .add(WheelSlider::new(&mut radius, 1..=200).text(t!("cleaning.common.brush_label")))
@@ -2366,7 +2193,7 @@ impl RegionMaskInpaintToolBase {
                 // while the parameter section is folded.
                 mask_generation.draw_progress(ui);
                 draw_custom_ui(ui);
-                Self::draw_mask_editor_image(ui, editor, brush_base, editor_state);
+                Self::draw_mask_editor_image(ui, input, editor, brush_base, editor_state);
 
                 if let Some(status) = editor.status.as_ref() {
                     ui.separator();
@@ -2473,8 +2300,13 @@ impl RegionMaskInpaintToolBase {
         }
     }
 
+    /// The preview of the mask editor window: the region image, the mask layers over it, the
+    /// brush ring, and the `cleaning.editor.paint` / `cleaning.editor.erase` gestures on it
+    /// (resolved from the image's drag `Response` with the chord held at the press; a running
+    /// `view.zoom_drag` of the window paints nothing).
     fn draw_mask_editor_image(
         ui: &mut egui::Ui,
+        input: &InputFrame,
         editor: &mut RegionEditorSession,
         brush_base: &mut MaskBrush,
         editor_state: &mut RegionInpaintEditorState,
@@ -2487,9 +2319,9 @@ impl RegionMaskInpaintToolBase {
             let Some(texture) = editor.texture.as_ref() else {
                 return;
             };
-            let response = ui.add(
-                egui::Image::new((texture.id(), preview_size)).sense(egui::Sense::click_and_drag()),
-            );
+            // Drag-only: a drag-only widget is dragged from the press on (egui
+            // `interaction.rs`), so a click without movement paints a dot, as it always did.
+            let response = ui.add(egui::Image::new((texture.id(), preview_size)).sense(egui::Sense::drag()));
             if let Some(sample_mask_texture) = editor_state.sample_mask_texture.as_ref() {
                 ui.painter().image(
                     sample_mask_texture.id(),
@@ -2507,55 +2339,24 @@ impl RegionMaskInpaintToolBase {
                 );
             }
 
-            let (primary_down, secondary_down, mods, z_down, smooth_scroll) =
-                ui.ctx().input(|i| {
-                    (
-                        i.pointer.primary_down(),
-                        i.pointer.secondary_down(),
-                        i.modifiers,
-                        i.key_down(egui::Key::Z),
-                        i.smooth_scroll_delta,
-                    )
-                });
-            let zoom_modifier_down = mods.ctrl || mods.command || z_down;
-            if zoom_modifier_down || editor.zoom_drag_active {
-                editor_state.last_drag_px = None;
-            }
-
+            let hit = input.gesture_for(&response, &[(input::TARGET_EDITOR_IMAGE, true)]);
+            let stroke = hit.filter(|hit| !editor.zoom_drag_active && matches!(hit.phase, HitPhase::DragStarted | HitPhase::Dragging));
             let mut painted = false;
-            if let Some(pointer_pos) = response.interact_pointer_pos()
+            if let Some(hit) = stroke.as_ref()
+                && let Some(pointer_pos) = response.interact_pointer_pos()
                 && response.rect.contains(pointer_pos)
-                && (primary_down || secondary_down)
-                && !zoom_modifier_down
-                && !editor.zoom_drag_active
             {
-                let (to_x, to_y) =
-                    scene_pointer_to_image_px(pointer_pos, response.rect, editor.image.size);
+                let (to_x, to_y) = scene_pointer_to_image_px(pointer_pos, response.rect, editor.image.size);
                 let (from_x, from_y) = editor_state.last_drag_px.unwrap_or((to_x, to_y));
-                let erase = (secondary_down && !primary_down) || mods.shift;
-                let paint_into_sample = editor_state.sample_mask_enabled
-                    && editor_state.active_mask_target == RegionInpaintMaskTarget::Sample;
+                let erase = hit.action == input::EDITOR_ERASE;
+                let paint_into_sample = editor_state.sample_mask_enabled && editor_state.active_mask_target == RegionInpaintMaskTarget::Sample;
                 if paint_into_sample {
                     if let Some(sample_mask) = editor_state.sample_mask.as_mut() {
-                        brush_base.paint_mask_segment(
-                            sample_mask,
-                            from_x,
-                            from_y,
-                            to_x,
-                            to_y,
-                            erase,
-                        );
+                        brush_base.paint_mask_segment(sample_mask, from_x, from_y, to_x, to_y, erase);
                         editor_state.sample_mask_texture_dirty = true;
                     }
                 } else {
-                    brush_base.paint_mask_segment(
-                        &mut editor_state.mask,
-                        from_x,
-                        from_y,
-                        to_x,
-                        to_y,
-                        erase,
-                    );
+                    brush_base.paint_mask_segment(&mut editor_state.mask, from_x, from_y, to_x, to_y, erase);
                     editor_state.mask_texture_dirty = true;
                 }
                 editor_state.last_drag_px = Some((to_x, to_y));
@@ -2564,20 +2365,8 @@ impl RegionMaskInpaintToolBase {
             if painted {
                 ui.ctx().request_repaint();
             }
-            if !(primary_down || secondary_down) {
+            if stroke.is_none() {
                 editor_state.last_drag_px = None;
-            }
-
-            if response.hovered() {
-                // Shift+wheel adjusts the brush; some backends deliver it as
-                // horizontal scroll, so fall back to the X component.
-                let mut wheel_delta = smooth_scroll.y;
-                if wheel_delta.abs() <= f32::EPSILON {
-                    wheel_delta = smooth_scroll.x;
-                }
-                if mods.shift && !zoom_modifier_down && brush_base.handle_wheel(wheel_delta, mods) {
-                    ui.ctx().request_repaint();
-                }
             }
 
             if let Some(pointer_pos) = response.hover_pos().filter(|p| response.rect.contains(*p)) {
@@ -2867,6 +2656,63 @@ pub(super) fn build_tinted_mask_preview(mask: &egui::ColorImage, rgb: [u8; 3]) -
         out.pixels[idx] = Color32::from_rgba_unmultiplied(rgb[0], rgb[1], rgb[2], preview_alpha);
     }
     out
+}
+
+/// Applies the shared `view.*` zoom aimed at the legacy editor window `view` this frame: the zoom
+/// commands whose focus is the window, the `view.zoom` axis over it (whole wheel notches, and a
+/// trackpad pinch as `exp(delta)` — the canvas' own rule) and its `view.zoom_drag` claim (the canvas' drag law,
+/// `ms_canvas::input::zoom_drag_factor`). The window zooms its preview about the scroll origin, as
+/// it always did. Returns whether the zoom changed or a zoom drag runs (the caller repaints).
+fn apply_editor_window_zoom(ctx: &egui::Context, input: &InputFrame, editor: &mut RegionEditorSession, view_id: ViewId) -> bool {
+    let mut changed = false;
+    for id in [view::ZOOM_IN, view::ZOOM_OUT, view::ZOOM_RESET] {
+        if !input.fired(id).and_then(|fired| fired.focus).is_some_and(|focus| focus.view == view_id) {
+            continue;
+        }
+        changed |= if id == view::ZOOM_RESET {
+            editor.set_zoom(1.0)
+        } else if id == view::ZOOM_IN {
+            editor.scale_zoom(REGION_EDITOR_ZOOM_STEP)
+        } else {
+            editor.scale_zoom(1.0 / REGION_EDITOR_ZOOM_STEP)
+        };
+    }
+    if let Some(sample) = input.axis_for_view(view::ZOOM, view_id) {
+        if sample.steps != 0 {
+            changed |= editor.scale_zoom(ms_canvas::input::wheel_zoom_factor(sample.steps));
+        } else if pinch_this_frame(ctx) {
+            changed |= editor.scale_zoom(sample.delta.exp());
+        }
+    }
+    match input.claimed(view_id).filter(|claim| claim.action == view::ZOOM_DRAG) {
+        Some(claim) => match claim.phase {
+            GesturePhase::Started | GesturePhase::Active => {
+                // A new drag measures from its press point; one already running from where it
+                // was applied last.
+                if claim.phase == GesturePhase::Started || !editor.zoom_drag_active {
+                    editor.zoom_drag_last_x = if claim.phase == GesturePhase::Started { claim.origin.x } else { claim.current.x };
+                }
+                let dx = claim.current.x - editor.zoom_drag_last_x;
+                if dx.abs() > f32::EPSILON {
+                    changed |= editor.scale_zoom(ms_canvas::input::zoom_drag_factor(dx));
+                }
+                editor.zoom_drag_last_x = claim.current.x;
+                editor.zoom_drag_active = true;
+            }
+            GesturePhase::Finished(_) => editor.zoom_drag_active = false,
+        },
+        None => editor.zoom_drag_active = false,
+    }
+    changed || editor.zoom_drag_active
+}
+
+/// Whether this frame holds a trackpad pinch (`Event::Zoom`), read without consuming: a
+/// `view.zoom` sample carries no source, and a pinch is the only one with `steps == 0` worth
+/// applying (a sub-notch wheel accumulates into later steps). The same rule as the canvas'
+/// `pinch_this_frame` (crate-private there). Removal condition: `ms_input::AxisSample` gains its
+/// source.
+fn pinch_this_frame(ctx: &egui::Context) -> bool {
+    ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Zoom(_))))
 }
 
 fn region_editor_target_window_size(content_size: egui::Vec2, max_size: egui::Vec2) -> egui::Vec2 {
@@ -3193,11 +3039,12 @@ fn source_rect_to_scene_rect(
 ///
 /// Split out of `end_selection` so both messages can be pinned by a test: producing the
 /// collapsed-rect case needs a page laid out by `ms-canvas`, whose scene rects a unit test of
-/// this crate cannot build.
+/// this crate cannot build. `gesture` is the binding text of the selection gesture the collapsed
+/// case tells the user to repeat.
 #[must_use]
-fn no_selection_reason(page_laid_out: bool, page_idx: usize) -> String {
+fn no_selection_reason(page_laid_out: bool, page_idx: usize, gesture: &str) -> String {
     if page_laid_out {
-        t!("cleaning.region.empty_selection_error").to_string()
+        tf!("cleaning.region.no_rectangle_error", gesture = gesture)
     } else {
         tf!("cleaning.region.page_not_found_error", page_idx = page_idx)
     }
@@ -4037,80 +3884,43 @@ mod tests {
         assert!(base.take_diverted_selection().is_none());
     }
 
-    /// One primary drag with no modifier held, as the cleaning tab delivers it.
+    /// One stroke point, as the cleaning tab's stroke driver delivers it.
     fn plain_point() -> StrokePoint {
-        StrokePoint {
-            page_idx: 0,
-            scene_pos: Pos2::new(10.0, 10.0),
-            modifiers: StrokeModifiers::default(),
-        }
+        StrokePoint { page_idx: 0, scene_pos: Pos2::new(10.0, 10.0), modes: StrokeModes::default() }
     }
 
-    /// The same drag with Shift held.
-    fn shift_point() -> StrokePoint {
-        StrokePoint {
-            page_idx: 0,
-            scene_pos: Pos2::new(10.0, 10.0),
-            modifiers: StrokeModifiers {
-                shift: true,
-                ctrl: false,
-            },
-        }
-    }
-
-    /// THE BUG: a plain drag while a reservation is armed must start the selection. Armed, the
-    /// button the user just pressed IS the statement of intent, and the Shift gate turned the
-    /// drag into a no-op with no rubber band, no pan and no message.
-    ///
-    /// The other half is the REGRESSION guard, and it is why the change sits behind the
-    /// diversion flag: `base.rs` is shared by every region-edit cleaning tool, and an
-    /// un-armed plain drag must still be refused exactly as before.
+    /// THE BUG this guards: a plain drag while a reservation is armed must start the selection.
+    /// Armed, the button the user just pressed IS the statement of intent, so the base publishes
+    /// `REGION_ARMED` (the plain-drag selection) next to `REGION_SELECT` (the selection-mode drag).
+    /// The other half is the REGRESSION guard: un-armed, only `REGION_SELECT` is published, and an
+    /// open editor window takes the canvas selection away entirely.
     #[test]
-    fn an_armed_plain_drag_selects_and_an_unarmed_one_still_does_not() {
+    fn an_armed_reservation_publishes_the_plain_drag_selection() {
         let mut base = RegionEditToolBase::new("test.gate", None);
-        assert!(
-            !base.wants_primary_stroke(plain_point()),
-            "with nothing armed a plain drag must not start a selection"
-        );
-        assert!(base.wants_primary_stroke(shift_point()));
-
+        assert_eq!(base.input_contexts(), vec![input::REGION_SELECT], "with nothing armed only the selection-mode drag selects");
         base.set_selection_diverted(true);
-        assert!(
-            base.wants_primary_stroke(plain_point()),
-            "an armed reservation must accept a plain ЛКМ drag"
-        );
-        assert!(
-            base.wants_primary_stroke(shift_point()),
-            "Shift keeps working while armed"
-        );
-
+        assert_eq!(base.input_contexts(), vec![input::REGION_SELECT, input::REGION_ARMED]);
         base.set_selection_diverted(false);
-        assert!(
-            !base.wants_primary_stroke(plain_point()),
-            "letting the reservation go restores the Shift-only gate"
-        );
+        assert_eq!(base.input_contexts(), vec![input::REGION_SELECT], "letting the reservation go restores the gate");
     }
 
-    /// The hint must name the gesture the tool ACTUALLY accepts in that state — a hint naming a
-    /// gesture the tool refuses is what sent the user to drag with nothing happening.
+    /// The hint must name the gesture the tool ACTUALLY accepts in that state, from the current
+    /// bindings — a hint naming a gesture the tool refuses is what sent the user to drag with
+    /// nothing happening.
     #[test]
     fn the_hint_names_the_gesture_that_is_actually_accepted() {
         let _guard = locale_guard();
+        let labels = Arc::new(CleaningLabels::from_registry(&crate::input::test_support::registry()));
         let mut base = RegionEditToolBase::new("test.hint", None);
-        assert_eq!(base.selection_hint(), t!("cleaning.region.selection_hint"));
+        base.set_input_labels(&labels);
+        assert_eq!(base.selection_hint(), tf!("cleaning.region.select_gesture_hint", gesture = labels.select_rect));
+        assert!(base.selection_hint().contains("Shift+LMB drag"), "{}", base.selection_hint());
         base.set_selection_diverted(true);
-        assert_eq!(
-            base.selection_hint(),
-            t!("cleaning.region.selection_hint_armed")
-        );
-        assert_ne!(
-            t!("cleaning.region.selection_hint_armed"),
-            "cleaning.region.selection_hint_armed",
-            "the armed hint must exist in the catalog, not fall back to its own key"
-        );
-        // Both hints are drawn by `draw_ui_hint`, which is the only caller.
+        let armed = base.selection_hint();
+        assert_eq!(armed, tf!("cleaning.region.select_armed_gesture_hint", armed = labels.select_rect_armed, gesture = labels.select_rect));
+        assert!(armed.contains("LMB drag") && armed.contains("Shift+LMB drag"), "{armed}");
         base.set_selection_diverted(false);
-        assert_ne!(base.selection_hint(), t!("cleaning.region.selection_hint_armed"));
+        assert_ne!(base.selection_hint(), armed);
     }
 
     /// A finished drag that produced NO rectangle is REFUSED WITH A REASON, never dropped in
@@ -4157,15 +3967,12 @@ mod tests {
     #[test]
     fn a_collapsed_rect_and_a_missing_page_read_differently() {
         let _guard = locale_guard();
-        let collapsed = no_selection_reason(true, 4);
-        let missing = no_selection_reason(false, 4);
+        let collapsed = no_selection_reason(true, 4, "LMB drag");
+        let missing = no_selection_reason(false, 4, "LMB drag");
         assert!(!collapsed.is_empty() && !missing.is_empty());
         assert_ne!(collapsed, missing);
-        assert_eq!(collapsed, t!("cleaning.region.empty_selection_error"));
-        assert_ne!(
-            collapsed, "cleaning.region.empty_selection_error",
-            "the reason must exist in the catalog, not fall back to its own key"
-        );
+        assert_eq!(collapsed, tf!("cleaning.region.no_rectangle_error", gesture = "LMB drag"));
+        assert!(collapsed.contains("LMB drag"), "the reason names the gesture to repeat: {collapsed}");
     }
 
     /// A selection the size limits refuse must ALSO reach a diverting tool: the region base's

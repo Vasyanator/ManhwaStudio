@@ -5,8 +5,7 @@ UI for Translation panel "Распознавание текста".
 Main types:
 - `OcrPanelOptions`: user OCR options (engine/langs/model/behavior toggles).
 - `OcrPanelActions`: UI actions emitted to tab controller.
-- `FingerOcrSelection`: which OCR a finger long-press drag makes when no OCR
-  modifier is held (persisted per title as `OCR.finger_selection`).
+- `OcrSelectionHints`: the binding texts and held state of the two canvas OCR selections.
 
 Main functions:
 - `draw_ocr_panel`: renders OCR controls and last OCR preview.
@@ -39,9 +38,10 @@ UI specifics:
   row with a "ja/zh/en only" hint and a warning when the MT source language is
   Korean (`OcrPanelModelView::korean_source`). PaddleOCR-VL has a weight-variant
   `WheelComboBox` (`OcrPanelOptions::paddle_vl_model`) above the script restriction.
-- While canvas finger gestures are effective (`finger_gestures_active`), the
-  selection hints gain a finger line and a quick/advanced choice for the finger
-  long-press drag (`OcrPanelOptions::finger_selection`); the mouse hints stay.
+- The selection hints name the bindings of the canvas gestures (`OcrSelectionHints`, from the
+  input registry), finger alternatives included: which OCR a finger long-press drag makes is a
+  binding (`translation.ocr.quick_rect` by default), not a panel setting. A title's stored
+  `OCR.finger_selection` is ignored.
 */
 
 use crate::ocr::{CharReplacementRule, OcrEngine, OcrLoadState, OcrRecognizeResult, external_model_spec};
@@ -55,22 +55,6 @@ use crate::panels::ocr_langs::{
     PADDLEOCR_MAIN_LANGUAGES, lang_label,
 };
 use ms_widgets::{AiButton, AiCaps, AiRequirement, WheelComboBox};
-
-/// The finger hint and the quick/advanced choice for a finger long-press drag; a change sets
-/// `options_changed` so the tab persists it. Radio buttons keep no widget state, so their
-/// localized labels need no `id_salt`.
-fn draw_finger_selection(ui: &mut egui::Ui, options: &mut OcrPanelOptions, actions: &mut OcrPanelActions) {
-    ui.small(t!("translation.ocr_panel.finger_selection_hint"));
-    ui.horizontal_wrapped(|ui| {
-        ui.label(t!("translation.ocr_panel.finger_selection_label"));
-        actions.options_changed |= ui
-            .radio_value(&mut options.finger_selection, FingerOcrSelection::Quick, t!("translation.recognition.quick_title"))
-            .changed();
-        actions.options_changed |= ui
-            .radio_value(&mut options.finger_selection, FingerOcrSelection::Advanced, t!("translation.recognition.advanced_title"))
-            .changed();
-    });
-}
 
 /// Runtime (not `const`) because `t!` is not const; resolves the active catalog value.
 #[must_use]
@@ -110,42 +94,16 @@ pub struct OcrPanelOptions {
     pub replace_chars_enabled: bool,
     pub replace_chars_expanded: bool,
     pub char_replacements: Vec<CharReplacementRuleUi>,
-    /// The OCR a finger long-press drag on a page makes when no OCR modifier is held;
-    /// persisted per title as `OCR.finger_selection`.
-    pub finger_selection: FingerOcrSelection,
 }
 
-/// Which OCR a finger long-press drag on a page makes when no OCR selection modifier is
-/// held (a tablet has no keyboard). A held modifier still decides the kind.
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
-pub enum FingerOcrSelection {
-    /// Quick OCR of the selected rect (the default).
-    #[default]
-    Quick,
-    /// Opens the advanced recognition window on the selected rect.
-    Advanced,
-}
-
-impl FingerOcrSelection {
-    /// The value stored under `OCR.finger_selection` in the title settings.
-    #[must_use]
-    pub const fn settings_key(self) -> &'static str {
-        match self {
-            Self::Quick => "quick",
-            Self::Advanced => "advanced",
-        }
-    }
-
-    /// Parses a stored `OCR.finger_selection` value; `None` for an unknown value (the caller
-    /// keeps the default).
-    #[must_use]
-    pub fn from_settings_key(raw: &str) -> Option<Self> {
-        match raw {
-            "quick" => Some(Self::Quick),
-            "advanced" => Some(Self::Advanced),
-            _ => None,
-        }
-    }
+/// The binding texts and held state of the canvas OCR selections the panel describes
+/// (`crate::input::OCR_QUICK_RECT` / `OCR_ADVANCED_RECT` labels, their modes from the frame).
+#[derive(Debug, Clone, Copy)]
+pub struct OcrSelectionHints<'a> {
+    pub quick_binding: &'a str,
+    pub quick_active: bool,
+    pub advanced_binding: &'a str,
+    pub advanced_active: bool,
 }
 
 /// Editable form of one character-substitution rule shown in the OCR panel.
@@ -209,7 +167,6 @@ impl Default for OcrPanelOptions {
             replace_chars_enabled: true,
             replace_chars_expanded: false,
             char_replacements: default_char_replacements(),
-            finger_selection: FingerOcrSelection::default(),
         }
     }
 }
@@ -402,9 +359,8 @@ fn engine_select_button(
 /// controller's live AI API request state; while it is active the generation status
 /// widget is drawn and its "Stop" sets `OcrPanelActions::stop_generation`. `model` lends
 /// the external-model state of the selected engine (download block, load gating) and
-/// whether the MT source language is Korean (Baberu warning). `finger_gestures_active` (canvas
-/// finger gestures effective: platform AND `General.touch_gestures`) adds the finger hint and
-/// the finger-selection choice under the mouse hints.
+/// whether the MT source language is Korean (Baberu warning). `selection` names the bindings of
+/// the canvas OCR selections and whether their modes are held.
 // Parameters represent distinct required inputs with no natural grouping.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_ocr_panel(
@@ -413,11 +369,7 @@ pub fn draw_ocr_panel(
     options: &mut OcrPanelOptions,
     last_error: Option<&str>,
     last_result: Option<&OcrRecognizeResult>,
-    quick_selection_shortcut: Option<&str>,
-    quick_selection_active: bool,
-    advanced_selection_shortcut: Option<&str>,
-    advanced_selection_active: bool,
-    finger_gestures_active: bool,
+    selection: OcrSelectionHints<'_>,
     generation: &GenerationSnapshot,
     model: OcrPanelModelView<'_>,
 ) -> OcrPanelActions {
@@ -706,30 +658,17 @@ pub fn draw_ocr_panel(
         .checkbox(&mut options.create_bubble, t!("translation.ocr_panel.create_bubble_label"))
         .changed();
     draw_char_replacements(ui, options, &mut actions);
-    let quick_label = match quick_selection_shortcut {
-        Some(shortcut) if !shortcut.is_empty() => {
-            tf!("translation.ocr_panel.quick_recognition_shortcut_hint", shortcut = shortcut)
-        }
-        _ => t!("translation.recognition.quick_title").to_string(),
-    };
-    let advanced_label = match advanced_selection_shortcut {
-        Some(shortcut) if !shortcut.is_empty() => {
-            tf!("translation.ocr_panel.advanced_recognition_shortcut_hint", shortcut = shortcut)
-        }
-        _ => t!("translation.recognition.advanced_title").to_string(),
-    };
-    if quick_selection_active {
+    let quick_label = tf!("translation.ocr_panel.quick_recognition_binding_hint", binding = selection.quick_binding);
+    let advanced_label = tf!("translation.ocr_panel.advanced_recognition_binding_hint", binding = selection.advanced_binding);
+    if selection.quick_active {
         ui.small(tf!("translation.ocr_panel.quick_active_hint", quick_label = quick_label));
     } else {
         ui.small(tf!("translation.ocr_panel.quick_inactive_hint", quick_label = quick_label));
     }
-    if advanced_selection_active {
+    if selection.advanced_active {
         ui.small(tf!("translation.ocr_panel.advanced_active_hint", advanced_label = advanced_label));
     } else {
         ui.small(tf!("translation.ocr_panel.advanced_inactive_hint", advanced_label = advanced_label));
-    }
-    if finger_gestures_active {
-        draw_finger_selection(ui, options, &mut actions);
     }
 
     let button_label = if state == OcrLoadState::Ready {

@@ -195,14 +195,15 @@ The main data flow is:
    read-only: `interact_page_rasters` adds canvas select + rotate drag, and hands a whole-layer MOVE
    (pointer drag as well as arrow-key nudge) to the shared move primitive in `tab/move_layer.rs` — the
    same primitive text overlays use, so both kinds and both input sources share every side effect (see
-   "Layer move" below). Scale is `-`/`=`/`0`; Ctrl/Cmd+wheel ordinary rotation is
-   `try_rotate_selected_raster_by_ctrl_wheel` — rasters have no vector rotation, so it always rotates
-   `transform.rotation` regardless of `RotationCtrlWheelMode`.
+   "Layer move" below). Scale is the `typing.layer.scale_*` commands (`scale_selected_layer`); the
+   wheel rotation (`typing.layer.rotate`, `rotate_selected_layer_by_wheel`) of a raster is
+   ordinary rotation — rasters have no vector rotation, so it always rotates `transform.rotation`
+   regardless of `RotationCtrlWheelMode`.
    The raster selection is `selected_raster_idx` PLUS `selected_raster_page` (kept in lock-step: set
    together in `select_raster`, cleared together everywhere). The page pairing is REQUIRED because
-   `draw_page_overlays` runs once per visible page — the per-page shortcut handlers (rotate/scale/nudge)
-   guard on `selected_raster_page == Some(page_idx)` so one gesture only affects the raster on its own
-   page, not the same bare index on other simultaneously-visible pages. EVERY raster geometry write
+   the same bare raster index exists on every page: the selection commands run once per frame
+   (`tab/input.rs`) on the page `selected_layer_page` names, and the per-page interaction pass guards
+   on `selected_raster_page == Some(page_idx)`. EVERY raster geometry write
    from this tab is DEFERRED off the GUI thread: Ctrl+wheel rotation, keyboard scale, the image-panel
    transform controls and a settled move go through `persist_raster_transform_deferred`, and a settled
    move of a DEFORMED raster through `persist_raster_deform_deferred`. Both route the geometry to the
@@ -438,23 +439,22 @@ saving, and export.
     `preload_all_pages_active` / `preload_all_pages_progress` / `drive_page_preload`).
   - `render_jobs.rs`: background edit/create/raster/shape-variant render jobs, loader/migration start.
   - `persist.rs`: text placement save / staging flush / save-to-project (`flush_text_layers`).
-  - `create_upload.rs`: create/shift-drag UI, text editor, status overlays, texture upload.
-    Finger input: the Shift+drag capture overlay (`shift_drag_capture_layer_id`) is a touch
-    capture layer of the canvas, so a plain finger pans under it; a finger long-press drag opens
-    the same create rectangle WITHOUT Shift (`ms_canvas::drive_touch_drag` onto
-    `create_selection`, marked `touch`; lift commits through `finish_create_selection`, cancel
-    drops it). `tab.rs` sets `CanvasView::set_long_press_selection` before `canvas.draw` with the
-    same gates the overlay hook applies (`touch_create_selection_available`, mask panel closed,
-    layout editor not editing) — the hook itself only gets `&CanvasView`. A finger tap outside
-    the open create editor (`CanvasView::touch_tap`) commits it like a mouse click outside
-    (`create_editor_commit_requested`). The create rectangle takes the finger drag as a parameter
-    (`draw_create_overlay_ui`); a finger moving a layer arrives on the canvas' separate region-drag
-    channel (`touch_layers.rs`) and never reaches it.
+  - `create_upload.rs`: the create rectangle, text editor, status overlays, texture upload.
+    The rectangle is the canvas-wide gesture `typing.create_rect` (see "Input"): the router claims
+    it at the press (mouse under `typing.create_mode`, or the finger long-press drag — its touch
+    alternative, which also turns the canvas touch surface's long-press selection on), the canvas
+    raises its own capture area while it is armed, and `step_create_selection` follows the claim
+    (start on a page, follow, commit on release / modifier release, drop on cancel). A click or a
+    finger tap (`CanvasView::touch_tap`) outside the open create editor commits it
+    (`create_editor_commit_requested`; the click is egui's `clicked_elsewhere` of the editor area —
+    widget semantics, not a binding). A finger moving a layer arrives on the canvas' separate
+    region-drag channel (`touch_layers.rs`) and never reaches it.
   - `touch_layers.rs`: finger input on text layers (text/image overlays), driven once per frame by
     `drive_touch_layer_input` from the canvas' top-left hook — the one hook that runs after the
     canvas took the frame's touch output and before it publishes its surface. A TAP selects the
     layer under it (the selected layer keeps a tap inside its grab area, the mouse's sticky focus;
-    otherwise the topmost by composite order) or deselects (`clear_selection`) when there is none —
+    otherwise the topmost by composite order) or deselects (`clear_selection`) when there is none (a
+    finger tap is not a canvas page click, so this is the finger's own deselect trigger) —
     a raster under the finger counts as none, rasters stay mouse-only; ignored while the create
     editor is open (the tap commits it), the mask panel is open, the eyedropper is active or the
     layout editor owns the canvas. A finger PRESSED on the SELECTED layer and dragged (no hold) moves
@@ -487,17 +487,22 @@ saving, and export.
   - `panels.rs`: the deformation, «Слои» and layout-editor dock tab BODIES, plus the layout
     editor's lifecycle (enter/exit, re-render) and its on-page overlay. No panel of its own —
     the dock owns every frame, header and position.
-  - `autotype.rs`: auto-typing hotkey trigger, job poll, result apply, debug visuals.
+  - `autotype.rs`: the auto-typing command (`typing.layer.autotype`) trigger, job poll, result apply,
+    debug visuals.
+  - `input.rs`: the tab's input set (`declarations`), its contexts (`contexts_for`), the binding
+    labels of its hints (`TypingInputLabelCache`, `typing_hint_rows`) and the ONE command / axis
+    dispatch (`TypingTabState::run_input_frame`); see "Input".
   - `draw_page.rs`: `draw_page_overlays` (master per-page draw) — takes the per-page `PageView`
-    transform plus a `TypingPageInteractionPolicy` snapshot (mask/focus/eyedropper/auto-type/strict-pixel
-    flags + `TypingCenteringAssistConfig`) built in the canvas hook before `text_overlays` is borrowed; its
-    `ctx` comes from `ui.ctx()`. Plus the composite-plan fill order (`merged_fill_plan`,
+    transform, a `TypingPageInteractionPolicy` snapshot (mask/eyedropper/auto-type/strict-pixel
+    flags + `TypingCenteringAssistConfig`) built in the canvas hook before `text_overlays` is borrowed,
+    and this frame's `InputFrame` (layer gestures); its `ctx` comes from `ui.ctx()`. It reads no key.
+    Plus the composite-plan fill order (`merged_fill_plan`,
     `page_fill_plan`, `composited_raster_flags`), repaint/visibility/pixel-snap and centering-assist
     helpers (`draw_centering_assist` takes a `CenteringMarker` + `PageView` + centering config).
   - `move_layer.rs`: the ONE whole-layer MOVE primitive — the move session's lifecycle
     (`begin_layer_move` / `drive_pointer_layer_move` / `add_keyboard_layer_move_step` /
-    `settle_layer_move` / `drive_layer_move_settle`), the single arrow-nudge entry point for both
-    layer kinds (`try_move_selected_layer_by_arrow_shortcuts`, guards included) and the mapping of a
+    `settle_layer_move` / `drive_layer_move_settle`), the single nudge entry point for both
+    layer kinds (`nudge_selected_layer`, called by the input dispatch, guards included) and the mapping of a
     move onto the two geometry stores. Its pure math lives in `mesh_geometry.rs`; see the "Layer move"
     contract below.
   - `vector_transform.rs`: on-canvas VECTOR transform mode for text overlays (Phase 3a + 3b) — seeds a
@@ -820,17 +825,72 @@ saving, and export.
 - `rotation_ctrl_wheel`: app-wide runtime-global (`RotationCtrlWheelMode` Vector/Raster,
   default Vector) selecting how the Ctrl+wheel gesture rotates a selected overlay. Config-free;
   seeded at startup from `TextTab.rotation_ctrl_wheel_mode`, written by the settings "Тайп" pane,
-  read by the overlay Ctrl+wheel handler in `tab/selection_rasters.rs`. The module itself lives at
+  read by the overlay wheel rotation (`typing.layer.rotate`) in `tab/selection_rasters.rs`. The module itself lives at
   the `ms-config` crate (re-exported as `ms_config::rotation_ctrl_wheel`) because the config default
   tree reads its default; `lib.rs`
-  re-exports it, so `ms_config::rotation_ctrl_wheel::…` stays the path callers use. Only text-overlay rotation consults the mode; raster Ctrl+wheel rotation
-  (`try_rotate_selected_raster_by_ctrl_wheel`) ignores it and always uses ordinary rotation.
+  re-exports it, so `ms_config::rotation_ctrl_wheel::…` stays the path callers use. Only text-overlay rotation consults the mode; raster wheel rotation
+  (`rotate_selected_raster_by_wheel`) ignores it and always uses ordinary rotation.
 - `render_next`: text rendering subsystem, the `ms-text-render` crate re-exported as
   `render_next` (by `lib.rs`). Its public contract is `render_next::types::*` plus
   `render_next::render_text_to_image`; callers in this directory should treat its layout,
   wrap, raster, formula, and effects modules as renderer internals.
 - `segmentation`: re-exported from the `ms-text-util` crate (line/unit segmentation used by
   the renderer's wrap path and the panel's form preview).
+
+## Input
+The tab reads NO key, modifier or wheel itself: the studio's `InputRouter::begin_frame` decides
+everything before any tab draws; `TypingDrawParams::{input, input_registry}` hand the frame and the
+registry to `draw`. Everything is declared in `tab/input.rs` (ids are persistence keys):
+- **Tab** (`Scope::Tab(Typing)`): commands `typing.toggle_clean` (C) and
+  `typing.toggle_centering_assist` (H) outside the layout editor; mode `typing.create_mode` (Shift)
+  and the canvas-wide gesture `typing.create_rect` on `view.surface` ([create_mode]+LMB drag, or a
+  finger long-press drag; needs `typing.create_available`); axis `typing.font_size` (Shift+wheel,
+  Shift+horizontal wheel; needs `typing.font_size_target` and the pointer on the canvas); the layer
+  gestures on the layer targets, by priority `centering_corner` 95 > `width_tick` 90 >
+  `deform_handle` 85 > `brush` 80 > `rotate_handle` 75 > `body` 60: `typing.layer.{select (LMB click),
+  menu (RMB click), move, resize_centering, set_width, deform, deform_brush, rotate_drag}` (LMB drags).
+  Overlays, rasters and the vector-transform pass share these actions and targets.
+- **Sub `typing.layer_selected`** (+ `.text` for an overlay, `.rotatable` outside transform modes):
+  `typing.layer.{autotype V, delete Del, duplicate Ctrl+D}` (overlay), `typing.layer.{scale_up
+  (= / Shift+= / +), scale_down (-), scale_reset (0)}`, `typing.layer.nudge_{left,right,up,down}`
+  (arrows, auto-repeat, 1 px) and `nudge_fast_*` (Shift+arrows, 5 px), and the axis
+  `typing.layer.rotate` (Ctrl+wheel, pointer on the canvas) — it SHADOWS only the Ctrl alternative of
+  `view.zoom`, so Ctrl+= / Z+wheel / Ctrl+drag / pinch keep zooming with a layer selected, and the
+  tab never blocks canvas zoom.
+- **Sub `typing.layout_editor.editing`**: `typing.layout.delete_point` (Del), mode
+  `typing.layout.extend_mode` (Shift), gestures `add_point` (click in the frame, empty line),
+  `append_point` ([extend]+click / drag on the last point), `move_point` (drag on a point),
+  `resize_frame` (drag on a frame handle); targets `typing.layout.{handle 90, last_point 75,
+  point 70, frame 20}`.
+- **Sub `typing.mask_edit`** (+ the shared `brush.active`, so the mask brush takes `brush.size` /
+  `brush.smaller` / `brush.larger` through `MaskBrush::apply_input`): mode `typing.mask.erase_mode`
+  (Shift), gestures `typing.mask.{paint (LMB drag), erase (RMB drag / [erase]+LMB drag), fill (LMB
+  click)}` on `typing.mask.page`. The brush senses drags only (a press paints a dot), fill mode clicks
+  only; a stroke paints or erases as decided at its press.
+- **Contexts** (`StudioTab::input_contexts` = the canvas's + `contexts_for(input_state)` + the brush
+  context while the mask is open). The layer contexts hold only while no mask is edited and no
+  layout editor is open; the declared exclusive groups `[layer_selected, layout_editing,
+  brush.active]` and `[layer_selected, layout_editing, mask_edit]` rely on that.
+- **Dispatch** (`run_input_frame`, before `canvas.draw`): commands and axes act once per frame on
+  the selected layer, on the page `selected_layer_page` names as the canvas drew it last frame
+  (nothing happens while that page is not drawn). No per-page key handler exists. Structural
+  commands (delete / duplicate) run last there.
+- **Deselect has ONE decision** (`selection_rasters::empty_click_deselects` + `deselect_by_empty_click`):
+  triggered by `CanvasHooks::on_page_click` (a `canvas.page.click` that reached the page row) and by a
+  select click that landed on a layer widget's bounding rect but on no part of the layer (overlay and
+  raster passes). Gates: mask / layout editor / eyedropper / a layer claimed the pointer / a popup
+  was open. A finger tap deselects through `touch_layers.rs`.
+- **Hints** come from registry labels (`TypingInputLabelCache`, rebuilt on a registry revision or a
+  locale change, pushed to the panel, the layer menus and the mask tab).
+- **Raw reads that remain, and why**: `input::nudge_keys_held` (TRANSITIONAL: `InputFrame` cannot
+  report "the command's key is still held", which keeps ONE keyboard move session across the OS
+  repeat delay; it reads the keys of the nudge commands' current bindings; removal: `ms-input`
+  answers "command held"); the layer gesture button level (`layer_gesture_button_down`: drag
+  continuation / pointer settle by the button the gesture's binding named); the sticky-frame click
+  (`draw_page.rs::click_in_selected_frame`) and the text-vs-raster topmost gate
+  (`interact_page_rasters`) read egui's primary click — hit-testing glue that assumes
+  `typing.layer.select` stays on the left button; widget-owned: the create editor's focus restore,
+  the horizontal param strips' wheel (`panel/ui_helpers.rs`), every TextEdit / Wheel widget.
 
 ## Contracts and invariants
 - GUI code must not block on rendering, file I/O, image decode, mask save/load, mask
@@ -856,7 +916,7 @@ saving, and export.
   hash of its key; `widgets::font_preview::combo_font_family_name` is the same pattern for the
   panel combos (a distinct prefix — the two content discriminants are different quantities).
 - **Layer move: ONE primitive, two input sources, two layer kinds** (`tab/move_layer.rs`). Translating
-  a layer — text/image overlay or raster, by pointer drag or by arrow keys — is a single *move session*
+  a layer — text/image overlay or raster, by pointer drag or by the nudge commands — is a single *move session*
   (`TypingLayerMoveSession`, at most one open). Nothing else may move a layer: rotation, deform-handle,
   brush and vector-warp drags are NOT moves and keep their own drag states and settle blocks.
   - **The delta is applied to the session BASE, never incrementally to the live geometry.** The base is
@@ -875,12 +935,14 @@ saving, and export.
     settles on `Released`, drops it and restores the geometry on `Cancelled`, and settles it as a
     lift when a frame reports no drag (the end was lost).
   - **A keyboard gesture ends by HELD keys, not by key events.** `drive_layer_move_settle` settles a
-    `Keyboard` session on the first frame where `key_down` reports no arrow held (level-triggered, so
-    OS key-repeat gaps do not split one hold into many gestures, and egui's focus-loss clearing of
-    `keys_down` ends a session left open by an alt-tab). A `Pointer` session settles when the primary
-    button is up. `wants_repaint()` includes `move_session.is_some()`, or the release frame might never
+    `Keyboard` session on the first frame where no key bound to a nudge command is held
+    (`input::nudge_keys_held`, read from the registry's current bindings; level-triggered, so OS
+    key-repeat gaps do not split one hold into many gestures, and egui's focus-loss clearing of
+    `keys_down` ends a session left open by an alt-tab). A `Pointer` session settles when the pointer
+    button that started its gesture (`layer_gesture_button`, recorded from the gesture's binding) is
+    up. `wants_repaint()` includes `move_session.is_some()`, or the release frame might never
     be drawn and the write would strand.
-  - **Exactly ONE settle site**: `TypingTabState::draw` calls `drive_layer_move_settle(ctx)` once per
+  - **Exactly ONE settle site**: `TypingTabState::draw` calls `drive_layer_move_settle(ctx, registry)` once per
     frame AFTER `canvas.draw`, immediately before `drive_placement_save_debounce` — same reasoning as
     the debounce tick, since the move is applied inside `canvas.draw`'s callees. Settling elsewhere is
     limited to the interruptions that would otherwise drop the write: `clear_selection`,
@@ -921,11 +983,12 @@ saving, and export.
     published by the next `drive_layer_move_settle`, which has a `Context`), and is retried by
     `retry_failed_raster_page_saves` at FLUSH POINTS only — never per frame. A queue that can never
     drain (the tab is no longer wired to a chapter) is dropped loudly instead of carried.
-  - **Guards run before any key is consumed**, so a rejected gesture leaves the arrows to their real
-    owner: any focused widget (`panel_text_input_focused` / `egui_wants_keyboard_input`), a text
-    overlay in VECTOR transform mode (moving it would invalidate the normalized warp points) and a
-    raster in perspective transform mode. Each kind's arrow rule mirrors that kind's mouse rule — which
-    is why a text overlay in RASTER transform mode is still movable by arrows.
+  - **Nudge guards**: keyboard focus needs none (the router never matches a key chord while a text
+    field has focus, nor fires a command while a popup is open); a text overlay in VECTOR transform
+    mode (moving it would invalidate the normalized warp points) and a raster in perspective
+    transform mode are not nudged. Each kind's nudge rule mirrors that kind's mouse rule — which is
+    why a text overlay in RASTER transform mode is still movable by the nudge commands. The command's
+    key is consumed by the router either way.
   - **A layer NEVER changes page by being dragged.** The cross-page drag transition no longer exists;
     dragging past a page boundary clamps within the layer's own page.
   - An open session is index-bookkeeping-aware like the drag states: `sync_from_doc` remaps a raster
@@ -1038,8 +1101,9 @@ saving, and export.
   has disk as its SOLE store (the renderer reads it back) and derives from `file_name` + dimensions
   only, so it is the only disk artifact keyed to a created overlay's `file_name`.
 - **A structural change requested during the draw is APPLIED AFTER THE PAINT PASS, never by returning
-  early** (`tab/draw_page.rs::draw_page_overlays`). Delete and duplicate are requested from inside the
-  per-page interaction block, but the ONLY place text overlays and PS rasters are painted is the unified
+  early** (`tab/draw_page.rs::draw_page_overlays`). Delete and duplicate from the layer MENU are
+  requested from inside the per-page interaction block (the `typing.layer.delete` / `duplicate`
+  COMMANDS run in the input dispatch before the page pass, so their frame already paints the result), but the ONLY place text overlays and PS rasters are painted is the unified
   fill pass that comes AFTER it. An arm that mutated and then `return`ed skipped that pass, so the page
   painted no text and no rasters for one frame — the "everything blinks out on delete/duplicate" the
   user saw (creation never blinked: it lands in `poll_create_overlay_jobs` at frame start, outside the
@@ -1062,7 +1126,7 @@ saving, and export.
   difference — so it cannot recurse (unlike `sync_overlay_state_into_doc`, which routes per page), costs
   no extra re-projection, and preserves `route_to_doc_reporting`'s "a no-op changes nothing" contract.
 - **Text-layer duplication is a CREATE, not a clone** (`selection_rasters.rs::duplicate_overlay`,
-  reachable from the overlay ПКМ menu and from Ctrl/Cmd+D on the selected layer). TEXT overlays only —
+  reachable from the overlay menu and from the `typing.layer.duplicate` command, default Ctrl/Cmd+D). TEXT overlays only —
   image overlays and rasters are refused (`None`). The copy is APPENDED (the overlay vector is
   append-only), goes through the single insertion point `insert_runtime_overlay`, and mints a FRESH uid
   plus a fresh `file_name`: a shared uid would make `sync_from_doc` reconcile two runtimes onto one doc
@@ -1541,7 +1605,8 @@ saving, and export.
 - To change overlay/raster selection, non-move drags (rotate / deform handles), or context menus, edit
   `tab/selection_rasters.rs`.
 - To change text-layer DUPLICATION (what is copied, the offset, the menu item), edit
-  `tab/selection_rasters.rs`; its Ctrl/Cmd+D hotkey and its menu item live in `tab/draw_page.rs`, and
+  `tab/selection_rasters.rs`; its command (`typing.layer.duplicate`) is dispatched in `tab/input.rs`,
+  its menu item lives in `tab/draw_page.rs`, and
   where the copy lands in the unified Z stack is `tab/doc_layers.rs`.
 - To change how a layer MOVES (pointer or arrows, either layer kind — clamp, pixel snap, settle,
   persistence), edit `tab/move_layer.rs`; its pure delta math lives in `tab/mesh_geometry.rs`.
@@ -1549,9 +1614,11 @@ saving, and export.
   from inside that draw must follow the "apply after the paint pass" rule above — never `return` before
   the fill pass.
 - To change background render/save jobs, edit `tab/render_jobs.rs` / `tab/persist.rs`.
-- To change a studio-root hook (eviction, exit-only settings, teardown store flush, dock builder) or the
-  bottom-hint rows, edit `tab/studio_tab.rs`; the exit-only keys and their defaults are persisted user
-  data and must not change.
+- To change a studio-root hook (eviction, exit-only settings, teardown store flush, dock builder), edit
+  `tab/studio_tab.rs`; the exit-only keys and their defaults are persisted user data and must not
+  change.
+- To add or change a binding, a context, a hint row or what a command does, edit `tab/input.rs` (and
+  the widget's gesture site for pointer gestures); never read a key, modifier or the wheel in a draw.
 - To change deform-mesh math or hit-testing, edit `tab/mesh_geometry.rs`.
 - To change the on-canvas VECTOR transform (seed/interaction/settle/reset), edit `tab/vector_transform.rs`;
   its pure page-px<->normalized conversions and the layout-gating predicate live in `tab/mesh_geometry.rs`.

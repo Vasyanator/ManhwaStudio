@@ -533,13 +533,17 @@ impl TypingTextOverlayLayer {
     /// `transform_mode_overlay_idx` when `transform_mode_kind == Vector`. Registers its own pointer
     /// widget over the working mesh, applies handle/brush/whole-mesh-move drags to the working mesh,
     /// settles on release, and draws the deform handles (idle) or the mesh WIREFRAME (during a drag).
-    /// Called from `draw_page_overlays` after the baked-PNG fill pass so it draws on top.
+    /// Called from `draw_page_overlays` after the baked-PNG fill pass so it draws on top. Drags and
+    /// the menu resolve through `input` with the layer gestures (`typing.layer.deform` on a handle,
+    /// `typing.layer.deform_brush` inside the mesh in a brush mode, `typing.layer.move` elsewhere on
+    /// it, `typing.layer.menu`).
     pub(super) fn draw_vector_transform_overlay(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         view: PageView,
         painter: &egui::Painter,
+        input: &InputFrame,
     ) {
         let page_idx = view.page_idx;
         let zoom = view.zoom;
@@ -636,32 +640,49 @@ impl TypingTextOverlayLayer {
         }
 
         // Context menu: exit / reset the VECTOR transform. A finger long-press lifted on this
-        // layer opens it too (`touch_layers.rs`), anchored at the press point.
+        // layer opens it too (`touch_layers.rs`), anchored at the press point. `None`: a secondary
+        // click the menu binding does not own — no popup this frame.
         let touch_menu_at = self.take_touch_layer_menu_at(overlay_idx, page_idx);
         let mut pending_exit = false;
         let mut pending_reset = false;
-        context_menu_popup(&response, touch_menu_at).show(|menu_ui| {
-            if menu_ui
-                .button(t!("typing.context_menu.exit_transform_mode_vector"))
-                .clicked()
-            {
-                pending_exit = true;
-                menu_ui.close();
-            }
-            if menu_ui
-                .button(t!("typing.context_menu.reset_transform_vector"))
-                .clicked()
-            {
-                pending_reset = true;
-                menu_ui.close();
-            }
-        });
+        let menu = input::layer_menu_popup(input, &response, pointer_targets_overlay, touch_menu_at);
+        if let Some((_, menu_popup)) = menu {
+            menu_popup.show(|menu_ui| {
+                if menu_ui
+                    .button(t!("typing.context_menu.exit_transform_mode_vector"))
+                    .clicked()
+                {
+                    pending_exit = true;
+                    menu_ui.close();
+                }
+                if menu_ui
+                    .button(t!("typing.context_menu.reset_transform_vector"))
+                    .clicked()
+                {
+                    pending_reset = true;
+                    menu_ui.close();
+                }
+            });
+        }
 
-        if response.drag_started()
-            && pointer_targets_overlay
+        let brush_hit = self.deform_mode.is_brush_mode() && pointer_inside_visual;
+        let drag_hit = input
+            .gesture_for(
+                &response,
+                &[
+                    (input::TARGET_DEFORM_HANDLE, pointer_on_handle.is_some()),
+                    (input::TARGET_BRUSH, brush_hit),
+                    (input::TARGET_BODY, pointer_targets_overlay),
+                ],
+            )
+            .filter(|hit| hit.phase == HitPhase::DragStarted);
+        if let Some(drag_hit) = drag_hit
             && let Some(start_pointer) = pointer_pos
         {
-            let mode = if let Some(handle_idx) = pointer_on_handle {
+            self.begin_layer_gesture(drag_hit.button);
+            let mode = if drag_hit.action == input::LAYER_DEFORM
+                && let Some(handle_idx) = pointer_on_handle
+            {
                 match self.deform_mode {
                     TypingDeformMode::Perspective => {
                         TypingOverlayDragMode::PerspectiveHandle(handle_idx)
@@ -678,7 +699,7 @@ impl TypingTextOverlayLayer {
                     | TypingDeformMode::Stretch
                     | TypingDeformMode::Fold => TypingOverlayDragMode::MoveMesh,
                 }
-            } else if self.deform_mode.is_brush_mode() && pointer_inside_visual {
+            } else if drag_hit.action == input::LAYER_DEFORM_BRUSH {
                 TypingOverlayDragMode::BrushStroke(self.deform_mode)
             } else {
                 TypingOverlayDragMode::MoveMesh

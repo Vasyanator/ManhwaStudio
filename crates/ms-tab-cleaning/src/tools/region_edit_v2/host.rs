@@ -52,11 +52,13 @@ helpers they call (engine picker, brush, layers, mask generation and actions, th
 `draw_host_actions` «Обработать» section) live in the sibling `host_panels.rs`, which is why the
 fields and helpers those read are `pub(super)`: nothing else in the framework touches them. NOTHING here decodes an image on the GUI thread: the source region is produced by
 the shared region loader worker of `base.rs` (`spawn_region_loader_thread`, reused rather than
-copied, D10/D14), and the engine runs its own workers. `block_canvas_zoom()` stays `false` (D5):
-that flag also disables the clean-overlay undo shortcuts for the whole session. Blocking is
-precise instead — `captures_canvas_pointer` over the hitbox,
-`block_canvas_drag_scroll_on_primary` only during a live gesture, and
-`block_canvas_zoom_on_ctrl_primary` only while the frame wants Ctrl+drag for a marks rectangle.
+copied, D10/D14), and the engine runs its own workers. Input (D5, `crate::input`): the host
+publishes `REGION_FRAME` + `BRUSH_ACTIVE` and never the editor-window context, so the canvas zoom
+and the clean-overlay undo stay on for the whole session; while the frame is up its own
+`cleaning.frame.undo_stroke` (Ctrl+Z) shadows the clean-overlay undo. The frame takes its gestures
+from its own `Response`s (`frame.rs`); `apply_input` runs the brush-size actions on the brush in
+use and the stroke undo. The canvas never sees a press over the frame: the frame's `Area` occludes
+the canvas view for the router.
 Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§13).
 */
 
@@ -67,15 +69,16 @@ use super::frame::{FrameHost, FrameLock, RegionFrame, page_source_size};
 use super::geometry::FrameConstraints;
 use super::layers::ResultLayer;
 use crate::tools::base::{
-    CleaningTool, RegionLoadRequest, RegionLoadResult, StrokePoint, capture_overlay_chunk, overlay_rect_to_scene_rect,
+    CleaningTool, RegionLoadRequest, RegionLoadResult, capture_overlay_chunk, overlay_rect_to_scene_rect,
     spawn_region_loader_thread,
 };
 use crate::tools::mask_generation::{self, GeneratedMask, MaskGenerationPoll, MaskGenerationSpawner, MaskGenerationState, MaskSource};
+use crate::input::{self, CleaningLabels};
+use ms_input::{ContextId, InputFrame};
 use ms_canvas::{CanvasView, OverlayRectPx};
 use ms_project::ProjectData;
 use ms_widgets::{ColorPresets, PresetDefaults, ViewportColorSelector};
 use eframe::egui;
-use egui::Pos2;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
@@ -422,6 +425,8 @@ pub struct RegionEditHost {
     /// `Some` while a run that composited the marks into its region is in flight: what
     /// `accept_result` needs to take them back out of the answer. Dropped with the run.
     marks_restore: Option<MarksRestore>,
+    /// The binding texts of the brush hints (`set_input_labels`).
+    pub(super) labels: Arc<CleaningLabels>,
 }
 
 impl std::fmt::Debug for RegionEditHost {
@@ -481,6 +486,7 @@ impl RegionEditHost {
             marks_presets: marks_color_presets(),
             marks_selector_drawn: false,
             marks_restore: None,
+            labels: Arc::default(),
         }
     }
 }
@@ -1268,12 +1274,13 @@ impl CleaningTool for RegionEditHost {
     ///    to an engine that treats that as "a different image" and cancels the run.
     /// 3. the outcome is acted on, then the load and the engine are polled, so a run started
     ///    this frame gets its first poll in the next one, never inside its own start.
-    fn draw_overlay_ui(&mut self, ctx: &egui::Context, canvas: &mut CanvasView, project: &ProjectData) {
+    fn draw_overlay_ui(&mut self, ctx: &egui::Context, canvas: &mut CanvasView, project: &ProjectData, input: &InputFrame) {
         self.push_engine_rules();
 
         let host = FrameHost {
             panel_rects: &self.panel_rects,
             page_count: project.pages.len(),
+            input,
         };
         let outcome = self.frame.update(ctx, canvas, host);
 
@@ -1317,47 +1324,25 @@ impl CleaningTool for RegionEditHost {
         self.poll_engine(ctx);
     }
 
-    /// The frame's hitbox swallows canvas input; nothing outside it does.
-    fn captures_canvas_pointer(&self, pointer_pos: Pos2) -> bool {
-        self.frame.captures_pointer(pointer_pos)
+    /// The frame's context (its gestures, marks-rectangle mode, stroke undo) and
+    /// `BRUSH_ACTIVE` (the shared size actions resize the brush in use).
+    fn input_contexts(&self) -> Vec<ContextId> {
+        vec![input::REGION_FRAME, ms_tools::mask_brush::BRUSH_ACTIVE]
     }
 
-    /// Only a live move/resize drag blocks canvas drag-scroll (D5), and canvas drag-scroll
-    /// needs Space held anyway, so painting is never affected.
-    fn block_canvas_drag_scroll_on_primary(&self) -> bool {
-        self.frame.drag_active()
+    /// The brush-size actions on the CURRENT brush (mask or marks), then
+    /// `cleaning.frame.undo_stroke` on the frame's one stroke history while the mask may be
+    /// edited (the same gate as the «Отменить штрих» button).
+    fn apply_input(&mut self, input: &InputFrame) -> bool {
+        let mut changed = self.frame.active_brush_mut().apply_input(input);
+        if input.fired(input::FRAME_UNDO_STROKE).is_some() && self.mask_editable() && !self.frame.masks().is_blank() {
+            changed |= self.frame.masks_mut().undo();
+        }
+        changed
     }
 
-    /// This tool never takes a canvas stroke: every gesture it has belongs to the frame's own
-    /// `egui::Area`, which senses it through a `Response`.
-    fn wants_primary_stroke(&self, _point: StrokePoint) -> bool {
-        false
-    }
-
-    /// Ctrl/Cmd+drag over the frame body draws a marks rectangle in marks mode, so the canvas
-    /// zoom drag is blocked exactly then — never as a constant (see
-    /// `RegionFrame::blocks_ctrl_primary_zoom`); mask mode keeps the canvas zoom.
-    fn block_canvas_zoom_on_ctrl_primary(&self) -> bool {
-        self.frame.blocks_ctrl_primary_zoom()
-    }
-
-    /// Shift+wheel resizes the CURRENT brush (mask or marks), through the frame's `MaskBrush`.
-    ///
-    /// This hook covers the pointer OUTSIDE the frame only: `tab.rs::handle_active_tool_wheel`
-    /// drops the event while the canvas pointer is occluded, and the frame occludes its own
-    /// hitbox. Over the frame the identical gesture is handled inside the frame's pass.
-    fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        self.frame.active_brush_mut().handle_wheel(delta_y, modifiers)
-    }
-
-    /// The region editor's brush-size shortcuts `-` / `=` / `+`, for the pointer OUTSIDE the
-    /// frame — `tab.rs::handle_active_tool_hotkeys` is gated on the same occlusion test as the
-    /// wheel, so over the frame the shortcuts are handled inside the frame's pass instead.
-    ///
-    /// The tab repaints on a `true`, which is what makes the new radius show up in the brush
-    /// ring immediately.
-    fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        self.frame.active_brush_mut().handle_size_shortcuts(ctx)
+    fn set_input_labels(&mut self, labels: &Arc<CleaningLabels>) {
+        self.labels = Arc::clone(labels);
     }
 }
 
@@ -1545,19 +1530,13 @@ mod tests {
         assert_eq!(tool.pytorch_required(), expected);
     }
 
-    /// D5, pinned. `block_canvas_zoom()` does not only block zooming: `tab.rs` refuses the
-    /// clean-overlay Ctrl+Z / Ctrl+Shift+Z shortcuts for any tool that returns `true`
-    /// (`handle_history_hotkeys`) and the zoom shortcuts with it. Ten of the twelve registered
-    /// tools DO override it to `true`, so copying a sibling is the likely edit — and this tool
-    /// lives on the canvas for the WHOLE editing session, so inheriting `true` would kill
-    /// canvas zoom and clean-overlay undo for the session with nothing else failing.
+    /// D5, pinned. The editor-window context switches off the clean-overlay undo and the canvas
+    /// gets no zoom over a window; this tool lives on the canvas for the WHOLE editing session,
+    /// so it must never publish it. It publishes the frame's context and the shared brush one.
     #[test]
-    fn the_area_editor_never_blocks_canvas_zoom_or_the_undo_shortcuts() {
+    fn the_area_editor_never_publishes_the_editor_window_context() {
         let tool = test_host();
-        assert!(!tool.block_canvas_zoom(), "D5: blocking is precise, never the whole canvas");
-        assert!(!tool.block_canvas_zoom_on_ctrl_primary(), "the same reasoning, for the Ctrl+drag zoom");
-        // Blocking is precise instead: only a live frame gesture stops canvas drag-scroll.
-        assert!(!tool.block_canvas_drag_scroll_on_primary(), "an idle frame blocks nothing");
+        assert_eq!(tool.input_contexts(), vec![input::REGION_FRAME, ms_tools::mask_brush::BRUSH_ACTIVE]);
     }
 
     /// A capture error must name the page and the region: the loader composites the clean
@@ -2242,27 +2221,35 @@ mod tests {
         assert!(!tool.marks_color_selector.eyedropper_active());
     }
 
-    /// The mode switch only ever happens in marks mode; the idle host keeps the canvas zoom,
-    /// and so does a marks-mode frame whose body was never hovered.
+    /// The shared brush actions resize the brush IN USE, and the frame's Ctrl+Z undoes the last
+    /// stroke of its one history.
     #[test]
-    fn the_marks_mode_does_not_block_the_canvas_zoom_by_itself() {
+    fn the_brush_actions_and_the_stroke_undo_reach_the_frame() {
+        use crate::input::test_support::{InputBench, key_press, wheel_line};
         let mut tool = test_host();
-        tool.frame.set_paint_target(PaintTarget::Marks);
-        assert!(!tool.block_canvas_zoom_on_ctrl_primary(), "not hovered, nothing in flight");
-        assert!(!tool.block_canvas_zoom(), "D5 still holds in marks mode");
-    }
-
-    /// The wheel and the size shortcuts outside the frame resize the brush IN USE.
-    #[test]
-    fn the_wheel_resizes_the_active_brush() {
-        let mut tool = test_host();
+        tool.frame.place_for_test(0, OverlayRectPx { x: 0, y: 0, w: 16, h: 16 });
+        let contexts = tool.input_contexts();
+        let mut bench = InputBench::new(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0)));
         let shift = egui::Modifiers { shift: true, ..egui::Modifiers::NONE };
         tool.frame.set_paint_target(PaintTarget::Marks);
         let marks_before = tool.frame.active_brush_mut().radius_px();
-        assert!(tool.on_wheel_event(400.0, shift));
+        bench.frame(shift, vec![wheel_line(1.0, shift)], &contexts, |_, frame| assert!(tool.apply_input(frame)));
         let marks_after = tool.frame.active_brush_mut().radius_px();
         assert!(marks_after > marks_before, "{marks_before} -> {marks_after}");
         tool.frame.set_paint_target(PaintTarget::Mask);
         assert_eq!(tool.frame.active_brush_mut().radius_px(), ms_tools::MaskBrush::default().radius_px(), "the mask brush is untouched");
+        bench.frame(egui::Modifiers::NONE, vec![key_press(egui::Key::Equals, egui::Modifiers::NONE)], &contexts, |_, frame| assert!(tool.apply_input(frame)));
+        assert!(tool.frame.active_brush_mut().radius_px() > ms_tools::MaskBrush::default().radius_px(), "`=` grows the mask brush");
+
+        tool.frame.masks_mut().push_undo();
+        tool.frame.masks_mut().paint_segment((2, 2), (6, 6), 2, false);
+        assert!(!tool.frame.masks().is_blank());
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
+        bench.frame(ctrl, vec![key_press(egui::Key::Z, ctrl)], &contexts, |_, frame| {
+            assert!(frame.fired(input::FRAME_UNDO_STROKE).is_some(), "the frame's undo shadows the clean-overlay undo");
+            assert!(frame.fired(input::CLEAN_UNDO).is_none());
+            assert!(tool.apply_input(frame));
+        });
+        assert!(tool.frame.masks().is_blank(), "the stroke is undone");
     }
 }

@@ -63,11 +63,16 @@ impl TypingTextOverlayLayer {
     /// hook stores them as per-page occluders that hide on-top bubbles and
     /// aside connector lines underneath overlays. GUI-thread only; called once
     /// per visible page per frame.
+    ///
+    /// Pointer gestures resolve through `input` (`InputFrame::gesture_for` with the declared layer
+    /// targets, `tab/input.rs`); no key is read here — the selected-layer commands run once per
+    /// frame before the canvas draws (`TypingTabState::run_input_frame`).
     pub(super) fn draw_page_overlays(
         &mut self,
         ui: &mut egui::Ui,
         view: PageView,
         policy: &TypingPageInteractionPolicy,
+        input: &InputFrame,
     ) -> Vec<[Pos2; 4]> {
         // `ctx` comes from `ui.ctx()`; clone once (Arc-backed, cheap) and reborrow so the rest of the
         // body keeps its `ctx: &Context` shape while `ui` stays free to be borrowed mutably below.
@@ -79,7 +84,6 @@ impl TypingTextOverlayLayer {
         let image_rect = view.image_rect;
         let zoom = view.zoom;
         let mask_panel_open = policy.mask_panel_open;
-        let panel_text_input_focused = policy.panel_text_input_focused;
         let eyedropper_blocks_focus_clear = policy.eyedropper_blocks_focus_clear;
         let auto_typing_settings = policy.auto_typing;
         let strict_pixel_movement = policy.strict_pixel_movement;
@@ -166,7 +170,8 @@ impl TypingTextOverlayLayer {
             self.clear_selection();
         }
 
-        if !ui.input(|i| i.pointer.primary_down()) {
+        // A layer drag ends with the pointer button that started its gesture (`layer_gesture_button`).
+        if !self.layer_gesture_button_down(ctx) {
             if self.drag_state.is_some() && self.drag_has_changes {
                 if let Some(state) = self.drag_state.as_ref() {
                     self.flush_overlay_texture_if_stale(state.overlay_idx);
@@ -206,25 +211,8 @@ impl TypingTextOverlayLayer {
         self.ensure_raster_layers_for_page(page_idx);
         let layout_editor_active = self.layout_editor.is_some();
         if !mask_panel_open && !layout_editor_active {
-            self.try_trigger_selected_overlay_auto_typing_by_hotkey(
-                ctx,
-                view,
-                panel_text_input_focused,
-                auto_typing_settings,
-            );
-            self.try_rotate_selected_overlay_by_ctrl_wheel(ui, view);
-            self.try_rotate_selected_raster_by_ctrl_wheel(ui, page_idx);
-            self.try_scale_selected_overlay_by_shortcuts(ui, page_idx);
-            self.try_scale_selected_raster_by_shortcuts(ui, page_idx);
-            // ONE arrow-nudge entry for both layer kinds; it resolves the selected target itself and
-            // consumes the arrow keys only once every guard has passed.
-            self.try_move_selected_layer_by_arrow_shortcuts(
-                ui,
-                view,
-                panel_text_input_focused,
-                strict_pixel_movement,
-            );
-            // Centering assist: after input handling, keep the bound center on the frame center (create
+            // Centering assist: after the frame's input (the commands ran before the canvas drew),
+            // keep the bound center on the frame center (create
             // the frame lazily; move the LAYER back for anchored changes; let the frame follow a
             // layer move-drag). Runs before `draw_entries` so an anchored re-render recenters lag-free.
             self.reconcile_centering_frame(ctx, view, strict_pixel_movement);
@@ -396,6 +384,9 @@ impl TypingTextOverlayLayer {
             let mut pending_delete_overlay_idx: Option<usize> = None;
             let mut pending_duplicate_overlay_idx: Option<usize> = None;
             let mut pending_enter_layout_editor_idx: Option<usize> = None;
+            // A select click that landed on a layer widget's bounding rect but on no part of the
+            // layer: an empty-canvas click (the shared deselect decision, after the loop).
+            let mut click_through = false;
             let popup_open_before = ui.ctx().any_popup_open();
             // Sticky-фокус: если клик пришёлся внутрь рамки уже выделенного оверлея,
             // фокус остаётся на нём, даже если сверху лежит перекрывающий оверлей или
@@ -659,7 +650,21 @@ impl TypingTextOverlayLayer {
                     ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
 
-                if response.clicked() && pointer_targets_overlay {
+                // The layer's targets under the pointer, highest priority first in meaning (the
+                // declared priorities in `tab/input.rs` order them; only hit ones compete).
+                let brush_hit = is_transform_mode && self.deform_mode.is_brush_mode() && pointer_inside_visual;
+                let candidates = [
+                    (input::TARGET_CENTERING_CORNER, pointer_on_centering_handle.is_some()),
+                    (input::TARGET_WIDTH_TICK, pointer_on_width_handle.is_some()),
+                    (input::TARGET_DEFORM_HANDLE, pointer_on_handle.is_some()),
+                    (input::TARGET_BRUSH, brush_hit),
+                    (input::TARGET_ROTATE_HANDLE, pointer_on_rotate_handle),
+                    (input::TARGET_BODY, pointer_inside_grab_area),
+                ];
+                let select_clicked = input
+                    .gesture_for(&response, &[(input::TARGET_BODY, true)])
+                    .is_some_and(|hit| hit.action == input::LAYER_SELECT && hit.phase == HitPhase::Clicked);
+                if select_clicked && pointer_targets_overlay {
                     // Не перехватываем фокус перекрывающим оверлеем, если клик попал
                     // в рамку уже выделенного (нижнего) оверлея — фокус удержит
                     // блок sticky-фокуса после цикла.
@@ -668,17 +673,21 @@ impl TypingTextOverlayLayer {
                         self.selected_overlay_idx = Some(entry.idx);
                         self.primary_pointer_targets_overlay_this_frame = true;
                     }
+                } else if select_clicked {
+                    click_through = true;
                 }
-                if response.secondary_clicked() && pointer_inside_visual {
+                // A finger long-press lifted on this layer (`touch_layers.rs`, hit-tested there with
+                // the grab rule): the same side effects as the menu gesture below, then the same
+                // menu, anchored at the press point.
+                let touch_menu_at = self.open_touch_layer_menu(ui.ctx(), entry.idx, page_idx);
+                // `None`: a secondary click the menu binding does not own — no popup this frame.
+                let layer_menu = input::layer_menu_popup(input, &response, pointer_inside_visual || pointer_inside_grab_area, touch_menu_at);
+                if layer_menu.as_ref().is_some_and(|(opened, _)| *opened) && pointer_inside_visual {
                     self.selected_overlay_idx = Some(entry.idx);
                     if let Some(origin) = pointer_pos {
                         self.start_shape_variant_preview_if_available(ui.ctx(), entry.idx, origin);
                     }
                 }
-                // A finger long-press lifted on this layer (`touch_layers.rs`, hit-tested there with
-                // the grab rule): the same side effects as the right-click above, then the same menu,
-                // anchored at the press point.
-                let touch_menu_at = self.open_touch_layer_menu(ui.ctx(), entry.idx, page_idx);
 
                 // Vector-transform menu availability for this overlay: `Some(true)` = text overlay
                 // whose layout mode allows the vector warp; `Some(false)` = text overlay whose layout
@@ -690,199 +699,210 @@ impl TypingTextOverlayLayer {
                         ))
                     })
                 });
-                // `context_menu_popup` is `response.context_menu` for the mouse, plus the finger open.
-                context_menu_popup(&response, touch_menu_at).show(|menu_ui| {
-                    if self.selected_overlay_idx != Some(entry.idx) {
-                        menu_ui.label(t!("typing.canvas.select_overlay_hint"));
-                        return;
-                    }
-                    if self
-                        .shape_variant_preview
-                        .as_ref()
-                        .is_none_or(|state| state.overlay_idx != entry.idx)
-                    {
-                        let origin = menu_ui
-                            .ctx()
-                            .pointer_latest_pos()
-                            .unwrap_or_else(|| menu_ui.min_rect().left_top());
-                        self.start_shape_variant_preview_if_available(
-                            menu_ui.ctx(),
-                            entry.idx,
-                            origin,
-                        );
-                    }
-                    if menu_ui
-                        .button(t!("typing.context_menu.enter_layout_edit_mode"))
-                        .clicked()
-                    {
-                        pending_enter_layout_editor_idx = Some(entry.idx);
-                        menu_ui.close();
-                    }
-                    menu_ui.separator();
-                    if !is_transform_mode {
+                // The one layer-menu path (`input::layer_menu_popup`): the menu gesture or a finger.
+                if let Some((_, menu_popup)) = layer_menu {
+                    menu_popup.show(|menu_ui| {
+                        if self.selected_overlay_idx != Some(entry.idx) {
+                            menu_ui.label(tf!("typing.canvas.select_overlay_binding_hint", binding = self.input_labels.layer_select.as_str()));
+                            return;
+                        }
+                        if self
+                            .shape_variant_preview
+                            .as_ref()
+                            .is_none_or(|state| state.overlay_idx != entry.idx)
+                        {
+                            let origin = menu_ui
+                                .ctx()
+                                .pointer_latest_pos()
+                                .unwrap_or_else(|| menu_ui.min_rect().left_top());
+                            self.start_shape_variant_preview_if_available(
+                                menu_ui.ctx(),
+                                entry.idx,
+                                origin,
+                            );
+                        }
                         if menu_ui
-                            .button(t!("typing.context_menu.enter_transform_mode_raster"))
+                            .button(t!("typing.context_menu.enter_layout_edit_mode"))
                             .clicked()
                         {
-                            if self.ensure_overlay_deform_mesh(entry.idx, view) {
-                                ms_log::trace_log!(
-                                    cat::TYPING,
-                                    "overlay_transform_mode enter idx={} kind=raster",
-                                    entry.idx
-                                );
-                                self.transform_mode_overlay_idx = Some(entry.idx);
-                                // Raster transform edits the runtime deform mesh; ensure no vector
-                                // working state lingers.
-                                self.exit_vector_transform_mode();
-                                self.deform_mode = TypingDeformMode::Perspective;
-                                self.drag_state = None;
-                            }
+                            pending_enter_layout_editor_idx = Some(entry.idx);
                             menu_ui.close();
                         }
-                        // Vector transform is TEXT-only and only for layouts that compose with the
-                        // post-layout warp (Normal / Shape / CustomVectorLines). Image overlays hide
-                        // it; Formula / CustomRasterLines show it disabled with a tooltip.
-                        match vector_menu_state {
-                            Some(true) => {
-                                if menu_ui
-                                    .button(t!("typing.context_menu.enter_transform_mode_vector"))
-                                    .clicked()
-                                {
+                        menu_ui.separator();
+                        if !is_transform_mode {
+                            if menu_ui
+                                .button(t!("typing.context_menu.enter_transform_mode_raster"))
+                                .clicked()
+                            {
+                                if self.ensure_overlay_deform_mesh(entry.idx, view) {
                                     ms_log::trace_log!(
                                         cat::TYPING,
-                                        "overlay_transform_mode enter idx={} kind=vector",
+                                        "overlay_transform_mode enter idx={} kind=raster",
                                         entry.idx
                                     );
-                                    self.selected_overlay_idx = Some(entry.idx);
                                     self.transform_mode_overlay_idx = Some(entry.idx);
-                                    self.transform_mode_kind = TypingTransformModeKind::Vector;
+                                    // Raster transform edits the runtime deform mesh; ensure no vector
+                                    // working state lingers.
+                                    self.exit_vector_transform_mode();
                                     self.deform_mode = TypingDeformMode::Perspective;
                                     self.drag_state = None;
-                                    self.seed_vector_transform_mesh(entry.idx, view);
-                                    menu_ui.close();
                                 }
+                                menu_ui.close();
                             }
-                            Some(false) => {
-                                menu_ui
-                                    .add_enabled(
-                                        false,
-                                        egui::Button::new(
-                                            t!("typing.context_menu.enter_transform_mode_vector"),
-                                        ),
-                                    )
-                                    .on_disabled_hover_text(t!("typing.context_menu.layout_not_supported"));
+                            // Vector transform is TEXT-only and only for layouts that compose with the
+                            // post-layout warp (Normal / Shape / CustomVectorLines). Image overlays hide
+                            // it; Formula / CustomRasterLines show it disabled with a tooltip.
+                            match vector_menu_state {
+                                Some(true) => {
+                                    if menu_ui
+                                        .button(t!("typing.context_menu.enter_transform_mode_vector"))
+                                        .clicked()
+                                    {
+                                        ms_log::trace_log!(
+                                            cat::TYPING,
+                                            "overlay_transform_mode enter idx={} kind=vector",
+                                            entry.idx
+                                        );
+                                        self.selected_overlay_idx = Some(entry.idx);
+                                        self.transform_mode_overlay_idx = Some(entry.idx);
+                                        self.transform_mode_kind = TypingTransformModeKind::Vector;
+                                        self.deform_mode = TypingDeformMode::Perspective;
+                                        self.drag_state = None;
+                                        self.seed_vector_transform_mesh(entry.idx, view);
+                                        menu_ui.close();
+                                    }
+                                }
+                                Some(false) => {
+                                    menu_ui
+                                        .add_enabled(
+                                            false,
+                                            egui::Button::new(
+                                                t!("typing.context_menu.enter_transform_mode_vector"),
+                                            ),
+                                        )
+                                        .on_disabled_hover_text(t!("typing.context_menu.layout_not_supported"));
+                                }
+                                None => {}
                             }
-                            None => {}
-                        }
-                    } else {
-                        if menu_ui
-                            .button(t!("typing.context_menu.exit_transform_mode_raster"))
-                            .clicked()
-                        {
-                            ms_log::trace_log!(
-                                cat::TYPING,
-                                "overlay_transform_mode exit idx={}",
-                                entry.idx
-                            );
-                            if self.transform_mode_overlay_idx == Some(entry.idx) {
-                                self.transform_mode_overlay_idx = None;
-                            }
-                            self.drag_state = None;
-                            self.drag_has_changes = false;
-                            menu_ui.close();
-                        }
-                        if menu_ui
-                            .button(t!("typing.context_menu.reset_transform_raster"))
-                            .clicked()
-                        {
-                            ms_log::trace_log!(
-                                cat::TYPING,
-                                "overlay_transform_reset idx={}",
-                                entry.idx
-                            );
-                            if let Some(overlay) = self.overlays.get_mut(entry.idx) {
-                                overlay.deform_mesh = None;
-                            }
-                            self.mark_overlay_geometry_changed(entry.idx, false);
-                            // EDIT (reset raster transform from the context menu): deferred.
-                            self.mark_placement_save_dirty();
-                            self.drag_state = None;
-                            self.drag_has_changes = false;
-                            menu_ui.close();
-                        }
-                    }
-                    menu_ui.separator();
-                    if let Some(overlay) = self.overlays.get(entry.idx) {
-                        let toggle_label = if overlay.mask_clip_enabled {
-                            t!("typing.context_menu.disable_mask_clip")
                         } else {
-                            t!("typing.context_menu.enable_mask_clip")
-                        };
-                        if menu_ui.button(toggle_label).clicked() {
-                            let mut new_state = false;
-                            if let Some(overlay) = self.overlays.get_mut(entry.idx) {
-                                overlay.mask_clip_enabled = !overlay.mask_clip_enabled;
-                                new_state = overlay.mask_clip_enabled;
+                            if menu_ui
+                                .button(t!("typing.context_menu.exit_transform_mode_raster"))
+                                .clicked()
+                            {
+                                ms_log::trace_log!(
+                                    cat::TYPING,
+                                    "overlay_transform_mode exit idx={}",
+                                    entry.idx
+                                );
+                                if self.transform_mode_overlay_idx == Some(entry.idx) {
+                                    self.transform_mode_overlay_idx = None;
+                                }
+                                self.drag_state = None;
+                                self.drag_has_changes = false;
+                                menu_ui.close();
                             }
-                            ms_log::trace_log!(
-                                cat::TYPING,
-                                "overlay_mask_clip_toggle idx={} enabled={}",
-                                entry.idx,
-                                new_state
-                            );
-                            self.mark_overlay_pixels_dirty(entry.idx);
-                            // EDIT (mask-clip toggle from the context menu): deferred.
-                            self.mark_placement_save_dirty();
+                            if menu_ui
+                                .button(t!("typing.context_menu.reset_transform_raster"))
+                                .clicked()
+                            {
+                                ms_log::trace_log!(
+                                    cat::TYPING,
+                                    "overlay_transform_reset idx={}",
+                                    entry.idx
+                                );
+                                if let Some(overlay) = self.overlays.get_mut(entry.idx) {
+                                    overlay.deform_mesh = None;
+                                }
+                                self.mark_overlay_geometry_changed(entry.idx, false);
+                                // EDIT (reset raster transform from the context menu): deferred.
+                                self.mark_placement_save_dirty();
+                                self.drag_state = None;
+                                self.drag_has_changes = false;
+                                menu_ui.close();
+                            }
+                        }
+                        menu_ui.separator();
+                        if let Some(overlay) = self.overlays.get(entry.idx) {
+                            let toggle_label = if overlay.mask_clip_enabled {
+                                t!("typing.context_menu.disable_mask_clip")
+                            } else {
+                                t!("typing.context_menu.enable_mask_clip")
+                            };
+                            if menu_ui.button(toggle_label).clicked() {
+                                let mut new_state = false;
+                                if let Some(overlay) = self.overlays.get_mut(entry.idx) {
+                                    overlay.mask_clip_enabled = !overlay.mask_clip_enabled;
+                                    new_state = overlay.mask_clip_enabled;
+                                }
+                                ms_log::trace_log!(
+                                    cat::TYPING,
+                                    "overlay_mask_clip_toggle idx={} enabled={}",
+                                    entry.idx,
+                                    new_state
+                                );
+                                self.mark_overlay_pixels_dirty(entry.idx);
+                                // EDIT (mask-clip toggle from the context menu): deferred.
+                                self.mark_placement_save_dirty();
+                                menu_ui.close();
+                            }
+                        }
+                        menu_ui.separator();
+                        {
+                            // ▲ / ▼ move the overlay one step in the unified Z order (text + raster
+                            // interleaved, shared with the PS editor). No more per-overlay text-group
+                            // number — order is the shared layer stack.
+                            let mut move_z_up: Option<bool> = None;
+                            menu_ui.horizontal(|row| {
+                                row.label(t!("typing.context_menu.order"));
+                                if row.button("▲").clicked() {
+                                    move_z_up = Some(true);
+                                }
+                                if row.button("▼").clicked() {
+                                    move_z_up = Some(false);
+                                }
+                            });
+                            if let Some(up) = move_z_up {
+                                self.move_overlay_in_unified_z(page_idx, entry.idx, up);
+                            }
+                        }
+                        menu_ui.separator();
+                        // Duplication is TEXT-only: an image overlay is a placed PNG whose file lifecycle
+                        // `duplicate_overlay` does not own, so the item is HIDDEN for it rather than shown
+                        // disabled. The `&&` short-circuits, so the button is not added at all.
+                        if self
+                            .overlays
+                            .get(entry.idx)
+                            .is_some_and(|overlay| overlay.kind == TypingOverlayKind::Text)
+                            && menu_ui
+                                .button(t!("typing.context_menu.duplicate_overlay"))
+                                .clicked()
+                        {
+                            pending_duplicate_overlay_idx = Some(entry.idx);
                             menu_ui.close();
                         }
-                    }
-                    menu_ui.separator();
-                    {
-                        // ▲ / ▼ move the overlay one step in the unified Z order (text + raster
-                        // interleaved, shared with the PS editor). No more per-overlay text-group
-                        // number — order is the shared layer stack.
-                        let mut move_z_up: Option<bool> = None;
-                        menu_ui.horizontal(|row| {
-                            row.label(t!("typing.context_menu.order"));
-                            if row.button("▲").clicked() {
-                                move_z_up = Some(true);
-                            }
-                            if row.button("▼").clicked() {
-                                move_z_up = Some(false);
-                            }
-                        });
-                        if let Some(up) = move_z_up {
-                            self.move_overlay_in_unified_z(page_idx, entry.idx, up);
+                        if menu_ui.button(t!("typing.context_menu.delete_overlay")).clicked() {
+                            pending_delete_overlay_idx = Some(entry.idx);
+                            menu_ui.close();
                         }
-                    }
-                    menu_ui.separator();
-                    // Duplication is TEXT-only: an image overlay is a placed PNG whose file lifecycle
-                    // `duplicate_overlay` does not own, so the item is HIDDEN for it rather than shown
-                    // disabled. The `&&` short-circuits, so the button is not added at all.
-                    if self
-                        .overlays
-                        .get(entry.idx)
-                        .is_some_and(|overlay| overlay.kind == TypingOverlayKind::Text)
-                        && menu_ui
-                            .button(t!("typing.context_menu.duplicate_overlay"))
-                            .clicked()
-                    {
-                        pending_duplicate_overlay_idx = Some(entry.idx);
-                        menu_ui.close();
-                    }
-                    if menu_ui.button(t!("typing.context_menu.delete_overlay")).clicked() {
-                        pending_delete_overlay_idx = Some(entry.idx);
-                        menu_ui.close();
-                    }
-                    self.update_shape_variant_preview_menu_rect(entry.idx, menu_ui.min_rect());
-                });
+                        self.update_shape_variant_preview_menu_rect(entry.idx, menu_ui.min_rect());
+                    });
+                }
 
-                if response.drag_started() && pointer_targets_overlay {
+                // Which layer gesture a drag that starts here drives: the bound button and chord of
+                // the press, the hit target of highest priority (a drag with another button, or
+                // none bound, drives nothing).
+                let drag_hit = input
+                    .gesture_for(&response, &candidates)
+                    .filter(|hit| hit.phase == HitPhase::DragStarted);
+                if let Some(drag_hit) = drag_hit {
                     self.primary_pointer_targets_overlay_this_frame = true;
+                    self.begin_layer_gesture(drag_hit.button);
                     if let Some(pointer_pos) = pointer_pos {
                         // A centering-frame corner starts a frame-resize drag (mutates the transient
                         // frame; the reconciliation moves+saves the layer), NOT a placement drag.
-                        if let Some(corner) = pointer_on_centering_handle {
+                        if drag_hit.action == input::LAYER_RESIZE_CENTERING
+                            && let Some(corner) = pointer_on_centering_handle
+                        {
                             self.selected_overlay_idx = Some(entry.idx);
                             let frame_and_angle = self.overlays.get(entry.idx).and_then(|overlay| {
                                 overlay.centering_frame.map(|frame| {
@@ -906,7 +926,9 @@ impl TypingTextOverlayLayer {
                         }
                         // A width-guide tick starts a width-resize drag (param edit + re-render), NOT a
                         // placement drag, so set that state and skip the placement drag setup.
-                        if let Some(right) = pointer_on_width_handle {
+                        if drag_hit.action == input::LAYER_SET_WIDTH
+                            && let Some(right) = pointer_on_width_handle
+                        {
                             self.selected_overlay_idx = Some(entry.idx);
                             self.width_resize_drag = Some(WidthResizeDragState {
                                 overlay_idx: entry.idx,
@@ -958,7 +980,9 @@ impl TypingTextOverlayLayer {
                                 // A handle or brush edits the mesh's SHAPE and keeps `drag_state`;
                                 // anything else in raster transform mode is a whole-layer MOVE and
                                 // goes to the shared move session.
-                                let deform_mode = if let Some(handle_idx) = pointer_on_handle {
+                                let deform_mode = if drag_hit.action == input::LAYER_DEFORM
+                                    && let Some(handle_idx) = pointer_on_handle
+                                {
                                     match self.deform_mode {
                                         TypingDeformMode::Perspective => {
                                             Some(TypingOverlayDragMode::PerspectiveHandle(handle_idx))
@@ -984,7 +1008,7 @@ impl TypingTextOverlayLayer {
                                         | TypingDeformMode::Stretch
                                         | TypingDeformMode::Fold => None,
                                     }
-                                } else if self.deform_mode.is_brush_mode() && pointer_inside_visual {
+                                } else if drag_hit.action == input::LAYER_DEFORM_BRUSH {
                                     Some(TypingOverlayDragMode::BrushStroke(self.deform_mode))
                                 } else {
                                     None
@@ -1041,7 +1065,7 @@ impl TypingTextOverlayLayer {
                             }
                         }
 
-                        if pointer_on_rotate_handle {
+                        if drag_hit.action == input::LAYER_ROTATE_DRAG {
                             ms_log::trace_log!(
                                 cat::INPUT,
                                 "overlay_drag_begin transform=false idx={} page={} mode=Rotate",
@@ -1406,85 +1430,18 @@ impl TypingTextOverlayLayer {
                 }
                 let popup_open_after = ui.ctx().any_popup_open();
                 let popup_open = popup_open_before || popup_open_after;
-                let delete_pressed = ui.input(|i| i.key_pressed(egui::Key::Delete));
-                if delete_pressed
-                    && !ui.ctx().egui_wants_keyboard_input()
-                    && let Some(selected_idx) = self.selected_overlay_idx
-                    && self
-                        .overlays
-                        .get(selected_idx)
-                        .is_some_and(|overlay| overlay.page_idx == page_idx)
-                {
-                    pending_structural = Some(PendingStructuralChange::Delete(selected_idx));
-                }
-
-                // Ctrl/Cmd+D duplicates the selected TEXT layer of THIS page. The guards are evaluated
-                // BEFORE the consume (short-circuit), so a press that this page cannot act on stays in the
-                // event queue for whoever else may want it; a press we do act on is consumed so it cannot
-                // fire twice across simultaneously visible pages.
-                let can_duplicate = pending_structural.is_none()
-                    && !ui.ctx().egui_wants_keyboard_input()
-                    && !panel_text_input_focused
-                    && self.selected_overlay_idx.is_some_and(|selected_idx| {
-                        self.overlays.get(selected_idx).is_some_and(|overlay| {
-                            overlay.page_idx == page_idx && overlay.kind == TypingOverlayKind::Text
-                        })
-                    });
-                let duplicate_pressed = ui.ctx().input_mut(|input| {
-                    can_duplicate && input.consume_key(egui::Modifiers::COMMAND, egui::Key::D)
-                });
-                if duplicate_pressed
-                    && let Some(selected_idx) = self.selected_overlay_idx
-                {
-                    pending_structural = Some(PendingStructuralChange::Duplicate(selected_idx));
-                }
-
-                let clicked_on_image_without_overlay = ui.input(|i| {
-                    i.pointer.primary_clicked()
-                        && i.pointer
-                            .interact_pos()
-                            .is_some_and(|pos| image_rect.contains(pos))
-                        && clicked_overlay_idx.is_none()
-                }) && !popup_open
-                    && !ms_widgets::input_util::pointer_over_floating_area(ui.ctx())
-                    && !eyedropper_blocks_focus_clear;
-                // Re-tested here, not only at the top of the block: the Delete/Ctrl+D arms above may have
-                // recorded a change since, and this arm mutates the selection and the selected layer's
-                // geometry by index.
-                if clicked_on_image_without_overlay && pending_structural.is_none() {
-                    if self
-                        .selected_overlay_idx
-                        .and_then(|idx| self.overlays.get(idx))
-                        .is_some_and(|overlay| overlay.page_idx == page_idx)
-                    {
-                        if let Some(selected_idx) = self.selected_overlay_idx
-                            && self.enforce_overlay_visibility_limit(selected_idx, view, strict_pixel_movement)
-                        {
-                            snap_overlay_center_to_pixels_if_enabled(
-                                self.overlays
-                                    .get_mut(selected_idx)
-                                    .expect("selected overlay exists after visibility enforcement"),
-                                strict_pixel_movement,
-                                page_size_from_image_rect(image_rect, zoom),
-                            );
-                            self.mark_overlay_geometry_changed(selected_idx, false);
-                            // EDIT (clamp on click-away). The deselect immediately below is itself a focus
-                            // loss, so `flush_edit_save_on_selection_change` writes this on the same frame.
-                            self.mark_placement_save_dirty();
-                        }
-                        if self.transform_mode_overlay_idx == self.selected_overlay_idx {
-                            self.transform_mode_overlay_idx = None;
-                        }
-                        self.selected_overlay_idx = None;
-                    }
-                    if self
-                        .drag_state
-                        .as_ref()
-                        .is_some_and(|state| state.page_idx == page_idx)
-                    {
-                        self.drag_state = None;
-                        self.drag_has_changes = false;
-                    }
+                // A select click on a layer widget's bounding rect that hit no part of any layer is a
+                // click on empty canvas: the ONE deselect decision (`empty_click_deselects`), whose
+                // other trigger is the canvas page click (`TypingHooks::on_page_click`).
+                let gates = selection_rasters::TypingEmptyClickGates {
+                    mask_panel_open,
+                    layout_editor_active,
+                    eyedropper_blocks: eyedropper_blocks_focus_clear,
+                    layer_claimed_pointer: clicked_overlay_idx.is_some(),
+                    popup_open,
+                };
+                if click_through && selection_rasters::empty_click_deselects(gates) {
+                    self.deselect_by_empty_click(Some(view), strict_pixel_movement);
                 }
                 if self
                     .transform_mode_overlay_idx
@@ -1638,10 +1595,10 @@ impl TypingTextOverlayLayer {
         // dedicated pass (drawn after the baked-PNG fill so it sits on top). Gated off while the mask
         // panel or the layout editor is active, matching the normal overlay interaction gate.
         if !mask_panel_open && !layout_editor_active {
-            self.draw_vector_transform_overlay(ui, ctx, view, &painter);
+            self.draw_vector_transform_overlay(ui, ctx, view, &painter, input);
         }
         if self.layout_editor.is_some() && !mask_panel_open {
-            self.draw_layout_editor_on_page(ui, ctx, view, clip_rect);
+            self.draw_layout_editor_on_page(ui, ctx, view, clip_rect, input);
         }
         if let Some(selected_idx) = self.transform_mode_overlay_idx
             && self.transform_mode_kind == TypingTransformModeKind::Raster
@@ -1668,7 +1625,7 @@ impl TypingTextOverlayLayer {
         // return skipped it: it selects and moves rasters by index against a page whose layer set is
         // about to change, and it would also steal the click that requested the change.
         if !mask_panel_open && !layout_editor_active && pending_structural.is_none() {
-            self.interact_page_rasters(ui, view, &painter, strict_pixel_movement);
+            self.interact_page_rasters(ui, view, &painter, policy, input);
         }
         // Occluders are built from the PRE-change entries — the set this frame actually painted, which is
         // what the bubble-hiding rules must agree with.

@@ -57,12 +57,14 @@ of the clean-overlay model.
   `crate::tools::patch::membrane` and has its own `MODULE_README.md` next to it.
 
 ## Contracts and invariants
-- **`block_canvas_zoom()` is `false`, always.** It also disables the clean-overlay Ctrl+Z /
-  Ctrl+Shift+Z shortcuts (`../../tab.rs::handle_history_hotkeys`), which is acceptable for a modal
-  editor window but not for a surface that lives on the canvas for a whole session. Pinned by a test.
-- **`captures_canvas_pointer()` is `false`, always.** The tab ORs it into `canvas_pointer_occluded`
-  and then calls `finish_stroke()` and returns, so a capturing tool receives no stroke, key or
-  cursor callbacks — and this tool's entire gesture rides those. Pinned by a test.
+- **Input** (`../../input.rs`): the tool publishes `cleaning.tool.patch` and nothing else (never
+  the editor-window context, which would switch the clean-overlay undo off for the session;
+  pinned by a test). Its gesture is the canvas-wide claim `cleaning.patch.drag` (LMB drag by
+  default; the core decides select vs. source drag from the press point), driven through the
+  tab's stroke pipeline; `cleaning.patch.cancel` (Esc by default) reaches the core in
+  `apply_input` as `PatchInput::cancel`, and `view.pan` held keeps the core idle. The core's
+  "has the button really been released" input of `draw_overlay_ui` is "no `cleaning.patch.drag`
+  claim of the canvas still runs this frame". The usage hint names the cancel's current binding.
 - Before the write, `check_chunk_fits` re-validates the chunk against the page's LIVE overlay, not
   the one measured when the job started (`cleaning/MODULE_README.md`'s overlay-edit rule, and D7 in
   `../region_edit_v2/frame.rs`). `replace_overlay_region_px` REPAIRS instead of refusing — it clips

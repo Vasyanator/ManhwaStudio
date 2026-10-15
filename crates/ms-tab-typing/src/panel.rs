@@ -88,7 +88,7 @@ FILE HEADER (tabs/typing/panel.rs)
   - `TypingTopPanelState::take_edit_request`: отдаёт изменения edit-панели для
     live-рендера оверлея в `tab.rs`.
   - `TypingTopPanelState::adjust_selected_text_overlay_font_size_by_wheel_steps`: меняет
-    `Размер (px)` у выделенного text-оверлея от внешнего hotkey (`Shift+колесо`) и
+    `Размер (px)` у выделенного text-оверлея от оси `typing.font_size` (по умолчанию Shift+колесо) и
     эмитит edit-запрос для немедленного фонового рендера.
   - `TypingTopPanelState::auto_typing_settings`: отдаёт параметры панели `Авто-тайп`
     (debug + смещение центра вниз) для runtime-логики в `tab.rs`.
@@ -133,6 +133,7 @@ use ms_config as config;
 use ms_log::trace::cat;
 use crate::auto_typing::TypingAutoTypingSettings;
 use crate::tab::TypingExportFormat;
+use crate::tab::input::TypingInputLabels;
 // Typed export destination/request of the «Действия» export block: the panel queues one of
 // these instead of a bare folder path, because a PDF export targets a FILE.
 use crate::tab::{TypingExportDestination, TypingExportRequest};
@@ -795,6 +796,9 @@ pub enum TypingTopPanelMode {
 }
 
 pub struct TypingTopPanelState {
+    /// Binding texts of the panel's shortcut hints (pushed by the tab when they change,
+    /// `tab/input.rs`); copied into both panels below.
+    input_labels: TypingInputLabels,
     mode: TypingTopPanelMode,
     /// Which of the two main dock tabs («Параметры» / «Эффекты») drew last.
     ///
@@ -1043,6 +1047,7 @@ impl TypingTopPanelState {
         // (CLAUDE.md §5), and it must not happen twice for one startup either.
         create_state::spawn_shared_font_reload(&mut create_panel, &mut edit_panel);
         Self {
+            input_labels: TypingInputLabels::default(),
             mode: TypingTopPanelMode::CreateText,
             active_main_tab: TypingMainTab::Parameters,
             create_panel,
@@ -2209,6 +2214,8 @@ pub(super) fn pdf_export_file_name(base: &str) -> String {
 }
 
 struct TypingCreatePanelState {
+    /// Binding texts of the panel's shortcut hints (copied from `TypingTopPanelState`).
+    input_labels: TypingInputLabels,
     fonts_dir: PathBuf,
     fonts: Vec<FontEntry>,
     /// App-side font source handed to every render: maps a working name (font
@@ -2457,7 +2464,6 @@ struct TypingCreatePanelState {
     preview_font_fallbacks: FontFallbackReport,
     preview_texture: Option<TextureHandle>,
     preview_size: [usize; 2],
-    tracked_text_input_ids: Vec<Id>,
     text_selection_char_range: Option<Range<usize>>,
     pending_text_selection_restore: Option<Range<usize>>,
     /// Буфер, к которому относятся выделение и инлайн-теги (исходный/сформированный).

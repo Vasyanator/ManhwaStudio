@@ -3,15 +3,15 @@ File: crates/ms-tab-typing/src/tab/studio_tab.rs
 
 Purpose:
 The «Текст» tab's answers to the studio root's order-free per-tab hooks
-(`ms_studio_tab::StudioTab`), plus the two tab-owned pieces those hooks rely on: the exit-only
-`user_config` keys (read once at construction, written once at teardown) and the canvas
-bottom-hint rows.
+(`ms_studio_tab::StudioTab`), plus the exit-only `user_config` keys those hooks rely on (read once
+at construction, written once at teardown).
 
 Key items:
-- `typing_hint_rows`: the curated bottom-hint rows, set by `TypingTabState::draw` every frame.
 - `TypingTabState::load_exit_settings`: seeds the exit-only flags from the startup `user_config`.
 - `impl StudioTab for TypingTabState`:
-  - `input_contexts`: the canvas's contexts, plus the brush context while the mask panel is open;
+  - `input_declarations`: the tab's input set (`tab/input.rs::declarations`);
+  - `input_contexts`: the canvas's contexts, the tab's own (`tab/input.rs::contexts_for`), plus the
+    brush context while the mask panel is open;
   - `default_dock_layout`: `typing_default_dock_layout` (the tab hosts the panel dock);
   - `evict_tab_gpu_caches`: the canvas clean-overlay cache, then the tab's own mask and overlay
     textures (`evict_gpu_caches`);
@@ -26,13 +26,12 @@ Notes:
   = expanded (`false`), absent `centering_assist_enabled` = off (`false`), absent
   `centering_show_center` = shown (`true`). The bound-center KIND is session-only and has no key.
   They are written only at teardown, never per toggle.
-- No declared actions yet (the tab reads its own keys while drawing, input-unification WP8), no
-  background poll, no committed-tree view: those hooks keep their no-op defaults.
+- No background poll and no committed-tree view: those hooks keep their no-op defaults.
+- The canvas bottom-hint rows are built from the input registry's labels in `tab/input.rs`.
 */
 
 use std::collections::HashSet;
 
-use ms_canvas::{CanvasHintHelp, CanvasHintRow};
 use ms_config::{CANVAS_SECTION, TEXT_TAB_SECTION, section_bool, set_section_bool};
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
 use ms_studio_tab::StudioTab;
@@ -49,47 +48,6 @@ const TEXT_TAB_CENTERING_ASSIST_ENABLED_KEY: &str = "centering_assist_enabled";
 /// is on by default, which is why its default differs from the assist toggle's).
 const TEXT_TAB_CENTERING_SHOW_CENTER_KEY: &str = "centering_show_center";
 
-/// Builds the fixed, hand-authored Typing-tab bottom-hint rows.
-///
-/// Content is a curated set of localized label/key pairs (via `t!`), NOT sourced from the hotkey
-/// registry. Rebuilt every frame so a runtime language switch re-localizes the rows. Order is
-/// canonical and must match the documented Typing shortcut set. The select-text-area row carries an
-/// animated "?" help icon, which puts this hint into the grid's three-column mode.
-#[must_use]
-pub(super) fn typing_hint_rows() -> Vec<CanvasHintRow> {
-    vec![
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.select_text_area_label"),
-            t!("canvas.bottom_hint.typing.select_text_area_keys"),
-        )
-        .with_help(CanvasHintHelp::Animation(ms_gifs::typing::SELECT_TEXT_AREA)),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.quick_font_size_label"),
-            t!("canvas.bottom_hint.typing.quick_font_size_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.rotate_label"),
-            t!("canvas.bottom_hint.typing.rotate_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.scale_label"),
-            t!("canvas.bottom_hint.typing.scale_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.nudge_label"),
-            t!("canvas.bottom_hint.typing.nudge_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.toggle_clean_label"),
-            t!("canvas.bottom_hint.typing.toggle_clean_keys"),
-        ),
-        CanvasHintRow::new(
-            t!("canvas.bottom_hint.typing.toggle_centering_assist_label"),
-            t!("canvas.bottom_hint.typing.toggle_centering_assist_keys"),
-        ),
-    ]
-}
-
 impl TypingTabState {
     /// Seeds the exit-only flags ONCE at construction from the merged startup `user_settings`:
     /// the bottom-hint collapsed state and both centering-assist checkboxes. A missing section or
@@ -105,12 +63,19 @@ impl TypingTabState {
 }
 
 impl StudioTab for TypingTabState {
-    /// The canvas's contexts (`CanvasView::input_contexts`: `canvas.zoom_accepted` while no
-    /// selected layer blocks canvas zoom, so Ctrl+wheel keeps rotating a selected layer), plus
-    /// `ms_tools::mask_brush::BRUSH_ACTIVE` while the mask panel is open (its brush takes the
+    /// The tab's commands, modes, axes, gestures and targets (`tab/input.rs`).
+    fn input_declarations(&self) -> ms_input::Declarations {
+        super::input::declarations()
+    }
+
+    /// The canvas's contexts (`CanvasView::input_contexts`; the tab never blocks canvas zoom: a
+    /// selected layer's Ctrl+wheel rotation shadows only the wheel), the tab's own contexts
+    /// (`tab/input.rs::contexts_for`: selection, layout editor, mask, create, font-size target),
+    /// plus `ms_tools::mask_brush::BRUSH_ACTIVE` while the mask panel is open (its brush takes the
     /// shared brush actions).
     fn input_contexts(&self) -> Vec<ms_input::ContextId> {
         let mut contexts = self.canvas.input_contexts();
+        contexts.extend(super::input::contexts_for(self.input_state()));
         if self.mask_layer.is_panel_open() {
             contexts.push(ms_tools::mask_brush::BRUSH_ACTIVE);
         }
@@ -169,7 +134,6 @@ mod tests {
     use ms_widgets::panel_dock::TabId;
     use serde_json::{Value, json};
 
-    use super::typing_hint_rows;
     use crate::tab::{TypingTabState, typing_default_dock_layout};
 
     /// Loads `user_settings` into a fresh tab and writes its exit settings into `root`.
@@ -282,14 +246,5 @@ mod tests {
                  on every load"
             );
         }
-    }
-
-    /// Seven rows in canonical order; only the first carries a help icon (three-column mode).
-    #[test]
-    fn the_hint_has_seven_rows_and_one_help_icon() {
-        let rows = typing_hint_rows();
-        assert_eq!(rows.len(), 7);
-        assert!(rows[0].help.is_some());
-        assert!(rows[1..].iter().all(|row| row.help.is_none()));
     }
 }

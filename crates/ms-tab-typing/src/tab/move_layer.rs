@@ -12,8 +12,8 @@ rebinding, dirty marking and the DEFERRED persist — happens here and nowhere e
 Main responsibilities:
 - open / drive / end a move session (`begin_layer_move`, `drive_pointer_layer_move`,
   `add_keyboard_layer_move_step`, `settle_layer_move`);
-- own the ONE arrow-key entry point for both layer kinds
-  (`try_move_selected_layer_by_arrow_shortcuts`), guards included;
+- own the ONE nudge entry point for both layer kinds (`nudge_selected_layer`, called by the
+  tab's input dispatch for the `typing.layer.nudge_*` commands), guards included;
 - run the once-per-frame settle driver (`drive_layer_move_settle`), called from
   `TypingTabState::draw` AFTER `canvas.draw`;
 - map the session's target onto the two geometry stores (overlay runtime vs cached
@@ -42,8 +42,7 @@ impl TypingTextOverlayLayer {
     /// A `Keyboard` session already open on the SAME target/page is left untouched (so OS key repeat
     /// keeps accumulating into one gesture); any other open session is settled first, so its write is
     /// never dropped. Returns `false` when the target does not resolve to a layer on that page, in
-    /// which case no session is opened — check [`Self::can_begin_layer_move`] FIRST when the caller
-    /// has already consumed input it would have to give back.
+    /// which case no session is opened.
     #[must_use]
     pub(super) fn begin_layer_move(
         &mut self,
@@ -79,30 +78,6 @@ impl TypingTextOverlayLayer {
             has_changes: false,
         });
         true
-    }
-
-    /// Whether `begin_layer_move` would succeed for `target` on `page_idx` — i.e. the target resolves
-    /// to a layer whose geometry can be snapshotted as a move base.
-    ///
-    /// Exists for the keyboard entry, which must decide BEFORE consuming the arrow keys: a gesture
-    /// that cannot start after the keys are gone leaves the user with a swallowed key press and an
-    /// unmoved layer.
-    #[must_use]
-    pub(super) fn can_begin_layer_move(
-        &self,
-        target: TypingLayerMoveTarget,
-        page_idx: usize,
-        view: PageView,
-    ) -> bool {
-        // An already-open keyboard session for the same target needs no new base.
-        if self.move_session.as_ref().is_some_and(|session| {
-            session.source == TypingLayerMoveSource::Keyboard
-                && session.target == target
-                && session.page_idx == page_idx
-        }) {
-            return true;
-        }
-        self.layer_move_base(target, page_idx, view).is_some()
     }
 
     /// Whether an open move session drives `target` on `page_idx`. Call sites use it to hand a drag
@@ -492,51 +467,43 @@ impl TypingTextOverlayLayer {
         self.move_session = None;
     }
 
-    /// Arrow-key nudge for the selected layer of `view.page_idx` — text overlay OR raster, whichever
-    /// is selected (the two selections are mutually exclusive). SHIFT steps 5 px instead of 1.
+    /// The nudge commands (`typing.layer.nudge_*`, default arrows / Shift+arrows) for the selected
+    /// layer of `view.page_idx` — text overlay OR raster, whichever is selected (the two selections
+    /// are mutually exclusive). `step_page_px` is this frame's summed step
+    /// (`input::nudge_step_px`: 1 px plain, 5 px fast per command).
     ///
     /// The nudge feeds the SAME move session the pointer drag uses, so a hold produces one gesture:
     /// the delta accumulates against a fixed base (a mesh can never be squashed by repeated
     /// application at a page edge), the mask clip is invalidated live, the visibility limit runs, and
-    /// exactly ONE deferred write is dispatched when the last arrow is released — not one per key
-    /// press.
+    /// exactly ONE deferred write is dispatched when the last nudge key is released — not one per
+    /// key press.
     ///
-    /// Every guard runs BEFORE any key is consumed, so a rejected gesture leaves the arrows to their
-    /// real owner instead of silently swallowing them:
-    /// - a focused text field anywhere in the UI (`panel_text_input_focused` or
-    ///   `egui_wants_keyboard_input`, which is "any focused widget" — the same rule the sibling
-    ///   canvas shortcut handlers use);
+    /// Keyboard focus needs no guard here: the router never matches a key chord while a text field
+    /// has focus, nor fires a command while a popup is open. The remaining guards:
     /// - a text overlay in VECTOR transform mode (moving its center would invalidate the normalized
     ///   warp points, which is exactly why the pointer move is skipped there too);
-    /// - a raster in perspective transform mode (there the mouse only edits corner handles).
+    /// - a raster in perspective transform mode (there the mouse only edits corner handles);
+    /// - a target whose geometry cannot be snapshotted (nothing would move).
     ///
     /// A text overlay in RASTER transform mode is deliberately still movable, because the mouse can
-    /// whole-mesh-move it there as well: each kind's arrow rule matches that kind's mouse rule.
-    ///
-    /// Runs once per visible page, hence the per-page guards on both selections.
-    pub(super) fn try_move_selected_layer_by_arrow_shortcuts(
+    /// whole-mesh-move it there as well: each kind's nudge rule matches that kind's mouse rule.
+    /// Returns whether the layer moved (a repaint is wanted).
+    pub(super) fn nudge_selected_layer(
         &mut self,
-        ui: &mut egui::Ui,
+        step_page_px: [f32; 2],
         view: PageView,
-        panel_text_input_focused: bool,
         strict_pixel_movement: bool,
-    ) {
+    ) -> bool {
         let page_idx = view.page_idx;
-        // Guard 1 — focus. Before `consume_key`, or a focused font-name autocomplete / combo box /
-        // panel field would lose the arrow it is waiting for (risk 7 of the plan).
-        if panel_text_input_focused || ui.ctx().egui_wants_keyboard_input() {
-            return;
-        }
-
         // Resolve the target. The two selections are mutually exclusive, so this cannot double-fire;
-        // both are additionally pinned to the page that OWNS them.
+        // both are pinned to the page that OWNS them (`view` is that page).
         let target = if let Some(overlay_idx) = self.selected_overlay_idx {
             if self
                 .overlays
                 .get(overlay_idx)
                 .is_none_or(|overlay| overlay.page_idx != page_idx)
             {
-                return;
+                return false;
             }
             TypingLayerMoveTarget::Overlay(overlay_idx)
         } else if let Some(raster_idx) = self.selected_raster_idx {
@@ -546,79 +513,51 @@ impl TypingTextOverlayLayer {
                     .get(&page_idx)
                     .is_some_and(|layers| raster_idx < layers.len())
             {
-                return;
+                return false;
             }
             TypingLayerMoveTarget::Raster(raster_idx)
         } else {
-            return;
+            return false;
         };
 
-        // Guard 2 — transform modes. Also before `consume_key`, for the same reason.
+        // Transform modes.
         match target {
             TypingLayerMoveTarget::Overlay(overlay_idx) => {
                 if self.transform_mode_overlay_idx == Some(overlay_idx)
                     && self.transform_mode_kind == TypingTransformModeKind::Vector
                 {
-                    return;
+                    return false;
                 }
             }
             TypingLayerMoveTarget::Raster(raster_idx) => {
                 if self.transform_mode_raster_idx == Some(raster_idx) {
-                    return;
+                    return false;
                 }
             }
         }
 
-        // Guard 3 — can the gesture actually start? Checked BEFORE `consume_key` for the same reason
-        // as the others: a target whose geometry cannot be snapshotted (e.g. a raster carrying a
-        // malformed `DeformRec`) would otherwise eat the key and move nothing.
-        if !self.can_begin_layer_move(target, page_idx, view) {
-            return;
-        }
-
-        let (plain_lrud, shift_lrud) = ui.ctx().input_mut(|input| {
-            (
-                [
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
-                ],
-                [
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp),
-                    input.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown),
-                ],
-            )
-        });
-        let step_page_px = arrow_nudge_step_px(plain_lrud, shift_lrud);
-        if step_page_px == [0.0, 0.0] {
-            return;
-        }
-
         // Re-opens nothing when a keyboard session for this target is already running (OS key repeat
-        // keeps ONE gesture), and settles a pointer session first if one is somehow open. The guard
-        // above already proved this can start, so a `false` here would mean the state changed under
-        // us within the same frame — report it rather than nudging nothing silently.
-        if self.begin_layer_move(
+        // keeps ONE gesture), and settles a pointer session first if one is somehow open. `false`
+        // means the layer's geometry could not be snapshotted (e.g. a raster carrying a malformed
+        // `DeformRec`): report it rather than nudging nothing silently.
+        if !self.begin_layer_move(
             target,
             page_idx,
             TypingLayerMoveSource::Keyboard,
             None,
             view,
         ) {
-            self.add_keyboard_layer_move_step(step_page_px, view, strict_pixel_movement);
-        } else {
             ms_log::runtime_log::log_warn(format!(
-                "[typing] arrow nudge consumed a key but could not start a move.\n\
+                "[typing] a layer nudge could not start a move.\n\
                  Page: {page_idx}\nTarget: {target:?}\n\
                  Cause: the layer's geometry could not be snapshotted as a move base."
             ));
+            return false;
         }
-        // The session settles on the first frame with no arrow HELD, so frames must keep coming
+        self.add_keyboard_layer_move_step(step_page_px, view, strict_pixel_movement);
+        // The session settles on the first frame with no nudge key HELD, so frames must keep coming
         // (`wants_repaint` also covers the gap between key repeats).
-        ui.ctx().request_repaint();
+        true
     }
 
     /// Once-per-frame settle driver. MUST be called from `TypingTabState::draw` AFTER `canvas.draw`
@@ -626,7 +565,11 @@ impl TypingTextOverlayLayer {
     /// `canvas.draw`'s callees, so an earlier tick would observe the release only on the NEXT frame —
     /// delaying every move write by a frame and stranding it entirely when the release frame is the
     /// last one drawn.
-    pub(super) fn drive_layer_move_settle(&mut self, ctx: &egui::Context) {
+    ///
+    /// A `Pointer` session ends with the pointer button that started its gesture
+    /// (`layer_gesture_button`), a `Keyboard` one with the last held key bound to a nudge command
+    /// (`input::nudge_keys_held`, read from `registry`).
+    pub(super) fn drive_layer_move_settle(&mut self, ctx: &egui::Context, registry: &InputRegistry) {
         // Publish a status message parked by a settle that had no `egui::Context` (one driven from a
         // flush point). Done here because this is the one per-frame settle driver that has one.
         if let Some(message) = self.pending_status_error.take() {
@@ -635,19 +578,12 @@ impl TypingTextOverlayLayer {
         let Some(source) = self.move_session.as_ref().map(|session| session.source) else {
             return;
         };
-        // `keys_down` is level-triggered and survives our own `consume_key` (which only filters
-        // events), and egui clears it on focus loss — so an alt-tab mid-hold settles the session
-        // instead of leaving it open forever.
-        let (primary_down, any_arrow_down) = ctx.input(|i| {
-            (
-                i.pointer.primary_down(),
-                i.key_down(egui::Key::ArrowLeft)
-                    || i.key_down(egui::Key::ArrowRight)
-                    || i.key_down(egui::Key::ArrowUp)
-                    || i.key_down(egui::Key::ArrowDown),
-            )
-        });
-        if layer_move_settles(source, primary_down, any_arrow_down) {
+        // Held keys are level-triggered and survive the router's consumption of the key events, and
+        // egui clears them on focus loss — so an alt-tab mid-hold settles the session instead of
+        // leaving it open forever.
+        let gesture_down = self.layer_gesture_button_down(ctx);
+        let nudge_key_down = input::nudge_keys_held(ctx, registry);
+        if layer_move_settles(source, gesture_down, nudge_key_down) {
             self.settle_layer_move();
         }
     }
@@ -697,19 +633,19 @@ pub(super) fn snap_move_base_on_first_displacement(
 
 /// Pure settle decision for one move session.
 ///
-/// A `Pointer` gesture ends when the primary button is up; a `Keyboard` gesture ends on the first
-/// frame with no arrow key HELD (level-triggered, so OS key-repeat gaps do not split one hold into
-/// many gestures). Each source ignores the other's signal. A `Touch` gesture never settles here: the
+/// A `Pointer` gesture ends when its pointer button (`gesture_button_down`) is up; a `Keyboard`
+/// gesture ends on the first frame with no nudge key HELD (`nudge_key_down`, level-triggered, so OS
+/// key-repeat gaps do not split one hold into many gestures). Each source ignores the other's signal. A `Touch` gesture never settles here: the
 /// finger drag's own end settles or cancels it (`touch_layers.rs`).
 #[must_use]
 pub(super) fn layer_move_settles(
     source: TypingLayerMoveSource,
-    primary_down: bool,
-    any_arrow_down: bool,
+    gesture_button_down: bool,
+    nudge_key_down: bool,
 ) -> bool {
     match source {
-        TypingLayerMoveSource::Pointer => !primary_down,
-        TypingLayerMoveSource::Keyboard => !any_arrow_down,
+        TypingLayerMoveSource::Pointer => !gesture_button_down,
+        TypingLayerMoveSource::Keyboard => !nudge_key_down,
         TypingLayerMoveSource::Touch => false,
     }
 }

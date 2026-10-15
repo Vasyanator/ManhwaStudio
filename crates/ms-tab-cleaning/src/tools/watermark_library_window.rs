@@ -216,6 +216,9 @@ pub(super) struct LibraryPanelContext<'a> {
     pub armed: Option<&'a str>,
     /// True while a chapter worker owns the catalog, so membership must stay read-only.
     pub chapter_busy: bool,
+    /// The localized line naming the selection gesture accepted while a reservation is armed,
+    /// built by the tool from the current bindings.
+    pub arm_select_hint: &'a str,
 }
 
 /// One canvas selection the tool already cut out of its page and measured.
@@ -2487,13 +2490,11 @@ fn draw_arm_control(
             button = cancel_label
         ));
         // The GESTURE, on the surface the user is reading. The hint above says a selection is
-        // expected but not how to make one, and the one place that does say
-        // (`cleaning.region.selection_hint`) is painted in a DIFFERENT dock tab. It names the
-        // gesture that is accepted while armed — a plain ЛКМ drag, Shift optional — which is
-        // the contract `RegionEditToolBase::wants_primary_stroke` enforces in that state.
-        ui.small(t!(
-            "cleaning.tools.watermark.chapter.library_arm_gesture_hint"
-        ));
+        // expected but not how to make one, and the one place that does say (the region base's
+        // selection hint) is painted in a DIFFERENT dock tab. It names the gesture accepted while
+        // armed — `cleaning.region.select_rect_armed`, the selection mode optional — which is the
+        // contract `RegionEditToolBase::input_contexts` publishes in that state.
+        ui.small(ctx.arm_select_hint);
         return;
     }
     let label = t!("cleaning.tools.watermark.chapter.library_add_sample_button");
@@ -3246,6 +3247,7 @@ mod tests {
             saved_entries: &saved,
             armed: None,
             chapter_busy: false,
+            arm_select_hint: "",
         };
         assert_eq!(entry_membership("loaded", &ctx), EntryMembership::Loaded);
         assert_eq!(

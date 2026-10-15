@@ -95,8 +95,7 @@ mod tests {
         assert_eq!(tool.tool_id(), "ai_api_editor");
         assert!(!tool.title().is_empty());
         assert!(!tool.pytorch_required(), "the tool button must not be gated on Torch");
-        assert!(!tool.block_canvas_zoom(), "D5: blocking is precise, never the whole canvas");
-        assert!(!tool.block_canvas_zoom_on_ctrl_primary());
+        assert!(!tool.input_contexts().contains(&crate::input::EDITOR_WINDOW), "D5: the frame never takes the clean-overlay undo or the canvas zoom");
     }
 
     /// Two hosted tools sharing a salt would share egui's stored widget state.

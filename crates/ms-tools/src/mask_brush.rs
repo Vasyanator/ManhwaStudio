@@ -9,8 +9,6 @@ FILE HEADER (tools/mask_brush.rs)
     active only while a host publishes `BRUSH_ACTIVE`.
   - `MaskBrush::apply_input`: applies this frame's brush actions from an `InputFrame`.
   - `MaskBrush::step_by_notches` / `shrink_one_step` / `grow_one_step`: the radius laws.
-  - `MaskBrush::handle_wheel` / `handle_size_shortcuts`: TRANSITIONAL raw-input path kept only
-    for the Cleaning brushes until input-unification WP7 moves them to `apply_input`.
 - Ключевые методы:
   - `paint_mask_segment`: рисует/стирает сегмент маски круглой кистью.
   - `paint_binary_mask_segment`: рисует/стирает бинарную маску (`0/255`) без
@@ -48,7 +46,8 @@ fn brush_command(id: ActionId, title_key: &'static str, chords: Vec<Chord>) -> A
 }
 
 /// The shared brush actions, registered once by the studio. Every brush host (Translation mask
-/// edit and advanced recognition, Typing mask edit, later the Cleaning brushes) publishes
+/// edit and advanced recognition, Typing mask edit, the Cleaning brushes, region frame and
+/// region-editor window) publishes
 /// [`BRUSH_ACTIVE`] while its brush is on and calls [`MaskBrush::apply_input`].
 ///
 /// Shift+wheel also has a horizontal-wheel alternative: some backends deliver Shift+wheel as
@@ -82,9 +81,6 @@ pub struct MaskBrush {
     min_radius_px: usize,
     max_radius_px: usize,
     wheel_step_px: usize,
-    /// Sub-notch wheel remainder of the transitional raw path (`handle_wheel`) only; the frame
-    /// path (`apply_input`) gets whole notches from the router.
-    wheel_accum: f32,
 }
 
 impl Default for MaskBrush {
@@ -94,7 +90,6 @@ impl Default for MaskBrush {
             min_radius_px: 1,
             max_radius_px: 200,
             wheel_step_px: 2,
-            wheel_accum: 0.0,
         }
     }
 }
@@ -154,50 +149,6 @@ impl MaskBrush {
     pub fn grow_one_step(&mut self) -> bool {
         let next = (self.radius_px.saturating_mul(11).saturating_add(9) / 10).max(self.radius_px.saturating_add(1));
         self.set_radius_px(next.min(self.max_radius_px))
-    }
-
-    /// Transitional raw path: Shift + `delta_y` wheel points resize the brush (40 points per
-    /// notch). Returns `true` while Shift is held (the wheel belongs to the brush), `false` and a
-    /// reset remainder otherwise.
-    ///
-    /// Only for the Cleaning brushes, which still read the wheel themselves; removed when they
-    /// take [`Self::apply_input`] (input-unification WP7). New hosts never call it.
-    pub fn handle_wheel(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        const WHEEL_NOTCH: f32 = 40.0;
-        if !modifiers.shift {
-            self.wheel_accum = 0.0;
-            return false;
-        }
-        if delta_y.abs() <= f32::EPSILON {
-            return true;
-        }
-        self.wheel_accum += delta_y;
-        let notches = (self.wheel_accum / WHEEL_NOTCH).trunc();
-        if notches == 0.0 {
-            return true;
-        }
-        self.wheel_accum -= notches * WHEEL_NOTCH;
-        // `notches` is a whole number bounded by one frame's wheel travel, and a float-to-int
-        // `as` saturates, so the conversion cannot wrap.
-        self.step_by_notches(notches as i32);
-        true
-    }
-
-    /// Transitional raw path: `-` shrinks, `=` / `+` grow the brush (any modifiers, as before).
-    /// Returns whether the radius changed.
-    ///
-    /// Only for the Cleaning brushes, which still read their keys themselves; removed when they
-    /// take [`Self::apply_input`] (input-unification WP7). New hosts never call it.
-    pub fn handle_size_shortcuts(&mut self, ctx: &egui::Context) -> bool {
-        let (minus, equals, plus) = ctx.input(|i| (i.key_pressed(egui::Key::Minus), i.key_pressed(egui::Key::Equals), i.key_pressed(egui::Key::Plus)));
-        let mut changed = false;
-        if minus {
-            changed |= self.shrink_one_step();
-        }
-        if equals || plus {
-            changed |= self.grow_one_step();
-        }
-        changed
     }
 
     pub fn paint_mask_segment(

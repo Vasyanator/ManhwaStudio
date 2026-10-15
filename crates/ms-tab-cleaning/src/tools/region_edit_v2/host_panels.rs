@@ -174,7 +174,7 @@ impl RegionEditHost {
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut erase, false, t!("cleaning.tools.area_editor.brush_paint_button"));
             ui.selectable_value(&mut erase, true, t!("cleaning.tools.area_editor.brush_erase_button"))
-                .on_hover_text(t!("cleaning.tools.area_editor.brush_erase_hint"));
+                .on_hover_text(tf!("cleaning.tools.area_editor.brush_erase_gesture_hint", erase = self.labels.frame_erase));
         });
         self.frame.set_erase(erase);
     }

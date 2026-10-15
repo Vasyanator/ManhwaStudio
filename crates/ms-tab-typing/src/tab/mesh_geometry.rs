@@ -1600,15 +1600,15 @@ pub(super) fn snapped_move_mesh_base(
     snapped
 }
 
-/// One arrow-key nudge step in page px, from the keys consumed this frame.
+/// One nudge step in page px, from the nudge commands fired this frame.
 ///
-/// Both arrays are in `[left, right, up, down]` order: `plain_lrud` are the unmodified arrows (1 px)
-/// and `shift_lrud` the SHIFT ones (5 px). Opposite directions cancel and a plain + SHIFT press of
-/// the same direction add up, because egui reports each combination separately and a frame may carry
-/// several. `[0.0, 0.0]` means nothing was pressed — callers must then leave the layer alone.
+/// Both arrays are in `[left, right, up, down]` order: `plain_lrud` are the plain nudge commands
+/// (1 px) and `shift_lrud` the fast ones (`input::NUDGE_FAST_STEP_PX`). Opposite directions cancel
+/// and a plain + fast command of the same direction add up (a frame may carry several presses).
+/// `[0.0, 0.0]` means nothing fired — callers must then leave the layer alone.
 #[must_use]
 pub(super) fn arrow_nudge_step_px(plain_lrud: [bool; 4], shift_lrud: [bool; 4]) -> [f32; 2] {
-    const SHIFT_STEP_PX: f32 = 5.0;
+    const SHIFT_STEP_PX: f32 = super::input::NUDGE_FAST_STEP_PX;
     let axis = |negative: bool, positive: bool| f32::from(positive) - f32::from(negative);
     [
         axis(plain_lrud[0], plain_lrud[1])

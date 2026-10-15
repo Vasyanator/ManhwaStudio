@@ -542,16 +542,36 @@ impl TypingTextOverlayLayer {
         self.start_edit_overlay_render_job(edit_request);
     }
 
+    /// `typing.layout.delete_point` (default Delete): removes the LAST point of the layout editor's
+    /// active vector line and re-renders the edited layer. Editing sub-mode only (the command's
+    /// context). Returns whether a point was removed.
+    pub(super) fn layout_editor_delete_last_point(&mut self, ctx: &egui::Context) -> bool {
+        let Some(editor) = self.layout_editor.as_mut() else {
+            return false;
+        };
+        if editor.mode != TypingLayoutEditorMode::Editing {
+            return false;
+        }
+        let line_idx = editor.active_line_idx.min(editor.lines.len().saturating_sub(1));
+        let removed = editor.lines.get_mut(line_idx).is_some_and(|line| line.points.pop().is_some());
+        if removed {
+            self.rerender_layout_editor_overlay(ctx);
+        }
+        removed
+    }
+
     /// Draws the on-canvas layout-editor overlay for `page_idx` (Editing sub-mode only): the frame
     /// handles, vector lines/dots, and — painted UNDER the frame at `preview_opacity` — the edited
     /// overlay's current rendered text layer, so the artist can trace vector lines over the real text.
-    /// No-op when the editor is closed, in Preview, or bound to a different page.
+    /// No-op when the editor is closed, in Preview, or bound to a different page. Point and frame
+    /// gestures resolve through `input` (`tab/input.rs`, sub-context `typing.layout_editor.editing`).
     pub(super) fn draw_layout_editor_on_page(
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         view: PageView,
         clip_rect: Rect,
+        input: &InputFrame,
     ) {
         let page_idx = view.page_idx;
         let zoom = view.zoom;
@@ -589,6 +609,7 @@ impl TypingTextOverlayLayer {
             view,
             &line_rect_response,
             ctx,
+            input,
         );
 
         let frame_scene = layout_editor_frame_scene_rect(editor.frame_page_rect, view);
@@ -610,7 +631,10 @@ impl TypingTextOverlayLayer {
                 let page = view.page_px_from_scene(pos);
                 Pos2::new(page[0], page[1])
             });
-            if response.drag_started()
+            let resize_started = input
+                .gesture_for(&response, &[(input::TARGET_LAYOUT_HANDLE, true)])
+                .is_some_and(|hit| hit.action == input::LAYOUT_RESIZE_FRAME && hit.phase == HitPhase::DragStarted);
+            if resize_started
                 && let Some(pointer_page) = pointer_page
             {
                 editor.frame_drag = Some(TypingLayoutFrameDragState {

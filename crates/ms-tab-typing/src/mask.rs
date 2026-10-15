@@ -14,13 +14,16 @@ FILE HEADER (tabs/typing/mask.rs)
     слайдер допуска цвета). Саму панель — позицию, размер, сворачивание и заголовок
     вкладки — рисует док (`crates/ms-widgets/src/panel_dock`); `expire_status_error`
     вызывается каждый кадр, чтобы TTL статуса истекал и при закрытой панели.
-  - `draw_page_mask_overlay_and_handle_input`: рисование маски поверх страницы и кисть
-    (`ЛКМ` рисует, `ПКМ`/`Shift+ЛКМ` стирает) без блокировки GUI; размер кисти
-    меняется общей `MaskBrush` из `crates/ms-tools/src/mask_brush.rs` (`Shift+колесо`, `-`/`=`/`+`),
-    а курсор рисуется кольцом с корректным scene-радиусом. Метод возвращает `true`
-    только при реальном изменении битовой маски страницы.
-    В режиме заливки — запускает flood fill в worker-потоке по composited-цвету
-    (`страница + clean overlay`) из shared cache.
+  - `draw_page_mask_overlay_and_handle_input`: draws the mask over the page and runs the brush
+    without blocking the GUI. Input is the declared gestures of the `typing.mask_edit`
+    sub-context (`tab/input.rs`): `typing.mask.paint` / `typing.mask.erase` (erase decided at the
+    stroke's press, e.g. RMB or the `typing.mask.erase_mode` modifier + LMB) and, in fill mode,
+    `typing.mask.fill`. The brush size is the shared `MaskBrush` actions (`brush.size`,
+    `brush.smaller` / `brush.larger`, applied by `apply_brush_input` while the tab publishes
+    `ms_tools::mask_brush::BRUSH_ACTIVE`); the cursor is a ring with the correct scene radius.
+    Returns `true` only when the page's bit mask really changed. In fill mode it starts a flood
+    fill on a worker over the composited colour (`page + clean overlay`) from the shared cache.
+  - `set_input_labels`: the binding texts of the tab's hints (`TypingInputLabels`).
   - `clip_overlay_rgba_if_needed`: бинарное обрезание RGBA-текста по маске страницы.
   - `export_masks_snapshot`: отдаёт снимок масок (по страницам) для фонового экспорта
     финальных изображений без доступа к внутреннему mutable-состоянию слоя.
@@ -38,10 +41,12 @@ use ms_memory::{
 use ms_models::clean_overlays_model::CleanOverlaysModel;
 use ms_project::ProjectData;
 use crate::tab::PageView;
+use crate::tab::input::{self, TypingInputLabels};
+use ms_input::{HitPhase, InputFrame};
 use ms_tools::MaskBrush;
 use ms_widgets::WheelSlider;
 use eframe::egui;
-use egui::{Color32, CursorIcon, Id, PointerButton, Pos2, Rect, Sense};
+use egui::{Color32, CursorIcon, Id, Pos2, Rect, Sense};
 // `write_image` is a `PngEncoder` method from this trait; needed for the in-memory
 // PNG encode that replaces `image::save_buffer` on the storage seam.
 use image::ImageEncoder;
@@ -138,6 +143,8 @@ pub struct TypingMaskLayer {
     /// fill and per page clear (never per frame; loading a chapter's masks is not an edit). The mask
     /// is outside the autosave gate's writers, so this is how a caller tells "edited since X".
     edit_count: u64,
+    /// Binding texts of the tab's hints (pushed by the tab when they change).
+    input_labels: TypingInputLabels,
 }
 
 impl Default for TypingMaskLayer {
@@ -160,6 +167,7 @@ impl Default for TypingMaskLayer {
             mask_brush: MaskBrush::default(),
             status_error: None,
             edit_count: 0,
+            input_labels: TypingInputLabels::default(),
         }
     }
 }
@@ -171,6 +179,11 @@ impl TypingMaskLayer {
 
     pub fn is_panel_open(&self) -> bool {
         self.panel_open
+    }
+
+    /// Sets the binding texts the mask tab's hints show (`tab/input.rs`).
+    pub(crate) fn set_input_labels(&mut self, labels: TypingInputLabels) {
+        self.input_labels = labels;
     }
 
     pub fn gpu_memory_snapshot(&self, pinned_pages: &BTreeSet<usize>) -> Vec<CacheResourceInfo> {
@@ -493,11 +506,11 @@ impl TypingMaskLayer {
         }
         ui.separator();
         if self.fill_mode {
-            ui.label(t!("typing.mask.hint_fill_by_color"));
+            ui.label(tf!("typing.mask.fill_hint", binding = self.input_labels.mask_fill.as_str()));
             ui.label(t!("typing.mask.hint_cursor_crosshair"));
         } else {
-            ui.label(t!("typing.mask.hint_draw"));
-            ui.label(t!("typing.mask.hint_erase"));
+            ui.label(tf!("typing.mask.paint_hint", binding = self.input_labels.mask_paint.as_str()));
+            ui.label(tf!("typing.mask.erase_hint", binding = self.input_labels.mask_erase.as_str()));
         }
         if let Some((message, _)) = self.status_error.as_ref() {
             ui.separator();
@@ -505,7 +518,10 @@ impl TypingMaskLayer {
         }
     }
 
-    pub fn draw_page_mask_overlay_and_handle_input(&mut self, ui: &mut egui::Ui, view: PageView) -> bool {
+    /// Draws the mask of `view`'s page and runs the mask gestures of `input` on it (see the file
+    /// header). The brush senses DRAGS only, so its stroke starts at the press (a click paints a
+    /// dot); fill mode senses CLICKS only. A stroke paints or erases as decided at its press.
+    pub fn draw_page_mask_overlay_and_handle_input(&mut self, ui: &mut egui::Ui, view: PageView, input: &InputFrame) -> bool {
         let page_idx = view.page_idx;
         let image_rect = view.image_rect;
         if !self.panel_open {
@@ -514,10 +530,11 @@ impl TypingMaskLayer {
         }
 
         let mut mask_changed = false;
+        let sense = if self.fill_mode { Sense::click() } else { Sense::drag() };
         let response = ui.interact(
             image_rect,
             Id::new(("typing_mask_overlay_page", page_idx)),
-            Sense::click_and_drag(),
+            sense,
         );
         if response.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
@@ -527,16 +544,11 @@ impl TypingMaskLayer {
             .interact_pointer_pos()
             .or_else(|| response.hover_pos());
         let hover_pos = response.hover_pos();
-        let (primary_down, secondary_down, shift_down) = ui.ctx().input(|input| {
-            (
-                input.pointer.primary_down(),
-                input.pointer.secondary_down(),
-                input.modifiers.shift,
-            )
-        });
+        let gesture = input.gesture_for(&response, &[(input::TARGET_MASK_PAGE, true)]);
         if self.fill_mode {
             self.active_stroke = None;
-            if response.clicked_by(PointerButton::Primary)
+            let fill_clicked = gesture.as_ref().is_some_and(|hit| hit.action == input::MASK_FILL && hit.phase == HitPhase::Clicked);
+            if fill_clicked
                 && self.fill_job_rx.is_none()
                 && pointer_pos.is_some_and(|pos| image_rect.contains(pos))
                 && let Some(pos) = pointer_pos
@@ -545,13 +557,16 @@ impl TypingMaskLayer {
                 self.set_error(ui.ctx(), err);
             }
         } else {
-            let mode = if secondary_down || (primary_down && shift_down) {
-                Some(true)
-            } else if primary_down {
-                Some(false)
-            } else {
-                None
-            };
+            // `Some(erase)` while a paint / erase stroke runs (its press decided which).
+            let mode = gesture.filter(|hit| matches!(hit.phase, HitPhase::DragStarted | HitPhase::Dragging)).and_then(|hit| {
+                if hit.action == input::MASK_ERASE {
+                    Some(true)
+                } else if hit.action == input::MASK_PAINT {
+                    Some(false)
+                } else {
+                    None
+                }
+            });
 
             if mode.is_none() {
                 self.active_stroke = None;
@@ -1645,19 +1660,36 @@ mod tests {
         assert!(!layer.masks_loaded_for_dir(&PathBuf::from("/chapter/b")));
     }
 
-    /// Runs one headless frame of the mask overlay over a 64x64 page at zoom 1 with `events`.
-    fn mask_frame(ctx: &egui::Context, layer: &mut TypingMaskLayer, events: Vec<egui::Event>) {
+    /// An input router over the studio's view set, the shared brush set and the Typing
+    /// declarations — what the mask gestures resolve against in the app.
+    fn mask_router() -> ms_input::InputRouter {
+        let mut declarations = ms_input::Declarations::default();
+        declarations.extend(ms_input::view::declarations());
+        declarations.extend(ms_tools::mask_brush::declarations());
+        declarations.extend(input::declarations());
+        ms_input::InputRouter::new(ms_input::InputRegistry::new(declarations).expect("the typing declarations are valid"))
+    }
+
+    /// Runs one headless frame of the mask overlay over a 64x64 page at zoom 1 with `events`, the
+    /// Typing tab active with the mask open (its contexts published), through `router`.
+    fn mask_frame(ctx: &egui::Context, router: &mut ms_input::InputRouter, layer: &mut TypingMaskLayer, events: Vec<egui::Event>) {
         let view = PageView { page_idx: 0, image_rect: Rect::from_min_size(Pos2::ZERO, egui::vec2(64.0, 64.0)), zoom: 1.0 };
-        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 200.0))), events, ..egui::RawInput::default() };
-        let output = ctx.run_ui(input, |ui| {
-            layer.draw_page_mask_overlay_and_handle_input(ui, view);
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(200.0, 200.0))), events, ..egui::RawInput::default() };
+        let env = ms_input::FrameEnv {
+            active_tab: Some(ms_config::app_tab::AppTab::Typing),
+            contexts: vec![input::MASK_EDIT, ms_tools::mask_brush::BRUSH_ACTIVE],
+            modal_open: false,
+        };
+        let output = ctx.run_ui(raw, |ui| {
+            let frame = router.begin_frame(ui.ctx(), &env);
+            layer.draw_page_mask_overlay_and_handle_input(ui, view, frame);
         });
         // The mask tiles queue texture uploads no renderer applies here.
         output.drop_without_applying_deltas();
     }
 
     fn press(pos: Pos2, pressed: bool) -> egui::Event {
-        egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }
     }
 
     /// Review Medium-1: a mask edit counts ONCE per gesture (a multi-frame stroke is one edit, a
@@ -1666,27 +1698,60 @@ mod tests {
     #[test]
     fn mask_edits_are_counted_once_per_gesture() {
         let ctx = egui::Context::default();
+        let mut router = mask_router();
         let mut layer = TypingMaskLayer { panel_open: true, ..TypingMaskLayer::default() };
-        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(10.0, 10.0))]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(10.0, 10.0))]);
         assert_eq!(layer.edit_count(), 0, "hovering is not an edit");
 
         // Stroke 1: press, two drag frames, release.
-        mask_frame(&ctx, &mut layer, vec![press(Pos2::new(10.0, 10.0), true)]);
-        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(20.0, 10.0))]);
-        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(30.0, 10.0))]);
-        mask_frame(&ctx, &mut layer, vec![press(Pos2::new(30.0, 10.0), false)]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![press(Pos2::new(10.0, 10.0), true)]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(20.0, 10.0))]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(30.0, 10.0))]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![press(Pos2::new(30.0, 10.0), false)]);
         assert!(layer.masks.get(&0).is_some_and(TypingPageMask::has_active_pixels), "the stroke painted");
         assert_eq!(layer.edit_count(), 1, "a multi-frame stroke is one edit");
 
         // Stroke 2.
-        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(10.0, 40.0)), press(Pos2::new(10.0, 40.0), true)]);
-        mask_frame(&ctx, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(30.0, 40.0))]);
-        mask_frame(&ctx, &mut layer, vec![press(Pos2::new(30.0, 40.0), false)]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(10.0, 40.0)), press(Pos2::new(10.0, 40.0), true)]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(30.0, 40.0))]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![press(Pos2::new(30.0, 40.0), false)]);
         assert_eq!(layer.edit_count(), 2, "a second gesture is a second edit");
 
         layer.clear_mask_page(0);
         assert_eq!(layer.edit_count(), 3, "clearing a painted page is an edit");
         layer.clear_mask_page(0);
         assert_eq!(layer.edit_count(), 3, "clearing an empty page changes nothing");
+    }
+
+    /// A stroke pressed with the erase modifier (default Shift, `typing.mask.erase_mode`) erases
+    /// what a plain stroke painted; a right-button stroke erases too. The decision is the press's.
+    #[test]
+    fn a_stroke_pressed_with_the_erase_modifier_erases() {
+        let ctx = egui::Context::default();
+        let mut router = mask_router();
+        let mut layer = TypingMaskLayer { panel_open: true, ..TypingMaskLayer::default() };
+        let shift = |on: bool| egui::Event::ModifiersChanged(if on { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE });
+        // A first frame registers the mask widget: egui hit-tests against the previous frame's rects.
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(10.0, 10.0))]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![press(Pos2::new(10.0, 10.0), true)]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(30.0, 10.0))]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![press(Pos2::new(30.0, 10.0), false)]);
+        assert!(layer.masks.get(&0).is_some_and(TypingPageMask::has_active_pixels), "the plain stroke painted");
+
+        // The pointer events carry the held modifiers, as egui-winit sends them.
+        let shift_press = |pos: Pos2, pressed: bool| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::SHIFT };
+        mask_frame(&ctx, &mut router, &mut layer, vec![shift(true), egui::Event::PointerMoved(Pos2::new(10.0, 10.0))]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![shift_press(Pos2::new(10.0, 10.0), true)]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(30.0, 10.0))]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![shift_press(Pos2::new(30.0, 10.0), false), shift(false)]);
+        assert!(!layer.masks.get(&0).is_some_and(TypingPageMask::has_active_pixels), "the Shift stroke erased it");
+
+        mask_frame(&ctx, &mut router, &mut layer, vec![egui::Event::PointerMoved(Pos2::new(10.0, 40.0)), press(Pos2::new(10.0, 40.0), true)]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![press(Pos2::new(10.0, 40.0), false)]);
+        assert!(layer.masks.get(&0).is_some_and(TypingPageMask::has_active_pixels), "a plain press paints a dot");
+        let right = |pressed: bool| egui::Event::PointerButton { pos: Pos2::new(10.0, 40.0), button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE };
+        mask_frame(&ctx, &mut router, &mut layer, vec![right(true)]);
+        mask_frame(&ctx, &mut router, &mut layer, vec![right(false)]);
+        assert!(!layer.masks.get(&0).is_some_and(TypingPageMask::has_active_pixels), "a right-button press erases the dot");
     }
 }

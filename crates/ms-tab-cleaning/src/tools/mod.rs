@@ -2,7 +2,7 @@
 FILE HEADER (tabs/cleaning/tools/mod.rs)
 - Назначение: корневой модуль инструментов клининга.
 - Экспорт:
-  - `CleaningTool`, `StrokePoint`, `StrokeModifiers` из `base.rs`.
+  - `CleaningTool`, `StrokePoint` из `base.rs` (the stroke modes are `crate::input::StrokeModes`).
   - Конкретные инструменты вкладки cleaning:
     `ZamazkaTool`, `StampTool`, `PatchTool`, `GradientFillTool`,
     `TextureSynthesisInpaintTool`, `AotInpaintTool`,
@@ -42,7 +42,6 @@ mod mask_generation;
 
 mod region_png;
 
-pub use base::StrokeModifiers;
 pub use base::{CleaningCursorOccluder, CleaningTool, StrokePoint};
 
 mod gradient;

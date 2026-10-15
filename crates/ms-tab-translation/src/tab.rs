@@ -6,9 +6,9 @@ text detector, and footer metadata synchronization with CanvasView/BubblesModel.
 Main types:
 - `TranslationPanel`: active floating panel (`None`, `Bubbles`, `Ocr`, `Composition`,
   `MachineTranslation`, `TextDetector`).
-- `OcrDragSelection`: transient OCR region selection on canvas (`start`, `current`).
-- `ImageCropDragSelection`: transient ImageBubble crop selection (`Shift+Q+drag`) that writes
-  crop metadata instead of dispatching OCR.
+- `canvas_input::CanvasSelection` (child module `tab/canvas_input.rs`): the running canvas-wide
+  rect selection (quick OCR, advanced recognition, image-bubble page crop) driven from the input
+  router's claim; the crop writes crop metadata instead of dispatching OCR.
 - `AdvancedRecognitionWindow`: floating OCR preview/editor for manual region recognition.
 - `OcrToast`: short-lived foreground notification (`text`, `severity`, `hide_at_s`); its colour
   comes from `ms_theme::Severity` (toasts and detector status never hand-type colours).
@@ -35,12 +35,9 @@ Key constants:
 - `TEXT_DETECTOR_OCR_RETRY_DELAY_SECS`: retry delay for failed detector-ocr block.
 
 TranslationPanel helpers:
-- `title_with_hotkey`: localized panel caption with hotkey hint (`[P]`, `[O]`, ...).
-- `open_button_label`: compact canvas button caption with hotkey hint (`(P)`, `(O)`, ...).
+- `panel_title`: localized panel caption with its toggle's binding text (`[P]`, ...).
+- `open_button_label`: compact canvas button caption with that binding text (`(P)`, ...).
 - `Default::default`: defaults to `TranslationPanel::None`.
-
-OcrDragSelection helper:
-- `rect`: current normalized selection rectangle.
 
 TranslationTabState lifecycle:
 - `new`: initializes state and starts async settings saver worker.
@@ -48,6 +45,8 @@ TranslationTabState lifecycle:
 - `Drop::drop`: sends shutdown sentinel and joins settings saver thread.
 
 TranslationTabState public API:
+- `begin_input_frame` / `end_input_frame`: the host hands the frame's input (and binding labels)
+  to the state for its draw; `input_contexts`, `lines_edit_active`, `input_labels` feed the host.
 - `sync_with_project_settings`: lazy-loads OCR/MT/composition/text-detector settings.
 - `draw_side_panel`: draws floating panel window and active panel body (takes the app's
   `page_infos` for the detector panel's per-page plan notice).
@@ -103,15 +102,10 @@ Characters/footer sync:
 
 OCR flow:
 - `poll_ocr_events`: consumes OCR controller events, toasts, optional bubble insert, retry logic.
-- `handle_ocr_selection`: OCR selection capture layer and finalize behavior.
-- `touch_selection_mode` / `touch_selection_mode_for` / `begin_touch_ocr_selection`: the finger
-  long-press selection drag of the held OCR / crop mode, or with no key held of the panel's
-  finger OCR kind (`OcrPanelOptions::finger_selection`), driven through
-  `ms_canvas::drive_touch_drag`; it ends on lift only (never on a modifier release), and on an
-  unavailable OCR route it is refused with a toast (`finger_ocr_selection_refused`). The capture
-  areas are registered as touch capture layers of the canvas, so a plain finger pans under them.
+- `drive_canvas_selection` (`tab/canvas_input.rs`): the canvas-wide rect selections, mouse and
+  finger alike, from `InputFrame::claimed`; an OCR selection on an unavailable route is refused
+  with a toast at its start.
 - `open_advanced_recognition_for_scene_rect`: opens advanced-recognition window for selected scene rect.
-- `wants_canvas_shift_drag_selection` (CanvasHooks): reserves canvas drag for OCR capture.
 
 Text detector flow:
 - `poll_text_detector_events`: consumes detector events and updates status/progress/results.
@@ -134,10 +128,9 @@ Text detector flow:
 - `maybe_dispatch_next_textdetector_ocr_request`: scheduler for sequential detector OCR.
 - `finish_textdetector_ocr_if_done`: finalize detector OCR batch.
 - `abort_textdetector_ocr`: hard-reset detector OCR state after a fatal condition (error status) or a user stop (neutral status).
-- `draw_text_detector_line_edit_overlay_on_page`, `handle_text_detector_line_edit_hotkeys`,
-  `create_text_detector_line_at_uv`: интерактивный режим правки строк + Del/N + создание из ПКМ.
-- `draw_text_detector_mask_edit_overlay_on_page`: интерактивный режим правки маски
-  детектора кистью (`ЛКМ` рисует, `ПКМ`/`Shift+ЛКМ` стирают).
+- `create_text_detector_line_at_uv`: adds a line (page menu item "create line", lines edit).
+- `tab/canvas_input.rs`: the lines editor and the mask brush on the page (their gestures and
+  the lines delete / new commands come from the input frame, `crate::input`).
 
 Machine translation flow:
 - `poll_mt_events`: consumes MT controller events and applies translated text to canvas.
@@ -177,7 +170,7 @@ Module-level utility functions:
   `text_detection_mask_file_path`, `load_text_detection_storage`,
   `load_text_detection_page`, `save_text_detection_storage`, `save_text_detection_page`.
 - Misc helpers:
-  `parse_u32_pair`, `contains_any_page`.
+  `parse_u32_pair`.
 - Async settings persistence:
   `spawn_translation_settings_saver_thread`, `save_translation_settings_to_project_file`.
 - Settings parsing/conversion:
@@ -200,7 +193,9 @@ Key TranslationTabState field groups:
   shared `text_mask_model`, `text_mask_synced_revision`,
   `text_detector_status`, `text_detector_status_severity`, `text_detector_progress`,
   `text_detection_storage_*`.
-- OCR interaction runtime: `ocr_selection`, `ocr_toast`, `next_ocr_request_id`,
+- Input: `input_frame` (this frame's `InputFrame`, `Some` only during the host's draw),
+  `input_labels` (this frame's binding texts).
+- OCR interaction runtime: `canvas_selection`, `ocr_toast`, `next_ocr_request_id`,
   `advanced_recognition`, `advanced_recognition_request`, `pending_bubble_inserts`,
   `pending_textdetector_ocr_tasks`,
   `textdetector_ocr_active_*`, `textdetector_ocr_retry_state`, `textdetector_ocr_* counters`.
@@ -222,9 +217,10 @@ Key TranslationTabState field groups:
 use ms_widgets::bubble_status::{BubbleBorderStyle, BubbleStatusContext, evaluate_bubble_status_rules};
 use ms_canvas::{
     BubbleAction, BubbleClass, CANVAS_RIBBON_TAB, CanvasHooks, CanvasScrollbarContext,
-    CanvasUiStatus, CanvasView, TouchDrivenDrag, TranslationStatusDisplay, drive_touch_drag,
+    CanvasUiStatus, CanvasView, TranslationStatusDisplay,
 };
-use ms_input::{ActionId, ActionMeta, ActionSpec, Binding, Button, Chord, CommandSpec, InputFrame, ModeEffect, ModeSpec, ModifierKey, ReleasePolicy, Scope};
+use ms_input::{InputFrame, InputRegistry};
+use crate::input::{ContextFacts, TranslationInputLabels};
 use ms_memory::{
     CacheEvictionReport, CacheEvictionRequest, CacheReloadCost, CacheResourceInfo,
     CacheResourceKind, select_eviction_candidates,
@@ -268,7 +264,7 @@ use crate::panels::machine_translation::{
     MtPanelOptions, MtPanelProgress, MtPanelRun, MtPanelTab, MtStopNotice, draw_machine_translation_panel,
 };
 use crate::panels::ocr::{
-    CharReplacementRuleUi, FingerOcrSelection, OcrPanelModelView, OcrPanelOptions, draw_ocr_panel, selected_mode_requirement,
+    CharReplacementRuleUi, OcrPanelModelView, OcrPanelOptions, OcrSelectionHints, draw_ocr_panel, selected_mode_requirement,
 };
 use crate::panels::text_detector::{
     DetectorUnavailable, TextDetectorAlgorithm, TextDetectorPanelOptions, TextDetectorPanelView, TextDetectorPlanNoticeCache,
@@ -299,6 +295,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use ms_thread::{self as thread, JoinHandle};
 use web_time::Duration;
+
+// The canvas pointer drivers (rect selections, lines / mask edit), fed by the input frame.
+mod canvas_input;
+
+use canvas_input::CanvasSelection;
 
 /// (detected results per page, total loaded, total failed)
 type DetectionLoadResult = Result<(Vec<(usize, TextDetectorPageResult)>, usize, usize), String>;
@@ -348,7 +349,8 @@ const RECENT_CHARACTER_HISTORY_LIMIT: usize = 6;
 // literal: it is the identity the persisted layout and every egui id of the
 // owning panel derive from (`dev-docs/i18n_exclusions.md` §A9).
 /// «Последние персонажи» — the row of cards naming the last
-/// [`RECENT_CHARACTER_HISTORY_LIMIT`] characters, one per digit hotkey.
+/// [`RECENT_CHARACTER_HISTORY_LIMIT`] characters, one per recent-character parameter mode
+/// (`crate::input::RECENT_CHARS`).
 const TRANSLATION_RECENT_CHARACTERS_TAB: TabId = TabId::new("translation.recent_characters");
 
 /// Gap, in points, between two recent-character cards on both axes.
@@ -464,54 +466,6 @@ pub fn translation_default_dock_layout() -> DockLayout {
     layout
 }
 
-/// Mode: quick OCR selection while held (default Shift). Persistence key, never rename.
-pub const HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE: ActionId = ActionId("translation.ocr.quick_mode");
-/// Mode: advanced OCR selection while held (default Alt); beats the quick mode. Persistence key.
-pub const HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE: ActionId = ActionId("translation.ocr.advanced_mode");
-pub const HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL: ActionId = ActionId("translation.panel.bubbles.toggle");
-pub const HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL: ActionId = ActionId("translation.panel.ocr.toggle");
-pub const HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL: ActionId = ActionId("translation.panel.composition.toggle");
-pub const HOTKEY_TRANSLATION_TOGGLE_MT_PANEL: ActionId = ActionId("translation.panel.machine_translation.toggle");
-pub const HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL: ActionId = ActionId("translation.panel.detector.toggle");
-pub const HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL: ActionId = ActionId("translation.bubble.copy_original");
-pub const HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION: ActionId = ActionId("translation.bubble.copy_translation");
-pub const HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL: ActionId = ActionId("translation.bubble.paste_original");
-pub const HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION: ActionId = ActionId("translation.bubble.paste_translation");
-
-/// The declaration part every Translation action shares: tab scope, no extra condition.
-#[must_use]
-pub(crate) fn translation_action_meta(id: ActionId, title_key: &'static str, section_key: &'static str, defaults: Vec<Binding>) -> ActionMeta {
-    ActionMeta { id, title_key, section_key, scope: Scope::Tab(AppTab::Translation), when: Vec::new(), defaults }
-}
-
-/// A Translation-scope command (no accepted parameter modes, no auto-repeat).
-#[must_use]
-pub(crate) fn translation_command_spec(id: ActionId, title_key: &'static str, section_key: &'static str, defaults: Vec<Binding>) -> ActionSpec {
-    ActionSpec::Command(CommandSpec { meta: translation_action_meta(id, title_key, section_key, defaults), accepts: Vec::new(), repeat: false })
-}
-
-/// The default alternatives "this key, no modifier".
-#[must_use]
-pub(crate) fn single_key_binding(key: egui::Key) -> Vec<Binding> {
-    vec![Binding::command(Chord::new([Button::Key(key)]))]
-}
-
-/// Binding texts and held-mode flags the tab state shows, filled by the host every frame from
-/// the input registry's labels (`None` = the action has no binding: no hint is shown) and the
-/// input frame's active modes.
-#[derive(Debug, Clone, Default)]
-pub struct TranslationHotkeyHints {
-    pub ocr_quick_selection_mode: Option<String>,
-    pub ocr_quick_selection_mode_modifier_down: bool,
-    pub ocr_advanced_selection_mode: Option<String>,
-    pub ocr_advanced_selection_mode_modifier_down: bool,
-    pub bubbles_panel: Option<String>,
-    pub ocr_panel: Option<String>,
-    pub composition_panel: Option<String>,
-    pub machine_translation_panel: Option<String>,
-    pub text_detector_panel: Option<String>,
-}
-
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum TranslationPanel {
     #[default]
@@ -544,133 +498,6 @@ impl TranslationPanel {
             TranslationPanel::MachineTranslation => t!("translation.tab.panel_mt_short_title"),
             TranslationPanel::TextDetector => t!("translation.text_detector.title"),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum OcrSelectionKind {
-    Simple,
-    Advanced,
-}
-
-impl From<FingerOcrSelection> for OcrSelectionKind {
-    fn from(finger: FingerOcrSelection) -> Self {
-        match finger {
-            FingerOcrSelection::Quick => Self::Simple,
-            FingerOcrSelection::Advanced => Self::Advanced,
-        }
-    }
-}
-
-/// The capture mode a finger long-press drag drives this frame (see `touch_selection_mode`).
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum TouchSelectionMode {
-    /// Shift+Q held: page-crop selection for an image bubble.
-    ImageCrop,
-    /// Quick or advanced OCR of the selected rect: the held OCR modifier's kind, or with no
-    /// key held the panel's finger OCR kind.
-    Ocr(OcrSelectionKind),
-}
-
-/// The per-frame facts [`touch_selection_mode_for`] decides on.
-#[derive(Debug, Clone, Copy)]
-struct TouchSelectionInputs {
-    /// The crop chord (Shift+Q) is held.
-    crop_keys_down: bool,
-    /// The advanced recognition window is open (it owns OCR until closed).
-    advanced_window_open: bool,
-    /// A text-detector edit mode (lines or mask) is on: its own long-press meaning stays.
-    detector_edit_mode: bool,
-    /// The advanced OCR modifier is held.
-    advanced_held: bool,
-    /// The quick OCR modifier is held.
-    quick_held: bool,
-    /// The panel's finger OCR kind, used when no key is held.
-    finger_kind: OcrSelectionKind,
-}
-
-/// The capture mode a finger long-press drag drives (pure; see
-/// `TranslationTabState::touch_selection_mode`): the crop chord, then a held advanced or quick
-/// modifier — the pointer path's precedence — and with no key held the finger OCR kind, unless
-/// the advanced window is open or a text-detector edit mode is on (`None`: the drag pans). The
-/// OCR route is NOT consulted: an unavailable route still claims the drag so it can be refused
-/// visibly (`finger_ocr_selection_refused`).
-fn touch_selection_mode_for(inputs: TouchSelectionInputs) -> Option<TouchSelectionMode> {
-    if inputs.crop_keys_down {
-        return Some(TouchSelectionMode::ImageCrop);
-    }
-    if inputs.advanced_window_open {
-        return None;
-    }
-    if inputs.advanced_held {
-        Some(TouchSelectionMode::Ocr(OcrSelectionKind::Advanced))
-    } else if inputs.quick_held {
-        Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple))
-    } else if inputs.detector_edit_mode {
-        None
-    } else {
-        Some(TouchSelectionMode::Ocr(inputs.finger_kind))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct OcrDragSelection {
-    start: Pos2,
-    current: Pos2,
-    kind: OcrSelectionKind,
-    recent_character_rank: Option<usize>,
-    /// Started by a finger long-press (`drive_touch_drag`), not by a mouse drag: the finger's
-    /// `TouchSelection` moves it and ends it, the pointer path never does.
-    touch: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ImageCropDragSelection {
-    start: Pos2,
-    current: Pos2,
-    /// Started by a finger long-press; see `OcrDragSelection::touch`.
-    touch: bool,
-}
-
-impl TouchDrivenDrag for OcrDragSelection {
-    fn is_touch_driven(&self) -> bool {
-        self.touch
-    }
-
-    fn set_current(&mut self, pos: Pos2) {
-        self.current = pos;
-    }
-}
-
-impl TouchDrivenDrag for ImageCropDragSelection {
-    fn is_touch_driven(&self) -> bool {
-        self.touch
-    }
-
-    fn set_current(&mut self, pos: Pos2) {
-        self.current = pos;
-    }
-}
-
-impl ImageCropDragSelection {
-    fn rect(self) -> Rect {
-        Rect::from_two_pos(self.start, self.current)
-    }
-}
-
-impl OcrDragSelection {
-    fn rect(&self) -> Rect {
-        Rect::from_two_pos(self.start, self.current)
-    }
-
-    /// Whether the pointer path ends this selection this frame: a mouse selection ends on a
-    /// drag stop or on releasing its own modifier. A finger one never ends here — only on lift
-    /// or cancel (`drive_touch_drag`), since it may run with no key held at all.
-    fn pointer_should_finish(&self, drag_stopped: bool, advanced_held: bool, quick_held: bool) -> bool {
-        !self.touch
-            && (drag_stopped
-                || (self.kind == OcrSelectionKind::Advanced && !advanced_held)
-                || (self.kind == OcrSelectionKind::Simple && !quick_held))
     }
 }
 
@@ -862,17 +689,17 @@ pub struct TranslationTabState {
     ribbon_panel_rect: Option<Rect>,
     text_detector_line_selection: Option<TextDetectorLineSelection>,
     text_detector_line_drag_state: Option<TextDetectorLineDragState>,
+    /// Where (page-normalized) the lines edit page menu was opened: its "create line" item adds
+    /// the line there.
+    text_detector_line_menu_uv: Option<Pos2>,
     text_detector_mask_stroke_state: Option<TextDetectorMaskStrokeState>,
     text_detector_mask_brush: MaskBrush,
     text_detection_storage_loaded_for: Option<PathBuf>,
     text_detection_storage_busy: bool,
     text_detection_storage_rx: Option<Receiver<TextDetectionStorageEvent>>,
-    ocr_selection: Option<OcrDragSelection>,
-    image_crop_selection: Option<ImageCropDragSelection>,
-    /// Edge gate for the plain-`Q` image-bubble shortcut. Cleared while `Q` participates in a
-    /// `Shift+Q` crop session or after a creation, and re-armed only once `Q` is fully released, so
-    /// a lingering `Q` (e.g. `Shift` released a frame before `Q`) cannot spawn an extra bubble.
-    image_create_q_armed: bool,
+    /// The running canvas-wide rect selection (quick / advanced OCR, image crop), driven from the
+    /// router's claim (`canvas_input::advance_selection`).
+    canvas_selection: Option<CanvasSelection>,
     advanced_recognition: AdvancedRecognitionWindow,
     advanced_recognition_request: Option<BuiltOcrRequest>,
     ocr_toast: Option<OcrToast>,
@@ -943,7 +770,11 @@ pub struct TranslationTabState {
     composition_panel_state: CompositionPanelState,
     composition_rebuild_requested: bool,
     expand_panel_on_show: bool,
-    hotkey_hints: TranslationHotkeyHints,
+    /// This frame's binding texts (`TranslationInputLabels::from_registry`), set by the host.
+    input_labels: TranslationInputLabels,
+    /// This frame's input, set by the host for its draw (`begin_input_frame`) and cleared after
+    /// it (`end_input_frame`); the canvas hooks and panels read it. `None` outside the draw.
+    input_frame: Option<InputFrame>,
     last_is_known_character: bool,
     last_character_name: String,
     last_clarification: String,
@@ -968,41 +799,6 @@ impl Default for TranslationTabState {
 }
 
 impl TranslationTabState {
-    /// The tab state's own input actions, in declaration order: the two OCR selection modes
-    /// (`advanced` beats `quick` when both are held), the five panel toggles and the four bubble
-    /// copy / paste commands (unbound by default). All in the Translation tab scope; the host
-    /// declares its canvas commands before them (`TranslationTab::input_declarations`). Ids are
-    /// persistence keys of the user's overrides: never rename them.
-    #[must_use]
-    pub fn input_actions() -> Vec<ActionSpec> {
-        let shift = Button::Modifier(ModifierKey::Shift);
-        let alt = Button::Modifier(ModifierKey::Alt);
-        let ocr_mode = |id: ActionId, title_key: &'static str, button: Button, beats: Vec<ActionId>| {
-            ActionSpec::Mode(ModeSpec {
-                meta: translation_action_meta(id, title_key, "app.hotkey.ocr_category", vec![Binding::mode([button])]),
-                effect: ModeEffect::Immediate,
-                on_release_mid_gesture: ReleasePolicy::Commit,
-                beats,
-                param: None,
-            })
-        };
-        const PANELS: &str = "translation.tab.hotkey_scope_panels";
-        const BUBBLES: &str = "translation.tab.bubbles_title";
-        vec![
-            ocr_mode(HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE, "translation.tab.hotkey_quick_recognition", shift, Vec::new()),
-            ocr_mode(HOTKEY_TRANSLATION_OCR_ADVANCED_SELECTION_MODE, "translation.tab.hotkey_advanced_recognition", alt, vec![HOTKEY_TRANSLATION_OCR_QUICK_SELECTION_MODE]),
-            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_BUBBLES_PANEL, "translation.tab.hotkey_open_bubbles", PANELS, single_key_binding(egui::Key::P)),
-            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_OCR_PANEL, "translation.tab.hotkey_open_ocr", PANELS, single_key_binding(egui::Key::S)),
-            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_COMPOSITION_PANEL, "translation.tab.hotkey_open_composition", PANELS, single_key_binding(egui::Key::K)),
-            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_MT_PANEL, "translation.tab.hotkey_open_mt", PANELS, single_key_binding(egui::Key::M)),
-            translation_command_spec(HOTKEY_TRANSLATION_TOGGLE_DETECTOR_PANEL, "translation.tab.hotkey_open_text_detector", PANELS, single_key_binding(egui::Key::D)),
-            translation_command_spec(HOTKEY_TRANSLATION_COPY_BUBBLE_ORIGINAL, "translation.tab.hotkey_copy_original", BUBBLES, Vec::new()),
-            translation_command_spec(HOTKEY_TRANSLATION_COPY_BUBBLE_TRANSLATION, "translation.tab.hotkey_copy_translation", BUBBLES, Vec::new()),
-            translation_command_spec(HOTKEY_TRANSLATION_PASTE_BUBBLE_ORIGINAL, "translation.tab.hotkey_paste_original", BUBBLES, Vec::new()),
-            translation_command_spec(HOTKEY_TRANSLATION_PASTE_BUBBLE_TRANSLATION, "translation.tab.hotkey_paste_translation", BUBBLES, Vec::new()),
-        ]
-    }
-
     /// Builds the tab. `local_ai` is the process's local-AI availability (carried by the
     /// backend supervisor handle); `ai_backend_health` / `ai_backend_probe_tx` are the shared
     /// health snapshot and the probe channel (`None` when no probe runs).
@@ -1057,14 +853,13 @@ impl TranslationTabState {
             ribbon_panel_rect: None,
             text_detector_line_selection: None,
             text_detector_line_drag_state: None,
+            text_detector_line_menu_uv: None,
             text_detector_mask_stroke_state: None,
             text_detector_mask_brush: MaskBrush::default(),
             text_detection_storage_loaded_for: None,
             text_detection_storage_busy: false,
             text_detection_storage_rx: None,
-            ocr_selection: None,
-            image_crop_selection: None,
-            image_create_q_armed: true,
+            canvas_selection: None,
             advanced_recognition: AdvancedRecognitionWindow::default(),
             advanced_recognition_request: None,
             ocr_toast: None,
@@ -1116,7 +911,8 @@ impl TranslationTabState {
             composition_panel_state: CompositionPanelState::default(),
             composition_rebuild_requested: true,
             expand_panel_on_show: false,
-            hotkey_hints: TranslationHotkeyHints::default(),
+            input_labels: TranslationInputLabels::default(),
+            input_frame: None,
             last_is_known_character: true,
             last_character_name: String::new(),
             last_clarification: String::new(),
@@ -1298,14 +1094,46 @@ impl TranslationTabState {
         }
     }
 
-    pub fn blocks_canvas_bubble_hotkeys(&self) -> bool {
-        self.text_detector_edit_lines_mode
-            || self.text_detector_edit_mask_mode
-            || self.advanced_recognition.is_open()
+    /// The contexts this tab publishes this frame (`crate::input::contexts`): the detector edit
+    /// mode, the advanced-recognition window and its brush, and `BRUSH_ACTIVE` while a brush of
+    /// this tab is on. The host adds its canvas's contexts.
+    #[must_use]
+    pub fn input_contexts(&self) -> Vec<ms_input::ContextId> {
+        crate::input::contexts(ContextFacts {
+            lines_edit: self.text_detector_edit_lines_mode,
+            mask_edit: self.text_detector_edit_mask_mode,
+            adv_rec_open: self.advanced_recognition.is_open(),
+            adv_rec_brush: self.advanced_recognition.brush_input_active(),
+        })
     }
 
-    pub fn blocks_canvas_zoom(&self) -> bool {
-        self.advanced_recognition.is_open()
+    /// Whether the text-detector lines edit mode is on (the host adds its hint rows).
+    #[must_use]
+    pub fn lines_edit_active(&self) -> bool {
+        self.text_detector_edit_lines_mode
+    }
+
+    /// Takes this frame's input for the draw: a copy of `input` for the canvas hooks and panels,
+    /// and the binding texts of the hints from `registry`. Paired with [`Self::end_input_frame`].
+    pub fn begin_input_frame(&mut self, input: &InputFrame, registry: &InputRegistry) {
+        self.input_frame = Some(input.clone());
+        self.input_labels = TranslationInputLabels::from_registry(registry);
+    }
+
+    /// Drops this frame's input copy after the draw (nothing reads a stale frame next frame).
+    pub fn end_input_frame(&mut self) {
+        self.input_frame = None;
+    }
+
+    /// This frame's binding texts.
+    #[must_use]
+    pub fn input_labels(&self) -> &TranslationInputLabels {
+        &self.input_labels
+    }
+
+    /// Whether mode `id` is active in this frame's input (`false` outside the draw).
+    fn input_mode_active(&self, id: ms_input::ActionId) -> bool {
+        self.input_frame.as_ref().is_some_and(|frame| frame.mode_active(id))
     }
 
     /// Whether a brush of this tab is on — the detector mask edit or the advanced-recognition
@@ -1356,20 +1184,15 @@ impl TranslationTabState {
         self.session_caps = caps;
     }
 
-    pub fn set_hotkey_hints(&mut self, hints: TranslationHotkeyHints) {
-        self.hotkey_hints = hints;
-    }
-
     fn panel_shortcut_hint(&self, panel: TranslationPanel) -> Option<&str> {
+        let labels = &self.input_labels;
         match panel {
             TranslationPanel::None => None,
-            TranslationPanel::Bubbles => self.hotkey_hints.bubbles_panel.as_deref(),
-            TranslationPanel::Ocr => self.hotkey_hints.ocr_panel.as_deref(),
-            TranslationPanel::Composition => self.hotkey_hints.composition_panel.as_deref(),
-            TranslationPanel::MachineTranslation => {
-                self.hotkey_hints.machine_translation_panel.as_deref()
-            }
-            TranslationPanel::TextDetector => self.hotkey_hints.text_detector_panel.as_deref(),
+            TranslationPanel::Bubbles => labels.bubbles_panel.as_deref(),
+            TranslationPanel::Ocr => labels.ocr_panel.as_deref(),
+            TranslationPanel::Composition => labels.composition_panel.as_deref(),
+            TranslationPanel::MachineTranslation => labels.machine_translation_panel.as_deref(),
+            TranslationPanel::TextDetector => labels.text_detector_panel.as_deref(),
         }
     }
 
@@ -1378,47 +1201,11 @@ impl TranslationTabState {
     }
 
     fn ocr_quick_selection_mode_active(&self) -> bool {
-        self.hotkey_hints.ocr_quick_selection_mode_modifier_down
+        self.input_mode_active(crate::input::OCR_QUICK_MODE)
     }
 
     fn ocr_advanced_selection_mode_active(&self) -> bool {
-        self.hotkey_hints.ocr_advanced_selection_mode_modifier_down
-    }
-
-    /// Whether the crop mode's chord (Shift+Q) is held, with no text field taking the keys.
-    fn image_crop_selection_keys_down(ctx: &egui::Context) -> bool {
-        ctx.input(|input| input.modifiers.shift && input.key_down(egui::Key::Q))
-            && !ctx.egui_wants_keyboard_input()
-    }
-
-    /// The crop mode as the POINTER path sees it: the chord held and no finger on the screen.
-    /// The finger path asks `image_crop_selection_keys_down` instead — its own touch would
-    /// otherwise switch the mode off under the selection it drives.
-    fn image_crop_selection_mode_active(ctx: &egui::Context) -> bool {
-        Self::image_crop_selection_keys_down(ctx) && !ctx.input(|input| input.any_touches())
-    }
-
-    /// The capture mode a finger long-press drag drives this frame, or `None` (the drag pans).
-    ///
-    /// The pointer path's precedence (crop chord, then the advanced, then the quick modifier);
-    /// with no key held a finger still selects, with the panel's finger OCR kind, because a
-    /// tablet has no keyboard. Rules: [`touch_selection_mode_for`].
-    fn touch_selection_mode(&self, ctx: &egui::Context) -> Option<TouchSelectionMode> {
-        touch_selection_mode_for(TouchSelectionInputs {
-            crop_keys_down: Self::image_crop_selection_keys_down(ctx),
-            advanced_window_open: self.advanced_recognition.is_open(),
-            detector_edit_mode: self.text_detector_edit_lines_mode || self.text_detector_edit_mask_mode,
-            advanced_held: self.ocr_advanced_selection_mode_active(),
-            quick_held: self.ocr_quick_selection_mode_active(),
-            finger_kind: self.ocr_panel_options.finger_selection.into(),
-        })
-    }
-
-    /// Whether canvas finger gestures are effective in this process: the platform supports
-    /// them AND the user's `General.touch_gestures` setting is on (`ms_config::touch_gestures`,
-    /// the owner the main window's router reads too). Gates the finger-only OCR panel controls.
-    fn finger_gestures_active() -> bool {
-        ms_config::touch_gestures::enabled_with(ms_platform::PlatformFeature::CanvasTouchGestures.is_available())
+        self.input_mode_active(crate::input::OCR_ADVANCED_MODE)
     }
 
     fn panel_title(&self, panel: TranslationPanel) -> String {
@@ -1674,6 +1461,7 @@ impl TranslationTabState {
                     last_page_idx: &mut self.last_page_idx,
                     last_bubble_order: &mut self.last_bubble_order,
                     image_bubble_pick: &mut self.image_bubble_pick,
+                    input: self.input_frame.as_ref(),
                 };
                 draw_bubbles_panel(
                     &mut self.bubbles_panel,
@@ -1712,18 +1500,18 @@ impl TranslationTabState {
                 let backend_unavailable = requires_backend && self.ai_backend_unavailable();
                 let quick_selection_active = self.ocr_quick_selection_mode_active();
                 let advanced_selection_active = self.ocr_advanced_selection_mode_active();
-                let finger_gestures_active = Self::finger_gestures_active();
                 let actions = draw_ocr_panel(
                     ui,
                     self.ocr_state_for_engine(self.ocr_panel_options.engine),
                     &mut self.ocr_panel_options,
                     self.ocr_controller.last_error(),
                     self.ocr_controller.last_result(),
-                    self.hotkey_hints.ocr_quick_selection_mode.as_deref(),
-                    quick_selection_active,
-                    self.hotkey_hints.ocr_advanced_selection_mode.as_deref(),
-                    advanced_selection_active,
-                    finger_gestures_active,
+                    OcrSelectionHints {
+                        quick_binding: &self.input_labels.quick_rect,
+                        quick_active: quick_selection_active,
+                        advanced_binding: &self.input_labels.advanced_rect,
+                        advanced_active: advanced_selection_active,
+                    },
                     &self.ocr_controller.generation_snapshot(),
                     OcrPanelModelView { korean_source, download: model_snapshot.as_ref() },
                 );
@@ -2232,14 +2020,16 @@ impl TranslationTabState {
         self.apply_recent_character_rank_to_bubble(canvas, project, bubble_id, rank)
     }
 
+    /// Creates a text bubble under the pointer and, with `recent_rank` (the recent-character
+    /// parameter of the create command), seeds it with that recent character. Returns whether a
+    /// bubble was created.
     pub fn create_bubble_at_pointer_shortcut(
         &mut self,
-        ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
         pointer_pos: Pos2,
+        recent_rank: Option<usize>,
     ) -> bool {
-        let recent_rank = recent_character_rank_from_input(ctx);
         if !canvas.create_bubble_at_pointer_shortcut(pointer_pos) {
             return false;
         }
@@ -2252,7 +2042,7 @@ impl TranslationTabState {
     /// Creates a hint bubble under the pointer; returns whether one was created.
     ///
     /// Unlike [`Self::create_bubble_at_pointer_shortcut`] there is no recent-character seeding:
-    /// a hint carries no character. Bound to the rebindable `H` hotkey.
+    /// a hint carries no character. Executed for `crate::input::CREATE_HINT_BUBBLE`.
     pub fn create_hint_bubble_at_pointer_shortcut(
         &mut self,
         ctx: &egui::Context,
@@ -2260,55 +2050,6 @@ impl TranslationTabState {
         pointer_pos: Pos2,
     ) -> bool {
         canvas.create_hint_bubble_at_pointer_shortcut(ctx, pointer_pos)
-    }
-
-    fn handle_image_bubble_hotkeys(
-        &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-    ) {
-        let (q_down, any_modifier) = ctx.input(|input| {
-            (
-                input.key_down(egui::Key::Q),
-                input.modifiers.shift
-                    || input.modifiers.ctrl
-                    || input.modifiers.command
-                    || input.modifiers.alt,
-            )
-        });
-        // Re-arm only once Q is fully released, so a Q still held after a Shift+Q crop (Shift may
-        // release a frame earlier) cannot spawn another bubble.
-        if !q_down {
-            self.image_create_q_armed = true;
-        }
-        let crop_context = Self::image_crop_selection_mode_active(ctx)
-            || self.image_crop_selection.is_some()
-            || any_modifier;
-        // Mark this Q-hold as belonging to a crop/modifier context; it must not create a plain
-        // bubble until released and pressed again.
-        if q_down && crop_context {
-            self.image_create_q_armed = false;
-        }
-
-        // Always consume the plain-Q press event so it does not leak elsewhere.
-        let q_pressed_event =
-            ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Q));
-        let create = q_pressed_event
-            && self.image_create_q_armed
-            && q_down
-            && !any_modifier
-            && !crop_context
-            && !ctx.egui_wants_keyboard_input();
-        if create {
-            // One bubble per fresh press: block until Q is released and pressed again.
-            self.image_create_q_armed = false;
-            if let Some(pointer_pos) = ctx.pointer_latest_pos()
-                && canvas.create_image_bubble_at_pointer_shortcut(ctx, pointer_pos)
-            {
-                canvas.flush_pending_bubble_upserts_now(project);
-            }
-        }
     }
 
     /// Resolves the image-bubble «choose file» dialog once it closed: copies the picked file into
@@ -3617,7 +3358,6 @@ impl TranslationTabState {
     fn draw_text_detector_additional_overlay_on_page(
         &mut self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
         page_idx: usize,
         page_rect: Rect,
     ) {
@@ -3631,7 +3371,7 @@ impl TranslationTabState {
         let painter = ui.painter().with_clip_rect(clip_rect);
 
         if self.text_detector_edit_lines_mode {
-            self.draw_text_detector_line_edit_overlay_on_page(ctx, &painter, page_idx, page_rect);
+            self.draw_text_detector_line_edit_overlay_on_page(ui, &painter, page_idx, page_rect);
             return;
         }
         if self.text_detector_edit_mask_mode {
@@ -3668,276 +3408,26 @@ impl TranslationTabState {
         }
     }
 
-    fn draw_text_detector_line_edit_overlay_on_page(
-        &mut self,
-        ctx: &egui::Context,
-        painter: &egui::Painter,
-        page_idx: usize,
-        page_rect: Rect,
-    ) {
-        let Some(result) = self.text_detector_results.get(&page_idx) else {
-            if self
-                .text_detector_line_selection
-                .is_some_and(|selection| selection.page_idx == page_idx)
-            {
-                self.text_detector_line_selection = None;
-                self.text_detector_line_drag_state = None;
-            }
-            return;
-        };
-        let source_w = result.source_size[0].max(1) as f32;
-        let source_h = result.source_size[1].max(1) as f32;
-        let lines = result.blocks.clone();
-        let selected_idx = self
-            .text_detector_line_selection
-            .filter(|selection| selection.page_idx == page_idx)
-            .map(|selection| selection.line_idx);
-        let pointer = ctx.input(|i| i.pointer.interact_pos());
-        let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
-        let primary_down = ctx.input(|i| i.pointer.primary_down());
-        let primary_released = ctx.input(|i| i.pointer.primary_released());
-
-        if primary_released
-            && self
-                .text_detector_line_drag_state
-                .is_some_and(|drag| drag.selection.page_idx == page_idx)
-        {
-            self.text_detector_line_drag_state = None;
-        }
-
-        let mut clicked_handle: Option<(usize, usize)> = None;
-        if let (Some(pointer_pos), Some(selection_idx)) = (pointer, selected_idx)
-            && let Some(selected_rect) = lines.get(selection_idx).copied()
-            && let Some(scene_rect) =
-                source_rect_to_scene_rect(page_rect, source_w, source_h, selected_rect)
-        {
-            for (handle_idx, handle_pos) in text_detector_line_handle_points(scene_rect)
-                .into_iter()
-                .enumerate()
-            {
-                if handle_pos.distance(pointer_pos) <= 8.0 {
-                    clicked_handle = Some((selection_idx, handle_idx));
-                    break;
-                }
-            }
-        }
-
-        if primary_pressed {
-            if let Some((line_idx, handle_idx)) = clicked_handle {
-                if let Some(pointer_pos) = pointer
-                    && let Some(src_pointer) =
-                        scene_pos_to_source(page_rect, source_w, source_h, pointer_pos)
-                    && let Some(start_rect) = lines.get(line_idx).copied()
-                {
-                    self.text_detector_line_selection =
-                        Some(TextDetectorLineSelection { page_idx, line_idx });
-                    self.text_detector_line_drag_state = Some(TextDetectorLineDragState {
-                        selection: TextDetectorLineSelection { page_idx, line_idx },
-                        start_pointer_src: src_pointer,
-                        start_rect,
-                        kind: TextDetectorLineDragKind::Resize { handle_idx },
-                    });
-                }
-            } else if let Some(pointer_pos) = pointer {
-                let hit = lines.iter().enumerate().rev().find_map(|(line_idx, rect)| {
-                    source_rect_to_scene_rect(page_rect, source_w, source_h, *rect)
-                        .filter(|scene_rect| scene_rect.contains(pointer_pos))
-                        .map(|_| line_idx)
-                });
-                if let Some(line_idx) = hit {
-                    if let Some(src_pointer) =
-                        scene_pos_to_source(page_rect, source_w, source_h, pointer_pos)
-                        && let Some(start_rect) = lines.get(line_idx).copied()
-                    {
-                        self.text_detector_line_selection =
-                            Some(TextDetectorLineSelection { page_idx, line_idx });
-                        self.text_detector_line_drag_state = Some(TextDetectorLineDragState {
-                            selection: TextDetectorLineSelection { page_idx, line_idx },
-                            start_pointer_src: src_pointer,
-                            start_rect,
-                            kind: TextDetectorLineDragKind::Move,
-                        });
-                    }
-                } else {
-                    self.text_detector_line_selection = None;
-                    self.text_detector_line_drag_state = None;
-                }
-            }
-        }
-
-        if primary_down
-            && let Some(drag) = self
-                .text_detector_line_drag_state
-                .filter(|drag| drag.selection.page_idx == page_idx)
-            && let Some(pointer_pos) = pointer
-            && let Some(pointer_src) =
-                scene_pos_to_source(page_rect, source_w, source_h, pointer_pos)
-            && let Some(current_result) = self.text_detector_results.get_mut(&page_idx)
-            && drag.selection.line_idx < current_result.blocks.len()
-        {
-            let next_rect = match drag.kind {
-                TextDetectorLineDragKind::Move => move_text_detector_rect(
-                    drag.start_rect,
-                    drag.start_pointer_src,
-                    pointer_src,
-                    source_w,
-                    source_h,
-                ),
-                TextDetectorLineDragKind::Resize { handle_idx } => resize_text_detector_rect(
-                    drag.start_rect,
-                    pointer_src,
-                    handle_idx,
-                    source_w,
-                    source_h,
-                ),
-            };
-            current_result.blocks[drag.selection.line_idx] = next_rect;
-        }
-
-        for (line_idx, rect) in lines.iter().copied().enumerate() {
-            if let Some(scene_rect) = source_rect_to_scene_rect(page_rect, source_w, source_h, rect)
-            {
-                let stroke = if Some(line_idx) == selected_idx {
-                    Stroke::new(2.2, Color32::from_rgb(120, 255, 120))
-                } else {
-                    Stroke::new(1.2, Color32::from_rgb(0, 255, 0))
-                };
-                painter.rect_stroke(scene_rect, 0.0, stroke, egui::StrokeKind::Outside);
-                if Some(line_idx) == selected_idx {
-                    for handle_pos in text_detector_line_handle_points(scene_rect) {
-                        painter.circle_filled(handle_pos, 4.0, Color32::from_rgb(120, 255, 120));
-                        painter.circle_stroke(
-                            handle_pos,
-                            4.0,
-                            Stroke::new(1.0, Color32::from_rgb(20, 90, 20)),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    fn draw_text_detector_mask_edit_overlay_on_page(
-        &mut self,
-        ui: &mut egui::Ui,
-        page_idx: usize,
-        page_rect: Rect,
-        zoom: f32,
-    ) {
-        self.materialize_text_mask_page_from_blocks_if_missing(page_idx);
-        let response = ui.interact(
-            page_rect,
-            egui::Id::new(("translation_text_detector_mask_edit", page_idx)),
-            egui::Sense::click_and_drag(),
-        );
-        let hovered = response.hovered();
-        if hovered {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-        }
-
-        let pointer_pos = response.interact_pointer_pos();
-        let hover_pos = response.hover_pos();
-        let (primary_down, secondary_down, shift_down) = ui.ctx().input(|input| {
-            (
-                input.pointer.primary_down(),
-                input.pointer.secondary_down(),
-                input.modifiers.shift,
-            )
-        });
-        let mode = if secondary_down || (primary_down && shift_down) {
-            Some(true)
-        } else if primary_down {
-            Some(false)
-        } else {
-            None
-        };
-
-        if mode.is_none() {
-            self.text_detector_mask_stroke_state = None;
-        }
-
-
-        if let (Some(erase), Some(pos)) = (mode, pointer_pos)
-            && page_rect.contains(pos)
-        {
-            let start_pos = match self.text_detector_mask_stroke_state {
-                Some(state) if state.page_idx == page_idx && state.erase == erase => {
-                    state.last_scene_pos
-                }
-                _ => pos,
-            };
-            if let Some((source_size, mask_size)) =
-                self.text_mask_target_sizes(page_idx, page_rect, zoom)
-            {
-                let _ = self.paint_text_mask_segment(
-                    page_idx,
-                    source_size,
-                    mask_size,
-                    page_rect,
-                    start_pos,
-                    pos,
-                    erase,
-                );
-            }
-            self.text_detector_mask_stroke_state = Some(TextDetectorMaskStrokeState {
-                page_idx,
-                erase,
-                last_scene_pos: pos,
-            });
-        }
-
-        if let Some(pointer) = hover_pos
-            && page_rect.contains(pointer)
-        {
-            let mask_size = self
-                .text_mask_target_sizes(page_idx, page_rect, zoom)
-                .map(|(_, mask_size)| mask_size)
-                .unwrap_or([1, 1]);
-            self.text_detector_mask_brush.draw_circle_cursor_on_image(
-                ui,
-                page_rect,
-                [mask_size[0].max(1) as usize, mask_size[1].max(1) as usize],
-                pointer,
-            );
-        }
-    }
-
-    fn handle_text_detector_line_edit_hotkeys(
-        &mut self,
-        ctx: &egui::Context,
-        canvas: &CanvasView,
-        project: &ProjectData,
-    ) {
-        if !self.text_detector_edit_lines_mode || ctx.egui_wants_keyboard_input() {
-            return;
-        }
-        let delete_pressed =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
-        if delete_pressed && let Some(selection) = self.text_detector_line_selection {
-            if let Some(result) = self.text_detector_results.get_mut(&selection.page_idx)
-                && selection.line_idx < result.blocks.len()
-            {
-                result.blocks.remove(selection.line_idx);
-            }
-            self.text_detector_line_selection = None;
-            self.text_detector_line_drag_state = None;
-        }
-
-        let create_pressed = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::N));
-        if create_pressed {
-            let page_idx = canvas.current_page_idx();
-            let _ = self.create_text_detector_line_at_uv(project, page_idx, egui::pos2(0.5, 0.5));
-        }
-    }
-
+    /// Adds a line centred at `uv` (page-normalized) on page `page_idx`, creating the page's
+    /// detector entry first when it has none, and selects it.
     fn create_text_detector_line_at_uv(
         &mut self,
         project: &ProjectData,
         page_idx: usize,
         uv: Pos2,
     ) -> Result<(), String> {
+        self.ensure_text_detector_page_entry(project, page_idx)?;
+        self.add_text_detector_line_at_uv(page_idx, uv)
+    }
+
+    /// Adds a line centred at `uv` (page-normalized) to the EXISTING detector entry of page
+    /// `page_idx` and selects it. Errors when the page has no entry or the rect is degenerate.
+    fn add_text_detector_line_at_uv(&mut self, page_idx: usize, uv: Pos2) -> Result<(), String> {
         let next_idx = {
-            let result = self.ensure_text_detector_page_entry(project, page_idx)?;
+            let result = self
+                .text_detector_results
+                .get_mut(&page_idx)
+                .ok_or_else(|| tf!("translation.tab.prepare_detection_error", page_idx = page_idx))?;
             let source_w = result.source_size[0].max(1) as f32;
             let source_h = result.source_size[1].max(1) as f32;
             let center_x = uv.x.clamp(0.0, 1.0) * source_w;
@@ -4721,114 +4211,6 @@ impl TranslationTabState {
             });
     }
 
-    fn handle_image_crop_selection(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-    ) {
-        let crop_keys_down = Self::image_crop_selection_keys_down(ctx);
-        let crop_mode_active = Self::image_crop_selection_mode_active(ctx);
-        let touch = canvas.touch_selection();
-        let selection_active = self.image_crop_selection.is_some();
-        if !crop_mode_active && !selection_active && !(crop_keys_down && touch.is_some()) {
-            return;
-        }
-
-        // The finger first (see `drive_touch_drag`): its selection starts at the long-press
-        // point and ends on lift exactly like a mouse release below.
-        if let Some(touch) = touch
-            && let Some(finished) = drive_touch_drag(&mut self.image_crop_selection, touch, |origin| {
-                (crop_keys_down && contains_any_page(canvas, project, origin))
-                    .then_some(ImageCropDragSelection { start: origin, current: origin, touch: true })
-            })
-        {
-            self.finish_image_crop_selection(ctx, canvas, project, finished);
-        }
-
-        let capture_layer = egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("translation_image_crop_selection_capture"),
-        );
-        // A finger under the capture area pans the canvas; only a long-press drag selects.
-        ms_widgets::touch_nav::publish_capture_layer(ctx, canvas.touch_owner_id(), capture_layer);
-        egui::Area::new(capture_layer.id)
-            .order(capture_layer.order)
-            .fixed_pos(canvas_rect.min)
-            .show(ctx, |ui| {
-                ui.set_min_size(canvas_rect.size());
-                let local_rect = Rect::from_min_size(Pos2::ZERO, canvas_rect.size());
-                let sense = if crop_mode_active {
-                    egui::Sense::click_and_drag()
-                } else {
-                    egui::Sense::hover()
-                };
-                let response = ui.interact(local_rect, ui.id().with("image_crop_drag"), sense);
-
-                if response.drag_started()
-                    && let Some(pos) = response.interact_pointer_pos()
-                    && contains_any_page(canvas, project, pos)
-                {
-                    self.image_crop_selection = Some(ImageCropDragSelection {
-                        start: pos,
-                        current: pos,
-                        touch: false,
-                    });
-                }
-
-                if let Some(selection) = self.image_crop_selection.as_mut()
-                    && !selection.touch
-                    && let Some(pos) = ctx.input(|input| input.pointer.latest_pos())
-                {
-                    selection.current = pos;
-                }
-
-                // A finger selection ends on lift (above) or when the chord is released; a mouse
-                // selection on its drag stop or when the mode ends.
-                let should_finish = self.image_crop_selection.is_some_and(|selection| {
-                    if selection.touch {
-                        !crop_keys_down
-                    } else {
-                        response.drag_stopped() || !crop_mode_active
-                    }
-                });
-                if should_finish && let Some(selection) = self.image_crop_selection.take() {
-                    self.finish_image_crop_selection(ctx, canvas, project, selection);
-                }
-            });
-
-        if let Some(selection) = self.image_crop_selection {
-            let rect = selection.rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("translation_image_crop_selection_painter"),
-            ));
-            painter.rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(220, 35, 35, 45));
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(2.0, Color32::from_rgb(220, 35, 35)),
-                egui::StrokeKind::Outside,
-            );
-        }
-    }
-
-    /// Commits a finished crop drag (mouse release or finger lift): a rect of at least 4x4
-    /// points becomes the image bubble's page crop, a smaller one is dropped.
-    fn finish_image_crop_selection(
-        &mut self,
-        ctx: &egui::Context,
-        canvas: &mut CanvasView,
-        project: &ProjectData,
-        selection: ImageCropDragSelection,
-    ) {
-        let rect = selection.rect();
-        if rect.width() >= 4.0 && rect.height() >= 4.0 {
-            self.apply_image_crop_selection(ctx, canvas, project, rect);
-        }
-    }
-
     fn apply_image_crop_selection(
         &mut self,
         ctx: &egui::Context,
@@ -4892,154 +4274,6 @@ impl TranslationTabState {
         patch.insert("rect_coords".to_string(), rect_coords_value(crop_rect));
         if canvas.patch_bubble_extra_fields(project, bubble_id, &patch) {
             canvas.flush_pending_bubble_upserts_now(project);
-        }
-    }
-
-    fn handle_ocr_selection(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: Rect,
-        canvas: &CanvasView,
-        project: &ProjectData,
-    ) {
-        let touch = canvas.touch_selection();
-        if let Err(off) = self.current_ocr_route_availability() {
-            self.ocr_selection = None;
-            // A finger OCR selection on an unavailable route is refused visibly at its start
-            // instead of drawing a rect that cannot run (the drag stays claimed, so it does
-            // not pan either).
-            if let Some(touch) = touch
-                && finger_ocr_selection_refused(touch, self.touch_selection_mode(ctx), contains_any_page(canvas, project, touch.origin))
-            {
-                self.push_toast(ctx, off.user_message(), Severity::Error, 2.6);
-            }
-            return;
-        }
-        if self.advanced_recognition.is_open() {
-            self.ocr_selection = None;
-            return;
-        }
-        if Self::image_crop_selection_mode_active(ctx) || self.image_crop_selection.is_some() {
-            self.ocr_selection = None;
-            return;
-        }
-        let advanced_mode_active = self.ocr_advanced_selection_mode_active();
-        let quick_mode_active = self.ocr_quick_selection_mode_active();
-        let selection_active = self.ocr_selection.is_some();
-        // A finger selection runs with no key held (the finger OCR kind), so its drag alone
-        // keeps this path alive.
-        if !advanced_mode_active && !quick_mode_active && !selection_active && touch.is_none() {
-            return;
-        }
-
-        // The finger first (see `drive_touch_drag`): its selection starts at the long-press
-        // point, takes the kind of the modifier held then (or the finger OCR kind with none),
-        // and ends on lift exactly like a mouse release below.
-        if let Some(touch) = touch {
-            let mode = self.touch_selection_mode(ctx);
-            if let Some(finished) = drive_touch_drag(&mut self.ocr_selection, touch, |origin| {
-                begin_touch_ocr_selection(mode, contains_any_page(canvas, project, origin), origin, recent_character_rank_from_input(ctx))
-            }) {
-                self.finish_ocr_selection(ctx, canvas, project, finished);
-            }
-        }
-
-        let capture_layer = egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("translation_ocr_selection_capture"),
-        );
-        // A finger under the capture area pans the canvas; only a long-press drag selects.
-        ms_widgets::touch_nav::publish_capture_layer(ctx, canvas.touch_owner_id(), capture_layer);
-        egui::Area::new(capture_layer.id)
-            .order(capture_layer.order)
-            .fixed_pos(canvas_rect.min)
-            .show(ctx, |ui| {
-                ui.set_min_size(canvas_rect.size());
-                let local_rect = Rect::from_min_size(Pos2::ZERO, canvas_rect.size());
-                let sense = if advanced_mode_active || quick_mode_active {
-                    egui::Sense::click_and_drag()
-                } else {
-                    egui::Sense::hover()
-                };
-                let response = ui.interact(local_rect, ui.id().with("ocr_selection_drag"), sense);
-
-                if response.drag_started()
-                    && let Some(pos) = response.interact_pointer_pos()
-                    && contains_any_page(canvas, project, pos)
-                {
-                    let kind = if advanced_mode_active {
-                        OcrSelectionKind::Advanced
-                    } else if quick_mode_active {
-                        OcrSelectionKind::Simple
-                    } else {
-                        return;
-                    };
-                    self.ocr_selection = Some(OcrDragSelection {
-                        start: pos,
-                        current: pos,
-                        kind,
-                        recent_character_rank: recent_character_rank_from_input(ctx),
-                        touch: false,
-                    });
-                }
-
-                if let Some(selection) = self.ocr_selection.as_mut() {
-                    // The finger's corner comes from its `TouchSelection` (above), never from
-                    // the pointer; the character rank is a key either way.
-                    if !selection.touch
-                        && let Some(pos) = ctx.input(|i| i.pointer.latest_pos())
-                    {
-                        selection.current = pos;
-                    }
-                    if let Some(rank) = recent_character_rank_from_input(ctx) {
-                        selection.recent_character_rank = Some(rank);
-                    }
-                }
-
-                let should_finish = self.ocr_selection.as_ref().is_some_and(|selection| {
-                    selection.pointer_should_finish(response.drag_stopped(), advanced_mode_active, quick_mode_active)
-                });
-                if should_finish && let Some(selection) = self.ocr_selection.take() {
-                    self.finish_ocr_selection(ctx, canvas, project, selection);
-                }
-            });
-
-        if let Some(selection) = &self.ocr_selection {
-            let rect = selection.rect();
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("translation_ocr_selection_painter"),
-            ));
-            painter.rect_filled(rect, 0.0, ms_theme::canvas::SELECTION.gamma_multiply_u8(60));
-            painter.rect_stroke(
-                rect,
-                0.0,
-                Stroke::new(2.0, ms_theme::canvas::SELECTION),
-                egui::StrokeKind::Outside,
-            );
-        }
-    }
-
-    /// Commits a finished OCR drag (mouse release, finger lift or modifier release): a rect of
-    /// at least 4x4 points starts the quick OCR or opens the advanced recognition window.
-    fn finish_ocr_selection(
-        &mut self,
-        ctx: &egui::Context,
-        canvas: &CanvasView,
-        project: &ProjectData,
-        selection: OcrDragSelection,
-    ) {
-        let rect = selection.rect();
-        if rect.width() < 4.0 || rect.height() < 4.0 {
-            return;
-        }
-        match selection.kind {
-            OcrSelectionKind::Simple => {
-                self.start_ocr_for_scene_rect(ctx, canvas, project, rect, selection.recent_character_rank);
-            }
-            OcrSelectionKind::Advanced => {
-                self.open_advanced_recognition_for_scene_rect(ctx, canvas, project, rect);
-            }
         }
     }
 
@@ -5127,7 +4361,7 @@ impl TranslationTabState {
         canvas: &mut CanvasView,
         project: &ProjectData,
     ) {
-        let Some(action) = self.advanced_recognition.draw(ctx) else {
+        let Some(action) = self.advanced_recognition.draw(ctx, self.input_frame.as_ref(), &self.input_labels) else {
             return;
         };
         match action {
@@ -5432,6 +4666,8 @@ struct TranslationDockCx<'a> {
     total_pages: usize,
     /// Most recently used characters, newest first — one card per entry.
     recent_characters: &'a VecDeque<RecentCharacterEntry>,
+    /// The binding text of each recent-character rank (`TranslationInputLabels::recent_char_keys`).
+    recent_char_keys: &'a [String],
 }
 
 impl TranslationDockCx<'_> {
@@ -5442,16 +4678,11 @@ impl TranslationDockCx<'_> {
     }
 }
 
-/// Caption of the recent-character card at `rank` (0-based): the digit that
-/// activates the character, then the name.
-///
-/// The digit is `rank + 1` because the hotkeys are `1`..=`6`
-/// ([`RECENT_CHARACTER_HISTORY_LIMIT`]) while the history is indexed from zero —
-/// the same off-by-one [`TranslationTabState::recent_character_entry_for_rank`]
-/// resolves in the other direction.
+/// Caption of a recent-character card: the binding text of the rank's parameter mode
+/// (`crate::input::RECENT_CHARS`, "1" by default for the first card), then the name.
 #[must_use]
-fn recent_character_card_caption(rank: usize, character_name: &str) -> String {
-    format!("[ {} ] {}", rank + 1, character_name)
+fn recent_character_card_caption(key_label: &str, character_name: &str) -> String {
+    format!("[ {key_label} ] {character_name}")
 }
 
 /// Outer size, in points, of a recent-character card whose caption laid out to
@@ -5489,7 +4720,7 @@ fn recent_character_card_caption_pos(card_rect: Rect) -> Pos2 {
 /// panel's own width.
 ///
 /// The cards are not interactive and this is deliberate — a character is picked by
-/// pressing its digit together with the bubble-create hotkey or the Shift+drag OCR
+/// holding its recent-character binding together with the bubble-create command or the quick OCR
 /// gesture, never by clicking the card. The body only reads
 /// [`TranslationDockCx::recent_characters`]; the allocation senses `hover` and
 /// nothing else, exactly as `Frame::allocate_space` did
@@ -5535,7 +4766,7 @@ fn draw_recent_characters_tab_body(ui: &mut egui::Ui, cx: &mut TranslationDockCx
             // `Extend` with an infinite width: the card is sized from this galley, so
             // the name must be measured as the single line it will be drawn as.
             let caption = egui::WidgetText::from(
-                egui::RichText::new(recent_character_card_caption(rank, &entry.character_name))
+                egui::RichText::new(recent_character_card_caption(cx.recent_char_keys.get(rank).map_or("", String::as_str), &entry.character_name))
                     .color(caption_color),
             )
             .into_galley(
@@ -5610,6 +4841,7 @@ impl TranslationTabState {
             canvas,
             total_pages,
             recent_characters: &self.recent_characters,
+            recent_char_keys: &self.input_labels.recent_char_keys,
         };
         let mut dock = PanelDock::begin(
             ctx,
@@ -5645,21 +4877,6 @@ impl TranslationTabState {
 }
 
 impl CanvasHooks for TranslationTabState {
-    fn wants_canvas_shift_drag_selection(&self, ctx: &egui::Context) -> bool {
-        if Self::image_crop_selection_mode_active(ctx) || self.image_crop_selection.is_some() {
-            return true;
-        }
-        if self.selected_ocr_route_availability().is_err() {
-            return false;
-        }
-        if self.advanced_recognition.is_open() {
-            return false;
-        }
-        self.ocr_quick_selection_mode_active()
-            || self.ocr_advanced_selection_mode_active()
-            || self.ocr_selection.is_some()
-    }
-
     fn canvas_scrollbar_marks(&mut self, ctx: &CanvasScrollbarContext<'_>) -> Vec<ScrollMark> {
         // Per-bubble translation status painted on the canvas scrollbar:
         // red while a bubble's translation is empty, blue once it is filled.
@@ -5756,12 +4973,12 @@ impl CanvasHooks for TranslationTabState {
     fn draw_canvas_overlay_on_page(
         &mut self,
         ui: &mut egui::Ui,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         page_idx: usize,
         image_rect: Rect,
         _zoom: f32,
     ) {
-        self.draw_text_detector_additional_overlay_on_page(ui, ctx, page_idx, image_rect);
+        self.draw_text_detector_additional_overlay_on_page(ui, page_idx, image_rect);
     }
 
     fn draw_canvas_overlay_top_left(
@@ -5798,19 +5015,15 @@ impl CanvasHooks for TranslationTabState {
         self.poll_ocr_model_downloads(ctx);
         self.poll_mt_events(ctx, canvas);
         self.poll_ai_api_events(ctx);
-        self.handle_image_bubble_hotkeys(ctx, canvas, project);
-        // Inside `draw`, before the canvas publishes its touch surface at the end of it: a
-        // finger claimed next frame drags a selection only while a selection mode is held.
-        canvas.set_long_press_selection(self.touch_selection_mode(ctx).is_some());
-        self.handle_image_crop_selection(ctx, canvas_rect, canvas, project);
-        self.handle_ocr_selection(ctx, canvas_rect, canvas, project);
+        // The canvas-wide rect selections (mouse and finger alike) come from the router's
+        // claim; the canvas raises its own capture area while one is armed.
+        self.drive_canvas_selection(ctx, canvas, project);
         self.handle_advanced_recognition_window(ctx, canvas, project);
         self.maybe_dispatch_next_textdetector_ocr_request(ctx, project);
         self.handle_pending_mt_actions(ctx, canvas, project);
         self.poll_image_bubble_pick(ctx, project, now_s);
         self.flush_footer_patches(canvas, project, now_s);
         self.bubbles_panel.flush_text_updates(canvas, now_s);
-        self.handle_text_detector_line_edit_hotkeys(ctx, canvas, project);
 
         egui::Area::new("translation_canvas_open_buttons".into())
             .fixed_pos(canvas_rect.right_bottom() + egui::vec2(0.0, -40.0))
@@ -5903,8 +5116,8 @@ impl CanvasHooks for TranslationTabState {
                             {
                                 self.text_detector_mask_brush.set_radius_px(radius);
                             }
-                            ui.small(t!("translation.tab.paint_hint"));
-                            ui.small(t!("translation.tab.erase_hint"));
+                            ui.small(tf!("translation.tab.paint_binding_hint", binding = self.input_labels.mask_paint));
+                            ui.small(tf!("translation.tab.erase_binding_hint", binding = self.input_labels.mask_erase));
                             if ui.button(t!("translation.tab.exit_button")).clicked() {
                                 self.set_text_detector_edit_mask_mode(false);
                             }
@@ -5916,8 +5129,7 @@ impl CanvasHooks for TranslationTabState {
         }
         if self.ocr_quick_selection_mode_active()
             || self.ocr_advanced_selection_mode_active()
-            || self.ocr_selection.is_some()
-            || self.image_crop_selection.is_some()
+            || self.canvas_selection.is_some()
             || self.advanced_recognition.is_open()
             || self.ocr_toast.is_some()
             || self.ocr_controller.state().is_busy()
@@ -6149,14 +5361,6 @@ impl TranslationTabState {
             }
             if let Some(bubbles) = ocr_obj.get("bubbles").and_then(Value::as_bool) {
                 self.ocr_panel_options.create_bubble = bubbles;
-            }
-            // Absent (older titles) or unknown keeps the quick default.
-            if let Some(finger) = ocr_obj
-                .get("finger_selection")
-                .and_then(Value::as_str)
-                .and_then(FingerOcrSelection::from_settings_key)
-            {
-                self.ocr_panel_options.finger_selection = finger;
             }
             if let Some(replace_chars) = ocr_obj.get("replace_chars").and_then(Value::as_bool) {
                 self.ocr_panel_options.replace_chars_enabled = replace_chars;
@@ -6740,67 +5944,6 @@ fn collect_recent_character_history(bubbles: &[Bubble]) -> VecDeque<RecentCharac
     recent
 }
 
-fn recent_character_rank_from_input(ctx: &egui::Context) -> Option<usize> {
-    ctx.input(|input| {
-        let from_pressed_event = input.events.iter().find_map(|event| match event {
-            egui::Event::Key {
-                key,
-                physical_key,
-                pressed: true,
-                repeat: false,
-                ..
-            } => physical_key
-                .and_then(recent_character_rank_from_digit_key)
-                .or_else(|| recent_character_rank_from_digit_key(*key)),
-            egui::Event::Text(text) => recent_character_rank_from_text(text, input.modifiers.shift),
-            _ => None,
-        });
-        from_pressed_event.or_else(|| {
-            [
-                egui::Key::Num1,
-                egui::Key::Num2,
-                egui::Key::Num3,
-                egui::Key::Num4,
-                egui::Key::Num5,
-                egui::Key::Num6,
-            ]
-            .iter()
-            .position(|key| input.key_down(*key))
-            .map(|idx| idx + 1)
-        })
-    })
-}
-
-fn recent_character_rank_from_digit_key(key: egui::Key) -> Option<usize> {
-    match key {
-        egui::Key::Num1 => Some(1),
-        egui::Key::Num2 => Some(2),
-        egui::Key::Num3 => Some(3),
-        egui::Key::Num4 => Some(4),
-        egui::Key::Num5 => Some(5),
-        egui::Key::Num6 => Some(6),
-        _ => None,
-    }
-}
-
-fn recent_character_rank_from_text(text: &str, shift_down: bool) -> Option<usize> {
-    match text {
-        "1" => Some(1),
-        "2" => Some(2),
-        "3" => Some(3),
-        "4" => Some(4),
-        "5" => Some(5),
-        "6" => Some(6),
-        "!" if shift_down => Some(1),
-        "@" | "\"" if shift_down => Some(2),
-        "#" | "№" if shift_down => Some(3),
-        "$" | ";" if shift_down => Some(4),
-        "%" if shift_down => Some(5),
-        "^" | ":" if shift_down => Some(6),
-        _ => None,
-    }
-}
-
 /// Cheap change probe of the title `characters.json` through the document store; `None`
 /// when it is absent or cannot be stated (the latter is logged).
 fn characters_file_signature(project: &ProjectData) -> Option<ms_docstore::Signature> {
@@ -6966,71 +6109,6 @@ fn scene_pos_to_source(
     let u = ((scene_pos.x - page_rect.left()) / page_rect.width()).clamp(0.0, 1.0);
     let v = ((scene_pos.y - page_rect.top()) / page_rect.height()).clamp(0.0, 1.0);
     Some(egui::pos2(u * source_w, v * source_h))
-}
-
-fn text_detector_line_handle_points(scene_rect: Rect) -> [Pos2; 8] {
-    [
-        scene_rect.left_top(),
-        egui::pos2(scene_rect.center().x, scene_rect.top()),
-        scene_rect.right_top(),
-        egui::pos2(scene_rect.right(), scene_rect.center().y),
-        scene_rect.right_bottom(),
-        egui::pos2(scene_rect.center().x, scene_rect.bottom()),
-        scene_rect.left_bottom(),
-        egui::pos2(scene_rect.left(), scene_rect.center().y),
-    ]
-}
-
-fn move_text_detector_rect(
-    start_rect: TextDetectorRect,
-    start_pointer_src: Pos2,
-    pointer_src: Pos2,
-    source_w: f32,
-    source_h: f32,
-) -> TextDetectorRect {
-    let width = (start_rect.x2 - start_rect.x1).max(1.0);
-    let height = (start_rect.y2 - start_rect.y1).max(1.0);
-    let dx = pointer_src.x - start_pointer_src.x;
-    let dy = pointer_src.y - start_pointer_src.y;
-    let max_x1 = (source_w - width).max(0.0);
-    let max_y1 = (source_h - height).max(0.0);
-    let x1 = (start_rect.x1 + dx).clamp(0.0, max_x1);
-    let y1 = (start_rect.y1 + dy).clamp(0.0, max_y1);
-    TextDetectorRect::from_xyxy(x1, y1, x1 + width, y1 + height).unwrap_or(start_rect)
-}
-
-fn resize_text_detector_rect(
-    start_rect: TextDetectorRect,
-    pointer_src: Pos2,
-    handle_idx: usize,
-    source_w: f32,
-    source_h: f32,
-) -> TextDetectorRect {
-    let min_side = 4.0f32;
-    let mut x1 = start_rect.x1;
-    let mut y1 = start_rect.y1;
-    let mut x2 = start_rect.x2;
-    let mut y2 = start_rect.y2;
-
-    let move_left = matches!(handle_idx, 0 | 6 | 7);
-    let move_right = matches!(handle_idx, 2..=4);
-    let move_top = matches!(handle_idx, 0..=2);
-    let move_bottom = matches!(handle_idx, 4..=6);
-
-    if move_left {
-        x1 = pointer_src.x.clamp(0.0, (x2 - min_side).max(0.0));
-    }
-    if move_right {
-        x2 = pointer_src.x.clamp((x1 + min_side).min(source_w), source_w);
-    }
-    if move_top {
-        y1 = pointer_src.y.clamp(0.0, (y2 - min_side).max(0.0));
-    }
-    if move_bottom {
-        y2 = pointer_src.y.clamp((y1 + min_side).min(source_h), source_h);
-    }
-
-    TextDetectorRect::from_xyxy(x1, y1, x2, y2).unwrap_or(start_rect)
 }
 
 struct TextDetectorMaskOverlayDrawParams<'a> {
@@ -7443,161 +6521,6 @@ fn parse_u32_pair(value: Option<&Value>) -> Option<[u32; 2]> {
     Some([w, h])
 }
 
-/// The finger OCR drag a long-press at `origin` starts, or `None` when it must not start: the
-/// mode held is not an OCR mode (`None`, or the crop chord, which owns the gesture) or the
-/// press is not on a page (`on_page`), the same refusal the mouse drag applies.
-fn begin_touch_ocr_selection(
-    mode: Option<TouchSelectionMode>,
-    on_page: bool,
-    origin: Pos2,
-    recent_character_rank: Option<usize>,
-) -> Option<OcrDragSelection> {
-    let Some(TouchSelectionMode::Ocr(kind)) = mode else {
-        return None;
-    };
-    on_page.then_some(OcrDragSelection { start: origin, current: origin, kind, recent_character_rank, touch: true })
-}
-
-/// Whether this frame's finger `touch` STARTS an OCR selection that must be refused because the
-/// OCR route is unavailable: exactly the press `begin_touch_ocr_selection` would turn into a
-/// rect (an OCR `mode`, on a page), on its first frame only, so one gesture toasts once.
-fn finger_ocr_selection_refused(touch: ms_widgets::touch_nav::TouchSelection, mode: Option<TouchSelectionMode>, on_page: bool) -> bool {
-    touch.began && begin_touch_ocr_selection(mode, on_page, touch.origin, None).is_some()
-}
-
-#[cfg(test)]
-mod touch_selection_tests {
-    use super::{
-        OcrDragSelection, OcrSelectionKind, TouchSelectionInputs, TouchSelectionMode, begin_touch_ocr_selection,
-        finger_ocr_selection_refused, touch_selection_mode_for,
-    };
-    use eframe::egui::{Rect, pos2};
-    use ms_canvas::drive_touch_drag;
-    use ms_widgets::touch_nav::{TouchSelection, TouchSelectionEnd};
-
-    #[test]
-    fn a_finger_ocr_drag_starts_only_in_an_ocr_mode_on_a_page() {
-        let origin = pos2(40.0, 50.0);
-        for kind in [OcrSelectionKind::Simple, OcrSelectionKind::Advanced] {
-            let drag = begin_touch_ocr_selection(Some(TouchSelectionMode::Ocr(kind)), true, origin, Some(2))
-                .expect("an OCR mode on a page starts the drag");
-            assert_eq!((drag.start, drag.current, drag.kind, drag.recent_character_rank, drag.touch), (origin, origin, kind, Some(2), true));
-        }
-        assert!(begin_touch_ocr_selection(Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple)), false, origin, None).is_none(), "off-page press");
-        assert!(begin_touch_ocr_selection(Some(TouchSelectionMode::ImageCrop), true, origin, None).is_none(), "the crop chord owns the gesture");
-        assert!(begin_touch_ocr_selection(None, true, origin, None).is_none(), "no mode held");
-    }
-
-    #[test]
-    fn a_finger_ocr_drag_commits_the_rect_from_the_press_point_on_lift() {
-        let origin = pos2(10.0, 10.0);
-        let mut slot: Option<OcrDragSelection> = None;
-        let begin = |at| begin_touch_ocr_selection(Some(TouchSelectionMode::Ocr(OcrSelectionKind::Advanced)), true, at, None);
-        let step = TouchSelection { origin, pos: pos2(60.0, 30.0), began: true, end: None };
-        assert!(drive_touch_drag(&mut slot, step, begin).is_none());
-        let lift = TouchSelection { origin, pos: pos2(80.0, 90.0), began: false, end: Some(TouchSelectionEnd::Released) };
-        let finished = drive_touch_drag(&mut slot, lift, begin).expect("lift commits");
-        assert_eq!(finished.rect(), Rect::from_two_pos(origin, pos2(80.0, 90.0)));
-        assert_eq!(finished.kind, OcrSelectionKind::Advanced);
-        assert!(slot.is_none());
-    }
-
-    /// No key held, nothing else active: the finger OCR kind of the panel.
-    fn idle(finger_kind: OcrSelectionKind) -> TouchSelectionInputs {
-        TouchSelectionInputs {
-            crop_keys_down: false,
-            advanced_window_open: false,
-            detector_edit_mode: false,
-            advanced_held: false,
-            quick_held: false,
-            finger_kind,
-        }
-    }
-
-    #[test]
-    fn with_no_key_held_a_finger_selects_the_configured_ocr_kind() {
-        for kind in [OcrSelectionKind::Simple, OcrSelectionKind::Advanced] {
-            assert_eq!(touch_selection_mode_for(idle(kind)), Some(TouchSelectionMode::Ocr(kind)));
-        }
-        assert_eq!(OcrSelectionKind::from(crate::panels::ocr::FingerOcrSelection::default()), OcrSelectionKind::Simple, "quick by default");
-    }
-
-    #[test]
-    fn a_held_key_wins_over_the_finger_kind() {
-        let finger_advanced = idle(OcrSelectionKind::Advanced);
-        let quick = TouchSelectionInputs { quick_held: true, ..finger_advanced };
-        assert_eq!(touch_selection_mode_for(quick), Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple)));
-        let finger_quick = idle(OcrSelectionKind::Simple);
-        let advanced = TouchSelectionInputs { advanced_held: true, quick_held: true, ..finger_quick };
-        assert_eq!(touch_selection_mode_for(advanced), Some(TouchSelectionMode::Ocr(OcrSelectionKind::Advanced)));
-        let crop = TouchSelectionInputs { crop_keys_down: true, advanced_held: true, ..finger_quick };
-        assert_eq!(touch_selection_mode_for(crop), Some(TouchSelectionMode::ImageCrop));
-    }
-
-    #[test]
-    fn the_finger_kind_yields_to_the_advanced_window_and_detector_edit_modes() {
-        let finger = idle(OcrSelectionKind::Simple);
-        assert_eq!(touch_selection_mode_for(TouchSelectionInputs { advanced_window_open: true, ..finger }), None);
-        assert_eq!(touch_selection_mode_for(TouchSelectionInputs { advanced_window_open: true, quick_held: true, ..finger }), None);
-        assert_eq!(touch_selection_mode_for(TouchSelectionInputs { detector_edit_mode: true, ..finger }), None, "edit modes keep their long-press");
-        assert_eq!(
-            touch_selection_mode_for(TouchSelectionInputs { detector_edit_mode: true, quick_held: true, ..finger }),
-            Some(TouchSelectionMode::Ocr(OcrSelectionKind::Simple)),
-            "a held key still selects in an edit mode, as the mouse does"
-        );
-    }
-
-    #[test]
-    fn a_finger_selection_is_not_finished_by_the_modifier_state() {
-        let origin = pos2(5.0, 5.0);
-        for kind in [OcrSelectionKind::Simple, OcrSelectionKind::Advanced] {
-            let finger = begin_touch_ocr_selection(Some(TouchSelectionMode::Ocr(kind)), true, origin, None).expect("starts");
-            for (drag_stopped, advanced_held, quick_held) in [(false, false, false), (true, false, false), (false, true, true)] {
-                assert!(!finger.pointer_should_finish(drag_stopped, advanced_held, quick_held), "a finger selection ends only on lift");
-            }
-            let mouse = OcrDragSelection { touch: false, ..finger.clone() };
-            assert!(mouse.pointer_should_finish(false, false, false), "a mouse selection ends when its modifier is released");
-            assert!(mouse.pointer_should_finish(true, true, true), "and on a drag stop");
-            assert!(!mouse.pointer_should_finish(false, true, true));
-        }
-    }
-
-    #[test]
-    fn a_cancelled_finger_selection_commits_nothing() {
-        let origin = pos2(10.0, 10.0);
-        let mut slot: Option<OcrDragSelection> = None;
-        let begin = |at| begin_touch_ocr_selection(touch_selection_mode_for(idle(OcrSelectionKind::Simple)), true, at, None);
-        let step = TouchSelection { origin, pos: pos2(60.0, 60.0), began: true, end: None };
-        assert!(drive_touch_drag(&mut slot, step, begin).is_none());
-        assert!(slot.is_some(), "the key-less finger drag started a selection");
-        let cancel = TouchSelection { origin, pos: pos2(70.0, 70.0), began: false, end: Some(TouchSelectionEnd::Cancelled) };
-        assert!(drive_touch_drag(&mut slot, cancel, begin).is_none(), "a cancel runs no OCR");
-        assert!(slot.is_none(), "and drops the rect");
-    }
-
-    #[test]
-    fn an_unavailable_route_refuses_a_finger_selection_once_at_its_start() {
-        let origin = pos2(10.0, 10.0);
-        let mode = touch_selection_mode_for(idle(OcrSelectionKind::Simple));
-        let began = TouchSelection { origin, pos: origin, began: true, end: None };
-        assert!(finger_ocr_selection_refused(began, mode, true));
-        let later = TouchSelection { began: false, ..began };
-        assert!(!finger_ocr_selection_refused(later, mode, true), "one toast per gesture");
-        assert!(!finger_ocr_selection_refused(began, mode, false), "off a page nothing would start");
-        assert!(!finger_ocr_selection_refused(began, Some(TouchSelectionMode::ImageCrop), true), "the crop chord is not OCR");
-        assert!(!finger_ocr_selection_refused(began, None, true));
-    }
-}
-
-fn contains_any_page(canvas: &CanvasView, project: &ProjectData, pos: Pos2) -> bool {
-    project.pages.iter().any(|page| {
-        canvas
-            .page_scene_rect(page.idx)
-            .map(|rect| rect.contains(pos))
-            .unwrap_or(false)
-    })
-}
-
 /// Default page-crop rect centered on the bubble anchor, sized to a 256x256 source-pixel square.
 ///
 /// The crop page dimensions are read from the image header (cheap, header-only) to convert 256 px
@@ -7985,10 +6908,6 @@ fn apply_translation_settings_sections(
     ocr_obj.insert(
         "bubbles".to_string(),
         Value::Bool(ocr_options.create_bubble),
-    );
-    ocr_obj.insert(
-        "finger_selection".to_string(),
-        Value::String(ocr_options.finger_selection.settings_key().to_string()),
     );
     ocr_obj.insert(
         "replace_chars".to_string(),
@@ -8684,15 +7603,14 @@ mod tests {
         DockEdge, HostId, PanelAnchor, PanelChrome, PanelId, PanelSizes, solve,
     };
 
-    /// The digit shown on a card is the digit that activates it, and the history is
-    /// indexed from zero while the hotkeys start at one.
+    /// A card shows the binding of its rank's parameter mode, then the name.
     #[test]
-    fn a_recent_character_card_is_captioned_with_its_own_digit() {
-        assert_eq!(recent_character_card_caption(0, "Аня"), "[ 1 ] Аня");
-        assert_eq!(recent_character_card_caption(5, "Bob"), "[ 6 ] Bob");
-        // A missing name still leaves the digit legible — the card is the only
-        // place that says which digit is bound to what.
-        assert_eq!(recent_character_card_caption(2, ""), "[ 3 ] ");
+    fn a_recent_character_card_is_captioned_with_its_own_binding() {
+        assert_eq!(recent_character_card_caption("1", "Аня"), "[ 1 ] Аня");
+        assert_eq!(recent_character_card_caption("F6", "Bob"), "[ F6 ] Bob");
+        // A missing name still leaves the binding legible — the card is the only
+        // place that says which key is bound to what.
+        assert_eq!(recent_character_card_caption("3", ""), "[ 3 ] ");
     }
 
     /// The two card helpers are each other's inverse, and nothing but their

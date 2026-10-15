@@ -16,9 +16,11 @@ owned by `ms_widgets::touch_nav` and reaches this tab only as typed canvas outpu
   settles it (one deferred write), a cancel (second finger) puts the layer back and writes nothing.
 - a LONG-PRESS lifted without moving on a text layer opens THAT layer's context menu (the one a
   right-click opens, with the same select side effect), never the canvas page menu.
-- everything else is the canvas' and the create tool's: a finger elsewhere pans, a hold lifted
-  off every text layer opens the canvas menu, a hold-drag off the selected layer is the create
-  rectangle when one can start (else it pans).
+- everything else is the canvas' and the create tool's: a finger elsewhere pans; a hold lifted
+  off every text layer does nothing (the Typing canvas is read-only, so it has no page menu); a
+  hold-drag off the selected layer is the create rectangle when one can start — the touch
+  alternative of the `typing.create_rect` gesture, claimed by the input router (`create_upload.rs`)
+  — and pans otherwise.
 
 Key structures:
 - `TypingTouchFrame`: this frame's finger facts, copied from the canvas.
@@ -598,8 +600,9 @@ mod tests {
         assert_eq!(layer.overlays[0].center_page_px, [40.0, 35.0]);
         assert!(layer.move_session.as_ref().is_some_and(|session| session.source == TypingLayerMoveSource::Touch));
         // A frame without a pointer button never settles a finger move (a claimed finger never
-        // presses), so the gesture stays one session.
-        layer.drive_layer_move_settle(&ctx);
+        // presses), so the gesture stays one session. (No bindings: a finger session ignores keys.)
+        let registry = ms_input::InputRegistry::new(ms_input::Declarations::default()).expect("an empty input registry is valid");
+        layer.drive_layer_move_settle(&ctx, &registry);
         assert!(layer.move_session.is_some());
         assert!(!layer.has_pending_placement_save(), "nothing is written mid-gesture");
         drive(&mut layer, drag(origin, Pos2::new(50.0, 45.0), false, None));

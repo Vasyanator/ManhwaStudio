@@ -21,12 +21,11 @@ Key functions:
 - `RegionFrame::set_constraints()`, `set_mask_layers()`, `set_allows_empty_mask()`: what a host
   pushes into the frame when the active consumer changes, or when its parameters do (D16)
 - `page_source_size()`: the source-pixel size of a page, i.e. the space `rect_px` lives in
-- `RegionFrame::captures_pointer()`, `drag_active()`: what the tool answers the canvas with
-- `handle_brush_gestures()`, `paint_brush_cursor()`: the brush gestures and ring the frame has
-  to own itself, because `tab.rs` delivers no key, wheel or cursor hook over an occluded pointer
+- `RegionFrame::drag_active()`: whether a gesture of the frame is in flight
+- `paint_brush_cursor()`: the brush ring the frame has to own itself, because `tab.rs` draws no
+  tool cursor over the frame (the frame's `Area` is not the canvas view)
 - `derive_lock()`, `derive_visual()`, `derive_buttons()`, `stroke_erases()`,
   `result_hidden()`, `keep_in_view_px()`, `initial_marks_radius()`: the pure rules
-- `blocks_ctrl_primary_zoom()`: whether Ctrl+drag over the frame belongs to the marks rectangle
 - `fold_pending()`: queued panel requests, dropped when the frame no longer allows them
 
 Notes:
@@ -35,7 +34,11 @@ viewport-sized area makes egui report the pointer as "over an area" everywhere a
 canvas wheel scrolling. The area sits on `Order::Middle`, below the dock panels
 (`Order::Foreground`), which is also what makes `tab.rs`'s z-order occlusion test treat the
 frame as canvas-blocking. Every hover and drag decision goes through a `Response` from
-`Ui::interact`, never through a raw pointer position (`egui-docs/06-overlays.md` §5).
+`Ui::interact`, never through a raw pointer position (`egui-docs/06-overlays.md` §5), and every
+gesture through `InputFrame::gesture_for` on that `Response` (`crate::input`: `cleaning.frame.
+{paint,erase,marks_rect}` on the body, `move` on the grip, `resize` on a handle — LEFT button by
+default, rebindable; the chord is the one held at the press). The brush size and the stroke undo
+are the host's `apply_input`.
 Touch: the area is a touch capture layer of the canvas, so a finger on the frame BODY pans the
 canvas (the body's primary drag paints the mask, never a finger's job), while the chrome around
 it — strip, handles, button rows — is published as touch holes (`geometry::chrome_touch_holes`)
@@ -46,8 +49,9 @@ and «Сравнить» is a MOMENTARY HOLD, not a toggle: while its pointer bu
 result layer is not painted, so the original pixels show through. That is why the row is sensed
 BEFORE the frame's contents are painted.
 The marks brush paints a colour layer under the masks with a brush of its OWN radius; in marks
-mode Ctrl/Cmd+drag over the body draws an unfilled rectangle instead of reaching the canvas zoom,
-which is why the frame tells the host when it wants that gesture (`blocks_ctrl_primary_zoom`).
+mode `cleaning.frame.marks_rect` (Ctrl+drag over the body by default) draws an unfilled
+rectangle. The canvas zoom drag cannot start over the frame (the router sees no canvas there), so
+nothing has to be blocked for it.
 Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§1, §2 D1-D6/D10, §10).
 */
 
@@ -58,7 +62,9 @@ use super::geometry::{
 use super::input::{DragKind, DragState, HANDLE_RADIUS, HandleKind, correction_delta_to_px, handle_hit_rects, handle_points, moved_rect_px, resized_rect_px, screen_delta_to_px};
 use super::layers::{MaskLayerSpec, MaskStack, ResultLayer, hollow_rect_boxes};
 use super::render;
+use crate::input;
 use ms_canvas::{CanvasView, OverlayRectPx};
+use ms_input::{HitPhase, InputFrame, view};
 use ms_tools::MaskBrush;
 use ms_widgets::touch_nav;
 use egui::{Color32, Id, Pos2, Rect, Sense, Vec2, pos2, vec2};
@@ -170,8 +176,8 @@ fn marks_brush_from(mask_brush: &MaskBrush) -> MaskBrush {
     brush
 }
 
-/// A Ctrl/Cmd+drag marks rectangle in flight: both corners in region pixels, and whether its
-/// release erases (decided once, at the press, by the same rule a stroke uses).
+/// A `cleaning.frame.marks_rect` rectangle in flight: both corners in region pixels, and whether
+/// its release erases (decided once, at the press, by the same rule a stroke uses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MarksRectGesture {
     start: (i32, i32),
@@ -187,6 +193,8 @@ pub struct FrameHost<'a> {
     pub panel_rects: &'a [Rect],
     /// Number of pages in the project, i.e. the range `choose_page` may re-anchor into.
     pub page_count: usize,
+    /// This frame's input: the frame's targeted gestures are resolved from it.
+    pub input: &'a InputFrame,
 }
 
 /// What the frame asks the host tool to do, decided during one pass.
@@ -268,16 +276,15 @@ fn derive_lock(processing: bool, has_result: bool, mask_empty: bool, stroke_in_f
     }
 }
 
-/// Whether a stroke ERASES, from the buttons held, the Shift key and the panel's mode.
+/// Whether a stroke ERASES: its gesture is an erasing one (`cleaning.frame.erase`, or the erase
+/// mode held at a marks rectangle's press), or the panel's mode erases.
 ///
-/// This is the region editor's rule verbatim (`base.rs::draw_mask_editor_image`): the right
-/// button erases unless the left is held too, and Shift+left erases whatever mode the panel
-/// offers. Shift is here rather than in `CleaningTool::set_temporary_erase` — the tab calls
-/// that hook only for a pointer it does NOT consider occluded, and the frame occludes its own
-/// hitbox, so the convention has to be read inside the pass to reach this tool at all.
+/// The region editor's rule: the erase gesture (right drag, or the erase mode held) erases
+/// whatever mode the panel offers, and the panel's erase mode turns the paint gesture into an
+/// erase as well.
 #[must_use]
-fn stroke_erases(primary: bool, secondary: bool, shift: bool, mode_erase: bool) -> bool {
-    (secondary && !primary) || shift || mode_erase
+fn stroke_erases(gesture_erases: bool, mode_erase: bool) -> bool {
+    gesture_erases || mode_erase
 }
 
 /// The colour state for a lock and an optional size violation (D6: red wins over green).
@@ -537,11 +544,6 @@ pub struct RegionFrame {
     /// Set by the host while something outside the frame owns the next click — the marks
     /// colour eyedropper — so the press that samples a colour does not also paint.
     painting_suppressed: bool,
-    /// Whether, in the last drawn pass with NO pointer button down, the frame was in marks mode,
-    /// paintable, with its body hovered and `Z` not held — the state in which a Ctrl/Cmd press
-    /// over the body starts a marks rectangle rather than a canvas zoom drag
-    /// (`blocks_ctrl_primary_zoom`). Frozen while a button is down (`update_ctrl_rect_arm`).
-    ctrl_rect_armed: bool,
     /// Whether the chrome's «Сравнить» button is being HELD right now, which hides the pending
     /// result so the original pixels show through.
     ///
@@ -605,7 +607,6 @@ impl RegionFrame {
             last_paint_px: None,
             marks_rect: None,
             painting_suppressed: false,
-            ctrl_rect_armed: false,
             compare_held: false,
             pending: PendingRequests::default(),
             hitbox: None,
@@ -846,19 +847,6 @@ impl RegionFrame {
         }
     }
 
-    /// Whether a Ctrl/Cmd+primary drag over the frame belongs to the frame right now: marks mode
-    /// armed by the last button-free pass (`update_ctrl_rect_arm`), or a marks rectangle in
-    /// flight. The host answers `CleaningTool::block_canvas_zoom_on_ctrl_primary` with it.
-    ///
-    /// Conditional, never a constant: switching the canvas zoom off mid-gesture cancels a
-    /// running zoom drag, and over the rest of the canvas Ctrl+drag must keep zooming. `Z` is
-    /// excluded because `Z`+drag stays a canvas zoom in every mode. Read one pass late, because
-    /// the tab asks before the pass runs.
-    #[must_use]
-    pub fn blocks_ctrl_primary_zoom(&self) -> bool {
-        self.paint_target == PaintTarget::Marks && (self.ctrl_rect_armed || self.marks_rect.is_some())
-    }
-
     /// Whether a primary-button stroke currently ERASES instead of painting.
     #[must_use]
     pub fn erase(&self) -> bool {
@@ -914,7 +902,6 @@ impl RegionFrame {
         // An uncommitted rectangle is dropped, never committed: the geometry it was measured
         // against is gone for this pass.
         self.marks_rect = None;
-        self.ctrl_rect_armed = false;
         // A hold is a gesture too: nothing may keep hiding a result the frame no longer draws.
         self.compare_held = false;
     }
@@ -922,22 +909,19 @@ impl RegionFrame {
     /// Whether a gesture of the frame is in flight: a move or resize drag, or a paint/erase
     /// stroke whose button is still down.
     ///
-    /// The host tool reports this through `block_canvas_drag_scroll_on_primary`, which is the
-    /// precise alternative to `block_canvas_zoom` (D5): the canvas keeps its zoom and its
-    /// undo shortcuts for the whole editing session. A stroke counts because it is exactly as
-    /// much a live gesture as a drag — scrolling the page out from under it would break it in
-    /// the same way.
+    /// An engine reads it as "the user's hand is off the frame" (`set_region`'s `settled`). A
+    /// stroke counts because it is exactly as much a live gesture as a drag.
     #[must_use]
     pub fn drag_active(&self) -> bool {
         self.drag.is_some() || self.stroke_in_flight()
     }
 
     /// Whether `pos` (screen points) lies on the frame's hitbox — the frame plus its top
-    /// strip and its two rows below.
+    /// strip and its two rows below — as the LAST drawn pass recorded it.
     ///
-    /// Answers from the LAST drawn pass, which is one frame behind when the tab asks before
-    /// `draw_overlay_ui`; the frame's `Order::Middle` area covers the same point through
-    /// egui's own z-order test, so a first frame is not left unguarded.
+    /// The test probe of the recorded hitbox (the one the touch layout publishes): in the product
+    /// the frame's `Order::Middle` area occludes the canvas view for the input router on its own.
+    #[cfg(test)]
     #[must_use]
     pub fn captures_pointer(&self, pos: Pos2) -> bool {
         self.hitbox.is_some_and(|rect| rect.contains(pos))
@@ -1182,7 +1166,7 @@ impl RegionFrame {
             .interactable(true)
             .show(ctx, |ui| {
                 ui.set_clip_rect(usable);
-                self.pass(ui, PassCtx { page: anchor.page, usable, hitbox, frame_screen, lock })
+                self.pass(ui, PassCtx { page: anchor.page, usable, hitbox, frame_screen, lock }, host.input)
             });
         // 5. The frame's own chrome asks for the same actions as the dock panel, so the two
         //    are merged rather than one replacing the other.
@@ -1219,27 +1203,24 @@ impl RegionFrame {
     }
 
     /// Senses the frame's widgets, applies what they did and paints the result.
-    fn pass(&mut self, ui: &mut egui::Ui, cx: PassCtx) -> FrameOutcome {
+    fn pass(&mut self, ui: &mut egui::Ui, cx: PassCtx, input: &InputFrame) -> FrameOutcome {
         let mut outcome = FrameOutcome::default();
         let strip = Rect::from_min_max(cx.hitbox.min, pos2(cx.hitbox.max.x, cx.hitbox.min.y + TOP_STRIP_H));
 
         // A hover sensor over the whole hitbox gives the area its size (and therefore its
         // entry in egui's layer hit-test) and swallows hover that would otherwise reach the
         // canvas between the widgets. Allocated FIRST: a later allocation wins the pointer,
-        // so every real control below stays reachable (`egui-docs/06-overlays.md` §6). Its
-        // `Response` is also the frame's own hover test for the brush gestures — a widget is
-        // only hidden from `contains_pointer` by a covering widget on ANOTHER layer, so this
-        // sensor still reports the pointer that the body or a handle went on to claim.
-        let over_frame = ui.allocate_rect(cx.hitbox, Sense::hover()).contains_pointer();
-        self.handle_brush_gestures(ui, over_frame);
+        // so every real control below stays reachable (`egui-docs/06-overlays.md` §6).
+        ui.allocate_rect(cx.hitbox, Sense::hover());
 
-        self.sense_strip_drag(ui, strip);
+        self.sense_strip_drag(ui, strip, input);
         if cx.lock.is_free() {
-            self.sense_handles(ui, cx.frame_screen);
+            self.sense_handles(ui, cx.frame_screen, input);
         }
-        let body = ui.interact(cx.frame_screen, Id::new((FRAME_AREA_ID, "body")), Sense::click_and_drag());
-        self.sense_mask_painting(ui, &body, cx.frame_screen);
-        self.update_ctrl_rect_arm(ui, &body);
+        // Drag-only: such a widget is dragged from the press on (egui `interaction.rs`), so a
+        // click without movement still paints a dot.
+        let body = ui.interact(cx.frame_screen, Id::new((FRAME_AREA_ID, "body")), Sense::drag());
+        self.sense_mask_painting(ui, &body, cx.frame_screen, input);
         // The pointer of a drag already claimed through a `Response`: the occlusion test ran
         // when the drag started, so following it raw afterwards is what egui itself does.
         let pointer = ui.ctx().input(|i| i.pointer.interact_pos());
@@ -1273,28 +1254,6 @@ impl RegionFrame {
         outcome
     }
 
-    /// Re-decides `ctrl_rect_armed`, which the tab reads BEFORE the next pass
-    /// (`blocks_ctrl_primary_zoom`).
-    ///
-    /// Decided only in a pass where NO pointer button is down, and frozen otherwise. The canvas
-    /// zoom drag is raw input, not an egui-dragged widget, so `body.hovered()` turns true the
-    /// moment a Ctrl+drag that started on the page crosses the body; arming then would flip the
-    /// block on mid-gesture and cancel that zoom. Frozen, the arm keeps the value it had when
-    /// the button went down: off for a drag that started elsewhere, on for a press that started
-    /// over the body (which is the rectangle). Armed only where a rectangle could actually
-    /// start — a frame that refuses painting leaves Ctrl+drag to the canvas zoom.
-    fn update_ctrl_rect_arm(&mut self, ui: &egui::Ui, body: &egui::Response) {
-        let (any_down, z_down) = ui.ctx().input(|i| (i.pointer.any_down(), i.key_down(egui::Key::Z)));
-        if any_down {
-            return;
-        }
-        self.ctrl_rect_armed = self.paint_target == PaintTarget::Marks
-            && self.mask_paintable()
-            && !self.painting_suppressed
-            && body.hovered()
-            && !z_down;
-    }
-
     /// Paints the marks, the mask layers over them and, on top, the pending result (§6 of the
     /// design: marks, then masks in index order, the result last). A marks rectangle in
     /// flight is previewed between the marks and the masks, where it will land.
@@ -1321,11 +1280,13 @@ impl RegionFrame {
         }
     }
 
-    /// Senses the drag grip of the top strip and starts / ends a move drag.
-    fn sense_strip_drag(&mut self, ui: &mut egui::Ui, strip: Rect) {
+    /// Senses the drag grip of the top strip and starts / ends a move drag
+    /// (`cleaning.frame.move`; another button's drag does nothing).
+    fn sense_strip_drag(&mut self, ui: &mut egui::Ui, strip: Rect, input: &InputFrame) {
         let grip = self.grip_rect(strip);
         let response = ui.interact(grip, Id::new((FRAME_AREA_ID, "grip")), Sense::click_and_drag());
-        if response.drag_started()
+        let phase = input.gesture_for(&response, &[(input::TARGET_FRAME_GRIP, true)]).filter(|hit| hit.action == input::FRAME_MOVE).map(|hit| hit.phase);
+        if phase == Some(HitPhase::DragStarted)
             && self.lock().is_free()
             && let (Some(origin), Some(start)) = (response.interact_pointer_pos(), self.rect_px)
         {
@@ -1346,7 +1307,9 @@ impl RegionFrame {
     /// `ui.interact` calls with distinct ids. Both drive the SAME handle: the drag state is
     /// keyed by `HandleKind`, never by the rectangle the pointer happened to grab, so which
     /// of the two `Response`s reports the gesture makes no difference to what it does.
-    fn sense_handles(&mut self, ui: &mut egui::Ui, frame_screen: Rect) {
+    ///
+    /// A resize is `cleaning.frame.resize` on either rect; another button's drag does nothing.
+    fn sense_handles(&mut self, ui: &mut egui::Ui, frame_screen: Rect, input: &InputFrame) {
         let points = handle_points(frame_screen);
         for (handle, point) in HandleKind::ALL.into_iter().zip(points) {
             let (primary, secondary) = handle_hit_rects(point, handle);
@@ -1356,7 +1319,12 @@ impl RegionFrame {
             let corner = secondary
                 .map(|rect| ui.interact(rect, Id::new((FRAME_AREA_ID, "handle_corner", handle.id_suffix())), Sense::click_and_drag()));
 
-            let started = response.drag_started() || corner.as_ref().is_some_and(egui::Response::drag_started);
+            let resize_started = |response: &egui::Response| {
+                input
+                    .gesture_for(response, &[(input::TARGET_FRAME_HANDLE, true)])
+                    .is_some_and(|hit| hit.action == input::FRAME_RESIZE && hit.phase == HitPhase::DragStarted)
+            };
+            let started = resize_started(&response) || corner.as_ref().is_some_and(resize_started);
             let origin = response
                 .interact_pointer_pos()
                 .or_else(|| corner.as_ref().and_then(egui::Response::interact_pointer_pos));
@@ -1402,13 +1370,17 @@ impl RegionFrame {
     }
 
     /// Paints a stroke into the active mask layer, or into the marks layer, while the body is
-    /// being dragged; in marks mode a Ctrl/Cmd+drag draws an unfilled rectangle instead.
+    /// being dragged; in marks mode `cleaning.frame.marks_rect` draws an unfilled rectangle.
     ///
-    /// The right mouse button always erases, whatever mode a panel offers — the one gesture
-    /// users expect for undoing a stray stroke (the same rule the FLUX.2 klein engine follows,
-    /// `tools/ai_editor/engines/flux2_klein/`). A marks stroke and a marks rectangle follow the
-    /// same erase rule and erase to transparent.
-    fn sense_mask_painting(&mut self, ui: &mut egui::Ui, body: &egui::Response, frame_screen: Rect) {
+    /// The gesture comes from `InputFrame::gesture_for` on the body's `Response`, resolved with
+    /// the chord held at the PRESS: `cleaning.frame.paint` paints (or erases in the panel's
+    /// erase mode), `cleaning.frame.erase` always erases — by default the right button or the
+    /// erase mode held, the one gesture users expect for undoing a stray stroke (the same rule
+    /// the FLUX.2 klein engine follows, `tools/ai_editor/engines/flux2_klein/`). A stroke starts
+    /// only at its press, never halfway through a drag. While the view zoom modifier is held a
+    /// paint / erase drag does not start (Z+drag never leaves a stroke behind). A marks stroke and
+    /// a marks rectangle follow the same erase rule and erase to transparent.
+    fn sense_mask_painting(&mut self, ui: &mut egui::Ui, body: &egui::Response, frame_screen: Rect, input: &InputFrame) {
         let Some(rect_px) = self.rect_px else {
             return;
         };
@@ -1417,68 +1389,56 @@ impl RegionFrame {
             self.marks_rect = None;
             return;
         }
-        let (primary, primary_pressed, secondary, mods, z_down) = ui.ctx().input(|i| {
-            (
-                i.pointer.primary_down(),
-                i.pointer.primary_pressed(),
-                i.pointer.secondary_down(),
-                i.modifiers,
-                i.key_down(egui::Key::Z),
-            )
-        });
         let image_size = [rect_px.w, rect_px.h];
-        // A rectangle in flight follows the pointer until the primary button is released and
-        // is committed then — whatever the modifiers do meanwhile, so letting go of Ctrl early
-        // neither drops the rectangle nor turns the rest of the drag into a stroke.
+        let hit = input.gesture_for(body, &[(input::TARGET_FRAME_BODY, true)]);
+        let pointer_px = || body.interact_pointer_pos().map(|pointer| super::super::base::scene_pointer_to_image_px(pointer, frame_screen, image_size));
+        // A rectangle in flight follows the pointer until its drag ends and is committed then —
+        // whatever the modifiers do meanwhile, so letting go of the rectangle mode early neither
+        // drops the rectangle nor turns the rest of the drag into a stroke.
         if let Some(mut gesture) = self.marks_rect {
-            if primary {
-                if let Some(pointer) = body.interact_pointer_pos() {
-                    gesture.end = super::super::base::scene_pointer_to_image_px(pointer, frame_screen, image_size);
+            let running = hit.as_ref().is_some_and(|hit| hit.action == input::FRAME_MARKS_RECT && matches!(hit.phase, HitPhase::DragStarted | HitPhase::Dragging));
+            if running {
+                if let Some(at) = pointer_px() {
+                    gesture.end = at;
                 }
                 self.marks_rect = Some(gesture);
-                ui.ctx().request_repaint();
             } else {
                 self.marks_rect = None;
                 self.commit_marks_rect(gesture);
-                ui.ctx().request_repaint();
             }
+            ui.ctx().request_repaint();
             return;
         }
-        // Ctrl / Cmd / Z are the canvas' zoom modifiers, and Ctrl+drag over the frame zooms the
-        // page (`canvas/mod.rs::handle_shortcuts` tests only `canvas_rect`, not occlusion). A
-        // zoom gesture must not leave a stroke behind, so a stroke is suppressed exactly as the
-        // region editor suppresses it. In marks mode Ctrl/Cmd is the rectangle gesture instead:
-        // the host then blocks the canvas zoom for it (`blocks_ctrl_primary_zoom`).
-        let rect_modifier = mods.ctrl || mods.command;
-        if z_down || rect_modifier {
+        let Some(hit) = hit else {
             self.last_paint_px = None;
-            if !z_down
+            return;
+        };
+        if hit.action == input::FRAME_MARKS_RECT {
+            // Mask mode has no rectangle: the gesture paints nothing there.
+            self.last_paint_px = None;
+            if hit.phase == HitPhase::DragStarted
                 && self.paint_target == PaintTarget::Marks
-                && primary
-                && primary_pressed
-                && let Some(pointer) = body.interact_pointer_pos()
+                && let Some(at) = pointer_px()
             {
-                let at = super::super::base::scene_pointer_to_image_px(pointer, frame_screen, image_size);
-                let erase = stroke_erases(true, false, mods.shift, self.erase);
+                let erase = stroke_erases(hit.params.contains(&input::ERASE_MODE), self.erase);
                 self.marks_rect = Some(MarksRectGesture { start: at, end: at, erase });
                 ui.ctx().request_repaint();
             }
             return;
         }
-        // `interact_pointer_pos` is `Some` only while EGUI decided this widget owns the
-        // pointer, so the occlusion test has already run — this is not a raw pointer read.
-        let Some(pointer) = body.interact_pointer_pos() else {
-            self.last_paint_px = None;
-            return;
-        };
-        if !(primary || secondary) {
+        let stroke = hit.action == input::FRAME_PAINT || hit.action == input::FRAME_ERASE;
+        let starting = hit.phase == HitPhase::DragStarted;
+        let continuing = hit.phase == HitPhase::Dragging && self.last_paint_px.is_some();
+        if !stroke || !(starting || continuing) || (starting && input.mode_active(view::ZOOM_MODIFIER)) {
             self.last_paint_px = None;
             return;
         }
-        let to = super::super::base::scene_pointer_to_image_px(pointer, frame_screen, image_size);
+        let Some(to) = pointer_px() else {
+            self.last_paint_px = None;
+            return;
+        };
         let from = self.last_paint_px.unwrap_or(to);
-        let starting = self.last_paint_px.is_none();
-        let erase = stroke_erases(primary, secondary, mods.shift, self.erase);
+        let erase = stroke_erases(hit.action == input::FRAME_ERASE, self.erase);
         let radius = self.active_brush().radius_px();
         // One snapshot per stroke, taken before the first segment reaches the buffer, into the
         // one history both layers share.
@@ -1542,56 +1502,12 @@ impl RegionFrame {
         render::paint_marks_rect_preview(ui.painter(), &boxes, (!gesture.erase).then_some(self.marks_color));
     }
 
-    /// Applies the two brush-size gestures of the region editor while the pointer is over the
-    /// frame: the `-` / `=` / `+` shortcuts and `Shift`+wheel.
-    ///
-    /// Both bindings are `MaskBrush`'s own, reused rather than reimplemented, and both are
-    /// handled HERE rather than only through `CleaningTool::on_key_event` / `on_wheel_event`:
-    /// `tab.rs` refuses to deliver either while the canvas pointer is occluded, and the frame
-    /// occludes it over its own hitbox (`captures_pointer`). The host tool keeps those two
-    /// hooks for the pointer OUTSIDE the frame, so between them the whole canvas is covered.
-    ///
-    /// `over_frame` must come from a `Response`, never from a raw pointer test. A change asks
-    /// for a repaint: the brush ring is drawn from the radius, so without one the new size
-    /// would stay invisible until something unrelated redrew the frame.
-    fn handle_brush_gestures(&mut self, ui: &mut egui::Ui, over_frame: bool) {
-        if !over_frame {
-            return;
-        }
-        let (mods, z_down, scroll) = ui
-            .ctx()
-            .input(|i| (i.modifiers, i.key_down(egui::Key::Z), i.smooth_scroll_delta));
-        // The canvas' zoom modifiers win over the brush: `canvas/mod.rs` consumes Ctrl + `-` /
-        // `=` for zooming and egui diverts Ctrl+wheel into a zoom delta, so answering either
-        // here would resize the brush behind a zoom the user asked for.
-        if mods.ctrl || mods.command || z_down {
-            return;
-        }
-        // The brush of the current target: the mask and the marks brush keep separate radii.
-        let brush = self.active_brush_mut();
-        let mut changed = brush.handle_size_shortcuts(ui.ctx());
-        // With Shift some backends remap the wheel into horizontal scrolling, so fall back to
-        // the X component. The delta is tested before the call because `handle_wheel` answers
-        // "handled" for every Shift-held frame, and repainting on that alone would spin the
-        // canvas at full frame rate for as long as the key is merely held.
-        let mut wheel = scroll.y;
-        if wheel.abs() <= f32::EPSILON {
-            wheel = scroll.x;
-        }
-        if wheel.abs() > f32::EPSILON && brush.handle_wheel(wheel, mods) {
-            changed = true;
-        }
-        if changed {
-            ui.ctx().request_repaint();
-        }
-    }
-
     /// Paints the brush ring over the frame body, above everything else the pass drew.
     ///
     /// It lives here and not in `CleaningTool::draw_cursor` because
-    /// `tab.rs::draw_active_tool_cursor` refuses to draw a tool cursor while the canvas
-    /// pointer is occluded, and the frame occludes it over its own hitbox — a ring requested
-    /// from that hook could therefore never appear over the one rectangle it belongs to.
+    /// `tab.rs::draw_active_tool_cursor` draws a tool cursor only while the pointer is on the
+    /// canvas view, and the frame's `Area` is not the canvas — a ring requested from that hook
+    /// could therefore never appear over the one rectangle it belongs to.
     /// Nothing is drawn while a stroke could not reach the mask, so the ring never advertises
     /// an edit the frame would refuse. The ring is the CURRENT brush's; in marks mode a thin
     /// cross of the marks colour marks its centre.
@@ -1764,6 +1680,7 @@ fn chrome_button(ui: &mut egui::Ui, rect: Rect, id_suffix: &'static str, label: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::test_support::InputBench;
 
     fn free_constraints() -> FrameConstraints {
         FrameConstraints { multiple: 1, min_side: 1, ..FrameConstraints::UNCONSTRAINED }
@@ -2043,30 +1960,26 @@ mod tests {
     /// PREVIOUS frame: one to register the handles, one to press, one to move far enough that
     /// a `click_and_drag` widget resolves the press as a drag rather than a click.
     fn drag_started_at(body: Rect, grab: Pos2) -> Option<DragKind> {
-        let ctx = egui::Context::default();
+        drag_started_by(body, grab, egui::PointerButton::Primary)
+    }
+
+    /// [`drag_started_at`] with any pointer button.
+    fn drag_started_by(body: Rect, grab: Pos2, button: egui::PointerButton) -> Option<DragKind> {
         let mut frame = placed_frame(body);
         let hitbox = hitbox_rect(body, &chrome());
-        let screen_rect = hitbox.expand(100.0);
+        let mut bench = InputBench::new(hitbox.expand(100.0));
+        let none = egui::Modifiers::NONE;
         for events in [
             Vec::new(),
-            vec![
-                egui::Event::PointerMoved(grab),
-                egui::Event::PointerButton { pos: grab, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE },
-            ],
+            vec![egui::Event::PointerMoved(grab), press_by(grab, button, none, true)],
             vec![egui::Event::PointerMoved(grab + vec2(40.0, 40.0))],
         ] {
-            let input = egui::RawInput { screen_rect: Some(screen_rect), events, ..Default::default() };
-            // No renderer applies this headless pass's texture uploads (egui 0.36 panics when a
-            // `TexturesDelta` is dropped unapplied), so its deltas are discarded; the state the
-            // test asserts on lives in `frame` instead.
-            ctx.run_ui(input, |ui| {
+            bench.frame(none, events, &[input::REGION_FRAME], |ui, input| {
                 // Same order as the real pass: the occluding hover sensor first, so the
-                // handles allocated after it keep the pointer. Its `Response` exists to
-                // OCCLUDE and is discarded exactly as the real pass discards it.
-                let _ = ui.allocate_rect(hitbox, Sense::hover());
-                frame.sense_handles(ui, body);
-            })
-            .drop_without_applying_deltas();
+                // handles allocated after it keep the pointer.
+                ui.allocate_rect(hitbox, Sense::hover());
+                frame.sense_handles(ui, body, input);
+            });
         }
         frame.drag.map(|drag| drag.kind)
     }
@@ -2424,145 +2337,14 @@ mod tests {
     // The brush: the region editor's gestures, on the canvas
     // -----------------------------------------------------------------------------------
 
-    /// Drives `handle_brush_gestures` through a real `egui::Context` with the pointer parked at
-    /// `pointer` and `events` / `modifiers` delivered on the second pass, and reports the
-    /// radius it left behind.
-    ///
-    /// Two passes, because egui hit-tests against the widget rects registered in the PREVIOUS
-    /// one: the first registers the hitbox sensor and moves the pointer, the second is the one
-    /// whose `Response` can answer `contains_pointer` at all.
-    fn brush_radius_after(body: Rect, pointer: Pos2, modifiers: egui::Modifiers, events: Vec<egui::Event>) -> usize {
-        let ctx = egui::Context::default();
-        let mut frame = placed_frame(body);
-        let hitbox = hitbox_rect(body, &chrome());
-        let screen_rect = hitbox.expand(200.0);
-        for pass_events in [vec![egui::Event::PointerMoved(pointer)], events] {
-            // egui 0.36 dropped `RawInput::modifiers`: held modifiers are now input-state that
-            // only an `Event::ModifiersChanged` updates, so it leads every pass's events.
-            let mut events = Vec::with_capacity(pass_events.len() + 1);
-            events.push(egui::Event::ModifiersChanged(modifiers));
-            events.extend(pass_events);
-            let input = egui::RawInput { screen_rect: Some(screen_rect), events, ..Default::default() };
-            // No renderer applies this headless pass's texture uploads (egui 0.36 panics when a
-            // `TexturesDelta` is dropped unapplied), so its deltas are discarded; what the test
-            // asserts on is the brush radius inside `frame`.
-            ctx.run_ui(input, |ui| {
-                // The same two lines the real pass runs, in the same order.
-                let over_frame = ui.allocate_rect(hitbox, Sense::hover()).contains_pointer();
-                frame.handle_brush_gestures(ui, over_frame);
-            })
-            .drop_without_applying_deltas();
-        }
-        frame.brush.radius_px()
-    }
-
-    fn key_press(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
-        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers }
-    }
-
-    /// A wheel notch delivered as six sub-notch events rather than one big one: egui hands any
-    /// wheel delta of 8 points or more to its own smoothing filter, which spreads it over
-    /// several frames, while anything smaller lands in `smooth_scroll_delta` whole
-    /// (`egui-0.35.0/src/input_state/wheel_state.rs`, `is_smooth`).
-    fn shift_wheel(points: f32) -> Vec<egui::Event> {
-        let modifiers = egui::Modifiers { shift: true, ..egui::Modifiers::NONE };
-        (0..6)
-            .map(|_| egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta: vec2(0.0, points),
-                phase: egui::TouchPhase::Move,
-                modifiers,
-            })
-            .collect()
-    }
-
-    /// The region editor's `-` / `=` / `+` must resize the brush with the pointer over the
-    /// frame. They cannot arrive through `CleaningTool::on_key_event` there: `tab.rs` drops
-    /// tool hotkeys while the canvas pointer is occluded and the frame occludes its own
-    /// hitbox, so the frame has to answer them inside its own pass.
-    #[test]
-    fn the_size_shortcuts_resize_the_brush_while_the_pointer_is_over_the_frame() {
-        let body = screen(200.0, 300.0, 500.0, 500.0);
-        let default_radius = MaskBrush::default().radius_px();
-        let none = egui::Modifiers::NONE;
-
-        let grown = brush_radius_after(body, body.center(), none, vec![key_press(egui::Key::Equals, none)]);
-        assert!(grown > default_radius, "`=` must grow the brush: {default_radius} -> {grown}");
-        let plus = brush_radius_after(body, body.center(), none, vec![key_press(egui::Key::Plus, none)]);
-        assert_eq!(plus, grown, "`+` is the same binding as `=`");
-        let shrunk = brush_radius_after(body, body.center(), none, vec![key_press(egui::Key::Minus, none)]);
-        assert!(shrunk < default_radius, "`-` must shrink the brush: {default_radius} -> {shrunk}");
-    }
-
-    /// The whole hitbox counts, not just the body: the strip, the handles and the two chrome
-    /// rows are the frame too, and the tab delivers nothing there either.
-    #[test]
-    fn the_size_shortcuts_reach_the_frame_over_its_chrome_but_not_off_it() {
-        let body = screen(200.0, 300.0, 500.0, 500.0);
-        let default_radius = MaskBrush::default().radius_px();
-        let none = egui::Modifiers::NONE;
-
-        let status_y = body.bottom() + HANDLE_RADIUS + CHROME_GAP + BUTTONS_H + CHROME_GAP + STATUS_H / 2.0;
-        let over_status = pos2(body.center().x, status_y);
-        assert!(
-            brush_radius_after(body, over_status, none, vec![key_press(egui::Key::Equals, none)]) > default_radius,
-            "the status line belongs to the frame"
-        );
-
-        // Off the hitbox the canvas owns the pointer, and `on_key_event` — which the tab does
-        // deliver there — is the path that answers instead.
-        let off_frame = pos2(body.center().x, body.top() - chrome().above() - 20.0);
-        assert_eq!(
-            brush_radius_after(body, off_frame, none, vec![key_press(egui::Key::Equals, none)]),
-            default_radius,
-            "the frame must not answer a shortcut aimed at the canvas"
-        );
-    }
-
-    /// Ctrl + `-` / `=` is the canvas zoom (`canvas/mod.rs`), so the brush must keep its hands
-    /// off it even with the pointer over the frame.
-    #[test]
-    fn a_zoom_modifier_takes_the_size_shortcuts_away_from_the_brush() {
-        let body = screen(200.0, 300.0, 500.0, 500.0);
-        let ctrl = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
-        assert_eq!(
-            brush_radius_after(body, body.center(), ctrl, vec![key_press(egui::Key::Equals, ctrl)]),
-            MaskBrush::default().radius_px()
-        );
-    }
-
-    /// Shift+wheel over the frame resizes the brush, exactly as it does over the region
-    /// editor's preview. With Shift held egui reports the wheel as HORIZONTAL scrolling, which
-    /// is why the gesture is read from the X component when Y is flat.
-    #[test]
-    fn shift_wheel_over_the_frame_resizes_the_brush() {
-        let body = screen(200.0, 300.0, 500.0, 500.0);
-        let default_radius = MaskBrush::default().radius_px();
-        let shift = egui::Modifiers { shift: true, ..egui::Modifiers::NONE };
-
-        assert!(brush_radius_after(body, body.center(), shift, shift_wheel(7.0)) > default_radius, "one notch up");
-        assert!(brush_radius_after(body, body.center(), shift, shift_wheel(-7.0)) < default_radius, "one notch down");
-        // Without Shift the wheel belongs to the canvas, which scrolls the page with it.
-        assert_eq!(
-            brush_radius_after(body, body.center(), egui::Modifiers::NONE, shift_wheel(7.0)),
-            default_radius,
-            "an unmodified wheel must not touch the brush"
-        );
-    }
-
-    /// The erase rule is the region editor's: the right button erases unless the left is held
-    /// too, and Shift+left erases whatever mode the panel offers. Shift is read inside the
-    /// pass because `CleaningTool::set_temporary_erase` never reaches a tool whose frame
-    /// occludes the canvas pointer.
+    /// The erase rule is the region editor's: the erase gesture erases whatever mode the panel
+    /// offers, and the panel's erase mode turns the paint gesture into an erase as well.
     #[test]
     fn the_erase_rule_matches_the_region_editors() {
-        // (primary, secondary, shift, mode) -> erases
-        assert!(!stroke_erases(true, false, false, false), "a plain left drag paints");
-        assert!(stroke_erases(false, true, false, false), "the right button erases");
-        assert!(stroke_erases(true, false, true, false), "Shift + left erases");
-        assert!(stroke_erases(true, false, false, true), "the panel's erase mode erases");
-        assert!(!stroke_erases(true, true, false, false), "with both buttons down the left one wins");
-        assert!(stroke_erases(false, false, true, false), "Shift alone would erase once a button goes down");
+        assert!(!stroke_erases(false, false), "a plain paint gesture paints");
+        assert!(stroke_erases(true, false), "the erase gesture erases");
+        assert!(stroke_erases(false, true), "the panel's erase mode erases");
+        assert!(stroke_erases(true, true));
     }
 
     // -----------------------------------------------------------------------------------
@@ -2623,55 +2405,34 @@ mod tests {
         assert!(b.process, "an engine that runs without a mask still may");
     }
 
-    /// The Ctrl+drag hook answers for the marks mode only, and only while the frame wants the
-    /// gesture: armed by hovering the body, or holding a rectangle in flight.
-    #[test]
-    fn the_ctrl_drag_zoom_block_belongs_to_the_marks_mode() {
-        let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
-        frame.ctrl_rect_armed = true;
-        assert!(!frame.blocks_ctrl_primary_zoom(), "mask mode never takes Ctrl+drag from the canvas");
-        frame.set_paint_target(PaintTarget::Marks);
-        assert!(frame.blocks_ctrl_primary_zoom());
-        frame.ctrl_rect_armed = false;
-        assert!(!frame.blocks_ctrl_primary_zoom(), "off the body the canvas keeps its zoom");
-        frame.marks_rect = Some(MarksRectGesture { start: (0, 0), end: (4, 4), erase: false });
-        assert!(frame.blocks_ctrl_primary_zoom(), "a rectangle in flight keeps the block wherever the pointer is");
-        assert!(frame.drag_active(), "and is a gesture");
-        assert_eq!(frame.lock(), FrameLock::MaskPainted, "that locks the frame");
-    }
-
-    /// Drives `sense_mask_painting` through a real `egui::Context`, one pass per entry, the
-    /// way the real pass runs it: the hover sensor, then the body, then the painting.
+    /// Drives `sense_mask_painting` through a real `egui::Context` and the cleaning input router,
+    /// one pass per entry, the way the real pass runs it: the hover sensor, then the body, then
+    /// the painting.
     fn drive_body(frame: &mut RegionFrame, body: Rect, passes: Vec<(egui::Modifiers, Vec<egui::Event>)>) {
-        let ctx = egui::Context::default();
         let hitbox = hitbox_rect(body, &chrome());
-        let screen_rect = hitbox.expand(200.0);
-        for (modifiers, pass_events) in passes {
-            let mut events = Vec::with_capacity(pass_events.len() + 1);
-            events.push(egui::Event::ModifiersChanged(modifiers));
-            events.extend(pass_events);
-            let input = egui::RawInput { screen_rect: Some(screen_rect), events, ..Default::default() };
-            // Headless: no renderer applies the texture deltas (see `drag_started_at`).
-            ctx.run_ui(input, |ui| {
-                // Allocated first to occlude, exactly as the real pass does; the `Response` is
-                // not needed here.
-                let _ = ui.allocate_rect(hitbox, Sense::hover());
-                let response = ui.interact(body, Id::new((FRAME_AREA_ID, "body")), Sense::click_and_drag());
-                frame.sense_mask_painting(ui, &response, body);
-                frame.update_ctrl_rect_arm(ui, &response);
-            })
-            .drop_without_applying_deltas();
+        let mut bench = InputBench::new(hitbox.expand(200.0));
+        for (modifiers, events) in passes {
+            bench.frame(modifiers, events, &[input::REGION_FRAME], |ui, input| {
+                // Allocated first to occlude, exactly as the real pass does.
+                ui.allocate_rect(hitbox, Sense::hover());
+                let response = ui.interact(body, Id::new((FRAME_AREA_ID, "body")), Sense::drag());
+                frame.sense_mask_painting(ui, &response, body, input);
+            });
         }
     }
 
     fn press(pos: Pos2, modifiers: egui::Modifiers, pressed: bool) -> egui::Event {
-        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers }
+        press_by(pos, egui::PointerButton::Primary, modifiers, pressed)
+    }
+
+    fn press_by(pos: Pos2, button: egui::PointerButton, modifiers: egui::Modifiers, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button, pressed, modifiers }
     }
 
     /// A Ctrl+drag in marks mode, over a 100x100 frame drawn 1:1 at (200, 300).
     fn ctrl_drag(frame: &mut RegionFrame, from: Pos2, to: Pos2) {
         let body = screen(200.0, 300.0, 300.0, 400.0);
-        let ctrl = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
+        let ctrl = egui::Modifiers { ctrl: true, command: true, ..egui::Modifiers::NONE };
         drive_body(
             frame,
             body,
@@ -2748,40 +2509,57 @@ mod tests {
         assert_eq!(&frame.masks().marks_rgba()[at..at + 4], &[230, 30, 30, 255], "the default red, along the stroke");
     }
 
-    /// The regression: a canvas Ctrl+drag zoom is raw input, so egui reports the body as
-    /// hovered as soon as such a drag crosses it. Arming then would block the zoom mid-gesture
-    /// and cancel it; the arm must stay as it was when the button went down.
+    /// The right button erases through `cleaning.frame.erase`; a drag held with the view zoom
+    /// modifier `Z` leaves nothing behind (Z+drag is the zoom everywhere).
     #[test]
-    fn a_canvas_zoom_drag_crossing_the_body_does_not_arm_the_rectangle() {
+    fn a_right_drag_erases_and_a_z_drag_paints_nothing() {
         let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
         frame.place_for_test(0, rect_px(0, 0, 100, 100));
-        frame.set_paint_target(PaintTarget::Marks);
+        frame.masks.paint_segment((25, 20), (55, 20), 2, false);
         let body = screen(200.0, 300.0, 300.0, 400.0);
-        let ctrl = egui::Modifiers { ctrl: true, ..egui::Modifiers::NONE };
-        let outside = pos2(100.0, 150.0);
+        let none = egui::Modifiers::NONE;
+        let (from, to) = (pos2(220.0, 320.0), pos2(260.0, 320.0));
         drive_body(
             &mut frame,
             body,
             vec![
-                (ctrl, vec![egui::Event::PointerMoved(outside)]),
-                (ctrl, vec![press(outside, ctrl, true)]),
-                (ctrl, vec![egui::Event::PointerMoved(body.center())]),
-                (ctrl, vec![egui::Event::PointerMoved(body.center() + vec2(5.0, 5.0))]),
+                (none, vec![egui::Event::PointerMoved(from)]),
+                (none, vec![press_by(from, egui::PointerButton::Secondary, none, true)]),
+                (none, vec![egui::Event::PointerMoved(to)]),
+                (none, vec![press_by(to, egui::PointerButton::Secondary, none, false)]),
             ],
         );
-        assert!(!frame.blocks_ctrl_primary_zoom(), "a zoom drag that started on the page must keep zooming over the frame");
-        assert!(frame.masks().is_blank(), "and leaves nothing behind");
+        assert!(frame.masks().is_blank(), "the right drag erased the painted line");
 
-        // The positive control: resting over the body with no button down arms it.
         let mut frame = RegionFrame::new(free_constraints(), &test_layers(&[Color32::RED]));
         frame.place_for_test(0, rect_px(0, 0, 100, 100));
-        frame.set_paint_target(PaintTarget::Marks);
+        let z_down = egui::Event::Key { key: egui::Key::Z, physical_key: Some(egui::Key::Z), pressed: true, repeat: false, modifiers: none };
         drive_body(
             &mut frame,
             body,
-            vec![(ctrl, vec![egui::Event::PointerMoved(body.center())]), (ctrl, vec![egui::Event::PointerMoved(body.center())])],
+            vec![
+                (none, vec![egui::Event::PointerMoved(from), z_down]),
+                (none, vec![press(from, none, true)]),
+                (none, vec![egui::Event::PointerMoved(to)]),
+                (none, vec![press(to, none, false)]),
+            ],
         );
-        assert!(frame.blocks_ctrl_primary_zoom(), "hovering the body in marks mode claims Ctrl+drag");
+        assert!(frame.masks().is_blank(), "Z+drag paints nothing");
+        assert!(!frame.drag_active());
+    }
+
+    /// A handle resizes the frame with the left button only (any-button drags used to resize and
+    /// move it).
+    #[test]
+    fn only_the_left_button_resizes_the_frame() {
+        let body = screen(200.0, 300.0, 500.0, 500.0);
+        let Some((handle, point)) = HandleKind::ALL.into_iter().zip(handle_points(body)).find(|(handle, _)| handle.is_corner()) else {
+            panic!("a frame has corner handles");
+        };
+        let corner = handle_hit_rects(point, handle).0.center();
+        assert_eq!(drag_started_at(body, corner), Some(DragKind::Resize(handle)), "the left button resizes");
+        assert_eq!(drag_started_by(body, corner, egui::PointerButton::Secondary), None, "the right button does not");
+        assert_eq!(drag_started_by(body, corner, egui::PointerButton::Middle), None, "nor does the middle one");
     }
 
     /// While the host's eyedropper waits for its click, that click must not paint.

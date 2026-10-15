@@ -442,14 +442,13 @@ impl TypingCreatePanelState {
             let has_selection = self.selected_preset_name.is_some();
             let field_width =
                 (ui.available_width() - PRESET_NAME_ROW_BUTTON_RESERVE_PT).max(120.0);
-            let preset_name_resp = ui.add_enabled(
+            ui.add_enabled(
                 has_selection,
                 egui::TextEdit::singleline(&mut self.preset_name_input)
                     .id_salt("typing_preset_name_input")
                     .hint_text(t!("typing.presets.name_hint"))
                     .desired_width(field_width),
             );
-            self.track_text_input(&preset_name_resp);
             if ui
                 .add_enabled(
                     has_selection,

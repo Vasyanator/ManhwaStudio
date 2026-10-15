@@ -30,8 +30,12 @@ FILE HEADER (cleaning/tools/stamp.rs)
     itself, so it cannot disagree with the pixels being read. With no active stroke the offset is
     zero, so it rests on the beacon and only travels away from it while the LMB stroke runs.
 - Поведение:
-  - ЛКМ: штамп кистью; `Shift+ЛКМ`: временный ластик; `Ctrl+ЛКМ`: прямоугольный штамп;
-    `Ctrl+Shift+ЛКМ`: прямоугольное стирание.
+  - Input (English; every binding rebindable, `crate::input`): `cleaning.stroke` stamps,
+    `cleaning.erase_mode` held = temporary eraser, `cleaning.rect_mode` held at the press =
+    rectangular stamp (with erase: rectangular erase); the right-button press is
+    `cleaning.stamp.set_anchor` (`on_page_press`); `cleaning.stamp.rotate` / `rotate_coarse`
+    (R+wheel / Shift+R+wheel) turn 0.5° / 2.5° per notch (`rotation_after_steps`); brush size is
+    the shared `brush.*` set. Hints and status texts name the current bindings.
   - В режиме alt-версии источник берётся из выбранной папки `project/alt_vers/<name>`.
   - В режиме текущей картинки ПКМ ставит точку штампа, а ЛКМ копирует пиксели от этой точки
     с Photoshop-like смещением и опциональным поворотом.
@@ -47,7 +51,9 @@ use super::base::{
     overlay_pixel_for_final_color, overlay_pos_to_scene_pos, overlay_rect_to_scene_rect,
     scene_pos_to_overlay_pos,
 };
+use crate::input::{self, CleaningLabels};
 use ms_canvas::{CanvasView, OverlayRectPx};
+use ms_input::{ActionId, ContextId, InputFrame};
 use ms_models::SessionCapabilities;
 use ms_project::ProjectData;
 use ms_widgets::{WheelComboBox, WheelSlider, WheelSpinBox};
@@ -173,7 +179,6 @@ pub struct StampTool {
     preview_opacity: u8,
     y_offset: i32,
     rotation_degrees: f32,
-    rotation_wheel_accum: f32,
     snap_anchor_position: bool,
     source_anchor: Option<StampAnchor>,
     active_stroke_origin: Option<StrokePoint>,
@@ -204,6 +209,8 @@ pub struct StampTool {
     /// the tab every frame before the dock bodies draw: without them the alt-version mode is
     /// hidden and never active.
     alt_versions: bool,
+    /// The binding texts of the control hints (`set_input_labels`).
+    labels: Arc<CleaningLabels>,
 }
 
 impl Default for StampTool {
@@ -251,7 +258,6 @@ impl Default for StampTool {
             preview_opacity: 160,
             y_offset: 0,
             rotation_degrees: 0.0,
-            rotation_wheel_accum: 0.0,
             snap_anchor_position: true,
             source_anchor: None,
             active_stroke_origin: None,
@@ -279,6 +285,7 @@ impl Default for StampTool {
             cursor_texture: None,
             cursor_texture_size: [0, 0],
             alt_versions: true,
+            labels: Arc::default(),
         }
     }
 }
@@ -293,24 +300,25 @@ impl StampTool {
         self.active_stroke_origin_overlay = None;
     }
 
-    fn handle_rotation_wheel(&mut self, delta_y: f32, fast_step: bool) -> bool {
-        if delta_y.abs() <= f32::EPSILON {
-            return true;
+    /// Rotates the stamp by `steps` whole wheel notches of `cleaning.stamp.rotate` (fine) or
+    /// `cleaning.stamp.rotate_coarse`. Returns whether the rotation changed.
+    fn rotate_by_steps(&mut self, steps: i32, coarse: bool) -> bool {
+        if steps == 0 {
+            return false;
         }
-        const WHEEL_NOTCH: f32 = 40.0;
-        const ROTATION_STEP_DEGREES: f32 = 0.5;
-        self.rotation_wheel_accum += delta_y;
-        let steps = (self.rotation_wheel_accum / WHEEL_NOTCH).trunc();
-        if steps.abs() <= f32::EPSILON {
-            return true;
-        }
-        self.rotation_wheel_accum -= steps * WHEEL_NOTCH;
-        let multiplier = if fast_step { 5.0 } else { 1.0 };
-        self.rotation_degrees = normalize_rotation_degrees(
-            self.rotation_degrees + steps * ROTATION_STEP_DEGREES * multiplier,
-        );
+        self.rotation_degrees = rotation_after_steps(self.rotation_degrees, steps, coarse);
         self.cursor_texture = None;
         true
+    }
+
+    /// The status text naming the set-anchor gesture, from the current bindings;
+    /// `on_this_page` asks for a point on the page being stamped.
+    fn set_anchor_status(&self, on_this_page: bool) -> String {
+        if on_this_page {
+            tf!("cleaning.tools.stamp.set_anchor_page_hint", gesture = self.labels.set_anchor)
+        } else {
+            tf!("cleaning.tools.stamp.set_anchor_hint", gesture = self.labels.set_anchor)
+        }
     }
 
     /// Draws the «Режим» label and the two mode buttons of the tool panel.
@@ -351,7 +359,7 @@ impl StampTool {
     }
 
     fn effective_erase(&self, point: StrokePoint) -> bool {
-        point.modifiers.shift
+        point.modes.erase
     }
 
     fn poll_source_loader(&mut self) {
@@ -619,8 +627,7 @@ impl StampTool {
                 .source_anchor
                 .is_some_and(|anchor| anchor.page_idx != point.page_idx)
         {
-            self.source_status_text =
-                Some(t!("cleaning.tools.stamp.set_stamp_point_page_hint").to_string());
+            self.source_status_text = Some(self.set_anchor_status(true));
             return false;
         }
         let source = if erase || !self.source_required_for_paint() {
@@ -755,7 +762,7 @@ impl StampTool {
                 );
             } else {
                 let Some(anchor) = self.source_anchor else {
-                    self.source_status_text = Some(t!("cleaning.tools.stamp.set_stamp_point_hint").to_string());
+                    self.source_status_text = Some(self.set_anchor_status(false));
                     return;
                 };
                 let Some(stroke_origin_overlay) = self.active_stroke_origin_overlay else {
@@ -923,7 +930,7 @@ impl StampTool {
                 return;
             }
             let Some(anchor) = self.source_anchor else {
-                self.source_status_text = Some(t!("cleaning.tools.stamp.set_stamp_point_hint").to_string());
+                self.source_status_text = Some(self.set_anchor_status(false));
                 return;
             };
             build_rect_chunk_from_current_source(
@@ -1202,7 +1209,6 @@ impl CleaningTool for StampTool {
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
-        self.brush_base.set_space_pan_active(false);
         self.rect_start = None;
         self.rect_current = None;
         self.rect_erase = false;
@@ -1277,7 +1283,7 @@ impl CleaningTool for StampTool {
                         y = format!("{:.1}", anchor.overlay_xy[1])
                     ));
                 } else {
-                    ui.small(t!("cleaning.tools.stamp.place_stamp_point_hint"));
+                    ui.small(tf!("cleaning.tools.stamp.place_anchor_hint", gesture = self.labels.set_anchor));
                 }
             }
         }
@@ -1323,30 +1329,40 @@ impl CleaningTool for StampTool {
         }
 
         ui.separator();
-        ui.small(t!("cleaning.tools.stamp.controls_hint_1"));
-        ui.small(t!("cleaning.tools.stamp.controls_hint_2"));
-        ui.small(t!("cleaning.tools.stamp.controls_hint_3"));
+        let labels = &self.labels;
+        ui.small(tf!("cleaning.tools.stamp.stroke_gestures_hint", stroke = labels.stroke, erase = labels.erase_mode, rect = labels.rect_mode));
+        ui.small(tf!(
+            "cleaning.tools.stamp.rect_erase_brush_hint",
+            stroke = labels.stroke,
+            erase = labels.erase_mode,
+            rect = labels.rect_mode,
+            size = labels.brush_size,
+            smaller = labels.brush_smaller,
+            larger = labels.brush_larger
+        ));
+        ui.small(tf!("cleaning.tools.stamp.rotate_hint", rotate = labels.rotate, rotate_coarse = labels.rotate_coarse));
     }
 
-    fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        self.brush_base.handle_wheel(delta_y, modifiers)
+    /// The brush tool contexts plus `BRUSH_ACTIVE` (the shared size actions).
+    fn input_contexts(&self) -> Vec<ContextId> {
+        vec![input::TOOL_BRUSH, input::TOOL_STAMP, ms_tools::mask_brush::BRUSH_ACTIVE]
     }
 
-    fn on_wheel_event_with_keys(
-        &mut self,
-        delta_y: f32,
-        modifiers: egui::Modifiers,
-        r_down: bool,
-    ) -> bool {
-        if r_down {
-            return self.handle_rotation_wheel(delta_y, modifiers.shift);
+    /// The shared brush actions, then the two rotation axes (whole notches; the coarse one wins
+    /// with Shift held, the router picks one axis per wheel event).
+    fn apply_input(&mut self, input: &InputFrame) -> bool {
+        let mut changed = self.brush_base.apply_input(input);
+        if let Some(sample) = input.axis(input::STAMP_ROTATE) {
+            changed |= self.rotate_by_steps(sample.steps, false);
         }
-        self.rotation_wheel_accum = 0.0;
-        self.brush_base.handle_wheel(delta_y, modifiers)
+        if let Some(sample) = input.axis(input::STAMP_ROTATE_COARSE) {
+            changed |= self.rotate_by_steps(sample.steps, true);
+        }
+        changed
     }
 
-    fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        self.brush_base.handle_size_shortcuts(ctx)
+    fn set_input_labels(&mut self, labels: &Arc<CleaningLabels>) {
+        self.labels = Arc::clone(labels);
     }
 
     fn set_session_capabilities(&mut self, caps: SessionCapabilities) {
@@ -1356,29 +1372,21 @@ impl CleaningTool for StampTool {
         self.set_mode(stamp_mode_for_session(self.mode, caps.alt_versions));
     }
 
-    fn set_space_pan_active(&mut self, active: bool) {
-        self.brush_base.set_space_pan_active(active);
-    }
-
-    fn space_pan_active(&self) -> bool {
-        self.brush_base.space_pan_active()
-    }
-
     fn stroke_begin(&mut self, canvas: &mut CanvasView, point: StrokePoint) {
         if self.brush_base.should_ignore_drawing() {
             return;
         }
-        if point.modifiers.ctrl {
+        if point.modes.rect {
             self.rect_start = Some(point);
             self.rect_current = Some(point);
-            self.rect_erase = point.modifiers.shift;
+            self.rect_erase = point.modes.erase;
             return;
         }
         if self.mode == StampMode::CurrentImage
             && self.source_anchor.is_none()
-            && !point.modifiers.shift
+            && !point.modes.erase
         {
-            self.source_status_text = Some(t!("cleaning.tools.stamp.set_stamp_point_hint").to_string());
+            self.source_status_text = Some(self.set_anchor_status(false));
             return;
         }
         let _ = self.begin_scratch_stroke(canvas, point, self.effective_erase(point));
@@ -1407,13 +1415,15 @@ impl CleaningTool for StampTool {
         self.commit_touched_pages(canvas);
     }
 
-    fn secondary_click(
+    /// `cleaning.stamp.set_anchor` (at its press): sets the clone-stamp source point.
+    fn on_page_press(
         &mut self,
         canvas: &mut CanvasView,
         _project: &ProjectData,
+        action: ActionId,
         point: StrokePoint,
     ) -> bool {
-        if self.brush_base.should_ignore_drawing() {
+        if action != input::STAMP_SET_ANCHOR || self.brush_base.should_ignore_drawing() {
             return false;
         }
         if self.mode == StampMode::CurrentImage {
@@ -1446,28 +1456,13 @@ impl CleaningTool for StampTool {
         if self.brush_base.should_ignore_drawing() {
             return false;
         }
-        if point.modifiers.ctrl {
-            return true;
-        }
-        if point.modifiers.shift {
+        if point.modes.rect || point.modes.erase {
             return true;
         }
         match self.mode {
             StampMode::AltVersion => self.selected_source_idx.is_some(),
             StampMode::CurrentImage => self.source_anchor.is_some(),
         }
-    }
-
-    fn block_canvas_drag_scroll_on_primary(&self) -> bool {
-        !self.brush_base.space_pan_active()
-    }
-
-    fn block_canvas_drag_scroll_on_secondary(&self) -> bool {
-        !self.brush_base.space_pan_active()
-    }
-
-    fn block_canvas_zoom_on_ctrl_primary(&self) -> bool {
-        true
     }
 
     fn suppress_base_overlay_render(&self) -> bool {
@@ -1481,6 +1476,7 @@ impl CleaningTool for StampTool {
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        _input: &InputFrame,
     ) {
         self.sync_source_dirs(project);
         self.poll_source_loader();
@@ -1637,6 +1633,22 @@ fn numeric_file_key(path: &Path) -> (u8, u64, String, u8, String) {
         ext_weight,
         base.to_ascii_lowercase(),
     )
+}
+
+/// Degrees one wheel notch of `cleaning.stamp.rotate` turns the stamp; the coarse axis turns
+/// `ROTATION_COARSE_FACTOR` times as far.
+const ROTATION_STEP_DEGREES: f32 = 0.5;
+const ROTATION_COARSE_FACTOR: f32 = 5.0;
+
+/// The rotation after `steps` wheel notches (positive = wheel away from the user) from
+/// `degrees`: 0.5° per notch, 2.5° when `coarse`, normalized to -180..=180.
+#[must_use]
+fn rotation_after_steps(degrees: f32, steps: i32, coarse: bool) -> f32 {
+    let multiplier = if coarse { ROTATION_COARSE_FACTOR } else { 1.0 };
+    // One frame's notches; a full turn is 720 fine notches, so a clamp to that loses nothing a
+    // wheel can deliver and keeps the conversion exact.
+    let notches = f32::from(i16::try_from(steps.clamp(-720, 720)).unwrap_or(0));
+    normalize_rotation_degrees(degrees + notches * ROTATION_STEP_DEGREES * multiplier)
 }
 
 fn normalize_rotation_degrees(mut degrees: f32) -> f32 {
@@ -2391,6 +2403,55 @@ mod tests {
 
     /// Tolerance of one 8-bit step, expressed in the normalized `0..=1` range.
     const ONE_STEP: f32 = 1.0 / 255.0;
+
+    /// One fine notch turns 0.5°, a coarse one 2.5°; the result wraps into -180..=180.
+    #[test]
+    fn rotation_steps_are_half_a_degree_fine_and_two_and_a_half_coarse() {
+        assert!((rotation_after_steps(0.0, 1, false) - 0.5).abs() < 1e-6);
+        assert!((rotation_after_steps(0.0, -3, false) + 1.5).abs() < 1e-6);
+        assert!((rotation_after_steps(10.0, 2, true) - 15.0).abs() < 1e-6);
+        assert!((rotation_after_steps(179.0, 1, true) + 178.5).abs() < 1e-4, "wraps past 180");
+        assert!((rotation_after_steps(0.0, i32::MAX, false) - 0.0).abs() < 1e-3, "a huge count clamps to one full turn");
+    }
+
+    /// The rotation axes reach the tool through `apply_input`: R+wheel turns fine, Shift+R+wheel
+    /// coarse, Shift+wheel alone resizes the brush instead.
+    #[test]
+    fn the_rotation_axes_turn_the_stamp_and_shift_wheel_sizes_the_brush() {
+        use crate::input::test_support::{InputBench, key_press, wheel_line};
+        use eframe::egui::{Modifiers, pos2, Rect};
+        let mut bench = InputBench::new(Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(800.0, 600.0)));
+        let mut tool = StampTool::default();
+        let contexts = tool.input_contexts();
+        let shift = Modifiers { shift: true, ..Modifiers::NONE };
+        let surface = |ui: &mut egui::Ui| {
+            ms_input::publish_view_surface(
+                ui.ctx(),
+                ms_input::ViewSurface { id: ms_input::ViewId(egui::Id::new("test.canvas")), rect: Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(800.0, 600.0)), holes: Vec::new(), capture_layer: None, primary: true, touch_owner: None },
+            );
+        };
+        // Publish the canvas surface and put the pointer on it.
+        bench.frame(Modifiers::NONE, vec![egui::Event::PointerMoved(pos2(100.0, 100.0))], &contexts, |ui, _| surface(ui));
+        bench.frame(Modifiers::NONE, vec![key_press(egui::Key::R, Modifiers::NONE)], &contexts, |ui, _| surface(ui));
+        bench.frame(Modifiers::NONE, vec![wheel_line(1.0, Modifiers::NONE)], &contexts, |ui, input| {
+            surface(ui);
+            assert!(tool.apply_input(input));
+        });
+        assert!((tool.rotation_degrees - 0.5).abs() < 1e-6, "R+wheel: {}", tool.rotation_degrees);
+        bench.frame(shift, vec![wheel_line(1.0, shift)], &contexts, |ui, input| {
+            surface(ui);
+            assert!(tool.apply_input(input));
+        });
+        assert!((tool.rotation_degrees - 3.0).abs() < 1e-6, "Shift+R+wheel: {}", tool.rotation_degrees);
+        let radius = tool.brush_base.radius_px();
+        bench.frame(shift, vec![egui::Event::Key { key: egui::Key::R, physical_key: Some(egui::Key::R), pressed: false, repeat: false, modifiers: shift }], &contexts, |ui, _| surface(ui));
+        bench.frame(shift, vec![wheel_line(1.0, shift)], &contexts, |ui, input| {
+            surface(ui);
+            assert!(tool.apply_input(input));
+        });
+        assert!((tool.rotation_degrees - 3.0).abs() < 1e-6, "Shift+wheel does not rotate");
+        assert!(tool.brush_base.radius_px() > radius, "Shift+wheel grows the brush");
+    }
 
     /// A context with no image layers — enough to exercise the coordinate mapping alone.
     fn coordinate_context(mode: StampMode, rotation_degrees: f32, y_offset: i32) -> StampSourceContext<'static> {

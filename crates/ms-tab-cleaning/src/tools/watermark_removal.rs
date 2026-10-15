@@ -44,8 +44,9 @@ editor — no loader job, no loading window, no editor left standing over the ca
 with its zoom and undo shortcuts disabled. The canvas says so too: `draw_cursor`
 tints the crosshair and the rubber band with the cancel button's own red
 (`ARM_CANCEL_RGB`) while a reservation is in force, and the drag becomes easier to
-START: while armed a plain ЛКМ drag selects as well as Shift+ЛКМ, which is what the
-panel's own `library_arm_gesture_hint` tells the user. Every refusal of the capture lane — its own early returns and every error of
+START: while armed a plain drag selects as well as the selection-mode drag
+(`cleaning.region.select_rect_armed`), which is what the panel's own
+`library_arm_select_hint` tells the user, from the current bindings. Every refusal of the capture lane — its own early returns and every error of
 `run_library_capture` — is reported the way a refused intake is: a red row on the armed entry
 (`WatermarkLibraryWindow::reject_capture`) plus a `log_warn`, never the status line alone.
 The crop the lane cuts is the selection grown by the measurement ring CLIPPED AT THE PAGE
@@ -126,8 +127,10 @@ use super::watermark_library_window::{
     LibraryPanelRequest,
     WatermarkLibraryWindow, remove_scratch_crop, thumbnail as library_window_thumbnail,
 };
+use crate::input::CleaningLabels;
 use ms_backend_ipc as backend_ipc;
 use ms_canvas::{CanvasView, OverlayRectPx};
+use ms_input::{ContextId, InputFrame};
 use ms_config as config;
 use ms_models::SessionCapabilities;
 use ms_project::ProjectData;
@@ -3342,13 +3345,23 @@ impl CleaningTool for WatermarkRemovalTool {
         }
     }
 
-    fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    fn input_contexts(&self) -> Vec<ContextId> {
+        self.region_base.input_contexts()
+    }
+
+    /// `cleaning.region.cancel` (published only while no editor window is open) drops the
+    /// selection and the editor session it would have opened.
+    fn apply_input(&mut self, input: &InputFrame) -> bool {
+        if RegionEditToolBase::cancel_fired(input) {
             self.region_base.cancel_selection();
             self.session.clear();
             return true;
         }
         false
+    }
+
+    fn set_input_labels(&mut self, labels: &Arc<CleaningLabels>) {
+        self.region_base.set_input_labels(labels);
     }
 
     fn set_ai_backend_available(&mut self, available: bool) {
@@ -3382,6 +3395,12 @@ impl CleaningTool for WatermarkRemovalTool {
         // that could disagree with the catalog after a scan rebuilt it.
         let selected_entries = self.chapter_library_selection();
         let saved_entries = self.chapter_saved_entries();
+        let labels = self.region_base.labels();
+        let arm_select_hint = tf!(
+            "cleaning.tools.watermark.chapter.library_arm_select_hint",
+            armed = labels.select_rect_armed,
+            select_mode = labels.select_mode
+        );
         let context = LibraryPanelContext {
             sample_params,
             max_side: CHAPTER_MAX_TEMPLATE_SIDE,
@@ -3389,6 +3408,7 @@ impl CleaningTool for WatermarkRemovalTool {
             saved_entries: &saved_entries,
             armed: self.library_arm.as_deref(),
             chapter_busy: self.chapter.busy(),
+            arm_select_hint: &arm_select_hint,
         };
         // The dock body may not touch the catalog or the canvas itself; what it asks for is
         // consumed by `draw_overlay_ui` later in this same frame.
@@ -3397,7 +3417,7 @@ impl CleaningTool for WatermarkRemovalTool {
         }
     }
 
-    fn wants_primary_stroke(&self, point: StrokePoint) -> bool {
+    fn wants_primary_stroke(&self, _point: StrokePoint) -> bool {
         // A click that ends an eyedropper sampling belongs to the colour control, not to the
         // canvas: letting it through would start a selection drag under the picked pixel.
         // BOTH predicates are needed. The colour widget clears `eyedropper_active` on the very
@@ -3405,10 +3425,7 @@ impl CleaningTool for WatermarkRemovalTool {
         // this hook, so on that frame the first flag already reads false — only
         // `primary_click_consumed_this_frame` still names the click. The typing tab guards the
         // same pair for the same reason (`ms-tab-typing/src/panel/create_state.rs`).
-        if self.library_window.eyedropper_owns_primary_click() {
-            return false;
-        }
-        self.region_base.wants_primary_stroke(point)
+        !self.library_window.eyedropper_owns_primary_click()
     }
 
     fn stroke_begin(&mut self, canvas: &mut CanvasView, point: StrokePoint) {
@@ -3423,14 +3440,8 @@ impl CleaningTool for WatermarkRemovalTool {
         self.region_base.end_selection(canvas);
     }
 
-    /// The primary stroke is the region selection (diverted or not), so a finger long-press
-    /// drag selects too. The eyedropper guard of `wants_primary_stroke` does not apply: it
-    /// protects a mouse CLICK, and a finger on the canvas never clicks.
-    fn accepts_touch_selection(&self) -> bool {
-        true
-    }
-
-    fn cancel_touch_selection(&mut self) {
+    /// A cancelled selection claim (a second finger, focus loss) drops only the drag in flight.
+    fn stroke_cancel(&mut self, _canvas: &mut CanvasView) {
         self.region_base.abort_selection_drag();
     }
 
@@ -3439,6 +3450,7 @@ impl CleaningTool for WatermarkRemovalTool {
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        input: &InputFrame,
     ) {
         self.poll_settings_load();
         self.poll_and_maybe_query_status();
@@ -3519,6 +3531,7 @@ impl CleaningTool for WatermarkRemovalTool {
                 ctx,
                 canvas,
                 project,
+                input,
                 t!("cleaning.tools.watermark.title"),
                 |editor| {
                     if editor.status.is_none() {
@@ -3605,24 +3618,6 @@ impl CleaningTool for WatermarkRemovalTool {
         self.region_base.draw_cursor(ui, canvas, pointer_scene_pos);
     }
 
-    /// Only the region-editor window is reported here.
-    ///
-    /// The library screen is a DOCK PANEL now, and a dock panel's rect reaches the tab's
-    /// occlusion gate on its own: `PanelDockOutput::drawn_panels` -> `dock_panel_rects` ->
-    /// `panel_rects` -> `CleaningTabState::canvas_pointer_occluded`. Reporting it a second
-    /// time here would be a duplicate the tool cannot keep in sync with the dock.
-    fn captures_canvas_pointer(&self, pointer_pos: egui::Pos2) -> bool {
-        self.region_base.editor_window_contains(pointer_pos)
-    }
-
-    /// Only the modal region editor blocks zoom.
-    ///
-    /// The library panel deliberately does NOT: it is a session-long surface, and
-    /// `block_canvas_zoom` also disables the clean-overlay undo shortcuts, which a panel that
-    /// may stay open for a whole chapter must not do (`tools/MODULE_README.md`).
-    fn block_canvas_zoom(&self) -> bool {
-        self.region_base.has_open_editor()
-    }
 }
 
 /// Everything the editor body may mutate, borrowed for exactly one frame.
@@ -4926,17 +4921,15 @@ mod tests {
         assert!(!tool.wants_library_panel());
     }
 
-    /// The library panel is a DOCK panel, so its rect reaches the tab's occlusion gate
-    /// through `PanelDockOutput::drawn_panels` and must not be reported a second time here —
-    /// and it must not block canvas zoom, which would also kill the clean-overlay undo
-    /// shortcuts for as long as the panel stays open.
+    /// The library panel is a DOCK panel: the router already treats it as occluding the canvas,
+    /// and it must not publish the editor-window context, which would switch off the
+    /// clean-overlay undo for as long as the panel stays open.
     #[test]
-    fn the_library_panel_neither_captures_the_pointer_nor_blocks_zoom() {
+    fn the_library_panel_keeps_the_canvas_selection_and_the_undo() {
         let mut tool = WatermarkRemovalTool::default();
         tool.library_window.toggle();
         assert!(tool.wants_library_panel());
-        assert!(!tool.block_canvas_zoom());
-        assert!(!tool.captures_canvas_pointer(egui::pos2(10.0, 10.0)));
+        assert_eq!(tool.input_contexts(), vec![crate::input::REGION_SELECT]);
     }
 
     #[test]
@@ -5373,49 +5366,40 @@ mod tests {
     }
 
     /// THE FIRST HALF OF THE BUG: while a reservation is armed the tool must accept a PLAIN
-    /// ЛКМ drag, and the hint the user is reading must say so.
+    /// drag, and the hint the user is reading must say so.
     ///
-    /// The Shift-only gate made an armed drag a complete no-op — no rubber band, no pan (the
-    /// canvas pans only with Space held), no message — and the one string that named Shift was
-    /// painted in a different dock tab from the library panel the user was reading.
+    /// The selection-mode-only gate made an armed drag a complete no-op — no rubber band, no pan
+    /// (the canvas pans only with Space held), no message — and the one string that named the
+    /// gesture was painted in a different dock tab from the library panel the user was reading.
     #[test]
     fn an_armed_tool_accepts_a_plain_drag_and_says_which_gesture_it_wants() {
         let _guard = locale_guard();
-        let plain = super::super::base::StrokePoint {
-            page_idx: 0,
-            scene_pos: egui::pos2(12.0, 12.0),
-            modifiers: super::super::base::StrokeModifiers::default(),
-        };
+        let labels = Arc::new(CleaningLabels::from_registry(&crate::input::test_support::registry()));
         let mut tool = WatermarkRemovalTool {
             library_arm: Some("entry-b".to_string()),
             ..Default::default()
         };
+        tool.set_input_labels(&labels);
         tool.sync_selection_diversion();
         assert!(
-            tool.wants_primary_stroke(plain),
+            tool.input_contexts().contains(&crate::input::REGION_ARMED),
             "the button the user just pressed IS the statement of intent"
         );
         assert_eq!(
             tool.region_base.selection_hint(),
-            t!("cleaning.region.selection_hint_armed"),
+            tf!("cleaning.region.select_armed_gesture_hint", armed = labels.select_rect_armed, gesture = labels.select_rect),
             "the tool's own hint must name the gesture accepted in this state"
         );
-        let gesture = t!("cleaning.tools.watermark.chapter.library_arm_gesture_hint");
-        assert_ne!(
-            gesture, "cleaning.tools.watermark.chapter.library_arm_gesture_hint",
-            "the panel's gesture line must exist in the catalog, not fall back to its own key"
-        );
+        let gesture = tf!("cleaning.tools.watermark.chapter.library_arm_select_hint", armed = labels.select_rect_armed, select_mode = labels.select_mode);
+        assert!(gesture.contains("LMB drag") && gesture.contains("Shift"), "{gesture}");
 
         tool.library_arm = None;
         tool.sync_selection_diversion();
         assert!(
-            !tool.wants_primary_stroke(plain),
-            "with nothing armed the Shift-only gate stands, as it does for every other tool"
+            !tool.input_contexts().contains(&crate::input::REGION_ARMED),
+            "with nothing armed the selection-mode gate stands, as it does for every other tool"
         );
-        assert_eq!(
-            tool.region_base.selection_hint(),
-            t!("cleaning.region.selection_hint")
-        );
+        assert_eq!(tool.region_base.selection_hint(), tf!("cleaning.region.select_gesture_hint", gesture = labels.select_rect));
     }
 
     /// A parked rect that reaches the tool with NO reservation must be REPORTED, not dropped.

@@ -5,13 +5,12 @@ FILE HEADER (tabs/cleaning/tab.rs)
   - `canvas`: холст с overlay-слоями клина. The Cleaning tab has NO bottom-hint (the canvas
     `bottom_hint` stays `None`, so the overlay is not drawn) and does not persist a collapsed flag.
   - `tools` / `active_tool_idx`: набор инструментов и выбранный инструмент.
-  - `stroke_active` / `last_stroke_point`: состояние текущего штриха.
-  - `touch_selection_point`: the finger long-press selection drag in flight (its own stroke
-    state, apart from the mouse one), replayed onto the active tool by
-    `crate::touch_selection::drive_tool_touch_selection` right after `canvas.draw`; the tool
-    declares it per frame through `canvas.set_long_press_selection` before `canvas.draw`.
+  - `strokes`: the stroke driver (`crate::canvas_input`) that turns this frame's canvas-wide
+    claim (a mouse drag or a finger long-press drag alike) into the active tool's stroke calls.
+  - `labels`: the binding-text cache the tool hints are built from (`crate::input`).
   - `panel_rects`: прямоугольники панелей ДОКА, нарисованных в этом кадре (добавляются в список
-    после `canvas.draw`), для фильтрации ввода. Своих плавающих окон у вкладки больше нет.
+    после `canvas.draw`); tools cut them out of the viewport. Input occlusion is the router's
+    (a dock panel is not the canvas view). Своих плавающих окон у вкладки больше нет.
   - `text_mask_model`: shared-модель маски текста для mask-layer overlay в cleaning-canvas.
   - `quick_text_mask_panel_open`: видимость вкладки дока «Быстрый клин найденного текста».
     Единственный источник истины: он же гейтит оверлей текстовой маски на холсте.
@@ -48,23 +47,30 @@ FILE HEADER (tabs/cleaning/tab.rs)
   - `start_quick_text_clean_job/poll_quick_text_clean_job`: многопоточная обработка страниц по маске текста
     с прогрессом и применением patch-ов в `CleanOverlaysModel`; pixel-level autoclean algorithm lives in
     `autoclean.rs`.
-  - `handle_history_hotkeys`: Ctrl+Z / Ctrl+Shift+Z для committed overlay-дельт из shared history.
-  - `handle_active_tool_input/hotkeys/wheel`: маршрутизация ввода в активный инструмент.
-  - `canvas_pointer_occluded`: общий гейт ввода, когда pointer занят floating UI/popup/dialog поверх canvas.
+  - `apply_history_commands`: `cleaning.clean.undo` / `redo` (declared actions) для committed
+    overlay-дельт из shared history.
+  - `drive_strokes`: the claimed canvas gesture -> the active tool (`canvas_input::StrokeDriver`).
   - `canvas` / `canvas_mut`: the tab's `CanvasView`, through which `StudioApp` syncs the shared
     viewport and page (`src/studio/view_sync.rs`) and reads the page window / pixel inspection.
-- Важно: если активный инструмент возвращает `block_canvas_zoom() = true` (например, открыт region editor),
-  zoom CanvasView блокируется, чтобы Ctrl/Z-комбинации обрабатывались только инструментом.
-  Для инструментов, которым нужен `Ctrl+ЛКМ` (например, `Замазка` для прямоугольника),
-  zoom также блокируется адресно на эту комбинацию.
+- Input (English): the tab reads NO key, modifier or wheel. Every binding is a declared action
+  (`crate::input`); the tab publishes the canvas' and the active tool's contexts
+  (`StudioTab::input_contexts`), applies the history commands and the tool's `apply_input` before
+  `canvas.draw`, drives strokes from the canvas claim after it, and hands the frame to the tool's
+  `draw_overlay_ui`. Transitional canvas adapters still called (`ms-canvas` README "Input"):
+  `set_wheel_scroll_blocked` while a stroke runs and `set_zoom_blocked` while a stroke runs or
+  `view.pan` is held — stroke points are screen positions, so the page must not scroll or zoom
+  under a running stroke, and the canvas raises its capture `Area` (which would take the
+  Space-pan press) unless its zoom is blocked. Removal: when the canvas stops raising the capture
+  area under `view.pan` and offers a "gesture running" scroll lock.
 */
 use super::autoclean::{autoclean_page, AutocleanInputError, UnevenBackgroundTool};
 use super::clean_status::{draw_clean_status, CleanFolderStatus, CleanStatusDismiss, CleanStatusView};
-use super::touch_selection::drive_tool_touch_selection;
+use super::canvas_input::{StrokeDriver, StrokeEvent, claim_sample};
+use super::input::{self as cleaning_input, CleaningLabels, CleaningLabelsCache, StrokeModes};
 use super::tools::{
     ai_api_editor_tool, ai_editor_tool, AotInpaintTool, CleaningCursorOccluder, CleaningTool,
     FluxFillInpaintTool, GradientFillTool, PatchTool, StampTool,
-    StrokeModifiers, StrokePoint, TextureSynthesisInpaintTool, WatermarkRemovalTool,
+    StrokePoint, TextureSynthesisInpaintTool, WatermarkRemovalTool,
     ZamazkaTool,
 };
 use ms_models::page_view::{PageImageInfo, PageTexture};
@@ -82,7 +88,7 @@ use ms_models::SessionCapabilities;
 use ms_models::text_mask_model::TextMaskModel;
 use ms_project::ProjectData;
 use ms_config::app_tab::AppTab;
-use ms_input::{InputFrame, InputRegistry};
+use ms_input::{ContextId, InputFrame, InputRegistry, view};
 use ms_local_ai::backend_health::AiBackendHealthSnapshot;
 use ms_widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
@@ -768,10 +774,11 @@ pub struct CleaningDrawParams<'a> {
     /// (`src/widgets/panel_dock/MODULE_README.md`); the lent-in borrow is also
     /// what keeps it disjoint from the fields the tab bodies touch.
     pub panel_dock: &'a mut PanelDockState,
-    /// This frame's input (`InputRouter::begin_frame`, run by the studio before any tab draws),
-    /// handed to the canvas (the shared `view.*` set, its gestures).
+    /// This frame's input (`InputRouter::begin_frame`, run by the studio before any tab draws):
+    /// the tab's commands, the tools' commands / axes / gestures, the canvas' shared `view.*`
+    /// set and its gestures.
     pub input: &'a InputFrame,
-    /// The studio's input registry (binding labels of the canvas' own chips).
+    /// The studio's input registry (binding labels of the canvas' chips and the tool hints).
     pub input_registry: &'a InputRegistry,
 }
 
@@ -779,12 +786,11 @@ pub struct CleaningTabState {
     canvas: CanvasView,
     tools: Vec<Box<dyn CleaningTool>>,
     active_tool_idx: usize,
-    stroke_active: bool,
-    last_stroke_point: Option<StrokePoint>,
-    active_stroke_page_idx: Option<usize>,
-    /// Last replayed point of the finger long-press selection drag in flight, `None` when
-    /// there is none (`crate::touch_selection`).
-    touch_selection_point: Option<StrokePoint>,
+    /// The canvas claim -> tool stroke driver (`crate::canvas_input`).
+    strokes: StrokeDriver,
+    /// The binding texts of the tool hints, rebuilt only when the registry or the UI language
+    /// changes (`crate::input`).
+    labels: CleaningLabelsCache,
     panel_rects: Vec<egui::Rect>,
     text_mask_model: Option<Arc<Mutex<TextMaskModel>>>,
     quick_text_mask_panel_open: bool,
@@ -830,10 +836,8 @@ impl Default for CleaningTabState {
             canvas,
             tools,
             active_tool_idx: 0,
-            stroke_active: false,
-            last_stroke_point: None,
-            active_stroke_page_idx: None,
-            touch_selection_point: None,
+            strokes: StrokeDriver::default(),
+            labels: CleaningLabelsCache::default(),
             // The six default dock panels, which is the most this tab puts on
             // screen at once. Nothing else is added: every floating surface of this
             // tab is a dock panel now.
@@ -913,6 +917,19 @@ impl CleaningTabState {
         &mut self.canvas
     }
 
+    /// The input contexts of the active tool in its current state (`CleaningTool::input_contexts`),
+    /// forwarded by `StudioTab::input_contexts`.
+    #[must_use]
+    pub(crate) fn active_tool_input_contexts(&self) -> Vec<ContextId> {
+        self.tools.get(self.active_tool_idx).map(|tool| tool.input_contexts()).unwrap_or_default()
+    }
+
+    /// Every registered tool's contexts in its current state, in registration order.
+    #[cfg(test)]
+    pub(crate) fn tool_input_contexts_for_tests(&self) -> Vec<Vec<ContextId>> {
+        self.tools.iter().map(|tool| tool.input_contexts()).collect()
+    }
+
     pub fn cleaning_mask_gpu_memory_snapshot(
         &self,
         pinned_pages: &BTreeSet<usize>,
@@ -979,44 +996,23 @@ impl CleaningTabState {
             input,
             input_registry,
         } = params;
-        if ctx.input(|i| i.pointer.primary_released()) {
-            self.finish_stroke();
-        }
         // This feeds a value a dock tab READS, and the dock runs inside
         // `canvas.draw`, so it has to run ahead of it or «Инструменты клина» would
         // show a tool that is no longer available as selected for one frame. It is
-        // safe here: it does what the frame's own `primary_released` branch above
-        // already may do — commit the stroke in flight and swap the active tool —
-        // before anything has been drawn.
+        // safe here: it commits the stroke in flight and swaps the active tool before
+        // anything has been drawn.
         self.ensure_active_tool_available();
         let canvas_rect = ui.max_rect();
-        let history_hotkeys_handled = self.handle_history_hotkeys(ctx);
-        let hotkeys_handled = self.handle_active_tool_hotkeys(ctx, canvas_rect);
-        let tool_blocks_canvas_zoom = self
-            .tools
-            .get(self.active_tool_idx)
-            .is_some_and(|tool| tool.block_canvas_zoom());
-        let (primary_down, secondary_down, space_down, modifiers, z_down) = ctx.input(|i| {
-            (
-                i.pointer.primary_down(),
-                i.pointer.secondary_down(),
-                i.key_down(egui::Key::Space),
-                i.modifiers,
-                i.key_down(egui::Key::Z),
-            )
-        });
-        let zoom_modifier_down = z_down || modifiers.ctrl || modifiers.command;
-        let tool_blocks_ctrl_primary_zoom = primary_down
-            && zoom_modifier_down
-            && self
-                .tools
-                .get(self.active_tool_idx)
-                .is_some_and(|tool| tool.block_canvas_zoom_on_ctrl_primary());
-        let wheel_blocked = self.handle_active_tool_wheel(ctx, canvas_rect) || self.stroke_active;
-        self.canvas.set_wheel_scroll_blocked(wheel_blocked);
-        self.canvas.set_zoom_blocked(
-            self.stroke_active || tool_blocks_canvas_zoom || tool_blocks_ctrl_primary_zoom,
-        );
+        let labels = std::sync::Arc::clone(self.labels.refresh(input_registry));
+        // Commands and axes BEFORE `canvas.draw`: a radius or rotation changed by a key shows in
+        // this frame's cursor, and the dock bodies drawn inside the canvas see the new state.
+        let history_changed = self.apply_history_commands(input);
+        let tool_changed = self.tools.get_mut(self.active_tool_idx).is_some_and(|tool| tool.apply_input(input));
+        let stroking = self.strokes.stroking();
+        // Transitional canvas adapters (see the file header): no scroll and no zoom under a running
+        // stroke, and no capture area while Space-pan is held.
+        self.canvas.set_wheel_scroll_blocked(stroking);
+        self.canvas.set_zoom_blocked(stroking || input.mode_active(view::PAN));
         let suppress_overlay_render = self
             .tools
             .get(self.active_tool_idx)
@@ -1024,27 +1020,14 @@ impl CleaningTabState {
         self.canvas
             .set_overlay_render_suppressed(suppress_overlay_render);
 
-        let space_pan_active = space_down;
         if let Some(active_tool) = self.tools.get_mut(self.active_tool_idx) {
-            active_tool.set_space_pan_active(space_pan_active);
-            // Before `canvas.draw`: the tool's dock bodies run inside it and hide what the
-            // session does not offer.
+            // Before `canvas.draw`: the tool's dock bodies run inside it, hide what the session
+            // does not offer and name the current bindings.
             active_tool.set_session_capabilities(self.session_caps);
+            active_tool.set_input_labels(&labels);
         }
-        let block_drag_scroll = self.tools.get(self.active_tool_idx).is_some_and(|tool| {
-            (primary_down && tool.block_canvas_drag_scroll_on_primary())
-                || (secondary_down && tool.block_canvas_drag_scroll_on_secondary())
-        });
-        self.canvas.set_drag_scroll_blocked(block_drag_scroll);
-        // A finger long-press drag selects only with a tool whose primary stroke is a selection
-        // (the region tools); with any other tool it pans. One-frame flag, consumed by `draw`.
-        self.canvas.set_long_press_selection(
-            self.tools
-                .get(self.active_tool_idx)
-                .is_some_and(|tool| tool.accepts_touch_selection()),
-        );
         self.canvas
-            .set_overlay_upload_min_interval_s(if self.stroke_active {
+            .set_overlay_upload_min_interval_s(if stroking {
                 STROKE_OVERLAY_UPLOAD_MIN_INTERVAL_S
             } else {
                 0.0
@@ -1062,7 +1045,7 @@ impl CleaningTabState {
         self.clean_folder_status.note_frame(ctx.cumulative_frame_nr());
         self.clean_folder_status.poll();
         self.clean_folder_status.start_scan_if_needed(ctx, project, self.session_caps.clean_scan);
-        let cursor_occluder = self.active_cursor_occluder(ctx, canvas_rect);
+        let cursor_occluder = self.active_cursor_occluder(ctx, canvas_rect, input);
         let mut hooks = CleaningHooks {
             quick_text_mask_panel_open: self.quick_text_mask_panel_open,
             text_mask_model: self.text_mask_model.as_ref().cloned(),
@@ -1080,6 +1063,7 @@ impl CleaningTabState {
             text_mask_load_in_progress: self.text_mask_load_in_progress,
             text_mask_load_status: self.text_mask_load_status.as_deref(),
             clean_status: self.clean_folder_status.view(),
+            labels: &labels,
             dock_out: CleaningDockOut::default(),
         };
         let mut source_upload_budget = SourceTextureUploadBudget::source_page_reupload_default();
@@ -1102,23 +1086,15 @@ impl CleaningTabState {
         let dock_out = std::mem::take(&mut hooks.dock_out);
         self.panel_rects.clear();
         // The dock drew its panels DURING `canvas.draw`, i.e. before this frame's `clear`, so its
-        // rects are re-added here: `canvas_pointer_occluded` gates the active tool on this
-        // same-frame list. They are the WHOLE list now — every floating surface of this tab is a
-        // dock panel, so nothing else is ever pushed into it.
-        //
-        // Its z-order term (`ctx.layer_id_at` == `Order::Foreground`) does cover a dock panel on
-        // its own, including the very first frame one appears — `Areas::set_state` records the
-        // panel's `Area` during `canvas.draw`, and `Areas::is_visible` accepts the CURRENT frame's
-        // set, so the lookup that runs later in the same frame already sees it. The explicit rects
-        // are kept anyway: they are this tab's uniform statement of "a floating surface of mine is
-        // here", and they do not depend on the panel widget staying an interactable `Area` on that
-        // order. They are MAIN-WINDOW rects by construction — `drawn_panels` never reports a panel
-        // the user detached into a sub-window, whose rect would otherwise blank out this window's
-        // top-left corner (`PanelDockOutput`).
+        // rects are re-added here: the active tool cuts them out of the viewport
+        // (`set_panel_rects`). They are the WHOLE list now — every floating surface of this tab is
+        // a dock panel, so nothing else is ever pushed into it. Input occlusion does not need them:
+        // a dock panel is not the canvas view for the router. They are MAIN-WINDOW rects by
+        // construction — `drawn_panels` never reports a panel the user detached into a sub-window,
+        // whose rect would otherwise blank out this window's top-left corner (`PanelDockOutput`).
         self.panel_rects.extend(dock_panel_rects);
         self.apply_dock_out(dock_out, project);
-        self.handle_active_tool_touch_selection(ctx);
-        self.handle_active_tool_input(ctx, canvas_rect, project);
+        self.drive_strokes(ctx, input, project);
         let ai_backend_available = self.ai_backend_available();
         let ai_backend_torch_available = self.ai_backend_torch_available();
         if let Some(active_tool) = self.tools.get_mut(self.active_tool_idx) {
@@ -1128,16 +1104,16 @@ impl CleaningTabState {
             // frame, so a tool that draws on the canvas can cut the panels out of the
             // viewport before `draw_overlay_ui` places anything against it.
             active_tool.set_panel_rects(&self.panel_rects);
-            active_tool.draw_overlay_ui(ctx, &mut self.canvas, project);
+            active_tool.draw_overlay_ui(ctx, &mut self.canvas, project, input);
         }
-        self.draw_active_tool_cursor(ctx, ui, canvas_rect);
+        self.draw_active_tool_cursor(ctx, ui, canvas_rect, input);
         self.canvas.draw_pixel_grid_overlay(ui);
         // Request a repaint only on real activity. A merely open quick-clean panel
         // must not force 60 fps: egui already repaints on panel interaction (drag,
         // resize, hover), and its spinners/progress are gated on the in-progress
         // flags below, so an idle open panel has nothing to animate.
-        if hotkeys_handled
-            || history_hotkeys_handled
+        if tool_changed
+            || history_changed
             || self.text_mask_load_in_progress
             || self.quick_clean_job_in_progress
         {
@@ -1198,11 +1174,6 @@ impl CleaningTabState {
         self.finish_stroke();
 
         if let Some(current) = self.tools.get_mut(self.active_tool_idx) {
-            // A finger selection never outlives its tool: dropped, not committed, exactly as a
-            // tool switch mid-drag means "not this one".
-            if self.touch_selection_point.take().is_some() {
-                current.cancel_touch_selection();
-            }
             current.deactivate(&mut self.canvas);
         }
 
@@ -1213,18 +1184,20 @@ impl CleaningTabState {
         }
     }
 
+    /// Ends the stroke in flight on the tab's own initiative (a tool switch): a mouse stroke
+    /// commits (`stroke_end`); a finger selection is dropped (`stroke_cancel`), exactly as a tool
+    /// switch mid-drag means "not this one". The rest of the claim is ignored.
     fn finish_stroke(&mut self) {
-        if !self.stroke_active {
-            self.last_stroke_point = None;
-            self.active_stroke_page_idx = None;
+        let finger = self.strokes.touch_point().is_some();
+        if !self.strokes.abort() {
             return;
         }
-        self.stroke_active = false;
-        self.last_stroke_point = None;
-        self.active_stroke_page_idx = None;
         if let Some(active) = self.tools.get_mut(self.active_tool_idx) {
-            active.stroke_end(&mut self.canvas);
-            active.set_temporary_erase(false);
+            if finger {
+                active.stroke_cancel(&mut self.canvas);
+            } else {
+                active.stroke_end(&mut self.canvas);
+            }
         }
     }
 
@@ -1572,301 +1545,85 @@ impl CleaningTabState {
         }
     }
 
-    fn active_tool_captures_pointer(&self, pointer_pos: egui::Pos2) -> bool {
-        self.tools
-            .get(self.active_tool_idx)
-            .is_some_and(|tool| tool.captures_canvas_pointer(pointer_pos))
-    }
-
-    fn pointer_in_any_panel(&self, pointer_pos: egui::Pos2) -> bool {
-        self.panel_rects
-            .iter()
-            .any(|panel_rect| panel_rect.contains(pointer_pos))
-    }
-
-    fn canvas_pointer_occluded(&self, ctx: &egui::Context, pointer_pos: egui::Pos2) -> bool {
-        ctx.any_popup_open()
-            || self.pointer_in_any_panel(pointer_pos)
-            || self.canvas.pointer_over_scrollbar(pointer_pos)
-            || self.active_tool_captures_pointer(pointer_pos)
-            || ctx.layer_id_at(pointer_pos).is_some_and(|layer| {
-                matches!(
-                    layer.order,
-                    egui::Order::Middle
-                        | egui::Order::Foreground
-                        | egui::Order::Tooltip
-                        | egui::Order::Debug
-                )
-            })
-    }
-
-    /// Replays this frame's finger long-press selection drag (`CanvasView::touch_selection`,
-    /// set by `canvas.draw` this frame) onto the active tool; see `crate::touch_selection`.
-    fn handle_active_tool_touch_selection(&mut self, ctx: &egui::Context) {
-        let Some(selection) = self.canvas.touch_selection() else {
-            return;
-        };
-        let Some(tool) = self.tools.get_mut(self.active_tool_idx) else {
-            return;
-        };
-        let replayed = drive_tool_touch_selection(
-            tool.as_mut(),
-            &mut self.canvas,
-            &mut self.touch_selection_point,
-            selection,
-            |canvas, previous, pos| {
-                previous
-                    .filter(|idx| canvas.page_contains_scene_pos(*idx, pos))
-                    .or_else(|| canvas.page_index_at_scene_pos(pos))
-            },
-        );
-        if replayed {
-            ctx.request_repaint();
-        }
-    }
-
-    fn handle_active_tool_input(
-        &mut self,
-        ctx: &egui::Context,
-        canvas_rect: egui::Rect,
-        project: &ProjectData,
-    ) {
-        let (
-            pointer_pos,
-            primary_pressed,
-            primary_down,
-            primary_released,
-            secondary_pressed,
-            modifiers,
-            z_down,
-        ) = ctx.input(|i| {
-            (
-                i.pointer.interact_pos(),
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.primary_released(),
-                i.pointer.secondary_pressed(),
-                i.modifiers,
-                i.key_down(egui::Key::Z),
-            )
-        });
-
-        if primary_released {
-            self.finish_stroke();
-            return;
-        }
-
-        let Some(pointer_pos) = pointer_pos else {
-            return;
-        };
-
-        let zoom_modifier_down = z_down || modifiers.ctrl || modifiers.command;
-        if zoom_modifier_down && primary_down {
-            let tool_consumes_ctrl_primary = self
-                .tools
-                .get(self.active_tool_idx)
-                .is_some_and(|tool| tool.block_canvas_zoom_on_ctrl_primary());
-            if !tool_consumes_ctrl_primary {
-                self.finish_stroke();
-                return;
-            }
-        }
-
-        if self
-            .tools
-            .get(self.active_tool_idx)
-            .is_some_and(|tool| tool.space_pan_active())
-        {
-            self.finish_stroke();
-            return;
-        }
-
-        if !canvas_rect.contains(pointer_pos) {
-            self.finish_stroke();
-            return;
-        }
-
-        if self.canvas_pointer_occluded(ctx, pointer_pos) {
-            self.finish_stroke();
-            return;
-        }
-
-        let page_idx = if let Some(idx) = self.active_stroke_page_idx {
-            if self.canvas.page_contains_scene_pos(idx, pointer_pos) {
-                Some(idx)
-            } else {
-                self.canvas.page_index_at_scene_pos(pointer_pos)
-            }
-        } else {
-            self.canvas.page_index_at_scene_pos(pointer_pos)
-        };
-        let Some(page_idx) = page_idx else {
-            return;
-        };
-
-        let point = StrokePoint {
-            page_idx,
-            scene_pos: pointer_pos,
-            modifiers: StrokeModifiers {
-                shift: modifiers.shift,
-                ctrl: modifiers.ctrl || modifiers.command,
-            },
-        };
-
-        if secondary_pressed
-            && let Some(active_tool) = self.tools.get_mut(self.active_tool_idx)
-            && active_tool.secondary_click(&mut self.canvas, project, point)
-        {
-            ctx.request_repaint();
-            return;
-        }
-
-        if !primary_down {
-            return;
-        }
-
-        if let Some(active_tool) = self.tools.get_mut(self.active_tool_idx) {
-            active_tool.set_temporary_erase(point.modifiers.shift);
-
-            if !self.stroke_active || primary_pressed {
-                if !active_tool.wants_primary_stroke(point) {
-                    return;
-                }
-                self.stroke_active = true;
-                self.last_stroke_point = Some(point);
-                self.active_stroke_page_idx = Some(page_idx);
-                active_tool.stroke_begin(&mut self.canvas, point);
-                ctx.request_repaint();
-                return;
-            }
-
-            if let Some(prev) = self.last_stroke_point {
-                if prev.scene_pos == point.scene_pos {
-                    return;
-                }
-                if prev.page_idx == point.page_idx {
-                    active_tool.stroke_update(&mut self.canvas, prev, point);
-                    self.last_stroke_point = Some(point);
-                    self.active_stroke_page_idx = Some(point.page_idx);
-                    ctx.request_repaint();
-                } else {
-                    active_tool.stroke_end(&mut self.canvas);
-                    active_tool.stroke_begin(&mut self.canvas, point);
-                    self.last_stroke_point = Some(point);
-                    self.active_stroke_page_idx = Some(point.page_idx);
-                    ctx.request_repaint();
-                }
-            }
-        }
-    }
-
-    fn handle_active_tool_hotkeys(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) -> bool {
-        let (pointer_pos, modifiers, z_down) =
-            ctx.input(|i| (i.pointer.hover_pos(), i.modifiers, i.key_down(egui::Key::Z)));
-        let wants_keyboard_input = ctx.egui_wants_keyboard_input();
-        if wants_keyboard_input {
+    /// The clean-overlay history commands (`cleaning.clean.undo` / `redo`; the router fires them
+    /// only while no legacy editor window is open, and the frame's own stroke undo shadows the
+    /// undo while the region frame is up). Nothing happens while a stroke runs. Returns whether
+    /// the history moved.
+    fn apply_history_commands(&mut self, input: &InputFrame) -> bool {
+        let redo = input.fired(cleaning_input::CLEAN_REDO).is_some();
+        let undo = input.fired(cleaning_input::CLEAN_UNDO).is_some();
+        if !(redo || undo) || self.strokes.stroking() {
             return false;
         }
-        if modifiers.ctrl || modifiers.command || z_down {
-            return false;
-        }
-        let Some(pointer_pos) = pointer_pos else {
-            return false;
-        };
-        if !canvas_rect.contains(pointer_pos) {
-            return false;
-        }
-        if self.canvas_pointer_occluded(ctx, pointer_pos) {
-            return false;
-        }
-        let Some(active_tool) = self.tools.get_mut(self.active_tool_idx) else {
-            return false;
-        };
-        active_tool.on_key_event(ctx)
-    }
-
-    fn handle_history_hotkeys(&mut self, ctx: &egui::Context) -> bool {
-        if ctx.egui_wants_keyboard_input() || self.stroke_active {
-            return false;
-        }
-        if self
-            .tools
-            .get(self.active_tool_idx)
-            .is_some_and(|tool| tool.block_canvas_zoom())
-        {
-            return false;
-        }
-        let command_shift_mods = egui::Modifiers {
-            shift: true,
-            command: true,
-            ..egui::Modifiers::NONE
-        };
-        let (redo, undo) = ctx.input_mut(|input| {
-            (
-                input.consume_key(command_shift_mods, egui::Key::Z),
-                input.consume_key(egui::Modifiers::COMMAND, egui::Key::Z),
-            )
-        });
         let Some(model) = self.overlays_model.as_ref() else {
             return false;
         };
         let Ok(mut model) = model.lock() else {
+            ms_log::runtime_log::log_warn("[cleaning] clean-overlay undo/redo skipped: the overlay model lock is poisoned");
             return false;
         };
-        if redo && model.redo_overlay_history() {
-            return true;
-        }
-        if undo && model.undo_overlay_history() {
-            return true;
-        }
-        false
+        // Redo first, as the old consume order did; one press fires only one of them.
+        (redo && model.redo_overlay_history()) || (undo && model.undo_overlay_history())
     }
 
-    fn handle_active_tool_wheel(&mut self, ctx: &egui::Context, canvas_rect: egui::Rect) -> bool {
-        let (pointer_pos, modifiers, r_down, scroll_delta) = ctx.input(|i| {
-            (
-                i.pointer.hover_pos(),
-                i.modifiers,
-                i.key_down(egui::Key::R),
-                i.smooth_scroll_delta,
-            )
+    /// Drives this frame's canvas claim into the active tool (`crate::canvas_input`). A stroke is
+    /// blocked while `view.pan` is held, and for a mouse claim while the pointer is off the
+    /// canvas view (a dock panel, the region frame, a window) or over a canvas scrollbar.
+    fn drive_strokes(&mut self, ctx: &egui::Context, input: &InputFrame, project: &ProjectData) {
+        let view_id = self.canvas.view_id();
+        let claim = claim_sample(input, view_id);
+        let mouse_off_canvas = claim.is_some_and(|claim| {
+            !claim.touch && (input.view_under_pointer() != Some(view_id) || self.canvas.pointer_over_scrollbar(claim.pos))
         });
-        let Some(pointer_pos) = pointer_pos else {
-            return false;
+        let blocked = input.mode_active(view::PAN) || mouse_off_canvas;
+        let Self { tools, canvas, strokes, active_tool_idx, .. } = self;
+        let Some(tool) = tools.get_mut(*active_tool_idx) else {
+            return;
         };
-        if !canvas_rect.contains(pointer_pos) {
-            return false;
-        }
-        if !modifiers.shift && !r_down {
-            return false;
-        }
-        // With Shift some platforms remap wheel into horizontal scrolling,
-        // so fallback to X when Y is near zero.
-        let mut wheel_delta = scroll_delta.y;
-        if wheel_delta.abs() <= f32::EPSILON {
-            wheel_delta = scroll_delta.x;
-        }
-        if wheel_delta.abs() <= f32::EPSILON {
-            return false;
-        }
-        if self.canvas_pointer_occluded(ctx, pointer_pos) {
-            return false;
-        }
-        let Some(active_tool) = self.tools.get_mut(self.active_tool_idx) else {
-            return false;
+        let events = {
+            let canvas: &CanvasView = canvas;
+            strokes.step(
+                claim,
+                blocked,
+                |pos, preferred| preferred.filter(|idx| canvas.page_contains_scene_pos(*idx, pos)).or_else(|| canvas.page_index_at_scene_pos(pos)),
+                |point| tool.wants_primary_stroke(point),
+            )
         };
-        let handled = active_tool.on_wheel_event_with_keys(wheel_delta, modifiers, r_down);
-        if handled {
-            ctx.request_repaint();
+        if events.is_empty() {
+            return;
         }
-        handled
+        for event in events {
+            match event {
+                StrokeEvent::Press { action, point } => {
+                    // The answer only says whether the tool used it; the repaint below runs anyway.
+                    tool.on_page_press(canvas, project, action, point);
+                }
+                StrokeEvent::Begin(point) => tool.stroke_begin(canvas, point),
+                StrokeEvent::Update { from, to } => tool.stroke_update(canvas, from, to),
+                StrokeEvent::Seam(point) => {
+                    tool.stroke_end(canvas);
+                    tool.stroke_begin(canvas, point);
+                }
+                StrokeEvent::End => tool.stroke_end(canvas),
+                StrokeEvent::Cancel => tool.stroke_cancel(canvas),
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    /// Whether the active tool's cursor belongs on the canvas this frame: a finger stroke runs,
+    /// or the mouse pointer is on the canvas view (not over a dock panel, the region frame, a
+    /// window or a scrollbar).
+    fn cursor_on_canvas(&self, input: &InputFrame, pointer_pos: Pos2) -> bool {
+        self.strokes.touch_point().is_some()
+            || (input.view_under_pointer() == Some(self.canvas.view_id()) && !self.canvas.pointer_over_scrollbar(pointer_pos))
     }
 
     /// Where the active tool's cursor (and a region tool's rubber band) is drawn this frame:
     /// see [`cursor_anchor_pos`].
     fn active_cursor_pos(&self, ctx: &egui::Context) -> Option<egui::Pos2> {
         let (interact, hover) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.hover_pos()));
-        cursor_anchor_pos(self.touch_selection_point, interact, hover, self.last_stroke_point)
+        cursor_anchor_pos(self.strokes.touch_point(), interact, hover, self.strokes.last_point())
     }
 
     fn draw_active_tool_cursor(
@@ -1874,14 +1631,12 @@ impl CleaningTabState {
         ctx: &egui::Context,
         ui: &mut egui::Ui,
         canvas_rect: egui::Rect,
+        input: &InputFrame,
     ) {
         let Some(pointer_pos) = self.active_cursor_pos(ctx) else {
             return;
         };
-        if !canvas_rect.contains(pointer_pos) {
-            return;
-        }
-        if self.canvas_pointer_occluded(ctx, pointer_pos) {
+        if !canvas_rect.contains(pointer_pos) || !self.cursor_on_canvas(input, pointer_pos) {
             return;
         }
         let page_idx = self.canvas.page_index_at_scene_pos(pointer_pos);
@@ -1889,18 +1644,9 @@ impl CleaningTabState {
             return;
         };
         if let Some(page_idx) = page_idx {
-            let modifiers = ctx.input(|i| i.modifiers);
-            active_tool.ensure_hover_overlay(
-                &mut self.canvas,
-                StrokePoint {
-                    page_idx,
-                    scene_pos: pointer_pos,
-                    modifiers: StrokeModifiers {
-                        shift: modifiers.shift,
-                        ctrl: modifiers.ctrl || modifiers.command,
-                    },
-                },
-            );
+            // A hover point carries the modes held now (a stroke samples its own).
+            let modes = StrokeModes { erase: input.mode_active(cleaning_input::ERASE_MODE), rect: input.mode_active(cleaning_input::RECT_MODE) };
+            active_tool.ensure_hover_overlay(&mut self.canvas, StrokePoint { page_idx, scene_pos: pointer_pos, modes });
         }
         active_tool.draw_cursor(ui, &self.canvas, Some(pointer_pos));
     }
@@ -1909,12 +1655,10 @@ impl CleaningTabState {
         &self,
         ctx: &egui::Context,
         canvas_rect: egui::Rect,
+        input: &InputFrame,
     ) -> Option<CleaningCursorOccluder> {
         let pointer_pos = self.active_cursor_pos(ctx)?;
-        if !canvas_rect.contains(pointer_pos) {
-            return None;
-        }
-        if self.canvas_pointer_occluded(ctx, pointer_pos) {
+        if !canvas_rect.contains(pointer_pos) || !self.cursor_on_canvas(input, pointer_pos) {
             return None;
         }
         self.tools
@@ -2017,6 +1761,8 @@ struct CleaningDockCx<'a> {
     text_mask_load_status: Option<&'a str>,
     /// Clean-folder scan result and dismiss state, read by the «Клин» status area.
     clean_status: CleanStatusView<'a>,
+    /// The binding texts of the «Клин» hints.
+    labels: &'a CleaningLabels,
     /// Everything the bodies decided this frame; drained after the canvas draw.
     out: &'a mut CleaningDockOut,
 }
@@ -2070,8 +1816,9 @@ fn draw_clean_tab_body(ui: &mut egui::Ui, cx: &mut CleaningDockCx<'_>) {
             }
         });
 
-        ui.small(t!("cleaning.tab.paint_erase_hint"));
-        ui.small(t!("cleaning.tab.scroll_brush_hint"));
+        let labels = cx.labels;
+        ui.small(tf!("cleaning.tab.stroke_controls_hint", stroke = labels.stroke, erase = labels.erase_mode));
+        ui.small(tf!("cleaning.tab.pan_brush_hint", pan = labels.pan, smaller = labels.brush_smaller, larger = labels.brush_larger));
 
         // Derived here rather than before `canvas.draw`: the canvas' current page is read at
         // the moment the body runs, so the message follows the page on the very frame it changes.
@@ -2337,6 +2084,8 @@ struct CleaningHooks<'a> {
     text_mask_load_status: Option<&'a str>,
     /// Clean-folder status, read by the «Клин» body.
     clean_status: CleanStatusView<'a>,
+    /// The binding texts of the «Клин» body's hints.
+    labels: &'a CleaningLabels,
     /// What the dock tab bodies decided this frame. Collected here for the same
     /// reason `dock_panel_rects` is: the hook runs inside `canvas.draw`, and every
     /// mutation it stands for needs `&mut CleaningTabState` after that call
@@ -2490,6 +2239,7 @@ impl CanvasHooks for CleaningHooks<'_> {
             text_mask_load_in_progress: self.text_mask_load_in_progress,
             text_mask_load_status: self.text_mask_load_status,
             clean_status: self.clean_status,
+            labels: self.labels,
             out: &mut self.dock_out,
         };
         let mut dock = PanelDock::begin(
@@ -3175,7 +2925,8 @@ mod tests {
         cleaning_row_width, cleaning_tab_outer_width, cursor_anchor_pos, drawn_tool_indices,
         scale_blocks_source_to_page, scale_edge_to_i32,
     };
-    use crate::tools::{StrokeModifiers, StrokePoint};
+    use crate::input::StrokeModes;
+    use crate::tools::StrokePoint;
     use ms_canvas::CANVAS_RIBBON_TAB;
     use ms_widgets::panel_dock::{DockEdge, PanelAnchor, PanelId};
     use egui::{Pos2, Rect, Vec2};
@@ -3186,7 +2937,7 @@ mod tests {
     /// must win over a stale mouse hover too.
     #[test]
     fn the_finger_selection_point_anchors_the_cursor_first() {
-        let point = |x: f32| StrokePoint { page_idx: 0, scene_pos: Pos2::new(x, 1.0), modifiers: StrokeModifiers::default() };
+        let point = |x: f32| StrokePoint { page_idx: 0, scene_pos: Pos2::new(x, 1.0), modes: StrokeModes::default() };
         let (finger, interact, hover, stroke) = (point(1.0), Pos2::new(2.0, 1.0), Pos2::new(3.0, 1.0), point(4.0));
         assert_eq!(cursor_anchor_pos(Some(finger), None, None, None), Some(finger.scene_pos));
         assert_eq!(cursor_anchor_pos(Some(finger), Some(interact), Some(hover), Some(stroke)), Some(finger.scene_pos));

@@ -2,7 +2,8 @@
 File: tab/autotype.rs
 
 Purpose:
-Auto-typing integration for the typing tab: hotkey-triggered bubble detection,
+Auto-typing integration for the typing tab: command-triggered bubble detection
+(`typing.layer.autotype`, run by the tab's input dispatch),
 background job polling, applying the detected bubble alignment to the selected
 text overlay, and drawing the auto-typing debug overlay visuals.
 
@@ -17,29 +18,21 @@ private items that stay there as descendants of module `tab`.
 use super::*;
 
 impl TypingTextOverlayLayer {
-    /// Starts the background auto-typing job for the selected text overlay on the `V` hotkey.
+    /// `typing.layer.autotype` (default V): starts the background auto-typing job for the selected
+    /// text overlay, which lives on `view.page_idx` (the page as the canvas drew it).
     ///
-    /// A no-op unless a text overlay of the currently drawn page (`view`) is selected, no job is
-    /// already running, and the keyboard is free (`panel_text_input_focused` / egui focus). The key
-    /// is `V`, not `C`: `C` is the clean-overlay («клин») visibility toggle handled in `tab.rs`.
-    /// `settings` supplies the optical-center shift used to pick the click point.
-    pub(super) fn try_trigger_selected_overlay_auto_typing_by_hotkey(
+    /// A no-op unless a TEXT overlay of that page is selected and no job is already running (the
+    /// router delivers the command only while a text / image overlay is selected and no text field
+    /// has focus; an exact-modifier match keeps Ctrl+V a paste). `settings` supplies the
+    /// optical-center shift used to pick the click point.
+    pub(super) fn trigger_selected_overlay_auto_typing(
         &mut self,
         ctx: &egui::Context,
         view: PageView,
-        panel_text_input_focused: bool,
         settings: TypingAutoTypingSettings,
     ) {
         let page_idx = view.page_idx;
-        if panel_text_input_focused || ctx.egui_wants_keyboard_input() {
-            return;
-        }
         if self.auto_typing_job.is_some() {
-            return;
-        }
-        // Bare `V` only: `V` is also the paste key, so a modifier-carrying press (Ctrl+V and
-        // friends) must not be mistaken for the auto-typing trigger.
-        if !ctx.input(|input| input.key_pressed(egui::Key::V) && input.modifiers.is_none()) {
             return;
         }
 
@@ -81,10 +74,6 @@ impl TypingTextOverlayLayer {
         let mut click_uv = uv_from_scene(view.image_rect, click_scene);
         click_uv[0] = click_uv[0].clamp(0.0, 1.0);
         click_uv[1] = click_uv[1].clamp(0.0, 1.0);
-        ctx.input_mut(|input| {
-            let _ = input.consume_key(egui::Modifiers::NONE, egui::Key::V);
-        });
-
         self.auto_typing_next_token = self.auto_typing_next_token.wrapping_add(1);
         let token = self.auto_typing_next_token;
         ms_log::trace_log!(

@@ -33,9 +33,8 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   width), the shared `ms_ai_api::draw_generation_status` widget right before the "Статус:" block
   while an AI API request is in flight (its Stop -> `OcrPanelActions::stop_generation`, carrying the clicked snapshot so the tab stops
   exactly that generation), behavior
-  toggles, load action, selection-mode hints (plus, only while canvas finger gestures are
-  effective, a finger hint and the quick/advanced `FingerOcrSelection` for a key-less finger
-  long-press drag, persisted per title as `OCR.finger_selection`), and last result/error preview. The "Заменять
+  toggles, load action, selection-mode hints (`OcrSelectionHints`: the bindings of the canvas OCR
+  gestures, finger alternatives included, from the input registry), and last result/error preview. The "Заменять
   символы" master toggle expands an inline editor of post-OCR substitution rules (per-row enable,
   quoted comma-separated targets, replacement, delete); `runtime_char_replacements` parses the
   enabled rows into `CharReplacementRule`s carried by `OcrRecognizeRequest`, and the OCR worker
@@ -114,7 +113,9 @@ and footer fields, then flushes text changes back through `CanvasView` after a d
   `preview_request_all`) that asks `tab.rs` to assemble and display the first request without
   sending it.
 - `bubbles.rs`: searchable bubble cards, debounced original/translation text syncing, footer field
-  editing, character filters, and card context actions. The class selector converts a bubble
+  editing, character filters, and card context actions (the card's `Ui` senses clicks behind its
+  widgets; the menu opens on the `translation.bubble_card.menu` gesture of the input frame,
+  `BubblesPanelContext::input`). The class selector converts a bubble
   between all three `BubbleClass` values; `BubbleCardBody::for_class` is the one exhaustive
   class→card-shape decision (single-line text vs translation+original, image controls, character
   controls, «Перевести» action), so a new class must state what its card shows instead of

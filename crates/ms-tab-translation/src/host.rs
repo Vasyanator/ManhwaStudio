@@ -9,14 +9,14 @@ Key items:
 - `TranslationTab::new`: builds the canvas (scroll salt, bubbles model, bottom-hint collapsed
   seed from `user_config` `Canvas.translation_hint_collapsed`). It seeds NO canvas settings: the
   canvas pulls `SharedCanvasSettings` from the bubbles model on its first draw.
-- `TranslationDrawParams` / `TranslationTab::draw`: the fired input commands and the binding
-  hints of this frame, the per-frame canvas configuration, the floating side panel and the
-  canvas draw inside the root's central panel.
-- `translation_hint_rows`: the fixed bottom-hint rows (`canvas.bottom_hint.translation.*`).
-- `impl StudioTab for TranslationTab`: input declarations and contexts, dock builder, GPU
-  eviction, source-page window, NEAREST sampling, the exit-only hint-collapsed key.
-- `hotkeys` (submodule): the three canvas-level command ids, their specs, the execute arms and
-  the per-frame binding hints (`hotkey_hints`).
+- `TranslationDrawParams` / `TranslationTab::draw`: this frame's input (handed to the tab state
+  for the draw, fired commands executed), the bottom-hint rows built from binding labels, the
+  per-frame canvas configuration, the floating side panel and the canvas draw inside the root's
+  central panel.
+- `impl StudioTab for TranslationTab`: input declarations (`crate::input::declarations`) and
+  contexts (the canvas's plus the tab's), dock builder, GPU eviction, source-page window,
+  NEAREST sampling, the exit-only hint-collapsed key.
+- `hotkeys` (submodule): the execute arms of every fired command.
 
 Notes:
 - Field order is drop order: the canvas drops before the tab state, as it did as a root field.
@@ -29,7 +29,7 @@ mod hotkeys;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use ms_canvas::{CanvasBottomHint, CanvasDrawParams, CanvasHintRow, CanvasUiStatus, CanvasView, SourceTextureUploadBudget};
+use ms_canvas::{CanvasBottomHint, CanvasDrawParams, CanvasUiStatus, CanvasView, SourceTextureUploadBudget};
 use ms_config::CANVAS_SECTION;
 use ms_memory::{CacheEvictionReport, CacheEvictionRequest};
 use ms_models::bubbles_model::BubblesModel;
@@ -72,7 +72,7 @@ pub struct TranslationDrawParams<'a> {
     /// The studio window's panel dock; the canvas carries it through to this tab's overlay hook.
     pub panel_dock: &'a mut PanelDockState,
     /// This frame's input (`InputRouter::begin_frame`, run by the root before any tab draws):
-    /// the fired commands this tab executes and its active modes.
+    /// the fired commands this tab executes, its modes, claims and gestures.
     pub input: &'a InputFrame,
     /// The studio's input registry: binding labels for the hints.
     pub input_registry: &'a InputRegistry,
@@ -115,26 +115,26 @@ impl TranslationTab {
         &mut self.state
     }
 
-    /// Draws the tab for one frame, in this order: the fired input commands, the binding hints,
-    /// bottom-hint rows, the lazy per-title settings load, the floating side panel, the canvas'
-    /// per-frame flags, then the canvas inside a `CentralPanel` of `p.ui`. The panel dock runs
-    /// inside the canvas draw (overlay hook).
+    /// Draws the tab for one frame, in this order: the frame's input handed to the tab state
+    /// (with this frame's binding labels), the fired commands, the brush actions, the bottom-hint
+    /// rows, the lazy per-title settings load, the floating side panel, the canvas' per-frame
+    /// flags, the canvas inside a `CentralPanel` of `p.ui` (the panel dock runs inside it, in the
+    /// overlay hook), then the input copy is dropped.
     pub fn draw(&mut self, p: TranslationDrawParams<'_>) {
         let TranslationDrawParams { ctx, ui, project, page_infos, texture_cache, status, panel_dock, input, input_registry } = p;
+        self.state.begin_input_frame(input, input_registry);
         self.run_fired_commands(ctx, project, input);
         if self.state.apply_brush_input(input) {
             ctx.request_repaint();
         }
-        let (create_bubble_hint, hints) = hotkeys::hotkey_hints(input_registry, input);
         let Self { canvas, state } = self;
-        canvas.set_create_bubble_shortcut_hint(create_bubble_hint);
-        state.set_hotkey_hints(hints);
-        canvas.set_bottom_hint(Some(CanvasBottomHint { rows: translation_hint_rows() }));
+        // Transitional canvas adapter: the page menu cannot name a tab's command itself yet, so
+        // the host hands it the create-bubble binding text (ms-canvas removes it, input WP9).
+        let create_bound = !input_registry.bindings(crate::input::CREATE_BUBBLE).is_empty();
+        canvas.set_create_bubble_shortcut_hint(create_bound.then(|| state.input_labels().create_bubble.clone()));
+        canvas.set_bottom_hint(Some(CanvasBottomHint { rows: state.input_labels().hint_rows(state.lines_edit_active()) }));
         state.sync_with_project_settings(project);
         state.draw_side_panel(ctx, canvas, project, page_infos);
-        canvas.set_drag_scroll_blocked(false);
-        canvas.set_wheel_scroll_blocked(false);
-        canvas.set_zoom_blocked(state.blocks_canvas_zoom());
         canvas.set_overlay_render_suppressed(false);
         canvas.set_overlay_upload_min_interval_s(0.0);
         // `panel_dock` is lent for the frame and disjoint from `state` and `canvas`; the canvas
@@ -155,28 +155,23 @@ impl TranslationTab {
                 input_registry,
             });
         });
+        state.end_input_frame();
     }
 }
 
 impl StudioTab for TranslationTab {
-    /// The host's three canvas commands (delete, create, create hint), then the tab state's own
-    /// actions (OCR selection modes, panel toggles, bubble copy / paste), all in the Translation
-    /// scope; pinned by `host/tests.rs` and the root's `input_registry_golden`.
+    /// The tab's whole input set (`crate::input::declarations`); pinned by
+    /// `input/tests.rs` and the root's `input_registry_golden`.
     fn input_declarations(&self) -> Declarations {
-        let mut actions = hotkeys::host_input_actions();
-        actions.extend(TranslationTabState::input_actions());
-        Declarations { actions, ..Declarations::default() }
+        crate::input::declarations()
     }
 
-    /// The canvas's contexts (`CanvasView::input_contexts`: it edits bubbles; it zooms while
-    /// the advanced-recognition window does not block canvas zoom, so that window's own zoom keys
-    /// reach it), plus `ms_tools::mask_brush::BRUSH_ACTIVE` while a brush of this tab is on (the
-    /// detector mask edit, the advanced-recognition brush).
+    /// The canvas's contexts (`CanvasView::input_contexts`: it edits bubbles and accepts zoom),
+    /// then the tab's (`TranslationTabState::input_contexts`: detector edit modes, the
+    /// advanced-recognition window and its brush, `BRUSH_ACTIVE` while a brush is on).
     fn input_contexts(&self) -> Vec<ContextId> {
         let mut contexts = self.canvas.input_contexts();
-        if self.state.brush_input_active() {
-            contexts.push(ms_tools::mask_brush::BRUSH_ACTIVE);
-        }
+        contexts.extend(self.state.input_contexts());
         contexts
     }
 
@@ -203,27 +198,6 @@ impl StudioTab for TranslationTab {
     fn write_exit_settings(&self, root: &mut Value) {
         ms_config::set_section_bool(root, CANVAS_SECTION, TRANSLATION_HINT_COLLAPSED_KEY, self.canvas.bottom_hint_collapsed());
     }
-}
-
-/// Builds the fixed, hand-authored Translation bottom-hint rows.
-///
-/// A curated set of localized label/key pairs (via `t!`), NOT sourced from the hotkey registry.
-/// Rebuilt every frame so a runtime language switch re-localizes them. The order is canonical and
-/// must match the documented Translation shortcut set. No row carries help, so the hint stays
-/// two-column; attach one with `CanvasHintRow::with_help` when a shortcut needs it.
-#[must_use]
-fn translation_hint_rows() -> Vec<CanvasHintRow> {
-    vec![
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_bubble_label"), t!("canvas.bottom_hint.translation.create_bubble_keys")),
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_bubble_recent_char_label"), t!("canvas.bottom_hint.translation.create_bubble_recent_char_keys")),
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.ocr_bubble_label"), t!("canvas.bottom_hint.translation.ocr_bubble_keys")),
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_label"), t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_keys")),
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.advanced_ocr_label"), t!("canvas.bottom_hint.translation.advanced_ocr_keys")),
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_image_bubble_label"), t!("canvas.bottom_hint.translation.create_image_bubble_keys")),
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_image_bubble_crop_label"), t!("canvas.bottom_hint.translation.create_image_bubble_crop_keys")),
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_hint_bubble_label"), t!("canvas.bottom_hint.translation.create_hint_bubble_keys")),
-        CanvasHintRow::new(t!("canvas.bottom_hint.translation.delete_bubble_label"), t!("canvas.bottom_hint.translation.delete_bubble_keys")),
-    ]
 }
 
 #[cfg(test)]

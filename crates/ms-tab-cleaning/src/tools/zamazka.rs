@@ -12,13 +12,18 @@ FILE HEADER (cleaning/tools/zamazka.rs)
   - Для пипетки base-страница под курсором предварительно подгружается в фоне на каждом кадре,
     чтобы цвет можно было взять до первого рисования на странице.
   - Прямоугольный режим формирует scene-rect и вставляет chunk через `replace_overlay_region`.
-  - Для `Ctrl+ЛКМ` (временный прямоугольник) и `Ctrl+Shift+ЛКМ` (временное прямоугольное
-    стирание) инструмент блокирует zoom CanvasView на эту комбинацию, чтобы не конфликтовать с
-    zoom-drag.
+  - Input (English): the stroke is `cleaning.stroke`; `cleaning.rect_mode` held at its press
+    draws a rectangle, `cleaning.erase_mode` erases (both rebindable, `crate::input`); the right
+    button press is `cleaning.pick_color` (`on_page_press`). The rectangle's Ctrl shadows only the
+    Ctrl alternative of the view zoom drag; Z+drag zooms. Brush size: the shared `brush.*`
+    actions through `BrushToolBase::apply_input`. Hints are built from the current bindings.
 - Потоки:
   - Отдельный worker загружает base-изображения страниц для пипетки, чтобы не блокировать GUI.
 */
 use super::base::{BrushToolBase, CleaningCursorOccluder, CleaningTool, StrokePoint};
+use crate::input::{self, CleaningLabels};
+use ms_input::{ActionId, ContextId, InputFrame};
+use std::sync::Arc;
 use ms_canvas::CanvasView;
 use ms_project::ProjectData;
 use ms_widgets::{WheelComboBox, WheelSlider};
@@ -53,7 +58,6 @@ pub struct ZamazkaTool {
     brush_base: BrushToolBase,
     color: Color32,
     mode: ZamazkaMode,
-    temporary_erase: bool,
     rect_erase: bool,
     rect_stroke_erase: bool,
     rect_start: Option<StrokePoint>,
@@ -63,6 +67,8 @@ pub struct ZamazkaTool {
     base_load_pending: HashSet<usize>,
     base_load_tx: Sender<(usize, PathBuf)>,
     base_load_rx: Receiver<(usize, Option<egui::ColorImage>)>,
+    /// The binding texts of the hotkey hints (`set_input_labels`).
+    labels: Arc<CleaningLabels>,
 }
 
 impl Default for ZamazkaTool {
@@ -85,7 +91,6 @@ impl Default for ZamazkaTool {
             brush_base: BrushToolBase::default(),
             color: Color32::from_rgba_unmultiplied(255, 0, 0, 255),
             mode: ZamazkaMode::Brush,
-            temporary_erase: false,
             rect_erase: false,
             rect_stroke_erase: false,
             rect_start: None,
@@ -95,6 +100,7 @@ impl Default for ZamazkaTool {
             base_load_pending: HashSet::new(),
             base_load_tx: request_tx,
             base_load_rx: result_rx,
+            labels: Arc::default(),
         }
     }
 }
@@ -172,7 +178,7 @@ impl ZamazkaTool {
     }
 
     fn effective_erase(&self, point: StrokePoint) -> bool {
-        point.modifiers.shift || self.temporary_erase || self.mode == ZamazkaMode::Eraser
+        point.modes.erase || self.mode == ZamazkaMode::Eraser
     }
 
     fn paint_segment(&self, canvas: &mut CanvasView, from: StrokePoint, to: StrokePoint) {
@@ -317,7 +323,6 @@ impl CleaningTool for ZamazkaTool {
     }
 
     fn deactivate(&mut self, _canvas: &mut CanvasView) {
-        self.brush_base.set_space_pan_active(false);
         self.brush_base.cancel_scratch_stroke();
         self.rect_stroke_erase = false;
         self.rect_start = None;
@@ -402,37 +407,37 @@ impl CleaningTool for ZamazkaTool {
 
         ui.separator();
         ui.label(t!("cleaning.tools.zamazka.hotkeys_heading"));
-        ui.label(t!("cleaning.tools.zamazka.pick_color_hint"));
-        ui.label(t!("cleaning.tools.zamazka.temp_eraser_hint"));
-        ui.label(t!("cleaning.tools.zamazka.rect_hint"));
-        ui.label(t!("cleaning.tools.zamazka.rect_erase_hint"));
-        ui.label(t!("cleaning.tools.zamazka.brush_size_wheel_hint"));
-        ui.label(t!("cleaning.tools.zamazka.brush_size_keys_hint"));
+        let labels = &self.labels;
+        ui.label(tf!("cleaning.tools.zamazka.pick_color_gesture_hint", gesture = labels.pick_color));
+        ui.label(tf!("cleaning.tools.zamazka.temp_eraser_gesture_hint", erase = labels.erase_mode, stroke = labels.stroke));
+        ui.label(tf!("cleaning.tools.zamazka.rect_gesture_hint", rect = labels.rect_mode, stroke = labels.stroke));
+        ui.label(tf!("cleaning.tools.zamazka.rect_erase_gesture_hint", rect = labels.rect_mode, erase = labels.erase_mode, stroke = labels.stroke));
+        ui.label(tf!("cleaning.tools.zamazka.brush_size_axis_hint", size = labels.brush_size));
+        ui.label(tf!("cleaning.tools.zamazka.brush_size_command_hint", smaller = labels.brush_smaller, larger = labels.brush_larger));
     }
 
-    fn on_wheel_event(&mut self, delta_y: f32, modifiers: egui::Modifiers) -> bool {
-        self.brush_base.handle_wheel(delta_y, modifiers)
+    /// The brush tool contexts plus `BRUSH_ACTIVE` (the shared size actions).
+    fn input_contexts(&self) -> Vec<ContextId> {
+        vec![input::TOOL_BRUSH, input::TOOL_ZAMAZKA, ms_tools::mask_brush::BRUSH_ACTIVE]
     }
 
-    fn on_key_event(&mut self, ctx: &egui::Context) -> bool {
-        self.brush_base.handle_size_shortcuts(ctx)
+    fn apply_input(&mut self, input: &InputFrame) -> bool {
+        self.brush_base.apply_input(input)
     }
 
-    fn set_space_pan_active(&mut self, active: bool) {
-        self.brush_base.set_space_pan_active(active);
+    fn set_input_labels(&mut self, labels: &Arc<CleaningLabels>) {
+        self.labels = Arc::clone(labels);
     }
 
-    fn space_pan_active(&self) -> bool {
-        self.brush_base.space_pan_active()
-    }
-
-    fn secondary_click(
+    /// `cleaning.pick_color` (at its press): samples the composited colour under the point.
+    fn on_page_press(
         &mut self,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        action: ActionId,
         point: StrokePoint,
     ) -> bool {
-        if self.brush_base.should_ignore_drawing() {
+        if action != input::PICK_COLOR || self.brush_base.should_ignore_drawing() {
             return false;
         }
         self.sample_color_with_base(canvas, project, point);
@@ -444,6 +449,7 @@ impl CleaningTool for ZamazkaTool {
         ctx: &egui::Context,
         canvas: &mut CanvasView,
         project: &ProjectData,
+        _input: &InputFrame,
     ) {
         self.prefetch_base_under_pointer(ctx, canvas, project);
     }
@@ -503,8 +509,8 @@ impl CleaningTool for ZamazkaTool {
         if self.brush_base.should_ignore_drawing() {
             return;
         }
-        if point.modifiers.ctrl || self.mode == ZamazkaMode::Rect {
-            self.rect_stroke_erase = point.modifiers.ctrl && point.modifiers.shift
+        if point.modes.rect || self.mode == ZamazkaMode::Rect {
+            self.rect_stroke_erase = point.modes.rect && point.modes.erase
                 || self.mode == ZamazkaMode::Rect && self.rect_erase;
             self.rect_start = Some(point);
             self.rect_current = Some(point);
@@ -574,22 +580,6 @@ impl CleaningTool for ZamazkaTool {
         for idx in self.touched_pages.drain() {
             let _ = canvas.commit_overlay_page_to_model(idx);
         }
-    }
-
-    fn set_temporary_erase(&mut self, erase: bool) {
-        self.temporary_erase = erase;
-    }
-
-    fn block_canvas_drag_scroll_on_primary(&self) -> bool {
-        !self.brush_base.space_pan_active()
-    }
-
-    fn block_canvas_drag_scroll_on_secondary(&self) -> bool {
-        !self.brush_base.space_pan_active()
-    }
-
-    fn block_canvas_zoom_on_ctrl_primary(&self) -> bool {
-        true
     }
 
     fn suppress_base_overlay_render(&self) -> bool {

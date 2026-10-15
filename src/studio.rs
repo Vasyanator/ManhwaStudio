@@ -1218,6 +1218,7 @@ mod tests {
     use crate::tabs::AppTab;
     use crate::tabs::cleaning::CleaningTabState;
     use crate::tabs::translation::{TranslationTab, TranslationTabState};
+    use crate::tabs::typing::TypingTabState;
     use eframe::egui;
     use ms_input::{ActionKind, Condition, Declarations, HotkeyOverrides, InputRegistry, Scope, view};
     use ms_canvas::input::{EDITABLE, ZOOM_ACCEPTED};
@@ -1249,10 +1250,16 @@ mod tests {
         assert!(pass.dock_ran());
     }
 
-    /// The tab-declared part of the studio's input: the only two tabs that declare or publish
-    /// anything input-related, Translation and Cleaning (the other eight answer the trait's empty
-    /// defaults). The bubbles model's documents live under a unique temp path that is never
+    /// The tab-declared part of the studio's input: the only three tabs that declare or publish
+    /// anything input-related, Translation, Cleaning and Typing (the other seven answer the trait's
+    /// empty defaults). The bubbles model's documents live under a unique temp path that is never
     /// created: the model writes nothing unless it is edited.
+    fn input_tabs() -> (TranslationTab, CleaningTabState, TypingTabState) {
+        let (translation, cleaning) = translation_and_cleaning();
+        (translation, cleaning, TypingTabState::default())
+    }
+
+    /// Translation and Cleaning only (see `input_tabs`).
     fn translation_and_cleaning() -> (TranslationTab, CleaningTabState) {
         let model_dir = std::env::temp_dir().join(format!("ms_input_golden_{}", std::process::id()));
         let model = BubblesModel::new_with_staging_probe(Vec::new(), model_dir.join("bubbles.json"), model_dir.join("unsaved_bubbles.json"), SharedCanvasSettings::default(), None, false);
@@ -1260,28 +1267,40 @@ mod tests {
         (translation, CleaningTabState::default())
     }
 
-    /// Pins the studio's code-declared input registry (no session actions, no user overrides):
-    /// every action's id, kind, scope, fixed flag and default label in English, in registry order
-    /// (actions in declaration order — view set, canvas set, brush set, then tabs in `AppTab::ALL`
-    /// order — then the fixed rows). Ids are persistence keys in `user_config` -> `Hotkeys`; the
-    /// format-1 ids they replace migrate in `ms_input::persist`. Also pins that the defaults hold no
-    /// conflict.
+    /// Every tab's declarations merged in `AppTab::ALL` order, as `Tabs::input_declarations`
+    /// merges them (the tabs not listed in `input_tabs` declare nothing).
+    fn all_tab_declarations() -> Declarations {
+        let (translation, cleaning, typing) = input_tabs();
+        let mut declarations = Declarations::default();
+        for tab in [&translation as &dyn StudioTab, &cleaning, &typing] {
+            declarations.extend(tab.input_declarations());
+        }
+        declarations
+    }
+
+    /// Pins the part of the input registry the ROOT owns or composes directly (no tab actions, no
+    /// user overrides): the view set as the root gates it, the canvas set, the brush set, the image
+    /// set's session commands and the fixed rows — every action's id, kind, scope, fixed flag and
+    /// default label in English, in registry order. Tab actions are pinned once, by each tab
+    /// crate's own golden (`ms-tab-translation` `input/tests.rs::declarations_golden`, and the
+    /// Cleaning and Typing goldens), never here. Ids are persistence keys in `user_config` ->
+    /// `Hotkeys`; the format-1 ids they replace migrate in `ms_input::persist`.
+    ///
+    /// Also checks the FULL registry, built exactly as `StudioApp::new` builds it (view + canvas +
+    /// brush + every tab + the image-set session): it must be valid and its defaults conflict-free.
     #[test]
     fn input_registry_golden() {
         use ActionKind::{Axis, Command, Gesture, Mode};
-        const TR: Scope = Scope::Tab(AppTab::Translation);
         const CV: Scope = Scope::Canvas;
         const BRUSH: Scope = Scope::Sub(None);
         // Held for the whole test: the active catalog is process-global.
         let _locale = crate::locale_store::GLOBAL_LOCALE_LOCK.lock().expect("locale lock");
         ms_i18n::set_locale(&ms_i18n::LocaleTag::english()).expect("embedded English catalog installs");
-        let (translation, cleaning) = translation_and_cleaning();
-        let mut tab_declarations = Declarations::default();
-        for tab in [&translation as &dyn StudioTab, &cleaning] {
-            tab_declarations.extend(tab.input_declarations());
-        }
-        let registry = build_input_registry(tab_declarations, Declarations::default(), &HotkeyOverrides::default()).expect("the studio declarations are valid");
 
+        let full = build_input_registry(all_tab_declarations(), crate::studio::session::image_set::input_declarations(), &HotkeyOverrides::default()).expect("the full studio declarations are valid");
+        assert!(full.conflicts().conflicts.is_empty(), "the default bindings of the full studio registry conflict: {:#?}", full.conflicts().conflicts);
+
+        let registry = build_input_registry(Declarations::default(), crate::studio::session::image_set::input_declarations(), &HotkeyOverrides::default()).expect("the root declarations are valid");
         let ctrl = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
         let zoom = format!("({ctrl} / Z)");
         let minus = egui::Key::Minus.symbol_or_name();
@@ -1315,20 +1334,8 @@ mod tests {
             ("brush.size", Axis, BRUSH, false, "Shift+Wheel / Shift+Horizontal wheel".to_owned()),
             ("brush.smaller", Command, BRUSH, false, minus.to_owned()),
             ("brush.larger", Command, BRUSH, false, "= / Shift+= / +".to_owned()),
-            ("translation.bubble.delete_selected", Command, TR, false, "Del".to_owned()),
-            ("translation.bubble.create_at_cursor", Command, TR, false, "T".to_owned()),
-            ("translation.bubble.create_hint_at_cursor", Command, TR, false, "H".to_owned()),
-            ("translation.ocr.quick_mode", Mode, TR, false, "Shift".to_owned()),
-            ("translation.ocr.advanced_mode", Mode, TR, false, "Alt".to_owned()),
-            ("translation.panel.bubbles.toggle", Command, TR, false, "P".to_owned()),
-            ("translation.panel.ocr.toggle", Command, TR, false, "S".to_owned()),
-            ("translation.panel.composition.toggle", Command, TR, false, "K".to_owned()),
-            ("translation.panel.machine_translation.toggle", Command, TR, false, "M".to_owned()),
-            ("translation.panel.detector.toggle", Command, TR, false, "D".to_owned()),
-            ("translation.bubble.copy_original", Command, TR, false, "no binding".to_owned()),
-            ("translation.bubble.copy_translation", Command, TR, false, "no binding".to_owned()),
-            ("translation.bubble.paste_original", Command, TR, false, "no binding".to_owned()),
-            ("translation.bubble.paste_translation", Command, TR, false, "no binding".to_owned()),
+            ("single_image.save", Command, Scope::Session, false, format!("{ctrl}+S")),
+            ("single_image.save_as", Command, Scope::Session, false, format!("{ctrl}+Shift+S")),
             ("view.scroll", Axis, Scope::View, true, "Wheel".to_owned()),
             ("view.scroll_horizontal", Axis, Scope::View, true, "Shift+Wheel / Horizontal wheel".to_owned()),
             ("canvas.bubble.copy", Command, CV, true, clipboard("C", &format!("{ctrl}+Ins"))),
@@ -1337,13 +1344,12 @@ mod tests {
         ];
         let actual: Vec<(&str, ActionKind, Scope, bool, String)> = registry.actions().map(|action| (action.meta.id.0, action.kind, action.meta.scope, action.fixed, registry.label(action.meta.id))).collect();
         assert_eq!(actual, expected);
-        assert!(registry.conflicts().conflicts.is_empty(), "the default bindings conflict: {:?}", registry.conflicts().conflicts);
     }
 
     /// The canvas gate: exactly the three zoom commands and the zoom axis of the view set gain
     /// `Context(ZOOM_ACCEPTED)`; every other view declaration is the crate's own, unchanged. Both
     /// canvas tabs forward their canvas's contexts: Translation edits bubbles, Cleaning does not,
-    /// and neither blocks zoom by default.
+    /// and none of the three canvas tabs blocks zoom by default (Typing: no layer selected).
     #[test]
     fn only_the_view_zoom_keys_are_gated_by_the_canvas() {
         let gated = canvas_gated_view_declarations();
@@ -1360,9 +1366,13 @@ mod tests {
             }
         }
         assert_eq!((gated.targets, gated.fixed), (original.targets, original.fixed));
-        let (translation, cleaning) = translation_and_cleaning();
-        assert_eq!(translation.input_contexts(), vec![EDITABLE, ZOOM_ACCEPTED]);
-        assert_eq!(cleaning.input_contexts(), vec![ZOOM_ACCEPTED]);
+        let (translation, cleaning, typing) = input_tabs();
+        let translation = translation.input_contexts();
+        assert!(translation.contains(&EDITABLE) && translation.contains(&ZOOM_ACCEPTED), "{translation:?}");
+        let cleaning = cleaning.input_contexts();
+        assert!(cleaning.contains(&ZOOM_ACCEPTED), "{cleaning:?}");
+        let typing = typing.input_contexts();
+        assert!(typing.contains(&ZOOM_ACCEPTED), "{typing:?}");
     }
 
     /// The image set's two save commands join the registry without a conflict (exact modifier sets:

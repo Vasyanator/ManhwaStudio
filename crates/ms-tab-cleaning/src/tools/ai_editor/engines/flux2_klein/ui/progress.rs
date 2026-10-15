@@ -35,7 +35,9 @@ use super::*;
 pub(super) fn draw_flux2_mask_hint(ui: &mut egui::Ui) {
     ui.separator();
     ui.label(t!("cleaning.tools.flux2_klein.mask_heading"));
-    ui.small(t!("cleaning.tools.flux2_klein.mask_hint"));
+    // What the mask MEANS only: the paint / erase gestures are named, from the current
+    // bindings, by the host's brush controls.
+    ui.small(t!("cleaning.tools.flux2_klein.mask_meaning_hint"));
 }
 
 /// Draws the progress shared by every long operation of this engine: one bar for the
