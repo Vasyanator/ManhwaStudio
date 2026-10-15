@@ -3327,8 +3327,6 @@
   "settings.typesetting.hanging_punctuation_save_button": "Salvar",
   "settings.typesetting.heading": "Diagramação",
   "settings.typesetting.language_label": "Idioma",
-  "settings.typesetting.rotation_ctrl_wheel_hint": "Como o gesto Ctrl+roda na aba «Texto» rotaciona a sobreposição selecionada.",
-  "settings.typesetting.rotation_ctrl_wheel_label": "Rotação Ctrl+roda:",
   "settings.typesetting.rotation_mode_raster": "Rasterizado",
   "settings.typesetting.rotation_mode_raster_hint": "Mais rápido, mas produz uma imagem menos nítida.",
   "settings.typesetting.rotation_mode_vector": "Vetorial",

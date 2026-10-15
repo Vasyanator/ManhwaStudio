@@ -444,7 +444,11 @@ impl SettingsTabState {
         match self.active_pane {
             SettingsSectionId::General => self.draw_general(ui),
             SettingsSectionId::CanvasRibbon => self.draw_canvas_ribbon(ui),
-            SettingsSectionId::Typesetting => self.draw_typesetting(ui),
+            SettingsSectionId::Typesetting => {
+                // The rotation-mode chooser names the Typing rotate axis by its current binding.
+                let rotate_binding = input.registry().label(crate::tabs::typing::LAYER_ROTATE_ACTION);
+                self.draw_typesetting(ui, &rotate_binding);
+            }
             SettingsSectionId::AiBackend => {
                 // Studio wraps the shared AI backend panel in a scroll area (it is
                 // taller than the settings viewport, like the launcher settings page);

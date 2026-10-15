@@ -125,7 +125,7 @@ use ms_config::app_tab::AppTab;
 use crate::{TypingPanelSeed, TypingTopPanelState};
 // Re-exported to `tab`'s child modules (e.g. `panels`, `layout_editor`) via `use super::*`.
 use ms_widgets::WheelSlider;
-use ms_widgets::touch_nav::context_menu_popup;
+use ms_input::touch::context_menu_popup;
 use ms_widgets::panel_dock::{
     DockArea, DockEdge, DockLayout, HostId, PanelAnchor, PanelDock, PanelDockState, PanelId,
     PanelNode, TabId,

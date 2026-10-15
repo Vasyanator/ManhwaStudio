@@ -17,13 +17,13 @@ loading, word checks, and dictionary writes still run off the GUI thread.
 ## Crate boundary
 `ms-widgets` is the reusable UI-primitive layer of the workspace. It knows NOTHING about the
 project domain: it may depend on `ms-config`, `ms-log`, `ms-i18n`, `ms-text-util`, `ms-sysprobe`,
-`ms-gifs`, `ms-thread`, `ms-theme`, `ms-input` (the unified input model and the touch router it
-re-exports as `touch_nav`) and `ms-fonts` (the last one native-only), and it may NOT depend on
+`ms-gifs`, `ms-thread`, `ms-theme` and `ms-fonts` (the last one native-only), and it may NOT depend on
 `ms-project`, `ms-models`, `ms-canvas` or anything in `src/` — the canvas, the tabs and the
 launcher depend on IT. The binary re-exports the crate as `crate::widgets` and its
 crate-root leaves as `crate::ui_fonts` and `crate::bubble_status` (`input_util` has no root
-shim: `ms_widgets::input_util`). Configurable bindings are not a widget concern: the studio's
-input registry and router live in `ms-input`.
+shim: `ms_widgets::input_util`). Configurable bindings and finger gestures are not a widget
+concern: the studio's input registry, router and canvas touch router live in `ms-input`
+(`ms_input::touch`), which every consumer names directly.
 
 Two helpers this crate owns are TEST-ONLY and reach dependent crates through the `test-support`
 feature of `ms-config`, not through `#[cfg(test)]`: `ms_config::config_saver::test_harness`
@@ -37,13 +37,6 @@ crate's `[dev-dependencies]`, so no production build carries them.
   `../examples/MODULE_README.md`.
 - `input_util.rs`: shared egui input helpers — raw (unsmoothed) wheel delta and the
   "is the pointer over a floating egui layer" test. Both restore semantics egui removed after 0.31 (still absent in 0.36).
-- `touch_nav` (no directory here): a TEMPORARY re-export shim, `pub use ms_input::touch as
-  touch_nav;` in `lib.rs`. The canvas touch-gesture owner (`TouchRouter`, `TouchSurface`,
-  `TouchOutput`, `context_menu_popup`, ...) lives in `crates/ms-input/src/touch/` (own
-  `MODULE_README.md`), part of the unified input crate. The shim keeps every
-  `ms_widgets::touch_nav::…` / `ms_widgets::TouchRouter` path compiling; it is removed (and the
-  importers re-pointed to `ms_input::touch`) by the input-unification cleanup package (WP9). Add
-  no new user of the shim.
 - `ui_scale.rs`: the single owner of the process-global interface scale
   (`General.ui_scale_percent`, in percent): the startup seed, the live read, the live change
   (`apply_ui_scale`, used by the settings slider) and `apply_ui_scale_to_context`, which every

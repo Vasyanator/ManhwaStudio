@@ -53,7 +53,8 @@ ms-tools = { path = "../ms-tools" }
 # (`panel_dock`) this tab's UI is built from, and `input_util`.
 ms-widgets = { path = "../ms-widgets" }
 # `button_label`: the patch tool's usage hint names the cancel key this editor reads (the core
-# reads no key; `ms_tools::patch::PatchInput`). Below `ms-widgets`, no layering constraint.
+# reads no key; `ms_tools::patch::PatchInput`), and `ms_input::touch` (finger pan / pinch,
+# long-press selection, the canvas menu popup). Below `ms-widgets`, no layering constraint.
 ms-input = { path = "../ms-input" }
 # Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
 # hand-typed here. A leaf over egui, so it adds no layering constraint.

@@ -4,7 +4,8 @@ FILE OVERVIEW: src/tabs/settings/typesetting/mod.rs
 rendering and form iteration across the app.
 
 Main responsibilities:
-- Render the "Поворот Ctrl+колесо" chooser and persist `TextTab.rotation_ctrl_wheel_mode`.
+- Render the rotation-mode chooser of the Typing rotate axis (labelled with that axis' current
+  binding, `typing.layer.rotate`) and persist `TextTab.rotation_ctrl_wheel_mode`.
 - Re-export the font-settings block's name-display switch types
   (`FontNameDisplayMode` / `FontListKind` / `FontNameDisplayModes`) to the parent `settings`
   module, which owns their `user_config.json` load/save. One mode per switchable surface:
@@ -71,7 +72,8 @@ impl SettingsTabState {
     /// Currently exposes the app-wide hanging-punctuation editor: saving applies
     /// the value to the live `text_punctuation` set and persists it to
     /// `user_config.json` (`TextTab.hanging_punctuation`) on a background thread.
-    pub(super) fn draw_typesetting(&mut self, ui: &mut egui::Ui) {
+    /// `rotate_binding` is the display label of the Typing rotate axis (`typing.layer.rotate`).
+    pub(super) fn draw_typesetting(&mut self, ui: &mut egui::Ui, rotate_binding: &str) {
         // Deep-link reveal: force-open the font headers while the request is pending. The
         // request is consumed only once the groups block actually DRAWS (first visit loads
         // the font categories asynchronously, so the nested "Группы" header may not exist
@@ -88,7 +90,7 @@ impl SettingsTabState {
         let scroll_output = egui::ScrollArea::vertical()
             .id_salt("settings.typesetting.scroll")
             .auto_shrink([false, false])
-            .show(ui, |ui| self.draw_typesetting_body(ui, force_reveal));
+            .show(ui, |ui| self.draw_typesetting_body(ui, force_reveal, rotate_binding));
         let groups_rect = scroll_output.inner;
 
         if force_reveal {
@@ -134,12 +136,13 @@ impl SettingsTabState {
     /// Draws the "Тайп" pane body inside the scroll area. Returns the font-groups block
     /// rect (header+body union) when it was drawn, for the reveal highlight. When
     /// `force_reveal_groups` is set (the deep-link frame), the font-settings and nested
-    /// groups headers are force-opened and scrolled into view.
-    fn draw_typesetting_body(&mut self, ui: &mut egui::Ui, force_reveal_groups: bool) -> Option<egui::Rect> {
+    /// groups headers are force-opened and scrolled into view. `rotate_binding`: see
+    /// [`Self::draw_typesetting`].
+    fn draw_typesetting_body(&mut self, ui: &mut egui::Ui, force_reveal_groups: bool, rotate_binding: &str) -> Option<egui::Rect> {
         ui.heading(t!("settings.typesetting.heading"));
 
         ui.add_space(8.0);
-        self.draw_rotation_ctrl_wheel_setting(ui);
+        self.draw_rotation_ctrl_wheel_setting(ui, rotate_binding);
 
         ui.add_space(10.0);
         ui.separator();
@@ -244,14 +247,14 @@ impl SettingsTabState {
             .flatten()
     }
 
-    /// Renders the "Поворот Ctrl+колесо" chooser: which rotation mechanism the typing
-    /// tab's Ctrl+wheel gesture drives. Applies the choice to the runtime global
-    /// immediately (so the typing tab picks it up on the next wheel event) and persists
-    /// it to `user_config.json` (`TextTab.rotation_ctrl_wheel_mode`) on a background
-    /// thread.
-    fn draw_rotation_ctrl_wheel_setting(&self, ui: &mut egui::Ui) {
-        ui.label(t!("settings.typesetting.rotation_ctrl_wheel_label"));
-        ui.small(t!("settings.typesetting.rotation_ctrl_wheel_hint"));
+    /// Renders the rotation-mode chooser: which rotation mechanism the typing tab's rotate axis
+    /// (`typing.layer.rotate`, shown by its current binding `rotate_binding`) drives. Applies the
+    /// choice to the runtime global immediately (so the typing tab picks it up on the next wheel
+    /// event) and persists it to `user_config.json` (`TextTab.rotation_ctrl_wheel_mode`) on a
+    /// background thread.
+    fn draw_rotation_ctrl_wheel_setting(&self, ui: &mut egui::Ui, rotate_binding: &str) {
+        ui.label(tf!("settings.typesetting.rotation_gesture_label", binding = rotate_binding));
+        ui.small(tf!("settings.typesetting.rotation_gesture_hint", binding = rotate_binding));
 
         let mut mode = rotation_ctrl_wheel_mode();
         let previous = mode;

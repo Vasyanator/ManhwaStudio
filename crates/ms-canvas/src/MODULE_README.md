@@ -472,7 +472,7 @@ the registry to `draw` (`input_frame` holds the frame for the pass).
   root layer, below dock panels / popups / windows (they keep their clicks), and code that treats
   a non-background layer under the pointer as occlusion (Cleaning strokes, Typing deselect) still
   sees bare canvas.
-- **Menus** open through the one canvas menu path (`touch_nav::context_menu_popup`) from the menu
+- **Menus** open through the one canvas menu path (`ms_input::touch::context_menu_popup`) from the menu
   gestures or egui's long touch on a touch hole; a secondary click the menu binding does not own
   skips the popup for that frame (`CanvasView::bubble_menu_popup` / `page_menu_clicked`).
 - **Widget-owned, not bindings**: the primary press that selects a bubble at once (on-top body,
@@ -486,11 +486,11 @@ the registry to `draw` (`input_frame` holds the frame for the pass).
   drag then reaches the tab as that claim.
 
 ## Touch gestures
-The finger decision is owned by `ms_widgets::touch_nav` (shell raw-input hook); the canvas is a
+The finger decision is owned by `ms_input::touch` (shell raw-input hook); the canvas is a
 consumer and never reads `Event::Touch` or `multi_touch()` itself.
 - **Owner id**: `CanvasView::touch_owner_id()` = `Id::new(("ms_canvas.touch_surface",
   scroll_area_id_salt))` — content-named, distinct per tab canvas. Tabs pass it to
-  `touch_nav::publish_capture_layer` for their capture overlays.
+  `ms_input::touch::publish_capture_layer` for their capture overlays.
 - **Surface** (published last in `draw`): `scroll_inner_rect`, holes = on-top hit rects ∪ aside
   card hit rects (`scene.aside_card_hit_rects`, collected next to the card hit response) ∪ the
   scrollbar rects ∪ the bottom-hint rect ∪ the small bubble handles (`scene.handle_hit_rects`:
@@ -517,7 +517,7 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   `touch::context_menu_open_pos` picks the secondary-click position or, failing that, the
   long-press point inside the row, and both go through `canvas_context_menu_target_at` and the same
   gates (`zoom_drag_active`, `suppress_canvas_page_context_menu`). The
-  menu is drawn with `ms_widgets::touch_nav::context_menu_popup(response, long_press)` — never
+  menu is drawn with `ms_input::touch::context_menu_popup(response, long_press)` — never
   `response.context_menu`, which anchors at a hover position a finger does not have. The armed
   long-press draws a ring (`draw_touch_long_press_feedback`) while the finger is held.
 - **Long-press selection**: the canvas page row has no selection drag of its own; every one lives
@@ -694,7 +694,7 @@ consumer and never reads `Event::Touch` or `multi_touch()` itself.
   applied (zoom, history commands, capture area, view surface), `lib.rs::apply_input_frame` /
   `draw_capture_area` / `publish_view_surface`.
 - To change finger navigation, the touch surface and its holes, or the long-press feedback, edit
-  `touch.rs` (the gesture rules themselves are `ms_widgets::touch_nav`'s).
+  `touch.rs` (the gesture rules themselves are `ms_input::touch`'s).
 - To change what the «Лента» tab SHOWS, edit `scene.rs::draw_ribbon_tab_body`; to change how big it
   starts or how small it may get, edit the two `CANVAS_RIBBON_TAB_*_SIZE_PX` constants in `lib.rs`.
   Where the panel holding it sits by default is a per-program-tab decision, and all three tabs have

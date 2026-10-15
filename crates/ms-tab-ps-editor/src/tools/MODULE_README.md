@@ -319,7 +319,7 @@ below. `TransformTool` / `DeformTool` drop their control drag and per-frame cach
   Alt closes the path). Esc aborts without touching the selection; Backspace/Delete pops the last
   lasso vertex and aborts at zero. `Gesture::rubber_band` is recomputed every frame because
   `draw_overlay` receives no modifiers.
-- **Finger selection.** A finger long-press drag (`ms_widgets::touch_nav::TouchSelection`) reaches
+- **Finger selection.** A finger long-press drag (`ms_input::touch::TouchSelection`) reaches
   the tool as a typed `TouchSelectionInput` (image px) through `PsTool::touch_selection`, never as a
   synthesized mouse press. `SelectTool::touch_step` (pure) maps it onto `step`: `began` drops any
   live outline and starts a fresh one at `origin` with `base_op` (a finger carries no modifiers),

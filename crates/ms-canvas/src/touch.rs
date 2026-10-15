@@ -2,7 +2,7 @@
 File: crates/ms-canvas/src/touch.rs
 
 Purpose:
-The canvas side of finger gestures. `ms_widgets::touch_nav` (driven by the shell's raw-input
+The canvas side of finger gestures. `ms_input::touch` (driven by the shell's raw-input
 hook) decides which touches belong to this canvas and turns them into typed output; this file
 publishes the canvas surface to it and applies what comes back: pan / pinch through the same
 view anchor the wheel zoom uses, and the long-press point that opens the page context menu.
@@ -44,7 +44,7 @@ pans. See `MODULE_README.md` "Touch gestures".
 use super::{CANVAS_ZOOM_MAX, CANVAS_ZOOM_MIN, CanvasView};
 use eframe::egui;
 use egui::{Id, Pos2, Rect, Stroke};
-use ms_widgets::touch_nav::{self, TouchNavigation, TouchSelection, TouchSurface};
+use ms_input::touch::{self, TouchNavigation, TouchSelection, TouchSurface};
 
 /// Radius (screen points) of the armed long-press feedback ring: about a fingertip, so the
 /// marker stays visible around the finger that covers its center.
@@ -128,7 +128,7 @@ impl CanvasView {
     }
 
     /// Stable id under which this canvas publishes its touch surface and takes its touch
-    /// output (`ms_widgets::touch_nav`). Tabs pass it to `touch_nav::publish_capture_layer` for
+    /// output (`ms_input::touch`). Tabs pass it to `touch::publish_capture_layer` for
     /// their capture overlays, so a finger pans under them too.
     #[must_use]
     pub fn touch_owner_id(&self) -> Id {
@@ -139,7 +139,7 @@ impl CanvasView {
     /// long-press repaint), applies its navigation and keeps the long-press points for the
     /// scene pass. Called from `apply_input_frame` after the zoom paths.
     pub(super) fn take_touch_output_for_frame(&mut self, ctx: &egui::Context, canvas_rect: Rect) {
-        let output = touch_nav::take_touch_output(ctx, self.touch_owner_id());
+        let output = touch::take_touch_output(ctx, self.touch_owner_id());
         self.scene.touch_long_press_at = output.long_press_at;
         self.scene.touch_long_press_armed_at = output.long_press_armed_at;
         self.scene.touch_region_drag = output.region_drag;
@@ -197,7 +197,7 @@ impl CanvasView {
     /// on non-background layers, which the router never claims on.
     pub(super) fn publish_touch_surface(&mut self, ctx: &egui::Context) {
         if let Some(surface) = self.take_touch_surface() {
-            touch_nav::publish_surface(ctx, surface);
+            touch::publish_surface(ctx, surface);
         }
     }
 

@@ -32,7 +32,8 @@ ms-project = { path = "../ms-project" }
 # Every reusable widget the panel puts on screen, plus `input_util` and `ui_fonts`.
 ms-widgets = { path = "../ms-widgets" }
 # The unified input system: the tab hands this frame's `InputFrame` and the registry to its canvas
-# and applies the shared brush actions (`ms_tools::mask_brush`) to its mask brush. Below
+# and applies the shared brush actions (`ms_tools::mask_brush`) to its mask brush;
+# `ms_input::touch` for the layer long-press selection and menu popup. Below
 # `ms-widgets`, so it adds no layering constraint.
 ms-input = { path = "../ms-input" }
 # The studio root's order-free per-tab hook trait (`StudioTab`), implemented in

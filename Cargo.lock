@@ -4260,7 +4260,6 @@ dependencies = [
  "ms-fonts",
  "ms-gifs",
  "ms-i18n",
- "ms-input",
  "ms-log",
  "ms-sysprobe",
  "ms-text-util",

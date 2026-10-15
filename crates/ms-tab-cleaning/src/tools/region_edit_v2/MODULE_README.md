@@ -164,7 +164,7 @@ that owns the context, the canvas and the project at once:
   sits on `Order::Middle`, below the dock panels on `Order::Foreground`.
 - **Fingers: the body pans, the chrome stays operable.** After the pass the frame registers its
   area as a touch capture layer of the canvas and publishes `geometry::chrome_touch_holes(hitbox,
-  body)` (strip, handles, rows and their margins) with `touch_nav::publish_hole`: a finger on the
+  body)` (strip, handles, rows and their margins) with `ms_input::touch::publish_hole`: a finger on the
   body pans the canvas — the body's primary drag paints the mask, which a finger must never do —
   and a finger on the chrome reaches its widgets through egui. The frame has no selection drag,
   so the host declares no touch alternative and a long-press drag pans.

@@ -6,7 +6,9 @@ The "Тайп" settings pane: text-typesetting options plus the app's font-admin
 is a UI-only module — the font MODEL lives in `crate::tabs::typing`.
 
 ## Architecture
-`mod.rs` is the pane orchestrator: it renders the Ctrl+wheel rotation chooser, the shared
+`mod.rs` is the pane orchestrator: it renders the rotation-mode chooser of the Typing rotate
+axis (labelled with that axis' current binding, `ms_tab_typing::LAYER_ROTATE_ACTION`, read from
+the studio's input registry by the parent `draw`), the shared
 typesetting-language selector, the hanging-punctuation editor, and two collapsed blocks — the
 effect-defaults editor (`crate::tabs::typing::EffectDefaultsEditorState`, a typing-panel widget)
 and the font-settings block (`FontSettingsEditorState`, owned here). The methods hang off

@@ -3,7 +3,7 @@ File: touch_gestures.rs
 
 Purpose:
 The touchscreen-gestures setting (`General.touch_gestures`): whether a finger on a canvas
-pans, pinch-zooms and long-presses (the `ms_widgets::touch_nav` router) or is left to egui
+pans, pinch-zooms and long-presses (the `ms_input::touch` router) or is left to egui
 as ordinary pointer input. One boolean for every platform; this file owns its frozen config
 spelling, the pure per-platform default, the pure reader, the process-global live value and
 the pure combination with the platform capability.

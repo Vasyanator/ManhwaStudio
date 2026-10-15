@@ -19,7 +19,7 @@ Key structures:
   capability today is "write this pixel rect into the active editable layer as ONE undo step".
 - `PsToolOverlayCx`: the page/view geometry an on-canvas `draw_overlay_ui` pass is handed.
 - `TouchSelectionInput`: one frame of a finger long-press selection drag in image pixels (the
-  typed tool-side form of `ms_widgets::touch_nav::TouchSelection`).
+  typed tool-side form of `ms_input::touch::TouchSelection`).
 - `PsTool`: trait every tool implements (interaction, overlay drawing, options UI, shortcut list,
   and the defaulted region-tool hooks below).
 
@@ -61,7 +61,7 @@ use super::selection::Selection;
 use super::viewport::ViewTransform;
 use eframe::egui;
 use egui::{ColorImage, Pos2, Rect};
-use ms_widgets::touch_nav::{TouchSelection, TouchSelectionEnd};
+use ms_input::touch::{TouchSelection, TouchSelectionEnd};
 
 /// Stable identifier for each tool, used by the toolbar and hotkeys.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -269,7 +269,7 @@ pub struct PsToolOverlayCx {
 
 /// One frame of a finger long-press selection drag, mapped into image pixels.
 ///
-/// The typed tool-side form of `ms_widgets::touch_nav::TouchSelection`: it is NOT a synthesized
+/// The typed tool-side form of `ms_input::touch::TouchSelection`: it is NOT a synthesized
 /// mouse press, and a tool reads it only through [`PsTool::touch_selection`]. The router reports
 /// it on every frame while the drag lasts.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -602,7 +602,7 @@ pub trait PsTool: Send {
     // ------------------------------------------------------------------------------------------
     // FINGER SELECTION HOOKS
     //
-    // A finger never reaches `interact` (`ms_widgets::touch_nav` strips its mouse emulation); a
+    // A finger never reaches `interact` (`ms_input::touch` strips its mouse emulation); a
     // finger long-press followed by a drag is delivered as a typed `TouchSelectionInput` instead.
     // Defaulted to "not a selection tool", in which case the router turns that drag into a pan.
     // ------------------------------------------------------------------------------------------

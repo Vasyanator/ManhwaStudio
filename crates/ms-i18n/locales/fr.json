@@ -3327,8 +3327,6 @@
   "settings.typesetting.hanging_punctuation_save_button": "Enregistrer",
   "settings.typesetting.heading": "Lettrage",
   "settings.typesetting.language_label": "Langue",
-  "settings.typesetting.rotation_ctrl_wheel_hint": "Comment le geste Ctrl+molette dans l'onglet « Texte » fait pivoter le calque de superposition sélectionné.",
-  "settings.typesetting.rotation_ctrl_wheel_label": "Rotation Ctrl+molette :",
   "settings.typesetting.rotation_mode_raster": "Matriciel",
   "settings.typesetting.rotation_mode_raster_hint": "Plus rapide, mais produit une image moins nette.",
   "settings.typesetting.rotation_mode_vector": "Vectoriel",

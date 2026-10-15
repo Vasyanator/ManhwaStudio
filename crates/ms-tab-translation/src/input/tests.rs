@@ -170,7 +170,7 @@ fn hint_rows_are_built_from_the_registry() {
             "T",
             "1-6+T",
             "Shift+LMB drag / Long press and drag",
-            "1-6+Shift+LMB drag / Long press and drag",
+            "1-6+Shift+LMB drag / 1-6+Long press and drag",
             "Alt+LMB drag / Alt+Long press and drag",
             "Q",
             "Shift+Q+LMB drag / Shift+Q+Long press and drag",

@@ -12,7 +12,7 @@ Key structures:
 
 Key functions:
 - `PsViewport::handle_input`: mouse wheel zoom and middle/Space drag pan.
-- `PsViewport::apply_touch_navigation`: finger pan / pinch from `ms_widgets::touch_nav`.
+- `PsViewport::apply_touch_navigation`: finger pan / pinch from `ms_input::touch`.
 
 Notes:
 World coordinates are image pixel coordinates: the top-left of the page is `(0, 0)` and the
@@ -22,7 +22,7 @@ allocated viewport rect.
 
 use eframe::egui;
 use egui::{Pos2, Rect, Vec2};
-use ms_widgets::touch_nav::TouchNavigation;
+use ms_input::touch::TouchNavigation;
 
 /// Minimum and maximum zoom factors (screen pixels per image pixel).
 const MIN_ZOOM: f32 = 0.02;
@@ -203,7 +203,7 @@ impl PsViewport {
         }
     }
 
-    /// Applies one frame of finger navigation (`ms_widgets::touch_nav::TouchNavigation`).
+    /// Applies one frame of finger navigation (`ms_input::touch::TouchNavigation`).
     ///
     /// Zooms by `nav.zoom_factor` about `nav.prev_centroid` (clamped to the viewport's zoom
     /// limits), then moves the camera so the world point that was under `prev_centroid` lands

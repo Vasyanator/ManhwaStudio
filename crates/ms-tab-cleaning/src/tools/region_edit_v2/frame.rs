@@ -66,7 +66,7 @@ use crate::input;
 use ms_canvas::{CanvasView, OverlayRectPx};
 use ms_input::{HitPhase, InputFrame, view};
 use ms_tools::MaskBrush;
-use ms_widgets::touch_nav;
+use ms_input::touch;
 use egui::{Color32, Id, Pos2, Rect, Sense, Vec2, pos2, vec2};
 
 /// Id source of the frame's `egui::Area` and the stem of every widget id inside it.
@@ -1180,12 +1180,12 @@ impl RegionFrame {
     /// the buttons). Uses the rectangle the pass settled on, like the painting does.
     fn publish_touch_layout(&self, ctx: &egui::Context, canvas: &CanvasView, page: PagePlacement) {
         let owner = canvas.touch_owner_id();
-        touch_nav::publish_capture_layer(ctx, owner, egui::LayerId::new(egui::Order::Middle, Id::new(FRAME_AREA_ID)));
+        touch::publish_capture_layer(ctx, owner, egui::LayerId::new(egui::Order::Middle, Id::new(FRAME_AREA_ID)));
         let (Some(hitbox), Some(rect_px)) = (self.hitbox, self.rect_px) else {
             return;
         };
         for hole in chrome_touch_holes(hitbox, page.screen_rect(rect_px)) {
-            touch_nav::publish_hole(ctx, owner, hole);
+            touch::publish_hole(ctx, owner, hole);
         }
     }
 

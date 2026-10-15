@@ -69,7 +69,7 @@ pub enum PlatformFeature {
     AppStorageVolumes,
     /// The Android "All files access" permission for a shared projects folder.
     AllFilesAccess,
-    /// Finger navigation on canvases (`ms_widgets::touch_nav`: pan, pinch-zoom, long-press
+    /// Finger navigation on canvases (`ms_input::touch`: pan, pinch-zoom, long-press
     /// menu), driven by the main window's `raw_input_hook`. Off on Windows until winit tells a
     /// pen from a finger there ([`UnavailableReason::PenTouchIndistinguishable`]); off on wasm,
     /// whose web entry has no input hook.

@@ -98,3 +98,6 @@ pub use tab::TypingSaveFlushReason;
 pub use tab::TypingTextFlushError;
 // Re-export the shared text-preview helper so other tabs (PS editor) reuse the same logic.
 pub use tab::text_preview_label;
+// The layer-rotation axis (`typing.layer.rotate`): Settings › Typesetting labels its rotation-mode
+// chooser with this action's current binding (`InputRegistry::label`), never a spelled key.
+pub use tab::input::LAYER_ROTATE as LAYER_ROTATE_ACTION;

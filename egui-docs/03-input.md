@@ -13,7 +13,7 @@ pub fn input_mut<R>(&self, writer: impl FnOnce(&mut InputState) -> R) -> R;
 ```
 The closure holds a lock — keep it tiny, copy the values out, and **never call another `ctx.input*`,
 `ui.*`, or repaint from inside it** (re-entrant deadlock). The repo's pattern is to destructure in one
-shot: `src/tabs/typing/tab.rs:721-728`.
+shot and copy the values out, e.g. `crates/ms-widgets/src/input_util.rs:56`.
 
 `InputState` (`egui-0.36.2/src/input_state/mod.rs:213`) — public fields:
 
@@ -47,17 +47,19 @@ Why it matters: under the zoom modifier (Ctrl/Cmd) egui diverts the wheel into `
 **Project replacement — call this, do not reinvent it:**
 
 ```rust
-// src/input_util.rs:31
+// crates/ms-widgets/src/input_util.rs:31
 pub fn raw_wheel_delta(input: &egui::InputState) -> egui::Vec2
 ```
-It sums the frame's `Event::MouseWheel { delta, .. }` values (`src/input_util.rs:32-39`). Sign matches
-`smooth_scroll_delta` (positive Y = content moved down). The magnitude is **unit-dependent** —
-`MouseWheelUnit::{Point, Line, Page}` (`egui-0.36.2/src/data/input/mouse_wheel_unit.rs`) — so only use
-it for sign/threshold decisions, never as a pixel distance. Unit tests: `src/input_util.rs:66-98`.
+It sums the frame's `Event::MouseWheel { delta, .. }` values (`crates/ms-widgets/src/input_util.rs:32-39`).
+Sign matches `smooth_scroll_delta` (positive Y = content moved down). The magnitude is
+**unit-dependent** — `MouseWheelUnit::{Point, Line, Page}`
+(`egui-0.36.2/src/data/input/mouse_wheel_unit.rs`) — so only use it for sign/threshold decisions,
+never as a pixel distance. Unit tests: `crates/ms-widgets/src/input_util.rs:63-95`.
 
-Callers: `src/canvas/mod.rs:1507`, `src/tabs/typing/tab.rs:725` and `:788`,
-`src/tabs/typing/tab/selection_rasters.rs:338`, `:616`, `src/tabs/cleaning/tools/base.rs:1234`,
-`src/tabs/translation/adv_rec.rs:962`.
+Callers: the page manager's boards and viewer (`crates/ms-tab-page-manager/src/{crop,split,stitch,viewer}.rs`).
+The input-migrated code (canvas, Translation / Cleaning / Typing, tools) never reads the wheel itself:
+a wheel binding is an `ms-input` axis (`view.zoom`, brush size, rotation), whose router reads the raw
+`Event::MouseWheel` the same way and reports notches (see "Project layer: `ms-input`" below).
 
 Caveat (pre-existing duplication, not a pattern to copy): the wheel widgets each carry a private clone
 of the same helper, `raw_wheel_events_delta` — `crates/ms-widgets/src/wheel_slider.rs:438`,
@@ -71,20 +73,21 @@ of the same helper, `raw_wheel_events_delta` — `crates/ms-widgets/src/wheel_sl
 (`egui-0.36.2/src/context.rs:2943`) is **not** a drop-in: with a space-filling `CentralPanel` the root
 ui's available rect is empty, so it reports `true` for every point over the central content. That
 permanently suppressed deselect-on-empty-click in the typing tab (see the doc comment at
-`src/input_util.rs:42-53`).
+`crates/ms-widgets/src/input_util.rs:42-53`).
 
 **Project replacement:**
 
 ```rust
-// src/input_util.rs:55
+// crates/ms-widgets/src/input_util.rs:55
 pub fn pointer_over_floating_area(ctx: &egui::Context) -> bool
 // = ctx.layer_id_at(interact_pos).is_some_and(|l| l.order != egui::Order::Background)
 ```
 Built on `Context::layer_id_at` (`egui-0.36.2/src/context.rs:3104`) and `Order`
 (`egui-0.36.2/src/layers.rs:10`: `Background, Middle, Foreground, Tooltip, Debug`). It answers
 "is a `Window`/menu/popup/tooltip drawn above this point", which is the question canvas code actually
-has. Callers: `src/tabs/typing/tab.rs:684`, `src/tabs/typing/tab/draw_page.rs:1139`,
-`src/tabs/typing/tab/selection_rasters.rs:1224`.
+has. No product caller remains: the input-migrated canvases ask the same question through
+`ms_input::Condition::PointerOnView` (the router's `Context::layer_id_at` test against the published
+view surface).
 
 Which to use: `pointer_over_floating_area` for "did this canvas click land on bare canvas";
 `egui_wants_keyboard_input()` (`context.rs:2986`) for "is a text field eating my key presses".
@@ -166,29 +169,61 @@ key_pressed(Key) / key_down(Key) / key_released(Key)     // :746 / :769 / :774
 ```
 `consume_*` need `ctx.input_mut(..)`; the non-consuming reads take `ctx.input(..)`.
 
-### Project layer: `InputManagerV2` — add hotkeys HERE, not ad hoc
+### Project layer: `ms-input` — every binding goes HERE, not ad hoc
 
-`src/input_manager_v2.rs`:
-- `HotkeySpecV2` (:40) — registration record: `id`, `title`, `section`, `default_shortcut:
-  Option<egui::KeyboardShortcut>`, `default_modifier_only: Option<ModifierOnlyV2>`, `scope:
-  HotkeyScopeV2` (`Global` | `Tab(AppTab)`, :34), `active_when_input: bool`.
-- `ModifierOnlyV2` (:58) — `Ctrl | Alt | Shift`: binds that are *just* a held modifier, which
-  `KeyboardShortcut` cannot express. `matches()` (:73) treats `ctrl || command` as Ctrl.
-  Query them per-frame with `modifier_only_active(ctx, id)` (:257) — they are level-triggered, and
-  `collect_triggered` deliberately skips them (:286-288).
-- `InputManagerV2::register` (:122), `set_shortcut` (:168), `set_modifier_only` (:198),
-  `clear_binding` (:184), `reset_to_default` (:214), `shortcut_text` (:243); overrides persist via
-  `load_overrides` (:150) / `save_hotkey_override` (:311).
-- `collect_triggered(ctx, active_tab) -> Vec<String>` (:270) — the dispatcher. It skips disabled and
-  out-of-scope commands, skips everything when `ctx.egui_wants_keyboard_input()` unless
-  `active_when_input`, then `ctx.input_mut(|i| i.consume_shortcut(&shortcut))` and fires **only on the
-  rising edge** (`last_shortcut_held`, :293-304) so a held key does not repeat.
+The studio's keys, modifiers, wheel axes and pointer gestures are actions of the `ms-input` crate
+(`crates/ms-input/MODULE_README.md`); the Translation, Cleaning and Typing tabs, the canvas and the
+tools read no key, modifier or wheel themselves. Do not sprinkle `input.key_pressed(..)` /
+`consume_key(..)` — that bypasses rebinding, alternatives, contexts, conflicts, text-field
+suppression and the displayed labels.
 
-Dispatch: `StudioApp::dispatch_hotkeys` (`src/studio.rs:773`) calls `collect_triggered` and routes each id
-through `StudioApp::execute_hotkey_command` (`src/studio.rs:782`).
+- **Declare** (pure model, no `Context`): an `ActionSpec` of one `ActionKind`
+  (`crates/ms-input/src/action.rs:40`: `Command` edge, `Mode` held, `Axis` continuous, `Gesture`
+  on a declared `TargetSpec`, :187) with an `ActionMeta` (:106: id = persistence key, title key,
+  section, `Scope` :58, `when` conditions, default `Binding`s), collected in `Declarations`
+  (:254). Owners: the shared viewer set `ms_input::view::declarations`
+  (`crates/ms-input/src/view.rs:66`), the brush set in `ms-tools`, each tab's
+  `StudioTab::input_declarations` (`crates/ms-studio-tab/src/lib.rs:38`) and the session's own;
+  merged by `build_input_registry` (`src/studio.rs:1129`) into one `InputRegistry`
+  (`crates/ms-input/src/registry.rs:147`, `new` :171) with the user's overrides applied
+  (`apply_overrides` :360; codec `crates/ms-input/src/persist.rs`, `load_overrides` :339,
+  `user_config` -> `Hotkeys` format `HOTKEYS_FORMAT` :47).
+- **Contexts**: `Condition` (`crates/ms-input/src/context.rs:38`: `NoPopup`, `PointerOnView`,
+  `ViewFocus`, `Context(ContextId)`, `NotContext(..)`). A tab publishes its current contexts
+  (tool, edit mode, open window) through `StudioTab::input_contexts`
+  (`crates/ms-studio-tab/src/lib.rs:46`), passed in `FrameEnv` (`crates/ms-input/src/frame.rs:45`).
+- **Frame order**: `InputRouter::begin_frame(ctx, &FrameEnv)` (`crates/ms-input/src/router.rs:203`)
+  runs ONCE per frame before any tab draws (`src/studio.rs:923`); it turns `Event::Key` (physical
+  key), modifiers, pointer buttons, `MouseWheel` and `Zoom` into matcher events
+  (`MatchState::step`, `crates/ms-input/src/matching.rs:139`), consumes only matched keys and owned
+  wheel input, and returns the `InputFrame` (`crates/ms-input/src/frame.rs:217`) every consumer
+  reads: `fired` (:269), `mode_active` (:281), `axis` / `axis_samples` (:289/:294),
+  `command_held` (:313), `claimed` (:319), `canvas_wide_armed` (:327), `gesture_for` (:360).
+  Key chords never match while a `TextEdit` has focus; commands never fire while a popup is open.
+- **Viewers** publish a `ViewSurface` (`crates/ms-input/src/frame.rs:66`) with
+  `publish_view_surface` (:100) while drawing; the next `begin_frame` uses it for `PointerOnView`,
+  command focus and canvas-wide gesture claims (claimed at the press, through the viewer's capture
+  `Area`). Targeted gestures keep egui's hit test and ask `InputFrame::gesture_for(response, ..)`.
+  The canvas consumes its frame in `CanvasView::apply_input_frame`
+  (`crates/ms-canvas/src/lib.rs:1982`).
+- **Labels**: hint and menu text names a binding only through `InputRegistry::label`
+  (`crates/ms-input/src/label.rs:158`, alternatives joined by " / "), `label_with_prefix` (:171) or
+  `param_group_label` (:226); words come from `input.*` keys. `crates/ms-i18n/tests/binding_text.rs`
+  fails on a binding spelled in the migrated locale namespaces.
+- **Conflicts** on one scope level and cross-level shadows: `InputRegistry::conflicts` /
+  `conflicts_for` / `shadows_for` (`crates/ms-input/src/registry.rs:547/:553/:559`), shown by
+  Settings › Hotkeys (`src/tabs/settings/hotkeys/`).
+- **Capture** (settings pane): `capture_begin` / `capture_set_mouse_zone` / `capture_finish` /
+  `capture_cancel` (`crates/ms-input/src/router.rs:313/:320/:338/:347`); the pane applies the
+  result with `InputRegistry::set_bindings` (`crates/ms-input/src/registry.rs:436`) through
+  `InputRouter::registry_mut` (`router.rs:191`) and persists it on a worker (`write_override`,
+  `persist.rs:569`).
+- **Touch**: finger gestures are `ms_input::touch` (section "Touch on canvases" below); a
+  long-press drag reaches the input router as the `Touch(LongPressDrag)` alternative of a
+  canvas-wide gesture (`InputFrame::touch_selection_available`, `frame.rs:334`).
 
-**Rule: a new hotkey = a new `HotkeySpecV2` + an arm in `execute_hotkey_command`.** Do not sprinkle
-`input.key_pressed(..)` — that bypasses rebinding, scoping, text-field suppression and edge-triggering.
+**Rule: a new shortcut or tool gesture = a declared action + a read of the `InputFrame` in its
+owner.** The PS editor, page manager and launcher are not migrated yet and still read raw keys.
 
 ## Event enum
 
@@ -225,8 +260,8 @@ a frame with `ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::User
 
 ## Touch on canvases
 
-Facts the canvas finger gestures rely on (owner: `ms_widgets::touch_nav`,
-`crates/ms-widgets/src/touch_nav/`):
+Facts the canvas finger gestures rely on (owner: `ms_input::touch`,
+`crates/ms-input/src/touch/`):
 
 - **egui-winit emulates the mouse from ONE touch.** `on_touch` pushes `Event::Touch` first and
   then, only for the touch that owns the emulated pointer (`pointer_touch_id`, the first touch of
@@ -244,45 +279,47 @@ Facts the canvas finger gestures rely on (owner: `ms_widgets::touch_nav`,
   panel; a long touch needs the emulated pointer pressed (`is_long_touch`, :917) and becomes
   `Response::secondary_clicked()` (`egui-0.36.2/src/response.rs:211`).
 - **`Context::layer_id_at` over bare canvas returns the background layer**
-  (`Some(LayerId::background())`, pinned by the `touch_nav` test
+  (`Some(LayerId::background())`, pinned by the `ms_input::touch` test
   `layer_id_at_over_bare_canvas_is_the_background_layer`), a Foreground area as itself, and the
   top modal layer while a modal is open (`egui-0.36.2/src/memory/mod.rs:838-845`). It walks only
   layers that have AREA state (`Areas::layer_id_at`, `egui-0.36.2/src/memory/mod.rs:1245-1267`): a
   bare `ctx.layer_painter(LayerId::new(Order::Middle, …))` is never reported, so it neither blocks
   a claim nor needs a capture registration (pinned by `bare_layer_painter_does_not_block_a_claim`).
   An `Area` over a canvas (a tool's capture overlay) does block it until the tool registers it
-  with `touch_nav::publish_capture_layer`; widgets inside such an area that a finger must still
-  operate are exempted with `touch_nav::publish_hole`.
+  with `ms_input::touch::publish_capture_layer`; widgets inside such an area that a finger must still
+  operate are exempted with `ms_input::touch::publish_hole`.
 - **egui's hit test grows every widget by `interact_radius`** read from the GLOBAL style
   (`egui-0.36.2/src/context.rs:486`), so a touch hole meant to cover a small handle is the
   handle's hit rect expanded by that radius (`ms-canvas` `note_touch_handle_hole`).
 - **`Popup::context_menu` anchors at the hover position of the opening frame**
   (`egui-0.36.2/src/containers/popup.rs:248-260`, stored by the `pub(crate)`
   `Memory::open_popup_at`, :522-523). A claimed finger has no hover position, so canvas menus use
-  `ms_widgets::touch_nav::context_menu_popup(response, long_press_at)`, which records the anchor
-  itself and is identical for the mouse (characterization test in `touch_nav/tests.rs`).
+  `ms_input::touch::context_menu_popup(response, long_press_at)`, which records the anchor
+  itself and is identical for the mouse (characterization test in `crates/ms-input/src/touch/tests.rs`).
 - **A repaint requested before the pass is lost**: `begin_pass_repaint_logic` resets the delay
   (`egui-0.36.2/src/context.rs:99-115`), so a timer decided in the hook is requested from inside
-  the pass (`touch_nav::take_touch_output`).
+  the pass (`ms_input::touch::take_touch_output`).
 - **`ScrollArea`'s kinetic fling cannot be driven from outside**: its velocity is the private
   `State::vel` (getter only, `egui-0.36.2/src/containers/scroll_area.rs:44,84`), set from
   `pointer.velocity()` on `drag_stopped` and decayed with friction 1000 pt/s², stop speed
   20 pt/s and `dt.at_most(0.1)` (:829, :859-877). A claimed finger never drags it, so
-  `touch_nav` reruns the same law itself over an `egui::util::History<Pos2>` with egui's pointer
+  `ms_input::touch` reruns the same law itself over an `egui::util::History<Pos2>` with egui's pointer
   window (`History::new(2..1000, 0.1)`, velocity only with ≥3 samples over >0.01 s,
   `input_state/mod.rs:1079,1234`).
 
 ## Editing map
 
-- Finger pan / pinch / fling / tap / long-press on a canvas → `ms_widgets::touch_nav` (publish a
+- Finger pan / pinch / fling / tap / long-press on a canvas → `ms_input::touch` (publish a
   `TouchSurface`, take `TouchOutput`, open menus with `context_menu_popup`); never read
-  `multi_touch()` or touch events directly. A tab mode with a selection drag → set
-  `CanvasView::set_long_press_selection` every frame and map `CanvasView::touch_selection`
-  (`ms_canvas::drive_touch_drag` for a rectangle drag); never synthesize a mouse press.
-- Wheel/zoom on any canvas → `ms_widgets::input_util::raw_wheel_delta` (`crates/ms-widgets/src/input_util.rs:31`).
+  `multi_touch()` or touch events directly. A tab mode with a selection drag on a migrated canvas
+  → give its canvas-wide gesture a `Touch(LongPressDrag)` alternative (the router claims it);
+  never synthesize a mouse press.
+- Wheel/zoom on a migrated canvas → an `ms-input` axis (`view.zoom` is shared); elsewhere (page
+  manager) `ms_widgets::input_util::raw_wheel_delta` (`crates/ms-widgets/src/input_util.rs:31`).
 - "Did the click hit bare canvas?" → `ms_widgets::input_util::pointer_over_floating_area` (`crates/ms-widgets/src/input_util.rs:55`).
-- New hotkey → register a `HotkeySpecV2` (`src/input_manager_v2.rs`) + handle it in
-  `StudioApp::execute_hotkey_command` (`src/studio.rs:782`).
+- New hotkey, held modifier, wheel axis or tool gesture → declare it in its owner's `ms-input`
+  declarations and read the `InputFrame` (`crates/ms-input/MODULE_README.md`, "Editing map");
+  display it with `InputRegistry::label`.
 - Widget-local interaction → allocate with the right `Sense` and read the `Response`; do not read
   `ctx.input().pointer` for widget hit-testing.
 - Screenshot/eyedropper flow → `crates/ms-widgets/src/viewport_color_selector.rs`.

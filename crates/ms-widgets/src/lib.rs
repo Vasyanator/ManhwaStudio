@@ -86,11 +86,6 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
   - `ui_scale` (`seed_ui_scale_from_user_settings`, `ui_scale_percent`, `apply_ui_scale`,
     `apply_ui_scale_to_context`): the process-global interface scale, applied once per egui
     context by every product window and changed live by the settings slider.
-  - `touch_nav` (`TouchRouter`, `TouchSurface`, `TouchOutput`, `TouchNavigation`,
-    `TouchSelection`, `context_menu_popup`, `publish_surface`, `take_touch_output`): a
-    temporary re-export of `ms_input::touch`, the one owner of finger input on canvases (see
-    `crates/ms-input/src/touch/MODULE_README.md`). Removed once every importer names
-    `ms_input::touch` directly.
 */
 #![warn(clippy::all)]
 
@@ -117,11 +112,6 @@ pub mod ui_fonts;
 // egui context. Next to `ui_fonts` for the same reason: every product window (main window,
 // startup prompts, installer / update windows) applies it once per context.
 pub mod ui_scale;
-// Canvas touch gestures moved to the unified input crate (`ms_input::touch`). TEMPORARY shim:
-// keeps every `ms_widgets::touch_nav::…` path (shell hook, ms-canvas, tab crates, PS editor)
-// compiling until the input-unification cleanup re-points them to `ms_input::touch` and deletes
-// this line together with the re-exports below. Add no new user.
-pub use ms_input::touch as touch_nav;
 
 mod ai_button;
 mod autocomplete_line;
@@ -204,10 +194,6 @@ pub use text_edit_plus::{TextEditPlus, TextEditPlusBackground, TextEditPlusTextC
 pub use viewport_color_selector::ViewportColorSelector;
 #[allow(unused_imports)]
 pub use wheel_combo_box::WheelComboBox;
-pub use touch_nav::{
-    TouchNavigation, TouchOutput, TouchRouter, TouchSelection, TouchSelectionEnd, TouchSurface,
-    context_menu_popup,
-};
 pub use wheel_input_guard::combo_popup_open;
 #[allow(unused_imports)]
 pub use wheel_slider::WheelSlider;

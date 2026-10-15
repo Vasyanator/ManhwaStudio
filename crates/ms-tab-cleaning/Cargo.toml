@@ -78,8 +78,8 @@ ms-widgets = { path = "../ms-widgets" }
 # `studio_tab.rs`. It sits below this crate (its own layer line under the tab crates).
 ms-studio-tab = { path = "../ms-studio-tab" }
 # The unified input model: the tab's declarations and contexts (`input.rs`), the per-frame
-# `InputFrame` its draw, stroke driver (`canvas_input.rs`) and tools read. Sits below every tab
-# crate.
+# `InputFrame` its draw, stroke driver (`canvas_input.rs`) and tools read; `ms_input::touch`
+# for the region-edit frame's capture layer and holes. Sits below every tab crate.
 ms-input = { path = "../ms-input" }
 # Semantic studio colours (status text, canvas chrome, scrim, checkerboard) — never
 # hand-typed here. A leaf over egui, so it adds no layering constraint.

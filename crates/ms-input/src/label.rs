@@ -7,7 +7,8 @@ instead of spelling a binding in a locale string.
 
 Key functions:
 - `InputRegistry::label`: every alternative of an action joined by " / ".
-- `InputRegistry::alternative_label`, `chord_label`, `param_group_label`.
+- `InputRegistry::alternative_label`, `chord_label`, `param_group_label`, `label_with_prefix`
+  (an action's label with a parameter group put before every alternative).
 - `InputRegistry::conflict_text`, `shadow_text`: the settings pane's conflict lines.
 - `button_label`: one button.
 
@@ -21,6 +22,8 @@ Format (pinned by tests):
   the localized gesture template around the button name ("Shift+LMB drag"); a touch source is
   its own gesture, so it prints without the template.
 - alternatives are joined by " / "; no alternative prints `app.hotkey.no_binding`.
+- `label_with_prefix` puts the prefix before every alternative as one more chord part
+  ("1-6+T / 1-6+Long press and drag"); a prefix with several alternatives is parenthesized.
 - a parameter group prints "first-last" when every member is one single-glyph key and the
   glyphs are consecutive ("1-6"), else the member labels joined by " / ".
 - the command modifier prints "Ctrl" on Linux / Windows and "⌘" on macOS.
@@ -158,6 +161,20 @@ impl InputRegistry {
             return t!("app.hotkey.no_binding").to_owned();
         }
         bindings.iter().map(|binding| self.alternative_label(binding)).collect::<Vec<_>>().join(ALTERNATIVE_SEPARATOR)
+    }
+
+    /// The display text of `id` with `prefix` (typically a [`Self::param_group_label`], e.g. "1-6")
+    /// put before EVERY alternative as one more chord part: "1-6+T / 1-6+Shift+LMB drag". A prefix
+    /// holding several alternatives is parenthesized like a mode reference ("(1 / X)+T"). The
+    /// "no binding" text when `id` has no alternative (also for an unknown id).
+    #[must_use]
+    pub fn label_with_prefix(&self, id: ActionId, prefix: &str) -> String {
+        let bindings = self.bindings(id);
+        if bindings.is_empty() {
+            return t!("app.hotkey.no_binding").to_owned();
+        }
+        let prefix = if prefix.contains(ALTERNATIVE_SEPARATOR) { format!("({prefix})") } else { prefix.to_owned() };
+        bindings.iter().map(|binding| format!("{prefix}{CHORD_SEPARATOR}{}", self.alternative_label(binding))).collect::<Vec<_>>().join(ALTERNATIVE_SEPARATOR)
     }
 
     /// The display text of one alternative.

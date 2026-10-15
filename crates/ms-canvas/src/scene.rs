@@ -69,7 +69,7 @@ use ms_models::page_view::{PageImageInfo, PageTexture, SourcePageLoadState};
 use ms_project::ProjectData;
 use ms_log::runtime_log;
 use ms_widgets::panel_dock::PanelDockState;
-use ms_widgets::touch_nav::{TouchSelection, context_menu_popup};
+use ms_input::touch::{TouchSelection, context_menu_popup};
 use ms_widgets::{HelpHint, WheelSlider};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Vec2};

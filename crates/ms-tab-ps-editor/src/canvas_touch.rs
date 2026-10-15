@@ -2,7 +2,7 @@
 File: crates/ms-tab-ps-editor/src/canvas_touch.rs
 
 Purpose:
-The PS editor canvas' side of `ms_widgets::touch_nav` (finger pan / pinch / long-press): publish
+The PS editor canvas' side of `ms_input::touch` (finger pan / pinch / long-press): publish
 the canvas as a touch surface every frame, take the router's output for it, and draw the
 long-press feedback marker. The camera math lives in `viewport.rs`
 (`PsViewport::apply_touch_navigation`), the finger selection in the tools
@@ -23,7 +23,7 @@ over it is claimed like bare canvas (see `MODULE_README.md` «Finger input»).
 
 use eframe::egui;
 use egui::{Context, Id, Painter, Pos2, Rect, Stroke};
-use ms_widgets::touch_nav::{self, TouchOutput, TouchSelection, TouchSelectionEnd, TouchSurface};
+use ms_input::touch::{self, TouchOutput, TouchSelection, TouchSelectionEnd, TouchSurface};
 
 /// Radius of the long-press feedback ring, in screen points.
 const LONG_PRESS_MARKER_RADIUS: f32 = 18.0;
@@ -41,11 +41,11 @@ fn owner_id() -> Id {
 /// with `false` the router turns a long-press drag into a pan.
 #[must_use]
 pub(crate) fn publish_and_take(ctx: &Context, rect: Rect, long_press_selection: bool) -> TouchOutput {
-    touch_nav::publish_surface(
+    touch::publish_surface(
         ctx,
         TouchSurface { owner: owner_id(), rect, holes: Vec::new(), long_press_selection, drag_regions: Vec::new() },
     );
-    touch_nav::take_touch_output(ctx, owner_id())
+    touch::take_touch_output(ctx, owner_id())
 }
 
 /// What the active tool is fed on one canvas frame (see [`tool_frame_route`]).

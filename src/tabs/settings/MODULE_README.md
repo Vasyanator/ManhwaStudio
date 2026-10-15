@@ -116,9 +116,10 @@ that path to Python with `--socket`. There is no free-port reservation and no HT
   font-administration UI. The pane hosts the app-wide
   hanging-punctuation list editor (`TextTab.hanging_punctuation`, applied live via
   `crate::text_punctuation` and persisted through `save_hanging_punctuation`, re-exported by `mod.rs` from `ms-config`)
-  the "Поворот Ctrl+колесо" chooser (`TextTab.rotation_ctrl_wheel_mode`, applied live
+  the rotation-mode chooser (`TextTab.rotation_ctrl_wheel_mode`, applied live
   via the `crate::tabs::typing::rotation_ctrl_wheel` global and persisted through
-  `save_rotation_ctrl_wheel_mode` in `mod.rs`; read by the typing tab's Ctrl+wheel handler),
+  `save_rotation_ctrl_wheel_mode` in `mod.rs`; read by the typing tab's rotate axis; its
+  label names that axis' current binding from the input registry, never a spelled key),
   the typesetting-language selector — the SHARED
   `crate::general_settings_panel::draw_text_language_setting(ui, id_salt)` function (two
   `WheelComboBox`es: `ScriptGroup` then the concrete `TextLanguage` within it; changing the group

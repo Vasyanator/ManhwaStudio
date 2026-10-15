@@ -39,7 +39,7 @@ raises its flag and dispatched as `ShellEvent::ExternalOpen`; a target the table
 about waits in `AppShell::pending_open` (`incoming.rs` moves the data). `on_exit` is the
 process-shutdown path only (eframe ended without the shell's consent, e.g. the Android Activity
 went away): it tears a running studio down inline. Finger input on canvases is routed here, in
-`raw_input_hook`, by ONE `ms_widgets::touch_nav::TouchRouter` per window, before egui builds its
+`raw_input_hook`, by ONE `ms_input::touch::TouchRouter` per window, before egui builds its
 pointer state; it is on while `PlatformFeature::CanvasTouchGestures` is available AND the
 `General.touch_gestures` setting is (`ms_config::touch_gestures`, re-read every frame). Native only,
 except `style` and `chapter_load` (the one owner of the resume-unsaved decision), which the web
@@ -83,7 +83,7 @@ mod native {
     use crate::window_geometry::{self, WindowGeometryTracker};
     use ms_platform::PlatformFeature;
     use ms_thread as thread;
-    use ms_widgets::touch_nav::TouchRouter;
+    use ms_input::touch::TouchRouter;
     use std::cell::Cell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -836,7 +836,7 @@ mod native {
             self.drain_studio_outputs(&ctx);
         }
 
-        /// Routes canvas finger input before egui sees it (`ms_widgets::touch_nav`): claimed
+        /// Routes canvas finger input before egui sees it (`ms_input::touch`): claimed
         /// touches lose their mouse emulation and become navigation / long-press outputs that the
         /// canvases take this frame. Child viewports pass through untouched (the router checks).
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {

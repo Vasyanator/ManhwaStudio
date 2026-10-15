@@ -83,7 +83,7 @@ one opened session and talks to the window only through its `StudioOutput` queue
 `lib.rs` mounts extracted crates under the `crate::…` names the root package's call sites use;
 `tabs/mod.rs` does the same for the tab crates (`tabs/MODULE_README.md`). Every crate documents
 itself in `crates/<crate>/src/MODULE_README.md` (or `crates/<crate>/MODULE_README.md`); a crate
-without a shim is named `ms_x::…` directly (`ms_tools`, `ms_onnx_runtime`, `ms_native_runtime`,
+without a shim is named `ms_x::…` directly (`ms_input`, `ms_tools`, `ms_onnx_runtime`, `ms_native_runtime`,
 the other `ms_sysprobe` modules such as `ai_models`, `gpu_utils`, `paste_image`).
 
 | `crate::` path | Crate (module) |
@@ -93,7 +93,7 @@ the other `ms_sysprobe` modules such as `ai_models`, `gpu_utils`, `paste_image`)
 | `canvas` | `ms-canvas` |
 | `project`, `project_scan` | `ms-project` |
 | `page_ops` | `ms-page-ops` |
-| `widgets`, `ui_fonts`, `bubble_status`, `input_manager_v2` | `ms-widgets` |
+| `widgets`, `ui_fonts`, `bubble_status` | `ms-widgets` |
 | `settings_shared`, `general_settings_panel`, `ai_backend_supervisor`, `storage_mode_job`, `tutorial` | `ms-settings-ui` |
 | `launcher` | `ms-launcher` |
 | `installer`, `venv_check` (native) | `ms-installer` |

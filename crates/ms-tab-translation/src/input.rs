@@ -420,6 +420,10 @@ pub struct TranslationInputLabels {
     pub create_bubble_menu: Option<String>,
     /// The recent-character ranks as a group ("1-6" by default).
     pub recent_chars: String,
+    /// `create_bubble` with the recent-character group before every alternative ("1-6+T").
+    pub create_bubble_recent: String,
+    /// `quick_rect` with the recent-character group before every alternative of both actions.
+    pub quick_rect_recent: String,
     /// The binding of each recent-character rank, rank 1 first (the recent-character cards).
     pub recent_char_keys: Vec<String>,
     pub create_hint_bubble: String,
@@ -451,10 +455,17 @@ impl TranslationInputLabels {
         // Quick OCR is two actions (mouse, finger); its hints name both, joined like alternatives.
         let quick: Vec<String> = [OCR_QUICK_RECT, OCR_QUICK_RECT_TOUCH].into_iter().filter_map(bound).collect();
         let quick_rect = if quick.is_empty() { registry.label(OCR_QUICK_RECT) } else { quick.join(ms_input::label::ALTERNATIVE_SEPARATOR) };
+        // Both quick-OCR actions accept a recent character, so every alternative of each gets the group.
+        let recent_chars = registry.param_group_label(&RECENT_CHARS);
+        let with_recent = |id: ActionId| (!registry.bindings(id).is_empty()).then(|| registry.label_with_prefix(id, &recent_chars));
+        let quick_recent: Vec<String> = [OCR_QUICK_RECT, OCR_QUICK_RECT_TOUCH].into_iter().filter_map(with_recent).collect();
+        let quick_rect_recent = if quick_recent.is_empty() { registry.label(OCR_QUICK_RECT) } else { quick_recent.join(ms_input::label::ALTERNATIVE_SEPARATOR) };
         Self {
             create_bubble: registry.label(CREATE_BUBBLE),
             create_bubble_menu: bound(CREATE_BUBBLE),
-            recent_chars: registry.param_group_label(&RECENT_CHARS),
+            create_bubble_recent: registry.label_with_prefix(CREATE_BUBBLE, &recent_chars),
+            quick_rect_recent,
+            recent_chars,
             recent_char_keys: RECENT_CHARS.iter().map(|&id| registry.label(id)).collect(),
             create_hint_bubble: registry.label(CREATE_HINT_BUBBLE),
             create_image_bubble: registry.label(CREATE_IMAGE_BUBBLE),
@@ -482,12 +493,11 @@ impl TranslationInputLabels {
     /// so the hint stays two-column.
     #[must_use]
     pub fn hint_rows(&self, lines_edit: bool) -> Vec<CanvasHintRow> {
-        let with_recent = |keys: &str| tf!("canvas.bottom_hint.translation.with_recent_char_keys", digits = self.recent_chars, keys = keys);
         let mut rows = vec![
             CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_bubble_label"), self.create_bubble.clone()),
-            CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_bubble_recent_char_label"), with_recent(&self.create_bubble)),
+            CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_bubble_recent_char_label"), self.create_bubble_recent.clone()),
             CanvasHintRow::new(t!("canvas.bottom_hint.translation.ocr_bubble_label"), self.quick_rect.clone()),
-            CanvasHintRow::new(t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_label"), with_recent(&self.quick_rect)),
+            CanvasHintRow::new(t!("canvas.bottom_hint.translation.ocr_bubble_recent_char_label"), self.quick_rect_recent.clone()),
             CanvasHintRow::new(t!("canvas.bottom_hint.translation.advanced_ocr_label"), self.advanced_rect.clone()),
             CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_image_bubble_label"), self.create_image_bubble.clone()),
             CanvasHintRow::new(t!("canvas.bottom_hint.translation.create_image_bubble_crop_label"), self.crop_rect.clone()),

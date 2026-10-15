@@ -47,6 +47,12 @@ fallback) -> `install` swaps the `ArcSwap` -> `t!/tf!/tp!` -> `lookup`/
   literals are not false-positives). It does NOT check `es`/`fr`/`pt` completeness.
 - `tests/migrated_keys_resolve.rs`: proves migrated keys resolve to real text, not to
   the key itself (the `t!`-returns-key-on-miss trap).
+- `tests/binding_text.rs`: no `en`/`ru` value under the namespaces of the input-migrated
+  features (`canvas.`, `translation.`, `cleaning.`, `typing.`, `tools.`, `app.hotkey.`,
+  `settings.hotkeys.`, the Typing rotation chooser) spells a binding (key / mouse-button names,
+  the wheel, "+drag", "(T)", "1-6"), and no key there ends in `_keys`: bindings are shown through
+  `ms_input::InputRegistry::label` placeholders. `input.*` (the button names themselves) is
+  excluded by design; a commented whitelist holds prose that merely contains such a word.
 
 ## Contracts and invariants
 - **`t!` is hot-path safe**: no lock, no allocation. It returns `&'static str`

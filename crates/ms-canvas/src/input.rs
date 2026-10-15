@@ -37,7 +37,7 @@ use ms_input::{
     ActionId, ActionMeta, ActionSpec, AxisSample, AxisSource, Binding, Button, Chord, ClaimedGesture, CommandSpec, Condition, ContextId, Declarations,
     FixedAction, GestureKind, GesturePhase, GestureSpec, HitPhase, InputRegistry, ModifierKey, MouseButton, Scope, TargetId, TargetSpec, ViewId, view,
 };
-use ms_widgets::touch_nav::context_menu_popup;
+use ms_input::touch::context_menu_popup;
 
 use super::{CanvasHintRow, CanvasView};
 
@@ -374,7 +374,7 @@ impl CanvasView {
 
     /// The bubble menu of `response` for this frame, or `None` when it must not be built.
     ///
-    /// The menu is opened through the one canvas menu path (`touch_nav::context_menu_popup`): by
+    /// The menu is opened through the one canvas menu path (`ms_input::touch::context_menu_popup`): by
     /// [`BUBBLE_MENU`] on `target`, or by egui's long touch on a widget a finger reaches (an aside
     /// card is a touch hole). A secondary click that the binding does not own (another modifier
     /// held, the menu rebound elsewhere) skips the popup for this frame, so it neither opens nor

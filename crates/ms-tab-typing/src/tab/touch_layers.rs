@@ -3,7 +3,7 @@ File: tab/touch_layers.rs
 
 Purpose:
 Finger input on the typing tab's text layers (text/image overlays). The finger decision itself is
-owned by `ms_widgets::touch_nav` and reaches this tab only as typed canvas output
+owned by `ms_input::touch` and reaches this tab only as typed canvas output
 (`CanvasView::touch_tap` / `touch_long_press_armed_at` / `touch_long_press_at` /
 `touch_region_drag`); nothing here reads raw touches. The rules, kept deliberately small:
 - a TAP on a text layer selects it (the selected layer keeps the tap inside its own grab area, like
@@ -53,7 +53,7 @@ its handles are mouse-only, and a whole-layer move there would fight them.
 */
 
 use super::*;
-use ms_widgets::touch_nav::{TouchSelection, TouchSelectionEnd};
+use ms_input::touch::{TouchSelection, TouchSelectionEnd};
 
 /// This frame's finger facts on the typing canvas, copied from `CanvasView` (all screen points).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

@@ -2066,7 +2066,7 @@ impl CanvasView {
             return;
         }
         let layer = input::capture_layer_for(self.scroll_area_id_salt);
-        ms_widgets::touch_nav::publish_capture_layer(ctx, self.touch_owner_id(), layer);
+        ms_input::touch::publish_capture_layer(ctx, self.touch_owner_id(), layer);
         egui::Area::new(layer.id)
             .order(layer.order)
             .fixed_pos(canvas_rect.min)

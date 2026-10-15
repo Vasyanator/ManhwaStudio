@@ -30,7 +30,7 @@ Architecture:
 - `viewport`: own camera (pan/zoom/fit), independent of the shared canvas engine.
 - `studio_tab`: `impl ms_studio_tab::StudioTab` — the tab's answers to the studio root's
   order-free hooks (only the panel-dock default layout).
-- `canvas_touch`: finger input from `ms_widgets::touch_nav` (surface publication, long-press
+- `canvas_touch`: finger input from `ms_input::touch` (surface publication, long-press
   marker); `draw_canvas` applies its navigation to the camera, its selection drag to the active
   tool (`PsTool::touch_selection`) and its long-press to `draw_selection_menu`.
 - `layers`: ordered layer stack with two locked base layers (source + clean) and user raster
@@ -5420,7 +5420,7 @@ impl PsEditorTabState {
         let anchor = input.hover_pos.filter(|p| rect.contains(*p));
         self.viewport
             .handle_input(rect, anchor, wheel_for_zoom, pan_delta);
-        // Finger input (`ms_widgets::touch_nav`): a claimed finger never reaches the tools; it
+        // Finger input (`ms_input::touch`): a claimed finger never reaches the tools; it
         // pans / pinches here, BEFORE this frame's transform is taken, opens the selection menu
         // on a long-press and drives the active selection tool on a long-press drag.
         let touch = canvas_touch::publish_and_take(
@@ -6355,7 +6355,7 @@ impl PsEditorTabState {
     ///
     /// Opens on a secondary click or when `long_press_at` (this frame's
     /// `TouchOutput::long_press_at`, screen points) is `Some`, anchored there; both take the one
-    /// open path `ms_widgets::touch_nav::context_menu_popup`. The touched-layer list is recomputed
+    /// open path `ms_input::touch::context_menu_popup`. The touched-layer list is recomputed
     /// once per menu open so the per-frame menu closure stays cheap even for large selections.
     ///
     /// `hud_gesture_possible` suppresses the menu for the frame unless a long-press opens it: Alt +
@@ -6379,7 +6379,7 @@ impl PsEditorTabState {
             self.clip_selected_layers.clear();
         }
         let has_selection = self.selection.as_ref().is_some_and(Selection::any);
-        ms_widgets::touch_nav::context_menu_popup(response, long_press_at)
+        ms_input::touch::context_menu_popup(response, long_press_at)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
                 if !has_selection {

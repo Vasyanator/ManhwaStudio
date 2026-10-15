@@ -101,11 +101,31 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   (`open_with_command_targets_install`); no other crate spells a record name or builds its values;
   platform capability decisions (`ms_platform::PlatformFeature`: never re-derive a capability from
   `cfg`), file dialogs (`ms_platform::file_dialog`), system clipboard reads
-  (`ms_platform::clipboard`), finger-gesture rules on canvases (`ms_widgets::touch_nav`: no
-  canvas or tool reads raw `Event::Touch` or decides pan/pinch/long-press itself).
+  (`ms_platform::clipboard`), finger-gesture rules on canvases (`ms_input::touch`: no
+  canvas or tool reads raw `Event::Touch` or decides pan/pinch/long-press itself), input
+  bindings, their display labels and conflicts (`ms-input`: `InputRegistry`, `InputRouter`).
 - Python backend on ROCm: never advise or enable `expandable_segments:True`; checkpoint weights
   move to the GPU only via `modules/ai_backend/runtime/rocm_mmap_transfer.py`; every
   user-facing backend error text passes through `runtime/error_text.py::sanitize_torch_error`.
+
+## Input (`ms-input`)
+
+- The input-migrated code — `ms-canvas`, `ms-tools`, `ms-tab-translation`, `ms-tab-cleaning`,
+  `ms-tab-typing` and `src/studio/` — never reads keys or modifiers raw (`key_pressed` /
+  `key_down` / `consume_key` / `consume_shortcut` / `modifiers`) and never makes a key, a modifier,
+  the wheel or a mouse button into a shortcut or tool gesture by itself: it declares an action in
+  `ms-input` and reads the frame's `InputFrame` (widget-local pointer state such as egui's own
+  click / drag responses stays as it is; sole exception: the dev-only `profiling` feature's F11
+  profiler toggle in `src/studio.rs`). The PS editor, page manager and launcher are not
+  migrated yet and still read raw input. Enforced by a per-crate `clippy.toml`
+  (`disallowed-methods`: `egui::InputState::{key_pressed, key_down, key_released, consume_key,
+  consume_shortcut}`) in each migrated crate; clippy reads it from the crate's own directory only,
+  so never add a root `clippy.toml` (it would reach every crate without its own file).
+- Hint and label text never spells a binding: it takes a `{placeholder}` filled from
+  `InputRegistry::label` (or `label_with_prefix` / `param_group_label`). Guarded for the migrated
+  namespaces by `crates/ms-i18n/tests/binding_text.rs`; `input.*` holds the button names.
+- Action ids are persistence keys of the user's overrides (`user_config` -> `Hotkeys`): never
+  rename one without a migration in `ms_input::persist`.
 
 ## Network downloads
 

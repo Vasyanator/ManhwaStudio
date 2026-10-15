@@ -13,7 +13,7 @@ AppShell (mod.rs, eframe::App)
            incoming-images take -> ExternalOpen) + root close_requested -> on_event(OsClose)
   ui():    geometry, Windows first-frame maximize, draw the active screen, UI exits,
            then drain_studio_outputs (the running studio's StudioOutput queue)
-  raw_input_hook(): TouchRouter::route (ms_widgets::touch_nav) before egui's pointer state
+  raw_input_hook(): TouchRouter::route (ms_input::touch) before egui's pointer state
   dispatch(event) -> resolve_open_event (pending_open) -> screen::on_event(kind, event)
                   -> Transition { next, effect, cancel_os_close }
                   -> run_effect (takes the data from the active screen) -> enter_screen on a switch
@@ -147,7 +147,7 @@ by `into_parts` on `Shutdown` when a close arrived during the load), the load er
   ask) is dropped by `incoming::discard_target`, which releases its inbox batches on a worker.
   Cold start: `startup::run_native` takes the batches pre-window; they become `InitialScreen::Studio` when
   there is no CLI target. A failed take is logged and shown once in a small window.
-- **Canvas touch routing**: the shell owns the window's ONE `ms_widgets::touch_nav::TouchRouter`
+- **Canvas touch routing**: the shell owns the window's ONE `ms_input::touch::TouchRouter`
   (created once, lives across every screen) and feeds it from `raw_input_hook`, the only point
   that sees `RawInput` before egui builds its pointer state. On iff
   `ms_platform::PlatformFeature::CanvasTouchGestures` is available (off on Windows: pen and
@@ -175,7 +175,7 @@ by `into_parts` on `Shutdown` when a close arrived during the load), the load er
 - Startup prompts and the post-window update: `src/startup/` (`routing.rs`: `resolve_start`,
   `resolve_cli_images`, `run_launcher_requested_update`; `prompts.rs`).
 - Finger gestures on canvases: the router and its contract live in
-  `crates/ms-widgets/src/touch_nav/`; the platform gate in `ms_platform` `features.rs`; the
+  `crates/ms-input/src/touch/`; the platform gate in `ms_platform` `features.rs`; the
   user switch in `ms_config::touch_gestures`; the shell only wires `raw_input_hook`.
 - Images other apps hand over: where they go per screen — `screen.rs` (`ExternalOpen` rows,
   `merge_open`); taking, mapping, dropping — `incoming.rs`; `pending_open` and the polling —

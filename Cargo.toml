@@ -229,7 +229,8 @@ ms-tab-translation = { path = "crates/ms-tab-translation" }
 # the root builds `LocalAiAvailability` at startup and the studio reads the health snapshot.
 ms-local-ai = { path = "crates/ms-local-ai" }
 # The unified input model (buttons, declared actions with rebindable alternatives, matcher,
-# conflicts, localized binding labels, the `Hotkeys` codec), named `ms_input::` directly (no
+# conflicts, localized binding labels, the `Hotkeys` codec) and the canvas touch router the
+# main window's raw-input hook drives (`ms_input::touch`), named `ms_input::` directly (no
 # shim). Sits BELOW `ms-widgets` and every tab crate, which declare their actions through it.
 ms-input = { path = "crates/ms-input" }
 # The `StudioTab` trait: the order-free per-tab hooks `studio/tabs.rs` (`Tabs`) iterates instead

@@ -16,8 +16,7 @@ Submodules:
 - `router`: the egui runtime (`InputRouter::begin_frame`) over the matcher.
 - `frame`: the per-frame result (`InputFrame`) and the view-surface publication.
 - `capture`: binding capture for the settings pane.
-- `touch`: the canvas touch-gesture router (raw-input stage), re-exported by `ms-widgets` as
-  `touch_nav` until its importers are re-pointed.
+- `touch`: the canvas touch-gesture router (raw-input stage).
 
 Notes:
 - The model (`action` .. `view`) is pure: it never reads an egui `Context`. The runtime

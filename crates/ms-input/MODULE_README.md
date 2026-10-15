@@ -25,7 +25,7 @@ Two layers in one crate: the pure MODEL (everything above, no egui `Context`) an
 RUNTIME on top of it (`router.rs`, `frame.rs`, `capture.rs`) plus the raw-stage touch router
 (`touch/`). The runtime never re-implements matching: it turns egui events into `MatchEvent`s
 and asks the matcher. Consumers (studio root, canvas, tabs, settings pane) are not in this
-crate; `ms-widgets` re-exports `touch` as `touch_nav` until its importers are re-pointed.
+crate; every consumer (shell hook, canvas, tabs, PS editor) names `ms_input::touch` directly.
 
 ## Files and submodules
 - `src/lib.rs`: crate root, lints (`clippy::pedantic`), i18n macros, re-exports.
@@ -52,8 +52,8 @@ crate; `ms-widgets` re-exports `touch` as `touch_nav` until its importers are re
   its outputs (`Fired`, `AxisSample`, `ViewFocus`, `ClaimedGesture`, `GestureHit`), `gesture_for`.
 - `src/capture.rs`: binding capture (`CaptureSlot`, `CaptureStatus`, `CaptureError`, the
   recording state machine, `captured_alternatives`).
-- `src/touch/`: the canvas touch-gesture router (raw-input stage, own `MODULE_README.md`), moved
-  here from `ms-widgets`; `peek_selection` is its non-consuming read for the input router.
+- `src/touch/`: the canvas touch-gesture router (raw-input stage, own `MODULE_README.md`);
+  `peek_selection` is its non-consuming read for the input router.
 - `src/tests/`: unit tests per contract (matching, conflicts, registry, labels, persistence, and
   `runtime_tests.rs`: headless `Context::run_ui` frames over synthetic `RawInput`).
 

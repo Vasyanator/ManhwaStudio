@@ -12,7 +12,7 @@ translated (bubbles, OCR, machine translation), cleaned (clean layers, inpaintin
 (rendered text layers) and exported.
 
 - **Rust application** — a Cargo workspace: the root package `manhwastudio_rs` (`src/`: a
-  library holding the application, plus a thin binary entry) over 38 `ms-*` library crates in
+  library holding the application, plus a thin binary entry) over 42 `ms-*` library crates in
   `crates/`. Builds for Linux and Windows (mandatory), macOS, `wasm32` (web entry,
   `src/web_entry.rs`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
   exists so that build can export `android_main`).
@@ -51,7 +51,7 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
   <- ms-models / ms-tabs-simple / ms-installer / ms-ai-api
   <- ms-studio-tab
   <- ms-project / ms-widgets / ms-native-runtime / ms-local-ai
-  <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration
+  <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration / ms-input
   <- ms-config / ms-text-render
   <- ms-backend-ipc / ms-docstore / ms-fonts / ms-memory / ms-onnx / ms-platform
   <- ms-log / ms-text-detect
@@ -114,14 +114,20 @@ shared wiki view). The studio never references
   action rules + elevated helper (`actions`). GUI-free. Consumers: the installer (per install
   kind), the binary (Linux startup entry, helper routing), `ms-settings-ui` (registration
   warnings) and `ms-launcher` (System registration tab).
+- `ms-input` — the unified input system: buttons, code-declared actions (Command / Mode / Axis /
+  Gesture) with any number of user alternatives, the registry, matcher, conflicts, binding labels,
+  the `Hotkeys` codec, the per-frame router (`InputRouter` -> `InputFrame`) and the canvas touch
+  router (`ms_input::touch`). Used by `ms-canvas`, `ms-tools`, `ms-studio-tab`, the tabs and the
+  root; never by `ms-widgets`.
 - `ms-project` — `ProjectData`, `ComicType`, `CanvasSettings`, project scan, save-merge.
 - `ms-widgets` — project widget set (`panel_dock`, `Wheel*`, `AiButton`, spellchecked edits),
-  `ui_fonts`, hotkey registry (`InputManagerV2`).
+  `ui_fonts`, `ui_scale`.
 - `ms-native-runtime` — process-global native ONNX manager (sessions, LRU, crash guard).
 - `ms-local-ai` — GUI-free local-AI facts: `local_ai` (which local runtimes the process may use:
   `--no-ai` + platform, the route-availability rule, the effective runtime) and
   `backend_health` (push-driven backend health snapshot, probe thread, device control).
-- `ms-studio-tab` — the `StudioTab` trait: order-free per-tab hooks (hotkeys, dock default
+- `ms-studio-tab` — the `StudioTab` trait: order-free per-tab hooks (input declarations and
+  contexts, dock default
   layout, GPU eviction, source-page window, background poll, exit settings, teardown store
   flush, committed-tree change) that every tab implements and the studio root iterates. Draw
   and ordered sequences stay explicit in the root.
@@ -284,18 +290,25 @@ shared wiki view). The studio never references
 - **Panel dock:** one `PanelDockState` per studio window, owned by `StudioApp` and lent to the
   active tab per frame; layouts are keyed by `AppTab::key()` and persisted through the
   `PanelLayout` config section.
-- **Touch on canvases:** one router (`ms_widgets::touch_nav`), run from the main window's
+- **Touch on canvases:** one router (`ms_input::touch`), run from the main window's
   `raw_input_hook` (gated by `PlatformFeature::CanvasTouchGestures`, off on Windows/wasm),
   claims a finger that lands on a published canvas surface and strips egui-winit's simulated
   mouse press for it, so a finger never reaches a tool. Canvases (`CanvasView`, PS editor)
   publish their surface + holes each frame and take a typed `TouchOutput` (pan/pinch, long-press
-  menu point, long-press-then-drag selection handed to the active mode via
-  `CanvasView::set_long_press_selection` / `touch_selection`). Mouse and pen (Android stylus is
-  routed as a mouse by the winit fork) keep tool behaviour.
-- **Hotkeys:** `ms_widgets::InputManagerV2`: specs declared by each tab
-  (`ms_studio_tab::StudioTab::hotkey_specs`) plus the session's own, user overrides in
-  `user_config` -> `Hotkeys`; `StudioApp` runs the session's ids and hands every other one to
-  the active tab (`StudioTab::execute_hotkey`).
+  menu point, long-press-then-drag selection). On the migrated canvases the selection reaches
+  the active mode as a `Touch(LongPressDrag)` alternative of a canvas-wide gesture (claimed by
+  the input router); the PS editor reads it from its `TouchOutput`. Mouse and pen (Android
+  stylus is routed as a mouse by the winit fork) keep tool behaviour.
+- **Input (bindings):** `ms-input`. Actions are declared in code (the shared `view.*` set, the
+  brush set, each tab's `StudioTab::input_declarations`, the session's own) and merged into one
+  `InputRegistry` with the user's overrides (`user_config` -> `Hotkeys`, format 2; any number of
+  alternatives per action). `StudioApp` calls `InputRouter::begin_frame` ONCE per frame, before
+  the tab draw, with the active tab's `StudioTab::input_contexts`; the session and the drawing tab
+  then read the same `InputFrame` (fired commands, active modes, axes, gesture claims). Viewers
+  publish their surfaces for the next frame. Hint text names a binding only through
+  `InputRegistry::label` (alternatives joined by " / "); conflicts and cross-level shadowing come
+  from the registry and are shown in Settings › Hotkeys, which edits the bindings through the
+  router (capture).
 
 ## 6. Canvas
 
@@ -322,7 +335,8 @@ Detail: `crates/ms-canvas/src/MODULE_README.md`.
 `AppTab` (`crates/ms-config/src/app_tab.rs`) fixes order and persistence ids. `StudioApp` owns
 every tab state, lends it shared models, textures and the panel dock each frame, and executes
 the actions tabs return. Canvas tabs implement `CanvasHooks` and own their canvas; the others
-draw their own UI. Every tab answers the root's order-free questions (hotkeys, dock host, GPU
+draw their own UI. Every tab answers the root's order-free questions (input declarations and
+contexts, dock host, GPU
 eviction, page window, background poll, exit settings, teardown store flush, committed-tree
 change) through `ms_studio_tab::StudioTab`; drawing and every ordered sequence stay explicit.
 
@@ -506,7 +520,9 @@ logged error); the GUI thread only polls and applies results.
   (`ms_models::layer_model::ordering`, consumed by the typing canvas, the typing
   flatten/export and the PS composite, layers tree and structural order), platform
   capability decisions (`ms_platform::PlatformFeature`), file dialogs
-  (`ms_platform::file_dialog`) and system clipboard reads (`ms_platform::clipboard`).
+  (`ms_platform::file_dialog`), system clipboard reads (`ms_platform::clipboard`), input
+  bindings, their labels and conflicts (`ms-input`) and finger gestures on canvases
+  (`ms_input::touch`).
   Layer and group visibility/opacity are `LayerDoc` facts, never one tab's view state.
 
 **Documents**

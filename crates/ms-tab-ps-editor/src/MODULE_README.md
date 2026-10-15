@@ -144,7 +144,7 @@ doc falls back inside the enqueue.
 - `viewport.rs`: `PsViewport` camera (pan/zoom/fit/100%, finger pan/pinch via
   `apply_touch_navigation`) and the per-frame `ViewTransform` (image↔screen mapping). Independent
   of the shared canvas engine.
-- `canvas_touch.rs`: the canvas' side of `ms_widgets::touch_nav` — publishes the canvas as a touch
+- `canvas_touch.rs`: the canvas' side of `ms_input::touch` — publishes the canvas as a touch
   surface (owner `ps_editor.canvas`, no holes) and takes the frame's output; decides which of the
   finger selection and the pointer frame reach the active tool; draws the long-press marker. See
   «Finger input» below.
@@ -354,7 +354,7 @@ out of the gesture is not to call it that frame. The flag is `alt && the brush i
 the tool that owns the gesture: under the lasso or the transform tool Alt+right-click is an ordinary
 right-click and must still open the menu.
 
-**Finger input** (`ms_widgets::touch_nav`, routed in the shell's raw-input hook). A finger that
+**Finger input** (`ms_input::touch`, routed in the shell's raw-input hook). A finger that
 starts on bare canvas is CLAIMED by the router and never reaches egui's pointer, so none of the
 mouse paths above (tools, wheel, Space/middle pan, the occlusion gate) ever sees it. `draw_canvas`
 calls `canvas_touch::publish_and_take` every frame a page is resident and:
@@ -367,16 +367,16 @@ calls `canvas_touch::publish_and_take` every frame a page is resident and:
   mouse/pen press that cancelled it starts its own drag (`canvas_touch::tool_frame_route`). The surface's
   `long_press_selection` is that same answer, so under any other tool a long-press drag pans;
 - passes `TouchOutput::long_press_at` to `draw_selection_menu`, which opens the copy/cut menu
-  through `ms_widgets::touch_nav::context_menu_popup` — the one open path for the secondary click
+  through `ms_input::touch::context_menu_popup` — the one open path for the secondary click
   and the long-press. `hud_gesture_possible` (Alt + brush) suppresses only the mouse path;
 - draws `canvas_touch::draw_long_press_marker` at `TouchOutput::long_press_armed_at`.
 The surface has no holes: dock panels and popups are `Area`s above `Order::Background`, and the
 router never claims a touch there. The patch tool's outline is NOT an `Area` — a bare
 `ctx.layer_painter(Order::Middle)` (`ms_tools::patch`) — and `Context::layer_id_at` never reports a
 layer without area state, so a finger over the outline is claimed like bare canvas and needs no
-capture registration (pinned by the `touch_nav` test `bare_layer_painter_does_not_block_a_claim`).
+capture registration (pinned by the `ms_input::touch` test `bare_layer_painter_does_not_block_a_claim`).
 A future tool that opens a real `Area` over the canvas must register it through
-`touch_nav::publish_capture_layer` under the canvas' owner id (`canvas_touch::owner_id`) to keep
+`ms_input::touch::publish_capture_layer` under the canvas' owner id (`canvas_touch::owner_id`) to keep
 the finger panning there.
 
 **The hint grid is a deliberate local duplicate.** `draw_hotkey_rows_grid` re-implements the
@@ -725,7 +725,7 @@ subsystem for no gain here. The duplication is recorded here so it stays deliber
 ## Editing map
 - To change the camera (pan/zoom/fit, finger pan/pinch), edit `viewport.rs`.
 - To change what a finger does on the canvas, edit `canvas_touch.rs` (surface, marker) and the
-  «Finger input» block of `draw_canvas`; the gesture decision itself is `ms_widgets::touch_nav`.
+  «Finger input» block of `draw_canvas`; the gesture decision itself is `ms_input::touch`.
 - To change layer rules (base locking, ordering, add/remove) or the per-layer transform math, edit
   `layers.rs` (`LayerTransform`, `local_to_world`/`world_to_local`/`world_corners`). Which layers
   accept pixel edits is `Layer::can_edit_pixels`; which are structurally locked is

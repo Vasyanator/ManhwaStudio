@@ -1,0 +1,13 @@
+# Clippy configuration of an input-migrated crate (PROJECT_RULES.md, "Input (`ms-input`)").
+# Keys are actions declared in `ms-input` and read from the frame's `InputFrame`; a raw key read
+# here would bypass rebinding, alternatives, contexts, conflicts and the displayed labels.
+# Clippy reads this file from the crate's own directory only, so the crates that are not migrated
+# yet (PS editor, page manager, launcher) are unaffected; there is deliberately no root
+# `clippy.toml` (it would apply to every crate without its own file).
+disallowed-methods = [
+    { path = "egui::InputState::key_pressed", reason = "declare an ms-input action and read the InputFrame" },
+    { path = "egui::InputState::key_down", reason = "declare an ms-input mode and read InputFrame::mode_active" },
+    { path = "egui::InputState::key_released", reason = "declare an ms-input action and read the InputFrame" },
+    { path = "egui::InputState::consume_key", reason = "the input router consumes matched keys; declare an ms-input action" },
+    { path = "egui::InputState::consume_shortcut", reason = "the input router consumes matched keys; declare an ms-input action" },
+]

@@ -129,7 +129,7 @@ that defines the type.
   `load_user_config` BEFORE the defaults backfill; the reader maps an unmigrated legacy key the
   same way. Applied to the forked winit by `ms_window_geometry` (Android only).
 - `touch_gestures.rs`: the touchscreen-gestures switch `General.touch_gestures` (frozen key, a
-  JSON boolean): whether canvas finger gestures (`ms_widgets::touch_nav`) run. Default per host
+  JSON boolean): whether canvas finger gestures (`ms_input::touch`) run. Default per host
   (`default_for(WindowHost)`: on for Android, off for desktop and web; `DEFAULT` goes into the
   `General` tree), pure reader `touch_gestures_from_user_settings` (absent or non-boolean ->
   `DEFAULT`), process-global live value (`current` / `set` / `seed_from_user_settings`, seeded

@@ -42,7 +42,7 @@ while `Add`/`Subtract`/`Intersect` leave the existing selection alone. The commi
 */
 
 use super::{PsHotkeyRow, PsTool, PsToolContext, PsToolId, ToolOutcome, TouchSelectionInput};
-use ms_widgets::touch_nav::TouchSelectionEnd;
+use ms_input::touch::TouchSelectionEnd;
 use crate::selection::SelectionOp;
 use crate::viewport::ViewTransform;
 use eframe::egui;

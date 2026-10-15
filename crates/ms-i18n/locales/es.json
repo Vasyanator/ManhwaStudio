@@ -3327,8 +3327,6 @@
   "settings.typesetting.hanging_punctuation_save_button": "Guardar",
   "settings.typesetting.heading": "Rotulación",
   "settings.typesetting.language_label": "Idioma",
-  "settings.typesetting.rotation_ctrl_wheel_hint": "Cómo el gesto Ctrl+rueda en la pestaña «Texto» rota la superposición seleccionada.",
-  "settings.typesetting.rotation_ctrl_wheel_label": "Rotación Ctrl+rueda:",
   "settings.typesetting.rotation_mode_raster": "Rasterizado",
   "settings.typesetting.rotation_mode_raster_hint": "Más rápido, pero produce una imagen menos nítida.",
   "settings.typesetting.rotation_mode_vector": "Vectorial",

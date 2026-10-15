@@ -70,8 +70,12 @@ fn parameter_groups_print_a_range_or_the_member_labels() {
     let mut registry = registry_with_view(actions, Vec::new());
     let group: Vec<ActionId> = ids.iter().map(|id| ActionId(id)).collect();
     assert_eq!(registry.param_group_label(&group), "1-6");
+    let prefix = registry.param_group_label(&group);
+    assert_eq!(registry.label_with_prefix(view::ZOOM, &prefix), format!("1-6+({ctrl} / Z)+Wheel / 1-6+Pinch", ctrl = ctrl_name()), "every alternative gets the prefix");
+    assert_eq!(registry.label_with_prefix(ActionId("ghost"), &prefix), "no binding");
     assert!(registry.set_bindings(ActionId("rc.3"), vec![Binding::mode([key(egui::Key::X)])]).is_ok());
     assert_eq!(registry.param_group_label(&group), "1 / 2 / X / 4 / 5 / 6");
+    assert_eq!(registry.label_with_prefix(view::PAN, &registry.param_group_label(&group)), "(1 / 2 / X / 4 / 5 / 6)+Space", "a prefix with alternatives is parenthesized");
     assert_eq!(registry.param_group_label(&[]), "no binding");
 }
 

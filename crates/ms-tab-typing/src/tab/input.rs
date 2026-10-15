@@ -109,8 +109,9 @@ pub(crate) const LAYER_NUDGE_FAST_LEFT: ActionId = ActionId("typing.layer.nudge_
 pub(crate) const LAYER_NUDGE_FAST_RIGHT: ActionId = ActionId("typing.layer.nudge_fast_right");
 pub(crate) const LAYER_NUDGE_FAST_UP: ActionId = ActionId("typing.layer.nudge_fast_up");
 pub(crate) const LAYER_NUDGE_FAST_DOWN: ActionId = ActionId("typing.layer.nudge_fast_down");
-/// Axis: rotate the selected layer by 2° per wheel notch (default Ctrl+wheel).
-pub(crate) const LAYER_ROTATE: ActionId = ActionId("typing.layer.rotate");
+/// Axis: rotate the selected layer by 2° per wheel notch (default Ctrl+wheel). Public (re-exported
+/// as `LAYER_ROTATE_ACTION`): the settings pane names its binding in the rotation-mode chooser.
+pub const LAYER_ROTATE: ActionId = ActionId("typing.layer.rotate");
 
 /// The nudge commands in `[left, right, up, down]` order (plain, then fast) — the slot order of
 /// `mesh_geometry::arrow_nudge_step_px`.

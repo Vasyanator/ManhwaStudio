@@ -19,7 +19,8 @@ paths, plus the settings tab itself.
 
 `settings/` is a module of this package: it composes the studio-only sections with the panes
 shared with the launcher (`ms-settings-ui`: `general_settings_panel`, `ai_backend_panel`,
-`settings_shared`, `tutorial`) and the hotkey registry (`input_manager_v2`).
+`settings_shared`, `tutorial`) and the Hotkeys pane over the studio's input router
+(`ms_input::InputRouter`, named `ms_input::` directly).
 
 The crates form a strict downward chain — `ms-tabs-simple` -> `ms-tab-translation`,
 `ms-tab-typing` -> `ms-tab-ps-editor` -> `ms-tab-page-manager`, and `ms-tab-cleaning` on top of
@@ -79,8 +80,8 @@ The tab crates document themselves:
   overlays.
 - New maintained source subdirectories under `tabs/` need their own `MODULE_README.md`.
 - A tab crate may never name `studio`, `launcher` or a tab crate above it in the chain. Anything a
-  tab needs from the binary must move DOWN into a library crate first (that is how
-  `input_manager_v2` came to live in `ms-widgets`).
+  tab needs from the binary must move DOWN into a library crate first (the input system, for
+  example, is the `ms-input` crate below every tab).
 - An item a tab crate exposes to the binary or to a tab above it must be `pub`, not `pub(crate)`,
   and must carry a comment naming the outside caller.
 

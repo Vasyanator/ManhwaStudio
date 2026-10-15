@@ -1,4 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+// A standalone eframe test app outside the studio: it has no input router, so the crate's
+// `clippy.toml` ban on raw key reads (input-migrated crate) does not apply to its `C` shortcut.
+#![expect(clippy::disallowed_methods, reason = "standalone dev example without the studio input router; reads its one test key directly")]
 
 /*
 FILE OVERVIEW: crates/ms-tab-typing/examples/test_center_find.rs
