@@ -86,7 +86,8 @@ shared wiki view). The studio never references
   with the CTD, Paddle and Surya postprocess); the model forward pass is supplied by the caller
   through `ProbMapRunner`. No logging, wasm-buildable.
 - `ms-custom-fonts` — GUI-free custom fonts: the kind-tagged recipe (hybrid = weighted blend of
-  2-4 real fonts; combined planned), its SHA-256 key and the compiler that turns a recipe plus
+  2-4 real fonts by one of five blend algorithms, optionally split shape / spacing / kerning
+  weights; combined planned), its SHA-256 key and the compiler that turns a recipe plus
   source bytes into a real TrueType face (blend, metrics, inherited `kern`, sfnt writer), and the
   export-time own-kerning rewrite. Bytes in, bytes out; no I/O, no logging.
 - `ms-docstore` — named logical documents (`DocRef`): per-document lock, atomic writes, JSON or
@@ -393,7 +394,9 @@ change) through `ms_studio_tab::StudioTab`; drawing and every ordered sequence s
   hyphenation, segmentation and font coverage follow the TEXT language.
 - **Custom fonts are recipes, never files.** A saved one lives in `fonts_data` (`custom_fonts`,
   kind-tagged; unknown kinds kept verbatim), an ad-hoc one in the layer's
-  `text_params.font_recipe`. `ms-custom-fonts` compiles a recipe into an in-memory face; the
+  `text_params.font_recipe`. The blend algorithm and property weights are recipe facts; a
+  recipe that differs from the plain weighted average carries kind `hybrid2`, which older
+  builds cannot read (an unknown kind: unavailable, never compiled as the baseline). `ms-custom-fonts` compiles a recipe into an in-memory face; the
   typing `custom_fonts` service (memory LRU + disk cache `fonts/custom_cache/<key>.ttf`, a
   disposable artefact skipped by the font scanner) serves it to the typing `FontProvider`, so
   the renderer sees an ordinary face. A missing source font blocks the layer (`missing_font`),

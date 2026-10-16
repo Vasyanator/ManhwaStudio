@@ -371,7 +371,8 @@ impl FontSettingsRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnsupportedCustomFont {
     /// The entry's `kind` is not one this build implements (a newer build wrote it); carries
-    /// the kind tag as written.
+    /// the kind tag as written, or `hybrid2/<algorithm>` for a hybrid whose blend algorithm
+    /// this build does not implement.
     UnknownKind(String),
     /// The entry does not parse as a recipe of a known kind, or the recipe breaks its
     /// invariants (`CustomFontRecipe::validate`); carries the log-ready reason.
@@ -867,6 +868,11 @@ fn decode_custom_font_entry(identity: &str, raw: Value) -> CustomFontRecord {
         Err(err) => {
             let reason = match err {
                 RecipeError::UnknownKind(kind) => UnsupportedCustomFont::UnknownKind(kind),
+                // A `hybrid2` algorithm of a newer build: same "newer version" treatment as an
+                // unknown kind, never compiled with another algorithm.
+                RecipeError::UnknownAlgorithm(algorithm) => {
+                    UnsupportedCustomFont::UnknownKind(format!("{}/{algorithm}", ms_custom_fonts::KIND_HYBRID_V2))
+                }
                 other => UnsupportedCustomFont::Invalid(other.to_string()),
             };
             ms_log::runtime_log::log_warn(format!(
@@ -2195,6 +2201,8 @@ mod tests {
                     },
                 ],
                 missing_default: MissingGlyphPolicy::Disable,
+                algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+                property_weights: None,
             }),
         }
     }
@@ -2273,6 +2281,42 @@ mod tests {
         save_to_file(&path, &loaded, SaveBaseline::Unchecked).expect("save must succeed");
         let written: Value = serde_json::from_str(&fs::read_to_string(&path).expect("read back")).expect("valid JSON");
         assert_eq!(written["custom_fonts"], doc["custom_fonts"], "every unsupported entry is written back verbatim");
+        fs::remove_file(&path).expect("remove the temp document");
+    }
+
+    /// A `hybrid2` entry with an algorithm this build does not know is unsupported for the
+    /// same "newer version" reason as an unknown kind (never compiled as another algorithm)
+    /// and written back verbatim; a `hybrid2` entry this build knows decodes as a font.
+    #[test]
+    fn hybrid2_with_a_future_algorithm_is_kept_verbatim_as_newer() {
+        let path = unique_temp_path("custom_fonts_hybrid2");
+        let future = serde_json::json!({
+            "name": "Новый алгоритм", "kind": "hybrid2", "algorithm": "glyph_dreams", "missing_default": "disable",
+            "sources": [ { "identity": "A-Regular", "weight": 1.0, "missing": null }, { "identity": "B-Regular", "weight": 1.0, "missing": null } ]
+        });
+        let known = serde_json::json!({
+            "name": "Поле", "kind": "hybrid2", "algorithm": "sdf", "missing_default": "disable",
+            "sources": [ { "identity": "C-Regular", "weight": 1.0, "missing": null }, { "identity": "D-Regular", "weight": 2.0, "missing": null } ]
+        });
+        let doc = serde_json::json!({
+            "version": 4,
+            "custom_fonts": { "MSCustom-4444444444444444": future, "MSCustom-5555555555555555": known }
+        });
+        fs::write(&path, doc.to_string()).expect("write the document");
+        let loaded = expect_loaded(load_outcome_from_file(&path));
+        assert!(matches!(
+            &loaded.custom_fonts["MSCustom-4444444444444444"].body,
+            CustomFontBody::Unsupported { reason: UnsupportedCustomFont::UnknownKind(kind), .. } if kind == "hybrid2/glyph_dreams"
+        ));
+        let CustomFontBody::Known(recipe) = &loaded.custom_fonts["MSCustom-5555555555555555"].body else {
+            panic!("a known hybrid2 algorithm decodes as a font");
+        };
+        let ms_custom_fonts::CustomFontKind::Hybrid(params) = &recipe.kind;
+        assert_eq!(params.algorithm, ms_custom_fonts::BlendAlgorithm::Sdf);
+
+        save_to_file(&path, &loaded, SaveBaseline::Unchecked).expect("save must succeed");
+        let written: Value = serde_json::from_str(&fs::read_to_string(&path).expect("read back")).expect("valid JSON");
+        assert_eq!(written["custom_fonts"]["MSCustom-4444444444444444"], doc["custom_fonts"]["MSCustom-4444444444444444"]);
         fs::remove_file(&path).expect("remove the temp document");
     }
 

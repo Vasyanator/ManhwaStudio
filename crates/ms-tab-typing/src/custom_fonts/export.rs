@@ -460,6 +460,8 @@ pub(crate) mod test_support {
                     HybridSource { identity: identities[1].to_owned(), weight: weight_b, missing_override: None },
                 ],
                 missing_default: MissingGlyphPolicy::NoInfluence,
+                algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+                property_weights: None,
             }),
         })
     }
@@ -522,6 +524,7 @@ pub(crate) mod test_support {
                 postscript_name: compiled_face_post_script_name(&key),
                 key,
                 report: CoverageReport::default(),
+                stats: ms_custom_fonts::BlendStats::default(),
             })
         });
         Arc::new(CustomFontService::new(compiler, None, 1024 * 1024))

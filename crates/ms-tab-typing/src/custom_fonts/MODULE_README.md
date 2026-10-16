@@ -10,7 +10,7 @@ disk, and owns the custom-font name namespace. The compiler itself lives in `ms-
 
 ## Architecture
 ```text
-font model (panel: custom_font_entry list build + previews, TabFontProvider; later the editor)
+font model (panel: custom_font_entry list build + previews, TabFontProvider) and hybrid_editor/
   -- TabFontProvider implements SourceResolver, calls -->
 service::service()  (process-global CustomFontService)
   memory LRU (by RecipeKey, byte budget)  ->  disk_cache (fonts/custom_cache/<key>.ttf)
@@ -36,7 +36,9 @@ export: PSD export (panel snapshot -> export worker) -> service faces -> names +
 - `adhoc.rs`: `render_name` / `recipe_for_render_name` — how a name-only `FontProvider` finds an
   ad-hoc layer's recipe.
 - `service.rs`: `CustomFontService` / `service()`, `CompiledFace`, `CompileTicket`,
-  `CustomFontError`; tests in `service_tests.rs`.
+  `CustomFontError`, and `blend_stats_summary` (the `blend paths: …` suffix of the one
+  "compiled custom font" log line every full compile writes, from `CompiledFont.stats`);
+  tests in `service_tests.rs`.
 - `disk_cache.rs`: the cache directory, validated load (mtime touch), atomic store, `prune`,
   and the checked-removal protocol (move aside, re-check, delete or restore).
 - `export.rs`: custom fonts in the PSD export (decision D2). `CustomFontUseKey` (saved identity

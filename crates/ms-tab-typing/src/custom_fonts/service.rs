@@ -19,7 +19,8 @@ Key functions:
 - `recipe_key`, `full_face_blocking` (worker threads only), `start_full_compile` (GUI-safe),
   `peek_full` / `request_disk_load` (GUI-safe previews: never compile),
   `subset_preview_blocking` (uncached preview subset, decision D5),
-  `prune_disk_cache` / `start_disk_prune_once`.
+  `prune_disk_cache` / `start_disk_prune_once`, `blend_stats_summary` (the log text of a
+  full compile's blend-path counts).
 
 Notes:
 - Threading: the GUI thread may call only `start_full_compile`, `peek_full`,
@@ -44,7 +45,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use ms_custom_fonts::{
-    CompileError, CompileScope, CompiledFont, CoverageReport, CustomFontRecipe, KerningPairPerMille, RecipeKey,
+    BlendStats, CompileError, CompileScope, CompiledFont, CoverageReport, CustomFontRecipe, KerningPairPerMille, RecipeKey,
     SourceDigest, SourceFont, recipe_key, source_digest,
 };
 use ms_log::runtime_log;
@@ -110,6 +111,33 @@ impl CompiledFace {
         let byte_len = bytes.len();
         Self { bytes: Arc::new(bytes), byte_len, content_id, post_script_name, family_name, key, report }
     }
+}
+
+/// One-line, log-ready text of a compile's blend-path counts: every path with its count
+/// (zero counts included, so lines of different compiles align), the skeleton-fallback
+/// reasons when there are any, and the transfer base substitutions.
+#[must_use]
+pub(crate) fn blend_stats_summary(stats: &BlendStats) -> String {
+    let mut text = format!(
+        "glyphs={} copied={} compatible={} matched={} sdf={} no_blend={} skeleton={} skeleton_fallback={} transfer={} \
+         transfer_base_substituted={}",
+        stats.glyphs(),
+        stats.copied,
+        stats.compatible,
+        stats.matched,
+        stats.sdf,
+        stats.no_blend,
+        stats.skeleton,
+        stats.skeleton_fallback,
+        stats.transfer,
+        stats.transfer_base_substituted
+    );
+    if !stats.skeleton_fallback_reasons.is_empty() {
+        let reasons: Vec<String> =
+            stats.skeleton_fallback_reasons.iter().map(|(reason, count)| format!("{reason}={count}")).collect();
+        text.push_str(&format!(" skeleton_fallback_reasons=[{}]", reasons.join(", ")));
+    }
+    text
 }
 
 /// Why a custom face is not available.
@@ -540,12 +568,15 @@ impl CustomFontService {
             }
             CustomFontError::from(err)
         })?;
+        // The one log of a full face's blend paths: every full compile passes here (editor
+        // commit, layer load, export), while a disk-cache hit has no compile to report.
         runtime_log::log_info(format!(
-            "typing: compiled custom font {} ({} bytes, {} characters) in {:.2} s",
+            "typing: compiled custom font {} ({} bytes, {} characters) in {:.2} s; blend paths: {}",
             compiled.postscript_name,
             compiled.bytes.len(),
             compiled.report.total_chars,
-            started.elapsed().as_secs_f64()
+            started.elapsed().as_secs_f64(),
+            blend_stats_summary(&compiled.stats)
         ));
         if compiled.key != key {
             // Both sides hash the same inputs with the same function; a mismatch means the

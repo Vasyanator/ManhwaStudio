@@ -60,8 +60,10 @@ pub enum CompileError {
         /// Glyphs required (including `.notdef`).
         count: usize,
     },
-    /// One glyph's outline cannot be stored (coordinates beyond the 16-bit range or too many
-    /// points); `ch` is the first character mapped to it.
+    /// One glyph's outline cannot be stored or blended (coordinates beyond the 16-bit range,
+    /// too many points to store, an aligned extent too large to blend, or more flattened
+    /// points than the blend work budget); `ch` is the first character mapped to it. Fails
+    /// the whole compile.
     #[error("glyph for U+{:04X} cannot be stored: {reason}", u32::from(*ch))]
     GlyphTooComplex {
         /// First character mapped to the glyph.

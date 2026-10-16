@@ -13,7 +13,7 @@ Key structures:
 - `TtPoint` / `TtContour`: quantized TrueType points (on/off-curve, `i16`).
 
 Key functions:
-- `reverse_contour`, `flatten_contour`.
+- `reverse_contour`, `flatten_contour` / `flatten_contour_within` (point-budgeted).
 - `to_truetype`: cubic -> quadratic (`kurbo`), rounding with range checks, cleanup of
   degenerate points and contours.
 
@@ -168,16 +168,41 @@ pub(crate) fn reverse_contour(contour: &Contour) -> Contour {
 /// Flattens a contour into a closed polygon (the start is not repeated at the end) whose
 /// deviation from the curves is at most about `tolerance` units.
 pub(crate) fn flatten_contour(contour: &Contour, tolerance: f64, out: &mut Vec<Point>) {
+    // With `usize::MAX` as the limit the check can never fire (`out` would exhaust memory long
+    // before), so the result carries no information here.
+    let unlimited = flatten_contour_within(contour, tolerance, usize::MAX, out);
+    debug_assert!(unlimited.is_ok(), "an unlimited flatten cannot exceed its limit");
+}
+
+/// The flattening of `flatten_contour` exceeded the caller's point limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PointLimitExceeded;
+
+/// `flatten_contour`, but checked against a point budget: the points of each segment are
+/// counted BEFORE they are computed or pushed, so `out` never grows beyond `limit` points and
+/// the work done is bounded by `limit` (plus one step count per segment). Within the limit the
+/// output is identical to `flatten_contour`'s.
+///
+/// # Errors
+/// `PointLimitExceeded` when the polygon would need more than `limit` points; `out` then holds
+/// a partial polygon of at most `limit` points that the caller must discard.
+pub(crate) fn flatten_contour_within(contour: &Contour, tolerance: f64, limit: usize, out: &mut Vec<Point>) -> Result<(), PointLimitExceeded> {
     out.clear();
+    let reserve = |out: &Vec<Point>, needed: usize| if out.len().saturating_add(needed) > limit { Err(PointLimitExceeded) } else { Ok(()) };
+    reserve(out, 1)?;
     out.push(contour.start);
     let mut current = contour.start;
     for seg in &contour.segs {
         match *seg {
-            Seg::Line(end) => out.push(end),
+            Seg::Line(end) => {
+                reserve(out, 1)?;
+                out.push(end);
+            }
             Seg::Quad(control, end) => {
                 // Max deviation of a uniform n-split is |p0 - 2p1 + p2| / (4 n^2).
                 let deviation = (current.to_vec2() - 2.0 * control.to_vec2() + end.to_vec2()).hypot();
                 let steps = subdivision_count(deviation / (4.0 * tolerance));
+                reserve(out, usize::try_from(steps).unwrap_or(usize::MAX))?;
                 for step in 1..steps {
                     let t = f64::from(step) / f64::from(steps);
                     let mt = 1.0 - t;
@@ -192,6 +217,7 @@ pub(crate) fn flatten_contour(contour: &Contour, tolerance: f64, out: &mut Vec<P
                 let d1 = (current.to_vec2() - 2.0 * control1.to_vec2() + control2.to_vec2()).hypot();
                 let d2 = (control1.to_vec2() - 2.0 * control2.to_vec2() + end.to_vec2()).hypot();
                 let steps = subdivision_count(0.75 * d1.max(d2) / tolerance);
+                reserve(out, usize::try_from(steps).unwrap_or(usize::MAX))?;
                 for step in 1..steps {
                     let t = f64::from(step) / f64::from(steps);
                     let mt = 1.0 - t;
@@ -210,6 +236,7 @@ pub(crate) fn flatten_contour(contour: &Contour, tolerance: f64, out: &mut Vec<P
     if out.len() > 1 && out.last() == Some(&contour.start) {
         out.pop();
     }
+    Ok(())
 }
 
 /// `ceil(sqrt(ratio))` clamped to `1..=64`, as an exact small integer.

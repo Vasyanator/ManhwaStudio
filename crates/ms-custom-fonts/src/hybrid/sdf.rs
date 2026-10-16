@@ -13,6 +13,8 @@ Key functions:
 - `blend`: outlines + weights -> blended `Outline`.
 - `signed_distance_field`: exact-seeded vector-propagated distances, nonzero-winding sign.
 - `marching_squares`: oriented zero-level loops (inside on the right => outer contours CW).
+- `offset_outline`: one outline grown / thinned by separate horizontal and vertical offsets
+  (level set of its own field; used by the parameter transfer).
 
 Notes:
 - Alignment (per glyph): x either "natural" (scaled by blended advance / own advance) or
@@ -38,12 +40,19 @@ Notes:
   extreme advances cannot make grid sizing spin.
 - Determinism: sources are summed in recipe order; every node is computed independently of
   thread scheduling.
+- Bounded input: every raster path flattens through `flatten_checked` with
+  `MAX_FLATTENED_POINTS` (4x the largest bundled glyph), rejecting a too-dense outline while
+  flattening (`TooManyPoints`, also `GlyphTooComplex`).
+- Crate-visible raster kit (reused by the other blend paths, never duplicated there):
+  `flatten_checked` (`flatten` is the unbudgeted test reference), `bounds` / `checked_bounds` (`Bounds`, `ExtentTooLarge::of`), `choose_alignment`
+  (`AxisMap::apply`), `grid_for` (`Grid`), `signed_distance_field`, `winding_inside`,
+  `marching_squares`.
 */
 
 use kurbo::Point;
 
 use crate::hybrid::trace;
-use crate::outline::{Outline, flatten_contour};
+use crate::outline::{Outline, flatten_contour_within};
 
 /// Grid cell size in font units (1000 per em).
 pub(crate) const SDF_CELL_UNITS: f64 = 4.0;
@@ -65,6 +74,9 @@ const ALIGNMENT_CELL_UNITS: f64 = 8.0;
 /// absurd source metrics (tiny units per em, extreme advances scaling the natural alignment)
 /// are rejected before any grid work.
 const MAX_BLEND_EXTENT_UNITS: f64 = 262_144.0;
+/// Largest axis stretch of one anisotropic `offset_outline` pass (also the stretch of its
+/// second pass when the offsets cannot share one).
+const MAX_OFFSET_ANISOTROPY: f64 = 8.0;
 /// Cell doublings `grid_for` tries. Within `MAX_BLEND_EXTENT_UNITS` at most ~6 are needed; the
 /// bound only guarantees termination.
 const MAX_COARSENING_STEPS: u32 = 32;
@@ -80,6 +92,34 @@ pub(crate) struct ExtentTooLarge {
     pub height: f64,
 }
 
+/// Most flattened points one source outline may have in the raster paths (distance-field
+/// blend, offset, skeleton analysis): 4x the largest glyph of every bundled `fonts/ui` face
+/// (8302, `PlangothicP2`; Source Han Sans K 2011, `HanaMinA` 1038, Noto Emoji 7972), so no real
+/// glyph is affected, while a hostile outline (tens of thousands of tiny contours, curves
+/// flattening 64-fold) is rejected while it is flattened, before any grid work. Raster work is
+/// then bounded by this budget times the grid size.
+pub(crate) const MAX_FLATTENED_POINTS: usize = 1 << 15;
+
+/// An outline flattens to more than `MAX_FLATTENED_POINTS` points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("the outline flattens to more than {limit} points, beyond the limit of the distance-field blend")]
+pub(crate) struct TooManyPoints {
+    /// The budget that was exceeded.
+    pub limit: usize,
+}
+
+/// Why the distance-field blend refused a glyph. `Display` is the reason text of
+/// `CompileError::GlyphTooComplex`.
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+pub(crate) enum BlendRejection {
+    /// The aligned glyph is too large or not finite.
+    #[error(transparent)]
+    Extent(#[from] ExtentTooLarge),
+    /// A source outline is too dense.
+    #[error(transparent)]
+    TooManyPoints(#[from] TooManyPoints),
+}
+
 /// Node lattice: node `(i, j)` sits at `(x0 + i * cell, y0 + j * cell)`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Grid {
@@ -91,10 +131,12 @@ pub(crate) struct Grid {
 }
 
 impl Grid {
-    fn x(&self, i: usize) -> f64 {
+    /// x of node column `i`.
+    pub(crate) fn x(&self, i: usize) -> f64 {
         self.x0 + index_f64(i) * self.cell
     }
-    fn y(&self, j: usize) -> f64 {
+    /// y of node row `j`.
+    pub(crate) fn y(&self, j: usize) -> f64 {
         self.y0 + index_f64(j) * self.cell
     }
 }
@@ -106,21 +148,22 @@ fn index_f64(index: usize) -> f64 {
 
 /// Axis-aligned box.
 #[derive(Debug, Clone, Copy)]
-struct Bounds {
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
+pub(crate) struct Bounds {
+    pub(crate) x0: f64,
+    pub(crate) y0: f64,
+    pub(crate) x1: f64,
+    pub(crate) y1: f64,
 }
 
 /// Blends non-empty outlines (`weights` sum to 1) through their distance fields. `advances`
 /// are the sources' advances (normalized units), used by the natural horizontal alignment.
 ///
 /// # Errors
-/// `ExtentTooLarge` when every candidate alignment yields outlines beyond
+/// `BlendRejection::TooManyPoints` when a source flattens beyond `MAX_FLATTENED_POINTS`;
+/// `BlendRejection::Extent` when every candidate alignment yields outlines beyond
 /// `MAX_BLEND_EXTENT_UNITS` (or with non-finite coordinates).
-pub(crate) fn blend(outlines: &[&Outline], weights: &[f64], advances: &[f64]) -> Result<Outline, ExtentTooLarge> {
-    let raw: Vec<Vec<Vec<Point>>> = outlines.iter().map(|outline| flatten(outline)).collect();
+pub(crate) fn blend(outlines: &[&Outline], weights: &[f64], advances: &[f64]) -> Result<Outline, BlendRejection> {
+    let raw = outlines.iter().map(|outline| flatten_checked(outline, MAX_FLATTENED_POINTS)).collect::<Result<Vec<_>, _>>()?;
     let Some(alignment) = choose_alignment(&raw, weights, advances)? else {
         return Ok(Vec::new());
     };
@@ -141,18 +184,90 @@ pub(crate) fn blend(outlines: &[&Outline], weights: &[f64], advances: &[f64]) ->
     Ok(trace::fit_loops(loops, grid.cell))
 }
 
+/// Offsets an outline's boundary by `dx` font units horizontally and `dy` vertically: a
+/// vertical stem gets `2 * dx` wider, a horizontal stem `2 * dy` thicker; negative values thin.
+/// The result is the shifted zero level set of the outline's distance field, re-fitted by
+/// `trace::fit_loops` (corners come out slightly rounded); `(0, 0)` returns the outline as is.
+///
+/// Anisotropy without a second distance metric: the Euclidean field of the outline stretched
+/// by `k` along one axis, offset by `e` and unstretched, moves edges across that axis by
+/// `e / k` and along it by `e`. Offsets of the same sign with a ratio up to
+/// `MAX_OFFSET_ANISOTROPY` take one such pass (the axis with the SMALLER offset is stretched,
+/// so no axis loses resolution); otherwise (opposite signs, a zero, a larger ratio) an
+/// isotropic pass `a` is followed by a pass with x stretched by `MAX_OFFSET_ANISOTROPY`, both
+/// solved so the stems land exactly on `dx` / `dy`. Work per pass is bounded by
+/// `MAX_GRID_NODES` (the stretched glyph is gridded like a blended one).
+///
+/// # Errors
+/// `ExtentTooLarge` when an offset is not finite or the (stretched, grown) outline exceeds
+/// `MAX_BLEND_EXTENT_UNITS` or has non-finite coordinates.
+pub(crate) fn offset_outline(outline: &Outline, dx: f64, dy: f64) -> Result<Outline, BlendRejection> {
+    if !(dx.is_finite() && dy.is_finite()) {
+        return Err(ExtentTooLarge { width: dx, height: dy }.into());
+    }
+    if dx.abs() < f64::EPSILON && dy.abs() < f64::EPSILON {
+        return Ok(outline.clone());
+    }
+    let polygons = flatten_checked(outline, MAX_FLATTENED_POINTS)?;
+    let (small, large) = if dx.abs() <= dy.abs() { (dx, dy) } else { (dy, dx) };
+    let (loops, cell) = if dx * dy > 0.0 && large / small <= MAX_OFFSET_ANISOTROPY {
+        // One pass: stretch the axis with the smaller offset by `large / small` (>= 1).
+        let stretch = large / small;
+        if dx.abs() <= dy.abs() { offset_pass(&polygons, stretch, 1.0, dy)? } else { offset_pass(&polygons, 1.0, stretch, dx)? }
+    } else {
+        // Two passes, x stretched by K in the second: vertical stems move by `a + delta / K`
+        // (= dx), horizontal stems by `a + delta` (= dy). The first pass's level-set loops feed
+        // the second directly, so the curve fit (and its tolerance) is paid once.
+        let k = MAX_OFFSET_ANISOTROPY;
+        let delta = (dy - dx) * k / (k - 1.0);
+        let isotropic = dx - delta / k;
+        let first = if isotropic.abs() < f64::EPSILON { polygons } else { offset_pass(&polygons, 1.0, 1.0, isotropic)?.0 };
+        offset_pass(&first, k, 1.0, delta)?
+    };
+    Ok(trace::fit_loops(loops, cell))
+}
+
+/// One offset pass: `polygons` scaled by `(sx, sy)`, their distance field shifted by `offset`
+/// units, and the zero level set mapped back by `(1 / sx, 1 / sy)`: oriented loops (inside on
+/// the right) and the grid cell they were sampled with.
+fn offset_pass(polygons: &[Vec<Point>], sx: f64, sy: f64, offset: f64) -> Result<(Vec<Vec<Point>>, f64), ExtentTooLarge> {
+    let stretched: Vec<Vec<Point>> = polygons.iter().map(|polygon| polygon.iter().map(|point| Point::new(point.x * sx, point.y * sy)).collect()).collect();
+    let Some(ink) = checked_bounds(&stretched)? else {
+        return Ok((Vec::new(), SDF_CELL_UNITS));
+    };
+    // The grid must hold the grown outline plus the usual margin, or loops would hit its border.
+    let grow = offset.max(0.0);
+    let target = Bounds { x0: ink.x0 - grow, y0: ink.y0 - grow, x1: ink.x1 + grow, y1: ink.y1 + grow };
+    let grid = grid_for(target, SDF_CELL_UNITS).ok_or_else(|| ExtentTooLarge::of(target))?;
+    let mut field = signed_distance_field(&stretched, &grid);
+    for value in &mut field {
+        *value -= offset;
+    }
+    let loops: Vec<Vec<Point>> = marching_squares(&field, &grid)
+        .into_iter()
+        .map(|polyline| polyline.into_iter().map(|point| Point::new(point.x / sx, point.y / sy)).collect())
+        .collect();
+    Ok((loops, grid.cell))
+}
+
 impl ExtentTooLarge {
-    fn of(bounds: Bounds) -> Self {
+    /// The rejection naming `bounds`' extent.
+    pub(crate) fn of(bounds: Bounds) -> Self {
         Self { width: bounds.x1 - bounds.x0, height: bounds.y1 - bounds.y0 }
     }
 }
 
-/// `bounds`, rejecting a box that is not finite or exceeds `MAX_BLEND_EXTENT_UNITS` on an
-/// axis. `Ok(None)` when there are no points.
-fn checked_bounds(polygons: &[Vec<Point>]) -> Result<Option<Bounds>, ExtentTooLarge> {
+/// `bounds`, rejecting any non-finite point and a box that exceeds `MAX_BLEND_EXTENT_UNITS` on
+/// an axis. `Ok(None)` when there are no points.
+pub(crate) fn checked_bounds(polygons: &[Vec<Point>]) -> Result<Option<Bounds>, ExtentTooLarge> {
     let Some(found) = bounds(polygons) else {
         return Ok(None);
     };
+    // `bounds` folds with `f64::min` / `max`, which skip NaN, so a NaN point would leave a
+    // finite box behind: every point is checked.
+    if polygons.iter().flatten().any(|point| !(point.x.is_finite() && point.y.is_finite())) {
+        return Err(ExtentTooLarge { width: f64::NAN, height: f64::NAN });
+    }
     let error = ExtentTooLarge::of(found);
     // `!(x <= max)` also rejects NaN; infinite corners make the extent infinite or NaN.
     let within = |extent: f64| extent.is_finite() && extent <= MAX_BLEND_EXTENT_UNITS;
@@ -165,7 +280,7 @@ fn checked_bounds(polygons: &[Vec<Point>]) -> Result<Option<Bounds>, ExtentTooLa
 
 /// Per-axis affine map `p -> (sx * x + ox, sy * y + oy)` of one source.
 #[derive(Debug, Clone, Copy)]
-struct AxisMap {
+pub(crate) struct AxisMap {
     sx: f64,
     ox: f64,
     sy: f64,
@@ -173,7 +288,8 @@ struct AxisMap {
 }
 
 impl AxisMap {
-    fn apply(&self, polygons: &[Vec<Point>]) -> Vec<Vec<Point>> {
+    /// The polygons mapped through this source's alignment.
+    pub(crate) fn apply(&self, polygons: &[Vec<Point>]) -> Vec<Vec<Point>> {
         polygons
             .iter()
             .map(|polygon| polygon.iter().map(|point| Point::new(point.x * self.sx + self.ox, point.y * self.sy + self.oy)).collect())
@@ -202,7 +318,7 @@ const ALIGNMENTS: [(AxisAlign, AxisAlign); 4] = [
 /// (weighted mean pairwise intersection-over-union on a coarse lattice), and returns each
 /// source's map. `Ok(None)` when no source has ink. A candidate whose aligned outlines exceed
 /// `MAX_BLEND_EXTENT_UNITS` is skipped; `Err` when every candidate does.
-fn choose_alignment(raw: &[Vec<Vec<Point>>], weights: &[f64], advances: &[f64]) -> Result<Option<Vec<AxisMap>>, ExtentTooLarge> {
+pub(crate) fn choose_alignment(raw: &[Vec<Vec<Point>>], weights: &[f64], advances: &[f64]) -> Result<Option<Vec<AxisMap>>, ExtentTooLarge> {
     let Some(boxes) = raw.iter().map(|polygons| bounds(polygons)).collect::<Option<Vec<Bounds>>>() else {
         return Ok(None);
     };
@@ -303,7 +419,7 @@ fn axis_map(from0: f64, from1: f64, to0: f64, to1: f64) -> (f64, f64) {
 /// doubled) for oversized glyphs. `None` when even `MAX_COARSENING_STEPS` doublings do not fit
 /// `MAX_GRID_NODES` (only for targets beyond `MAX_BLEND_EXTENT_UNITS` or non-finite ones,
 /// which callers reject before).
-fn grid_for(target: Bounds, cell: f64) -> Option<Grid> {
+pub(crate) fn grid_for(target: Bounds, cell: f64) -> Option<Grid> {
     let mut cell = cell;
     for _ in 0..=MAX_COARSENING_STEPS {
         let margin = MARGIN_CELLS * cell;
@@ -340,12 +456,14 @@ fn cells_to_cover(extent: f64, cell: f64) -> usize {
     whole + 1
 }
 
-/// Flattened closed polygons of an outline.
-fn flatten(outline: &Outline) -> Vec<Vec<Point>> {
+/// Flattened closed polygons of an outline, without a budget (tests compare against it; every
+/// runtime path uses `flatten_checked`).
+#[cfg(test)]
+pub(crate) fn flatten(outline: &Outline) -> Vec<Vec<Point>> {
     let mut polygons = Vec::with_capacity(outline.len());
     for contour in outline {
         let mut polygon = Vec::new();
-        flatten_contour(contour, FLATTEN_TOLERANCE, &mut polygon);
+        crate::outline::flatten_contour(contour, FLATTEN_TOLERANCE, &mut polygon);
         if polygon.len() >= 2 {
             polygons.push(polygon);
         }
@@ -353,8 +471,28 @@ fn flatten(outline: &Outline) -> Vec<Vec<Point>> {
     polygons
 }
 
+/// `flatten` with a budget of `limit` points over all contours, enforced while flattening
+/// (`flatten_contour_within`), so a hostile outline costs at most `limit` points of work and
+/// memory. Within the budget the polygons equal `flatten`'s.
+///
+/// # Errors
+/// `TooManyPoints` when the outline needs more than `limit` points.
+pub(crate) fn flatten_checked(outline: &Outline, limit: usize) -> Result<Vec<Vec<Point>>, TooManyPoints> {
+    let mut polygons = Vec::with_capacity(outline.len().min(limit));
+    let mut used = 0_usize;
+    for contour in outline {
+        let mut polygon = Vec::new();
+        flatten_contour_within(contour, FLATTEN_TOLERANCE, limit.saturating_sub(used), &mut polygon).map_err(|_| TooManyPoints { limit })?;
+        used += polygon.len();
+        if polygon.len() >= 2 {
+            polygons.push(polygon);
+        }
+    }
+    Ok(polygons)
+}
+
 /// Bounding box of polygons, `None` when empty.
-fn bounds(polygons: &[Vec<Point>]) -> Option<Bounds> {
+pub(crate) fn bounds(polygons: &[Vec<Point>]) -> Option<Bounds> {
     let mut points = polygons.iter().flatten();
     let first = points.next()?;
     Some(points.fold(Bounds { x0: first.x, y0: first.y, x1: first.x, y1: first.y }, |acc, point| Bounds {
@@ -511,7 +649,7 @@ fn propagate(grid: &Grid, nearest: &mut [Point], dist2: &mut [f64]) {
 }
 
 /// Nonzero-winding inside flags of every node, by per-row scanline crossings.
-fn winding_inside(polygons: &[Vec<Point>], grid: &Grid) -> Vec<bool> {
+pub(crate) fn winding_inside(polygons: &[Vec<Point>], grid: &Grid) -> Vec<bool> {
     let mut inside = vec![false; grid.nx * grid.ny];
     let mut crossings: Vec<(f64, i32)> = Vec::new();
     for j in 0..grid.ny {
@@ -667,6 +805,23 @@ mod tests {
         assert!((blended_box.y0 - 0.0).abs() < 1.0 && (blended_box.y1 - 700.0).abs() < 1.0);
     }
 
+    #[test]
+    fn offsets_move_each_axis_by_its_own_amount() {
+        let outline = square(100.0, 0.0, 300.0, 700.0);
+        // Isotropic, same-sign anisotropic (one pass), opposite signs and a zero (two passes).
+        for (dx, dy) in [(10.0, 10.0), (6.0, 24.0), (-12.0, -3.0), (10.0, -8.0), (0.0, 15.0)] {
+            let grown = offset_outline(&outline, dx, dy).expect("in range");
+            let found = bounds(&flatten(&grown)).expect("ink");
+            let wanted = [100.0 - dx, -dy, 300.0 + dx, 700.0 + dy];
+            for (value, expected) in [found.x0, found.y0, found.x1, found.y1].into_iter().zip(wanted) {
+                assert!((value - expected).abs() < 1.0, "offset ({dx}, {dy}): {found:?}");
+            }
+        }
+        assert_eq!(offset_outline(&outline, 0.0, 0.0), Ok(outline.clone()));
+        assert!(offset_outline(&outline, f64::NAN, 1.0).is_err());
+        assert!(offset_outline(&square(0.0, 0.0, 1.0e12, 10.0), 5.0, 5.0).is_err());
+    }
+
     /// The linear count `cells_to_cover` replaced, kept as the reference it must reproduce.
     fn reference_cells_to_cover(extent: f64, cell: f64) -> usize {
         let cells = (extent / cell).ceil();
@@ -717,5 +872,39 @@ mod tests {
         // Non-finite coordinates never reach the grid.
         let broken = square(0.0, 0.0, f64::INFINITY, 100.0);
         assert!(blend(&[&broken, &small], &[0.5, 0.5], &[500.0, 500.0]).is_err());
+        // NaN is skipped by min / max, so it is rejected point by point.
+        let nan = square(0.0, 0.0, f64::NAN, 100.0);
+        assert!(checked_bounds(&flatten(&nan)).is_err());
+        assert!(blend(&[&nan, &small], &[0.5, 0.5], &[500.0, 500.0]).is_err());
+        assert!(offset_outline(&nan, 5.0, 5.0).is_err());
+    }
+
+    #[test]
+    fn dense_outlines_are_refused_while_flattening() {
+        use crate::outline::flatten_contour_within;
+        // One contour of 2000 cubics that each flatten into 64 points (128 000 points).
+        let wavy = Contour {
+            start: Point::new(0.0, 0.0),
+            segs: (0..2000)
+                .map(|k| {
+                    let x = f64::from(k + 1);
+                    Seg::Cubic(Point::new(x - 0.7, 5000.0), Point::new(x - 0.3, -5000.0), Point::new(x, 0.0))
+                })
+                .collect(),
+        };
+        let mut polygon = Vec::new();
+        assert!(flatten_contour_within(&wavy, FLATTEN_TOLERANCE, MAX_FLATTENED_POINTS, &mut polygon).is_err());
+        // The budget is enforced before points are pushed: the partial polygon stays within it.
+        assert!(polygon.len() <= MAX_FLATTENED_POINTS);
+        let outline = vec![wavy];
+        assert_eq!(flatten_checked(&outline, MAX_FLATTENED_POINTS), Err(TooManyPoints { limit: MAX_FLATTENED_POINTS }));
+        let small = square(0.0, 0.0, 100.0, 100.0);
+        assert!(matches!(blend(&[&outline, &small], &[0.5, 0.5], &[2000.0, 200.0]), Err(BlendRejection::TooManyPoints(_))));
+        assert!(offset_outline(&outline, 5.0, 5.0).is_err());
+        // Tens of thousands of tiny contours: the budget spans all contours of the outline.
+        let tiny: Outline = (0..21_845).flat_map(|k| square(f64::from(k % 200) * 4.0, f64::from(k / 200) * 4.0, f64::from(k % 200) * 4.0 + 2.0, f64::from(k / 200) * 4.0 + 2.0)).collect();
+        assert!(matches!(blend(&[&tiny, &small], &[0.5, 0.5], &[800.0, 200.0]), Err(BlendRejection::TooManyPoints(_))));
+        // Within the budget the checked flatten equals the plain one.
+        assert_eq!(flatten_checked(&small, MAX_FLATTENED_POINTS), Ok(flatten(&small)));
     }
 }

@@ -8,7 +8,10 @@ from `CARGO_MANIFEST_DIR`. A test whose font is absent logs one line and returns
 Covers: deterministic bytes (repeat, 1 vs N threads), output parses and maps every included
 character, `Disable` / `NoInfluence`, single-source reproduction, near-1:0 weights, kerning
 inheritance rules, preview naming, cancel, source matching errors, loading + rendering
-through `ms-text-render`, and baked own kerning (`with_kerning_overrides`) reaching the shaper.
+through `ms-text-render`, baked own kerning (`with_kerning_overrides`) reaching the shaper,
+property weights (split equal to plain = same glyph tables; shapes and spacing from different
+sources) and the algorithm dispatch (`Sdf`, `NoBlend`, `Skeleton` / `Transfer` path counts,
+`BlendStats` sums).
 */
 
 use std::collections::BTreeSet;
@@ -20,8 +23,9 @@ use kurbo::Point;
 
 use crate::outline::{Outline, OutlineCollector, flatten_contour};
 use crate::{
-    CompileError, CompileScope, CompiledFont, CustomFontKind, CustomFontRecipe, HybridParams, HybridSource,
-    KerningPairPerMille, MissingGlyphPolicy, SourceFont, compile, coverage_report, included_chars, with_kerning_overrides,
+    BlendAlgorithm, CompileError, CompileScope, CompiledFont, CustomFontKind, CustomFontRecipe, HybridParams, HybridSource,
+    KerningPairPerMille, MissingGlyphPolicy, PropertyWeights, SourceFont, compile, coverage_report, included_chars,
+    with_kerning_overrides,
 };
 
 const NOTO_REGULAR: &str = "core/00-NotoSans-Regular.ttf";
@@ -48,6 +52,8 @@ fn recipe(sources: &[(&str, f32, Option<MissingGlyphPolicy>)], missing_default: 
                 .map(|&(identity, weight, missing_override)| HybridSource { identity: identity.to_owned(), weight, missing_override })
                 .collect(),
             missing_default,
+            algorithm: BlendAlgorithm::Auto,
+            property_weights: None,
         }),
     }
 }
@@ -570,4 +576,192 @@ fn three_and_four_sources_compile() {
     let face = ttf_parser::Face::parse(&compiled.bytes, 0).expect("valid");
     assert!(face.glyph_index('한').is_none(), "missing in three sources with Disable");
     assert!(face.glyph_index('g').is_some());
+}
+
+/// `recipe` with an algorithm and property weights.
+fn recipe_with(
+    sources: &[(&str, f32, Option<MissingGlyphPolicy>)],
+    missing_default: MissingGlyphPolicy,
+    algorithm: BlendAlgorithm,
+    property_weights: Option<Vec<PropertyWeights>>,
+) -> CustomFontRecipe {
+    let mut built = recipe(sources, missing_default);
+    let CustomFontKind::Hybrid(params) = &mut built.kind;
+    params.algorithm = algorithm;
+    params.property_weights = property_weights;
+    built
+}
+
+/// The raw bytes of table `tag` of an sfnt file, `None` when absent.
+fn table(font: &[u8], tag: [u8; 4]) -> Option<&[u8]> {
+    let count = usize::from(u16::from_be_bytes([*font.get(4)?, *font.get(5)?]));
+    (0..count).find_map(|index| {
+        let record = font.get(12 + 16 * index..28 + 16 * index)?;
+        if record[..4] != tag {
+            return None;
+        }
+        let read = |at: usize| usize::try_from(u32::from_be_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])).ok();
+        let (offset, length) = (read(8)?, read(12)?);
+        font.get(offset..offset + length)
+    })
+}
+
+/// Compiled glyphs of a face (every glyph but `.notdef`).
+fn compiled_glyphs(compiled: &CompiledFont) -> usize {
+    usize::from(ttf_parser::Face::parse(&compiled.bytes, 0).expect("valid").number_of_glyphs()) - 1
+}
+
+#[test]
+fn property_weights_equal_to_the_plain_weights_produce_the_same_glyphs() {
+    let (Some(regular), Some(han)) = (bundled(NOTO_REGULAR), bundled(SOURCE_HAN)) else {
+        return;
+    };
+    let set = chars("AaBgQ@&8ЖжЯ한글 AV");
+    let sources = [source("Noto", &regular, &[]), source("Han", &han, &[])];
+    let plain = recipe(&[("Noto", 0.6, None), ("Han", 0.4, None)], MissingGlyphPolicy::NoInfluence);
+    let same = Some(vec![
+        PropertyWeights { shape: 0.6, spacing: 0.6, kerning: 0.6 },
+        PropertyWeights { shape: 0.4, spacing: 0.4, kerning: 0.4 },
+    ]);
+    let split = recipe_with(&[("Noto", 0.6, None), ("Han", 0.4, None)], MissingGlyphPolicy::NoInfluence, BlendAlgorithm::Auto, same);
+    let (a, b) = (run(&plain, &sources, CompileScope::Subset(&set)), run(&split, &sources, CompileScope::Subset(&set)));
+    // The names (and `head`'s whole-file checksum) carry the key, which differs by the kind
+    // tag; every table the blend produces must be byte-identical.
+    assert_ne!(a.key, b.key);
+    for tag in [b"glyf", b"loca", b"hmtx", b"hhea", b"kern", b"cmap", b"OS/2", b"maxp", b"post"] {
+        let (left, right) = (table(&a.bytes, *tag), table(&b.bytes, *tag));
+        assert!(left.is_some() || tag == b"kern", "table {} present", String::from_utf8_lossy(tag));
+        assert_eq!(left, right, "table {} differs", String::from_utf8_lossy(tag));
+    }
+    assert_eq!(a.stats, b.stats);
+}
+
+#[test]
+fn shapes_from_one_source_and_spacing_from_another() {
+    let (Some(regular), Some(bold)) = (bundled(NOTO_REGULAR), bundled(NOTO_BOLD)) else {
+        return;
+    };
+    let set = chars("lonH");
+    let weights = Some(vec![
+        PropertyWeights { shape: 1.0, spacing: 0.0001, kerning: 1.0 },
+        PropertyWeights { shape: 0.0001, spacing: 1.0, kerning: 1.0 },
+    ]);
+    let recipe = recipe_with(&[("Regular", 1.0, None), ("Bold", 1.0, None)], MissingGlyphPolicy::Disable, BlendAlgorithm::Auto, weights);
+    let compiled = run(&recipe, &[source("Regular", &regular, &[]), source("Bold", &bold, &[])], CompileScope::Subset(&set));
+    let face = ttf_parser::Face::parse(&compiled.bytes, 0).expect("valid");
+    let bold_face = ttf_parser::Face::parse(&bold, 0).expect("valid");
+    let advance = |face: &ttf_parser::Face<'_>, ch: char| face.glyph_index(ch).and_then(|glyph| face.glyph_hor_advance(glyph)).map(i32::from);
+    for ch in set {
+        let (mixed, spacing_source) = (advance(&face, ch).expect("mapped"), advance(&bold_face, ch).expect("mapped"));
+        assert!((mixed - spacing_source).abs() <= 1, "{ch}: advance {mixed} follows the spacing source's {spacing_source}");
+        let distance = hausdorff(&outline_of(&compiled.bytes, ch).expect("ink"), &outline_of(&regular, ch).expect("ink"));
+        assert!(distance < 2.0, "{ch}: outline follows the shape source within 2 units, got {distance}");
+    }
+}
+
+#[test]
+fn no_blend_copies_the_heaviest_source_and_ties_go_to_recipe_order() {
+    let (Some(regular), Some(bold)) = (bundled(NOTO_REGULAR), bundled(NOTO_BOLD)) else {
+        return;
+    };
+    let set = chars("lonH");
+    let compile_no_blend = |sources: &[(&str, f32, Option<MissingGlyphPolicy>)], fonts: &[SourceFont<'_>]| {
+        run(&recipe_with(sources, MissingGlyphPolicy::Disable, BlendAlgorithm::NoBlend, None), fonts, CompileScope::Subset(&set))
+    };
+    let regular_first = [source("Regular", &regular, &[]), source("Bold", &bold, &[])];
+    let bold_first = [source("Bold", &bold, &[]), source("Regular", &regular, &[])];
+    let cases: [(CompiledFont, &[u8], &[u8]); 3] = [
+        (compile_no_blend(&[("Regular", 1.0, None), ("Bold", 3.0, None)], &regular_first), &bold, &regular),
+        (compile_no_blend(&[("Regular", 1.0, None), ("Bold", 1.0, None)], &regular_first), &regular, &bold),
+        (compile_no_blend(&[("Bold", 1.0, None), ("Regular", 1.0, None)], &bold_first), &bold, &regular),
+    ];
+    for (compiled, winner, loser) in &cases {
+        assert_eq!(compiled.stats.no_blend, compiled_glyphs(compiled));
+        for ch in set.iter().copied() {
+            let output = outline_of(&compiled.bytes, ch).expect("ink");
+            let copied = hausdorff(&output, &outline_of(winner, ch).expect("ink"));
+            assert!(copied < 0.75, "{ch}: the winner's outline is copied (quantization only), got {copied}");
+            assert!(hausdorff(&output, &outline_of(loser, ch).expect("ink")) > 5.0, "{ch}: not the other source");
+        }
+    }
+}
+
+#[test]
+fn forced_sdf_and_the_stats_count_every_glyph() {
+    let (Some(regular), Some(bold)) = (bundled(NOTO_REGULAR), bundled(NOTO_BOLD)) else {
+        return;
+    };
+    let sources = [source("Regular", &regular, &[]), source("Bold", &bold, &[])];
+    let inked = chars("lonH");
+    let auto = run(&recipe(&[("Regular", 1.0, None), ("Bold", 1.0, None)], MissingGlyphPolicy::Disable), &sources, CompileScope::Subset(&inked));
+    assert!(auto.stats.compatible + auto.stats.matched > 0, "same-family glyphs interpolate under Auto: {:?}", auto.stats);
+    assert_eq!(auto.stats.sdf + auto.stats.compatible + auto.stats.matched, compiled_glyphs(&auto));
+    let forced = recipe_with(&[("Regular", 1.0, None), ("Bold", 1.0, None)], MissingGlyphPolicy::Disable, BlendAlgorithm::Sdf, None);
+    let sdf = run(&forced, &sources, CompileScope::Subset(&inked));
+    assert_eq!(sdf.stats.sdf, compiled_glyphs(&sdf));
+    assert_ne!(table(&sdf.bytes, *b"glyf"), table(&auto.bytes, *b"glyf"));
+    // With a space (no ink anywhere) the copy count joins in; the counts add up to the glyphs.
+    let with_space = chars("lo H");
+    let sdf = run(&forced, &sources, CompileScope::Subset(&with_space));
+    assert_eq!((sdf.stats.copied, sdf.stats.sdf), (1, 3));
+    assert_eq!(sdf.stats.glyphs(), compiled_glyphs(&sdf));
+}
+
+#[test]
+fn skeleton_and_transfer_count_their_paths() {
+    let (Some(regular), Some(bold), Some(han)) = (bundled(NOTO_REGULAR), bundled(NOTO_BOLD), bundled(SOURCE_HAN)) else {
+        return;
+    };
+    let set = chars("lo AgЖ");
+    let sources = [source("Noto", &regular, &[]), source("Han", &han, &[])];
+    let skeleton = recipe_with(&[("Noto", 1.0, None), ("Han", 1.0, None)], MissingGlyphPolicy::NoInfluence, BlendAlgorithm::Skeleton, None);
+    let compiled = run(&skeleton, &sources, CompileScope::Subset(&set));
+    let stats = &compiled.stats;
+    // Skeleton never takes the matched path or Auto's SDF path; a glyph it gives up on is
+    // counted as a fallback with its reason.
+    assert_eq!((stats.matched, stats.sdf, stats.no_blend, stats.transfer), (0, 0, 0, 0));
+    assert_eq!(stats.glyphs(), compiled_glyphs(&compiled));
+    assert_eq!(stats.skeleton_fallback_reasons.values().sum::<usize>(), stats.skeleton_fallback);
+
+    // Transfer: '한' is absent from the base (Regular, NoInfluence) and inked in two other
+    // sources, so it is transferred from the heaviest of them and counted as substituted.
+    let transfer_set = chars("lo 한");
+    let transfer = recipe_with(
+        &[("Regular", 1.0, None), ("Han", 1.0, None), ("Han2", 1.0, None), ("Bold", 1.0, None)],
+        MissingGlyphPolicy::NoInfluence,
+        BlendAlgorithm::Transfer { base_source: 0 },
+        None,
+    );
+    let fonts = [source("Regular", &regular, &[]), source("Han", &han, &[]), source("Han2", &han, &[]), source("Bold", &bold, &[])];
+    let compiled = run(&transfer, &fonts, CompileScope::Subset(&transfer_set));
+    let stats = &compiled.stats;
+    assert_eq!((stats.transfer, stats.transfer_base_substituted, stats.copied), (3, 1, 1), "{stats:?}");
+    assert_eq!(stats.glyphs(), compiled_glyphs(&compiled));
+
+    // A glyph with ink in ONE source is transferred too (font-wide parameters): '한' only in
+    // Han (not the base) is substituted, 'l' / 'o' use the base; the space
+    // (no ink) stays a copy.
+    let pair = recipe_with(&[("Regular", 1.0, None), ("Han", 1.0, None)], MissingGlyphPolicy::NoInfluence, BlendAlgorithm::Transfer { base_source: 0 }, None);
+    let compiled = run(&pair, &[source("Regular", &regular, &[]), source("Han", &han, &[])], CompileScope::Subset(&transfer_set));
+    let stats = &compiled.stats;
+    assert_eq!((stats.transfer, stats.transfer_base_substituted, stats.copied), (3, 1, 1), "{stats:?}");
+    assert_eq!(stats.glyphs(), compiled_glyphs(&compiled));
+}
+
+#[test]
+fn every_algorithm_is_deterministic_across_thread_counts() {
+    let (Some(regular), Some(han)) = (bundled(NOTO_REGULAR), bundled(SOURCE_HAN)) else {
+        return;
+    };
+    let set = chars("AaBgQ@&8Жж한 ");
+    let sources = [source("Noto", &regular, &[]), source("Han", &han, &[])];
+    let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("pool");
+    let many = rayon::ThreadPoolBuilder::new().num_threads(4).build().expect("pool");
+    for algorithm in [BlendAlgorithm::Sdf, BlendAlgorithm::NoBlend, BlendAlgorithm::Skeleton, BlendAlgorithm::Transfer { base_source: 1 }] {
+        let recipe = recipe_with(&[("Noto", 0.5, None), ("Han", 0.5, None)], MissingGlyphPolicy::NoInfluence, algorithm, None);
+        let first = one.install(|| run(&recipe, &sources, CompileScope::Subset(&set)));
+        let second = many.install(|| run(&recipe, &sources, CompileScope::Subset(&set)));
+        assert_eq!(first.bytes, second.bytes, "{algorithm:?}");
+        assert_eq!(first.stats, second.stats, "{algorithm:?}");
+    }
 }

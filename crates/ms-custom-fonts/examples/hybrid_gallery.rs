@@ -10,11 +10,14 @@ Usage:
   cargo run --release -p ms-custom-fonts --example hybrid_gallery -- \
       <out_dir> <font_a> <font_b> [<font_c> <font_d>] \
       [--weights 50:50,80:20] [--name gallery] [--policy disable|no_influence] [--full] [--text "..."]
-      [--size 52] [--save-fonts]
+      [--size 52] [--save-fonts] [--algorithm auto|sdf|no_blend|skeleton|transfer] [--base 0]
 
   `--weights` lists weight sets separated by commas, one value per font separated by colons
   (default `50:50,80:20` for two fonts, equal weights otherwise). `--full` compiles the whole
   face (prints glyph count, total and per-glyph time) instead of only the sample characters.
+  `--algorithm` picks the recipe's blend algorithm (default `auto`); `--base` is the base
+  font's index (position among the fonts) for `transfer`. Every compile prints its
+  `BlendStats` (which outline path produced how many glyphs, skeleton fallback reasons).
   The labels are drawn with the bundled Noto Sans located from this crate's manifest directory.
 
 Notes:
@@ -30,7 +33,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use ms_custom_fonts::{
-    CompileScope, CompiledFont, CustomFontKind, CustomFontRecipe, HybridParams, HybridSource, MissingGlyphPolicy, SourceFont,
+    BlendAlgorithm, CompileScope, CompiledFont, CustomFontKind, CustomFontRecipe, HybridParams, HybridSource, MissingGlyphPolicy, SourceFont,
     compile,
 };
 use ms_text_render::types::{
@@ -58,6 +61,7 @@ struct Args {
     text: String,
     size: f32,
     save_fonts: bool,
+    algorithm: BlendAlgorithm,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -69,6 +73,8 @@ fn parse_args() -> Result<Args, String> {
     let mut text = DEFAULT_TEXT.to_owned();
     let mut size = 52.0_f32;
     let mut save_fonts = false;
+    let mut algorithm = BlendAlgorithm::Auto;
+    let mut base = None;
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -77,6 +83,14 @@ fn parse_args() -> Result<Args, String> {
             "--policy" => {
                 let raw = iter.next().ok_or("--policy needs a value")?;
                 policy = MissingGlyphPolicy::parse(&raw).ok_or(format!("unknown policy '{raw}'"))?;
+            }
+            "--algorithm" => {
+                let raw = iter.next().ok_or("--algorithm needs a value")?;
+                algorithm = BlendAlgorithm::parse(&raw).ok_or(format!("unknown algorithm '{raw}'"))?;
+            }
+            "--base" => {
+                let raw = iter.next().ok_or("--base needs a value")?;
+                base = Some(raw.parse::<usize>().map_err(|error| format!("bad base index '{raw}': {error}"))?);
             }
             "--full" => full = true,
             "--save-fonts" => save_fonts = true,
@@ -89,7 +103,7 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     if positional.len() < 3 {
-        return Err("usage: hybrid_gallery <out_dir> <font_a> <font_b> [<font_c> <font_d>] [--weights 50:50,80:20] [--name N] [--policy P] [--full] [--text T] [--size PX] [--save-fonts]".to_owned());
+        return Err("usage: hybrid_gallery <out_dir> <font_a> <font_b> [<font_c> <font_d>] [--weights 50:50,80:20] [--name N] [--policy P] [--full] [--text T] [--size PX] [--save-fonts] [--algorithm A] [--base N]".to_owned());
     }
     let out_dir = PathBuf::from(positional.remove(0));
     let fonts: Vec<PathBuf> = positional.into_iter().map(PathBuf::from).collect();
@@ -104,7 +118,14 @@ fn parse_args() -> Result<Args, String> {
     if weight_sets.iter().any(|set| set.len() != fonts.len()) {
         return Err("every weight set needs one value per font".to_owned());
     }
-    Ok(Args { out_dir, fonts, weight_sets, name, policy, full, text, size, save_fonts })
+    match (&mut algorithm, base) {
+        (BlendAlgorithm::Transfer { base_source }, Some(index)) => *base_source = index,
+        (BlendAlgorithm::Auto | BlendAlgorithm::Sdf | BlendAlgorithm::NoBlend | BlendAlgorithm::Skeleton, Some(_)) => {
+            return Err("--base applies to --algorithm transfer only".to_owned());
+        }
+        (BlendAlgorithm::Auto | BlendAlgorithm::Sdf | BlendAlgorithm::NoBlend | BlendAlgorithm::Skeleton | BlendAlgorithm::Transfer { .. }, None) => {}
+    }
+    Ok(Args { out_dir, fonts, weight_sets, name, policy, full, text, size, save_fonts, algorithm })
 }
 
 fn identity_of(path: &Path) -> String {
@@ -215,15 +236,19 @@ fn run() -> Result<(), String> {
                     .map(|(identity, &weight)| HybridSource { identity: identity.clone(), weight, missing_override: None })
                     .collect(),
                 missing_default: args.policy,
+                algorithm: args.algorithm,
+                property_weights: None,
             }),
         };
         let started = Instant::now();
         let preview = compile(&recipe, &sources, CompileScope::Subset(&sample), &|_, _| {}, &never).map_err(|error| error.to_string())?;
         println!(
-            "weights {weights:?}: subset of {} chars compiled in {:.1} ms ({} bytes)",
+            "weights {weights:?} ({}): subset of {} chars compiled in {:.1} ms ({} bytes)\n  {:?}",
+            args.algorithm.as_str(),
             sample.len(),
             started.elapsed().as_secs_f64() * 1000.0,
-            preview.bytes.len()
+            preview.bytes.len(),
+            preview.stats
         );
         let compiled = if args.full {
             let started = Instant::now();
@@ -242,13 +267,14 @@ fn run() -> Result<(), String> {
                 full.report.total_chars,
                 full.report.disabled
             );
+            println!("  {:?}", full.stats);
             full
         } else {
             preview
         };
-        let label = weights.iter().map(|weight| format!("{weight}")).collect::<Vec<_>>().join(":");
+        let label = format!("{} {}", weights.iter().map(|weight| format!("{weight}")).collect::<Vec<_>>().join(":"), args.algorithm.as_str());
         if args.save_fonts {
-            let path = args.out_dir.join(format!("{}-{}.ttf", args.name, label.replace(':', "_")));
+            let path = args.out_dir.join(format!("{}-{}.ttf", args.name, label.replace([':', ' '], "_")));
             std::fs::write(&path, &compiled.bytes).map_err(|error| format!("cannot write {}: {error}", path.display()))?;
             println!("saved {}", path.display());
         }

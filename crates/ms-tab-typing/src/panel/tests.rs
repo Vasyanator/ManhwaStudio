@@ -7129,6 +7129,8 @@ paths change.
                     HybridSource { identity: b.to_owned(), weight: 2.0, missing_override: None },
                 ],
                 missing_default: MissingGlyphPolicy::NoInfluence,
+                algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+                property_weights: None,
             }),
         })
     }
@@ -7394,6 +7396,45 @@ paths change.
         );
     }
 
+    /// A preset carrying a newer-format raw recipe applies as an unavailable hybrid, cannot be
+    /// re-saved from that state (the raw recipe stays), and loses the raw recipe as soon as the
+    /// user saves a real choice over it.
+    #[test]
+    fn overwriting_a_preset_drops_its_newer_format_raw_recipe() {
+        let raw = serde_json::json!({"kind": "hybrid2", "algorithm": "glyph_dreams"});
+        let mut state = TypingCreatePanelState::new(false);
+        state.preview_enabled = true;
+        state.identity_mode = ParamIdentityMode::Font;
+        state.fonts = fonts_with_adhoc_entry(vec![alpha_raw(), beta_raw()]);
+        state.presets_by_name.insert(
+            "Новее".to_string(),
+            TypingCreatePreset {
+                font: crate::custom_fonts::identity::ADHOC_CUSTOM_FONT_IDENTITY.to_string(),
+                font_recipe_raw: Some(raw.clone()),
+                ..TypingCreatePreset::default()
+            },
+        );
+        state.apply_preset_by_name("Новее".to_string());
+        assert!(state.selected_font_is_adhoc());
+        assert!(state.custom_font.adhoc_recipe.is_none());
+        assert!(state.missing_font.is_some(), "the hybrid is blocked, never substituted");
+
+        state.preset_name_input = "Новее".to_string();
+        state.save_current_preset();
+        assert_eq!(
+            state.presets_by_name.get("Новее").and_then(|preset| preset.font_recipe_raw.as_ref()),
+            Some(&raw),
+            "a save from the blocked state is refused and keeps the raw recipe"
+        );
+
+        state.selected_font_idx = idx_of(&state, "Alpha-Regular");
+        state.missing_font = None;
+        state.save_current_preset();
+        let saved = state.presets_by_name.get("Новее").expect("preset saved");
+        assert_eq!(saved.font, "Alpha-Regular");
+        assert!(saved.font_recipe_raw.is_none(), "a real choice overwrites the stale raw recipe");
+    }
+
     // ---- Typing hybrid-font UI: group rule, row, inline refusal, dock commit (package P7) ----
 
     /// Index of the entry whose identity is `identity` (test lists only).
@@ -7463,6 +7504,17 @@ paths change.
         let recipe = adhoc_recipe("Alpha-Regular", "Beta-Regular");
         let summary = custom_font_select::hybrid_summary(&recipe, |identity| identity.trim_end_matches("-Regular").to_owned());
         assert_eq!(summary, "Alpha 33% + Beta 67%");
+
+        // With separate property weights the summary shows the SHAPE shares (3:1), not the
+        // unused main weights (1:2).
+        let mut split = (*recipe).clone();
+        let ms_custom_fonts::CustomFontKind::Hybrid(params) = &mut split.kind;
+        params.property_weights = Some(vec![
+            ms_custom_fonts::PropertyWeights { shape: 3.0, spacing: 1.0, kerning: 1.0 },
+            ms_custom_fonts::PropertyWeights { shape: 1.0, spacing: 1.0, kerning: 1.0 },
+        ]);
+        let summary = custom_font_select::hybrid_summary(&split, |identity| identity.trim_end_matches("-Regular").to_owned());
+        assert_eq!(summary, "Alpha 75% + Beta 25%");
     }
 
     #[test]

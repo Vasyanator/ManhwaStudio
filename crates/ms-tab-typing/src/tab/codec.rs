@@ -2475,6 +2475,8 @@ mod tests {
                     HybridSource { identity: "Beta-Regular".to_owned(), weight: 3.0, missing_override: None },
                 ],
                 missing_default: MissingGlyphPolicy::Disable,
+                algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+                property_weights: None,
             }),
         })
     }

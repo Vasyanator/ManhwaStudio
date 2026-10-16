@@ -495,6 +495,8 @@ mod tests {
                     HybridSource { identity: b.to_owned(), weight: 1.0, missing_override: None },
                 ],
                 missing_default: MissingGlyphPolicy::Disable,
+                algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+                property_weights: None,
             }),
         })
     }
@@ -676,6 +678,8 @@ mod tests {
                         HybridSource { identity: "Thai".to_owned(), weight: 1.0, missing_override: None },
                     ],
                     missing_default: policy,
+                    algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+                    property_weights: None,
                 }),
             }
         };

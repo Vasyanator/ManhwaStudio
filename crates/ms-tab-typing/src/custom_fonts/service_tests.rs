@@ -33,6 +33,8 @@ fn recipe(identities: [&str; 2]) -> Arc<CustomFontRecipe> {
                 .map(|identity| HybridSource { identity: (*identity).to_owned(), weight: 1.0, missing_override: None })
                 .collect(),
             missing_default: MissingGlyphPolicy::NoInfluence,
+            algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+            property_weights: None,
         }),
     })
 }
@@ -81,6 +83,7 @@ fn fake_compiled(recipe: &CustomFontRecipe, sources: &[SourceFont<'_>], len: usi
         postscript_name: compiled_face_post_script_name(&key),
         key,
         report: CoverageReport::default(),
+        stats: ms_custom_fonts::BlendStats::default(),
     }
 }
 
@@ -481,4 +484,21 @@ fn real_compile_round_trips_through_the_disk_cache() {
     assert_eq!((*loaded.bytes).as_ref().len(), loaded.byte_len);
     assert_eq!(loaded.family_name, compiled.family_name);
     assert_eq!(loaded.report, compiled.report);
+}
+
+#[test]
+fn the_blend_stats_log_line_names_every_path_and_the_fallback_reasons() {
+    let mut stats = ms_custom_fonts::BlendStats { copied: 4, skeleton: 2, skeleton_fallback: 3, ..ms_custom_fonts::BlendStats::default() };
+    assert_eq!(
+        blend_stats_summary(&stats),
+        "glyphs=9 copied=4 compatible=0 matched=0 sdf=0 no_blend=0 skeleton=2 skeleton_fallback=3 transfer=0 \
+         transfer_base_substituted=0"
+    );
+    stats.skeleton_fallback_reasons.insert("no skeleton", 1);
+    stats.skeleton_fallback_reasons.insert("too many strokes", 2);
+    assert!(
+        blend_stats_summary(&stats).ends_with(" skeleton_fallback_reasons=[no skeleton=1, too many strokes=2]"),
+        "{}",
+        blend_stats_summary(&stats)
+    );
 }

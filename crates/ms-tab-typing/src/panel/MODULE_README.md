@@ -129,7 +129,8 @@ here for panel state/UI, font loading, and coverage; edit `render_next/` for the
   edits and renames, so layers, group memberships and the font's own `fonts.<identity>`
   kerning follow it). The compiled face is never stored here. Decode (`fonts_data`):
   `CustomFontBody::Known` for a recipe that parses AND validates under
-  `normalize_font_identity`; anything else (unknown `kind`, malformed, invalid) is
+  `normalize_font_identity`; anything else (unknown `kind`, a `hybrid2` algorithm this build
+  does not know — reported as kind `hybrid2/<algorithm>` —, malformed, invalid) is
   `CustomFontBody::Unsupported` and keeps the WHOLE entry object verbatim through decode →
   merge → encode — listed, never edited, deletable. A blank name decodes to the identity;
   only an entry under a blank identity is dropped. Two keys naming ONE identity once
@@ -1208,8 +1209,9 @@ session long before this call.
   `custom_fonts`, an ad-hoc one in a layer's `text_params.font_recipe`); its compiled face is a
   disposable derivative served by `crate::custom_fonts::service`. In the list it is
   `FontEntryKind::Custom(Arc<CustomFontRef>)`: no file (`file_path()` is empty), one face, a
-  fixed identity, language coverage reported `Full` (the compiler's `CoverageReport` carries
-  counts, not the character set — a known gap).
+  fixed identity. A saved entry's language coverage is classified like a file's over the
+  characters its compiled face will map (`ms_custom_fonts::included_chars`, no compile); a
+  failed classification and the ad-hoc entry report `Full`.
 - SAVED fonts join at the END of `build_combined_font_list`
   (`custom_font_entry::build_custom_font_entries`): each recipe's sources are resolved against
   the finalized real fonts + the bundled entry through a SOURCE-ONLY `TabFontProvider` that the
@@ -1257,7 +1259,10 @@ session long before this call.
 - PRESETS: `presets.json` schema 3 (`PRESETS_VERSION`, a gate: an older build refuses it)
   stores `font_recipe` next to a font-mode preset whose `font` is the ad-hoc identity
   (`TypingCreatePreset.font_recipe`; written and decoded only there, a damaged one decodes to
-  `None` with a warning). `capture_current_preset` takes it from `selected_font_ref`;
+  `None` with a warning). A recipe in a NEWER format (`RecipeError::UnknownKind` /
+  `UnknownAlgorithm`) also decodes to `None` but is kept as `TypingCreatePreset.font_recipe_raw`
+  and written back verbatim (a recipe the panel holds wins; damage is never carried), so this
+  build never strips a newer build's recipe. `capture_current_preset` takes it from `selected_font_ref`;
   `apply_preset_by_name` routes such a preset through `select_adhoc_font` (no profile
   applied; an absent recipe blocks as damaged). Local presets carry it inside their snapshot.
 - PSD NAMES: `font_post_script_names` lists real fonts only; custom faces are named by the

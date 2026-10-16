@@ -556,6 +556,14 @@ struct TypingCreatePreset {
     /// identity (`MSCustom-adhoc-hybrid`); `None` for every other font, and for an ad-hoc
     /// preset whose recipe was never configured or could not be read.
     font_recipe: Option<Arc<CustomFontRecipe>>,
+    /// The stored `font_recipe` JSON of an ad-hoc preset whose recipe is in a NEWER format
+    /// this build cannot read (`RecipeError::UnknownKind` / `UnknownAlgorithm`), kept so a
+    /// save writes it back VERBATIM instead of dropping it (`presets_store::encode` uses it
+    /// only while `font_recipe` is `None` and `font` is the ad-hoc identity). A damaged
+    /// recipe is NOT carried (`None`). Only `presets_store::decode` fills it; every preset the
+    /// panel captures from its own state has `None`, so a re-saved preset never keeps a stale
+    /// raw recipe.
+    font_recipe_raw: Option<Value>,
 }
 
 #[derive(Clone)]

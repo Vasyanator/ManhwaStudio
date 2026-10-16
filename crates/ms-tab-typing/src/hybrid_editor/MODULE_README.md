@@ -16,17 +16,20 @@ host (typing dock / settings)            -- owns HybridEditorState + Arc<SourceC
         worker "typing-hybrid-editor-preview" (one per editor, latest-wins):
           resolve sources (catalog resolver) -> comparison renders (memoized)
           -> coverage_report (ms-custom-fonts)  -> subset compile (service().subset_preview_blocking)
-          -> render_text_to_image (white glyphs, display px) -> response + ctx.request_repaint
+          -> render_text_to_image (white glyphs, display px) -> response (+ BlendStats) + ctx.request_repaint
     commit: state.start_commit -> service().start_full_compile -> CompileTicket polled per frame
         -> HybridEditorOutcome::Committed(CommittedRecipe { recipe, face })
 ```
 
 ## Files and submodules
 - `mod.rs`: `draw_hybrid_editor`, `HybridEditorCx`, `CommitButton` (`Apply` / `HostDrawn`),
-  `HybridEditorOutcome`; the drawing of source rows, policies, preview and commit.
-- `state.rs`: `HybridEditorState` (draft rows, default policy, preview text, revision, commit
-  status, preview engine), `DraftError`, `CommittedRecipe`, and the pure helpers
-  (`weight_shares`, override index mapping, `cycle_index`, row limits).
+  `HybridEditorOutcome`; the drawing of source rows, policies, the blend algorithm / transfer
+  base / «Раздельные веса» controls, preview (+ its stats lines) and commit.
+- `state.rs`: `HybridEditorState` (draft rows with their property weights, default policy,
+  algorithm choice, transfer base, split toggle, preview text, revision, commit status,
+  preview engine), `BlendAlgorithmChoice`, `DraftError`, `CommittedRecipe`, and the pure
+  helpers (`weight_shares`, override / algorithm index mapping, `cycle_index`, row limits,
+  `skeleton_fallback_counts`).
 - `catalog.rs`: `SourceCatalog` / `SourceItem` — the allowed sources (bundled interface font
   first, real fonts; never a custom font) + their resolver + a process-unique serial.
 - `preview.rs`: `PreviewEngine` (scheduler, slots, worker protocol), `LatestWins`,
@@ -41,7 +44,26 @@ host (typing dock / settings)            -- owns HybridEditorState + Arc<SourceC
 - Missing glyphs (D9): each row has an override («как у шрифта / отключать символ / без
   влияния»), the hybrid a default (new drafts: `NoInfluence`). The editor never re-derives the
   rule: coverage counts come from `ms_custom_fonts::coverage_report`.
-- Live preview (D5): every edit (rows, weights, policies, sample text) recompiles ONLY the
+- Blend algorithm and property weights are recipe facts (`ms_custom_fonts::BlendAlgorithm`,
+  `PropertyWeights`): the draft carries `property_weights` only while «Раздельные веса» is on,
+  so Auto with the toggle off is a baseline (`hybrid`) recipe again. Turning the toggle on
+  seeds a row's shape / spacing / kerning from its weight only when the row never held split
+  values in this editor (a fresh row, a baseline recipe), so the first split draft blends
+  like the unsplit one, and off-then-on restores the user's split values. While split, the
+  recipe's `weight` is written as the shape weight (the hidden main weight never changes the
+  key or forces a recompile); turning the toggle on still makes a `hybrid2` recipe, dirty
+  even with unchanged glyphs. With the toggle on, the row's share label shows the SHAPE
+  share. The transfer base is a row index kept
+  apart from the algorithm choice (it survives switching away and back), clamped to the rows
+  when the recipe is built and kept on the same font when an earlier row is removed (removing
+  the base row resets it to the first). The editor offers the algorithms; it never decides
+  per glyph (that is `ms-custom-fonts` `hybrid/`).
+- Preview stats: each preview response carries the subset compile's `BlendStats`; the editor
+  shows the skeleton-fallback count (Skeleton) and the transfer base-substitution count
+  (Transfer) under the hybrid render. They describe the PREVIEW subset only; the full face's
+  counts are logged once per full compile by the compile service
+  (`custom_fonts::service::blend_stats_summary`), not shown here.
+- Live preview (D5): every edit (rows, weights, policies, algorithm, base, split, sample text) recompiles ONLY the
   sample's characters (uncached subset face), latest-wins: a newer request raises the previous
   one's cancel flag and bumps the shared generation that stops its renders; responses older than
   the image shown are dropped; the previous image stays until replaced. Requests also follow the

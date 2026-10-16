@@ -95,6 +95,8 @@ mod tests {
                     HybridSource { identity: "NotoSans-Bold".to_owned(), weight: weight_b, missing_override: None },
                 ],
                 missing_default: MissingGlyphPolicy::NoInfluence,
+                algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+                property_weights: None,
             }),
         })
     }

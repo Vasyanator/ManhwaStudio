@@ -806,6 +806,9 @@ impl TypingCreatePanelState {
                 // The ad-hoc entry's recipe IS its font: a preset naming it without the
                 // recipe would apply a hybrid it cannot describe (`selected_font_ref` rule).
                 font_recipe: self.selected_font_ref().and_then(|font_ref| font_ref.recipe),
+                // Only `presets_store::decode` carries a raw newer-format recipe: a capture
+                // overwrites the preset with what the user chose, never a stale raw.
+                font_recipe_raw: None,
             },
             ParamIdentityMode::LocalPreset => TypingCreatePreset {
                 font: String::new(),
@@ -814,6 +817,7 @@ impl TypingCreatePanelState {
                 local_presets: self.local_presets.clone(),
                 selected_local_preset: self.selected_local_preset,
                 font_recipe: None,
+                font_recipe_raw: None,
             },
         }
     }

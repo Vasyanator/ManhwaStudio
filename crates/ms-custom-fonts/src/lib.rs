@@ -9,7 +9,8 @@ derivative that callers cache by `RecipeKey`.
 
 Main responsibilities:
 - `recipe`: `CustomFontRecipe` / `CustomFontKind` (`Hybrid` implemented; `Combined` planned),
-  canonical JSON, validation.
+  the hybrid's `BlendAlgorithm` and `PropertyWeights`, canonical JSON (kind tags `hybrid` /
+  `hybrid2`), validation.
 - `key`: `SourceDigest`, `RecipeKey` (SHA-256, stable across machines).
 - `source` / `kerning` / `outline`: reading sources into normalized units.
 - `hybrid/`: the hybrid compiler (character plan, outline blend, metrics, kerning).
@@ -18,7 +19,8 @@ Main responsibilities:
 
 Public surface:
 - `compile`, `coverage_report`, `included_chars`, `with_kerning_overrides`, `CompileScope`,
-  `CompiledFont`, `CoverageReport`, `CompileError`, `ENGINE_VERSION`, plus the re-exported
+  `CompiledFont` (with its per-path `BlendStats`), `CoverageReport`, `CompileError`,
+  `ENGINE_VERSION`, plus the re-exported
   recipe/key/source types (incl. `RecipeKey::verify_full_face` with `VerifiedFullFace` /
   `FaceKeyMismatch`: the one rule for trusting a stored full face).
 
@@ -41,7 +43,7 @@ mod recipe;
 mod sfnt;
 mod source;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicBool;
 
 pub use error::CompileError;
@@ -49,8 +51,8 @@ pub use kern_override::with_kerning_overrides;
 pub use kerning::KerningPairPerMille;
 pub use key::{FaceKeyMismatch, RecipeKey, SourceDigest, VerifiedFullFace, recipe_key, source_digest};
 pub use recipe::{
-    CustomFontKind, CustomFontRecipe, HybridParams, HybridSource, MAX_HYBRID_SOURCES, MIN_HYBRID_SOURCES,
-    MissingGlyphPolicy, RecipeError,
+    BlendAlgorithm, CustomFontKind, CustomFontRecipe, EffectiveWeights, HybridParams, HybridSource, KIND_HYBRID,
+    KIND_HYBRID_V2, MAX_HYBRID_SOURCES, MIN_HYBRID_SOURCES, MissingGlyphPolicy, PropertyWeights, RecipeError,
 };
 pub use source::SourceFont;
 
@@ -82,6 +84,45 @@ pub struct CoverageReport {
     pub disabled_sample: Vec<char>,
 }
 
+/// How the glyphs of a compile were produced: one count per outline path, over the compiled
+/// glyphs (`.notdef` excluded). Every glyph is counted in exactly one of `copied`,
+/// `compatible`, `matched`, `sdf`, `no_blend`, `skeleton`, `skeleton_fallback`, `transfer`
+/// (their sum is `glyphs()`); `transfer_base_substituted` is a subset of `transfer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlendStats {
+    /// No source with ink (empty glyph), or exactly one under every algorithm except
+    /// `Transfer` (which transfers single-source glyphs too): copied unchanged.
+    pub copied: usize,
+    /// Exact point interpolation (same point structure).
+    pub compatible: usize,
+    /// Contour-correspondence interpolation (same topology; `Auto` only).
+    pub matched: usize,
+    /// Distance-field blend chosen by `Auto` or forced by `Sdf`.
+    pub sdf: usize,
+    /// `NoBlend`: copied from the source with the highest shape weight.
+    pub no_blend: usize,
+    /// Stroke-skeleton blend.
+    pub skeleton: usize,
+    /// `Skeleton` glyphs the skeleton blend could not handle, blended by distance field
+    /// instead (reasons in `skeleton_fallback_reasons`).
+    pub skeleton_fallback: usize,
+    /// Parameter transfer onto the base font's glyph.
+    pub transfer: usize,
+    /// Of `transfer`, glyphs the base font has no ink for, transferred onto the inked source
+    /// with the highest shape weight instead.
+    pub transfer_base_substituted: usize,
+    /// `skeleton_fallback` per reason key (the fallback's `Display`), ascending by key.
+    pub skeleton_fallback_reasons: BTreeMap<&'static str, usize>,
+}
+
+impl BlendStats {
+    /// Compiled glyphs counted (the sum of the exclusive path counts).
+    #[must_use]
+    pub fn glyphs(&self) -> usize {
+        self.copied + self.compatible + self.matched + self.sdf + self.no_blend + self.skeleton + self.skeleton_fallback + self.transfer
+    }
+}
+
 /// A compiled custom face.
 #[derive(Debug, Clone)]
 pub struct CompiledFont {
@@ -96,6 +137,8 @@ pub struct CompiledFont {
     pub key: RecipeKey,
     /// Coverage of the compiled scope (for `Subset`: of the requested characters only).
     pub report: CoverageReport,
+    /// Which outline path produced each compiled glyph.
+    pub stats: BlendStats,
 }
 
 /// Compiles `recipe` into a TrueType face.

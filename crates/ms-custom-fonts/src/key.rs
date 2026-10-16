@@ -18,6 +18,10 @@ Key functions:
 - `subset_tag` (crate-internal): the hash suffix that makes a preview face's name distinct.
 
 Notes:
+The recipe encoding of a BASELINE hybrid (`HybridParams::is_baseline`) is the one every earlier
+build used, so such a recipe keeps its key (and its cached face) across the introduction of
+algorithms and property weights; every other hybrid hashes the `hybrid2` tag and appends its
+property weights and algorithm (see `recipe_key`).
 Everything here is SHA-256 over a fixed BINARY canonical encoding (big-endian integers,
 length-prefixed UTF-8, `f32` bit patterns with `-0.0` folded into `0.0`), never over
 `DefaultHasher` or `Debug` output, so a key is identical on every machine and Rust release.
@@ -30,7 +34,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ENGINE_VERSION;
 use crate::kerning::KerningPairPerMille;
-use crate::recipe::{CustomFontKind, CustomFontRecipe, MissingGlyphPolicy};
+use crate::recipe::{BlendAlgorithm, CustomFontKind, CustomFontRecipe, MissingGlyphPolicy};
 
 /// Domain separator of `source_digest`.
 const SOURCE_DOMAIN: &[u8] = b"ms-custom-fonts/source/v1\0";
@@ -167,8 +171,10 @@ pub fn source_digest(data: &[u8], face_index: u32) -> SourceDigest {
 
 /// Key of a compiled face.
 ///
-/// Hashes `ENGINE_VERSION`, the recipe in canonical binary form (kind, default policy, every
-/// source's identity, weight bits and override, in recipe order), then, per entry of
+/// Hashes `ENGINE_VERSION`, the recipe in canonical binary form (kind tag, default policy,
+/// every source's identity, weight bits and override, in recipe order; for a non-baseline
+/// hybrid — tag `hybrid2` — then per source `[1]` + shape / spacing / kerning bits or `[0]`
+/// without property weights, one algorithm byte and, for transfer, the base index), then, per entry of
 /// `sources` (expected in recipe order), the source digest and that source's EFFECTIVE user
 /// kerning (later entries of the slice override earlier ones for the same pair; hashed sorted
 /// by `(left, right)`). The hybrid's OWN user kerning is not part of the binary and therefore
@@ -187,6 +193,25 @@ pub fn recipe_key(recipe: &CustomFontRecipe, sources: &[(SourceDigest, &[Kerning
                 hash_str(&mut hasher, &source.identity);
                 hasher.update(canonical_f32_bits(source.weight).to_be_bytes());
                 hasher.update([policy_byte(source.missing_override)]);
+            }
+            // Baseline recipes stop here: byte-for-byte the encoding of builds without
+            // algorithms, so their keys (and cached faces) stay valid.
+            if !params.is_baseline() {
+                for index in 0..params.sources.len() {
+                    match params.property_weights.as_ref().and_then(|split| split.get(index)) {
+                        Some(weights) => {
+                            hasher.update([1]);
+                            for value in [weights.shape, weights.spacing, weights.kerning] {
+                                hasher.update(canonical_f32_bits(value).to_be_bytes());
+                            }
+                        }
+                        None => hasher.update([0]),
+                    }
+                }
+                hasher.update([algorithm_byte(params.algorithm)]);
+                if let BlendAlgorithm::Transfer { base_source } = params.algorithm {
+                    hash_len(&mut hasher, base_source);
+                }
             }
         }
     }
@@ -236,6 +261,18 @@ fn policy_byte(policy: Option<MissingGlyphPolicy>) -> u8 {
     }
 }
 
+/// One byte per algorithm: 0 = auto, 1 = sdf, 2 = no blend, 3 = skeleton, 4 = transfer (its
+/// base index is hashed separately).
+fn algorithm_byte(algorithm: BlendAlgorithm) -> u8 {
+    match algorithm {
+        BlendAlgorithm::Auto => 0,
+        BlendAlgorithm::Sdf => 1,
+        BlendAlgorithm::NoBlend => 2,
+        BlendAlgorithm::Skeleton => 3,
+        BlendAlgorithm::Transfer { .. } => 4,
+    }
+}
+
 /// Hashes a length as a big-endian `u64` (lossless on every platform).
 fn hash_len(hasher: &mut Sha256, len: usize) {
     // `usize` is at most 64 bits on every supported target; saturate instead of panicking.
@@ -262,7 +299,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::recipe::{HybridParams, HybridSource};
+    use crate::recipe::{HybridParams, HybridSource, PropertyWeights};
 
     fn recipe(weight_b: f32) -> CustomFontRecipe {
         CustomFontRecipe {
@@ -272,6 +309,8 @@ mod tests {
                     HybridSource { identity: "B".to_owned(), weight: weight_b, missing_override: None },
                 ],
                 missing_default: MissingGlyphPolicy::NoInfluence,
+                algorithm: BlendAlgorithm::Auto,
+                property_weights: None,
             }),
         }
     }
@@ -356,6 +395,68 @@ mod tests {
         // must come with an `ENGINE_VERSION` bump.
         let key = RecipeKey([0xab; 32]);
         assert_eq!(key.full_face_unique_id(), format!("MSCustom-abababab;{};ms-custom-fonts engine {ENGINE_VERSION}", "ab".repeat(32)));
+    }
+
+    /// The fixed recipe of the pinned key vectors: two sources with an override, default
+    /// `NoInfluence`, the given algorithm and property weights.
+    fn pinned_recipe(algorithm: BlendAlgorithm, property_weights: Option<Vec<PropertyWeights>>) -> CustomFontRecipe {
+        CustomFontRecipe {
+            kind: CustomFontKind::Hybrid(HybridParams {
+                sources: vec![
+                    HybridSource { identity: "FontA".to_owned(), weight: 0.6, missing_override: None },
+                    HybridSource { identity: "FontB".to_owned(), weight: 0.4, missing_override: Some(MissingGlyphPolicy::Disable) },
+                ],
+                missing_default: MissingGlyphPolicy::NoInfluence,
+                algorithm,
+                property_weights,
+            }),
+        }
+    }
+
+    /// `recipe_key` of `recipe` over the pinned source digests and user pairs.
+    fn pinned_key(recipe: &CustomFontRecipe) -> String {
+        let pairs = [KerningPairPerMille { left: 'A', right: 'V', em: -40.0 }];
+        let none: &[KerningPairPerMille] = &[];
+        recipe_key(recipe, &[(source_digest(b"font a", 0), &pairs), (source_digest(b"font b", 0), none)]).hex()
+    }
+
+    #[test]
+    fn baseline_key_matches_the_pre_algorithm_vector() {
+        // Computed by the build BEFORE algorithms and property weights existed: a baseline
+        // recipe must keep its key, or every cached face on disk is silently recompiled.
+        assert_eq!(pinned_key(&pinned_recipe(BlendAlgorithm::Auto, None)), "fb260a2516a19a17d3e94b869f9bfb4f18d573c9adc8e580a68b5605b06797b1");
+    }
+
+    #[test]
+    fn hybrid2_key_matches_a_fixed_vector_and_covers_every_field() {
+        let split = |shape: f32| Some(vec![PropertyWeights { shape, spacing: 0.4, kerning: 0.5 }, PropertyWeights { shape: 0.4, spacing: 0.6, kerning: 0.5 }]);
+        let transfer = pinned_recipe(BlendAlgorithm::Transfer { base_source: 1 }, split(0.6));
+        // Pins the `hybrid2` encoding: a change invalidates cached faces of such recipes and
+        // must come with an `ENGINE_VERSION` bump.
+        assert_eq!(pinned_key(&transfer), "e7b1e25cfa7da02c8cc9402334f69daa74d2e633f6ca5534107a1c571f8c74b6");
+        let baseline = pinned_key(&pinned_recipe(BlendAlgorithm::Auto, None));
+        let mut keys = vec![
+            baseline.clone(),
+            pinned_key(&transfer),
+            pinned_key(&pinned_recipe(BlendAlgorithm::Transfer { base_source: 0 }, split(0.6))),
+            pinned_key(&pinned_recipe(BlendAlgorithm::Transfer { base_source: 1 }, split(0.7))),
+            pinned_key(&pinned_recipe(BlendAlgorithm::Transfer { base_source: 1 }, None)),
+            pinned_key(&pinned_recipe(BlendAlgorithm::Sdf, None)),
+            pinned_key(&pinned_recipe(BlendAlgorithm::NoBlend, None)),
+            pinned_key(&pinned_recipe(BlendAlgorithm::Skeleton, None)),
+            pinned_key(&pinned_recipe(BlendAlgorithm::Auto, split(0.6))),
+        ];
+        // Property weights equal to the plain weights still form a different recipe (tag
+        // `hybrid2`), never the baseline's key.
+        let same_as_plain = Some(vec![
+            PropertyWeights { shape: 0.6, spacing: 0.6, kerning: 0.6 },
+            PropertyWeights { shape: 0.4, spacing: 0.4, kerning: 0.4 },
+        ]);
+        keys.push(pinned_key(&pinned_recipe(BlendAlgorithm::Auto, same_as_plain)));
+        let count = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), count, "every algorithm, base and property weight changes the key");
     }
 
     #[test]

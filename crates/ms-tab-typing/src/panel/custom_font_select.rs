@@ -353,12 +353,15 @@ impl TypingCreatePanelState {
 /// The ad-hoc recipe's one-line summary under the font combo: every source as
 /// `typing.hybrid_font.summary_part` («{font} {percent}%») joined by ` + `, the share being
 /// the weight's normalized percentage (`hybrid_editor::weight_shares`, the editor's own
-/// rule; a weight without a valid share shows 0). `label` names a source identity.
+/// rule; a weight without a valid share shows 0). With separate property weights the share
+/// is the SHAPE share (`HybridParams::effective_weights`), as in the editor's rows. `label`
+/// names a source identity.
 #[must_use]
 pub(super) fn hybrid_summary(recipe: &CustomFontRecipe, label: impl Fn(&str) -> String) -> String {
     match &recipe.kind {
         CustomFontKind::Hybrid(params) => {
-            let weights: Vec<f32> = params.sources.iter().map(|source| source.weight).collect();
+            // `effective_weights` is the one owner of which weight applies where.
+            let weights = params.effective_weights().shape;
             params
                 .sources
                 .iter()
@@ -403,6 +406,8 @@ mod tests {
                     HybridSource { identity: "Beta-Regular".to_owned(), weight: 3.0, missing_override: None },
                 ],
                 missing_default: MissingGlyphPolicy::NoInfluence,
+                algorithm: ms_custom_fonts::BlendAlgorithm::Auto,
+                property_weights: None,
             }),
         })
     }

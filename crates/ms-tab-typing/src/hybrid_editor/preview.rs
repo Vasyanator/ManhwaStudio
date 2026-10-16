@@ -33,6 +33,8 @@ Notes:
   with the text colour, so a theme change needs no re-render.
 - The preview never registers an egui font (egui cannot unload one) and never compiles a
   full face; the subset compile is uncached by design (`service::subset_preview_blocking`).
+- A response also carries the subset compile's `BlendStats` (skeleton fallbacks, transfer
+  base substitutions), stored beside the hybrid image and replaced together with it.
 - Source comparison renders are memoized on the worker by (font bytes, text, size), so a
   weight edit re-renders only the hybrid.
 - The hybrid's OWN user kerning pairs (a saved font's) are not applied to the preview; the
@@ -46,7 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use eframe::egui;
-use ms_custom_fonts::{CoverageReport, CustomFontRecipe, coverage_report};
+use ms_custom_fonts::{BlendStats, CoverageReport, CustomFontRecipe, coverage_report};
 use ms_log::runtime_log;
 use web_time::{Duration, Instant};
 
@@ -133,6 +135,9 @@ pub(crate) struct PreviewResponse {
     generation: u64,
     /// The hybrid render, `None` when the draft is not valid or the text is blank.
     hybrid: Option<RenderOutcome>,
+    /// Which outline path built each glyph of the subset compile; `None` when nothing was
+    /// compiled (invalid draft, blank text, failed compile).
+    stats: Option<BlendStats>,
     /// One entry per row: `None` for an empty slot.
     sources: Vec<Option<SourceRender>>,
     /// The draft's coverage report (`None` when the draft is not valid; `Err` = failed, logged).
@@ -239,6 +244,8 @@ pub(crate) struct PreviewEngine {
     wanted: Option<(RequestKey, Instant)>,
     /// The hybrid render.
     pub(crate) hybrid: PreviewSlot,
+    /// Blend-path counts of the subset compile behind `hybrid` (replaced together with it).
+    pub(crate) stats: Option<BlendStats>,
     /// One comparison slot per row.
     pub(crate) sources: Vec<PreviewSlot>,
     /// The draft's coverage.
@@ -412,6 +419,7 @@ impl PreviewEngine {
             None => PreviewSlot::None,
             Some(outcome) => slot_for(ctx, "typing_hybrid_editor_preview", 0, &outcome, None),
         };
+        self.stats = response.stats;
         for (slot, render) in self.sources.iter_mut().zip(response.sources) {
             let previous = std::mem::take(slot);
             *slot = match render {
@@ -558,8 +566,8 @@ fn process(request: &PreviewRequest, memo: &mut SourceMemo, last_error: &mut Opt
         sources.push(render);
     }
 
-    let (hybrid, coverage) = match &request.recipe {
-        None => (None, None),
+    let (hybrid, stats, coverage) = match &request.recipe {
+        None => (None, None, None),
         Some(recipe) => {
             let recipe_sources: Option<Vec<ResolvedSource>> = recipe
                 .source_identities()
@@ -567,11 +575,16 @@ fn process(request: &PreviewRequest, memo: &mut SourceMemo, last_error: &mut Opt
                 .map(|identity| resolved.get(identity).cloned().flatten())
                 .collect();
             match recipe_sources {
-                None => (Some(RenderOutcome::Failed), Some(Err(()))),
+                None => (Some(RenderOutcome::Failed), None, Some(Err(()))),
                 Some(recipe_sources) => {
                     let coverage = recipe_coverage(recipe, &recipe_sources, last_error);
-                    let hybrid = if blank { None } else { Some(hybrid_render(request, recipe, &recipe_sources, last_error)?) };
-                    (hybrid, Some(coverage))
+                    let (hybrid, stats) = if blank {
+                        (None, None)
+                    } else {
+                        let (outcome, stats) = hybrid_render(request, recipe, &recipe_sources, last_error)?;
+                        (Some(outcome), stats)
+                    };
+                    (hybrid, stats, Some(coverage))
                 }
             }
         }
@@ -579,7 +592,7 @@ fn process(request: &PreviewRequest, memo: &mut SourceMemo, last_error: &mut Opt
     if superseded() {
         return None;
     }
-    Some(PreviewResponse { generation: request.generation, hybrid, sources, coverage })
+    Some(PreviewResponse { generation: request.generation, hybrid, stats, sources, coverage })
 }
 
 /// The coverage report of the whole draft (cmap lookups only).
@@ -589,23 +602,25 @@ fn recipe_coverage(recipe: &CustomFontRecipe, sources: &[ResolvedSource], last_e
     result.map_err(|err| log_once(last_error, format!("typing: hybrid font coverage failed: {err}. Recipe: {}", recipe.to_json())))
 }
 
-/// Compiles the subset hybrid of the sample's characters and renders the sample with it.
-/// `None` when the request was superseded mid-compile.
+/// Compiles the subset hybrid of the sample's characters and renders the sample with it,
+/// returning the render and the compile's blend-path counts (`None` when the compile
+/// failed). `None` when the request was superseded mid-compile.
 fn hybrid_render(
     request: &PreviewRequest,
     recipe: &CustomFontRecipe,
     sources: &[ResolvedSource],
     last_error: &mut Option<String>,
-) -> Option<RenderOutcome> {
+) -> Option<(RenderOutcome, Option<BlendStats>)> {
     let chars = preview_chars(&request.text);
     let compiled = match service().subset_preview_blocking(recipe, sources, &chars, &request.cancel) {
         Ok(compiled) => compiled,
         Err(crate::custom_fonts::service::CustomFontError::Cancelled) => return None,
         Err(err) => {
             log_once(last_error, format!("typing: hybrid font preview could not be compiled: {err}. Recipe: {}", recipe.to_json()));
-            return Some(RenderOutcome::Failed);
+            return Some((RenderOutcome::Failed, None));
         }
     };
+    let stats = compiled.stats;
     let content = FontContent {
         name: compiled.postscript_name.clone(),
         original_name: compiled.family_name.clone(),
@@ -614,7 +629,8 @@ fn hybrid_render(
         face_index: 0,
         custom_kerning: None,
     };
-    Some(render(request, content, last_error).map_or(RenderOutcome::Failed, |image| RenderOutcome::Image(Arc::new(image))))
+    let outcome = render(request, content, last_error).map_or(RenderOutcome::Failed, |image| RenderOutcome::Image(Arc::new(image)));
+    Some((outcome, Some(stats)))
 }
 
 /// Renders the sample in one source font (memoized by bytes, text and size).
