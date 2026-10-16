@@ -25,6 +25,7 @@ Coverage:
   sum that misses the blob is a request error;
 - `params` passed through, `null` params treated as an empty object;
 - no-emitter => no progress frames, still a correct terminal response;
+- a dead peer: every frame still attempted, ONE warning per request, the work goes on;
 - `inpaint.flux2_klein.status` with and without `params`;
 - `inpaint.flux2_klein.estimate` requires a positive region size;
 - `inpaint.flux2_klein.unload` returns `{"unloaded": bool}`;
@@ -279,6 +280,14 @@ def _default_result() -> dict[str, Any]:
             "unload_text_encoder_after_encode": False,
             "text_encoder_fp8": False,
         },
+        "profile": "balanced",
+        "profile_effective": "balanced",
+        "vram_step": "phase",
+        "ram_step": "keep",
+        "vram_step_effective": "phase",
+        "ram_step_effective": "keep",
+        "degraded": False,
+        "degrade_reason": None,
     }
 
 
@@ -344,8 +353,33 @@ def test_streaming_emits_two_phases_then_the_terminal_response() -> None:
             "text_encoder_fp8": False,
         },
         "text_attention_in_mask": False,
+        "profile": "balanced",
+        "profile_effective": "balanced",
+        "vram_step": "phase",
+        "ram_step": "keep",
+        "vram_step_effective": "phase",
+        "ram_step_effective": "keep",
+        "degraded": False,
+        "degrade_reason": None,
     }
     assert "image_png" not in resp_header
+
+
+def test_a_degraded_run_reports_the_manager_fields() -> None:
+    result = _default_result()
+    result.update({"profile": "max_speed", "profile_effective": "balanced", "vram_step": "max", "vram_step_effective": "phase", "degraded": True, "degrade_reason": "device_oom"})
+    svc = _FakeFlux2KleinService(result)
+    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
+    resp_header, _blob = handler(_ctx(svc), _header({"params": {}}), REGION_PNG + MASK_PNG, _no_cancel())
+    assert (resp_header["profile"], resp_header["profile_effective"], resp_header["degraded"], resp_header["degrade_reason"]) == ("max_speed", "balanced", True, "device_oom")
+    assert (resp_header["vram_step"], resp_header["vram_step_effective"], resp_header["ram_step"], resp_header["ram_step_effective"]) == ("max", "phase", "keep", "keep")
+
+
+def test_the_step_keys_mirror_the_service() -> None:
+    from modules.ai_backend.inpaint.flux2_klein import memory
+    from modules.ai_backend.ipc.handlers import flux2_klein as handler_module
+
+    assert handler_module._STEP_KEYS == memory.STEP_FIELD_KEYS
 
 
 def test_oom_recovery_is_reported_in_the_response_header() -> None:
@@ -1176,7 +1210,7 @@ def test_existing_four_argument_progress_callers_are_unchanged() -> None:
     from modules.ai_backend.ipc.handlers.flux2_klein import _progress_forwarder
 
     emitter, disp = _emitter()
-    forward = _progress_forwarder(_ctx(_FakeFlux2KleinService(), emitter=emitter))
+    forward = _progress_forwarder(_ctx(_FakeFlux2KleinService(), emitter=emitter), METHOD_INPAINT_FLUX2_KLEIN)
     forward("load", 2, 6, "Загрузка трансформера")
 
     assert len(disp.frames) == 1
@@ -1192,3 +1226,28 @@ def test_existing_four_argument_progress_callers_are_unchanged() -> None:
 def test_both_download_methods_are_registered() -> None:
     assert get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK) is not None
     assert get_handler(METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START) is not None
+
+
+def test_a_dead_peer_is_logged_once_per_request_and_never_aborts_the_work(caplog: pytest.LogCaptureFixture) -> None:
+    # Documented semantics: the work goes on (a disconnect does not cancel a
+    # run or a download), but the failure is no longer swallowed silently.
+    from modules.ai_backend.ipc.handlers.flux2_klein import _progress_forwarder
+
+    class _DeadDispatcher:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        def _write(self, header: dict[str, Any], blob: bytes = b"") -> None:
+            self.attempts += 1
+            raise BrokenPipeError("peer gone")
+
+    dead = _DeadDispatcher()
+    forward = _progress_forwarder(_ctx(_FakeFlux2KleinService(), emitter=ProgressEmitter(dead, REQUEST_ID)), METHOD_INPAINT_FLUX2_KLEIN)
+    with caplog.at_level("WARNING", logger="modules.ai_backend.ipc.handlers.flux2_klein"):
+        for step in range(3):
+            forward("generate", step, 3, "Генерация")
+    assert dead.attempts == 3, "every frame is still attempted"
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert METHOD_INPAINT_FLUX2_KLEIN in warnings[0].getMessage()
+    assert "BrokenPipeError" in warnings[0].getMessage()

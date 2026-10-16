@@ -10,7 +10,7 @@ Main responsibilities:
 - single-image text recognition from raw image bytes with a fixed OCR prompt
   (PaddleOCR-VL needs no separate text detection and no language selection);
 - synchronization of the model device with backend `General.ai_device`;
-- cooperation with `LoadedModelManager` (lease key per variant + device).
+- cooperation with `SmallModelManager` (lease key per variant + device).
 
 Key structures:
 - `PaddleVlOcrService`
@@ -59,7 +59,8 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
+from ..runtime.residency.footprint import hint_from_files
 from ..runtime.rocm_mmap_transfer import move_module_to
 from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from .result_format import format_recognition_lines
@@ -91,6 +92,9 @@ _resolve_selected_backend_device = resolve_selected_backend_device
 #: patched by name in the test suite.
 _clear_torch_cache = functools.partial(clear_torch_cache, owner="PaddleOCR-VL")
 
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "ocr.paddle_vl"
+
 
 @dataclass(frozen=True)
 class _ModelIdentity:
@@ -113,13 +117,13 @@ class PaddleVlOcrService:
     """PaddleOCR-VL OCR runtime backed by Hugging Face Transformers.
 
     One model (variant + directory + device) is resident at a time and shared
-    across requests; `LoadedModelManager` may evict it when idle to keep the
+    across requests; `SmallModelManager` may evict it when idle to keep the
     resident model count within the configured limit.
     """
 
     MODEL_KEY_PREFIX = "paddlevlocr"
 
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.Lock()
         self._model_manager = model_manager
         self._model = None
@@ -197,8 +201,14 @@ class PaddleVlOcrService:
             return self._unload_model_key(model_key)
 
         # Lease before the instance lock: an eviction callback of another
-        # service may hold the manager while waiting for this lock.
-        lease = self._model_manager.begin_model_use(model_key, unload_callback=unload)
+        # service may hold the manager while waiting for this lock. Pre-load
+        # size: every file of the checkpoint directory.
+        lease = self._model_manager.begin_model_use(
+            model_key,
+            unload_callback=unload,
+            owner=_LEASE_OWNER,
+            hint=hint_from_files([directory], selected_device),
+        )
         try:
             with self._lock:
                 # Load scope: only a failure in here is a failed LOAD.
@@ -210,10 +220,11 @@ class PaddleVlOcrService:
                     if lease.needs_load:
                         lease.mark_load_failed()
                     raise
-            # Resident from here on, so it is registered before the constraint
-            # build and inference: a failure there must leave it counted and
-            # evictable, not occupying VRAM off the books.
-            if lease.needs_load:
+                # Resident from here on, so it is registered before the
+                # constraint build and inference: a failure there must leave it
+                # counted and evictable, not occupying VRAM off the books.
+                # Under the lock and unconditionally: the lease protocol in
+                # `runtime/model_manager.py`.
                 lease.mark_loaded(unload_callback=unload)
             try:
                 constraint = None

@@ -27,7 +27,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from modules.ai_backend.inpaint import lama_mpe
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 #: The pin as shipped, captured before any test replaces it.
 _SHIPPED_PIN = lama_mpe._LAMA_MPE_SHA256
@@ -43,7 +43,7 @@ class LamaMpeCheckpointGateTests(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.service = lama_mpe.LamaMpeInpaintService(LoadedModelManager(max_loaded_models=1))
+        self.service = lama_mpe.LamaMpeInpaintService(SmallModelManager(max_loaded_models=1))
         self.path = Path(tmp.name) / "LaMa_MPE" / "inpainting_lama_mpe.ckpt"
         self.service._model_path = self.path
         import requests

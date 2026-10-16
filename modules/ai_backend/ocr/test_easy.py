@@ -40,7 +40,7 @@ from typing import Any
 from unittest.mock import patch
 
 from modules.ai_backend.ocr import easy as easy_module
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 from modules.ai_backend.runtime.paths import program_root
 
 IMAGE_RGB = object()
@@ -93,7 +93,7 @@ class EasyOcrOfflineTests(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(prefix="ms_easyocr_")
         self.addCleanup(tmp.cleanup)
         self.model_dir = tmp.name
-        self.service = easy_module.EasyOcrService(LoadedModelManager())
+        self.service = easy_module.EasyOcrService(SmallModelManager())
 
     def _recognize(self, *, langs: str = "ko,en", model_dir: str | None = None) -> dict[str, Any]:
         return self.service.recognize_image_bytes(
@@ -254,7 +254,7 @@ class RealWeightsTests(unittest.TestCase):
         with patch.object(easyocr_pkg, "download_and_unzip", no_download), patch.object(
             easy_module, "_resolve_selected_backend_device", lambda _fallback: "cpu"
         ):
-            service = easy_module.EasyOcrService(LoadedModelManager())
+            service = easy_module.EasyOcrService(SmallModelManager())
             result = service.recognize_image_bytes(
                 buffer.getvalue(), model_dir=str(Path(os.environ["MS_EASYOCR_MODEL_DIR"]).resolve()), langs="ko,en"
             )

@@ -30,11 +30,24 @@ user's marks composited over a copy of the region, handed to the pipeline as its
 The result PNG goes in the response blob (raw bytes) and its length is repeated
 as ``image_len`` in the response header, next to the OOM-recovery report and the
 effective ``text_attention_in_mask`` (reported beside ``applied``, not in it,
-because ``applied`` is persisted into the user's settings).
+because ``applied`` is persisted into the user's settings). Since the FLUX.2
+service runs on the large-model manager the header also carries, additively,
+the requested and effective resource steps — ``vram_step`` / ``ram_step``
+(requested: ``params.vram_step`` / ``params.ram_step``, else the legacy
+``params.profile`` id, else the legacy ``placement`` mapping) and
+``vram_step_effective`` / ``ram_step_effective`` — plus their legacy names
+``profile`` / ``profile_effective``, ``degraded`` and ``degrade_reason``
+(mapping tables: ``inpaint/flux2_klein/memory.py``). The legacy ``placement``
+flags and ``params.profile`` stay accepted (stage 1), with their meaning for
+the text encoder: a request that sends neither ``vram_step`` nor ``ram_step``
+encodes on the CPU (``memory.encoder_cpu_pinned``). ``.estimate`` answers from
+the manager's forecast (the encoder planned as the run would) and adds the same
+six step keys and ``calibrated``.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
 import traceback
 from typing import Any
@@ -56,6 +69,8 @@ from ..protocol import (
 )
 from ..registry import HandlerContext, Interrupted, register
 
+log = logging.getLogger(__name__)
+
 _PROGRESS_EMITTER_ATTR = "progress_emitter"
 
 #: The memory settings reported back as `applied`, in the order `PROTOCOL.md §5.4`
@@ -68,6 +83,12 @@ _APPLIED_FLAGS = (
     "unload_text_encoder_after_encode",
     "text_encoder_fp8",
 )
+
+#: The run's step keys copied from the service answer (requested / effective
+#: steps and their legacy profile names). The handler imports no service code at
+#: module level, so this mirrors `inpaint.flux2_klein.memory.STEP_FIELD_KEYS`;
+#: `test_flux2_klein` guards the mirror.
+_STEP_KEYS = ("profile", "profile_effective", "vram_step", "ram_step", "vram_step_effective", "ram_step_effective")
 
 
 def _require_segment_len(header: dict[str, Any], field: str, *, optional: bool) -> int:
@@ -140,13 +161,18 @@ def _require_non_empty_str(header: dict[str, Any], field: str) -> str:
     return value
 
 
-def _progress_forwarder(ctx: HandlerContext) -> "Any":
-    """Bind the request's `ProgressEmitter` into a service `progress_callback`.
+def _progress_forwarder(ctx: HandlerContext, method: str) -> "Any":
+    """Bind the request's `ProgressEmitter` into a service `progress_callback` for `method`.
 
-    Shared by the generation method, by `prompt_cache.build` and by
-    `download.start`: all three stream the same `{phase, step, total, label}`
-    frame with an empty blob. A dead peer must never abort the work, so every
-    emit failure is swallowed.
+    Shared by the generation method, `component_action`, `prompt_cache.build`
+    and `download.start`: all stream the same `{phase, step, total, label}`
+    frame with an empty blob. A dead peer must never abort the work (a download
+    or a run outlives one client connection), so an emit failure never reaches
+    the service: the FIRST one of the request is logged at WARNING with the
+    method and the frame (later frames are still attempted; their failures are
+    not logged again). A disconnect therefore does not cancel a FLUX.2 run;
+    the `cancel` frame is observed only before the service call and after it
+    returns (mid-run cancellation is a separate, future feature).
 
     The three keyword-only arguments are the download's SECOND progress level and
     are additive: `step`/`total` keep meaning the OVERALL level, so every existing
@@ -156,6 +182,7 @@ def _progress_forwarder(ctx: HandlerContext) -> "Any":
     frame; a consumer that does not know the three ignores them.
     """
     emitter = getattr(ctx, _PROGRESS_EMITTER_ATTR, None)
+    failed = False
 
     def on_progress(
         phase: str,
@@ -181,10 +208,13 @@ def _progress_forwarder(ctx: HandlerContext) -> "Any":
             fields["file_total"] = int(file_total)
         if file_label is not None:
             fields["file_label"] = str(file_label)
+        nonlocal failed
         try:
             emitter.emit(fields, b"")
-        except Exception:  # noqa: BLE001 - peer gone; keep working
-            pass
+        except Exception as exc:  # noqa: BLE001 - a write failure means the peer is gone; the work goes on (docstring)
+            if not failed:
+                failed = True
+                log.warning("%s: progress frame not delivered (%s: %s), phase=%s step=%s/%s; the work continues, later failures of this request are not logged again", method, type(exc).__name__, exc, fields["phase"], fields["step"], fields["total"])
 
     return on_progress
 
@@ -200,7 +230,7 @@ def _handle_inpaint_flux2_klein(
 
     image_png, mask_png, reference_png = _split_request_blob(header, blob)
     params_raw = _require_params(header)
-    on_progress = _progress_forwarder(ctx)
+    on_progress = _progress_forwarder(ctx, METHOD_INPAINT_FLUX2_KLEIN)
 
     try:
         result = ctx.state.flux2_klein_inpaint.inpaint_image_bytes(
@@ -236,6 +266,12 @@ def _handle_inpaint_flux2_klein(
         # `applied` rather than inside it: `applied` is persisted into the user's
         # settings, and a mode-forced off must not overwrite the user's choice.
         "text_attention_in_mask": bool(result.get("text_attention_in_mask", False)),
+        # The large-model manager's view of the run (additive): the steps asked
+        # for, the ones that actually ran (also by their legacy profile names),
+        # and whether the degrade ladder changed them.
+        **{key: result.get(key) for key in _STEP_KEYS},
+        "degraded": bool(result.get("degraded", False)),
+        "degrade_reason": result.get("degrade_reason"),
     }
     return fields, image_png_out
 
@@ -321,7 +357,7 @@ def _handle_inpaint_flux2_klein_component_action(
             params_raw,
             component=component,
             action=action,
-            progress_callback=_progress_forwarder(ctx),
+            progress_callback=_progress_forwarder(ctx, METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION),
         )
     except (ValueError, FileNotFoundError):
         raise
@@ -361,7 +397,7 @@ def _handle_prompt_cache_build(
     params_raw = _require_params(header)
     try:
         result = ctx.state.flux2_klein_inpaint.prompt_cache_build(
-            params_raw, progress_callback=_progress_forwarder(ctx)
+            params_raw, progress_callback=_progress_forwarder(ctx, METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD)
         )
     except (ValueError, FileNotFoundError):
         raise
@@ -574,7 +610,7 @@ def _handle_download_start(
             token,
             uncensored=uncensored,
             variant=_read_variant(header),
-            progress_callback=_progress_forwarder(ctx),
+            progress_callback=_progress_forwarder(ctx, METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START),
             should_cancel=cancel_event.is_set,
         )
     except downloads.DownloadCanceled:

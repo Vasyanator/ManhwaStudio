@@ -46,11 +46,15 @@ except Exception as exc:  # pragma: no cover - environment specific
 else:
     ORT_IMPORT_ERROR = None
 
-from ..runtime.model_manager import LoadedModelManager, ModelUsageLease
+from ..runtime.model_manager import SmallModelManager, ModelUsageLease
 from ..runtime.paths import program_root
+from ..runtime.residency.footprint import hint_from_files
 
 
 log = logging.getLogger(__name__)
+
+#: Execution providers whose sessions live in the memory of GPU `device_id`.
+_GPU_PROVIDERS = frozenset({"CUDAExecutionProvider", "MIGraphXExecutionProvider"})
 
 DEFAULT_DET_RESIZE_LONG = 960
 DEFAULT_DET_STRIDE = 32
@@ -90,6 +94,17 @@ class ProviderSettings:
 
     def is_migraphx(self) -> bool:
         return self.provider == "MIGraphXExecutionProvider"
+
+    def footprint_device(self) -> str:
+        """Residency-arbiter device of a session on this EP.
+
+        `cuda:<device_id>` for the CUDA and MIGraphX (ROCm) EPs, `cpu` for every
+        other EP (CPU; DirectML, whose adapter memory the arbiter cannot probe and
+        accounts on the host anyway).
+        """
+        if self.provider in _GPU_PROVIDERS:
+            return f"cuda:{self.device_id}"
+        return "cpu"
 
 
 @dataclass(frozen=True)
@@ -413,7 +428,7 @@ class ManagedOnnxSession:
 
 
 class RuntimeFactory:
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.Lock()
         self._model_manager = model_manager
         self._cache: dict[tuple[str, str], OnnxSessionRunner] = {}
@@ -422,9 +437,17 @@ class RuntimeFactory:
     def acquire_runner(self, model_path: Path, settings: ProviderSettings) -> ManagedOnnxSession:
         key = (str(model_path.resolve()), settings.cache_key())
         model_key = self._manager_key_for(key)
+        # Pre-load size: the `.onnx` file (x1.25 for arena and workspace) on the
+        # EP's device. No `owner=`: each session is its own owner (the key). The
+        # owner rule is not needed here, because the reclaim callback takes only
+        # `self._lock`, which is never held across `begin_model_use`, and a
+        # shared owner would keep every idle session unevictable while any
+        # other one is in use.
+        hint = hint_from_files([model_path], settings.footprint_device(), onnx=True)
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_runner_by_key(key),
+            hint=hint,
         )
         try:
             with self._lock:
@@ -436,6 +459,12 @@ class RuntimeFactory:
                         settings.provider,
                         settings.device_id,
                     )
+                    # Registered on the cache hit too (the lease protocol in
+                    # `runtime/model_manager.py`): a lease that reserved the load
+                    # would otherwise leave the entry `loading` forever, and one
+                    # that found the key unregistered would leave the session
+                    # outside the cap.
+                    lease.mark_loaded(unload_callback=lambda: self._unload_runner_by_key(key))
                     return ManagedOnnxSession(cached, lease)
                 if self._configured_cache_key is None:
                     _configure_onnx_cache_environment(resolve_compiled_cache_root(), settings)
@@ -556,7 +585,13 @@ class PaddleOnnxRuntime:
         rec_cfg = parse_rec_config(model_paths.rec_dict_path)
         det_settings = self._det_provider_settings(settings)
         managed_det_runner = self._factory.acquire_runner(model_paths.det_model_path, det_settings)
-        managed_rec_runner = self._factory.acquire_runner(model_paths.rec_model_path, settings)
+        try:
+            managed_rec_runner = self._factory.acquire_runner(model_paths.rec_model_path, settings)
+        except BaseException:
+            # The rec admission can be refused (`ModelMemoryShortError`) or its
+            # load can fail; the det lease taken above must not leak.
+            managed_det_runner.release()
+            raise
         try:
             det_runner = managed_det_runner.runner
             rec_runner = managed_rec_runner.runner

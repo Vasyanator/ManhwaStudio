@@ -17,7 +17,11 @@ imports an engine module itself. Instances are built once in `server.py` and sto
 Every service is lazy: importing the module must not import its engine, and the model is loaded on
 first recognition. Resident models are leased from `runtime/model_manager.py`
 (`begin_model_use` -> `mark_loaded`/`mark_load_failed` -> `release`), so the shared manager can evict
-them; an eviction callback that does not own the requested key returns `False`.
+them; an eviction callback that does not own the requested key returns `False`. Every lease passes
+`owner=` (the module's `_LEASE_OWNER`) and `hint=` (the residency footprint hint from the files the
+load reads: ONNX files x1.25 on the EP's device, Baberu's int8 decoders on the host; MangaOCR's
+PyTorch weights sit in the Hugging Face cache and get a device-only hint). A non-absolute directory
+is never sized (an empty one would sum the working directory).
 
 Device selection is not decided here. Torch services resolve `General.ai_device` through
 `runtime/torch_device.py` (`resolve_selected_backend_device`; `easy.py` binds it with
@@ -72,6 +76,8 @@ its vision graph only and keeps both decoders on the CPU provider (see its bulle
   `ocr_with_boxes` task; each is leased under its own model key, and the directory is part of the
   resident identity next to the device.
 - `script_constraint.py`: stateful UTF-8 `prefix_allowed_tokens_fn` used only by `paddle_vl.py`.
+- `test_lease_hints.py`: the MangaOCR, EasyOCR and Surya hint builders (Baberu's split hint and its
+  lease spy are in `test_baberu.py` `LeaseHintTests`).
 - `test_manga.py`, `test_paddle_vl.py`, `test_surya.py`, `test_easy.py`, `test_script_constraint.py`,
   `test_baberu.py`, `test_paddle_vl_vendor.py`: unit tests for the contracts below. They fake
   `torch`/`transformers`/`surya`/`easyocr`/`manga_ocr` in `sys.modules` or stub the runtime, so no

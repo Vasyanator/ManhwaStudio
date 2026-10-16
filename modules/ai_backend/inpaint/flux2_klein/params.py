@@ -12,17 +12,17 @@ Main responsibilities:
   the typed, clamped, validated dictionary the rest of the package consumes;
 - `validate_region_size` - the region contract (multiple, minimum side, pixel
   budget, aspect ratio); nothing is silently resized;
-- `_model_key` / `_lenient_paths` - the resident-model key and the tolerant path
-  view `status` uses before a run has ever happened;
+- `_lenient_paths` - the tolerant path view `status` uses before a run has
+  ever happened;
 - `text_encoder_dtype_name` - the ONE place that answers what dtype the
-  host-resident text encoder runs in; it is deliberately NOT the request's
+  text encoder runs in; it is deliberately NOT the request's
   `dtype`, which governs the transformer and the VAE alone.
 
 Key functions:
 - normalize_flux2_klein_params()
 - _whole_region_overrides()
 - validate_region_size()
-- _model_key(), effective_steps(), _lenient_paths()
+- effective_steps(), _lenient_paths()
 - text_encoder_dtype_name()
 
 Notes:
@@ -36,19 +36,31 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from ...runtime.large_models.tiers import RamStep, VramStep
+
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Contract constants
 # ---------------------------------------------------------------------------
 
-#: Weight placement modes for the TRANSFORMER AND THE VAE. `full_gpu` and
-#: `encoder_cpu` both put them on the accelerator (they differ only in whether
-#: `low_cpu_mem_usage` is offered alongside); the two offload modes hand placement
-#: to accelerate. The text encoder is not placed by these at all any more — since
-#: the load reorder it always encodes in host memory, because the transformer is
-#: already on the card by the time it is read (`_encode_prompts_locked`).
+#: The LEGACY placement modes (stage 1 of the large-model manager keeps them on
+#: the wire; the Rust settings still send them). They no longer place anything
+#: themselves: `memory.requested_steps` maps them onto a step pair of the
+#: manager (table in `inpaint/MODULE_README.md`, FLUX.2 klein sections).
 VALID_PLACEMENTS = ("full_gpu", "encoder_cpu", "model_cpu_offload", "sequential_cpu_offload")
+
+#: Values of the optional `vram_step` / `ram_step` request fields (`tiers.VramStep`
+#: / `tiers.RamStep` values, `auto` included). Either one present overrides
+#: `profile` and the legacy `placement` mapping; the absent axis is then `auto`.
+VALID_VRAM_STEPS = tuple(step.value for step in VramStep)
+VALID_RAM_STEPS = tuple(step.value for step in RamStep)
+
+#: Values of the optional LEGACY `profile` request field (the stage-1 profile
+#: ids before the two axes; `memory.LEGACY_PROFILE_STEPS` maps each onto a step
+#: pair). Present without `vram_step` / `ram_step`, it overrides the legacy
+#: `placement` mapping.
+VALID_PROFILES = ("auto", "max_speed", "fast", "balanced", "economy", "max_economy")
 
 #: Compute dtypes offered to the user. Both are 2 bytes per parameter. Since the
 #: encoder dtype was fixed (`text_encoder_dtype_name`) this governs the
@@ -58,9 +70,6 @@ VALID_DTYPES = ("bfloat16", "float16")
 #: The dtype the text encoder always runs in, whatever `dtype` the request asks
 #: for. See `text_encoder_dtype_name` for why it is not a choice.
 TEXT_ENCODER_DTYPE = "bfloat16"
-
-#: Placements that are meaningless without an accelerator.
-_GPU_ONLY_PLACEMENTS = ("encoder_cpu", "model_cpu_offload", "sequential_cpu_offload")
 
 #: The pipeline crops (never pads) its input to a multiple of
 #: `vae_scale_factor * 2`; for `AutoencoderKLFlux2` that is 16.
@@ -83,11 +92,11 @@ MAX_REGION_ASPECT_RATIO = 8.0
 #  The text encoder's dtype
 # =====================================================================
 def text_encoder_dtype_name() -> str:
-    """THE single answer to "what dtype does the host-resident text encoder use".
+    """THE single answer to "what dtype does the text encoder use".
 
-    Always `bfloat16`, whatever `normalized["dtype"]` says, because the encoder
-    always runs on the HOST (`_ensure_text_encoder_locked` pins
-    `torch.device("cpu")`) and x86 has no native float16 arithmetic: a fp16
+    Always `bfloat16`, whatever `normalized["dtype"]` says. The encoder runs on
+    the HOST CPU whenever the profile (or the free device memory) puts it there,
+    and x86 has no native float16 arithmetic: a fp16
     forward is emulated element by element, while bfloat16 lowers onto the same
     fp32 paths as everything else. A sibling project measured 59 s against 2.4 s
     per encode on a Zen host for exactly this pair. bfloat16 is also the dtype
@@ -96,9 +105,10 @@ def text_encoder_dtype_name() -> str:
 
     **The scope of that argument is x86**, which is what this project targets
     (`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`), and it is a statement
-    about the HOST's CPU, not about the GPU vendor: it holds identically on a
-    CUDA machine and on a ROCm one, because the encoder never reaches either
-    accelerator. On an ARM host the premise would be the other way round — NEON
+    about the HOST's CPU, not about the GPU vendor. When the encoder runs on the
+    accelerator instead (a profile that keeps it there beside the pipeline),
+    bfloat16 is a native format on both CUDA and ROCm, so the same constant is
+    right there too. On an ARM host the premise would be the other way round — NEON
     has native fp16 while bf16 needs FEAT_BF16 — so if this service is ever
     supported there, re-measure before assuming this constant still points the
     right way. It is deliberately NOT branched on the architecture today:
@@ -150,7 +160,8 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
 
     # Raises
     `ValueError` when the transformer or VAE path is empty or absent, or when an
-    enum value is not one of `VALID_PLACEMENTS` / `VALID_DTYPES`.
+    enum value is not one of `VALID_PLACEMENTS` / `VALID_DTYPES` /
+    `VALID_PROFILES` / `VALID_VRAM_STEPS` / `VALID_RAM_STEPS`.
     """
     merged: dict[str, Any] = {}
     if isinstance(params, dict):
@@ -166,6 +177,10 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
             f"Неизвестный режим размещения FLUX.2 klein: {placement!r}. "
             f"Допустимые значения: {', '.join(VALID_PLACEMENTS)}"
         )
+
+    profile = _optional_choice(merged.get("profile"), VALID_PROFILES, "профиль ресурсов")
+    vram_step = _optional_choice(merged.get("vram_step"), VALID_VRAM_STEPS, "шаг «Видеопамять»")
+    ram_step = _optional_choice(merged.get("ram_step"), VALID_RAM_STEPS, "шаг «Оперативная память»")
 
     dtype = str(merged.get("dtype", "bfloat16") or "").strip()
     if dtype not in VALID_DTYPES:
@@ -188,6 +203,12 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
         "strength": _clamp_float(merged.get("strength"), default=1.0, low=0.25, high=1.0),
         "seed": _to_optional_int(merged.get("seed")),
         "placement": placement,
+        # The manager's step pair when the client sends it (`None` = not sent;
+        # `memory.requested_steps` resolves the three in that order, falling
+        # back to the legacy `placement` flags).
+        "vram_step": vram_step,
+        "ram_step": ram_step,
+        "profile": profile,
         "dtype": dtype,
         "low_cpu_mem_usage": _to_bool(merged.get("low_cpu_mem_usage"), False),
         "vae_tiling": _to_bool(merged.get("vae_tiling"), True),
@@ -344,30 +365,6 @@ def validate_region_size(width: int, height: int) -> None:
 _PATH_KEYS = ("text_encoder_path", "transformer_path", "vae_path")
 
 
-def _model_key(normalized: dict[str, Any]) -> str:
-    """Resident-model key: everything that changes the loaded object.
-
-    `vae_tiling` / `vae_slicing` are excluded on purpose — they are re-applied to
-    the cached pipeline on every request instead of forcing a reload. The text
-    encoder is excluded too, unless it is kept resident: see below.
-    """
-    parts = [
-        normalized["dtype"],
-        normalized["placement"],
-        "lowram" if normalized["low_cpu_mem_usage"] else "normal",
-        normalized["transformer_path"],
-        normalized["vae_path"],
-    ]
-    # The text encoder is NOT part of the pipeline: the prompt phase uses it and
-    # may release it. It belongs to the key only when the user asked to keep it resident,
-    # because that is exactly when the key would otherwise claim less than what
-    # this service is holding.
-    if not normalized["unload_text_encoder_after_encode"]:
-        parts.append(normalized["text_encoder_path"])
-        parts.append("encfp8" if normalized["text_encoder_fp8"] else "encbf16")
-    return "flux2_klein:" + "|".join(parts)
-
-
 def effective_steps(num_steps: int, strength: float) -> int:
     """Denoising steps the pipeline will actually run for `strength`.
 
@@ -401,6 +398,23 @@ def _require_existing_path(value: Any, field: str) -> str:
     if not Path(raw).exists():
         raise ValueError(f"Путь {field} не найден: {raw}")
     return raw
+
+
+def _optional_choice(value: Any, allowed: tuple[str, ...], what: str) -> str | None:
+    """`None` for an absent / empty value, else the stripped value when it is one of `allowed`.
+
+    # Raises
+    `ValueError` naming `what` and the allowed values for anything else.
+    """
+    if value is None or not str(value).strip():
+        return None
+    choice = str(value).strip()
+    if choice not in allowed:
+        raise ValueError(
+            f"Неизвестный {what} FLUX.2 klein: {choice!r}. "
+            f"Допустимые значения: {', '.join(allowed)}"
+        )
+    return choice
 
 
 def _floor_to(value: int, multiple: int = REGION_SIZE_MULTIPLE) -> int:

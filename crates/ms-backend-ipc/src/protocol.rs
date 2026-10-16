@@ -56,7 +56,15 @@ use serde_json::{Map, Value, json};
 /// (`textdetector.surya.forward`), [`HEADER_SDXL_CONFIG_DIR`] (`inpaint.sdxl`), plus
 /// [`HEADER_SDXL_MODEL_DIR`] (`inpaint.sdxl`, required for the curated repo id);
 /// [`HEADER_EASY_LANGS`] is no longer aliased by the backend; other SDXL repo ids are refused.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// 13: large-model pool: new methods [`METHOD_LARGE_MODELS_PROFILES`],
+/// [`METHOD_LARGE_MODELS_LIMITS_SET`], [`METHOD_LARGE_MODELS_STATUS`],
+/// [`METHOD_LARGE_MODELS_UNLOAD`], [`METHOD_LARGE_MODELS_LEARNED_RESET`]; the `health` payload's
+/// `model_manager` object gains `small_models`, `large_models`, `limits`, `budget`; new
+/// `user_config` keys `General.large_models_{vram_cap_bytes, ram_cap_bytes}` (written by the
+/// backend) and `General.large_models_oom_score_adj` (read at backend start). Residency is chosen
+/// on two step axes, `vram_step` x `ram_step`; `inpaint.flux2_klein` gains the optional step
+/// fields additively.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -268,6 +276,23 @@ pub const METHOD_RELINE_PROCESS: &str = "reline.process";
 // `payload` field; progress streams as `progress` frames and the daemon's
 // terminal event dict is the response header. Mirrors Python METHOD_BROWSER_COMMAND.
 pub const METHOD_BROWSER_COMMAND: &str = "browser.command";
+
+// --- Large-model pool (protocol v13) ---
+/// Plans the VRAM / RAM step pickers of one large model for one request shape (read-only: the
+/// backend probes and plans, never loads). Request: `model`, `params`, `shape`, optional
+/// `format` / `vram_step` / `ram_step`; answer: `selected`, `vram`, `ram`, `learned_floor`,
+/// `limits`, `formats`, `suggestions`.
+/// Shapes: `modules/ai_backend/ipc/PROTOCOL.md` §5.10.
+pub const METHOD_LARGE_MODELS_PROFILES: &str = "large_models.profiles";
+/// Sets the large-model pool's hard VRAM / RAM caps (persisted by the backend in
+/// `user_config` `General`); answers the limits in force.
+pub const METHOD_LARGE_MODELS_LIMITS_SET: &str = "large_models.limits.set";
+/// Loaded large-model handles (effective steps, per-component placement) and the limits in force.
+pub const METHOD_LARGE_MODELS_STATUS: &str = "large_models.status";
+/// Drops the idle large-model handles (all, or one model's); answers the dropped keys.
+pub const METHOD_LARGE_MODELS_UNLOAD: &str = "large_models.unload";
+/// Forgets the learned step floors (all, or one model's); answers how many were cleared.
+pub const METHOD_LARGE_MODELS_LEARNED_RESET: &str = "large_models.learned.reset";
 
 // --- Health ---
 pub const METHOD_HEALTH: &str = "health";

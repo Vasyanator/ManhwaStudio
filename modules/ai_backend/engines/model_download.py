@@ -61,7 +61,7 @@ other receives the token as a request field, and this layer must not decide
 which. No header value is ever logged or interpolated into an error message.
 
 The download lock is intentionally NOT a service lock: a multi-GiB transfer must
-never block `health()`, `unload()` or a `LoadedModelManager` eviction callback.
+never block `health()`, `unload()` or a `SmallModelManager` eviction callback.
 It is therefore held across network I/O and must never be nested inside a
 service-local lock.
 

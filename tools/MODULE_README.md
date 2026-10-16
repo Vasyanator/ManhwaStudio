@@ -18,6 +18,10 @@ Several unrelated concerns live here:
   fixtures of `ms-text-detect` recorded from the Python backend, and the Baberu OCR
   parity fixtures of `ms-onnx` recorded from Pillow and the upstream reference loop. Run
   by hand only when a fixture's contract changes.
+- **large-model calibration** (`large_model_calibration/`) — measuring the backend's
+  large-model manager on a real GPU (FLUX.3 / FLUX.2 runs under the real manager) and
+  fitting / judging its cost tables `modules/ai_backend/runtime/large_models/calibration/`.
+  Run by hand when a device class is (re)calibrated.
 - **`run-dev/`** — the source-run entry point (update from git, provision Rust,
   `cargo run`). Unlike everything else here it is aimed at **users**, not agents,
   and is invoked through the launchers in the project root. It has its own
@@ -80,6 +84,13 @@ detection cannot be fooled by punctuation inside strings or comments.
   plus its contract tests. Boundary: it may read `Cargo.toml` and drive `git`,
   `rustup` and `cargo`, but must never import or be imported by anything in
   `src/`. See its own `MODULE_README.md`.
+- `large_model_calibration/`: run as a directory
+  (`venv/bin/python tools/large_model_calibration {flux3,flux2,fit,check} ...`). Drives the
+  real FLUX services under the real `LargeModelManager`, records every manager step
+  (device and in-step host peaks, placements, phase work) into a report OUTSIDE the
+  repository, fits `calibration/<device_class>.json` from reports (`fit`) and judges
+  forecasts against measurements (`check`). Needs the backend's torch stack and a GPU;
+  nothing in the backend imports it. See its `MODULE_README.md`.
 - `model_pins/`: stdlib-only pin generator (`compute_pins.py` + `sources.json`). Downloads
   each pinned source once into a scratch dir OUTSIDE the repo, hashes it (zip members too)
   and prints catalog rows (size + sha256) for the Rust / Python download catalogs. Never

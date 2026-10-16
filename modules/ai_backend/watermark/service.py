@@ -14,7 +14,7 @@ Main responsibilities:
   staging file and the atomic publish come from
   `engines/model_download.download_http_to_path`;
 - lazily build one resident network at a time under an `RLock`, leased from the
-  shared `LoadedModelManager` with key `watermark:<model>:<device>`;
+  shared `SmallModelManager` with key `watermark:<model>:<device>`;
 - `detect_mask_bytes`: a single whole-image pass on a downscaled square copy,
   producing an L8 mask at the SOURCE resolution — the primary product, meant to
   be fed to one of the project's existing inpainters;
@@ -60,12 +60,17 @@ from ..engines.model_download import (
     retry_progress_label,
 )
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
+from ..runtime.residency.footprint import hint_from_files
+from ..runtime.residency.holdings import FootprintHint
 from ..runtime.rocm_mmap_transfer import move_module_to
 from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from . import code_fetch
 
 log = logging.getLogger(__name__)
+
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "watermark"
 
 #: Progress callback: `(phase, step, total, label)`, phase in {"download", "generate"}.
 ProgressCb = Callable[[str, int, int, str], None]
@@ -229,11 +234,11 @@ class WatermarkRemovalService:
     """Lazy-loading visible-watermark detector/remover for the `watermark.*` methods.
 
     One network is resident at a time, guarded by `self._lock` and leased from
-    the shared `LoadedModelManager` under the key `watermark:<model>:<device>`.
+    the shared `SmallModelManager` under the key `watermark:<model>:<device>`.
     Construction is cheap and imports nothing heavy.
     """
 
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.RLock()
         self._model_manager = model_manager
         self._net: Any = None
@@ -604,8 +609,18 @@ class WatermarkRemovalService:
         """
         device = _resolve_selected_backend_device(self._active_device)
         model_key = f"watermark:{model_id}:{device}"
+        # Pre-load size: the checkpoint `_ensure_model_locked` reads. An unknown
+        # `model_id` gets an unknown-size hint here, so its `ValueError` is still
+        # raised (and recorded) by the load scope below, as before.
+        if model_id in WEIGHTS:
+            hint = hint_from_files([weights_path(model_id)], device)
+        else:
+            hint = FootprintHint(device=device)
         lease = self._model_manager.begin_model_use(
-            model_key, unload_callback=lambda: self._unload_key(model_key)
+            model_key,
+            unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=hint,
         )
         with self._lock:
             try:
@@ -615,8 +630,7 @@ class WatermarkRemovalService:
                     if lease.needs_load:
                         lease.mark_load_failed()
                     raise
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
+                lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 result = run(net)
                 self._last_error = None
                 self._publish_health_locked()

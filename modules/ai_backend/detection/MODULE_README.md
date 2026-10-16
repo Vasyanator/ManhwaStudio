@@ -38,9 +38,11 @@ contract and its validation, and touches services exclusively through `HandlerCo
 never imports this package. Its only service call is `forward_tiles(tiles)` (Surya:
 `forward_tiles(tiles, model_dir=...)`).
 
-`ctd.py` and `surya.py` take a `LoadedModelManager` (`../runtime/model_manager.py`) and hold a lease
-around every forward pass so the process-wide resident-model budget can unload them. `paddle.py` has
-no lease of its own: ONNX sessions are leased inside `PaddleOnnxRuntime`.
+`ctd.py` and `surya.py` take a `SmallModelManager` (`../runtime/model_manager.py`) and hold a lease
+around every forward pass so the process-wide resident-model budget can unload them; each lease
+passes `owner=` (`_LEASE_OWNER`) and `hint=` (the checkpoint file / directory size, see
+`../runtime/residency/MODULE_README.md`). `paddle.py` has no lease of its own: ONNX sessions are
+leased inside `PaddleOnnxRuntime`.
 
 ## Files and submodules
 - `ctd.py`: CTD service. Keys the loaded network by `ctd:<device>` so a device change reloads it;
@@ -54,6 +56,7 @@ no lease of its own: ONNX sessions are leased inside `PaddleOnnxRuntime`.
   fake nets and predictors injected at `CtdTextDetectorService._forward_locked`,
   `surya._forward_with_predictor` and the Paddle service's runtime factory (Torch tests skip when
   Torch is absent).
+- `test_lease_hints.py`: the owner and size hint the CTD and Surya leases hand the manager.
 - `test_surya_service.py`: the Surya checkpoint contract with fake `surya.*` modules (local dir as
   `checkpoint=` and in the settings, "not downloaded" errors, directory identity, health; a fake
   `download_directory` raises), plus the opt-in `RealCheckpointTests` (`MS_SURYA_DETECTION_DIR`).

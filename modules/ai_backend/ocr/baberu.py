@@ -10,7 +10,7 @@ Main responsibilities:
 - preprocess a crop exactly like upstream `onnx_infer.py` (`preprocess`);
 - run the upstream greedy decode with its repetition penalty and run caps
   (`greedy_decode`) and map ids back to characters (`BaberuVocab`);
-- lease the resident sessions from the shared `LoadedModelManager`.
+- lease the resident sessions from the shared `SmallModelManager`.
 
 Key structures:
 - `BaberuOcrService`, `BaberuFiles`, `BaberuVocab`
@@ -54,7 +54,9 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping
 import numpy as np
 
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
+from ..runtime.residency.footprint import hint_from_files
+from ..runtime.residency.holdings import FootprintHint, Runtime
 from .result_format import format_recognition_lines
 
 if TYPE_CHECKING:
@@ -62,6 +64,9 @@ if TYPE_CHECKING:
     from ..runtime.device_service import AiDeviceService
 
 log = logging.getLogger(__name__)
+
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "ocr.baberu"
 
 # DINOv2 / ImageNet preprocessing: the whole crop is resized to 224x224 (no
 # aspect preservation, no center crop), as in upstream `onnx_infer.py`.
@@ -311,6 +316,25 @@ def _build_cpu_session(ort: Any, model_path: Path) -> Any:
         raise RuntimeError(f"Failed to create the Baberu ONNX session for {model_path}: {exc}") from exc
 
 
+def _footprint_hint(files: BaberuFiles, selected: "ProviderSettings") -> FootprintHint:
+    """Pre-load size of a Baberu runtime for the residency arbiter (split by device).
+
+    The vision session's file (x1.25, ONNX) sits on the device of
+    `vision_provider_settings(selected)`; the int8 prefill and step decoders
+    always run on the CPU, so their file bytes (x1.25) are added to the host
+    side. An unreadable file leaves that side unknown (the arbiter's default).
+    A vision session that falls back to the CPU at build time is still
+    estimated on the requested device.
+    """
+    vision = hint_from_files([files.vision], vision_provider_settings(selected).footprint_device(), onnx=True)
+    decoders = hint_from_files([files.prefill, files.step], "cpu", onnx=True)
+    if vision.host_bytes is None or decoders.host_bytes is None:
+        host_bytes = None
+    else:
+        host_bytes = vision.host_bytes + decoders.host_bytes
+    return FootprintHint(device=vision.device, device_bytes=vision.device_bytes, host_bytes=host_bytes, runtime=Runtime.ONNX)
+
+
 def _build_vision_session(ort: Any, model_path: Path, selected: "ProviderSettings") -> tuple[Any, str]:
     """Build the vision session per `vision_provider_settings`; return it and its device label.
 
@@ -489,7 +513,7 @@ class BaberuOcrService:
 
     MODEL_KEY_PREFIX = "baberuocr"
 
-    def __init__(self, model_manager: LoadedModelManager, ai_device_service: "AiDeviceService") -> None:
+    def __init__(self, model_manager: SmallModelManager, ai_device_service: "AiDeviceService") -> None:
         self._lock = threading.Lock()
         self._model_manager = model_manager
         self._ai_device_service = ai_device_service
@@ -541,7 +565,12 @@ class BaberuOcrService:
 
         # Lease before the instance lock: an eviction callback of another
         # service may hold the manager while waiting for this lock.
-        lease = self._model_manager.begin_model_use(model_key, unload_callback=lambda: self._unload_key(model_key))
+        lease = self._model_manager.begin_model_use(
+            model_key,
+            unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=_footprint_hint(files, settings),
+        )
         try:
             with self._lock:
                 # Load scope: only a failure in here is a failed LOAD.
@@ -553,9 +582,10 @@ class BaberuOcrService:
                     if lease.needs_load:
                         lease.mark_load_failed()
                     raise
-            # Resident from here on, so it is registered before inference: an
-            # inference failure must leave it counted and evictable.
-            if lease.needs_load:
+                # Resident from here on, so it is registered before inference:
+                # an inference failure must leave it counted and evictable.
+                # Under the lock and unconditionally: the lease protocol in
+                # `runtime/model_manager.py`.
                 lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
             try:
                 text = runtime.recognize(image)

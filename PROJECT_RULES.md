@@ -100,6 +100,10 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   tiling decision (`ms_text_detect::plan_detection`, used by the detector worker and panel notice),
   local-AI route availability (`ms_local_ai::local_ai::AiRouteKind::availability`: never test
   `--no-ai` or the platform for an AI route anywhere else),
+  backend memory budget (usable memory: `modules/ai_backend/runtime/memory_budget.py`; ledger and
+  reclaim: `runtime/residency/`), large-model placement / forecast / degrade
+  (`runtime/large_models/`: a model service declares specs and phases, never moves a weight),
+  checkpoint -> meta-module filling (`runtime.safetensors_stream.fill_module_from_safetensors`),
   OS integration records — record names (`ms_os_integration::identity`), expected registry
   values (`ms_os_integration::windows::values`) and the "Open with" ownership rule
   (`open_with_command_targets_install`); no other crate spells a record name or builds its values;
@@ -111,6 +115,20 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
 - Python backend on ROCm: never advise or enable `expandable_segments:True`; checkpoint weights
   move to the GPU only via `modules/ai_backend/runtime/rocm_mmap_transfer.py`; every
   user-facing backend error text passes through `runtime/error_text.py::sanitize_torch_error`.
+
+## Backend memory (`modules/ai_backend/runtime/`)
+
+- Never plan device memory above `total - reserve`; budget on reserved bytes / `mem_get_info`,
+  never on allocated bytes (the allocator's cache and the context are real usage).
+- Release the allocator cache (`clear_torch_cache`) at every phase boundary: the large-model
+  forecast assumes it, and carried-over cache is the main source of under-forecasts.
+- Park a host copy as one buffer per block, never per tensor: glibc keeps small frees in RSS.
+- Count host memory as `RssAnon + RssShmem`: CUDA pinned memory shows up as `RssShmem`.
+- Never rsync/scp the whole `modules/` directory to another machine: it holds private browser
+  profiles (`modules/browser_profiles/`). Copy only the files a measurement needs.
+- Regenerate a calibration table (`runtime/large_models/calibration/<device_class>.json`) with
+  `venv/bin/python tools/large_model_calibration` on an idle GPU: `flux2` / `flux3` measure,
+  `fit <reports> --base <table> --out <table>`, then `check` a validation grid (its `MODULE_README.md`).
 
 ## Input (`ms-input`)
 

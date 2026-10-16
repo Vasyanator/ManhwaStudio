@@ -50,12 +50,16 @@ if TYPE_CHECKING:
     import numpy as np
 
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
+from ..runtime.residency.footprint import hint_from_files
 from ..runtime.rocm_mmap_transfer import patched_module_to
 from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from .lama import LamaInpaintService
 
 MODEL_SUFFIXES = (".safetensors", ".ckpt")
+#: Owner name of this service's leases in the residency arbiter (owner rule; the
+#: nested LaMa prefill lease is LaMa's own owner).
+_LEASE_OWNER = "inpaint.sdxl"
 
 # The only Hugging Face repo id `model_path` may name. Rust downloads its pinned
 # fp16 files (`ms_sysprobe` external catalog) and sends that directory as the
@@ -179,7 +183,7 @@ class SdxlInpaintService:
 
     def __init__(
         self,
-        model_manager: LoadedModelManager,
+        model_manager: SmallModelManager,
         lama_service: LamaInpaintService,
     ) -> None:
         self._lock = threading.RLock()
@@ -245,9 +249,17 @@ class SdxlInpaintService:
 
         device = _resolve_selected_backend_device(self._active_device)
         model_key = self._model_key_for(source, normalized["mode"], device)
+        # Pre-load size: the checkpoint file, or every file of the diffusers
+        # folder (the curated download holds only its pinned fp16 files). The
+        # single-file config repo holds no weights. File bytes, not the loaded
+        # dtype: an fp32 checkpoint loaded in fp16 stays over-counted (a clean
+        # load records max(hint, measured)).
+        hint = hint_from_files([source.path], device)
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=hint,
         )
 
         with self._lock:
@@ -271,8 +283,7 @@ class SdxlInpaintService:
                 # `four_channel` mode the generation below takes a SECOND lease
                 # (the shared LaMa prefill), which is exactly when the manager
                 # must see this pipeline as resident and in use.
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
+                lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 out_rgb = self._inpaint_locked(
                     pipe,
                     image_rgb=image_rgb,

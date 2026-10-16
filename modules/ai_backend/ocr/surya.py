@@ -7,7 +7,7 @@ Main responsibilities:
 - optional lazy init of Surya text detector for `ocr_with_boxes` mode;
 - OCR recognition from raw image bytes with stable JSON-friendly output;
 - synchronization of model device with backend `General.ai_device`;
-- cooperation with `LoadedModelManager` for bounded resident model count.
+- cooperation with `SmallModelManager` for bounded resident model count.
 
 Key runtime options:
 - `task_name`: `ocr_without_boxes`, `block_without_boxes`, or `ocr_with_boxes`;
@@ -40,11 +40,14 @@ import io
 import logging
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from ..engines.surya_checkpoints import point_settings_at, require_local_checkpoint
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
+from ..runtime.residency.footprint import hint_from_files
+from ..runtime.residency.holdings import FootprintHint
 from ..runtime.rocm_mmap_transfer import patched_module_to
 from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 
@@ -72,12 +75,27 @@ _resolve_selected_backend_device = resolve_selected_backend_device
 #: patched by name in the test suite.
 _clear_torch_cache = functools.partial(clear_torch_cache, owner="Surya OCR")
 
+#: Owner name of this service's leases (foundation and line detector) in the
+#: residency arbiter (owner rule).
+_LEASE_OWNER = "ocr.surya"
+
+
+def _dir_hint(directory: str, device: str) -> FootprintHint:
+    """Pre-load size of a checkpoint directory: every file in it, on `device`.
+
+    A non-absolute `directory` (refused by the load) is never sized, since an
+    empty one would sum the working directory: it gets an unknown-size hint.
+    """
+    if not Path(directory).is_absolute():
+        return FootprintHint(device=device)
+    return hint_from_files([directory], device)
+
 
 class SuryaOcrService:
     FOUNDATION_MODEL_KEY_PREFIX = "suryaocr:foundation"
     DETECTOR_MODEL_KEY_PREFIX = "suryaocr:detector"
 
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.Lock()
         self._model_manager = model_manager
         self._foundation_predictor = None
@@ -165,21 +183,36 @@ class SuryaOcrService:
         detector_needed = normalized_task == SURYA_TASK_OCR_WITH_BOXES
         detector_key = self._detector_model_key(selected_device)
 
+        # Pre-load sizes: every file of the directory each predictor loads.
         foundation_lease = self._model_manager.begin_model_use(
             foundation_key,
             unload_callback=lambda: self._unload_foundation_key(foundation_key),
+            owner=_LEASE_OWNER,
+            hint=_dir_hint(recognition_dir, selected_device),
         )
         detector_lease = None
         if detector_needed:
-            detector_lease = self._model_manager.begin_model_use(
-                detector_key,
-                unload_callback=lambda: self._unload_detector_key(detector_key),
-            )
+            try:
+                detector_lease = self._model_manager.begin_model_use(
+                    detector_key,
+                    unload_callback=lambda: self._unload_detector_key(detector_key),
+                    owner=_LEASE_OWNER,
+                    hint=_dir_hint(detection_dir, selected_device),
+                )
+            except BaseException:
+                # The detector admission can be refused (`ModelMemoryShortError`);
+                # the foundation lease taken above must not leak. It has loaded
+                # nothing yet, so a reserved load is aborted, not left `loading`.
+                if foundation_lease.needs_load:
+                    foundation_lease.mark_load_failed()
+                foundation_lease.release()
+                raise
 
         try:
+            # Each `mark_loaded` under the lock that guards its model and
+            # unconditionally: the lease protocol in `runtime/model_manager.py`.
             with self._lock:
                 recognition_predictor = self._ensure_recognition_loaded_locked(selected_device, recognition_dir)
-            if foundation_lease.needs_load:
                 foundation_lease.mark_loaded(
                     unload_callback=lambda: self._unload_foundation_key(foundation_key)
                 )
@@ -189,10 +222,10 @@ class SuryaOcrService:
                     if detector_needed
                     else None
                 )
-            if detector_lease is not None and detector_lease.needs_load:
-                detector_lease.mark_loaded(
-                    unload_callback=lambda: self._unload_detector_key(detector_key)
-                )
+                if detector_lease is not None:
+                    detector_lease.mark_loaded(
+                        unload_callback=lambda: self._unload_detector_key(detector_key)
+                    )
 
             result = self._recognize_with_predictors(
                 image=image,
@@ -445,7 +478,7 @@ class SuryaOcrService:
         """Drop every predictor when `model_key` names the resident foundation.
 
         Returns `False` when another key is resident, which is what tells
-        `LoadedModelManager` the eviction did not happen.
+        `SmallModelManager` the eviction did not happen.
         """
         with self._lock:
             current_device = self._device

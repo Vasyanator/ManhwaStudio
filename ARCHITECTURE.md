@@ -430,6 +430,18 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   `AppState` fields (their names are contract). Dependency direction: domains (`ocr`,
   `detection`, `inpaint`, `reline`, `translate`, `watermark`, `browser`) -> `engines/` ->
   `runtime/`. Detail: `modules/ai_backend/MODULE_README.md`.
+- **Backend memory: two peer pools, one arbiter.** Every model the backend holds is a lease of
+  one `ResidencyArbiter` (`runtime/residency/`, the backend's memory-budget ledger; usable
+  host/device memory is read only by `runtime/memory_budget.py`): the small pool
+  (`SmallModelManager`, byte-aware, `General.ai_max_loaded_models` a secondary count cap) and the
+  large pool (`LargeModelManager`, `runtime/large_models/`) reclaim idle holdings from each other.
+  The large-model manager alone decides placement, forecast (per-device-class calibration tables)
+  and degrade for large models; their services declare specs and phases and never move a weight.
+  The user steers it on two axes, «Видеопамять» (max / phase / half / min) and «Оперативная
+  память» (keep / run / min), each with auto, under hard byte caps (`large_models.*`,
+  `PROTOCOL.md` §5.10). FLUX.2 klein runs on it; FLUX.3 klein is a backend service on it that
+  is not wired yet (no `server.py` construction, IPC method or UI). Detail:
+  `modules/ai_backend/runtime/large_models/MODULE_README.md`.
 - **One ONNX selection** (`General.ai_onnx_build` / `ai_onnx_provider` / `ai_onnx_device_id`)
   drives both runtimes. An unavailable accelerator falls back to the CPU build with a log; a
   different build needs an app restart.
@@ -512,6 +524,7 @@ logged error); the GUI thread only polls and applies results.
 | Text detection plan / tiles / stitch / postprocess (one plan for worker and panel notice) | `ms-text-detect`, driven by `ms-tab-translation/src/text_detector/` |
 | Native ONNX load and inference | `ms-native-runtime` (called from those workers) |
 | AI backend process supervisor | `ms-settings-ui/src/ai_backend_supervisor.rs` |
+| Large-model run (admission, per-phase loads and block moves with prefetch, degrade retries) | `modules/ai_backend/runtime/large_models/` (`Session`), driven by the FLUX klein services |
 | Storage-mode conversion job | `ms-settings-ui/src/storage_mode_job.rs` |
 | Structural page ops, thumbnails, viewer clean decode | `ms-tab-page-manager` + `ms-page-ops` |
 | Typing live render (latest-wins), save, export | `ms-tab-typing/src/tab/` |
@@ -580,6 +593,16 @@ logged error); the GUI thread only polls and applies results.
 
 Detail: `src/studio/MODULE_README.md`, `crates/ms-models/src/MODULE_README.md`,
 `crates/ms-models/src/layer_model/MODULE_README.md`, `crates/ms-tab-typing/src/MODULE_README.md`.
+
+**AI backend memory**
+- One owner of the backend memory budget: usable memory `runtime/memory_budget.py`, ledger and
+  reclaim `runtime/residency/`; no pool or service plans against a probe of its own.
+- Never a host OOM: a large-model plan must fit the host budget before admission and every load
+  or move is guarded live (`HostWatch`); device plans never exceed `total - reserve`. On Linux
+  the backend sets its own `oom_score_adj` to 1000, so the kernel's last resort hits the backend,
+  not the app.
+- Single copy of weights: a weight block lives in exactly one place (device, host or file) apart
+  from the blocks in flight; nothing keeps a RAM copy of what sits in VRAM.
 
 **Versions and protocol**
 - Program versions are compared only via `CARGO_PKG_VERSION`; `MS_APP_VERSION` is display-only.

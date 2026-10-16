@@ -5,7 +5,8 @@ Purpose:
 Unit tests for `runtime/torch_device.py`: the `General.ai_device` resolution
 order, the `not-selected` sentinel, both per-service device policies
 (`accept_mps`, `mps_last_resort`), the CPU-only answer of a failing device probe,
-and `clear_torch_cache` (CUDA always, MPS only with `include_mps`, a failing
+the integrated-GPU rule and the discrete resolution of the large-model services
+(table-driven over faked device properties), and `clear_torch_cache` (CUDA always, MPS only with `include_mps`, a failing
 release logged rather than raised, no torch tolerated).
 
 Notes:
@@ -19,6 +20,7 @@ from __future__ import annotations
 import sys
 import types
 import unittest
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -88,6 +90,118 @@ class ResolveSelectedBackendDeviceTests(unittest.TestCase):
         self.assertEqual(_resolve("vulkan", ["cpu", "mps"], "cuda", mps_last_resort=True), "mps")
         self.assertEqual(_resolve("vulkan", ["cpu", "mps", "cuda"], "cuda:5", mps_last_resort=True), "cuda")
         self.assertEqual(_resolve("cpu", ["cpu", "mps"], "cpu", mps_last_resort=True), "cpu")
+
+
+def _gpu(name: str, arch: str, gib: int, **extra: Any) -> SimpleNamespace:
+    """Fake `torch.cuda` device properties; `extra` may carry `is_integrated`."""
+    return SimpleNamespace(name=name, gcnArchName=arch, total_memory=gib << 30, **extra)
+
+
+_RX9070 = _gpu("AMD Radeon RX 9070 XT", "gfx1201", 16)
+_RX6800 = _gpu("AMD Radeon RX 6800", "gfx1030:sramecc-:xnack-", 16)
+_RX6600 = _gpu("AMD Radeon RX 6600", "gfx1032", 8)
+_RAPHAEL = _gpu("AMD Radeon Graphics", "gfx1036", 2)
+_PHOENIX = _gpu("AMD Radeon 780M", "gfx1103", 4)
+_STRIX_HALO = _gpu("AMD Radeon 8060S", "gfx1151", 96)
+_RTX5070 = _gpu("NVIDIA GeForce RTX 5070", "", 12, is_integrated=False)
+_JETSON = _gpu("Orin", "", 32, is_integrated=True)
+
+
+def _resolve_discrete(
+    ai_device: Any,
+    devices: list[SimpleNamespace],
+    fallback: str = "cuda",
+    available: list[str] | None = None,
+    **policy: bool,
+) -> str:
+    with mock.patch.object(torch_device, "UserConfig", _Config(ai_device)), mock.patch.object(
+        torch_device, "AIDevice", _Devices(["cpu"] if available is None else available)
+    ), mock.patch.object(torch_device, "_cuda_device_properties", lambda: list(devices)):
+        return torch_device.resolve_discrete_backend_device(fallback, **policy)
+
+
+class IsIntegratedGpuTests(unittest.TestCase):
+    def test_the_rule_table(self) -> None:
+        cases = (
+            (_RX9070, False),
+            (_RX6800, False),  # gfx1030 is discrete: no prefix matching
+            (_RX6600, False),
+            (_gpu("AMD Radeon RX 6500 XT", "gfx1034", 4), False),
+            (_RAPHAEL, True),
+            (_PHOENIX, True),
+            (_STRIX_HALO, True),
+            (_gpu("AMD Radeon Graphics", "gfx90c:xnack-", 1), True),
+            (_gpu("AMD Ryzen 7 5800H with Radeon Graphics", "", 1), True),
+            (_RTX5070, False),
+            (_JETSON, True),
+            # `is_integrated` False does not clear an iGPU arch.
+            (_gpu("AMD Radeon Graphics", "gfx1036", 2, is_integrated=False), True),
+            # A missing attribute is no evidence either way.
+            (SimpleNamespace(), False),
+        )
+        for props, expected in cases:
+            with self.subTest(name=getattr(props, "name", "<none>"), arch=getattr(props, "gcnArchName", "")):
+                self.assertIs(torch_device.is_integrated_gpu(props), expected)
+
+
+class ResolveDiscreteBackendDeviceTests(unittest.TestCase):
+    def test_honoured_configuration_table(self) -> None:
+        # (configured, devices, fallback, available, expected)
+        cases = (
+            (None, [_RX9070, _RAPHAEL], "cuda", None, "cuda:0"),
+            (None, [_RAPHAEL, _RX9070], "cuda", None, "cuda:1"),
+            ("cuda", [_RAPHAEL, _RX6800], "cuda", None, "cuda:1"),
+            ("not-selected", [_RX6600, _RX9070], "cuda", None, "cuda:1"),  # most memory wins
+            ("cuda:0", [_RX6600, _RX9070], "cuda", None, "cuda:0"),  # a configured discrete one stays
+            ("cuda:1", [_RX9070, _RAPHAEL], "cuda", None, "cuda:0"),  # configured iGPU overridden
+            ("cuda:7", [_RX9070], "cuda", None, "cuda:0"),  # unknown index
+            ("cuda:1", [_RX9070, _PHOENIX], "cuda", None, "cuda:0"),
+            (None, [_STRIX_HALO], "cuda", None, "cpu"),  # iGPU only -> CPU, never the iGPU
+            ("cuda:0", [_RAPHAEL], "cuda", None, "cpu"),
+            ("cpu", [_RX9070], "cuda", None, "cpu"),
+            (None, [_RX9070], "cpu", None, "cpu"),  # the fallback decides when unset
+            (None, [], "cuda", None, "cpu"),
+            ("mps", [], "cuda", ["cpu", "mps"], "mps"),
+            ("mps", [_RX9070], "cuda", ["cpu"], "cuda:0"),  # unavailable mps
+            (None, [_RTX5070, _JETSON], "cuda", None, "cuda:0"),
+        )
+        for configured, devices, fallback, available, expected in cases:
+            with self.subTest(configured=configured, devices=[d.name for d in devices], fallback=fallback):
+                self.assertEqual(_resolve_discrete(configured, devices, fallback, available), expected)
+
+    def test_a_configured_igpu_is_overridden_with_a_warning(self) -> None:
+        with self.assertLogs(torch_device.log, level="WARNING") as logs:
+            self.assertEqual(_resolve_discrete("cuda:1", [_RX9070, _RAPHAEL]), "cuda:0")
+        self.assertIn("integrated GPU", "\n".join(logs.output))
+
+    def test_mps_policies(self) -> None:
+        self.assertEqual(_resolve_discrete("mps", [], "cuda", ["cpu", "mps"], accept_mps=False), "cpu")
+        self.assertEqual(_resolve_discrete(None, [_RAPHAEL], "cuda", ["cpu", "mps"]), "cpu")
+        self.assertEqual(
+            _resolve_discrete(None, [_RAPHAEL], "cuda", ["cpu", "mps"], mps_last_resort=True), "mps"
+        )
+
+    def test_without_honouring_the_configuration(self) -> None:
+        # FLUX.1-Fill: the setting is ignored, `cpu` included.
+        cases = (
+            ("cpu", [_RAPHAEL, _RX6800], "cuda:1"),
+            ("cuda:0", [_RAPHAEL, _RX6800], "cuda:1"),
+            (None, [_RX6600, _RX9070], "cuda:1"),
+            ("cuda:0", [_RAPHAEL], "cpu"),
+            (None, [], "cpu"),
+        )
+        for configured, devices, expected in cases:
+            with self.subTest(configured=configured, devices=[d.name for d in devices]):
+                self.assertEqual(
+                    _resolve_discrete(configured, devices, honour_configured=False), expected
+                )
+
+    def test_a_failing_probe_counts_as_no_gpu(self) -> None:
+        fake = types.ModuleType("torch")
+        cuda = types.SimpleNamespace(is_available=lambda: True, device_count=mock.Mock(side_effect=RuntimeError("hip")))
+        fake.cuda = cuda  # type: ignore[attr-defined]
+        with mock.patch.dict(sys.modules, {"torch": fake}), self.assertLogs(torch_device.log, level="WARNING"):
+            self.assertEqual(torch_device._cuda_device_properties(), [])
 
 
 class NormalizeBackendDeviceTests(unittest.TestCase):

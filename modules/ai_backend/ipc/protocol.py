@@ -46,8 +46,16 @@ from __future__ import annotations
 # (textdetector.surya.forward), `sdxl_config_dir` (inpaint.sdxl), plus
 # `sdxl_model_dir` (inpaint.sdxl, required for the curated repo id);
 # `easy_langs` is no longer aliased; other SDXL repo ids are refused.
+# 13: large-model pool: new methods `large_models.profiles` / `.limits.set` /
+# `.status` / `.unload` / `.learned.reset`; the `health` payload's
+# `model_manager` object gains `small_models`, `large_models`, `limits`, `budget`;
+# new `user_config` keys `General.large_models_{vram_cap_bytes, ram_cap_bytes}`
+# (written by the backend) and `General.large_models_oom_score_adj` (read at
+# backend start). Residency is chosen on two step axes, `vram_step` x `ram_step`
+# (`.profiles` request and answer, `.status` entries); `inpaint.flux2_klein`
+# gains the optional step fields additively.
 # ============================================================================
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 13
 
 # ============================================================================
 # FRAME SIZE GUARDS
@@ -216,6 +224,17 @@ METHOD_RELINE_PROCESS = "reline.process"  # POST /reline/process
 # and the daemon's terminal event dict is returned as the response header.
 METHOD_BROWSER_COMMAND = "browser.command"  # was: adv_fetch_cli.py / adv_fetch_cloak_cli.py stdio
 
+# --- Large-model pool (v13) ---
+# Model-agnostic planning and residency of the large models (FLUX.2 / FLUX.3
+# klein) through `AppState.large_models` (`runtime/large_models/manager.py`).
+# `.profiles` is read-only (probes and plans, never loads); the others change the
+# pool or the user's limits. Request/response shapes: PROTOCOL.md §5.10.
+METHOD_LARGE_MODELS_PROFILES = "large_models.profiles"  # VRAM / RAM step pickers (fit + forecast) for one request
+METHOD_LARGE_MODELS_LIMITS_SET = "large_models.limits.set"  # hard VRAM / RAM caps (persisted)
+METHOD_LARGE_MODELS_STATUS = "large_models.status"  # loaded handles and the limits in force (floors: .profiles)
+METHOD_LARGE_MODELS_UNLOAD = "large_models.unload"  # drop idle handles (all, or one model's)
+METHOD_LARGE_MODELS_LEARNED_RESET = "large_models.learned.reset"  # forget learned step floors
+
 # --- Health ---
 # Health is primarily pushed via TOPIC_HEALTH events, but a request/response
 # form is kept so a freshly connected client can pull the current snapshot.
@@ -268,6 +287,11 @@ ALL_METHODS = frozenset(
         METHOD_RELINE_MODELS,
         METHOD_RELINE_PROCESS,
         METHOD_BROWSER_COMMAND,
+        METHOD_LARGE_MODELS_PROFILES,
+        METHOD_LARGE_MODELS_LIMITS_SET,
+        METHOD_LARGE_MODELS_STATUS,
+        METHOD_LARGE_MODELS_UNLOAD,
+        METHOD_LARGE_MODELS_LEARNED_RESET,
         METHOD_HEALTH,
     }
 )

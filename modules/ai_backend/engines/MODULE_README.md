@@ -35,7 +35,9 @@ for cv2/onnxruntime at startup.
   and device id, runs the PP-OCR recognition pipeline and the forward-only detection pass
   (`PaddleOnnxRuntime.forward_det`; `normalize_det_rgb` is the one owner of the detection input
   normalization) without any Paddle dependency,
-  reuses sessions across backend requests through `runtime/model_manager.py`, and configures the
+  reuses sessions across backend requests through `runtime/model_manager.py` (owner = the
+  per-session key, hint = the `.onnx` file x1.25 on `ProviderSettings.footprint_device()`,
+  the one EP -> residency-device rule the ONNX OCR services share), and configures the
   compiled-kernel cache directory used by MiGraphX. Key entry points: `resolve_model_paths()`,
   `resolve_det_model_path()`, `resolve_models_root()`, `resolve_compiled_cache_root()`,
   `provider_attempts()`, `RuntimeFactory`, `PaddleOnnxRuntime`.
@@ -59,6 +61,7 @@ for cv2/onnxruntime at startup.
   no staging — Reline's catalog. The token is an ARGUMENT, never read from the environment: one
   caller reads `HF_TOKEN`, the other receives the token as a request field, and this layer must not
   decide which.
+- `test_paddle_onnx_lease.py`: `footprint_device` and the owner/hint `RuntimeFactory` leases with.
 - `test_surya_checkpoints.py`, `test_model_download.py`: unit tests for the contracts above. A fake
   `surya.common.s3` (whose `download_directory` raises) is injected into `sys.modules` for the former; the `download_http_to_path` /
   `download_bearer_to_path` cases of the latter inject a scripted `get` and a recording `sleep`. Neither touches the network.
@@ -159,7 +162,7 @@ for cv2/onnxruntime at startup.
   length must pass a `present` predicate and a `verify`.
 - `model_download`'s lock is a **download lock, not a service lock**: it is held across network I/O
   and must never be nested inside a service-local lock, because a multi-GiB transfer must not block
-  `health()`, `unload()` or a `LoadedModelManager` eviction callback. Its per-destination locks are
+  `health()`, `unload()` or a `SmallModelManager` eviction callback. Its per-destination locks are
   created on demand and never removed. A destination only ever appears complete on disk: `verify`
   runs on the staging file, and a failed or rejected transfer removes (or, resumable, parks) it and
   leaves any previous destination untouched.

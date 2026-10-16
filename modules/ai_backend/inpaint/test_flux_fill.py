@@ -51,7 +51,7 @@ from unittest.mock import patch
 
 from modules.ai_backend.engines import model_download as md
 from modules.ai_backend.inpaint import flux_fill as svc
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 
 class NormalizeFluxFillParamsTests(unittest.TestCase):
@@ -431,7 +431,7 @@ class PipelinePlacementTests(unittest.TestCase):
             attr_patch.start()
             self.addCleanup(attr_patch.stop)
 
-        self.service = svc.FluxFillInpaintService(LoadedModelManager())
+        self.service = svc.FluxFillInpaintService(SmallModelManager())
 
     def _build(self, model_key: str = "flux_fill:test", **overrides: object):
         params: dict[str, object] = {"mode": "inpaint"}
@@ -751,7 +751,7 @@ class EnsureModelTests(unittest.TestCase):
             seam = patch.object(svc, target, value)
             seam.start()
             self.addCleanup(seam.stop)
-        self.service = svc.FluxFillInpaintService(LoadedModelManager())
+        self.service = svc.FluxFillInpaintService(SmallModelManager())
         self.calls: list[dict[str, str]] = []
         self.sleeps: list[float] = []
 
@@ -811,7 +811,7 @@ class EnsureModelTests(unittest.TestCase):
 
 class UnloadTests(unittest.TestCase):
     def test_unload_drops_the_pipeline_and_reports_it(self) -> None:
-        service = svc.FluxFillInpaintService(LoadedModelManager())
+        service = svc.FluxFillInpaintService(SmallModelManager())
         service._pipe = object()
         service._active_key = "flux_fill:Q8_0"
 
@@ -823,11 +823,11 @@ class UnloadTests(unittest.TestCase):
         self.assertIsNone(service._active_key)
 
     def test_unload_without_a_pipeline_is_a_noop(self) -> None:
-        service = svc.FluxFillInpaintService(LoadedModelManager())
+        service = svc.FluxFillInpaintService(SmallModelManager())
         self.assertFalse(service.unload())
 
     def test_unload_key_refuses_a_foreign_key(self) -> None:
-        service = svc.FluxFillInpaintService(LoadedModelManager())
+        service = svc.FluxFillInpaintService(SmallModelManager())
         service._pipe = object()
         service._active_key = "flux_fill:Q8_0"
 

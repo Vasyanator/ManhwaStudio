@@ -29,7 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
+from ..runtime.residency.footprint import hint_from_files
+from ..runtime.residency.holdings import FootprintHint
 from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 
 log = logging.getLogger(__name__)
@@ -55,9 +57,12 @@ _resolve_selected_backend_device = functools.partial(resolve_selected_backend_de
 #: patched by name in the test suite.
 _clear_torch_cache = functools.partial(clear_torch_cache, owner="EasyOCR")
 
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "ocr.easyocr"
+
 
 class EasyOcrService:
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.Lock()
         self._model_manager = model_manager
         self._reader = None
@@ -99,11 +104,14 @@ class EasyOcrService:
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=self._footprint_hint(selected_device, model_dir),
         )
         try:
             with self._lock:
                 reader = self._ensure_loaded_locked(langs, model_dir)
-            if lease.needs_load:
+                # Under the lock and unconditionally: the lease protocol in
+                # `runtime/model_manager.py`.
                 lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
             import numpy as np  # type: ignore
 
@@ -140,17 +148,21 @@ class EasyOcrService:
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=self._footprint_hint(selected_device, model_dir),
         )
         try:
             with self._lock:
                 reader = self._ensure_loaded_locked(langs, model_dir)
+                # Right after the load, under the lock and unconditionally (the
+                # lease protocol in `runtime/model_manager.py`): a failure of the
+                # inference below is a failed run, never a failed load.
+                lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 result = reader.readtext(
                     rgb_arr,
                     detail=self._detail,
                     paragraph=self._paragraph,
                 )
-            if lease.needs_load:
-                lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
         except Exception:
             if lease.needs_load:
                 lease.mark_load_failed()
@@ -277,6 +289,22 @@ class EasyOcrService:
             _clear_torch_cache()
             self._model_manager.mark_unloaded(model_key)
             return True
+
+    @classmethod
+    def _footprint_hint(cls, device: str, model_dir: str) -> FootprintHint:
+        """Pre-load size of a reader for the residency arbiter.
+
+        Every file of the shared weight directory (the detector plus each
+        downloaded recognizer: an upper bound, since easyocr's language ->
+        recognizer table is not consulted before the load) on the device the
+        reader is created for (`cpu` when EasyOCR gets no GPU). A non-absolute
+        `model_dir` (refused by the load) is never sized: an empty one would
+        sum the working directory.
+        """
+        hint_device = device if cls._easyocr_gpu_value(device) is not False else "cpu"
+        if not Path(model_dir).is_absolute():
+            return FootprintHint(device=hint_device)
+        return hint_from_files([model_dir], hint_device)
 
     @staticmethod
     def _model_key_for(langs: list[str], device: str, model_dir: str) -> str:

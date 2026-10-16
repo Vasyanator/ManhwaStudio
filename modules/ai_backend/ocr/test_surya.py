@@ -40,7 +40,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from modules.ai_backend.ocr import surya as service_module  # noqa: E402
-from modules.ai_backend.runtime.model_manager import LoadedModelManager  # noqa: E402
+from modules.ai_backend.runtime.model_manager import SmallModelManager  # noqa: E402
 
 # Surya's own defaults; a load must never reach them.
 S3_FOUNDATION_DEFAULT = "s3://text_recognition/2025_09_23"
@@ -171,7 +171,7 @@ class SuryaPredictorLoadTests(unittest.TestCase):
         staging_patch.start()
         self.addCleanup(staging_patch.stop)
 
-        self.service = service_module.SuryaOcrService(LoadedModelManager())
+        self.service = service_module.SuryaOcrService(SmallModelManager())
 
     def _load_recognition(self, device: str = "cuda:0"):
         return self.service._ensure_recognition_loaded_locked(device, self.rec_dir)
@@ -349,7 +349,7 @@ class RealCheckpointTests(unittest.TestCase):
         with patch.object(s3, "download_directory", no_download), patch.object(
             service_module, "_resolve_selected_backend_device", lambda _fallback: "cpu"
         ):
-            service = service_module.SuryaOcrService(LoadedModelManager())
+            service = service_module.SuryaOcrService(SmallModelManager())
             result = service.recognize_image_bytes(
                 buffer.getvalue(),
                 recognition_dir=str(Path(os.environ["MS_SURYA_RECOGNITION_DIR"]).resolve()),

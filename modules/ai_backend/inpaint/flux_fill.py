@@ -63,14 +63,15 @@ from ..engines.model_download import (
     retry_progress_label,
 )
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
 from ..runtime.paths import side_models_root
+from ..runtime.residency.footprint import hint_from_files
 from ..runtime.rocm_mmap_transfer import (
     mmap_staging_required,
     patched_module_to,
     tensor_needs_staging,
 )
-from ..runtime.torch_device import clear_torch_cache
+from ..runtime.torch_device import clear_torch_cache, resolve_discrete_backend_device
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +104,8 @@ AVAILABLE_QUANTS = (
     "Q8_0",
 )
 DEFAULT_QUANT = "Q8_0"
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "inpaint.flux_fill"
 
 OBJECT_REMOVAL_PROMPT = (
     "clean background, seamless continuation of the surrounding texture, "
@@ -184,7 +187,7 @@ def normalize_flux_fill_params(params: dict[str, Any] | None) -> dict[str, Any]:
 class FluxFillInpaintService:
     """Lazy-loading FLUX.1-Fill-dev inpaint pipeline for `inpaint.flux_fill`."""
 
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.RLock()
         self._model_manager = model_manager
         self._pipe: Any = None
@@ -276,8 +279,17 @@ class FluxFillInpaintService:
 
         quant = normalized["quant"]
         model_key = f"flux_fill:{quant}"
+        # Pre-load size: the GGUF transformer plus every diffusers component
+        # `_ensure_pipeline_locked` loads. The device is the one that load
+        # will pick (a read-only probe, made current only by the load); with
+        # CPU offload the weights stay in RAM, so they are host-accounted.
+        hint_device = "cpu" if normalized["cpu_offload"] else resolve_discrete_backend_device("cuda", honour_configured=False)
+        hint = hint_from_files([gguf_path(quant), _components_dir()], hint_device)
         lease = self._model_manager.begin_model_use(
-            model_key, unload_callback=lambda: self._unload_key(model_key)
+            model_key,
+            unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=hint,
         )
         with self._lock:
             try:
@@ -292,8 +304,7 @@ class FluxFillInpaintService:
                 # The pipeline is resident from here on, so it is registered
                 # before generation: a generation failure must leave it counted
                 # and evictable, not silently occupying VRAM off the books.
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
+                lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 out_rgb = self._generate_locked(
                     pipe, image_rgb, mask_u8, normalized, progress_callback
                 )
@@ -740,26 +751,18 @@ def _is_complete_file(path: str, expected_size: int) -> bool:
 #  Device / MIOpen (discrete GPU only — iGPU excluded)
 # =====================================================================
 def _select_discrete_device() -> Any:
+    """The discrete GPU with the most memory as a `torch.device` (made current), else CPU.
+
+    This service ignores `General.ai_device` by design (`honour_configured=False`);
+    the iGPU rule and the choice belong to
+    `runtime.torch_device.resolve_discrete_backend_device`.
+    """
     import torch
 
-    if not torch.cuda.is_available():
-        return torch.device("cpu")
-    igpu_markers = ("ryzen", "cpu", "radeon graphics integrated")
-    igpu_archs = ("gfx1036", "gfx1037", "gfx90c", "gfx902", "gfx1035", "gfx103")
-    best = None
-    for i in range(torch.cuda.device_count()):
-        p = torch.cuda.get_device_properties(i)
-        name = p.name.lower()
-        arch = str(getattr(p, "gcnArchName", "")).lower()
-        if any(m in name for m in igpu_markers) or any(arch.startswith(a) for a in igpu_archs):
-            continue
-        if best is None or p.total_memory > best[1].total_memory:
-            best = (i, p)
-    if best is None:
-        # No discrete GPU detected; refuse iGPU and fall back to CPU.
-        return torch.device("cpu")
-    torch.cuda.set_device(best[0])
-    return torch.device(f"cuda:{best[0]}")
+    device = torch.device(resolve_discrete_backend_device("cuda", honour_configured=False))
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    return device
 
 
 # Pipeline components loaded from safetensors, i.e. the ones diffusers hands out

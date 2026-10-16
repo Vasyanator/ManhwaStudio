@@ -31,7 +31,7 @@ from unittest.mock import patch
 import numpy as np
 
 from modules.ai_backend.detection import surya as surya_detector
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 S3_DETECTOR_DEFAULT = "s3://text_detection/2025_05_07"
 
@@ -89,7 +89,7 @@ class SuryaDetectorCheckpointTests(unittest.TestCase):
             attr_patch.start()
             self.addCleanup(attr_patch.stop)
 
-        self.service = surya_detector.SuryaTextDetectorService(LoadedModelManager())
+        self.service = surya_detector.SuryaTextDetectorService(SmallModelManager())
         self.tiles = np.zeros((1, 4, 4, 3), dtype=np.uint8)
 
     def test_predictor_loads_the_local_dir(self) -> None:
@@ -154,7 +154,7 @@ class RealCheckpointTests(unittest.TestCase):
         with patch.object(s3, "download_directory", no_download), patch.object(
             surya_detector, "_resolve_selected_backend_device", lambda _fallback: "cpu"
         ):
-            service = surya_detector.SuryaTextDetectorService(LoadedModelManager())
+            service = surya_detector.SuryaTextDetectorService(SmallModelManager())
             maps = service.forward_tiles(np.full((1, 64, 64, 3), 255, dtype=np.uint8), model_dir=model_dir)
         self.assertEqual(maps.shape, (1, 1, 16, 16))
         self.assertEqual(service.health()["model_dir"], model_dir)

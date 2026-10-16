@@ -2,15 +2,19 @@
 File: modules/ai_backend/runtime/torch_device.py
 
 Purpose:
-The one owner of two decisions every Torch service in the backend makes: which
+The one owner of three decisions Torch services in the backend make: which
 concrete Torch device the user's `General.ai_device` choice resolves to right
-now, and how the accelerator allocator cache is released after a model drop.
+now, which CUDA/ROCm devices count as integrated GPUs that a large model must
+never run on, and how the accelerator allocator cache is released after a model
+drop.
 
 Key functions:
 - read_configured_device() - `General.ai_device`, `None` for unset / sentinel
 - normalize_backend_device() - coerce a device string to a Torch device name
 - safe_available_devices() - `AIDevice.detect_available_devices()`, `{"cpu"}` on failure
 - resolve_selected_backend_device() - the full resolution rule
+- is_integrated_gpu() - the "this is an iGPU" rule over device properties
+- resolve_discrete_backend_device() - the resolution rule that never answers an iGPU
 - clear_torch_cache() - `gc.collect()` plus the CUDA (and optionally MPS) cache release
 
 Notes:
@@ -24,6 +28,10 @@ service states its policy once, at its module-level binding (a
   else matches, an available `mps` is preferred over `cpu`;
 - `include_mps=False` in `clear_torch_cache` (FLUX.1-Fill, FLUX.2 klein,
   watermark): only the CUDA cache is released.
+The large-model services (FLUX.1-Fill, FLUX.2 klein, FLUX.3 klein) resolve
+through `resolve_discrete_backend_device` instead: on a machine with an APU the
+integrated GPU is also a "cuda" device, and a multi-GB model on it is either
+refused for memory or runs at a fraction of the speed while starving the host.
 torch is imported lazily inside each call, so importing this module stays cheap.
 """
 
@@ -116,6 +124,133 @@ def resolve_selected_backend_device(fallback: str, *, accept_mps: bool = True, m
     if "cuda" in available:
         return "cuda"
     if mps_last_resort and "mps" in available:
+        return "mps"
+    return "cpu"
+
+
+#: Device-name fragments (lower-cased) that mark an integrated GPU.
+_IGPU_NAME_MARKERS = ("ryzen", "cpu", "radeon graphics integrated")
+
+#: AMD integrated-GPU architectures, matched EXACTLY on the `gcnArchName` base
+#: (before any `:feature` suffix). Never a prefix: `gfx103*` also names the
+#: discrete RX 6000 cards (gfx1030/1031/1032/1034).
+_IGPU_ARCHS = frozenset(
+    {
+        "gfx902",  # Raven Ridge / Picasso
+        "gfx90c",  # Renoir / Cezanne / Lucienne
+        "gfx1033",  # Van Gogh
+        "gfx1035",  # Rembrandt
+        "gfx1036",  # Raphael / Granite Ridge desktop iGPU
+        "gfx1037",  # Mendocino
+        "gfx1103",  # Phoenix / Hawk Point
+        "gfx1150",  # Strix Point
+        "gfx1151",  # Strix Halo
+        "gfx1152",  # Krackan Point
+    }
+)
+
+
+def is_integrated_gpu(props: object) -> bool:
+    """True when the device described by `props` (a `torch.cuda` device-properties object) is an iGPU.
+
+    Integrated when `props.is_integrated` exists and is truthy, OR the name
+    carries an iGPU marker, OR the arch is one of `_IGPU_ARCHS` exactly. A
+    missing attribute counts as "no evidence", never as integrated.
+    """
+    if bool(getattr(props, "is_integrated", False)):
+        return True
+    name = str(getattr(props, "name", "")).lower()
+    if any(marker in name for marker in _IGPU_NAME_MARKERS):
+        return True
+    arch = str(getattr(props, "gcnArchName", "")).lower().split(":", 1)[0].strip()
+    return arch in _IGPU_ARCHS
+
+
+def _cuda_device_properties() -> list[object]:
+    """Properties of every visible CUDA/ROCm device in index order; `[]` without torch or CUDA.
+
+    Never raises: a failing probe is logged at WARNING and counts as no device.
+    The tests replace this function.
+    """
+    try:
+        import torch  # type: ignore
+    except Exception:
+        # No torch: no CUDA device can be used anyway.
+        return []
+    try:
+        if not torch.cuda.is_available():
+            return []
+        return [torch.cuda.get_device_properties(index) for index in range(torch.cuda.device_count())]
+    except Exception as exc:
+        log.warning("torch CUDA device probing failed, assuming no CUDA device: %s", exc, exc_info=True)
+        return []
+
+
+def _best_discrete_cuda_index(devices: list[object]) -> int | None:
+    """Index of the non-integrated device with the most `total_memory`; `None` when there is none."""
+    best: tuple[int, int] | None = None
+    for index, props in enumerate(devices):
+        if is_integrated_gpu(props):
+            continue
+        total = int(getattr(props, "total_memory", 0) or 0)
+        if best is None or total > best[1]:
+            best = (index, total)
+    return None if best is None else best[0]
+
+
+def _cuda_index(device: str) -> int | None:
+    """`<n>` of `cuda:<n>`; `None` for plain `cuda` or a malformed index."""
+    _, sep, raw = device.partition(":")
+    if not sep:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def resolve_discrete_backend_device(
+    fallback: str,
+    *,
+    accept_mps: bool = True,
+    mps_last_resort: bool = False,
+    honour_configured: bool = True,
+) -> str:
+    """Resolve the device for a large model: never an integrated GPU.
+
+    With `honour_configured` (FLUX.2 / FLUX.3 klein), `General.ai_device` (or the
+    normalized `fallback` when nothing is configured) decides first: `cpu` ->
+    `cpu`; an available `mps` -> `mps`; a `cuda:<n>` that exists and is discrete
+    -> it. A configured iGPU is overridden with a WARNING. Every other case
+    (plain `cuda`, an unknown index, an iGPU, an unavailable `mps`, an unknown
+    value) takes the discrete device with the most memory as `cuda:<n>`, else
+    `mps` when `mps_last_resort` and available, else `cpu`. Without
+    `honour_configured` (FLUX.1-Fill) the configuration is ignored: the largest
+    discrete device, else (`mps` per `mps_last_resort`) `cpu`. Never raises; a failing probe counts as CPU only.
+    """
+    devices = _cuda_device_properties()
+    best = _best_discrete_cuda_index(devices)
+    if honour_configured:
+        fallback_norm = normalize_backend_device(fallback, "cpu", accept_mps=accept_mps)
+        configured = read_configured_device()
+        normalized = normalize_backend_device(configured or fallback_norm, fallback_norm, accept_mps=accept_mps)
+        if normalized == "cpu":
+            return "cpu"
+        if normalized == "mps" and "mps" in safe_available_devices():
+            return "mps"
+        index = _cuda_index(normalized)
+        if index is not None and 0 <= index < len(devices):
+            if not is_integrated_gpu(devices[index]):
+                return normalized
+            log.warning(
+                "Configured device %s is an integrated GPU (%s); a large model uses %s instead",
+                normalized,
+                getattr(devices[index], "name", "?"),
+                "cpu" if best is None else f"cuda:{best}",
+            )
+    if best is not None:
+        return f"cuda:{best}"
+    if mps_last_resort and "mps" in safe_available_devices():
         return "mps"
     return "cpu"
 

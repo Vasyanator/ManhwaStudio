@@ -195,12 +195,24 @@ tools/egui_docs/*.py[cod]
 !tools/model_pins/sources.json
 !tools/model_pins/MODULE_README.md
 tools/model_pins/__pycache__/
+# Large-model calibration tool: measures the FLUX services per manager step on a GPU and fits
+# modules/ai_backend/runtime/large_models/calibration/*.json (its output never enters the tree).
+!tools/large_model_calibration/
+!tools/large_model_calibration/*.py
+!tools/large_model_calibration/MODULE_README.md
+tools/large_model_calibration/__pycache__/
 
 # Python backend and helper modules. Keep bytecode and local browser profiles out.
 !modules/
 !modules/**/
 !modules/**/*.py
 !modules/**/MODULE_README.md
+# Golden fixtures of backend characterization tests; a fresh clone needs them.
+!modules/ai_backend/**/fixtures/
+!modules/ai_backend/**/fixtures/*.json
+# Seed calibration tables of the large-model forecast (runtime/large_models/calibration/).
+!modules/ai_backend/**/calibration/
+!modules/ai_backend/**/calibration/*.json
 modules/**/__pycache__/
 modules/**/*.py[cod]
 modules/browser_profiles/

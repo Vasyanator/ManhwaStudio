@@ -10,10 +10,13 @@ domains (`ocr/`, `detection/`, `inpaint/`, `reline/`, `translate/`) depend on th
 other way round.
 
 ## Architecture
-`paths.py` sits at the bottom and is stdlib-only. `torch_support.py` and `model_manager.py` are
-likewise dependency-free. `device_service.py` reads/writes user config and probes runtimes.
+`paths.py` sits at the bottom and is stdlib-only. `torch_support.py` is likewise dependency-free;
+`model_manager.py` builds only on `residency/` (which builds on `memory_budget.py` and `torch_support.py`). `device_service.py` reads/writes user config and probes runtimes.
 `rocm_runtime.py` and `rocm_mmap_transfer.py` are the two ROCm/HIP workarounds: the first is applied
 once at backend startup, the second is applied per weight transfer by the Torch services.
+`safetensors_stream.py` and `encoder_truncation.py` are stdlib-only (torch lazily, per read);
+`memory_probe.py` depends only on `torch_support.py`. They are the shared, model-agnostic
+checkpoint/memory utilities model packages build on (first consumer: `inpaint/flux2_klein/`).
 
 The only outbound dependency of this package is `rocm_runtime._resolve_cache_root()`, which lazily
 imports `..engines.paddle_onnx` to reuse the ONNX model-root resolution and falls back to
@@ -29,23 +32,39 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - `torch_support.py`: `is_torch_available()` cached import probe, a debug override that simulates a
   missing Torch (`configure_torch_support(simulate_disabled=...)`), and the stable user-facing
   message for Torch-gated endpoints.
-- `model_manager.py`: `LoadedModelManager` / `ModelUsageLease` — resident-model bookkeeping,
-  LRU eviction of idle models under a configurable cap, and leases that keep an in-use model from
-  being unloaded. It never loads models itself; services own their runtime objects.
+- `model_manager.py`: `SmallModelManager` — the small-model pool over the residency arbiter:
+  the service-facing lease API (`begin_model_use(key, unload_callback, *, owner=, hint=)` ->
+  `ModelUsageLease`, `mark_unloaded`), its reclaim policy (drop whole idle models, LRU) and the
+  secondary count cap `General.ai_max_loaded_models` as slots (`set_max_loaded_models` evicts
+  live); `health()` keeps the four small-pool counters. It never loads models itself; services
+  own their runtime objects.
+- `residency/`: `ResidencyArbiter` — the one ledger and reclaim arbiter both model pools (small
+  and large) take their leases from as peers: lease state machine, byte reservations, reclaim
+  order, owner rule, footprint measurement. See its `MODULE_README.md`.
+- `test_model_manager.py`, `test_model_manager_race.py`: the lease report calls; the S-058 race
+  (two threads, two keys, a stub service in the reference lease shape).
+  `test_model_manager_pool.py`: the count cap as slots (LRU, live lowering, kept in-use and
+  callback-less models, unchanged refusal text).
 - `device_service.py`: selected Torch device and ONNX provider/device-id state, accelerated
   defaults, human-readable device-name probing (CUDA / DirectML / MiGraphX), CUDA-ROCm diagnostics
   for the Rust settings tab, and persistence into `UserConfig`. Every write is
   `UserConfig.update(mutator)` touching only its own keys (a serialized re-read + write of the
   on-disk `user_config.json`/`.db` via the root `docstore.py`); automatic fallbacks and the
   model-limit normalization at startup are best-effort (logged, never abort a query) and the
-  limit is written only when the stored value differs.
+  limit is written only when the stored value differs. It is also the large-model pool's
+  `LimitsStore` (`UserConfigLimitsStore`, built by `large_models_limits_store(floors)`): the two
+  hard caps `General.large_models_{vram,ram}_cap_bytes` (a `None` removes the key; a retired
+  `General.large_models_keep_policy` is ignored with one INFO log and left in place), floors
+  delegated to the cache-side store; `general_section()` hands `General` to the startup OOM
+  backstop.
 - `torch_device.py`: the one owner of `General.ai_device` -> concrete Torch device resolution
   (`resolve_selected_backend_device`, with `read_configured_device`, `normalize_backend_device`,
   `safe_available_devices`) and of the allocator-cache release after a model drop
-  (`clear_torch_cache`). Each Torch service binds them once at module level under the private names
-  `_resolve_selected_backend_device` / `_clear_torch_cache` (the names the tests patch), with its
-  policy as the binding's arguments. `test_torch_device.py` covers the resolution order, both
-  device policies and the cache release.
+  (`clear_torch_cache`), and of the "never the iGPU" rule (`is_integrated_gpu`,
+  `resolve_discrete_backend_device`). Each Torch service binds them once at module level under the
+  private names `_resolve_selected_backend_device` / `_clear_torch_cache` (the names the tests
+  patch), with its policy as the binding's arguments. `test_torch_device.py` covers the resolution
+  order, both device policies, the iGPU rule table, the discrete resolution and the cache release.
 - `rocm_runtime.py`: `configure_rocm_runtime()` — MIOpen tuning and the allocator override, applied
   once at backend startup. It is also what tells `error_text` whether this process is on ROCm.
 - `error_text.py`: `sanitize_torch_error()` — strips Torch's `expandable_segments:True` out-of-memory
@@ -59,6 +78,37 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - `rocm_mmap_transfer.py`: the ROCm host->device weight-transfer workaround
   (`mmap_staging_required()`, `stage_cpu_tensor()`, `move_module_to()`, `patched_module_to()`,
   `invalidate_maps_cache()`).
+- `safetensors_stream.py`: model-agnostic safetensors container I/O — the one header parser
+  (`read_safetensors_header_and_data_start` / `read_safetensors_header`, ceiling
+  `MAX_SAFETENSORS_HEADER_BYTES`), the per-tensor contract (`TensorSpan`, `parse_tensor_spans`:
+  mappable dtype, length == shape x itemsize, no overlap, file order), the tensor-at-a-time
+  reader (`StreamingSafetensorsReader`), rate-limited byte progress (`ByteProgress`,
+  `ByteProgressCb`), the opt-in `SAFETENSORS_DTYPES_WITH_F8` table and the backend's ONE
+  meta-module filler (`fill_module_from_safetensors` -> `FillReport`, `MissingWeightsError`,
+  `LEAVE_ON_META`, `TensorWrite`). Stdlib only; torch is imported lazily by `read_tensor` and the
+  filler.
+- `memory_probe.py`: `memory_snapshot` — the tolerant `{vram,ram}_{total,free}` snapshot, `0` =
+  unknown, never raises — and `cuda_device_index`.
+- `encoder_truncation.py`: `keep_layers_for_hidden_states` — how many decoder layers a text
+  encoder keeps when a pipeline reads only some hidden states (`max(indices) + 1`, and why the
+  `+ 1` is exact).
+- `memory_budget.py`: the single owner of "usable host/device memory now" for every model pool.
+  Reads MemAvailable, the cgroup v2 limit (`memory.max` / `memory.high`, tightest ancestor, only
+  `inactive_file` counted as reclaimable) and `RssAnon + RssShmem` (psutil on Windows/macOS),
+  plus device total/free/reserved after one warm-up matmul (`HostBudget`, `DeviceBudget`,
+  `read_host_budget`, `read_device_budget`). Reserves: 2 GiB host, 512 MiB ROCm / 768 MiB CUDA;
+  headroom never exceeds `total - reserve`; unknown = 0 = refuse. Also `HostWatch` (live check
+  during a load -> `HostMemoryShort`) and the Windows sysmem-spill heuristic. Tests:
+  `test_memory_budget.py`.
+- `large_models/`: the model-agnostic large-model core (spec, header inventory, tier templates of
+  the two resource axes «Видеопамять» x «Оперативная память», planner, calibration tables,
+  forecast, mechanics, manager). See its `MODULE_README.md`.
+- `test_safetensors_stream.py`, `test_memory_probe.py`, `test_encoder_truncation.py`: their
+  contracts; the truncation test builds tiny random `Qwen3Model`s on the CPU (skips without
+  torch/transformers).
+- `test_device_service_large_limits.py`: the large-model limits store over an in-memory settings
+  document (only its two keys written, invalid values read as defaults, the retired key ignored,
+  floors delegated, a failed write leaves the manager unchanged).
 - `test_device_service.py`, `test_rocm_runtime.py`, `test_rocm_mmap_transfer.py`,
   `test_error_text.py`: unit tests for the contracts below. None of them needs a GPU; ROCm decisions
   are forced via monkeypatch.
@@ -98,6 +148,14 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   `include_mps=False` in `clear_torch_cache` (release only the CUDA cache: FLUX.1-Fill, FLUX.2
   klein, watermark). Resolution never raises (a failing probe counts as CPU only); a failing cache
   release is logged at WARNING with the service name, never raised.
+- **A large model never runs on an integrated GPU; the rule has one owner,
+  `torch_device.resolve_discrete_backend_device`.** iGPU = `props.is_integrated` truthy, OR an iGPU
+  name marker, OR an EXACT AMD iGPU arch (`_IGPU_ARCHS`, compared on the `gcnArchName` base; never a
+  prefix — `gfx103*` also names discrete RX 6000 cards). Among the rest the device with the most
+  `total_memory` wins. FLUX.2 klein / FLUX.3 klein bind it with `honour_configured=True` (a
+  configured `cpu`, available `mps` or discrete `cuda:<n>` is kept; a configured iGPU is overridden
+  with a WARNING); FLUX.1-Fill uses `honour_configured=False` (the setting is ignored). With no
+  discrete device the answer is CPU (or `mps` per `mps_last_resort`), never the iGPU.
 - Torch and ONNX model roots are separate trees (`ManhwaStudio_AI_Models/Torch` vs `.../ONNX`);
   device selection here is per-runtime for that reason and the two selections never alias.
 - **`health()` never takes a service's work lock.** A service's instance lock is held across a
@@ -110,8 +168,14 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   service lock -> snapshot lock, never the reverse. While a load runs, `ready` is `False` (the old
   model was dropped first) and `last_error` keeps its previous value; no extra state field is sent,
   because the health payload is part of the IPC contract (`PROTOCOL_VERSION`).
-- `LoadedModelManager` eviction callbacks always run outside the manager lock, so a service-local
-  lock can be taken inside them without deadlock.
+- Eviction callbacks always run outside every manager lock (the arbiter lock is a leaf), so a
+  service-local lock can be taken inside them without deadlock. **A service never holds its lock
+  across `begin_model_use` without holding a lease of its own** (the owner-rule premise in
+  `residency/MODULE_README.md`; SDXL's nested LaMa lease is the allowed shape: SDXL holds its own
+  lease). `owner=` / `hint=` are optional: without them a lease reserves only its slot and its
+  owner is the key, which is the pre-arbiter behaviour; with a hint
+  (`residency.footprint.hint_from_files`) a load first reclaims idle models of either pool until
+  its bytes fit and is refused with `ModelMemoryShortError` (a `RuntimeError`) otherwise.
 - **`ModelUsageLease.mark_load_failed()` means the LOAD failed, nothing else.** It reaches
   `abort_load`, which clears the entry's `resident` flag and drops its unload callback, so calling
   it for a failure that happened after the model was already loaded makes the manager under-count
@@ -120,8 +184,20 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   before running inference — while `release()` runs in `finally` on every path. The inpaint and
   watermark services are the reference shape (`inpaint/MODULE_README.md`, covered by
   `inpaint/test_lease_protocol.py`); `ocr/paddle_vl.py` and `ocr/baberu.py` follow it too. The other
-  `ocr/` services and `detection/` still wrap load and inference in one `try` and are due the same
-  treatment.
+  `ocr/` services and `detection/` still wrap load and inference in one `try`, which is harmless only
+  because their `mark_loaded()` precedes the inference (a later `mark_load_failed()` is a no-op).
+- **`mark_loaded()` is called UNCONDITIONALLY, under the service lock, whenever the service holds
+  the model after its load step** — never gated on `lease.needs_load`. `needs_load` is only the
+  manager's expectation at lease time: between the lease and the service lock another request can
+  switch or unload the model (`mark_unloaded` keeps the entry, not resident, while a lease uses it),
+  and the service then reloads it under a lease that said `needs_load=False`. Gated, that reload is
+  never registered: the model sits outside `max_loaded_models` and is never evictable (STATE
+  S-058). Called outside the lock, the opposite race registers a model another thread already
+  dropped. `finish_load` is idempotent, so a call for a model that was resident all along only
+  refreshes its LRU time. Such a race reload bypasses the eviction that precedes a reserved load, so
+  the cap can be exceeded by one until the next reserved load evicts; evicting from `mark_loaded`
+  would run foreign unload callbacks under this service's lock (deadlock order). Pinned by
+  `test_model_manager_race.py` and `inpaint/test_lease_protocol.py` (`StaleLeaseReloadTests`).
 - On a ROCm Torch build, `configure_rocm_runtime()` runs once at process startup before any
   inference: it defaults `MIOPEN_FIND_MODE=FAST` (immediate mode, no per-input-shape kernel
   auto-tuning), forces `expandable_segments:False` into the allocator-config variable Torch will
@@ -185,7 +261,32 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   `patched_module_to` block) and is thread-local, so services carry no invalidation obligation;
   `invalidate_maps_cache()` exists only as a manual reset.
 - Every module here must surface a missing package or an unusable device as an explicit error. No
-  silent fallback to CPU, to a different provider, or to a guessed path.
+  silent fallback to CPU, to a different provider, or to a guessed path. (`memory_probe` is the
+  deliberate exception for a REPORT: a missing figure is `0` = unknown, never a guessed value.)
+- **The meta-module filler contract** (`fill_module_from_safetensors`): files in the given order,
+  each in file order, ONE tensor at a time — when a file tensor is read the filler references no
+  earlier one (pinned by `test_safetensors_stream.py` and FLUX.2's characterization tests). Key
+  conversion is exactly one form: 1:1 `key_map` (+ `cast`) or 1:N `convert(file_key, tensor) ->
+  [(state_key, tensor)]`, optionally with `expected_keys_of(file_key)`. Whenever the keys are known
+  from the headers (1:1, or `expected_keys_of`), unexpected / duplicate / missing keys are refused
+  before the first read; otherwise per tensor, missing after the last read
+  (`MissingWeightsError`, a `ValueError` carrying `missing`). `targets(state_key)` places each key
+  (device, or `LEAVE_ON_META`: not written, and a tensor yielding only such keys is not read). The
+  default writer checks the shape and copies with `.to(device)` into
+  `nn.Parameter(requires_grad=False)` / the buffer; a `write` callback replaces that step per file
+  tensor. A CUDA/HIP device is synchronized after every file tensor (measured HIP pile-up of host
+  staging buffers otherwise). Byte progress: one rate-limited report per read tensor, the last one
+  always. On any refusal the module is partially filled and must be discarded.
+- **`safetensors_stream`, `memory_probe` and `encoder_truncation` are model-agnostic.** They carry
+  model-agnostic checkpoint I/O, memory probes and the hidden-state truncation rule: no
+  model-family names and no refusal policy (FLUX.2 klein's fp8-scaled refusal stays in
+  `inpaint/flux2_klein/`). The default `SAFETENSORS_DTYPES` deliberately has no 8-bit float
+  tokens — a caller that reads them passes `SAFETENSORS_DTYPES_WITH_F8` (or its own table) through
+  `dtypes`. Log wording and the
+  logger belong to the caller (`owner` / `logger` parameters of `ByteProgress` and
+  `memory_snapshot`), so each service's records keep its prefix and land in its own logger tree;
+  a service whose tests patch its own `is_torch_available` passes that binding as
+  `torch_available`.
 
 ## Editing map
 - To change how the installation root is found, edit `paths.py` — and only `paths.py`.
@@ -195,7 +296,8 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
 - To change how a Torch service turns `General.ai_device` into a device, or how it releases the
   allocator cache, edit `torch_device.py` and `test_torch_device.py`; a per-service difference is a
   keyword argument of the owner, never a local copy.
-- To change the resident-model cap or eviction policy, edit `model_manager.py`.
+- To change the small pool's cap or eviction policy, edit `model_manager.py`; to change the
+  shared ledger, reclaim order, owner rule or footprint rules, edit `residency/`.
 - To add a health field to a service, publish it from that service's `_publish_health_locked()`
   (never read guarded state in `health()`); a new or changed field is an IPC contract change.
 - To change MIOpen tuning, the MIOpen cache location, the allocator override, or an environment
@@ -210,5 +312,20 @@ a ROCm startup tweak from pulling cv2/onnxruntime into a Torch-only install.
   the same gate as the ROCm one, never applied unconditionally.
 - To change the staging gate, the `/proc/self/maps` classifier, or the `Module.to` patch, edit
   `rocm_mmap_transfer.py`; add the corresponding case to `test_rocm_mmap_transfer.py`.
+- To change which safetensors dtypes are mappable by default, what makes a header or tensor entry
+  malformed, how a tensor is read, or the byte-progress rate limit, edit `safetensors_stream.py`
+  and `test_safetensors_stream.py` (and re-run `inpaint/flux2_klein/` tests: FLUX.2 re-binds these
+  names). A model-specific refusal belongs in that model's package, not here.
+- To change how a `meta`-built module is filled from checkpoint files, edit
+  `fill_module_from_safetensors` and re-run `inpaint/flux2_klein/` and `inpaint/flux3_klein/`
+  tests. It is the one direct-to-device filler: FLUX.3 klein's standalone loaders (`load_dit`,
+  `load_autoencoder`, `load_text_encoder*`) use its 1:1 form, while the FLUX.3 service loads through
+  the large-model manager (`large_models/loader.py`, the spec's conversion per tensor); FLUX.2 klein
+  loads through the manager too, its spec's conversion using the 1:N form (one fused BFL tensor ->
+  several diffusers keys).
+  A model-specific conversion, writer or refusal wording is a callback or a caller-side re-raise,
+  never a branch inside the filler.
+- To change the memory snapshot, edit `memory_probe.py`; to change the truncation rule, edit
+  `encoder_truncation.py`.
 - To wire a new Torch service onto the GPU, do not edit this package: pick the
   `move_module_to` / `patched_module_to` form described above from the service side.

@@ -2,11 +2,12 @@
 File: modules/ai_backend/inpaint/test_lease_protocol.py
 
 Purpose:
-Pins the `LoadedModelManager` lease protocol of all six inpaint services
-(`lama_v2`, `lama_mpe`, `aot`, `sdxl`, `flux_fill`, `flux2_klein`) — plus FLUX.2
-klein's second leased entry point, `component_action`'s user-pressed pipeline
-load — against one specific way of getting it wrong: reporting a failed
-INFERENCE as a failed LOAD.
+Pins the `SmallModelManager` lease protocol of the five small-pool inpaint
+services (`lama_v2`, `lama_mpe`, `aot`, `sdxl`, `flux_fill`; FLUX.2 klein and
+FLUX.3 klein are large-model manager handles and take no small-pool lease)
+against two specific ways of getting it wrong: reporting a failed
+INFERENCE as a failed LOAD, and not registering a model the service reloaded
+under a lease that had found the key resident (STATE S-058).
 
 Main responsibilities:
 - verify a model whose load succeeded is registered with `mark_loaded()` even
@@ -16,14 +17,19 @@ Main responsibilities:
 - verify it is still evictable afterwards, i.e. its entry kept the service's
   unload callback and another model can reclaim the slot;
 - verify the lease is released in every case, and that a genuine LOAD failure
-  still reports `mark_load_failed()` and leaves nothing resident.
+  still reports `mark_load_failed()` and leaves nothing resident;
+- verify a model dropped between the lease and the service lock (another
+  request unloaded or switched it) and reloaded under that now-stale lease is
+  registered resident and evictable — `mark_loaded()` is called
+  unconditionally after the load (the lease protocol in
+  `runtime/model_manager.py`).
 
 Notes:
 - No torch, no diffusers, no weights and no GPU: each service's load step is
   replaced by a stub that installs a stand-in model under the service's own
   model key, and each service's inference step by one that raises. Everything in
   between — the lease calls, their ordering, the `finally` — is the real code.
-- The six services deliberately share one table of cases: the protocol is a
+- The five services deliberately share one table of cases: the protocol is a
   cross-service contract, and a fix applied to only some of them is exactly the
   inconsistency these tests exist to catch.
 """
@@ -31,7 +37,6 @@ Notes:
 from __future__ import annotations
 
 import io
-import pathlib
 import unittest
 from contextlib import ExitStack
 from typing import Any, Callable
@@ -39,21 +44,17 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from modules.ai_backend.inpaint import aot, flux2_klein, flux_fill, lama, lama_mpe, sdxl
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.inpaint import aot, flux_fill, lama, lama_mpe, sdxl
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 #: Message raised by every stand-in inference below.
 _BOOM = "inference exploded"
 
 _SDXL_MODEL_PATH = "/models/sdxl-inpaint.safetensors"
 
-#: FLUX.2 klein validates its three component paths eagerly, so the case builder
-#: points them all at a directory that certainly exists.
-_FLUX2_KLEIN_PATH = str(pathlib.Path(__file__).resolve().parent)
-
 #: One case: `(service, invoke)`, where `invoke()` runs a single request whose
 #: LOAD succeeds and whose INFERENCE raises.
-CaseBuilder = Callable[[ExitStack, LoadedModelManager], "tuple[Any, Callable[[], None]]"]
+CaseBuilder = Callable[[ExitStack, SmallModelManager], "tuple[Any, Callable[[], None]]"]
 
 
 def _png_bytes(mode: str, color: object, size: tuple[int, int] = (16, 16)) -> bytes:
@@ -66,10 +67,6 @@ def _png_bytes(mode: str, color: object, size: tuple[int, int] = (16, 16)) -> by
 IMAGE_PNG = _png_bytes("RGB", (128, 128, 128))
 MASK_PNG = _png_bytes("L", 255)
 
-#: FLUX.2 klein refuses a region smaller than 128 px per side (see
-#: `flux2_klein.validate_region_size`), so it gets its own pair.
-REGION_PNG = _png_bytes("RGB", (128, 128, 128), size=(128, 128))
-REGION_MASK_PNG = _png_bytes("L", 255, size=(128, 128))
 
 
 class _StubModel:
@@ -98,7 +95,7 @@ def _fail_to_load(*_args: object, **_kwargs: object) -> None:
     raise FileNotFoundError("checkpoint missing")
 
 
-def _case_lama(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Callable[[], None]]:
+def _case_lama(stack: ExitStack, manager: SmallModelManager) -> tuple[Any, Callable[[], None]]:
     service = lama.LamaInpaintService(manager)
     key = service._model_key_for("cpu", "model.ckpt")
 
@@ -115,7 +112,7 @@ def _case_lama(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Call
     return service, lambda: service.inpaint_image_bytes(IMAGE_PNG, MASK_PNG)
 
 
-def _case_lama_mpe(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Callable[[], None]]:
+def _case_lama_mpe(stack: ExitStack, manager: SmallModelManager) -> tuple[Any, Callable[[], None]]:
     service = lama_mpe.LamaMpeInpaintService(manager)
     key = service._model_key_for("cpu")
 
@@ -134,7 +131,7 @@ def _case_lama_mpe(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, 
     return service, lambda: service.inpaint_image_bytes(IMAGE_PNG, MASK_PNG)
 
 
-def _case_aot(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Callable[[], None]]:
+def _case_aot(stack: ExitStack, manager: SmallModelManager) -> tuple[Any, Callable[[], None]]:
     service = aot.AotInpaintService(manager)
     key = service._model_key_for("cpu")
 
@@ -151,7 +148,7 @@ def _case_aot(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Calla
     return service, lambda: service.inpaint_image_bytes(IMAGE_PNG, MASK_PNG)
 
 
-def _case_sdxl(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Callable[[], None]]:
+def _case_sdxl(stack: ExitStack, manager: SmallModelManager) -> tuple[Any, Callable[[], None]]:
     # `server.py` shares ONE `LamaInpaintService` between SDXL and LaMa V2; the
     # prefill that uses it lives inside `_inpaint_locked`, which never runs here.
     service = sdxl.SdxlInpaintService(manager, lama.LamaInpaintService(manager))
@@ -176,7 +173,7 @@ def _case_sdxl(stack: ExitStack, manager: LoadedModelManager) -> tuple[Any, Call
 
 
 def _case_flux_fill(
-    stack: ExitStack, manager: LoadedModelManager
+    stack: ExitStack, manager: SmallModelManager
 ) -> tuple[Any, Callable[[], None]]:
     service = flux_fill.FluxFillInpaintService(manager)
 
@@ -194,93 +191,6 @@ def _case_flux_fill(
     )
 
 
-def _case_flux2_klein(
-    stack: ExitStack, manager: LoadedModelManager
-) -> tuple[Any, Callable[[], None]]:
-    service = flux2_klein.Flux2KleinInpaintService(manager)
-
-    def ensure(
-        _normalized: dict[str, Any],
-        model_key: str,
-        _report: Any,
-        *,
-        region_hw: tuple[int, int],
-        progress_callback: Any = None,
-    ) -> _StubModel:
-        service._pipe = _StubModel()
-        service._active_key = model_key
-        return service._pipe
-
-    stack.enter_context(patch.object(flux2_klein, "_clear_torch_cache", lambda: None))
-    stack.enter_context(patch.object(service, "_ensure_pipeline_locked", ensure))
-    # Phase 1 (the prompt encoder) and the pre-load memory guard are separate
-    # concerns with their own tests; this case is about the lease protocol only.
-    stack.enter_context(
-        patch.object(
-            service,
-            "_prompt_embeds_locked",
-            lambda _normalized, _report: {"prompt": object(), "negative": None},
-        )
-    )
-    stack.enter_context(
-        patch.object(service, "_require_headroom_locked", lambda *_a, **_k: None)
-    )
-    stack.enter_context(patch.object(service, "_generate_locked", _explode))
-    # The region must survive `validate_region_size`, so this case uses its own
-    # 128x128 image instead of the shared 16x16 one.
-    params = {
-        "text_encoder_path": _FLUX2_KLEIN_PATH,
-        "transformer_path": _FLUX2_KLEIN_PATH,
-        "vae_path": _FLUX2_KLEIN_PATH,
-    }
-    return service, lambda: service.inpaint_image_bytes(
-        REGION_PNG, REGION_MASK_PNG, params=params
-    )
-
-
-def _case_flux2_klein_component_action(
-    stack: ExitStack, manager: LoadedModelManager
-) -> tuple[Any, Callable[[], None]]:
-    """FLUX.2 klein's SECOND leased path: a user-pressed per-component load.
-
-    `component_action("transformer", "load")` builds the same pipeline a run
-    does and warms it up afterwards, so it owes the same two `try` scopes: the
-    warm-up is not part of the load, and a warm-up failure must leave the
-    manager holding a resident, evictable entry.
-    """
-    service = flux2_klein.Flux2KleinInpaintService(manager)
-
-    def ensure(
-        _normalized: dict[str, Any],
-        model_key: str,
-        _report: Any,
-        *,
-        region_hw: tuple[int, int],
-        progress_callback: Any = None,
-    ) -> _StubModel:
-        service._pipe = _StubModel()
-        service._active_key = model_key
-        return service._pipe
-
-    stack.enter_context(patch.object(flux2_klein, "_clear_torch_cache", lambda: None))
-    stack.enter_context(patch.object(service, "_ensure_pipeline_locked", ensure))
-    # The pre-load memory guard has its own tests; this case is about the lease.
-    stack.enter_context(
-        patch.object(service, "_require_pipeline_headroom_locked", lambda *_a, **_k: None)
-    )
-    # The warm-up is this path's "inference": it runs with the pipeline already
-    # resident, so a failure here is a failed RUN, never a failed load.
-    stack.enter_context(patch.object(service, "_warmup_pipeline_locked", _explode))
-    params = {
-        "text_encoder_path": _FLUX2_KLEIN_PATH,
-        "transformer_path": _FLUX2_KLEIN_PATH,
-        "vae_path": _FLUX2_KLEIN_PATH,
-    }
-    return service, lambda: service.component_action(
-        params, component="transformer", action="load"
-    )
-
-
 #: `(name, builder, load method)` per leased inpaint path.
 _CASES: tuple[tuple[str, CaseBuilder, str], ...] = (
     ("lama_v2", _case_lama, "_ensure_inpainter_locked"),
@@ -288,19 +198,13 @@ _CASES: tuple[tuple[str, CaseBuilder, str], ...] = (
     ("aot", _case_aot, "_ensure_model_locked"),
     ("sdxl", _case_sdxl, "_ensure_pipeline_locked"),
     ("flux_fill", _case_flux_fill, "_ensure_pipeline_locked"),
-    ("flux2_klein", _case_flux2_klein, "_ensure_pipeline_locked"),
-    (
-        "flux2_klein.component_action",
-        _case_flux2_klein_component_action,
-        "_ensure_pipeline_locked",
-    ),
 )
 
 
 class InferenceFailureLeaseTests(unittest.TestCase):
     """An inference failure must not be reported as a load failure.
 
-    `mark_load_failed()` reaches `LoadedModelManager.abort_load`, which clears
+    `mark_load_failed()` reaches `SmallModelManager.abort_load`, which clears
     the entry's `resident` flag and drops its unload callback. Calling it after
     `_ensure_*_locked` already succeeded therefore makes the manager under-count
     residency while the weights still sit in VRAM, and makes that model
@@ -310,7 +214,7 @@ class InferenceFailureLeaseTests(unittest.TestCase):
     def test_the_model_stays_resident_after_a_failed_inference(self) -> None:
         for name, builder, _load_method in _CASES:
             with self.subTest(service=name):
-                manager = LoadedModelManager(max_loaded_models=4)
+                manager = SmallModelManager(max_loaded_models=4)
                 with ExitStack() as stack:
                     service, invoke = builder(stack, manager)
                     with self.assertRaises(RuntimeError) as caught:
@@ -327,7 +231,7 @@ class InferenceFailureLeaseTests(unittest.TestCase):
     def test_the_model_is_still_evictable_after_a_failed_inference(self) -> None:
         for name, builder, _load_method in _CASES:
             with self.subTest(service=name):
-                manager = LoadedModelManager(max_loaded_models=1)
+                manager = SmallModelManager(max_loaded_models=1)
                 with ExitStack() as stack:
                     service, invoke = builder(stack, manager)
                     with self.assertRaises(RuntimeError):
@@ -349,7 +253,7 @@ class InferenceFailureLeaseTests(unittest.TestCase):
         """The other half of the contract, so the fix cannot be a blanket removal."""
         for name, builder, load_method in _CASES:
             with self.subTest(service=name):
-                manager = LoadedModelManager(max_loaded_models=4)
+                manager = SmallModelManager(max_loaded_models=4)
                 with ExitStack() as stack:
                     service, invoke = builder(stack, manager)
                     stack.enter_context(patch.object(service, load_method, _fail_to_load))
@@ -360,6 +264,60 @@ class InferenceFailureLeaseTests(unittest.TestCase):
                     self.assertEqual(health["resident_model_count"], 0)
                     self.assertEqual(health["active_model_count"], 0)
                     self.assertEqual(health["loading_model_count"], 0)
+
+
+class StaleLeaseReloadTests(unittest.TestCase):
+    """A reload under a lease that found the key resident must still be registered.
+
+    The race: request 2 takes its lease while key A is resident
+    (`needs_load=False`), then — before request 2 reaches the service lock —
+    another request drops A (a switch to another key or an explicit unload;
+    `mark_unloaded` keeps the entry only because request 2 still uses it).
+    Request 2 then reloads A. Here the drop is the service's own `unload()`,
+    run from inside `begin_model_use`, i.e. exactly between the lease and the
+    lock, which makes the race deterministic in one thread.
+    """
+
+    def test_a_model_reloaded_under_a_stale_lease_is_registered_and_evictable(self) -> None:
+        for name, builder, _load_method in _CASES:
+            with self.subTest(service=name):
+                manager = SmallModelManager(max_loaded_models=1)
+                with ExitStack() as stack:
+                    service, invoke = builder(stack, manager)
+                    with self.assertRaises(RuntimeError):
+                        invoke()
+                    self.assertEqual(manager.health()["resident_model_count"], 1)
+
+                    original_begin = manager.begin_model_use
+                    seen_needs_load: list[bool] = []
+
+                    def begin_then_drop(*args: Any, **kwargs: Any) -> Any:
+                        lease = original_begin(*args, **kwargs)
+                        if not seen_needs_load:
+                            seen_needs_load.append(lease.needs_load)
+                            self.assertTrue(service.unload(), "the model should still be held")
+                            self.assertEqual(manager.health()["resident_model_count"], 0)
+                        return lease
+
+                    stack.enter_context(patch.object(manager, "begin_model_use", begin_then_drop))
+                    with self.assertRaises(RuntimeError) as caught:
+                        invoke()
+                    self.assertIn(_BOOM, str(caught.exception))
+                    # The lease found the key resident, so the manager expected no load.
+                    self.assertEqual(seen_needs_load, [False])
+
+                    health = manager.health()
+                    self.assertEqual(health["resident_model_count"], 1)
+                    self.assertEqual(health["active_model_count"], 0)
+                    self.assertEqual(health["loading_model_count"], 0)
+
+                lease = manager.begin_model_use("other_domain:model")
+                self.addCleanup(lease.release)
+                self.assertTrue(lease.needs_load)
+                self.assertFalse(
+                    service.unload(),
+                    "the eviction callback should already have dropped the reloaded model",
+                )
 
 
 if __name__ == "__main__":

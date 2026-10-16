@@ -16,7 +16,14 @@ IPC method.
 
 Main responsibilities:
 - construct the shared `AppState` (OCR / text detector / inpaint / translation /
-  device services) consumed by the IPC handlers in `ipc/handlers/`;
+  device services) consumed by the IPC handlers in `ipc/handlers/`
+  (`build_app_state`): ONE `ResidencyArbiter` over ONE `MemoryBudgetProbes`, the
+  small-model pool `SmallModelManager(arbiter=...)` and the large-model pool
+  `LargeModelManager(arbiter, ...)` over the same arbiter and probes, its limits
+  persisted in `user_config` through `AiDeviceService` and its learned floors in
+  `<model cache root>/large_models/limits.json`; the FLUX.2 klein service is the
+  `large_models.profiles` adapter of `flux2_klein` (`large_model_adapters`);
+- apply the Linux OOM backstop (`General.large_models_oom_score_adj`) at start;
 - maintain a non-blocking health snapshot and publish it as a `health` event on
   the IPC event bus;
 - expose the backend version metadata for Rust-side compatibility checks.
@@ -36,6 +43,7 @@ differs.
 
 from __future__ import annotations
 
+import functools
 import os
 import socket
 import threading
@@ -43,14 +51,19 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 # Domain sub-packages wired together here (see the module docstring): each import
 # names the package that owns the service, never a flat top-level module.
 from .runtime.device_service import AiDeviceService
-from .runtime.model_manager import LoadedModelManager
+from .runtime.model_manager import SmallModelManager
+from .runtime.large_models.cost_tables import CostTables, detect_device_class, load_tables
+from .runtime.large_models.manager import JsonLimitsStore, LargeModelManager, apply_oom_score_backstop, limits_store_path
+from .runtime.memory_budget import TorchDeviceProbe
+from .runtime.residency.arbiter import MemoryBudgetProbes, ResidencyArbiter
 from .runtime.torch_support import is_torch_available
-from .engines.paddle_onnx import RuntimeFactory
+from .engines.paddle_onnx import RuntimeFactory, resolve_compiled_cache_root
 from .detection.ctd import CtdTextDetectorService
 from .detection.paddle import PaddleTextDetectorService
 from .detection.surya import SuryaTextDetectorService
@@ -99,7 +112,7 @@ class AppState:
     """
 
     app_version: str
-    model_manager: LoadedModelManager
+    model_manager: SmallModelManager
     easy_ocr: EasyOcrService
     manga_ocr: MangaOcrService
     paddle_ocr: PaddleOcrService
@@ -120,6 +133,17 @@ class AppState:
     machine_translation: MachineTranslationService
     ai_device: AiDeviceService
     browser: BrowserService
+    # The large-model pool (`large_models.*` IPC, FLUX services), sharing the
+    # small pool's arbiter and memory probes.
+    large_models: LargeModelManager
+    # `large_models.profiles` adapters: {model name registered with `large_models`:
+    # an object with `large_model_inputs(params: dict) -> (options, device)`} (the
+    # contract is `ipc/handlers/large_models.py`).
+    large_model_adapters: Mapping[str, Any]
+    # Probes of the health snapshot's `model_manager.budget` only: no warm-up
+    # matmul, so the health thread never synchronizes a device behind a running
+    # inference (the arbiter's probes warm up; these must not).
+    health_probes: MemoryBudgetProbes
     health_snapshot: dict[str, Any] = field(default_factory=dict)
     health_snapshot_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -176,7 +200,76 @@ def _build_health_snapshot(state: AppState) -> dict[str, Any]:
             "reline": _safe_service_health(state.reline),
         },
         "machine_translation": _safe_service_health(state.machine_translation),
-        "model_manager": _safe_service_health(state.model_manager),
+        "model_manager": _model_manager_health(state),
+    }
+
+
+def _model_manager_health(state: AppState) -> dict[str, Any]:
+    """The `model_manager` health object: the small pool's four counters plus the additive keys of v13.
+
+    Additive keys, each built in isolation (a failing one becomes the
+    `{"status":"error","error":...}` placeholder, the others survive):
+    `small_models` (one entry per small-pool holding), `large_models` + `limits`
+    (`LargeModelManager.health()`), `budget` (`_budget_health`). The four
+    counters keep the old all-or-nothing behaviour of `_safe_service_health`.
+    """
+    payload = _safe_service_health(state.model_manager)
+    payload = dict(payload)
+    try:
+        payload["small_models"] = [_small_holding_entry(view) for view in state.model_manager.holdings().values()]
+    except Exception as exc:  # noqa: BLE001 - one bad part must not sink the snapshot (FIX-6)
+        payload["small_models"] = {"status": "error", "error": str(exc)}
+    large = _safe_service_health(state.large_models)
+    if "large_models" in large:
+        payload.update(large)
+    else:
+        payload["large_models"] = large
+    try:
+        payload["budget"] = _budget_health(state, payload)
+    except Exception as exc:  # noqa: BLE001 - a probe failure must not sink the snapshot (FIX-6)
+        payload["budget"] = {"status": "error", "error": str(exc)}
+    return payload
+
+
+def _small_holding_entry(view: Any) -> dict[str, Any]:
+    """One `small_models` entry from a residency `HoldingView`."""
+    footprint = view.footprint
+    return {
+        "key": view.key,
+        "owner": view.owner,
+        "device": footprint.device,
+        "device_bytes": footprint.device_bytes,
+        "host_bytes": footprint.host_bytes,
+        "size_source": footprint.source.value,
+        "resident": view.resident,
+        "in_use": view.in_use_count > 0,
+        "loading": view.loading,
+    }
+
+
+def _budget_health(state: AppState, model_manager_payload: Mapping[str, Any]) -> dict[str, Any]:
+    """`model_manager.budget`: host budget, the budgets of devices that hold or reserve bytes, outstanding reservations.
+
+    Only `cuda*` devices named by a holding or a reservation are probed, so the
+    snapshot never initializes a GPU context the backend did not already use.
+    """
+    reservations = state.model_manager.arbiter.health()["reservations"]
+    devices: set[str] = set(reservations["device_bytes"])
+    for entry in model_manager_payload.get("small_models") or ():
+        if isinstance(entry, dict) and entry.get("device"):
+            devices.add(str(entry["device"]))
+    for entry in model_manager_payload.get("large_models") or ():
+        if isinstance(entry, dict) and entry.get("device") and (entry.get("device_bytes") or 0) > 0:
+            devices.add(str(entry["device"]))
+    host = state.health_probes.host()
+    device_rows = []
+    for device in sorted(name for name in devices if name.lower().startswith("cuda")):
+        budget = state.health_probes.device(device)
+        device_rows.append({"device": device, "total": budget.total, "free": budget.free, "headroom": budget.headroom(), "reserve": budget.reserve})
+    return {
+        "host": {"total": host.total, "available": host.available, "headroom": host.headroom(), "reserve": host.reserve, "cgroup_limit": host.cgroup_limit},
+        "devices": device_rows,
+        "reservations": reservations,
     }
 
 
@@ -197,6 +290,77 @@ def _get_health_snapshot(state: AppState) -> dict[str, Any]:
         "snapshot_state": "warming_up",
         "is_torch_available": is_torch_available(),
     }
+
+
+@functools.lru_cache(maxsize=None)
+def _cost_tables_for(device: str) -> CostTables:
+    """The large-model cost tables of `device`'s class, read once per device name.
+
+    Raises `OSError` / `ValueError` when the tracked calibration data is missing or
+    malformed (an installation defect, see `cost_tables.load_tables`); nothing is
+    cached then, so the next request retries.
+    """
+    return load_tables(detect_device_class(device))
+
+
+def build_app_state(app_version: str, *, user_config: Any = None, large_models_cache_root: Path | None = None) -> AppState:
+    """Construct every backend service and the `AppState` the IPC handlers read; starts no thread and no transport.
+
+    Wiring: one `MemoryBudgetProbes` -> one `ResidencyArbiter` -> the small pool
+    `SmallModelManager(arbiter=...)` and the large pool `LargeModelManager(arbiter,
+    probes=<the same probes>)`; the large pool's limits persist in `user_config`
+    `General` through `AiDeviceService` and its learned floors in
+    `limits_store_path(<cache root>)`. `user_config` (default: the process
+    `config.UserConfig`) and `large_models_cache_root` (default:
+    `engines.paddle_onnx.resolve_compiled_cache_root()`) exist so tests never touch
+    the user's documents. Constructing reads the settings document and may
+    normalize `General.ai_max_loaded_models` (as before); it loads no model.
+    """
+    probes = MemoryBudgetProbes()
+    arbiter = ResidencyArbiter(probes)
+    model_manager = SmallModelManager(arbiter=arbiter)
+    onnx_runtime_factory = RuntimeFactory(model_manager)
+    ai_device_service = AiDeviceService(model_manager, user_config=user_config)
+    cache_root = large_models_cache_root if large_models_cache_root is not None else resolve_compiled_cache_root()
+    large_models = LargeModelManager(
+        arbiter,
+        limits_store=ai_device_service.large_models_limits_store(JsonLimitsStore(limits_store_path(cache_root))),
+        tables=_cost_tables_for,
+        probes=probes,
+    )
+    # Shared so the SDXL 4-channel prefill reuses the same LaMa model cache.
+    lama_inpaint_service = LamaInpaintService(model_manager)
+    flux2_klein_service = Flux2KleinInpaintService(model_manager, large_models=large_models)
+    return AppState(
+        app_version=app_version,
+        model_manager=model_manager,
+        easy_ocr=EasyOcrService(model_manager),
+        manga_ocr=MangaOcrService(model_manager, ai_device_service),
+        paddle_ocr=PaddleOcrService(onnx_runtime_factory),
+        paddle_vl_ocr=PaddleVlOcrService(model_manager),
+        surya_ocr=SuryaOcrService(model_manager),
+        baberu_ocr=BaberuOcrService(model_manager, ai_device_service),
+        text_detector_ctd=CtdTextDetectorService(model_manager),
+        text_detector_paddle=PaddleTextDetectorService(onnx_runtime_factory),
+        text_detector_surya=SuryaTextDetectorService(model_manager),
+        lama_inpaint=lama_inpaint_service,
+        lama_mpe_inpaint=LamaMpeInpaintService(model_manager),
+        aot_inpaint=AotInpaintService(model_manager),
+        sdxl_inpaint=SdxlInpaintService(model_manager, lama_inpaint_service),
+        flux_fill_inpaint=FluxFillInpaintService(model_manager),
+        flux2_klein_inpaint=flux2_klein_service,
+        watermark=WatermarkRemovalService(model_manager),
+        reline=RelineService(),
+        machine_translation=MachineTranslationService(),
+        ai_device=ai_device_service,
+        browser=BrowserService(),
+        large_models=large_models,
+        # A large model is servable by `large_models.profiles` when its service
+        # (registered with `large_models`) is listed here under its registered
+        # model name; the service implements `large_model_inputs(params)`.
+        large_model_adapters={"flux2_klein": flux2_klein_service},
+        health_probes=MemoryBudgetProbes(device_probe=TorchDeviceProbe(warm_up=False)),
+    )
 
 
 def run_server(
@@ -229,35 +393,10 @@ def run_server(
     Raises ValueError for an unknown `transport` value or a `"ws"` transport with
     no `ws_token`.
     """
-    model_manager = LoadedModelManager()
-    onnx_runtime_factory = RuntimeFactory(model_manager)
-    ai_device_service = AiDeviceService(model_manager)
-    # Shared so the SDXL 4-channel prefill reuses the same LaMa model cache.
-    lama_inpaint_service = LamaInpaintService(model_manager)
-    state = AppState(
-        app_version=app_version,
-        model_manager=model_manager,
-        easy_ocr=EasyOcrService(model_manager),
-        manga_ocr=MangaOcrService(model_manager, ai_device_service),
-        paddle_ocr=PaddleOcrService(onnx_runtime_factory),
-        paddle_vl_ocr=PaddleVlOcrService(model_manager),
-        surya_ocr=SuryaOcrService(model_manager),
-        baberu_ocr=BaberuOcrService(model_manager, ai_device_service),
-        text_detector_ctd=CtdTextDetectorService(model_manager),
-        text_detector_paddle=PaddleTextDetectorService(onnx_runtime_factory),
-        text_detector_surya=SuryaTextDetectorService(model_manager),
-        lama_inpaint=lama_inpaint_service,
-        lama_mpe_inpaint=LamaMpeInpaintService(model_manager),
-        aot_inpaint=AotInpaintService(model_manager),
-        sdxl_inpaint=SdxlInpaintService(model_manager, lama_inpaint_service),
-        flux_fill_inpaint=FluxFillInpaintService(model_manager),
-        flux2_klein_inpaint=Flux2KleinInpaintService(model_manager),
-        watermark=WatermarkRemovalService(model_manager),
-        reline=RelineService(),
-        machine_translation=MachineTranslationService(),
-        ai_device=ai_device_service,
-        browser=BrowserService(),
-    )
+    state = build_app_state(app_version)
+    # Linux: make the kernel's OOM killer pick this backend, never the editor
+    # (`General.large_models_oom_score_adj`, default on; never raises).
+    apply_oom_score_backstop(state.ai_device.general_section())
     _set_health_snapshot(
         state,
         {

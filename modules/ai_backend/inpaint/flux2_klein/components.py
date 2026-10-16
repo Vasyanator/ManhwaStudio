@@ -11,9 +11,11 @@ that is shaped into the `components` map `status` returns.
 Main responsibilities:
 - search roots and probe order (`component_search_roots`, `component_probe_order`,
   `discover_component_dir`, `_require_component_dir`);
-- safetensors header reading and the fp8-scaled refusal
+- the fp8-scaled refusal (`is_fp8_scaled_checkpoint`,
+  `_reject_fp8_scaled_directory`) over the safetensors header parser, which is
+  owned by `runtime.safetensors_stream` and re-bound here
   (`read_safetensors_header_and_data_start`, `read_safetensors_header`,
-  `is_fp8_scaled_checkpoint`, `_reject_fp8_scaled_directory`);
+  `_MAX_SAFETENSORS_HEADER_BYTES`) so the package's callers keep their imports;
 - the transformer config contract (`find_transformer_config_dir`,
   `validate_transformer_config_dir`, `_missing_transformer_config_message`);
 - text-encoder availability (`text_encoder_available`, `require_text_encoder`);
@@ -25,8 +27,7 @@ Main responsibilities:
   distillation (`model_index_search_roots`, `checkpoint_is_distilled`) — a
   tri-state, because a hand-assembled component folder declares nothing;
 - the text encoder's truncation to the layers the pipeline actually reads
-  (`ENCODER_KEEP_LAYERS`, `text_encoder_truncation_kwargs`) and the resident size
-  that follows from it (`text_encoder_resident_bytes`);
+  (`ENCODER_KEEP_LAYERS`, `text_encoder_truncation_kwargs`);
 - the VAE's own tiling threshold (`vae_tile_threshold_pixels`,
   `VAE_TILE_THRESHOLD_FALLBACK_PIXELS`) — the pixel side above which diffusers
   actually decodes tiled, which is what the memory forecast must know before it
@@ -35,15 +36,13 @@ Main responsibilities:
   (`_weight_bytes`, `_path_state`, `_component_states`, `_first_unavailable_reason`).
 
 Notes:
-- `_weight_bytes` is the DISK size (`status.components[*].size_bytes`) and
-  `text_encoder_resident_bytes` is the RAM size the forecast needs. They differ
-  for the text encoder alone, and on purpose; neither may be expressed in terms
-  of the other.
-- `_weight_bytes`, `text_encoder_resident_bytes` and `is_torch_available` are
-  replaced by the test suite through this module object, so every consumer
-  outside this file must reach them as `components._weight_bytes(...)` /
-  `components.text_encoder_resident_bytes(...)` / through this module rather than
-  by importing the name - one patch must reach every caller.
+- `_weight_bytes` is the DISK size (`status.components[*].size_bytes`); what a
+  component occupies once loaded is the manager's inventory (the truncated
+  encoder's resident bytes included), never this figure.
+- `_weight_bytes` and `is_torch_available` are replaced by the test suite
+  through this module object, so every consumer outside this file must reach
+  them as `components._weight_bytes(...)` / through this module rather than by
+  importing the name - one patch must reach every caller.
 - No torch import: this module answers questions about the filesystem only.
 """
 
@@ -51,10 +50,15 @@ from __future__ import annotations
 
 import json
 import logging
-import struct
 from pathlib import Path
 from typing import Any
 
+from ...runtime.encoder_truncation import keep_layers_for_hidden_states
+from ...runtime.safetensors_stream import (  # noqa: F401 - re-bound for the package's callers
+    MAX_SAFETENSORS_HEADER_BYTES,
+    read_safetensors_header,
+    read_safetensors_header_and_data_start,
+)
 from ...runtime.torch_support import is_torch_available
 from .params import MAX_REGION_PIXELS
 
@@ -82,8 +86,9 @@ _SCHEDULER_MARKER = "scheduler_config.json"
 #: A directory is a diffusers/transformers model when it carries this file.
 _MODEL_CONFIG_MARKER = "config.json"
 
-#: Upper bound on the JSON header of a safetensors file we are willing to parse.
-_MAX_SAFETENSORS_HEADER_BYTES = 100 * 1024 * 1024
+#: Upper bound on the JSON header of a safetensors file we are willing to parse
+#: (owner: `runtime.safetensors_stream`; the parser itself is re-bound above).
+_MAX_SAFETENSORS_HEADER_BYTES = MAX_SAFETENSORS_HEADER_BYTES
 
 #: Suffixes of the per-tensor scale entries an fp8-scaled checkpoint carries.
 #: diffusers 0.39 has no converter for them, so such a file must be rejected with
@@ -113,33 +118,21 @@ TEXT_ENCODER_OUT_LAYER_INDICES = (9, 18, 27)
 TEXT_ENCODER_OUT_LAYERS = len(TEXT_ENCODER_OUT_LAYER_INDICES)
 
 #: Decoder layers the text encoder must keep for the run, i.e. how far
-#: `_load_text_encoder` truncates it. Everything above this index is dead weight:
+#: the encoder spec (`large_model.encoder_spec`) truncates it. Everything above this index is dead weight:
 #: the pipeline reads `output.hidden_states` and nothing else, so layers past the
-#: last requested index are computed, stored and thrown away.
-#:
-#: **The `+ 1` is exact and must not be shaved.** `hidden_states[n]` for
-#: `n == num_hidden_layers` is not a raw layer output but the output of
-#: `model.norm` applied to the last layer — measured on a random Qwen3, a 6-layer
-#: and a 4-layer model agree bit-for-bit on `hidden_states[1..3]` and differ by
-#: 2.53 on `hidden_states[4]`. Keeping `max(indices)` layers instead of
-#: `max(indices) + 1` would therefore silently feed the denoise a normed tensor
-#: where a raw one belongs. Keeping MORE than this changes nothing but the cost:
-#: with 36 layers the states at `(9, 18, 27)` are bit-identical to a 28-layer
+#: last requested index are computed, stored and thrown away. The rule — and why
+#: its `+ 1` is exact (`hidden_states[num_hidden_layers]` is the NORMED last
+#: state) — is owned by `runtime.encoder_truncation.keep_layers_for_hidden_states`.
+#: With 36 layers the states at `(9, 18, 27)` are bit-identical to a 28-layer
 #: model's, which is why embeddings saved before the truncation stay valid.
-ENCODER_KEEP_LAYERS = max(TEXT_ENCODER_OUT_LAYER_INDICES) + 1
+ENCODER_KEEP_LAYERS = keep_layers_for_hidden_states(TEXT_ENCODER_OUT_LAYER_INDICES)
 
 #: Prefix of the tied output projection of a causal Qwen3. `Qwen3Model` (the
 #: class this service loads) has no such layer at all, so its tensors are never
-#: materialized — see `text_encoder_resident_bytes`.
+#: materialized (`large_model._encoder_state_key` maps them to nothing).
 _ENCODER_LM_HEAD_PREFIX = "lm_head."
 
-#: Prefix of one decoder layer's tensors in a Qwen3 checkpoint, e.g.
-#: `model.layers.31.self_attn.q_proj.weight`.
-_ENCODER_LAYER_PREFIX = "model.layers."
-
-#: File suffixes counted as component weights. Shared by `_weight_bytes` and
-#: `text_encoder_resident_bytes` so the disk walk and the resident walk cannot
-#: disagree about which files are weights.
+#: File suffixes `_weight_bytes` counts as component weights.
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 
 #: Tiling threshold `vae_tile_threshold_pixels` reports when the VAE's own config
@@ -226,57 +219,6 @@ def _require_component_dir(
 # =====================================================================
 #  Checkpoint inspection
 # =====================================================================
-def read_safetensors_header_and_data_start(path: Path) -> tuple[dict[str, Any], int]:
-    """Parse the JSON header AND report where the tensor data section begins.
-
-    The second element is the absolute byte offset of the first tensor byte,
-    i.e. `8 + header_len`: every `data_offsets` pair in the header is relative
-    to it. A streaming reader needs both halves, so this is the full answer and
-    `read_safetensors_header` is the header-only view of it — there is exactly
-    one parser, and its `_MAX_SAFETENSORS_HEADER_BYTES` ceiling and truncation
-    checks apply to both callers.
-
-    # Raises
-    `ValueError` when the file is not a safetensors container or its header is
-    implausibly large / not valid UTF-8 JSON.
-    """
-    try:
-        with path.open("rb") as handle:
-            raw_len = handle.read(8)
-            if len(raw_len) != 8:
-                raise ValueError(f"Файл слишком мал для safetensors: {path}")
-            header_len = struct.unpack("<Q", raw_len)[0]
-            if header_len == 0 or header_len > _MAX_SAFETENSORS_HEADER_BYTES:
-                raise ValueError(
-                    f"Некорректный заголовок safetensors ({header_len} байт): {path}"
-                )
-            payload = handle.read(header_len)
-    except OSError as exc:
-        raise ValueError(f"Не удалось прочитать {path}: {exc}") from exc
-    if len(payload) != header_len:
-        raise ValueError(f"Обрезанный заголовок safetensors: {path}")
-    try:
-        header = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Заголовок safetensors не является JSON: {path}") from exc
-    if not isinstance(header, dict):
-        raise ValueError(f"Заголовок safetensors не является объектом: {path}")
-    return header, 8 + header_len
-
-
-def read_safetensors_header(path: Path) -> dict[str, Any]:
-    """Parse the JSON header of a safetensors file without loading any tensor.
-
-    A thin view over `read_safetensors_header_and_data_start` for the callers
-    that only ask what the file CONTAINS, not where it keeps it.
-
-    # Raises
-    `ValueError` when the file is not a safetensors container or its header is
-    implausibly large / not valid UTF-8 JSON.
-    """
-    return read_safetensors_header_and_data_start(path)[0]
-
-
 def is_fp8_scaled_checkpoint(header: dict[str, Any]) -> bool:
     """Whether a safetensors header describes an fp8_scaled checkpoint.
 
@@ -548,8 +490,8 @@ def transformer_config_dir(transformer_path: str) -> Path | None:
 
     A diffusers folder carries its own `config.json`; a single `.safetensors`
     checkpoint has one found beside it by `find_transformer_config_dir`, which
-    is the SAME search `_load_transformer` performs, so the guard below and the
-    loader always read the same file. `None` when there is none to read.
+    is the SAME search `large_model.transformer_config_dir` performs, so the guard
+    below and the loader always read the same file. `None` when there is none to read.
     """
     source = Path(transformer_path)
     try:
@@ -666,12 +608,11 @@ def model_index_search_roots(paths: dict[str, Any]) -> list[Path]:
     Deliberately NARROWER than `component_search_roots`: only the transformer and
     the VAE contribute a root. `model_index.json` describes the diffusion
     pipeline, and the `is_distilled` read from it becomes part of what the
-    resident pipeline IS — so it must be a function of the paths
-    `params._model_key` ALWAYS carries. The text-encoder path enters that key
-    only when the user keeps the encoder resident
-    (`unload_text_encoder_after_encode == False`), so letting the encoder's root
-    decide would let two requests that share a key disagree about `is_distilled`
-    on a pipeline the second one reuses. Nothing is lost in the shipped layout: a
+    resident pipeline IS — so it must be a function of the paths the
+    pipeline handle's residency key carries (`large_model.pipeline_spec`: the
+    transformer and the VAE). The text encoder is another handle with its own
+    key, so letting the encoder's root decide would let two requests that share
+    a pipeline key disagree about `is_distilled`. Nothing is lost in the shipped layout: a
     klein checkout keeps `model_index.json` in the root that is the parent of
     both `transformer/` and `vae/`.
     """
@@ -754,8 +695,7 @@ def vae_tile_threshold_pixels(vae_path: str) -> int:
     fallback deliberately rounds toward the EXPENSIVE answer: the only consumer is
     the memory forecast behind a guard whose failure mode is the OOM killer, so
     over-reserving costs a run that might have fitted while under-reserving costs
-    the user's whole session. `components.text_encoder_resident_bytes` rounds up
-    for the same reason.
+    the user's whole session.
     """
     try:
         config_dir = component_dir_for_path(Path(vae_path))
@@ -805,114 +745,8 @@ def vae_tile_threshold_pixels(vae_path: str) -> int:
     return latent_threshold * scale
 
 # =====================================================================
-#  Text-encoder truncation and its resident size
+#  Text-encoder truncation
 # =====================================================================
-def _encoder_layer_index(tensor_name: str) -> int | None:
-    """Decoder-layer index a Qwen3 checkpoint tensor belongs to, or `None`.
-
-    `None` means the tensor is not part of a numbered decoder layer at all
-    (`model.embed_tokens.weight`, `model.norm.weight`, `lm_head.weight`), so no
-    layer count can remove it.
-    """
-    if not tensor_name.startswith(_ENCODER_LAYER_PREFIX):
-        return None
-    rest = tensor_name[len(_ENCODER_LAYER_PREFIX):]
-    head = rest.split(".", 1)[0]
-    return int(head) if head.isdigit() else None
-
-
-def _encoder_tensor_materialized(tensor_name: str, keep_layers: int) -> bool:
-    """Whether `tensor_name` still ends up in memory after a truncated load.
-
-    Two families do not: `lm_head.*`, which `Qwen3Model` does not define (and
-    which the shipped klein checkpoints do not even store — they tie it to
-    `embed_tokens`), and every decoder layer at or above `keep_layers`, which the
-    truncated config never constructs. Everything else is materialized.
-    """
-    if tensor_name.startswith(_ENCODER_LM_HEAD_PREFIX):
-        return False
-    index = _encoder_layer_index(tensor_name)
-    return index is None or index < keep_layers
-
-
-def _safetensors_materialized_bytes(path: Path, keep_layers: int) -> int | None:
-    """Bytes of `path`'s tensors that survive a truncated load, or `None`.
-
-    `None` says the header could not be read as a safetensors one — a `.bin`
-    checkpoint, a truncated download, a placeholder file — and the caller must
-    then fall back to the file's full size rather than guess a smaller number:
-    over-reporting a memory need refuses a run that might have fitted, while
-    under-reporting one invites the OOM killer, and only the second is
-    unrecoverable.
-    """
-    try:
-        header = read_safetensors_header(path)
-    except ValueError as exc:
-        log.debug("FLUX.2 klein: заголовок %s не разобран (%s)", path, exc)
-        return None
-    total = 0
-    for name, entry in header.items():
-        if name == "__metadata__" or not isinstance(entry, dict):
-            continue
-        offsets = entry.get("data_offsets")
-        if not (isinstance(offsets, list) and len(offsets) == 2):
-            continue
-        try:
-            span = int(offsets[1]) - int(offsets[0])
-        except (TypeError, ValueError):
-            continue
-        if span > 0 and _encoder_tensor_materialized(name, keep_layers):
-            total += span
-    return total
-
-
-def text_encoder_resident_bytes(path: str, keep_layers: int = ENCODER_KEEP_LAYERS) -> int:
-    """Bytes of the text encoder a run actually MATERIALIZES in host memory.
-
-    Deliberately NOT `_weight_bytes`, and the two must not be merged. The pair
-    has opposite jobs: `_weight_bytes` answers "how big is this on disk", which
-    is what `status.components[*].size_bytes` shows the user, while this answers
-    "how much of it will exist in RAM", which is what the memory forecast needs.
-    Since the encoder is loaded as a TRUNCATED `Qwen3Model` those two figures
-    genuinely differ — on the shipped klein 4B encoder the trimmed layers 28..35
-    are 20.1% of the 7.492 GiB of tensors — and reporting the disk figure to the
-    forecast over-reserved by that much on every phase that carries the encoder.
-
-    Only safetensors shards can be inspected without reading a tensor
-    (`read_safetensors_header`), so a shard whose header does not parse and any
-    non-safetensors weight file counts in FULL; see
-    `_safetensors_materialized_bytes` for why the fallback rounds up.
-
-    `path` is walked exactly like `_weight_bytes` walks it — a file counts as
-    itself, a directory as its weight files — so the resident figure can never
-    exceed the disk figure for the same path.
-    """
-    source = Path(path)
-    try:
-        if source.is_file():
-            candidates = [source]
-        elif source.is_dir():
-            candidates = [
-                entry
-                for entry in source.rglob("*")
-                if entry.is_file() and entry.suffix.lower() in _WEIGHT_SUFFIXES
-            ]
-        else:
-            return 0
-        total = 0
-        for entry in candidates:
-            materialized = (
-                _safetensors_materialized_bytes(entry, keep_layers)
-                if entry.suffix.lower() == ".safetensors"
-                else None
-            )
-            total += int(entry.stat().st_size) if materialized is None else materialized
-        return total
-    except OSError as exc:
-        log.debug("FLUX.2 klein: could not size %s (%s)", path, exc)
-        return 0
-
-
 def text_encoder_truncation_kwargs(
     encoder_dir: Path, keep_layers: int = ENCODER_KEEP_LAYERS
 ) -> dict[str, Any]:
@@ -994,9 +828,9 @@ def _weight_bytes(path: str) -> int:
     `status.components[*].size_bytes` reports and what the client renders as a
     file size. The text encoder is the one component whose resident size is
     smaller than its files — it is loaded truncated — and the memory forecast
-    therefore asks `text_encoder_resident_bytes` instead. Do not "fix" this
-    function to account for that: it would make the size on screen disagree with
-    the size on disk.
+    therefore takes the manager's inventory instead. Do not "fix" this function
+    to account for that: it would make the size on screen disagree with the size
+    on disk.
     """
     source = Path(path)
     try:
@@ -1060,7 +894,7 @@ def _first_unavailable_reason(components: dict[str, Any], *, prompt_cached: bool
     machine that never downloaded it.
 
     **The Qwen tokenizer is NOT waived along with it**, even though the denoise
-    never tokenizes anything: `_ensure_pipeline_locked` builds the pipeline with
+    never tokenizes anything: `service._pipeline_for` builds the pipeline with
     a real `Qwen2TokenizerFast` and `_require_component_dir` raises without one,
     so a run on a machine that has no `tokenizer/` fails at the load. Verified on
     the reference host — the pipeline build emits its own "Загрузка токенизатора"

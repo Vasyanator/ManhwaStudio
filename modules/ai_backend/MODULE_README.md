@@ -46,13 +46,20 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
   A runtime used by exactly one domain belongs inside that domain.
 
 ## Files and submodules
-- `server.py`: composition root — service construction, `AppState` wiring, framed IPC startup.
+- `server.py`: composition root — `build_app_state(app_version, *, user_config=None,
+  large_models_cache_root=None)` constructs every service and the `AppState` (one
+  `ResidencyArbiter` shared by the small pool and the `LargeModelManager`; `large_model_adapters`
+  lists the services `large_models.profiles` serves, today `flux2_klein`); `run_server` applies the
+  OOM backstop and starts the framed IPC. The two keyword seams exist so tests never touch the
+  user's documents.
 - `__init__.py`: PEP 562 lazy re-export of `run_server`, so importing a light submodule (e.g.
   `ipc.framing`) never drags in the AI stack.
-- `test_health_snapshot.py`: covers `server._build_health_snapshot` (a raising service, and a build
-  while every real service's instance lock is held); lives here because `server.py` does.
+- `test_health_snapshot.py`: covers `server._build_health_snapshot` (a raising service, a build
+  while every real service's instance lock is held, the additive `model_manager` payload) and
+  `build_app_state` wiring; lives here because `server.py` does.
 - `runtime/`: program root (`paths.program_root()`), Torch availability, device/provider selection,
-  `LoadedModelManager`, and the two ROCm workarounds. See `runtime/MODULE_README.md`.
+  the memory budget (`memory_budget.py`), the residency arbiter (`residency/`), the two model pools
+  (`SmallModelManager`, `large_models/` `LargeModelManager`), and the two ROCm workarounds. See `runtime/MODULE_README.md`.
 - `engines/`: cross-domain model-family runtime and model acquisition (`paddle_onnx`,
   `surya_checkpoints`, `model_download`). See `engines/MODULE_README.md`.
 - `ocr/`: OCR services (`ocr.manga` / `.easy` / `.paddle` / `.paddle_vl` / `.surya` / `.baberu`),
@@ -62,8 +69,9 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
   probability maps out; Rust plans and post-processes) plus the vendored ComicTextDetector network
   in `detection/textdetector/`. See `detection/MODULE_README.md`.
 - `inpaint/`: inpainting backends (`inpaint.lama_v2` / `.lama_mpe` / `.aot` / `.sdxl` /
-  `.flux_fill` / `.flux2_klein`), the standalone LaMa V2 runtime module, and the vendored
-  `lama_runtime_bundle/`. See `inpaint/MODULE_README.md`.
+  `.flux_fill` / `.flux2_klein`), the standalone LaMa V2 runtime module, the vendored
+  `lama_runtime_bundle/`, and the FLUX.3 Image Klein generator `flux3_klein/` (a service package
+  that is not wired into `server.py` or IPC yet). See `inpaint/MODULE_README.md`.
 - `watermark/`: visible-watermark removal (`watermark.detect` / `.remove` / `.status` / `.unload`).
   A domain of its own, not an inpainter: it PREDICTS a mask instead of consuming one, and its
   weights plus the network code are fetched on demand into `side_models/WatermarkRemoval/`

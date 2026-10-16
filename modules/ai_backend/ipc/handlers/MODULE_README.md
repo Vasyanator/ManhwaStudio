@@ -101,6 +101,21 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
 - `watermark.py`: `watermark.detect` / `.remove` / `.status` / `.unload` — visible-watermark removal
   (`ctx.state.watermark`). Same two-phase streaming contract as `flux_fill.py`; `.remove` is the only
   method whose RESPONSE blob concatenates two PNGs (`clean ++ mask`, split by `image_len`/`mask_len`).
+- `large_models.py`: `large_models.profiles` / `.limits.set` / `.status` / `.unload` /
+  `.learned.reset` over `ctx.state.large_models` (`LargeModelManager`). Validates field types and
+  builds the model-agnostic `RequestShape` and the requested `Steps` (`vram_step` / `ram_step`,
+  each `auto` when absent); what a step, a format or a limit means is the manager's answer, and
+  `profiles` answers `ProfilesReport.to_dict()` unchanged. The retired single-scale fields
+  (`profile` on `profiles`, `keep_policy` on `limits.set`) are refused by name. `profiles` turns the model's wire `params` into the manager's options and device
+  through `ctx.state.large_model_adapters[model].large_model_inputs(params) -> (options, device)`
+  (the model service implements it; a model without an adapter is refused); an adapter whose
+  params select another registration adds `large_model_name(params) -> str`. An adapter whose
+  operation opens several handles (FLUX.2: pipeline + encoder) adds
+  `large_model_profiles(params, shape, *, format, steps) -> dict` and composes the whole
+  `to_dict()`-shaped answer itself (e.g. through `LargeModelManager.profiles(...,
+  claimed_device_bytes=, claimed_host_bytes=)`); when present it is preferred. `limits.set`: an absent
+  field keeps its value, `null` clears it, merged atomically by `LargeModelManager.set_limits`. Imports only the stdlib-only `runtime/large_models/spec`
+  and `tiers` modules (torch-free). See `../PROTOCOL.md §5.10`.
 - `reline.py`: `reline.models` / `reline.process` (on-disk paths only, no image bytes).
 - `device.py`: `device.get` / `.set` / `.cuda_diagnostics`.
 - `translate.py`: `translate.deep`.
@@ -117,6 +132,9 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   `flux2_klein.py`'s `_download_module()` -> `../../inpaint/flux2_download.py` (a function module
   that owns no resident state, so a service field for it would be an empty object in the composition
   root). Do not grow that list: a helper that acquires state belongs on `AppState`.
+  (`large_models.py` importing the pure value types `RequestShape` / `VramStep` / `RamStep` / `Steps`
+  from `runtime/large_models/` is not a service import: those modules are stdlib-only and hold no
+  state.)
 - This package must stay importable without torch, diffusers, onnxruntime or any model. Heavy work
   belongs to the service; a module-level import of a service package here would break the IPC tests
   and the torch-free `ipc/` guarantee.

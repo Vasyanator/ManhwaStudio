@@ -10,7 +10,7 @@ Main responsibilities:
   return the text heatmap (model channel 0, at a quarter of the tile size) as
   `uint8`;
 - synchronize model device with backend `General.ai_device`;
-- cooperate with `LoadedModelManager` for bounded resident model count.
+- cooperate with `SmallModelManager` for bounded resident model count.
 
 Key structures:
 - SuryaTextDetectorService
@@ -33,12 +33,15 @@ from __future__ import annotations
 import functools
 import logging
 import threading
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
+from ..runtime.residency.footprint import hint_from_files
+from ..runtime.residency.holdings import FootprintHint
 from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from ..engines.surya_checkpoints import point_settings_at, require_local_checkpoint
 from .forward_maps import quantize_probability_maps, validate_tiles
@@ -63,11 +66,25 @@ _resolve_selected_backend_device = resolve_selected_backend_device
 #: patched by name in the test suite.
 _clear_torch_cache = functools.partial(clear_torch_cache, owner="Surya detection")
 
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "detection.surya"
+
+
+def _dir_hint(directory: str, device: str) -> FootprintHint:
+    """Pre-load size of a checkpoint directory: every file in it, on `device`.
+
+    A non-absolute `directory` (refused by the load) is never sized, since an
+    empty one would sum the working directory: it gets an unknown-size hint.
+    """
+    if not Path(directory).is_absolute():
+        return FootprintHint(device=device)
+    return hint_from_files([directory], device)
+
 
 class SuryaTextDetectorService:
     MODEL_KEY_PREFIX = "surya:detector_only"
 
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.RLock()
         self._model_manager = model_manager
         self._predictor = None
@@ -126,16 +143,21 @@ class SuryaTextDetectorService:
             selected_device,
             model_key,
         )
+        # Pre-load size: every file of the checkpoint directory the predictor loads.
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=_dir_hint(model_dir, selected_device),
         )
         try:
             with self._lock:
                 predictor = self._ensure_predictor_locked(selected_device, model_dir)
-                maps = _forward_with_predictor(predictor, tiles)
-            if lease.needs_load:
+                # Right after the load, under the lock and unconditionally (the
+                # lease protocol in `runtime/model_manager.py`): a failed forward
+                # is a failed run, never a failed load.
                 lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
+                maps = _forward_with_predictor(predictor, tiles)
             self._last_error = None
             # Set outside `_lock` (a forward must not wait for another request's
             # load just to clear its error), so only this field is republished.

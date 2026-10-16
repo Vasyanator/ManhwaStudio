@@ -33,8 +33,9 @@ if TYPE_CHECKING:
     import torch as torch_mod
 
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
 from ..runtime.paths import program_root
+from ..runtime.residency.footprint import hint_from_files
 from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 
 try:
@@ -73,6 +74,8 @@ log = logging.getLogger(__name__)
 #: (`Torch/LaMa_MPE/inpainting_lama_mpe.ckpt`, 108 580 583 bytes) has these bytes.
 _LAMA_MPE_SHA256 = "d625aa1b3e0d0408acfd6928aa84f005867aa8dbb9162480346a4e20660786cc"
 _LAMA_MPE_CKPT_NAME = "inpainting_lama_mpe.ckpt"
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "inpaint.lama_mpe"
 
 
 def _torch() -> torch_mod:
@@ -231,7 +234,7 @@ def _resize_keepasp(
 
 
 class LamaMpeInpaintService:
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.RLock()
         self._model_manager = model_manager
         self._model: Any = None
@@ -281,9 +284,14 @@ class LamaMpeInpaintService:
         normalized = self._normalize_params(params)
         device = _resolve_selected_backend_device(self._active_device)
         model_key = self._model_key_for(device)
+        # Pre-load size: the checkpoint file; before Rust fetched it the size
+        # is unknown and the arbiter's unknown-size default applies.
+        hint = hint_from_files([self._model_path], device)
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=hint,
         )
 
         with self._lock:
@@ -300,8 +308,7 @@ class LamaMpeInpaintService:
                 # The model is resident from here on, so it is registered before
                 # inference: an inference failure must leave it counted and
                 # evictable, not silently occupying VRAM off the books.
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
+                lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 out_rgb = self._inpaint_locked(
                     model,
                     image_rgb=image_rgb,

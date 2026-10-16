@@ -29,6 +29,7 @@ import unittest
 from pathlib import Path
 
 from modules.ai_backend.inpaint import flux2_klein as svc
+from modules.ai_backend.inpaint.flux2_klein import large_model
 
 from ._test_fixtures import _make_model_tree, _TempTreeCase, _write_safetensors
 
@@ -102,9 +103,9 @@ class CheckpointIsDistilledTests(_TempTreeCase):
 
     def test_only_the_transformer_and_vae_roots_are_searched(self) -> None:
         # The answer becomes part of what the resident pipeline IS, so it must be
-        # a function of the paths `_model_key` ALWAYS carries. The text-encoder
-        # path is in that key only when the encoder is kept resident, so a
-        # manifest reachable through it alone must not decide.
+        # a function of the paths the pipeline handle's key carries. The text
+        # encoder is another handle, so a manifest reachable through it alone
+        # must not decide.
         self.declare_distilled(None)
         encoder_only = self.root / "elsewhere"
         (encoder_only / "text_encoder").mkdir(parents=True)
@@ -155,47 +156,15 @@ class ComponentDirNormalizationTests(_TempTreeCase):
     def test_vae_loader_accepts_a_file_inside_the_folder(self) -> None:
         vae_dir = Path(self.paths["vae_path"])
         weights = vae_dir / "diffusion_pytorch_model.safetensors"
-        weights.write_bytes(b"")
-        seen: list[str] = []
-
-        class _Vae:
-            @staticmethod
-            def from_pretrained(path: str, **_kwargs: object) -> str:
-                seen.append(path)
-                return "vae"
-
-            @staticmethod
-            def from_single_file(path: str, **_kwargs: object) -> str:
-                raise AssertionError(f"single-file loader must not be reached for {path}")
-
-        loaded = svc._load_vae(
-            _Vae, str(weights), dtype=None, device_map=None, low_cpu_mem_usage=True
-        )
-        self.assertEqual(loaded, "vae")
-        self.assertEqual(seen, [str(vae_dir)])
+        self.assertEqual(svc.component_dir_for_path(weights), vae_dir)
+        # The manager's VAE files are the folder's shards, whichever path was picked.
+        self.assertEqual(large_model.vae_files(str(weights)), large_model.vae_files(str(vae_dir)))
 
     def test_text_encoder_accepts_a_file_inside_the_folder(self) -> None:
         encoder_dir = Path(self.paths["text_encoder_path"])
         weights = encoder_dir / "model.safetensors"
-        weights.write_bytes(b"")
-        seen: list[str] = []
-
-        class _Encoder:
-            @staticmethod
-            def from_pretrained(path: str, **_kwargs: object) -> str:
-                seen.append(path)
-                return "encoder"
-
-        loaded = svc._load_text_encoder(
-            _Encoder,
-            str(weights),
-            dtype=None,
-            device_map=None,
-            low_cpu_mem_usage=True,
-            keep_layers=None,
-        )
-        self.assertEqual(loaded, "encoder")
-        self.assertEqual(seen, [str(encoder_dir)])
+        self.assertEqual(svc.component_dir_for_path(weights), encoder_dir)
+        self.assertEqual(large_model.encoder_files(str(weights)), [weights])
 
 
 class SafetensorsInspectionTests(unittest.TestCase):
@@ -324,7 +293,7 @@ class EncoderTransformerCompatibilityTests(unittest.TestCase):
             )
 
     def test_a_single_file_transformer_uses_the_config_beside_it(self) -> None:
-        # The same search `_load_transformer` performs, so the guard and the
+        # The same search `large_model.transformer_config_dir` performs, so the guard and the
         # loader can never read two different configs.
         self._transformer(7680)
         checkpoint = self.root / "transformer" / "diffusion_pytorch_model.safetensors"
@@ -409,7 +378,7 @@ class EncoderTransformerCompatibilityTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Text-encoder truncation and its resident size
+# Text-encoder truncation
 # ---------------------------------------------------------------------------
 class EncoderTruncationKwargsTests(unittest.TestCase):
     """`text_encoder_truncation_kwargs` decides per config, and never clamps."""
@@ -471,68 +440,6 @@ class EncoderTruncationKwargsTests(unittest.TestCase):
             svc.ENCODER_KEEP_LAYERS, max(svc.TEXT_ENCODER_OUT_LAYER_INDICES) + 1
         )
         self.assertEqual(svc.TEXT_ENCODER_OUT_LAYERS, len(svc.TEXT_ENCODER_OUT_LAYER_INDICES))
-
-
-class TextEncoderResidentBytesTests(unittest.TestCase):
-    """The RAM figure the forecast uses, next to the DISK figure `status` shows."""
-
-    def setUp(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
-        self.folder = self.root / "text_encoder"
-        self.folder.mkdir(parents=True)
-
-    @staticmethod
-    def _entry(begin: int, end: int) -> dict[str, object]:
-        return {"dtype": "BF16", "shape": [end - begin], "data_offsets": [begin, end]}
-
-    def test_trimmed_layers_and_the_tied_head_do_not_count(self) -> None:
-        keep = svc.ENCODER_KEEP_LAYERS
-        _write_safetensors(
-            self.folder / "model.safetensors",
-            {
-                "model.embed_tokens.weight": self._entry(0, 1000),
-                f"model.layers.{keep - 1}.self_attn.q_proj.weight": self._entry(1000, 1100),
-                f"model.layers.{keep}.self_attn.q_proj.weight": self._entry(1100, 1300),
-                "model.norm.weight": self._entry(1300, 1310),
-                "lm_head.weight": self._entry(1310, 3310),
-            },
-        )
-        self.assertEqual(svc.text_encoder_resident_bytes(str(self.folder)), 1000 + 100 + 10)
-
-    def test_it_never_exceeds_the_disk_figure_status_reports(self) -> None:
-        keep = svc.ENCODER_KEEP_LAYERS
-        shard = self.folder / "model.safetensors"
-        _write_safetensors(
-            shard,
-            {
-                "model.embed_tokens.weight": self._entry(0, 1000),
-                f"model.layers.{keep}.mlp.up_proj.weight": self._entry(1000, 9000),
-            },
-        )
-        # `_write_safetensors` writes the header alone; the tensor bytes have to
-        # exist for the DISK figure to be the one a real checkout would show.
-        shard.write_bytes(shard.read_bytes() + b"\x00" * 9000)
-        self.assertLess(
-            svc.text_encoder_resident_bytes(str(self.folder)),
-            svc._weight_bytes(str(self.folder)),
-        )
-
-    def test_a_shard_whose_header_cannot_be_read_counts_in_full(self) -> None:
-        # Rounding DOWN here would invite the OOM killer; rounding up only
-        # refuses a run that might have fitted. The fixture trees ship exactly
-        # such a file (2 KiB of zeros).
-        blob = self.folder / "model.safetensors"
-        blob.write_bytes(b"\x00" * 2048)
-        self.assertEqual(svc.text_encoder_resident_bytes(str(self.folder)), 2048)
-
-    def test_a_non_safetensors_weight_file_counts_in_full(self) -> None:
-        (self.folder / "pytorch_model.bin").write_bytes(b"\x01" * 512)
-        self.assertEqual(svc.text_encoder_resident_bytes(str(self.folder)), 512)
-
-    def test_a_path_that_is_not_there_costs_nothing(self) -> None:
-        self.assertEqual(svc.text_encoder_resident_bytes(str(self.root / "nope")), 0)
 
 
 @unittest.skipIf(

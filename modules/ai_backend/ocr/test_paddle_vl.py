@@ -42,7 +42,7 @@ from unittest import mock
 from modules.ai_backend.ocr import paddle_vl as service_module
 from modules.ai_backend.ocr.paddle_vl import PaddleVlOcrService
 from modules.ai_backend.ocr.result_format import format_recognition_lines
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 
 class FormatRecognitionLinesTests(unittest.TestCase):
@@ -317,7 +317,7 @@ class ServiceLeaseTests(unittest.TestCase):
         self.dir_b = root / "manga_ja"
         self.dir_a.mkdir()
         self.dir_b.mkdir()
-        self.manager = LoadedModelManager()
+        self.manager = SmallModelManager()
         self.service = PaddleVlOcrService(self.manager)
         self.loads: list[tuple[Path, str]] = []
         self.fail_load = False
@@ -352,7 +352,7 @@ class ServiceLeaseTests(unittest.TestCase):
         )
 
     def _resident_keys(self) -> set[str]:
-        return {key for key, entry in self.manager._entries.items() if entry.resident}
+        return {key for key, entry in self.manager.holdings().items() if entry.resident}
 
     def test_key_format(self) -> None:
         self.assertEqual(PaddleVlOcrService._model_key("manga_ja", "cuda:0"), "paddlevlocr:manga_ja:cuda:0")
@@ -375,7 +375,7 @@ class ServiceLeaseTests(unittest.TestCase):
             self._recognize(model_dir=Path("relative/dir"))
         with self.assertRaisesRegex(RuntimeError, "does not exist"):
             self._recognize(model_dir=self.dir_a / "absent")
-        self.assertEqual(self.manager._entries, {})
+        self.assertEqual(self.manager.holdings(), {})
         self.assertEqual(self.loads, [])
 
     def test_mark_loaded_precedes_a_failing_inference(self) -> None:
@@ -401,13 +401,13 @@ class ServiceLeaseTests(unittest.TestCase):
                 self._recognize(script="korean")
         self.assertEqual(self._resident_keys(), {"paddlevlocr:official_1_6:cpu"})
         self.assertTrue(self.service._unload_model_key("paddlevlocr:official_1_6:cpu"))
-        self.assertEqual(self.manager._entries, {})
+        self.assertEqual(self.manager.holdings(), {})
 
     def test_load_failure_leaves_no_entry(self) -> None:
         self.fail_load = True
         with self.assertRaisesRegex(RuntimeError, "init failed"):
             self._recognize()
-        self.assertEqual(self.manager._entries, {})
+        self.assertEqual(self.manager.holdings(), {})
         self.assertFalse(self.service.health()["ready"])
 
     def test_variant_switch_unloads_the_old_key(self) -> None:
@@ -438,7 +438,7 @@ class ServiceLeaseTests(unittest.TestCase):
         self.fail_load = True
         with self.assertRaises(RuntimeError):
             self._recognize(model_dir=other_dir)
-        self.assertEqual(self.manager._entries, {})
+        self.assertEqual(self.manager.holdings(), {})
         self.assertFalse(self.service.health()["ready"])
 
     def test_device_fallback_is_read_without_waiting_for_the_instance_lock(self) -> None:
@@ -479,7 +479,7 @@ class UnloadTests(unittest.TestCase):
     """Pin what `_unload_model_key` releases and when it refuses."""
 
     def _loaded_service(self) -> PaddleVlOcrService:
-        service = PaddleVlOcrService(LoadedModelManager())
+        service = PaddleVlOcrService(SmallModelManager())
         service._model = object()
         service._processor = object()
         service._identity = service_module._ModelIdentity(
@@ -527,7 +527,7 @@ class UnloadTests(unittest.TestCase):
                 self.assertIs(service._model, model)
 
     def test_unload_without_a_loaded_model_is_refused(self) -> None:
-        service = PaddleVlOcrService(LoadedModelManager())
+        service = PaddleVlOcrService(SmallModelManager())
 
         unloaded_ok, unloaded = self._unload(service, PaddleVlOcrService._model_key("official_1_6", "cuda:0"))
 

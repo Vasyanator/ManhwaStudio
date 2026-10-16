@@ -50,8 +50,10 @@ from ..engines.paddle_onnx import (
 )
 from ..runtime.device_service import AiDeviceService
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
 from ..runtime.paths import program_root
+from ..runtime.residency.footprint import hint_from_files
+from ..runtime.residency.holdings import FootprintHint
 from ..runtime.rocm_mmap_transfer import move_module_to
 
 try:
@@ -73,6 +75,8 @@ MANGA_OCR_MODEL_DIRS: dict[str, str] = {
 }
 ENCODER_FILE_NAME = "encoder_model.onnx"
 DECODER_FILE_NAME = "decoder_model.onnx"
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "ocr.manga"
 
 
 def _clear_runtime_cache() -> None:
@@ -391,7 +395,7 @@ class MangaOcrService:
 
     def __init__(
         self,
-        model_manager: LoadedModelManager,
+        model_manager: SmallModelManager,
         ai_device_service: AiDeviceService,
     ) -> None:
         self._lock = threading.Lock()
@@ -431,7 +435,8 @@ class MangaOcrService:
         try:
             with self._lock:
                 runtime = self._ensure_loaded_locked(lease_ctx.model_key, lease_ctx.settings)
-            if lease_ctx.needs_load:
+                # Under the lock and unconditionally: the lease protocol in
+                # `runtime/model_manager.py`.
                 lease_ctx.mark_loaded(
                     unload_callback=lambda: self._unload_key(lease_ctx.model_key)
                 )
@@ -458,7 +463,8 @@ class MangaOcrService:
         try:
             with self._lock:
                 runtime = self._ensure_loaded_locked(lease_ctx.model_key, lease_ctx.settings)
-            if lease_ctx.needs_load:
+                # Under the lock and unconditionally: the lease protocol in
+                # `runtime/model_manager.py`.
                 lease_ctx.mark_loaded(
                     unload_callback=lambda: self._unload_key(lease_ctx.model_key)
                 )
@@ -494,6 +500,8 @@ class MangaOcrService:
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=self._footprint_hint(selected_model, settings),
         )
         return _LeaseContext(
             lease=lease,
@@ -501,6 +509,20 @@ class MangaOcrService:
             settings=settings,
             needs_load=bool(lease.needs_load),
         )
+
+    def _footprint_hint(self, model_name: str, settings: ProviderSettings) -> FootprintHint:
+        """Pre-load size of `model_name` for the residency arbiter.
+
+        ONNX: the encoder + decoder files `_OnnxMangaOcrRuntime` opens, on the
+        EP's device. PyTorch: the weights sit in the Hugging Face cache, whose
+        files are not resolved before the load, so only the device is given
+        (the arbiter's unknown-size default, replaced after a clean load).
+        """
+        if model_name == "base_torch":
+            selected_device = str(self._ai_device_service.get_state().get("selected_device") or "cpu")
+            return FootprintHint(device="cpu" if self._torch_force_cpu(selected_device) else selected_device)
+        model_dir = self._model_dir(model_name)
+        return hint_from_files([model_dir / ENCODER_FILE_NAME, model_dir / DECODER_FILE_NAME], settings.footprint_device(), onnx=True)
 
     @staticmethod
     def _models_root() -> Path:

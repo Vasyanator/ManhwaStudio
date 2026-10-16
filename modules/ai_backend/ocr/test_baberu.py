@@ -17,6 +17,8 @@ Main responsibilities:
   files change rebuilds under the same key without a phantom resident, a
   provider-selection change rebuilds under `baberuocr:<provider>:<device>` and
   unloads the old key;
+- the lease's residency owner and split size hint (vision file on the EP's
+  device, int8 decoders on the host, x1.25 ONNX);
 - session placement: vision on the selected provider (TensorRT -> CUDA),
   decoders on CPU, CPU fallback with a WARN on an unavailable provider, a
   failed build or a silent onnxruntime drop (fake `onnxruntime` module);
@@ -54,7 +56,9 @@ from modules.ai_backend.ocr.baberu import (
     preprocess,
     vision_provider_settings,
 )
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.memory_budget import MIB
+from modules.ai_backend.runtime.model_manager import SmallModelManager
+from modules.ai_backend.runtime.residency.holdings import FootprintHint, Runtime
 from modules.ai_backend.runtime.paths import program_root
 
 VOCAB_SIZE = 8  # ids 0..3 special, 4..7 content/symbol under test control
@@ -277,7 +281,7 @@ class LeaseProtocolTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self._tmp = tempfile.TemporaryDirectory(prefix="ms_baberu_lease_")
         self.addCleanup(self._tmp.cleanup)
-        self.manager = LoadedModelManager()
+        self.manager = SmallModelManager()
         self.devices = _FakeDeviceService()
         self.service = BaberuOcrService(self.manager, self.devices)
 
@@ -303,7 +307,7 @@ class LeaseProtocolTests(unittest.TestCase):
             self.service.health(),
             {"ready": True, "device": "CPUExecutionProvider:0", "last_error": None},
         )
-        self.assertIn("baberuocr:CPUExecutionProvider:0", self.manager._entries)
+        self.assertIn("baberuocr:CPUExecutionProvider:0", self.manager.holdings())
 
     def test_inference_failure_keeps_the_model_counted_and_evictable(self) -> None:
         _StubRuntime.fail_inference = True
@@ -322,7 +326,7 @@ class LeaseProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "init failed"):
             self.service.recognize_image_bytes(_png_bytes(), model_files=self._files("a"))
         self.assertEqual(self.manager.health()["resident_model_count"], 0)
-        self.assertEqual(self.manager._entries, {})
+        self.assertEqual(self.manager.holdings(), {})
         self.assertFalse(self.service.health()["ready"])
 
     def test_same_files_reuse_and_changed_files_rebuild_under_one_key(self) -> None:
@@ -343,7 +347,7 @@ class LeaseProtocolTests(unittest.TestCase):
         self.assertEqual(len(_StubRuntime.loads), 2)
         self.assertEqual(_StubRuntime.loads[1][1], ProviderSettings("CUDAExecutionProvider", "1"))
         self.assertEqual(self._resident(), 1)
-        self.assertEqual(set(self.manager._entries), {"baberuocr:CUDAExecutionProvider:1"})
+        self.assertEqual(set(self.manager.holdings()), {"baberuocr:CUDAExecutionProvider:1"})
         self.assertEqual(self.service.health()["device"], "CUDAExecutionProvider:1")
         # The old key's eviction callback no longer owns anything.
         self.assertFalse(self.service._unload_key("baberuocr:CPUExecutionProvider:0"))
@@ -358,13 +362,55 @@ class LeaseProtocolTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.service.recognize_image_bytes(_png_bytes(), model_files=self._files("b"))
         self.assertEqual(self._resident(), 0)
-        self.assertEqual(self.manager._entries, {})
+        self.assertEqual(self.manager.holdings(), {})
         self.assertFalse(self.service.health()["ready"])
 
     def test_invalid_paths_never_take_a_lease(self) -> None:
         with self.assertRaises(ValueError):
             self.service.recognize_image_bytes(_png_bytes(), model_files={"vision": "rel"})
-        self.assertEqual(self.manager._entries, {})
+        self.assertEqual(self.manager.holdings(), {})
+
+
+class LeaseHintTests(unittest.TestCase):
+    """The lease carries the service owner and a hint split by device: vision on the EP, decoders on the CPU."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="ms_baberu_hint_")
+        self.addCleanup(self._tmp.cleanup)
+        sizes = {"vision": 800, "prefill": 400, "step": 200, "vocab": 10}
+        self.raw: dict[str, str] = {}
+        for name, size in sizes.items():
+            path = Path(self._tmp.name) / f"{name}.onnx"
+            path.write_bytes(b"x" * size)
+            self.raw[name] = str(path)
+        self.files = BaberuFiles.from_request(self.raw)
+
+    def test_gpu_selection_puts_vision_on_the_device_and_decoders_on_the_host(self) -> None:
+        hint = baberu_module._footprint_hint(self.files, ProviderSettings("CUDAExecutionProvider", "1"))
+        self.assertEqual(hint, FootprintHint(device="cuda:1", device_bytes=1000, host_bytes=256 * MIB + 750, runtime=Runtime.ONNX))
+
+    def test_tensorrt_selection_is_estimated_on_its_cuda_device(self) -> None:
+        hint = baberu_module._footprint_hint(self.files, ProviderSettings("TensorrtExecutionProvider", "0"))
+        self.assertEqual(hint.device, "cuda:0")
+        self.assertEqual(hint.device_bytes, 1000)
+
+    def test_cpu_selection_is_host_only(self) -> None:
+        hint = baberu_module._footprint_hint(self.files, ProviderSettings("CPUExecutionProvider", "0"))
+        self.assertEqual(hint, FootprintHint(device="cpu", device_bytes=0, host_bytes=1000 + 750, runtime=Runtime.ONNX))
+
+    def test_the_hint_and_owner_reach_the_manager(self) -> None:
+        manager = SmallModelManager()
+        service = BaberuOcrService(manager, _FakeDeviceService())
+        seen: list[tuple[Any, Any]] = []
+        real = manager.begin_model_use
+
+        def spy(key: str, unload_callback: Any = None, *, owner: Any = None, hint: Any = None) -> Any:
+            seen.append((owner, hint))
+            return real(key, unload_callback, owner=owner, hint=hint)
+
+        with mock.patch.object(manager, "begin_model_use", spy), mock.patch.object(baberu_module, "_BaberuOnnxRuntime", _StubRuntime):
+            service.recognize_image_bytes(_png_bytes(), model_files=self.raw)
+        self.assertEqual(seen, [(baberu_module._LEASE_OWNER, baberu_module._footprint_hint(self.files, ProviderSettings("CPUExecutionProvider", "0")))])
 
 
 class _BlockingRuntime(_StubRuntime):
@@ -397,7 +443,7 @@ class HealthDuringLoadTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self._tmp = tempfile.TemporaryDirectory(prefix="ms_baberu_health_")
         self.addCleanup(self._tmp.cleanup)
-        self.service = BaberuOcrService(LoadedModelManager(), _FakeDeviceService())
+        self.service = BaberuOcrService(SmallModelManager(), _FakeDeviceService())
         self.errors: list[BaseException] = []
 
     def _files(self) -> dict[str, str]:
@@ -624,7 +670,7 @@ class RealWeightsTests(unittest.TestCase):
         buffer = io.BytesIO()
         image.save(buffer, format="PNG")
 
-        service = BaberuOcrService(LoadedModelManager(), _FakeDeviceService())
+        service = BaberuOcrService(SmallModelManager(), _FakeDeviceService())
         result = service.recognize_image_bytes(buffer.getvalue(), model_files=files)
 
         self.assertEqual(result["lines"], lines)

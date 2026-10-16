@@ -28,7 +28,7 @@ import numpy as np
 from PIL import Image
 
 from modules.ai_backend.inpaint import aot
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 
 def _png_bytes(mode: str, color: object) -> bytes:
@@ -60,7 +60,7 @@ class AotHealthDuringLoadTests(unittest.TestCase):
             patcher = mock.patch.object(aot, target, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
-        self.service = aot.AotInpaintService(LoadedModelManager())
+        self.service = aot.AotInpaintService(SmallModelManager())
         self.service._model_path = checkpoint
         inference = mock.patch.object(self.service, "_inpaint_locked", self._blocking_inference)
         inference.start()

@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `12` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `13` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -229,7 +229,7 @@ Legend:
   method replaced; it is not an address the backend serves. Methods added after
   the HTTP backend was retired have no such column entry.
 
-Total methods mapped: **46** — the full contents of `ALL_METHODS` in
+Total methods mapped: **51** — the full contents of `ALL_METHODS` in
 `protocol.py`, which is the machine-readable source of the same list. A method
 present in `protocol.py` but absent here is a documentation defect.
 
@@ -423,7 +423,7 @@ streams `phase:"download"`.
 |---------------------------------|------------------------------------------------------------------------------------------|------------------------|--------------------------------------------------------------------------|------------|---------|--------|
 | `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `reference_len: int?`, `params: object` (see below)     | region PNG ++ mask PNG [++ reference PNG] | `image_len: int`, `oom_recovered: bool`, `applied: object`, `text_attention_in_mask: bool` | result PNG | **yes** | yes    |
 | `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `memory: object`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `text_encoder_available: bool`, `guidance_supported: bool` | none | no | no |
-| `inpaint.flux2_klein.estimate`  | `params: object`, `region_width: int`, `region_height: int`                                | none                   | `vram_bytes`, `ram_bytes`, `vram_free`, `ram_free`, `fits: bool`, `breakdown: object` | none | no | no |
+| `inpaint.flux2_klein.estimate`  | `params: object`, `region_width: int`, `region_height: int`                                | none                   | `vram_bytes`, `ram_bytes`, `vram_free`, `ram_free`, `fits: bool`, `breakdown: object` (v13 adds the six step keys and `calibrated`, §5.10) | none | no | no |
 | `inpaint.flux2_klein.unload`    | (none)                                                                                     | none                   | `unloaded: bool`                                                          | none       | no      | no     |
 | `inpaint.flux2_klein.component_action` | `params: object`, `component: string`, `action: string`                             | none                   | `component`, `action`, `performed: bool`, `components: object`, `components_busy: false`, `device: string` | none | **yes** | yes |
 | `inpaint.flux2_klein.prompt_cache.build`  | `params: object`                                                         | none                   | `prompt: string`, `encoded: bool`, `prompt_cached: true`, `device: string` | none      | **yes** | yes    |
@@ -568,7 +568,9 @@ see "generating without a text encoder" below):
 accepted and then ignored),
 `strength` (0.25..1.0, default 1.0), `seed: int|null`,
 `placement` (`full_gpu` | `encoder_cpu` | `model_cpu_offload` |
-`sequential_cpu_offload`), `dtype` (`bfloat16` | `float16`),
+`sequential_cpu_offload`; LEGACY since v13, mapped onto a step pair — §5.10),
+`vram_step` / `ram_step` (v13, §5.10), `profile` (LEGACY stage-1 id, §5.10),
+`dtype` (`bfloat16` | `float16`),
 `low_cpu_mem_usage: bool`, `vae_tiling: bool`, `vae_slicing: bool`,
 `unload_transformer_before_vae: bool` (default: `true` for every placement
 except `full_gpu`), `unload_text_encoder_after_encode: bool` (default `false`
@@ -598,8 +600,8 @@ stays the clean image the model edits, and the reference never enters the
 composite. The pipeline preprocesses a reference with the region's own rules (the
 1 MP cap and the floor to a multiple of 16), so a reference of the region's size
 stays pixel-aligned with it — and for a valid region both rules are no-ops. The
-pre-load memory guard counts the reference's condition tokens in the denoise
-phase; `.estimate` takes no reference and forecasts a run without one.
+large-model manager's admission counts the reference's condition tokens in the
+denoise phase; `.estimate` takes no reference and forecasts a run without one.
 
 **`whole_region` — editing without a painted mask.** The request format does not
 fork: the blob still carries a mask, and under `whole_region: true` it must be
@@ -630,7 +632,7 @@ instruction can be grounded on a matching object OUTSIDE the mask and edited
 there — an edit the latent blend and the composite then discard, leaving nothing
 changed under the mask. Costs: one `S x S` mask on the compute device (about
 150-330 MB at 1 MP; counted in the denoise phase of `.estimate` and of the
-pre-load guard, listed as `breakdown.attention_mask` while it is in force) and
+manager's admission, listed as `breakdown.attention_mask` while it is in force) and
 the flash attention kernel. It is a no-op under `whole_region` (every token is
 inside), so that mode forces it to `false`. A mask with no set pixel (refused
 before any model loads), or a negative prompt whose text length differs from
@@ -641,20 +643,26 @@ client persists `applied` into the user's settings and a `whole_region` run
 must not switch the user's choice off.
 
 Response detail — `applied` is the set of memory settings ACTUALLY in force when
-the run finished, `{unload_transformer_before_vae: bool, vae_tiling: bool,
-vae_slicing: bool}`. The backend splits denoising from the VAE decode, so an
-out-of-memory failure in the decode is recovered from without repeating the
-denoise — every retry starts from the same host copy of the latents. Three rungs,
-in order: it parks the transformer on the host; it enables VAE tiling, but only
-when tiling would ACTUALLY engage for this region (diffusers takes the tiled
-branch only above the VAE's own threshold — 1024 output px on the shipped klein
-VAE — so below it the flag changes nothing and `applied.vae_tiling` must not
-claim a saving that never happened); and finally it shrinks the VAE's tile itself
-for ONE decode, lowering the latent and the sample threshold together, so that
-tiling engages on a region the shipped threshold ignores. That last rung is an
-emergency, not a setting: both thresholds are restored before the answer is sent
-and neither appears in `applied`, and its output is not bit-identical to an
-untiled decode because the tiles are blended. `vae_slicing` is NOT a rung at all:
+the run finished, ALWAYS all five flags (the client parses it as one struct):
+`{unload_transformer_before_vae: bool, vae_tiling: bool, vae_slicing: bool,
+unload_text_encoder_after_encode: bool, text_encoder_fp8: bool}`.
+`unload_transformer_before_vae` is true when the run's effective plan kept the
+transformer off the device during the decode; the last two echo the request. The
+backend splits denoising from the VAE decode, so an out-of-memory failure in the
+decode is recovered from without repeating the denoise — every retry starts from
+the same host copy of the latents. The rungs, in order (the large-model manager's
+degrade ladder): VAE tiling, but only when tiling would ACTUALLY engage for this
+region (diffusers takes the tiled branch only above the VAE's own threshold —
+1024 output px on the shipped klein VAE — so below it the flag changes nothing
+and `applied.vae_tiling` must not claim a saving that never happened); then the
+VAE's tile itself shrunk for ONE decode, lowering the latent and the sample
+threshold together, so that tiling engages on a region the shipped threshold
+ignores; then the next more economical «Видеопамять» step (which takes the
+transformer off the device: `applied.unload_transformer_before_vae`,
+`degraded: true`). The lowered tile is an emergency, not a setting: both
+thresholds are restored before the answer is sent and neither appears in
+`applied`, and its output is not bit-identical to an untiled decode because the
+tiles are blended. `vae_slicing` is NOT a rung at all:
 `decode` slices only a batch larger than one and this service always decodes a
 batch of one. When a retry was needed `oom_recovered` is `true` and `applied`
 names the settings the client should persist so the next run takes the cheap path
@@ -664,23 +672,23 @@ immediately.
 `status.components` (`text_encoder`, `transformer`, `vae` — not `tokenizer` /
 `scheduler`, which carry none) also carry two fields beside their disk facts:
 
-- `residency`: `"not_loaded"` (not in the service) | `"ram"` (every parameter and
-  buffer on the host) | `"gpu"` (all of them on the compute device) |
-  `"offloaded"` (an accelerate hook owns it: the parameters sit on `meta` and the
-  bytes in a host weights map) | `"mixed"` (genuinely split across devices).
-  Three labels are not enough to be honest: under `sequential_cpu_offload` the
-  component is in neither RAM nor VRAM, and a load can leave part of one behind.
-  `"mixed"` is REPORTED, never rounded to a neighbouring state.
+- `residency`: `"not_loaded"` (the large pool holds no byte of it) | `"ram"` (all
+  its bytes on the host) | `"gpu"` (all of them on the compute device) |
+  `"mixed"` (genuinely split: a block-juggled component partly parked) |
+  `"offloaded"` (kept in the vocabulary for the client; never answered since the
+  large-model manager replaced the accelerate hooks). Read from the manager's
+  per-component ledger. `"mixed"` is REPORTED, never rounded to a neighbouring
+  state.
 - `actions`: which of `load` / `unload` / `to_ram` / `to_gpu` / `warmup` are
   possible RIGHT NOW. This list is the AUTHORITY — the client renders it and must
   never re-derive it, or the matrix would exist twice and drift on the first
-  edit. Invariants the backend holds: the text encoder never offers `to_gpu`
-  (prompt encoding pins the host and the load-order memory contract depends on
-  it); the transformer never offers `warmup` (the warm-up forwards the VAE only,
-  and no transformer path exists); `load` and `unload` appear on BOTH the
-  transformer and the VAE, always together, because they act on the pipeline as
-  a whole — `_model_key` describes a whole pipeline, so one of them alone can
-  neither be dropped nor loaded. The VAE is never moved by hand: no helper exists
+  edit. Invariants the backend holds: the text encoder offers only `load` /
+  `unload` (where it computes is the request's decision — on the CPU for a
+  legacy request, §5.10 — never a button); the transformer never offers `warmup`
+  (the warm-up forwards the VAE only, and no transformer path exists); `load`
+  and `unload` appear on BOTH the transformer and the VAE, always together,
+  because they act on the pipeline as a whole — the two are ONE large-model
+  handle, so one of them alone can neither be dropped nor loaded. The VAE is never moved by hand: no helper exists
   and a host-resident VAE would silently make the next decode run on the CPU.
 
 Both fields are ABSENT — and `components_busy` is `true` — when the backend could
@@ -696,10 +704,10 @@ tens of seconds and the transformer 18 GB, and it claims the same single progres
 generation does — so an action and a generation can never run at once. `params`
 is the same normalized object every other FLUX.2 call takes. Refusals are
 `status:"error"` with an actionable message, never a silent no-op: the action is
-not in that component's current `actions`, the service is busy, or the pre-load
-memory guard refuses — a user-pressed load of the 16 GB encoder or a 9B restore
-to the card goes through the SAME guard, with the same reserves and the same
-"what does fit" advice, that a generation does.
+not in that component's current `actions`, the service is busy, or the
+large-model manager refuses the admission — every action is a manager session,
+so a user-pressed load of the 16 GB encoder or a 9B restore to the card goes
+through the SAME admission (reserves, limits, reclaim) that a generation does.
 
 **FLUX.2 klein streaming detail**: same frame shape as FLUX.1, two phases:
 
@@ -710,11 +718,19 @@ to the card goes through the SAME guard, with the same reserves and the same
   the transformer, tokenizer, VAE and scheduler are loaded and placed (1-5), the
   placed weights are warmed up (6), and only then is the text encoder read and
   the prompt encoded (7-9). That order is a memory contract, not a cosmetic
-  choice: the encoder's 16 GB arrive into the host memory the transformer has
-  just vacated for the accelerator. The warm-up is a `load` step and never a
-  `generate` one.
+  choice: the encoder handle is admitted only after the pipeline's, on what the
+  pipeline's reservation left, and never above a device ceiling that keeps a
+  lower «Видеопамять» step at or below a higher one for both handles together. A warm pipeline reports steps 0 and 9 only (plus
+  7-8 when the prompt has to be encoded). The warm-up is a `load` step and never
+  a `generate` one.
 - `phase:"generate"` — `step`/`total` are diffusion steps (`total` already
   accounts for the steps `strength` drops).
+- A progress frame that cannot be written (the client is gone) never stops the
+  work: the backend logs the first failure of the request at WARNING and keeps
+  going, so a disconnect does NOT cancel a FLUX.2 run, a component action, a
+  prompt-cache build or a download. `cancel` is observed before the work starts
+  and after it returns (`download.start` also polls it at every chunk); cancelling a
+  FLUX.2 run mid-way is not supported yet.
 
 **FLUX.2 klein prompt cache.** Encoding a prompt costs a ~16 GB read of the Qwen3
 encoder (tens of seconds) and yields ~4 MiB of
@@ -729,8 +745,8 @@ in-memory cache, `prompt_cache.build`, `prompt_cache.load` and `status`'s
 - `prompt_cache.build` encodes the prompt and NOTHING else: no transformer, no
   VAE, no image. It streams the same `phase:"load"` frames as a run, but only the
   prompt phase's steps occur (0, then 7-9 of the same 0..9 scale), because no
-  pipeline is built. The memory guard therefore checks only the standalone encode
-  and never demands room for the 9B transformer. `encoded: false` means the cache
+  pipeline is built. Only the encoder handle is admitted, so it never demands
+  room for the 9B transformer. `encoded: false` means the cache
   already covered the prompt and nothing was read. The encoder is released
   afterwards unless one was already resident with the same settings.
 - **The library** lives at `<program root>/prompt_cache/<encoder family>/<name>.msprompt`.
@@ -803,8 +819,8 @@ generates.
   `tokenizer/` and `scheduler/` directories are pipeline components and are still
   required.
 - `.estimate` is lower on such a machine: the encode phase cannot run there, so
-  it contributes nothing to `peak_encode` or to the totals. The same single
-  forecast still gates the load.
+  it contributes nothing to `peak_encode` or to the totals. `.estimate` is
+  advice; the manager's admission of the run is the guard.
 
 **FLUX.2 klein: guidance and distilled checkpoints.** `.status` answers
 `guidance_supported: bool` — whether `guidance_scale` can do anything at all on
@@ -927,6 +943,142 @@ Notes:
 - `phase:"generate"` — `step`/`total` are tiles (or detection passes) processed,
   `label` names the current tile row.
 
+### 5.10 Large-model pool (v13)
+
+Domain `large_models.*`, backed by `AppState.large_models`
+(`runtime/large_models/manager.py` `LargeModelManager`): the byte-budgeted pool of
+the large models (FLUX.2 / FLUX.3 klein) beside the small-model count pool, both
+under one residency arbiter. All five are plain request/response, no blob in
+either direction, no streaming, no cancel, and none requires Torch to answer (a
+`profiles` call on a GPU device reads its memory through Torch when Torch is
+present).
+
+| method                       | request fields (inline)                                                                                         | response fields (status=ok) |
+|------------------------------|------------------------------------------------------------------------------------------------------------------|-----------------------------|
+| `large_models.profiles`      | `model: string` (required), `params: object={}`, `shape: object` (required), `format: string\|null`, `vram_step: string\|null`, `ram_step: string\|null` | `model`, `format`, `selected: object`, `vram: object`, `ram: object`, `learned_floor: object\|null`, `limits: object`, `formats: object[]`, `suggestions: object[]` |
+| `large_models.limits.set`    | `vram_cap_bytes: int\|null`, `ram_cap_bytes: int\|null` (each optional)                                          | `limits: {vram_cap, ram_cap}` |
+| `large_models.status`        | (none)                                                                                                           | `large_models: object[]`, `limits: {vram_cap, ram_cap}` |
+| `large_models.unload`        | `model: string\|null`                                                                                            | `unloaded: string[]` (residency keys) |
+| `large_models.learned.reset` | `model: string\|null`                                                                                            | `cleared: int` |
+
+Notes:
+- **Two step axes.** «Видеопамять» `vram_step`:
+  `max` (the whole model on the card, kept between runs), `phase` (only the
+  current stage on the card), `half` (at most half of the usable card, the rest
+  copied in per step), `min` (almost nothing kept on the card). «Оперативная
+  память» `ram_step`: `keep` (parts not on the card stay in RAM, also between
+  runs), `run` (in RAM during the run only), `min` (read from disk on every use).
+  Each also takes `auto` (the default when absent or `null`): the first step
+  that fits, fastest first; with both on `auto` the walk is RAM-major (VRAM is
+  given up before RAM). Along one axis, with the other fixed, a more economical
+  step never forecasts more of that axis' memory. Step semantics owner:
+  `runtime/large_models/tiers.py` (`VramStep`, `RamStep`, `template_for`).
+- `profiles` is READ-ONLY: it probes the budgets and plans, never loads, reserves
+  or reclaims. `model` names a model registered with the manager AND served
+  through `AppState.large_model_adapters` (the model's service turns `params` —
+  its paths and options, same object as its own inpaint method — into the
+  manager's options and the torch device; today `flux2_klein`); any other name
+  is a request error. An unknown step id is a request error; the retired
+  `profile` field is refused by name.
+- `shape`: `region_width`, `region_height` (required, > 0, pixels of the generated
+  region), `references: [{w, h}]` (optional, pixels before any model-side
+  resize), `prompt_tokens` (optional, >= 0), `steps` (optional, > 0). Unknown keys
+  are ignored.
+- `format` absent/`null` = the best available weight format; the backend NEVER
+  changes the format on its own, other formats only appear in `formats` and
+  `suggestions`.
+- `selected`: what the requested pair resolves to, exactly as an admission would
+  plan it (learned floor and reclaim rules applied): `{vram_requested,
+  ram_requested, vram: string|null, ram: string|null, fits: bool, needs_reclaim:
+  {device_bytes, host_bytes}|null (bytes other idle models must give up),
+  reason: string|null, shortest_resource: string|null (refused only), forecast:
+  {device_peak, host_peak, peak_phase, time: {load_cold_s, load_warm_s,
+  per_step_s, total_s}, calibrated: bool, device_calibrated: bool}|null,
+  plan_summary: [{component, tier, exec_device, blocks_device, blocks_host,
+  blocks_disk}]}`. A refusal carries the closest attempt's forecast.
+- `vram: {steps: [{id, fits, same_as: string|null, below_floor: bool,
+  device_peak: int|null, total_s: float|null}], recommended: string|null,
+  floor: string|null}` — the four VRAM steps planned with the selected RAM step
+  (the requested one; `keep` when it is `auto` and nothing fits). `ram: {steps:
+  [{id, fits, same_as, below_floor, host_peak, total_s}], recommended, floor}` —
+  the three RAM steps planned with the selected VRAM step (`max` likewise).
+  `same_as` names the step above whose plan this one repeats on this card (the
+  UI shows "= «…»"); `below_floor` marks a step faster than the learned floor;
+  `recommended` is what `auto` on that axis resolves to with the other axis
+  fixed. Forecasts here are the full ones (every activation counted).
+- `limits` here also carries the probed figures: `vram_total`, `vram_free`,
+  `vram_reserve`, `ram_total`, `ram_free`, `ram_cgroup_limit`, `ram_reserve`.
+  `formats[]`: `{id, available, reason, dit_bytes, compute_path, quality_rank,
+  fits_best: {vram, ram}|null}` (what `auto` on both axes resolves to in that
+  format); `suggestions[]`: `{kind: "format"|"limits"|"steps", text_key,
+  payload}` (every payload names the pair that fits, `{vram, ram}`; a `format`
+  one adds `format`); `learned_floor`: `{model,
+  format, device_class, vram: string|null, ram: string|null, reason, step,
+  recorded_at}`. Shape owner: `ProfilesReport.to_dict()`.
+- `limits.set`: an ABSENT field keeps its value, `null` clears it (no cap). Caps
+  are bytes, `>= 0`, HARD over every step; `vram_cap` bounds the whole device
+  usage, `ram_cap` this process's anonymous memory. What stays resident between
+  runs is decided by the steps (the card only under `max`, RAM only under
+  `keep`), so the retired `keep_policy` field is refused by name. Persisted in
+  `user_config` `General` as `large_models_vram_cap_bytes`,
+  `large_models_ram_cap_bytes` (a cleared value removes its key) by
+  `runtime/device_service.py`; a stored `General.large_models_keep_policy` from an
+  earlier build is ignored (one INFO log) and left in place. A store failure is a
+  request error and leaves the limits unchanged. No `device` event is pushed (no
+  topic carries the limits).
+- `status` entries: `{model, key, format, device, vram_step: string|null,
+  ram_step: string|null (effective steps of the last finished run), device_bytes,
+  host_bytes, in_use, degraded, degrade_reason, components: {name: {tier:
+  "device"|"host"|"disk"|null, exec_device: string|null, blocks_device,
+  blocks_host, blocks_disk, device_bytes, host_bytes}}}` (`components` from the
+  ledger, no probe). `unload` skips a handle that is in a run (not an error);
+  `learned.reset` forgets the learned floor entries (each holds both axes' floors),
+  which are kept per device class, model and format in
+  `ManhwaStudio_AI_Models/.cache/large_models/limits.json` (a backend cache, not a
+  user document; entries of the retired profile scale are skipped on read); the
+  user's chosen steps are never rewritten.
+- `General.large_models_oom_score_adj` (bool, default `true`) is read once at
+  backend start: on Linux the backend sets its own `oom_score_adj` to `1000`.
+- The FLUX.2 klein methods (§5.4) change only additively in v13: `params` accepts
+  optional `vram_step` / `ram_step` (same ids as above) and the LEGACY stage-1
+  `profile` id (`auto`, `max_speed`, `fast`, `balanced`, `economy`,
+  `max_economy`); either step field wins over `profile`, which wins over the
+  legacy `placement` flags (each still maps onto a pair). Six step keys come back
+  at the top level, never inside `applied` (whose five flags the client parses as
+  one fixed struct): `vram_step`, `ram_step` (requested), `vram_step_effective`,
+  `ram_step_effective` (what ran; on `.estimate` what the plan chose, `null` when
+  it does not fit) and their legacy names `profile`, `profile_effective` (the
+  name of the VRAM step: `max_speed`, `balanced`, `economy`, `max_economy`,
+  `auto`; the RAM step is not in it). The `inpaint.flux2_klein` response adds
+  `degraded` / `degrade_reason`; the `.estimate` answer adds `calibrated` (an
+  uncalibrated forecast is an estimate) and carries no `degraded`.
+- **The legacy wire keeps encoding on the host.** A FLUX.2 request that sends
+  neither `vram_step` nor `ram_step` (every request of a stage-1 client) pins the
+  text encoder to the CPU, as every legacy `placement` did: `full_gpu` keeps the
+  PIPELINE on the card, never the 9B encoder beside it. The one exception is the
+  legacy `profile` `max_economy` (RAM `min` offers no CPU placement). With either
+  step field sent, the encoder may compute on the GPU under `max` / `phase`.
+  `.estimate` plans the encoder exactly as the run will.
+- **A host run device** (`cpu` / `mps`): FLUX.2 runs and `.estimate` are planned
+  on the host alone; `.estimate` answers `vram_bytes: 0`, `vram_free: 0`,
+  `ram_bytes` = the host growth and `fits` = what the admission will decide.
+- **`large_models.profiles` with `model: "flux2_klein"`** plans the registration
+  the request's `dtype` selects: the answer's `model` is `flux2_klein` for
+  `bfloat16` and `flux2_klein.float16` for `float16`. The pickers are the
+  PIPELINE's (transformer + VAE), planned with the text encoder's admission
+  claimed (the encoder planned on what the pipeline leaves, under the same
+  device ceiling, as a run admits it); the answer adds `encoder: object|null` — the encoder's `selected`
+  (`null` when the prompt is cached or no encoder is installed) — and an encoder
+  that does not fit makes `selected.fits` `false` with the encoder's `reason` /
+  `shortest_resource`. The FLUX.2
+  registrations are `flux2_klein`, `flux2_klein.float16` (pipelines) and
+  `flux2_klein_text_encoder`, `flux2_klein_text_encoder.fp8` with their CPU-only
+  twins `….cpu` (encoders); `large_models.unload` / `learned.reset` with a
+  `model` act on that one registration only (`inpaint.flux2_klein.unload` drops
+  every FLUX.2 handle).
+- Key owner: the module docstring of `ipc/handlers/flux2_klein.py`; mapping
+  tables: `inpaint/flux2_klein/memory.py`.
+
 ---
 
 ## 6. Error model
@@ -975,7 +1127,7 @@ Events are `kind:"event"`, `id:0`, with a `topic`. Payload fields are inline in
 
 | topic        | trigger                                    | payload (inline header fields)                                                                                                                                                                                                  | blob              |
 |--------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|
-| `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr, baberuocr}` (each that service's own `health()` object with at least `ready: bool`; `paddleocrvl` is `{ready, device, model, last_error}` where `model` is the resident variant label or `null`, and `baberuocr` is `{ready, device, last_error}` where `device` is the effective vision device, e.g. `"CUDAExecutionProvider:0"` or `"CPUExecutionProvider"`, or `null` when nothing is resident; its decoders always run on the CPU), `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill}`, `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object`. (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
+| `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr, baberuocr}` (each that service's own `health()` object with at least `ready: bool`; `paddleocrvl` is `{ready, device, model, last_error}` where `model` is the resident variant label or `null`, and `baberuocr` is `{ready, device, last_error}` where `device` is the effective vision device, e.g. `"CUDAExecutionProvider:0"` or `"CPUExecutionProvider"`, or `null` when nothing is resident; its decoders always run on the CPU), `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill}`, `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object` (see "`model_manager` payload" below). (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
 | `device`     | device/provider selection changed          | the full `device.get` result shape (selected/available torch + onnx fields)                                                                                                                                                    | none              |
 | `model_load` | model load/unload progress (new in v2)     | `model: string`, `phase: string` (e.g. `"start"\|"progress"\|"done"\|"unload"`), `loaded: int` (optional), `total: int` (optional), `message: string` (optional)                                                               | none              |
 | `log`        | optional backend log line stream (opt-in)  | `level: string` (e.g. `"info"\|"warn"\|"error"`), `message: string`, `ts_unix_s: float` (optional)                                                                                                                             | none              |
@@ -984,6 +1136,27 @@ The `health` snapshot payload mirrors `_build_health_snapshot` /
 `_get_health_snapshot` in `server.py` exactly (each nested service value is that
 service's own `.health()` object, passed through). The `health` event replaces
 the Rust client polling `GET /health`.
+
+**`model_manager` payload** (`server._model_manager_health`). The small pool's
+four counters keep their names and meaning: `max_loaded_models`,
+`resident_model_count`, `active_model_count`, `loading_model_count`. Since v13 it
+also carries, each built in isolation (a failing part becomes
+`{"status":"error","error":string}` in place of its value, the rest survive):
+- `small_models: [{key, owner, device: string|null, device_bytes, host_bytes,
+  size_source: "declared"|"measured"|"learned"|"default", resident, in_use, loading}]`
+  — one entry per small-pool holding;
+- `large_models: [{model, key, format, device, vram_step: string|null,
+  ram_step: string|null, device_bytes, host_bytes, in_use, degraded,
+  degrade_reason: string|null, components: {...}}]` and
+  `limits: {vram_cap, ram_cap}` — `LargeModelManager.health()`, the
+  same objects `large_models.status` answers (§5.10);
+- `budget: {host: {total, available, headroom, reserve, cgroup_limit: int|null},
+  devices: [{device, total, free, headroom, reserve}], reservations: {count,
+  device_bytes: {device: int}, host_bytes}}` — bytes; `devices` lists only the
+  `cuda*` devices a holding or a reservation names, so the snapshot never
+  initializes a GPU, and it is probed without the arbiter's warm-up matmul.
+Clients must ignore keys they do not know (the Rust health parser reads
+`serde_json::Value` fields by name).
 
 ---
 

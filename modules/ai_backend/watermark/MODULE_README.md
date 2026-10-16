@@ -20,7 +20,7 @@ code_fetch.py                        — pinned manifest, verified download, san
      │                                 network construction (no weights)
      ▼
 ../engines/model_download.py         — the retrying transfer both files download through
-../runtime/                          — paths, LoadedModelManager, rocm_mmap_transfer
+../runtime/                          — paths, SmallModelManager, rocm_mmap_transfer
 ```
 `code_fetch.py` never touches weights and never imports `service.py`. `service.py` is the only
 module that imports torch (lazily, inside the methods that need it).
@@ -165,8 +165,9 @@ handler reports `Interrupted`.
 ### Service shape
 - Construction is cheap; torch is imported lazily inside the methods that need it.
 - One resident network at a time under an `RLock`, key `watermark:<model>:<device>`, leased from
-  `LoadedModelManager` with the full four-call protocol (`begin_model_use` → `mark_loaded` /
-  `mark_load_failed` → `release`). `_unload_key` refuses a foreign key; `unload()` reports the
+  `SmallModelManager` with the full four-call protocol (`begin_model_use` → `mark_loaded` /
+  `mark_load_failed` → `release`), with `owner="watermark"` and a hint from the checkpoint file's
+  size (`../runtime/residency/`). `_unload_key` refuses a foreign key; `unload()` reports the
   dropped key with `mark_unloaded`.
 - **`mark_load_failed()` is reserved for a failed LOAD.** `_lease_and_run` wraps
   `_ensure_model_locked` in its own `try` and calls `mark_loaded()` as soon as it returns, before

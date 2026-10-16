@@ -5,6 +5,9 @@ Device/provider selection service behind the `device.*` IPC methods.
 Main responsibilities:
 - Expose current PyTorch backend device and ONNX provider/device state.
 - Expose and persist the loaded-model limit used by backend runtimes.
+- Persist the large-model pool's user limits (`General.large_models_vram_cap_bytes`,
+  `General.large_models_ram_cap_bytes`) as the `LimitsStore` the `LargeModelManager` writes through (`UserConfigLimitsStore`),
+  and hand the `General` section to the startup OOM backstop (`general_section`).
 - Persist user selections in `UserConfig` when available.
 - Detect human-readable device names for CUDA, DirectML, and MiGraphX.
 - Provide CUDA/ROCm diagnostics for the Rust settings tab.
@@ -12,12 +15,14 @@ Main responsibilities:
 
 from __future__ import annotations
 
+import logging
 import platform
 import shutil
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Optional
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 try:
     from ai_device import AIDevice, set_config_path
@@ -29,7 +34,13 @@ try:
 except Exception:
     UserConfig = None
 
-from .model_manager import LoadedModelManager, clamp_max_loaded_models
+from .large_models.tiers import Limits
+from .model_manager import SmallModelManager, clamp_max_loaded_models
+
+if TYPE_CHECKING:
+    from .large_models.degrade import FloorEntry, FloorsStore
+
+log = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -627,12 +638,114 @@ class _OnnxDeviceSelector:
         return normalized
 
 
+#: `General.<key>` of the large-model pool's user limits. Absent (or `null`) means "no
+#: limit"; these Python-side defaults are the only ones in stage 1 (the Rust
+#: `ms-config` defaults tree does not list the keys yet).
+LARGE_MODELS_VRAM_CAP_KEY = "large_models_vram_cap_bytes"
+LARGE_MODELS_RAM_CAP_KEY = "large_models_ram_cap_bytes"
+#: A key an earlier stage-1 build wrote (the between-runs keep policy). The VRAM /
+#: RAM steps decide what stays between runs now, so it is neither read nor written:
+#: a stored value is reported once at INFO and left in place (no migration).
+_RETIRED_KEEP_POLICY_KEY = "large_models_keep_policy"
+
+
+class UserConfigLimitsStore:
+    """The backend's `LimitsStore` (`runtime/large_models/manager.py`): limits in `user_config`, floors elsewhere.
+
+    The two user caps live in `General` beside `ai_max_loaded_models`, so the
+    user's choice travels with the settings document; the learned floors are a
+    backend-private cache and stay in `floors` (the `JsonLimitsStore` under the
+    model cache root). `write_limits` writes only its two keys: a `None` value
+    REMOVES the key (absent = the default), so no `null` leaf is ever stored.
+    A retired `General.large_models_keep_policy` value is ignored (one INFO log
+    per store) and never removed.
+    Built by `AiDeviceService.large_models_limits_store`; `lock` is that
+    service's lock, so a limits write never interleaves with a `device.set`.
+    """
+
+    def __init__(self, user_config: Any, floors: "FloorsStore", lock: threading.RLock) -> None:
+        self._user_config = user_config
+        self._floors = floors
+        self._lock = lock
+        self._retired_key_reported = False
+
+    def read_limits(self) -> Limits:
+        """The stored limits; an invalid value is logged and read as its default (`None`)."""
+        with self._lock:
+            general = _general_section(self._user_config)
+            report_retired = general.get(_RETIRED_KEEP_POLICY_KEY) is not None and not self._retired_key_reported
+            self._retired_key_reported = self._retired_key_reported or report_retired
+        if report_retired:
+            log.info("large models: user_config General.%s = %r is no longer used (the VRAM / RAM steps decide what stays between runs); ignored", _RETIRED_KEEP_POLICY_KEY, general.get(_RETIRED_KEEP_POLICY_KEY))
+        return Limits(
+            vram_cap=_stored_cap(general, LARGE_MODELS_VRAM_CAP_KEY),
+            ram_cap=_stored_cap(general, LARGE_MODELS_RAM_CAP_KEY),
+        )
+
+    def write_limits(self, limits: Limits) -> None:
+        """Persist `limits` into `General` (one `user_config.update`).
+
+        Raises what the settings store raises (`docstore.DocStoreError`, `OSError`);
+        nothing is changed then.
+        """
+        values: dict[str, Any] = {
+            LARGE_MODELS_VRAM_CAP_KEY: limits.vram_cap,
+            LARGE_MODELS_RAM_CAP_KEY: limits.ram_cap,
+        }
+
+        def mutate(document: dict) -> None:
+            general = document.get("General")
+            if not isinstance(general, dict):
+                general = {}
+                document["General"] = general
+            for key, value in values.items():
+                if value is None:
+                    general.pop(key, None)
+                else:
+                    general[key] = value
+
+        with self._lock:
+            _update_user_config(self._user_config, mutate)
+        log.info("large models: limits saved to user_config General: vram_cap=%s, ram_cap=%s", limits.vram_cap, limits.ram_cap)
+
+    def read_floors(self) -> list["FloorEntry"]:
+        """The learned floors of the delegated floors store."""
+        return self._floors.read_floors()
+
+    def write_floors(self, entries: Sequence["FloorEntry"]) -> None:
+        """Replace the learned floors in the delegated floors store (raises its `OSError`)."""
+        self._floors.write_floors(entries)
+
+
+def _general_section(user_config: Any) -> dict[str, Any]:
+    """A shallow copy of the in-memory `General` section (`{}` when absent or not an object)."""
+    node = getattr(user_config, "config", None)
+    general = node.get("General") if isinstance(node, dict) else None
+    return dict(general) if isinstance(general, dict) else {}
+
+
+def _stored_cap(general: dict[str, Any], key: str) -> Optional[int]:
+    """`General.<key>` as a byte cap: a non-negative int, else `None` (an invalid value is logged)."""
+    raw = general.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        log.warning("large models: user_config General.%s must be a non-negative integer of bytes, got %r; read as no limit", key, raw)
+        return None
+    return raw
+
+
 class AiDeviceService:
     MAX_LOADED_MODELS_CONFIG_PATH = ("General", "ai_max_loaded_models")
 
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager, *, user_config: Any = None) -> None:
+        """`user_config` is the settings document object (default: the process `config.UserConfig`,
+        or an in-memory stand-in when that module is unavailable); tests pass a `_MemoryUserConfig`."""
         self._lock = threading.RLock()
-        self._user_config = UserConfig if UserConfig is not None else _MemoryUserConfig()
+        if user_config is not None:
+            self._user_config = user_config
+        else:
+            self._user_config = UserConfig if UserConfig is not None else _MemoryUserConfig()
         self._model_manager = model_manager
         self._selector = AIDevice(self._user_config)
         self._onnx_selector = _OnnxDeviceSelector(self._user_config)
@@ -740,6 +853,15 @@ class AiDeviceService:
     def diagnose_cuda_rocm(self) -> str:
         with self._lock:
             return AIDevice.diagnose_cuda_rocm()
+
+    def large_models_limits_store(self, floors: "FloorsStore") -> UserConfigLimitsStore:
+        """The large-model pool's `LimitsStore` over this service's settings document (floors kept in `floors`)."""
+        return UserConfigLimitsStore(self._user_config, floors, self._lock)
+
+    def general_section(self) -> dict[str, Any]:
+        """A shallow copy of the in-memory `General` section (for startup switches such as the OOM backstop)."""
+        with self._lock:
+            return _general_section(self._user_config)
 
     def _available_devices_locked(self) -> list[str]:
         available = AIDevice.detect_available_devices()

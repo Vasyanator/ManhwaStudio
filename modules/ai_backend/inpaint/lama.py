@@ -44,8 +44,9 @@ if TYPE_CHECKING:
     import numpy as np
 
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
 from ..runtime.paths import program_root
+from ..runtime.residency.footprint import hint_from_files
 from ..runtime.torch_device import resolve_selected_backend_device
 
 try:
@@ -77,6 +78,8 @@ log = logging.getLogger(__name__)
 # ============================================================================
 
 _INPAINTER_MODULE_NAME = "mf_lama_inpainter_v2_runtime"
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "inpaint.lama"
 
 
 def _to_int(value: Any, default: int) -> int:
@@ -102,7 +105,7 @@ def _to_bool(value: Any, default: bool) -> bool:
 
 
 class LamaInpaintService:
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.RLock()
         self._model_manager = model_manager
         self._inpainter: Any = None
@@ -170,9 +173,14 @@ class LamaInpaintService:
         device = _resolve_selected_backend_device(self._active_device)
         checkpoint_name = self._resolve_checkpoint_name(normalized.get("model_name"))
         model_key = self._model_key_for(device, checkpoint_name)
+        # Pre-load size: the checkpoint file `InpainterV2._load_model` reads
+        # (`<model_dir>/models/<checkpoint_name>`).
+        hint = hint_from_files([self._model_dir / "models" / checkpoint_name], device)
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=hint,
         )
 
         with self._lock:
@@ -188,8 +196,7 @@ class LamaInpaintService:
                 # The checkpoint is resident from here on, so it is registered
                 # before inference: an inference failure must leave it counted
                 # and evictable, not silently occupying VRAM off the books.
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
+                lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 inpainter.set_refine(
                     normalized["refine"],
                     n_iters=normalized["n_iters"],

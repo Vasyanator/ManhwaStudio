@@ -18,7 +18,7 @@ from unittest.mock import patch
 
 from modules.ai_backend.inpaint import flux2_klein as svc
 from modules.ai_backend.inpaint.flux2_klein import hardware
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 from ._test_fixtures import _TempTreeCase
 
@@ -48,7 +48,7 @@ class DeviceReportingTests(_TempTreeCase):
         memory_patch.start()
         self.addCleanup(memory_patch.stop)
 
-        self.service = svc.Flux2KleinInpaintService(LoadedModelManager())
+        self.service = svc.Flux2KleinInpaintService(SmallModelManager())
 
     def test_status_before_the_first_load_reports_the_device_that_will_be_used(self) -> None:
         out = self.service.status(self.params())
@@ -59,17 +59,14 @@ class DeviceReportingTests(_TempTreeCase):
         self.assertEqual(self.resolved, ["cuda"])
 
     def test_status_after_a_load_reports_the_actual_device(self) -> None:
-        self.service._pipe = object()
         self.service._device = "cuda:1"
         out = self.service.status(self.params())
         self.assertEqual(out["device"], "cuda:1")
-        self.assertTrue(out["loaded"])
         # The loaded device is a fact; nothing is resolved on top of it.
         self.assertEqual(self.resolved, [])
 
     def test_health_follows_the_same_rule(self) -> None:
         self.assertEqual(self.service.health()["device"], "cuda:0")
-        self.service._pipe = object()
         self.service._device = "cuda:1"
         self.assertEqual(self.service.health()["device"], "cuda:1")
 
@@ -78,6 +75,12 @@ class DeviceReportingTests(_TempTreeCase):
         # about the wrong hardware.
         self.service.estimate(params=self.params(), region_width=512, region_height=512)
         self.assertEqual(self.snapshots, ["cuda:0"])
+
+    def test_a_cpu_run_device_offers_no_vram_in_the_estimate(self) -> None:
+        with patch.object(hardware, "_resolve_selected_backend_device", lambda _fallback: "cpu"):
+            out = self.service.estimate(params=self.params(), region_width=512, region_height=512)
+        self.assertEqual((out["vram_bytes"], out["vram_free"]), (0, 0))
+        self.assertIsInstance(out["fits"], bool)
 
     def test_a_cpu_selection_is_still_reported_as_cpu(self) -> None:
         with patch.object(hardware, "_resolve_selected_backend_device", lambda _fallback: "cpu"):

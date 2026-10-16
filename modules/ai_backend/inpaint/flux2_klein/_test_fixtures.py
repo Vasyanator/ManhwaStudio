@@ -3,33 +3,34 @@ File: modules/ai_backend/inpaint/flux2_klein/_test_fixtures.py
 
 Purpose:
 Shared fixtures for the FLUX.2 klein test modules: the on-disk model tree the
-path-based tests need, the fake `torch` / `diffusers` / `transformers` stack that
-lets the placement and generation tests run without those packages, the klein
-weights or a GPU, and `_PlacementFixture`, the base case that installs all of it.
+path-based tests need (header-only weights by default, tiny REAL weights on
+request) and `_ManagedRunFixture`, a service over a REAL large-model manager on
+the CPU.
 
 Key declarations:
-- `_make_model_tree` / `_write_safetensors` / `_write_safetensors_with_data` /
-  `_png_bytes` - on-disk inputs. The first safetensors helper writes a header-only
-  container, the second a real one with tensor bytes at chosen offsets.
-- `VAE_SAMPLE_SIZE` / `VAE_BLOCK_OUT_CHANNELS` and the thresholds derived from them -
-  the fixture VAE's tiling geometry, written both into its `config.json` and into
-  `_make_fake_vae`, so "tiling requested" and "tiling engaged" are different states
-  a test can actually assert. They are DERIVED exactly as diffusers derives them and
-  must never be set independently of each other.
+- `_make_model_tree` / `_write_header_only` / `_write_real_weights` /
+  `_write_safetensors` / `_png_bytes` - on-disk inputs (`_write_safetensors`
+  writes a raw header dict, for malformed / fp8 containers).
+- `VAE_SAMPLE_SIZE` / `VAE_BLOCK_OUT_CHANNELS` and the thresholds derived from
+  them - the fixture VAE's tiling geometry, written into its `config.json` and
+  DERIVED exactly as diffusers derives them (never set independently).
+- `TINY_TRANSFORMER_CONFIG` / `TINY_VAE_CONFIG` / `TINY_ENCODER_CONFIG` - the tiny
+  real models (the encoder has exactly `ENCODER_KEEP_LAYERS` layers and a width
+  that matches the transformer, so the variant guard passes).
 - `DEFAULT_MODEL_INDEX` - the `model_index.json` the tree carries by default, kept
   faithful to the shipped klein 4B one (`is_distilled: true`). Pass another dict,
   or `None` for no manifest at all, to build an undeclared checkpoint.
-- `_TempTreeCase` - a `TestCase` with a complete model tree in a temp directory.
-- `_install_fake_torch` and the `_Fake*` doubles - the injected torch stack.
-- `_PlacementFixture` - `_TempTreeCase` plus the fake modules and the three
-  monkeypatches every pipeline-building test needs.
-- `_ResidencyModule` - a module double whose parameters and buffers sit on chosen
-  devices, for the per-component residency and action tests.
+- `_TempTreeCase` - a `TestCase` with a complete model tree in a temp directory
+  (`real_weights = True` in a subclass for the tiny real models).
+- `_FakeEmbeds` - a prompt-embedding stand-in for the library tests.
+- `_ManagedRunFixture` (+ `_RoomyProbes`, `_FakeRunPipeline`, `_ImageProcessor`,
+  `_flat_tables`) - real manager, arbiter, small pool, torch and model classes;
+  fake pipeline call, tokenizer, budget probes and transport device.
 
 Notes:
 - The leading underscore keeps pytest from collecting this file as a test module.
-- Module attributes are patched on the module that DEFINES them (`pipeline`,
-  `hardware`, ...), never on the `flux2_klein` package: the package's re-export is
+- Module attributes are patched on the module that DEFINES them (`hardware`,
+  `memory`, ...), never on the `flux2_klein` package: the package's re-export is
   a separate binding, so patching it would not reach the real callers.
 """
 
@@ -37,7 +38,6 @@ from __future__ import annotations
 
 import json
 import struct
-import sys
 import tempfile
 import types
 import unittest
@@ -48,8 +48,8 @@ import numpy as np
 from PIL import Image
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import hardware, pipeline
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.inpaint.flux2_klein import hardware
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 
 # ---------------------------------------------------------------------------
@@ -80,24 +80,54 @@ DEFAULT_MODEL_INDEX: dict[str, object] = {
 }
 
 
+#: Header-only tensors of the default tree (`(dtype, shape)`, no data bytes):
+#: valid containers the manager's inventory can read, in each component's
+#: real key layout (diffusers transformer, Qwen3 causal-LM encoder, diffusers VAE).
+_HEADER_ONLY_TENSORS: dict[str, dict[str, tuple[str, tuple[int, ...]]]] = {
+    "transformer": {"x_embedder.weight": ("BF16", (8, 8)), "transformer_blocks.0.attn.to_q.weight": ("BF16", (8, 8)), "single_transformer_blocks.0.attn.to_out.weight": ("BF16", (8, 8))},
+    "text_encoder": {"model.embed_tokens.weight": ("BF16", (16, 8)), "model.layers.0.self_attn.q_proj.weight": ("BF16", (8, 8)), "model.norm.weight": ("BF16", (8,)), "lm_head.weight": ("BF16", (16, 8))},
+    "vae": {"decoder.conv_in.weight": ("BF16", (4, 4))},
+}
+
+
+def _write_header_only(path: Path, tensors: dict[str, tuple[str, tuple[int, ...]]]) -> None:
+    """A valid safetensors HEADER for `tensors` (back to back offsets) with no data bytes."""
+    item = {"BF16": 2, "F16": 2, "F32": 4, "I64": 8}
+    header: dict[str, object] = {}
+    offset = 0
+    for name, (dtype, shape) in tensors.items():
+        length = item[dtype]
+        for side in shape:
+            length *= side
+        header[name] = {"dtype": dtype, "shape": list(shape), "data_offsets": [offset, offset + length]}
+        offset += length
+    payload = json.dumps(header).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(payload)) + payload)
+
+
 def _make_model_tree(
     root: Path,
     *,
     single_file_transformer: bool = False,
     model_index: dict[str, object] | None = DEFAULT_MODEL_INDEX,
+    real_weights: bool = False,
 ) -> dict[str, str]:
     """Lay out a klein-like checkout and return the three user-supplied paths.
 
     `model_index` is the manifest written at the checkout root; pass `None` to
     build a tree with no `model_index.json` at all, which is what a
-    hand-assembled folder of components looks like.
+    hand-assembled folder of components looks like. The weights are
+    header-only containers by default (enough for every header reader and the
+    manager's inventory); `real_weights=True` (needs torch, diffusers and
+    transformers) writes tiny REAL models with their configs instead
+    (`_write_real_weights`), which the manager can load and run on the CPU.
     """
     if model_index is not None:
         root.mkdir(parents=True, exist_ok=True)
         (root / "model_index.json").write_text(json.dumps(model_index), encoding="utf-8")
     (root / "text_encoder").mkdir(parents=True)
     (root / "text_encoder" / "config.json").write_text("{}", encoding="utf-8")
-    (root / "text_encoder" / "model.safetensors").write_bytes(b"\x00" * 2048)
+    _write_header_only(root / "text_encoder" / "model.safetensors", _HEADER_ONLY_TENSORS["text_encoder"])
     (root / "vae").mkdir()
     # The two fields the tiling threshold is derived from, at the shipped klein
     # VAE's values: `sample_size` 1024 over four `block_out_channels` gives a
@@ -108,7 +138,7 @@ def _make_model_tree(
         json.dumps({"sample_size": VAE_SAMPLE_SIZE, "block_out_channels": list(VAE_BLOCK_OUT_CHANNELS)}),
         encoding="utf-8",
     )
-    (root / "vae" / "diffusion_pytorch_model.safetensors").write_bytes(b"\x00" * 1024)
+    _write_header_only(root / "vae" / "diffusion_pytorch_model.safetensors", _HEADER_ONLY_TENSORS["vae"])
     (root / "tokenizer").mkdir()
     (root / "tokenizer" / "tokenizer_config.json").write_text("{}", encoding="utf-8")
     (root / "scheduler").mkdir()
@@ -128,8 +158,12 @@ def _make_model_tree(
         transformer = root / "transformer"
         transformer.mkdir()
         (transformer / "config.json").write_text("{}", encoding="utf-8")
-        (transformer / "diffusion_pytorch_model.safetensors").write_bytes(b"\x00" * 4096)
+        _write_header_only(transformer / "diffusion_pytorch_model.safetensors", _HEADER_ONLY_TENSORS["transformer"])
 
+    if real_weights:
+        if single_file_transformer:
+            raise ValueError("real_weights: the tiny real tree is a diffusers folder layout")
+        _write_real_weights(root)
     return {
         "text_encoder_path": str(root / "text_encoder"),
         "transformer_path": str(transformer),
@@ -137,46 +171,73 @@ def _make_model_tree(
     }
 
 
+#: Tiny real configs of `_write_real_weights` (CPU-fast; the VAE keeps the
+#: shipped tiling geometry: four `block_out_channels`, `sample_size` 1024).
+TINY_TRANSFORMER_CONFIG: dict[str, object] = {
+    "_class_name": "Flux2Transformer2DModel",
+    "in_channels": 8,
+    "num_layers": 1,
+    "num_single_layers": 2,
+    "attention_head_dim": 16,
+    "num_attention_heads": 2,
+    "joint_attention_dim": 24,
+    "axes_dims_rope": [4, 4, 4, 4],
+    "timestep_guidance_channels": 32,
+    "guidance_embeds": False,
+}
+TINY_VAE_CONFIG: dict[str, object] = {
+    "_class_name": "AutoencoderKLFlux2",
+    "block_out_channels": [8, 8, 8, 8],
+    "latent_channels": 4,
+    "norm_num_groups": 4,
+    "layers_per_block": 1,
+    "sample_size": VAE_SAMPLE_SIZE,
+}
+#: 28 decoder layers: exactly `ENCODER_KEEP_LAYERS`, the minimum the pipeline reads.
+TINY_ENCODER_CONFIG: dict[str, object] = {
+    "architectures": ["Qwen3ForCausalLM"],
+    "model_type": "qwen3",
+    # 3 x 8 = the tiny transformer's `joint_attention_dim` (the variant guard).
+    "hidden_size": 8,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "head_dim": 4,
+    "intermediate_size": 16,
+    "num_hidden_layers": 28,
+    "vocab_size": 64,
+}
+
+
+def _write_real_weights(root: Path) -> None:
+    """Overwrite the tree's three weight files and configs with tiny REAL models (seeded, CPU).
+
+    The transformer is written in the diffusers layout, the encoder as a
+    causal-LM checkpoint (`model.` prefix plus an `lm_head`) the way the
+    shipped one is, the VAE in its folder.
+    """
+    import torch
+    from diffusers import AutoencoderKLFlux2, Flux2Transformer2DModel
+    from safetensors.torch import save_file
+    from transformers import Qwen3Config, Qwen3Model
+
+    torch.manual_seed(0)
+    transformer = Flux2Transformer2DModel.from_config({key: value for key, value in TINY_TRANSFORMER_CONFIG.items() if key != "_class_name"})
+    save_file({key: value.to(torch.bfloat16).contiguous() for key, value in transformer.state_dict().items()}, str(root / "transformer" / "diffusion_pytorch_model.safetensors"))
+    (root / "transformer" / "config.json").write_text(json.dumps(TINY_TRANSFORMER_CONFIG), encoding="utf-8")
+    vae = AutoencoderKLFlux2.from_config({key: value for key, value in TINY_VAE_CONFIG.items() if key != "_class_name"})
+    save_file({key: (value.to(torch.bfloat16) if value.is_floating_point() else value).contiguous() for key, value in vae.state_dict().items()}, str(root / "vae" / "diffusion_pytorch_model.safetensors"))
+    (root / "vae" / "config.json").write_text(json.dumps(TINY_VAE_CONFIG), encoding="utf-8")
+    encoder = Qwen3Model(Qwen3Config(**{key: value for key, value in TINY_ENCODER_CONFIG.items() if key not in ("architectures", "model_type")}))
+    tensors = {f"model.{key}": value.to(torch.float16).contiguous() for key, value in encoder.state_dict().items()}
+    tensors["lm_head.weight"] = torch.zeros((int(TINY_ENCODER_CONFIG["vocab_size"]), int(TINY_ENCODER_CONFIG["hidden_size"])), dtype=torch.float16)
+    save_file(tensors, str(root / "text_encoder" / "model.safetensors"))
+    (root / "text_encoder" / "config.json").write_text(json.dumps(TINY_ENCODER_CONFIG), encoding="utf-8")
+
+
 def _write_safetensors(path: Path, header: dict[str, object]) -> None:
     """Write a safetensors container carrying only `header` (no tensor bytes)."""
     payload = json.dumps(header).encode("utf-8")
     path.write_bytes(struct.pack("<Q", len(payload)) + payload)
-
-
-def _write_safetensors_with_data(
-    path: Path,
-    tensors: dict[str, tuple[str, tuple[int, ...], bytes]],
-    *,
-    metadata: dict[str, str] | None = None,
-) -> None:
-    """Write a REAL safetensors container: header plus the tensor bytes themselves.
-
-    `tensors` maps a tensor name to `(safetensors dtype token, shape, payload)`.
-    Data offsets are assigned in INSERTION order, and the JSON header preserves
-    that order too, so a caller that inserts anti-alphabetically produces a file
-    whose key order and whose byte order genuinely disagree — which is what the
-    file-order tests need. No consistency between `shape`, the dtype and
-    `len(payload)` is enforced here: a test that wants a corrupt container asks
-    for one explicitly.
-
-    The sibling `_write_safetensors` stays the right tool whenever only the
-    header matters (dtype refusals, fp8 detection, size accounting).
-    """
-    header: dict[str, object] = {}
-    if metadata is not None:
-        header["__metadata__"] = metadata
-    offset = 0
-    blobs: list[bytes] = []
-    for name, (dtype_token, shape, payload) in tensors.items():
-        header[name] = {
-            "dtype": dtype_token,
-            "shape": list(shape),
-            "data_offsets": [offset, offset + len(payload)],
-        }
-        blobs.append(payload)
-        offset += len(payload)
-    encoded = json.dumps(header).encode("utf-8")
-    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + b"".join(blobs))
 
 
 def _png_bytes(array: np.ndarray, mode: str) -> bytes:
@@ -191,6 +252,8 @@ class _TempTreeCase(unittest.TestCase):
     """Base class giving every test a throwaway klein-like model tree."""
 
     single_file_transformer = False
+    #: Tiny REAL weights instead of header-only files (`_write_real_weights`).
+    real_weights = False
     #: Manifest written at the tree's root; `None` builds a tree without one.
     #: Override it in a subclass to exercise a checkpoint that declares
     #: `is_distilled: false` or declares nothing.
@@ -204,6 +267,7 @@ class _TempTreeCase(unittest.TestCase):
             self.root,
             single_file_transformer=self.single_file_transformer,
             model_index=self.model_index,
+            real_weights=self.real_weights,
         )
 
     def params(self, **overrides: object) -> dict[str, object]:
@@ -229,72 +293,8 @@ class _TempTreeCase(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Fake torch / diffusers / transformers
+# Stand-ins
 # ---------------------------------------------------------------------------
-class _PatchRecorder:
-    """Recording stand-in for `rocm_mmap_transfer.patched_module_to`.
-
-    The instance is both the factory and the context manager, so `depth` can be
-    sampled from inside a faked `.to()` to prove the move happened while the
-    staging patch was installed.
-    """
-
-    def __init__(self) -> None:
-        self.depth = 0
-        self.enters = 0
-
-    def __call__(self) -> "_PatchRecorder":
-        return self
-
-    def __enter__(self) -> "_PatchRecorder":
-        self.depth += 1
-        self.enters += 1
-        return self
-
-    def __exit__(self, *exc_info: object) -> bool:
-        self.depth -= 1
-        return False
-
-
-class _FakeDevice:
-    """Stand-in for `torch.device`."""
-
-    def __init__(self, spec: object = "cuda:0") -> None:
-        self.spec = str(spec)
-        self.type = self.spec.split(":")[0]
-
-    def __str__(self) -> str:
-        return self.spec
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, _FakeDevice) and other.spec == self.spec
-
-    def __hash__(self) -> int:
-        return hash(self.spec)
-
-
-class _FakeTensor:
-    """Minimal parameter stand-in for `_largest_cpu_tensor`'s probe."""
-
-    def __init__(self, ptr: int, nbytes: int, device_type: str = "cpu") -> None:
-        self.device = types.SimpleNamespace(type=device_type)
-        self._ptr = ptr
-        self._nbytes = nbytes
-
-    def numel(self) -> int:
-        return self._nbytes
-
-    def element_size(self) -> int:
-        return 1
-
-    def data_ptr(self) -> int:
-        return self._ptr
-
-
-class _FakeOutOfMemoryError(RuntimeError):
-    """Stand-in for `torch.OutOfMemoryError`."""
-
-
 class _FakeEmbeds:
     """Prompt-embedding stand-in: records every device it was moved to.
 
@@ -318,360 +318,122 @@ class _FakeEmbeds:
         return self
 
 
-def _install_fake_torch(recorder: _PatchRecorder) -> types.ModuleType:
-    """Inject a `torch` whose `nn.Module` records every `.to()` and its patch depth.
+# ---------------------------------------------------------------------------
+# A real run through the large-model manager, on the CPU
+# ---------------------------------------------------------------------------
+GIB = 1024**3
 
-    The fake deliberately has no `cuda` attribute, so `_clear_torch_cache` cannot
-    initialize a real accelerator context.
+
+class _RoomyProbes:
+    """Budget probes of an ample machine (64 GiB device, 64 GiB host), so every plan fits."""
+
+    def __init__(self, *, device_total: int = 64 * GIB, host_available: int = 64 * GIB) -> None:
+        self.device_total = device_total
+        self.host_available = host_available
+
+    def host(self) -> object:
+        from modules.ai_backend.runtime.memory_budget import HostBudget
+
+        return HostBudget(total=128 * GIB, available=self.host_available, cgroup_limit=None, cgroup_used=None, rss_anon=1 << 30, rss_shmem=0, reserve=0)
+
+    def device(self, device: str) -> object:
+        from modules.ai_backend.runtime.memory_budget import DeviceBudget
+
+        return DeviceBudget(device=device, total=self.device_total, free=self.device_total, torch_allocated=0, torch_reserved=0, non_torch=0, reserve=0, cap=None)
+
+
+class _FakeRunPipeline:
+    """`Flux2KleinInpaintPipeline` stand-in: the diffusers CALL is the only faked part of a managed run.
+
+    It keeps the components it is built with (the manager's real tiny modules),
+    returns zero embeddings of `max_sequence_length` tokens from `encode_prompt`
+    and, called, zero latents of the region's latent size, which the real tiny
+    VAE then decodes (`calls` / `encode_calls` record the kwargs).
     """
 
-    class Module:
-        def __init__(
-            self,
-            name: str = "component",
-            *,
-            ptr: int = 0,
-            nbytes: int = 4 << 20,
-            device_type: str = "cpu",
-        ) -> None:
-            # (target, staging patch depth at the time of the move).
-            self.moves: list[tuple[object, int]] = []
-            self.name = name
-            self.device = _FakeDevice(device_type)
-            self.dtype = "bfloat16"
-            self._tensors = [_FakeTensor(ptr, nbytes, device_type)] if nbytes else []
+    calls: list[dict[str, object]] = []
+    encode_calls: list[dict[str, object]] = []
 
-        def parameters(self) -> list[_FakeTensor]:
-            return list(self._tensors)
+    def __init__(self, **components: object) -> None:
+        self.__dict__.update(components)
+        self._attention_kwargs = None
 
-        def buffers(self) -> list[_FakeTensor]:
-            return []
+    def set_progress_bar_config(self, **_kwargs: object) -> None:
+        return None
 
-        def to(self, target: object) -> "Module":
-            self.moves.append((target, recorder.depth))
-            self.device = target if isinstance(target, _FakeDevice) else _FakeDevice(target)
-            for tensor in self._tensors:
-                tensor.device = types.SimpleNamespace(type=self.device.type)
-            return self
+    def encode_prompt(self, **kwargs: object) -> tuple[object, object]:
+        import torch
 
-    class Generator:
-        def __init__(self, _device: str = "cpu") -> None:
-            self.seed: int | None = None
+        type(self).encode_calls.append(kwargs)
+        return torch.zeros((1, int(kwargs["max_sequence_length"]), 24)), None
 
-        def manual_seed(self, seed: int) -> "Generator":
-            self.seed = int(seed)
-            return self
+    def __call__(self, **kwargs: object) -> object:
+        """Record the call, report every effective step, return zero latents of the region's latent size."""
+        import torch
 
-    class _NoGrad:
-        """Stand-in for `torch.no_grad()`; counts how often it was entered.
-
-        The phase-1 encode and the standalone VAE decode both run OUTSIDE
-        `pipeline.__call__`, which is where diffusers puts the decorator, so they
-        have to open it themselves — the fake records that they do.
-        """
-
-        entered = 0
-
-        def __enter__(self) -> "_NoGrad":
-            type(self).entered += 1
-            return self
-
-        def __exit__(self, *_exc: object) -> bool:
-            return False
-
-    def zeros(shape: tuple[int, ...], **kwargs: object) -> "_FakeWarmupLatents":
-        """`torch.zeros` stand-in: only `_warmup_vae_decode` builds a tensor here."""
-        return _FakeWarmupLatents(shape, **kwargs)
-
-    nn = types.ModuleType("torch.nn")
-    nn.Module = Module
-    fake_torch = types.ModuleType("torch")
-    fake_torch.nn = nn
-    fake_torch.bfloat16 = "bfloat16"
-    fake_torch.float16 = "float16"
-    fake_torch.device = _FakeDevice
-    fake_torch.Generator = Generator
-    fake_torch.OutOfMemoryError = _FakeOutOfMemoryError
-    fake_torch.no_grad = _NoGrad
-    fake_torch.zeros = zeros
-    return fake_torch
+        type(self).calls.append(kwargs)
+        self._attention_kwargs = kwargs.get("attention_kwargs")
+        steps = svc.effective_steps(int(kwargs["num_inference_steps"]), float(kwargs["strength"]))  # type: ignore[arg-type]
+        for step in range(steps):
+            kwargs["callback_on_step_end"](self, step, None, {})  # type: ignore[operator]
+        height, width = int(kwargs["height"]), int(kwargs["width"])  # type: ignore[arg-type]
+        channels = int(TINY_VAE_CONFIG["latent_channels"])  # type: ignore[arg-type]
+        return types.SimpleNamespace(images=torch.zeros((1, channels, height // VAE_LATENT_SCALE, width // VAE_LATENT_SCALE)))
 
 
-class _FakeWarmupLatents:
-    """The tensor `_warmup_vae_decode` synthesizes, tagged so the fake VAE knows it.
+class _ImageProcessor:
+    """Turns the real VAE's output into a solid PIL image of the decoded size (value `value`)."""
 
-    The distinction matters: a warm-up decode and the run's real decode are the
-    same call on the same object, and the tests have to be able to tell an OOM
-    armed for one from an OOM hit by the other.
-    """
+    def __init__(self, value: int = 210) -> None:
+        self.value = value
 
-    is_warmup = True
-
-    def __init__(self, shape: tuple[int, ...], **kwargs: object) -> None:
-        self.shape = tuple(shape)
-        self.kwargs = kwargs
-
-
-class _FakeLatents:
-    """Stand-in for the latent tensor handed back by `output_type="latent"`.
-
-    `shape` is real, because the decode's tiling gate reads it: diffusers enters
-    the tiled path only when a LATENT side exceeds `tile_latent_min_size`, so a
-    shapeless stand-in cannot express "tiling engages" at all. The default is a
-    64x64 latent — a 512 px region on the fixture VAE, below its 128-cell
-    threshold — which is the common case the ladder must stop crediting tiling
-    for.
-    """
-
-    def __init__(self, shape: tuple[int, ...] = (1, 16, 64, 64)) -> None:
-        self.shape = tuple(shape)
-        self.moves: list[dict[str, object]] = []
-        self.detached = 0
-
-    def detach(self) -> "_FakeLatents":
-        self.detached += 1
-        return self
-
-    def to(self, *args: object, **kwargs: object) -> "_FakeLatents":
-        self.moves.append({"args": args, **kwargs})
-        return self
-
-
-def _make_fake_vae(
-    module_cls: type,
-    decoded: object,
-    *,
-    oom_times: int = 0,
-    device_type: str = "cpu",
-    latent_channels: int | None = 16,
-    sample_size: int | None = VAE_SAMPLE_SIZE,
-) -> object:
-    """VAE stand-in: a real subclass of the fake `nn.Module` that also decodes.
-
-    It must genuinely be an `nn.Module` subclass, because
-    `_materialize_components_for_offload` skips anything that is not one.
-    `device_type` is where the loader is pretending to have put it, and
-    `latent_channels` is one of the `config` fields `_warmup_vae_decode` reads —
-    `None` models a VAE that does not carry it, which is the degraded warm-up
-    path.
-
-    **The two tile thresholds are DERIVED, exactly as `AutoencoderKLFlux2.__init__`
-    derives them**, from `sample_size` and `block_out_channels`; they are not
-    independent knobs and must not be set apart from each other, because
-    `tiled_decode` slices by the latent one and blends by the sample one.
-    `sample_size=None` models a VAE that declares neither threshold, which is the
-    case where the decode ladder must refuse to lower them rather than corrupt
-    the image.
-
-    Warm-up decodes are counted separately from real ones and never consume
-    `oom_times`: an OOM armed for the run's decode must not be spent on the
-    64x64 warm-up pass.
-    """
-
-    class _FakeVae(module_cls):  # type: ignore[misc, valid-type]
-        def __init__(self) -> None:
-            super().__init__("vae", ptr=0x1000, device_type=device_type)
-            self.decoded = decoded
-            self.oom_left = oom_times
-            self.decode_calls = 0
-            self.warmup_calls = 0
-            self.tiling = False
-            self.slicing = False
-            self.thresholds_at_decode: list[tuple[object, object]] = []
-            config: dict[str, object] = {}
-            if latent_channels is not None:
-                config["latent_channels"] = latent_channels
-            if sample_size is not None:
-                config["sample_size"] = sample_size
-                config["block_out_channels"] = list(VAE_BLOCK_OUT_CHANNELS)
-                scale = 2 ** (len(VAE_BLOCK_OUT_CHANNELS) - 1)
-                self.tile_sample_min_size = sample_size
-                self.tile_latent_min_size = int(sample_size / scale)
-            if config:
-                self.config = types.SimpleNamespace(**config)
-
-        def decode(self, latents: object, return_dict: bool = True) -> list[object]:
-            if getattr(latents, "is_warmup", False):
-                self.warmup_calls += 1
-                return [self.decoded]
-            self.decode_calls += 1
-            # The thresholds IN FORCE for this attempt. The last rung of the OOM
-            # ladder lowers them for one decode and restores them afterwards, so
-            # the values a test reads after the call cannot show what ran.
-            self.thresholds_at_decode.append(
-                (
-                    getattr(self, "tile_latent_min_size", None),
-                    getattr(self, "tile_sample_min_size", None),
-                )
-            )
-            if self.oom_left > 0:
-                self.oom_left -= 1
-                raise _FakeOutOfMemoryError("HIP out of memory. Tried to allocate 2.00 GiB")
-            return [self.decoded]
-
-        def enable_tiling(self) -> None:
-            self.tiling = True
-
-        def disable_tiling(self) -> None:
-            self.tiling = False
-
-        def enable_slicing(self) -> None:
-            self.slicing = True
-
-        def disable_slicing(self) -> None:
-            self.slicing = False
-
-    return _FakeVae()
-
-
-class _FakeImageProcessor:
     def postprocess(self, image: object, output_type: str = "pil") -> list[object]:
         assert output_type == "pil"
-        return [image]
+        height, width = int(image.shape[-2]), int(image.shape[-1])  # type: ignore[attr-defined]
+        return [Image.new("RGB", (width, height), (self.value,) * 3)]
 
 
-def _fake_pipe(
-    module_cls: type,
-    decoded: object,
-    *,
-    oom_times: int = 0,
-    sample_size: int | None = VAE_SAMPLE_SIZE,
-) -> types.SimpleNamespace:
-    """A pipeline stand-in with just the surface the decode step touches."""
-    return types.SimpleNamespace(
-        vae=_make_fake_vae(module_cls, decoded, oom_times=oom_times, sample_size=sample_size),
-        transformer=module_cls("transformer", ptr=0x4000, device_type="cuda"),
-        text_encoder=module_cls("text_encoder", ptr=0x2000),
-        image_processor=_FakeImageProcessor(),
-    )
+class _ManagedRunFixture(_TempTreeCase):
+    """A service over a REAL large-model manager on the CPU, with tiny real weights on disk.
 
-
-# ---------------------------------------------------------------------------
-# Pipeline placement
-# ---------------------------------------------------------------------------
-class _PlacementFixture(_TempTreeCase):
-    """Fake torch/diffusers/transformers plus a service, shared by the two cases below.
-
-    Carries no tests of its own: the transformer layout (folder vs. single file)
-    is what the two subclasses differ in, and each loader shape needs its own
-    assertions.
+    Real: the manager (planner, loader, ledger, moves, hooks), the arbiter, the
+    small pool, torch, the diffusers transformer / VAE classes and the
+    transformers Qwen3 class. Faked: the diffusers pipeline CALL
+    (`_FakeRunPipeline`), the Qwen tokenizer, the budget probes (`_RoomyProbes`)
+    and the transport's device (every "cuda:0" unit lives on the CPU). The run
+    device label is `cuda:0`.
     """
 
+    real_weights = True
+
     def setUp(self) -> None:
+        try:
+            import diffusers  # noqa: F401 - availability probe
+            import torch  # noqa: F401 - availability probe
+            import transformers  # noqa: F401 - availability probe
+        except ImportError as exc:  # pragma: no cover - the backend may run without torch
+            self.skipTest(f"needs torch, diffusers and transformers ({exc})")
         super().setUp()
-        self.recorder = _PatchRecorder()
-        self.torch = _install_fake_torch(self.recorder)
-        module_cls = self.torch.nn.Module
-        self.load_kwargs: dict[str, dict[str, object]] = {}
-        load_kwargs = self.load_kwargs
-        #: How often each component loader was entered. `load_kwargs` only keeps
-        #: the LAST call, so a cache that must read a component once per
-        #: directory rather than once per use is not assertable without a count.
-        self.load_calls: dict[str, int] = {}
-        load_calls = self.load_calls
+        import diffusers
+        import transformers
 
-        class _Loader:
-            """Records the kwargs a component loader was called with.
+        from modules.ai_backend.runtime.large_models.loader import TorchTransport
+        from modules.ai_backend.runtime.large_models.manager import LargeModelManager, MemoryLimitsStore
+        from modules.ai_backend.runtime.residency.arbiter import ResidencyArbiter
 
-            The two entry points place the produced module the way the real
-            loaders do, because that difference IS the failure this fixture must
-            be able to reproduce: `from_pretrained` honours `device_map`, while
-            diffusers 0.39's `from_single_file` pops `device_map`, discards it,
-            and looks only at its own `device` kwarg — defaulting to the CPU.
-            """
+        self.pipeline_cls = type("FakeRunPipeline", (_FakeRunPipeline,), {"calls": [], "encode_calls": [], "image_processor": _ImageProcessor()})
+        self.tokenizer_loads: list[str] = []
+        tokenizer_loads = self.tokenizer_loads
 
-            def __init__(self, name: str, factory) -> None:
-                self.name = name
-                self.factory = factory
-
-            def from_pretrained(self, path: str, **kwargs: object) -> object:
-                load_kwargs[self.name] = {"path": path, **kwargs}
-                load_calls[self.name] = load_calls.get(self.name, 0) + 1
-                device_map = kwargs.get("device_map")
-                target = device_map.get("") if isinstance(device_map, dict) else None
-                return self.factory(str(target) if target else "cpu")
-
-            def from_single_file(self, path: str, **kwargs: object) -> object:
-                load_kwargs[f"{self.name}_single"] = {"path": path, **kwargs}
-                load_calls[self.name] = load_calls.get(self.name, 0) + 1
-                # `device_map` is deliberately NOT consulted here.
-                device = kwargs.get("device")
-                return self.factory(str(device) if device else "cpu")
-
-        encode_calls = self.encode_calls = []
-
-        class FakePipeline:
-            def __init__(self, **components: object) -> None:
-                self.__dict__.update(components)
-                self.moves: list[tuple[object, int]] = []
-                self.offload_devices: list[str] = []
-                self.sequential_offload_devices: list[str] = []
-                self.progress_bar_disabled = False
-
-            def to(self, device: object) -> "FakePipeline":
-                self.moves.append((device, self.recorder_depth()))
-                return self
-
+        class _Tokenizer:
             @staticmethod
-            def recorder_depth() -> int:
-                return recorder.depth
-
-            def set_progress_bar_config(self, **_kwargs: object) -> None:
-                self.progress_bar_disabled = True
-
-            def encode_prompt(self, **kwargs: object) -> tuple[object, object]:
-                """Phase 1 builds an encoder-only instance of this class."""
-                encode_calls.append(kwargs)
-                return _FakeEmbeds(str(kwargs.get("prompt", ""))), object()
-
-            def enable_model_cpu_offload(self, device: str) -> None:
-                self.offload_devices.append(device)
-
-            def enable_sequential_cpu_offload(self, device: str) -> None:
-                self.sequential_offload_devices.append(device)
-
-        recorder = self.recorder
-        self.pipeline_cls = FakePipeline
-
-        diffusers = types.ModuleType("diffusers")
-        diffusers.Flux2Transformer2DModel = _Loader(
-            "transformer",
-            lambda device: module_cls("transformer", ptr=0x4000, device_type=device),
-        )
-        diffusers.AutoencoderKLFlux2 = _Loader(
-            "vae", lambda device: _make_fake_vae(module_cls, object(), device_type=device)
-        )
-        diffusers.FlowMatchEulerDiscreteScheduler = _Loader("scheduler", lambda _device: object())
-        diffusers.Flux2KleinInpaintPipeline = FakePipeline
-
-        transformers = types.ModuleType("transformers")
-        # `Qwen3Model` is what the service loads (the pipeline reads hidden states
-        # only). `Qwen3ForCausalLM` stays on the double because the real module
-        # still exports it and a test may want to prove we do NOT ask for it.
-        transformers.Qwen3Model = _Loader(
-            "text_encoder",
-            lambda device: module_cls("text_encoder", ptr=0x2000, device_type=device),
-        )
-        transformers.Qwen3ForCausalLM = _Loader(
-            "text_encoder_causal_lm",
-            lambda device: module_cls("text_encoder", ptr=0x2000, device_type=device),
-        )
-        transformers.Qwen2TokenizerFast = _Loader("tokenizer", lambda _device: object())
-
-        modules_patch = patch.dict(
-            sys.modules,
-            {
-                "torch": self.torch,
-                "torch.nn": self.torch.nn,
-                "diffusers": diffusers,
-                "transformers": transformers,
-            },
-        )
-        modules_patch.start()
-        self.addCleanup(modules_patch.stop)
+            def from_pretrained(path: str, **_kwargs: object) -> object:
+                tokenizer_loads.append(path)
+                return object()
 
         for module, name, replacement in (
-            (pipeline, "patched_module_to", self.recorder),
+            (diffusers, "Flux2KleinInpaintPipeline", self.pipeline_cls),
+            (transformers, "Qwen2TokenizerFast", _Tokenizer),
             (hardware, "_resolve_selected_backend_device", lambda _fallback: "cuda:0"),
             (hardware, "_clear_torch_cache", lambda: None),
         ):
@@ -679,43 +441,37 @@ class _PlacementFixture(_TempTreeCase):
             attr_patch.start()
             self.addCleanup(attr_patch.stop)
 
-        self.service = svc.Flux2KleinInpaintService(LoadedModelManager())
-
-    def _build(self, model_key: str = "flux2_klein:test", **overrides: object):
-        normalized = svc.normalize_flux2_klein_params(self.params(**overrides))
-        return self.service._ensure_pipeline_locked(
-            normalized, model_key, lambda _step, _label: None, region_hw=(128, 128)
+        self.probes = _RoomyProbes()
+        arbiter = ResidencyArbiter(self.probes, admission_wait_s=0.0)
+        self.small = SmallModelManager(arbiter=arbiter)
+        self.large = LargeModelManager(
+            arbiter,
+            limits_store=MemoryLimitsStore(),
+            tables=lambda _device: _flat_tables(),
+            probes=self.probes,
+            transport_factory=lambda _device: TorchTransport("cpu"),
+            device_class=lambda _device: "test",
         )
+        self.service = svc.Flux2KleinInpaintService(self.small, large_models=self.large)
 
-    def _encode(self, **overrides: object) -> dict[str, object]:
-        """Drive phase 1 (`_prompt_embeds_locked`) with a no-op progress reporter."""
-        normalized = svc.normalize_flux2_klein_params(self.params(**overrides))
-        return self.service._prompt_embeds_locked(normalized, lambda _step, _label: None)
+    def held(self) -> dict[str, tuple[int, int]]:
+        """`{handle key: (device bytes, host bytes)}` of every FLUX.2 handle (`LargeModelManager.status()`)."""
+        return {entry["key"]: (int(entry["device_bytes"]), int(entry["host_bytes"])) for entry in self.large.status()}
 
-class _ResidencyModule:
-    """Weight-bearing module stand-in for `_module_residency`.
 
-    Only the surface the probe reads: `parameters()`, `buffers()` and, when
-    `hooked` is set, the `_hf_hook` attribute accelerate leaves behind.
-    """
+def _flat_tables() -> object:
+    """A calibrated round-number table with 1 MiB activations (the tiny models need nothing near it)."""
+    from modules.ai_backend.runtime.large_models.cost_tables import parse_tables
 
-    def __init__(
-        self,
-        *parameter_devices: str,
-        buffer_devices: tuple[str, ...] = (),
-        hooked: bool = False,
-    ) -> None:
-        self._parameters = [_ResidencyModule._tensor(name) for name in parameter_devices]
-        self._buffers = [_ResidencyModule._tensor(name) for name in buffer_devices]
-        if hooked:
-            self._hf_hook = object()
+    def entry(exec_kind: str) -> dict[str, object]:
+        return {"family": "*", "phase": "*", "variant": "*", "format": "*", "compute_path": "*", "exec": exec_kind, "measured": True, "fixed_bytes": 1 << 20, "bytes_per_token": 0, "bytes_per_pixel": 0, "reserved_factor": 1.0, "seconds_fixed": 0.0, "seconds_per_ktoken_pass": 0.0, "seconds_per_ktoken2_pass": 0.0, "seconds_per_mpixel": 0.0}
 
-    @staticmethod
-    def _tensor(device_type: str) -> types.SimpleNamespace:
-        return types.SimpleNamespace(device=types.SimpleNamespace(type=device_type))
-
-    def parameters(self) -> list[types.SimpleNamespace]:
-        return list(self._parameters)
-
-    def buffers(self) -> list[types.SimpleNamespace]:
-        return list(self._buffers)
+    rate = 1 << 30
+    data = {
+        "device_class": "test",
+        "calibrated": True,
+        "source": "test",
+        "device": {"runtime_overhead_bytes": 0, "margin_fraction": 0.0, "margin_cap_bytes": 0, "park_bytes_per_s": rate, "restore_bytes_per_s": rate, "block_h2d_bytes_per_s": rate, "disk_cold_bytes_per_s": rate, "disk_warm_bytes_per_s": rate, "prefetch_depth": 1},
+        "phases": [entry("device"), entry("cpu")],
+    }
+    return parse_tables(data, source="test")

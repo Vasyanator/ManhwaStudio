@@ -36,7 +36,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from modules.ai_backend.inpaint import sdxl as svc
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
 
 class NormalizeSdxlParamsTests(unittest.TestCase):
@@ -382,7 +382,7 @@ class SdxlUnloadTests(unittest.TestCase):
     """Pin the unload bookkeeping; no torch, diffusers or weights involved."""
 
     def test_unload_drops_the_pipeline_and_reports_it(self) -> None:
-        service = svc.SdxlInpaintService(LoadedModelManager(), object())
+        service = svc.SdxlInpaintService(SmallModelManager(), object())
         service._pipe = object()
         service._active_model_key = "sdxl:nine_channel:cuda:0:/models/a.safetensors"
 
@@ -394,11 +394,11 @@ class SdxlUnloadTests(unittest.TestCase):
         self.assertIsNone(service._active_model_key)
 
     def test_unload_without_a_pipeline_is_a_noop(self) -> None:
-        service = svc.SdxlInpaintService(LoadedModelManager(), object())
+        service = svc.SdxlInpaintService(SmallModelManager(), object())
         self.assertFalse(service.unload())
 
     def test_unload_key_refuses_a_foreign_key(self) -> None:
-        service = svc.SdxlInpaintService(LoadedModelManager(), object())
+        service = svc.SdxlInpaintService(SmallModelManager(), object())
         service._pipe = object()
         service._active_model_key = "sdxl:a"
 

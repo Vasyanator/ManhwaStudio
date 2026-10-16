@@ -24,7 +24,6 @@ everything else about the file is covered from its safetensors HEADER alone.
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
 import json
 import struct
@@ -36,10 +35,10 @@ from unittest.mock import patch
 import numpy as np
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.inpaint.flux2_klein import components, hardware, prompt_cache
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.inpaint.flux2_klein import hardware, prompt_cache
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 
-from ._test_fixtures import _FakeEmbeds, _PlacementFixture, _TempTreeCase, _png_bytes
+from ._test_fixtures import _FakeEmbeds, _ManagedRunFixture, _TempTreeCase, _png_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -61,22 +60,6 @@ def _prompt_cache_bytes(metadata: dict[str, str], *, dtype_token: str = "BF16") 
     }
     blob = json.dumps(header).encode("utf-8")
     return struct.pack("<Q", len(blob)) + blob + payload
-
-
-@contextlib.contextmanager
-def _patched_sizes(sizes: dict[str, int]):
-    """Patch BOTH component sizers with the same figures, for one `with` block.
-
-    `forecast_memory` asks `text_encoder_resident_bytes` for the encoder and
-    `_weight_bytes` for the transformer and the VAE, so a test that patches only
-    one leaves the encoder at the fixture tree's real (tiny) size and stops
-    measuring what it says it measures.
-    """
-    with patch.object(components, "_weight_bytes", lambda path: sizes.get(path, 0)):
-        with patch.object(
-            components, "text_encoder_resident_bytes", lambda path, *_a, **_k: sizes.get(path, 0)
-        ):
-            yield
 
 
 def _write_prompt_cache_file(path: Path, metadata: dict[str, str], **kwargs: object) -> None:
@@ -197,7 +180,7 @@ class PromptCacheLibraryTests(_TempTreeCase):
         write_patch.start()
         self.addCleanup(write_patch.stop)
 
-        self.service = svc.Flux2KleinInpaintService(LoadedModelManager())
+        self.service = svc.Flux2KleinInpaintService(SmallModelManager())
         self.encoder_id = svc.text_encoder_fingerprint(self.paths["text_encoder_path"])
         self.family = svc.encoder_family_name(self.paths["text_encoder_path"], self.encoder_id)
 
@@ -641,7 +624,7 @@ class PromptCacheRoundTripTests(_TempTreeCase):
         root_patch = patch.object(prompt_cache, "program_root", lambda: self.library)
         root_patch.start()
         self.addCleanup(root_patch.stop)
-        self.service = svc.Flux2KleinInpaintService(LoadedModelManager())
+        self.service = svc.Flux2KleinInpaintService(SmallModelManager())
 
     def test_a_saved_entry_loads_back_into_the_cache_unchanged(self) -> None:
         import torch
@@ -657,7 +640,7 @@ class PromptCacheRoundTripTests(_TempTreeCase):
         self.assertGreater(saved["size_bytes"], 0)
 
         # A fresh service: nothing in memory, everything from the file.
-        other = svc.Flux2KleinInpaintService(LoadedModelManager())
+        other = svc.Flux2KleinInpaintService(SmallModelManager())
         loaded = other.prompt_cache_load(self.params(prompt="ignored"), "круглый рейс")
         self.assertEqual(loaded["prompt"], "remove the text")
         self.assertTrue(loaded["prompt_cached"])
@@ -691,7 +674,7 @@ class PromptCacheRoundTripTests(_TempTreeCase):
         self.service._prompt_cache[key] = embeds
         saved = self.service.prompt_cache_save(self.params(prompt="remove the text"), "перенос")
 
-        other = svc.Flux2KleinInpaintService(LoadedModelManager())
+        other = svc.Flux2KleinInpaintService(SmallModelManager())
         params = dict(self.params())
         params.pop("text_encoder_path")
         loaded = other.prompt_cache_load(params, "перенос")
@@ -718,7 +701,7 @@ class PromptCacheRoundTripTests(_TempTreeCase):
             (1, 2, 4), dtype=torch.bfloat16
         )
         self.service.prompt_cache_save(self.params(prompt="p"), "entry")
-        other = svc.Flux2KleinInpaintService(LoadedModelManager())
+        other = svc.Flux2KleinInpaintService(SmallModelManager())
         loaded = other.prompt_cache_load(
             self.params(text_encoder_path=str(self.root / "no-such-encoder")), "entry"
         )
@@ -739,139 +722,92 @@ class PromptCacheRoundTripTests(_TempTreeCase):
         self.assertEqual(tensor["shape"], [1, 2, 4])
 
 
-class PromptCacheBuildTests(_PlacementFixture):
-    """`prompt_cache.build`: encode the prompt, load nothing else, let go again."""
+class PromptCacheBuildTests(_ManagedRunFixture):
+    """`prompt_cache.build`: encode the prompt through the encoder handle only, then let it go."""
 
-    def setUp(self) -> None:
-        super().setUp()
-        snapshot = {
-            "ram_free": 64 * 1024**3,
-            "ram_total": 64 * 1024**3,
-            "vram_free": 32 * 1024**3,
-            "vram_total": 32 * 1024**3,
-        }
-        memory_patch = patch.object(hardware, "memory_snapshot", lambda _device=None: snapshot)
-        memory_patch.start()
-        self.addCleanup(memory_patch.stop)
+    def _encoder_held(self) -> bool:
+        return any(sum(held) > 0 for key, held in self.held().items() if key.startswith("flux2_klein_text_encoder:"))
 
-    def test_it_encodes_the_prompt_without_building_a_pipeline(self) -> None:
+    def _pipeline_held(self) -> bool:
+        return any(sum(held) > 0 for key, held in self.held().items() if key.startswith("flux2_klein:"))
+
+    def _run(self, prompt: str) -> None:
+        region = np.full((128, 128, 3), 90, dtype=np.uint8)
+        mask = np.zeros((128, 128), dtype=np.uint8)
+        mask[48:80, 48:80] = 255
+        self.service.inpaint_image_bytes(_png_bytes(region, "RGB"), _png_bytes(mask, "L"), params=self.params(prompt=prompt))
+
+    def test_it_encodes_the_prompt_without_admitting_a_pipeline(self) -> None:
         out = self.service.prompt_cache_build(self.params(prompt="a cat"))
         self.assertTrue(out["encoded"])
         self.assertTrue(out["prompt_cached"])
-        self.assertEqual([call["prompt"] for call in self.encode_calls], ["a cat"])
+        self.assertEqual([call["prompt"] for call in self.pipeline_cls.encode_calls], ["a cat"])
         # The 9B transformer takes no part in a prompt.
-        self.assertIsNone(self.service._pipe)
-        self.assertNotIn("transformer", self.load_kwargs)
-        self.assertNotIn("vae", self.load_kwargs)
+        self.assertFalse(self._pipeline_held())
+        self.assertFalse(any(entry["model"].startswith("flux2_klein") and not entry["model"].startswith("flux2_klein_text") for entry in self.large.status()))
 
     def test_it_releases_the_encoder_it_loaded(self) -> None:
-        # The whole point of the button: cache the prompt so the 16 GB encoder
-        # does not have to stay.
         self.service.prompt_cache_build(self.params(prompt="a cat"))
-        self.assertIsNone(self.service._text_encoder)
+        self.assertFalse(self._encoder_held())
 
     def test_an_encoder_that_was_already_resident_is_left_alone(self) -> None:
-        self._encode(prompt="first")  # a normal run keeps the encoder by default
-        self.assertIsNotNone(self.service._text_encoder)
+        self._run("first")  # a normal run keeps the encoder by default
+        self.assertTrue(self._encoder_held())
         self.service.prompt_cache_build(self.params(prompt="second"))
-        self.assertIsNotNone(self.service._text_encoder)
+        self.assertTrue(self._encoder_held())
 
     def test_a_second_build_of_the_same_prompt_reads_nothing(self) -> None:
         self.service.prompt_cache_build(self.params(prompt="a cat"))
-        self.load_kwargs.clear()
+        self.pipeline_cls.encode_calls.clear()
         out = self.service.prompt_cache_build(self.params(prompt="a cat"))
         self.assertFalse(out["encoded"])
-        self.assertNotIn("text_encoder", self.load_kwargs)
+        self.assertEqual(self.pipeline_cls.encode_calls, [])
+        self.assertFalse(self._encoder_held())
 
     def test_an_empty_prompt_is_refused(self) -> None:
         with self.assertRaises(ValueError):
             self.service.prompt_cache_build(self.params(prompt="   "))
 
     def test_the_status_flag_follows_the_shared_key(self) -> None:
-        with patch.object(components, "is_torch_available", lambda: True):
+        with patch.object(hardware, "memory_snapshot", lambda *_a, **_k: {"vram_total": 0, "vram_free": 0, "ram_total": 0, "ram_free": 0}):
             self.service.prompt_cache_build(self.params(prompt="a cat"))
             self.assertTrue(self.service.status(self.params(prompt="a cat"))["prompt_cached"])
             self.assertFalse(self.service.status(self.params(prompt="a dog"))["prompt_cached"])
             # Same prompt, another sequence length: a different embedding.
-            self.assertFalse(
-                self.service.status(self.params(prompt="a cat", max_sequence_length=256))[
-                    "prompt_cached"
-                ]
-            )
+            self.assertFalse(self.service.status(self.params(prompt="a cat", max_sequence_length=256))["prompt_cached"])
             self.assertFalse(self.service.status(self.params(prompt="  "))["prompt_cached"])
             self.assertFalse(self.service.status(None)["prompt_cached"])
 
     def test_it_streams_the_prompt_phase_steps(self) -> None:
         frames: list[tuple[str, int, int, str]] = []
-        self.service.prompt_cache_build(
-            self.params(prompt="a cat"), progress_callback=lambda *frame: frames.append(frame)
-        )
+        self.service.prompt_cache_build(self.params(prompt="a cat"), progress_callback=lambda *frame: frames.append(frame))
         self.assertTrue(all(phase == "load" for phase, _s, _t, _l in frames))
         steps = [step for _p, step, _t, _l in frames]
-        self.assertIn(svc.LOAD_STEP_TEXT_ENCODER, steps)
-        self.assertIn(svc.LOAD_STEP_ENCODE, steps)
-        self.assertEqual(steps, sorted(steps))
+        self.assertEqual(steps, [svc.LOAD_STEP_PREPARE, svc.LOAD_STEP_TEXT_ENCODER, svc.LOAD_STEP_ENCODE, svc.LOAD_STEP_ENCODER_DONE])
 
-    def test_the_memory_gate_charges_only_for_the_encoder(self) -> None:
-        # A build must not demand the transformer's 18 GB of VRAM: it never
-        # loads one. `encode_standalone` is what the guard checks.
-        sizes = {
-            self.paths["transformer_path"]: 18_157_185_168,
-            self.paths["text_encoder_path"]: 16_381_516_808,
-            self.paths["vae_path"]: 168_120_878,
-        }
-        with _patched_sizes(sizes):
-            forecast = svc.forecast_memory(
-                svc.normalize_flux2_klein_params(self.params()), 384, 384
-            )
-            phase = forecast["phases"]["encode_standalone"]
-            self.assertEqual(phase["vram_bytes"], 0)
-            self.assertLess(phase["ram_bytes"], forecast["phases"]["encode"]["ram_bytes"] + 1)
-            self.assertGreaterEqual(phase["ram_bytes"], sizes[self.paths["text_encoder_path"]])
-            # Adding the phase must not have moved the numbers the UI shows.
-            self.assertEqual(
-                forecast["vram_bytes"],
-                max(
-                    forecast["phases"][name]["vram_bytes"]
-                    for name in ("encode", "denoise", "decode")
-                ),
-            )
+    def test_the_forecast_charges_the_build_with_the_encoder_alone(self) -> None:
+        forecast = svc.forecast_memory(svc.normalize_flux2_klein_params(self.params()), 384, 384)
+        standalone = forecast["phases"]["encode_standalone"]
+        encode = forecast["phases"]["encode"]
+        self.assertLess(standalone["vram_bytes"], encode["vram_bytes"], "no pipeline beside the encoder")
+        self.assertLessEqual(standalone["ram_bytes"], encode["ram_bytes"])
 
-    def test_a_host_short_of_memory_refuses_the_build_before_reading_anything(self) -> None:
-        sizes = {self.paths["text_encoder_path"]: 16_381_516_808}
-        snapshot = {
-            "ram_free": 4 * 1024**3,
-            "ram_total": 64 * 1024**3,
-            "vram_free": 32 * 1024**3,
-            "vram_total": 32 * 1024**3,
-        }
-        with _patched_sizes(sizes):
-            with patch.object(hardware, "memory_snapshot", lambda _device=None: snapshot):
-                with self.assertRaises(RuntimeError) as caught:
-                    self.service.prompt_cache_build(self.params(prompt="a cat"))
-        self.assertIn("кэширование", str(caught.exception))
-        self.assertNotIn("text_encoder", self.load_kwargs)
+    def test_a_machine_short_of_memory_refuses_the_build_before_reading_anything(self) -> None:
+        self.probes.device_total = 1 << 10
+        self.probes.host_available = 1 << 10
+        with self.assertRaises(RuntimeError):
+            self.service.prompt_cache_build(self.params(prompt="a cat"))
+        self.assertEqual(self.pipeline_cls.encode_calls, [])
+        self.assertFalse(self._encoder_held())
 
 
-class NoTextEncoderTests(_PlacementFixture):
+class NoTextEncoderTests(_ManagedRunFixture):
     """A machine where the 16 GB Qwen3 was never downloaded.
 
     The contract: a cached prompt generates (the denoise and the VAE decode never
     look at the encoder), and everything that would have to ENCODE is refused
-    with a message naming both ways out.
+    with a message naming both ways out, before any weight is read.
     """
-
-    def setUp(self) -> None:
-        super().setUp()
-        snapshot = {
-            "ram_free": 64 * 1024**3,
-            "ram_total": 64 * 1024**3,
-            "vram_free": 32 * 1024**3,
-            "vram_total": 32 * 1024**3,
-        }
-        memory_patch = patch.object(hardware, "memory_snapshot", lambda _device=None: snapshot)
-        memory_patch.start()
-        self.addCleanup(memory_patch.stop)
 
     def _params(self, **overrides: object) -> dict[str, object]:
         params = self.params(**overrides)
@@ -879,16 +815,21 @@ class NoTextEncoderTests(_PlacementFixture):
         return params
 
     def _cache(self, params: dict[str, object]) -> dict[str, Any]:
+        import torch
+
         normalized = svc.normalize_flux2_klein_params(params)
-        self.service._prompt_cache[
-            self.service._prompt_cache_key(normalized, normalized["prompt"])
-        ] = _FakeEmbeds(str(normalized["prompt"]))
+        self.service._prompt_cache[self.service._prompt_cache_key(normalized, normalized["prompt"])] = torch.zeros((1, int(normalized["max_sequence_length"]), 24))
         return normalized
+
+    def _run(self, params: dict[str, object]) -> dict[str, Any]:
+        region = np.full((128, 128, 3), 90, dtype=np.uint8)
+        mask = np.zeros((128, 128), dtype=np.uint8)
+        mask[48:80, 48:80] = 255
+        return self.service.inpaint_image_bytes(_png_bytes(region, "RGB"), _png_bytes(mask, "L"), params=params)
 
     def test_an_absent_encoder_path_normalizes_instead_of_raising(self) -> None:
         normalized = svc.normalize_flux2_klein_params(self._params(prompt="a cat"))
         self.assertEqual(normalized["text_encoder_path"], "")
-        # The other two paths are still mandatory: nothing can replace them.
         for key in ("transformer_path", "vae_path"):
             with self.subTest(key=key):
                 params = self._params()
@@ -900,90 +841,47 @@ class NoTextEncoderTests(_PlacementFixture):
         params = self.params(text_encoder_path=str(self.root / "gone"))
         self.assertFalse(svc.text_encoder_available(svc.normalize_flux2_klein_params(params)))
         self.assertIsNone(svc.local_encoder_identity(str(self.root / "gone")))
-        configured = svc.normalize_flux2_klein_params(self.params())
-        self.assertTrue(svc.text_encoder_available(configured))
+        self.assertTrue(svc.text_encoder_available(svc.normalize_flux2_klein_params(self.params())))
 
     def test_an_encoder_that_exists_but_cannot_be_identified_is_still_an_error(self) -> None:
-        # Degrading a broken checkout into "no encoder" would hide it behind a
-        # silently weaker check; it stays the error it always was.
         (self.root / "text_encoder" / "config.json").unlink()
         with self.assertRaises(ValueError):
             svc.local_encoder_identity(self.paths["text_encoder_path"])
 
     def test_a_cached_prompt_is_served_without_touching_the_encoder(self) -> None:
-        normalized = self._cache(self._params(prompt="a cat"))
-        embeds = self.service._prompt_embeds_locked(normalized, lambda _step, _label: None)
-        self.assertEqual(embeds["prompt"].text, "a cat")
-        self.assertIsNone(embeds["negative"])
-        self.assertNotIn("text_encoder", self.load_kwargs)
-        self.assertEqual(self.encode_calls, [])
+        params = self._params(prompt="a cat")
+        self._cache(params)
+        out = self._run(params)
+        self.assertEqual(out["region_size"], [128, 128])
+        self.assertEqual(self.pipeline_cls.encode_calls, [])
+        self.assertFalse(any(key.startswith("flux2_klein_text_encoder:") for key in self.held()))
 
-    def test_an_uncached_prompt_is_refused_naming_both_ways_out(self) -> None:
-        normalized = svc.normalize_flux2_klein_params(self._params(prompt="a cat"))
+    def test_an_uncached_prompt_is_refused_naming_both_ways_out_before_any_load(self) -> None:
         with self.assertRaises(ValueError) as caught:
-            self.service._prompt_embeds_locked(normalized, lambda _step, _label: None)
+            self._run(self._params(prompt="a cat"))
         message = str(caught.exception)
         self.assertIn("энкодер", message)
         self.assertIn("кэш", message)
-        self.assertNotIn("text_encoder", self.load_kwargs)
+        self.assertEqual(self.large.status(), [], "nothing was admitted")
 
     def test_the_refusal_names_a_configured_path_that_is_missing(self) -> None:
         missing = str(self.root / "gone")
-        normalized = svc.normalize_flux2_klein_params(
-            self.params(prompt="a cat", text_encoder_path=missing)
-        )
         with self.assertRaises(ValueError) as caught:
-            self.service._prompt_embeds_locked(normalized, lambda _step, _label: None)
+            self._run(self.params(prompt="a cat", text_encoder_path=missing))
         self.assertIn(missing, str(caught.exception))
-
-    def test_a_run_with_an_uncached_prompt_loads_nothing_at_all(self) -> None:
-        # The refusal has to happen BEFORE the 18 GB transformer is read: loading
-        # a pipeline for a run that cannot finish is the cost this check avoids.
-        region = np.full((128, 128, 3), 90, dtype=np.uint8)
-        mask = np.zeros((128, 128), dtype=np.uint8)
-        mask[48:80, 48:80] = 255
-        with self.assertRaises(ValueError):
-            self.service.inpaint_image_bytes(
-                _png_bytes(region, "RGB"),
-                _png_bytes(mask, "L"),
-                params=self._params(prompt="a cat"),
-            )
-        self.assertEqual(self.load_kwargs, {})
-        self.assertIsNone(self.service._pipe)
-
-    def test_a_run_with_a_cached_prompt_gets_past_the_check(self) -> None:
-        # Only the encoder gate is under test here, so the run is stopped right
-        # after it by a pipeline build that refuses to happen — what matters is
-        # WHICH error comes back, and that it is no longer the encoder one.
-        self._cache(self._params(prompt="a cat"))
-        region = np.full((128, 128, 3), 90, dtype=np.uint8)
-        mask = np.zeros((128, 128), dtype=np.uint8)
-        mask[48:80, 48:80] = 255
-        def _reached(*_args: object, **_kwargs: object) -> object:
-            raise RuntimeError("pipeline reached")
-
-        with patch.object(self.service, "_ensure_pipeline_locked", _reached):
-            with self.assertRaises(RuntimeError) as caught:
-                self.service.inpaint_image_bytes(
-                    _png_bytes(region, "RGB"),
-                    _png_bytes(mask, "L"),
-                    params=self._params(prompt="a cat"),
-                )
-        self.assertEqual(str(caught.exception), "pipeline reached")
 
     def test_build_without_an_encoder_is_refused(self) -> None:
         with self.assertRaises(ValueError) as caught:
             self.service.prompt_cache_build(self._params(prompt="a cat"))
         self.assertIn("энкодер", str(caught.exception))
-        self.assertNotIn("text_encoder", self.load_kwargs)
+        self.assertEqual(self.large.status(), [])
 
     def test_build_of_an_already_cached_prompt_needs_no_encoder(self) -> None:
-        # Nothing has to be encoded, so nothing has to be refused.
         self._cache(self._params(prompt="a cat"))
         out = self.service.prompt_cache_build(self._params(prompt="a cat"))
         self.assertFalse(out["encoded"])
         self.assertTrue(out["prompt_cached"])
-        self.assertNotIn("text_encoder", self.load_kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()

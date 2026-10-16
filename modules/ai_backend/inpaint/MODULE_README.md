@@ -1,30 +1,37 @@
 # Module: modules/ai_backend/inpaint
 
 ## Purpose
-Inpainting backends of the Python AI backend: six independent service adapters (LaMa V2, LaMa MPE,
-AOT, SDXL, FLUX.1-Fill-dev, FLUX.2 klein) that take an image + mask as PNG bytes and return PNG
-bytes. They are constructed in `server.py`, stored on `AppState`, and reached from Rust through the
-`inpaint.*` IPC methods implemented in `ipc/handlers/`.
+Inpainting and image-generation backends of the Python AI backend: seven services. Six of
+them (LaMa V2, LaMa MPE, AOT, SDXL, FLUX.1-Fill-dev, FLUX.2 klein) take an image + mask as PNG bytes
+and return PNG bytes; they are constructed in `server.py`, stored on `AppState`, and reached from
+Rust through the `inpaint.*` IPC methods implemented in `ipc/handlers/`. The seventh, FLUX.3 Image
+Klein (`flux3_klein/`, caption + references -> image), is NOT wired yet: no `server.py`
+construction, no `AppState` field, no IPC method.
 
 ## Architecture
-Every service follows the same shape and is safe to copy from when adding a seventh backend:
+Every service follows the same shape and is safe to copy from when adding another backend:
 
 - construction is cheap; torch / diffusers / cv2 are imported lazily inside the methods that need
   them, so importing one inpainter never pulls in another one's dependencies;
 - one resident model at a time, guarded by an `RLock`, keyed by a service-specific `model_key`
   (`lama_v2:<device>:<ckpt>`, `aot:<device>`, `sdxl:<mode>:<device>:<source>`, `flux_fill:<quant>`,
-  `flux2_klein:<dtype>|<placement>|…|<paths>`, …);
-- the key is leased from the shared `runtime.model_manager.LoadedModelManager`
+  …); the large-model services (FLUX.2 klein, FLUX.3 klein) are handles of the large-model
+  manager instead (`runtime.large_models`), keyed by their spec;
+- the key is leased from the shared `runtime.model_manager.SmallModelManager`
   (`begin_model_use` → `mark_loaded` / `mark_load_failed` → `release`), which is what lets an idle
   model be evicted by another service. **Load and inference are two separate `try` scopes**: see
-  the lease-protocol section below;
+  the lease-protocol section below. The small-pool services (LaMa V2, LaMa MPE, AOT, SDXL, FLUX
+  Fill) pass `owner=` (a module constant `_LEASE_OWNER`) and `hint=` (the residency footprint
+  hint from the very checkpoint files the load reads) to `begin_model_use`, so their bytes count in
+  the shared budget (`runtime/residency/MODULE_README.md`);
 - the target device comes from `General.ai_device` through the module-level binding
   `_resolve_selected_backend_device()` of `runtime.torch_device.resolve_selected_backend_device`
   (the one owner; each service's policy is the binding's arguments, and the allocator cache is
   released the same way through `_clear_torch_cache` -> `runtime.torch_device.clear_torch_cache`;
-  `not-selected` resolves to a real runtime default). The one
-  exception is `flux_fill.py`, which ignores the user's device choice and pins itself to the
-  discrete GPU via `_select_discrete_device()` — see the FLUX section;
+  `not-selected` resolves to a real runtime default). The large-model services (FLUX.2 klein,
+  FLUX.3 klein) bind `runtime.torch_device.resolve_discrete_backend_device` instead, which honours
+  the choice but never answers an integrated GPU. `flux_fill.py` ignores the user's device choice
+  and pins itself to the discrete GPU via `_select_discrete_device()` — see the FLUX section;
 - `health()` / `unload()` are part of every service's contract, and `unload()` reports the dropped
   key back to the model manager. `health()` never takes the service lock (which spans load AND
   inference here): it reads the service's `HealthSnapshot`, republished by `_publish_health_locked()`
@@ -54,26 +61,34 @@ Every service follows the same shape and is safe to copy from when adding a seve
   `.status`, streaming). See the FLUX section.
 - `flux2_klein/`: `Flux2KleinInpaintService` — FLUX.2 klein region editing
   (`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload`, `.component_action` and the
-  `.prompt_cache.*` family, streaming). Serves BOTH variants (9B and 4B) without knowing which:
-  it is driven by the three user paths and `_model_key` / `_encoder_key` keep exactly one
-  pipeline and one encoder resident, so there is no variant field on the inference path — only
+  `.prompt_cache.*` family, streaming) on the large-model manager. Serves BOTH variants (9B and
+  4B) without knowing which:
+  it is driven by the three user paths, and the large-model manager keeps one pipeline handle and
+  one encoder handle per path set (`large_model.py`), so there is no variant field on the
+  inference path — only
   `require_encoder_transformer_compatible`, which refuses a MIXED pair.
-  A PACKAGE, not a module: the service was split along its
-  seams (`params`, `progress`, `components`, `prompt_cache`, `imaging`, `hardware`, `memory`,
-  `pipeline`, `service`) once the single file passed the 3000-line ceiling. `__init__.py` re-exports
-  the whole surface the single file had, so `from .inpaint.flux2_klein import
-  Flux2KleinInpaintService` and every `flux2_klein.<name>` reference keep working unchanged. See
+  A PACKAGE (`params`, `progress`, `conversion`, `components`, `prompt_cache`, `imaging`,
+  `hardware`, `pipeline`, `large_model`, `memory`, `service`); `__init__.py` re-exports its public
+  surface, so `from .inpaint.flux2_klein import Flux2KleinInpaintService` and every
+  `flux2_klein.<name>` reference resolve against the package. See
   `flux2_klein/MODULE_README.md` for the layout and the FLUX.2 klein sections below for the
   contracts.
+- `flux3_klein/`: `Flux3KleinService` — FLUX.3 Image Klein generation from the official weight
+  package (bf16 / fp8r / nvfp4 DiT, AE, Qwen3-VL encoder), with a `PhaseObserver` per phase. Not
+  wired (see Purpose); its one caller is the measurement tool `tools/large_model_calibration/`. See the FLUX.3 klein section
+  below and `flux3_klein/MODULE_README.md`.
 - `flux2_download.py`: acquisition of the klein weights from Hugging Face
   (`inpaint.flux2_klein.download.check` / `.start`), for either VARIANT (`ModelVariant`: `9b`
   gated, `4b` public). NOT a service and deliberately so: it holds no
   resident model, takes no lease and has no `AppState` field — it is a module of functions the
   handler imports lazily. See the FLUX.2 klein download section.
+- `test_lease_hints.py`: the owner and the file-size hint each small-pool service hands
+  `begin_model_use` (reuses `test_lease_protocol.py`'s case builders, temp checkpoint files).
 - `test_health_during_load.py`: `health()` answers while AOT's lock section loads and infers, and
   reflects loading -> ready and a load error (stubbed load and inference, no torch).
-- `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_download.py`, `test_lease_protocol.py` (and the
-  `test_*.py` modules inside `flux2_klein/`): pure-Python
+- `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_download.py`, `test_lease_protocol.py`
+  (`flux2_klein/`'s and `flux3_klein/`'s tests run real torch on the CPU, see their readmes):
+  pure-Python
   unit tests (no torch, no diffusers, no weights, no GPU — fake `torch`/`diffusers`/`transformers`
   modules are injected into `sys.modules`, `test_flux2_download.py` fakes the repository listings and
   the `requests` module, and `test_lease_protocol.py` stubs each service's load and
@@ -82,21 +97,27 @@ Every service follows the same shape and is safe to copy from when adding a seve
 ## Contracts and invariants
 
 ### The lease protocol: a failed inference is not a failed load
-All six services take the lease BEFORE `self._lock` (`begin_model_use` can block while another
+Every small-pool service takes the lease BEFORE `self._lock` (FLUX.2 klein is a large-model manager
+handle instead: its sessions, see the FLUX.2 klein section) (`begin_model_use` can block while another
 thread's eviction callback waits for this service's lock; the reverse order deadlocks), and then run
 two distinct `try` scopes inside it:
 
 - **load scope** — `_ensure_*_locked(...)` only. A failure here, and only here, reports
   `lease.mark_load_failed()`.
 - **run scope** — everything after `lease.mark_loaded(...)`, which is called as soon as the load
-  returned. A failure here records `_last_error` and re-raises without touching the lease.
+  returned, still under `self._lock` and UNCONDITIONALLY (never gated on `lease.needs_load`): a
+  lease that found the key resident can see the model switched or unloaded by another request
+  before it reaches the lock, and the reload that follows must be registered too
+  (`runtime/MODULE_README.md`, STATE S-058). A failure here records `_last_error` and re-raises
+  without touching the lease.
 
-`mark_load_failed()` reaches `LoadedModelManager.abort_load`, which clears the entry's `resident`
+`mark_load_failed()` reaches `SmallModelManager.abort_load`, which clears the entry's `resident`
 flag and drops its unload callback. Calling it after the load already succeeded — while the service
 still holds the model in `_net`/`_model`/`_pipe` with `_active_key` set and its weights still occupy
 VRAM — makes the manager under-count residency and makes that model permanently non-evictable until
 the same key is used again. Wrapping load and inference in one `try` is therefore a defect, not a
-style choice; `test_lease_protocol.py` pins it for all six services at once.
+style choice; `test_lease_protocol.py` pins it for all seven services at once, together with the
+stale-lease reload (`StaleLeaseReloadTests`).
 
 `lease.release()` runs in `finally` in every path. One consequence to keep in mind: because a model
 that survived a failed inference now correctly counts toward `max_loaded_models`, a user cap of `1`
@@ -175,8 +196,11 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   `phase`/`step`/`total`/`label` and no preview blob. A retry wait is an ordinary `download` frame
   whose `label` is `engines.model_download.retry_progress_label` — no extra field. A failing
   progress callback is logged once per call and never aborts the download or the generation.
-- The pipeline is pinned to the DISCRETE GPU; `_select_discrete_device()` excludes the Ryzen iGPU and
-  falls back to CPU rather than using it.
+- The pipeline is pinned to the DISCRETE GPU; `_select_discrete_device()` delegates to
+  `runtime.torch_device.resolve_discrete_backend_device(..., honour_configured=False)` (the one owner
+  of the iGPU rule: `is_integrated`, name markers, exact AMD iGPU arch set), takes the discrete
+  device with the most memory, makes it current, and falls back to CPU rather than use an iGPU.
+  `General.ai_device` is ignored here by design.
 
 ### FLUX.2 klein
 - **The mask is a PERMISSION TO CHANGE, not a hole.** Every pixel outside it must come back
@@ -226,11 +250,11 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     lease, load and prompt encode (`attention.require_text_attention_target` on the wire mask —
     dilation only grows it); the planner's own refusal stays as a last-resort contract check.
   - The mask lives for the denoise only. diffusers keeps `pipe._attention_kwargs` after the call,
-    so `_generate_locked` clears it (and its own reference) in a `finally` around the pipeline
+    so `service._denoise` clears it (and its own reference) in a `finally` around the pipeline
     call: the mask never survives into the VAE decode (whose forecast excludes it), a failed
     denoise, or an idle resident pipeline.
   - The mask is in the transformer's dtype (SDPA wants an additive mask to match the queries),
-    on `self._device` (where `prompt_embeds` go in every placement), and is a `(S, S)` VIEW of a
+    on the transformer's compute device (where `prompt_embeds` go), and is a `(S, S)` VIEW of a
     buffer whose rows are padded to a multiple of 8: SDPA's memory-efficient kernel otherwise
     copies an unaligned mask on EVERY attention call (measured: 281 MB vs 136 MB extra peak at
     S = 8706). A mask also rules out the flash kernel; attention runs ~1.5x slower.
@@ -253,7 +277,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   element. The pipeline already conditions on the region itself, so the reference is the second
   condition image. It never enters `_composite_over_region` or the colour match; without one the
   pipeline call carries no `image_reference` key at all. The memory guard counts its condition
-  tokens in the denoise (`forecast_memory(with_reference=True)`: the region's token count again);
+  tokens in the denoise (the spec's denoise work: the region's token count again);
   `.estimate` has no reference input and forecasts a run without one, so the on-screen figure can
   sit below the guard's for a marked run by exactly that term.
 - **The region's border is a mask contour.** `_mask_distance_inside` pads the mask with a ring of
@@ -283,20 +307,21 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   anything else. An RGB/RGBA mask used to be converted by taking the alpha or the per-channel
   maximum, which silently promoted stray colored pixels to "edit this" — a client bug turning
   into an edit of the wrong area. There is no conversion path; the wire contract is the check.
-- **The transformer path is one contract for both input shapes.** `_load_transformer` forces
-  `guidance_embeds=False` and refuses fp8_scaled weights BEFORE it branches on file vs.
-  directory: klein has no `guidance_in` block whatever config a diffusers folder ships, and a
-  folder of fp8 shards must be refused on the header (`component_safetensors_shards` walks the
-  `*.index.json` weight map plus the `*.safetensors` glob) instead of failing multiple GiB into
-  `from_pretrained`.
+- **The transformer path is one contract for both input shapes.** A single `.safetensors` FILE
+  (BFL or diffusers layout) or a diffusers FOLDER (its shards, `component_safetensors_shards`) are
+  inventoried and loaded by the large-model manager the same way; `large_model.require_loadable`
+  refuses an fp8_scaled checkpoint (header, sharded folders included) and a
+  `model.diffusion_model.`-prefixed one BEFORE anything is admitted, and the skeleton is built from
+  the checkpoint's own config with `guidance_embeds=False` forced (klein has no `guidance_in`).
 - **A single-file transformer REQUIRES its own `config.json` on disk, and there is no substitute
   for it.** diffusers 0.39 recognizes every FLUX.2 checkpoint as `flux-2-dev`
   (`single_file_utils.py`, `CHECKPOINT_KEY_NAMES["flux2"]`) and, given no `config`, resolves the
   gated `black-forest-labs/FLUX.2-dev` repo over the network — the config of a DIFFERENT model.
-  `_load_transformer` therefore searches `<checkpoint dir>/transformer`, `<checkpoint dir>`,
+  `large_model.transformer_config_dir` therefore searches `<checkpoint dir>/transformer`, `<checkpoint dir>`,
   `<parent>/transformer`, `<parent>` (`find_transformer_config_dir`, order shared with the error
-  message through `component_probe_order`), passes the directory it finds as `config=` and adds
-  `local_files_only=True`; when it finds none it raises naming the exact file to provide. Two
+  message through `component_probe_order`); the skeleton is built from the
+  directory it finds (`local_files_only=True`); when it finds none the run is refused naming the
+  exact file to provide. Two
   things must not be "fixed" here:
   - **Do not reconstruct the config from the checkpoint.** Most parameters do follow from tensor
     shapes (`num_layers`, `num_single_layers`, `in_channels`, `joint_attention_dim`,
@@ -310,34 +335,15 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   `validate_transformer_config_dir` additionally refuses a discovered `config.json` whose
   `_class_name` is not `Flux2Transformer2DModel`, because the search also probes the checkpoint's
   own directory, where a VAE or text-encoder config could otherwise be picked up.
-- **A single-file transformer is read ONE TENSOR AT A TIME when it can be, and that decision is
-  made and LOGGED by the caller.** `from_single_file` materializes the WHOLE checkpoint in host
-  memory before anything reaches the accelerator (`load_single_file_checkpoint` calls
-  `load_state_dict()` on the entire file), so a ~17 GiB klein checkpoint costs ~17 GiB of host RAM
-  it does not need. `flux2_klein/streaming.py` builds the model skeleton on `meta` and fills it
-  tensor by tensor instead, leaving one tensor live at a time; a sibling project measured the peak
-  dropping from 17.7 GiB to 1.55 GiB on a 16.9 GiB checkpoint. Four preconditions, all four checked
-  by `streaming_load_eligible` and none of them assumed: one `.safetensors` FILE (not a directory,
-  not one shard of a set), `low_cpu_mem_usage=True`, a whole-model `device_map` (i.e. a non-offload
-  placement), and a CUDA/ROCm target — the last being about WORTH, since streaming a CPU-resident
-  model from a CPU-read file buys nothing.
-  - **The module contains no fallback on purpose.** `pipeline._load_transformer` asks the predicate
-    first, and on `False` logs the Russian reason it returned before calling `from_single_file`.
-    A silent fallback would make the difference between a 1.5 GiB and a 17 GiB host peak invisible
-    in the log of a machine that was just OOM-killed.
-  - **It weakens neither placement guarantee.** `_apply_placement` still moves the components
-    unconditionally and `_require_components_materialized` still runs afterwards; a streamed model
-    is verified like any other (see "Placement never trusts the loader kwargs"). It also runs
-    OUTSIDE `patched_module_to()`: measured on this host a `torch.frombuffer` tensor reports
-    `tensor_needs_staging() == False`, the patch hooks `nn.Module.to` which this path never calls,
-    and that patch's contract forbids file I/O inside the block.
-  - **The read drives a SECOND progress level, not a new step.** `LOAD_STEP_TRANSFORMER` /
-    `LOAD_PHASE_STEPS` are unchanged — they are a wire contract shared with the Rust client — and
-    the bytes travel in the already-existing optional `file_step` / `file_total` / `file_label`
-    fields of the same frame, which the client parses phase-agnostically and draws as a second bar.
-    `file_label` is the CHECKPOINT FILE's name; the loader's per-tensor key is dropped, because the
-    client renders that label beside a GiB figure. Reports are rate-limited to 2 s inside
-    `streaming.py` and always fire on the last tensor.
+- **Every component is read ONE TENSOR AT A TIME, straight into its tier.** The large-model
+  manager's loader (`runtime.large_models.loader`, over the one filler
+  `runtime.safetensors_stream.fill_module_from_safetensors`) builds each component on `meta` and
+  fills it per its plan: device units on the device, parked units in packed host buffers, disk units
+  not at all; the host peak is one tensor. diffusers' `from_single_file` / `from_pretrained` are not
+  used any more (the old streaming loader and its eligibility rule are gone). The BFL -> diffusers
+  key rule is `conversion.py` (diffusers' own per-key converter), applied per tensor. A single-file
+  transformer reports its bytes as the wire's SECOND progress level (`file_step` / `file_total` /
+  `file_label` = the FILE name) inside `LOAD_STEP_TRANSFORMER`; a folder reports steps only.
 - **The text encoder and the transformer must be the SAME variant, and that is checked before any
   weight is read** (`require_encoder_transformer_compatible`, `components.py`). The pipeline
   concatenates the encoder's hidden states at layers `(9, 18, 27)`
@@ -350,22 +356,14 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   derived from the tuple rather than written out a second time. Nothing else compares the two — a 4B transformer beside a 9B encoder
   passes every component check, passes the memory guard, and dies as a bare torch matmul error
   inside the denoise, ~34 GB into the read. The guard reads the two `config.json` files only and
-  fires from `inpaint_image_bytes` (before `_require_headroom_locked`, hence before
-  `_ensure_pipeline_locked`) and from `_load_pipeline_action_locked` (the other route that reads
-  the 18 GB transformer). It is deliberately SILENT when it cannot PROVE a mismatch — an empty
+  fires from `inpaint_image_bytes` and from the transformer/VAE `load` action, before any session is
+  admitted. It is deliberately SILENT when it cannot PROVE a mismatch — an empty
   path, a component not on disk, a config without the field — because each of those is a
   different fault with a better diagnosis further down; adding a "missing config" error here
   would replace those messages with a worse one.
-- **A failed transformer restore invalidates the pipeline.** Moving the parked 9B transformer
-  back onto the device is itself a full host->device copy that can OOM. That failure never
-  reaches the caller — it must mask neither a decode that succeeded nor one that failed for a
-  better reason — so `_decode_locked` logs it (with the decode error still in the exception
-  chain) and calls `_invalidate_pipeline_locked`: `_pipe`/`_active_key` are cleared and the key
-  is reported to the model manager, because a cache hit skips placement and would otherwise run
-  a pipeline whose transformer sits on the host.
 - **Cancellation happens at call boundaries only.** The handler checks `cancel_event` before it
   calls the service and after the service returns; a running diffusion step is not interrupted.
-  This is the shared contract of all six inpaint services (`ipc/handlers/sdxl.py`,
+  This is the shared contract of all six wired inpaint services (`ipc/handlers/sdxl.py`,
   `ipc/handlers/flux_fill.py` do exactly the same) — do not make this one the exception.
 - **The service itself downloads nothing.** The user supplies three paths (Qwen3 text encoder,
   transformer, VAE); the pipeline needs five components, so the tokenizer and the scheduler are
@@ -381,137 +379,49 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   a user-facing error. A file whose directory holds a `config.json` is therefore normalized to that
   directory; a file without that sibling is left alone so the caller still diagnoses it. This is a
   path normalization, not a fallback: the folder containing the file IS the component, and its
-  `config.json` describes that very file. The transformer is exempt — it has a real single-file
-  loader, so a file path there means a file.
+  `config.json` describes that very file. The transformer is exempt — the manager reads a single
+  file directly, so a file path there means a file.
 - **The region is validated, never fixed up** (`validate_region_size`): sides a multiple of 16 and
   at least 128 px, area at most 1 MP, aspect ratio at most 8:1. The pipeline would otherwise resize
   above 1 MP and crop to a multiple of 16, returning a window of a different size than the mask.
-- **The standalone decode owns two things `pipeline.__call__` would have given it for free.**
-  Pulling the VAE decode out of the pipeline means it is no longer under diffusers'
-  `@torch.no_grad()` and no longer gets the pipeline's device bookkeeping, and both bit us on real
-  weights:
-  - `_decode_once` (and `_encode_prompt_phase`) open `torch.no_grad()` themselves. Without it the
-    VAE builds an autograd graph and `image_processor.postprocess` dies on *"Can't call numpy() on
-    Tensor that requires grad"*.
-  - `_vae_input_device` decides where the latents go. With NO accelerate hook it is the VAE's own
-    device — never `_execution_device`, because `unload_transformer_before_vae` may have parked the
-    transformer on the host by then and the probe would answer `cpu`. UNDER a hook
-    (`model_cpu_offload`, `sequential_cpu_offload`) it is `_execution_device`, because diffusers'
-    `@apply_forward_hook` calls `pre_forward(self)` WITHOUT the arguments: the hook moves the
-    weights to the accelerator and leaves the latents behind (`cpu` under model offload, `meta`
-    under sequential).
-- **Denoise and decode are two steps.** The pipeline is called with `output_type="latent"` (which
-  already returns unpacked, batch-norm-denormalized latents) and the VAE decode runs separately, so
-  the transformer can be parked on the host first — its residency plus the decode peak is the most
-  common OOM here. An OOM in the decode is recovered from without repeating the denoise: a host copy
-  of the latents is kept and each rung retries from it. The settings actually in force come back to
-  Rust as `applied` so the next run starts on the cheap path.
-  - **The ladder has three rungs, and two of them used to be one lie.** (1) park the transformer;
-    (2) enable VAE tiling — but ONLY when tiling can actually engage for these latents; (3) shrink
-    the VAE's tile so that it can. `enable_tiling()` moves no threshold: `AutoencoderKLFlux2._decode`
-    takes the tiled branch only when a LATENT side exceeds `tile_latent_min_size`, which on the
-    shipped klein VAE (`sample_size: 1024`, four `block_out_channels`) means **above 1024 output
-    px** — and since `MAX_REGION_PIXELS` caps the area at 1 MP, NO SQUARE REGION can ever reach it.
-    Tiling is therefore genuinely useful for an elongated region (1200x800 is legal, the extreme is
-    ~368x2848) and genuinely inert for the near-square majority. Rung 2 asks
-    `pipeline._vae_tiling_engages` before it claims anything, because `applied` is written into the
-    user's settings file and read back by the memory guard.
-  - **Rung 3 changes TWO thresholds or none.** `tiled_decode` slices the latents by
-    `tile_latent_min_size` and blends/crops the decoded tiles by `tile_sample_min_size`, and its
-    arithmetic assumes `tile_sample_min_size == tile_latent_min_size * 2 ** (len(block_out_channels)
-    - 1)`. A sibling project lowered only the latent one and got a 1024x1024 image rebuilt as a
-    mosaic of nine shifted copies with visible seams. `pipeline._lowered_vae_tile_thresholds` moves
-    both, and a VAE whose config cannot give the scale factor is left alone instead.
-  - **Rung 3 is a per-decode emergency, not a setting.** Both thresholds are restored in a `finally`
-    so nothing leaks into the next request, the warm-up or a cached pipeline, and no threshold ever
-    appears in `applied`, which carries the five persisted memory flags and nothing else. A tiled
-    decode is a BLENDED reconstruction, so the image is not bit-identical to an untiled one; that is
-    acceptable here only because `oom_recovered` already tells the caller a retry happened.
-  - **`vae_slicing` is not a rung and never was one that worked.** `decode` slices only when
-    `z.shape[0] > 1` and this service always decodes a batch of one, so enabling it cannot save a
-    byte. It stays on the wire because the Rust `MemoryPreset` values and `Flux2KleinSettings`
-    mirror it; see `dev-docs/known_gaps.md`, KG-008, for the removal condition.
-  - When every rung is exhausted the refusal names what was actually tried and, when tiling could
-    not engage, says so with the numbers — a message telling the user to enable a tiling flag that
-    is already on and cannot help is worse than none.
-- **A run is TWO PHASES, and their ORDER is a memory contract, not an optimization.** The text
-  encoder is needed for exactly one forward pass per prompt: the four denoising steps and the VAE
-  decode never look at it. Holding 8B of Qwen3 resident next to the 9B transformer is what made
-  every profile cost ~32 GiB — more than the 31.9 GiB this project's reference card reports free,
-  so `full_gpu` could not work at all, and more than the host had free, so the load once got the
-  user's editor killed by the OOM killer. Therefore:
-  - **phase 1** (`_ensure_pipeline_locked`) builds the pipeline with `text_encoder=None` and
-    places the transformer + VAE. `Flux2KleinInpaintPipeline` accepts the `None`: `pipe.components`
-    validates only the KEY set, `device` / `_execution_device` skip non-modules, and `encode_prompt`
-    is never reached because `prompt_embeds` is supplied.
-  - **the warm-up** (`_warmup_pipeline_locked`) then makes "placed" mean "materialized": it refuses
-    a component still on the host or on `meta` (`_require_components_materialized`), runs one 64x64
-    VAE decode (`_warmup_vae_decode`) to retire the copies and prime the allocator / MIOpen, and
-    synchronizes. It is a `phase:"load"` step and deliberately never a `generate` one. Skipped
-    under the two accelerate offload placements, where the weights are SUPPOSED to stay in host
-    memory between forwards.
-  - **The warm-up is owed ONCE PER PLACEMENT of the weights, not once per request.** Everything it
-    establishes is a fact about a placement, so a request that cache-hits a pipeline nothing has
-    moved skips it entirely — `_warmup_pipeline_if_needed_locked` is the guarded form the generation
-    path and the `load` action use, and `self._pipeline_warmed` is the flag. Running it per request
-    cost a parameter walk over the whole 9B transformer, a real VAE decode and an allocator flush on
-    every hot run, and announced «Прогрев модели» to a user whose model had been resident for an
-    hour. The flag is cleared by EVERY path that moves weights, and that list is a correctness
-    obligation — a move that forgets to clear it lets the next run skip a check it needed and fail
-    inside the VAE with the device mismatch `_require_components_materialized` exists to pre-empt:
-    the rebuild branch of `_ensure_pipeline_locked`; `_unload_pipeline_locked` (hence `unload()` and
-    the `_unload_key` eviction) and `_invalidate_pipeline_locked`; the transformer park, both via the
-    `to_ram` action and via `_decode_locked`'s `unload_transformer_before_vae` path; and the restore
-    back onto the device, both via `to_gpu` and via `_decode_locked`'s `finally` — a SUCCESSFUL
-    restore leaves the pipeline cold, because its copy is queued exactly like a placement's. Only a
-    warm-up sets the flag. The consequence is deliberate: `unload_transformer_before_vae` (the
-    default in every placement but `full_gpu`) parks the transformer on every run, so under it every
-    run still owes a warm-up; `full_gpu` is where a hot pipeline stays hot. The user-pressed `warmup`
-    component action deliberately calls the UNGUARDED `_warmup_pipeline_locked`: a button that
-    decided for itself not to act would be a lie about what happened.
-  - **phase 2** (`_prompt_embeds_locked` → `_encode_prompts_locked` → `_encode_prompt_phase`) loads
-    the encoder, encodes the prompt (and the empty negative prompt when the EFFECTIVE guidance
-    scale exceeds 1 — `_effective_guidance_scale`, never the raw request) into a few MB of
-    embeddings, and by default keeps it.
-  - **The encoder is loaded as a TRUNCATED `Qwen3Model`, never as `Qwen3ForCausalLM`.** The
-    pipeline reads `output.hidden_states` and nothing else, so the causal head would compute a
-    `[1, 512, 151936]` logits tensor per prompt — ~400 GFLOP and ~155 MiB — on the HOST CPU, where
-    the user waits for it, and throw it away. For the same reason every decoder layer above the
-    last one the pipeline asks for is never built: `components.ENCODER_KEEP_LAYERS` is
-    `max(TEXT_ENCODER_OUT_LAYER_INDICES) + 1` and `text_encoder_truncation_kwargs` reads the
-    encoder's own `config.json` to decide what to pass. Three things about that are contracts:
-    - **The `+ 1` is exact.** `hidden_states[n]` for `n == num_hidden_layers` is the `model.norm`-ed
-      output, not a raw layer output, so one layer fewer silently corrupts the last requested state.
-      Measured, and defended by a real-torch test in `test_components.py`.
-    - **Truncation does not invalidate a saved embedding.** The states at `(9, 18, 27)` are
-      bit-identical between the full and the truncated model, which is why the `.msprompt` library
-      and the fingerprint say nothing about it.
-    - **The count and `layer_types` travel together.** transformers 4.57 validates
-      `num_hidden_layers` against `len(config.layer_types)`, so overriding only the count raises;
-      the shipped list is sliced, never invented. An encoder with FEWER layers than the pipeline
-      reads is REFUSED naming the file, the count and the minimum — it is never clamped — and a
-      config with no `num_hidden_layers` at all is loaded whole, with the reason logged.
-  - **The encoder's dtype is always bfloat16** (`params.text_encoder_dtype_name`), whatever `dtype`
-    the request carries. It runs on the host, where x86 has no native float16 arithmetic — a
-    sibling project measured 59 s against 2.4 s per encode on a Zen host for exactly this pair —
-    and bfloat16 is what the shipped checkpoints declare anyway. `dtype` keeps governing the
-    transformer and the VAE, which run on the accelerator, so `float16` stays a valid request value.
-    Everything that describes the EMBEDDING rather than the run records the encoder's dtype:
-    `_encoder_key`, `_prompt_cache_key` and the `.msprompt` metadata. The consequence is deliberate
-    and visible: a `.msprompt` saved while the service still ran the encoder at float16 is refused
-    on load, because its embedding really did come from a different encoder precision, and the
-    refusal says to rebuild the entry.
-  - **Why the encoder comes SECOND.** In the reverse order — the one this replaced — the encoder's
-    16 GB host peak and the transformer's 18 GB host peak were both host peaks, so keeping the
-    encoder meant `max` became a sum (~34.7 GiB) and only `unload_text_encoder_after_encode=True`
-    made a run fit. Loading the pipeline first moves 18 GB to the accelerator BEFORE the encoder is
-    read, so the encoder arrives into a host that is free and can stay there. The peak is
-    `max(encoder-in-host, transformer + VAE-on-card)` on two different resources instead of one.
-  - **The encoder therefore encodes in HOST memory in every placement**, `full_gpu` included. It
-    used to go on the accelerator there, which was safe only while it ran before the transformer
-    existed; now the transformer is already resident and 18.3 + 16.4 GB does not fit on a 34.2 GB
-    card. Anything that puts the encoder back onto the device, or back into the resident pipeline,
-    undoes this.
+- **A run is TWO HANDLES of the large-model manager, admitted in this ORDER** (a memory contract):
+  the PIPELINE handle (`transformer` + `vae`, phases `denoise` / `decode`) is admitted, loaded and
+  placed into its denoise state FIRST; the TEXT ENCODER handle (Qwen3, phase `encode`) is admitted
+  second, so it plans on what the pipeline's reservation left — on the GPU when the step pair and
+  the free device memory allow it beside the pipeline, else juggled, else on the CPU from RAM (the
+  encoder alternatives of `tiers.template_for`). It is admitted under a device ceiling
+  (`device_cap_bytes`): the combined device peak of the nearest fitting HIGHER «Видеопамять» step
+  minus this step's pipeline weights, so a lower step never forecasts or uses more device memory
+  than a higher one for the two handles together (without it, a step whose pipeline reserves less
+  would hand the encoder more room; `flux2_klein/memory.py` module notes). It encodes what the prompt cache misses into a few
+  MB of embeddings and goes to its between-runs state; then the denoise and the decode run as
+  manager phases. Sessions are acquired under the service lock, pipeline before encoder — the
+  stated exception of the manager's "acquire before the service lock" rule for a multi-handle
+  service with no small-pool lease (why it is deadlock-free: the `service.py` header; pinned by
+  `flux2_klein/test_service.py::LockOrderTests`). The encoder being its own handle is what lets a prompt-cache build touch
+  the encoder alone and a run with a cached prompt need no encoder installed.
+- **The warm-up belongs to a COLD load.** When the pipeline handle held no byte at the start of the
+  run (first run, after an unload or an eviction, after steps that drop everything between runs), steps 1-6
+  are reported (transformer, tokenizer, VAE, scheduler, placement = the transition into the denoise
+  state, warm-up = one 64x64 VAE decode that primes the allocator and MIOpen). A hot run reports
+  steps 0 and 9 only; whatever the manager parked between runs is restored when the denoise phase
+  starts. The manager's loader and moves are synchronous, so "placed" is "materialized".
+- **Denoise and decode are two manager phases.** The pipeline is called with `output_type="latent"`
+  and the latents are kept on the host, so a decode retry never repeats the denoise. A memory failure
+  in a phase is the manager's (`Session.run_phase`): rung 0 reclaims idle holdings of other pools,
+  then the degrade ladder re-plans. **The ladder's own order: (1) the tiling
+  fallback (`large_model.FALLBACK_VAE_TILING`; tiling engages only above the VAE's threshold, 1024
+  output px on the shipped VAE), (2) the lowered tile (`FALLBACK_VAE_TILE_LOWERED`: both thresholds
+  together to 64 latent cells / 512 px for that decode, restored afterwards), (3) the next «Видеопамять»
+  step (same RAM step), whose decode keeps the transformer off the device** — so the transformer
+  is parked only after both tiling rungs failed. At most `degrade.MAX_RETRIES` (3) retries per run (rung 0 included); then the
+  run fails with `LargeModelRunFailed`. `applied.vae_tiling` claims tiling only where it engaged;
+  thresholds never appear in `applied`; `applied.unload_transformer_before_vae` says whether the
+  transformer was off the device during the decode of the plan that ran. `vae_slicing` stays inert
+  (KG-008, reported back as requested).
+  - The decode owns `torch.no_grad()` (it is not inside `pipeline.__call__`) and decodes on the
+    VAE's own device; `_require_execution_device` checks the denoise call computes where the
+    transformer was placed.
 - **The prompt-embedding cache is always on** (`_prompt_cache`, LRU, `PROMPT_EMBED_CACHE_ENTRIES`).
   It is keyed by encoder path + text + `max_sequence_length` + the ENCODER's dtype (always
   bfloat16, `text_encoder_dtype_name`, never the request's `dtype`) + fp8 — not by placement, since
@@ -557,7 +467,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
       encoder: the entry it writes must name the encoder that produced it.
     - **`status`** reports `text_encoder_available` beside `available`; `available` is not false
       merely because the encoder is missing when `prompt_cached` is true. Only the ENCODER is
-      waived that way: the Qwen tokenizer is a real pipeline component (`_ensure_pipeline_locked`
+      waived that way: the Qwen tokenizer is a real pipeline component (`service._pipeline_for`
       builds the pipeline with one and `_require_component_dir` raises without it), so it stays
       required in every case — measured on the reference host, where the encoder-less run still
       emitted the "Загрузка токенизатора" load step.
@@ -594,121 +504,101 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     `overwrite` was passed, because rebuilding a lost entry costs the encoder read it was saved
     to avoid. Every write is atomic (`publish_bytes_atomically`: `<name>.<pid>.part` +
     `fsync` + `os.replace`), the same recipe as `../engines/model_download.py`.
-  - **A `build` loads ONLY the encoder, and the guard knows it.** `forecast_memory` grows one
-    phase, `encode_standalone` (no pipeline on the card, no pipeline in the host), which is the
-    only phase `_require_encode_headroom_locked` checks. Its VRAM is 0 and its RAM never exceeds
-    the `encode` phase's, so adding it cannot move `estimate`, `vram_bytes`/`ram_bytes` or
-    `_preset_advice` — there is still exactly ONE forecast.
-  - `build` releases the encoder afterwards (that is the point of the button), EXCEPT when one
-    was already resident under the same key when the call arrived — that one belongs to the
-    previous run and the user's own `unload_text_encoder_after_encode` decides its fate.
+  - **A `build` admits ONLY the encoder handle**; its admission is the guard (the
+    `encode_standalone` row of `.estimate` is that handle's forecast alone).
+  - `build` releases the encoder afterwards (that is the point of the button), EXCEPT when its
+    handle already held bytes when the call arrived — that one belongs to the previous run and the
+    steps / `unload_text_encoder_after_encode` decide its fate.
   - A corrupt or foreign file in a family directory does not break `list`: it is reported in
     `skipped` with its reason. Users can and do drop files there by hand.
-- **`unload_text_encoder_after_encode`** (default: `False` in EVERY placement) keeps the encoder
-  between runs for instant prompt changes. The default flipped with the load reorder: the encoder
-  now arrives after the transformer has left host memory, so keeping it costs RAM that nothing else
-  in the run wants back, while dropping it costs a full 16 GB re-read on the next cache miss. When
-  it is off, the encoder IS resident, so it joins `_model_key` — the key must never claim less than
-  what the service holds. **The default is duplicated on the Rust side** (`MemoryPreset::values` and
-  `Flux2KleinSettings` in `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/settings.rs`); changing one side alone makes
-  the UI and the backend disagree about what a preset means.
-  - The one combination the reorder does NOT make cheaper is a resident encoder together with
-    `unload_transformer_before_vae`: parking the 9B transformer for the decode copies it back into
-    host memory, where the kept encoder already sits, and those two genuinely coexist (~34.5 GiB).
-    `forecast_memory` sums them for the `decode` phase, and `_preset_advice` offers the encoder
-    unload as its own lever precisely for that case.
-- **`text_encoder_fp8`** (default `False` everywhere, presets included) is weight-only fp8 for the
-  encoder's linear layers, done with torch alone (`_quantize_text_encoder_fp8`; torchao,
-  bitsandbytes and quanto are not installed and none was added). Per-output-row scales, dequantized
-  to the compute dtype in `forward`; measured relative max error ~3.4% per weight tensor on gfx1201
-  / torch 2.12.0+rocm7.2. **It does not lower the load peak** — the bf16 weights must exist before
-  they can be quantized — so it only pays off together with
-  `unload_text_encoder_after_encode=False`. A torch build without `float8_e4m3fn` raises; the flag
-  is never silently ignored. The "bytes saved" it reports is now TRUE: the walk used to include the
-  TIED `lm_head`, whose bf16 storage stayed alive through `embed_tokens`, so quantizing it freed
-  nothing, ADDED the fp8 copy plus its scales and counted the whole tensor as saved. `Qwen3Model`
-  has no such layer, which is why there is no tied-weight special case here and must not become
-  one.
-- **`placement` is an enum, not a boolean**: `full_gpu`, `encoder_cpu`, `model_cpu_offload`,
-  `sequential_cpu_offload`. Since the load reorder it governs ONE thing: how the transformer + VAE
-  are placed. It no longer decides where the prompt is encoded — that is always host memory now,
-  because the transformer is already on the card by then.
-- **Placement never trusts the loader kwargs.** `_apply_placement` moves the GPU-resident components
-  unconditionally, even when they were asked to load straight onto the device: `nn.Module.to` is a
-  no-op for a tensor already there, and a loader that silently ignores a placement kwarg must not be
-  able to leave a component behind. diffusers 0.39's `from_single_file` is exactly such a loader — it
-  accepts `device_map`, discards it, and honours only its own `device` kwarg (`_single_file_device`
-  does the translation) — which is how a single-file transformer used to stay in host RAM under
-  «Минимум RAM» while the VAE was on the GPU, making `_execution_device` answer `cpu` and killing the
-  run inside the VAE's first `conv2d`. Before the pipeline is called under `encoder_cpu`,
-  `_require_execution_device` checks the probe against the placement TARGET (the service's
-  `_device`, not a component's own device) and raises a named error instead of letting torch fail.
-- The Qwen3 encoder is the one **transformers** loader here, so it takes `dtype=`; the diffusers
-  loaders take `torch_dtype=` and nothing else. Do not unify the two spellings.
-- **The load is GATED on free memory, per phase** (`_require_memory_headroom`, called from
-  `_require_headroom_locked` before anything is read). A host-side shortfall is not an exception:
-  the kernel OOM killer picks a victim among everything running, and it has already closed a user's
-  editor with unsaved work. The forecast is `forecast_memory` — the SAME function `estimate` reports
-  to the UI, because a guard that disagrees with the number on screen is worse than no guard — and
-  each phase is checked separately, since they run in sequence. Only phases that will actually load
-  something are checked: a cached prompt skips `encode`, a resident pipeline skips
-  `denoise`/`decode`. Reserves (`HOST_MEMORY_RESERVE_BYTES` 2 GiB, `DEVICE_MEMORY_RESERVE_BYTES`
-  512 MiB) exist because occupying the last byte is what makes the OOM killer fire before our own
-  exception can. A free-memory figure of `0` means UNKNOWN (no psutil, no accelerator) and never
-  refuses a run.
-  - **The forecast's encoder figure is a RESIDENT size, and it deliberately disagrees with the one
-    on screen.** `status.components[*].size_bytes` is a DISK size (`components._weight_bytes`) — the
-    client renders it as a file size and it must keep matching what the filesystem says. The
-    forecast needs what will exist in RAM, and the encoder is loaded truncated, so it asks
-    `components.text_encoder_resident_bytes`, which walks the safetensors headers and skips
-    `lm_head.*` and every `model.layers.<i>` at or above `ENCODER_KEEP_LAYERS` (20.1% of the
-    shipped 4B encoder's 7.492 GiB of tensors). The two figures are therefore different numbers for
-    the same component, on purpose; neither may be expressed in terms of the other, and a shard
-    whose header cannot be parsed counts in FULL, because rounding a memory need DOWN is the one
-    error that ends in an OOM kill.
-  - **A `low_cpu_mem_usage` the loader ignores is not a saving either.** The pipeline's transient
-    HOST term used to be `0 if low_cpu_mem_usage else transformer + vae`, which is FALSE for a
-    single-file transformer: `from_single_file` reads the whole checkpoint into host memory
-    whatever the flag says, so the guard under-forecast ~17 GiB on exactly the path most likely to
-    get the user's editor OOM-killed. `memory._transformer_avoids_the_host` now answers the real
-    question — a diffusers FOLDER goes through accelerate's `device_map` path and really is
-    host-free, a single FILE is host-free only when the streaming loader takes it — and the term is
-    `0`, `transformer_bytes` or `transformer + vae` accordingly. It is still ONE forecast:
-    `estimate` and the guard read the same function. The forecast runs before any device exists, so
-    the one precondition it cannot read from the request (the accelerator target) is ASSUMED, which
-    is the same assumption the surrounding branch already makes — that the weights end up on the
-    card. Everything else it cannot prove yields the EXPENSIVE answer, for the reason stated just
-    below: over-reserving refuses a run that might have fitted, under-reserving invites the OOM
-    killer, and only the second is unrecoverable.
-  - **`text_attention_in_mask` costs a quadratic term, and only while it is in force.** The
-    denoise phase's device figure adds `attention.text_attention_mask_bytes(L, N, R, dtype)` —
-    `S` rows of `S` padded to 8, `S = max_sequence_length + 2N + R` with the region's clean copy
-    counted — the same formula the run allocates by, so `estimate`, the guard and the allocation
-    are still one arithmetic. Normalization forces the flag off under `whole_region`, so the term
-    is zero exactly when no mask will exist; while it is non-zero `breakdown.attention_mask`
-    reports it on its own.
-  - **A saving that cannot happen is not forecast.** The decode's per-pixel constant is the cheap
-    (tiled) one only when `vae_tiling` is set AND the region reaches
-    `components.vae_tile_threshold_pixels` — the threshold read from the VAE's own `config.json`,
-    never a literal here. `vae_tiling` DEFAULTS to `True`, so the old flag-only predicate
-    (`vae_tiling or vae_slicing`) under-forecast the decode of every region up to 1024 px by a
-    factor of four, in a guard whose whole purpose is to fire before the OOM killer does. A config
-    that cannot be read yields a threshold no region can reach — i.e. the EXPENSIVE answer — for the
-    same reason `text_encoder_resident_bytes` rounds up: over-reserving refuses a run that might
-    have fitted, under-reserving invites the OOM killer, and only the second is unrecoverable.
-    `vae_slicing` is not part of the predicate at all (KG-008).
-  - **What the service already HOLDS is discounted, and that is not optional.** `forecast_memory`
-    answers for a run starting from nothing, which is what `estimate` must show; the guard runs
-    against a machine where the placed pipeline and the kept encoder are already allocated and
-    therefore already missing from the free figures. `forecast_memory` publishes those two costs
-    as `resident` (`pipeline_device` / `text_encoder_host`) and `_require_memory_headroom`
-    subtracts whichever `_require_headroom_locked` reports as held — so there is still exactly one
-    calculation, and the numbers in the refusal are the ones that were compared. Measured on the
-    reference host the first time a second prompt reached a resident pipeline: the guard demanded
-    17.6 GiB of VRAM that the very pipeline it was about to reuse was occupying, and refused a run
-    whose memory was already in place. The refusal message names the short resource, the phase, the numbers, and the
-  settings that DO fit right now — computed from `_MEMORY_PRESETS`, which must stay in sync with
-  `MemoryPreset::values` in `crates/ms-tab-cleaning/src/tools/ai_editor/engines/flux2_klein/settings.rs`.
+- **Resources are the large-model manager's** (`runtime/large_models/MODULE_README.md`): where every
+  byte of both handles lives in every phase, the forecast, the admission guard (no host OOM, device
+  never above `total - reserve`), the degrade ladder and the between-runs state. FLUX.2 contributes
+  only its specs (`large_model.py`). The calibration tables measure the `flux2_klein` phases per
+  device class (`../runtime/large_models/calibration/`, fitted by `tools/large_model_calibration/`),
+  so those forecasts are `calibrated: true` and their activations bind the admission. A phase
+  without a measured entry (a borrowed table of an unknown device class) is `calibrated: false`:
+  its activations choose the plan, the admission is checked on the exact weight bytes and strictly
+  on the host side, and a device OOM is the ladder's (`planner` module contract).
+- **Stage-1 wire adapter (`memory.py`)**: the request's step pair (`memory.requested_steps`) is
+  `params.vram_step` / `params.ram_step` (`tiers.VramStep` / `RamStep` ids, `auto` included) when
+  either is sent — the absent axis is then «Авто»; else the LEGACY `params.profile` id
+  (`memory.LEGACY_PROFILE_STEPS`: `max_speed` / `fast` -> (MAX, KEEP), `balanced` -> (PHASE, KEEP),
+  `economy` -> (HALF, RUN), `max_economy` -> (MIN, MIN), `auto` -> (AUTO, AUTO)); else the LEGACY
+  `placement` flags still accepted on the wire — and that table is the stage-2 migration of the
+  persisted settings:
+
+  | `placement` | flags | steps (VRAM, RAM) |
+  |---|---|---|
+  | `full_gpu` | any | (MAX, KEEP) |
+  | `encoder_cpu` | `unload_transformer_before_vae=False` | (MAX, KEEP) |
+  | `encoder_cpu` | `unload_transformer_before_vae=True` (its default) | (PHASE, KEEP) |
+  | `model_cpu_offload` | any | (PHASE, KEEP) |
+  | `sequential_cpu_offload` | any | (MIN, KEEP) |
+  | otherwise | | (AUTO, AUTO) |
+
+  **The legacy wire pins the text encoder to the CPU** (`memory.encoder_cpu_pinned`): every
+  `placement` encoded on the host before the manager, so a request that sends neither `vram_step`
+  nor `ram_step` plans its encoder under the CPU-only spec (`flux2_klein_text_encoder.cpu` /
+  `.fp8.cpu`, `large_model.encoder_spec(cpu_only=True)`). Without it the default `full_gpu` ->
+  (MAX, KEEP) would put the 9B encoder on the card and KEEP it there (measured: 28.6 GiB reserved
+  instead of ~18.5, no speed gain). The one exception is the legacy `profile` `max_economy`
+  (RAM MIN): that step offers the encoder no CPU placement (`tiers.template_for`), so it stays
+  unpinned. With `vram_step` / `ram_step` sent, the encoder may compute on the GPU under MAX /
+  PHASE; the two specs' handles never share a key, so switching between the wires reloads it.
+
+  `low_cpu_mem_usage` changes nothing any more (every load streams); `vae_tiling` is the decode's
+  request; `unload_text_encoder_after_encode` drops the encoder handle after the encode;
+  `text_encoder_fp8` selects the fp8 encoder spec. The accelerate offload modes are gone (B1: the
+  manager's per-block hooks juggle the DiT instead). `inpaint.flux2_klein.estimate` answers from the
+  manager's forecast (`memory.forecast_memory`: pipeline planned first, encoder on what is left,
+  under the same CPU pin a run would use, against the free memory of the run device; `fits` =
+  both plan, `true` when the free memory is unknown) in the stage-1 shape plus the six step keys (`memory.STEP_FIELD_KEYS`) and
+  `calibrated`. A run's answer adds the same six keys, `degraded`, `degrade_reason` at the top
+  level (`applied` keeps exactly its five flags). The six keys: `vram_step`, `ram_step` (requested),
+  `vram_step_effective`, `ram_step_effective` (what ran), and `profile` / `profile_effective`, the
+  legacy name of the VRAM step (MAX `max_speed`, PHASE `balanced`, HALF `economy`, MIN
+  `max_economy`, AUTO `auto`; the RAM step is not in the name). `status.memory` stays the stage-1
+  snapshot. The adapter of `large_models.profiles` is `large_model_name(params)` (the dtype's
+  registered pipeline model) plus `large_model_inputs(params)` (options, device) — the
+  single-handle fallback — and `large_model_profiles(params, shape, format=, steps=)`, which the
+  handler prefers: the pipeline planned alone, the encoder planned (unpinned: the pickers are the
+  two-axis settings) with that plan's reservation claimed, then the pipeline planned again with the
+  encoder's reservation claimed (`LargeModelManager.profiles(claimed_device_bytes=,
+  claimed_host_bytes=)`); the answer is that report plus `encoder` (the encoder's `selected`, `null`
+  when the prompt is cached or no encoder is installed), and an encoder that does not fit refuses
+  `selected`. The reservation of a plan is its device peak and its host peak above the baseline
+  RSS (`service._reservation_of`).
+- **A host run device (`cpu` / `mps`)** is planned on the host alone, exactly as the manager plans
+  it (`Budgets.host_device`; any non-`cuda*` device, `memory.is_host_run_device`): no device
+  budget, every byte in RAM, the RAM step alone picks the plan. `.estimate` then answers
+  `vram_bytes: 0`, `vram_free: 0`, `ram_bytes` = the host growth and `fits` = the host plan's, so it
+  agrees with what a run's admission will do (the unknown-VRAM-fits rule is a CUDA-only rule).
+- **A failed COLD pipeline load drops only its own handle** (`LargeModelManager.unload_key` of the
+  session's key): a warm handle of another checkpoint or device under the same model name keeps
+  its bytes; an admission refusal left nothing to drop.
+- **A progress callback that raises aborts the run**: `_denoise`'s per-step callback lets the
+  exception propagate out of the pipeline call, so the session finishes (reservation, run lock and
+  lease returned) and the caller gets the error. Whether a dead peer is tolerated is the caller's
+  policy: the IPC handler's forwarder never raises (it logs the first failed frame of a request at
+  WARNING and keeps going), so **a client disconnect does not cancel a FLUX.2 run**; mid-run
+  cancellation is a separate, future feature.
+- **`unload_text_encoder_after_encode`** (default `False`): the encoder handle stays as the steps
+  keep it between runs (on the GPU under «Максимум скорости» when it ran there — never for a
+  CPU-pinned legacy request, which keeps it in RAM — in RAM under «Держать модели в памяти»,
+  dropped otherwise); `True` drops it after every encode.
+- **`text_encoder_fp8`** (default `False`) is weight-only fp8 for the encoder's decoder-layer
+  linears (`large_model.encoder_spec(True)`): the conversion quantizes each weight to
+  `float8_e4m3fn` with per-output-row scales WHILE it is read (so the load peak is one bf16 tensor,
+  and the resident encoder is ~half), dequantized to bfloat16 in `forward`; measured relative max
+  error ~3.4% per tensor. A torch without `float8_e4m3fn` is refused, never ignored. The embedding
+  and the norms stay bfloat16.
+- The Qwen3 encoder is built as a truncated `Qwen3Model` (`components.ENCODER_KEEP_LAYERS` layers,
+  `lm_head` and deeper layers never built nor read); its checkpoint keys lose their `model.`
+  prefix in the spec.
+- **Models on disk (local check, 2026-10-16):** the klein 9B checkpoint (`flux-2-klein-9b`) and the
+  uncensored 9B encoder; no 4B checkpoint, so the 4B path is exercised by the tiny real models of
+  the tests only. One spec family serves both variants (block and layer counts come from the files).
 - **`is_distilled` is READ FROM THE CHECKPOINT, and it decides whether guidance can happen at all.**
   `components.checkpoint_is_distilled` answers a TRI-STATE from the `model_index.json` beside the
   weights — `True` / `False` as declared, `None` when there is no manifest, it cannot be read, or it
@@ -718,106 +608,70 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   step for a guidance that was distilled away, plus a whole wasted pass over the 16 GB text encoder
   for a negative prompt the denoise never reads.
   - **Unknown means today's behaviour, logged.** `None` builds the pipeline with `is_distilled=False`
-    and leaves `guidance_scale` in force, and `_ensure_pipeline_locked` says so at INFO. This is a
+    and leaves `guidance_scale` in force, and `service._pipeline_for` says so at INFO. This is a
     documented choice, not a silent fallback: a hand-assembled folder of components carries no
     manifest, and refusing it would be worse than running it the way this service ran every
     checkpoint before the flag was read.
   - **A distilled checkpoint skips the negative encode entirely.** Every decision that depends on
     the scale asks `service._effective_guidance_scale`, which returns 1.0 there and announces the
     ignored slider once per `(checkpoint, requested scale)`. So `_prompts_to_encode` never asks for
-    the empty prompt, `_prompt_embeds_locked` returns `negative=None`, and `_generate_locked` sends
+    the empty prompt, `_prompt_embeds_locked` returns `negative=None`, and `_denoise` sends
     `guidance_scale=1.0` down to diffusers. The filesystem is consulted only when the user actually
     raised the slider, so the default costs nothing.
-  - **The flag needs no field in `_model_key`.** `components.model_index_search_roots` reads only
-    the transformer's and the VAE's roots — the two paths that key ALWAYS carries — so a checkpoint
-    that would answer differently is already a different key and therefore a different pipeline.
-    The text-encoder path is in the key only when the encoder is kept resident, which is why it is
-    deliberately NOT a search root here.
+  - **The flag needs no field in the pipeline key.** `components.model_index_search_roots` reads
+    only the transformer's and the VAE's roots — the two paths the pipeline handle's key carries —
+    so a checkpoint that would answer differently is already a different handle. The encoder is
+    another handle, which is why its path is deliberately NOT a search root here.
   - **`status.guidance_supported`** is the same answer told to the client: `False` exactly when the
     checkpoint declares `is_distilled: true`, `True` otherwise — the undeclared case included,
     because that is what its run really does. A plain boolean, not the tri-state (`ipc/PROTOCOL.md`
     §5.4).
 - Unlike `flux_fill.py`, this service honours the user's `General.ai_device` choice through the
-  module-level `_resolve_selected_backend_device()` binding (`hardware.py`).
+  module-level `_resolve_selected_backend_device()` binding (`hardware.py`, bound to
+  `runtime.torch_device.resolve_discrete_backend_device`): a configured discrete `cuda:<n>` or `cpu`
+  is used as is, a configured integrated GPU is overridden (WARNING) by the largest discrete device,
+  and an unset / plain `cuda` choice takes that device too (CPU when there is none).
 - **The reported device is never a placeholder.** `status`, `health` and the generation answer take
   it from `_device_label()`: the loaded `self._device` when a pipeline is resident, otherwise the
   device `_resolve_selected_backend_device("cuda")` WILL pick — the same call the pipeline build
   makes, so the two cannot disagree. Answering `"cpu"` because nothing is loaded yet told the user
   that a run costing tens of minutes would happen on the CPU while it would in fact run on the
   configured GPU; `loaded` / `ready` are what distinguish a fact from a plan. For the same reason
-  `memory_snapshot(device)` reads the free VRAM of THAT accelerator (`cuda:1` means card 1), so the
-  `estimate` forecast is not compared against another card's memory.
-- `_materialize_components_for_offload` is a deliberate copy of `flux_fill.py`'s (this package
-  forbids importing a sibling service); it differs in listing the transformer too — here it is
-  safetensors-backed, not GGUF — and last, so a failed round trip of the largest component still
-  leaves the smaller ones re-homed.
+  `estimate` reads the free VRAM of THAT accelerator (`cuda:1` means card 1).
 
 ### FLUX.2 klein: per-component residency and actions
 The wire contract is `dev-docs/flux2_component_residency.md`; `ipc/PROTOCOL.md §5.4` carries the
 client-facing half. What this module owns:
 
-- **One probe, reused, never a third.** `_module_residency` answers `not_loaded` / `ram` / `gpu` /
-  `offloaded` / `mixed` from the two probes this file already relied on: the `_hf_hook` presence
-  check (an accelerate hook owning the module IS `offloaded`, whatever the parameters momentarily
-  say) and the device-TYPE count over `parameters()` + `buffers()` that
-  `_require_components_materialized` uses. `hf_device_map` is unusable here — `from_single_file`
-  discards `device_map`. `meta` without a visible hook is `offloaded` too: `accelerate.cpu_offload`
-  keeps the bytes in a host weights map and its hook may sit on a submodule. **`mixed` is reported,
-  never rounded** — rounding a half-placed pipeline is how it becomes a device mismatch several
-  frames inside the VAE instead of a named problem.
-- **`_component_actions` is the AUTHORITY, and it lives only here.** The client renders the list and
-  must never re-derive it. Its invariants and the reasons are in the function's own docstring; the
-  short version: the text encoder never offers `to_gpu` (the load-order memory contract), the
-  transformer never offers `warmup` (no such path exists — the warm-up forwards the VAE only), and
-  `load`/`unload` appear on BOTH the transformer and the VAE because `_model_key` describes a whole
-  pipeline and one of them alone can neither be dropped nor loaded.
-- **Deliberate omissions, because they cannot be done honestly today.** The VAE gets no
-  `to_ram`/`to_gpu`: no helper exists and `_decode_once` follows `vae.device`, so a host-resident
-  VAE would silently move the next decode onto the CPU. A transformer that is `offloaded` or `mixed`
-  gets no move either: under accelerate the parameters are on `meta` and the hooks would have to be
-  removed first (`remove_all_hooks`), and `.to(device)` on a genuinely mixed module raises as often
-  as it succeeds. Adding either one requires per-component residency bookkeeping in place of the
-  whole-pipeline `_model_key`, plus per-component phases in `forecast_memory` — a much larger change
-  than exposing the helpers that already exist.
+- **Residency comes from the large pool's ledger parts** (`pipeline.residency_of` over the
+  arbiter's per-component `(device bytes, host bytes)` of the pipeline handle of the request's paths
+  and dtype, and of the encoder handles of its path and precision — the CPU-pinned and the unpinned
+  one summed, since a status poll carries no step fields): `not_loaded` / `ram` / `gpu` /
+  `mixed` (a juggled component parked in part — reported, never rounded). `offloaded` stays in the
+  vocabulary but is never answered (no accelerate hooks any more).
+- **`_component_actions` is the AUTHORITY, and it lives only here.** The text encoder offers `load`
+  / `unload` only (where it runs is the steps' decision, never a button); `load` / `unload`
+  appear on both the transformer and the VAE (one handle); the transformer offers `to_ram` while on
+  the device and `to_gpu` while in RAM, never on a `mixed` one; the VAE offers `warmup` while on the
+  device and no move.
+- **Every action is a manager operation**: `load` (transformer/VAE) a pipeline session that loads,
+  places and warms up (steps 0-6) and ends in the steps' between-runs state; the encoder's `load`
+  an encoder session (steps that would drop it at once — VRAM not MAX and RAM not KEEP / «Авто» —
+  are replaced by (PHASE, KEEP): kept in RAM);
+  `unload` drops the idle handles (`unload()` = every FLUX.2 handle; the transformer/VAE «unload»
+  the pipeline only, the encoder's the encoder only); `to_ram` a (PHASE, KEEP) session whose
+  `finish` parks the pipeline in RAM; `to_gpu` a (MAX, KEEP) session that calls `Session.settle()`
+  (the manager's `finish` only shrinks, so moving back onto the device is explicit) — the VAE
+  moves with the transformer; `warmup` one 64x64 decode. Every admission is the guard; the old
+  per-button headroom checks are gone. The encoder KNOWN GAP (a user-loaded encoder outside the
+  lease accounting) is closed: the encoder is a large-pool handle like the pipeline.
 - **`status` never blocks, and that is load-bearing.** A generation holds `self._lock` for its
   entire run, so the residency probe takes it with `acquire(blocking=False)` and reports
-  `components_busy: true` with the `residency`/`actions` keys ABSENT when it cannot. Absent means
-  "not known", never "not loaded". Everything else `status` reports is read WITHOUT the lock —
-  `self._pipe` / `self._device` are single attribute loads and `prompt_cached` is one dict
-  membership test, all atomic under the GIL with no compound invariant to protect. Do not put the
-  lock back: taking it made a status poll wait out a whole generation, which is exactly what makes
-  `components_busy` unobservable and the feature dead.
-- **The guard is not optional on a button.** `component_action`'s pipeline load runs
-  `_require_pipeline_headroom_locked` (`denoise` + `decode` phases), a transformer restore runs
-  `_require_restore_headroom_locked` (`denoise`), and an encoder load runs the very
-  `_require_encode_headroom_locked` that `prompt_cache.build` uses. All three are
-  `_require_memory_headroom` over the ONE `forecast_memory` — never a second calculation. The
-  restore deliberately does not discount the resident pipeline: the transformer is on the host at
-  that moment, so only the VAE's ~0.2 GB is over-charged, and erring toward a refusal is the correct
-  direction for a guard whose failure mode is the kernel OOM killer.
-- **KNOWN GAP: a user-pressed text-encoder load takes no model-manager lease.** `_model_key` names a
-  whole pipeline-plus-encoder bundle and `_unload_key` refuses when `self._pipe is None`, so leasing
-  a pipeline key for an encoder-only residency would register an entry the manager could never
-  evict. Memory SAFETY is unaffected — the pre-load guard reads the actual free host memory, which a
-  resident encoder has already reduced — but `max_loaded_models` under-counts an encoder loaded this
-  way until the user unloads it or the next run replaces it, and it is never auto-evicted to make
-  room for another service. Removal condition: give the service per-component residency bookkeeping
-  (a resident-bundle key that can name "encoder only"), at which point this becomes a normal lease.
-  The new residency in `status` is what makes such an encoder visible in the meantime.
-- **`unload()` and the per-component «unload» are different operations.** `unload()` (the `.unload`
-  wire method) drops the pipeline AND the encoder; `_unload_pipeline_locked`, which the
-  transformer/VAE action uses, drops the pipeline only — a user unloading the VAE must not silently
-  pay for a 16 GB encoder re-read.
-- The lease protocol is unchanged and binding on the new path: the lease is taken before
-  `self._lock`, the load scope ends at `_ensure_pipeline_locked`, and `mark_load_failed` is reported
-  from that scope only. `test_lease_protocol.py` pins `component_action`'s load beside the six
-  services. Two things are specific to it and must survive any edit: **only `load` takes a lease at
-  all** (`_LEASED_ACTIONS`) — `to_gpu` and `warmup` change no key and cannot race an eviction, since
-  `_unload_key` needs the lock the action holds throughout — and **the `finally` resolves the lease
-  on every path** with an idempotent `mark_load_failed()` before `release()`. `release()` does NOT
-  clear the manager's `loading` flag, so the busy refusal and the "action no longer available"
-  refusal, both of which fire AFTER the lease is taken, would otherwise leave that key flagged
-  `loading` forever and make the next `begin_model_use` for it wait on a load that never finishes.
+  `components_busy: true` with the `residency`/`actions` keys ABSENT when it cannot. Everything else
+  `status` reports is read without the lock.
+- **Refusal before admission**: `component_action` takes the lock WITHOUT waiting (busy refusal) and
+  re-checks the action against the current list BEFORE any session is acquired — a session that is
+  finished unused moves the model to its between-runs state, which would perform the refused action.
 
 ### FLUX.2 klein: model download (`flux2_download.py`)
 The wire contract is `dev-docs/flux2_model_download.md`; `ipc/PROTOCOL.md` carries the frame shapes.
@@ -940,27 +794,34 @@ or `text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config
 - **Nothing here runs under a service lock**, for the same reason `ensure_model` does not: a
   multi-gigabyte transfer must never block `health()`, `unload()` or an eviction callback.
 
+### FLUX.3 klein (`flux3_klein/`)
+- Not wired: no `server.py` construction, no `AppState` field, no IPC method, no Rust side, no
+  `PROTOCOL_VERSION` change. Wiring it is a separate task (and the weights' licence question,
+  `flux3_klein/MODULE_README.md`, comes first).
+- A large-model manager handle, not a small-pool service: no small-pool lease. One handle per run,
+  admitted by `LargeModelManager.acquire(steps=...)` BEFORE the service lock (the large-pool
+  lease and reservation); every load and move is a manager `Session` step under the lock, driven
+  by the user's two resource steps (`Flux3Options.vram_step` x `ram_step`). `health()` reads the
+  published fields from a `HealthSnapshot` and where each component is from the manager's ledger
+  (`LargeModelManager.placements`). The lease contract is pinned by `flux3_klein/test_characterization.py`
+  (`LeaseContract`) and `flux3_klein/test_service.py`, not by `test_lease_protocol.py`.
+- Device: `options.device` or `_resolve_selected_backend_device` (the FLUX.2 klein policy:
+  `runtime.torch_device.resolve_discrete_backend_device`, never an integrated GPU unless
+  `options.device` names one explicitly).
+- Every contract of the port (reference parity, deviations, fp8 probe, the step pair -> placement
+  mapping, observer phases and their `info` keys): `flux3_klein/MODULE_README.md`.
+
 ### ROCm staging obligation
 On a ROCm Torch build, a host→device copy out of a safetensors file mapping stalls in amdkfd (~1-2 s
 per tensor ≥1 MiB). Any weight move here must route through `runtime/rocm_mmap_transfer.py`:
-- `sdxl.py`, the plain FLUX path and the non-offload FLUX.2 klein placements wrap their move in
-  `with patched_module_to():`;
+- `sdxl.py` and the plain FLUX path wrap their move in `with patched_module_to():` (FLUX.2 klein
+  moves nothing itself: the large-model manager's loader reads into anonymous or registered
+  buffers and never copies a file-mapped tensor to the GPU);
 - the FLUX CPU-offload path cannot (the patch is process-global and must never wrap inference), so
   `_materialize_components_for_offload()` re-homes the safetensors components in anonymous host
   memory up front instead, clearing the allocator cache between components.
 The block under `patched_module_to()` must contain the weight move and nothing else — no download,
 no network wait, no inference. Everything is a strict no-op off ROCm.
-
-One documented exception: FLUX.2 klein's `low_cpu_mem_usage` path hands accelerate a GPU
-`device_map`, which never calls `nn.Module.to` and therefore cannot be staged. **Measured**
-2026-09-02 on this project's ROCm host (AMD Radeon AI PRO R9700 / gfx1201, torch 2.12.0+rocm7.2,
-diffusers 0.39.0, accelerate 1.12.0), klein VAE, 168 MB, 250 BF16 tensors of which 42 are ≥ 1 MiB,
-page cache dropped before each run, two runs per variant: `device_map` 1.35 s / 1.12 s, CPU load +
-staged `.to()` 1.38 s / 1.13 s, CPU load + UNSTAGED `.to()` 1.46 s / 1.27 s. All 42 large tensors
-report `tensor_needs_staging() == True`, yet the unstaged move costs 0.10 s rather than the 42-84 s
-an amdkfd stall would imply: the pathology does not reproduce through this loader on this driver,
-so the `device_map` shortcut costs nothing measurable and stays. This is a measurement of one host,
-not a repeal of the rule — re-measure before extending the exception anywhere else.
 
 ### Package boundaries
 - `__init__.py` exposes nothing on purpose: importing one inpainter must not drag in another's
@@ -988,41 +849,37 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   (`AVAILABLE_QUANTS`, `_build_download_plan`, `_select_discrete_device`); the staging /
   serialization / atomic-publish envelope itself lives in `../engines/model_download.py` and is
   shared with `watermark/`.
-- To change how the single-file transformer is READ — tensor by tensor or in one piece — see
-  `flux2_klein/streaming.py` for the loader and `pipeline._load_transformer` for the choice between
-  the two (the refusal must stay logged there; `streaming.py` carries no fallback). The byte-level
-  progress that read publishes is `progress._file_progress_reporter`, wired in
-  `service._ensure_pipeline_locked`; it must never move `LOAD_STEP_*` / `LOAD_PHASE_STEPS`.
-- To change FLUX.2 klein params, region limits, placement modes, the memory forecast, or the OOM
-  recovery ladder, see `flux2_klein/` (`params.normalize_flux2_klein_params`,
-  `params.validate_region_size`, `pipeline._apply_placement`, `memory.forecast_memory`,
-  `pipeline._decode_region_latents`); keep the param set in sync with
-  `ipc/PROTOCOL.md §5.4`. The wire contract carries five `applied` flags —
+- To change how a FLUX.2 component is described to the large-model manager — its files, key
+  mapping, blocks, dtype, the fp8 encoder, the phases' work, the decode fallbacks, the pre-admission
+  refusals — see `flux2_klein/large_model.py` (BFL keys: `flux2_klein/conversion.py`). How a
+  component is READ (tensor by tensor) is `../runtime/large_models/loader.py` over
+  `../runtime/safetensors_stream.py`; the fp8-scaled refusal stays in `flux2_klein/`. The
+  byte-level progress of a single-file transformer is `progress._file_progress_reporter`, wired in
+  `service._load_pipeline_locked`; it must never move `LOAD_STEP_*` / `LOAD_PHASE_STEPS`.
+- To change FLUX.2 klein params, region limits, the legacy placement / profile -> step mapping
+  or the stage-1 `estimate`, see `flux2_klein/` (`params.normalize_flux2_klein_params`,
+  `params.validate_region_size`, `memory.requested_steps`, `memory.forecast_memory`); the
+  steps, the forecast arithmetic and the degrade ladder are `../runtime/large_models/`. Keep
+  the param set in sync with `ipc/PROTOCOL.md §5.4`. The wire contract carries five `applied` flags —
   `unload_transformer_before_vae`, `vae_tiling`, `vae_slicing`,
   `unload_text_encoder_after_encode`, `text_encoder_fp8` — and the `estimate` breakdown carries
   three peaks, `peak_encode` / `peak_denoise` / `peak_decode`, in pipeline order. The Rust side
   matches those names exactly; do not rename one side alone.
 - To change what "tiling" means — the threshold, the forecast predicate or the decode's last rung —
   see `flux2_klein/components.py::vae_tile_threshold_pixels` (the threshold, read from the VAE
-  config), `memory.forecast_memory` (the predicate) and
+  config), `large_model._decode_work` / `tiling_engages` (the forecast) and
   `pipeline._vae_tiling_engages` / `_lowered_vae_tile_thresholds` (the decode). Never hard-code the
   1024/128 numbers in any of the three, and never move one of the two tile thresholds alone.
-- To change the memory gate or its advice, see `forecast_memory`, `_require_memory_headroom` and
-  `_preset_advice`. Never add a second forecast: `estimate` and the gate must be the same
-  arithmetic. Its three per-action entry points are `_require_pipeline_headroom_locked`,
-  `_require_restore_headroom_locked` and `_require_encode_headroom_locked`. The pipeline's transient
-  host term is `_transformer_avoids_the_host`, which follows the LOADER and not the flag.
+- The memory gate is the large-model manager's admission; `memory._preset_advice` only names the
+  step pairs that fit. Never add a second forecast: `memory.forecast_memory` plans through the
+  manager's planner and forecast.
 - To change what `status` reports per component, or which buttons the FLUX.2 panel offers, see
-  `_module_residency` (where the weights are), `_component_actions` (the authoritative matrix —
-  it exists only there) and `Flux2KleinInpaintService._components_locked` /
-  `_components_residency_nowait`. To change what an action DOES, see `component_action` and its
-  `_*_action_locked` helpers; each one delegates to the helper the generation path already uses
-  (`_ensure_pipeline_locked`, `_warmup_pipeline_locked` — the unguarded primitive, because the user
-  pressed the button, `_park_transformer_off_device`, `_restore_transformer_to_device`,
-  `_ensure_text_encoder_locked`, `_release_text_encoder_locked`)
-  — do not add a second implementation of a move. The two that MOVE weights (`to_ram`, `to_gpu`)
-  clear `_pipeline_warmed`; so does the invalidation after a failed restore. Keep the wire literals in step with
-  `dev-docs/flux2_component_residency.md` and `ipc/PROTOCOL.md §5.4`.
+  `pipeline.residency_of` (the literal of the ledger parts), `_component_actions` (the
+  authoritative matrix — it exists only there) and `Flux2KleinInpaintService._components_locked` /
+  `_components_residency_nowait`. To change what an action DOES, see `component_action` /
+  `_component_action_locked`: every action is a manager session or `unload` — never a hand-made
+  move. Keep the wire literals in step with `dev-docs/flux2_component_residency.md` and
+  `ipc/PROTOCOL.md §5.4`.
 - To add or change a downloadable MODEL VARIANT, see `ModelVariant` / `VARIANTS` /
   `DEFAULT_VARIANT` in `flux2_download.py`, and `resolve_variant` /
   `require_uncensored_supported` / `token_required` / `repo_token` for the wire vocabulary, the two
@@ -1041,8 +898,8 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   belong to `../engines/model_download.py` and are shared, so do not re-implement them here. Keep every wire literal in step with
   `dev-docs/flux2_model_download.md` and `ipc/PROTOCOL.md`; the Rust side is written against the same
   document.
-- To change the prompt phase, see `_prompt_embeds_locked` / `_encode_prompts_locked` /
-  `_encode_prompt_phase`, and `_prompt_cache_key` for what invalidates a cached embedding.
+- To change the prompt phase, see `_prompt_embeds_locked` / `_encode_prompts_locked` (the encoder
+  session) / `_encode_prompt_phase`, and `_prompt_cache_key` for what invalidates a cached embedding.
 - To change the prompt-cache LIBRARY, see the `prompt_cache_*` methods of the service
   (`prompt_cache_build` / `_list` / `_save` / `_load` / `_export` / `_import`) and, one layer
   below them, `prompt_cache_root` / `encoder_family_name` / `sanitize_name_component` /
@@ -1055,27 +912,23 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
   `local_encoder_identity` and `find_prompt_cache_entry`; `text_encoder_path` inside a file's
   metadata stays informational and must never become a compatibility input — on another machine
   it points nowhere.
-- To change the load ORDER or the warm-up, see `inpaint_image_bytes` (the sequence and the lease
-  boundary — `mark_loaded` runs before the warm-up, because everything after
-  `_ensure_pipeline_locked` fails with the pipeline already resident) and
-  `_warmup_pipeline_if_needed_locked` (the once-per-placement guard and the exhaustive list of what
-  clears `_pipeline_warmed`) / `_warmup_pipeline_locked` / `_require_components_materialized` /
-  `_warmup_vae_decode`. Adding a path that MOVES weights means clearing `_pipeline_warmed` there.
-  The `phase:"load"` step numbers live in the `LOAD_STEP_*` constants and `LOAD_PHASE_STEPS`; they
-  are the order the user sees, so they must stay strictly increasing along that sequence, and the
-  first `LOAD_STEP_PREPARE` frame is emitted BEFORE the encoder check and the memory guard, both of
-  which touch the filesystem — the progress bar has to appear when the button is pressed.
-- To change how the Qwen tokenizer is obtained, see `_ensure_tokenizer_locked` — the one place
-  `Qwen2TokenizerFast` is constructed. It is cached by the discovered directory, shared between the
+- To change the load ORDER or the warm-up, see `_run_locked` (pipeline session, then the encoder
+  session, then the denoise and decode phases) and `_load_pipeline_locked` (the cold-load steps 1-6
+  and `_warmup_locked`). The `phase:"load"` step numbers live in the `LOAD_STEP_*` constants and
+  `LOAD_PHASE_STEPS`; they are the order the user sees, so they must stay strictly increasing
+  along that sequence, and the first `LOAD_STEP_PREPARE` frame is emitted BEFORE the encoder check
+  and the pre-admission refusals, which touch the filesystem.
+- To change how the Qwen tokenizer (or the scheduler, `_ensure_scheduler_locked`) is obtained, see
+  `_ensure_tokenizer_locked` — the one place `Qwen2TokenizerFast` is constructed. It is cached by the discovered directory, shared between the
   pipeline component and every prompt encode (encoding is read-only and the pipeline's copy is never
   called), and dropped by `unload()`. Do not add a second read: it used to happen on every encode,
   which is real disk I/O on an otherwise hot pipeline.
 - To change how the marks reference reaches the pipeline, see `_split_request_blob` in
   `../ipc/handlers/flux2_klein.py` (the wire split), `inpaint_image_bytes` (decode and size check)
-  and `_generate_locked` (`image_reference`) in `flux2_klein/service.py`, and the `with_reference`
-  term of `forecast_memory` in `flux2_klein/memory.py`.
+  and `_denoise` (`image_reference`) in `flux2_klein/service.py`, and the reference term of the
+  denoise work in `flux2_klein/large_model.py`.
 - To change the "no mask" mode, see `normalize_flux2_klein_params` / `_whole_region_overrides` (the
-  params it settles) and `_require_solid_mask` (the check). `_generate_locked` needs no special
+  params it settles) and `_require_solid_mask` (the check). `_denoise` needs no special
   case and must not grow one — the mode is expressed entirely as normalized parameters.
 - To change where the FLUX.2 klein transformer config is looked for, see
   `transformer_config_roots` / `find_transformer_config_dir` / `validate_transformer_config_dir` in
@@ -1084,10 +937,14 @@ not a repeal of the rule — re-measure before extending the exception anywhere 
 - To change the encoder<->transformer compatibility rule, see `TEXT_ENCODER_OUT_LAYERS` /
   `transformer_config_dir` / `require_encoder_transformer_compatible` in
   `flux2_klein/components.py`, and its two call sites in `service.py` (`inpaint_image_bytes`,
-  `_load_pipeline_action_locked`). `transformer_config_dir` must keep resolving to the SAME
-  directory `_load_transformer` reads, or the guard and the loader would judge different files.
-- To change how a service reports load vs. inference failures to the model manager, change all six
-  at once and extend `test_lease_protocol.py` — the protocol is a cross-service contract.
+  `_component_action_locked`). `transformer_config_dir` must keep resolving to the SAME
+  directory `large_model.transformer_config_dir` builds the skeleton from, or the guard and the
+  loader would judge different files.
+- To change how a service reports load vs. inference failures to the model manager, change all the
+  small-pool services at once and extend `test_lease_protocol.py` — the protocol is a cross-service
+  contract (FLUX.2 klein is a large-model manager handle: its sessions follow the manager's).
+- To change FLUX.3 klein (run order, its model spec, observer phases, loaders), see
+  `flux3_klein/MODULE_README.md`; to wire it into IPC, follow the next bullet.
 - To add a new inpaint backend, copy the service shape above, wire it in `server.py` + `AppState`,
   add an `ipc/handlers/` method and a `METHOD_INPAINT_*` constant in `ipc/protocol.py`, and route any
   GPU weight move through `runtime/rocm_mmap_transfer.py`.

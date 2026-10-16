@@ -26,6 +26,8 @@ Main responsibilities:
   and that an exhausted retry budget parks only the pid-free `.part` for a resume;
 - verify a failed forward is reported as a failed INFERENCE, not a failed load:
   the network stays resident, counted and evictable;
+- verify the lease carries the service owner and the checkpoint's file size as
+  its residency hint, and an unknown model still fails inside the load scope;
 - verify the tiling geometry (tile count, full coverage) and that the
   cosine feather is a partition of unity across an overlap band;
 - verify the downscale -> pad -> crop -> upscale mask round trip preserves the
@@ -57,7 +59,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from modules.ai_backend.runtime.model_manager import LoadedModelManager
+from modules.ai_backend.runtime.model_manager import SmallModelManager
 from modules.ai_backend.watermark import code_fetch as cf
 from modules.ai_backend.watermark import service as svc
 
@@ -313,7 +315,7 @@ class _SmallPinnedWeightTestCase(unittest.TestCase):
         self.base = svc._DRIVE_URL.format(file_id=self.FILE_ID)
         self.sleeps: list[float] = []
         self.frames: list[tuple[str, int, int, str]] = []
-        self.service = svc.WatermarkRemovalService(LoadedModelManager(max_loaded_models=1))
+        self.service = svc.WatermarkRemovalService(SmallModelManager(max_loaded_models=1))
 
     def _pin(self, payload: bytes) -> None:
         spec = svc._WeightSpec(
@@ -699,7 +701,7 @@ class ResidencyTests(unittest.TestCase):
             attr_patch.start()
             self.addCleanup(attr_patch.stop)
 
-        self.service = svc.WatermarkRemovalService(LoadedModelManager(max_loaded_models=4))
+        self.service = svc.WatermarkRemovalService(SmallModelManager(max_loaded_models=4))
 
     def test_first_use_loads_evaluates_and_stages_the_weights(self) -> None:
         result = self.service._lease_and_run("slbr", lambda net: net.model_id)
@@ -772,7 +774,7 @@ class ResidencyTests(unittest.TestCase):
         self.assertEqual(health["loading_model_count"], 0)
 
     def test_a_network_left_by_a_failed_forward_is_still_evictable(self) -> None:
-        service = svc.WatermarkRemovalService(LoadedModelManager(max_loaded_models=1))
+        service = svc.WatermarkRemovalService(SmallModelManager(max_loaded_models=1))
 
         def boom(_net: object) -> None:
             raise RuntimeError("forward exploded")
@@ -1009,6 +1011,39 @@ class ProgressEmitTests(unittest.TestCase):
         frames: list[tuple[str, int, int, str]] = []
         svc._emit(lambda *frame: frames.append(frame), "generate", 0, 0, "label")
         self.assertEqual(frames, [("generate", 0, 1, "label")])
+
+
+class LeaseHintTests(unittest.TestCase):
+    """The lease carries the service owner and the checkpoint's file size."""
+
+    def test_the_checkpoint_size_and_owner_reach_the_manager(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="ms_wm_hint_")
+        self.addCleanup(tmp.cleanup)
+        weights = Path(tmp.name) / "w.pth"
+        weights.write_bytes(b"x" * 1234)
+        manager = SmallModelManager(max_loaded_models=1)
+        service = svc.WatermarkRemovalService(manager)
+        seen: list[tuple[object, object]] = []
+        real = manager.begin_model_use
+
+        def spy(key: str, unload_callback: object = None, *, owner: object = None, hint: object = None) -> object:
+            seen.append((owner, hint))
+            return real(key, unload_callback, owner=owner, hint=hint)
+
+        with patch.object(manager, "begin_model_use", spy), \
+                patch.object(svc, "weights_path", lambda _model_id: weights), \
+                patch.object(svc, "_resolve_selected_backend_device", lambda _fallback: "cpu"), \
+                patch.object(service, "_ensure_model_locked", lambda *_args: object()):
+            self.assertEqual(service._lease_and_run(svc.DEFAULT_MODEL, lambda _net: "ran"), "ran")
+        self.assertEqual(seen, [(svc._LEASE_OWNER, svc.FootprintHint(device="cpu", device_bytes=0, host_bytes=1234))])
+
+    def test_an_unknown_model_still_fails_in_the_load_scope(self) -> None:
+        manager = SmallModelManager(max_loaded_models=1)
+        service = svc.WatermarkRemovalService(manager)
+        with patch.object(svc, "_resolve_selected_backend_device", lambda _fallback: "cpu"):
+            with self.assertRaisesRegex(ValueError, "Неизвестная модель"):
+                service._lease_and_run("no-such-model", lambda _net: None)
+        self.assertEqual(manager.health()["resident_model_count"], 0)
 
 
 if __name__ == "__main__":

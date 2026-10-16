@@ -36,7 +36,8 @@ import numpy as np
 
 from config import TEXT_DETECTOR_DIR
 from ..runtime.health_snapshot import HealthSnapshot
-from ..runtime.model_manager import LoadedModelManager
+from ..runtime.model_manager import SmallModelManager
+from ..runtime.residency.footprint import hint_from_files
 from ..runtime.torch_device import clear_torch_cache, resolve_selected_backend_device
 from .forward_maps import quantize_probability_maps, validate_tiles
 
@@ -57,6 +58,9 @@ _resolve_selected_backend_device = functools.partial(resolve_selected_backend_de
 #: patched by name in the test suite.
 _clear_torch_cache = functools.partial(clear_torch_cache, owner="ComicTextDetector")
 
+#: Owner name of this service's leases in the residency arbiter (owner rule).
+_LEASE_OWNER = "detection.ctd"
+
 
 def _default_device() -> str:
     try:
@@ -70,14 +74,14 @@ def _default_device() -> str:
 
 
 class CtdTextDetectorService:
-    """CTD forward pass behind a `LoadedModelManager` lease.
+    """CTD forward pass behind a `SmallModelManager` lease.
 
     Thread-safety: `forward_tiles` serializes model load and inference on one
     re-entrant lock; the lease is taken before the lock so the resident-model
     budget can ask this service to unload while it waits.
     """
 
-    def __init__(self, model_manager: LoadedModelManager) -> None:
+    def __init__(self, model_manager: SmallModelManager) -> None:
         self._lock = threading.RLock()
         self._model_manager = model_manager
         self._net = None
@@ -126,16 +130,21 @@ class CtdTextDetectorService:
         n, height, width = validate_tiles(tiles, align=CTD_INPUT_ALIGN, engine="ctd")
         device = _resolve_selected_backend_device(self._device)
         model_key = self._model_key_for(device)
+        # Pre-load size: the checkpoint file `TextDetBase` reads.
         lease = self._model_manager.begin_model_use(
             model_key,
             unload_callback=lambda: self._unload_key(model_key),
+            owner=_LEASE_OWNER,
+            hint=hint_from_files([self._model_path], device),
         )
         with self._lock:
             try:
                 net = self._ensure_net_locked(device, model_key)
+                # Right after the load and unconditionally (the lease protocol in
+                # `runtime/model_manager.py`): a failed forward is a failed run,
+                # never a failed load.
+                lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 maps = self._forward_locked(net, tiles, device)
-                if lease.needs_load:
-                    lease.mark_loaded(unload_callback=lambda: self._unload_key(model_key))
                 self._last_error = None
                 self._publish_health_locked()
                 log.info("CTD forward done device=%s tiles=%s size=%sx%s", device, n, width, height)
