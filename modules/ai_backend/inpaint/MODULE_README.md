@@ -308,19 +308,35 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   centre (the fill averages the scene), which no global curve can fix. In CIELAB, at
   `s = color_match_scale_px` (the Gaussian SIGMA of the finest level, not a window side):
   lightness mean and contrast (gain clipped to 0.8..1.4), a/b mean shift only, blended at
-  `strength`. The GENERATED image's local statistics are a normalized convolution over the
-  pixels INSIDE the mask only — a deliberate departure from the spec's plain Gaussian, whose window
-  at the contour mixes the drift with the matching outside, sees about half of it and left an
-  under-corrected rim band 1-2 scales wide (a seam users saw along the contour). The target
-  statistics come from the original outside the mask (+3 px) carried inwards by a cascade of normalized convolutions at `s..16s` — one scale has no valid pixel in
-  reach at the centre of a wide mask and divides by ~0 — terminated by the valid-weighted GLOBAL
-  moments of the original, because cv2 truncates each Gaussian at 4 sigma and beyond ~67·s from
-  the ring no level has any weight (without it the far interior got no correction and a 0.8
-  contrast cut, with a seam where the support ended). Its fields are computed on a grid
-  `s // 4` times coarser (bounded cost: ~0.4 s for 2048x2048) from fine fields reflect-padded by
-  the finest kernel's reach (a grid's own border mirrors about its first cell, not pixel 0), and it
-  rewrites only pixels inside the mask. The global step rounds like the composite. Default
-  strength 60 %: full strength brings the statistics closest to the ring but its lightness gain turns dark-area noise into specks. Off (0) under `whole_region`.
+  `strength`. The GENERATED image's local statistics come from the pixels INSIDE the mask only —
+  a deliberate departure from the spec's plain Gaussian, whose window at the contour mixes the
+  drift with the matching outside, sees about half of it and left an under-corrected rim band 1-2
+  scales wide (a seam users saw along the contour). The target statistics come from the original
+  outside the mask (+3 px) carried inwards by a cascade of scales `s..16s` — one scale has no
+  valid pixel in reach at the centre of a wide mask — terminated by the GLOBAL moments of the
+  original, because cv2 truncates each Gaussian at 4 sigma and beyond ~67·s from the ring no
+  level has any weight (without it the far interior got no correction and a 0.8 contrast cut,
+  with a seam where the support ended).
+  Both sides are ROBUST local modes, not means: at every scale, `LOCAL_MATCH_ROBUST_ITERATIONS`
+  (2) passes reweight each sample by `exp(-ΔE²/2τ²)`, τ = `LOCAL_MATCH_SIMILARITY_DE` (12),
+  against that scale's field at the SAMPLE's position, and the means and E[L²] are re-estimated
+  with those weights (per scale: a surface dominant in its own small neighbourhood, such as the
+  page beyond a panel border, must not keep full weight in a coarse window). Why: on line art the
+  ring's mean is a darker, greyer fill (ink, outlines, page) and dragged the model's clean fill
+  into a grey patch the shape of the mask. Where a side's similar-pixel share is below
+  `LOCAL_MATCH_MIN_SHARE` (0.25) the estimate is a mixture and the correction fades to the
+  identity. Known limits: a drift larger than about τ is no longer pulled by the local step (the
+  global step still fixes the VAE's tone shift); and where a surface boundary runs through the
+  mask's INTERIOR the coarse target blends both surfaces and can pull one towards the other (the
+  plain-mean version did the same; the rims next to each surface converge to their own) — the fix
+  would be a cross-bilateral estimate (similarity measured at the evaluated point, e.g. colour
+  clusters), deliberately not done. Its fields are computed on a grid `s // 4` times coarser from
+  fine fields reflect-padded by the finest kernel's reach (a grid's own border mirrors about its
+  first cell, not pixel 0); coarser scales use seeded jittered point samples at stride `2**i`
+  (unbiased, no aliasing on screentone). Cost at 2048x2048 with cv2: ~0.7 s at s = 24, ~1.1 s
+  at s = 8. It rewrites only pixels inside the mask. The global step rounds like the composite.
+  Default strength 60 %: full strength brings the statistics closest to the ring but its
+  lightness gain turns dark-area noise into specks. Off (0) under `whole_region`.
 - **The region's border is a mask contour.** `region_imaging.mask_distance_inside` pads the mask with a ring of
   zeros before measuring, because the region is a WINDOW onto a larger page and the pixels past its
   edge belong to that page, which the request may not change. Without the ring neither backend sees

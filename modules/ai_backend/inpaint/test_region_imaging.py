@@ -343,6 +343,61 @@ class LocalColorMatchTests(unittest.TestCase):
                     self.assertLessEqual(abs(residual(depth)), 0.5, depth)
                     self.assertLessEqual(abs(residual(depth) - centre), 0.5, depth)
 
+    def test_a_clean_fill_on_line_art_is_not_dragged_towards_the_ink(self) -> None:
+        # Flat fill + 6 px ink strokes every 40 px + white page: a plain mean of
+        # the ring is a darker, greyer fill and dragged the model's clean fill
+        # into a grey patch the shape of the mask; the robust estimate keeps the
+        # fill as the local colour.
+        orange = np.asarray([214, 150, 95], dtype=np.uint8)
+        original = np.tile(orange, (512, 512, 1))
+        for row in range(0, 512, 40):
+            original[row : row + 6] = (25, 15, 10)
+        original[:60] = 255
+        mask = np.zeros((512, 512), dtype=np.uint8)
+        mask[150:400, 120:400] = 255
+        generated = original.copy()
+        generated[mask > 0] = orange
+        before = ri._srgb_u8_to_lab(generated)
+        for scale in (8, 24):
+            for strength in (0.6, 1.0):
+                with self.subTest(scale=scale, strength=strength):
+                    out = ri._srgb_u8_to_lab(ri.match_color_local(original, generated, mask, strength=strength, scale_px=scale))
+                    delta_e = np.sqrt(((out - before) ** 2).sum(axis=-1))[mask > 0]
+                    self.assertLess(float(delta_e.mean()), 1.0)
+
+    def test_each_rim_converges_to_its_own_surface(self) -> None:
+        # Dark-green grass on the left, red-brown ground on the right, the
+        # boundary through the mask, a small warm drift inside it. Pinned: the
+        # rim next to each surface is pulled to THAT surface (strength 0.6
+        # leaves 40 % of the ~3 ΔE drift). Deliberately NOT pinned: the interior
+        # next to the surface boundary, where the coarse target blends both
+        # surfaces (a documented limit, see `match_color_local`).
+        rng = np.random.default_rng(6)
+        size = 320
+        base = np.empty((size, size, 3), dtype=np.float32)
+        base[:, :160] = (40, 70, 35)
+        base[:, 160:] = (150, 80, 55)
+        base[:, :160] += rng.normal(0, 7, (size, 160, 3))
+        base[:, 160:] += rng.normal(0, 4, (size, 160, 3))
+        original = np.clip(base, 0, 255).astype(np.uint8)
+        mask = np.zeros((size, size), dtype=np.uint8)
+        mask[80:240, 80:240] = 255
+        drift = np.asarray([6, 2, -2], dtype=np.int16) * (mask[..., None] > 0)
+        generated = np.clip(original.astype(np.int16) + drift, 0, 255).astype(np.uint8)
+        source = ri._srgb_u8_to_lab(original)
+        rows = slice(120, 200)
+
+        def rim_delta_e(image_lab: np.ndarray, columns: slice) -> float:
+            return float(np.linalg.norm((image_lab[rows, columns] - source[rows, columns]).reshape(-1, 3).mean(axis=0)))
+
+        rims = {"grass": slice(81, 90), "ground": slice(230, 239)}
+        for scale in (8, 24):
+            for strength, limit in ((0.6, 1.8), (1.0, 0.75)):
+                out = ri._srgb_u8_to_lab(ri.match_color_local(original, generated, mask, strength=strength, scale_px=scale))
+                for name, columns in rims.items():
+                    with self.subTest(scale=scale, strength=strength, rim=name):
+                        self.assertLess(rim_delta_e(out, columns), limit)
+
     def test_a_non_finite_strength_is_refused(self) -> None:
         for strength in (float("nan"), float("inf")):
             with self.subTest(strength=strength), self.assertRaises(ValueError):

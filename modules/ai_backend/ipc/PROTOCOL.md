@@ -633,8 +633,10 @@ mask itself, and one too small for that skips the match). (2) Unless
 `color_match_local_pct` is `0`, a LOCAL CIELAB match of strength
 `color_match_local_pct / 100` whose finest level is a Gaussian of standard
 deviation (sigma) `color_match_scale_px` pixels, not a window side: the
-lightness mean and contrast and the a/b means inside the mask are pulled towards
-the surroundings' (carried into the mask from the original's pixels outside it),
+lightness and a/b of the dominant local colour inside the mask (a robust local
+mode, so ink lines and outlines do not count) are pulled towards the
+surroundings' dominant colour (carried into the mask from the original's pixels
+outside it),
 which corrects the drift a diffusion fill shows towards the mask centre; far
 from the ring the target converges to the ring's global statistics. The global
 step rewrites the whole generated region and the local step only pixels inside

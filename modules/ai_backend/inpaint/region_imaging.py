@@ -18,8 +18,9 @@ Main responsibilities:
   the ring outside the mask (`match_color_outside_mask`, kept
   `COLOR_MATCH_MARGIN_PX` clear of the contour), then the optional local CIELAB
   match that pulls the low frequencies inside the mask towards the surroundings
-  (`match_color_local`: cascade-filled target statistics, lightness mean +
-  contrast, a/b mean shift), then the composite (`composite_over_region`,
+  (`match_color_local`: robust local modes — target outside the mask, cascade-
+  filled inwards; current inside the mask — lightness mean + contrast, a/b
+  mean shift), then the composite (`composite_over_region`,
   `feather_mask_inwards`, `mask_distance_inside`);
 - mask morphology (`dilate_mask`, `erode_mask`, `morph_mask`).
 
@@ -29,8 +30,8 @@ inside the functions that need them, and every cv2 path has a numpy fallback
 (the local match's Gaussian, box downscale, bilinear upscale and channel mix
 included). The local match computes its low-frequency fields on a grid
 `scale // LOCAL_MATCH_GRID_SIGMA` times coarser than the region, so its cost is
-a few full-resolution passes whatever the scale (~0.4 s for a 2048x2048 region
-with cv2).
+a few full-resolution passes whatever the scale (2048x2048 with cv2: ~0.7 s at
+scale 24, ~1.1 s at scale 8).
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ from __future__ import annotations
 import io
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     import numpy as np
@@ -81,6 +82,21 @@ LOCAL_MATCH_VARIANCE_FLOOR = 1e-3
 #: Valid weight below which a cascade level counts as having no support at a
 #: cell (its normalized-convolution ratio would be rounding noise).
 LOCAL_MATCH_MIN_WEIGHT = 1e-6
+
+#: Similarity scale tau of the local match's robust estimate: a pixel ΔE (CIE76)
+#: from the local colour keeps weight `exp(-ΔE² / (2·tau²))` — 0.61 at tau,
+#: 0.04 at 2.5·tau. 12 sits between a surface's own texture/noise (a few ΔE,
+#: kept) and ink lines, outlines and page background (tens of ΔE, dropped); a
+#: generated drift larger than about tau is therefore no longer pulled by the
+#: local step (the global step still corrects the VAE's tone shift).
+LOCAL_MATCH_SIMILARITY_DE = 12.0
+
+#: Reweighting passes of the robust estimate (mean shift towards the local mode).
+LOCAL_MATCH_ROBUST_ITERATIONS = 2
+
+#: Similar-pixel share below which a side's estimate is a mixture rather than a
+#: surface: the correction fades linearly to the identity below it.
+LOCAL_MATCH_MIN_SHARE = 0.25
 
 #: Gaussian sigma, in grid cells, at which the local match's low-pass works.
 #: A larger sigma is applied on a grid downscaled by `floor(sigma / this)`: the
@@ -170,25 +186,46 @@ def match_color_local(
     - the result is `C + (R - C) * strength`.
 
     `mu_c` / `sd_c` are the statistics of `corrected` taken only from pixels
-    INSIDE `mask` (a normalized convolution at `scale_px`; the global inside
-    moments where no inside pixel is in reach). This deliberately departs from
-    the spec's plain Gaussian over all pixels: near the contour that window
+    INSIDE `mask`, at scale `scale_px`. This deliberately departs from the
+    spec's plain Gaussian over all pixels: near the contour that window
     averages the drifted generated pixels with the (already matching) outside,
     sees only part of the drift and inflates `sd_c` across the edge step, so the
     rim stayed under-corrected in a band 1-2 scales wide — a visible seam along
-    the contour against the fully corrected centre. `mu_t` /
-    `sd_t` are those of `original`, taken only from pixels outside `mask` grown
-    by `LOCAL_MATCH_VALID_MARGIN_PX` and carried into the mask by a cascade of
-    normalized convolutions (`scale_px * 2**i`, `LOCAL_MATCH_LEVELS` levels): a
-    single scale has no valid pixel in reach at the centre of a wide mask, so
-    each coarser scale fills what the finer ones were not confident about, and
-    the valid-weighted global moments of the original end the cascade: every
-    Gaussian is truncated at 4 sigma, so beyond ~67·`scale_px` from the ring no
-    level has any weight and the target converges smoothly to the global one.
+    the contour against the fully corrected centre. `mu_t` / `sd_t` are those of
+    `original`, taken only from pixels outside `mask` grown by
+    `LOCAL_MATCH_VALID_MARGIN_PX` and carried into the mask by a cascade of
+    scales (`scale_px * 2**i`, `LOCAL_MATCH_LEVELS` levels): a single scale has
+    no valid pixel in reach at the centre of a wide mask, so each coarser scale
+    fills what the finer ones were not confident about, and the global moments
+    of the original end the cascade (every Gaussian is truncated at 4 sigma, so
+    beyond ~67·`scale_px` from the ring no level has any weight and the target
+    converges smoothly to the global one).
+
+    Both sides are ROBUST local modes, not means (`_robust_local_moments`): at
+    each scale, `LOCAL_MATCH_ROBUST_ITERATIONS` passes reweight every sample by
+    `exp(-ΔE² / (2·LOCAL_MATCH_SIMILARITY_DE²))` against that scale's field at
+    the sample's position, and the means and E[L²] are re-estimated with those
+    weights. On line art the ring's mean is a darker, greyer fill (ink, white
+    outlines, page) and dragged the model's clean fill into a grey patch the
+    shape of the mask; the mode keeps the fill. Where a side's similar-pixel
+    share falls below `LOCAL_MATCH_MIN_SHARE` the estimate is a mixture, not a
+    surface, and the correction fades linearly to the identity there.
+
+    Known limits: (1) a drift larger than about `LOCAL_MATCH_SIMILARITY_DE` is
+    no longer pulled by this step (the generated pixels are then "another
+    colour"; the global step still corrects the VAE's tone shift). (2) Where a
+    surface boundary runs through the mask's interior, each ring sample agrees
+    with its own surface, so a coarse window keeps both and the target there
+    blends them, pulling one surface towards the other (measured: up to ~8 ΔE
+    at strength 0.6, scale 8, as before the robust estimate). The rims next to
+    each surface converge to their own surface. The fix would be a
+    cross-bilateral estimate (similarity measured at the evaluated point, e.g.
+    through colour clusters); deliberately not done.
+
     The low-frequency fields are evaluated on a coarser grid over a reflect-101
-    padded copy of the region; they agree with a full-resolution evaluation to
-    about one level (p99.9 two levels, a handful of isolated pixels up to five
-    on a region border the mask touches at the largest scale).
+    padded copy of the region (coarse scales on seeded jittered point samples);
+    they agree with a full-resolution evaluation to about one level (p99 two
+    levels on a region border the mask touches at the largest scale).
 
     `original`, `corrected`: HxWx3 uint8 RGB of the same shape; `mask`: HxW, non-
     zero = may change. `strength` is clamped to 0..1 (0 returns `corrected`
@@ -240,35 +277,11 @@ def match_color_local(
     height, width = mask.shape
     source_lab = _srgb_u8_to_lab(original)
     corrected_lab = _srgb_u8_to_lab(corrected)
-    weight = valid.astype(np.float32)
-    inside_weight = inside.astype(np.float32)
 
     # Moments are taken about one shared centre near both images' mean, so
     # `E[x²] - E[x]²` does not cancel catastrophically in float32 (L² reaches
     # 1e4). Any value close to the mean conditions it; a strided sample is enough.
     center = corrected_lab[::4, ::4].reshape(-1, 3).mean(axis=0, dtype=np.float64).astype(np.float32)
-    # The cascade's terminal level: the valid-weighted GLOBAL moments of the
-    # original [L, a, b, L²] (centred). It always has support, so a pixel no
-    # scale reaches (cv2 truncates each Gaussian at 4 sigma: beyond ~4·16·s
-    # from the ring every level's weight is exactly zero) converges to the
-    # global target instead of to garbage or the variance floor.
-    weight_sum = float(weight.sum(dtype=np.float64))
-    source_centred = source_lab - center
-    global_moments = np.empty(4, dtype=np.float32)
-    for channel in range(3):
-        global_moments[channel] = float((source_centred[..., channel] * weight).sum(dtype=np.float64)) / weight_sum
-    global_moments[3] = float((source_centred[..., 0] * source_centred[..., 0] * weight).sum(dtype=np.float64)) / weight_sum
-    del source_centred
-    # The same for the corrected image over the INSIDE pixels: the fallback of
-    # its local statistics where no inside pixel is in reach (only grid cells
-    # far from the mask, never a pixel the result is read at).
-    inside_sum = float(inside_weight.sum(dtype=np.float64))
-    corrected_centred = corrected_lab - center
-    inside_moments = np.empty(4, dtype=np.float32)
-    for channel in range(3):
-        inside_moments[channel] = float((corrected_centred[..., channel] * inside_weight).sum(dtype=np.float64)) / inside_sum
-    inside_moments[3] = float((corrected_centred[..., 0] * corrected_centred[..., 0] * inside_weight).sum(dtype=np.float64)) / inside_sum
-    del corrected_centred
 
     # Every low-frequency field lives on one grid `grid_factor` times coarser
     # than the region: the fine pixels' MOMENTS are box-averaged (never the
@@ -288,78 +301,38 @@ def match_color_local(
     pad = 0 if grid_factor == 1 else grid_factor * (int(np.ceil(4.0 * grid_sigma(scale))) + 1)
     pad_bottom = pad + (-(height + 2 * pad) % grid_factor)
     pad_right = pad + (-(width + 2 * pad) % grid_factor)
-    if pad or pad_bottom or pad_right:
-        source_lab_padded = _reflect_pad(source_lab, pad, pad_bottom, pad, pad_right)
-        corrected_padded = _reflect_pad(corrected_lab, pad, pad_bottom, pad, pad_right)
-        weight_padded = _reflect_pad(weight[..., None], pad, pad_bottom, pad, pad_right)[..., 0]
-        inside_padded = _reflect_pad(inside_weight[..., None], pad, pad_bottom, pad, pad_right)[..., 0]
-    else:
-        source_lab_padded, corrected_padded, weight_padded, inside_padded = source_lab, corrected_lab, weight, inside_weight
-    padded_shape = weight_padded.shape
-
-    # Grid channels: 0 valid (outside) weight, 1-3 weighted source Lab, 4
-    # weighted source L², 5 inside weight, 6-8 inside-weighted corrected Lab, 9
-    # inside-weighted corrected L² (each term is reduced on its own to keep the
-    # fine-resolution temporaries to one HxWx3 at a time).
-    s = (source_lab_padded - center) * weight_padded[..., None]
-    source_l = source_lab_padded[..., :1] - center[0]
-    c = (corrected_padded - center) * inside_padded[..., None]
-    corrected_l = corrected_padded[..., :1] - center[0]
-    grid = np.concatenate(
-        (
-            _box_downsample(weight_padded[..., None], grid_factor),
-            _box_downsample(s, grid_factor),
-            _box_downsample(source_l * s[..., :1], grid_factor),
-            _box_downsample(inside_padded[..., None], grid_factor),
-            _box_downsample(c, grid_factor),
-            _box_downsample(corrected_l * c[..., :1], grid_factor),
-        ),
-        axis=2,
+    geometry = _LocalGrid(
+        factor=grid_factor,
+        crop=(pad, pad + height, pad, pad + width),
+        sigmas_px=tuple(scale * float(2**level) for level in range(LOCAL_MATCH_LEVELS)),
     )
-    del s, source_l, c, corrected_l, source_lab_padded, corrected_padded, weight_padded, inside_padded
 
-    # Target statistics: cascade fill of [L, a, b, L²] from the valid pixels.
-    def fill_level(level: int) -> tuple[np.ndarray, np.ndarray]:
-        # Normalized convolution at `scale * 2**level` and how sure it is. Where
-        # the level has no support at all its ratio means nothing, so it reads
-        # as the global moments instead of 0 (it carries zero confidence there).
-        blurred = _smooth(grid[..., :5], grid_sigma(scale * float(2**level)))
-        level_weight = blurred[..., :1]
-        supported = level_weight > LOCAL_MATCH_MIN_WEIGHT
-        value = np.where(supported, blurred[..., 1:] / np.maximum(level_weight, LOCAL_MATCH_MIN_WEIGHT), global_moments)
-        return value, np.clip(level_weight / LOCAL_MATCH_CONFIDENCE, 0.0, 1.0)
+    def padded(field: np.ndarray) -> np.ndarray:
+        if not (pad or pad_bottom or pad_right):
+            return field
+        return _reflect_pad(field, pad, pad_bottom, pad, pad_right)
 
-    target, confidence = fill_level(0)
-    for level in range(1, LOCAL_MATCH_LEVELS):
-        level_value, level_confidence = fill_level(level)
-        target = confidence * target + (1.0 - confidence) * level_value
-        confidence = np.maximum(confidence, level_confidence)
-    target = confidence * target + (1.0 - confidence) * global_moments
+    # Target: the original's dominant local colour outside the margin, carried
+    # into the mask by the cascade. Current: the corrected image's dominant
+    # local colour over the pixels INSIDE the mask only (see the docstring).
+    target, target_share = _robust_local_moments(padded(source_lab - center), padded(valid.astype(np.float32)[..., None])[..., 0], geometry, cascade=True)
+    local, local_share = _robust_local_moments(padded(corrected_lab - center), padded(inside.astype(np.float32)[..., None])[..., 0], geometry, cascade=False)
     target_mean = target[..., :3]
     target_std = np.sqrt(np.maximum(target[..., 3] - target_mean[..., 0] ** 2, LOCAL_MATCH_VARIANCE_FLOOR))
-
-    # Local statistics of the corrected image: a normalized convolution at
-    # `scale` over the pixels INSIDE the mask, mirroring the target's
-    # outside-only one. A plain Gaussian would average the generated pixels
-    # near the contour with the (already matching) outside, see only part of
-    # the drift there and leave a rim band 1-2 scales wide under-corrected.
-    blurred_inside = _smooth(grid[..., 5:], grid_sigma(scale))
-    local_weight = blurred_inside[..., :1]
-    local = np.where(
-        local_weight > LOCAL_MATCH_MIN_WEIGHT,
-        blurred_inside[..., 1:] / np.maximum(local_weight, LOCAL_MATCH_MIN_WEIGHT),
-        inside_moments,
-    )
     local_mean = local[..., :3]
     local_std = np.sqrt(np.maximum(local[..., 3] - local_mean[..., 0] ** 2, LOCAL_MATCH_VARIANCE_FLOOR))
 
     # The correction is linear per pixel: L' = L·gain + offset_L, a' = a + shift_a,
     # b' = b + shift_b, on absolute Lab values (the shared centre is folded in).
-    gain = np.clip(target_std / local_std, *LOCAL_MATCH_GAIN_RANGE)
-    shift = target_mean - local_mean
-    offset_l = target_mean[..., 0] + center[0] - (local_mean[..., 0] + center[0]) * gain
+    # Where either side's dominant colour is carried by too few similar pixels
+    # the estimate is not a surface but a mixture, so the correction fades to
+    # the identity (gain 1, no offset) instead of pulling towards it.
+    trust = np.clip(np.minimum(target_share, local_share) / LOCAL_MATCH_MIN_SHARE, 0.0, 1.0)
+    gain = 1.0 + (np.clip(target_std / local_std, *LOCAL_MATCH_GAIN_RANGE) - 1.0) * trust
+    shift = (target_mean - local_mean) * trust[..., None]
+    offset_l = (target_mean[..., 0] + center[0]) * trust - (local_mean[..., 0] + center[0]) * (gain - 1.0 + trust)
     fields = np.stack((gain, offset_l, shift[..., 1], shift[..., 2]), axis=2).astype(np.float32)
-    fields = _upsample_linear(fields, grid_factor, padded_shape)[pad : pad + height, pad : pad + width]
+    fields = _upsample_linear(fields, grid_factor, padded(np.zeros((height, width, 1), dtype=np.float32)).shape[:2])[pad : pad + height, pad : pad + width]
 
     at = fields[inside]
     lab = corrected_lab[inside]
@@ -381,6 +354,142 @@ def match_color_local(
     )
     return np.ascontiguousarray(out)
 
+
+class _LocalGrid(NamedTuple):
+    """Geometry shared by both sides of the local match.
+
+    `factor`: fine pixels per grid cell; `crop`: (top, bottom, left, right) of
+    the region inside the padded fine fields (`top` / `left` are whole cells);
+    `sigmas_px`: the cascade's Gaussian sigmas in fine pixels, finest first (the
+    current side uses the first only).
+    """
+
+    factor: int
+    crop: tuple[int, int, int, int]
+    sigmas_px: tuple[float, ...]
+
+
+def _jittered_sample_indices(height: int, width: int, stride: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """Row and column index grids picking ONE pixel per `stride` x `stride` block, at a seeded random offset.
+
+    Point samples keep every sample a real pixel (an ink line stays an ink
+    sample, not an ink-and-fill blend), and the per-block jitter keeps a
+    periodic pattern (screentone, hatching) whose period divides the stride
+    from aliasing into a biased sample. Seeded, so a run is reproducible.
+    """
+    import numpy as np
+
+    rows = -(-height // stride)
+    cols = -(-width // stride)
+    rng = np.random.default_rng(seed)
+    row_index = np.minimum(np.arange(rows)[:, None] * stride + rng.integers(0, stride, size=(rows, cols)), height - 1)
+    col_index = np.minimum(np.arange(cols)[None, :] * stride + rng.integers(0, stride, size=(rows, cols)), width - 1)
+    return row_index, col_index
+
+
+def _robust_local_moments(
+    centred_lab: np.ndarray, base_weight: np.ndarray, geometry: _LocalGrid, *, cascade: bool
+) -> tuple[np.ndarray, np.ndarray]:
+    """Dominant local colour [L, a, b, E[L²]] (centred) on the grid, and its share.
+
+    `centred_lab`: padded HxWx3 fine Lab minus the shared centre; `base_weight`:
+    padded HxW 0/1 weight of the pixels this side may sample. Each scale starts
+    from its weighted mean field, then `LOCAL_MATCH_ROBUST_ITERATIONS` times
+    reweights every sample by `exp(-ΔE² / (2·LOCAL_MATCH_SIMILARITY_DE²))`
+    against that scale's field at the sample's own position (mean shift towards
+    the local mode at that scale) and re-estimates: on line art the ink,
+    outlines and page drop out and the fill survives, and the same weights give
+    the L variance, so ink does not inflate the gain. Reweighting per SCALE
+    matters: a surface that dominates its own small neighbourhood (a white page
+    beyond the panel border) is a minority at a coarse scale and must not leak
+    into the coarse fill of the mask's interior with full weight.
+
+    Scale `i` (sigma `sigmas_px[i]`) works on jittered point samples at stride
+    `2**i` (`_jittered_sample_indices`) and its own grid `factor·2**i` px a
+    cell, so every scale costs a quarter of the previous one and the whole
+    cascade about 1.3 full-resolution passes per reweighting.
+
+    `cascade=True` (the target) fills the field into regions without samples
+    through every scale and ends with the robust global moments (weighted by the
+    coarsest scale's similarities); `cascade=False` (the current side) uses the
+    finest scale only, with the robust global moments where no sample is in
+    reach. The share is the similarity-weighted fraction of the sampled pixels
+    (1 = all agree with the field), filled the same way; the caller fades the
+    correction to the identity where it is low.
+    """
+    import numpy as np
+
+    top, bottom, left, right = geometry.crop
+    factor = geometry.factor
+    grid_shape = (base_weight.shape[0] // factor, base_weight.shape[1] // factor)
+
+    def robust_scale(level: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.float32]:
+        stride = 2**level
+        if stride == 1:
+            lab, base = centred_lab, base_weight
+        else:
+            row_index, col_index = _jittered_sample_indices(base_weight.shape[0], base_weight.shape[1], stride, seed=level)
+            lab, base = centred_lab[row_index, col_index], base_weight[row_index, col_index]
+        cell_px = factor * stride
+        sigma_px = geometry.sigmas_px[level]
+        sigma = float(np.sqrt(max(sigma_px * sigma_px - (cell_px * cell_px - 1) / 12.0, 0.0))) / cell_px
+        base_grid = _box_downsample(base[..., None], factor)
+        # The region's own cells (a ragged edge cell holds a few reflected
+        # pixels, negligible for a global fallback).
+        cells = (slice(top // cell_px, -(-bottom // cell_px)), slice(left // cell_px, -(-right // cell_px)))
+        base_sum = float(base_grid[cells].sum(dtype=np.float64))
+
+        def estimate(robust: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.float32]:
+            # Normalized convolution of [robust·Lab, robust·L²] by robust:
+            # value, share and spatial confidence; a cell with no (similar)
+            # sample reads as the robust global estimate.
+            weighted = lab * robust[..., None]
+            grid = np.concatenate(
+                (
+                    base_grid,
+                    _box_downsample(robust[..., None], factor),
+                    _box_downsample(weighted, factor),
+                    _box_downsample(lab[..., :1] * weighted[..., :1], factor),
+                ),
+                axis=2,
+            )
+            del weighted
+            sums = grid[cells].reshape(-1, grid.shape[2]).sum(axis=0, dtype=np.float64)
+            robust_sum = float(sums[1])
+            totals = (sums[2:] / robust_sum).astype(np.float32) if robust_sum > 0.0 else np.zeros(4, dtype=np.float32)
+            share_total = np.float32(robust_sum / base_sum) if base_sum > 0.0 else np.float32(0.0)
+            blurred = _smooth(grid, sigma)
+            cell_base, cell_weight = blurred[..., :1], blurred[..., 1:2]
+            value = np.where(cell_weight > LOCAL_MATCH_MIN_WEIGHT, blurred[..., 2:] / np.maximum(cell_weight, LOCAL_MATCH_MIN_WEIGHT), totals)
+            share = np.where(cell_base > LOCAL_MATCH_MIN_WEIGHT, cell_weight / np.maximum(cell_base, LOCAL_MATCH_MIN_WEIGHT), share_total)
+            confidence = np.clip(cell_base / LOCAL_MATCH_CONFIDENCE, 0.0, 1.0)
+            return value, share, confidence, totals, share_total
+
+        value, share, confidence, totals, share_total = estimate(base)
+        for _ in range(LOCAL_MATCH_ROBUST_ITERATIONS):
+            mean_at_samples = _upsample_linear(np.ascontiguousarray(value[..., :3]), factor, base.shape)
+            distance = lab - mean_at_samples
+            # einsum: numpy's reduce over a length-3 last axis is ~10x slower.
+            similarity = np.exp(np.einsum("ijk,ijk->ij", distance, distance) * np.float32(-0.5 / LOCAL_MATCH_SIMILARITY_DE**2))
+            del mean_at_samples, distance
+            value, share, confidence, totals, share_total = estimate(base * similarity.astype(np.float32))
+        if stride > 1:
+            # This scale's cells span exactly `stride` x `stride` grid cells.
+            stacked = _upsample_linear(np.concatenate((value, share, confidence), axis=2), stride, grid_shape)
+            value, share, confidence = stacked[..., :4], stacked[..., 4:5], stacked[..., 5:6]
+        return value, share[..., 0], confidence[..., 0], totals, share_total
+
+    moments, share, confidence, totals, share_total = robust_scale(0)
+    if not cascade:
+        return moments, share
+    for level in range(1, len(geometry.sigmas_px)):
+        level_value, level_share, level_confidence, totals, share_total = robust_scale(level)
+        moments = confidence[..., None] * moments + (1.0 - confidence[..., None]) * level_value
+        share = confidence * share + (1.0 - confidence) * level_share
+        confidence = np.maximum(confidence, level_confidence)
+    moments = confidence[..., None] * moments + (1.0 - confidence[..., None]) * totals
+    share = confidence * share + (1.0 - confidence) * share_total
+    return moments, share
 
 # ---------------------------------------------------------------------
 #  CIELAB (sRGB, D65) and the local match's low-pass
