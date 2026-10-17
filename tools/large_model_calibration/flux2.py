@@ -133,6 +133,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParse
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--vram-cap-gib", type=float, default=None, help="the manager's vram_cap plus torch's allocator cap (see flux3 --help)")
     parser.add_argument("--device", default="discrete", help="'discrete' (never the iGPU), 'service' (General.ai_device), or cuda:N")
+    parser.add_argument("--encoder-on-cpu", action="store_true", help="«Энкодер на CPU»: pin the text encoder to the CPU (off: the steps place it, the measured grid)")
     parser.add_argument("--keep-learned-floors", action="store_true", help="keep the manager's learned step floors between combos")
     parser.add_argument("--dry-run", action="store_true", help="print the combos and exit (no torch import)")
     return parser
@@ -184,6 +185,8 @@ def _params(args: argparse.Namespace, combo: Flux2Combo, index: int) -> dict[str
         "seed": args.seed,
         "dtype": combo.dtype,
         "text_encoder_fp8": combo.encoder_fp8,
+        # Explicit, because the wire default is «Энкодер на CPU» on.
+        "encoder_on_cpu": bool(args.encoder_on_cpu),
         "max_sequence_length": combo.max_seq,
         "vram_step": combo.vram_step.value,
         "ram_step": combo.ram_step.value,

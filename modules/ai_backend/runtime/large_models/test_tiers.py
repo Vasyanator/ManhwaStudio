@@ -3,7 +3,8 @@ File: modules/ai_backend/runtime/large_models/test_tiers.py
 
 Purpose:
 Unit tests for `tiers.py`: the step orders and the RAM-major Auto walk, the
-composition table of `template_for` (all 12 concrete pairs), placement and
+composition table of `template_for` (all 12 concrete pairs), the pinned
+component's policy per RAM step (`host_pinned_policy`), placement and
 policy validation, the floor and plan rules (`AUTO` is never a plan value),
 and transitions derived from consecutive states.
 """
@@ -31,6 +32,7 @@ from .tiers import (
     Tier,
     VramStep,
     derive_transitions,
+    host_pinned_policy,
     more_economical_ram,
     more_economical_vram,
     template_for,
@@ -105,6 +107,16 @@ class CompositionTests(unittest.TestCase):
                     for policy in (dit, encoder, ae):
                         self.assertEqual((policy.idle, policy.keep), ((idle,), (keep,)), "every step is strict: one idle and one keep tier")
                     self.assertEqual(template.device_share, 0.5 if vram is VramStep.HALF else None)
+
+    def test_a_pinned_component_follows_the_ram_step_alone(self) -> None:
+        expected = {RamStep.KEEP: (_H, _H), RamStep.RUN: (_H, _X), RamStep.MIN: (_X, _X)}
+        for ram, (idle, keep) in expected.items():
+            with self.subTest(ram=ram.value):
+                policy = host_pinned_policy(ram)
+                self.assertEqual(_active(policy.active), [(_H, _CPU, False, None)])
+                self.assertEqual((policy.idle, policy.keep), ((idle,), (keep,)))
+        with self.assertRaises(ValueError):
+            host_pinned_policy(RamStep.AUTO)
 
     def test_auto_has_no_template(self) -> None:
         for steps in (AUTO_STEPS, Steps(VramStep.MAX, RamStep.AUTO), Steps(VramStep.AUTO, RamStep.KEEP)):

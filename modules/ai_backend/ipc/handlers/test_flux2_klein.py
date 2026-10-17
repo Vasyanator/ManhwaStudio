@@ -17,8 +17,9 @@ whose `_write` records each frame, so the exact on-the-wire progress shape
 Coverage:
 - two-phase progress (`load` / `generate`) with an always-empty blob;
 - terminal response: result PNG as the RESPONSE BLOB, header carrying
-  `image_len`, `oom_recovered`, the `applied` memory settings and, beside them
-  (never inside), the effective `text_attention_in_mask`;
+  `image_len`, `oom_recovered`, `applied` (`{vae_tiling}` alone) and, beside
+  it (never inside), the effective `text_attention_in_mask` and the four step
+  keys; the retired `placement` / `profile*` keys never reach the client;
 - request blob split by `image_len`/`mask_len`/`reference_len` with strict
   equality; an absent or zero `reference_len` reaches the service as NO reference
   (`None`), a present one as exactly its own segment, and a malformed length or a
@@ -27,7 +28,8 @@ Coverage:
 - no-emitter => no progress frames, still a correct terminal response;
 - a dead peer: every frame still attempted, ONE warning per request, the work goes on;
 - `inpaint.flux2_klein.status` with and without `params`;
-- `inpaint.flux2_klein.estimate` requires a positive region size;
+- `inpaint.flux2_klein.estimate` is gone (protocol 14): no handler, not in
+  `ALL_METHODS`;
 - `inpaint.flux2_klein.unload` returns `{"unloaded": bool}`;
 - error mapping: ValueError / FileNotFoundError / generic Exception propagate
   (the dispatcher maps them to `response{status:"error"}`);
@@ -68,6 +70,7 @@ import pytest
 
 from modules.ai_backend.ipc.dispatcher import ProgressEmitter
 from modules.ai_backend.ipc.protocol import (
+    ALL_METHODS,
     HEADER_ID,
     HEADER_KIND,
     KIND_PROGRESS,
@@ -75,7 +78,6 @@ from modules.ai_backend.ipc.protocol import (
     METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
     METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK,
     METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START,
-    METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_EXPORT,
     METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
@@ -133,7 +135,6 @@ class _FakeFlux2KleinService:
         #: The `reference_bytes` of every `inpaint_image_bytes` call, in order.
         self.reference_calls: list[bytes | None] = []
         self.status_calls: list[Any] = []
-        self.estimate_calls: list[dict[str, Any]] = []
         #: (method, params, extra kwargs) per prompt-cache call.
         self.prompt_cache_calls: list[tuple[str, Any, dict[str, Any]]] = []
         #: (params, component, action) per `component_action` call.
@@ -162,14 +163,6 @@ class _FakeFlux2KleinService:
     def status(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
         self.status_calls.append(params)
         return {"available": False, "reason": "Не выбран трансформер"}
-
-    def estimate(
-        self, *, params: dict[str, Any], region_width: int, region_height: int
-    ) -> dict[str, Any]:
-        self.estimate_calls.append(
-            {"params": params, "region_width": region_width, "region_height": region_height}
-        )
-        return {"vram_bytes": 1024, "fits": True}
 
     def unload(self) -> bool:
         self.unload_calls += 1
@@ -271,17 +264,8 @@ def _default_result() -> dict[str, Any]:
         "image_png": RESULT_PNG,
         "region_size": [512, 512],
         "device": "cuda:0",
-        "placement": "encoder_cpu",
         "oom_recovered": False,
-        "applied": {
-            "unload_transformer_before_vae": True,
-            "vae_tiling": True,
-            "vae_slicing": True,
-            "unload_text_encoder_after_encode": False,
-            "text_encoder_fp8": False,
-        },
-        "profile": "balanced",
-        "profile_effective": "balanced",
+        "applied": {"vae_tiling": True},
         "vram_step": "phase",
         "ram_step": "keep",
         "vram_step_effective": "phase",
@@ -345,16 +329,8 @@ def test_streaming_emits_two_phases_then_the_terminal_response() -> None:
     assert resp_header == {
         "image_len": len(RESULT_PNG),
         "oom_recovered": False,
-        "applied": {
-            "unload_transformer_before_vae": True,
-            "vae_tiling": True,
-            "vae_slicing": True,
-            "unload_text_encoder_after_encode": False,
-            "text_encoder_fp8": False,
-        },
+        "applied": {"vae_tiling": True},
         "text_attention_in_mask": False,
-        "profile": "balanced",
-        "profile_effective": "balanced",
         "vram_step": "phase",
         "ram_step": "keep",
         "vram_step_effective": "phase",
@@ -367,11 +343,11 @@ def test_streaming_emits_two_phases_then_the_terminal_response() -> None:
 
 def test_a_degraded_run_reports_the_manager_fields() -> None:
     result = _default_result()
-    result.update({"profile": "max_speed", "profile_effective": "balanced", "vram_step": "max", "vram_step_effective": "phase", "degraded": True, "degrade_reason": "device_oom"})
+    result.update({"vram_step": "max", "vram_step_effective": "phase", "degraded": True, "degrade_reason": "device_oom"})
     svc = _FakeFlux2KleinService(result)
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
     resp_header, _blob = handler(_ctx(svc), _header({"params": {}}), REGION_PNG + MASK_PNG, _no_cancel())
-    assert (resp_header["profile"], resp_header["profile_effective"], resp_header["degraded"], resp_header["degrade_reason"]) == ("max_speed", "balanced", True, "device_oom")
+    assert (resp_header["degraded"], resp_header["degrade_reason"]) == (True, "device_oom")
     assert (resp_header["vram_step"], resp_header["vram_step_effective"], resp_header["ram_step"], resp_header["ram_step_effective"]) == ("max", "phase", "keep", "keep")
 
 
@@ -385,40 +361,30 @@ def test_the_step_keys_mirror_the_service() -> None:
 def test_oom_recovery_is_reported_in_the_response_header() -> None:
     result = _default_result()
     result["oom_recovered"] = True
-    result["applied"] = {
-        "unload_transformer_before_vae": True,
-        "vae_tiling": True,
-        "vae_slicing": True,
-        "unload_text_encoder_after_encode": False,
-        "text_encoder_fp8": False,
-    }
     svc = _FakeFlux2KleinService(result)
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
     resp_header, _blob = handler(
         _ctx(svc), _header({"params": {}}), REGION_PNG + MASK_PNG, _no_cancel()
     )
     assert resp_header["oom_recovered"] is True
-    assert resp_header["applied"]["unload_transformer_before_vae"] is True
+    assert resp_header["applied"] == {"vae_tiling": True}
 
 
-def test_every_applied_flag_is_forwarded_even_when_the_service_omits_one() -> None:
-    # The Rust client parses `applied` as one struct and ignores an incomplete
-    # object outright, so a missing key does not degrade the answer — it throws
-    # away the OOM-recovery settings the next run was meant to start from.
+def test_applied_is_exactly_the_tiling_flag_whatever_the_service_answers() -> None:
+    # The client persists `applied`; a flag the service omits reads `false`, and
+    # an extra key (a retired v13 flag) never reaches the wire.
     result = _default_result()
-    result["applied"] = {"vae_tiling": True}
+    result["applied"] = {"unload_transformer_before_vae": True}
+    result["placement"] = "full_gpu"
+    result["profile"] = "max_speed"
     svc = _FakeFlux2KleinService(result)
     handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN)
     resp_header, _blob = handler(
         _ctx(svc), _header({"params": {}}), REGION_PNG + MASK_PNG, _no_cancel()
     )
-    assert resp_header["applied"] == {
-        "unload_transformer_before_vae": False,
-        "vae_tiling": True,
-        "vae_slicing": False,
-        "unload_text_encoder_after_encode": False,
-        "text_encoder_fp8": False,
-    }
+    assert resp_header["applied"] == {"vae_tiling": False}
+    for retired in ("placement", "profile", "profile_effective"):
+        assert retired not in resp_header
 
 
 def test_the_effective_text_attention_flag_is_reported_beside_applied() -> None:
@@ -596,7 +562,7 @@ def test_cancel_observed_after_the_service_returns_is_an_interrupt() -> None:
 
 
 # ---------------------------------------------------------------------------
-# status / estimate / unload
+# status / unload
 # ---------------------------------------------------------------------------
 def test_status_forwards_params_when_given() -> None:
     svc = _FakeFlux2KleinService()
@@ -614,35 +580,11 @@ def test_status_without_params_asks_for_the_last_configuration() -> None:
     assert svc.status_calls == [None]
 
 
-def test_estimate_forwards_the_region_size() -> None:
-    svc = _FakeFlux2KleinService()
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE)
-    header, blob = handler(
-        _ctx(svc),
-        {"params": {"placement": "full_gpu"}, "region_width": 512, "region_height": 256},
-        b"",
-        _no_cancel(),
-    )
-    assert blob == b""
-    assert header == {"vram_bytes": 1024, "fits": True}
-    assert svc.estimate_calls == [
-        {"params": {"placement": "full_gpu"}, "region_width": 512, "region_height": 256}
-    ]
-
-
-@pytest.mark.parametrize(
-    "header",
-    [
-        {"params": {}},  # both sizes missing
-        {"params": {}, "region_width": 512},
-        {"params": {}, "region_width": 0, "region_height": 256},
-        {"params": {}, "region_width": "512", "region_height": 256},
-    ],
-)
-def test_estimate_requires_a_positive_region_size(header: dict[str, Any]) -> None:
-    handler = get_handler(METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE)
-    with pytest.raises(ValueError):
-        handler(_ctx(_FakeFlux2KleinService()), header, b"", _no_cancel())
+def test_the_estimate_method_is_gone() -> None:
+    # Protocol 14: forecasts are `large_models.profiles`; the dispatcher answers
+    # the old name as an unknown method.
+    assert get_handler("inpaint.flux2_klein.estimate") is None
+    assert "inpaint.flux2_klein.estimate" not in ALL_METHODS
 
 
 @pytest.mark.parametrize("unloaded", [True, False])
@@ -1207,10 +1149,10 @@ def test_existing_four_argument_progress_callers_are_unchanged() -> None:
     # The download's three extra fields are additive: a service that calls its
     # progress callback with four positional arguments — every caller that
     # existed before — must emit exactly the frame it always did.
-    from modules.ai_backend.ipc.handlers.flux2_klein import _progress_forwarder
+    from modules.ai_backend.ipc.handlers.streaming import progress_forwarder
 
     emitter, disp = _emitter()
-    forward = _progress_forwarder(_ctx(_FakeFlux2KleinService(), emitter=emitter), METHOD_INPAINT_FLUX2_KLEIN)
+    forward = progress_forwarder(_ctx(_FakeFlux2KleinService(), emitter=emitter), METHOD_INPAINT_FLUX2_KLEIN)
     forward("load", 2, 6, "Загрузка трансформера")
 
     assert len(disp.frames) == 1
@@ -1231,7 +1173,7 @@ def test_both_download_methods_are_registered() -> None:
 def test_a_dead_peer_is_logged_once_per_request_and_never_aborts_the_work(caplog: pytest.LogCaptureFixture) -> None:
     # Documented semantics: the work goes on (a disconnect does not cancel a
     # run or a download), but the failure is no longer swallowed silently.
-    from modules.ai_backend.ipc.handlers.flux2_klein import _progress_forwarder
+    from modules.ai_backend.ipc.handlers.streaming import progress_forwarder
 
     class _DeadDispatcher:
         def __init__(self) -> None:
@@ -1242,8 +1184,8 @@ def test_a_dead_peer_is_logged_once_per_request_and_never_aborts_the_work(caplog
             raise BrokenPipeError("peer gone")
 
     dead = _DeadDispatcher()
-    forward = _progress_forwarder(_ctx(_FakeFlux2KleinService(), emitter=ProgressEmitter(dead, REQUEST_ID)), METHOD_INPAINT_FLUX2_KLEIN)
-    with caplog.at_level("WARNING", logger="modules.ai_backend.ipc.handlers.flux2_klein"):
+    forward = progress_forwarder(_ctx(_FakeFlux2KleinService(), emitter=ProgressEmitter(dead, REQUEST_ID)), METHOD_INPAINT_FLUX2_KLEIN)
+    with caplog.at_level("WARNING", logger="modules.ai_backend.ipc.handlers.streaming"):
         for step in range(3):
             forward("generate", step, 3, "Генерация")
     assert dead.attempts == 3, "every frame is still attempted"

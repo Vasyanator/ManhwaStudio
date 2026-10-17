@@ -37,9 +37,15 @@ pub(super) fn region_rect(x: usize, y: usize, w: usize, h: usize) -> Option<Over
 pub(super) fn engine_with_settled_region() -> Flux2KleinEngine {
     let mut engine = Flux2KleinEngine::default();
     engine.set_region(region_rect(0, 0, 128, 128), true);
-    engine.estimate_wanted = false;
+    engine.resources.wanted = false;
     engine.region_resize_pending = false;
     engine
+}
+
+/// The settings a valid document loads as (migration applied), for tests that only care
+/// about the values. A document that is not a settings object fails the test.
+pub(super) fn loaded_settings(value: &Value) -> Flux2KleinSettings {
+    settings_from_json(value).expect("a valid settings document").settings
 }
 
 /// Settings that pass every gate except the one under test, so a block reason a

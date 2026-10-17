@@ -22,7 +22,9 @@ Arithmetic (all bytes):
 - phase host peak = baseline RSS + host-resident weights + CPU activation +
   host staging when blocks stream from disk;
 - transition peak = max(before, after) of the weights + ONE unit in flight
-  (largest moving block or tensor) — a component that moves is counted in its
+  (largest moving block or tensor; on the DEVICE side only among the
+  components whose device bytes change: a CPU-executed component read into or
+  dropped from RAM has nothing in flight on the device) — a component that moves is counted in its
   old place before and in its new place after, never in both; on the host the
   unit in flight is at least the load transient
   (`ComponentInventory.load_host_bytes`: the loader's read buffer of one file
@@ -267,6 +269,10 @@ class _Calc:
         device_a, host_a = self.weights(before)
         device_b, host_b = self.weights(after)
         in_flight = 0
+        # A move that never touches the device (a CPU-executed component read
+        # from its files into RAM, or dropped from RAM) has no unit in flight on
+        # the device: only components whose device bytes change count there.
+        device_in_flight = 0
         load_transient = 0
         move_s = 0.0
         disk_bytes = 0
@@ -278,6 +284,8 @@ class _Calc:
             if (dev_a, hst_a) == (dev_b, hst_b):
                 continue
             in_flight = max(in_flight, _moving_unit(inventory))
+            if dev_a != dev_b:
+                device_in_flight = max(device_in_flight, _moving_unit(inventory))
             d_dev, d_host = dev_b - dev_a, hst_b - hst_a
             from_disk = 0
             if d_dev > 0:
@@ -295,7 +303,7 @@ class _Calc:
                 load_transient = max(load_transient, inventory.load_host_bytes)
             disk_bytes += inventory.file_bytes_for(from_disk)
         device_w = max(device_a, device_b)
-        device_peak = self._device_peak(device_w + in_flight)
+        device_peak = self._device_peak(device_w + device_in_flight)
         host_w = max(host_a, host_b)
         host_peak = self.baseline + host_w + max(in_flight, load_transient)
         disk_s = disk_bytes / disk_rate

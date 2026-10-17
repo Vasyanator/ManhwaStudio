@@ -70,17 +70,11 @@ class DeviceReportingTests(_TempTreeCase):
         self.service._device = "cuda:1"
         self.assertEqual(self.service.health()["device"], "cuda:1")
 
-    def test_the_memory_forecast_is_read_from_the_selected_device(self) -> None:
-        # A VRAM forecast compared against another card's free memory is advice
-        # about the wrong hardware.
-        self.service.estimate(params=self.params(), region_width=512, region_height=512)
-        self.assertEqual(self.snapshots, ["cuda:0"])
-
-    def test_a_cpu_run_device_offers_no_vram_in_the_estimate(self) -> None:
-        with patch.object(hardware, "_resolve_selected_backend_device", lambda _fallback: "cpu"):
-            out = self.service.estimate(params=self.params(), region_width=512, region_height=512)
-        self.assertEqual((out["vram_bytes"], out["vram_free"]), (0, 0))
-        self.assertIsInstance(out["fits"], bool)
+    def test_status_probes_no_memory(self) -> None:
+        # Free memory and forecasts are `large_models.profiles`' answer (protocol 14).
+        out = self.service.status(self.params())
+        self.assertNotIn("memory", out)
+        self.assertEqual(self.snapshots, [])
 
     def test_a_cpu_selection_is_still_reported_as_cpu(self) -> None:
         with patch.object(hardware, "_resolve_selected_backend_device", lambda _fallback: "cpu"):

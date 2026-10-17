@@ -2,16 +2,16 @@
 File: modules/ai_backend/inpaint/flux2_klein/test_memory.py
 
 Purpose:
-Unit tests for `memory.py`, the stage-1 adapters over the large-model manager:
-the legacy `placement` -> step pair mapping (also the stage-2 settings
-migration), the `params.vram_step` / `ram_step` / legacy `profile` overrides and
-the legacy names reported back, the legacy wire's CPU pin of the text encoder
-(`encoder_cpu_pinned`, and the forecast keeping the encoder off the card under
-it), the `forecast_memory` answer (shape, the pipeline-then-encoder admission,
-the no-encoder case, the attention-mask row, `fits` on unknown / tiny memory,
-`calibrated`, MIN uses less VRAM than MAX), the combined VRAM-axis ceiling
-chain and its monotonicity for both handles together, a host run device (`cpu`: planned
-on the host alone, no VRAM figures) and the step-pair advice.
+Unit tests for `memory.py`, the FLUX.2 glue over the large-model manager: the
+request's step pair (`params.vram_step` / `ram_step`, an absent axis «Авто») and
+the four step keys reported back, the `forecast_memory` answer (shape, the
+pipeline-then-encoder admission, the encoder on the card beside the pipeline
+under (MAX, KEEP), the no-encoder case, the attention-mask row, `fits` on
+unknown / tiny memory, `calibrated`, MIN uses less VRAM than MAX), the combined
+VRAM-axis ceiling chain and its monotonicity for both handles together, «Энкодер
+на CPU» (`EncoderOnCpuTests`: no VRAM step puts the encoder on the card, the RAM
+step keeps or releases it), and a
+host run device (`cpu`: planned on the host alone, no VRAM figures).
 
 Notes:
 Header-only weight files (`_TempTreeCase`); the reference calibration table
@@ -27,7 +27,7 @@ from unittest.mock import patch
 from modules.ai_backend.inpaint import flux2_klein as svc
 from modules.ai_backend.inpaint.flux2_klein import memory
 from modules.ai_backend.runtime.large_models.cost_tables import REFERENCE_DEVICE_CLASS, load_tables
-from modules.ai_backend.runtime.large_models.tiers import AUTO_STEPS, STEP_WALK, RamStep, Steps, VramStep
+from modules.ai_backend.runtime.large_models.tiers import AUTO_STEPS, RamStep, Steps, VramStep
 
 from ._test_fixtures import _TempTreeCase
 from .test_characterization import _golden_environment
@@ -43,71 +43,24 @@ class RequestedStepsTests(_TempTreeCase):
     def _steps(self, **overrides: object) -> Steps:
         return memory.requested_steps(svc.normalize_flux2_klein_params(self.params(**overrides)))
 
-    def test_the_placement_mapping_table(self) -> None:
-        self.assertEqual(self._steps(placement="full_gpu"), MAX_KEEP)
-        self.assertEqual(self._steps(placement="full_gpu", unload_transformer_before_vae=True), MAX_KEEP)
-        self.assertEqual(self._steps(placement="encoder_cpu", unload_transformer_before_vae=False), MAX_KEEP)
-        self.assertEqual(self._steps(placement="encoder_cpu"), PHASE_KEEP, "its default parks the transformer")
-        self.assertEqual(self._steps(placement="model_cpu_offload"), PHASE_KEEP)
-        self.assertEqual(self._steps(placement="sequential_cpu_offload"), Steps(VramStep.MIN, RamStep.KEEP))
-
-    def test_explicit_steps_win_and_the_absent_axis_is_auto(self) -> None:
-        self.assertEqual(self._steps(placement="full_gpu", vram_step="min", ram_step="min"), Steps(VramStep.MIN, RamStep.MIN))
-        self.assertEqual(self._steps(placement="full_gpu", vram_step="half"), Steps(VramStep.HALF, RamStep.AUTO))
-        self.assertEqual(self._steps(placement="full_gpu", ram_step="run", profile="max_economy"), Steps(VramStep.AUTO, RamStep.RUN), "the steps beat a legacy profile")
+    def test_explicit_steps_and_the_absent_axis_is_auto(self) -> None:
+        self.assertEqual(self._steps(vram_step="min", ram_step="min"), Steps(VramStep.MIN, RamStep.MIN))
+        self.assertEqual(self._steps(vram_step="half"), Steps(VramStep.HALF, RamStep.AUTO))
+        self.assertEqual(self._steps(ram_step="run"), Steps(VramStep.AUTO, RamStep.RUN))
         self.assertEqual(self._steps(vram_step="auto", ram_step="auto"), AUTO_STEPS)
+        self.assertEqual(self._steps(), AUTO_STEPS)
+        self.assertEqual(self._steps(vram_step=" ", ram_step=None), AUTO_STEPS)
 
-    def test_the_legacy_profile_ids(self) -> None:
-        self.assertEqual(set(memory.LEGACY_PROFILE_STEPS), set(svc.VALID_PROFILES))
-        expected = {
-            "auto": AUTO_STEPS,
-            "max_speed": MAX_KEEP,
-            "fast": MAX_KEEP,
-            "balanced": PHASE_KEEP,
-            "economy": Steps(VramStep.HALF, RamStep.RUN),
-            "max_economy": Steps(VramStep.MIN, RamStep.MIN),
-        }
-        for profile, steps in expected.items():
-            with self.subTest(profile=profile):
-                self.assertEqual(self._steps(placement="full_gpu", profile=profile), steps)
-
-    def test_the_legacy_names_reported_back(self) -> None:
-        # Every id but `fast` (which shares MAX with `max_speed`) round-trips.
-        for profile, steps in memory.LEGACY_PROFILE_STEPS.items():
-            with self.subTest(profile=profile):
-                self.assertEqual(memory.legacy_profile_name(steps), "max_speed" if profile == "fast" else profile)
+    def test_the_step_keys_reported_back(self) -> None:
         fields = memory.steps_fields(Steps(VramStep.AUTO, RamStep.KEEP), Steps(VramStep.HALF, RamStep.KEEP))
         self.assertEqual(tuple(fields), memory.STEP_FIELD_KEYS)
-        self.assertEqual(fields, {"profile": "auto", "profile_effective": "economy", "vram_step": "auto", "ram_step": "keep", "vram_step_effective": "half", "ram_step_effective": "keep"})
+        self.assertEqual(fields, {"vram_step": "auto", "ram_step": "keep", "vram_step_effective": "half", "ram_step_effective": "keep"})
         self.assertIsNone(memory.steps_fields(MAX_KEEP, None)["vram_step_effective"])
 
     def test_unknown_values_are_request_errors(self) -> None:
-        for field, value in (("profile", "turbo"), ("vram_step", "huge"), ("ram_step", "keep_forever")):
+        for field, value in (("vram_step", "huge"), ("ram_step", "keep_forever")):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 svc.normalize_flux2_klein_params(self.params(**{field: value}))
-
-    def test_empty_values_mean_the_legacy_mapping(self) -> None:
-        self.assertEqual(self._steps(placement="full_gpu", profile="", vram_step=" ", ram_step=None), MAX_KEEP)
-
-
-class EncoderCpuPinTests(_TempTreeCase):
-    def _pinned(self, **overrides: object) -> bool:
-        return memory.encoder_cpu_pinned(svc.normalize_flux2_klein_params(self.params(**overrides)))
-
-    def test_every_legacy_placement_pins_the_encoder(self) -> None:
-        for placement in svc.VALID_PLACEMENTS:
-            with self.subTest(placement=placement):
-                self.assertTrue(self._pinned(placement=placement))
-
-    def test_a_legacy_profile_pins_it_unless_its_ram_step_offers_no_cpu(self) -> None:
-        for profile, steps in memory.LEGACY_PROFILE_STEPS.items():
-            with self.subTest(profile=profile):
-                self.assertEqual(self._pinned(placement="full_gpu", profile=profile), steps.ram is not RamStep.MIN)
-
-    def test_explicit_steps_never_pin(self) -> None:
-        self.assertFalse(self._pinned(placement="full_gpu", vram_step="max", ram_step="keep"))
-        self.assertFalse(self._pinned(placement="encoder_cpu", vram_step="auto"))
-        self.assertFalse(self._pinned(ram_step="keep", profile="balanced"))
 
 
 class ForecastMemoryTests(_TempTreeCase):
@@ -149,16 +102,16 @@ class ForecastMemoryTests(_TempTreeCase):
 
     def test_the_encoder_falls_back_to_the_cpu_beside_the_pipeline(self) -> None:
         # Room for the pipeline but not for the encoder beside it: (MAX, KEEP)'s
-        # unpinned encoder goes to the CPU and the encode phase then costs host memory.
+        # encoder goes to the CPU and the encode phase then costs host memory.
         # The card is derived from the unbounded plan (pipeline peak + 3/4 of the
         # encoder's GPU peak), so the scenario survives a recalibration.
-        roomy = self._forecast(vram_step="max", ram_step="keep")
+        roomy = self._forecast(vram_step="max", ram_step="keep", encoder_on_cpu=False)
         gpu_encoder = roomy["phases"]["encode_standalone"]["vram_bytes"]
         self.assertEqual(roomy["phases"]["encode_standalone"]["ram_bytes"], 0, "unbounded: the encoder runs on the card")
         card = max(roomy["phases"]["denoise"]["vram_bytes"], roomy["phases"]["decode"]["vram_bytes"]) + gpu_encoder * 3 // 4
-        out = self._forecast({"vram_total": card, "vram_free": card, "ram_total": 64 * GIB, "ram_free": 40 * GIB}, vram_step="max", ram_step="keep")
+        out = self._forecast({"vram_total": card, "vram_free": card, "ram_total": 64 * GIB, "ram_free": 40 * GIB}, vram_step="max", ram_step="keep", encoder_on_cpu=False)
         self.assertTrue(out["fits"])
-        self.assertEqual((out["vram_step_effective"], out["ram_step_effective"], out["profile_effective"]), ("max", "keep", "max_speed"))
+        self.assertEqual((out["vram_step_effective"], out["ram_step_effective"]), ("max", "keep"))
         self.assertLess(out["phases"]["encode_standalone"]["vram_bytes"], gpu_encoder)
         self.assertGreater(out["phases"]["encode_standalone"]["ram_bytes"], 0)
 
@@ -239,53 +192,56 @@ class CombinedCeilingTests(unittest.TestCase):
         self.assertEqual(memory.combined_ceilings(RamStep.KEEP, lambda _cell, _ceiling: self.fail("planned"), until=VramStep.MAX), {VramStep.MAX: None})
 
 
-class LegacyEncoderOnHostTests(unittest.TestCase):
-    """The klein 9B sizes on an empty 32 GiB card: `full_gpu` keeps the pipeline on the card, never the encoder."""
+class EncoderOnCpuTests(unittest.TestCase):
+    """«Энкодер на CPU» (`encoder_on_cpu`, the encoder spec's host pin) at the klein 9B sizes on an empty 32 GiB card.
+
+    Every VRAM step's device forecast excludes the encoder (its standalone
+    encode puts only the runtime overhead on the card and the encode moment is
+    the pipeline's resting weights plus that), while the RAM step still
+    governs it: kept in RAM between runs under KEEP, not under RUN / MIN.
+    """
 
     CARD = {"vram_total": 32 * GIB, "vram_free": 31 * GIB, "ram_total": 128 * GIB, "ram_free": 100 * GIB}
 
-    def test_full_gpu_encodes_on_the_host_while_the_same_explicit_pair_may_use_the_card(self) -> None:
+    def test_every_vram_step_excludes_the_encoder_and_the_ram_step_places_it(self) -> None:
+        tables = load_tables(REFERENCE_DEVICE_CLASS)
+        overhead = tables.device.runtime_overhead_bytes
+        with _golden_environment() as paths, patch.object(memory, "_tables_for", lambda _device: tables):
+            for ram in ("keep", "run", "min"):
+                for vram in ("max", "phase", "half", "min"):
+                    with self.subTest(vram=vram, ram=ram):
+                        pinned = memory.forecast_memory(svc.normalize_flux2_klein_params({**paths, "vram_step": vram, "ram_step": ram}), 512, 512, memory=self.CARD, device="cuda:0")
+                        self.assertTrue(pinned["fits"])
+                        self.assertEqual((pinned["vram_step_effective"], pinned["ram_step_effective"]), (vram, ram))
+                        self.assertEqual(pinned["phases"]["encode_standalone"]["vram_bytes"], overhead)
+                        self.assertGreater(pinned["phases"]["encode_standalone"]["ram_bytes"], pinned["breakdown"]["text_encoder"])
+                        self.assertEqual(pinned["phases"]["encode"]["vram_bytes"], pinned["resident"]["pipeline_device"] + overhead)
+                        kept = pinned["resident"]["text_encoder_host"]
+                        if ram == "keep":
+                            self.assertGreaterEqual(kept, pinned["breakdown"]["text_encoder"])
+                        else:
+                            self.assertEqual(kept, 0)
+            unpinned = memory.forecast_memory(svc.normalize_flux2_klein_params({**paths, "vram_step": "max", "ram_step": "keep", "encoder_on_cpu": False}), 512, 512, memory=self.CARD, device="cuda:0")
+            pinned = memory.forecast_memory(svc.normalize_flux2_klein_params({**paths, "vram_step": "max", "ram_step": "keep"}), 512, 512, memory=self.CARD, device="cuda:0")
+        self.assertLess(pinned["vram_bytes"], unpinned["vram_bytes"])
+
+
+class EncoderOnTheCardTests(unittest.TestCase):
+    """The klein 9B sizes on an empty 32 GiB card: (MAX, KEEP) puts the encoder beside the pipeline on the card."""
+
+    CARD = {"vram_total": 32 * GIB, "vram_free": 31 * GIB, "ram_total": 128 * GIB, "ram_free": 100 * GIB}
+
+    def test_max_keep_encodes_on_the_card(self) -> None:
         with _golden_environment() as paths:
-            legacy = memory.forecast_memory(svc.normalize_flux2_klein_params({**paths, "placement": "full_gpu"}), 512, 512, memory=self.CARD, device="cuda:0")
-            explicit = memory.forecast_memory(svc.normalize_flux2_klein_params({**paths, "vram_step": "max", "ram_step": "keep"}), 512, 512, memory=self.CARD, device="cuda:0")
-        self.assertEqual((legacy["vram_step_effective"], legacy["ram_step_effective"]), ("max", "keep"))
-        self.assertTrue(legacy["fits"])
-        # Pinned: no encoder weight on the card (the forecast's own per-phase device
-        # overhead stays), the encoder resident in RAM.
-        self.assertLess(legacy["phases"]["encode_standalone"]["vram_bytes"], GIB)
-        self.assertGreater(legacy["phases"]["encode_standalone"]["ram_bytes"], 10 * GIB)
-        self.assertGreater(legacy["resident"]["text_encoder_host"], 10 * GIB)
-        # The pinned encoder adds nothing to the device peak: it is the pipeline's own.
-        self.assertEqual(legacy["vram_bytes"], max(legacy["phases"]["denoise"]["vram_bytes"], legacy["phases"]["decode"]["vram_bytes"]))
-        # Unpinned (MAX, KEEP) puts most of the 9B encoder beside the pipeline on
-        # the card (as much as the room left by the pipeline's reservation holds).
-        half_encoder = explicit["breakdown"]["text_encoder"] // 2
-        self.assertGreater(explicit["phases"]["encode_standalone"]["vram_bytes"], half_encoder)
-        self.assertGreater(explicit["phases"]["encode"]["vram_bytes"], legacy["phases"]["encode"]["vram_bytes"] + half_encoder)
-        self.assertGreater(explicit["vram_bytes"], legacy["vram_bytes"])
-
-
-class PresetAdviceTests(_TempTreeCase):
-    def setUp(self) -> None:
-        super().setUp()
-        reference = load_tables(REFERENCE_DEVICE_CLASS)
-        tables = patch.object(memory, "_tables_for", lambda _device: reference)
-        tables.start()
-        self.addCleanup(tables.stop)
-        resolve = patch.object(svc.hardware, "_resolve_selected_backend_device", lambda _fallback: "cuda:0")
-        resolve.start()
-        self.addCleanup(resolve.stop)
-
-    def test_everything_fits_a_roomy_machine(self) -> None:
-        normalized = svc.normalize_flux2_klein_params(self.params())
-        advice = memory._preset_advice(normalized, 512, 512, {"vram_total": 64 * GIB, "vram_free": 64 * GIB, "ram_total": 128 * GIB, "ram_free": 128 * GIB})
-        labels = [f"«{memory.VRAM_STEP_LABELS[pair.vram]} + {memory.RAM_STEP_LABELS[pair.ram]}»" for pair in STEP_WALK]
-        self.assertEqual(advice, "Сейчас помещаются: " + ", ".join(labels) + ".")
-
-    def test_nothing_fits_names_the_remaining_levers(self) -> None:
-        normalized = svc.normalize_flux2_klein_params(self.params())
-        advice = memory._preset_advice(normalized, 512, 512, {"vram_total": 1 << 20, "vram_free": 1 << 10, "ram_total": 1 << 20, "ram_free": 1 << 10})
-        self.assertTrue(advice.startswith("Ни одно сочетание «Видеопамять» и «Оперативная память»"))
+            out = memory.forecast_memory(svc.normalize_flux2_klein_params({**paths, "vram_step": "max", "ram_step": "keep", "encoder_on_cpu": False}), 512, 512, memory=self.CARD, device="cuda:0")
+        self.assertTrue(out["fits"])
+        self.assertEqual((out["vram_step_effective"], out["ram_step_effective"]), ("max", "keep"))
+        # Most of the 9B encoder sits beside the pipeline on the card (as much as
+        # the room left by the pipeline's reservation holds), so the encode moment
+        # raises the device peak above the pipeline's own phases.
+        half_encoder = out["breakdown"]["text_encoder"] // 2
+        self.assertGreater(out["phases"]["encode_standalone"]["vram_bytes"], half_encoder)
+        self.assertGreater(out["vram_bytes"], max(out["phases"]["denoise"]["vram_bytes"], out["phases"]["decode"]["vram_bytes"]))
 
 
 if __name__ == "__main__":

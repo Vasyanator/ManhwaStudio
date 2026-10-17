@@ -1,7 +1,7 @@
 """
 File: modules/ai_backend/ipc/handlers/large_models.py
 
-Methods hosted here (protocol v13, `PROTOCOL.md §5.10`):
+Methods hosted here (introduced in protocol v13, `PROTOCOL.md §5.10`):
     large_models.profiles       — the VRAM / RAM step pickers planned for one request (read-only).
     large_models.limits.set     — the pool's hard VRAM / RAM caps (persisted).
     large_models.status         — loaded handles + the limits in force.

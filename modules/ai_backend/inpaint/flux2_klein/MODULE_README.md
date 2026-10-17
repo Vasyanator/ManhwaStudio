@@ -2,7 +2,8 @@
 
 ## Purpose
 The FLUX.2 klein region-editing backend: everything behind the IPC methods `inpaint.flux2_klein`,
-`.status`, `.estimate`, `.unload`, `.component_action` and the `.prompt_cache.*` family. It edits a
+`.status`, `.unload`, `.component_action` and the `.prompt_cache.*` family, plus the FLUX.2 adapter
+of `large_models.profiles` (`service.large_model_profiles`). It edits a
 user-selected page REGION with `diffusers.Flux2KleinInpaintPipeline`, whose weights are handles of
 the large-model manager (`../../runtime/large_models/`): the manager decides where every byte lives
 in every phase, admits, degrades and keeps the model between runs; this package describes FLUX.2 to
@@ -16,8 +17,8 @@ refuses a MIXED pair before any weight is read — see the FLUX.2 klein sections
 exercised by the tiny real models of the tests.
 
 **This file documents the LAYOUT only.** The domain contracts — mask semantics, run order, the
-legacy placement / profile -> step-pair mapping, the decode fallbacks, per-component residency, the
-prompt-cache library — are documented in the FLUX.2 klein sections of `../MODULE_README.md`, which
+request's step pair and the refused placement wire, the decode fallbacks, per-component residency,
+the prompt-cache library — are documented in the FLUX.2 klein sections of `../MODULE_README.md`, which
 is the authority on them.
 
 ## Architecture
@@ -25,7 +26,7 @@ Strict one-directional layering. A module may import from any module ABOVE it in
 `../../runtime/`, never from a module below it:
 
 ```
-params, progress, imaging, conversion   (no intra-package dependencies; params -> runtime tiers)
+params, progress, conversion            (no intra-package dependencies; params -> runtime tiers)
 attention                               (-> params)
 components                              (-> params, runtime.torch_support, runtime.safetensors_stream,
                                              runtime.encoder_truncation)
@@ -44,11 +45,13 @@ __init__                                (-> all of the above; re-export only)
 
 Two manager handles per run: the PIPELINE (`transformer` + `vae`; phases `denoise`, `decode`;
 model `flux2_klein` / `flux2_klein.float16`) and the TEXT ENCODER (`text_encoder`; phase
-`encode`; model `flux2_klein_text_encoder` / `.fp8`, each also as a CPU-only spec `.cpu` that a
-legacy request uses, `memory.encoder_cpu_pinned`). `service.py` admits the pipeline first and
+`encode`; model `flux2_klein_text_encoder` / `.fp8`, computing on the run device or the CPU as the
+plan decides, always on the CPU under «Энкодер на CPU»: `params.encoder_on_cpu`, default on,
+`EncoderOptions.on_cpu` -> the spec's host pin, its own residency key). `service.py` admits the pipeline first and
 the encoder second, under its lock, the encoder under a device ceiling that keeps the two handles
 together monotone on the VRAM axis (`memory.combined_ceilings` / `encoder_device_cap`, planned
-before the pipeline's admission; one rule for the run, `.estimate` and `large_model_profiles`).
+before the pipeline's admission; one rule for the run, `memory.forecast_memory` and
+`large_model_profiles`).
 
 `__init__.py` defines no behaviour. It carries the package docstring and re-exports the package's
 public surface, so `server.py` and any `flux2_klein.<name>` reference resolve against the package
@@ -56,9 +59,11 @@ object itself.
 
 ## Files and submodules
 - `__init__.py`: the package docstring and the re-export block (plus the package-level `log`).
-- `params.py`: `normalize_flux2_klein_params` (including the optional `vram_step` / `ram_step`,
-  the LEGACY `profile` id and the LEGACY `placement` flags), `_whole_region_overrides`, `validate_region_size`, `effective_steps`,
-  `_lenient_paths`, `text_encoder_dtype_name` and the coercion helpers.
+- `params.py`: `normalize_flux2_klein_params` (including the optional `vram_step` / `ram_step`
+  and the by-name refusal of the retired placement wire, `RETIRED_FIELDS`),
+  `_whole_region_overrides`, `validate_region_size`, `effective_steps`,
+  `_lenient_paths`, `encoder_on_cpu` (the «Энкодер на CPU» flag and its default, also read
+  leniently by `status`), `text_encoder_dtype_name` and the coercion helpers.
 - `progress.py`: the `phase:"load"` step numbering (`LOAD_STEP_*`, `LOAD_PHASE_STEPS`), the
   `ProgressCb` protocol with its three OPTIONAL file fields, `_progress_reporter` and
   `_file_progress_reporter`. A wire contract shared with the Rust client; imports nothing from the
@@ -78,19 +83,17 @@ object itself.
   work, the decode fallbacks (`FALLBACK_VAE_TILING`, `FALLBACK_VAE_TILE_LOWERED`), the
   pre-admission refusals (`require_loadable`, `require_loadable_encoder`) and the model names.
 - `prompt_cache.py`: encoder identity, the `.msprompt` container and the on-disk library.
-- `imaging.py`: wire decode/encode of the region and the mask, the color match, the feathered
-  composite, and the mask morphology they need.
 - `attention.py`: the `text_attention_in_mask` contract — the token grid, the joint-sequence layout,
   the early empty-mask refusal, THE device-byte formula of the mask (shared by the run's log and the
   spec's denoise work) and the additive mask itself.
-- `hardware.py`: `memory_snapshot` (the stage-1 `status.memory` / `estimate` free figures),
+- `hardware.py`: `memory_snapshot` (the free figures `memory.forecast_memory` plans against in
+  the calibration tool),
   `_resolve_selected_backend_device`, `_clear_torch_cache`, `_cuda_device_index`.
-- `memory.py`: the stage-1 wire adapters over the manager — `requested_steps` /
-  `legacy_steps` (the placement -> step-pair table, also the stage-2 settings migration),
-  `encoder_cpu_pinned` (a legacy request pins the text encoder to the CPU),
-  `LEGACY_PROFILE_STEPS` / `legacy_profile_name` / `steps_fields` (the legacy `profile` ids in and
-  out, the six step keys of an answer), `forecast_memory` (the `estimate` answer from the manager's planner + forecast), `_preset_advice`.
-  No arithmetic of its own.
+- `memory.py`: the glue over the manager — `requested_steps` (the request's step pair),
+  `steps_fields` / `STEP_FIELD_KEYS` (the four step keys of an answer), the combined VRAM-axis
+  rule (`combined_device_peak`, `combined_ceilings`, `encoder_device_cap`), `forecast_memory`
+  (the two-handle run forecast from the manager's planner + forecast; consumers: the calibration
+  tool and the golden test), `is_host_run_device`. No arithmetic of its own.
 - `pipeline.py`: what a run does WITH the placed modules — the prompt encode, the warm-up decode,
   the execution-device check, ONE VAE decode attempt with its tiling options, and the residency
   vocabulary / action matrix (`residency_of`, `_component_actions`).
@@ -100,23 +103,24 @@ object itself.
   pipeline pickers with the encoder's claim; `large_model_name` / `large_model_inputs` its
   single-handle fallback), `set_phase_observer` (the calibration hook) and
   `_effective_guidance_scale`.
-- `fixtures/forecast_golden.json`: the golden snapshot of `test_characterization.py`
-  (regenerate with its `--write-golden`).
+- `fixtures/forecast_golden.json`: the golden `forecast_memory` snapshot of
+  `test_characterization.py`, one case per step pair (regenerate with its `--write-golden`).
 - `_test_fixtures.py`: shared test fixtures — the model tree (header-only weights, or tiny REAL
   models with `real_weights=True`), `_TempTreeCase`, `_FakeEmbeds`, and `_ManagedRunFixture` (a
   service over a REAL manager on the CPU; only the pipeline call, the tokenizer, the budget probes
   and the transport's device are faked).
 - `test_*.py`: one per module; `test_characterization.py` holds the CONTRACT tests of the wire (and
-  the GOLDEN forecast/advice), `test_runtime_extraction.py` pins what FLUX.2 keeps seeing of names
+  the GOLDEN forecast), `test_runtime_extraction.py` pins what FLUX.2 keeps seeing of names
   that live in `../../runtime/`. Torch / diffusers / transformers tests skip without them; no GPU,
   no network. Run them with `python -m pytest modules/ai_backend/inpaint/ -q` from the repo root.
 
 ## Memory behaviour under the manager
 - The decode out-of-memory order is the manager ladder's: tiling, the lowered tile, then the next
   «Видеопамять» step (the transformer off the device).
-- DiT blocks are juggled by the manager's block hooks (no accelerate offload); the encoder may run
-  on the GPU when the request sends `vram_step` / `ram_step` and the pair and the device allow it
-  (a legacy `placement` / `profile` request keeps encoding on the CPU, as before the manager);
+- DiT blocks are juggled by the manager's block hooks (no accelerate offload); the encoder runs
+  on the GPU when the step pair and the device allow it beside the pipeline, else on the CPU —
+  always on the CPU under «Энкодер на CPU» (no VRAM step's forecast includes it then; the RAM
+  step keeps it, releases it after the run, or re-reads it per run);
   forecasts are measured where the device class's calibration table has `flux2_klein` entries.
 - `status.loaded` / `health.ready` mean "the pipeline handle holds bytes"; the pipeline is a LARGE
   holding and never counts in the small pool's counters.
@@ -131,7 +135,7 @@ up on the module that defines it:
 | Name | Owner |
 |---|---|
 | `memory_snapshot`, `_clear_torch_cache`, `_resolve_selected_backend_device` | `hardware` |
-| `_tables_for` (the estimate's cost tables) | `memory` |
+| `_tables_for` (the forecast's cost tables) | `memory` |
 | `_weight_bytes` (the disk size `status` reports) | `components` |
 | `program_root`, `write_prompt_file` | `prompt_cache` |
 | `build_text_attention_mask` | `attention` |
@@ -159,8 +163,6 @@ three places may repeat the 1024/128 literals:
 - the lowered-tile fallback lowers `tile_latent_min_size` AND `tile_sample_min_size` together
   (`_lowered_vae_tile_thresholds`) for ONE decode, then restores both.
 
-`vae_slicing` is inert in every case (`decode` slices only a batch larger than one); it is reported
-back as requested because the Rust `MemoryPreset` mirrors it (`dev-docs/known_gaps.md`, KG-008).
 
 ### The manager owns every byte
 Nothing in this package moves a module, picks a device for a weight, or decides what stays
@@ -179,10 +181,10 @@ Every module defines `log = logging.getLogger(__name__)`; `__init__.py` defines 
 which is what makes `assertLogs(svc.log)` capture records of the submodules.
 
 ## Editing map
-- To change a request parameter, a clamp, the region limits, or the accepted step / profile ids,
-  see `params.py`.
-- To change how a legacy `placement` or `profile` maps onto a step pair, or the `estimate` / advice answer, see
-  `memory.py` (and the table in `../MODULE_README.md`, which is the stage-2 settings migration too).
+- To change a request parameter, a clamp, the region limits, the accepted step ids or the
+  retired-field refusals, see `params.py`.
+- To change the step keys of an answer, the combined VRAM-axis rule or the two-handle forecast,
+  see `memory.py`.
 - To change what the manager knows of a component — files, keys, blocks, dtype, fp8, a phase's
   work, a decode fallback, a pre-admission refusal — see `large_model.py`; the BFL key rule is
   `conversion.py`. The steps, the forecast, the planner, the loader and the ladder are
@@ -198,7 +200,8 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
   `_component_action_locked`); what a phase DOES with the modules (encode, warm-up, decode,
   device check) is `pipeline.py`.
 - To change the prompt-cache file format or the library layout, see `prompt_cache.py`.
-- To change the composite, the color match, or the mask morphology, see `imaging.py`.
+- To change the composite, the color match, or the mask morphology, see `../region_imaging.py`
+  (shared with FLUX.3 klein).
 - To change which token pairs `text_attention_in_mask` blocks, the token grid, or the mask's
   dtype/padding/size, see `attention.py` — and keep `text_attention_mask_bytes` the ONE formula
   the spec's denoise work and the allocation use. After a diffusers upgrade,

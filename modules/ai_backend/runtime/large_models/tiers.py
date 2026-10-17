@@ -18,7 +18,9 @@ Main responsibilities:
   (`HOST_DEVICE_VRAM`, `host_device_steps`: no VRAM axis there);
 - the plan types `ComponentPlan`, `PhasePlan`, `Transition`, `ResidencyPlan`
   and `derive_transitions`;
-- the templates: `Placement`, `RolePolicy`, `ProfileTemplate`, `template_for`.
+- the templates: `Placement`, `RolePolicy`, `ProfileTemplate`, `template_for`,
+  and the policy of a component the request pins to the host
+  (`host_pinned_policy`, below).
 
 Composition (`template_for`; rest = HOST for keep/run, DISK for min; park = HOST
 for keep/run, DROPPED for min; cpu_ok = RAM step is not min):
@@ -30,6 +32,21 @@ for keep/run, DROPPED for min; cpu_ok = RAM step is not min):
 | AE active      | DEVICE           | DEVICE   | DEVICE        | DEVICE                        |
 | idle in run    | DEVICE           | park     | park          | park                          |
 | between runs   | DEVICE           | HOST if keep, else DROPPED (PHASE / HALF / MIN)    |
+
+A component the request pins to host execution (`LargeModelSpec.host_pin`,
+e.g. "encoder on the CPU") ignores its role's row: the RAM step alone places
+it, at every VRAM step (`host_pinned_policy`):
+
+| pinned component | KEEP | RUN     | MIN     |
+|------------------|------|---------|---------|
+| active           | CPU  | CPU     | CPU     |
+| idle in run      | HOST | HOST    | DROPPED |
+| between runs     | HOST | DROPPED | DROPPED |
+
+So it is never on the device (a VRAM step's device side excludes it), and
+under MIN it is read from its files for its own phase and dropped right after
+(nothing parked; the CPU executes from RAM, so the whole component is in RAM
+while its phase runs).
 
 HALF judges the device side against at most half of the usable card
 (`ProfileTemplate.device_share`). Every step is STRICT: one idle and one keep
@@ -412,3 +429,20 @@ def template_for(steps: Steps) -> ProfileTemplate:
         Role.AE: RolePolicy((_ON_DEVICE,), (idle,), (keep,)),
     })
     return ProfileTemplate(steps, roles, HALF_DEVICE_SHARE if vram is VramStep.HALF else None)
+
+
+def host_pinned_policy(ram: RamStep) -> RolePolicy:
+    """The policy of a component pinned to host execution at RAM step `ram` (module table); the VRAM step plays no part. Pure.
+
+    # Raises
+    `ValueError` for `RamStep.AUTO`.
+    """
+    match ram:
+        case RamStep.KEEP:
+            return RolePolicy((_ON_CPU,), (_H,), (_H,))
+        case RamStep.RUN:
+            return RolePolicy((_ON_CPU,), (_H,), (_X,))
+        case RamStep.MIN:
+            return RolePolicy((_ON_CPU,), (_X,), (_X,))
+        case RamStep.AUTO:
+            raise ValueError("host_pinned_policy: нужен конкретный шаг ОЗУ, получено auto")

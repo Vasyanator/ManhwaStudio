@@ -12,7 +12,8 @@ Main responsibilities:
   `Flux3Options`, the run device, the concrete fp8 path);
 - `model_name` / `model_specs` / `build_spec` - one registered model per
   (encoder mode, AE dtype), all of family `FAMILY`;
-- `residency_key` - one manager handle per loaded byte set;
+- `residency_key` - one manager handle per loaded byte set (the manager adds
+  the host pin, `LargeModelSpec.key`);
 - `formats` - bf16 / fp8r / nvfp4 with availability, DiT size, compute path,
   quality rank (the user's choice; the manager never changes it);
 - `request_shape`, `caption_token_bound`, `reference_pixel_bound` - the
@@ -43,7 +44,8 @@ Notes:
   its own registered model; the residency key keeps their handles apart too.
 - No model-specific degrade rung (`fallbacks=()`): `reference_max_pixels` and
   the AE dtype are the user's quality choices, the port has no tiled AE, and
-  "encoder on the CPU" is already a step placement (`tiers.template_for`).
+  "encoder on the CPU" is a step placement (`tiers.template_for`) or, under
+  `Flux3Options.encoder_on_cpu`, the spec's host pin (`_host_pin`).
 - Forecast inputs are UPPER bounds where the exact figure needs the tokenizer
   (`caption_token_bound`) or the reference preparation (`reference_pixel_bound`):
   a forecast may be high, never low because of them.
@@ -439,6 +441,11 @@ def formats(model_options: Flux3ModelOptions) -> dict[str, FormatInfo]:
     return result
 
 
+def _host_pin(model_options: Flux3ModelOptions) -> tuple[str, ...]:
+    """«Энкодер на CPU»: the encoder pinned to host execution when `Flux3Options.encoder_on_cpu`."""
+    return (COMPONENT_ENCODER,) if model_options.options.encoder_on_cpu else ()
+
+
 def _key_of(model_options: Flux3ModelOptions, weight_format: str, device: str) -> str:
     return residency_key(model_options.options, weight_format, device)
 
@@ -471,6 +478,7 @@ def build_spec(encoder_mode: EncoderMode, ae_dtype: AeDtype) -> LargeModelSpec:
         formats=formats,
         key_of=_key_of,
         fallbacks=(),
+        host_pin_of=_host_pin,
     )
 
 

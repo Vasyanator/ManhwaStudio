@@ -10,12 +10,11 @@ the large-model manager (`runtime.large_models`), which this service drives
 through `Session`s of the FLUX.2 specs (`large_model.py`).
 
 Main responsibilities:
-- `status` / `estimate` / `health` / `unload` - what the client polls
-  (`estimate` and the residency report answer from the manager);
+- `status` / `health` / `unload` - what the client polls (the residency
+  report answers from the manager's ledger);
 - `inpaint_image_bytes` - one region edit, in the documented order: the
   pipeline handle (transformer + VAE) is admitted and loaded FIRST, then the
-  text encoder handle encodes whatever the prompt cache misses (a legacy
-  request pins it to the CPU, `memory.encoder_cpu_pinned`; otherwise on the GPU
+  text encoder handle encodes whatever the prompt cache misses (on the GPU
   when the step pair and the device allow it beside the pipeline, else on the
   CPU from RAM; always under the combined VRAM-axis ceiling planned before
   the pipeline's admission, `_combined_ceilings` / `memory` module notes), then the denoise and the VAE decode run as manager phases (a
@@ -45,7 +44,7 @@ Notes:
   pipeline -> encoder. It also lets an action refuse "busy" before any session
   exists. Pinned by `test_service.LockOrderTests`.
 - Symbols the test suite monkeypatches are reached through their defining
-  module (`hardware.memory_snapshot`, `prompt_cache.write_prompt_file`,
+  module (`hardware._clear_torch_cache`, `prompt_cache.write_prompt_file`,
   `attention.build_text_attention_mask`, ...).
 - torch / diffusers / transformers / cv2 are imported lazily.
 """
@@ -70,10 +69,19 @@ from ...runtime.large_models.forecast import Forecast
 from ...runtime.large_models.planner import Planned
 from ...runtime.large_models.spec import ExecDevice
 from ...runtime.large_models.spec import RequestShape
-from ...runtime.large_models.tiers import IDLE_PHASE, RamStep, Steps, Tier, VramStep
+from ...runtime.large_models.tiers import IDLE_PHASE, RamStep, Steps, VramStep
 from ...runtime.model_manager import SmallModelManager
 from ...runtime.residency.footprint import normalize_device
 from ...runtime.residency.holdings import Pool
+from ..region_imaging import (
+    composite_over_region,
+    decode_image_rgb,
+    decode_mask,
+    dilate_mask,
+    encode_png_rgb,
+    match_color_outside_mask,
+    require_solid_mask,
+)
 from . import attention, hardware, large_model, memory, pipeline, prompt_cache
 from .components import (
     _SCHEDULER_MARKER,
@@ -89,19 +97,11 @@ from .components import (
     require_text_encoder,
     text_encoder_available,
 )
-from .imaging import (
-    _composite_over_region,
-    _decode_image_rgb,
-    _decode_mask,
-    _dilate_mask,
-    _encode_png_bytes_rgb,
-    _match_color_outside_mask,
-    _require_solid_mask,
-)
 from .params import (
     _lenient_paths,
     _PATH_KEYS,
     effective_steps,
+    encoder_on_cpu,
     MIN_REGION_SIDE,
     normalize_flux2_klein_params,
     text_encoder_dtype_name,
@@ -253,9 +253,9 @@ class Flux2KleinInpaintService:
         options = large_model.PipelineOptions(normalized["transformer_path"], normalized["vae_path"], normalized["dtype"], 0, 1, False, False, False, 0, None)
         return large_model.pipeline_spec(normalized["dtype"]).key(options, large_model.WEIGHT_FORMAT, normalize_device(device) or str(device))
 
-    def _encoder_key(self, paths: Mapping[str, Any], fp8: bool, device: str, *, cpu_only: bool) -> str:
-        options = large_model.EncoderOptions(str(paths.get("text_encoder_path") or ""), bool(fp8), 0, cpu_only=cpu_only)
-        return large_model.encoder_spec(fp8, cpu_only).key(options, large_model.WEIGHT_FORMAT, normalize_device(device) or str(device))
+    def _encoder_key(self, paths: Mapping[str, Any], fp8: bool, device: str, *, on_cpu: bool) -> str:
+        options = large_model.EncoderOptions(str(paths.get("text_encoder_path") or ""), bool(fp8), 0, on_cpu=on_cpu)
+        return large_model.encoder_spec(fp8).key(options, large_model.WEIGHT_FORMAT, normalize_device(device) or str(device))
 
     def _parts(self, key: str | None) -> dict[str, tuple[int, int]]:
         """`{component: (device bytes, host bytes)}` the large pool holds for `key` (empty when nothing)."""
@@ -310,7 +310,7 @@ class Flux2KleinInpaintService:
         if not alone.vram_applicable or not isinstance(alone.selected, Planned):
             return None
         ram = alone.selected.plan.steps.ram
-        encoder_model = large_model.encoder_model_name(encoder_options.fp8, encoder_options.cpu_only)
+        encoder_model = large_model.encoder_model_name(encoder_options.fp8)
 
         def combined_at(cell: Steps, ceiling: int | None) -> int | None:
             row = alone.vram_rows.get(cell.vram)
@@ -370,8 +370,7 @@ class Flux2KleinInpaintService:
         A run admits the pipeline first and the encoder on what the pipeline's
         reservation left. So: (1) the pipeline is planned alone; (2) the
         encoder is planned with that plan's reservation claimed, under the
-        same requested `steps` and UNPINNED (the pickers are the two-axis
-        settings), with the combined VRAM-axis ceiling a run would give it
+        same requested `steps`, with the combined VRAM-axis ceiling a run would give it
         (`_combined_ceilings`, `memory` module notes); (3) the pipeline is planned again with the encoder's
         reservation claimed, and that report is the answer
         (`ProfilesReport.to_dict()`; `model` is the dtype's registration). The
@@ -410,7 +409,7 @@ class Flux2KleinInpaintService:
 
     # ---- status / health ----
     def status(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Component availability, residency and free memory for the given (or last) paths.
+        """Component availability and residency for the given (or last) paths.
 
         `params` is read leniently: an absent or empty path is reported as "not
         configured". `prompt_cached` answers whether a READY embedding exists
@@ -422,8 +421,8 @@ class Flux2KleinInpaintService:
         large pool's ledger parts and is reported only when the service lock was
         free: a generation holds it for its entire run, so the probe never waits;
         when it is busy the two keys are absent and `components_busy` is true.
-        **This call never blocks**; `memory` stays the stage-1 snapshot of the
-        run device.
+        **This call never blocks.** Free memory and forecasts are
+        `large_models.profiles`' answer, never this one's.
         """
         paths = _lenient_paths(params) or dict(self._last_paths)
         components = _component_states(paths)
@@ -439,7 +438,6 @@ class Flux2KleinInpaintService:
             "reason": reason,
             "components": components,
             "components_busy": busy,
-            "memory": hardware.memory_snapshot(device),
             "loaded": self._holds(self._active_key),
             "device": device,
             "prompt_cached": prompt_cached,
@@ -462,22 +460,19 @@ class Flux2KleinInpaintService:
         """Residency and available actions of the three weight-bearing components (caller holds `self._lock`).
 
         The pipeline's parts are the handle of `paths` with the request's dtype
-        on `device` (default `_device_label`); the encoder's are the handles of
-        its path in the request's precision, CPU-pinned or not, summed (a
-        status poll carries no step fields to tell which one a run would use).
+        on `device` (default `_device_label`); the encoder's are the handle of
+        its path in the request's precision.
         """
         device = device or self._device_label()
         dtype = str((params or {}).get("dtype") or "bfloat16")
         fp8 = bool((params or {}).get("text_encoder_fp8"))
+        on_cpu = encoder_on_cpu(params)
         pipeline_parts: dict[str, tuple[int, int]] = {}
         if paths.get("transformer_path") and paths.get("vae_path") and dtype in ("bfloat16", "float16"):
             pipeline_parts = self._parts(self._handle_key(lambda: self._pipeline_key({**paths, "dtype": dtype}, device), "pipeline"))
         encoder_parts: dict[str, tuple[int, int]] = {}
         if paths.get("text_encoder_path"):
-            for cpu_only in (False, True):
-                for name, (device_b, host_b) in self._parts(self._handle_key(lambda: self._encoder_key(paths, fp8, device, cpu_only=cpu_only), "text_encoder")).items():
-                    held_device, held_host = encoder_parts.get(name, (0, 0))
-                    encoder_parts[name] = (held_device + device_b, held_host + host_b)
+            encoder_parts = self._parts(self._handle_key(lambda: self._encoder_key(paths, fp8, device, on_cpu=on_cpu), "text_encoder"))
         pipeline_loaded = any(device_b or host_b for device_b, host_b in pipeline_parts.values())
         held = {
             "text_encoder": encoder_parts.get(large_model.TEXT_ENCODER, (0, 0)),
@@ -496,42 +491,6 @@ class Flux2KleinInpaintService:
         if device is not None:
             return str(device)
         return self._device_name()
-
-    def estimate(self, *, params: dict[str, Any] | None, region_width: int, region_height: int) -> dict[str, Any]:
-        """The manager's forecast of one run with `params` on that region (stage-1 `estimate` shape).
-
-        `memory.forecast_memory` plans the pipeline, then the encoder, exactly
-        as a run is admitted, against the free memory of the device this
-        service would use; `fits` is that plan's fit (`True` when the free
-        memory is unknown). On a host run device (`cpu` / `mps`) the plan is
-        the host's alone, as the manager makes it: `vram_bytes` and `vram_free`
-        are `0`, `ram_bytes` the host growth, `fits` the host plan's. Advice
-        for the UI: the admission is the guard. The
-        answer adds the requested / effective steps (`memory.steps_fields`:
-        `vram_step`, `ram_step`, `*_effective`, the legacy names `profile`,
-        `profile_effective`) and `calibrated` (an uncalibrated forecast is an
-        estimate).
-
-        # Raises
-        `ValueError` for invalid params or region, or weights whose headers
-        cannot be read.
-        """
-        normalized = normalize_flux2_klein_params(params)
-        validate_region_size(region_width, region_height)
-        device = self._device_label()
-        snapshot = hardware.memory_snapshot(device)
-        forecast = memory.forecast_memory(normalized, region_width, region_height, memory=snapshot, device=device)
-        return {
-            "vram_bytes": forecast["vram_bytes"],
-            "ram_bytes": forecast["ram_bytes"],
-            # A host run device has no VRAM to offer (its forecast puts every byte in RAM).
-            "vram_free": 0 if memory.is_host_run_device(device) else int(snapshot["vram_free"]),
-            "ram_free": int(snapshot["ram_free"]),
-            "fits": bool(forecast["fits"]),
-            "breakdown": forecast["breakdown"],
-            **{key: forecast[key] for key in memory.STEP_FIELD_KEYS},
-            "calibrated": bool(forecast["calibrated"]),
-        }
 
     def health(self) -> dict[str, Any]:
         """Snapshot for the periodic backend health event (never takes the service lock)."""
@@ -605,12 +564,11 @@ class Flux2KleinInpaintService:
         loaded first; the encoder handle second, planned on what the pipeline's
         reservation left; then the denoise and the decode as manager phases.
 
-        The answer keeps the stage-1 keys (`placement`, `applied` with its five
-        flags, `oom_recovered`) and adds the requested / effective steps
-        (`memory.steps_fields`: `vram_step`, `ram_step`, `vram_step_effective`,
-        `ram_step_effective`, the legacy names `profile`, `profile_effective`),
-        `degraded`, `degrade_reason` at the top level (`applied` is persisted by
-        the client as exactly five flags).
+        The answer carries `applied` (`{"vae_tiling"}`: whether the decode really
+        ran tiled, which the client persists), `oom_recovered`, the requested /
+        effective steps (`memory.steps_fields`: `vram_step`, `ram_step`,
+        `vram_step_effective`, `ram_step_effective`), `degraded` and
+        `degrade_reason`.
 
         # Raises
         `ValueError` for bad params, region, mask or reference, an empty mask
@@ -621,19 +579,19 @@ class Flux2KleinInpaintService:
         pipeline raises.
         """
         normalized = normalize_flux2_klein_params(params)
-        region_rgb = _decode_image_rgb(image_bytes)
+        region_rgb = decode_image_rgb(image_bytes)
         height, width = region_rgb.shape[:2]
         validate_region_size(width, height)
-        mask_u8 = _decode_mask(mask_bytes, expected_hw=(height, width))
+        mask_u8 = decode_mask(mask_bytes, expected_hw=(height, width))
         if normalized["whole_region"]:
-            _require_solid_mask(mask_u8)
+            require_solid_mask(mask_u8)
         if normalized["text_attention_in_mask"]:
             # Before any load: an empty mask would otherwise be refused only
             # after the transformer had been read.
             attention.require_text_attention_target(mask_u8)
         reference_rgb = None
         if reference_bytes is not None:
-            reference_rgb = _decode_image_rgb(reference_bytes)
+            reference_rgb = decode_image_rgb(reference_bytes)
             if reference_rgb.shape[:2] != (height, width):
                 raise ValueError(
                     f"Референс меток {reference_rgb.shape[1]}x{reference_rgb.shape[0]} не совпадает "
@@ -688,7 +646,7 @@ class Flux2KleinInpaintService:
         ceilings = None
         if text_encoder_available(normalized) and self._prompts_to_encode(normalized):
             alone = self._large.profiles(model, options, shape, device=device, format=large_model.WEIGHT_FORMAT, steps=steps)
-            ceilings = self._combined_ceilings(alone, large_model.encoder_options(normalized, cpu_only=memory.encoder_cpu_pinned(normalized)), shape, device, until=VramStep.MIN)
+            ceilings = self._combined_ceilings(alone, large_model.encoder_options(normalized), shape, device, until=VramStep.MIN)
         session = self._acquire(model, options, shape, steps, device)
         loaded = False
         try:
@@ -699,7 +657,7 @@ class Flux2KleinInpaintService:
                 loaded = True
                 embeds, encoder_retries = self._prompt_embeds_locked(normalized, report, steps=steps, device=device, shape=shape, device_cap_bytes=self._encoder_cap(ceilings, session))
                 retries += encoder_retries
-                latent_mask = _dilate_mask(mask_u8, normalized["mask_dilate_px"])
+                latent_mask = dilate_mask(mask_u8, normalized["mask_dilate_px"])
                 latents_cpu, image_processor = session.run_phase(
                     large_model.PHASE_DENOISE,
                     lambda ctx: self._denoise(ctx, region_rgb, latent_mask, normalized, embeds, progress_callback, reference_rgb),
@@ -708,14 +666,7 @@ class Flux2KleinInpaintService:
                     large_model.PHASE_DECODE,
                     lambda ctx: decode_region_latents(ctx.module(large_model.VAE), image_processor, latents_cpu, tiling=ctx.options.vae_tiling, lowered=ctx.options.vae_tile_lowered),
                 )
-                decode_plan = session.plan.phase(large_model.PHASE_DECODE).components[large_model.TRANSFORMER]
-                applied = {
-                    "unload_transformer_before_vae": decode_plan.tier is not Tier.DEVICE,
-                    "vae_tiling": bool(normalized["vae_tiling"]) or bool(tiled),
-                    "vae_slicing": bool(normalized["vae_slicing"]),
-                    "unload_text_encoder_after_encode": bool(normalized["unload_text_encoder_after_encode"]),
-                    "text_encoder_fp8": bool(normalized["text_encoder_fp8"]),
-                }
+                applied = {"vae_tiling": bool(normalized["vae_tiling"]) or bool(tiled)}
                 retries += session.retries
                 effective = session.steps_effective
                 degraded = session.degraded
@@ -736,13 +687,12 @@ class Flux2KleinInpaintService:
                 f"{width}x{height}; композит невозможен"
             )
         if normalized["color_match"]:
-            generated = _match_color_outside_mask(generated, region_rgb, latent_mask)
-        composed = _composite_over_region(region_rgb, generated, mask_u8, int(normalized["mask_feather_px"]))
+            generated = match_color_outside_mask(generated, region_rgb, latent_mask)
+        composed = composite_over_region(region_rgb, generated, mask_u8, int(normalized["mask_feather_px"]))
         return {
-            "image_png": _encode_png_bytes_rgb(composed),
+            "image_png": encode_png_rgb(composed),
             "region_size": [int(width), int(height)],
             "device": self._device_label(),
-            "placement": normalized["placement"],
             "applied": applied,
             "oom_recovered": retries > 0,
             # Deliberately NOT inside `applied` (persisted by the client): the
@@ -956,17 +906,16 @@ class Flux2KleinInpaintService:
         steps: Steps,
         device: str,
         shape: Any,
-        release: bool | None = None,
+        release: bool = False,
         device_cap_bytes: int | None = None,
     ) -> int:
         """Encode `texts` into the cache through an encoder session; returns its retries.
 
         THE place a missing encoder becomes fatal (`require_text_encoder`).
-        Where the encoder computes is the plan's: on the CPU only for a legacy
-        request (`memory.encoder_cpu_pinned`), else the GPU when `steps` and the
+        Where the encoder computes is the plan's: the GPU when `steps` and the
         device allow it, else the CPU from RAM; between runs it stays as the
-        steps keep it, unless `release` (default:
-        `unload_text_encoder_after_encode`) drops it after the encode.
+        steps keep it, unless `release` drops it after the encode (the
+        prompt-cache build's own release).
         `device_cap_bytes` is the encoder's device ceiling beside an admitted
         pipeline (`None` when no pipeline is involved: the cache build).
         """
@@ -975,8 +924,8 @@ class Flux2KleinInpaintService:
 
         roots = component_search_roots(normalized)
         tokenizer = self._ensure_tokenizer_locked(_require_component_dir(roots, _TOKENIZER_SUBDIR, _TOKENIZER_MARKERS, "токенизатор Qwen"))
-        options = large_model.encoder_options(normalized, cpu_only=memory.encoder_cpu_pinned(normalized))
-        model = large_model.encoder_model_name(options.fp8, options.cpu_only)
+        options = large_model.encoder_options(normalized)
+        model = large_model.encoder_model_name(options.fp8)
         msl = int(normalized["max_sequence_length"])
         report(LOAD_STEP_TEXT_ENCODER, "Загрузка текстового энкодера")
         encoder_session = self._acquire(model, options, shape, steps, device, device_cap_bytes=device_cap_bytes)
@@ -994,8 +943,7 @@ class Flux2KleinInpaintService:
             retries = encoder_session.retries
         for text, embeds in zip(texts, results):
             self._store_embeds(self._prompt_cache_key(normalized, text), embeds)
-        drop = normalized["unload_text_encoder_after_encode"] if release is None else release
-        if drop:
+        if release:
             self._unload_models_locked((model,))
         if self._holds(key):
             report(LOAD_STEP_ENCODER_DONE, "Текстовый энкодер оставлен в памяти")
@@ -1033,9 +981,9 @@ class Flux2KleinInpaintService:
                     large_model.require_loadable_encoder(normalized)
                     report(LOAD_STEP_PREPARE, "Подготовка кэширования промпта")
                     device = self._device_name()
-                    resident = self._holds(self._handle_key(lambda: self._encoder_key(normalized, normalized["text_encoder_fp8"], device, cpu_only=memory.encoder_cpu_pinned(normalized)), "text_encoder"))
+                    resident = self._holds(self._handle_key(lambda: self._encoder_key(normalized, normalized["text_encoder_fp8"], device, on_cpu=normalized["encoder_on_cpu"]), "text_encoder"))
                     shape = large_model.request_shape(MIN_REGION_SIDE, MIN_REGION_SIDE, with_reference=False, max_sequence_length=int(normalized["max_sequence_length"]), steps=1)
-                    self._encode_prompts_locked(normalized, [text], report, steps=memory.requested_steps(normalized), device=device, shape=shape, release=None if resident else True)
+                    self._encode_prompts_locked(normalized, [text], report, steps=memory.requested_steps(normalized), device=device, shape=shape, release=not resident)
                     encoded = True
                 self._last_error = None
                 self._publish_health_locked()
@@ -1144,9 +1092,9 @@ class Flux2KleinInpaintService:
             large_model.require_loadable_encoder(normalized)
             report(LOAD_STEP_PREPARE, "Подготовка загрузки текстового энкодера")
             steps = _encoder_load_steps(memory.requested_steps(normalized))
-            options = large_model.encoder_options(normalized, cpu_only=memory.encoder_cpu_pinned(normalized))
+            options = large_model.encoder_options(normalized)
             report(LOAD_STEP_TEXT_ENCODER, "Загрузка текстового энкодера")
-            with self._acquire(large_model.encoder_model_name(options.fp8, options.cpu_only), options, shape, steps, device) as session:
+            with self._acquire(large_model.encoder_model_name(options.fp8), options, shape, steps, device) as session:
                 session.load(large_model.TEXT_ENCODER)
             report(LOAD_STEP_ENCODER_DONE, "Текстовый энкодер загружен")
             return True
@@ -1583,7 +1531,7 @@ class Flux2KleinInpaintService:
     def _prompt_cache_key(self, normalized: dict[str, Any], text: str) -> tuple[Any, ...]:
         """Everything that changes an embedding: encoder, text, length, dtype, fp8.
 
-        The placement is deliberately absent — the same encoder computes the same
+        Where the encoder ran is deliberately absent — the same encoder computes the same
         embedding whether it ran on the host or the accelerator, and including it
         would evict the cache on a step change for nothing.
 

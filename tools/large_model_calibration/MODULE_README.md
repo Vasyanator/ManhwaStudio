@@ -62,7 +62,10 @@ and is reported (`settings.vram_cap`, per step `non_torch_end`).
   the user's images in `<model-root>/refs/{edit,obj}`.
 - `flux2.py`: the FLUX.2 driver (region sizes x encoders x prompt lengths x references x steps)
   through `Flux2KleinInpaintService.inpaint_image_bytes` and its `set_phase_observer` hook; the
-  cell forecast is the service's own estimate (`memory.forecast_memory`).
+  cell forecast is the service's own estimate (`memory.forecast_memory`). It sends
+  `encoder_on_cpu: false` unless `--encoder-on-cpu` (the wire default is on; the measured grid
+  lets the steps place the encoder). The FLUX.3 driver builds `Flux3Options`, whose
+  `encoder_on_cpu` defaults to off.
 - `report.py`: `report.json` / `report.csv` (rewritten after every combo), the step grids and the
   per-axis monotonic check, the summary.
 - `device_memory.py`: the `--vram-cap-gib` cap and the device baseline (amdgpu sysfs, or

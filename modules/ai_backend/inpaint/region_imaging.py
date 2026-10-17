@@ -1,21 +1,22 @@
 """
-File: modules/ai_backend/inpaint/flux2_klein/imaging.py
+File: modules/ai_backend/inpaint/region_imaging.py
 
 Purpose:
-The pixel work around the diffusion run: decoding the region and the mask off
-the wire, the color match and the feathered composite that put the generated
-region back over the original, and the mask morphology those need.
+The pixel work around a region editor's diffusion run (FLUX.2 klein, FLUX.3
+klein): decoding the region and the mask off the wire, the color match and the
+feathered composite that put the generated region back over the original, and
+the mask morphology those need. Model-agnostic: numpy arrays in, arrays out.
 
 The mask here is a PERMISSION TO CHANGE, not a hole to fill: everything outside
 it must come back byte-identical, which is why the composite is done here rather
 than left to the pipeline's own latent masking.
 
 Main responsibilities:
-- wire decoding (`_decode_image_rgb`, `_decode_mask`, `_require_solid_mask`) and
-  encoding (`_encode_png_bytes_rgb`);
-- color alignment (`_match_color_outside_mask`) and the composite
-  (`_composite_over_region`, `_feather_mask_inwards`, `_mask_distance_inside`);
-- mask morphology (`_dilate_mask`, `_erode_mask`, `_morph_mask`).
+- wire decoding (`decode_image_rgb`, `decode_mask`, `require_solid_mask`) and
+  encoding (`encode_png_rgb`);
+- color alignment (`match_color_outside_mask`) and the composite
+  (`composite_over_region`, `feather_mask_inwards`, `mask_distance_inside`);
+- mask morphology (`dilate_mask`, `erode_mask`, `morph_mask`).
 
 Notes:
 numpy is a hard dependency of these helpers; cv2 and PIL are imported lazily
@@ -35,11 +36,11 @@ log = logging.getLogger(__name__)
 
 #: Minimum number of pixels outside the mask required for a meaningful
 #: mean/std color match; below it the statistics are noise.
-_MIN_COLOR_MATCH_SAMPLES = 256
+MIN_COLOR_MATCH_SAMPLES = 256
 
-#: Largest inward distance the cv2-free fallback of `_mask_distance_inside`
-#: measures, in pixels. One above the widest feather `normalize_flux2_klein_params`
-#: accepts, so the ramp width is never clamped by the probe itself; the fallback
+#: Largest inward distance the cv2-free fallback of `mask_distance_inside`
+#: measures, in pixels. One above the widest feather the region editors' wire
+#: normalizers accept (32 px), so the ramp width is never clamped by the probe itself; the fallback
 #: costs one erosion per level, which is why it is bounded at all.
 MAX_MASK_DISTANCE_PROBE = 33
 
@@ -47,7 +48,7 @@ MAX_MASK_DISTANCE_PROBE = 33
 # =====================================================================
 #  Post-processing (ours, not the pipeline's)
 # =====================================================================
-def _match_color_outside_mask(
+def match_color_outside_mask(
     generated: np.ndarray, original: np.ndarray, mask: np.ndarray
 ) -> np.ndarray:
     """Align the generated region's per-channel mean/std to the original.
@@ -62,9 +63,9 @@ def _match_color_outside_mask(
 
     outside = mask == 0
     sample_count = int(np.count_nonzero(outside))
-    if sample_count < _MIN_COLOR_MATCH_SAMPLES:
+    if sample_count < MIN_COLOR_MATCH_SAMPLES:
         log.debug(
-            "FLUX.2 klein: only %d pixels outside the mask, skipping the color match.",
+            "region imaging: only %d pixels outside the mask, skipping the color match.",
             sample_count,
         )
         return generated
@@ -87,12 +88,12 @@ def _match_color_outside_mask(
     return np.clip(matched, 0, 255).astype(np.uint8)
 
 
-def _composite_over_region(
+def composite_over_region(
     original: np.ndarray, generated: np.ndarray, mask: np.ndarray, feather_px: int
 ) -> np.ndarray:
     """Alpha-blend `generated` into `original` under a feathered `mask`.
 
-    The feather is applied INWARDS (see `_feather_mask_inwards`), so the blend
+    The feather is applied INWARDS (see `feather_mask_inwards`), so the blend
     weight is exactly zero on every pixel the user did not paint. The final
     `np.where` then guarantees those pixels come back byte-identical, which is
     this service's core contract.
@@ -110,14 +111,14 @@ def _composite_over_region(
     import numpy as np
 
     inside = mask > 0
-    alpha = _feather_mask_inwards(mask, feather_px).astype(np.float32) / 255.0
+    alpha = feather_mask_inwards(mask, feather_px).astype(np.float32) / 255.0
     alpha = np.where(inside, alpha, 0.0)[..., None]
     blended = original.astype(np.float32) * (1.0 - alpha) + generated.astype(np.float32) * alpha
     blended = np.clip(np.rint(blended), 0, 255).astype(np.uint8)
     return np.ascontiguousarray(np.where(inside[..., None], blended, original))
 
 
-def _feather_mask_inwards(mask: np.ndarray, feather_px: int) -> np.ndarray:
+def feather_mask_inwards(mask: np.ndarray, feather_px: int) -> np.ndarray:
     """Blend weights that rise from 0 on the mask contour to 1 `feather_px` inside.
 
     `feather_px` is the RAMP WIDTH in pixels, and the ramp is a smoothstep of the
@@ -140,7 +141,7 @@ def _feather_mask_inwards(mask: np.ndarray, feather_px: int) -> np.ndarray:
 
     if feather_px <= 0:
         return mask
-    distance = _mask_distance_inside(mask)
+    distance = mask_distance_inside(mask)
     reach = float(distance.max())
     if reach <= 0.0:  # pragma: no cover - an empty mask never reaches the blend
         return mask
@@ -152,13 +153,13 @@ def _feather_mask_inwards(mask: np.ndarray, feather_px: int) -> np.ndarray:
     return np.ascontiguousarray((smooth * 255.0 + 0.5).astype(np.uint8))
 
 
-def _mask_distance_inside(mask: np.ndarray) -> np.ndarray:
+def mask_distance_inside(mask: np.ndarray) -> np.ndarray:
     """Distance in pixels from every masked pixel to the nearest unmasked one.
 
     Zero outside the mask, so a ramp built on it cannot leak past the contour.
     cv2 gives the exact Euclidean distance; without it the distance is built from
     successive erosions, which measures the same thing on the elliptical
-    structuring element `_morph_mask` already uses. The fallback costs one
+    structuring element `morph_mask` already uses. The fallback costs one
     erosion per level and is bounded by `MAX_MASK_DISTANCE_PROBE`, which is above
     the largest feather the contract accepts.
 
@@ -192,7 +193,7 @@ def _mask_distance_inside(mask: np.ndarray) -> np.ndarray:
     distance[binary > 0] = 1.0
     eroded = binary * 255
     for step in range(2, MAX_MASK_DISTANCE_PROBE + 1):
-        eroded = _erode_mask(eroded, 1)
+        eroded = erode_mask(eroded, 1)
         remaining = eroded > 0
         if not remaining.any():
             break
@@ -200,17 +201,17 @@ def _mask_distance_inside(mask: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(distance[1:-1, 1:-1])
 
 
-def _dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+def dilate_mask(mask: np.ndarray, radius: int) -> np.ndarray:
     """Grow the mask by `radius` pixels (cv2 when available, PIL otherwise)."""
-    return _morph_mask(mask, radius, grow=True)
+    return morph_mask(mask, radius, grow=True)
 
 
-def _erode_mask(mask: np.ndarray, radius: int) -> np.ndarray:
+def erode_mask(mask: np.ndarray, radius: int) -> np.ndarray:
     """Shrink the mask by `radius` pixels (cv2 when available, PIL otherwise)."""
-    return _morph_mask(mask, radius, grow=False)
+    return morph_mask(mask, radius, grow=False)
 
 
-def _morph_mask(mask: np.ndarray, radius: int, *, grow: bool) -> np.ndarray:
+def morph_mask(mask: np.ndarray, radius: int, *, grow: bool) -> np.ndarray:
     """Dilate (`grow`) or erode the mask with an elliptical structuring element.
 
     cv2 is preferred; the PIL fallback exists because OpenCV is an optional
@@ -245,7 +246,8 @@ def _morph_mask(mask: np.ndarray, radius: int, *, grow: bool) -> np.ndarray:
 # =====================================================================
 #  Image / mask codecs
 # =====================================================================
-def _decode_image_rgb(image_bytes: bytes) -> np.ndarray:
+def decode_image_rgb(image_bytes: bytes) -> np.ndarray:
+    """Decode any PIL-readable image to a contiguous HxWx3 uint8 RGB array (PIL errors propagate)."""
     import numpy as np
     from PIL import Image
 
@@ -253,7 +255,7 @@ def _decode_image_rgb(image_bytes: bytes) -> np.ndarray:
         return np.ascontiguousarray(np.array(img.convert("RGB"), dtype=np.uint8))
 
 
-def _decode_mask(mask_bytes: bytes, *, expected_hw: tuple[int, int]) -> np.ndarray:
+def decode_mask(mask_bytes: bytes, *, expected_hw: tuple[int, int]) -> np.ndarray:
     """Decode a strictly L8 mask and binarize it; the size must match the region.
 
     The wire contract is 8-bit greyscale and nothing else. Accepting RGB/RGBA and
@@ -285,7 +287,7 @@ def _decode_mask(mask_bytes: bytes, *, expected_hw: tuple[int, int]) -> np.ndarr
     return np.where(mask > 0, 255, 0).astype(np.uint8)
 
 
-def _require_solid_mask(mask_u8: np.ndarray) -> None:
+def require_solid_mask(mask_u8: np.ndarray) -> None:
     """Refuse a `whole_region` request whose mask is not solid.
 
     `whole_region` does not change the wire format: the client still sends a
@@ -295,7 +297,7 @@ def _require_solid_mask(mask_u8: np.ndarray) -> None:
     contradicts the flag (the mask would win, and the user would see a partial
     edit while the UI showed "no mask needed").
 
-    `mask_u8` is the already-binarized output of `_decode_mask`, so "non-zero"
+    `mask_u8` is the already-binarized output of `decode_mask`, so "non-zero"
     and "255" are the same test here.
 
     # Raises
@@ -313,7 +315,8 @@ def _require_solid_mask(mask_u8: np.ndarray) -> None:
     )
 
 
-def _encode_png_bytes_rgb(image_rgb: np.ndarray) -> bytes:
+def encode_png_rgb(image_rgb: np.ndarray) -> bytes:
+    """Encode an HxWx3 RGB array as PNG bytes."""
     import numpy as np
     from PIL import Image
 

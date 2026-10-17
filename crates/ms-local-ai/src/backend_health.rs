@@ -26,6 +26,8 @@ Main types:
 - `AiBackendHealthSnapshot`: last health result for UI status
   (`connected`, `details`, `checked_at`, backend version); `unavailable(LocalAiOff)` is the
   fixed snapshot of a process whose backend is off (`--no-ai` or platform).
+- `AiBackendHealthSnapshot::large_pool`: the large-model pool part of the pushed
+  `model_manager` payload, parsed by `large_models::parse_pool_status` (no polling).
 - `AiBackendProbeCommand`: control messages for probe thread
   (`CheckNow`, `RefreshDeviceInfo`, `SetDevice`, `SetOnnxDevice`, `RefreshCudaDiagnostics`, `Stop`).
 
@@ -40,6 +42,7 @@ Main functions:
   one resident variant in `ocr.paddleocrvl.model`).
 */
 
+use crate::large_models::{LargeModelsError, LargePoolStatus, parse_pool_status};
 use crate::local_ai::LocalAiOff;
 use ms_backend_ipc::{self as backend_ipc, CallError};
 use serde_json::{Value, json};
@@ -107,6 +110,11 @@ pub struct AiBackendHealthSnapshot {
     pub device_checked_at: Option<Instant>,
     pub cuda_diagnostics: String,
     pub cuda_checked_at: Option<Instant>,
+    /// The large-model pool as the last pushed snapshot reported it
+    /// (`model_manager.large_models` + `model_manager.limits`). `None` while not connected,
+    /// warming up, or when the snapshot carries no pool part; `Some(Err)` when the backend
+    /// sent its `{"status":"error"}` placeholder or an unreadable shape.
+    pub large_pool: Option<Result<LargePoolStatus, LargeModelsError>>,
 }
 
 impl Default for AiBackendHealthSnapshot {
@@ -140,6 +148,7 @@ impl Default for AiBackendHealthSnapshot {
             device_checked_at: None,
             cuda_diagnostics: t!("translation.backend_health.cuda_diagnostics_not_run_status").to_string(),
             cuda_checked_at: None,
+            large_pool: None,
         }
     }
 }
@@ -180,6 +189,7 @@ impl AiBackendHealthSnapshot {
             device_checked_at: None,
             cuda_diagnostics: t!("translation.backend_health.cuda_diagnostics_unavailable_status").to_string(),
             cuda_checked_at: None,
+            large_pool: None,
         }
     }
 }
@@ -257,6 +267,7 @@ struct HealthFields {
     ocr_surya_ready: Option<bool>,
     ocr_baberu_ready: Option<bool>,
     backend_version: Option<String>,
+    large_pool: Option<Result<LargePoolStatus, LargeModelsError>>,
 }
 
 /// Maps a successful health payload (`ok`, `is_torch_available`, `ocr{...}`,
@@ -277,7 +288,16 @@ fn parse_health_payload(payload: &Value) -> HealthFields {
         ocr_surya_ready: health_ocr_ready_flag(payload, "suryaocr"),
         ocr_baberu_ready: health_ocr_ready_flag(payload, "baberuocr"),
         backend_version: health_backend_version(payload),
+        large_pool: health_large_pool(payload),
     }
+}
+
+/// The large-model pool part of a health payload: `None` when `model_manager` or either of
+/// its two pool keys is absent (warming-up snapshot), else what the parser makes of them.
+/// Not logged here: the snapshot arrives about once a second, the panel shows the error.
+fn health_large_pool(payload: &Value) -> Option<Result<LargePoolStatus, LargeModelsError>> {
+    let manager = payload.get("model_manager")?;
+    Some(parse_pool_status(manager.get("large_models")?, manager.get("limits")?))
 }
 
 /// Folds parsed [`HealthFields`] into the shared snapshot and returns whether a
@@ -311,6 +331,7 @@ fn apply_health_fields(
     guard.ocr_paddle_vl_model = fields.ocr_paddle_vl_model;
     guard.ocr_surya_ready = fields.ocr_surya_ready;
     guard.ocr_baberu_ready = fields.ocr_baberu_ready;
+    guard.large_pool = fields.large_pool;
     // Backend onnxruntime reachability: available only while connected AND a
     // provider list has been enumerated. The retained list is not cleared on
     // disconnect, so on reconnect this restores immediately from the last-known
@@ -354,6 +375,7 @@ fn apply_health_offline(snapshot: &Arc<Mutex<AiBackendHealthSnapshot>>, details:
             ocr_surya_ready: None,
             ocr_baberu_ready: None,
             backend_version: None,
+            large_pool: None,
         },
     );
 }
@@ -1323,6 +1345,43 @@ mod tests {
         assert!(refresh, "first connect should request a device refresh");
     }
 
+    /// The pool part of `model_manager` reaches the snapshot; a part the backend failed to
+    /// build arrives as an error; a snapshot without `model_manager` (warming up) carries
+    /// none, and an offline state clears it.
+    #[test]
+    fn the_large_pool_part_is_folded_into_the_snapshot() {
+        let snapshot = Arc::new(Mutex::new(AiBackendHealthSnapshot::default()));
+        let event = json!({
+            "ocr": {},
+            "model_manager": {
+                "max_loaded_models": 3,
+                "large_models": [{
+                    "model": "flux2_klein", "key": "flux2_klein@cuda:0", "format": "bf16", "device": "cuda:0",
+                    "vram_step": "max", "ram_step": "keep", "device_bytes": 1u64, "host_bytes": 2u64,
+                    "in_use": true, "degraded": false, "degrade_reason": null, "components": {}
+                }],
+                "limits": { "vram_cap": 8u64, "ram_cap": null }
+            }
+        });
+        apply_health_fields(&snapshot, parse_health_payload(&event));
+        {
+            let guard = snapshot.lock().unwrap();
+            let pool = guard.large_pool.clone().expect("the pool part is present").expect("and readable");
+            assert_eq!(pool.entries.len(), 1);
+            assert!(pool.entries[0].in_use);
+            assert_eq!(pool.limits.vram_cap, Some(8));
+        }
+        let failed = json!({
+            "ocr": {},
+            "model_manager": { "large_models": { "status": "error", "error": "boom" }, "limits": { "vram_cap": null, "ram_cap": null } }
+        });
+        assert!(matches!(parse_health_payload(&failed).large_pool, Some(Err(_))));
+        let warming = json!({ "snapshot_state": "warming_up" });
+        assert!(parse_health_payload(&warming).large_pool.is_none());
+        super::apply_health_offline(&snapshot, "down".to_string());
+        assert!(snapshot.lock().unwrap().large_pool.is_none());
+    }
+
     /// A disconnect->reconnect transition re-requests a device refresh even when
     /// device info was previously enumerated, so a restarted backend's capabilities
     /// (and the derived onnx availability) are re-read rather than left stale.
@@ -1414,6 +1473,7 @@ mod tests {
                 ocr_surya_ready: None,
                 ocr_baberu_ready: None,
                 backend_version: None,
+                large_pool: None,
             },
         );
         let guard = snapshot.lock().unwrap();

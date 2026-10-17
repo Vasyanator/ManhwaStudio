@@ -327,7 +327,7 @@ pub(super) struct Flux2ComponentSnapshot {
     pub(super) components_busy: bool,
 }
 
-/// The `.status` answer: whether a run can start at all, plus the host's memory.
+/// The `.status` answer: whether a run can start at all, and what of the model is where.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Flux2Status {
     pub(super) available: bool,
@@ -337,11 +337,6 @@ pub(super) struct Flux2Status {
     pub(super) vae: Flux2Component,
     pub(super) tokenizer: Flux2Component,
     pub(super) scheduler: Flux2Component,
-    /// Total device VRAM in bytes, `0` when the backend did not report one. Shown
-    /// beside the forecast's "free" figure, which alone says nothing about headroom.
-    pub(super) vram_total: u64,
-    /// Total host RAM in bytes, `0` when unknown. Same role as `vram_total`.
-    pub(super) ram_total: u64,
     pub(super) loaded: bool,
     pub(super) device: String,
     /// Whether the backend already holds the embeddings of the prompt this answer was

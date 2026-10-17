@@ -55,6 +55,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .memory_probe import cuda_device_index
+from .torch_device import is_integrated_gpu
 from .torch_support import is_torch_available
 
 log = logging.getLogger(__name__)
@@ -392,6 +393,11 @@ class TorchDeviceProbe:
     matmul there first: the BLAS workspace (0.2-0.3 GiB, measured on ROCm
     gfx1201 and CUDA sm_120) is allocated only at the first matmul, and a reading
     taken before it would overstate the free memory by that much.
+
+    An integrated GPU (`torch_device.is_integrated_gpu`) is never read and never
+    touched: its memory is shared system RAM, and the torch build may carry no
+    kernels for its arch, so even the warm-up matmul can crash the process
+    (gfx1036 segfaults). It reads as unknown, which the pools treat as slot-only.
     """
 
     def __init__(self, torch_available: Callable[[], bool] = is_torch_available, *, warm_up: bool = True) -> None:
@@ -412,7 +418,7 @@ class TorchDeviceProbe:
         del probe
 
     def query(self, device: str) -> DeviceReading | None:
-        """Figures of `device` (`cuda`, `cuda:<n>`); `None` for CPU/MPS, no torch or no GPU."""
+        """Figures of `device` (`cuda`, `cuda:<n>`); `None` for CPU/MPS, an integrated GPU, no torch or no GPU."""
         if not str(device).strip().lower().startswith("cuda"):
             return None
         if not self._torch_available():
@@ -422,6 +428,9 @@ class TorchDeviceProbe:
         index = cuda_device_index(device)
         try:
             if not torch.cuda.is_available():
+                return None
+            if is_integrated_gpu(torch.cuda.get_device_properties(index)):
+                log.debug("device budget: %s is an integrated GPU; not read", device)
                 return None
             if self._warm_up:
                 self._ensure_warm(torch, str(device))

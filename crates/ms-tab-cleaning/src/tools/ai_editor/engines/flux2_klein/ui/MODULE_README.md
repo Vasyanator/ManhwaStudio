@@ -33,22 +33,35 @@ never work started from inside a widget closure.
 - `mod.rs`: `Flux2PanelCtx` and the panel body, plus the two pinned parts. Edit it to move a
   control between blocks or to change the order of the panel.
 - `install.rs`: the source-mode switch, the editable model-path rows and their pickers,
-  the derived paths of the download mode, and the whole Hugging Face download block — the
-  ONLY file where the two checkpoints differ on screen. Also
-  `flux2_gated_button`, the gated-action button with its mandatory disabled tooltip, which
-  the component list and the prompt-cache controls share.
-- `components.rs`: the memory-preset picker, the RAM/VRAM forecast, and the merged
+  the derived paths of the download mode, and the FLUX.2 half of the Hugging Face download
+  block (heading, repository line, the token-row conditions, the encoder toggle) — the ONLY
+  file where the two checkpoints differ on screen. The token row and the check / plan /
+  download controls themselves are the shared `draw_hf_token_row` / `draw_hf_download_controls`
+  (`../../shared/hf_download_ui.rs`), and so is `gated_button`, the gated-action button with
+  its mandatory disabled tooltip that the component list and the prompt-cache controls use.
+  The token row carries the step-by-step access hint (`ms_widgets::HfAccessHint`) naming the
+  variant's model repository and, while «Расцензуренный энкодер» is in effect, the gated
+  encoder repository (`Flux2VariantPresentation::uncensored_encoder_repo`).
+- `components.rs`: the merged
   component list — one row per component carrying presence, size, residency and the
   backend's own action buttons.
 - `advanced.rs`: «Для экспертов» — the generation parameters, the mask shaping and the
-  placement fields the memory preset owns. It holds the panel's only gated non-button
+  precision / VAE tiling / fp8-encoder switches. It holds the panel's only gated non-button
   control: `guidance_scale`, closed on a distilled checkpoint.
-- `progress.rs`: the progress bars and the mask hint the body opens with.
+- `mask_hint.rs`: the mask hint the body closes with. The progress bar is the shared
+  `draw_stream_progress`, called from `draw_flux2_progress_section` in `mod.rs`.
+- «Память и скорость» has no file here: `mod.rs` `draw_memory_section` hands the shared
+  `ai_editor::large_model_resources` widget the engine's forecast state for one frame
+  (`ResourcesView`, from the engine's `ResourcesController`) together with the step pair and
+  the persisted «Энкодер на CPU» flag, and folds its `ResourcesAction`s back through
+  `Flux2PanelCtx::resources_actions`. The settings-file notice (moved aside / save blocked)
+  is the first line of the body (`draw_settings_problem`).
 
 ## Contracts and invariants
 - **No literal user-visible strings.** Every caption, hover and message goes through
-  `t!` / `tf!` / `tp!` under `cleaning.tools.flux2_klein.*` (the download block under
-  `cleaning.tools.flux2_klein.download.*`). A widget whose `Id` comes from a localized
+  `t!` / `tf!` / `tp!` under `cleaning.tools.flux2_klein.*` (the download block's own
+  sentences under `cleaning.tools.flux2_klein.download.*`; the shared parts it draws use
+  `cleaning.tools.hf_download.*` and `cleaning.tools.engine_progress.*`). A widget whose `Id` comes from a localized
   caption carries a stable `id_salt`, or switching language resets its state.
 - **`egui::Slider`, `egui::ComboBox` and `egui::DragValue` are forbidden** in product UI;
   use the `Wheel*` widgets. See `egui-docs/04-widgets.md` §0.2.
@@ -56,7 +69,7 @@ never work started from inside a widget closure.
   beside a path comes from the last `.status` answer, never from a `Path::exists` call.
 - **A disabled control explains itself.** Every gated button here is disabled for a reason
   the user cannot read off the button, so the disabled tooltip is the only place that
-  reason is stated — hence `flux2_gated_button` rather than a hand-threaded
+  reason is stated — hence `gated_button` rather than a hand-threaded
   `add_enabled(..)`. The one non-button gate is `guidance_scale` in `advanced.rs`, closed
   when `.status` reports the checkpoint as distilled (`flux2_guidance_supported`): it
   carries the disabled tooltip AND a line under it, because a section the user opened
@@ -88,7 +101,9 @@ never work started from inside a widget closure.
 - To move a control between sections, or to change what the panel contains: `mod.rs`.
 - To change a model path row, the source-mode switch or anything about the download:
   `install.rs`.
-- To change a component row, the preset picker or the forecast line: `components.rs`.
+- To change a component row: `components.rs`. To change the memory steps, the per-step rows,
+  the forecast line or «Пределы»: `../../../large_model_resources/` (shared with every
+  large-model engine).
 - To change what a line SAYS rather than how it looks: `../decisions.rs`, with its test.
 - The tests kept in this directory are CATALOG tests: they assert that every shipped
   locale carries the keys and the `{placeholder}` interpolations this panel spells, which

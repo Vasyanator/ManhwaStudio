@@ -79,6 +79,14 @@ not the dependency list.
   the locale-catalog helpers the launcher's first-run language modal reuses. Its projects-root
   "Browse" button uses the non-blocking `ms_platform::file_dialog` (`PickDirectoryPath`, polled
   each frame) and is drawn only where `PlatformFeature::PersistentDirectoryPicker` is available.
+- `large_models_panel.rs`: the AI pane's «Большие модели» section, drawn under the small-model
+  limit (`draw_model_manager`): one line per pool entry (from the PUSHED health snapshot,
+  `AiBackendHealthSnapshot::large_pool` — no polling), the two hard caps (`ByteCapEdit`, sent
+  debounced through `ms_local_ai::large_models::LimitsWriter`, ONE AXIS per edit with `Keep`
+  for the other so the cleaning panel's edits are never undone; the backend is their only writer
+  and this crate never writes those `user_config` keys), and «Выгрузить большие модели» /
+  «Сбросить выученные ограничения» on a worker. Offline it draws no editor. A pending edit is
+  sent by the section's own poll, or on a worker when the pane state is dropped.
 - `ai_backend_panel.rs`: AI runtime selection, ONNX provider/device/build, model limit,
   backend health readout, ORT crash-guard reset. The provider list is the UNION of the offline
   native set and the providers the backend reports; backend-only providers (e.g. MIGraphX,
@@ -194,6 +202,8 @@ not the dependency list.
   `storage_mode.rs`.
 - To add a settings section, see `settings_shared.rs` (`SettingsSectionId`, `sections_for`,
   `title_key`) and add both halves of the double interface in the new pane.
+- To change what the large-model section shows or does, see `large_models_panel.rs` (the wire
+  client and its types are `ms_local_ai::large_models`).
 - To change what the AI pane offers or reports, see `ai_backend_panel.rs`; which device ids
   an EP offers or what the capability probe gathers, `onnx_caps.rs`; how the backend process
   is started, watched or stopped (and what blocks a spawn), `ai_backend_supervisor.rs`.

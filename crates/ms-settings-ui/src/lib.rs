@@ -19,6 +19,8 @@ Main modules:
   (named worker running `ms_project::storage_mode::convert_globals`) and its pane row.
 - `ai_backend_panel`: the AI-backend pane (runtime selection, ONNX provider/device/build,
   model limit, health readout, ORT crash-guard reset).
+- `large_models_panel`: the pane's «Большие модели» section (pool entries from the pushed
+  health, the two hard caps, unload / reset learned limits).
 - `ai_backend_supervisor`: the app-global handle both shells drive the Python AI backend
   through (`AiBackendHandle`), including its health probe, and the backend spawn
   preconditions (`check_backend_spawnable`).
@@ -43,6 +45,8 @@ extern crate ms_i18n;
 
 pub mod ai_backend_panel;
 pub mod ai_backend_supervisor;
+// «Большие модели» of the AI-backend pane: the large-model pool, its caps and actions.
+pub mod large_models_panel;
 pub mod general_settings_panel;
 // Process-wide count of background `user_config` writes, waited for at process exit.
 pub mod pending_config_writes;

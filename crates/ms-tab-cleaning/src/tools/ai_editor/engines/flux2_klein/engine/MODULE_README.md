@@ -52,8 +52,20 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   `.prompt_cache.build`, `.component_action` and `.download.start` — so `pipeline_busy`
   reads all four receivers, and the RUN gate reads `non_run_pipeline_busy` instead, which
   is the same rule with the generation taken out.
-- **At most one query of a kind is ever in flight.** `.status`, `.estimate` and
-  `.prompt_cache.list` are re-armed by a flag, never issued per keystroke.
+- **At most one query of a kind is ever in flight.** `.status`, the forecast
+  (`large_models.profiles`, through the shared `ResourcesController` — its `ProfilesQuery` also
+  keeps the last answer as a STALE one while the next is asked) and `.prompt_cache.list` are
+  re-armed by a flag (`resources.arm()` for the forecast), never issued per keystroke. Events
+  that change the machine rather than the question (a finished run, a component action, a cap
+  write, a floor reset, a reconnect, a download) go through `invalidate_forecast`. The caps are
+  sent by the controller's debounced `LimitsWriter`, drained from `poll` (`poll_side_jobs`).
+- **A failed settings write is not success**: the shared `SettingsSaver` (`saver`) drives the
+  write; a failure restores `dirty`, shows `saver.error` and retries after `save_retry_delay`
+  (2 s doubling to 60 s); the writer function is `saver.write`, so a test can inject a failing
+  one.
+- **A blocked settings file is never written** (`settings_save_blocked`): the edits stay in
+  memory and `poll_and_maybe_save` returns early. A MIGRATED load is marked dirty, so the
+  file is rewritten once without the retired placement fields.
 - **`variant` is set at construction and never changes.** The picker holds one instance per
   `config::Flux2Variant`, each with its own settings file, model directory and
   `.download.*` requests. `new(variant)` stamps it into the in-memory settings before the
@@ -70,7 +82,8 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   accepted marks modes, what a run answers with — see `impl AiEngine` in `mod.rs`; to change
   what a run request is validated and turned into, see `Flux2KleinEngine::run_input`.
 - To change when the catalog, the forecast or the library listing is re-queried, see
-  `poll_and_maybe_query_*` and `note_settings_changed` in `mod.rs`.
+  `poll_and_maybe_query_*`, `invalidate_forecast` and `note_settings_changed` in `mod.rs`;
+  what the forecast is asked about is `profiles_request`.
 - To add a button that starts something long, add its `start_*` / `poll_*` pair in
   `actions.rs`, drain it from `AiEngine::poll` and add its receiver to `pipeline_busy`.
 - Tests sit at the end of each file and use the fixtures of `../test_support.rs`.

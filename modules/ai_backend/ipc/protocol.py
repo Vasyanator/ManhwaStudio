@@ -54,8 +54,23 @@ from __future__ import annotations
 # backend start). Residency is chosen on two step axes, `vram_step` x `ram_step`
 # (`.profiles` request and answer, `.status` entries); `inpaint.flux2_klein`
 # gains the optional step fields additively.
+# 14: the FLUX.2 klein placement wire is retired: `inpaint.flux2_klein*` params
+# refuse `placement`, `profile`, `low_cpu_mem_usage`, `vae_slicing`,
+# `unload_transformer_before_vae`, `unload_text_encoder_after_encode` by name;
+# `applied` is `{vae_tiling}`; the run answer loses `placement`, `profile`,
+# `profile_effective`; `.status` loses `memory`; `inpaint.flux2_klein.estimate`
+# is removed (forecasts are `large_models.profiles`); the text encoder is never
+# pinned to the CPU and the `….cpu` encoder registrations are gone; new
+# `user_config` default `General.large_models_oom_score_adj: true`.
+# 15: FLUX.3 klein region editing: new methods `inpaint.flux3_klein` (streaming,
+# blob region ++ mask ++ references, frames with a stable `stage`) / `.status` /
+# `.unload` / `.download.check` / `.download.start`; `large_models.profiles`
+# serves `model: "flux3_klein"`; the `health` payload gains `inpaint.flux3_klein`;
+# «Энкодер на CPU»: optional `encoder_on_cpu` (bool, absent = true) in the
+# `inpaint.flux2_klein*` params, the FLUX.3 params and their `large_models.profiles`
+# params (the text encoder then runs on the CPU at every VRAM step).
 # ============================================================================
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 15
 
 # ============================================================================
 # FRAME SIZE GUARDS
@@ -161,8 +176,7 @@ METHOD_INPAINT_FLUX_FILL_STATUS = "inpaint.flux_fill.status"  # quant catalog + 
 # pixel outside it comes back byte-identical. All weights are user-supplied
 # paths, so there is no download phase — the streamed phases are `load`/`generate`.
 METHOD_INPAINT_FLUX2_KLEIN = "inpaint.flux2_klein"                    # streams load+gen progress
-METHOD_INPAINT_FLUX2_KLEIN_STATUS = "inpaint.flux2_klein.status"      # components + free memory
-METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE = "inpaint.flux2_klein.estimate"  # RAM/VRAM forecast
+METHOD_INPAINT_FLUX2_KLEIN_STATUS = "inpaint.flux2_klein.status"      # components + residency
 METHOD_INPAINT_FLUX2_KLEIN_UNLOAD = "inpaint.flux2_klein.unload"
 # Per-component residency actions. `.status` reports, for the text encoder, the
 # transformer and the VAE, where the weights are and which actions are possible;
@@ -189,6 +203,15 @@ METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT = "inpaint.flux2_klein.prompt_cac
 # run beside a generation. The wire contract is `dev-docs/flux2_model_download.md`.
 METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK = "inpaint.flux2_klein.download.check"
 METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START = "inpaint.flux2_klein.download.start"
+# FLUX.3 Image Klein region editing (`ipc/handlers/flux3_klein.py`, PROTOCOL.md
+# "FLUX.3 klein"): the region is reference #0, the composite stays inside the
+# mask. The run streams `load` / `generate` frames with a stable `stage` and
+# cancels mid-run; the package comes from the gated repository per format.
+METHOD_INPAINT_FLUX3_KLEIN = "inpaint.flux3_klein"                    # streams load+gen progress
+METHOD_INPAINT_FLUX3_KLEIN_STATUS = "inpaint.flux3_klein.status"      # package files + health
+METHOD_INPAINT_FLUX3_KLEIN_UNLOAD = "inpaint.flux3_klein.unload"
+METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK = "inpaint.flux3_klein.download.check"
+METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START = "inpaint.flux3_klein.download.start"
 
 # --- Visible watermark removal ---
 # Primary flow is `watermark.detect` (mask only, fed to the existing inpainters);
@@ -263,7 +286,6 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX_FILL_STATUS,
         METHOD_INPAINT_FLUX2_KLEIN,
         METHOD_INPAINT_FLUX2_KLEIN_STATUS,
-        METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE,
         METHOD_INPAINT_FLUX2_KLEIN_UNLOAD,
         METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
@@ -274,6 +296,11 @@ ALL_METHODS = frozenset(
         METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_IMPORT,
         METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK,
         METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START,
+        METHOD_INPAINT_FLUX3_KLEIN,
+        METHOD_INPAINT_FLUX3_KLEIN_STATUS,
+        METHOD_INPAINT_FLUX3_KLEIN_UNLOAD,
+        METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK,
+        METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START,
         METHOD_WATERMARK_DETECT,
         METHOD_WATERMARK_REMOVE,
         METHOD_WATERMARK_STATUS,

@@ -328,11 +328,17 @@ def _lowers(candidate: Planned, current: Planned, failure: RunFailure) -> bool:
 # =====================================================================
 @dataclass(frozen=True)
 class FloorKey:
-    """Where a floor applies: one model in one weight format on one device class."""
+    """Where a floor applies: one model in one weight format on one device class, with one host pin.
+
+    `host_pin` are the component names the request pinned to host execution
+    (`LargeModelSpec.host_pin`, sorted; `()` = none): a pinned request places
+    differently, so what it needed says nothing about an unpinned one.
+    """
 
     device_class: str
     model: str
     format: str
+    host_pin: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -392,7 +398,7 @@ class LearnedFloors:
         """Every floor (of `model`, when given), sorted by key."""
         with self._lock:
             found = [entry for entry in self._entries.values() if model is None or entry.key.model == model]
-        return sorted(found, key=lambda entry: (entry.key.model, entry.key.format, entry.key.device_class))
+        return sorted(found, key=lambda entry: (entry.key.model, entry.key.format, entry.key.device_class, entry.key.host_pin))
 
     def record(self, entry: FloorEntry) -> bool:
         """Lower the floor of `entry.key` on each axis `entry` names (never raise one); returns whether anything changed.
@@ -413,7 +419,7 @@ class LearnedFloors:
             merged = FloorEntry(entry.key, vram, ram, entry.reason, entry.step, entry.recorded_at)
             self._entries[entry.key] = merged
             snapshot = list(self._entries.values())
-        log.warning("large models: learned floor %s/%s on %s -> vram %s, ram %s (%s at %s)", entry.key.model, entry.key.format, entry.key.device_class, vram.value if vram else "-", ram.value if ram else "-", entry.reason, entry.step)
+        log.warning("large models: learned floor %s/%s on %s (host pin %s) -> vram %s, ram %s (%s at %s)", entry.key.model, entry.key.format, entry.key.device_class, ",".join(entry.key.host_pin) or "-", vram.value if vram else "-", ram.value if ram else "-", entry.reason, entry.step)
         self._write(snapshot)
         return True
 

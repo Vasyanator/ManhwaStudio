@@ -24,6 +24,8 @@ the free fit); admission refusal; the sysmem-spill degrade; the live host guard
 before DISK staging (a budget that shrinks after admission); a `cpu` run device
 planned, reserved and reported on the host side; the per-handle device
 ceiling (`device_cap_bytes`) in profiles, admissions and ladder re-plans;
+the host pin (`HostPinTests`: its own handle and floor key, the pinned encoder
+executes on the CPU and the RAM step keeps or drops it);
 `placements` from
 the ledger; health / status / profiles shapes; the store (old profile floors
 and keep policy ignored); the Linux OOM backstop.
@@ -163,6 +165,8 @@ class _Rig:
             phases=(PhaseSpec("encode", frozenset({"enc"}), "enc", work(1)), PhaseSpec("denoise", frozenset({"dit"}), "dit", work(2)), PhaseSpec("decode", frozenset({"ae"}), "ae", work(1))),
             formats=lambda options: {"f32": FormatInfo(True, None, 0, "native", 1)},
             fallbacks=fallbacks,
+            # `{"pin": True}` pins the encoder to host execution (`HostPinTests`).
+            host_pin_of=lambda options: ("enc",) if options.get("pin") else (),
         )
 
     def _transport(self, device: str) -> Any:
@@ -171,8 +175,8 @@ class _Rig:
         return transport
 
     # ------------------------------------------------------------- driving
-    def acquire(self, steps: Steps = AUTO_STEPS, **kwargs: Any) -> Any:
-        return self.manager.acquire("toy", {}, SHAPE, device="cuda:0", format="f32", steps=steps, **kwargs)
+    def acquire(self, steps: Steps = AUTO_STEPS, *, options: dict[str, Any] | None = None, **kwargs: Any) -> Any:
+        return self.manager.acquire("toy", options or {}, SHAPE, device="cuda:0", format="f32", steps=steps, **kwargs)
 
     def phase_fn(self, phase: str, component: str, *, before: Any = None) -> Any:
         def fn(ctx: Any) -> Any:
@@ -190,13 +194,15 @@ class _Rig:
             outputs[component] = session.run_phase(phase, self.phase_fn(phase, component, before=befores.get(phase)))
         return outputs
 
-    def handle(self) -> Any:
+    def handle(self, key: str | None = None) -> Any:
+        if key is not None:
+            return self.manager._handles[key]
         handles = list(self.manager._handles.values())
         assert len(handles) == 1
         return handles[0]
 
-    def tiers(self, component: str) -> set[Tier]:
-        handle = self.handle()
+    def tiers(self, component: str, key: str | None = None) -> set[Tier]:
+        handle = self.handle(key)
         if component not in handle.components:
             return {Tier.DROPPED}
         return {state.tier for state in handle.ledger.units(component)}
@@ -815,6 +821,83 @@ class HostRunDeviceTests(unittest.TestCase):
                 session.load("dit")
         self.assertIs(caught.exception.failure.kind, FailureKind.HOST_SHORT)
         self.assertNotIn("dit", rig.handle().components)
+
+
+@unittest.skipIf(torch is None, "torch not installed")
+class HostPinTests(unittest.TestCase):
+    """`LargeModelSpec.host_pin`: the pinned encoder runs on the CPU from RAM at every VRAM step; its own handle and floor key."""
+
+    PIN = {"pin": True}
+
+    def test_a_pinned_run_encodes_on_the_cpu_and_matches_the_reference(self) -> None:
+        rig = _Rig(self)
+        seen: dict[str, Any] = {}
+
+        def look(ctx: Any) -> None:
+            seen["device"] = ctx.exec_device("enc")
+
+        with rig.acquire(MAX_KEEP, options=self.PIN) as session:
+            self.assertTrue(session.key.endswith("|host_pin=enc"), session.key)
+            for state in (*session.plan.phases, session.plan.idle):
+                self.assertIs(state.components["enc"].exec_device, ExecDevice.CPU)
+                self.assertIsNot(state.components["enc"].tier, Tier.DEVICE)
+            rig.assert_outputs(self, rig.run(session, encode=look))
+        self.assertEqual(seen["device"], "cpu")
+        # VRAM «Максимум скорости» keeps the DiT and the AE on the card, RAM
+        # «Держать» keeps the encoder in RAM: the VRAM step never reaches it.
+        self.assertEqual(rig.tiers("enc"), {Tier.HOST})
+        self.assertEqual(rig.tiers("dit"), {Tier.DEVICE})
+        placement = rig.manager.placements(session.key)["enc"]
+        self.assertEqual((placement.blocks_device, placement.exec_device), (0, ExecDevice.CPU))
+        self.assertEqual(placement.device_bytes, 0)
+
+    def test_the_ram_step_alone_decides_whether_the_pinned_encoder_stays(self) -> None:
+        rig = _Rig(self)
+        with rig.acquire(PHASE_RUN, options=self.PIN) as session:
+            rig.assert_outputs(self, rig.run(session))
+        self.assertEqual(rig.tiers("enc"), {Tier.DROPPED})
+        with rig.acquire(Steps(VramStep.MIN, RamStep.MIN), options=self.PIN) as session:
+            encode = session.plan.phase("encode").components["enc"]
+            self.assertEqual((encode.tier, encode.exec_device), (Tier.HOST, ExecDevice.CPU))
+            self.assertIs(session.plan.phase("denoise").components["enc"].tier, Tier.DROPPED)
+            rig.assert_outputs(self, rig.run(session))
+
+    def test_pinned_and_unpinned_requests_are_separate_handles_and_floors(self) -> None:
+        rig = _Rig(self)
+        with rig.acquire(MAX_KEEP) as unpinned:
+            rig.run(unpinned)
+        failures = [rig.oom(ACT)]
+
+        def fail_once(ctx: Any) -> None:
+            if failures:
+                raise failures.pop(0)
+
+        with rig.acquire(options=self.PIN) as pinned:
+            rig.run(pinned, denoise=fail_once)
+        self.assertNotEqual(unpinned.key, pinned.key)
+        self.assertEqual(rig.tiers("enc", unpinned.key), {Tier.DEVICE})
+        floors = rig.manager.floors("toy")
+        self.assertEqual([entry.key.host_pin for entry in floors], [("enc",)])
+        self.assertIsNone(rig.manager.profiles("toy", {}, SHAPE, device="cuda:0").floor)
+        # The pinned request's answer carries the pinned floor (the wire's
+        # `learned_floor` shape is unchanged: the request already names the pin).
+        pinned_floor = rig.manager.profiles("toy", self.PIN, SHAPE, device="cuda:0").floor
+        assert pinned_floor is not None
+        self.assertEqual(pinned_floor.key.host_pin, ("enc",))
+
+    def test_the_store_round_trips_the_pin_and_reads_old_entries_as_unpinned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = limits_store_path(Path(directory))
+            entry = FloorEntry(FloorKey("c", "m", "f", ("enc",)), VramStep.HALF, None, "device_oom", "denoise", 1.0)
+            JsonLimitsStore(path).write_floors([entry])
+            self.assertEqual(JsonLimitsStore(path).read_floors(), [entry])
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["floors"].append({"device_class": "c", "model": "m", "format": "f", "vram": "min", "ram": None})
+            document["floors"].append({"device_class": "c", "model": "m", "format": "f", "host_pin": "enc", "vram": "min", "ram": None})
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertLogs(level="WARNING"):
+                reread = JsonLimitsStore(path).read_floors()
+            self.assertEqual([floor.key.host_pin for floor in reread], [("enc",), ()])
 
 
 @unittest.skipIf(torch is None, "torch not installed")

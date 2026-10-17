@@ -10,13 +10,18 @@ two resource steps «Видеопамять» x «Оперативная пам�
 default); where every byte of the DiT, the AE and the encoder lives
 during each phase is the manager's plan, never a per-component option of this package.
 
-**Integration boundary.** The service is NOT constructed in `server.py` (its `LargeModelManager`
-does not register the FLUX.3 models), has no `AppState` field, no IPC handler or method, no Rust
-side, and the IPC protocol carries nothing of it. Wiring it is a separate task. Its only caller today is the measurement / calibration tool `tools/large_model_calibration/` (its `flux3` driver). The weights
-carry their own licence ("FLUX Kommunity License"), a question to settle before any product wiring.
+**Integration boundary.** `server.py` constructs `Flux3KleinService(large_models)` as
+`AppState.flux3_klein` (health key `inpaint.flux3_klein`) and lists it as the
+`large_models.profiles` adapter `flux3_klein`. The IPC surface is `ipc/handlers/flux3_klein.py`:
+`inpaint.flux3_klein` (the cleaning tab's region editor, through `region.py`), `.status`,
+`.unload` and the two `.download.*` methods (`../flux3_download.py`, the gated repository
+`black-forest-labs/flux-3-image-klein`; the user accepts the FLUX Kommunity License on Hugging Face
+and sends a token). The wire is `ipc/PROTOCOL.md` "FLUX.3 klein"; `wire.py` is its one mapping onto
+`Flux3Options`. The calibration tool `tools/large_model_calibration/` (its `flux3` driver) calls the
+service directly.
 
 Out of scope: the CFG "base" model (refused by `config.py` and `loading.require_flow_map`), the
-prompt upsampler, the safety checker, bounding boxes, a prompt cache, and downloading the weights.
+prompt upsampler, the safety checker, bounding boxes, a prompt cache, and prompt translation.
 
 ## Architecture
 One-directional layering; a module imports only from modules on lines above it and from
@@ -24,11 +29,13 @@ One-directional layering; a module imports only from modules on lines above it a
 
 ```
 config, params, phases          (torch-free; params -> runtime.large_models.tiers for VramStep / RamStep / Steps)
+wire                            (torch-free; the IPC params mapping and the region frame rule)
 large_model                     (torch-free at import; the LargeModelSpecs)
 quant, packing                  (torch)
 dit, autoencoder, sampling      (torch)
 loading, text_encoder           (torch; transformers / accelerate lazily)
 service                         (torch-free at import; imports the torch modules inside methods)
+region                          (numpy / PIL; ../region_imaging; the region editor over the service)
 __init__                        (re-export only; the torch-side names lazily, PEP 562)
 ```
 
@@ -78,7 +85,17 @@ keeps nothing before its first use.
 - `text_encoder.py`: the truncated Qwen3-VL encoder (33 of 36 layers): `build_text_encoder_meta`,
   `encoder_key_map`, `load_text_encoder` / `load_text_encoder_model` (standalone),
   `load_text_processor`, `encode_text`, `encode_with_references`.
-- `service.py`: `Flux3KleinService`, `Flux3Result`, `Flux3Applied`, `_model_key`.
+- `wire.py`: `normalize_flux3_params` -> `Flux3WireParams` (the one wire -> options mapping;
+  unknown keys, wrong types and out-of-range values refused by name), `validate_region_size`
+  (multiple of 16, side >= 128, 4 MP, aspect 4:1), `MAX_EXTRA_REFERENCES` (9), `FIELDS`.
+- `region.py`: `edit_region_bytes` — the region editor: decode and check region / mask /
+  references, the seed (`null` = random, echoed), `Flux3Request(region as reference #0, explicit
+  size)`, the progress frames (`progress_stages()`, stable `stage` ids), cancellation through the
+  observer and the step callback, the size check, the color match and the inward-feathered
+  composite (`../region_imaging.py`), the answer dict.
+- `service.py`: `Flux3KleinService` (`generate`, `status`, the profiles adapter
+  `large_model_name` / `large_model_inputs`, `health`, `unload`), `Flux3Result`, `Flux3Applied`,
+  `Flux3Canceled`, `_model_key`.
 - `_service_test_fixtures.py`: the service test harness (tiny real safetensors of stand-in
   modules, the real arbiter + manager over fake probes, stubs at the meta-build seams).
 - `LICENSE`: the reference's Apache-2.0 licence (the ported files name it in their headers).
@@ -86,6 +103,8 @@ keeps nothing before its first use.
   `test_large_model.py` runs the spec over a real tiny package through the real manager (a
   juggled DiT equals the resident one in every format); `test_characterization.py` holds the
   observer / health / lease CONTRACT and the per-step-pair GOLDEN table;
+  `test_wire.py` / `test_region.py` pin the wire mapping and the region editor (byte identity
+  outside the mask, seed echo, stages, cancel);
   `test_real_headers_*.py` and `test_real_processor.py` read the real package and skip unless
   `MS_FLUX3_DIR` names its root. Run: `venv/bin/python -m pytest modules/ai_backend/inpaint/flux3_klein -q`.
 
@@ -149,10 +168,15 @@ reported in `Flux3Result.applied.fp8_compute` and `health()["fp8_compute"]`.
   admission), nvfp4 (dequant) with availability, DiT file size, quality rank 3 / 2 / 1. The
   manager never changes the format; a refusal names the formats that would fit.
 - No model-specific degrade rung: `reference_max_pixels` and the AE dtype are the user's quality
-  choices, the port has no tiled AE, encoder-on-CPU is already a step placement (`tiers.template_for`).
+  choices, the port has no tiled AE, encoder-on-CPU is a step placement (`tiers.template_for`) or
+  the host pin below.
+- «Энкодер на CPU» (`Flux3Options.encoder_on_cpu`; dataclass default `False`, WIRE default
+  `true`): the spec's `host_pin_of` pins `encoder` to host execution
+  (`runtime/large_models` "Host pin"): CPU from RAM at every VRAM step, placed by the RAM step alone.
 - Residency key `flux3_klein:{format}|{device}|{fp8 requested}|{ae dtype}|{encoder mode}|{root}`
-  (`residency_key`, also `service._model_key`): everything that changes the loaded bytes or
-  modules; `reference_max_pixels` and the resource steps are not in it.
+  (`residency_key`), plus `|host_pin=encoder` under «Энкодер на CPU» (added by
+  `LargeModelSpec.key`; `service._model_key` is that key): everything that changes the loaded
+  bytes, modules or placement; `reference_max_pixels` and the resource steps are not in it.
 
 ### Service
 - Defaults: `EncoderMode.TEXT`, `Fp8Compute.AUTO`, AE float32, `reference_max_pixels=None`,
@@ -169,7 +193,17 @@ reported in `Flux3Result.applied.fp8_compute` and `health()["fp8_compute"]`.
   failure only the RAM step; `applied.steps_requested` and the options are never rewritten).
 - Failures: a refusal before or at the admission touches nothing (no phase, nothing held;
   `last_error` set for an admission refusal). A failed load scope registers nothing: the session
-  finishes and the model's idle handles are unloaded. A failed run keeps the between-runs state
+  finishes and the model's idle handles are unloaded. A CANCEL (`Flux3Canceled`, raised by the
+  caller's observer at a phase begin or by its `step_callback` after a denoise step) is not a
+  failure: no degrade retry (`degrade.classify_failure` does not know it), nothing is unloaded
+  (the session's `finish` shrinks to the between-runs state as after any non-memory error), it is
+  logged at INFO and does not touch `last_error`; the next run starts normally.
+- `generate(..., step_callback=)`: `(step, total)` after every flow-map step (repeats steps after a
+  degrade retry; exceptions propagate).
+- `status(params)` (the `.status` answer: file checks through `large_model.formats` with a
+  placeholder fp8 path, never a probe) and the profiles adapter (`large_model_name`,
+  `large_model_inputs`: the fp8 path is probed once per device, cached) read the wire through
+  `wire.normalize_flux3_params`. A failed run keeps the between-runs state
   (a memory failure makes the manager drop everything); every failure of `generate` is logged with
   its traceback, then `_release_failed_run_memory` clears the frames' locals and releases the
   allocator cache.
@@ -221,7 +255,11 @@ time. Patching the package re-export is a silent no-op.
 ## Editing map
 - Package layout, `config.json` rules, weight-format detection, encoder checkpoint layout:
   `config.py`.
-- Request validation, defaults, option enums: `params.py`.
+- Request validation, defaults, option enums: `params.py`; the IPC params, their defaults and
+  the region frame rule: `wire.py` (keep `PROTOCOL.md` "FLUX.3 klein" and the Rust engine's
+  settings / frame rule in step).
+- The region editor (composite, seed, progress stages, cancel points): `region.py`; the pixel
+  helpers it shares with FLUX.2: `../region_imaging.py`; the download: `../flux3_download.py`.
 - Components, blocks, phases, formats, residency key, forecast inputs: `large_model.py` (the
   per-phase activation and time constants are the calibration tables of `runtime/large_models`).
 - Run order, the step <-> observer-phase mapping, `info` keys, health: `service.py` (update the

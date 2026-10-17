@@ -1,47 +1,45 @@
 {
-  "_note": "GOLDEN snapshot of FLUX.2 klein forecast_memory / _preset_advice (klein 9B sizes), the large-model manager's forecast with the reference calibration table (its measured FLUX.2 entries). Expected to change with every recalibration of that table (behaviour change B4): regenerate deliberately with `python -m modules.ai_backend.inpaint.flux2_klein.test_characterization --write-golden` and review the diff. Case tables: FORECAST_CASES / ADVICE_CASES in that module.",
+  "_note": "GOLDEN snapshot of FLUX.2 klein forecast_memory (klein 9B sizes), the large-model manager's forecast with the reference calibration table (its measured FLUX.2 entries). Expected to change with every recalibration of that table (behaviour change B4): regenerate deliberately with `python -m modules.ai_backend.inpaint.flux2_klein.test_characterization --write-golden` and review the diff. Case table: FORECAST_CASES in that module.",
   "sizes": {
     "transformer": 18157185168,
     "text_encoder": 16381516808,
     "vae": 168120878
   },
   "forecast_memory": {
-    "full_gpu_512": {
-      "vram_bytes": 21723760106,
-      "ram_bytes": 12423465992,
+    "max_keep_512": {
+      "vram_bytes": 32084051524,
+      "ram_bytes": 0,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
+          "vram_bytes": 32084051524,
+          "ram_bytes": 0
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
+          "vram_bytes": 13758745478,
+          "ram_bytes": 0
         },
         "denoise": {
           "vram_bytes": 21159042867,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         },
         "decode": {
           "vram_bytes": 21723760106,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         }
       },
       "resident": {
         "pipeline_device": 18325306046,
-        "text_encoder_host": 12133145608
+        "text_encoder_host": 0
       },
       "breakdown": {
         "transformer": 18157185168,
         "text_encoder": 12133145608,
         "vae": 168120878,
         "activations": 3956780961,
-        "peak_encode": 18926140094,
+        "peak_encode": 32084051524,
         "peak_denoise": 21159042867,
         "peak_decode": 21723760106
       },
-      "profile": "max_speed",
-      "profile_effective": "max_speed",
       "vram_step": "max",
       "ram_step": "keep",
       "vram_step_effective": "max",
@@ -49,42 +47,40 @@
       "fits": true,
       "calibrated": true
     },
-    "full_gpu_1024": {
-      "vram_bytes": 28349606992,
-      "ram_bytes": 12423465992,
+    "max_keep_1024": {
+      "vram_bytes": 32084051524,
+      "ram_bytes": 0,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
+          "vram_bytes": 32084051524,
+          "ram_bytes": 0
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
+          "vram_bytes": 13758745478,
+          "ram_bytes": 0
         },
         "denoise": {
           "vram_bytes": 25229519335,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         },
         "decode": {
           "vram_bytes": 28349606992,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         }
       },
       "resident": {
         "pipeline_device": 18325306046,
-        "text_encoder_host": 12133145608
+        "text_encoder_host": 0
       },
       "breakdown": {
         "transformer": 18157185168,
         "text_encoder": 12133145608,
         "vae": 168120878,
         "activations": 14653104315,
-        "peak_encode": 18926140094,
+        "peak_encode": 32084051524,
         "peak_denoise": 25229519335,
         "peak_decode": 28349606992
       },
-      "profile": "max_speed",
-      "profile_effective": "max_speed",
       "vram_step": "max",
       "ram_step": "keep",
       "vram_step_effective": "max",
@@ -92,42 +88,40 @@
       "fits": true,
       "calibrated": true
     },
-    "full_gpu_512_reference": {
-      "vram_bytes": 21837455612,
-      "ram_bytes": 12423465992,
+    "max_keep_512_reference": {
+      "vram_bytes": 32084051524,
+      "ram_bytes": 0,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
+          "vram_bytes": 32084051524,
+          "ram_bytes": 0
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
+          "vram_bytes": 13758745478,
+          "ram_bytes": 0
         },
         "denoise": {
           "vram_bytes": 21837455612,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         },
         "decode": {
           "vram_bytes": 21723760106,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         }
       },
       "resident": {
         "pipeline_device": 18325306046,
-        "text_encoder_host": 12133145608
+        "text_encoder_host": 0
       },
       "breakdown": {
         "transformer": 18157185168,
         "text_encoder": 12133145608,
         "vae": 168120878,
         "activations": 4635193706,
-        "peak_encode": 18926140094,
+        "peak_encode": 32084051524,
         "peak_denoise": 21837455612,
         "peak_decode": 21723760106
       },
-      "profile": "max_speed",
-      "profile_effective": "max_speed",
       "vram_step": "max",
       "ram_step": "keep",
       "vram_step_effective": "max",
@@ -135,43 +129,41 @@
       "fits": true,
       "calibrated": true
     },
-    "full_gpu_512_attention_mask": {
-      "vram_bytes": 21723760106,
-      "ram_bytes": 12423465992,
+    "max_keep_512_attention_mask": {
+      "vram_bytes": 32084051524,
+      "ram_bytes": 0,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
+          "vram_bytes": 32084051524,
+          "ram_bytes": 0
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
+          "vram_bytes": 13758745478,
+          "ram_bytes": 0
         },
         "denoise": {
           "vram_bytes": 21172150067,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         },
         "decode": {
           "vram_bytes": 21723760106,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         }
       },
       "resident": {
         "pipeline_device": 18325306046,
-        "text_encoder_host": 12133145608
+        "text_encoder_host": 0
       },
       "breakdown": {
         "transformer": 18157185168,
         "text_encoder": 12133145608,
         "vae": 168120878,
         "activations": 3969888161,
-        "peak_encode": 18926140094,
+        "peak_encode": 32084051524,
         "peak_denoise": 21172150067,
         "peak_decode": 21723760106,
         "attention_mask": 13107200
       },
-      "profile": "max_speed",
-      "profile_effective": "max_speed",
       "vram_step": "max",
       "ram_step": "keep",
       "vram_step_effective": "max",
@@ -179,7 +171,7 @@
       "fits": true,
       "calibrated": true
     },
-    "full_gpu_512_no_encoder": {
+    "max_keep_512_no_encoder": {
       "vram_bytes": 21723760106,
       "ram_bytes": 0,
       "phases": {
@@ -213,8 +205,6 @@
         "peak_denoise": 21159042867,
         "peak_decode": 21723760106
       },
-      "profile": "max_speed",
-      "profile_effective": "max_speed",
       "vram_step": "max",
       "ram_step": "keep",
       "vram_step_effective": "max",
@@ -222,17 +212,17 @@
       "fits": true,
       "calibrated": true
     },
-    "encoder_cpu_512": {
-      "vram_bytes": 21159042867,
+    "phase_keep_512": {
+      "vram_bytes": 32084051524,
       "ram_bytes": 30290330776,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
+          "vram_bytes": 32084051524,
+          "ram_bytes": 750927872
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
+          "vram_bytes": 13758745478,
+          "ram_bytes": 750927872
         },
         "denoise": {
           "vram_bytes": 21159042867,
@@ -252,12 +242,10 @@
         "text_encoder": 12133145608,
         "vae": 168120878,
         "activations": 3956780961,
-        "peak_encode": 18926140094,
+        "peak_encode": 32084051524,
         "peak_denoise": 21159042867,
         "peak_decode": 3102570125
       },
-      "profile": "balanced",
-      "profile_effective": "balanced",
       "vram_step": "phase",
       "ram_step": "keep",
       "vram_step_effective": "phase",
@@ -265,60 +253,17 @@
       "fits": true,
       "calibrated": true
     },
-    "encoder_cpu_512_low_cpu": {
-      "vram_bytes": 21159042867,
+    "phase_keep_1152x896_tiled": {
+      "vram_bytes": 32084051524,
       "ram_bytes": 30290330776,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
+          "vram_bytes": 32084051524,
+          "ram_bytes": 750927872
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
-        },
-        "denoise": {
-          "vram_bytes": 21159042867,
-          "ram_bytes": 12133145608
-        },
-        "decode": {
-          "vram_bytes": 3102570125,
-          "ram_bytes": 30290330776
-        }
-      },
-      "resident": {
-        "pipeline_device": 18325306046,
-        "text_encoder_host": 12133145608
-      },
-      "breakdown": {
-        "transformer": 18157185168,
-        "text_encoder": 12133145608,
-        "vae": 168120878,
-        "activations": 3956780961,
-        "peak_encode": 18926140094,
-        "peak_denoise": 21159042867,
-        "peak_decode": 3102570125
-      },
-      "profile": "balanced",
-      "profile_effective": "balanced",
-      "vram_step": "phase",
-      "ram_step": "keep",
-      "vram_step_effective": "phase",
-      "ram_step_effective": "keep",
-      "fits": true,
-      "calibrated": true
-    },
-    "encoder_cpu_1152x896_tiled": {
-      "vram_bytes": 25144717742,
-      "ram_bytes": 30290330776,
-      "phases": {
-        "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
-        },
-        "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
+          "vram_bytes": 13758745478,
+          "ram_bytes": 750927872
         },
         "denoise": {
           "vram_bytes": 25144717742,
@@ -338,12 +283,10 @@
         "text_encoder": 12133145608,
         "vae": 168120878,
         "activations": 13463994908,
-        "peak_encode": 18926140094,
+        "peak_encode": 32084051524,
         "peak_denoise": 25144717742,
         "peak_decode": 8789755369
       },
-      "profile": "balanced",
-      "profile_effective": "balanced",
       "vram_step": "phase",
       "ram_step": "keep",
       "vram_step_effective": "phase",
@@ -351,17 +294,17 @@
       "fits": true,
       "calibrated": true
     },
-    "encoder_cpu_1152x896_untiled": {
-      "vram_bytes": 25144717742,
+    "phase_keep_1152x896_untiled": {
+      "vram_bytes": 32084051524,
       "ram_bytes": 30290330776,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
+          "vram_bytes": 32084051524,
+          "ram_bytes": 750927872
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
+          "vram_bytes": 13758745478,
+          "ram_bytes": 750927872
         },
         "denoise": {
           "vram_bytes": 25144717742,
@@ -381,12 +324,10 @@
         "text_encoder": 12133145608,
         "vae": 168120878,
         "activations": 14430264246,
-        "peak_encode": 18926140094,
+        "peak_encode": 32084051524,
         "peak_denoise": 25144717742,
         "peak_decode": 9785012787
       },
-      "profile": "balanced",
-      "profile_effective": "balanced",
       "vram_step": "phase",
       "ram_step": "keep",
       "vram_step_effective": "phase",
@@ -394,60 +335,17 @@
       "fits": true,
       "calibrated": true
     },
-    "encoder_cpu_512_unload_encoder": {
-      "vram_bytes": 21159042867,
-      "ram_bytes": 30290330776,
-      "phases": {
-        "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
-        },
-        "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
-        },
-        "denoise": {
-          "vram_bytes": 21159042867,
-          "ram_bytes": 12133145608
-        },
-        "decode": {
-          "vram_bytes": 3102570125,
-          "ram_bytes": 30290330776
-        }
-      },
-      "resident": {
-        "pipeline_device": 18325306046,
-        "text_encoder_host": 12133145608
-      },
-      "breakdown": {
-        "transformer": 18157185168,
-        "text_encoder": 12133145608,
-        "vae": 168120878,
-        "activations": 3956780961,
-        "peak_encode": 18926140094,
-        "peak_denoise": 21159042867,
-        "peak_decode": 3102570125
-      },
-      "profile": "balanced",
-      "profile_effective": "balanced",
-      "vram_step": "phase",
-      "ram_step": "keep",
-      "vram_step_effective": "phase",
-      "ram_step_effective": "keep",
-      "fits": true,
-      "calibrated": true
-    },
-    "encoder_cpu_512_encoder_fp8": {
-      "vram_bytes": 21159042867,
+    "phase_keep_512_encoder_fp8": {
+      "vram_bytes": 26283133713,
       "ram_bytes": 25033835672,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 7166970888
+          "vram_bytes": 26283133713,
+          "ram_bytes": 750927872
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 7166970888
+          "vram_bytes": 7957827667,
+          "ram_bytes": 750927872
         },
         "denoise": {
           "vram_bytes": 21159042867,
@@ -467,12 +365,10 @@
         "text_encoder": 6876650504,
         "vae": 168120878,
         "activations": 3956780961,
-        "peak_encode": 18926140094,
+        "peak_encode": 26283133713,
         "peak_denoise": 21159042867,
         "peak_decode": 3102570125
       },
-      "profile": "balanced",
-      "profile_effective": "balanced",
       "vram_step": "phase",
       "ram_step": "keep",
       "vram_step_effective": "phase",
@@ -480,93 +376,48 @@
       "fits": true,
       "calibrated": true
     },
-    "encoder_cpu_512_keep_transformer": {
-      "vram_bytes": 21723760106,
-      "ram_bytes": 12423465992,
+    "half_run_512": {
+      "vram_bytes": 32084051524,
+      "ram_bytes": 18157185168,
       "phases": {
         "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
+          "vram_bytes": 32084051524,
+          "ram_bytes": 750927872
         },
         "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
+          "vram_bytes": 13758745478,
+          "ram_bytes": 750927872
         },
         "denoise": {
           "vram_bytes": 21159042867,
-          "ram_bytes": 12133145608
-        },
-        "decode": {
-          "vram_bytes": 21723760106,
-          "ram_bytes": 12133145608
-        }
-      },
-      "resident": {
-        "pipeline_device": 18325306046,
-        "text_encoder_host": 12133145608
-      },
-      "breakdown": {
-        "transformer": 18157185168,
-        "text_encoder": 12133145608,
-        "vae": 168120878,
-        "activations": 3956780961,
-        "peak_encode": 18926140094,
-        "peak_denoise": 21159042867,
-        "peak_decode": 21723760106
-      },
-      "profile": "max_speed",
-      "profile_effective": "max_speed",
-      "vram_step": "max",
-      "ram_step": "keep",
-      "vram_step_effective": "max",
-      "ram_step_effective": "keep",
-      "fits": true,
-      "calibrated": true
-    },
-    "model_cpu_offload_512": {
-      "vram_bytes": 21159042867,
-      "ram_bytes": 30290330776,
-      "phases": {
-        "encode": {
-          "vram_bytes": 18926140094,
-          "ram_bytes": 12423465992
-        },
-        "encode_standalone": {
-          "vram_bytes": 600834048,
-          "ram_bytes": 12423465992
-        },
-        "denoise": {
-          "vram_bytes": 21159042867,
-          "ram_bytes": 12133145608
+          "ram_bytes": 0
         },
         "decode": {
           "vram_bytes": 3102570125,
-          "ram_bytes": 30290330776
+          "ram_bytes": 18157185168
         }
       },
       "resident": {
         "pipeline_device": 18325306046,
-        "text_encoder_host": 12133145608
+        "text_encoder_host": 0
       },
       "breakdown": {
         "transformer": 18157185168,
         "text_encoder": 12133145608,
         "vae": 168120878,
         "activations": 3956780961,
-        "peak_encode": 18926140094,
+        "peak_encode": 32084051524,
         "peak_denoise": 21159042867,
         "peak_decode": 3102570125
       },
-      "profile": "balanced",
-      "profile_effective": "balanced",
-      "vram_step": "phase",
-      "ram_step": "keep",
-      "vram_step_effective": "phase",
-      "ram_step_effective": "keep",
+      "vram_step": "half",
+      "ram_step": "run",
+      "vram_step_effective": "half",
+      "ram_step_effective": "run",
       "fits": true,
       "calibrated": true
     },
-    "sequential_cpu_offload_512": {
+    "min_keep_512": {
       "vram_bytes": 4221147580,
       "ram_bytes": 30290330776,
       "phases": {
@@ -600,8 +451,6 @@
         "peak_denoise": 4221147580,
         "peak_decode": 3102570125
       },
-      "profile": "max_economy",
-      "profile_effective": "max_economy",
       "vram_step": "min",
       "ram_step": "keep",
       "vram_step_effective": "min",
@@ -609,7 +458,7 @@
       "fits": true,
       "calibrated": true
     },
-    "sequential_cpu_offload_256x2048": {
+    "min_keep_256x2048": {
       "vram_bytes": 5618677834,
       "ram_bytes": 30290330776,
       "phases": {
@@ -643,26 +492,217 @@
         "peak_denoise": 5618677834,
         "peak_decode": 3102570125
       },
-      "profile": "max_economy",
-      "profile_effective": "max_economy",
       "vram_step": "min",
       "ram_step": "keep",
       "vram_step_effective": "min",
       "ram_step_effective": "keep",
       "fits": true,
       "calibrated": true
+    },
+    "min_min_512": {
+      "vram_bytes": 4422225558,
+      "ram_bytes": 1100431360,
+      "phases": {
+        "encode": {
+          "vram_bytes": 4422225558,
+          "ram_bytes": 750927872
+        },
+        "encode_standalone": {
+          "vram_bytes": 3703821272,
+          "ram_bytes": 750927872
+        },
+        "denoise": {
+          "vram_bytes": 4221147580,
+          "ram_bytes": 1100431360
+        },
+        "decode": {
+          "vram_bytes": 3102570125,
+          "ram_bytes": 0
+        }
+      },
+      "resident": {
+        "pipeline_device": 718404286,
+        "text_encoder_host": 0
+      },
+      "breakdown": {
+        "transformer": 18157185168,
+        "text_encoder": 12133145608,
+        "vae": 168120878,
+        "activations": 3956780961,
+        "peak_encode": 4422225558,
+        "peak_denoise": 4221147580,
+        "peak_decode": 3102570125
+      },
+      "vram_step": "min",
+      "ram_step": "min",
+      "vram_step_effective": "min",
+      "ram_step_effective": "min",
+      "fits": true,
+      "calibrated": true
+    },
+    "auto_auto_512": {
+      "vram_bytes": 32084051524,
+      "ram_bytes": 0,
+      "phases": {
+        "encode": {
+          "vram_bytes": 32084051524,
+          "ram_bytes": 0
+        },
+        "encode_standalone": {
+          "vram_bytes": 13758745478,
+          "ram_bytes": 0
+        },
+        "denoise": {
+          "vram_bytes": 21159042867,
+          "ram_bytes": 0
+        },
+        "decode": {
+          "vram_bytes": 21723760106,
+          "ram_bytes": 0
+        }
+      },
+      "resident": {
+        "pipeline_device": 18325306046,
+        "text_encoder_host": 0
+      },
+      "breakdown": {
+        "transformer": 18157185168,
+        "text_encoder": 12133145608,
+        "vae": 168120878,
+        "activations": 3956780961,
+        "peak_encode": 32084051524,
+        "peak_denoise": 21159042867,
+        "peak_decode": 21723760106
+      },
+      "vram_step": "auto",
+      "ram_step": "auto",
+      "vram_step_effective": "max",
+      "ram_step_effective": "keep",
+      "fits": true,
+      "calibrated": true
+    },
+    "max_keep_512_encoder_on_cpu": {
+      "vram_bytes": 21723760106,
+      "ram_bytes": 12423465992,
+      "phases": {
+        "encode": {
+          "vram_bytes": 18926140094,
+          "ram_bytes": 12423465992
+        },
+        "encode_standalone": {
+          "vram_bytes": 600834048,
+          "ram_bytes": 12423465992
+        },
+        "denoise": {
+          "vram_bytes": 21159042867,
+          "ram_bytes": 12133145608
+        },
+        "decode": {
+          "vram_bytes": 21723760106,
+          "ram_bytes": 12133145608
+        }
+      },
+      "resident": {
+        "pipeline_device": 18325306046,
+        "text_encoder_host": 12133145608
+      },
+      "breakdown": {
+        "transformer": 18157185168,
+        "text_encoder": 12133145608,
+        "vae": 168120878,
+        "activations": 3956780961,
+        "peak_encode": 18926140094,
+        "peak_denoise": 21159042867,
+        "peak_decode": 21723760106
+      },
+      "vram_step": "max",
+      "ram_step": "keep",
+      "vram_step_effective": "max",
+      "ram_step_effective": "keep",
+      "fits": true,
+      "calibrated": true
+    },
+    "phase_run_512_encoder_on_cpu": {
+      "vram_bytes": 21159042867,
+      "ram_bytes": 18157185168,
+      "phases": {
+        "encode": {
+          "vram_bytes": 18926140094,
+          "ram_bytes": 12423465992
+        },
+        "encode_standalone": {
+          "vram_bytes": 600834048,
+          "ram_bytes": 12423465992
+        },
+        "denoise": {
+          "vram_bytes": 21159042867,
+          "ram_bytes": 0
+        },
+        "decode": {
+          "vram_bytes": 3102570125,
+          "ram_bytes": 18157185168
+        }
+      },
+      "resident": {
+        "pipeline_device": 18325306046,
+        "text_encoder_host": 0
+      },
+      "breakdown": {
+        "transformer": 18157185168,
+        "text_encoder": 12133145608,
+        "vae": 168120878,
+        "activations": 3956780961,
+        "peak_encode": 18926140094,
+        "peak_denoise": 21159042867,
+        "peak_decode": 3102570125
+      },
+      "vram_step": "phase",
+      "ram_step": "run",
+      "vram_step_effective": "phase",
+      "ram_step_effective": "run",
+      "fits": true,
+      "calibrated": true
+    },
+    "min_min_512_encoder_on_cpu": {
+      "vram_bytes": 4221147580,
+      "ram_bytes": 12423465992,
+      "phases": {
+        "encode": {
+          "vram_bytes": 1319238334,
+          "ram_bytes": 12423465992
+        },
+        "encode_standalone": {
+          "vram_bytes": 600834048,
+          "ram_bytes": 12423465992
+        },
+        "denoise": {
+          "vram_bytes": 4221147580,
+          "ram_bytes": 1100431360
+        },
+        "decode": {
+          "vram_bytes": 3102570125,
+          "ram_bytes": 0
+        }
+      },
+      "resident": {
+        "pipeline_device": 718404286,
+        "text_encoder_host": 0
+      },
+      "breakdown": {
+        "transformer": 18157185168,
+        "text_encoder": 12133145608,
+        "vae": 168120878,
+        "activations": 3956780961,
+        "peak_encode": 12423465992,
+        "peak_denoise": 4221147580,
+        "peak_decode": 3102570125
+      },
+      "vram_step": "min",
+      "ram_step": "min",
+      "vram_step_effective": "min",
+      "ram_step_effective": "min",
+      "fits": true,
+      "calibrated": true
     }
-  },
-  "preset_advice": {
-    "encoder_cpu_ram12_vram31": "Сейчас помещаются: «Максимум скорости + Держать модели в памяти», «Максимум скорости + Только на время задачи», «Максимум скорости + Минимум, читать с диска», «Только текущий этап + Минимум, читать с диска», «Не больше половины + Минимум, читать с диска», «Минимум + Минимум, читать с диска».",
-    "encoder_cpu_ram18_vram31": "Сейчас помещаются: «Максимум скорости + Держать модели в памяти», «Максимум скорости + Только на время задачи», «Максимум скорости + Минимум, читать с диска», «Только текущий этап + Минимум, читать с диска», «Не больше половины + Минимум, читать с диска», «Минимум + Минимум, читать с диска».",
-    "encoder_cpu_ram64_vram8": "Сейчас помещаются: «Минимум + Держать модели в памяти», «Минимум + Только на время задачи», «Минимум + Минимум, читать с диска».",
-    "encoder_cpu_ram64_vram20": "Сейчас помещаются: «Минимум + Держать модели в памяти», «Минимум + Только на время задачи», «Минимум + Минимум, читать с диска».",
-    "full_gpu_ram27_vram31": "Сейчас помещаются: «Максимум скорости + Держать модели в памяти», «Максимум скорости + Только на время задачи», «Только текущий этап + Только на время задачи», «Не больше половины + Только на время задачи», «Максимум скорости + Минимум, читать с диска», «Только текущий этап + Минимум, читать с диска», «Не больше половины + Минимум, читать с диска», «Минимум + Минимум, читать с диска».",
-    "full_gpu_ram40_vram18_reference": "Сейчас помещаются: «Минимум + Держать модели в памяти», «Минимум + Только на время задачи», «Минимум + Минимум, читать с диска».",
-    "custom_combination_ram30_vram31": "Сейчас помещаются: «Максимум скорости + Держать модели в памяти», «Максимум скорости + Только на время задачи», «Только текущий этап + Только на время задачи», «Не больше половины + Только на время задачи», «Минимум + Только на время задачи», «Максимум скорости + Минимум, читать с диска», «Только текущий этап + Минимум, читать с диска», «Не больше половины + Минимум, читать с диска», «Минимум + Минимум, читать с диска».",
-    "unload_encoder_already_ram20_vram31": "Сейчас помещаются: «Максимум скорости + Держать модели в памяти», «Максимум скорости + Только на время задачи», «Максимум скорости + Минимум, читать с диска», «Только текущий этап + Минимум, читать с диска», «Не больше половины + Минимум, читать с диска», «Минимум + Минимум, читать с диска».",
-    "nothing_fits_ram1_vram1": "Ни одно сочетание «Видеопамять» и «Оперативная память» сейчас не помещается: уменьшите выделенную область или освободите память, закрыв другие программы.",
-    "everything_fits_ram128_vram64": "Сейчас помещаются: «Максимум скорости + Держать модели в памяти», «Только текущий этап + Держать модели в памяти», «Не больше половины + Держать модели в памяти», «Минимум + Держать модели в памяти», «Максимум скорости + Только на время задачи», «Только текущий этап + Только на время задачи», «Не больше половины + Только на время задачи», «Минимум + Только на время задачи», «Максимум скорости + Минимум, читать с диска», «Только текущий этап + Минимум, читать с диска», «Не больше половины + Минимум, читать с диска», «Минимум + Минимум, читать с диска»."
   }
 }

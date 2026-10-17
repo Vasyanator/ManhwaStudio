@@ -15,9 +15,9 @@ Main responsibilities:
     dtype (`pipeline_model_name`);
   - the TEXT ENCODER (Qwen3 truncated to `components.ENCODER_KEEP_LAYERS`
     decoder layers, one block per layer; phase `encode`), one spec per encoder
-    precision (bf16, or weight-only fp8 done by the conversion) and per
-    execution rule (the run device or the CPU, or the CPU only:
-    `encoder_model_name`);
+    precision (bf16, or weight-only fp8 done by the conversion:
+    `encoder_model_name`), computing on the run device or the CPU as the plan
+    decides;
 - `PipelineOptions` / `EncoderOptions` (the manager's `options`), built from a
   normalized request by `pipeline_options` / `encoder_options`, and
   `request_shape`;
@@ -38,12 +38,6 @@ Notes:
   on the GPU when both fit, else on the CPU from RAM, `tiers.template_for`).
 - Why one spec per dtype / per encoder precision: `ComponentSpec.convert` sees
   only `(file_key, tensor)`, so the stored dtype is a property of the spec.
-- Why a CPU-only encoder spec: where a component may compute is the spec's
-  static `exec_devices_allowed`, never an option. A legacy request (the stage-1
-  `placement` / `profile` wire, `memory.encoder_cpu_pinned`) means "the encoder
-  runs on the host", so it is planned under the CPU-only spec
-  (`EncoderOptions.cpu_only`); its key differs from the other spec's, so the
-  two never share a handle.
 - Conversions are device-agnostic torch code (the DISK tier applies them to
   device views on every pass); torch / diffusers / transformers are imported
   lazily inside the functions.
@@ -105,12 +99,10 @@ FALLBACK_VAE_TILING = "vae_tiling"
 FALLBACK_VAE_TILE_LOWERED = "vae_tile_lowered"
 
 _PIPELINE_MODELS = {"bfloat16": "flux2_klein", "float16": "flux2_klein.float16"}
-#: `(fp8, cpu_only) -> model name`.
+#: `fp8 -> model name`.
 _ENCODER_MODELS = {
-    (False, False): "flux2_klein_text_encoder",
-    (True, False): "flux2_klein_text_encoder.fp8",
-    (False, True): "flux2_klein_text_encoder.cpu",
-    (True, True): "flux2_klein_text_encoder.fp8.cpu",
+    False: "flux2_klein_text_encoder",
+    True: "flux2_klein_text_encoder.fp8",
 }
 
 
@@ -119,9 +111,9 @@ def pipeline_model_name(dtype: str) -> str:
     return _PIPELINE_MODELS[dtype]
 
 
-def encoder_model_name(fp8: bool, cpu_only: bool = False) -> str:
-    """The manager model name of the text-encoder spec (`fp8` = weight-only fp8 linears; `cpu_only` = it computes on the CPU only)."""
-    return _ENCODER_MODELS[(bool(fp8), bool(cpu_only))]
+def encoder_model_name(fp8: bool) -> str:
+    """The manager model name of the text-encoder spec (`fp8` = weight-only fp8 linears)."""
+    return _ENCODER_MODELS[bool(fp8)]
 
 
 def pipeline_model_names() -> tuple[str, ...]:
@@ -166,14 +158,15 @@ class PipelineOptions:
 class EncoderOptions:
     """The manager's `options` of one text-encoder use.
 
-    `cpu_only` selects the CPU-only spec (`encoder_model_name`): set for a
-    legacy request (`memory.encoder_cpu_pinned`), it changes the residency key.
+    `on_cpu` is «Энкодер на CPU»: the encoder spec pins its one component to
+    host execution (`LargeModelSpec.host_pin_of`), so the RAM step alone places
+    it and the residency key carries the pin.
     """
 
     text_encoder_path: str
     fp8: bool
     max_sequence_length: int
-    cpu_only: bool = False
+    on_cpu: bool = False
 
 
 def vae_latent_scale(vae_path: str) -> int | None:
@@ -202,13 +195,13 @@ def pipeline_options(normalized: dict[str, Any], *, guidance: bool) -> PipelineO
     )
 
 
-def encoder_options(normalized: dict[str, Any], *, cpu_only: bool = False) -> EncoderOptions:
-    """`EncoderOptions` of a normalized request (`cpu_only`: the service passes `memory.encoder_cpu_pinned`)."""
+def encoder_options(normalized: dict[str, Any]) -> EncoderOptions:
+    """`EncoderOptions` of a normalized request."""
     return EncoderOptions(
         text_encoder_path=normalized["text_encoder_path"],
         fp8=bool(normalized["text_encoder_fp8"]),
         max_sequence_length=int(normalized["max_sequence_length"]),
-        cpu_only=bool(cpu_only),
+        on_cpu=bool(normalized["encoder_on_cpu"]),
     )
 
 
@@ -625,9 +618,14 @@ def _pipeline_key(options: PipelineOptions, weight_format: str, device: str) -> 
     return f"flux2_klein:{options.dtype}|{options.transformer_path}|{options.vae_path}|{device}"
 
 
+def _encoder_host_pin(options: EncoderOptions) -> tuple[str, ...]:
+    """«Энкодер на CPU»: the encoder component pinned to host execution when `options.on_cpu`."""
+    return (TEXT_ENCODER,) if options.on_cpu else ()
+
+
 def _encoder_key(options: EncoderOptions, weight_format: str, device: str) -> str:
-    """`flux2_klein_text_encoder:<bf16|fp8>[+cpu]|<path>|<device>`: the CPU-only spec's handles never share a key with the other's."""
-    return f"flux2_klein_text_encoder:{'fp8' if options.fp8 else 'bf16'}{'+cpu' if options.cpu_only else ''}|{options.text_encoder_path}|{device}"
+    """`flux2_klein_text_encoder:<bf16|fp8>|<path>|<device>`."""
+    return f"flux2_klein_text_encoder:{'fp8' if options.fp8 else 'bf16'}|{options.text_encoder_path}|{device}"
 
 
 # =====================================================================
@@ -671,13 +669,8 @@ def pipeline_spec(dtype: str) -> LargeModelSpec:
     )
 
 
-def encoder_spec(fp8: bool, cpu_only: bool = False) -> LargeModelSpec:
-    """The text-encoder spec (`fp8`: weight-only fp8 linears, quantized tensor by tensor while loading).
-
-    `cpu_only`: the encoder may compute on the CPU only (the legacy wire's
-    meaning, module notes); otherwise on the run device or the CPU, as the
-    plan decides.
-    """
+def encoder_spec(fp8: bool) -> LargeModelSpec:
+    """The text-encoder spec (`fp8`: weight-only fp8 linears, quantized tensor by tensor while loading); it computes on the run device or the CPU, as the plan decides."""
     return LargeModelSpec(
         family=FAMILY,
         components=(
@@ -688,7 +681,7 @@ def encoder_spec(fp8: bool, cpu_only: bool = False) -> LargeModelSpec:
                 encoder_block_of,
                 state_keys_of=_make_encoder_state_keys(fp8),
                 device_itemsize=_make_encoder_itemsize(fp8),
-                exec_devices_allowed=frozenset({ExecDevice.CPU}) if cpu_only else frozenset({ExecDevice.RUN_DEVICE, ExecDevice.CPU}),
+                exec_devices_allowed=frozenset({ExecDevice.RUN_DEVICE, ExecDevice.CPU}),
                 build_meta=_make_build_encoder_meta(fp8),
                 convert=_make_encoder_convert(fp8),
             ),
@@ -696,6 +689,7 @@ def encoder_spec(fp8: bool, cpu_only: bool = False) -> LargeModelSpec:
         phases=(PhaseSpec(PHASE_ENCODE, frozenset({TEXT_ENCODER}), TEXT_ENCODER, _encode_work),),
         formats=_encoder_formats,
         key_of=_encoder_key,
+        host_pin_of=_encoder_host_pin,
     )
 
 
@@ -705,7 +699,7 @@ def register_specs(manager: LargeModelManager) -> None:
     for dtype, name in _PIPELINE_MODELS.items():
         if name not in known:
             manager.register(pipeline_spec(dtype), model=name)
-    for (fp8, cpu_only), name in _ENCODER_MODELS.items():
+    for fp8, name in _ENCODER_MODELS.items():
         if name not in known:
-            manager.register(encoder_spec(fp8, cpu_only), model=name)
+            manager.register(encoder_spec(fp8), model=name)
 

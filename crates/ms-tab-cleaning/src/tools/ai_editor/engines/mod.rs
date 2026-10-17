@@ -21,6 +21,9 @@ head of the list.
 Every engine is constructed eagerly, which is why an engine's constructor must not do I/O on
 the GUI thread — every engine here reads its settings file on a worker.
 
+FLUX.3 klein (`flux3_klein`) is one entry right after the two FLUX.2 ones; its weight formats
+are a parameter inside its panel, not separate entries.
+
 One MODULE may contribute several entries when the difference between them is a parameter
 rather than an implementation: FLUX.2 klein contributes one per `config::Flux2Variant` (9B
 and 4B), which is what keeps the second checkpoint from being a copy of the first module.
@@ -39,6 +42,8 @@ this subtree, and it is one-directional.
 */
 
 mod flux2_klein;
+// FLUX.3 klein: the region as reference #0, up to nine extra references, three weight formats.
+mod flux3_klein;
 // Private, like every other engine: the LaMa model catalog it exports reaches only its
 // sibling `sdxl`, whose 4-channel prefill sends a checkpoint file name to the backend.
 mod lama;
@@ -46,10 +51,15 @@ mod lama;
 // `sdxl`): worker, channel, and the cancel flag its drop sets.
 mod run_job;
 mod sdxl;
+// The model-agnostic building blocks of the large-model engines (FLUX.2 klein and FLUX.3
+// klein): streamed progress, the Hugging Face download, the settings-file rules and the
+// mask -> working-mode rule.
+mod shared;
 
 use crate::tools::region_edit_v2::engine::AiEngine;
 use ms_config::Flux2Variant;
 use flux2_klein::Flux2KleinEngine;
+use flux3_klein::Flux3KleinEngine;
 use lama::LamaEngine;
 use sdxl::SdxlEngine;
 
@@ -64,6 +74,9 @@ use sdxl::SdxlEngine;
 /// them can be resident in the backend at a time (one pipeline, keyed by the component
 /// paths), which the panel says and this side does not orchestrate.
 ///
+/// FLUX.3 klein appears ONCE, after FLUX.2: its three weight formats are a parameter of one
+/// engine (one package, one settings file), chosen inside its own panel.
+///
 /// «Lama» appears ONCE and offers its four checkpoints inside its own panel; the two backend
 /// methods behind them are its business, not the picker's. «SDXL Inpaint» likewise appears
 /// ONCE and offers its two channel modes inside its own panel — the mode is a parameter of
@@ -74,6 +87,8 @@ pub(super) fn all_engines() -> Vec<Box<dyn AiEngine>> {
         .into_iter()
         .map(|variant| Box::new(Flux2KleinEngine::new(variant)) as Box<dyn AiEngine>)
         .collect();
+    // After FLUX.2 klein, so index 0 (the engine selected on creation) is unchanged.
+    engines.push(Box::new(Flux3KleinEngine::new()));
     engines.push(Box::new(LamaEngine::new()));
     engines.push(Box::new(SdxlEngine::new()));
     engines
@@ -91,13 +106,13 @@ mod tests {
     #[test]
     fn the_catalog_offers_every_engine_exactly_once() {
         let engines = all_engines();
-        assert_eq!(engines.len(), Flux2Variant::all().len() + 2);
+        assert_eq!(engines.len(), Flux2Variant::all().len() + 3);
         // Pinned literals rather than a call back into the engine modules: these ids are
         // the catalog's own contract, the 9B one is frozen at its historic value, and a
         // test that asked the engine what its id is could never catch it changing.
         assert_eq!(
             engines.iter().map(|engine| engine.id()).collect::<Vec<_>>(),
-            ["flux2_klein", "flux2_klein_4b", "lama", "sdxl"],
+            ["flux2_klein", "flux2_klein_4b", "flux3_klein", "lama", "sdxl"],
             "FLUX.2 klein 9B stays at index 0 — it is the engine selected on creation"
         );
         for engine in &engines {

@@ -2,21 +2,17 @@
 File: cleaning/tools/ai_editor/engines/flux2_klein/ui/components.rs
 
 Purpose:
-The «Память» half of the panel and the merged component list of «Установка модели»: the
-memory preset, the RAM/VRAM forecast, and the one row per model component that carries
-presence, size, residency and the backend's own action buttons together.
+The merged component list of «Установка модели»: one row per model component that carries
+presence, size, residency and the backend's own action buttons together. (The memory steps
+and their forecast are the shared `ai_editor::large_model_resources` widget.)
 
 Main responsibilities:
-- draw the memory-preset picker, which offers «Пользовательский» but never as a choice
-  (`draw_preset_row`);
-- draw the backend's forecast, warning visibly when it does not fit (`draw_estimate_ui`);
 - draw the merged component list — region size, `.status` errors, one row per component,
   and the device the backend runs on (`draw_component_list_ui`);
 - draw one row's residency, degrading an unknown literal to "not known" with the literal
   on hover (`draw_component_residency_label`).
 
 Key functions:
-- `draw_preset_row()`, `draw_estimate_ui()`
 - `draw_component_list_ui()`, `draw_component_residency_label()`
 
 Notes:
@@ -27,75 +23,6 @@ local gate only says whether the pipeline is free.
 */
 
 use super::*;
-
-/// Draws the memory-preset picker. `Пользовательский` is shown when the current values
-/// match no preset but is never offered as a choice.
-pub(super) fn draw_preset_row(ui: &mut egui::Ui, settings: &mut Flux2KleinSettings, changed: &mut bool) {
-    let active = MemoryPreset::detect(settings);
-    let mut picked: Option<MemoryPreset> = None;
-    ui.horizontal(|ui| {
-        ui.label(t!("cleaning.tools.flux2_klein.preset_label"))
-            .on_hover_text(t!("cleaning.tools.flux2_klein.preset_hint"));
-        WheelComboBox::from_id_salt("cleaning_flux2_klein_preset")
-            .selected_text(active.label())
-            .show_ui(ui, |ui| {
-                for preset in MemoryPreset::selectable() {
-                    if ui
-                        .selectable_label(preset == active, preset.label())
-                        .clicked()
-                    {
-                        picked = Some(preset);
-                    }
-                }
-            })
-            .response
-            .on_hover_text(t!("cleaning.tools.flux2_klein.preset_hint"));
-    });
-    if let Some(preset) = picked {
-        *changed |= preset.apply(settings);
-    }
-}
-
-/// Draws the backend's memory forecast, warning visibly when it does not fit.
-pub(super) fn draw_estimate_ui(
-    ui: &mut egui::Ui,
-    estimate: Option<&Flux2Estimate>,
-    error: Option<&str>,
-    busy: bool,
-    status: Option<&Flux2Status>,
-) {
-    if busy {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.small(t!("cleaning.tools.flux2_klein.estimate_running_status"));
-        });
-        ui.ctx().request_repaint();
-    }
-    if let Some(error) = error {
-        ui.small(tf!("cleaning.tools.flux2_klein.estimate_error", err = error));
-    }
-    let Some(estimate) = estimate else {
-        if !busy && error.is_none() {
-            ui.small(t!("cleaning.tools.flux2_klein.estimate_unknown_status"));
-        }
-        return;
-    };
-    let line = estimate_status_line(estimate, status);
-    // The line stays one short sentence; the per-phase peaks and the full per-component
-    // breakdown live in its tooltip, because the forecast is max(prompt encoding,
-    // denoise, decode) and which of the phases dominates is the actionable part.
-    let tooltip = estimate_tooltip(estimate);
-    if estimate.fits {
-        ui.small(line).on_hover_text(tooltip);
-    } else {
-        ui.colored_label(ms_theme::status::WARNING, line)
-            .on_hover_text(tooltip);
-        ui.colored_label(
-            ms_theme::status::WARNING,
-            t!("cleaning.tools.flux2_klein.estimate_does_not_fit_warning"),
-        );
-    }
-}
 
 /// Draws the merged component list of «Установка модели»: the current region size, the
 /// `.status` errors, one row per model component, and the device the backend runs on.
@@ -184,7 +111,7 @@ pub(super) fn draw_component_list_ui(
             };
             draw_component_residency_label(ui, residency);
             for offered in &residency.actions {
-                if flux2_gated_button(
+                if gated_button(
                     ui,
                     actions_enabled,
                     offered.label(),
@@ -271,8 +198,6 @@ mod tests {
             "cleaning.tools.flux2_klein.component_action_unload_pair_tooltip",
             "cleaning.tools.flux2_klein.vae_tiling_label",
             "cleaning.tools.flux2_klein.vae_tiling_hint",
-            "cleaning.tools.flux2_klein.vae_slicing_label",
-            "cleaning.tools.flux2_klein.vae_slicing_hint",
         ];
         for (tag, source) in ms_i18n::embedded_locales() {
             let catalog: Value = serde_json::from_str(source)

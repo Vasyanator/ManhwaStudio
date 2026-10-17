@@ -52,10 +52,16 @@ Contracts:
   side (parts, `Need`, own bytes, baseline RSS); loads and restores count the
   device-tier bytes against the `HostWatch`; learned floors are kept under
   `HOST_DEVICE_CLASS`.
+- **Host pin** (`LargeModelSpec.host_pin(options)`, e.g. "encoder on the
+  CPU"): the planner places the pinned components by the RAM step alone
+  (`planner` module notes); the pin is part of the residency key
+  (`LargeModelSpec.key`: a pinned request is its own handle) and of the
+  learned-floor key (`FloorKey.host_pin`, persisted as `host_pin`; an entry
+  stored without it is unpinned).
 - **The format is never changed** here; a refusal carries the planner's format
   suggestions. The user's steps are never rewritten: degrades show as
   `Session.steps_effective` / `degraded` / `degrade_reason`, and a learned
-  floor (per device class, model, format; per axis) is recorded only after a
+  floor (per device class, model, format, host pin; per axis) is recorded only after a
   run that succeeded lower on that axis.
 - **Safe points** are step boundaries only (a load, a transition, a whole phase:
   a phase function must be restartable from its inputs). Modules are fetched
@@ -282,6 +288,19 @@ def _optional_bytes(raw: Any, name: str, source: Path) -> int | None:
     return raw
 
 
+def _stored_host_pin(raw: Any) -> tuple[str, ...]:
+    """The `host_pin` of a stored floor entry: absent / `null` = none (entries written before the pin existed).
+
+    # Raises
+    `TypeError` for anything but a list of strings (the caller skips the entry).
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(name, str) for name in raw):
+        raise TypeError(f"host_pin должен быть списком строк, получено {raw!r}")
+    return tuple(sorted(raw))
+
+
 class JsonLimitsStore:
     """The stage-1 `LimitsStore`: one small JSON document (`{"version", "limits", "floors"}`), written atomically.
 
@@ -325,7 +344,7 @@ class JsonLimitsStore:
                 legacy += 1
                 continue
             try:
-                key = FloorKey(device_class=str(item["device_class"]), model=str(item["model"]), format=str(item["format"]))
+                key = FloorKey(device_class=str(item["device_class"]), model=str(item["model"]), format=str(item["format"]), host_pin=_stored_host_pin(item.get("host_pin")))
                 vram = VramStep(item["vram"]) if item.get("vram") is not None else None
                 ram = RamStep(item["ram"]) if item.get("ram") is not None else None
                 entries.append(FloorEntry(key=key, vram=vram, ram=ram, reason=str(item.get("reason", "")), step=str(item.get("step", "")), recorded_at=float(item.get("recorded_at", 0.0))))
@@ -339,7 +358,7 @@ class JsonLimitsStore:
         with self._lock:
             document = self._read_locked()
             document["floors"] = [
-                {"device_class": entry.key.device_class, "model": entry.key.model, "format": entry.key.format, "vram": entry.vram.value if entry.vram is not None else None, "ram": entry.ram.value if entry.ram is not None else None, "reason": entry.reason, "step": entry.step, "recorded_at": entry.recorded_at}
+                {"device_class": entry.key.device_class, "model": entry.key.model, "format": entry.key.format, "host_pin": list(entry.key.host_pin), "vram": entry.vram.value if entry.vram is not None else None, "ram": entry.ram.value if entry.ram is not None else None, "reason": entry.reason, "step": entry.step, "recorded_at": entry.recorded_at}
                 for entry in entries
             ]
             self._write_locked(document)
@@ -1236,8 +1255,9 @@ class LargeModelManager:
         for the admission and for every re-plan of the degrade ladder.
 
         # Raises
-        `ValueError` for an unregistered model or a negative / non-integer
-        `device_cap_bytes`; `LargeModelRefused` when no plan
+        `ValueError` for an unregistered model, a negative / non-integer
+        `device_cap_bytes` or a host pin the spec cannot honour
+        (`LargeModelSpec.host_pin`); `LargeModelRefused` when no plan
         fits (shortest resource and format suggestions named) or the reservation
         cannot be made; `ModelMemoryShortError` is never raised here (large
         leases carry no admission hint).
@@ -1251,7 +1271,7 @@ class LargeModelManager:
         handle: _Handle | None = None
         locked = False
         try:
-            handle = self._handle_for(model, key, spec, device_name, format)
+            handle = self._handle_for(model, key, spec, device_name, format, spec.host_pin(options))
             handle.run_lock.acquire()
             locked = True
             session = self._admit(handle, lease, owner_name, options, shape, steps, observer, device_cap_bytes)
@@ -1345,8 +1365,8 @@ class LargeModelManager:
         to every row the same way.
 
         # Raises
-        `ValueError` for an unregistered model or a negative / non-integer claim
-        or cap.
+        `ValueError` for an unregistered model, a negative / non-integer claim
+        or cap, or a host pin the spec cannot honour.
         """
         _check_device_cap(device_cap_bytes)
         for name, value in (("claimed_device_bytes", claimed_device_bytes), ("claimed_host_bytes", claimed_host_bytes)):
@@ -1361,7 +1381,7 @@ class LargeModelManager:
         key = spec.key(options, weight_format, device_name)
         with self._lock:
             handle = self._handles.get(key)
-        floor_key = FloorKey(self._floor_class(device_name), model, weight_format)
+        floor_key = FloorKey(self._floor_class(device_name), model, weight_format, tuple(sorted(spec.host_pin(options))))
         floor_entry = next((entry for entry in self._floors.entries(model) if entry.key == floor_key), None)
         floor = floor_entry.floor if floor_entry is not None else None
         requester = Requester(pool=Pool.LARGE, key=key, owner=key, urgency=Urgency.ADMISSION, holds_lease=False)
@@ -1391,7 +1411,7 @@ class LargeModelManager:
         for name, info in formats.items():
             best: Steps | None = None
             if info.available and name in inventories:
-                other_floor = self._floors.get(FloorKey(floor_key.device_class, model, name))
+                other_floor = self._floors.get(replace(floor_key, format=name))
                 answer = resolve(name, AUTO_STEPS, other_floor)
                 best = answer.plan.steps if isinstance(answer, Planned) else None
             if name == weight_format:
@@ -1557,7 +1577,7 @@ class LargeModelManager:
         assert spec.formats is not None  # checked by register
         return spec.formats(options)
 
-    def _handle_for(self, model: str, key: str, spec: LargeModelSpec, device: str, weight_format: str) -> _Handle:
+    def _handle_for(self, model: str, key: str, spec: LargeModelSpec, device: str, weight_format: str, host_pin: frozenset[str]) -> _Handle:
         with self._lock:
             handle = self._handles.get(key)
             if handle is not None:
@@ -1565,7 +1585,7 @@ class LargeModelManager:
         # Created outside the lock: the transport and the device class may touch torch.
         transport = self._transport_factory(device)
         tables = self._tables_for(device)
-        floor_key = FloorKey(self._floor_class(device), model, weight_format)
+        floor_key = FloorKey(self._floor_class(device), model, weight_format, tuple(sorted(host_pin)))
         created = _Handle(model=model, key=key, spec=spec, device=device, weight_format=weight_format, transport=transport, ledger=Ledger(max_in_flight=max(2, tables.device.prefetch_depth + 1)), floor_key=floor_key, host_device=self._is_host_device(device))
         with self._lock:
             return self._handles.setdefault(key, created)

@@ -356,7 +356,9 @@ Host contracts:
   (`ms_widgets::panel_dock`, «Pinned sections»). An engine draws its progress ONLY in
   `draw_progress` (nothing while idle, so the scroll gets the room back) and only per-run
   options in `draw_run_options`. `RunOptionsCtx::mask_painted` is `!MaskStack::is_empty()` —
-  the marks never count.
+  the marks never count; `RunOptionsCtx::marks_reference` is "marks drawn AND the mode in force
+  is «Отдельный референс»", i.e. exactly when `prepare_run_marks` would build a
+  `RunMarks::Reference` (an engine whose forecast counts references uses it).
 - **Only the spec differs between hosted tools.** `tool_id`, `title`, `log_tag`, both id salts and
   `catalog` come from the `HostSpec`; a salt must be unique per tool (two tools sharing one share
   stored widget state) and frozen once shipped (changing it resets that state).

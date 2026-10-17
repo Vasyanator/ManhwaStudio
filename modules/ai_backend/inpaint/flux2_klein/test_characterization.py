@@ -11,14 +11,16 @@ Every test class here belongs to exactly ONE of two kinds, and says which in its
 docstring:
 
 - CONTRACT - a wire shape or an ordering the refactor must keep: the `status` /
-  `estimate` / `health` keys, the `inpaint.flux2_klein` response and its
-  `applied` flags, the accepted `placement` values, the `phase:"load"` step
-  numbers, the `phase:"generate"` frames, mask semantics on a real run, the lease
-  always being resolved, and the ORDER of the decode fallbacks. A failure here
-  is a regression, never a reason to edit the test.
-- GOLDEN - a snapshot of today's NUMBERS and choices: `forecast_memory` for a
-  fixed set of (request, region) cases and `_preset_advice` for a fixed set of
-  (request, free memory) cases, stored in `fixtures/forecast_golden.json`. These
+  `health` keys, the `inpaint.flux2_klein` response and its `applied` flag,
+  the refusal of the retired placement wire, the `phase:"load"` step numbers,
+  the `phase:"generate"` frames, mask semantics on a real run, the lease always
+  being resolved, and the ORDER of the decode fallbacks. A failure here is a
+  regression, never a reason to edit the test (protocol 14 retired the
+  placement wire, `.estimate` and `status.memory` deliberately: those contracts
+  were re-pinned with that change).
+- GOLDEN - a snapshot of today's NUMBERS: `forecast_memory` (the two-handle run
+  forecast) for a fixed set of (step pair, region) cases, stored in
+  `fixtures/forecast_golden.json`. These
   are EXPECTED TO CHANGE when the forecast is recalibrated (behaviour change
   B4: since WP6 they are the large-model manager's numbers). Update them
   deliberately, with the diff reviewed:
@@ -26,9 +28,9 @@ docstring:
   from the repository root rewrites the file from the current code.
 
 Main responsibilities:
-- `ProgressNumberingContract`, `PlacementWireContract`, `StatusWireContract`,
-  `EstimateWireContract`, `HealthWireContract`, `InpaintRunContract`,
-  `DecodeFallbackOrderContract` - the contracts;
+- `ProgressNumberingContract`, `RetiredWireContract`, `StatusWireContract`,
+  `HealthWireContract`, `InpaintRunContract`, `DecodeFallbackOrderContract` -
+  the contracts;
 - `ForecastGoldenTests` - the golden snapshot, plus `_compute_golden` and the
   `--write-golden` entry point that share the case tables.
 
@@ -43,13 +45,18 @@ Notes:
   the large pool (`LargeModelManager.status()`), because a large holding never
   counts in the small pool's counters; the decode fallback ORDER is the
   manager's ladder: tiling (where requested it engages), the lowered tile,
-  then a more economical profile that takes the transformer off the device.
+  then a more economical «Видеопамять» step that takes the transformer off the device.
 - What is already pinned elsewhere is referenced, not repeated: mask
-  morphology and the composite (`test_imaging.py`), each decode rung on its own
+  morphology and the composite (`../test_region_imaging.py`), each decode rung on its own
   (`test_pipeline.py::DecodeRecoveryTests`), the lease protocol across services
   (`../test_lease_protocol.py`), the attention-mask formula (`test_attention.py`).
   Where a contract below overlaps one of those, it pins the WIRE-visible part
   only, because those files are rewritten by the refactor.
+- Re-pinned with protocol 14: the cases name step pairs instead of the retired
+  placements (the encoder is never CPU-pinned any more, so the encode figures
+  of the former `full_gpu` / `encoder_cpu` cases moved onto the card), the
+  `estimate` contract and the preset advice are gone (forecasts are
+  `large_models.profiles`), and `status` carries no `memory`.
 - The golden cases run against a temporary tree of header-only files with the
   real klein 9B file sizes and block structure (8 + 24 transformer blocks, 36
   encoder layers), planned with the reference calibration table, so the
@@ -78,7 +85,7 @@ from PIL import Image
 # `patch.dict`, which on exit removes every module first imported inside it. A
 # first `import cv2` there (the mask dilation) would leave OpenCV half-registered
 # and make every later import of it fail with `cv2.dnn has no DictValue`. cv2 is
-# optional for this backend (`imaging.py` falls back to PIL), hence the guard.
+# optional for this backend (`region_imaging.py` falls back to PIL), hence the guard.
 try:
     import cv2  # noqa: F401 - imported for its side effect on `sys.modules`
 except ImportError:
@@ -109,81 +116,41 @@ GIB = 1024**3
 
 #: Golden forecast cases: name -> (request overrides, region width, height,
 #: with_reference). `"__no_encoder__"` in the overrides drops `text_encoder_path`
-#: from the request (no encoder installed). Twelve-plus pairs covering every
-#: placement, the loader-dependent host term, tiling engaging or not, the marks
-#: reference, the attention mask, fp8 and the encoder levers.
+#: from the request (no encoder installed). Covers every concrete VRAM step,
+#: every RAM step, «Авто», tiling engaging or not, the marks reference, the
+#: attention mask, fp8 and the no-encoder case.
+MAX_KEEP = {"vram_step": "max", "ram_step": "keep"}
+PHASE_KEEP = {"vram_step": "phase", "ram_step": "keep"}
+MIN_KEEP = {"vram_step": "min", "ram_step": "keep"}
 FORECAST_CASES: dict[str, tuple[dict[str, Any], int, int, bool]] = {
-    "full_gpu_512": ({"placement": "full_gpu"}, 512, 512, False),
-    "full_gpu_1024": ({"placement": "full_gpu"}, 1024, 1024, False),
-    "full_gpu_512_reference": ({"placement": "full_gpu"}, 512, 512, True),
-    "full_gpu_512_attention_mask": (
-        {"placement": "full_gpu", "text_attention_in_mask": True},
-        512,
-        512,
-        False,
-    ),
-    "full_gpu_512_no_encoder": ({"placement": "full_gpu", "__no_encoder__": True}, 512, 512, False),
-    "encoder_cpu_512": ({"placement": "encoder_cpu"}, 512, 512, False),
-    "encoder_cpu_512_low_cpu": ({"placement": "encoder_cpu", "low_cpu_mem_usage": True}, 512, 512, False),
-    "encoder_cpu_1152x896_tiled": ({"placement": "encoder_cpu"}, 1152, 896, False),
-    "encoder_cpu_1152x896_untiled": ({"placement": "encoder_cpu", "vae_tiling": False}, 1152, 896, False),
-    "encoder_cpu_512_unload_encoder": (
-        {"placement": "encoder_cpu", "unload_text_encoder_after_encode": True},
-        512,
-        512,
-        False,
-    ),
-    "encoder_cpu_512_encoder_fp8": ({"placement": "encoder_cpu", "text_encoder_fp8": True}, 512, 512, False),
-    "encoder_cpu_512_keep_transformer": (
-        {"placement": "encoder_cpu", "unload_transformer_before_vae": False},
-        512,
-        512,
-        False,
-    ),
-    "model_cpu_offload_512": ({"placement": "model_cpu_offload", "low_cpu_mem_usage": True}, 512, 512, False),
-    "sequential_cpu_offload_512": (
-        {"placement": "sequential_cpu_offload", "low_cpu_mem_usage": True},
-        512,
-        512,
-        False,
-    ),
-    "sequential_cpu_offload_256x2048": (
-        {"placement": "sequential_cpu_offload", "low_cpu_mem_usage": True},
-        256,
-        2048,
-        False,
-    ),
-}
-
-#: Golden preset-advice cases: name -> (request overrides, ram_free GiB,
-#: vram_free GiB, with_reference). Region 512x512 throughout.
-ADVICE_CASES: dict[str, tuple[dict[str, Any], float, float, bool]] = {
-    "encoder_cpu_ram12_vram31": ({"placement": "encoder_cpu", "low_cpu_mem_usage": True}, 12.0, 31.9, False),
-    "encoder_cpu_ram18_vram31": ({"placement": "encoder_cpu", "low_cpu_mem_usage": True}, 18.0, 31.9, False),
-    "encoder_cpu_ram64_vram8": ({"placement": "encoder_cpu", "low_cpu_mem_usage": True}, 64.0, 8.0, False),
-    "encoder_cpu_ram64_vram20": ({"placement": "encoder_cpu", "low_cpu_mem_usage": True}, 64.0, 20.0, False),
-    "full_gpu_ram27_vram31": ({"placement": "full_gpu"}, 27.0, 31.9, False),
-    "full_gpu_ram40_vram18_reference": ({"placement": "full_gpu"}, 40.0, 18.5, True),
-    "custom_combination_ram30_vram31": (
-        {"placement": "full_gpu", "low_cpu_mem_usage": True, "unload_transformer_before_vae": True},
-        30.0,
-        31.9,
-        False,
-    ),
-    "unload_encoder_already_ram20_vram31": (
-        {"placement": "encoder_cpu", "unload_text_encoder_after_encode": True},
-        20.0,
-        31.9,
-        False,
-    ),
-    "nothing_fits_ram1_vram1": ({"placement": "encoder_cpu"}, 1.0, 1.0, False),
-    "everything_fits_ram128_vram64": ({"placement": "encoder_cpu"}, 128.0, 64.0, False),
+    "max_keep_512": (MAX_KEEP, 512, 512, False),
+    "max_keep_1024": (MAX_KEEP, 1024, 1024, False),
+    "max_keep_512_reference": (MAX_KEEP, 512, 512, True),
+    "max_keep_512_attention_mask": ({**MAX_KEEP, "text_attention_in_mask": True}, 512, 512, False),
+    "max_keep_512_no_encoder": ({**MAX_KEEP, "__no_encoder__": True}, 512, 512, False),
+    "phase_keep_512": (PHASE_KEEP, 512, 512, False),
+    "phase_keep_1152x896_tiled": (PHASE_KEEP, 1152, 896, False),
+    "phase_keep_1152x896_untiled": ({**PHASE_KEEP, "vae_tiling": False}, 1152, 896, False),
+    "phase_keep_512_encoder_fp8": ({**PHASE_KEEP, "text_encoder_fp8": True}, 512, 512, False),
+    "half_run_512": ({"vram_step": "half", "ram_step": "run"}, 512, 512, False),
+    "min_keep_512": (MIN_KEEP, 512, 512, False),
+    "min_keep_256x2048": (MIN_KEEP, 256, 2048, False),
+    "min_min_512": ({"vram_step": "min", "ram_step": "min"}, 512, 512, False),
+    "auto_auto_512": ({}, 512, 512, False),
+    # «Энкодер на CPU»: the encoder never on the card, the RAM step places it.
+    "max_keep_512_encoder_on_cpu": ({**MAX_KEEP, "encoder_on_cpu": True}, 512, 512, False),
+    "phase_run_512_encoder_on_cpu": ({"vram_step": "phase", "ram_step": "run", "encoder_on_cpu": True}, 512, 512, False),
+    "min_min_512_encoder_on_cpu": ({"vram_step": "min", "ram_step": "min", "encoder_on_cpu": True}, 512, 512, False),
 }
 
 
 def _request(paths: dict[str, str], overrides: dict[str, Any]) -> dict[str, Any]:
-    """The wire `params` of one case: the tree's paths plus the case overrides."""
-    params: dict[str, Any] = dict(paths)
+    """The wire `params` of one case: the tree's paths plus the case overrides.
+
+    «Энкодер на CPU» is off unless a case turns it on: the other cases
+    characterize the encoder placed by the steps.
+    """
+    params: dict[str, Any] = {**paths, "encoder_on_cpu": False}
     for key, value in overrides.items():
         if key == "__no_encoder__":
             params.pop("text_encoder_path", None)
@@ -231,35 +198,24 @@ def _golden_environment() -> Iterator[dict[str, str]]:
 
 
 def _compute_golden() -> dict[str, Any]:
-    """Today's forecast and advice for every golden case, as the JSON document."""
+    """Today's forecast for every golden case, as the JSON document."""
     forecasts: dict[str, Any] = {}
-    advice: dict[str, str] = {}
     with _golden_environment() as paths:
         for name, (overrides, width, height, with_reference) in FORECAST_CASES.items():
             normalized = svc.normalize_flux2_klein_params(_request(paths, overrides))
             forecasts[name] = memory.forecast_memory(normalized, width, height, with_reference=with_reference)
             assert set(forecasts[name]["breakdown"]) >= {"transformer", "text_encoder", "vae"}
-        for name, (overrides, ram_free, vram_free, with_reference) in ADVICE_CASES.items():
-            normalized = svc.normalize_flux2_klein_params(_request(paths, overrides))
-            snapshot = {
-                "ram_free": int(ram_free * GIB),
-                "ram_total": int(128 * GIB),
-                "vram_free": int(vram_free * GIB),
-                "vram_total": int(64 * GIB),
-            }
-            advice[name] = memory._preset_advice(normalized, 512, 512, snapshot, with_reference=with_reference)
     return {
         "_note": (
-            "GOLDEN snapshot of FLUX.2 klein forecast_memory / _preset_advice (klein 9B sizes), "
+            "GOLDEN snapshot of FLUX.2 klein forecast_memory (klein 9B sizes), "
             "the large-model manager's forecast with the reference calibration table (its measured "
             "FLUX.2 entries). Expected to change with every recalibration of that table "
             "(behaviour change B4): regenerate deliberately with "
             "`python -m modules.ai_backend.inpaint.flux2_klein.test_characterization --write-golden` "
-            "and review the diff. Case tables: FORECAST_CASES / ADVICE_CASES in that module."
+            "and review the diff. Case table: FORECAST_CASES in that module."
         ),
         "sizes": {"transformer": TRANSFORMER_BYTES, "text_encoder": TEXT_ENCODER_BYTES, "vae": VAE_BYTES},
         "forecast_memory": forecasts,
-        "preset_advice": advice,
     }
 
 
@@ -303,73 +259,33 @@ class ProgressNumberingContract(unittest.TestCase):
         self.assertEqual(frames, [("load", 3, 9, "Загрузка VAE")])
 
 
-class PlacementWireContract(_TempTreeCase):
-    """CONTRACT (stage 1): the `placement` enum and its flags stay accepted on the wire.
+class RetiredWireContract(_TempTreeCase):
+    """CONTRACT (protocol 14): the placement wire is refused by name; the kept flags keep their defaults.
 
-    Stage 1 maps them onto the manager's profiles through an adapter; their
-    removal is stage 2 (B2). An unknown value stays a request error.
+    A stale client must get a clear error naming the field, never a silently
+    ignored memory choice.
     """
 
-    def test_every_placement_value_is_accepted(self) -> None:
-        self.assertEqual(
-            tuple(svc.VALID_PLACEMENTS),
-            ("full_gpu", "encoder_cpu", "model_cpu_offload", "sequential_cpu_offload"),
-        )
-        for placement in svc.VALID_PLACEMENTS:
-            for low_cpu in (False, True):
-                with self.subTest(placement=placement, low_cpu=low_cpu):
-                    normalized = svc.normalize_flux2_klein_params(
-                        self.params(
-                            placement=placement,
-                            low_cpu_mem_usage=low_cpu,
-                            vae_tiling=True,
-                            vae_slicing=False,
-                            unload_transformer_before_vae=True,
-                            unload_text_encoder_after_encode=True,
-                            text_encoder_fp8=False,
-                        )
-                    )
-                    self.assertEqual(normalized["placement"], placement)
-
-    def test_an_unknown_placement_is_a_request_error(self) -> None:
-        with self.assertRaises(ValueError):
-            svc.normalize_flux2_klein_params(self.params(placement="gpu_please"))
+    def test_every_retired_field_is_refused_by_name(self) -> None:
+        for field in ("placement", "profile", "low_cpu_mem_usage", "vae_slicing", "unload_transformer_before_vae", "unload_text_encoder_after_encode"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    svc.normalize_flux2_klein_params(self.params(**{field: False}))
 
     def test_the_persisted_flags_keep_their_defaults(self) -> None:
-        # What a settings file written before a flag existed resolves to: the
-        # Rust side mirrors these defaults (`MemoryPreset::values`).
-        for placement in svc.VALID_PLACEMENTS:
-            with self.subTest(placement=placement):
-                normalized = svc.normalize_flux2_klein_params(self.params(placement=placement))
-                self.assertEqual(
-                    {
-                        key: normalized[key]
-                        for key in (
-                            "low_cpu_mem_usage",
-                            "vae_tiling",
-                            "vae_slicing",
-                            "unload_transformer_before_vae",
-                            "unload_text_encoder_after_encode",
-                            "text_encoder_fp8",
-                        )
-                    },
-                    {
-                        "low_cpu_mem_usage": False,
-                        "vae_tiling": True,
-                        "vae_slicing": True,
-                        "unload_transformer_before_vae": placement != "full_gpu",
-                        "unload_text_encoder_after_encode": False,
-                        "text_encoder_fp8": False,
-                    },
-                )
+        normalized = svc.normalize_flux2_klein_params(self.params())
+        self.assertEqual(
+            {key: normalized[key] for key in ("vae_tiling", "text_encoder_fp8", "vram_step", "ram_step")},
+            {"vae_tiling": True, "text_encoder_fp8": False, "vram_step": None, "ram_step": None},
+        )
 
 
 class StatusWireContract(_TempTreeCase):
     """CONTRACT: the `inpaint.flux2_klein.status` answer (`ipc/PROTOCOL.md` §5.4).
 
     Required keys are a SUBSET check: an added key is a deliberate wire change,
-    a missing one is a regression. The `memory` object stays in stage 1 (its
-    removal is B2, stage 2).
+    a missing one is a regression. `memory` is gone since protocol 14 (free
+    memory is `large_models.profiles`' answer).
     """
 
     SNAPSHOT = {"vram_total": 32 * GIB, "vram_free": 30 * GIB, "ram_total": 64 * GIB, "ram_free": 40 * GIB}
@@ -393,7 +309,6 @@ class StatusWireContract(_TempTreeCase):
             "reason": type(None),
             "components": dict,
             "components_busy": bool,
-            "memory": dict,
             "loaded": bool,
             "device": str,
             "prompt_cached": bool,
@@ -405,7 +320,7 @@ class StatusWireContract(_TempTreeCase):
             with self.subTest(key=key):
                 self.assertIsInstance(out[key], kind)
         self.assertEqual(out["device"], "cuda:0")
-        self.assertEqual(out["memory"], self.SNAPSHOT)
+        self.assertNotIn("memory", out)
 
     def test_the_component_entries(self) -> None:
         out = self.service.status(self.params())
@@ -452,85 +367,6 @@ class StatusWireContract(_TempTreeCase):
         for name in svc.ACTIONABLE_COMPONENTS:
             self.assertNotIn("residency", out["components"][name])
             self.assertNotIn("actions", out["components"][name])
-
-
-class EstimateWireContract(_TempTreeCase):
-    """CONTRACT (stage 1): the `inpaint.flux2_klein.estimate` answer shape and `fits`.
-
-    The NUMBERS are golden (B4); the keys, the types, the `breakdown` key set (the
-    Rust side renders every unknown breakdown key as an extra row, so the set is
-    exact) and the `fits` semantics are the contract.
-    """
-
-    BREAKDOWN_KEYS = {
-        "transformer",
-        "text_encoder",
-        "vae",
-        "activations",
-        "peak_encode",
-        "peak_denoise",
-        "peak_decode",
-    }
-
-    def setUp(self) -> None:
-        super().setUp()
-        self.snapshot: dict[str, int] = {
-            "vram_total": 12 << 30,
-            "vram_free": 10 << 30,
-            "ram_total": 32 << 30,
-            "ram_free": 16 << 30,
-        }
-        self.snapshot_devices: list[Any] = []
-
-        def snapshot(device: Any = None) -> dict[str, int]:
-            self.snapshot_devices.append(device)
-            return dict(self.snapshot)
-
-        for module, name, replacement in (
-            (hardware, "memory_snapshot", snapshot),
-            (hardware, "_resolve_selected_backend_device", lambda _fallback: "cuda:1"),
-        ):
-            attr_patch = patch.object(module, name, replacement)
-            attr_patch.start()
-            self.addCleanup(attr_patch.stop)
-        self.service = svc.Flux2KleinInpaintService(SmallModelManager())
-
-    def _estimate(self, **overrides: object) -> dict[str, Any]:
-        return self.service.estimate(params=self.params(**overrides), region_width=512, region_height=512)
-
-    def test_the_keys_and_their_types(self) -> None:
-        out = self._estimate()
-        for key in ("vram_bytes", "ram_bytes", "vram_free", "ram_free"):
-            with self.subTest(key=key):
-                self.assertIsInstance(out[key], int)
-        self.assertIsInstance(out["fits"], bool)
-        self.assertEqual(set(out["breakdown"]), self.BREAKDOWN_KEYS)
-        self.assertTrue(all(isinstance(value, int) for value in out["breakdown"].values()))
-        self.assertEqual((out["vram_free"], out["ram_free"]), (10 << 30, 16 << 30))
-
-    def test_the_attention_mask_is_a_breakdown_row_only_while_it_costs(self) -> None:
-        self.assertEqual(
-            set(self._estimate(text_attention_in_mask=True)["breakdown"]),
-            self.BREAKDOWN_KEYS | {"attention_mask"},
-        )
-        self.assertEqual(
-            set(self._estimate(text_attention_in_mask=True, whole_region=True)["breakdown"]),
-            self.BREAKDOWN_KEYS,
-        )
-
-    def test_the_free_memory_is_read_from_the_card_the_run_would_use(self) -> None:
-        self._estimate()
-        self.assertEqual(self.snapshot_devices, ["cuda:1"])
-
-    def test_unknown_free_memory_fits_and_a_tiny_one_does_not(self) -> None:
-        self.snapshot = {"vram_total": 0, "vram_free": 0, "ram_total": 0, "ram_free": 0}
-        self.assertTrue(self._estimate()["fits"])
-        self.snapshot = {"vram_total": 1 << 20, "vram_free": 1 << 10, "ram_total": 1 << 20, "ram_free": 1 << 10}
-        self.assertFalse(self._estimate()["fits"])
-
-    def test_an_invalid_region_is_a_request_error(self) -> None:
-        with self.assertRaises(ValueError):
-            self.service.estimate(params=self.params(), region_width=100, region_height=256)
 
 
 class HealthWireContract(unittest.TestCase):
@@ -588,31 +424,21 @@ class InpaintRunContract(_ManagedRunFixture):
         )
 
     def test_the_response_shape(self) -> None:
-        out = self._run(placement="encoder_cpu", low_cpu_mem_usage=True)
-        self.assertLessEqual(
-            {"image_png", "region_size", "device", "placement", "applied", "oom_recovered", "text_attention_in_mask"},
+        out = self._run(vram_step="phase", ram_step="keep")
+        self.assertEqual(
             set(out),
+            {"image_png", "region_size", "device", "applied", "oom_recovered", "text_attention_in_mask", "vram_step", "ram_step", "vram_step_effective", "ram_step_effective", "degraded", "degrade_reason"},
         )
         self.assertEqual(out["region_size"], [self.REGION, self.REGION])
         self.assertEqual(out["device"], "cuda:0")
-        self.assertEqual(out["placement"], "encoder_cpu")
         self.assertIs(out["oom_recovered"], False)
         self.assertIs(out["text_attention_in_mask"], False)
-        # `applied` is persisted by the Rust side as ONE struct of exactly five
-        # flags (`Flux2AppliedFlags`); a partial object is discarded there.
-        self.assertEqual(
-            out["applied"],
-            {
-                "unload_transformer_before_vae": True,
-                "vae_tiling": True,
-                "vae_slicing": True,
-                "unload_text_encoder_after_encode": False,
-                "text_encoder_fp8": False,
-            },
-        )
+        # `applied` is what the Rust side persists (`Flux2AppliedFlags`): the
+        # tiling flag alone since protocol 14.
+        self.assertEqual(out["applied"], {"vae_tiling": True})
 
     def test_the_mask_is_a_permission_to_change(self) -> None:
-        out = self._run(placement="full_gpu", color_match=False)
+        out = self._run(vram_step="max", ram_step="keep", color_match=False)
         result = np.asarray(Image.open(io.BytesIO(out["image_png"])).convert("RGB"))
         self.assertEqual(result.shape, self.region.shape)
         outside = self.mask == 0
@@ -620,14 +446,14 @@ class InpaintRunContract(_ManagedRunFixture):
         self.assertFalse(np.array_equal(result[~outside], self.region[~outside]))
 
     def test_the_load_frames_follow_the_documented_order(self) -> None:
-        self._run(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
         load = [step for phase, step, _total, _label in self.frames if phase == "load"]
         self.assertTrue(all(total == 9 for phase, _s, total, _l in self.frames if phase == "load"))
         # A cold run reports every load step, in this order, exactly once.
         self.assertEqual(load, list(range(10)))
 
     def test_the_generate_frames_count_the_effective_steps(self) -> None:
-        self._run(placement="full_gpu", steps=4, strength=1.0)
+        self._run(vram_step="max", ram_step="keep", steps=4, strength=1.0)
         generate = [(step, total) for phase, step, total, _label in self.frames if phase == "generate"]
         self.assertEqual(generate, [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)])
         # Every load frame precedes the first generate frame.
@@ -635,9 +461,9 @@ class InpaintRunContract(_ManagedRunFixture):
         self.assertEqual(phases, sorted(phases, key=lambda phase: phase != "load"))
 
     def test_a_hot_second_run_jumps_from_preparation_to_the_last_step(self) -> None:
-        self._run(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
         self.frames.clear()
-        self._run(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
         load = [(step, label) for phase, step, _total, label in self.frames if phase == "load"]
         # Resident pipeline, cached prompt: nothing is loaded, and the bar still
         # reaches its last step so the client sees the load phase complete.
@@ -645,7 +471,7 @@ class InpaintRunContract(_ManagedRunFixture):
 
     def test_the_lease_is_resolved_and_the_pipeline_registered(self) -> None:
         manager = self.service._model_manager
-        self._run(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
         health = manager.health()
         self.assertEqual((health["loading_model_count"], health["active_model_count"]), (0, 0))
         # Re-pinned (D1): the pipeline is a LARGE holding, which the small pool's
@@ -668,7 +494,7 @@ class InpaintRunContract(_ManagedRunFixture):
 
         with patch.object(diffusers.AutoencoderKLFlux2, "from_config", explode):
             with self.assertRaises(OSError):
-                self._run(placement="full_gpu")
+                self._run(vram_step="max", ram_step="keep")
         health = manager.health()
         self.assertEqual(
             (health["loading_model_count"], health["active_model_count"], health["resident_model_count"]),
@@ -685,7 +511,7 @@ class DecodeFallbackOrderContract(_ManagedRunFixture):
     Re-pinned in WP6 (D1) to the large-model manager's ladder: (1) the VAE
     tiling fallback (it engages only where the region exceeds the VAE's
     threshold), (2) both tile thresholds lowered together for this decode,
-    (3) a more economical profile whose decode phase holds the transformer off
+    (3) a more economical «Видеопамять» step whose decode phase holds the transformer off
     the device. The denoise is never repeated, the thresholds come back, and
     the ladder gives up after its retry cap with a named error.
     """
@@ -729,7 +555,7 @@ class DecodeFallbackOrderContract(_ManagedRunFixture):
             outcome: Any = self.service.inpaint_image_bytes(
                 _png_bytes(region, "RGB"),
                 _png_bytes(mask, "L"),
-                params=self.params(prompt="a cat", placement="full_gpu", vae_tiling=False, vae_slicing=False),
+                params=self.params(prompt="a cat", vram_step="max", ram_step="keep", vae_tiling=False),
             )
         except RuntimeError as exc:
             outcome = exc
@@ -765,21 +591,19 @@ class DecodeFallbackOrderContract(_ManagedRunFixture):
         self.assertEqual(len(self.attempts), 3)
         self.assertTrue(outcome["oom_recovered"])
         self.assertTrue(outcome["degraded"])
-        self.assertEqual(outcome["profile_effective"], "max_speed")
         # The transformer stayed on the device: the lowered tile was enough.
-        self.assertEqual((outcome["applied"]["unload_transformer_before_vae"], outcome["applied"]["vae_tiling"]), (False, True))
+        self.assertEqual((outcome["vram_step_effective"], outcome["applied"]), ("max", {"vae_tiling": True}))
 
 
 # ---------------------------------------------------------------------------
 # GOLDEN
 # ---------------------------------------------------------------------------
 class ForecastGoldenTests(unittest.TestCase):
-    """GOLDEN: today's `forecast_memory` and `_preset_advice` answers.
+    """GOLDEN: today's `forecast_memory` answers.
 
     EXPECTED TO CHANGE with every recalibration of the reference table
     (behaviour change B4) — update deliberately with `--write-golden` and review the diff; never edit the
-    JSON by hand to make a test pass. The case tables are `FORECAST_CASES` and
-    `ADVICE_CASES` above.
+    JSON by hand to make a test pass. The case table is `FORECAST_CASES` above.
     """
 
     maxDiff = None
@@ -790,18 +614,12 @@ class ForecastGoldenTests(unittest.TestCase):
 
     def test_the_case_tables_match_the_snapshot(self) -> None:
         self.assertEqual(set(self.golden["forecast_memory"]), set(FORECAST_CASES))
-        self.assertEqual(set(self.golden["preset_advice"]), set(ADVICE_CASES))
         self.assertEqual(self.golden["sizes"], self.current["sizes"])
 
     def test_forecast_memory_matches_the_snapshot(self) -> None:
         for name in FORECAST_CASES:
             with self.subTest(case=name):
                 self.assertEqual(self.current["forecast_memory"][name], self.golden["forecast_memory"][name])
-
-    def test_preset_advice_matches_the_snapshot(self) -> None:
-        for name in ADVICE_CASES:
-            with self.subTest(case=name):
-                self.assertEqual(self.current["preset_advice"][name], self.golden["preset_advice"][name])
 
 
 def _main(argv: list[str]) -> int:

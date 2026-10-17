@@ -439,8 +439,11 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   and degrade for large models; their services declare specs and phases and never move a weight.
   The user steers it on two axes, «Видеопамять» (max / phase / half / min) and «Оперативная
   память» (keep / run / min), each with auto, under hard byte caps (`large_models.*`,
-  `PROTOCOL.md` §5.10). FLUX.2 klein runs on it; FLUX.3 klein is a backend service on it that
-  is not wired yet (no `server.py` construction, IPC method or UI). Detail:
+  `PROTOCOL.md` §5.10). FLUX.2 klein and FLUX.3 klein (`inpaint.flux3_klein`, region editing with
+  the region as reference #0) run on it. A model service may pin components to host execution
+  per request (`LargeModelSpec.host_pin`; «Энкодер на CPU», `encoder_on_cpu`, default on for both
+  klein models): a pinned component runs on the CPU at every VRAM step and only the RAM step
+  places it; the pin is part of the residency and learned-floor keys. Detail:
   `modules/ai_backend/runtime/large_models/MODULE_README.md`.
 - **One ONNX selection** (`General.ai_onnx_build` / `ai_onnx_provider` / `ai_onnx_device_id`)
   drives both runtimes. An unavailable accelerator falls back to the CPU build with a log; a

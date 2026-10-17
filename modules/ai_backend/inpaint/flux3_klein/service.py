@@ -19,16 +19,22 @@ Main responsibilities:
   (`inpaint/MODULE_README.md`, health snapshot); where each component is comes
   from the manager's ledger (`LargeModelManager.placements`), never from the
   service's own bookkeeping;
-- `_model_key` - the residency key (`large_model.residency_key`), from the
-  options alone.
+- the `large_models.profiles` adapter (`large_model_name`, `large_model_inputs`)
+  and `status`, all over the one wire mapping `wire.normalize_flux3_params`;
+- cancellation: an observer or a step callback raises `Flux3Canceled`; it is
+  never a memory failure (no degrade retry), the run ends with the weights
+  wherever the manager's `finish` leaves them, and nothing is unloaded for it.
 
 Key declarations:
-- `Flux3KleinService`, `Flux3Result`, `Flux3Applied`
+- `Flux3KleinService`, `Flux3Result`, `Flux3Applied`, `Flux3Canceled`
 - `_resolve_selected_backend_device`, `_clear_torch_cache` (patch points)
 
 Notes:
-- Not wired: no `server.py` construction, no `AppState` field, no IPC method.
-  The calibration tool (`tools/large_model_calibration/`, its `flux3` driver) is the only caller for now.
+- Callers: `region.py` (the cleaning tab's region editor, IPC
+  `inpaint.flux3_klein`, `ipc/handlers/flux3_klein.py`), the
+  `large_models.profiles` adapter (`server.py` `large_model_adapters`) and the
+  calibration tool (`tools/large_model_calibration/`, its `flux3` driver).
+- `_model_key` - the residency key, from the options alone (`LargeModelSpec.key`).
 - The service never moves a weight itself: every placement change is a manager
   step; a phase function fetches its module from the `PhaseContext` on every
   call and is restartable (the manager may retry it on a gentler plan).
@@ -71,6 +77,7 @@ from .large_model import (
 )
 from .params import AeDtype, EncoderMode, Flux3Options, Flux3Request, Fp8Compute, normalize_request
 from .phases import Phase, PhaseObserver, observed
+from .wire import normalize_flux3_params
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -114,7 +121,8 @@ class Flux3Applied:
     axis), `steps_effective` the concrete pair the run ended on (Auto
     resolved, a learned floor applied, a degrade included); `degraded` whether
     the manager had to lower a step (or take another rung) after a memory
-    failure. The weight format is never changed by the manager.
+    failure, `degrade_reason` the failure kind it degraded for (`None` when it
+    did not). The weight format is never changed by the manager.
     """
 
     variant: WeightFormat
@@ -125,6 +133,7 @@ class Flux3Applied:
     steps_requested: Steps
     steps_effective: Steps
     degraded: bool
+    degrade_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -177,9 +186,33 @@ class _Held:
     compute_path: str
 
 
+@functools.lru_cache(maxsize=None)
+def _spec_of(encoder_mode: EncoderMode, ae_dtype: AeDtype) -> Any:
+    """The `LargeModelSpec` of (`encoder_mode`, `ae_dtype`), built once (its residency key)."""
+    return large_model.build_spec(encoder_mode, ae_dtype)
+
+
 def _model_key(options: Flux3Options, device: str) -> str:
-    """The residency key of the weights `options` loads on `device` (see `large_model.residency_key`)."""
-    return large_model.residency_key(options, options.variant.value, device)
+    """The residency key of the weights `options` loads on `device`: `LargeModelSpec.key` (`large_model.residency_key` + the host pin).
+
+    The key reads `options` alone (the requested fp8 path, not the probed
+    one), so the placeholder concrete path below never changes it.
+    """
+    return _spec_of(options.encoder_mode, options.ae_dtype).key(Flux3ModelOptions(options=options, device=device, fp8_compute=Fp8Compute.DEQUANT), options.variant.value, device)
+
+
+#: A denoise progress sink: `(step, total)` after every flow-map step (1-based).
+StepCallback = Callable[[int, int], None]
+
+
+class Flux3Canceled(Exception):
+    """The caller canceled a generation (raised by its observer or step callback).
+
+    Not a memory failure: the manager re-raises it unchanged (no degrade
+    rung), `generate` finishes the session with it and keeps whatever the
+    manager's `finish` left (no unload), and it is not recorded as the
+    service's last error.
+    """
 
 
 def _release_failed_run_memory(exc: BaseException) -> None:
@@ -363,8 +396,14 @@ class Flux3KleinService:
         options: Flux3Options,
         *,
         observer: PhaseObserver | None = None,
+        step_callback: StepCallback | None = None,
     ) -> Flux3Result:
         """Generate one image for `request` with the package and run options `options`.
+
+        `step_callback(step, total)` is called after every denoise step; it may
+        repeat steps when the manager retries the denoise on a gentler plan.
+        Exceptions of `observer` and `step_callback` propagate (raise
+        `Flux3Canceled` to cancel: see the class).
 
         Before the admission (refusals here cost no load): the package files and
         `config.json`, `normalize_request`, the VL_REFS-needs-references rule,
@@ -423,7 +462,7 @@ class Flux3KleinService:
                 load_failed = True
                 self._load_locked(session, plan, observer)
                 load_failed = False
-                result = self._generate_locked(session, plan, held, observer)
+                result = self._generate_locked(session, plan, held, observer, step_callback)
             except BaseException as exc:
                 self._finish_failed_locked(session, plan, held, exc, load_failed=load_failed)
                 raise
@@ -450,19 +489,26 @@ class Flux3KleinService:
         a failed load registers nothing (the partial handle is unloaded, with
         any other idle handle of the same model). Caller holds `self._lock`.
         """
+        canceled = isinstance(exc, Flux3Canceled)
         try:
             session.finish(exc)
             memory = isinstance(exc, LargeModelRunFailed) or classify_failure(exc, step="finish") is not None
-            if load_failed and not memory:
+            if load_failed and not memory and not canceled:
                 dropped = self._large.unload(plan.model)
                 log.info("FLUX.3 klein: загрузка не удалась, частично загруженная модель выгружена (%s)", ", ".join(dropped) or "-")
             self._held = held
         finally:
-            self._last_error = str(exc)
-            self._publish_health_locked()
-            if isinstance(exc, Exception):
-                log.exception("FLUX.3 klein: генерация не удалась (%s): %s", held.key, exc)
+            if canceled:
+                # A cancel is the user's choice, not a failure of the service.
+                self._publish_health_locked()
+                log.info("FLUX.3 klein: генерация отменена (%s): %s", held.key, exc)
                 _release_failed_run_memory(exc)
+            else:
+                self._last_error = str(exc)
+                self._publish_health_locked()
+                if isinstance(exc, Exception):
+                    log.exception("FLUX.3 klein: генерация не удалась (%s): %s", held.key, exc)
+                    _release_failed_run_memory(exc)
 
     @staticmethod
     def _placements(session: Session) -> dict[str, _Placement]:
@@ -497,6 +543,74 @@ class Flux3KleinService:
             return Fp8Compute.DEQUANT
         return Fp8Compute.SCALED_MM if quant.probe_scaled_mm(device).supported else Fp8Compute.DEQUANT
 
+    def _model_options(self, options: Flux3Options) -> Flux3ModelOptions:
+        """The manager's options of `options`: the normalized run device and the concrete fp8 path (`_fp8_path`).
+
+        # Raises
+        `RuntimeError` when an explicit `SCALED_MM` cannot run on the device.
+        """
+        raw_device = options.device or _resolve_selected_backend_device(_DEVICE_FALLBACK)
+        device = normalize_device(raw_device) or str(raw_device)
+        return Flux3ModelOptions(options=options, device=device, fp8_compute=self._fp8_path(options, device))
+
+    # ---- the wire: profiles adapter and status ----
+    def large_model_name(self, params: dict[str, Any]) -> str:
+        """The registered model `large_models.profiles` plans for wire `params`: `flux3_klein.<mode>.ae_<dtype>`.
+
+        # Raises
+        `ValueError` for invalid params (`wire.normalize_flux3_params`).
+        """
+        options = normalize_flux3_params(params, require_prompt=False).options
+        return large_model.model_name(options.encoder_mode, options.ae_dtype)
+
+    def large_model_inputs(self, params: dict[str, Any]) -> tuple[Flux3ModelOptions, str]:
+        """`(options, device)` of `large_model_name(params)` for `large_models.profiles` (the fp8 probe is cached per device).
+
+        # Raises
+        `ValueError` for invalid params; `RuntimeError` for an explicit
+        `scaled_mm` the device cannot run.
+        """
+        model_options = self._model_options(normalize_flux3_params(params, require_prompt=False).options)
+        return model_options, model_options.device
+
+    def status(self, params: dict[str, Any] | None) -> dict[str, Any]:
+        """The `inpaint.flux3_klein.status` answer for wire `params` (file checks only; never loads, never probes).
+
+        `available` / `reason`: the selected format's files; `formats`: every
+        format's `{available, reason, dit_bytes}`; `ae_present`,
+        `text_encoder_present`: the shared files; plus `health()`. Without a
+        `source_root` nothing is available and `reason` says so.
+
+        # Raises
+        `ValueError` for invalid params other than a missing `source_root`.
+        """
+        from .config import package_ae_file, package_text_encoder_dir
+
+        raw = dict(params or {})
+        if not str(raw.get("source_root") or "").strip():
+            reason = "Не указан каталог модели FLUX.3 klein"
+            return {
+                "available": False,
+                "reason": reason,
+                "formats": {variant.value: {"available": False, "reason": reason, "dit_bytes": 0} for variant in WeightFormat},
+                "ae_present": False,
+                "text_encoder_present": False,
+                **self.health(),
+            }
+        options = normalize_flux3_params(raw, require_prompt=False).options
+        # `formats` needs a concrete fp8 path only for `compute_path`, which
+        # status does not report: DEQUANT avoids the device probe.
+        found = large_model.formats(Flux3ModelOptions(options=options, device="cpu", fp8_compute=Fp8Compute.DEQUANT))
+        selected = found[options.variant.value]
+        return {
+            "available": selected.available,
+            "reason": selected.reason,
+            "formats": {name: {"available": info.available, "reason": info.reason, "dit_bytes": info.dit_bytes} for name, info in found.items()},
+            "ae_present": package_ae_file(options.model_root).is_file(),
+            "text_encoder_present": package_text_encoder_dir(options.model_root).is_dir(),
+            **self.health(),
+        }
+
     def _plan(self, request: Flux3Request, options: Flux3Options) -> _Plan:
         """Validate and shape the request; no lock, no admission, no weights.
 
@@ -519,10 +633,8 @@ class Flux3KleinService:
         # Reference rule (`generate.py`): each missing side takes the default's.
         width = normalized.width or default_width
         height = normalized.height or default_height
-        raw_device = options.device or _resolve_selected_backend_device(_DEVICE_FALLBACK)
-        device = normalize_device(raw_device) or str(raw_device)
-        fp8 = self._fp8_path(options, device)
-        model_options = Flux3ModelOptions(options=options, device=device, fp8_compute=fp8)
+        model_options = self._model_options(options)
+        device, fp8 = model_options.device, model_options.fp8_compute
         shape = large_model.request_shape(width, height, [image.size for image in references.images], caption=normalized.caption, steps=normalized.steps)
         ratio = autoencoder.DOWNSAMPLING_RATIO
         info = {
@@ -596,7 +708,7 @@ class Flux3KleinService:
             return "on_host"
         return "skipped"
 
-    def _generate_locked(self, session: Session, plan: _Plan, held: _Held, observer: PhaseObserver | None) -> Flux3Result:
+    def _generate_locked(self, session: Session, plan: _Plan, held: _Held, observer: PhaseObserver | None, step_callback: StepCallback | None) -> Flux3Result:
         """The run scope, one manager step per observer phase (see `generate`); caller holds `self._lock`."""
         import torch
 
@@ -669,7 +781,7 @@ class Flux3KleinService:
             text = (encoded.tokens.to(device), encoded.ids.to(device))
             packed = packing.pack([(text, cond, (noise, packing.scaled_ids(image_ids, rope_scale)))], dit_config.in_channels)
             schedule = sampling.flow_map_schedule(plan.steps, plan.package.sampler.alpha)
-            tokens = sampling.denoise_flow_map(ctx.module(COMPONENT_DIT), packed, schedule, device_type=torch.device(device).type)
+            tokens = sampling.denoise_flow_map(ctx.module(COMPONENT_DIT), packed, schedule, device_type=torch.device(device).type, step_callback=step_callback)
             return tokens, image_ids
 
         tokens, image_ids = self._step(observer, Phase.DENOISE, session, info, lambda: session.run_phase(PHASE_DENOISE, denoise))
@@ -704,6 +816,7 @@ class Flux3KleinService:
                 steps_requested=session.steps_requested,
                 steps_effective=session.steps_effective,
                 degraded=session.degraded,
+                degrade_reason=session.degrade_reason,
             ),
         )
 

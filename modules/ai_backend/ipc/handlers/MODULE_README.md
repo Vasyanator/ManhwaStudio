@@ -44,20 +44,20 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   service resolves the model source, `PROTOCOL.md §5.4`).
 - `flux_fill.py`: `inpaint.flux_fill` (+ `.unload`, `.status`) — streaming `download` and `generate`
   phases, no preview blob.
-- `flux2_klein.py`: `inpaint.flux2_klein` (+ `.status`, `.estimate`, `.unload`,
+- `flux2_klein.py`: `inpaint.flux2_klein` (+ `.status`, `.unload`,
   `.component_action`, the six `.prompt_cache.*` methods and the two `.download.*` methods) — FLUX.2
   klein region editing. Generation streams `load`/`generate` phases (never `download`: by then the
   weights are user-supplied paths) and returns `image_len` + the
-  OOM-recovery report (`oom_recovered`, `applied`) in the response header. Its request blob is
+  OOM-recovery report (`oom_recovered`, `applied`) and the four step keys in the response header.
+  Its request blob is
   `region ++ mask [++ reference]`, split by `_split_request_blob` with strict equality against
   `image_len + mask_len + reference_len`; an absent or zero `reference_len` reaches the service as
-  `reference_bytes=None`. `.estimate` is the only
-  inpaint method taking a region size instead of image bytes.
-  **`applied` must always carry all five names of `_APPLIED_FLAGS`**: the Rust client parses it as
-  one struct and ignores an incomplete object outright, so omitting a key does not degrade the
-  answer — it throws the whole OOM-recovery report away.
+  `reference_bytes=None`. Forecasts are `large_models.profiles` (`large_models.py`), never a
+  FLUX.2 method. **`applied` carries exactly the names of `_APPLIED_FLAGS`** (`vae_tiling`), each
+  always present: the client persists it after a run. The retired placement fields are refused
+  by the service's params normalization, not here.
   `prompt_cache.build` is the second streaming method of the group (same
-  `{phase, step, total, label}` frames through the shared `_progress_forwarder`, no blob): it
+  `{phase, step, total, label}` frames through the shared `streaming.progress_forwarder`, no blob): it
   encodes a prompt without generating anything, and reading the text encoder takes tens of seconds,
   so a
   silent wait is not acceptable. `prompt_cache.list`/`.save`/`.load`/`.export`/`.import` are plain
@@ -86,7 +86,7 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   `download.check`'s `plan` is NULLABLE and its `plan_error` travels beside it; this layer forwards
   both unchanged. A listing failure is NOT turned into a repo state here or anywhere else — auth
   succeeded, and the client renders a `null` plan as "size unknown", never as a finished install.
-  The token arrives as the `hf_token` REQUEST FIELD (`_read_hf_token`), never as an environment
+  The token arrives as the `hf_token` REQUEST FIELD (`streaming.read_hf_token`), never as an environment
   variable and never inside `params`; nothing in this layer logs it, echoes it back or names it in
   an error. The `variant` field (`_read_variant`) is forwarded VERBATIM for the same reason
   `component` and `action` are: which variants exist, that an absent field means `"9b"`, that an
@@ -94,10 +94,23 @@ It reaches services only through `ctx.state.<AppState field>`, streams intermedi
   answer (`resolve_variant` / `require_uncensored_supported`). Re-deriving any of it here is the
   drift the contract puts it in one place to avoid — and note that an EMPTY `hf_token` is a legal,
   servable request for `"4b"`, whose repository is public, so this layer must not gate on it. The download's second progress level (`file_step` / `file_total` / `file_label`) is
-  ADDITIVE: `_progress_forwarder` takes the three as keyword-only optionals and omits each one it
+  ADDITIVE: `streaming.progress_forwarder` takes the three as keyword-only optionals and omits each one it
   was not given, so `step`/`total` keep meaning the overall level and every four-positional-argument
   caller emits exactly the frame it always did. See `PROTOCOL.md` and
   `dev-docs/flux2_model_download.md`.
+- `flux3_klein.py`: `inpaint.flux3_klein` (+ `.status`, `.unload`, `.download.check`,
+  `.download.start`) — FLUX.3 klein region editing over `ctx.state.flux3_klein`. The run's blob
+  is `region ++ mask ++ references` split by `image_len` / `mask_len` / `reference_lens` (0..9
+  positive lengths, strict sum; `MAX_REFERENCES` mirrors `wire.MAX_EXTRA_REFERENCES`); `params` is
+  forwarded verbatim to `inpaint/flux3_klein/region.py` (whose `wire.py` is the one params owner).
+  The run streams `load` / `generate` frames with a stable `stage` and is canceled MID-RUN:
+  `cancel_event.is_set` is the region editor's `should_cancel` (checked at every stage begin and
+  denoise step), `Flux3Canceled` becomes `Interrupted`. `.download.*` mirror FLUX.2's
+  (`../../inpaint/flux3_download.py`, lazy import, `format` echoed, cancel inside the transfer).
+- `streaming.py`: helpers shared by the region-editor groups (`flux2_klein.py`, `flux3_klein.py`),
+  registering no method: `require_segment_len`, `require_params`, `progress_forwarder` (a dead peer
+  never aborts the work; the first failed frame of a request is logged once) and `read_hf_token`.
+  Not imported by `__init__.py` (it is not a group).
 - `watermark.py`: `watermark.detect` / `.remove` / `.status` / `.unload` — visible-watermark removal
   (`ctx.state.watermark`). Same two-phase streaming contract as `flux_fill.py`; `.remove` is the only
   method whose RESPONSE blob concatenates two PNGs (`clean ++ mask`, split by `image_len`/`mask_len`).

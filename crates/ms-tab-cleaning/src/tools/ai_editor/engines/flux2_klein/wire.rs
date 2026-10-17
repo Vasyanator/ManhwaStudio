@@ -2,16 +2,15 @@
 File: cleaning/tools/ai_editor/engines/flux2_klein/wire.rs
 
 Purpose:
-Every backend call the FLUX.2 klein engine makes that is not a download or a prompt-cache
-operation: the generation run itself with its OOM retry pass, the streaming call helper
-the long operations share, the `.status` query and its parsers, the component
+Every backend call the FLUX.2 klein engine makes that is not a download, a prompt-cache
+operation or a large-model forecast: the generation run itself, the `.status` query and its parsers, the component
 load/unload actions, and the encoding of the image/mask(/reference) blob that travels with a
 run.
 
 Main responsibilities:
-- run one generation pass and, on an OOM, the recovery pass (`run_flux2_klein`,
-  `run_flux2_klein_pass`);
-- drive a streamed IPC call and hand every frame to the caller (`flux2_stream_call`);
+- run one generation and read what it reports about memory (`run_flux2_klein`,
+  `run_flux2_klein_pass`; any out-of-memory recovery is the BACKEND's, there is no client
+  retry);
 - query the component catalog and parse the answer (`fetch_flux2_status`,
   `parse_flux2_status`, `parse_flux2_component_snapshot`);
 - request a component load/unload and read the catalog it answers with;
@@ -24,15 +23,17 @@ Key structures:
 - `Flux2RunInput` — the pixels of one run (region, optional reference, mask, mode)
 
 Key functions:
-- `run_flux2_klein()`, `run_flux2_klein_pass()`, `flux2_stream_call()`
+- `run_flux2_klein()`, `run_flux2_klein_pass()`
 - `flux2_status_header()`, `fetch_flux2_status()`, `parse_flux2_status()`,
   `parse_flux2_component_snapshot()`
 - `unload_flux2_klein()`, `flux2_component_action_header()`,
   `run_flux2_component_action()`
-- `translate_prompt_to_english()`, `map_flux2_call_error()`
+- `translate_prompt_to_english()`
 - `flux2_run_request()`
 
 Notes:
+Streaming calls go through the shared `stream_call` (`../shared/stream_progress.rs`) with
+`FLUX2_RUN_TIMEOUT` per frame; errors are mapped by the shared `map_call_error`.
 Every function here runs on a WORKER thread — none of it may be called from the GUI
 thread. `FLUX2_MAX_SEQ` is pinned at 512 and is part of the prompt-cache key: lowering
 it invalidates the whole saved `.msprompt` library at once.
@@ -48,10 +49,12 @@ use super::*;
 /// built at another length). The constant stays because the wire field stays.
 pub(super) const FLUX2_MAX_SEQ: u32 = 512;
 
-/// Generation may load ~20 GB of weights before the first step; allow a wide window.
+/// Generation may load ~20 GB of weights before the first step; allow a wide window. It is
+/// the PER-FRAME timeout of every streaming call of this engine (`stream_call` restarts it on
+/// each progress frame), which is what lets a multi-hour model download share it.
 pub(super) const FLUX2_RUN_TIMEOUT: Duration = Duration::from_secs(3 * 60 * 60);
 
-/// `.status` / `.estimate` / `.unload` are cheap bookkeeping calls.
+/// `.status` / `.unload` / the component calls are cheap bookkeeping calls.
 pub(super) const FLUX2_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------------------
@@ -95,16 +98,13 @@ pub(super) struct Flux2RunInput {
 pub(super) fn run_flux2_klein(
     input: &Flux2RunInput,
     settings: &Flux2KleinSettings,
-    progress: &Arc<Mutex<Flux2Progress>>,
-    generation: u64,
+    progress: &Arc<Mutex<EngineProgress>>,
+    claim: &ProgressClaim,
 ) -> Result<Flux2RunOutcome, String> {
-    let outcome = run_flux2_klein_pass(input, settings, progress, generation);
+    let outcome = run_flux2_klein_pass(input, settings, progress, claim);
     // The bar is cleared on EVERY exit, including the early validation refusals above
     // the IPC call, because `start_run` raised it before the worker even started.
-    update_progress(progress, generation, |state| {
-        state.active = false;
-        state.cancel_id = None;
-    });
+    update_progress(progress, claim.generation, |state| state.active = false);
     outcome
 }
 
@@ -114,8 +114,8 @@ pub(super) fn run_flux2_klein(
 pub(super) fn run_flux2_klein_pass(
     input: &Flux2RunInput,
     settings: &Flux2KleinSettings,
-    progress: &Arc<Mutex<Flux2Progress>>,
-    generation: u64,
+    progress: &Arc<Mutex<EngineProgress>>,
+    claim: &ProgressClaim,
 ) -> Result<Flux2RunOutcome, String> {
     let Flux2RunInput {
         region: image,
@@ -166,12 +166,13 @@ pub(super) fn run_flux2_klein_pass(
         settings.to_params(whole_region),
     );
 
-    let stream_result = flux2_stream_call(
+    let stream_result = stream_call(
         backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN,
         header,
         &blob,
-        |id| update_progress(progress, generation, |state| state.cancel_id = Some(id)),
-        |frame| publish_progress_frame(progress, generation, frame),
+        FLUX2_RUN_TIMEOUT,
+        |id| claim.publish_request_id(id),
+        |frame| publish_progress_frame(progress, claim.generation, frame),
     );
 
     let (response_header, out_bytes) = stream_result?;
@@ -214,45 +215,8 @@ pub(super) fn run_flux2_klein_pass(
             .and_then(Value::as_bool)
             .unwrap_or(false),
         applied: parse_applied_flags(&response_header),
+        degraded: parse_degraded(&response_header),
     })
-}
-
-/// Streaming call to `method`. Each `progress` frame carries `phase`/`step`/`total`/
-/// `label` in the header and no preview blob — the same shape for a generation, a
-/// prompt-cache build, a component action and a model download, which is why all four go
-/// through here. A download additionally fills [`Flux2ProgressFrame::file`].
-///
-/// `on_started` receives the IPC id of the request as soon as it is on the wire; the
-/// progress state keeps it so a cancel can stop the work backend-side. This is why the call is
-/// built from `begin_call` + `wait_streaming` rather than from the `call_streaming`
-/// shorthand, which never exposes the id.
-pub(super) fn flux2_stream_call<S, F>(
-    method: &'static str,
-    header: Value,
-    blob: &[u8],
-    on_started: S,
-    mut on_progress: F,
-) -> Result<(Value, Vec<u8>), String>
-where
-    S: FnOnce(u64),
-    F: FnMut(Flux2ProgressFrame),
-{
-    let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
-    let handle = client
-        .begin_call(method, header, blob)
-        .map_err(|err| map_flux2_call_error(CallError::Transport(err)))?;
-    on_started(handle.id());
-    handle
-        .wait_streaming(
-            |progress_header, _preview_blob| {
-                on_progress(parse_flux2_progress_frame(progress_header));
-            },
-            // Per FRAME, not per call: `wait_streaming` restarts the timer on every
-            // progress frame, which is what lets a multi-hour model download share this
-            // timeout with a generation.
-            FLUX2_RUN_TIMEOUT,
-        )
-        .map_err(map_flux2_call_error)
 }
 
 /// Builds the `.status` request header.
@@ -266,7 +230,7 @@ pub(super) fn flux2_status_header(params: &Value) -> Value {
     json!({ "params": params })
 }
 
-/// Queries `.status` for the component catalog and the host's memory figures.
+/// Queries `.status` for the component catalog.
 ///
 /// `params` must come from a `normalized()` settings value; empty paths are allowed
 /// and are what the backend reports as "not configured".
@@ -279,7 +243,7 @@ pub(super) fn fetch_flux2_status(params: &Value) -> Result<Flux2Status, String> 
             &[],
             FLUX2_QUERY_TIMEOUT,
         )
-        .map_err(map_flux2_call_error)?;
+        .map_err(map_call_error)?;
     Ok(parse_flux2_status(&header))
 }
 
@@ -288,13 +252,6 @@ pub(super) fn fetch_flux2_status(params: &Value) -> Result<Flux2Status, String> 
 pub(super) fn parse_flux2_status(header: &Value) -> Flux2Status {
     let components = header.get("components");
     let component = |name: &str| Flux2Component::parse(components.and_then(|c| c.get(name)));
-    let memory = header.get("memory");
-    let memory_u64 = |name: &str| {
-        memory
-            .and_then(|m| m.get(name))
-            .and_then(Value::as_u64)
-            .unwrap_or_default()
-    };
     Flux2Status {
         available: header
             .get("available")
@@ -310,8 +267,6 @@ pub(super) fn parse_flux2_status(header: &Value) -> Flux2Status {
         vae: component("vae"),
         tokenizer: component("tokenizer"),
         scheduler: component("scheduler"),
-        vram_total: memory_u64("vram_total"),
-        ram_total: memory_u64("ram_total"),
         loaded: header
             .get("loaded")
             .and_then(Value::as_bool)
@@ -398,7 +353,7 @@ pub(super) fn unload_flux2_klein() -> Result<(), String> {
             &[],
             FLUX2_QUERY_TIMEOUT,
         )
-        .map_err(map_flux2_call_error)?;
+        .map_err(map_call_error)?;
     Ok(())
 }
 
@@ -407,7 +362,7 @@ pub(super) fn unload_flux2_klein() -> Result<(), String> {
 /// `component` and `action` sit at the TOP LEVEL beside `params`, in the same shape the
 /// prompt-cache calls put their `name`/`path` beside it — `params` is the normalized
 /// settings every other FLUX.2 call carries, and it is what tells the backend which model
-/// paths, placement and memory flags the action is about. Without it the backend would act
+/// paths, steps and memory flags the action is about. Without it the backend would act
 /// on the paths of its last successful generation, i.e. on nothing until one has run.
 ///
 /// `settings` must already be `normalized()`.
@@ -442,21 +397,19 @@ pub(super) fn flux2_component_action_header(
 /// does not know the method, or when it is unreachable.
 pub(super) fn run_flux2_component_action(
     header: Value,
-    progress: &Arc<Mutex<Flux2Progress>>,
-    generation: u64,
+    progress: &Arc<Mutex<EngineProgress>>,
+    claim: &ProgressClaim,
 ) -> Result<Flux2ComponentSnapshot, String> {
-    let outcome = flux2_stream_call(
+    let outcome = stream_call(
         backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN_COMPONENT_ACTION,
         header,
         &[],
-        |id| update_progress(progress, generation, |state| state.cancel_id = Some(id)),
-        |frame| publish_progress_frame(progress, generation, frame),
+        FLUX2_RUN_TIMEOUT,
+        |id| claim.publish_request_id(id),
+        |frame| publish_progress_frame(progress, claim.generation, frame),
     )
     .map(|(header, _blob)| parse_flux2_component_snapshot(&header));
-    update_progress(progress, generation, |state| {
-        state.active = false;
-        state.cancel_id = None;
-    });
+    update_progress(progress, claim.generation, |state| state.active = false);
     outcome
 }
 
@@ -481,14 +434,6 @@ pub(super) fn translate_prompt_to_english(
             Err(t!("cleaning.tools.flux2_klein.translate_empty_result_error").to_string())
         }
         Some(Err(err)) => Err(err),
-    }
-}
-
-pub(super) fn map_flux2_call_error(err: CallError) -> String {
-    match err {
-        CallError::Error(msg) => msg,
-        CallError::Interrupted(msg) => tf!("cleaning.inpaint.request_aborted_error", msg = msg),
-        CallError::Transport(_) => ai_backend_offline_error().to_string(),
     }
 }
 
@@ -561,8 +506,8 @@ mod tests {
     /// refusal happens with no backend at all, which is what this test relies on.
     #[test]
     fn a_reference_of_another_size_is_refused_before_the_wire() {
-        let progress = Arc::new(Mutex::new(Flux2Progress::default()));
-        let generation = begin_progress_generation(&progress);
+        let progress = Arc::new(Mutex::new(EngineProgress::default()));
+        let claim = begin_progress_generation(&progress);
         let input = Flux2RunInput {
             region: egui::ColorImage::filled([128, 128], egui::Color32::WHITE),
             reference: Some(egui::ColorImage::filled([128, 64], egui::Color32::RED)),
@@ -570,7 +515,7 @@ mod tests {
             whole_region: true,
             mask_size: [128, 128],
         };
-        let outcome = run_flux2_klein(&input, &runnable_settings().normalized(), &progress, generation);
+        let outcome = run_flux2_klein(&input, &runnable_settings().normalized(), &progress, &claim);
         assert_eq!(
             outcome.err(),
             Some(t!("cleaning.inpaint.size_mismatch_error").to_string())
@@ -595,7 +540,6 @@ mod tests {
                 "text_encoder": { "path": "/a", "exists": true, "size_bytes": 1024 },
                 "tokenizer": { "found": true, "path": "/b" }
             },
-            "memory": { "vram_total": 16, "ram_total": 32 },
             "loaded": true,
             "device": "cuda:0"
         });
@@ -605,7 +549,6 @@ mod tests {
         assert_eq!(status.text_encoder.size_bytes, 1024);
         assert!(status.tokenizer.present);
         assert!(!status.vae.present, "a missing component reads as absent");
-        assert_eq!(status.vram_total, 16);
         assert_eq!(status.device, "cuda:0");
     }
 

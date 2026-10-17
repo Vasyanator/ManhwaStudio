@@ -23,6 +23,9 @@ Main items:
   `update_user_config_file` (exit-only tab settings).
 - `user_config_defaults` / `project_config_defaults`: default trees for global and project settings.
 - `AiInstallType`: installed AI dependency level recorded in `user_config.json`.
+- `flux3_klein_dir` / `flux3_klein_settings_path`: the FLUX.3 klein model package root the
+  download fills (mirrors the backend's `flux3_download.model_root`) and that engine's
+  settings file.
 - `Flux2Variant`: which FLUX.2 klein checkpoint an «ИИ-редактор области» engine works with
   (9B / 4B). It keys the model directory, the three component directories, the engine's
   settings file below, the engine id and the two capability gates; its PRESENTATION (picker
@@ -279,6 +282,21 @@ pub const AUTOSAVE_ACTION_THRESHOLD_DEFAULT: u32 = 30;
 /// launcher modal's confirm path. Gate the modal with
 /// [`user_settings_first_run_languages_pending`].
 pub const GENERAL_FIRST_RUN_LANGUAGES_CONFIRMED_KEY: &str = "first_run_languages_confirmed";
+/// `General.large_models_vram_cap_bytes`: the large-model pool's hard VRAM cap in bytes.
+///
+/// Deliberately ABSENT from [`user_config_defaults`]: the Python backend is its only writer
+/// (`large_models.limits.set` -> `runtime/device_service.py`), which REMOVES the key to
+/// clear the cap, so an absent key means "no cap" and a `null` leaf is never stored. A
+/// default here would make [`JsonConfig::apply_defaults`] materialize one at every start.
+pub const GENERAL_LARGE_MODELS_VRAM_CAP_BYTES_KEY: &str = "large_models_vram_cap_bytes";
+/// `General.large_models_ram_cap_bytes`: the large-model pool's hard RAM cap in bytes.
+/// Absent from the defaults tree for the same reason as
+/// [`GENERAL_LARGE_MODELS_VRAM_CAP_BYTES_KEY`].
+pub const GENERAL_LARGE_MODELS_RAM_CAP_BYTES_KEY: &str = "large_models_ram_cap_bytes";
+/// `General.large_models_oom_score_adj` (bool, default `true`): read once at backend start;
+/// on Linux the backend then makes itself the kernel OOM killer's first choice. No UI; the
+/// defaults entry is what makes the switch discoverable in `user_config`.
+pub const GENERAL_LARGE_MODELS_OOM_SCORE_ADJ_KEY: &str = "large_models_oom_score_adj";
 /// Schema version of the `PanelLayout` section of `user_config.json`. The config file
 /// has no global version, so the section carries its own (precedent: `fonts_data.rs`).
 /// The section itself is owned by `widgets::panel_dock::persist`, which re-exports this
@@ -739,6 +757,15 @@ pub fn flux2_klein_settings_path(variant: Flux2Variant) -> PathBuf {
     data_dir().join(variant.settings_file_name())
 }
 
+/// Dedicated settings file of the «FLUX.3 klein» region-edit engine (its model source, weight
+/// format, prompt, generation and memory parameters), kept out of `user_config.json` for the
+/// same reason as the FLUX.2 klein, SDXL and watermark ones: its background saves must not
+/// race the canvas-settings saver.
+#[must_use]
+pub fn flux3_klein_settings_path() -> PathBuf {
+    data_dir().join("flux3_klein_settings.json")
+}
+
 /// Dedicated settings file of the «Lama» region-edit engine (the selected model and
 /// the parameters of both backend methods), kept out of `user_config.json` for the
 /// same reason as the SDXL, FLUX.1-Fill and watermark ones: its background saves must
@@ -1175,6 +1202,18 @@ pub fn flux2_klein_text_encoder_dir(variant: Flux2Variant, uncensored: bool) -> 
     })
 }
 
+/// FLUX.3 klein: root of the model package the «ИИ-редактор области» download fills
+/// (`ae.safetensors`, `text_encoder/`, and per weight format `model.safetensors` (bf16) or
+/// `variants/<format>/`), laid out like the Hugging Face repository.
+///
+/// The directory name mirrors `model_root()` in `modules/ai_backend/inpaint/flux3_download.py`;
+/// the two must not drift. The backend creates and fills it; this side needs the path because
+/// in download mode it is the `source_root` every FLUX.3 request names.
+#[must_use]
+pub fn flux3_klein_dir() -> PathBuf {
+    side_models_dir().join("FLUX.3-image-klein")
+}
+
 /// Visible-watermark-removal models. Each network gets its own subdirectory
 /// (`slbr/`, `wdnet/`, `splitnet/`) holding its weights and its runtime-fetched
 /// source; mirrors `WATERMARK_DIR` in the Python backend's `config.py`.
@@ -1465,6 +1504,8 @@ pub fn user_config_defaults() -> Value {
             "ai_onnx_device_id": "not-selected",
             "ai_onnx_build": "not-selected",
             "ai_max_loaded_models": 3,
+            // The large-model caps are NOT here: see `GENERAL_LARGE_MODELS_VRAM_CAP_BYTES_KEY`.
+            "large_models_oom_score_adj": true,
             "ai_install_type": AiInstallType::None.as_str(),
             "ai_runtime": AiRuntime::Native.as_key(),
             "ai_runtime_configured": false,
@@ -2817,6 +2858,21 @@ mod tests {
     }
 
     #[test]
+    fn user_config_defaults_carry_the_large_model_switch_but_never_the_caps() {
+        // The backend is the caps' only writer and removes a key to clear it; a defaults
+        // entry would write a `null` leaf back at every start.
+        let defaults = user_config_defaults();
+        let general = defaults
+            .get("General")
+            .and_then(Value::as_object)
+            .expect("user_config_defaults must contain a General object");
+        for key in [GENERAL_LARGE_MODELS_VRAM_CAP_BYTES_KEY, GENERAL_LARGE_MODELS_RAM_CAP_BYTES_KEY] {
+            assert!(!general.contains_key(key), "General.{key} must not be part of the defaults tree");
+        }
+        assert_eq!(general.get(GENERAL_LARGE_MODELS_OOM_SCORE_ADJ_KEY), Some(&Value::Bool(true)));
+    }
+
+    #[test]
     fn ui_scale_percent_defaults_and_clamps() {
         // Missing key / missing section / wrong type -> native size.
         assert_eq!(
@@ -3281,6 +3337,20 @@ mod tests {
             flux2_klein_settings_path(Flux2Variant::Klein9B),
             flux2_klein_settings_path(Flux2Variant::Klein4B),
         );
+    }
+
+    /// The FLUX.3 klein package directory and settings file are the backend's and existing
+    /// installations' contract: the directory name mirrors `flux3_download.model_root`, and
+    /// neither may collide with a FLUX.2 klein one.
+    #[test]
+    fn the_flux3_klein_paths_are_frozen_and_distinct() {
+        assert!(flux3_klein_dir().ends_with("FLUX.3-image-klein"));
+        assert!(flux3_klein_dir().starts_with(side_models_dir()));
+        assert!(flux3_klein_settings_path().ends_with("flux3_klein_settings.json"));
+        for variant in Flux2Variant::all() {
+            assert_ne!(flux3_klein_dir(), flux2_klein_dir(variant));
+            assert_ne!(flux3_klein_settings_path(), flux2_klein_settings_path(variant));
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@ the channel it answers on, and nothing in between runs on the GUI thread.
 Main responsibilities:
 - the per-component load/unload actions (`start_component_action`, `poll_component_action`);
 - the Hugging Face token, which travels in the request and never into the settings file
-  (`start_store_hf_token`, `start_clear_hf_token`, `poll_hf_token`);
+  (the shared `HfTokenControl`, drained by `poll_hf_token`);
 - the model download: the pre-flight check, the transfer, its cancellation, and the
   derivation it applies when it finishes (`start_download_check` .. `apply_download_outcome`);
 - the prompt translation (`start_translate`, `poll_translate`) and the non-blocking file
@@ -23,7 +23,8 @@ Key functions:
 Notes:
 A second inherent `impl Flux2KleinEngine` block; the state these methods move is declared
 in `mod.rs` beside the struct. All four operations here share ONE progress bar and claim
-it by GENERATION, so a write from a retired job is dropped — see `../progress.rs`. The
+it by GENERATION, so a write from a retired job is dropped — see
+`../../shared/stream_progress.rs`. The
 gate that means "wait for the current operation" is `pipeline_busy`, in `mod.rs`, and it
 reads all four channels at once.
 */
@@ -48,7 +49,7 @@ impl Flux2KleinEngine {
             return;
         }
         let header = flux2_component_action_header(&self.settings.normalized(), id, action);
-        let generation = begin_progress_generation(&self.progress);
+        let claim = begin_progress_generation(&self.progress);
         let progress = Arc::clone(&self.progress);
         let (tx, rx) = mpsc::channel();
         self.component_action_rx = Some(rx);
@@ -59,7 +60,7 @@ impl Flux2KleinEngine {
             action = action.label()
         ));
         thread::spawn(move || {
-            let _ = tx.send(run_flux2_component_action(header, &progress, generation));
+            let _ = tx.send(run_flux2_component_action(header, &progress, &claim));
         });
     }
 
@@ -84,6 +85,8 @@ impl Flux2KleinEngine {
                     status.components = snapshot;
                 }
                 self.status_wanted = true;
+                // Weights moved: the forecast's "what is resident" is stale.
+                self.invalidate_forecast();
                 self.component_action_status =
                     Some(t!("cleaning.tools.flux2_klein.component_action_done_status").to_string());
             }
@@ -106,6 +109,7 @@ impl Flux2KleinEngine {
                 // The action may have moved weights before it failed, so the rows on
                 // screen are no longer trustworthy.
                 self.status_wanted = true;
+                self.invalidate_forecast();
             }
             Err(TryRecvError::Disconnected) => {
                 self.component_action_rx = None;
@@ -118,72 +122,14 @@ impl Flux2KleinEngine {
         }
     }
 
-    /// Writes the token field into the OS secret store, on a worker thread.
-    ///
-    /// The keyring is an OS round trip, so it never happens on the GUI thread
-    /// (`machine_translation.rs` spawns for the AI API keys for the same reason). The
-    /// buffer is cleared IMMEDIATELY, before the worker even starts: the value is already
-    /// on its way to the store, and leaving it in a widget only keeps a secret on screen.
-    pub(super) fn start_store_hf_token(&mut self) {
-        if self.hf_token_rx.is_some() {
-            return;
-        }
-        let token = std::mem::take(&mut self.hf_token_input);
-        let (tx, rx) = mpsc::channel();
-        self.hf_token_rx = Some(rx);
-        thread::spawn(move || {
-            let result = ms_sysprobe::hf_token::store_hf_token(&token).map(|()| {
-                t!("cleaning.tools.flux2_klein.download.token_saved_status").to_string()
-            });
-            let _ = tx.send(result);
-        });
-    }
-
-    /// Deletes the stored token, on a worker thread. See [`Self::start_store_hf_token`].
-    pub(super) fn start_clear_hf_token(&mut self) {
-        if self.hf_token_rx.is_some() {
-            return;
-        }
-        self.hf_token_input.clear();
-        let (tx, rx) = mpsc::channel();
-        self.hf_token_rx = Some(rx);
-        thread::spawn(move || {
-            let result = ms_sysprobe::hf_token::clear_hf_token().map(|()| {
-                t!("cleaning.tools.flux2_klein.download.token_deleted_status").to_string()
-            });
-            let _ = tx.send(result);
-        });
-    }
-
-    /// Drains the secret-store channel into the token status line.
+    /// Drains the secret-store operation of the token field (the shared `HfTokenControl`).
     ///
     /// A finished operation also drops the last access check: it was computed for the
     /// PREVIOUS token and would otherwise keep claiming access the new one may not have.
     pub(super) fn poll_hf_token(&mut self) {
-        let Some(rx) = self.hf_token_rx.as_ref() else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(status)) => {
-                self.hf_token_rx = None;
-                self.hf_token_status = Some(status);
-                self.download_check = None;
-                self.download_check_error = None;
-            }
-            Ok(Err(err)) => {
-                self.hf_token_rx = None;
-                // The error carries the keyring's message, which never contains the token.
-                ms_log::runtime_log::log_warn(format!(
-                    "[cleaning] FLUX.2 klein Hugging Face token operation failed: {err}"
-                ));
-                self.hf_token_status = Some(err);
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.hf_token_rx = None;
-                self.hf_token_status =
-                    Some(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string());
-            }
-            Err(TryRecvError::Empty) => {}
+        if self.hf_token.poll(FLUX2_LOG_LABEL) {
+            self.download_check = None;
+            self.download_check_error = None;
         }
     }
 
@@ -206,7 +152,7 @@ impl Flux2KleinEngine {
             // Stamped on the worker, from the value that actually travelled: the answer
             // describes THAT toggle, whatever the user flips while it is in flight.
             let answer = check_flux2_download(header).map(|mut check| {
-                check.uncensored = uncensored;
+                check.question.uncensored = uncensored;
                 check
             });
             let _ = tx.send(answer);
@@ -234,7 +180,7 @@ impl Flux2KleinEngine {
                 if let Some(message) = download_check_variant_mismatch(&check, self.variant) {
                     ms_log::runtime_log::log_warn(format!(
                         "[cleaning] FLUX.2 klein download access check answered about variant {}, but {} was requested; the answer is discarded",
-                        check.variant.wire(),
+                        check.question.variant.wire(),
                         self.variant.wire()
                     ));
                     // The previous answer, if any, described THIS variant and is still
@@ -247,7 +193,7 @@ impl Flux2KleinEngine {
                 // no localizable content at all. The request's token is not in scope here
                 // and must never enter this line.
                 for repo in &check.repos {
-                    if repo.state != Some(Flux2DownloadState::Ok) {
+                    if repo.state != Some(HfDownloadState::Ok) {
                         ms_log::runtime_log::log_warn(format!(
                             "[cleaning] FLUX.2 klein download access check: repo {}, state {}, message: {}",
                             repo.repo, repo.state_wire, repo.message
@@ -291,14 +237,14 @@ impl Flux2KleinEngine {
             self.settings.uncensored_encoder_active(),
             self.variant,
         );
-        let generation = begin_progress_generation(&self.progress);
+        let claim = begin_progress_generation(&self.progress);
         let progress = Arc::clone(&self.progress);
         let (tx, rx) = mpsc::channel();
         self.download_rx = Some(rx);
         self.download_status =
             Some(t!("cleaning.tools.flux2_klein.download.running_status").to_string());
         thread::spawn(move || {
-            let _ = tx.send(run_flux2_download(header, &progress, generation));
+            let _ = tx.send(run_flux2_download(header, &progress, &claim));
         });
     }
 
@@ -309,13 +255,13 @@ impl Flux2KleinEngine {
     /// Files already published on disk stay — they are complete and were renamed
     /// atomically, so a re-run resumes at file granularity.
     pub(super) fn cancel_download(&mut self) {
-        if self.download_rx.is_none() {
+        let Some(rx) = self.download_rx.take() else {
             return;
-        }
-        self.download_rx = None;
-        if let Some(id) = retire_progress_generation(&self.progress) {
-            spawn_flux2_cancel(id);
-        }
+        };
+        // Kept until the worker ends: the backend stops at its next chunk, and nothing may
+        // start on the pipeline before it has (`pipeline_busy`).
+        self.session.abandoned.push(rx);
+        retire_progress_generation(&self.progress, FLUX2_LOG_LABEL);
         self.download_status =
             Some(t!("cleaning.tools.flux2_klein.download.cancelled_status").to_string());
     }
@@ -379,9 +325,11 @@ impl Flux2KleinEngine {
                 ));
             }
         }
-        // The files on disk changed, so what the backend reports about them did too.
+        // The files on disk changed, so what the backend reports about them did too — and
+        // the forecast question is the SAME (the derived paths did not move), so it is
+        // invalidated rather than merely re-armed.
         self.status_wanted = true;
-        self.estimate_wanted = true;
+        self.invalidate_forecast();
         self.prompt_cache_list_wanted = true;
         // The plan is spent: the missing bytes it named are on disk now.
         self.download_check = None;
@@ -525,7 +473,7 @@ impl Flux2KleinEngine {
         }
         self.dirty = true;
         self.status_wanted = true;
-        self.estimate_wanted = true;
+        self.resources.arm();
         // The encoder family — and therefore the whole library listing — is decided by
         // the model paths, so a new path invalidates the list just as it does the catalog.
         self.prompt_cache_list_wanted = true;
@@ -542,7 +490,7 @@ impl Flux2KleinEngine {
             return;
         }
         let header = self.prompt_cache_header(&[]);
-        let generation = begin_progress_generation(&self.progress);
+        let claim = begin_progress_generation(&self.progress);
         let progress = Arc::clone(&self.progress);
         let (tx, rx) = mpsc::channel();
         self.prompt_cache_rx = Some(rx);
@@ -551,7 +499,7 @@ impl Flux2KleinEngine {
         // A warning belongs to the operation that produced it, not to the next one.
         self.prompt_cache_warning = None;
         thread::spawn(move || {
-            let result = build_flux2_prompt_cache(header, &progress, generation);
+            let result = build_flux2_prompt_cache(header, &progress, &claim);
             let _ = tx.send(result);
         });
     }
@@ -752,7 +700,7 @@ impl Flux2KleinEngine {
                 self.settings.prompt = loaded.prompt;
                 self.dirty = true;
                 self.status_wanted = true;
-                self.estimate_wanted = true;
+                self.resources.arm();
                 // The load SUCCEEDED and everything checkable was checked; what could not
                 // be checked is the encoder's own fingerprint, because there is no local
                 // encoder to compare it against. That is a one-off remark about this
@@ -816,7 +764,7 @@ mod tests {
         let en = ms_i18n::LocaleTag::parse("en").expect("en tag is valid");
         ms_i18n::set_locale(&en).expect("en catalog installs");
         let previous = Flux2DownloadCheck {
-            variant: Flux2Variant::Klein9B,
+            question: Flux2CheckQuestion { variant: Flux2Variant::Klein9B, ..Flux2CheckQuestion::default() },
             plan_error: "the previous, correct answer".to_string(),
             ..Flux2DownloadCheck::default()
         };
@@ -827,7 +775,7 @@ mod tests {
             ..Flux2KleinEngine::default()
         };
         tx.send(Ok(Flux2DownloadCheck {
-            variant: Flux2Variant::Klein4B,
+            question: Flux2CheckQuestion { variant: Flux2Variant::Klein4B, ..Flux2CheckQuestion::default() },
             ..Flux2DownloadCheck::default()
         }))
         .expect("the receiver is alive");
@@ -850,7 +798,7 @@ mod tests {
     #[test]
     fn a_check_answer_about_this_checkpoint_is_stored() {
         let answer = Flux2DownloadCheck {
-            variant: Flux2Variant::Klein9B,
+            question: Flux2CheckQuestion { variant: Flux2Variant::Klein9B, ..Flux2CheckQuestion::default() },
             ..Flux2DownloadCheck::default()
         };
         let (tx, rx) = mpsc::channel();
@@ -884,7 +832,7 @@ mod tests {
                 uncensored_text_encoder: true,
                 ..runnable_settings()
             },
-            hf_token_input: SECRET.to_string(),
+            hf_token: HfTokenControl { input: SECRET.to_string(), ..HfTokenControl::default() },
             ..Flux2KleinEngine::default()
         };
         let document =
@@ -964,7 +912,7 @@ mod tests {
         assert_eq!(paths.vae, config::flux2_klein_vae_dir(Flux2Variant::Klein9B).to_string_lossy());
 
         // Everything the new files invalidate is re-armed, and the spent plan is dropped.
-        assert!(engine.status_wanted && engine.estimate_wanted);
+        assert!(engine.status_wanted && engine.resources.wanted);
         assert!(engine.prompt_cache_list_wanted);
         assert!(engine.download_check.is_none());
 

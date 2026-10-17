@@ -7,7 +7,8 @@ edition = "2024"
 # the launcher and the root: which local runtimes this process may use (`local_ai`: `--no-ai`
 # plus the platform, the one route-availability rule, the effective-runtime helper) and the
 # push-driven Python backend health model with its device-control probe thread
-# (`backend_health`). GUI-free: no egui, no tab state.
+# (`backend_health`), and the one client of the backend's large-model pool (`large_models`).
+# GUI-free: no egui, no tab state.
 #
 # Layer: the `ms-project / ms-widgets / ms-native-runtime` line. Every dependency sits below it,
 # and nothing on that line or below uses it. It must never depend on a tab crate,

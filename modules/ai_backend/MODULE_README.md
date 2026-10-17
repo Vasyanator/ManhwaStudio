@@ -49,7 +49,7 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
 - `server.py`: composition root — `build_app_state(app_version, *, user_config=None,
   large_models_cache_root=None)` constructs every service and the `AppState` (one
   `ResidencyArbiter` shared by the small pool and the `LargeModelManager`; `large_model_adapters`
-  lists the services `large_models.profiles` serves, today `flux2_klein`); `run_server` applies the
+  lists the services `large_models.profiles` serves: `flux2_klein`, `flux3_klein`); `run_server` applies the
   OOM backstop and starts the framed IPC. The two keyword seams exist so tests never touch the
   user's documents.
 - `__init__.py`: PEP 562 lazy re-export of `run_server`, so importing a light submodule (e.g.
@@ -69,9 +69,9 @@ ai_backend.py (repo root)          — process entrypoint, puts <repo>/modules o
   probability maps out; Rust plans and post-processes) plus the vendored ComicTextDetector network
   in `detection/textdetector/`. See `detection/MODULE_README.md`.
 - `inpaint/`: inpainting backends (`inpaint.lama_v2` / `.lama_mpe` / `.aot` / `.sdxl` /
-  `.flux_fill` / `.flux2_klein`), the standalone LaMa V2 runtime module, the vendored
-  `lama_runtime_bundle/`, and the FLUX.3 Image Klein generator `flux3_klein/` (a service package
-  that is not wired into `server.py` or IPC yet). See `inpaint/MODULE_README.md`.
+  `.flux_fill` / `.flux2_klein` / `.flux3_klein`), the standalone LaMa V2 runtime module, the
+  vendored `lama_runtime_bundle/`, the shared region-editor helpers (`region_imaging.py`) and
+  the gated Hugging Face download machinery (`hf_gated_download.py`). See `inpaint/MODULE_README.md`.
 - `watermark/`: visible-watermark removal (`watermark.detect` / `.remove` / `.status` / `.unload`).
   A domain of its own, not an inpainter: it PREDICTS a mask instead of consuming one, and its
   weights plus the network code are fetched on demand into `side_models/WatermarkRemoval/`

@@ -1,0 +1,93 @@
+{
+  "model": "flux2_klein",
+  "format": "bf16",
+  "selected": {
+    "vram_requested": "auto",
+    "ram_requested": "auto",
+    "vram": "phase",
+    "ram": "keep",
+    "fits": true,
+    "needs_reclaim": { "device_bytes": 0, "host_bytes": 1073741824 },
+    "reason": null,
+    "shortest_resource": null,
+    "forecast": {
+      "device_peak": 14495514624,
+      "host_peak": 30064771072,
+      "peak_phase": "denoise",
+      "time": { "load_cold_s": 48.5, "load_warm_s": 6.0, "per_step_s": 1.75, "total_s": 61.0 },
+      "calibrated": false,
+      "device_calibrated": true
+    },
+    "plan_summary": [
+      { "component": "transformer", "tier": "device", "exec_device": "device", "blocks_device": 24, "blocks_host": 0, "blocks_disk": 0 },
+      { "component": "vae", "tier": "host", "exec_device": "device", "blocks_device": 0, "blocks_host": 1, "blocks_disk": 0 }
+    ]
+  },
+  "vram": {
+    "applicable": true,
+    "steps": [
+      { "id": "max", "fits": false, "same_as": null, "below_floor": true, "device_peak": 24696061952, "total_s": 55.0 },
+      { "id": "phase", "fits": true, "same_as": null, "below_floor": false, "device_peak": 14495514624, "total_s": 61.0 },
+      { "id": "half", "fits": true, "same_as": null, "below_floor": false, "device_peak": 12348030976, "total_s": 95.5 },
+      { "id": "min", "fits": true, "same_as": "half", "below_floor": false, "device_peak": 12348030976, "total_s": 95.5 }
+    ],
+    "recommended": "phase",
+    "floor": "phase"
+  },
+  "ram": {
+    "applicable": true,
+    "steps": [
+      { "id": "keep", "fits": true, "same_as": null, "below_floor": false, "host_peak": 30064771072, "total_s": 61.0 },
+      { "id": "run", "fits": true, "same_as": null, "below_floor": false, "host_peak": 30064771072, "total_s": 61.0 },
+      { "id": "min", "fits": true, "same_as": null, "below_floor": false, "host_peak": 6442450944, "total_s": 410.0 }
+    ],
+    "recommended": "keep",
+    "floor": null
+  },
+  "learned_floor": {
+    "model": "flux2_klein",
+    "format": "bf16",
+    "device_class": "cuda_sm89_24g",
+    "vram": "phase",
+    "ram": null,
+    "reason": "device_oom",
+    "step": "denoise",
+    "recorded_at": 1760000000.0
+  },
+  "limits": {
+    "vram_cap": null,
+    "ram_cap": 34359738368,
+    "ram_total": 67108864000,
+    "ram_free": 41943040000,
+    "ram_cgroup_limit": null,
+    "ram_reserve": 2147483648,
+    "vram_total": 25753026560,
+    "vram_free": 24696061952,
+    "vram_reserve": 1073741824
+  },
+  "formats": [
+    { "id": "bf16", "available": true, "reason": null, "dit_bytes": 18253611008, "compute_path": "bf16", "quality_rank": 0, "fits_best": { "vram": "phase", "ram": "keep" } }
+  ],
+  "suggestions": [
+    { "kind": "limits", "text_key": "large_models.suggestion.raise_limits", "payload": { "vram": "max", "ram": "keep" } }
+  ],
+  "encoder": {
+    "vram_requested": "auto",
+    "ram_requested": "auto",
+    "vram": "phase",
+    "ram": "keep",
+    "fits": true,
+    "needs_reclaim": { "device_bytes": 0, "host_bytes": 0 },
+    "reason": null,
+    "shortest_resource": null,
+    "forecast": {
+      "device_peak": 8589934592,
+      "host_peak": 16106127360,
+      "peak_phase": "encode",
+      "time": { "load_cold_s": 30.0, "load_warm_s": 3.0, "per_step_s": 0.4, "total_s": 31.0 },
+      "calibrated": false,
+      "device_calibrated": false
+    },
+    "plan_summary": []
+  }
+}

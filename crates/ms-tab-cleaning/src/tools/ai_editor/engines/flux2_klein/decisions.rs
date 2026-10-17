@@ -124,7 +124,7 @@ pub(super) enum Flux2LineTone {
 /// The memory forecast as the readiness line carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Flux2MemorySummary {
-    /// The one-line forecast, already formatted by [`estimate_status_line`].
+    /// The one-line forecast, already formatted by `large_model_resources::forecast_line`.
     pub(super) line: String,
     /// The backend's own verdict. `false` turns the readiness line amber, because the
     /// spelled-out «не помещается» warning lives inside «Память и скорость» and that

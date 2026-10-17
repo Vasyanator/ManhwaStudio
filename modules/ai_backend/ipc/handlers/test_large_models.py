@@ -21,7 +21,13 @@ Coverage:
   `keep_policy` are refused and leave the limits unchanged; the store sees the
   write; two concurrent partial sets lose no cap and leave the store and the
   limits in force equal;
-- `status` / `unload` / `learned.reset` answer their documented shapes.
+- `status` / `unload` / `learned.reset` answer their documented shapes;
+- the `profiles` answer's key tree and value types equal the Rust client's
+  pinned fixture (`crates/ms-local-ai/fixtures/large_models_profiles_v13.json`,
+  parsed by `ms_local_ai::large_models::parse_profiles`), so the two sides
+  cannot drift apart silently;
+- the `config.py` defaults tree matches ms-config for the large-model keys:
+  `large_models_oom_score_adj` defaults to `true`, the two caps are absent.
 """
 
 from __future__ import annotations
@@ -46,6 +52,10 @@ from modules.ai_backend.runtime.memory_budget import DeviceBudget, HostBudget
 from modules.ai_backend.runtime.residency.arbiter import ResidencyArbiter
 
 GIB = 1 << 30
+
+#: The Rust side of the `large_models.profiles` shape parity (tracked, repo-relative).
+RUST_PROFILES_FIXTURE = Path(__file__).resolve().parents[4] / "crates" / "ms-local-ai" / "fixtures" / "large_models_profiles_v13.json"
+
 METHODS = (
     protocol.METHOD_LARGE_MODELS_PROFILES,
     protocol.METHOD_LARGE_MODELS_LIMITS_SET,
@@ -319,6 +329,79 @@ class StatusUnloadResetTests(unittest.TestCase):
         self.assertEqual(rig.call(protocol.METHOD_LARGE_MODELS_LEARNED_RESET, {"model": "toy"}), {"cleared": 1})
         self.assertEqual(rig.call(protocol.METHOD_LARGE_MODELS_LEARNED_RESET, {"model": None}), {"cleared": 1})
         self.assertEqual(rig.store.read_floors(), [])
+
+
+def _shape_mismatches(python: Any, rust: Any, path: str = "$") -> list[str]:
+    """Where the Python answer's key tree / value types differ from the Rust fixture's.
+
+    Dicts must have the same keys. A `null` on either side matches any type (the
+    field is nullable; which side is populated depends on the plan). An int
+    where the fixture has a float is accepted (Rust reads an integer as `f64`);
+    the reverse is a mismatch. Lists compare their first elements when both
+    sides have one.
+    """
+    if python is None or rust is None:
+        return []
+    if isinstance(rust, dict):
+        if not isinstance(python, dict):
+            return [f"{path}: object expected, got {type(python).__name__}"]
+        found = [f"{path}: keys differ: python-only {sorted(set(python) - set(rust))}, rust-only {sorted(set(rust) - set(python))}"] if set(python) != set(rust) else []
+        for key in sorted(set(python) & set(rust)):
+            found.extend(_shape_mismatches(python[key], rust[key], f"{path}.{key}"))
+        return found
+    if isinstance(rust, list):
+        if not isinstance(python, list):
+            return [f"{path}: array expected, got {type(python).__name__}"]
+        return _shape_mismatches(python[0], rust[0], f"{path}[0]") if python and rust else []
+    if isinstance(rust, bool) or isinstance(python, bool):
+        return [] if isinstance(rust, bool) and isinstance(python, bool) else [f"{path}: bool vs {type(python).__name__}"]
+    if isinstance(rust, float) and isinstance(python, (int, float)):
+        return []
+    return [] if type(python) is type(rust) else [f"{path}: {type(rust).__name__} expected, got {type(python).__name__}"]
+
+
+class RustFixtureShapeTests(unittest.TestCase):
+    """The `profiles` wire shape against the Rust client's pinned fixture (`ProfilesReport.to_dict` is the shape owner)."""
+
+    def _answers(self) -> list[dict[str, Any]]:
+        floor = FloorEntry(key=FloorKey("test_class", "toy", "big"), vram=VramStep.HALF, ram=None, reason="device_oom", step="denoise", recorded_at=1.0)
+        rig = _Rig(self, store=MemoryLimitsStore(Limits(None, 32 * GIB), floors=[floor]))
+        fitting = rig.call(protocol.METHOD_LARGE_MODELS_PROFILES, {"model": "toy", "shape": SHAPE})
+        # A 1 KiB VRAM cap refuses every device step: `reason`, `shortest_resource`
+        # and the `suggestions` are populated on this answer.
+        rig.call(protocol.METHOD_LARGE_MODELS_LIMITS_SET, {"vram_cap_bytes": 1024})
+        refused = rig.call(protocol.METHOD_LARGE_MODELS_PROFILES, {"model": "toy", "shape": SHAPE, "vram_step": "max", "ram_step": "keep"})
+        # The FLUX.2 adapter adds `encoder`: the encoder handle's `selected`
+        # (`Flux2KleinInpaintService.large_model_profiles`), same shape.
+        return [{**answer, "encoder": answer["selected"]} for answer in (fitting, refused)]
+
+    def test_profiles_shape_matches_rust_fixture(self) -> None:
+        rust = json.loads(RUST_PROFILES_FIXTURE.read_text(encoding="utf-8"))
+        answers = self._answers()
+        for index, answer in enumerate(answers):
+            with self.subTest(answer=index):
+                self.assertEqual(_shape_mismatches(json.loads(json.dumps(answer)), rust), [])
+        # The comparison is only as strong as what got populated: every nullable
+        # part of the fixture is non-null in at least one answer.
+        self.assertTrue(any(answer["learned_floor"] is not None for answer in answers))
+        self.assertTrue(any(answer["suggestions"] for answer in answers))
+        self.assertTrue(any(answer["selected"]["reason"] is not None for answer in answers))
+        self.assertTrue(any(answer["selected"]["needs_reclaim"] is not None for answer in answers))
+        self.assertTrue(all(answer["selected"]["forecast"] is not None and answer["selected"]["plan_summary"] for answer in answers))
+        self.assertTrue(all(answer["formats"] and answer["formats"][0]["fits_best"] is not None for answer in answers[:1]))
+
+
+class UserConfigDefaultsTests(unittest.TestCase):
+    """`config.py` `USER_CONFIG_DEFAULTS` agrees with Rust `ms_config::user_config_defaults` on the large-model keys."""
+
+    def test_the_oom_switch_defaults_on_and_the_caps_are_absent(self) -> None:
+        import config
+
+        general = config.USER_CONFIG_DEFAULTS["General"]
+        self.assertIs(general["large_models_oom_score_adj"], True)
+        # Absent = no cap; the backend is the caps' only writer (`device_service.py`).
+        self.assertNotIn("large_models_vram_cap_bytes", general)
+        self.assertNotIn("large_models_ram_cap_bytes", general)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,221 @@
+/*
+File: cleaning/tools/ai_editor/engines/flux3_klein/ui/install.rs
+
+Purpose:
+«Установка модели» of the FLUX.3 klein panel: the weight-format picker, the source-mode switch
+(«Скачать для меня» / «Своя папка»), the package folder row of manual mode, the Hugging Face
+download block of download mode (repository, licence page, token row with the access hint,
+check / plan / «Скачать» / «Отмена»), the residency line and «Выгрузить из памяти».
+
+Key functions:
+- `Flux3PanelCtx::draw_install_section()`, `draw_format_picker()`, `draw_source_mode_switch()`,
+  `Flux3PanelCtx::draw_download_block()`
+
+Notes:
+The section starts folded and opens ITSELF once, on the first definite non-ready verdict, unless
+the user already moved the fold (FLUX.2 klein's seeding rule); «Установить» on the readiness
+line opens it on the frame it is pressed. Presence comes from the last `.status` answer, never a
+filesystem probe (this runs on the GUI thread). The token is never formatted or logged here.
+*/
+
+use super::*;
+
+impl Flux3PanelCtx<'_> {
+    /// Draws «Установка модели». `open_requested` is «Установить», pressed this frame above.
+    pub(super) fn draw_install_section(&mut self, ui: &mut egui::Ui, open_requested: bool) {
+        ui.separator();
+        let section_id = ui.make_persistent_id("cleaning_flux3_klein_install_section");
+        let mut section = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), section_id, false);
+        // A fold that differs from what the previous frame left is the user's own click; it
+        // retires the one-shot seeding for good.
+        let user_moved = self.install_section_open_prev.is_some_and(|prev| prev != section.is_open());
+        if !*self.install_section_seeded {
+            match self.readiness {
+                Flux3ModelReadiness::Unknown => {}
+                Flux3ModelReadiness::Ready => *self.install_section_seeded = true,
+                Flux3ModelReadiness::Missing(_) | Flux3ModelReadiness::NoRoot => {
+                    if !user_moved {
+                        section.set_open(true);
+                    }
+                    *self.install_section_seeded = true;
+                }
+            }
+            if user_moved {
+                *self.install_section_seeded = true;
+            }
+        }
+        if open_requested {
+            section.set_open(true);
+        }
+        *self.install_section_open_prev = Some(section.is_open());
+        section
+            .show_header(ui, |ui| {
+                ui.label(t!("cleaning.tools.flux3_klein.install_heading"));
+            })
+            .body(|ui| {
+                draw_format_picker(ui, self.settings, &mut self.intents.settings_changed);
+                draw_source_mode_switch(ui, self.settings, &mut self.intents.settings_changed);
+                match self.settings.source_mode() {
+                    Flux3SourceMode::Manual => self.draw_model_root_row(ui),
+                    Flux3SourceMode::Download => self.draw_download_block(ui),
+                }
+                ui.separator();
+                self.draw_residency(ui);
+            });
+    }
+
+    /// The package folder of manual mode: an editable path with a folder picker, and what the
+    /// last answer says is inside it.
+    fn draw_model_root_row(&mut self, ui: &mut egui::Ui) {
+        ui.label(t!("cleaning.tools.flux3_klein.model_root_label")).on_hover_text(t!("cleaning.tools.flux3_klein.model_root_hint"));
+        ui.horizontal(|ui| {
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.settings.model_root)
+                    .id_salt("cleaning_flux3_klein_model_root")
+                    .hint_text(t!("cleaning.tools.flux3_klein.model_root_placeholder"))
+                    .desired_width(ui.available_width() - 32.0),
+            );
+            self.intents.settings_changed |= edit.on_hover_text(t!("cleaning.tools.flux3_klein.model_root_hint")).changed();
+            // A glyph is not prose; the meaning is on the hover.
+            if ui.small_button("📁").on_hover_text(t!("cleaning.tools.flux3_klein.browse_folder_tooltip")).clicked() {
+                self.intents.picker = Some(Flux3PickerPurpose::ModelRoot);
+            }
+        });
+        self.draw_package_parts(ui);
+    }
+
+    /// The three parts the selected format needs, each with its presence from the last answer
+    /// about the current root; nothing is claimed without one.
+    fn draw_package_parts(&mut self, ui: &mut egui::Ui) {
+        let format = self.settings.format();
+        let Some(status) = self.status.filter(|_| !matches!(self.readiness, Flux3ModelReadiness::Unknown | Flux3ModelReadiness::NoRoot)) else {
+            return;
+        };
+        let dit = status.format(format);
+        for (part, present, reason) in [
+            (Flux3Part::Dit(format), dit.available, dit.reason.as_str()),
+            (Flux3Part::Autoencoder, status.ae_present, ""),
+            (Flux3Part::TextEncoder, status.text_encoder_present, ""),
+        ] {
+            ui.horizontal_wrapped(|ui| {
+                let (mark, color) = if present { ("✓", ms_theme::status::SUCCESS) } else { ("✗", ms_theme::status::WARNING) };
+                ui.colored_label(color, mark);
+                let response = ui.small(part.label());
+                if !reason.is_empty() {
+                    // The backend's own words: the technical half of the verdict.
+                    response.on_hover_text(reason.to_string());
+                }
+            });
+        }
+    }
+
+    /// The download mode's body: the gated repository and its licence page, the token row,
+    /// where the files go, and the check / download controls — all for the selected format.
+    fn draw_download_block(&mut self, ui: &mut egui::Ui) {
+        ui.small(t!("cleaning.tools.flux3_klein.download_hint"));
+        ui.horizontal_wrapped(|ui| {
+            ui.small(tf!("cleaning.tools.flux3_klein.download_repo_status", repo = FLUX3_REPO));
+            ui.hyperlink_to(t!("cleaning.tools.flux3_klein.licence_link"), ms_widgets::hf_access_hint::hf_repo_url(FLUX3_REPO));
+        });
+        let hint = HfAccessHint::new("cleaning_flux3_klein_hf_access_hint", token_save_button_label()).repo(t!("cleaning.tools.flux3_klein.title"), FLUX3_REPO);
+        draw_hf_token_row(
+            ui,
+            HfTokenView { state: self.hf_token_state, input: &mut *self.hf_token_input, status: self.hf_token_status, busy: self.hf_token_busy },
+            "cleaning_flux3_klein_hf_token",
+            Some(hint),
+            &mut self.intents.hf_token_action,
+        );
+        ui.label(t!("cleaning.tools.flux3_klein.download_destination_label"));
+        // A path is data: selectable so it can be copied, never translated.
+        ui.add(egui::Label::new(egui::RichText::new(self.settings.effective_root()).small()).selectable(true));
+        self.draw_package_parts(ui);
+        let tooltip = tf!("cleaning.tools.flux3_klein.download_tooltip", format = self.settings.format().label());
+        draw_hf_download_controls(
+            ui,
+            &HfDownloadControlsView {
+                check: self.download_check,
+                check_error: self.download_check_error,
+                check_busy: self.download_check_busy,
+                download_busy: self.download_busy,
+                download_status: self.download_status,
+                ai_backend_available: self.ai_backend_available,
+                pipeline_busy: self.pipeline_busy,
+                download_tooltip: &tooltip,
+            },
+            &mut self.intents.download_action,
+        );
+    }
+
+    /// Where the model sits in memory right now, and the button that frees it.
+    fn draw_residency(&mut self, ui: &mut egui::Ui) {
+        if let Some(status) = self.status {
+            let place = |value: Option<&String>| value.map_or_else(|| t!("cleaning.tools.flux3_klein.residency_none").to_string(), Clone::clone);
+            if status.loaded || status.dit_device.is_some() || status.encoder_resident.is_some() {
+                ui.small(tf!(
+                    "cleaning.tools.flux3_klein.residency_status",
+                    dit = place(status.dit_device.as_ref()),
+                    encoder = place(status.encoder_resident.as_ref())
+                ));
+            } else {
+                ui.small(t!("cleaning.tools.flux3_klein.residency_unloaded_status"));
+            }
+        }
+        if gated_button(
+            ui,
+            self.ai_backend_available && !self.pipeline_busy,
+            t!("cleaning.tools.flux3_klein.unload_button"),
+            t!("cleaning.tools.flux3_klein.unload_hint"),
+            t!("cleaning.tools.flux3_klein.unload_disabled_tooltip"),
+        ) {
+            self.intents.unload = true;
+        }
+        if let Some(text) = self.unload_status {
+            ui.small(text);
+        }
+    }
+}
+
+/// The weight-format picker: what the run loads AND what the download fetches. The memory
+/// widget's format rows change the same setting from the forecast's side.
+fn draw_format_picker(ui: &mut egui::Ui, settings: &mut Flux3KleinSettings, changed: &mut bool) {
+    let mut format = settings.format();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(t!("cleaning.tools.flux3_klein.format_label")).on_hover_text(t!("cleaning.tools.flux3_klein.format_hint"));
+        WheelComboBox::from_id_salt("cleaning_flux3_klein_format")
+            .selected_text(format.label())
+            .show_ui(ui, |ui| {
+                for candidate in Flux3Format::all() {
+                    ui.selectable_value(&mut format, candidate, candidate.label()).on_hover_text(candidate.hint());
+                }
+            })
+            .response
+            .on_hover_text(format.hint());
+    });
+    if format.wire() != settings.format {
+        settings.format = format.wire().to_string();
+        *changed = true;
+    }
+}
+
+/// The source-mode switch: two toggle buttons (FLUX.2 klein's idiom), each under a stable salt
+/// — the mode's token — so a language switch cannot change which button egui sees.
+fn draw_source_mode_switch(ui: &mut egui::Ui, settings: &mut Flux3KleinSettings, changed: &mut bool) {
+    let active = settings.source_mode();
+    let mut picked = None;
+    ui.label(t!("cleaning.tools.flux3_klein.source_mode_label"));
+    ui.horizontal_wrapped(|ui| {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        for mode in Flux3SourceMode::all() {
+            let response = ui.push_id(mode.wire(), |ui| ui.add(egui::Button::new(mode.label()).selected(mode == active))).inner;
+            if response.on_hover_text(mode.hint()).clicked() {
+                picked = Some(mode);
+            }
+        }
+    });
+    if let Some(mode) = picked
+        && mode != active
+    {
+        settings.source_mode = mode.wire().to_string();
+        *changed = true;
+    }
+}

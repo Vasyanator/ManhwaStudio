@@ -8,8 +8,10 @@ the `engine` module; the long-operation plumbing it starts and drains lives in
 `actions.rs` beside it.
 
 Main responsibilities:
-- own `Flux2KleinEngine` — the settings and their save timer, the cached `.status`
-  catalog, the forecast, the progress, the session and every worker channel;
+- own `Flux2KleinEngine` — the settings and their saver (the shared `SettingsSaver`), the
+  cached `.status` catalog, the large-model forecast / caps / floor reset (the shared
+  `ResourcesController`), the token field (`HfTokenControl`), the progress, the session and
+  every worker channel;
 - implement `AiEngine`: the sections the host draws, the mask layer it declares, the
   frame constraints it validates against, the marks modes it accepts (a separate reference
   by preference, or composited onto the region — never a transparent layer), the run it
@@ -82,7 +84,14 @@ pub struct Flux2KleinEngine {
     /// only while `dirty` is clear — an edit the user has already made outranks the file.
     pub(super) settings: Flux2KleinSettings,
     /// Channel of the initial settings load, `None` once it has landed.
-    pub(super) settings_rx: Option<Receiver<Flux2KleinSettings>>,
+    pub(super) settings_rx: Option<Receiver<Flux2SettingsLoad>>,
+    /// What was wrong with the settings file, shown at the top of the panel: a damaged file
+    /// moved aside (cleared by the next edit) or one that could not be (kept: saving stays
+    /// blocked for the session).
+    pub(super) settings_problem: Option<SettingsProblem>,
+    /// The settings file could not be read or moved aside: it is NEVER written this
+    /// session, so nothing overwrites it.
+    pub(super) settings_save_blocked: bool,
     /// Whether the initial load has landed. Gates saving: writing before it would overwrite
     /// the user's file with the in-memory defaults.
     pub(super) settings_loaded: bool,
@@ -90,7 +99,10 @@ pub struct Flux2KleinEngine {
     /// makes a user edit outrank a settings load that lands afterwards
     /// ([`Self::poll_settings_load`]).
     pub(super) dirty: bool,
-    pub(super) save_rx: Option<Receiver<()>>,
+    /// The settings writer: the write in flight, its failure line and the retry backoff
+    /// (the shared `SettingsSaver`). Its `write` is [`save_flux2_settings`] in the product; a
+    /// test injects a failing one (it must never write the user's real file).
+    pub(super) saver: SettingsSaver<Flux2KleinSettings>,
     /// Component catalog; `None` until the first `.status` answer.
     pub(super) status: Option<Flux2Status>,
     pub(super) status_rx: Option<Receiver<Result<Flux2Status, String>>>,
@@ -142,19 +154,18 @@ pub struct Flux2KleinEngine {
     /// Entry an export dialog was opened for, captured when the dialog started so a
     /// selection changed while it was open cannot export the wrong entry.
     pub(super) prompt_cache_export_name: Option<String>,
-    pub(super) estimate: Option<Flux2Estimate>,
-    pub(super) estimate_rx: Option<Receiver<Result<Flux2Estimate, String>>>,
-    pub(super) estimate_error: Option<String>,
-    /// Same one-shot arming as `status_wanted`; re-armed whenever a parameter changed and,
-    /// for the geometry, only by a SETTLED region SIZE change ([`AiEngine::set_region`]), so
-    /// the forecast follows the controls without flooding the IPC from scrolling or dragging.
-    pub(super) estimate_wanted: bool,
+    /// The `large_models.profiles` forecast (at most one request in flight, latest wins) and
+    /// its one-shot arming, the «Пределы» caps buffer with its debounced writer, and the
+    /// learned-floor reset. Armed whenever a parameter changed and, for the geometry, only by
+    /// a SETTLED region SIZE change ([`AiEngine::set_region`]), so the forecast follows the
+    /// controls without flooding the IPC from scrolling or dragging.
+    pub(super) resources: ResourcesController,
     /// Whether a mask pixel was painted, as the host reported it the last time it drew the
-    /// panel's run options ([`AiEngine::draw_run_options`]). Only the `.estimate` query reads
+    /// panel's run options ([`AiEngine::draw_run_options`]). Only the forecast query reads
     /// it — whether «Внимание только к маске» is in effect moves the forecast — and a stale
     /// value costs at most one forecast; the RUN derives its mode from the mask it is handed.
     /// It goes stale whenever the panel is not drawn: while «Редактор области» is collapsed
-    /// or hidden, painting or clearing the mask does not reach it, so an `.estimate`
+    /// or hidden, painting or clearing the mask does not reach it, so a forecast
     /// dispatched by something else (a settled resize, a settings load) forecasts with the
     /// old attention-mask term until the panel is drawn again and the change re-arms the
     /// query. Bounded, accepted: one wrong forecast, never a wrong run.
@@ -170,15 +181,10 @@ pub struct Flux2KleinEngine {
     pub(super) component_action_pending: Option<(Flux2ComponentId, Flux2ComponentAction)>,
     /// User-facing line about the last component action, shown under the residency block.
     pub(super) component_action_status: Option<String>,
-    /// Buffer of the Hugging Face token field. NEVER persisted and never sent anywhere on
-    /// its own: it is only what «Сохранить» hands to the OS secret store, and it is
-    /// cleared as soon as the store accepts it, so the value does not linger on screen.
-    pub(super) hf_token_input: String,
-    /// A secret-store save or delete in flight. `Ok` carries the localized outcome line;
-    /// neither branch ever carries the token.
-    pub(super) hf_token_rx: Option<Receiver<Result<String, String>>>,
-    /// User-facing line about the last token operation, shown beside the badge.
-    pub(super) hf_token_status: Option<String>,
+    /// The Hugging Face token field and its secret-store worker. The buffer is NEVER
+    /// persisted and never sent anywhere on its own: it is only what «Сохранить» hands to the
+    /// OS secret store, cleared as soon as the store accepts it.
+    pub(super) hf_token: HfTokenControl,
     /// The last `.download.check` answer; `None` until one lands.
     pub(super) download_check: Option<Flux2DownloadCheck>,
     pub(super) download_check_rx: Option<Receiver<Result<Flux2DownloadCheck, String>>>,
@@ -192,7 +198,7 @@ pub struct Flux2KleinEngine {
     pub(super) translate_status: Option<String>,
     /// The open file dialog and what it was opened for; at most one at a time.
     pub(super) picker: Option<(Flux2PickerPurpose, ms_platform::file_dialog::PendingDialog)>,
-    pub(super) progress: Arc<Mutex<Flux2Progress>>,
+    pub(super) progress: Arc<Mutex<EngineProgress>>,
     pub(super) ai_backend_available: bool,
     /// Whether the prompt-cache LIBRARY is unfolded under the prompt block.
     ///
@@ -270,9 +276,11 @@ impl Flux2KleinEngine {
             run_status: None,
             settings: Flux2KleinSettings::default(),
             settings_rx: None,
+            settings_problem: None,
+            settings_save_blocked: false,
             settings_loaded: false,
             dirty: false,
-            save_rx: None,
+            saver: SettingsSaver::new(save_flux2_settings),
             status: None,
             status_rx: None,
             status_error: None,
@@ -291,18 +299,13 @@ impl Flux2KleinEngine {
             prompt_cache_selected: None,
             prompt_cache_name_input: String::new(),
             prompt_cache_export_name: None,
-            estimate: None,
-            estimate_rx: None,
-            estimate_error: None,
-            estimate_wanted: false,
+            resources: ResourcesController::new(FLUX2_LARGE_MODEL, FLUX2_LOG_LABEL),
             unload_rx: None,
             unload_status: None,
             component_action_rx: None,
             component_action_pending: None,
             component_action_status: None,
-            hf_token_input: String::new(),
-            hf_token_rx: None,
-            hf_token_status: None,
+            hf_token: HfTokenControl::default(),
             download_check: None,
             download_check_rx: None,
             download_check_error: None,
@@ -311,7 +314,7 @@ impl Flux2KleinEngine {
             translate_rx: None,
             translate_status: None,
             picker: None,
-            progress: Arc::new(Mutex::new(Flux2Progress::default())),
+            progress: Arc::new(Mutex::new(EngineProgress::default())),
             mask_painted: false,
             ai_backend_available: false,
             prompt_library_open: false,
@@ -349,7 +352,11 @@ impl Flux2KleinEngine {
     ///
     /// The memory forecast is re-armed only when the load actually replaced the settings: a
     /// discarded document changes nothing, and the edit that outranked it armed the forecast
-    /// through [`Self::note_settings_changed`] already.
+    /// through [`Self::note_settings_changed`] already. A MIGRATED document marks the
+    /// settings dirty, so it is written back once without the retired placement fields.
+    ///
+    /// A damaged settings file is reported (`settings_problem`) and, when it could not be
+    /// moved aside, blocks saving for the session whichever document wins.
     ///
     /// A disconnected channel keeps the in-memory settings and unblocks saving, so a crashed
     /// loader cannot freeze persistence forever.
@@ -358,10 +365,13 @@ impl Flux2KleinEngine {
             return;
         };
         match rx.try_recv() {
-            Ok(settings) => {
+            Ok(load) => {
+                self.settings_save_blocked = load.save_blocked();
+                self.settings_problem = load.problem.clone();
                 if !self.dirty {
-                    self.settings = settings;
-                    self.estimate_wanted = true;
+                    self.settings = load.settings;
+                    self.resources.arm();
+                    self.dirty = load.migrated;
                 }
                 self.settings_loaded = true;
                 self.settings_rx = None;
@@ -379,30 +389,23 @@ impl Flux2KleinEngine {
     ///
     /// It is driven from [`AiEngine::poll`] and from nowhere else, which is why the host must
     /// poll the selected engine EVERY frame, panel visible or not: without that call nothing
-    /// ever writes the settings file and every model path, memory preset and prompt is lost on
+    /// ever writes the settings file and every model path, memory step and prompt is lost on
     /// exit, with no error anywhere.
+    ///
+    /// A settings file that could not be read or moved aside is never written: the edits
+    /// stay in memory (`dirty` kept) and the panel says why.
+    ///
+    /// A FAILED write is not success: `dirty` is restored, the localized reason is shown
+    /// (`saver.error`), and the next attempt waits the shared `save_retry_delay` (2 s
+    /// doubling to 60 s). A successful write clears all of it.
     pub(super) fn poll_and_maybe_save(&mut self) {
-        if let Some(rx) = self.save_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(()) | Err(TryRecvError::Disconnected) => self.save_rx = None,
-                Err(TryRecvError::Empty) => return,
-            }
-        }
-        if !settings_save_due(self.dirty, self.settings_loaded, self.save_rx.is_some()) {
-            return;
-        }
-        self.dirty = false;
-        let settings = self.settings.clone();
-        let (tx, rx) = mpsc::channel();
-        self.save_rx = Some(rx);
-        thread::spawn(move || {
-            if let Err(err) = save_flux2_settings(&settings) {
-                ms_log::runtime_log::log_warn(format!(
-                    "[cleaning] failed to save FLUX.2 klein settings: {err}"
-                ));
-            }
-            let _ = tx.send(());
-        });
+        self.saver.poll(
+            Instant::now(),
+            SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: self.settings_save_blocked },
+            &self.settings,
+            FLUX2_LOG_LABEL,
+            |err| tf!("cleaning.tools.flux2_klein.settings_save_error", err = err),
+        );
     }
 
     /// Polls the `.status` query and arms a new one when it is wanted, the backend is
@@ -534,9 +537,15 @@ impl Flux2KleinEngine {
     /// alone cannot make it stale — and arming unconditionally would fire an IPC per frame
     /// of a dragged wheel. A typed or pasted path correction reaches the backend through
     /// here; only the folder picker arms the query on its own.
+    ///
+    /// The one-off "the damaged file was moved aside" notice retires with the first edit;
+    /// a blocked save keeps its line.
     pub(super) fn note_settings_changed(&mut self) {
         self.dirty = true;
-        self.estimate_wanted = true;
+        self.resources.arm();
+        if matches!(self.settings_problem, Some(SettingsProblem::MovedAside(_))) {
+            self.settings_problem = None;
+        }
         if flux2_status_paths_stale(
             &self.settings.effective_paths(),
             self.status_paths.as_ref(),
@@ -546,45 +555,43 @@ impl Flux2KleinEngine {
         }
     }
 
-    /// Polls the `.estimate` query and sends a new one when something armed
-    /// `estimate_wanted`. `region` is the frame rectangle's size; without a frame there is
-    /// nothing to forecast and the arming is kept for the next frame that has one.
-    pub(super) fn poll_and_maybe_query_estimate(&mut self, region: Option<[usize; 2]>) {
-        if let Some(rx) = self.estimate_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(Ok(estimate)) => {
-                    self.estimate = Some(estimate);
-                    self.estimate_error = None;
-                    self.estimate_rx = None;
-                }
-                Ok(Err(err)) => {
-                    self.estimate_error = Some(err);
-                    self.estimate_rx = None;
-                }
-                Err(TryRecvError::Disconnected) => self.estimate_rx = None,
-                Err(TryRecvError::Empty) => {}
-            }
+    /// Drains the forecast query and asks the next question when one is armed
+    /// ([`ResourcesController::poll_query`]). `region` is the frame rectangle's size; the
+    /// engine's gate is a reachable backend and no long operation holding it.
+    pub(super) fn poll_and_maybe_query_profiles(&mut self, region: Option<[usize; 2]>) {
+        let gate_open = self.ai_backend_available && !self.pipeline_busy();
+        let Self { resources, settings, mask_painted, .. } = self;
+        resources.poll_query(region, gate_open, |size| Self::profiles_request(settings, *mask_painted, size));
+    }
+
+    /// The forecast question for the current settings and a `size` region.
+    ///
+    /// The forecast is about memory, which the working mode barely moves: the peak is set by
+    /// the weights and the region size, not by which pixels the mask permits. The one
+    /// exception is the prompt-attention mask, counted while it is in effect.
+    ///
+    /// An associated function over the two fields it reads (`settings`, `mask_painted`), so
+    /// the query can be built while `resources` is borrowed mutably.
+    pub(super) fn profiles_request(settings: &Flux2KleinSettings, mask_painted: bool, size: [usize; 2]) -> ProfilesRequest {
+        let normalized = settings.normalized();
+        let side = |px: usize| u32::try_from(px).unwrap_or(u32::MAX);
+        ProfilesRequest {
+            model: FLUX2_LARGE_MODEL.to_string(),
+            params: normalized.to_profiles_params(mask_painted),
+            region: [side(size[0]), side(size[1])],
+            steps: Some(normalized.steps),
+            // FLUX.2 has one weight format; the backend's best is the only one.
+            format: None,
+            choice: normalized.step_choice(),
+            // FLUX.2 conditions on no reference images of its own: no `shape.references`.
+            references: Vec::new(),
         }
-        let Some([width, height]) = region else {
-            return;
-        };
-        if !self.estimate_wanted
-            || !self.ai_backend_available
-            || self.estimate_rx.is_some()
-            || self.pipeline_busy()
-        {
-            return;
-        }
-        self.estimate_wanted = false;
-        // The forecast is about memory, which the working mode barely moves: the peak is set
-        // by the weights and the region size, not by which pixels the mask permits. The one
-        // exception is the prompt-attention mask, counted while it is in effect.
-        let params = self.settings.normalized().to_estimate_params(self.mask_painted);
-        let (tx, rx) = mpsc::channel();
-        self.estimate_rx = Some(rx);
-        thread::spawn(move || {
-            let _ = tx.send(fetch_flux2_estimate(&params, width, height));
-        });
+    }
+
+    /// Marks the held forecast stale and re-arms it: the machine changed under it (a run
+    /// finished, weights moved, the caps or the learned floor changed, the backend came back).
+    pub(super) fn invalidate_forecast(&mut self) {
+        self.resources.invalidate();
     }
 
     /// Drains the unload channel into the status line under the parameter section.
@@ -618,7 +625,7 @@ impl Flux2KleinEngine {
             self.prompt_cache_rx.is_some(),
             self.component_action_rx.is_some(),
             self.download_rx.is_some(),
-        )
+        ) || self.session.abandoned.busy()
     }
 
     /// The same rule with the GENERATION taken out: true while an operation OTHER than a
@@ -629,13 +636,16 @@ impl Flux2KleinEngine {
     /// must not read nothing, because a generation started under a `.prompt_cache.build`,
     /// a `.component_action` or a multi-hour model download would queue behind it and
     /// steal its progress bar.
+    ///
+    /// A CANCELLED run or download whose worker has not ended counts too: it still holds the
+    /// backend, and a run started now would queue behind it (`session.abandoned`).
     pub(super) fn non_run_pipeline_busy(&self) -> bool {
         flux2_pipeline_busy(
             false,
             self.prompt_cache_rx.is_some(),
             self.component_action_rx.is_some(),
             self.download_rx.is_some(),
-        )
+        ) || self.session.abandoned.busy()
     }
 
     /// Size requirements this engine imposes on the frame rectangle, in source page pixels.
@@ -813,14 +823,15 @@ impl AiEngine for Flux2KleinEngine {
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
         let mut settings_changed = false;
         let mut want_status = false;
-        let mut want_estimate = false;
+        let mut want_forecast = false;
+        let mut resources_actions: Vec<ResourcesAction> = Vec::new();
         let mut unload_requested = false;
         let mut translate_requested = false;
         let mut prompt_cache_action: Option<Flux2PromptCacheAction> = None;
         let mut component_action: Option<(Flux2ComponentId, Flux2ComponentAction)> = None;
         let mut picker_requested: Option<Flux2PickerPurpose> = None;
-        let mut hf_token_action: Option<Flux2HfTokenAction> = None;
-        let mut download_action: Option<Flux2DownloadAction> = None;
+        let mut hf_token_action: Option<HfTokenAction> = None;
+        let mut download_action: Option<HfDownloadAction> = None;
         // Read before the destructure: it is a process-wide global, not a field the
         // context can borrow.
         let hf_token_state = ms_sysprobe::hf_token::hf_token_state();
@@ -844,13 +855,13 @@ impl AiEngine for Flux2KleinEngine {
                 settings,
                 status,
                 status_error,
-                estimate,
-                estimate_error,
+                resources,
+                settings_problem,
+                saver,
                 unload_status,
                 component_action_status,
                 translate_status,
                 translate_rx,
-                estimate_rx,
                 prompt_cache_rx,
                 prompt_cache_status,
                 prompt_cache_warning,
@@ -862,9 +873,7 @@ impl AiEngine for Flux2KleinEngine {
                 prompt_library_open,
                 install_section_seeded,
                 install_section_open_prev,
-                hf_token_input,
-                hf_token_rx,
-                hf_token_status,
+                hf_token,
                 download_check,
                 download_check_rx,
                 download_check_error,
@@ -878,14 +887,14 @@ impl AiEngine for Flux2KleinEngine {
                 settings,
                 status: status.as_ref(),
                 status_error: status_error.as_deref(),
-                estimate: estimate.as_ref(),
-                estimate_error: estimate_error.as_deref(),
+                resources: resources.view(*ai_backend_available),
+                settings_problem: settings_problem.as_ref(),
+                save_error: saver.error.as_deref(),
                 unload_status,
                 component_action_status: component_action_status.as_deref(),
                 pipeline_busy,
                 translate_status: translate_status.as_deref(),
                 translate_busy: translate_rx.is_some(),
-                estimate_busy: estimate_rx.is_some(),
                 prompt_cache_state,
                 prompt_cache_status: prompt_cache_status.as_deref(),
                 prompt_cache_warning: prompt_cache_warning.as_deref(),
@@ -900,9 +909,9 @@ impl AiEngine for Flux2KleinEngine {
                 install_section_open_prev,
                 readiness,
                 hf_token_state,
-                hf_token_input,
-                hf_token_status: hf_token_status.as_deref(),
-                hf_token_busy: hf_token_rx.is_some(),
+                hf_token_busy: hf_token.busy(),
+                hf_token_input: &mut hf_token.input,
+                hf_token_status: hf_token.status.as_deref(),
                 download_check: download_check.as_ref().filter(|_| download_check_current),
                 download_check_error: download_check_error.as_deref(),
                 download_check_busy: download_check_rx.is_some(),
@@ -911,7 +920,8 @@ impl AiEngine for Flux2KleinEngine {
                 ai_backend_available: *ai_backend_available,
                 settings_changed: &mut settings_changed,
                 want_status: &mut want_status,
-                want_estimate: &mut want_estimate,
+                want_forecast: &mut want_forecast,
+                resources_actions: &mut resources_actions,
                 unload_requested: &mut unload_requested,
                 translate_requested: &mut translate_requested,
                 prompt_cache_action: &mut prompt_cache_action,
@@ -935,8 +945,21 @@ impl AiEngine for Flux2KleinEngine {
         if want_status {
             self.status_wanted = true;
         }
-        if want_estimate {
-            self.estimate_wanted = true;
+        if want_forecast {
+            // The refresh button: the staleness it exists for is caused outside the app (another
+            // process took memory), so the same question must be asked again.
+            self.invalidate_forecast();
+        }
+        // The widget already wrote a picked step pair into the settings it was handed; a
+        // suggestion is written here, and the caps and the floor reset go to the controller.
+        let mut choice = self.settings.step_choice();
+        let before = choice;
+        let mut resources_changed = self.resources.fold(resources_actions, &mut choice, None);
+        if choice != before {
+            resources_changed |= self.settings.set_step_choice(choice);
+        }
+        if resources_changed {
+            self.note_settings_changed();
         }
         if translate_requested {
             self.start_translate();
@@ -959,15 +982,13 @@ impl AiEngine for Flux2KleinEngine {
         if let Some((id, action)) = component_action {
             self.start_component_action(id, action);
         }
-        match hf_token_action {
-            Some(Flux2HfTokenAction::Save) => self.start_store_hf_token(),
-            Some(Flux2HfTokenAction::Delete) => self.start_clear_hf_token(),
-            None => {}
+        if let Some(action) = hf_token_action {
+            self.hf_token.apply(action);
         }
         match download_action {
-            Some(Flux2DownloadAction::Check) => self.start_download_check(),
-            Some(Flux2DownloadAction::Start) => self.start_download(),
-            Some(Flux2DownloadAction::Cancel) => self.cancel_download(),
+            Some(HfDownloadAction::Check) => self.start_download_check(),
+            Some(HfDownloadAction::Start) => self.start_download(),
+            Some(HfDownloadAction::Cancel) => self.cancel_download(),
             None => {}
         }
         if let Some(purpose) = picker_requested {
@@ -1005,7 +1026,7 @@ impl AiEngine for Flux2KleinEngine {
         if self.mask_painted != ctx.mask_painted {
             self.mask_painted = ctx.mask_painted;
             if self.settings.text_attention_in_mask {
-                self.estimate_wanted = true;
+                self.resources.arm();
             }
         }
         // Same per-variant id namespace as the parameter body.
@@ -1071,7 +1092,7 @@ impl AiEngine for Flux2KleinEngine {
         // A run may have to load weights it did not have; the catalog and the forecast are
         // stale afterwards.
         self.status_wanted = true;
-        self.estimate_wanted = true;
+        self.resources.arm();
         // CLEARED, not set to «идёт обработка»: that sentence is already on screen three
         // times over — the progress bar this line sits under, the host's panel status line
         // and the frame's own chrome — and a fourth copy only pushed the panel down. What
@@ -1086,6 +1107,11 @@ impl AiEngine for Flux2KleinEngine {
     /// Called whether the parameter panel is drawn or not, which is why all the polling
     /// lives here: a finished run must land even while the panel is closed.
     fn poll(&mut self, ctx: &egui::Context) -> EnginePoll {
+        // A cancelled worker that has not ended keeps the pipeline busy and wakes the GUI
+        // until it does, so the gate reopens without user input.
+        if self.session.abandoned.poll() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         self.poll_settings_load();
         self.poll_and_maybe_query_status();
         self.poll_unload();
@@ -1098,6 +1124,8 @@ impl AiEngine for Flux2KleinEngine {
         self.poll_download();
         self.poll_picker();
 
+        self.resources.poll_side_jobs(Instant::now());
+
         let mut settings_changed = false;
         let run = self.session.poll_run(
             &mut self.settings,
@@ -1107,10 +1135,19 @@ impl AiEngine for Flux2KleinEngine {
         if settings_changed {
             self.note_settings_changed();
         }
+        if matches!(run, Flux2RunPoll::Done(_) | Flux2RunPoll::Failed(_)) {
+            // A finished run loaded weights, may have degraded and taught the backend a floor:
+            // every held forecast describes a machine that no longer exists.
+            self.invalidate_forecast();
+        }
 
         let region = self.region_size();
-        self.poll_and_maybe_query_estimate(region);
+        self.poll_and_maybe_query_profiles(region);
         self.poll_and_maybe_save();
+        // A cap edit waits for its quiet time with no input event to wake the GUI.
+        if self.resources.wants_repaint() || self.saver.retry_pending() {
+            ctx.request_repaint_after(LIMITS_EDIT_DEBOUNCE);
+        }
 
         match run {
             Flux2RunPoll::Idle => EnginePoll::Idle,
@@ -1132,7 +1169,12 @@ impl AiEngine for Flux2KleinEngine {
         }
     }
 
+    /// A backend that came (back) up answers about a fresh process: the forecast is asked
+    /// again.
     fn set_backend_available(&mut self, available: bool) {
+        if available && !self.ai_backend_available {
+            self.invalidate_forecast();
+        }
         self.ai_backend_available = available;
     }
 
@@ -1145,7 +1187,7 @@ impl AiEngine for Flux2KleinEngine {
     /// change.
     ///
     /// The rectangle itself is stored unconditionally, so the status line keeps printing the
-    /// live size while the user drags. The `.estimate` round trip is what is gated, on two
+    /// live size while the user drags. The forecast round trip is what is gated, on two
     /// rules that are one bug each if dropped:
     /// - the forecast depends on the SIZE alone, so a pure position change arms nothing —
     ///   the host pushes this every frame and the frame's keep-in-view clamp moves the
@@ -1175,7 +1217,7 @@ impl AiEngine for Flux2KleinEngine {
         }
         if self.region_resize_pending && geometry_settled {
             self.region_resize_pending = false;
-            self.estimate_wanted = true;
+            self.resources.arm();
         }
     }
 }
@@ -1183,6 +1225,7 @@ impl AiEngine for Flux2KleinEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 
     /// The undo entries describe the rectangle they were captured from, so a frame that
     /// moves or resizes invalidates them. `same_region` is what decides that, because
@@ -1232,8 +1275,7 @@ mod tests {
         // Exactly what `start_download_check` stamps: the EFFECTIVE toggle and the echoed
         // checkpoint.
         engine.download_check = Some(Flux2DownloadCheck {
-            uncensored: engine.settings.uncensored_encoder_active(),
-            variant: Flux2Variant::Klein4B,
+            question: Flux2CheckQuestion { uncensored: engine.settings.uncensored_encoder_active(), variant: Flux2Variant::Klein4B },
             ..Default::default()
         });
         assert!(
@@ -1258,8 +1300,7 @@ mod tests {
         engine.settings.uncensored_text_encoder = true;
         assert!(engine.settings.uncensored_encoder_active());
         engine.download_check = Some(Flux2DownloadCheck {
-            uncensored: false,
-            variant: Flux2Variant::Klein9B,
+            question: Flux2CheckQuestion { uncensored: false, variant: Flux2Variant::Klein9B },
             ..Default::default()
         });
         assert!(!engine.download_check_current());
@@ -1301,7 +1342,7 @@ mod tests {
         let mut engine = Flux2KleinEngine { settings_loaded: false, dirty: true, ..Default::default() };
         engine.poll_and_maybe_save();
         assert!(engine.dirty, "the change must survive until it can be written");
-        assert!(engine.save_rx.is_none(), "and no writer may have been started");
+        assert!(engine.saver.rx.is_none(), "and no writer may have been started");
     }
 
     /// An edit made before the load lands survives it: the file is discarded, the edit stays,
@@ -1322,7 +1363,7 @@ mod tests {
         engine.settings.steps = FLUX2_STEPS_MIN;
         engine.note_settings_changed();
 
-        assert!(tx.send(from_file).is_ok(), "the test channel must accept the settings");
+        assert!(tx.send(plain_load(from_file)).is_ok(), "the test channel must accept the settings");
         engine.poll_settings_load();
 
         assert_eq!(
@@ -1334,7 +1375,7 @@ mod tests {
         // The save GATE is asserted rather than driven: `poll_and_maybe_save` would write
         // the real settings file of whoever runs the test suite.
         assert!(
-            settings_save_due(engine.dirty, engine.settings_loaded, engine.save_rx.is_some()),
+            settings_save_due(engine.dirty, engine.settings_loaded, engine.saver.rx.is_some()),
             "the surviving edit is what gets written next"
         );
     }
@@ -1351,7 +1392,7 @@ mod tests {
         };
 
         let from_file = Flux2KleinSettings { steps: FLUX2_STEPS_MAX, ..runnable_settings() };
-        assert!(tx.send(from_file).is_ok(), "the test channel must accept the settings");
+        assert!(tx.send(plain_load(from_file)).is_ok(), "the test channel must accept the settings");
         engine.poll_settings_load();
 
         assert_eq!(engine.settings.steps, FLUX2_STEPS_MAX);
@@ -1360,12 +1401,12 @@ mod tests {
 
     /// The host pushes the rectangle EVERY frame, and the frame's keep-in-view clamp moves it
     /// whenever the canvas is scrolled — so a position change must cost nothing. It used to
-    /// arm one `.estimate` round trip per scrolled frame.
+    /// arm one forecast round trip per scrolled frame.
     #[test]
     fn a_position_only_change_does_not_arm_the_forecast() {
         let mut engine = engine_with_settled_region();
         engine.set_region(region_rect(64, 32, 128, 128), true);
-        assert!(!engine.estimate_wanted, "the forecast depends on the size alone");
+        assert!(!engine.resources.wanted, "the forecast depends on the size alone");
         assert!(
             engine.region.is_some_and(|rect| rect.x == 64 && rect.y == 32),
             "the rectangle itself must still follow the frame, so the status line stays live"
@@ -1378,7 +1419,7 @@ mod tests {
     fn a_size_change_while_the_geometry_is_unsettled_does_not_arm_the_forecast() {
         let mut engine = engine_with_settled_region();
         engine.set_region(region_rect(0, 0, 192, 128), false);
-        assert!(!engine.estimate_wanted, "nothing may be queried mid-gesture");
+        assert!(!engine.resources.wanted, "nothing may be queried mid-gesture");
         assert!(
             engine.region.is_some_and(|rect| rect.w == 192),
             "the dragged size must still be displayed"
@@ -1390,11 +1431,11 @@ mod tests {
     fn a_settled_size_change_arms_the_forecast_exactly_once() {
         let mut engine = engine_with_settled_region();
         engine.set_region(region_rect(0, 0, 192, 128), true);
-        assert!(engine.estimate_wanted, "a settled resize must re-arm the forecast");
-        engine.estimate_wanted = false;
+        assert!(engine.resources.wanted, "a settled resize must re-arm the forecast");
+        engine.resources.wanted = false;
         // The host keeps pushing the same rectangle every frame afterwards.
         engine.set_region(region_rect(0, 0, 192, 128), true);
-        assert!(!engine.estimate_wanted, "the arming must not repeat on the next frames");
+        assert!(!engine.resources.wanted, "the arming must not repeat on the next frames");
     }
 
     /// The sizes a drag passes through are one change, not many: the pending flag survives
@@ -1404,13 +1445,13 @@ mod tests {
         let mut engine = engine_with_settled_region();
         engine.set_region(region_rect(0, 0, 160, 128), false);
         engine.set_region(region_rect(0, 0, 192, 128), false);
-        assert!(!engine.estimate_wanted, "still mid-drag");
+        assert!(!engine.resources.wanted, "still mid-drag");
         // The release frame carries the same rectangle as the last dragged one.
         engine.set_region(region_rect(0, 0, 192, 128), true);
-        assert!(engine.estimate_wanted, "the finished resize must arm the forecast");
-        engine.estimate_wanted = false;
+        assert!(engine.resources.wanted, "the finished resize must arm the forecast");
+        engine.resources.wanted = false;
         engine.set_region(region_rect(0, 0, 192, 128), true);
-        assert!(!engine.estimate_wanted, "and exactly once");
+        assert!(!engine.resources.wanted, "and exactly once");
     }
 
     /// The setter runs every frame with an unchanged rectangle for as long as the user does
@@ -1421,24 +1462,147 @@ mod tests {
         for _ in 0..3 {
             engine.set_region(region_rect(0, 0, 128, 128), true);
         }
-        assert!(!engine.estimate_wanted, "an idle frame must be silent");
+        assert!(!engine.resources.wanted, "an idle frame must be silent");
+    }
+
+    /// A load as the worker sends it for a healthy, current document.
+    fn plain_load(settings: Flux2KleinSettings) -> Flux2SettingsLoad {
+        Flux2SettingsLoad { settings, migrated: false, problem: None }
+    }
+
+    /// A migrated document is written back once (dirty), without the retired fields.
+    #[test]
+    fn a_migrated_load_is_written_back_once() {
+        let (tx, rx) = mpsc::channel();
+        let mut engine = Flux2KleinEngine { settings_rx: Some(rx), ..Flux2KleinEngine::default() };
+        let load = Flux2SettingsLoad { migrated: true, ..plain_load(runnable_settings()) };
+        assert!(tx.send(load).is_ok(), "the test channel must accept the load");
+        engine.poll_settings_load();
+        assert!(engine.dirty, "the migrated document owes one save");
+        assert!(settings_save_due(engine.dirty, engine.settings_loaded, engine.saver.rx.is_some()));
+    }
+
+    /// A settings file that could be neither read nor moved aside is never written: the save
+    /// stays pending and no writer starts, edits or not.
+    #[test]
+    fn a_blocked_settings_file_is_never_saved() {
+        let (tx, rx) = mpsc::channel();
+        let mut engine = Flux2KleinEngine { settings_rx: Some(rx), ..Flux2KleinEngine::default() };
+        let load = Flux2SettingsLoad {
+            problem: Some(SettingsProblem::SaveBlocked("denied".to_string())),
+            ..plain_load(runnable_settings())
+        };
+        assert!(tx.send(load).is_ok(), "the test channel must accept the load");
+        engine.poll_settings_load();
+        assert!(engine.settings_save_blocked);
+        engine.settings.steps += 1;
+        engine.note_settings_changed();
+        engine.poll_and_maybe_save();
+        assert!(engine.saver.rx.is_none(), "no writer may touch the damaged file");
+        assert!(engine.dirty, "the edit is kept in memory");
+        assert!(
+            matches!(engine.settings_problem, Some(SettingsProblem::SaveBlocked(_))),
+            "the blocked line stays: it is not a one-off notice"
+        );
+    }
+
+    /// A failed write is not success: the edit stays pending, the error is visible, the retry
+    /// waits for its backoff, and a later success clears everything.
+    #[test]
+    fn a_failed_save_keeps_the_edit_pending_and_retries_later() {
+        fn failing(_: &Flux2KleinSettings) -> Result<(), String> {
+            Err("disk full".to_string())
+        }
+        fn succeeding(_: &Flux2KleinSettings) -> Result<(), String> {
+            Ok(())
+        }
+        let mut engine = Flux2KleinEngine { settings_loaded: true, dirty: true, saver: SettingsSaver::new(failing), ..Flux2KleinEngine::default() };
+        engine.poll_and_maybe_save();
+        assert!(engine.saver.rx.is_some(), "the write started");
+        for _ in 0..2000 {
+            engine.poll_and_maybe_save();
+            if engine.saver.rx.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(engine.dirty, "the unsaved edit is still pending");
+        assert!(engine.saver.error.is_some(), "and the failure is visible");
+        assert_eq!(engine.saver.failures, 1);
+        assert!(engine.saver.retry_at.is_some());
+        engine.poll_and_maybe_save();
+        assert!(engine.saver.rx.is_none(), "no retry before the backoff elapsed");
+
+        // The backoff elapses; the next attempt succeeds and clears the failure state.
+        engine.saver.retry_at = Some(Instant::now());
+        engine.saver.write = succeeding;
+        engine.poll_and_maybe_save();
+        assert!(engine.saver.rx.is_some(), "retried once the backoff elapsed");
+        for _ in 0..2000 {
+            engine.poll_and_maybe_save();
+            if engine.saver.rx.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(!engine.dirty);
+        assert!(engine.saver.error.is_none() && engine.saver.retry_at.is_none());
+        assert_eq!(engine.saver.failures, 0);
+    }
+
+    /// The moved-aside notice is a one-off: the first edit retires it.
+    #[test]
+    fn the_moved_aside_notice_retires_with_the_first_edit() {
+        let mut engine = Flux2KleinEngine {
+            settings_problem: Some(SettingsProblem::MovedAside(PathBuf::from("/tmp/x.malformed-1.json"))),
+            ..Flux2KleinEngine::default()
+        };
+        engine.note_settings_changed();
+        assert!(engine.settings_problem.is_none());
+    }
+
+    /// The forecast question carries the adapter name, the region, the steps and the user's
+    /// step pair; FLUX.2 never names a format.
+    #[test]
+    fn the_forecast_request_describes_the_current_settings() {
+        let mut engine = Flux2KleinEngine { settings: runnable_settings(), ..Flux2KleinEngine::default() };
+        engine.settings.set_step_choice(StepChoice { vram: VramStep::Half, ram: RamStep::Run });
+        let req = Flux2KleinEngine::profiles_request(&engine.settings, engine.mask_painted, [512, 768]);
+        assert_eq!(req.model, "flux2_klein");
+        assert_eq!(req.region, [512, 768]);
+        assert_eq!(req.steps, Some(4));
+        assert_eq!(req.format, None);
+        assert_eq!(req.choice, StepChoice { vram: VramStep::Half, ram: RamStep::Run });
+        assert_eq!(req.params["vram_step"], json!("half"));
+    }
+
+    /// A backend that comes (back) up invalidates the held forecast and re-arms it.
+    #[test]
+    fn a_reconnect_rearms_the_forecast() {
+        let mut engine = engine_with_settled_region();
+        engine.ai_backend_available = false;
+        engine.set_backend_available(true);
+        assert!(engine.resources.wanted);
+        engine.resources.wanted = false;
+        engine.set_backend_available(true);
+        assert!(!engine.resources.wanted, "staying connected is not a reconnect");
     }
 
     /// Regression guard for the fix above: gating the GEOMETRY must not disarm the forecast
     /// as a whole. Everything that is not the rectangle still arms it — here the settings
-    /// load, which carries the memory preset, the placement and the model paths.
+    /// load, which carries the memory steps and the model paths.
     #[test]
     fn a_settings_change_still_arms_the_forecast() {
         let (tx, rx) = mpsc::channel();
-        assert!(tx.send(runnable_settings()).is_ok(), "the test channel must accept the settings");
+        assert!(tx.send(plain_load(runnable_settings())).is_ok(), "the test channel must accept the settings");
         let mut engine = Flux2KleinEngine {
             settings_rx: Some(rx),
-            estimate_wanted: false,
+            // `resources.wanted` starts unarmed: only the load below may arm it.
             ..Flux2KleinEngine::default()
         };
         engine.poll_settings_load();
         assert!(engine.settings_loaded, "the load must have landed");
-        assert!(engine.estimate_wanted, "loaded settings describe another forecast");
+        assert!(engine.resources.wanted, "loaded settings describe another forecast");
     }
 
     /// The host promises that the region and every mask buffer are exactly `rect_px`.
@@ -1605,7 +1769,7 @@ mod tests {
         engine.settings.mask_dilate_px = 0;
         engine.settings.mask_feather_px = 0;
         engine.settings.color_match = false;
-        MemoryPreset::MinRam.apply(&mut engine.settings);
+        engine.settings.set_step_choice(StepChoice { vram: VramStep::Min, ram: RamStep::Min });
         assert!(engine.allows_empty_mask(), "no parameter may gate the empty-mask rule");
 
         // Every other gate still applies.
@@ -1632,7 +1796,7 @@ mod tests {
             status: Some(status_with_present(&FLUX2_ALL_COMPONENTS)),
             status_paths: Some(asked_about.clone()),
             status_wanted: false,
-            estimate_wanted: false,
+            // `resources.wanted` starts unarmed, like `status_wanted` above.
             dirty: false,
             ..Flux2KleinEngine::default()
         };
@@ -1641,7 +1805,7 @@ mod tests {
         let mut typed = engine_at_rest();
         typed.settings.transformer_path = "/models/flux2-corrected.safetensors".to_string();
         typed.note_settings_changed();
-        assert!(typed.dirty && typed.estimate_wanted);
+        assert!(typed.dirty && typed.resources.wanted);
         assert!(
             typed.status_wanted,
             "a typed path must re-ask the catalog — only the picker armed it before"
@@ -1652,7 +1816,7 @@ mod tests {
         let mut steps = engine_at_rest();
         steps.settings.steps += 1;
         steps.note_settings_changed();
-        assert!(steps.dirty && steps.estimate_wanted);
+        assert!(steps.dirty && steps.resources.wanted);
         assert!(
             !steps.status_wanted,
             "a parameter that leaves the paths alone must not re-ask the catalog"

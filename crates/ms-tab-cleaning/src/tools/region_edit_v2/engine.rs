@@ -246,6 +246,10 @@ pub struct RunOptionsCtx {
     /// At least one mask layer holds a painted pixel (`MaskStack::is_empty` is `false`). The
     /// marks layer does not count: it is never a permission mask.
     pub mask_painted: bool,
+    /// A run started now would carry `RunMarks::Reference`: marks are drawn and the marks mode
+    /// in force for this engine is «Отдельный референс». An engine whose forecast counts its
+    /// reference images (FLUX.3 klein) counts this one too.
+    pub marks_reference: bool,
 }
 
 /// One AI engine a region-editing host can run.

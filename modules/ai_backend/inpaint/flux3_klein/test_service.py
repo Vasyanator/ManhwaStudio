@@ -10,7 +10,9 @@ before / at the admission touches nothing, a failed load registers nothing, a
 failed run keeps the handle and releases what its frames held, the reference
 rules (VL images = AE images, the reference cap, the crop), `health()` while
 the lock is held and read from the manager's ledger (a reclaim park seen live),
-`unload`, a residency-key change, the key format.
+`unload`, a residency-key change, the key format; the step callback, «Энкодер
+на CPU» (the encoder on the CPU at every VRAM step), a cancel that unloads
+nothing, the `large_models.profiles` adapter and `status`.
 
 Notes:
 CPU only, no weights (stand-in modules in tiny real safetensors files); the
@@ -326,6 +328,102 @@ class HealthTests(_Case):
     def test_the_model_key_is_computed_from_options_alone(self) -> None:
         options = Flux3Options(model_root=Path("/nowhere/flux3"), variant=WeightFormat.NVFP4)
         self.assertEqual(service._model_key(options, "cuda:0"), "flux3_klein:nvfp4|cuda:0|auto|float32|text|/nowhere/flux3")
+
+
+class WireIntegrationTests(_Case):
+    """The step callback, «Энкодер на CPU», cancellation, the profiles adapter and `status`."""
+
+    def _params(self, **overrides: Any) -> dict[str, Any]:
+        return {"source_root": str(self.rig.root), "prompt": "a cat", **overrides}
+
+    def test_the_step_callback_sees_every_denoise_step(self) -> None:
+        seen: list[tuple[int, int]] = []
+        self.service.generate(Flux3Request(caption="a cat", steps=3), self._options(), step_callback=lambda step, total: seen.append((step, total)))
+        self.assertEqual(seen, [(1, 3), (2, 3), (3, 3)])
+
+    def test_encoder_on_cpu_runs_the_encoder_on_the_cpu_at_every_vram_step(self) -> None:
+        for vram in (VramStep.MAX, VramStep.PHASE, VramStep.HALF, VramStep.MIN):
+            with self.subTest(vram=vram.value):
+                result = self._run(self._options(vram_step=vram, ram_step=RamStep.KEEP, encoder_on_cpu=True))
+                session = self._session()
+                self.assertTrue(session.key.endswith("|host_pin=encoder"), session.key)
+                for state in (*session.plan.phases, session.plan.idle):
+                    self.assertIs(state.components["encoder"].exec_device, ExecDevice.CPU)
+                    self.assertIsNot(state.components["encoder"].tier, Tier.DEVICE)
+                self.assertEqual(result.applied.steps_effective, Steps(vram, RamStep.KEEP))
+                self.assertEqual(str(self.rig.encode_calls[-1][1]), "cpu")
+                self.assertEqual(self.service.health()["encoder_resident"], "cpu")
+
+    def test_a_cancel_ends_the_run_and_unloads_nothing(self) -> None:
+        self._run(self._options(vram_step=VramStep.MAX, ram_step=RamStep.KEEP))
+        warm = self.rig.dits[-1]
+
+        def cancel_at(target: Phase) -> Any:
+            def observer(phase: Phase, event: str, info: Any) -> None:
+                if phase is target and event == "begin":
+                    raise service.Flux3Canceled("canceled")
+
+            return observer
+
+        for target in (Phase.DIT_LOAD, Phase.ENCODE, Phase.DECODE):
+            with self.subTest(phase=target.value):
+                with self.assertRaises(service.Flux3Canceled):
+                    self.service.generate(Flux3Request(caption="a cat"), self._options(vram_step=VramStep.MAX, ram_step=RamStep.KEEP), observer=cancel_at(target))
+                self.assertIsNone(self.service.health()["last_error"])
+                self.assertEqual(self.rig.large_holdings()[1:], (0, 0), "no session left in use")
+        def cancel_after_two(step: int, total: int) -> None:
+            if step == 2:
+                raise service.Flux3Canceled("mid-denoise")
+
+        before = warm.calls
+        with self.assertRaises(service.Flux3Canceled):
+            self.service.generate(Flux3Request(caption="a cat", steps=3), self._options(vram_step=VramStep.MAX, ram_step=RamStep.KEEP), step_callback=cancel_after_two)
+        self.assertEqual(warm.calls - before, 2, "the denoise stopped at the step the callback canceled")
+        result = self._run(self._options(vram_step=VramStep.MAX, ram_step=RamStep.KEEP))
+        self.assertIs(self.rig.dits[-1], warm, "the warm DiT survived every cancel")
+        self.assertFalse(result.applied.degraded)
+
+    def test_the_profiles_adapter(self) -> None:
+        for mode in ("text", "vl_refs"):
+            for ae in ("float32", "bfloat16"):
+                with self.subTest(mode=mode, ae=ae):
+                    self.assertEqual(self.service.large_model_name(self._params(encoder_mode=mode, ae_dtype=ae)), f"flux3_klein.{mode}.ae_{ae}")
+        options, device = self.service.large_model_inputs(self._params(format="nvfp4"))
+        self.assertEqual((device, options.device, options.options.variant), ("cpu", "cpu", WeightFormat.NVFP4))
+        self.assertTrue(options.options.encoder_on_cpu, "absent = «Энкодер на CPU» on")
+        with self.assertRaises(ValueError):
+            self.service.large_model_inputs(self._params(bogus=1))
+        report = self.manager_profiles(self._params())
+        self.assertEqual(report.format, "fp8r")
+        self.assertIsNotNone(report.selected)
+
+    def manager_profiles(self, params: dict[str, Any]) -> Any:
+        from ...runtime.large_models.spec import RequestShape
+
+        options, device = self.service.large_model_inputs(params)
+        return self.rig.manager.profiles(self.service.large_model_name(params), options, RequestShape(64, 64, references=((64, 64),)), device=device)
+
+    def test_status_and_an_explicit_dequant_never_probe(self) -> None:
+        calls: list[Any] = []
+        with patch.object(quant, "probe_scaled_mm", lambda device: calls.append(device) or quant.ScaledMmProbe(supported=False, reason="test", rel_error=None)):
+            self.service.status(self._params(format="nvfp4"))
+            self.service.large_model_inputs(self._params(format="nvfp4", fp8_compute="dequant"))
+        self.assertEqual(calls, [])
+
+    def test_status(self) -> None:
+        answer = self.service.status(self._params())
+        self.assertTrue(answer["available"])
+        self.assertIsNone(answer["reason"])
+        self.assertEqual(set(answer["formats"]), {"bf16", "fp8r", "nvfp4"})
+        self.assertTrue(answer["formats"]["fp8r"]["available"])
+        self.assertFalse(answer["formats"]["bf16"]["available"])
+        self.assertGreater(answer["formats"]["fp8r"]["dit_bytes"], 0)
+        self.assertTrue(answer["ae_present"] and answer["text_encoder_present"])
+        self.assertIn("ready", answer)
+        self.assertFalse(self.service.status(self._params(format="bf16"))["available"])
+        empty = self.service.status({})
+        self.assertFalse(empty["available"])
+        self.assertTrue(empty["reason"])
 
 
 if __name__ == "__main__":

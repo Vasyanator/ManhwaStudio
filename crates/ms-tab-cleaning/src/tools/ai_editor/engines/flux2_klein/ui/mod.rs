@@ -26,9 +26,10 @@ Key functions:
 
 Submodules:
 - `install.rs`: the source-mode switch, the model paths and the whole download block.
-- `components.rs`: the memory preset, the forecast and the merged component list.
+- `components.rs`: the merged component list (the memory steps are the shared
+  `ai_editor::large_model_resources` widget, drawn by `draw_memory_section`).
 - `advanced.rs`: «Для экспертов».
-- `progress.rs`: the progress bars and the mask hint.
+- `mask_hint.rs`: the mask hint (the progress bar is the shared `draw_stream_progress`).
 
 Notes:
 No file under `ui/` decides anything a test would want to assert on its own: the verdicts
@@ -42,15 +43,15 @@ use super::*;
 // The source-mode switch, the model paths and the whole download block.
 mod install;
 use install::*;
-// The memory preset, the forecast and the merged component list.
+// The merged component list of «Установка модели».
 mod components;
 use components::*;
 // «Для экспертов»: the parameters set once per machine or per page.
 mod advanced;
 use advanced::*;
-// The progress bars and the mask hint the body opens with.
-mod progress;
-use progress::*;
+// The mask hint the body closes with.
+mod mask_hint;
+use mask_hint::*;
 
 // ---------------------------------------------------------------------------------------
 // Pinned parts
@@ -63,10 +64,10 @@ use progress::*;
 /// idle panel gives the whole height to its parameters.
 pub(super) fn draw_flux2_progress_section(
     ui: &mut egui::Ui,
-    progress: &Mutex<Flux2Progress>,
+    progress: &Mutex<EngineProgress>,
     run_status: Option<&str>,
 ) {
-    draw_flux2_progress_ui(ui, progress);
+    draw_stream_progress(ui, progress);
     if let Some(status) = run_status {
         ui.small(status);
     }
@@ -112,8 +113,13 @@ pub(super) struct Flux2PanelCtx<'a> {
     pub(super) settings: &'a mut Flux2KleinSettings,
     pub(super) status: Option<&'a Flux2Status>,
     pub(super) status_error: Option<&'a str>,
-    pub(super) estimate: Option<&'a Flux2Estimate>,
-    pub(super) estimate_error: Option<&'a str>,
+    /// The large-model forecast and the caps buffer («Память и скорость», the readiness
+    /// line).
+    pub(super) resources: ResourcesView<'a>,
+    /// What is wrong with the settings file, drawn above everything else.
+    pub(super) settings_problem: Option<&'a SettingsProblem>,
+    /// The last failed settings write (localized), drawn beside the file notice.
+    pub(super) save_error: Option<&'a str>,
     pub(super) unload_status: &'a mut Option<String>,
     /// The engine's line about the last per-component action, drawn under the block.
     pub(super) component_action_status: Option<&'a str>,
@@ -124,7 +130,6 @@ pub(super) struct Flux2PanelCtx<'a> {
     pub(super) pipeline_busy: bool,
     pub(super) translate_status: Option<&'a str>,
     pub(super) translate_busy: bool,
-    pub(super) estimate_busy: bool,
     /// Three-state answer for the prompt currently in the field: `Some(true)` cached,
     /// `Some(false)` not cached, `None` not known yet.
     pub(super) prompt_cache_state: Option<bool>,
@@ -169,8 +174,10 @@ pub(super) struct Flux2PanelCtx<'a> {
     pub(super) settings_changed: &'a mut bool,
     /// Set when the component catalog should be re-queried.
     pub(super) want_status: &'a mut bool,
-    /// Set when the memory forecast should be re-queried.
-    pub(super) want_estimate: &'a mut bool,
+    /// Set when the memory forecast should be asked again (refresh button).
+    pub(super) want_forecast: &'a mut bool,
+    /// What the user did in the memory widget this frame.
+    pub(super) resources_actions: &'a mut Vec<ResourcesAction>,
     /// Set when the user asked to unload the backend pipeline.
     pub(super) unload_requested: &'a mut bool,
     /// Set when the user pressed the "translate into English" arrow.
@@ -182,9 +189,9 @@ pub(super) struct Flux2PanelCtx<'a> {
     /// At most one file dialog request per frame.
     pub(super) picker_requested: &'a mut Option<Flux2PickerPurpose>,
     /// The one secret-store control the user pressed this frame, if any.
-    pub(super) hf_token_action: &'a mut Option<Flux2HfTokenAction>,
+    pub(super) hf_token_action: &'a mut Option<HfTokenAction>,
     /// The one download control the user pressed this frame, if any.
-    pub(super) download_action: &'a mut Option<Flux2DownloadAction>,
+    pub(super) download_action: &'a mut Option<HfDownloadAction>,
 }
 
 impl Flux2PanelCtx<'_> {
@@ -206,6 +213,7 @@ impl Flux2PanelCtx<'_> {
     /// paths used to sit two clicks deep while the expert prompt library was expanded on
     /// every frame; that is the inversion this order exists to undo.
     pub(super) fn draw(&mut self, ui: &mut egui::Ui, region: Option<[usize; 2]>) {
+        self.draw_settings_problem(ui);
         self.draw_prompt(ui);
         self.draw_strength(ui);
         // Handed in, not derived: the readiness line reports it and the setup section
@@ -224,6 +232,31 @@ impl Flux2PanelCtx<'_> {
         let guidance_supported = flux2_guidance_supported(self.status);
         draw_advanced_section(ui, self.settings, guidance_supported, self.settings_changed);
         draw_flux2_mask_hint(ui);
+    }
+
+    /// Draws what is wrong with the settings file, when something is: a write that failed
+    /// (retried automatically), a damaged file that
+    /// was moved aside (a warning; defaults are in use and saving works), or one that could
+    /// not be (an error; saving is blocked so the file is never overwritten).
+    pub(super) fn draw_settings_problem(&mut self, ui: &mut egui::Ui) {
+        if let Some(error) = self.save_error {
+            ui.colored_label(ms_theme::status::ERROR, error);
+        }
+        match self.settings_problem {
+            None => {}
+            Some(SettingsProblem::MovedAside(path)) => {
+                ui.colored_label(
+                    ms_theme::status::WARNING,
+                    tf!("cleaning.tools.flux2_klein.settings_malformed_status", path = path.display()),
+                );
+            }
+            Some(SettingsProblem::SaveBlocked(reason)) => {
+                ui.colored_label(
+                    ms_theme::status::ERROR,
+                    tf!("cleaning.tools.flux2_klein.settings_save_blocked_error", err = reason),
+                );
+            }
+        }
     }
 
     /// Draws the prompt block: the English field that is actually sent, the one compact
@@ -446,7 +479,7 @@ impl Flux2PanelCtx<'_> {
         let mut action: Option<Flux2PromptCacheAction> = None;
 
         ui.horizontal_wrapped(|ui| {
-            if flux2_gated_button(
+            if gated_button(
                 ui,
                 gates.build,
                 t!("cleaning.tools.flux2_klein.prompt_cache_build_button"),
@@ -472,7 +505,7 @@ impl Flux2PanelCtx<'_> {
                     .hint_text(t!("cleaning.tools.flux2_klein.prompt_cache_name_hint"))
                     .desired_width(field_width),
             );
-            if flux2_gated_button(
+            if gated_button(
                 ui,
                 gates.save,
                 t!("cleaning.tools.flux2_klein.prompt_cache_save_button"),
@@ -508,7 +541,7 @@ impl Flux2PanelCtx<'_> {
                     Flux2PromptCacheAction::Import,
                 ),
             ] {
-                if flux2_gated_button(ui, enabled, caption, tooltip, disabled_tooltip) {
+                if gated_button(ui, enabled, caption, tooltip, disabled_tooltip) {
                     action = Some(requested);
                 }
             }
@@ -646,9 +679,8 @@ impl Flux2PanelCtx<'_> {
         // figures describe a run that cannot start, and naming what is missing is the
         // actionable half.
         let memory = match readiness {
-            Flux2ModelReadiness::Ready => self.estimate.map(|estimate| Flux2MemorySummary {
-                line: estimate_status_line(estimate, self.status),
-                fits: estimate.fits,
+            Flux2ModelReadiness::Ready => self.resources.profiles.and_then(|profiles| {
+                forecast_line(&profiles.selected).map(|line| Flux2MemorySummary { line, fits: profiles.selected.fits })
             }),
             Flux2ModelReadiness::Missing(_) | Flux2ModelReadiness::Unknown => None,
         };
@@ -681,7 +713,7 @@ impl Flux2PanelCtx<'_> {
                 .clicked()
             {
                 *self.want_status = true;
-                *self.want_estimate = true;
+                *self.want_forecast = true;
             }
         });
         install_requested
@@ -900,28 +932,37 @@ impl Flux2PanelCtx<'_> {
             });
     }
 
-    /// Draws «Память и скорость»: the memory preset and the backend's forecast, and
-    /// nothing else.
+    /// Draws «Память и скорость»: the two memory steps with the backend's forecast for them,
+    /// the learned floor and the folded caps — the shared large-model widget.
     ///
-    /// Closed by default, because a preset is chosen once and the forecast it produces is
-    /// already on the readiness line above — the section exists to CHANGE the preset, not
-    /// to report it. The seven fields a preset owns live in «Для экспертов», where
-    /// overriding one is presented as what it is.
+    /// Closed by default: the steps are chosen once per machine and the forecast they produce
+    /// is already on the readiness line above. The widget writes the step pair into a copy
+    /// that is stored back here, and every other action travels to the engine.
     pub(super) fn draw_memory_section(&mut self, ui: &mut egui::Ui) {
         let settings = &mut *self.settings;
         let changed = &mut *self.settings_changed;
-        let estimate = self.estimate;
-        let estimate_error = self.estimate_error;
-        let estimate_busy = self.estimate_busy;
-        let status = self.status;
+        let actions_out = &mut *self.resources_actions;
+        let resources = &mut self.resources;
         RegionEditToolBase::draw_region_editor_collapsible_section(
             ui,
             "cleaning_flux2_klein_memory",
             t!("cleaning.tools.flux2_klein.memory_heading"),
             false,
             |ui| {
-                draw_preset_row(ui, settings, changed);
-                draw_estimate_ui(ui, estimate, estimate_error, estimate_busy, status);
+                let mut choice = settings.step_choice();
+                let actions = draw_large_model_resources(
+                    ui,
+                    "cleaning_flux2_klein_resources",
+                    &mut choice,
+                    // One weight format: no format rows.
+                    None,
+                    Some(&mut settings.encoder_on_cpu),
+                    resources.reborrow(),
+                );
+                if actions.contains(&ResourcesAction::StepsChanged) {
+                    *changed |= settings.set_step_choice(choice);
+                }
+                actions_out.extend(actions);
             },
         );
     }
@@ -944,7 +985,7 @@ mod tests {
             // actionable only while it names the parts that are missing.
             "cleaning.tools.flux2_klein.model_missing_status",
         ];
-        const PLAIN: [&str; 26] = [
+        const PLAIN: [&str; 22] = [
             "cleaning.tools.flux2_klein.guidance_label",
             // The two halves of the ONE disabled control in this panel. A language that
             // lacks either leaves the user with a grey dial and no reason for it, which is
@@ -953,10 +994,7 @@ mod tests {
             "cleaning.tools.flux2_klein.guidance_unsupported_note",
             "cleaning.tools.flux2_klein.strength_hint",
             "cleaning.tools.flux2_klein.fixed_seed_hint",
-            "cleaning.tools.flux2_klein.preset_hint",
-            "cleaning.tools.flux2_klein.placement_hint",
             "cleaning.tools.flux2_klein.dtype_hint",
-            "cleaning.tools.flux2_klein.low_cpu_mem_usage_hint",
             "cleaning.tools.flux2_klein.color_match_hint",
             "cleaning.tools.flux2_klein.refresh_state_hint",
             "cleaning.tools.flux2_klein.unload_hint",
@@ -976,7 +1014,6 @@ mod tests {
             "cleaning.tools.flux2_klein.model_ready_status",
             "cleaning.tools.flux2_klein.model_readiness_unknown_status",
             "cleaning.tools.flux2_klein.install_hint",
-            "cleaning.tools.flux2_klein.preset_fields_hint",
         ];
         for (tag, source) in ms_i18n::embedded_locales() {
             let catalog: Value = serde_json::from_str(source)
@@ -1043,11 +1080,10 @@ mod tests {
     /// and `ru`) must carry every one of their keys; `es` / `fr` / `pt` fall back to `en`.
     #[test]
     fn the_reference_catalogs_carry_the_text_attention_keys() {
-        const KEYS: [&str; 4] = [
+        const KEYS: [&str; 3] = [
             "cleaning.tools.flux2_klein.text_attention_in_mask_label",
             "cleaning.tools.flux2_klein.text_attention_in_mask_hint",
             "cleaning.tools.flux2_klein.text_attention_in_mask_disabled_hint",
-            "cleaning.tools.flux2_klein.estimate_attention_mask",
         ];
         for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
             let catalog: Value = serde_json::from_str(source)
@@ -1059,8 +1095,46 @@ mod tests {
                     .unwrap_or_else(|| panic!("locale `{tag}` lacks the key `{key}`"));
                 assert!(!value.trim().is_empty(), "locale `{tag}`: `{key}` is empty");
             }
-            let estimate = catalog.get(KEYS[3]).and_then(Value::as_str).unwrap_or_default();
-            assert!(estimate.contains("{size}"), "locale `{tag}`: the forecast line must name its size");
+        }
+    }
+
+    /// The memory section's own lines: the retired preset/placement/estimate vocabulary is
+    /// gone from both reference catalogs, and the new lines carry their placeholders.
+    #[test]
+    fn the_reference_catalogs_carry_the_step_era_keys_and_not_the_retired_ones() {
+        const RETIRED_PREFIXES: [&str; 9] = [
+            "cleaning.tools.flux2_klein.preset_",
+            "cleaning.tools.flux2_klein.placement_",
+            "cleaning.tools.flux2_klein.estimate_",
+            "cleaning.tools.flux2_klein.low_cpu_mem_usage_",
+            "cleaning.tools.flux2_klein.vae_slicing_",
+            "cleaning.tools.flux2_klein.unload_before_vae_",
+            "cleaning.tools.flux2_klein.unload_text_encoder_",
+            "cleaning.tools.flux2_klein.text_encoder_fp8_hint_pointless",
+            "cleaning.tools.flux2_klein.preset_fields_",
+        ];
+        const WITH_PLACEHOLDERS: [(&str, &[&str]); 4] = [
+            ("cleaning.tools.flux2_klein.settings_save_error", &["{err}"]),
+            ("cleaning.tools.flux2_klein.degraded_status", &["{vram}", "{ram}"]),
+            ("cleaning.tools.flux2_klein.settings_malformed_status", &["{path}"]),
+            ("cleaning.tools.flux2_klein.settings_save_blocked_error", &["{err}"]),
+        ];
+        for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
+            let catalog: Value = serde_json::from_str(source)
+                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            let object = catalog.as_object().expect("a catalog is an object");
+            for key in object.keys() {
+                assert!(
+                    !RETIRED_PREFIXES.iter().any(|prefix| key.starts_with(prefix)),
+                    "locale `{tag}` still carries the retired `{key}`"
+                );
+            }
+            for (key, needed) in WITH_PLACEHOLDERS {
+                let value = object.get(key).and_then(Value::as_str).unwrap_or_else(|| panic!("locale `{tag}` lacks `{key}`"));
+                for placeholder in needed {
+                    assert!(value.contains(placeholder), "locale `{tag}`: `{key}` drops `{placeholder}`");
+                }
+            }
         }
     }
 }

@@ -65,6 +65,16 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   диска» (nothing parked: juggled blocks read from the file per pass, no CPU encoder).
 - The composition table is the `tiers` module header; every step is strict (one idle and one keep
   tier). «Авто» on both axes walks RAM-major (`tiers.STEP_WALK`: give up VRAM before RAM).
+- **Host pin** (`LargeModelSpec.host_pin_of(options)` -> component names, e.g. FLUX.2 / FLUX.3
+  «Энкодер на CPU»): a request may pin components to host execution. A pinned component ignores
+  its role's row of the template: `tiers.host_pinned_policy(ram)` places it — CPU from RAM at EVERY
+  VRAM step; between runs in RAM under KEEP, during the run only under RUN, read from its files for
+  its own phase and dropped right after under MIN (it is never block-streamed to the CPU). No
+  VRAM step's device placement or forecast holds any of it, and neither «Авто» nor a degrade rung
+  moves it to the device. The pin is validated by the spec (`host_pin`: a declared component that
+  may run on the CPU), is part of the residency key (`LargeModelSpec.key` appends
+  `|host_pin=<names>`) and of the learned-floor key (`FloorKey.host_pin`), and is ignored on a
+  host run device.
 - **Per-axis monotonic invariant, by construction** (`planner` room chain): for the same request
   and budgets a lower VRAM step never forecasts more device bytes than a higher one (full
   forecast), a lower RAM step never more host growth. A cell whose own template fits its room but
@@ -76,8 +86,8 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
 - `spec.py`: what a model package declares — `LargeModelSpec`, `ComponentSpec` (`block_of`,
   `state_keys_of` for 1:N conversions, `device_itemsize`, allowed `ExecDevice`s, block order),
   `PhaseSpec` (`uses`, `compute`, `work(shape, options) -> PhaseWork`), `RequestShape`,
-  `FormatInfo`, `Role`; manager-side `LargeModelSpec.formats` / `key_of` (`key()`) / `fallbacks`
-  (`Fallback`).
+  `FormatInfo`, `Role`; manager-side `LargeModelSpec.formats` / `key_of` (`key()`, with the host
+  pin suffix) / `fallbacks` (`Fallback`) / `host_pin_of` (`host_pin()`).
 - `inventory.py`: `build_inventory` / `build_inventories` -> `ComponentInventory` (blocks in
   residency order, non-block weights, device and file bytes, largest tensor/block, `fragmented`,
   the load transient `load_host_bytes` from `BlockSpan.convert_bytes`: the spec's conversion run
@@ -86,7 +96,7 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   `STEP_WALK`), `StepFloor`, `Limits` (hard caps only), the plan types (`ComponentPlan`,
   `PhasePlan`, `Transition`, `ResidencyPlan`, `derive_transitions`) and the templates
   (`Placement` with `resident_cap`, `RolePolicy`, `ProfileTemplate` with `device_share`,
-  `template_for`).
+  `template_for`) and `host_pinned_policy` (a pinned component per RAM step).
 - `cost_tables.py` + `calibration/<device_class>.json`: the measured cost model (per-phase
   activation and seconds, device constants: runtime overhead, margin, park / restore / per-block
   H2D / disk rates, prefetch depth), `device_class_of`, `load_tables`, `parse_tables`; an entry's
@@ -110,8 +120,8 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
 - `moves.py`: `transfer_block_wise` -> `TransferReport`, `park`, `restore`, `drop`, `DeviceShort`.
 - `degrade.py`: `classify_failure` -> `RunFailure` (`FailureKind`), `Ladder` (rungs `RungKind`:
   `RECLAIM`, `TIGHTER_DEVICE`, `FALLBACK`, `NEXT_VRAM_STEP`, `NEXT_RAM_STEP`; `Replan`, `Rung`,
-  `MAX_RETRIES`), learned floors per axis (`FloorKey`, `FloorEntry`, `FloorsStore`,
-  `LearnedFloors`).
+  `MAX_RETRIES`), learned floors per axis (`FloorKey` with its `host_pin`, `FloorEntry`,
+  `FloorsStore`, `LearnedFloors`).
 - `manager.py`: `LargeModelManager` (`register`, `acquire(steps=)`, `profiles(claimed_*_bytes=)` ->
   `ProfilesReport`, `limits` / `set_limits` (partial, atomic: `KEEP_LIMIT`), `floors` /
   `reset_floors`, `status`, `placements` -> `ComponentPlacement`, `health`, `unload` /
@@ -152,7 +162,9 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   block's weights exist in exactly one location (device, host or disk) except the
   `prefetch_depth + 1` blocks in flight. The forecast is written to this invariant: a component
   that moves at a transition is counted in its old place before and its new place after, never
-  in both, plus ONE moving unit in flight.
+  in both, plus ONE moving unit in flight (on the device side only when a component's device
+  bytes change: a host-only move — a CPU component read into or dropped from RAM — has nothing in
+  flight on the device).
 - **Forecast = max over phases, transitions and the idle state**, computed by ONE function the
   UI and the guard share. **A load's host transient is forecast:** the loader holds one file
   tensor's read buffer plus its non-aliasing conversion outputs at once
@@ -235,9 +247,10 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
   it lowers the failing step's forecast peak. A run that ends by a memory failure drops everything.
 - **The format is never changed by the manager**; a refusal carries the planner's format
   suggestions and names the shortest resource. The user's steps are never rewritten; a learned
-  floor (device class, model, format) is recorded PER AXIS only after a successful run that ended
+  floor (device class, model, format, host pin) is recorded PER AXIS only after a successful run that ended
   lower on that axis, each axis only lowered, applies to the next plans (`planner` floor), and is
-  reset explicitly. Floors of the old single profile scale in the store are skipped (one INFO).
+  reset explicitly. Floors of the old single profile scale in the store are skipped (one INFO);
+  an entry stored without `host_pin` is an unpinned one.
 - **Per-handle device ceiling** (`acquire(..., device_cap_bytes=)`, `profiles(...,
   device_cap_bytes=)`, `Budgets.device_cap_bytes`): bounds the device peak this handle's plan may
   forecast, after claims and reclaim, for the admission and every degrade re-plan; it never raises
@@ -275,7 +288,8 @@ The two axes (`tiers.VramStep`, `tiers.RamStep`; each also `AUTO`, request only)
 
 ## Editing map
 - To change what a step pair means, edit `tiers.template_for` and its table (and `test_tiers.py`
-  `CompositionTests`, `test_planner.py`).
+  `CompositionTests`, `test_planner.py`); a pinned component's placement per RAM step:
+  `tiers.host_pinned_policy` (`test_planner.py` `HostPinTests`, `test_manager.py` `HostPinTests`).
 - To change how a fit is judged, how alternatives are tried, the room chain or the Auto walk, edit
   `planner.py`; `GridInvariantTests` is the property test of the monotonic invariant.
 - To change the forecast arithmetic (staging, margin, transition accounting, time model), edit

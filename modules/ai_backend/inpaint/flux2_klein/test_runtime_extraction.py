@@ -14,9 +14,7 @@ Main responsibilities:
   unavailable" DEBUG records on the `hardware` logger, and still honours
   `hardware.is_torch_available` as its patch point;
 - the constants (`ENCODER_KEEP_LAYERS`, the header ceiling) keep their values;
-- every moved name stays reachable on its old module AND on the package;
-- `patch.object(hardware, "memory_snapshot", ...)` still reaches the
-  `estimate` forecast, with the device the service would use.
+- every moved name stays reachable on its old module AND on the package.
 
 The streaming single-file loader these tests also pinned is gone (WP6: the
 large-model manager's loader reads every component tensor by tensor); its
@@ -36,10 +34,8 @@ from typing import Any
 from unittest.mock import patch
 
 from modules.ai_backend.inpaint import flux2_klein as svc
-from modules.ai_backend.runtime.model_manager import SmallModelManager
 from modules.ai_backend.inpaint.flux2_klein import components, hardware
 
-from ._test_fixtures import _TempTreeCase
 
 def _import_blocking(*blocked: str) -> Any:
     """A `builtins.__import__` replacement that refuses the named top-level modules."""
@@ -123,20 +119,6 @@ class SurfaceCharacterizationTests(unittest.TestCase):
         # A wrapper def owned by `hardware`, not a re-bound import: that is what
         # keeps `hardware.memory_snapshot` the one patch point.
         self.assertEqual(hardware.memory_snapshot.__module__, hardware.__name__)
-
-
-class MemorySnapshotPatchPointTests(_TempTreeCase):
-    def test_patching_hardware_reaches_the_estimate(self) -> None:
-        devices: list[object] = []
-        plenty = 1 << 50
-
-        def _snapshot(device: object = None) -> dict[str, int]:
-            devices.append(device)
-            return {"vram_total": plenty, "vram_free": plenty, "ram_total": plenty, "ram_free": plenty}
-
-        with patch.object(hardware, "memory_snapshot", _snapshot), patch.object(hardware, "_resolve_selected_backend_device", lambda _fallback: "cuda:1"):
-            svc.Flux2KleinInpaintService(SmallModelManager()).estimate(params=self.params(), region_width=128, region_height=128)
-        self.assertEqual(devices, ["cuda:1"])
 
 
 if __name__ == "__main__":

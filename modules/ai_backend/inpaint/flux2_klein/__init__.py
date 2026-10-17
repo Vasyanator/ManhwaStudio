@@ -3,7 +3,7 @@ Package: modules/ai_backend/inpaint/flux2_klein
 
 Purpose:
 FLUX.2 klein (9B / 4B) region-editing service for the Python AI backend (methods
-`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload`, `.component_action`
+`inpaint.flux2_klein`, `.status`, `.unload`, `.component_action`
 and the `.prompt_cache.*` family; streaming). It edits a user-selected page
 REGION with `diffusers.Flux2KleinInpaintPipeline`. Its weights are two handles
 of the large-model manager (`runtime.large_models`): the PIPELINE (transformer
@@ -12,8 +12,8 @@ byte lives in every phase, admits a run, degrades it on a memory failure and
 keeps the model between runs per the two resource steps («Видеопамять» x
 «Оперативная память»). This package describes
 FLUX.2 to it (`large_model.py`) and drives runs through its sessions
-(`service.py`); the legacy `placement` flags of the wire are mapped onto a
-step pair (`memory.requested_steps`).
+(`service.py`); a request names its step pair as `vram_step` / `ram_step`
+(`memory.requested_steps`).
 
 Mask semantics (this is NOT classic inpainting):
 The mask is a PERMISSION TO CHANGE. Everything outside it must come back
@@ -44,10 +44,9 @@ Module layout (this file re-exports the package's public surface):
 - `attention.py`    - `text_attention_in_mask`: token grid, layout, the mask and its bytes.
 - `hardware.py`     - device resolution, memory snapshot, torch cache clearing.
 - `prompt_cache.py` - encoder fingerprint, the `.msprompt` container, the library.
-- `imaging.py`      - mask/region decoding, color match, feathered composite.
 - `pipeline.py`     - what a phase does with the placed modules; residency / actions.
 - `large_model.py`  - the manager specs, options, phase work, decode fallbacks.
-- `memory.py`       - stage-1 wire adapters: step mapping, `estimate`, advice.
+- `memory.py`       - step pair and step keys, the combined VRAM-axis rule, the two-handle forecast.
 - `service.py`      - `Flux2KleinInpaintService`: the lock, the sessions, the run.
 
 Notes:
@@ -79,9 +78,8 @@ from .params import (  # noqa: F401  - re-exported public surface
     PIPELINE_MIN_REGION_SIDE,
     REGION_SIZE_MULTIPLE,
     TEXT_ENCODER_DTYPE,
+    RETIRED_FIELDS,
     VALID_DTYPES,
-    VALID_PLACEMENTS,
-    VALID_PROFILES,
     VALID_RAM_STEPS,
     VALID_VRAM_STEPS,
     effective_steps,
@@ -202,21 +200,6 @@ from .prompt_cache import (  # noqa: F401  - re-exported public surface
     _foreign_prompt_file_message,
     _short_id,
 )
-from .imaging import (  # noqa: F401  - re-exported public surface
-    MAX_MASK_DISTANCE_PROBE,
-    _MIN_COLOR_MATCH_SAMPLES,
-    _composite_over_region,
-    _decode_image_rgb,
-    _decode_mask,
-    _dilate_mask,
-    _encode_png_bytes_rgb,
-    _erode_mask,
-    _feather_mask_inwards,
-    _mask_distance_inside,
-    _match_color_outside_mask,
-    _morph_mask,
-    _require_solid_mask,
-)
 from .attention import (  # noqa: F401  - re-exported public surface
     MASK_ROW_ALIGNMENT,
     TOKEN_PIXELS,
@@ -235,18 +218,11 @@ from .hardware import (  # noqa: F401  - re-exported public surface
     _resolve_selected_backend_device,
 )
 from .memory import (  # noqa: F401  - re-exported public surface
-    LEGACY_PROFILE_STEPS,
-    RAM_STEP_LABELS,
     STEP_FIELD_KEYS,
-    VRAM_STEP_LABELS,
     forecast_memory,
-    legacy_profile_name,
-    legacy_steps,
-    encoder_cpu_pinned,
     is_host_run_device,
     requested_steps,
     steps_fields,
-    _preset_advice,
 )
 from .pipeline import (  # noqa: F401  - re-exported public surface
     ACTIONABLE_COMPONENTS,

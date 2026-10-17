@@ -15,6 +15,7 @@ Key functions:
 
 Submodules:
 - `engines`: the engine catalog, one module per engine
+- `large_model_resources`: the two-axis memory widget the large-model engines draw
 
 Notes:
 The spec values are frozen: the two id salts key egui's stored widget state (the folded
@@ -23,6 +24,8 @@ every user. Design: `dev-docs/region_edit_v2_plan.md` (§13).
 */
 
 mod engines;
+// The «Видеопамять» × «Оперативная память» widget of the large-model engines (FLUX.2, FLUX.3).
+mod large_model_resources;
 
 use super::region_edit_v2::host::{HostSpec, RegionEditHost};
 

@@ -91,6 +91,17 @@ executes in host memory):
   three cells. The VRAM picker rows are not applicable (the manager reports
   them so).
 
+Host pin (`LargeModelSpec.host_pin(options)`, e.g. "encoder on the CPU"):
+- a pinned component is placed by `tiers.host_pinned_policy(<the cell's RAM
+  step>)` instead of its role's row of the cell's template: CPU execution from
+  RAM at every VRAM step, so no cell's device side (weights, activation,
+  staging) holds any of it, and the VRAM ladder / «Авто» walk never moves it to
+  the device; the RAM step alone decides whether it is kept, parked during the
+  run, or read from its files per run. The other components plan as before;
+  the per-axis invariant holds unchanged (the pinned placement is the same
+  along a row and RAM-monotone along a column);
+- ignored on a host run device (everything executes in host memory there).
+
 Notes:
 - Stdlib only.
 """
@@ -131,6 +142,7 @@ from .tiers import (
     more_economical_vram,
     ram_index,
     host_device_steps,
+    host_pinned_policy,
     template_for,
     vram_index,
 )
@@ -316,8 +328,12 @@ class _Request:
     device_room: int = field(init=False)
     host_room: int = field(init=False)
     device_usable: int = field(init=False)
+    host_pin: frozenset[str] = field(init=False)
 
     def __post_init__(self) -> None:
+        # Validated by the spec (unknown / CPU-incapable names raise); a host
+        # run device executes everything in host memory, so a pin means nothing.
+        object.__setattr__(self, "host_pin", frozenset() if self.budgets.host_device else self.spec.host_pin(self.options))
         # `*_free`: what fits without touching anyone; `*_room`: plus what other
         # pools could free. Fits are judged against the room; `PlanFit` reports
         # the part above the free figure.
@@ -471,7 +487,7 @@ def _plan_template(request: _Request, template: ProfileTemplate, inventories: Ma
     steps = template.steps
     slots: list[list[tuple[Placement, Tier, Tier]]] = []
     for component in spec.components:
-        policy = template.roles[component.role]
+        policy = host_pinned_policy(steps.ram) if component.name in request.host_pin else template.roles[component.role]
         # A host run device never juggles: its "device" slots are host memory.
         actives = [placement for placement in policy.active if placement.exec_device in component.exec_devices_allowed and not (placement.juggle and request.budgets.host_device)]
         if not actives:
@@ -690,10 +706,13 @@ def plan(
     learned floor per axis (`None` = none).
 
     Returns `Planned` (the first fit of the request's walk, module contract) or
-    `PlanRefusal` with format / limits / steps suggestions.
+    `PlanRefusal` with format / limits / steps suggestions. The components
+    `spec.host_pin(options)` names are placed by the RAM step alone (module
+    notes, "Host pin").
 
     # Raises
-    `KeyError` when an inventory misses a component of `spec`.
+    `KeyError` when an inventory misses a component of `spec`; `ValueError`
+    from `spec.host_pin` for a pin the spec cannot honour.
     """
     request = _Request(spec, limits, budgets, shape, tables, options)
     device_unknown = not budgets.device.known and not budgets.host_device

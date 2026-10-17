@@ -23,13 +23,14 @@ Notes:
   are consumed only by the mechanics layer (`loader`, `hooks`); sizing,
   planning and forecasting never call them.
 - Manager-side fields (`LargeModelSpec.formats`, `key_of`, `fallbacks`) are
-  consumed only by `manager` / `degrade`.
+  consumed only by `manager` / `degrade`; `host_pin_of` by the planner (where
+  the pinned components are placed) and by `key` (the residency key).
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -259,7 +260,11 @@ class LargeModelSpec:
       weights (one manager handle per key): it must change whenever the loaded
       bytes would differ; `None` = `default_key_of(family)`;
     - `fallbacks`: model-specific degrade rungs in the order they are tried
-      (names unique, phases declared).
+      (names unique, phases declared);
+    - `host_pin_of(options)` -> the names of the components THIS request pins
+      to host execution (CPU, from RAM; e.g. "encoder on the CPU"); `None` =
+      the model never pins. A pinned component is placed by the RAM step alone
+      (`tiers.host_pinned_policy`), never on the device; see `host_pin`.
     """
 
     family: str
@@ -269,6 +274,7 @@ class LargeModelSpec:
     formats: Callable[[Any], Mapping[str, FormatInfo]] | None = None
     key_of: Callable[[Any, str, str], str] | None = None
     fallbacks: tuple[Fallback, ...] = ()
+    host_pin_of: Callable[[Any], Collection[str]] | None = None
 
     def __post_init__(self) -> None:
         names = [component.name for component in self.components]
@@ -298,10 +304,39 @@ class LargeModelSpec:
         """The component called `name`; `KeyError` when the spec has none."""
         return self._by_name[name]
 
+    def host_pin(self, options: Any) -> frozenset[str]:
+        """The components `options` pin to host execution (`host_pin_of`; empty when the spec has none).
+
+        # Raises
+        `ValueError` when a pinned name is not a component of this spec or names
+        a component that may not execute on the CPU (`exec_devices_allowed`).
+        """
+        if self.host_pin_of is None:
+            return frozenset()
+        pinned = frozenset(self.host_pin_of(options))
+        for name in sorted(pinned):
+            component = self._by_name.get(name)
+            if component is None:
+                raise ValueError(f"LargeModelSpec «{self.family}»: закреплённый за процессором компонент «{name}» не объявлен")
+            if ExecDevice.CPU not in component.exec_devices_allowed:
+                raise ValueError(f"LargeModelSpec «{self.family}»: компонент «{name}» не может исполняться на процессоре, закрепить его за ним нельзя")
+        return pinned
+
     def key(self, options: Any, weight_format: str, device: str) -> str:
-        """The residency key of `options` loaded in `weight_format` on `device` (`key_of` or the default)."""
+        """The residency key of `options` loaded in `weight_format` on `device` (`key_of` or the default).
+
+        A request that pins components to the host (`host_pin`) gets the suffix
+        `|host_pin=<names, sorted>`: its placement differs, so it is its own
+        handle (with its own learned floors); toggling the pin leaves the other
+        handle idle, reclaimed like any idle holding.
+
+        # Raises
+        `ValueError` from `host_pin`.
+        """
         key_of = self.key_of if self.key_of is not None else default_key_of(self.family)
-        return str(key_of(options, weight_format, device))
+        key = str(key_of(options, weight_format, device))
+        pinned = self.host_pin(options)
+        return f"{key}|host_pin={','.join(sorted(pinned))}" if pinned else key
 
 
 @dataclass(frozen=True)

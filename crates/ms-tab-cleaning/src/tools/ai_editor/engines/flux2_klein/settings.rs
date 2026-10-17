@@ -4,17 +4,21 @@ File: cleaning/tools/ai_editor/engines/flux2_klein/settings.rs
 Purpose:
 Everything the FLUX.2 klein engine persists to its VARIANT's settings file
 (`config::flux2_klein_settings_path`) and the wire enums those fields are spelled in:
-the placement/dtype vocabulary, the memory presets built out of it, the source mode
-that decides whether the three model paths are typed by hand or derived from the
-download directory, and the load/save pair that moves the whole struct through a
-worker thread.
+the dtype vocabulary, the two memory steps («Видеопамять» / «Оперативная память»), the
+source mode that decides whether the three model paths are typed by hand or derived from
+the download directory, the one-time migration of the retired memory placement, and the
+load/save pair that moves the whole struct through a worker thread.
 
 Main responsibilities:
 - own `Flux2KleinSettings`, its defaults, its clamping (`normalized`) and the JSON
   body it puts on the wire (`params`);
-- own the placement/dtype/preset vocabulary and the preset <-> field mapping;
+- own the dtype vocabulary and the persisted step ids (`step_choice`);
+- migrate a document written before the step axes existed (`legacy_memory_steps`,
+  which owns the placement -> step-pair table; the backend refuses those fields);
 - derive the effective model paths from the source mode AND the variant;
-- read and write the settings file, and decide when a save is due.
+- read the settings file, moving a damaged one aside instead of ever overwriting it
+  (`load_flux2_settings_from`, over the shared `read_settings_file`), and write it back
+  (`save_flux2_settings`, over the shared `write_settings_json`).
 
 There is ONE FILE PER VARIANT and the document records which one it is: 9B keeps
 `flux2_klein_settings.json` byte-for-byte, 4B gets its own name, `load_flux2_settings`
@@ -22,12 +26,12 @@ stamps the owning variant over whatever it read, and `save_flux2_settings` write
 the file the document itself names.
 
 Key structures:
-- `Flux2KleinSettings`, `Flux2EffectivePaths`
-- `MemoryPreset`, `MemoryPresetValues`, `Flux2Placement`, `Flux2Dtype`
-- `Flux2SourceMode`
+- `Flux2KleinSettings`, `Flux2EffectivePaths`, `Flux2Dtype`, `Flux2SourceMode`
+- `Flux2LoadedDocument`, `Flux2SettingsLoad` (its `problem` is the shared `SettingsProblem`)
 
 Key functions:
-- `load_flux2_settings()`, `save_flux2_settings()`, `settings_from_json()`
+- `load_flux2_settings()`, `load_flux2_settings_from()`, `save_flux2_settings()`,
+  `settings_from_json()`, `legacy_memory_steps()`
 - `normalize_source_lang()`, `source_lang_title()`
 
 Notes:
@@ -41,62 +45,6 @@ use super::*;
 // ---------------------------------------------------------------------------------------
 // Wire enums
 // ---------------------------------------------------------------------------------------
-
-/// Where the pipeline's modules live during a run. Wire values are the persisted
-/// identity and are literals by design (`dev-docs/i18n_exclusions.md` §A5: a value that
-/// doubles as stored content is never localized).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Flux2Placement {
-    FullGpu,
-    EncoderCpu,
-    ModelCpuOffload,
-    SequentialCpuOffload,
-}
-
-impl Flux2Placement {
-    /// The value put on the wire; also the value persisted in the settings file.
-    pub(super) fn wire(self) -> &'static str {
-        match self {
-            Flux2Placement::FullGpu => "full_gpu",
-            Flux2Placement::EncoderCpu => "encoder_cpu",
-            Flux2Placement::ModelCpuOffload => "model_cpu_offload",
-            Flux2Placement::SequentialCpuOffload => "sequential_cpu_offload",
-        }
-    }
-
-    /// Parses a persisted/wire value, falling back to the default placement so a
-    /// hand-edited settings file cannot push an unknown mode onto the backend.
-    pub(super) fn from_wire(value: &str) -> Self {
-        match value.trim() {
-            "encoder_cpu" => Flux2Placement::EncoderCpu,
-            "model_cpu_offload" => Flux2Placement::ModelCpuOffload,
-            "sequential_cpu_offload" => Flux2Placement::SequentialCpuOffload,
-            _ => Flux2Placement::FullGpu,
-        }
-    }
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            Flux2Placement::FullGpu => t!("cleaning.tools.flux2_klein.placement_full_gpu"),
-            Flux2Placement::EncoderCpu => t!("cleaning.tools.flux2_klein.placement_encoder_cpu"),
-            Flux2Placement::ModelCpuOffload => {
-                t!("cleaning.tools.flux2_klein.placement_model_cpu_offload")
-            }
-            Flux2Placement::SequentialCpuOffload => {
-                t!("cleaning.tools.flux2_klein.placement_sequential_cpu_offload")
-            }
-        }
-    }
-
-    pub(super) fn all() -> [Self; 4] {
-        [
-            Flux2Placement::FullGpu,
-            Flux2Placement::EncoderCpu,
-            Flux2Placement::ModelCpuOffload,
-            Flux2Placement::SequentialCpuOffload,
-        ]
-    }
-}
 
 /// Compute precision of the pipeline. Both names are technical identifiers and stay
 /// literal in the UI.
@@ -126,161 +74,61 @@ impl Flux2Dtype {
     }
 }
 
-/// The seven settings fields a [`MemoryPreset`] owns, as one comparable value.
+/// The retired memory fields of a document written before the step axes, with the values
+/// every such document was CREATED with. A document whose memory fields all still read as
+/// these (absent or equal) was never touched by the user, which is what decides its
+/// migration ([`legacy_memory_steps`]).
+const LEGACY_DEFAULT_PLACEMENT: &str = "full_gpu";
+const LEGACY_MEMORY_FLAGS_AND_DEFAULTS: [(&str, bool); 6] = [
+    ("low_cpu_mem_usage", false),
+    ("vae_tiling", false),
+    ("vae_slicing", false),
+    ("unload_transformer_before_vae", false),
+    ("unload_text_encoder_after_encode", false),
+    ("text_encoder_fp8", false),
+];
+
+/// The step pair a document written before the step axes migrates to, or `None` when it
+/// needs no migration.
 ///
-/// A named struct rather than a tuple because equality between "what the preset says"
-/// and "what the settings hold" is the whole mechanism behind
-/// [`MemoryPreset::detect`], and a seven-slot positional tuple makes a swapped pair of
-/// booleans invisible at the call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct MemoryPresetValues {
-    pub(super) placement: Flux2Placement,
-    pub(super) low_cpu_mem_usage: bool,
-    pub(super) vae_tiling: bool,
-    pub(super) vae_slicing: bool,
-    pub(super) unload_transformer_before_vae: bool,
-    pub(super) unload_text_encoder_after_encode: bool,
-    pub(super) text_encoder_fp8: bool,
-}
-
-/// A built-in memory profile: one named combination of placement, VAE flags and
-/// text-encoder handling.
+/// Trigger: the document carries NEITHER `vram_step` NOR `ram_step` but does carry a
+/// `placement` string. A document that has either step field is never re-migrated and its
+/// legacy keys are ignored, which is what makes the migration idempotent.
 ///
-/// `Custom` is never selectable — it is what [`MemoryPreset::detect`] reports when the
-/// seven fields match no preset, so editing any of them below silently moves the picker
-/// to «Пользовательский» instead of leaving a lie on screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum MemoryPreset {
-    MaxSpeed,
-    Balanced,
-    MinRam,
-    MinVram,
-    Custom,
-}
-
-impl MemoryPreset {
-    /// The four selectable presets, in the order they are offered.
-    pub(super) fn selectable() -> [Self; 4] {
-        [
-            MemoryPreset::MaxSpeed,
-            MemoryPreset::Balanced,
-            MemoryPreset::MinRam,
-            MemoryPreset::MinVram,
-        ]
+/// A document whose seven memory fields are all still the SHIPPED DEFAULTS — `placement`
+/// `full_gpu` and each of the six flags absent or at its default — migrates to «Авто» /
+/// «Авто»: such a file is indistinguishable from one the user never opened the memory
+/// section of, and the strict (Максимум скорости, Держать модели в памяти) pair the table
+/// gives `full_gpu` would refuse to run on a card it does not fit. Every other document
+/// follows the placement mapping table, owned here (the backend refuses the retired fields
+/// since protocol 14 and keeps no copy): `full_gpu` -> (max, keep); `encoder_cpu` -> (phase, keep) with
+/// `unload_transformer_before_vae` on — its derived value `true` when absent — else
+/// (max, keep); `model_cpu_offload` -> (phase, keep); `sequential_cpu_offload` -> (min, keep);
+/// anything else -> (auto, auto).
+#[must_use]
+pub(super) fn legacy_memory_steps(value: &Value) -> Option<StepChoice> {
+    if value.get("vram_step").is_some() || value.get("ram_step").is_some() {
+        return None;
     }
-
-    pub(super) fn label(self) -> &'static str {
-        match self {
-            MemoryPreset::MaxSpeed => t!("cleaning.tools.flux2_klein.preset_max_speed"),
-            MemoryPreset::Balanced => t!("cleaning.tools.flux2_klein.preset_balanced"),
-            MemoryPreset::MinRam => t!("cleaning.tools.flux2_klein.preset_min_ram"),
-            MemoryPreset::MinVram => t!("cleaning.tools.flux2_klein.preset_min_vram"),
-            MemoryPreset::Custom => t!("cleaning.tools.flux2_klein.preset_custom"),
-        }
+    let placement = value.get("placement")?.as_str()?.trim();
+    let flag = |name: &str| value.get(name).and_then(Value::as_bool);
+    let untouched = placement == LEGACY_DEFAULT_PLACEMENT
+        && LEGACY_MEMORY_FLAGS_AND_DEFAULTS
+            .iter()
+            .all(|(name, default)| value.get(*name).is_none() || flag(name) == Some(*default));
+    if untouched {
+        return Some(StepChoice::default());
     }
-
-    /// The seven fields a preset owns: placement, `low_cpu_mem_usage`, VAE tiling, VAE
-    /// slicing, whether the transformer is unloaded before the VAE decode, whether the
-    /// text encoder is unloaded right after the prompt is encoded, and whether that
-    /// encoder is quantized to fp8. `Custom` owns none, so it answers `None` and cannot
-    /// be applied.
-    ///
-    /// `text_encoder_fp8` is `false` in EVERY preset on purpose: it trades embedding
-    /// quality for memory, and that trade is the user's to make, never a preset's.
-    pub(super) fn values(self) -> Option<MemoryPresetValues> {
-        match self {
-            MemoryPreset::MaxSpeed => Some(MemoryPresetValues {
-                placement: Flux2Placement::FullGpu,
-                low_cpu_mem_usage: false,
-                vae_tiling: false,
-                vae_slicing: false,
-                unload_transformer_before_vae: false,
-                unload_text_encoder_after_encode: false,
-                text_encoder_fp8: false,
-            }),
-            MemoryPreset::Balanced => Some(MemoryPresetValues {
-                placement: Flux2Placement::EncoderCpu,
-                low_cpu_mem_usage: false,
-                vae_tiling: true,
-                vae_slicing: false,
-                unload_transformer_before_vae: true,
-                unload_text_encoder_after_encode: false,
-                text_encoder_fp8: false,
-            }),
-            MemoryPreset::MinRam => Some(MemoryPresetValues {
-                placement: Flux2Placement::EncoderCpu,
-                low_cpu_mem_usage: true,
-                vae_tiling: true,
-                vae_slicing: false,
-                unload_transformer_before_vae: true,
-                unload_text_encoder_after_encode: false,
-                text_encoder_fp8: false,
-            }),
-            // `low_cpu_mem_usage` joins the VRAM profile because sequential offload
-            // streams every module through host RAM: loading without it spikes RAM as
-            // well, which defeats the point of the profile on a small machine.
-            MemoryPreset::MinVram => Some(MemoryPresetValues {
-                placement: Flux2Placement::SequentialCpuOffload,
-                low_cpu_mem_usage: true,
-                vae_tiling: true,
-                vae_slicing: true,
-                unload_transformer_before_vae: true,
-                unload_text_encoder_after_encode: false,
-                text_encoder_fp8: false,
-            }),
-            MemoryPreset::Custom => None,
-        }
-    }
-
-    /// Reports which preset `settings` currently equals, or `Custom` when none does.
-    pub(super) fn detect(settings: &Flux2KleinSettings) -> Self {
-        let current = MemoryPresetValues {
-            placement: Flux2Placement::from_wire(&settings.placement),
-            low_cpu_mem_usage: settings.low_cpu_mem_usage,
-            vae_tiling: settings.vae_tiling,
-            vae_slicing: settings.vae_slicing,
-            unload_transformer_before_vae: settings.unload_transformer_before_vae,
-            unload_text_encoder_after_encode: settings.unload_text_encoder_after_encode,
-            text_encoder_fp8: settings.text_encoder_fp8,
-        };
-        Self::selectable()
-            .into_iter()
-            .find(|preset| preset.values() == Some(current))
-            .unwrap_or(MemoryPreset::Custom)
-    }
-
-    /// Writes the preset's seven fields into `settings`. Returns `true` if anything
-    /// changed. `Custom` is a no-op: it has no values of its own.
-    pub(super) fn apply(self, settings: &mut Flux2KleinSettings) -> bool {
-        let Some(values) = self.values() else {
-            return false;
-        };
-        let mut changed = false;
-        if settings.placement != values.placement.wire() {
-            settings.placement = values.placement.wire().to_string();
-            changed = true;
-        }
-        for (field, value) in [
-            (&mut settings.low_cpu_mem_usage, values.low_cpu_mem_usage),
-            (&mut settings.vae_tiling, values.vae_tiling),
-            (&mut settings.vae_slicing, values.vae_slicing),
-            (
-                &mut settings.unload_transformer_before_vae,
-                values.unload_transformer_before_vae,
-            ),
-            (
-                &mut settings.unload_text_encoder_after_encode,
-                values.unload_text_encoder_after_encode,
-            ),
-            (&mut settings.text_encoder_fp8, values.text_encoder_fp8),
-        ] {
-            if *field != value {
-                *field = value;
-                changed = true;
-            }
-        }
-        changed
-    }
+    let keep = |vram| StepChoice { vram, ram: RamStep::Keep };
+    Some(match placement {
+        "full_gpu" => keep(VramStep::Max),
+        // The flag's legacy default followed the placement: `true` everywhere but `full_gpu`.
+        "encoder_cpu" if flag("unload_transformer_before_vae").unwrap_or(true) => keep(VramStep::Phase),
+        "encoder_cpu" => keep(VramStep::Max),
+        "model_cpu_offload" => keep(VramStep::Phase),
+        "sequential_cpu_offload" => keep(VramStep::Min),
+        _ => StepChoice::default(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -428,38 +276,28 @@ pub(super) struct Flux2KleinSettings {
     /// Sent only when `use_seed` is set; otherwise the wire value is `null`.
     pub(super) seed: u64,
     pub(super) use_seed: bool,
-    pub(super) placement: String,
+    /// «Видеопамять»: the `VramStep` wire id (`auto` / `max` / `phase` / `half` / `min`).
+    ///
+    /// Persisted as the wire id so a hand-edited file is readable; `normalized()` maps an
+    /// unknown id to `auto`. What a step MEANS is the backend's (`tiers.py`); the user's
+    /// choice is never rewritten by a run — the backend learns floors instead.
+    pub(super) vram_step: String,
+    /// «Оперативная память»: the `RamStep` wire id (`auto` / `keep` / `run` / `min`).
+    /// Same rules as `vram_step`.
+    pub(super) ram_step: String,
     pub(super) dtype: String,
-    pub(super) low_cpu_mem_usage: bool,
+    /// VAE decode in tiles. The one memory flag a run may write back: the backend's
+    /// out-of-memory recovery of the decode switches it on (`apply_backend_flags`).
     pub(super) vae_tiling: bool,
-    pub(super) vae_slicing: bool,
-    /// Move the transformer off the GPU before the VAE decode.
-    ///
-    /// The decode peaks ON TOP of a resident transformer, which is the most common
-    /// source of an out-of-memory failure; unloading first trades a short reload for
-    /// that peak. Its default follows the placement — `false` under `full_gpu`, `true`
-    /// everywhere else — which is applied in `load_flux2_settings` for a settings file
-    /// written before the field existed (serde's per-field default cannot read
-    /// `placement`).
-    pub(super) unload_transformer_before_vae: bool,
-    /// Drop the Qwen3 text encoder from memory as soon as the prompt is encoded.
-    ///
-    /// The encoder is ~16 GB and is needed exactly ONCE per generation, while the
-    /// transformer that follows it is ~18 GB: holding both at the same time fits
-    /// neither the device nor the host, and the failure mode is the kernel's OOM killer
-    /// rather than a catchable exception. Unloading costs a re-read from disk on the
-    /// next NEW prompt (tens of seconds); repeating the same prompt is free, because the
-    /// backend caches the embeddings. Its default follows the placement — `false` under
-    /// `full_gpu`, `true` everywhere else — applied in `load_flux2_settings` for a file
-    /// written before the field existed, exactly like the flag above.
-    pub(super) unload_text_encoder_after_encode: bool,
-    /// Quantize the text encoder to fp8.
-    ///
-    /// Defaults to `false` in every preset and in `Default`: it trades embedding quality
-    /// for memory, and it only helps while the encoder is actually resident — once
-    /// `unload_text_encoder_after_encode` is on, the peak is set by the transformer and
-    /// this flag no longer moves it.
+    /// Quantize the text encoder to fp8. Defaults to `false`: it trades embedding quality
+    /// for memory, and that trade is the user's alone.
     pub(super) text_encoder_fp8: bool,
+    /// «Энкодер на CPU»: the text encoder runs on the CPU and obeys only the RAM step, never
+    /// the VRAM one. It runs once per changed prompt (its result is cached), so the CPU costs
+    /// almost nothing. Default `true`, also for a file written before the field existed (the
+    /// struct-level `#[serde(default)]`). Sent as `encoder_on_cpu` in every `params`, the
+    /// forecast's included, so the forecast reflects it; honouring it is the backend's.
+    pub(super) encoder_on_cpu: bool,
     pub(super) mask_dilate_px: u32,
     pub(super) mask_feather_px: u32,
     pub(super) color_match: bool,
@@ -503,25 +341,18 @@ impl Default for Flux2KleinSettings {
             strength: 1.0,
             seed: 0,
             use_seed: false,
-            placement: Flux2Placement::FullGpu.wire().to_string(),
+            // «Авто» on both axes: the backend picks the fastest step pair that fits this
+            // machine, so a fresh install never starts on a step its card cannot hold.
+            vram_step: VramStep::Auto.wire().to_string(),
+            ram_step: RamStep::Auto.wire().to_string(),
             dtype: Flux2Dtype::Bfloat16.wire().to_string(),
-            low_cpu_mem_usage: false,
             vae_tiling: false,
-            vae_slicing: false,
-            // Nothing is unloaded by default. The encoder is loaded LAST, after the
-            // transformer already sits on the card, so it lands in host memory the pipeline
-            // has just vacated. Keeping it there is what turns a NEW prompt from a full
-            // re-read of the encoder into a single encode pass, and the host memory it
-            // costs is memory nothing else wants at that moment. The backend now loads a
-            // TRUNCATED encoder (28 of 36 decoder layers, no `lm_head`), so both the
-            // residency and the read are about a fifth smaller than they were; the exact
-            // figures that used to stand here were measured on the full model and no
-            // replacement has been measured on real hardware yet.
-            unload_transformer_before_vae: false,
-            unload_text_encoder_after_encode: false,
             // Never defaulted on: quantizing the encoder is a quality trade the user
             // makes deliberately.
             text_encoder_fp8: false,
+            // On: the encoder runs once per changed prompt, so the CPU barely costs time, and
+            // keeping it off the GPU leaves the video memory to the model that runs every step.
+            encoder_on_cpu: true,
             mask_dilate_px: 16,
             // 12 px, not 6: with a correct ramp (its width IS `mask_feather_px`) 6 px still
             // leaves a visible step — measured +9.8% excess gradient on the mask contour
@@ -538,7 +369,7 @@ impl Default for Flux2KleinSettings {
 
 impl Flux2KleinSettings {
     /// Returns a copy with every field forced into its supported range: unknown
-    /// placement/dtype/service values fall back to their defaults, numeric ranges are
+    /// step/dtype/service values fall back to their defaults, numeric ranges are
     /// clamped, and non-finite floats are replaced by the default. This is the ONLY
     /// value ever put on the wire.
     #[must_use]
@@ -588,19 +419,33 @@ impl Flux2KleinSettings {
             ),
             seed: self.seed,
             use_seed: self.use_seed,
-            placement: Flux2Placement::from_wire(&self.placement).wire().to_string(),
+            vram_step: self.step_choice().vram.wire().to_string(),
+            ram_step: self.step_choice().ram.wire().to_string(),
             dtype: Flux2Dtype::from_wire(&self.dtype).wire().to_string(),
-            low_cpu_mem_usage: self.low_cpu_mem_usage,
             vae_tiling: self.vae_tiling,
-            vae_slicing: self.vae_slicing,
-            unload_transformer_before_vae: self.unload_transformer_before_vae,
-            unload_text_encoder_after_encode: self.unload_text_encoder_after_encode,
             text_encoder_fp8: self.text_encoder_fp8,
+            encoder_on_cpu: self.encoder_on_cpu,
             mask_dilate_px: self.mask_dilate_px.min(FLUX2_DILATE_MAX),
             mask_feather_px: self.mask_feather_px.min(FLUX2_FEATHER_MAX),
             color_match: self.color_match,
             text_attention_in_mask: self.text_attention_in_mask,
         }
+    }
+
+    /// The memory step pair, an unknown persisted id reading as «Авто».
+    pub(super) fn step_choice(&self) -> StepChoice {
+        StepChoice {
+            vram: VramStep::from_wire(self.vram_step.trim()).unwrap_or(VramStep::Auto),
+            ram: RamStep::from_wire(self.ram_step.trim()).unwrap_or(RamStep::Auto),
+        }
+    }
+
+    /// Stores `choice`; returns `true` when anything changed (a save is owed).
+    pub(super) fn set_step_choice(&mut self, choice: StepChoice) -> bool {
+        let changed = self.vram_step != choice.vram.wire() || self.ram_step != choice.ram.wire();
+        self.vram_step = choice.vram.wire().to_string();
+        self.ram_step = choice.ram.wire().to_string();
+        changed
     }
 
     /// The active source mode.
@@ -670,7 +515,8 @@ impl Flux2KleinSettings {
         }
     }
 
-    /// Builds the `params` object of a generation or estimate request.
+    /// Builds the `params` object of a generation request (and, through the builder they
+    /// share, of every query about one).
     ///
     /// `self` must already be `normalized()`. `seed` is `null` unless the user pinned
     /// one, which is what the backend expects for "pick a fresh seed".
@@ -680,31 +526,35 @@ impl Flux2KleinSettings {
     /// buffer and the flag together. It does not replace the mask — the blob still carries
     /// one, and the backend refuses `whole_region = true` unless that mask is solid.
     ///
-    /// Every path that only ASKS the backend something (`.status`, `.estimate`, the
-    /// prompt-cache calls) passes `false`: no mask exists for those, and `true` would make
+    /// Every path that only ASKS the backend something (`.status`, the prompt-cache calls)
+    /// passes `false`: no mask exists for those, and `true` would make
     /// the backend apply the mode's parameter overrides — and log them — on a polling path.
     ///
     /// `text_attention_in_mask` goes out as its EFFECTIVE value — the setting AND a painted
     /// mask (`!whole_region`) — so the wire never claims a mode the run cannot have. The
-    /// `.estimate` query uses [`Flux2KleinSettings::to_estimate_params`] instead.
+    /// `large_models.profiles` forecast uses [`Flux2KleinSettings::to_profiles_params`]
+    /// instead.
     #[must_use]
     pub(super) fn to_params(&self, whole_region: bool) -> Value {
         self.params_for(whole_region, self.text_attention_in_mask && !whole_region)
     }
 
-    /// The `params` of an `.estimate` query. Like `to_params(false)` — a forecast is never
-    /// a whole-region request — except that `text_attention_in_mask` is effective only
-    /// while `mask_painted`, the host's answer of the last drawn frame: the backend adds
-    /// the attention-mask term to the forecast exactly when the flag is on, and a run
-    /// over an empty mask will not have it.
+    /// The `params` of a `large_models.profiles` forecast. Like `to_params(false)` — a
+    /// forecast is never a whole-region request — except that `text_attention_in_mask` is
+    /// effective only while `mask_painted`, the host's answer of the last drawn frame: the
+    /// backend counts the attention mask exactly when the flag is on, and a run over an
+    /// empty mask will not have it.
     #[must_use]
-    pub(super) fn to_estimate_params(&self, mask_painted: bool) -> Value {
+    pub(super) fn to_profiles_params(&self, mask_painted: bool) -> Value {
         self.params_for(false, self.text_attention_in_mask && mask_painted)
     }
 
     /// The one builder behind [`Flux2KleinSettings::to_params`] and
-    /// [`Flux2KleinSettings::to_estimate_params`]; `text_attention_in_mask` is the
+    /// [`Flux2KleinSettings::to_profiles_params`]; `text_attention_in_mask` is the
     /// already-effective wire value.
+    ///
+    /// The memory steps always travel (`vram_step` / `ram_step`, the v13 two-axis fields that
+    /// win over everything legacy), and none of the retired placement fields does.
     fn params_for(&self, whole_region: bool, text_attention_in_mask: bool) -> Value {
         // The EFFECTIVE paths, never the raw fields: in download mode the fields hold the
         // user's own configuration and must not reach the backend.
@@ -718,14 +568,12 @@ impl Flux2KleinSettings {
             "guidance_scale": self.guidance_scale,
             "strength": self.strength,
             "seed": if self.use_seed { json!(self.seed) } else { Value::Null },
-            "placement": self.placement,
+            "vram_step": self.vram_step,
+            "ram_step": self.ram_step,
             "dtype": self.dtype,
-            "low_cpu_mem_usage": self.low_cpu_mem_usage,
             "vae_tiling": self.vae_tiling,
-            "vae_slicing": self.vae_slicing,
-            "unload_transformer_before_vae": self.unload_transformer_before_vae,
-            "unload_text_encoder_after_encode": self.unload_text_encoder_after_encode,
             "text_encoder_fp8": self.text_encoder_fp8,
+            "encoder_on_cpu": self.encoder_on_cpu,
             "whole_region": whole_region,
             "mask_dilate_px": self.mask_dilate_px,
             "mask_feather_px": self.mask_feather_px,
@@ -757,57 +605,100 @@ pub(super) fn source_lang_title(code: &str) -> String {
         .map_or_else(|| code.to_string(), |lang| lang.title().to_string())
 }
 
-/// Reads `variant`'s settings file, falling back to defaults on any error (a missing file
-/// is the normal first-run case, and a corrupt one must not block the tool).
+/// A settings document as read, before the variant stamp: the settings and whether the
+/// retired memory placement was migrated into them ([`legacy_memory_steps`]).
+#[derive(Debug, Clone)]
+pub(super) struct Flux2LoadedDocument {
+    pub(super) settings: Flux2KleinSettings,
+    /// The document carried the retired placement fields and was migrated: the engine
+    /// writes it back once, without them.
+    pub(super) migrated: bool,
+}
+
+/// The outcome of the settings load the engine applies on the GUI thread.
+#[derive(Debug, Clone)]
+pub(super) struct Flux2SettingsLoad {
+    pub(super) settings: Flux2KleinSettings,
+    pub(super) migrated: bool,
+    pub(super) problem: Option<SettingsProblem>,
+}
+
+impl Flux2SettingsLoad {
+    /// Whether the engine must not write the settings file this session.
+    pub(super) fn save_blocked(&self) -> bool {
+        matches!(self.problem, Some(SettingsProblem::SaveBlocked(_)))
+    }
+}
+
+/// Reads `variant`'s settings file. Runs on a worker thread.
+///
+/// See [`load_flux2_settings_from`]; the aside name is stamped with the current Unix time.
+pub(super) fn load_flux2_settings(variant: Flux2Variant) -> Flux2SettingsLoad {
+    load_flux2_settings_from(&config::flux2_klein_settings_path(variant), variant, unix_now_secs())
+}
+
+/// Reads the settings file at `path`, which belongs to `variant`.
+///
+/// The file rules are the shared `read_settings_file`: a missing file is the normal first
+/// run (defaults); a file that is not a readable settings document is NEVER silently
+/// replaced — it is moved aside to the first free `<stem>.malformed-<unix_secs>[-<n>].json`
+/// beside it and defaults load, or, when that fails (or the file cannot be read at all),
+/// defaults load with saving BLOCKED. Both cases are logged and reported in
+/// [`Flux2SettingsLoad::problem`] for the panel. A readable document is migrated
+/// ([`settings_from_json`]) and the migration is logged.
 ///
 /// The returned document always carries `variant`, whatever the file said: the file that
 /// was read is the one that BELONGS to this engine, so a document copied over from the
 /// other variant must not keep claiming to describe the other model's paths.
-pub(super) fn load_flux2_settings(variant: Flux2Variant) -> Flux2KleinSettings {
-    let path = config::flux2_klein_settings_path(variant);
-    let mut settings = match fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<Value>(&raw) {
-            Ok(value) => settings_from_json(&value),
-            Err(_) => Flux2KleinSettings::default(),
-        },
-        Err(_) => Flux2KleinSettings::default(),
+pub(super) fn load_flux2_settings_from(path: &Path, variant: Flux2Variant, unix_secs: u64) -> Flux2SettingsLoad {
+    let read = read_settings_file(path, unix_secs, FLUX2_LOG_LABEL, settings_from_json);
+    let (settings, migrated) = match read.document {
+        Some(document) => {
+            if document.migrated {
+                ms_log::runtime_log::log_info(format!(
+                    "[cleaning] FLUX.2 klein settings {}: the retired memory placement was migrated to vram_step={} ram_step={}",
+                    path.display(),
+                    document.settings.vram_step,
+                    document.settings.ram_step
+                ));
+            }
+            (document.settings, document.migrated)
+        }
+        None => (Flux2KleinSettings::default(), false),
     };
-    settings.variant = variant.wire().to_string();
-    settings
+    let mut load = Flux2SettingsLoad { settings, migrated, problem: read.problem };
+    // Stamps the owning variant over whatever the document said.
+    load.settings.variant = variant.wire().to_string();
+    load
 }
 
-/// Deserializes a settings document and migrates the placement-dependent memory flags.
+/// Deserializes a settings document and migrates the retired memory placement.
 ///
-/// Split out of [`load_flux2_settings`] so the migration itself is testable without a
-/// settings file on disk: the file I/O has no contract worth asserting, this does.
+/// Split out of the loader so the migration is testable without a file on disk.
 ///
-/// A document that is not a settings object at all deserializes to `Default`, which is
-/// the same "a corrupt file must not block the tool" rule the caller applies.
-pub(super) fn settings_from_json(value: &Value) -> Flux2KleinSettings {
-    let has_boolean = |name: &str| value.get(name).is_some_and(Value::is_boolean);
-    let has_unload_transformer = has_boolean("unload_transformer_before_vae");
-    let has_unload_text_encoder = has_boolean("unload_text_encoder_after_encode");
-    let mut settings: Flux2KleinSettings =
-        serde_json::from_value(value.clone()).unwrap_or_default();
-    // `unload_transformer_before_vae` defaults from the PLACEMENT, which a serde
-    // per-field default cannot read: it sees one field at a time and never its siblings.
-    // A file written before the flag existed gets it derived here — `false` under
-    // `full_gpu` (nothing is unloaded, everything already fits), `true` for every
-    // economical placement — while a file that carries it keeps the user's choice.
+/// # Errors
+/// The `serde_json` error when the value is not a settings object (or a field has the wrong
+/// type): the loader then treats the file as damaged and moves it aside, instead of
+/// loading defaults over it and overwriting it on the next save.
+pub(super) fn settings_from_json(value: &Value) -> Result<Flux2LoadedDocument, serde_json::Error> {
+    // serde also builds a struct from a JSON ARRAY (field by position): `["9b", "download"]`
+    // would load as a variant and a source mode. Only an object is a settings document; anything
+    // else is damaged and moved aside.
+    if !value.is_object() {
+        return Err(<serde_json::Error as serde::de::Error>::custom("the settings document is not a JSON object"));
+    }
+    let mut settings: Flux2KleinSettings = serde_json::from_value(value.clone())?;
     // An ABSENT variant is what every file written before the 4B engine existed looks
     // like, and serde's `#[serde(default)]` already answers `9b` for it. A PRESENT but
     // unrecognized token is normalized here for the same reason every other wire enum is:
     // a hand-edited value must not reach a path derivation as an unknown literal.
     settings.variant = Flux2Variant::from_wire(&settings.variant).wire().to_string();
-    let economical = Flux2Placement::from_wire(&settings.placement) != Flux2Placement::FullGpu;
-    if !has_unload_transformer {
-        settings.unload_transformer_before_vae = economical;
-    }
-    // The ENCODER flag does not follow the placement: the encoder is loaded last, after
-    // the transformer already sits on the card, so it lands in host memory the pipeline
-    // has just vacated and there is nothing to save by dropping it. `false` everywhere.
-    if !has_unload_text_encoder {
-        settings.unload_text_encoder_after_encode = false;
+    // The retired placement fields (`placement`, `low_cpu_mem_usage`, `vae_slicing`,
+    // `unload_transformer_before_vae`, `unload_text_encoder_after_encode`) map to no field
+    // any more; serde drops them, and only `legacy_memory_steps` still reads them, once.
+    let migration = legacy_memory_steps(value);
+    if let Some(choice) = migration {
+        settings.set_step_choice(choice);
     }
     // A file written before the prompt had a default — or one the user emptied — loads
     // with the default prompt rather than with a blank field. A blank prompt is not a
@@ -817,9 +708,6 @@ pub(super) fn settings_from_json(value: &Value) -> Flux2KleinSettings {
     if settings.prompt.trim().is_empty() {
         settings.prompt = FLUX2_DEFAULT_PROMPT.to_string();
     }
-    // `text_encoder_fp8` needs no migration: its default is `false` for EVERY placement,
-    // which is exactly what serde's `#[serde(default)]` already produces.
-    //
     // A file written by a build that still had the «Работа без маски» checkbox carries a
     // `whole_region` key that no longer maps to a field; older files likewise carry
     // `max_sequence_length` (pinned to `FLUX2_MAX_SEQ` now) and `brush_radius` (the brush
@@ -828,7 +716,7 @@ pub(super) fn settings_from_json(value: &Value) -> Flux2KleinSettings {
     // silently, the document loads with every other setting intact, and the next save simply
     // writes it out without them. The mode `whole_region` used to hold is derived from the
     // painted mask now (`mask_for_run`), so there is nothing left for a stored value to mean.
-    settings
+    Ok(Flux2LoadedDocument { settings, migrated: migration.is_some() })
 }
 
 /// Writes `settings` into the file of the variant the document itself names.
@@ -842,15 +730,11 @@ pub(super) fn settings_from_json(value: &Value) -> Flux2KleinSettings {
 /// Returns a user-facing message when the data directory cannot be created, when the
 /// settings cannot be serialized, or when the write fails.
 pub(super) fn save_flux2_settings(settings: &Flux2KleinSettings) -> Result<(), String> {
-    let path = config::flux2_klein_settings_path(settings.variant());
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| tf!("cleaning.settings_io.create_dir_error", err = err))?;
-    }
-    let raw = serde_json::to_string_pretty(settings)
-        .map_err(|err| tf!("cleaning.tools.flux2_klein.serialize_settings_error", err = err))?;
-    fs::write(&path, raw)
-        .map_err(|err| tf!("cleaning.tools.flux2_klein.write_settings_error", err = err))
+    write_settings_json(&config::flux2_klein_settings_path(settings.variant()), settings).map_err(|err| match err {
+        SettingsWriteError::CreateDir(err) => tf!("cleaning.settings_io.create_dir_error", err = err),
+        SettingsWriteError::Serialize(err) => tf!("cleaning.tools.flux2_klein.serialize_settings_error", err = err),
+        SettingsWriteError::Write(err) => tf!("cleaning.tools.flux2_klein.write_settings_error", err = err),
+    })
 }
 
 #[cfg(test)]
@@ -858,19 +742,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placement_wire_roundtrip() {
-        for placement in Flux2Placement::all() {
-            assert_eq!(Flux2Placement::from_wire(placement.wire()), placement);
-        }
-        assert_eq!(
-            Flux2Placement::from_wire("bogus"),
-            Flux2Placement::FullGpu,
-            "an unknown placement must fall back to the default"
-        );
-    }
-
-    #[test]
-    fn defaults_match_the_distilled_checkpoint() {
+    fn defaults_match_the_distilled_checkpoint_and_start_on_auto() {
         let settings = Flux2KleinSettings::default();
         assert_eq!(settings.steps, 4);
         assert!((settings.guidance_scale - 1.0).abs() < f32::EPSILON);
@@ -879,102 +751,13 @@ mod tests {
         assert_eq!(settings.mask_dilate_px, 16);
         assert_eq!(settings.mask_feather_px, 12);
         assert!(settings.color_match);
-        // The default placement is `full_gpu`, where the transformer stays put...
-        assert!(!settings.unload_transformer_before_vae);
-        // ...and the encoder is kept too: loaded LAST, it occupies host memory the
-        // pipeline has already vacated, and keeping it spares every new prompt a full
-        // re-read of the encoder.
-        assert!(!settings.unload_text_encoder_after_encode);
+        assert_eq!(settings.step_choice(), StepChoice::default(), "«Авто» / «Авто»");
         // Quantizing the text encoder is never defaulted on.
         assert!(!settings.text_encoder_fp8);
-    }
-
-    #[test]
-    fn presets_pin_the_unload_flags_and_never_the_fp8_one() {
-        let mut settings = Flux2KleinSettings::default();
-        MemoryPreset::MaxSpeed.apply(&mut settings);
-        assert!(!settings.unload_transformer_before_vae);
-        // No preset releases the encoder: keeping it costs host memory the pipeline no
-        // longer needs and saves a full encoder re-read on every new prompt.
-        assert!(!settings.unload_text_encoder_after_encode);
-        for preset in [
-            MemoryPreset::Balanced,
-            MemoryPreset::MinRam,
-            MemoryPreset::MinVram,
-        ] {
-            let mut settings = Flux2KleinSettings::default();
-            preset.apply(&mut settings);
-            assert!(
-                settings.unload_transformer_before_vae,
-                "every economical preset unloads before the VAE decode"
-            );
-            assert!(
-                !settings.unload_text_encoder_after_encode,
-                "no preset drops the text encoder: it is loaded last, into host memory \
-                 the pipeline has already vacated"
-            );
-        }
-        // fp8 is a quality trade and belongs to the user, so NO preset turns it on —
-        // including the one whose whole purpose is the smallest VRAM footprint.
-        for preset in MemoryPreset::selectable() {
-            let mut settings = Flux2KleinSettings {
-                text_encoder_fp8: true,
-                ..Flux2KleinSettings::default()
-            };
-            preset.apply(&mut settings);
-            assert!(
-                !settings.text_encoder_fp8,
-                "{:?} must clear fp8, not carry it",
-                preset
-            );
-        }
-    }
-
-    #[test]
-    fn the_unload_flags_migrate_from_the_placement_and_fp8_does_not() {
-        // A file written before either flag existed: `full_gpu` unloads nothing …
-        let old_full_gpu = json!({ "placement": "full_gpu", "steps": 4 });
-        let migrated = settings_from_json(&old_full_gpu);
-        assert!(!migrated.unload_transformer_before_vae);
-        assert!(!migrated.unload_text_encoder_after_encode);
-        assert!(!migrated.text_encoder_fp8);
-        // … while every economical placement unloads the TRANSFORMER, which `Default`
-        // alone (it only knows the `full_gpu` case) would have got wrong. The encoder
-        // flag is `false` regardless of placement — see `settings_from_json`.
-        for placement in ["encoder_cpu", "model_cpu_offload", "sequential_cpu_offload"] {
-            let migrated = settings_from_json(&json!({ "placement": placement }));
-            assert!(
-                migrated.unload_transformer_before_vae,
-                "{placement} must unload the transformer"
-            );
-            assert!(
-                !migrated.unload_text_encoder_after_encode,
-                "{placement} must KEEP the text encoder: it is loaded last, into host \
-                 memory the pipeline has vacated"
-            );
-            assert!(
-                !migrated.text_encoder_fp8,
-                "{placement} must not silently quantize the encoder"
-            );
-        }
-        // A file that CARRIES the flags keeps the user's own choice, migration or not.
-        let explicit = settings_from_json(&json!({
-            "placement": "encoder_cpu",
-            "unload_transformer_before_vae": false,
-            "unload_text_encoder_after_encode": false,
-            "text_encoder_fp8": true
-        }));
-        assert!(!explicit.unload_transformer_before_vae);
-        assert!(!explicit.unload_text_encoder_after_encode);
-        assert!(explicit.text_encoder_fp8);
-    }
-
-    #[test]
-    fn partial_json_uses_defaults() {
-        let settings: Flux2KleinSettings =
-            serde_json::from_str("{}").expect("deserialize empty object");
-        assert_eq!(settings.steps, 4);
-        assert_eq!(settings.placement, "full_gpu");
+        let partial = loaded_settings(&json!({}));
+        assert_eq!(partial.steps, 4);
+        assert_eq!(partial.vram_step, "auto");
+        assert_eq!(partial.ram_step, "auto");
     }
 
     #[test]
@@ -985,7 +768,8 @@ mod tests {
             strength: 0.0,
             mask_dilate_px: 999,
             mask_feather_px: 999,
-            placement: "nonsense".to_string(),
+            vram_step: "turbo".to_string(),
+            ram_step: " keep ".to_string(),
             dtype: "nonsense".to_string(),
             mt_service: "nonsense".to_string(),
             source_lang: "nonsense".to_string(),
@@ -998,14 +782,151 @@ mod tests {
         assert!((norm.strength - FLUX2_STRENGTH_MIN).abs() < f32::EPSILON);
         assert_eq!(norm.mask_dilate_px, FLUX2_DILATE_MAX);
         assert_eq!(norm.mask_feather_px, FLUX2_FEATHER_MAX);
-        assert_eq!(norm.placement, "full_gpu");
+        assert_eq!(norm.vram_step, "auto", "an unknown step id normalizes to «Авто»");
+        assert_eq!(norm.ram_step, "keep", "a padded known id is kept");
         assert_eq!(norm.dtype, "bfloat16");
         assert_eq!(norm.mt_service, "google");
         assert_eq!(norm.source_lang, "auto");
         assert_eq!(norm.text_encoder_path, "/models/qwen3");
-        assert!(norm.to_params(false)["unload_transformer_before_vae"].is_boolean());
-        assert!(norm.to_params(false)["unload_text_encoder_after_encode"].is_boolean());
-        assert!(norm.to_params(false)["text_encoder_fp8"].is_boolean());
+    }
+
+    /// The run carries the two step ids and none of the retired placement fields.
+    #[test]
+    fn params_carry_the_steps_and_none_of_the_retired_fields() {
+        let mut settings = runnable_settings();
+        assert!(settings.set_step_choice(StepChoice { vram: VramStep::Half, ram: RamStep::Run }));
+        assert!(!settings.set_step_choice(StepChoice { vram: VramStep::Half, ram: RamStep::Run }), "no change, no save");
+        for params in [settings.normalized().to_params(false), settings.normalized().to_profiles_params(true)] {
+            assert_eq!(params["vram_step"], json!("half"));
+            assert_eq!(params["ram_step"], json!("run"));
+            assert!(params["vae_tiling"].is_boolean());
+            assert!(params["text_encoder_fp8"].is_boolean());
+            for retired in ["placement", "profile", "low_cpu_mem_usage", "vae_slicing", "unload_transformer_before_vae", "unload_text_encoder_after_encode"] {
+                assert!(params.get(retired).is_none(), "`{retired}` must not reach the wire");
+            }
+        }
+    }
+
+    /// The placement mapping table, row by row, for documents that are NOT the untouched default.
+    #[test]
+    fn the_legacy_placement_migrates_by_the_mapping_table() {
+        let pair = |vram, ram| Some(StepChoice { vram, ram });
+        let cases = [
+            // `full_gpu` with any non-default flag is an explicit choice: the strict pair.
+            (json!({ "placement": "full_gpu", "vae_tiling": true }), pair(VramStep::Max, RamStep::Keep)),
+            (json!({ "placement": "full_gpu", "low_cpu_mem_usage": true }), pair(VramStep::Max, RamStep::Keep)),
+            (json!({ "placement": "encoder_cpu", "unload_transformer_before_vae": false }), pair(VramStep::Max, RamStep::Keep)),
+            (json!({ "placement": "encoder_cpu", "unload_transformer_before_vae": true }), pair(VramStep::Phase, RamStep::Keep)),
+            // Absent flag: derived as `placement != full_gpu`, i.e. `true` here.
+            (json!({ "placement": "encoder_cpu" }), pair(VramStep::Phase, RamStep::Keep)),
+            (json!({ "placement": "model_cpu_offload" }), pair(VramStep::Phase, RamStep::Keep)),
+            (json!({ "placement": "sequential_cpu_offload", "vae_slicing": true }), pair(VramStep::Min, RamStep::Keep)),
+            (json!({ "placement": " sequential_cpu_offload " }), pair(VramStep::Min, RamStep::Keep)),
+            // An unknown placement: «Авто» / «Авто».
+            (json!({ "placement": "quantum" }), pair(VramStep::Auto, RamStep::Auto)),
+        ];
+        for (document, expected) in cases {
+            assert_eq!(legacy_memory_steps(&document), expected, "{document}");
+            let migrated = settings_from_json(&document).expect("a valid document");
+            assert!(migrated.migrated, "{document}");
+            assert_eq!(Some(migrated.settings.step_choice()), expected, "{document}");
+        }
+    }
+
+    /// Q1: a document whose seven memory fields are all still the shipped defaults was
+    /// never touched (the default `full_gpu` cannot be told apart from an explicit
+    /// «Максимум скорости»), and migrates to «Авто» / «Авто» rather than to the strict pair.
+    #[test]
+    fn an_untouched_default_document_migrates_to_auto() {
+        let shipped_defaults = json!({
+            "placement": "full_gpu",
+            "low_cpu_mem_usage": false,
+            "vae_tiling": false,
+            "vae_slicing": false,
+            "unload_transformer_before_vae": false,
+            "unload_text_encoder_after_encode": false,
+            "text_encoder_fp8": false,
+            "prompt": "a red balloon"
+        });
+        assert_eq!(legacy_memory_steps(&shipped_defaults), Some(StepChoice::default()));
+        // A file older than some of the flags carries fewer keys: absent reads as default.
+        assert_eq!(legacy_memory_steps(&json!({ "placement": "full_gpu", "steps": 4 })), Some(StepChoice::default()));
+        // Any ONE flag away from its default is an explicit choice.
+        for (flag, _) in LEGACY_MEMORY_FLAGS_AND_DEFAULTS {
+            let mut touched = shipped_defaults.clone();
+            touched[flag] = json!(true);
+            assert_eq!(
+                legacy_memory_steps(&touched),
+                Some(StepChoice { vram: VramStep::Max, ram: RamStep::Keep }),
+                "`{flag}` changed: the table decides"
+            );
+        }
+        let migrated = settings_from_json(&shipped_defaults).expect("valid");
+        assert!(migrated.migrated);
+        assert_eq!(migrated.settings.step_choice(), StepChoice::default());
+        assert_eq!(migrated.settings.prompt, "a red balloon", "the migration costs nothing else");
+    }
+
+    /// A document that has either step field is never re-migrated (steps win over a stale
+    /// placement), and a migrated document written back is stable.
+    #[test]
+    fn the_migration_is_idempotent_and_steps_win() {
+        let both = json!({ "placement": "sequential_cpu_offload", "vram_step": "half", "ram_step": "run" });
+        assert_eq!(legacy_memory_steps(&both), None);
+        let loaded = settings_from_json(&both).expect("valid");
+        assert!(!loaded.migrated);
+        assert_eq!(loaded.settings.step_choice(), StepChoice { vram: VramStep::Half, ram: RamStep::Run });
+        let one = json!({ "placement": "sequential_cpu_offload", "ram_step": "min" });
+        assert_eq!(legacy_memory_steps(&one), None, "one step field is enough to stop the migration");
+        assert_eq!(loaded_settings(&one).step_choice(), StepChoice { vram: VramStep::Auto, ram: RamStep::Min });
+
+        let first = settings_from_json(&json!({ "placement": "model_cpu_offload" })).expect("valid");
+        assert!(first.migrated);
+        let written = serde_json::to_value(&first.settings).expect("serialize");
+        assert!(written.get("placement").is_none());
+        let second = settings_from_json(&written).expect("valid");
+        assert!(!second.migrated, "a written-back document is never migrated again");
+        assert_eq!(second.settings.step_choice(), first.settings.step_choice());
+        // No placement at all: nothing to migrate.
+        assert_eq!(legacy_memory_steps(&json!({ "steps": 4 })), None);
+        // An unknown step id in the file reads as «Авто».
+        assert_eq!(loaded_settings(&json!({ "vram_step": "warp" })).step_choice().vram, VramStep::Auto);
+    }
+
+    /// A damaged file is MOVED ASIDE, never overwritten; a missing one is a first run; a
+    /// readable one loads (and is migrated). Scratch files live under the OS temp dir.
+    #[test]
+    fn a_damaged_settings_file_is_moved_aside() {
+        let dir = std::env::temp_dir().join(format!("ms_flux2_settings_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let path = dir.join("flux2_klein_settings.json");
+
+        let missing = load_flux2_settings_from(&path, Flux2Variant::Klein4B, 7);
+        assert!(missing.problem.is_none() && !missing.migrated);
+        assert_eq!(missing.settings.variant(), Flux2Variant::Klein4B, "the owning variant is stamped");
+
+        // `["9b", "download"]` is valid JSON that serde would read field by position.
+        for damaged in ["{ not json", "", "[1, 2]", "[\"9b\", \"download\"]", "\"text\"", "{\"steps\": \"many\"}"] {
+            std::fs::write(&path, damaged).expect("write the damaged file");
+            let load = load_flux2_settings_from(&path, Flux2Variant::Klein9B, 42);
+            let aside = malformed_aside_path(&path, 42, 0);
+            assert_eq!(load.problem, Some(SettingsProblem::MovedAside(aside.clone())), "{damaged:?}");
+            assert!(!load.save_blocked());
+            assert!(!path.exists(), "the damaged file left its place");
+            assert_eq!(std::fs::read_to_string(&aside).expect("the aside copy"), damaged, "kept byte for byte");
+            std::fs::remove_file(&aside).expect("remove the aside copy");
+        }
+        assert_eq!(malformed_aside_path(&path, 42, 0).file_name().and_then(|n| n.to_str()), Some("flux2_klein_settings.malformed-42.json"));
+        assert_eq!(malformed_aside_path(&path, 42, 3).file_name().and_then(|n| n.to_str()), Some("flux2_klein_settings.malformed-42-3.json"));
+
+        std::fs::write(&path, r#"{ "placement": "encoder_cpu", "prompt": "a cat" }"#).expect("write a legacy file");
+        let legacy = load_flux2_settings_from(&path, Flux2Variant::Klein9B, 1);
+        assert!(legacy.problem.is_none());
+        assert!(legacy.migrated, "the engine writes it back once");
+        assert_eq!(legacy.settings.step_choice(), StepChoice { vram: VramStep::Phase, ram: RamStep::Keep });
+        std::fs::remove_file(&path).expect("remove the legacy file");
+
+        std::fs::remove_dir_all(&dir).expect("remove the scratch dir");
     }
 
     #[test]
@@ -1045,41 +966,6 @@ mod tests {
         assert!(pinned.to_params(false).get("negative_prompt").is_none());
     }
 
-    #[test]
-    fn presets_are_detected_back_from_their_own_values() {
-        for preset in MemoryPreset::selectable() {
-            let mut settings = Flux2KleinSettings::default();
-            preset.apply(&mut settings);
-            assert_eq!(MemoryPreset::detect(&settings), preset);
-        }
-    }
-
-    #[test]
-    fn a_hand_edited_combination_reports_custom() {
-        let mut settings = Flux2KleinSettings::default();
-        MemoryPreset::Balanced.apply(&mut settings);
-        settings.vae_slicing = !settings.vae_slicing;
-        assert_eq!(MemoryPreset::detect(&settings), MemoryPreset::Custom);
-        // The two new fields are owned by the preset too, so toggling either of them
-        // alone must move the picker off the preset just as the VAE flags do.
-        for flip in [
-            |s: &mut Flux2KleinSettings| {
-                s.unload_text_encoder_after_encode = !s.unload_text_encoder_after_encode;
-            },
-            |s: &mut Flux2KleinSettings| s.text_encoder_fp8 = !s.text_encoder_fp8,
-        ] {
-            let mut settings = Flux2KleinSettings::default();
-            MemoryPreset::Balanced.apply(&mut settings);
-            flip(&mut settings);
-            assert_eq!(MemoryPreset::detect(&settings), MemoryPreset::Custom);
-        }
-        // `Custom` owns no values, so applying it must not touch anything.
-        let before = settings.clone();
-        assert!(!MemoryPreset::Custom.apply(&mut settings));
-        assert_eq!(before.placement, settings.placement);
-        assert_eq!(before.vae_slicing, settings.vae_slicing);
-    }
-
     /// The mode is not a setting any more, so the only thing left to pin about the wire
     /// is that the flag the caller derived is the flag that reaches the backend.
     #[test]
@@ -1112,7 +998,7 @@ mod tests {
         {
             let mut settings = runnable_settings();
             settings.text_attention_in_mask = setting;
-            let params = settings.normalized().to_estimate_params(painted);
+            let params = settings.normalized().to_profiles_params(painted);
             assert_eq!(params["text_attention_in_mask"], json!(expected), "setting {setting}, painted {painted}");
             assert_eq!(params["whole_region"], json!(false), "a forecast is never a whole-region request");
         }
@@ -1133,6 +1019,30 @@ mod tests {
         assert!(!round.text_attention_in_mask, "an explicit `false` is kept");
     }
 
+    /// «Энкодер на CPU» defaults ON — for a fresh document AND for one written before the
+    /// field existed — survives normalization and a round trip, and travels as
+    /// `encoder_on_cpu` in the run `params` AND in the forecast's.
+    #[test]
+    fn encoder_on_cpu_defaults_on_and_reaches_the_run_and_the_forecast() {
+        assert!(Flux2KleinSettings::default().encoder_on_cpu);
+        let old = loaded_settings(&json!({ "prompt": "remove the text", "vram_step": "half" }));
+        assert!(old.encoder_on_cpu, "a document without the field reads as on");
+        for flag in [true, false] {
+            let settings = Flux2KleinSettings { encoder_on_cpu: flag, ..runnable_settings() };
+            let round: Flux2KleinSettings =
+                serde_json::from_str(&serde_json::to_string(&settings).expect("serializes")).expect("round-trips");
+            assert_eq!(round.encoder_on_cpu, flag, "an explicit value is kept");
+            let normalized = settings.normalized();
+            assert_eq!(normalized.encoder_on_cpu, flag);
+            for whole_region in [false, true] {
+                assert_eq!(normalized.to_params(whole_region)["encoder_on_cpu"], json!(flag), "run params");
+            }
+            for painted in [false, true] {
+                assert_eq!(normalized.to_profiles_params(painted)["encoder_on_cpu"], json!(flag), "forecast params");
+            }
+        }
+    }
+
     /// A settings file written by an older build carries keys nothing maps to any more:
     /// `whole_region` (the mode is derived from the mask), `max_sequence_length` (pinned to
     /// [`FLUX2_MAX_SEQ`]) and `brush_radius` (the brush belongs to the host). The struct does
@@ -1150,13 +1060,13 @@ mod tests {
             "brush_radius": 64,
             "mask_dilate_px": 8
         });
-        let migrated = settings_from_json(&old);
+        let migrated = loaded_settings(&old);
         assert_eq!(migrated.text_encoder_path, "/a", "the removed keys must not cost the rest");
         assert_eq!(migrated.transformer_path, "/b");
         assert_eq!(migrated.vae_path, "/c");
         assert_eq!(migrated.mask_dilate_px, 8);
         // The neighbouring placement migration still runs on such a document.
-        assert!(migrated.unload_transformer_before_vae);
+        assert_eq!(migrated.step_choice(), StepChoice { vram: VramStep::Min, ram: RamStep::Keep });
         // A stale `max_sequence_length` cannot lower what goes on the wire any more.
         assert_eq!(
             migrated.normalized().to_params(false)["max_sequence_length"],
@@ -1170,7 +1080,7 @@ mod tests {
             map.remove("max_sequence_length");
             map.remove("brush_radius");
         }
-        let plain = settings_from_json(&without);
+        let plain = loaded_settings(&without);
         assert_eq!(
             serde_json::to_value(&migrated).expect("serialize"),
             serde_json::to_value(&plain).expect("serialize"),
@@ -1188,7 +1098,7 @@ mod tests {
         };
         let stored = serde_json::to_value(&settings).expect("settings serialize");
         assert_eq!(stored["uncensored_text_encoder"], json!(true));
-        let reloaded = settings_from_json(&stored);
+        let reloaded = loaded_settings(&stored);
         assert!(reloaded.uncensored_text_encoder);
         assert!(settings.normalized().uncensored_text_encoder);
 
@@ -1224,7 +1134,7 @@ mod tests {
         let stored = serde_json::to_value(&settings).expect("settings serialize");
         assert_eq!(stored["source_mode"], json!("download"));
         assert_eq!(
-            settings_from_json(&stored).source_mode(),
+            loaded_settings(&stored).source_mode(),
             Flux2SourceMode::Download
         );
 
@@ -1238,7 +1148,7 @@ mod tests {
             .remove("source_mode");
         assert!(legacy.get("source_mode").is_none());
         assert_eq!(
-            settings_from_json(&legacy).source_mode(),
+            loaded_settings(&legacy).source_mode(),
             Flux2SourceMode::Manual,
             "a file without the field must load as manual"
         );
@@ -1401,9 +1311,11 @@ mod tests {
             "the historic settings path must not move"
         );
 
-        // Every field the previous build persisted, and the ONE the variant added. A field
-        // that disappears from this list silently drops a user setting on the next save.
-        const HISTORIC_KEYS: [&str; 26] = [
+        // Every field the previous build persisted that is still a setting. A field that
+        // disappears from this list silently drops a user setting on the next save. The five
+        // retired memory-placement fields left it on purpose: they migrate into the two step
+        // axes once (`legacy_memory_steps`) and are written out without them.
+        const HISTORIC_KEYS: [&str; 21] = [
             "source_mode",
             "text_encoder_path",
             "uncensored_text_encoder",
@@ -1419,13 +1331,8 @@ mod tests {
             "strength",
             "seed",
             "use_seed",
-            "placement",
             "dtype",
-            "low_cpu_mem_usage",
             "vae_tiling",
-            "vae_slicing",
-            "unload_transformer_before_vae",
-            "unload_text_encoder_after_encode",
             "text_encoder_fp8",
             "mask_dilate_px",
             "mask_feather_px",
@@ -1442,18 +1349,23 @@ mod tests {
             .map(String::as_str)
             .filter(|key| !HISTORIC_KEYS.contains(key))
             .collect();
-        // Key order (`serde_json` without `preserve_order`). Both are ADDITIVE: the variant
-        // came with the second engine and «Внимание только к маске» with the pinned run
-        // options; a document without either still loads (`#[serde(default)]`).
+        // Key order (`serde_json` without `preserve_order`). All are ADDITIVE: the variant
+        // came with the second engine, «Внимание только к маске» with the pinned run
+        // options, the two step axes with the large-model manager and «Энкодер на CPU» with
+        // the encoder placement; a document without any of them still loads
+        // (`#[serde(default)]`).
         assert_eq!(
             added,
-            ["text_attention_in_mask", "variant"],
-            "only the variant and the run option were added to the historic document"
+            ["encoder_on_cpu", "ram_step", "text_attention_in_mask", "variant", "vram_step"],
+            "only the variant, the run option, the two step axes and the encoder placement were added"
         );
+        for retired in ["placement", "low_cpu_mem_usage", "vae_slicing", "unload_transformer_before_vae", "unload_text_encoder_after_encode"] {
+            assert!(!object.contains_key(retired), "the retired `{retired}` must not be written back");
+        }
 
         // A document written by the previous build carries no `variant` and must load as
         // the 9B engine with every value the user typed intact.
-        let legacy = settings_from_json(&json!({
+        let legacy = loaded_settings(&json!({
             "source_mode": "manual",
             "text_encoder_path": "/home/u/sd_models/qwen3",
             "transformer_path": "/home/u/sd_models/flux2.safetensors",

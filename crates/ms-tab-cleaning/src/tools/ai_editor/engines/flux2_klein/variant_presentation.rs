@@ -40,6 +40,11 @@ pub(super) trait Flux2VariantPresentation {
     /// A repository ID is a backend identifier and stays literal in the UI, exactly like
     /// the ids the `.download.check` rows carry.
     fn model_repo(self) -> &'static str;
+
+    /// The gated Hugging Face repository of the UNCENSORED text encoder the download can fetch
+    /// instead of the official one, `None` for a variant that has none published
+    /// (`Flux2Variant::supports_uncensored_encoder`). Literal for the same reason.
+    fn uncensored_encoder_repo(self) -> Option<&'static str>;
 }
 
 impl Flux2VariantPresentation for Flux2Variant {
@@ -54,6 +59,13 @@ impl Flux2VariantPresentation for Flux2Variant {
         match self {
             Flux2Variant::Klein9B => "black-forest-labs/FLUX.2-klein-9B",
             Flux2Variant::Klein4B => "black-forest-labs/FLUX.2-klein-4B",
+        }
+    }
+
+    fn uncensored_encoder_repo(self) -> Option<&'static str> {
+        match self {
+            Flux2Variant::Klein9B => Some("ponpoke/flux2-klein-9b-uncensored-text-encoder"),
+            Flux2Variant::Klein4B => None,
         }
     }
 }
@@ -71,6 +83,16 @@ mod tests {
         assert_eq!(Flux2Variant::Klein9B.model_repo(), "black-forest-labs/FLUX.2-klein-9B");
         assert_eq!(Flux2Variant::Klein4B.model_repo(), "black-forest-labs/FLUX.2-klein-4B");
         assert_ne!(Flux2Variant::Klein9B.model_repo(), Flux2Variant::Klein4B.model_repo());
+    }
+
+    /// The uncensored encoder's repository exists exactly where the capability gate says one
+    /// is published, so the access hint never links a repository the download cannot use.
+    #[test]
+    fn only_a_variant_with_an_uncensored_encoder_names_its_repository() {
+        for variant in Flux2Variant::all() {
+            assert_eq!(variant.uncensored_encoder_repo().is_some(), variant.supports_uncensored_encoder(), "{variant:?}");
+        }
+        assert_eq!(Flux2Variant::Klein9B.uncensored_encoder_repo(), Some("ponpoke/flux2-klein-9b-uncensored-text-encoder"));
     }
 
     /// A caption is what the picker distinguishes the two entries by, so an empty or

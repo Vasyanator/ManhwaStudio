@@ -639,8 +639,8 @@ class _OnnxDeviceSelector:
 
 
 #: `General.<key>` of the large-model pool's user limits. Absent (or `null`) means "no
-#: limit"; these Python-side defaults are the only ones in stage 1 (the Rust
-#: `ms-config` defaults tree does not list the keys yet).
+#: limit". Neither defaults tree lists them (`config.py`, Rust `ms-config`, whose test
+#: guards the absence): this store is their only writer.
 LARGE_MODELS_VRAM_CAP_KEY = "large_models_vram_cap_bytes"
 LARGE_MODELS_RAM_CAP_KEY = "large_models_ram_cap_bytes"
 #: A key an earlier stage-1 build wrote (the between-runs keep policy). The VRAM /

@@ -3,7 +3,7 @@ File: modules/ai_backend/engines/test_model_download.py
 
 Purpose:
 Unit tests for the shared staged-download primitive used by `inpaint/flux_fill.py`,
-`inpaint/flux2_download.py` and `watermark/service.py`.
+`inpaint/hf_gated_download.py` and `watermark/service.py`.
 
 Main responsibilities:
 - verify a destination that is already on disk is not fetched again;

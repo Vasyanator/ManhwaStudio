@@ -21,8 +21,9 @@ Main responsibilities:
   small-model pool `SmallModelManager(arbiter=...)` and the large-model pool
   `LargeModelManager(arbiter, ...)` over the same arbiter and probes, its limits
   persisted in `user_config` through `AiDeviceService` and its learned floors in
-  `<model cache root>/large_models/limits.json`; the FLUX.2 klein service is the
-  `large_models.profiles` adapter of `flux2_klein` (`large_model_adapters`);
+  `<model cache root>/large_models/limits.json`; the FLUX.2 / FLUX.3 klein
+  services are the `large_models.profiles` adapters of `flux2_klein` /
+  `flux3_klein` (`large_model_adapters`);
 - apply the Linux OOM backstop (`General.large_models_oom_score_adj`) at start;
 - maintain a non-blocking health snapshot and publish it as a `health` event on
   the IPC event bus;
@@ -79,6 +80,7 @@ from .inpaint.lama_mpe import LamaMpeInpaintService
 from .inpaint.sdxl import SdxlInpaintService
 from .inpaint.flux_fill import FluxFillInpaintService
 from .inpaint.flux2_klein import Flux2KleinInpaintService
+from .inpaint.flux3_klein.service import Flux3KleinService
 from .watermark.service import WatermarkRemovalService
 from .reline.service import RelineService
 from .translate.machine_translation import MachineTranslationService
@@ -128,6 +130,7 @@ class AppState:
     sdxl_inpaint: SdxlInpaintService
     flux_fill_inpaint: FluxFillInpaintService
     flux2_klein_inpaint: Flux2KleinInpaintService
+    flux3_klein: Flux3KleinService
     watermark: WatermarkRemovalService
     reline: RelineService
     machine_translation: MachineTranslationService
@@ -192,6 +195,7 @@ def _build_health_snapshot(state: AppState) -> dict[str, Any]:
             "aot": _safe_service_health(state.aot_inpaint),
             "flux_fill": _safe_service_health(state.flux_fill_inpaint),
             "flux2_klein": _safe_service_health(state.flux2_klein_inpaint),
+            "flux3_klein": _safe_service_health(state.flux3_klein),
         },
         # Watermark removal is a domain of its own, not an inpaint engine: it
         # predicts a mask instead of consuming one, so it gets a top-level key.
@@ -331,6 +335,7 @@ def build_app_state(app_version: str, *, user_config: Any = None, large_models_c
     # Shared so the SDXL 4-channel prefill reuses the same LaMa model cache.
     lama_inpaint_service = LamaInpaintService(model_manager)
     flux2_klein_service = Flux2KleinInpaintService(model_manager, large_models=large_models)
+    flux3_klein_service = Flux3KleinService(large_models)
     return AppState(
         app_version=app_version,
         model_manager=model_manager,
@@ -349,6 +354,7 @@ def build_app_state(app_version: str, *, user_config: Any = None, large_models_c
         sdxl_inpaint=SdxlInpaintService(model_manager, lama_inpaint_service),
         flux_fill_inpaint=FluxFillInpaintService(model_manager),
         flux2_klein_inpaint=flux2_klein_service,
+        flux3_klein=flux3_klein_service,
         watermark=WatermarkRemovalService(model_manager),
         reline=RelineService(),
         machine_translation=MachineTranslationService(),
@@ -358,7 +364,7 @@ def build_app_state(app_version: str, *, user_config: Any = None, large_models_c
         # A large model is servable by `large_models.profiles` when its service
         # (registered with `large_models`) is listed here under its registered
         # model name; the service implements `large_model_inputs(params)`.
-        large_model_adapters={"flux2_klein": flux2_klein_service},
+        large_model_adapters={"flux2_klein": flux2_klein_service, "flux3_klein": flux3_klein_service},
         health_probes=MemoryBudgetProbes(device_probe=TorchDeviceProbe(warm_up=False)),
     )
 

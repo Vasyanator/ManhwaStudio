@@ -7,8 +7,8 @@ and the region contract of `validate_region_size`.
 
 Main responsibilities:
 - verify every enum/path error and every numeric clamp of the wire contract,
-  including the placement-dependent default of `unload_transformer_before_vae`
-  and the opt-in `text_attention_in_mask` that `whole_region` forces off;
+  the refusal by name of every field of the retired placement wire, and the
+  opt-in `text_attention_in_mask` that `whole_region` forces off;
 - verify a region that the pipeline would silently resize or crop is refused
   with concrete numbers instead;
 - verify `effective_steps` matches what the pipeline will actually run.
@@ -39,9 +39,33 @@ class NormalizeParamsTests(_TempTreeCase):
             svc.normalize_flux2_klein_params(self.params(vae_path=str(self.root / "nope")))
         self.assertIn("не найден", str(caught.exception))
 
-    def test_unknown_placement_raises(self) -> None:
-        with self.assertRaises(ValueError):
-            svc.normalize_flux2_klein_params(self.params(placement="teleport"))
+    def test_unknown_step_ids_raise(self) -> None:
+        for field, value in (("vram_step", "turbo"), ("ram_step", "keep_forever"), ("vram_step", "keep")):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                svc.normalize_flux2_klein_params(self.params(**{field: value}))
+
+    def test_absent_or_empty_steps_mean_auto(self) -> None:
+        for extra in ({}, {"vram_step": None, "ram_step": None}, {"vram_step": "", "ram_step": " "}):
+            with self.subTest(extra=extra):
+                out = svc.normalize_flux2_klein_params(self.params(**extra))
+                self.assertEqual((out["vram_step"], out["ram_step"]), (None, None))
+        out = svc.normalize_flux2_klein_params(self.params(vram_step=" half ", ram_step="run"))
+        self.assertEqual((out["vram_step"], out["ram_step"]), ("half", "run"))
+
+    def test_every_retired_field_is_refused_by_name(self) -> None:
+        # Protocol 14: a stale client must get a clear error, never a silently
+        # ignored memory choice; even an explicit `null` names the field.
+        self.assertEqual(
+            set(svc.RETIRED_FIELDS),
+            {"placement", "profile", "low_cpu_mem_usage", "vae_slicing", "unload_transformer_before_vae", "unload_text_encoder_after_encode"},
+        )
+        for field in svc.RETIRED_FIELDS:
+            for value in ("full_gpu", True, None):
+                with self.subTest(field=field, value=value):
+                    with self.assertRaises(ValueError) as caught:
+                        svc.normalize_flux2_klein_params(self.params(**{field: value}))
+                    self.assertIn(field, str(caught.exception))
+                    self.assertIn(svc.RETIRED_FIELDS[field], str(caught.exception))
 
     def test_unknown_dtype_raises(self) -> None:
         with self.assertRaises(ValueError):
@@ -52,14 +76,14 @@ class NormalizeParamsTests(_TempTreeCase):
         self.assertEqual(out["steps"], 4)
         self.assertAlmostEqual(out["guidance_scale"], 1.0)
         self.assertAlmostEqual(out["strength"], 1.0)
-        self.assertEqual(out["placement"], "full_gpu")
+        self.assertEqual((out["vram_step"], out["ram_step"]), (None, None))
+        self.assertTrue(out["vae_tiling"])
         self.assertEqual(out["dtype"], "bfloat16")
         self.assertEqual(out["mask_dilate_px"], 16)
         self.assertEqual(out["mask_feather_px"], 12)
         self.assertEqual(out["max_sequence_length"], 512)
         self.assertTrue(out["color_match"])
         self.assertFalse(out["whole_region"])
-        self.assertFalse(out["unload_text_encoder_after_encode"])
         self.assertFalse(out["text_encoder_fp8"])
         self.assertIsNone(out["seed"])
 
@@ -78,17 +102,12 @@ class NormalizeParamsTests(_TempTreeCase):
                 "guidance_scale",
                 "strength",
                 "seed",
-                "placement",
                 "vram_step",
                 "ram_step",
-                "profile",
                 "dtype",
-                "low_cpu_mem_usage",
                 "vae_tiling",
-                "vae_slicing",
-                "unload_transformer_before_vae",
-                "unload_text_encoder_after_encode",
                 "text_encoder_fp8",
+                "encoder_on_cpu",
                 "mask_dilate_px",
                 "mask_feather_px",
                 "color_match",
@@ -97,6 +116,10 @@ class NormalizeParamsTests(_TempTreeCase):
                 "text_attention_in_mask",
             },
         )
+
+    def test_encoder_on_cpu_is_on_unless_turned_off(self) -> None:
+        self.assertIs(svc.normalize_flux2_klein_params(self.params())["encoder_on_cpu"], True)
+        self.assertIs(svc.normalize_flux2_klein_params(self.params(encoder_on_cpu=False))["encoder_on_cpu"], False)
 
     def test_text_attention_in_mask_is_off_unless_asked_for(self) -> None:
         # A request written before the field existed must run exactly as before.
@@ -136,28 +159,6 @@ class NormalizeParamsTests(_TempTreeCase):
         self.assertEqual(out["mask_dilate_px"], 64)
         self.assertEqual(out["mask_feather_px"], 0)
         self.assertEqual(out["max_sequence_length"], 512)
-
-    def test_unload_before_vae_default_depends_on_placement(self) -> None:
-        # The VAE peak lands on top of the resident transformer everywhere except
-        # `full_gpu`, whose whole point is that nothing leaves the GPU.
-        self.assertFalse(
-            svc.normalize_flux2_klein_params(self.params(placement="full_gpu"))[
-                "unload_transformer_before_vae"
-            ]
-        )
-        for placement in ("encoder_cpu", "model_cpu_offload", "sequential_cpu_offload"):
-            with self.subTest(placement=placement):
-                self.assertTrue(
-                    svc.normalize_flux2_klein_params(self.params(placement=placement))[
-                        "unload_transformer_before_vae"
-                    ]
-                )
-
-    def test_explicit_unload_flag_wins_over_the_default(self) -> None:
-        out = svc.normalize_flux2_klein_params(
-            self.params(placement="full_gpu", unload_transformer_before_vae=True)
-        )
-        self.assertTrue(out["unload_transformer_before_vae"])
 
     def test_seed_is_kept_and_null_means_random(self) -> None:
         self.assertEqual(svc.normalize_flux2_klein_params(self.params(seed=7))["seed"], 7)

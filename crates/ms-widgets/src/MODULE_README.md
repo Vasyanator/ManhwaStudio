@@ -355,12 +355,27 @@ crate's `[dev-dependencies]`, so no production build carries them.
   raw wheel delta, e.g. the page manager's split board) must skip its wheel reaction while a
   list is open, exactly as the wheel widgets here do.
 - `seed_spin_box.rs`: seed value input with random generation support.
+- `byte_cap_edit.rs`: `ByteCapEdit`, one row editing an OPTIONAL byte cap (`&mut Option<u64>`,
+  `None` = no limit): caption, a "no limit" checkbox, and a GiB `WheelSpinBox` on a 0.5 GiB grid
+  bounded by an optional maximum. Every text comes in from the caller; `changed()` is set on
+  every edit so the caller can debounce. The unit conversions (`gib_to_bytes` saturating,
+  `bytes_to_gib`, `snap_to_half_gib`) are public and tested. Consumers: the large-model limits
+  of the cleaning AI editor and of the AI-backend settings pane.
 - `marquee.rs`: paint-only web-style marquee for a single-line label that overflows its rect
   (`paint_marquee_galley`): rest at the start, scroll at constant speed until the end shows, short
   rest, jump back. The phase is the pure `marquee_frame(overflow, time, timing)`, derived from the
   absolute `InputState::time`, so the helper has no per-widget state and no id. The caller lays
   out the galley (font and colour are theirs; no theme here). Used by the launcher settings
   sidebar tabs and its two-line buttons.
+- `hf_access_hint.rs`: `HfAccessHint` — a small underlined caption whose hover tooltip explains,
+  for a non-expert, how to get into a GATED Hugging Face model: create an account (link), open
+  each repository the caller names with `repo(name, id)` and accept its licence (links built by
+  `hf_repo_url`, which also accepts a full URL), create a Read token (link), paste it and press
+  the save button whose caption the caller hands in. The links are interactive widgets, so the
+  tooltip stays open while the pointer moves into it (`egui-0.36.2/src/containers/tooltip.rs:135`,
+  `:274-291`). The module is public because it is the one owner of the Hugging Face page URLs
+  (`HF_JOIN_URL`, `HF_TOKEN_SETTINGS_URL`, `HF_URL_PREFIX`); texts are `widgets.hf_access_hint.*`
+  (en + ru, pinned by its catalog test). Consumer: the cleaning large-model engines' token row.
 - `help_hint.rs`: light-gray circled "?" icon whose hover tooltip explains a control. The
   tooltip may carry a localized text line, an animated WebP hint from the `ms-gifs` crate, or
   both — text first, animation below it — selected by the constructors (`animated`, `text`,

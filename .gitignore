@@ -116,6 +116,9 @@ android/app/src/main/assets/
 !crates/ms-docstore/fixtures/*.json
 # Pinned EasyOCR language -> script -> file/md5 table (S-016), guarded by Rust and Python tests.
 !crates/ms-sysprobe/fixtures/*.json
+# The pinned `large_models.profiles` answer shape (protocol v13) the Rust parser and the
+# Python contract test both read.
+!crates/ms-local-ai/fixtures/*.json
 
 # Golden text-detector postprocess fixtures of ms-text-detect (inputs and expected outputs
 # recorded from the reference Python implementation). The parity tests read them, so a clean

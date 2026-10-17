@@ -8,9 +8,11 @@ weight package (bf16, fp8r or nvfp4 DiT; float32 AE; Qwen3-VL text encoder),
 through `Flux3KleinService`, driven by the large-model manager
 (`runtime.large_models`; the model's spec is `large_model.py`).
 
-Integration boundary: the service is NOT constructed in `server.py`, has no
-`AppState` field, no IPC method and no Rust side, and `PROTOCOL_VERSION` is
-unchanged. Its one caller is the VRAM / parity script in `test/`.
+Integration boundary: `server.py` constructs the service (`AppState.flux3_klein`);
+the IPC methods `inpaint.flux3_klein*` (`ipc/handlers/flux3_klein.py`) run the
+cleaning tab's region editor through `region.py`, whose params are mapped by
+`wire.py`; the calibration tool `tools/large_model_calibration/` drives the
+service directly.
 
 Module layout (dependency direction strictly downwards; see `MODULE_README.md`):
 
@@ -25,7 +27,9 @@ Module layout (dependency direction strictly downwards; see `MODULE_README.md`):
 - `loading.py`      - `load_dit` (header checks, quantized swap, streaming fill).
 - `text_encoder.py` - the truncated Qwen3-VL encoder, TEXT and VL_REFS encodes.
 - `large_model.py`  - the `LargeModelSpec`s, residency key, formats, request shape.
-- `service.py`      - `Flux3KleinService`.
+- `wire.py`         - the IPC params -> `Flux3Options` mapping, the region frame rule.
+- `service.py`      - `Flux3KleinService`, `Flux3Canceled`.
+- `region.py`       - the region editor (composite inside the mask, seed, progress stages, cancel).
 
 Notes:
 - Importing the package does NOT import torch: `config`, `params`, `phases`, `large_model` and

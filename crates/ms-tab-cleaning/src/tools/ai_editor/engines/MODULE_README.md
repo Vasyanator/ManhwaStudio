@@ -49,7 +49,8 @@ functions with unit tests, not conditionals inside the drawing code.
 ## Files and submodules
 - `mod.rs`: the catalog — `all_engines()`, the `HostSpec::catalog` of `../mod.rs`. It also decides ONE
   thing beyond the list: the engine at index 0 is the one selected when the tool is created, which
-  is why FLUX.2 klein 9B stays at the head and `lama` then `sdxl` are appended after it. Screen
+  is why FLUX.2 klein 9B stays at the head and `flux3_klein`, `lama` then `sdxl` are appended
+  after the FLUX.2 entries. Screen
   order is unaffected — the picker draws «Без промпта» before «С промптом», so «Lama» appears first
   regardless.
 - `run_job.rs`: `EngineRunJob` — the run in flight of an engine whose run may download an
@@ -62,7 +63,7 @@ functions with unit tests, not conditionals inside the drawing code.
   source of TWO picker entries (9B and 4B, one per `config::Flux2Variant`); its own
   `MODULE_README.md` is the map of the split and is where to look before editing it (IPC methods
   `inpaint.flux2_klein` streaming,
-  `.status`, `.estimate`, `.unload`, `.component_action` streaming, the six
+  `.status`, `.unload`, `.component_action` streaming, the six
   `.prompt_cache.*` methods, and the two `.download.*` methods). The user paints the
   area the model is ALLOWED to change, writes a prompt and gets that area regenerated; everything
   outside the painted mask must survive untouched, which is why the engine declares exactly ONE
@@ -97,16 +98,14 @@ functions with unit tests, not conditionals inside the drawing code.
   contracts below. Model paths (Qwen3 text encoder folder, transformer file or diffusers folder,
   VAE) are entered by hand or through a non-blocking native picker and persist to the VARIANT's own
   settings file (`config::flux2_klein_settings_path`; 9B keeps `flux2_klein_settings.json`
-  unchanged, 4B gets `flux2_klein_4b_settings.json`). Memory placement is chosen
-  through four BUILT-IN presets («Максимум скорости» / «Сбалансированный» / «Минимум RAM» /
-  «Минимум VRAM»); «Пользовательский» is never selectable — it is what the picker reports when the
-  SEVEN fields a preset owns match none of them (placement, `low_cpu_mem_usage`, VAE
-  tiling/slicing, `unload_transformer_before_vae`, `unload_text_encoder_after_encode`,
-  `text_encoder_fp8`). The last two are the text-encoder memory controls, and BOTH are `false` in
-  EVERY preset. The Qwen3 encoder is ~16 GB and is needed exactly once per generation, but it is
-  loaded LAST — after the transformer already sits on the card — so it occupies host memory the
-  pipeline has just vacated, and holding it turns a new prompt from a fresh read of the weights
-  into a single encode pass; that is why no preset unloads it after encoding. What reaches memory is
+  unchanged, 4B gets `flux2_klein_4b_settings.json`). WHERE THE MODEL LIVES IN MEMORY is two
+  persisted STEPS, «Видеопамять» (`vram_step`: auto / max / phase / half / min) and «Оперативная
+  память» (`ram_step`: auto / keep / run / min), whose semantics are the backend's
+  (`runtime/large_models/tiers.py`); the backend's large-model manager plans the pipeline AND the
+  text encoder under them (the encoder may compute on the GPU under max / phase), keeps or frees
+  the encoder by the RAM step, and learns a FLOOR after a memory failure instead of rewriting the
+  user's steps. A settings file from the placement era migrates once (`legacy_memory_steps`, which
+  owns the placement table; an untouched default file goes to «Авто» / «Авто»). What reaches memory is
   LESS than what sits on disk: the encoder is loaded as a `Qwen3Model` truncated to the decoder
   layers the pipeline actually reads, which on the shipped 4B encoder leaves about a fifth of its
   tensors unread, so `status.components[*].size_bytes` (disk) and the memory forecast (RAM)
@@ -116,10 +115,11 @@ functions with unit tests, not conditionals inside the drawing code.
   and reports `guidance_supported` in `.status` (absent means supported). Both shipped klein
   checkpoints are distilled, so guidance is inert there, the negative prompt is never encoded, and
   the UI greys the control out (4 steps, guidance 1.0). The RAM/VRAM forecast is
-  COMPUTED BY THE BACKEND (`.estimate`, peak = max over PHASES: prompt encoding, denoise, VAE
-  decode); this side only formats it and warns when `fits` is false. The `breakdown` peaks are
-  looked up by name and each one is optional, so a backend that does not report a phase simply
-  loses that line of the tooltip. `.status` and `.estimate` both carry the normalized `params`: the
+  COMPUTED BY THE BACKEND (`large_models.profiles`: one row per step of each axis, the selected
+  plan, the encoder's own plan, the learned floor, the probed limits), asked through the
+  latest-wins `ms_local_ai::large_models::ProfilesQuery` and drawn by the shared
+  `../large_model_resources/` widget; this side only formats it. `.status` and the forecast both
+  carry the normalized `params`: the
   backend answers about the paths in the REQUEST, falling back to those of its last successful
   generation when they are absent, so a query without them reports "nothing is configured" for the
   paths the user has just entered. The single progress bar is shared by every run of the engine and
@@ -127,6 +127,29 @@ functions with unit tests, not conditionals inside the drawing code.
   replaced it; cancelling also stops the backend through `CallHandle::cancel` instead of only
   dropping the answer.
 
+- `flux3_klein/`: the FLUX.3 klein engine — a DIRECTORY with FLUX.2 klein's three layers
+  (`ui/` draws, `decisions.rs` decides, `engine/` owns the state) and exactly ONE picker entry
+  (`flux3_klein`, «С промптом»); its own `MODULE_README.md` is the map. IPC methods
+  `inpaint.flux3_klein` (streaming, cancelled MID-RUN through `CallHandle::cancel`), `.status`,
+  `.unload`, `.download.check` and `.download.start` (streaming), plus the forecast
+  `large_models.profiles` with `model: "flux3_klein"`. FLUX.3 has no mask input: the REGION is
+  reference #0 and the output is the region's size; the painted mask is permission to change
+  (the backend composites inside it) and an empty one is the whole-region mode (`mask_for_run`).
+  Up to nine extra reference images (session state) follow as #1 and up, the marks reference is
+  one more of them. Size contract: multiple of 16, shortest side >= 128 px, area <= 4 MP, aspect
+  not steeper than 4:1 — declared through `constraints()` and re-checked on the run path through
+  the shared `region_size_refusal` (validity is `region_edit_v2::geometry::check_size`). Three
+  weight formats (BF16 / FP8 / NVFP4, default FP8) are a parameter of the one entry; the model
+  comes from a manual package folder or the gated Hugging Face download (`config::flux3_klein_dir`).
+
+- `shared/`: the MODEL-AGNOSTIC building blocks of the large-model engines (FLUX.2 klein and
+  FLUX.3 klein), re-exported flat: the streamed progress bar with its generation guard,
+  rate window, frame parser and `stream_call`; the Hugging Face download (per-repository
+  verdicts and links, the nullable plan, `hf_download_readiness`, the two calls,
+  `HfTokenControl`) and its drawing (`draw_hf_token_row`, `draw_hf_download_controls`,
+  `gated_button`); the settings-file rules (`read_settings_file` quarantines a damaged file,
+  `SettingsSaver` keeps a failed write pending with backoff); `mask_for_run`. Nothing there names
+  a model. Own `MODULE_README.md`.
 - `lama/`: the «Lama» engine — a DIRECTORY for the same reason `flux2_klein/` is one, and the source
   of exactly ONE picker entry offering FOUR checkpoints. Its own `MODULE_README.md` is the map. The
   user paints what must be REMOVED and gets the background restored under it; there is no prompt and
@@ -165,7 +188,7 @@ functions with unit tests, not conditionals inside the drawing code.
   so a finished run lands with the panel closed.
 - **`poll` is also the only writer of the settings file, and losing it loses data silently.**
   Every engine's saver runs inside `poll`; a host that stops polling keeps the tool working and
-  quietly discards every model path, memory preset, prompt and parameter on exit. The arming rule
+  quietly discards every model path, memory step, prompt and parameter on exit. The arming rule
   is the pure `settings_save_due(dirty, settings_loaded, save_in_flight)`, ONE copy for every
   engine in `../../region_edit_v2/engine_settings.rs` — a plain gate with no
   time debounce, so a save starts on the first poll it is due on: a write before the initial load
@@ -184,19 +207,21 @@ functions with unit tests, not conditionals inside the drawing code.
   (`violation_text`); `flux2_klein/` does it through its own
   `region_block_reason`, whose message set is engine-specific and whose agreement with `check_size`
   is pinned by a unit test.
-- **The RAM/VRAM forecast is armed by a SETTLED SIZE change and by nothing else geometric.**
+- **The memory forecast is armed by a SETTLED SIZE change and by nothing else geometric.**
   `set_region` is pushed every frame and carries `geometry_settled`; the rectangle is stored
   unconditionally, so the status line keeps printing the size the user is dragging, but the
-  `.estimate` round trip is armed only when the region's SIZE changed AND no frame gesture is in
+  forecast round trip is armed only when the region's SIZE changed AND no frame gesture is in
   flight. A pure position change costs nothing — scrolling moves the rectangle through the frame's
   keep-in-view clamp — and a resize drag costs exactly one request, on release, rather than one per
   rendered frame. The size change is held in `region_resize_pending` because the rectangle usually
   does not change on the release frame itself. Everything that is NOT the geometry (a parameter,
-  the memory preset, a loaded prompt cache, a finished run, the settings load) still arms the
-  forecast directly, and a test pins that.
+  the memory steps, a loaded prompt cache, a finished run, the settings load) still arms the
+  forecast directly, and a test pins that. Events that change the MACHINE rather than the
+  question (a finished run, a component action, a cap or floor change, a backend reconnect, a
+  download) INVALIDATE the held answer (`Flux2KleinEngine::invalidate_forecast`).
 - FLUX.2 klein's `whole_region` is a WORKING MODE that is DERIVED FROM THE PAINTED MASK and is not a
   setting: there is no switch, no persisted field and no `MemoryPresetValues` entry for it, and
-  `mask_for_run` is the ONLY place the decision is made — it returns the wire buffer and the flag
+  `mask_for_run` (`shared/region_mask.rs`) is the ONLY place the decision is made — it returns the wire buffer and the flag
   together, so the two can never disagree. An empty layer means "edit the whole region" and yields a
   SOLID mask (every byte `255`) with `whole_region = true`, because the backend refuses that flag
   unless the mask really is uniform; anything painted means "edit only what is under it" and travels
@@ -206,7 +231,7 @@ functions with unit tests, not conditionals inside the drawing code.
   is therefore unconditionally `true`, which is what stops the frame demanding a non-empty mask. It
   is the HOST that tells the user an empty mask is legal (`RegionEditHost::draw_empty_mask_hint`), not
   this engine. `whole_region` also travels as `false` on every path that only ASKS the backend
-  something (`.status`, `.estimate`, the prompt-cache calls): no mask exists there, which is why
+  something (`.status`, the forecast, the prompt-cache calls): no mask exists there, which is why
   `to_params` takes the flag instead of reading it. Backend-side `mask_dilate_px` is ignored when
   nothing is painted; the slider is not faded for that (the engine cannot see the host's mask
   stack, so the state is unknowable while the panel is drawn) and its hover text names the condition
@@ -218,6 +243,12 @@ functions with unit tests, not conditionals inside the drawing code.
   transparent layer, which the pipeline would flatten to RGB. Lama and SDXL keep the trait default
   `OVERLAY_ONLY` — neither pipeline has a reference input — so their run requests never carry
   separate marks. See `flux2_klein/MODULE_README.md`.
+- **FLUX.3 klein's marks mode follows its reference list.** It declares
+  `MarksSupport::new(SeparateReference).with(OverlayOnRegion)` while the user's extra references
+  leave a slot (the marks reference is one more extra reference, nine at most), and
+  `OVERLAY_ONLY` once the list is full — `marks_support()` is re-read every frame, so the host
+  switches the mode itself. `run_input` still refuses a request whose references would exceed
+  nine. See `flux3_klein/MODULE_README.md`.
 - **Lama's mask is MANDATORY and means the OPPOSITE of FLUX.2 klein's.** `allows_empty_mask()` is
   unconditionally `false`: the mask says WHAT TO REMOVE, so an empty one describes no work at all,
   and the host disables «Обработать» rather than sending a request whose only possible answer is the
@@ -307,17 +338,16 @@ functions with unit tests, not conditionals inside the drawing code.
 - FLUX.2 klein's request blob is `region.png ++ mask.png` with the mask an L8 PNG of EXACTLY the
   region size; the response header's `image_len` is validated with STRICT equality against the blob
   length and the decoded PNG must be exactly the region size. The response also carries
-  `oom_recovered` and an `applied` object of FIVE memory flags (`unload_transformer_before_vae`,
-  `vae_tiling`, `vae_slicing`, `unload_text_encoder_after_encode`, `text_encoder_fp8`): when the
-  backend recovers from an out-of-memory failure during the VAE decode it retries the decode with
-  cheaper flags, and the engine writes those flags back into its settings (so the next run starts
-  economical) and says so in its status line. A partial `applied` object — including one carrying
-  only the three older flags — is ignored wholesale rather than half-applied.
-- The two placement-derived settings flags (`unload_transformer_before_vae`,
-  `unload_text_encoder_after_encode`) default from the PLACEMENT, which serde's per-field default
-  cannot see. `settings_from_json` derives them for a settings file written before the field
-  existed — `false` under `full_gpu`, `true` for every economical placement — and leaves a file that
-  carries them untouched. Add any further placement-dependent flag there, not in a serde default.
+  `oom_recovered`, `degraded` / `degrade_reason` with the effective steps, and an `applied`
+  object of which ONLY `vae_tiling` is read (tolerantly: the five-flag v13 object and the
+  one-flag v14 one both work) and written back, so a decode that had to be retried tiled starts
+  tiled next time. The user's steps are never rewritten by a run; a degraded run names the steps
+  it actually ran as in the engine's status line.
+- The retired placement fields (`placement`, `low_cpu_mem_usage`, `vae_slicing`,
+  `unload_transformer_before_vae`, `unload_text_encoder_after_encode`) are read exactly once, by
+  `legacy_memory_steps`, for a document that has neither step field; the migrated document is
+  written back without them. A damaged settings file is moved aside, never overwritten
+  (`load_flux2_settings_from`).
 - The size gate is SPLIT and must stay split: the frame validates a rectangle against
   `constraints()`, the run path re-validates the actual region against `region_block_reason`, and
   `flux2_run_block_reason` answers only for the model paths, their CONTENTS and the prompt. A test
@@ -463,14 +493,14 @@ functions with unit tests, not conditionals inside the drawing code.
     cannot explain the gap — it is shown on hover beside a localized line, the way a repo
     `message` is — and empty otherwise, when no extra line is synthesised at all. That case
     keeps «Скачать» OPEN, because pressing it re-lists. The four-way decision is the pure
-    `flux2_download_readiness`, and `Complete` is reachable only through a plan that was
-    actually computed.
+    `hf_download_readiness` (`shared/hf_download.rs`), and `Complete` is reachable only through
+    a plan that was actually computed.
   - **Speed and remaining time are DERIVED on this side, with no wire field for either.**
-    `Flux2RateEstimator` averages the OVERALL byte counter over a five-second wall-clock
+    `RateEstimator` (`shared/stream_progress.rs`) averages the OVERALL byte counter over a five-second wall-clock
     window — a time window and not a frame count, because the backend's two throttles (~10
     frames/s AND >= 4 MB apart) make the frame cadence depend on the line speed. It is never
     fed the per-file counter, which resets at every file boundary. Nothing is reported until
-    the window spans `FLUX2_RATE_MIN_SPAN`, so a transfer shows no estimate at its start
+    the window spans `RATE_MIN_SPAN`, so a transfer shows no estimate at its start
     rather than a wrong one, and a stalled or finished counter reports no rate rather than
     zero or infinity. A BACKWARDS step discards the window and restarts it: a resumed file
     whose length check fails is refetched from zero, so the overall counter really does move
@@ -478,27 +508,41 @@ functions with unit tests, not conditionals inside the drawing code.
     seam would report a rate that never happened. The numbers are cleared by
     `begin_progress_generation` and drawn only while the bar is active and the phase is
     `download`, so they never sit frozen beside an idle bar.
-  - **A finished download configures the engine**: the answer's three paths are written into the
-    settings and marked dirty, only non-empty ones, so a partial answer cannot blank a path the
-    user set by hand.
-- Every `t!` key of this engine lives under `cleaning.tools.flux2_klein.*` (the download block under
-  `cleaning.tools.flux2_klein.download.*`); the run/cancel wording it shares with the older editors
-  stays under `cleaning.mask_editor.*`. The `hf_token` module has its own `hf_token.*` namespace,
+  - **A finished download writes nothing into the settings**: in download mode the effective
+    paths are derived from the models directory (`Flux2KleinSettings::effective_paths`), so the
+    manual-mode paths the user set by hand survive; an answer path that differs from the derived
+    one is logged as a layout drift between the two halves.
+- Every `t!` key of FLUX.3 klein lives under `cleaning.tools.flux3_klein.*` (stage names
+  `cleaning.tools.flux3_klein.stage_<id>`).
+- Every `t!` key of FLUX.2 klein lives under `cleaning.tools.flux2_klein.*` (its own download
+  sentences under `cleaning.tools.flux2_klein.download.*`); the texts of `shared/` live under
+  `cleaning.tools.engine_progress.*` (the bar, speed, ETA) and `cleaning.tools.hf_download.*` (the
+  verdicts, the token row, the check / download controls); the run/cancel wording shared with the
+  older editors stays under `cleaning.mask_editor.*`. The `hf_token` module has its own `hf_token.*` namespace,
   because the token is not a cleaning-tool concept.
 
 ## Editing map
 - To add an engine: a module here plus one line in `mod.rs::all_engines`; the trait it must satisfy
-  is `../../region_edit_v2/engine.rs`.
+  is `../../region_edit_v2/engine.rs`. A large-model engine composes `shared/` (progress, HF
+  download, settings file, mask rule) and `../large_model_resources/` (`ResourcesController` +
+  the widget) instead of copying FLUX.2 klein's.
+- To change the progress bar, the HF download verdicts / token row / controls, the settings-file
+  quarantine or save backoff for every large-model engine at once: `shared/`.
 - To change which paths a run uses, or to add a third source mode:
   `Flux2KleinSettings::effective_paths` and `Flux2SourceMode` — never a second computation at a
   call site.
-- To change FLUX.2 klein's parameters, prompt block, prompt-cache library, memory presets,
-  RAM/VRAM forecast or model-download block: `flux2_klein/`, whose `MODULE_README.md` says which
+- To change FLUX.3 klein's parameters, references, weight formats, download or panel:
+  `flux3_klein/`, whose `MODULE_README.md` says which file owns which; its size contract is
+  `Flux3KleinEngine::frame_constraints` (pinned against the backend's `validate_region_size` by a
+  test).
+- To change FLUX.2 klein's parameters, prompt block, prompt-cache library, memory steps or
+  model-download block: `flux2_klein/`, whose `MODULE_README.md` says which
   file owns which of them. The wire names of its methods live in `backend_ipc::protocol`.
 - To change what one of FLUX.2 klein's lines SAYS, edit its pure function and its test, never the
   drawing code (`flux2_klein/decisions.rs`): `flux2_readiness_line` (the readiness line),
   `flux2_prompt_cache_line` (the one line under the prompt), `flux2_component_rows` / `flux2_component_row_tooltip` (a row of the
-  merged component list), `estimate_status_line` (the forecast, printed by two surfaces).
+  merged component list), `large_model_resources::forecast_line` (the forecast, printed by two
+  surfaces).
 - To move a control between FLUX.2 klein's sections: `Flux2PanelCtx::draw` (`flux2_klein/ui/mod.rs`)
   is the whole order, and
   the five bodies under it are `draw_prompt`, `draw_strength`, `draw_readiness`,

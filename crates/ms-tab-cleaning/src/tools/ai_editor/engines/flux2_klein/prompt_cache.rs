@@ -328,8 +328,8 @@ pub(super) fn flux2_prompt_cache_header(settings: &Flux2KleinSettings, extra: &[
 ///
 /// Streaming, because reading the Qwen3 encoder takes far longer than a call may block for:
 /// the progress frames have the same shape as a generation's and drive the same bar.
-/// `generation` is the
-/// progress generation claimed on the GUI thread; every write is dropped once a newer run
+/// `claim` is the
+/// progress claim taken on the GUI thread; every write is dropped once a newer run
 /// — or a cancel — has retired it, and the bar is cleared on EVERY exit.
 ///
 /// # Errors
@@ -337,21 +337,19 @@ pub(super) fn flux2_prompt_cache_header(settings: &Flux2KleinSettings, extra: &[
 /// unreachable.
 pub(super) fn build_flux2_prompt_cache(
     header: Value,
-    progress: &Arc<Mutex<Flux2Progress>>,
-    generation: u64,
+    progress: &Arc<Mutex<EngineProgress>>,
+    claim: &ProgressClaim,
 ) -> Result<Flux2PromptCacheOutcome, String> {
-    let outcome = flux2_stream_call(
+    let outcome = stream_call(
         backend_ipc::protocol::METHOD_INPAINT_FLUX2_KLEIN_PROMPT_CACHE_BUILD,
         header,
         &[],
-        |id| update_progress(progress, generation, |state| state.cancel_id = Some(id)),
-        |frame| publish_progress_frame(progress, generation, frame),
+        FLUX2_RUN_TIMEOUT,
+        |id| claim.publish_request_id(id),
+        |frame| publish_progress_frame(progress, claim.generation, frame),
     )
     .map(|(_header, _blob)| Flux2PromptCacheOutcome::Built);
-    update_progress(progress, generation, |state| {
-        state.active = false;
-        state.cancel_id = None;
-    });
+    update_progress(progress, claim.generation, |state| state.active = false);
     outcome
 }
 
@@ -548,7 +546,7 @@ pub(super) fn flux2_prompt_cache_call(method: &'static str, header: Value) -> Re
     let client = backend_ipc::shared_client().map_err(|_| ai_backend_offline_error().to_string())?;
     let (response, _blob) = client
         .call(method, header, &[], FLUX2_QUERY_TIMEOUT)
-        .map_err(map_flux2_call_error)?;
+        .map_err(map_call_error)?;
     Ok(response)
 }
 

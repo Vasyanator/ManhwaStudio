@@ -15,7 +15,8 @@ Unit tests for `server._build_health_snapshot`:
   failing part becomes the error placeholder, the rest survives); the budget
   probes only devices that hold or reserve bytes;
 - `server.build_app_state` wires ONE arbiter into both pools and the services,
-  and lists FLUX.2 as the `flux2_klein` profiles adapter (in-memory settings
+  and lists FLUX.2 / FLUX.3 as the `flux2_klein` / `flux3_klein` profiles
+  adapters, the snapshot carrying `inpaint.flux3_klein` (in-memory settings
   document, temp cache root: no user document is touched).
 
 Notes:
@@ -48,6 +49,7 @@ from modules.ai_backend.engines.paddle_onnx import RuntimeFactory
 from modules.ai_backend.inpaint.aot import AotInpaintService
 from modules.ai_backend.inpaint.flux2_klein import Flux2KleinInpaintService
 from modules.ai_backend.inpaint.flux2_klein import hardware as flux2_hardware
+from modules.ai_backend.inpaint.flux3_klein.service import Flux3KleinService
 from modules.ai_backend.inpaint.flux_fill import FluxFillInpaintService
 from modules.ai_backend.inpaint.lama import LamaInpaintService
 from modules.ai_backend.inpaint.lama_mpe import LamaMpeInpaintService
@@ -131,6 +133,7 @@ def _make_state(*, surya_raises: bool = False) -> SimpleNamespace:
         aot_inpaint=_OkService("aot"),
         flux_fill_inpaint=_OkService("flux_fill"),
         flux2_klein_inpaint=_OkService("flux2_klein"),
+        flux3_klein=_OkService("flux3_klein"),
         watermark=_OkService("watermark"),
         reline=_OkService("reline"),
         machine_translation=_OkService("mt"),
@@ -173,6 +176,7 @@ def test_one_raising_service_does_not_kill_snapshot() -> None:
     assert snap["inpaint"]["aot"]["status"] == "ok"
     assert snap["inpaint"]["flux_fill"]["status"] == "ok"
     assert snap["inpaint"]["flux2_klein"]["status"] == "ok"
+    assert snap["inpaint"]["flux3_klein"]["status"] == "ok"
     assert snap["watermark"]["status"] == "ok"
     assert snap["image_processing"]["reline"]["status"] == "ok"
     assert snap["machine_translation"]["status"] == "ok"
@@ -231,6 +235,7 @@ def _make_real_state(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         aot_inpaint=AotInpaintService(manager),
         flux_fill_inpaint=FluxFillInpaintService(manager),
         flux2_klein_inpaint=Flux2KleinInpaintService(manager, large_models=large),
+        flux3_klein=Flux3KleinService(large),
         watermark=WatermarkRemovalService(manager),
         reline=RelineService(),
         machine_translation=MachineTranslationService(),
@@ -247,8 +252,8 @@ def test_snapshot_builds_while_every_service_lock_is_held(monkeypatch: pytest.Mo
     # Service instance locks only: the large pool's `_lock` is a leaf held for
     # dictionary reads (never across a load), so it is not part of S-014.
     locks = [service._lock for name, service in vars(state).items() if hasattr(service, "_lock") and name != "large_models"]
-    # Six OCR engines, three detectors, five inpaint engines, watermark.
-    assert len(locks) == 15
+    # Six OCR engines, three detectors, six inpaint engines, watermark.
+    assert len(locks) == 16
     held = threading.Event()
     release = threading.Event()
 
@@ -286,6 +291,7 @@ def test_snapshot_builds_while_every_service_lock_is_held(monkeypatch: pytest.Mo
         assert entry.get("status") != "error", entry
     assert snap["ocr"]["baberuocr"] == {"ready": False, "device": None, "last_error": None}
     assert snap["inpaint"]["aot"]["ready"] is False
+    assert snap["inpaint"]["flux3_klein"]["ready"] is False
     assert snap["watermark"]["ready"] is False
 
 
@@ -354,8 +360,8 @@ def test_build_app_state_shares_one_arbiter(monkeypatch: pytest.MonkeyPatch, tmp
     assert state.large_models._arbiter is state.model_manager.arbiter
     # The persisted user limit is the large pool's limit in force.
     assert state.large_models.limits().vram_cap == 6 * GIB
-    # FLUX.2 serves `large_models.profiles` under its pipeline model name.
-    assert dict(state.large_model_adapters) == {"flux2_klein": state.flux2_klein_inpaint}
+    # FLUX.2 / FLUX.3 serve `large_models.profiles` (the adapter picks the registration).
+    assert dict(state.large_model_adapters) == {"flux2_klein": state.flux2_klein_inpaint, "flux3_klein": state.flux3_klein}
     snap = _build_health_snapshot(state)
     assert snap["model_manager"]["large_models"] == []
     assert snap["model_manager"]["budget"]["devices"] == []

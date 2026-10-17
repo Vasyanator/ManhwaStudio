@@ -3,7 +3,7 @@
 ## Purpose
 The FLUX.2 klein engine of the «ИИ-редактор области» tool: one implementation of
 `region_edit_v2::engine::AiEngine`. It owns everything model-specific — the persisted
-parameters, the memory presets, the RAM/VRAM forecast, the prompt-cache library, the
+parameters, the two memory steps and their large-model forecast, the prompt-cache library, the
 model download, the per-component residency, the request/response wire contracts, the
 OOM recovery, the worker threads and its own progress bar — and nothing host-specific:
 the on-canvas frame, the painted mask stack and the pending result belong to the host.
@@ -75,16 +75,26 @@ Data flow of one edit:
 host frame + painted mask (+ marks reference)
         -> AiEngine::start           (engine/mod.rs)
         -> run_input                 (engine/mod.rs) validates sizes, accepts the marks
-        -> mask_for_run              (session.rs)   derives the working mode
+        -> mask_for_run              (../shared)    derives the working mode
         -> settings.normalized()     (settings.rs)  the ONLY value put on the wire
         -> run_flux2_klein           (wire.rs)      worker thread, streaming call
-        -> publish_progress_frame    (progress.rs)  generation-guarded bar writes
+        -> publish_progress_frame    (../shared)    generation-guarded bar writes
         -> AiEngine::poll            (engine/mod.rs) drains the channel, returns pixels
 ```
 
 Queries the panel arms are one-shot and independent of the run: `.status`
-(`status.rs` + `wire.rs`), `.estimate` (`estimate.rs`), `.prompt_cache.list`
-(`prompt_cache.rs`) and `.download.check` (`download.rs`).
+(`status.rs` + `wire.rs`), the memory forecast `large_models.profiles`
+(the engine's `ResourcesController` from `../../large_model_resources/`: one request in
+flight, latest wins, plus the debounced cap writer and the floor reset), `.prompt_cache.list`
+(`prompt_cache.rs`) and `.download.check` (`download.rs` over `../shared/hf_download.rs`).
+The forecast is drawn by the shared widget `../../large_model_resources/` (steps, per-step
+rows, floor, «Пределы»).
+
+MODEL-AGNOSTIC PARTS LIVE IN `../shared/` (`use super::shared::*` in `mod.rs`): the progress
+state of all four long operations and its streaming call, the Hugging Face check / plan /
+token / download vocabulary and its drawing, the settings-file quarantine and save backoff,
+and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its question
+(`Flux2CheckQuestion`), its settings document and migration, its sentences.
 
 ## Files and submodules
 - `mod.rs`: the module root — the header, the `mod`/`use` wiring and the shared constants.
@@ -96,41 +106,50 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   polling that keeps its derived state current; `actions.rs` holds the `start_*`/`poll_*`
   pair of every long operation. See `engine/MODULE_README.md`.
 - `ui/`: the parameter panel. `mod.rs` is the body and its ORDER; `install.rs`,
-  `components.rs`, `advanced.rs` and `progress.rs` draw the blocks it calls into. See
+  `components.rs`, `advanced.rs` and `mask_hint.rs` draw the blocks it calls into. See
   `ui/MODULE_README.md`.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
   `flux2_prompt_cache_line`, `flux2_guidance_supported`, `flux2_run_block_reason`,
   `region_block_reason` — with the line/tone types they answer in. Edit it to change what a
   line or a refusal SAYS, or which control the backend's answer closes.
 - `settings.rs`: `Flux2KleinSettings`, its defaults, `normalized()`, `params()`, the
-  placement/dtype/preset vocabulary, `Flux2SourceMode`, the persisted `variant` and
-  `effective_paths`, and the settings-file load/save pair. Edit it to add or change a
-  persisted field. ONE FILE PER VARIANT: 9B keeps `flux2_klein_settings.json` unchanged,
+  dtype vocabulary, the two step ids (`step_choice` / `set_step_choice`), the one-time
+  migration of the retired placement (`legacy_memory_steps`, the one owner of the placement ->
+  step-pair table; an untouched default document goes to «Авто» / «Авто»),
+  `Flux2SourceMode`, the persisted `variant` and `effective_paths`, «Энкодер на CPU»
+  (`encoder_on_cpu`, default on — also for a file without the field — and sent in every
+  `params`, the forecast's included), and the settings-file
+  load/save pair (`load_flux2_settings_from` / `save_flux2_settings`, over the shared
+  `read_settings_file` / `write_settings_json`: a damaged file is moved aside, never
+  overwritten, and when that fails saving is BLOCKED). Edit it to add or change a persisted field. ONE FILE PER VARIANT: 9B keeps `flux2_klein_settings.json` unchanged,
   the loader stamps the owning variant over whatever it read, and the saver writes back to
   the file the document itself names.
 - `status.rs`: `Flux2Status` and everything derived from it — `Flux2ModelReadiness`,
   `flux2_status_for_paths`, the merged `flux2_component_rows`, `flux2_install_seed`,
   `flux2_pipeline_busy`. Edit it to change what a catalog MEANS; the parsers that build
   one live in `wire.rs`.
-- `download.rs`: the `.download.check` / `.download.start` contracts, the per-repository
-  state vocabulary and its links, `flux2_download_readiness`,
+- `download.rs`: the FLUX.2 half of `.download.check` / `.download.start` — the request
+  header (`flux2_download_header`), what an answer is about (`Flux2CheckQuestion`;
+  `Flux2DownloadCheck` = the shared `HfDownloadCheck<Flux2CheckQuestion>`),
   `download_check_matches_selection` (stale over the encoder toggle AND the variant),
   `download_check_variant_mismatch` (a disagreeing echo is REPORTED, not hidden),
-  `download_check_blames_token` (what reopens the token row on the ungated checkpoint) and
-  `flux2_text_encoder_path_after_toggle`.
+  `flux2_text_encoder_path_after_toggle`, and the outcome parse. The verdict vocabulary,
+  `hf_download_readiness` and `download_check_blames_token` (what reopens the token row on the
+  ungated checkpoint) are `../shared/hf_download.rs`.
 - `prompt_cache.rs`: the `.msprompt` library — entry/listing/load shapes,
   `flux2_prompt_cache_gates`, `prompt_cache_state_for`, and the six `.prompt_cache.*`
   calls with their parsers.
-- `estimate.rs`: `Flux2Estimate`, the `peak_*` breakdown keys, the fetch/parse pair and
-  the two strings the forecast is rendered as.
-- `progress.rs`: `Flux2Progress` and its `Mutex` discipline, the generation counter,
-  `Flux2RateEstimator`, the streamed frame parsers and the byte/rate/duration formatters.
+- `run_outcome.rs`: what one run answers with (`Flux2RunOutcome`, `Flux2JobResult`) and the one
+  memory flag it writes back (`parse_applied_flags`: `vae_tiling` only, tolerant of the v13 and
+  v14 shapes). The progress state, its generation guard and `parse_degraded` are
+  `../shared/stream_progress.rs`.
 - `session.rs`: `Flux2SessionState` (run channel + per-RUN undo stack), `Flux2RunPoll`,
-  `mask_for_run`, `apply_backend_flags` and `flux2_picker_request` (the dialog request per
+  `apply_backend_flags` (writes `vae_tiling` only), `flux2_run_done_status`
+  (a degraded run names its effective steps) and `flux2_picker_request` (the dialog request per
   picker purpose; the engine opens it through `ms_platform::file_dialog::request` and commits
   the prompt-cache export's save target after the backend wrote it).
-- `wire.rs`: `Flux2RunInput` (the pixels of one run), `run_flux2_klein` with its OOM
-  retry pass, `flux2_stream_call`, the `.status` and `.component_action` calls and their
+- `wire.rs`: `Flux2RunInput` (the pixels of one run), `run_flux2_klein`, the `.status` and
+  `.component_action` calls (streaming through the shared `stream_call`) and their
   parsers, the prompt translation and the run request packing `flux2_run_request`
   (header + `image ++ mask [++ reference]` blob; the PNGs come from `tools/region_png.rs`).
 - `test_support.rs`: `cfg(test)` only. The fixtures every `mod tests` here is built from
@@ -147,15 +166,22 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   `effective_paths` is the ONE answer to which three model paths a call uses. Both are
   variant-aware: the derived paths sit under the variant's own model directory, and a
   refused `variant`/`uncensored` pairing is normalized away before it can travel.
-- **`mask_for_run` is the only place the working mode is decided** (`session.rs`): a
+- **The memory steps are the user's and the wire always carries them** (`vram_step` /
+  `ram_step` in every `params`; none of the retired placement fields ever does). A run never
+  rewrites them: after a memory failure the backend degrades the run and learns a floor,
+  which «Память и скорость» shows with «Забыть»; only `applied.vae_tiling` is written back.
+  The forecast never decides anything: the backend's admission is the guard.
+- **A damaged settings file is never overwritten.** It is moved aside before defaults load
+  and the panel says where; if it cannot be moved (or cannot be read at all), saving is
+  blocked for the session and the panel says so (the shared `SettingsProblem`).
+- **`mask_for_run` is the only place the working mode is decided** (`../shared/region_mask.rs`): a
   painted mask travels verbatim with `whole_region = false`; an empty one becomes a
   SOLID mask, because the backend refuses `whole_region = true` otherwise.
 - **«Внимание только к маске» is a persisted CHOICE with an effective wire value**
   (`text_attention_in_mask`, default on). `to_params` sends `setting && !whole_region`, and
-  the `.estimate` query sends `setting && mask_painted` (`to_estimate_params`) with the
+  the forecast sends `setting && mask_painted` (`to_profiles_params`) with the
   painted state the host last handed `draw_run_options`; a change of that state re-arms the
-  forecast while the option is on, because the backend then adds the `attention_mask`
-  breakdown term. The backend echoes the effective value as a TOP-LEVEL response field,
+  forecast while the option is on, because the backend then counts the attention mask. The backend echoes the effective value as a TOP-LEVEL response field,
   deliberately outside `applied`: `apply_backend_flags` must never write it back, or a
   whole-region run would switch the user's choice off. The checkbox is drawn only in
   `draw_run_options` (pinned under «Обработать»), closed while no mask is painted
@@ -168,10 +194,10 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   Compositing onto the region (`OverlayOnRegion`) is offered too and needs nothing here.
   `TransparentLayer` is NOT supported — the pipeline flattens every condition image to
   RGB — so a `RunMarks::Layer` that arrives anyway is refused and logged, never dropped.
-  The `.estimate` forecast takes no reference (the engine learns of the marks only at
+  The forecast takes no reference (the engine learns of the marks only at
   `start`), so for a marked run the backend's pre-load guard counts a little more than
   the forecast on screen — the reference's condition tokens.
-- **One progress bar, claimed by generation** (`progress.rs`): four operations — a run,
+- **One progress bar, claimed by generation** (`../shared/stream_progress.rs`): four operations — a run,
   `.prompt_cache.build`, `.component_action`, `.download.start` — share it, and a write
   from a retired generation is dropped. Gates that mean "wait for the current operation"
   read `flux2_pipeline_busy` over all four.
@@ -218,8 +244,8 @@ Queries the panel arms are one-shot and independent of the run: `.status`
   both sides.
 - To change which marks modes the engine accepts or how a marks reference is validated,
   see `marks_support` and `run_input` in `engine/mod.rs`.
-- To change the progress bar's arithmetic, see `progress.rs`; to change how it looks, see
-  `ui/progress.rs`. The bar and the run status are drawn by `AiEngine::draw_progress`
+- To change the progress bar's arithmetic or how it looks, see `../shared/` (it is every
+  large-model engine's bar). The bar and the run status are drawn by `AiEngine::draw_progress`
   (`draw_flux2_progress_section`), which the host pins above the scrolled parameters.
 - To change the run's undo history or the derived mask, see `session.rs`.
 - To change what the engine DOES when a control is pressed, see `engine/actions.rs`; to

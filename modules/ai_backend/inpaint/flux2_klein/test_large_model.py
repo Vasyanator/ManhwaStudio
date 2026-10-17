@@ -46,8 +46,8 @@ class NamesAndRegistrationTests(unittest.TestCase):
         self.assertEqual(large_model.pipeline_model_name("float16"), "flux2_klein.float16")
         self.assertEqual(large_model.encoder_model_name(False), "flux2_klein_text_encoder")
         self.assertEqual(large_model.encoder_model_name(True), "flux2_klein_text_encoder.fp8")
-        self.assertEqual(large_model.encoder_model_name(False, cpu_only=True), "flux2_klein_text_encoder.cpu")
-        self.assertEqual(large_model.encoder_model_name(True, cpu_only=True), "flux2_klein_text_encoder.fp8.cpu")
+        # Protocol 14 retired the CPU-only `….cpu` twins: two encoder registrations.
+        self.assertEqual(large_model.encoder_model_names(), ("flux2_klein_text_encoder", "flux2_klein_text_encoder.fp8"))
 
     def test_registration_is_idempotent(self) -> None:
         manager = LargeModelManager(ResidencyArbiter(_RoomyProbes()), limits_store=MemoryLimitsStore(), tables=_flat_tables(), probes=_RoomyProbes())
@@ -62,10 +62,12 @@ class NamesAndRegistrationTests(unittest.TestCase):
         self.assertEqual([phase.name for phase in pipeline.phases], ["denoise", "decode"])
         self.assertEqual(pipeline.phases[0].uses, frozenset({"transformer", "vae"}), "the pipeline call VAE-encodes the region")
         self.assertEqual([fallback.name for fallback in pipeline.fallbacks], ["vae_tiling", "vae_tile_lowered"])
-        encoder = large_model.encoder_spec(False)
-        self.assertEqual(encoder.components[0].exec_devices_allowed, frozenset({ExecDevice.RUN_DEVICE, ExecDevice.CPU}))
-        self.assertEqual([phase.name for phase in encoder.phases], ["encode"])
-        self.assertEqual(large_model.encoder_spec(False, cpu_only=True).components[0].exec_devices_allowed, frozenset({ExecDevice.CPU}), "the legacy wire's encoder")
+        for fp8 in (False, True):
+            with self.subTest(fp8=fp8):
+                encoder = large_model.encoder_spec(fp8)
+                # Every request may encode on the GPU: where it computes is the plan's.
+                self.assertEqual(encoder.components[0].exec_devices_allowed, frozenset({ExecDevice.RUN_DEVICE, ExecDevice.CPU}))
+                self.assertEqual([phase.name for phase in encoder.phases], ["encode"])
 
 
 class TransformerKeyTests(unittest.TestCase):
@@ -191,11 +193,8 @@ class OptionsAndWorkTests(_TempTreeCase):
         encoder = large_model.encoder_spec(True)
         encoder_options = large_model.encoder_options(svc.normalize_flux2_klein_params(self.params(text_encoder_fp8=True)))
         self.assertIn("fp8", encoder.key(encoder_options, large_model.WEIGHT_FORMAT, "cuda:0"))
-        # The CPU-only spec never shares a handle with the other one (the manager keys handles globally).
-        normalized = svc.normalize_flux2_klein_params(self.params())
-        pinned = large_model.encoder_options(normalized, cpu_only=True)
-        unpinned = large_model.encoder_options(normalized)
-        self.assertNotEqual(large_model.encoder_spec(False, cpu_only=True).key(pinned, large_model.WEIGHT_FORMAT, "cuda:0"), large_model.encoder_spec(False).key(unpinned, large_model.WEIGHT_FORMAT, "cuda:0"))
+        bf16_options = large_model.encoder_options(svc.normalize_flux2_klein_params(self.params()))
+        self.assertNotEqual(large_model.encoder_spec(False).key(bf16_options, large_model.WEIGHT_FORMAT, "cuda:0"), encoder.key(encoder_options, large_model.WEIGHT_FORMAT, "cuda:0"))
 
 
 class RequireLoadableTests(_TempTreeCase):

@@ -3,15 +3,13 @@ File: cleaning/tools/ai_editor/engines/flux2_klein/session.rs
 
 Purpose:
 The per-session run state of the FLUX.2 klein engine: the channel a worker answers on,
-the per-RUN undo stack, the derivation of the mask that actually goes on the wire, and
-the file-dialog requests the panel opens.
+the per-RUN undo stack, and the file-dialog requests the panel opens.
 
 Main responsibilities:
 - own `Flux2SessionState` — the run receiver, the undo history and their bounds;
 - poll the worker and report what arrived (`Flux2RunPoll`);
-- decide the working mode from the painted mask (`mask_for_run`): a painted buffer
-  travels verbatim with `whole_region = false`, an empty one becomes a SOLID mask;
-- write the flags the backend reports back into the settings (`apply_backend_flags`);
+- write the one flag the backend reports back into the settings (`apply_backend_flags`:
+  `vae_tiling` only — the memory steps are the user's and are never rewritten);
 - build the file-dialog request of each picker purpose (`flux2_picker_request`); the engine
   opens it through the non-blocking `ms_platform::file_dialog::request`.
 
@@ -19,13 +17,13 @@ Key structures:
 - `Flux2SessionState`, `Flux2RunPoll`, `Flux2PickerPurpose`
 
 Key functions:
-- `mask_for_run()`, `apply_backend_flags()`, `flux2_picker_request()`
+- `apply_backend_flags()`, `flux2_picker_request()`
 
 Notes:
 The painted mask is NOT stored here — it belongs to the host's `MaskStack` and arrives
-in `EngineRunRequest::masks`. `mask_for_run` is the ONLY place the working mode is
-decided; the backend refuses `whole_region = true` unless the mask really is uniformly
-255. The model-path pickers ask for a directory PATH used in place (`PickDirectoryPath`) or
+in `EngineRunRequest::masks`; the working mode is decided by the shared `mask_for_run`
+(`../shared/region_mask.rs`), because the backend refuses `whole_region = true` unless the
+mask really is uniformly 255. The model-path pickers ask for a directory PATH used in place (`PickDirectoryPath`) or
 an existing file; a platform without them answers the request with a typed error.
 */
 
@@ -62,6 +60,9 @@ pub(super) struct Flux2SessionState {
     /// [`FLUX2_UNDO_LIMIT`].
     pub(super) undo_stack: Vec<egui::ColorImage>,
     pub(super) run_rx: Option<Receiver<Flux2JobResult>>,
+    /// Cancelled operations (runs, downloads) whose workers have not ended yet; while one is
+    /// running nothing new starts on the backend's pipeline (`Flux2KleinEngine::pipeline_busy`).
+    pub(super) abandoned: AbandonedJobs,
 }
 
 impl Flux2SessionState {
@@ -87,7 +88,7 @@ impl Flux2SessionState {
         &mut self,
         input: Flux2RunInput,
         settings: &Flux2KleinSettings,
-        progress: &Arc<Mutex<Flux2Progress>>,
+        progress: &Arc<Mutex<EngineProgress>>,
     ) -> Result<(), String> {
         if self.run_rx.is_some() {
             return Err(t!("cleaning.mask_editor.processing_already_running_status").to_string());
@@ -95,11 +96,11 @@ impl Flux2SessionState {
         let settings = settings.normalized();
         // Claimed here rather than on the worker: the claim then happens in the order
         // the user pressed the button, whatever order the threads start in.
-        let generation = begin_progress_generation(progress);
+        let claim = begin_progress_generation(progress);
         let progress = Arc::clone(progress);
         let (tx, rx) = mpsc::channel::<Flux2JobResult>();
         thread::spawn(move || {
-            let result = run_flux2_klein(&input, &settings, &progress, generation);
+            let result = run_flux2_klein(&input, &settings, &progress, &claim);
             let _ = tx.send(Flux2JobResult {
                 source: input.region,
                 result,
@@ -114,30 +115,30 @@ impl Flux2SessionState {
     /// backend is told to stop instead of finishing a generation nobody will see.
     /// Returns `true` when there was a run to abandon.
     ///
-    /// A no-op detail that matters: `run_rx` is dropped first, so a result that lands
-    /// between the two statements is discarded rather than reported as a finished run.
+    /// The receiver moves into `abandoned` first, so a result that lands meanwhile is never
+    /// reported as a finished run; the engine stays busy until that worker ends.
     ///
-    /// During the short window before the request reaches the wire (the region and mask
-    /// are still being encoded) there is no id to cancel yet; the run is detached all
-    /// the same and its answer is dropped, the backend simply finishes it.
-    pub(super) fn cancel_run(&mut self, progress: &Arc<Mutex<Flux2Progress>>) -> bool {
-        if self.run_rx.is_none() {
+    /// A cancel in the window before the request reaches the wire (no id yet) is STICKY: the
+    /// claim's `CallControl` sends the backend cancel the moment the worker publishes the id.
+    pub(super) fn cancel_run(&mut self, progress: &Arc<Mutex<EngineProgress>>) -> bool {
+        let Some(rx) = self.run_rx.take() else {
             return false;
-        }
-        self.run_rx = None;
-        if let Some(id) = retire_progress_generation(progress) {
-            spawn_flux2_cancel(id);
-        }
+        };
+        // The answer is never read, but the worker is waited for: the backend stops at its next
+        // check, and a run started meanwhile would queue behind this one.
+        self.abandoned.push(rx);
+        retire_progress_generation(progress, FLUX2_LOG_LABEL);
         true
     }
 
     /// Polls the run channel and reports what it found, writing the user-facing line for
     /// the engine's own status slot into `status`.
     ///
-    /// A finished run also writes the memory flags the backend actually used back into
-    /// `settings` (setting `settings_changed`, which the caller turns into a background
-    /// save), so a run that had to recover from an out-of-memory failure makes the next
-    /// one take the cheap path from the start.
+    /// A finished run also writes the `vae_tiling` flag the backend actually used back
+    /// into `settings` (setting `settings_changed`, which the caller turns into a
+    /// background save), so a decode that had to be retried tiled starts tiled next time.
+    /// A DEGRADED run is reported with the step pair it actually ran as; the user's own
+    /// steps stay as they are (the backend learned a floor, which the panel shows).
     pub(super) fn poll_run(
         &mut self,
         settings: &mut Flux2KleinSettings,
@@ -156,11 +157,7 @@ impl Flux2SessionState {
                         if let Some(applied) = outcome.applied {
                             *settings_changed |= apply_backend_flags(settings, applied);
                         }
-                        *status = Some(if outcome.oom_recovered {
-                            t!("cleaning.tools.flux2_klein.oom_recovered_status").to_string()
-                        } else {
-                            t!("cleaning.mask_editor.processing_done_status").to_string()
-                        });
+                        *status = Some(flux2_run_done_status(outcome.degraded.as_ref(), outcome.oom_recovered));
                         Flux2RunPoll::Done(outcome.image)
                     }
                     Err(err) => {
@@ -194,55 +191,33 @@ impl Flux2SessionState {
     }
 }
 
-/// The L8 mask a run actually puts on the wire, region-sized either way, together with the
-/// `whole_region` flag that must accompany it.
-///
-/// This is the ONE place the working mode is decided, and it is DERIVED, never chosen: an
-/// empty `painted` layer means "edit the whole region", anything painted means "edit only
-/// what is under it". A single painted pixel is already a mask — the threshold is "any byte
-/// above zero" and nothing softer, so a stray dot cannot be mistaken for an empty layer.
-///
-/// `painted` is the host's mask layer, exactly `w * h` bytes. In the whole-region case the
-/// model may change every pixel and the backend proves that by REQUIRING a solid mask
-/// alongside the flag, so a fresh all-`255` buffer is built here rather than the host's
-/// layer being overwritten — the host's `MaskStack` is never written to by the engine at
-/// all, which is what keeps the user's painting theirs.
-#[must_use]
-pub(super) fn mask_for_run(painted: &[u8]) -> (Vec<u8>, bool) {
-    if painted.iter().any(|value| *value > 0) {
-        (painted.to_vec(), false)
-    } else {
-        (vec![255u8; painted.len()], true)
+/// Copies the `vae_tiling` flag the backend actually used into `settings`. Returns `true`
+/// when it changed, i.e. when a background save is owed. Nothing else is written back: the
+/// memory steps are the user's (the backend learns a floor instead) and fp8 is a quality
+/// trade only the user makes.
+pub(super) fn apply_backend_flags(settings: &mut Flux2KleinSettings, applied: Flux2AppliedFlags) -> bool {
+    match applied.vae_tiling {
+        Some(tiling) if tiling != settings.vae_tiling => {
+            settings.vae_tiling = tiling;
+            true
+        }
+        Some(_) | None => false,
     }
 }
 
-/// Copies the flags the backend actually used into `settings`. Returns `true` when
-/// anything changed, i.e. when a background save is owed.
-///
-/// The memory preset is deliberately NOT re-pinned here: if the recovered combination
-/// matches no preset, the picker moves itself to «Пользовательский», which is the
-/// honest report of what is now in effect.
-pub(super) fn apply_backend_flags(settings: &mut Flux2KleinSettings, applied: Flux2AppliedFlags) -> bool {
-    let mut changed = false;
-    for (field, value) in [
-        (
-            &mut settings.unload_transformer_before_vae,
-            applied.unload_transformer_before_vae,
-        ),
-        (&mut settings.vae_tiling, applied.vae_tiling),
-        (&mut settings.vae_slicing, applied.vae_slicing),
-        (
-            &mut settings.unload_text_encoder_after_encode,
-            applied.unload_text_encoder_after_encode,
-        ),
-        (&mut settings.text_encoder_fp8, applied.text_encoder_fp8),
-    ] {
-        if *field != value {
-            *field = value;
-            changed = true;
-        }
+/// The engine's line about a finished run: a degraded run names the steps it ran as (that
+/// is the one thing no other surface says), a recovered decode says so, else plain "done".
+#[must_use]
+pub(super) fn flux2_run_done_status(degraded: Option<&RunDegraded>, oom_recovered: bool) -> String {
+    if let Some(degraded) = degraded {
+        let vram = degraded.vram.map_or_else(|| t!("large_models.step.unknown_label").to_string(), |step| step.label().to_string());
+        let ram = degraded.ram.map_or_else(|| t!("large_models.step.unknown_label").to_string(), |step| step.label().to_string());
+        return tf!("cleaning.tools.flux2_klein.degraded_status", vram = vram, ram = ram);
     }
-    changed
+    if oom_recovered {
+        return t!("cleaning.tools.flux2_klein.oom_recovered_status").to_string();
+    }
+    t!("cleaning.mask_editor.processing_done_status").to_string()
 }
 
 // ---------------------------------------------------------------------------------------

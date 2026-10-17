@@ -240,6 +240,10 @@ USER_CONFIG_DEFAULTS = {
         "ai_onnx_provider": "not-selected",
         "ai_onnx_device_id": "not-selected",
         "ai_max_loaded_models": 3,
+        # Read once at backend start (Linux: the backend's own oom_score_adj -> 1000).
+        # The large-model caps `large_models_{vram,ram}_cap_bytes` are deliberately NOT
+        # defaults: absent = no cap, and only the backend writes them (as in ms-config).
+        "large_models_oom_score_adj": True,
         "open_page_last_title": "",
         "open_page_last_chapter": "",
         "enabled_tabs": {

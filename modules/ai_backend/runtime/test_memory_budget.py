@@ -209,6 +209,7 @@ class DeviceBudgetTests(unittest.TestCase):
             memory_allocated=lambda index: 1 * GIB,
             memory_reserved=lambda index: 2 * GIB,
             synchronize=lambda device: calls.append(f"sync:{device}"),
+            get_device_properties=lambda index: types.SimpleNamespace(name="Radeon AI PRO R9700", gcnArchName="gfx1201", is_integrated=0),
         )
         fake_torch = types.SimpleNamespace(cuda=fake_cuda, bfloat16="bf16", ones=lambda shape, dtype, device: calls.append(f"ones:{device}") or object(), matmul=lambda a, b: calls.append("matmul"))
         with mock.patch.dict(sys.modules, {"torch": fake_torch}):
@@ -218,6 +219,21 @@ class DeviceBudgetTests(unittest.TestCase):
         self.assertEqual(first, mb.DeviceReading(total=8 * GIB, free=6 * GIB, torch_allocated=1 * GIB, torch_reserved=2 * GIB))
         self.assertEqual(calls.count("matmul"), 1, "the warm-up matmul runs once per device")
         self.assertLess(calls.index("matmul"), calls.index("info:1"), "the reading is taken after the warm-up")
+
+    def test_torch_probe_never_touches_an_integrated_gpu(self) -> None:
+        calls: list[str] = []
+        fake_cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_properties=lambda index: types.SimpleNamespace(name="AMD Ryzen 5 9600X 6-Core Processor", gcnArchName="gfx1036", is_integrated=1),
+            mem_get_info=lambda index: calls.append("info") or (1 * GIB, 2 * GIB),
+            memory_allocated=lambda index: 0,
+            memory_reserved=lambda index: 0,
+            synchronize=lambda device: calls.append("sync"),
+        )
+        fake_torch = types.SimpleNamespace(cuda=fake_cuda, bfloat16="bf16", ones=lambda shape, dtype, device: calls.append("ones") or object(), matmul=lambda a, b: calls.append("matmul"))
+        with mock.patch.dict(sys.modules, {"torch": fake_torch}):
+            self.assertIsNone(mb.TorchDeviceProbe(lambda: True).query("cuda:1"))
+        self.assertEqual(calls, [], "no allocation, kernel or reading on an iGPU")
 
     def test_default_reserves(self) -> None:
         self.assertEqual(mb.default_device_reserve(is_rocm=True), 512 * MIB)

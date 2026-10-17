@@ -2,78 +2,38 @@
 File: modules/ai_backend/inpaint/flux2_klein/memory.py
 
 Purpose:
-The FLUX.2 klein adapters between the stage-1 wire (the legacy `placement`
-flags, `inpaint.flux2_klein.estimate`, the guard's preset advice) and the
-large-model manager, which owns every resource decision. Nothing here
-forecasts on its own: the numbers come from `runtime.large_models` (the
-planner on `large_model.py`'s specs, the one `forecast` arithmetic).
+The FLUX.2 klein resource glue over the large-model manager, which owns every
+resource decision: the request's step pair, the step keys of an answer, the
+COMBINED VRAM-axis rule of the two handles (pipeline + text encoder), and the
+two-handle run forecast the calibration tool and the golden tests read.
+Nothing here forecasts on its own: the numbers come from `runtime.large_models`
+(the planner on `large_model.py`'s specs, the one `forecast` arithmetic).
 
 Main responsibilities:
 - `requested_steps` - the manager step pair of a request: `params.vram_step` /
-  `params.ram_step` when either is sent (the absent axis «Авто»), else the
-  LEGACY `params.profile` id (`LEGACY_PROFILE_STEPS`), else the legacy
-  `placement` mapping `legacy_steps` (table below);
-- `legacy_profile_name` - the stage-1 `profile` / `profile_effective` wire
-  value of a step pair (the legacy name of its VRAM step, table below);
-- `encoder_cpu_pinned` - whether a request pins the text encoder to the CPU
-  (the legacy wire's meaning, below);
-- `forecast_memory` - the `estimate` / golden answer for one request: the
-  pipeline planned first, the text encoder second on what the pipeline left
-  (exactly how a run is admitted), reported in the stage-1 shape
-  (`vram_bytes`, `ram_bytes`, `phases`, `resident`, `breakdown`) plus the
-  manager's requested / effective steps (`vram_step`, `ram_step`,
-  `vram_step_effective`, `ram_step_effective`, and the legacy names
-  `profile`, `profile_effective`), `fits` and `calibrated`;
+  `params.ram_step`, an absent axis «Авто»;
+- `steps_fields` / `STEP_FIELD_KEYS` - the four step keys of an answer
+  (requested and effective);
 - the COMBINED VRAM-axis rule of the two handles (`combined_device_peak`,
   `combined_ceilings`, `encoder_device_cap`; module notes), shared by
   `forecast_memory`, the run's encoder admission and `large_model_profiles`;
-- `_preset_advice` - which concrete step pairs fit the given free memory;
+- `forecast_memory` - the forecast of one run of both handles: the pipeline
+  planned first, the text encoder second on what the pipeline left (exactly
+  how a run is admitted), as `vram_bytes`, `ram_bytes`, per-phase figures,
+  `resident`, `breakdown`, the four step keys, `fits` and `calibrated`
+  (consumers: `tools/large_model_calibration/flux2.py`, `test_characterization`);
 - `is_host_run_device` - whether a run device is planned on the host alone.
-
-Legacy `placement` mapping (also the stage-2 migration of the persisted settings):
-| `placement` | flags | steps (VRAM, RAM) |
-|---|---|---|
-| `full_gpu` | any | (MAX, KEEP) |
-| `encoder_cpu` | `unload_transformer_before_vae=False` | (MAX, KEEP) |
-| `encoder_cpu` | `unload_transformer_before_vae=True` (its default) | (PHASE, KEEP) |
-| `model_cpu_offload` | any | (PHASE, KEEP) |
-| `sequential_cpu_offload` | any | (MIN, KEEP) |
-| anything else | | (AUTO, AUTO) |
-`low_cpu_mem_usage` no longer changes anything (the manager always streams
-tensor by tensor) and `vae_slicing` was always inert (KG-008).
-
-The text encoder under the legacy wire (`encoder_cpu_pinned`): every legacy
-`placement` encoded on the HOST before the manager, whatever the step pair
-above keeps of the pipeline. A request that sends neither `vram_step` nor
-`ram_step` therefore pins the encoder to the CPU (the CPU-only encoder spec,
-`large_model.encoder_spec(cpu_only=True)`): (MAX, KEEP) for `full_gpu` keeps
-the PIPELINE on the card, never the 9B encoder beside it. The one exception is
-a legacy `profile` whose RAM step is MIN (`max_economy`): that step offers the
-encoder no CPU placement at all (`tiers.template_for`), so it keeps the
-unpinned spec (juggled from disk). With `vram_step` / `ram_step` sent the
-encoder may compute on the GPU under MAX / PHASE (the two-axis semantics).
-
-Legacy `profile` ids (stage-1 field, no client sends it) -> steps, and back:
-| id | steps in | name out (by VRAM step) |
-|---|---|---|
-| `max_speed` | (MAX, KEEP) | MAX |
-| `fast` | (MAX, KEEP) | - (reported as `max_speed`) |
-| `balanced` | (PHASE, KEEP) | PHASE |
-| `economy` | (HALF, RUN) | HALF |
-| `max_economy` | (MIN, MIN) | MIN |
-| `auto` | (AUTO, AUTO) | AUTO |
-The name ignores the RAM step (a compatibility label); the exact pair is in
-the `*_step*` keys.
 
 Notes:
 - `hardware.memory_snapshot` (the patch point the suite uses) supplies the
-  free figures; `0` = unknown, which plans against unbounded budgets and
-  always "fits" (advice only: the manager's admission is the guard).
+  free figures `forecast_memory` plans against; `0` = unknown, which plans
+  against unbounded budgets and always "fits" (a forecast only: the manager's
+  admission is the guard).
 - A HOST run device (`cpu` / `mps`: any device the manager does not budget
   against a device probe, `runtime.residency.footprint.is_device_accounted`)
   is planned exactly as the manager plans it (`Budgets.host_device`): no
   device budget and no unbounded-VRAM rule, every byte on the host side, the
-  RAM step alone picks the plan; the answer's VRAM figures are `0` and `fits`
+  RAM step alone picks the plan; the forecast's VRAM figures are `0` and `fits`
   is the host plan's.
 - Combined VRAM-axis monotonicity (the two handles together): the planner keeps
   each handle monotone on its own, but the encoder is admitted on what the
@@ -94,6 +54,10 @@ Notes:
   borrowed table of an unknown device class): it may admit on their weights alone. The
   displayed peaks are the plan's full forecast (`Planned.full_forecast`, every
   activation estimate included); `calibrated` says whether it is measured.
+- The persisted FLUX.2 settings of a build before the step axes are migrated
+  by the Rust client (`legacy_memory_steps` in the cleaning tab's
+  `flux2_klein/settings.rs`, which owns that table); this backend refuses the
+  retired fields (`params.RETIRED_FIELDS`).
 """
 
 from __future__ import annotations
@@ -110,7 +74,7 @@ from ...runtime.large_models.forecast import Forecast
 from ...runtime.large_models.inventory import ComponentInventory, build_inventory
 from ...runtime.large_models.planner import Budgets, Planned, PlanRefusal, plan
 from ...runtime.large_models.spec import LargeModelSpec
-from ...runtime.large_models.tiers import AUTO_STEPS, STEP_WALK, VRAM_ORDER, Limits, RamStep, Steps, VramStep
+from ...runtime.large_models.tiers import VRAM_ORDER, Limits, RamStep, Steps, VramStep
 from ...runtime.memory_budget import DeviceBudget, HostBudget
 from ...runtime.residency.footprint import is_device_accounted
 from . import attention, hardware, large_model
@@ -118,93 +82,24 @@ from .components import text_encoder_available
 
 log = logging.getLogger(__name__)
 
-#: User-facing names of the concrete steps (the settings' labels), for advice.
-VRAM_STEP_LABELS = {
-    VramStep.MAX: "Максимум скорости",
-    VramStep.PHASE: "Только текущий этап",
-    VramStep.HALF: "Не больше половины",
-    VramStep.MIN: "Минимум",
-}
-RAM_STEP_LABELS = {
-    RamStep.KEEP: "Держать модели в памяти",
-    RamStep.RUN: "Только на время задачи",
-    RamStep.MIN: "Минимум, читать с диска",
-}
-
-#: The legacy `params.profile` ids onto step pairs (module table).
-LEGACY_PROFILE_STEPS: dict[str, Steps] = {
-    "auto": AUTO_STEPS,
-    "max_speed": Steps(VramStep.MAX, RamStep.KEEP),
-    "fast": Steps(VramStep.MAX, RamStep.KEEP),
-    "balanced": Steps(VramStep.PHASE, RamStep.KEEP),
-    "economy": Steps(VramStep.HALF, RamStep.RUN),
-    "max_economy": Steps(VramStep.MIN, RamStep.MIN),
-}
-
-#: The legacy wire name of each VRAM step (module table).
-_LEGACY_PROFILE_NAMES = {
-    VramStep.AUTO: "auto",
-    VramStep.MAX: "max_speed",
-    VramStep.PHASE: "balanced",
-    VramStep.HALF: "economy",
-    VramStep.MIN: "max_economy",
-}
-
 #: "Unbounded" figure for an unknown budget side (1 PiB): the plan of an
 #: unknown machine is the step pair's first choice.
 _UNBOUNDED = 1 << 50
 
 
-def legacy_steps(normalized: dict[str, Any]) -> Steps:
-    """The step pair the legacy `placement` flags mean (module table)."""
-    placement = normalized["placement"]
-    if placement == "full_gpu":
-        return Steps(VramStep.MAX, RamStep.KEEP)
-    if placement == "encoder_cpu":
-        return Steps(VramStep.PHASE if normalized["unload_transformer_before_vae"] else VramStep.MAX, RamStep.KEEP)
-    if placement == "model_cpu_offload":
-        return Steps(VramStep.PHASE, RamStep.KEEP)
-    if placement == "sequential_cpu_offload":
-        return Steps(VramStep.MIN, RamStep.KEEP)
-    return AUTO_STEPS
-
-
 def requested_steps(normalized: dict[str, Any]) -> Steps:
-    """`params.vram_step` / `params.ram_step` when either is sent (the other «Авто»), else `params.profile`, else `legacy_steps`."""
+    """The step pair of a normalized request: `params.vram_step` / `params.ram_step`, an absent axis «Авто»."""
     vram, ram = normalized.get("vram_step"), normalized.get("ram_step")
-    if vram or ram:
-        return Steps(VramStep(vram) if vram else VramStep.AUTO, RamStep(ram) if ram else RamStep.AUTO)
-    if normalized.get("profile"):
-        return LEGACY_PROFILE_STEPS[normalized["profile"]]
-    return legacy_steps(normalized)
-
-
-def encoder_cpu_pinned(normalized: dict[str, Any]) -> bool:
-    """Whether the request pins the text encoder to the CPU: a legacy request (no `vram_step` / `ram_step`) whose RAM step is not MIN (module notes)."""
-    if normalized.get("vram_step") or normalized.get("ram_step"):
-        return False
-    return requested_steps(normalized).ram is not RamStep.MIN
-
-
-def legacy_profile_name(steps: Steps) -> str:
-    """The stage-1 `profile` wire value of `steps`: the legacy name of its VRAM step (module table)."""
-    return _LEGACY_PROFILE_NAMES[steps.vram]
+    return Steps(VramStep(vram) if vram else VramStep.AUTO, RamStep(ram) if ram else RamStep.AUTO)
 
 
 #: The keys `steps_fields` returns (wire order).
-STEP_FIELD_KEYS = ("profile", "profile_effective", "vram_step", "ram_step", "vram_step_effective", "ram_step_effective")
+STEP_FIELD_KEYS = ("vram_step", "ram_step", "vram_step_effective", "ram_step_effective")
 
 
 def steps_fields(requested: Steps, effective: Steps | None) -> dict[str, str | None]:
-    """The wire keys of a requested / effective step pair (`None` effective = nothing planned).
-
-    `{"profile", "profile_effective", "vram_step", "ram_step",
-    "vram_step_effective", "ram_step_effective"}`; `profile*` are the legacy
-    names (`legacy_profile_name`).
-    """
+    """The wire keys of a requested / effective step pair (`None` effective = nothing planned): `STEP_FIELD_KEYS`."""
     return {
-        "profile": legacy_profile_name(requested),
-        "profile_effective": legacy_profile_name(effective) if effective is not None else None,
         "vram_step": requested.vram.value,
         "ram_step": requested.ram.value,
         "vram_step_effective": effective.vram.value if effective is not None else None,
@@ -230,10 +125,10 @@ def _pipeline_spec(dtype: str) -> LargeModelSpec:
 
 
 def _encoder_spec(options: large_model.EncoderOptions) -> LargeModelSpec:
-    """The encoder spec `options` select (precision, CPU-only), built once per process."""
-    key = ("encoder", options.fp8, options.cpu_only)
+    """The encoder spec `options` select (precision), built once per process."""
+    key = ("encoder", options.fp8)
     if key not in _SPECS:
-        _SPECS[key] = large_model.encoder_spec(options.fp8, options.cpu_only)
+        _SPECS[key] = large_model.encoder_spec(options.fp8)
     return _SPECS[key]
 
 
@@ -330,7 +225,7 @@ def combined_ceilings(ram: RamStep, combined_at: Callable[[Steps, int | None], i
 
 @dataclass(frozen=True)
 class _Part:
-    """One planned handle of the estimate.
+    """One planned handle of the forecast.
 
     `steps` is the concrete pair planned (`None` when refused); `guarded` the
     forecast the planner admitted on (what the manager reserves: without the
@@ -363,24 +258,23 @@ def forecast_memory(
     steps: Steps | None = None,
     device: str | None = None,
 ) -> dict[str, Any]:
-    """The manager's forecast of one run, in the stage-1 `estimate` shape (bytes).
+    """The manager's forecast of one run of both handles (bytes).
 
     The pipeline is planned for `steps` (default `requested_steps`) against
     `memory` (a `hardware.memory_snapshot`; `None` / unknown = unbounded; a
     host run `device` plans on the host alone, module notes),
     then the text encoder against what the pipeline's peak left, under the
-    combined VRAM-axis ceiling (module notes), as the service admits them. The encoder is pinned to the CPU exactly when a run
-    of this request would pin it (`encoder_cpu_pinned`) — and never for an
-    explicit `steps` pair (the two-axis semantics the advice names). A side
-    that does not fit reports the planner's closest attempt. With no text
+    combined VRAM-axis ceiling (module notes), as the service admits them. A
+    side that does not fit reports the planner's closest attempt. With no text
     encoder installed both encode phases are 0.
 
     Returns `{"vram_bytes", "ram_bytes", "phases", "resident", "breakdown",
     "fits", "calibrated"}` plus the `steps_fields` keys (effective = the
     pipeline's plan, `None` when it does not fit); `phases` maps
     `encode`, `encode_standalone`, `denoise`, `decode` to `{"vram_bytes",
-    "ram_bytes"}`; `breakdown` keeps the stage-1 key set (+ `attention_mask`
-    while that term is non-zero).
+    "ram_bytes"}`; `breakdown` names the weight bytes per component, the
+    activations and the per-phase device peaks (+ `attention_mask` while that
+    term is non-zero).
 
     # Raises
     `ValueError` for files whose headers cannot be read (the manager would
@@ -396,7 +290,7 @@ def forecast_memory(
     pipeline = _plan_part(pipeline_spec, options, shape, chosen, _budgets(memory, host_device=host_device), tables)
 
     encoder_installed = text_encoder_available(normalized)
-    encoder_options = large_model.encoder_options(normalized, cpu_only=steps is None and encoder_cpu_pinned(normalized))
+    encoder_options = large_model.encoder_options(normalized)
     encoder: _Part | None = None
     if encoder_installed:
         encoder_spec = _encoder_spec(encoder_options)
@@ -477,25 +371,3 @@ def forecast_memory(
         "fits": pipeline.fits and (encoder is None or encoder.fits),
         "calibrated": calibrated,
     }
-
-
-def _preset_advice(
-    normalized: dict[str, Any],
-    region_width: int,
-    region_height: int,
-    memory: dict[str, int],
-    *,
-    with_reference: bool = False,
-) -> str:
-    """One sentence naming the concrete step pairs whose plan fits `memory` right now (computed, never hard-coded), `STEP_WALK` order."""
-    fitting = [
-        f"«{VRAM_STEP_LABELS[pair.vram]} + {RAM_STEP_LABELS[pair.ram]}»"
-        for pair in STEP_WALK
-        if forecast_memory(normalized, region_width, region_height, with_reference=with_reference, memory=memory, steps=pair)["fits"]
-    ]
-    if not fitting:
-        return (
-            "Ни одно сочетание «Видеопамять» и «Оперативная память» сейчас не помещается: "
-            "уменьшите выделенную область или освободите память, закрыв другие программы."
-        )
-    return "Сейчас помещаются: " + ", ".join(fitting) + "."

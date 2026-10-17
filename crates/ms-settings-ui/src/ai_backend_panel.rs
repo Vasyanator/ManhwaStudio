@@ -72,6 +72,8 @@ use std::sync::mpsc::{Receiver, Sender};
 /// the studio and launcher panels can hold independent in-progress selections.
 #[derive(Debug, Default)]
 pub struct AiBackendPanelState {
+    /// The «Большие модели» section's own state (caps buffer, cap writer, pool actions).
+    pub large_models: crate::large_models_panel::LargeModelsPanelState,
     pub selected_backend_device: String,
     pub selected_onnx_provider: String,
     pub selected_onnx_device_id: String,
@@ -1042,10 +1044,14 @@ fn draw_model_manager(
 ) {
     ui.separator();
     ui.label(t!("ai_backend.model_manager_heading"));
-    let slider_response = ui.add(
-        WheelSlider::new(&mut state.selected_max_loaded_models, 1..=10)
-            .text(t!("ai_backend.max_loaded_models_label")),
-    );
+    let slider_response = ui
+        .add(
+            WheelSlider::new(&mut state.selected_max_loaded_models, 1..=10)
+                .text(t!("ai_backend.max_loaded_models_label")),
+        )
+        // The count applies to the small pool only; the large models are budgeted by bytes
+        // in the section below.
+        .on_hover_text(t!("ai_backend.max_loaded_models_hint"));
     if slider_response.changed() {
         spawn_save_max_loaded_models(state.selected_max_loaded_models);
         if snapshot.connected {
@@ -1057,6 +1063,7 @@ fn draw_model_manager(
     if snapshot.connected {
         ui.small(tf!("ai_backend.backend_current_limit", snapshot = snapshot.max_loaded_models));
     }
+    crate::large_models_panel::draw_large_models_section(ui, &mut state.large_models, snapshot);
 }
 
 /// Web build: the native ONNX path does not exist, so the ONNX provider/device

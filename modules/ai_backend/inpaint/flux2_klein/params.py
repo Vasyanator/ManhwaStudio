@@ -14,6 +14,7 @@ Main responsibilities:
   budget, aspect ratio); nothing is silently resized;
 - `_lenient_paths` - the tolerant path view `status` uses before a run has
   ever happened;
+- `encoder_on_cpu` - the «Энкодер на CPU» flag and its default (on);
 - `text_encoder_dtype_name` - the ONE place that answers what dtype the
   text encoder runs in; it is deliberately NOT the request's
   `dtype`, which governs the transformer and the VAE alone.
@@ -22,7 +23,7 @@ Key functions:
 - normalize_flux2_klein_params()
 - _whole_region_overrides()
 - validate_region_size()
-- effective_steps(), _lenient_paths()
+- effective_steps(), _lenient_paths(), encoder_on_cpu()
 - text_encoder_dtype_name()
 
 Notes:
@@ -34,6 +35,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Any
 
 from ...runtime.large_models.tiers import RamStep, VramStep
@@ -44,23 +46,23 @@ log = logging.getLogger(__name__)
 # Contract constants
 # ---------------------------------------------------------------------------
 
-#: The LEGACY placement modes (stage 1 of the large-model manager keeps them on
-#: the wire; the Rust settings still send them). They no longer place anything
-#: themselves: `memory.requested_steps` maps them onto a step pair of the
-#: manager (table in `inpaint/MODULE_README.md`, FLUX.2 klein sections).
-VALID_PLACEMENTS = ("full_gpu", "encoder_cpu", "model_cpu_offload", "sequential_cpu_offload")
-
 #: Values of the optional `vram_step` / `ram_step` request fields (`tiers.VramStep`
-#: / `tiers.RamStep` values, `auto` included). Either one present overrides
-#: `profile` and the legacy `placement` mapping; the absent axis is then `auto`.
+#: / `tiers.RamStep` values, `auto` included). An absent or `null` axis is `auto`
+#: (`memory.requested_steps`).
 VALID_VRAM_STEPS = tuple(step.value for step in VramStep)
 VALID_RAM_STEPS = tuple(step.value for step in RamStep)
 
-#: Values of the optional LEGACY `profile` request field (the stage-1 profile
-#: ids before the two axes; `memory.LEGACY_PROFILE_STEPS` maps each onto a step
-#: pair). Present without `vram_step` / `ram_step`, it overrides the legacy
-#: `placement` mapping.
-VALID_PROFILES = ("auto", "max_speed", "fast", "balanced", "economy", "max_economy")
+#: Request fields of the retired placement wire (protocol <= 13) -> what replaced
+#: each. A request carrying one is REFUSED by name (`_refuse_retired_fields`): a
+#: stale client gets a clear error instead of a silently ignored memory choice.
+RETIRED_FIELDS: dict[str, str] = {
+    "placement": "передавайте «vram_step» и «ram_step»",
+    "profile": "передавайте «vram_step» и «ram_step»",
+    "unload_transformer_before_vae": "где трансформер находится во время декодирования, решает «vram_step»",
+    "unload_text_encoder_after_encode": "остаётся ли текстовый энкодер между запусками, решает «ram_step»",
+    "low_cpu_mem_usage": "загрузка всегда идёт тензор за тензором; уберите поле",
+    "vae_slicing": "на декодирование одной области оно никогда не влияло; уберите поле",
+}
 
 #: Compute dtypes offered to the user. Both are 2 bytes per parameter. Since the
 #: encoder dtype was fixed (`text_encoder_dtype_name`) this governs the
@@ -95,7 +97,7 @@ def text_encoder_dtype_name() -> str:
     """THE single answer to "what dtype does the text encoder use".
 
     Always `bfloat16`, whatever `normalized["dtype"]` says. The encoder runs on
-    the HOST CPU whenever the profile (or the free device memory) puts it there,
+    the HOST CPU whenever the step pair (or the free device memory) puts it there,
     and x86 has no native float16 arithmetic: a fp16
     forward is emulated element by element, while bfloat16 lowers onto the same
     fp32 paths as everything else. A sibling project measured 59 s against 2.4 s
@@ -106,7 +108,7 @@ def text_encoder_dtype_name() -> str:
     **The scope of that argument is x86**, which is what this project targets
     (`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-gnu`), and it is a statement
     about the HOST's CPU, not about the GPU vendor. When the encoder runs on the
-    accelerator instead (a profile that keeps it there beside the pipeline),
+    accelerator instead (a step pair that keeps it there beside the pipeline),
     bfloat16 is a native format on both CUDA and ROCm, so the same constant is
     right there too. On an ARM host the premise would be the other way round — NEON
     has native fp16 while bf16 needs FEAT_BF16 — so if this service is ever
@@ -134,7 +136,7 @@ def text_encoder_dtype_name() -> str:
 def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any]:
     """Validate and clamp the request params into a fully populated dict.
 
-    Out-of-range numbers are clamped; an unknown `placement`/`dtype`, a missing
+    Out-of-range numbers are clamped; an unknown step id or `dtype`, a missing
     transformer/VAE path, or one that does not exist on disk is an error, because
     every one of them would otherwise surface much later as an unreadable
     failure inside a loader.
@@ -159,26 +161,20 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     Returns a dict with every key of the wire contract present.
 
     # Raises
-    `ValueError` when the transformer or VAE path is empty or absent, or when an
-    enum value is not one of `VALID_PLACEMENTS` / `VALID_DTYPES` /
-    `VALID_PROFILES` / `VALID_VRAM_STEPS` / `VALID_RAM_STEPS`.
+    `ValueError` when the transformer or VAE path is empty or absent, when an
+    enum value is not one of `VALID_DTYPES` / `VALID_VRAM_STEPS` /
+    `VALID_RAM_STEPS`, or when a field of the retired placement wire
+    (`RETIRED_FIELDS`) is present, naming it and its replacement.
     """
     merged: dict[str, Any] = {}
     if isinstance(params, dict):
         merged.update(params)
 
+    _refuse_retired_fields(merged)
     text_encoder_path = str(merged.get("text_encoder_path") or "").strip()
     transformer_path = _require_existing_path(merged.get("transformer_path"), "transformer_path")
     vae_path = _require_existing_path(merged.get("vae_path"), "vae_path")
 
-    placement = str(merged.get("placement", "full_gpu") or "").strip()
-    if placement not in VALID_PLACEMENTS:
-        raise ValueError(
-            f"Неизвестный режим размещения FLUX.2 klein: {placement!r}. "
-            f"Допустимые значения: {', '.join(VALID_PLACEMENTS)}"
-        )
-
-    profile = _optional_choice(merged.get("profile"), VALID_PROFILES, "профиль ресурсов")
     vram_step = _optional_choice(merged.get("vram_step"), VALID_VRAM_STEPS, "шаг «Видеопамять»")
     ram_step = _optional_choice(merged.get("ram_step"), VALID_RAM_STEPS, "шаг «Оперативная память»")
 
@@ -202,43 +198,23 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
         ),
         "strength": _clamp_float(merged.get("strength"), default=1.0, low=0.25, high=1.0),
         "seed": _to_optional_int(merged.get("seed")),
-        "placement": placement,
-        # The manager's step pair when the client sends it (`None` = not sent;
-        # `memory.requested_steps` resolves the three in that order, falling
-        # back to the legacy `placement` flags).
+        # The manager's step pair (`None` = not sent = «Авто» on that axis,
+        # `memory.requested_steps`).
         "vram_step": vram_step,
         "ram_step": ram_step,
-        "profile": profile,
         "dtype": dtype,
-        "low_cpu_mem_usage": _to_bool(merged.get("low_cpu_mem_usage"), False),
         "vae_tiling": _to_bool(merged.get("vae_tiling"), True),
-        "vae_slicing": _to_bool(merged.get("vae_slicing"), True),
-        # The VAE decode peaks ON TOP of the resident transformer and is the most
-        # common source of OOM here, so parking the transformer first is the
-        # default everywhere except `full_gpu`, whose whole point is that
-        # everything stays on the GPU.
-        "unload_transformer_before_vae": _to_bool(
-            merged.get("unload_transformer_before_vae"), placement != "full_gpu"
-        ),
-        # The text encoder now arrives LAST, into a host that the transformer has
-        # already left for the accelerator, and it encodes there in every
-        # placement. Keeping it resident therefore costs host memory that nothing
-        # else in the run wants back, and buys an instant prompt change plus a
-        # skipped 16 GB read from disk on every cache miss. Measured on this
-        # project's reference host (see `inpaint/MODULE_README.md`), so the
-        # default is now to KEEP it in every placement. A settings file written
-        # before this field existed has no value for it, and that absence must
-        # resolve to this default — which is what `_to_bool(None, default)` does.
-        "unload_text_encoder_after_encode": _to_bool(
-            merged.get("unload_text_encoder_after_encode"), False
-        ),
         # Weight-only fp8 for the encoder's linear layers: a real quality/memory
-        # trade, never made on the user's behalf, so the default is False in
-        # every placement and in every preset. It shrinks the RESIDENT encoder,
-        # not the load peak (the bf16 weights exist before they are quantized),
-        # so it is only useful together with
-        # `unload_text_encoder_after_encode=False`.
+        # trade, never made on the user's behalf, so the default is False. It
+        # shrinks the RESIDENT encoder, not the load peak (the bf16 weights exist
+        # before they are quantized), so it pays off when the RAM step keeps the
+        # encoder between runs.
         "text_encoder_fp8": _to_bool(merged.get("text_encoder_fp8"), False),
+        # «Энкодер на CPU» (default on): the text encoder runs on the CPU from
+        # RAM whatever the VRAM step; the RAM step alone keeps it, releases it
+        # after the run or re-reads it per run (`large_model.encoder_spec`'s
+        # host pin, `runtime/large_models` "Host pin").
+        "encoder_on_cpu": encoder_on_cpu(merged),
         "mask_dilate_px": _clamp_int(merged.get("mask_dilate_px"), default=16, low=0, high=64),
         # 12 px, not 6: `_feather_mask_inwards` now ramps over exactly this many
         # pixels, where the old construction spread a nominal 6 over ~22. Measured
@@ -400,6 +376,18 @@ def _require_existing_path(value: Any, field: str) -> str:
     return raw
 
 
+def _refuse_retired_fields(params: dict[str, Any]) -> None:
+    """Refuse a request that carries any field of the retired placement wire (`RETIRED_FIELDS`), even `null`.
+
+    # Raises
+    `ValueError` naming the first retired field present (in `RETIRED_FIELDS`
+    order) and what replaced it.
+    """
+    for field, replacement in RETIRED_FIELDS.items():
+        if field in params:
+            raise ValueError(f"FLUX.2 klein: поле «{field}» больше не поддерживается (протокол 14): {replacement}.")
+
+
 def _optional_choice(value: Any, allowed: tuple[str, ...], what: str) -> str | None:
     """`None` for an absent / empty value, else the stripped value when it is one of `allowed`.
 
@@ -442,6 +430,15 @@ def _to_optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def encoder_on_cpu(params: Mapping[str, Any] | None) -> bool:
+    """The «Энкодер на CPU» flag of a (raw or normalized) params object: `encoder_on_cpu`, absent = `True`.
+
+    The one owner of the default: `normalize_flux2_klein_params` and the
+    lenient `status` path both read it here.
+    """
+    return _to_bool((params or {}).get("encoder_on_cpu"), True)
 
 
 def _to_bool(value: Any, default: bool) -> bool:

@@ -14,7 +14,10 @@ per step, `plan_axis` rows and `same_as`, the per-handle device ceiling
 phase (estimated device activations choose the plan but never refuse it;
 measured ones, an unmeasured CPU phase, weights and the host side stay
 strict), with the tracked gfx1201 table as the CPU-encoder regression; a host
-run device (`cpu` / `mps`) planned on the host budget alone (`HostRunDeviceTests`).
+run device (`cpu` / `mps`) planned on the host budget alone (`HostRunDeviceTests`);
+the host pin (`HostPinTests`: a pinned encoder is never on the device at any
+VRAM step, its size never changes a device forecast, the RAM step alone places
+it, the per-axis invariant still holds).
 
 `GridInvariantTests` is the property test of the per-axis monotonic
 invariant: four toy shapes (DiT-dominant, encoder larger than the DiT, a big
@@ -33,7 +36,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
-from ._test_fixtures import GIB, budgets, simple_tables, toy_files, toy_formats, toy_inventories, toy_spec
+from ._test_fixtures import GIB, PIN_ENCODER, budgets, simple_tables, toy_files, toy_formats, toy_inventories, toy_spec
 from .cost_tables import load_tables
 from .planner import REASON_BUDGET_UNKNOWN, REASON_DEVICE_SHORT, REASON_FORMAT_UNAVAILABLE, REASON_HOST_SHORT, REASON_STEPS_UNSUPPORTED, FitKind, PlanRefusal, Planned, axis_rows, guarded_forecast, plan, plan_axis, plan_grid
 from .spec import ExecDevice, FormatInfo, RequestShape
@@ -560,6 +563,146 @@ class GridInvariantTests(unittest.TestCase):
                     self.assertEqual(type(alone), type(result))
                     if isinstance(result, Planned):
                         self.assertEqual(alone, result)
+
+
+class HostPinTests(unittest.TestCase):
+    """A component the request pins to the host (`LargeModelSpec.host_pin`, planner notes "Host pin").
+
+    Invariant: with the encoder pinned, every VRAM step's device placement and
+    device forecast exclude the encoder (an encoder ten times larger changes no
+    device figure of a cell that places the DiT and the AE the same way), while
+    the RAM steps still govern it (KEEP keeps it in RAM between runs, RUN only
+    during the run, MIN never parks it) and its CPU run is on the host side.
+    """
+
+    DEVICE_TOTALS = (8, 12, 16, 24, 32)
+    HOST_SIZES = (16, 32, 64, 128)
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._dir = tempfile.TemporaryDirectory()
+        root = Path(cls._dir.name)
+        cls.models: dict[str, Any] = {}
+        for name, encoder_gib in (("small_encoder", 4.0), ("large_encoder", 40.0)):
+            files = {"big": toy_files(root / name, "big", encoder_gib=encoder_gib)}
+            spec = toy_spec(files, pinnable=True)
+            cls.models[name] = (spec, toy_inventories(spec, files))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._dir.cleanup()
+
+    def _grid(self, model: str, device_gib: int, host_gib: int, *, options: Any = PIN_ENCODER, host_device: bool = False) -> dict[Steps, Any]:
+        spec, inventories = self.models[model]
+        budget = budgets(vram_free_gib=device_gib, vram_total_gib=device_gib, ram_available_gib=host_gib)
+        if host_device:
+            from dataclasses import replace
+
+            budget = replace(budget, host_device=True)
+        return plan_grid(spec, inventories, format="big", formats=toy_formats(small=False), limits=Limits(), budgets=budget, shape=_SHAPE, tables=simple_tables(), options=options)
+
+    @staticmethod
+    def _device_figures(result: Planned) -> dict[str, int]:
+        forecast = result.full_forecast
+        return {**{name: entry.device_peak for name, entry in forecast.phases.items()}, **{name: entry.device_peak for name, entry in forecast.transitions.items()}}
+
+    def test_a_pinned_encoder_is_never_on_the_device_and_the_ram_step_places_it(self) -> None:
+        idle_tier = {_KEEP: Tier.HOST, _RUN: Tier.DROPPED, _RMIN: Tier.DROPPED}
+        in_run_tier = {_KEEP: Tier.HOST, _RUN: Tier.HOST, _RMIN: Tier.DROPPED}
+        planned_cells = 0
+        for device_gib in self.DEVICE_TOTALS:
+            for host_gib in self.HOST_SIZES:
+                grid = self._grid("small_encoder", device_gib, host_gib)
+                for cell, result in grid.items():
+                    if not isinstance(result, Planned):
+                        continue
+                    planned_cells += 1
+                    with self.subTest(device=device_gib, host=host_gib, cell=cell.label):
+                        plan_ = result.plan
+                        for state in (*plan_.phases, plan_.idle):
+                            encoder = state.components["encoder"]
+                            self.assertIsNot(encoder.tier, Tier.DEVICE, state.phase)
+                            self.assertIsNone(encoder.resident_blocks, state.phase)
+                            self.assertIs(encoder.exec_device, ExecDevice.CPU, state.phase)
+                        ram = plan_.steps.ram
+                        self.assertIs(plan_.phase("encode").components["encoder"].tier, Tier.HOST)
+                        self.assertIs(plan_.phase("denoise").components["encoder"].tier, in_run_tier[ram])
+                        self.assertIs(plan_.idle.components["encoder"].tier, idle_tier[ram])
+                        encode = result.full_forecast.phases["encode"]
+                        self.assertEqual(encode.device_activation, 0)
+                        encoder_bytes = self.models["small_encoder"][1]["big"]["encoder"].bytes_total
+                        self.assertGreaterEqual(encode.host_weights, encoder_bytes)
+                        self.assertGreater(encode.host_activation, 0)
+                        line = next(line for line in result.full_forecast.plan_summary if line.component == "encoder")
+                        self.assertEqual(line.blocks_device, 0)
+        self.assertGreater(planned_cells, 100)
+
+    def test_the_encoder_size_changes_no_device_figure(self) -> None:
+        compared = 0
+        for device_gib in self.DEVICE_TOTALS:
+            small = self._grid("small_encoder", device_gib, 128)
+            large = self._grid("large_encoder", device_gib, 128)
+            for cell in small:
+                first, second = small[cell], large[cell]
+                if not (isinstance(first, Planned) and isinstance(second, Planned)):
+                    continue
+                same_layout = all(first.plan.phase(state.phase).components[name] == second.plan.phase(state.phase).components[name] for state in (*first.plan.phases, first.plan.idle) for name in ("dit", "ae"))
+                if not same_layout:
+                    continue
+                compared += 1
+                with self.subTest(device=device_gib, cell=cell.label):
+                    self.assertEqual(self._device_figures(first), self._device_figures(second))
+                    self.assertGreater(second.full_forecast.host_peak, first.full_forecast.host_peak)
+        self.assertGreater(compared, 20)
+
+    def test_the_per_axis_invariant_holds_with_a_pin(self) -> None:
+        checker = GridInvariantTests()
+        for model in self.models:
+            for device_gib in self.DEVICE_TOTALS:
+                for host_gib in self.HOST_SIZES:
+                    with self.subTest(model=model, device=device_gib, host=host_gib):
+                        grid = self._grid(model, device_gib, host_gib)
+                        for ram in RAM_ORDER:
+                            checker._check_axis(axis_rows(grid, axis="vram", fixed=ram), measure=lambda result: result.full_forecast.device_peak, same_of=lambda result: result.same_as_vram)
+                        for vram in VRAM_ORDER:
+                            checker._check_axis(axis_rows(grid, axis="ram", fixed=vram), measure=lambda result: max(0, result.full_forecast.host_peak - 2 * GIB), same_of=lambda result: result.same_as_ram)
+
+    def test_auto_never_moves_a_pinned_encoder_to_the_device(self) -> None:
+        spec, inventories = self.models["small_encoder"]
+        for device_gib in self.DEVICE_TOTALS:
+            result = plan(spec, inventories, format="big", formats=toy_formats(small=False), steps=AUTO_STEPS, limits=Limits(), budgets=budgets(vram_free_gib=device_gib, vram_total_gib=device_gib), shape=_SHAPE, tables=simple_tables(), options=PIN_ENCODER)
+            self.assertIsInstance(result, Planned)
+            assert isinstance(result, Planned)
+            self.assertIs(result.plan.phase("encode").components["encoder"].exec_device, ExecDevice.CPU)
+            unpinned = plan(spec, inventories, format="big", formats=toy_formats(small=False), steps=AUTO_STEPS, limits=Limits(), budgets=budgets(vram_free_gib=device_gib, vram_total_gib=device_gib), shape=_SHAPE, tables=simple_tables())
+            assert isinstance(unpinned, Planned)
+            if device_gib >= 24:
+                # Room for everything: unpinned «Авто» runs the encoder on the device.
+                self.assertIs(unpinned.plan.phase("encode").components["encoder"].tier, Tier.DEVICE)
+
+    def test_a_pin_is_ignored_on_a_host_run_device(self) -> None:
+        pinned = self._grid("small_encoder", 8, 64, host_device=True)
+        free = self._grid("small_encoder", 8, 64, options=None, host_device=True)
+        for cell in pinned:
+            first, second = pinned[cell], free[cell]
+            self.assertEqual(type(first), type(second))
+            if isinstance(first, Planned):
+                self.assertTrue(first.plan.same_placement(second.plan), cell.label)
+
+    def test_the_spec_refuses_a_pin_it_cannot_honour(self) -> None:
+        from .spec import LargeModelSpec
+
+        spec, _ = self.models["small_encoder"]
+        bad_name = LargeModelSpec(spec.family, spec.components, spec.phases, host_pin_of=lambda options: ("vae",))
+        with self.assertRaises(ValueError):
+            bad_name.host_pin(None)
+        no_cpu = LargeModelSpec(spec.family, spec.components, spec.phases, host_pin_of=lambda options: ("dit",))
+        with self.assertRaises(ValueError):
+            no_cpu.host_pin(None)
+        self.assertEqual(spec.host_pin(PIN_ENCODER), frozenset({"encoder"}))
+        self.assertEqual(spec.host_pin(None), frozenset())
+        self.assertEqual(spec.key(PIN_ENCODER, "big", "cuda:0"), "toy:big:cuda:0|host_pin=encoder")
+        self.assertEqual(spec.key(None, "big", "cuda:0"), "toy:big:cuda:0")
 
 
 if __name__ == "__main__":

@@ -200,7 +200,7 @@ _EMPTY_MASK_MESSAGE = (
 def require_text_attention_target(mask_u8: np.ndarray) -> None:
     """Refuse, before anything loads, a mask that would leave the prompt nothing.
 
-    `mask_u8` is the binarized wire mask (`imaging._decode_mask`). Checking it
+    `mask_u8` is the binarized wire mask (`region_imaging.decode_mask`). Checking it
     instead of the dilated mask is exact: dilation only grows a mask, so the
     dilated mask has a set pixel iff this one does, and any set pixel puts its
     token inside (`token_grid_inside`). This is what makes the planner's own

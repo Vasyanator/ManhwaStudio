@@ -78,7 +78,12 @@ class Fp8Compute(Enum):
 
 
 class AeDtype(Enum):
-    """Autoencoder run dtype; float32 is the reference."""
+    """Autoencoder run dtype; float32 is the reference and the default.
+
+    bfloat16 is not a memory saving everywhere: on ROCm (gfx1201) MIOpen gives bf16
+    convolutions large workspaces, so a bf16 decode reserves ~1.45x the fp32 bytes per
+    pixel (measured in `calibration/rocm_gfx1201.json`); on CUDA it halves them.
+    """
 
     FLOAT32 = "float32"
     BFLOAT16 = "bfloat16"
@@ -94,7 +99,10 @@ class Flux3Options:
     `ram_step` («Оперативная память») are the user's two resource axes (`AUTO`
     = the first step that fits on that axis); where the DiT, the AE and the
     text encoder live and run during a run follows from the pair (`steps`),
-    never from a per-component option. Neither is part of the residency key. `vl_ref_max_pixels` caps each reference image shown
+    except under `encoder_on_cpu` («Энкодер на CPU»): the encoder then runs on
+    the CPU from RAM at every VRAM step and the RAM step alone keeps, releases
+    or re-reads it (the spec's host pin, `large_model.build_spec`; the pin is
+    part of the residency key, the steps are not). `vl_ref_max_pixels` caps each reference image shown
     to the encoder in `VL_REFS` mode; `device` `None` means the backend's
     selected device. `reference_max_pixels` lowers the pixel cap of every
     prepared reference (aspect kept, sides on the 16 grid, never upscaled)
@@ -105,7 +113,8 @@ class Flux3Options:
 
     # Raises
     `ValueError` (construction) when `variant` is not a `WeightFormat`,
-    `vram_step` not a `VramStep`, `ram_step` not a `RamStep`, `vl_ref_max_pixels` not a positive int, or
+    `vram_step` not a `VramStep`, `ram_step` not a `RamStep`, `encoder_on_cpu`
+    not a bool, `vl_ref_max_pixels` not a positive int, or
     `reference_max_pixels` neither `None` nor an int of at least
     `MIN_REFERENCE_PIXELS`.
     """
@@ -120,12 +129,15 @@ class Flux3Options:
     reference_max_pixels: int | None = None
     vram_step: VramStep = VramStep.AUTO
     ram_step: RamStep = RamStep.AUTO
+    encoder_on_cpu: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.variant, WeightFormat):
             raise ValueError(f"variant должен быть форматом весов ({[f.value for f in WeightFormat]}), а не {self.variant!r}")
         if not isinstance(self.vram_step, VramStep):
             raise ValueError(f"vram_step должен быть шагом видеопамяти ({[s.value for s in VramStep]}), а не {self.vram_step!r}")
+        if not isinstance(self.encoder_on_cpu, bool):
+            raise ValueError(f"encoder_on_cpu должен быть логическим значением, а не {self.encoder_on_cpu!r}")
         if not isinstance(self.ram_step, RamStep):
             raise ValueError(f"ram_step должен быть шагом оперативной памяти ({[s.value for s in RamStep]}), а не {self.ram_step!r}")
         if not _is_int(self.vl_ref_max_pixels) or self.vl_ref_max_pixels <= 0:

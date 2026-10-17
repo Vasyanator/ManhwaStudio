@@ -522,8 +522,13 @@ impl RegionEditHost {
     /// `mask_painted` is the MASK stack's answer, never the marks': it is exactly the question
     /// «Обработать» and an engine's working mode ask (FLUX.2 klein's whole-region mode is "no
     /// mask pixel painted"), and the marks never act as a permission mask.
+    ///
+    /// `marks_reference` answers what `prepare_run_marks` would build: marks drawn AND the mode
+    /// in force (`reconcile_marks_mode` over the engine's support) a separate reference.
     pub(super) fn run_options_ctx(&self) -> RunOptionsCtx {
-        RunOptionsCtx { mask_painted: !self.frame.masks().is_empty() }
+        let masks = self.frame.masks();
+        let mode = reconcile_marks_mode(self.marks_mode, self.marks_support());
+        RunOptionsCtx { mask_painted: !masks.is_empty(), marks_reference: !masks.marks_is_empty() && mode == MarksMode::SeparateReference }
     }
 
     /// Why the selected engine says a switch is unsafe right now; `None` when it is free.
@@ -1983,6 +1988,38 @@ mod tests {
         draw(&mut tool);
         let painted: Vec<bool> = recorded(&calls).run_options.iter().map(|ctx| ctx.mask_painted).collect();
         assert_eq!(painted, vec![false, false, true]);
+        let reference: Vec<bool> = recorded(&calls).run_options.iter().map(|ctx| ctx.marks_reference).collect();
+        assert_eq!(reference, vec![false, false, false], "an overlay-only engine never receives a marks reference");
+    }
+
+    /// `marks_reference` says exactly when the next run would carry `RunMarks::Reference`:
+    /// marks drawn under the «Отдельный референс» mode, and not once the engine stops offering it.
+    #[test]
+    fn the_run_options_learn_whether_a_marks_reference_would_travel() {
+        let ctx = egui::Context::default();
+        let calls = Arc::new(Mutex::new(EngineCalls::default()));
+        let marks = Arc::new(Mutex::new(MarksSupport::new(MarksMode::SeparateReference).with(MarksMode::OverlayOnRegion)));
+        let mut tool = test_host();
+        tool.engines = vec![Box::new(RecordingEngine {
+            calls: Arc::clone(&calls),
+            answer: EnginePoll::Idle,
+            switch_block: None,
+            grid: Arc::new(AtomicUsize::new(1)),
+            marks: Arc::clone(&marks),
+        })];
+        tool.selected = 0;
+        tool.marks_mode = MarksMode::SeparateReference;
+        tool.frame.place_for_test(0, rect(0, 0, 4, 4));
+        let draw = |tool: &mut RegionEditHost| {
+            ctx.run_ui(egui::RawInput::default(), |ui| tool.draw_main_panel_bottom(ui)).drop_without_applying_deltas();
+        };
+        draw(&mut tool);
+        tool.frame.masks_mut().paint_marks_segment((1, 1), (1, 1), 1, Color32::RED, false);
+        draw(&mut tool);
+        *recorded(&marks) = MarksSupport::OVERLAY_ONLY;
+        draw(&mut tool);
+        let reference: Vec<bool> = recorded(&calls).run_options.iter().map(|ctx| ctx.marks_reference).collect();
+        assert_eq!(reference, vec![false, true, false]);
     }
 
     /// A failed run releases the frame and is reported to the user; it must not leave the

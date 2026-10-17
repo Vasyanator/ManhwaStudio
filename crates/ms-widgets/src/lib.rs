@@ -20,6 +20,9 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     при наведении и гасит прокрутку родительского интерфейса.
   - `WheelSpinBox`: spinbox на базе `DragValue` с таким же поведением колеса мыши.
   - `SeedSpinBox`: spinbox для seed-значения с кнопкой генерации случайного seed.
+  - `ByteCapEdit` (+ `gib_to_bytes`, `bytes_to_gib`, `snap_to_half_gib`): one row editing an
+    optional byte cap — caption, a "no limit" checkbox and a GiB `WheelSpinBox` on a 0.5 GiB
+    grid; every text is handed in by the caller.
   - `TextEditPlus`: многострочный редактор с цветом текста по диапазонам и
     упорядоченными цветными фонами под диапазонами символов.
   - `wheel_input_guard`: общий runtime guard, блокирующий wheel-реакции нижних
@@ -83,6 +86,10 @@ FILE HEADER (crates/ms-widgets/src/lib.rs)
     short-lived background worker, or both — text above the animation. An optional
     `with_action` button sits below that content; `show_with_action` returns a
     `HelpHintResponse` reporting its click.
+  - `hf_access_hint` (`HfAccessHint`, `hf_repo_url`, `HF_JOIN_URL`, `HF_TOKEN_SETTINGS_URL`):
+    a small "How do I get access?" caption whose hover tooltip walks the user through a gated
+    Hugging Face model in four steps (account, licence on the repo page, a Read token, paste
+    it), every page a clickable link; the tooltip stays open while the pointer moves into it.
   - `ui_scale` (`seed_ui_scale_from_user_settings`, `ui_scale_percent`, `apply_ui_scale`,
     `apply_ui_scale_to_context`): the process-global interface scale, applied once per egui
     context by every product window and changed live by the settings slider.
@@ -115,6 +122,7 @@ pub mod ui_scale;
 
 mod ai_button;
 mod autocomplete_line;
+mod byte_cap_edit;
 mod color_preset_picker;
 mod editable_combo_box;
 // `EmbeddedWindow`: a secondary window shown either as a separate OS window or embedded over
@@ -124,6 +132,10 @@ pub mod embedded_window;
 mod font_preview;
 mod hangul_keyboard;
 mod help_hint;
+// The step-by-step "how to get into a gated Hugging Face model" hover hint, and the one owner
+// of the Hugging Face page URLs (`HF_JOIN_URL`, `HF_TOKEN_SETTINGS_URL`, `hf_repo_url`), which
+// is why the module itself is public.
+pub mod hf_access_hint;
 mod marked_scroll;
 mod marquee;
 pub mod panel_dock;
@@ -141,6 +153,7 @@ mod wheel_spin_box;
 pub use ai_button::{AiButton, AiButtonResponse, AiCaps, AiRequirement, marker_badge_overhang};
 #[allow(unused_imports)]
 pub use autocomplete_line::{AutocompleteLine, AutocompleteLineResponse};
+pub use byte_cap_edit::{ByteCapEdit, bytes_to_gib, gib_to_bytes, snap_to_half_gib};
 #[allow(unused_imports)]
 pub use color_preset_picker::{
     ColorPresetPicker, ColorPresetPickerOutput, ColorPresets, PRESET_COLUMNS, PRESET_COUNT,
@@ -161,6 +174,7 @@ pub use hangul_keyboard::{
 };
 #[allow(unused_imports)]
 pub use help_hint::{HelpHint, HelpHintResponse};
+pub use hf_access_hint::HfAccessHint;
 #[allow(unused_imports)]
 pub use marked_scroll::{
     ArrowStyle, BarGeometry, GutterItem, GutterSlot, MarkFill, MarkKind, MarkedScrollArea,

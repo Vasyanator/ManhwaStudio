@@ -61,6 +61,10 @@ Main responsibilities:
 - verify the free-space guard refuses before the first byte with both numbers.
 
 Notes:
+The generic machinery these tests drive lives in `hf_gated_download.py` (plan,
+access states, transfer, throttle, free space), so its patch points are set on
+THAT module (`hgd.probe_repo_access`, `hgd.fetch_listings`, `hgd.free_bytes`,
+...); the FLUX.2 seams (`fd.model_root`) stay on `flux2_download`.
 Nothing here touches the network. The listings are fakes, and the tests that
 exercise the real streaming path replace the shared primitive's two seams —
 `model_download._default_get` and `model_download._default_sleep` — for the
@@ -78,6 +82,7 @@ from typing import Any, Callable, Iterator
 
 from modules.ai_backend.engines import model_download as md
 from modules.ai_backend.inpaint import flux2_download as fd
+from modules.ai_backend.inpaint import hf_gated_download as hgd
 
 OFFICIAL = fd.OFFICIAL_REPO_9B
 UNCENSORED = fd.UNCENSORED_REPO_9B
@@ -358,7 +363,7 @@ class VariantResolutionTests(unittest.TestCase):
 class Variant4BPlanTests(unittest.TestCase):
     """The 4B plan against the live listing measured on 2026-09-05."""
 
-    def _plan(self, root: str = "/models") -> list[fd.PlannedFile]:
+    def _plan(self, root: str = "/models") -> list[hgd.PlannedFile]:
         return fd.resolve_plan(FAKE_LISTINGS_4B, variant=V4B, uncensored=False, root=root)
 
     def test_only_the_4b_repository_is_needed(self) -> None:
@@ -420,7 +425,7 @@ class Variant4BPlanTests(unittest.TestCase):
             noise.mkdir(parents=True, exist_ok=True)
             (noise / "model_index.json.metadata").write_text("irrelevant", encoding="utf-8")
 
-            totals = fd.plan_totals(plan)
+            totals = hgd.plan_totals(plan)
             self.assertEqual(totals["missing_bytes"], 0)
             self.assertEqual(totals["missing_files"], 0)
             self.assertEqual(totals["total_bytes"], 15980141329)
@@ -430,15 +435,15 @@ class TokenlessAccessTests(unittest.TestCase):
     """4B is PUBLIC: an empty token must not short-circuit to `no_token`."""
 
     def setUp(self) -> None:
-        self._probe = fd.probe_repo_access
-        self._listings = fd.fetch_listings
+        self._probe = hgd.probe_repo_access
+        self._listings = hgd.fetch_listings
         self._root = fd.model_root
         self._tmp = tempfile.TemporaryDirectory()
         fd.model_root = lambda variant: Path(self._tmp.name)  # type: ignore[assignment]
 
     def tearDown(self) -> None:
-        fd.probe_repo_access = self._probe  # type: ignore[assignment]
-        fd.fetch_listings = self._listings  # type: ignore[assignment]
+        hgd.probe_repo_access = self._probe  # type: ignore[assignment]
+        hgd.fetch_listings = self._listings  # type: ignore[assignment]
         fd.model_root = self._root  # type: ignore[assignment]
         self._tmp.cleanup()
 
@@ -447,16 +452,16 @@ class TokenlessAccessTests(unittest.TestCase):
 
         def probe(repo: str, token: str) -> tuple[str, str]:
             seen.append((repo, token))
-            return fd.STATE_OK, ""
+            return hgd.STATE_OK, ""
 
-        fd.probe_repo_access = probe  # type: ignore[assignment]
-        fd.fetch_listings = lambda repos, token: {r: FAKE_4B for r in repos}  # type: ignore[assignment]
+        hgd.probe_repo_access = probe  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: FAKE_4B for r in repos}  # type: ignore[assignment]
 
         answer = fd.check_access("", uncensored=False, variant="4b")
 
         self.assertEqual(seen, [(V4B.repo, "")])
         self.assertEqual(answer["variant"], "4b")
-        self.assertEqual(answer["repos"][V4B.repo]["state"], fd.STATE_OK)
+        self.assertEqual(answer["repos"][V4B.repo]["state"], hgd.STATE_OK)
         self.assertEqual(answer["plan"]["total_bytes"], 15980141329)
         self.assertEqual(answer["plan"]["missing_files"], 19)
 
@@ -464,16 +469,16 @@ class TokenlessAccessTests(unittest.TestCase):
         def explode(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("a gated repo must not be probed without a token")
 
-        fd.probe_repo_access = explode  # type: ignore[assignment]
-        fd.fetch_listings = explode  # type: ignore[assignment]
+        hgd.probe_repo_access = explode  # type: ignore[assignment]
+        hgd.fetch_listings = explode  # type: ignore[assignment]
 
         answer = fd.check_access("", uncensored=False)
         self.assertEqual(answer["variant"], "9b")
-        self.assertEqual(answer["repos"][OFFICIAL]["state"], fd.STATE_NO_TOKEN)
+        self.assertEqual(answer["repos"][OFFICIAL]["state"], hgd.STATE_NO_TOKEN)
 
     def test_the_answer_echoes_the_variant_it_was_computed_for(self) -> None:
-        fd.probe_repo_access = lambda repo, token: (fd.STATE_OK, "")  # type: ignore[assignment]
-        fd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS.get(r, FAKE_4B) for r in repos}  # type: ignore[assignment]
+        hgd.probe_repo_access = lambda repo, token: (hgd.STATE_OK, "")  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS.get(r, FAKE_4B) for r in repos}  # type: ignore[assignment]
 
         self.assertEqual(fd.check_access("t", uncensored=False)["variant"], "9b")
         self.assertEqual(fd.check_access("t", uncensored=False, variant="4b")["variant"], "4b")
@@ -482,8 +487,8 @@ class TokenlessAccessTests(unittest.TestCase):
         def explode(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("a malformed request must not touch the network")
 
-        fd.probe_repo_access = explode  # type: ignore[assignment]
-        fd.fetch_listings = explode  # type: ignore[assignment]
+        hgd.probe_repo_access = explode  # type: ignore[assignment]
+        hgd.fetch_listings = explode  # type: ignore[assignment]
 
         with self.assertRaises(ValueError):
             fd.check_access("t", uncensored=False, variant="2b")
@@ -494,7 +499,7 @@ class TokenlessAccessTests(unittest.TestCase):
         def offline(repos: Any, token: str) -> Any:
             raise ConnectionError("offline")
 
-        fd.fetch_listings = offline  # type: ignore[assignment]
+        hgd.fetch_listings = offline  # type: ignore[assignment]
 
         # 9B: refused for the token itself, before any listing is attempted.
         with self.assertRaises(ValueError):
@@ -508,7 +513,7 @@ class TokenlessAccessTests(unittest.TestCase):
         def explode(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("a malformed request must not touch the network")
 
-        fd.fetch_listings = explode  # type: ignore[assignment]
+        hgd.fetch_listings = explode  # type: ignore[assignment]
 
         with self.assertRaises(ValueError) as caught:
             fd.download("t", uncensored=True, variant="4b")
@@ -616,29 +621,29 @@ class ListingDigestTests(unittest.TestCase):
 
         self_sha = self.SHA
         with _FakeHfApi(_Api):
-            got = fd.repo_listing(V4B.repo, "")
+            got = hgd.repo_listing(V4B.repo, "")
 
-        self.assertEqual(got[shard], fd.ListedFile(listing[shard], self.SHA))
+        self.assertEqual(got[shard], hgd.ListedFile(listing[shard], self.SHA))
         self.assertTrue(all(value.sha256 is None for path, value in got.items() if path != shard))
         plan = fd.resolve_plan({V4B.repo: got}, variant=V4B, uncensored=False, root="/m")
         by_source = {item.source: item for item in plan}
         self.assertEqual(by_source[shard].sha256, self.SHA)
 
     def test_the_transfer_gets_the_planned_digest(self) -> None:
-        item = fd.PlannedFile(V4B.repo, "a.safetensors", "/m/a.safetensors", "a.safetensors", 10, self.SHA)
+        item = hgd.PlannedFile(V4B.repo, "a.safetensors", "/m/a.safetensors", "a.safetensors", 10, self.SHA)
         seen: dict[str, Any] = {}
 
         def fake_transfer(url: str, dest: str, **kwargs: Any) -> bool:
             seen.update(kwargs)
             return True
 
-        saved = (fd.download_bearer_to_path, fd._file_url)
-        fd.download_bearer_to_path = fake_transfer  # type: ignore[assignment]
-        fd._file_url = lambda _item: "https://hf/a"  # type: ignore[assignment]
+        saved = (hgd.download_bearer_to_path, hgd._file_url)
+        hgd.download_bearer_to_path = fake_transfer  # type: ignore[assignment]
+        hgd._file_url = lambda _item: "https://hf/a"  # type: ignore[assignment]
         try:
-            fd._fetch_one(item, token="", on_chunk=lambda *_: None, on_retry=lambda _e: None, should_cancel=None)
+            hgd._fetch_one(item, token="", on_chunk=lambda *_: None, on_retry=lambda _e: None, should_cancel=None, label=fd.LABEL)
         finally:
-            fd.download_bearer_to_path, fd._file_url = saved  # type: ignore[assignment]
+            hgd.download_bearer_to_path, hgd._file_url = saved  # type: ignore[assignment]
 
         self.assertEqual(seen["expected_sha256"], self.SHA)
         self.assertEqual(seen["expected_size"], 10)
@@ -693,7 +698,7 @@ class PerRepositoryTokenTests(unittest.TestCase):
             answer = fd.check_access(self.STALE, uncensored=False, variant="4b")
 
         self.assertEqual(answer["variant"], "4b")
-        self.assertEqual(answer["repos"][V4B.repo]["state"], fd.STATE_OK)
+        self.assertEqual(answer["repos"][V4B.repo]["state"], hgd.STATE_OK)
         self.assertEqual(answer["plan_error"], "")
         self.assertIsNotNone(answer["plan"])
         self.assertEqual(answer["plan"]["total_bytes"], 15980141329)
@@ -710,7 +715,7 @@ class PerRepositoryTokenTests(unittest.TestCase):
             answer = fd.check_access(good, uncensored=True)
 
         for repo in (OFFICIAL, UNCENSORED):
-            self.assertEqual(answer["repos"][repo]["state"], fd.STATE_OK)
+            self.assertEqual(answer["repos"][repo]["state"], hgd.STATE_OK)
         self.assertIsNotNone(answer["plan"])
         self.assertEqual(answer["plan_error"], "")
         # Every call to a gated repository carried the token, unchanged.
@@ -724,7 +729,7 @@ class PerRepositoryTokenTests(unittest.TestCase):
         with _FakeHfApi(api):
             answer = fd.check_access(self.STALE, uncensored=False)
 
-        self.assertEqual(answer["repos"][OFFICIAL]["state"], fd.STATE_INVALID_TOKEN)
+        self.assertEqual(answer["repos"][OFFICIAL]["state"], hgd.STATE_INVALID_TOKEN)
         self.assertIsNone(answer["plan"])
         self.assertEqual(answer["plan_error"], "")
         # The gated repository was probed WITH the token, as before.
@@ -763,12 +768,12 @@ class PublicDownloadTokenTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self._saved = (fd.model_root, fd.fetch_listings)
+        self._saved = (fd.model_root, hgd.fetch_listings)
         fd.model_root = lambda variant: Path(self._tmp.name) / variant.dir_name  # type: ignore[assignment]
-        fd.fetch_listings = lambda repos, token: {r: self.SMALL for r in repos}  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: self.SMALL for r in repos}  # type: ignore[assignment]
 
     def tearDown(self) -> None:
-        fd.model_root, fd.fetch_listings = self._saved  # type: ignore[assignment]
+        fd.model_root, hgd.fetch_listings = self._saved  # type: ignore[assignment]
         self._tmp.cleanup()
 
     def _headers(self, variant: str) -> list[dict[str, str]]:
@@ -796,7 +801,7 @@ class PublicDownloadTokenTests(unittest.TestCase):
 class MissingFilterTests(unittest.TestCase):
     """Presence means the file is there AT THE ANNOUNCED SIZE, not merely non-empty."""
 
-    def _write(self, item: fd.PlannedFile, payload: bytes) -> None:
+    def _write(self, item: hgd.PlannedFile, payload: bytes) -> None:
         Path(item.dest).parent.mkdir(parents=True, exist_ok=True)
         Path(item.dest).write_bytes(payload)
 
@@ -808,11 +813,11 @@ class MissingFilterTests(unittest.TestCase):
             self._write(complete, b"c" * complete.size)
             self._write(empty, b"")
 
-            missing = {item.label for item in fd.missing_files(plan)}
+            missing = {item.label for item in hgd.missing_files(plan)}
             self.assertNotIn("vae/config.json", missing)
             self.assertIn("model_index.json", missing)
 
-            totals = fd.plan_totals(plan)
+            totals = hgd.plan_totals(plan)
             self.assertEqual(totals["total_bytes"], sum(item.size for item in plan))
             self.assertEqual(totals["missing_files"], len(plan) - 1)
             self.assertEqual(
@@ -829,9 +834,9 @@ class MissingFilterTests(unittest.TestCase):
             self.assertGreater(truncated.size, 8)
             self._write(truncated, b"short")
 
-            missing = {item.label for item in fd.missing_files(plan)}
+            missing = {item.label for item in hgd.missing_files(plan)}
             self.assertIn("vae/config.json", missing)
-            self.assertFalse(fd.is_complete_on_disk(truncated))
+            self.assertFalse(hgd.is_complete_on_disk(truncated))
 
     def test_a_longer_file_is_also_replanned(self) -> None:
         # Not just short: any length that is not the announced one means the file
@@ -840,7 +845,7 @@ class MissingFilterTests(unittest.TestCase):
             plan = fd.resolve_plan(FAKE_LISTINGS, variant=V9B, uncensored=False, root=tmp)
             item = next(entry for entry in plan if entry.label == "vae/config.json")
             self._write(item, b"c" * (item.size + 1))
-            self.assertFalse(fd.is_complete_on_disk(item))
+            self.assertFalse(hgd.is_complete_on_disk(item))
 
     def test_a_file_without_an_announced_size_falls_back_to_non_empty(self) -> None:
         # A missing size must not force an endless re-download; the old rule
@@ -852,19 +857,19 @@ class MissingFilterTests(unittest.TestCase):
             item = next(entry for entry in plan if entry.label == "vae/config.json")
             self.assertEqual(item.size, 0)
 
-            self.assertFalse(fd.is_complete_on_disk(item))
+            self.assertFalse(hgd.is_complete_on_disk(item))
             self._write(item, b"anything at all")
-            with self.assertLogs("modules.ai_backend.inpaint.flux2_download", level="WARNING"):
-                self.assertTrue(fd.is_complete_on_disk(item))
+            with self.assertLogs("modules.ai_backend.inpaint.hf_gated_download", level="WARNING"):
+                self.assertTrue(hgd.is_complete_on_disk(item))
             self._write(item, b"")
-            self.assertFalse(fd.is_complete_on_disk(item))
+            self.assertFalse(hgd.is_complete_on_disk(item))
 
     def test_a_directory_in_place_of_a_file_is_not_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             plan = fd.resolve_plan(FAKE_LISTINGS, variant=V9B, uncensored=False, root=tmp)
             item = next(entry for entry in plan if entry.label == "vae/config.json")
             Path(item.dest).mkdir(parents=True, exist_ok=True)
-            self.assertFalse(fd.is_complete_on_disk(item))
+            self.assertFalse(hgd.is_complete_on_disk(item))
 
 
 def _http_error(status: int, kind: str) -> Exception:
@@ -894,26 +899,26 @@ class StateMappingTests(unittest.TestCase):
         # GatedRepoError with status 401. The user must be told the token is
         # wrong, not that they failed to accept conditions — which is why the
         # status is consulted before the exception type.
-        self.assertEqual(fd.classify_repo_error(_http_error(401, "gated")), fd.STATE_INVALID_TOKEN)
+        self.assertEqual(hgd.classify_repo_error(_http_error(401, "gated")), hgd.STATE_INVALID_TOKEN)
 
     def test_401_on_an_unknown_repo_is_an_invalid_token(self) -> None:
         self.assertEqual(
-            fd.classify_repo_error(_http_error(401, "not_found")), fd.STATE_INVALID_TOKEN
+            hgd.classify_repo_error(_http_error(401, "not_found")), hgd.STATE_INVALID_TOKEN
         )
 
     def test_403_is_conditions_not_accepted(self) -> None:
         # MEASURED on a repo whose conditions this account has not accepted:
         # GatedRepoError, status 403, `X-Error-Code: GatedRepo`.
-        self.assertEqual(fd.classify_repo_error(_http_error(403, "gated")), fd.STATE_NOT_ACCEPTED)
-        self.assertEqual(fd.classify_repo_error(_http_error(403, "http")), fd.STATE_NOT_ACCEPTED)
+        self.assertEqual(hgd.classify_repo_error(_http_error(403, "gated")), hgd.STATE_NOT_ACCEPTED)
+        self.assertEqual(hgd.classify_repo_error(_http_error(403, "http")), hgd.STATE_NOT_ACCEPTED)
 
     def test_gated_repo_error_without_a_status_is_conditions_not_accepted(self) -> None:
         from huggingface_hub.errors import GatedRepoError
 
-        self.assertEqual(fd.classify_repo_error(GatedRepoError("gated")), fd.STATE_NOT_ACCEPTED)
+        self.assertEqual(hgd.classify_repo_error(GatedRepoError("gated")), hgd.STATE_NOT_ACCEPTED)
 
     def test_404_is_not_found(self) -> None:
-        self.assertEqual(fd.classify_repo_error(_http_error(404, "not_found")), fd.STATE_NOT_FOUND)
+        self.assertEqual(hgd.classify_repo_error(_http_error(404, "not_found")), hgd.STATE_NOT_FOUND)
 
     def test_gated_repo_error_does_not_shadow_not_found(self) -> None:
         # `GatedRepoError` SUBCLASSES `RepositoryNotFoundError`, so an
@@ -923,23 +928,23 @@ class StateMappingTests(unittest.TestCase):
         self.assertTrue(issubclass(GatedRepoError, RepositoryNotFoundError))
 
     def test_anything_else_is_a_network_error(self) -> None:
-        self.assertEqual(fd.classify_repo_error(OSError("connection reset")), fd.STATE_NETWORK_ERROR)
-        self.assertEqual(fd.classify_repo_error(_http_error(500, "http")), fd.STATE_NETWORK_ERROR)
+        self.assertEqual(hgd.classify_repo_error(OSError("connection reset")), hgd.STATE_NETWORK_ERROR)
+        self.assertEqual(hgd.classify_repo_error(_http_error(500, "http")), hgd.STATE_NETWORK_ERROR)
 
 
 class CheckAccessTests(unittest.TestCase):
     """The `.check` answer: which repos are reported, and when the network is touched."""
 
     def setUp(self) -> None:
-        self._probe = fd.probe_repo_access
-        self._listings = fd.fetch_listings
+        self._probe = hgd.probe_repo_access
+        self._listings = hgd.fetch_listings
         self._root = fd.model_root
         self._tmp = tempfile.TemporaryDirectory()
         fd.model_root = lambda variant: Path(self._tmp.name)  # type: ignore[assignment]
 
     def tearDown(self) -> None:
-        fd.probe_repo_access = self._probe  # type: ignore[assignment]
-        fd.fetch_listings = self._listings  # type: ignore[assignment]
+        hgd.probe_repo_access = self._probe  # type: ignore[assignment]
+        hgd.fetch_listings = self._listings  # type: ignore[assignment]
         fd.model_root = self._root  # type: ignore[assignment]
         self._tmp.cleanup()
 
@@ -947,13 +952,13 @@ class CheckAccessTests(unittest.TestCase):
         def explode(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("no_token must not touch the network")
 
-        fd.probe_repo_access = explode  # type: ignore[assignment]
-        fd.fetch_listings = explode  # type: ignore[assignment]
+        hgd.probe_repo_access = explode  # type: ignore[assignment]
+        hgd.fetch_listings = explode  # type: ignore[assignment]
 
         answer = fd.check_access("   ", uncensored=True)
         self.assertEqual(set(answer["repos"]), {OFFICIAL, UNCENSORED})
         for entry in answer["repos"].values():
-            self.assertEqual(entry["state"], fd.STATE_NO_TOKEN)
+            self.assertEqual(entry["state"], hgd.STATE_NO_TOKEN)
             self.assertEqual(entry["message"], "")
         # No listing was fetched, so there is no plan — NOT a zeroed one, which
         # would read as "everything is already downloaded".
@@ -961,8 +966,8 @@ class CheckAccessTests(unittest.TestCase):
         self.assertEqual(answer["plan_error"], "")
 
     def test_only_the_needed_repos_are_reported(self) -> None:
-        fd.probe_repo_access = lambda repo, token: (fd.STATE_OK, "")  # type: ignore[assignment]
-        fd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS[r] for r in repos}  # type: ignore[assignment]
+        hgd.probe_repo_access = lambda repo, token: (hgd.STATE_OK, "")  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS[r] for r in repos}  # type: ignore[assignment]
 
         self.assertEqual(set(fd.check_access("t", uncensored=False)["repos"]), {OFFICIAL})
         self.assertEqual(
@@ -971,24 +976,24 @@ class CheckAccessTests(unittest.TestCase):
 
     def test_plan_is_absent_when_a_repo_is_inaccessible(self) -> None:
         def probe(repo: str, token: str) -> tuple[str, str]:
-            return (fd.STATE_NOT_ACCEPTED, "403") if repo == UNCENSORED else (fd.STATE_OK, "")
+            return (hgd.STATE_NOT_ACCEPTED, "403") if repo == UNCENSORED else (hgd.STATE_OK, "")
 
         def explode(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("no listing is fetched when access was refused")
 
-        fd.probe_repo_access = probe  # type: ignore[assignment]
-        fd.fetch_listings = explode  # type: ignore[assignment]
+        hgd.probe_repo_access = probe  # type: ignore[assignment]
+        hgd.fetch_listings = explode  # type: ignore[assignment]
 
         answer = fd.check_access("t", uncensored=True)
-        self.assertEqual(answer["repos"][UNCENSORED]["state"], fd.STATE_NOT_ACCEPTED)
+        self.assertEqual(answer["repos"][UNCENSORED]["state"], hgd.STATE_NOT_ACCEPTED)
         self.assertIsNone(answer["plan"])
         # The state already says what is wrong; `plan_error` is for the case the
         # states CANNOT explain.
         self.assertEqual(answer["plan_error"], "")
 
     def test_plan_counts_the_missing_bytes(self) -> None:
-        fd.probe_repo_access = lambda repo, token: (fd.STATE_OK, "")  # type: ignore[assignment]
-        fd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS[r] for r in repos}  # type: ignore[assignment]
+        hgd.probe_repo_access = lambda repo, token: (hgd.STATE_OK, "")  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS[r] for r in repos}  # type: ignore[assignment]
 
         answer = fd.check_access("t", uncensored=False)
         plan = fd.resolve_plan({OFFICIAL: FAKE_OFFICIAL}, variant=V9B, uncensored=False, root=self._tmp.name)
@@ -1001,18 +1006,18 @@ class CheckAccessTests(unittest.TestCase):
         # answer was a concrete zero-valued plan beside `ok` states — which the
         # UI renders as a completed installation on an empty machine.
         def probe(repo: str, token: str) -> tuple[str, str]:
-            return fd.STATE_OK, ""
+            return hgd.STATE_OK, ""
 
         def offline(repos: Any, token: str) -> Any:
             raise ConnectionError("offline")
 
-        fd.probe_repo_access = probe  # type: ignore[assignment]
-        fd.fetch_listings = offline  # type: ignore[assignment]
+        hgd.probe_repo_access = probe  # type: ignore[assignment]
+        hgd.fetch_listings = offline  # type: ignore[assignment]
 
         answer = fd.check_access("t", uncensored=True)
 
         for repo, entry in answer["repos"].items():
-            self.assertEqual(entry["state"], fd.STATE_OK, repo)
+            self.assertEqual(entry["state"], hgd.STATE_OK, repo)
         self.assertIsNone(answer["plan"])
         self.assertIn("offline", answer["plan_error"])
 
@@ -1020,21 +1025,21 @@ class CheckAccessTests(unittest.TestCase):
         secret = "hf_" + "p" * 34
 
         def probe(repo: str, token: str) -> tuple[str, str]:
-            return fd.STATE_OK, ""
+            return hgd.STATE_OK, ""
 
         def leaky(repos: Any, token: str) -> Any:
             raise ConnectionError(f"failed with {token}")
 
-        fd.probe_repo_access = probe  # type: ignore[assignment]
-        fd.fetch_listings = leaky  # type: ignore[assignment]
+        hgd.probe_repo_access = probe  # type: ignore[assignment]
+        hgd.fetch_listings = leaky  # type: ignore[assignment]
 
         answer = fd.check_access(secret, uncensored=False)
         self.assertNotIn(secret, answer["plan_error"])
         self.assertIn("<токен>", answer["plan_error"])
 
     def test_a_present_plan_comes_with_an_empty_plan_error(self) -> None:
-        fd.probe_repo_access = lambda repo, token: (fd.STATE_OK, "")  # type: ignore[assignment]
-        fd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS[r] for r in repos}  # type: ignore[assignment]
+        hgd.probe_repo_access = lambda repo, token: (hgd.STATE_OK, "")  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: FAKE_LISTINGS[r] for r in repos}  # type: ignore[assignment]
 
         answer = fd.check_access("t", uncensored=False)
         self.assertIsNotNone(answer["plan"])
@@ -1055,10 +1060,10 @@ class CheckAccessTests(unittest.TestCase):
         original = huggingface_hub.HfApi
         huggingface_hub.HfApi = _Api  # type: ignore[assignment]
         try:
-            state, message = fd.probe_repo_access(OFFICIAL, secret)
+            state, message = hgd.probe_repo_access(OFFICIAL, secret)
         finally:
             huggingface_hub.HfApi = original  # type: ignore[assignment]
-        self.assertEqual(state, fd.STATE_NETWORK_ERROR)
+        self.assertEqual(state, hgd.STATE_NETWORK_ERROR)
         self.assertNotIn(secret, message)
         self.assertIn("<токен>", message)
 
@@ -1066,8 +1071,8 @@ class CheckAccessTests(unittest.TestCase):
 class ProgressThrottleTests(unittest.TestCase):
     """Both gates must open, and the terminal frame is never throttled away."""
 
-    def _throttle(self, clock: Callable[[], float]) -> fd.ProgressThrottle:
-        return fd.ProgressThrottle(min_interval=0.1, min_bytes=4 << 20, clock=clock)
+    def _throttle(self, clock: Callable[[], float]) -> hgd.ProgressThrottle:
+        return hgd.ProgressThrottle(min_interval=0.1, min_bytes=4 << 20, clock=clock)
 
     def test_both_gates_must_open(self) -> None:
         now = [0.0]
@@ -1275,12 +1280,12 @@ class DownloadLoopTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name) / "FLUX.2-klein-9B"
-        self._saved = (fd.model_root, fd.fetch_listings)
+        self._saved = (fd.model_root, hgd.fetch_listings)
         fd.model_root = lambda variant: self.root  # type: ignore[assignment]
-        fd.fetch_listings = lambda repos, token: {r: self.SMALL_OFFICIAL for r in repos}  # type: ignore[assignment]
+        hgd.fetch_listings = lambda repos, token: {r: self.SMALL_OFFICIAL for r in repos}  # type: ignore[assignment]
 
     def tearDown(self) -> None:
-        fd.model_root, fd.fetch_listings = self._saved  # type: ignore[assignment]
+        fd.model_root, hgd.fetch_listings = self._saved  # type: ignore[assignment]
         self._tmp.cleanup()
 
     def _requests(self, chunk: int = 1024) -> _FakeRequestsModule:
@@ -1333,13 +1338,13 @@ class DownloadLoopTests(unittest.TestCase):
 
         # A throttle that lets everything through, so the per-chunk frame shape
         # is observable at all.
-        original = fd.ProgressThrottle
-        fd.ProgressThrottle = lambda **_kwargs: original(min_interval=0.0, min_bytes=0)  # type: ignore[assignment]
+        original = hgd.ProgressThrottle
+        hgd.ProgressThrottle = lambda **_kwargs: original(min_interval=0.0, min_bytes=0)  # type: ignore[assignment]
         try:
             with self._requests(chunk=1024):
                 fd.download("token", uncensored=False, progress_callback=progress)
         finally:
-            fd.ProgressThrottle = original  # type: ignore[assignment]
+            hgd.ProgressThrottle = original  # type: ignore[assignment]
 
         detailed = [frame for frame in frames if "file_label" in frame]
         self.assertTrue(detailed)
@@ -1366,7 +1371,7 @@ class DownloadLoopTests(unittest.TestCase):
 
         fake = _FakeRequests(payload, 1024)
         with _FakeRequestsModule(fake):
-            with self.assertRaises(fd.DownloadCanceled):
+            with self.assertRaises(hgd.DownloadCanceled):
                 fd.download("token", uncensored=False, should_cancel=should_cancel)
 
         published = sorted(
@@ -1418,7 +1423,7 @@ class DownloadLoopTests(unittest.TestCase):
                 fd.download("token", uncensored=False)
 
         plan = fd.resolve_plan({fd.OFFICIAL_REPO_9B: self.SMALL_OFFICIAL}, variant=V9B, uncensored=False, root=self.root)
-        self.assertEqual(len(fd.missing_files(plan)), len(self.SMALL_OFFICIAL))
+        self.assertEqual(len(hgd.missing_files(plan)), len(self.SMALL_OFFICIAL))
 
     def test_a_file_without_an_announced_size_is_published_unverified(self) -> None:
         # There is nothing to compare against, so the transfer must still
@@ -1482,13 +1487,13 @@ class DownloadLoopTests(unittest.TestCase):
         def progress(phase: str, step: int, total: int, label: str, **extra: Any) -> None:
             frames.append({"step": step, "total": total, **extra})
 
-        original = fd.ProgressThrottle
-        fd.ProgressThrottle = lambda **_kwargs: original(min_interval=0.0, min_bytes=0)  # type: ignore[assignment]
+        original = hgd.ProgressThrottle
+        hgd.ProgressThrottle = lambda **_kwargs: original(min_interval=0.0, min_bytes=0)  # type: ignore[assignment]
         try:
             with _FakeRequestsModule(_RangeRequests(full)):
                 fd.download("token", uncensored=False, progress_callback=progress)
         finally:
-            fd.ProgressThrottle = original  # type: ignore[assignment]
+            hgd.ProgressThrottle = original  # type: ignore[assignment]
 
         detailed = [frame for frame in frames if "file_step" in frame]
         self.assertTrue(detailed)
@@ -1608,7 +1613,7 @@ class DownloadLoopTests(unittest.TestCase):
             return bool(transport.sleeps)
 
         with _FakeRequestsModule(transport):
-            with self.assertRaises(fd.DownloadCanceled):
+            with self.assertRaises(hgd.DownloadCanceled):
                 fd.download("token", uncensored=False, should_cancel=should_cancel)
 
         self.assertEqual(len(transport.sleeps), 1)
@@ -1632,7 +1637,7 @@ class DownloadLoopTests(unittest.TestCase):
             return polls["since_get"] > 3
 
         with _FakeRequestsModule(first):
-            with self.assertRaises(fd.DownloadCanceled):
+            with self.assertRaises(hgd.DownloadCanceled):
                 fd.download("token", uncensored=False, should_cancel=should_cancel)
 
         parked = dest.with_name(dest.name + ".part")
@@ -1657,63 +1662,63 @@ class DownloadLoopTests(unittest.TestCase):
 
         # 96 bytes are still to fetch. Without subtracting the staged 4000 the
         # guard would demand 4096 and refuse a download that plainly fits.
-        original = fd.free_bytes
-        fd.free_bytes = lambda path: fd.FREE_SPACE_MARGIN_BYTES + 100  # type: ignore[assignment]
+        original = hgd.free_bytes
+        hgd.free_bytes = lambda path: hgd.FREE_SPACE_MARGIN_BYTES + 100  # type: ignore[assignment]
         try:
             with _FakeRequestsModule(_RangeRequests(full)):
                 fd.download("token", uncensored=False)
         finally:
-            fd.free_bytes = original  # type: ignore[assignment]
+            hgd.free_bytes = original  # type: ignore[assignment]
 
         self.assertEqual(dest.read_bytes(), full)
 
     def test_free_space_refusal_names_both_numbers(self) -> None:
-        original = fd.free_bytes
-        fd.free_bytes = lambda path: 1000  # type: ignore[assignment]
+        original = hgd.free_bytes
+        hgd.free_bytes = lambda path: 1000  # type: ignore[assignment]
         try:
             with self._requests() as fake:
                 with self.assertRaises(RuntimeError) as caught:
                     fd.download("token", uncensored=False)
             self.assertFalse(fake.calls, "no byte may be fetched before the guard passes")
         finally:
-            fd.free_bytes = original  # type: ignore[assignment]
+            hgd.free_bytes = original  # type: ignore[assignment]
         message = str(caught.exception)
         self.assertIn("1000", message)
-        self.assertIn(str(4096 * len(self.SMALL_OFFICIAL) + fd.FREE_SPACE_MARGIN_BYTES), message)
+        self.assertIn(str(4096 * len(self.SMALL_OFFICIAL) + hgd.FREE_SPACE_MARGIN_BYTES), message)
 
     def test_unqueryable_filesystem_is_not_treated_as_full(self) -> None:
-        original = fd.free_bytes
-        fd.free_bytes = lambda path: -1  # type: ignore[assignment]
+        original = hgd.free_bytes
+        hgd.free_bytes = lambda path: -1  # type: ignore[assignment]
         try:
             with self._requests():
                 fd.download("token", uncensored=False)
         finally:
-            fd.free_bytes = original  # type: ignore[assignment]
+            hgd.free_bytes = original  # type: ignore[assignment]
 
     def test_empty_token_is_refused_without_a_network_call(self) -> None:
         def explode(*args: Any, **kwargs: Any) -> Any:
             raise AssertionError("an empty token must not reach the hub")
 
-        saved = fd.fetch_listings
-        fd.fetch_listings = explode  # type: ignore[assignment]
+        saved = hgd.fetch_listings
+        hgd.fetch_listings = explode  # type: ignore[assignment]
         try:
             with self.assertRaises(ValueError):
                 fd.download("  ", uncensored=False)
         finally:
-            fd.fetch_listings = saved  # type: ignore[assignment]
+            hgd.fetch_listings = saved  # type: ignore[assignment]
 
 
 class FreeSpaceTests(unittest.TestCase):
     """The guard itself, independent of a transfer."""
 
     def test_nothing_required_is_always_allowed(self) -> None:
-        fd.require_free_space(Path(os.sep), 0)
+        hgd.require_free_space(Path(os.sep), 0, label=fd.LABEL)
 
     def test_existing_ancestor_walks_up_to_a_real_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "a" / "b" / "c"
-            self.assertEqual(fd._existing_ancestor(missing), Path(tmp))
-            self.assertGreater(fd.free_bytes(missing), 0)
+            self.assertEqual(hgd._existing_ancestor(missing), Path(tmp))
+            self.assertGreater(hgd.free_bytes(missing), 0)
 
 
 if __name__ == "__main__":

@@ -13,11 +13,11 @@ Main responsibilities:
   (one mask from the dilated mask, dropped after the call), every refusal that
   must happen before anything loads, the variant guard;
 - the warm-up belongs to a cold load: a hot run reports load steps 0 and 9 only;
-- a legacy request encodes under the CPU-pinned encoder spec, a two-axis one
-  under the other (two handles, two keys, one status residency);
+- a field of the retired placement wire is refused before anything loads;
 - a raising progress callback aborts the run and leaves no session in use;
-- the response: legacy `applied` flags, the requested / effective steps and
-  their legacy profile names, `degraded`;
+- the response: `applied` = `{vae_tiling}`, the requested / effective steps,
+  `degraded`, no retired key; the encoder's between-runs state follows the
+  RAM step;
 - `status` (disk facts, residency from the large pool's parts, busy), `unload`;
 - every `component_action` as a manager operation, and its refusals;
 - the single-file transformer's byte-level progress (second wire level);
@@ -44,6 +44,7 @@ import numpy as np
 from PIL import Image
 
 from modules.ai_backend.inpaint import flux2_klein as svc
+from modules.ai_backend.inpaint import region_imaging
 from modules.ai_backend.inpaint.flux2_klein import components, hardware, large_model
 from modules.ai_backend.runtime.model_manager import SmallModelManager
 
@@ -98,22 +99,16 @@ class InpaintRunTests(_RunCase):
         self._run()
         loads = [(model, step) for model, step, event in self.steps if event == "begin" and step.startswith("load:")]
         self.assertEqual(loads[:2], [("flux2_klein", "load:transformer"), ("flux2_klein", "load:vae")])
-        # The fixture's request is legacy (no step fields): the CPU-pinned encoder spec.
-        self.assertIn(("flux2_klein_text_encoder.cpu", "load:text_encoder"), loads)
-        self.assertLess(loads.index(("flux2_klein", "load:vae")), loads.index(("flux2_klein_text_encoder.cpu", "load:text_encoder")))
+        self.assertIn(("flux2_klein_text_encoder", "load:text_encoder"), loads)
+        self.assertLess(loads.index(("flux2_klein", "load:vae")), loads.index(("flux2_klein_text_encoder", "load:text_encoder")))
         phases = [step for model, step, event in self.steps if event == "begin" and model == "flux2_klein" and step in ("denoise", "decode")]
         self.assertEqual(phases, ["denoise", "decode"])
 
-    def test_a_legacy_request_encodes_on_the_cpu_and_a_two_axis_one_may_not(self) -> None:
-        self._run(placement="full_gpu")
-        self._run(placement="full_gpu", vram_step="max", ram_step="keep", prompt="a dog")
-        encoders = {entry["model"]: entry for entry in self.large.status() if entry["model"].startswith("flux2_klein_text_encoder")}
-        self.assertEqual(set(encoders), {"flux2_klein_text_encoder.cpu", "flux2_klein_text_encoder"})
-        self.assertEqual(encoders["flux2_klein_text_encoder.cpu"]["components"]["text_encoder"]["exec_device"], "cpu")
-        self.assertNotEqual(encoders["flux2_klein_text_encoder"]["key"], encoders["flux2_klein_text_encoder.cpu"]["key"])
-        # The status residency of the encoder covers both handles.
-        components = self.service.status(self.params())["components"]
-        self.assertNotEqual(components["text_encoder"]["residency"], "not_loaded")
+    def test_a_retired_field_is_refused_before_anything_loads(self) -> None:
+        for field, value in (("placement", "full_gpu"), ("profile", "balanced"), ("unload_text_encoder_after_encode", True)):
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                self._run(**{field: value})
+        self.assertEqual(self.large.status(), [])
 
     def test_a_lower_vram_step_admits_the_encoder_under_its_combined_ceiling(self) -> None:
         # The ceiling is planned before the pipeline holds a reservation; the
@@ -173,20 +168,25 @@ class InpaintRunTests(_RunCase):
         return tuple(out[key] for key in svc.STEP_FIELD_KEYS)
 
     def test_the_response_reports_the_steps(self) -> None:
-        out = self._run(placement="encoder_cpu")
-        self.assertEqual(self._steps(out), ("balanced", "balanced", "phase", "keep", "phase", "keep"))
+        out = self._run(vram_step="phase", ram_step="keep")
+        self.assertEqual(self._steps(out), ("phase", "keep", "phase", "keep"))
         self.assertEqual((out["degraded"], out["degrade_reason"]), (False, None))
-        self.assertTrue(out["applied"]["unload_transformer_before_vae"], "PHASE keeps the transformer off the device during the decode")
-        out = self._run(placement="full_gpu")
-        self.assertEqual(self._steps(out), ("max_speed", "max_speed", "max", "keep", "max", "keep"))
-        self.assertFalse(out["applied"]["unload_transformer_before_vae"])
-        out = self._run(placement="full_gpu", profile="max_economy")
-        self.assertEqual(self._steps(out), ("max_economy", "max_economy", "min", "min", "min", "min"))
-        out = self._run(placement="full_gpu", vram_step="half", ram_step="run")
-        self.assertEqual(self._steps(out), ("economy", "economy", "half", "run", "half", "run"))
-        self.assertTrue(out["applied"]["unload_transformer_before_vae"], "HALF parks the juggled transformer during the decode")
-        out = self._run(placement="full_gpu", vram_step="auto")
-        self.assertEqual(self._steps(out)[:4], ("auto", "max_speed", "auto", "auto"))
+        out = self._run(vram_step="max", ram_step="keep")
+        self.assertEqual(self._steps(out), ("max", "keep", "max", "keep"))
+        out = self._run(vram_step="min", ram_step="min")
+        self.assertEqual(self._steps(out), ("min", "min", "min", "min"))
+        out = self._run(vram_step="half", ram_step="run")
+        self.assertEqual(self._steps(out), ("half", "run", "half", "run"))
+        out = self._run(vram_step="auto")
+        self.assertEqual(self._steps(out)[:2], ("auto", "auto"))
+        self.assertIsNotNone(out["vram_step_effective"])
+
+    def test_the_response_carries_no_retired_key(self) -> None:
+        out = self._run(vram_step="max", ram_step="keep")
+        self.assertEqual(out["applied"], {"vae_tiling": True}, "the request's tiling flag (on by default)")
+        for retired in ("placement", "profile", "profile_effective"):
+            self.assertNotIn(retired, out)
+        self.assertEqual(self._run(vae_tiling=False)["applied"], {"vae_tiling": False}, "a 128 px region never tiles")
 
     def test_a_distilled_checkpoint_gets_no_raised_guidance_and_no_negative(self) -> None:
         self._run(guidance_scale=4.0)
@@ -266,10 +266,10 @@ class InpaintRunTests(_RunCase):
             self._run(whole_region=True, mask=holed)
 
     def test_a_cold_run_warms_up_and_a_hot_one_does_not(self) -> None:
-        self._run(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
         self.assertIn(svc.LOAD_STEP_WARMUP, [step for phase, step, *_rest in self.frames if phase == "load"])
         self.frames.clear()
-        self._run(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
         self.assertEqual([step for phase, step, *_rest in self.frames if phase == "load"], [svc.LOAD_STEP_PREPARE, svc.LOAD_STEP_ENCODER_DONE])
 
     def test_an_unload_makes_the_next_run_cold_again(self) -> None:
@@ -279,11 +279,18 @@ class InpaintRunTests(_RunCase):
         self._run()
         self.assertIn(svc.LOAD_STEP_TRANSFORMER, [step for phase, step, *_rest in self.frames if phase == "load"])
 
-    def test_unloading_the_encoder_after_encode_drops_its_handle(self) -> None:
-        self._run(unload_text_encoder_after_encode=True)
+    def test_the_ram_step_decides_whether_the_encoder_stays(self) -> None:
+        # (PHASE, RUN): nothing stays on the card or in RAM after the task.
+        self._run(vram_step="phase", ram_step="run")
         encoder = [held for key, held in self.held().items() if key.startswith("flux2_klein_text_encoder:")]
         self.assertTrue(all(sum(held) == 0 for held in encoder))
         self.assertEqual(self.frames[-1 - sum(1 for f in self.frames if f[0] == "generate")][3], "Текстовый энкодер выгружен")
+        # (PHASE, KEEP): it stays in RAM between runs.
+        self.frames.clear()
+        self._run(vram_step="phase", ram_step="keep", prompt="a dog")
+        encoder = [held for key, held in self.held().items() if key.startswith("flux2_klein_text_encoder:")]
+        self.assertTrue(any(sum(held) > 0 for held in encoder))
+        self.assertEqual(self.frames[-1 - sum(1 for f in self.frames if f[0] == "generate")][3], "Текстовый энкодер оставлен в памяти")
 
     def test_the_prompt_cache_survives_an_unload(self) -> None:
         self._run()
@@ -371,8 +378,8 @@ class ComponentStatusTests(_RunCase):
                 self.assertNotIn("residency", entry)
 
     def test_a_loaded_pipeline_is_reported_per_component(self) -> None:
-        self._run(placement="full_gpu")
-        components_out = self._components(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
+        components_out = self._components(vram_step="max", ram_step="keep")
         self.assertEqual(components_out["transformer"]["residency"], "gpu")
         self.assertEqual(components_out["transformer"]["actions"], ["unload", "to_ram"])
         self.assertEqual(components_out["vae"]["actions"], ["unload", "warmup"])
@@ -429,22 +436,22 @@ class ComponentActionTests(_RunCase):
         self.assertEqual(self.large.status(), [], "a refused action admitted nothing")
 
     def test_loading_the_transformer_builds_the_whole_pipeline_and_warms_it_up(self) -> None:
-        out = self._action("transformer", "load", placement="full_gpu")
+        out = self._action("transformer", "load", vram_step="max", ram_step="keep")
         self.assertTrue(out["performed"])
         self.assertEqual(out["components"]["vae"]["residency"], "gpu")
         self.assertEqual([frame[1] for frame in self.frames], list(range(7)))
 
     def test_parking_and_restoring_the_transformer(self) -> None:
-        self._action("transformer", "load", placement="full_gpu")
-        parked = self._action("transformer", "to_ram", placement="full_gpu")
+        self._action("transformer", "load", vram_step="max", ram_step="keep")
+        parked = self._action("transformer", "to_ram", vram_step="max", ram_step="keep")
         self.assertEqual(parked["components"]["transformer"]["residency"], "ram")
         self.assertEqual(parked["components"]["transformer"]["actions"], ["unload", "to_gpu"])
-        restored = self._action("transformer", "to_gpu", placement="full_gpu")
+        restored = self._action("transformer", "to_gpu", vram_step="max", ram_step="keep")
         self.assertEqual(restored["components"]["transformer"]["residency"], "gpu")
 
     def test_unloading_the_vae_drops_the_pipeline_but_keeps_the_encoder(self) -> None:
-        self._run(placement="full_gpu")
-        out = self._action("vae", "unload", placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
+        out = self._action("vae", "unload", vram_step="max", ram_step="keep")
         self.assertEqual(out["components"]["transformer"]["residency"], "not_loaded")
         self.assertEqual(out["components"]["text_encoder"]["actions"], ["unload"])
 
@@ -456,7 +463,7 @@ class ComponentActionTests(_RunCase):
         self.assertEqual(unloaded["components"]["text_encoder"]["residency"], "not_loaded")
 
     def test_an_encoder_load_under_dropping_steps_keeps_it_anyway(self) -> None:
-        for overrides in ({"profile": "max_economy"}, {"vram_step": "min", "ram_step": "run"}):
+        for overrides in ({"vram_step": "min", "ram_step": "min"}, {"vram_step": "min", "ram_step": "run"}):
             with self.subTest(**overrides):
                 loaded = self._action("text_encoder", "load", **overrides)
                 self.assertEqual(loaded["components"]["text_encoder"]["residency"], "ram", "(PHASE, KEEP) keeps it in RAM")
@@ -480,7 +487,7 @@ class ComponentActionTests(_RunCase):
     def test_warming_up_the_vae_runs_one_tiny_decode(self) -> None:
         import diffusers
 
-        self._action("transformer", "load", placement="full_gpu")
+        self._action("transformer", "load", vram_step="max", ram_step="keep")
         decodes: list[tuple[int, ...]] = []
         real = diffusers.AutoencoderKLFlux2.decode
 
@@ -489,7 +496,7 @@ class ComponentActionTests(_RunCase):
             return real(vae, latents, return_dict=return_dict)
 
         with patch.object(diffusers.AutoencoderKLFlux2, "decode", decode):
-            out = self._action("vae", "warmup", placement="full_gpu")
+            out = self._action("vae", "warmup", vram_step="max", ram_step="keep")
         self.assertTrue(out["performed"])
         self.assertEqual(len(decodes), 1)
         self.assertEqual(decodes[0][-1], svc.WARMUP_LATENT_CELLS)
@@ -501,13 +508,13 @@ class ComponentActionTests(_RunCase):
             raise OSError("disk read failed")
 
         with patch.object(diffusers.AutoencoderKLFlux2, "from_config", explode), self.assertRaises(OSError):
-            self._action("transformer", "load", placement="full_gpu")
+            self._action("transformer", "load", vram_step="max", ram_step="keep")
         self.assertTrue(all(sum(held) == 0 for held in self.held().values()), "the transformer read before the VAE failed is dropped")
 
     def test_a_failed_cold_load_drops_only_its_own_handle(self) -> None:
         import diffusers
 
-        self._run(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
         warm = {key: held for key, held in self.held().items() if key.startswith("flux2_klein:") and sum(held) > 0}
         self.assertEqual(len(warm), 1)
         # Checkpoint B: a copy of the transformer under another path (another key, same model name).
@@ -522,7 +529,7 @@ class ComponentActionTests(_RunCase):
             raise OSError("disk read failed")
 
         with patch.object(diffusers.AutoencoderKLFlux2, "from_config", explode), self.assertRaises(OSError):
-            self._run(placement="full_gpu", transformer_path=str(other))
+            self._run(vram_step="max", ram_step="keep", transformer_path=str(other))
         held = self.held()
         for key, before in warm.items():
             self.assertEqual(held[key], before, "the warm handle of checkpoint A survives")
@@ -613,7 +620,7 @@ class LockOrderTests(_RunCase):
 
     def _prepare(self) -> None:
         """An idle pipeline on the device, no encoder: the run below needs both handles."""
-        self._run(placement="full_gpu")
+        self._run(vram_step="max", ram_step="keep")
         self._action_unload_encoder()
 
     def _action_unload_encoder(self) -> None:
@@ -649,7 +656,7 @@ class LockOrderTests(_RunCase):
                     errors.append(exc)
 
             works = {
-                "run": lambda: self._run(placement="full_gpu", prompt=f"a dog {round_index}"),
+                "run": lambda: self._run(vram_step="max", ram_step="keep", prompt=f"a dog {round_index}"),
                 "encoder_load": lambda: self.service.component_action(self.params(), component="text_encoder", action="load"),
                 "reclaim": lambda: self._small_admission(f"small-model-{round_index}"),
             }
@@ -786,20 +793,20 @@ class WholeRegionTests(_TempTreeCase):
         self.assertEqual(normalized["mask_feather_px"], 20)
 
     def test_a_solid_mask_is_accepted(self) -> None:
-        svc._require_solid_mask(np.full((32, 32), 255, dtype=np.uint8))
+        region_imaging.require_solid_mask(np.full((32, 32), 255, dtype=np.uint8))
 
     def test_a_mask_with_a_hole_is_refused_with_the_count(self) -> None:
         mask = np.full((32, 32), 255, dtype=np.uint8)
         mask[4:8, 4:8] = 0
         with self.assertRaises(ValueError) as caught:
-            svc._require_solid_mask(mask)
+            region_imaging.require_solid_mask(mask)
         message = str(caught.exception)
         self.assertIn("16", message)
         self.assertIn("whole_region", message)
 
     def test_an_empty_mask_is_refused_too(self) -> None:
         with self.assertRaises(ValueError):
-            svc._require_solid_mask(np.zeros((16, 16), dtype=np.uint8))
+            region_imaging.require_solid_mask(np.zeros((16, 16), dtype=np.uint8))
 
 
 class StatusTests(_TempTreeCase):

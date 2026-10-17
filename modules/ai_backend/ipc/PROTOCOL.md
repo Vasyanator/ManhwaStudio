@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `13` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `15` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 12. Optional/ignored on others.  |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 14. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -421,9 +421,8 @@ streams `phase:"download"`.
 
 | method                          | request fields (inline)                                                                 | blob(req)              | response fields (status=ok)                                            | blob(resp) | stream  | cancel |
 |---------------------------------|------------------------------------------------------------------------------------------|------------------------|--------------------------------------------------------------------------|------------|---------|--------|
-| `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `reference_len: int?`, `params: object` (see below)     | region PNG ++ mask PNG [++ reference PNG] | `image_len: int`, `oom_recovered: bool`, `applied: object`, `text_attention_in_mask: bool` | result PNG | **yes** | yes    |
-| `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `memory: object`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `text_encoder_available: bool`, `guidance_supported: bool` | none | no | no |
-| `inpaint.flux2_klein.estimate`  | `params: object`, `region_width: int`, `region_height: int`                                | none                   | `vram_bytes`, `ram_bytes`, `vram_free`, `ram_free`, `fits: bool`, `breakdown: object` (v13 adds the six step keys and `calibrated`, §5.10) | none | no | no |
+| `inpaint.flux2_klein`           | `image_len: int`, `mask_len: int`, `reference_len: int?`, `params: object` (see below)     | region PNG ++ mask PNG [++ reference PNG] | `image_len: int`, `oom_recovered: bool`, `applied: {vae_tiling: bool}`, `text_attention_in_mask: bool`, `vram_step`, `ram_step`, `vram_step_effective`, `ram_step_effective`, `degraded: bool`, `degrade_reason: string\|null` (§5.10) | result PNG | **yes** | yes    |
+| `inpaint.flux2_klein.status`    | `params: object={}` (the three paths and `prompt`; may be partial)                         | none                   | `available: bool`, `reason: string\|null`, `components: object`, `components_busy: bool`, `loaded: bool`, `device: string`, `prompt_cached: bool`, `text_encoder_available: bool`, `guidance_supported: bool` | none | no | no |
 | `inpaint.flux2_klein.unload`    | (none)                                                                                     | none                   | `unloaded: bool`                                                          | none       | no      | no     |
 | `inpaint.flux2_klein.component_action` | `params: object`, `component: string`, `action: string`                             | none                   | `component`, `action`, `performed: bool`, `components: object`, `components_busy: false`, `device: string` | none | **yes** | yes |
 | `inpaint.flux2_klein.prompt_cache.build`  | `params: object`                                                         | none                   | `prompt: string`, `encoded: bool`, `prompt_cached: true`, `device: string` | none      | **yes** | yes    |
@@ -567,18 +566,21 @@ see "generating without a text encoder" below):
 "guidance and distilled checkpoints" below; on a distilled checkpoint it is
 accepted and then ignored),
 `strength` (0.25..1.0, default 1.0), `seed: int|null`,
-`placement` (`full_gpu` | `encoder_cpu` | `model_cpu_offload` |
-`sequential_cpu_offload`; LEGACY since v13, mapped onto a step pair — §5.10),
-`vram_step` / `ram_step` (v13, §5.10), `profile` (LEGACY stage-1 id, §5.10),
+`vram_step` / `ram_step` (§5.10; absent or `null` = `auto`),
 `dtype` (`bfloat16` | `float16`),
-`low_cpu_mem_usage: bool`, `vae_tiling: bool`, `vae_slicing: bool`,
-`unload_transformer_before_vae: bool` (default: `true` for every placement
-except `full_gpu`), `unload_text_encoder_after_encode: bool` (default `false`
-in every placement), `text_encoder_fp8: bool` (default `false`),
+`vae_tiling: bool` (default `true`), `text_encoder_fp8: bool` (default `false`),
+`encoder_on_cpu: bool` (default `true`, v15: «Энкодер на CPU» — the text encoder
+runs on the CPU from RAM at every VRAM step; §5.10 "Encoder on the CPU"),
 `mask_dilate_px` (0..64, default 16), `mask_feather_px` (0..32, default 12),
 `color_match: bool` (default `true`), `whole_region: bool` (default `false`),
 `max_sequence_length` (64..512, default 512),
 `text_attention_in_mask: bool` (default `false`; see below).
+The fields of the retired placement wire (protocol <= 13) — `placement`,
+`profile`, `low_cpu_mem_usage`, `vae_slicing`, `unload_transformer_before_vae`,
+`unload_text_encoder_after_encode` — are refused BY NAME (a request error naming
+the field and what replaced it), even with a `null` value: a stale client gets a
+clear error instead of a silently ignored memory choice. This holds for every
+`inpaint.flux2_klein*` method that takes `params` and normalizes it.
 
 Region constraints, enforced by the backend and never fixed up silently: both
 sides a multiple of **16** and at least **128 px**, area at most **1048576 px²**,
@@ -601,7 +603,7 @@ composite. The pipeline preprocesses a reference with the region's own rules (th
 1 MP cap and the floor to a multiple of 16), so a reference of the region's size
 stays pixel-aligned with it — and for a valid region both rules are no-ops. The
 large-model manager's admission counts the reference's condition tokens in the
-denoise phase; `.estimate` takes no reference and forecasts a run without one.
+denoise phase (`large_models.profiles` counts them through `shape.references`).
 
 **`whole_region` — editing without a painted mask.** The request format does not
 fork: the blob still carries a mask, and under `whole_region: true` it must be
@@ -631,8 +633,8 @@ image pair. Why: the region's clean copy shows the model the whole region, so an
 instruction can be grounded on a matching object OUTSIDE the mask and edited
 there — an edit the latent blend and the composite then discard, leaving nothing
 changed under the mask. Costs: one `S x S` mask on the compute device (about
-150-330 MB at 1 MP; counted in the denoise phase of `.estimate` and of the
-manager's admission, listed as `breakdown.attention_mask` while it is in force) and
+150-330 MB at 1 MP; counted in the denoise phase of `large_models.profiles` and
+of the manager's admission) and
 the flash attention kernel. It is a no-op under `whole_region` (every token is
 inside), so that mode forces it to `false`. A mask with no set pixel (refused
 before any model loads), or a negative prompt whose text length differs from
@@ -642,12 +644,10 @@ the prompt's (guidance), is a
 client persists `applied` into the user's settings and a `whole_region` run
 must not switch the user's choice off.
 
-Response detail — `applied` is the set of memory settings ACTUALLY in force when
-the run finished, ALWAYS all five flags (the client parses it as one struct):
-`{unload_transformer_before_vae: bool, vae_tiling: bool, vae_slicing: bool,
-unload_text_encoder_after_encode: bool, text_encoder_fp8: bool}`.
-`unload_transformer_before_vae` is true when the run's effective plan kept the
-transformer off the device during the decode; the last two echo the request. The
+Response detail — `applied` is `{vae_tiling: bool}`: whether the decode ran with
+tiling requested or engaged by the degrade ladder, the one setting the client
+persists after a run. Where the weights sat is the effective step pair
+(`vram_step_effective` / `ram_step_effective`, §5.10), never a flag. The
 backend splits denoising from the VAE decode, so an out-of-memory failure in the
 decode is recovered from without repeating the denoise — every retry starts from
 the same host copy of the latents. The rungs, in order (the large-model manager's
@@ -658,15 +658,14 @@ and `applied.vae_tiling` must not claim a saving that never happened); then the
 VAE's tile itself shrunk for ONE decode, lowering the latent and the sample
 threshold together, so that tiling engages on a region the shipped threshold
 ignores; then the next more economical «Видеопамять» step (which takes the
-transformer off the device: `applied.unload_transformer_before_vae`,
+transformer off the device: `vram_step_effective` below `vram_step`,
 `degraded: true`). The lowered tile is an emergency, not a setting: both
 thresholds are restored before the answer is sent and neither appears in
 `applied`, and its output is not bit-identical to an untiled decode because the
-tiles are blended. `vae_slicing` is NOT a rung at all:
-`decode` slices only a batch larger than one and this service always decodes a
-batch of one. When a retry was needed `oom_recovered` is `true` and `applied`
-names the settings the client should persist so the next run takes the cheap path
-immediately.
+tiles are blended. When a retry was needed `oom_recovered` is `true` and `applied`
+names the tiling the client should persist so the next run takes the cheap path
+immediately; the step floor the run learned is the backend's (`learned_floor`,
+§5.10), and the user's chosen steps are never rewritten.
 
 **FLUX.2 klein per-component residency.** The three WEIGHT-BEARING entries of
 `status.components` (`text_encoder`, `transformer`, `vae` — not `tokenizer` /
@@ -683,8 +682,8 @@ immediately.
   possible RIGHT NOW. This list is the AUTHORITY — the client renders it and must
   never re-derive it, or the matrix would exist twice and drift on the first
   edit. Invariants the backend holds: the text encoder offers only `load` /
-  `unload` (where it computes is the request's decision — on the CPU for a
-  legacy request, §5.10 — never a button); the transformer never offers `warmup`
+  `unload` (where it computes is the plan's decision under the request's step
+  pair, §5.10 — never a button); the transformer never offers `warmup`
   (the warm-up forwards the VAE only, and no transformer path exists); `load`
   and `unload` appear on BOTH the transformer and the VAE, always together,
   because they act on the pipeline as a whole — the two are ONE large-model
@@ -818,9 +817,9 @@ generates.
   that only ready caches will work. Only the encoder is optional — the
   `tokenizer/` and `scheduler/` directories are pipeline components and are still
   required.
-- `.estimate` is lower on such a machine: the encode phase cannot run there, so
-  it contributes nothing to `peak_encode` or to the totals. `.estimate` is
-  advice; the manager's admission of the run is the guard.
+- `large_models.profiles` answers `encoder: null` on such a machine (nothing will
+  be encoded), so the forecast is the pipeline's alone. It is advice; the
+  manager's admission of the run is the guard.
 
 **FLUX.2 klein: guidance and distilled checkpoints.** `.status` answers
 `guidance_supported: bool` — whether `guidance_scale` can do anything at all on
@@ -838,6 +837,81 @@ before: the slider is live and classifier-free guidance really runs. The field i
 a plain boolean, never a third "unknown" value: it says what the run will do, and
 the run treats an undeclared checkpoint as guided. Clients should use it to
 disable the control, not to decide whether to send the param.
+
+**FLUX.3 klein region editing** (v15; `ipc/handlers/flux3_klein.py`, service
+`inpaint/flux3_klein/`, region semantics `inpaint/flux3_klein/region.py`).
+FLUX.3 has no mask input: the REGION is reference #0 and the output is exactly
+the region's size; the mask is a **permission to change** — the generated pixels
+are composited back inside it (feathered inwards, color-matched to the ring
+outside it), so every pixel outside the mask comes back byte-identical. The
+package (DiT of the chosen format, AE, Qwen3-VL text encoder) is a directory the
+client names (`source_root`); acquiring it is the separate `download.*` pair.
+
+| method                               | request fields (inline)                                                                 | blob(req)                         | response fields (status=ok)                                                                 | blob(resp) | stream  | cancel |
+|--------------------------------------|------------------------------------------------------------------------------------------|-----------------------------------|----------------------------------------------------------------------------------------------|------------|---------|--------|
+| `inpaint.flux3_klein`                | `image_len: int`, `mask_len: int`, `reference_lens: int[]` (0..9 entries, each > 0; absent = `[]`), `params: object` (below) | region PNG ++ mask PNG ++ reference PNGs | `image_len`, `seed: int`, `steps: int`, `width`, `height`, `text_tokens: int`, `applied: {format, fp8_compute: string\|null, compute_path, encoder_mode, ae_dtype}`, `vram_step`, `ram_step`, `vram_step_effective`, `ram_step_effective`, `degraded: bool`, `degrade_reason: string\|null` (§5.10) | result PNG | **yes** | **mid-run** |
+| `inpaint.flux3_klein.status`         | `params: object={}` (may be partial; without `source_root` nothing is available)        | none                              | `available: bool`, `reason: string\|null` (the selected format), `formats: {bf16\|fp8r\|nvfp4: {available, reason, dit_bytes}}`, `ae_present: bool`, `text_encoder_present: bool`, plus the `health()` fields (`loaded`, `ready`, `device`, `model_key`, `variant`, `fp8_compute`, `compute_path`, `vram_step`, `ram_step`, `degraded`, `last_error`, `dit_device`, `encoder_resident`) | none | no | no |
+| `inpaint.flux3_klein.unload`         | (none)                                                                                   | none                              | `unloaded: bool`                                                                              | none       | no      | no     |
+| `inpaint.flux3_klein.download.check` | `hf_token: string` (may be empty), `format: "bf16"\|"fp8r"\|"nvfp4"="fp8r"`              | none                              | `format: string` (echo), `repos: {"black-forest-labs/flux-3-image-klein": {state, message}}`, `plan: {total_bytes, missing_bytes, missing_files}\|null`, `plan_error: string` | none | no | no |
+| `inpaint.flux3_klein.download.start` | `hf_token: string`, `format` (as above)                                                  | none                              | `root: string` (the package root to send as `source_root`), `downloaded_bytes: int`, `skipped_files: int` | none | **yes** | yes |
+
+`params` (one mapping, `inpaint/flux3_klein/wire.py`; read by the run, `.status`
+and `large_models.profiles`). An UNKNOWN key, a wrong type or an out-of-range
+value is a request error naming the field — never clamped:
+- `source_root: string` (REQUIRED, the package root);
+- `format`: `bf16` | `fp8r` | `nvfp4` (default `fp8r`) — never changed by the backend;
+- `encoder_mode`: `text` | `vl_refs` (default `text`; `vl_refs` shows the references to the encoder);
+- `ae_dtype`: `float32` | `bfloat16` (default `float32`);
+- `fp8_compute`: `auto` | `scaled_mm` | `dequant` (default `auto`; fp8r only);
+- `reference_max_pixels: int|null` (`null` = the model's caps; else 4096..4194304);
+- `prompt: string` (required non-empty for a run; stripped);
+- `steps: int|null` (1..64; `null` = the package default, 16);
+- `seed: int|null` (`null` = a random 32-bit seed, echoed in the answer; else 0..2^64-1);
+- `vram_step` / `ram_step` (§5.10; absent or `null` = `auto`);
+- `encoder_on_cpu: bool` (default `true`: «Энкодер на CPU», §5.10);
+- `mask_feather_px: int` (0..32, default 12);
+- `color_match: bool` (default `true`; the effective value is `false` under `whole_region`);
+- `whole_region: bool` (default `false`: the mask must be solid and the whole region is regenerated).
+There is no guidance and no negative prompt (the model is distilled).
+
+Region constraints (mirrored by the client's frame rule, re-checked here, never
+resized): both sides a multiple of **16** and at least **128 px**, area at most
+**4194304 px²** (4 MP), aspect ratio at most **4:1**. The mask is an L8 PNG of
+exactly the region's size and must not be empty (unless `whole_region`, where it
+must be solid). Up to **9** user references (RGB(A) PNGs of any size) follow it;
+they become references #1 and up after the region (with two or more references
+in total each is capped at 1 MP by the model's own rule; the output stays the
+region's size).
+
+**FLUX.3 klein streaming detail.** Frames carry `phase`, `step`, `total`, `label`
+(Russian log text) and a stable `stage` id the client localizes:
+- `phase:"load"` — `stage` one of `prepare`, `dit_load`, `ae_load`,
+  `dit_offload`, `encoder_load`, `encode`, `encoder_release`, `ref_encode`,
+  `dit_restore`, `dit_offload_decode`, `decode`; `step` is its position in the
+  full order `prepare, dit_load, ae_load, dit_offload, encoder_load, encode,
+  encoder_release, ref_encode, dit_restore, denoise, dit_offload_decode, decode`
+  (0..11) and `total` is `11`;
+- `phase:"generate"` — `stage:"denoise"`, `step` / `total` are flow-map steps
+  (a `0/total` frame when the denoise begins). A degrade retry may repeat steps.
+- `phase:"download"` (download.start only) — the FLUX.2 two-level byte frames
+  (`file_step` / `file_total` / `file_label`).
+
+**Cancellation is mid-run**: the backend checks the request's `cancel` at every
+`stage` begin and after every denoise step and answers `Interrupted`; the weights
+stay wherever the manager's run end leaves them (nothing is unloaded for a cancel)
+and the next run starts normally. A cancel is not a memory failure (no degrade).
+
+**FLUX.3 download** (`inpaint/flux3_download.py` over `inpaint/hf_gated_download.py`):
+the repository `black-forest-labs/flux-3-image-klein` is GATED (FLUX Kommunity
+License; the user accepts its conditions on Hugging Face). One format per call:
+the shared `ae.safetensors` and `text_encoder/`, plus `model.safetensors` +
+`config.json` + `manifest.json` (`bf16`) or `variants/<format>/` (`fp8r`,
+`nvfp4`), into `ManhwaStudio_AI_Models/side_models/FLUX.3-image-klein/` (the
+package root `start` answers). The state taxonomy, the NULLABLE `plan`, the
+token rules (a request field, never logged; an empty token answers `no_token`
+without a network call), the publish gates and the resume behaviour are the
+FLUX.2 download's ("Model download from Hugging Face" above). An unknown `format` is a request error (never a
+downgrade to the default).
 
 All inpaint engines require Torch.
 
@@ -977,8 +1051,8 @@ Notes:
   or reclaims. `model` names a model registered with the manager AND served
   through `AppState.large_model_adapters` (the model's service turns `params` —
   its paths and options, same object as its own inpaint method — into the
-  manager's options and the torch device; today `flux2_klein`); any other name
-  is a request error. An unknown step id is a request error; the retired
+  manager's options and the torch device; `flux2_klein` and, since v15,
+  `flux3_klein`); any other name is a request error. An unknown step id is a request error; the retired
   `profile` field is refused by name.
 - `shape`: `region_width`, `region_height` (required, > 0, pixels of the generated
   region), `references: [{w, h}]` (optional, pixels before any model-side
@@ -1033,35 +1107,40 @@ Notes:
   blocks_host, blocks_disk, device_bytes, host_bytes}}}` (`components` from the
   ledger, no probe). `unload` skips a handle that is in a run (not an error);
   `learned.reset` forgets the learned floor entries (each holds both axes' floors),
-  which are kept per device class, model and format in
+  which are kept per device class, model, format and host pin in
   `ManhwaStudio_AI_Models/.cache/large_models/limits.json` (a backend cache, not a
   user document; entries of the retired profile scale are skipped on read); the
   user's chosen steps are never rewritten.
 - `General.large_models_oom_score_adj` (bool, default `true`) is read once at
   backend start: on Linux the backend sets its own `oom_score_adj` to `1000`.
-- The FLUX.2 klein methods (§5.4) change only additively in v13: `params` accepts
-  optional `vram_step` / `ram_step` (same ids as above) and the LEGACY stage-1
-  `profile` id (`auto`, `max_speed`, `fast`, `balanced`, `economy`,
-  `max_economy`); either step field wins over `profile`, which wins over the
-  legacy `placement` flags (each still maps onto a pair). Six step keys come back
-  at the top level, never inside `applied` (whose five flags the client parses as
-  one fixed struct): `vram_step`, `ram_step` (requested), `vram_step_effective`,
-  `ram_step_effective` (what ran; on `.estimate` what the plan chose, `null` when
-  it does not fit) and their legacy names `profile`, `profile_effective` (the
-  name of the VRAM step: `max_speed`, `balanced`, `economy`, `max_economy`,
-  `auto`; the RAM step is not in it). The `inpaint.flux2_klein` response adds
-  `degraded` / `degrade_reason`; the `.estimate` answer adds `calibrated` (an
-  uncalibrated forecast is an estimate) and carries no `degraded`.
-- **The legacy wire keeps encoding on the host.** A FLUX.2 request that sends
-  neither `vram_step` nor `ram_step` (every request of a stage-1 client) pins the
-  text encoder to the CPU, as every legacy `placement` did: `full_gpu` keeps the
-  PIPELINE on the card, never the 9B encoder beside it. The one exception is the
-  legacy `profile` `max_economy` (RAM `min` offers no CPU placement). With either
-  step field sent, the encoder may compute on the GPU under `max` / `phase`.
-  `.estimate` plans the encoder exactly as the run will.
-- **A host run device** (`cpu` / `mps`): FLUX.2 runs and `.estimate` are planned
-  on the host alone; `.estimate` answers `vram_bytes: 0`, `vram_free: 0`,
-  `ram_bytes` = the host growth and `fits` = what the admission will decide.
+- The FLUX.2 / FLUX.3 klein methods (§5.4) take the pair as `params.vram_step` /
+  `params.ram_step` (same ids as above; absent or `null` = `auto`). Four step keys
+  come back at the top level of the `inpaint.flux2_klein` / `inpaint.flux3_klein` answer, never inside
+  `applied`: `vram_step`, `ram_step` (requested), `vram_step_effective`,
+  `ram_step_effective` (what ran), plus `degraded` / `degrade_reason`. Since v14
+  the placement wire is refused by name (§5.4) and the text encoder may compute
+  on the GPU under every step pair whose plan puts it there (`max` / `phase`)
+  — unless `encoder_on_cpu` (v15, default `true`) pins it to the CPU.
+- **Encoder on the CPU** (v15; `params.encoder_on_cpu`, default `true`, in the
+  FLUX.2 and FLUX.3 params and therefore in their `large_models.profiles`
+  params): the text encoder is pinned to host execution
+  (`LargeModelSpec.host_pin`): it runs on the CPU from RAM at EVERY VRAM step —
+  no VRAM row's device forecast or placement includes it, and «Авто» or a
+  degrade never moves it to the card — while the RAM step alone keeps it in RAM
+  between runs (`keep`), only during the run (`run`), or reads it from its
+  files for its own phase and drops it right after (`min`). Its CPU run is on
+  the host side of the forecast (`selected.plan_summary` shows its
+  `exec_device: "cpu"`). A pinned request is its own manager handle (residency
+  key suffix `|host_pin=<component>`) with its own learned floors; toggling the
+  flag leaves the other handle idle, reclaimed like any idle holding. With
+  `false` the steps place the encoder as before.
+- **`large_models.profiles` with `model: "flux3_klein"`** plans the registration
+  `flux3_klein.<encoder_mode>.ae_<ae_dtype>` the params select (the answer's
+  `model`); `params` is the FLUX.3 run's (`source_root` required, `prompt` not
+  needed) and `shape.references` should list the region itself plus the user
+  references. The `formats[]` rows are the package's three formats.
+- **A host run device** (`cpu` / `mps`): FLUX.2 runs and `large_models.profiles`
+  are planned on the host alone (`vram.applicable: false`).
 - **`large_models.profiles` with `model: "flux2_klein"`** plans the registration
   the request's `dtype` selects: the answer's `model` is `flux2_klein` for
   `bfloat16` and `flux2_klein.float16` for `float16`. The pickers are the
@@ -1072,12 +1151,16 @@ Notes:
   that does not fit makes `selected.fits` `false` with the encoder's `reason` /
   `shortest_resource`. The FLUX.2
   registrations are `flux2_klein`, `flux2_klein.float16` (pipelines) and
-  `flux2_klein_text_encoder`, `flux2_klein_text_encoder.fp8` with their CPU-only
-  twins `….cpu` (encoders); `large_models.unload` / `learned.reset` with a
+  `flux2_klein_text_encoder`, `flux2_klein_text_encoder.fp8` (encoders); a learned
+  floor stored for a registration an earlier build had (the retired `….cpu`
+  encoder twins) stays in the floors cache unused until a `learned.reset`;
+  `large_models.unload` / `learned.reset` with a
   `model` act on that one registration only (`inpaint.flux2_klein.unload` drops
   every FLUX.2 handle).
-- Key owner: the module docstring of `ipc/handlers/flux2_klein.py`; mapping
-  tables: `inpaint/flux2_klein/memory.py`.
+- Key owner: the module docstring of `ipc/handlers/flux2_klein.py`; the request's
+  step pair: `inpaint/flux2_klein/memory.py` (`requested_steps`). The migration of
+  a client's saved settings from the retired placement wire is the client's
+  (`ms-tab-cleaning` `flux2_klein/settings.rs`, `legacy_memory_steps`).
 
 ---
 
@@ -1127,7 +1210,7 @@ Events are `kind:"event"`, `id:0`, with a `topic`. Payload fields are inline in
 
 | topic        | trigger                                    | payload (inline header fields)                                                                                                                                                                                                  | blob              |
 |--------------|--------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|
-| `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr, baberuocr}` (each that service's own `health()` object with at least `ready: bool`; `paddleocrvl` is `{ready, device, model, last_error}` where `model` is the resident variant label or `null`, and `baberuocr` is `{ready, device, last_error}` where `device` is the effective vision device, e.g. `"CUDAExecutionProvider:0"` or `"CPUExecutionProvider"`, or `null` when nothing is resident; its decoders always run on the CPU), `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill}`, `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object` (see "`model_manager` payload" below). (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
+| `health`     | periodic (~1s) snapshot push               | `ok: bool`, `service: "mf_ai_backend"`, `backend_version: string`, `snapshot_unix_s: float`, `is_torch_available: bool`, `ocr: {easyocr, mangaocr, paddleocr, paddleocrvl, suryaocr, baberuocr}` (each that service's own `health()` object with at least `ready: bool`; `paddleocrvl` is `{ready, device, model, last_error}` where `model` is the resident variant label or `null`, and `baberuocr` is `{ready, device, last_error}` where `device` is the effective vision device, e.g. `"CUDAExecutionProvider:0"` or `"CPUExecutionProvider"`, or `null` when nothing is resident; its decoders always run on the CPU), `text_detector: {ctd, paddle, surya}`, `inpaint: {lama_v2, lama_mpe, aot, flux_fill, flux2_klein, flux3_klein}` (`flux3_klein` since v15: `Flux3KleinService.health()`), `watermark: object`, `image_processing: {reline}`, `machine_translation: object`, `model_manager: object` (see "`model_manager` payload" below). (Warming-up form: `snapshot_state:"warming_up"` plus `ok/service/backend_version/snapshot_unix_s/is_torch_available`.) | none              |
 | `device`     | device/provider selection changed          | the full `device.get` result shape (selected/available torch + onnx fields)                                                                                                                                                    | none              |
 | `model_load` | model load/unload progress (new in v2)     | `model: string`, `phase: string` (e.g. `"start"\|"progress"\|"done"\|"unload"`), `loaded: int` (optional), `total: int` (optional), `message: string` (optional)                                                               | none              |
 | `log`        | optional backend log line stream (opt-in)  | `level: string` (e.g. `"info"\|"warn"\|"error"`), `message: string`, `ts_unix_s: float` (optional)                                                                                                                             | none              |

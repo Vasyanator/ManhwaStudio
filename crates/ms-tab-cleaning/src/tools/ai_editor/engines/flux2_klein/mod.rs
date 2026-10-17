@@ -4,8 +4,9 @@ FILE HEADER (cleaning/tools/ai_editor/engines/flux2_klein/mod.rs)
 Purpose:
 The FLUX.2 klein ENGINE of the «ИИ-редактор области» tool. The HOST owns the on-canvas
 frame — the rectangle, the painted mask stack, the pending result and Применить/Отменить.
-This MODULE owns everything model-specific: the parameters and their persistence, the memory
-presets, the RAM/VRAM forecast, the prompt-cache library, the request/response wire
+This MODULE owns everything model-specific: the parameters and their persistence, the two
+memory steps («Видеопамять» / «Оперативная память») and their large-model forecast, the
+prompt-cache library, the request/response wire
 contracts, the OOM recovery, the worker thread and its own progress bar. It implements
 `region_edit_v2::engine::AiEngine` and never touches `CanvasView`, `ProjectData` or the frame.
 
@@ -78,13 +79,14 @@ Submodules (each re-exported into this root with `use <name>::*;`):
   `poll_*` pair of every long operation (component actions, the HF token, the download,
   the translator, the pickers and the prompt-cache jobs).
 - `ui/`: the parameter panel. `mod.rs` is the body and its ORDER; `install.rs`,
-  `components.rs`, `advanced.rs` and `progress.rs` draw the blocks it calls into.
+  `components.rs`, `advanced.rs` and `mask_hint.rs` draw the blocks it calls into.
 - `decisions.rs`: the PURE decisions the panel renders — `flux2_readiness_line`,
   `flux2_prompt_cache_line`, `flux2_run_block_reason`, `region_block_reason` — kept apart
   from the drawing so they can be asserted without a frame.
-- `settings.rs`: `Flux2KleinSettings` and everything persisted with it — the placement /
-  dtype vocabulary, the memory presets, the source mode and the effective-path derivation,
-  plus the settings file IO.
+- `settings.rs`: `Flux2KleinSettings` and everything persisted with it — the dtype
+  vocabulary, the two step ids, the one-time migration of the retired memory placement,
+  the source mode and the effective-path derivation, plus the settings file IO (a damaged
+  file is moved aside, never overwritten).
 - `status.rs`: the `.status` component catalog (`Flux2Status`) and every verdict derived
   from it — `Flux2ModelReadiness`, the merged component rows, the install-fold seed and
   `flux2_pipeline_busy`.
@@ -92,13 +94,20 @@ Submodules (each re-exported into this root with `use <name>::*;`):
   per-repository verdicts, the transfer plan and the encoder toggle's path repointing.
 - `prompt_cache.rs`: the saved `.msprompt` library — its shapes, its operation gates and
   the whole `.prompt_cache.*` wire block.
-- `estimate.rs`: the backend's RAM/VRAM forecast and the two strings the panel renders
-  from its phase peaks.
-- `progress.rs`: the shared progress state of all four long operations, its generation
-  guard, the transfer-rate window and the streamed frame parsers.
-- `session.rs`: the run channel, the per-RUN undo stack, `mask_for_run` and the pickers.
-- `wire.rs`: the generation run with its OOM retry pass, the streaming call helper, the
-  `.status` and `.component_action` calls and the image/mask blob encoding.
+- The memory forecast is NOT a file here: it is `large_models.profiles`, asked through
+  `ms_local_ai::large_models::ProfilesQuery` (latest wins, one in flight) and drawn by the
+  shared `ai_editor::large_model_resources` widget.
+- `run_outcome.rs`: what one run answers with — the region, the `applied.vae_tiling` flag,
+  a degraded run's effective steps.
+- `session.rs`: the run channel, the per-RUN undo stack and the pickers.
+- `wire.rs`: the generation run, the `.status` and `.component_action` calls and the
+  image/mask blob encoding.
+- The MODEL-AGNOSTIC parts are not files here: the progress state of all four long
+  operations with its generation guard, rate window, frame parser and streaming call, the
+  Hugging Face check/plan/token/download vocabulary and its drawing, the settings-file
+  quarantine and save backoff, and `mask_for_run` are `../shared/` (`use super::shared::*`),
+  and the forecast / caps / learned-floor state is `ai_editor::large_model_resources`'
+  `ResourcesController`.
 - `variant_presentation.rs`: the `Flux2VariantPresentation` extension trait — the picker
   caption and the Hugging Face repository of a variant, which belong to this module rather
   than to the configuration crate that declares the enum.
@@ -131,30 +140,30 @@ Key items:
   and re-arms the query (`note_settings_changed`).
 - `Flux2SessionState`: the run channel and the per-RUN undo stack. The painted mask is NOT
   here — it belongs to the host's `MaskStack` and arrives in `EngineRunRequest::masks`.
-- `MemoryPreset`: four built-in placement/VAE/text-encoder configurations plus `Custom`,
-  which is never chosen by hand — it is what `detect` reports when the seven fields a
-  preset owns match no preset.
-- `Flux2Status` / `Flux2Estimate`: the `.status` component catalog and the backend's
-  own VRAM/RAM forecast. The forecast is COMPUTED BY THE BACKEND; this file only
-  displays it. Its geometry input is the region SIZE, so `set_region` arms it on a
-  settled size change and never on a move — see that method for the full rule.
+- The memory steps (`vram_step` / `ram_step`, `StepChoice`): what a step MEANS is the
+  backend's (`runtime/large_models/tiers.py`); this side persists the ids and shows the
+  `large_models.profiles` forecast for them. A run never rewrites the user's steps — the
+  backend learns a floor instead, shown and resettable in «Память и скорость».
+- `Flux2Status`: the `.status` component catalog. The forecast is COMPUTED BY THE BACKEND
+  (`large_models.profiles`); its geometry input is the region SIZE, so `set_region` arms it
+  on a settled size change and never on a move — see that method for the full rule.
 
 IPC (`backend_ipc::protocol`):
 - `inpaint.flux2_klein` — streaming. Header `{image_len, mask_len, params}`, blob
   `region.png ++ mask.png` (mask L8, exactly the region size). Response header
-  `{image_len, oom_recovered, applied{...}}`, blob = RGB PNG of exactly the region
+  `{image_len, oom_recovered, applied{...}, degraded, degrade_reason, *_step_effective}`,
+  blob = RGB PNG of exactly the region
   size, validated by STRICT equality before use (`image_len` is REQUIRED; an answer
   without it is refused). Progress frames carry `phase` (`load`/`generate`), `step`,
   `total`, `label` and no preview blob. The request goes out through `begin_call`, so
   its id is known and a cancel can stop it with `CallHandle::cancel`.
-- The backend may RECOVER from an out-of-memory failure during the VAE decode by
-  retrying it with the transformer unloaded (and, if needed, VAE tiling/slicing on).
-  The five memory flags it actually used come back in `applied`; this side writes them
-  into the settings and saves them, so the next run takes the cheap path immediately,
-  and says so in the engine's status line when `oom_recovered` is set. A partial `applied`
-  object is ignored wholesale.
-- `.status`, `.estimate`, `.unload` — one-shot. `.status` and `.estimate` carry the
-  normalized `params`: both are questions ABOUT the paths in the request, and a
+- The backend may RECOVER from an out-of-memory failure (the decode retried with VAE
+  tiling, or the run degraded to a more economical step pair). Of `applied` this side reads
+  ONLY `vae_tiling` (tolerant of the five-flag v13 and the one-flag v14 object) and writes
+  it back; the user's steps are never rewritten — the backend learns a floor. A degraded
+  run names the effective steps in the engine's status line.
+- `.status`, `.unload` — one-shot; `large_models.profiles` (the forecast) likewise. All
+  carry the normalized `params`: they are questions ABOUT the paths in the request, and a
   backend that receives none answers about the paths of its last successful
   generation, i.e. about nothing until one has run. `.status` additionally answers
   `prompt_cached` — whether the embeddings of the prompt IN THE REQUEST are already
@@ -256,7 +265,7 @@ Contracts:
   `step`/`total` stay the overall counter and `file_step`/`file_total`/`file_label` are
   optional, so a frame without them renders the overall bar alone rather than a second bar
   frozen at zero. The transfer SPEED and the remaining TIME are derived here from those
-  frames — no wire field carries either — by `Flux2RateEstimator`, over the overall counter
+  frames — no wire field carries either — by `RateEstimator`, over the overall counter
   only, and are absent rather than wrong until the window is wide enough to mean something.
 - The prompt sent to the backend is the ENGLISH field. The optional second field plus
   the Google/Yandex/DeepL picker only fill it in, reusing the translation tab's own
@@ -282,18 +291,23 @@ Contracts:
   may point at one that is not.
 */
 use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RunMarks, RunOptionsCtx};
-// The save gate every engine's settings saver consults; one owner for all hosted engines.
-use crate::tools::region_edit_v2::engine_settings::settings_save_due;
-use ms_backend_ipc::{self as backend_ipc, CallError};
+use ms_backend_ipc as backend_ipc;
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
 use ms_config::Flux2Variant;
 use crate::tools::base::RegionEditToolBase;
 use crate::tools::region_edit_v2::geometry::{AspectLimit, FrameConstraints};
 use ms_local_ai::backend_health::ai_backend_offline_error;
+// The one client of `large_models.*`: the step vocabulary, the forecast query and the caps.
+use ms_local_ai::large_models::{LIMITS_EDIT_DEBOUNCE, LargeModelStep, ProfilesRequest, RamStep, StepChoice, VramStep, format_gib};
+// The axes widget the large-model cleaning engines share (FLUX.2 and FLUX.3 klein).
+use crate::tools::ai_editor::large_model_resources::{ResourcesAction, ResourcesController, ResourcesView, draw_large_model_resources, forecast_line};
+// The model-agnostic parts the large-model engines share: streamed progress, the Hugging Face
+// download, the settings-file rules and the mask -> working-mode rule.
+use super::shared::*;
 use ms_tab_translation::machine_translation::{MtService, translate_texts_via_translator};
 use ms_tab_translation::panels::machine_translation::{MT_SOURCE_LANGUAGES, MtLanguage};
-use ms_widgets::{SeedSpinBox, WheelComboBox, WheelSlider};
+use ms_widgets::{HfAccessHint, SeedSpinBox, WheelComboBox, WheelSlider};
 use eframe::egui;
 use egui::Color32;
 // The wire PNG encoders, shared by `wire.rs` (through its `use super::*`) and the tests.
@@ -301,11 +315,9 @@ use crate::tools::region_png::{encode_color_image_png_rgba, encode_mask_png_l8};
 use ms_thread as thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::fs;
-use std::path::PathBuf;
-use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use web_time::{Duration, Instant};
 
 // The caption and the model repository of a `Flux2Variant` — the enum's presentation half,
@@ -324,12 +336,9 @@ use download::*;
 // The saved `.msprompt` library, its gates and the `.prompt_cache.*` wire block.
 mod prompt_cache;
 use prompt_cache::*;
-// The backend's RAM/VRAM forecast and the two strings the panel renders from it.
-mod estimate;
-use estimate::*;
-// The shared progress state of every long operation, its generation guard and rate window.
-mod progress;
-use progress::*;
+// What one run answers with: the region, the written-back memory flag, a degraded run.
+mod run_outcome;
+use run_outcome::*;
 // The run channel, the per-run undo stack, the mask derivation and the file pickers.
 mod session;
 use session::*;
@@ -390,6 +399,14 @@ const FLUX2_CACHE_NAME_BUTTON_RESERVE: f32 = 140.0;
 /// over the artwork, and a tint that arrived already translucent would be darkened twice.
 const FLUX2_MASK_TINT: Color32 = Color32::from_rgb(80, 200, 255);
 
+/// The engine's name in log lines (a log token, never shown to the user).
+const FLUX2_LOG_LABEL: &str = "FLUX.2 klein";
+
+/// The adapter name this engine's forecast is asked under (`large_models.profiles`
+/// `model`). A wire identifier, never localized; the backend answers with the registration
+/// the request's dtype selects (`flux2_klein` / `flux2_klein.float16`).
+const FLUX2_LARGE_MODEL: &str = "flux2_klein";
+
 /// The prompt a fresh settings file starts from, and the one substituted for an
 /// absent or blank prompt in an existing one.
 ///
@@ -409,26 +426,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn applied_flags_are_written_back_and_can_unpin_the_preset() {
+    fn only_vae_tiling_is_written_back_and_the_steps_never_are() {
         let mut settings = Flux2KleinSettings::default();
-        MemoryPreset::MaxSpeed.apply(&mut settings);
-        assert_eq!(MemoryPreset::detect(&settings), MemoryPreset::MaxSpeed);
-        let recovered = Flux2AppliedFlags {
-            unload_transformer_before_vae: true,
-            vae_tiling: true,
-            vae_slicing: false,
-            unload_text_encoder_after_encode: true,
-            text_encoder_fp8: true,
-        };
+        assert!(settings.set_step_choice(StepChoice { vram: VramStep::Max, ram: RamStep::Keep }));
+        let recovered = Flux2AppliedFlags { vae_tiling: Some(true) };
         assert!(apply_backend_flags(&mut settings, recovered));
-        assert!(settings.unload_transformer_before_vae);
         assert!(settings.vae_tiling);
-        assert!(settings.unload_text_encoder_after_encode);
-        assert!(settings.text_encoder_fp8);
-        // Applying the same values twice owes no second save.
+        // Applying the same value twice owes no second save.
         assert!(!apply_backend_flags(&mut settings, recovered));
-        // `full_gpu` plus the recovered flags matches no preset any more.
-        assert_eq!(MemoryPreset::detect(&settings), MemoryPreset::Custom);
+        // An answer without the flag changes nothing.
+        assert!(!apply_backend_flags(&mut settings, Flux2AppliedFlags { vae_tiling: None }));
+        assert_eq!(
+            settings.step_choice(),
+            StepChoice { vram: VramStep::Max, ram: RamStep::Keep },
+            "the user's steps survive a recovered run: the backend learns a floor instead"
+        );
+        assert!(!settings.text_encoder_fp8, "fp8 is the user's alone, never written back");
     }
 
     /// The engine owns no brush any more: the host's `MaskStack` paints, and the engine's
@@ -459,19 +472,19 @@ mod tests {
         assert!(!FLUX2_DEFAULT_PROMPT.trim().is_empty());
 
         // A settings file written before the prompt had a default: the key is ABSENT.
-        let absent = settings_from_json(&json!({ "placement": "full_gpu", "steps": 4 }));
+        let absent = loaded_settings(&json!({ "placement": "full_gpu", "steps": 4 }));
         assert_eq!(absent.prompt, FLUX2_DEFAULT_PROMPT);
         // A file whose prompt is present but blank — whitespace included — is the same
         // unusable state and gets the same substitution.
         for blank in ["", "   ", "\n\t "] {
-            let migrated = settings_from_json(&json!({ "prompt": blank }));
+            let migrated = loaded_settings(&json!({ "prompt": blank }));
             assert_eq!(
                 migrated.prompt, FLUX2_DEFAULT_PROMPT,
                 "a blank prompt ({blank:?}) must not survive the load"
             );
         }
         // A file that carries a real prompt keeps the user's own text, verbatim.
-        let carried = settings_from_json(&json!({ "prompt": "a red balloon" }));
+        let carried = loaded_settings(&json!({ "prompt": "a red balloon" }));
         assert_eq!(carried.prompt, "a red balloon");
         // And the default one passes the run gate it exists for.
         let settings = Flux2KleinSettings {

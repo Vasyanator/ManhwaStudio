@@ -64,7 +64,22 @@ use serde_json::{Map, Value, json};
 /// backend) and `General.large_models_oom_score_adj` (read at backend start). Residency is chosen
 /// on two step axes, `vram_step` x `ram_step`; `inpaint.flux2_klein` gains the optional step
 /// fields additively.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// 14: the FLUX.2 klein placement wire is retired: `inpaint.flux2_klein*` params refuse
+/// `placement`, `profile`, `low_cpu_mem_usage`, `vae_slicing`, `unload_transformer_before_vae`,
+/// `unload_text_encoder_after_encode` by name; `applied` is `{vae_tiling}`; the run answer loses
+/// `placement`, `profile`, `profile_effective`; `.status` loses `memory`; the method
+/// `inpaint.flux2_klein.estimate` is removed (forecasts are [`METHOD_LARGE_MODELS_PROFILES`]);
+/// the text encoder is never pinned to the CPU and the `….cpu` encoder registrations are gone;
+/// new `user_config` default `General.large_models_oom_score_adj: true`.
+/// 15: FLUX.3 klein region editing: new methods [`METHOD_INPAINT_FLUX3_KLEIN`] (streaming, blob
+/// region ++ mask ++ references, frames with a stable `stage`),
+/// [`METHOD_INPAINT_FLUX3_KLEIN_STATUS`], [`METHOD_INPAINT_FLUX3_KLEIN_UNLOAD`],
+/// [`METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK`], [`METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START`];
+/// [`METHOD_LARGE_MODELS_PROFILES`] serves `model: "flux3_klein"`; the `health` payload gains
+/// `inpaint.flux3_klein`; «Энкодер на CPU»: optional `encoder_on_cpu` (bool, absent = true) in
+/// the `inpaint.flux2_klein*` params, the FLUX.3 params and their `large_models.profiles` params
+/// (the text encoder then runs on the CPU at every VRAM step).
+pub const PROTOCOL_VERSION: u32 = 15;
 
 // ============================================================================
 // FRAME SIZE GUARDS
@@ -150,12 +165,9 @@ pub const METHOD_INPAINT_FLUX_FILL_STATUS: &str = "inpaint.flux_fill.status";
 /// zero `reference_len` means no reference). The response header carries `image_len` and the blob is the
 /// edited region as an RGB PNG of exactly the region size.
 pub const METHOD_INPAINT_FLUX2_KLEIN: &str = "inpaint.flux2_klein";
-/// Reports whether the FLUX.2 klein components resolve on disk plus the host's
-/// current VRAM/RAM figures.
+/// Reports whether the FLUX.2 klein components resolve on disk and where each one is
+/// resident (free memory and forecasts are [`METHOD_LARGE_MODELS_PROFILES`]).
 pub const METHOD_INPAINT_FLUX2_KLEIN_STATUS: &str = "inpaint.flux2_klein.status";
-/// Predicts the VRAM/RAM cost of one FLUX.2 klein run for the given `params` and
-/// region size, and whether it fits.
-pub const METHOD_INPAINT_FLUX2_KLEIN_ESTIMATE: &str = "inpaint.flux2_klein.estimate";
 /// Releases the resident FLUX.2 klein pipeline.
 pub const METHOD_INPAINT_FLUX2_KLEIN_UNLOAD: &str = "inpaint.flux2_klein.unload";
 /// Loads, unloads or moves ONE FLUX.2 klein component (text encoder, transformer,
@@ -239,6 +251,30 @@ pub const METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK: &str = "inpaint.flux2_klein
 /// its settings, so a finished download leaves a configured engine. The pinned wire
 /// contract is `dev-docs/flux2_model_download.md` §4.
 pub const METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_START: &str = "inpaint.flux2_klein.download.start";
+/// FLUX.3 klein region edit (streaming, mid-run cancel). Request header: `image_len`,
+/// `mask_len`, `reference_lens` (0..9 integers) and `params`; the blob is
+/// `region.png ++ mask.png ++ reference_0.png ++ …` (mask L8 of the region size; the lengths
+/// must sum to the blob exactly). The region is reference #0 and the result is composited
+/// inside the mask. The response header carries `image_len`, `seed`, `steps`, `width`,
+/// `height`, `text_tokens`, `applied` and the step keys; the blob is the edited region as an
+/// RGB PNG of exactly the region size. Progress frames carry `phase` (`load` / `generate`),
+/// `step`, `total`, `label` and a stable `stage` id. Wire: `PROTOCOL.md` "FLUX.3 klein".
+pub const METHOD_INPAINT_FLUX3_KLEIN: &str = "inpaint.flux3_klein";
+/// Reports the FLUX.3 klein package files under `params.source_root` per format and the
+/// service health (free memory and forecasts are [`METHOD_LARGE_MODELS_PROFILES`]).
+pub const METHOD_INPAINT_FLUX3_KLEIN_STATUS: &str = "inpaint.flux3_klein.status";
+/// Releases every idle FLUX.3 klein handle.
+pub const METHOD_INPAINT_FLUX3_KLEIN_UNLOAD: &str = "inpaint.flux3_klein.unload";
+/// Checks Hugging Face access to the gated FLUX.3 klein repository and prices the download of
+/// one weight format, without transferring anything. Request header: `hf_token`, `format`
+/// (`bf16` / `fp8r` / `nvfp4`, default `fp8r`). The answer: `format` (echo), `repos`
+/// (one `{state, message}`), `plan` (nullable) and `plan_error`, as for
+/// [`METHOD_INPAINT_FLUX2_KLEIN_DOWNLOAD_CHECK`].
+pub const METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_CHECK: &str = "inpaint.flux3_klein.download.check";
+/// Downloads one weight format of the FLUX.3 klein package into `side_models/FLUX.3-image-klein/`
+/// (streaming two-level byte progress, cancel inside the transfer). Request header: `hf_token`,
+/// `format`. The answer: `root` (the package root), `downloaded_bytes`, `skipped_files`.
+pub const METHOD_INPAINT_FLUX3_KLEIN_DOWNLOAD_START: &str = "inpaint.flux3_klein.download.start";
 
 // --- Visible watermark removal ---
 /// Predicts a watermark mask for the request blob; responds with an L8 mask PNG

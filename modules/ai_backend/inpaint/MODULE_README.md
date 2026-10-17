@@ -1,12 +1,13 @@
 # Module: modules/ai_backend/inpaint
 
 ## Purpose
-Inpainting and image-generation backends of the Python AI backend: seven services. Six of
-them (LaMa V2, LaMa MPE, AOT, SDXL, FLUX.1-Fill-dev, FLUX.2 klein) take an image + mask as PNG bytes
-and return PNG bytes; they are constructed in `server.py`, stored on `AppState`, and reached from
-Rust through the `inpaint.*` IPC methods implemented in `ipc/handlers/`. The seventh, FLUX.3 Image
-Klein (`flux3_klein/`, caption + references -> image), is NOT wired yet: no `server.py`
-construction, no `AppState` field, no IPC method.
+Inpainting and image-generation backends of the Python AI backend: seven services (LaMa V2,
+LaMa MPE, AOT, SDXL, FLUX.1-Fill-dev, FLUX.2 klein, FLUX.3 Image Klein). Each takes an image (a
+region for the two klein editors) + mask as PNG bytes and returns PNG bytes; they are constructed
+in `server.py`, stored on `AppState`, and reached from Rust through the `inpaint.*` IPC methods
+implemented in `ipc/handlers/`. FLUX.3 klein is a caption + references -> image generator
+(`flux3_klein/`) that serves region editing through `flux3_klein/region.py` (the region is
+reference #0, the result is composited inside the mask).
 
 ## Architecture
 Every service follows the same shape and is safe to copy from when adding another backend:
@@ -60,7 +61,7 @@ Every service follows the same shape and is safe to copy from when adding anothe
 - `flux_fill.py`: `FluxFillInpaintService` — FLUX.1-Fill-dev (`inpaint.flux_fill`, `.unload`,
   `.status`, streaming). See the FLUX section.
 - `flux2_klein/`: `Flux2KleinInpaintService` — FLUX.2 klein region editing
-  (`inpaint.flux2_klein`, `.status`, `.estimate`, `.unload`, `.component_action` and the
+  (`inpaint.flux2_klein`, `.status`, `.unload`, `.component_action` and the
   `.prompt_cache.*` family, streaming) on the large-model manager. Serves BOTH variants (9B and
   4B) without knowing which:
   it is driven by the three user paths, and the large-model manager keeps one pipeline handle and
@@ -74,19 +75,36 @@ Every service follows the same shape and is safe to copy from when adding anothe
   `flux2_klein/MODULE_README.md` for the layout and the FLUX.2 klein sections below for the
   contracts.
 - `flux3_klein/`: `Flux3KleinService` — FLUX.3 Image Klein generation from the official weight
-  package (bf16 / fp8r / nvfp4 DiT, AE, Qwen3-VL encoder), with a `PhaseObserver` per phase. Not
-  wired (see Purpose); its one caller is the measurement tool `tools/large_model_calibration/`. See the FLUX.3 klein section
-  below and `flux3_klein/MODULE_README.md`.
+  package (bf16 / fp8r / nvfp4 DiT, AE, Qwen3-VL encoder), with a `PhaseObserver` per phase;
+  `AppState.flux3_klein` (`inpaint.flux3_klein*`, the `large_models.profiles` adapter
+  `flux3_klein`); the region editor `region.py` and its wire `wire.py`. Also driven by the
+  measurement tool `tools/large_model_calibration/`. See the FLUX.3 klein section below and
+  `flux3_klein/MODULE_README.md`.
+- `flux3_download.py`: acquisition of one weight format of the FLUX.3 klein package from the gated
+  repository (`inpaint.flux3_klein.download.check` / `.start`) into
+  `side_models/FLUX.3-image-klein/` (mirrored by Rust `ms_config::flux3_klein_dir`): the format
+  manifest over `hf_gated_download`. Stateless, imported lazily by the handler. Tests:
+  `test_flux3_download.py`.
+- `hf_gated_download.py`: the model-agnostic half of a backend-side Hugging Face download
+  (`DownloadTarget` = label + `RepoSpec`s + `ManifestEntry` prefixes + root): plan resolution,
+  the per-repository access check (`STATE_*`), the per-repository token rule, the publish gates,
+  free space, throttled two-level progress and the resumable transfer over
+  `../engines/model_download.py`. Used by `flux2_download.py` and `flux3_download.py`.
 - `flux2_download.py`: acquisition of the klein weights from Hugging Face
   (`inpaint.flux2_klein.download.check` / `.start`), for either VARIANT (`ModelVariant`: `9b`
-  gated, `4b` public). NOT a service and deliberately so: it holds no
+  gated, `4b` public): the variant table, the encoder toggle and the manifest, mapped onto
+  `hf_gated_download`. NOT a service and deliberately so: it holds no
   resident model, takes no lease and has no `AppState` field — it is a module of functions the
   handler imports lazily. See the FLUX.2 klein download section.
+- `region_imaging.py`: the region editors' pixel work (FLUX.2 klein, FLUX.3 klein): strict L8 mask
+  and RGB decode, the solid-mask check, the color match outside the mask, the inward-feathered
+  composite (byte-identical outside the mask) and the mask morphology. Tests:
+  `test_region_imaging.py`.
 - `test_lease_hints.py`: the owner and the file-size hint each small-pool service hands
   `begin_model_use` (reuses `test_lease_protocol.py`'s case builders, temp checkpoint files).
 - `test_health_during_load.py`: `health()` answers while AOT's lock section loads and infers, and
   reflects loading -> ready and a load error (stubbed load and inference, no torch).
-- `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_download.py`, `test_lease_protocol.py`
+- `test_sdxl.py`, `test_flux_fill.py`, `test_flux2_download.py` (also covers `hf_gated_download.py`), `test_lease_protocol.py`
   (`flux2_klein/`'s and `flux3_klein/`'s tests run real torch on the CPU, see their readmes):
   pure-Python
   unit tests (no torch, no diffusers, no weights, no GPU — fake `torch`/`diffusers`/`transformers`
@@ -204,16 +222,16 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
 
 ### FLUX.2 klein
 - **The mask is a PERMISSION TO CHANGE, not a hole.** Every pixel outside it must come back
-  byte-identical, and `_composite_over_region` guarantees that: the feather is applied INWARDS
+  byte-identical, and `region_imaging.composite_over_region` guarantees that: the feather is applied INWARDS
   so the blend weight is exactly zero outside, and a final `np.where` copies the original pixels
   back. Do not replace it with a plain Gaussian feather.
 - **`whole_region` is the "no mask" mode, and the flag is VERIFIED, not trusted.** The client still
-  sends a mask — a solid one — so the request format does not fork, and `_require_solid_mask`
+  sends a mask — a solid one — so the request format does not fork, and `region_imaging.require_solid_mask`
   refuses a mask with any empty pixel, naming the count. A flag that disagrees with the data would
   otherwise surface as a partial edit while the UI said no mask was needed. The mode settles three
   other params in `normalize_flux2_klein_params` (`_whole_region_overrides`, which logs whenever it
   overrides something the caller asked for): `mask_dilate_px` → 0, because a full mask has nothing
-  to grow into, and `color_match` → `False`, because `_match_color_outside_mask` takes its
+  to grow into, and `color_match` → `False`, because `region_imaging.match_color_outside_mask` takes its
   statistics from the ring OUTSIDE the mask and here that ring is empty — computing it from the
   changed pixels would force the edit's own mean and standard deviation back onto the original's,
   i.e. undo the edit, and computing it from an empty sample is a division by zero. `mask_feather_px`
@@ -223,7 +241,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
 - **`text_attention_in_mask` confines the PROMPT to the mask** (opt-in, default `False`;
   `flux2_klein/attention.py`). Why it exists: the pipeline always conditions on a clean copy of
   the WHOLE region, so an instruction can be grounded on a matching object OUTSIDE the mask; the
-  model edits it there, the per-step latent blend and `_composite_over_region` throw that edit
+  model edits it there, the per-step latent blend and `region_imaging.composite_over_region` throw that edit
   away, and the user sees nothing change under the mask. The contract:
   - ONE additive `(S, S)` mask per run over diffusers 0.39's joint sequence `[text L | noisy N |
     region clean copy N | reference R]` (verified in the installed pipeline and transformer),
@@ -275,20 +293,19 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   pixel-aligned with the region, and for a valid region both are no-ops), and passes it as
   `image_reference`: ONE PIL image, because diffusers treats a list as a batch sized from its first
   element. The pipeline already conditions on the region itself, so the reference is the second
-  condition image. It never enters `_composite_over_region` or the colour match; without one the
+  condition image. It never enters `region_imaging.composite_over_region` or the colour match; without one the
   pipeline call carries no `image_reference` key at all. The memory guard counts its condition
-  tokens in the denoise (the spec's denoise work: the region's token count again);
-  `.estimate` has no reference input and forecasts a run without one, so the on-screen figure can
-  sit below the guard's for a marked run by exactly that term.
-- **The region's border is a mask contour.** `_mask_distance_inside` pads the mask with a ring of
+  tokens in the denoise (the spec's denoise work: the region's token count again), and so does
+  `large_models.profiles` when the request's `shape.references` names it.
+- **The region's border is a mask contour.** `region_imaging.mask_distance_inside` pads the mask with a ring of
   zeros before measuring, because the region is a WINDOW onto a larger page and the pixels past its
   edge belong to that page, which the request may not change. Without the ring neither backend sees
   a contour there — `cv2.distanceTransform` only measures to zeros that exist inside the array, and
   `cv2.erode` / `ImageFilter.MinFilter` extend the border rather than eating into it — so a mask
   painted up to the region edge met the untouched page with a hard step, and under `whole_region`,
   where the mask covers everything, the feather was a complete no-op.
-- **`mask_feather_px` is the ramp WIDTH, and the blend rounds.** `_feather_mask_inwards` builds
-  the alpha as a smoothstep of `_mask_distance_inside`, so the weight is 0 on the contour and 1
+- **`mask_feather_px` is the ramp WIDTH, and the blend rounds.** `region_imaging.feather_mask_inwards` builds
+  the alpha as a smoothstep of `region_imaging.mask_distance_inside`, so the weight is 0 on the contour and 1
   at exactly `feather_px` px inside; a mask thinner than that compresses the ramp to its own
   half-width instead of losing the edit. Two failure modes this replaced, both measured on a real
   page and both visible as the "seam" users reported: an erode-then-Gaussian-blur ramp whose
@@ -303,7 +320,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   is that a 4-step distilled denoise returns the masked area ~18% less textured than the original
   (Laplacian variance, ring 8-24 px inside the mask); that is the model, and no parameter here
   changes it.
-- **The mask is accepted only as L8.** `_decode_mask` checks `img.mode == "L"` and raises on
+- **The mask is accepted only as L8.** `region_imaging.decode_mask` checks `img.mode == "L"` and raises on
   anything else. An RGB/RGBA mask used to be converted by taking the alpha or the per-channel
   maximum, which silently promoted stray colored pixels to "edit this" — a client bug turning
   into an edit of the wrong area. There is no conversion path; the wire contract is the check.
@@ -389,7 +406,9 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   placed into its denoise state FIRST; the TEXT ENCODER handle (Qwen3, phase `encode`) is admitted
   second, so it plans on what the pipeline's reservation left — on the GPU when the step pair and
   the free device memory allow it beside the pipeline, else juggled, else on the CPU from RAM (the
-  encoder alternatives of `tiers.template_for`). It is admitted under a device ceiling
+  encoder alternatives of `tiers.template_for`) — or, under «Энкодер на CPU» (`encoder_on_cpu`,
+  default `true`: `EncoderOptions.on_cpu`, the encoder spec's host pin), always on the CPU from
+  RAM, kept / released / re-read by the RAM step alone. It is admitted under a device ceiling
   (`device_cap_bytes`): the combined device peak of the nearest fitting HIGHER «Видеопамять» step
   minus this step's pipeline weights, so a lower step never forecasts or uses more device memory
   than a higher one for the two handles together (without it, a step whose pipeline reserves less
@@ -416,15 +435,14 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   step (same RAM step), whose decode keeps the transformer off the device** — so the transformer
   is parked only after both tiling rungs failed. At most `degrade.MAX_RETRIES` (3) retries per run (rung 0 included); then the
   run fails with `LargeModelRunFailed`. `applied.vae_tiling` claims tiling only where it engaged;
-  thresholds never appear in `applied`; `applied.unload_transformer_before_vae` says whether the
-  transformer was off the device during the decode of the plan that ran. `vae_slicing` stays inert
-  (KG-008, reported back as requested).
+  thresholds never appear in `applied`, which is `{vae_tiling}` alone; whether the transformer
+  was off the device during the decode is the effective step pair (`vram_step_effective`).
   - The decode owns `torch.no_grad()` (it is not inside `pipeline.__call__`) and decodes on the
     VAE's own device; `_require_execution_device` checks the denoise call computes where the
     transformer was placed.
 - **The prompt-embedding cache is always on** (`_prompt_cache`, LRU, `PROMPT_EMBED_CACHE_ENTRIES`).
   It is keyed by encoder path + text + `max_sequence_length` + the ENCODER's dtype (always
-  bfloat16, `text_encoder_dtype_name`, never the request's `dtype`) + fp8 — not by placement, since
+  bfloat16, `text_encoder_dtype_name`, never the request's `dtype`) + fp8 — not by where it ran, since
   the same encoder produces the same embedding wherever it ran. A mask edit, a new seed or a
   repeated prompt therefore skips the prompt phase entirely; a miss costs a full 16 GB read from
   disk, which is why that phase reports its own `phase:"load"` progress steps (7-9). Entries
@@ -472,8 +490,8 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
       required in every case — measured on the reference host, where the encoder-less run still
       emitted the "Загрузка токенизатора" load step.
     - **The forecast follows.** With no encoder installed `forecast_memory` zeroes the `encode`
-      and `encode_standalone` phases (neither can run there), so `estimate` and the guard get a
-      lower number from the same single calculation.
+      and `encode_standalone` phases (neither can run there), and `large_model_profiles` answers
+      `encoder: null`, so the forecast and the guard get a lower number from the same planner.
   - **Layout:** `<program root>/prompt_cache/<encoder family>/<name>.msprompt`, the root taken
     from `runtime.paths.program_root()`. The family level exists because an embedding is only
     valid for the encoder that produced it; two encoders must never share a listing. A family
@@ -505,10 +523,10 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     to avoid. Every write is atomic (`publish_bytes_atomically`: `<name>.<pid>.part` +
     `fsync` + `os.replace`), the same recipe as `../engines/model_download.py`.
   - **A `build` admits ONLY the encoder handle**; its admission is the guard (the
-    `encode_standalone` row of `.estimate` is that handle's forecast alone).
+    `encode_standalone` phase of `memory.forecast_memory` is that handle's forecast alone).
   - `build` releases the encoder afterwards (that is the point of the button), EXCEPT when its
     handle already held bytes when the call arrived — that one belongs to the previous run and the
-    steps / `unload_text_encoder_after_encode` decide its fate.
+    steps decide its fate.
   - A corrupt or foreign file in a family directory does not break `list`: it is reported in
     `skipped` with its reason. Users can and do drop files there by hand.
 - **Resources are the large-model manager's** (`runtime/large_models/MODULE_README.md`): where every
@@ -520,60 +538,37 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   without a measured entry (a borrowed table of an unknown device class) is `calibrated: false`:
   its activations choose the plan, the admission is checked on the exact weight bytes and strictly
   on the host side, and a device OOM is the ladder's (`planner` module contract).
-- **Stage-1 wire adapter (`memory.py`)**: the request's step pair (`memory.requested_steps`) is
-  `params.vram_step` / `params.ram_step` (`tiers.VramStep` / `RamStep` ids, `auto` included) when
-  either is sent — the absent axis is then «Авто»; else the LEGACY `params.profile` id
-  (`memory.LEGACY_PROFILE_STEPS`: `max_speed` / `fast` -> (MAX, KEEP), `balanced` -> (PHASE, KEEP),
-  `economy` -> (HALF, RUN), `max_economy` -> (MIN, MIN), `auto` -> (AUTO, AUTO)); else the LEGACY
-  `placement` flags still accepted on the wire — and that table is the stage-2 migration of the
-  persisted settings:
-
-  | `placement` | flags | steps (VRAM, RAM) |
-  |---|---|---|
-  | `full_gpu` | any | (MAX, KEEP) |
-  | `encoder_cpu` | `unload_transformer_before_vae=False` | (MAX, KEEP) |
-  | `encoder_cpu` | `unload_transformer_before_vae=True` (its default) | (PHASE, KEEP) |
-  | `model_cpu_offload` | any | (PHASE, KEEP) |
-  | `sequential_cpu_offload` | any | (MIN, KEEP) |
-  | otherwise | | (AUTO, AUTO) |
-
-  **The legacy wire pins the text encoder to the CPU** (`memory.encoder_cpu_pinned`): every
-  `placement` encoded on the host before the manager, so a request that sends neither `vram_step`
-  nor `ram_step` plans its encoder under the CPU-only spec (`flux2_klein_text_encoder.cpu` /
-  `.fp8.cpu`, `large_model.encoder_spec(cpu_only=True)`). Without it the default `full_gpu` ->
-  (MAX, KEEP) would put the 9B encoder on the card and KEEP it there (measured: 28.6 GiB reserved
-  instead of ~18.5, no speed gain). The one exception is the legacy `profile` `max_economy`
-  (RAM MIN): that step offers the encoder no CPU placement (`tiers.template_for`), so it stays
-  unpinned. With `vram_step` / `ram_step` sent, the encoder may compute on the GPU under MAX /
-  PHASE; the two specs' handles never share a key, so switching between the wires reloads it.
-
-  `low_cpu_mem_usage` changes nothing any more (every load streams); `vae_tiling` is the decode's
-  request; `unload_text_encoder_after_encode` drops the encoder handle after the encode;
-  `text_encoder_fp8` selects the fp8 encoder spec. The accelerate offload modes are gone (B1: the
-  manager's per-block hooks juggle the DiT instead). `inpaint.flux2_klein.estimate` answers from the
-  manager's forecast (`memory.forecast_memory`: pipeline planned first, encoder on what is left,
-  under the same CPU pin a run would use, against the free memory of the run device; `fits` =
-  both plan, `true` when the free memory is unknown) in the stage-1 shape plus the six step keys (`memory.STEP_FIELD_KEYS`) and
-  `calibrated`. A run's answer adds the same six keys, `degraded`, `degrade_reason` at the top
-  level (`applied` keeps exactly its five flags). The six keys: `vram_step`, `ram_step` (requested),
-  `vram_step_effective`, `ram_step_effective` (what ran), and `profile` / `profile_effective`, the
-  legacy name of the VRAM step (MAX `max_speed`, PHASE `balanced`, HALF `economy`, MIN
-  `max_economy`, AUTO `auto`; the RAM step is not in the name). `status.memory` stays the stage-1
-  snapshot. The adapter of `large_models.profiles` is `large_model_name(params)` (the dtype's
-  registered pipeline model) plus `large_model_inputs(params)` (options, device) — the
-  single-handle fallback — and `large_model_profiles(params, shape, format=, steps=)`, which the
-  handler prefers: the pipeline planned alone, the encoder planned (unpinned: the pickers are the
-  two-axis settings) with that plan's reservation claimed, then the pipeline planned again with the
-  encoder's reservation claimed (`LargeModelManager.profiles(claimed_device_bytes=,
+- **The request's step pair (`memory.requested_steps`)** is `params.vram_step` /
+  `params.ram_step` (`tiers.VramStep` / `RamStep` ids, `auto` included); an absent or `null` axis
+  is «Авто». The retired placement wire (`placement`, `profile`, `low_cpu_mem_usage`,
+  `vae_slicing`, `unload_transformer_before_vae`, `unload_text_encoder_after_encode`) is REFUSED
+  by name (`params.RETIRED_FIELDS`), never mapped: the migration of a client's saved settings is
+  the client's (Rust `legacy_memory_steps`, which owns that table). The text encoder computes
+  wherever the plan of the pair puts it — on the GPU under MAX / PHASE when it fits beside the
+  pipeline, else on the CPU from RAM — unless `encoder_on_cpu` pins it to the CPU (`params.encoder_on_cpu`,
+  the one owner of its default); there is one encoder spec per precision
+  (`flux2_klein_text_encoder` / `.fp8`). `vae_tiling` is the decode's request; `text_encoder_fp8`
+  selects the fp8 encoder spec. A run's answer carries the four step keys
+  (`memory.STEP_FIELD_KEYS`: `vram_step`, `ram_step` requested, `vram_step_effective`,
+  `ram_step_effective` what ran), `degraded`, `degrade_reason` at the top level and `applied` =
+  `{vae_tiling}`. Forecasts are `large_models.profiles`, whose adapter is
+  `large_model_name(params)` (the dtype's registered pipeline model) plus
+  `large_model_inputs(params)` (options, device) — the single-handle fallback — and
+  `large_model_profiles(params, shape, format=, steps=)`, which the handler prefers: the pipeline
+  planned alone, the encoder planned with that plan's reservation claimed, then the pipeline
+  planned again with the encoder's reservation claimed (`LargeModelManager.profiles(claimed_device_bytes=,
   claimed_host_bytes=)`); the answer is that report plus `encoder` (the encoder's `selected`, `null`
   when the prompt is cached or no encoder is installed), and an encoder that does not fit refuses
   `selected`. The reservation of a plan is its device peak and its host peak above the baseline
-  RSS (`service._reservation_of`).
+  RSS (`service._reservation_of`). `memory.forecast_memory` is the same two-handle admission as
+  one forecast dict (pipeline first, encoder on what is left, under the combined ceiling); its
+  consumers are the calibration tool (`tools/large_model_calibration/flux2.py`) and the golden
+  test.
 - **A host run device (`cpu` / `mps`)** is planned on the host alone, exactly as the manager plans
   it (`Budgets.host_device`; any non-`cuda*` device, `memory.is_host_run_device`): no device
-  budget, every byte in RAM, the RAM step alone picks the plan. `.estimate` then answers
-  `vram_bytes: 0`, `vram_free: 0`, `ram_bytes` = the host growth and `fits` = the host plan's, so it
-  agrees with what a run's admission will do (the unknown-VRAM-fits rule is a CUDA-only rule).
+  budget, every byte in RAM, the RAM step alone picks the plan. `memory.forecast_memory` then
+  answers `vram_bytes: 0`, `ram_bytes` = the host growth and `fits` = the host plan's, so it agrees
+  with what a run's admission will do (the unknown-VRAM-fits rule is a CUDA-only rule).
 - **A failed COLD pipeline load drops only its own handle** (`LargeModelManager.unload_key` of the
   session's key): a warm handle of another checkpoint or device under the same model name keeps
   its bytes; an admission refusal left nothing to drop.
@@ -583,10 +578,10 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   policy: the IPC handler's forwarder never raises (it logs the first failed frame of a request at
   WARNING and keeps going), so **a client disconnect does not cancel a FLUX.2 run**; mid-run
   cancellation is a separate, future feature.
-- **`unload_text_encoder_after_encode`** (default `False`): the encoder handle stays as the steps
-  keep it between runs (on the GPU under «Максимум скорости» when it ran there — never for a
-  CPU-pinned legacy request, which keeps it in RAM — in RAM under «Держать модели в памяти»,
-  dropped otherwise); `True` drops it after every encode.
+- **The encoder's between-runs state follows the RAM step**: it stays as the session's plan keeps
+  it (on the GPU under «Максимум скорости» when it ran there, in RAM under «Держать модели в
+  памяти», dropped otherwise). The only explicit release is the prompt-cache build's own
+  (`_encode_prompts_locked(release=True)`).
 - **`text_encoder_fp8`** (default `False`) is weight-only fp8 for the encoder's decoder-layer
   linears (`large_model.encoder_spec(True)`): the conversion quantizes each weight to
   `float8_e4m3fn` with per-output-row scales WHILE it is read (so the load peak is one bf16 tensor,
@@ -637,7 +632,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   makes, so the two cannot disagree. Answering `"cpu"` because nothing is loaded yet told the user
   that a run costing tens of minutes would happen on the CPU while it would in fact run on the
   configured GPU; `loaded` / `ready` are what distinguish a fact from a plan. For the same reason
-  `estimate` reads the free VRAM of THAT accelerator (`cuda:1` means card 1).
+  `large_models.profiles` plans against the free VRAM of THAT accelerator (`cuda:1` means card 1).
 
 ### FLUX.2 klein: per-component residency and actions
 The wire contract is `dev-docs/flux2_component_residency.md`; `ipc/PROTOCOL.md §5.4` carries the
@@ -645,8 +640,7 @@ client-facing half. What this module owns:
 
 - **Residency comes from the large pool's ledger parts** (`pipeline.residency_of` over the
   arbiter's per-component `(device bytes, host bytes)` of the pipeline handle of the request's paths
-  and dtype, and of the encoder handles of its path and precision — the CPU-pinned and the unpinned
-  one summed, since a status poll carries no step fields): `not_loaded` / `ram` / `gpu` /
+  and dtype, and of the encoder handle of its path and precision): `not_loaded` / `ram` / `gpu` /
   `mixed` (a juggled component parked in part — reported, never rounded). `offloaded` stays in the
   vocabulary but is never answered (no accelerate hooks any more).
 - **`_component_actions` is the AUTHORITY, and it lives only here.** The text encoder offers `load`
@@ -673,7 +667,10 @@ client-facing half. What this module owns:
   re-checks the action against the current list BEFORE any session is acquired — a session that is
   finished unused moves the model to its between-runs state, which would perform the refused action.
 
-### FLUX.2 klein: model download (`flux2_download.py`)
+### FLUX.2 klein: model download (`flux2_download.py` over `hf_gated_download.py`)
+The FLUX.2 module owns only the variant table, the encoder toggle and the manifest; every generic
+rule below (per-repository token, prefix plan, state taxonomy, publish gates, throttle, free
+space, transfer) is `hf_gated_download.py`'s and applies to the FLUX.3 download as well.
 The wire contract is `dev-docs/flux2_model_download.md`; `ipc/PROTOCOL.md` carries the frame shapes.
 Everything lands in `<side_models>/<variant directory>/` — `transformer/`, ONE of `text_encoder/`
 or `text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config.json`,
@@ -795,9 +792,13 @@ or `text_encoder_uncensored/`, `tokenizer/`, `vae/`, `scheduler/scheduler_config
   multi-gigabyte transfer must never block `health()`, `unload()` or an eviction callback.
 
 ### FLUX.3 klein (`flux3_klein/`)
-- Not wired: no `server.py` construction, no `AppState` field, no IPC method, no Rust side, no
-  `PROTOCOL_VERSION` change. Wiring it is a separate task (and the weights' licence question,
-  `flux3_klein/MODULE_README.md`, comes first).
+- Wired since protocol v15: `AppState.flux3_klein`, `inpaint.flux3_klein` (region editing:
+  `flux3_klein/region.py`; mid-run cancel through the observer and the denoise step callback,
+  `Flux3Canceled`), `.status`, `.unload`, `.download.*` (`flux3_download.py`; the weights' licence
+  is accepted by the user on Hugging Face, the repository is gated), and `large_models.profiles`
+  with `model: "flux3_klein"`. Wire: `ipc/PROTOCOL.md` "FLUX.3 klein".
+- «Энкодер на CPU» (`encoder_on_cpu`, wire default `true`, shared with FLUX.2): the text encoder
+  is pinned to host execution through the spec's host pin (`runtime/large_models` "Host pin").
 - A large-model manager handle, not a small-pool service: no small-pool lease. One handle per run,
   admitted by `LargeModelManager.acquire(steps=...)` BEFORE the service lock (the large-pool
   lease and reservation); every load and move is a manager `Session` step under the lock, driven
@@ -856,23 +857,21 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   `../runtime/safetensors_stream.py`; the fp8-scaled refusal stays in `flux2_klein/`. The
   byte-level progress of a single-file transformer is `progress._file_progress_reporter`, wired in
   `service._load_pipeline_locked`; it must never move `LOAD_STEP_*` / `LOAD_PHASE_STEPS`.
-- To change FLUX.2 klein params, region limits, the legacy placement / profile -> step mapping
-  or the stage-1 `estimate`, see `flux2_klein/` (`params.normalize_flux2_klein_params`,
+- To change FLUX.2 klein params, region limits, the retired-field refusals or the step pair of a
+  request, see `flux2_klein/` (`params.normalize_flux2_klein_params`, `params.RETIRED_FIELDS`,
   `params.validate_region_size`, `memory.requested_steps`, `memory.forecast_memory`); the
   steps, the forecast arithmetic and the degrade ladder are `../runtime/large_models/`. Keep
-  the param set in sync with `ipc/PROTOCOL.md §5.4`. The wire contract carries five `applied` flags —
-  `unload_transformer_before_vae`, `vae_tiling`, `vae_slicing`,
-  `unload_text_encoder_after_encode`, `text_encoder_fp8` — and the `estimate` breakdown carries
-  three peaks, `peak_encode` / `peak_denoise` / `peak_decode`, in pipeline order. The Rust side
-  matches those names exactly; do not rename one side alone.
+  the param set in sync with `ipc/PROTOCOL.md §5.4`. The wire contract carries one `applied` flag,
+  `vae_tiling`, and the four step keys; the Rust side matches those names exactly; do not rename
+  one side alone.
 - To change what "tiling" means — the threshold, the forecast predicate or the decode's last rung —
   see `flux2_klein/components.py::vae_tile_threshold_pixels` (the threshold, read from the VAE
   config), `large_model._decode_work` / `tiling_engages` (the forecast) and
   `pipeline._vae_tiling_engages` / `_lowered_vae_tile_thresholds` (the decode). Never hard-code the
   1024/128 numbers in any of the three, and never move one of the two tile thresholds alone.
-- The memory gate is the large-model manager's admission; `memory._preset_advice` only names the
-  step pairs that fit. Never add a second forecast: `memory.forecast_memory` plans through the
-  manager's planner and forecast.
+- The memory gate is the large-model manager's admission. Never add a second forecast:
+  `large_model_profiles` and `memory.forecast_memory` plan through the manager's planner and
+  forecast.
 - To change what `status` reports per component, or which buttons the FLUX.2 panel offers, see
   `pipeline.residency_of` (the literal of the ledger parts), `_component_actions` (the
   authoritative matrix — it exists only there) and `Flux2KleinInpaintService._components_locked` /
@@ -888,13 +887,14 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   gatedness up from the same row. Keep the wire values in step with
   `dev-docs/flux2_model_download.md` §1a and `ipc/PROTOCOL.md`.
 - To change WHICH files the FLUX.2 klein download fetches, see `shared_manifest` /
-  `official_encoder_manifest` / `uncensored_encoder_manifest` / `EXCLUDED_SUFFIXES` /
-  `EXCLUDED_NAMES` in `flux2_download.py` — never a hard-coded shard name. An entry added to
+  `official_encoder_manifest` / `uncensored_encoder_manifest` in `flux2_download.py`
+  (`EXCLUDED_SUFFIXES` / `EXCLUDED_NAMES` are `hf_gated_download.py`'s) — never a hard-coded
+  shard name. An entry added to
   `shared_manifest` is fetched in BOTH toggle states and by BOTH variants; the two encoder
-  tuples stay mutually exclusive. To change the access states, see `classify_repo_error` (status before
-  type); to change the frame shape or the throttle, `_chunk_reporter` / `ProgressThrottle`; to change
-  where it all lands, `model_root` / `component_paths`; to change how a file is fetched, `_fetch_one`
-  / `_retry_reporter` — retry, resume, the size gate, staging, claiming and parking themselves
+  tuples stay mutually exclusive. To change the access states, see `hf_gated_download.classify_repo_error`
+  (status before type); to change the frame shape or the throttle, its `_chunk_reporter` /
+  `ProgressThrottle`; to change where it all lands, `model_root` / `component_paths`; to change how
+  a file is fetched, its `_fetch_one` / `_retry_reporter` — retry, resume, the size gate, staging, claiming and parking themselves
   belong to `../engines/model_download.py` and are shared, so do not re-implement them here. Keep every wire literal in step with
   `dev-docs/flux2_model_download.md` and `ipc/PROTOCOL.md`; the Rust side is written against the same
   document.
@@ -928,7 +928,7 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
   and `_denoise` (`image_reference`) in `flux2_klein/service.py`, and the reference term of the
   denoise work in `flux2_klein/large_model.py`.
 - To change the "no mask" mode, see `normalize_flux2_klein_params` / `_whole_region_overrides` (the
-  params it settles) and `_require_solid_mask` (the check). `_denoise` needs no special
+  params it settles) and `region_imaging.require_solid_mask` (the check). `_denoise` needs no special
   case and must not grow one — the mode is expressed entirely as normalized parameters.
 - To change where the FLUX.2 klein transformer config is looked for, see
   `transformer_config_roots` / `find_transformer_config_dir` / `validate_transformer_config_dir` in
@@ -943,8 +943,8 @@ no network wait, no inference. Everything is a strict no-op off ROCm.
 - To change how a service reports load vs. inference failures to the model manager, change all the
   small-pool services at once and extend `test_lease_protocol.py` — the protocol is a cross-service
   contract (FLUX.2 klein is a large-model manager handle: its sessions follow the manager's).
-- To change FLUX.3 klein (run order, its model spec, observer phases, loaders), see
-  `flux3_klein/MODULE_README.md`; to wire it into IPC, follow the next bullet.
+- To change FLUX.3 klein (run order, its model spec, observer phases, loaders, the region editor
+  and its wire), see `flux3_klein/MODULE_README.md`; its download manifest: `flux3_download.py`.
 - To add a new inpaint backend, copy the service shape above, wire it in `server.py` + `AppState`,
   add an `ipc/handlers/` method and a `METHOD_INPAINT_*` constant in `ipc/protocol.py`, and route any
   GPU weight move through `runtime/rocm_mmap_transfer.py`.

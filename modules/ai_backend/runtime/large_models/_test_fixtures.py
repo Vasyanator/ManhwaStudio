@@ -11,7 +11,8 @@ Key functions:
 - `write_header_only(path, tensors)` - a safetensors file whose header lists
   `(name, dtype, elements)` tensors back to back;
 - `toy_spec(...)`, `toy_inventories(...)` - the toy model and its inventories
-  for one or several formats;
+  for one or several formats (`pinnable=True`: options `PIN_ENCODER` pin the
+  encoder to the host);
 - `simple_tables(...)` - a small calibration table with round numbers for the
   toy family, so forecast arithmetic can be asserted exactly;
 - `budgets(...)` - `planner.Budgets` from GiB figures.
@@ -86,8 +87,16 @@ def _decode_work(shape: RequestShape, options: Any) -> PhaseWork:
     return PhaseWork(pixels=shape.width * shape.height, variant="float32")
 
 
-def toy_spec(files_by_format: dict[str, dict[str, list[Path]]], *, encoder_exec: frozenset[ExecDevice] = frozenset({ExecDevice.RUN_DEVICE, ExecDevice.CPU}), family: str = "toy") -> LargeModelSpec:
-    """The toy model: `dit` (blocks), `encoder` (layers), `ae` (monolithic); phases encode, denoise, decode."""
+#: The toy `options` value that pins the encoder to the host (`toy_spec(pinnable=True)`).
+PIN_ENCODER = "pin_encoder"
+
+
+def toy_spec(files_by_format: dict[str, dict[str, list[Path]]], *, encoder_exec: frozenset[ExecDevice] = frozenset({ExecDevice.RUN_DEVICE, ExecDevice.CPU}), family: str = "toy", pinnable: bool = False) -> LargeModelSpec:
+    """The toy model: `dit` (blocks), `encoder` (layers), `ae` (monolithic); phases encode, denoise, decode.
+
+    `pinnable`: `options == PIN_ENCODER` pins the encoder to host execution
+    (`LargeModelSpec.host_pin_of`); any other options pin nothing.
+    """
 
     def _files(name: str) -> Any:
         return lambda options, weight_format: files_by_format[weight_format][name]
@@ -104,6 +113,7 @@ def toy_spec(files_by_format: dict[str, dict[str, list[Path]]], *, encoder_exec:
             PhaseSpec("denoise", frozenset({"dit"}), "dit", _denoise_work),
             PhaseSpec("decode", frozenset({"ae"}), "ae", _decode_work),
         ),
+        host_pin_of=(lambda options: ("encoder",) if options == PIN_ENCODER else ()) if pinnable else None,
     )
 
 

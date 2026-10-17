@@ -6,6 +6,9 @@ and the root.
 
 Submodules:
 - `backend_health`: push-driven AI-backend health (`TOPIC_HEALTH` v2 events) + device-control helpers.
+- `large_models`: the one Rust client of the backend's large-model pool (`large_models.*`):
+  wire types and strict parsers, the step vocabulary with its labels, the calls (worker-only),
+  and the latest-wins `ProfilesQuery` / debounced `LimitsWriter`.
 - `local_ai`: which local AI runtimes (Python backend, native ONNX) the process may use
   (`--no-ai` + platform), the one route-availability rule (`AiRouteKind::availability`) and
   the effective-runtime helper (`effective_ai_runtime`).
@@ -23,4 +26,5 @@ Notes:
 extern crate ms_i18n;
 
 pub mod backend_health;
+pub mod large_models;
 pub mod local_ai;
