@@ -79,6 +79,7 @@ from ..region_imaging import (
     decode_mask,
     dilate_mask,
     encode_png_rgb,
+    match_color_local,
     match_color_outside_mask,
     require_solid_mask,
 )
@@ -687,7 +688,17 @@ class Flux2KleinInpaintService:
                 f"{width}x{height}; композит невозможен"
             )
         if normalized["color_match"]:
+            # Both matches sample outside the LATENT (dilated) mask: that is the
+            # area the pipeline was allowed to repaint.
             generated = match_color_outside_mask(generated, region_rgb, latent_mask)
+            if normalized["color_match_local_pct"] > 0:
+                generated = match_color_local(
+                    region_rgb,
+                    generated,
+                    latent_mask,
+                    strength=normalized["color_match_local_pct"] / 100.0,
+                    scale_px=int(normalized["color_match_scale_px"]),
+                )
         composed = composite_over_region(region_rgb, generated, mask_u8, int(normalized["mask_feather_px"]))
         return {
             "image_png": encode_png_rgb(composed),

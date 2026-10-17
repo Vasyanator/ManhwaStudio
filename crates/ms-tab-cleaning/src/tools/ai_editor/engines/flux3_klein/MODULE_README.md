@@ -72,7 +72,9 @@ two-axis widget with the format rows and «Энкодер на CPU»).
 - **`normalized().to_params()` is the only wire value.** An unknown key is refused by the
   backend by name, so the key set is pinned by a test; `fp8_compute` travels as chosen only for
   fp8r; `encoder_on_cpu` (default on, also for an old file) travels in the run, the status and the
-  forecast.
+  forecast; so do `color_match_local_pct` (0..=100, default 60) and `color_match_scale_px`
+  (Gaussian sigma of the finest averaging level, 8..=96, default 24), sent as stored — the backend applies the local match only under
+  `color_match` and never in a whole-region run.
 - **The seed is the user's or random**: blank field = `null` (the backend draws one and echoes
   it, shown in the run line and offered as «Повторить этот сид»); an invalid text blocks the run
   and is never persisted.

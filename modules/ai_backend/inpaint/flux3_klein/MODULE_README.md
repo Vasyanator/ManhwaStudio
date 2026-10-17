@@ -91,8 +91,10 @@ keeps nothing before its first use.
 - `region.py`: `edit_region_bytes` — the region editor: decode and check region / mask /
   references, the seed (`null` = random, echoed), `Flux3Request(region as reference #0, explicit
   size)`, the progress frames (`progress_stages()`, stable `stage` ids), cancellation through the
-  observer and the step callback, the size check, the color match and the inward-feathered
-  composite (`../region_imaging.py`), the answer dict.
+  observer and the step callback, the size check, the color match (global, then local CIELAB
+  unless `color_match_local_pct` is 0; both against the painted mask — rules in
+  `../MODULE_README.md` "The color match is two steps") and the inward-feathered composite
+  (`../region_imaging.py`), the answer dict.
 - `service.py`: `Flux3KleinService` (`generate`, `status`, the profiles adapter
   `large_model_name` / `large_model_inputs`, `health`, `unload`), `Flux3Result`, `Flux3Applied`,
   `Flux3Canceled`, `_model_key`.

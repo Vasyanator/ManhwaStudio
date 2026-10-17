@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `15` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `16` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -572,7 +572,10 @@ accepted and then ignored),
 `encoder_on_cpu: bool` (default `true`, v15: «Энкодер на CPU» — the text encoder
 runs on the CPU from RAM at every VRAM step; §5.10 "Encoder on the CPU"),
 `mask_dilate_px` (0..64, default 16), `mask_feather_px` (0..32, default 12),
-`color_match: bool` (default `true`), `whole_region: bool` (default `false`),
+`color_match: bool` (default `true`), `color_match_local_pct` (0..100, default
+60, v16) and `color_match_scale_px` (8..96, default 24, v16; the Gaussian sigma
+of the local match's finest level, in pixels) — see "Color match"
+below; `whole_region: bool` (default `false`),
 `max_sequence_length` (64..512, default 512),
 `text_attention_in_mask: bool` (default `false`; see below).
 The fields of the retired placement wire (protocol <= 13) — `placement`,
@@ -614,10 +617,31 @@ user was told not to expect. The mode also settles other params by itself:
 `mask_dilate_px` becomes `0` (a full mask has nothing to grow into) and
 `color_match` becomes `false` (the match takes its statistics from the pixels
 OUTSIDE the mask, and here there are none — matching against the changed pixels
-would force the edit's own tone back onto the original's). `mask_feather_px`
+would force the edit's own tone back onto the original's), and with it
+`color_match_local_pct` becomes `0`. `mask_feather_px`
 stays in force and ramps inwards from the region's border, which is what joins
 the regenerated region to the rest of the page. `text_attention_in_mask` is
 forced to `false` as well (see below).
+
+**Color match** (both region editors, FLUX.2 klein and FLUX.3 klein;
+`inpaint/region_imaging.py`). With `color_match` the generated region goes
+through two steps before the composite. (1) A GLOBAL per-channel RGB mean/std
+match, its statistics taken outside the mask (FLUX.2: the dilated latent mask;
+FLUX.3: the painted mask) grown by a further 6 px, so a text outline left at
+the mask edge does not bias it (v16; a ring too small for that falls back to the
+mask itself, and one too small for that skips the match). (2) Unless
+`color_match_local_pct` is `0`, a LOCAL CIELAB match of strength
+`color_match_local_pct / 100` whose finest level is a Gaussian of standard
+deviation (sigma) `color_match_scale_px` pixels, not a window side: the
+lightness mean and contrast and the a/b means inside the mask are pulled towards
+the surroundings' (carried into the mask from the original's pixels outside it),
+which corrects the drift a diffusion fill shows towards the mask centre; far
+from the ring the target converges to the ring's global statistics. The global
+step rewrites the whole generated region and the local step only pixels inside
+the mask; the composite then keeps every pixel outside the mask byte-identical.
+The two local fields are clamped to their ranges by FLUX.2 and
+refused out of range by FLUX.3 (each side's usual rule); an absent field takes
+its default.
 
 **`text_attention_in_mask` — the prompt acts only inside the mask.** Opt-in;
 absent means `false`, so an older client's request runs unchanged. When `true`
@@ -871,6 +895,10 @@ value is a request error naming the field — never clamped:
 - `encoder_on_cpu: bool` (default `true`: «Энкодер на CPU», §5.10);
 - `mask_feather_px: int` (0..32, default 12);
 - `color_match: bool` (default `true`; the effective value is `false` under `whole_region`);
+- `color_match_local_pct: int` (0..100, default 60, v16; 0 = global match only; the effective
+  value is `0` whenever `color_match` is off) and `color_match_scale_px: int` (8..96, default
+  24, v16; the Gaussian sigma of the finest level, in pixels): the local color match, see
+  "Color match" in the FLUX.2 klein section;
 - `whole_region: bool` (default `false`: the mask must be solid and the whole region is regenerated).
 There is no guidance and no negative prompt (the model is distilled).
 

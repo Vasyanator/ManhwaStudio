@@ -40,10 +40,11 @@ pub(super) fn test_reference(name: &str, marker: u8) -> Flux3Reference {
 }
 
 /// Every `cleaning.tools.flux3_klein.<key>` without placeholders (the catalog test walks it).
-pub(super) const FLUX3_PLAIN_KEYS: [&str; 89] = [
+pub(super) const FLUX3_PLAIN_KEYS: [&str; 93] = [
     "cancel_pending_error",
     "advanced_heading", "ae_bf16_hint", "ae_bf16_label", "browse_folder_tooltip", "color_match_hint",
-    "color_match_label", "download_cancelled_status", "download_destination_label", "download_hint",
+    "color_match_label", "color_match_local_hint", "color_match_local_label", "color_match_scale_hint",
+    "color_match_scale_label", "download_cancelled_status", "download_destination_label", "download_hint",
     "download_running_status", "empty_mask_error", "format_bf16_hint", "format_bf16_label",
     "format_fp8r_hint", "format_fp8r_label", "format_hint", "format_label", "format_nvfp4_hint",
     "format_nvfp4_label", "fp8_compute_auto", "fp8_compute_dequant", "fp8_compute_hint", "fp8_compute_label",

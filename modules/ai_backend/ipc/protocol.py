@@ -69,8 +69,14 @@ from __future__ import annotations
 # «Энкодер на CPU»: optional `encoder_on_cpu` (bool, absent = true) in the
 # `inpaint.flux2_klein*` params, the FLUX.3 params and their `large_models.profiles`
 # params (the text encoder then runs on the CPU at every VRAM step).
+# 16: local color match of the region editors: optional `color_match_local_pct`
+# (0..100, default 60) and `color_match_scale_px` (8..96, default 24, Gaussian
+# sigma of the finest level) in the
+# `inpaint.flux2_klein` and `inpaint.flux3_klein` params (effective only with
+# `color_match`, off under `whole_region`); the global `color_match` now samples
+# outside the mask grown by 6 px.
 # ============================================================================
-PROTOCOL_VERSION = 15
+PROTOCOL_VERSION = 16
 
 # ============================================================================
 # FRAME SIZE GUARDS

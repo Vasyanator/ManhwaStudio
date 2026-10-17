@@ -384,6 +384,13 @@ const FLUX2_STRENGTH_MIN: f32 = 0.25;
 const FLUX2_STRENGTH_MAX: f32 = 1.0;
 const FLUX2_DILATE_MAX: u32 = 64;
 const FLUX2_FEATHER_MAX: u32 = 32;
+/// Range of `color_match_local_pct`, the local colour-match strength in percent (`0` = the
+/// global match only). The backend's accepted range (`modules/ai_backend/inpaint/flux2_klein/params.py`).
+const FLUX2_COLOR_MATCH_LOCAL_PCT_MAX: u32 = 100;
+/// Range of `color_match_scale_px`, the Gaussian sigma in pixels of the finest level of the
+/// local colour match's averaging; the backend's accepted range.
+const FLUX2_COLOR_MATCH_SCALE_MIN: u32 = 8;
+const FLUX2_COLOR_MATCH_SCALE_MAX: u32 = 96;
 /// Largest number of pre-run region images kept for «Вернуть». A megapixel region is
 /// ~4 MB, so an unbounded stack would grow without limit over a long session; the
 /// oldest entry is dropped instead.

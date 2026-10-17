@@ -30,7 +30,8 @@ nests another.
   controls), the residency line and «Выгрузить из памяти». It opens itself once on the first
   definite non-ready verdict unless the user already moved the fold.
 - `advanced.rs`: «Для экспертов» — «Референсы и в текстовый энкодер» (`vl_refs`), «Автоэнкодер в
-  bfloat16», the fp8 path (drawn for fp8r only), «Ограничить референсы», soft edge, colour match.
+  bfloat16», the fp8 path (drawn for fp8r only), «Ограничить референсы», soft edge, colour match
+  with its local strength / scale dials (closed while the colour match is off).
 
 ## Contracts and invariants
 - **No literals**: every text is a `cleaning.tools.flux3_klein.*` key (shared parts use

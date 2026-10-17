@@ -118,7 +118,9 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   step-pair table; an untouched default document goes to «Авто» / «Авто»),
   `Flux2SourceMode`, the persisted `variant` and `effective_paths`, «Энкодер на CPU»
   (`encoder_on_cpu`, default on — also for a file without the field — and sent in every
-  `params`, the forecast's included), and the settings-file
+  `params`, the forecast's included), the local colour match (`color_match_local_pct`
+  0..=100 default 60, `color_match_scale_px`, the Gaussian sigma of the finest averaging level, 8..=96 default 24; defaults also for a file
+  without them, clamped by `normalized()`, sent as stored like `color_match`), and the settings-file
   load/save pair (`load_flux2_settings_from` / `save_flux2_settings`, over the shared
   `read_settings_file` / `write_settings_json`: a damaged file is moved aside, never
   overwritten, and when that fails saving is BLOCKED). Edit it to add or change a persisted field. ONE FILE PER VARIANT: 9B keeps `flux2_klein_settings.json` unchanged,

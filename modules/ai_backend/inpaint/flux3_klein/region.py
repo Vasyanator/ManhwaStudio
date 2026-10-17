@@ -7,8 +7,9 @@ a region PNG, a mask PNG and up to `wire.MAX_EXTRA_REFERENCES` reference PNGs
 in, the edited region PNG out. FLUX.3 has no mask input, so the region is
 reference #0 and the output is the region's size; the painted mask is a
 PERMISSION TO CHANGE: the generated pixels are composited back inside it
-(feathered inwards, color-matched to the ring outside it), so every pixel
-outside the mask comes back byte-identical.
+(feathered inwards, color-matched to the ring outside it — globally, then
+locally in CIELAB unless `color_match_local_pct` is 0), so every pixel outside
+the mask comes back byte-identical.
 
 Key functions:
 - `edit_region_bytes(service, image_png, mask_png, reference_pngs, params, *,
@@ -43,7 +44,7 @@ import secrets
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from ..region_imaging import composite_over_region, decode_image_rgb, decode_mask, encode_png_rgb, match_color_outside_mask, require_solid_mask
+from ..region_imaging import composite_over_region, decode_image_rgb, decode_mask, encode_png_rgb, match_color_local, match_color_outside_mask, require_solid_mask
 from .params import Flux3Request
 from .phases import Phase
 from .service import Flux3Canceled, Flux3KleinService
@@ -173,6 +174,8 @@ def edit_region_bytes(
         raise ValueError(f"FLUX.3 klein вернул изображение {generated.shape[1]}x{generated.shape[0]} вместо области {width}x{height}; композит невозможен")
     if wire.color_match:
         generated = match_color_outside_mask(generated, region_rgb, mask_u8)
+        if wire.color_match_local_pct > 0:
+            generated = match_color_local(region_rgb, generated, mask_u8, strength=wire.color_match_local_pct / 100.0, scale_px=wire.color_match_scale_px)
     composed = composite_over_region(region_rgb, generated, mask_u8, wire.mask_feather_px)
     applied = result.applied
     return {

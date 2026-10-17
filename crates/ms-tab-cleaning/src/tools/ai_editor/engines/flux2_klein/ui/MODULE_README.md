@@ -45,7 +45,8 @@ never work started from inside a widget closure.
 - `components.rs`: the merged
   component list — one row per component carrying presence, size, residency and the
   backend's own action buttons.
-- `advanced.rs`: «Для экспертов» — the generation parameters, the mask shaping and the
+- `advanced.rs`: «Для экспертов» — the generation parameters, the mask shaping (colour match
+  with its local strength / scale dials, closed while the colour match is off) and the
   precision / VAE tiling / fp8-encoder switches. It holds the panel's only gated non-button
   control: `guidance_scale`, closed on a distilled checkpoint.
 - `mask_hint.rs`: the mask hint the body closes with. The progress bar is the shared

@@ -14,19 +14,30 @@ than left to the pipeline's own latent masking.
 Main responsibilities:
 - wire decoding (`decode_image_rgb`, `decode_mask`, `require_solid_mask`) and
   encoding (`encode_png_rgb`);
-- color alignment (`match_color_outside_mask`) and the composite
-  (`composite_over_region`, `feather_mask_inwards`, `mask_distance_inside`);
+- color alignment, in run order: the global per-channel mean/std match against
+  the ring outside the mask (`match_color_outside_mask`, kept
+  `COLOR_MATCH_MARGIN_PX` clear of the contour), then the optional local CIELAB
+  match that pulls the low frequencies inside the mask towards the surroundings
+  (`match_color_local`: cascade-filled target statistics, lightness mean +
+  contrast, a/b mean shift), then the composite (`composite_over_region`,
+  `feather_mask_inwards`, `mask_distance_inside`);
 - mask morphology (`dilate_mask`, `erode_mask`, `morph_mask`).
 
 Notes:
 numpy is a hard dependency of these helpers; cv2 and PIL are imported lazily
-inside the functions that need them, and every cv2 path has a numpy fallback.
+inside the functions that need them, and every cv2 path has a numpy fallback
+(the local match's Gaussian, box downscale, bilinear upscale and channel mix
+included). The local match computes its low-frequency fields on a grid
+`scale // LOCAL_MATCH_GRID_SIGMA` times coarser than the region, so its cost is
+a few full-resolution passes whatever the scale (~0.4 s for a 2048x2048 region
+with cv2).
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -44,6 +55,39 @@ MIN_COLOR_MATCH_SAMPLES = 256
 #: costs one erosion per level, which is why it is bounded at all.
 MAX_MASK_DISTANCE_PROBE = 33
 
+#: Pixels the global color match keeps clear of the mask contour. A text outline
+#: or halo the mask does not quite cover sits right at its edge, and including it
+#: would bias the fit towards the very text being removed.
+COLOR_MATCH_MARGIN_PX = 6
+
+#: Margin, in pixels, between the mask and the pixels the LOCAL match samples
+#: its target statistics from (the same reason as `COLOR_MATCH_MARGIN_PX`, a
+#: narrower one because the local fit is a spatial interpolation, not one global
+#: fit, and a wide margin would push its anchors away from the contour).
+LOCAL_MATCH_VALID_MARGIN_PX = 3
+
+#: Number of scales of the local match's cascade fill (`s, 2s, 4s, 8s, 16s`).
+LOCAL_MATCH_LEVELS = 5
+
+#: Valid-weight fraction at which one cascade scale is fully trusted.
+LOCAL_MATCH_CONFIDENCE = 0.25
+
+#: Range of the local lightness contrast gain (target std / generated std).
+LOCAL_MATCH_GAIN_RANGE = (0.8, 1.4)
+
+#: Variance floor of the local statistics, so a flat channel has a finite std.
+LOCAL_MATCH_VARIANCE_FLOOR = 1e-3
+
+#: Valid weight below which a cascade level counts as having no support at a
+#: cell (its normalized-convolution ratio would be rounding noise).
+LOCAL_MATCH_MIN_WEIGHT = 1e-6
+
+#: Gaussian sigma, in grid cells, at which the local match's low-pass works.
+#: A larger sigma is applied on a grid downscaled by `floor(sigma / this)`: the
+#: fields are smooth by construction, so a few cells per sigma lose nothing
+#: visible, and the cascade's 16·s scales stay a fixed, small cost.
+LOCAL_MATCH_GRID_SIGMA = 4.0
+
 
 # =====================================================================
 #  Post-processing (ours, not the pipeline's)
@@ -53,16 +97,29 @@ def match_color_outside_mask(
 ) -> np.ndarray:
     """Align the generated region's per-channel mean/std to the original.
 
-    The statistics are taken over the pixels OUTSIDE `mask`, i.e. the ring the
-    model was not allowed to change: the VAE round trip shifts the whole window's
-    tone, and that ring is the only place where the two images are supposed to be
-    identical. Returns `generated` unchanged when the ring is too small to give
-    meaningful statistics.
+    The statistics are taken over the pixels outside `mask` grown by
+    `COLOR_MATCH_MARGIN_PX`, i.e. the ring the model was not allowed to change:
+    the VAE round trip shifts the whole window's tone, and that ring is the only
+    place where the two images are supposed to be identical. The margin keeps a
+    text outline or halo left right at the mask edge out of the fit. When the
+    margin leaves fewer than `MIN_COLOR_MATCH_SAMPLES` pixels the undilated mask
+    is used instead; when even that is too few, `generated` is returned unchanged
+    (the statistics would be noise).
     """
     import numpy as np
 
-    outside = mask == 0
+    outside = dilate_mask(mask, COLOR_MATCH_MARGIN_PX) == 0
     sample_count = int(np.count_nonzero(outside))
+    if sample_count < MIN_COLOR_MATCH_SAMPLES:
+        # A thin ring around a large mask: a margin-free fit beats no fit.
+        log.debug(
+            "region imaging: only %d pixels outside the mask grown by %d px, "
+            "matching the color against the undilated mask instead.",
+            sample_count,
+            COLOR_MATCH_MARGIN_PX,
+        )
+        outside = mask == 0
+        sample_count = int(np.count_nonzero(outside))
     if sample_count < MIN_COLOR_MATCH_SAMPLES:
         log.debug(
             "region imaging: only %d pixels outside the mask, skipping the color match.",
@@ -85,7 +142,464 @@ def match_color_outside_mask(
             matched[..., channel] = (matched[..., channel] - gen_mean) * (
                 ref_std / gen_std
             ) + ref_mean
-    return np.clip(matched, 0, 255).astype(np.uint8)
+    # Rounded, not truncated: truncation darkens every channel by half a level
+    # on average (see `composite_over_region`).
+    return np.clip(np.rint(matched), 0, 255).astype(np.uint8)
+
+
+def match_color_local(
+    original: np.ndarray,
+    corrected: np.ndarray,
+    mask: np.ndarray,
+    *,
+    strength: float,
+    scale_px: int,
+) -> np.ndarray:
+    """Pull the low frequencies inside `mask` towards the surroundings, in CIELAB.
+
+    Runs after `match_color_outside_mask`, which fixes the VAE's tone shift of the
+    whole window but not what the model PAINTED: a diffusion fill tends to average
+    the scene's atmosphere, so its colour drifts away from the surroundings
+    towards the mask centre and its contrast is flatter. Per pixel, at scale
+    `scale_px` (the Gaussian SIGMA of the finest level, in pixels — not a
+    window side):
+
+    - lightness: `(L - mu_c) * clip(sd_t / sd_c, LOCAL_MATCH_GAIN_RANGE) + mu_t`;
+    - a, b: `a - mu_c + mu_t` (mean shift only: scaling chroma amplifies colour
+      noise);
+    - the result is `C + (R - C) * strength`.
+
+    `mu_c` / `sd_c` are the statistics of `corrected` taken only from pixels
+    INSIDE `mask` (a normalized convolution at `scale_px`; the global inside
+    moments where no inside pixel is in reach). This deliberately departs from
+    the spec's plain Gaussian over all pixels: near the contour that window
+    averages the drifted generated pixels with the (already matching) outside,
+    sees only part of the drift and inflates `sd_c` across the edge step, so the
+    rim stayed under-corrected in a band 1-2 scales wide — a visible seam along
+    the contour against the fully corrected centre. `mu_t` /
+    `sd_t` are those of `original`, taken only from pixels outside `mask` grown
+    by `LOCAL_MATCH_VALID_MARGIN_PX` and carried into the mask by a cascade of
+    normalized convolutions (`scale_px * 2**i`, `LOCAL_MATCH_LEVELS` levels): a
+    single scale has no valid pixel in reach at the centre of a wide mask, so
+    each coarser scale fills what the finer ones were not confident about, and
+    the valid-weighted global moments of the original end the cascade: every
+    Gaussian is truncated at 4 sigma, so beyond ~67·`scale_px` from the ring no
+    level has any weight and the target converges smoothly to the global one.
+    The low-frequency fields are evaluated on a coarser grid over a reflect-101
+    padded copy of the region; they agree with a full-resolution evaluation to
+    about one level (p99.9 two levels, a handful of isolated pixels up to five
+    on a region border the mask touches at the largest scale).
+
+    `original`, `corrected`: HxWx3 uint8 RGB of the same shape; `mask`: HxW, non-
+    zero = may change. `strength` is clamped to 0..1 (0 returns `corrected`
+    itself); a non-finite one is refused. Only pixels inside `mask` are rewritten; every other pixel is
+    returned exactly as in `corrected`. The result is ROUNDED to uint8 (see
+    `composite_over_region` for why truncation is a visible bias). Returns
+    `corrected` unchanged, with a debug log, when the mask is empty or fewer than
+    `MIN_COLOR_MATCH_SAMPLES` pixels are valid (the whole region is masked).
+
+    # Raises
+    `ValueError` when the shapes disagree, `scale_px` is below 1 or
+    `strength` is NaN or infinite.
+    """
+    import time
+
+    import numpy as np
+
+    if original.shape != corrected.shape or original.ndim != 3 or original.shape[2] != 3:
+        raise ValueError(
+            f"Локальная подгонка цвета: формы исходника {original.shape} и результата "
+            f"{corrected.shape} должны совпадать и быть HxWx3"
+        )
+    if mask.shape != original.shape[:2]:
+        raise ValueError(
+            f"Локальная подгонка цвета: маска {mask.shape} не совпадает с областью {original.shape[:2]}"
+        )
+    if int(scale_px) < 1:
+        raise ValueError(f"Локальная подгонка цвета: масштаб должен быть не меньше 1 px, получено {scale_px}")
+    strength = float(strength)
+    if not math.isfinite(strength):
+        raise ValueError(f"Локальная подгонка цвета: сила должна быть конечным числом, получено {strength}")
+    strength = min(max(strength, 0.0), 1.0)
+    if strength <= 0.0:
+        return corrected
+    inside = mask > 0
+    if not inside.any():
+        return corrected
+    valid = dilate_mask(mask, LOCAL_MATCH_VALID_MARGIN_PX) == 0
+    valid_count = int(np.count_nonzero(valid))
+    if valid_count < MIN_COLOR_MATCH_SAMPLES:
+        log.debug(
+            "region imaging: only %d valid pixels around the mask, skipping the local color match.",
+            valid_count,
+        )
+        return corrected
+
+    started = time.perf_counter()
+    scale = float(scale_px)
+    height, width = mask.shape
+    source_lab = _srgb_u8_to_lab(original)
+    corrected_lab = _srgb_u8_to_lab(corrected)
+    weight = valid.astype(np.float32)
+    inside_weight = inside.astype(np.float32)
+
+    # Moments are taken about one shared centre near both images' mean, so
+    # `E[x²] - E[x]²` does not cancel catastrophically in float32 (L² reaches
+    # 1e4). Any value close to the mean conditions it; a strided sample is enough.
+    center = corrected_lab[::4, ::4].reshape(-1, 3).mean(axis=0, dtype=np.float64).astype(np.float32)
+    # The cascade's terminal level: the valid-weighted GLOBAL moments of the
+    # original [L, a, b, L²] (centred). It always has support, so a pixel no
+    # scale reaches (cv2 truncates each Gaussian at 4 sigma: beyond ~4·16·s
+    # from the ring every level's weight is exactly zero) converges to the
+    # global target instead of to garbage or the variance floor.
+    weight_sum = float(weight.sum(dtype=np.float64))
+    source_centred = source_lab - center
+    global_moments = np.empty(4, dtype=np.float32)
+    for channel in range(3):
+        global_moments[channel] = float((source_centred[..., channel] * weight).sum(dtype=np.float64)) / weight_sum
+    global_moments[3] = float((source_centred[..., 0] * source_centred[..., 0] * weight).sum(dtype=np.float64)) / weight_sum
+    del source_centred
+    # The same for the corrected image over the INSIDE pixels: the fallback of
+    # its local statistics where no inside pixel is in reach (only grid cells
+    # far from the mask, never a pixel the result is read at).
+    inside_sum = float(inside_weight.sum(dtype=np.float64))
+    corrected_centred = corrected_lab - center
+    inside_moments = np.empty(4, dtype=np.float32)
+    for channel in range(3):
+        inside_moments[channel] = float((corrected_centred[..., channel] * inside_weight).sum(dtype=np.float64)) / inside_sum
+    inside_moments[3] = float((corrected_centred[..., 0] * corrected_centred[..., 0] * inside_weight).sum(dtype=np.float64)) / inside_sum
+    del corrected_centred
+
+    # Every low-frequency field lives on one grid `grid_factor` times coarser
+    # than the region: the fine pixels' MOMENTS are box-averaged (never the
+    # moments of averaged pixels), and the box adds `(f² - 1) / 12` px² of
+    # variance that each later sigma subtracts.
+    grid_factor = max(1, int(scale // LOCAL_MATCH_GRID_SIGMA))
+    box_variance = (grid_factor * grid_factor - 1) / 12.0
+
+    def grid_sigma(sigma_px: float) -> float:
+        return float(np.sqrt(max(sigma_px * sigma_px - box_variance, 0.0))) / grid_factor
+
+    # A grid's own reflect-101 border would mirror about the centre of its first
+    # CELL, not about the region's first pixel, which biases the statistics by
+    # several levels along a border the mask touches at a large scale. So the
+    # fine fields are reflect-padded first, by whole cells and by the finest
+    # level's kernel reach, and the grid's own border lies outside that reach.
+    pad = 0 if grid_factor == 1 else grid_factor * (int(np.ceil(4.0 * grid_sigma(scale))) + 1)
+    pad_bottom = pad + (-(height + 2 * pad) % grid_factor)
+    pad_right = pad + (-(width + 2 * pad) % grid_factor)
+    if pad or pad_bottom or pad_right:
+        source_lab_padded = _reflect_pad(source_lab, pad, pad_bottom, pad, pad_right)
+        corrected_padded = _reflect_pad(corrected_lab, pad, pad_bottom, pad, pad_right)
+        weight_padded = _reflect_pad(weight[..., None], pad, pad_bottom, pad, pad_right)[..., 0]
+        inside_padded = _reflect_pad(inside_weight[..., None], pad, pad_bottom, pad, pad_right)[..., 0]
+    else:
+        source_lab_padded, corrected_padded, weight_padded, inside_padded = source_lab, corrected_lab, weight, inside_weight
+    padded_shape = weight_padded.shape
+
+    # Grid channels: 0 valid (outside) weight, 1-3 weighted source Lab, 4
+    # weighted source L², 5 inside weight, 6-8 inside-weighted corrected Lab, 9
+    # inside-weighted corrected L² (each term is reduced on its own to keep the
+    # fine-resolution temporaries to one HxWx3 at a time).
+    s = (source_lab_padded - center) * weight_padded[..., None]
+    source_l = source_lab_padded[..., :1] - center[0]
+    c = (corrected_padded - center) * inside_padded[..., None]
+    corrected_l = corrected_padded[..., :1] - center[0]
+    grid = np.concatenate(
+        (
+            _box_downsample(weight_padded[..., None], grid_factor),
+            _box_downsample(s, grid_factor),
+            _box_downsample(source_l * s[..., :1], grid_factor),
+            _box_downsample(inside_padded[..., None], grid_factor),
+            _box_downsample(c, grid_factor),
+            _box_downsample(corrected_l * c[..., :1], grid_factor),
+        ),
+        axis=2,
+    )
+    del s, source_l, c, corrected_l, source_lab_padded, corrected_padded, weight_padded, inside_padded
+
+    # Target statistics: cascade fill of [L, a, b, L²] from the valid pixels.
+    def fill_level(level: int) -> tuple[np.ndarray, np.ndarray]:
+        # Normalized convolution at `scale * 2**level` and how sure it is. Where
+        # the level has no support at all its ratio means nothing, so it reads
+        # as the global moments instead of 0 (it carries zero confidence there).
+        blurred = _smooth(grid[..., :5], grid_sigma(scale * float(2**level)))
+        level_weight = blurred[..., :1]
+        supported = level_weight > LOCAL_MATCH_MIN_WEIGHT
+        value = np.where(supported, blurred[..., 1:] / np.maximum(level_weight, LOCAL_MATCH_MIN_WEIGHT), global_moments)
+        return value, np.clip(level_weight / LOCAL_MATCH_CONFIDENCE, 0.0, 1.0)
+
+    target, confidence = fill_level(0)
+    for level in range(1, LOCAL_MATCH_LEVELS):
+        level_value, level_confidence = fill_level(level)
+        target = confidence * target + (1.0 - confidence) * level_value
+        confidence = np.maximum(confidence, level_confidence)
+    target = confidence * target + (1.0 - confidence) * global_moments
+    target_mean = target[..., :3]
+    target_std = np.sqrt(np.maximum(target[..., 3] - target_mean[..., 0] ** 2, LOCAL_MATCH_VARIANCE_FLOOR))
+
+    # Local statistics of the corrected image: a normalized convolution at
+    # `scale` over the pixels INSIDE the mask, mirroring the target's
+    # outside-only one. A plain Gaussian would average the generated pixels
+    # near the contour with the (already matching) outside, see only part of
+    # the drift there and leave a rim band 1-2 scales wide under-corrected.
+    blurred_inside = _smooth(grid[..., 5:], grid_sigma(scale))
+    local_weight = blurred_inside[..., :1]
+    local = np.where(
+        local_weight > LOCAL_MATCH_MIN_WEIGHT,
+        blurred_inside[..., 1:] / np.maximum(local_weight, LOCAL_MATCH_MIN_WEIGHT),
+        inside_moments,
+    )
+    local_mean = local[..., :3]
+    local_std = np.sqrt(np.maximum(local[..., 3] - local_mean[..., 0] ** 2, LOCAL_MATCH_VARIANCE_FLOOR))
+
+    # The correction is linear per pixel: L' = L·gain + offset_L, a' = a + shift_a,
+    # b' = b + shift_b, on absolute Lab values (the shared centre is folded in).
+    gain = np.clip(target_std / local_std, *LOCAL_MATCH_GAIN_RANGE)
+    shift = target_mean - local_mean
+    offset_l = target_mean[..., 0] + center[0] - (local_mean[..., 0] + center[0]) * gain
+    fields = np.stack((gain, offset_l, shift[..., 1], shift[..., 2]), axis=2).astype(np.float32)
+    fields = _upsample_linear(fields, grid_factor, padded_shape)[pad : pad + height, pad : pad + width]
+
+    at = fields[inside]
+    lab = corrected_lab[inside]
+    remapped = np.empty_like(lab)
+    remapped[:, 0] = lab[:, 0] * at[:, 0] + at[:, 1]
+    remapped[:, 1] = lab[:, 1] + at[:, 2]
+    remapped[:, 2] = lab[:, 2] + at[:, 3]
+    blended = lab + (remapped - lab) * np.float32(strength)
+    out = corrected.copy()
+    out[inside] = _lab_to_srgb_u8(blended)
+    log.debug(
+        "region imaging: local color match %dx%d, scale %d px, strength %.2f, grid /%d, %.1f ms.",
+        width,
+        height,
+        int(scale_px),
+        strength,
+        grid_factor,
+        (time.perf_counter() - started) * 1000.0,
+    )
+    return np.ascontiguousarray(out)
+
+
+# ---------------------------------------------------------------------
+#  CIELAB (sRGB, D65) and the local match's low-pass
+# ---------------------------------------------------------------------
+#: D65 reference white of the XYZ <-> Lab conversion.
+_D65_WHITE = (0.95047, 1.0, 1.08883)
+
+#: Linear sRGB -> XYZ (D65), rows X, Y, Z.
+_SRGB_TO_XYZ = (
+    (0.4124564, 0.3575761, 0.1804375),
+    (0.2126729, 0.7151522, 0.0721750),
+    (0.0193339, 0.1191920, 0.9503041),
+)
+
+#: XYZ (D65) -> linear sRGB, the inverse of `_SRGB_TO_XYZ`.
+_XYZ_TO_SRGB = (
+    (3.2404542, -1.5371385, -0.4985314),
+    (-0.9692660, 1.8760108, 0.0415560),
+    (0.0556434, -0.2040259, 1.0572252),
+)
+
+#: CIELAB's linear-segment threshold `(6/29)`.
+_LAB_DELTA = 6.0 / 29.0
+
+
+def _srgb_u8_to_lab(rgb: np.ndarray) -> np.ndarray:
+    """HxWx3 uint8 sRGB -> HxWx3 float32 CIELAB (D65): L in 0..100."""
+    import numpy as np
+
+    levels = np.arange(256, dtype=np.float64) / 255.0
+    to_linear = np.where(levels <= 0.04045, levels / 12.92, ((levels + 0.055) / 1.055) ** 2.4).astype(np.float32)
+    linear = to_linear[rgb]
+    matrix = np.asarray(_SRGB_TO_XYZ, dtype=np.float32) / np.asarray(_D65_WHITE, dtype=np.float32)[:, None]
+    xyz = _mix_channels(linear, matrix)
+    f = np.where(
+        xyz > _LAB_DELTA**3,
+        np.cbrt(np.maximum(xyz, 0.0)),
+        xyz / (3.0 * _LAB_DELTA * _LAB_DELTA) + 4.0 / 29.0,
+    ).astype(np.float32)
+    lab = np.empty_like(f)
+    lab[..., 0] = 116.0 * f[..., 1] - 16.0
+    lab[..., 1] = 500.0 * (f[..., 0] - f[..., 1])
+    lab[..., 2] = 200.0 * (f[..., 1] - f[..., 2])
+    return lab
+
+
+def _lab_to_srgb_u8(lab: np.ndarray) -> np.ndarray:
+    """...x3 float CIELAB (D65) -> ...x3 uint8 sRGB, clipped to the gamut and ROUNDED."""
+    import numpy as np
+
+    fy = (lab[..., 0] + 16.0) / 116.0
+    f = np.stack((fy + lab[..., 1] / 500.0, fy, fy - lab[..., 2] / 200.0), axis=-1)
+    xyz = np.where(f > _LAB_DELTA, f * f * f, 3.0 * _LAB_DELTA * _LAB_DELTA * (f - 4.0 / 29.0))
+    xyz = xyz * np.asarray(_D65_WHITE, dtype=np.float32)
+    linear = np.clip(_mix_channels(xyz.astype(np.float32), np.asarray(_XYZ_TO_SRGB, dtype=np.float32)), 0.0, 1.0)
+    encoded = np.where(linear <= 0.0031308, 12.92 * linear, 1.055 * np.power(linear, 1.0 / 2.4) - 0.055)
+    return np.clip(np.rint(encoded * 255.0), 0, 255).astype(np.uint8)
+
+
+def _mix_channels(field: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """`out[..., i] = sum_j matrix[i, j] * field[..., j]` for a ...x3 float32 field and a 3x3 matrix.
+
+    cv2.transform when available; the numpy fallback is three explicit sums,
+    because numpy's `(N, 3) @ (3, 3)` is a poor BLAS shape (~20x slower).
+    """
+    import numpy as np
+
+    try:
+        import cv2
+    except ImportError:
+        pass
+    else:
+        flat = np.ascontiguousarray(field, dtype=np.float32).reshape(-1, 1, 3)
+        return cv2.transform(flat, np.asarray(matrix, dtype=np.float32)).reshape(field.shape)
+    out = np.empty(field.shape, dtype=np.float32)
+    for row in range(3):
+        out[..., row] = field[..., 0] * matrix[row, 0] + field[..., 1] * matrix[row, 1] + field[..., 2] * matrix[row, 2]
+    return out
+
+
+def _smooth(field: np.ndarray, sigma: float) -> np.ndarray:
+    """Gaussian low-pass of an HxWxK float32 field with standard deviation `sigma` (cells).
+
+    A sigma of at least `2 * LOCAL_MATCH_GRID_SIGMA` is applied on a grid
+    `floor(sigma / LOCAL_MATCH_GRID_SIGMA)` times coarser (box down, blur, linear
+    up), so the cost does not grow with sigma; the result is smooth on the scale
+    of the coarse cells, which is what makes the interpolation lossless enough.
+    """
+    import numpy as np
+
+    if sigma <= 0.0:
+        return field
+    factor = int(sigma // LOCAL_MATCH_GRID_SIGMA)
+    if factor < 2:
+        return _gaussian_blur(field, sigma)
+    coarse = _box_downsample(field, factor)
+    coarse_sigma = float(np.sqrt(max(sigma * sigma - (factor * factor - 1) / 12.0, 0.0))) / factor
+    return _upsample_linear(_gaussian_blur(coarse, coarse_sigma), factor, field.shape[:2])
+
+
+def _box_downsample(field: np.ndarray, factor: int) -> np.ndarray:
+    """Mean over `factor` x `factor` blocks of an HxWxK field; the ragged edge is padded by replication."""
+    import numpy as np
+
+    if factor <= 1:
+        return np.ascontiguousarray(field, dtype=np.float32)
+    height, width, channels = field.shape
+    pad_h = -height % factor
+    pad_w = -width % factor
+    if pad_h or pad_w:
+        field = np.pad(field, ((0, pad_h), (0, pad_w), (0, 0)), mode="edge")
+    coarse_h = (height + pad_h) // factor
+    coarse_w = (width + pad_w) // factor
+    try:
+        import cv2
+    except ImportError:
+        pass
+    else:
+        if channels <= 4:
+            # INTER_AREA at an exact integer ratio IS the block mean, ~20x faster.
+            area = cv2.resize(np.ascontiguousarray(field, dtype=np.float32), (coarse_w, coarse_h), interpolation=cv2.INTER_AREA)
+            return np.ascontiguousarray(area.reshape(coarse_h, coarse_w, channels))
+    blocks = field.reshape(coarse_h, factor, coarse_w, factor, channels)
+    return np.ascontiguousarray(blocks.mean(axis=(1, 3), dtype=np.float32))
+
+
+def _upsample_linear(field: np.ndarray, factor: int, shape_hw: tuple[int, int]) -> np.ndarray:
+    """Bilinear inverse of `_box_downsample`: an hxwxK grid back to `shape_hw`.
+
+    Coarse cell `i` is centred on fine coordinate `i·factor + (factor - 1) / 2`
+    (the alignment of `cv2.resize(INTER_LINEAR)` to `(w·factor, h·factor)`, whose
+    output is then cropped to `shape_hw`); coordinates past the outer centres
+    clamp to the edge cell.
+    """
+    import numpy as np
+
+    height, width = shape_hw
+    if factor <= 1:
+        return np.ascontiguousarray(field[:height, :width])
+    coarse_h, coarse_w, channels = field.shape
+    try:
+        import cv2
+    except ImportError:
+        pass
+    else:
+        resized = cv2.resize(field, (coarse_w * factor, coarse_h * factor), interpolation=cv2.INTER_LINEAR)
+        return np.ascontiguousarray(resized.reshape(coarse_h * factor, coarse_w * factor, channels)[:height, :width])
+
+    def axis_weights(fine: int, coarse: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        position = (np.arange(fine, dtype=np.float32) + 0.5) / factor - 0.5
+        position = np.clip(position, 0.0, float(coarse - 1))
+        low = np.floor(position).astype(np.intp)
+        high = np.minimum(low + 1, coarse - 1)
+        return low, high, (position - low).astype(np.float32)
+
+    row_low, row_high, row_t = axis_weights(height, coarse_h)
+    col_low, col_high, col_t = axis_weights(width, coarse_w)
+    rows = field[row_low] * (1.0 - row_t)[:, None, None] + field[row_high] * row_t[:, None, None]
+    out = rows[:, col_low] * (1.0 - col_t)[None, :, None] + rows[:, col_high] * col_t[None, :, None]
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
+def _gaussian_blur(field: np.ndarray, sigma: float) -> np.ndarray:
+    """Separable Gaussian blur of an HxWxK float32 field, reflect-101 border.
+
+    cv2 when available; the numpy fallback builds the kernel cv2 builds for a
+    float image with `ksize=(0, 0)` (`round(8·sigma + 1) | 1` taps) and the same
+    border, so both paths agree to float rounding.
+    """
+    import numpy as np
+
+    if sigma <= 0.0:
+        return field
+    field = np.ascontiguousarray(field, dtype=np.float32)
+    try:
+        import cv2
+    except ImportError:
+        pass
+    else:
+        blurred = cv2.GaussianBlur(field, (0, 0), sigmaX=sigma, sigmaY=sigma, borderType=cv2.BORDER_REFLECT_101)
+        return blurred.reshape(field.shape)
+
+    taps = int(round(8.0 * sigma + 1.0)) | 1
+    radius = taps // 2
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-(offsets * offsets) / (2.0 * sigma * sigma))
+    kernel = (kernel / kernel.sum()).astype(np.float32)
+    out = field
+    for axis in (0, 1):
+        length = out.shape[axis]
+        index = _reflect101_indices(np.arange(-radius, length + radius), length)
+        padded = np.take(out, index, axis=axis)
+        accumulated = np.zeros_like(out)
+        for tap, weight in enumerate(kernel):
+            window = padded[tap : tap + length] if axis == 0 else padded[:, tap : tap + length]
+            accumulated += weight * window
+        out = accumulated
+    return out
+
+
+def _reflect_pad(field: np.ndarray, top: int, bottom: int, left: int, right: int) -> np.ndarray:
+    """Reflect-101 pad an HxWxK field (`cv2.BORDER_REFLECT_101`), at any width — even wider than the field."""
+    import numpy as np
+
+    height, width = field.shape[:2]
+    rows = _reflect101_indices(np.arange(-top, height + bottom), height)
+    cols = _reflect101_indices(np.arange(-left, width + right), width)
+    return np.ascontiguousarray(np.take(np.take(field, rows, axis=0), cols, axis=1))
+
+
+def _reflect101_indices(index: np.ndarray, length: int) -> np.ndarray:
+    """Map any integer index onto 0..length-1 by reflect-101 (`cv2.BORDER_REFLECT_101`), at any distance."""
+    import numpy as np
+
+    if length == 1:
+        return np.zeros_like(index)
+    period = 2 * (length - 1)
+    folded = np.abs(index) % period
+    return np.where(folded >= length, period - folded, folded)
 
 
 def composite_over_region(

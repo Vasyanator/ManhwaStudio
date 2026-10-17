@@ -3,7 +3,8 @@ File: cleaning/tools/ai_editor/engines/flux2_klein/ui/advanced.rs
 
 Purpose:
 «Для экспертов», the last of the panel's three collapsible sections: the generation
-parameters nobody touches between two runs, the mask shaping, and the three model-side
+parameters nobody touches between two runs, the mask shaping (with the colour match and its
+local strength / scale), and the three model-side
 switches that are not memory steps (precision, VAE tiling, fp8 encoder).
 
 Main responsibilities:
@@ -139,6 +140,33 @@ pub(super) fn draw_advanced_section(
                 )
                 .on_hover_text(t!("cleaning.tools.flux2_klein.color_match_hint"))
                 .changed();
+            // The local match refines the global one and the backend applies it only under
+            // it, so both dials close while the checkbox is off; the stored values are kept.
+            // A disabled `WheelSlider` ignores the wheel itself (`egui-docs/04-widgets.md`).
+            let color_match = settings.color_match;
+            ui.indent("cleaning_flux2_klein_color_match_local", |ui| {
+                *changed |= ui
+                    .add_enabled(
+                        color_match,
+                        WheelSlider::new(&mut settings.color_match_local_pct, 0..=FLUX2_COLOR_MATCH_LOCAL_PCT_MAX)
+                            // A unit symbol, not prose: the project's percent dials spell it literally.
+                            .suffix("%")
+                            .text(t!("cleaning.tools.flux2_klein.color_match_local_label")),
+                    )
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.color_match_local_hint"))
+                    .on_disabled_hover_text(t!("cleaning.tools.flux2_klein.color_match_local_hint"))
+                    .changed();
+                *changed |= ui
+                    .add_enabled(
+                        color_match,
+                        WheelSlider::new(&mut settings.color_match_scale_px, FLUX2_COLOR_MATCH_SCALE_MIN..=FLUX2_COLOR_MATCH_SCALE_MAX)
+                            .suffix(t!("cleaning.tab.pixels_suffix"))
+                            .text(t!("cleaning.tools.flux2_klein.color_match_scale_label")),
+                    )
+                    .on_hover_text(t!("cleaning.tools.flux2_klein.color_match_scale_hint"))
+                    .on_disabled_hover_text(t!("cleaning.tools.flux2_klein.color_match_scale_hint"))
+                    .changed();
+            });
 
             ui.separator();
             ui.horizontal(|ui| {

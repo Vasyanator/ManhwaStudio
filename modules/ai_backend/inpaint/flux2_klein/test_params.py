@@ -8,7 +8,8 @@ and the region contract of `validate_region_size`.
 Main responsibilities:
 - verify every enum/path error and every numeric clamp of the wire contract,
   the refusal by name of every field of the retired placement wire, and the
-  opt-in `text_attention_in_mask` that `whole_region` forces off;
+  opt-in `text_attention_in_mask` and the local color match fields that
+  `whole_region` forces off;
 - verify a region that the pipeline would silently resize or crop is refused
   with concrete numbers instead;
 - verify `effective_steps` matches what the pipeline will actually run.
@@ -83,6 +84,8 @@ class NormalizeParamsTests(_TempTreeCase):
         self.assertEqual(out["mask_feather_px"], 12)
         self.assertEqual(out["max_sequence_length"], 512)
         self.assertTrue(out["color_match"])
+        self.assertEqual(out["color_match_local_pct"], 60)
+        self.assertEqual(out["color_match_scale_px"], 24)
         self.assertFalse(out["whole_region"])
         self.assertFalse(out["text_encoder_fp8"])
         self.assertIsNone(out["seed"])
@@ -111,6 +114,8 @@ class NormalizeParamsTests(_TempTreeCase):
                 "mask_dilate_px",
                 "mask_feather_px",
                 "color_match",
+                "color_match_local_pct",
+                "color_match_scale_px",
                 "whole_region",
                 "max_sequence_length",
                 "text_attention_in_mask",
@@ -141,6 +146,24 @@ class NormalizeParamsTests(_TempTreeCase):
             )
         self.assertFalse(out["text_attention_in_mask"])
         self.assertTrue(any("text_attention_in_mask" in line for line in captured.output))
+
+    def test_the_local_color_match_fields_clamp_to_their_ranges(self) -> None:
+        for raw, expected in ((-5, 0), (0, 0), (35, 35), (100, 100), (250, 100), ("x", 60), (None, 60), (True, 60)):
+            with self.subTest(pct=raw):
+                self.assertEqual(svc.normalize_flux2_klein_params(self.params(color_match_local_pct=raw))["color_match_local_pct"], expected)
+        for raw, expected in ((1, 8), (8, 8), (40, 40), (96, 96), (500, 96), (None, 24)):
+            with self.subTest(scale=raw):
+                self.assertEqual(svc.normalize_flux2_klein_params(self.params(color_match_scale_px=raw))["color_match_scale_px"], expected)
+
+    def test_whole_region_switches_the_local_color_match_off_and_says_so(self) -> None:
+        with self.assertLogs(svc.log, level="INFO") as captured:
+            out = svc.normalize_flux2_klein_params(
+                self.params(whole_region=True, color_match=False, color_match_local_pct=80, color_match_scale_px=40)
+            )
+        self.assertEqual(out["color_match_local_pct"], 0)
+        # No "off" value exists for the scale; it is left as sent and never read.
+        self.assertEqual(out["color_match_scale_px"], 40)
+        self.assertTrue(any("color_match_local_pct" in line for line in captured.output))
 
     def test_numeric_clamping(self) -> None:
         out = svc.normalize_flux2_klein_params(

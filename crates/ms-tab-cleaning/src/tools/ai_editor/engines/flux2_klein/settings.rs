@@ -300,7 +300,17 @@ pub(super) struct Flux2KleinSettings {
     pub(super) encoder_on_cpu: bool,
     pub(super) mask_dilate_px: u32,
     pub(super) mask_feather_px: u32,
+    /// Global colour match of the generated region to the ring outside the mask.
     pub(super) color_match: bool,
+    /// «Сила локальной подгонки», percent 0..=100: the low-frequency Lab mean/contrast match
+    /// inside the mask the backend applies AFTER the global one; `0` = global match only.
+    /// Effective only with `color_match` (the backend ignores it otherwise, and so does a
+    /// whole-region run). Default 60, also for a file without the field.
+    pub(super) color_match_local_pct: u32,
+    /// «Масштаб локальной подгонки»: the Gaussian sigma, pixels, of the finest
+    /// level of that local match's averaging (its blur radius), 8..=96.
+    /// Default 24, also for a file without the field.
+    pub(super) color_match_scale_px: u32,
     /// «Внимание только к маске»: the prompt acts only on the masked area, so the model
     /// cannot apply the instruction to a matching object OUTSIDE the mask.
     ///
@@ -360,6 +370,10 @@ impl Default for Flux2KleinSettings {
             // cleaner again (+0.3%) but gives up too much of it.
             mask_feather_px: 12,
             color_match: true,
+            // The backend's defaults for the local match (a document without the fields loads
+            // them through the struct-level `#[serde(default)]`).
+            color_match_local_pct: 60,
+            color_match_scale_px: 24,
             // On: a prompt that may also act outside the mask can edit a matching object
             // the user never selected, and painting a mask says "only here".
             text_attention_in_mask: true,
@@ -428,6 +442,8 @@ impl Flux2KleinSettings {
             mask_dilate_px: self.mask_dilate_px.min(FLUX2_DILATE_MAX),
             mask_feather_px: self.mask_feather_px.min(FLUX2_FEATHER_MAX),
             color_match: self.color_match,
+            color_match_local_pct: self.color_match_local_pct.min(FLUX2_COLOR_MATCH_LOCAL_PCT_MAX),
+            color_match_scale_px: self.color_match_scale_px.clamp(FLUX2_COLOR_MATCH_SCALE_MIN, FLUX2_COLOR_MATCH_SCALE_MAX),
             text_attention_in_mask: self.text_attention_in_mask,
         }
     }
@@ -578,6 +594,11 @@ impl Flux2KleinSettings {
             "mask_dilate_px": self.mask_dilate_px,
             "mask_feather_px": self.mask_feather_px,
             "color_match": self.color_match,
+            // Sent as stored whatever `color_match` and `whole_region` are, like `color_match`
+            // itself: the backend applies the local match only under the global one and never
+            // in a whole-region run.
+            "color_match_local_pct": self.color_match_local_pct,
+            "color_match_scale_px": self.color_match_scale_px,
             "text_attention_in_mask": text_attention_in_mask,
             // Pinned, not a setting: see `FLUX2_MAX_SEQ`. The field stays on the wire
             // because the backend still reads it.
@@ -751,6 +772,8 @@ mod tests {
         assert_eq!(settings.mask_dilate_px, 16);
         assert_eq!(settings.mask_feather_px, 12);
         assert!(settings.color_match);
+        assert_eq!(settings.color_match_local_pct, 60);
+        assert_eq!(settings.color_match_scale_px, 24);
         assert_eq!(settings.step_choice(), StepChoice::default(), "«Авто» / «Авто»");
         // Quantizing the text encoder is never defaulted on.
         assert!(!settings.text_encoder_fp8);
@@ -768,6 +791,8 @@ mod tests {
             strength: 0.0,
             mask_dilate_px: 999,
             mask_feather_px: 999,
+            color_match_local_pct: 101,
+            color_match_scale_px: 97,
             vram_step: "turbo".to_string(),
             ram_step: " keep ".to_string(),
             dtype: "nonsense".to_string(),
@@ -782,6 +807,11 @@ mod tests {
         assert!((norm.strength - FLUX2_STRENGTH_MIN).abs() < f32::EPSILON);
         assert_eq!(norm.mask_dilate_px, FLUX2_DILATE_MAX);
         assert_eq!(norm.mask_feather_px, FLUX2_FEATHER_MAX);
+        assert_eq!(norm.color_match_local_pct, FLUX2_COLOR_MATCH_LOCAL_PCT_MAX);
+        assert_eq!(norm.color_match_scale_px, FLUX2_COLOR_MATCH_SCALE_MAX);
+        let small = Flux2KleinSettings { color_match_scale_px: 0, color_match_local_pct: 0, ..Flux2KleinSettings::default() }.normalized();
+        assert_eq!(small.color_match_scale_px, FLUX2_COLOR_MATCH_SCALE_MIN);
+        assert_eq!(small.color_match_local_pct, 0, "0 % is a valid value: the global match only");
         assert_eq!(norm.vram_step, "auto", "an unknown step id normalizes to «Авто»");
         assert_eq!(norm.ram_step, "keep", "a padded known id is kept");
         assert_eq!(norm.dtype, "bfloat16");
@@ -1017,6 +1047,33 @@ mod tests {
         let round: Flux2KleinSettings =
             serde_json::from_str(&serde_json::to_string(&off).expect("serializes")).expect("round-trips");
         assert!(!round.text_attention_in_mask, "an explicit `false` is kept");
+    }
+
+    /// The local colour match: a document without the two fields loads the backend's defaults
+    /// (60 %, 24 px), explicit values survive a round trip, and both travel as stored in the run
+    /// `params` (whole-region included — the backend switches the match off there) and in the
+    /// forecast's.
+    #[test]
+    fn local_color_match_defaults_and_reaches_the_wire() {
+        let old = loaded_settings(&json!({ "prompt": "remove the text", "color_match": true }));
+        assert_eq!((old.color_match_local_pct, old.color_match_scale_px), (60, 24), "a document without the fields reads the defaults");
+        let settings = Flux2KleinSettings { color_match_local_pct: 35, color_match_scale_px: 48, ..runnable_settings() };
+        let round: Flux2KleinSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).expect("serializes")).expect("round-trips");
+        assert_eq!((round.color_match_local_pct, round.color_match_scale_px), (35, 48), "explicit values are kept");
+        let normalized = settings.normalized();
+        for whole_region in [false, true] {
+            let params = normalized.to_params(whole_region);
+            assert_eq!(params["color_match_local_pct"], json!(35), "run params");
+            assert_eq!(params["color_match_scale_px"], json!(48), "run params");
+        }
+        let forecast = normalized.to_profiles_params(true);
+        assert_eq!(forecast["color_match_local_pct"], json!(35), "forecast params");
+        assert_eq!(forecast["color_match_scale_px"], json!(48), "forecast params");
+        let out_of_range = Flux2KleinSettings { color_match_local_pct: 500, color_match_scale_px: 2, ..runnable_settings() };
+        let params = out_of_range.normalized().to_params(false);
+        assert_eq!(params["color_match_local_pct"], json!(100), "only the clamped value reaches the wire");
+        assert_eq!(params["color_match_scale_px"], json!(8), "only the clamped value reaches the wire");
     }
 
     /// «Энкодер на CPU» defaults ON — for a fresh document AND for one written before the
@@ -1352,12 +1409,12 @@ mod tests {
         // Key order (`serde_json` without `preserve_order`). All are ADDITIVE: the variant
         // came with the second engine, «Внимание только к маске» with the pinned run
         // options, the two step axes with the large-model manager and «Энкодер на CPU» with
-        // the encoder placement; a document without any of them still loads
-        // (`#[serde(default)]`).
+        // the encoder placement, the two local colour-match values with the local match; a
+        // document without any of them still loads (`#[serde(default)]`).
         assert_eq!(
             added,
-            ["encoder_on_cpu", "ram_step", "text_attention_in_mask", "variant", "vram_step"],
-            "only the variant, the run option, the two step axes and the encoder placement were added"
+            ["color_match_local_pct", "color_match_scale_px", "encoder_on_cpu", "ram_step", "text_attention_in_mask", "variant", "vram_step"],
+            "only the variant, the run option, the two step axes, the encoder placement and the local colour match were added"
         );
         for retired in ["placement", "low_cpu_mem_usage", "vae_slicing", "unload_transformer_before_vae", "unload_text_encoder_after_encode"] {
             assert!(!object.contains_key(retired), "the retired `{retired}` must not be written back");

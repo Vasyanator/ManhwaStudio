@@ -228,6 +228,15 @@ pub(super) struct Flux3KleinSettings {
     pub(super) mask_feather_px: u32,
     /// Match the generated colours to the ring outside the mask (ineffective under a whole-region run).
     pub(super) color_match: bool,
+    /// «Сила локальной подгонки», percent 0..=100: the low-frequency Lab mean/contrast match
+    /// inside the mask the backend applies AFTER the global one; `0` = global match only.
+    /// Effective only with `color_match` (and, like it, never under a whole-region run).
+    /// Default 60, also for a document without the field.
+    pub(super) color_match_local_pct: u32,
+    /// «Масштаб локальной подгонки»: the Gaussian sigma, pixels, of the finest
+    /// level of that local match's averaging (its blur radius), 8..=96.
+    /// Default 24, also for a document without the field.
+    pub(super) color_match_scale_px: u32,
     /// «Видеопамять»: the `VramStep` wire id; an unknown id reads as «Авто».
     pub(super) vram_step: String,
     /// «Оперативная память»: the `RamStep` wire id; an unknown id reads as «Авто».
@@ -254,6 +263,8 @@ impl Default for Flux3KleinSettings {
             reference_max_side: 0,
             mask_feather_px: FLUX3_DEFAULT_FEATHER,
             color_match: true,
+            color_match_local_pct: FLUX3_DEFAULT_COLOR_MATCH_LOCAL_PCT,
+            color_match_scale_px: FLUX3_DEFAULT_COLOR_MATCH_SCALE,
             vram_step: VramStep::Auto.wire().to_string(),
             ram_step: RamStep::Auto.wire().to_string(),
             encoder_on_cpu: true,
@@ -280,6 +291,8 @@ impl Flux3KleinSettings {
             reference_max_side: if FLUX3_REFERENCE_CAP_SIDES.contains(&self.reference_max_side) { self.reference_max_side } else { 0 },
             mask_feather_px: self.mask_feather_px.min(FLUX3_FEATHER_MAX),
             color_match: self.color_match,
+            color_match_local_pct: self.color_match_local_pct.min(FLUX3_COLOR_MATCH_LOCAL_PCT_MAX),
+            color_match_scale_px: self.color_match_scale_px.clamp(FLUX3_COLOR_MATCH_SCALE_MIN, FLUX3_COLOR_MATCH_SCALE_MAX),
             vram_step: choice.vram.wire().to_string(),
             ram_step: choice.ram.wire().to_string(),
             encoder_on_cpu: self.encoder_on_cpu,
@@ -359,6 +372,10 @@ impl Flux3KleinSettings {
             "encoder_on_cpu": self.encoder_on_cpu,
             "mask_feather_px": self.mask_feather_px,
             "color_match": self.color_match,
+            // Sent as stored, like `color_match`: the backend settles both under `whole_region`
+            // and applies the local match only under the global one.
+            "color_match_local_pct": self.color_match_local_pct,
+            "color_match_scale_px": self.color_match_scale_px,
             "whole_region": whole_region,
         })
     }
@@ -442,6 +459,7 @@ mod tests {
         assert_eq!(settings.source_mode(), Flux3SourceMode::Download);
         assert_eq!(settings.mask_feather_px, 12);
         assert!(settings.color_match);
+        assert_eq!((settings.color_match_local_pct, settings.color_match_scale_px), (60, 24));
         assert!(!settings.prompt.trim().is_empty());
         assert_eq!(settings.normalized(), settings, "the defaults are already normal");
     }
@@ -453,6 +471,7 @@ mod tests {
         let loaded = settings_from_json(&json!({ "steps": 8, "prompt": "  ", "some_future_key": 1 })).expect("loads");
         assert_eq!(loaded.steps, 8);
         assert!(loaded.encoder_on_cpu, "a document without the flag keeps the encoder on the CPU");
+        assert_eq!((loaded.color_match_local_pct, loaded.color_match_scale_px), (60, 24), "a document without the local match reads its defaults");
         assert_eq!(loaded.prompt, FLUX3_DEFAULT_PROMPT);
         assert_eq!(loaded.format, "fp8r");
         assert!(settings_from_json(&json!(["not", "an", "object"])).is_err());
@@ -471,6 +490,8 @@ mod tests {
             fp8_compute: "magic".to_string(),
             reference_max_side: 333,
             mask_feather_px: 99,
+            color_match_local_pct: 101,
+            color_match_scale_px: 97,
             vram_step: "warp".to_string(),
             ram_step: "".to_string(),
             ..Flux3KleinSettings::default()
@@ -484,6 +505,11 @@ mod tests {
         assert_eq!(wild.fp8_compute, "auto");
         assert_eq!(wild.reference_max_side, 0);
         assert_eq!(wild.mask_feather_px, FLUX3_FEATHER_MAX);
+        assert_eq!(wild.color_match_local_pct, FLUX3_COLOR_MATCH_LOCAL_PCT_MAX);
+        assert_eq!(wild.color_match_scale_px, FLUX3_COLOR_MATCH_SCALE_MAX);
+        let small = Flux3KleinSettings { color_match_local_pct: 0, color_match_scale_px: 0, ..Flux3KleinSettings::default() }.normalized();
+        assert_eq!(small.color_match_local_pct, 0, "0 % is a valid value: the global match only");
+        assert_eq!(small.color_match_scale_px, FLUX3_COLOR_MATCH_SCALE_MIN);
         assert_eq!((wild.vram_step.as_str(), wild.ram_step.as_str()), ("auto", "auto"));
         assert_eq!(Flux3KleinSettings { steps: 0, ..Flux3KleinSettings::default() }.normalized().steps, FLUX3_STEPS_MIN);
     }
@@ -493,9 +519,10 @@ mod tests {
     /// the types it checks: an extra key would turn every call into a refusal.
     #[test]
     fn the_params_carry_exactly_the_backend_fields() {
-        const BACKEND_FIELDS: [&str; 15] = [
+        const BACKEND_FIELDS: [&str; 17] = [
             "source_root", "format", "encoder_mode", "ae_dtype", "fp8_compute", "reference_max_pixels", "prompt", "steps", "seed",
-            "vram_step", "ram_step", "encoder_on_cpu", "mask_feather_px", "color_match", "whole_region",
+            "vram_step", "ram_step", "encoder_on_cpu", "mask_feather_px", "color_match", "color_match_local_pct",
+            "color_match_scale_px", "whole_region",
         ];
         let params = Flux3KleinSettings::default().normalized().to_params(false);
         let mut keys: Vec<&str> = params.as_object().expect("an object").keys().map(String::as_str).collect();
@@ -511,6 +538,8 @@ mod tests {
         assert_eq!(params["reference_max_pixels"], Value::Null);
         assert_eq!(params["whole_region"], json!(false));
         assert_eq!(params["steps"], json!(16));
+        assert_eq!(params["color_match_local_pct"], json!(60));
+        assert_eq!(params["color_match_scale_px"], json!(24));
     }
 
     /// Each expert switch reaches its wire value; the seed travels as a number when pinned.
@@ -524,10 +553,14 @@ mod tests {
             reference_max_side: 768,
             seed: Some(u64::MAX),
             encoder_on_cpu: false,
+            color_match_local_pct: 35,
+            color_match_scale_px: 48,
             ..Flux3KleinSettings::default()
         }
         .normalized();
         let params = settings.to_params(true);
+        assert_eq!(params["color_match_local_pct"], json!(35), "sent as stored under whole_region too");
+        assert_eq!(params["color_match_scale_px"], json!(48));
         assert_eq!(params["encoder_mode"], json!("vl_refs"));
         assert_eq!(params["ae_dtype"], json!("bfloat16"));
         assert_eq!(params["fp8_compute"], json!("dequant"));
@@ -555,7 +588,7 @@ mod tests {
     /// A round trip through the file shape keeps every field, the optional seed included.
     #[test]
     fn the_document_round_trips() {
-        let settings = Flux3KleinSettings { seed: Some(42), vl_refs: true, reference_max_side: 512, ..Flux3KleinSettings::default() };
+        let settings = Flux3KleinSettings { seed: Some(42), vl_refs: true, reference_max_side: 512, color_match_local_pct: 0, color_match_scale_px: 96, ..Flux3KleinSettings::default() };
         let text = serde_json::to_string(&settings).expect("serializes");
         let back = settings_from_json(&serde_json::from_str(&text).expect("json")).expect("loads");
         assert_eq!(back, settings);

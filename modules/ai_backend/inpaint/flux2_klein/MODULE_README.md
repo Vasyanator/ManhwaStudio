@@ -200,7 +200,9 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
   `_component_action_locked`); what a phase DOES with the modules (encode, warm-up, decode,
   device check) is `pipeline.py`.
 - To change the prompt-cache file format or the library layout, see `prompt_cache.py`.
-- To change the composite, the color match, or the mask morphology, see `../region_imaging.py`
+- To change the composite, the color match (global and local; its params are normalized in
+  `params.py`, applied in `service.py` against the dilated latent mask), or the mask morphology,
+  see `../region_imaging.py`
   (shared with FLUX.3 klein).
 - To change which token pairs `text_attention_in_mask` blocks, the token grid, or the mask's
   dtype/padding/size, see `attention.py` — and keep `text_attention_mask_bytes` the ONE formula

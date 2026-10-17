@@ -79,7 +79,12 @@ use serde_json::{Map, Value, json};
 /// `inpaint.flux3_klein`; «Энкодер на CPU»: optional `encoder_on_cpu` (bool, absent = true) in
 /// the `inpaint.flux2_klein*` params, the FLUX.3 params and their `large_models.profiles` params
 /// (the text encoder then runs on the CPU at every VRAM step).
-pub const PROTOCOL_VERSION: u32 = 15;
+/// 16: local colour match in the FLUX.2 klein and FLUX.3 klein region editors: optional
+/// `color_match_local_pct` (integer 0..=100, absent = 60; 0 = global match only) and
+/// `color_match_scale_px` (integer 8..=96, absent = 24) in the `inpaint.flux2_klein*` and
+/// `inpaint.flux3_klein*` params (the low-frequency Lab mean/contrast match inside the mask,
+/// applied after the global `color_match` and only under it).
+pub const PROTOCOL_VERSION: u32 = 16;
 
 // ============================================================================
 // FRAME SIZE GUARDS

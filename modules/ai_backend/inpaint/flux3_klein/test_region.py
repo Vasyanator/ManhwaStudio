@@ -5,6 +5,7 @@ Purpose:
 Unit tests of `region.py` over the real service and manager
 (`_service_test_fixtures.ServiceRig`: stand-in models on the CPU, the stub AE
 decodes flat grey): outside the mask the answer is byte-identical to the region,
+the local color match called with its params and the painted mask,
 `whole_region` (a solid mask required, the whole region regenerated),
 reference order (the region is #0), `seed: null` drawn and echoed, the
 progress frames (stable `stage` ids), cancellation at a phase begin and at a
@@ -83,6 +84,18 @@ class RegionTests(unittest.TestCase):
         self.assertIsNotNone(answer["vram_step_effective"])
         self.assertFalse(answer["degraded"])
         self.assertIsNone(answer["degrade_reason"])
+
+    def test_the_local_color_match_follows_its_params_and_the_painted_mask(self) -> None:
+        with patch.object(region, "match_color_local", wraps=region.match_color_local) as spy:
+            answer = self._edit(color_match_local_pct=35, color_match_scale_px=40)
+            self._edit(color_match_local_pct=0)
+            self._edit(color_match=False)
+        self.assertEqual(spy.call_count, 1)
+        args, kwargs = spy.call_args
+        self.assertEqual(kwargs, {"strength": 0.35, "scale_px": 40})
+        self.assertTrue(np.array_equal(args[2], _mask()))
+        outside = _mask() == 0
+        self.assertTrue(np.array_equal(self._decoded(answer)[outside], self.region[outside]))
 
     def test_whole_region_needs_a_solid_mask_and_regenerates_everything(self) -> None:
         with self.assertRaises(ValueError):

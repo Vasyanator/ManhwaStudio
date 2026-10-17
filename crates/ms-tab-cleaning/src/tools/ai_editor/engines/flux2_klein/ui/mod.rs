@@ -1098,6 +1098,31 @@ mod tests {
         }
     }
 
+    /// The two local colour-match dials («Сила» / «Масштаб локальной подгонки») explain
+    /// themselves only on hover — and the strength one warns that too high a value amplifies
+    /// noise — so both reference catalogs (`en`, `ru`) carry every one of their keys; `es` /
+    /// `fr` / `pt` fall back to `en`.
+    #[test]
+    fn the_reference_catalogs_carry_the_local_color_match_keys() {
+        const KEYS: [&str; 4] = [
+            "cleaning.tools.flux2_klein.color_match_local_label",
+            "cleaning.tools.flux2_klein.color_match_local_hint",
+            "cleaning.tools.flux2_klein.color_match_scale_label",
+            "cleaning.tools.flux2_klein.color_match_scale_hint",
+        ];
+        for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
+            let catalog: Value = serde_json::from_str(source)
+                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
+            for key in KEYS {
+                let value = catalog
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("locale `{tag}` lacks the key `{key}`"));
+                assert!(!value.trim().is_empty(), "locale `{tag}`: `{key}` is empty");
+            }
+        }
+    }
+
     /// The memory section's own lines: the retired preset/placement/estimate vocabulary is
     /// gone from both reference catalogs, and the new lines carry their placeholders.
     #[test]

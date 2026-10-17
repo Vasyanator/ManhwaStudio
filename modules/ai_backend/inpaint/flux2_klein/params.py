@@ -89,6 +89,18 @@ MAX_REGION_PIXELS = 1024 * 1024
 #: Extreme aspect ratios collapse one latent axis to a handful of tokens.
 MAX_REGION_ASPECT_RATIO = 8.0
 
+#: Default strength, in percent, of the local color match (0 = global only).
+#: 60, not 100: measured on a dark page (`region_imaging.match_color_local`),
+#: full strength brings the statistics closest to the surroundings but its
+#: lightness gain turns the noise of the darkest areas into crunchy specks.
+DEFAULT_COLOR_MATCH_LOCAL_PCT = 60
+
+#: Default and range of the local color match's scale: the Gaussian sigma of
+#: its finest level, in pixels (not a window side).
+DEFAULT_COLOR_MATCH_SCALE_PX = 24
+MIN_COLOR_MATCH_SCALE_PX = 8
+MAX_COLOR_MATCH_SCALE_PX = 96
+
 
 # =====================================================================
 #  The text encoder's dtype
@@ -153,10 +165,10 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     `status` still reports the path and its `exists: false` flag, so nothing
     about a mistyped path is hidden.
 
-    `whole_region=True` is a MODE, not a hint, and it settles three other keys on
+    `whole_region=True` is a MODE, not a hint, and it settles four other keys on
     the caller's behalf (`mask_dilate_px` -> 0, `color_match` -> False,
-    `text_attention_in_mask` -> False); see `_whole_region_overrides` for why
-    none is meaningful there.
+    `color_match_local_pct` -> 0, `text_attention_in_mask` -> False); see
+    `_whole_region_overrides` for why none is meaningful there.
 
     Returns a dict with every key of the wire contract present.
 
@@ -226,6 +238,21 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
         # keeping 81-84% of the edit, where 16 keeps only 75-79%.
         "mask_feather_px": _clamp_int(merged.get("mask_feather_px"), default=12, low=0, high=32),
         "color_match": _to_bool(merged.get("color_match"), True),
+        # The local CIELAB match after the global one (`region_imaging.
+        # match_color_local`), effective only while `color_match` is: its
+        # strength in percent (0 = the global match alone) and its Gaussian scale.
+        "color_match_local_pct": _clamp_int(
+            merged.get("color_match_local_pct"),
+            default=DEFAULT_COLOR_MATCH_LOCAL_PCT,
+            low=0,
+            high=100,
+        ),
+        "color_match_scale_px": _clamp_int(
+            merged.get("color_match_scale_px"),
+            default=DEFAULT_COLOR_MATCH_SCALE_PX,
+            low=MIN_COLOR_MATCH_SCALE_PX,
+            high=MAX_COLOR_MATCH_SCALE_PX,
+        ),
         "max_sequence_length": _clamp_int(
             merged.get("max_sequence_length"), default=512, low=64, high=512
         ),
@@ -266,6 +293,10 @@ def _whole_region_overrides(normalized: dict[str, Any]) -> dict[str, Any]:
       computing it from an empty sample is a division by zero. Neither is a
       correction, so the match is switched off and `mask_feather_px` — which is
       NOT switched off — is what joins the regenerated region to the page.
+    - **`color_match_local_pct` -> 0.** The local match samples the same ring
+      (grown by a margin) and is a refinement of the global one, so it goes with
+      it. `color_match_scale_px` has no "off" value and is left as sent: with
+      the strength at zero it is never read.
 
     - **`text_attention_in_mask` -> False.** It confines the prompt to the
       tokens inside the mask, and a solid mask has every token inside: the
@@ -279,6 +310,7 @@ def _whole_region_overrides(normalized: dict[str, Any]) -> dict[str, Any]:
     overrides: dict[str, Any] = {
         "mask_dilate_px": 0,
         "color_match": False,
+        "color_match_local_pct": 0,
         "text_attention_in_mask": False,
     }
     contradicted = sorted(key for key, value in overrides.items() if normalized[key] != value)

@@ -97,9 +97,9 @@ Every service follows the same shape and is safe to copy from when adding anothe
   resident model, takes no lease and has no `AppState` field — it is a module of functions the
   handler imports lazily. See the FLUX.2 klein download section.
 - `region_imaging.py`: the region editors' pixel work (FLUX.2 klein, FLUX.3 klein): strict L8 mask
-  and RGB decode, the solid-mask check, the color match outside the mask, the inward-feathered
-  composite (byte-identical outside the mask) and the mask morphology. Tests:
-  `test_region_imaging.py`.
+  and RGB decode, the solid-mask check, the color match (global mean/std outside the mask, then
+  the optional local CIELAB match), the inward-feathered composite (byte-identical outside the
+  mask) and the mask morphology. Tests: `test_region_imaging.py`.
 - `test_lease_hints.py`: the owner and the file-size hint each small-pool service hands
   `begin_model_use` (reuses `test_lease_protocol.py`'s case builders, temp checkpoint files).
 - `test_health_during_load.py`: `health()` answers while AOT's lock section loads and infers, and
@@ -231,7 +231,7 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   otherwise surface as a partial edit while the UI said no mask was needed. The mode settles three
   other params in `normalize_flux2_klein_params` (`_whole_region_overrides`, which logs whenever it
   overrides something the caller asked for): `mask_dilate_px` → 0, because a full mask has nothing
-  to grow into, and `color_match` → `False`, because `region_imaging.match_color_outside_mask` takes its
+  to grow into, and `color_match` → `False` (with it `color_match_local_pct` → 0), because `region_imaging.match_color_outside_mask` takes its
   statistics from the ring OUTSIDE the mask and here that ring is empty — computing it from the
   changed pixels would force the edit's own mean and standard deviation back onto the original's,
   i.e. undo the edit, and computing it from an empty sample is a division by zero. `mask_feather_px`
@@ -297,6 +297,30 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   pipeline call carries no `image_reference` key at all. The memory guard counts its condition
   tokens in the denoise (the spec's denoise work: the region's token count again), and so does
   `large_models.profiles` when the request's `shape.references` names it.
+- **The color match is two steps, both owned by `region_imaging`, the same for FLUX.2 and FLUX.3
+  klein** (`color_match`, then `color_match_local_pct` / `color_match_scale_px`; FLUX.2 passes the
+  dilated latent mask, FLUX.3 the painted one). (1) `match_color_outside_mask`: per-channel RGB
+  mean/std over the pixels outside the mask grown by `COLOR_MATCH_MARGIN_PX` (6), so a text outline
+  or halo at the contour does not bias it; a ring too small for the margin falls back to the mask
+  itself, one too small for that skips. It fixes the VAE's tone shift of the whole window — a gain
+  + offset per channel is all that shift needs (richer fits measured no better). (2)
+  `match_color_local`: what the model PAINTED drifts away from the surroundings towards the mask
+  centre (the fill averages the scene), which no global curve can fix. In CIELAB, at
+  `s = color_match_scale_px` (the Gaussian SIGMA of the finest level, not a window side):
+  lightness mean and contrast (gain clipped to 0.8..1.4), a/b mean shift only, blended at
+  `strength`. The GENERATED image's local statistics are a normalized convolution over the
+  pixels INSIDE the mask only — a deliberate departure from the spec's plain Gaussian, whose window
+  at the contour mixes the drift with the matching outside, sees about half of it and left an
+  under-corrected rim band 1-2 scales wide (a seam users saw along the contour). The target
+  statistics come from the original outside the mask (+3 px) carried inwards by a cascade of normalized convolutions at `s..16s` — one scale has no valid pixel in
+  reach at the centre of a wide mask and divides by ~0 — terminated by the valid-weighted GLOBAL
+  moments of the original, because cv2 truncates each Gaussian at 4 sigma and beyond ~67·s from
+  the ring no level has any weight (without it the far interior got no correction and a 0.8
+  contrast cut, with a seam where the support ended). Its fields are computed on a grid
+  `s // 4` times coarser (bounded cost: ~0.4 s for 2048x2048) from fine fields reflect-padded by
+  the finest kernel's reach (a grid's own border mirrors about its first cell, not pixel 0), and it
+  rewrites only pixels inside the mask. The global step rounds like the composite. Default
+  strength 60 %: full strength brings the statistics closest to the ring but its lightness gain turns dark-area noise into specks. Off (0) under `whole_region`.
 - **The region's border is a mask contour.** `region_imaging.mask_distance_inside` pads the mask with a ring of
   zeros before measuring, because the region is a WINDOW onto a larger page and the pixels past its
   edge belong to that page, which the request may not change. Without the ring neither backend sees
