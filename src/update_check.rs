@@ -8,20 +8,22 @@ runs in the installer's update window after the main window has closed.
 
 Key functions:
 - `spawn(force_update_available)`: starts the named worker and returns the one-shot receiver.
-- `fetch_latest_release_tag()`: the newest release tag that carries the release archive.
+- `fetch_latest_release_tag()`: the tag of the newest updatable release.
 
 Notes:
-The release comparison is `ms_config::version_format::is_remote_newer` and the release feed
-(URL, archive asset name) is `ms_installer::update`'s; this file owns neither.
+The release comparison is `ms_config::version_format::is_remote_newer`; the release feed URL
+and the choice of the release (`ms_installer::release::select_app_release`: archive, this
+platform's binary and `SHA256SUMS`, the same rule the update window applies) are
+`ms_installer::release`'s; this file owns neither, only its own lighter request policy.
 Native only (`ms_download::fetch_small`, OS threads). The shell (`src/shell/`) starts it on the first launcher entry
-and caches the answer for every later entry. The comparison runs on `CARGO_PKG_VERSION`, never
-on the git-derived display version (see the version split in `src/MODULE_README.md`).
+and caches the answer for every later entry. The local side is `MS_APP_VERSION`, the one
+program version (see the version contract in `crates/ms-config/src/version_format.rs`).
 */
 
 use crate::launcher::state::UpdateNotification;
 use crate::runtime_log;
 use crate::version_format::is_remote_newer;
-use ms_installer::update::{APP_RELEASES_API, APP_ZIP_ASSET_NAME};
+use ms_installer::release::{APP_RELEASES_API, select_app_release};
 use ms_download::resumable::{FetcherConfig, RetryPolicy, UreqFetcher};
 use ms_download::{SmallRequest, fetch_small};
 use ms_thread as thread;
@@ -40,25 +42,21 @@ const RELEASES_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// receiver then reports `Disconnected`, which the caller treats as "no update".
 pub(crate) fn spawn(force_update_available: bool) -> mpsc::Receiver<Option<UpdateNotification>> {
     let (tx, rx) = mpsc::channel();
-    // Two values, on purpose. The comparison against a GitHub release tag runs on the
-    // plain `CARGO_PKG_VERSION`, so a development build is never mistaken for a newer
-    // release than the tag it was built from; the notification is shown to a person and
-    // therefore carries the extended, git-derived string.
-    let local_version = env!("CARGO_PKG_VERSION").to_string();
-    let display_version = env!("MS_APP_VERSION").to_string();
+    // The one program version: compared with the release tag and shown in the notice.
+    let local_version = env!("MS_APP_VERSION").to_string();
 
     let spawn_result = thread::Builder::new()
         .name("startup-version-check".to_string())
         .spawn(move || {
             let notification = if force_update_available {
-                Some(UpdateNotification { local_version: display_version, remote_version: "test-update".to_string() })
+                Some(UpdateNotification { local_version, remote_version: "test-update".to_string() })
             } else {
                 match fetch_latest_release_tag() {
                     Ok(remote_version) if is_remote_newer(&local_version, &remote_version) => {
-                        Some(UpdateNotification { local_version: display_version, remote_version })
+                        Some(UpdateNotification { local_version, remote_version })
                     }
                     Ok(remote_version) => {
-                        runtime_log::log_info(format!("[startup-version-check] no update: local={display_version}, remote={remote_version}"));
+                        runtime_log::log_info(format!("[startup-version-check] no update: local={local_version}, remote={remote_version}"));
                         None
                     }
                     Err(err) => {
@@ -77,7 +75,7 @@ pub(crate) fn spawn(force_update_available: bool) -> mpsc::Receiver<Option<Updat
     rx
 }
 
-/// The tag of the newest release that carries [`APP_ZIP_ASSET_NAME`]. Blocking network I/O
+/// The tag of the newest updatable release (`select_app_release`). Blocking network I/O
 /// through `ms_download::fetch_small` (connect timeout 10 s, read timeout 30 s, at most 2
 /// retries of a transient failure with backoff, `Range` resume); worker only, never
 /// cancelled (the result is dropped when the window is gone). `GITHUB_TOKEN`, when set, is
@@ -85,7 +83,7 @@ pub(crate) fn spawn(force_update_available: bool) -> mpsc::Receiver<Option<Updat
 ///
 /// # Errors
 /// A localized message for a failed request, an unreadable or malformed response, or no
-/// release with the asset.
+/// updatable release.
 fn fetch_latest_release_tag() -> Result<String, String> {
     let bearer = std::env::var("GITHUB_TOKEN").ok().map(|token| token.trim().to_string()).filter(|token| !token.is_empty());
     let fetcher = UreqFetcher::with_config(FetcherConfig {
@@ -103,29 +101,5 @@ fn fetch_latest_release_tag() -> Result<String, String> {
         .map_err(|e| tf!("startup.update_check.request_error", e = e))?;
     let body = String::from_utf8(body).map_err(|e| tf!("startup.update_check.response_read_error", e = e))?;
 
-    let releases: serde_json::Value = serde_json::from_str(&body).map_err(|e| tf!("startup.update_check.json_error", e = e))?;
-    let releases = releases.as_array().ok_or_else(|| t!("startup.update_check.unexpected_format").to_string())?;
-
-    for rel in releases {
-        let tag = rel
-            .get("tag_name")
-            .and_then(|v| v.as_str())
-            .or_else(|| rel.get("name").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .trim();
-        if tag.is_empty() {
-            continue;
-        }
-
-        let has_zip = rel
-            .get("assets")
-            .and_then(|v| v.as_array())
-            .is_some_and(|assets| assets.iter().any(|asset| asset.get("name").and_then(|v| v.as_str()) == Some(APP_ZIP_ASSET_NAME)));
-
-        if has_zip {
-            return Ok(tag.to_string());
-        }
-    }
-
-    Err(tf!("startup.update_check.asset_not_found", UPDATE_ASSET_NAME = APP_ZIP_ASSET_NAME))
+    select_app_release(&body).map(|release| release.tag).map_err(|err| err.user_message())
 }

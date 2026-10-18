@@ -25,8 +25,6 @@ use super::HOST_VERSION;
 use super::mode::UsageConflicts;
 use crate::args::Cli;
 use crate::installer::install as launcher_install;
-#[cfg(target_os = "windows")]
-use crate::version_format;
 use crate::{config, locale_store, runtime_log, venv_check};
 use ms_platform::PlatformFeature;
 use std::path::Path;
@@ -122,7 +120,7 @@ pub(super) fn run_system_registration_helper(cli: &Cli) -> i32 {
             runtime_log::log_error("[startup] --system-registration-apply without --system-registration-result");
             return CLI_USAGE_ERROR_EXIT;
         };
-        ms_os_integration::windows::elevation::run_elevated_helper(actions, result_file, version_format::version_core(HOST_VERSION.core))
+        ms_os_integration::windows::elevation::run_elevated_helper(actions, result_file, HOST_VERSION.version)
     }
     #[cfg(not(target_os = "windows"))]
     {

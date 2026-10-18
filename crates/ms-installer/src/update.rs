@@ -11,8 +11,9 @@ Main responsibilities:
 - support the startup test-version override without performing network I/O;
 - run the updater in two stages: executable replacement, then `--continue-update` environment and
   archive refresh;
-- own the release-feed constants (`APP_RELEASES_API`, `APP_ZIP_ASSET_NAME`) that `utils.rs` and
-  the binary's startup update check also use. Versions are ordered only by
+- compare the running program's version (`HostVersion::version`, i.e. `MS_APP_VERSION`) with the
+  tag of the release `release::fetch_latest_app_release` selects (the release feed and its
+  selection live in `release.rs`). Versions are ordered only by
   `ms_config::version_format::compare_release_versions` / `is_remote_newer`.
 
 Notes:
@@ -33,19 +34,12 @@ use ms_config::version_format::is_remote_newer;
 use crate::HostVersion;
 use crate::window::prepare_window_context;
 
-use super::download::github_api_get;
 use super::install::TorchInstallSelection;
+use super::release::fetch_latest_app_release;
 use super::utils::{
     ExternalUpdateTarget, UpdateWorkerEvent, load_embedded_icon_data,
-    platform_binary_asset_name, run_external_update_binary_stage, run_update_binary_stage,
-    run_update_continuation_stage,
+    run_external_update_binary_stage, run_update_binary_stage, run_update_continuation_stage,
 };
-
-/// GitHub API endpoint listing this program's releases. The one copy: the startup update
-/// check (`src/update_check.rs`) and the installer's download paths (`utils.rs`) use it too.
-pub const APP_RELEASES_API: &str = "https://api.github.com/repos/Vasyanator/ManhwaStudio/releases";
-/// The application archive asset; a release without it is not installable or updatable.
-pub const APP_ZIP_ASSET_NAME: &str = "ManhwaStudio.zip";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateWindowOutcome {
@@ -54,7 +48,7 @@ pub enum UpdateWindowOutcome {
 }
 
 /// Opens the update window for the running copy. `host` carries the application's own
-/// version pair, which this crate cannot read for itself (see [`HostVersion`]).
+/// version, which this crate cannot read for itself (see [`HostVersion`]).
 pub fn run_update_window(force_update_available: bool, host: HostVersion) -> Result<UpdateWindowOutcome, String> {
     run_update_window_internal(
         UpdateMode::Initial {
@@ -70,7 +64,7 @@ pub fn run_continue_update_window(host: HostVersion) -> Result<UpdateWindowOutco
 }
 
 /// Updates an install found elsewhere on disk (`target`), not the running copy.
-/// `host` is still the RUNNING copy's version pair — it is what the window displays.
+/// `host` is still the RUNNING copy's version — it is what the window displays.
 pub fn run_external_install_update_window(
     target: ExternalUpdateTarget,
     host: HostVersion,
@@ -143,11 +137,9 @@ enum UpdateMode {
 }
 
 struct UpdateApp {
-    /// Plain `CARGO_PKG_VERSION`: the value fed to the release comparison, so that a
-    /// git-suffixed development build never outranks the tag it was built from.
+    /// The running program's version (`MS_APP_VERSION`): shown to the user and compared with
+    /// the selected release's tag.
     local_version: String,
-    /// Extended `MS_APP_VERSION`: shown to the user, never compared or parsed.
-    local_version_display: String,
     page: UpdatePage,
     state: UpdateState,
     pending_check: Option<mpsc::Receiver<Result<UpdateCheckResult, String>>>,
@@ -176,8 +168,7 @@ impl Drop for UpdateApp {
 impl UpdateApp {
     fn new(mode: UpdateMode, output: Arc<Mutex<UpdateWindowOutcome>>, host: HostVersion) -> Self {
         let mut app = Self {
-            local_version: host.core.to_string(),
-            local_version_display: host.display.to_string(),
+            local_version: host.version.to_string(),
             page: UpdatePage::Check,
             state: UpdateState::Checking,
             pending_check: None,
@@ -325,9 +316,12 @@ impl UpdateApp {
         self.selected_torch_index = None;
 
         let cancel = Arc::clone(&self.cancel);
+        // The running (freshly installed) binary's version selects the release whose archive
+        // the stage installs.
+        let own_version = self.local_version.clone();
         let _ = thread::Builder::new()
             .name("update-continuation-stage".to_string())
-            .spawn(move || run_update_continuation_stage(root_dir, torch_selection, &tx, &cancel));
+            .spawn(move || run_update_continuation_stage(root_dir, &own_version, torch_selection, &tx, &cancel));
     }
 
     fn poll_worker_events(&mut self, ctx: &egui::Context) {
@@ -413,7 +407,7 @@ impl UpdateApp {
             ui.add_space(44.0);
             ui.heading(t!("installer.update.window_title"));
             ui.add_space(8.0);
-            ui.label(tf!("installer.update.current_version_label", arg = self.local_version_display));
+            ui.label(tf!("installer.update.current_version_label", arg = self.local_version));
             ui.add_space(18.0);
 
             match &self.state {
@@ -574,47 +568,9 @@ impl eframe::App for UpdateApp {
     }
 }
 
-/// The newest release tag that carries both the app archive and this platform's binary.
-/// `cancel` stops the request and its retry waits (window closed).
+/// The tag of the newest updatable release (`release::select_app_release`: archive, this
+/// platform's binary and `SHA256SUMS`). `cancel` stops the request and its retry waits
+/// (window closed).
 fn fetch_latest_app_release_tag(cancel: &AtomicBool) -> Result<String, String> {
-    // Shared installer helper: retries transient network failures with backoff.
-    let body = github_api_get(APP_RELEASES_API, "update-window", cancel)
-        .map_err(|e| tf!("installer.update.get_releases_error", e = e))?;
-    let releases: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| tf!("installer.update.parse_releases_error", e = e))?;
-    let releases = releases
-        .as_array()
-        .ok_or_else(|| t!("installer.update.unexpected_releases_format_error").to_string())?;
-
-    for release in releases {
-        let tag = release
-            .get("tag_name")
-            .and_then(|value| value.as_str())
-            .or_else(|| release.get("name").and_then(|value| value.as_str()))
-            .unwrap_or("")
-            .trim();
-        if tag.is_empty() {
-            continue;
-        }
-
-        let has_required_assets = release
-            .get("assets")
-            .and_then(|value| value.as_array())
-            .map(|assets| {
-                let has_zip = assets.iter().any(|asset| {
-                    asset.get("name").and_then(|value| value.as_str()) == Some(APP_ZIP_ASSET_NAME)
-                });
-                let has_binary = assets.iter().any(|asset| {
-                    asset.get("name").and_then(|value| value.as_str())
-                        == Some(platform_binary_asset_name())
-                });
-                has_zip && has_binary
-            })
-            .unwrap_or(false);
-        if has_required_assets {
-            return Ok(tag.to_string());
-        }
-    }
-
-    Err(tf!("installer.update.no_release_with_assets_error", app_zip_asset_name = APP_ZIP_ASSET_NAME, platform_binary_asset_name = platform_binary_asset_name()))
+    fetch_latest_app_release("update-window", cancel).map(|release| release.tag)
 }

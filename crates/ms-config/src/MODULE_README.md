@@ -70,9 +70,12 @@ that defines the type.
   uses it for the working directory of every OS record it writes — never copy the rule there).
   `lib.rs::resolve_runtime_root` does the I/O (cwd, `current_exe`, `dir_has_program_markers`)
   and handles the macOS `.app` bundle data root before it.
-- `version_format.rs`: pure, std-only composition (`compose_app_version`), stripping
-  (`version_core`) and ordering (`compare_release_versions` / `is_remote_newer`, the ONE
-  release-version comparator of the workspace) of the application version string. The ROOT `build.rs` pulls this exact file
+- `version_format.rs`: pure, std-only parsing (`parse_commit_count`: the strict
+  `git rev-list --count HEAD` parse behind `MS_APP_VERSION`), stripping (`version_core`, for
+  OTHER copies' `--version` output of the pre-commit-count form `3.6.0+<hash>-<n>`) and ordering
+  (`compare_release_versions` / `is_remote_newer`, the ONE release-version comparator of the
+  workspace; its tests pin the commit-count outcomes: `330 > 3.6.0`, `330.0.0` vs tag `330` is
+  no update) of the application version string; its header states the version contract. The ROOT `build.rs` pulls this exact file
   in with `include!("crates/ms-config/src/version_format.rs")`, so the code the build script
   runs is the code `cargo test` covers — which is why it must stay std-only: no `t!`, no
   logging, no reference to any other item of this crate.

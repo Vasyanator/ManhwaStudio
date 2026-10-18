@@ -11,7 +11,11 @@ Key items:
 - `GithubAsset`: one release asset as the GitHub API lists it (name, URL, size, digest).
 - `github_api_get()`: one GitHub API GET (`fetch_small`), `GITHUB_TOKEN` as bearer.
 - `AssetDownload` + `download_asset()`: one asset into its destination through
-  `fetch_verified`, pinned to the asset's size and (when GitHub publishes one) sha256.
+  `fetch_verified`, pinned to the asset's size and to a sha256: the caller's required pin
+  (the release's `SHA256SUMS` entry, `release.rs`) when given, else GitHub's digest if any.
+- `fetch_small_asset()`: a small release asset (the `SHA256SUMS` list) into memory
+  (`fetch_small`), its length checked against the listed size and its bytes against GitHub's
+  sha256 digest when one is listed.
 - `AssetIdentity`: the sidecar `<file>.identity.json` that decides whether the staged files
   left by an earlier run may be reused.
 
@@ -36,6 +40,7 @@ use std::sync::mpsc;
 use ms_download::resumable::{FetcherConfig, RangeFetcher, ResumableFetch, RetryPolicy, StreamEvent, UreqFetcher};
 use ms_download::{DownloadError, Expected, FileEvent, FileRequest, SmallRequest, fetch_small, fetch_verified};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use web_time::{Duration, Instant};
 
 use super::install::InstallEvent;
@@ -80,10 +85,12 @@ impl GithubAsset {
         }
     }
 
-    /// What the downloaded file must match: size + sha256 when GitHub published a digest,
-    /// otherwise the size alone.
-    fn expected(&self) -> Expected<'_> {
-        match self.sha256_pin() {
+    /// What the downloaded file must match: size + `required_sha256` when the caller pins one,
+    /// else size + GitHub's digest when published, otherwise the size alone. A required pin
+    /// replaces the digest without comparing the two: `release::ReleaseChecksums::pin_for`
+    /// refuses an asset whose digest disagrees with its `SHA256SUMS` entry before any download.
+    fn expected<'a>(&'a self, required_sha256: Option<&'a str>) -> Expected<'a> {
+        match required_sha256.or_else(|| self.sha256_pin()) {
             Some(sha256) => Expected::SizeSha256 { size: self.size, sha256 },
             None => Expected::Size(self.size),
         }
@@ -139,6 +146,54 @@ fn github_api_get_with(fetcher: &dyn RangeFetcher, retry: &RetryPolicy<'_>, canc
     }
 }
 
+/// Fetches the small release asset `asset` into memory, at most `max_bytes`, and checks that
+/// exactly the listed `size` arrived and, when GitHub lists a well-formed sha256 `digest` for
+/// the asset, that the body matches it (a short, long or corrupted body is refused, never
+/// parsed).
+///
+/// Transient failures are retried per `RetryPolicy::standard()`; `cancel` stops the request
+/// and any backoff wait. No JSON `Accept` header: this is a file, not an API answer.
+///
+/// # Errors
+/// The (English, technical) failure text, or the localized cancel text; callers wrap it into
+/// their own localized message.
+pub(crate) fn fetch_small_asset(asset: &GithubAsset, max_bytes: u64, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+    let fetcher = UreqFetcher::with_config(installer_fetcher_config(Vec::new()));
+    fetch_small_asset_with(&fetcher, &RetryPolicy::standard(), cancel, asset, max_bytes)
+}
+
+/// [`fetch_small_asset`] over an injected fetcher and retry schedule (tests use a scripted one).
+fn fetch_small_asset_with(fetcher: &dyn RangeFetcher, retry: &RetryPolicy<'_>, cancel: &AtomicBool, asset: &GithubAsset, max_bytes: u64) -> Result<Vec<u8>, String> {
+    if asset.size > max_bytes {
+        return Err(format!("the asset is {} bytes, more than the {max_bytes}-byte limit", asset.size));
+    }
+    let request = SmallRequest { url: &asset.browser_download_url, max_bytes };
+    let log_context = format!("small-asset asset={}", asset.name);
+    let body = match fetch_small(fetcher, retry, cancel, &request, LOG_TAG, &log_context) {
+        Ok(body) => body,
+        Err(DownloadError::Cancelled) => return Err(t!("installer.utils.download_cancelled_error").to_string()),
+        Err(err) => {
+            ms_log::runtime_log::log_warn(format!("{LOG_TAG} small asset request failed: {log_context} error={err}"));
+            return Err(err.to_string());
+        }
+    };
+    let received = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    if received != asset.size {
+        ms_log::runtime_log::log_warn(format!("{LOG_TAG} small asset size mismatch: {log_context} listed={} received={received}", asset.size));
+        return Err(format!("received {received} bytes, the release lists {}", asset.size));
+    }
+    if let Some(expected) = asset.sha256_pin() {
+        let actual: String = sha2::Sha256::digest(&body).iter().map(|byte| format!("{byte:02x}")).collect();
+        // GitHub's digest is lowercase today; compare case-insensitively so a casing change
+        // cannot turn into a false "corrupted" verdict.
+        if !actual.eq_ignore_ascii_case(expected) {
+            ms_log::runtime_log::log_warn(format!("{LOG_TAG} small asset sha256 mismatch: {log_context} expected={expected} actual={actual}"));
+            return Err(format!("the body does not match the published sha256 {expected}"));
+        }
+    }
+    Ok(body)
+}
+
 /// One release asset to download into `dst_path`.
 pub(crate) struct AssetDownload<'a> {
     pub(crate) asset: &'a GithubAsset,
@@ -148,10 +203,15 @@ pub(crate) struct AssetDownload<'a> {
     pub(crate) label_prefix: &'a str,
     /// The slice of the overall progress bar the transfer reports into.
     pub(crate) overall_range: (f32, f32),
+    /// A sha256 (64 lowercase hex) the file MUST match, from the release's `SHA256SUMS`
+    /// (`release::ReleaseChecksums::pin_for`); `None` pins GitHub's digest when published.
+    pub(crate) required_sha256: Option<&'a str>,
 }
 
-/// Downloads `req.asset` into `req.dst_path`, verified against its size and (when GitHub
-/// published one) its sha256, tolerating an unreliable connection.
+/// Downloads `req.asset` into `req.dst_path`, verified against its size and its sha256
+/// (`req.required_sha256`, else GitHub's digest when published), tolerating an unreliable
+/// connection. The verification runs before the file is published, so nothing downstream
+/// (executable replacement, archive extraction) ever sees unverified bytes.
 ///
 /// The body streams into `<file>.part`; transient failures are retried with capped
 /// exponential backoff and resumed with `Range` (shown as progress, not as an error); the
@@ -163,8 +223,9 @@ pub(crate) struct AssetDownload<'a> {
 /// backoff wait, keeping the `.part`.
 ///
 /// # Errors
-/// A localized message: the cancel text, the download error naming the asset (a hash
-/// mismatch deletes the `.part`), or a failed final rename (the verified `.download` is kept).
+/// A localized message: the cancel text, the checksum-mismatch text (the `.part` is deleted as
+/// proven wrong; not retried), the download error naming the asset, or a failed final rename
+/// (the verified `.download` is kept).
 pub(crate) fn download_asset(req: &AssetDownload<'_>, tx: &mpsc::Sender<InstallEvent>, cancel: &AtomicBool) -> Result<(), String> {
     let fetcher = UreqFetcher::with_config(installer_fetcher_config(Vec::new()));
     download_asset_with(&fetcher, &RetryPolicy::standard(), req, tx, cancel)
@@ -179,7 +240,7 @@ fn download_asset_with(fetcher: &dyn RangeFetcher, retry: &RetryPolicy<'_>, req:
 
     let log_context = format!("asset={} dest={}", req.asset.name, req.dst_path.display());
     let engine = ResumableFetch { fetcher, retry, cancel, log_tag: LOG_TAG, log_context: &log_context };
-    let expected = req.asset.expected();
+    let expected = req.asset.expected(req.required_sha256);
     // `fetch_verified` publishes into the staged sibling, never onto `dst_path`: an existing
     // destination is unproven (its size may match by chance) and must survive a failed attempt.
     let file_request = FileRequest { url: &req.asset.browser_download_url, part: &part_path, dest: &staged_path, expected };
@@ -205,12 +266,14 @@ fn download_asset_with(fetcher: &dyn RangeFetcher, retry: &RetryPolicy<'_>, req:
 fn download_error_message(err: &DownloadError, label_prefix: &str) -> String {
     match err {
         DownloadError::Cancelled => t!("installer.utils.download_cancelled_error").to_string(),
+        // Its own text: the file arrived but is not the published one. Retrying the same
+        // release cannot fix that, so the user is told so instead of "network error".
+        DownloadError::HashMismatch { .. } => tf!("installer.utils.download_checksum_mismatch_error", label_prefix = label_prefix),
         DownloadError::Busy { .. }
         | DownloadError::InvalidRequest { .. }
         | DownloadError::Io { .. }
         | DownloadError::Http { .. }
         | DownloadError::SizeMismatch { .. }
-        | DownloadError::HashMismatch { .. }
         | DownloadError::Archive { .. } => tf!("installer.utils.download_error", label_prefix = label_prefix, e = err),
     }
 }

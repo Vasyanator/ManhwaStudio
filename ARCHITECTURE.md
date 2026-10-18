@@ -143,7 +143,8 @@ shared wiki view). The studio never references
   `layer_model::LayerDoc`, `page_view`, `AutosaveGate`, `clean_assign`). Holds egui data types
   but never takes `Ui` / `Painter`.
 - `ms-tabs-simple` — Characters, Terms, Notes, Wiki tabs.
-- `ms-installer` — install/update, Python environment, `venv_check`.
+- `ms-installer` — install/update (release selection + `SHA256SUMS` verification in `release`),
+  Python environment, `venv_check`.
 - `ms-ai-api` — the multi-provider LLM API layer over `genai` (re-exported): services
   (including OpenAI- / Anthropic-compatible endpoints at a user base URL, key optional),
   client, keyring key storage, model listing, account status, the hard-coded image-input
@@ -501,9 +502,14 @@ Detail: `crates/ms-text-render/src/MODULE_README.md`, `crates/ms-tab-typing/src/
   never logged and reaches the backend only as a per-request field.
 - **Threads** — spawned through `ms_thread` on any path that also runs on wasm; `rayon` for CPU
   work; `tokio` only in `ms-ai-api`.
-- **Versions** — `MS_APP_VERSION` (git-derived in `build.rs`) is display-only;
-  `CARGO_PKG_VERSION` is what is compared and parsed; cross-process comparisons reduce both via
-  `version_format::version_core`. Libraries receive the version as `ms_installer::HostVersion`.
+- **Versions** — the program version is the commit count of the build (`MS_APP_VERSION`,
+  `git rev-list --count HEAD` in `build.rs`; full `CARGO_PKG_VERSION` when git is unavailable or
+  the clone is shallow). It is the one value shown, compared and sent across processes; libraries
+  receive it as `ms_installer::HostVersion`. A release is tag `N` + `Cargo.toml` `N.0.0`
+  (`CARGO_PKG_VERSION` is packaging metadata only: Windows FILEVERSION, Android versionCode, macOS
+  plist). Other copies' `--version` output is reduced with `version_format::version_core` (old
+  builds print `3.6.0+hash-n`). Release selection and its `SHA256SUMS` check have one owner,
+  `ms_installer::release`.
 
 ## 11. Background pipelines
 
@@ -608,6 +614,7 @@ Detail: `src/studio/MODULE_README.md`, `crates/ms-models/src/MODULE_README.md`,
   from the blocks in flight; nothing keeps a RAM copy of what sits in VRAM.
 
 **Versions and protocol**
-- Program versions are compared only via `CARGO_PKG_VERSION`; `MS_APP_VERSION` is display-only.
+- Program versions are compared only via `MS_APP_VERSION` (commit count); the asset names,
+  `--continue-update` and the one-token `--version` are frozen by the installed 3.6.0 updater.
 - Rust <-> Python compatibility is decided solely by `PROTOCOL_VERSION` in `hello`; any contract
   change bumps it on both sides (rule: `PROJECT_RULES.md`).

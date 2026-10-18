@@ -1,6 +1,12 @@
 /*
 FILE OVERVIEW: crates/ms-config/src/version_format.rs
-Pure, dependency-free composition, stripping and ordering of the application version string.
+Pure, dependency-free parsing, stripping and ordering of the application version string.
+
+The program version (`MS_APP_VERSION`, emitted by `build.rs`) is the commit count of the commit
+a build was made from (`git rev-list --count HEAD`, e.g. `335`), or the full `CARGO_PKG_VERSION`
+(e.g. `3.6.0`, `330.0.0`) when no repository is available. It is the ONE version of a build:
+displayed, printed by `--version`, compared against release tags (plain numbers, `330`) and
+handed to other processes. `CARGO_PKG_VERSION` is packaging metadata only (Windows FILEVERSION).
 
 This file is compiled TWICE, deliberately:
 - as a normal module of `ms-config` (re-exported by the binary as `crate::version_format`), and
@@ -15,9 +21,10 @@ Because of that dual compilation the file must stay std-only: no `t!`/`tf!`, no 
 reference to any other item of the crate. Keep it that way.
 
 Key functions:
-- `compose_app_version()`: builds the human-facing version out of the Cargo version, the
-  optional git describe result and the dirty flag.
-- `version_core()`: strips semver build metadata, for the machine-facing comparisons.
+- `parse_commit_count()`: strict parse of `git rev-list --count HEAD` output (used by `build.rs`).
+- `version_core()`: strips semver build metadata. A current build's version carries none; it
+  is still needed for ANOTHER copy's `--version` output, which older builds print as
+  `3.6.0+<hash>-<n>[-dirty]`.
 - `compare_release_versions()` / `is_remote_newer()`: THE release-version ordering, used by
   the startup update check, the installer's update window and its updater / PyTorch-minimum
   checks. There is no other comparator; do not add one.
@@ -29,56 +36,37 @@ Names are fully qualified (`std::cmp::Ordering`) because `include!` pastes them 
 build script's root, where an extra `use` could collide.
 */
 
-/// Composes the human-facing application version string.
+/// Parses the stdout of `git rev-list --count HEAD` into the commit count that IS this
+/// build's program version (`MS_APP_VERSION`, see `build.rs`).
 ///
-/// `base_version` is the version declared in `Cargo.toml` (`CARGO_PKG_VERSION`); it is
-/// trimmed but otherwise reproduced verbatim. `git_info` is `Some((short_hash, distance))`
-/// where `distance` is the number of commits between the last reachable tag and `HEAD`
-/// (`git describe --long`), or `None` when git is unavailable, the source tree is not a
-/// repository, or any git command failed. `dirty` reports uncommitted changes in the
-/// source directories only (`src/`, `crates/`).
-///
-/// Shape of the result:
-/// - `git_info == None` -> `base_version` verbatim, `dirty` ignored. This is the
-///   GitHub-source-ZIP case: without any git identification a lone dirty marker would
-///   claim knowledge the build does not have.
-/// - distance `0` (HEAD exactly on a tag) -> `base_version`, plus `+dirty` when dirty.
-/// - distance `n > 0` -> `base_version+<hash>-<n>`, plus `-dirty` when dirty.
-///
-/// The marker separator differs on purpose: the first `+` opens semver build metadata, so
-/// the marker joins with `+` when no `+` exists yet and with `-` when one already does.
-///
-/// Never fails and never panics; the result is always non-empty when `base_version` is.
-// Compiled into both the crate and the build script; the crate itself only reads the
-// composed value out of the environment, so this is dead code on the crate side.
-#[allow(dead_code)]
-pub fn compose_app_version(base_version: &str, git_info: Option<(&str, u32)>, dirty: bool) -> String {
-    let base = base_version.trim();
-    let Some((short_hash, distance)) = git_info else {
-        return base.to_string();
-    };
-
-    if distance == 0 {
-        if dirty { format!("{base}+dirty") } else { base.to_string() }
-    } else if dirty {
-        format!("{base}+{short_hash}-{distance}-dirty")
-    } else {
-        format!("{base}+{short_hash}-{distance}")
+/// Strict on purpose, because a wrong number is a wrong release identity: after trimming
+/// surrounding whitespace the text must be one or more ASCII digits (no sign, no inner
+/// whitespace, no second line) and the value must be a positive `u64` — a repository whose
+/// `HEAD` resolves has at least one commit. Anything else is `None`, and the caller falls back
+/// to `CARGO_PKG_VERSION`. Never panics.
+#[must_use]
+pub fn parse_commit_count(output: &str) -> Option<u64> {
+    let trimmed = output.trim();
+    // `u64::from_str` alone would also accept a leading `+`.
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
+    trimmed.parse::<u64>().ok().filter(|count| *count > 0)
 }
 
 /// Returns the semver core of `version`: the input trimmed, with build metadata
 /// (everything from the first `+`) removed.
 ///
-/// This is the machine-facing half of the version contract. Anything compared against a
-/// release tag, a Python-side constant or another process's `--version` output must be
-/// reduced with this function first, so that a git-suffixed development build still
-/// compares as the release it was built from.
+/// A version this build produces (`MS_APP_VERSION`) has no build metadata, so for it this is
+/// the identity. It exists for the OTHER side of a cross-process comparison: an installed copy
+/// built before commit-count versioning prints `3.6.0+<hash>-<n>[-dirty]` from `--version`, and
+/// that must compare as the `3.6.0` release it was built from. Callers comparing a probed
+/// `--version` output against a release tag reduce both sides with this function first.
 ///
 /// Pre-release identifiers (a leading `-` segment) are intentionally preserved: they are
 /// part of the semver core and carry ordering meaning. Malformed and empty input is
 /// returned as-is (possibly empty); the function never panics.
-// See the note on `compose_app_version`: unused on the build-script side of the include.
+// Compiled into the build script too, which never calls it (see the file header Notes).
 #[allow(dead_code)]
 pub fn version_core(version: &str) -> &str {
     let trimmed = version.trim();
@@ -96,7 +84,7 @@ pub fn version_core(version: &str) -> &str {
 /// This is deliberately not full semver: a pre-release suffix and build metadata are just
 /// further parts, so callers that may see build metadata reduce both sides with
 /// [`version_core`] first. A part that overflows `u64` counts as text. Never panics.
-// See the note on `compose_app_version`: unused on the build-script side of the include.
+// Compiled into the build script too, which never calls it (see the file header Notes).
 #[allow(dead_code)]
 pub fn compare_release_versions(left: &str, right: &str) -> std::cmp::Ordering {
     let left_parts = release_version_parts(left);
@@ -116,14 +104,14 @@ pub fn compare_release_versions(left: &str, right: &str) -> std::cmp::Ordering {
 }
 
 /// Whether release `remote` is strictly newer than `local`, per [`compare_release_versions`].
-// See the note on `compose_app_version`: unused on the build-script side of the include.
+// Compiled into the build script too, which never calls it (see the file header Notes).
 #[allow(dead_code)]
 pub fn is_remote_newer(local: &str, remote: &str) -> bool {
     compare_release_versions(remote, local).is_gt()
 }
 
 /// Splits a version string into the parts [`compare_release_versions`] orders.
-// See the note on `compose_app_version`: unused on the build-script side of the include.
+// Compiled into the build script too, which never calls it (see the file header Notes).
 #[allow(dead_code)]
 fn release_version_parts(version: &str) -> Vec<ReleaseVersionPart> {
     let trimmed = version.trim();
@@ -140,7 +128,7 @@ fn release_version_parts(version: &str) -> Vec<ReleaseVersionPart> {
 }
 
 /// One component of a release version string (see [`compare_release_versions`]).
-// See the note on `compose_app_version`: unused on the build-script side of the include.
+// Compiled into the build script too, which never calls it (see the file header Notes).
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum ReleaseVersionPart {
@@ -150,36 +138,29 @@ enum ReleaseVersionPart {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_release_versions, compose_app_version, is_remote_newer, version_core};
+    use super::{compare_release_versions, is_remote_newer, parse_commit_count, version_core};
     use std::cmp::Ordering;
 
     #[test]
-    fn no_git_info_returns_the_base_version_verbatim() {
-        assert_eq!(compose_app_version("3.6.0", None, false), "3.6.0");
-        // A source ZIP has no git data at all, so even a "dirty" probe result must not
-        // decorate the version.
-        assert_eq!(compose_app_version("3.6.0", None, true), "3.6.0");
-        assert_eq!(compose_app_version("  3.6.0\n", None, false), "3.6.0");
+    fn commit_count_parses_plain_decimal_output() {
+        assert_eq!(parse_commit_count("323\n"), Some(323));
+        assert_eq!(parse_commit_count("  1 "), Some(1));
+        assert_eq!(parse_commit_count("330"), Some(330));
     }
 
     #[test]
-    fn on_tag_clean_returns_the_base_version() {
-        assert_eq!(compose_app_version("3.6.0", Some(("1cd9638", 0)), false), "3.6.0");
-    }
-
-    #[test]
-    fn on_tag_dirty_appends_the_marker_with_a_plus() {
-        assert_eq!(compose_app_version("3.6.0", Some(("1cd9638", 0)), true), "3.6.0+dirty");
-    }
-
-    #[test]
-    fn ahead_of_tag_clean_appends_hash_and_distance() {
-        assert_eq!(compose_app_version("3.6.0", Some(("1cd9638", 83)), false), "3.6.0+1cd9638-83");
-    }
-
-    #[test]
-    fn ahead_of_tag_dirty_appends_the_marker_with_a_dash() {
-        assert_eq!(compose_app_version("3.6.0", Some(("1cd9638", 83)), true), "3.6.0+1cd9638-83-dirty");
+    fn commit_count_rejects_anything_but_a_positive_decimal() {
+        assert_eq!(parse_commit_count(""), None);
+        assert_eq!(parse_commit_count("  \n"), None);
+        assert_eq!(parse_commit_count("0"), None);
+        assert_eq!(parse_commit_count("+5"), None);
+        assert_eq!(parse_commit_count("-5"), None);
+        assert_eq!(parse_commit_count("3 3"), None);
+        assert_eq!(parse_commit_count("3\n4"), None);
+        assert_eq!(parse_commit_count("3.6.0"), None);
+        assert_eq!(parse_commit_count("fatal: not a git repository"), None);
+        // Overflows u64.
+        assert_eq!(parse_commit_count("18446744073709551616"), None);
     }
 
     #[test]
@@ -263,5 +244,40 @@ mod tests {
         // Build metadata is NOT ignored here; callers reduce with `version_core` first.
         assert_eq!(compare_release_versions("3.6.0+dirty", "3.6.0"), Ordering::Greater);
         assert_eq!(compare_release_versions(version_core("3.6.0+dirty"), "3.6.0"), Ordering::Equal);
+    }
+
+    // Commit-count versioning contract (program version = commit count, releases tagged with
+    // the plain number). The algorithm is unchanged; these pin the outcomes the release
+    // scheme relies on.
+
+    #[test]
+    fn commit_count_versions_outrank_the_last_semver_release() {
+        assert_eq!(compare_release_versions("330", "3.6.0"), Ordering::Greater);
+        assert_eq!(compare_release_versions("3.6.0", "330"), Ordering::Less);
+        // An installed 3.6.0 sees tag `330` as an update.
+        assert!(is_remote_newer("3.6.0", "330"));
+    }
+
+    #[test]
+    fn cargo_fallback_version_is_not_older_than_its_own_tag() {
+        // A build without git reports the full `CARGO_PKG_VERSION` (`330.0.0`); tag `330` must
+        // not look newer, or that build would offer the same release forever.
+        assert!(!is_remote_newer("330.0.0", "330"));
+        assert_ne!(compare_release_versions("330.0.0", "330"), Ordering::Less);
+    }
+
+    #[test]
+    fn commit_count_updates_only_to_a_higher_count() {
+        assert!(!is_remote_newer("335", "330"), "a build ahead of the release must not update back");
+        assert!(!is_remote_newer("330", "330"));
+        assert!(is_remote_newer("327", "330"));
+    }
+
+    #[test]
+    fn old_extended_version_output_reduces_below_a_commit_count_tag() {
+        // `--version` of a build from before commit-count versioning.
+        let old_output = "3.6.0+abc1234-199";
+        assert_eq!(compare_release_versions(version_core(old_output), "330"), Ordering::Less);
+        assert!(is_remote_newer(version_core(old_output), version_core("330")));
     }
 }

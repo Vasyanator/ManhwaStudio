@@ -143,11 +143,12 @@ pub(crate) use ms_installer as installer;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use ms_installer::venv_check;
 
-// Pure version-string composition/stripping, shared verbatim with `build.rs` through
+// Pure version-string parsing/stripping/ordering, shared verbatim with `build.rs` through
 // `include!("crates/ms-config/src/version_format.rs")`. It moved into `ms-config` so the
-// installer and launcher crates can reach it without going through the binary. Defines
-// the human/machine split: `MS_APP_VERSION` (composed at build time) is for display,
-// `CARGO_PKG_VERSION` is for every comparison and cross-process parse.
+// installer and launcher crates can reach it without going through the binary. Its header
+// defines the version contract: `MS_APP_VERSION` (the commit count, emitted by `build.rs`) is
+// the ONE program version — displayed, compared and handed to other processes;
+// `CARGO_PKG_VERSION` is packaging metadata only (Windows FILEVERSION).
 pub(crate) use ms_config::version_format;
 
 // The reusable UI-primitive layer — `crates/ms-widgets/src/` plus two neighbouring leaves of the

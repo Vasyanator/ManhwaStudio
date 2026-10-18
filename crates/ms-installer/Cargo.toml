@@ -63,6 +63,9 @@ eframe.workspace = true
 # Release metadata (`fetch_small`) and release-asset downloads (`fetch_verified`): retry with
 # capped backoff, `Range` resume, size / sha256 verification, cancel (`src/download.rs`).
 ms-download = { path = "../ms-download" }
+# sha256 of a small asset fetched into memory (`download.rs::fetch_small_asset`: the
+# `SHA256SUMS` manifest against its GitHub digest); file downloads hash inside `ms-download`.
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The Python runtime and the release payloads ship as `.tar.gz` (flate2 + tar) and
@@ -88,5 +91,3 @@ libc.workspace = true
 tempfile.workspace = true
 # `test_support::ScriptedFetcher`: the in-memory server of the download tests.
 ms-download = { path = "../ms-download", features = ["test-support"] }
-# sha256 of the test content (asset digest pins).
-sha2.workspace = true

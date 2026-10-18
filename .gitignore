@@ -23,6 +23,7 @@
 !README.md
 !PROJECT_RULES.md
 !ARCHITECTURE.md
+!CHANGELOG.md
 
 # Published, human-facing documentation (including localized README translations).
 # Counterpart: dev-docs/ holds development-time plans, reports and changelogs and is

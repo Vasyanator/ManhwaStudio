@@ -55,8 +55,9 @@ one opened session and talks to the window only through its `StudioOutput` queue
   (`conflicting_installed_copy_flags`, `conflicting_image_flags`, `conflicting_project_flags`,
   `windows_only_flags`) and the image path pre-check. Consumed by `startup/mode.rs`.
 - `update_check.rs` (native): the startup check for a newer GitHub release on a worker
-  (comparison on `CARGO_PKG_VERSION`), started once by the shell on the first launcher entry;
-  the release list comes through `ms_download::fetch_small` with at most 2 retries.
+  (comparison on `MS_APP_VERSION`; release chosen by `ms_installer::release::select_app_release`),
+  started once by the shell on the first launcher entry; the release list comes through
+  `ms_download::fetch_small` with at most 2 retries.
 - `web_entry.rs` (`wasm32`): the browser entry — in-memory storage, a generated demo chapter, a
   launcher -> `StudioApp` swap behind one `eframe::App`. It shares only `shell::style` and
   `shell::chapter_load` with the native window; the studio's outbound queue is drained and
@@ -115,20 +116,23 @@ the other `ms_sysprobe` modules such as `ai_models`, `gpu_utils`, `paste_image`)
 - **Runtime paths** belong in the `config` crate (`crates/ms-config`): no hard-coded writable
   data, model, config, log or project paths in feature modules. `ProjectPaths` owns the chapter
   layout.
-- **The application version has TWO forms** — a safety rule, not a preference. `MS_APP_VERSION`
-  (composed by `build.rs`, e.g. `3.6.0+1cd9638-83-dirty`) is the HUMAN form: window title, version
-  labels, `--version`, diagnostic logs. `CARGO_PKG_VERSION` is the MACHINE form: every comparison
-  and every value another process parses — every caller of the one release comparator
+- **The application version is ONE value: `MS_APP_VERSION`** — the commit count of the commit
+  the build was made from (`git rev-list --count HEAD`, emitted by `build.rs`, e.g. `335`), or
+  the full `CARGO_PKG_VERSION` (`3.6.0`, `N.0.0`) for a build without git. Window title, version
+  labels, `--version`, logs, every caller of the one release comparator
   (`version_format::compare_release_versions` / `is_remote_newer`: `update_check.rs`,
-  `ms-installer`'s `update.rs` / `utils.rs`). A suffix on a compared value makes a build outrank
-  its own release tag. Where an extended string unavoidably crosses a process boundary (an
-  installed copy probed with `--version`), reduce BOTH sides with `version_format::version_core`.
-  The Python backend is never version-compared: compatibility is `PROTOCOL_VERSION` in `hello`.
-  A library cannot read the binary's version (`MS_APP_VERSION` is a `rustc-env` of the ROOT crate
-  only; `CARGO_PKG_VERSION` inside a crate is that crate's own), so `startup/` hands the pair to
-  the crates that need it as `ms_installer::HostVersion`. `version_format` stays std-only: it is
-  also `include!`d by `build.rs`, so the code the build script runs is the code `cargo test`
-  covers.
+  `ms-installer`'s `update.rs` / `utils.rs`), the Uninstall entry's `DisplayVersion` and the IPC
+  studio version all use it; releases are tagged with the plain number. `CARGO_PKG_VERSION` is
+  packaging metadata only (Windows FILEVERSION). `--version` output is a frozen contract:
+  `manhwastudio_rs <version>`, the version one token and the last one, because installed
+  updaters probe copies with it. A probed copy built before commit-count versioning prints
+  `3.6.0+<hash>-<n>[-dirty]`, so that comparison reduces BOTH sides with
+  `version_format::version_core`. The Python backend is never version-compared: compatibility is
+  `PROTOCOL_VERSION` in `hello`. A library cannot read the binary's version (`MS_APP_VERSION`
+  is a `rustc-env` of the ROOT crate only; `CARGO_PKG_VERSION` inside a crate is that crate's
+  own), so `startup/` hands it to the crates that need it as `ms_installer::HostVersion`.
+  `version_format` stays std-only: it is also `include!`d by `build.rs`, so the code the build
+  script runs is the code `cargo test` covers.
 - **`General.enabled_tabs`** keys are the stable English `AppTab::key()` ids, never localized
   (`dev-docs/i18n_exclusions.md` A3/B1). The field has NO reader. `merge_missing` adds keys but
   never removes, so an old user config may still carry legacy Russian tab labels as keys next to
@@ -206,8 +210,8 @@ itself a defect):
   the two kinds: `studio/session/`.
 - Settings tab: `tabs/settings/`; the panes shared with the launcher (General, AI backend /
   ONNX selection, Tutorials, UI scale, section registry): crate `ms-settings-ui`.
-- Version reporting and the git suffix: `crates/ms-config/src/version_format.rs` (pure rules) +
-  `build.rs` (git probing, rerun watches); then the version contract above.
+- Version reporting (commit count, fallback): `crates/ms-config/src/version_format.rs` (pure
+  rules) + `build.rs` (git probing, rerun watches); then the version contract above.
 - `--check-venv` readiness: `crates/ms-installer/src/venv_check.rs` (decision) +
   `startup/service_flags.rs` (window, exit code) + `crates/ms-installer/src/utils.rs`
   (`required_dependency_specs`).

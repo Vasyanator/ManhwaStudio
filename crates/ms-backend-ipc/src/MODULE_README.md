@@ -116,8 +116,9 @@ is ephemeral and published per process.
   it must never gate a feature or raise UI.
 - The STUDIO half of that same log line comes from `client::set_studio_version`, a
   write-once process-global the BINARY seeds at startup (`src/startup/mod.rs`, `init_minimal`, from
-  `HOST_VERSION.core`). This crate cannot read it for itself: `env!("CARGO_PKG_VERSION")`
-  compiled here expands to the library's own `0.1.0`. Unseeded it logs `<unknown>` rather
+  `HOST_VERSION.version`, i.e. `MS_APP_VERSION`). This crate cannot read it for itself:
+  `MS_APP_VERSION` exists only for the binary, and `env!("CARGO_PKG_VERSION")` compiled here
+  expands to the library's own `0.1.0`. Unseeded it logs `<unknown>` rather
   than a plausible-looking wrong number. It is diagnostic only — `hello_header()` does not
   carry it, so it is not part of the wire contract and never affects `PROTOCOL_VERSION`.
 - Wire bytes are identical on both transports; the receiver treats all payloads as one

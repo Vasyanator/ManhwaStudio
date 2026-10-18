@@ -105,7 +105,7 @@ pub(crate) fn tab_visible(tab: AppTab, single_image: bool) -> bool {
 /// Studio window title of an image-set session: `ManhwaStudio v{version} - {file name}` for one
 /// page (the whole path when it has no file-name component); for `count` > 1 pages the name is
 /// followed by the number of the others (`single_image.window_title_more`, e.g. `b.png (+2)`).
-/// `first` is page 0's file; `version` is the display version (`MS_APP_VERSION`). The one owner
+/// `first` is page 0's file; `version` is the program version (`MS_APP_VERSION`). The one owner
 /// of this format: startup (`StartupTarget::window_title`) and the controller (after «Сохранить
 /// как» moved the save target) both call it. Native-only like both callers.
 #[cfg(not(target_arch = "wasm32"))]

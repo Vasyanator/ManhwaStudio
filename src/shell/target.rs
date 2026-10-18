@@ -104,7 +104,7 @@ pub enum StartupTarget {
 impl StartupTarget {
     /// Studio window title: `ManhwaStudio v{version} - {chapter path}` for a project; for an
     /// image set the one owner `crate::studio::session::image_set::image_window_title` (first file name, plus
-    /// the count of the others). `version` is the display version (`MS_APP_VERSION`).
+    /// the count of the others). `version` is the program version (`MS_APP_VERSION`).
     #[must_use]
     pub fn window_title(&self, version: &str) -> String {
         match self {

@@ -81,8 +81,9 @@ impl std::error::Error for CallError {}
 // ============================================================================
 // Host application version (diagnostic only)
 // ----------------------------------------------------------------------------
-// `env!("CARGO_PKG_VERSION")` expanded HERE yields THIS crate's version (`0.1.0`),
-// not the application's (the same trap `ms-installer` avoids with `HostVersion`). The
+// `MS_APP_VERSION` exists only for the binary crate, and `env!("CARGO_PKG_VERSION")`
+// expanded HERE yields THIS crate's version (`0.1.0`), not the application's (the same
+// trap `ms-installer` avoids with `HostVersion`). The
 // value must therefore originate in the binary crate, and it is carried by a
 // process-global seed rather than by a `connect` parameter for two reasons:
 //   * the only public way in is `shared_client()` — a no-argument lazy singleton with
@@ -106,10 +107,9 @@ static STUDIO_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::
 
 /// Records the HOST application's version for the handshake diagnostic log line.
 ///
-/// `version` is the application's plain `CARGO_PKG_VERSION` (the machine-facing half of
-/// the version split — see `crates/ms-config/src/version_format.rs`); it must be passed
-/// in by the BINARY crate, which is the only place that macro expands to the program's
-/// own version. Call it once during startup, before the first backend connection; the
+/// `version` is the application's program version `MS_APP_VERSION` (the commit count — see
+/// `crates/ms-config/src/version_format.rs`); it must be passed in by the BINARY crate, the
+/// only crate `build.rs` emits it for. Call it once during startup, before the first backend connection; the
 /// first call wins and later calls are ignored. Purely diagnostic: it is written to
 /// `last.log` at every handshake and is never sent to the backend, never compared, and
 /// never gates a feature.

@@ -29,8 +29,9 @@ Notes:
 The initial install flow intentionally does not download application AI model weights. Runtime
 code downloads app-managed models lazily through `ai_models.rs` when a feature needs them.
 Release metadata and asset downloads live in `download.rs` (`github_api_get`,
-`download_asset`); this file only picks the assets (`fetch_latest_*`, `select_uv_asset`) and
-sequences the downloads. Every worker takes a cancel flag (`&AtomicBool`, set when its window
+`download_asset`) and the app release selection plus its `SHA256SUMS` pins in `release.rs`;
+this file only picks the uv asset (`fetch_latest_uv_asset`, `select_uv_asset`) and sequences
+the downloads, passing each app asset's pin into `download_asset`. Every worker takes a cancel flag (`&AtomicBool`, set when its window
 closes) and hands it to the downloads and to `run_command_with_retry`, whose failed commands are
 retried after a capped 2 / 4 / 8 s backoff that the flag interrupts.
 */
@@ -88,13 +89,15 @@ use super::install::{
 };
 #[cfg(target_os = "windows")]
 use super::install::{UninstallEvent, run_windows_uninstall_window, send_uninstall_progress};
-use super::update::{APP_RELEASES_API, APP_ZIP_ASSET_NAME};
+use super::release::{APP_ZIP_ASSET_NAME, ArchiveRelease, fetch_app_release_by_tag, fetch_latest_app_release};
 use super::download::{AssetDownload, GithubAsset, INSTALLER_USER_AGENT, download_asset, github_api_get};
 
 const UV_RELEASE_API: &str = "https://api.github.com/repos/astral-sh/uv/releases/latest";
 // Per-platform × per-arch GitHub *release asset* names of the main executable,
 // as produced by `build-all.py`. These name the file uploaded to the release,
-// NOT the on-disk executable (see `platform_executable_file_name`).
+// NOT the on-disk executable (see `platform_executable_file_name`). Releases no
+// longer carry the Windows / Linux aarch64 binaries: a build for those targets
+// keeps compiling, but `release::select_app_release` finds no release for it.
 const WINDOWS_BINARY_ASSET_NAME_X86_64: &str = "manhwastudio_rs.exe";
 const WINDOWS_BINARY_ASSET_NAME_AARCH64: &str = "manhwastudio_rs_arm64.exe";
 const MACOS_BINARY_ASSET_NAME_X86_64: &str = "manhwastudio_rs_macos";
@@ -167,14 +170,6 @@ fn send_console_line(tx: &mpsc::Sender<InstallEvent>, line: impl Into<String>) {
 
 #[derive(Deserialize)]
 struct GithubRelease {
-    assets: Vec<GithubAsset>,
-}
-
-#[derive(Deserialize)]
-struct GithubReleaseListItem {
-    tag_name: Option<String>,
-    name: Option<String>,
-    #[serde(default)]
     assets: Vec<GithubAsset>,
 }
 
@@ -311,6 +306,7 @@ pub(super) fn run_install_worker(
             dst_path: &archive_path,
             label_prefix: "uv",
             overall_range: (python_range.0, lerp(python_range.0, python_range.1, 0.55)),
+            required_sha256: None,
         },
         tx,
         cancel,
@@ -396,7 +392,12 @@ pub(super) fn run_install_worker(
     let _ = tx.send(InstallEvent::Step(
         t!("installer.utils.searching_app_zip_status").to_string(),
     ));
-    let app_asset = fetch_latest_app_zip_asset(cancel)?;
+    // The archive is verified against the release's `SHA256SUMS` before it is published into
+    // `downloads/`, i.e. before it can be extracted (`release.rs`).
+    let app_release = fetch_latest_app_release("install-worker", cancel)?;
+    let app_checksums = app_release.checksums.fetch(cancel)?;
+    let app_asset = &app_release.archive;
+    let app_zip_sha256 = app_checksums.pin_for(app_asset)?;
     let app_zip_path = downloads_dir.join(APP_ZIP_ASSET_NAME);
 
     let _ = tx.send(InstallEvent::Step(
@@ -404,10 +405,11 @@ pub(super) fn run_install_worker(
     ));
     download_asset(
         &AssetDownload {
-            asset: &app_asset,
+            asset: app_asset,
             dst_path: &app_zip_path,
             label_prefix: APP_ZIP_ASSET_NAME,
             overall_range: (app_range.0, lerp(app_range.0, app_range.1, 0.50)),
+            required_sha256: Some(app_zip_sha256),
         },
         tx,
         cancel,
@@ -898,13 +900,17 @@ pub(crate) fn run_external_update_binary_stage(
     }
 }
 
+/// Runs the `--continue-update` stage in the freshly installed binary. `own_version` is that
+/// binary's `MS_APP_VERSION` (`HostVersion::version`): the archive is taken from the release
+/// with exactly that tag, never from a newer one (`release::select_app_release_by_tag`).
 pub(crate) fn run_update_continuation_stage(
     root_dir: PathBuf,
+    own_version: &str,
     torch_selection: Option<TorchInstallSelection>,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
     cancel: &AtomicBool,
 ) {
-    match run_update_continuation_stage_inner(&root_dir, torch_selection, tx, cancel) {
+    match run_update_continuation_stage_inner(&root_dir, own_version, torch_selection, tx, cancel) {
         Ok(UpdateContinuationOutcome::Completed) => {
             let _ = tx.send(UpdateWorkerEvent::Finished(Ok(())));
         }
@@ -953,12 +959,13 @@ fn run_update_binary_stage_inner(
         t!("installer.utils.checking_latest_release_status").to_string(),
     ));
     send_update_progress(tx, 0.0, t!("installer.common.preparation"), 0.0, t!("installer.utils.stage_update_binary"));
-    let remote_version =
-        fetch_latest_app_release_tag_with_required_asset(platform_binary_asset_name(), cancel)?;
-    // The probed binary prints the EXTENDED version (`--version` -> `MS_APP_VERSION`), so
-    // both sides are reduced to their semver core before comparing: build metadata such as
-    // `+1cd9638-83-dirty` carries no ordering meaning, and leaving it in would make a
-    // development build compare as strictly newer than its own release tag forever.
+    let release = fetch_latest_app_release("update-binary-stage", cancel)?;
+    let remote_version = release.tag.clone();
+    // The probed binary prints its `MS_APP_VERSION`: a commit count for current builds, but
+    // `3.6.0+1cd9638-83-dirty` for an installed copy built before commit-count versioning. Both
+    // sides are therefore reduced to their semver core before comparing: build metadata carries
+    // no ordering meaning, and leaving it in would make such a build compare as strictly newer
+    // than its own release tag forever.
     if compare_release_versions(version_core(&remote_version), version_core(&local_version)).is_le() {
         return Ok(UpdateBinaryStageOutcome::NoUpdate {
             local_version,
@@ -967,7 +974,11 @@ fn run_update_binary_stage_inner(
     }
 
     let _ = tx.send(UpdateWorkerEvent::Step(tf!("installer.utils.version_available_status", remote_version = remote_version)));
-    let binary_asset = fetch_latest_app_asset_by_name(platform_binary_asset_name(), cancel)?;
+    // The binary is verified against the release's `SHA256SUMS` before it is published into
+    // `downloads/`, i.e. before it can replace the program (`release.rs`).
+    let checksums = release.checksums.fetch(cancel)?;
+    let binary_asset = &release.binary;
+    let binary_sha256 = checksums.pin_for(binary_asset)?;
     let downloads_dir = root_dir.join("installer_files").join("downloads");
     fs::create_dir_all(&downloads_dir)
         .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
@@ -976,10 +987,11 @@ fn run_update_binary_stage_inner(
     let install_tx = UpdateToInstallEventBridge { tx }.sender();
     download_asset(
         &AssetDownload {
-            asset: &binary_asset,
+            asset: binary_asset,
             dst_path: &downloaded_binary,
             label_prefix: &binary_asset.name,
             overall_range: (0.0, 0.82),
+            required_sha256: Some(binary_sha256),
         },
         &install_tx,
         cancel,
@@ -1017,6 +1029,7 @@ fn run_update_binary_stage_inner(
 
 fn run_update_continuation_stage_inner(
     root_dir: &Path,
+    own_version: &str,
     torch_selection: Option<TorchInstallSelection>,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
     cancel: &AtomicBool,
@@ -1026,6 +1039,12 @@ fn run_update_continuation_stage_inner(
     let torch_range = alloc_progress_range(&mut progress_cursor, 0.20);
     let deps_range = alloc_progress_range(&mut progress_cursor, 0.28);
     let app_range = (progress_cursor, 1.0_f32);
+
+    // Resolve this binary's own release BEFORE the environment is touched: if it is not
+    // listed (or lacks the archive / `SHA256SUMS`), the stage stops with nothing changed.
+    let _ = tx.send(UpdateWorkerEvent::Step(t!("installer.utils.finding_own_release_status").to_string()));
+    let app_release = fetch_app_release_by_tag(own_version, "update-continuation", cancel)?;
+    send_update_console_line(tx, format!("[Update] Program files from release {}", app_release.tag));
 
     let (uv_exe, python_exe) = ensure_uv_managed_python_environment(root_dir, tx, env_range, cancel)?;
     let pip_runner = PipInstallRunner::Uv(uv_exe);
@@ -1069,7 +1088,7 @@ fn run_update_continuation_stage_inner(
         deps_range,
         cancel,
     )?;
-    download_and_extract_app_archive_for_update(root_dir, tx, app_range, cancel)?;
+    download_and_extract_app_archive_for_update(root_dir, &app_release, tx, app_range, cancel)?;
     send_update_progress(tx, 1.0, t!("installer.utils.update_complete_status"), 1.0, t!("installer.common.ready"));
     Ok(UpdateContinuationOutcome::Completed)
 }
@@ -1079,9 +1098,9 @@ fn run_update_continuation_stage_inner(
 /// uploaded to the release, NOT the executable's on-disk name — see
 /// `platform_executable_file_name`.
 ///
-/// The single source of truth for the six release-asset names: both the release
-/// availability check (`update.rs`) and the download stage
-/// (`run_update_binary_stage_inner`) call it, so they always agree on the asset.
+/// The single source of truth for the six release-asset names: the release
+/// selection (`release::select_app_release`, used by every update and install
+/// path) calls it, so the check and the download always agree on the asset.
 ///
 /// Selection is by OS × architecture at compile time:
 ///
@@ -1143,9 +1162,10 @@ fn platform_executable_file_name() -> &'static str {
 
 /// Runs `executable --version` in `root_dir` and returns the version string it printed.
 ///
-/// The returned string is the EXTENDED, git-derived version (`MS_APP_VERSION`, e.g.
-/// `3.6.0+1cd9638-83-dirty`): it may be DISPLAYED as-is, but any comparison must first
-/// reduce both sides with [`version_core`] (see `src/MODULE_README.md`, version contract).
+/// The returned string is the copy's `MS_APP_VERSION`: a commit count (`335`) for current
+/// builds, but `3.6.0+1cd9638-83-dirty` for one built before commit-count versioning. It may be
+/// DISPLAYED as-is, but any comparison must first reduce both sides with [`version_core`] (see
+/// `crates/ms-config/src/version_format.rs`).
 ///
 /// Blocking: it spawns a process and waits for it, so callers must be on a worker thread.
 ///
@@ -1372,6 +1392,7 @@ fn ensure_uv_runtime(
             dst_path: &archive_path,
             label_prefix: "uv",
             overall_range: (overall_start, lerp(overall_start, overall_end, 0.55)),
+            required_sha256: None,
         },
         tx,
         cancel,
@@ -1522,8 +1543,11 @@ fn install_missing_dependencies_for_update(
     Ok(())
 }
 
+/// Downloads `app_release`'s archive (verified against its `SHA256SUMS`) and merges it over
+/// `root_dir`, keeping the already-replaced executable.
 fn download_and_extract_app_archive_for_update(
     root_dir: &Path,
+    app_release: &ArchiveRelease,
     tx: &mpsc::Sender<UpdateWorkerEvent>,
     overall_range: (f32, f32),
     cancel: &AtomicBool,
@@ -1534,15 +1558,20 @@ fn download_and_extract_app_archive_for_update(
     let downloads_dir = root_dir.join("installer_files").join("downloads");
     fs::create_dir_all(&downloads_dir)
         .map_err(|e| tf!("installer.utils.create_downloads_dir_error", downloads_dir = downloads_dir.display(), e = e))?;
-    let app_asset = fetch_latest_app_zip_asset(cancel)?;
+    // Verified against the release's `SHA256SUMS` before it is published, i.e. before the
+    // extraction below can see it (`release.rs`).
+    let app_checksums = app_release.checksums.fetch(cancel)?;
+    let app_asset = &app_release.archive;
+    let app_zip_sha256 = app_checksums.pin_for(app_asset)?;
     let archive_path = downloads_dir.join(&app_asset.name);
     let install_tx = UpdateToInstallEventBridge { tx }.sender();
     download_asset(
         &AssetDownload {
-            asset: &app_asset,
+            asset: app_asset,
             dst_path: &archive_path,
             label_prefix: APP_ZIP_ASSET_NAME,
             overall_range: (overall_range.0, lerp(overall_range.0, overall_range.1, 0.45)),
+            required_sha256: Some(app_zip_sha256),
         },
         &install_tx,
         cancel,
@@ -3590,46 +3619,6 @@ fn fetch_latest_uv_asset(platform: Platform, arch: &str, cancel: &AtomicBool) ->
         .map_err(|e| tf!("installer.utils.parse_uv_release_error", e = e))?;
 
     select_uv_asset(&release.assets, platform, arch)
-}
-
-fn fetch_latest_app_zip_asset(cancel: &AtomicBool) -> Result<GithubAsset, String> {
-    fetch_latest_app_asset_by_name(APP_ZIP_ASSET_NAME, cancel)
-}
-
-fn fetch_latest_app_asset_by_name(asset_name: &str, cancel: &AtomicBool) -> Result<GithubAsset, String> {
-    fetch_latest_app_release_with_asset(asset_name, cancel).map(|(_, asset)| asset)
-}
-
-fn fetch_latest_app_release_tag_with_required_asset(asset_name: &str, cancel: &AtomicBool) -> Result<String, String> {
-    fetch_latest_app_release_with_asset(asset_name, cancel).map(|(tag, _)| tag)
-}
-
-fn fetch_latest_app_release_with_asset(asset_name: &str, cancel: &AtomicBool) -> Result<(String, GithubAsset), String> {
-    let body = github_api_get(APP_RELEASES_API, INSTALLER_USER_AGENT, cancel)
-        .map_err(|e| tf!("installer.utils.get_releases_error", e = e))?;
-    let releases: Vec<GithubReleaseListItem> = serde_json::from_str(&body)
-        .map_err(|e| tf!("installer.utils.parse_releases_error", e = e))?;
-
-    for release in releases {
-        let tag = release
-            .tag_name
-            .or(release.name)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if tag.is_empty() {
-            continue;
-        }
-        if let Some(asset) = release
-            .assets
-            .into_iter()
-            .find(|asset| asset.name == asset_name)
-        {
-            return Ok((tag, asset));
-        }
-    }
-
-    Err(tf!("installer.utils.asset_not_found_error", asset_name = asset_name))
 }
 
 fn select_uv_asset(

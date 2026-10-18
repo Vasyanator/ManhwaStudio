@@ -186,7 +186,7 @@ fn build_web_launcher() -> WebApp {
         crate::ai_backend_supervisor::AiBackendHandle::disabled(),
         // The web build has no installed copy and no OS records (no System registration tab);
         // the version core is still reduced exactly as `startup::launcher_host` does.
-        crate::launcher::state::LauncherHost { ignore_installed: false, version_core: crate::version_format::version_core(env!("CARGO_PKG_VERSION")) },
+        crate::launcher::state::LauncherHost { ignore_installed: false, version_core: env!("MS_APP_VERSION") },
         false,
     );
     WebApp::Launcher(Box::new(crate::launcher::app::LauncherApp::new(entry)))

@@ -4,13 +4,15 @@
 # Steps: Rust cdylib via cargo-ndk -> stripped into android/app/src/main/jniLibs, bundled
 # runtime files (tracked fonts and launcher backgrounds ui_new/menu_imgs; --full adds the
 # extended fonts and the wiki) staged into
-# android/app/src/main/assets, launcher icon staged, then the Gradle wrapper builds the APK
-# (debug variant, signed with AGP's debug keystore). Everything staged is generated and
-# gitignored. Details and prerequisites: android/README.md.
+# android/app/src/main/assets, launcher icon staged, then the Gradle wrapper builds the APK:
+# by default the debug variant (AGP's debug keystore), with --release the release variant
+# signed with the release keystore, copied to target/android/ManhwaStudio_android_arm64.apk.
+# Everything staged is generated and gitignored. Details and prerequisites: android/README.md.
 #
 # Usage: ./build-android.sh [--release|--debug] [--full] [--install] [--logcat]
-#   --release   Rust release profile for the native library (default)
-#   --debug     Rust dev profile (debug info stripped, symbols kept)
+#   (default)   Rust release profile, debug APK (android/app/build/outputs/apk/debug/)
+#   --release   Rust release profile, signed release APK -> target/android/ (needs the keystore)
+#   --debug     Rust dev profile (debug info stripped, symbols kept), debug APK
 #   --full      also bundle fonts/ui/ext (~77 MB) and the wiki (~41 MB)
 #   --install   adb install -r the APK and launch it (uses the `adb` on PATH)
 #   --logcat    after launching, follow the app's logcat (implies --install)
@@ -19,6 +21,11 @@
 #   ANDROID_HOME (or ANDROID_SDK_ROOT)  Android SDK with platforms;android-35
 #   ANDROID_NDK_HOME                     NDK (default: the newest one under $ANDROID_HOME/ndk)
 #   JAVA_HOME                            JDK 17+ for Gradle (default: `java` on PATH)
+# Release signing (--release only; each falls back to .secret/build_config.json, gitignored):
+#   MS_ANDROID_KEYSTORE           absolute path of the keystore    (android_keystore)
+#   MS_ANDROID_KEYSTORE_PASSWORD  keystore password                (android_keystore_password)
+#   MS_ANDROID_KEY_ALIAS          key alias                        (android_key_alias)
+#   MS_ANDROID_KEY_PASSWORD       key password                     (android_key_password)
 set -euo pipefail
 
 readonly APP_ID="io.github.vasyanator.manhwastudio"
@@ -34,18 +41,61 @@ MAIN_DIR="$ANDROID_DIR/app/src/main"
 die() { echo "build-android.sh: error: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
 
-profile="release"; full=0; install=0; logcat=0
+profile="release"; variant="debug"; full=0; install=0; logcat=0
 for arg in "$@"; do
   case "$arg" in
-    --release) profile="release" ;;
+    --release) variant="release" ;;
     --debug) profile="debug" ;;
     --full) full=1 ;;
     --install) install=1 ;;
     --logcat) install=1; logcat=1 ;;
-    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) die "unknown argument '$arg' (see --help)" ;;
   esac
 done
+# A distributed APK must carry the optimized library.
+[ "$variant" = "release" ] && [ "$profile" = "debug" ] && die "--release and --debug cannot be combined"
+
+# --- release signing -------------------------------------------------------------------------
+# Checked before anything expensive runs. Values never reach the terminal: they are only
+# exported for Gradle (android/app/build.gradle.kts reads the same four variables).
+if [ "$variant" = "release" ]; then
+  secret_config="$REPO/.secret/build_config.json"
+  secret_value() {  # secret_value <json key>: string value from $secret_config, empty when absent
+    [ -f "$secret_config" ] || return 0
+    python3 -I -c '
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        config = json.load(f)
+except (OSError, ValueError) as e:
+    sys.exit("cannot read %s: %s" % (sys.argv[1], e))
+value = config.get(sys.argv[2], "") if isinstance(config, dict) else ""
+if not isinstance(value, str):
+    sys.exit("%s: key %s is not a string" % (sys.argv[1], sys.argv[2]))
+sys.stdout.write(value)
+' "$secret_config" "$1" || die "cannot read '$1' from $secret_config"
+  }
+  missing=()
+  for pair in MS_ANDROID_KEYSTORE:android_keystore MS_ANDROID_KEYSTORE_PASSWORD:android_keystore_password \
+              MS_ANDROID_KEY_ALIAS:android_key_alias MS_ANDROID_KEY_PASSWORD:android_key_password; do
+    var="${pair%%:*}"; key="${pair#*:}"
+    if [ -z "${!var:-}" ]; then
+      value="$(secret_value "$key")"
+      printf -v "$var" '%s' "$value"
+    fi
+    if [ -n "${!var}" ]; then export "${var?}"; else missing+=("$var"); fi
+  done
+  unset value
+  [ "${#missing[@]}" -eq 0 ] \
+    || die "release signing needs ${missing[*]} (environment or .secret/build_config.json; see android/README.md, \"Release builds\")"
+  case "$MS_ANDROID_KEYSTORE" in
+    /*) ;;
+    *) die "MS_ANDROID_KEYSTORE must be an absolute path (got '$MS_ANDROID_KEYSTORE')" ;;
+  esac
+  [ -f "$MS_ANDROID_KEYSTORE" ] || die "release keystore '$MS_ANDROID_KEYSTORE' does not exist"
+  info "release signing: keystore $MS_ANDROID_KEYSTORE, alias $MS_ANDROID_KEY_ALIAS"
+fi
 
 # --- toolchain -------------------------------------------------------------------------------
 local_prop() {  # local_prop <key>: value from android/local.properties, empty when absent
@@ -160,10 +210,22 @@ mkdir -p "$icon_dir"
 cp "$REPO/app_icon_512.png" "$icon_dir/ic_launcher.png"
 
 # --- APK -------------------------------------------------------------------------------------
-info "Gradle assembleDebug"
-(cd "$ANDROID_DIR" && ./gradlew --console=plain assembleDebug)
-apk="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
-[ -f "$apk" ] || die "Gradle produced no '$apk'"
+if [ "$variant" = "release" ]; then
+  info "Gradle assembleRelease"
+  (cd "$ANDROID_DIR" && ./gradlew --console=plain assembleRelease)
+  gradle_apk="$ANDROID_DIR/app/build/outputs/apk/release/app-release.apk"
+  [ -f "$gradle_apk" ] || die "Gradle produced no signed '$gradle_apk'"
+  # Stable path the release tooling picks the asset up from.
+  release_dir="$REPO/target/android"
+  mkdir -p "$release_dir"
+  apk="$release_dir/ManhwaStudio_android_arm64.apk"
+  cp "$gradle_apk" "$apk"
+else
+  info "Gradle assembleDebug"
+  (cd "$ANDROID_DIR" && ./gradlew --console=plain assembleDebug)
+  apk="$ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+  [ -f "$apk" ] || die "Gradle produced no '$apk'"
+fi
 info "APK: $apk ($(du -h "$apk" | cut -f1))"
 
 [ "$install" = 1 ] || exit 0

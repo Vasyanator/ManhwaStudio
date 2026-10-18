@@ -250,7 +250,7 @@ Reformatting is acceptable only once proven inert this way.
 
 ## Where facts go
 
-- `dev-docs/` (gitignored, never published): plans, reports, changelogs, migration notes,
+- `dev-docs/` (gitignored, never published): plans, reports, migration notes,
   machine-local notes, `i18n_exclusions.md`. Known gaps and accepted debt (global §2.5 option b):
   the nearest `MODULE_README.md` or `dev-docs/known_gaps.md` (entry shape `KG-NNN`, defined at
   its top).
@@ -265,6 +265,26 @@ Reformatting is acceptable only once proven inert this way.
   owning `MODULE_README.md`.
 - Update `PROJECT_RULES.md` when you learn a project-specific agent rule the hard way (a tool
   pitfall, a verification command, a house-style fact). Never restate a global rule here.
+
+## Changelog and releases
+
+- **`CHANGELOG.md` (tracked) is kept by the agent after every task** whose result a user can
+  notice (feature, behaviour change, fix, new setting, removed option). Add the entry in BOTH
+  halves: English under the trailing `## Unreleased`, Russian under the trailing
+  `## Не выпущено`, inside the matching `###` category (New features / Improvements / Behaviour
+  changes / Fixes / Technical; Russian: Новые возможности / Улучшения / Изменения поведения /
+  Исправления / Техническое), creating the category if absent. One bullet per feature,
+  `- **Name** — what the user gets`, written for users, no file paths or internal names. Extend
+  an existing bullet of the same unreleased feature instead of adding a second one. Pure
+  refactors with no visible effect get no entry. Never edit a released `## N — date` block.
+- Versions are commit counts (`git rev-list --count`); a release is tag `N` + root `Cargo.toml`
+  `N.0.0`, made only by the private `release.py` (its docstring is the manual), which turns the
+  unreleased blocks into `## N — date` and publishes them as the GitHub release notes. Never edit
+  the version, create a numeric tag or a GitHub release by hand.
+- Frozen by the installed 3.6.0 updater (it takes the FIRST release in GitHub's list carrying
+  `ManhwaStudio.zip` + its platform binary, compares `tag_name` with its own `--version`): the
+  asset names, the hidden `--continue-update` flag, `--version` printing the version as its last
+  whitespace token, plain numeric tags, and never a pre-release carrying those assets.
 
 ## File-size calibration (global §2.5)
 

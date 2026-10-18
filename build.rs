@@ -3,27 +3,32 @@ FILE OVERVIEW: build.rs
 Build script for platform-specific executable metadata and the compile-time version.
 
 Main responsibilities:
-- Emits `cargo:rustc-env=MS_APP_VERSION=<composed version>` — the human-facing
-  application version, derived from `CARGO_PKG_VERSION` plus the git state of the
-  source tree. `CARGO_PKG_VERSION` itself is NEVER overridden: it stays the
-  machine-facing value used by every comparison and cross-process parse, and it is
-  also what `winresource` reads from this script's own environment for the numeric
-  Windows `FILEVERSION` (which has no encoding for a hash suffix anyway).
-  The composition itself lives in `crates/ms-config/src/version_format.rs` and is
-  pulled in with `include!` so that the exact code this script runs is covered by
-  `cargo test`.
-  Every git failure — no `git` on PATH, no repository, no tags, a shallow clone,
-  a non-zero exit — degrades silently to the plain `Cargo.toml` version. That is the
-  normal state of a GitHub source ZIP, so it must never produce a `cargo:warning=`.
+- Emits `cargo:rustc-env=MS_APP_VERSION=<version>` — THE program version of this build:
+  the commit count of the commit it was built from (`git rev-list --count HEAD`, e.g.
+  `335`; no hash, no dirty marker). Displayed, printed by `--version`, compared against
+  release tags and handed to other processes (`crates/ms-config/src/version_format.rs`).
+  `CARGO_PKG_VERSION` is NEVER overridden: it is packaging metadata, read by `winresource`
+  from this script's own environment for the numeric Windows `FILEVERSION`.
+  The count is parsed by `version_format::parse_commit_count`, pulled in with `include!`
+  so that the exact code this script runs is covered by `cargo test`.
+  When no count can be obtained — no `.git` in the manifest directory (a GitHub source ZIP),
+  no `git` on PATH, a shallow clone (its count would be too small, i.e. a wrong version),
+  a non-zero exit or unparsable output — the version is the FULL `CARGO_PKG_VERSION`
+  (`3.6.0`, or `N.0.0` after release N), which compares correctly against tags, and a
+  `cargo:warning=` says so.
 - Emits the `cargo:rerun-if-changed` watches that keep that version fresh. This is
   NOT optional bookkeeping: this script already emitted `rerun-if-changed`, which
   REPLACES cargo's default "re-run when any package file changed", so without the
-  watches below a git-derived value would go stale on the very next build. Watched:
-  `.git/HEAD`, `.git/index`, `.git/packed-refs`, `.git/refs` (commits, staging,
-  branch switches, tag changes) and the `src` / `crates` directories (which is what
-  makes the dirty marker track reality — editing a file without staging it does not
-  touch `.git/index`). When `.git` is a FILE (linked worktree or submodule checkout)
-  the ref watches are skipped rather than guessed at.
+  watches below a git-derived value would go stale on the very next build. The git
+  directories are resolved with `git rev-parse --git-dir --git-common-dir`, so a linked
+  worktree or submodule checkout (where `.git` is a FILE) is covered too. Watched: `HEAD`
+  of the worktree's own git dir (a branch switch or detached-HEAD move rewrites it) and, in
+  the common dir, `refs/` (recursively: a commit moves the checked-out branch's loose ref,
+  including one that does not exist yet while the branch is only packed), `packed-refs`
+  and `shallow` when present. The `src` / `crates` directories are watched too: the
+  count does not depend on them, but they are what re-runs this script — and with it the
+  Windows signer below — on every source change, a behaviour the release workflow relies
+  on until the owner decides otherwise (see KNOWN CONSEQUENCE).
 - **EVERY watch this script emits — the codesign ones at the top of `main` included —
   is emitted ONLY for a path that actually exists, and that rule is load bearing.**
   Cargo treats a `rerun-if-changed` naming a MISSING path as permanently stale, so it
@@ -38,7 +43,8 @@ Main responsibilities:
   Verify with `CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build`: cargo
   names the missing file outright ("Dirty …: the file … is missing").
   KNOWN CONSEQUENCE, awaiting a decision by the project owner: watching `src`/`crates`
-  makes this script re-run on every source change, so EVERY Windows-target build or
+  (originally for the git dirty marker, now kept only for this effect) makes this script
+  re-run on every source change, so EVERY Windows-target build or
   check that does not set `MS_DISABLE_BUILD_CODESIGN=1` re-spawns the detached
   `osslsigncode` worker below. `cargo check-all` is exactly such an invocation — it
   cross-checks the windows-gnu target and sets nothing — so the routine post-change
@@ -69,7 +75,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-// The version composition is shared verbatim with the crate: it is a module of
+// The commit-count parser is shared verbatim with the crate: it is a module of
 // `ms-config` (re-exported by the binary as `crate::version_format`, see `src/lib.rs`).
 // `include!` rather than a copy, so that the code this script runs is the code
 // `cargo test` covers; the file's `#[cfg(test)] mod tests` is inert here.
@@ -221,75 +227,78 @@ fn secret_config_path() -> PathBuf {
 }
 
 /// Emits `cargo:rustc-env=MS_APP_VERSION` together with the `rerun-if-changed` watches
-/// that keep it fresh. See this file's header for the rerun policy and its accepted
-/// side effect on the Windows codesign worker.
+/// that keep it fresh. See this file's header for the version rule, the rerun policy and
+/// its accepted side effect on the Windows codesign worker.
 ///
-/// Never fails: any git problem degrades to the plain `CARGO_PKG_VERSION`, silently and
-/// without a `cargo:warning=` (a source ZIP has no repository, and that is normal).
+/// Never fails the build: when no commit count can be obtained the version is the full
+/// `CARGO_PKG_VERSION`, announced with one `cargo:warning=` naming the reason.
 fn emit_app_version() {
     let manifest = manifest_dir();
     emit_version_rerun_watches(&manifest);
 
-    let base_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    // The probes run with `current_dir(manifest)` and git searches UPWARD for a
-    // repository. Without this gate a `.git`-less source tree unpacked inside some other
-    // repository — the GitHub-ZIP case this feature exists to degrade gracefully on —
-    // would silently adopt the ENCLOSING repository's tag, distance and hash. That is a
-    // wrong version rather than a missing one, and a permanently stale one, since no
-    // `.git/*` watch was emitted for a directory that is not there. `.exists()`, not
-    // `.is_dir()`: a linked worktree stores `.git` as a file and is still a repository.
-    let git_info = if manifest.join(".git").exists() { git_describe_info(&manifest) } else { None };
-    // The dirty flag is meaningless without a commit to attach it to, so the probe is
-    // skipped entirely when `git describe` produced nothing (see `compose_app_version`).
-    let dirty = git_info.is_some() && git_source_tree_is_dirty(&manifest);
-    let version = compose_app_version(
-        &base_version,
-        git_info.as_ref().map(|(hash, distance)| (hash.as_str(), *distance)),
-        dirty,
-    );
+    let version = match git_commit_count(&manifest) {
+        Ok(count) => count.to_string(),
+        Err(reason) => {
+            let fallback = env::var("CARGO_PKG_VERSION").unwrap_or_default();
+            println!("cargo:warning=MS_APP_VERSION: no git commit count ({reason}); using the Cargo.toml version {fallback}");
+            fallback
+        }
+    };
     println!("cargo:rustc-env=MS_APP_VERSION={version}");
 }
 
-/// Emits one `cargo:rerun-if-changed` per EXISTING path that can change the composed
-/// version. Missing paths are skipped on purpose: cargo treats a watch on a missing path
-/// as "always changed" and would re-run this script on every build, which is precisely
-/// the wrong outcome in a `.git`-less source ZIP.
+/// Emits one `cargo:rerun-if-changed` per EXISTING path that can change the version (or, for
+/// `src` / `crates`, must re-run this script for the signer; see the file header). Missing
+/// paths are skipped on purpose: cargo treats a watch on a missing path as "always changed"
+/// and would re-run this script on every build, which is precisely the wrong outcome in a
+/// `.git`-less source ZIP.
 fn emit_version_rerun_watches(manifest: &Path) {
-    // Source directories: cargo walks a watched directory recursively. These are what the
-    // dirty marker depends on — an unstaged edit never touches anything under `.git/`.
+    // Cargo walks a watched directory recursively.
     for source_dir in ["src", "crates"] {
         if manifest.join(source_dir).is_dir() {
             println!("cargo:rerun-if-changed={source_dir}");
         }
     }
 
-    // A linked worktree or a submodule checkout stores `.git` as a FILE pointing at the
-    // real git directory. Resolving that indirection is out of scope; skip the ref
-    // watches rather than watch paths that do not exist.
-    let git_dir = manifest.join(".git");
-    if !git_dir.is_dir() {
+    // Same gate as `git_commit_count`: without a `.git` of its own, the source tree must not
+    // adopt (and watch) an ENCLOSING repository.
+    if !manifest.join(".git").exists() {
         return;
     }
-    // `HEAD` catches branch switches and detached-HEAD moves, `index` catches staging,
-    // `packed-refs` and `refs/` catch commits and tag creation/packing.
-    for git_rel in [".git/HEAD", ".git/index", ".git/packed-refs", ".git/refs"] {
-        if manifest.join(git_rel).exists() {
-            println!("cargo:rerun-if-changed={git_rel}");
-        }
+    // `.git` may be a FILE (linked worktree, submodule checkout) pointing elsewhere, so the
+    // real directories come from git itself. A failure means no count either (it would fail
+    // the same way), so there is nothing to keep fresh.
+    let Some(dirs) = run_git(manifest, &["rev-parse", "--git-dir", "--git-common-dir"]) else {
+        return;
+    };
+    let mut lines = dirs.lines();
+    let (Some(git_dir), Some(common_dir)) = (lines.next(), lines.next()) else {
+        return;
+    };
+    // Relative answers are relative to the probe's working directory, i.e. `manifest`;
+    // `join` keeps an absolute answer as it is.
+    let git_dir = manifest.join(git_dir.trim());
+    let common_dir = manifest.join(common_dir.trim());
+    // `HEAD` is per worktree; refs, packed refs and the shallow marker are shared. Watching
+    // the whole `refs/` directory (cargo scans a directory recursively) covers the
+    // checked-out branch's loose ref even when a commit creates it for a branch that was
+    // only packed so far — a watch on that not-yet-existing file would be a missing path.
+    let watched = [git_dir.join("HEAD"), common_dir.join("refs"), common_dir.join("packed-refs"), common_dir.join("shallow")];
+    for path in watched.iter().filter(|path| path.exists()) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
 }
 
 /// Runs `git` in `manifest` and returns its trimmed stdout, or `None` on any failure.
 ///
 /// stderr is discarded so that it can never end up in parsed data, and
-/// `GIT_OPTIONAL_LOCKS=0` forbids git from taking the index lock: without it a plain
-/// `git status` may rewrite `.git/index` while refreshing it, and `.git/index` is one of
-/// the paths this script watches — the build would then re-run the script forever.
+/// `GIT_OPTIONAL_LOCKS=0` forbids git from taking optional locks (a probe must never write
+/// into `.git`, whose files this script watches — a write would re-run the script forever).
 ///
 /// `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` are removed from the child environment:
 /// inherited, any of them would point the probe at a repository other than the one being
 /// built (a git hook or a wrapper script is enough to set them), which is the same wrong
-/// answer the `.git` gate in `emit_app_version` exists to prevent.
+/// answer the `.git` gate in `git_commit_count` exists to prevent.
 fn run_git(manifest: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
@@ -309,34 +318,27 @@ fn run_git(manifest: &Path, args: &[&str]) -> Option<String> {
     Some(text.trim().to_string())
 }
 
-/// Returns `(short_hash, commits_since_tag)` from `git describe --tags --long`, or `None`
-/// when there is no git, no repository, no reachable tag, or the output does not parse.
+/// Returns the commit count of `HEAD` in the repository at `manifest`, or the reason (English,
+/// for the build warning) why none can be trusted.
 ///
-/// `git describe --long` prints `<tag>-<distance>-g<hash>`, and a tag name may itself
-/// contain `-`, so the two trailing fields are split off from the RIGHT. Anything that
-/// does not parse into a numeric distance and a hex hash is rejected instead of guessed.
-fn git_describe_info(manifest: &Path) -> Option<(String, u32)> {
-    let described = run_git(manifest, &["describe", "--tags", "--long", "--abbrev=7"])?;
-    let (head, hash_field) = described.rsplit_once('-')?;
-    let (_tag, distance_field) = head.rsplit_once('-')?;
-
-    let short_hash = hash_field.strip_prefix('g')?;
-    if short_hash.is_empty() || !short_hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return None;
+/// The probes run with `current_dir(manifest)` and git searches UPWARD for a repository.
+/// Without the `.git` gate a `.git`-less source tree unpacked inside some other repository —
+/// the GitHub-ZIP case — would silently adopt the ENCLOSING repository's count: a wrong
+/// version rather than a missing one, and a permanently stale one, since no `.git/*` watch was
+/// emitted for a directory that is not there. `.exists()`, not `.is_dir()`: a linked worktree
+/// stores `.git` as a file and is still a repository. A shallow clone is refused because its
+/// history is truncated, so `rev-list --count` would report a smaller, wrong number.
+fn git_commit_count(manifest: &Path) -> Result<u64, &'static str> {
+    if !manifest.join(".git").exists() {
+        return Err("no .git in the source tree");
     }
-    let distance = distance_field.parse::<u32>().ok()?;
-    Some((short_hash.to_string(), distance))
-}
-
-/// Reports whether `src/` or `crates/` carry uncommitted changes (modified, staged or
-/// untracked). The scope is those two directory trees ENTIRELY, documentation included:
-/// `src/MODULE_README.md` and the per-module readmes live inside `src/`, so editing one
-/// marks the build dirty. Everything outside the two trees — `wiki/`, `dev-docs/`,
-/// `user_config.json`, logs, `ARCHITECTURE.md` — does not. Any git failure reads as
-/// "clean".
-fn git_source_tree_is_dirty(manifest: &Path) -> bool {
-    run_git(manifest, &["status", "--porcelain", "--", "src", "crates"])
-        .is_some_and(|status| !status.is_empty())
+    match run_git(manifest, &["rev-parse", "--is-shallow-repository"]).as_deref() {
+        Some("false") => {}
+        Some("true") => return Err("shallow clone"),
+        Some(_) | None => return Err("git is unavailable or the repository is unreadable"),
+    }
+    let output = run_git(manifest, &["rev-list", "--count", "HEAD"]).ok_or("git rev-list --count HEAD failed")?;
+    parse_commit_count(&output).ok_or("unparsable git rev-list output")
 }
 
 /// Reads `key_path` and `password` from `.secret/build_config.json`. Either may

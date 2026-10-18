@@ -27,22 +27,18 @@ extern crate ms_i18n;
 
 /// The HOST application's own version, handed to the installer by the binary.
 ///
-/// A library cannot read the executable's version: `env!("CARGO_PKG_VERSION")` compiled
-/// inside this crate would yield *this crate's* version, and `MS_APP_VERSION` is a
-/// `rustc-env` the root `build.rs` emits for the root crate only. Both halves are
-/// therefore passed in at the entry points instead of being read here.
-///
-/// The two fields are NOT interchangeable — see
-/// `crates/ms-config/src/version_format.rs` for the split.
+/// A library cannot read the executable's version: `MS_APP_VERSION` is a `rustc-env` the
+/// root `build.rs` emits for the root crate only (and `env!("CARGO_PKG_VERSION")` compiled
+/// inside this crate would yield *this crate's* version). It is therefore passed in at the
+/// entry points instead of being read here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostVersion {
-    /// Plain `CARGO_PKG_VERSION` of the application. The machine-facing value: every
-    /// release comparison reduces this and the remote tag with `version_core` first, so a
-    /// git-suffixed development build never outranks the tag it was built from.
-    pub core: &'static str,
-    /// Extended, git-derived `MS_APP_VERSION` of the application. Display only — never
-    /// compared, never parsed.
-    pub display: &'static str,
+    /// `MS_APP_VERSION` of the application: the commit count it was built from (`335`), or the
+    /// full `CARGO_PKG_VERSION` for a build without git. The one version of the program —
+    /// displayed, compared against release tags (`version_format::compare_release_versions`)
+    /// and written as the Windows Uninstall entry's `DisplayVersion`. See
+    /// `crates/ms-config/src/version_format.rs`.
+    pub version: &'static str,
 }
 
 // Desktop-only subsystem: installs/updates the native Python env and binary.
@@ -51,6 +47,10 @@ pub struct HostVersion {
 pub mod install;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod update;
+// The release feed, the selection of the release to update to, and its `SHA256SUMS` pins;
+// `pub` because the binary's startup update check selects with the same function.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod release;
 // The missing-environment startup prompt window (install / update a custom folder / launcher).
 #[cfg(not(target_arch = "wasm32"))]
 pub mod prompt_window;

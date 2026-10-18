@@ -6,14 +6,48 @@ only the thin Android shell. Build it with the script in the repository root:
 
 ```bash
 ./build-android.sh            # release-profile native library, APK in android/app/build/outputs/apk/debug/
+./build-android.sh --release  # signed release APK -> target/android/ManhwaStudio_android_arm64.apk
 ./build-android.sh --install  # ... then `adb install -r` and launch on the connected device
 ./build-android.sh --logcat   # ... then follow the app's logcat
 ./build-android.sh --full     # also bundle the extended CJK fonts (fonts/ui/ext) and the wiki
 ./build-android.sh --debug    # Rust dev profile instead of release
 ```
 
-The APK is always Gradle's debug variant, signed with AGP's debug keystore
-(`~/.android/debug.keystore`); release signing is not set up yet.
+Without `--release` the APK is Gradle's debug variant, signed with AGP's debug keystore
+(`~/.android/debug.keystore`). `--release` builds the release variant signed with the release
+keystore (see "Release builds"); it cannot be combined with `--debug`.
+
+## Release builds
+
+The release APK (`ManhwaStudio_android_arm64.apk`, a release asset) is signed with ONE
+long-lived keystore. Android installs an update in place only when it is signed with the same
+key, so **losing the keystore (or its passwords) means users can never update the app in place**:
+they would have to uninstall it, losing its app data. Keep the keystore outside the repository
+and back it up together with its passwords.
+
+Create it once (JDK `keytool`; it asks for the passwords):
+
+```bash
+keytool -genkeypair -v -keystore <path outside the repo>/manhwastudio-release.jks \
+  -alias manhwastudio -keyalg RSA -keysize 4096 -validity 36500
+```
+
+`./build-android.sh --release` takes the credentials from the environment, each variable falling
+back to the key in brackets of the gitignored `.secret/build_config.json` (a JSON object of
+strings):
+
+- `MS_ANDROID_KEYSTORE` (`android_keystore`): absolute path of the keystore;
+- `MS_ANDROID_KEYSTORE_PASSWORD` (`android_keystore_password`);
+- `MS_ANDROID_KEY_ALIAS` (`android_key_alias`), e.g. `manhwastudio`;
+- `MS_ANDROID_KEY_PASSWORD` (`android_key_password`).
+
+The script checks them (and that the keystore file exists) before the Rust build starts,
+exports them for Gradle and never prints a password. `app/build.gradle.kts` reads only the
+environment: a credential never comes from a tracked file. When one is missing, only release
+tasks fail (`checkReleaseSigning`, naming the missing variables); debug builds keep working.
+The release variant is not minified (the Rust side reaches Java / Kotlin classes through JNI by
+name) and is not debuggable, so `adb shell run-as` does not work with it. A device that has the
+debug build installed must uninstall it before installing a release APK (different signing key).
 
 ## Prerequisites
 
@@ -43,8 +77,14 @@ The APK is always Gradle's debug variant, signed with AGP's debug keystore
   `rustls-platform-verifier` found through `cargo metadata` (the crate ships its Kotlin
   component as an AAR inside its source), and the `:winit-secondary-window` module (see
   "Secondary windows" below).
-- `app/build.gradle.kts`: SDK levels, versions (versionName = root `Cargo.toml` version,
-  versionCode = major * 1000000 + minor * 1000 + patch), dependencies, packaging.
+- `app/build.gradle.kts`: SDK levels, versions (from the root `Cargo.toml` version `X.Y.Z`:
+  versionName = `N` for a release version `N.0.0` — N being the release's commit count — else
+  `X.Y.Z`; versionCode = major * 10000 + minor * 100 + patch, minor and patch below 100), release
+  signing, dependencies, packaging. A debug build made under the older versionCode scheme
+  (major * 1000000 + …, e.g. 3006000 for 3.6.0) carries a higher code than builds of the
+  current scheme made before the first commit-count release (`3.6.0` -> 30600), so Android
+  refuses those as a downgrade: uninstall it once. From release 301 on (code N * 10000 >=
+  3010000) the new code is higher and no uninstall is needed for the version code alone.
 - `app/src/main/AndroidManifest.xml`: `LaunchActivity` (launcher entry) and `MainActivity`
   (the `GameActivity`, `android.app.lib_name = manhwastudio_rs`).
 - `app/src/main/res/xml/data_extraction_rules.xml`: Android 12+ backup / device-transfer
@@ -215,6 +255,6 @@ are no longer listed.
 - Use one `adb` binary consistently: two different adb versions kill each other's server and
   drop wireless connections. The script calls the `adb` on `PATH`.
 - `adb shell run-as io.github.vasyanator.manhwastudio ls files/ms_root` inspects the runtime
-  root (works because the APK is debuggable).
+  root (works because the debug APK is debuggable; not with a release APK).
 - Logcat tag `ManhwaStudio` carries the app's `log` lines and the winit fork's `tracing` lines
   (`winit ime:`, `winit insets:`, warnings), at Info level and above.

@@ -41,8 +41,8 @@ Main items:
 - `Cli.trace`: enables detailed execution tracing to `trace-last.log` (see `crates/ms-log/src/trace.rs`).
 
 Notes:
-`--version` reports the extended, git-derived `MS_APP_VERSION` (see `crates/ms-config/src/version_format.rs`
-and `build.rs`), not the plain `CARGO_PKG_VERSION`.
+`--version` reports `MS_APP_VERSION` (the commit count; see `crates/ms-config/src/version_format.rs`
+and `build.rs`), not clap's default `CARGO_PKG_VERSION`.
 */
 
 use clap::{ArgAction, ArgGroup, Parser};
@@ -50,11 +50,11 @@ use clap::{ArgAction, ArgGroup, Parser};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-// `--version` prints the EXTENDED, git-derived version (`MS_APP_VERSION`), not clap's
-// default `CARGO_PKG_VERSION`: a developer typing it is exactly the reader this string
-// serves. The installer also probes an installed copy with `--version`
-// (`installer::utils::query_executable_version`), and that consumer compares only the
-// semver core through `version_format::version_core`, so the suffix is invisible to it.
+// `--version` prints the program version (`MS_APP_VERSION`, the commit count), not clap's
+// default `CARGO_PKG_VERSION`. FROZEN output shape: `manhwastudio_rs <version>`, the version
+// being ONE whitespace-free token and the LAST token of the line. Installed updaters of every
+// release (3.6.0 included) probe a copy with `--version` and take the last token containing a
+// digit (`installer::utils::query_executable_version`) to compare it with release tags.
 #[derive(Debug, Parser)]
 #[command(
     author,

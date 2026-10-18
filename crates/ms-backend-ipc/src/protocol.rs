@@ -30,7 +30,7 @@ use serde_json::{Map, Value, json};
 ///
 /// This constant is the ONLY compatibility gate between the Rust application and the
 /// Python backend: `client::verify_hello` rejects a connection whose `hello` reply
-/// carries a different value. The program version (`CARGO_PKG_VERSION` /
+/// carries a different value. The program version (`MS_APP_VERSION` /
 /// `config.VERSION`) is never compared — it is diagnostic information only.
 ///
 /// It MUST be bumped in BOTH files together on ANY change to that contract, not only on

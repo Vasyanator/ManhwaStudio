@@ -28,8 +28,8 @@ holds no state between calls: process-global services it starts (AI backend supe
   table-tested; see "Run modes" below).
 - `mod.rs`: `run_native` (parse -> decide -> match), `init_minimal` (the process-wide side
   effects every non-helper mode needs), `run_main` (update preludes, test launcher, main
-  window), `HOST_VERSION` (the `ms_installer::HostVersion` pair
-  this package hands to the installer and IPC crates), `launcher_host`, the ONE session-log
+  window), `HOST_VERSION` (the `ms_installer::HostVersion`, i.e.
+  `MS_APP_VERSION`, this package hands to the installer, launcher and IPC crates), `launcher_host`, the ONE session-log
   init (`init_startup_logging_best_effort`, called once before the mode split; no later window
   re-opens the log).
 - `services.rs`: `init_full`, the ONE owner of the startup-order contract (its doc comment lists

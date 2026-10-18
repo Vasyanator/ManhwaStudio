@@ -65,8 +65,9 @@ pub struct LauncherHost {
     /// `--ignore-installed`: the launcher never modifies the OS records of an installed copy;
     /// the System registration tab is read-only and its warnings are silent.
     pub ignore_installed: bool,
-    /// This build's version core (`version_format::version_core` of `CARGO_PKG_VERSION`):
-    /// the `DisplayVersion` a written Uninstall entry carries.
+    /// This build's program version (`MS_APP_VERSION`, the commit count; it carries no build
+    /// metadata, so it is its own version core): the `DisplayVersion` a written Uninstall
+    /// entry carries.
     pub version_core: &'static str,
 }
 

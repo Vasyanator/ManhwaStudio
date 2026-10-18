@@ -42,17 +42,24 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 
 ## Files and submodules
 - `lib.rs`: crate boundary, public installer entry point export, and `HostVersion` — the
-  application's own version pair, which the binary hands in at the entry points because a
-  library cannot read the executable's `CARGO_PKG_VERSION` / `MS_APP_VERSION`.
+  application's own version (`MS_APP_VERSION`, the commit count), which the binary hands in at
+  the entry points because a library cannot read it.
 - `install.rs`: installer UI, event types, public startup/service functions. Its folder picker
   (custom install location) is the non-blocking `ms_platform::file_dialog` (`PickDirectoryPath`,
   polled each frame).
 - `update.rs`: update window shell, background release re-check, test-version override,
   executable-update progress, PyTorch choice continuation, completion state, and no-update exit.
 - `utils.rs`: worker pipeline and platform helpers used by installer and updater UI.
+- `release.rs` (+ `release/tests.rs`): the one owner of the app release feed
+  (`APP_RELEASES_API`, `APP_ZIP_ASSET_NAME`, `APP_CHECKSUMS_ASSET_NAME`), of the selection of
+  the release to update to / install from (`select_app_release`, pure; `fetch_latest_app_release`),
+  of the continuation's own-version release (`select_app_release_by_tag`,
+  `fetch_app_release_by_tag`) and of its `SHA256SUMS` manifest (`ChecksumsAsset::fetch`, strict
+  `parse_sha256sums`, `ReleaseChecksums::pin_for`). `pub` because the binary's startup check selects with it too.
 - `download.rs` (+ `download/tests.rs`): the network layer on `ms-download` — `GithubAsset`
-  (name, URL, `size`, `digest`), `github_api_get` (`fetch_small`), `download_asset`
-  (`fetch_verified`, identity sidecar, progress / retry text). Edit it for how anything is
+  (name, URL, `size`, `digest`), `github_api_get` (`fetch_small`), `fetch_small_asset` (a small
+  asset such as `SHA256SUMS`, exact listed size), `download_asset` (`fetch_verified`, identity
+  sidecar, required sha256 pin, progress / retry text). Edit it for how anything is
   fetched; edit `utils.rs` for what is fetched and when.
 - `prompt_window.rs`: the missing-environment startup prompt (install / update a custom install
   folder / open the launcher), returning `MissingPythonEnvAction`; the binary's
@@ -87,8 +94,28 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - Direct HTTP file downloads must go through `download.rs::download_asset`, which runs
   `ms_download::fetch_verified` (`RetryPolicy::standard`, `Range` resume into `<file>.part`,
   15 s connect / 60 s read timeouts, fsync + rename; the destination never holds a partial or
-  unverified file). The pin is the GitHub asset's `size` plus its sha256 when the API publishes
-  a `digest` (`sha256:<hex>`), else the size alone; a hash mismatch deletes the `.part`.
+  unverified file). The pin is the GitHub asset's `size` plus a sha256: the caller's
+  `AssetDownload::required_sha256` when set, else the API's `digest` (`sha256:<hex>`) when
+  published, else the size alone; a hash mismatch deletes the `.part`, is not retried and gets
+  its own message (`installer.utils.download_checksum_mismatch_error`).
+- **Every app download is verified against the release's `SHA256SUMS`** (`STATE.md` S-066):
+  the platform binary of the update stage, `ManhwaStudio.zip` of the `--continue-update` stage
+  and of a fresh install. The binary stage and the install select the newest release
+  (`release::fetch_latest_app_release`; eligible only with the archive, this platform's binary
+  AND `SHA256SUMS`). The `--continue-update` stage, running in the new binary, selects the
+  release whose tag EQUALS its own `MS_APP_VERSION` (`release::fetch_app_release_by_tag`; archive
+  + `SHA256SUMS` required), before it touches the environment, so a release published between
+  the two stages can never mix an executable of one release with the files of another; a
+  missing own release stops the stage with a user-visible error. The worker downloads the
+  manifest (exact listed size; GitHub's sha256 digest of the manifest itself when listed),
+  parses it — strict per-line syntax and no duplicate names; line order and completeness are
+  NOT checked, pins are taken only for the assets this program downloads — takes the asset's entry with
+  `ReleaseChecksums::pin_for` and passes it as `required_sha256`. Because `fetch_verified`
+  checks the pin before publishing, the binary is verified before it can replace the program
+  and the archive before it can be extracted. A malformed manifest, a missing entry, a GitHub
+  digest that disagrees with the entry, or a downloaded file that does not match is a hard,
+  logged, user-visible error; nothing is retried and the proven-wrong staged bytes are
+  discarded. uv downloads keep the GitHub-digest pin (uv publishes no such manifest).
   Retries are shown as stage progress ("network error, retrying in N s (k/n)"), not as errors.
 - Cross-run resume: `<file>.identity.json` records the `{url, size, digest}` the staged files
   (`<file>.part`, the verified `<file>.download`) belong to; when it is missing, unreadable or
@@ -155,16 +182,17 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   run on background workers; the GUI thread only polls worker results, asks for PyTorch choice when
   needed, and draws state. Existing-install and custom-folder update entry points first query the
   target executable with `--version`, compare against GitHub releases, replace that executable, and
-  launch the target copy with `--continue-update`. `--version` prints the EXTENDED version
-  (`MS_APP_VERSION`, possibly `3.6.0+1cd9638-83-dirty`), so `run_update_binary_stage_inner` reduces
-  both sides with `version_format::version_core` before `version_format::compare_release_versions`
-  (the ONE release comparator, also used by the update window and the binary's startup check;
-  never add a local copy); the release checks themselves are always fed the plain
-  `CARGO_PKG_VERSION`. The releases API URL and archive asset name are the `pub const`s in
-  `update.rs` (`APP_RELEASES_API`, `APP_ZIP_ASSET_NAME`). The extended string may be
-  displayed (`UpdateApp::local_version_display`) but never compared.
+  launch the target copy with `--continue-update`. `--version` prints the copy's
+  `MS_APP_VERSION` — a commit count, or `3.6.0+1cd9638-83-dirty` for a copy built before
+  commit-count versioning — so `run_update_binary_stage_inner` reduces both sides with
+  `version_format::version_core` before `version_format::compare_release_versions` (the ONE
+  release comparator, also used by the update window and the binary's startup check; never add
+  a local copy). The update window compares and displays the running copy's
+  `HostVersion::version` (`MS_APP_VERSION`). The releases API URL and the asset names are the
+  `pub const`s in `release.rs`.
 - Update flow is two-stage: first replace the platform executable from the latest GitHub release,
-  then resume with `--continue-update` to repair/create uv-managed `installer_files/venv`, refresh
+  then resume with `--continue-update` (archive from the release of the new binary's own
+  version, see above) to repair/create uv-managed `installer_files/venv`, refresh
   PyTorch only for Full installs when the embedded torch version is newer, install missing embedded
   dependency-list packages, and unpack `ManhwaStudio.zip` over the install root.
 - Which Windows records an install gets is decided HERE, by install kind
@@ -175,7 +203,7 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   shortcuts the user ticked). "Open with" registration is best-effort for both kinds
   (`utils.rs::register_windows_open_with_best_effort`: logged and shown in the console, never
   fails an install). The Uninstall entry's `DisplayVersion` is the RUNNING program's
-  `version_core` (`HostVersion` handed to `install::run_python_installer_window`, carried by
+  version (`HostVersion::version` handed to `install::run_python_installer_window`, carried by
   `InstallerPurpose::FullInstall`). Uninstall (`run_windows_uninstall_worker`) removes
   shortcuts, then the registry entries that point into the uninstalled directory, then the
   files; when existing entries were left in place (another install's, or unverifiable) it shows
@@ -193,7 +221,9 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
   / aarch64 `manhwastudio_rs_macos_arm64`; Linux x86_64 bare `manhwastudio_rs` / aarch64
   `manhwastudio_rs_linux_arm64`. A single `pub(crate) fn platform_binary_asset_name()` in `utils.rs`
   selects among them via `cfg!(target_os = ...)` × `cfg!(target_arch = "aarch64")` and is the one
-  source used by both the release availability check (`update.rs`) and the download stage. On-disk
+  source used by the release selection (`release::select_app_release`), hence by every check and
+  download. Releases no longer publish the Windows / Linux aarch64 binaries, so builds for those
+  targets compile but find no updatable release. On-disk
   executable names stay arch-agnostic (`platform_executable_file_name()`), so `_macos`/`_arm64`
   suffixes never leak into install-path or archive-strip logic.
 - The Windows existing-install window (`install.rs`, `ExistingInstallApp`) offers seven choices and
@@ -220,8 +250,8 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - Every background job of that window (the installed copy's `--version` probe, the reinstall, the
   replacement, the Desktop / Start-menu shortcut buttons on the `existing-install-shortcut`
   worker) reports through ONE `mpsc` channel owned by `ExistingInstallApp`; the GUI thread only
-  drains it and draws. The probed version is the EXTENDED `MS_APP_VERSION` string: it is displayed
-  as-is next to `env!("MS_APP_VERSION")` of the running copy and never compared. A failed probe is
+  drains it and draws. The probed version is the installed copy's `MS_APP_VERSION` string: it is
+  displayed as-is next to the running copy's `HostVersion::version` and never compared. A failed probe is
   logged and shown as "unknown"; it never blocks any of the window's actions, because the user may
   be repairing exactly that broken install.
 - The finish screen of a full install writes the ticked Desktop / per-user Start-menu shortcuts
@@ -246,6 +276,8 @@ exclude `torch-directml`; PyTorch itself is installed by the explicit Torch stag
 - To change the update window shell, edit `update.rs`.
 - To change how release metadata or assets are fetched (retry, resume, pins, progress text),
   edit `download.rs`.
+- To change which release is chosen, the release asset names, or the `SHA256SUMS` format and
+  pin rules, edit `release.rs` (and keep the release script's manifest in step).
 - To change install/update worker steps, release assets, command execution, or archive handling,
   edit `utils.rs`.
 - To change PyTorch preflight, backend selection, or dependency groups, edit `utils.rs` and keep

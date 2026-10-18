@@ -42,8 +42,8 @@ use web_time::SystemTime;
 use ms_config as config;
 use ms_platform::file_dialog::{self, DialogKind, FileDialogRequest, PendingDialog, Picked};
 
-// The host version: displayed by the Windows "existing install found" window, and its
-// version core written as the Uninstall entry's `DisplayVersion` by a full install.
+// The host version: displayed by the Windows "existing install found" window, and written as
+// the Uninstall entry's `DisplayVersion` by a full install.
 use crate::HostVersion;
 use ms_sysprobe::gpu_utils::RuntimeVersion;
 #[cfg(target_os = "windows")]
@@ -93,7 +93,7 @@ pub(super) enum InstallerPurpose {
     /// Full application install: pick a location (possibly elevated), deploy the app
     /// archive and executable, create shortcuts/registry entries, then offer to launch
     /// the installed copy. `host` is the RUNNING program's version — the copy being
-    /// installed — whose core becomes the Uninstall entry's `DisplayVersion`.
+    /// installed — which becomes the Uninstall entry's `DisplayVersion`.
     FullInstall { host: HostVersion },
     /// Repair the managed Python environment of an existing root directory. The
     /// location screen is skipped (the root is fixed), and the worker only provisions
@@ -165,8 +165,9 @@ enum ExistingInstallEvent {
 enum InstalledVersionProbe {
     /// The worker thread has not answered yet.
     Pending,
-    /// The installed copy printed this EXTENDED version string (`MS_APP_VERSION` form).
-    /// It is only ever displayed, never compared.
+    /// The installed copy printed this version string (its `MS_APP_VERSION`: a commit count,
+    /// or `3.6.0+<hash>-<n>` from a build before commit-count versioning). It is only ever
+    /// displayed, never compared.
     Known(String),
     /// The probe failed; the reason is logged, and the UI must say "unknown" rather than
     /// invent a version.
@@ -206,7 +207,7 @@ struct ExistingInstallApp {
 
 /// Opens the full-install window for `root_dir` (or continues an elevated install into
 /// `auto_install_target`). `host` is this executable's version, passed in because a library
-/// cannot read it; its core is registered as the installed program's `DisplayVersion`.
+/// cannot read it; it is registered as the installed program's `DisplayVersion`.
 /// Blocks until the window closes.
 ///
 /// # Errors
@@ -631,7 +632,7 @@ impl ExistingInstallApp {
             rx,
             installed_version: InstalledVersionProbe::Pending,
             result_sink,
-            host_version_display: host.display.to_string(),
+            host_version_display: host.version.to_string(),
         }
     }
 
@@ -1259,7 +1260,7 @@ impl InstallerApp {
                     InstallerPurpose::FullInstall { host } => run_install_worker(
                         root_dir,
                         launcher_exe_path,
-                        config::version_format::version_core(host.core),
+                        host.version,
                         dependency_profile,
                         torch_selection,
                         &tx,

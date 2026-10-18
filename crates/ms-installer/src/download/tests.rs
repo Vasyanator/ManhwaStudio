@@ -3,7 +3,9 @@ File: crates/ms-installer/src/download/tests.rs
 
 Purpose:
 Unit tests of the installer's network layer: an asset download resumed after a mid-body
-disconnect, sha256-pinned assets (accepted, and a mismatch deleting the `.part`), the identity
+disconnect, sha256-pinned assets (accepted, and a mismatch deleting the `.part`), the
+required `SHA256SUMS` pin (match publishes, mismatch is the checksum error and leaves nothing,
+it outranks GitHub's digest), the small-asset fetch and its exact-size and digest checks, the identity
 sidecar (a matching `.part` resumes when the sha256 is pinned and restarts otherwise, a foreign
 one restarts from zero), cancel, digest
 parsing, a failed attempt keeping the old destination, the GitHub API GET retrying a transient status, and the progress fraction.
@@ -56,10 +58,15 @@ fn asset(body: &[u8], url: &str, digest: Option<String>) -> GithubAsset {
     GithubAsset { name: "asset.bin".to_owned(), browser_download_url: url.to_owned(), size: len_u64(body), digest }
 }
 
-/// Runs `download_asset_with` for `asset` into `<root>/downloads/asset.bin`.
+/// Runs `download_asset_with` for `asset` into `dst_path`, without a required pin.
 fn run(fetcher: &ScriptedFetcher, asset: &GithubAsset, dst_path: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    run_pinned(fetcher, asset, dst_path, None, cancel)
+}
+
+/// Runs `download_asset_with` for `asset` into `dst_path` with `required_sha256`.
+fn run_pinned(fetcher: &ScriptedFetcher, asset: &GithubAsset, dst_path: &Path, required_sha256: Option<&str>, cancel: &AtomicBool) -> Result<(), String> {
     let (tx, _rx) = mpsc::channel();
-    let req = AssetDownload { asset, dst_path, label_prefix: "test-asset", overall_range: (0.0, 1.0) };
+    let req = AssetDownload { asset, dst_path, label_prefix: "test-asset", overall_range: (0.0, 1.0), required_sha256 };
     download_asset_with(fetcher, &fast_policy(), &req, &tx, cancel)
 }
 
@@ -208,11 +215,69 @@ fn cancel_stops_the_download_with_the_cancel_message() {
 fn only_a_well_formed_sha256_digest_pins_the_hash() {
     let hex = "ab".repeat(32);
     let pinned = GithubAsset { name: "a".to_owned(), browser_download_url: "u".to_owned(), size: 7, digest: Some(format!("sha256:{hex}")) };
-    assert_eq!(pinned.expected(), Expected::SizeSha256 { size: 7, sha256: &hex });
+    assert_eq!(pinned.expected(None), Expected::SizeSha256 { size: 7, sha256: &hex });
     for digest in [None, Some(format!("sha512:{hex}")), Some("sha256:xyz".to_owned())] {
         let asset = GithubAsset { digest, ..pinned.clone() };
-        assert_eq!(asset.expected(), Expected::Size(7));
+        assert_eq!(asset.expected(None), Expected::Size(7));
     }
+}
+
+#[test]
+fn a_required_pin_outranks_the_github_digest() {
+    let digest_hex = "ab".repeat(32);
+    let required = "cd".repeat(32);
+    let with_digest = GithubAsset { name: "a".to_owned(), browser_download_url: "u".to_owned(), size: 7, digest: Some(format!("sha256:{digest_hex}")) };
+    assert_eq!(with_digest.expected(Some(&required)), Expected::SizeSha256 { size: 7, sha256: &required });
+    let without_digest = GithubAsset { digest: None, ..with_digest };
+    assert_eq!(without_digest.expected(Some(&required)), Expected::SizeSha256 { size: 7, sha256: &required });
+}
+
+#[test]
+fn a_matching_required_pin_publishes_the_file() {
+    let root = temp_root();
+    let body = content(150_000, 7);
+    let dst = root.path().join("asset.bin");
+    let fetcher = ScriptedFetcher::new(&body, &[]);
+    let pin = sha256_hex(&body);
+    assert_eq!(run_pinned(&fetcher, &asset(&body, "https://example.invalid/a", None), &dst, Some(&pin), &AtomicBool::new(false)), Ok(()));
+    assert_eq!(read(&dst), body);
+}
+
+#[test]
+fn a_required_pin_mismatch_is_the_checksum_error_and_publishes_nothing() {
+    let root = temp_root();
+    let body = content(150_000, 8);
+    let dst = root.path().join("asset.bin");
+    std::fs::write(&dst, b"previous verified file").unwrap_or_else(|err| panic!("write dst: {err}"));
+    let fetcher = ScriptedFetcher::new(&body, &[]);
+    let wrong = sha256_hex(b"what SHA256SUMS lists");
+    let result = run_pinned(&fetcher, &asset(&body, "https://example.invalid/a", None), &dst, Some(&wrong), &AtomicBool::new(false));
+    assert_eq!(result, Err(tf!("installer.utils.download_checksum_mismatch_error", label_prefix = "test-asset")));
+    assert_eq!(fetcher.offsets(), vec![0], "a checksum mismatch is permanent and must not be retried");
+    assert!(!root.path().join("asset.bin.part").exists(), "a proven-wrong .part must be deleted");
+    assert!(!root.path().join("asset.bin.download").exists());
+    assert_eq!(read(&dst), b"previous verified file", "the destination is only ever replaced by a verified file");
+}
+
+#[test]
+fn small_asset_fetch_returns_exactly_the_listed_bytes() {
+    let body = b"0000000000000000000000000000000000000000000000000000000000000000  a.zip\n";
+    let listed = GithubAsset { name: "SHA256SUMS".to_owned(), browser_download_url: "https://example.invalid/sums".to_owned(), size: len_u64(body), digest: None };
+    let fetcher = ScriptedFetcher::new(body, &[Step::Status(503, None)]);
+    let result = fetch_small_asset_with(&fetcher, &fast_policy(), &AtomicBool::new(false), &listed, 4096);
+    assert_eq!(result.as_deref(), Ok(&body[..]));
+}
+
+#[test]
+fn small_asset_fetch_refuses_a_size_other_than_listed_or_over_the_cap() {
+    let body = b"short";
+    let listed = GithubAsset { name: "SHA256SUMS".to_owned(), browser_download_url: "https://example.invalid/sums".to_owned(), size: 99, digest: None };
+    let fetcher = ScriptedFetcher::new(body, &[]);
+    assert!(fetch_small_asset_with(&fetcher, &fast_policy(), &AtomicBool::new(false), &listed, 4096).is_err());
+    let oversized = GithubAsset { size: 10_000, ..listed };
+    let untouched = ScriptedFetcher::new(body, &[]);
+    assert!(fetch_small_asset_with(&untouched, &fast_policy(), &AtomicBool::new(false), &oversized, 4096).is_err());
+    assert!(untouched.offsets().is_empty(), "an asset listed above the cap is refused before any request");
 }
 
 #[test]
@@ -248,4 +313,15 @@ fn fraction_is_bounded_and_handles_an_empty_total() {
     assert!((fraction(50, 100) - 0.5).abs() < 1e-4);
     assert!((fraction(200, 100) - 1.0).abs() < f32::EPSILON);
     assert!((fraction(u64::MAX, u64::MAX) - 1.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn small_asset_fetch_checks_a_listed_github_digest() {
+    let body = b"manifest bytes\n";
+    let good = GithubAsset { name: "SHA256SUMS".to_owned(), browser_download_url: "https://example.invalid/sums".to_owned(), size: len_u64(body), digest: Some(format!("sha256:{}", sha256_hex(body))) };
+    let fetcher = ScriptedFetcher::new(body, &[]);
+    assert_eq!(fetch_small_asset_with(&fetcher, &fast_policy(), &AtomicBool::new(false), &good, 4096).as_deref(), Ok(&body[..]));
+    let corrupted = GithubAsset { digest: Some(format!("sha256:{}", sha256_hex(b"other manifest\n"))), ..good };
+    let fetcher = ScriptedFetcher::new(body, &[]);
+    assert!(fetch_small_asset_with(&fetcher, &fast_policy(), &AtomicBool::new(false), &corrupted, 4096).is_err());
 }

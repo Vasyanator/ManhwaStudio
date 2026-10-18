@@ -60,28 +60,24 @@ use crate::args::Cli;
 #[cfg(target_os = "windows")]
 use crate::installer::install as launcher_install;
 use crate::installer::update::UpdateWindowOutcome;
-use crate::{backend_ipc, config, installer, launcher, runtime_log, shell, trace, trace_log, version_format};
+use crate::{backend_ipc, config, installer, launcher, runtime_log, shell, trace, trace_log};
 use clap::Parser;
 #[cfg(target_os = "windows")]
 use std::path::Path;
 
-/// The application's own version pair, handed to `ms-installer` at its entry points.
+/// The application's own version, handed to `ms-installer` at its entry points.
 ///
-/// It cannot be read inside that crate: `env!("CARGO_PKG_VERSION")` compiled there would
-/// yield the LIBRARY's version, and `MS_APP_VERSION` is a `rustc-env` that `build.rs`
-/// emits for this crate only. The two halves are not interchangeable — `core` is the
-/// machine-facing value every release comparison reduces with `version_format::version_core`,
-/// `display` is the git-derived string shown to the user and never parsed.
-const HOST_VERSION: ms_installer::HostVersion = ms_installer::HostVersion {
-    core: env!("CARGO_PKG_VERSION"),
-    display: env!("MS_APP_VERSION"),
-};
+/// It cannot be read inside that crate: `MS_APP_VERSION` is a `rustc-env` that `build.rs`
+/// emits for this crate only (and `env!("CARGO_PKG_VERSION")` compiled there would yield the
+/// LIBRARY's version). It is the one program version — displayed, compared against release
+/// tags and handed to other processes (`crates/ms-config/src/version_format.rs` file header).
+const HOST_VERSION: ms_installer::HostVersion = ms_installer::HostVersion { version: env!("MS_APP_VERSION") };
 
 /// The process facts the launcher needs from startup: `--ignore-installed` (the System
-/// registration tab is read-only and its warnings silent) and this build's version core (the
-/// installer's reduction, `install.rs`), which a written Uninstall entry carries.
+/// registration tab is read-only and its warnings silent) and this build's version, which a
+/// written Uninstall entry carries as `DisplayVersion`.
 fn launcher_host(ignore_installed: bool) -> launcher::state::LauncherHost {
-    launcher::state::LauncherHost { ignore_installed, version_core: version_format::version_core(HOST_VERSION.core) }
+    launcher::state::LauncherHost { ignore_installed, version_core: HOST_VERSION.version }
 }
 
 /// The whole native startup sequence, called only by `lib.rs::native_main`, which logs how it
@@ -180,12 +176,13 @@ fn init_minimal(cli: &Cli) {
     if !cli.ignore_installed {
         install_linux_desktop_integration_async();
     }
-    // Hand the IPC crate this package's own version. It cannot read it itself — compiled
-    // inside `ms-backend-ipc`, `env!("CARGO_PKG_VERSION")` yields that crate's `0.1.0` — and the
+    // Hand the IPC crate this program's version (`MS_APP_VERSION`). It cannot read it itself —
+    // that env var exists only for the root crate, and `env!("CARGO_PKG_VERSION")` compiled
+    // inside `ms-backend-ipc` yields that crate's `0.1.0` — and the
     // handshake log line exists precisely to make a mixed installation visible in
     // `last.log`, so a wrong number there defeats its only purpose. Diagnostic only: it
     // never reaches the wire. Seeded before any backend client exists; read-only afterwards.
-    backend_ipc::set_studio_version(HOST_VERSION.core);
+    backend_ipc::set_studio_version(HOST_VERSION.version);
     // Give this copy its own backend socket so a dev build and an installed copy can run
     // side by side without adopting each other's Python backend. Seeded before any
     // backend client or supervisor exists; read-only afterwards.

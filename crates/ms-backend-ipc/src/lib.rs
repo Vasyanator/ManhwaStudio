@@ -66,7 +66,8 @@ pub use transport::{BackendEndpoint, current_backend_endpoint, set_ws_endpoint};
 #[allow(unused_imports)]
 pub use client::{BackendClient, CallError, CallHandle, shared_client};
 // The host application's own version, which this crate cannot read for itself
-// (`env!("CARGO_PKG_VERSION")` here yields the LIBRARY's `0.1.0`). The binary seeds it at
+// (`MS_APP_VERSION` exists only for the binary; `env!("CARGO_PKG_VERSION")` here yields
+// the LIBRARY's `0.1.0`). The binary seeds it at
 // startup; it is logged at every handshake and is diagnostic only — never on the wire.
 #[allow(unused_imports)]
 pub use client::{set_studio_version, studio_version};
