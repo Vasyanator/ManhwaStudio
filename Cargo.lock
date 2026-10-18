@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "manhwastudio_rs"
-version = "3.6.0"
+version = "325.0.0"
 dependencies = [
  "ag-psd",
  "android_logger",

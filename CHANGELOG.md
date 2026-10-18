@@ -2,7 +2,7 @@
 
 Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release last; new entries go under "Unreleased" (and "Не выпущено" in the Russian half).
 
-## Unreleased
+## 325 — 2026-10-18
 
 ### New features
 
@@ -127,13 +127,15 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - The launcher's export page warns that chapter export uses the program's own format.
 - Updates and fresh installs verify every downloaded file against the release's SHA-256 checksums before using it.
 
+## Unreleased
+
 ---
 
 # ManhwaStudio — Список изменений
 
 Выпущенные блоки (`## N — ГГГГ-ММ-ДД`) идут от старых к новым, последний выпуск внизу; новые записи добавляются под «Не выпущено».
 
-## Не выпущено
+## 325 — 2026-10-18
 
 ### Новые возможности
 
@@ -257,3 +259,5 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - Версия протокола бэкенда 16; Python-бэкенд реорганизован по доменным пакетам.
 - Страница экспорта в лаунчере предупреждает, что экспорт главы идёт в собственном формате программы.
 - Обновление и установка проверяют каждый скачанный файл по контрольным суммам SHA-256 релиза перед использованием.
+
+## Не выпущено

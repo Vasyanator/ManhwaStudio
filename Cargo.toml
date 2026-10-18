@@ -1,6 +1,6 @@
 [package]
 name = "manhwastudio_rs"
-version = "3.6.0"
+version = "325.0.0"
 edition = "2024"
 # Minimum supported Rust version. Derived from the dependency graph, not chosen:
 # egui/eframe 0.36 declare `rust-version = "1.95"`, the highest floor here (next
