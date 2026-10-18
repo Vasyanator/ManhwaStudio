@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 # The one owner of the FLUX klein region post-processing: the persisted post settings (defaults,
-# ranges, the whole-region rule), the cv2-exact elliptical mask dilation (also the FLUX.2 latent
+# ranges, the effective rule), the cv2-exact elliptical mask dilation (also the FLUX.2 latent
 # mask built BEFORE a run), the global and local colour match, the inward feather, the rounded
 # composite, the cached re-derivation (`RegionPostprocessor`) and the settings-section body UI.
 # The core is GUI-free, does no I/O and no logging; callers own threads, logs and textures.

@@ -2,8 +2,9 @@
 
 ## Purpose
 The one owner of the FLUX.2 / FLUX.3 klein region post-processing: the persisted post settings
-(defaults, ranges, the whole-region rule), the cv2-exact elliptical mask dilation, the global and
-local colour match, the inward feather, the rounded composite, the cached re-derivation of a
+(defaults, ranges, the effective rule), the cv2-exact elliptical mask dilation, the global and
+local colour match (against the ring around a painted mask, or the edge band of a whole-region
+run), the inward feather, the rounded composite, the cached re-derivation of a
 result when a setting changes, and the body of the «Постобработка» settings section. The Python
 backend returns the RAW model output; everything here runs in Rust, so a post setting re-applies
 to a shown result without a new run.
@@ -20,34 +21,38 @@ or `ms-ai-api`.
 
 ## Architecture
 ```text
-RegionInputs { base, reference?, generated, mask, sample_mask? }   (RGB8 / L8, row-major)
+RegionInputs { base, reference?, generated, mask, sample_mask?, colour_reference }   (RGB8 / L8, row-major)
   -> RegionPostprocessor::new (validates every buffer)
   -> render(EffectiveSettings) / render_masked_into(settings, out, write):
        rayon::join(
          alpha   = feather(inside_distance(mask), feather_px)          [distance once, alpha per width]
-         global  = global_match(generated vs reference, ring)           [once]
-         local   = sampling(sample_mask)                                [once, built beside global]
+         global  = global_match(generated vs reference, ring | band)    [once]
+         local   = sampling(sample_mask | band)                         [once, built beside global]
                    -> fields(global or generated, scale)                [per (global on/off, scale), few kept]
                    -> apply(fields, strength)                           [last (global, scale, strength)]
        )
        result  = composite(base, local, mask, alpha)  (outside mask = base bytes; `render_masked_into`
                  writes only the masked pixels of a caller's buffer, e.g. the host's Color32 image)
-PostprocessSettings --effective(whole_region)--> EffectiveSettings
+PostprocessSettings --effective()--> EffectiveSettings
 draw_postprocess_body(ui, &mut PostprocessSettings, id_salt) -> changed
 ```
 `reference` defaults to `base` (it differs when the region SENT to the model carried overlay
 marks: the colour match needs the image the model round-tripped, the composite the unmarked one);
-`sample_mask` defaults to `mask` (FLUX.2: the dilated latent mask).
+`sample_mask` defaults to `mask` (FLUX.2: the dilated latent mask). `colour_reference` is the
+run's mode (`Ring` for a painted mask, `EdgeBand` for a whole-region run), fixed per result.
 
 ## Files and submodules
 - `fixtures/`: golden parity data generated from the Python reference (`fixtures/README.md`).
 - `src/lib.rs`: crate root, re-exports, `PostprocessError`, shape helpers.
 - `src/settings.rs`: `PostprocessSettings` (persisted keys), `EffectiveSettings`, ranges and defaults.
-- `src/pipeline.rs`: `RegionInputs`, `RegionPostprocessor` (stage caches, `render`,
+- `src/pipeline.rs`: `RegionInputs`, `ColourReference`, `RegionPostprocessor` (stage caches, `render`,
   `render_masked_into`), `postprocess_region`; the cache keys and the field-cache bounds.
 - `src/mask.rs`: `dilate_ellipse` (public, radius capped at `MAX_DILATE_RADIUS_PX`; also used by
   `local_match/` for its 3 px margin).
-- `src/global_match.rs`: ring mean/std match; numpy-float32-exact statistics; `round_to_u8`.
+- `src/global_match.rs`: mean/std match — ring selection (`match_color_global`) or edge band
+  (`match_color_band`) over one fit; numpy-float32-exact statistics; `round_to_u8`.
+- `src/edge_band.rs`: `EdgeBand`, the reference frame of a whole-region run (`EDGE_BAND_PX`,
+  `EDGE_BAND_SIDE_DIVISOR`).
 - `src/local_match/`: robust local CIELAB match (cascade, coarse grid, jitter), split into
   `LocalSampling` (once) / `fields` (per input + scale) / `apply` (per strength). See its readme.
 - `src/feather.rs`: inside distance (exact EDT, region border = contour) and the smoothstep alpha.
@@ -55,6 +60,8 @@ marks: the colour match needs the image the model round-tripped, the composite t
   it into a caller's pixel buffer, row-parallel.
 - `src/ui.rs`: `draw_postprocess_body`, `section_title`.
 - `src/fixture_tests.rs` (`cfg(test)`): golden parity against `fixtures/` (see `fixtures/README.md`).
+- `src/band_mode_tests.rs` (`cfg(test)`): Rust-only properties of the edge-band mode (no Python
+  reference) and its ignored 2048² release benchmark.
 
 ## Contracts and invariants
 - **The mask is a PERMISSION TO CHANGE.** Outside `mask` the result is `base` byte for byte; the
@@ -63,14 +70,23 @@ marks: the colour match needs the image the model round-tripped, the composite t
 - **Field names of `PostprocessSettings` are persisted keys** (`mask_feather_px`,
   `color_match`, `color_match_local_pct`, `color_match_scale_px`), embedded flattened in the
   engines' settings; never rename. Defaults 12 / true / 60 / 24; ranges 0..=32, 0..=100, 8..=96.
-- **Whole-region rule** (`effective`): with a solid mask there is no ring to measure, so both
-  colour matches are off (a fit on the changed pixels would undo the edit); the feather stays, it
-  joins the region to the page. The local match runs only under the global one.
-- **Global match**: per-channel RGB mean/std over the pixels outside `sample_mask` grown by 6 px,
+- **Effective rule** (`effective`): the local match runs only under the global one; the run's mode
+  does not enter it (it picks the reference instead, `ColourReference`).
+- **Edge-band mode** (`ColourReference::EdgeBand`, a whole-region run): there is no ring outside a
+  solid mask, and a fit inside it would undo the edit, so the reference is the region's outer
+  frame — `EDGE_BAND_PX` = 12 px, at most a quarter of the shorter side
+  (`EDGE_BAND_SIDE_DIVISOR`), where the picture still has to meet the page. Thin on purpose: a
+  model drift growing from the border biases a wide band. Global: the same fit on the band, NO
+  margin (no contour, no halo). Local: the robust local mode of `Lab(original) - Lab(current)` on
+  the band, cascaded inwards like the ring's target, applied as an OFFSET (gain 1) over the whole
+  mask at the local strength and scale (strength 0 = global only). `sample_mask` is ignored. Under
+  256 band samples both stages skip. An edit meant to change the border is pulled back there:
+  the user turns the colour match off for it. No Python reference: `band_mode_tests.rs`.
+- **Global match** (ring mode): per-channel RGB mean/std over the pixels outside `sample_mask` grown by 6 px,
   so a text outline or halo at the contour does not bias it; a ring too thin for the margin falls
   back to the undilated mask, one under 256 samples skips. It fixes the VAE's tone shift of the
   whole window (a gain + offset per channel is all that shift needs) and rewrites every pixel.
-- **Local match**: what the model PAINTED drifts towards the scene average at the mask centre,
+- **Local match** (ring mode): what the model PAINTED drifts towards the scene average at the mask centre,
   which no global curve fixes. In CIELAB at scale `s` (the Gaussian sigma of the finest level):
   lightness mean and contrast (gain clipped to 0.8..1.4), a/b shift only, blended at `strength`.
   The generated side's statistics come from inside the mask only; the target's from the original
@@ -95,7 +111,8 @@ marks: the colour match needs the image the model round-tripped, the composite t
   pairwise sums split only along numpy's own halving tree. Never a split float reduction in any
   other order.
 - **Caches** (`pipeline.rs`): a cache key names every input of its stage. Fields: global flag +
-  scale (reference and masks are fixed per processor); remap: fields + strength bits. At most
+  scale (reference, masks and the reference mode are fixed per processor); remap: fields +
+  strength bits — in both modes a strength change is one remap. At most
   `FIELDS_CACHE_LEN` field sets within `FIELDS_CACHE_BYTES` are kept, newest always.
 - **Deliberate deviations from the Python reference** (region_imaging.py at `c11c4eb`): the
   feather distance is the EXACT Euclidean transform (`ms_raster::squared_distance_to_mask`)
@@ -110,7 +127,7 @@ marks: the colour match needs the image the model round-tripped, the composite t
   `ms-raster`'s distance transform stays sequential (a std-only level-0 crate); it is hidden by
   the `rayon::join`. `draw_postprocess_body` is cheap.
 - **Memory** per processor, beside the inputs: global + remapped image (3 B/px each), distance
-  (4 B/px), alpha (1 B/px), the local sampling (2 B/px sample sets) and the kept
+  (4 B/px), alpha (1 B/px), the local sampling (2 B/px ring sample sets, 1 B/px band) and the kept
   field sets (coarse grids, `FIELDS_CACHE_BYTES` at most).
 - **UI**: body only, no chrome; the host draws the section header (collapsed by default) with
   `section_title()` and a stable `id_salt`. No literal strings except the `%` unit symbol.
@@ -126,6 +143,7 @@ fixtures with `venv/bin/python -I tools/make_region_postprocess_fixtures.py`.
 All paths below are under `src/`.
 - Defaults or ranges: `settings.rs` (the UI dials read them).
 - A new stage or a cache key: `pipeline.rs` (extend `alternating_settings_equal_fresh_renders`).
-- The ring statistics: `global_match.rs`; the local CIELAB match: `local_match/`.
+- The ring / band statistics: `global_match.rs`; the band geometry: `edge_band.rs`; the local
+  CIELAB match (both modes): `local_match/`.
 - The edge ramp: `feather.rs`; the blend: `composite.rs`.
 - Labels and hints: `ui.rs` + `cleaning.region_postprocess.*` in `ms-i18n` `en.json` / `ru.json`.

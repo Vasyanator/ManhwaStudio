@@ -13,6 +13,7 @@ The match is split where its inputs change, so the pipeline can cache each part:
 1. `LocalSampling::new(reference, sample_mask)` — once per region: the 3 px margin dilation and
    the target (valid) and current (inside) sample sets; or "identity" for an empty mask / fewer
    than 256 valid pixels. The target's Lab is NOT cached (12 B/px for ~5 ms per scale change).
+   `LocalSampling::new_band(band)` is the edge-band mode of a whole-region run (see below).
 2. `LocalSampling::fields(reference, current, scale)` — per (current image, scale): the shared geometry
    (grid factor `floor(scale / 4)`, reflect-101 padding by whole cells plus the finest kernel
    reach), the centred Lab of each side (only where it samples), then `robust_local_moments`
@@ -23,6 +24,14 @@ The match is split where its inputs change, so the pipeline can cache each part:
 3. `LocalFields::apply(current, sample_mask, strength)` — the fields upsampled and applied to
    masked pixels only, blended by `strength`: the ONLY step `strength` enters.
 `match_color_local` (tests only) is the one-shot composition the parity fixtures pin.
+
+**Edge-band mode** (not in the reference): a whole-region run has no outside, so both images
+are sampled on the SAME band pixels and step 2 builds one field: the robust local mode of
+`Lab(reference) - Lab(current)` (uncentred: near 0 after the global stage), cascaded like the
+target and ended by its robust global value (`offset_fields`). The correction is a pure offset
+`[1, dL·t, da·t, db·t]`, `t = clamp(share / 0.25)` (`offset_correction`), and step 3 applies it
+over the whole mask (the pipeline passes `mask`). A difference field, not two moment fields:
+each side's robust mode would pick different band pixels.
 
 ## Files and submodules
 - `mod.rs`: `LocalSampling` / `LocalFields` (the three steps), `match_color_local` (tests),
@@ -35,12 +44,13 @@ The match is split where its inputs change, so the pipeline can cache each part:
   helper-equivalence tests, the ignored release benchmark.
 
 ## Contracts and invariants
-- Only pixels inside `sample_mask` change; every other byte is `current`'s (tested exactly).
+- Only pixels inside the mask `apply` receives change; every other byte is `current`'s (tested
+  exactly).
 - Deterministic: f32 work with numpy 2 weak-scalar semantics and numpy's summation orders
   (`grid.rs` notes), f64 statistics summed sequentially; parallelism only over rows with
   per-row outputs (`grid::for_each_row`) and between the two independent sides, never a
   parallel float reduction.
-- `fields()` depends on exactly `(reference, sample_mask, current, scale)`; `apply()` on the
+- `fields()` depends on exactly `(reference, sample_mask or band, current, scale)`; `apply()` on the
   fields, `current`, `sample_mask` and `strength`. A cache keyed on less is wrong (the pipeline
   keys fields by global-match flag + scale, its `current` being fixed per flag).
 - Deliberate deviation from the reference: the coarse-level jitter uses splitmix64 instead of

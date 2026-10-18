@@ -76,7 +76,8 @@ pub(super) struct Flux3RunOutcome {
     pub(super) answer: Flux3RunAnswer,
     /// The L8 mask the run sent (`mask_for_run`'s output), `size` bytes.
     pub(super) mask: Vec<u8>,
-    /// The run regenerated the whole region (no ring to colour-match against).
+    /// The run regenerated the whole region: the host colour-matches it against the region's
+    /// edge band instead of a ring (`ms_region_postprocess::ColourReference::EdgeBand`).
     pub(super) whole_region: bool,
 }
 

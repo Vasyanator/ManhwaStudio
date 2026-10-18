@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::feather::{feather_alpha, inside_distance};
 use crate::global_match::{GlobalPath, match_color_global};
 use crate::mask::{dilate_ellipse, ellipse_half_widths};
-use crate::{EffectiveSettings, PostprocessSettings, RegionInputs, composite, postprocess_region};
+use crate::{ColourReference, EffectiveSettings, PostprocessSettings, RegionInputs, composite, postprocess_region};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -98,6 +98,7 @@ impl Case {
             generated: self.generated.clone(),
             mask: self.mask.clone(),
             sample_mask: Some(self.sample_mask.clone()),
+            colour_reference: if self.whole_region { ColourReference::EdgeBand } else { ColourReference::Ring },
         }
     }
 }
@@ -209,7 +210,7 @@ fn dilation_equals_cv2_exactly() -> TestResult {
 #[test]
 fn effective_settings_match_the_cases() -> TestResult {
     for case in load_cases()? {
-        assert_eq!(case.stored.effective(case.whole_region), case.effective()?, "{}", case.name);
+        assert_eq!(case.stored.effective(), case.effective()?, "{}", case.name);
     }
     Ok(())
 }

@@ -3,7 +3,7 @@ File: crates/ms-region-postprocess/src/settings.rs
 
 Purpose:
 The one owner of the region post-processing settings: the persisted struct, its defaults and
-ranges, and the whole-region rule that turns stored values into what a run applies.
+ranges, and the rule that turns stored values into what a run applies.
 
 Key items:
 - `PostprocessSettings`: the stored values (field names are persisted keys of the engines'
@@ -42,7 +42,8 @@ pub const DEFAULT_SCALE_PX: u32 = 24;
 pub struct PostprocessSettings {
     /// Inward feather ramp width, px (`0..=FEATHER_MAX_PX`, 0 = hard edge).
     pub mask_feather_px: u32,
-    /// Global colour match against the ring outside the mask (the local match refines it).
+    /// Global colour match against the ring outside the mask, or the region's edge band in a
+    /// whole-region run (the local match refines it).
     pub color_match: bool,
     /// Local CIELAB match strength, percent (`0..=LOCAL_PCT_MAX`, 0 = global only).
     pub color_match_local_pct: u32,
@@ -73,16 +74,14 @@ impl PostprocessSettings {
         }
     }
 
-    /// What a run applies, after [`Self::normalized`].
-    ///
-    /// The whole-region rule: when the mask covers the whole region (`whole_region`) there is
-    /// no ring outside it to take colour statistics from, so both colour matches are off (a fit
-    /// on the changed pixels would undo the edit); the feather stays, it joins the region to the
-    /// page. The local match only refines the global one, so it is off whenever the global one is.
+    /// What a run applies, after [`Self::normalized`]. The local match only refines the global
+    /// one, so it is off whenever the global one is. Independent of the run's mode: a
+    /// whole-region run is colour-matched against its edge band instead of a ring
+    /// (`ColourReference`, chosen per result).
     #[must_use]
-    pub fn effective(self, whole_region: bool) -> EffectiveSettings {
+    pub fn effective(self) -> EffectiveSettings {
         let s = self.normalized();
-        let global_match = s.color_match && !whole_region;
+        let global_match = s.color_match;
         let local_strength = if global_match { pct_to_strength(s.color_match_local_pct) } else { 0.0 };
         EffectiveSettings { feather_px: s.mask_feather_px, global_match, local_strength, local_scale_px: s.color_match_scale_px }
     }
@@ -132,19 +131,17 @@ mod tests {
     fn effective_truth_table() {
         let on = PostprocessSettings::default();
         let off = PostprocessSettings { color_match: false, ..on };
-        let e = on.effective(false);
+        let e = on.effective();
         assert!(e.global_match);
         assert!((e.local_strength - 0.6).abs() < 1e-7);
         assert_eq!((e.feather_px, e.local_scale_px), (12, 24));
-        for (s, whole) in [(on, true), (off, false), (off, true)] {
-            let e = s.effective(whole);
-            assert!(!e.global_match, "{s:?} whole={whole}");
-            assert!(e.local_strength.to_bits() == 0, "local is off whenever global is");
-            assert_eq!(e.feather_px, 12, "the feather survives the whole-region rule");
-        }
-        let zero_local = PostprocessSettings { color_match_local_pct: 0, ..on }.effective(false);
+        let e = off.effective();
+        assert!(!e.global_match);
+        assert!(e.local_strength.to_bits() == 0, "local is off whenever global is");
+        assert_eq!(e.feather_px, 12, "the feather does not depend on the colour match");
+        let zero_local = PostprocessSettings { color_match_local_pct: 0, ..on }.effective();
         assert!(zero_local.global_match && zero_local.local_strength.to_bits() == 0);
-        let clamped = PostprocessSettings { color_match_local_pct: 400, mask_feather_px: 40, ..on }.effective(false);
+        let clamped = PostprocessSettings { color_match_local_pct: 400, mask_feather_px: 40, ..on }.effective();
         assert!((clamped.local_strength - 1.0).abs() < f32::EPSILON);
         assert_eq!(clamped.feather_px, 32);
     }

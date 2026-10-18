@@ -7,7 +7,7 @@ CIELAB match -> inward feather -> composite, with per-stage caches so a settings
 only the stages it affects.
 
 Key items:
-- `RegionInputs`: the owned buffers of one result.
+- `RegionInputs`: the owned buffers of one result; `ColourReference`: ring or edge band.
 - `RegionPostprocessor`: validated inputs + stage caches; `render()`.
 - `postprocess_region()`: one-shot convenience.
 
@@ -15,14 +15,16 @@ Notes:
 Stage chaining: `global = match(generated, reference, sample_mask)` when `global_match`, else
 `generated`; `local = match_local(reference, global, sample_mask)` when `local_strength > 0`,
 else `global`; result = `composite(base, local, mask, feather)`. `reference` defaults to `base`,
-`sample_mask` to `mask`. The local match is cached in three parts (sampling once, fields per
+`sample_mask` to `mask`. Under `ColourReference::EdgeBand` both colour stages sample the
+region's edge band instead (`edge_band.rs`) and the local remap covers all of `mask`. The local match is cached in three parts (sampling once, fields per
 global flag + scale, remap per strength), so a strength change never re-runs the cascade. CPU
 work: call it off the GUI thread (a cold 4 MP render is about a hundred ms on a multi-core
 machine, dominated by the local match; the feather runs concurrently with the colour chain).
 */
 
+use crate::edge_band::EdgeBand;
 use crate::feather::{feather_alpha, inside_distance};
-use crate::global_match::match_color_global;
+use crate::global_match::{match_color_band, match_color_global};
 use crate::local_match::{LocalFields, LocalMatchError, LocalSampling};
 use crate::{EffectiveSettings, PostprocessError, check_len, checked_area, composite};
 
@@ -43,8 +45,27 @@ pub struct RegionInputs {
     /// Composite mask, nonzero = may change.
     pub mask: Vec<u8>,
     /// Colour-match mask when it differs from `mask` (FLUX.2: the dilated latent mask);
-    /// `None` = `mask`.
+    /// `None` = `mask`. Ignored in [`ColourReference::EdgeBand`] mode.
     pub sample_mask: Option<Vec<u8>>,
+    /// Where the colour match measures what generated and original should agree on.
+    pub colour_reference: ColourReference,
+}
+
+/// Where the colour match takes its reference statistics: fixed per result (the run's mode),
+/// so every stage cache stays valid across settings changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColourReference {
+    /// A painted mask: the ring OUTSIDE `sample_mask` (global: grown by 6 px; local: target
+    /// outside, current inside, applied inside `sample_mask`).
+    #[default]
+    Ring,
+    /// A whole-region run (nothing painted, solid mask): the region's outer edge band
+    /// (`EDGE_BAND_PX` = 12 px, at most a quarter of the shorter side). Global: the same fit on
+    /// the band pixels, no margin; local: the band's Lab offset `original - generated`,
+    /// extrapolated inwards by the cascade, applied over the whole `mask` at the local
+    /// strength and scale. A result whose border was MEANT to change is pulled back towards
+    /// the original there; the user turns the colour match off for it.
+    EdgeBand,
 }
 
 /// One raw result plus cached stage outputs, so a settings change re-runs only what it affects:
@@ -216,16 +237,33 @@ impl ColourCache {
         let (w, h) = (inputs.width, inputs.height);
         let reference = inputs.reference.as_deref().unwrap_or(&inputs.base);
         let sample_mask = inputs.sample_mask.as_deref().unwrap_or(&inputs.mask);
+        // The pixels the local remap rewrites: the sample mask around a ring, the whole
+        // permission mask under an edge band (the band's offset extends over all of it).
+        let (band, apply_mask) = match inputs.colour_reference {
+            ColourReference::Ring => (None, sample_mask),
+            ColourReference::EdgeBand => (Some(EdgeBand::new(w, h)), &inputs.mask[..]),
+        };
         let need_global = global_match && self.global.is_none();
         let sampling_slot = &mut self.sampling;
         let (global, sampling) = rayon::join(
-            || need_global.then(|| match_color_global(reference, &inputs.generated, sample_mask, w, h)).transpose(),
+            || {
+                need_global
+                    .then(|| match &band {
+                        None => match_color_global(reference, &inputs.generated, sample_mask, w, h),
+                        Some(band) => Ok(match_color_band(reference, &inputs.generated, band)),
+                    })
+                    .transpose()
+            },
             || -> Result<Option<&LocalSampling>, PostprocessError> {
                 if local.is_none() {
                     return Ok(None);
                 }
                 if sampling_slot.is_none() {
-                    *sampling_slot = Some(LocalSampling::new(reference, sample_mask, w, h).map_err(|error| local_error(&error))?);
+                    let sampling = match &band {
+                        None => LocalSampling::new(reference, sample_mask, w, h),
+                        Some(band) => LocalSampling::new_band(band.to_mask(), w, h),
+                    };
+                    *sampling_slot = Some(sampling.map_err(|error| local_error(&error))?);
                 }
                 Ok(sampling_slot.as_ref())
             },
@@ -246,7 +284,7 @@ impl ColourCache {
             None => (key.fields, sampling.fields(reference, current, key.fields.scale_px).map_err(|error| local_error(&error))?),
         };
         let strength = f32::from_bits(key.strength_bits);
-        let remapped = entry.1.as_ref().map(|fields| fields.apply(current, sample_mask, strength)).transpose().map_err(|error| local_error(&error))?;
+        let remapped = entry.1.as_ref().map(|fields| fields.apply(current, apply_mask, strength)).transpose().map_err(|error| local_error(&error))?;
         self.remember_fields(entry);
         self.local = Some((key, remapped));
         Ok(())
@@ -290,7 +328,7 @@ mod tests {
     use super::*;
 
     fn inputs(w: usize, h: usize) -> RegionInputs {
-        RegionInputs { width: w, height: h, base: vec![10; w * h * 3], reference: None, generated: vec![200; w * h * 3], mask: vec![255; w * h], sample_mask: None }
+        RegionInputs { width: w, height: h, base: vec![10; w * h * 3], reference: None, generated: vec![200; w * h * 3], mask: vec![255; w * h], sample_mask: None, colour_reference: ColourReference::Ring }
     }
 
     const PLAIN: EffectiveSettings = EffectiveSettings { feather_px: 0, global_match: false, local_strength: 0.0, local_scale_px: 24 };
@@ -343,15 +381,22 @@ mod tests {
             }
         }
         let sample_mask = crate::dilate_ellipse(&mask, w, h, 4).ok();
-        RegionInputs { width: w, height: h, base, reference: None, generated, mask, sample_mask }
+        RegionInputs { width: w, height: h, base, reference: None, generated, mask, sample_mask, colour_reference: ColourReference::Ring }
     }
 
     /// The caches never leak one setting into another: an alternating sequence that revisits
     /// strengths, scales (beyond the field-cache length) and the colour toggle renders exactly
     /// the bytes of a fresh processor every time, and the masked-into form writes exactly those
-    /// bytes inside the mask and nothing outside it.
+    /// bytes inside the mask and nothing outside it. Both reference modes: the ring around a
+    /// blob, and the edge band of a whole-region result.
     #[test]
     fn alternating_settings_equal_fresh_renders() -> Result<(), PostprocessError> {
+        assert_alternating_settings_equal_fresh_renders(|| textured(72, 56))?;
+        assert_alternating_settings_equal_fresh_renders(|| RegionInputs { mask: vec![255; 72 * 56], sample_mask: None, colour_reference: ColourReference::EdgeBand, ..textured(72, 56) })
+    }
+
+    /// The body of `alternating_settings_equal_fresh_renders` for the inputs `make` builds.
+    fn assert_alternating_settings_equal_fresh_renders(make: impl Fn() -> RegionInputs) -> Result<(), PostprocessError> {
         const SENTINEL: [u8; 4] = [1, 2, 3, 4];
         let base = EffectiveSettings { feather_px: 6, global_match: true, local_strength: 0.6, local_scale_px: 24 };
         let mut sequence = vec![base];
@@ -371,12 +416,12 @@ mod tests {
             EffectiveSettings { global_match: false, local_strength: 0.0, ..base },
             base,
         ]);
-        let (w, h) = (72, 56);
-        let mut cached = RegionPostprocessor::new(textured(w, h))?;
-        let mask = textured(w, h).mask;
+        let (w, h) = (make().width, make().height);
+        let mut cached = RegionPostprocessor::new(make())?;
+        let mask = make().mask;
         let mut previous: Option<Vec<u8>> = None;
         for settings in &sequence {
-            let fresh = postprocess_region(textured(w, h), settings)?;
+            let fresh = postprocess_region(make(), settings)?;
             assert_eq!(cached.render(settings)?, fresh, "{settings:?}");
             let mut shown = vec![SENTINEL; w * h];
             cached.render_masked_into(settings, &mut shown, |px, [r, g, b]| *px = [r, g, b, 255])?;

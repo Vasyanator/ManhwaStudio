@@ -295,8 +295,11 @@ def build_cases() -> list[Case]:
     flux2 = blob_mask(176, 224, [(90, 110, 40, 55)])
     add("04_flux2_latent", 176, 224, flux2, 4, sample_mask=ellipse_dilate(flux2, 16), sample_mask_rule="dilate_ellipse(mask, 16)",
         feather_px=12, color_match=True, local_pct=60, scale_px=96, whole_region=False, expect_global="margin", expect_local="applied")
+    # A whole-region run is colour-matched against its edge band in Rust, which the reference
+    # has no counterpart for (Rust-only property tests cover it): this case stores the colour
+    # match OFF and pins the feather-only path.
     add("05_whole_region", 96, 128, np.full((96, 128), 255, dtype=np.uint8), 5,
-        feather_px=12, color_match=True, local_pct=60, scale_px=24, whole_region=True, expect_global="off", expect_local="off")
+        feather_px=12, color_match=False, local_pct=60, scale_px=24, whole_region=True, expect_global="off", expect_local="off")
     add("06a_ring_unmargined", 64, 64, ring_mask(64, 64, 3), 6,
         feather_px=8, color_match=True, local_pct=60, scale_px=24, whole_region=False, expect_global="unmargined", expect_local="skipped")
     add("06b_ring_skipped", 40, 40, ring_mask(40, 40, 1), 7,
@@ -325,8 +328,14 @@ class Effective:
 
 
 def effective(case: Case) -> Effective:
-    """No colour match without a ring (`whole_region`); the local match only under the global one."""
-    global_match = case.color_match and not case.whole_region
+    """The local match only under the global one; the run's mode does not enter the rule.
+
+    A whole-region case must store the colour match off: its Rust reference mode (the edge
+    band) has no counterpart in the Python reference this script runs.
+    """
+    if case.whole_region and case.color_match:
+        raise FixtureError(f"{case.name}: a whole-region case cannot store color_match=True (no edge-band reference in Python)")
+    global_match = case.color_match
     return Effective(case.feather_px, global_match, case.local_pct if global_match else 0, case.scale_px)
 
 

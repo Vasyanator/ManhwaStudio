@@ -3,23 +3,28 @@ File: crates/ms-region-postprocess/src/global_match.rs
 
 Purpose:
 The global colour match: aligns the generated region's per-channel RGB mean and standard
-deviation to the reference over the ring OUTSIDE the colour-match mask.
+deviation to the reference over the ring OUTSIDE the colour-match mask, or, for a whole-region
+run, over the region's edge band.
 
 Key items:
-- `match_color_global()`: the stage (whole region rewritten).
+- `match_color_global()`: the ring stage (sample selection with its fallbacks).
+- `match_color_band()`: the edge-band stage.
+- `fit_and_apply()`: the shared fit (whole region rewritten).
 - `GlobalPath`: which sample set the stage used (diagnostics and tests).
 - `MARGIN_PX` / `MIN_SAMPLES`: the ring margin and the minimum sample count.
 
 Notes:
-The ring is the only place where the model's output and the original are supposed to agree, so
-it measures the VAE round trip's tone shift of the whole window; a gain + offset per channel is
-all that shift needs. The 6 px margin keeps a text outline or halo at the contour out of the fit.
+The ring (or the edge band) is the only place where the model's output and the original are
+supposed to agree, so it measures the VAE round trip's tone shift of the whole window; a gain +
+offset per channel is all that shift needs. The 6 px ring margin keeps a text outline or halo at
+the contour out of the fit; the band has no contour and no margin.
 Statistics mirror the reference's numpy float32 arithmetic exactly (pairwise summation, see
 `pairwise_sum_f32`), so the stage is bit-identical to it, and deterministic: the statistics run
 concurrently as whole values, a large sum splits only along numpy's own halving tree (each half
 summed as numpy sums it, then the one `+` numpy does), and the apply is per pixel.
 */
 
+use crate::edge_band::EdgeBand;
 use crate::mask::dilate_ellipse;
 use crate::PostprocessError;
 use rayon::prelude::*;
@@ -38,17 +43,17 @@ pub(crate) enum GlobalPath {
     Margin,
     /// The margin left too few samples: outside the undilated mask.
     Unmargined,
-    /// Too few samples either way: the input is returned unchanged.
+    /// The region's edge band (a whole-region run, see `edge_band.rs`).
+    Band,
+    /// Too few samples: the input is returned unchanged.
     Skipped,
 }
 
 /// Matches `generated` (RGB8, `width * height * 3`) to `reference` over the pixels outside
 /// `sample_mask` (nonzero = masked) grown by `MARGIN_PX`; falls back to the undilated mask, then
-/// to no change, when fewer than `MIN_SAMPLES` pixels remain.
+/// to no change, when fewer than `MIN_SAMPLES` pixels remain (the RING reference mode).
 ///
-/// Per channel, with population mean/std `rm, rs` (reference) and `gm, gs` (generated) over the
-/// ring: `x' = (x - gm) * (rs / gs) + rm`, or `x + (rm - gm)` for a flat generated channel,
-/// applied to EVERY pixel, rounded half to even and clamped.
+/// The fit itself is [`fit_and_apply`]; this function only selects the ring samples.
 ///
 /// # Errors
 /// `PostprocessError::SizeOverflow` / `ShapeMismatch` from the mask dilation (the caller has
@@ -65,6 +70,26 @@ pub(crate) fn match_color_global(reference: &[u8], generated: &[u8], sample_mask
     if count_unmasked(selector) < MIN_SAMPLES {
         return Ok((generated.to_vec(), GlobalPath::Skipped));
     }
+    Ok((fit_and_apply(reference, generated, width, |index| selector[index] == 0), path))
+}
+
+/// Matches `generated` to `reference` over the pixels of the region's edge `band` (the
+/// EDGE-BAND reference mode of a whole-region run): no margin, because nothing was painted, so
+/// no outline or halo sits at a contour; fewer than `MIN_SAMPLES` band pixels skip.
+pub(crate) fn match_color_band(reference: &[u8], generated: &[u8], band: &EdgeBand) -> (Vec<u8>, GlobalPath) {
+    if band.count() < MIN_SAMPLES {
+        return (generated.to_vec(), GlobalPath::Skipped);
+    }
+    (fit_and_apply(reference, generated, band.width(), |index| band.contains_index(index)), GlobalPath::Band)
+}
+
+/// The global fit over the pixels `is_sample(index)` selects (`index` = row-major pixel index,
+/// visited in ascending order), applied to EVERY pixel of `generated`.
+///
+/// Per channel, with population mean/std `rm, rs` (reference) and `gm, gs` (generated) over the
+/// samples: `x' = (x - gm) * (rs / gs) + rm`, or `x + (rm - gm)` for a flat generated channel,
+/// rounded half to even and clamped. The caller guarantees at least one sample.
+fn fit_and_apply(reference: &[u8], generated: &[u8], width: usize, is_sample: impl Fn(usize) -> bool + Sync) -> Vec<u8> {
     // Six independent statistics (reference / generated x three channels), each summed in
     // numpy's own sequential pairwise order; only whole statistics run concurrently, so every
     // value is the one the sequential computation gives.
@@ -72,7 +97,7 @@ pub(crate) fn match_color_global(reference: &[u8], generated: &[u8], sample_mask
         .into_par_iter()
         .map(|job| {
             let (image, channel) = if job < 3 { (reference, job) } else { (generated, job - 3) };
-            let values: Vec<f32> = selector.iter().zip(image.chunks_exact(3)).filter(|(m, _)| **m == 0).map(|(_, px)| f32::from(px[channel])).collect();
+            let values: Vec<f32> = image.chunks_exact(3).enumerate().filter(|(index, _)| is_sample(*index)).map(|(_, px)| f32::from(px[channel])).collect();
             mean_std_f32(&values)
         })
         .collect();
@@ -97,7 +122,7 @@ pub(crate) fn match_color_global(reference: &[u8], generated: &[u8], sample_mask
             }
         }
     });
-    Ok((out, path))
+    out
 }
 
 /// Number of unmasked (zero) entries of a mask.

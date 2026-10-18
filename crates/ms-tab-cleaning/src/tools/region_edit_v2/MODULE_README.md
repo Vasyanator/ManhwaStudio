@@ -153,11 +153,13 @@ that owns the context, the canvas and the project at once:
   and the next pass re-checks the same enablement table. Queued requests are folded at the TOP
   of the pass, so they survive the off-screen early return — which is exactly the state that
   strands the user otherwise. «Обработать» has no chrome button at all: the row holds exactly
-  «Применить», «Сравнить», «Отменить» and «Стереть маску», so starting a run is always a panel
-  action. «Сравнить» is the one chrome button a panel must NOT repeat — a frame that scrolled
-  out of view has nothing to look at.
-- **«Сравнить» is a MOMENTARY HOLD, not a toggle, and it is the only button that is not a
-  request.** It is enabled while a result is pending — the condition «Применить» has, except that
+  «Применить», «Сравнить», «Скрыть рамку», «Отменить» and «Стереть маску» (in that slot order),
+  so starting a run is always a panel action. «Сравнить» and «Скрыть рамку» are the chrome
+  buttons a panel must NOT repeat — a frame that scrolled out of view has nothing to look at.
+  `CHROME_MIN_W` is sized from the widest Russian / English caption for FIVE slots
+  (`chrome_caption_slots_hold_the_russian_and_english_captions` guards it).
+- **«Сравнить» is a MOMENTARY HOLD, not a toggle, and with «Скрыть рамку» it is one of the two
+  buttons that are not a request.** It is enabled while a result is pending — the condition «Применить» has, except that
   «Применить» also waits out a settling result (`set_result_settling`, see the host) — and
   while its pointer button is down the pending result layer is not painted, so the original
   pixels show through. `compare_held` is recomputed from scratch in every drawn pass as
@@ -168,6 +170,19 @@ that owns the context, the canvas and the project at once:
   and after a run, and blinking them would disturb the comparison rather than help it. This is
   also why the button row is sensed BEFORE the frame's contents are painted — a hold sensed
   after them would apply one frame late, and egui may not repaint again until the release.
+- **«Скрыть рамку» is a LATCHING toggle with «Сравнить»'s enablement** (`FrameButtons::hide_frame`
+  = a result is pending, settling included — tuning a settling result with the frame hidden is
+  its main use). A click flips the private `frame_hidden` latch, read only through the pure
+  `chrome_hidden(buttons, latch)`, which re-checks the enablement like `result_hidden`; the
+  button shows its state through egui's selected style. The latch is cleared by
+  `set_result(None)` and `reset()` — so apply, cancel, deactivate and a dropped result all end
+  it — and deliberately NOT by `cancel_gestures`, which runs on every off-screen pass: the
+  toggle survives scrolling. While hidden, the frame skips the top strip (painting AND grip /
+  chip sensing), the border, the eight handles, the marks layer, the mask layers and the status
+  row; it keeps the button row with its plate, the result layer and the off-screen arrow, and
+  the hitbox is unchanged, so the row does not jump. The status row is painted only after the
+  buttons are sensed, so the toggle takes effect in the frame of the click. With «Сравнить»
+  held as well only the page and the button row show.
 - **The host never publishes `cleaning.editor_window`.** That context also switches off the
   clean-overlay undo for the whole session; the host publishes `cleaning.region_frame` and
   `brush.active` only. The frame's `Area` is not the canvas view for the input router, so the
@@ -276,7 +291,9 @@ that owns the context, the canvas and the project at once:
 - To change a chrome colour, a plate, the grip or the arrow: `render.rs` only; the state colours
   are retuned studio-wide in `crates/ms-theme/src/canvas.rs`.
 - To change the lock rules, the button enablement, the status line or the pass order:
-  `frame.rs`.
+  `frame.rs`. The chrome row's buttons are `sense_buttons` there (slot order and captions;
+  `CHROME_MIN_W` and its caption test when a slot is added); what «Скрыть рамку» hides is
+  gated on `chrome_hidden` in `pass`, `draw_rows` and `paint_contents`.
 - To change how a mask layer or the marks layer stores, previews or uploads its pixels, or how
   the shared undo history is bounded: `layers.rs`.
 - To change the marks gestures (stroke, Ctrl rectangle, crosshair, brush switch): `frame.rs`
@@ -414,7 +431,9 @@ Host contracts:
   pairing (`Done` after a capture, `DoneRaw` without one) is a logged contract violation and is
   refused. The HOST owns the post-process: the composite BASE is the unmarked region (so outside
   the run mask the result is the page as loaded, original alpha included, and marks never bleed
-  into it), the colour-match REFERENCE is the region the model was sent. The pending result is
+  into it), the colour-match REFERENCE is the region the model was sent, measured on the ring
+  around the run mask — or, for a `whole_region` run, on the region's edge band
+  (`ms_region_postprocess::ColourReference`, chosen in `postprocess.rs`). The pending result is
   re-derived from the kept raw answer whenever the engine's live settings change (re-read every
   frame, like `constraints()`); the first derivation runs while the frame is still `Processing`,
   later ones replace the shown pixels in place (`ResultLayer::replace_image`): a re-derivation of

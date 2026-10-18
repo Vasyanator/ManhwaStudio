@@ -37,7 +37,7 @@ the finest scale) and exits — it is never joined on the GUI thread.
 
 use super::engine::RawRegionResult;
 use super::layers::ResultPatch;
-use ms_region_postprocess::{EffectiveSettings, PostprocessSettings, RegionInputs, RegionPostprocessor};
+use ms_region_postprocess::{ColourReference, EffectiveSettings, PostprocessSettings, RegionInputs, RegionPostprocessor};
 use eframe::egui;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
@@ -120,10 +120,9 @@ pub(super) struct PendingRaw {
     answer_rx: Receiver<Answer>,
     /// The raw settings last asked for, compared against the engine's answer every frame.
     requested_settings: PostprocessSettings,
-    /// Their effective form: a change that leaves it equal (a colour-match toggle in
-    /// whole-region mode) needs no new derivation.
+    /// Their effective form: a change that leaves it equal (a local-strength change while the
+    /// colour match is off) needs no new derivation.
     requested_effective: EffectiveSettings,
-    whole_region: bool,
     requested_generation: u64,
     shown_generation: u64,
     /// A send that failed because the worker is gone, reported by the next `poll`.
@@ -146,8 +145,7 @@ impl PendingRaw {
     /// started. Nothing is left running on an error.
     pub(super) fn start(ctx: &egui::Context, capture: RunCapture, raw: RawRegionResult, settings: PostprocessSettings, log_tag: &'static str, lineage: u64) -> Result<Self, PostprocessFailure> {
         check_shapes(&capture, &raw)?;
-        let whole_region = raw.whole_region;
-        let effective = settings.effective(whole_region);
+        let effective = settings.effective();
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let (answer_tx, answer_rx) = std::sync::mpsc::channel::<Answer>();
         let waker = Waker { ctx: ctx.clone(), viewport: ctx.viewport_id() };
@@ -160,7 +158,6 @@ impl PendingRaw {
             answer_rx,
             requested_settings: settings,
             requested_effective: effective,
-            whole_region,
             requested_generation: 0,
             shown_generation: 0,
             lost: None,
@@ -183,7 +180,7 @@ impl PendingRaw {
             return;
         }
         self.requested_settings = settings;
-        let effective = settings.effective(self.whole_region);
+        let effective = settings.effective();
         if effective == self.requested_effective {
             return;
         }
@@ -357,6 +354,9 @@ fn run_worker(capture: RunCapture, raw: RawRegionResult, job_rx: &Receiver<Job>,
         generated: rgb_bytes(&raw.image),
         mask: raw.mask.clone(),
         sample_mask: raw.sample_mask,
+        // A whole-region run has no ring outside its (solid) mask: it is colour-matched against
+        // the region's edge band instead.
+        colour_reference: if raw.whole_region { ColourReference::EdgeBand } else { ColourReference::Ring },
     };
     let bbox = mask_bbox(&raw.mask, w);
     let mut processor = RegionPostprocessor::new(inputs);
@@ -446,15 +446,29 @@ mod tests {
         assert_eq!(second.pixels[0], first.pixels[0]);
     }
 
-    /// In whole-region mode the colour match is off anyway, so toggling it needs no new run.
+    /// A whole-region run is colour-matched too (against its edge band), so toggling the
+    /// colour match re-derives the result.
     #[test]
-    fn an_effectively_equal_change_starts_nothing() {
+    fn a_colour_toggle_in_whole_region_mode_re_derives() {
         let (capture, mut raw) = fixture();
         raw.whole_region = true;
         let settings = PostprocessSettings::default();
         let mut pending = start(capture, raw, settings).expect("the shapes agree");
         wait(&mut pending).expect("generation 1 renders");
         pending.request(PostprocessSettings { color_match: !settings.color_match, ..settings });
+        assert!(pending.settling(), "the toggle changes what is applied");
+        wait(&mut pending).expect("generation 2 renders");
+    }
+
+    /// A change that leaves the effective settings equal (the local strength while the colour
+    /// match is off) needs no new run.
+    #[test]
+    fn an_effectively_equal_change_starts_nothing() {
+        let (capture, raw) = fixture();
+        let settings = PostprocessSettings { color_match: false, ..PostprocessSettings::default() };
+        let mut pending = start(capture, raw, settings).expect("the shapes agree");
+        wait(&mut pending).expect("generation 1 renders");
+        pending.request(PostprocessSettings { color_match_local_pct: settings.color_match_local_pct + 10, ..settings });
         assert!(!pending.settling());
     }
 
@@ -479,13 +493,12 @@ mod tests {
     fn scripted(settings: PostprocessSettings) -> (PendingRaw, Receiver<Job>, Sender<Answer>) {
         let (job_tx, job_rx) = std::sync::mpsc::channel::<Job>();
         let (answer_tx, answer_rx) = std::sync::mpsc::channel::<Answer>();
-        let effective = settings.effective(false);
+        let effective = settings.effective();
         let mut pending = PendingRaw {
             job_tx: Some(job_tx),
             answer_rx,
             requested_settings: settings,
             requested_effective: effective,
-            whole_region: false,
             requested_generation: 0,
             shown_generation: 0,
             lost: None,
@@ -557,9 +570,9 @@ mod tests {
         let translucent = Color32::from_rgba_premultiplied(40, 40, 40, 128);
         let original = egui::ColorImage::new([3, 2], vec![translucent, Color32::WHITE, translucent, translucent, translucent, translucent]);
         let mask = vec![0, 255, 0, 0, 0, 0];
-        let inputs = RegionInputs { width: 3, height: 2, base: rgb_bytes(&original), reference: None, generated: vec![7; 18], mask: mask.clone(), sample_mask: None };
+        let inputs = RegionInputs { width: 3, height: 2, base: rgb_bytes(&original), reference: None, generated: vec![7; 18], mask: mask.clone(), sample_mask: None, colour_reference: ColourReference::Ring };
         let mut processor = RegionPostprocessor::new(inputs).expect("the shapes agree");
-        let settings = PostprocessSettings { mask_feather_px: 0, color_match: false, ..PostprocessSettings::default() }.effective(false);
+        let settings = PostprocessSettings { mask_feather_px: 0, color_match: false, ..PostprocessSettings::default() }.effective();
         let derived = derive(&mut processor, &original, mask_bbox(&mask, 3), &settings).expect("the render succeeds");
         let mut expected = original.pixels.clone();
         expected[1] = Color32::from_rgb(7, 7, 7);

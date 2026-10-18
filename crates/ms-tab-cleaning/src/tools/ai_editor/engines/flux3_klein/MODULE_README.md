@@ -38,7 +38,8 @@ permission to change: the backend only validates it and answers the RAW region (
 the HOST composites it inside the mask (feather + colour match, `ms_region_postprocess`, the
 engine's persisted «Постобработка» settings), so everything outside stays byte-identical and a
 settings change re-derives a pending result without a new run; an EMPTY mask is the
-whole-region mode (`mask_for_run`), with no ring to colour-match against. User references
+whole-region mode (`mask_for_run`), colour-matched against the region's edge band instead of a
+ring. User references
 follow as #1.., the marks reference is appended last.
 
 The model-agnostic parts are not here: `../shared/` (progress + `stream_call`, the Hugging Face

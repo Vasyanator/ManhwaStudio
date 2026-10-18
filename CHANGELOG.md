@@ -130,7 +130,8 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 ## Unreleased
 
 ### Improvements
-- **Post-processing of FLUX klein results** — in the area editor, edge feathering and colour matching to the original now live in a separate «Post-processing» section and apply to the shown result instantly, without regenerating it. Colour marks no longer bleed into the edge of the inserted result.
+- **Post-processing of FLUX klein results** — in the area editor, edge feathering and colour matching to the original now live in a separate «Post-processing» section and apply to the shown result instantly, without regenerating it. Colour marks no longer bleed into the edge of the inserted result. Colours are now matched even when nothing is painted (the whole area is regenerated): the edges of the area serve as the reference.
+- **«Hide frame» in the area editor** — a toggle next to «Compare» hides the frame, its handles, the masks and the status line while a result is waiting to be applied, so you can check how the edges of the area join the page.
 
 ---
 
@@ -266,4 +267,5 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 ## Не выпущено
 
 ### Улучшения
-- **Постобработка результатов FLUX klein** — в редакторе области растушёвка края и подгонка цветов к оригиналу вынесены в отдельный раздел «Постобработка» и применяются к показанному результату сразу, без повторной генерации. Цветовые пометки больше не просачиваются в край вставки.
+- **Постобработка результатов FLUX klein** — в редакторе области растушёвка края и подгонка цветов к оригиналу вынесены в отдельный раздел «Постобработка» и применяются к показанному результату сразу, без повторной генерации. Цветовые пометки больше не просачиваются в край вставки. Цвета теперь подгоняются и тогда, когда ничего не закрашено (перерисовывается вся область): опорой служат края области.
+- **«Скрыть рамку» в редакторе области** — переключатель рядом с «Сравнить» прячет рамку, её ручки, маски и строку состояния, пока результат ждёт применения, чтобы посмотреть, как края области стыкуются со страницей.

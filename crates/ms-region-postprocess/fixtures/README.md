@@ -76,7 +76,7 @@ the port drifts from the shipped behaviour; it is not a parity target.
 | `02_border_blob` | 256x96 | blob touching the top and right borders, scale 8, local 100 %, feather 32 |
 | `03_thin_stroke` | 160x160 | 7 px stroke narrower than the feather 12 (compressed ramp), scale 16, local 80 % |
 | `04_flux2_latent` | 224x176 | FLUX.2-like: `sample_mask = dilate_ellipse(mask, 16)`, scale 96 |
-| `05_whole_region` | 128x96 | solid mask + `whole_region`: colour match off by the effective rule, feather only |
+| `05_whole_region` | 128x96 | solid mask + `whole_region`, colour match stored OFF: feather only (the Rust edge-band colour match has no Python reference; `band_mode_tests.rs` covers it) |
 | `06a_ring_unmargined` | 64x64 | 3 px ring: global falls back to the undilated mask, local skipped |
 | `06b_ring_skipped` | 40x40 | 1 px ring (156 samples): global and local both skipped |
 | `07_marks_overlay` | 128x112 | reference (marked) differs from base (unmarked), feather 0 (hard edge) |

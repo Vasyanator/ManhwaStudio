@@ -8,7 +8,7 @@ body UI.
 
 Exports:
 - `PostprocessSettings` / `EffectiveSettings` and the range/default constants (`settings`).
-- `RegionInputs`, `RegionPostprocessor`, `postprocess_region` (`pipeline`).
+- `RegionInputs`, `ColourReference`, `RegionPostprocessor`, `postprocess_region` (`pipeline`).
 - `dilate_ellipse`, `MAX_DILATE_RADIUS_PX`: cv2-exact elliptical mask dilation (also the FLUX.2
   latent mask) and its radius cap.
 - `draw_postprocess_body`, `section_title` (`ui`).
@@ -28,6 +28,7 @@ local CIELAB match lives in `local_match/` behind one crate-private function.
 extern crate ms_i18n;
 
 mod composite;
+mod edge_band;
 mod feather;
 mod global_match;
 mod local_match;
@@ -37,10 +38,12 @@ mod settings;
 mod ui;
 
 #[cfg(test)]
+mod band_mode_tests;
+#[cfg(test)]
 mod fixture_tests;
 
 pub use mask::{MAX_DILATE_RADIUS_PX, dilate_ellipse};
-pub use pipeline::{RegionInputs, RegionPostprocessor, postprocess_region};
+pub use pipeline::{ColourReference, RegionInputs, RegionPostprocessor, postprocess_region};
 pub use settings::{
     DEFAULT_FEATHER_PX, DEFAULT_LOCAL_PCT, DEFAULT_SCALE_PX, EffectiveSettings, FEATHER_MAX_PX, LOCAL_PCT_MAX, PostprocessSettings, SCALE_MAX_PX, SCALE_MIN_PX,
 };

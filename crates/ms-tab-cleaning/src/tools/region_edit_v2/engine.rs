@@ -246,7 +246,8 @@ pub struct RawRegionResult {
     /// latent mask the model saw), same size; `None` = `mask`.
     pub sample_mask: Option<Vec<u8>>,
     /// The run regenerated the whole region (an empty painted mask): there is no ring outside
-    /// the mask to colour-match against (`PostprocessSettings::effective`).
+    /// the mask, so the colour match takes its reference from the region's edge band
+    /// (`ms_region_postprocess::ColourReference::EdgeBand`).
     pub whole_region: bool,
 }
 

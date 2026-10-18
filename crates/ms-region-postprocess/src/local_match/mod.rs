@@ -10,7 +10,8 @@ VAE's tone shift, it pulls the LOW frequencies inside the sample mask towards th
 
 Key structures:
 - `LocalMatchError`: typed refusals (shape, size overflow, scale, strength, margin dilation).
-- `LocalSampling`: the sample-mask half, built once per region (margin, sample sets).
+- `LocalSampling`: the sample-mask half, built once per region (margin, sample sets), or the
+  edge band of a whole-region run (`new_band`).
 - `LocalFields`: the correction fields of one current image at one scale; `apply()` is the only
   step `strength` enters.
 - `Geometry`: grid factor, reflect padding and cascade sigmas shared by both sides.
@@ -32,6 +33,10 @@ Algorithm (contract of the reference, see `match_color_local`'s doc comment):
   coarser over a reflect-101 padded copy; coarse levels use jittered point samples (`jitter.rs`);
 - the correction fades to the identity where either side's similar-pixel share is below
   `LOCAL_MATCH_MIN_SHARE`, and is blended by `strength`.
+
+Edge-band mode (not in the reference; a whole-region run has no outside): the robust local mode
+of `Lab(reference) - Lab(current)` over the band pixels, cascaded like the target, becomes a
+pure offset `[1, dL, da, db]` (faded by the band's share), applied over the whole mask.
 
 Notes:
 Deliberate deviation: the coarse-level jitter uses splitmix64 instead of numpy's PCG64 (see
@@ -179,25 +184,34 @@ fn clamp_strength(strength: f32) -> Result<f32, LocalMatchError> {
 }
 
 /// The half of the local match that depends only on the sample mask — the valid-margin
-/// dilation and both sides' sample sets — built once per region and shared by every current
-/// image, scale and strength.
+/// dilation and both sides' sample sets, or the edge band of a whole-region run — built once
+/// per region and shared by every current image, scale and strength.
 #[derive(Debug)]
 pub(crate) struct LocalSampling {
     width: usize,
     height: usize,
     tables: LabTables,
     /// `None`: the match is the identity whatever the current image, scale or strength (an
-    /// empty sample mask, or fewer than `MIN_VALID_SAMPLES` pixels outside the margin).
+    /// empty sample mask, or fewer than `MIN_VALID_SAMPLES` target pixels).
     sides: Option<Sides>,
 }
 
-/// The two sides' sample sets of a non-identity match.
+/// The sample sets of a non-identity match.
 #[derive(Debug)]
-struct Sides {
-    /// Target samples: outside the sample mask grown by `LOCAL_MATCH_VALID_MARGIN_PX`.
-    valid: Vec<bool>,
-    /// Current samples: inside the sample mask.
-    inside: Vec<bool>,
+enum Sides {
+    /// The ring mode: target outside the mask, current inside it.
+    Ring {
+        /// Target samples: outside the sample mask grown by `LOCAL_MATCH_VALID_MARGIN_PX`.
+        valid: Vec<bool>,
+        /// Current samples: inside the sample mask.
+        inside: Vec<bool>,
+    },
+    /// The edge-band mode: both images are sampled on the same band pixels, and their Lab
+    /// DIFFERENCE is carried inwards (`offset_fields`).
+    Band {
+        /// Band pixels.
+        band: Vec<bool>,
+    },
 }
 
 impl LocalSampling {
@@ -222,12 +236,31 @@ impl LocalSampling {
         }
         let valid: Vec<bool> = margin.iter().map(|&value| value == 0).collect();
         let inside: Vec<bool> = sample_mask.iter().map(|&value| value > 0).collect();
-        Ok(Self { width, height, tables, sides: Some(Sides { valid, inside }) })
+        Ok(Self { width, height, tables, sides: Some(Sides::Ring { valid, inside }) })
+    }
+
+    /// The edge-band sampling of a whole-region run: `band` (one entry per pixel, `true` = a
+    /// band pixel, see `crate::edge_band`) is where generated and original are supposed to
+    /// agree. The identity when it holds fewer than `MIN_VALID_SAMPLES` pixels.
+    ///
+    /// # Errors
+    /// `SizeOverflow` / `ShapeMismatch` for a `band` that does not fit `width x height`.
+    pub(crate) fn new_band(band: Vec<bool>, width: usize, height: usize) -> Result<Self, LocalMatchError> {
+        let pixels = width.checked_mul(height).ok_or(LocalMatchError::SizeOverflow { width, height })?;
+        if band.len() != pixels {
+            return Err(LocalMatchError::ShapeMismatch { what: "band", expected: pixels, actual: band.len() });
+        }
+        let tables = LabTables::new();
+        if band.iter().filter(|&&on| on).count() < MIN_VALID_SAMPLES {
+            return Ok(Self { width, height, tables, sides: None });
+        }
+        Ok(Self { width, height, tables, sides: Some(Sides::Band { band }) })
     }
 
     /// The strength-independent correction fields of `current` at `scale_px` (`reference` must be
     /// the image this sampling was built from): the target's
-    /// cascade and the current side's moments (run concurrently) and the per-cell correction.
+    /// cascade and the current side's moments (run concurrently) and the per-cell correction;
+    /// in the edge-band mode the band's offset field (`offset_fields`) instead.
     /// `None` when the match is the identity for this region (see `sides`).
     ///
     /// # Errors
@@ -239,8 +272,10 @@ impl LocalSampling {
         check_rgb("reference", reference, width * height, width, height)?;
         check_rgb("current", current, width * height, width, height)?;
         check_scale(scale_px)?;
-        let Some(sides) = &self.sides else {
-            return Ok(None);
+        let (valid, inside) = match &self.sides {
+            None => return Ok(None),
+            Some(Sides::Band { band }) => return self.offset_fields(band, reference, current, scale_px).map(Some),
+            Some(Sides::Ring { valid, inside }) => (valid, inside),
         };
         let center = strided_center(&self.tables, current, width, height);
         let geometry = Geometry::new(scale_px, width, height)?;
@@ -250,19 +285,51 @@ impl LocalSampling {
         // only. The two sides share nothing but read-only inputs, so they run concurrently.
         let (target, local) = rayon::join(
             || -> Result<(Field, Field), LocalMatchError> {
-                let lab = geometry.padded_centred_lab(&self.tables, reference, &sides.valid, center)?;
-                let weight = geometry.padded_weight(&sides.valid)?;
+                let lab = geometry.padded_centred_lab(&self.tables, reference, valid, center)?;
+                let weight = geometry.padded_weight(valid)?;
                 robust_local_moments(&lab, &weight, &geometry, true)
             },
             || -> Result<(Field, Field), LocalMatchError> {
-                let lab = geometry.padded_centred_lab(&self.tables, current, &sides.inside, center)?;
-                let weight = geometry.padded_weight(&sides.inside)?;
+                let lab = geometry.padded_centred_lab(&self.tables, current, inside, center)?;
+                let weight = geometry.padded_weight(inside)?;
                 robust_local_moments(&lab, &weight, &geometry, false)
             },
         );
         let ((target, target_share), (local, local_share)) = (target?, local?);
         let fields = correction_fields(&target, &target_share, &local, &local_share, center[0])?;
         Ok(Some(LocalFields { fields, geometry }))
+    }
+
+    /// The edge-band fields: the dominant local `Lab(reference) - Lab(current)` over the band,
+    /// carried over the whole region by the target's cascade (ending, far from every band
+    /// sample, with the band's robust global difference), as a pure offset (gain 1).
+    ///
+    /// Why a difference and not two moment fields: the robust mode of each side would pick
+    /// different pixels of the band and their difference would carry that mismatch inwards
+    /// (measured worse than the global stage alone on a 64 px region); the mode of the
+    /// per-pixel difference compares each original pixel with ITS own generated pixel. No
+    /// centring is needed: after the global stage the difference is near 0.
+    fn offset_fields(&self, band: &[bool], reference: &[u8], current: &[u8], scale_px: u32) -> Result<LocalFields, LocalMatchError> {
+        let geometry = Geometry::new(scale_px, self.width, self.height)?;
+        let tables = &self.tables;
+        let width = self.width;
+        // Only band pixels are converted, the others hold 0 behind a zero weight (the
+        // `padded_centred_lab` argument).
+        let difference = geometry.padded_field(3, |row, values| {
+            let start = row * width;
+            for (col, out) in values.chunks_exact_mut(3).enumerate() {
+                if band[start + col] {
+                    let target = tables.to_lab(rgb_at(reference, start + col));
+                    let generated = tables.to_lab(rgb_at(current, start + col));
+                    for ((value, &t), &g) in out.iter_mut().zip(&target).zip(&generated) {
+                        *value = t - g;
+                    }
+                }
+            }
+        })?;
+        let weight = geometry.padded_weight(band)?;
+        let (offset, share) = robust_local_moments(&difference, &weight, &geometry, true)?;
+        Ok(LocalFields { fields: offset_correction(&offset, &share)?, geometry })
     }
 }
 
@@ -694,6 +761,20 @@ fn correction_fields(target: &Field, target_share: &Field, local: &Field, local_
         fields.extend_from_slice(&[gain, offset_l, (t[1] - l[1]) * trust, (t[2] - l[2]) * trust]);
     }
     Field::from_vec(target.height, target.width, 4, fields)
+}
+
+/// The per-cell correction `[1, dL·trust, da·trust, db·trust]` of the edge-band mode, in the
+/// layout `apply_fields` reads: the difference field's mean is the offset, and it fades to the
+/// identity where the band's similar-pixel share is below `LOCAL_MATCH_MIN_SHARE` (a mixture of
+/// two differences, e.g. where an edit reaches the border).
+fn offset_correction(offset: &Field, share: &Field) -> Result<Field, LocalMatchError> {
+    let min_share = to_f32(LOCAL_MATCH_MIN_SHARE);
+    let mut fields = Vec::with_capacity(share.data.len() * 4);
+    for (d, &s) in offset.data.chunks_exact(4).zip(&share.data) {
+        let trust = (s / min_share).clamp(0.0, 1.0);
+        fields.extend_from_slice(&[1.0, d[0] * trust, d[1] * trust, d[2] * trust]);
+    }
+    Field::from_vec(offset.height, offset.width, 4, fields)
 }
 
 /// Applies the fields (upsampled to the padded fine grid and cropped to the region) to every

@@ -29,7 +29,7 @@
   "sample_mask_distinct": false,
   "sample_mask_rule": "mask",
   "settings": {
-    "color_match": true,
+    "color_match": false,
     "color_match_local_pct": 60,
     "color_match_scale_px": 24,
     "mask_feather_px": 12
