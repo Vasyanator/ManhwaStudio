@@ -88,7 +88,10 @@ frame's `InputFrame` and the registry; `draw` holds the frame for the pass, read
 area while a canvas-wide gesture is armed and `view.pan` is not held (`draw_capture_area`) and
 publishes its view surface with the bottom hint, Hangul window and scrollbars as holes
 (`publish_view_surface`). While a claim other than `view.zoom_drag` runs on this view the canvas
-neither zooms nor wheel-scrolls (`claim_locks_view`). No key, modifier or wheel is read here.
+neither zooms nor wheel-scrolls (`claim_locks_view`). No key, modifier or wheel binding is read
+here; the one wheel exception is `scene::forward_wheel_hidden_by_capture_layer`, which applies
+egui's leftover (post-router) scroll delta to the canvas `ScrollArea` while the capture layer
+hides the pointer from it.
 
 CanvasHooks methods:
 - `on_page_click`: a `canvas.page.click` on a page, before the canvas' own handling (also on
@@ -2059,8 +2062,10 @@ impl CanvasView {
     /// those keep their clicks; and tab code that treats a non-background layer under the pointer
     /// as "occluded" still sees bare canvas. The layer is published as the surface's
     /// `capture_layer` and as a touch capture layer, so it occludes neither the router's view
-    /// lookup nor a finger. The scrollbars are view-surface holes, so the area is not armed over
-    /// them and they stay draggable.
+    /// lookup nor a finger. It DOES hide the pointer from egui's `ScrollArea` hover test (raised
+    /// this frame or the previous one), which would drop the wheel; the scene pass compensates
+    /// with `scene::forward_wheel_hidden_by_capture_layer`. The scrollbars are view-surface holes,
+    /// so the area is not armed over them and they stay draggable.
     fn draw_capture_area(&self, ctx: &egui::Context, canvas_rect: Rect) {
         let raise = self.input_frame.as_ref().is_some_and(|frame| frame.canvas_wide_armed(self.view_id()) && !frame.mode_active(view::PAN));
         if !raise || !canvas_rect.is_positive() {

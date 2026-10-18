@@ -29,6 +29,8 @@ Key functions:
   the `canvas.page.menu` gesture and a finger long-press share the target code and
   `context_menu_popup`; `canvas.page.click` goes to `CanvasHooks::on_page_click` first)
 - CanvasView::bubble_widgets_locked() (zoom drag or `view.pan`: bubble widgets sense hover only)
+- forward_wheel_hidden_by_capture_layer() (wheel scroll egui drops while the capture `Area`
+  covers the scene `ScrollArea`; replays egui's wheel branch on its stored state)
 - CanvasView::draw_canvas_viewport_ui()
 - CanvasView::draw_ribbon_tab_body()
 - CanvasView::draw_canvas_bottom_hint()
@@ -981,7 +983,7 @@ impl CanvasView {
             scroll_area = scroll_area.scroll_offset(offset);
         }
 
-        let scene_output = scroll_area.show(ui, |ui| {
+        let mut scene_output = scroll_area.show(ui, |ui| {
             self.scene.visible_scene_rect = Some(ui.clip_rect());
             // The page strip is positioned explicitly (edge_margin / page_spacing in world
             // units scaled by zoom); egui's ambient item_spacing must not add incidental
@@ -1128,6 +1130,9 @@ impl CanvasView {
         // Tabs decorate the vertical scrollbar (e.g. translation status marks) after
         // the scene is laid out, so the bar geometry and bubble positions are final.
         self.render_scrollbar_marks(ui, &scene_output, project, hooks);
+        // After the marks, so they match the bars egui painted this frame; the forwarded offset
+        // shows next frame, as egui's own wheel scroll does.
+        forward_wheel_hidden_by_capture_layer(ui, &mut scene_output, input::capture_layer_for(self.scroll_area_id_salt), !frame.suppress_wheel_scroll);
         scene_output
     }
 
@@ -2035,6 +2040,74 @@ impl CanvasView {
     }
 }
 
+/// Applies the frame's wheel scroll to the canvas `ScrollArea` when the canvas' own capture layer
+/// hid the pointer from it, replicating egui 0.36.2's wheel branch (`Prepared::end`,
+/// `containers/scroll_area.rs`) on the stored `scroll_area::State`.
+///
+/// egui applies the wheel only when the topmost interactable layer under the pointer is the
+/// `ScrollArea`'s own, and the capture `Area` (`CanvasView::draw_capture_area`) sits above it for
+/// as long as egui counts it visible (raised this frame or the previous one). The trigger is
+/// therefore egui's own fact, `layer_id_at(pointer) == capture_layer`, never a copy of the raise
+/// rule; when the area is down nothing here runs. Everything else follows egui's branch:
+/// `wheel_allowed` stands for the canvas' `ScrollSource::mouse_wheel` (false while a claim locks
+/// the view, the zoom modifier is held or a zoom drag runs), the parent `ui` must be enabled, no
+/// widget may be dragged, the pointer must be inside the area's inner rect; per axis (both are
+/// enabled: the canvas uses `ScrollArea::both()`, multiplier 1) a component scrolls only away
+/// from its bound and only a scrolled component of `smooth_scroll_delta` is zeroed. That delta is
+/// already post-router (wheel owned by an `ms-input` axis is zeroed in `InputRouter::begin_frame`)
+/// and folded by egui (Shift -> horizontal; a zoom-modifier wheel never reaches it). Like egui's
+/// branch, the new offset shows from the next frame on; unlike it, a pending scroll-to animation
+/// target (private egui state) is not cancelled.
+pub(super) fn forward_wheel_hidden_by_capture_layer<R>(
+    ui: &egui::Ui,
+    scroll_output: &mut egui::scroll_area::ScrollAreaOutput<R>,
+    capture_layer: egui::LayerId,
+    wheel_allowed: bool,
+) {
+    if !wheel_allowed || !ui.is_enabled() {
+        return;
+    }
+    let ctx = ui.ctx();
+    let Some(pointer) = ctx.pointer_interact_pos() else {
+        return;
+    };
+    if !scroll_output.inner_rect.contains(pointer) || ctx.dragged_id().is_some() || ctx.layer_id_at(pointer) != Some(capture_layer) {
+        return;
+    }
+    let delta = ctx.input(|input| input.smooth_scroll_delta());
+    if delta == Vec2::ZERO {
+        return;
+    }
+    // `show` stored the state it returned; reload it so every private field stays egui's own.
+    let Some(mut state) = egui::scroll_area::State::load(ctx, scroll_output.id) else {
+        return;
+    };
+    let max_offset = scroll_output.content_size - scroll_output.inner_rect.size();
+    let mut scrolled = [false; 2];
+    for axis in 0..2 {
+        let axis_delta = delta[axis];
+        let scrolling_up = state.offset[axis] > 0.0 && axis_delta > 0.0;
+        let scrolling_down = state.offset[axis] < max_offset[axis] && axis_delta < 0.0;
+        if scrolling_up || scrolling_down {
+            state.offset[axis] -= axis_delta;
+            scrolled[axis] = true;
+        }
+    }
+    if !scrolled.contains(&true) {
+        return;
+    }
+    // egui clamps after its wheel branch in the same `end`; this runs after `end`, so clamp here.
+    state.offset = state.offset.min(max_offset).max(Vec2::ZERO);
+    scroll_output.state.offset = state.offset;
+    state.store(ctx, scroll_output.id);
+    ctx.input_mut(|input| {
+        for (axis, _) in scrolled.iter().enumerate().filter(|(_, scrolled)| **scrolled) {
+            input.smooth_scroll_delta[axis] = 0.0;
+        }
+    });
+    ctx.request_repaint();
+}
+
 /// The page menu's "Create bubble" label, with `shortcut` (the tab's binding text,
 /// `CanvasHooks::page_menu_create_bubble_shortcut`) when it has a non-empty one.
 fn create_bubble_context_menu_label(shortcut: Option<String>) -> String {
@@ -2776,5 +2849,119 @@ mod tests {
             center_px: None,
         });
         assert_eq!(view.strip_width_compensation_offset(Some(previous), current), None);
+    }
+
+    /// How a wheel test frame treats the canvas-like `ScrollArea`.
+    #[derive(Debug, Clone, Copy)]
+    struct WheelCase {
+        /// Raise an interactable full-screen area on the canvas capture layer, as
+        /// `CanvasView::draw_capture_area` does while a canvas-wide gesture is armed.
+        raise_capture: bool,
+        /// `Some(wheel_allowed)`: call `forward_wheel_hidden_by_capture_layer` after `show`.
+        forward: Option<bool>,
+        modifiers: egui::Modifiers,
+    }
+
+    /// Runs headless egui frames with the pointer over a large `ScrollArea::both()` and one wheel
+    /// notch (`notch` lines) on frame 2, then returns the final scroll offset. egui smooths a line
+    /// wheel over several frames, so the run lasts until the smoothing has drained.
+    fn wheel_scroll_offset(case: WheelCase, notch: Vec2) -> Vec2 {
+        let ctx = egui::Context::default();
+        let capture_layer = input::capture_layer_for("scene_wheel_test");
+        let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let pointer = egui::pos2(400.0, 300.0);
+        let mut offset = Vec2::ZERO;
+        for frame in 0..60_u32 {
+            let mut events = vec![egui::Event::PointerMoved(pointer)];
+            if frame == 2 {
+                events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: notch,
+                    phase: egui::TouchPhase::Move,
+                    modifiers: case.modifiers,
+                });
+            }
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(f64::from(frame) / 60.0),
+                events,
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| {
+                if case.raise_capture {
+                    egui::Area::new(capture_layer.id)
+                        .order(capture_layer.order)
+                        .fixed_pos(screen.min)
+                        .constrain(false)
+                        .movable(false)
+                        .interactable(true)
+                        .show(ui.ctx(), |ui| {
+                            ui.set_min_size(screen.size());
+                            ui.interact(screen, capture_layer.id.with("sense"), Sense::click_and_drag());
+                        });
+                }
+                let mut output = egui::ScrollArea::both()
+                    .id_salt("scene_wheel_test")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.allocate_space(egui::vec2(4000.0, 4000.0));
+                    });
+                if let Some(wheel_allowed) = case.forward {
+                    forward_wheel_hidden_by_capture_layer(ui, &mut output, capture_layer, wheel_allowed);
+                }
+                offset = output.state.offset;
+            })
+            .drop_without_applying_deltas();
+        }
+        offset
+    }
+
+    const NOTCH_DOWN: Vec2 = Vec2::new(0.0, -1.0);
+
+    #[test]
+    fn capture_layer_hides_the_wheel_from_the_scroll_area() {
+        // The defect this forwarding exists for: egui alone drops the wheel under the area.
+        let hidden = WheelCase { raise_capture: true, forward: None, modifiers: egui::Modifiers::NONE };
+        assert_eq!(wheel_scroll_offset(hidden, NOTCH_DOWN), Vec2::ZERO);
+    }
+
+    #[test]
+    fn forwarded_wheel_matches_egui_native_scroll() {
+        let native = WheelCase { raise_capture: false, forward: None, modifiers: egui::Modifiers::NONE };
+        let forwarded = WheelCase { raise_capture: true, forward: Some(true), modifiers: egui::Modifiers::NONE };
+        let native_offset = wheel_scroll_offset(native, NOTCH_DOWN);
+        assert!(native_offset.y > 0.0, "egui scrolls a bare ScrollArea: {native_offset:?}");
+        assert_eq!(wheel_scroll_offset(forwarded, NOTCH_DOWN), native_offset);
+    }
+
+    #[test]
+    fn forwarded_shift_wheel_scrolls_horizontally_like_egui() {
+        let native = WheelCase { raise_capture: false, forward: None, modifiers: egui::Modifiers::SHIFT };
+        let forwarded = WheelCase { raise_capture: true, forward: Some(true), modifiers: egui::Modifiers::SHIFT };
+        let native_offset = wheel_scroll_offset(native, NOTCH_DOWN);
+        assert!(native_offset.x > 0.0 && native_offset.y == 0.0, "egui folds Shift+wheel into X: {native_offset:?}");
+        assert_eq!(wheel_scroll_offset(forwarded, NOTCH_DOWN), native_offset);
+    }
+
+    #[test]
+    fn suppressed_wheel_is_not_forwarded() {
+        // `wheel_allowed == false`: a claim locks the view, the zoom modifier is held or a zoom
+        // drag runs (`CanvasFrameParams::suppress_wheel_scroll`).
+        let locked = WheelCase { raise_capture: true, forward: Some(false), modifiers: egui::Modifiers::NONE };
+        assert_eq!(wheel_scroll_offset(locked, NOTCH_DOWN), Vec2::ZERO);
+    }
+
+    #[test]
+    fn zoom_modifier_wheel_never_scrolls_when_forwarded() {
+        // egui turns a Command/Ctrl wheel into zoom, so no scroll delta is left to forward.
+        let zoom = WheelCase { raise_capture: true, forward: Some(true), modifiers: egui::Modifiers::COMMAND };
+        assert_eq!(wheel_scroll_offset(zoom, NOTCH_DOWN), Vec2::ZERO);
+    }
+
+    #[test]
+    fn forwarding_is_inert_without_the_capture_layer() {
+        let native = WheelCase { raise_capture: false, forward: None, modifiers: egui::Modifiers::NONE };
+        let forwarding = WheelCase { raise_capture: false, forward: Some(true), modifiers: egui::Modifiers::NONE };
+        assert_eq!(wheel_scroll_offset(forwarding, NOTCH_DOWN), wheel_scroll_offset(native, NOTCH_DOWN));
     }
 }

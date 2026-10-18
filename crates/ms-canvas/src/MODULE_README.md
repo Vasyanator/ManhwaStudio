@@ -419,8 +419,9 @@ this high (the other two are in `ms-project` and `ms-models`, both below it).
 - `workers.rs`: background worker startup for overlay preparation, autosave, and settings.
 
 ## Input
-The canvas reads NO key, modifier or wheel itself: the studio's `InputRouter::begin_frame` decides
-everything before any tab draws, and `CanvasDrawParams::{input, input_registry}` hand the frame and
+The canvas reads NO key, modifier or wheel binding itself: the studio's `InputRouter::begin_frame`
+decides everything before any tab draws (sole wheel exception: the capture-area wheel forwarding
+below, which applies egui's own leftover scroll delta, never a binding), and `CanvasDrawParams::{input, input_registry}` hand the frame and
 the registry to `draw` (`input_frame` holds the frame for the pass).
 - **Declared here** (`input::declarations`, scope `Canvas`, registered once by the studio):
   commands `canvas.bubble.undo` (Ctrl+Z), `redo` (Ctrl+Shift+Z / Ctrl+Y), `duplicate` (Ctrl+D),
@@ -472,6 +473,21 @@ the registry to `draw` (`input_frame` holds the frame for the pass).
   root layer, below dock panels / popups / windows (they keep their clicks), and code that treats
   a non-background layer under the pointer as occlusion (Cleaning strokes, Typing deselect) still
   sees bare canvas.
+- **Wheel under the capture area** (`scene::forward_wheel_hidden_by_capture_layer`, right after
+  the scene `ScrollArea::show`): egui scrolls a `ScrollArea` by wheel only when the topmost layer
+  under the pointer is its own, and the capture area is on top while raised AND one frame after
+  it is lowered (egui counts last frame's areas as visible). Hover alone arms a plain canvas-wide
+  drag (Cleaning Замазка / Штамп / Заплатка), held modes arm the others (Translation OCR / crop,
+  Typing create, Cleaning select), so without help the plain wheel would not scroll there. When
+  egui reports the capture layer as the top layer at the pointer and the canvas' wheel scrolling is
+  not suppressed (`CanvasFrameParams::suppress_wheel_scroll`: claim lock, zoom modifier, zoom
+  drag), the canvas replays egui 0.36.2's wheel branch on the stored `scroll_area::State`: same
+  bounds and per-axis consumption, so the offset matches a bare `ScrollArea` exactly (pinned by
+  the `scene` wheel tests). The delta it reads is already post-router (owned axes such as
+  Shift+wheel brush size or R+wheel stamp rotation are zeroed) and folded by egui (Shift ->
+  horizontal; a Ctrl wheel is zoom and leaves no delta). The trigger is egui's layer fact, not a
+  copy of the raise rule. Known difference: a nested `ScrollArea` inside the scene under the
+  pointer is not scrolled first, the canvas strip is (the canvas-wide gesture owns that spot).
 - **Menus** open through the one canvas menu path (`ms_input::touch::context_menu_popup`) from the menu
   gestures or egui's long touch on a touch hole; a secondary click the menu binding does not own
   skips the popup for that frame (`CanvasView::bubble_menu_popup` / `page_menu_clicked`).
