@@ -9,7 +9,7 @@ This document is the single source of truth. Both sides are implemented purely
 from it. The Python constants live in `protocol.py`; the Rust side mirrors the
 same string/number values. Any field listed here is part of the contract.
 
-- **Protocol version:** `16` (`PROTOCOL_VERSION`). This is the ONLY compatibility
+- **Protocol version:** `17` (`PROTOCOL_VERSION`). This is the ONLY compatibility
   gate between the two halves: it is compared in the `hello` handshake and lives in
   `protocol.py` mirrored by `crates/ms-backend-ipc/src/protocol.rs`. It MUST be bumped in BOTH
   files on ANY change to this contract, not only on one judged breaking — a new method,
@@ -78,7 +78,7 @@ WebSocket is only a carrier.
 
 | Field             | Type   | Required on            | Meaning                                                                 |
 |-------------------|--------|------------------------|-------------------------------------------------------------------------|
-| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 14. Optional/ignored on others.  |
+| `v`               | int    | `hello`                | Protocol version. `PROTOCOL_VERSION` = 17. Optional/ignored on others.  |
 | `id`              | u64    | all framed messages    | Correlation id. `0` means a server-initiated frame (events, hello).     |
 | `kind`            | string | all                    | One of `hello`,`request`,`response`,`progress`,`event`,`cancel`,`error`.|
 | `method`          | string | `request`              | Method name, e.g. `ocr.manga`. See §5.                                  |
@@ -411,9 +411,12 @@ by a `phase` header field, and never carries a preview blob:
 
 **FLUX.2 klein 9B region editing** (no HTTP predecessor; same blob convention):
 
-Unlike every other engine here the mask is a **permission to change**, not a
-hole to fill: every pixel outside it comes back byte-identical, and the request
-carries a REGION of the page rather than a whole page. The three component paths
+Unlike every other engine here the painted mask is a **permission to change**,
+not a hole to fill: every pixel outside it must end up byte-identical. Since v17
+the CLIENT enforces that: it dilates the painted mask into the LATENT mask the
+request carries, and post-processes the RAW answer itself (colour match, inward
+feathered composite). The request carries a REGION of the page rather than a
+whole page. The three component paths
 are supplied by the user, so generation itself downloads nothing and its streamed
 phases are `load`/`generate`. Acquiring those components is a SEPARATE pair of
 methods (`download.check` / `download.start`, below), and only `download.start`
@@ -571,19 +574,28 @@ accepted and then ignored),
 `vae_tiling: bool` (default `true`), `text_encoder_fp8: bool` (default `false`),
 `encoder_on_cpu: bool` (default `true`, v15: «Энкодер на CPU» — the text encoder
 runs on the CPU from RAM at every VRAM step; §5.10 "Encoder on the CPU"),
-`mask_dilate_px` (0..64, default 16), `mask_feather_px` (0..32, default 12),
-`color_match: bool` (default `true`), `color_match_local_pct` (0..100, default
-60, v16) and `color_match_scale_px` (8..96, default 24, v16; the Gaussian sigma
-of the local match's finest level, in pixels) — see "Color match"
-below; `whole_region: bool` (default `false`),
+`whole_region: bool` (default `false`),
 `max_sequence_length` (64..512, default 512),
 `text_attention_in_mask: bool` (default `false`; see below).
-The fields of the retired placement wire (protocol <= 13) — `placement`,
-`profile`, `low_cpu_mem_usage`, `vae_slicing`, `unload_transformer_before_vae`,
-`unload_text_encoder_after_encode` — are refused BY NAME (a request error naming
-the field and what replaced it), even with a `null` value: a stale client gets a
-clear error instead of a silently ignored memory choice. This holds for every
-`inpaint.flux2_klein*` method that takes `params` and normalizes it.
+Retired fields are refused BY NAME (a request error naming the field, the
+protocol that retired it and what replaced it), even with a `null` value: a
+stale client gets a clear error instead of a silently ignored choice. They are
+the placement wire (v14) — `placement`, `profile`, `low_cpu_mem_usage`,
+`vae_slicing`, `unload_transformer_before_vae`, `unload_text_encoder_after_encode`
+— and the region post-processing (v17) — `mask_dilate_px`, `mask_feather_px`,
+`color_match`, `color_match_local_pct`, `color_match_scale_px`. Any other
+unknown key is ignored. This holds for every `inpaint.flux2_klein*` method that
+takes `params` and normalizes it.
+
+**The mask is the LATENT mask; the answer is RAW** (v17). The mask segment is
+the painted mask already dilated by the client (L8, binarized by the backend,
+non-zero = "may be repainted"); the backend applies no morphology and uses it
+unchanged as the pipeline's `mask_image` and as the `text_attention_in_mask`
+target. The response blob is the RGB PNG of the decoded region, exactly the
+region's size, with no colour match and no composite: outside the mask the
+pipeline's own latent blend keeps the region, but the answer there is a VAE
+round trip of it, NOT byte-identical. The client keeps the run's inputs and
+does every post-processing step itself.
 
 Region constraints, enforced by the backend and never fixed up silently: both
 sides a multiple of **16** and at least **128 px**, area at most **1048576 px²**,
@@ -613,51 +625,22 @@ fork: the blob still carries a mask, and under `whole_region: true` it must be
 SOLID (every pixel non-zero). The backend verifies that instead of trusting the
 flag and answers `status:"error"` naming how many pixels are empty, because a
 flag that disagrees with the data would otherwise surface as a partial edit the
-user was told not to expect. The mode also settles other params by itself:
-`mask_dilate_px` becomes `0` (a full mask has nothing to grow into) and
-`color_match` becomes `false` (the match takes its statistics from the pixels
-OUTSIDE the mask, and here there are none — matching against the changed pixels
-would force the edit's own tone back onto the original's), and with it
-`color_match_local_pct` becomes `0`. `mask_feather_px`
-stays in force and ramps inwards from the region's border, which is what joins
-the regenerated region to the rest of the page. `text_attention_in_mask` is
-forced to `false` as well (see below).
-
-**Color match** (both region editors, FLUX.2 klein and FLUX.3 klein;
-`inpaint/region_imaging.py`). With `color_match` the generated region goes
-through two steps before the composite. (1) A GLOBAL per-channel RGB mean/std
-match, its statistics taken outside the mask (FLUX.2: the dilated latent mask;
-FLUX.3: the painted mask) grown by a further 6 px, so a text outline left at
-the mask edge does not bias it (v16; a ring too small for that falls back to the
-mask itself, and one too small for that skips the match). (2) Unless
-`color_match_local_pct` is `0`, a LOCAL CIELAB match of strength
-`color_match_local_pct / 100` whose finest level is a Gaussian of standard
-deviation (sigma) `color_match_scale_px` pixels, not a window side: the
-lightness and a/b of the dominant local colour inside the mask (a robust local
-mode, so ink lines and outlines do not count) are pulled towards the
-surroundings' dominant colour (carried into the mask from the original's pixels
-outside it),
-which corrects the drift a diffusion fill shows towards the mask centre; far
-from the ring the target converges to the ring's global statistics. The global
-step rewrites the whole generated region and the local step only pixels inside
-the mask; the composite then keeps every pixel outside the mask byte-identical.
-The two local fields are clamped to their ranges by FLUX.2 and
-refused out of range by FLUX.3 (each side's usual rule); an absent field takes
-its default.
+user was told not to expect. The mode forces `text_attention_in_mask` to
+`false` (see below); what it means for the post-processing is the client's rule.
 
 **`text_attention_in_mask` — the prompt acts only inside the mask.** Opt-in;
 absent means `false`, so an older client's request runs unchanged. When `true`
 the backend passes the pipeline ONE additive attention mask over the joint
 sequence `[text | noisy region tokens | the region's clean condition copy |
 reference]` (one token = 16x16 px; a token is "inside" when any of its pixels is
-set in the DILATED mask the pipeline receives). Blocked: image tokens outside the
+set in the latent mask the request carries, which the pipeline receives as is). Blocked: image tokens outside the
 mask reading the text, and the text reading them — for the noisy tokens, the
 clean copy and the reference alike, since a reference must have the region's
 size and is therefore spatially aligned with it (its token (i, j) shows the
 region's pixels). Open: text <-> text, text <-> inside tokens, every image <->
 image pair. Why: the region's clean copy shows the model the whole region, so an
 instruction can be grounded on a matching object OUTSIDE the mask and edited
-there — an edit the latent blend and the composite then discard, leaving nothing
+there — an edit the latent blend and the client's composite then discard, leaving nothing
 changed under the mask. Costs: one `S x S` mask on the compute device (about
 150-330 MB at 1 MP; counted in the denoise phase of `large_models.profiles` and
 of the manager's admission) and
@@ -867,9 +850,11 @@ disable the control, not to decide whether to send the param.
 **FLUX.3 klein region editing** (v15; `ipc/handlers/flux3_klein.py`, service
 `inpaint/flux3_klein/`, region semantics `inpaint/flux3_klein/region.py`).
 FLUX.3 has no mask input: the REGION is reference #0 and the output is exactly
-the region's size; the mask is a **permission to change** — the generated pixels
-are composited back inside it (feathered inwards, color-matched to the ring
-outside it), so every pixel outside the mask comes back byte-identical. The
+the region's size. The painted mask is a **permission to change** that the
+CLIENT enforces (v17): the response blob is the RAW generated region as an RGB
+PNG (the decode clamped and ROUNDED half to even to 8 bits), with no colour
+match and no composite, and the client colour-matches and composites it inside
+the mask. Here the mask travels for validation only. The
 package (DiT of the chosen format, AE, Qwen3-VL text encoder) is a directory the
 client names (`source_root`); acquiring it is the separate `download.*` pair.
 
@@ -895,13 +880,10 @@ value is a request error naming the field — never clamped:
 - `seed: int|null` (`null` = a random 32-bit seed, echoed in the answer; else 0..2^64-1);
 - `vram_step` / `ram_step` (§5.10; absent or `null` = `auto`);
 - `encoder_on_cpu: bool` (default `true`: «Энкодер на CPU», §5.10);
-- `mask_feather_px: int` (0..32, default 12);
-- `color_match: bool` (default `true`; the effective value is `false` under `whole_region`);
-- `color_match_local_pct: int` (0..100, default 60, v16; 0 = global match only; the effective
-  value is `0` whenever `color_match` is off) and `color_match_scale_px: int` (8..96, default
-  24, v16; the Gaussian sigma of the finest level, in pixels): the local color match, see
-  "Color match" in the FLUX.2 klein section;
 - `whole_region: bool` (default `false`: the mask must be solid and the whole region is regenerated).
+The post-processing fields of v15-v16 (`mask_feather_px`, `color_match`,
+`color_match_local_pct`, `color_match_scale_px`) are unknown keys since v17 and
+refused like any other.
 There is no guidance and no negative prompt (the model is distilled).
 
 Region constraints (mirrored by the client's frame rule, re-checked here, never

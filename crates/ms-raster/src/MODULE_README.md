@@ -3,14 +3,15 @@
 ## Purpose
 Generic, GUI-free raster primitives that the project implements exactly ONCE: the even-odd polygon
 scanline rasterizer, the square (Chebyshev) binary dilation, the Otsu threshold, integer-factor
-replicate upscale / box downscale of interleaved `u8` rasters, the `u8` box blur and the flattening
-of straight RGBA8 over opaque white to RGB8. Every crate
+replicate upscale / box downscale of interleaved `u8` rasters, the `u8` box blur, the flattening
+of straight RGBA8 over opaque white to RGB8 and the exact Euclidean distance transform. Every crate
 that needs one of these rules calls this owner; a second implementation anywhere is a defect.
 
 ## Architecture
 Level 0 (foundation): std plus `thiserror`, no `ms-*` dependency, no egui, no `image`, wasm-safe.
-It sits this low so that `ms-tools`, the cleaning and translation tabs and the text-detection
-domain (`ms-text-detect`) can all share the rules without depending on each other.
+It sits this low so that `ms-tools`, the cleaning and translation tabs, the text-detection
+domain (`ms-text-detect`), the text renderer (`ms-text-render`) and the region post-processing
+can all share the rules without depending on each other.
 
 The primitives work on plain slices and closures. Output formats that differ between callers
 (0/1 vs 0/255 masks, in-place `GrayImage` updates keeping original values, `bool` masks, a
@@ -30,6 +31,10 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
   image-edit mask feather).
 - `alpha.rs`: `rgba_over_white_to_rgb`, straight RGBA8 over opaque white appended as RGB8 (the
   typing tab's PDF image streams; JPEG saves of alpha-less outputs).
+- `distance.rs`: `squared_distance_to_mask` / `squared_distance_with_costs` + `EDT_COST_INF` / `EDT_MAX_DIMENSION`,
+  the Felzenszwalb-Huttenlocher squared Euclidean distance transform in `f32` (the text
+  renderer's glow / dry-media effects through its `image_ops.rs` adapters, the example
+  `text_render_test`, the region post-processing feather). The one EDT of the project.
 
 ## Contracts and invariants
 - `fill_polygon_spans` emits `span(y, x0, x1)` with an INCLUSIVE `x0..=x1`, clamped to the
@@ -58,6 +63,17 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
   each component as `(c*a + 255*(255-a) + 127) / 255`; that rounding is a byte-level output
   contract (PDF/JPEG bytes), pinned by an exhaustive 256x256 test against the reference formula.
   A length that is not a multiple of 4 is `NotWholePixels` and leaves `dst` unchanged.
+- `squared_distance_with_costs` returns `min_p (dx*dx + dy*dy + costs[p])` per pixel; a seed
+  cost is valid in `[0.0, EDT_COST_INF)`, anything else (negative, NaN, infinite, `>= INF`) is a
+  non-seed, and a pixel with no reachable seed is exactly `EDT_COST_INF`.
+  `squared_distance_to_mask` is that transform over nonzero-is-seed `{0.0, INF}` seeding. Both
+  are O(w*h), exact in real arithmetic, and their `f32` output bits are a contract: the text
+  renderer pins them (`edt_characterization_is_bit_exact`, mirrored by
+  `matches_pre_move_characterization_bits` here) because glow and dry-media pixels derive from
+  them. A width or height above `EDT_MAX_DIMENSION` (2^24, where `f32` stops holding every
+  scanline index distinctly) is `DimensionTooLarge`, checked before the length; a length mismatch
+  (overflow included) is `LengthMismatch`; the renderer's historical all-INF fallback is its own
+  adapter and covers both.
 - Shape and parameter errors are typed `RasterError` variants; sizes use checked arithmetic and
   no public function panics.
 - No I/O, no logging, no threads, no global state: callers log.
@@ -71,5 +87,8 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
   bit-exact "untouched outside the mask" guarantee depends on the round trip and on the blur's
   zero-stays-zero reach, so keep those tests green.
 - To change alpha flattening, edit `alpha.rs`; any rounding change alters exported PDF bytes.
+- To change the distance transform, edit `distance.rs`; any arithmetic change alters rendered
+  glow / dry-media pixels and the region feather, so both characterization digests must be
+  re-pinned knowingly.
 - A new primitive belongs here only if it is generic (no detector, tab or UI semantics) and has,
   or replaces, more than one implementation.

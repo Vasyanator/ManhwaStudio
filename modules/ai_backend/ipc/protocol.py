@@ -75,8 +75,16 @@ from __future__ import annotations
 # `inpaint.flux2_klein` and `inpaint.flux3_klein` params (effective only with
 # `color_match`, off under `whole_region`); the global `color_match` now samples
 # outside the mask grown by 6 px.
+# 17: the FLUX.2 klein and FLUX.3 klein region post-processing is the client's:
+# both answers are the RAW generated region (RGB PNG; no colour match, no
+# composite, so outside the mask the FLUX.2 answer is a VAE round trip); the
+# `inpaint.flux2_klein` mask is the latent mask, already dilated by the client,
+# and its params refuse `mask_dilate_px`, `mask_feather_px`, `color_match`,
+# `color_match_local_pct`, `color_match_scale_px` by name; those four post
+# fields are unknown keys of the `inpaint.flux3_klein` params (refused), whose
+# mask is validated only; the FLUX.3 decode rounds to uint8 instead of truncating.
 # ============================================================================
-PROTOCOL_VERSION = 16
+PROTOCOL_VERSION = 17
 
 # ============================================================================
 # FRAME SIZE GUARDS

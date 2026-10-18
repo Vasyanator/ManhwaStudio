@@ -13,22 +13,26 @@ Main responsibilities:
   run, damaged -> quarantined to the first FREE `<stem>.malformed-<unix_secs>[-<n>].json`
   (reserved with `create_new`, never replacing an earlier copy) and defaults, unreadable or
   unquarantinable -> defaults with saving BLOCKED (`SettingsProblem`);
-- write a document as pretty JSON, creating the directory (`write_settings_json`, typed
-  `SettingsWriteError`);
+- write a document as pretty JSON, creating the directory, and replace the file ATOMICALLY
+  (unique sibling temp `.<name>.<pid>.<n>.tmp`, synced, renamed over it; `write_settings_json`,
+  typed `SettingsWriteError`);
 - drive the save from an engine's `poll`: at most one writer, never before the load landed,
-  never while blocked, and a failed write restores `dirty` and retries after 2 s doubling to
-  60 s (`SettingsSaver`, `save_retry_delay`).
+  never while blocked, only after `SETTINGS_SAVE_DEBOUNCE` (700 ms) without a change (detected
+  by value), a failed write restores `dirty` and retries after 2 s doubling to 60 s, and the
+  GUI is woken per `wake_after` (`SettingsSaver`, `save_retry_delay`);
+- flush a value still owed when the saver is dropped, on a detached worker that first waits for
+  the write in flight (`impl Drop for SettingsSaver`).
 
 Key structures:
 - `SettingsProblem`, `SettingsFileRead`, `SettingsWriteError`, `SettingsSaver`
 
 Key functions:
 - `read_settings_file()`, `malformed_aside_path()`, `write_settings_json()`, `unix_now_secs()`,
-  `save_retry_delay()`
+  `save_retry_delay()`, `SettingsSaver::{poll, wake_after}`
 
 Notes:
-Every function that touches the disk runs on a worker thread (`ms_thread::spawn` in the engine
-or in `SettingsSaver::poll`); nothing here blocks the GUI thread. The save gate itself is
+Every function that touches the disk runs on a worker thread (`ms_thread::spawn` in the engine,
+in `SettingsSaver::poll` or in its `Drop`); nothing here blocks the GUI thread. The save gate itself is
 `region_edit_v2::engine_settings::settings_save_due`, shared by every hosted engine.
 */
 
@@ -38,6 +42,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use web_time::{Duration, Instant};
 
@@ -195,17 +200,67 @@ pub(in crate::tools::ai_editor::engines) enum SettingsWriteError {
     Write(std::io::Error),
 }
 
-/// Writes `document` to `path` as pretty JSON, creating the parent directory first. Runs on a
-/// worker thread.
+/// Writes `document` to `path` as pretty JSON, creating the parent directory first, and
+/// REPLACES the file atomically: the bytes go to a fresh sibling temp file
+/// ([`settings_temp_path`]), are synced, and only then is the temp renamed over `path`. A
+/// crash or a full disk mid-write therefore leaves the previous complete file (or the new
+/// complete one), never a truncated document the next load would have to quarantine. Runs on
+/// a worker thread.
+///
+/// The rename replaces an existing file on every target: `rename(2)` on unix, and on Windows
+/// `std::fs::rename` is `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)` (std
+/// `sys/fs/windows.rs` `rename`). The directory entry itself is not synced: after a power
+/// loss either the old or the new complete file is there, both readable.
 ///
 /// # Errors
-/// [`SettingsWriteError`] naming the step that failed.
+/// [`SettingsWriteError`] naming the step that failed. On a failed write, sync or rename the
+/// temp file is removed (a failed removal is logged) and `path` is left exactly as it was.
 pub(in crate::tools::ai_editor::engines) fn write_settings_json<T: Serialize>(path: &Path, document: &T) -> Result<(), SettingsWriteError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(SettingsWriteError::CreateDir)?;
     }
     let raw = serde_json::to_string_pretty(document).map_err(SettingsWriteError::Serialize)?;
-    fs::write(path, raw).map_err(SettingsWriteError::Write)
+    replace_file_atomically(path, raw.as_bytes()).map_err(SettingsWriteError::Write)
+}
+
+/// Process-wide counter that makes every temp name of [`settings_temp_path`] unique, so two
+/// writers (two engines, or an exit flush behind a write) never share a temp file.
+static SETTINGS_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The `serial`-th temp name for a write of `path`: `<dir>/.<file name>.<pid>.<serial>.tmp`.
+///
+/// It can never be taken for a settings document or a quarantine copy: settings files are
+/// opened by their exact name, aside copies are `<stem>.malformed-*.json`, and this name
+/// starts with a dot and ends in `.tmp`.
+#[must_use]
+fn settings_temp_path(path: &Path, serial: u64) -> PathBuf {
+    let name = path.file_name().map_or_else(|| "settings".into(), |name| name.to_string_lossy());
+    path.with_file_name(format!(".{name}.{}.{serial}.tmp", std::process::id()))
+}
+
+/// Writes `bytes` into a fresh temp file beside `path` (reserved with `create_new`), syncs it
+/// and renames it over `path`.
+///
+/// # Errors
+/// The I/O error of the step that failed; the temp file is removed first, so nothing is left
+/// behind and `path` is untouched.
+fn replace_file_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let temp = settings_temp_path(path, SETTINGS_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temp)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    // Closed before the rename: Windows refuses to rename a file that is still open.
+    drop(file);
+    if let Err(err) = written.and_then(|()| fs::rename(&temp, path)) {
+        if let Err(cleanup) = fs::remove_file(&temp) {
+            ms_log::runtime_log::log_warn(format!(
+                "[cleaning] could not remove the settings temp file {} ({cleanup})",
+                temp.display()
+            ));
+        }
+        return Err(err);
+    }
+    Ok(())
 }
 
 /// How long to wait before retrying the settings write after `failures` consecutive
@@ -228,15 +283,39 @@ pub(in crate::tools::ai_editor::engines) struct SaveGate<'a> {
     pub(in crate::tools::ai_editor::engines) blocked: bool,
 }
 
-/// The settings writer of one engine: the write in flight and the failure state.
+/// The quiet time a settings change must survive before its write starts: a dragged dial
+/// changes the settings on every frame, and only the value it settles on is worth a disk
+/// write. The same 700 ms as `ms_config::config_saver`'s private `SAVE_DEBOUNCE`, which a
+/// drag of a GUI-driven config section waits for.
+pub(in crate::tools::ai_editor::engines) const SETTINGS_SAVE_DEBOUNCE: Duration = Duration::from_millis(700);
+
+/// How often the GUI is woken while a write is in flight, so its outcome (and a newer change
+/// waiting behind it) is picked up without user input. A write of a small JSON file lands
+/// well within it.
+const SAVE_IN_FLIGHT_POLL: Duration = Duration::from_millis(100);
+
+/// The settings writer of one engine: the change waiting out its quiet time, the write in
+/// flight and the failure state.
+///
+/// A change is detected BY VALUE: while the engine's `dirty` is set, every poll compares the
+/// settings with the last value it saw ([`Self::pending`]); a difference restarts the quiet
+/// time ([`SETTINGS_SAVE_DEBOUNCE`]). So every place that raises `dirty` gets the debounce
+/// without telling the saver anything.
+///
+/// Dropping the saver with a value still owed to the file (waiting out its quiet time, or
+/// changed while the previous write was in flight) writes that value on a detached worker
+/// thread — after the in-flight write ended, so the newest value is renamed last — and logs
+/// a failure; the dropping thread never waits.
 ///
 /// `write` is the function that writes the file — the engine's own saver in the product; a
-/// test injects a failing one (it must never write the user's real file).
-pub(in crate::tools::ai_editor::engines) struct SettingsSaver<T> {
+/// test injects a failing or recording one (it must never write the user's real file).
+pub(in crate::tools::ai_editor::engines) struct SettingsSaver<T: Clone + PartialEq + Send + 'static> {
     /// The settings write in flight; answers whether it succeeded.
     pub(in crate::tools::ai_editor::engines) rx: Option<Receiver<Result<(), String>>>,
     pub(in crate::tools::ai_editor::engines) write: fn(&T) -> Result<(), String>,
-    /// The last write's failure, as the engine described it, shown at the top of the panel
+    /// Names the engine in the log lines (e.g. `"FLUX.2 klein"`).
+    log_label: &'static str,
+    /// The last failure, as the engine described it, shown at the top of the panel
     /// until a write succeeds.
     pub(in crate::tools::ai_editor::engines) error: Option<String>,
     /// When a failed write may be retried; `None` when nothing failed. Bounded backoff, so a
@@ -244,81 +323,156 @@ pub(in crate::tools::ai_editor::engines) struct SettingsSaver<T> {
     pub(in crate::tools::ai_editor::engines) retry_at: Option<Instant>,
     /// Consecutive failed writes; drives the backoff ([`save_retry_delay`]).
     pub(in crate::tools::ai_editor::engines) failures: u32,
+    /// The value owed to the file: the settings as last seen while dirty, loaded and not
+    /// blocked; `None` when nothing is owed. Moved into the write when it starts, and the
+    /// payload of the teardown flush.
+    pending: Option<T>,
+    /// When [`Self::pending`] last changed: the start of its quiet time.
+    changed_at: Option<Instant>,
 }
 
-impl<T: Clone + Send + 'static> SettingsSaver<T> {
-    /// A saver with nothing in flight and nothing failed.
-    pub(in crate::tools::ai_editor::engines) fn new(write: fn(&T) -> Result<(), String>) -> Self {
-        Self { rx: None, write, error: None, retry_at: None, failures: 0 }
+impl<T: Clone + PartialEq + Send + 'static> SettingsSaver<T> {
+    /// A saver with nothing owed, nothing in flight and nothing failed.
+    pub(in crate::tools::ai_editor::engines) fn new(write: fn(&T) -> Result<(), String>, log_label: &'static str) -> Self {
+        Self { rx: None, write, log_label, error: None, retry_at: None, failures: 0, pending: None, changed_at: None }
     }
 
-    /// Whether a retry is pending, i.e. the GUI must be woken when its backoff elapses.
-    pub(in crate::tools::ai_editor::engines) fn retry_pending(&self) -> bool {
-        self.retry_at.is_some()
+    /// How long the GUI may sleep before the saver needs another poll at `now`: when the
+    /// quiet time of a pending change ends, when a failed write may be retried, or shortly
+    /// while a write is in flight. `None` when nothing waits (the engine then needs no
+    /// wake-up for its settings). `Some(Duration::ZERO)` means "poll on the next frame".
+    #[must_use]
+    pub(in crate::tools::ai_editor::engines) fn wake_after(&self, now: Instant) -> Option<Duration> {
+        if self.rx.is_some() {
+            return Some(SAVE_IN_FLIGHT_POLL);
+        }
+        let quiet_end = self.changed_at.filter(|_| self.pending.is_some()).map(|at| at + SETTINGS_SAVE_DEBOUNCE);
+        let due = match (quiet_end, self.retry_at) {
+            (Some(quiet), Some(retry)) => Some(quiet.max(retry)),
+            // A retry with no pending value cannot start; nothing to wake for.
+            (None, _) => None,
+            (Some(quiet), None) => Some(quiet),
+        };
+        due.map(|at| at.saturating_duration_since(now))
     }
 
     /// Drains the write in flight and starts the next one when it is due.
     ///
     /// Driven from the engine's `poll` and from nowhere else, which is why the host must poll
-    /// the selected engine EVERY frame, panel visible or not. A blocked file is never written
-    /// (the edits stay in memory, `dirty` kept). A FAILED write is not success: `dirty` is
-    /// restored, `describe(err)` becomes the shown [`Self::error`], and the next attempt waits
-    /// [`save_retry_delay`]. A successful write clears all of it. `settings` is cloned onto
-    /// the writer thread only when a write actually starts; `log_label` names the engine in the
-    /// failure log.
+    /// the selected engine EVERY frame, panel visible or not (and wake it per
+    /// [`Self::wake_after`]). Before the load landed and while blocked nothing is owed or
+    /// written (the edits stay in memory, `dirty` kept). A dirty value starts its write only
+    /// once it stayed unchanged for [`SETTINGS_SAVE_DEBOUNCE`], no write is in flight and no
+    /// retry backoff runs. A FAILED write is not success: `dirty` is restored,
+    /// `describe(err)` becomes the shown [`Self::error`], and the next attempt waits
+    /// [`save_retry_delay`]. A successful write clears all of it. `settings` is cloned only
+    /// when it differs from the value already owed.
     pub(in crate::tools::ai_editor::engines) fn poll(
         &mut self,
         now: Instant,
         gate: SaveGate<'_>,
         settings: &T,
-        log_label: &str,
         describe: impl FnOnce(&str) -> String,
     ) {
         let SaveGate { dirty, loaded, blocked } = gate;
         if let Some(rx) = self.rx.as_ref() {
             let outcome = match rx.try_recv() {
-                Ok(outcome) => outcome,
-                Err(TryRecvError::Disconnected) => Err(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string()),
-                Err(TryRecvError::Empty) => return,
+                Ok(outcome) => Some(outcome),
+                Err(TryRecvError::Disconnected) => Some(Err(t!("cleaning.mask_editor.processing_thread_crashed_error").to_string())),
+                Err(TryRecvError::Empty) => None,
             };
-            self.rx = None;
-            match outcome {
-                Ok(()) => {
-                    self.error = None;
-                    self.retry_at = None;
-                    self.failures = 0;
-                }
-                Err(err) => {
-                    *dirty = true;
-                    self.failures = self.failures.saturating_add(1);
-                    let delay = save_retry_delay(self.failures);
-                    self.retry_at = Some(now + delay);
-                    ms_log::runtime_log::log_warn(format!(
-                        "[cleaning] failed to save {log_label} settings (attempt {}): {err}; retrying in {} s",
-                        self.failures,
-                        delay.as_secs()
-                    ));
-                    self.error = Some(describe(&err));
-                }
+            if let Some(outcome) = outcome {
+                self.rx = None;
+                self.finish_write(now, outcome, dirty, describe);
             }
         }
-        if blocked {
+        if blocked || !loaded {
+            // Never owed: an exit flush must not write a blocked file, nor the in-memory
+            // defaults over a file whose load has not landed.
+            self.pending = None;
+            self.changed_at = None;
             return;
         }
-        if self.retry_at.is_some_and(|at| now < at) {
+        if !*dirty {
+            self.pending = None;
+            self.changed_at = None;
+            return;
+        }
+        if self.pending.as_ref() != Some(settings) {
+            self.pending = Some(settings.clone());
+            self.changed_at = Some(now);
+        }
+        if self.rx.is_some() || self.retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+        if self.changed_at.is_some_and(|at| now.saturating_duration_since(at) < SETTINGS_SAVE_DEBOUNCE) {
             return;
         }
         if !settings_save_due(*dirty, loaded, self.rx.is_some()) {
             return;
         }
+        let Some(settings) = self.pending.take() else {
+            return;
+        };
         *dirty = false;
-        let settings = settings.clone();
+        self.changed_at = None;
         let write = self.write;
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
         thread::spawn(move || {
             // A failed send means the engine was dropped meanwhile: nobody waits for it.
             let _ = tx.send(write(&settings));
+        });
+    }
+
+    /// Applies the outcome of the write that just ended (see [`Self::poll`]).
+    fn finish_write(&mut self, now: Instant, outcome: Result<(), String>, dirty: &mut bool, describe: impl FnOnce(&str) -> String) {
+        match outcome {
+            Ok(()) => {
+                self.error = None;
+                self.retry_at = None;
+                self.failures = 0;
+            }
+            Err(err) => {
+                *dirty = true;
+                self.failures = self.failures.saturating_add(1);
+                let delay = save_retry_delay(self.failures);
+                self.retry_at = Some(now + delay);
+                ms_log::runtime_log::log_warn(format!(
+                    "[cleaning] failed to save {} settings (attempt {}): {err}; retrying in {} s",
+                    self.log_label,
+                    self.failures,
+                    delay.as_secs()
+                ));
+                self.error = Some(describe(&err));
+            }
+        }
+    }
+}
+
+impl<T: Clone + PartialEq + Send + 'static> Drop for SettingsSaver<T> {
+    /// The teardown flush: a value still owed to the file is written on a detached worker,
+    /// never on the dropping (possibly GUI) thread. A write in flight is waited for ON THAT
+    /// WORKER first, so the two renames cannot land out of order.
+    fn drop(&mut self) {
+        let Some(settings) = self.pending.take() else {
+            return;
+        };
+        let in_flight = self.rx.take();
+        let write = self.write;
+        let log_label = self.log_label;
+        ms_log::runtime_log::log_info(format!("[cleaning] writing the unsaved {log_label} settings on teardown"));
+        thread::spawn(move || {
+            // Only the ORDER matters here: whatever the earlier write answered (or a writer
+            // that died without answering), the flushed value replaces it.
+            if let Some(rx) = in_flight
+                && rx.recv().is_err()
+            {
+                ms_log::runtime_log::log_warn(format!("[cleaning] the previous {log_label} settings writer ended without an answer; flushing anyway"));
+            }
+            if let Err(err) = write(&settings) {
+                ms_log::runtime_log::log_error(format!("[cleaning] failed to write the unsaved {log_label} settings on teardown: {err}"));
+            }
         });
     }
 }
@@ -405,13 +559,211 @@ mod tests {
         assert_eq!(save_retry_delay(u32::MAX), Duration::from_secs(60));
     }
 
-    /// The written document reads back, and the directory is created on the way.
+    /// The written document reads back, the directory is created on the way, an existing
+    /// file is replaced, and no temp file is left beside it.
     #[test]
     fn a_written_document_reads_back() {
         let dir = std::env::temp_dir().join(format!("ms_engine_settings_file_write_{}", std::process::id()));
         let path = dir.join("nested").join("engine_settings.json");
         write_settings_json(&path, &serde_json::json!({ "steps": 3 })).expect("the write succeeds");
         assert_eq!(read_settings_file(&path, 1, "test", parse_steps).document, Some(3));
+        write_settings_json(&path, &serde_json::json!({ "steps": 4 })).expect("the rewrite succeeds");
+        assert_eq!(read_settings_file(&path, 1, "test", parse_steps).document, Some(4), "replaced");
+        let entries: Vec<_> = std::fs::read_dir(dir.join("nested")).expect("list the dir").map(|entry| entry.expect("an entry").file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("engine_settings.json")], "no temp file left behind");
         std::fs::remove_dir_all(&dir).expect("remove the scratch dir");
+    }
+
+    /// The temp name can never be read as a settings file or an aside copy.
+    #[test]
+    fn the_temp_name_is_neither_a_settings_file_nor_an_aside_copy() {
+        let path = Path::new("/home/u/data/flux2_klein_settings.json");
+        let temp = settings_temp_path(path, 7);
+        let name = temp.file_name().and_then(|name| name.to_str()).expect("a UTF-8 name");
+        assert_eq!(temp.parent(), path.parent(), "a sibling, so the rename stays on one filesystem");
+        assert_eq!(name, format!(".flux2_klein_settings.json.{}.7.tmp", std::process::id()));
+        assert!(name.starts_with('.') && !name.ends_with(".json") && !name.contains(".malformed-"));
+        assert_ne!(settings_temp_path(path, 8), temp, "every write gets its own temp");
+    }
+
+    /// A failed replacement leaves the target exactly as it was and no temp behind: here the
+    /// rename fails because the target name is a non-empty directory (portable failure).
+    #[test]
+    fn a_failed_rename_leaves_the_target_and_no_temp() {
+        let dir = std::env::temp_dir().join(format!("ms_engine_settings_file_rename_{}", std::process::id()));
+        let path = dir.join("engine_settings.json");
+        std::fs::create_dir_all(&path).expect("occupy the target with a directory");
+        std::fs::write(path.join("keep.txt"), "kept").expect("make it non-empty");
+        let err = write_settings_json(&path, &serde_json::json!({ "steps": 3 })).expect_err("a directory cannot be replaced");
+        assert!(matches!(err, SettingsWriteError::Write(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(path.join("keep.txt")).expect("the target is intact"), "kept");
+        let entries: Vec<_> = std::fs::read_dir(&dir).expect("list the dir").map(|entry| entry.expect("an entry").file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("engine_settings.json")], "the temp file was removed");
+        std::fs::remove_dir_all(&dir).expect("remove the scratch dir");
+    }
+
+    /// A temp file that cannot even be created (a read-only directory) fails the write and
+    /// leaves the old file intact. Skipped when the process can write there anyway (root).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_directory_fails_the_write_and_keeps_the_old_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ms_engine_settings_file_readonly_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let path = dir.join("engine_settings.json");
+        std::fs::write(&path, r#"{ "steps": 1 }"#).expect("the old file");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("make the dir read-only");
+        let probe = dir.join("probe");
+        let skip = std::fs::write(&probe, "x").is_ok();
+        let result = if skip { None } else { Some(write_settings_json(&path, &serde_json::json!({ "steps": 3 }))) };
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("restore the permissions");
+        match result {
+            None => eprintln!("skipped: the read-only directory is writable for this user"),
+            Some(result) => {
+                assert!(matches!(result, Err(SettingsWriteError::Write(_))), "{result:?}");
+                assert_eq!(read_settings_file(&path, 1, "test", parse_steps).document, Some(1), "the old file is intact");
+                assert_eq!(std::fs::read_dir(&dir).expect("list the dir").count(), 1, "no temp file left behind");
+            }
+        }
+        std::fs::remove_dir_all(&dir).expect("remove the scratch dir");
+    }
+
+    /// Polls `saver` at `now` until its write in flight answered (bounded).
+    fn drain(saver: &mut SettingsSaver<u32>, now: Instant, dirty: &mut bool, settings: u32) {
+        for _ in 0..2000 {
+            saver.poll(now, SaveGate { dirty: &mut *dirty, loaded: true, blocked: false }, &settings, |err| err.to_string());
+            if saver.rx.is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        panic!("the settings writer never answered");
+    }
+
+    /// Waits (bounded) until `log` holds `expected`; a detached flush writes on its own.
+    fn await_writes(log: &std::sync::Mutex<Vec<u32>>, expected: &[u32]) {
+        for _ in 0..2000 {
+            if log.lock().expect("the test log").as_slice() == expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(log.lock().expect("the test log").as_slice(), expected);
+    }
+
+    /// No write inside the quiet time; a change during it restarts it; a burst costs ONE
+    /// write of the value it settled on; the wake-up names the end of the quiet time.
+    #[test]
+    fn a_burst_of_changes_is_written_once_after_the_quiet_time() {
+        static WRITES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        fn record(value: &u32) -> Result<(), String> {
+            WRITES.lock().map_err(|err| err.to_string())?.push(*value);
+            Ok(())
+        }
+        let mut saver = SettingsSaver::new(record, "test");
+        let mut dirty = true;
+        let t0 = Instant::now();
+        let half = SETTINGS_SAVE_DEBOUNCE / 2;
+        fn gate(dirty: &mut bool) -> SaveGate<'_> {
+            SaveGate { dirty, loaded: true, blocked: false }
+        }
+        assert_eq!(saver.wake_after(t0), None, "nothing seen yet");
+
+        saver.poll(t0, gate(&mut dirty), &1, |err| err.to_string());
+        assert!(saver.rx.is_none() && dirty, "no write inside the quiet time");
+        assert_eq!(saver.wake_after(t0), Some(SETTINGS_SAVE_DEBOUNCE));
+
+        // The dial moves on before the quiet time ended: it restarts.
+        saver.poll(t0 + half, gate(&mut dirty), &2, |err| err.to_string());
+        saver.poll(t0 + SETTINGS_SAVE_DEBOUNCE, gate(&mut dirty), &2, |err| err.to_string());
+        assert!(saver.rx.is_none(), "the change restarted the quiet time");
+        assert_eq!(saver.wake_after(t0 + SETTINGS_SAVE_DEBOUNCE), Some(half));
+
+        let settled = t0 + half + SETTINGS_SAVE_DEBOUNCE;
+        saver.poll(settled, gate(&mut dirty), &2, |err| err.to_string());
+        assert!(saver.rx.is_some() && !dirty, "the settled value is written");
+        assert_eq!(saver.wake_after(settled), Some(SAVE_IN_FLIGHT_POLL), "the GUI is woken for the answer");
+        drain(&mut saver, settled, &mut dirty, 2);
+        assert_eq!(WRITES.lock().expect("the test log").as_slice(), &[2], "one write, of the last value");
+        assert_eq!(saver.wake_after(settled), None, "nothing waits any more");
+        drop(saver);
+        assert_eq!(WRITES.lock().expect("the test log").as_slice(), &[2], "nothing owed: no teardown write");
+    }
+
+    /// A failed write still retries after its backoff (not sooner, and the wake-up says so).
+    #[test]
+    fn a_failed_write_retries_after_the_backoff() {
+        fn failing(_: &u32) -> Result<(), String> {
+            Err("disk full".to_string())
+        }
+        let mut saver = SettingsSaver::new(failing, "test");
+        let mut dirty = true;
+        let t0 = Instant::now();
+        let settled = t0 + SETTINGS_SAVE_DEBOUNCE;
+        saver.poll(t0, SaveGate { dirty: &mut dirty, loaded: true, blocked: false }, &5, |err| err.to_string());
+        saver.poll(settled, SaveGate { dirty: &mut dirty, loaded: true, blocked: false }, &5, |err| err.to_string());
+        assert!(saver.rx.is_some());
+        drain(&mut saver, settled, &mut dirty, 5);
+        assert!(dirty && saver.failures == 1 && saver.error.as_deref() == Some("disk full"));
+        assert_eq!(saver.wake_after(settled), Some(save_retry_delay(1)), "woken when the retry may run");
+        saver.poll(settled + Duration::from_secs(1), SaveGate { dirty: &mut dirty, loaded: true, blocked: false }, &5, |err| err.to_string());
+        assert!(saver.rx.is_none(), "no retry before the backoff");
+        let retry = settled + save_retry_delay(1);
+        saver.poll(retry, SaveGate { dirty: &mut dirty, loaded: true, blocked: false }, &5, |err| err.to_string());
+        assert!(saver.rx.is_some(), "retried after the backoff");
+        drain(&mut saver, retry, &mut dirty, 5);
+        // Owed again after the second failure: the drop flush calls `failing`, which writes nothing.
+    }
+
+    /// Before the load and while blocked nothing is owed: no write, no wake-up, no flush.
+    #[test]
+    fn nothing_is_owed_before_the_load_or_while_blocked() {
+        static WRITES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        fn record(value: &u32) -> Result<(), String> {
+            WRITES.lock().map_err(|err| err.to_string())?.push(*value);
+            Ok(())
+        }
+        let t0 = Instant::now();
+        for (loaded, blocked) in [(false, false), (true, true)] {
+            let mut saver = SettingsSaver::new(record, "test");
+            let mut dirty = true;
+            saver.poll(t0, SaveGate { dirty: &mut dirty, loaded, blocked }, &9, |err| err.to_string());
+            saver.poll(t0 + SETTINGS_SAVE_DEBOUNCE, SaveGate { dirty: &mut dirty, loaded, blocked }, &9, |err| err.to_string());
+            assert!(saver.rx.is_none() && dirty, "kept in memory, never written");
+            assert_eq!(saver.wake_after(t0), None, "no wake-up loop for a write that cannot run");
+        }
+        // Every saver above was dropped; give a (wrong) detached flush time to show up.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(WRITES.lock().expect("the test log").is_empty());
+    }
+
+    /// Teardown flush: a value waiting out its quiet time is written after the drop, and one
+    /// changed while a write was in flight lands AFTER that write.
+    #[test]
+    fn a_dropped_saver_flushes_the_value_it_still_owes() {
+        static WRITES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+        fn slow_record(value: &u32) -> Result<(), String> {
+            // Slow enough that the drop below happens while this write is in flight.
+            std::thread::sleep(Duration::from_millis(50));
+            WRITES.lock().map_err(|err| err.to_string())?.push(*value);
+            Ok(())
+        }
+        let t0 = Instant::now();
+        let mut saver = SettingsSaver::new(slow_record, "test");
+        let mut dirty = true;
+        saver.poll(t0, SaveGate { dirty: &mut dirty, loaded: true, blocked: false }, &1, |err| err.to_string());
+        drop(saver);
+        await_writes(&WRITES, &[1]);
+
+        let mut saver = SettingsSaver::new(slow_record, "test");
+        let mut dirty = true;
+        let settled = t0 + SETTINGS_SAVE_DEBOUNCE;
+        saver.poll(t0, SaveGate { dirty: &mut dirty, loaded: true, blocked: false }, &2, |err| err.to_string());
+        saver.poll(settled, SaveGate { dirty: &mut dirty, loaded: true, blocked: false }, &2, |err| err.to_string());
+        assert!(saver.rx.is_some(), "the write of 2 is in flight");
+        dirty = true;
+        saver.poll(settled, SaveGate { dirty: &mut dirty, loaded: true, blocked: false }, &3, |err| err.to_string());
+        drop(saver);
+        await_writes(&WRITES, &[1, 2, 3]);
     }
 }

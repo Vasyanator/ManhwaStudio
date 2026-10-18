@@ -16,8 +16,10 @@ docstring:
   the `phase:"generate"` frames, mask semantics on a real run, the lease always
   being resolved, and the ORDER of the decode fallbacks. A failure here is a
   regression, never a reason to edit the test (protocol 14 retired the
-  placement wire, `.estimate` and `status.memory` deliberately: those contracts
-  were re-pinned with that change).
+  placement wire, `.estimate` and `status.memory` deliberately, and protocol 17
+  moved the region post-processing to the client, so the answer is the RAW
+  decode and the wire mask is the latent mask: those contracts were re-pinned
+  with those changes).
 - GOLDEN - a snapshot of today's NUMBERS: `forecast_memory` (the two-handle run
   forecast) for a fixed set of (step pair, region) cases, stored in
   `fixtures/forecast_golden.json`. These
@@ -46,8 +48,8 @@ Notes:
   counts in the small pool's counters; the decode fallback ORDER is the
   manager's ladder: tiling (where requested it engages), the lowered tile,
   then a more economical «Видеопамять» step that takes the transformer off the device.
-- What is already pinned elsewhere is referenced, not repeated: mask
-  morphology and the composite (`../test_region_imaging.py`), each decode rung on its own
+- What is already pinned elsewhere is referenced, not repeated: the wire
+  codecs (`../test_region_imaging.py`), each decode rung on its own
   (`test_pipeline.py::DecodeRecoveryTests`), the lease protocol across services
   (`../test_lease_protocol.py`), the attention-mask formula (`test_attention.py`).
   Where a contract below overlaps one of those, it pins the WIRE-visible part
@@ -80,16 +82,6 @@ from unittest.mock import patch
 
 import numpy as np
 from PIL import Image
-
-# Imported at module scope ON PURPOSE: the run tests patch `sys.modules` with
-# `patch.dict`, which on exit removes every module first imported inside it. A
-# first `import cv2` there (the mask dilation) would leave OpenCV half-registered
-# and make every later import of it fail with `cv2.dnn has no DictValue`. cv2 is
-# optional for this backend (`region_imaging.py` falls back to PIL), hence the guard.
-try:
-    import cv2  # noqa: F401 - imported for its side effect on `sys.modules`
-except ImportError:
-    cv2 = None
 
 from modules.ai_backend.inpaint import flux2_klein as svc
 from modules.ai_backend.inpaint.flux2_klein import components, hardware, memory
@@ -389,7 +381,7 @@ class InpaintRunContract(_ManagedRunFixture):
     tiny real weights on the CPU, only the diffusers call, the tokenizer, the
     budget probes and the transport's device are faked) and the free-memory
     figures `status` reports are unknown, so the run order, the progress
-    frames, the response shape, the composite and the residency are the
+    frames, the response shape, the raw answer and the residency are the
     production code's.
     """
 
@@ -437,13 +429,15 @@ class InpaintRunContract(_ManagedRunFixture):
         # tiling flag alone since protocol 14.
         self.assertEqual(out["applied"], {"vae_tiling": True})
 
-    def test_the_mask_is_a_permission_to_change(self) -> None:
-        out = self._run(vram_step="max", ram_step="keep", color_match=False)
+    def test_the_answer_is_the_raw_decode_over_the_wire_mask(self) -> None:
+        # Protocol 17: the wire mask is the latent mask as the pipeline gets it,
+        # and the answer is the decode itself (the fixture decodes to a solid
+        # 210 over a solid-90 region), with no composite outside the mask.
+        out = self._run(vram_step="max", ram_step="keep")
         result = np.asarray(Image.open(io.BytesIO(out["image_png"])).convert("RGB"))
         self.assertEqual(result.shape, self.region.shape)
-        outside = self.mask == 0
-        self.assertTrue(np.array_equal(result[outside], self.region[outside]))
-        self.assertFalse(np.array_equal(result[~outside], self.region[~outside]))
+        self.assertTrue(np.all(result == 210))
+        self.assertTrue(np.array_equal(np.asarray(self.calls[-1]["mask_image"]), self.mask))
 
     def test_the_load_frames_follow_the_documented_order(self) -> None:
         self._run(vram_step="max", ram_step="keep")

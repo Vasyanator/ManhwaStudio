@@ -115,11 +115,14 @@ max 0/255 for both the RGBA and alpha paths).
   row kernel, costing `O(width * height * (up + down + 1))` — seconds, not milliseconds, at
   radii in the hundreds, so callers must treat a large round dilation as a long uninterruptible
   pass. With equal extents the rectangle is byte-identical to the legacy iterated
-  `dilate_alpha_max_filter3`, which is now a test-only reference. The EDT comes in
-  two forms: `euclidean_distance_transform_to_mask` (binary 0/1 seeding) is a thin wrapper over
-  `euclidean_distance_transform_with_costs`, the Felzenszwalb-Huttenlocher transform evaluated
-  in `f32` over an arbitrary squared-distance cost field (a valid seed cost is in
-  `[0, EDT_COST_INF)`; anything else is normalized to the non-seed sentinel). Blur has a `u8`
+  `dilate_alpha_max_filter3`, which is now a test-only reference. The EDT is owned
+  by `ms-raster` (`squared_distance_to_mask` / `squared_distance_with_costs`, the
+  Felzenszwalb-Huttenlocher transform evaluated in `f32` over a binary mask or an arbitrary
+  squared-distance cost field; a valid seed cost is in `[0, EDT_COST_INF)`, anything else is
+  normalized to the non-seed sentinel). `image_ops.rs` keeps two `pub(crate)` adapters,
+  `euclidean_distance_transform_to_mask` and `euclidean_distance_transform_with_costs`, that map
+  an invalid shape onto the effects' all-INF / empty fallback instead of an error; their output
+  is pinned bit for bit by `edt_characterization_is_bit_exact`. Blur has a `u8`
   form and an `f32` form (`gaussian_blur_alpha_f32_in_place`) for banding-free pre-composite
   smoothing; `gaussian_blur_kernel_radius` gives the padding a caller needs for the blur tail.
 
@@ -200,8 +203,10 @@ max 0/255 for both the RGBA and alpha paths).
   both `dry_media` and `interference` depend on them.
 - To change legacy JSON compatibility, edit `parse.rs` and update parent typing
   serialization only if the persisted contract changes.
-- To change blur, dilation, distance transform, blitting, or shared sampling behavior,
-  edit `image_ops.rs` and audit all effect modules that call the helper.
+- To change blur, dilation, blitting, or shared sampling behavior, edit `image_ops.rs` and
+  audit all effect modules that call the helper. The distance transform itself lives in
+  `ms-raster/src/distance.rs`; a change there must keep `edt_characterization_is_bit_exact`
+  green or re-pin it knowingly (glow and dry-media output changes with it).
 - To change text-mutating effects, update the preprocess path in `mod.rs` and keep the
   output compatible with `inline_styles.rs`.
 - To change post-raster visual behavior, keep the work local to the concrete effect

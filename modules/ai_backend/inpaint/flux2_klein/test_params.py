@@ -7,9 +7,9 @@ and the region contract of `validate_region_size`.
 
 Main responsibilities:
 - verify every enum/path error and every numeric clamp of the wire contract,
-  the refusal by name of every field of the retired placement wire, and the
-  opt-in `text_attention_in_mask` and the local color match fields that
-  `whole_region` forces off;
+  the refusal by name of every retired field (the placement wire, protocol 14;
+  the region post-processing, protocol 17), and the opt-in
+  `text_attention_in_mask` that `whole_region` forces off;
 - verify a region that the pipeline would silently resize or crop is refused
   with concrete numbers instead;
 - verify `effective_steps` matches what the pipeline will actually run.
@@ -54,19 +54,32 @@ class NormalizeParamsTests(_TempTreeCase):
         self.assertEqual((out["vram_step"], out["ram_step"]), ("half", "run"))
 
     def test_every_retired_field_is_refused_by_name(self) -> None:
-        # Protocol 14: a stale client must get a clear error, never a silently
-        # ignored memory choice; even an explicit `null` names the field.
+        # A stale client must get a clear error, never a silently ignored
+        # choice; even an explicit `null` names the field and its protocol.
         self.assertEqual(
-            set(svc.RETIRED_FIELDS),
-            {"placement", "profile", "low_cpu_mem_usage", "vae_slicing", "unload_transformer_before_vae", "unload_text_encoder_after_encode"},
+            {field: protocol for field, (protocol, _replacement) in svc.RETIRED_FIELDS.items()},
+            {
+                "placement": 14,
+                "profile": 14,
+                "low_cpu_mem_usage": 14,
+                "vae_slicing": 14,
+                "unload_transformer_before_vae": 14,
+                "unload_text_encoder_after_encode": 14,
+                "mask_dilate_px": 17,
+                "mask_feather_px": 17,
+                "color_match": 17,
+                "color_match_local_pct": 17,
+                "color_match_scale_px": 17,
+            },
         )
-        for field in svc.RETIRED_FIELDS:
+        for field, (protocol, replacement) in svc.RETIRED_FIELDS.items():
             for value in ("full_gpu", True, None):
                 with self.subTest(field=field, value=value):
                     with self.assertRaises(ValueError) as caught:
                         svc.normalize_flux2_klein_params(self.params(**{field: value}))
                     self.assertIn(field, str(caught.exception))
-                    self.assertIn(svc.RETIRED_FIELDS[field], str(caught.exception))
+                    self.assertIn(f"протокол {protocol}", str(caught.exception))
+                    self.assertIn(replacement, str(caught.exception))
 
     def test_unknown_dtype_raises(self) -> None:
         with self.assertRaises(ValueError):
@@ -80,12 +93,7 @@ class NormalizeParamsTests(_TempTreeCase):
         self.assertEqual((out["vram_step"], out["ram_step"]), (None, None))
         self.assertTrue(out["vae_tiling"])
         self.assertEqual(out["dtype"], "bfloat16")
-        self.assertEqual(out["mask_dilate_px"], 16)
-        self.assertEqual(out["mask_feather_px"], 12)
         self.assertEqual(out["max_sequence_length"], 512)
-        self.assertTrue(out["color_match"])
-        self.assertEqual(out["color_match_local_pct"], 60)
-        self.assertEqual(out["color_match_scale_px"], 24)
         self.assertFalse(out["whole_region"])
         self.assertFalse(out["text_encoder_fp8"])
         self.assertIsNone(out["seed"])
@@ -111,11 +119,6 @@ class NormalizeParamsTests(_TempTreeCase):
                 "vae_tiling",
                 "text_encoder_fp8",
                 "encoder_on_cpu",
-                "mask_dilate_px",
-                "mask_feather_px",
-                "color_match",
-                "color_match_local_pct",
-                "color_match_scale_px",
                 "whole_region",
                 "max_sequence_length",
                 "text_attention_in_mask",
@@ -147,40 +150,18 @@ class NormalizeParamsTests(_TempTreeCase):
         self.assertFalse(out["text_attention_in_mask"])
         self.assertTrue(any("text_attention_in_mask" in line for line in captured.output))
 
-    def test_the_local_color_match_fields_clamp_to_their_ranges(self) -> None:
-        for raw, expected in ((-5, 0), (0, 0), (35, 35), (100, 100), (250, 100), ("x", 60), (None, 60), (True, 60)):
-            with self.subTest(pct=raw):
-                self.assertEqual(svc.normalize_flux2_klein_params(self.params(color_match_local_pct=raw))["color_match_local_pct"], expected)
-        for raw, expected in ((1, 8), (8, 8), (40, 40), (96, 96), (500, 96), (None, 24)):
-            with self.subTest(scale=raw):
-                self.assertEqual(svc.normalize_flux2_klein_params(self.params(color_match_scale_px=raw))["color_match_scale_px"], expected)
-
-    def test_whole_region_switches_the_local_color_match_off_and_says_so(self) -> None:
-        with self.assertLogs(svc.log, level="INFO") as captured:
-            out = svc.normalize_flux2_klein_params(
-                self.params(whole_region=True, color_match=False, color_match_local_pct=80, color_match_scale_px=40)
-            )
-        self.assertEqual(out["color_match_local_pct"], 0)
-        # No "off" value exists for the scale; it is left as sent and never read.
-        self.assertEqual(out["color_match_scale_px"], 40)
-        self.assertTrue(any("color_match_local_pct" in line for line in captured.output))
-
     def test_numeric_clamping(self) -> None:
         out = svc.normalize_flux2_klein_params(
             self.params(
                 steps=9999,
                 guidance_scale=-3.0,
                 strength=0.0,
-                mask_dilate_px=999,
-                mask_feather_px=-4,
                 max_sequence_length=4096,
             )
         )
         self.assertEqual(out["steps"], 50)
         self.assertAlmostEqual(out["guidance_scale"], 1.0)
         self.assertAlmostEqual(out["strength"], 0.25)
-        self.assertEqual(out["mask_dilate_px"], 64)
-        self.assertEqual(out["mask_feather_px"], 0)
         self.assertEqual(out["max_sequence_length"], 512)
 
     def test_seed_is_kept_and_null_means_random(self) -> None:

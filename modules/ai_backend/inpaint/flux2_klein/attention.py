@@ -9,8 +9,8 @@ that enforces it, and what that mask costs in device memory.
 Why it exists: the pipeline always conditions on a clean copy of the WHOLE
 region, so an instruction like "make the cup red" can be grounded on a matching
 object OUTSIDE the mask. The model edits it there, the per-step latent blend and
-the composite throw that edit away, and the user sees nothing change under the
-mask. Confining the prompt to the masked image tokens removes the first-order
+the client's composite throw that edit away, and the user sees nothing change
+under the mask. Confining the prompt to the masked image tokens removes the first-order
 path by which the prompt reaches anything outside. The marks reference is a
 copy of the same region with marks drawn on it, so when it is spatially aligned
 with the region its outside tokens are cut off from the prompt the same way;
@@ -200,10 +200,10 @@ _EMPTY_MASK_MESSAGE = (
 def require_text_attention_target(mask_u8: np.ndarray) -> None:
     """Refuse, before anything loads, a mask that would leave the prompt nothing.
 
-    `mask_u8` is the binarized wire mask (`region_imaging.decode_mask`). Checking it
-    instead of the dilated mask is exact: dilation only grows a mask, so the
-    dilated mask has a set pixel iff this one does, and any set pixel puts its
-    token inside (`token_grid_inside`). This is what makes the planner's own
+    `mask_u8` is the binarized wire mask (`region_imaging.decode_mask`): the
+    latent mask itself, already dilated by the client, so it is exactly the
+    mask the attention plan reads, and any set pixel puts its token inside
+    (`token_grid_inside`). This is what makes the planner's own
     refusal unreachable for a request that passed here; it exists so the user
     learns it in milliseconds, not after the transformer load and the prompt
     encode.

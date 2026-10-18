@@ -53,6 +53,7 @@ the pointer in the window the press started in.
 
 pub mod cross_window;
 pub mod drag;
+pub mod elastic;
 pub mod extras;
 pub mod model;
 pub mod panel;

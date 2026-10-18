@@ -129,6 +129,9 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 
 ## Unreleased
 
+### Improvements
+- **Post-processing of FLUX klein results** — in the area editor, edge feathering and colour matching to the original now live in a separate «Post-processing» section and apply to the shown result instantly, without regenerating it. Colour marks no longer bleed into the edge of the inserted result.
+
 ---
 
 # ManhwaStudio — Список изменений
@@ -261,3 +264,6 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - Обновление и установка проверяют каждый скачанный файл по контрольным суммам SHA-256 релиза перед использованием.
 
 ## Не выпущено
+
+### Улучшения
+- **Постобработка результатов FLUX klein** — в редакторе области растушёвка края и подгонка цветов к оригиналу вынесены в отдельный раздел «Постобработка» и применяются к показанному результату сразу, без повторной генерации. Цветовые пометки больше не просачиваются в край вставки.

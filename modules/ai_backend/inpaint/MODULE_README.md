@@ -7,7 +7,7 @@ region for the two klein editors) + mask as PNG bytes and returns PNG bytes; the
 in `server.py`, stored on `AppState`, and reached from Rust through the `inpaint.*` IPC methods
 implemented in `ipc/handlers/`. FLUX.3 klein is a caption + references -> image generator
 (`flux3_klein/`) that serves region editing through `flux3_klein/region.py` (the region is
-reference #0, the result is composited inside the mask).
+reference #0; the RAW result is answered and the client composites it inside the mask).
 
 ## Architecture
 Every service follows the same shape and is safe to copy from when adding another backend:
@@ -96,10 +96,8 @@ Every service follows the same shape and is safe to copy from when adding anothe
   `hf_gated_download`. NOT a service and deliberately so: it holds no
   resident model, takes no lease and has no `AppState` field — it is a module of functions the
   handler imports lazily. See the FLUX.2 klein download section.
-- `region_imaging.py`: the region editors' pixel work (FLUX.2 klein, FLUX.3 klein): strict L8 mask
-  and RGB decode, the solid-mask check, the color match (global mean/std outside the mask, then
-  the optional local CIELAB match), the inward-feathered composite (byte-identical outside the
-  mask) and the mask morphology. Tests: `test_region_imaging.py`.
+- `region_imaging.py`: the region editors' wire codecs (FLUX.2 klein, FLUX.3 klein): strict L8 mask
+  and RGB decode, the solid-mask check, the RGB PNG answer. Tests: `test_region_imaging.py`.
 - `test_lease_hints.py`: the owner and the file-size hint each small-pool service hands
   `begin_model_use` (reuses `test_lease_protocol.py`'s case builders, temp checkpoint files).
 - `test_health_during_load.py`: `health()` answers while AOT's lock section loads and infers, and
@@ -221,33 +219,34 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   `General.ai_device` is ignored here by design.
 
 ### FLUX.2 klein
-- **The mask is a PERMISSION TO CHANGE, not a hole.** Every pixel outside it must come back
-  byte-identical, and `region_imaging.composite_over_region` guarantees that: the feather is applied INWARDS
-  so the blend weight is exactly zero outside, and a final `np.where` copies the original pixels
-  back. Do not replace it with a plain Gaussian feather.
+- **The backend answers the RAW decode; the client post-processes it.** The painted mask is a
+  PERMISSION TO CHANGE: every pixel outside it must end up byte-identical. Since protocol 17 that
+  is the Rust host's job (`crates/ms-region-postprocess`: the colour match, the inward-feathered
+  composite, the latent-mask dilation), so a settings change re-composites without a new run. The
+  wire mask of `inpaint.flux2_klein` is therefore the LATENT mask, already dilated by the client
+  (`mask_dilate_px` there, 0 under `whole_region`); the service uses it unchanged as the pipeline's
+  `mask_image` and as the `text_attention_in_mask` target, and answers `decoded.convert("RGB")`.
+  Outside the mask that answer is a VAE round trip of the region, NOT byte-identical to it. The
+  former post fields (`mask_dilate_px`, `mask_feather_px`, `color_match`, `color_match_local_pct`,
+  `color_match_scale_px`) are refused by name (`params.RETIRED_FIELDS`).
 - **`whole_region` is the "no mask" mode, and the flag is VERIFIED, not trusted.** The client still
   sends a mask — a solid one — so the request format does not fork, and `region_imaging.require_solid_mask`
   refuses a mask with any empty pixel, naming the count. A flag that disagrees with the data would
-  otherwise surface as a partial edit while the UI said no mask was needed. The mode settles three
-  other params in `normalize_flux2_klein_params` (`_whole_region_overrides`, which logs whenever it
-  overrides something the caller asked for): `mask_dilate_px` → 0, because a full mask has nothing
-  to grow into, and `color_match` → `False` (with it `color_match_local_pct` → 0), because `region_imaging.match_color_outside_mask` takes its
-  statistics from the ring OUTSIDE the mask and here that ring is empty — computing it from the
-  changed pixels would force the edit's own mean and standard deviation back onto the original's,
-  i.e. undo the edit, and computing it from an empty sample is a division by zero. `mask_feather_px`
-  is deliberately NOT switched off: it is what joins the regenerated region to the page. The
-  third is `text_attention_in_mask` → `False`: every token is inside a solid mask, so the
-  attention mask would block nothing and still cost its `S²` bytes (see the next bullet).
+  otherwise surface as a partial edit while the UI said no mask was needed. The mode settles one
+  other param in `normalize_flux2_klein_params` (`_whole_region_overrides`, which logs whenever it
+  overrides something the caller asked for): `text_attention_in_mask` → `False`: every token is
+  inside a solid mask, so the attention mask would block nothing and still cost its `S²` bytes
+  (see the next bullet). What the mode means for the post-processing is the client's rule.
 - **`text_attention_in_mask` confines the PROMPT to the mask** (opt-in, default `False`;
   `flux2_klein/attention.py`). Why it exists: the pipeline always conditions on a clean copy of
   the WHOLE region, so an instruction can be grounded on a matching object OUTSIDE the mask; the
-  model edits it there, the per-step latent blend and `region_imaging.composite_over_region` throw that edit
+  model edits it there, the per-step latent blend and the client's composite throw that edit
   away, and the user sees nothing change under the mask. The contract:
   - ONE additive `(S, S)` mask per run over diffusers 0.39's joint sequence `[text L | noisy N |
     region clean copy N | reference R]` (verified in the installed pipeline and transformer),
     passed as the pipeline's `attention_kwargs={"attention_mask": M}`, which diffusers forwards to
     every double- and single-stream attention of the conditional AND the unconditional pass.
-  - "Inside" is the 16 px token grid of the DILATED mask the pipeline receives as `mask_image`,
+  - "Inside" is the 16 px token grid of the latent (client-dilated) mask the pipeline receives as `mask_image`,
     with a token inside when ANY of its pixels is set — one token wider than the pipeline's own
     bilinear latent mask, so the text reaches the partially masked band too.
   - Blocked: image queries outside the mask -> text keys, and text queries -> outside image
@@ -265,8 +264,8 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
     content). `R` is derived from the reference's own size (`condition_tokens`), never assumed.
     A negative embedding of another length, or a mask with no inside token, is a `ValueError` —
     never a silently unmasked or everything-blocked run. The empty mask is refused BEFORE the
-    lease, load and prompt encode (`attention.require_text_attention_target` on the wire mask —
-    dilation only grows it); the planner's own refusal stays as a last-resort contract check.
+    lease, load and prompt encode (`attention.require_text_attention_target` on the wire mask,
+    which is the latent mask itself); the planner's own refusal stays as a last-resort contract check.
   - The mask lives for the denoise only. diffusers keeps `pipe._attention_kwargs` after the call,
     so `service._denoise` clears it (and its own reference) in a `finally` around the pipeline
     call: the mask never survives into the VAE decode (whose forecast excludes it), a failed
@@ -293,73 +292,15 @@ a `FileNotFoundError` the first time a user runs LaMa V2 inpainting.
   pixel-aligned with the region, and for a valid region both are no-ops), and passes it as
   `image_reference`: ONE PIL image, because diffusers treats a list as a batch sized from its first
   element. The pipeline already conditions on the region itself, so the reference is the second
-  condition image. It never enters `region_imaging.composite_over_region` or the colour match; without one the
+  condition image. It never enters the client's composite or colour match; without one the
   pipeline call carries no `image_reference` key at all. The memory guard counts its condition
   tokens in the denoise (the spec's denoise work: the region's token count again), and so does
   `large_models.profiles` when the request's `shape.references` names it.
-- **The color match is two steps, both owned by `region_imaging`, the same for FLUX.2 and FLUX.3
-  klein** (`color_match`, then `color_match_local_pct` / `color_match_scale_px`; FLUX.2 passes the
-  dilated latent mask, FLUX.3 the painted one). (1) `match_color_outside_mask`: per-channel RGB
-  mean/std over the pixels outside the mask grown by `COLOR_MATCH_MARGIN_PX` (6), so a text outline
-  or halo at the contour does not bias it; a ring too small for the margin falls back to the mask
-  itself, one too small for that skips. It fixes the VAE's tone shift of the whole window — a gain
-  + offset per channel is all that shift needs (richer fits measured no better). (2)
-  `match_color_local`: what the model PAINTED drifts away from the surroundings towards the mask
-  centre (the fill averages the scene), which no global curve can fix. In CIELAB, at
-  `s = color_match_scale_px` (the Gaussian SIGMA of the finest level, not a window side):
-  lightness mean and contrast (gain clipped to 0.8..1.4), a/b mean shift only, blended at
-  `strength`. The GENERATED image's local statistics come from the pixels INSIDE the mask only —
-  a deliberate departure from the spec's plain Gaussian, whose window at the contour mixes the
-  drift with the matching outside, sees about half of it and left an under-corrected rim band 1-2
-  scales wide (a seam users saw along the contour). The target statistics come from the original
-  outside the mask (+3 px) carried inwards by a cascade of scales `s..16s` — one scale has no
-  valid pixel in reach at the centre of a wide mask — terminated by the GLOBAL moments of the
-  original, because cv2 truncates each Gaussian at 4 sigma and beyond ~67·s from the ring no
-  level has any weight (without it the far interior got no correction and a 0.8 contrast cut,
-  with a seam where the support ended).
-  Both sides are ROBUST local modes, not means: at every scale, `LOCAL_MATCH_ROBUST_ITERATIONS`
-  (2) passes reweight each sample by `exp(-ΔE²/2τ²)`, τ = `LOCAL_MATCH_SIMILARITY_DE` (12),
-  against that scale's field at the SAMPLE's position, and the means and E[L²] are re-estimated
-  with those weights (per scale: a surface dominant in its own small neighbourhood, such as the
-  page beyond a panel border, must not keep full weight in a coarse window). Why: on line art the
-  ring's mean is a darker, greyer fill (ink, outlines, page) and dragged the model's clean fill
-  into a grey patch the shape of the mask. Where a side's similar-pixel share is below
-  `LOCAL_MATCH_MIN_SHARE` (0.25) the estimate is a mixture and the correction fades to the
-  identity. Known limits: a drift larger than about τ is no longer pulled by the local step (the
-  global step still fixes the VAE's tone shift); and where a surface boundary runs through the
-  mask's INTERIOR the coarse target blends both surfaces and can pull one towards the other (the
-  plain-mean version did the same; the rims next to each surface converge to their own) — the fix
-  would be a cross-bilateral estimate (similarity measured at the evaluated point, e.g. colour
-  clusters), deliberately not done. Its fields are computed on a grid `s // 4` times coarser from
-  fine fields reflect-padded by the finest kernel's reach (a grid's own border mirrors about its
-  first cell, not pixel 0); coarser scales use seeded jittered point samples at stride `2**i`
-  (unbiased, no aliasing on screentone). Cost at 2048x2048 with cv2: ~0.7 s at s = 24, ~1.1 s
-  at s = 8. It rewrites only pixels inside the mask. The global step rounds like the composite.
-  Default strength 60 %: full strength brings the statistics closest to the ring but its
-  lightness gain turns dark-area noise into specks. Off (0) under `whole_region`.
-- **The region's border is a mask contour.** `region_imaging.mask_distance_inside` pads the mask with a ring of
-  zeros before measuring, because the region is a WINDOW onto a larger page and the pixels past its
-  edge belong to that page, which the request may not change. Without the ring neither backend sees
-  a contour there — `cv2.distanceTransform` only measures to zeros that exist inside the array, and
-  `cv2.erode` / `ImageFilter.MinFilter` extend the border rather than eating into it — so a mask
-  painted up to the region edge met the untouched page with a hard step, and under `whole_region`,
-  where the mask covers everything, the feather was a complete no-op.
-- **`mask_feather_px` is the ramp WIDTH, and the blend rounds.** `region_imaging.feather_mask_inwards` builds
-  the alpha as a smoothstep of `region_imaging.mask_distance_inside`, so the weight is 0 on the contour and 1
-  at exactly `feather_px` px inside; a mask thinner than that compresses the ramp to its own
-  half-width instead of losing the edit. Two failure modes this replaced, both measured on a real
-  page and both visible as the "seam" users reported: an erode-then-Gaussian-blur ramp whose
-  nominal 6 px spanned ~22 px and whose weight peaked at 0.13 for `feather_px=32` (silently
-  discarding 87% of the edit), and a truncating `astype(np.uint8)` that biased every partially
-  blended pixel one level DARKER — a mask-shaped dark patch with a hard contour. The blend must
-  stay an exact identity when `generated == original`; there is a test for it.
-- **The seam is bounded by the composite, not by `mask_dilate_px`.** Measured across dilate
-  0/8/16/32/64 with the corrected feather, the excess gradient on the mask contour stays within
-  0.3-0.8% — the dilate exists to give a thin mask a full latent cell (the pipeline bilinearly
-  downsamples the mask to a 16 px grid), not to control the edge. What the composite CANNOT fix
-  is that a 4-step distilled denoise returns the masked area ~18% less textured than the original
-  (Laplacian variance, ring 8-24 px inside the mask); that is the model, and no parameter here
-  changes it.
+- **The latent-mask dilation gives a thin mask a full latent cell** (the pipeline bilinearly
+  downsamples the mask to a 16 px grid); it does not control the seam, which is the client's
+  composite. What no composite can fix is that a 4-step distilled denoise returns the masked area
+  ~18% less textured than the original (Laplacian variance, ring 8-24 px inside the mask); that is
+  the model.
 - **The mask is accepted only as L8.** `region_imaging.decode_mask` checks `img.mode == "L"` and raises on
   anything else. An RGB/RGBA mask used to be converted by taking the alpha or the per-channel
   maximum, which silently promoted stray colored pixels to "edit this" — a client bug turning

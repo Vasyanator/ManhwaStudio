@@ -20,14 +20,15 @@ Key structures:
 - `MaskStack`: geometry, the mask layers, the marks layer, the active index, the undo history
 - `MaskLayer`: one layer's buffer, counter, preview, dirty box and texture (private)
 - `MarksLayer`: the marks buffer, counter, preview, dirty box and texture (private)
-- `ResultLayer`: the processed image plus its lazily created texture
+- `ResultLayer`: the processed image plus its lazily created texture; `Lineage` / `ResultPatch`:
+  what a replacement shares with the image it replaces (patch uploads)
 
 Key functions:
 - `MaskStack::paint_segment`, `set_active_from_alpha`, `clear_all`, `push_undo`, `undo`
 - `MaskStack::paint_marks_segment`, `paint_marks_boxes`, `push_marks_undo`, `marks_rgba`
 - `hollow_rect_boxes()`: the pixel boxes of an unfilled rectangle (pure)
 - `MaskStack::ensure_textures`, `MaskStack::draw_marks`, `MaskStack::draw_masks`
-- `ResultLayer::ensure_texture`, `ResultLayer::draw`
+- `ResultLayer::ensure_texture`, `ResultLayer::replace_image`, `ResultLayer::draw`
 
 Notes:
 Modelled on `Flux2SessionState` (`tools/ai_editor/engines/flux2_klein/session.rs`), with N mask
@@ -43,6 +44,7 @@ Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md`.
 use ms_log::runtime_log;
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, TextureHandle, TextureOptions};
+use std::sync::Arc;
 
 /// Fraction of a tint's own alpha that a set mask pixel gets in the preview.
 ///
@@ -1037,9 +1039,45 @@ impl MaskStack {
 /// Applying belongs to the tool, which must first refuse a result whose `size` differs from the
 /// frame rect — `CanvasView::replace_overlay_region_px` silently nearest-rescales and overwrites
 /// alpha (D7 of the design).
+///
+/// The pixels sit behind an `Arc` so the texture upload shares them with the layer instead of
+/// copying the whole image on the GUI thread (egui's `ImageData` is an `Arc<ColorImage>`).
 pub struct ResultLayer {
-    image: egui::ColorImage,
+    image: Arc<egui::ColorImage>,
     texture: Option<TextureHandle>,
+    /// The id of the image stream the current pixels belong to (`Lineage`), `None` for an
+    /// image of no stream. Only a replacement of the SAME lineage may upload a patch.
+    lineage: Option<u64>,
+}
+
+/// Where a replacement result image comes from (`ResultLayer::replace_image`): a stream of
+/// images that are equal outside each one's `patch`.
+#[derive(Debug)]
+pub struct Lineage {
+    /// The stream's id, unique per stream for the layer's lifetime (the host's pending result).
+    pub id: u64,
+    /// The part of the image that can differ from the previous image of the same stream; every
+    /// pixel outside it is guaranteed equal. `None`: anything may differ.
+    pub patch: Option<ResultPatch>,
+}
+
+/// A rectangle of a result image: `image` holds exactly its pixels, `pos` is its top-left
+/// corner in the whole image.
+#[derive(Debug)]
+pub struct ResultPatch {
+    /// Top-left corner of the rectangle in the whole image, px.
+    pub pos: [usize; 2],
+    /// The rectangle's pixels.
+    pub image: egui::ColorImage,
+}
+
+impl ResultPatch {
+    /// Whether the patch is non-empty and lies inside an image of `size`.
+    fn fits(&self, size: [usize; 2]) -> bool {
+        let [x, y] = self.pos;
+        let [w, h] = self.image.size;
+        w > 0 && h > 0 && x.checked_add(w).is_some_and(|end| end <= size[0]) && y.checked_add(h).is_some_and(|end| end <= size[1])
+    }
 }
 
 // `TextureHandle` implements no `Debug`; print the geometry and the upload state, never the pixels.
@@ -1057,9 +1095,17 @@ impl ResultLayer {
     #[must_use]
     pub fn new(image: egui::ColorImage) -> Self {
         Self {
-            image,
+            image: Arc::new(image),
             texture: None,
+            lineage: None,
         }
+    }
+
+    /// The layer with its image marked as the first of the stream `lineage` (see `Lineage`).
+    #[must_use]
+    pub fn in_lineage(mut self, lineage: u64) -> Self {
+        self.lineage = Some(lineage);
+        self
     }
 
     /// `[width, height]` of the result in pixels — what the tool compares against the frame rect.
@@ -1074,8 +1120,41 @@ impl ResultLayer {
         &self.image
     }
 
-    /// Uploads the image once. Later calls are no-ops: the image never changes after `new`, so
-    /// there is no dirty box and no partial upload here.
+    /// Replaces the pending image IN PLACE with `image` of the same size, re-uploading it into the
+    /// existing texture when one was already created. Returns `false`, having changed nothing,
+    /// when the size differs: a result is always exactly the frame rectangle, and a new size
+    /// would mean a different result.
+    ///
+    /// The upload is the patch only (`TextureHandle::set_partial`) when `lineage` carries one
+    /// that fits AND the current pixels belong to the same lineage: then everything outside the
+    /// patch is already on the GPU. Otherwise it is one full upload sharing the pixels
+    /// (`TextureHandle::set`, no copy, no handle churn). The layer then belongs to `lineage`'s
+    /// stream (`None`: to none).
+    ///
+    /// The host's live post-process uses it to swap in a re-derived result while the user
+    /// edits the post-process settings of a pending result.
+    pub fn replace_image(&mut self, image: egui::ColorImage, lineage: Option<Lineage>) -> bool {
+        if image.size != self.image.size {
+            return false;
+        }
+        let image = Arc::new(image);
+        let id = lineage.as_ref().map(|lineage| lineage.id);
+        if let Some(texture) = self.texture.as_mut() {
+            let same_stream = id.is_some() && id == self.lineage;
+            let patch = lineage.and_then(|lineage| lineage.patch).filter(|patch| same_stream && patch.fits(image.size));
+            // The same filter `ensure_texture` uploads with, so a replaced preview looks alike.
+            match patch {
+                Some(patch) => texture.set_partial(patch.pos, patch.image, TextureOptions::LINEAR),
+                None => texture.set(Arc::clone(&image), TextureOptions::LINEAR),
+            }
+        }
+        self.image = image;
+        self.lineage = id;
+        true
+    }
+
+    /// Uploads the image once. Later calls are no-ops: the texture follows the image from then
+    /// on through `replace_image` (which may upload only a patch), so there is no dirty box here.
     pub fn ensure_texture(&mut self, ctx: &egui::Context) {
         if self.texture.is_some() || self.image.pixels.is_empty() {
             return;
@@ -1084,7 +1163,7 @@ impl ResultLayer {
         // itself drawn with LINEAR, so a different filter would make the preview stand out.
         self.texture = Some(ctx.load_texture(
             "region-edit-v2-result",
-            self.image.clone(),
+            Arc::clone(&self.image),
             TextureOptions::LINEAR,
         ));
     }
@@ -1528,6 +1607,56 @@ mod tests {
         let result = ResultLayer::new(egui::ColorImage::filled([7, 3], Color32::RED));
         assert_eq!(result.size(), [7, 3]);
         assert_eq!(result.image().pixels.len(), 21);
+    }
+
+    /// A replacement of the same size swaps the pixels (and the uploaded texture); another size
+    /// is refused and changes nothing.
+    #[test]
+    fn a_result_layer_replaces_only_an_image_of_its_own_size() {
+        let ctx = egui::Context::default();
+        let mut result = ResultLayer::new(egui::ColorImage::filled([4, 2], Color32::RED));
+        result.ensure_texture(&ctx);
+        assert!(result.texture.is_some(), "uploaded before the replacement");
+        assert!(!result.replace_image(egui::ColorImage::filled([2, 4], Color32::BLUE), None), "a transposed size is refused");
+        assert_eq!(result.image().pixels[0], Color32::RED, "a refusal changes nothing");
+        assert!(result.replace_image(egui::ColorImage::filled([4, 2], Color32::BLUE), None));
+        assert_eq!(result.image().pixels[0], Color32::BLUE);
+        assert!(result.texture.is_some(), "the texture handle is kept, not re-created");
+        // The queued upload holds the layer's own pixels: shared, not a GUI-thread copy.
+        assert!(Arc::strong_count(&result.image) >= 2, "the upload shares the image");
+    }
+
+    /// The upload deltas queued for `texture` since the last call: `true` per partial one.
+    fn queued_uploads(ctx: &egui::Context, texture: &TextureHandle) -> Vec<bool> {
+        let mut delta = ctx.tex_manager().write().take_delta();
+        let partial = delta.set.get(&texture.id()).map(|deltas| deltas.iter().map(|delta| !delta.is_whole()).collect()).unwrap_or_default();
+        // No painter applies them here; dropping unapplied deltas is a debug assertion.
+        delta.clear();
+        partial
+    }
+
+    /// A patch is uploaded alone only within one lineage, after the texture exists; a new
+    /// lineage, no lineage or a patch that does not fit uploads the whole image.
+    #[test]
+    fn a_result_patch_is_uploaded_only_within_its_lineage() {
+        let ctx = egui::Context::default();
+        let patch = || ResultPatch { pos: [1, 0], image: egui::ColorImage::filled([2, 2], Color32::GREEN) };
+        let mut result = ResultLayer::new(egui::ColorImage::filled([4, 2], Color32::RED)).in_lineage(3);
+        assert!(result.replace_image(egui::ColorImage::filled([4, 2], Color32::BLUE), Some(Lineage { id: 3, patch: Some(patch()) })), "no texture yet: nothing to patch");
+        result.ensure_texture(&ctx);
+        let texture = result.texture.clone().expect("uploaded");
+        assert_eq!(queued_uploads(&ctx, &texture), vec![false], "the first upload is whole");
+        assert!(result.replace_image(egui::ColorImage::filled([4, 2], Color32::BLUE), Some(Lineage { id: 3, patch: Some(patch()) })));
+        assert_eq!(queued_uploads(&ctx, &texture), vec![true], "same lineage: the patch only");
+        assert!(result.replace_image(egui::ColorImage::filled([4, 2], Color32::BLUE), Some(Lineage { id: 4, patch: Some(patch()) })));
+        assert_eq!(queued_uploads(&ctx, &texture), vec![false], "a new lineage uploads everything");
+        let outside = ResultPatch { pos: [3, 0], image: egui::ColorImage::filled([2, 2], Color32::GREEN) };
+        assert!(result.replace_image(egui::ColorImage::filled([4, 2], Color32::BLUE), Some(Lineage { id: 4, patch: Some(outside) })));
+        assert_eq!(queued_uploads(&ctx, &texture), vec![false], "a patch past the edge is not trusted");
+        assert!(result.replace_image(egui::ColorImage::filled([4, 2], Color32::BLUE), None));
+        assert_eq!(queued_uploads(&ctx, &texture), vec![false], "no lineage: a whole upload");
+        assert!(result.replace_image(egui::ColorImage::filled([4, 2], Color32::BLUE), Some(Lineage { id: 4, patch: Some(patch()) })));
+        assert_eq!(queued_uploads(&ctx, &texture), vec![false], "an image of no lineage breaks the stream");
     }
 
     // -----------------------------------------------------------------------------------

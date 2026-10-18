@@ -68,6 +68,10 @@ ms-tools = { path = "../ms-tools" }
 # The one square dilation (`dilate_square`) behind the autoclean cluster/stroke growth and
 # the gradient tool's ring masks. A level-0 leaf (std + thiserror), no layering constraint.
 ms-raster = { path = "../ms-raster" }
+# The FLUX klein region post-processing (colour match, inward feather, composite, the cached
+# re-derivation the region-edit host runs on a worker, the «Постобработка» section body). It
+# sits on the `ms-studio-tab` line, below this crate.
+ms-region-postprocess = { path = "../ms-region-postprocess" }
 # The detector mask contract (`mask::binary_alpha_from_gray`: 0/255 normalization and the
 # `MAX_MASK_PIXELS` guard) applied to the L8 mask PNGs the backend returns. A level-1 leaf.
 ms-text-detect = { path = "../ms-text-detect" }

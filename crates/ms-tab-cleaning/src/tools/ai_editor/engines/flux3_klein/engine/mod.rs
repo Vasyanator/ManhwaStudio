@@ -12,7 +12,9 @@ Main responsibilities:
   the run channel and the progress bar;
 - implement `AiEngine`: one mask layer, the FLUX.3 frame constraints, marks as a separate
   reference while the reference list has room (else composited onto the region), the run it
-  starts, mid-run cancel, and the poll it answers with;
+  starts, mid-run cancel, the poll it answers with (`EnginePoll::DoneRaw`: the raw region, its
+  mask and mode) and the live «Постобработка» settings the host finishes it with
+  (`postprocess_settings`);
 - validate a run request and turn it into the run's pixels (`run_input`);
 - keep the derived state honest: load the settings once, save them when they settle, re-ask
   `.status` when the package root changes, re-arm the forecast on a settled region SIZE.
@@ -21,7 +23,7 @@ Key structures:
 - `Flux3KleinEngine`
 
 Key functions:
-- `AiEngine::{start, poll, cancel, draw_parameters, marks_support}`,
+- `AiEngine::{start, poll, cancel, draw_parameters, marks_support, postprocess_settings}`,
   `Flux3KleinEngine::{run_input, frame_constraints, model_readiness, profiles_request}`
 
 Notes:
@@ -140,7 +142,7 @@ impl Flux3KleinEngine {
             settings_save_blocked: false,
             settings_loaded: false,
             dirty: false,
-            saver: SettingsSaver::new(save_flux3_settings),
+            saver: SettingsSaver::new(save_flux3_settings, FLUX3_LOG_LABEL),
             seed_input: String::new(),
             status: None,
             status_root: None,
@@ -208,13 +210,14 @@ impl Flux3KleinEngine {
     }
 
     /// Writes dirty settings on a worker (the shared `SettingsSaver`): never before the load,
-    /// never while the file is blocked, a failure retried with backoff.
-    pub(super) fn poll_and_maybe_save(&mut self) {
+    /// never while the file is blocked, only once a change stayed unchanged for the shared
+    /// `SETTINGS_SAVE_DEBOUNCE`, a failure retried with backoff; a value still owed when the
+    /// engine is dropped is flushed by the saver on a worker. `now` is the poll's clock.
+    pub(super) fn poll_and_maybe_save(&mut self, now: Instant) {
         self.saver.poll(
-            Instant::now(),
+            now,
             SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: self.settings_save_blocked },
             &self.settings,
-            FLUX3_LOG_LABEL,
             |err| tf!("cleaning.tools.flux3_klein.settings_save_error", err = err),
         );
     }
@@ -274,15 +277,23 @@ impl Flux3KleinEngine {
     /// Records a parameter change: a save is owed, the forecast is re-armed, a "moved aside"
     /// notice retires, and `.status` is re-asked when the package root moved.
     pub(super) fn note_settings_changed(&mut self) {
-        self.dirty = true;
+        self.note_postprocess_changed();
         self.resources.arm();
-        if matches!(self.settings_problem, Some(SettingsProblem::MovedAside(_))) {
-            self.settings_problem = None;
-        }
         let root = self.settings.effective_root();
         let asked = self.status_query_root.as_deref().or(self.status_root.as_deref());
         if asked != Some(root.as_str()) {
             self.status_wanted = true;
+        }
+    }
+
+    /// Records a change of the «Постобработка» values ONLY: a save is owed and a "moved aside"
+    /// notice retires, but neither the forecast nor `.status` is re-armed — post-processing
+    /// runs in the host after the run and is no part of either question (`to_params` leaves
+    /// those keys out), and a dragged dial changes it on every frame.
+    pub(super) fn note_postprocess_changed(&mut self) {
+        self.dirty = true;
+        if matches!(self.settings_problem, Some(SettingsProblem::MovedAside(_))) {
+            self.settings_problem = None;
         }
     }
 
@@ -414,14 +425,17 @@ impl Flux3KleinEngine {
         self.resources.invalidate();
         self.status_wanted = true;
         match result {
-            Ok(outcome) => {
+            Ok(Flux3RunOutcome { answer, mask, whole_region }) => {
                 ms_log::runtime_log::log_info(format!(
-                    "[cleaning] {FLUX3_LOG_LABEL} run finished: seed {}, steps {}, format {}, compute {}, encoder {}, ae {}",
-                    outcome.seed, outcome.steps, outcome.applied.format, outcome.applied.compute_path, outcome.applied.encoder_mode, outcome.applied.ae_dtype
+                    "[cleaning] {FLUX3_LOG_LABEL} run finished: seed {}, steps {}, format {}, compute {}, encoder {}, ae {}, whole region {whole_region}",
+                    answer.seed, answer.steps, answer.applied.format, answer.applied.compute_path, answer.applied.encoder_mode, answer.applied.ae_dtype
                 ));
-                self.last_seed = Some(outcome.seed);
-                self.run_status = Some(flux3_run_done_status(outcome.seed, outcome.degraded.as_ref()));
-                EnginePoll::Done(outcome.image)
+                self.last_seed = Some(answer.seed);
+                self.run_status = Some(flux3_run_done_status(answer.seed, answer.degraded.as_ref()));
+                // The raw model output: the host composites it inside `mask` with the live
+                // «Постобработка» settings. The colour match samples the same mask (FLUX.3 has
+                // no separate latent mask).
+                EnginePoll::DoneRaw(RawRegionResult { image: answer.image, mask, sample_mask: None, whole_region })
             }
             Err(err) => {
                 let message = tf!("cleaning.mask_editor.processing_error", err = err);
@@ -506,6 +520,12 @@ impl AiEngine for Flux3KleinEngine {
         } else {
             MarksSupport::OVERLAY_ONLY
         }
+    }
+
+    /// Always `Some` (every run answers `DoneRaw`): the persisted «Постобработка» values,
+    /// normalized. Read every frame by the host; a copy of four numbers.
+    fn postprocess_settings(&self) -> Option<PostprocessSettings> {
+        Some(self.settings.postprocess.normalized())
     }
 
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
@@ -641,7 +661,7 @@ impl AiEngine for Flux3KleinEngine {
         let progress = Arc::clone(&self.progress);
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(run_flux3_klein(&input, &settings, &progress, &claim));
+            let _ = tx.send(run_flux3_klein(input, &settings, &progress, &claim));
         });
         self.run_rx = Some(rx);
         self.run_status = None;
@@ -665,9 +685,15 @@ impl AiEngine for Flux3KleinEngine {
         self.resources.poll_side_jobs(Instant::now());
         let run = self.poll_run();
         self.poll_and_maybe_query_profiles();
-        self.poll_and_maybe_save();
-        if self.resources.wants_repaint() || self.saver.retry_pending() || self.references_rx.is_some() {
+        let now = Instant::now();
+        self.poll_and_maybe_save(now);
+        if self.resources.wants_repaint() || self.references_rx.is_some() {
             ctx.request_repaint_after(LIMITS_EDIT_DEBOUNCE);
+        }
+        // The settings save debounce, a failed save's retry and a write in flight: the saver
+        // says exactly when it needs the next poll.
+        if let Some(after) = self.saver.wake_after(now) {
+            ctx.request_repaint_after(after);
         }
         if matches!(run, EnginePoll::Running) {
             // The bar moves on backend frames, not on input.

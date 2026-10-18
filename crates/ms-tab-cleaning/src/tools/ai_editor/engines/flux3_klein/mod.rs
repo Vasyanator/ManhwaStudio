@@ -19,9 +19,11 @@ How a region is edited (the backend's `inpaint/flux3_klein/region.py`):
 - FLUX.3 has no mask input. The REGION is reference #0 and the output is the region's size;
   the user's extra references (up to `FLUX3_MAX_EXTRA_REFERENCES`) follow as #1 and up, and a
   marks reference (`RunMarks::Reference`) is appended last as one more of them.
-- The painted mask is "permission to change": the backend composites the generated image
-  inside it (feather + colour match), so everything outside stays byte-identical. An EMPTY
-  mask is the whole-region mode, derived by the shared `mask_for_run`, exactly as for FLUX.2.
+- The painted mask is "permission to change". The backend validates it and answers the RAW
+  generated region (`EnginePoll::DoneRaw`); the HOST composites it inside the mask (feather +
+  colour match, `ms_region_postprocess`, live settings from `postprocess_settings()`), so
+  everything outside stays byte-identical. An EMPTY mask is the whole-region mode, derived by
+  the shared `mask_for_run`, exactly as for FLUX.2.
 - The size rule (multiple of 16, side >= 128, area <= 4 MP, aspect <= 4:1) is declared through
   `constraints()` and decided by `region_edit_v2::geometry::check_size`, the one owner of
   validity; the run path re-checks the actual region through the shared `region_size_refusal`.
@@ -40,12 +42,14 @@ Submodules:
 - `ui/`: the parameter panel.
 - `test_support.rs`: `cfg(test)` fixtures.
 
-IPC (`backend_ipc::protocol`, PROTOCOL_VERSION 16, `modules/ai_backend/ipc/PROTOCOL.md` §5.4):
+IPC (`backend_ipc::protocol`, PROTOCOL_VERSION 17, `modules/ai_backend/ipc/PROTOCOL.md` §5.4):
 `inpaint.flux3_klein` (streaming, cancelled mid-run through `CallHandle::cancel`),
 `.status`, `.unload`, `.download.check`, `.download.start` (streaming), and the forecast
 `large_models.profiles` with `model: "flux3_klein"`.
 */
-use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RunMarks, RunOptionsCtx, region_size_refusal};
+use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RawRegionResult, RunMarks, RunOptionsCtx, region_size_refusal};
+// The post-process settings the host applies to a raw run answer (one owner of defaults, ranges, UI).
+use ms_region_postprocess::PostprocessSettings;
 use ms_backend_ipc as backend_ipc;
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
@@ -126,17 +130,6 @@ const FLUX3_STEPS_MAX: u32 = 64;
 /// The package's own sampler default (`config.json` `steps`); the model is distilled and has
 /// no guidance or negative prompt.
 const FLUX3_DEFAULT_STEPS: u32 = 16;
-const FLUX3_FEATHER_MAX: u32 = 32;
-const FLUX3_DEFAULT_FEATHER: u32 = 12;
-/// Largest `color_match_local_pct`, the local colour-match strength in percent (`0` = the
-/// global match only); the backend's accepted range (`inpaint/flux3_klein/wire.py`).
-const FLUX3_COLOR_MATCH_LOCAL_PCT_MAX: u32 = 100;
-const FLUX3_DEFAULT_COLOR_MATCH_LOCAL_PCT: u32 = 60;
-/// Range and default of `color_match_scale_px`, the Gaussian sigma in pixels of the finest
-/// level of the local colour match's averaging; the backend's accepted range.
-const FLUX3_COLOR_MATCH_SCALE_MIN: u32 = 8;
-const FLUX3_COLOR_MATCH_SCALE_MAX: u32 = 96;
-const FLUX3_DEFAULT_COLOR_MATCH_SCALE: u32 = 24;
 
 /// Preview tint of the engine's single mask layer (the edit-permission area). Opaque on
 /// purpose: `MaskStack` scales the alpha itself.

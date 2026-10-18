@@ -16,6 +16,7 @@ settings-file notice -> prompt (any language) -> «Референсы» (N of 9,
 -> the ONE readiness line («Установить» / «Обновить»)
 -> «Установка модели» (install.rs) -> «Память и скорость» (shared widget) -> «Для экспертов»
    (advanced.rs) -> the mask note
+-> «Постобработка» (shared `draw_postprocess_section`, LAST, bottom-docked, collapsed)
 ```
 
 What is touched per edit is never folded; what is set once per machine always is; no section
@@ -23,19 +24,23 @@ nests another.
 
 ## Files and submodules
 - `mod.rs`: the body, the prompt, references, steps/seed, readiness and memory blocks, and the
-  catalog test over every `cleaning.tools.flux3_klein.*` key (en and ru).
+  catalog test over every `cleaning.tools.flux3_klein.*` key and the shared section's
+  `cleaning.region_postprocess.*` keys (en and ru).
 - `install.rs`: «Установка модели» — format picker, source-mode switch, the package folder row
   (manual) or the download block (repository + licence page, token row with
   `ms_widgets::HfAccessHint`, destination, the parts present, the shared check / download
   controls), the residency line and «Выгрузить из памяти». It opens itself once on the first
   definite non-ready verdict unless the user already moved the fold.
 - `advanced.rs`: «Для экспертов» — «Референсы и в текстовый энкодер» (`vl_refs`), «Автоэнкодер в
-  bfloat16», the fp8 path (drawn for fp8r only), «Ограничить референсы», soft edge, colour match
-  with its local strength / scale dials (closed while the colour match is off).
+  bfloat16», the fp8 path (drawn for fp8r only) and «Ограничить референсы». Feather and colour
+  match are the shared «Постобработка» section (`../../shared/postprocess_section.rs`, body owned
+  by `ms_region_postprocess`), drawn last by `mod.rs` under the stable id `cleaning_flux3_klein`; its edits raise
+  `Flux3PanelIntents::postprocess_changed` (a save, no forecast question), never `settings_changed`.
 
 ## Contracts and invariants
 - **No literals**: every text is a `cleaning.tools.flux3_klein.*` key (shared parts use
-  `cleaning.tools.hf_download.*`, `large_models.*`, `cleaning.common.*`); glyph buttons carry
+  `cleaning.tools.hf_download.*`, `large_models.*`, `cleaning.common.*`,
+  `cleaning.region_postprocess.*`); glyph buttons carry
   their meaning on hover. Localized collapsibles and the mode buttons carry stable salts; the
   whole body sits under `push_id("flux3_klein")`.
 - **Project widgets only** (`WheelSlider`, `WheelComboBox`; no `egui::Slider` / `ComboBox` /
@@ -47,3 +52,4 @@ nests another.
 ## Editing map
 - Order or content of the body: `mod.rs`; installation and download: `install.rs`; expert
   switches: `advanced.rs`; what a line says: `../decisions.rs`.
+- Feather / colour-match controls: `ms_region_postprocess::draw_postprocess_body` (never here).

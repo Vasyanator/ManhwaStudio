@@ -16,6 +16,9 @@ Exports:
 - `box_blur_u8`: clamp-to-edge separable box blur of a single-channel `u8` plane, O(w*h).
 - `rgba_over_white_to_rgb`: straight RGBA8 composited over opaque white into RGB8 (PDF image
   streams, JPEG saves).
+- `squared_distance_to_mask` / `squared_distance_with_costs` + `EDT_COST_INF` / `EDT_MAX_DIMENSION`: the exact
+  Euclidean (Felzenszwalb-Huttenlocher) squared distance transform in `f32`, over a `u8` mask or
+  a sub-pixel seed-cost field (text-render glow / dry-media effects, region post-processing).
 - `RasterError`: the typed buffer-shape / parameter error.
 
 Notes:
@@ -28,6 +31,7 @@ Level 0 crate: std + `thiserror` only, GUI-free and wasm-safe. Callers own outpu
 
 mod alpha;
 mod blur;
+mod distance;
 mod morph;
 mod otsu;
 mod polygon;
@@ -35,6 +39,7 @@ mod scale;
 
 pub use alpha::rgba_over_white_to_rgb;
 pub use blur::box_blur_u8;
+pub use distance::{EDT_COST_INF, EDT_MAX_DIMENSION, squared_distance_to_mask, squared_distance_with_costs};
 pub use morph::dilate_square;
 pub use otsu::otsu_threshold;
 pub use polygon::fill_polygon_spans;
@@ -109,6 +114,17 @@ pub enum RasterError {
         len: usize,
         /// Bytes per pixel the primitive expects.
         channels: usize,
+    },
+    /// A width or height exceeds the domain a primitive computes exactly in (the distance
+    /// transform: `EDT_MAX_DIMENSION`, the exact-`f32` coordinate range).
+    #[error("raster size {width}x{height} exceeds the supported {max} pixels per dimension")]
+    DimensionTooLarge {
+        /// Declared width in pixels.
+        width: usize,
+        /// Declared height in pixels.
+        height: usize,
+        /// The largest accepted width or height.
+        max: usize,
     },
     /// The blur radius is so large that the exact window sum does not fit in `u64`.
     #[error("blur radius {radius} is too large")]

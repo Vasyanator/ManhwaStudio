@@ -37,7 +37,8 @@ Notes:
   `default_size` takes the text-to-image size from the caller; side bounds come
   from `params.py`; the reference pixel caps can be LOWERED by the caller
   (`Flux3Options.reference_max_pixels`, a low-VRAM option absent from the
-  reference; `None` keeps the reference caps exactly).
+  reference; `None` keeps the reference caps exactly); `to_pil` rounds (half
+  to even) where the reference truncates to uint8.
 - Torch, numpy and PIL are imported at module level: this module is only
   imported by the torch-side components.
 """
@@ -315,9 +316,15 @@ def to_tensor(image: Image.Image) -> Tensor:
 
 
 def to_pil(image: Tensor) -> Image.Image:
-    """A `[3, H, W]` tensor in [-1, 1] -> RGB PIL image (clamped, truncated to
-    uint8 as in the reference)."""
-    array = ((image.float().clamp(-1, 1) + 1) * 127.5).to(torch.uint8).permute(1, 2, 0).cpu().numpy()
+    """A `[3, H, W]` tensor in [-1, 1] -> RGB PIL image: clamped, then ROUNDED
+    (half to even) to uint8.
+
+    Rounding, not the reference's truncation: truncating biases every pixel up
+    to one level dark, which shows as a seam where the client composites the
+    answer over the untouched region. The clamp comes first, so the scaled
+    value lies in [0, 255] and the rounded one cannot overflow the uint8 range.
+    """
+    array = ((image.float().clamp(-1, 1) + 1) * 127.5).round().to(torch.uint8).permute(1, 2, 0).cpu().numpy()
     return Image.fromarray(array)
 
 

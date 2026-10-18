@@ -100,12 +100,17 @@ Notes:
   one-frame lag. A pinned section that draws nothing costs no height, and the
   frame itself never extends past the solved rect: the pinned-mode body is laid
   out in a child `Ui` whose extent reaches the frame clamped to the rect.
+- The scroll body is bracketed by `elastic::open_body` / `close_body`, and the
+  filler `elastic::bottom_aligned` drew inside it is subtracted from the content
+  height: it is room the body was given, not room it needs, so it never becomes
+  part of the request.
 */
 
 use egui::scroll_area::ScrollBarVisibility;
 use egui::{Id, Pos2, Rect, Sense, Stroke, Vec2};
 
 use super::drag::{DraggedTab, SNAP_LINE_WIDTH, insertion_index};
+use super::elastic;
 use super::model::{PanelId, TabId};
 use super::solver::{
     COLLAPSED_PANEL_HEIGHT, PANEL_MIN_BODY_HEIGHT, PANEL_MIN_WIDTH, PanelChrome, SolvedPanel,
@@ -280,6 +285,9 @@ pub struct CollapsiblePanelOutput {
     /// width the panel was GIVEN — the widget lays the body out inside it and
     /// never measures a preferred width — which is why the driver keeps the width
     /// the panel asked for instead of storing this one.
+    ///
+    /// A filler drawn by [`super::elastic::bottom_aligned`] in the scroll body is
+    /// NOT content and is left out of the height.
     pub measured_size: Option<Vec2>,
     /// Style-dependent vertical overhead this panel actually drew, reported in
     /// every state (collapsed included) so the solver stops guessing it from the
@@ -792,6 +800,10 @@ impl<'a> CollapsiblePanel<'a> {
             if fade_bars {
                 body_ui.spacing_mut().scroll = faded_scroll_style(unfaded_scroll, chrome_opacity);
             }
+            // Brackets the scroll body for `elastic::bottom_aligned`: the
+            // fillers it draws in there are summed and handed back by
+            // `close_body` below, so the measurement can leave them out.
+            elastic::open_body(body_ui.ctx());
             let scroll = egui::ScrollArea::both()
                 .id_salt(("ms_panel_dock_body", self.id_scope, active.as_str()))
                 .max_height(body_max_height)
@@ -830,7 +842,12 @@ impl<'a> CollapsiblePanel<'a> {
             // exactly the budget above — which is what makes the subtraction
             // below the panel's overhead and nothing else.
             body_budget_height = scroll.inner_rect.height();
-            body_content_height = scroll.content_size.y;
+            // An elastic filler is room the body was GIVEN, not content it
+            // needs: egui counts it in `content_size` (`scroll_area.rs:1082`),
+            // and reporting it would let the panel grow by it and never shrink
+            // back after a section above it collapsed.
+            let elastic_filler = elastic::close_body(body_ui.ctx());
+            body_content_height = (scroll.content_size.y - elastic_filler).max(0.0);
             if self.pinned_bottom {
                 // After the scroll area, so it sits under it; its height is read
                 // back as next frame's reserve. Nothing here is faded: the scroll
@@ -2361,5 +2378,91 @@ mod tests {
             (grown_request - settled_request).abs() < 0.5,
             "lag frame {grown_request} vs settled {settled_request}"
         );
+    }
+
+    /// One frame of [`probe_elastic`]: the panel's output and the section's rect.
+    struct ElasticFrame {
+        output: CollapsiblePanelOutput,
+        section: Rect,
+    }
+
+    /// Draws a panel at `rect` for one frame per entry of `sections` in ONE
+    /// context: `above` points of scroll content, then a block of that entry's
+    /// height — through [`elastic::bottom_aligned`] when `elastic`, plainly
+    /// otherwise.
+    fn probe_elastic(rect: Rect, above: f32, sections: &[f32], elastic: bool) -> Vec<ElasticFrame> {
+        let ctx = egui::Context::default();
+        let mut frames = Vec::new();
+        for &section_height in sections {
+            let mut frame = None;
+            // `FullOutput` carries this test's paint output only; nothing is
+            // rendered, so dropping it is the whole intent.
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                let headers = [PanelTabHeader {
+                    id: TabId::new("probe_tab"),
+                    title: "probe",
+                }];
+                let panel = CollapsiblePanel::new(PanelId::new(0), "probe")
+                    .geometry(SolvedPanel {
+                        rect,
+                        body_max_height: rect.height(),
+                        shrunk: false,
+                    })
+                    .tabs(&headers, Some(TabId::new("probe_tab")));
+                let mut section = Rect::NOTHING;
+                let output = panel.show_sections(ui.ctx(), |ui, part| {
+                    if !matches!(part, PanelSection::Scroll) {
+                        return;
+                    }
+                    let width = ui.available_width();
+                    ui.allocate_exact_size(Vec2::new(width, above), Sense::hover());
+                    let block = |ui: &mut egui::Ui| {
+                        ui.allocate_exact_size(Vec2::new(width, section_height), Sense::hover()).0
+                    };
+                    section = if elastic {
+                        elastic::bottom_aligned(ui, "probe_elastic_section", block)
+                    } else {
+                        block(ui)
+                    };
+                });
+                frame = Some(ElasticFrame { output, section });
+            })
+            .drop_without_applying_deltas();
+            frames.extend(frame);
+        }
+        frames
+    }
+
+    #[test]
+    fn an_elastic_filler_is_left_out_of_the_measured_request() {
+        let rect = probe_rect(400.0);
+        let aligned = probe_elastic(rect, 100.0, &[40.0; 3], true);
+        let plain = probe_elastic(rect, 100.0, &[40.0; 3], false);
+        let (aligned, plain) = (aligned.last().expect("frames ran"), plain.last().expect("frames ran"));
+        // The filler really is there: the section sits far below where the
+        // plain body draws it…
+        assert!(aligned.section.top() > plain.section.top() + 100.0, "{:?} vs {:?}", aligned.section, plain.section);
+        assert!(aligned.section.bottom() <= rect.bottom(), "{:?} vs {rect:?}", aligned.section);
+        // …and the request is exactly the one without it.
+        let aligned_request = aligned.output.measured_size.expect("expanded panel").y;
+        let plain_request = plain.output.measured_size.expect("expanded panel").y;
+        assert!(
+            (aligned_request - plain_request).abs() < 0.5,
+            "aligned {aligned_request} vs plain {plain_request}"
+        );
+    }
+
+    #[test]
+    fn a_collapsed_section_shrinks_the_request_despite_the_filler() {
+        let rect = probe_rect(400.0);
+        // A section 200 pt tall that collapses to 20 pt: no ratchet, the request
+        // follows the content down once the lag frame has passed.
+        let frames = probe_elastic(rect, 100.0, &[200.0, 200.0, 200.0, 20.0, 20.0], true);
+        let plain = probe_elastic(rect, 100.0, &[20.0; 3], false);
+        let settled = frames.last().expect("frames ran").output.measured_size.expect("expanded panel").y;
+        let plain = plain.last().expect("frames ran").output.measured_size.expect("expanded panel").y;
+        assert!((settled - plain).abs() < 0.5, "settled {settled} vs plain {plain}");
+        let tall = frames[2].output.measured_size.expect("expanded panel").y;
+        assert!(settled < tall - 100.0, "settled {settled} vs tall {tall}");
     }
 }

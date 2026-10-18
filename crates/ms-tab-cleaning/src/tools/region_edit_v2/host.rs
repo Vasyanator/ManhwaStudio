@@ -21,6 +21,10 @@ Main responsibilities:
   the answer into the frame's pending result or into a user-facing failure (D14)
 - run mask generation into the selected mask layer through the same region load
 - refuse a result whose size is not exactly the frame rect (D7), with a message and a log
+- finish a RAW engine answer (`EnginePoll::DoneRaw`): keep the unmarked region from the
+  hand-off, run the post-process on one latest-wins worker (`postprocess.rs`) and re-derive the
+  pending result whenever the engine's live post-process settings change
+  (`request_postprocess` before the frame pass, `poll_postprocess` after the engine poll)
 - own the marks mode (how the marks layer reaches the engine), keep it inside the selected
   engine's `marks_support()` and package the marks into each run (`prepare_run_marks`)
 - own the marks colour selector, and keep its eyedropper click from also painting
@@ -39,6 +43,8 @@ Key functions:
   (scrolled), host actions + engine run options (pinned)
 - `run_options_ctx()`: the host facts handed to `AiEngine::draw_run_options`
 - `start_run()`, `poll_region_load()`, `poll_engine()`: the three steps of one run
+- `accept_raw_result()`, `request_postprocess()` / `poll_postprocess()`: a raw answer's start
+  and the two halves of its per-frame drive
 - `apply_result()`: the only `&mut CanvasView` action
 - `select_engine()`: applies an engine's constraints and mask layers to the frame
 - `capture_clean_overlay()`: the clean chunk that is composited over the page crop
@@ -63,11 +69,12 @@ Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md` (§13).
 */
 
 use super::engine::{
-    AiEngine, EnginePoll, EngineRunRequest, MarksMode, MarksSupport, RunMarks, RunOptionsCtx, composite_marks_over,
+    AiEngine, EnginePoll, EngineRunRequest, MarksMode, MarksSupport, RawRegionResult, RunMarks, RunOptionsCtx, composite_marks_over,
 };
 use super::frame::{FrameHost, FrameLock, RegionFrame, page_source_size};
 use super::geometry::FrameConstraints;
-use super::layers::ResultLayer;
+use super::layers::{Lineage, ResultLayer};
+use super::postprocess::{Derived, PendingRaw, PostprocessFailure, RunCapture};
 use crate::tools::base::{
     CleaningTool, RegionLoadRequest, RegionLoadResult, capture_overlay_chunk, overlay_rect_to_scene_rect,
     spawn_region_loader_thread,
@@ -425,7 +432,18 @@ pub struct RegionEditHost {
     pub(super) marks_selector_drawn: bool,
     /// `Some` while a run that composited the marks into its region is in flight: what
     /// `accept_result` needs to take them back out of the answer. Dropped with the run.
+    /// Never set for an engine whose answer is raw: `run_capture` covers the marks there.
     marks_restore: Option<MarksRestore>,
+    /// `Some` while a run of an engine that answers RAW pixels (`postprocess_settings()` is
+    /// `Some`) is in flight: the unmarked region (the composite base) and the marked one it was
+    /// sent (the colour-match reference). Taken by `accept_raw_result`; dropped with the run.
+    run_capture: Option<RunCapture>,
+    /// `Some` from a raw answer until the result is applied or cancelled: the post-process
+    /// worker that derives the pending result, and re-derives it when the settings change.
+    pending_raw: Option<PendingRaw>,
+    /// The lineage id of the newest `PendingRaw` (one per raw answer): a result layer uploads
+    /// only a patch for a re-derivation of the SAME pending result (`ResultLayer::replace_image`).
+    raw_lineage: u64,
     /// The binding texts of the brush hints (`set_input_labels`).
     pub(super) labels: Arc<CleaningLabels>,
 }
@@ -487,6 +505,9 @@ impl RegionEditHost {
             marks_presets: marks_color_presets(),
             marks_selector_drawn: false,
             marks_restore: None,
+            run_capture: None,
+            pending_raw: None,
+            raw_lineage: 0,
             labels: Arc::default(),
         }
     }
@@ -926,9 +947,14 @@ impl RegionEditHost {
         }
         let frame_masks = self.frame.masks();
         let marks_empty = frame_masks.marks_is_empty();
+        let marked_overlay = mode == MarksMode::OverlayOnRegion && !marks_empty;
+        // Decided at hand-off and frozen for the run: an engine answers raw pixels exactly when
+        // it publishes post-process settings (`AiEngine::postprocess_settings`).
+        let raw_answer = self.engine().is_some_and(|engine| engine.postprocess_settings().is_some());
         // Overlay mode puts the marks INTO the picture the engine edits; the unmarked region is
-        // kept so `accept_result` can take every untouched mark back out of the answer.
-        let original = (mode == MarksMode::OverlayOnRegion && !marks_empty).then(|| region.clone());
+        // kept so `accept_result` can take every untouched mark back out of the answer. A raw
+        // answer always keeps it: it is the base the host composites the model output over.
+        let original = (marked_overlay || raw_answer).then(|| region.clone());
         let (region, marks) = match prepare_run_marks(mode, region, frame_masks.marks_rgba(), marks_empty) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -939,7 +965,11 @@ impl RegionEditHost {
                 return;
             }
         };
-        let restore = original.map(|original| MarksRestore { original, sent: region.clone() });
+        let (restore, capture) = match original {
+            Some(original) if raw_answer => (None, Some(RunCapture::new(original, marked_overlay.then(|| region.clone())))),
+            Some(original) => (Some(MarksRestore { original, sent: region.clone() }), None),
+            None => (None, None),
+        };
         let request = EngineRunRequest {
             page_idx: pending.page_idx,
             rect_px: rect,
@@ -954,6 +984,7 @@ impl RegionEditHost {
         match outcome {
             Ok(()) => {
                 self.marks_restore = restore;
+                self.run_capture = capture;
                 self.report_info(t!("cleaning.tools.area_editor.run_started_status").to_string());
             }
             Err(reason) => {
@@ -1066,9 +1097,24 @@ impl RegionEditHost {
         match poll {
             // A run that is still going, or none at all: the frame's own lock already says so.
             EnginePoll::Idle | EnginePoll::Running => {}
-            EnginePoll::Done(image) => self.accept_result(image),
+            EnginePoll::Done(image) => {
+                if self.run_capture.take().is_some() {
+                    // The engine published post-process settings at hand-off and then answered
+                    // final pixels: whichever half is wrong, the host cannot tell which picture
+                    // it got, so the answer is refused rather than shown.
+                    self.frame.set_processing(false);
+                    self.report_error(
+                        t!("cleaning.tools.area_editor.error_postprocess").to_string(),
+                        &"contract violation: an engine with post-process settings answered final pixels (Done)",
+                    );
+                    return;
+                }
+                self.accept_result(image);
+            }
+            EnginePoll::DoneRaw(raw) => self.accept_raw_result(ctx, raw),
             EnginePoll::Failed(reason) => {
                 self.marks_restore = None;
+                self.run_capture = None;
                 self.frame.set_processing(false);
                 self.report_error(reason, &"the engine reported a failed run");
             }
@@ -1114,6 +1160,130 @@ impl RegionEditHost {
         self.report_info(t!("cleaning.tools.area_editor.result_ready_status").to_string());
     }
 
+    /// Starts the post-process of a RAW answer (D7 size check first). The frame stays
+    /// `Processing` until the first derivation lands in `poll_postprocess`, which only then
+    /// sets the pending result — so a slow first derivation reads as part of the run and can be
+    /// cancelled like one.
+    ///
+    /// Refused, with a log, when the run kept no capture (the engine published no post-process
+    /// settings at hand-off) or publishes none now: both mean the engine broke the
+    /// `DoneRaw` <-> `postprocess_settings` pairing.
+    fn accept_raw_result(&mut self, ctx: &egui::Context, raw: RawRegionResult) {
+        let capture = self.run_capture.take();
+        self.marks_restore = None;
+        let refuse = |host: &mut Self, detail: &dyn std::fmt::Display| {
+            host.frame.set_processing(false);
+            host.report_error(t!("cleaning.tools.area_editor.error_postprocess").to_string(), detail);
+        };
+        let Some(rect) = self.frame.rect_px() else {
+            self.frame.set_processing(false);
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_no_frame").to_string(),
+                &"a raw result arrived for a frame that has no rectangle",
+            );
+            return;
+        };
+        if raw.image.size != [rect.w, rect.h] {
+            self.frame.set_processing(false);
+            self.report_error(
+                t!("cleaning.tools.area_editor.error_size_mismatch").to_string(),
+                &format!(
+                    "the engine answered {}x{} raw, the frame region is {}x{}",
+                    raw.image.size[0], raw.image.size[1], rect.w, rect.h
+                ),
+            );
+            return;
+        }
+        let Some(capture) = capture else {
+            refuse(self, &"contract violation: a raw answer (DoneRaw) for a run that kept no capture");
+            return;
+        };
+        let Some(settings) = self.engine().and_then(AiEngine::postprocess_settings) else {
+            refuse(self, &"contract violation: a raw answer (DoneRaw) from an engine without post-process settings");
+            return;
+        };
+        self.raw_lineage = self.raw_lineage.wrapping_add(1);
+        match PendingRaw::start(ctx, capture, raw, settings, self.spec.log_tag, self.raw_lineage) {
+            Ok(pending) => self.pending_raw = Some(pending),
+            Err(error) => refuse(self, &error),
+        }
+    }
+
+    /// The request half of a pending raw result's per-frame drive, run BEFORE the frame pass:
+    /// forwards the engine's live post-process settings (changed by this frame's panel body,
+    /// which ran earlier inside `CanvasView::draw`) and tells the frame whether a derivation is
+    /// in flight. Running it before the pass is what keeps an apply clicked in the same frame
+    /// as a settings change from merging the previous settings' image: the pass folds a queued
+    /// apply, and draws its own button, against `buttons()`, which reads this flag. A no-op
+    /// without a pending raw result; `processing` is never touched for a re-derivation.
+    fn request_postprocess(&mut self) {
+        let Some(pending) = self.pending_raw.as_mut() else {
+            return;
+        };
+        if let Some(settings) = self.engines.get(self.selected).and_then(|engine| engine.postprocess_settings()) {
+            pending.request(settings);
+        }
+        self.frame.set_result_settling(pending.settling());
+    }
+
+    /// The poll half of a pending raw result's per-frame drive (pass step 5, after
+    /// `poll_engine`): shows the derivation of the newest requested settings and updates the
+    /// frame's settling flag (a raw answer that landed this frame starts its derivation here).
+    /// A no-op without a pending raw result.
+    ///
+    /// The first derivation turns the still-`Processing` frame into `ResultPending`; a later
+    /// one replaces the shown pixels in place. A failure is logged and shown: the first one
+    /// releases the frame with no result, a later one keeps the last good result as a final
+    /// one (no further re-derivation), so «Применить» is never left closed for good.
+    ///
+    /// No repaint is scheduled here: the worker wakes the GUI after every answer and when it
+    /// exits (`postprocess.rs`), so a landed derivation is polled on the very next frame.
+    fn poll_postprocess(&mut self) {
+        let Some(pending) = self.pending_raw.as_mut() else {
+            return;
+        };
+        match pending.poll() {
+            None => {}
+            Some(Ok(derived)) => self.show_derived(derived),
+            Some(Err(error)) => self.fail_postprocess(&error),
+        }
+        let settling = self.pending_raw.as_ref().is_some_and(PendingRaw::settling);
+        self.frame.set_result_settling(settling);
+    }
+
+    /// Puts a finished derivation on screen: the pending result's first image, or a
+    /// replacement of the shown one (a patch upload when it replaces an image of the same
+    /// pending result, see `raw_lineage`).
+    fn show_derived(&mut self, derived: Derived) {
+        let lineage = self.pending_raw.as_ref().map(PendingRaw::lineage);
+        let Derived { image, patch } = derived;
+        if self.frame.result().is_none() {
+            self.frame.set_processing(false);
+            let layer = ResultLayer::new(image);
+            self.frame.set_result(Some(match lineage {
+                Some(id) => layer.in_lineage(id),
+                None => layer,
+            }));
+            self.report_info(t!("cleaning.tools.area_editor.result_ready_status").to_string());
+            return;
+        }
+        let size = image.size;
+        if !self.frame.replace_result_image(image, lineage.map(|id| Lineage { id, patch })) {
+            let shown = self.frame.result().map(ResultLayer::size);
+            self.fail_postprocess(&PostprocessFailure::Shape(format!("a {}x{} derivation for the shown {shown:?} result", size[0], size[1])));
+        }
+    }
+
+    /// Reports a failed derivation and drops the pending raw result (see `poll_postprocess`).
+    fn fail_postprocess(&mut self, error: &PostprocessFailure) {
+        self.pending_raw = None;
+        if self.frame.result().is_none() {
+            self.frame.set_processing(false);
+        }
+        self.frame.set_result_settling(false);
+        self.report_error(t!("cleaning.tools.area_editor.error_postprocess").to_string(), error);
+    }
+
     /// Abandons everything in flight: the engine's run, a mask detection, the region load that
     /// precedes either, and a queued generation request.
     ///
@@ -1123,6 +1293,9 @@ impl RegionEditHost {
     fn cancel_run(&mut self) {
         self.pending_load = None;
         self.marks_restore = None;
+        self.run_capture = None;
+        // Dropping it stops the post-process worker after the render in hand.
+        self.pending_raw = None;
         self.mask_generation_rx = None;
         self.generate_mask_requested = false;
         if let Some(engine) = self.engine_mut() {
@@ -1144,6 +1317,14 @@ impl RegionEditHost {
             );
             return;
         };
+        if self.frame.result_settling() {
+            // `FrameButtons::apply` is closed while settling, so a queued apply is already
+            // dropped by the frame; restated where it is enforceable. Applying now would merge
+            // an image the post-process settings no longer describe.
+            ms_log::runtime_log::log_warn(format!("{} apply refused: the result is still being re-derived", self.spec.log_tag));
+            self.report_info(t!("cleaning.region_frame.status.result_settling").to_string());
+            return;
+        }
         let Some(result) = self.frame.result() else {
             self.report_error(
                 t!("cleaning.tools.area_editor.error_no_result").to_string(),
@@ -1166,6 +1347,8 @@ impl RegionEditHost {
             return;
         }
         self.frame.reset();
+        self.pending_raw = None;
+        self.run_capture = None;
         self.report_info(t!("cleaning.tools.area_editor.applied_status").to_string());
     }
 }
@@ -1276,8 +1459,15 @@ impl CleaningTool for RegionEditHost {
     ///    to an engine that treats that as "a different image" and cancels the run.
     /// 3. the outcome is acted on, then the load and the engine are polled, so a run started
     ///    this frame gets its first poll in the next one, never inside its own start.
+    /// 4. the post-process settings are requested BEFORE the pass (`request_postprocess`) and
+    ///    polled AFTER the engine poll (`poll_postprocess`): the pass must see this frame's
+    ///    settling flag, and a raw answer from this frame's engine poll starts its derivation
+    ///    at once.
     fn draw_overlay_ui(&mut self, ctx: &egui::Context, canvas: &mut CanvasView, project: &ProjectData, input: &InputFrame) {
         self.push_engine_rules();
+        // Before the pass too: a post-process change made in this frame's panel closes
+        // «Применить» before the pass folds or draws an apply (see `request_postprocess`).
+        self.request_postprocess();
 
         let host = FrameHost {
             panel_rects: &self.panel_rects,
@@ -1324,6 +1514,8 @@ impl CleaningTool for RegionEditHost {
         self.poll_region_load();
         self.poll_mask_generation(ctx);
         self.poll_engine(ctx);
+        // After the engine poll: a raw answer that landed this frame starts its derivation now.
+        self.poll_postprocess();
     }
 
     /// The frame's context (its gestures, marks-rectangle mode, stroke undo) and
@@ -1355,6 +1547,7 @@ mod tests {
     use super::super::frame::PaintTarget;
     use super::super::geometry::SizeViolation;
     use crate::tools::mask_generation::{MaskGenerationMessage, MaskGenerationParams, WatermarkProgress};
+    use ms_region_postprocess::PostprocessSettings;
     use egui::Color32;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -1509,6 +1702,7 @@ mod tests {
             switch_block: None,
             grid: Arc::clone(&grid),
             marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
+            postprocess: Arc::new(Mutex::new(None)),
         })];
         tool.selected = 0;
         tool.frame.place_for_test(0, rect(0, 0, 12, 20));
@@ -1799,6 +1993,10 @@ mod tests {
         /// What its `marks_support()` answers, shared for the same reason as `grid`. The
         /// trait default (overlay only) everywhere else.
         marks: Arc<Mutex<MarksSupport>>,
+        /// What its `postprocess_settings()` answers, shared so a test can edit the live
+        /// settings of a pending raw result. `None` (the trait default, final pixels) everywhere
+        /// but the raw-answer tests.
+        postprocess: Arc<Mutex<Option<PostprocessSettings>>>,
     }
 
     impl RecordingEngine {
@@ -1810,6 +2008,7 @@ mod tests {
                 switch_block: None,
                 grid: Arc::new(AtomicUsize::new(1)),
                 marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
+                postprocess: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1822,6 +2021,7 @@ mod tests {
                 switch_block: None,
                 grid: Arc::new(AtomicUsize::new(1)),
                 marks: Arc::clone(&marks),
+                postprocess: Arc::new(Mutex::new(None)),
             };
             (engine, marks)
         }
@@ -1867,6 +2067,9 @@ mod tests {
         fn marks_support(&self) -> MarksSupport {
             *recorded(&self.marks)
         }
+        fn postprocess_settings(&self) -> Option<PostprocessSettings> {
+            *recorded(&self.postprocess)
+        }
         fn start(&mut self, request: EngineRunRequest) -> Result<(), String> {
             let mut calls = recorded(&self.calls);
             calls.started = Some((request.page_idx, request.region.size[0], request.masks.len()));
@@ -1905,6 +2108,7 @@ mod tests {
             switch_block: None,
             grid: Arc::new(AtomicUsize::new(1)),
             marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
+            postprocess: Arc::new(Mutex::new(None)),
         })];
         tool.selected = 0;
         (tool, calls)
@@ -1922,6 +2126,7 @@ mod tests {
             switch_block: reason.map(str::to_string),
             grid: Arc::new(AtomicUsize::new(1)),
             marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
+            postprocess: Arc::new(Mutex::new(None)),
         };
         let mut tool = test_host();
         tool.engines = vec![Box::new(busy(Some("downloading"))), Box::new(busy(None))];
@@ -2006,6 +2211,7 @@ mod tests {
             switch_block: None,
             grid: Arc::new(AtomicUsize::new(1)),
             marks: Arc::clone(&marks),
+            postprocess: Arc::new(Mutex::new(None)),
         })];
         tool.selected = 0;
         tool.marks_mode = MarksMode::SeparateReference;
@@ -2287,5 +2493,217 @@ mod tests {
             assert!(tool.apply_input(frame));
         });
         assert!(tool.frame.masks().is_blank(), "the stroke is undone");
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Raw answers and the live post-process
+    // -----------------------------------------------------------------------------------
+
+    /// Settings with a hard edge and no colour match: the derived result is then exactly
+    /// "original outside the mask, model pixel inside it", which the tests can state.
+    const HARD_EDGE: PostprocessSettings = PostprocessSettings { mask_feather_px: 0, color_match: false, color_match_local_pct: 0, color_match_scale_px: 24 };
+
+    const GREY: Color32 = Color32::from_rgb(90, 90, 90);
+    const MODEL_RED: Color32 = Color32::from_rgb(200, 0, 0);
+
+    /// A recording engine that publishes `postprocess` (raw answers) and answers `answer` once.
+    fn raw_engine(answer: EnginePoll, postprocess: &Arc<Mutex<Option<PostprocessSettings>>>) -> RecordingEngine {
+        RecordingEngine {
+            calls: Arc::new(Mutex::new(EngineCalls::default())),
+            answer,
+            switch_block: None,
+            grid: Arc::new(AtomicUsize::new(1)),
+            marks: Arc::new(Mutex::new(MarksSupport::OVERLAY_ONLY)),
+            postprocess: Arc::clone(postprocess),
+        }
+    }
+
+    /// An 8x8 frame with a 4x4 mask block in its centre; the run is handed over a grey region,
+    /// so the host holds a capture. Returns the tool, the shared settings and the run mask.
+    fn raw_run(settings: PostprocessSettings) -> (RegionEditHost, Arc<Mutex<Option<PostprocessSettings>>>, Vec<u8>) {
+        let postprocess = Arc::new(Mutex::new(Some(settings)));
+        let mut tool = test_host();
+        tool.engines = vec![Box::new(raw_engine(EnginePoll::Idle, &postprocess))];
+        tool.selected = 0;
+        tool.frame.place_for_test(0, rect(0, 0, 8, 8));
+        let mask: Vec<u8> = (0..64).map(|idx| if (2..6).contains(&(idx % 8)) && (2..6).contains(&(idx / 8)) { 255 } else { 0 }).collect();
+        assert!(tool.frame.masks_mut().set_active_from_alpha(&mask));
+        tool.frame.set_processing(true);
+        tool.hand_region_to_engine(PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 8, 8), purpose: LoadPurpose::Run }, egui::ColorImage::filled([8, 8], GREY));
+        assert!(tool.run_capture.is_some(), "a raw-answer engine's run keeps the unmarked region");
+        assert!(tool.marks_restore.is_none(), "the capture replaces the marks restore");
+        (tool, postprocess, mask)
+    }
+
+    /// The model's raw answer for `mask`: red everywhere (a VAE round trip repaints every pixel).
+    fn raw_answer(mask: Vec<u8>) -> RawRegionResult {
+        RawRegionResult { image: egui::ColorImage::filled([8, 8], MODEL_RED), mask, sample_mask: None, whole_region: false }
+    }
+
+    /// One frame's post-process drive, in `draw_overlay_ui`'s order: the request half before
+    /// the pass, the poll half after the engine poll.
+    fn drive(tool: &mut RegionEditHost) {
+        tool.request_postprocess();
+        tool.poll_postprocess();
+    }
+
+    /// Drives the post-process until no derivation is in flight and a result is shown.
+    fn settle(tool: &mut RegionEditHost) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            drive(tool);
+            if tool.pending_raw.as_ref().is_none_or(|pending| !pending.settling()) && tool.frame.result().is_some() {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "the post-process never settled: {:?}", tool.message);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// A `DoneRaw` answer goes through the engine poll and the worker: the frame stays
+    /// `Processing` until the first derivation lands, then holds the derived result.
+    #[test]
+    fn a_raw_answer_lands_as_a_result_after_the_worker() {
+        let ctx = egui::Context::default();
+        let (mut tool, postprocess, mask) = raw_run(HARD_EDGE);
+        tool.engines = vec![Box::new(raw_engine(EnginePoll::DoneRaw(raw_answer(mask.clone())), &postprocess))];
+        tool.poll_engine(&ctx);
+        assert!(tool.pending_raw.is_some(), "the raw answer started the post-process");
+        assert!(tool.run_capture.is_none(), "the capture moved into the worker");
+        assert_eq!(tool.frame.lock(), FrameLock::Processing, "no result before the first derivation");
+        settle(&mut tool);
+        assert_eq!(tool.frame.lock(), FrameLock::ResultPending);
+        assert!(tool.frame.buttons().apply);
+        let shown = tool.frame.result().expect("the derived result is pending").image();
+        for (idx, pixel) in shown.pixels.iter().enumerate() {
+            let expected = if mask[idx] == 0 { GREY } else { MODEL_RED };
+            assert_eq!(*pixel, expected, "pixel {idx}");
+        }
+    }
+
+    /// A settings change while the result is pending re-derives it in place: «Применить» is
+    /// closed while the recompute runs and opens again with the new pixels.
+    #[test]
+    fn a_settings_change_replaces_the_pending_result() {
+        let ctx = egui::Context::default();
+        let (mut tool, postprocess, mask) = raw_run(HARD_EDGE);
+        tool.accept_raw_result(&ctx, raw_answer(mask.clone()));
+        settle(&mut tool);
+        let before = tool.frame.result().expect("pending").image().clone();
+
+        *recorded(&postprocess) = Some(PostprocessSettings { mask_feather_px: 3, ..HARD_EDGE });
+        drive(&mut tool);
+        assert!(tool.frame.result_settling(), "the change is being derived");
+        let buttons = tool.frame.buttons();
+        assert!(!buttons.apply && buttons.compare && buttons.cancel, "{buttons:?}");
+        assert_eq!(tool.frame.lock(), FrameLock::ResultPending, "a re-derivation never toggles `processing`");
+        assert!(tool.frame.status_text() == t!("cleaning.region_frame.status.result_settling"));
+
+        settle(&mut tool);
+        drive(&mut tool);
+        assert!(!tool.frame.result_settling());
+        assert!(tool.frame.buttons().apply);
+        let after = tool.frame.result().expect("still pending").image();
+        assert_ne!(after.pixels, before.pixels, "the feather changed the edge of the mask");
+        for (idx, pixel) in after.pixels.iter().enumerate() {
+            if mask[idx] == 0 {
+                assert_eq!(*pixel, GREY, "outside the mask nothing changes: pixel {idx}");
+            }
+        }
+    }
+
+    /// A settings change and an apply in the SAME frame: the request half (run before the
+    /// frame pass) already closes «Применить», so the pass drops the queued apply instead of
+    /// merging the image of the previous settings, and nothing about it waits for the poll.
+    #[test]
+    fn an_apply_in_the_frame_of_a_settings_change_is_dropped() {
+        let ctx = egui::Context::default();
+        let (mut tool, postprocess, mask) = raw_run(HARD_EDGE);
+        tool.accept_raw_result(&ctx, raw_answer(mask));
+        settle(&mut tool);
+        assert!(tool.frame.buttons().apply, "the settled result can be applied");
+
+        // This frame's panel body: a dial changes and «Применить» is queued.
+        *recorded(&postprocess) = Some(PostprocessSettings { mask_feather_px: 5, ..HARD_EDGE });
+        tool.frame.request_apply();
+        // `draw_overlay_ui` before the pass.
+        tool.request_postprocess();
+        assert!(tool.frame.result_settling(), "the change is in flight before the pass runs");
+        assert!(!tool.frame.buttons().apply, "the pass folds the queued apply against a closed button");
+    }
+
+    /// «Отменить» drops the worker and everything the run kept.
+    #[test]
+    fn cancelling_drops_the_post_process() {
+        let ctx = egui::Context::default();
+        let (mut tool, _postprocess, mask) = raw_run(HARD_EDGE);
+        tool.accept_raw_result(&ctx, raw_answer(mask));
+        settle(&mut tool);
+        tool.cancel_run();
+        assert!(tool.pending_raw.is_none() && tool.run_capture.is_none());
+        assert!(!tool.frame.result_settling());
+        assert!(tool.frame.result().is_none());
+        drive(&mut tool);
+        assert!(tool.frame.result().is_none(), "nothing comes back after a cancel");
+    }
+
+    /// In overlay-marks mode the model saw the marks, but the composite base is the UNMARKED
+    /// region: outside the mask, a mark never reaches the result.
+    #[test]
+    fn an_overlay_raw_run_keeps_the_unmarked_original_outside_the_mask() {
+        let ctx = egui::Context::default();
+        let postprocess = Arc::new(Mutex::new(Some(HARD_EDGE)));
+        let engine = raw_engine(EnginePoll::Idle, &postprocess);
+        let calls = Arc::clone(&engine.calls);
+        let mut tool = test_host();
+        tool.engines = vec![Box::new(engine)];
+        tool.selected = 0;
+        tool.marks_mode = MarksMode::OverlayOnRegion;
+        tool.frame.place_for_test(0, rect(0, 0, 8, 8));
+        let mask: Vec<u8> = (0..64).map(|idx| if idx >= 32 { 255 } else { 0 }).collect();
+        assert!(tool.frame.masks_mut().set_active_from_alpha(&mask));
+        // A mark on row 0 (outside the mask) and one on row 6 (inside it).
+        tool.frame.masks_mut().paint_marks_boxes(&[(0, 0, 3, 1), (0, 6, 3, 7)], Color32::BLUE, false);
+        tool.frame.set_processing(true);
+        tool.hand_region_to_engine(PendingLoad { job_id: 1, page_idx: 0, rect: rect(0, 0, 8, 8), purpose: LoadPurpose::Run }, egui::ColorImage::filled([8, 8], GREY));
+        let sent = recorded(&calls).run_region.clone().expect("the run started");
+        assert_eq!(sent.pixels[0], Color32::BLUE, "the model saw the marks");
+        assert_eq!(sent.pixels[6 * 8], Color32::BLUE, "inside the mask too");
+        // The model hands every pixel back repainted: the marks it got, plus red in the mask.
+        let mut image = sent.clone();
+        for (idx, pixel) in image.pixels.iter_mut().enumerate() {
+            if mask[idx] != 0 {
+                *pixel = MODEL_RED;
+            }
+        }
+        tool.accept_raw_result(&ctx, RawRegionResult { image, mask: mask.clone(), sample_mask: None, whole_region: false });
+        settle(&mut tool);
+        let shown = tool.frame.result().expect("pending").image();
+        for (idx, pixel) in shown.pixels.iter().enumerate() {
+            let expected = if mask[idx] == 0 { GREY } else { MODEL_RED };
+            assert_eq!(*pixel, expected, "pixel {idx}");
+        }
+    }
+
+    /// The two halves of the `DoneRaw` <-> `postprocess_settings` pairing: a raw answer for a
+    /// run that kept nothing, and final pixels for a run that kept a capture, are both refused.
+    #[test]
+    fn a_broken_raw_pairing_is_refused() {
+        let ctx = egui::Context::default();
+        let mut tool = test_host();
+        tool.frame.place_for_test(0, rect(0, 0, 8, 8));
+        tool.frame.set_processing(true);
+        tool.accept_raw_result(&ctx, raw_answer(vec![255; 64]));
+        assert!(tool.pending_raw.is_none() && tool.frame.result().is_none());
+        assert_eq!(tool.frame.lock(), FrameLock::Free, "the refusal releases the frame");
+        assert!(tool.message.as_ref().is_some_and(|message| message.error));
+
+        let (mut tool, postprocess, _mask) = raw_run(HARD_EDGE);
+        tool.engines = vec![Box::new(raw_engine(EnginePoll::Done(egui::ColorImage::filled([8, 8], MODEL_RED)), &postprocess))];
+        tool.poll_engine(&ctx);
+        assert!(tool.frame.result().is_none(), "final pixels from a raw-answer run are refused");
+        assert!(tool.run_capture.is_none());
+        assert!(tool.message.as_ref().is_some_and(|message| message.error));
+        assert_ne!(tool.frame.lock(), FrameLock::Processing, "the refusal releases the frame");
     }
 }

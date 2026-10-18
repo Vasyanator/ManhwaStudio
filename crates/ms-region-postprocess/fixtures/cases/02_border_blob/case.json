@@ -1,0 +1,56 @@
+{
+  "effective": {
+    "feather_px": 32,
+    "global_match": true,
+    "local_scale_px": 8,
+    "local_strength_pct": 100
+  },
+  "global_margin_samples": 15995,
+  "global_path": "margin",
+  "global_unmargined_samples": 17083,
+  "height": 96,
+  "local_path": "applied",
+  "local_valid_samples": 16553,
+  "mask_pixels": 7493,
+  "name": "02_border_blob",
+  "patched_diagnostics": {
+    "expected_cv2_helpers_vs_fallbacks": {
+      "differing_values": 0,
+      "max_abs": 0,
+      "p99_abs": 0
+    },
+    "local_cv2_helpers_vs_fallbacks": {
+      "differing_values": 0,
+      "max_abs": 0,
+      "p99_abs": 0
+    }
+  },
+  "reference_distinct": false,
+  "sample_mask_distinct": false,
+  "sample_mask_rule": "mask",
+  "settings": {
+    "color_match": true,
+    "color_match_local_pct": 100,
+    "color_match_scale_px": 8,
+    "mask_feather_px": 32
+  },
+  "unpatched_deviation": {
+    "alpha": {
+      "differing_values": 1641,
+      "max_abs": 5,
+      "p99_abs": 3
+    },
+    "expected": {
+      "differing_values": 1500,
+      "max_abs": 3,
+      "p99_abs": 1
+    },
+    "local": {
+      "differing_values": 3501,
+      "max_abs": 2,
+      "p99_abs": 1
+    }
+  },
+  "whole_region": false,
+  "width": 256
+}

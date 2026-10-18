@@ -174,6 +174,31 @@ because all three closures borrow the same `&mut C`. Rules:
 * A tab without pinned sections is drawn exactly as before (`CollapsiblePanel::show` is
   `show_sections` with the scroll section only).
 
+**Bottom-aligned last section** (`elastic.rs`). A section that must sit at the very BOTTOM of the
+scroll viewport while the body is shorter than it — and simply follow the content once the body
+scrolls — is drawn with `elastic::bottom_aligned(ui, id_salt, |ui| …)` as the LAST thing of the
+body. It inserts a filler of `floor(available - last height - 1)` points above the section; the
+1 pt slack keeps the content strictly inside the ceiled viewport, so no phantom scroll bar shows.
+Rules:
+
+* **The filler is not content.** `CollapsiblePanel::contents` brackets the scroll body with
+  `elastic::open_body` / `close_body` (a stack in one global egui temp slot, valid only between
+  the two calls) and subtracts the summed filler from `content_size.y`, so the request is the one
+  the body makes without it. A plain `add_space` would be counted by egui and the panel could
+  grow by it and never shrink back after a section above collapsed.
+* **One-frame lag on the section's own height.** It is placed from last frame's height (egui temp
+  data under `ui.make_persistent_id(id_salt)`); a section seen for the first time follows the
+  content, and a change of at least the slack repaints, so the placement settles next frame.
+* **A growing section never grows the scroll content.** While a filler is in place the section
+  is drawn in a non-allocating child `Ui` and only its part above the room's bottom (less the
+  slack) is allocated, so a section that grew since last frame — a collapsing header animating
+  open grows on every frame of its animation — is clipped by at most that growth for one frame
+  instead of flashing a scroll bar; the child is the one `Ui::scope` would build, so its ids
+  and fold states are a scope's.
+* Drawn outside a dock body (a pinned section, a plain window) it still aligns and reports
+  nothing. Never inside a nested `ScrollArea` of the body: the free room is measured against the
+  calling `Ui`'s `max_rect`.
+
 ## Files and submodules
 - `mod.rs`: the public re-export surface, `PanelDockState`, `DockArea`, `PanelDock`,
   `PanelDockOutput`, and the three pure frame-planning helpers (`ensure_declared_tabs`,
@@ -190,6 +215,9 @@ because all three closures borrow the same `&mut C`. Rules:
   Pure like `model.rs` / `solver.rs`: no egui type, no I/O, unit-testable. Edit it to change what a
   bag may hold or what counts as a change.
 - `tab.rs`: widget #1, `PanelTab` — the per-frame declaration builder returned by `PanelDock::tab`.
+- `elastic.rs`: `bottom_aligned` — a body's last section placed at the bottom of the viewport
+  through a filler the panel excludes from its measurement (see «Bottom-aligned last section»),
+  and the `open_body` / `close_body` bracket `panel.rs` draws the scroll body inside.
 - `panel.rs`: widget #2, `CollapsiblePanel` — draws ONE panel (header strip, active tab's body,
   resize grip, header drag handle, tab drop zone, and the two context menus) and reports what the
   user did through `CollapsiblePanelOutput` / `TabDrop` / `MoveTargetEntry`. It never touches the
@@ -950,6 +978,9 @@ content.
   `mod.rs`. Pinned sections: the budget split is `scroll_budget` / `CollapsiblePanel::contents`
   in `panel.rs`, the per-tab height cache and the repaint rule (`pinned_height_changed`) are in
   `mod.rs`.
+- To change how a bottom-aligned section is placed (slack, lag, repaint rule) edit `elastic.rs`;
+  the subtraction of its filler from the measured content height is in
+  `CollapsiblePanel::contents` (`panel.rs`), next to `elastic::open_body` / `close_body`.
 - To change the frame model (which sizes are fed to the solver, which panels are solved, which tab
   is drawn, when a repaint is requested), edit `plan_frame` / `frame_layout` / `PanelDock::end` in
   `mod.rs`. All planning helpers are pure and unit-tested; keep new decisions inside them rather

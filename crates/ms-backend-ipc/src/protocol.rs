@@ -84,7 +84,14 @@ use serde_json::{Map, Value, json};
 /// `color_match_scale_px` (integer 8..=96, absent = 24) in the `inpaint.flux2_klein*` and
 /// `inpaint.flux3_klein*` params (the low-frequency Lab mean/contrast match inside the mask,
 /// applied after the global `color_match` and only under it).
-pub const PROTOCOL_VERSION: u32 = 16;
+/// 17: the FLUX.2 klein and FLUX.3 klein region post-processing is the client's: both
+/// answers are the RAW generated region (RGB PNG; no colour match, no composite, so outside
+/// the mask the FLUX.2 answer is a VAE round trip); the `inpaint.flux2_klein` mask is the
+/// latent mask, already dilated by the client, and its params refuse `mask_dilate_px`,
+/// `mask_feather_px`, `color_match`, `color_match_local_pct`, `color_match_scale_px` by name;
+/// those four post fields are unknown keys of the `inpaint.flux3_klein` params (refused), whose
+/// mask is validated only; the FLUX.3 decode rounds to `u8` instead of truncating.
+pub const PROTOCOL_VERSION: u32 = 17;
 
 // ============================================================================
 // FRAME SIZE GUARDS

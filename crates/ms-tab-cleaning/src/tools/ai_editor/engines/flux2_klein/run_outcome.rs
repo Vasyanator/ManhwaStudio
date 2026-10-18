@@ -2,8 +2,9 @@
 File: cleaning/tools/ai_editor/engines/flux2_klein/run_outcome.rs
 
 Purpose:
-What one FLUX.2 klein run answers with, as the run worker hands it to the engine: the
-regenerated region, whether the backend recovered from an out-of-memory failure, the one
+What one FLUX.2 klein run answers with, as the run worker hands it to the engine: the RAW
+regenerated region with the mask it ran under and the latent mask the model saw (the host
+post-processes them), whether the backend recovered from an out-of-memory failure, the one
 memory flag of `applied` this side writes back, and a degraded run's effective steps.
 
 Key structures:
@@ -31,10 +32,14 @@ pub(super) struct Flux2AppliedFlags {
     pub(super) vae_tiling: Option<bool>,
 }
 
-/// One finished generation: the regenerated region plus what the backend reports about
+/// One finished generation: the RAW regenerated region plus what the backend reports about
 /// how it got there.
 pub(super) struct Flux2RunOutcome {
+    /// The backend's raw decode, exactly the region size and opaque.
     pub(super) image: egui::ColorImage,
+    /// The L8 0/255 latent mask the run sent (the painted mask dilated by `mask_dilate_px`),
+    /// region-sized; the host's colour-match sample mask.
+    pub(super) latent_mask: Vec<u8>,
     /// The backend hit an out-of-memory failure during the VAE decode and recovered
     /// from it without re-running the denoising.
     pub(super) oom_recovered: bool,
@@ -44,10 +49,13 @@ pub(super) struct Flux2RunOutcome {
     pub(super) degraded: Option<RunDegraded>,
 }
 
-/// Message the run worker sends back. `source` is the region the run started from and
-/// becomes the undo entry.
+/// Message the run worker sends back: the run's facts the host post-processes with (moved
+/// out of the run input once the call is over) and the call's outcome.
 pub(super) struct Flux2JobResult {
-    pub(super) source: egui::ColorImage,
+    /// The mask the run used (`mask_for_run` output): nonzero = the pixel may change.
+    pub(super) mask: Vec<u8>,
+    /// The run regenerated the whole region (nothing painted).
+    pub(super) whole_region: bool,
     pub(super) result: Result<Flux2RunOutcome, String>,
 }
 

@@ -4,8 +4,7 @@ File: modules/ai_backend/inpaint/flux3_klein/wire.py
 Purpose:
 The ONE mapping of the `inpaint.flux3_klein` wire `params` (also read by
 `.status` and by `large_models.profiles` with `model: "flux3_klein"`) onto the
-service's typed options and the region post-processing, and the region-size
-rule of the cleaning tab's region editor. Torch-free.
+service's typed options, and the region-size rule of the cleaning tab's region editor. Torch-free.
 
 Key declarations:
 - `normalize_flux3_params(params, *, require_prompt)` -> `Flux3WireParams`
@@ -25,22 +24,15 @@ Wire fields (`PROTOCOL.md`, FLUX.3 klein section), all optional unless noted:
 int >= `MIN_REFERENCE_PIXELS`), `prompt` (required non-empty for a run),
 `steps` (1..64, `null` = the package default), `seed` (`null` = random, drawn by
 `region.py`; else 0..2**64-1), `vram_step` / `ram_step` (`auto` default),
-`encoder_on_cpu` (bool, default `true`: «Энкодер на CPU»), `mask_feather_px`
-(0..32, default 12), `color_match` (bool, default `true`; forced off by
-`whole_region`), `color_match_local_pct` (0..100, default 60: strength of the
-local CIELAB match after the global one, 0 = global only; effective only with
-`color_match`), `color_match_scale_px` (8..96, default 24: the Gaussian sigma of its finest
-level, in pixels),
-`whole_region` (bool, default `false`).
+`encoder_on_cpu` (bool, default `true`: «Энкодер на CPU»), `whole_region`
+(bool, default `false`). The region post-processing (feather, colour match) is
+the client's since protocol 17: its former fields are unknown keys now and are
+refused like any other.
 
 Notes:
 - Strict on types: a bool field must be a JSON bool, an int field a JSON
   integer (never a bool), an enum one of its values; a value out of range is a
   refusal, never a clamp — the client's settings validate the same ranges.
-- `whole_region` settles `color_match` (the ring the match samples is empty
-  under a solid mask): the effective value is reported back. The local match
-  goes with it: `color_match_local_pct` is the EFFECTIVE strength, 0 whenever
-  `color_match` is off.
 """
 
 from __future__ import annotations
@@ -67,21 +59,6 @@ REGION_MIN_SIDE = 128
 REGION_MAX_PIXELS = 4 * 1024 * 1024
 REGION_MAX_ASPECT = 4
 
-#: Default and range of the feather ramp (pixels inwards from the mask contour).
-DEFAULT_MASK_FEATHER_PX = 12
-MAX_MASK_FEATHER_PX = 32
-
-#: Default and range of the local color match (`region_imaging.match_color_local`):
-#: strength in percent (0 = the global match alone) and the Gaussian sigma of
-#: its finest level in pixels.
-#: The same values as FLUX.2 klein's (`flux2_klein.params`); 60 % because full
-#: strength turns the noise of dark areas into specks.
-DEFAULT_COLOR_MATCH_LOCAL_PCT = 60
-MAX_COLOR_MATCH_LOCAL_PCT = 100
-DEFAULT_COLOR_MATCH_SCALE_PX = 24
-MIN_COLOR_MATCH_SCALE_PX = 8
-MAX_COLOR_MATCH_SCALE_PX = 96
-
 #: The weight format a request without `format` runs.
 DEFAULT_FORMAT = WeightFormat.FP8R
 
@@ -99,10 +76,6 @@ FIELDS = frozenset({
     "vram_step",
     "ram_step",
     "encoder_on_cpu",
-    "mask_feather_px",
-    "color_match",
-    "color_match_local_pct",
-    "color_match_scale_px",
     "whole_region",
 })
 
@@ -116,19 +89,13 @@ class Flux3WireParams:
     `options` are the service's run options (device `None`: the backend's
     selected device); `prompt` is stripped (may be empty unless a run asked
     for it); `steps` / `seed` `None` = the package default / a random seed;
-    `color_match` is the EFFECTIVE value (off under `whole_region`), and so is
-    `color_match_local_pct` (0 whenever `color_match` is off);
-    `color_match_scale_px` is the scale as sent or its default.
+    `whole_region` as sent (the region editor's "no mask" mode).
     """
 
     options: Flux3Options
     prompt: str
     steps: int | None
     seed: int | None
-    mask_feather_px: int
-    color_match: bool
-    color_match_local_pct: int
-    color_match_scale_px: int
     whole_region: bool
 
 
@@ -192,11 +159,6 @@ def normalize_flux3_params(params: Mapping[str, Any] | None, *, require_prompt: 
         raise ValueError("Пустой запрос: опишите, что нужно сделать с областью")
     reference_max_pixels = _int(params, "reference_max_pixels", low=MIN_REFERENCE_PIXELS, high=REGION_MAX_PIXELS)
     whole_region = _bool(params, "whole_region", False)
-    feather = _int(params, "mask_feather_px", low=0, high=MAX_MASK_FEATHER_PX)
-    local_pct = _int(params, "color_match_local_pct", low=0, high=MAX_COLOR_MATCH_LOCAL_PCT)
-    scale_px = _int(params, "color_match_scale_px", low=MIN_COLOR_MATCH_SCALE_PX, high=MAX_COLOR_MATCH_SCALE_PX)
-    # The match samples the ring outside the mask; under a solid mask it is empty.
-    color_match = _bool(params, "color_match", True) and not whole_region
     options = Flux3Options(
         model_root=Path(root.strip()),
         variant=_enum(params, "format", WeightFormat, DEFAULT_FORMAT),
@@ -213,11 +175,6 @@ def normalize_flux3_params(params: Mapping[str, Any] | None, *, require_prompt: 
         prompt=prompt,
         steps=_int(params, "steps", low=MIN_STEPS, high=MAX_STEPS),
         seed=_int(params, "seed", low=0, high=MAX_SEED),
-        mask_feather_px=DEFAULT_MASK_FEATHER_PX if feather is None else feather,
-        color_match=color_match,
-        # A refinement of the global match: never runs without it.
-        color_match_local_pct=(DEFAULT_COLOR_MATCH_LOCAL_PCT if local_pct is None else local_pct) if color_match else 0,
-        color_match_scale_px=DEFAULT_COLOR_MATCH_SCALE_PX if scale_px is None else scale_px,
         whole_region=whole_region,
     )
 

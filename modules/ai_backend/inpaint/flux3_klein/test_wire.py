@@ -3,9 +3,10 @@ File: modules/ai_backend/inpaint/flux3_klein/test_wire.py
 
 Purpose:
 Unit tests of `wire.py`: every `params` key with its default, strict types and
-ranges, unknown keys and bad enums refused by name, `whole_region` settling
-`color_match` and with it the local color match, and the region frame rule (multiple of 16, side >= 128, 4 MP,
-aspect 4:1) with the area cap equal to `packing.MATCH_MAX_PIXELS`.
+ranges, unknown keys and bad enums refused by name (the post-processing fields
+retired by protocol 17 among them), and the region frame rule (multiple of 16,
+side >= 128, 4 MP, aspect 4:1) with the area cap equal to
+`packing.MATCH_MAX_PIXELS`.
 
 Notes:
 Torch is imported only by the area-cap equality check (through `packing`).
@@ -38,8 +39,7 @@ class NormalizeTests(unittest.TestCase):
         self.assertIsNone(options.device)
         self.assertTrue(options.encoder_on_cpu)
         self.assertEqual((normalized.prompt, normalized.steps, normalized.seed), ("", None, None))
-        self.assertEqual((normalized.mask_feather_px, normalized.color_match, normalized.whole_region), (12, True, False))
-        self.assertEqual((normalized.color_match_local_pct, normalized.color_match_scale_px), (60, 24))
+        self.assertFalse(normalized.whole_region)
 
     def test_every_key(self) -> None:
         normalized = self._normalize(
@@ -55,31 +55,21 @@ class NormalizeTests(unittest.TestCase):
             vram_step="half",
             ram_step="min",
             encoder_on_cpu=False,
-            mask_feather_px=0,
-            color_match=True,
-            color_match_local_pct=35,
-            color_match_scale_px=96,
-            whole_region=False,
+            whole_region=True,
         )
         options = normalized.options
         self.assertEqual((options.variant, options.encoder_mode, options.ae_dtype, options.fp8_compute), (WeightFormat.NVFP4, EncoderMode.VL_REFS, AeDtype.BFLOAT16, Fp8Compute.DEQUANT))
         self.assertEqual((options.reference_max_pixels, options.vram_step, options.ram_step, options.encoder_on_cpu), (512 * 512, VramStep.HALF, RamStep.MIN, False))
-        self.assertEqual((normalized.prompt, normalized.steps, normalized.seed, normalized.mask_feather_px, normalized.color_match), ("remove the text", 20, MAX_SEED, 0, True))
-        self.assertEqual((normalized.color_match_local_pct, normalized.color_match_scale_px), (35, 96))
-        self.assertEqual(wire.FIELDS, {"source_root", "format", "encoder_mode", "ae_dtype", "fp8_compute", "reference_max_pixels", "prompt", "steps", "seed", "vram_step", "ram_step", "encoder_on_cpu", "mask_feather_px", "color_match", "color_match_local_pct", "color_match_scale_px", "whole_region"})
+        self.assertEqual((normalized.prompt, normalized.steps, normalized.seed, normalized.whole_region), ("remove the text", 20, MAX_SEED, True))
+        self.assertEqual(wire.FIELDS, {"source_root", "format", "encoder_mode", "ae_dtype", "fp8_compute", "reference_max_pixels", "prompt", "steps", "seed", "vram_step", "ram_step", "encoder_on_cpu", "whole_region"})
 
-    def test_whole_region_turns_the_color_match_off(self) -> None:
-        normalized = self._normalize(whole_region=True, color_match=True)
-        self.assertTrue(normalized.whole_region)
-        self.assertFalse(normalized.color_match)
-
-    def test_the_local_match_is_effective_only_with_the_color_match(self) -> None:
-        # A refinement of the global match: off with it, under `whole_region` too.
-        for params in ({"whole_region": True, "color_match_local_pct": 80}, {"color_match": False, "color_match_local_pct": 80}):
-            with self.subTest(params=params):
-                self.assertEqual(self._normalize(**params).color_match_local_pct, 0)
-        self.assertEqual(self._normalize(color_match_local_pct=0).color_match_local_pct, 0)
-        self.assertEqual(self._normalize(color_match_local_pct=100, color_match_scale_px=8).color_match_scale_px, 8)
+    def test_the_post_processing_fields_are_unknown_keys(self) -> None:
+        # Protocol 17: the client post-processes the raw answer, so a request
+        # still carrying a post field is refused by name, never ignored.
+        for field, value in (("mask_feather_px", 12), ("color_match", True), ("color_match_local_pct", 60), ("color_match_scale_px", 24)):
+            with self.subTest(field=field), self.assertRaises(ValueError) as caught:
+                self._normalize(**{field: value})
+            self.assertIn(field, str(caught.exception))
 
     def test_nulls_read_as_absent(self) -> None:
         normalized = self._normalize(format=None, seed=None, steps=None, encoder_on_cpu=None, prompt=None)
@@ -96,12 +86,8 @@ class NormalizeTests(unittest.TestCase):
             "ram_step": {"ram_step": True},
             "steps": {"steps": 0},
             "seed": {"seed": -1},
-            "mask_feather_px": {"mask_feather_px": 33},
             "reference_max_pixels": {"reference_max_pixels": 100},
             "encoder_on_cpu": {"encoder_on_cpu": "yes"},
-            "color_match": {"color_match": 1},
-            "color_match_local_pct": {"color_match_local_pct": 101},
-            "color_match_scale_px": {"color_match_scale_px": 7},
             "whole_region": {"whole_region": "true"},
             "prompt": {"prompt": 5},
         }
@@ -113,10 +99,6 @@ class NormalizeTests(unittest.TestCase):
         for steps in (True, 2.0, 65):
             with self.subTest(steps=steps), self.assertRaises(ValueError):
                 self._normalize(steps=steps)
-        for field, value in (("color_match_local_pct", -1), ("color_match_local_pct", 60.0), ("color_match_local_pct", True), ("color_match_scale_px", 97), ("color_match_scale_px", "24")):
-            with self.subTest(field=field, value=value), self.assertRaises(ValueError) as caught:
-                self._normalize(**{field: value})
-            self.assertIn(field, str(caught.exception))
 
     def test_the_root_and_the_prompt(self) -> None:
         for params in ({}, {"source_root": ""}, {"source_root": "  "}, {"source_root": 5}):

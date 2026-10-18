@@ -29,7 +29,7 @@ Module layout (dependency direction strictly downwards; see `MODULE_README.md`):
 - `large_model.py`  - the `LargeModelSpec`s, residency key, formats, request shape.
 - `wire.py`         - the IPC params -> `Flux3Options` mapping, the region frame rule.
 - `service.py`      - `Flux3KleinService`, `Flux3Canceled`.
-- `region.py`       - the region editor (composite inside the mask, seed, progress stages, cancel).
+- `region.py`       - the region editor (raw answer, mask validation, seed, progress stages, cancel).
 
 Notes:
 - Importing the package does NOT import torch: `config`, `params`, `phases`, `large_model` and

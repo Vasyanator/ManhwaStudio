@@ -22,6 +22,8 @@ Key functions:
   pushes into the frame when the active consumer changes, or when its parameters do (D16)
 - `page_source_size()`: the source-pixel size of a page, i.e. the space `rect_px` lives in
 - `RegionFrame::drag_active()`: whether a gesture of the frame is in flight
+- `RegionFrame::replace_result_image()`, `set_result_settling()`: the host's live re-derivation of
+  a pending result (same-size swap; «Применить» closed while settling)
 - `paint_brush_cursor()`: the brush ring the frame has to own itself, because `tab.rs` draws no
   tool cursor over the frame (the frame's `Area` is not the canvas view)
 - `derive_lock()`, `derive_visual()`, `derive_buttons()`, `stroke_erases()`,
@@ -60,7 +62,7 @@ use super::geometry::{
     hitbox_rect, keep_in_view_delta,
 };
 use super::input::{DragKind, DragState, HANDLE_RADIUS, HandleKind, correction_delta_to_px, handle_hit_rects, handle_points, moved_rect_px, resized_rect_px, screen_delta_to_px};
-use super::layers::{MaskLayerSpec, MaskStack, ResultLayer, hollow_rect_boxes};
+use super::layers::{Lineage, MaskLayerSpec, MaskStack, ResultLayer, hollow_rect_boxes};
 use super::render;
 use crate::input;
 use ms_canvas::{CanvasView, OverlayRectPx};
@@ -235,11 +237,12 @@ impl FrameOutcome {
 pub struct FrameButtons {
     /// «Обработать»: the size is valid, nothing is running and the mask is not empty.
     pub process: bool,
-    /// «Применить»: a result is pending.
+    /// «Применить»: a result is pending and is not being re-derived (`result_settling`).
     pub apply: bool,
-    /// «Сравнить»: a result is pending, i.e. there is something to hide. Exactly the same
-    /// condition as `apply` — the button exists to show what is UNDER the pending result, and
-    /// there is nothing to compare while the frame is free or a run has not answered yet.
+    /// «Сравнить»: a result is pending, i.e. there is something to hide. The same condition as
+    /// `apply` except while the result settles — the button exists to show what is UNDER the
+    /// pending result, and there is nothing to compare while the frame is free or a run has not
+    /// answered yet.
     pub compare: bool,
     /// «Отменить»: a result is pending, or work is running and can be cancelled.
     pub cancel: bool,
@@ -313,15 +316,19 @@ fn derive_visual(lock: FrameLock, violation: Option<SizeViolation>) -> FrameVisu
 /// `mask_empty` is about the MASK layers only — marks alone never enable «Обработать», they
 /// annotate a run, they do not describe one — while «Стереть маску» clears the marks too, so it
 /// is offered while either holds something (`marks_empty`).
+///
+/// `result_settling` — the host is re-deriving the pending result from new post-process
+/// settings — closes «Применить» only: applying then would merge an image the settings no
+/// longer describe. «Сравнить» and «Отменить» stay, the shown (stale) result is still real.
 #[must_use]
-fn derive_buttons(lock: FrameLock, violation: Option<SizeViolation>, mask_empty: bool, marks_empty: bool, allows_empty_mask: bool) -> FrameButtons {
+fn derive_buttons(lock: FrameLock, violation: Option<SizeViolation>, mask_empty: bool, marks_empty: bool, allows_empty_mask: bool, result_settling: bool) -> FrameButtons {
     let processing = matches!(lock, FrameLock::Processing);
     let has_result = matches!(lock, FrameLock::ResultPending);
     FrameButtons {
         process: violation.is_none()
             && matches!(lock, FrameLock::Free | FrameLock::MaskPainted)
             && (!mask_empty || allows_empty_mask),
-        apply: has_result,
+        apply: has_result && !result_settling,
         compare: has_result,
         cancel: has_result || processing,
         clear_mask: !mask_empty || !marks_empty,
@@ -520,6 +527,11 @@ pub struct RegionFrame {
     /// relaxes `derive_buttons`' non-empty-mask requirement; the lock rules are untouched.
     allows_empty_mask: bool,
     result: Option<ResultLayer>,
+    /// Whether the host is re-deriving the pending result from changed post-process settings.
+    /// It closes «Применить» (`derive_buttons`) and names itself in the status line; it is NOT a
+    /// lock reason and never touches `processing`, so the frame stays `ResultPending` and the
+    /// shown result keeps its «Сравнить» / «Отменить». Only meaningful with a result.
+    result_settling: bool,
     processing: bool,
     drag: Option<DragState>,
     /// The mask brush. Its radius is independent of the marks brush's.
@@ -597,6 +609,7 @@ impl RegionFrame {
             layers: layers.to_vec(),
             allows_empty_mask: false,
             result: None,
+            result_settling: false,
             processing: false,
             drag: None,
             brush: MaskBrush::default(),
@@ -747,7 +760,7 @@ impl RegionFrame {
     /// Which of the four actions are available right now.
     #[must_use]
     pub fn buttons(&self) -> FrameButtons {
-        derive_buttons(self.lock(), self.size_violation(), self.masks.is_empty(), self.masks.marks_is_empty(), self.allows_empty_mask)
+        derive_buttons(self.lock(), self.size_violation(), self.masks.is_empty(), self.masks.marks_is_empty(), self.allows_empty_mask, self.result_settling)
     }
 
     #[must_use]
@@ -770,7 +783,30 @@ impl RegionFrame {
     /// tool's job and so is that check (D7) — `replace_overlay_region_px` would silently
     /// rescale a mismatched image.
     pub fn set_result(&mut self, result: Option<ResultLayer>) {
+        if result.is_none() {
+            // Settling describes a result; nothing can settle once it is gone.
+            self.result_settling = false;
+        }
         self.result = result;
+    }
+
+    /// Replaces the pending result's pixels in place (same size only; `lineage` decides whether a
+    /// patch upload suffices, see `ResultLayer::replace_image`). Returns `false`, having changed
+    /// nothing, when there is no pending result or the size differs.
+    pub fn replace_result_image(&mut self, image: egui::ColorImage, lineage: Option<Lineage>) -> bool {
+        self.result.as_mut().is_some_and(|result| result.replace_image(image, lineage))
+    }
+
+    /// Marks the pending result as being re-derived (`true`) or current (`false`). Ignored
+    /// (kept `false`) while no result is pending.
+    pub fn set_result_settling(&mut self, settling: bool) {
+        self.result_settling = settling && self.result.is_some();
+    }
+
+    /// Whether the pending result is being re-derived right now.
+    #[must_use]
+    pub fn result_settling(&self) -> bool {
+        self.result_settling
     }
 
     /// Marks the frame as being processed by a consumer, which locks it (D4).
@@ -889,6 +925,7 @@ impl RegionFrame {
     pub fn reset(&mut self) {
         self.masks.clear_all();
         self.result = None;
+        self.result_settling = false;
         self.processing = false;
         self.cancel_gestures();
         self.pending = PendingRequests::default();
@@ -951,6 +988,8 @@ impl RegionFrame {
                 t!("cleaning.region_frame.status.marks_drawn").to_string()
             }
             FrameLock::MaskPainted => t!("cleaning.region_frame.status.mask_painted").to_string(),
+            // The status names the recompute while it runs, so a disabled «Применить» says why.
+            FrameLock::ResultPending if self.result_settling => t!("cleaning.region_frame.status.result_settling").to_string(),
             FrameLock::ResultPending => t!("cleaning.region_frame.status.result_pending").to_string(),
             FrameLock::Processing => t!("cleaning.region_frame.status.processing").to_string(),
         }
@@ -1759,19 +1798,19 @@ mod tests {
 
     #[test]
     fn buttons_of_a_free_frame_with_an_empty_mask() {
-        let b = derive_buttons(FrameLock::Free, None, true, true, false);
+        let b = derive_buttons(FrameLock::Free, None, true, true, false, false);
         assert_eq!(b, FrameButtons { process: false, apply: false, compare: false, cancel: false, clear_mask: false });
     }
 
     #[test]
     fn buttons_of_a_painted_frame() {
-        let b = derive_buttons(FrameLock::MaskPainted, None, false, true, false);
+        let b = derive_buttons(FrameLock::MaskPainted, None, false, true, false, false);
         assert_eq!(b, FrameButtons { process: true, apply: false, compare: false, cancel: false, clear_mask: true });
     }
 
     #[test]
     fn buttons_of_a_painted_frame_with_an_invalid_size() {
-        let b = derive_buttons(FrameLock::MaskPainted, Some(SizeViolation::TooSmall), false, true, false);
+        let b = derive_buttons(FrameLock::MaskPainted, Some(SizeViolation::TooSmall), false, true, false, false);
         assert!(!b.process, "an invalid size must block processing");
         assert!(!b.compare, "there is no result to compare against yet");
         assert!(b.clear_mask, "erasing the mask is how the user gets back to a free frame");
@@ -1781,13 +1820,41 @@ mod tests {
     /// recovered, so «Обработать» stays disabled until the user applies or cancels.
     #[test]
     fn buttons_of_a_pending_result() {
-        let b = derive_buttons(FrameLock::ResultPending, None, false, true, false);
+        let b = derive_buttons(FrameLock::ResultPending, None, false, true, false, false);
         assert_eq!(b, FrameButtons { process: false, apply: true, compare: true, cancel: true, clear_mask: true });
+    }
+
+    /// A result being re-derived from new post-process settings cannot be applied (it would
+    /// merge an image the settings no longer describe), but stays comparable and cancellable.
+    #[test]
+    fn buttons_of_a_settling_result() {
+        let b = derive_buttons(FrameLock::ResultPending, None, false, true, false, true);
+        assert_eq!(b, FrameButtons { process: false, apply: false, compare: true, cancel: true, clear_mask: true });
+    }
+
+    /// Settling needs a result, ends with it, and is named by the status line.
+    #[test]
+    fn settling_follows_the_pending_result() {
+        let mut frame = RegionFrame::new(FrameConstraints::UNCONSTRAINED, &[]);
+        frame.set_result_settling(true);
+        assert!(!frame.result_settling(), "nothing settles without a result");
+        frame.set_result(Some(ResultLayer::new(egui::ColorImage::filled([2, 2], Color32::WHITE))));
+        frame.set_result_settling(true);
+        assert!(frame.result_settling());
+        assert!(!frame.buttons().apply && frame.buttons().compare);
+        assert!(frame.replace_result_image(egui::ColorImage::filled([2, 2], Color32::BLACK), None));
+        assert!(!frame.replace_result_image(egui::ColorImage::filled([3, 2], Color32::BLACK), None), "another size is refused");
+        frame.set_result(None);
+        assert!(!frame.result_settling(), "dropping the result ends the settling");
+        frame.set_result(Some(ResultLayer::new(egui::ColorImage::filled([2, 2], Color32::WHITE))));
+        frame.set_result_settling(true);
+        frame.reset();
+        assert!(!frame.result_settling(), "`reset` ends it too");
     }
 
     #[test]
     fn buttons_while_processing() {
-        let b = derive_buttons(FrameLock::Processing, None, false, true, false);
+        let b = derive_buttons(FrameLock::Processing, None, false, true, false, false);
         // No result exists yet, so there is nothing for «Сравнить» to hide.
         assert_eq!(b, FrameButtons { process: false, apply: false, compare: false, cancel: true, clear_mask: true });
     }
@@ -2096,13 +2163,14 @@ mod tests {
         assert!(!frame.compare_held, "`reset` ends the hold with the other gestures");
     }
 
-    /// «Сравнить» is enabled by exactly the condition «Применить» is: both act on the pending
-    /// result, and a user who can apply one can always look under it first.
+    /// «Сравнить» is enabled by exactly the condition «Применить» is while nothing settles:
+    /// both act on the pending result, and a user who can apply one can always look under it
+    /// first.
     #[test]
     fn compare_is_offered_exactly_when_apply_is() {
         for lock in [FrameLock::Free, FrameLock::MaskPainted, FrameLock::ResultPending, FrameLock::Processing] {
             for mask_empty in [false, true] {
-                let b = derive_buttons(lock, None, mask_empty, true, false);
+                let b = derive_buttons(lock, None, mask_empty, true, false, false);
                 assert_eq!(b.compare, b.apply, "lock {lock:?}, mask_empty {mask_empty}");
             }
         }
@@ -2225,7 +2293,7 @@ mod tests {
 
         // A pending result: apply and cancel are allowed, a second run is not (F4).
         let mut outcome = FrameOutcome::default();
-        fold_pending(pending, derive_buttons(FrameLock::ResultPending, None, false, true, false), &mut outcome);
+        fold_pending(pending, derive_buttons(FrameLock::ResultPending, None, false, true, false, false), &mut outcome);
         assert_eq!(
             outcome,
             FrameOutcome { process_requested: false, apply_requested: true, cancel_requested: true, clear_mask_requested: false }
@@ -2233,7 +2301,7 @@ mod tests {
 
         // A free frame with an empty mask allows none of the three.
         let mut outcome = FrameOutcome::default();
-        fold_pending(pending, derive_buttons(FrameLock::Free, None, true, true, false), &mut outcome);
+        fold_pending(pending, derive_buttons(FrameLock::Free, None, true, true, false, false), &mut outcome);
         assert_eq!(outcome, FrameOutcome::default());
     }
 
@@ -2399,9 +2467,9 @@ mod tests {
 
     #[test]
     fn marks_count_in_the_button_table_for_clearing_only() {
-        let b = derive_buttons(FrameLock::MaskPainted, None, true, false, false);
+        let b = derive_buttons(FrameLock::MaskPainted, None, true, false, false, false);
         assert_eq!(b, FrameButtons { process: false, apply: false, compare: false, cancel: false, clear_mask: true });
-        let b = derive_buttons(FrameLock::MaskPainted, None, true, false, true);
+        let b = derive_buttons(FrameLock::MaskPainted, None, true, false, true, false);
         assert!(b.process, "an engine that runs without a mask still may");
     }
 

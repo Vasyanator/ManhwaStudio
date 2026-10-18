@@ -11,7 +11,9 @@ Main responsibilities:
 - own `Flux3KleinSettings`, its defaults and `normalized()` (the only value put on the wire);
 - answer which package root a call names (`effective_root`, the ONE answer for both source
   modes) and which step pair is persisted (`step_choice` / `set_step_choice`);
-- build the `params` of a run, a `.status` and a forecast (`to_params`);
+- build the `params` of a run, a `.status` and a forecast (`to_params`); the «Постобработка»
+  settings (`postprocess`, the shared `ms_region_postprocess::PostprocessSettings`) are
+  persisted here but applied by the host, never sent;
 - load and save the settings file on worker threads (`load_flux3_settings`,
   `save_flux3_settings`).
 
@@ -224,19 +226,13 @@ pub(super) struct Flux3KleinSettings {
     pub(super) fp8_compute: String,
     /// One of [`FLUX3_REFERENCE_CAP_SIDES`]; `0` = no cap.
     pub(super) reference_max_side: u32,
-    /// Feather ramp of the composite, pixels inwards from the mask contour, 0..=32.
-    pub(super) mask_feather_px: u32,
-    /// Match the generated colours to the ring outside the mask (ineffective under a whole-region run).
-    pub(super) color_match: bool,
-    /// «Сила локальной подгонки», percent 0..=100: the low-frequency Lab mean/contrast match
-    /// inside the mask the backend applies AFTER the global one; `0` = global match only.
-    /// Effective only with `color_match` (and, like it, never under a whole-region run).
-    /// Default 60, also for a document without the field.
-    pub(super) color_match_local_pct: u32,
-    /// «Масштаб локальной подгонки»: the Gaussian sigma, pixels, of the finest
-    /// level of that local match's averaging (its blur radius), 8..=96.
-    /// Default 24, also for a document without the field.
-    pub(super) color_match_scale_px: u32,
+    /// «Постобработка» — feather and colour match — that the HOST applies to the raw run answer
+    /// (`AiEngine::postprocess_settings`); never on the wire. Flattened, so its four keys
+    /// (`mask_feather_px`, `color_match`, `color_match_local_pct`, `color_match_scale_px`) stay
+    /// top-level in the file exactly as before they moved into the shared struct; an absent
+    /// key reads as the crate's default.
+    #[serde(flatten)]
+    pub(super) postprocess: PostprocessSettings,
     /// «Видеопамять»: the `VramStep` wire id; an unknown id reads as «Авто».
     pub(super) vram_step: String,
     /// «Оперативная память»: the `RamStep` wire id; an unknown id reads as «Авто».
@@ -261,10 +257,7 @@ impl Default for Flux3KleinSettings {
             ae_bf16: false,
             fp8_compute: Flux3Fp8Compute::Auto.wire().to_string(),
             reference_max_side: 0,
-            mask_feather_px: FLUX3_DEFAULT_FEATHER,
-            color_match: true,
-            color_match_local_pct: FLUX3_DEFAULT_COLOR_MATCH_LOCAL_PCT,
-            color_match_scale_px: FLUX3_DEFAULT_COLOR_MATCH_SCALE,
+            postprocess: PostprocessSettings::default(),
             vram_step: VramStep::Auto.wire().to_string(),
             ram_step: RamStep::Auto.wire().to_string(),
             encoder_on_cpu: true,
@@ -289,10 +282,7 @@ impl Flux3KleinSettings {
             ae_bf16: self.ae_bf16,
             fp8_compute: Flux3Fp8Compute::from_wire(&self.fp8_compute).wire().to_string(),
             reference_max_side: if FLUX3_REFERENCE_CAP_SIDES.contains(&self.reference_max_side) { self.reference_max_side } else { 0 },
-            mask_feather_px: self.mask_feather_px.min(FLUX3_FEATHER_MAX),
-            color_match: self.color_match,
-            color_match_local_pct: self.color_match_local_pct.min(FLUX3_COLOR_MATCH_LOCAL_PCT_MAX),
-            color_match_scale_px: self.color_match_scale_px.clamp(FLUX3_COLOR_MATCH_SCALE_MIN, FLUX3_COLOR_MATCH_SCALE_MAX),
+            postprocess: self.postprocess.normalized(),
             vram_step: choice.vram.wire().to_string(),
             ram_step: choice.ram.wire().to_string(),
             encoder_on_cpu: self.encoder_on_cpu,
@@ -346,7 +336,8 @@ impl Flux3KleinSettings {
     /// The `params` object of a run (`whole_region` from `mask_for_run`) and — with
     /// `whole_region = false`, since no mask exists there — of a `.status` and a forecast.
     ///
-    /// `self` must already be `normalized()`. Exactly the backend's accepted keys travel, and
+    /// `self` must already be `normalized()`. Exactly the backend's accepted keys travel (the
+    /// post-process settings are the host's and never do; the backend refuses them), and
     /// `fp8_compute` carries the choice only for the fp8r format (`auto` otherwise): the
     /// choice is meaningless for the other formats, and a pinned `scaled_mm` must not turn a
     /// bf16 run into a refusal.
@@ -370,12 +361,6 @@ impl Flux3KleinSettings {
             "vram_step": self.vram_step,
             "ram_step": self.ram_step,
             "encoder_on_cpu": self.encoder_on_cpu,
-            "mask_feather_px": self.mask_feather_px,
-            "color_match": self.color_match,
-            // Sent as stored, like `color_match`: the backend settles both under `whole_region`
-            // and applies the local match only under the global one.
-            "color_match_local_pct": self.color_match_local_pct,
-            "color_match_scale_px": self.color_match_scale_px,
             "whole_region": whole_region,
         })
     }
@@ -433,7 +418,21 @@ pub(super) fn settings_from_json(value: &Value) -> Result<Flux3KleinSettings, se
 /// # Errors
 /// A user-facing message when the directory cannot be created, the settings cannot be
 /// serialized, or the write fails.
+///
+/// A test build of this crate writes NOTHING and answers `Ok(())`: the path is the user's real
+/// data directory, and the shared saver's teardown flush can reach this function from any test
+/// that leaves a loaded, dirty engine behind. `Ok` rather than an error because the saver reads
+/// `Ok` as "nothing is owed any more"; an error would show a failure and retry with backoff
+/// for a write that must never happen. `cfg!(test)` alone is enough here (no runtime latch as
+/// in `ms-tab-typing`'s `persistence_suppressed_by_tests`): this function is private to
+/// `ms-tab-cleaning`, the engines are built only by this crate's `engines/mod.rs`, and every
+/// test that reaches them is one of this crate's own. Tests of real writing use an injected
+/// writer or `write_settings_json` on a temp path.
 pub(super) fn save_flux3_settings(settings: &Flux3KleinSettings) -> Result<(), String> {
+    if cfg!(test) {
+        ms_log::runtime_log::log_info(format!("[cleaning] {FLUX3_LOG_LABEL} settings not written: a test build never writes the user's settings file"));
+        return Ok(());
+    }
     write_settings_json(&config::flux3_klein_settings_path(), settings).map_err(|err| match err {
         SettingsWriteError::CreateDir(err) => tf!("cleaning.settings_io.create_dir_error", err = err),
         SettingsWriteError::Serialize(err) => tf!("cleaning.tools.flux3_klein.serialize_settings_error", err = err),
@@ -444,6 +443,16 @@ pub(super) fn save_flux3_settings(settings: &Flux3KleinSettings) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A test build never writes the user's real settings file (the saver's teardown flush
+    /// can reach the product writer from any test): it answers `Ok` and leaves the file alone.
+    #[test]
+    fn a_test_build_never_writes_the_settings_file() {
+        let path = config::flux3_klein_settings_path();
+        let before = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+        assert!(save_flux3_settings(&Flux3KleinSettings::default()).is_ok());
+        assert_eq!(std::fs::metadata(&path).and_then(|meta| meta.modified()).ok(), before);
+    }
 
     /// The defaults are the package's: fp8r, 16 steps, no guidance, a random seed, the
     /// encoder on the CPU, «Авто» on both axes, the reference AE and encoder mode.
@@ -457,9 +466,7 @@ mod tests {
         assert!(!settings.vl_refs && !settings.ae_bf16);
         assert_eq!(settings.step_choice(), StepChoice { vram: VramStep::Auto, ram: RamStep::Auto });
         assert_eq!(settings.source_mode(), Flux3SourceMode::Download);
-        assert_eq!(settings.mask_feather_px, 12);
-        assert!(settings.color_match);
-        assert_eq!((settings.color_match_local_pct, settings.color_match_scale_px), (60, 24));
+        assert_eq!(settings.postprocess, PostprocessSettings::default(), "the crate owns the post-process defaults");
         assert!(!settings.prompt.trim().is_empty());
         assert_eq!(settings.normalized(), settings, "the defaults are already normal");
     }
@@ -471,7 +478,7 @@ mod tests {
         let loaded = settings_from_json(&json!({ "steps": 8, "prompt": "  ", "some_future_key": 1 })).expect("loads");
         assert_eq!(loaded.steps, 8);
         assert!(loaded.encoder_on_cpu, "a document without the flag keeps the encoder on the CPU");
-        assert_eq!((loaded.color_match_local_pct, loaded.color_match_scale_px), (60, 24), "a document without the local match reads its defaults");
+        assert_eq!(loaded.postprocess, PostprocessSettings::default(), "a document without the post-process keys reads their defaults");
         assert_eq!(loaded.prompt, FLUX3_DEFAULT_PROMPT);
         assert_eq!(loaded.format, "fp8r");
         assert!(settings_from_json(&json!(["not", "an", "object"])).is_err());
@@ -489,9 +496,7 @@ mod tests {
             steps: 500,
             fp8_compute: "magic".to_string(),
             reference_max_side: 333,
-            mask_feather_px: 99,
-            color_match_local_pct: 101,
-            color_match_scale_px: 97,
+            postprocess: PostprocessSettings { mask_feather_px: 99, color_match: false, color_match_local_pct: 101, color_match_scale_px: 97 },
             vram_step: "warp".to_string(),
             ram_step: "".to_string(),
             ..Flux3KleinSettings::default()
@@ -504,12 +509,11 @@ mod tests {
         assert_eq!(wild.steps, FLUX3_STEPS_MAX);
         assert_eq!(wild.fp8_compute, "auto");
         assert_eq!(wild.reference_max_side, 0);
-        assert_eq!(wild.mask_feather_px, FLUX3_FEATHER_MAX);
-        assert_eq!(wild.color_match_local_pct, FLUX3_COLOR_MATCH_LOCAL_PCT_MAX);
-        assert_eq!(wild.color_match_scale_px, FLUX3_COLOR_MATCH_SCALE_MAX);
-        let small = Flux3KleinSettings { color_match_local_pct: 0, color_match_scale_px: 0, ..Flux3KleinSettings::default() }.normalized();
-        assert_eq!(small.color_match_local_pct, 0, "0 % is a valid value: the global match only");
-        assert_eq!(small.color_match_scale_px, FLUX3_COLOR_MATCH_SCALE_MIN);
+        // The ranges are the crate's; `normalized()` delegates to it.
+        assert_eq!(
+            wild.postprocess,
+            PostprocessSettings { mask_feather_px: ms_region_postprocess::FEATHER_MAX_PX, color_match: false, color_match_local_pct: ms_region_postprocess::LOCAL_PCT_MAX, color_match_scale_px: ms_region_postprocess::SCALE_MAX_PX }
+        );
         assert_eq!((wild.vram_step.as_str(), wild.ram_step.as_str()), ("auto", "auto"));
         assert_eq!(Flux3KleinSettings { steps: 0, ..Flux3KleinSettings::default() }.normalized().steps, FLUX3_STEPS_MIN);
     }
@@ -519,10 +523,9 @@ mod tests {
     /// the types it checks: an extra key would turn every call into a refusal.
     #[test]
     fn the_params_carry_exactly_the_backend_fields() {
-        const BACKEND_FIELDS: [&str; 17] = [
+        const BACKEND_FIELDS: [&str; 13] = [
             "source_root", "format", "encoder_mode", "ae_dtype", "fp8_compute", "reference_max_pixels", "prompt", "steps", "seed",
-            "vram_step", "ram_step", "encoder_on_cpu", "mask_feather_px", "color_match", "color_match_local_pct",
-            "color_match_scale_px", "whole_region",
+            "vram_step", "ram_step", "encoder_on_cpu", "whole_region",
         ];
         let params = Flux3KleinSettings::default().normalized().to_params(false);
         let mut keys: Vec<&str> = params.as_object().expect("an object").keys().map(String::as_str).collect();
@@ -538,8 +541,6 @@ mod tests {
         assert_eq!(params["reference_max_pixels"], Value::Null);
         assert_eq!(params["whole_region"], json!(false));
         assert_eq!(params["steps"], json!(16));
-        assert_eq!(params["color_match_local_pct"], json!(60));
-        assert_eq!(params["color_match_scale_px"], json!(24));
     }
 
     /// Each expert switch reaches its wire value; the seed travels as a number when pinned.
@@ -553,14 +554,10 @@ mod tests {
             reference_max_side: 768,
             seed: Some(u64::MAX),
             encoder_on_cpu: false,
-            color_match_local_pct: 35,
-            color_match_scale_px: 48,
             ..Flux3KleinSettings::default()
         }
         .normalized();
         let params = settings.to_params(true);
-        assert_eq!(params["color_match_local_pct"], json!(35), "sent as stored under whole_region too");
-        assert_eq!(params["color_match_scale_px"], json!(48));
         assert_eq!(params["encoder_mode"], json!("vl_refs"));
         assert_eq!(params["ae_dtype"], json!("bfloat16"));
         assert_eq!(params["fp8_compute"], json!("dequant"));
@@ -588,10 +585,33 @@ mod tests {
     /// A round trip through the file shape keeps every field, the optional seed included.
     #[test]
     fn the_document_round_trips() {
-        let settings = Flux3KleinSettings { seed: Some(42), vl_refs: true, reference_max_side: 512, color_match_local_pct: 0, color_match_scale_px: 96, ..Flux3KleinSettings::default() };
+        let settings = Flux3KleinSettings { seed: Some(42), vl_refs: true, reference_max_side: 512, postprocess: PostprocessSettings { mask_feather_px: 3, color_match: false, color_match_local_pct: 0, color_match_scale_px: 96 }, ..Flux3KleinSettings::default() };
         let text = serde_json::to_string(&settings).expect("serializes");
         let back = settings_from_json(&serde_json::from_str(&text).expect("json")).expect("loads");
         assert_eq!(back, settings);
+    }
+
+    /// A file written before the post-process settings moved into the shared struct (the four
+    /// keys flat at the top level) loads its values, and a save writes exactly the same key set
+    /// as that build did: the flattened struct changed the code, not the document.
+    #[test]
+    fn an_old_document_keeps_its_post_process_values_and_its_key_set() {
+        let old = json!({
+            "source_mode": "manual", "model_root": "/m/flux3", "format": "bf16", "prompt": "edit", "steps": 8, "seed": 7,
+            "vl_refs": true, "ae_bf16": false, "fp8_compute": "auto", "reference_max_side": 768,
+            "mask_feather_px": 5, "color_match": false, "color_match_local_pct": 30, "color_match_scale_px": 40,
+            "vram_step": "auto", "ram_step": "auto", "encoder_on_cpu": false,
+        });
+        let loaded = settings_from_json(&old).expect("loads");
+        assert_eq!(loaded.postprocess, PostprocessSettings { mask_feather_px: 5, color_match: false, color_match_local_pct: 30, color_match_scale_px: 40 });
+        assert_eq!((loaded.steps, loaded.reference_max_side, loaded.seed), (8, 768, Some(7)));
+        let saved = serde_json::to_value(&loaded).expect("serializes");
+        let mut saved_keys: Vec<&str> = saved.as_object().expect("an object").keys().map(String::as_str).collect();
+        saved_keys.sort_unstable();
+        let mut old_keys: Vec<&str> = old.as_object().expect("an object").keys().map(String::as_str).collect();
+        old_keys.sort_unstable();
+        assert_eq!(saved_keys, old_keys);
+        assert_eq!(saved, old, "every value is written back where the old build read it");
     }
 
     /// A damaged settings file is moved aside and the defaults load; the copy keeps its bytes.

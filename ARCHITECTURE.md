@@ -12,7 +12,7 @@ translated (bubbles, OCR, machine translation), cleaned (clean layers, inpaintin
 (rendered text layers) and exported.
 
 - **Rust application** — a Cargo workspace: the root package `manhwastudio_rs` (`src/`: a
-  library holding the application, plus a thin binary entry) over 43 `ms-*` library crates in
+  library holding the application, plus a thin binary entry) over 44 `ms-*` library crates in
   `crates/`. Builds for Linux and Windows (mandatory), macOS, `wasm32` (web entry,
   `src/web_entry.rs`; currently inactive and not kept building, `PROJECT_RULES.md`) and, in progress, Android (`dev-docs/ANDROID_PORT.md`; the library target
   exists so that build can export `android_main`).
@@ -49,7 +49,7 @@ root package (src/: lib.rs + thin main.rs, startup/, shell/, studio.rs, tabs/set
   <- ms-tools
   <- ms-canvas
   <- ms-models / ms-tabs-simple / ms-installer / ms-ai-api
-  <- ms-studio-tab
+  <- ms-studio-tab / ms-region-postprocess
   <- ms-project / ms-widgets / ms-native-runtime / ms-local-ai
   <- ms-page-ops / ms-sysprobe / ms-onnx-runtime / ms-window-geometry / ms-os-integration / ms-input
   <- ms-config / ms-text-render
@@ -79,7 +79,8 @@ shared wiki view). The studio never references
 - `ms-raster` — generic raster primitives with one owner each: polygon scanline fill
   (re-exported as `ms_tools::fill_polygon_spans`), square binary dilation, Otsu threshold,
   integer replicate upscale / box downscale, single-channel box blur, RGBA-over-white to RGB
-  (used by PDF export and JPEG encoding).
+  (used by PDF export and JPEG encoding), exact Euclidean distance transform (text-render
+  effects, region-edit feather).
 - `ms-log` — session log (`runtime_log`) and opt-in trace log (`trace_log!` / `trace_scope!`).
 - `ms-text-detect` — GUI-free text-detection domain (block sort and cap, mask normalization, DB
   postprocess, glyph mask, per-engine scale/tiling plan, tile stitching and the runner pipeline
@@ -134,6 +135,11 @@ shared wiki view). The studio never references
 - `ms-local-ai` — GUI-free local-AI facts: `local_ai` (which local runtimes the process may use:
   `--no-ai` + platform, the route-availability rule, the effective runtime) and
   `backend_health` (push-driven backend health snapshot, probe thread, device control).
+- `ms-region-postprocess` — the one owner of region-edit result post-processing for engines
+  that answer RAW pixels (FLUX klein): persisted settings (defaults, ranges, whole-region rule),
+  global and local CIELAB colour match, inward feather, composite over the original, the cached
+  re-derivation `RegionPostprocessor`, the cv2-exact ellipse dilation (also the FLUX.2 latent mask
+  built before a run) and the «Постобработка» section body UI. Core GUI-free, no I/O, no logging.
 - `ms-studio-tab` — the `StudioTab` trait: order-free per-tab hooks (input declarations and
   contexts, dock default
   layout, GPU eviction, source-page window, background poll, exit settings, teardown store
@@ -365,7 +371,8 @@ change) through `ms_studio_tab::StudioTab`; drawing and every ordered sequence s
   on ONE generic host (`tools/region_edit_v2`: `RegionEditHost` + `HostSpec`, engines behind
   `AiEngine`) — the local AI region editor (`tools/ai_editor`) and the cloud «ИИ редактирование
   (API)» (`tools/ai_api_editor`, no Torch, over `ms_ai_api::image_edit`) — and the watermark
-  engine. Writes only through `CleanOverlaysModel`.
+  engine. FLUX klein engines answer RAW model output; the host finishes it through
+  `ms-region-postprocess` and re-derives the pending result live when post settings change. Writes only through `CleanOverlaysModel`.
 - **Typing** — `ms-tab-typing` (+ renderer `ms-text-render`): text layers in `LayerDoc`, masks,
   export (PNG, PSD, lossless PDF), custom fonts (compile service, the shared hybrid editor hosted
   as a dock panel here and as a dialog in Settings › Тайп).
@@ -540,6 +547,7 @@ logged error); the GUI thread only polls and applies results.
 | Custom font compile (one job per recipe key, memory LRU, disk cache, prune) and the editor's latest-wins subset preview | `ms-tab-typing/src/custom_fonts/` + `hybrid_editor/`, compiler `ms-custom-fonts` |
 | PS editor page decode, raster effects | `ms-tab-ps-editor` |
 | Cleaning region loader, inpaint runs, quick text clean | `ms-tab-cleaning` |
+| Region-edit post-process re-derivation (latest-wins, one worker per pending raw result) | `ms-tab-cleaning/src/tools/region_edit_v2/postprocess.rs` + `ms-region-postprocess` |
 | Cloud image-edit run (submit, poll, download, exact-size finish) | `ms-tab-cleaning/src/tools/ai_api_editor` + `ms_ai_api::image_edit` |
 | Characters / Notes / Wiki background work | `ms-tabs-simple` |
 | Batch processing of new projects | `ms-launcher/src/new_project/batch_processing/` |

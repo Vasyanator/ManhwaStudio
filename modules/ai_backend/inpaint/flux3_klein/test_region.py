@@ -4,9 +4,9 @@ File: modules/ai_backend/inpaint/flux3_klein/test_region.py
 Purpose:
 Unit tests of `region.py` over the real service and manager
 (`_service_test_fixtures.ServiceRig`: stand-in models on the CPU, the stub AE
-decodes flat grey): outside the mask the answer is byte-identical to the region,
-the local color match called with its params and the painted mask,
-`whole_region` (a solid mask required, the whole region regenerated),
+decodes flat grey): the answer is the RAW generated region (no colour match, no
+composite: flat grey outside the mask too), `whole_region` (a solid mask
+required, the whole region regenerated),
 reference order (the region is #0), `seed: null` drawn and echoed, the
 progress frames (stable `stage` ids), cancellation at a phase begin and at a
 denoise step with no session left in use and a follow-up run that succeeds,
@@ -70,14 +70,15 @@ class RegionTests(unittest.TestCase):
         with Image.open(io.BytesIO(answer["image_png"])) as image:
             return np.asarray(image.convert("RGB"))
 
-    def test_outside_the_mask_is_byte_identical(self) -> None:
-        answer = self._edit(color_match=False, mask_feather_px=4)
+    def test_the_answer_is_the_raw_generated_region(self) -> None:
+        # Protocol 17: the client composites. The stub decodes one flat grey,
+        # so the raw answer is that grey everywhere, outside the mask too.
+        answer = self._edit()
         out = self._decoded(answer)
+        self.assertEqual(out.shape, self.region.shape)
+        self.assertEqual(len(np.unique(out.reshape(-1, 3), axis=0)), 1)
         outside = _mask() == 0
-        self.assertTrue(np.array_equal(out[outside], self.region[outside]))
-        # The stub decodes flat grey: the core of the mask is the generated colour.
-        inside = out[_mask() > 0]
-        self.assertFalse(np.array_equal(inside, self.region[_mask() > 0]))
+        self.assertFalse(np.array_equal(out[outside], self.region[outside]))
         self.assertEqual((answer["width"], answer["height"], answer["steps"]), (SIZE, SIZE, 2))
         self.assertEqual(answer["applied"], {"format": "fp8r", "fp8_compute": "dequant", "compute_path": "dequant", "encoder_mode": "text", "ae_dtype": "float32"})
         self.assertEqual((answer["vram_step"], answer["ram_step"]), ("auto", "auto"))
@@ -85,22 +86,10 @@ class RegionTests(unittest.TestCase):
         self.assertFalse(answer["degraded"])
         self.assertIsNone(answer["degrade_reason"])
 
-    def test_the_local_color_match_follows_its_params_and_the_painted_mask(self) -> None:
-        with patch.object(region, "match_color_local", wraps=region.match_color_local) as spy:
-            answer = self._edit(color_match_local_pct=35, color_match_scale_px=40)
-            self._edit(color_match_local_pct=0)
-            self._edit(color_match=False)
-        self.assertEqual(spy.call_count, 1)
-        args, kwargs = spy.call_args
-        self.assertEqual(kwargs, {"strength": 0.35, "scale_px": 40})
-        self.assertTrue(np.array_equal(args[2], _mask()))
-        outside = _mask() == 0
-        self.assertTrue(np.array_equal(self._decoded(answer)[outside], self.region[outside]))
-
     def test_whole_region_needs_a_solid_mask_and_regenerates_everything(self) -> None:
         with self.assertRaises(ValueError):
             self._edit(whole_region=True)
-        out = self._decoded(self._edit(mask=_mask(solid=True), whole_region=True, mask_feather_px=0))
+        out = self._decoded(self._edit(mask=_mask(solid=True), whole_region=True))
         # The stub decodes one flat grey: every pixel is the generated one.
         self.assertEqual(len(np.unique(out.reshape(-1, 3), axis=0)), 1)
         self.assertFalse(np.array_equal(out, self.region))

@@ -26,6 +26,7 @@ engine.rs          the contract    AiEngine + run request/poll; the one size-vio
 engine_settings.rs engine helper   the settings save gate shared by every hosted engine
 host.rs            the tool        HostSpec, RegionEditHost: run, mask generation, apply, tests
 host_panels.rs     the panels      the host's compact panel and its half of the main panel
+postprocess.rs     host helper     a raw answer's capture and its latest-wins post-process worker
 ```
 
 Dependency direction: the framework files know nothing of the host; `host*.rs`, `engine.rs` and
@@ -63,7 +64,8 @@ that owns the context, the canvas and the project at once:
   catalog key of its name), `MaskStack` (per-layer L8 buffer, O(1) set-pixel counter, tinted
   preview, partial texture upload; the straight-alpha RGBA marks layer; ONE per-stroke undo
   history over both), `hollow_rect_boxes` (the pixel boxes of a marks rectangle) and
-  `ResultLayer`. The disc and the segment walk are one rasterizer shared by masks and marks. No
+  `ResultLayer` with `Lineage` / `ResultPatch` (a patch upload is trusted only within one
+  lineage, after the texture exists, and only when it fits). The disc and the segment walk are one rasterizer shared by masks and marks. No
   brush radius policy lives here.
 - `input.rs`: `HandleKind`, the handle hit rects and arcs, and `moved_rect_px` /
   `resized_rect_px`. Every drag is measured from an anchor captured on `drag_started`, never
@@ -86,6 +88,16 @@ that owns the context, the canvas and the project at once:
   `RegionEditHost::new(&'static HostSpec)`), the run and mask-generation pipelines, the D7 size
   check `check_result_fits`, `ApplyError` / `CaptureError`, and the host's tests (over a test
   spec of recording engines).
+- `postprocess.rs`: `RunCapture` (the unmarked region, and the marked one the model was sent in
+  overlay-marks mode) and `PendingRaw` — ONE `ms_thread` worker per pending raw result that owns an
+  `ms_region_postprocess::RegionPostprocessor`, converts to RGB on the worker, renders the newest
+  requested settings straight into a copy of the original's `Color32` pixels
+  (`render_masked_into`; latest-wins: the worker drains its queue, `poll` drops older answers),
+  cuts the run mask's bounding box out as a `ResultPatch`, and wakes the GUI
+  (`request_repaint_of` the viewport captured at `start`) after every answer and on exit — the
+  host never polls on a timer. It logs the first derivation at INFO, later ones to the trace log
+  (`ms_log::trace_log!`), failures as warnings; `PostprocessFailure` is its technical error.
+  Split from `host.rs` for size; only the host uses it.
 - `host_panels.rs`: `impl RegionEditHost` panel bodies — engine picker, brush, layer picker, mask
   generation, mask actions and summary, and the host actions under the engine's parameters. Split
   from `host.rs` for size only; the fields it reads are `pub(super)` for that reason.
@@ -145,7 +157,8 @@ that owns the context, the canvas and the project at once:
   action. «Сравнить» is the one chrome button a panel must NOT repeat — a frame that scrolled
   out of view has nothing to look at.
 - **«Сравнить» is a MOMENTARY HOLD, not a toggle, and it is the only button that is not a
-  request.** It is enabled by exactly the condition «Применить» is (a result is pending), and
+  request.** It is enabled while a result is pending — the condition «Применить» has, except that
+  «Применить» also waits out a settling result (`set_result_settling`, see the host) — and
   while its pointer button is down the pending result layer is not painted, so the original
   pixels show through. `compare_held` is recomputed from scratch in every drawn pass as
   "enabled AND `Response::is_pointer_button_down_on`" — never toggled, never accumulated — and
@@ -284,7 +297,9 @@ that owns the context, the canvas and the project at once:
 - To build a region tool that is NOT an engine host, drive `RegionFrame` from its own
   `CleaningTool::draw_overlay_ui`, as `host.rs` does.
 - To change the host's run path: `start_run`, `poll_region_load`, `hand_region_to_engine`,
-  `poll_engine`, `accept_result` in `host.rs` — in that order, they are one pipeline.
+  `poll_engine`, `accept_result` in `host.rs` — in that order, they are one pipeline. A raw
+  answer continues in `accept_raw_result`, `request_postprocess` and `poll_postprocess`; the worker, its generations
+  and the RGB conversion are `postprocess.rs`, the pixels are `ms-region-postprocess`.
 - To change the mask-generation path: `start_mask_generation`, `start_mask_detection`,
   `poll_mask_generation`, `accept_generated_mask` in `host.rs`. To change a SOURCE, a requirement
   rule, the detection call or the shared controls: `../mask_generation.rs`, never here.
@@ -318,11 +333,15 @@ CleaningTool::apply_input       the shared brush actions on the active brush, th
 
 `draw_overlay_ui` is the whole per-frame pass and its ORDER is load-bearing:
 
-1. `push_engine_rules`: read `allows_empty_mask()` and `constraints()` back from the engine into
+1. `push_engine_rules`, then `request_postprocess`: read `allows_empty_mask()` and `constraints()` back from the engine into
    the frame and `marks_support()` into the marks mode — the engine may derive any of them from
    a parameter the user changed in this same frame's panel body, which ran earlier inside
    `CanvasView::draw`; a stale copy silently blocks or allows a run (§13.5) or validates against
-   the previous model's size rules. It also pushes the marks eyedropper's claim on the click;
+   the previous model's size rules. It also pushes the marks eyedropper's claim on the click.
+   `request_postprocess` forwards the engine's live post-process settings to a pending raw
+   result and sets the frame's settling flag BEFORE the pass, which folds a queued apply (and
+   draws its own button) against `buttons()`: an apply in the frame of a settings change is
+   dropped, never merged with the previous settings' image;
 2. `RegionFrame::update` — the frame settles its rectangle and reports a `FrameOutcome`;
 3. push `set_backend_available` / `set_torch_available` / `set_region` — after the pass, so the
    rectangle is THIS frame's (an engine may treat a moved rectangle as "a different image" and
@@ -331,13 +350,18 @@ CleaningTool::apply_input       the shared brush actions on the active brush, th
 4. act on the outcome: clear mask, cancel, process, apply, and last the mask generation the
    compact panel may have queued — `cancel_run` clears that flag, so a cancel and a generate
    clicked in the same frame resolve as the cancel;
-5. `poll_region_load()`, `poll_mask_generation(ctx)`, then `poll_engine(ctx)`.
+5. `poll_region_load()`, `poll_mask_generation(ctx)`, `poll_engine(ctx)`, then
+   `poll_postprocess()` (a raw answer that landed in this poll starts its derivation now).
 
 ```
 «Обработать» -> start_run()             capture the clean-overlay chunk, send a RegionLoadRequest
              -> poll_region_load()      the loader worker answers -> hand_region_to_engine()
              -> AiEngine::start()       the engine's own worker runs the model
              -> poll_engine() each frame -> Done -> accept_result() -> ResultLayer
+                                         -> DoneRaw -> accept_raw_result() -> PendingRaw (worker)
+             -> request_postprocess() / poll_postprocess() each frame: first derivation ->
+                                         ResultLayer, later ones replace its pixels in place
+                                         while the settings change
 «Сгенерировать маску» -> start_mask_generation() -> poll_region_load() (purpose MaskGeneration)
              -> start_mask_detection() -> poll_mask_generation() -> accept_generated_mask()
 ```
@@ -382,6 +406,25 @@ Host contracts:
   back UNTOUCHED (`restore_untouched_marked_pixels`), so a mark outside an inpainting mask can
   never reach the clean overlay through «Применить». A pixel the engine changed is the engine's
   answer and is kept. The other two modes never put marks into the region at all.
+- **A run's answer is pixels, final or raw (D12 amended, plan §13.3).** An engine whose
+  `postprocess_settings()` is `Some` answers `EnginePoll::DoneRaw(RawRegionResult { image, mask,
+  sample_mask, whole_region })` — the RAW model output plus the run facts only the engine knows —
+  and every other engine answers `Done` with final pixels. Whether the run is raw is decided at
+  hand-off (`hand_region_to_engine` keeps a `RunCapture` instead of a `MarksRestore`); the other
+  pairing (`Done` after a capture, `DoneRaw` without one) is a logged contract violation and is
+  refused. The HOST owns the post-process: the composite BASE is the unmarked region (so outside
+  the run mask the result is the page as loaded, original alpha included, and marks never bleed
+  into it), the colour-match REFERENCE is the region the model was sent. The pending result is
+  re-derived from the kept raw answer whenever the engine's live settings change (re-read every
+  frame, like `constraints()`); the first derivation runs while the frame is still `Processing`,
+  later ones replace the shown pixels in place (`ResultLayer::replace_image`): a re-derivation of
+  the SAME pending result (`Lineage`: the host's `raw_lineage` id) uploads only the mask's
+  bounding box (`TextureHandle::set_partial`), since outside the run mask every derivation is the
+  original; anything else is one full `TextureHandle::set`. While one is in flight the frame is SETTLING: «Применить» is closed and
+  the status line says so, `processing` is never toggled, «Сравнить» / «Отменить» stay.
+  `cancel_run`, `apply_result` and `deactivate` drop the capture and the worker. A failed
+  derivation is logged with its detail and shown as `error_postprocess`: the first one releases
+  the frame without a result, a later one keeps the last good result as a final one.
 - **Apply validates the size and refuses (D7).** `check_result_fits` rejects a wrong size or an
   out-of-overlay rectangle before `replace_overlay_region_px` could rescale or clip; the same
   check runs on the engine's answer (`accept_result`) and on the loaded region
@@ -423,10 +466,23 @@ Host contracts:
   (`the_area_editor_never_publishes_the_editor_window_context`). It takes no canvas gesture.
 - **Nothing blocks the GUI thread**: the only GUI-thread work of a job is capturing an
   in-memory overlay chunk when it starts and, when marks are drawn, ONE per-pixel pass over the
-  region at hand-off (`prepare_run_marks`: a composite or a copy of the marks layer) plus the
-  same order of work once on accept (`restore_untouched_marked_pixels`). Both are linear in the
-  frame size and happen once per run, never per frame; moving them into the shared loader
-  worker would widen `base.rs`'s `RegionLoadRequest` for every tool, so they stay here.
-- Every `t!` key of the host lives under `cleaning.tools.area_editor.*` (generation-block keys are
-  the mask editor's own `cleaning.mask_editor.*`); the dock tab caption is
-  `cleaning.tab.area_editor_tab`.
+  region at hand-off (`prepare_run_marks`: a composite or a copy of the marks layer), one region
+  copy for a raw-answer engine (`RunCapture`), plus the same order of work once on accept
+  (`restore_untouched_marked_pixels`). These are linear in the frame size and happen once per
+  run; moving them into the shared loader worker would widen `base.rs`'s `RegionLoadRequest` for
+  every tool, so they stay here. The post-process itself, RGB conversion and the composition of
+  the shown image included, runs on its own worker; the GUI thread only moves each finished
+  derivation into the result layer and re-uploads it into the existing texture
+  (`ResultLayer::replace_image` shares the pixels with the upload, no copy). That re-upload
+  happens once per DERIVATION, so up to every frame while a dial is dragged.
+- **A failed re-derivation keeps the last good result** (a deliberate choice): the first failed
+  derivation of a raw answer releases the frame with no result, but a later one (reachable only
+  through a worker panic or a `Render` error the normalized settings cannot produce) drops the
+  worker and leaves the last shown image pending with «Применить» open, so the user is never
+  locked out. From then on post-process edits no longer re-derive it; the error is reported
+  once. The stricter alternative (drop the result like a cancel) was considered and not taken.
+- The host's own `t!` keys live under `cleaning.tools.area_editor.*`; the frame's button and
+  status vocabulary it repeats in its panels and messages is the frame's `cleaning.region_frame.*`
+  (`button.*`, `status.result_settling`), the brush-size label is the shared
+  `cleaning.common.size_label`, generation-block keys are the mask editor's own
+  `cleaning.mask_editor.*`, and the dock tab caption is `cleaning.tab.area_editor_tab`.

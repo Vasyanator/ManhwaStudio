@@ -28,14 +28,18 @@ host frame + painted mask (+ marks reference) + session references
   -> settings.normalized().to_params(whole_region)       (the ONLY wire params)
   -> run_flux3_klein (worker, streaming, generation-guarded bar, stage ids)
   -> parse_flux3_run_answer (strict image_len, exact size, echoed seed)
-  -> AiEngine::poll -> EnginePoll::Done(pixels)
+  -> AiEngine::poll -> EnginePoll::DoneRaw(raw region, mask, whole_region)
+  -> host: ms_region_postprocess with AiEngine::postprocess_settings (re-read every frame)
 ```
 
 How the model edits a region (backend `inpaint/flux3_klein/region.py`): FLUX.3 has no mask
 input, so the REGION is reference #0 and the output is the region's size; the painted mask is
-permission to change and the backend composites the result inside it (feather + colour match),
-everything outside stays byte-identical; an EMPTY mask is the whole-region mode
-(`mask_for_run`). User references follow as #1.., the marks reference is appended last.
+permission to change: the backend only validates it and answers the RAW region (protocol 17), and
+the HOST composites it inside the mask (feather + colour match, `ms_region_postprocess`, the
+engine's persisted «Постобработка» settings), so everything outside stays byte-identical and a
+settings change re-derives a pending result without a new run; an EMPTY mask is the
+whole-region mode (`mask_for_run`), with no ring to colour-match against. User references
+follow as #1.., the marks reference is appended last.
 
 The model-agnostic parts are not here: `../shared/` (progress + `stream_call`, the Hugging Face
 check / plan / token / download and their drawing, the settings-file quarantine and save
@@ -44,16 +48,18 @@ two-axis widget with the format rows and «Энкодер на CPU»).
 
 ## Files and submodules
 - `mod.rs`: root — constants (frame limits mirrored from the backend's `wire.py`, nine extra
-  references, steps 1..64 default 16, feather, mask tint, adapter / engine id, repository,
-  default prompt, timeouts).
+  references, steps 1..64 default 16, mask tint, adapter / engine id, repository, default
+  prompt, timeouts). Feather and colour-match ranges are `ms_region_postprocess`'s.
 - `settings.rs`: `Flux3KleinSettings` (+ `Flux3SourceMode`, `Flux3Format`, `Flux3Fp8Compute`),
   `normalized()`, `effective_root()` (THE package root of both modes), `to_params()` (exactly
-  the backend's 15 `FIELDS`), the settings-file load/save.
+  the backend's 13 `FIELDS`), the flattened `postprocess: PostprocessSettings` (persisted,
+  never sent), the settings-file load/save.
 - `references.rs`: `Flux3References` (session list, capacity, marks-reference room) and
   `read_reference_file` (worker: decode any image, re-encode through the tab's PNG codec).
 - `status.rs`: `Flux3Status`, `flux3_status_for_root` (stale guard), `flux3_model_readiness`
   (`Unknown` never blocks; `NoRoot` / `Missing` do).
-- `wire.rs`: `flux3_run_request`, `run_flux3_klein`, `parse_flux3_run_answer`,
+- `wire.rs`: `flux3_run_request`, `run_flux3_klein` (answer + the run's mask and mode,
+  `Flux3RunOutcome`), `parse_flux3_run_answer` (`Flux3RunAnswer`),
   `fetch_flux3_status`, `unload_flux3_klein`.
 - `download.rs`: the token + format header (the ONE place the token goes on the wire), the
   echo-format staleness rule, the two download calls over the shared ones.
@@ -72,9 +78,13 @@ two-axis widget with the format rows and «Энкодер на CPU»).
 - **`normalized().to_params()` is the only wire value.** An unknown key is refused by the
   backend by name, so the key set is pinned by a test; `fp8_compute` travels as chosen only for
   fp8r; `encoder_on_cpu` (default on, also for an old file) travels in the run, the status and the
-  forecast; so do `color_match_local_pct` (0..=100, default 60) and `color_match_scale_px`
-  (Gaussian sigma of the finest averaging level, 8..=96, default 24), sent as stored — the backend applies the local match only under
-  `color_match` and never in a whole-region run.
+  forecast. The «Постобработка» settings never travel (the backend refuses their keys).
+- **Post-processing is the host's**: every run answers `EnginePoll::DoneRaw` with the raw
+  region, the mask the run sent and `whole_region` (`sample_mask: None`: FLUX.3 has no separate
+  latent mask), and `postprocess_settings()` is `Some(settings.postprocess.normalized())` for
+  the engine's whole life. The four persisted keys (`mask_feather_px`, `color_match`,
+  `color_match_local_pct`, `color_match_scale_px`) are flattened, so an older file keeps its
+  values and the saved key set is unchanged (pinned by a test).
 - **The seed is the user's or random**: blank field = `null` (the backend draws one and echoes
   it, shown in the run line and offered as «Повторить этот сид»); an invalid text blocks the run
   and is never persisted.
@@ -96,7 +106,8 @@ two-axis widget with the format rows and «Энкодер на CPU»).
 - **A damaged settings file is never overwritten** (shared rules); a JSON array is no document.
 
 ## Editing map
-- A persisted parameter: `settings.rs`, then the `ui/` file that draws it.
+- A persisted parameter: `settings.rs`, then the `ui/` file that draws it. Feather / colour
+  match: `ms_region_postprocess` (settings, ranges, body UI) and `../shared/postprocess_section.rs`.
 - What a line or refusal SAYS: `decisions.rs` + its test; what `.status` MEANS: `status.rs`.
 - A request or response shape: `wire.rs` / `download.rs` — a protocol change (bump
   `PROTOCOL_VERSION` on both sides; the Python split is `ipc/handlers/flux3_klein.py`).
@@ -104,4 +115,4 @@ two-axis widget with the format rows and «Энкодер на CPU»).
 - What happens when a control is pressed: `engine/actions.rs`; what is kept between frames and
   when a query is re-armed: `engine/mod.rs`.
 - Texts: `cleaning.tools.flux3_klein.*` in `crates/ms-i18n/locales/{en,ru}.json`; a new key also
-  goes into `test_support.rs`'s key list.
+  goes into `test_support.rs`'s key list (the shared «Постобработка» keys are `POSTPROCESS_KEYS`).

@@ -19,7 +19,7 @@ Main responsibilities:
 - validate a run request and turn it into the run's pixels (`run_input`);
 - keep the derived state honest between frames: reload the settings once, save them when
   they settle, re-query the catalog when the paths change, re-arm the forecast when the
-  region SIZE settles, and drop the undo history when the region moves;
+  region SIZE settles, and cancel the run in flight when the region moves;
 - answer the questions the panel gates on — `pipeline_busy`, `model_readiness`,
   `status_for_current_paths`, `prompt_cache_state`, `download_check_current`;
 - name the work that makes leaving this engine unsafe (`switch_block_reason`), which is
@@ -280,7 +280,7 @@ impl Flux2KleinEngine {
             settings_save_blocked: false,
             settings_loaded: false,
             dirty: false,
-            saver: SettingsSaver::new(save_flux2_settings),
+            saver: SettingsSaver::new(save_flux2_settings, FLUX2_LOG_LABEL),
             status: None,
             status_rx: None,
             status_error: None,
@@ -395,15 +395,19 @@ impl Flux2KleinEngine {
     /// A settings file that could not be read or moved aside is never written: the edits
     /// stay in memory (`dirty` kept) and the panel says why.
     ///
+    /// A change is written only once it stayed unchanged for the shared
+    /// `SETTINGS_SAVE_DEBOUNCE` (a dragged dial changes it every frame); [`AiEngine::poll`]
+    /// wakes the GUI when that quiet time ends (`saver.wake_after`). A value still owed when
+    /// the engine is dropped is flushed by the saver on a worker.
+    ///
     /// A FAILED write is not success: `dirty` is restored, the localized reason is shown
     /// (`saver.error`), and the next attempt waits the shared `save_retry_delay` (2 s
-    /// doubling to 60 s). A successful write clears all of it.
-    pub(super) fn poll_and_maybe_save(&mut self) {
+    /// doubling to 60 s). A successful write clears all of it. `now` is the poll's clock.
+    pub(super) fn poll_and_maybe_save(&mut self, now: Instant) {
         self.saver.poll(
-            Instant::now(),
+            now,
             SaveGate { dirty: &mut self.dirty, loaded: self.settings_loaded, blocked: self.settings_save_blocked },
             &self.settings,
-            FLUX2_LOG_LABEL,
             |err| tf!("cleaning.tools.flux2_klein.settings_save_error", err = err),
         );
     }
@@ -531,7 +535,9 @@ impl Flux2KleinEngine {
 
     /// Records a parameter change and re-arms the background answers it invalidated.
     ///
-    /// The memory forecast is re-armed as a whole, because any parameter can move it. The
+    /// The memory forecast is re-armed as a whole, because any parameter can move it — any
+    /// but the «Постобработка» values, whose edits go through
+    /// [`Self::note_postprocess_changed`] instead. The
     /// `.status` catalog is re-asked only when the change moved the EFFECTIVE PATHS: the
     /// catalog is an answer about exactly those three paths, so a change that leaves them
     /// alone cannot make it stale — and arming unconditionally would fire an IPC per frame
@@ -541,17 +547,26 @@ impl Flux2KleinEngine {
     /// The one-off "the damaged file was moved aside" notice retires with the first edit;
     /// a blocked save keeps its line.
     pub(super) fn note_settings_changed(&mut self) {
-        self.dirty = true;
+        self.note_postprocess_changed();
         self.resources.arm();
-        if matches!(self.settings_problem, Some(SettingsProblem::MovedAside(_))) {
-            self.settings_problem = None;
-        }
         if flux2_status_paths_stale(
             &self.settings.effective_paths(),
             self.status_paths.as_ref(),
             self.status_query_paths.as_ref(),
         ) {
             self.status_wanted = true;
+        }
+    }
+
+    /// Records a change of the «Постобработка» values ONLY: a save is owed and the one-off
+    /// "moved aside" notice retires, but neither the forecast nor `.status` is re-armed —
+    /// post-processing runs in the host after the run and is no part of either question
+    /// (`to_profiles_params` leaves those keys out), and a dragged dial changes it on every
+    /// frame. Any other change goes through [`Self::note_settings_changed`].
+    pub(super) fn note_postprocess_changed(&mut self) {
+        self.dirty = true;
+        if matches!(self.settings_problem, Some(SettingsProblem::MovedAside(_))) {
+            self.settings_problem = None;
         }
     }
 
@@ -820,8 +835,17 @@ impl AiEngine for Flux2KleinEngine {
         MarksSupport::new(MarksMode::SeparateReference).with(MarksMode::OverlayOnRegion)
     }
 
+    /// Always `Some`: every run answers RAW pixels (`EnginePoll::DoneRaw`), and the host
+    /// finishes them with these values — the in-memory settings, so an edit in «Постобработка»
+    /// re-derives a pending result on the next frame, before (and whether or not) the file is
+    /// saved. The in-memory settings exist from construction, before the file load lands.
+    fn postprocess_settings(&self) -> Option<PostprocessSettings> {
+        Some(self.settings.postprocess.normalized())
+    }
+
     fn draw_parameters(&mut self, ui: &mut egui::Ui) {
         let mut settings_changed = false;
+        let mut postprocess_changed = false;
         let mut want_status = false;
         let mut want_forecast = false;
         let mut resources_actions: Vec<ResourcesAction> = Vec::new();
@@ -919,6 +943,7 @@ impl AiEngine for Flux2KleinEngine {
                 download_status: download_status.as_deref(),
                 ai_backend_available: *ai_backend_available,
                 settings_changed: &mut settings_changed,
+                postprocess_changed: &mut postprocess_changed,
                 want_status: &mut want_status,
                 want_forecast: &mut want_forecast,
                 resources_actions: &mut resources_actions,
@@ -941,6 +966,8 @@ impl AiEngine for Flux2KleinEngine {
 
         if settings_changed {
             self.note_settings_changed();
+        } else if postprocess_changed {
+            self.note_postprocess_changed();
         }
         if want_status {
             self.status_wanted = true;
@@ -1143,10 +1170,16 @@ impl AiEngine for Flux2KleinEngine {
 
         let region = self.region_size();
         self.poll_and_maybe_query_profiles(region);
-        self.poll_and_maybe_save();
+        let now = Instant::now();
+        self.poll_and_maybe_save(now);
         // A cap edit waits for its quiet time with no input event to wake the GUI.
-        if self.resources.wants_repaint() || self.saver.retry_pending() {
+        if self.resources.wants_repaint() {
             ctx.request_repaint_after(LIMITS_EDIT_DEBOUNCE);
+        }
+        // So does a settings change (its save debounce), a failed save's retry and a write in
+        // flight: the saver says exactly when it needs the next poll.
+        if let Some(after) = self.saver.wake_after(now) {
+            ctx.request_repaint_after(after);
         }
 
         match run {
@@ -1157,7 +1190,9 @@ impl AiEngine for Flux2KleinEngine {
                 ctx.request_repaint();
                 EnginePoll::Running
             }
-            Flux2RunPoll::Done(image) => EnginePoll::Done(image),
+            // RAW pixels: the host composites, feathers and colour-matches them with the live
+            // `postprocess_settings()` (protocol 17 moved all of that out of the backend).
+            Flux2RunPoll::Done(raw) => EnginePoll::DoneRaw(raw),
             Flux2RunPoll::Failed(err) => EnginePoll::Failed(err),
         }
     }
@@ -1197,9 +1232,9 @@ impl AiEngine for Flux2KleinEngine {
     ///   `region_resize_pending` until `geometry_settled` — one request when the handle is
     ///   released, no matter how many sizes the drag passed through.
     ///
-    /// The cancel-and-clear half stays keyed to the rectangle's IDENTITY: a rectangle that
-    /// moved describes another part of the page, so a run in flight would answer about the
-    /// previous one and the pre-run images kept for chaining runs stop describing anything.
+    /// The cancel half stays keyed to the rectangle's IDENTITY: a rectangle that moved
+    /// describes another part of the page, so a run in flight would answer about the
+    /// previous one.
     /// In practice it fires only on a deliberate move — a frame holding a run or a result is
     /// locked and neither the user nor the keep-in-view clamp moves it — but the engine
     /// cannot see the frame's lock and must not depend on it.
@@ -1213,7 +1248,6 @@ impl AiEngine for Flux2KleinEngine {
                 self.run_status =
                     Some(t!("cleaning.mask_editor.processing_cancelled_status").to_string());
             }
-            self.session.clear();
         }
         if self.region_resize_pending && geometry_settled {
             self.region_resize_pending = false;
@@ -1227,11 +1261,11 @@ mod tests {
     use super::*;
     use crate::tools::region_edit_v2::engine_settings::settings_save_due;
 
-    /// The undo entries describe the rectangle they were captured from, so a frame that
-    /// moves or resizes invalidates them. `same_region` is what decides that, because
-    /// `OverlayRectPx` derives no `PartialEq` to lean on.
+    /// A run in flight describes the rectangle it started from, so a frame that moves or
+    /// resizes cancels it. `same_region` is what decides that, because `OverlayRectPx`
+    /// derives no `PartialEq` to lean on.
     #[test]
-    fn a_moved_frame_is_a_new_region_and_drops_the_undo_history() {
+    fn a_moved_or_resized_frame_is_a_new_region() {
         let rect = |x, y, w, h| OverlayRectPx { x, y, w, h };
         assert!(same_region(None, None));
         assert!(same_region(Some(&rect(1, 2, 64, 64)), Some(&rect(1, 2, 64, 64))));
@@ -1244,11 +1278,6 @@ mod tests {
             "a resize is a new region"
         );
         assert!(!same_region(Some(&rect(1, 2, 64, 64)), None));
-
-        let mut session = Flux2SessionState::default();
-        session.push_undo(egui::ColorImage::filled([2, 2], Color32::WHITE));
-        session.clear();
-        assert!(session.undo_stack.is_empty());
     }
 
     /// A 4B settings document that carries `uncensored_text_encoder: true` — hand-edited, or
@@ -1340,7 +1369,7 @@ mod tests {
     #[test]
     fn a_change_made_before_the_initial_load_is_kept_pending() {
         let mut engine = Flux2KleinEngine { settings_loaded: false, dirty: true, ..Default::default() };
-        engine.poll_and_maybe_save();
+        engine.poll_and_maybe_save(Instant::now());
         assert!(engine.dirty, "the change must survive until it can be written");
         assert!(engine.saver.rx.is_none(), "and no writer may have been started");
     }
@@ -1497,7 +1526,7 @@ mod tests {
         assert!(engine.settings_save_blocked);
         engine.settings.steps += 1;
         engine.note_settings_changed();
-        engine.poll_and_maybe_save();
+        engine.poll_and_maybe_save(Instant::now());
         assert!(engine.saver.rx.is_none(), "no writer may touch the damaged file");
         assert!(engine.dirty, "the edit is kept in memory");
         assert!(
@@ -1507,7 +1536,8 @@ mod tests {
     }
 
     /// A failed write is not success: the edit stays pending, the error is visible, the retry
-    /// waits for its backoff, and a later success clears everything.
+    /// waits for its backoff, and a later success clears everything. Every write waits out
+    /// the save debounce first. The clock is explicit; only the worker's answer is awaited.
     #[test]
     fn a_failed_save_keeps_the_edit_pending_and_retries_later() {
         fn failing(_: &Flux2KleinSettings) -> Result<(), String> {
@@ -1516,38 +1546,66 @@ mod tests {
         fn succeeding(_: &Flux2KleinSettings) -> Result<(), String> {
             Ok(())
         }
-        let mut engine = Flux2KleinEngine { settings_loaded: true, dirty: true, saver: SettingsSaver::new(failing), ..Flux2KleinEngine::default() };
-        engine.poll_and_maybe_save();
-        assert!(engine.saver.rx.is_some(), "the write started");
-        for _ in 0..2000 {
-            engine.poll_and_maybe_save();
-            if engine.saver.rx.is_none() {
-                break;
+        fn drain(engine: &mut Flux2KleinEngine, now: Instant) {
+            for _ in 0..2000 {
+                engine.poll_and_maybe_save(now);
+                if engine.saver.rx.is_none() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            panic!("the settings writer never answered");
         }
+        let start = Instant::now();
+        let settled = start + SETTINGS_SAVE_DEBOUNCE;
+        let mut engine = Flux2KleinEngine { settings_loaded: true, dirty: true, saver: SettingsSaver::new(failing, "test"), ..Flux2KleinEngine::default() };
+        engine.poll_and_maybe_save(start);
+        assert!(engine.saver.rx.is_none(), "no write inside the quiet time");
+        engine.poll_and_maybe_save(settled);
+        assert!(engine.saver.rx.is_some(), "the write started once the value settled");
+        drain(&mut engine, settled);
         assert!(engine.dirty, "the unsaved edit is still pending");
         assert!(engine.saver.error.is_some(), "and the failure is visible");
         assert_eq!(engine.saver.failures, 1);
         assert!(engine.saver.retry_at.is_some());
-        engine.poll_and_maybe_save();
+        engine.poll_and_maybe_save(settled + Duration::from_secs(1));
         assert!(engine.saver.rx.is_none(), "no retry before the backoff elapsed");
 
         // The backoff elapses; the next attempt succeeds and clears the failure state.
-        engine.saver.retry_at = Some(Instant::now());
+        let retried = settled + save_retry_delay(1);
         engine.saver.write = succeeding;
-        engine.poll_and_maybe_save();
+        engine.poll_and_maybe_save(retried);
         assert!(engine.saver.rx.is_some(), "retried once the backoff elapsed");
-        for _ in 0..2000 {
-            engine.poll_and_maybe_save();
-            if engine.saver.rx.is_none() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+        drain(&mut engine, retried);
         assert!(!engine.dirty);
         assert!(engine.saver.error.is_none() && engine.saver.retry_at.is_none());
         assert_eq!(engine.saver.failures, 0);
+    }
+
+    /// A «Постобработка» edit owes a save but re-arms neither the forecast nor the catalog
+    /// (they do not depend on it, and a dragged dial changes it every frame); any other edit
+    /// still re-arms the forecast.
+    #[test]
+    fn a_postprocess_only_change_does_not_re_arm_the_forecast() {
+        let mut engine = Flux2KleinEngine {
+            settings: runnable_settings(),
+            settings_loaded: true,
+            status_paths: Some(runnable_settings().effective_paths()),
+            status_wanted: false,
+            settings_problem: Some(SettingsProblem::MovedAside(PathBuf::from("/tmp/x.malformed-1.json"))),
+            ..Flux2KleinEngine::default()
+        };
+        engine.resources.wanted = false;
+        engine.settings.postprocess.mask_feather_px += 1;
+        engine.note_postprocess_changed();
+        assert!(engine.dirty, "a save is owed");
+        assert!(!engine.resources.wanted, "the forecast is not re-asked");
+        assert!(!engine.status_wanted, "nor the catalog");
+        assert!(engine.settings_problem.is_none(), "the one-off notice retires like on any edit");
+
+        engine.settings.steps += 1;
+        engine.note_settings_changed();
+        assert!(engine.resources.wanted, "a forecast parameter re-arms it");
     }
 
     /// The moved-aside notice is a one-off: the first edit retires it.
@@ -1767,8 +1825,8 @@ mod tests {
         // Every parameter the panel offers, at a value away from its default: none of
         // them may turn the empty-mask answer back into a refusal.
         engine.settings.mask_dilate_px = 0;
-        engine.settings.mask_feather_px = 0;
-        engine.settings.color_match = false;
+        engine.settings.postprocess.mask_feather_px = 0;
+        engine.settings.postprocess.color_match = false;
         engine.settings.set_step_choice(StepChoice { vram: VramStep::Min, ram: RamStep::Min });
         assert!(engine.allows_empty_mask(), "no parameter may gate the empty-mask rule");
 

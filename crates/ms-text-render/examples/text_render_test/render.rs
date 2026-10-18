@@ -2663,11 +2663,19 @@ fn apply_glow_effect_v2(image: &mut RenderedTextImage, glow: &GlowEffectParams) 
         return;
     }
 
-    let dist2_map = euclidean_distance_transform_to_mask(
+    // `contour_mask` is `out_width * out_height` by construction, so the shape error cannot
+    // occur; it is still reported instead of panicking.
+    let dist2_map = match ms_raster::squared_distance_to_mask(
         contour_mask.as_slice(),
         out_width as usize,
         out_height as usize,
-    );
+    ) {
+        Ok(dist2_map) => dist2_map,
+        Err(err) => {
+            eprintln!("glow_v2: distance transform failed: {err}");
+            return;
+        }
+    };
     let radius2 = radius * radius;
 
     for idx in 0..dist2_map.len() {
@@ -2766,94 +2774,6 @@ fn bias01(t: f32, b: f32) -> f32 {
     let b = b.clamp(0.01, 0.99);
     let k = (1.0 / b) - 2.0;
     (t / (k * (1.0 - t) + 1.0)).clamp(0.0, 1.0)
-}
-
-fn euclidean_distance_transform_to_mask(mask: &[u8], width: usize, height: usize) -> Vec<f32> {
-    const INF: f32 = 1.0e15;
-
-    let mut tmp = vec![INF; width * height];
-    let mut dist2 = vec![INF; width * height];
-    let mut f = vec![0.0f32; width.max(height)];
-    let mut d = vec![0.0f32; width.max(height)];
-
-    for x in 0..width {
-        for (y, fi) in f[..height].iter_mut().enumerate() {
-            let idx = y * width + x;
-            *fi = if mask[idx] > 0 { 0.0 } else { INF };
-        }
-        edt_1d(f[..height].as_ref(), d[..height].as_mut(), INF);
-        for y in 0..height {
-            tmp[y * width + x] = d[y];
-        }
-    }
-
-    for y in 0..height {
-        let row = y * width;
-        f[..width].copy_from_slice(&tmp[row..(width + row)]);
-        edt_1d(f[..width].as_ref(), d[..width].as_mut(), INF);
-        dist2[row..(width + row)].copy_from_slice(&d[..width]);
-    }
-
-    dist2
-}
-
-fn edt_1d(f: &[f32], out: &mut [f32], inf: f32) {
-    let n = f.len();
-    if n == 0 {
-        return;
-    }
-    if !f.iter().any(|&v| v < inf * 0.5) {
-        out.fill(inf);
-        return;
-    }
-
-    let mut v = vec![0usize; n];
-    let mut z = vec![0.0f32; n + 1];
-    let mut k = 0usize;
-
-    v[0] = 0;
-    z[0] = f32::NEG_INFINITY;
-    z[1] = f32::INFINITY;
-
-    for q in 1..n {
-        let mut s = edt_intersection(f, q, v[k]);
-        while s <= z[k] {
-            if k == 0 {
-                break;
-            }
-            k -= 1;
-            s = edt_intersection(f, q, v[k]);
-        }
-
-        if s <= z[k] && k == 0 {
-            v[0] = q;
-            z[0] = f32::NEG_INFINITY;
-            z[1] = f32::INFINITY;
-            k = 0;
-            continue;
-        }
-
-        k += 1;
-        v[k] = q;
-        z[k] = s;
-        z[k + 1] = f32::INFINITY;
-    }
-
-    let mut kk = 0usize;
-    for (q, out_q) in out[..n].iter_mut().enumerate() {
-        while z[kk + 1] < q as f32 {
-            kk += 1;
-        }
-        let p = v[kk];
-        let dq = q as f32 - p as f32;
-        *out_q = dq * dq + f[p];
-    }
-}
-
-fn edt_intersection(f: &[f32], q: usize, p: usize) -> f32 {
-    let qf = q as f32;
-    let pf = p as f32;
-    ((f[q] + qf * qf) - (f[p] + pf * pf)) / (2.0 * (qf - pf))
 }
 
 fn apply_gradient2_effect(image: &mut RenderedTextImage, gradient: &Gradient2EffectParams) {

@@ -1,0 +1,36 @@
+[package]
+name = "ms-region-postprocess"
+version = "0.1.0"
+edition = "2024"
+
+# The one owner of the FLUX klein region post-processing: the persisted post settings (defaults,
+# ranges, the whole-region rule), the cv2-exact elliptical mask dilation (also the FLUX.2 latent
+# mask built BEFORE a run), the global and local colour match, the inward feather, the rounded
+# composite, the cached re-derivation (`RegionPostprocessor`) and the settings-section body UI.
+# The core is GUI-free, does no I/O and no logging; callers own threads, logs and textures.
+#
+# Layer: the `ms-studio-tab` line (directly above `ms-project / ms-widgets`). Every dependency
+# sits below it; it must never depend on a tab crate, `ms-models` or `ms-ai-api` — those may
+# depend on it.
+
+[dependencies]
+# The exact Euclidean distance transform behind the inward feather.
+ms-raster = { path = "../ms-raster" }
+# `WheelSlider`, the project replacement for `egui::Slider` (section body UI).
+ms-widgets = { path = "../ms-widgets" }
+# Localized labels and hints of the section body (`t!`), mounted crate-wide in `lib.rs`.
+ms-i18n = { path = "../ms-i18n" }
+# The section body draws into a caller's `egui::Ui`.
+egui.workspace = true
+# `PostprocessSettings` is embedded (flattened) in the engines' persisted settings.
+serde.workspace = true
+# Typed public error (`PostprocessError`).
+thiserror.workspace = true
+# Row-parallel passes of the local colour match (`local_match::grid::for_each_row`).
+rayon.workspace = true
+
+[dev-dependencies]
+# PNG decoding of the golden parity fixtures.
+image.workspace = true
+# `case.json` / `kernels.json` of the fixtures and the settings serde round trip.
+serde_json.workspace = true

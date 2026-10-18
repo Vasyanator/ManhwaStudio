@@ -19,6 +19,7 @@ engine (flux2_klein/, flux3_klein/)
                          gated_button
   -> settings_file       read_settings_file (quarantine), write_settings_json, SettingsSaver
   -> region_mask         mask_for_run
+  -> postprocess_section draw_postprocess_section (the «Постобработка» chrome, bottom-docked)
 ```
 `mod.rs` re-exports every submodule flat, so an engine writes `use super::shared::*;`. The
 forecast / caps / learned-floor half of «Память и скорость» is NOT here: it is
@@ -45,11 +46,21 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   the engine's), and `gated_button`.
 - `settings_file.rs`: `read_settings_file` (missing -> first run; damaged -> moved aside to the
   first free `<stem>.malformed-<unix_secs>[-<n>].json`, reserved with `create_new`; unreadable or
-  unquarantinable -> saving BLOCKED), `write_settings_json` (typed `SettingsWriteError`),
-  `SettingsSaver` + `SaveGate` (one writer, never before the load, never while blocked; a failed
-  write restores `dirty` and retries after `save_retry_delay`: 2 s doubling to 60 s).
+  unquarantinable -> saving BLOCKED), `write_settings_json` (atomic: a unique sibling temp
+  `.<name>.<pid>.<n>.tmp`, synced, renamed over the file; typed `SettingsWriteError`),
+  `SettingsSaver` + `SaveGate` (one writer, never before the load, never while blocked; a change
+  is written only after `SETTINGS_SAVE_DEBOUNCE` = 700 ms of quiet, detected BY VALUE so the
+  settings type is `PartialEq`; `wake_after(now)` says when the engine must be polled again; a
+  failed write restores `dirty` and retries after `save_retry_delay`: 2 s doubling to 60 s;
+  dropping the saver flushes a value still owed on a detached worker, after the write in
+  flight).
 - `region_mask.rs`: `mask_for_run` — painted -> verbatim + `whole_region = false`; empty -> a
   SOLID buffer + `whole_region = true`.
+- `postprocess_section.rs`: `draw_postprocess_section(ui, id, &mut PostprocessSettings) -> bool` —
+  `ms_widgets::panel_dock::elastic::bottom_aligned` around the region-editor section chrome
+  (collapsed by default, titled `ms_region_postprocess::section_title()`) around
+  `ms_region_postprocess::draw_postprocess_body`. For an engine whose runs answer raw pixels
+  (`AiEngine::postprocess_settings`); the host re-derives a pending result from what it edits.
 
 ## Contracts and invariants
 - **Nothing names a model.** Log lines take a `log_label`; user texts are
@@ -82,6 +93,17 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   the header the ENGINE builds; `HfTokenControl::input` is the entry buffer, cleared when the
   store worker takes it.
 - **A damaged settings file is never overwritten**, and an earlier aside copy is never replaced.
+- **A settings file is replaced atomically** (temp + sync + rename; `std::fs::rename` replaces an
+  existing file on Windows too: `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`), so a crash leaves
+  the old or the new complete document, and a dragged dial costs ONE write after it settles.
+  An engine wakes its GUI per `SettingsSaver::wake_after` instead of repainting every frame.
+  A detached teardown flush can still be cut short if the whole process exits within the few
+  milliseconds the write takes.
+- **The «Постобработка» section is the LAST thing of the scrolled body**, drawn directly in the
+  `Ui` the host hands `draw_parameters` (a `push_id` child is fine), never in a nested
+  `ScrollArea` or a pinned section: `bottom_aligned` measures the free room against that `Ui`.
+  Its `id` is stable and never localized. The body, defaults and ranges belong to
+  `ms-region-postprocess`; never copy a dial into an engine.
 - Visibility ceiling: `pub(in crate::tools::ai_editor::engines)`.
 
 ## Editing map
@@ -91,6 +113,9 @@ forecast / caps / learned-floor half of «Память и скорость» is 
   `hf_download.rs` (the wire literals are pinned by `dev-docs/flux2_model_download.md` §3 and matched by the
   backend's download module).
 - To change the token row or the download controls for every engine: `hf_download_ui.rs`.
-- To change the quarantine naming or the save backoff: `settings_file.rs`.
+- To change the quarantine naming, the temp naming, the save debounce or backoff, or the
+  teardown flush: `settings_file.rs`.
+- To change where the «Постобработка» section sits or its chrome: `postprocess_section.rs`; its
+  dials and texts: `ms-region-postprocess` (`ui.rs`).
 - Tests sit at the end of each file; the catalog tests (every key in every shipped locale, with
   its placeholders) are in `hf_download_ui.rs` and `stream_progress_ui.rs`.

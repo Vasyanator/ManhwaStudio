@@ -3910,6 +3910,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ms-region-postprocess"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "image 0.25.10",
+ "ms-i18n",
+ "ms-raster",
+ "ms-widgets",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "ms-settings-ui"
 version = "0.1.0"
 dependencies = [
@@ -4002,6 +4017,7 @@ dependencies = [
  "ms-platform",
  "ms-project",
  "ms-raster",
+ "ms-region-postprocess",
  "ms-studio-tab",
  "ms-sysprobe",
  "ms-tab-translation",
@@ -4205,6 +4221,7 @@ dependencies = [
  "ms-fonts",
  "ms-log",
  "ms-platform",
+ "ms-raster",
  "ms-text-util",
  "ms-theme",
  "rayon",

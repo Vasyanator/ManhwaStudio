@@ -10,6 +10,9 @@ edition = "2024"
 web-time.workspace = true
 ms-log = { path = "../ms-log" }
 ms-text-util = { path = "../ms-text-util" }
+# The one exact Euclidean distance transform (glow and dry-media effects call it through the
+# adapters in src/effects/image_ops.rs).
+ms-raster = { path = "../ms-raster" }
 # The bundled `fonts/ui` stack: the renderer builds its own deterministic fontdb
 # base out of it instead of loading the operating system's fonts
 # (see src/font_base.rs and dev-docs/unicode_base_font_plan.md, decision 1).

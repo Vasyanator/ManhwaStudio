@@ -4,8 +4,9 @@ File: cleaning/tools/ai_editor/engines/flux3_klein/ui/advanced.rs
 Purpose:
 «Для экспертов» of the FLUX.3 klein panel: the switches set once per machine or per page —
 «Референсы и в текстовый энкодер» (`vl_refs`), «Автоэнкодер в bfloat16», the fp8 matmul path
-(fp8r only), «Ограничить референсы», and the composite's feather and colour match (global, plus
-the local match's strength and scale, closed while the global one is off).
+(fp8r only) and «Ограничить референсы». The composite's feather and colour match are not here:
+they are the shared «Постобработка» section (`../../shared/postprocess_section.rs`) drawn last
+in the body by `mod.rs`.
 
 Key functions:
 - `draw_advanced_section()`
@@ -13,7 +14,7 @@ Key functions:
 Notes:
 Folded by default. Every control writes the persisted settings and raises `changed`; nothing
 here decides anything (the wire values are `Flux3KleinSettings::to_params`). Project widgets
-only (`WheelSlider`, `WheelComboBox`).
+only (`WheelComboBox`).
 */
 
 use super::*;
@@ -74,40 +75,5 @@ pub(super) fn draw_advanced_section(ui: &mut egui::Ui, settings: &mut Flux3Klein
             settings.reference_max_side = cap;
             *changed = true;
         }
-        *changed |= ui
-            .add(WheelSlider::new(&mut settings.mask_feather_px, 0..=FLUX3_FEATHER_MAX).text(t!("cleaning.tools.flux3_klein.mask_feather_label")))
-            .on_hover_text(t!("cleaning.tools.flux3_klein.mask_feather_hint"))
-            .changed();
-        *changed |= ui
-            .checkbox(&mut settings.color_match, t!("cleaning.tools.flux3_klein.color_match_label"))
-            .on_hover_text(t!("cleaning.tools.flux3_klein.color_match_hint"))
-            .changed();
-        // The local match refines the global one and the backend applies it only under it, so
-        // both dials close while the checkbox is off; the stored values are kept. A disabled
-        // `WheelSlider` ignores the wheel itself (`egui-docs/04-widgets.md`).
-        let color_match = settings.color_match;
-        ui.indent("cleaning_flux3_klein_color_match_local", |ui| {
-            *changed |= ui
-                .add_enabled(
-                    color_match,
-                    WheelSlider::new(&mut settings.color_match_local_pct, 0..=FLUX3_COLOR_MATCH_LOCAL_PCT_MAX)
-                        // A unit symbol, not prose: the project's percent dials spell it literally.
-                        .suffix("%")
-                        .text(t!("cleaning.tools.flux3_klein.color_match_local_label")),
-                )
-                .on_hover_text(t!("cleaning.tools.flux3_klein.color_match_local_hint"))
-                .on_disabled_hover_text(t!("cleaning.tools.flux3_klein.color_match_local_hint"))
-                .changed();
-            *changed |= ui
-                .add_enabled(
-                    color_match,
-                    WheelSlider::new(&mut settings.color_match_scale_px, FLUX3_COLOR_MATCH_SCALE_MIN..=FLUX3_COLOR_MATCH_SCALE_MAX)
-                        .suffix(t!("cleaning.tab.pixels_suffix"))
-                        .text(t!("cleaning.tools.flux3_klein.color_match_scale_label")),
-                )
-                .on_hover_text(t!("cleaning.tools.flux3_klein.color_match_scale_hint"))
-                .on_disabled_hover_text(t!("cleaning.tools.flux3_klein.color_match_scale_hint"))
-                .changed();
-        });
     });
 }

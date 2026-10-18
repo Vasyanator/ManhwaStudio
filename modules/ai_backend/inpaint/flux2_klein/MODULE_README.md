@@ -60,7 +60,8 @@ object itself.
 ## Files and submodules
 - `__init__.py`: the package docstring and the re-export block (plus the package-level `log`).
 - `params.py`: `normalize_flux2_klein_params` (including the optional `vram_step` / `ram_step`
-  and the by-name refusal of the retired placement wire, `RETIRED_FIELDS`),
+  and the by-name refusal of every retired field, `RETIRED_FIELDS`: the placement wire and the
+  region post-processing fields),
   `_whole_region_overrides`, `validate_region_size`, `effective_steps`,
   `_lenient_paths`, `encoder_on_cpu` (the «Энкодер на CPU» flag and its default, also read
   leniently by `status`), `text_encoder_dtype_name` and the coercion helpers.
@@ -200,10 +201,10 @@ which is what makes `assertLogs(svc.log)` capture records of the submodules.
   `_component_action_locked`); what a phase DOES with the modules (encode, warm-up, decode,
   device check) is `pipeline.py`.
 - To change the prompt-cache file format or the library layout, see `prompt_cache.py`.
-- To change the composite, the color match (global and local; its params are normalized in
-  `params.py`, applied in `service.py` against the dilated latent mask), or the mask morphology,
-  see `../region_imaging.py`
-  (shared with FLUX.3 klein).
+- The latent-mask dilation, the colour match and the composite are not here: the backend answers
+  the RAW decode and the Rust host post-processes it (`crates/ms-region-postprocess`). The wire
+  codecs (region, L8 mask, solid-mask check, PNG answer) are `../region_imaging.py` (shared with
+  FLUX.3 klein).
 - To change which token pairs `text_attention_in_mask` blocks, the token grid, or the mask's
   dtype/padding/size, see `attention.py` — and keep `text_attention_mask_bytes` the ONE formula
   the spec's denoise work and the allocation use. After a diffusers upgrade,

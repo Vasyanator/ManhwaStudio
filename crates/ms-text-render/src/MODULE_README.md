@@ -902,6 +902,9 @@ renderer contract. Internal modules may be reorganized as long as `types.rs` and
 - `ms-fonts` owns the bundled `fonts/ui` stack (paths, `NN-` order, family names,
   `'static` bytes) that `font_base.rs` turns into the render database. The renderer
   never resolves that directory itself.
+- `ms-raster` owns the exact Euclidean distance transform (`squared_distance_*`) that the
+  glow and dry-media effects use through the adapters in `effects/image_ops.rs`; a second EDT
+  copy in this crate (or its examples) is a defect.
 - `unicode-script` supplies the `Script` type of the `cosmic_text::Fallback` trait;
   cosmic-text does not re-export it, so it is a direct dependency.
 - `hyphenation` provides the embedded per-language hyphenation dictionaries; the

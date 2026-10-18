@@ -2,12 +2,13 @@
 File: cleaning/tools/ai_editor/engines/flux2_klein/session.rs
 
 Purpose:
-The per-session run state of the FLUX.2 klein engine: the channel a worker answers on,
-the per-RUN undo stack, and the file-dialog requests the panel opens.
+The per-session run state of the FLUX.2 klein engine: the channel a worker answers on
+and the file-dialog requests the panel opens.
 
 Main responsibilities:
-- own `Flux2SessionState` — the run receiver, the undo history and their bounds;
-- poll the worker and report what arrived (`Flux2RunPoll`);
+- own `Flux2SessionState` — the run receiver and the cancelled workers still ending;
+- poll the worker and report what arrived (`Flux2RunPoll`; a finished run is the RAW answer
+  plus its run facts, `RawRegionResult`, which the host post-processes);
 - write the one flag the backend reports back into the settings (`apply_backend_flags`:
   `vae_tiling` only — the memory steps are the user's and are never rewritten);
 - build the file-dialog request of each picker purpose (`flux2_picker_request`); the engine
@@ -43,22 +44,20 @@ pub(super) enum Flux2RunPoll {
     Idle,
     /// A run is still in flight.
     Running,
-    /// The run finished; the image is exactly the region the run started from.
-    Done(egui::ColorImage),
+    /// The run finished: the RAW image, exactly the region the run started from, with the
+    /// mask it ran under and the latent mask as the colour-match sample mask.
+    Done(RawRegionResult),
     /// The run failed, with an already-localized message.
     Failed(String),
 }
 
-/// State of the engine's runs: the channel the worker answers on and the region images
-/// that preceded the runs already reported.
+/// State of the engine's runs: the channel the worker answers on.
 ///
 /// The painted MASK is deliberately not here and must not come back: the host's `MaskStack`
-/// owns it and hands its bytes over in `EngineRunRequest::masks`.
+/// owns it and hands its bytes over in `EngineRunRequest::masks`. Neither is any region image:
+/// the pending result, and what Отменить restores, are the host's.
 #[derive(Default)]
 pub(super) struct Flux2SessionState {
-    /// Region images from before each finished run, most recent last, bounded by
-    /// [`FLUX2_UNDO_LIMIT`].
-    pub(super) undo_stack: Vec<egui::ColorImage>,
     pub(super) run_rx: Option<Receiver<Flux2JobResult>>,
     /// Cancelled operations (runs, downloads) whose workers have not ended yet; while one is
     /// running nothing new starts on the backend's pipeline (`Flux2KleinEngine::pipeline_busy`).
@@ -66,16 +65,9 @@ pub(super) struct Flux2SessionState {
 }
 
 impl Flux2SessionState {
-    /// Drops the run history. The caller is responsible for the run in flight
-    /// ([`Self::cancel_run`]) — dropping the receiver alone would leave the backend
-    /// generating an image nothing can receive.
-    pub(super) fn clear(&mut self) {
-        self.undo_stack.clear();
-    }
-
     /// Starts a run on a worker thread. A second run is refused while one is in flight.
     ///
-    /// `input.mask` is the L8 buffer that actually goes on the wire — the host's painted
+    /// `input.mask` is the run's L8 mask (dilated into the wire's latent mask on the worker) — the host's painted
     /// layer, or the solid one built for the whole-region mode — and `input.mask_size` is
     /// the region size it, `input.region` and the optional `input.reference` all describe.
     /// `input.whole_region` is the flag [`mask_for_run`] derived alongside that buffer and
@@ -101,10 +93,10 @@ impl Flux2SessionState {
         let (tx, rx) = mpsc::channel::<Flux2JobResult>();
         thread::spawn(move || {
             let result = run_flux2_klein(&input, &settings, &progress, &claim);
-            let _ = tx.send(Flux2JobResult {
-                source: input.region,
-                result,
-            });
+            // A failed send means the receiver is gone: the run was cancelled (its receiver
+            // sits in `abandoned`, which only waits for the disconnect) or the engine was
+            // dropped. Either way nobody wants the answer, so there is nothing to report.
+            let _ = tx.send(Flux2JobResult { mask: input.mask, whole_region: input.whole_region, result });
         });
         self.run_rx = Some(rx);
         Ok(())
@@ -153,12 +145,16 @@ impl Flux2SessionState {
                 self.run_rx = None;
                 match job.result {
                     Ok(outcome) => {
-                        self.push_undo(job.source);
                         if let Some(applied) = outcome.applied {
                             *settings_changed |= apply_backend_flags(settings, applied);
                         }
                         *status = Some(flux2_run_done_status(outcome.degraded.as_ref(), outcome.oom_recovered));
-                        Flux2RunPoll::Done(outcome.image)
+                        Flux2RunPoll::Done(RawRegionResult {
+                            image: outcome.image,
+                            mask: job.mask,
+                            sample_mask: Some(outcome.latent_mask),
+                            whole_region: job.whole_region,
+                        })
                     }
                     Err(err) => {
                         let message = tf!("cleaning.mask_editor.processing_error", err = err);
@@ -176,18 +172,6 @@ impl Flux2SessionState {
                 Flux2RunPoll::Failed(message)
             }
         }
-    }
-
-    /// Pushes one pre-run region image onto the undo stack, dropping the oldest entry
-    /// once [`FLUX2_UNDO_LIMIT`] is reached.
-    ///
-    /// The bound is what keeps a long session from accumulating megabytes of history
-    /// nobody will walk back to; the entries lost are always the oldest.
-    pub(super) fn push_undo(&mut self, image: egui::ColorImage) {
-        if self.undo_stack.len() >= FLUX2_UNDO_LIMIT {
-            self.undo_stack.remove(0);
-        }
-        self.undo_stack.push(image);
     }
 }
 
@@ -287,23 +271,6 @@ mod tests {
         // whole-region mode. The bytes on the wire are identical either way.
         let solid = vec![255u8; 32 * 16];
         assert_eq!(mask_for_run(&solid), (solid.clone(), false));
-    }
-
-    #[test]
-    fn the_undo_stack_is_bounded() {
-        let mut session = Flux2SessionState::default();
-        for index in 0..(FLUX2_UNDO_LIMIT + 3) {
-            // A distinguishable one-pixel entry: the width encodes the push order.
-            session.push_undo(egui::ColorImage::filled([index + 1, 1], Color32::WHITE));
-        }
-        assert_eq!(session.undo_stack.len(), FLUX2_UNDO_LIMIT);
-        // The oldest entries are the ones dropped, so the most recent run is always
-        // the one «Вернуть» restores.
-        assert_eq!(
-            session.undo_stack[FLUX2_UNDO_LIMIT - 1].size,
-            [FLUX2_UNDO_LIMIT + 3, 1]
-        );
-        assert_eq!(session.undo_stack[0].size, [4, 1]);
     }
 
     /// The whole rule, in one place: nothing painted is the whole-region mode and yields

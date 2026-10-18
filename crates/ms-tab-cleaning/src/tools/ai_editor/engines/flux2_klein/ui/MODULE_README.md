@@ -12,6 +12,7 @@ exactly one frame, and the `draw` method whose ORDER is the design:
 the PROMPT block (English field, the one cache line, the translator and library toggles)
 -> «Сила изменения» -> the READINESS line -> three SIBLING collapsible sections
 («Установка модели» / «Память и скорость» / «Для экспертов») -> the mask note
+-> «Постобработка» (the shared `draw_postprocess_section`, LAST: it docks at the bottom)
 ```
 
 Two more parts are drawn OUTSIDE that scrolled body, in the sections the host pins around it:
@@ -45,9 +46,12 @@ never work started from inside a widget closure.
 - `components.rs`: the merged
   component list — one row per component carrying presence, size, residency and the
   backend's own action buttons.
-- `advanced.rs`: «Для экспертов» — the generation parameters, the mask shaping (colour match
-  with its local strength / scale dials, closed while the colour match is off) and the
-  precision / VAE tiling / fp8-encoder switches. It holds the panel's only gated non-button
+- `advanced.rs`: «Для экспертов» — the generation parameters, the growth of the mask contour
+  (`mask_dilate_px`) and the precision / VAE tiling / fp8-encoder switches. The feather and the
+  colour match are NOT here: they are the host's post-process, drawn by the shared
+  «Постобработка» section (`../../shared/postprocess_section.rs`) over
+  `Flux2KleinSettings::postprocess`; its edits raise `Flux2PanelCtx::postprocess_changed` (a save,
+  no forecast question), never `settings_changed`. `advanced.rs` holds the panel's only gated non-button
   control: `guidance_scale`, closed on a distilled checkpoint.
 - `mask_hint.rs`: the mask hint the body closes with. The progress bar is the shared
   `draw_stream_progress`, called from `draw_flux2_progress_section` in `mod.rs`.
@@ -76,11 +80,6 @@ never work started from inside a widget closure.
   carries the disabled tooltip AND a line under it, because a section the user opened
   deliberately should not need a hover to explain a grey control. Its stored value is
   untouched while it is closed.
-- **A disabled `WheelSlider` still sees the mouse wheel.** `add_enabled` clears
-  `Response::hovered()` but not `contains_pointer()` — a disabled widget stays in egui's
-  hit test so `on_disabled_hover_text` can work — and the widget's wheel path keys on
-  `hovered() || contains_pointer()` (`crates/ms-widgets/src/wheel_slider.rs`). A closed `Wheel*`
-  control must therefore be handed a value the frame throws away, never the persisted one.
 - **A backend literal this build does not know degrades to "not known"**, with the literal
   on hover, and offers no action. It is never guessed into one of the known states.
 - **The two FLUX.2 klein engines draw the SAME body**, differing only where

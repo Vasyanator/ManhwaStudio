@@ -8,13 +8,14 @@ tokenizer, the budget probes and the transport's device are faked).
 
 Main responsibilities:
 - the run: the pipeline handle is admitted and loaded before the encoder, the
-  dilated latent mask and latents-only call, the composite, the guidance
-  decision (`is_distilled`), the local color match's params and mask, the
-  marks reference, `text_attention_in_mask`
-  (one mask from the dilated mask, dropped after the call), every refusal that
+  wire's latent mask passed to the pipeline unchanged and a latents-only call,
+  the RAW decode answered (no colour match, no composite), the guidance
+  decision (`is_distilled`), the marks reference, `text_attention_in_mask`
+  (one mask from the latent mask, dropped after the call), every refusal that
   must happen before anything loads, the variant guard;
 - the warm-up belongs to a cold load: a hot run reports load steps 0 and 9 only;
-- a field of the retired placement wire is refused before anything loads;
+- a retired field (placement wire, region post-processing) is refused before
+  anything loads;
 - a raising progress callback aborts the run and leaves no session in use;
 - the response: `applied` = `{vae_tiling}`, the requested / effective steps,
   `degraded`, no retired key; the encoder's between-runs state follows the
@@ -106,7 +107,7 @@ class InpaintRunTests(_RunCase):
         self.assertEqual(phases, ["denoise", "decode"])
 
     def test_a_retired_field_is_refused_before_anything_loads(self) -> None:
-        for field, value in (("placement", "full_gpu"), ("profile", "balanced"), ("unload_text_encoder_after_encode", True)):
+        for field, value in (("placement", "full_gpu"), ("profile", "balanced"), ("unload_text_encoder_after_encode", True), ("mask_dilate_px", 8), ("color_match", False)):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
                 self._run(**{field: value})
         self.assertEqual(self.large.status(), [])
@@ -149,36 +150,23 @@ class InpaintRunTests(_RunCase):
         # Run locks, reservations and leases were all returned: the next run is admitted.
         self.assertIn("image_png", self._run())
 
-    def test_the_result_is_the_region_size_and_untouched_outside_the_mask(self) -> None:
-        region, mask = _region()
-        out = self._run(color_match=False)
+    def test_the_answer_is_the_raw_decode_of_the_region_size(self) -> None:
+        # Protocol 17: no colour match and no composite here. The fixture's
+        # image processor decodes to a solid 210, the region is a solid 90, so
+        # a composite would show 90 outside the mask.
+        region, _mask = _region()
+        out = self._run()
         result = np.asarray(Image.open(__import__("io").BytesIO(out["image_png"])).convert("RGB"))
         self.assertEqual(result.shape, region.shape)
-        self.assertTrue(np.array_equal(result[mask == 0], region[mask == 0]))
+        self.assertTrue(np.all(result == 210))
 
-    def test_the_local_color_match_follows_its_params_and_the_latent_mask(self) -> None:
-        # `service` binds the helper by name, so the spy goes on that module.
-        from modules.ai_backend.inpaint.flux2_klein import service as service_module
-
-        region, mask = _region()
-        with patch.object(service_module, "match_color_local", wraps=region_imaging.match_color_local) as spy:
-            out = self._run(color_match_local_pct=35, color_match_scale_px=40, mask_dilate_px=8)
-            self._run(color_match_local_pct=0)
-            self._run(color_match=False, color_match_local_pct=80)
-        self.assertEqual(spy.call_count, 1)
-        args, kwargs = spy.call_args
-        self.assertEqual(kwargs, {"strength": 0.35, "scale_px": 40})
-        self.assertTrue(np.array_equal(args[2], region_imaging.dilate_mask(mask, 8)))
-        result = np.asarray(Image.open(__import__("io").BytesIO(out["image_png"])).convert("RGB"))
-        self.assertTrue(np.array_equal(result[mask == 0], region[mask == 0]))
-
-    def test_the_pipeline_is_asked_for_latents_and_a_dilated_mask(self) -> None:
+    def test_the_pipeline_is_asked_for_latents_and_gets_the_wire_mask_unchanged(self) -> None:
+        # The client dilates the latent mask; the backend applies no morphology.
         _region_rgb, mask = _region()
-        self._run(mask_dilate_px=8)
+        self._run()
         self.assertEqual(self.call["output_type"], "latent")
         self.assertIsNone(self.call.get("prompt", None))
-        latent_mask = np.asarray(self.call["mask_image"])
-        self.assertGreater(int((latent_mask > 0).sum()), int((mask > 0).sum()))
+        self.assertTrue(np.array_equal(np.asarray(self.call["mask_image"]), mask))
 
     @staticmethod
     def _steps(out: dict[str, Any]) -> tuple[Any, ...]:
@@ -792,22 +780,6 @@ class WholeRegionTests(_TempTreeCase):
         self.assertFalse(
             svc.normalize_flux2_klein_params(self.params())["whole_region"]
         )
-
-    def test_it_switches_off_the_dilate_and_the_color_match(self) -> None:
-        normalized = svc.normalize_flux2_klein_params(
-            self.params(whole_region=True, mask_dilate_px=32, color_match=True)
-        )
-        # Nothing to grow into, and no unchanged ring to take statistics from.
-        self.assertEqual(normalized["mask_dilate_px"], 0)
-        self.assertFalse(normalized["color_match"])
-
-    def test_it_leaves_the_feather_alone(self) -> None:
-        # The feather is what joins the regenerated region to the rest of the
-        # page, so it is the one mask parameter this mode keeps.
-        normalized = svc.normalize_flux2_klein_params(
-            self.params(whole_region=True, mask_feather_px=20)
-        )
-        self.assertEqual(normalized["mask_feather_px"], 20)
 
     def test_a_solid_mask_is_accepted(self) -> None:
         region_imaging.require_solid_mask(np.full((32, 32), 255, dtype=np.uint8))

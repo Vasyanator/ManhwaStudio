@@ -21,13 +21,15 @@ Key submodules:
 - `engine_settings`: engine-agnostic settings helpers shared by every hosted engine (the save gate)
 - `host`: `HostSpec` and `RegionEditHost` — the generic hosted tool
 - `host_panels`: the host's two panel bodies
+- `postprocess`: what a run of a raw-answer engine keeps, and the latest-wins worker that
+  derives (and re-derives) its pending result
 - `size_oracle` (test only): the frozen legacy size rules the live ones are swept against
 
 Notes:
 A consumer tool declares a `host::HostSpec` (id, title, id salts, log tag, engine catalog) and
 builds its tool with `host::RegionEditHost::new`; its engines implement `engine::AiEngine`.
-Everything is imported straight from the submodule that owns it; `render`, `input` and
-`host_panels` are internal. There are deliberately no flattening re-exports here.
+Everything is imported straight from the submodule that owns it; `render`, `input`,
+`postprocess` and `host_panels` are internal. There are deliberately no flattening re-exports here.
 Design and the decisions behind it: `dev-docs/region_edit_v2_plan.md`.
 */
 
@@ -41,6 +43,8 @@ pub mod layers;
 // Internal to the framework: their items are `pub(super)` and exist only to serve `frame`.
 mod input;
 mod render;
+// The host's raw-answer post-process (worker, generations), split from `host.rs` for size.
+mod postprocess;
 // The panel bodies of `host::RegionEditHost`, split from `host.rs` for size; one type.
 mod host_panels;
 // TEST ONLY: the frozen pre-extension size rules the live ones are swept against.

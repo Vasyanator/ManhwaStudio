@@ -10,7 +10,8 @@ run.
 Main responsibilities:
 - run one generation and read what it reports about memory (`run_flux2_klein`,
   `run_flux2_klein_pass`; any out-of-memory recovery is the BACKEND's, there is no client
-  retry);
+  retry); the painted mask is dilated into the LATENT mask here, on the worker, and the
+  answer is the backend's RAW decode;
 - query the component catalog and parse the answer (`fetch_flux2_status`,
   `parse_flux2_status`, `parse_flux2_component_snapshot`);
 - request a component load/unload and read the catalog it answers with;
@@ -68,7 +69,7 @@ pub(super) const FLUX2_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// the backend hands the pipeline as one extra condition image. Both are exactly
 /// `mask_size` pixels — the reference must undergo exactly the region's geometric
 /// preprocessing, and the backend guarantees that only for two images of one size. `mask`
-/// is the L8 buffer that goes on the wire and `whole_region` the mode [`mask_for_run`]
+/// is the run's L8 mask (the wire carries its dilation, the latent mask) and `whole_region` the mode [`mask_for_run`]
 /// derived for exactly that buffer.
 pub(super) struct Flux2RunInput {
     pub(super) region: egui::ColorImage,
@@ -78,8 +79,9 @@ pub(super) struct Flux2RunInput {
     pub(super) mask_size: [usize; 2],
 }
 
-/// Runs one FLUX.2 klein edit pass and returns the regenerated region plus what the
-/// backend reports about how it got there.
+/// Runs one FLUX.2 klein edit pass and returns the RAW regenerated region (the backend's
+/// decode, not composited, feathered or colour-matched — the host does that), the latent mask
+/// it was generated under, and what the backend reports about how it got there.
 ///
 /// `settings` must already be `normalized()`. `input.mask` is the L8 edit-permission mask
 /// in region coordinates and must be exactly `mask_size[0] * mask_size[1]` bytes matching
@@ -153,8 +155,21 @@ pub(super) fn run_flux2_klein_pass(
         return Err(t!("cleaning.inpaint.size_mismatch_error").to_string());
     }
 
+    // The LATENT mask (protocol 17): the painted mask grown by `mask_dilate_px` with the
+    // cv2-exact ellipse, built HERE on the worker (a 1 MP dilation is not GUI-thread work).
+    // A whole-region run has no contour to grow, so its solid mask is only binarized. The
+    // backend uses it verbatim, and the host colour-matches against the same mask afterwards
+    // (`RawRegionResult::sample_mask`), so the two can never disagree.
+    let radius = if whole_region { 0 } else { settings.mask_dilate_px };
+    let latent_mask = dilate_ellipse(mask, width, height, radius).map_err(|err| {
+        ms_log::runtime_log::log_error(format!(
+            "[cleaning] {FLUX2_LOG_LABEL}: latent mask dilation failed (region {width}x{height}, mask {} bytes, radius {radius} px): {err}",
+            mask.len()
+        ));
+        t!("cleaning.inpaint.size_mismatch_error").to_string()
+    })?;
     let image_png = encode_color_image_png_rgba(image)?;
-    let mask_png = encode_mask_png_l8(mask, width, height)?;
+    let mask_png = encode_mask_png_l8(&latent_mask, width, height)?;
     let reference_png = reference
         .as_ref()
         .map(encode_color_image_png_rgba)
@@ -210,6 +225,7 @@ pub(super) fn run_flux2_klein_pass(
     }
     Ok(Flux2RunOutcome {
         image: egui::ColorImage::from_rgba_unmultiplied([out_w, out_h], out_rgba.as_raw()),
+        latent_mask,
         oom_recovered: response_header
             .get("oom_recovered")
             .and_then(Value::as_bool)

@@ -4,11 +4,13 @@ File: cleaning/tools/ai_editor/engines/flux3_klein/test_support.rs
 Purpose:
 `cfg(test)` only: the fixtures the `mod tests` of this directory share — the English catalog
 under the crate's locale lock, a `.status` answer with dictated presence, a reference with a
-recognisable byte, and the list of every `cleaning.tools.flux3_klein.*` key the code spells.
+recognisable byte, and the list of every `cleaning.tools.flux3_klein.*` key the code spells plus
+the shared «Постобработка» keys the panel draws.
 
 Key items:
 - `english()`, `status_with()`, `test_reference()`
-- `FLUX3_PLAIN_KEYS`, `FLUX3_PLACEHOLDER_KEYS` (the stage keys come from `FLUX3_STAGES`)
+- `FLUX3_PLAIN_KEYS`, `FLUX3_PLACEHOLDER_KEYS` (the stage keys come from `FLUX3_STAGES`),
+  `POSTPROCESS_KEYS` (the shared section's full keys)
 
 Notes:
 Not a test module itself; it declares no `#[test]`.
@@ -40,30 +42,38 @@ pub(super) fn test_reference(name: &str, marker: u8) -> Flux3Reference {
 }
 
 /// Every `cleaning.tools.flux3_klein.<key>` without placeholders (the catalog test walks it).
-pub(super) const FLUX3_PLAIN_KEYS: [&str; 93] = [
-    "cancel_pending_error",
-    "advanced_heading", "ae_bf16_hint", "ae_bf16_label", "browse_folder_tooltip", "color_match_hint",
-    "color_match_label", "color_match_local_hint", "color_match_local_label", "color_match_scale_hint",
-    "color_match_scale_label", "download_cancelled_status", "download_destination_label", "download_hint",
+pub(super) const FLUX3_PLAIN_KEYS: [&str; 85] = [
+    "cancel_pending_error", "advanced_heading", "ae_bf16_hint", "ae_bf16_label",
+    "browse_folder_tooltip", "download_cancelled_status", "download_destination_label", "download_hint",
     "download_running_status", "empty_mask_error", "format_bf16_hint", "format_bf16_label",
     "format_fp8r_hint", "format_fp8r_label", "format_hint", "format_label", "format_nvfp4_hint",
-    "format_nvfp4_label", "fp8_compute_auto", "fp8_compute_dequant", "fp8_compute_hint", "fp8_compute_label",
-    "fp8_compute_scaled_mm", "install_button", "install_heading", "install_hint", "licence_link",
-    "mask_feather_hint", "mask_feather_label", "mask_heading", "mask_hint", "memory_heading",
-    "model_readiness_unknown_status", "model_ready_status", "model_root_dialog_title", "model_root_hint",
-    "model_root_label", "model_root_missing_status", "model_root_placeholder", "model_root_required_error",
+    "format_nvfp4_label", "fp8_compute_auto", "fp8_compute_dequant", "fp8_compute_hint",
+    "fp8_compute_label", "fp8_compute_scaled_mm", "install_button", "install_heading", "install_hint",
+    "licence_link", "mask_heading", "mask_hint", "memory_heading", "model_readiness_unknown_status",
+    "model_ready_status", "model_root_dialog_title", "model_root_hint", "model_root_label",
+    "model_root_missing_status", "model_root_placeholder", "model_root_required_error",
     "part_autoencoder", "part_text_encoder", "pipeline_busy_error", "prompt_hint", "prompt_label",
     "prompt_tooltip", "prompt_required_error", "reference_cap_hint", "reference_cap_label",
     "reference_cap_off", "references_add_button", "references_add_disabled_tooltip",
     "references_add_tooltip", "references_clear_button", "references_clear_tooltip",
     "references_dialog_title", "references_files_filter", "references_loading_error",
     "references_remove_tooltip", "references_tooltip", "refresh_state_button", "refresh_state_hint",
-    "residency_none", "residency_unloaded_status", "reuse_seed_button", "reuse_seed_tooltip", "seed_hint",
-    "seed_invalid_error", "seed_label", "seed_random_hint", "source_mode_download",
+    "residency_none", "residency_unloaded_status", "reuse_seed_button", "reuse_seed_tooltip",
+    "seed_hint", "seed_invalid_error", "seed_label", "seed_random_hint", "source_mode_download",
     "source_mode_download_hint", "source_mode_label", "source_mode_manual", "source_mode_manual_hint",
     "steps_hint", "switch_blocked_check", "switch_blocked_download", "title", "unload_button",
     "unload_disabled_tooltip", "unload_done_status", "unload_hint", "unload_nothing_status",
     "unload_requested_status", "vl_refs_hint", "vl_refs_label",
+];
+
+/// The FULL keys of the shared «Постобработка» section this panel draws (owned by
+/// `ms_region_postprocess`, outside the `cleaning.tools.flux3_klein.*` namespace).
+pub(super) const POSTPROCESS_KEYS: [&str; 10] = [
+    "cleaning.region_postprocess.section_title", "cleaning.region_postprocess.feather_label",
+    "cleaning.region_postprocess.feather_hint", "cleaning.region_postprocess.color_match_label",
+    "cleaning.region_postprocess.color_match_hint", "cleaning.region_postprocess.color_match_local_label",
+    "cleaning.region_postprocess.color_match_local_hint", "cleaning.region_postprocess.color_match_scale_label",
+    "cleaning.region_postprocess.color_match_scale_hint", "cleaning.tab.pixels_suffix",
 ];
 
 /// Every `cleaning.tools.flux3_klein.<key>` with the placeholders the code fills.

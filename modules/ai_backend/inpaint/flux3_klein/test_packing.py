@@ -6,7 +6,8 @@ Unit tests for `flux3_klein/packing.py`: `pack` spans and dtypes, rope-id
 scaling, the single-reference canvas (4 MP cap, 64..4096 sides, reflect vs
 symmetric padding, crop box), the multi-reference 1 MP floor and 16-grid crop,
 the reference selection rule, reference token ids (l axis), image <-> tensor
-conversion, and the bf16-rounded deterministic noise.
+conversion (`to_pil` clamps, then rounds half to even), and the bf16-rounded
+deterministic noise.
 
 Notes:
 Real torch, numpy and PIL on the CPU; skipped where torch or PIL is absent.
@@ -248,9 +249,18 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(tuple(tensor.shape), (3, 8, 16))
         self.assertGreaterEqual(float(tensor.min()), -1.0)
         self.assertLessEqual(float(tensor.max()), 1.0)
-        back = np.asarray(pk.to_pil(tensor)).astype(np.int16)
-        # to_pil truncates; a float32 round trip may land one level low.
-        self.assertLessEqual(int(np.abs(back - np.asarray(source).astype(np.int16)).max()), 1)
+        back = np.asarray(pk.to_pil(tensor))
+        # to_pil rounds, so the float32 round trip is exact.
+        self.assertTrue(np.array_equal(back, np.asarray(source)))
+
+    def test_to_pil_clamps_then_rounds_half_to_even(self) -> None:
+        # 0.0 -> 127.5 -> 128 (half to even; truncation would give 127);
+        # 10.6 levels -> 11 (truncation: 10); out-of-range values clamp to 0 / 255.
+        values = torch.tensor([0.0, 10.6 / 127.5 - 1.0, -3.0, 3.0], dtype=torch.float32)
+        tensor = values.view(1, 1, 4).expand(3, 1, 4)
+        out = np.asarray(pk.to_pil(tensor))
+        self.assertEqual(out.dtype, np.uint8)
+        self.assertEqual(out[0, :, 0].tolist(), [128, 11, 0, 255])
 
     def test_to_tensor_refuses_non_rgb(self) -> None:
         with self.assertRaises(ValueError):

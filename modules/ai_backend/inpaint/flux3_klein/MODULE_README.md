@@ -91,10 +91,10 @@ keeps nothing before its first use.
 - `region.py`: `edit_region_bytes` — the region editor: decode and check region / mask /
   references, the seed (`null` = random, echoed), `Flux3Request(region as reference #0, explicit
   size)`, the progress frames (`progress_stages()`, stable `stage` ids), cancellation through the
-  observer and the step callback, the size check, the color match (global, then local CIELAB
-  unless `color_match_local_pct` is 0; both against the painted mask — rules in
-  `../MODULE_README.md` "The color match is two steps") and the inward-feathered composite
-  (`../region_imaging.py`), the answer dict.
+  observer and the step callback, the size check and the answer dict. The answer is the RAW
+  generated region (`packing.to_pil`, rounded): the colour match and the composite inside the
+  painted mask are the Rust host's (`crates/ms-region-postprocess`); the mask travels for
+  validation only (non-empty, or solid under `whole_region`).
 - `service.py`: `Flux3KleinService` (`generate`, `status`, the profiles adapter
   `large_model_name` / `large_model_inputs`, `health`, `unload`), `Flux3Result`, `Flux3Applied`,
   `Flux3Canceled`, `_model_key`.
@@ -105,8 +105,8 @@ keeps nothing before its first use.
   `test_large_model.py` runs the spec over a real tiny package through the real manager (a
   juggled DiT equals the resident one in every format); `test_characterization.py` holds the
   observer / health / lease CONTRACT and the per-step-pair GOLDEN table;
-  `test_wire.py` / `test_region.py` pin the wire mapping and the region editor (byte identity
-  outside the mask, seed echo, stages, cancel);
+  `test_wire.py` / `test_region.py` pin the wire mapping and the region editor (the raw
+  answer, seed echo, stages, cancel);
   `test_real_headers_*.py` and `test_real_processor.py` read the real package and skip unless
   `MS_FLUX3_DIR` names its root. Run: `venv/bin/python -m pytest modules/ai_backend/inpaint/flux3_klein -q`.
 
@@ -260,8 +260,8 @@ time. Patching the package re-export is a silent no-op.
 - Request validation, defaults, option enums: `params.py`; the IPC params, their defaults and
   the region frame rule: `wire.py` (keep `PROTOCOL.md` "FLUX.3 klein" and the Rust engine's
   settings / frame rule in step).
-- The region editor (composite, seed, progress stages, cancel points): `region.py`; the pixel
-  helpers it shares with FLUX.2: `../region_imaging.py`; the download: `../flux3_download.py`.
+- The region editor (raw answer, seed, progress stages, cancel points): `region.py`; the wire
+  codecs it shares with FLUX.2: `../region_imaging.py`; the download: `../flux3_download.py`.
 - Components, blocks, phases, formats, residency key, forecast inputs: `large_model.py` (the
   per-phase activation and time constants are the calibration tables of `runtime/large_models`).
 - Run order, the step <-> observer-phase mapping, `info` keys, health: `service.py` (update the

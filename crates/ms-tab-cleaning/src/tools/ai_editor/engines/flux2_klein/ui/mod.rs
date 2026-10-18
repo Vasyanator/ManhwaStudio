@@ -10,8 +10,9 @@ Main responsibilities:
 - own `Flux2PanelCtx`: everything the panel may read or mutate, borrowed for exactly one
   frame, with the intents the controls raise travelling back as plain flags;
 - draw the body in its designed ORDER: the prompt block with its cache line and its two
-  unfolding toggles, «Сила изменения», the readiness line, and the three sibling
-  collapsible sections;
+  unfolding toggles, «Сила изменения», the readiness line, the three sibling
+  collapsible sections, the mask hint and, docked at the bottom, the shared
+  «Постобработка» section (`draw_postprocess_section`);
 - draw the two PINNED parts the host places outside the panel's scroll: the progress with
   the run status (`draw_flux2_progress_section`, top) and the per-run option
   «Внимание только к маске» (`draw_flux2_run_options`, bottom);
@@ -170,8 +171,11 @@ pub(super) struct Flux2PanelCtx<'a> {
     pub(super) download_busy: bool,
     pub(super) download_status: Option<&'a str>,
     pub(super) ai_backend_available: bool,
-    /// Set when a control changed a persisted value.
+    /// Set when a control changed a persisted value (a save is owed, the forecast re-armed).
     pub(super) settings_changed: &'a mut bool,
+    /// Set when only a «Постобработка» value changed: a save is owed, but the forecast and
+    /// the catalog are not re-asked (`Flux2KleinEngine::note_postprocess_changed`).
+    pub(super) postprocess_changed: &'a mut bool,
     /// Set when the component catalog should be re-queried.
     pub(super) want_status: &'a mut bool,
     /// Set when the memory forecast should be asked again (refresh button).
@@ -196,7 +200,7 @@ pub(super) struct Flux2PanelCtx<'a> {
 
 impl Flux2PanelCtx<'_> {
     /// Draws the scrolled «Редактор области» body for this engine: the prompt block, the
-    /// parameters, and the note on what the mask means.
+    /// parameters, the note on what the mask means and, last, «Постобработка».
     ///
     /// No scroll area, no progress and no run button: the panel that hosts this body owns
     /// its scrolling, the progress is pinned above it (`draw_flux2_progress_section`), and
@@ -232,6 +236,10 @@ impl Flux2PanelCtx<'_> {
         let guidance_supported = flux2_guidance_supported(self.status);
         draw_advanced_section(ui, self.settings, guidance_supported, self.settings_changed);
         draw_flux2_mask_hint(ui);
+        // LAST, by the shared section's contract: it docks at the bottom of the body's free
+        // room. The values are the host's live post-process (`AiEngine::postprocess_settings`),
+        // so an edit here re-derives a pending result without a new run.
+        *self.postprocess_changed |= draw_postprocess_section(ui, "cleaning_flux2_klein", &mut self.settings.postprocess);
     }
 
     /// Draws what is wrong with the settings file, when something is: a write that failed
@@ -985,7 +993,7 @@ mod tests {
             // actionable only while it names the parts that are missing.
             "cleaning.tools.flux2_klein.model_missing_status",
         ];
-        const PLAIN: [&str; 22] = [
+        const PLAIN: [&str; 21] = [
             "cleaning.tools.flux2_klein.guidance_label",
             // The two halves of the ONE disabled control in this panel. A language that
             // lacks either leaves the user with a grey dial and no reason for it, which is
@@ -995,7 +1003,6 @@ mod tests {
             "cleaning.tools.flux2_klein.strength_hint",
             "cleaning.tools.flux2_klein.fixed_seed_hint",
             "cleaning.tools.flux2_klein.dtype_hint",
-            "cleaning.tools.flux2_klein.color_match_hint",
             "cleaning.tools.flux2_klein.refresh_state_hint",
             "cleaning.tools.flux2_klein.unload_hint",
             "cleaning.tools.flux2_klein.text_encoder_path_hint",
@@ -1098,36 +1105,13 @@ mod tests {
         }
     }
 
-    /// The two local colour-match dials («Сила» / «Масштаб локальной подгонки») explain
-    /// themselves only on hover — and the strength one warns that too high a value amplifies
-    /// noise — so both reference catalogs (`en`, `ru`) carry every one of their keys; `es` /
-    /// `fr` / `pt` fall back to `en`.
-    #[test]
-    fn the_reference_catalogs_carry_the_local_color_match_keys() {
-        const KEYS: [&str; 4] = [
-            "cleaning.tools.flux2_klein.color_match_local_label",
-            "cleaning.tools.flux2_klein.color_match_local_hint",
-            "cleaning.tools.flux2_klein.color_match_scale_label",
-            "cleaning.tools.flux2_klein.color_match_scale_hint",
-        ];
-        for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
-            let catalog: Value = serde_json::from_str(source)
-                .unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
-            for key in KEYS {
-                let value = catalog
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| panic!("locale `{tag}` lacks the key `{key}`"));
-                assert!(!value.trim().is_empty(), "locale `{tag}`: `{key}` is empty");
-            }
-        }
-    }
-
-    /// The memory section's own lines: the retired preset/placement/estimate vocabulary is
-    /// gone from both reference catalogs, and the new lines carry their placeholders.
+    /// The memory section's own lines: the retired preset/placement/estimate vocabulary — and
+    /// the engine's own feather / colour-match keys, now the shared «Постобработка» section's
+    /// (`ms_region_postprocess`) — is gone from both reference catalogs, and the new lines carry
+    /// their placeholders.
     #[test]
     fn the_reference_catalogs_carry_the_step_era_keys_and_not_the_retired_ones() {
-        const RETIRED_PREFIXES: [&str; 9] = [
+        const RETIRED_PREFIXES: [&str; 11] = [
             "cleaning.tools.flux2_klein.preset_",
             "cleaning.tools.flux2_klein.placement_",
             "cleaning.tools.flux2_klein.estimate_",
@@ -1137,6 +1121,8 @@ mod tests {
             "cleaning.tools.flux2_klein.unload_text_encoder_",
             "cleaning.tools.flux2_klein.text_encoder_fp8_hint_pointless",
             "cleaning.tools.flux2_klein.preset_fields_",
+            "cleaning.tools.flux2_klein.mask_feather_",
+            "cleaning.tools.flux2_klein.color_match_",
         ];
         const WITH_PLACEHOLDERS: [(&str, &[&str]); 4] = [
             ("cleaning.tools.flux2_klein.settings_save_error", &["{err}"]),

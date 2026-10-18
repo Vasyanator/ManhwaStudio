@@ -16,12 +16,14 @@ FLUX.2 to it (`large_model.py`) and drives runs through its sessions
 (`memory.requested_steps`).
 
 Mask semantics (this is NOT classic inpainting):
-The mask is a PERMISSION TO CHANGE. Everything outside it must come back
-byte-identical; the color alignment and the composite are done HERE. The wire
-format is L8 and only L8. `text_attention_in_mask=True` confines the prompt to
-the (dilated) mask's tokens; `whole_region=True` is the "no mask" mode, verified
-against a solid mask, and settles the dilate, the color match and the attention
-flag by itself.
+The mask is a PERMISSION TO CHANGE. The wire mask is the LATENT mask, already
+dilated by the client, and is used as-is as the pipeline's `mask_image`; the
+answer is the RAW decoded region, and the client does the colour alignment and
+the composite that make everything outside the painted mask come back
+byte-identical. The wire format is L8 and only L8. `text_attention_in_mask=True`
+confines the prompt to the latent mask's tokens; `whole_region=True` is the "no
+mask" mode, verified against a solid mask, and settles the attention flag by
+itself.
 
 Run order (a memory contract, see `service._run_locked`): the pipeline handle
 is admitted and loaded first, the text encoder handle second (on the GPU when
@@ -50,7 +52,7 @@ Module layout (this file re-exports the package's public surface):
 - `service.py`      - `Flux2KleinInpaintService`: the lock, the sessions, the run.
 
 Notes:
-- torch / diffusers / transformers / cv2 are imported lazily inside the
+- torch / diffusers / transformers are imported lazily inside the
   functions that need them, so importing this package costs nothing.
 - Generation is cancellable only at call boundaries (the handler checks
   `cancel_event` before and after the service call), like every inpaint service.

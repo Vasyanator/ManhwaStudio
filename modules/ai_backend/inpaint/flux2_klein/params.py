@@ -52,16 +52,24 @@ log = logging.getLogger(__name__)
 VALID_VRAM_STEPS = tuple(step.value for step in VramStep)
 VALID_RAM_STEPS = tuple(step.value for step in RamStep)
 
-#: Request fields of the retired placement wire (protocol <= 13) -> what replaced
-#: each. A request carrying one is REFUSED by name (`_refuse_retired_fields`): a
-#: stale client gets a clear error instead of a silently ignored memory choice.
-RETIRED_FIELDS: dict[str, str] = {
-    "placement": "передавайте «vram_step» и «ram_step»",
-    "profile": "передавайте «vram_step» и «ram_step»",
-    "unload_transformer_before_vae": "где трансформер находится во время декодирования, решает «vram_step»",
-    "unload_text_encoder_after_encode": "остаётся ли текстовый энкодер между запусками, решает «ram_step»",
-    "low_cpu_mem_usage": "загрузка всегда идёт тензор за тензором; уберите поле",
-    "vae_slicing": "на декодирование одной области оно никогда не влияло; уберите поле",
+#: Retired request fields -> `(the protocol that retired it, what replaced it)`.
+#: A request carrying one is REFUSED by name (`_refuse_retired_fields`): a stale
+#: client gets a clear error instead of a silently ignored choice. Protocol 14
+#: retired the placement wire; protocol 17 moved the region post-processing
+#: (latent-mask dilation, feather, colour match) to the client, which now sends
+#: the latent mask already dilated and post-processes the raw answer itself.
+RETIRED_FIELDS: dict[str, tuple[int, str]] = {
+    "placement": (14, "передавайте «vram_step» и «ram_step»"),
+    "profile": (14, "передавайте «vram_step» и «ram_step»"),
+    "unload_transformer_before_vae": (14, "где трансформер находится во время декодирования, решает «vram_step»"),
+    "unload_text_encoder_after_encode": (14, "остаётся ли текстовый энкодер между запусками, решает «ram_step»"),
+    "low_cpu_mem_usage": (14, "загрузка всегда идёт тензор за тензором; уберите поле"),
+    "vae_slicing": (14, "на декодирование одной области оно никогда не влияло; уберите поле"),
+    "mask_dilate_px": (17, "присылайте маску латентов уже расширенной; уберите поле"),
+    "mask_feather_px": (17, "растушёвку делает клиент над сырым ответом; уберите поле"),
+    "color_match": (17, "подгонку цвета делает клиент над сырым ответом; уберите поле"),
+    "color_match_local_pct": (17, "подгонку цвета делает клиент над сырым ответом; уберите поле"),
+    "color_match_scale_px": (17, "подгонку цвета делает клиент над сырым ответом; уберите поле"),
 }
 
 #: Compute dtypes offered to the user. Both are 2 bytes per parameter. Since the
@@ -88,18 +96,6 @@ MAX_REGION_PIXELS = 1024 * 1024
 
 #: Extreme aspect ratios collapse one latent axis to a handful of tokens.
 MAX_REGION_ASPECT_RATIO = 8.0
-
-#: Default strength, in percent, of the local color match (0 = global only).
-#: 60, not 100: measured on a dark page (`region_imaging.match_color_local`),
-#: full strength brings the statistics closest to the surroundings but its
-#: lightness gain turns the noise of the darkest areas into crunchy specks.
-DEFAULT_COLOR_MATCH_LOCAL_PCT = 60
-
-#: Default and range of the local color match's scale: the Gaussian sigma of
-#: its finest level, in pixels (not a window side).
-DEFAULT_COLOR_MATCH_SCALE_PX = 24
-MIN_COLOR_MATCH_SCALE_PX = 8
-MAX_COLOR_MATCH_SCALE_PX = 96
 
 
 # =====================================================================
@@ -165,18 +161,19 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
     `status` still reports the path and its `exists: false` flag, so nothing
     about a mistyped path is hidden.
 
-    `whole_region=True` is a MODE, not a hint, and it settles four other keys on
-    the caller's behalf (`mask_dilate_px` -> 0, `color_match` -> False,
-    `color_match_local_pct` -> 0, `text_attention_in_mask` -> False); see
-    `_whole_region_overrides` for why none is meaningful there.
+    `whole_region=True` is a MODE, not a hint, and it settles
+    `text_attention_in_mask` -> False on the caller's behalf; see
+    `_whole_region_overrides` for why it is not meaningful there. The mask is
+    the LATENT mask as sent (the client dilates it), so no mask morphology is
+    configured here.
 
     Returns a dict with every key of the wire contract present.
 
     # Raises
     `ValueError` when the transformer or VAE path is empty or absent, when an
     enum value is not one of `VALID_DTYPES` / `VALID_VRAM_STEPS` /
-    `VALID_RAM_STEPS`, or when a field of the retired placement wire
-    (`RETIRED_FIELDS`) is present, naming it and its replacement.
+    `VALID_RAM_STEPS`, or when a retired field (`RETIRED_FIELDS`) is present,
+    naming it and its replacement.
     """
     merged: dict[str, Any] = {}
     if isinstance(params, dict):
@@ -227,32 +224,6 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
         # after the run or re-reads it per run (`large_model.encoder_spec`'s
         # host pin, `runtime/large_models` "Host pin").
         "encoder_on_cpu": encoder_on_cpu(merged),
-        "mask_dilate_px": _clamp_int(merged.get("mask_dilate_px"), default=16, low=0, high=64),
-        # 12 px, not 6: `_feather_mask_inwards` now ramps over exactly this many
-        # pixels, where the old construction spread a nominal 6 over ~22. Measured
-        # on a real page (384x384 region, 56 px blob mask, 4 steps, two prompts —
-        # one strong edit, one text removal) as the excess Sobel gradient on the
-        # mask contour over the same contour in the untouched original: 6 px
-        # leaves +9.8% / +5.1%, 8 px +4.4% / +2.4%, 12 px +1.1% / +0.5%, 16 px
-        # +0.3% / +0.1%. 12 is the knee: it removes ~90% of the visible seam while
-        # keeping 81-84% of the edit, where 16 keeps only 75-79%.
-        "mask_feather_px": _clamp_int(merged.get("mask_feather_px"), default=12, low=0, high=32),
-        "color_match": _to_bool(merged.get("color_match"), True),
-        # The local CIELAB match after the global one (`region_imaging.
-        # match_color_local`), effective only while `color_match` is: its
-        # strength in percent (0 = the global match alone) and its Gaussian scale.
-        "color_match_local_pct": _clamp_int(
-            merged.get("color_match_local_pct"),
-            default=DEFAULT_COLOR_MATCH_LOCAL_PCT,
-            low=0,
-            high=100,
-        ),
-        "color_match_scale_px": _clamp_int(
-            merged.get("color_match_scale_px"),
-            default=DEFAULT_COLOR_MATCH_SCALE_PX,
-            low=MIN_COLOR_MATCH_SCALE_PX,
-            high=MAX_COLOR_MATCH_SCALE_PX,
-        ),
         "max_sequence_length": _clamp_int(
             merged.get("max_sequence_length"), default=512, low=64, high=512
         ),
@@ -275,29 +246,6 @@ def normalize_flux2_klein_params(params: dict[str, Any] | None) -> dict[str, Any
 def _whole_region_overrides(normalized: dict[str, Any]) -> dict[str, Any]:
     """The keys `whole_region` settles on the caller's behalf, with the reasons.
 
-    Each would otherwise operate on an input it has no meaning for, and each
-    is silent about it — which is exactly the failure mode this module refuses
-    everywhere else:
-
-    - **`mask_dilate_px` -> 0.** The dilate exists to give a thin painted mask a
-      full latent cell of room; a mask that already covers the whole region has
-      nothing left to grow into, and growing it would only push the latent mask
-      past the region's own edge.
-    - **`color_match` -> False.** `_match_color_outside_mask` takes its
-      statistics from the pixels OUTSIDE the mask — the ring the model was not
-      allowed to touch, and therefore the only place where the two images are
-      supposed to agree. Here that ring is empty. Computing the match from the
-      changed pixels instead would force the edit's own mean and standard
-      deviation back onto the original's, i.e. undo the very change the user
-      asked for (a "make this panel darker" edit would be re-brightened), and
-      computing it from an empty sample is a division by zero. Neither is a
-      correction, so the match is switched off and `mask_feather_px` — which is
-      NOT switched off — is what joins the regenerated region to the page.
-    - **`color_match_local_pct` -> 0.** The local match samples the same ring
-      (grown by a margin) and is a refinement of the global one, so it goes with
-      it. `color_match_scale_px` has no "off" value and is left as sent: with
-      the strength at zero it is never read.
-
     - **`text_attention_in_mask` -> False.** It confines the prompt to the
       tokens inside the mask, and a solid mask has every token inside: the
       attention mask would block nothing and still cost `S²` bytes of VRAM and
@@ -308,17 +256,13 @@ def _whole_region_overrides(normalized: dict[str, Any]) -> dict[str, Any]:
     override is visible in the backend log rather than inferred from the result.
     """
     overrides: dict[str, Any] = {
-        "mask_dilate_px": 0,
-        "color_match": False,
-        "color_match_local_pct": 0,
         "text_attention_in_mask": False,
     }
     contradicted = sorted(key for key, value in overrides.items() if normalized[key] != value)
     if contradicted:
         log.info(
-            "FLUX.2 klein: режим «без маски» переопределяет %s — расширять маску, сверять цвет "
-            "по кольцу вокруг неё и ограничивать внимание текста в нём нечем "
-            "(см. _whole_region_overrides).",
+            "FLUX.2 klein: режим «без маски» переопределяет %s — ограничивать внимание текста "
+            "сплошной маской нечем (см. _whole_region_overrides).",
             ", ".join(contradicted),
         )
     return overrides
@@ -409,15 +353,15 @@ def _require_existing_path(value: Any, field: str) -> str:
 
 
 def _refuse_retired_fields(params: dict[str, Any]) -> None:
-    """Refuse a request that carries any field of the retired placement wire (`RETIRED_FIELDS`), even `null`.
+    """Refuse a request that carries any retired field (`RETIRED_FIELDS`), even `null`.
 
     # Raises
     `ValueError` naming the first retired field present (in `RETIRED_FIELDS`
-    order) and what replaced it.
+    order), the protocol that retired it and what replaced it.
     """
-    for field, replacement in RETIRED_FIELDS.items():
+    for field, (protocol, replacement) in RETIRED_FIELDS.items():
         if field in params:
-            raise ValueError(f"FLUX.2 klein: поле «{field}» больше не поддерживается (протокол 14): {replacement}.")
+            raise ValueError(f"FLUX.2 klein: поле «{field}» больше не поддерживается (протокол {protocol}): {replacement}.")
 
 
 def _optional_choice(value: Any, allowed: tuple[str, ...], what: str) -> str | None:

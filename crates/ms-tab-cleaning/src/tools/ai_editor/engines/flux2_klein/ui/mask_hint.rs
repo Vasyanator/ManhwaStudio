@@ -2,7 +2,8 @@
 File: cleaning/tools/ai_editor/engines/flux2_klein/ui/mask_hint.rs
 
 Purpose:
-The hint that explains what the mask MEANS for this engine (the end of the scrolled body).
+The hint that explains what the mask MEANS for this engine (the end of the scrolled body,
+just above the bottom-docked «Постобработка» section).
 The progress bar every long operation of the engine shares is the shared
 `draw_stream_progress` (`../../shared/stream_progress_ui.rs`), called from
 `draw_flux2_progress_section` in `mod.rs`.

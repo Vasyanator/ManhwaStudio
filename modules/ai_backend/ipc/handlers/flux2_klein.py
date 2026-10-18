@@ -26,7 +26,10 @@ Blob convention (the other inpaint methods' two segments, plus one optional):
 `reference_len` is optional: absent or 0 means no reference. A reference is the
 user's marks composited over a copy of the region, handed to the pipeline as its
 `image_reference`; the service requires it to be exactly the region's size.
-The result PNG goes in the response blob (raw bytes) and its length is repeated
+`mask_png` is the LATENT mask (L8, already dilated by the client), used as-is.
+The result — the RAW decoded region as an RGB PNG, with no colour match and no
+composite (the client post-processes it, protocol 17) — goes in the response
+blob (raw bytes) and its length is repeated
 as ``image_len`` in the response header, next to the OOM-recovery report and the
 effective ``text_attention_in_mask`` (reported beside ``applied``, not in it,
 because ``applied`` is persisted into the user's settings). ``applied`` is
@@ -34,8 +37,10 @@ because ``applied`` is persisted into the user's settings). ``applied`` is
 of the run: the requested resource steps ``vram_step`` / ``ram_step``
 (``params.vram_step`` / ``params.ram_step``, an absent axis ``auto``), the
 effective ``vram_step_effective`` / ``ram_step_effective``, ``degraded`` and
-``degrade_reason``. The fields of the retired placement wire (``placement``,
-``profile``, the unload / slicing / low-memory flags) are refused by name by
+``degrade_reason``. Retired fields — the placement wire (``placement``,
+``profile``, the unload / slicing / low-memory flags) and the region
+post-processing (``mask_dilate_px``, ``mask_feather_px``, ``color_match``,
+``color_match_local_pct``, ``color_match_scale_px``) — are refused by name by
 ``params.normalize_flux2_klein_params``. Forecasts are ``large_models.profiles``
 (``large_models.py``, the FLUX.2 adapter ``large_model_profiles``).
 """

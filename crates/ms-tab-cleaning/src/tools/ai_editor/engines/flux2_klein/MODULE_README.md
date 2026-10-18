@@ -77,9 +77,12 @@ host frame + painted mask (+ marks reference)
         -> run_input                 (engine/mod.rs) validates sizes, accepts the marks
         -> mask_for_run              (../shared)    derives the working mode
         -> settings.normalized()     (settings.rs)  the ONLY value put on the wire
-        -> run_flux2_klein           (wire.rs)      worker thread, streaming call
+        -> run_flux2_klein           (wire.rs)      worker thread: latent mask (dilate_ellipse
+                                                    by mask_dilate_px), streaming call
         -> publish_progress_frame    (../shared)    generation-guarded bar writes
-        -> AiEngine::poll            (engine/mod.rs) drains the channel, returns pixels
+        -> AiEngine::poll            (engine/mod.rs) drains the channel, answers DoneRaw
+        -> host post-process         (region_edit_v2) composite, feather, colour match with
+                                                    AiEngine::postprocess_settings, live
 ```
 
 Queries the panel arms are one-shot and independent of the run: `.status`
@@ -118,9 +121,10 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   step-pair table; an untouched default document goes to «Авто» / «Авто»),
   `Flux2SourceMode`, the persisted `variant` and `effective_paths`, «Энкодер на CPU»
   (`encoder_on_cpu`, default on — also for a file without the field — and sent in every
-  `params`, the forecast's included), the local colour match (`color_match_local_pct`
-  0..=100 default 60, `color_match_scale_px`, the Gaussian sigma of the finest averaging level, 8..=96 default 24; defaults also for a file
-  without them, clamped by `normalized()`, sent as stored like `color_match`), and the settings-file
+  `params`, the forecast's included), «Постобработка» (`postprocess`: the shared
+  `ms_region_postprocess::PostprocessSettings`, embedded `#[serde(flatten)]` so the file keeps
+  its flat `mask_feather_px` / `color_match` / `color_match_local_pct` / `color_match_scale_px`
+  keys; defaults and ranges are that crate's, and none of it is ever sent), and the settings-file
   load/save pair (`load_flux2_settings_from` / `save_flux2_settings`, over the shared
   `read_settings_file` / `write_settings_json`: a damaged file is moved aside, never
   overwritten, and when that fails saving is BLOCKED). Edit it to add or change a persisted field. ONE FILE PER VARIANT: 9B keeps `flux2_klein_settings.json` unchanged,
@@ -141,16 +145,19 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
 - `prompt_cache.rs`: the `.msprompt` library — entry/listing/load shapes,
   `flux2_prompt_cache_gates`, `prompt_cache_state_for`, and the six `.prompt_cache.*`
   calls with their parsers.
-- `run_outcome.rs`: what one run answers with (`Flux2RunOutcome`, `Flux2JobResult`) and the one
+- `run_outcome.rs`: what one run answers with (`Flux2RunOutcome`: the raw decode and the latent
+  mask; `Flux2JobResult`: plus the run's mask and `whole_region`) and the one
   memory flag it writes back (`parse_applied_flags`: `vae_tiling` only, tolerant of the v13 and
   v14 shapes). The progress state, its generation guard and `parse_degraded` are
   `../shared/stream_progress.rs`.
-- `session.rs`: `Flux2SessionState` (run channel + per-RUN undo stack), `Flux2RunPoll`,
+- `session.rs`: `Flux2SessionState` (run channel + cancelled workers), `Flux2RunPoll` (a
+  finished run is the host's `RawRegionResult`),
   `apply_backend_flags` (writes `vae_tiling` only), `flux2_run_done_status`
   (a degraded run names its effective steps) and `flux2_picker_request` (the dialog request per
   picker purpose; the engine opens it through `ms_platform::file_dialog::request` and commits
   the prompt-cache export's save target after the backend wrote it).
-- `wire.rs`: `Flux2RunInput` (the pixels of one run), `run_flux2_klein`, the `.status` and
+- `wire.rs`: `Flux2RunInput` (the pixels of one run), `run_flux2_klein` (which builds the
+  latent mask on the worker), the `.status` and
   `.component_action` calls (streaming through the shared `stream_call`) and their
   parsers, the prompt translation and the run request packing `flux2_run_request`
   (header + `image ++ mask [++ reference]` blob; the PNGs come from `tools/region_png.rs`).
@@ -177,8 +184,16 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
   and the panel says where; if it cannot be moved (or cannot be read at all), saving is
   blocked for the session and the panel says so (the shared `SettingsProblem`).
 - **`mask_for_run` is the only place the working mode is decided** (`../shared/region_mask.rs`): a
-  painted mask travels verbatim with `whole_region = false`; an empty one becomes a
+  painted mask is used with `whole_region = false`; an empty one becomes a
   SOLID mask, because the backend refuses `whole_region = true` otherwise.
+- **The wire carries the LATENT mask, the answer is RAW** (protocol 17): the run worker
+  dilates the run's mask by `mask_dilate_px` (0 under `whole_region`) with the cv2-exact
+  `ms_region_postprocess::dilate_ellipse` and sends that; the backend answers its raw decode
+  and `params` carries none of the five mask/post fields (the backend refuses them by name).
+  `poll` answers `EnginePoll::DoneRaw` with the run's mask and the latent mask as
+  `sample_mask`, and `postprocess_settings()` is `Some` for the engine's whole life (the
+  in-memory `settings.postprocess`, normalized): the HOST composites, feathers and
+  colour-matches, and re-derives a pending result live when the user edits «Постобработка».
 - **«Внимание только к маске» is a persisted CHOICE with an effective wire value**
   (`text_attention_in_mask`, default on). `to_params` sends `setting && !whole_region`, and
   the forecast sends `setting && mask_painted` (`to_profiles_params`) with the
@@ -249,7 +264,9 @@ and `mask_for_run`. What stays here is what is FLUX.2's own: its headers, its qu
 - To change the progress bar's arithmetic or how it looks, see `../shared/` (it is every
   large-model engine's bar). The bar and the run status are drawn by `AiEngine::draw_progress`
   (`draw_flux2_progress_section`), which the host pins above the scrolled parameters.
-- To change the run's undo history or the derived mask, see `session.rs`.
+- To change how a finished run is handed to the host, see `session.rs` (`poll_run`); to change
+  the latent mask, see `run_flux2_klein_pass` in `wire.rs`. The post-process itself is
+  `ms-region-postprocess` and the host (`region_edit_v2`), not this module.
 - To change what the engine DOES when a control is pressed, see `engine/actions.rs`; to
   change what it keeps between frames, see `engine/mod.rs`.
 - Tests live beside the code they exercise, in a `#[cfg(test)] mod tests` at the end of

@@ -20,8 +20,10 @@ and is re-exported explicitly, because a private glob would not carry it out of 
 
 The mask means "you MAY change what is under it" — the inverse of the mask-inpaint tools'
 "remove what is under it". Everything outside it must survive the round trip untouched,
-which is why the engine declares exactly ONE mask layer and puts its bytes on the wire
-verbatim.
+which is why the engine declares exactly ONE mask layer. What goes on the wire is the
+LATENT mask: that layer grown by `mask_dilate_px` (cv2-exact ellipse,
+`ms_region_postprocess::dilate_ellipse`, on the run worker); the host's composite keeps the
+pixels outside the PAINTED mask byte-identical whatever the model did there.
 
 TWO ENGINES, ONE IMPLEMENTATION (`Flux2Variant`, declared in `ms-config`, which owns every
 fact that keys a path, a persisted document, an id or a capability gate; its caption and
@@ -45,8 +47,9 @@ persisted field, and `mask_for_run` is the only place the decision is made.
 - nothing painted: the WHOLE selected region is regenerated. The request keeps its shape —
   a mask is still sent, a SOLID one built by `mask_for_run`, because the backend refuses
   `whole_region = true` unless the mask really is uniformly 255. `mask_dilate_px` is
-  ignored backend-side then (there is no contour to grow); `mask_feather_px` keeps working
-  and is what softens the join between the regenerated region and the page.
+  ignored then (there is no contour to grow: the latent mask is the solid one); the host's
+  feather keeps working and is what softens the join between the regenerated region and
+  the page, while its colour match is off (no ring outside the mask to match against).
 `allows_empty_mask()` is therefore unconditionally `true`: an empty mask is a legal run
 rather than a refusal, and the host is what tells the user so (its own green hint under
 «Обработать»).
@@ -63,7 +66,8 @@ Panel layout (`Flux2PanelCtx::draw`, and its ORDER is the design):
 progress bar -> run status -> the PROMPT block (the English field, the one compact line
 about its cache state, and two toggles that unfold the translator and the prompt-cache
 library) -> «Сила изменения» -> the READINESS line -> three sibling collapsible sections,
-«Установка модели» / «Память и скорость» / «Для экспертов» -> the mask note.
+«Установка модели» / «Память и скорость» / «Для экспертов» -> the mask note -> the shared
+«Постобработка» section (`../shared/postprocess_section.rs`), docked at the bottom.
 Everything a user touches per edit is above the folds; everything set once per machine is
 inside them. There is no wrapper section around the whole body and no section nested in
 another. «Установка модели» is the only one built from `CollapsingState` rather than
@@ -97,11 +101,11 @@ Submodules (each re-exported into this root with `use <name>::*;`):
 - The memory forecast is NOT a file here: it is `large_models.profiles`, asked through
   `ms_local_ai::large_models::ProfilesQuery` (latest wins, one in flight) and drawn by the
   shared `ai_editor::large_model_resources` widget.
-- `run_outcome.rs`: what one run answers with — the region, the `applied.vae_tiling` flag,
-  a degraded run's effective steps.
-- `session.rs`: the run channel, the per-RUN undo stack and the pickers.
-- `wire.rs`: the generation run, the `.status` and `.component_action` calls and the
-  image/mask blob encoding.
+- `run_outcome.rs`: what one run answers with — the raw region, the run's mask and latent
+  mask, the `applied.vae_tiling` flag, a degraded run's effective steps.
+- `session.rs`: the run channel and the pickers.
+- `wire.rs`: the generation run (including the latent-mask dilation), the `.status` and
+  `.component_action` calls and the image/mask blob encoding.
 - The MODEL-AGNOSTIC parts are not files here: the progress state of all four long
   operations with its generation guard, rate window, frame parser and streaming call, the
   Hugging Face check/plan/token/download vocabulary and its drawing, the settings-file
@@ -138,7 +142,7 @@ Key items:
   the exact counterpart of `prompt_cache_state_for` for the prompt half of the same
   answer); a path edit both invalidates it — back to `Unknown`, which never blocks —
   and re-arms the query (`note_settings_changed`).
-- `Flux2SessionState`: the run channel and the per-RUN undo stack. The painted mask is NOT
+- `Flux2SessionState`: the run channel. The painted mask is NOT
   here — it belongs to the host's `MaskStack` and arrives in `EngineRunRequest::masks`.
 - The memory steps (`vram_step` / `ram_step`, `StepChoice`): what a step MEANS is the
   backend's (`runtime/large_models/tiers.py`); this side persists the ids and shows the
@@ -150,10 +154,12 @@ Key items:
 
 IPC (`backend_ipc::protocol`):
 - `inpaint.flux2_klein` — streaming. Header `{image_len, mask_len, params}`, blob
-  `region.png ++ mask.png` (mask L8, exactly the region size). Response header
+  `region.png ++ mask.png [++ reference.png]` (mask = the LATENT mask, L8 0/255, exactly the
+  region size; `params` carries none of `mask_dilate_px`, `mask_feather_px`, `color_match`,
+  `color_match_local_pct`, `color_match_scale_px`, which protocol 17 refuses by name). Response header
   `{image_len, oom_recovered, applied{...}, degraded, degrade_reason, *_step_effective}`,
-  blob = RGB PNG of exactly the region
-  size, validated by STRICT equality before use (`image_len` is REQUIRED; an answer
+  blob = RGB PNG of the RAW decode of exactly the region size (outside the mask a VAE round
+  trip, not the original bytes), validated by STRICT equality before use (`image_len` is REQUIRED; an answer
   without it is refused). Progress frames carry `phase` (`load`/`generate`), `step`,
   `total`, `label` and no preview blob. The request goes out through `begin_call`, so
   its id is known and a cancel can stop it with `CallHandle::cancel`.
@@ -277,10 +283,15 @@ Contracts:
   the flag, and at most one query is ever in flight, so editing the prompt cannot turn
   a keystroke into a request. A `prompt_cached` answer is shown only while the prompt it
   was asked about still equals the one in the field.
-- The answer of a run is PIXELS and nothing else (D12): `EnginePoll::Done` carries a
-  `ColorImage` of exactly the frame rectangle. Merging it into the clean overlay is the
-  HOST's job; this file never writes `CleanOverlaysModel` storage and never touches
-  `CanvasView`.
+- The answer of a run is RAW PIXELS plus the run facts (D12, raw-result amendment):
+  `EnginePoll::DoneRaw` carries a `RawRegionResult` — the decode, exactly the frame
+  rectangle, the mask the run used, the latent mask as the colour-match sample mask and
+  `whole_region`. The HOST post-processes it (composite onto the unmarked region, feather,
+  colour match) with `AiEngine::postprocess_settings`, i.e. this engine's persisted
+  «Постобработка» values (`Flux2KleinSettings::postprocess`, flattened into the settings
+  file under the keys it always had), re-deriving a pending result whenever they change.
+  Merging it into the clean overlay is the HOST's job too; this module never writes
+  `CleanOverlaysModel` storage and never touches `CanvasView`.
 - The model is distilled: 4 steps and `guidance_scale = 1.0` are the defaults and
   there is no negative prompt — do not add a field for one. Whether guidance can do
   anything at all is the BACKEND's answer, not an assumption of this side: a checkpoint
@@ -290,7 +301,10 @@ Contracts:
   SUPPORTED — the shipped klein checkpoints are distilled, but the paths are the user's and
   may point at one that is not.
 */
-use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RunMarks, RunOptionsCtx};
+use crate::tools::region_edit_v2::engine::{AiEngine, EnginePoll, EngineRunRequest, EngineSection, MarksMode, MarksSupport, MaskLayerSpec, RawRegionResult, RunMarks, RunOptionsCtx};
+// The host-side post-process: its persisted settings (flattened into this engine's document)
+// and the latent-mask dilation the run worker applies before the mask goes on the wire.
+use ms_region_postprocess::{PostprocessSettings, dilate_ellipse};
 use ms_backend_ipc as backend_ipc;
 use ms_canvas::OverlayRectPx;
 use ms_config as config;
@@ -339,7 +353,7 @@ use prompt_cache::*;
 // What one run answers with: the region, the written-back memory flag, a degraded run.
 mod run_outcome;
 use run_outcome::*;
-// The run channel, the per-run undo stack, the mask derivation and the file pickers.
+// The run channel, the raw-result hand-off and the file pickers.
 mod session;
 use session::*;
 // The run, status and component-action calls, and the blob encoding a run carries.
@@ -382,19 +396,9 @@ const FLUX2_GUIDANCE_MIN: f32 = 1.0;
 const FLUX2_GUIDANCE_MAX: f32 = 10.0;
 const FLUX2_STRENGTH_MIN: f32 = 0.25;
 const FLUX2_STRENGTH_MAX: f32 = 1.0;
+/// Largest growth of the painted mask contour into the latent mask, pixels
+/// (`mask_dilate_px`). The feather and colour-match ranges are `ms_region_postprocess`'s.
 const FLUX2_DILATE_MAX: u32 = 64;
-const FLUX2_FEATHER_MAX: u32 = 32;
-/// Range of `color_match_local_pct`, the local colour-match strength in percent (`0` = the
-/// global match only). The backend's accepted range (`modules/ai_backend/inpaint/flux2_klein/params.py`).
-const FLUX2_COLOR_MATCH_LOCAL_PCT_MAX: u32 = 100;
-/// Range of `color_match_scale_px`, the Gaussian sigma in pixels of the finest level of the
-/// local colour match's averaging; the backend's accepted range.
-const FLUX2_COLOR_MATCH_SCALE_MIN: u32 = 8;
-const FLUX2_COLOR_MATCH_SCALE_MAX: u32 = 96;
-/// Largest number of pre-run region images kept for «Вернуть». A megapixel region is
-/// ~4 MB, so an unbounded stack would grow without limit over a long session; the
-/// oldest entry is dropped instead.
-const FLUX2_UNDO_LIMIT: usize = 8;
 
 /// Horizontal room left for the «Сохранить кэш» button beside the name field, points.
 /// The field takes whatever is left, so the button never wraps onto its own line.

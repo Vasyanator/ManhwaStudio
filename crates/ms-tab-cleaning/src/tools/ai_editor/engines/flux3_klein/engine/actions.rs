@@ -32,6 +32,7 @@ impl Flux3KleinEngine {
     pub(super) fn apply_intents(&mut self, intents: Flux3PanelIntents) {
         let Flux3PanelIntents {
             mut settings_changed,
+            postprocess_changed,
             want_status,
             want_forecast,
             resources_actions,
@@ -72,6 +73,8 @@ impl Flux3KleinEngine {
         }
         if settings_changed {
             self.note_settings_changed();
+        } else if postprocess_changed {
+            self.note_postprocess_changed();
         }
         if want_status {
             self.status_wanted = true;
@@ -373,6 +376,25 @@ mod tests {
         assert!(engine.resources.wanted);
         engine.apply_intents(Flux3PanelIntents { clear_references: true, ..Flux3PanelIntents::default() });
         assert!(engine.references.items.is_empty());
+    }
+
+    /// A «Постобработка» edit owes a save but re-arms neither the forecast nor `.status`; a
+    /// forecast parameter in the same frame still re-arms it.
+    #[test]
+    fn a_postprocess_only_change_does_not_re_arm_the_forecast() {
+        let mut engine = Flux3KleinEngine::at_rest();
+        engine.status_root = Some(engine.settings.effective_root());
+        engine.status_wanted = false;
+        engine.resources.wanted = false;
+        engine.settings.postprocess.mask_feather_px += 1;
+        engine.apply_intents(Flux3PanelIntents { postprocess_changed: true, ..Flux3PanelIntents::default() });
+        assert!(engine.dirty, "a save is owed");
+        assert!(!engine.resources.wanted, "the forecast is not re-asked");
+        assert!(!engine.status_wanted, "nor the status");
+
+        engine.dirty = false;
+        engine.apply_intents(Flux3PanelIntents { settings_changed: true, postprocess_changed: true, ..Flux3PanelIntents::default() });
+        assert!(engine.dirty && engine.resources.wanted, "any other change still re-arms it");
     }
 
     /// The encoder flag toggled in the widget is a settings change (a save is owed).

@@ -17,6 +17,7 @@ Key structures:
 - `MarksMode`, `MarksSupport`, `RunMarks`: how the user's marks layer may reach an engine, what
   an engine accepts, and what one run carries
 - `EnginePoll`: what one `poll` says about the run in flight
+- `RawRegionResult`: a RAW model answer plus the run facts the host post-processes it with
 - `RunOptionsCtx`: the host facts an engine's pinned run options may depend on
 
 Key functions:
@@ -31,7 +32,11 @@ progress vocabulary (`dev-docs/region_edit_v2_plan.md` §13.2 D13): engines disa
 what progress even is, so each draws its own bar and the host learns only Running / Done /
 Failed. The host decides only WHERE it is drawn: the panel has three sections —
 `draw_progress` pinned at the top, `draw_parameters` in the scroll, and the host's actions
-followed by the engine's `draw_run_options` pinned at the bottom (§13.3 amendment). A run's answer is PIXELS and only pixels (D12).
+followed by the engine's `draw_run_options` pinned at the bottom (§13.3 amendment). A run's answer is
+PIXELS (D12), in one of two forms: FINAL pixels (`EnginePoll::Done`), or the RAW model output plus
+the run facts the host needs to finish it (`EnginePoll::DoneRaw`, for an engine that answers
+`postprocess_settings()`); the host then owns the post-process and re-derives the shown result
+whenever those live settings change (§13.3 raw-result amendment).
 The marks layer is the user's colour annotation over the region (arrows, outlines); the HOST
 decides how it travels — composited into the region, as a separate reference image or as a
 transparent layer — from the engine's `marks_support()`, so an engine only ever reads
@@ -40,6 +45,7 @@ transparent layer — from the engine's `marks_support()`, so an engine only eve
 
 use super::geometry::{FrameConstraints, SizeViolation, check_size};
 use ms_canvas::OverlayRectPx;
+use ms_region_postprocess::PostprocessSettings;
 use eframe::egui;
 
 /// Which picker section an engine appears in.
@@ -221,20 +227,59 @@ pub(super) fn composite_marks_over(region: &egui::ColorImage, marks: &[u8]) -> O
     Some(egui::ColorImage::new(region.size, pixels))
 }
 
+/// The RAW answer of a run whose post-process the HOST owns ([`AiEngine::postprocess_settings`]
+/// answers `Some`), plus the run facts that post-process needs and only the engine knows.
+///
+/// The host keeps it, with the unmarked region it loaded, until the result is applied or
+/// cancelled, and re-derives the shown result from it whenever the live settings change
+/// (`ms_region_postprocess::RegionPostprocessor`): outside `mask` the result is the unmarked
+/// region, inside it the colour-matched, feathered model output.
+#[derive(Clone)]
+pub struct RawRegionResult {
+    /// The raw model output, exactly `rect_px` in size and opaque.
+    pub image: egui::ColorImage,
+    /// The L8 mask the run used (`shared::mask_for_run`'s output: the painted layer verbatim,
+    /// or a solid buffer in whole-region mode), `rect_px.w * rect_px.h` bytes, nonzero = the
+    /// pixel may change.
+    pub mask: Vec<u8>,
+    /// The colour-match sample mask when it differs from `mask` (FLUX.2 klein: the dilated
+    /// latent mask the model saw), same size; `None` = `mask`.
+    pub sample_mask: Option<Vec<u8>>,
+    /// The run regenerated the whole region (an empty painted mask): there is no ring outside
+    /// the mask to colour-match against (`PostprocessSettings::effective`).
+    pub whole_region: bool,
+}
+
+// Hand-written: the derived form would print every pixel and mask byte into a log line.
+impl std::fmt::Debug for RawRegionResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawRegionResult")
+            .field("size", &self.image.size)
+            .field("mask_len", &self.mask.len())
+            .field("sample_mask_len", &self.sample_mask.as_ref().map(Vec::len))
+            .field("whole_region", &self.whole_region)
+            .finish()
+    }
+}
+
 /// What one `poll` says about the run in flight.
 ///
-/// `Done` and `Failed` are TERMINAL and are reported exactly once: the engine has dropped
-/// the run by the time it returns either, and the next poll answers `Idle`. `Done` carries a
-/// `ColorImage` of exactly the requested `rect_px` — the host refuses any other size rather
-/// than rescaling it (D7).
+/// `Done`, `DoneRaw` and `Failed` are TERMINAL and are reported exactly once: the engine has
+/// dropped the run by the time it returns one, and the next poll answers `Idle`. `Done` and
+/// `DoneRaw` carry an image of exactly the requested `rect_px` — the host refuses any other size
+/// rather than rescaling it (D7). An engine answers `DoneRaw` exactly when its
+/// [`AiEngine::postprocess_settings`] is `Some`, and `Done` otherwise; the host refuses the other
+/// pairing as a contract violation.
 #[derive(Debug, Clone)]
 pub enum EnginePoll {
     /// No run has been started, or the last one has already been reported.
     Idle,
     /// A run is in flight; the engine's own panel shows how far it has got.
     Running,
-    /// The run finished. The image is exactly `rect_px` in size.
+    /// The run finished with FINAL pixels. The image is exactly `rect_px` in size.
     Done(egui::ColorImage),
+    /// The run finished with RAW pixels the host post-processes (see [`RawRegionResult`]).
+    DoneRaw(RawRegionResult),
     /// The run failed, with an already-localized message for the user.
     Failed(String),
 }
@@ -354,6 +399,18 @@ pub trait AiEngine: Send {
     /// mode stops being supported the host falls back to `preferred()`. Must stay cheap.
     fn marks_support(&self) -> MarksSupport {
         MarksSupport::OVERLAY_ONLY
+    }
+
+    /// The live post-process settings of an engine whose runs answer [`EnginePoll::DoneRaw`];
+    /// `None` (the default) = its runs answer final pixels through [`EnginePoll::Done`].
+    ///
+    /// Re-read by the host EVERY frame, like `constraints()`: the user edits them in the
+    /// engine's own panel while a result is pending, and the host re-derives that result from
+    /// the kept raw answer without a new run. Must stay cheap and return already-`normalized()`
+    /// values. Whether it is `Some` must not change during a run: the host decides at hand-off
+    /// what to keep for the answer.
+    fn postprocess_settings(&self) -> Option<PostprocessSettings> {
+        None
     }
 
     /// Starts one run. The engine takes over `request` and reports through `poll`.

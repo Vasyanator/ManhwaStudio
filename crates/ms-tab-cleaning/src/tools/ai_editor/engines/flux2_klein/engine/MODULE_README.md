@@ -10,8 +10,8 @@ the decisions (`../decisions.rs`) only read values handed to them.
 Two files, one type. `mod.rs` declares `Flux2KleinEngine`, implements `AiEngine`, and
 keeps the per-frame housekeeping that must run whether the panel is visible or not —
 loading the settings once, saving them when they settle, re-querying the `.status` catalog
-when the paths change, re-arming the forecast when the region SIZE settles, and dropping
-the undo history when the region moves. `actions.rs` is a second inherent `impl` block
+when the paths change, re-arming the forecast when the region SIZE settles, and cancelling
+the run in flight when the region moves. `actions.rs` is a second inherent `impl` block
 holding the `start_*` / `poll_*` pair of every long operation.
 
 The split is by lifetime, not by topic: `mod.rs` answers questions the panel asks on the
@@ -63,6 +63,14 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
   write; a failure restores `dirty`, shows `saver.error` and retries after `save_retry_delay`
   (2 s doubling to 60 s); the writer function is `saver.write`, so a test can inject a failing
   one.
+- **Settings are written once they settle**: a change waits out the saver's quiet time
+  (`SETTINGS_SAVE_DEBOUNCE`, 700 ms after the LAST change; a dragged dial changes the settings
+  every frame), `poll` wakes the GUI per `saver.wake_after(now)`, and a value still owed when
+  the engine is dropped is flushed by the saver on a worker. `poll_and_maybe_save(now)` takes
+  the clock, so tests drive the quiet time explicitly.
+- **A «Постобработка» edit is not a forecast question**: the panel reports it separately
+  (`Flux2PanelCtx::postprocess_changed`) and `note_postprocess_changed` only owes a save;
+  every other edit goes through `note_settings_changed`, which also re-arms the forecast.
 - **A blocked settings file is never written** (`settings_save_blocked`): the edits stay in
   memory and `poll_and_maybe_save` returns early. A MIGRATED load is marked dirty, so the
   file is rewritten once without the retired placement fields.
@@ -79,7 +87,8 @@ poll_x()   -> try_recv, apply the outcome, clear the Receiver
 
 ## Editing map
 - To change what the host sees — the sections, the mask layer, the size constraints, the
-  accepted marks modes, what a run answers with — see `impl AiEngine` in `mod.rs`; to change
+  accepted marks modes, what a run answers with (`DoneRaw`) and the live post-process
+  settings (`postprocess_settings`) — see `impl AiEngine` in `mod.rs`; to change
   what a run request is validated and turned into, see `Flux2KleinEngine::run_input`.
 - To change when the catalog, the forecast or the library listing is re-queried, see
   `poll_and_maybe_query_*`, `invalidate_forecast` and `note_settings_changed` in `mod.rs`;

@@ -30,6 +30,11 @@ poll_x()   -> try_recv, apply the outcome, clear the receiver
   the panel being drawn.
 - **A user edit outranks a late settings load** (`poll_settings_load` adopts the file only while
   `dirty` is clear) and nothing is written before the load landed (`SettingsSaver`).
+- **Settings are written once they settle**: the saver waits `SETTINGS_SAVE_DEBOUNCE` (700 ms)
+  after the last change, `poll` wakes the GUI per `saver.wake_after(now)`, and a value still
+  owed on drop is flushed by the saver on a worker. A «Постобработка» edit
+  (`Flux3PanelIntents::postprocess_changed`) only owes a save (`note_postprocess_changed`); any
+  other edit (`note_settings_changed`) also re-arms the forecast.
 - **One query of a kind in flight**: `.status` by `status_wanted`, the forecast by the
   controller's arming; the status answer counts only for the root it was asked about.
 - **The forecast asks** the `flux3_klein` adapter with the selected format, the normalized params
@@ -37,11 +42,15 @@ poll_x()   -> try_recv, apply the outcome, clear the receiver
   non-empty root (the backend refuses a forecast without one).
 - **The run gate reads `non_run_pipeline_busy`** (a download), never the run itself; a run started
   while references are still being read is refused with its own sentence.
+- **A run answers raw pixels**: `poll` returns `EnginePoll::DoneRaw` (raw region + the mask and
+  mode `run_input` derived, moved back from the worker); `postprocess_settings` answers the
+  persisted «Постобработка» values, normalized, every frame and for the engine's whole life.
 - **A moved frame cancels the run** (the answer would describe another place); a settled resize
   arms the forecast once, a pure move arms nothing.
 
 ## Editing map
-- What the host sees (layers, constraints, marks modes, the run): `impl AiEngine` in `mod.rs`;
+- What the host sees (layers, constraints, marks modes, the run, the post-process settings):
+  `impl AiEngine` in `mod.rs`;
   what a request becomes: `run_input`.
 - A new button that starts something long: a `start_*` / `poll_*` pair in `actions.rs`, drained
   from `AiEngine::poll`, its receiver in `pipeline_busy` if it holds the backend.

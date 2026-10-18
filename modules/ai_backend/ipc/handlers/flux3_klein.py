@@ -12,8 +12,9 @@ Blob convention of `inpaint.flux3_klein`:
     request blob = region_png ++ mask_png ++ reference_png_0 ++ ... ++ reference_png_{n-1}
                    (split via image_len / mask_len / reference_lens, n <= 9)
 The lengths must sum to the blob length exactly; a reference length of 0 is a
-request error. The response blob is the edited region PNG (its length repeated
-as `image_len`); the header carries `seed`, `steps`, `width`, `height`,
+request error. The mask travels for validation only. The response blob is the
+RAW generated region as an RGB PNG, with no colour match and no composite (the
+client post-processes it, protocol 17; its length repeated as `image_len`); the header carries `seed`, `steps`, `width`, `height`,
 `text_tokens`, `applied` and the step keys (`region.edit_region_bytes`).
 
 Streaming: `progress{id}` frames through the request's `ProgressEmitter`

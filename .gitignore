@@ -126,6 +126,11 @@ android/app/src/main/assets/
 # clone needs them. Regenerate with tools/make_text_detect_fixtures.py (whitelisted below).
 !crates/ms-text-detect/fixtures/**
 
+# Golden region post-processing fixtures of ms-region-postprocess (synthetic inputs, stage outputs
+# recorded from the reference Python at a pinned revision). The parity tests read them, so a clean
+# clone needs them. Regenerate with tools/make_region_postprocess_fixtures.py (whitelisted below).
+!crates/ms-region-postprocess/fixtures/**
+
 # ag-psd is a standalone project (github.com/Vasyanator/ag-psd-rs) consumed from
 # crates.io (ag-psd = "0.2.0"); its local dev checkout is not part of this repo.
 crates/ag-psd/
@@ -178,6 +183,10 @@ tools/egui_docs/*.py[cod]
 # The generator of the committed ms-text-detect fixtures (whitelisted above), published with them
 # so the fixtures stay reproducible.
 !tools/make_text_detect_fixtures.py
+
+# The generator of the committed ms-region-postprocess fixtures (whitelisted above), published with
+# them so the fixtures stay reproducible.
+!tools/make_region_postprocess_fixtures.py
 
 # Baberu OCR parity fixtures of ms-onnx (Pillow resize goldens, reference non-content ids, small
 # sample crops + reference decodes) and their generator; the parity tests read them.

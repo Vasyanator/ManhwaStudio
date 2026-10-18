@@ -11,7 +11,9 @@ load/save pair that moves the whole struct through a worker thread.
 
 Main responsibilities:
 - own `Flux2KleinSettings`, its defaults, its clamping (`normalized`) and the JSON
-  body it puts on the wire (`params`);
+  body it puts on the wire (`params`); the «Постобработка» values are the shared
+  `ms_region_postprocess::PostprocessSettings`, embedded FLATTENED (`postprocess`) so the
+  file keeps its historic flat keys, and they never reach the wire (the host applies them);
 - own the dtype vocabulary and the persisted step ids (`step_choice`);
 - migrate a document written before the step axes existed (`legacy_memory_steps`,
   which owns the placement -> step-pair table; the backend refuses those fields);
@@ -221,7 +223,8 @@ pub(super) struct Flux2EffectivePaths {
 ///
 /// `#[serde(default)]` so a file written by an older build keeps loading; the wire
 /// value is always `normalized()`, never this struct as edited.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `PartialEq`: the shared `SettingsSaver` detects a change by value (its save debounce).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Flux2KleinSettings {
     /// `Flux2Variant::wire()` — which checkpoint this document describes.
@@ -298,19 +301,17 @@ pub(super) struct Flux2KleinSettings {
     /// struct-level `#[serde(default)]`). Sent as `encoder_on_cpu` in every `params`, the
     /// forecast's included, so the forecast reflects it; honouring it is the backend's.
     pub(super) encoder_on_cpu: bool,
+    /// Growth of the painted mask contour, pixels (`0..=FLUX2_DILATE_MAX`): the run dilates
+    /// the painted mask by it (an ellipse, on the run worker) into the LATENT mask the model
+    /// sees. Ignored in a whole-region run, which has no contour to grow.
     pub(super) mask_dilate_px: u32,
-    pub(super) mask_feather_px: u32,
-    /// Global colour match of the generated region to the ring outside the mask.
-    pub(super) color_match: bool,
-    /// «Сила локальной подгонки», percent 0..=100: the low-frequency Lab mean/contrast match
-    /// inside the mask the backend applies AFTER the global one; `0` = global match only.
-    /// Effective only with `color_match` (the backend ignores it otherwise, and so does a
-    /// whole-region run). Default 60, also for a file without the field.
-    pub(super) color_match_local_pct: u32,
-    /// «Масштаб локальной подгонки»: the Gaussian sigma, pixels, of the finest
-    /// level of that local match's averaging (its blur radius), 8..=96.
-    /// Default 24, also for a file without the field.
-    pub(super) color_match_scale_px: u32,
+    /// «Постобработка»: feather and colour match, applied by the HOST to the raw run answer
+    /// (`AiEngine::postprocess_settings`), never sent to the backend. FLATTENED, so its keys
+    /// (`mask_feather_px`, `color_match`, `color_match_local_pct`, `color_match_scale_px`) are
+    /// the very top-level keys this document always had, at the same place; its own
+    /// `#[serde(default)]` reads every absent one as the shared default.
+    #[serde(flatten)]
+    pub(super) postprocess: PostprocessSettings,
     /// «Внимание только к маске»: the prompt acts only on the masked area, so the model
     /// cannot apply the instruction to a matching object OUTSIDE the mask.
     ///
@@ -364,16 +365,8 @@ impl Default for Flux2KleinSettings {
             // keeping it off the GPU leaves the video memory to the model that runs every step.
             encoder_on_cpu: true,
             mask_dilate_px: 16,
-            // 12 px, not 6: with a correct ramp (its width IS `mask_feather_px`) 6 px still
-            // leaves a visible step — measured +9.8% excess gradient on the mask contour
-            // against +1.1% at 12 px, while 12 px still keeps 81-84% of the edit. 16 px is
-            // cleaner again (+0.3%) but gives up too much of it.
-            mask_feather_px: 12,
-            color_match: true,
-            // The backend's defaults for the local match (a document without the fields loads
-            // them through the struct-level `#[serde(default)]`).
-            color_match_local_pct: 60,
-            color_match_scale_px: 24,
+            // The one owner of the post-processing defaults is `ms_region_postprocess`.
+            postprocess: PostprocessSettings::default(),
             // On: a prompt that may also act outside the mask can edit a matching object
             // the user never selected, and painting a mask says "only here".
             text_attention_in_mask: true,
@@ -440,10 +433,7 @@ impl Flux2KleinSettings {
             text_encoder_fp8: self.text_encoder_fp8,
             encoder_on_cpu: self.encoder_on_cpu,
             mask_dilate_px: self.mask_dilate_px.min(FLUX2_DILATE_MAX),
-            mask_feather_px: self.mask_feather_px.min(FLUX2_FEATHER_MAX),
-            color_match: self.color_match,
-            color_match_local_pct: self.color_match_local_pct.min(FLUX2_COLOR_MATCH_LOCAL_PCT_MAX),
-            color_match_scale_px: self.color_match_scale_px.clamp(FLUX2_COLOR_MATCH_SCALE_MIN, FLUX2_COLOR_MATCH_SCALE_MAX),
+            postprocess: self.postprocess.normalized(),
             text_attention_in_mask: self.text_attention_in_mask,
         }
     }
@@ -591,14 +581,9 @@ impl Flux2KleinSettings {
             "text_encoder_fp8": self.text_encoder_fp8,
             "encoder_on_cpu": self.encoder_on_cpu,
             "whole_region": whole_region,
-            "mask_dilate_px": self.mask_dilate_px,
-            "mask_feather_px": self.mask_feather_px,
-            "color_match": self.color_match,
-            // Sent as stored whatever `color_match` and `whole_region` are, like `color_match`
-            // itself: the backend applies the local match only under the global one and never
-            // in a whole-region run.
-            "color_match_local_pct": self.color_match_local_pct,
-            "color_match_scale_px": self.color_match_scale_px,
+            // No `mask_dilate_px` and none of the `postprocess` keys (protocol 17 refuses all
+            // five by name): the dilation is already in the mask the blob carries
+            // (`run_flux2_klein_pass`), and feather / colour match are the host's.
             "text_attention_in_mask": text_attention_in_mask,
             // Pinned, not a setting: see `FLUX2_MAX_SEQ`. The field stays on the wire
             // because the backend still reads it.
@@ -750,7 +735,21 @@ pub(super) fn settings_from_json(value: &Value) -> Result<Flux2LoadedDocument, s
 /// # Errors
 /// Returns a user-facing message when the data directory cannot be created, when the
 /// settings cannot be serialized, or when the write fails.
+///
+/// A test build of this crate writes NOTHING and answers `Ok(())`: the path is the user's real
+/// data directory, and the shared saver's teardown flush can reach this function from any test
+/// that leaves a loaded, dirty engine behind. `Ok` rather than an error because the saver reads
+/// `Ok` as "nothing is owed any more"; an error would show a failure and retry with backoff
+/// for a write that must never happen. `cfg!(test)` alone is enough here (no runtime latch as
+/// in `ms-tab-typing`'s `persistence_suppressed_by_tests`): this function is private to
+/// `ms-tab-cleaning`, the engines are built only by this crate's `engines/mod.rs`, and every
+/// test that reaches them is one of this crate's own. Tests of real writing use an injected
+/// writer or `write_settings_json` on a temp path.
 pub(super) fn save_flux2_settings(settings: &Flux2KleinSettings) -> Result<(), String> {
+    if cfg!(test) {
+        ms_log::runtime_log::log_info(format!("[cleaning] {FLUX2_LOG_LABEL} settings not written: a test build never writes the user's settings file"));
+        return Ok(());
+    }
     write_settings_json(&config::flux2_klein_settings_path(settings.variant()), settings).map_err(|err| match err {
         SettingsWriteError::CreateDir(err) => tf!("cleaning.settings_io.create_dir_error", err = err),
         SettingsWriteError::Serialize(err) => tf!("cleaning.tools.flux2_klein.serialize_settings_error", err = err),
@@ -762,6 +761,17 @@ pub(super) fn save_flux2_settings(settings: &Flux2KleinSettings) -> Result<(), S
 mod tests {
     use super::*;
 
+    /// A test build never writes the user's real settings file (the saver's teardown flush
+    /// can reach the product writer from any test): it answers `Ok` and leaves the file alone.
+    #[test]
+    fn a_test_build_never_writes_the_settings_file() {
+        let settings = Flux2KleinSettings::default();
+        let path = config::flux2_klein_settings_path(settings.variant());
+        let before = std::fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+        assert!(save_flux2_settings(&settings).is_ok());
+        assert_eq!(std::fs::metadata(&path).and_then(|meta| meta.modified()).ok(), before);
+    }
+
     #[test]
     fn defaults_match_the_distilled_checkpoint_and_start_on_auto() {
         let settings = Flux2KleinSettings::default();
@@ -770,10 +780,7 @@ mod tests {
         assert!((settings.strength - 1.0).abs() < f32::EPSILON);
         assert!(!settings.use_seed);
         assert_eq!(settings.mask_dilate_px, 16);
-        assert_eq!(settings.mask_feather_px, 12);
-        assert!(settings.color_match);
-        assert_eq!(settings.color_match_local_pct, 60);
-        assert_eq!(settings.color_match_scale_px, 24);
+        assert_eq!(settings.postprocess, PostprocessSettings::default(), "the shared post-processing defaults");
         assert_eq!(settings.step_choice(), StepChoice::default(), "«Авто» / «Авто»");
         // Quantizing the text encoder is never defaulted on.
         assert!(!settings.text_encoder_fp8);
@@ -790,9 +797,7 @@ mod tests {
             guidance_scale: f32::NAN,
             strength: 0.0,
             mask_dilate_px: 999,
-            mask_feather_px: 999,
-            color_match_local_pct: 101,
-            color_match_scale_px: 97,
+            postprocess: PostprocessSettings { mask_feather_px: 999, color_match: true, color_match_local_pct: 101, color_match_scale_px: 97 },
             vram_step: "turbo".to_string(),
             ram_step: " keep ".to_string(),
             dtype: "nonsense".to_string(),
@@ -806,12 +811,9 @@ mod tests {
         assert!((norm.guidance_scale - 1.0).abs() < f32::EPSILON);
         assert!((norm.strength - FLUX2_STRENGTH_MIN).abs() < f32::EPSILON);
         assert_eq!(norm.mask_dilate_px, FLUX2_DILATE_MAX);
-        assert_eq!(norm.mask_feather_px, FLUX2_FEATHER_MAX);
-        assert_eq!(norm.color_match_local_pct, FLUX2_COLOR_MATCH_LOCAL_PCT_MAX);
-        assert_eq!(norm.color_match_scale_px, FLUX2_COLOR_MATCH_SCALE_MAX);
-        let small = Flux2KleinSettings { color_match_scale_px: 0, color_match_local_pct: 0, ..Flux2KleinSettings::default() }.normalized();
-        assert_eq!(small.color_match_scale_px, FLUX2_COLOR_MATCH_SCALE_MIN);
-        assert_eq!(small.color_match_local_pct, 0, "0 % is a valid value: the global match only");
+        // The post-processing ranges are `ms_region_postprocess`'s; `normalized()` delegates.
+        assert_eq!(norm.postprocess, settings.postprocess.normalized());
+        assert_eq!(norm.postprocess.mask_feather_px, ms_region_postprocess::FEATHER_MAX_PX);
         assert_eq!(norm.vram_step, "auto", "an unknown step id normalizes to «Авто»");
         assert_eq!(norm.ram_step, "keep", "a padded known id is kept");
         assert_eq!(norm.dtype, "bfloat16");
@@ -1003,9 +1005,20 @@ mod tests {
         for whole_region in [false, true] {
             let params = runnable_settings().normalized().to_params(whole_region);
             assert_eq!(params["whole_region"], json!(whole_region));
-            // The mode never replaces the mask parameters: feathering still reaches the
-            // backend and still means what it means in both.
-            assert_eq!(params["mask_feather_px"], json!(12));
+        }
+    }
+
+    /// Protocol 17: the dilation travels inside the mask blob and the post-processing is the
+    /// host's, so none of the five retired mask/post keys reaches the backend — not in a run
+    /// (either mode) and not in a forecast. The backend refuses each of them by name.
+    #[test]
+    fn no_mask_or_post_key_reaches_the_wire() {
+        let normalized = runnable_settings().normalized();
+        let all = [normalized.to_params(false), normalized.to_params(true), normalized.to_profiles_params(true), normalized.to_profiles_params(false)];
+        for params in all {
+            for retired in ["mask_dilate_px", "mask_feather_px", "color_match", "color_match_local_pct", "color_match_scale_px"] {
+                assert!(params.get(retired).is_none(), "`{retired}` must not reach the wire: {params}");
+            }
         }
     }
 
@@ -1049,31 +1062,39 @@ mod tests {
         assert!(!round.text_attention_in_mask, "an explicit `false` is kept");
     }
 
-    /// The local colour match: a document without the two fields loads the backend's defaults
-    /// (60 %, 24 px), explicit values survive a round trip, and both travel as stored in the run
-    /// `params` (whole-region included — the backend switches the match off there) and in the
-    /// forecast's.
+    /// The post-processing values live in the flattened `postprocess` block, but the FILE keeps
+    /// the flat keys every older build wrote: an old document loads its values from them, a
+    /// document without them reads the shared defaults, and saving writes the same flat keys
+    /// (with the same values) back — no nested object, no renamed key.
     #[test]
-    fn local_color_match_defaults_and_reaches_the_wire() {
-        let old = loaded_settings(&json!({ "prompt": "remove the text", "color_match": true }));
-        assert_eq!((old.color_match_local_pct, old.color_match_scale_px), (60, 24), "a document without the fields reads the defaults");
-        let settings = Flux2KleinSettings { color_match_local_pct: 35, color_match_scale_px: 48, ..runnable_settings() };
-        let round: Flux2KleinSettings =
-            serde_json::from_str(&serde_json::to_string(&settings).expect("serializes")).expect("round-trips");
-        assert_eq!((round.color_match_local_pct, round.color_match_scale_px), (35, 48), "explicit values are kept");
-        let normalized = settings.normalized();
-        for whole_region in [false, true] {
-            let params = normalized.to_params(whole_region);
-            assert_eq!(params["color_match_local_pct"], json!(35), "run params");
-            assert_eq!(params["color_match_scale_px"], json!(48), "run params");
+    fn an_old_flat_post_processing_document_loads_its_values_and_saves_the_same_keys() {
+        let old = json!({
+            "prompt": "remove the text",
+            "mask_dilate_px": 9,
+            "mask_feather_px": 5,
+            "color_match": false,
+            "color_match_local_pct": 35,
+            "color_match_scale_px": 48
+        });
+        let loaded = loaded_settings(&old);
+        assert_eq!(loaded.mask_dilate_px, 9);
+        assert_eq!(
+            loaded.postprocess,
+            PostprocessSettings { mask_feather_px: 5, color_match: false, color_match_local_pct: 35, color_match_scale_px: 48 },
+            "every flat key lands in the flattened block"
+        );
+        let written = serde_json::to_value(&loaded).expect("serialize");
+        let object = written.as_object().expect("the settings serialize as an object");
+        assert!(object.get("postprocess").is_none(), "the block is flattened, never nested");
+        for key in ["mask_dilate_px", "mask_feather_px", "color_match", "color_match_local_pct", "color_match_scale_px"] {
+            assert_eq!(object.get(key), old.get(key), "`{key}` is written back flat with its value");
         }
-        let forecast = normalized.to_profiles_params(true);
-        assert_eq!(forecast["color_match_local_pct"], json!(35), "forecast params");
-        assert_eq!(forecast["color_match_scale_px"], json!(48), "forecast params");
-        let out_of_range = Flux2KleinSettings { color_match_local_pct: 500, color_match_scale_px: 2, ..runnable_settings() };
-        let params = out_of_range.normalized().to_params(false);
-        assert_eq!(params["color_match_local_pct"], json!(100), "only the clamped value reaches the wire");
-        assert_eq!(params["color_match_scale_px"], json!(8), "only the clamped value reaches the wire");
+        let without = loaded_settings(&json!({ "prompt": "remove the text" }));
+        assert_eq!(without.postprocess, PostprocessSettings::default(), "absent keys read the shared defaults");
+        let partial = loaded_settings(&json!({ "color_match": false }));
+        assert_eq!(partial.postprocess, PostprocessSettings { color_match: false, ..PostprocessSettings::default() }, "one key does not cost the others");
+        // A wrong type inside the flattened block is still a damaged document (moved aside).
+        assert!(settings_from_json(&json!({ "mask_feather_px": "wide" })).is_err());
     }
 
     /// «Энкодер на CPU» defaults ON — for a fresh document AND for one written before the

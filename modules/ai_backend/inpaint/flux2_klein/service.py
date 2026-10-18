@@ -46,7 +46,7 @@ Notes:
 - Symbols the test suite monkeypatches are reached through their defining
   module (`hardware._clear_torch_cache`, `prompt_cache.write_prompt_file`,
   `attention.build_text_attention_mask`, ...).
-- torch / diffusers / transformers / cv2 are imported lazily.
+- torch / diffusers / transformers are imported lazily.
 """
 
 from __future__ import annotations
@@ -73,16 +73,7 @@ from ...runtime.large_models.tiers import IDLE_PHASE, RamStep, Steps, VramStep
 from ...runtime.model_manager import SmallModelManager
 from ...runtime.residency.footprint import normalize_device
 from ...runtime.residency.holdings import Pool
-from ..region_imaging import (
-    composite_over_region,
-    decode_image_rgb,
-    decode_mask,
-    dilate_mask,
-    encode_png_rgb,
-    match_color_local,
-    match_color_outside_mask,
-    require_solid_mask,
-)
+from ..region_imaging import decode_image_rgb, decode_mask, encode_png_rgb, require_solid_mask
 from . import attention, hardware, large_model, memory, pipeline, prompt_cache
 from .components import (
     _SCHEDULER_MARKER,
@@ -552,14 +543,18 @@ class Flux2KleinInpaintService:
         params: dict[str, Any] | None = None,
         progress_callback: ProgressCb | None = None,
     ) -> dict[str, Any]:
-        """Regenerate the masked part of `image_bytes` and composite it back.
+        """Regenerate the masked part of `image_bytes` and return the RAW decoded region.
 
-        `image_bytes` is the region PNG and `mask_bytes` an L8 mask of the same
-        size, where non-zero means "may change"; `reference_bytes`, when given,
-        is the user's marks over a copy of the region and must have EXACTLY the
-        region's size (it is the pipeline's `image_reference`, never part of the
-        composite). The returned `image_png` is byte-identical to the input
-        outside the mask. Under `whole_region` the mask must be solid.
+        `image_bytes` is the region PNG and `mask_bytes` the LATENT mask: an L8
+        mask of the same size, already dilated by the client, where non-zero
+        means "may be repainted". It is used as-is (no morphology here) as the
+        pipeline's `mask_image` and as the text-attention target.
+        `reference_bytes`, when given, is the user's marks over a copy of the
+        region and must have EXACTLY the region's size (the pipeline's
+        `image_reference`). The returned `image_png` is the RGB decode of the
+        run, with no colour match and no composite: outside the mask it is a
+        VAE round trip of the region, NOT byte-identical to it; the client owns
+        every post-processing step. Under `whole_region` the mask must be solid.
 
         **Order** (a memory contract): the pipeline handle is admitted and
         loaded first; the encoder handle second, planned on what the pipeline's
@@ -633,7 +628,11 @@ class Flux2KleinInpaintService:
         report: Callable[[int, str], None],
         progress_callback: ProgressCb | None,
     ) -> dict[str, Any]:
-        """The run under `self._lock`: pipeline session, prompt, denoise, decode, composite."""
+        """The run under `self._lock`: pipeline session, prompt, denoise, decode; answers the raw decode.
+
+        `mask_u8` is the binarized latent mask from the wire, passed to the
+        pipeline unchanged.
+        """
         height, width = region_rgb.shape[:2]
         device = self._device_name()
         guidance = self._effective_guidance_scale(normalized) > 1.0
@@ -658,10 +657,9 @@ class Flux2KleinInpaintService:
                 loaded = True
                 embeds, encoder_retries = self._prompt_embeds_locked(normalized, report, steps=steps, device=device, shape=shape, device_cap_bytes=self._encoder_cap(ceilings, session))
                 retries += encoder_retries
-                latent_mask = dilate_mask(mask_u8, normalized["mask_dilate_px"])
                 latents_cpu, image_processor = session.run_phase(
                     large_model.PHASE_DENOISE,
-                    lambda ctx: self._denoise(ctx, region_rgb, latent_mask, normalized, embeds, progress_callback, reference_rgb),
+                    lambda ctx: self._denoise(ctx, region_rgb, mask_u8, normalized, embeds, progress_callback, reference_rgb),
                 )
                 decoded, tiled = session.run_phase(
                     large_model.PHASE_DECODE,
@@ -685,23 +683,10 @@ class Flux2KleinInpaintService:
         if generated.shape[:2] != (height, width):
             raise RuntimeError(
                 f"Пайплайн вернул область {generated.shape[1]}x{generated.shape[0]} вместо "
-                f"{width}x{height}; композит невозможен"
+                f"{width}x{height}"
             )
-        if normalized["color_match"]:
-            # Both matches sample outside the LATENT (dilated) mask: that is the
-            # area the pipeline was allowed to repaint.
-            generated = match_color_outside_mask(generated, region_rgb, latent_mask)
-            if normalized["color_match_local_pct"] > 0:
-                generated = match_color_local(
-                    region_rgb,
-                    generated,
-                    latent_mask,
-                    strength=normalized["color_match_local_pct"] / 100.0,
-                    scale_px=int(normalized["color_match_scale_px"]),
-                )
-        composed = composite_over_region(region_rgb, generated, mask_u8, int(normalized["mask_feather_px"]))
         return {
-            "image_png": encode_png_rgb(composed),
+            "image_png": encode_png_rgb(generated),
             "region_size": [int(width), int(height)],
             "device": self._device_label(),
             "applied": applied,
@@ -812,7 +797,8 @@ class Flux2KleinInpaintService:
     ) -> tuple[Any, Any]:
         """The denoise phase (restartable): returns `(latents on the host, the pipeline's image processor)`.
 
-        The LATENT mask (`latent_mask`, dilated) goes to the pipeline; with
+        The LATENT mask (`latent_mask`, the wire mask, dilated by the client)
+        goes to the pipeline; with
         `text_attention_in_mask` the call carries `attention_kwargs` confining
         the prompt to that mask's tokens, dropped from the pipeline again on
         every exit (diffusers keeps `_attention_kwargs`). Latents come back
@@ -1663,7 +1649,8 @@ class Flux2KleinInpaintService:
     ) -> Any:
         """Build the `text_attention_in_mask` attention mask for this run.
 
-        `latent_mask` is the DILATED mask the pipeline receives as `mask_image`,
+        `latent_mask` is the wire's latent mask (dilated by the client) that the
+        pipeline receives as `mask_image`,
         so the prompt reaches every token the latent blend may change. The text
         length is read from the real `prompt_embeds`, never from the request:
         the mask must match the sequence the transformer will actually see.

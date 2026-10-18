@@ -11,11 +11,12 @@ Main responsibilities:
 - run it streaming on a worker (`run_flux3_klein`), publishing progress frames under the
   run's generation and clearing the bar on every exit;
 - validate the answer (`parse_flux3_run_answer`): the declared `image_len` with STRICT
-  equality, a PNG of exactly the region size, the echoed `seed`, the degraded steps;
+  equality, a PNG of exactly the region size, the echoed `seed`, the degraded steps. The PNG is
+  the RAW model output (protocol 17); the host post-processes it with the run's mask;
 - ask `.status` (`fetch_flux3_status`) and `.unload` (`unload_flux3_klein`).
 
 Key structures:
-- `Flux3RunInput`, `Flux3RunOutcome`, `Flux3Applied`
+- `Flux3RunInput`, `Flux3RunAnswer`, `Flux3RunOutcome`, `Flux3Applied`
 
 Key functions:
 - `flux3_run_request()`, `run_flux3_klein()`, `parse_flux3_run_answer()`,
@@ -56,9 +57,9 @@ pub(super) struct Flux3Applied {
     pub(super) ae_dtype: String,
 }
 
-/// One finished run.
-pub(super) struct Flux3RunOutcome {
-    /// The edited region, exactly the requested size.
+/// One validated success reply ([`parse_flux3_run_answer`]).
+pub(super) struct Flux3RunAnswer {
+    /// The RAW generated region (no feather, no colour match), exactly the requested size.
     pub(super) image: egui::ColorImage,
     /// The seed the run used (drawn by the backend when none was pinned).
     pub(super) seed: u64,
@@ -67,6 +68,16 @@ pub(super) struct Flux3RunOutcome {
     pub(super) applied: Flux3Applied,
     /// Present when the backend had to degrade the step pair to finish.
     pub(super) degraded: Option<RunDegraded>,
+}
+
+/// One finished run: the reply plus the run facts the host post-processes its raw image with
+/// (`RawRegionResult`), moved back from the worker's `Flux3RunInput`.
+pub(super) struct Flux3RunOutcome {
+    pub(super) answer: Flux3RunAnswer,
+    /// The L8 mask the run sent (`mask_for_run`'s output), `size` bytes.
+    pub(super) mask: Vec<u8>,
+    /// The run regenerated the whole region (no ring to colour-match against).
+    pub(super) whole_region: bool,
 }
 
 /// Builds the `inpaint.flux3_klein` request: its header and the one blob it describes.
@@ -92,7 +103,7 @@ pub(super) fn flux3_run_request(region_png: &[u8], mask_png: &[u8], references: 
     (header, blob)
 }
 
-/// Runs one region edit and returns the edited region.
+/// Runs one region edit and returns the RAW generated region with the run's mask and mode.
 ///
 /// `settings` must already be `normalized()`. `claim` is the progress claim taken on the GUI
 /// thread by `start`: every write is dropped once a cancel retired its generation, the request
@@ -104,14 +115,14 @@ pub(super) fn flux3_run_request(region_png: &[u8], mask_png: &[u8], references: 
 /// encoded, the backend refused or is unreachable, or the answer is malformed
 /// ([`parse_flux3_run_answer`]).
 pub(super) fn run_flux3_klein(
-    input: &Flux3RunInput,
+    input: Flux3RunInput,
     settings: &Flux3KleinSettings,
     progress: &Arc<Mutex<EngineProgress>>,
     claim: &ProgressClaim,
 ) -> Result<Flux3RunOutcome, String> {
-    let outcome = run_flux3_klein_pass(input, settings, progress, claim);
+    let answer = run_flux3_klein_pass(&input, settings, progress, claim);
     update_progress(progress, claim.generation, |state| state.active = false);
-    outcome
+    answer.map(|answer| Flux3RunOutcome { answer, mask: input.mask, whole_region: input.whole_region })
 }
 
 /// The body of [`run_flux3_klein`] without the bar bookkeeping; split so no early return can
@@ -121,7 +132,7 @@ fn run_flux3_klein_pass(
     settings: &Flux3KleinSettings,
     progress: &Arc<Mutex<EngineProgress>>,
     claim: &ProgressClaim,
-) -> Result<Flux3RunOutcome, String> {
+) -> Result<Flux3RunAnswer, String> {
     let Flux3RunInput { region, mask, whole_region, size, references, marks_reference } = input;
     let [width, height] = *size;
     if region.size != *size || mask.len() != width.saturating_mul(height) || marks_reference.as_ref().is_some_and(|marks| marks.size != *size) {
@@ -174,7 +185,7 @@ fn run_flux3_klein_pass(
 /// # Errors
 /// A user-facing message for an empty blob, a missing or disagreeing `image_len`, an
 /// undecodable PNG or one of another size, or a malformed required field (named, and logged).
-pub(super) fn parse_flux3_run_answer(header: &Value, blob: &[u8], size: [usize; 2]) -> Result<Flux3RunOutcome, String> {
+pub(super) fn parse_flux3_run_answer(header: &Value, blob: &[u8], size: [usize; 2]) -> Result<Flux3RunAnswer, String> {
     if blob.is_empty() {
         return Err(t!("cleaning.inpaint.no_png_result_error").to_string());
     }
@@ -196,7 +207,7 @@ pub(super) fn parse_flux3_run_answer(header: &Value, blob: &[u8], size: [usize; 
         return Err(tf!("cleaning.inpaint.unexpected_size_error", out_w = out[0], out_h = out[1], width = size[0], height = size[1]));
     }
     let Flux3AnswerFields { seed, steps, applied } = fields;
-    Ok(Flux3RunOutcome {
+    Ok(Flux3RunAnswer {
         image: egui::ColorImage::from_rgba_unmultiplied(out, rgba.as_raw()),
         seed,
         steps,
@@ -456,9 +467,9 @@ mod tests {
             marks_reference: None,
         };
         let claim = begin_progress_generation(&progress);
-        assert!(run_flux3_klein(&input([120, 128], 0), &settings, &progress, &claim).is_err(), "off the 16 grid");
-        assert!(run_flux3_klein(&input([128, 1024], 0), &settings, &progress, &claim).is_err(), "steeper than 4:1");
-        assert!(run_flux3_klein(&input([128, 128], 10), &settings, &progress, &claim).is_err(), "ten extra references");
+        assert!(run_flux3_klein(input([120, 128], 0), &settings, &progress, &claim).is_err(), "off the 16 grid");
+        assert!(run_flux3_klein(input([128, 1024], 0), &settings, &progress, &claim).is_err(), "steeper than 4:1");
+        assert!(run_flux3_klein(input([128, 128], 10), &settings, &progress, &claim).is_err(), "ten extra references");
         assert!(!lock_progress(&progress).active, "the bar is cleared on a refusal");
     }
 }

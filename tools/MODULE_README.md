@@ -13,11 +13,13 @@ Several unrelated concerns live here:
   font-IDENTITY rules before the identity code ever sees the files. Run by hand when
   the bundle changes.
 - **fixture generation** (`make_ellipsis_ligature_fixture.py`,
-  `make_text_detect_fixtures.py`, `make_baberu_fixtures.py`) — building committed test
+  `make_text_detect_fixtures.py`, `make_baberu_fixtures.py`,
+  `make_region_postprocess_fixtures.py`) — building committed test
   fixtures: the one test font of `ms-text-render`, the golden text-detector postprocess
-  fixtures of `ms-text-detect` recorded from the Python backend, and the Baberu OCR
-  parity fixtures of `ms-onnx` recorded from Pillow and the upstream reference loop. Run
-  by hand only when a fixture's contract changes.
+  fixtures of `ms-text-detect` recorded from the Python backend, the Baberu OCR
+  parity fixtures of `ms-onnx` recorded from Pillow and the upstream reference loop, and
+  the region post-processing parity fixtures of `ms-region-postprocess` recorded from the
+  former Python `region_imaging.py`. Run by hand only when a fixture's contract changes.
 - **large-model calibration** (`large_model_calibration/`) — measuring the backend's
   large-model manager on a real GPU (FLUX.3 / FLUX.2 runs under the real manager) and
   fitting / judging its cost tables `modules/ai_backend/runtime/large_models/calibration/`.
@@ -209,7 +211,24 @@ detection cannot be fooled by punctuation inside strings or comments.
   onnxruntime for `--model-dir`), all in `venv/`. The docstring documents formats and the
   PRNG contract that the Rust test reimplements.
 
+- `make_region_postprocess_fixtures.py`: records
+  `crates/ms-region-postprocess/fixtures/` (layout and case list in its `README.md`). It
+  loads the reference `modules/ai_backend/inpaint/region_imaging.py` from git revision
+  `c11c4eb` (`git show`, never the working tree, where the module no longer has these
+  helpers) and runs it twice on synthetic inputs: PATCHED with the Rust port's deliberate
+  deviations (exact EDT feather, splitmix64 jitter, numpy-fallback low-pass helpers) as the
+  parity target, and UNPATCHED as today's real output for the deviation report. Also
+  writes the cv2 ellipse kernel table (r = 1..=64), dilation fixtures and splitmix64
+  vectors. Needs numpy, OpenCV and Pillow from `venv/` and a git checkout holding the
+  revision. Run: `venv/bin/python -I tools/make_region_postprocess_fixtures.py`; exit `0` =
+  written, `1` = a case missed the branch it was built for or broke the outside-mask
+  contract, `2` = git or the revision is unavailable. Output is byte-deterministic; the
+  docstring documents the patches and the jitter rule.
+
 ## Editing map
+- To add or change a region post-processing fixture case, edit `build_cases()` in
+  `make_region_postprocess_fixtures.py`, rerun it, and update
+  `crates/ms-region-postprocess/fixtures/README.md` (case table / layout).
 - To add a Baberu resize golden case or sample, edit `RESIZE_CASES` / `E2E_SAMPLES` in
   `make_baberu_fixtures.py` and rerun it (Pillow and onnxruntime versions are recorded).
 - To add or change a text-detector fixture case, edit the `*_cases()` builders in

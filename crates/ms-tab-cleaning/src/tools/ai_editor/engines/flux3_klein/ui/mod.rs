@@ -11,7 +11,8 @@ Main responsibilities:
 - draw the body in its ORDER: the settings-file notice, the prompt, «Референсы», steps and
   seed, the readiness line, then the sibling folds «Установка модели» (`install.rs`),
   «Память и скорость» (the shared `large_model_resources` widget with the format rows and
-  «Энкодер на CPU») and «Для экспертов» (`advanced.rs`), and the mask note.
+  «Энкодер на CPU») and «Для экспертов» (`advanced.rs`), the mask note, and last the shared
+  «Постобработка» section (`shared::draw_postprocess_section`, bottom-docked).
 
 Key structures:
 - `Flux3PanelCtx`, `Flux3PanelIntents`
@@ -40,6 +41,9 @@ use advanced::*;
 pub(super) struct Flux3PanelIntents {
     /// A persisted value changed (a save is owed, the forecast re-armed).
     pub(super) settings_changed: bool,
+    /// Only a «Постобработка» value changed: a save is owed, the forecast and `.status` are
+    /// not re-asked (`Flux3KleinEngine::note_postprocess_changed`).
+    pub(super) postprocess_changed: bool,
     /// «Обновить»: re-ask `.status`.
     pub(super) want_status: bool,
     /// «Обновить»: the forecast's machine may have changed outside the app.
@@ -109,6 +113,10 @@ impl Flux3PanelCtx<'_> {
         draw_advanced_section(ui, self.settings, &mut self.intents.settings_changed);
         ui.separator();
         ui.small(t!("cleaning.tools.flux3_klein.mask_hint"));
+        // LAST: the shared section docks at the bottom of the body's free room. A change is a
+        // save like any other edit (but no forecast question); the host re-derives a pending
+        // result from it every frame.
+        self.intents.postprocess_changed |= draw_postprocess_section(ui, "cleaning_flux3_klein", &mut self.settings.postprocess);
     }
 
     /// A failed write (retried), a damaged file moved aside, or a file that blocks saving.
@@ -290,15 +298,16 @@ impl Flux3PanelCtx<'_> {
 mod tests {
     use super::*;
 
-    /// Every key this panel and its decisions spell exists in BOTH reference catalogs (en and
-    /// ru; es / fr / pt fall back to en) with the placeholders the code fills, and the two
-    /// texts of a placeholder key agree on them. A `t!` call cannot check this: a unit test
+    /// Every key this panel and its decisions spell (and the shared «Постобработка» section's)
+    /// exists in BOTH reference catalogs (en and ru; es / fr / pt fall back to en) with the
+    /// placeholders the code fills, and the two texts of a placeholder key agree on them. A `t!` call cannot check this: a unit test
     /// runs with no catalog loaded.
     #[test]
     fn the_reference_catalogs_carry_every_flux3_key() {
         let mut keys: Vec<(String, &[&str])> = FLUX3_PLAIN_KEYS.iter().map(|key| (format!("cleaning.tools.flux3_klein.{key}"), &[][..])).collect();
         keys.extend(FLUX3_PLACEHOLDER_KEYS.iter().map(|(key, placeholders)| (format!("cleaning.tools.flux3_klein.{key}"), *placeholders)));
         keys.extend(FLUX3_STAGES.iter().map(|stage| (format!("cleaning.tools.flux3_klein.stage_{stage}"), &[][..])));
+        keys.extend(POSTPROCESS_KEYS.iter().map(|key| ((*key).to_string(), &[][..])));
         for (tag, source) in ms_i18n::embedded_locales().iter().filter(|(tag, _)| matches!(*tag, "en" | "ru")) {
             let catalog: Value = serde_json::from_str(source).unwrap_or_else(|error| panic!("locale `{tag}` is not valid JSON: {error}"));
             for (key, placeholders) in &keys {
