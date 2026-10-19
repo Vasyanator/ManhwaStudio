@@ -66,6 +66,8 @@ Panel/UI flow:
 - `draw_toast`: renders toast popup.
 - `draw_text_detector_mask_layer_on_page`: draws detector mask and mask-edit interaction on canvas mask layer.
 - `draw_text_detector_additional_overlay_on_page`: draws detector boxes/line-edit overlay on additional-elements layer.
+  Both draw while `detector_overlay_visible()` (`tab/detector_region.rs`): Detector panel open,
+  or the selected OCR engine's "create mask" parameter on.
 - `draw_canvas_overlay_top_left` (CanvasHooks): frame orchestrator, buttons, polling, flushes.
 
 Panel dock:
@@ -116,6 +118,14 @@ Text detector flow:
 - `SessionCapabilities::chapter_storage`: false in a single-image session (scratch deleted on
   exit): no lazy load, no Save button, a stray save request is refused.
 - `poll_text_detection_storage_events`: applies load/save completion results.
+- `tab/detector_region.rs`: an OCR selection's region detection (PaddleOCR / Surya with that
+  engine's `*_detect_mask` parameter; started from `start_ocr_for_scene_rect` and the advanced
+  window's Create bubble, answered through `poll_text_detector_events`) merged into both detector
+  stores (held in `pending_region_detections` while a storage job runs), and
+  `detection_pages_for_save`, the Save snapshot of the SHOWN masks (shared model, brush edits
+  included), taken under the model lock with only the written masks copied.
+- `apply_loaded_detection_pages`: fills empty pages from the stored detection.
+- `rasterize_resolved_blocks`: the display raster of a legacy blocks-only page.
 - `set_text_detector_status`: updates detector status text and color.
 - `materialize_text_mask_page_from_blocks_if_missing`: legacy fallback that converts
   current detector blocks into a real editable mask if stored results have no `mask_alpha`.
@@ -281,7 +291,7 @@ use crate::panels::text_detector::{
     detector_page_size, draw_text_detector_panel,
 };
 use crate::text_detector::{
-    SURYA_DETECTOR_SPECS, TextDetectorControllerEvent, TextDetectorPageResult, TextDetectorRect, TextDetectorRunMode,
+    RegionDetection, SURYA_DETECTOR_SPECS, TextDetectorControllerEvent, TextDetectorPageResult, TextDetectorRect, TextDetectorRunMode,
     TranslationTextDetectorController,
 };
 use ms_models::page_view::PageImageInfo;
@@ -308,6 +318,9 @@ use web_time::Duration;
 
 // The canvas pointer drivers (rect selections, lines / mask edit), fed by the input frame.
 mod canvas_input;
+// An OCR selection's region detection (trigger, merge into both detector stores) and the
+// detector Save snapshot of the shown masks.
+mod detector_region;
 // Off-GUI-thread refresh of the OCR / detector routing inputs (desktop-only).
 #[cfg(not(target_arch = "wasm32"))]
 mod route_inputs;
@@ -716,6 +729,11 @@ pub struct TranslationTabState {
     text_detection_storage_loaded_for: Option<PathBuf>,
     text_detection_storage_busy: bool,
     text_detection_storage_rx: Option<Receiver<TextDetectionStorageEvent>>,
+    /// Region detections that arrived while the chapter's stored detection was loading (or
+    /// being saved); applied in arrival order once that job ends
+    /// (`detector_region::replay_pending_region_detections`), so a region never replaces a
+    /// stored page the load has not delivered yet.
+    pending_region_detections: Vec<RegionDetection>,
     /// The running canvas-wide rect selection (quick / advanced OCR, image crop), driven from the
     /// router's claim (`canvas_input::advance_selection`).
     canvas_selection: Option<CanvasSelection>,
@@ -875,6 +893,7 @@ impl TranslationTabState {
             text_detector_mask_brush: MaskBrush::default(),
             text_detection_storage_loaded_for: None,
             text_detection_storage_busy: false,
+            pending_region_detections: Vec::new(),
             text_detection_storage_rx: None,
             canvas_selection: None,
             advanced_recognition: AdvancedRecognitionWindow::default(),
@@ -1425,9 +1444,15 @@ impl TranslationTabState {
     /// the cached route inputs (`detector_native_route`, the rule the detector worker applies),
     /// checked against `local_ai` and the backend's PyTorch report.
     fn text_detector_availability(&self) -> Result<(), DetectorUnavailable> {
+        self.detector_algorithm_availability(self.text_detector_options.algorithm)
+    }
+
+    /// [`Self::text_detector_availability`] for any `algorithm` (an OCR selection's region
+    /// detection runs the OCR engine's detector, not necessarily the panel's).
+    fn detector_algorithm_availability(&self, algorithm: TextDetectorAlgorithm) -> Result<(), DetectorUnavailable> {
         let torch_available = self.ai_backend_torch_available();
         self.gate_over_ocr_route_inputs(|(runtime, guard)| {
-            self.text_detector_options.algorithm.availability(
+            algorithm.availability(
                 crate::text_detector::detector_native_route(runtime, guard),
                 &self.local_ai,
                 torch_available,
@@ -1679,8 +1704,10 @@ impl TranslationTabState {
                 let can_ocr_all = block_ocr_route.is_ok()
                     && self.ocr_controller.state() == OcrLoadState::Ready
                     && self.has_detected_blocks_any();
-                let can_save =
-                    !self.text_detector_results.is_empty() && !self.text_detection_storage_busy;
+                // The same pages `detector_region::detection_pages_for_save` writes: detected
+                // ones, or hand-painted ones (an all-erased painted page is refused on click).
+                let can_save = !self.text_detection_storage_busy
+                    && (!self.text_detector_results.is_empty() || self.has_hand_painted_only_pages());
                 let ocr_busy = self.textdetector_ocr_is_running();
                 let page_size = detector_page_size(page_infos.get(&canvas.current_page_idx()));
                 // The Surya checkpoint's install state, probed once per session on selection.
@@ -1729,9 +1756,7 @@ impl TranslationTabState {
                     self.start_text_detection_storage_save(project);
                 }
                 if actions.clear_results {
-                    self.text_detector_results.clear();
-                    self.text_detector_mask_textures.clear();
-                    self.clear_text_mask_model();
+                    self.clear_detector_result_stores();
                     self.text_detector_progress = None;
                     self.clear_text_detector_line_edit_state();
                     self.set_text_detector_status(t!("translation.tab.results_cleared_status"), Severity::Success);
@@ -2463,6 +2488,8 @@ impl TranslationTabState {
     }
 
     fn poll_text_detector_events(&mut self, ctx: &egui::Context) {
+        // Regions held back by a storage job that has ended since.
+        self.replay_pending_region_detections(ctx);
         for event in self.text_detector_controller.poll_events() {
             // Pages and the batch end follow a finished (or stopped) download.
             if !matches!(event, TextDetectorControllerEvent::ModelDownloadStarted | TextDetectorControllerEvent::ModelDownloadProgress(_)) {
@@ -2477,9 +2504,7 @@ impl TranslationTabState {
                 }
                 TextDetectorControllerEvent::DetectStarted { total, replace } => {
                     if replace {
-                        self.text_detector_results.clear();
-                        self.text_detector_mask_textures.clear();
-                        self.clear_text_mask_model();
+                        self.clear_detector_result_stores();
                     }
                     self.text_detector_progress = Some((0, total));
                     self.set_text_detector_status(
@@ -2541,6 +2566,13 @@ impl TranslationTabState {
                     self.text_detector_progress = None;
                     self.set_text_detector_status(t!("translation.tab.detector_cancelled_status"), Severity::Info);
                 }
+                TextDetectorControllerEvent::RegionDetected(region) => {
+                    self.receive_region_detection(ctx, region);
+                }
+                TextDetectorControllerEvent::RegionFailed { page_idx, engine, error } => {
+                    ms_log::runtime_log::log_error(format!("[text-detector] region detection on page {page_idx} failed: {error}"));
+                    self.region_detection_failed(ctx, engine, error);
+                }
             }
         }
     }
@@ -2599,7 +2631,18 @@ impl TranslationTabState {
         if !self.session_caps.chapter_storage || self.text_detection_storage_busy {
             return;
         }
-        if self.text_detector_results.is_empty() {
+        // Save what the user sees: the shared model holds the shown masks (brush edits
+        // included), the tab's store the blocks. Only the masks to write are copied under the
+        // lock; the files are written on a worker.
+        let pages = match self.text_mask_model.as_ref().map(|model| model.lock()) {
+            Some(Ok(model)) => detector_region::detection_pages_for_save(&self.text_detector_results, Some(&model)),
+            Some(Err(error)) => {
+                ms_log::runtime_log::log_error(format!("[text-detector] text mask model lock poisoned, saving detector results without shown masks: {error}"));
+                detector_region::detection_pages_for_save(&self.text_detector_results, None)
+            }
+            None => detector_region::detection_pages_for_save(&self.text_detector_results, None),
+        };
+        if pages.is_empty() {
             self.set_text_detector_status(
                 t!("translation.tab.no_results_to_save_status"),
                 Severity::Error,
@@ -2608,11 +2651,6 @@ impl TranslationTabState {
         }
         let project_dir = project.paths.project_dir.clone();
         let storage_dir = project.paths.text_detection_dir.clone();
-        let pages = self
-            .text_detector_results
-            .iter()
-            .map(|(page_idx, result)| (*page_idx, result.clone()))
-            .collect::<Vec<_>>();
         let (tx, rx) = mpsc::channel::<TextDetectionStorageEvent>();
         self.text_detection_storage_busy = true;
         self.text_detection_storage_rx = Some(rx);
@@ -2641,6 +2679,14 @@ impl TranslationTabState {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.text_detection_storage_rx = None;
                 self.text_detection_storage_busy = false;
+                // `loaded_for` stays unset, so the next region dispatch or detector panel draw
+                // runs the load again; held regions wait for it (`region_merge_must_wait`).
+                if !self.pending_region_detections.is_empty() {
+                    ms_log::runtime_log::log_warn(format!(
+                        "[text-detector] stored detection job died; {} region result(s) wait for the stored detection to load",
+                        self.pending_region_detections.len()
+                    ));
+                }
                 self.set_text_detector_status(
                     t!("translation.tab.text_detection_aborted_status"),
                     Severity::Error,
@@ -2662,15 +2708,7 @@ impl TranslationTabState {
                 if project_dir != current_project_dir {
                     return;
                 }
-                for (page_idx, result) in pages {
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        self.text_detector_results.entry(page_idx)
-                    {
-                        entry.insert(result);
-                        self.text_detector_mask_textures.remove(&page_idx);
-                        self.sync_text_mask_page_from_result(page_idx);
-                    }
-                }
+                self.apply_loaded_detection_pages(pages);
                 self.text_detection_storage_loaded_for = Some(project_dir);
                 let status = if failed == 0 {
                     tf!("translation.tab.loaded_saved_pages_status", loaded = loaded)
@@ -2714,6 +2752,27 @@ impl TranslationTabState {
                     tf!("translation.tab.text_detection_error", error = error),
                     Severity::Error,
                 );
+            }
+        }
+    }
+
+    /// Empties both detector stores, their mask textures and the region results still waiting
+    /// for a storage job (they belong to the results being cleared and must not come back).
+    fn clear_detector_result_stores(&mut self) {
+        self.text_detector_results.clear();
+        self.text_detector_mask_textures.clear();
+        self.clear_text_mask_model();
+        self.pending_region_detections.clear();
+    }
+
+    /// Applies the chapter's stored detection: fills only pages that hold no result yet (a page
+    /// detected in this session wins) and mirrors each into the shared model.
+    fn apply_loaded_detection_pages(&mut self, pages: Vec<(usize, TextDetectorPageResult)>) {
+        for (page_idx, result) in pages {
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.text_detector_results.entry(page_idx) {
+                entry.insert(result);
+                self.text_detector_mask_textures.remove(&page_idx);
+                self.sync_text_mask_page_from_result(page_idx);
             }
         }
     }
@@ -2816,40 +2875,12 @@ impl TranslationTabState {
         if !result.mask_alpha.is_empty() || result.blocks.is_empty() {
             return;
         }
-
-        let mask_size = result.source_size;
-        let mask_w = usize::try_from(mask_size[0]).ok().unwrap_or(0);
-        let mask_h = usize::try_from(mask_size[1]).ok().unwrap_or(0);
-        if mask_w == 0 || mask_h == 0 {
+        let Some((mask_alpha, resolved)) = rasterize_resolved_blocks(result, &self.text_detector_options) else {
             return;
-        }
+        };
         // The synthesized mask IS a raster of the resolved (expanded/merged) blocks, so
         // store those same resolved blocks as the page's box set — they match the mask.
-        let resolved = detector_blocks_with_options(result, &self.text_detector_options);
-        let mut mask_alpha = vec![0u8; mask_w.saturating_mul(mask_h)];
-        for rect in &resolved {
-            // Same checked float->int rounding as the block set, then clamp the covering
-            // rect into the mask raster (negative edges -> 0, far edges -> mask extent).
-            let Some([rx1, ry1, rx2, ry2]) = detector_rect_to_px_rect(rect) else {
-                continue;
-            };
-            let x0 = usize::try_from(rx1.max(0)).unwrap_or(0).min(mask_w);
-            let y0 = usize::try_from(ry1.max(0)).unwrap_or(0).min(mask_h);
-            let x1 = usize::try_from(rx2.max(0)).unwrap_or(0).min(mask_w);
-            let y1 = usize::try_from(ry2.max(0)).unwrap_or(0).min(mask_h);
-            if x0 >= x1 || y0 >= y1 {
-                continue;
-            }
-            for y in y0..y1 {
-                let row = y.saturating_mul(mask_w);
-                for x in x0..x1 {
-                    mask_alpha[row + x] = 255;
-                }
-            }
-        }
-        if !mask_alpha.iter().any(|&px| px != 0) {
-            return;
-        }
+        let mask_size = result.source_size;
         let blocks = detector_rects_to_blocks_px(&resolved);
         let source_size = result.source_size;
         if let Some(model) = self.text_mask_model.as_ref()
@@ -3389,7 +3420,7 @@ impl TranslationTabState {
         page_rect: Rect,
         zoom: f32,
     ) {
-        if self.active_panel != TranslationPanel::TextDetector {
+        if !self.detector_overlay_visible() {
             return;
         }
         self.sync_text_mask_revision_cache();
@@ -3470,7 +3501,7 @@ impl TranslationTabState {
         page_idx: usize,
         page_rect: Rect,
     ) {
-        if self.active_panel != TranslationPanel::TextDetector {
+        if !self.detector_overlay_visible() {
             return;
         }
         let clip_rect = ui.clip_rect().intersect(page_rect);
@@ -4579,6 +4610,14 @@ impl TranslationTabState {
                     canvas.flush_pending_bubble_upserts_now(project);
                 }
                 self.advanced_recognition_request = None;
+                // The window's ORIGINAL page selection (never its edited / rotated preview),
+                // with the engine parameters as they are now.
+                if let Some(page) = project.pages.iter().find(|page| page.idx == page_idx) {
+                    let options = build_ocr_runtime_options(&self.ocr_panel_options, &self.mt_panel_options.source_lang);
+                    let engine = self.ocr_panel_options.engine;
+                    let selection = detector_region::OcrSelection { page_idx, page_path: page.path.clone(), uv_rect };
+                    self.start_selection_region_detection(ctx, project, engine, &options, selection);
+                }
             }
             AdvancedRecognitionAction::Close => {
                 self.advanced_recognition_request = None;
@@ -4643,12 +4682,23 @@ impl TranslationTabState {
             return;
         }
 
+        let region_engine = built_request.request.engine;
+        let region_options = built_request.request.options.clone();
+        let region_selection = detector_region::OcrSelection {
+            page_idx: built_request.page_idx,
+            page_path: built_request.request.page_path.clone(),
+            uv_rect: built_request.request.uv_rect,
+        };
         self.dispatch_manual_ocr_request(
             ctx,
             built_request,
             pending_insert,
             ManualOcrResultTarget::AdvancedWindowText,
         );
+        // The detector runs on the same selection only when the OCR itself was dispatched.
+        if self.manual_ocr_active_request_id == Some(request_id) {
+            self.start_selection_region_detection(ctx, project, region_engine, &region_options, region_selection);
+        }
     }
 }
 
@@ -5131,6 +5181,11 @@ impl CanvasHooks for TranslationTabState {
         self.ensure_text_detector_settings_loaded(project);
         self.flush_settings_save_if_needed(project);
 
+        // The detector overlay shown outside its panel (OCR engine's "create mask" parameter)
+        // needs the stored detection too; the load runs on its worker.
+        if self.detector_overlay_visible() {
+            self.ensure_text_detection_storage_loaded(project);
+        }
         self.poll_text_detector_events(ctx);
         self.poll_text_detection_storage_events(project);
         self.poll_ocr_events(ctx, canvas, project);
@@ -5515,6 +5570,9 @@ impl TranslationTabState {
                     if let Some(show_full) = paddle.get("full_langs").and_then(Value::as_bool) {
                         self.ocr_panel_options.paddle_show_full_langs = show_full;
                     }
+                    if let Some(detect_mask) = detect_mask_param(paddle) {
+                        self.ocr_panel_options.paddle_detect_mask = detect_mask;
+                    }
                 }
                 let paddle_vl_obj = params
                     .get("paddle_vl")
@@ -5574,6 +5632,9 @@ impl TranslationTabState {
                         && let Ok(value) = u32::try_from(max_tokens)
                     {
                         self.ocr_panel_options.surya_max_tokens = value;
+                    }
+                    if let Some(detect_mask) = detect_mask_param(surya) {
+                        self.ocr_panel_options.surya_detect_mask = detect_mask;
                     }
                 }
                 let ai_api_obj = params
@@ -6136,6 +6197,44 @@ fn detector_rects_to_blocks_px(rects: &[TextDetectorRect]) -> Option<Vec<[i32; 4
     } else {
         Some(blocks)
     }
+}
+
+/// Rasterizes a mask-less result's blocks as the user sees them: the blocks resolved with the
+/// detector panel's options (expanded / merged) filled into a source-size 0/255 mask. Returns
+/// the mask and those resolved blocks, or `None` when the page has no size or no block covers a
+/// pixel. The one owner of the legacy "blocks without a stored mask" display mask.
+fn rasterize_resolved_blocks(result: &TextDetectorPageResult, options: &TextDetectorPanelOptions) -> Option<(Vec<u8>, Vec<TextDetectorRect>)> {
+    let mask_w = usize::try_from(result.source_size[0]).ok().unwrap_or(0);
+    let mask_h = usize::try_from(result.source_size[1]).ok().unwrap_or(0);
+    if mask_w == 0 || mask_h == 0 {
+        return None;
+    }
+    let resolved = detector_blocks_with_options(result, options);
+    let mut mask_alpha = vec![0u8; mask_w.saturating_mul(mask_h)];
+    for rect in &resolved {
+        // Same checked float->int rounding as the block set, then clamp the covering
+        // rect into the mask raster (negative edges -> 0, far edges -> mask extent).
+        let Some([rx1, ry1, rx2, ry2]) = detector_rect_to_px_rect(rect) else {
+            continue;
+        };
+        let x0 = usize::try_from(rx1.max(0)).unwrap_or(0).min(mask_w);
+        let y0 = usize::try_from(ry1.max(0)).unwrap_or(0).min(mask_h);
+        let x1 = usize::try_from(rx2.max(0)).unwrap_or(0).min(mask_w);
+        let y1 = usize::try_from(ry2.max(0)).unwrap_or(0).min(mask_h);
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        for y in y0..y1 {
+            let row = y.saturating_mul(mask_w);
+            for x in x0..x1 {
+                mask_alpha[row + x] = 255;
+            }
+        }
+    }
+    if !mask_alpha.iter().any(|&px| px != 0) {
+        return None;
+    }
+    Some((mask_alpha, resolved))
 }
 
 fn detector_blocks_with_options(
@@ -7104,6 +7203,7 @@ fn apply_translation_settings_sections(
         "full_langs".to_string(),
         Value::Bool(ocr_options.paddle_show_full_langs),
     );
+    paddle_obj.insert("detect_mask".to_string(), Value::Bool(ocr_options.paddle_detect_mask));
     if !paddle_obj.contains_key("gpu") {
         paddle_obj.insert("gpu".to_string(), Value::Bool(false));
     }
@@ -7155,6 +7255,7 @@ fn apply_translation_settings_sections(
             ocr_options.surya_max_tokens,
         ))),
     );
+    surya_obj.insert("detect_mask".to_string(), Value::Bool(ocr_options.surya_detect_mask));
     params_obj.insert("surya".to_string(), Value::Object(surya_obj));
     let mut ai_api_obj = params_obj
         .get("ai_api")
@@ -7561,6 +7662,12 @@ fn parse_single_ocr_lang_setting(value: Option<&Value>) -> Option<String> {
     }
 }
 
+/// An engine's "create mask and text blocks" parameter from its `OCR.params.<engine>` section;
+/// `None` (keep the default) when absent or not a boolean.
+fn detect_mask_param(engine_params: &Map<String, Value>) -> Option<bool> {
+    engine_params.get("detect_mask").and_then(Value::as_bool)
+}
+
 /// Snapshots the OCR panel state into worker options. `ocr_source_lang` is the OCR input
 /// language (the MT panel's source-language code) the AI API default instruction is worded for.
 fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions, ocr_source_lang: &str) -> OcrRuntimeOptions {
@@ -7601,6 +7708,8 @@ fn build_ocr_runtime_options(ocr_options: &OcrPanelOptions, ocr_source_lang: &st
         } else {
             ocr_options.surya_max_tokens
         },
+        paddle_detect_mask: ocr_options.paddle_detect_mask,
+        surya_detect_mask: ocr_options.surya_detect_mask,
         ai_api_service: ocr_options.ai_api.service,
         ai_api_base_url: ocr_options.ai_api.base_url.clone(),
         ai_api_model: ocr_options.ai_api.model.clone(),
@@ -8295,7 +8404,7 @@ mod settings_persistence_tests {
 mod ocr_model_settings_tests {
     use super::{
         CompositionPanelOptions, Map, MtPanelOptions, OcrEngine, OcrPanelOptions, PaddleVlVariant, TextDetectorPanelOptions,
-        Value, apply_translation_settings_sections, ocr_engine_to_project_key, paddle_vl_model_from_settings,
+        Value, apply_translation_settings_sections, detect_mask_param, ocr_engine_to_project_key, paddle_vl_model_from_settings,
         parse_ocr_engine_key,
     };
     use serde_json::json;
@@ -8354,6 +8463,34 @@ mod ocr_model_settings_tests {
         assert_eq!(parse_ocr_engine_key(ocr_engine_to_project_key(OcrEngine::Baberu)), OcrEngine::Baberu);
         let options = OcrPanelOptions { engine: OcrEngine::Baberu, ..Default::default() };
         assert_eq!(written_ocr_section(&options, json!({}))["engine"], json!("baberu"));
+    }
+
+    /// The "create mask and text blocks" parameters are per engine: written under their own
+    /// engine's params section, never as a top-level `OCR` key; other keys of those sections
+    /// survive.
+    #[test]
+    fn detect_mask_parameters_are_written_per_engine() {
+        let options = OcrPanelOptions { paddle_detect_mask: true, surya_detect_mask: false, ..Default::default() };
+        let written = written_ocr_section(&options, json!({ "OCR": { "params": { "surya": { "custom": 1 } } } }));
+        assert_eq!(written["params"]["paddle"]["detect_mask"], json!(true));
+        assert_eq!(written["params"]["surya"]["detect_mask"], json!(false));
+        assert_eq!(written["params"]["surya"]["custom"], json!(1));
+        assert!(written.get("detect_mask").is_none());
+    }
+
+    /// What is written is what the loader reads back per engine; an absent or non-boolean
+    /// value keeps the default.
+    #[test]
+    fn detect_mask_parameters_are_read_per_engine() {
+        let options = OcrPanelOptions { paddle_detect_mask: false, surya_detect_mask: true, ..Default::default() };
+        let written = written_ocr_section(&options, json!({}));
+        let params = written.get("params").and_then(Value::as_object).cloned().unwrap_or_default();
+        let section = |engine: &str| params.get(engine).and_then(Value::as_object).cloned().unwrap_or_default();
+        assert_eq!(detect_mask_param(&section("paddle")), Some(false));
+        assert_eq!(detect_mask_param(&section("surya")), Some(true));
+        assert_eq!(detect_mask_param(&Map::new()), None);
+        let not_bool = json!({ "detect_mask": "yes" });
+        assert_eq!(detect_mask_param(not_bool.as_object().unwrap_or(&Map::new())), None);
     }
 }
 

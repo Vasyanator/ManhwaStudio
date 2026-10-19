@@ -22,6 +22,8 @@ Submodules:
 - `model_download_status`: the one owner of how an app-managed model download is shown
   (latest event, text, progress bar); `pub` because the Cleaning tools draw it too.
 - `ocr_case_fix`: pure post-OCR "ALL CAPS" -> sentence-case normalization.
+- `page_crop`: the one uv selection -> page pixel rect rule (OCR crop and the detector's region
+  detection of the same selection).
 - `text_detector`: text detector controller/worker (classic + Paddle/CTD/Surya backend modes).
 - `panels`: UI subpanels for Translation tab.
 - `tab`: top-level Translation tab state implementing `CanvasHooks`, plus this program tab's
@@ -56,6 +58,8 @@ mod machine_translators;
 pub mod model_download_status;
 mod ocr;
 mod ocr_case_fix;
+// The one uv selection -> page pixel rect rule, shared by the OCR crop and region detection.
+mod page_crop;
 // `pub` rather than crate-private: the `cleaning` tab's SDXL engine downloads its pinned
 // config specs through the same controller and draws the same block
 // (`panels::ocr_model_download`).

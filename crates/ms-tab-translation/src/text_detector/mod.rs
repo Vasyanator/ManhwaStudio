@@ -20,8 +20,14 @@ Main types:
   running batch's cancel flag (set on drop).
 - `DetectFailure` (from `pipeline`): cancelled vs localized failure of one detection.
 
+- `RegionDetectRequest` / `RegionDetection` / `RegionDetectEngine` (from `region_detect`): an
+  OCR selection's region detection (`start_region_detection`, answered by `RegionDetected` /
+  `RegionFailed`) and its pure page merge (`merge_region_into_page`).
+
 Worker flow:
-- `worker_loop` receives `WorkerCommand::Detect` and runs `run_detect_batch`.
+- `worker_loop` receives `WorkerCommand::Detect` and runs `run_detect_batch`, or
+  `WorkerCommand::DetectRegion` and runs `run_region_command` (same backend gate, model ensure,
+  cancel flag and download events as a batch; one region, no page progress).
 - `run_detect_batch` reads the PaddleOCR route once, gates the backend, ensures models,
   processes pages sequentially in background (model engines through
   `pipeline::detect_page_file`), applies the Rust mask dilation to every page result and emits
@@ -36,6 +42,7 @@ Submodules:
 - `backend`: the forward-only IPC runner and the backend readiness / model gates.
 - `native` (desktop only): native ONNX PaddleOCR route read and runner.
 - `region`: in-memory region helpers for the Cleaning tools.
+- `region_detect`: an OCR selection's region detection (worker side) and its page merge.
 
 Notes:
 Scale, tiling, stitching, postprocess, block order/cap and mask normalization are owned by
@@ -49,6 +56,7 @@ mod classic;
 mod native;
 mod pipeline;
 mod region;
+mod region_detect;
 #[cfg(test)]
 mod tests;
 
@@ -65,6 +73,10 @@ use ms_text_detect::{DetectParams, EngineKind};
 pub(crate) use pipeline::{DetectorRoute, detector_native_route};
 // The Surya detector's download bundle: the panel's download block and the tab's re-probe.
 pub(crate) use backend::SURYA_DETECTOR_SPECS;
+// An OCR selection's region detection: the tab's trigger, its worker answer and the page merge.
+// The two types the public controller event carries are `pub`; the rest stays in the crate.
+pub use region_detect::{RegionDetectEngine, RegionDetection};
+pub(crate) use region_detect::{RegionDetectRequest, empty_page_result, merge_region_into_page};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,8 +171,17 @@ pub enum TextDetectorControllerEvent {
         error: String,
     },
     /// The batch's cancel flag stopped it (a model download or the page loop): a neutral end,
-    /// not a failure. Pages detected before it were already delivered.
+    /// not a failure. Pages detected before it were already delivered. Also ends a cancelled
+    /// region detection.
     DetectCancelled,
+    /// A region detection (`start_region_detection`) finished; the controller is idle again.
+    RegionDetected(RegionDetection),
+    /// A region detection failed with a localized message; the controller is idle again.
+    RegionFailed {
+        page_idx: usize,
+        engine: RegionDetectEngine,
+        error: String,
+    },
 }
 
 #[derive(Debug)]
@@ -231,6 +252,27 @@ impl TranslationTextDetectorController {
         Ok(())
     }
 
+    /// Starts the region detection of one OCR selection on the worker (same cancel flag and
+    /// download events as a batch). Answered by `RegionDetected` / `RegionFailed` (or
+    /// `DetectCancelled`).
+    ///
+    /// # Errors
+    /// The localized "already running" text while a batch or region detection runs (nothing is
+    /// queued), or the "worker unavailable" text when the worker is gone.
+    pub(crate) fn start_region_detection(&mut self, mut request: RegionDetectRequest) -> Result<(), String> {
+        if self.busy {
+            return Err(t!("translation.text_detector.already_running_status").to_string());
+        }
+        request.mask_dilate_size = request.mask_dilate_size.clamp(0, 30);
+        self.busy = true;
+        self.batch_cancel = Arc::new(AtomicBool::new(false));
+        if self.cmd_tx.send(WorkerCommand::DetectRegion { request, cancel: Arc::clone(&self.batch_cancel) }).is_err() {
+            self.busy = false;
+            return Err(t!("translation.text_detector.worker_unavailable_error").to_string());
+        }
+        Ok(())
+    }
+
     /// Stops the running batch (the panel's Cancel of a model download): a download stops
     /// keeping its staged bytes, the page loop stops before its next page, and the batch ends
     /// with `DetectCancelled`. A no-op while idle (the next batch gets a fresh flag).
@@ -253,6 +295,14 @@ impl TranslationTextDetectorController {
                 Ok(WorkerEvent::DetectCancelled) => {
                     self.busy = false;
                     out.push(TextDetectorControllerEvent::DetectCancelled);
+                }
+                Ok(WorkerEvent::RegionDetected(region)) => {
+                    self.busy = false;
+                    out.push(TextDetectorControllerEvent::RegionDetected(region));
+                }
+                Ok(WorkerEvent::RegionFailed { page_idx, engine, error }) => {
+                    self.busy = false;
+                    out.push(TextDetectorControllerEvent::RegionFailed { page_idx, engine, error });
                 }
                 Ok(WorkerEvent::DetectStarted { total, replace }) => {
                     out.push(TextDetectorControllerEvent::DetectStarted { total, replace });
@@ -316,6 +366,11 @@ enum WorkerCommand {
         /// The batch's cancel flag (`TranslationTextDetectorController::batch_cancel`).
         cancel: Arc<AtomicBool>,
     },
+    DetectRegion {
+        request: RegionDetectRequest,
+        /// The controller's current cancel flag (`batch_cancel`).
+        cancel: Arc<AtomicBool>,
+    },
     Stop,
 }
 
@@ -347,6 +402,12 @@ enum WorkerEvent {
         total_blocks: usize,
         failed_pages: usize,
     },
+    RegionDetected(RegionDetection),
+    RegionFailed {
+        page_idx: usize,
+        engine: RegionDetectEngine,
+        error: String,
+    },
 }
 
 fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
@@ -361,6 +422,9 @@ fn worker_loop(cmd_rx: Receiver<WorkerCommand>, evt_tx: Sender<WorkerEvent>) {
                 cancel,
             } => {
                 run_detect_batch(pages, replace, mode, mask_dilate_size, &cancel, &evt_tx);
+            }
+            WorkerCommand::DetectRegion { request, cancel } => {
+                run_region_command(&request, &cancel, &evt_tx);
             }
         }
     }
@@ -458,6 +522,51 @@ fn run_detect_batch(
         total_blocks,
         failed_pages,
     });
+}
+
+/// Runs one region detection (`WorkerCommand::DetectRegion`) with the batch's gates: the
+/// PaddleOCR route read once, the backend readiness gate, the model ensure of the engine's mode
+/// (Surya: the "not downloaded" error, never a download), then `run_region_detection`. Download
+/// events are forwarded like a batch's; a cancel ends with `DetectCancelled`.
+fn run_region_command(request: &RegionDetectRequest, cancel: &AtomicBool, evt_tx: &Sender<WorkerEvent>) {
+    let mut download_reported = false;
+    let mut forward = |event: &ModelDownloadEvent| {
+        if !download_reported {
+            download_reported = true;
+            let _ = evt_tx.send(WorkerEvent::ModelDownloadStarted);
+        }
+        let _ = evt_tx.send(WorkerEvent::ModelDownloadProgress(event.clone()));
+    };
+    let mut ctx = EnsureCtx { cancel, progress: &mut forward };
+    let fail = |error: String| WorkerEvent::RegionFailed { page_idx: request.page_idx, engine: request.engine, error };
+    let mode = request.engine.run_mode();
+    let route = match request.engine {
+        RegionDetectEngine::PaddleOcr => pipeline::paddle_route(),
+        RegionDetectEngine::Surya => DetectorRoute::Backend,
+    };
+    // Sends are best effort: a gone controller (dropped tab) has nobody to tell.
+    if detector_mode_needs_backend(&mode, route) && let Err(error) = backend::ensure_v2_backend_ready() {
+        let _ = evt_tx.send(fail(error));
+        return;
+    }
+    let event = match ensure_detector_models_for_mode(&mode, &mut ctx) {
+        Err(ModelEnsureError::Cancelled) => WorkerEvent::DetectCancelled,
+        Err(ModelEnsureError::Failed(error)) => fail(error),
+        Ok(()) => match region_detect::run_region_detection(request, route, &mut ctx) {
+            Ok(region) => {
+                ms_log::runtime_log::log_info(format!(
+                    "[text-detector] region on page {}: {} blocks in {:?}",
+                    region.page_idx,
+                    region.blocks.len(),
+                    region.rect
+                ));
+                WorkerEvent::RegionDetected(region)
+            }
+            Err(DetectFailure::Cancelled) => WorkerEvent::DetectCancelled,
+            Err(DetectFailure::Failed(error)) => fail(error),
+        },
+    };
+    let _ = evt_tx.send(event);
 }
 
 /// Whether a detector mode needs the Python backend ready at batch start.

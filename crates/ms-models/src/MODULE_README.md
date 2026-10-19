@@ -29,7 +29,10 @@ LRU order, and optional page-window pins.
 
 `TextMaskModel` stores detector mask alpha planes by page index with source and mask dimensions,
 plus the optional detector text boxes (`TextMaskPage.blocks`) that describe the same detection.
-Writers replace whole pages (mask + blocks) or use closure-based in-place edits; readers track the
+Writers replace whole pages (mask + blocks), use closure-based in-place edits, or replace one
+source-pixel rect with a region detection (`merge_region`: in place, keeps brush edits outside the
+rect, stores the caller's merged box set; its raster rule `replace_mask_region` is the one owner,
+also applied by the Translation tab to its own result store); readers track the
 model revision to refresh local mask caches. Autoclean reads `blocks` to build a box-based mask
 candidate.
 

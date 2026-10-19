@@ -48,6 +48,9 @@ UI specifics:
   row with a "ja/zh/en only" hint and a warning when the MT source language is
   Korean (`OcrPanelModelView::korean_source`). PaddleOCR-VL has a weight-variant
   `WheelComboBox` (`OcrPanelOptions::paddle_vl_model`) above the script restriction.
+- PaddleOCR and Surya, which are also text detectors, each have their own "create mask and
+  text blocks" parameter (`paddle_detect_mask` / `surya_detect_mask`, `draw_detect_mask_checkbox`):
+  a selection OCR then also runs that engine's detector on the selected area (the tab's trigger).
 - The selection hints name the bindings of the canvas gestures (`OcrSelectionHints`, from the
   input registry), finger alternatives included: which OCR a finger long-press drag makes is a
   binding (`translation.ocr.quick_rect` by default), not a panel setting. A title's stored
@@ -84,6 +87,10 @@ pub struct OcrPanelOptions {
     pub manga_model: String,
     pub paddle_lang: String,
     pub paddle_show_full_langs: bool,
+    /// PaddleOCR parameter: a selection OCR also runs the PaddleOCR text detector on the same
+    /// area and replaces the detector mask and blocks inside it. Persisted per title as
+    /// `OCR.params.paddle.detect_mask`; default off.
+    pub paddle_detect_mask: bool,
     pub paddle_vl_script: String,
     /// Selected PaddleOCR-VL weights; persisted per title as `OCR.params.paddle_vl.model`.
     pub paddle_vl_model: PaddleVlVariant,
@@ -96,6 +103,10 @@ pub struct OcrPanelOptions {
     pub surya_drop_repeated_text: bool,
     pub surya_max_sliding_window: u32,
     pub surya_max_tokens: u32,
+    /// Surya parameter: a selection OCR also runs the Surya text detector on the same area and
+    /// replaces the detector mask and blocks inside it. Persisted per title as
+    /// `OCR.params.surya.detect_mask`; default off.
+    pub surya_detect_mask: bool,
     /// AI API engine connection (service, model, system instruction are persisted by the tab).
     pub ai_api: AiApiConnectionState,
     /// The AI API "service, key and instruction" section is expanded (UI-only, not persisted).
@@ -161,6 +172,7 @@ impl Default for OcrPanelOptions {
             manga_model: "base_onnx".to_string(),
             paddle_lang: "korean_v5".to_string(),
             paddle_show_full_langs: false,
+            paddle_detect_mask: false,
             paddle_vl_script: "auto".to_string(),
             paddle_vl_model: PaddleVlVariant::default(),
             easy_langs: "ko".to_string(),
@@ -172,6 +184,7 @@ impl Default for OcrPanelOptions {
             surya_drop_repeated_text: false,
             surya_max_sliding_window: 0,
             surya_max_tokens: 0,
+            surya_detect_mask: false,
             // Language-less until the first draw syncs it to the OCR input language
             // (`sync_default_ai_api_instruction`); requests resolve it themselves.
             ai_api: AiApiConnectionState::new(default_ai_api_ocr_instruction("auto")),
@@ -553,6 +566,7 @@ pub fn draw_ocr_panel(
                                 .changed();
                         }
                     });
+                actions.options_changed |= draw_detect_mask_checkbox(ui, &mut options.paddle_detect_mask);
             }
             OcrEngine::EasyOcr => {
                 let show_all_changed = ui
@@ -613,7 +627,9 @@ pub fn draw_ocr_panel(
                 }
             }
             // Surya auto-detects language and needs no selection UI here.
-            OcrEngine::Surya => {}
+            OcrEngine::Surya => {
+                actions.options_changed |= draw_detect_mask_checkbox(ui, &mut options.surya_detect_mask);
+            }
             OcrEngine::Baberu => {
                 ui.small(t!("translation.ocr_panel.baberu_languages_hint"));
                 if model.korean_source {
@@ -778,6 +794,14 @@ pub fn draw_ocr_panel(
     }
 
     actions
+}
+
+/// The "also create the detector mask and text blocks" parameter of an engine that is also a
+/// text detector (PaddleOCR, Surya); each engine passes its own flag. Returns whether it changed.
+fn draw_detect_mask_checkbox(ui: &mut egui::Ui, enabled: &mut bool) -> bool {
+    ui.checkbox(enabled, t!("translation.ocr_panel.detect_mask_label"))
+        .on_hover_text(t!("translation.ocr_panel.detect_mask_tooltip"))
+        .changed()
 }
 
 /// Renders the "Заменять символы" toggle plus its expandable rule editor.

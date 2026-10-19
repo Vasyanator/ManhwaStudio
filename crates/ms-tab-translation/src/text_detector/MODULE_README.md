@@ -23,6 +23,11 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
   `decode_forward_response`; `native::NativePaddleRunner` calls `ms_native_runtime::paddle_det_forward`.
 - `region.rs` converts a region `ColorImage` (unmultiplied colour, alpha dropped) and runs the same
   `detect_image`, then dilates the region-size mask in Rust.
+- `region_detect.rs` is an OCR selection's region detection on the controller's worker
+  (`start_region_detection` -> `WorkerCommand::DetectRegion` -> `RegionDetected` / `RegionFailed`):
+  the batch's backend gate and model ensure for the engine's mode, then decode, the OCR crop rule
+  (`crate::page_crop`), `detect_image` on the crop, Rust dilation, blocks offset to page pixels.
+  The tab merges the answer with `merge_region_into_page` ("replace inside the selection").
 - Domain rules are NOT owned here: scale/tiling plan, stitching, the CTD/Paddle/Surya postprocess,
   block sort/cap and 0/255 mask normalization are `ms_text_detect`; square dilation and Otsu are
   `ms_raster`; the wire contract is `ms_backend_ipc::textdetector`.
@@ -47,6 +52,10 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
 - `classic.rs`: `detect_page_classic` (decode wrapper) over the pure `detect_classic_from_gray`
   (downscale to 1600, Otsu, (2, 1) dilation, connected components, nearest mask promotion).
 - `region.rs`: `detect_{ai_ctd,paddle,surya}_mask_for_image`, `region_mask`, `color_image_to_rgb`.
+- `region_detect.rs`: `RegionDetectEngine` (`for_ocr`: the one trigger rule — PaddleOCR / Surya
+  with that engine's own `*_detect_mask` parameter), `RegionDetectRequest`, `RegionDetection`,
+  `run_region_detection` (worker), the pure `merge_region_into_page` / `empty_page_result`, and
+  their unit tests.
 - `tests.rs`: unit tests (routing, gate, batch sizing, IPC runner over a fake transport, fallback
   decision, error texts, region contract) and the Phase 1 characterization tests of `classic.rs`
   and the dilation adapter.
@@ -88,6 +97,18 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
   flag is set is treated as the cancel), never a page failure; the batch ends with
   `DetectCancelled`. The page batch owns one flag per batch, set by the controller's drop and
   checked before every page.
+- Region detection: one region at a time and only while the controller is idle (busy is shared
+  with page batches; nothing is queued, the caller reports the refusal). Its crop is exactly the
+  OCR crop of the same selection (`page_crop::uv_rect_to_pixel_rect`, one owner). The merge
+  replaces the selection's rect only. Mask: one raster rule, `ms_models::text_mask_model::
+  replace_mask_region`, applied to the tab's result here and to the model's current mask by
+  `TextMaskModel::merge_region`. Blocks: decided only here (`region_contains_block_centre` drops
+  the result's blocks whose centre is in the rect, the region's blocks are appended, then
+  `ms_text_detect` finalizes them); the tab hands that finalized set (as integer boxes) to the
+  model, which stores it as is, so both stores hold the same blocks. The answer carries the page
+  size, so the GUI thread never reads the page to create a missing entry. Dilation stops at the
+  selection border. The tab holds an answer back while the chapter's stored detection is
+  loading or saving (`tab/detector_region.rs`).
 - The `characterization_*` expected values in `tests.rs` were observed before the Phase 1
   refactor; never edit them to make a change pass.
 
@@ -100,5 +121,7 @@ local detector, and the region-image helpers the Cleaning tab reuses for its mas
   (`paddle_det_max_batch`).
 - Fallback policy, logs, user-facing error texts: `pipeline.rs`.
 - Classic thresholds and component filters: `classic.rs`.
+- Which OCR selections also detect, the region worker and the region merge: `region_detect.rs`;
+  the tab's trigger / apply: `../tab/detector_region.rs`.
 - Scale, tiling, stitching, postprocess, block order/cap, mask normalization:
   `crates/ms-text-detect/src/`.

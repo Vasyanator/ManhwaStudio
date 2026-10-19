@@ -12,6 +12,7 @@ Key items:
 - `detect_image()`: plan + run one in-memory RGB page; native Paddle first when routed there,
   re-running the whole page on the backend after a native failure that the backend may not
   share (`backend_fallback_applies`).
+- `decode_page_rgb()`: the one page decode (open / empty-image errors) of the detector.
 - `detect_page_file()`: decode a page file on the worker and run `detect_image`.
 - `ctd_detect_params()`: the CTD options' share of `DetectParams`.
 - `detect_error_message()`: `DetectError` -> localized text.
@@ -293,12 +294,12 @@ pub(super) fn detection_into_page_result(detection: Detection) -> TextDetectorPa
     }
 }
 
-/// Decodes the page file `path` to RGB (alpha dropped) on the calling worker and runs
-/// [`detect_image`] with `ctx`. The returned mask is NOT dilated (the batch driver does it).
+/// Decodes the page file `path` to RGB (alpha dropped) on the calling worker: the one page
+/// decode of the detector (page batches and an OCR selection's region detection).
 ///
 /// # Errors
-/// The localized open / empty-image message, or [`detect_image`]'s error.
-pub(super) fn detect_page_file(path: &Path, engine: EngineKind, params: &DetectParams, route: DetectorRoute, ctx: &mut EnsureCtx<'_>) -> Result<TextDetectorPageResult, DetectFailure> {
+/// The localized open / empty-image message (logged).
+pub(super) fn decode_page_rgb(path: &Path) -> Result<RgbImage, DetectFailure> {
     let page = image::open(path)
         .map_err(|err| {
             ms_log::runtime_log::log_error(format!("[text-detector] cannot open page {}: {err}", path.display()));
@@ -308,6 +309,16 @@ pub(super) fn detect_page_file(path: &Path, engine: EngineKind, params: &DetectP
     if page.width() == 0 || page.height() == 0 {
         return Err(DetectFailure::Failed(tf!("translation.text_detector.empty_image_error", path = path.display())));
     }
+    Ok(page)
+}
+
+/// Decodes the page file `path` (`decode_page_rgb`) and runs
+/// [`detect_image`] with `ctx`. The returned mask is NOT dilated (the batch driver does it).
+///
+/// # Errors
+/// The localized open / empty-image message, or [`detect_image`]'s error.
+pub(super) fn detect_page_file(path: &Path, engine: EngineKind, params: &DetectParams, route: DetectorRoute, ctx: &mut EnsureCtx<'_>) -> Result<TextDetectorPageResult, DetectFailure> {
+    let page = decode_page_rgb(path)?;
     ms_log::runtime_log::log_info(format!("[text-detector] {} page {}", engine_label(engine), path.display()));
     detect_image(engine, &page, params, route, ctx).map(detection_into_page_result)
 }

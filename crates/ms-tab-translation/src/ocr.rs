@@ -59,6 +59,7 @@ use ms_local_ai::backend_health::ai_backend_offline_error;
 use ms_local_ai::local_ai::effective_ai_runtime;
 use ms_local_ai::local_ai::{AiRouteKind, LocalAiAvailability, LocalAiOff};
 use crate::ocr_case_fix;
+use crate::page_crop;
 use ms_config as config;
 use ms_sysprobe::ai_models;
 use ms_sysprobe::ai_models::{EnsureCtx, ModelDownloadEvent, ModelEnsureError};
@@ -172,6 +173,12 @@ pub struct OcrRuntimeOptions {
     pub surya_drop_repeated_text: bool,
     pub surya_max_sliding_window: u32,
     pub surya_max_tokens: u32,
+    /// PaddleOCR's "create mask and text blocks" parameter (`OcrPanelOptions::paddle_detect_mask`).
+    /// Read by the tab's selection trigger (`region_detect_engine`), never by the OCR worker.
+    pub paddle_detect_mask: bool,
+    /// Surya's "create mask and text blocks" parameter (`OcrPanelOptions::surya_detect_mask`).
+    /// Read by the tab's selection trigger (`region_detect_engine`), never by the OCR worker.
+    pub surya_detect_mask: bool,
     pub ai_api_service: AiApiService,
     /// Server address of a compatible AI API service, as typed (validated per request).
     pub ai_api_base_url: String,
@@ -1722,17 +1729,12 @@ fn crop_image(
     if img_w == 0 || img_h == 0 {
         return Err(tf!("translation.ocr.empty_image_error", request = request.page_path.display()));
     }
-
-    let [u1, v1, u2, v2] = normalized_uv(request.uv_rect);
-    let x1 = ((u1 * img_w as f32).floor() as u32).min(img_w.saturating_sub(1));
-    let y1 = ((v1 * img_h as f32).floor() as u32).min(img_h.saturating_sub(1));
-    let x2 = ((u2 * img_w as f32).ceil() as u32).min(img_w);
-    let y2 = ((v2 * img_h as f32).ceil() as u32).min(img_h);
-
-    if x2 <= x1 || y2 <= y1 {
+    // The one uv -> pixel rule, shared with the detector's region detection of the same
+    // selection (`text_detector::region_detect`).
+    let Some(rect) = page_crop::uv_rect_to_pixel_rect(request.uv_rect, img_w, img_h) else {
         return Err(t!("translation.ocr.selection_too_small_error").to_string());
-    }
-    Ok(source.crop_imm(x1, y1, x2 - x1, y2 - y1))
+    };
+    Ok(source.crop_imm(rect.x, rect.y, rect.width, rect.height))
 }
 
 fn encode_png(image: DynamicImage) -> Result<Vec<u8>, String> {
@@ -1741,14 +1743,6 @@ fn encode_png(image: DynamicImage) -> Result<Vec<u8>, String> {
         .write_to(&mut cursor, ImageFormat::Png)
         .map_err(|err| tf!("translation.ocr.serialize_crop_error", err = err))?;
     Ok(cursor.into_inner())
-}
-
-fn normalized_uv(uv: [f32; 4]) -> [f32; 4] {
-    let left = uv[0].min(uv[2]).clamp(0.0, 1.0);
-    let right = uv[0].max(uv[2]).clamp(0.0, 1.0);
-    let top = uv[1].min(uv[3]).clamp(0.0, 1.0);
-    let bottom = uv[1].max(uv[3]).clamp(0.0, 1.0);
-    [left, top, right, bottom]
 }
 
 fn non_zero_u32_to_option(value: u32) -> Option<u32> {
@@ -2104,6 +2098,8 @@ mod tests {
             surya_drop_repeated_text: false,
             surya_max_sliding_window: 0,
             surya_max_tokens: 128,
+            paddle_detect_mask: false,
+            surya_detect_mask: false,
             ai_api_service: AiApiService::OpenAi,
             ai_api_base_url: String::new(),
             ai_api_model: "gpt-4o-mini".to_string(),

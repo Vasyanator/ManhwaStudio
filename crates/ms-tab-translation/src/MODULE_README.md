@@ -54,6 +54,28 @@ Long work is delegated to focused controllers:
   same `TextDetectorRunMode::plan_inputs` the worker uses; the page sizes the root lends
   (`page_infos`, `TranslationDrawParams`) reach it through `draw_side_panel`.
   Dilation and Otsu come from `ms-raster` (see `text_detector/MODULE_README.md`).
+  PaddleOCR and Surya, which are also detectors, each have a "create mask and text blocks"
+  parameter (`OcrPanelOptions::{paddle,surya}_detect_mask`, per title in
+  `OCR.params.{paddle,surya}.detect_mask`, carried in `OcrRuntimeOptions`). With it on, a quick
+  OCR selection (once its OCR is dispatched) and the advanced window's Create bubble (on its
+  ORIGINAL page selection, never the edited preview) also run that engine's detector on the same
+  crop (`text_detector::RegionDetectEngine::for_ocr`, the one trigger rule; block OCR never
+  does) and replace the detector mask and blocks inside the selection in both stores
+  (`tab/detector_region.rs`). A region dispatch starts the chapter's stored-detection load when
+  it has not run, and an answer arriving while that load (or a save) runs, or before a load has
+  succeeded (a dead load is retried by the next dispatch or panel draw), waits and is applied
+  after it, in order, so a region never stands in for a stored page; Clear and a replacing page
+  batch drop the waiting answers. The detector's Save button
+  writes the masks the user sees — the shared `TextMaskModel`'s, brush edits and region merges
+  included — with the tab's blocks, plus pages that only have a hand-painted mask
+  (`detector_region::detection_pages_for_save`; the button is enabled for either). A legacy page
+  (stored blocks, no stored mask) the user never edited is written exactly as before, without a
+  mask; a region merge onto it first freezes its shown block raster into the result. The mask is
+  never autosaved. The detector's mask and blocks are drawn on the canvas while the Detector
+  panel is open OR while the selected OCR engine's "create mask" parameter is on
+  (`detector_region::detector_overlay_visible_for`, the one owner; the same draw path either way,
+  and the stored detection's lazy load is started for it). Display only: the mask brush and the
+  lines editor stay tied to the panel.
 - `machine_translation.rs` owns MT run threads, AI API MT chat batching/context pruning,
   cancellation, and stale-event filtering.
 - Live AI API generation progress: every AI API OCR / MT request runs through
@@ -371,6 +393,8 @@ is an author note addressed to the translator, not a replica.
 - `model_download_status.rs` (`pub`): `ModelDownloadStatus` (latest event of a job, empty once
   its last file is in) and `draw_model_download_status` (localized line / per-file bar); used by
   the OCR and detector panels and by `ms-tab-cleaning`.
+- `page_crop.rs`: the one uv selection -> page pixel rect rule (`uv_rect_to_pixel_rect`), used by
+  the OCR crop and the detector's region detection of the same selection.
 - `ocr_case_fix.rs`: pure, GUI-free post-OCR ALL-CAPS normalization (detector +
   character state machine) used by `ocr.rs`'s post-processing helper.
 - `ocr_model_download.rs` (`pub`, reused by `ms-tab-cleaning`): `OcrModelDownloadController`
@@ -414,6 +438,9 @@ is an author note addressed to the translator, not a replica.
 - `tab/canvas_input.rs` (child module of `tab`): the canvas pointer drivers — the claimed rect
   selections (`advance_selection`, `drive_canvas_selection`), the lines editor and the mask brush
   on the page, the lines edit commands; `tab/canvas_input/tests.rs` covers the pure helpers.
+- `tab/detector_region.rs` (child module of `tab`): the selection region-detection trigger, the
+  merge of its answer into `text_detector_results` and the shared `TextMaskModel`, and the
+  detector Save snapshot of the shown masks (`detection_pages_for_save`); unit tests inline.
 - `tab/route_inputs.rs` (child module of `tab`, desktop-only): `OcrRouteInputsRefresh`, the
   non-blocking refresh state machine of the OCR/detector routing inputs (injected reader, unit
   tests inline) and its production spawner over `ocr::read_ocr_route_inputs`.

@@ -131,10 +131,14 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 
 ### New features
 - **«Fill enclosed» in the area editor** — a button next to «Generate mask» fills everything the selected mask layer completely surrounds: outline an area with the brush and fill it in one click. The edge of the area does not count as a boundary.
+- **Text mask and blocks from a recognition selection** — PaddleOCR and Surya have a new «Create mask and text blocks» parameter in the Text recognition panel: with it on, selecting an area for recognition also finds the text in it with the same engine and puts the text detector's mask and text blocks there, replacing the old ones inside the selection only. While the parameter is on, the mask and text blocks stay visible on the page, as with the text detector panel open.
 
 ### Improvements
 - **Post-processing of FLUX klein results** — in the area editor, edge feathering and colour matching to the original now live in a separate «Post-processing» section and apply to the shown result instantly, without regenerating it. Colour marks no longer bleed into the edge of the inserted result. Colours are now matched even when nothing is painted (the whole area is regenerated): the edges of the area serve as the reference.
 - **«Hide frame» in the area editor** — a toggle next to «Compare» hides the frame, its handles, the masks and the status line while a result is waiting to be applied, so you can check how the edges of the area join the page.
+
+### Fixes
+- **Saving the text detector's mask** — «Save selection» in the text detector panel of the Translation tab now saves the mask exactly as you see it, including what you painted or erased with the mask brush; before, those edits were lost.
 
 ---
 
@@ -271,7 +275,11 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 
 ### Новые возможности
 - **«Заполнить обведённое» в редакторе области** — кнопка рядом с «Сгенерировать маску» заливает всё, что полностью окружено выбранным слоем маски: обведите область кистью и залейте её одним нажатием. Край области не считается границей.
+- **Маска и текстовые блоки из выделения для распознавания** — у PaddleOCR и Surya в панели распознавания появился параметр «Создавать маску и текстовые блоки»: если он включён, выделение области для распознавания заодно ищет в ней текст тем же движком и ставит туда маску и текстовые блоки детектора текста, заменяя старые только внутри выделения. Пока параметр включён, маска и текстовые блоки видны на странице так же, как при открытой панели детектора текста.
 
 ### Улучшения
 - **Постобработка результатов FLUX klein** — в редакторе области растушёвка края и подгонка цветов к оригиналу вынесены в отдельный раздел «Постобработка» и применяются к показанному результату сразу, без повторной генерации. Цветовые пометки больше не просачиваются в край вставки. Цвета теперь подгоняются и тогда, когда ничего не закрашено (перерисовывается вся область): опорой служат края области.
 - **«Скрыть рамку» в редакторе области** — переключатель рядом с «Сравнить» прячет рамку, её ручки, маски и строку состояния, пока результат ждёт применения, чтобы посмотреть, как края области стыкуются со страницей.
+
+### Исправления
+- **Сохранение маски детектора текста** — «Сохранить выделение» в панели детектора текста во вкладке перевода теперь сохраняет маску ровно такой, какой вы её видите, вместе с тем, что нарисовано или стёрто кистью маски; раньше эти правки терялись.
