@@ -77,7 +77,8 @@ shared wiki view). The studio never references
 - `ms-theme` — sole owner of semantic colours over egui's dark theme.
 - `ms-gifs` — embedded animated hints, streaming decoder.
 - `ms-raster` — generic raster primitives with one owner each: polygon scanline fill
-  (re-exported as `ms_tools::fill_polygon_spans`), square binary dilation, Otsu threshold,
+  (re-exported as `ms_tools::fill_polygon_spans`), square binary dilation, enclosed-hole fill,
+  Otsu threshold,
   integer replicate upscale / box downscale, single-channel box blur, RGBA-over-white to RGB
   (used by PDF export and JPEG encoding), exact Euclidean distance transform (text-render
   effects, region-edit feather).

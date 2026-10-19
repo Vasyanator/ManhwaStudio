@@ -10,6 +10,9 @@ Exports:
   historical path `ms_tools::fill_polygon_spans`).
 - `dilate_square`: square (Chebyshev) binary dilation with independent x/y radii, O(w*h) for any
   radius.
+- `fill_enclosed`: hole filling of a binary mask — every unset pixel the mask fully encloses
+  (4-connected background flooded from the border) becomes 255 (autoclean letter interiors, the
+  area editor's «Заполнить обведённое»).
 - `otsu_threshold`: the Otsu threshold of a `u8` sample set, `None` when no split exists.
 - `upscale_replicate` / `downscale_box`: integer-factor pixel replication and box-average
   downscale of interleaved 1..=4-channel `u8` rasters; an exact (bit-for-bit) inverse pair.
@@ -32,6 +35,7 @@ Level 0 crate: std + `thiserror` only, GUI-free and wasm-safe. Callers own outpu
 mod alpha;
 mod blur;
 mod distance;
+mod fill;
 mod morph;
 mod otsu;
 mod polygon;
@@ -40,6 +44,7 @@ mod scale;
 pub use alpha::rgba_over_white_to_rgb;
 pub use blur::box_blur_u8;
 pub use distance::{EDT_COST_INF, EDT_MAX_DIMENSION, squared_distance_to_mask, squared_distance_with_costs};
+pub use fill::fill_enclosed;
 pub use morph::dilate_square;
 pub use otsu::otsu_threshold;
 pub use polygon::fill_polygon_spans;

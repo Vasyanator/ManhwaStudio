@@ -93,7 +93,7 @@ agent context through the gitignored `CLAUDE.local.md` that the SessionStart hoo
   `ms_text_detect::glyph_mask` keeps imageproc's boundary-inclusive `draw_polygon_mut`, because
   its gates are calibrated on OpenCV `fillPoly` coverage and the spans rule breaks fixture
   parity), square binary dilation
-  (`ms_raster::dilate_square`), Otsu threshold (`ms_raster::otsu_threshold`), exact Euclidean
+  (`ms_raster::dilate_square`), Otsu threshold (`ms_raster::otsu_threshold`), enclosed-hole fill of a binary mask (`ms_raster::fill_enclosed`), exact Euclidean
   distance transform (`ms_raster::squared_distance_to_mask` / `_with_costs`), region-edit result
   post-processing — colour match, inward feather, composite, the cv2-ellipse mask dilation, the
   post settings' defaults / ranges and their UI body (`ms-region-postprocess`; the Python

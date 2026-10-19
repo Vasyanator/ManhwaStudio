@@ -20,6 +20,8 @@ Main responsibilities:
 - run one job: load the source region on a worker, hand it to the engine, poll it, and turn
   the answer into the frame's pending result or into a user-facing failure (D14)
 - run mask generation into the selected mask layer through the same region load
+- fill what the selected mask layer encloses («Заполнить обведённое», `fill_enclosed_in_frame`,
+  gated by `fill_enclosed_block_reason`)
 - refuse a result whose size is not exactly the frame rect (D7), with a message and a log
 - finish a RAW engine answer (`EnginePoll::DoneRaw`): keep the unmarked region from the
   hand-off, run the post-process on one latest-wins worker (`postprocess.rs`) and re-derive the
@@ -791,6 +793,60 @@ impl RegionEditHost {
             ));
         }
         None
+    }
+
+    /// Why «Заполнить обведённое» must refuse right now: `(the sentence the user reads, the
+    /// technical detail for the log)`, or `None` while the active layer may be filled.
+    ///
+    /// ONE rule, read by the button's enablement and tooltips AND by
+    /// [`Self::fill_enclosed_in_frame`], so a greyed-out button and a refused click cannot
+    /// disagree. Most-specific first: an unplaced frame, then a frame holding work (a pending
+    /// result, a run or a detection in flight: the mask then describes work already handed
+    /// over), then an active layer with nothing painted that could enclose anything.
+    #[must_use]
+    pub(super) fn fill_enclosed_block_reason(&self) -> Option<(String, String)> {
+        if !self.frame.is_placed() {
+            return Some((
+                t!("cleaning.tools.area_editor.error_no_frame").to_string(),
+                "the frame has no page anchor or no rectangle".to_string(),
+            ));
+        }
+        if !self.mask_editable() {
+            return Some((
+                t!("cleaning.tools.area_editor.generate_mask_locked_hint").to_string(),
+                "a result waits or work is running".to_string(),
+            ));
+        }
+        let masks = self.frame.masks();
+        if masks.layer_set_px(masks.active()) == 0 {
+            return Some((
+                t!("cleaning.tools.area_editor.fill_enclosed_empty_hint").to_string(),
+                format!("mask layer {} is empty", masks.active()),
+            ));
+        }
+        None
+    }
+
+    /// Performs «Заполнить обведённое»: fills what the selected mask layer fully encloses
+    /// (`MaskStack::fill_enclosed_in_active`, one undo step) and reports the outcome — the
+    /// filled pixel count, or a hint that a closed loop is needed when nothing was enclosed.
+    ///
+    /// Called straight from the compact panel, like «Отменить мазок» and «Стереть маску»: it is a
+    /// mask-only edit of the tool's own frame that needs neither the canvas nor the project.
+    /// It runs on the GUI thread on purpose — a single O(w*h) flood of the frame's mask (tens of
+    /// milliseconds for the largest frames) after one click, the same class of work as a brush
+    /// stroke. The lock follows from the layer counters, so nothing else needs notifying; a
+    /// pending result cannot exist here (the block reason refuses it).
+    pub(super) fn fill_enclosed_in_frame(&mut self) {
+        if let Some((text, detail)) = self.fill_enclosed_block_reason() {
+            self.report_error(text, &detail);
+            return;
+        }
+        match self.frame.masks_mut().fill_enclosed_in_active() {
+            Ok(0) => self.report_info(t!("cleaning.tools.area_editor.fill_enclosed_nothing_hint").to_string()),
+            Ok(count) => self.report_info(tf!("cleaning.tools.area_editor.fill_enclosed_status", count = count)),
+            Err(error) => self.report_error(t!("cleaning.tools.area_editor.error_fill_enclosed").to_string(), &error),
+        }
     }
 
     /// Queues one region load for `purpose` and locks the frame for its duration.
@@ -1856,6 +1912,106 @@ mod tests {
         tool.accept_generated_mask(GeneratedMask::from_parts_for_test([3, 5], vec![255u8; 15]));
         assert!(tool.message.as_ref().is_some_and(|message| message.error));
         assert!(tool.frame.masks().is_empty(), "nothing may be written from a mask of the wrong shape");
+    }
+
+    /// A closed 5x5 ring (walls 1 px around a 3x3 hollow) in the top-left corner of an
+    /// 8x8 alpha buffer: 16 wall pixels enclosing 9.
+    fn ring_alpha() -> Vec<u8> {
+        let mut alpha = vec![0u8; 64];
+        for i in 0..5 {
+            for (x, y) in [(i, 0), (i, 4), (0, i), (4, i)] {
+                alpha[y * 8 + x] = 255;
+            }
+        }
+        alpha
+    }
+
+    /// «Заполнить обведённое» fills what the SELECTED layer encloses, only there, as one undo
+    /// step, and says how much it filled.
+    #[test]
+    fn filling_the_enclosed_area_fills_the_selected_layer_only() {
+        let mut tool = test_host();
+        tool.frame.place_for_test(0, rect(0, 0, 8, 8));
+        let layers = tool.frame.masks().layer_count();
+        let target = layers - 1;
+        tool.frame.masks_mut().set_active(target);
+        assert!(tool.frame.masks_mut().set_active_from_alpha(&ring_alpha()));
+        assert!(tool.fill_enclosed_block_reason().is_none(), "a painted ring on a free frame may be filled");
+
+        tool.fill_enclosed_in_frame();
+
+        assert_eq!(tool.frame.masks().layer_set_px(target), 25);
+        assert_eq!(tool.frame.masks().bytes(target)[2 * 8 + 2], 255, "the ring's centre is set");
+        for idx in 0..layers {
+            if idx != target {
+                assert_eq!(tool.frame.masks().layer_set_px(idx), 0, "layer {idx} must be untouched");
+            }
+        }
+        assert_eq!(
+            tool.message.as_ref().map(|message| (message.text.clone(), message.error)),
+            Some((tf!("cleaning.tools.area_editor.fill_enclosed_status", count = 9), false))
+        );
+        assert!(tool.frame.masks_mut().undo());
+        assert_eq!(tool.frame.masks().layer_set_px(target), 16, "one undo takes the fill back");
+    }
+
+    /// An open stroke encloses nothing: the layer is unchanged and the user is told why.
+    #[test]
+    fn filling_with_nothing_enclosed_changes_nothing_and_says_so() {
+        let mut tool = test_host();
+        tool.frame.place_for_test(0, rect(0, 0, 8, 8));
+        let mut open = ring_alpha();
+        open[2 * 8 + 4] = 0;
+        assert!(tool.frame.masks_mut().set_active_from_alpha(&open));
+        let active = tool.frame.masks().active();
+        let before = tool.frame.masks().bytes(active).to_vec();
+
+        tool.fill_enclosed_in_frame();
+
+        assert_eq!(tool.frame.masks().bytes(active), before.as_slice());
+        assert_eq!(
+            tool.message.as_ref().map(|message| (message.text.clone(), message.error)),
+            Some((t!("cleaning.tools.area_editor.fill_enclosed_nothing_hint").to_string(), false))
+        );
+    }
+
+    /// Every state that must refuse the fill does, with its own reason, in the documented
+    /// order; and a click in a blocked state (a panel drawn one frame late) changes nothing.
+    #[test]
+    fn filling_is_refused_in_every_blocked_state() {
+        let mut tool = test_host();
+        assert_eq!(
+            tool.fill_enclosed_block_reason().map(|(text, _)| text),
+            Some(t!("cleaning.tools.area_editor.error_no_frame").to_string())
+        );
+
+        tool.frame.place_for_test(0, rect(0, 0, 8, 8));
+        assert_eq!(
+            tool.fill_enclosed_block_reason().map(|(text, _)| text),
+            Some(t!("cleaning.tools.area_editor.fill_enclosed_empty_hint").to_string()),
+            "an empty selected layer has nothing that could enclose anything"
+        );
+
+        assert!(tool.frame.masks_mut().set_active_from_alpha(&ring_alpha()));
+        assert!(tool.fill_enclosed_block_reason().is_none());
+
+        tool.frame
+            .set_result(Some(ResultLayer::new(egui::ColorImage::filled([8, 8], Color32::WHITE))));
+        assert_eq!(
+            tool.fill_enclosed_block_reason().map(|(text, _)| text),
+            Some(t!("cleaning.tools.area_editor.generate_mask_locked_hint").to_string())
+        );
+        let active = tool.frame.masks().active();
+        tool.fill_enclosed_in_frame();
+        assert_eq!(tool.frame.masks().layer_set_px(active), 16, "a refused click must not fill under a pending result");
+        assert!(tool.message.as_ref().is_some_and(|message| message.error));
+        tool.frame.set_result(None);
+
+        tool.frame.set_processing(true);
+        assert_eq!(
+            tool.fill_enclosed_block_reason().map(|(text, _)| text),
+            Some(t!("cleaning.tools.area_editor.generate_mask_locked_hint").to_string())
+        );
     }
 
     /// Every state that must refuse a generation does, with its own reason, in the documented

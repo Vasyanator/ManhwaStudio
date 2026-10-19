@@ -2,7 +2,8 @@
 
 ## Purpose
 Generic, GUI-free raster primitives that the project implements exactly ONCE: the even-odd polygon
-scanline rasterizer, the square (Chebyshev) binary dilation, the Otsu threshold, integer-factor
+scanline rasterizer, the square (Chebyshev) binary dilation, the enclosed-hole fill of a binary
+mask, the Otsu threshold, integer-factor
 replicate upscale / box downscale of interleaved `u8` rasters, the `u8` box blur, the flattening
 of straight RGBA8 over opaque white to RGB8 and the exact Euclidean distance transform. Every crate
 that needs one of these rules calls this owner; a second implementation anywhere is a defect.
@@ -23,6 +24,8 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
   `ms-tools` as `ms_tools::fill_polygon_spans`, the path the PS-editor selection, the cleaning
   tools and the patch core use.
 - `morph.rs`: `dilate_square`, separable sliding-window square dilation with independent x/y radii.
+- `fill.rs`: `fill_enclosed`, the hole fill of a binary mask (span flood of the background from
+  the border); autoclean's letter interiors and the area editor's «Заполнить обведённое».
 - `otsu.rs`: `otsu_threshold`, the 256-bin Otsu threshold.
 - `scale.rs`: `upscale_replicate` / `downscale_box`, integer-factor nearest upscale and
   box-average downscale of interleaved 1..=4-channel `u8` rasters (the cloud image-edit pipeline
@@ -46,6 +49,12 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
   `RasterError::LengthMismatch` when `len != w*h` (overflow included). Radius `r` equals `r`
   iterated 3x3 passes; tests pin it against a brute-force reference and the pre-refactor copies'
   characterization vectors.
+- `fill_enclosed` treats nonzero as set and sets to `255` exactly the unset pixels no
+  4-connected path of unset pixels links to the border (outside the buffer is background, so a
+  loop closed only by the edge encloses nothing; a diagonal-only wall still closes). Set pixels
+  keep their value; the return is the number of newly set pixels; `LengthMismatch` (overflow
+  included) leaves the mask untouched. Its stack grows with background runs, never recursion.
+  A test pins it pixel for pixel against the pre-move per-pixel flood.
 - `otsu_threshold` returns `None` when no split exists (empty input or one distinct value); ties
   keep the FIRST maximum. Each caller keeps its historical default with `unwrap_or` (the classic
   detector 127, the Paddle glyph mask 0).
@@ -82,6 +91,8 @@ caller-specific Otsu default) are thin adapters at the call site, never variants
 - To change polygon fill semantics, edit `polygon.rs` and re-verify the PS-editor selection, the
   cleaning tools and the patch core.
 - To change the dilation rule, edit `morph.rs`; every caller's adapter test must stay green.
+- To change what counts as enclosed, edit `fill.rs`; autoclean's candidate A and the area
+  editor's fill both follow it.
 - To change the threshold rule, edit `otsu.rs`; the classic detector and the glyph mask use it.
 - To change integer scaling or the blur, edit `scale.rs` / `blur.rs`; the image-edit pipeline's
   bit-exact "untouched outside the mask" guarantee depends on the round trip and on the blur's

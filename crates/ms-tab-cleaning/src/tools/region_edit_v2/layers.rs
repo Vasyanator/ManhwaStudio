@@ -24,7 +24,8 @@ Key structures:
   what a replacement shares with the image it replaces (patch uploads)
 
 Key functions:
-- `MaskStack::paint_segment`, `set_active_from_alpha`, `clear_all`, `push_undo`, `undo`
+- `MaskStack::paint_segment`, `set_active_from_alpha`, `fill_enclosed_in_active`, `clear_all`,
+  `push_undo`, `undo`
 - `MaskStack::paint_marks_segment`, `paint_marks_boxes`, `push_marks_undo`, `marks_rgba`
 - `hollow_rect_boxes()`: the pixel boxes of an unfilled rectangle (pure)
 - `MaskStack::ensure_textures`, `MaskStack::draw_marks`, `MaskStack::draw_masks`
@@ -629,7 +630,7 @@ pub struct MaskLayerSpec {
 /// layer it went into.
 #[derive(Debug)]
 enum UndoStep {
-    /// Mask layer `layer` before a stroke or a generated fill.
+    /// Mask layer `layer` before a stroke, a generated fill or an enclosed-area fill.
     Mask { layer: usize, bytes: Vec<u8>, set_px: usize },
     /// The marks layer before a marks stroke or rectangle; the counter and the preview are
     /// re-derived from the bytes on undo. `None` is the marker for an empty (or unallocated)
@@ -918,6 +919,41 @@ impl MaskStack {
         layer.set_px = set_px;
         layer.rebuild_preview(w, h);
         true
+    }
+
+    /// Sets every pixel of the ACTIVE layer that its painted pixels fully enclose and returns
+    /// how many pixels were newly set (`ms_raster::fill_enclosed`: the background is flooded
+    /// 4-connected from the layer's border, so a loop closed only by the frame edge encloses
+    /// nothing).
+    ///
+    /// The fill is computed on a copy first: when nothing is enclosed (`Ok(0)`) the layer, its
+    /// preview and the undo history are left exactly as they were. Otherwise the previous
+    /// buffer becomes ONE undo step (moved, not copied again), the filled pixels are written as
+    /// `255` — the layer's own `0`/`255` invariant — and the counter grows by exactly the
+    /// returned count. The other layers, the marks and the active index are untouched. A stack
+    /// without layers answers `Ok(0)`.
+    ///
+    /// # Errors
+    /// `RasterError::LengthMismatch` when the active layer's buffer does not hold `w * h` bytes
+    /// (a broken stack invariant); nothing is changed then.
+    pub fn fill_enclosed_in_active(&mut self) -> Result<usize, ms_raster::RasterError> {
+        let (w, h) = (self.w, self.h);
+        let active = self.active;
+        let Some(layer) = self.layers.get_mut(active) else {
+            return Ok(0);
+        };
+        let mut filled_bytes = layer.bytes.clone();
+        let filled = ms_raster::fill_enclosed(&mut filled_bytes, w, h)?;
+        if filled == 0 {
+            return Ok(0);
+        }
+        let previous = std::mem::replace(&mut layer.bytes, filled_bytes);
+        let previous_set_px = layer.set_px;
+        // Every newly filled pixel was 0 and is now 255, so the counter follows exactly.
+        layer.set_px = previous_set_px.saturating_add(filled);
+        layer.rebuild_preview(w, h);
+        self.push_step(UndoStep::Mask { layer: active, bytes: previous, set_px: previous_set_px });
+        Ok(filled)
     }
 
     /// Clears EVERY mask layer and the marks, and drops the undo history.
@@ -1253,6 +1289,81 @@ mod tests {
         // A transposed buffer has the right LENGTH, so it is accepted — the caller checks the
         // shape. This pins that the length check is the only guard here.
         assert!(stack.set_active_from_alpha(&[255u8; 15]));
+    }
+
+    /// Writes the 7x7 ring (walls 1 px, centre 5x5 hollow) at the origin of the active layer
+    /// through the generated-mask door, then drops that snapshot so tests see only the fill's.
+    fn draw_ring(stack: &mut MaskStack) {
+        let (w, h) = stack.size();
+        let mut alpha = vec![0u8; w * h];
+        for i in 0..7 {
+            for (x, y) in [(i, 0), (i, 6), (0, i), (6, i)] {
+                alpha[y * w + x] = 255;
+            }
+        }
+        assert!(stack.set_active_from_alpha(&alpha));
+        stack.undo.clear();
+    }
+
+    /// The inside of a closed ring is filled, in the active layer only, with the counter and the
+    /// preview exact and every value `255`.
+    #[test]
+    fn an_enclosed_area_fill_fills_the_inside_of_a_ring() {
+        let (w, h) = (10usize, 9usize);
+        let mut stack = stack(w, h);
+        stack.set_active(1);
+        draw_ring(&mut stack);
+        assert_eq!(stack.layer_set_px(1), 24);
+
+        assert_eq!(stack.fill_enclosed_in_active(), Ok(25));
+        assert_eq!(stack.layer_set_px(1), 49);
+        assert!(stack.bytes(1).iter().all(|&byte| byte == 0 || byte == 255), "the 0/255 invariant holds");
+        assert_eq!(stack.bytes(1)[3 * w + 3], 255, "the ring's centre is set");
+        assert_eq!(stack.bytes(1)[3 * w + 8], 0, "outside the ring stays empty");
+        assert_eq!(stack.layer_set_px(0), 0, "the other layer is untouched");
+        assert!(stack.marks_is_empty(), "the marks are untouched");
+        assert_counters_exact(&stack);
+        assert_preview_matches_bytes(&stack);
+    }
+
+    /// The fill is ONE undo step that restores the ring exactly.
+    #[test]
+    fn an_enclosed_area_fill_is_undone_in_one_step() {
+        let mut stack = stack(10, 9);
+        draw_ring(&mut stack);
+        let ring = stack.bytes(0).to_vec();
+        assert_eq!(stack.fill_enclosed_in_active(), Ok(25));
+        assert!(stack.undo());
+        assert_eq!(stack.bytes(0), ring.as_slice());
+        assert_eq!(stack.layer_set_px(0), 24);
+        assert!(!stack.undo(), "the fill took exactly one step");
+        assert_counters_exact(&stack);
+        assert_preview_matches_bytes(&stack);
+    }
+
+    /// Nothing enclosed (an open stroke, or an empty layer): nothing changes and no undo step
+    /// is taken, so «Отменить мазок» still undoes the stroke before it.
+    #[test]
+    fn an_enclosed_area_fill_with_nothing_enclosed_is_a_no_op() {
+        let mut stack = stack(12, 12);
+        assert_eq!(stack.fill_enclosed_in_active(), Ok(0));
+        assert!(!stack.undo(), "an empty layer took no snapshot");
+
+        stack.push_undo();
+        stack.paint_segment((2, 6), (9, 6), 1, false);
+        let before = stack.bytes(0).to_vec();
+        assert_eq!(stack.fill_enclosed_in_active(), Ok(0));
+        assert_eq!(stack.bytes(0), before.as_slice());
+        assert!(stack.undo(), "the stroke's own snapshot is still the latest");
+        assert!(stack.is_empty());
+        assert!(!stack.undo());
+    }
+
+    /// A stack without layers or without geometry never panics and fills nothing.
+    #[test]
+    fn an_enclosed_area_fill_on_a_degenerate_stack_fills_nothing() {
+        assert_eq!(MaskStack::new(4, 4, &[]).fill_enclosed_in_active(), Ok(0));
+        assert_eq!(stack(0, 0).fill_enclosed_in_active(), Ok(0));
     }
 
     /// Every counter agrees with a brute-force scan of its own buffer.

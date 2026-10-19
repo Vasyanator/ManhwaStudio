@@ -18,8 +18,10 @@ Key functions:
 - `engine_picker_shown()`: the one-engine rule of the picker (pure, tested)
 
 Notes:
-A panel body runs inside `CanvasView::draw` and may mutate only the tool, so every action here
-QUEUES (`RegionFrame::request_*`, `generate_mask_requested`) and `draw_overlay_ui` performs it.
+A panel body runs inside `CanvasView::draw` and may mutate only the tool, so every action that
+needs the canvas or the project QUEUES (`RegionFrame::request_*`, `generate_mask_requested`) and
+`draw_overlay_ui` performs it; mask-only edits of the tool's own stack (undo, erase, «Заполнить
+обведённое») run at once.
 Localized controls take their `id_salt` from the tool's `HostSpec`, so two hosted tools never
 share stored widget state.
 */
@@ -267,7 +269,7 @@ impl RegionEditHost {
 
     /// Draws the mask-generation block of the compact panel: the source picker, the selected
     /// source's parameters in a collapsed section, the live progress of a streaming source, and
-    /// «Сгенерировать маску».
+    /// one row with «Сгенерировать маску» and «Заполнить обведённое».
     ///
     /// It sits among the mask actions because that is what it is — filling the selected layer
     /// from a backend detector instead of by hand — and it is the HOST's, not an engine's: every
@@ -275,8 +277,10 @@ impl RegionEditHost {
     /// "remove this". The block therefore says nothing about what the mask means; the engines
     /// state that in their own panel bodies.
     ///
-    /// The button only QUEUES the job ([`Self::generate_mask_requested`]): a dock panel body
-    /// may mutate the tool alone, and the load needs the canvas and the project.
+    /// «Сгенерировать маску» only QUEUES the job ([`Self::generate_mask_requested`]): a dock
+    /// panel body may mutate the tool alone, and the load needs the canvas and the project.
+    /// «Заполнить обведённое» needs neither, so it fills the selected layer at once
+    /// ([`Self::fill_enclosed_in_frame`]), like the undo and erase buttons of the mask actions.
     pub(super) fn draw_mask_generation(&mut self, ui: &mut egui::Ui) {
         let busy = self.mask_generation_rx.is_some() || self.pending_load.is_some();
         // The ✓/«скачать» marks of the watermark catalog come from the backend and are fetched
@@ -309,15 +313,33 @@ impl RegionEditHost {
                 self.torch_available,
             ),
         };
-        if ui
-            .add_enabled(block_reason.is_none(), egui::Button::new(t!("cleaning.mask_editor.generate_mask_button")))
-            .on_hover_text(hint.clone())
-            // `on_hover_text` is enabled-only (`Tooltip::for_enabled`), so the reason the button
-            // is greyed out needs the disabled variant too.
-            .on_disabled_hover_text(hint)
-            .clicked()
-        {
-            self.generate_mask_requested = true;
+        let fill_block_reason = self.fill_enclosed_block_reason();
+        let fill_hint = match fill_block_reason {
+            Some((ref text, _)) => text.clone(),
+            None => t!("cleaning.tools.area_editor.fill_enclosed_tooltip").to_string(),
+        };
+        let mut fill_clicked = false;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(block_reason.is_none(), egui::Button::new(t!("cleaning.mask_editor.generate_mask_button")))
+                .on_hover_text(hint.clone())
+                // `on_hover_text` is enabled-only (`Tooltip::for_enabled`), so the reason the
+                // button is greyed out needs the disabled variant too.
+                .on_disabled_hover_text(hint)
+                .clicked()
+            {
+                self.generate_mask_requested = true;
+            }
+            // Same pairing as above: enablement and both tooltips come from the one rule the
+            // action re-checks.
+            fill_clicked = ui
+                .add_enabled(fill_block_reason.is_none(), egui::Button::new(t!("cleaning.tools.area_editor.fill_enclosed_button")))
+                .on_hover_text(fill_hint.clone())
+                .on_disabled_hover_text(fill_hint)
+                .clicked();
+        });
+        if fill_clicked {
+            self.fill_enclosed_in_frame();
         }
     }
 

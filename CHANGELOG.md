@@ -129,6 +129,9 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 
 ## Unreleased
 
+### New features
+- **«Fill enclosed» in the area editor** — a button next to «Generate mask» fills everything the selected mask layer completely surrounds: outline an area with the brush and fill it in one click. The edge of the area does not count as a boundary.
+
 ### Improvements
 - **Post-processing of FLUX klein results** — in the area editor, edge feathering and colour matching to the original now live in a separate «Post-processing» section and apply to the shown result instantly, without regenerating it. Colour marks no longer bleed into the edge of the inserted result. Colours are now matched even when nothing is painted (the whole area is regenerated): the edges of the area serve as the reference.
 - **«Hide frame» in the area editor** — a toggle next to «Compare» hides the frame, its handles, the masks and the status line while a result is waiting to be applied, so you can check how the edges of the area join the page.
@@ -265,6 +268,9 @@ Released blocks (`## N — YYYY-MM-DD`) are listed oldest first, newest release 
 - Обновление и установка проверяют каждый скачанный файл по контрольным суммам SHA-256 релиза перед использованием.
 
 ## Не выпущено
+
+### Новые возможности
+- **«Заполнить обведённое» в редакторе области** — кнопка рядом с «Сгенерировать маску» заливает всё, что полностью окружено выбранным слоем маски: обведите область кистью и залейте её одним нажатием. Край области не считается границей.
 
 ### Улучшения
 - **Постобработка результатов FLUX klein** — в редакторе области растушёвка края и подгонка цветов к оригиналу вынесены в отдельный раздел «Постобработка» и применяются к показанному результату сразу, без повторной генерации. Цветовые пометки больше не просачиваются в край вставки. Цвета теперь подгоняются и тогда, когда ничего не закрашено (перерисовывается вся область): опорой служат края области.

@@ -242,6 +242,16 @@ that owns the context, the canvas and the project at once:
   the same stride, so a mask of the wrong shape must never be stretched over a layer. The
   consumer checks the SHAPE (a transposed buffer has the right length); this checks the length.
   The host's «Сгенерировать маску» is the only caller today.
+- **«Заполнить обведённое» fills what the ACTIVE layer encloses, through
+  `MaskStack::fill_enclosed_in_active` and the one hole fill `ms_raster::fill_enclosed`.** The
+  background is flooded 4-connected from the layer's border, so a loop closed only by the frame
+  edge encloses nothing and a diagonal-only wall still closes. It is computed on a copy: nothing
+  enclosed changes nothing and takes no undo step; otherwise the old buffer becomes ONE undo
+  step, filled pixels are `255` and the counter grows by the returned count. The host gates the
+  button and the click on one rule (`fill_enclosed_block_reason`: unplaced frame, a frame holding
+  work, an empty active layer) and runs the fill straight from the compact panel, like the undo
+  and erase buttons — a mask-only O(w*h) edit of its own frame, the same class of work as a
+  stroke.
 - **Painting is refused while a result is pending or work is running**: the mask then describes
   work already handed over. It is also refused while a canvas zoom modifier (Ctrl/Cmd/`Z`) is
   held, because Ctrl+drag over the frame zooms the page and must not leave a stroke behind —
@@ -302,7 +312,10 @@ that owns the context, the canvas and the project at once:
 - To change how marks reach an engine: `prepare_run_marks` / `reconcile_marks_mode` in `host.rs`,
   the types in `engine.rs`; the compact-panel controls are in `host_panels.rs`.
 - To change how a mask arrives from somewhere other than the brush: `set_active_from_alpha` in
-  `layers.rs`. `place_for_test` in `frame.rs` is how a CONSUMER's own tests reach a placed
+  `layers.rs`. To change «Заполнить обведённое»: `fill_enclosed_in_active` in `layers.rs`
+  (the stack side), `fill_enclosed_block_reason` / `fill_enclosed_in_frame` in `host.rs` (the
+  gate and the report), the button in `host_panels.rs` (`draw_mask_generation`); what counts as
+  enclosed is `ms_raster::fill_enclosed`, never here. `place_for_test` in `frame.rs` is how a CONSUMER's own tests reach a placed
   frame — the rectangle stays unsettable from production code, which is what keeps every
   placement inside the pass with its constraints and its clamp.
 - To change what a consumer may declare about a layer, or how a consumer switch re-shapes the
@@ -381,6 +394,8 @@ CleaningTool::apply_input       the shared brush actions on the active brush, th
                                          while the settings change
 «Сгенерировать маску» -> start_mask_generation() -> poll_region_load() (purpose MaskGeneration)
              -> start_mask_detection() -> poll_mask_generation() -> accept_generated_mask()
+«Заполнить обведённое» -> fill_enclosed_in_frame() (from the panel, at once)
+             -> MaskStack::fill_enclosed_in_active() -> ms_raster::fill_enclosed
 ```
 
 The source region is the SOURCE PAGE crop composited with the current clean overlay (D14),

@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 # Generic, GUI-free raster primitives with exactly one owner each in the project: the even-odd
-# polygon scanline rasterizer, the square (Chebyshev) binary dilation, the Otsu threshold,
+# polygon scanline rasterizer, the square (Chebyshev) binary dilation, the enclosed-hole fill,
+# the Otsu threshold,
 # integer-factor replicate upscale / box downscale, the `u8` box blur, the RGBA-over-white
 # flattening to RGB and the exact Euclidean distance transform.
 #

@@ -660,42 +660,22 @@ fn has_foreground(mask: &image::GrayImage) -> bool {
     mask.as_raw().iter().any(|&v| v != 0)
 }
 
-/// Заполнить фоновые пиксели, полностью окружённые маской (внутренности букв):
-/// заливка фона от границы crop, всё недостигнутое — дырка.
+/// Fills the background pixels the mask fully encloses (letter interiors) in place, through the
+/// one hole fill `ms_raster::fill_enclosed`: the background is flooded 4-connected from the crop
+/// border, and every unreached unset pixel becomes 255. Set pixels keep their value.
 fn fill_holes(mask: &mut image::GrayImage) {
-    let (w, h) = (mask.width() as i32, mask.height() as i32);
-    let mut outside = vec![false; (w * h) as usize];
-    let mut stack: Vec<(i32, i32)> = Vec::new();
-    let push = |x: i32, y: i32, outside: &mut Vec<bool>, stack: &mut Vec<(i32, i32)>| {
-        let idx = (y * w + x) as usize;
-        if !outside[idx] && mask.get_pixel(x as u32, y as u32)[0] == 0 {
-            outside[idx] = true;
-            stack.push((x, y));
-        }
+    let (Ok(width), Ok(height)) = (usize::try_from(mask.width()), usize::try_from(mask.height())) else {
+        ms_log::runtime_log::log_error(format!(
+            "[autoclean] hole fill skipped: {}x{} mask does not fit usize",
+            mask.width(),
+            mask.height()
+        ));
+        return;
     };
-    for x in 0..w {
-        push(x, 0, &mut outside, &mut stack);
-        push(x, h - 1, &mut outside, &mut stack);
-    }
-    for y in 0..h {
-        push(0, y, &mut outside, &mut stack);
-        push(w - 1, y, &mut outside, &mut stack);
-    }
-    while let Some((x, y)) = stack.pop() {
-        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-            let (nx, ny) = (x + dx, y + dy);
-            if nx >= 0 && ny >= 0 && nx < w && ny < h {
-                push(nx, ny, &mut outside, &mut stack);
-            }
-        }
-    }
-    for y in 0..h {
-        for x in 0..w {
-            let idx = (y * w + x) as usize;
-            if !outside[idx] && mask.get_pixel(x as u32, y as u32)[0] == 0 {
-                mask.put_pixel(x as u32, y as u32, image::Luma([255]));
-            }
-        }
+    // `GrayImage` holds exactly `width * height` bytes, so a length error is an invariant
+    // violation; it is logged and the mask is left as it was (candidate A without filled holes).
+    if let Err(err) = ms_raster::fill_enclosed(mask, width, height) {
+        ms_log::runtime_log::log_error(format!("[autoclean] hole fill skipped: {err}"));
     }
 }
 
